@@ -19,6 +19,13 @@ import "testing"
 // the hierarchical / NewParser (load-override) path. Flat-set ParseSetCommand +
 // SetPath MERGES two lines with an identical key-path into one node, so it is
 // structurally immune and is NOT the reproducer here — parseHierarchical is.
+//
+// #6525: the configs below gained a top-level `interfaces ge-0/0/0 { ... }`
+// definition. They use the compact-leaf zone-membership spelling
+// `interfaces ge-0/0/0;`, which before #6525 compiled to an EMPTY member set —
+// so the strict zone-interface-defined gate passed vacuously and the missing
+// definition went unnoticed. Now the member actually lands in zone membership
+// and the gate (correctly) demands the interface exist.
 
 // TestHostInboundDupBlock4544ZoneMerges is the primary zone-level RED-on-revert
 // guard: two host-inbound-traffic blocks (block 1: system-services ssh; block 2:
@@ -28,6 +35,15 @@ import "testing"
 // lost) and this goes RED.
 func TestHostInboundDupBlock4544ZoneMerges(t *testing.T) {
 	tree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {
@@ -112,6 +128,15 @@ security {
 // distinct tokens across blocks all survive.
 func TestHostInboundDupBlock4544MergeDedups(t *testing.T) {
 	tree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {
@@ -157,6 +182,15 @@ security {
 func TestHostInboundDupBlock4544SingleBlockUnchanged(t *testing.T) {
 	// Zone-level single block.
 	ztree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+}
 security {
     zones {
         security-zone trust {

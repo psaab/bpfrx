@@ -974,6 +974,73 @@ membership (security boundary) loss that also hid the dropped interface from
 the strict `validateZoneInterfaceDefinedStrict` gate. Covered by
 `pkg/config/compiler_zone_interfaces_bracket_5248_test.go`.
 
+**The COMPACT-LEAF spelling puts the members on the STANZA's own Keys — reading
+only `prop.Children` compiles the zone with ZERO interfaces (#6525).** The
+`interfaces` stanza reaches the compiler in two structurally different shapes,
+and only one of them is reachable from `set`:
+
+| authored as | `interfaces` node | members live in |
+|---|---|---|
+| `interfaces { a; b; }` — BLOCK; also the ONLY shape `set` produces | `Keys=["interfaces"]` | `Children`, one node per member |
+| `interfaces a;` — COMPACT LEAF | `Keys=["interfaces","a"]` | the stanza's own `Keys[1:]`; `Children` nil |
+| `interfaces [ a b ];` | `Keys=["interfaces","a","b"]` | ditto (the lexer strips the brackets, #2419) |
+| `interfaces a { host-inbound-traffic {...} }` | `Keys=["interfaces","a"]` | `Keys[1:]`; `Children` is the member's **BODY**, not more members |
+
+`compileZones` iterated `prop.Children`, so every compact spelling ran the loop
+body ZERO times and the zone compiled with NO interfaces — cleanly, with no
+error and no warning. Both strict zone gates
+(`validateZoneInterfaceMembershipStrict`, `validateZoneInterfaceDefinedStrict`)
+then passed VACUOUSLY: they iterate `zone.Interfaces`, which was empty, so the
+two gates that exist specifically to protect zone membership were inert against
+a membership list that never arrived. Downstream, `UserspaceBoundLinuxInterfaces`
+skips any interface with `Zone == ""`, so the interface was never AF_XDP-bound
+and every policy naming that zone never applied to its traffic.
+
+Two traps in the fix, both live:
+
+- **`zoneInterfaceMembers(prop)` is the WRONG fix.** Its Keys loop starts at
+  index 0, which is a member name for a CHILD but the stanza keyword
+  `interfaces` for the stanza itself — it compiles a zone member literally named
+  `interfaces`. `zoneInterfaceMemberNodes` synthesizes a member node from
+  `prop.Keys[1:]` instead.
+- **Excluding the BODY matters as much as reading the Keys.** In the compact
+  with-body shape `prop.Children` holds the `host-inbound-traffic` node, and in
+  the hierarchical PACKED shape (`interfaces a host-inbound-traffic
+  system-services ssh;`) the body sits on the member's own Keys. Reading either
+  without excluding the body trades a silent DROP for a silent INVENTION — body
+  keywords promoted to interface names (measured on master:
+  `ifaces=[host-inbound-traffic system-services ssh]`). `zoneInterfaceMembers`
+  now truncates a member's Keys at a `zoneInterfaceBodyKeywords` token and stops
+  recursing there; that token set mirrors the schema (the interface-name
+  wildcard's only child is `host-inbound-traffic`) and must be kept in lockstep
+  with it.
+
+Normalizing the compact shape onto the block shape — rather than adding a second
+read path — keeps membership, the #5248 bracket flatten and the #6391 Keys-scoped
+override in ONE implementation; a second derivation is exactly how this defect
+class arises.
+
+**Fail-closed belt (#6525).** `validateZoneInterfacesNonEmptyStrict` rejects an
+`interfaces` stanza that CARRIES CONTENT yet contributes zero members, so any
+future shape the compiler cannot read is LOUD instead of silent. It asks the
+compiler's own reader (`zoneInterfaceStanzaMembers`) and runs on the
+group-expanded `*ConfigTree`, because a compiled `ZoneConfig` cannot distinguish
+"no stanza" from "a stanza that compiled to nothing". It deliberately does NOT
+fire on a stanza that carries nothing at all: `delete security zones
+security-zone <z> interfaces <if>` of the last member leaves the empty container
+behind (`deletePath` does not prune it), and rejecting that would make an
+ordinary edit uncommittable against a stanza that renders invisibly — the #4191
+over-rejection class. Strict on commit / commit-check, downgraded to a warning on
+the tolerant load / peer-sync paths (`lenientZoneInterfacesNonEmpty`, #1960
+no-brick). Covered by
+`pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`.
+
+REACHABILITY (honest bound): hierarchical text ingest only — `load override` /
+`load merge` / the persisted config file / HA `SyncApply`. `set` cannot produce
+the compact shape (`SetPath` always descends the `interfaces` container), and
+`show configuration | display set` round-trips safely. Those are still the boot
+path and the peer-sync path.
+
 **A per-interface `host-inbound-traffic` override is scoped by the KEYS of the
 node it is authored on, never by that node's CHILDREN (#6391).** The
 `zoneInterfaceMembers` flatten above is for zone MEMBERSHIP only — it recurses

@@ -1,3 +1,57 @@
+## 2026-08-01 — #6525: security-zone `interfaces` compact-leaf compiled ZERO interfaces
+
+- **Timestamp**: 2026-08-01 (fix/6525-zone-compact-leaf)
+- **Action**: `compileZones` iterated `prop.Children` for the `interfaces`
+  stanza and never read `prop` itself, so the hierarchical COMPACT-LEAF spelling
+  `security-zone untrust { interfaces ge-0/0/1.0; }` — member name on the
+  stanza's own `Keys[1]`, nil `Children` — ran the loop body ZERO times and the
+  zone compiled with NO interfaces, cleanly and without a warning. Both strict
+  zone gates (`validateZoneInterfaceMembershipStrict`,
+  `validateZoneInterfaceDefinedStrict`) then passed VACUOUSLY over the empty
+  slice, and downstream `UserspaceBoundLinuxInterfaces` skipped the interface
+  (`Zone == ""`) so it was never AF_XDP-bound and no policy naming the zone
+  applied to its traffic. The with-body variant was worse than a drop: the loop
+  ran once with the `host-inbound-traffic` BODY node mistaken for a member, so
+  the real member was dropped AND its body keywords compiled as phantom
+  interface names. Fixed by NORMALIZING the compact shape onto the block shape
+  (`zoneInterfaceMemberNodes` synthesizes one member node from `prop.Keys[1:]`
+  plus `prop.Children` as its body) so membership, the #5248 bracket flatten and
+  the #6391 Keys-scoped host-inbound override stay in ONE read path — a second
+  derivation is how this class arises. `zoneInterfaceMembers` now also truncates
+  a member's Keys at a body keyword and stops recursing there, which closes the
+  drop→invention trade for the hierarchical PACKED spelling (`interfaces a
+  host-inbound-traffic system-services ssh;`) in the block form too, where it
+  was already compiling three phantom members. Added the fail-closed belt
+  `validateZoneInterfacesNonEmptyStrict`: an `interfaces` stanza that carries
+  content yet contributes zero members is rejected on the strict
+  commit/commit-check path and warned on the tolerant load/peer-sync path
+  (`lenientZoneInterfacesNonEmpty`, #1960 no-brick). It deliberately does NOT
+  fire on a stanza carrying nothing at all — `delete ... interfaces <if>` of the
+  last member leaves the empty container behind (`deletePath` does not prune
+  it), so a blanket check would make an ordinary edit uncommittable against an
+  invisibly-rendered stanza (#4191 over-rejection class); a mutation confirmed
+  that. Four pre-existing tests were relying on the silent drop: their configs
+  used the compact-leaf spelling and never defined the interfaces, which only
+  compiled because the members never reached the defined gate — they now carry
+  the missing `interfaces` definitions.
+- **Validation**: `go build ./...` + `go vet ./...` clean; full Go suite green
+  (59 packages, exit 0). Eight mutations, each build+vet CLEAN with a real
+  assertion failure: normalization reverted to `prop.Children`; the issue's own
+  proposed fix (`prop.Keys` not sliced) which compiles a member named
+  `interfaces`; body-keyword truncation removed; body-on-Keys no longer stopping
+  child recursion; the #6391 override scope widened to `zoneInterfaceMembers`
+  (six pre-existing #6391 sibling-leak guards fired); the non-empty gate call
+  removed; the over-rejection carve-out removed; and an edge mutation collapsing
+  BOTH sides of the differential, which trips the count floor rather than
+  passing vacuously.
+- **File(s)**: pkg/config/compiler_security_zones.go,
+  pkg/config/compiler_validate_strict_zones.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_cluster_zone.go,
+  pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go,
+  pkg/config/host_inbound_dup_block_4544_test.go,
+  pkg/config/parser_ast_test.go, pkg/config/README.md,
+  docs/config-schema.md, _Log.md
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

@@ -140,7 +140,17 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 		for _, prop := range inst.node.Children {
 			switch prop.Name() {
 			case "interfaces":
-				for _, iface := range prop.Children {
+				// #6525: iterate the NORMALIZED member nodes, not prop.Children
+				// directly. The hierarchical COMPACT-LEAF spelling
+				// `interfaces ge-0/0/1.0;` carries the member name on the
+				// stanza's OWN Keys tail with nil Children, so a bare
+				// `range prop.Children` ran the body ZERO times and the zone
+				// compiled with no interfaces at all — silently, cleanly, and
+				// with both strict zone-membership gates then passing
+				// VACUOUSLY over the empty slice. zoneInterfaceMemberNodes
+				// rewrites that shape onto the block shape this loop already
+				// understands, so every spelling reaches the same body.
+				for _, iface := range zoneInterfaceMemberNodes(prop) {
 					// #5248: accumulate EVERY interface name this member node
 					// carries, across all parser AST shapes, not just the first.
 					// A bracketed flat-set / load-override membership list
@@ -237,10 +247,16 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 						// unchanged when dst is nil, so storing `hib` directly under
 						// several keys would alias ONE value across the members and a
 						// later in-place merge on one would surface on all of them.
-						for _, name := range iface.Keys {
-							if name == "" {
-								continue
-							}
+						//
+						// #6525: read the keys through zoneInterfaceMemberKeys
+						// rather than iface.Keys directly. It is iface.Keys
+						// TRUNCATED at the first body keyword, which is a no-op
+						// for every shape that existed before (`set` never puts
+						// a body keyword on Keys — it is always a child) and
+						// stops the compact-leaf packed spelling
+						// `interfaces a host-inbound-traffic ...` from keying
+						// the override on its own body tokens.
+						for _, name := range zoneInterfaceMemberKeys(iface) {
 							zone.InterfaceHostInbound[name] = mergeHostInbound(zone.InterfaceHostInbound[name], cloneHostInbound(hib))
 						}
 					}
@@ -304,7 +320,15 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 // silently dropped the rest (#5248). Recursing the nested chain and reading every
 // key at each level recovers all members. A `host-inbound-traffic` body under a
 // member is NOT an interface name — it is compiled separately (#3362) and skipped
-// here.
+// here, whether it arrives as a CHILD node (every shape `set` can author, plus
+// the ordinary hierarchical block) or, since #6525, as a token on the member's
+// own Keys (the hierarchical PACKED spelling `a host-inbound-traffic
+// system-services ssh`, which used to compile three phantom members).
+//
+// The caller passes MEMBER nodes, never the `interfaces` STANZA node — the
+// Keys loop starts at index 0, which is a member name for a child but the
+// stanza keyword `interfaces` for the stanza itself. Use
+// zoneInterfaceMemberNodes to normalize a stanza into member nodes (#6525).
 //
 // This helper is for zone MEMBERSHIP ONLY. Do NOT reuse it to scope a
 // per-interface host-inbound override: it recurses into CHILDREN, and a flat-set
@@ -312,20 +336,138 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 // above) while a subsequent `set ... interfaces a host-inbound-traffic ...`
 // reuses that same `a` container. Fanning an override across this member set
 // therefore opens the service on `b` for a config that scoped it to `a` alone —
-// the #6389 regression, closed unmerged. compileZones scopes the override on
-// `iface.Keys` instead, which separates the two shapes (#6391).
+// the #6389 regression, closed unmerged. compileZones scopes the override on the
+// member node's own KEYS instead (zoneInterfaceMemberKeys), which separates the
+// two shapes (#6391).
 func zoneInterfaceMembers(iface *Node) []string {
-	var names []string
-	for _, k := range iface.Keys {
-		if k != "" {
-			names = append(names, k)
-		}
+	names, hasBody := zoneInterfaceKeysBeforeBody(iface)
+	if hasBody {
+		// A body keyword landed on this node's OWN Keys, which means the
+		// statement was written in the packed spelling
+		// `<if> host-inbound-traffic system-services ssh` — everything from
+		// that token on is the member's BODY, including this node's CHILDREN
+		// (they are the body's contents, e.g. `system-services ssh`). Recursing
+		// them would promote body keywords to phantom interface names (#6525).
+		// The body itself is not compiled from this shape; that is the residual
+		// tracked separately (see the helper doc below).
+		return names
 	}
 	for _, child := range iface.Children {
-		if child.Name() == "host-inbound-traffic" {
+		if zoneInterfaceBodyKeywords[child.Name()] {
 			continue
 		}
 		names = append(names, zoneInterfaceMembers(child)...)
+	}
+	return names
+}
+
+// zoneInterfaceBodyKeywords is the set of tokens that may legally appear UNDER a
+// `security zones security-zone <z> interfaces <if>` member and are therefore
+// part of the member's BODY — never a member NAME. It mirrors the schema: the
+// interface-name wildcard's only child is `host-inbound-traffic`
+// (schema_security.go). Keep the two in lockstep; a body keyword missing from
+// this set is compiled as a phantom interface name, which then either fails the
+// strict zone-interface-DEFINED gate (loud) or, on the tolerant path, lands in
+// zone membership as an interface that does not exist (silent).
+var zoneInterfaceBodyKeywords = map[string]bool{
+	"host-inbound-traffic": true,
+}
+
+// zoneInterfaceKeysBeforeBody splits a member node's Keys at the first body
+// keyword: it returns the interface names that precede it, and whether one was
+// found. Empty keys are skipped.
+//
+// Before #6525 the caller read every key unconditionally. That is correct for
+// every shape `set` can author (SetPath always makes `host-inbound-traffic` a
+// CHILD node, never a Keys token) and for the ordinary hierarchical block, but
+// the hierarchical PACKED spelling puts the body on Keys:
+//
+//	interfaces { ge-0/0/0.0 host-inbound-traffic system-services ssh; }
+//	                        ^--------- body, not membership ---------^
+//
+// which compiled `host-inbound-traffic`, `system-services` and `ssh` as three
+// phantom zone members. Truncating at the body keyword drops them. The packed
+// body is NOT parsed into a per-interface override here — that is a separate
+// gap in the same #2419 packed-body class, deliberately out of scope for #6525
+// and filed on its own; the direction is fail-CLOSED (the override is absent, so
+// the interface admits only what the zone-level stanza admits) rather than the
+// fail-open a phantom membership would produce.
+func zoneInterfaceKeysBeforeBody(iface *Node) (names []string, hasBody bool) {
+	for _, k := range iface.Keys {
+		if k == "" {
+			continue
+		}
+		if zoneInterfaceBodyKeywords[k] {
+			return names, true
+		}
+		names = append(names, k)
+	}
+	return names, false
+}
+
+// zoneInterfaceMemberKeys returns the interface names a member node carries on
+// its OWN Keys — iface.Keys truncated at the first body keyword and with empty
+// keys dropped. This is the #6391 host-inbound override scope: the override
+// applies to every name in the node's Keys and NEVER to its children. See the
+// long comment at the override site in compileZones for why the two shapes it
+// separates are not interchangeable.
+func zoneInterfaceMemberKeys(iface *Node) []string {
+	names, _ := zoneInterfaceKeysBeforeBody(iface)
+	return names
+}
+
+// zoneInterfaceMemberNodes returns the MEMBER NODES of a `security zones
+// security-zone <z> interfaces` stanza node, normalizing the hierarchical
+// compact-leaf shape onto the block shape (#6525).
+//
+// The stanza reaches the compiler in two structurally different shapes:
+//
+//	BLOCK   `interfaces { a; b; }`  → Keys=["interfaces"], one child per member.
+//	                                  This is also the ONLY shape `set` can
+//	                                  produce: SetPath descends the `interfaces`
+//	                                  container and stores each member below it.
+//	COMPACT `interfaces a;`         → Keys=["interfaces","a"], Children=nil
+//	        `interfaces [ a b ];`   → Keys=["interfaces","a","b"], Children=nil
+//	        `interfaces a { ... }`  → Keys=["interfaces","a"], Children=BODY
+//
+// In the COMPACT shape the member names are on the STANZA's own Keys tail and
+// prop.Children — if present at all — holds the member's BODY, not more
+// members. compileZones iterated prop.Children directly, so the compact shape
+// ran the loop body zero times (member silently DROPPED, #6525) or, when a body
+// was present, ran it once with the BODY node mistaken for a member (member
+// dropped AND its body keywords compiled as phantom member names).
+//
+// Synthesizing one member node `Keys=prop.Keys[1:], Children=prop.Children`
+// makes every compact spelling take the identical code path as its block
+// equivalent, so membership, the #5248 bracket flatten and the #6391
+// Keys-scoped host-inbound override all stay in ONE implementation. In
+// particular the override still keys on the synthesized node's Keys, so
+// `interfaces [ a b ] { host-inbound-traffic {...} }` fans to a and b (the
+// multi-member intent of a body authored ON a bracket membership) while
+// `interfaces a { host-inbound-traffic {...} b; }` scopes it to `a` alone —
+// exactly what the block spellings of those two configs already did.
+//
+// Note prop.Keys[0] is the stanza keyword `interfaces` itself and is skipped;
+// passing prop straight to zoneInterfaceMembers (whose Keys loop starts at
+// index 0, correct for a CHILD) would compile a zone member literally named
+// `interfaces`.
+func zoneInterfaceMemberNodes(prop *Node) []*Node {
+	if len(prop.Keys) > 1 {
+		return []*Node{{Keys: prop.Keys[1:], Children: prop.Children}}
+	}
+	return prop.Children
+}
+
+// zoneInterfaceStanzaMembers returns every interface name an `interfaces`
+// STANZA node contributes to zone membership, across every AST shape. It is
+// exactly what compileZones accumulates for that stanza, factored out so the
+// fail-closed gate (validateZoneInterfacesNonEmptyStrict) asks the COMPILER'S
+// OWN reader whether the stanza named anything rather than re-deriving it — a
+// second derivation is precisely how this defect class arises.
+func zoneInterfaceStanzaMembers(prop *Node) []string {
+	var names []string
+	for _, iface := range zoneInterfaceMemberNodes(prop) {
+		names = append(names, zoneInterfaceMembers(iface)...)
 	}
 	return names
 }

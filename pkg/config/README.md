@@ -224,6 +224,27 @@ parser treats newlines as whitespace and merges multiple set lines into
 one giant node. This trap has bitten the project repeatedly — see
 CLAUDE.md.
 
+**A stanza's members can live on the STANZA's own Keys, not only in its
+children (#6525).** The dual-shape rule above has a third shape that is easy
+to miss because `set` cannot produce it: the hierarchical COMPACT LEAF.
+`security zones security-zone <z> interfaces ge-0/0/1.0;` lowers to
+`Node{Keys:["interfaces","ge-0/0/1.0"]}` with **nil Children**, so a compiler
+arm written as `for _, x := range prop.Children` runs ZERO times and the
+stanza compiles to nothing — silently. For zone membership that meant a zone
+with no interfaces at all: the interface was never AF_XDP-bound (it kept
+`Zone == ""`), every policy naming the zone applied to nothing, and both
+strict zone gates passed VACUOUSLY because they iterate the empty
+`zone.Interfaces`. When you add a compiler arm for a container stanza, read
+`prop.Keys[1:]` as well as `prop.Children` — and when the member can carry a
+BODY (here `host-inbound-traffic`), exclude the body from the member names in
+BOTH positions, or the fix trades a silent drop for a silent invention.
+`compileZones` normalizes the compact shape onto the block shape
+(`zoneInterfaceMemberNodes`, `compiler_security_zones.go`) so there is one
+read path, and `validateZoneInterfacesNonEmptyStrict`
+(`compiler_validate_strict_zones.go`) rejects a content-bearing stanza that
+still compiles to zero members. See `docs/config-schema.md` "The COMPACT-LEAF
+spelling…".
+
 **Interface-name canonicalization is not injective (#5832).**
 `LinuxIfName` only replaces `/` with `-`, so the DISTINCT authored names
 `ge-0/0/0` and `ge-0-0-0` collapse to the SAME Linux device / ifindex.

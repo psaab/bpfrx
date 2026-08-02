@@ -511,3 +511,115 @@ func validateHostInboundStanzaStrict(zone, ifName string, hib *HostInboundTraffi
 	}
 	return nil
 }
+
+// validateZoneInterfacesNonEmptyStrict rejects a `security zones security-zone
+// <z> interfaces` stanza that CARRIES CONTENT yet contributes ZERO members to
+// the zone (#6525). It is the fail-closed belt for the whole "restrictive-
+// looking config compiles to something weaker" class in this stanza: whatever
+// AST shape a future parser/schema change introduces, membership that the
+// compiler cannot read becomes LOUD instead of silent.
+//
+// The defect it was written for: the hierarchical COMPACT-LEAF spelling
+//
+//	security { zones { security-zone untrust { interfaces ge-0/0/1.0; } } }
+//
+// put the member name on the STANZA's own Keys tail with nil Children, so
+// compileZones — which iterated prop.Children — ran its body zero times and the
+// zone compiled with NO interfaces, cleanly and without a warning. The two
+// gates above then passed VACUOUSLY over the empty slice: the very gates that
+// exist to protect zone membership are inert against a membership list that
+// never arrives. Downstream the interface is left with Zone == "", which
+// dataplane/userspace.UserspaceBoundLinuxInterfaces skips, so it is never
+// AF_XDP-bound and every policy naming that zone never applies to its traffic.
+// compileZones now normalizes the compact shape (zoneInterfaceMemberNodes); this
+// gate makes the residue of the class impossible to ship silently.
+//
+// It asks the COMPILER'S OWN reader (zoneInterfaceStanzaMembers) whether the
+// stanza named anything, deliberately — a gate that re-derived membership from
+// the AST itself would be a second implementation, which is exactly how this
+// defect class arises. It therefore runs on the group-expanded, inactive-pruned
+// *ConfigTree rather than the compiled *Config: the compiled ZoneConfig cannot
+// distinguish "no interfaces stanza" from "a stanza that compiled to nothing".
+//
+// A stanza that carries NOTHING AT ALL — no member token on its Keys tail and no
+// child node — is NOT flagged. That is the residue `delete security zones
+// security-zone <z> interfaces <if>` leaves behind when the last member goes
+// (deletePath removes the member node but does not prune the now-empty
+// container, ast_edit.go), and it is what a bare hand-authored `interfaces;`
+// parses to. Neither declares a member, so neither can lose one; rejecting them
+// would make an ordinary "remove the last interface from this zone" edit
+// uncommittable, against a stanza that renders invisibly — the #4191
+// over-rejection class.
+//
+// Strict on the commit / commit-check path (CompileConfig — hard-reject, same as
+// the two zone-interface gates above, so the operator sees it while they are
+// editing); downgraded to a cfg.Warnings entry on the tolerant load / peer-sync
+// paths (CompileConfigLenient / CompileConfigForNodeLenient, flag
+// lenientZoneInterfacesNonEmpty) so an already-persisted or peer-synced config
+// that an older binary accepted still BOOTS (#1960 fail-closed-on-load
+// doctrine). On that tolerant path behavior is unchanged: the stanza contributed
+// no members before this gate existed and still contributes none, just with an
+// operator-visible warning.
+//
+// Zones are walked in the tree's source order, which is deterministic for a
+// given config, so the first-reported error is stable.
+func validateZoneInterfacesNonEmptyStrict(tree *ConfigTree) error {
+	if tree == nil {
+		return nil
+	}
+	// Mirrors the compile walk exactly: compileSections dispatches every
+	// top-level `security` node (duplicate roots merge in author order),
+	// compileSecurity every `zones` child, compileZones every `security-zone`
+	// instance via namedInstances.
+	for _, root := range tree.Children {
+		if root.Name() != "security" {
+			continue
+		}
+		for _, zonesNode := range root.Children {
+			if zonesNode.Name() != "zones" {
+				continue
+			}
+			for _, inst := range namedInstances(zonesNode.FindChildren("security-zone")) {
+				for _, prop := range inst.node.Children {
+					if prop.Name() != "interfaces" {
+						continue
+					}
+					if len(prop.Keys) <= 1 && len(prop.Children) == 0 {
+						// Declares nothing — see the doc above.
+						continue
+					}
+					if len(zoneInterfaceStanzaMembers(prop)) > 0 {
+						continue
+					}
+					return fmt.Errorf(
+						"security zone %q has an `interfaces` stanza (%s) that names no "+
+							"interface; the zone compiles with an EMPTY member set, so every "+
+							"interface the stanza was meant to cover is left with no zone — the "+
+							"dataplane never binds it and no policy naming this zone applies to "+
+							"its traffic, while the zone-membership and zone-interface-defined "+
+							"gates pass vacuously over the empty set — name a configured "+
+							"interface or remove the stanza",
+						inst.name, zoneInterfaceStanzaTokens(prop))
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// zoneInterfaceStanzaTokens renders the tokens an `interfaces` stanza node
+// actually carries, so the reject above quotes the operator's own text back at
+// them. A stanza that names no interface is by definition one whose content the
+// compiler could not read, so naming the offending tokens is the only way the
+// message is actionable.
+func zoneInterfaceStanzaTokens(prop *Node) string {
+	var toks []string
+	toks = append(toks, prop.Keys[1:]...)
+	for _, child := range prop.Children {
+		toks = append(toks, child.KeyPath())
+	}
+	if len(toks) == 0 {
+		return "empty"
+	}
+	return strings.Join(toks, " ")
+}
