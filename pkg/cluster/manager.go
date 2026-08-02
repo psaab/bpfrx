@@ -208,7 +208,9 @@ type Manager struct {
 	//
 	// One incarnation now emits exactly one session with a counter that is
 	// monotonic across heartbeat restarts, so the epoch floor leaves an attacker
-	// at most one session to replay and the ring rejects it on the watermark.
+	// at most heartbeatEpochSessionsPerEpoch sessions to replay PER EPOCH VALUE
+	// (heartbeatAuthState.highEpochSessions) and the ring rejects those on the
+	// watermark.
 	// Nothing regresses on the receiver: a heartbeat restart keeps the session
 	// and advances the counter, which the ring admits; a daemon restart builds a
 	// new Manager and so draws a fresh random session, which the ring admits as

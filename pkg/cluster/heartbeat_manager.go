@@ -556,20 +556,34 @@ type HeartbeatStats struct {
 	EpochDowngradeRejected uint64
 
 	// EpochSessionCollision counts frames refused because they claimed the
-	// FLOOR epoch under a session other than the one that raised it
-	// (heartbeatAuthState.highEpochSession).
+	// FLOOR epoch beyond the bound on how many sessions may be admitted at one
+	// epoch value (heartbeatAuthState.highEpochSessions,
+	// heartbeatEpochSessionsPerEpoch slots).
 	//
 	// It is the meter for the one case the floor's own value cannot order: two
 	// peer incarnations advertising the SAME epoch. Distinct sessions at one
-	// epoch are what let a replay churn the bounded ring, so they are refused —
-	// and a non-zero value says which of the two causes is in play. An attacker
-	// replaying a captured set that shares an epoch climbs it steadily while
-	// peer liveness is unaffected. A sender emitting a constant epoch across
-	// its own incarnations — a clock at or before the Unix epoch, whose store
-	// also never raises the seed — shows it climbing alongside a peer that
-	// keeps being declared dead. Neither is visible in the other two counters:
-	// such a frame carries an epoch (so it is not EpochlessAdmitted) and is not
-	// a downgrade (so it is not EpochDowngradeRejected).
+	// epoch are what let a replay churn the bounded ring, so past the bound they
+	// are refused — and a non-zero value says which of the two causes is in
+	// play.
+	//
+	// CLIMBING ALONGSIDE A PEER THAT KEEPS BEING DECLARED DEAD is a SENDER
+	// emitting one constant epoch across its own incarnations, and the first
+	// thing to check is a NON-WRITABLE /var on that node — a full filesystem, a
+	// quota, or a read-only remount. refineBootEpoch chains to persisted+1,
+	// which is a pure function of the file, so a store that READS but cannot
+	// WRITE hands every restart the identical value; the node's clock is
+	// irrelevant to this and is usually perfectly correct. `df` and a test write
+	// under /var/lib/xpf find it. The degenerate second cause — a clock at or
+	// before the Unix epoch, which makes bootEpochSeed return the literal 1 for
+	// every incarnation — is worth checking only after the store is ruled out.
+	// Either way the sender recovers once its epoch can move again; see
+	// pkg/cluster/README.md.
+	//
+	// CLIMBING WHILE PEER LIVENESS IS UNAFFECTED is an attacker replaying a
+	// captured set that shares an epoch. Neither cause is visible in the other
+	// two counters: such a frame carries an epoch (so it is not
+	// EpochlessAdmitted) and is not a downgrade (so it is not
+	// EpochDowngradeRejected).
 	EpochSessionCollision uint64
 
 	// PeerEpochLatched is the DOWNGRADE LATCH itself (heartbeatAuthState.

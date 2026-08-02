@@ -57,26 +57,31 @@ import (
 //
 // What the floor DOES buy is that an attacker cannot keep a retired incarnation
 // admitted indefinitely: sustained ring churn needs heartbeatReplaySessions+1
-// sessions the floor ADMITS, and the floor admits at most one session per epoch
-// VALUE. Measured on 65 captured epoch-bearing incarnations: 325/325 admitted on
-// the ascending pass, then 0/1625 across five further rounds.
+// sessions the floor ADMITS, and the floor admits at most
+// heartbeatEpochSessionsPerEpoch of them per epoch VALUE. Measured on 65
+// captured epoch-bearing incarnations: 325/325 admitted on the ascending pass,
+// then 0/1625 across five further rounds.
 //
-// "ONE SESSION PER EPOCH VALUE" IS THE LOAD-BEARING HALF, AND IT TOOK A SECOND
-// MECHANISM. The natural argument is "one incarnation emits exactly one session
+// THE PER-VALUE BOUND IS THE LOAD-BEARING HALF, AND IT TOOK A SECOND MECHANISM.
+// The natural argument is "one incarnation emits exactly one session
 // (Manager.heartbeatNonce, #6169 Stage 0), so distinct sessions are distinct
 // incarnations, so they carry distinct epochs and all but the newest sit below
 // the floor". The first two steps hold; the third does not. One session per
 // process does NOT imply one epoch per process, and the comparison against the
 // floor alone let equality through to the ring — so 65 captured incarnations
 // SHARING one valid epoch churned it exactly as epochless frames do (measured
-// 1625/1625 before heartbeatAuthState.highEpochSession existed).
+// 1625/1625 before heartbeatAuthState.highEpochSessions existed).
 //
-// Equal epochs are reachable rather than contrived: the wall-clock seed is
-// published before refinement and a failing store never raises it, and
-// bootEpochSeed returns the literal 1 for every incarnation of a node whose
-// clock reads at or before the Unix epoch. The floor therefore binds the SESSION
-// that raised it and refuses any other session claiming that same value; see
-// highEpochSession for the mechanism, its cost, and how it clears.
+// Equal epochs are reachable rather than contrived, and the reachable path runs
+// straight through THIS FILE: refineBootEpoch chains to prev+1, which is a pure
+// function of the persisted value, so whenever the persist half cannot advance
+// the file — an ordinary unwritable /var — every successive incarnation
+// republishes the identical epoch on a healthy, advancing clock. (bootEpochSeed
+// also returns the literal 1 for every incarnation of a node whose clock reads
+// at or before the Unix epoch, which is the degenerate case.) The floor
+// therefore admits a BOUNDED SET of sessions at one value and refuses the rest;
+// see highEpochSessions for why the bound is neither one nor unbounded, what it
+// still costs, and the sender-side alternative that was declined.
 //
 // The bound is then over DISTINCT EPOCH VALUES rather than over incarnations,
 // and it is finite for the same reason either way: the floor is monotone, so an
@@ -195,6 +200,21 @@ var epochFlock = unix.Flock
 // with the real clock. Production never replaces it.
 var epochNowNanos = func() int64 { return time.Now().UnixNano() }
 
+// epochRefineBeforeRelease is a test seam on the refine worker's exit path, for
+// the same reason epochFlock is one: the branch behind it is otherwise
+// unreachable from a test.
+//
+// It runs in startBootEpochRefine between the worker's first pending check and
+// the store that releases bootEpochRefining. That window is the ONLY one in
+// which a requester both loses the CAS (so it queues rather than spawning) and
+// stores its request too late for the check that just ran — i.e. the window the
+// re-claim step below the release exists to cover. It is nanoseconds wide in
+// production, so hammering does not reach it; without the seam the re-claim can
+// be deleted outright with the suite green.
+//
+// No-op by default and never set outside tests.
+var epochRefineBeforeRelease = func() {}
+
 // epochUsableAsFloor bounds what the receiver is willing to LATCH as its
 // high-water epoch.
 //
@@ -252,8 +272,8 @@ func epochUsableAsFloor(epoch uint64) bool {
 // is ADMITTED, not rejected — deliberately, because re-testing an
 // already-accepted epoch after a backward clock step is what declared a healthy
 // peer dead and went dual-master. See epochWithinForwardBound. (Equality has a
-// separate gate of its own — it is admitted only from the session that raised
-// the floor, see heartbeatAuthState.highEpochSession — but that gate is
+// separate gate of its own — it is admitted only from a session within the
+// per-value bound, see heartbeatAuthState.highEpochSessions — but that gate is
 // clock-INDEPENDENT, so it does not reintroduce the wall-clock sensitivity this
 // split exists to keep off the accept path.)
 //
@@ -424,8 +444,21 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 //     makes A exit before B re-refines, and that step is load-bearing.
 //
 // Both are characterized in
-// TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669, and both need the same
-// missing state as the mis-ordering itself, so they are tracked with it.
+// TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669, and they are tracked
+// with the mis-ordering — but they do NOT both need the same missing state, and
+// an earlier revision of this comment said they did.
+//
+// CONDITION 2 does: separating "a concurrent newer incarnation wrote it" from
+// "a predecessor wrote it after a backward clock step" needs a writer identity
+// or a lifetime-held liveness lock, which is where the leapfrog lives.
+//
+// CONDITION 1 needs neither. It needs A to RETRY ITS FAILED PERSIST, and the
+// code already does the right thing on a retry: A's published value is already
+// b+1, so `next := prev+1` is not > epoch, nothing ratchets, and the
+// WriteFileDurable is simply re-attempted. Once b+1 reaches the file, B's next
+// refreshBootEpoch reads it, raises to b+2 and is admitted. What is missing is
+// only a TRIGGER for that retry — the "no periodic re-check" half of #6724 —
+// which is a materially smaller change than a writer identity.
 //
 // Fails CLOSED: if the lock cannot be taken, the read-modify-write is SKIPPED
 // rather than run unlocked. A lock whose failure path executes the critical
@@ -670,8 +703,28 @@ func (m *Manager) refreshBootEpoch() {
 //
 // B is then below the peer's floor until some LATER heartbeat start, which
 // nothing bounds (#6724) and which may never come. Coalescing turns "the
-// request is lost" into "the request costs one extra pass", which is the whole
-// difference.
+// request is lost" into "the request costs one extra pass".
+//
+// FOR EVERY REQUEST BUT ONE, and stating it flat overstates it. The worker
+// re-checks the bit twice — once with the in-flight flag still held, once after
+// releasing it (the re-claim step, TestLateRefineRequestIsReclaimed_6669) — and
+// a request that stores the bit after the SECOND check has nobody left to serve
+// it:
+//
+//	R: CAS(refining, false->true) FAILS   (worker still in flight)
+//	W: clears pending; releases refining; re-claims pending -> nothing;
+//	   returns.                              <-- no worker left
+//	R: Store(pending, true)                  <-- nobody will serve it
+//
+// The window is the few instructions between W's final CompareAndSwap and its
+// return, and R must complete a whole lost CAS inside it. It survives as the
+// same bounded cost as the mis-ordering it recovers from — the request is
+// served at the next heartbeat start, which nothing bounds (#6724) — and the
+// stranded state is self-announcing rather than silent, since waitBootEpochIdle
+// hangs on exactly the bit that was left set. 3000 rounds x 4 concurrent
+// refreshBootEpoch did not reach it. Closing it needs the pending bit and the
+// in-flight flag to move together (one word, CAS'd as a pair), which is a
+// larger change than the drop it replaced.
 //
 // It is a BIT, not a queue, so the cost stays bounded: any number of requests
 // arriving during one pass collapse into a single follow-up, and a caller that
@@ -714,6 +767,7 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 				// the in-flight flag still held, so no second worker spawns.
 				continue
 			}
+			epochRefineBeforeRelease()
 			m.bootEpochRefining.Store(false)
 			// A request that lost the CAS between our check above and that
 			// store set the bit and returned expecting US to serve it. Nobody
@@ -831,13 +885,13 @@ func refineBootEpoch(path string, published *atomic.Uint64, lastWrote uint64) (w
 				// two hours slow still reads past the floor two real hours later,
 				// and a restart then publishes a value STRICTLY ABOVE it, which
 				// the peer admits on the raise path and which rebinds the floor
-				// to this incarnation. Strictly above, not "at equality": an
-				// earlier revision of this comment said equality, which was true
-				// while equality fell through to the ring unconditionally and is
-				// not now that the floor is session-bound (highEpochSession). The
-				// raise path is the wider door of the two anyway — a nanosecond
-				// of wall clock past the floor, rather than landing on one exact
-				// value — so the recovery is sooner, not later. Measured in
+				// to this incarnation. THE RAISE PATH IS THE ONE TO RELY ON, and
+				// not because equality is shut: a frame landing exactly ON the
+				// floor is admitted while a slot is free
+				// (heartbeatEpochSessionsPerEpoch, per value, no refill), so that
+				// door is real but finite. The raise is the wider one — a
+				// nanosecond of wall clock past the floor, rather than hitting
+				// one exact value — and it cannot be exhausted. Measured in
 				// TestPoisonedFloorStillRecoversByRaise_6669.
 				//
 				// What recovers it sooner still is fixing the clock, or a

@@ -695,12 +695,24 @@ func TestInitHeartbeatEpochStateNeverBlocks_6169(t *testing.T) {
 	}
 
 	// Release and drain so the worker cannot race t.TempDir cleanup.
+	//
+	// bootEpochReady IS NOT A FULL DRAIN, and treating it as one left this test
+	// leaking a worker into the rest of the package. It is closed when the FIRST
+	// attempt finishes, by contract (see startBootEpochRefine); the second and
+	// third calls above go through refreshBootEpoch, whose requests are COALESCED
+	// onto the running worker rather than dropped, so passes are still owed after
+	// it closes. The escaped worker then read epochNowNanos while a later test
+	// (senderIncarnationAt, TestArchivedEpochPoisonsAFreshFloor_6711) overrode
+	// it: a data race that failed `go test -race ./pkg/cluster/` 20 times out of
+	// 20 when those two tests ran together, and intermittently in the full suite.
+	// waitBootEpochIdle polls the pending bit as well, which is the actual drain.
 	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
 	select {
 	case <-m.bootEpochReady:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the refine worker never completed after the lock was released")
 	}
+	waitBootEpochIdle(t, m)
 }
 
 // TestStartHeartbeatReturnsWithAUsableEpoch_6169 answers the question deleting
@@ -809,7 +821,7 @@ func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	const liveSession = uint64(0x7701)
 	e.r.auth.mu.Lock()
 	e.r.auth.highEpoch = stepped
-	e.r.auth.highEpochSession = liveSession
+	e.r.auth.bindEpochSession(liveSession, true)
 	e.r.auth.epochSeen = true
 	e.r.auth.mu.Unlock()
 

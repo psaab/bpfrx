@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,18 +28,20 @@ import (
 // heartbeat_epoch_test.go hard-codes strictly increasing epochs (1000+i), so it
 // held constant the very variable the defect lives in.
 //
-// The fix binds the floor to the session that raised it
-// (heartbeatAuthState.highEpochSession). These tests pin the closed hole, the
-// live-peer path it must not break, and the recovery that replaces "admitted at
-// equality".
+// The fix binds the floor to a BOUNDED SET of sessions
+// (heartbeatAuthState.highEpochSessions, heartbeatEpochSessionsPerEpoch slots,
+// reset by a raise). Round 10 shipped that set as a singleton, which refused a
+// legitimate successor incarnation on every heartbeat — see
+// TestEqualEpochSuccessorIsAdmitted_6669. These tests pin the closed hole, the
+// live-peer path it must not break, and both doors out of a poisoned floor.
 
 // TestEqualEpochsCannotChurnTheRing_6669 is the fail-on-revert gate for the
 // equal-epoch replay hole.
 //
-// RED-on-revert: delete the `epoch == s.highEpoch && session !=
-// s.highEpochSession` rejection in admitAuthedLocked (or move it AFTER the
-// s.replay.admit call, which is the same ordering bug the floor itself has to
-// avoid) and both subtests go back to sustained admits.
+// RED-on-revert: delete the `epoch == s.highEpoch &&
+// !s.epochSessionAdmissible(session)` rejection in admitAuthedLocked (or move
+// it AFTER the s.replay.admit call, which is the same ordering bug the floor
+// itself has to avoid) and both subtests go back to sustained admits.
 func TestEqualEpochsCannotChurnTheRing_6669(t *testing.T) {
 	// ALL captures share ONE epoch. This is what a sender with a clock at or
 	// before the Unix epoch emits: bootEpochSeed returns the literal 1 for every
@@ -150,15 +153,22 @@ func TestFloorRebindsToTheRaisingIncarnation_6669(t *testing.T) {
 	}
 }
 
-// TestPoisonedFloorStillRecoversByRaise_6669 pins the claim that REPLACES
-// "a regressed sender that has climbed back to exactly the floor is admitted".
+// TestPoisonedFloorStillRecoversByRaise_6669 pins BOTH doors out of a poisoned
+// floor (#6711), which is the shape the equal-epoch bound changed.
 //
-// That statement was written when equality fell through to the ring
-// unconditionally. It is no longer the recovery path: the archived frame that
-// poisoned the floor (#6711) bound its OWN session, so the live peer at exactly
-// the floor is refused. What recovers it is the RAISE path — its epoch reaching
-// STRICTLY past the floor, which is one nanosecond of wall clock rather than
-// hitting a single value exactly, and is therefore the wider door of the two.
+// While equality fell through to the ring unconditionally, the only statement
+// was "a regressed sender that has climbed back to exactly the floor is
+// admitted". Round 10 replaced that with a singleton binding, which shut the
+// equality door completely — the archived frame had bound its own session, so
+// the live peer at exactly the floor was refused. The bound is now
+// heartbeatEpochSessionsPerEpoch rather than one, so BOTH doors are open and
+// each has a different shape:
+//
+//   - AT the floor, while a slot is free. Narrow (one exact value) and finite
+//     (the slots do not refill), but it is the door a legitimate successor
+//     incarnation that republished its predecessor's epoch comes through.
+//   - STRICTLY past the floor. One nanosecond of wall clock rather than an
+//     exact value, and never exhausted, so it is the wider of the two.
 func TestPoisonedFloorStillRecoversByRaise_6669(t *testing.T) {
 	e := newEpochEnv(t)
 	const archivedSession, liveSession = uint64(0xAAAA), uint64(0xBBBB)
@@ -173,9 +183,21 @@ func TestPoisonedFloorStillRecoversByRaise_6669(t *testing.T) {
 	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, liveSession, 1, floor-1000)) {
 		t.Fatal("a frame BELOW the floor was admitted")
 	}
-	// And AT it under its own session — this is the case that used to pass.
-	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, liveSession, 2, floor)) {
-		t.Fatal("a different session was admitted AT the floor; the equal-epoch churn is open")
+	// AT it under its own session: admitted, because a slot is free. This is the
+	// door a successor incarnation needs, and shutting it is what made a healthy
+	// node refused on every heartbeat.
+	if !e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, liveSession, 2, floor)) {
+		t.Fatal("the live peer was refused AT the floor with a slot free; a successor " +
+			"incarnation that republished its predecessor's epoch is locked out")
+	}
+	// But the door is FINITE. With the slots spent, a further session at the
+	// same value is refused however many times it asks — that is what keeps a
+	// shared-epoch capture set from churning the ring.
+	for c := 1; c <= 20; c++ {
+		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0xCCCC, uint64(c), floor)) {
+			t.Fatalf("frame %d from a third session was admitted at one epoch value; the "+
+				"equal-epoch churn is open", c)
+		}
 	}
 
 	// One nanosecond past: admitted, and the floor rebinds to the live peer.
@@ -264,6 +286,94 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 
 	if got := m.heartbeatBootEpoch(); got <= raised {
 		t.Fatalf("published epoch = %d, want > %d — the coalesced pass ran but did not chain "+
+			"from the value another incarnation left in the file", got, raised)
+	}
+}
+
+// TestLateRefineRequestIsReclaimed_6669 is the fail-on-revert gate for the
+// RE-CLAIM half of the coalescing fix, which nothing else binds.
+//
+// TestOverlappingRefineRequestIsCoalesced_6669 covers the request that lands
+// while the worker is still inside its pass — the worker's own pending check
+// sees it and `continue`s. The re-claim below the release covers the OTHER
+// window: a request that loses the CAS (so it queues rather than spawning a
+// worker) and stores the bit AFTER that check has already run. Nobody else will
+// serve it — the setter saw a worker in flight and returned — so without the
+// re-claim it is stranded with no worker running, and this node stays below its
+// peer's floor until some later heartbeat start that nothing bounds (#6724).
+//
+// The window is a few instructions wide in production, so hammering does not
+// reach it: 3000 rounds x 4 concurrent refreshBootEpoch never landed in it.
+// It is driven deterministically through the epochRefineBeforeRelease seam.
+//
+// RED-on-revert: delete the re-claim step in startBootEpochRefine (everything
+// between `m.bootEpochRefining.Store(false)` and the loop's closing brace,
+// returning instead) and the second pass never runs.
+func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+
+	var passes atomic.Int64
+	entered := make(chan int, 8)
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		if n := passes.Add(1); n >= 2 {
+			entered <- int(n)
+		}
+		return origFlock(fd, how)
+	}
+	t.Cleanup(func() { epochFlock = origFlock })
+
+	atRelease := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var once sync.Once
+	origHook := epochRefineBeforeRelease
+	epochRefineBeforeRelease = func() {
+		once.Do(func() {
+			close(atRelease)
+			<-releaseWorker
+		})
+	}
+	t.Cleanup(func() { epochRefineBeforeRelease = origHook })
+
+	m.initHeartbeatEpochState()
+	select {
+	case <-atRelease:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refine worker never reached its release point")
+	}
+
+	// Pass 1 is COMPLETE (it has read, written and checked pending) but the
+	// in-flight flag is still held, so this request loses the CAS and queues —
+	// too late for the check that just ran.
+	if !m.bootEpochRefining.Load() {
+		t.Fatal("the worker released the in-flight flag before the seam; the window this " +
+			"test drives is not the one the re-claim covers")
+	}
+	m.refreshBootEpoch()
+	if !m.bootEpochRefinePending.Load() {
+		t.Fatal("the request did not queue: it either spawned a second worker or was dropped")
+	}
+
+	// Another incarnation raises the file. Pass 1 has already read AND written,
+	// so only a second pass can carry it — which is exactly what the queued
+	// request is for.
+	raised := m.heartbeatBootEpoch() + uint64(time.Hour)
+	if err := os.WriteFile(path, []byte(strconv.FormatUint(raised, 10)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseWorker)
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("only %d refine pass(es) ran: a request that queued AFTER the worker's own "+
+			"pending check was STRANDED with no worker to serve it", passes.Load())
+	}
+	waitBootEpochIdle(t, m)
+
+	if got := m.heartbeatBootEpoch(); got <= raised {
+		t.Fatalf("published epoch = %d, want > %d — the re-claimed pass ran but did not chain "+
 			"from the value another incarnation left in the file", got, raised)
 	}
 }

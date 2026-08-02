@@ -577,25 +577,30 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 //
 // What survives is narrower and is what the paragraph above actually needs:
 // SUSTAINED churn still requires heartbeatReplaySessions+1 captured sessions the
-// floor ADMITS, and the floor admits at most ONE SESSION PER EPOCH VALUE. So
+// floor ADMITS, and the floor admits at most heartbeatEpochSessionsPerEpoch of
+// them PER EPOCH VALUE — a constant far below the ring's 64 slots. So
 // epoch-BEARING captures buy a finite ascending pass rather than an indefinite
 // one — measured on 65 captured epoch-bearing incarnations against a fresh
 // receiver: 325/325 admitted on the ascending pass, then 0/1625 across five
 // further rounds. It is the epoch-LESS captures that stay indefinitely
 // churnable, which is what the downgrade latch exists for.
 //
-// "ONE SESSION PER EPOCH VALUE" IS NOT A COROLLARY OF "ONE SESSION PER
-// INCARNATION", and an earlier revision of this comment derived it as one. The
-// derivation was: one incarnation emits exactly one session (#6169 Stage 0), so
-// distinct sessions are distinct incarnations, so their epochs differ and all
-// but the newest are below the floor. The last step is the false one — nothing
-// stops two incarnations publishing the SAME epoch, and `epoch == highEpoch`
-// falls through to the ring, so 65 captures sharing one valid epoch churned it
-// exactly as epochless frames do (measured 1625/1625). Reachable whenever the
-// sender's epoch does not move between incarnations: bootEpochSeed returns the
-// literal 1 under a clock at or before the Unix epoch, and a store that never
-// completes never raises it. The floor therefore also binds the SESSION that
-// raised it — see the highEpochSession field.
+// THE PER-VALUE BOUND IS NOT A COROLLARY OF "ONE SESSION PER INCARNATION", and
+// an earlier revision of this comment derived it as one. The derivation was: one
+// incarnation emits exactly one session (#6169 Stage 0), so distinct sessions
+// are distinct incarnations, so their epochs differ and all but the newest are
+// below the floor. The last step is the false one — nothing stops two
+// incarnations publishing the SAME epoch, and `epoch == highEpoch` fell through
+// to the ring for every session, so 65 captures sharing one valid epoch churned
+// it exactly as epochless frames do (measured 1625/1625). Reachable whenever the
+// sender's epoch does not move between incarnations, which takes neither a dead
+// clock nor a dead store: refineBootEpoch chains to prev+1, a pure function of
+// the state FILE, so a store that reads but cannot WRITE republishes one value
+// across every incarnation on a healthy advancing clock. (bootEpochSeed also
+// returns the literal 1 under a clock at or before the Unix epoch, which is the
+// degenerate case where nothing orders anything.) The floor therefore binds a
+// BOUNDED SET of sessions per value — see the highEpochSessions field for why
+// the bound is neither one nor unbounded.
 //
 // The ring is retained and still owns within-incarnation replay. It does NOT
 // cause a genuine-peer lockout (an evicted live-peer watermark just makes the
@@ -619,6 +624,36 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // (hbNonceOnce) and only advances the counter, so a restart no longer
 // re-anchors. See TestHeartbeatNonceIsIncarnationScoped_6169.
 const heartbeatReplaySessions = 64
+
+// heartbeatEpochSessionsPerEpoch is how many DISTINCT peer sessions may be
+// admitted at one boot-epoch VALUE (heartbeatAuthState.highEpochSessions).
+//
+// It is the whole knob in the equal-epoch trade-off, and both ends of its range
+// are wrong for reasons that have been measured, not argued:
+//
+//   - 1 (round 10 of #6669 shipped this) refuses every successor incarnation
+//     that publishes its predecessor's epoch, and that is REACHABLE on a
+//     healthy, advancing clock: refineBootEpoch chains to exactly prev+1, which
+//     is a pure function of the file, so a store that reads but cannot WRITE
+//     hands every successive incarnation the identical value. Measured through
+//     initHeartbeatEpochState over a write-failing directory: 0/40 heartbeats
+//     from the second incarnation admitted, which declares a healthy node dead
+//     in 1s at the shipped 200ms interval and threshold 5.
+//   - unbounded (pre-round-10) is the #6169 replay hole itself: 65 captured
+//     incarnations sharing one epoch churned the ring 1625/1625.
+//
+// Any finite bound keeps the security property, because the floor is monotone:
+// at most this many sessions are ever admitted at a given value, so an
+// attacker's capture set buys a finite ascending pass and NOTHING sustained.
+// The bound must not be refilled by anything an attacker can produce — in
+// particular not by the bound session going quiet, which is free (wait out the
+// dead-peer interval between captures) and restores unbounded admissions.
+//
+// 2 is the smallest value that admits a legitimate successor at an unchanged
+// epoch, and it is far below heartbeatReplaySessions so the sessions bound at
+// one value can never evict each other from the ring. What it does NOT cover is
+// stated where the cost is: see heartbeatAuthState.highEpochSessions.
+const heartbeatEpochSessionsPerEpoch = 2
 
 // replaySessionMark is one remembered (session, high-water counter) pair.
 type replaySessionMark struct {
@@ -745,48 +780,102 @@ type heartbeatAuthState struct {
 	// epoch" sentinel, so it can never be a real floor.
 	highEpoch uint64
 
-	// highEpochSession is the peer SESSION id that raised highEpoch, and it is
-	// what makes the floor bound the ring rather than merely order it.
+	// highEpochSessions are the peer SESSION ids admitted at exactly highEpoch,
+	// and highEpochSessionCount is how many slots are in use. BOUNDING that set
+	// is what makes the floor bound the ring rather than merely order it. Both
+	// are reset by a raise, so they describe the CURRENT floor value only, and
+	// both are meaningless while highEpoch is 0.
 	//
 	// The floor's whole security value is the step "sustained ring churn needs
 	// heartbeatReplaySessions+1 sessions the floor admits, and one incarnation
 	// emits exactly one session (Manager.heartbeatNonce, #6169 Stage 0)". That
 	// step needs DISTINCT SESSIONS TO IMPLY DISTINCT EPOCHS, and the comparison
-	// against highEpoch alone does not give it: `epoch == highEpoch` falls
-	// through to the ring, so any number of distinct sessions sharing ONE valid
-	// epoch are all admitted at the floor and churn the ring exactly as
-	// epochless frames do. Measured before this field existed: 65 captured
+	// against highEpoch alone does not give it: `epoch == highEpoch` fell
+	// through to the ring for every session, so any number of them sharing ONE
+	// valid epoch were admitted at the floor and churned the ring exactly as
+	// epochless frames do. Measured before this bound existed: 65 captured
 	// incarnations sharing one epoch -> 325/325 admitted on the first pass and
 	// 1625/1625 across five further rounds, against 0/1625 for the same 65 with
 	// strictly increasing epochs.
 	//
-	// Equal epochs across incarnations are REACHABLE, so this is not a
-	// theoretical gap. The wall-clock seed is published before refinement and a
-	// failing store never raises it (heartbeat_epoch.go), and bootEpochSeed
-	// returns the literal 1 for every incarnation on a box whose clock reads at
-	// or before the Unix epoch — a dead RTC. Under that pair of faults the
-	// sender emits one constant epoch across all of its incarnations.
-	//
-	// So the floor pins ONE incarnation, identified by its session, at its
-	// value: a frame at exactly highEpoch is admitted only from the session
-	// that raised it, and any other session claiming that epoch is refused
+	// So a frame at exactly highEpoch is admitted only from a session already
+	// bound here, or from a new one while a slot is free; any other is refused
 	// BEFORE the ring (the same ordering the floor itself needs — see
-	// admitAuthed). Raising the floor rebinds it.
+	// admitAuthed) and counted as epochSessionCollision. A raise rebinds to the
+	// raising session alone.
 	//
-	// WHAT THIS COSTS is one narrow case, and it is bounded rather than
-	// permanent: a peer incarnation whose epoch is EXACTLY a previous
-	// incarnation's is refused until its epoch moves at all. Any raise clears
-	// it — a nanosecond of wall clock, or one successful refineBootEpoch pass
-	// (which persists prev+1). It becomes durable only under the dead-clock AND
-	// dead-store pair above, which is precisely the regime in which the sender
-	// publishes no order at all and the epoch mechanism can distinguish
-	// nothing. Counted as epochSessionCollision so that regime is visible
-	// rather than inferred.
+	// WHY THE SET IS NOT A SINGLETON — this is the part round 10 got wrong, and
+	// its cost was larger than the hole it closed. Equal epochs across
+	// incarnations were said to need "a dead clock AND a dead store", the regime
+	// in which the sender publishes no order at all. That is false. The reachable
+	// regime needs neither:
 	//
-	// It is 0 whenever highEpoch is 0. A peer session id of 0 is possible
-	// (crypto/rand) at ~2^-64 and needs no special case: it binds and compares
-	// like any other value.
-	highEpochSession uint64
+	//   - the state file holds a value AHEAD of now but inside bootEpochMaxSkew
+	//     — an RTC that ran fast and was corrected back by NTP. Beyond an hour
+	//     refineBootEpoch declines to chain; inside it, chaining is mandatory,
+	//     and it is the case persistence exists for;
+	//   - the store READS but cannot WRITE (ENOSPC/EDQUOT/EACCES on /var — an
+	//     ordinary appliance fault, and one that tends to CAUSE restarts). The
+	//     .lock already exists so withEpochFileLock takes it and os.ReadFile
+	//     succeeds; only WriteFileDurable's temp file fails;
+	//   - a restart inside that window.
+	//
+	// refineBootEpoch then chains with `if next := prev + 1; next > epoch`,
+	// which is a pure function of the FILE. With the persist half unable to
+	// advance it, every successive incarnation reads the same prev and publishes
+	// exactly prev+1 — on a healthy advancing clock, with visibly different
+	// seeds and sessions. REFINEMENT, which the round-10 text offered as the
+	// escape ("one successful pass, which persists prev+1"), is the equal-epoch
+	// GENERATOR whenever persist fails. Measured through the production entry
+	// point (Manager.initHeartbeatEpochState) over a write-failing directory,
+	// two Managers, real signed frames through the real readLoop gate: identical
+	// epochs, and 0/40 heartbeats from the second incarnation admitted at a
+	// singleton bound, against 40/40 with no bound at all. That refusal returns
+	// false here, so readLoop continues BEFORE r.lastSeen.Store — the peer
+	// declares a healthy node dead in 1s at the shipped 200ms interval and
+	// threshold 5 and takes over its RGs while it still holds them.
+	//
+	// WHAT IT STILL COSTS, stated as the bound actually is. A successor beyond
+	// the heartbeatEpochSessionsPerEpoch-th at one unchanged epoch value IS
+	// refused, and refused for its whole process lifetime: bootEpoch is set once
+	// under bootEpochOnce, and re-refinement lands on the same prev+1 every pass
+	// (prev+1 > prev+1 is false), so nothing recovers it in-process. Recovery
+	// needs the wall clock to climb past prev+1 AND another restart, i.e. up to
+	// however far the file leads the clock — at most bootEpochMaxSkew, one hour.
+	// So the honest statement is NOT "only under a dead clock and a dead store":
+	// it is DURABLE ACROSS EVERY RESTART IN A WINDOW UP TO bootEpochMaxSkew
+	// WHENEVER THE PERSIST HALF CANNOT ADVANCE THE FILE, and the bound buys
+	// heartbeatEpochSessionsPerEpoch-1 restarts inside it rather than removing
+	// it. epochSessionCollision is what makes that regime visible; a
+	// non-writable /var is the first thing to check when it climbs.
+	//
+	// TWO ALTERNATIVES WERE PRICED AND DECLINED.
+	//
+	// Rebinding when the bound session goes QUIET would cover every successor.
+	// It also hands the attack back: waiting out the dead-peer interval between
+	// captures is free, so 65 captures sharing one epoch become 65 rebinds and
+	// then 65 more, and the finite-admissions property — the only thing the
+	// floor buys against a shared epoch — is gone. A budget refilled by silence
+	// is refilled by the attacker.
+	//
+	// Fixing the GENERATOR so it stops emitting equal epochs cannot replace this
+	// bound, only narrow it. The collision is deterministic precisely because
+	// prev+1 is a pure function of the file, and the only local source of
+	// distinctness is this incarnation's own entropy — so any generator fix is
+	// PROBABILISTIC (a jittered chain collides at 2^-j rather than never) and,
+	// worse, has no entropy to draw on in the case that motivated the mechanism:
+	// a clock at or before the Unix epoch with NO chainable file makes
+	// bootEpochSeed return the literal 1 for every incarnation, with nothing to
+	// jitter. A receiver-side bound is needed in every regime; a sender-side
+	// jitter is needed in none of them on its own. It is therefore left out
+	// rather than stacked on top, and the residual above is stated instead.
+	//
+	// A peer session id of 0 is possible (crypto/rand) at ~2^-64 and needs no
+	// special case: it binds and compares like any other value, because
+	// membership is decided against highEpochSessionCount and never against a
+	// zero sentinel.
+	highEpochSessions     [heartbeatEpochSessionsPerEpoch]uint64
+	highEpochSessionCount int
 
 	// epochSeen is the DOWNGRADE LATCH: an epoch-bearing frame has been accepted
 	// from this peer, and admitAuthedLocked refuses an epochless one from now
@@ -941,11 +1030,12 @@ type heartbeatAuthState struct {
 	epochDowngradeRejected atomic.Uint64
 
 	// epochSessionCollision counts frames refused because they claimed the
-	// floor epoch under a session other than the one that raised it (see
-	// highEpochSession). A non-zero value means either an on-link attacker
-	// replaying a captured set that shares one epoch, or a sender emitting a
-	// constant epoch across incarnations — a dead clock whose store also never
-	// raises the seed. Both are things an operator must see, and neither is
+	// floor epoch beyond the bound on sessions at that value (see
+	// highEpochSessions). A non-zero value means either a sender emitting one
+	// constant epoch across its own incarnations — most often a store that
+	// cannot WRITE, so refinement republishes prev+1 unchanged — or an on-link
+	// attacker replaying a captured set that shares one epoch. Both are things
+	// an operator must see, and neither is
 	// visible in the other two counters: such a frame carries an epoch, so it
 	// is not epochlessAdmitted, and it is not a downgrade, so it is not
 	// epochDowngradeRejected.
@@ -984,17 +1074,23 @@ type heartbeatAuthState struct {
 //     retired one is admitted above.
 //   - epoch == highEpoch — an incarnation at the floor. Fall through to the
 //     ring, which is what handles within-incarnation replay (unchanged #6167
-//     behaviour) — but ONLY for the session that raised the floor.
-//     Equality MUST fall through for the bound session: the live peer signs
+//     behaviour) — but only for a BOUNDED set of sessions at that value
+//     (heartbeatEpochSessionsPerEpoch slots, reset by a raise).
+//     Equality MUST fall through for a bound session: the live peer signs
 //     every frame of its incarnation with one epoch, so rejecting equality
-//     outright would declare a healthy peer dead. It must NOT fall through for
-//     any other session: distinct sessions sharing one epoch churn the ring
-//     exactly as epochless frames do (measured 1625/1625). See highEpochSession.
-//     A regressed sender recovers by RAISING past the floor rather than by
-//     landing exactly on it — an earlier revision of this comment said equality
-//     was the recovery. Strictly past is the wider door anyway (a nanosecond of
-//     wall clock, versus hitting one value exactly), and it is what
-//     TestPoisonedFloorStillRecoversByRaise_6669 measures.
+//     outright would declare a healthy peer dead. It must NOT fall through
+//     without a bound: distinct sessions sharing one epoch churn the ring
+//     exactly as epochless frames do (measured 1625/1625). And the bound
+//     cannot be ONE — a successor incarnation republishes its predecessor's
+//     epoch whenever the store cannot advance the file, so a singleton refused
+//     a healthy node on every heartbeat (measured 0/40). See
+//     highEpochSessions for both measurements and the residual.
+//     A regressed sender therefore has two doors out of a poisoned floor:
+//     landing exactly ON it while a slot is free, or RAISING past it. Strictly
+//     past is the wider (a nanosecond of wall clock, versus hitting one value
+//     exactly) and the only one that cannot be exhausted; an earlier revision
+//     of this comment named equality alone, and round 10 shut it entirely.
+//     TestPoisonedFloorStillRecoversByRaise_6669 measures both.
 //   - epoch > highEpoch — an incarnation newer than anything accepted so far
 //     (genuinely newer while the sender's clock advances; #6711 is when it is
 //     merely a higher reading from an older one). Let the ring vet the
@@ -1070,17 +1166,23 @@ type heartbeatAuthState struct {
 //     retired one is admitted above.
 //   - epoch == highEpoch — an incarnation at the floor. Fall through to the
 //     ring, which is what handles within-incarnation replay (unchanged #6167
-//     behaviour) — but ONLY for the session that raised the floor.
-//     Equality MUST fall through for the bound session: the live peer signs
+//     behaviour) — but only for a BOUNDED set of sessions at that value
+//     (heartbeatEpochSessionsPerEpoch slots, reset by a raise).
+//     Equality MUST fall through for a bound session: the live peer signs
 //     every frame of its incarnation with one epoch, so rejecting equality
-//     outright would declare a healthy peer dead. It must NOT fall through for
-//     any other session: distinct sessions sharing one epoch churn the ring
-//     exactly as epochless frames do (measured 1625/1625). See highEpochSession.
-//     A regressed sender recovers by RAISING past the floor rather than by
-//     landing exactly on it — an earlier revision of this comment said equality
-//     was the recovery. Strictly past is the wider door anyway (a nanosecond of
-//     wall clock, versus hitting one value exactly), and it is what
-//     TestPoisonedFloorStillRecoversByRaise_6669 measures.
+//     outright would declare a healthy peer dead. It must NOT fall through
+//     without a bound: distinct sessions sharing one epoch churn the ring
+//     exactly as epochless frames do (measured 1625/1625). And the bound
+//     cannot be ONE — a successor incarnation republishes its predecessor's
+//     epoch whenever the store cannot advance the file, so a singleton refused
+//     a healthy node on every heartbeat (measured 0/40). See
+//     highEpochSessions for both measurements and the residual.
+//     A regressed sender therefore has two doors out of a poisoned floor:
+//     landing exactly ON it while a slot is free, or RAISING past it. Strictly
+//     past is the wider (a nanosecond of wall clock, versus hitting one value
+//     exactly) and the only one that cannot be exhausted; an earlier revision
+//     of this comment named equality alone, and round 10 shut it entirely.
+//     TestPoisonedFloorStillRecoversByRaise_6669 measures both.
 //   - epoch > highEpoch — an incarnation newer than anything accepted so far
 //     (genuinely newer while the sender's clock advances; #6711 is when it is
 //     merely a higher reading from an older one). Let the ring vet the
@@ -1114,9 +1216,9 @@ type heartbeatAuthState struct {
 // subsequent frame from a healthy, already-latched incarnation fail the bound
 // and be rejected BEFORE the monotonic lastSeen update, so the peer was
 // declared dead in ~500ms and the cluster went dual-master. At epoch ==
-// highEpoch the frame therefore falls through to the ring (for the bound
-// session — see highEpochSession), which is correct: equality cannot move the
-// floor, so the one-way door is untouched either way.
+// highEpoch the frame therefore falls through to the ring (for a session within
+// the per-value bound — see highEpochSessions), which is correct: equality
+// cannot move the floor, so the one-way door is untouched either way.
 //
 // The second-order consequence is the safe direction and is deliberate: a peer
 // whose clock runs more than an hour ahead cannot RAISE the floor, and because
@@ -1163,16 +1265,21 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	if epoch < s.highEpoch {
 		return false
 	}
-	// ONE INCARNATION PER EPOCH. Equality falls through to the ring — it must,
-	// because the live peer signs every one of its frames with the same epoch —
-	// but only for the SESSION that raised the floor. Without this, distinct
+	// A BOUNDED NUMBER OF INCARNATIONS PER EPOCH VALUE. Equality falls through
+	// to the ring — it must, because the live peer signs every one of its frames
+	// with the same epoch — but only for a session already bound at this floor,
+	// or for a new one while a slot is free. Without any bound, distinct
 	// sessions sharing one valid epoch are all admitted at the floor and churn
-	// the ring exactly as epochless frames do (measured 1625/1625). This runs
-	// BEFORE s.replay.admit for the same reason the floor itself does:
+	// the ring exactly as epochless frames do (measured 1625/1625); with a
+	// singleton bound, a legitimate successor incarnation that republished its
+	// predecessor's epoch is refused on every heartbeat (measured 0/40). This
+	// runs BEFORE s.replay.admit for the same reason the floor itself does:
 	// admit() RECORDS a never-seen session as a side effect, so a check placed
-	// after it would evict a live watermark while rejecting. See
-	// highEpochSession for the cost and how it clears.
-	if epoch == s.highEpoch && session != s.highEpochSession {
+	// after it would evict a live watermark while rejecting. The binding itself
+	// is recorded only once the frame is actually admitted, below, so a frame
+	// the ring refuses cannot spend a slot. See highEpochSessions for the bound,
+	// its residual cost, and the two alternatives that were declined.
+	if epoch == s.highEpoch && !s.epochSessionAdmissible(session) {
 		s.epochSessionCollision.Add(1)
 		return false
 	}
@@ -1237,12 +1344,58 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	s.epochSeen = true
 	if epoch > s.highEpoch {
 		s.highEpoch = epoch
-		// Rebind the floor to THIS incarnation. The two must move together: a
-		// floor whose bound session is stale would refuse the very peer that
-		// just raised it.
-		s.highEpochSession = session
+		// Rebind the floor to THIS incarnation, DISCARDING the sessions bound at
+		// the old value. The two must move together: a floor whose bound
+		// sessions are stale would refuse the very peer that just raised it, and
+		// carrying them forward would let one epoch value's budget be spent at
+		// the next. The discarded sessions are below the floor from here on and
+		// are refused by the `epoch < s.highEpoch` test above.
+		s.bindEpochSession(session, true)
+	} else {
+		// epoch == s.highEpoch: admissibility was decided above, so this either
+		// re-affirms a session already bound or consumes a free slot.
+		s.bindEpochSession(session, false)
 	}
 	return true
+}
+
+// epochSessionAdmissible reports whether a frame claiming exactly highEpoch may
+// proceed from this session. It is a pure predicate: the caller records the
+// binding with bindEpochSession only after the frame is actually admitted.
+//
+// s.mu must be held.
+func (s *heartbeatAuthState) epochSessionAdmissible(session uint64) bool {
+	for i := 0; i < s.highEpochSessionCount; i++ {
+		if s.highEpochSessions[i] == session {
+			return true
+		}
+	}
+	return s.highEpochSessionCount < len(s.highEpochSessions)
+}
+
+// bindEpochSession records session as one of the incarnations admitted at the
+// current floor. reset drops every previous binding, which is what a raise
+// does; otherwise the session is added if it is not already present and a slot
+// is free. Adding when the set is full is a no-op rather than an eviction —
+// evicting would make the budget refillable and hand an attacker back the
+// unbounded churn the bound exists to stop.
+//
+// s.mu must be held.
+func (s *heartbeatAuthState) bindEpochSession(session uint64, reset bool) {
+	if reset {
+		s.highEpochSessions[0] = session
+		s.highEpochSessionCount = 1
+		return
+	}
+	for i := 0; i < s.highEpochSessionCount; i++ {
+		if s.highEpochSessions[i] == session {
+			return
+		}
+	}
+	if s.highEpochSessionCount < len(s.highEpochSessions) {
+		s.highEpochSessions[s.highEpochSessionCount] = session
+		s.highEpochSessionCount++
+	}
 }
 
 // peerEpochFloor reports the highest peer boot epoch accepted so far (0 when

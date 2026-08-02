@@ -67069,3 +67069,86 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go (new),
   pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_auth_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+## 2026-08-01 18:59 — #6669 fold round 11: the equal-epoch bound was a singleton, and that refused a HEALTHY node
+- **Action**: Fold the round-8 review's MAJOR and two MINORs on PR #6669
+  (`fix/6169-heartbeat-boot-epoch-v2`, head `3aced9e80`).
+- **MAJOR — round 10's fix cost more than the hole it closed, and it is this
+  PR's regression.** Round 10 bound the epoch floor to EXACTLY ONE session
+  (`highEpochSession`) and claimed the resulting lockout was "durable only under
+  the dead-clock AND dead-store pair, the regime in which the sender publishes
+  no order at all" (`heartbeat.go`, `heartbeat_manager.go`, `README.md`, three
+  verbatim copies). That is false. `refineBootEpoch` chains with
+  `if next := prev + 1; next > epoch`, which is a pure function of the FILE, so
+  a store that READS but cannot WRITE hands every successive incarnation the
+  identical epoch — on a healthy, advancing clock. Refinement, which the prose
+  offered as the escape, is the equal-epoch GENERATOR whenever persist fails.
+  REPRODUCED FIRSTHAND through the production entry point
+  (`m.initHeartbeatEpochState()`, what `StartHeartbeat` calls): two Managers
+  over a write-failing directory, `.lock` pre-created so the read-modify-write
+  runs, file 30 min ahead (an RTC corrected back by NTP, inside
+  `bootEpochMaxSkew`); real signed frames through the real `readLoop` gate ->
+  `file=1785636088974200628`, both incarnations publish `...629` with different
+  sessions, and the successor is admitted **0/40**. With only the round-10 check
+  removed: **40/40, collisions=0**, `go build ./pkg/cluster/` rc 0 in both
+  states. The refusal returns false before `r.lastSeen.Store`, so at the shipped
+  200 ms interval and threshold 5 the peer declares a healthy node dead in 1 s.
+- **Direction chosen**: the reviewer's shape — a small constant `k`
+  (`heartbeatEpochSessionsPerEpoch = 2`) of distinct sessions per epoch VALUE,
+  reset by a raise (`highEpochSessions` + `highEpochSessionCount`,
+  `epochSessionAdmissible` / `bindEpochSession`). Any finite `k` keeps the
+  security property (the floor is monotone, so a capture set buys a finite
+  ascending pass and 0 sustained), and 2 is far below the ring's 64 slots so the
+  bound sessions cannot evict each other. Staleness-based rebind DECLINED:
+  waiting out the dead-peer interval is free, so it restores unbounded
+  admissions. Generator-side fix DECLINED and the reason stated in the code: the
+  only local source of distinctness is the incarnation's own entropy, so it is
+  probabilistic and has nothing to draw on in the degenerate case (clock at or
+  before the Unix epoch, no chainable file) — a receiver bound is needed in
+  every regime, a sender jitter in none of them alone.
+- **Residual, stated rather than hidden**: a successor past the last slot at one
+  unchanged epoch is refused for its whole process lifetime (`bootEpochOnce` +
+  re-refinement lands on the same `prev+1`; measured: 10 re-refinements move
+  nothing). Recovery needs the clock past `prev+1` AND another restart — up to
+  `bootEpochMaxSkew`. Made executable as
+  `TestEqualEpochBoundStillStrandsTheNextSuccessor_6669`.
+- **MINOR 1**: MAJOR 3's re-claim step was deletable with the suite green.
+  Added the `epochRefineBeforeRelease` seam (same rationale as `epochFlock`) and
+  `TestLateRefineRequestIsReclaimed_6669`; hammering does NOT reach the window
+  (measured firsthand: 3000 rounds x 4 concurrent `refreshBootEpoch` -> 0
+  strands). Its prose claim ("the request costs one extra pass") is now
+  qualified with the one interleaving that is still lost.
+- **MINOR 2**: corrected "both need the same missing state" — condition 1 needs
+  only a TRIGGER to retry the failed persist (#6724), not a writer identity.
+- **PRE-EXISTING FLAKE IN THIS PR, fixed**: `go test -race ./pkg/cluster/`
+  failed intermittently at `3aced9e80` (1/6 runs) and 20/20 when
+  `TestInitHeartbeatEpochStateNeverBlocks_6169` and
+  `TestArchivedEpochPoisonsAFreshFloor_6711` ran together — the former drained
+  only `bootEpochReady` (the FIRST attempt), so a coalesced worker escaped and
+  read `epochNowNanos` while the latter overrode it. Verified absent at the
+  merge-base only because the file does not exist there, so it is this PR's.
+  `waitBootEpochIdle` is the real drain: 20/20 -> 0/20, full race suite 0/6.
+- **Mutation proof** (build+vet rc 0 in EVERY mutated state): (M1)
+  `heartbeatEpochSessionsPerEpoch = 1` -> successor gate RED at 0/40, churn +
+  slots-once + floor-rebind + reclaim controls GREEN; (M2) delete the equality
+  check -> churn 1625/1625 RED, slots-once RED (65 sessions at one value),
+  poisoned-floor RED, successor GREEN; (M3) move the check AFTER `ring.admit` ->
+  churn RED at 50/1625, proving the ORDERING; (M4) record the binding BEFORE
+  `ring.admit` -> slot-ordering gate RED; (M5) raise ADDS instead of resetting
+  -> raise-resets gate RED on both halves; (M6) delete the re-claim step ->
+  reclaim gate RED ("only 1 refine pass(es) ran"), coalesce + no-ratchet +
+  successor controls GREEN. One prediction was WRONG and is reported as such:
+  `TestFloorRebindsToTheRaisingIncarnation_6669` stays GREEN under M5 because it
+  uses a single session and cannot fill the set — so the claim it was meant to
+  cover ("a floor whose bound sessions are stale refuses the peer that just
+  raised it") was added to `a_raise_resets_the_slots`, which then REDs.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race -count=1 ./pkg/cluster/` ok 6/6 runs, `gofmt -l pkg/cluster/`
+  empty, plus pkg/daemon + pkg/conntrack + pkg/grpcapi + pkg/upgrade + pkg/cli
+  green.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/manager.go,
+  pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_session_budget_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
