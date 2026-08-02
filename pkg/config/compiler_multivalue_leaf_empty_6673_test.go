@@ -1210,6 +1210,64 @@ security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.5; to; } } }
 		{"well-formed sibling beside a malformed range", `
 security { nat { proxy-arp { interface ge-0-0-0 { address [ to 192.0.2.1 ]; address 192.0.2.9; } } } }`,
 			[]string{"192.0.2.9/32"}, []string{"192.0.2.9/32"}},
+		// --- BLOCK-CHILD placements (round 7) -------------------------------
+		//
+		// In the hierarchical BLOCK form a range rides on a child's OWN Keys —
+		// Children[i].Keys = [".2","to",".9"] — so Keys[0] is the address and
+		// the `to` sits at Keys[1] or later, or under a nested child. The
+		// position-enumerating detector inspected only prop.Keys[1:] and
+		// Children[i].Keys[0], saw no `to`, and let the list reader promote
+		// every child's Keys[0] — including each malformed range's low endpoint
+		// — to a live proxy address. Every wantInstalled below is MEASURED on
+		// origin/master through the installer's netip.ParsePrefix gate.
+		{"block child carries the range on its own Keys", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to 192.0.2.9; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"block child range with no high endpoint", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"two block-child ranges", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.2 to 192.0.2.9; 198.51.100.2 to 198.51.100.9; } } } } }`,
+			[]string{"192.0.2.2/32"}, []string{"192.0.2.2/32"}},
+		// The per-STATEMENT veto: 198.51.100.1 is well-formed but shares the
+		// statement with a broken range, so it is dropped with it — which is
+		// what master installs, and what the bracket form above already does.
+		// Promoting it instead would install an address master never answered
+		// ARP for.
+		{"block-child range beside well-formed siblings", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; 192.0.2.2 to 192.0.2.9; 198.51.100.1; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"IPv6 block-child range", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 2001:db8::1; 2001:db8::2 to 2001:db8::9; } } } } }`,
+			[]string{"2001:db8::1/32"}, []string{"2001:db8::1/32"}},
+		// The `to` at a child's THIRD key, and under a NESTED child — two more
+		// positions an enumeration would have to know about in advance. The
+		// detector walks the statement's whole token stream instead, so depth
+		// and index are irrelevant to it.
+		{"keyword at a block child's third key", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 192.0.2.2 to 192.0.2.9; 198.51.100.1; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"keyword nested one level below a block child", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 { to 192.0.2.9; } 198.51.100.1; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		{"keyword nested two levels below a block child", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 { 192.0.2.5 { to 192.0.2.9; } } 198.51.100.1; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		// Pre-existing on BOTH trees and deliberately left alone: a lone
+		// block-form range does not EXPAND. Master compiles the low endpoint
+		// only, and so does this tree — making it expand would be a change to
+		// range handling, not the install-parity fix this arm is.
+		{"lone block-child range does not expand (PRE-EXISTING, both trees)", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1 to 192.0.2.9; } } } } }`,
+			[]string{"192.0.2.1/32"}, []string{"192.0.2.1/32"}},
+		// CONTROL: a `to` leading a block child IS a well-formed set-syntax
+		// range (FindChild("to") consumes it), so the caller's second range
+		// branch expands it BEFORE the value reader runs. The veto must not
+		// steal this — proving the detector gates only what fell through.
+		{"block child leading with the keyword still expands (CONTROL)", `
+security { nat { proxy-arp { interface ge-0-0-0 { address { 192.0.2.1; to 192.0.2.3; } } } } }`,
+			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"},
+			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"}},
 		{"well-formed range still expands (CONTROL)", `
 security { nat { proxy-arp { interface ge-0-0-0 { address 192.0.2.1 to 192.0.2.3; } } } }`,
 			[]string{"192.0.2.1/32", "192.0.2.2/32", "192.0.2.3/32"},
@@ -1334,4 +1392,188 @@ func CompileConfigMustFail6673(t *testing.T, tree *ConfigTree) error {
 			"cardinality gate must still fire on real values")
 	}
 	return err
+}
+
+// TestStaticNATMatch6673RuleVerdictIsObservedNotMirrored guards the round-7
+// finding: the suffix on a complaint about a NON-selected `match
+// destination-address` value must agree with EVERY other verdict reported for
+// the same rule, not just with the two match-side loops.
+//
+// The previous spelling computed a `selectedInstalls` predicate that
+// hand-mirrored those two loops. Three rule-dropping causes never touch a match
+// address and so were invisible to it — the then-side parse, the then-side
+// host-mask, and the /0 block-pair loop — and for each, the complaint about a
+// non-selected value announced that the selected value "stays active" while
+// another warning on the same rule said the dataplane drops it. That is the
+// same contradiction #6673 already fixed once for the match-side legs; the
+// mirror was simply scoped narrower than the claim its comment made.
+//
+// The fix stops mirroring and starts OBSERVING: `emit` — the closure whose
+// suffix is "rule dropped by dataplane until corrected" — sets the rule's
+// verdict flag itself, so every present and future rule-dropping check counts
+// automatically, while the port-scoped emitSuffix callers correctly do not.
+// Each case below is a cause the mirror could not see.
+func TestStaticNATMatch6673RuleVerdictIsObservedNotMirrored(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  string
+		// nonSelectedSub identifies the complaint about the value the compiler
+		// did NOT select — the one whose suffix is under test.
+		nonSelectedSub string
+		wantSelected   string
+		// ruleDropped: some OTHER verdict on this rule drops it, so the
+		// complaint must not promise the selected value stays active.
+		ruleDropped bool
+		// blamesSelected: the dropping cause IS the selected match value, so
+		// the complaint may name it as invalid. False when the cause is on the
+		// `then` side — blaming the selected value would be a fresh falsehood.
+		blamesSelected bool
+		// droppedCauseSub is the OTHER warning that must be present and must
+		// carry the rule-dropped suffix, proving the two agree.
+		droppedCauseSub string
+	}{
+		{
+			// Cause: the `then` prefix does not parse. parse_nat_prefix returns
+			// None and from_snapshots drops the whole mapping, no matter which
+			// match value was selected.
+			name: "then prefix does not parse",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 198.51.100.0/24; destination-address 192.0.2.1/32; }
+              then { static-nat prefix not-an-addr; } } } } } }`,
+			nonSelectedSub:  `destination-address "198.51.100.0/24" must be a host route`,
+			wantSelected:    "192.0.2.1/32",
+			ruleDropped:     true,
+			droppedCauseSub: `then static-nat prefix "not-an-addr" is not a valid`,
+		},
+		{
+			// Cause: the /0 block pair. Measured, this config ALSO trips the
+			// then-side host-mask check (0.0.0.0/0 is not a host route), so the
+			// rule genuinely is dropped — the pre-fix wording was wrong about
+			// WHICH value it was talking about rather than about the verdict.
+			// The complaint names the non-selected /0 pair, which is not the
+			// pair that installs (192.0.2.1/32 <-> 0.0.0.0/0 is).
+			name: "zero-length block pair in a non-selected slot",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 0.0.0.0/0; destination-address 192.0.2.1/32; }
+              then { static-nat prefix 0.0.0.0/0; } } } } } }`,
+			nonSelectedSub:  `zero-length (/0) prefix (match destination-address "0.0.0.0/0"`,
+			wantSelected:    "192.0.2.1/32",
+			ruleDropped:     true,
+			droppedCauseSub: `then static-nat prefix "0.0.0.0/0" must be a host route`,
+		},
+		{
+			// CONTROL, opposite direction: the /0 pair IS the selected value,
+			// so its own complaint keeps the unconditional rule-dropped suffix
+			// and the other match value may be told the selected one is invalid
+			// too. Without this case a fix that simply stopped using `emit` in
+			// the /0 loop would look correct.
+			name: "zero-length block pair IS the selected value",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 192.0.2.0/24; destination-address 0.0.0.0/0; }
+              then { static-nat prefix 0.0.0.0/0; } } } } } }`,
+			nonSelectedSub:  `destination-address "192.0.2.0/24" must be a host route`,
+			wantSelected:    "0.0.0.0/0",
+			ruleDropped:     true,
+			blamesSelected:  true,
+			droppedCauseSub: `zero-length (/0) prefix (match destination-address "0.0.0.0/0"`,
+		},
+		{
+			// CONTROL: nothing drops the rule, so the complaint must still say
+			// the selected value stays active. This is what stops the fix from
+			// degenerating into "never promise anything".
+			name: "selected value installs and the rule survives",
+			cfg: `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 198.51.100.0/24; destination-address 192.0.2.1/32; }
+              then { static-nat prefix 10.0.0.1/32; } } } } } }`,
+			nonSelectedSub: `destination-address "198.51.100.0/24" must be a host route`,
+			wantSelected:   "192.0.2.1/32",
+			ruleDropped:    false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(hierTree6659(t, tc.cfg))
+			if err != nil {
+				t.Fatalf("tolerant compile: %v", err)
+			}
+			rule := cfg.Security.NAT.Static[0].Rules[0]
+			if rule.Match != tc.wantSelected {
+				t.Fatalf("Match = %q, want %q — the premise of this case is "+
+					"which value the compiler selects", rule.Match, tc.wantSelected)
+			}
+			w := findWarning6673(t, cfg, tc.nonSelectedSub)
+			if !tc.ruleDropped {
+				if !strings.Contains(w, "stays active") {
+					t.Fatalf("nothing about this rule drops it, so the complaint "+
+						"about the non-selected value must say the selected value "+
+						"stays active:\n  %s", w)
+				}
+				return
+			}
+			if strings.Contains(w, "stays active") {
+				t.Fatalf("another verdict on this rule drops it, but the complaint "+
+					"about the non-selected value promises the selected value %q "+
+					"stays active — the two warnings on this rule contradict each "+
+					"other:\n  %s", rule.Match, w)
+			}
+			// The complaint must not carry the UNCONDITIONAL rule-dropped
+			// suffix either: this value is not the one that installs, and
+			// saying "rule dropped by dataplane until corrected" against it
+			// attributes the drop to the wrong operand.
+			if strings.Contains(w, "ignored: rule dropped by dataplane until corrected") {
+				t.Fatalf("the complaint about a NON-selected value carries the "+
+					"scalar rule-dropped suffix, which attributes the drop to "+
+					"this value rather than to the cause that actually dropped "+
+					"the rule:\n  %s", w)
+			}
+			if got := strings.Contains(w, "invalid too"); got != tc.blamesSelected {
+				t.Fatalf("blames-the-selected-value = %v, want %v — the wording "+
+					"may call the selected value invalid only when the selected "+
+					"value is itself the dropping cause:\n  %s",
+					got, tc.blamesSelected, w)
+			}
+			// And the cause it defers to must actually be reported, or the
+			// operator is told to look for a warning that does not exist.
+			if tc.droppedCauseSub != "" {
+				cause := findWarning6673(t, cfg, tc.droppedCauseSub)
+				if !strings.Contains(cause, "ignored: rule dropped by dataplane until corrected") {
+					t.Fatalf("the warning the complaint defers to does not itself "+
+						"claim the rule is dropped:\n  %s", cause)
+				}
+			}
+		})
+	}
+}
+
+// TestStaticNATMatch6673PortVerdictsDoNotDropTheRule is the negative half of
+// the guard above. The verdict flag is set by `emit`, so a check that reports a
+// NARROWER effect through emitSuffix — the port-scoped ones — must NOT mark the
+// rule as dropped. If it did, the fix would swing from over-promising to
+// over-warning: a rule whose only fault is a bad `mapped-port` still installs
+// its address translation, and the complaint about an unused match value must
+// keep saying so.
+func TestStaticNATMatch6673PortVerdictsDoNotDropTheRule(t *testing.T) {
+	cfg, err := CompileConfigLenient(hierTree6659(t, `
+security { nat { static { rule-set rs1 { from zone untrust;
+    rule r1 { match { destination-address 198.51.100.0/24; destination-address 192.0.2.1/32;
+                      destination-port 80; }
+              then { static-nat prefix 10.0.0.1/32 mapped-port 70000; } } } } } }`))
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+	// Premise: the port fault really is reported, and reported as port-scoped.
+	port := findWarning6673(t, cfg, "mapped-port", "is not a valid port number")
+	if !strings.Contains(port, "port translation dropped") {
+		t.Fatalf("premise failed: the mapped-port fault is not reported with a "+
+			"port-scoped effect:\n  %s", port)
+	}
+	w := findWarning6673(t, cfg, `destination-address "198.51.100.0/24" must be a host route`)
+	if !strings.Contains(w, "stays active") {
+		t.Fatalf("a port-scoped fault does not drop the rule — the address "+
+			"translation still installs on the selected value — so the complaint "+
+			"about the unused match value must still say it stays active:\n  %s", w)
+	}
 }

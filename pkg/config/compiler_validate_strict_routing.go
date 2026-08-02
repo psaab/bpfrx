@@ -242,15 +242,26 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 		case checkPolicyRef("routing-options forwarding-table export",
 			selected, hintExport) != nil:
 			// #6673: "%q is, and it still resolves" ASSUMED the selected policy
-			// resolves without ever checking it. With `export missing-old;`
-			// then `export missing-selected;` the list is
-			// [missing-old, missing-selected] and the scalar is
-			// missing-selected; the loop reaches missing-old FIRST and
-			// reassured the operator that missing-selected "still resolves"
-			// when it is undefined too and ECMP is disabled. The verdict was
-			// right (strict rejects, tolerant warns) and the stated consequence
-			// was backwards, which on the tolerant path is the only thing the
-			// operator gets.
+			// resolves without ever checking it. The loop reaches a
+			// non-selected undefined policy FIRST and reassured the operator
+			// that the selected one "still resolves" when it is undefined too
+			// and ECMP is disabled. The verdict was right (strict rejects,
+			// tolerant warns) and the stated consequence was backwards, which
+			// on the tolerant path is the only thing the operator gets.
+			//
+			// Reaching this branch needs the SELECTED value to be a LATER
+			// authored one, which takes two top-level `routing-options` roots:
+			//
+			//   routing-options { forwarding-table { export missing-old; } }
+			//   routing-options { forwarding-table { export missing-selected; } }
+			//
+			// → list [missing-old missing-selected], scalar "missing-selected".
+			// Both single-block spellings — two `export` leaves in one
+			// forwarding-table, and `export [ missing-old missing-selected ]` —
+			// select the FIRST value instead (FindChild takes the first leaf;
+			// measured scalar "missing-old"), so the loop hits `ref == selected`
+			// on iteration 1 and returns there. Do not use them as a repro for
+			// this branch; they exercise the case above it.
 			return fmt.Errorf("%s (this value is not the one the forwarding "+
 				"table renders — %q is, but that policy is UNDEFINED as well, "+
 				"so the expected ECMP / consistent-hash load-balancing is "+

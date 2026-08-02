@@ -996,6 +996,44 @@ validating a value and MUST count only non-empty entries when enforcing
 cardinality (`nonEmptyValues`) — an empty slot is a selection, not a second
 policy or prefix, so counting it would invent a rejection.
 
+### Detect a grammar keyword by CLASS, never by position (#6673)
+
+`proxyARPAddressValues` is a SET reader with one exception: a MALFORMED RANGE
+does not widen. `security nat proxy-arp … address` accepts `<low> to <high>`,
+and the compiler consumes the two well-formed range shapes before the value
+reader runs — so a `to` that survives to the reader means the statement is a
+broken range, not a list, and it falls back to `nodeVal` (master's single-value
+read). Widening it instead PROMOTES the range's surviving endpoint to a
+standalone proxy address: `pkg/dataplane/proxyarp.go` installs an `NTF_PROXY`
+neighbour for it and enables the per-interface kernel proxy responder, so the
+appliance answers ARP/ND for an address that was never authored as one.
+
+The detector for that must be over the statement's TOKEN STREAM, not over a
+list of positions. Enumerating positions failed three times, because the parser
+puts a `to` in at least four different places for this one statement:
+
+| Spelling | Where the `to` lands |
+|---|---|
+| `address [ .1 .2 to .9 ];` | `prop.Keys[n]` (the bracket collapses onto one node) |
+| `address { to; .5; }` | `Children[i].Keys[0]` |
+| `address { .1; .2 to .9; }` | `Children[i].Keys[1]` — the BLOCK form, on the child's own Keys |
+| `address { .1 .2 to .9; }` | `Children[i].Keys[2]` |
+| `address { .1 { to .9; } }` | `Children[i].Children[j].Keys[0]`, nesting arbitrarily deep |
+
+Each position-based revision passed its own tests and shipped the next
+unenumerated shape as a live install divergence from master. `nodeSubtreeHasKey`
+walks the whole subtree the parser built for the statement instead: every token
+the parser keeps lands in some node's `Keys` there, so no shape — present or
+future — can hide the keyword from it. **When a reader must recognise a grammar
+keyword inside a multi-value leaf, scan the subtree; do not enumerate slots.**
+
+The veto is per STATEMENT, so a malformed range suppresses the widening for the
+whole statement it appears in (`address { .1; .2 to .9; 198.51.100.1; }` yields
+`.1` alone). That matches what master installs and what the bracket form already
+did; vetoing per CHILD instead would install an address master never claimed.
+Separate `address` statements are independent, so a broken one never suppresses
+a well-formed sibling statement.
+
 Two traps this closed, both invisible to a shape matrix that never builds an
 empty value:
 
@@ -1034,14 +1072,33 @@ holds only when the SELECTED value would itself install, and nothing guarantees
 that: with `destination-address bad-old;` then `destination-address
 bad-selected;` both values are malformed, so the warning about `bad-old`
 announcing that `bad-selected` "stays active" was contradicted by the very next
-warning on the same rule. `emitMatchAddr` therefore takes a `selectedInstalls`
-flag computed from the same two checks the loops apply, plus the empty-selection
-case (`[ "" a b ]` blanks `ExternalIP` and the Rust parse drops the mapping).
-The same trap sits on the routing side: the forwarding-table export diagnostic
-must re-run `checkPolicyRef` on the selected policy before saying it "still
-resolves", because the loop reports whichever undefined value it reaches first
-and that is usually not the selected one. State the consequence you have
-CHECKED, not the one the happy path suggests.
+warning on the same rule. The same trap sits on the routing side: the
+forwarding-table export diagnostic must re-run `checkPolicyRef` on the selected
+policy before saying it "still resolves", because the loop reports whichever
+undefined value it reaches first and that is usually not the selected one. State
+the consequence you have CHECKED, not the one the happy path suggests.
+
+**And OBSERVE the verdict; do not MIRROR it (#6673).** The first fix here gave
+`emitMatchAddr` a `selectedInstalls` flag recomputed from the two match-side
+checks the loops apply. That mirror was wrong by three causes — the then-side
+parse, the then-side host-mask, and the `/0` block-pair loop each drop the rule
+without touching a match address — so the contradiction simply moved rather than
+closing. A hand-written mirror of a set of checks drifts from that set by
+construction, exactly as a hand-written list of AST positions drifts from the
+parser's shapes.
+
+The reliable form is to make the emission itself carry the verdict.
+`validateNATHostMaskStrict` declares a per-rule `ruleDropped` flag that `emit` —
+the closure whose suffix is *"rule dropped by dataplane until corrected"* — sets
+on every call, while the port-scoped `emitSuffix` callers deliberately do not.
+Any check added later participates for free. The per-value complaints are then
+appended with a blank suffix and patched in place at the end of the rule (which
+preserves warning order), once the verdict is final. Note the bound this puts on
+the claim: it reports what THAT validator concluded, so a way to break a rule it
+does not check at all — a cross-family `then` prefix, today — still leaves
+"stays active" standing. Also keep the empty-selection case, which is not a
+verdict about validity at all: `[ "" a b ]` blanks `ExternalIP` and the Rust
+parse drops the mapping, so there is no surviving rule to describe.
 
 **Cardinality gates name the SELECTED value, which is not element `[0]`.**
 `compileNATStatic` assigns `rule.Match = nodeVal(m)` once per

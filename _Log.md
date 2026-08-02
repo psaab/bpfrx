@@ -73808,3 +73808,75 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_services.go,
   pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #6673 round 7 — detect the proxy-ARP range keyword by CLASS, and
+  OBSERVE the static-NAT rule verdict instead of mirroring it. Round 6 found the
+  round-5 fix at a position its enumeration missed, which is the third time a
+  position list has shipped a live divergence, so both fixes here replace an
+  enumeration with a total rule. (F1, MAJOR) `proxyARPMalformedRange` inspected
+  `prop.Keys[1:]` and `Children[i].Keys[0]`. In the hierarchical BLOCK form a
+  range rides on a CHILD's own Keys (`address { .1; .2 to .9; }` →
+  `Children[1].Keys=[".2","to",".9"]`), so `Keys[0]` is the address and the `to`
+  at `Keys[1]` is invisible; the veto never engaged and every child's `Keys[0]`,
+  including each broken range's low endpoint, became a live proxy address.
+  Reproduced firsthand before fixing, differentially against origin/master
+  through the installer's own `netip.ParsePrefix` gate: SEVEN malformed shapes
+  diverged, e.g. `address { 192.0.2.1; 192.0.2.2 to; }` master installs
+  `[192.0.2.1/32]` and head installed `[192.0.2.1/32 192.0.2.2/32]`;
+  `{ .2 to .9; 198.51.100.2 to .9; }` master `[192.0.2.2/32]`, head added
+  `198.51.100.2/32`; same for the no-high-endpoint, three-child, IPv6, and two
+  NEWLY-found shapes the review had not seen — `to` at a child's THIRD key, and
+  `to` under a NESTED child (`address { .1 { to .9; } .3; }`), which the parser
+  nests arbitrarily deep. That is four distinct positions for one statement, so
+  the fix does not add a fifth: `nodeSubtreeHasKey` walks the whole subtree the
+  parser built for the statement and asks whether the keyword is among its
+  tokens. Position-independent by construction — every token the parser keeps
+  lands in some node's Keys there. Runtime impact of the bug:
+  `pkg/dataplane/proxyarp.go` parses the promoted address, installs an
+  `NTF_PROXY` neighbour, and `recordFamily` enables the per-interface kernel
+  proxy responder, so the appliance answered ARP/ND on an interface master left
+  silent for that address. The false universal at compiler_nat_source.go:218
+  ("installed(head)==installed(master) for EVERY malformed shape") is replaced
+  by what is actually measured — a corpus claim plus a detector that provably
+  sees every `to` — and the residual is stated: the veto is per STATEMENT, so a
+  broken range suppresses the #6659 widening for its own statement's operands
+  (matching master, and matching the already-shipped bracket form); per-CHILD
+  vetoing would install an address master never claimed. Block-form ranges still
+  do not EXPAND on either tree; that is pre-existing and out of scope, raised
+  rather than taken. (F2/F3, MINOR) `selectedInstalls` hand-mirrored the two
+  match-side loops and was wrong by THREE causes, not the one reported: the
+  then-side parse, the then-side host-mask, and the `/0` block-pair loop each
+  drop the rule without touching a match address. Replaced the mirror with
+  observation — `emit`, the closure whose suffix is "rule dropped by dataplane
+  until corrected", sets a per-rule `ruleDropped` flag itself, so every present
+  and future rule-dropping check counts while the port-scoped `emitSuffix`
+  callers correctly do not. Per-value complaints are appended with a blank
+  suffix and patched in place at end-of-rule (preserving warning order), and
+  `selectedMatchInvalid` keeps the sharper "that value is invalid too" wording
+  where the selected match value IS the cause. The `/0` loop now routes through
+  `emitMatchAddr` like its two siblings (F2). Measured while fixing: the review's
+  F2 repro does drop the rule — its `then 0.0.0.0/0` fails the host-route check —
+  so "it installs and translates" would have been a NEW falsehood; the wording
+  defers to the co-reported cause instead. Residual documented in code: the flag
+  observes THIS validator, so a cross-family `then` prefix (no such check exists)
+  still leaves "stays active" standing. (N1) The routing comment's repro was
+  measured unreachable and corrected: a single `forwarding-table` block selects
+  the FIRST export leaf (`FindChild`), so the branch needs two top-level
+  `routing-options` roots. RED-then-GREEN, `go build ./...` and `go vet ./...`
+  rc=0 asserted in BOTH states for all four mutations, each a scoped assertion
+  red: reverting the detector to the round-6 spelling reds the 8 new block-child
+  subtests and no others; reverting it to the REVIEWER's own prescribed fix
+  (scan `vn.Keys[1:]` too) still reds the 2 nested-depth subtests — direct
+  evidence the prescribed positional fix would have shipped a fourth round;
+  removing the `ruleDropped` observation reds the then-parse and non-selected /0
+  subtests; restoring the scalar `emit` in the /0 loop reds both /0 subtests;
+  and making `emitSuffix` set the flag reds the port-scoped negative-half test.
+  Every new `wantInstalled` oracle was re-measured on origin/master with the
+  EXACT test configs, not transcribed. `go test ./...` rc=0, 0 FAIL (known flake
+  #6726 `pkg/ddns` did not fire this run — pkg/ddns ok 3.629s).
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md

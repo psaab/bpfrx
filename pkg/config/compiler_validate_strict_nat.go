@@ -1253,7 +1253,39 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 		}
 		return fmt.Errorf("%s", msg)
 	}
+	// ruleDropped records whether ANY check in the static-NAT rule currently
+	// being validated has already reported a cause that drops the WHOLE rule.
+	// Reset at the top of each rule; read only when resolving the deferred
+	// emitMatchAddr suffixes at the end of that rule.
+	//
+	// #6673: it is set by `emit` itself rather than by a hand-maintained list
+	// of causes. `emit` IS the rule-dropped closure — its suffix is "rule
+	// dropped by dataplane until corrected" — so every present and future
+	// caller of it marks the rule automatically, and a check that reports a
+	// NARROWER effect (the port-scoped emitSuffix callers below) correctly does
+	// not. The previous spelling mirrored the two match-side loops by hand and
+	// was wrong by three causes: the then-side parse, the then-side host-mask,
+	// and the /0 block-pair loop each drop the rule without touching a match
+	// address, so a warning about a non-selected match value announced that the
+	// selected value "stays active" while the rule was in fact dropped.
+	// Observing the emissions cannot drift the way mirroring them did.
+	//
+	// RESIDUAL, stated because observation bounds the claim: this reports what
+	// THIS validator concludes, so a way to break a rule that it does not check
+	// at all still leaves "stays active" standing. Measured example: `match
+	// destination-address 192.0.2.1/32` with `then static-nat prefix
+	// 2001:db8::1/128` emits no then-side complaint (the target parses and is a
+	// host route), so a non-selected match value is still told the rule stays
+	// active. Adding a cross-family gate is a new rejection, not a wording fix,
+	// and belongs in its own change.
+	// selectedMatchInvalid narrows that: the rule-dropping cause was the
+	// SELECTED match address failing one of the match-side checks, so the
+	// complaint about another slot can name it as invalid rather than pointing
+	// vaguely at a different error. Set only by the emitMatchAddr addr ==
+	// selected path, and likewise observed rather than recomputed.
+	ruleDropped, selectedMatchInvalid := false, false
 	emit := func(msg string) error {
+		ruleDropped = true
 		return emitSuffix(msg, " (ignored: rule dropped by dataplane until corrected)")
 	}
 	// emitMatchAddr is emit for a complaint whose operand is ONE authored
@@ -1270,17 +1302,46 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 	// value: the selected one really does drop the rule, a non-selected one is
 	// ignored on its own.
 	//
-	// #6673 follow-up: selectedInstalls says whether the SELECTED value would
-	// itself survive this validator's own checks. Without it the two loops can
-	// contradict each other on the same rule: with `destination-address bad-old;
-	// destination-address bad-selected;` the warning for bad-old announced that
-	// bad-selected "stays active", and the very next warning — for
-	// bad-selected, the value that IS selected — correctly said the dataplane
-	// drops the rule. The caller decides; this closure only words the result.
-	emitMatchAddr := func(addr, selected string, selectedInstalls bool, msg string) error {
+	// #6673 follow-up: whether a non-selected value's complaint may promise that
+	// the selected value "stays active" depends on whether ANYTHING ELSE drops
+	// the rule — and some of those causes are checked AFTER these loops run.
+	// Without accounting for them the two loops contradicted each other on the
+	// same rule: with `destination-address bad-old; destination-address
+	// bad-selected;` the warning for bad-old announced that bad-selected "stays
+	// active", and the very next warning — for bad-selected, the value that IS
+	// selected — correctly said the dataplane drops the rule.
+	//
+	// So a non-selected complaint is emitted in place (preserving warning
+	// order) but with its suffix left BLANK, and the suffix is patched in at
+	// the end of the rule, once ruleDropped is final. That is what lets the
+	// verdict be OBSERVED from the emissions rather than mirrored by hand.
+	// Strict mode never defers: emitSuffix discards the suffix entirely when
+	// !lenient, and the first violation returns as the error, so deferring
+	// there would only risk changing which error is reported.
+	type deferredMatchAddrSuffix struct {
+		warningIdx int
+		selected   string
+	}
+	var deferredSuffixes []deferredMatchAddrSuffix
+	emitMatchAddr := func(addr, selected, msg string) error {
 		if addr == selected {
+			selectedMatchInvalid = true
 			return emit(msg)
 		}
+		if !lenient {
+			// Suffix is discarded in strict mode; report the violation now.
+			return emitSuffix(msg, "")
+		}
+		warnings = append(warnings, msg)
+		deferredSuffixes = append(deferredSuffixes, deferredMatchAddrSuffix{
+			warningIdx: len(warnings) - 1,
+			selected:   selected,
+		})
+		return nil
+	}
+	// matchAddrSuffix words the effect of a complaint about a match value the
+	// compiler did NOT select, given the rule's final verdict.
+	matchAddrSuffix := func(selected string, dropped, selectedInvalid bool) string {
 		// #6673: an authored-but-EMPTY slot can be the SELECTED value —
 		// `destination-address [ "" bogus ]` blanks the match, and nodeVal
 		// selects the blank. The "%q is, and it stays active" wording then
@@ -1289,22 +1350,34 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 		// == "" lowers ExternalIP: "" and the Rust parse_nat_prefix("") returns
 		// None, so from_snapshots drops the whole mapping. Neither of the other
 		// two suffixes is true here — this value still is not the one that
-		// installs, but there is no surviving rule to keep active.
+		// installs, but there is no surviving rule to keep active. Checked
+		// first because an empty selection names no value to quote.
 		if selected == "" {
-			return emitSuffix(msg, " (ignored: this value is not the one the rule "+
-				"installs — the selected match destination-address is EMPTY, so "+
-				"the rule is dropped by the dataplane regardless of this value)")
+			return " (ignored: this value is not the one the rule " +
+				"installs — the selected match destination-address is EMPTY, so " +
+				"the rule is dropped by the dataplane regardless of this value)"
 		}
-		if !selectedInstalls {
-			return emitSuffix(msg, fmt.Sprintf(
+		if selectedInvalid {
+			return fmt.Sprintf(
 				" (ignored: this value is not the one the rule installs — %q is, "+
 					"but that value is invalid too, so the rule is dropped by the "+
-					"dataplane regardless of this value)", selected))
+					"dataplane regardless of this value)", selected)
 		}
-		return emitSuffix(msg, fmt.Sprintf(
+		if dropped {
+			// The selected match value is fine; something else about the rule
+			// — a then-side parse or host-mask failure, a /0 block pair — drops
+			// it. Do NOT blame the selected value here, and do not promise it
+			// stays active either. The cause is in another warning on the same
+			// rule.
+			return fmt.Sprintf(
+				" (ignored: this value is not the one the rule installs — %q is, "+
+					"but this rule is dropped by the dataplane anyway for a "+
+					"separate reason reported alongside this warning)", selected)
+		}
+		return fmt.Sprintf(
 			" (ignored: this value is not the one the rule installs — %q is, "+
 				"and it stays active; correct or remove the unused value)",
-			selected))
+			selected)
 	}
 
 	for _, rs := range cfg.Security.NAT.Static {
@@ -1404,30 +1477,24 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			blockPairFor := func(matchAddr string) bool {
 				return isStaticBlockPair(matchAddr, rule.Then)
 			}
-			// #6673: does the SELECTED match value clear BOTH match-side checks
-			// below — the literal-address parse and the host-mask rule (with the
-			// same per-address block-pair exemption)? If not, a complaint about
-			// some OTHER slot must not promise that the selected value "stays
-			// active": the selected value is the one that lowers to
+			// #6673: a complaint about some OTHER slot must not promise that the
+			// selected value "stays active" when the rule does not survive. The
+			// selected value is the one that lowers to
 			// StaticNATRuleSnapshot.ExternalIP, and the dataplane drops the
-			// whole rule when it cannot parse it. Mirrors the two loops exactly
-			// so the wording can never disagree with the loops' own verdicts.
-			selectedInstalls := func() bool {
-				if _, _, _, parsedIP := natStaticPrefixInfo(rule.Match); !parsedIP {
-					return false
-				}
-				if blockPairFor(rule.Match) {
-					return true
-				}
-				host, parsed := isHostMaskAddress(rule.Match)
-				return !parsed || host
-			}()
+			// whole rule when it cannot parse it — but so do the then-side and
+			// /0 verdicts, which is why this is no longer a hand-written mirror
+			// of the two match-side loops. ruleDropped is set by `emit` itself,
+			// so it accumulates EVERY rule-dropping cause reported for this
+			// rule, including ones added later; the deferred suffixes below are
+			// resolved from it once the rule is fully validated.
+			ruleDropped, selectedMatchInvalid = false, false
+			deferredSuffixes = deferredSuffixes[:0]
 			for _, addr := range matchAddrs {
 				if addr == "" {
 					continue
 				}
 				if _, _, _, parsedIP := natStaticPrefixInfo(addr); !parsedIP {
-					if err := emitMatchAddr(addr, rule.Match, selectedInstalls, fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q is not a valid IP address or CIDR prefix (static NAT requires a literal address or prefix, not an address-book name or a typo'd value)",
 						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
@@ -1472,12 +1539,21 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			// per authored value — a /0 block pair authored in the tail is
 			// reported against its own address rather than being classified
 			// against slot 1 and skipped.
+			//
+			// #6673: and because the operand is a match value, the effect must
+			// be worded per value like its two sibling loops — this one was
+			// widened to iterate matchAddrs but kept the scalar `emit`, whose
+			// suffix says the rule is "dropped by dataplane until corrected".
+			// For a /0 pair in a slot the compiler did not select that is two
+			// falsehoods at once: the quoted pair is not the pair that installs
+			// (rule.Match <-> rule.Then is), and the rule is not dropped — it
+			// installs and translates on the selected value.
 			for _, addr := range matchAddrs {
 				if addr == "" || !blockPairFor(addr) {
 					continue
 				}
 				if _, bits, _, _ := natStaticPrefixInfo(addr); bits == 0 {
-					if err := emit(fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q maps a block-to-block subnet with a zero-length (/0) prefix (match destination-address %q <-> then static-nat prefix %q); a /0 mapping remaps the ENTIRE address family 1:1 (an identity translation that shadows every narrower static/DNAT rule) — use a specific subnet prefix",
 						rs.Name, rule.Name, addr, rule.Then)); err != nil {
 						return nil, err
@@ -1523,7 +1599,7 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					continue
 				}
 				if host, parsed := isHostMaskAddress(addr); parsed && !host {
-					if err := emitMatchAddr(addr, rule.Match, selectedInstalls, fmt.Sprintf(
+					if err := emitMatchAddr(addr, rule.Match, fmt.Sprintf(
 						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
 						rs.Name, rule.Name, addr)); err != nil {
 						return nil, err
@@ -1627,6 +1703,14 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 					" (ignored: port translation dropped by dataplane until corrected)"); err != nil {
 					return nil, err
 				}
+			}
+			// #6673: every rule-dropping cause for THIS rule has now been
+			// reported, so ruleDropped is final — word the non-selected match
+			// value complaints held open above. Patching in place keeps the
+			// warnings in emission order. Only reachable on the lenient path;
+			// strict returned at the first violation.
+			for _, d := range deferredSuffixes {
+				warnings[d.warningIdx] += matchAddrSuffix(d.selected, ruleDropped, selectedMatchInvalid)
 			}
 		}
 	}
