@@ -1,6 +1,32 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v90 — r88 folds: AGY b1's missing §9 test
+- **Status**: DRAFT v91 — r88 Codex folds (its verdict ran
+  against v89; both of its headline defects were already v90's
+  AGY folds, and its three residuals are folded here): the
+  partition preamble now classifies per-access (class 2 = "EVERY
+  registry access neutral-on-absent"; class 1 = "contains at
+  least one REQUIRED access" — the v90 "whose missing-map
+  outcome is NEUTRAL" read as a singular per-method outcome that
+  mixed methods do not have); the omitted-site set is now
+  CLASS-ASSIGNED per Codex's table (seventeen class-2 +
+  `maps_counters.go:181`/`:233` in class-3 hybrids + the class-4
+  getters `loader.go:1152`/`:1157` + the internal composed
+  helpers `:910`/`:928` — v90's blanket "class-2" for the
+  single-map set was wrong for the counters pair);
+  the continuation-oracle naming is extended to the three
+  omitted paths (`ClearStaticNATEntries` absent-v4→v6,
+  `setXDPAttachedFlag` absent-vlan→physical, `Compile` absent-
+  redirect_capable→continue); the AttachXDP chain is qualified
+  (the pinned-link-reuse path returns at `:536`, skipping the
+  `:591` seed while still running the deferred `:700`/`:730`);
+  and the two limiting-summary sites (§4.7, §7) now cross-
+  reference the IsLoaded surface instead of saying the narrowing
+  is "limited to the loaded-check set" full stop. r88 verdicts:
+  Codex PLAN-NEEDS-MAJOR (1M/2m, on v89 — headline defects
+  already v90's folds, residuals folded here), AGY
+  PLAN-NEEDS-MINOR (b1/b2, folded in v90), Claude SMR
+  PLAN-READY (on v90); pending convergence review r89.
+- **Prior**: DRAFT v90 — r88 folds: AGY b1's missing §9 test
   leg (v89 claimed "the §9 teardown legs assert this directly"
   but named NO such leg — the oracle set gains leg (5),
   `TestManager_ArmedGate_CloseWindowIsLoaded`: Close held at a
@@ -3325,7 +3351,11 @@
   semantics; the IsLoaded observability surface). v90 (r88
   AGY: the §9 IsLoaded-window test leg (leg 5); the inventory
   arithmetic + scoping correction — 17 mixed sites, the
-  single-map neutral set named).
+  single-map neutral set named). v91 (r88 Codex residuals: the
+  per-access partition preamble; the class-assigned omitted
+  set; the three continuation-oracle paths; the AttachXDP
+  pinned-link qualification; the limiting-summary cross-
+  references).
 
 ---
 
@@ -3711,9 +3741,14 @@ class. The fold:
   a method that ESCAPES a Start-state reference is class 4; else a
   method touching Start-state with required pre-error Go-side side
   effects is class 3; else a method touching Start-state whose
-  missing-map outcome is NEUTRAL (nil/zero/empty — never an error)
-  is class 2, any signature; else a method touching Start-state (its
-  missing-map outcome is an ERROR) is class 1 — the typed
+  EVERY registry access is neutral-on-absent (nil/zero/empty/
+  silent-skip — never an error; v91 per-access phrasing per r88
+  Codex m2's preamble residual — the v90 "whose missing-map
+  outcome is NEUTRAL" read as a SINGULAR per-method outcome,
+  which mixed methods do not have)
+  is class 2, any signature; else a method touching Start-state
+  CONTAINING AT LEAST ONE REQUIRED access (an access whose absent
+  outcome is an ERROR) is class 1 — the typed
   `ErrDataplaneNotArmed` replaces exactly that error on the fresh
   state (subject to the higher-precedence classes 3/4, r81 Codex
   m4's overbreadth fix — a class-3 hybrid with an error signature
@@ -4183,8 +4218,12 @@ v20 history). The delivery is TWO units:
   ARMED Manager's Close retains a nonempty registry, so ordinary
   methods classify retained and proceed — a never-armed Manager's
   Close has an empty registry and changes nothing — the narrowing
-  is limited to the loaded-check set, not "fresh-state admission";
-  the r70-era framing sentence is rewritten accordingly); the
+  is limited to the loaded-check set's INTERNAL rejections, not
+  "fresh-state admission" — plus the externally observable
+  `IsLoaded()` surface (`loader.go:456` → REST/gRPC status),
+  which the entry Store also advances (v89's correction, cross-
+  referenced here at v91 per r88 Codex m2); the
+  r70-era framing sentence is rewritten accordingly); the
   §10 residuals remain open).
 - **Follow-up issue (filed at /engineer time; seeded from this
   document)**: "commit-confirmed recovery integrity: startup gate +
@@ -4649,7 +4688,10 @@ Preserved exactly:
     selector). NO lifetime or
     teardown exclusion is claimed — the Store(false) at `Close()`'s
     entry (:1206) narrows the LOADED-CHECK SET's admission at
-    teardown (r83 Codex m1's qualification, scoped at v86 per r84
+    teardown AND advances the externally observable `IsLoaded()`
+    surface (`loader.go:456` → the REST/gRPC `DataplaneLoaded`
+    reads; §9 leg 5 asserts the window, v91 cross-reference per
+    r88 Codex m2) (r83 Codex m1's qualification, scoped at v86 per r84
     Codex m1: an ARMED Manager's Close retains a nonempty registry,
     so ordinary methods classify retained and proceed per the
     two-state rule, = master; a never-armed Close stays fresh and
@@ -5037,7 +5079,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    and `loader.go:700` (`iface_zone_map`, inside
    `setXDPAttachedFlag` — absent means early-boot no-op success,
    the comment at :701-703 pins it). The composition matters
-   (r87 Codex M1): `AttachXDP` walks required program lookup
+   (r87 Codex M1; the AttachXDP chain qualified at v91 per r88
+   Codex M1 — the full sequence occurs on a SUCCESSFUL FRESH
+   attachment; the pinned-link-reuse path returns early at `:536`
+   after the `:495` lookup, SKIPPING the `:591` seed while still
+   running the deferred `:700`/:730` accesses): `AttachXDP` walks
+   required program lookup
    (:495) -> optional seed (:591) -> deferred optional accesses
    (:700/:730); `ClearNAT64Configs` walks required
    `nat64_configs` (:319) -> optional `nat64_prefix_map` (:328)
@@ -5046,8 +5093,17 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    conversions, NOT registry reads — excluded.) THE SINGLE-MAP
    NEUTRAL SET (v90 addition per r88 AGY b2 — the remaining
    neutral-outcome accesses, each the ONLY registry access in a
-   void or no-error-outcome method, class-2 by the plan's own
-   precedence rule; their absent outcome is master's silent
+   void or no-error-outcome method; class-assigned at v91 per r88
+   Codex M1's table — seventeen are class-2 by the plan's
+   precedence rule (the twelve stale cleanups, `maps_nat.go:435`,
+   `maps_policy.go:253`, `maps_screen.go:60`, `maps_session.go:612`,
+   `maps_stats.go:72`), while `maps_counters.go:181` and `:233`
+   sit in class-3 hybrid methods (`ClearGlobalCounters` resets the
+   Go offsets BEFORE the map access — the pinned side-effect-plus-
+   neutral composition, NOT pure class-2) and the class-4 getters
+   (`loader.go:1152`/`:1157`) plus the internal composed helpers
+   (`loader.go:910`/`:928`) carry their own categories; their
+   absent outcome is master's silent
    return/continue, no error): the twelve stale cleanups
    `maps_stale.go:18` (iface_zone_map), `:41` (vlan_iface_map),
    `:65` (zone_pair_policies), `:93` (applications), `:117`
@@ -5088,7 +5144,19 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    methods with post-optional work (`SessionCount`'s v4+v6 both
    reported, `ClearSessionCounts`' both maps cleared,
    `GetMapStats`' all descriptors reported, the multi-map stale
-   cleanups' all-maps processed).
+   cleanups' all-maps processed) — each fixture makes an EARLIER
+   access absent and a LATER access present, extended at v91 per
+   r88 Codex M1 to the three continuation paths v90's naming
+   omitted: `ClearStaticNATEntries` (absent v4 at `maps_nat.go:261`
+   must continue to v6 at `:274`), `setXDPAttachedFlag` (absent
+   `vlan_iface_map` at `loader.go:730` must continue into the
+   physical-interface processing at `:744-826`), and `Compile`
+   (absent `redirect_capable` at `compiler.go:353` must continue
+   past into the attachment work — the nil-guard SKIPS the
+   redirect-map population, it does not return). This matters
+   because the AST canary cannot distinguish required from
+   optional consumption — the continuation legs are the only
+   net catching a premature optional-miss return.
 
    `present` includes present-but-nil: callers retain their existing
    handle-level nil behavior. Fresh+present is production-
@@ -5677,12 +5745,16 @@ Still open:
    the inventory and made the oracle DISCRIMINATING, and r88
    (AGY) fixed the inventory arithmetic + scoping (17 mixed
    sites, not 16; the single-map neutral set named) and added
-   the missing §9 IsLoaded-window test leg (leg 5). v90 pins
-   all of these. Each reviewer: verify the 17-site mixed
-   inventory AND the named single-map neutral set against your
-   own grep, the discriminating oracle's continuation assertion,
-   the per-access gating phrasing, and the IsLoaded window
-   leg.
+   the missing §9 IsLoaded-window test leg (leg 5); r88 Codex's
+   residuals (the per-access partition preamble, the class-
+   assigned omitted set, the three continuation-oracle paths,
+   the AttachXDP pinned-link qualification, the limiting-summary
+   cross-references) landed in v91. Each reviewer: verify the
+   17-site mixed inventory AND the class-assigned neutral sets
+   against your own grep, the discriminating oracle's
+   continuation assertions (including the three v91 paths), the
+   per-access gating phrasing (preamble included), and the
+   IsLoaded window leg.
 
 ---
 
