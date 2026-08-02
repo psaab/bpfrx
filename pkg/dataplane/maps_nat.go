@@ -17,8 +17,11 @@ import (
 
 // SetDNATEntry writes a dnat_table entry.
 func (m *Manager) SetDNATEntry(key DNATKey, val DNATValue) error {
-	zm, ok := m.maps["dnat_table"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("dnat_table")
+	if st == registryFresh {
+		return fmt.Errorf("%w: dnat_table", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("dnat_table map not found")
 	}
 	return zm.Update(key, val, ebpf.UpdateAny)
@@ -26,8 +29,11 @@ func (m *Manager) SetDNATEntry(key DNATKey, val DNATValue) error {
 
 // DeleteDNATEntry deletes a dnat_table entry.
 func (m *Manager) DeleteDNATEntry(key DNATKey) error {
-	zm, ok := m.maps["dnat_table"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("dnat_table")
+	if st == registryFresh {
+		return fmt.Errorf("%w: dnat_table", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("dnat_table map not found")
 	}
 	return zm.Delete(key)
@@ -35,8 +41,11 @@ func (m *Manager) DeleteDNATEntry(key DNATKey) error {
 
 // ClearDNATStatic deletes all static (flags=1) dnat_table entries.
 func (m *Manager) ClearDNATStatic() error {
-	zm, ok := m.maps["dnat_table"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("dnat_table")
+	if st == registryFresh {
+		return fmt.Errorf("%w: dnat_table", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("dnat_table map not found")
 	}
 	var key DNATKey
@@ -58,8 +67,11 @@ func (m *Manager) ClearDNATStatic() error {
 // The snat_rules map is an ARRAY keyed by flat index:
 // from_zone * MaxZones * MaxSNATRulesPerPair + to_zone * MaxSNATRulesPerPair + rule_idx.
 func (m *Manager) SetSNATRule(fromZone, toZone, ruleIdx uint16, val SNATValue) error {
-	zm, ok := m.maps["snat_rules"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("snat_rules")
+	if st == registryFresh {
+		return fmt.Errorf("%w: snat_rules", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("snat_rules map not found")
 	}
 	key := uint32(fromZone)*MaxZones*MaxSNATRulesPerPair + uint32(toZone)*MaxSNATRulesPerPair + uint32(ruleIdx)
@@ -68,8 +80,11 @@ func (m *Manager) SetSNATRule(fromZone, toZone, ruleIdx uint16, val SNATValue) e
 
 // ClearSNATRules zeroes all snat_rules entries (ARRAY map semantics).
 func (m *Manager) ClearSNATRules() error {
-	zm, ok := m.maps["snat_rules"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("snat_rules")
+	if st == registryFresh {
+		return fmt.Errorf("%w: snat_rules", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("snat_rules map not found")
 	}
 	empty := SNATValue{}
@@ -81,8 +96,11 @@ func (m *Manager) ClearSNATRules() error {
 
 // SetDNATEntryV6 writes a dnat_table_v6 entry.
 func (m *Manager) SetDNATEntryV6(key DNATKeyV6, val DNATValueV6) error {
-	zm, ok := m.maps["dnat_table_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("dnat_table_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: dnat_table_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("dnat_table_v6 map not found")
 	}
 	return zm.Update(key, val, ebpf.UpdateAny)
@@ -90,8 +108,11 @@ func (m *Manager) SetDNATEntryV6(key DNATKeyV6, val DNATValueV6) error {
 
 // DeleteDNATEntryV6 deletes a dnat_table_v6 entry.
 func (m *Manager) DeleteDNATEntryV6(key DNATKeyV6) error {
-	zm, ok := m.maps["dnat_table_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("dnat_table_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: dnat_table_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("dnat_table_v6 map not found")
 	}
 	return zm.Delete(key)
@@ -99,8 +120,11 @@ func (m *Manager) DeleteDNATEntryV6(key DNATKeyV6) error {
 
 // ClearDNATStaticV6 deletes all static (flags=1) dnat_table_v6 entries.
 func (m *Manager) ClearDNATStaticV6() error {
-	zm, ok := m.maps["dnat_table_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("dnat_table_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: dnat_table_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("dnat_table_v6 map not found")
 	}
 	var key DNATKeyV6
@@ -122,8 +146,11 @@ func (m *Manager) ClearDNATStaticV6() error {
 // The snat_rules_v6 map is an ARRAY keyed by flat index:
 // from_zone * MaxZones * MaxSNATRulesPerPair + to_zone * MaxSNATRulesPerPair + rule_idx.
 func (m *Manager) SetSNATRuleV6(fromZone, toZone, ruleIdx uint16, val SNATValueV6) error {
-	zm, ok := m.maps["snat_rules_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("snat_rules_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: snat_rules_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("snat_rules_v6 map not found")
 	}
 	key := uint32(fromZone)*MaxZones*MaxSNATRulesPerPair + uint32(toZone)*MaxSNATRulesPerPair + uint32(ruleIdx)
@@ -132,8 +159,11 @@ func (m *Manager) SetSNATRuleV6(fromZone, toZone, ruleIdx uint16, val SNATValueV
 
 // ClearSNATRulesV6 zeroes all snat_rules_v6 entries (ARRAY map semantics).
 func (m *Manager) ClearSNATRulesV6() error {
-	zm, ok := m.maps["snat_rules_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("snat_rules_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: snat_rules_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("snat_rules_v6 map not found")
 	}
 	empty := SNATValueV6{}
@@ -145,8 +175,11 @@ func (m *Manager) ClearSNATRulesV6() error {
 
 // SetNATPoolConfig writes a NAT pool configuration entry.
 func (m *Manager) SetNATPoolConfig(poolID uint32, cfg NATPoolConfig) error {
-	zm, ok := m.maps["nat_pool_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat_pool_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat_pool_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat_pool_configs map not found")
 	}
 	return zm.Update(poolID, cfg, ebpf.UpdateAny)
@@ -154,8 +187,11 @@ func (m *Manager) SetNATPoolConfig(poolID uint32, cfg NATPoolConfig) error {
 
 // SetNATPoolIPV4 writes an IPv4 address to a NAT pool IP slot.
 func (m *Manager) SetNATPoolIPV4(poolID, index uint32, ip uint32) error {
-	zm, ok := m.maps["nat_pool_ips_v4"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat_pool_ips_v4")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat_pool_ips_v4", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat_pool_ips_v4 map not found")
 	}
 	mapIdx := poolID*MaxNATPoolIPsPerPool + index
@@ -164,8 +200,11 @@ func (m *Manager) SetNATPoolIPV4(poolID, index uint32, ip uint32) error {
 
 // SetNATPoolIPV6 writes an IPv6 address to a NAT pool IP slot.
 func (m *Manager) SetNATPoolIPV6(poolID, index uint32, ip [16]byte) error {
-	zm, ok := m.maps["nat_pool_ips_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat_pool_ips_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat_pool_ips_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat_pool_ips_v6 map not found")
 	}
 	mapIdx := poolID*MaxNATPoolIPsPerPool + index
@@ -175,8 +214,11 @@ func (m *Manager) SetNATPoolIPV6(poolID, index uint32, ip [16]byte) error {
 
 // ClearNATPoolConfigs zeroes all nat_pool_configs entries.
 func (m *Manager) ClearNATPoolConfigs() error {
-	zm, ok := m.maps["nat_pool_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat_pool_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat_pool_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat_pool_configs map not found")
 	}
 	empty := NATPoolConfig{}
@@ -188,12 +230,18 @@ func (m *Manager) ClearNATPoolConfigs() error {
 
 // ClearNATPoolIPs zeroes all nat_pool_ips_v4 and nat_pool_ips_v6 entries.
 func (m *Manager) ClearNATPoolIPs() error {
-	v4Map, ok := m.maps["nat_pool_ips_v4"]
-	if !ok {
+	v4Map, present, st := m.lookupMapLocked("nat_pool_ips_v4")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat_pool_ips_v4", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat_pool_ips_v4 map not found")
 	}
-	v6Map, ok := m.maps["nat_pool_ips_v6"]
-	if !ok {
+	v6Map, present, st := m.lookupMapLocked("nat_pool_ips_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat_pool_ips_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat_pool_ips_v6 map not found")
 	}
 	maxEntries := uint32(32 * MaxNATPoolIPsPerPool)
@@ -208,8 +256,11 @@ func (m *Manager) ClearNATPoolIPs() error {
 
 // SetSNATEgressIP writes a per-interface SNAT address for interface-mode SNAT.
 func (m *Manager) SetSNATEgressIP(key SNATEgressKey, val SNATEgressValue) error {
-	zm, ok := m.maps["snat_egress_ips"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("snat_egress_ips")
+	if st == registryFresh {
+		return fmt.Errorf("%w: snat_egress_ips", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("snat_egress_ips map not found")
 	}
 	return zm.Update(key, val, ebpf.UpdateAny)
@@ -217,8 +268,11 @@ func (m *Manager) SetSNATEgressIP(key SNATEgressKey, val SNATEgressValue) error 
 
 // ClearSNATEgressIPs deletes all snat_egress_ips entries.
 func (m *Manager) ClearSNATEgressIPs() error {
-	zm, ok := m.maps["snat_egress_ips"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("snat_egress_ips")
+	if st == registryFresh {
+		return fmt.Errorf("%w: snat_egress_ips", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("snat_egress_ips map not found")
 	}
 	var key SNATEgressKey
@@ -236,8 +290,11 @@ func (m *Manager) ClearSNATEgressIPs() error {
 
 // SetStaticNATEntryV4 writes a static NAT v4 entry.
 func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uint32) error {
-	zm, ok := m.maps["static_nat_v4"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("static_nat_v4")
+	if st == registryFresh {
+		return fmt.Errorf("%w: static_nat_v4", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("static_nat_v4 map not found")
 	}
 	key := StaticNATKeyV4{IP: ip, Direction: direction}
@@ -246,8 +303,11 @@ func (m *Manager) SetStaticNATEntryV4(ip uint32, direction uint8, translated uin
 
 // SetStaticNATEntryV6 writes a static NAT v6 entry.
 func (m *Manager) SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [16]byte) error {
-	zm, ok := m.maps["static_nat_v6"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("static_nat_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: static_nat_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("static_nat_v6 map not found")
 	}
 	key := StaticNATKeyV6{IP: ip, Direction: direction}
@@ -258,7 +318,7 @@ func (m *Manager) SetStaticNATEntryV6(ip [16]byte, direction uint8, translated [
 // ClearStaticNATEntries deletes all static_nat_v4 and static_nat_v6 entries.
 func (m *Manager) ClearStaticNATEntries() error {
 	// Clear v4
-	if zm, ok := m.maps["static_nat_v4"]; ok {
+	if zm, present, _ := m.lookupMapLocked("static_nat_v4"); present {
 		var key StaticNATKeyV4
 		iter := zm.Iterate()
 		var keys []StaticNATKeyV4
@@ -271,7 +331,7 @@ func (m *Manager) ClearStaticNATEntries() error {
 		}
 	}
 	// Clear v6
-	if zm, ok := m.maps["static_nat_v6"]; ok {
+	if zm, present, _ := m.lookupMapLocked("static_nat_v6"); present {
 		var key StaticNATKeyV6
 		iter := zm.Iterate()
 		var keys []StaticNATKeyV6
@@ -288,16 +348,21 @@ func (m *Manager) ClearStaticNATEntries() error {
 
 // SetNAT64Config writes a NAT64 prefix config at the given index and hash map.
 func (m *Manager) SetNAT64Config(index uint32, cfg NAT64Config) error {
-	zm, ok := m.maps["nat64_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat64_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat64_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat64_configs not found")
 	}
 	if err := zm.Update(index, cfg, ebpf.UpdateAny); err != nil {
 		return err
 	}
 	// Also write to the hash map for O(1) lookup in BPF
-	hm, ok := m.maps["nat64_prefix_map"]
-	if ok {
+	// #2114 A3: OPTIONAL access — absent skips the mirror write, exactly
+	// as master.
+	hm, present, _ := m.lookupMapLocked("nat64_prefix_map")
+	if present {
 		key := NAT64PrefixKey{Prefix: cfg.Prefix}
 		hm.Update(key, cfg, ebpf.UpdateAny)
 	}
@@ -306,8 +371,11 @@ func (m *Manager) SetNAT64Config(index uint32, cfg NAT64Config) error {
 
 // SetNAT64Count writes the number of active NAT64 prefixes.
 func (m *Manager) SetNAT64Count(count uint32) error {
-	zm, ok := m.maps["nat64_count"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat64_count")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat64_count", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat64_count not found")
 	}
 	var zero uint32
@@ -316,8 +384,11 @@ func (m *Manager) SetNAT64Count(count uint32) error {
 
 // ClearNAT64Configs zeroes all NAT64 config entries and sets count to 0.
 func (m *Manager) ClearNAT64Configs() error {
-	zm, ok := m.maps["nat64_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat64_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nat64_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nat64_configs not found")
 	}
 	var empty NAT64Config
@@ -325,7 +396,7 @@ func (m *Manager) ClearNAT64Configs() error {
 		zm.Update(i, empty, ebpf.UpdateAny)
 	}
 	// Clear the hash map
-	if hm, ok := m.maps["nat64_prefix_map"]; ok {
+	if hm, present, _ := m.lookupMapLocked("nat64_prefix_map"); present {
 		var key NAT64PrefixKey
 		var val []byte
 		iter := hm.Iterate()
@@ -342,8 +413,11 @@ func (m *Manager) ClearNAT64Configs() error {
 
 // SetNPTv6Rule writes an NPTv6 prefix translation rule.
 func (m *Manager) SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error {
-	zm, ok := m.maps["nptv6_rules"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nptv6_rules")
+	if st == registryFresh {
+		return fmt.Errorf("%w: nptv6_rules", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("nptv6_rules map not found")
 	}
 	return zm.Update(key, val, ebpf.UpdateAny)
@@ -397,8 +471,11 @@ func (m *Manager) ClearNATRuleCounters() error {
 	// Drop userspace-reported offsets first so a clear takes effect even
 	// without a BPF map (userspace-only runtime) (#2218).
 	m.ClearNATRuleCounterOffsets()
-	zm, ok := m.maps["nat_rule_counters"]
-	if !ok {
+	// #2114 A3 class 3: state-independent pinned behavior — the offset
+	// reset above is the meaningful clear; the absent map is not an error
+	// in ANY state. Scoped lookup only; the zeroing below runs off-lock.
+	zm, present, _ := m.lookupMapLocked("nat_rule_counters")
+	if !present {
 		return nil
 	}
 	numCPUs := ebpf.MustPossibleCPU()
@@ -412,8 +489,11 @@ func (m *Manager) ClearNATRuleCounters() error {
 // ReadNATPortCounter reads the per-CPU NAT port allocation counter for a pool
 // and returns the sum across all CPUs.
 func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) {
-	zm, ok := m.maps["nat_port_counters"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("nat_port_counters")
+	if st == registryFresh {
+		return 0, fmt.Errorf("%w: nat_port_counters", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return 0, fmt.Errorf("nat_port_counters map not found")
 	}
 	var perCPU []NATPortCounter
@@ -432,8 +512,8 @@ func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) {
 // the seed, the allocator starts from port_low and reuses ports that remote
 // servers may still have in ESTABLISHED state from pre-restart sessions.
 func (m *Manager) SeedNATPortCounters() {
-	zm, ok := m.maps["nat_port_counters"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("nat_port_counters")
+	if !present {
 		return
 	}
 	numCPUs, err := ebpf.PossibleCPU()

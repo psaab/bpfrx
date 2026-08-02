@@ -66307,3 +66307,50 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/daemon_dp_canary_test.go (new), pkg/fwdstatus/sampler.go,
   pkg/dataplane/retirement_boundary_canary_test.go, 29 daemon test files
   (literal conversions), _Log.md
+## 2026-08-02 — #2114 A3: armed-state admission gate in pkg/dataplane
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Implemented work item A3 of the converged #2114 plan. The
+  atomic dpCell closes the interface tear but cannot order mutations the
+  backend performs on ITSELF after publication (the HA watcher can call
+  HA().SetRGActive on a coherent-but-starting backend while Start populates
+  the plain Go registries — a fatal concurrent-map read/write). Manager.loaded
+  is now atomic.Bool; Store(true) is the FINAL step inside the new
+  publishShimRegistryLocked whole-batch m.mu hold (batch+flag publish
+  atomically); Store(false) moved to Close()'s ENTRY (narrows the
+  loaded-check set's admission window and advances the externally visible
+  IsLoaded()/DataplaneLoaded surface during the close window — asserted, not
+  incidental). Every m.maps/m.programs access in every class in every state
+  now goes through the m.mu-scoped typed helper pair (lookupMapLocked/
+  lookupProgramLocked → handle, present, registryState), so classification
+  and handle selection are atomic with the gate outcome. The gate is
+  two-state: it fires ONLY on the FRESH-unarmed state (loaded==false AND
+  m.maps empty) where class-1 required accesses now return the typed
+  errors.Is-compatible ErrDataplaneNotArmed instead of master's per-map
+  "not found" error (or the fatal concurrent-map throw); the
+  RETAINED-unarmed state (Close/Teardown keep the pinned-map registry live)
+  proceeds exactly as master. The attach family + CompileConfig path keep
+  their own pre-registry loaded rejections (the carve-out — the typed error
+  never fires for them). Class-2 neutral outcomes are byte-for-byte
+  preserved; class-3 hybrids (ClearNATRuleCounters/ClearGlobalCounters/
+  ClearZoneCounters/ClearAllCounters) stay ungated with scoped lookups, and
+  ClearAllCounters composes through the ungated raw internals
+  (clearInterfaceCountersRaw/clearPolicyCountersRaw/clearFilterCountersRaw)
+  so the pinned legacy "interface_counters map not found" text survives on
+  every state (nested-call rule). Class-4 getters: Map/Program nil outcomes
+  preserved; NewEventSource's fresh outcome becomes the typed error (its
+  signature carries one). The xdpEntryProg trio + swapXDPEntryProg moved to
+  the locked-helper scheme (raw xdpEntryProgramLocked + scoped sections,
+  never whole-method locking); setXDPAttachedFlag's optional accesses keep
+  master's early-boot no-op (no gate — the DetachXDP claim cleanup must
+  always run). watchdog_test.go's two fresh-state pins moved from the
+  "ha_watchdog map not found" text to errors.Is(ErrDataplaneNotArmed) — the
+  intended class-1 fresh-state change.
+- **File(s)**: pkg/dataplane/armed_gate.go (new), pkg/dataplane/loader.go,
+  pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/maps_counters.go,
+  pkg/dataplane/maps_fabric.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/maps_flow.go, pkg/dataplane/maps_mirror.go,
+  pkg/dataplane/maps_nat.go, pkg/dataplane/maps_policy.go,
+  pkg/dataplane/maps_screen.go, pkg/dataplane/maps_session.go,
+  pkg/dataplane/maps_stale.go, pkg/dataplane/maps_stats.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/watchdog_test.go, _Log.md

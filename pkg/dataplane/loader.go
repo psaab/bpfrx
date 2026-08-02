@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -33,7 +34,14 @@ const (
 
 // Manager manages the eBPF dataplane: programs, maps, and attachments.
 type Manager struct {
-	loaded                  bool
+	// loaded is the #2114 A3 armed-admission bit: atomic so the
+	// pre-registry loaded checks (AttachXDP/AttachTC/CompileConfig) and
+	// the externally visible IsLoaded() surface never race the shim
+	// publication batch or Close. Store(true) is the FINAL step inside
+	// publishShimRegistryLocked's whole-batch m.mu hold; Store(false)
+	// runs at Close()'s ENTRY. It is an admission bit, NOT a lease — it
+	// cannot drain an operation that already observed true.
+	loaded                  atomic.Bool
 	programs                map[string]*ebpf.Program
 	maps                    map[string]*ebpf.Map
 	xdpLinks                map[int]link.Link
@@ -46,7 +54,7 @@ type Manager struct {
 	EnableCPUMap            bool // Enable cpumap multi-CPU distribution (adds startup overhead)
 	xdpEntryProg            string
 	VlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these)
-	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets + zone/flood offsets
+	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets + zone/flood offsets; #2114 A3: also the uniform m.maps/m.programs registry rule (every access goes through the lookupMapLocked/lookupProgramLocked scoped helpers, classification + handle selection atomic inside) and the xdpEntryProg field
 	userspaceCounterOffsets map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
 	// natRuleCounterOffsets holds per-rule NAT translation hit totals reported
 	// by the Rust userspace dataplane (keyed by compiler-assigned counter ID),
@@ -101,8 +109,22 @@ func New() *Manager {
 }
 
 // XDPEntryProgram returns the entry program selected for future XDP
-// attachments and non-VLAN-subinterface link swaps.
+// attachments and non-VLAN-subinterface link swaps. #2114 A3: the field
+// is m.mu-protected; each public accessor takes the lock ONCE and
+// delegates to the raw helper (sync.Mutex is non-reentrant, so the
+// predicate must NOT call the public getter).
 func (m *Manager) XDPEntryProgram() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if xdpEntryProgSelectorHook != nil {
+		xdpEntryProgSelectorHook()
+	}
+	return m.xdpEntryProgramLocked()
+}
+
+// xdpEntryProgramLocked returns the selected entry program with no
+// locking of its own; callers hold m.mu.
+func (m *Manager) xdpEntryProgramLocked() string {
 	if m.xdpEntryProg == "" {
 		return defaultXDPEntryProg
 	}
@@ -112,13 +134,20 @@ func (m *Manager) XDPEntryProgram() string {
 // SelectUserspaceXDPShimEntryProgram selects the retained userspace shim for
 // future XDP attachments without touching already attached links.
 func (m *Manager) SelectUserspaceXDPShimEntryProgram() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if xdpEntryProgSelectorHook != nil {
+		xdpEntryProgSelectorHook()
+	}
 	m.xdpEntryProg = userspaceShimEntryProg
 }
 
 // UsingUserspaceXDPShimEntryProgram reports whether the retained userspace
 // shim is selected for XDP attachments and swapped links.
 func (m *Manager) UsingUserspaceXDPShimEntryProgram() bool {
-	return m.XDPEntryProgram() == userspaceShimEntryProg
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.xdpEntryProgramLocked() == userspaceShimEntryProg
 }
 
 // Load is a retirement stub after the #1476 mechanical source removal.
@@ -161,7 +190,10 @@ func (m *Manager) LoadUserspaceShim() error {
 	if err := m.loadUserspaceShimObjects(); err != nil {
 		return err
 	}
-	m.loaded = true
+	// #2114 A3: the armed Store(true) lives INSIDE the shim registry
+	// publication batch (publishShimRegistryLocked, called from the load
+	// above), so the flag and a fully populated registry publish
+	// atomically.
 	slog.Info("userspace XDP shim loaded successfully")
 	return nil
 }
@@ -455,7 +487,7 @@ func (d userspaceShimCompileDataplane) ZeroStaleFilterConfigs(uint32) {}
 
 // IsLoaded returns true if eBPF programs are loaded.
 func (m *Manager) IsLoaded() bool {
-	return m.loaded
+	return m.loaded.Load()
 }
 
 // xdpAttachModeMatches reports whether the kernel's current XDP attach mode
@@ -487,13 +519,16 @@ func xdpAttachModeMatches(ifindex int, wantGeneric bool) bool {
 // When forceGeneric is false, tries native driver mode only (no automatic fallback).
 // On restart, reuses a previously pinned link and atomically replaces the program.
 func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
-	if !m.loaded {
+	// #2114 A3 carve-out: the attach family keeps its own pre-registry
+	// loaded rejection on BOTH unarmed states; the typed ErrDataplaneNotArmed
+	// never fires here.
+	if !m.loaded.Load() {
 		return fmt.Errorf("eBPF programs not loaded")
 	}
 
 	entryProg := m.XDPEntryProgram()
-	prog, ok := m.programs[entryProg]
-	if !ok {
+	prog, present, _ := m.lookupProgramLocked(entryProg)
+	if !present {
 		return fmt.Errorf("%s not found", entryProg)
 	}
 
@@ -588,7 +623,7 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 // never allocates in softirq context (#759). Idempotent: UpdateNoExist
 // races safely across repeated registrations.
 func (m *Manager) seedInterfaceCounter(ifindex int) {
-	ic := m.maps["interface_counters"]
+	ic, _, _ := m.lookupMapLocked("interface_counters")
 	if ic == nil {
 		return
 	}
@@ -606,11 +641,20 @@ func (m *Manager) SwapToUserspaceXDPShimEntryProgram() error {
 }
 
 func (m *Manager) swapXDPEntryProg(name string) error {
-	prog, ok := m.programs[name]
-	if !ok {
+	// #2114 A3 class 1: the program registry read is a REQUIRED access —
+	// the fresh state returns the typed gate error, an armed/retained miss
+	// keeps master's "not found".
+	prog, present, st := m.lookupProgramLocked(name)
+	if st == registryFresh {
+		return fmt.Errorf("%w: XDP program %s", ErrDataplaneNotArmed, name)
+	}
+	if !present {
 		return fmt.Errorf("XDP program %q not found", name)
 	}
-	if m.XDPEntryProgram() == name {
+	m.mu.Lock()
+	currentEntry := m.xdpEntryProgramLocked()
+	m.mu.Unlock()
+	if currentEntry == name {
 		return nil // already using this program
 	}
 	var errs []error
@@ -629,7 +673,15 @@ func (m *Manager) swapXDPEntryProg(name string) error {
 	if len(errs) > 0 {
 		return errs[0]
 	}
+	// #2114 A3: scoped section around the field write only — never
+	// whole-method locking (the xdpLinks loop above is serialized by the
+	// outer userspace-manager lock at the liveness-restore call site).
+	m.mu.Lock()
+	if swapXDPEntryProgHook != nil {
+		swapXDPEntryProgHook()
+	}
 	m.xdpEntryProg = name
+	m.mu.Unlock()
 	slog.Info("swapped XDP entry program", "program", name, "interfaces", len(m.xdpLinks))
 	return nil
 }
@@ -697,8 +749,11 @@ func (m *Manager) DetachXDP(ifindex int) error {
 // attach succeeded; the next SetZone re-applies the bit per the
 // claim set.
 func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
-	zm, ok := m.maps["iface_zone_map"]
-	if !ok {
+	// #2114 A3: OPTIONAL access — the absent-iface_zone_map early-boot
+	// no-op is master's preserved outcome in every state (no gate; the
+	// DetachXDP claim cleanup must always run on the retained registry).
+	zm, present, _ := m.lookupMapLocked("iface_zone_map")
+	if !present {
 		// No iface_zone_map yet (early boot before Compile) — nothing
 		// to flag. Caller treats this as a no-op success.
 		return nil
@@ -727,7 +782,7 @@ func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
 	// is the legitimate fast path: lookup returns ErrKeyNotExist
 	// for any non-VLAN ifindex) from a real lookup error (which we
 	// propagate so the caller can retry).
-	if vmap, ok := m.maps["vlan_iface_map"]; ok {
+	if vmap, present, _ := m.lookupMapLocked("vlan_iface_map"); present {
 		var vinfo VlanIfaceInfo
 		switch err := vmap.Lookup(uint32(ifindex), &vinfo); {
 		case err == nil:
@@ -828,8 +883,11 @@ func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
 
 // SetZone maps an {ifindex, vlanID} to a security zone and routing table in the BPF map.
 func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8, screenFlags uint32) error {
-	zm, ok := m.maps["iface_zone_map"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("iface_zone_map")
+	if st == registryFresh {
+		return fmt.Errorf("%w: iface_zone_map", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("iface_zone_map not found")
 	}
 	// #863: preserve / establish IFACE_FLAG_XDP_ATTACHED.
@@ -877,8 +935,11 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 
 // SetVlanIfaceInfo maps a VLAN sub-interface ifindex to its parent info.
 func (m *Manager) SetVlanIfaceInfo(subIfindex int, parentIfindex int, vlanID uint16) error {
-	zm, ok := m.maps["vlan_iface_map"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("vlan_iface_map")
+	if st == registryFresh {
+		return fmt.Errorf("%w: vlan_iface_map", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("vlan_iface_map not found")
 	}
 	val := VlanIfaceInfo{ParentIfindex: uint32(parentIfindex), VlanID: vlanID}
@@ -887,8 +948,11 @@ func (m *Manager) SetVlanIfaceInfo(subIfindex int, parentIfindex int, vlanID uin
 
 // ClearIfaceZoneMap deletes all iface_zone_map entries.
 func (m *Manager) ClearIfaceZoneMap() error {
-	zm, ok := m.maps["iface_zone_map"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("iface_zone_map")
+	if st == registryFresh {
+		return fmt.Errorf("%w: iface_zone_map", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("iface_zone_map not found")
 	}
 	var key IfaceZoneKey
@@ -907,8 +971,8 @@ func (m *Manager) ClearIfaceZoneMap() error {
 // clearNativeXDPFlags removes IfaceFlagNativeXDP from all iface_zone_map
 // entries.  Called when falling back from native to generic XDP mode.
 func (m *Manager) clearNativeXDPFlags() {
-	zm, ok := m.maps["iface_zone_map"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("iface_zone_map")
+	if !present {
 		return
 	}
 	var key IfaceZoneKey
@@ -925,8 +989,8 @@ func (m *Manager) clearNativeXDPFlags() {
 // clearNativeXDPFlagsForIfindexes removes IfaceFlagNativeXDP from iface_zone_map
 // entries that belong to the specified physical interfaces.
 func (m *Manager) clearNativeXDPFlagsForIfindexes(ifindexes []int) {
-	zm, ok := m.maps["iface_zone_map"]
-	if !ok || len(ifindexes) == 0 {
+	zm, present, _ := m.lookupMapLocked("iface_zone_map")
+	if !present || len(ifindexes) == 0 {
 		return
 	}
 	targets := make(map[uint32]struct{}, len(ifindexes))
@@ -954,8 +1018,11 @@ func (m *Manager) clearNativeXDPFlagsForIfindexes(ifindexes []int) {
 
 // ClearVlanIfaceMap deletes all vlan_iface_map entries.
 func (m *Manager) ClearVlanIfaceMap() error {
-	zm, ok := m.maps["vlan_iface_map"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("vlan_iface_map")
+	if st == registryFresh {
+		return fmt.Errorf("%w: vlan_iface_map", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("vlan_iface_map not found")
 	}
 	var key uint32
@@ -986,8 +1053,11 @@ func (m *Manager) AddTxPort(ifindex int) error {
 			ifindex, MaxInterfaces,
 		)
 	}
-	tm, ok := m.maps["tx_ports"]
-	if !ok {
+	tm, present, st := m.lookupMapLocked("tx_ports")
+	if st == registryFresh {
+		return fmt.Errorf("%w: tx_ports", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("tx_ports not found")
 	}
 	val := struct {
@@ -1079,12 +1149,12 @@ func (m *Manager) preflightCheckIfindexCaps(referenced map[int]bool) error {
 // AttachTC attaches the TC main program to the egress path of the given interface.
 // On restart, reuses a previously pinned link and atomically replaces the program.
 func (m *Manager) AttachTC(ifindex int) error {
-	if !m.loaded {
+	if !m.loaded.Load() {
 		return fmt.Errorf("eBPF programs not loaded")
 	}
 
-	prog, ok := m.programs["tc_main_prog"]
-	if !ok {
+	prog, present, _ := m.lookupProgramLocked("tc_main_prog")
+	if !present {
 		return fmt.Errorf("tc_main_prog not found")
 	}
 
@@ -1147,19 +1217,29 @@ func (m *Manager) GetPersistentNAT() *PersistentNATTable {
 	return m.PersistentNAT
 }
 
-// Map returns a named eBPF map, or nil if not found.
+// Map returns a named eBPF map, or nil if not found. #2114 A3 class 4:
+// the handle copy happens inside the scoped registry lookup; nil covers
+// the fresh and absent outcomes exactly as master.
 func (m *Manager) Map(name string) *ebpf.Map {
-	return m.maps[name]
+	h, _, _ := m.lookupMapLocked(name)
+	return h
 }
 
-// Program returns a named eBPF program, or nil if not found.
+// Program returns a named eBPF program, or nil if not found (#2114 A3
+// class 4 — see Map).
 func (m *Manager) Program(name string) *ebpf.Program {
-	return m.programs[name]
+	p, _, _ := m.lookupProgramLocked(name)
+	return p
 }
 
 // NewEventSource creates an EventSource that reads from the eBPF events ring buffer.
 func (m *Manager) NewEventSource() (EventSource, error) {
-	evMap := m.maps["events"]
+	// #2114 A3 class 4 with an error signature: the fresh state returns
+	// the typed gate error; an armed/retained miss keeps master's text.
+	evMap, _, st := m.lookupMapLocked("events")
+	if st == registryFresh {
+		return nil, fmt.Errorf("%w: events", ErrDataplaneNotArmed)
+	}
 	if evMap == nil {
 		return nil, fmt.Errorf("events map not loaded")
 	}
@@ -1204,6 +1284,18 @@ func (m *Manager) TCLinks() map[int]link.Link {
 // and links in the kernel for the next daemon to reuse. This enables
 // hitless restarts — sessions survive and XDP/TC programs keep running.
 func (m *Manager) Close() error {
+	// #2114 A3: publish the unarmed transition at ENTRY so the
+	// loaded-check set (AttachXDP/AttachTC/CompileConfig) stops admitting
+	// new work BEFORE the link handles close, and the externally visible
+	// IsLoaded() surface (REST/gRPC DataplaneLoaded) flips at the start
+	// of the close window rather than its end. The registry is
+	// deliberately NOT cleared: hitless restart keeps the pinned-map
+	// handles live (the retained-unarmed state), so ordinary methods
+	// still classify retained and proceed.
+	m.loaded.Store(false)
+	if closeWindowHook != nil {
+		closeWindowHook()
+	}
 	for ifindex, l := range m.xdpLinks {
 		if err := l.Close(); err != nil {
 			slog.Error("failed to close XDP link handle", "ifindex", ifindex, "err", err)
@@ -1214,7 +1306,6 @@ func (m *Manager) Close() error {
 			slog.Error("failed to close TC link handle", "ifindex", ifindex, "err", err)
 		}
 	}
-	m.loaded = false
 	return nil
 }
 

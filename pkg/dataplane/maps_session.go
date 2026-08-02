@@ -41,8 +41,11 @@ func IsKeyNotFound(err error) bool {
 // reasonably accurate idle times.  Session lifetime is owned by the
 // helper, not Go GC (GC.SkipSweep is set).  See #333.
 func (m *Manager) IterateSessions(fn func(SessionKey, SessionValue) bool) error {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions map not found")
 	}
 
@@ -59,8 +62,11 @@ func (m *Manager) IterateSessions(fn func(SessionKey, SessionValue) bool) error 
 
 // DeleteSession deletes a session entry by key.
 func (m *Manager) DeleteSession(key SessionKey) error {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions map not found")
 	}
 	return sm.Delete(key)
@@ -68,8 +74,11 @@ func (m *Manager) DeleteSession(key SessionKey) error {
 
 // SetSessionV4 writes a v4 session entry (used by cluster sync to install sessions from peer).
 func (m *Manager) SetSessionV4(key SessionKey, val SessionValue) error {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions map not found")
 	}
 	return sm.Update(key, val.toBPF(), ebpf.UpdateAny)
@@ -77,8 +86,11 @@ func (m *Manager) SetSessionV4(key SessionKey, val SessionValue) error {
 
 // GetSessionV4 looks up a single v4 session entry by key.
 func (m *Manager) GetSessionV4(key SessionKey) (SessionValue, error) {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return SessionValue{}, fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return SessionValue{}, fmt.Errorf("sessions map not found")
 	}
 	var val bpfSessionValue
@@ -90,8 +102,11 @@ func (m *Manager) GetSessionV4(key SessionKey) (SessionValue, error) {
 
 // GetSessionV6 looks up a single v6 session entry by key.
 func (m *Manager) GetSessionV6(key SessionKeyV6) (SessionValueV6, error) {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return SessionValueV6{}, fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return SessionValueV6{}, fmt.Errorf("sessions_v6 map not found")
 	}
 	var val bpfSessionValueV6
@@ -103,8 +118,11 @@ func (m *Manager) GetSessionV6(key SessionKeyV6) (SessionValueV6, error) {
 
 // IterateSessionsV6 iterates all IPv6 session entries, calling fn for each.
 func (m *Manager) IterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) error {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 
@@ -123,8 +141,11 @@ func (m *Manager) IterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) 
 // If cursorKey is nil, iteration starts from the beginning.
 // fn returns false to stop iteration.
 func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey, SessionValue) bool) error {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions map not found")
 	}
 
@@ -174,8 +195,11 @@ func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey,
 // If cursorKey is nil, iteration starts from the beginning.
 // fn returns false to stop iteration.
 func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(SessionKeyV6, SessionValueV6) bool) error {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 
@@ -223,8 +247,11 @@ func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(Session
 // kernel lock contention.  Yields between batches so BPF datapath isn't
 // starved of hash-table bucket locks.
 func (m *Manager) BatchIterateSessions(fn func(SessionKey, SessionValue) bool) error {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions map not found")
 	}
 
@@ -252,8 +279,11 @@ func (m *Manager) BatchIterateSessions(fn func(SessionKey, SessionValue) bool) e
 
 // BatchIterateSessionsV6 is the IPv6 variant of BatchIterateSessions.
 func (m *Manager) BatchIterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) error {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 
@@ -281,8 +311,11 @@ func (m *Manager) BatchIterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) b
 
 // BatchDeleteSessions deletes multiple session entries in a single syscall.
 func (m *Manager) BatchDeleteSessions(keys []SessionKey) (int, error) {
-	sm, ok := m.maps["sessions"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions")
+	if st == registryFresh {
+		return 0, fmt.Errorf("%w: sessions", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return 0, fmt.Errorf("sessions map not found")
 	}
 	if len(keys) == 0 {
@@ -293,8 +326,11 @@ func (m *Manager) BatchDeleteSessions(keys []SessionKey) (int, error) {
 
 // BatchDeleteSessionsV6 deletes multiple IPv6 session entries in a single syscall.
 func (m *Manager) BatchDeleteSessionsV6(keys []SessionKeyV6) (int, error) {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return 0, fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return 0, fmt.Errorf("sessions_v6 map not found")
 	}
 	if len(keys) == 0 {
@@ -305,8 +341,11 @@ func (m *Manager) BatchDeleteSessionsV6(keys []SessionKeyV6) (int, error) {
 
 // DeleteSessionV6 deletes an IPv6 session entry by key.
 func (m *Manager) DeleteSessionV6(key SessionKeyV6) error {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 	return sm.Delete(key)
@@ -314,8 +353,11 @@ func (m *Manager) DeleteSessionV6(key SessionKeyV6) error {
 
 // SetSessionV6 writes a v6 session entry (used by cluster sync to install sessions from peer).
 func (m *Manager) SetSessionV6(key SessionKeyV6, val SessionValueV6) error {
-	sm, ok := m.maps["sessions_v6"]
-	if !ok {
+	sm, present, st := m.lookupMapLocked("sessions_v6")
+	if st == registryFresh {
+		return fmt.Errorf("%w: sessions_v6", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
 	return sm.Update(key, val.toBPF(), ebpf.UpdateAny)
@@ -324,7 +366,7 @@ func (m *Manager) SetSessionV6(key SessionKeyV6, val SessionValueV6) error {
 // SessionCount returns the number of active IPv4 and IPv6 sessions.
 // Only forward entries are counted (IsReverse == 0).
 func (m *Manager) SessionCount() (v4, v6 int) {
-	if sm, ok := m.maps["sessions"]; ok {
+	if sm, present, _ := m.lookupMapLocked("sessions"); present {
 		var key SessionKey
 		var val bpfSessionValue
 		iter := sm.Iterate()
@@ -334,7 +376,7 @@ func (m *Manager) SessionCount() (v4, v6 int) {
 			}
 		}
 	}
-	if sm, ok := m.maps["sessions_v6"]; ok {
+	if sm, present, _ := m.lookupMapLocked("sessions_v6"); present {
 		var key SessionKeyV6
 		var val bpfSessionValueV6
 		iter := sm.Iterate()
@@ -609,8 +651,8 @@ func (m *Manager) clearSessionsV6(keys []SessionKeyV6) int {
 // node-specific base to avoid collisions between cluster nodes.
 // Each CPU gets base = (nodeID << 48) | (cpuIndex << 32).
 func (m *Manager) SeedSessionIDCounter(nodeID int) {
-	zm, ok := m.maps["session_id_gen"]
-	if !ok {
+	zm, present, _ := m.lookupMapLocked("session_id_gen")
+	if !present {
 		return
 	}
 	numCPUs, err := ebpf.PossibleCPU()

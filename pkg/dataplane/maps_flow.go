@@ -30,8 +30,11 @@ const Lo0FilterNone = uint16(0xFFFF)
 
 // SetFlowTimeout writes a flow timeout value (in seconds) at the given index.
 func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
-	zm, ok := m.maps["flow_timeouts"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("flow_timeouts")
+	if st == registryFresh {
+		return fmt.Errorf("%w: flow_timeouts", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("flow_timeouts map not found")
 	}
 	return zm.Update(idx, seconds, ebpf.UpdateAny)
@@ -39,8 +42,11 @@ func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
 
 // SetFlowConfig writes the global flow configuration (TCP MSS clamp, etc.).
 func (m *Manager) SetFlowConfig(cfg FlowConfigValue) error {
-	zm, ok := m.maps["flow_config_map"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("flow_config_map")
+	if st == registryFresh {
+		return fmt.Errorf("%w: flow_config_map", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("flow_config_map map not found")
 	}
 	return zm.Update(uint32(0), cfg, ebpf.UpdateAny)

@@ -14,8 +14,11 @@ import (
 
 // SetScreenConfig writes a screen profile configuration entry.
 func (m *Manager) SetScreenConfig(profileID uint32, cfg ScreenConfig) error {
-	zm, ok := m.maps["screen_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("screen_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: screen_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("screen_configs map not found")
 	}
 	return zm.Update(profileID, cfg, ebpf.UpdateAny)
@@ -23,8 +26,11 @@ func (m *Manager) SetScreenConfig(profileID uint32, cfg ScreenConfig) error {
 
 // ClearScreenConfigs zeroes all screen_configs entries.
 func (m *Manager) ClearScreenConfigs() error {
-	zm, ok := m.maps["screen_configs"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("screen_configs")
+	if st == registryFresh {
+		return fmt.Errorf("%w: screen_configs", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("screen_configs map not found")
 	}
 	empty := ScreenConfig{}
@@ -36,8 +42,11 @@ func (m *Manager) ClearScreenConfigs() error {
 
 // UpdateSessionCountSrc writes a per-source-IP session count entry.
 func (m *Manager) UpdateSessionCountSrc(key SessionCountKey, count uint32) error {
-	zm, ok := m.maps["session_count_src"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("session_count_src")
+	if st == registryFresh {
+		return fmt.Errorf("%w: session_count_src", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("session_count_src map not found")
 	}
 	val := SessionCountValue{Count: count}
@@ -46,8 +55,11 @@ func (m *Manager) UpdateSessionCountSrc(key SessionCountKey, count uint32) error
 
 // UpdateSessionCountDst writes a per-destination-IP session count entry.
 func (m *Manager) UpdateSessionCountDst(key SessionCountKey, count uint32) error {
-	zm, ok := m.maps["session_count_dst"]
-	if !ok {
+	zm, present, st := m.lookupMapLocked("session_count_dst")
+	if st == registryFresh {
+		return fmt.Errorf("%w: session_count_dst", ErrDataplaneNotArmed)
+	}
+	if !present {
 		return fmt.Errorf("session_count_dst map not found")
 	}
 	val := SessionCountValue{Count: count}
@@ -57,8 +69,8 @@ func (m *Manager) UpdateSessionCountDst(key SessionCountKey, count uint32) error
 // ClearSessionCounts deletes all entries from the session count maps.
 func (m *Manager) ClearSessionCounts() error {
 	for _, name := range []string{"session_count_src", "session_count_dst"} {
-		zm, ok := m.maps[name]
-		if !ok {
+		zm, present, _ := m.lookupMapLocked(name)
+		if !present {
 			continue
 		}
 		var key SessionCountKey
