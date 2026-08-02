@@ -183,6 +183,17 @@ const (
 // heartbeatAuthState.epochSeen for why the receiver latch is process-scoped.
 var bootEpochPath = "/var/lib/xpf/ha-boot-epoch"
 
+// bootEpochStopJoinBudget is how long Manager.Stop waits for an in-flight
+// refine worker before giving up on it.
+//
+// Two seconds is chosen against the shutdown path, not against the store: the
+// worker's only blocking calls are a flock and an fsync, which cost
+// microseconds on a healthy store and are unbounded on a wedged one, so the
+// budget never bites in the case it is not needed and bounds the case it is.
+// Stop runs immediately after VRRP priority-0 and before the session-sync stop
+// (its own 5s), inside the unit's TimeoutStopSec=20.
+const bootEpochStopJoinBudget = 2 * time.Second
+
 // epochFlock is the lock withEpochFileLock takes. A var for the same reason
 // epochNowNanos is one: the SECOND of its two failure branches is otherwise
 // unreachable from a test. Failing the open is easy (point the lock path
@@ -204,16 +215,29 @@ var epochNowNanos = func() int64 { return time.Now().UnixNano() }
 // the same reason epochFlock is one: the branch behind it is otherwise
 // unreachable from a test.
 //
-// It runs in startBootEpochRefine between the worker's first pending check and
-// the store that releases bootEpochRefining. That window is the ONLY one in
-// which a requester both loses the CAS (so it queues rather than spawning) and
-// stores its request too late for the check that just ran — i.e. the window the
-// re-claim step below the release exists to cover. It is nanoseconds wide in
-// production, so hammering does not reach it; without the seam the re-claim can
-// be deleted outright with the suite green.
+// It runs in releaseBootEpochRefine between the pending check and the CAS that
+// releases the in-flight bit. That window is the ONLY one in which a requester
+// both loses the claim (so it queues rather than spawning) and publishes its
+// request too late for the check that just ran — i.e. the window the release
+// CAS has to detect. It is nanoseconds wide in production, so hammering does
+// not reach it; without the seam the release can be reduced to a plain store
+// with the suite green.
 //
 // No-op by default and never set outside tests.
 var epochRefineBeforeRelease = func() {}
+
+// epochRefineAfterLostClaim is the OTHER side of that same window, and it is a
+// seam for the same reason: the interleaving cannot be scheduled from a test
+// without one.
+//
+// It runs in claimBootEpochRefine after the caller has observed a worker in
+// flight and before it publishes its request against that observation. Holding
+// a requester here while the worker runs all the way out lands the request
+// exactly where a torn (two-atomic) pair would strand it, which is what
+// TestLateRefineRequestCannotBeStranded_6669 drives.
+//
+// No-op by default and never set outside tests.
+var epochRefineAfterLostClaim = func() {}
 
 // epochUsableAsFloor bounds what the receiver is willing to LATCH as its
 // high-water epoch.
@@ -678,6 +702,133 @@ func (m *Manager) refreshBootEpoch() {
 	m.startBootEpochRefine(nil)
 }
 
+// The two bits of Manager.bootEpochRefine. Only three states are reachable —
+// 0, {refining}, {refining|pending} — because the pending bit is only ever set
+// while the in-flight bit is held, and the release drops both together. A bare
+// {pending} would be a request with no worker, which is the state this word
+// exists to make unrepresentable.
+const (
+	bootEpochRefiningBit uint32 = 1 << 0
+	bootEpochPendingBit  uint32 = 1 << 1
+)
+
+// claimBootEpochRefine takes the in-flight slot for the CALLER, or hands the
+// request to the worker already holding it. It reports whether the caller now
+// owns the slot and must spawn the worker. It never blocks.
+//
+// THE PAIR MOVES AS ONE WORD, and that is what closes a lost wakeup rather than
+// saving a cache line. With the in-flight flag and the pending bit as separate
+// atomics, this sequence stranded a request with nobody to serve it:
+//
+//	R: CAS(refining, false->true) FAILS   (worker still in flight)
+//	W: clears pending; releases refining; re-claims pending -> nothing;
+//	   returns.                              <-- no worker left
+//	R: Store(pending, true)                  <-- nobody will serve it
+//
+// R's observation ("a worker is in flight") had gone stale by the time it acted
+// on it, and a plain Store cannot notice. Here the observation and the action
+// are ONE CompareAndSwap on the pair: if the worker released the slot in
+// between, the CAS fails against the word the worker left, and the retry sees
+// an idle slot and takes it — spawning the pass itself instead of queuing it
+// onto a worker that has gone. Symmetrically, releaseBootEpochRefine's release
+// only succeeds while the pending bit is still clear.
+//
+// The window it closes is a few instructions wide and was not reachable by
+// hammering (3000 rounds x 4 concurrent refreshBootEpoch never landed in it),
+// so it is driven deterministically through the epochRefineAfterLostClaim seam
+// — see TestLateRefineRequestCannotBeStranded_6669. What it cost when it did
+// land was not a diagnosable failure: nothing in production observes the
+// stranded bit, so an operator would have seen only a node that stayed below
+// its peer's floor until some later heartbeat start, which nothing bounds
+// (#6724) and which may never come.
+//
+// COALESCING IS PRESERVED: pending is a BIT, not a queue, so any number of
+// requests arriving during one pass collapse into a single follow-up, and a
+// caller that must not block still cannot build a backlog of fsync-ing workers.
+func (m *Manager) claimBootEpochRefine() bool {
+	for {
+		st := m.bootEpochRefine.Load()
+		if st&bootEpochRefiningBit == 0 {
+			// Idle. Take the slot; preserve any pending bit so a follow-up
+			// already owed is served rather than dropped.
+			if m.bootEpochRefine.CompareAndSwap(st, st|bootEpochRefiningBit) {
+				return true
+			}
+			continue
+		}
+		epochRefineAfterLostClaim()
+		if st&bootEpochPendingBit != 0 {
+			// A follow-up is already owed. Coalesce onto it.
+			return false
+		}
+		if m.bootEpochRefine.CompareAndSwap(st, st|bootEpochPendingBit) {
+			return false
+		}
+		// The word moved under us — the worker either took a pass or released
+		// the slot. Re-read and decide again against what it actually left.
+	}
+}
+
+// releaseBootEpochRefine ends one pass. It reports whether another pass is
+// owed; when it returns false the in-flight slot has been released and the
+// worker must return without touching Manager state again.
+//
+// s.mu is not involved: the whole protocol is the one word. The release CAS
+// carries the pending bit's value at the instant of release, so a request that
+// lands between the check and the CAS fails the CAS rather than being lost —
+// the mirror of claimBootEpochRefine's retry.
+func (m *Manager) releaseBootEpochRefine() bool {
+	for {
+		st := m.bootEpochRefine.Load()
+		if st&bootEpochPendingBit != 0 {
+			// Serve it here, with the in-flight bit still held, so no second
+			// worker spawns.
+			if m.bootEpochRefine.CompareAndSwap(st, st&^bootEpochPendingBit) {
+				return true
+			}
+			continue
+		}
+		epochRefineBeforeRelease()
+		if m.bootEpochRefine.CompareAndSwap(st, st&^bootEpochRefiningBit) {
+			return false
+		}
+		// A request arrived in that window. It is still in the word; loop and
+		// pick it up.
+	}
+}
+
+// joinBootEpochRefine waits for an in-flight refine worker to exit, up to
+// budget. It reports whether the worker was joined.
+//
+// THE BOUND IS THE POINT. The worker's blocking calls are a flock and an fsync,
+// and this whole file exists because those can wedge indefinitely without that
+// being allowed to stall the HA path (see heartbeatBootEpoch, and the 2s wait
+// initHeartbeatEpochState had to lose). An unbounded join in Manager.Stop would
+// reintroduce exactly that: a shutdown parked behind a dead disk, on the path
+// that has just sent VRRP priority-0 and still has to stop session sync. So the
+// wait is bounded and the timeout is reported rather than hidden.
+//
+// WHAT THE TIMEOUT LEAVES BEHIND is small and bounded: the worker holds no
+// locks a caller can wait on and, after its final pass, touches only
+// m.bootEpoch and m.bootEpochWrote (both atomic) and the state file (written
+// through fsatomic, so a concurrent reader sees the old or the new value and
+// never a torn one). It cannot resurrect the heartbeat or re-enter election.
+func (m *Manager) joinBootEpochRefine(budget time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		m.bootEpochWG.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 // startBootEpochRefine runs one refinement on a worker. ready, when non-nil, is
 // closed once that attempt finishes.
 //
@@ -685,8 +836,8 @@ func (m *Manager) refreshBootEpoch() {
 // (withEpochFileLock serializes them) but they race on the persist watermark,
 // whose whole job is to tell "the file holds what I wrote" from "the file moved
 // under me". So exactly one worker runs — and a request that arrives while it
-// is in flight sets bootEpochRefinePending, which that worker serves as another
-// pass before it exits.
+// is in flight sets the pending bit, which that worker serves as another pass
+// before it exits.
 //
 // AN EARLIER REVISION DROPPED SUCH A REQUEST, and the drop silently discarded
 // precisely the request that was needed. The in-flight worker's locked READ can
@@ -694,50 +845,40 @@ func (m *Manager) refreshBootEpoch() {
 // pass:
 //
 //   - B's worker finishes its read of file `b`, releases the lock, and is
-//     descheduled before storing its watermark and clearing the in-flight flag;
+//     descheduled before storing its watermark and clearing the in-flight bit;
 //   - A locks next, persists `b+1` and emits it; the peer raises its floor and
 //     refuses B at `b`;
-//   - B's next StartHeartbeat loses the CAS and returns WITHOUT queuing;
+//   - B's next StartHeartbeat loses the claim and returns WITHOUT queuing;
 //   - B's old worker resumes, records the stale watermark `b`, and clears the
-//     flag without re-reading.
+//     bit without re-reading.
 //
 // B is then below the peer's floor until some LATER heartbeat start, which
 // nothing bounds (#6724) and which may never come. Coalescing turns "the
-// request is lost" into "the request costs one extra pass".
-//
-// FOR EVERY REQUEST BUT ONE, and stating it flat overstates it. The worker
-// re-checks the bit twice — once with the in-flight flag still held, once after
-// releasing it (the re-claim step, TestLateRefineRequestIsReclaimed_6669) — and
-// a request that stores the bit after the SECOND check has nobody left to serve
-// it:
-//
-//	R: CAS(refining, false->true) FAILS   (worker still in flight)
-//	W: clears pending; releases refining; re-claims pending -> nothing;
-//	   returns.                              <-- no worker left
-//	R: Store(pending, true)                  <-- nobody will serve it
-//
-// The window is the few instructions between W's final CompareAndSwap and its
-// return, and R must complete a whole lost CAS inside it. It survives as the
-// same bounded cost as the mis-ordering it recovers from — the request is
-// served at the next heartbeat start, which nothing bounds (#6724) — and the
-// stranded state is self-announcing rather than silent, since waitBootEpochIdle
-// hangs on exactly the bit that was left set. 3000 rounds x 4 concurrent
-// refreshBootEpoch did not reach it. Closing it needs the pending bit and the
-// in-flight flag to move together (one word, CAS'd as a pair), which is a
-// larger change than the drop it replaced.
-//
-// It is a BIT, not a queue, so the cost stays bounded: any number of requests
-// arriving during one pass collapse into a single follow-up, and a caller that
-// must not block still cannot build a backlog of fsync-ing workers.
+// request is lost" into "the request costs one extra pass", and the claim/
+// release pair on ONE word (claimBootEpochRefine) is what makes that hold for
+// EVERY request rather than for every request but one.
 func (m *Manager) startBootEpochRefine(ready chan struct{}) {
-	if !m.bootEpochRefining.CompareAndSwap(false, true) {
-		// Hand the request to the worker already running rather than dropping
-		// it. The worker re-checks this bit after every pass.
-		m.bootEpochRefinePending.Store(true)
-		// Signal anyway: a caller joining `ready` must never block because
-		// someone else got there first. Only heartbeatBootEpoch passes a
-		// non-nil channel and only from inside bootEpochOnce, so this cannot
-		// double-close.
+	// Claim the slot and register the worker under one lock. A concurrent
+	// Manager.Stop therefore either sees the registration and joins it, or
+	// refuses the spawn outright — it can never Add to a WaitGroup it is
+	// already waiting on. The lock is never held across I/O (the claim is a
+	// CAS loop), so this still cannot block a heartbeat start.
+	m.bootEpochRefineMu.Lock()
+	claimed := false
+	if !m.bootEpochStopped {
+		claimed = m.claimBootEpochRefine()
+		if claimed {
+			m.bootEpochWG.Add(1)
+		}
+	}
+	m.bootEpochRefineMu.Unlock()
+
+	if !claimed {
+		// Either the request was handed to a worker already running, or the
+		// manager is stopped and no refinement will run at all. Signal anyway:
+		// a caller joining `ready` must never block because someone else got
+		// there first. Only heartbeatBootEpoch passes a non-nil channel and
+		// only from inside bootEpochOnce, so this cannot double-close.
 		if ready != nil {
 			close(ready)
 		}
@@ -747,6 +888,7 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 	// override, and a worker reading it later would race the next test.
 	path := bootEpochPath
 	go func() {
+		defer m.bootEpochWG.Done()
 		// `ready` keeps its documented meaning — closed when the FIRST attempt
 		// finishes — rather than being deferred to the end of a coalesced run.
 		// The deferred close covers the paths that leave the loop early.
@@ -762,25 +904,7 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 				signalled = true
 				close(ready)
 			}
-			if m.bootEpochRefinePending.CompareAndSwap(true, false) {
-				// A request arrived while that pass ran. Serve it here, with
-				// the in-flight flag still held, so no second worker spawns.
-				continue
-			}
-			epochRefineBeforeRelease()
-			m.bootEpochRefining.Store(false)
-			// A request that lost the CAS between our check above and that
-			// store set the bit and returned expecting US to serve it. Nobody
-			// else will: the setter saw a worker in flight. Re-claim it.
-			if !m.bootEpochRefinePending.CompareAndSwap(true, false) {
-				return
-			}
-			if !m.bootEpochRefining.CompareAndSwap(false, true) {
-				// Another worker took the slot in that window. Hand the request
-				// back rather than consuming it — that worker re-checks the bit
-				// after its own pass, so the request is still served exactly
-				// once and cannot be stranded with no worker running.
-				m.bootEpochRefinePending.Store(true)
+			if !m.releaseBootEpochRefine() {
 				return
 			}
 		}

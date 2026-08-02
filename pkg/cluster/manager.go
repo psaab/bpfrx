@@ -239,8 +239,7 @@ type Manager struct {
 	// a node whose heartbeat was already stopped, and that wait was removed
 	// (initHeartbeatEpochState). Tests use it to join the worker.
 	//
-	// bootEpochWrote is the epoch this incarnation last persisted, and
-	// bootEpochRefining admits one refine worker at a time. Refinement is
+	// bootEpochWrote is the epoch this incarnation last persisted. Refinement is
 	// RE-RUN on every later heartbeat start (Manager.refreshBootEpoch), because
 	// the epoch is resolved against a file other incarnations also write: one
 	// that takes withEpochFileLock after us can raise the file above what we
@@ -250,20 +249,35 @@ type Manager struct {
 	// left alone rather than chained from, which would ratchet the epoch by one
 	// per pass.
 	//
-	// bootEpochRefinePending COALESCES a request that arrives while a worker is
-	// in flight. Dropping it instead lost exactly the request that was needed:
-	// the in-flight worker may already have completed its locked READ, so an
-	// update that lands after it is invisible to that pass, and the caller who
-	// lost the CAS is the one asking for the re-read. See
-	// Manager.startBootEpochRefine. It is a BIT, not a queue: at most one extra
-	// pass is ever outstanding, so a caller that must not block cannot build an
-	// unbounded backlog of fsync-ing workers.
-	bootEpochOnce          sync.Once
-	bootEpoch              atomic.Uint64
-	bootEpochReady         chan struct{}
-	bootEpochWrote         atomic.Uint64
-	bootEpochRefining      atomic.Bool
-	bootEpochRefinePending atomic.Bool
+	// bootEpochRefine is ONE WORD holding TWO bits — bootEpochRefiningBit admits
+	// one refine worker at a time, bootEpochPendingBit COALESCES a request that
+	// arrives while that worker is in flight — and their being one word is a
+	// correctness requirement, not packing. Two separate atomic.Bools could be
+	// observed torn: a requester that read "a worker is in flight" and then
+	// stored the pending bit after that worker's last check had nobody left to
+	// serve it. Every transition is a CAS on the pair, so a requester whose
+	// observation went stale fails its CAS and takes the in-flight slot itself.
+	// See Manager.startBootEpochRefine.
+	//
+	// Dropping the request instead of coalescing it lost exactly the request
+	// that was needed: the in-flight worker may already have completed its
+	// locked READ, so an update that lands after it is invisible to that pass,
+	// and the caller who lost the claim is the one asking for the re-read. It is
+	// a BIT, not a queue: at most one extra pass is ever outstanding, so a
+	// caller that must not block cannot build an unbounded backlog of fsync-ing
+	// workers.
+	//
+	// bootEpochWG tracks the worker so Manager.Stop can join it (bounded);
+	// bootEpochStopped, under bootEpochRefineMu, keeps a spawn from Add-ing to a
+	// WaitGroup that Stop is already waiting on. See Manager.joinBootEpochRefine.
+	bootEpochOnce     sync.Once
+	bootEpoch         atomic.Uint64
+	bootEpochReady    chan struct{}
+	bootEpochWrote    atomic.Uint64
+	bootEpochRefine   atomic.Uint32
+	bootEpochRefineMu sync.Mutex
+	bootEpochStopped  bool
+	bootEpochWG       sync.WaitGroup
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable — a peer rolled back to a pre-#6169
@@ -625,7 +639,36 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 // Stop halts monitoring and heartbeat goroutines.
+//
+// It also joins the boot-epoch refine worker, which nothing used to wait for.
+// That worker is spawned from StartHeartbeat (initHeartbeatEpochState) or from
+// the first signed send (heartbeatBootEpoch, under bootEpochOnce), and it is
+// allowed to park indefinitely inside a flock or an fsync — so it OUTLIVING
+// Stop needs no race at all: a single sequential shutdown over a wedged store
+// reaches it. It would then still be storing to m.bootEpoch / m.bootEpochWrote
+// and writing the state file on a manager the daemon has finished tearing down,
+// and in tests it outlives the t.Cleanup that restores bootEpochPath / the
+// epochFlock and epochNowNanos seams it reads.
+//
+// The join is BOUNDED for the reason the wait in initHeartbeatEpochState had to
+// go: a storage fault must never stall the HA path, and this one runs directly
+// after VRRP priority-0. See Manager.joinBootEpochRefine for what a timeout
+// leaves behind.
+//
+// Stop is terminal, exactly like m.stopped: the flag is never cleared, so a
+// manager that has been stopped starts no further refinement. A late
+// heartbeatBootEpoch on a sender still winding down therefore still publishes
+// its wall-clock epoch — that store is synchronous and ahead of any I/O — and
+// simply skips the persistence refinement, which is the same degradation a
+// wedged store produces and which the design already treats as survivable.
 func (m *Manager) Stop() {
+	// Refuse new refine workers BEFORE waiting on the ones already registered,
+	// so the WaitGroup cannot be Add-ed to while joinBootEpochRefine waits on
+	// it. startBootEpochRefine claims and registers under this same lock.
+	m.bootEpochRefineMu.Lock()
+	m.bootEpochStopped = true
+	m.bootEpochRefineMu.Unlock()
+
 	m.mu.Lock()
 	mon := m.monitor
 	sender := m.hbSender
@@ -656,5 +699,10 @@ func (m *Manager) Stop() {
 	}
 	if receiver != nil {
 		receiver.stop()
+	}
+	if !m.joinBootEpochRefine(bootEpochStopJoinBudget) {
+		slog.Warn("cluster: HA boot-epoch refinement still in flight after teardown; "+
+			"proceeding without it (its store is probably wedged — the shutdown path "+
+			"must not block on one)", "waited", bootEpochStopJoinBudget)
 	}
 }

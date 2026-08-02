@@ -371,11 +371,21 @@ peer liveness (`lastSeen`) or drive election.
     frame fills the second slot and the first genuine successor is refused.
     Raising the bound does not help — an attacker spends `k-1` slots as cheaply
     as one. **Sender-side recovery** needs the wall clock to climb past
-    `prev+1` **and** another restart — at most an hour. **Restarting the
-    RECEIVER clears it at once**: `highEpoch` and `highEpochSessions` are
-    Manager-scoped, so a receiver restart zeroes the floor and the stranded
-    successor is admitted immediately on the raise-from-0 path. Prefer that
-    when both nodes are reachable. **When
+    `prev+1` **and** another restart — at most an hour.
+    **Receiver-side, only a full `xpfd` restart on the receiving node clears
+    it**, and an earlier revision of this document had the reason exactly
+    backwards. `highEpoch` and `highEpochSessions` live on the `Manager`, which
+    is why a *heartbeat* restart does **not** clear them: `StartHeartbeat`,
+    `RestartHeartbeat` on a DHCP-triggered VRF rebind and the HA comms restart
+    all preserve `hbAuth` deliberately (#5086/#6642 — a receiver-scoped floor
+    would be zeroed by every routine restart and re-admit a replayed retired
+    epoch). Only a new `Manager`, i.e. restarting the daemon, resets the floor
+    and admits the stranded successor on the raise-from-0 path. That is a
+    heavier operation than it sounds, and it is **not** unconditionally
+    preferable: a restarted floor is also a *cleared* floor, which one archived
+    frame re-raises just as it re-arms a cleared latch (residual 5 below), so
+    on a link an attacker is on, restarting can hand the lockout straight back.
+    **When
     "Epoch session collisions" climbs alongside a peer that keeps being
     declared dead, check for a non-writable `/var` on the peer first**
     (`df`, and a test write under `/var/lib/xpf`); a clock at or before the
@@ -971,11 +981,37 @@ peer liveness (`lastSeen`) or drive election.
        A refine requested while one is in flight used to be DROPPED, which lost
        exactly this recovery request — the in-flight worker's locked read can
        already be complete, so an update landing behind it is invisible to that
-       pass. It is now COALESCED into one follow-up pass
-       (`Manager.bootEpochRefinePending`), which bounds the extra work at one
-       outstanding request rather than an unbounded backlog of fsync-ing
-       workers. (`TestOverlappingRefineRequestIsCoalesced_6669`,
+       pass. It is now COALESCED into one follow-up pass, which bounds the extra
+       work at one outstanding request rather than an unbounded backlog of
+       fsync-ing workers. (`TestOverlappingRefineRequestIsCoalesced_6669`,
        `TestCoalescingDoesNotRatchetOnAHealthyNode_6669`.)
+
+       **The in-flight flag and the pending bit are ONE WORD**
+       (`Manager.bootEpochRefine`, claimed and released by CAS on the pair) and
+       that is a correctness requirement rather than packing. As two separate
+       atomics they could be observed torn: a requester that read "a worker is
+       in flight", lost the race while that worker ran all the way out, and only
+       then stored the pending bit published it against a worker that no longer
+       existed, and nothing in production observes a stranded bit — the operator
+       would have seen only a node still below its peer's floor, recovering at
+       some later heartbeat start that nothing bounds. On one word the publish is
+       conditional on the observation still holding, so a requester whose CAS
+       fails takes the idle slot and runs the pass itself. The window was a few
+       instructions wide and unreachable by hammering (3000 rounds x 4 concurrent
+       `refreshBootEpoch`), so it is driven through two seams.
+       (`TestLateRefineRequestIsReclaimed_6669` for a request landing before the
+       release, `TestLateRefineRequestCannotBeStranded_6669` for one landing
+       after.)
+
+       **`Manager.Stop` joins the worker, with a bound.** The worker may park
+       indefinitely in a flock or an fsync, so it outliving `Stop` needs no race
+       — one sequential shutdown over a wedged store reaches it — and it would
+       then still be storing to `m.bootEpoch` and writing the state file on a
+       torn-down manager. `Stop` refuses new workers and waits
+       `bootEpochStopJoinBudget` (2 s) for the one already running; the wait is
+       bounded because the shutdown path has just sent VRRP priority-0 and must
+       not block on a dead disk. A timeout is logged, and leaves only atomic
+       stores and one `fsatomic` write behind.
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
     cloned from one image may hold identical persisted boot epochs harmlessly;

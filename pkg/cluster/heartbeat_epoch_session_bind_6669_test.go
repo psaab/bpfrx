@@ -295,20 +295,25 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 //
 // TestOverlappingRefineRequestIsCoalesced_6669 covers the request that lands
 // while the worker is still inside its pass — the worker's own pending check
-// sees it and `continue`s. The re-claim below the release covers the OTHER
-// window: a request that loses the CAS (so it queues rather than spawning a
-// worker) and stores the bit AFTER that check has already run. Nobody else will
-// serve it — the setter saw a worker in flight and returned — so without the
-// re-claim it is stranded with no worker running, and this node stays below its
-// peer's floor until some later heartbeat start that nothing bounds (#6724).
+// sees it and `continue`s. The release CAS covers the OTHER window: a request
+// that loses the claim (so it queues rather than spawning a worker) and
+// publishes the bit AFTER that check has already run. Nobody else will serve it
+// — the setter saw a worker in flight and returned — so without the re-claim it
+// is stranded with no worker running, and this node stays below its peer's
+// floor until some later heartbeat start that nothing bounds (#6724).
 //
 // The window is a few instructions wide in production, so hammering does not
 // reach it: 3000 rounds x 4 concurrent refreshBootEpoch never landed in it.
 // It is driven deterministically through the epochRefineBeforeRelease seam.
 //
-// RED-on-revert: delete the re-claim step in startBootEpochRefine (everything
-// between `m.bootEpochRefining.Store(false)` and the loop's closing brace,
-// returning instead) and the second pass never runs.
+// This is the half where the request lands BEFORE the release CAS, so the CAS
+// fails and the worker picks it up.
+// TestLateRefineRequestCannotBeStranded_6669 drives the half where it lands
+// after, which is what needs claim and release to move ONE word.
+//
+// RED-on-revert: make releaseBootEpochRefine release unconditionally (drop the
+// `st&bootEpochPendingBit` branch and the CAS retry, storing 0 and returning
+// false) and the second pass never runs.
 func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 	m := keyedEpochManager(t, path)
@@ -344,14 +349,14 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 	}
 
 	// Pass 1 is COMPLETE (it has read, written and checked pending) but the
-	// in-flight flag is still held, so this request loses the CAS and queues —
+	// in-flight bit is still held, so this request loses the claim and queues —
 	// too late for the check that just ran.
-	if !m.bootEpochRefining.Load() {
-		t.Fatal("the worker released the in-flight flag before the seam; the window this " +
-			"test drives is not the one the re-claim covers")
+	if m.bootEpochRefine.Load()&bootEpochRefiningBit == 0 {
+		t.Fatal("the worker released the in-flight bit before the seam; the window this " +
+			"test drives is not the one the release CAS covers")
 	}
 	m.refreshBootEpoch()
-	if !m.bootEpochRefinePending.Load() {
+	if m.bootEpochRefine.Load()&bootEpochPendingBit == 0 {
 		t.Fatal("the request did not queue: it either spawned a second worker or was dropped")
 	}
 
@@ -374,6 +379,145 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 
 	if got := m.heartbeatBootEpoch(); got <= raised {
 		t.Fatalf("published epoch = %d, want > %d — the re-claimed pass ran but did not chain "+
+			"from the value another incarnation left in the file", got, raised)
+	}
+}
+
+// TestLateRefineRequestCannotBeStranded_6669 is the fail-on-revert gate for the
+// PACKED refine word, and it is the one window the re-claim step above does not
+// cover.
+//
+// TestLateRefineRequestIsReclaimed_6669 lands the request BEFORE the worker's
+// release, so the release notices it. This lands it AFTER: with the in-flight
+// flag and the pending bit as two separate atomics, a requester could observe
+// "a worker is in flight", lose the race while the worker ran all the way out,
+// and only then store the pending bit — against a worker that no longer exists:
+//
+//	R: CAS(refining, false->true) FAILS   (worker still in flight)
+//	W: clears pending; releases refining; re-claims pending -> nothing;
+//	   returns.                              <-- no worker left
+//	R: Store(pending, true)                  <-- nobody will serve it
+//
+// Nothing in production observes that bit, so the cost was a node silently
+// parked below its peer's floor until some later heartbeat start, which nothing
+// bounds (#6724). With claim and release as CASes on ONE word, R's publish is
+// conditional on the observation still holding: it fails against the word the
+// worker left and R takes the idle slot itself.
+//
+// THIS TEST IS DETERMINISTIC, not a stress loop. The window is a few
+// instructions wide and 3000 rounds x 4 concurrent refreshBootEpoch never
+// reached it, so the schedule is imposed through two seams —
+// epochRefineBeforeRelease parks the worker at its exit, epochRefineAfterLostClaim
+// parks the requester between observing the worker and publishing its request —
+// and the worker is JOINED (not polled) before the requester is let go, so
+// "the worker has gone" is a fact and not a timing hope. Every step below is
+// ordered by a channel handoff.
+//
+// RED-on-revert: restore the two separate atomics (bootEpochRefining /
+// bootEpochRefinePending) with the plain Store on the request path, and the
+// second pass never runs.
+func TestLateRefineRequestCannotBeStranded_6669(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+
+	var passes atomic.Int64
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		passes.Add(1)
+		return origFlock(fd, how)
+	}
+	t.Cleanup(func() { epochFlock = origFlock })
+
+	// Park the worker at its exit, with the in-flight slot still held.
+	atRelease := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var releaseOnce sync.Once
+	origRelease := epochRefineBeforeRelease
+	epochRefineBeforeRelease = func() {
+		releaseOnce.Do(func() {
+			close(atRelease)
+			<-releaseWorker
+		})
+	}
+	t.Cleanup(func() { epochRefineBeforeRelease = origRelease })
+
+	// Park the requester between observing that worker and publishing its
+	// request against that observation.
+	lostClaim := make(chan struct{})
+	resumeRequester := make(chan struct{})
+	var lostOnce sync.Once
+	origLost := epochRefineAfterLostClaim
+	epochRefineAfterLostClaim = func() {
+		lostOnce.Do(func() {
+			close(lostClaim)
+			<-resumeRequester
+		})
+	}
+	t.Cleanup(func() { epochRefineAfterLostClaim = origLost })
+
+	m.initHeartbeatEpochState()
+	select {
+	case <-atRelease:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refine worker never reached its release point")
+	}
+
+	requested := make(chan struct{})
+	go func() {
+		defer close(requested)
+		m.refreshBootEpoch()
+	}()
+	select {
+	case <-lostClaim:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the requester never observed a worker in flight (refine word = %#x); the "+
+			"window this test drives is not the one it reached", m.bootEpochRefine.Load())
+	}
+
+	// Let the worker run ALL the way out — past its release and past anything
+	// that could still re-claim — while the requester is still parked. The join
+	// is on the worker goroutine itself, so this is not a poll on a flag that
+	// clears a few instructions early.
+	close(releaseWorker)
+	if !m.joinBootEpochRefine(5 * time.Second) {
+		t.Fatal("the in-flight refine worker never exited")
+	}
+	if passes.Load() != 1 {
+		t.Fatalf("%d refine pass(es) ran before the request was published, want 1", passes.Load())
+	}
+
+	// Another incarnation raises the file. Pass 1 has already read AND written,
+	// so only a second pass can carry it — and the request for that second pass
+	// is the one about to be published into a word with no worker in it.
+	raised := m.heartbeatBootEpoch() + uint64(time.Hour)
+	if err := os.WriteFile(path, []byte(strconv.FormatUint(raised, 10)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	close(resumeRequester)
+	select {
+	case <-requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refreshBootEpoch never returned")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for passes.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d refine pass(es) ran: the request was published AFTER the worker "+
+				"had gone and was STRANDED with nothing to serve it (refine word = %#x). "+
+				"This node stays below its peer's floor until some later heartbeat start, "+
+				"which nothing bounds (#6724).", passes.Load(), m.bootEpochRefine.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waitBootEpochIdle(t, m)
+
+	if got := m.bootEpochRefine.Load(); got != 0 {
+		t.Fatalf("refine word settled at %#x, want 0 — a bit was left set with no worker", got)
+	}
+	if got := m.heartbeatBootEpoch(); got <= raised {
+		t.Fatalf("published epoch = %d, want > %d — the re-taken pass ran but did not chain "+
 			"from the value another incarnation left in the file", got, raised)
 	}
 }

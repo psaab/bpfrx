@@ -67219,3 +67219,79 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_manager.go,
   pkg/cluster/README.md,
   pkg/cluster/heartbeat_epoch_session_budget_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 21:05 PDT
+- **Action**: #6669 round 13 — close the boot-epoch refine LOST WAKEUP by packing
+  the in-flight flag and the pending bit into one CAS'd word; join the refine
+  worker in `Manager.Stop`; correct four claims round 12 got wrong.
+- **Item 1 — the lost wakeup is CLOSED, not documented.** `bootEpochRefining`
+  and `bootEpochRefinePending` were two separate `atomic.Bool`s, so the pair
+  could be observed torn: a requester that lost the in-flight CAS, was descheduled
+  while the worker ran all the way out, and only then stored the pending bit
+  published it against a worker that no longer existed. They are now ONE
+  `atomic.Uint32` (`Manager.bootEpochRefine`, bits `bootEpochRefiningBit` /
+  `bootEpochPendingBit`) with `claimBootEpochRefine` / `releaseBootEpochRefine`
+  moving the pair by CompareAndSwap. A requester whose observation went stale
+  fails its CAS and takes the idle slot itself; the worker's release only
+  succeeds while the pending bit is still clear. Coalescing is unchanged (a BIT,
+  not a queue) and `ready` keeps its "closed when the FIRST attempt finishes"
+  meaning with no double-close.
+- **Item 1 proof — DETERMINISTIC, not a stress loop.**
+  `TestLateRefineRequestCannotBeStranded_6669` imposes the schedule through two
+  seams (`epochRefineBeforeRelease` parks the worker at its exit,
+  the new `epochRefineAfterLostClaim` parks the requester between observing that
+  worker and publishing its request) and JOINS the worker goroutine before
+  letting the requester go, so "the worker has gone" is a fact rather than a
+  poll on a flag that clears a few instructions early. MUTATION: publish
+  unconditionally (`Or(bootEpochPendingBit)`, exactly a separate
+  `bootEpochRefinePending.Store(true)`) — build rc 0, vet rc 0, the new test the
+  ONLY failure across the whole package, asserting `only 1 refine pass(es) ran:
+  the request was published AFTER the worker had gone and was STRANDED with
+  nothing to serve it (refine word = 0x2)`. 0x2 is `{pending}` with no worker,
+  the stranded state itself. Restored by Edit; all green.
+- **Item 2 — the false justification is GONE.** The shipped comment said the
+  stranded state "is self-announcing rather than silent, since waitBootEpochIdle
+  hangs on exactly the bit that was left set". `waitBootEpochIdle` is a
+  TEST-ONLY helper taking a `*testing.T`; nothing in production observes that
+  bit. The window is closed rather than excused, and what it cost is now stated
+  in operator terms: a node silently below its peer's floor until some later
+  heartbeat start that nothing bounds (#6724).
+- **Item 3 — REACHABLE, and `Manager.Stop` now joins.** No race is needed: the
+  worker parks indefinitely inside a flock or an fsync by design, so one
+  sequential shutdown over a wedged store leaves it storing to `m.bootEpoch` /
+  `m.bootEpochWrote` and writing the state file on a torn-down manager (and in
+  tests outliving the `t.Cleanup` that restores `bootEpochPath`, `epochFlock`,
+  `epochNowNanos`, `epochRefineBeforeRelease`). Stop refuses new workers under
+  `bootEpochRefineMu` and then waits `bootEpochStopJoinBudget` (2s). The join is
+  BOUNDED deliberately — an unbounded one would park the shutdown path behind a
+  dead disk, which is the exact failure the 2s wait in `initHeartbeatEpochState`
+  was removed for. Both halves proven: dropping the join reds
+  `TestStopJoinsTheBootEpochRefineWorker_6669`; making it unbounded reds
+  `TestStopDoesNotBlockOnAWedgedRefineWorker_6669` and leaves the other green.
+- **Item 4 — four round-12 claims corrected.** (1) The `k-1-j` headroom
+  arithmetic over-counts: a replay the ring refuses spends no slot at all, since
+  `admitAuthedLocked` binds only after `s.replay.admit` succeeds. Restated as "at
+  most k-1 and can be none", with `k <= heartbeatReplaySessions` named as the
+  invariant the constant is chosen against. (2) The README said restarting the
+  receiver clears the floor *because* the state is Manager-scoped — backwards.
+  Manager-scoping is why `RestartHeartbeat` PRESERVES it; only a full `xpfd`
+  restart builds a new Manager, and even that is not unconditionally preferable
+  (a cleared floor is re-raised by one archived frame, residual 5). (3) The
+  generator-decline reason "the attacker will not jitter them" is false: the
+  epoch is inside the HMAC-signed span, so a replay carries the ORIGINAL
+  sender's value verbatim. The real reason is that the receiver cannot depend on
+  the sender's generator at all. (4) `bindEpochSession` credited
+  `epochSessionAdmissible` with the NO-REFILL property; that gate enforces the
+  CAPACITY REFUSAL. No-refill is enforced here — this is the only mutator, it
+  never evicts or decrements, and resets only on a raise.
+- **Validation.** `go build ./...` rc 0, `go vet ./...` rc 0, `gofmt -l
+  pkg/cluster/` empty. Full Go suite 59/59 ok. `go test -race ./pkg/cluster/`:
+  clean on 5 fresh-process runs at the PARENT before any edit, and after the
+  change on `-count=5` twice plus 13 fresh-process runs — 0 races, 0 failures.
+  The round-12 unreproduced `-race` failure did not recur; Item 3 is the most
+  likely explanation for it (a worker outliving a test's seam restore) and is
+  now closed, but that is an inference and not a reproduction.
+- **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
