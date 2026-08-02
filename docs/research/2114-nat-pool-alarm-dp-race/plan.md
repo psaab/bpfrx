@@ -1,25 +1,27 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v81 — r79 folds: Codex M1's retained-oracle
-  correction (the v80 retained overlap text still had retained
-  methods "proceeding" across the held seam — impossible under
-  the uniform mutex; the quiescent retained leg is now its own
-  named test `TestManager_ArmedGate_RetainedOutcomes`, and the
-  overlap leg reads block-during-hold + armed-after-release),
-  Codex M2's pre-rejection side-effect clause
-  (`CompileUserspaceShim` runs the idempotent cleanups + the
-  constant selector write before the `CompileConfig` rejection —
-  the rejection fires in every state; serialization-after-Start
-  documented as master's own race-winner-proceeds shape), Codex
-  M3's invariant-12 carve-out (the loaded-check set rejects per
-  master on every state), Codex m1's two acquire-load remnants
-  (independently found by AGY r79; AGY's third finding — a
-  Store(true)-at-Close typo — was verified a MISREAD and not
-  folded), Codex m2's §5.5 H-attribution fix; r79 verdicts:
-  Codex PLAN-NEEDS-MAJOR (3M/2m — all text-level), AGY
-  PLAN-NEEDS-MINOR (0M/3m — one a verified misread), Claude SMR
-  PLAN-READY-WITH-NITS (0M/2m — the two real stragglers);
-  pending convergence review r80
+- **Status**: DRAFT v82 — r80 folds: Codex M1's class-2
+  predicate correction (the v80 precedence literally swept the
+  fabric methods into class 2 — class 2 is now the NEUTRAL
+  missing-map outcome set, nil/zero/empty never an error;
+  error-outcome methods are class 1 regardless), Codex M2's
+  carve-out precision (the loaded-check set rejects WHENEVER
+  `loaded==false` — "every state" was false for armed; the
+  nil-config/loaded ordering within CompileConfig named), Codex
+  M3's per-entry-point side-effect ordering (direct Compile/
+  ApplyConfig reject immediately even pre-Store;
+  CompileUserspaceShim blocks at the selector, :181; production
+  Compile blocks at its outer selector; the pass-then-block
+  barrier named), Codex M4's reverse-schedule guard (the class-3
+  hybrids' side-effect lock precedes their raw lookup, so the
+  writer-first test could pass with unlocked lookups — the
+  lookup-entry reverse-schedule seam PLUS the AST canary
+  forbidding direct registry access outside the helper/writer),
+  Codex m1's obsolete-generation wording + retained-fixture
+  scope pin, Codex m2's idempotency weakening + citation fix;
+  r80 verdicts: Codex PLAN-NEEDS-MAJOR (4M/2m — all precision/
+  consistency), AGY PLAN-READY, Claude SMR PLAN-READY; pending
+  convergence review r81
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3204,7 +3206,12 @@
   leg blocks-then-armed); the pre-rejection side-effect
   clause; the invariant-12 carve-out; the two acquire-load
   remnants; the §5.5 attribution; AGY's third finding
-  verified a misread, not folded).
+  verified a misread, not folded). v82 (r80: the class-2
+  predicate corrected to the neutral set; the carve-out's
+  whenever-loaded-false precision; the per-entry-point
+  side-effect ordering; the reverse-schedule seam + the AST
+  canary structural net; the obsolete-generation wording;
+  the idempotency weakening).
 
 ---
 
@@ -3589,11 +3596,17 @@ class. The fold:
   (r71 Codex M2 — the precedence is what makes the classes disjoint):
   a method that ESCAPES a Start-state reference is class 4; else a
   method touching Start-state with required pre-error Go-side side
-  effects is class 3; else a method touching Start-state whose pre-arm
-  outcome is master's missing-map outcome is class 2 (any signature);
-  else a method touching Start-state is class 1; methods touching only
-  `m.mu`-protected Go state are category G; lifecycle and facade
-  methods are categories L/F. The §9 matrix test assigns every
+  effects is class 3; else a method touching Start-state whose
+  missing-map outcome is NEUTRAL (nil/zero/empty — never an error)
+  is class 2, any signature; else a method touching Start-state (its
+  missing-map outcome is an ERROR) is class 1 — the typed
+  `ErrDataplaneNotArmed` replaces exactly that error on the fresh
+  state (the class-2 predicate corrected at v82 per r80 Codex M1:
+  the v80 form "missing-map outcome, any signature" literally swept
+  the class-1 fabric methods into class 2 — `UpdateRGActive`/
+  `UpdateFabricFwd` return missing-map ERRORS, `maps_fabric.go:18,
+  :38`); methods touching only `m.mu`-protected Go state are
+  category G; lifecycle and facade methods are categories L/F. The §9 matrix test assigns every
   exported method to exactly one class via a generated AST inventory
   — an unassigned or double-assigned method fails the test. The
   oracle split is stated honestly (r72 Codex M1): the AST manifest
@@ -3914,8 +3927,11 @@ class. The fold:
   delivery, re-arm linearizability, or teardown/lifetime safety:
   on the bootstrap-recurrence path (`bootstrap.go:470` —
   Teardown-RETAINs the Manager, `Cleanup` removes the pin tree,
-  `loader.go:1221-1235`), the retained handles reference DEAD
-  unpinned kernel objects, a re-`Start` creates FRESH maps
+  `loader.go:1221-1235`), the retained handles reference LIVE
+  FD-BACKED OBJECTS OF AN OBSOLETE FORWARDING GENERATION (Teardown
+  does not close the `m.maps` FDs, r80 Codex m1's precision — a
+  mutation can SUCCEED yet miss the new generation), a re-`Start`
+  creates FRESH maps
   (`loadOrCreatePinnedShimMap`, `loader_userspace_shim.go:602`),
   and a retained-proceed method can mutate the obsolete object —
   a mutation that never reaches the live generation. That hazard
@@ -4426,10 +4442,15 @@ Preserved exactly:
     touches Start-populated state; (ii) a method observing true
     sees a fully-populated registry; (iii) a retained-state method
     proceeds against the retained registry UNDER the uniform
-    registry rule — master's exact behavior (r79 Codex M3's
-    carve-out: methods WITH a pre-existing loaded check — the
-    attaches, the CompileConfig path — reject per master on EVERY
-    state and never reach the registry). NO lifetime or
+    registry rule — master's exact behavior (r79 Codex M3 +
+    r80 Codex M2's precision: methods WITH a pre-existing loaded
+    check — the attaches, the CompileConfig path — reject
+    WHENEVER `loaded==false`, i.e. on BOTH unarmed states, and
+    proceed when armed; the "every state" phrasing was false
+    for the armed state. Ordering within the path: `CompileConfig`
+    checks nil-config first (:179-181), then the loaded rejection
+    (:182); `CompileUserspaceShim`'s cleanup errors precede the
+    selector). NO lifetime or
     teardown exclusion is claimed — the Store(false) at `Close()`'s
     entry (:1206) gates new FRESH-state entrants (retained-state
     methods proceed per the two-state rule, = master) and cannot
@@ -4597,17 +4618,26 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    BEFORE the in-hold Store(true), preserved loaded-check methods
    (the attaches, the CompileConfig path) return immediately;
    after it, they pass their precheck and block at registry
-   selection. The PRE-REJECTION SIDE-EFFECT clause (r79 Codex M2):
-   `CompileUserspaceShim` runs the two legacy cleanups (:174/:177)
-   and the selector write (:180) BEFORE the `CompileConfig`
-   rejection (`compiler.go:182`), and the production compiler calls
-   the selector before `CompileUserspaceShim`
-   (`manager_compile.go:184`) — all idempotent (the selector writes
-   a constant; the cleanups remove legacy pins/links), the
-   rejection fires in every state, and a call blocked at the
-   selector during the hold proceeds after release when armed —
-   master's own race-winner-proceeds shape (serialization-after-
-   Start accepted and documented, not a behavior change). The XDP field's dedicated two-sided seam stands
+   selection. The PRE-REJECTION SIDE-EFFECT clause (r79 Codex M2,
+   made per-entry-point exact at v82 per r80 Codex M3): a direct
+   `Manager.Compile`/`ApplyConfig` call rejects IMMEDIATELY even
+   pre-Store (its first registry-adjacent step is `CompileConfig`'s
+   loaded check); a direct `CompileUserspaceShim` runs the two
+   legacy cleanups (:174/:177) and the constant selector write
+   (:181 — citation corrected from :180, r80 Codex m2) BEFORE the
+   `CompileConfig` rejection (`compiler.go:182`) and BLOCKS at the
+   selector during the hold (proceeding armed after release);
+   production `userspace.Manager.Compile` blocks at its OUTER
+   selector (`manager_compile.go:184`) even earlier. The side
+   effects are safe/no-op when repeated after a successful cleanup
+   (NOT unconditionally idempotent, r80 Codex m2: partial
+   Unpin/Close failures aggregate after partial progress, and
+   concurrent TC cleanups can both load the same pin before one
+   removes it, :294); the rejection fires whenever
+   `loaded==false`; and the deterministic pass-then-block shape
+   gets its explicit post-Store/pre-unlock barrier (a loaded-check
+   method that must pass its check and then block at registry
+   selection uses the seam's second barrier). The XDP field's dedicated two-sided seam stands
    (r73 Codex M3): a second entered/resume barrier around the
    `:154` selector write with getter/predicate/swap driven across
    it; and the `:632` lock is pinned DIRECTLY (r74 Codex M2) by a
@@ -4628,7 +4658,13 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    PLUS the RETAINED-state coverage (r76 Codex m2; corrected to the
    four-leg form at v81 per r79 Codex M1 — the v80 text still had
    retained methods "proceeding" across the held seam, impossible
-   under the uniform mutex): `TestManager_ArmedGate_RetainedOutcomes`
+   under the uniform mutex; the fixture scope pinned at v82 per
+   r80 Codex m1 — ONE seeded retained fixture suffices for A3's
+   state classification because Close and Teardown both present
+   `loaded=false` + a nonempty registry; NO duplicate Teardown
+   outcome matrix, and no current-generation-delivery claim; a
+   small Close-transition assertion proves production preservation
+   of the registry): `TestManager_ArmedGate_RetainedOutcomes`
    — the QUIESCENT retained leg as its own named test (seeded
    retained registry: maps+programs present, `loaded=false`; no
    overlap; every class proceeds exactly as master — retained reads
@@ -4642,7 +4678,20 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    proving both the whole-batch boundary (no partial registry
    observable) and lock ownership. The named Detach test's
    "race-free" gains its concurrent population actor (the same
-   blocked re-`Start` seam).
+   blocked re-`Start` seam). TWO further guards (r80 Codex M4 —
+   the class-3 hybrids already take `m.mu` for their side effects
+   BEFORE their raw lookup — `ClearGlobalCounters` locks at
+   `maps_counters.go:176` and looks up at :181 — so the
+   writer-first held-batch test blocks class 3 at the PRE-EXISTING
+   side-effect lock even if the later lookup never adopts the
+   helper, missing the dangerous REVERSE schedule: side-effect
+   unlock -> Start writes -> raw lookup races): (a) a
+   lookup-entry reverse-schedule seam — the class-3 lookup's entry
+   barrier raced against the population writer released BETWEEN
+   the side-effect unlock and the lookup; and (b) the structural
+   net per this repo's compile-time-invariant discipline: an AST
+   canary forbidding direct `m.maps`/`m.programs` access outside
+   the registry helper and the whole-batch publication writer.
    The fixture-migration classification is REDONE under the
    two-state rule (r76 Codex m3 — v77's prescription was stale):
    `injectShimMap` modifies only `maps`, never `loaded`
@@ -4715,8 +4764,10 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
   retain recurrence paths (r76 Codex M2; ownership corrected r77
   Codex m2 — NOT H)**: `bootstrap.go:470` Teardown-retains the
   Manager; `Cleanup` removes the pin tree (`loader.go:1221-1235`);
-  the retained `m.maps`/`m.programs` handles reference dead
-  unpinned kernel objects while re-`Start` creates fresh ones. A
+  the retained `m.maps`/`m.programs` handles reference live
+  FD-backed objects of an obsolete forwarding generation (r80 Codex
+  m1 — Teardown does not close the FDs) while re-`Start` creates
+  fresh ones. A
   retained-proceed method can mutate the obsolete object (the
   mutation never reaches the live generation) and multi-map
   readers can report a mixed old/new generation. Master has this
@@ -5193,18 +5244,17 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r79 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r78 falsified each
-   intermediate form, and r79 caught the last text-level
-   contradictions (the retained overlap oracle surviving beside its
-   four-leg summary; the pre-rejection side-effect ordering in
-   CompileUserspaceShim; the invariant-12 carve-out erasure; the two
-   acquire-load remnants — the pair independently found by AGY, whose
-   third finding was verified a misread and is NOT folded). v81
-   carries the corrected retained legs, the side-effect clause, and
-   the carve-out-complete invariant. Each reviewer: verify the four
-   oracle legs are now self-consistent with their named tests, and
-   the selector/cleanup ordering claim against loader.go:174-186.
+7. **r68-r80 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r79 falsified each
+   intermediate form, and r80 caught the precision stragglers (the
+   class-2 predicate sweeping error-outcome methods; the "every
+   state" carve-out phrasing; the per-entry-point ordering; the
+   class-3 reverse-schedule blind spot — now covered by the
+   lookup-entry seam AND the AST canary forbidding direct registry
+   access outside the helper/writer). v82 carries them. Each
+   reviewer: verify the corrected precedence against
+   maps_fabric.go:18/:38, the four oracle legs' mutual consistency,
+   and the reverse-schedule seam's schedule.
 
 ---
 
