@@ -1,6 +1,16 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v93 — r90 folds: Codex's four minors (the
+- **Status**: DRAFT v94 — r91 fold: AGY's single residual (the
+  summary line's bucket label now matches the body: "3 non-comma-ok
+  single-value reads = 17 sites" — the v93 rename landed in the
+  body but the summary line kept "3 nil-guard reads"; the SMR r91
+  pass independently caught the same residual on its re-grep);
+  r91 verdicts: AGY PLAN-NEEDS-MINOR (1 residual — "once this
+  single string correction is folded, PR-1 will be completely
+  converged and PLAN-READY"), Claude SMR PLAN-READY (0 findings
+  beyond the shared residual), Codex PENDING (task-msbep0ei-
+  dqo6n8, running); pending Codex r91 + convergence review r92.
+- **Prior**: DRAFT v93 — r90 folds: Codex's four minors (the
   second consecutive all-minor round): minor-1's residual
   "simply returns" (the corrected rule's own parenthetical
   half-undid it — now "the `if ok` body does not run, the
@@ -3418,7 +3428,8 @@
   minors: the "simply returns" residual + the bucket rename;
   the Detach-qualification propagation to A3/§5.1; the
   signature falsehood + the source-pin correction; the stale
-  "22 lookups" label).
+  "22 lookups" label). v94 (r91 AGY's single residual: the
+  summary-line bucket label matches the body).
 
 ---
 
@@ -5147,7 +5158,9 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    redirect-map population) — only the helper wraps
    the lookup, never the outcome. THE MIXED-SITE INVENTORY (the
    complete MIXED / MULTI-ACCESS subset — 14 optional-if-ok reads +
-   3 nil-guard reads = 17 sites; the count and the scoping
+   3 non-comma-ok single-value reads = 17 sites (the bucket label
+   aligned with the body at v94 per r91 AGY's single residual);
+   the count and the scoping
    corrected at v90 per r88 AGY b2 — v89's summary said "13 + 3 =
    16" while its own body enumerated FOURTEEN if-ok sites, and
    the "complete list" phrasing overclaimed: the full

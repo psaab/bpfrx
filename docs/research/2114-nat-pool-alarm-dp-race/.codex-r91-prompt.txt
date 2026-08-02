@@ -1,0 +1,17 @@
+Adversarial PLAN review for #2114 — round 91 (CONVERGENCE), plan v93 @ 9a30b5087a4a on branch research/2114-nat-pool-alarm-dp-race.
+
+Repo: /home/ps/git/kimi-xpf/.claude/worktrees/2114-research-nat-pool-alarm-dp-race
+
+This is a PLAN review, NOT a code review. No code has been written. The verdict surface is PR-1 ONLY (the G+H+H2 follow-up unit lives in followup-seed.md, out of scope).
+
+CONTEXT: your r90 review returned PLAN-NEEDS-MINOR (4 minors — the second consecutive all-minor round). v93 folds all four. Re-verify each fold against the real code and the document's internal consistency, then attack the v93 delta freshly.
+
+Fold verification (plan.md v93):
+1. Your minor-1 → the optional rule now reads "the if-ok body does not run, the nil-guard returns, OR the skip-and-continue proceeds past the skipped block"; the bucket renamed "three non-comma-ok single-value reads" with per-site behaviors (compiler.go:353 skip-and-continue, loader.go:591 nil-guard, loader.go:700 comma-ok early return). VERIFY and hunt for any residual "simply returns" / overgeneralized bucket label.
+2. Your minor-2 → A3's and §5.1's "cleanup always runs" summaries now carry the §9 qualification (iface_zone_map seeded; the absent-map no-op excluded). VERIFY all three sites (A3, §5.1, §9) are now consistent.
+3. Your minor-3 → the mixed-method neutral-return hosts are now "single-registry-access methods", four of six void (SeedNATPortCounters, SeedSessionIDCounter, the two internal helpers loader.go:909/:927), only UpdatePolicyScheduleState and ClearZoneCounters returning errors; the source pin corrected (offset reset maps_nat.go:399, lookup :400). VERIFY.
+4. Your minor-4 → "22 best-fit class-2 lookups" → METHODS. VERIFY and hunt for residual lookup/method count confusions.
+5. Fresh attacks on v93 (be hostile): (a) the A3 block + §5.1 + §9 tri-site consistency for EVERY qualified claim (not just Detach) — any other claim folded in one place but summarized unconditionally elsewhere? (b) the five-leg oracle set — is every leg's assertion implementable with the stated hook protocol (instance-scoped, one ownership hook per test)? (c) final full read of the A3 block + §7 + §9 — any remaining contradiction?
+6. Anything else in the PR-1 surface that regresses, overclaims, or misses a hazard.
+
+Verdict: PLAN-READY / PLAN-NEEDS-MINOR / PLAN-NEEDS-MAJOR / PLAN-KILL, findings numbered with file:line evidence. State explicitly: does anything in PR-1 block PLAN-READY for #2114? Be hostile.
