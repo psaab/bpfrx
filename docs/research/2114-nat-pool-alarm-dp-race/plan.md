@@ -1,6 +1,27 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v98 — r94 Codex fold (1 MAJOR — the first
+- **Status**: DRAFT v99 — r95 Codex fold (1 minor, not a design
+  major): the extensional 17-site inventory is load-bearing but
+  was mechanically UNCHECKED (an omitted or newly added helper
+  callsite would pass silently — the registry canary forbids raw
+  access but does not check list equality, and the method matrix
+  inventories methods, not per-access roles). v99 adds the
+  STALE-CHECKED HELPER-CALLSITE MANIFEST (the same stale-
+  allowlist self-check pattern as the registry canary's): every
+  `lookupMapLocked`/`lookupProgramLocked` callsite maps to its
+  required/optional outcome, with the 17 mixed sites mapped to
+  their named §9 legs — the manifest does not infer semantics;
+  it forces explicit review when callsites change. Codex's
+  fold-free verification: all 17 sites have coverage (the
+  per-site table maps each to its named leg); the three new
+  legs match real control flow and are compatible with the
+  two-state/whole-batch design; the absent-`iface_zone_map`
+  fixture is separate from the Detach fixture; the
+  pattern-not-membership wording correct; A3/§7/§9 otherwise
+  agree; no G+H+H2 leakage. r95 verdicts: Codex
+  PLAN-NEEDS-MINOR (1m), AGY PLAN-READY, Claude SMR PLAN-READY;
+  pending convergence review r96.
+- **Prior**: DRAFT v98 — r94 Codex fold (1 MAJOR — the first
   MAJOR since r88): the v97 oracle-role definition was non-
   exclusive in BOTH directions (§9 applied the continuation
   oracle to `ClearSessionCounts`/`GetMapStats`, OUTSIDE the 17,
@@ -3546,7 +3567,9 @@
   criterion); the fifth optional-read shape + the full 41-read
   breakdown). v98 (r94 Codex's MAJOR: the extensional
   definition restored + the coextensive continuation coverage —
-  three new legs named).
+  three new legs named). v99 (r95 Codex's minor: the stale-
+  checked helper-callsite manifest — the load-bearing
+  extensional list is now mechanically checked).
 
 ---
 
@@ -5313,7 +5336,21 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `interface_counters`, and `setXDPAttachedFlag`'s absent
    `iface_zone_map` path (the Detach leg requires that map
    PRESENT); the §9 coverage is made coextensive with the
-   enumerated list below). The host shapes, as DESCRIPTION only
+   enumerated list below). The extensional list is load-bearing,
+   so it is MECHANICALLY CHECKED (v99 addition per r95 Codex's
+   minor — an omitted or newly added helper callsite would
+   otherwise pass silently: the registry canary forbids raw
+   access but does not check list equality, and
+   `TestManager_PreArmMethodMatrix` inventories methods, not
+   per-access roles): a STALE-CHECKED HELPER-CALLSITE MANIFEST
+   (the same stale-allowlist self-check pattern as the registry
+   canary's) maps EVERY `lookupMapLocked`/`lookupProgramLocked`
+   callsite to its required/optional outcome, with the 17 mixed
+   sites mapped to their named §9 legs — the manifest does NOT
+   infer semantics; it forces explicit review when callsites
+   change (a callsite added, removed, or moved fails the build
+   until the manifest and the leg mapping are updated). The
+   host shapes, as DESCRIPTION only
    (v97 per r93 Codex minor-1 — no transitive criterion):
    15 sites in
    MULTI-SELECTOR methods (methods with more than one DIRECT
@@ -6122,7 +6159,8 @@ Still open:
    SINGLE-ACCESS-SELECTOR naming, the FIVE-shape optional-outcome
    enumeration (14+1+3+21+2 = 41), the EXTENSIONAL 17-site
    definition with the coextensive continuation coverage (the
-   three v98 legs), and the census
+   three v98 legs), the stale-checked callsite manifest (v99),
+   and the census
    labels.
 
 ---
