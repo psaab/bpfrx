@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 )
@@ -56,14 +57,18 @@ func (st registryState) String() string {
 	return "unknown"
 }
 
-// classifyRegistryLocked computes the armedness classification. Caller
-// must hold m.mu (the loaded flag is atomic, but the maps-emptiness read
-// must not race the publication batch's inserts).
-func (m *Manager) classifyRegistryLocked() registryState {
-	if m.loaded.Load() {
+// classifyRegistry computes the armedness classification from the registry
+// length. Callers hold m.mu (the loaded flag is atomic, but the
+// maps-emptiness read must not race the publication batch's inserts) — the
+// two lookup helpers pass their in-hold len(m.maps) reading so the
+// classification and the handle selection stay one scoped operation and
+// the registry canary's allowlist stays exactly the two helpers + the
+// publisher.
+func classifyRegistry(loaded *atomic.Bool, numMaps int) registryState {
+	if loaded.Load() {
 		return registryArmed
 	}
-	if len(m.maps) == 0 {
+	if numMaps == 0 {
 		return registryFresh
 	}
 	return registryRetained
@@ -93,7 +98,7 @@ func (m *Manager) lookupMapLocked(name string) (h *ebpf.Map, present bool, st re
 		registryLookupHook()
 	}
 	h, present = m.maps[name]
-	return h, present, m.classifyRegistryLocked()
+	return h, present, classifyRegistry(&m.loaded, len(m.maps))
 }
 
 // lookupProgramLocked is lookupMapLocked for the m.programs registry
@@ -105,7 +110,7 @@ func (m *Manager) lookupProgramLocked(name string) (p *ebpf.Program, present boo
 		registryLookupHook()
 	}
 	p, present = m.programs[name]
-	return p, present, m.classifyRegistryLocked()
+	return p, present, classifyRegistry(&m.loaded, len(m.maps))
 }
 
 // shimRegistryPublishHook runs INSIDE the publisher's m.mu hold BEFORE

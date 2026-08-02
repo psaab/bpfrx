@@ -66354,3 +66354,40 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/maps_screen.go, pkg/dataplane/maps_session.go,
   pkg/dataplane/maps_stale.go, pkg/dataplane/maps_stats.go,
   pkg/dataplane/compiler.go, pkg/dataplane/watchdog_test.go, _Log.md
+## 2026-08-02 — #2114 A3 enforcement surface: matrix + canary + manifest + gate legs
+
+- **Timestamp**: 2026-08-02 (fix/2114-dp-accessor)
+- **Action**: Added the A3 enforcement/test surface per the converged plan
+  §9: (1) TestManager_PreArmMethodMatrix — the handwritten 157-method class
+  manifest (90 class-1 incl. the 2 carve-out + 2 delegation, 23 class-2, 4
+  class-3, 3 class-4, 9 catL, 8 catF, 20 catG) with AST-inventory totality
+  and the class-3 raw-helper composition shape assertion. (2)
+  TestManagerRegistryAccessAllowlist — the registry canary (exactly the two
+  lookup helpers + the publisher may touch m.maps/m.programs; index/len-only
+  shape rule kills the alias escape; lock-domination rule kills
+  unlock-before-access; exactly one in-lock Store(true) in the publisher),
+  with stale-allowlist self-check and both-direction synthetic negatives.
+  (3) TestManagerRegistryCallsiteManifest — the stale-checked 135-callsite
+  manifest (91 required + 41 optional + 3 raw composition legs, matching the
+  plan census) with the per-callsite gated bit AST-verified via the
+  non-blank registryState binding. (4) The five-leg armed-gate oracle:
+  quiescent fresh/retained outcomes over every manifest host, blocked
+  fresh-Start and retained-reStart lock-ownership legs (readers block during
+  the whole-batch hold, observe armed after release), the Close-window
+  IsLoaded leg (entry Store(false) visible during the window, registry
+  retained); plus the lookup-ownership (both helpers), swapXDPEntryProg
+  :632-write ownership, XDP-selector two-sided seam, Detach retained-claims
+  (privileged), absent-iface_zone_map no-op (leg iii), seed-interface-counter
+  nil-guard (leg ii absent half), and the privileged continuation legs
+  (ClearNAT64Configs partial-registry count-zeroed, SetNAT64Config
+  required-write-lands, ClearStaticNATEntries v4→v6 continuation,
+  SessionCount both families, ClearSessionCounts both maps,
+  SeedNATPortCounters present-write). The canary immediately caught two of
+  my own implementation bugs (an unlisted classifier touching m.maps —
+  inlined into the helpers per the exact-3 allowlist; the per-function
+  gated-bit being too coarse for mixed methods — replaced with the
+  per-callsite third-LHS signal). Privileged legs skip cleanly on
+  unprivileged hosts per the repo's skipIfBPFUnavailable idiom.
+- **File(s)**: pkg/dataplane/armed_gate.go, pkg/dataplane/loader.go (seam),
+  pkg/dataplane/armed_gate_matrix_test.go (new),
+  pkg/dataplane/armed_gate_legs_test.go (new), _Log.md

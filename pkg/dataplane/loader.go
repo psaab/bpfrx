@@ -181,13 +181,7 @@ func (m *Manager) Load() error {
 func (m *Manager) LoadUserspaceShim() error {
 	slog.Info("loading userspace XDP shim")
 	m.SelectUserspaceXDPShimEntryProgram()
-	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
-		return err
-	}
-	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
-		return err
-	}
-	if err := m.loadUserspaceShimObjects(); err != nil {
+	if err := shimPrePublishLoad(m); err != nil {
 		return err
 	}
 	// #2114 A3: the armed Store(true) lives INSIDE the shim registry
@@ -196,6 +190,25 @@ func (m *Manager) LoadUserspaceShim() error {
 	// atomically.
 	slog.Info("userspace XDP shim loaded successfully")
 	return nil
+}
+
+// shimPrePublishLoad runs the privileged load leg of LoadUserspaceShim:
+// the legacy TC-link/map-pin cleanups and the object acquisition +
+// publication. It is a package var ONLY as the #2114 A3 armed-gate test
+// seam — the blocked-Start legs substitute a synthetic loader that still
+// routes the registry writes through the production
+// publishShimRegistryLocked, so the whole-batch hold and the in-hold
+// Store(true) are exercised for real. Production never reassigns it; at
+// most ONE test arms it at a time (the same single-hook discipline as the
+// other A3 seams).
+var shimPrePublishLoad = func(m *Manager) error {
+	if err := cleanupUserspaceShimLegacyTCLinks(); err != nil {
+		return err
+	}
+	if err := cleanupUserspaceShimLegacyOnlyMapPins(); err != nil {
+		return err
+	}
+	return m.loadUserspaceShimObjects()
 }
 
 // CompileUserspaceShim runs the shared config compiler for its Linux interface
