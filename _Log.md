@@ -74447,3 +74447,112 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cli/canary_helper_parity_6706_test.go, pkg/cli/identity.go,
   pkg/cli/identity_6701_test.go, pkg/daemon/cli_rbac_wiring_6706_test.go,
   _Log.md
+
+## 2026-08-01 — #6706 fold r8→r9: three guards that could not fire, and a false justification
+
+- **Timestamp**: 2026-08-01
+- **Action**: Round-9 fold of PR #6706 at `a4daf0831`. An independent review at
+  that exact head confirmed the RUNTIME path is correct — identity comes from
+  the kernel real uid (`osident.go` → `daemon_run.go:723`, `cli.go`,
+  `cmd/cli/main.go`), no `USER`/`LOGNAME`, no `os/user`, no caller-supplied
+  source. Every change below is to the GUARDS. Round 8 closed six findings;
+  three of the guards it wrote did not bind what they claimed, and one of its
+  own justifications was false.
+- **F1 — the `import "C"` over-scan was NOT bounded; round 8's justification was
+  false.** Round 8 chose the UNION of both cgo build contexts over pinning
+  `CGO_ENABLED=0`, justified by "everything scanned is compiled by SOME
+  toolchain configuration, so it can never produce a red that no `go build`
+  agrees with". Reproduced firsthand that it can: a file carrying BOTH
+  `//go:build !cgo` and `import "C"` is accepted by `MatchFile` under the
+  shipped context (the cgo split happens in `ImportDir`, not `MatchFile`) while
+  `CGO_ENABLED=0 go list` puts it in `IgnoredGoFiles` (it imports C) and
+  `CGO_ENABLED=1` ignores it (the constraint is false). Planted at
+  `pkg/zzf1probe/probe.go`: build and vet rc 0 under BOTH settings, `go list`
+  reporting it ignored under both, and `TestNoIdentityFromEnvironment_6701` RED
+  on a `$USER` read no configuration compiles. FIX: `compiledByGoBuild` now
+  derives the file set from real package loading — the union of `GoFiles`,
+  `CgoFiles` and `InvalidGoFiles` from `build.Context.ImportDir`, memoised per
+  directory (619 dirs, ~530ms). `InvalidGoFiles` is unioned deliberately: it is
+  the set go/build could not CLASSIFY, and on an unanswerable question the guard
+  should fire. Round 8's property is preserved and re-verified: a `//go:build
+  !cgo` file carrying a real `$USER` read still REDs, and so does a legitimate
+  cgo source (`CgoFiles`).
+- **F2 — traversal equality with cmd/go was FALSE; `go.mod ignore` was not the
+  sole residual.** A SYMLINKED walk root makes `filepath.WalkDir` visit nothing
+  (it Lstats its root), while `go list ./...` from that path reports every
+  package — a divergence in the SILENT direction. `walkCanaryFiles` now resolves
+  the root with `EvalSymlinks` and `rebaseCanaryPath` maps visited paths back
+  under the caller's spelling, so `filepath.Rel(root, path)` still answers.
+  Symlinked SUBdirectories needed nothing: cmd/go ignores those too
+  (`modload/search.go` warns and returns), verified by planting one. The
+  `ignore` directive is now genuinely the sole residual, and the comment says so
+  with that qualifier.
+- **F3 — the oracle had a coverage hole.** `assertFixtureMatchesGoList` read
+  only `.GoFiles`, so a legitimate cgo source — declared in the table — was
+  validated by nothing. It now reads `.GoFiles` AND `.CgoFiles`, via a
+  tab-per-file template (a package with no CgoFiles cannot be confused with a
+  malformed line) and stdout-only parsing so a `go list` warning cannot enter
+  the file set.
+- **F4 — `classFieldWrites` was not decoy-proof; the anti-vacuity check was
+  defeatable.** Reproduced both: `(c.userClass) = "super-user"` (LHS is an
+  `*ast.ParenExpr`) and `*c = CLI{}` (whole-object) each gave build rc 0, vet rc
+  0 and every canary green. The second is a privilege escalation, not
+  bookkeeping: it sets the class to `""`, which `checkPermission` and
+  `showConfigRedacted` both read as the legacy allow-everything mode. (`*c =
+  *other` is blocked by `go vet`'s copylocks — CLI holds a `sync.Mutex` — but
+  `*c = CLI{}` is not, and an incidental fence in another tool is not this
+  canary's coverage.) FIX: parentheses are unwrapped at every LHS position;
+  whole-object writes are recognised through a declared `*CLI` (receiver,
+  parameter, `var`) and through an embedded `x.CLI`; two further forms found
+  while sweeping are closed — a POSITIONAL `CLI{a, b}` literal (no
+  `KeyValueExpr` to see) and `c.userClass++` (`IncDecStmt` is not an
+  `AssignStmt`). Both allowlists now carry an entry-PRESENCE floor
+  (`requiredSetUserClassCallers` / `requiredClassFieldWriters`): the stale-entry
+  loop asks only "is every allowlisted key still seen?", which an EMPTY map
+  satisfies vacuously, and that vacuity was the half of the round-8 escape that
+  the parenthesised write needed.
+- **F5 — the RBAC wiring predicate was defeatable by same-name shadowing.**
+  Reproduced: a local `osident := struct{ Current func() ... }{...}` returning a
+  forged uid 0, with the real package imported as `kernelident`, gave build rc
+  0, vet rc 0 and ALL #6701/#6706 canaries green — #6701 restored in full. FIX:
+  `go/types` binding verification. `bindQualifiers` type-checks package daemon
+  against STUB imports (every dependency fabricated empty) and reads
+  `Info.Uses`; the qualifier must resolve to a `*types.PkgName` whose
+  `Imported().Path()` is `github.com/psaab/xpf/pkg/osident`. Stdlib only, ~120ms
+  over 69 files, no package loader. The check is also more CORRECT than the
+  spelling it replaces: a genuine aliased import is now accepted.
+- **RED-then-GREEN, 16 mutations, build and vet rc 0 in EVERY state.** Each fix
+  was mutated out by edit and the specific guard reds with a real assertion:
+  restoring `MatchFile` reds the `zz_nocgo_importsc.go` fixture row; dropping
+  `EvalSymlinks` reds the symlink test with an empty visited set; dropping
+  `rebaseCanaryPath` reds it on relativisation; a GoFiles-only oracle reds
+  `zz_cgo_importsc.go`; an identity `unparenExpr` reds three forms; removing the
+  whole-object arm reds five; removing the positional and IncDec arms reds one
+  each; a spelling-based `bindsToOsident` reds the shadowed forgeries. EDGE
+  mutations, aimed at the boundary rather than the centre: a ONE-level
+  `unparenExpr` reds only `doubleParenAssign`; a whole-object arm that does not
+  unparen reds only `wholeObjectParen`; a binder that resolves the qualifier but
+  drops the PATH check reds only `shadow.Current()`. The allowlist floor was
+  isolated by reconstructing the round-8 world (blind detector + parenthesised
+  setter) and emptying the map: ONLY the floor reds, proving it binds
+  independently of the detector.
+- **Named limits rather than silence**: a whole-value write into a COLLECTION
+  element (`shells[0] = CLI{}`) is not recognised — the LHS is an `IndexExpr`
+  and deciding it needs the element type; there is no `[]CLI`, `[]*CLI` or
+  map-of-CLI in the tree (grepped). A narrower RHS-keyed rule was rejected
+  because partial coverage of a form invites the belief that the form is
+  covered. reflect/unsafe stay outside any AST predicate.
+- **Docs**: no operator-facing doc changed. These are test-only structural
+  canaries; the runtime identity/class contract `docs/system-login.md`
+  documents is untouched. The claims that were falsified lived in the test-file
+  comments (the "bounded over-scan" paragraph and the traversal-equality claim)
+  and are corrected there.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0, focused
+  `6701|6706` suites rc 0 under BOTH `CGO_ENABLED=0` and `CGO_ENABLED=1` with
+  every new test NAME confirmed present in `-v` output, full `go test ./...` rc
+  0. `gofmt -l` clean on all five touched files.
+- **File(s)**: pkg/osident/user_env_canary_test.go,
+  pkg/osident/canary_walk_rule_6706_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/cli/canary_helper_parity_6706_test.go,
+  pkg/daemon/cli_rbac_wiring_6706_test.go, _Log.md

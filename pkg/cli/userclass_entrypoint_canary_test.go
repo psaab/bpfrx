@@ -40,6 +40,12 @@ var allowedSetUserClassCallers = map[string]string{
 // not flagged.
 const classFieldName = "userClass"
 
+// classHolderType is the type that OWNS that field. Replacing a whole CLI value
+// writes userClass along with every other field while never naming it, so the
+// whole-object arms of classFieldWrites key on this name rather than on
+// classFieldName.
+const classHolderType = "CLI"
+
 // allowedClassFieldWriters is the allowlist of production functions permitted
 // to write `<x>.userClass` DIRECTLY, keyed like allowedSetUserClassCallers.
 //
@@ -50,6 +56,28 @@ const classFieldName = "userClass"
 var allowedClassFieldWriters = map[string]string{
 	"cli::CLI.SetUserClass": "the setter itself (pkg/cli/cli.go) — the one write to the field",
 }
+
+// requiredSetUserClassCallers and requiredClassFieldWriters are the entries the
+// allowlists above MUST CONTAIN.
+//
+// They are the anti-vacuity floor for the allowlists themselves, and they bind
+// the dimension they protect — the specific entries — rather than a total. The
+// stale-entry loop in the test asks only "is every allowlisted key still seen?",
+// which an EMPTY map satisfies vacuously; nothing else noticed the difference
+// between an allowlist that permits one thing and an allowlist that permits
+// nothing because it is describing nothing. That is not a hypothetical gap:
+// combined with a write form the detector could not see, emptying the map is a
+// two-line mutation that left the whole test green while the RBAC class was
+// written from an unallowlisted place (#6706 review r8 F4).
+//
+// FAIL-ON-REVERT: empty either map, or rename its entry without renaming the
+// function, and the test reds here — independently of whether the write
+// detector is working, which is the point of stating the requirement separately
+// from the map.
+var (
+	requiredSetUserClassCallers = []string{"daemon::applyCLILoginClass"}
+	requiredClassFieldWriters   = []string{"cli::CLI.SetUserClass"}
+)
 
 // TestSetUserClassHasOneProductionCaller_6701 enumerates every production call
 // to SetUserClass across the repository — AND every direct write to the field
@@ -117,6 +145,24 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 		t.Errorf("%s (%s) writes the %s field directly — the RBAC class must change only through "+
 			"SetUserClass, or every guard keyed on that selector is bypassable from inside "+
 			"pkg/cli (#6701)", c.key, c.pos, classFieldName)
+	}
+
+	// The allowlists must CONTAIN what they are supposed to permit. An emptied
+	// allowlist contradicts nothing below and is the half of a green-staying
+	// mutation (#6706 review r8 F4); see requiredSetUserClassCallers.
+	for _, key := range requiredSetUserClassCallers {
+		if _, ok := allowedSetUserClassCallers[key]; !ok {
+			t.Errorf("allowedSetUserClassCallers has no entry for %s — an allowlist that permits "+
+				"nothing is not a tightened allowlist, it is a check that has stopped describing "+
+				"the code it guards (#6701)", key)
+		}
+	}
+	for _, key := range requiredClassFieldWriters {
+		if _, ok := allowedClassFieldWriters[key]; !ok {
+			t.Errorf("allowedClassFieldWriters has no entry for %s — the setter must be the one "+
+				"permitted writer of %s, and an empty allowlist asserts nothing about that (#6701)",
+				key, classFieldName)
+		}
 	}
 
 	// The allowlists must not rot into lists of functions that no longer exist:
@@ -218,6 +264,24 @@ func setUserClassRefs(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 //     without ever assigning to it.
 //   - `for c.userClass = range xs` — legal Go, and an assignment the AssignStmt
 //     arm does not see because RangeStmt carries its own Key/Value.
+//   - `c.userClass++` — IncDecStmt is not an AssignStmt. Illegal on today's
+//     string field and legal the moment the class becomes an ordinal, which is
+//     the wrong time to discover the arm is missing.
+//   - `(c.userClass) = x` — the assignment LHS is an *ast.ParenExpr, so a
+//     predicate that accepts only a bare *ast.SelectorExpr records ZERO writes
+//     for it. Valid Go, and it was invisible: build rc 0, vet rc 0, every canary
+//     green (#6706 review r8 F4, reproduced firsthand).
+//   - `*c = CLI{}` — WHOLE-OBJECT assignment through a pointer. It names no
+//     field at all and sets userClass to "", which checkPermission and
+//     showConfigRedacted both read as the legacy allow-everything mode, so this
+//     is the most privileged state the RBAC has. `go vet`'s copylocks blocks the
+//     `*c = *other` spelling because CLI holds a sync.Mutex, but not this one,
+//     and an incidental fence in another tool is not this canary's coverage.
+//   - `CLI{a, b, c}` — a POSITIONAL composite literal supplies every field by
+//     position, including userClass, with no KeyValueExpr for the keyed arm to
+//     see.
+//   - `x.CLI = other` — replacing an embedded CLI. No type embeds CLI today;
+//     the arm costs one case and closes the shape rather than waiting for one.
 //
 // READS ARE NOT WRITES. permissions.go reads c.userClass in both of its
 // permission gates (:44,51,53 and :94,97) and must not be flagged, which is why
@@ -225,6 +289,23 @@ func setUserClassRefs(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 // all — the difference between this and setUserClassRefs, where a bare
 // reference IS the violation because a method value defers the write out of
 // sight.
+//
+// KNOWN LIMITS, named rather than implied, because each round of this PR has
+// found one more form and the honest statement is where the enumeration stops:
+//
+//   - The whole-object arms learn which identifiers point AT a CLI from
+//     DECLARED types (holderPointerNames), not from a type-checker. A pointer
+//     from an untyped source (`p := somethingReturningStar()`) and a double
+//     indirection (`**pp`) are not recognised.
+//   - A whole-value write into a COLLECTION element — `shells[0] = CLI{}`,
+//     `byName[k] = other` — is not recognised: the LHS is an IndexExpr and
+//     deciding it needs the element type. There is no `[]CLI`, `[]*CLI` or
+//     map-of-CLI anywhere in the tree today (grepped), so no such write exists
+//     to catch; a narrower rule keyed on the RHS literal was rejected because
+//     partial coverage of a form invites the belief that the form is covered.
+//   - reflect and unsafe are outside any AST predicate.
+//
+// The arms that exist are the ones a reviewer could plausibly write by hand.
 func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRef {
 	var out []classRef
 	for _, decl := range f.Decls {
@@ -232,21 +313,27 @@ func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 		if fn, ok := decl.(*ast.FuncDecl); ok {
 			key = funcKeyFor(pkgRel, fn)
 		}
+		holders := holderPointerNames(decl)
 		record := func(n ast.Node) {
 			out = append(out, classRef{key: key, pos: fset.Position(n.Pos()).String()})
+		}
+		recordLHS := func(lhs ast.Expr) {
+			if isClassFieldSelector(lhs) || isWholeHolderWrite(lhs, holders) {
+				record(lhs)
+			}
 		}
 		ast.Inspect(decl, func(n ast.Node) bool {
 			switch node := n.(type) {
 			case *ast.AssignStmt:
 				for _, lhs := range node.Lhs {
-					if isClassFieldSelector(lhs) {
-						record(lhs)
-					}
+					recordLHS(lhs)
 				}
+			case *ast.IncDecStmt:
+				recordLHS(node.X)
 			case *ast.RangeStmt:
 				for _, lhs := range []ast.Expr{node.Key, node.Value} {
-					if lhs != nil && isClassFieldSelector(lhs) {
-						record(lhs)
+					if lhs != nil {
+						recordLHS(lhs)
 					}
 				}
 			case *ast.UnaryExpr:
@@ -254,7 +341,11 @@ func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 					record(node)
 				}
 			case *ast.KeyValueExpr:
-				if id, ok := node.Key.(*ast.Ident); ok && id.Name == classFieldName {
+				if id, ok := unparenExpr(node.Key).(*ast.Ident); ok && id.Name == classFieldName {
+					record(node)
+				}
+			case *ast.CompositeLit:
+				if isHolderTypeName(node.Type) && hasPositionalElts(node) {
 					record(node)
 				}
 			}
@@ -264,10 +355,119 @@ func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 	return out
 }
 
-// isClassFieldSelector reports whether expr is a `<x>.userClass` selector.
+// unparenExpr strips redundant parentheses. `(c.userClass) = "super-user"` is
+// valid Go whose assignment LHS is an *ast.ParenExpr; without this the write is
+// recorded nowhere (#6706 review r8 F4).
+func unparenExpr(expr ast.Expr) ast.Expr {
+	for {
+		p, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = p.X
+	}
+}
+
+// isClassFieldSelector reports whether expr is a `<x>.userClass` selector,
+// however many parentheses it is wrapped in.
 func isClassFieldSelector(expr ast.Expr) bool {
-	sel, ok := expr.(*ast.SelectorExpr)
+	sel, ok := unparenExpr(expr).(*ast.SelectorExpr)
 	return ok && sel.Sel.Name == classFieldName
+}
+
+// isWholeHolderWrite reports whether expr, in assignment-LHS position,
+// replaces an ENTIRE CLI value — which writes userClass along with every other
+// field while naming none of them.
+//
+// Two shapes: through a pointer this declaration declares as *CLI (`*c = ...`),
+// and through an embedded CLI field (`x.CLI = ...`).
+func isWholeHolderWrite(expr ast.Expr, holderPtrs map[string]bool) bool {
+	switch e := unparenExpr(expr).(type) {
+	case *ast.StarExpr:
+		id, ok := unparenExpr(e.X).(*ast.Ident)
+		return ok && holderPtrs[id.Name]
+	case *ast.SelectorExpr:
+		return e.Sel.Name == classHolderType
+	}
+	return false
+}
+
+// holderPointerNames collects the identifiers within decl whose DECLARED type
+// is `*CLI` (or `*<pkg>.CLI`): the pointer receiver, the parameters of the
+// declaration and of any function literal inside it, and `var p *CLI`.
+//
+// Collected flatly rather than per-scope. A name shadowed inside an inner block
+// is then still treated as a holder, which over-approximates toward FLAGGING —
+// the safe direction for a canary, and a false positive here is a prompt to
+// think rather than a silent pass.
+func holderPointerNames(decl ast.Decl) map[string]bool {
+	out := map[string]bool{}
+	addFields := func(fl *ast.FieldList) {
+		if fl == nil {
+			return
+		}
+		for _, field := range fl.List {
+			if !isHolderPointerType(field.Type) {
+				continue
+			}
+			for _, name := range field.Names {
+				out[name.Name] = true
+			}
+		}
+	}
+	ast.Inspect(decl, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.FuncDecl:
+			addFields(node.Recv)
+			if node.Type != nil {
+				addFields(node.Type.Params)
+			}
+		case *ast.FuncLit:
+			if node.Type != nil {
+				addFields(node.Type.Params)
+			}
+		case *ast.ValueSpec:
+			if isHolderPointerType(node.Type) {
+				for _, name := range node.Names {
+					out[name.Name] = true
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// isHolderPointerType reports whether expr spells `*CLI` or `*<pkg>.CLI`.
+// The qualifier is ignored for the same reason every other predicate in this
+// file ignores it: a whole-value assignment through a *cli.CLI from another
+// package is legal and writes the private field just as effectively.
+func isHolderPointerType(expr ast.Expr) bool {
+	star, ok := expr.(*ast.StarExpr)
+	return ok && isHolderTypeName(star.X)
+}
+
+// isHolderTypeName reports whether expr names the CLI type, bare or qualified.
+func isHolderTypeName(expr ast.Expr) bool {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name == classHolderType
+	case *ast.SelectorExpr:
+		return t.Sel.Name == classHolderType
+	}
+	return false
+}
+
+// hasPositionalElts reports whether lit supplies at least one field by
+// POSITION. `CLI{}` sets nothing and is not a write; `CLI{userClass: x}` is
+// caught by the KeyValueExpr arm; `CLI{a, b, c}` is caught only here.
+func hasPositionalElts(lit *ast.CompositeLit) bool {
+	for _, elt := range lit.Elts {
+		if _, keyed := elt.(*ast.KeyValueExpr); !keyed {
+			return true
+		}
+	}
+	return false
 }
 
 // TestClassFieldWriteCanaryDetectsEveryWriteForm_6706 proves classFieldWrites
@@ -277,6 +477,12 @@ func isClassFieldSelector(expr ast.Expr) bool {
 // forms that reach the field just as well.
 //
 // It runs the REAL predicate, not a copy.
+//
+// Every form here was once invisible to some revision of the predicate, and
+// three rounds of this PR each found exactly one more, so the cases are kept in
+// the order they were found and each names what it defeats. The EDGE cases —
+// double parentheses, a parenthesised deref — exist because a fix aimed at one
+// spelling of a form is not a fix for the form.
 func TestClassFieldWriteCanaryDetectsEveryWriteForm_6706(t *testing.T) {
 	const src = `package cli
 
@@ -293,9 +499,34 @@ func (c *CLI) viaRange(xs []string) {
 	}
 }
 
+func (c *CLI) parenAssign() { (c.userClass) = "super-user" }
+
+func (c *CLI) doubleParenAssign() { ((c.userClass)) = "super-user" }
+
+func (c *CLI) incDec() { c.userClass++ }
+
+func (c *CLI) wholeObject() { *c = CLI{} }
+
+func (c *CLI) wholeObjectParen() { (*c) = CLI{} }
+
+func wholeObjectViaParam(c *CLI, other CLI) { *c = other }
+
+func wholeObjectViaVar(other CLI) {
+	var p *CLI
+	*p = other
+}
+
+func (c *CLI) positionalComposite() *CLI { return &CLI{"prompt", "super-user"} }
+
+func (s *superShell) embeddedWhole(other CLI) { s.CLI = other }
+
 func (c *CLI) readsOnly() bool { return c.userClass == "" || c.userClass == "super-user" }
 
 func (c *CLI) unrelatedWrite() { c.version = "x" }
+
+func (c *CLI) emptyLiteralOfAnotherType() *other { return &other{} }
+
+func notAHolder(p *string, v string) { *p = v }
 
 var packageLevelSetter = func(c *CLI) { c.userClass = "super-user" }
 `
@@ -308,26 +539,43 @@ var packageLevelSetter = func(c *CLI) { c.userClass = "super-user" }
 	for _, ref := range classFieldWrites(fset, f, "cli") {
 		got[ref.key]++
 	}
-	want := map[string]int{
-		"cli::CLI.plainAssign":    1,
-		"cli::CLI.tupleAssign":    1,
-		"cli::CLI.addressOf":      1,
-		"cli::CLI.composite":      1,
-		"cli::CLI.viaRange":       1,
-		"cli::" + packageLevelKey: 1,
+	want := map[string]struct {
+		n   int
+		why string
+	}{
+		"cli::CLI.plainAssign":          {1, "the obvious form"},
+		"cli::CLI.tupleAssign":          {1, "every LHS element is checked"},
+		"cli::CLI.addressOf":            {1, "the address escapes to code this file cannot follow"},
+		"cli::CLI.composite":            {1, "a keyed literal constructs the field without assigning"},
+		"cli::CLI.viaRange":             {1, "RangeStmt carries its own Key/Value"},
+		"cli::CLI.parenAssign":          {1, "r8 F4: the LHS is an *ast.ParenExpr"},
+		"cli::CLI.doubleParenAssign":    {1, "EDGE: one Unparen is not unwrapping"},
+		"cli::CLI.incDec":               {1, "IncDecStmt is not an AssignStmt"},
+		"cli::CLI.wholeObject":          {1, "r8 F4: whole-object write names no field, and sets the class to the allow-everything empty string"},
+		"cli::CLI.wholeObjectParen":     {1, "EDGE: a parenthesised deref is the same write"},
+		"cli::wholeObjectViaParam":      {1, "the holder need not be the receiver"},
+		"cli::wholeObjectViaVar":        {1, "nor a parameter"},
+		"cli::CLI.positionalComposite":  {1, "a POSITIONAL literal sets every field with no KeyValueExpr to see"},
+		"cli::superShell.embeddedWhole": {1, "replacing an embedded CLI replaces its class"},
+		"cli::" + packageLevelKey:       {1, "a package-level func literal is not inside any FuncDecl"},
 	}
-	for key, n := range want {
-		if got[key] != n {
-			t.Errorf("classFieldWrites found %d writes in %s, want %d — that write form reaches "+
+	for key, w := range want {
+		if got[key] != w.n {
+			t.Errorf("classFieldWrites found %d writes in %s, want %d — %s; that write form reaches "+
 				"the RBAC class without going through SetUserClass and must not be invisible",
-				got[key], key, n)
+				got[key], key, w.n, w.why)
 		}
 	}
-	for _, mustNotWrite := range []string{"cli::CLI.readsOnly", "cli::CLI.unrelatedWrite"} {
-		if got[mustNotWrite] != 0 {
-			t.Errorf("classFieldWrites flagged %s (%d times) — reads and unrelated fields are not "+
-				"class writes, and a predicate that says they are gets deleted rather than fixed",
-				mustNotWrite, got[mustNotWrite])
+	mustNotWrite := map[string]string{
+		"cli::CLI.readsOnly":                 "reads are not writes — permissions.go is nothing but reads",
+		"cli::CLI.unrelatedWrite":            "a different field of the same object",
+		"cli::CLI.emptyLiteralOfAnotherType": "an empty literal of an unrelated type sets nothing",
+		"cli::notAHolder":                    "a deref of a *string is not a whole-object CLI write",
+	}
+	for key, why := range mustNotWrite {
+		if got[key] != 0 {
+			t.Errorf("classFieldWrites flagged %s (%d times) — %s, and a predicate that says "+
+				"otherwise gets deleted rather than fixed", key, got[key], why)
 		}
 	}
 	if len(got) != len(want) {
@@ -825,19 +1073,34 @@ func isNestedModuleRoot(path string) bool {
 // TestCanaryTraversalHelpersMatchTheOsidentCopy_6706 below reds if the bodies
 // drift apart.
 func walkCanaryFiles(root string, visit func(path string)) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	// RESOLVE A SYMLINKED ROOT. filepath.WalkDir Lstats its root, so a symlink
+	// pointing at the checkout is not a directory to it: the walk visits the
+	// link itself, skips it as a non-.go file and reports NOTHING, while
+	// `go list ./...` run from that same path reports every package. That is a
+	// divergence from cmd/go in the silent direction, which is the one this
+	// walk must not have (#6706 review r8 F2). Symlinked SUBdirectories need no
+	// such handling: cmd/go does not descend into them either
+	// (modload/search.go warns "ignoring symlink" and returns), so
+	// filepath.WalkDir's Lstat semantics already match there — verified by
+	// planting one and observing `go list ./...` omit it.
+	walkRoot := root
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		walkRoot = resolved
+	}
+	compiled := map[string]map[string]bool{}
+	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if skipCanaryDir(root, path) {
+			if skipCanaryDir(walkRoot, path) {
 				return fs.SkipDir
 			}
 			// Skip NESTED GO MODULES — a directory below the root carrying its
 			// own go.mod FILE. See isNestedModuleRoot for why the
 			// file-vs-directory distinction is load-bearing rather than
 			// pedantic.
-			if path != root && isNestedModuleRoot(path) {
+			if path != walkRoot && isNestedModuleRoot(path) {
 				return fs.SkipDir
 			}
 			return nil
@@ -845,12 +1108,27 @@ func walkCanaryFiles(root string, visit func(path string)) error {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		if !compiledByGoBuild(path) {
+		if !compiledByGoBuild(compiled, path) {
 			return nil
 		}
-		visit(path)
+		visit(rebaseCanaryPath(walkRoot, root, path))
 		return nil
 	})
+}
+
+// rebaseCanaryPath re-expresses a path discovered under walkRoot in terms of
+// the root the CALLER passed in. VERBATIM COPY of pkg/osident's — see it for
+// why a symlinked walk root is a divergence from cmd/go in the silent
+// direction (#6706 review r8 F2).
+func rebaseCanaryPath(walkRoot, root, path string) string {
+	if walkRoot == root {
+		return path
+	}
+	rel, err := filepath.Rel(walkRoot, path)
+	if err != nil {
+		return path
+	}
+	return filepath.Join(root, rel)
 }
 
 // skipCanaryDir reports directories the canary walks must not descend into,
@@ -890,16 +1168,37 @@ var canaryBuildCtxs = func() [2]build.Context {
 // package in its directory, asking go/build ITSELF rather than restating its
 // rule, under either of canaryBuildCtxs. VERBATIM COPY of pkg/osident's — see
 // it for why the `.go` suffix test alone was not the `./...` rule (#6706 review
-// r5 F2).
-func compiledByGoBuild(path string) bool {
+// r5 F2), and for why it LOADS the package rather than asking MatchFile, which
+// answers a strictly weaker question and scanned a file no configuration
+// compiles (r8 F1).
+func compiledByGoBuild(cache map[string]map[string]bool, path string) bool {
 	dir, name := filepath.Dir(path), filepath.Base(path)
+	files, ok := cache[dir]
+	if !ok {
+		files = compiledFilesInDir(dir)
+		cache[dir] = files
+	}
+	return files[name]
+}
+
+// compiledFilesInDir is the per-directory half of compiledByGoBuild. VERBATIM
+// COPY of pkg/osident's — see it for why loading the package is not the same
+// question as MatchFile, and for the file that MatchFile scanned although no
+// toolchain configuration compiles it (#6706 review r8 F1).
+func compiledFilesInDir(dir string) map[string]bool {
+	out := map[string]bool{}
 	for _, ctxt := range canaryBuildCtxs {
-		ok, err := ctxt.MatchFile(dir, name)
-		if err != nil || ok {
-			return true
+		pkg, _ := ctxt.ImportDir(dir, 0)
+		if pkg == nil {
+			continue
+		}
+		for _, list := range [][]string{pkg.GoFiles, pkg.CgoFiles, pkg.InvalidGoFiles} {
+			for _, name := range list {
+				out[name] = true
+			}
 		}
 	}
-	return false
+	return out
 }
 
 // relKeyFor renders a walked path relative to root with forward slashes.

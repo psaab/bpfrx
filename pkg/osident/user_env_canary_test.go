@@ -126,19 +126,34 @@ var traversalSentinels = []string{
 // TestCanaryWalkRuleMatchesTheToolchain_6706 drives THIS function over a
 // fixture tree and cross-checks its answer against `go list ./...`.
 func walkCanaryFiles(root string, visit func(path string)) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	// RESOLVE A SYMLINKED ROOT. filepath.WalkDir Lstats its root, so a symlink
+	// pointing at the checkout is not a directory to it: the walk visits the
+	// link itself, skips it as a non-.go file and reports NOTHING, while
+	// `go list ./...` run from that same path reports every package. That is a
+	// divergence from cmd/go in the silent direction, which is the one this
+	// walk must not have (#6706 review r8 F2). Symlinked SUBdirectories need no
+	// such handling: cmd/go does not descend into them either
+	// (modload/search.go warns "ignoring symlink" and returns), so
+	// filepath.WalkDir's Lstat semantics already match there — verified by
+	// planting one and observing `go list ./...` omit it.
+	walkRoot := root
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		walkRoot = resolved
+	}
+	compiled := map[string]map[string]bool{}
+	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
-			if skipCanaryDir(root, path) {
+			if skipCanaryDir(walkRoot, path) {
 				return fs.SkipDir
 			}
 			// Skip NESTED GO MODULES — a directory below the root carrying its
 			// own go.mod FILE. See isNestedModuleRoot for why the
 			// file-vs-directory distinction is load-bearing rather than
 			// pedantic.
-			if path != root && isNestedModuleRoot(path) {
+			if path != walkRoot && isNestedModuleRoot(path) {
 				return fs.SkipDir
 			}
 			return nil
@@ -146,12 +161,27 @@ func walkCanaryFiles(root string, visit func(path string)) error {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		if !compiledByGoBuild(path) {
+		if !compiledByGoBuild(compiled, path) {
 			return nil
 		}
-		visit(path)
+		visit(rebaseCanaryPath(walkRoot, root, path))
 		return nil
 	})
+}
+
+// rebaseCanaryPath re-expresses a path discovered under walkRoot in terms of
+// the root the CALLER passed in, so that resolving a symlinked root stays
+// invisible to callers that relativise against their own spelling of it.
+// Every caller does exactly that, to build the keys traversalSentinels names.
+func rebaseCanaryPath(walkRoot, root, path string) string {
+	if walkRoot == root {
+		return path
+	}
+	rel, err := filepath.Rel(walkRoot, path)
+	if err != nil {
+		return path
+	}
+	return filepath.Join(root, rel)
 }
 
 // skipCanaryDir reports directories the walk must not descend into, modelling
@@ -184,7 +214,12 @@ func walkCanaryFiles(root string, visit func(path string)) error {
 // Left in the SAFE (over-scan) direction and deliberately not implemented:
 // go.mod `ignore` directives (search.go:107-112) also set `want = false`. There
 // are none in this module; if one is added, this walk scans a tree cmd/go does
-// not, which reds rather than falls silent.
+// not, which reds rather than falls silent. That is the ONE residual difference
+// from cmd/go's directory rule, and the qualifier matters — an earlier revision
+// of this comment called it the sole residual while a SYMLINKED WALK ROOT was a
+// second one, in the silent direction (#6706 review r8 F2). walkCanaryFiles now
+// resolves the root; symlinked subdirectories need nothing, because cmd/go
+// ignores those too.
 func skipCanaryDir(root, path string) bool {
 	if path == root {
 		return false
@@ -219,13 +254,16 @@ func skipCanaryDir(root, path string) bool {
 // whole of the defect above. The union does that AND covers `//go:build cgo`
 // files, which the pin excludes. This canary's remit is explicitly prospective
 // ("whether or not anybody remembers to write a test for it"), and a cgo-only
-// file that reads $USER is a defect one Makefile edit away from shipping. The
-// union's cost is bounded by an invariant that the pin also satisfies:
-// everything scanned is compiled by SOME toolchain configuration on this
-// GOOS/GOARCH, so it can never produce a red that no `go build` agrees with —
-// the property #6706 review r5 F2 established. Today the union changes nothing:
-// `grep -rn '^//go:build' --include=*.go` over non-test files returns zero
-// lines, so both settings currently scan the identical set.
+// file that reads $USER is a defect one Makefile edit away from shipping.
+//
+// The union's cost is bounded by the invariant that everything scanned is
+// COMPILED by some toolchain configuration on this GOOS/GOARCH, so it can never
+// produce a red that no `go build` agrees with. That invariant is now enforced
+// by compiledByGoBuild loading the package; it was NOT enforced while the rule
+// was MatchFile, and the claim that it was is the defect #6706 review r8 F1
+// reports — see compiledByGoBuild for the counter-example. Today the union
+// changes nothing: `grep -rn '^//go:build' --include=*.go` over non-test files
+// returns zero lines, so both settings currently scan the identical set.
 //
 // KNOWN LIMIT, named rather than implied, and now named on the axis that
 // matters. The cgo axis IS covered. What is not: GOOS/GOARCH, which stay at
@@ -233,15 +271,7 @@ func skipCanaryDir(root, path string) bool {
 // `//go:build windows` or `//go:build debuglog` file is not reported — and is
 // not in the appliance either, which is linux/amd64 with no custom tags (the
 // Makefile's `debug-log` feature is a cargo feature of the Rust helper, not a
-// Go build tag). A parse error in the constraint means go/build cannot answer,
-// so the file is SCANNED: on an unanswerable question the guard should fire,
-// not fall silent.
-//
-// One MatchFile quirk, stated because it is an over-scan: a file that imports
-// "C" matches under BOTH settings (the CgoFiles/IgnoredGoFiles split happens in
-// ImportDir, not in MatchFile), so under CGO_ENABLED=0 it is scanned although
-// the shipped build ignores it. The invariant holds — CGO_ENABLED=1 does
-// compile it — and there are no such files outside test sources.
+// Go build tag).
 var canaryBuildCtxs = func() [2]build.Context {
 	shipped, devel := build.Default, build.Default
 	shipped.CgoEnabled = false // Makefile builds xpfd and cli with CGO_ENABLED=0
@@ -251,7 +281,9 @@ var canaryBuildCtxs = func() [2]build.Context {
 
 // compiledByGoBuild reports whether the toolchain would compile path into the
 // package in its directory, asking go/build ITSELF rather than restating its
-// rule, under either of canaryBuildCtxs.
+// rule, under either of canaryBuildCtxs. cache memoises the per-directory
+// answer, which is what makes a per-file question affordable: the walk asks it
+// once per file and go/build answers it once per directory.
 //
 // `./...` excludes more than `_`/`.`-prefixed DIRECTORIES: go/build's matchFile
 // also drops `_`/`.`-prefixed FILES, files whose _GOOS/_GOARCH suffix does not
@@ -262,15 +294,66 @@ var canaryBuildCtxs = func() [2]build.Context {
 // `pkg/osident/zz_windows.go` reddened it with build and vet rc 0 — the exact
 // false red the directory half of the rule exists to prevent (#6706 review r5
 // F2).
-func compiledByGoBuild(path string) bool {
+//
+// WHY IT LOADS THE PACKAGE INSTEAD OF ASKING MatchFile. MatchFile answers a
+// strictly WEAKER question than "is this file compiled": it applies the name
+// and constraint rules, and stops there. The cgo split happens later, in
+// ImportDir, so MatchFile accepts a file that imports "C" under BOTH cgo
+// settings. Union that with a `//go:build !cgo` constraint and the two halves
+// select DISJOINT configurations:
+//
+//	//go:build !cgo
+//	package probe
+//	/*
+//	*/
+//	import "C"
+//	import "os"
+//	var _ = os.Getenv("USER")
+//
+// CGO_ENABLED=0 puts this file in IgnoredGoFiles (it imports "C");
+// CGO_ENABLED=1 ignores it too (the constraint is false); `go build ./...`
+// succeeds under both. Under the MatchFile rule the canary scanned it anyway
+// and reported a $USER read — a red no `go build` agrees with, which is exactly
+// the false positive the union was claimed to be incapable of producing (#6706
+// review r8 F1, reproduced firsthand: build and vet rc 0 under both settings,
+// `go list` reporting probe.go in IgnoredGoFiles under both, canary RED).
+//
+// GoFiles and CgoFiles are the lists `go list` prints, computed by the same
+// go/build code that computes them for cmd/go, so this is the toolchain's own
+// answer rather than a restatement of it. InvalidGoFiles is unioned in as well:
+// it holds the files go/build could not CLASSIFY (a malformed build constraint,
+// a package-clause conflict). On an unanswerable question the guard should fire
+// rather than fall silent, and `go list ./...` does not succeed on such a
+// directory either, so scanning them cannot contradict a successful build.
+func compiledByGoBuild(cache map[string]map[string]bool, path string) bool {
 	dir, name := filepath.Dir(path), filepath.Base(path)
+	files, ok := cache[dir]
+	if !ok {
+		files = compiledFilesInDir(dir)
+		cache[dir] = files
+	}
+	return files[name]
+}
+
+// compiledFilesInDir is the per-directory half of compiledByGoBuild: the union,
+// over canaryBuildCtxs, of the files go/build reports as compiled into the
+// package in dir. A directory with no buildable Go files yields the empty set
+// (ImportDir's NoGoError leaves the lists empty, which is the correct answer,
+// not an error to react to).
+func compiledFilesInDir(dir string) map[string]bool {
+	out := map[string]bool{}
 	for _, ctxt := range canaryBuildCtxs {
-		ok, err := ctxt.MatchFile(dir, name)
-		if err != nil || ok {
-			return true
+		pkg, _ := ctxt.ImportDir(dir, 0)
+		if pkg == nil {
+			continue
+		}
+		for _, list := range [][]string{pkg.GoFiles, pkg.CgoFiles, pkg.InvalidGoFiles} {
+			for _, name := range list {
+				out[name] = true
+			}
 		}
 	}
-	return false
+	return out
 }
 
 // identityEnvHit is one production read of an identity-naming environment

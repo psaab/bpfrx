@@ -25,6 +25,8 @@ var canaryTraversalHelpers = []string{
 	"skipCanaryDir",
 	"isNestedModuleRoot",
 	"compiledByGoBuild",
+	"compiledFilesInDir",
+	"rebaseCanaryPath",
 	"canaryBuildCtxs",
 }
 

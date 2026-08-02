@@ -43,6 +43,19 @@ var canaryWalkFixture = []struct {
 	{"zz_cgo.go", "//go:build cgo\n\npackage probe\n", true,
 		"compiled by a cgo-enabled build; invisible if CgoEnabled were pinned false"},
 
+	// r8 F1 — MATCHING a build constraint is not the same as BEING COMPILED,
+	// and the two halves of the union can select disjoint configurations. The
+	// cgo file split (CgoFiles vs IgnoredGoFiles) happens in ImportDir, not in
+	// MatchFile, so the MatchFile rule accepted the first row below under the
+	// shipped context although NOTHING compiles it — a red no `go build`
+	// agrees with. Cross-checked against `go list` by the oracle half, which
+	// now reads CgoFiles as well as GoFiles (r8 F3: a legitimate cgo source was
+	// never validated by the oracle at all).
+	{"zz_nocgo_importsc.go", "//go:build !cgo\n\npackage probe\n\n/*\n*/\nimport \"C\"\n", false,
+		"`!cgo` AND `import \"C\"`: CGO_ENABLED=0 ignores it for importing C, CGO_ENABLED=1 for the constraint — no configuration compiles it"},
+	{"zz_cgo_importsc.go", "package probe\n\n/*\n*/\nimport \"C\"\n", true,
+		"a legitimate cgo source — CgoFiles under CGO_ENABLED=1, and the class the oracle could not see while it read only GoFiles"},
+
 	// F2 — cmd/go adds the vendor DIRECTORY as a package and prunes only its
 	// SUBTREE (modload/search.go:139-152).
 	{"vendor/probe.go", "package vendor\n", true,
@@ -131,6 +144,54 @@ func TestCanaryWalkRuleMatchesTheToolchain_6706(t *testing.T) {
 	assertFixtureMatchesGoList(t, root)
 }
 
+// TestCanaryWalkFollowsASymlinkedRoot_6706 pins the SECOND residual difference
+// from cmd/go that #6706 review r8 F2 found — and it was in the silent
+// direction, which is the one this walk must never be in.
+//
+// filepath.WalkDir Lstats its root. A symlink pointing at a checkout is
+// therefore not a directory to it: the walk visits the link itself, drops it as
+// a non-.go file, and reports NOTHING — no packages, no files, no hits — while
+// `go list ./...` run from that same path reports every package the module has.
+// A canary walked from such a root is green because it looked at nothing.
+//
+// Both halves matter and both are asserted here: the walk must FIND the files,
+// and it must hand back paths that relativise against the root the CALLER
+// passed, since building the traversalSentinels keys is the only thing every
+// caller does with them.
+//
+// FAIL-ON-REVERT: drop the filepath.EvalSymlinks in walkCanaryFiles and this
+// reds with an empty visited set; drop rebaseCanaryPath and it reds because
+// every path relativises to something outside the link root.
+func TestCanaryWalkFollowsASymlinkedRoot_6706(t *testing.T) {
+	real := t.TempDir()
+	writeCanaryFixture(t, real)
+
+	link := filepath.Join(t.TempDir(), "linkroot")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create a symlink here (%v) — the walk assertions elsewhere still ran", err)
+	}
+
+	got := map[string]bool{}
+	if err := walkCanaryFiles(link, func(path string) {
+		rel, err := filepath.Rel(link, path)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			t.Errorf("walkCanaryFiles handed back %s, which does not relativise against the root "+
+				"it was given (%s) — every caller keys on filepath.Rel(root, path)", path, link)
+			return
+		}
+		got[filepath.ToSlash(rel)] = true
+	}); err != nil {
+		t.Fatalf("walkCanaryFiles through a symlinked root: %v", err)
+	}
+
+	for _, f := range canaryWalkFixture {
+		if got[f.path] != f.want {
+			t.Errorf("through a SYMLINKED root, walkCanaryFiles visited %s = %v, want %v — %s",
+				f.path, got[f.path], f.want, f.why)
+		}
+	}
+}
+
 // fixtureDeclares reports whether path has a row in canaryWalkFixture.
 func fixtureDeclares(path string) bool {
 	for _, f := range canaryWalkFixture {
@@ -180,29 +241,38 @@ func assertFixtureMatchesGoList(t *testing.T, root string) {
 		goBin = found
 	}
 
+	// GoFiles AND CgoFiles. Reading only GoFiles left an entire class — a
+	// legitimate source that imports "C" — declared in the table above and
+	// validated by nothing, which is the half of the oracle that makes the
+	// table non-circular (#6706 review r8 F3). The template emits one
+	// tab-separated field per file rather than a comma-joined list so that a
+	// package with no CgoFiles cannot be confused with a malformed line.
+	const listFormat = "{{.Dir}}{{range .GoFiles}}\t{{.}}{{end}}{{range .CgoFiles}}\t{{.}}{{end}}"
 	oracle := map[string]bool{}
 	for _, cgo := range []string{"0", "1"} {
-		cmd := exec.Command(goBin, "list", "-f", "{{.Dir}}\t{{join .GoFiles \",\"}}", "./...")
+		cmd := exec.Command(goBin, "list", "-f", listFormat, "./...")
 		cmd.Dir = root
 		cmd.Env = append(os.Environ(), "CGO_ENABLED="+cgo,
 			"GOWORK=off",        // a parent workspace must not redefine the module set
 			"GOFLAGS=-mod=mod",  // a root `vendor/` must not switch the go command to -mod=vendor
 			"GOPROXY=off",       // the fixture has no dependencies; a network fetch is a bug
 			"GOTOOLCHAIN=local") // never download a toolchain to answer this
-		out, err := cmd.CombinedOutput()
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
 		if err != nil {
-			t.Fatalf("go list (CGO_ENABLED=%s) in the fixture module: %v\n%s", cgo, err, out)
+			t.Fatalf("go list (CGO_ENABLED=%s) in the fixture module: %v\n%s", cgo, err, stderr.String())
 		}
 		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-			dir, files, ok := strings.Cut(strings.TrimSpace(line), "\t")
-			if !ok || files == "" {
-				continue
+			fields := strings.Split(strings.TrimSpace(line), "\t")
+			if len(fields) < 2 {
+				continue // a package with no compiled files
 			}
-			rel, err := filepath.Rel(root, dir)
+			rel, err := filepath.Rel(root, fields[0])
 			if err != nil {
-				t.Fatalf("relativise go list dir %s: %v", dir, err)
+				t.Fatalf("relativise go list dir %s: %v", fields[0], err)
 			}
-			for _, name := range strings.Split(files, ",") {
+			for _, name := range fields[1:] {
 				oracle[filepath.ToSlash(filepath.Join(rel, name))] = true
 			}
 		}
