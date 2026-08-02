@@ -35,7 +35,7 @@
     },
     {
       "path": "userspace-xdp/src/binding_index.rs",
-      "sha256": "be13c9404a0e2f128579afe68dd727fa172b3027816c8746f1427dfcfae1565d"
+      "sha256": "31cebf64428a8820f636bfd38cdfb8253c865e3ae0d9a485460a18175433776b"
     },
     {
       "path": "userspace-xdp/src/lib.rs",

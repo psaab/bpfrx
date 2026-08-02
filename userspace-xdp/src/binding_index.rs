@@ -29,19 +29,48 @@
 //!     bounded by the parity tests — a hostile round added an arithmetic impl
 //!     plus a public field and nothing went red, which with one extra line
 //!     reintroduced the defect with no `unsafe` marker anywhere in it.
-//!   - **Executed.** [`binding_slot`] is host-compiled and driven over the
-//!     `(ifindex, queue)` grid the parity tests cover — queues 0..64 against a
-//!     spread of ifindexes up to 65535, so both sides of the stride boundary
-//!     are exercised — and the mapping, the bound, and the property that a slot
-//!     never leaves its own interface's row are behavioural results rather than
-//!     claims about text. NOT covered: ifindexes large enough for
-//!     `ifindex * BINDING_QUEUES_PER_IFACE` to overflow `u32` (2^28 and up).
-//!     Host and target disagree there — a debug host build PANICS on the
-//!     overflow while the release target WRAPS — so the grid deliberately stops
-//!     below it. A kernel ifindex is an `int` and the shim gates on its
-//!     ingress-interface map before reaching here, so that range is unreachable
-//!     in practice; it is also pre-existing on master, same multiply, same
-//!     absent bound.
+//!   - **Executed.** [`binding_slot`] is host-compiled and RUN by the parity
+//!     tests over both coordinate axes, so the mapping, the stride bound and
+//!     the property that a slot never leaves its own interface's row are
+//!     behavioural results rather than claims about text.
+//!
+//!     The axes are POWER-OF-TWO LADDERS — `2^k`, `2^k - 1` and `2^k + 1` for
+//!     every representable k — and NOT the hand-picked spread an earlier
+//!     revision of this comment described. That revision also got its own gap
+//!     wrong in both directions: it named the only uncovered range as
+//!     "ifindexes large enough for `ifindex * BINDING_QUEUES_PER_IFACE` to
+//!     overflow `u32` (2^28 and up)", while the grid it described actually
+//!     stopped at ifindex 65535 and at queue 63. That is not a rounding error
+//!     in a comment, it is the whole defect: `& 0xffff` is the identity on
+//!     every ifindex such a grid tests and `& 0x3f` is the identity on every
+//!     queue it tests, so the largest value on each axis WAS the boundary of
+//!     the mask that would walk through it. A hostile round added exactly those
+//!     two masks to the two bodies below, compiled them, and left every guard
+//!     green with a masking instruction in the emitted object.
+//!
+//!     A ladder has no such tell: the OR of the tested values is all-ones
+//!     across the representable range, so a mask that clears ANY bit changes at
+//!     least one tested result. NOT covered, and this time measured rather than
+//!     asserted: ifindexes at or above 2^28, where the multiply overflows `u32`
+//!     and host and target genuinely disagree — a debug host build PANICS while
+//!     the release target WRAPS. `(2^28 - 1) * BINDING_QUEUES_PER_IFACE + 15` is
+//!     exactly `u32::MAX`, so the executed axis stops at that ceiling for a
+//!     stated reason rather than by accident. A kernel ifindex is an `int` and
+//!     the shim gates on its ingress-interface map before reaching here; that
+//!     range is also pre-existing on master, same multiply, same absent bound.
+//!     The queue axis has no such ceiling and runs to `u32::MAX`.
+//!   - **Pinned as text — the BODIES, not only the signatures.** Widening an
+//!     executed axis relocates a boundary; it does not remove one. So all three
+//!     function bodies in this module — the constructor, the telemetry readback
+//!     and [`binding_slot`] — are pinned token-for-token by the parity tests,
+//!     exactly as the call sites in `lib.rs` already were. (Their symbol names
+//!     are deliberately not spelled here: the parity tests pin how many times
+//!     each is named in this crate, so prose that repeats one is a spurious
+//!     RED.) That is what closes the class rather than moving
+//!     it: a body is the one place an in-place arithmetic edit costs nothing
+//!     else. It creates no binding, needs no dependency, spends no mention from
+//!     the per-file tally and touches no pinned statement, which is why every
+//!     other bound here was blind to it.
 //!   - **NOT closed by a TYPE, and that list is not empty.** The constructor
 //!     must accept a bare `u32`, because the value originates in an aya
 //!     `XdpContext` that cannot cross into a `core`-only module. So (a) a

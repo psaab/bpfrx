@@ -1,3 +1,146 @@
+## 2026-08-01 — #5173 round 7: a seventh escape class — the function BODIES were never pinned
+
+- **Timestamp**: 2026-08-01 (fix/6676-shim-rx-queue-r7)
+- **Action**: Round-6 hostile re-gate returned `MERGE-NEEDS-MAJOR` on the
+  GUARD apparatus, not the runtime fix. Runtime behaviour is untouched:
+  the shim source change in this round is COMMENT-ONLY, and the installed
+  object reproduces bit-identically at
+  `114354c9a2238bfa1229027b66da3f815a1c5deeaebd2c48f141ef8b84a35e96`
+  after `make generate` (verifier PASS).
+
+  **F1 (MAJOR) — a seventh escape class, and cheaper than the six before
+  it.** Six escapes had been closed on this branch; every one of them
+  needed a binding, a proc macro, a `--extern`, a `[patch]`, a manifest
+  edit or a deletion. This one needs a single in-place arithmetic edit
+  inside a shim function BODY. It creates no binding, spends nothing from
+  the per-file mention tally (`rx_queue_index` is a different token to
+  the counted `rx_queue`) and moves no other pinned sequence.
+  `binding_slot`'s SIGNATURE was pinned but its body was not, and
+  `CONSTRUCTION_STATEMENT` pinned the constructor's CALL SITE in `lib.rs`
+  while its body went unpinned.
+
+  Reproduced firsthand before fixing, both instances GREEN on the shipped
+  guards: `RawRxQueue(rx_queue_index & 0x3f)` at `binding_index.rs:134`,
+  and `Some((ingress_ifindex & 0xffff) * BINDING_QUEUES_PER_IFACE + …)`
+  at `:171`.
+
+  The ROOT REASON is worth recording, because it generalises past this
+  file: the only value-level check was an enumerated grid
+  (`ifindex ∈ {0,1,2,7,63,1000,65535}` × `q ∈ [0,64)`) whose LARGEST
+  TESTED VALUE ON EACH AXIS WAS EXACTLY THE MASK'S BOUNDARY.
+  `65535 & 0xffff == 65535`; every `q < 64` satisfies `q & 0x3f == q`. So
+  both masks were the identity on every point the grid tested. The guard
+  was not weak — it was precisely coextensive with the defect it existed
+  to catch.
+
+  The `& 0x3f` instance is RUNTIME-REACHABLE, not theoretical. On a NIC
+  left above 64 combined channels with the helper's queue count capped at
+  ≤16 (one of the two remediations `docs/afxdp-packet-processing.md`
+  names), a packet on hardware queue 70 resolves to `None` today and
+  takes the designed binding-missing path; masked, `70 & 0x3f = 6`
+  resolves to a LIVE binding and the shim redirects to an XSK bound to a
+  queue the packet did not arrive on — `xsk_rcv_check()` returns
+  `-EINVAL`, the driver discards, and the trace stage stays REDIRECT.
+  #5173 verbatim. The Go publish-side `queue_id >= 16` refusal bounds
+  what Go WRITES, not what arrives from hardware. The `& 0xffff`
+  instance is bounded by the Go cap (fails closed at ifindex ≥ 65536), so
+  it is a guard defect rather than a shipping one — recorded as such
+  rather than inflated, and fixed because it proves the hole is a CLASS.
+
+  Fixed by pinning all THREE bodies in `binding_index.rs`
+  token-for-token, the way the call sites in `lib.rs` already were —
+  the constructor, the telemetry readback and `binding_slot` — which
+  closes the class exactly. The executed grid was ALSO replaced with a
+  property over power-of-two ladders (`2^k`, `2^k ± 1`) on both axes:
+  ifindex to `2^28 - 1` (where `ifindex * 16 + 15` is exactly `u32::MAX`
+  and host/target genuinely disagree above it), queue to `u32::MAX`, with
+  a per-axis floor asserting the OR of the tested values is all-ones so
+  ANY mask that clears a bit alters a tested result. Widening ALONE was
+  refused: it relocates the boundary and buys one round.
+
+  Mutation-proved, four ways. Both reviewer instances now RED with real
+  assertions. Two edge mutations show why the pin and not the axis is the
+  primary bound: `& 0x1ffff` is the identity on the shipped grid AND at
+  `2^16 ± 1` (a grid widened one step would still miss it) and reds at
+  `2^17`; and a `#[cfg(target_arch = "bpf")]`-split body that masks in the
+  BPF object while evaluating `& !0` on the host left the executed axis
+  green at all ~7700 points AND left the per-file tally green — ONLY the
+  body pin caught it. A host test cannot see a target-conditional body by
+  construction, however wide its axes.
+
+  Also corrected the module comment at `binding_index.rs:32-44`, which
+  named its only gap as "ifindexes … (2^28 and up)". That was wrong by
+  four orders of magnitude on the ifindex axis (everything above 65535
+  was uncovered) and silent on the queue axis, whose coverage stopped at
+  63.
+
+  **F2 (MINOR) — `rustc-wrapper` was not on the banned-capability list.**
+  It tokenizes to `rustc`, `-`, `wrapper`, so none of
+  `extern`/`patch`/`replace` appears in it. A wrapper is exec'd as
+  `<wrapper> <rustc> <args…>` and can append `--extern <procmacro>=<path>`
+  to every invocation — the exact acquisition capability the manifest pin
+  exists to close. The reviewer verified empirically that a wrapper in the
+  repo-root config IS invoked for the `bpfel-unknown-none` shim build with
+  all three tests green. Added the token `rustc` to both ban lists
+  (neither config contains a bare `rustc` token, verified before relying
+  on it). A second, narrower claim in the same paragraph was false and is
+  now CLOSED rather than reworded: `rustflags` is legal in the repo-root
+  config, and `-L dependency=…` there spells the injection in the SOURCE
+  as `extern crate evil;` — so the source walk now refuses the token pair
+  `extern crate` alongside `[path]`/`include`, bounding that route at both
+  ends.
+
+  **F3 (MINOR) — the trait-impl refusal missed an impl on a reference.**
+  `impl core::ops::Rem<u32> for &RawRxQueue` tokenizes `… for & RawRxQueue`,
+  so the adjacent needle `["for","RawRxQueue"]` missed it while the
+  message claimed "must implement NO traits". The scan now steps over
+  reference sugar (`&`, `mut`, a lifetime), and a `RawRxQueue` mention
+  count (8) was added as the bound that is complete over impl FORMS the
+  way a needle is not — coherence means any impl must NAME the type.
+
+  **F4 (MINOR) — dangling citations this PR introduced.** Moving
+  `BINDING_QUEUES_PER_IFACE` out of `lib.rs` left four citations behind;
+  a repo-wide sweep found a FIFTH the review did not list. Fixed:
+  `pkg/dataplane/constants.go:7` and `:25`, the two operator-facing
+  #4894 fail-closed error strings at
+  `pkg/dataplane/userspace/maps_sync.go` (which sent an operator to a file
+  that no longer contains the constant), and
+  `pkg/dataplane/userspace/maps_sync_cap_test.go:672`. Deliberately NOT
+  changed: `constants.go:31` cites `BINDING_ARRAY_MAX_ENTRIES`, which
+  genuinely stayed at `lib.rs:86` — verified.
+
+  **F5 (MINOR) — rustfmt.** The repo-wide failure is real and
+  pre-existing. Measured per file at the parent `ad9591177`: userspace-dp
+  2495 hunks, `main_tests.rs` 4, userspace-xdp 0. This PR had widened
+  `main_tests.rs` to 8. All four extra hunks were in its own new code and
+  are fixed; the per-file count is back to the parent's exact 4 and the
+  total to 2495, so the delta is zero per file, not merely in aggregate.
+
+  **F6 (MINOR) — two comments claiming more than their assertions.** The
+  `for_trace()` claim ("corrupting it … reds here") was false: the test
+  evaluated it at one input, 3, and `3 & 0x3f == 3`. It now runs the
+  readback over the same `u32`-wide ladder, and the sentence says what is
+  true. The interface-half residual was presented "as inventory" naming
+  three free `ingress_ifindex` mentions in `lib.rs`; there are SIX
+  (`:127`, `:246`, `:437`, `:696`, `:1124`, `:1140`) — verified
+  firsthand, and 16 + 6 == the pinned tally of 22. The inventory is now
+  complete and each site is named.
+- **File(s)**: `userspace-xdp/src/binding_index.rs` (comment only),
+  `userspace-dp/src/main_tests.rs`, `pkg/dataplane/constants.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/maps_sync_cap_test.go`,
+  `pkg/dataplane/userspace_xdp_manifest.json` (source-hash refresh only),
+  `_Log.md`
+- **Validation**: `make generate` rc=0, kernel verifier PASS, installed
+  object sha UNCHANGED; `go build ./...` and `go vet ./...` rc=0;
+  `go test ./pkg/dataplane/...` all 4 packages ok; the full userspace-dp
+  cargo suite green; `cargo fmt --check` per-file delta vs the parent
+  exactly zero. No docs change was needed in
+  `docs/afxdp-packet-processing.md`: it documents runtime behaviour, and
+  this round changes only the guard apparatus and comments — the
+  citations it carries were already correct, and the four that were not
+  are fixed above.
+
 ## 2026-08-01 — #5173 fold: bound VALUE, not just spelling; close the off-path fail-open
 
 - **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)

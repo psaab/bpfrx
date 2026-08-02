@@ -2499,38 +2499,135 @@ fn shim_token_seq_count(hay: &[String], needle: &[&str]) -> usize {
 #[path = "../../userspace-xdp/src/binding_index.rs"]
 mod shim_binding_index;
 
+/// The value ladder both coordinate axes are driven over: `2^k`, `2^k - 1` and
+/// `2^k + 1` for every representable `k`, plus `0` and `ceiling`.
+///
+/// NOT a hand-picked spread, and the difference IS the round-6 defect. The
+/// executed grid this replaces was `ifindex ∈ {0,1,2,7,63,1000,65535}` ×
+/// `queue ∈ [0,64)`, and on it `& 0xffff` is the identity on every ifindex
+/// while `& 0x3f` is the identity on every queue. Both masks were added to the
+/// shim's own function bodies, compiled, and left all three tests below GREEN
+/// with a masking instruction in the emitted object. The grid's largest tested
+/// value on each axis WAS the boundary of the mask that walked through it — the
+/// check was precisely coextensive with the defect it existed to catch.
+///
+/// A ladder removes that tell, and the caller asserts the property that makes
+/// it work: the bitwise OR of the returned values is all-ones across the
+/// representable range, so ANY mask that clears a bit alters at least one
+/// tested result. That is a property rather than a bigger grid, which matters —
+/// simply widening the old spread would have moved the boundary to the new
+/// maximum and bought one round. It is still not the primary bound: an executed
+/// axis always has a largest value, so the function BODIES are pinned
+/// token-for-token as well, in
+/// `shim_index_path_has_one_construction_and_one_lookup`.
+fn shim_coordinate_ladder(ceiling: u32) -> Vec<u32> {
+    let mut out = vec![0u32, ceiling];
+    for k in 0..u32::BITS {
+        let p = 1u32 << k;
+        out.extend([p - 1, p]);
+        if let Some(next) = p.checked_add(1) {
+            out.push(next);
+        }
+    }
+    out.retain(|v| *v <= ceiling);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// Every `(ifindex, queue)` resolves to its OWN interface's row, or to nothing.
 ///
 /// This replaces four source-spelling checks that a hostile review escaped
 /// twice. The mapping, the stride bound, and the property that a slot never
 /// leaves its interface's row are now results of running the shim's function.
+///
+/// Driven over [`shim_coordinate_ladder`] on both axes rather than over the
+/// hand-picked spread it used to carry — see there for the two masks that
+/// walked through that spread with this test green.
 #[test]
 fn shim_binding_slot_never_leaves_its_interfaces_row() {
     use shim_binding_index::{BINDING_QUEUES_PER_IFACE as STRIDE, RawRxQueue, binding_slot};
-    for ifindex in [0u32, 1, 2, 7, 63, 1000, 65535] {
-        let row_start = ifindex * STRIDE;
-        for q in 0u32..64 {
+
+    // The ifindex axis has a real ceiling; the queue axis does not.
+    // `binding_slot` multiplies the ifindex by the stride, so
+    // `ifindex * STRIDE + (STRIDE - 1)` must stay inside `u32` — and
+    // `(2^28 - 1) * 16 + 15` is exactly `u32::MAX`, so this is the largest
+    // ifindex the host can evaluate at all. Above it host and target genuinely
+    // disagree (a debug host build panics on the overflow, the release target
+    // wraps), which is why the axis stops here and why `binding_index.rs` names
+    // that range — and only that range — as uncovered. The queue coordinate is
+    // rejected before the multiply, so its axis runs to `u32::MAX`.
+    const IFINDEX_CEILING: u32 = (1 << 28) - 1;
+    let ifindexes = shim_coordinate_ladder(IFINDEX_CEILING);
+    let queues = shim_coordinate_ladder(u32::MAX);
+
+    // Each axis is floored on ITS OWN dimension. A combined count would let one
+    // axis collapse to nothing while the other satisfied the threshold alone,
+    // and the round-6 escape lived in exactly one axis at a time.
+    let check_axis = |label: &str, values: &[u32], ceiling: u32, probes: [u32; 3], floor: usize| {
+        assert!(
+            values.len() >= floor,
+            "#5173: the {label} axis must carry at least {floor} values, found {}",
+            values.len(),
+        );
+        for probe in probes {
+            assert!(
+                values.contains(&probe),
+                "#5173: the {label} axis must test {probe}. The spread this replaced stopped just \
+                 below exactly these points, which is what made `& 0xffff` (ifindex) and `& 0x3f` \
+                 (queue) the identity on every value it tested.",
+            );
+        }
+        assert_eq!(
+            values.iter().fold(0u32, |acc, v| acc | v),
+            ceiling,
+            "#5173: the {label} axis must set every bit a representable value can carry, or a \
+             mask clearing one of them is the identity on the whole axis and this test cannot \
+             see it",
+        );
+    };
+    check_axis(
+        "ifindex",
+        &ifindexes,
+        IFINDEX_CEILING,
+        [65536, 65537, IFINDEX_CEILING],
+        80,
+    );
+    check_axis("queue", &queues, u32::MAX, [64, 65, u32::MAX], 90);
+    assert!(
+        queues.iter().any(|q| *q < STRIDE) && queues.iter().any(|q| *q >= STRIDE),
+        "#5173: the queue axis must straddle the stride boundary, or one half of the mapping is \
+         never exercised",
+    );
+
+    for &ifindex in &ifindexes {
+        // u64 throughout: the top of the ifindex axis puts `row_start + STRIDE`
+        // one past `u32::MAX`, and the expected value must be computed in a
+        // width that cannot itself wrap.
+        let row_start = u64::from(ifindex) * u64::from(STRIDE);
+        for &q in &queues {
             let got = binding_slot(ifindex, RawRxQueue::from_ctx_field(q));
             if q >= STRIDE {
                 assert_eq!(
-                    got, None,
+                    got,
+                    None,
                     "#5173: queue {q} is at or above the stride and must resolve to NO binding; \
                      clamping it back into range is the mis-steer in another form, and indexing \
                      with it addresses ifindex {}'s row",
-                    ifindex + q / STRIDE
+                    u64::from(ifindex) + u64::from(q) / u64::from(STRIDE),
                 );
                 continue;
             }
             let slot = got.unwrap_or_else(|| panic!("in-stride queue {q} resolved to no binding"));
             assert_eq!(
-                slot,
-                row_start + q,
-                "#5173: the slot must be the packet's OWN queue in its OWN interface's row"
+                u64::from(slot),
+                row_start + u64::from(q),
+                "#5173: the slot must be the packet's OWN queue in its OWN interface's row",
             );
             assert!(
-                slot >= row_start && slot < row_start + STRIDE,
+                u64::from(slot) >= row_start && u64::from(slot) < row_start + u64::from(STRIDE),
                 "#5173: slot {slot} escaped ifindex {ifindex}'s row [{row_start}, {})",
-                row_start + STRIDE
+                row_start + u64::from(STRIDE),
             );
         }
     }
@@ -2566,14 +2663,30 @@ fn shim_binding_slot_never_leaves_its_interfaces_row() {
 ///
 /// This test itself is not decorative: `for_trace()` feeds the queue index the
 /// shim hands to the helper in `record_trace`, so corrupting it is a runtime
-/// defect and reds here.
+/// defect and reds here — for any corruption visible somewhere on
+/// [`shim_coordinate_ladder`], which is the whole `u32` range at `2^k ± 1`.
+/// The shipped version of that sentence said "reds here" with no qualifier
+/// while the test evaluated `for_trace()` at exactly ONE input, 3; `self.0 &
+/// 0x3f` returns 3 for input 3, so the claim was false for precisely the mask
+/// that was demonstrated walking through the index path in the same round. The
+/// body is also pinned token-for-token in
+/// `shim_index_path_has_one_construction_and_one_lookup`, which is what covers
+/// a corruption no executed value can see.
 #[test]
 fn shim_raw_rx_queue_exposes_no_arithmetic() {
     use shim_binding_index::RawRxQueue;
     let a = RawRxQueue::from_ctx_field(3);
     let b = RawRxQueue::from_ctx_field(3);
     assert_eq!(a, b, "the wrapper must preserve the coordinate verbatim");
-    assert_eq!(a.for_trace(), 3, "telemetry readback must not alter the value");
+    for q in shim_coordinate_ladder(u32::MAX) {
+        assert_eq!(
+            RawRxQueue::from_ctx_field(q).for_trace(),
+            q,
+            "#5173: the telemetry readback must return the coordinate VERBATIM; a reduction here \
+             makes every trace record name a queue the redirect did not use, which is the \
+             mis-traced-drop hazard `binding_index.rs` documents",
+        );
+    }
 }
 
 /// REPO-scoped and TOKEN-exact: the whole shim crate wraps the coordinate in
@@ -2641,6 +2754,22 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 ///     therefore pinned per file. For the queue coordinate that is what closes
 ///     conservation, because every one of its `lib.rs` mentions is inside a
 ///     pinned statement. For the interface coordinate it does not — also below.
+///  8. **Everything above bounds where a value COMES FROM and how it is
+///     PASSED. None of it bounded what the shim's own functions DO with it.**
+///     Round 6 needed one in-place arithmetic edit inside a function BODY —
+///     `RawRxQueue(rx_queue_index & 0x3f)` — and that is cheaper than all six
+///     escapes before it: no binding, no proc macro, no `--extern`, no
+///     `[patch]`, no manifest edit, no deletion, and nothing spent from the
+///     tally, since `rx_queue_index` is a different token to the counted
+///     `rx_queue`. Both bodies took a mask, compiled, and left every bound here
+///     green with the mask in the emitted object. The one value-level check
+///     that should have seen it was an enumerated grid whose LARGEST TESTED
+///     VALUE ON EACH AXIS WAS THE MASK'S BOUNDARY — `65535 & 0xffff == 65535`,
+///     and every `q < 64` satisfies `q & 0x3f == q` — so the check was exactly
+///     coextensive with the defect. Hence the three body pins here, and hence
+///     `shim_coordinate_ladder` replacing the grid with a property. The pins
+///     are the primary bound: widening an axis relocates a boundary, it does
+///     not remove one.
 ///
 /// # What is still unbound — and it cannot be driven to zero here
 ///
@@ -2694,17 +2823,31 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 ///    an ALIAS refunds mentions with nothing deleted at all. Two pins narrow
 ///    that — every `record_trace` call's argument prefix, so an argument cannot
 ///    be rerouted through an alias, and `record_trace`'s own signature, because
-///    renaming its interface parameter was itself worth two free mentions. What
-///    is left, stated as inventory rather than as a defence: the coordinate can
-///    be dropped from the trace-key mix (it compiles, and it degrades trace-key
-///    distribution rather than the index path), and neither `#[repr(C)]`
-///    struct's field DECLARATION is pinned here — the wire contract with
-///    userspace-dp is by offset, so this test says nothing about those names.
+///    renaming its interface parameter was itself worth two free mentions.
+///
+///    What is left, stated as inventory rather than as a defence — and stated
+///    COMPLETELY this time, because the shipped version of this paragraph named
+///    three of the six in the round that rewrote it specifically to be
+///    complete. `lib.rs` names `ingress_ifindex` 22 times. Sixteen are pinned:
+///    two by `INGRESS_STATEMENT` (the read writes the name twice), one by
+///    `LOOKUP_STATEMENT`, twelve by `TRACE_ARGUMENT_PREFIX` and one by
+///    `TRACE_SIGNATURE`. The other SIX are free:
+///
+///      - `:127` and `:246` — the two `#[repr(C)]` struct field DECLARATIONS.
+///        The wire contract with userspace-dp is by offset, so this test says
+///        nothing about those names.
+///      - `:437` — the ingress-interface gate, `USERSPACE_INGRESS_IFACES.get`.
+///      - `:696` — the `UserspaceDpMeta` initializer.
+///      - `:1124` — the `UserspaceTraceValue` initializer.
+///      - `:1140` — the trace-key mix. Dropping the coordinate from it compiles
+///        and degrades trace-key distribution rather than the index path.
+///
 ///    Buying a shadow of the interface coordinate therefore still costs only
 ///    edits that compile and red nothing, and this test does not prevent it.
 ///    Driving it to zero would mean pinning most of a trace function that has
 ///    nothing to do with the index path; the bound above is the bound that
-///    ships.
+///    ships. (Line numbers drift; the count does not — it is pinned by
+///    `MENTIONS_PER_FILE`, so a seventh free mention is a RED whatever it is.)
 ///  - **The ifindex half is a bare `u32`.** `binding_slot`'s queue argument is a
 ///    newtype; its ifindex argument is not, and it cannot be one without a
 ///    second wrapper whose constructor would take a bare `u32` for the same
@@ -2741,7 +2884,11 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // `read_dir` order is unspecified; the per-file tally is compared as an
     // ordered list, so sort before anything reads this.
     sources.sort();
-    assert!(!sources.is_empty(), "found no shim sources under {}", root.display());
+    assert!(
+        !sources.is_empty(),
+        "found no shim sources under {}",
+        root.display()
+    );
 
     let tokens: Vec<(String, Vec<String>)> = sources
         .iter()
@@ -2782,17 +2929,28 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // aliased or not, has to NAME `include` to import it. Both are refused
     // outright; prose that trips them is a spurious RED, which is the polarity
     // this whole test is built on.
+    //
+    // `extern crate` is refused with them, for the CRATE half of the same
+    // fail-open. A crate placed on the search path by `-L dependency=…` — which
+    // the repo-root config may legally spell, since `rustflags` is not banned
+    // there (see below) — is not nameable in edition 2024 without either
+    // `--extern` (refused in both cargo configs) or an `extern crate` item
+    // HERE. Refusing the pair closes the second half, so the route is bounded
+    // at both ends rather than at one, which is what the shipped comment on the
+    // cargo-config refusal claimed and did not have.
     let offpath: Vec<String> = seq(&["[", "path"])
         .into_iter()
         .chain(seq(&["path", "="]))
         .chain(seq(&["include"]))
+        .chain(seq(&["extern", "crate"]))
         .collect();
     assert!(
         offpath.is_empty(),
-        "#5173: {offpath:?} names a module-path attribute or the `include` macro, so the shim \
-         crate is no longer confined to {}. The bounds in this test walk that directory; source \
-         pulled in from elsewhere would be invisible to every one of them — the exact fail-open \
-         this refusal exists to close. Extend the walk before adding either. (Prose tripping \
+        "#5173: {offpath:?} names a module-path attribute, the `include` macro, or an \
+         `extern crate` item, so the shim crate is no longer confined to {}. The bounds in this \
+         test walk that directory; source pulled in from elsewhere — or a crate pulled in from a \
+         `-L` search path — would be invisible to every one of them, the exact fail-open this \
+         refusal exists to close. Extend the walk before adding any of them. (Prose tripping \
          this is a false RED; reword it.)",
         root.display()
     );
@@ -2876,11 +3034,32 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // files: both are mostly explanatory comments and a token-exact pin of
     // either would red on a reworded sentence.
     //
-    // `extern`, `patch` and `replace` are refused in BOTH files; `rustflags` is
-    // refused only in the crate-local one, because the repo-root config carries
-    // an x86_64-scoped link-arg (#3595) that is inert for `bpfel-unknown-none`
-    // — and the `extern` refusal covers that file's injection route regardless
-    // of the flag it would be spelled with.
+    // `extern`, `patch`, `replace` and `rustc` are refused in BOTH files;
+    // `rustflags` is refused only in the crate-local one, because the repo-root
+    // config carries an x86_64-scoped link-arg (#3595) that is inert for
+    // `bpfel-unknown-none`.
+    //
+    // `rustc` is on the list because of what it TOKENIZES: `rustc-wrapper`
+    // becomes `rustc`, `-`, `wrapper`, so none of `extern`/`patch`/`replace`
+    // appears in it and the shipped list did not see it at all. A wrapper is
+    // exec'd as `<wrapper> <rustc> <args…>` and is free to append
+    // `--extern <procmacro>=<path>` to every invocation — the exact acquisition
+    // capability the manifest pin above exists to close, through a door the
+    // refusal did not cover. Measured, not argued: a wrapper added to the
+    // repo-root config IS invoked for the `bpfel-unknown-none` shim build (7
+    // invocations, 3 naming the target triple) with all three tests green.
+    // Neither config contains a bare `rustc` token today, so the ban costs
+    // nothing; `rustc-workspace-wrapper` lands on it too.
+    //
+    // A NARROWER gap that the shipped comment claimed was closed and was not:
+    // it said "the `extern` refusal covers that file's injection route
+    // regardless of the flag it would be spelled with". It does not.
+    // `rustflags` is legal in the repo-root config, and `-L dependency=…`
+    // there spells the injection in the SOURCE instead, as `extern crate evil;`
+    // — which this refusal never reads. Closed at the other end: the walk
+    // refuses the token pair `extern crate` (above, with `[path]`/`include`),
+    // because `-L` only tells rustc where to LOOK. Naming the crate still needs
+    // either `--extern` (refused here) or `extern crate` (refused there).
     //
     // NOT covered, and it cannot be: a cargo config outside the repository
     // (`$CARGO_HOME/config.toml`), or `RUSTFLAGS` in the environment. Those are
@@ -2891,12 +3070,12 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         (
             "userspace-xdp/.cargo/config.toml",
             crate_dir.join(".cargo").join("config.toml"),
-            &["extern", "patch", "replace", "rustflags"][..],
+            &["extern", "patch", "replace", "rustflags", "rustc"][..],
         ),
         (
             ".cargo/config.toml",
             repo_root.join(".cargo").join("config.toml"),
-            &["extern", "patch", "replace"][..],
+            &["extern", "patch", "replace", "rustc"][..],
         ),
     ] {
         let body = std::fs::read_to_string(&path)
@@ -2911,7 +3090,9 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
             found.is_empty(),
             "#5173: {label} names {found:?}, any of which can put a crate into the shim build \
              that {} never mentions — `--extern` injects one outright, `[patch]`/`[replace]` \
-             substitutes one already pinned. A proc macro acquired that way expands \
+             substitutes one already pinned, and `rustc-wrapper` (which contains none of the \
+             other three tokens) wraps every `rustc` invocation and can append `--extern` to \
+             all of them. A proc macro acquired that way expands \
              call-site-hygienic tokens that shadow a coordinate while writing its name nowhere \
              the tally below walks, which is the escape the manifest pin above exists to close; \
              a second door to the same room closes with it. Refused as capabilities rather than \
@@ -3028,6 +3209,58 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         ctors.len(),
     );
 
+    // ---- …and the constructor's BODY, which is where a mask costs NOTHING. -
+    //
+    // Round 6, and structurally unlike the six escapes before it: ONE in-place
+    // arithmetic edit inside a shim function body.
+    //
+    //     RawRxQueue(rx_queue_index & 0x3f)
+    //
+    // It creates no binding, needs no proc macro, no `--extern`, no `[patch]`,
+    // no manifest edit and no deletion, and it spends NOTHING from the per-file
+    // tally — `rx_queue_index` is a different token to the counted `rx_queue`.
+    // Every bound in this test stayed green and the emitted object gained
+    // `r1 &= 0x3f` at insn 1006, on the `xdp_md.rx_queue_index` load the
+    // pristine object performs unmasked. That is byte-for-byte the shape round
+    // 5's proc-macro escape produced, reached with none of its machinery.
+    //
+    // It is RUNTIME-REACHABLE, not a theoretical hole. On a NIC left above 64
+    // combined channels with the helper's queue count capped at ≤16 — one of
+    // the two remediations `docs/afxdp-packet-processing.md` names — a packet on
+    // hardware queue 70 resolves to `None` today and takes the designed
+    // binding-missing path. Masked, `70 & 0x3f = 6` resolves to a LIVE binding,
+    // the shim redirects to an XSK bound to a queue the packet did not arrive
+    // on, `xsk_rcv_check()` returns `-EINVAL` and the driver discards while the
+    // last recorded trace stage stays REDIRECT. #5173 verbatim. The Go
+    // publish-side `queue_id >= 16` refusal (`maps_sync.go`) bounds what Go
+    // WRITES, not what arrives from hardware.
+    //
+    // The pins above fix these functions' INTERFACE; this is what fixes what
+    // they DO. Pinning the body rather than widening the executed axis is
+    // deliberate — see `shim_coordinate_ladder`: any executed axis has a
+    // largest tested value, and a mask sized to it is invisible by
+    // construction, so widening relocates the boundary instead of removing it.
+    // These are 1-, 1- and 4-line functions; the pins are cheap to hold.
+    #[rustfmt::skip]
+    const CTOR_ITEM: &[&str] = &[
+        "pub", "fn", "from_ctx_field", "(", "rx_queue_index", ":", "u32", ")", "-", ">", "Self",
+        "{",
+        "RawRxQueue", "(", "rx_queue_index", ")",
+        "}",
+    ];
+    let ctor_item = seq(CTOR_ITEM);
+    assert_eq!(
+        ctor_item.len(),
+        1,
+        "#5173: the constructor must be exactly this item, once:\n  {}\nfound {} occurrence(s) \
+         {ctor_item:?}. Its SIGNATURE alone is not enough: the wrapper is an identity function \
+         and a reduction written INSIDE it reaches every packet while creating no binding, \
+         spending no mention from the tally below, and touching no other pinned sequence. \
+         Demonstrated compiling with every other bound in this test green.",
+        CTOR_ITEM.join(" "),
+        ctor_item.len(),
+    );
+
     // ---- The wrap site's only READER, pinned too. -------------------------
     //
     // `for_trace()` has exactly one caller, and until round 5 that caller was
@@ -3062,6 +3295,30 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
          traced must be the coordinate that was wrapped, not a second read of the context.",
         TRACE_READBACK_STATEMENT.join(" "),
         readback.len(),
+    );
+
+    // …and the readback's own BODY, same class as the constructor's above.
+    // `for_trace(self) -> u32 { self.0 & 0x3f }` is a telemetry defect that
+    // pins on the CALLER cannot see, and the executed test could not either
+    // until this round: it evaluated the readback at one input, 3, and
+    // `3 & 0x3f == 3`.
+    #[rustfmt::skip]
+    const TRACE_READBACK_ITEM: &[&str] = &[
+        "pub", "fn", "for_trace", "(", "self", ")", "-", ">", "u32",
+        "{",
+        "self", ".", "0",
+        "}",
+    ];
+    let readback_item = seq(TRACE_READBACK_ITEM);
+    assert_eq!(
+        readback_item.len(),
+        1,
+        "#5173: the telemetry readback must be exactly this item, once:\n  {}\nfound {} \
+         occurrence(s) {readback_item:?}. A reduction inside it makes every trace record name a \
+         queue the redirect did not use — the mis-traced-drop hazard `binding_index.rs` \
+         documents — while the pinned call site above stays byte-identical.",
+        TRACE_READBACK_ITEM.join(" "),
+        readback_item.len(),
     );
 
     // ---- `binding_slot`'s SIGNATURE, pinned. ------------------------------
@@ -3099,6 +3356,65 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
          it is.",
         BINDING_SLOT_SIGNATURE.join(" "),
         slot_sig.len(),
+    );
+
+    // ---- …and the BODY that signature wraps. ------------------------------
+    //
+    // The second instance of the round-6 class, in the other coordinate:
+    //
+    //     Some((ingress_ifindex & 0xffff) * BINDING_QUEUES_PER_IFACE + rx_queue.0)
+    //
+    // adds four tokens inside the body, writes `ingress_ifindex` in the same
+    // place it was already written, and left all three tests green while the
+    // object gained `r1 &= 0xffff0` at insn 1118, wedged between the `<<= 0x4`
+    // stride multiply and the `|= rx_queue`. Its runtime reach is BOUNDED — the
+    // Go publish side fails closed at ifindex ≥ 65536 (#4894) — so this
+    // instance is a GUARD defect rather than a shipping one, and it is pinned
+    // because it proves the hole is a CLASS and not one function.
+    //
+    // Anchored on the return type so the sequence is unambiguously this
+    // function's body. The stride guard is inside the pin deliberately: an
+    // executed axis proves the guard's EFFECT at the values it runs, and this
+    // proves its SPELLING at all of them.
+    //
+    // The sharpest reason the pin and not a wider axis is the primary bound —
+    // measured while closing round 6, because "the executed test would catch a
+    // real one" is the argument that would retire it. This body:
+    //
+    //     #[cfg(target_arch = "bpf")]      const MASK: u32 = 0x3;
+    //     #[cfg(not(target_arch = "bpf"))] const MASK: u32 = !0;
+    //     Some(ingress_ifindex * BINDING_QUEUES_PER_IFACE + (rx_queue.0 & MASK))
+    //
+    // masks the coordinate in the BPF object and is the exact identity on the
+    // host, where `MASK` is `!0`. The executed axis stayed green at every one
+    // of its ~7700 points and so did the per-file tally — the spelling writes
+    // each coordinate the same number of times. ONLY this pin reddened. A host
+    // test cannot see a target-conditional body by construction, however wide
+    // its axes are.
+    #[rustfmt::skip]
+    const BINDING_SLOT_BODY: &[&str] = &[
+        "-", ">", "Option", "<", "u32", ">",
+        "{",
+        "if", "rx_queue", ".", "0", ">", "=", "BINDING_QUEUES_PER_IFACE", "{",
+        "return", "None", ";",
+        "}",
+        "Some", "(",
+        "ingress_ifindex", "*", "BINDING_QUEUES_PER_IFACE", "+", "rx_queue", ".", "0",
+        ")",
+        "}",
+    ];
+    let slot_body = seq(BINDING_SLOT_BODY);
+    assert_eq!(
+        slot_body.len(),
+        1,
+        "#5173: the slot resolver's body must be exactly this, once:\n  {}\nfound {} \
+         occurrence(s) {slot_body:?}. A mask applied to either coordinate INSIDE the body reaches \
+         every packet, creates no binding, spends nothing from the tally below and moves no other \
+         pinned sequence — it is the cheapest reintroduction of #5173 there is, and the executed \
+         axis cannot be relied on to catch it because any axis has a largest tested value that a \
+         mask can be sized to.",
+        BINDING_SLOT_BODY.join(" "),
+        slot_body.len(),
     );
 
     // ---- The INTERFACE half of the index, pinned the same way. ------------
@@ -3397,14 +3713,64 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // line that is a full #5173 reintroduction with no `unsafe` marker for a
     // reader to catch. These two bounds are what make the compile-time claim a
     // claim about the code that is actually there.
-    let trait_impls = seq(&["for", "RawRxQueue"]);
+    // The shipped needle was the ADJACENT pair `for RawRxQueue`, and its message
+    // said "must implement NO traits" — wider than what it checked.
+    // `impl core::ops::Rem<u32> for &RawRxQueue` tokenizes `… for & RawRxQueue`,
+    // the adjacency fails, and `&rx_queue % 4` then compiles. So step over the
+    // reference sugar (`&`, `mut`, a lifetime) between `for` and the type.
+    let mut trait_impls: Vec<String> = Vec::new();
+    for (name, toks) in &tokens {
+        for i in 0..toks.len() {
+            if toks[i] != "for" {
+                continue;
+            }
+            let mut j = i + 1;
+            loop {
+                match toks.get(j).map(String::as_str) {
+                    Some("&") | Some("mut") => j += 1,
+                    // A lifetime is the tick plus its name, two tokens.
+                    Some("'") => j += 2,
+                    _ => break,
+                }
+            }
+            if toks.get(j).map(String::as_str) == Some("RawRxQueue") {
+                trait_impls.push(name.clone());
+            }
+        }
+    }
     assert!(
         trait_impls.is_empty(),
-        "#5173: `RawRxQueue` must implement NO traits — found {trait_impls:?}. An arithmetic impl \
-         (`Rem`, `BitAnd`, `Shr`) makes reducing the coordinate compile, and `Deref`/`Into` hand \
-         out the raw integer to be reduced elsewhere; either way the module's compile-time half \
-         is gone while every other check here stays green. `#[derive]`d traits are written before \
-         the type, not after it, so they do not trip this."
+        "#5173: `RawRxQueue` must implement NO traits, on the type OR on a reference to it — \
+         found {trait_impls:?}. An arithmetic impl (`Rem`, `BitAnd`, `Shr`) makes reducing the \
+         coordinate compile, and `Deref`/`Into` hand out the raw integer to be reduced elsewhere; \
+         either way the module's compile-time half is gone while every other check here stays \
+         green. `#[derive]`d traits are written before the type, not after it, so they do not \
+         trip this."
+    );
+
+    // …and the type's mention count, which is the bound that is complete over
+    // impl FORMS the way the needle above is not. Coherence means an impl of
+    // any shape — on the type, on a reference, on a wrapper, inherent or
+    // trait — has to NAME the type to exist, so all of them land here. Same
+    // idiom as `BINDINGS_MENTIONS` and `CTOR_MENTIONS`; the residual is the same
+    // too, and stated rather than papered over: this is a CRATE total, so an
+    // author who also deletes an existing mention can pay for one. What that
+    // buys on its own is an impl, not a defect — reducing the coordinate still
+    // needs a shadow, and the per-file coordinate tally below is what bounds
+    // those.
+    const RAW_TYPE_MENTIONS: usize = 8;
+    let raw_type = seq(&["RawRxQueue"]);
+    assert_eq!(
+        raw_type.len(),
+        RAW_TYPE_MENTIONS,
+        "#5173: `RawRxQueue` must be named exactly {RAW_TYPE_MENTIONS} times in the shim crate — \
+         in `binding_index.rs` the module doc, the `struct` item, the inherent `impl` header, the \
+         constructor body and `binding_slot`'s parameter type; in `lib.rs` the `use`, one doc line \
+         and the pinned construction — but was named {} times {raw_type:?}. An `impl` block of any \
+         shape has to write this name, which is why the count is the bound and the needle above is \
+         only the precise message. A comment spelling the identifier trips it too; that is a \
+         spurious RED, never a silent pass.",
+        raw_type.len(),
     );
     let decl = seq(&["RawRxQueue", "(", "u32", ")"]);
     assert_eq!(
@@ -3417,4 +3783,3 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         decl.len(),
     );
 }
-

@@ -4,8 +4,9 @@ package dataplane
 // THEY MUST STAY IN SYNC WITH:
 //
 //   - MAX_INTERFACES in bpf/headers/xpf_common.h
-//   - BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs
-//     (which derives BINDING_ARRAY_MAX_ENTRIES = MAX_INTERFACES *
+//   - BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs
+//     (from which userspace-xdp/src/lib.rs derives
+//      BINDING_ARRAY_MAX_ENTRIES = MAX_INTERFACES *
 //      BINDING_QUEUES_PER_IFACE via env!("MAX_INTERFACES"))
 //
 // Drift between these and the BPF objects is the exact recurrence #814
@@ -23,7 +24,7 @@ const (
 	MaxInterfaces uint32 = 65536
 
 	// BindingQueuesPerIface mirrors BINDING_QUEUES_PER_IFACE in
-	// userspace-xdp/src/lib.rs. Used as the stride in the flat
+	// userspace-xdp/src/binding_index.rs. Used as the stride in the flat
 	// index formula `idx = ifindex * BindingQueuesPerIface + queue`.
 	BindingQueuesPerIface uint32 = 16
 
