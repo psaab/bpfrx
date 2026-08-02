@@ -1,28 +1,30 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v83 — r81 folds: Codex M1's canary
-  specification (the registry AST canary now pins an exactly-
-  named allowlist — the registry helper + `loadUserspaceShimObjects`
-  — with permitted shapes, the stale-allowlist self-check, and
-  synthetic negative tests; the whole-batch hold's placement is
-  now structurally exact: the `m.mu` hold is taken in
-  `LoadUserspaceShim` SPANNING the `loadUserspaceShimObjects`
-  call AND the Store(true) at :163 — batch+flag publish as one
-  atomic operation inside one function's hold; the canary joins
-  §5.1/§9 item 5), Codex M2's reverse-schedule implementability
-  fix (the adjacent-statement interval has no injectable
-  operation — the runtime proof is now the helper lock-ownership
-  test + the canary net, and the synthetic loader replaces only
-  privileged syscalls, never the production registry writes),
-  Codex m1-m4 (the class-1/§6 summary carve-out pointers; the
-  per-entry-point oracle subcases — nil config :179, canceled
-  context apply.go:238, cleanup failures, the pin removal at
-  manager_compile.go:163, and the two-invocation shape for
-  loaded-check entries; the closure-wording consistency fix;
-  the UpdateFabricFwd :18 citation + the higher-precedence
-  overbreadth fix); r81 verdicts: Codex PLAN-NEEDS-MAJOR
-  (2M/4m — specification precision), AGY PLAN-READY, Claude
-  SMR PLAN-READY; pending convergence review r82
+- **Status**: DRAFT v84 — r82 folds: Codex M1+M2's unified
+  named-publisher design (the v83 canary named the WRAPPER
+  `loadUserspaceShimObjects` while the writes live in the
+  `...Once` function, and a body-wide hold would self-deadlock
+  on the :154 selector — the writer now splits into unlocked
+  privileged ACQUISITION + ONE small named locked publisher
+  `publishShimRegistryLocked` carrying the registry assignments
+  AND the Store(true); the canary allowlist is exactly the
+  registry helper + the publisher, with the locked-interval
+  shape check defeating the Lock→hook→Unlock→access anti-
+  pattern), Codex m1's hook protocol (instance-scoped hooks,
+  one ownership hook per test, TryLock-inside-the-interval),
+  Codex m2's privilege split (always-on classification/
+  ownership legs + privileged semantic-mutation legs), Codex
+  m3's three summary-site carve-out pointers, Codex m4's
+  closure-wording resolution (registry selection CLOSED in
+  every state; the teardown narrowing is limited to the
+  loaded-check set — Close retains a nonempty registry), Codex
+  m5's qualification propagation (canceled context wins first,
+  apply.go:238), Codex m6's inventory fixes (canary pair →
+  set; the ship-it-all escape hatch marked closed post-v69);
+  r82 verdicts: Codex PLAN-NEEDS-MAJOR (2M/5m), AGY PLAN-READY,
+  Claude SMR PLAN-READY-WITH-NITS (0M/1m — the hold-open
+  placement, subsumed and corrected by Codex M2's fuller
+  placement analysis); pending convergence review r83
 - **Issue**: psaab/xpf#2114 (OPEN; `bug`, `audit`)
 - **Branch**: `research/2114-nat-pool-alarm-dp-race` (plan docs only — NO
   production code in `/research`)
@@ -3219,7 +3221,13 @@
   the reverse-schedule runtime proof replaced by the helper
   ownership test + the canary; the summary carve-out
   pointers; the oracle subcase qualifications; the closure
-  wording; citations).
+  wording; citations). v84 (r82: the named-publisher design
+  (acquisition unlocked + publishShimRegistryLocked carrying
+  the writes AND the Store — killing the body-wide-hold
+  deadlock and the wrapper/writer allowlist misalignment);
+  the hook protocol; the privilege split; the summary
+  carve-out pointers; the closure-wording resolution; the
+  qualification propagation; the inventory fixes).
 
 ---
 
@@ -3891,10 +3899,12 @@ class. The fold:
   class-2 neutral outcomes INCLUDING the error-signature no-ops'
   nil returns — preserved byte-for-byte; (iii) the class-1
   outcomes (map-not-found error or the fatal concurrent-map
-  throw) — these become the one clean typed error, the only
-  intentional behavior change; (iv) the class-4 getters'
-  nil-return — preserved, with the typed error added where the
-  signature carries one. A pre-arm initial-election `SetRGActive`
+  throw) — these become the one clean typed error on the fresh
+  state, the only intentional behavior change (EXCLUDING the
+  loaded-check set — the attaches and the CompileConfig path keep
+  their own rejections per the carve-out, r82 Codex m3); (iv) the
+  class-4 getters' nil-return — preserved, with the typed error
+  added where the signature carries one. A pre-arm initial-election `SetRGActive`
   now returns the typed error instead of racing; the desired state
   was already recorded (`daemon_ha.go:290-291`, before the call)
   and is retried unconditionally by the reconcile loop
@@ -4020,8 +4030,9 @@ v20 history). The delivery is TWO units:
   method gate, r68 Codex M1, §4 A1), the 5-site writer conversion
   (§5.2), the per-site snapshot boundaries (§5.3), the full reader
   conversion (134 prod + ~110 test, §5.4), the `CachedStatusProvider`
-  sampler narrowing (§4 A1), the canary pair (§5.1 + `pkg/daemon` AST
-  canary), docs + tests. This core is complete and self-contained:
+  sampler narrowing (§4 A1), the canary set (§5.1 + `pkg/daemon` AST
+  canary + the pkg/dataplane registry canary, r82 Codex m6's
+  inventory fix), docs + tests. This core is complete and self-contained:
   it closes RACE-1 (watcher chain), RACE-2 (bootstrap-exit arm), and
   RACE-3 (recovered confirm timer) at BOTH layers — (L1) the
   interface tear, by the cell; (L2) in its narrowed, exact form
@@ -4029,15 +4040,16 @@ v20 history). The delivery is TWO units:
   selection race safety in every state, by A3's contract — NOT
   current-generation delivery, re-arm linearizability, or
   teardown/lifetime safety (§10) — and
-  regresses nothing: no pre-existing hazard is WORSENED, and two
-  pre-existing windows are NARROWED without closure being claimed
-  (r70 Codex m3 — the `Close()`-entry Store(false) narrows new
-  fresh-state admission at teardown; the population `m.mu` plus
-  the uniform registry rule CLOSES the registry-selection race in
-  every state (r81 Codex m3's consistency fix — the earlier
-  "narrows without closure" phrasing contradicted the §4.7 claim;
-  the narrowing language applies only to the teardown window);
-  the §10 residuals remain open).
+  regresses nothing: no pre-existing hazard is WORSENED; the
+  registry-selection race is CLOSED in every state (the uniform
+  registry rule + whole-batch publication); and the teardown-window
+  exposure is NARROWED with no closure claimed — the `Close()`-entry
+  Store(false) narrows the LOADED-CHECK SET's admission at teardown
+  (r82 Codex m4's precision: Close retains a nonempty registry, so
+  ordinary methods classify retained and proceed — the narrowing is
+  limited to the loaded-check set, not "fresh-state admission";
+  the r70-era framing sentence is rewritten accordingly); the
+  §10 residuals remain open).
 - **Follow-up issue (filed at /engineer time; seeded from this
   document)**: "commit-confirmed recovery integrity: startup gate +
   FirstCommit+cluster Load recovery + confirm-record durability" —
@@ -4058,9 +4070,11 @@ v20 history). The delivery is TWO units:
   already-validated design. The user makes the final call at manual
   approval: the plan converges PLAN-READY under EITHER structure
   (all three reviewers' verdicts gate the DESIGN, which is
-  identical; the split is a packaging recommendation). If the user
-  prefers one PR, §4.7 collapses to "ship it all" with no design
-  change.
+  identical; the split is a packaging recommendation). (The v69
+  execution shipped the split physically; re-merging would be a
+  deliberate user decision at approval time, re-widening the
+  review surface — the escape hatch is otherwise closed, r82 Codex
+  m6's staleness fix.)
 
 **v69 — the split EXECUTED at the document level.** The follow-up
 unit's design text (~5,170 lines: the §4 A1 work items G/H/H2, the
@@ -4409,7 +4423,9 @@ Preserved exactly:
   FRESH-unarmed state (`loaded==false` AND maps empty) — there,
   class-1 methods return the typed `ErrDataplaneNotArmed` instead of
   master's "map not found" error or the fatal concurrent-map throw
-  (the ONLY intentional behavior change, now precisely scoped; the
+  (the ONLY intentional behavior change — scoped to the fresh state
+  and EXCLUDING the loaded-check set, which keeps its own rejections
+  per the carve-out, r82 Codex m3; the
   class-3 raw-helper composition rule keeps even the legacy error
   TEXTS stable, r71 Codex M3); class-2 keep master's missing-map
   outcome byte-for-byte; class-3 keep their test-pinned
@@ -4476,7 +4492,9 @@ Preserved exactly:
     proceed when armed; the "every state" phrasing was false
     for the armed state. Ordering within the path: `CompileConfig`
     checks nil-config first (:179-181), then the loaded rejection
-    (:182); `CompileUserspaceShim`'s cleanup errors precede the
+    (:182); `ApplyConfig`'s canceled context wins before either
+    (`apply.go:238`, r82 Codex m5's propagation fix);
+    `CompileUserspaceShim`'s cleanup errors precede the
     selector). NO lifetime or
     teardown exclusion is claimed — the Store(false) at `Close()`'s
     entry (:1206) gates new FRESH-state entrants (retained-state
@@ -4625,7 +4643,8 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `TestManager_ArmedGate_FreshOutcomes` — a QUIESCENT fresh-state
    outcome test (a pre-lock hook; no overlap): every class returns
    its fresh-unarmed outcome (typed error / neutral / pinned hybrid
-   / nil per class); (ib) `TestManager_ArmedGate_BlockedStart` — the
+   / nil per class — the loaded-check set returns master's OWN
+   rejection per the carve-out, r82 Codex m3); (ib) `TestManager_ArmedGate_BlockedStart` — the
    in-batch lock-ownership test: the whole-batch hold contains a
    test hook, readers from every class BLOCK until the hold
    releases, and after release they observe the ARMED state (the
@@ -4671,7 +4690,9 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    Unpin/Close failures aggregate after partial progress, and
    concurrent TC cleanups can both load the same pin before one
    removes it, :294); the rejection fires whenever
-   `loaded==false`; and the deterministic pass-then-block shape
+   `loaded==false` — with the qualifications above (nil config,
+   canceled context, cleanup failures win first, r82 Codex m5's
+   propagation fix); and the deterministic pass-then-block shape
    gets its explicit post-Store/pre-unlock barrier (a loaded-check
    method that must pass its check and then block at registry
    selection uses the seam's second barrier). The XDP field's dedicated two-sided seam stands
@@ -4684,7 +4705,13 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    executes), the section containing a test hook that HOLDS it
    while a getter attempts — the getter BLOCKS until release (or
    fails an in-section `TryLock`), proving lock OWNERSHIP, not
-   branch execution (r75 Codex M2); no fatal fault; (ii)
+   branch execution (r75 Codex M2). The hook protocol is pinned
+   (r82 Codex m1): hooks are INSTANCE-scoped (one per seam), only
+   ONE ownership hook is armed per test (two hooks on the same
+   mutex cannot both be awaited — the second cannot execute while
+   the first holds it), and the assertion is either
+   `TryLock()==false` INSIDE the actual access interval or the
+   before-lock/after-acquire handshake; no fatal fault; (ii)
    `TestManager_PreArmMethodMatrix` — every exported `*Manager`
    method is ASSIGNED to exactly one v75 class/category by the
    generated AST inventory — the manifest asserts TOTALITY (one
@@ -4693,15 +4720,20 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    is asserted (r71 Codex M3 — `ClearAllCounters` composes through
    internal raw helpers, preserving its pinned legacy error text).
    PLUS the RETAINED-state coverage (r76 Codex m2; corrected to the
-   four-leg form at v81 per r79 Codex M1 — the v80 text still had
-   retained methods "proceeding" across the held seam, impossible
-   under the uniform mutex; the fixture scope pinned at v82 per
-   r80 Codex m1 — ONE seeded retained fixture suffices for A3's
-   state classification because Close and Teardown both present
-   `loaded=false` + a nonempty registry; NO duplicate Teardown
-   outcome matrix, and no current-generation-delivery claim; a
-   small Close-transition assertion proves production preservation
-   of the registry): `TestManager_ArmedGate_RetainedOutcomes`
+   four-leg form at v81 per r79 Codex M1; the fixture scope pinned
+   at v82 per r80 Codex m1 — ONE seeded retained fixture suffices
+   for A3's state classification because Close and Teardown both
+   present `loaded=false` + a nonempty registry; NO duplicate
+   Teardown outcome matrix, and no current-generation-delivery
+   claim; a small Close-transition assertion proves production
+   preservation of the registry; the oracle split for privilege at
+   v84 per r82 Codex m2 — registry values are concrete `*ebpf.Map`
+   and unprivileged tests skip real-map semantics
+   (`maps_session_clear_test.go:14`), so the retained legs split
+   into ALWAYS-ON all-entry classification/ownership tests
+   (sentinel/absent registries prove classification + blocking for
+   every entry) plus PRIVILEGED semantic-mutation legs (or a
+   map-operation seam) that run where BPF privileges exist): `TestManager_ArmedGate_RetainedOutcomes`
    — the QUIESCENT retained leg as its own named test (seeded
    retained registry: maps+programs present, `loaded=false`; no
    overlap; every class proceeds exactly as master — retained reads
@@ -4732,24 +4764,38 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    must block until release (the same ownership-assertion pattern
    as the `:632` proof); and (b) the structural net per this
    repo's compile-time-invariant discipline, now fully specified
-   (r81 Codex M1): an AST canary over `pkg/dataplane` forbidding
-   direct `m.maps`/`m.programs` access outside an EXACTLY-NAMED
-   allowlist — the registry helper function and the whole-batch
-   writer `loadUserspaceShimObjects` — with permitted access
-   shapes only inside the allowlist, a stale-allowlist self-check
-   (an allowlisted function that no longer touches the registry
-   FAILS the canary, keeping the list current), and synthetic
-   negative tests (a test-only file with a forbidden access fails
-   the canary). The whole-batch hold's placement is now structurally
-   exact (r81 Codex M1's observation): the Store(true) lives in the
-   CALLER (`LoadUserspaceShim`, `loader.go:163`), so the `m.mu`
-   hold is taken in `LoadUserspaceShim` SPANNING the
-   `loadUserspaceShimObjects` call AND the Store — batch+flag as
-   one atomic publication inside one function's hold. The seam-
-   scoping rule: the synthetic loader replaces only the privileged
-   operations (pin/load syscalls), never the registry writes —
-   publication writes run the production code path under the
-   test's barrier.
+   (r81 Codex M1; the allowlist/publisher alignment fixed at v84
+   per r82 Codex M1 — the v83 text named the WRAPPER
+   `loadUserspaceShimObjects` (:95), while the actual writes live
+   in `loadUserspaceShimObjectsOnce` (:106, writes :185/:187/:190),
+   so the stale-allowlist self-check would have rejected the named
+   writer and forbidden the real one): the writer splits into
+   ACQUISITION + PUBLICATION. Acquisition stays unlocked and
+   privileged (collection construction, program lookup, pinning —
+   the current `...Once` body's non-registry work, preserving the
+   "construction and pinning stay outside" rule); ONE small named
+   publisher, `publishShimRegistryLocked`, takes `m.mu` and
+   performs the registry assignments (the current :183-190
+   content) AND the Store(true) — the hold is exactly the
+   publisher's short body. `LoadUserspaceShim` runs: selector
+   (:154) -> cleanups (:155/:158) -> acquisition (unlocked) ->
+   the publisher (locked). This kills the body-wide-hold deadlock
+   (r82 Codex M2: a hold spanning the body would re-enter `m.mu`
+   at the :154 selector, which A3 makes lock-taking) and keeps
+   the cleanups' filesystem work outside. The AST canary over
+   `pkg/dataplane` forbids direct `m.maps`/`m.programs` access
+   outside the EXACTLY-NAMED allowlist — the registry helper
+   function and `publishShimRegistryLocked` — and asserts the
+   LOCKED-INTERVAL shape: every allowed access is dominated by
+   the allowlisted function's `m.mu` acquisition and precedes its
+   release (the `Lock -> hook -> Unlock -> access` anti-pattern
+   FAILS the shape check, r82 Codex M1's hole). The stale-
+   allowlist self-check (an allowlisted function that stops
+   touching the registry FAILS) and the synthetic negative tests
+   stand. The seam-scoping rule: the synthetic loader replaces
+   only the privileged acquisition operations (pin/load
+   syscalls), never the publisher — the publication writes run
+   the production code path under the test's barrier.
    The fixture-migration classification is REDONE under the
    two-state rule (r76 Codex m3 — v77's prescription was stale):
    `injectShimMap` modifies only `maps`, never `loaded`
@@ -5303,18 +5349,18 @@ Still open:
    PLAN-READY when all three verdicts gate the PR-1 design as
    ready.
 
-7. **r68-r81 resolution (for the record)**: Codex r68 M1 (armed-state
-   admission gate) folded as work item A3; r69-r80 falsified each
-   intermediate form, and r81 pinned the last two guards to
-   implementation grade (the registry canary's exact allowlist +
-   stale-allowlist self-check + negative tests, with the batch hold
-   structurally spanning LoadUserspaceShim's body; the reverse-
-   schedule runtime proof replaced by the helper lock-ownership test
-   since the adjacent-statement interval has no injectable
-   operation). v83 carries them plus the summary/oracle subcase
-   qualifications. Each reviewer: verify the canary spec against
-   loader_userspace_shim.go:183-190 + loader.go:152-166, and the
-   two-invocation shape for loaded-check entries.
+7. **r68-r82 resolution (for the record)**: Codex r68 M1 (armed-state
+   admission gate) folded as work item A3; r69-r81 falsified each
+   intermediate form, and r82 pinned the last structural defect (the
+   canary named the wrapper while the writes lived in the ...Once
+   function, and a body-wide hold would self-deadlock on the :154
+   selector) — v84's named-publisher design (unlocked privileged
+   acquisition + publishShimRegistryLocked carrying the writes AND
+   the Store) resolves both, with the canary's locked-interval shape
+   check defeating the Lock→hook→Unlock→access anti-pattern. Each
+   reviewer: verify the publisher design against
+   loader_userspace_shim.go:95-195 and loader.go:152-166, and the
+   hook protocol's one-ownership-hook-per-test rule.
 
 ---
 
