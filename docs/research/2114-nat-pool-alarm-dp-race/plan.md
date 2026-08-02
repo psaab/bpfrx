@@ -1,6 +1,30 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v96 — r92 Codex folds (2 documentation-only
+- **Status**: DRAFT v97 — r93 Codex folds (2 documentation
+  minors, no MAJOR, no design change): minor-1's transitivity
+  reframe (the v96 "composed into multi-access operations"
+  criterion was transitive and therefore non-exhaustive — the
+  same proof composes `Compile` with
+  `clearNativeXDPFlagsForIfindexes` whose selector
+  `loader.go:928` sits in the single-selector remainder, and
+  `ClearSessionCounts`/`GetMapStats` are single-selector-but-
+  multi-runtime-map; the 17-site subset is now defined by its
+  §9 ORACLE ROLE — "the sites whose absent outcome the mixed-
+  method oracle legs exercise" — with the 15+2 host shapes as
+  DESCRIPTION, not a defining criterion); minor-2's fifth shape
+  (the class-4 `Map`/`Program` getters at `loader.go:1152`/
+  `:1157` return nil directly on a missing key — none of the
+  four other shapes; the FULL breakdown across the 41 optional
+  reads is now 14 if-ok skips + 1 nil-guard return + 3
+  skip/continue outcomes + 21 comma-ok early returns + 2 direct
+  nil returns = 41). Codex's fold-free passes: the 15+2
+  arithmetic itself correct; both compositions real; the three
+  `other-shape` occurrences mutually consistent; the full
+  A3/§7/§9 read consistent; no PR-1 regression, synchronization
+  hazard, oracle gap, teardown overclaim, or G+H+H2 leakage.
+  r93 verdicts: Codex PLAN-NEEDS-MINOR (2m), AGY PLAN-READY,
+  Claude SMR PLAN-READY; pending convergence review r94.
+- **Prior**: DRAFT v96 — r92 Codex folds (2 documentation-only
   minors, no MAJOR, no design change): minor-1's MULTI-ACCESS
   partition precision (the v95 "methods with MORE THAN ONE
   registry access" was false under direct-access semantics for
@@ -3485,7 +3509,11 @@
   selector-site rename; the §9 "nil-guard SKIPS" correction).
   v96 (r92 Codex's two documentation minors: the MULTI-ACCESS
   partition precision — 15 multi-selector + 2 composed single-
-  selector; the fourth optional-outcome shape).
+  selector; the fourth optional-outcome shape). v97 (r93
+  Codex's two documentation minors: the oracle-role reframe of
+  the 17-site subset (host shapes as description, not
+  criterion); the fifth optional-read shape + the full 41-read
+  breakdown).
 
 ---
 
@@ -5208,11 +5236,18 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    REQUIRED accesses; an OPTIONAL access inside ANY class keeps
    master's exact per-site outcome — the `if ok` body does not
    run, the nil-guard returns, the skip-and-continue proceeds
-   past the skipped block, OR the comma-ok early return fires
+   past the skipped block, the comma-ok early return fires
    (the fourth shape added at v96 per r92 Codex minor-2 — the
    three-form enumeration omitted `loader.go:700`'s comma-ok
-   early return, which the same block correctly names; the four
-   shapes are exhaustive across the 41 optional reads)
+   early return, which the same block correctly names), OR the
+   getter returns nil directly (the fifth shape added at v97 per
+   r93 Codex minor-2 — the class-4 `Map`/`Program` getters at
+   `loader.go:1152`/`:1157` return `m.maps[name]`/
+   `m.programs[name]` directly, nil on a missing key — none of
+   the four other shapes; the FULL breakdown across the 41
+   optional reads: 14 if-ok skips + 1 nil-guard return + 3
+   skip/continue outcomes + 21 comma-ok early returns + 2 direct
+   nil returns = 41)
    (v93 precision per r90 Codex minor-1 —
    the parenthetical's "simply returns" half-undid the v92 rule
    change; `compiler.go:353` CONTINUES past the skipped
@@ -5232,16 +5267,22 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    16" while its own body enumerated FOURTEEN if-ok sites, and
    the "complete list" phrasing overclaimed: the full
    neutral-outcome access set across `pkg/dataplane` is ~41 sites
-   (r87 Codex's table), of which these 17 are the ones inside
-   MULTI-ACCESS OPERATIONS — precisely: 15 sites in
+   (r87 Codex's table), of which these 17 are the ones whose
+   absent outcome the §9 mixed-method oracle legs exercise —
+   the MIXED-METHOD subset, defined by that oracle role and NOT
+   by a transitive multi-access criterion (v97 reframe per r93
+   Codex minor-1 — the v96 "composed into multi-access
+   operations" criterion was transitive and therefore non-
+   exhaustive: the same proof composes `Compile` with
+   `clearNativeXDPFlagsForIfindexes`, whose selector
+   `loader.go:928` sits in the single-selector remainder, and
+   `ClearSessionCounts`/`GetMapStats` are single-selector-but-
+   multi-runtime-map; the accurate statement is the host-shape
+   DESCRIPTION, not a defining criterion: 15 sites in
    MULTI-SELECTOR methods (methods with more than one DIRECT
-   registry selector) plus TWO single-selector sites composed
-   into multi-access operations (v96 precision per r92 Codex
-   minor-1 — the v95 "methods with MORE THAN ONE registry
-   access" was false under A3's direct-access semantics for
-   `Compile`, whose only direct selector is `compiler.go:353`,
-   and `seedInterfaceCounter`, whose only selector is
-   `loader.go:591`: `Compile` composes with
+   registry selector) plus TWO single-selector sites
+   (`compiler.go:353`, `loader.go:591`) whose host methods
+   compose into multi-access operations — `Compile` composes with
    `clearNativeXDPFlagsForIfindexes` at `compiler.go:399` (that
    helper's selector `loader.go:928` sits in the single-selector
    set) and `seedInterfaceCounter` composes into
@@ -6014,10 +6055,10 @@ Still open:
    reviewer: verify the per-site outcome rule's three-way
    phrasing (skip / return / continue), the A3+§5.1+§9 Detach
    consistency, the void-host enumeration, the exact 14+2+1
-   optional-read split, the MULTI-ACCESS scoping (precisely 15
-   multi-selector + 2 composed single-selector, per v96), the
-   SINGLE-ACCESS-SELECTOR naming, the four-shape optional-outcome
-   enumeration, and the census
+   optional-read split, the mixed-subset oracle-role scoping
+   (host shapes described, not defining, per v97), the
+   SINGLE-ACCESS-SELECTOR naming, the FIVE-shape optional-outcome
+   enumeration (14+1+3+21+2 = 41), and the census
    labels.
 
 ---
