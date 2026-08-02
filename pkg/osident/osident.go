@@ -40,10 +40,22 @@
 //
 // Reading /etc/passwd here is not a downgrade in reach: with CGO_ENABLED=0 the
 // standard library's own lookup is a pure-Go /etc/passwd scan (os/user
-// userFile) with no NSS either, so for every uid that HAS a local row the
-// resolved name is identical. What changes is that a uid WITHOUT one now
-// resolves to "unidentified" instead of to whatever the caller put in $USER —
-// and pkg/cli fails closed on unidentified.
+// userFile) with no NSS either, and this package applies os/user's row filters
+// (matchPasswdRow) and its chunked long-row reader (readPasswdRow) unchanged.
+// So for a READABLE database, every uid the file maps to exactly one account
+// name resolves to that same name here.
+//
+// Two divergences are deliberate, and both NARROW:
+//
+//	a uid mapped to SEVERAL names resolves to "" here, where os/user returns
+//	whichever row came first — see lookupPasswd for why that fails closed.
+//	a uid with NO row resolves to "unidentified" here, instead of to whatever
+//	the caller put in $USER.
+//
+// pkg/cli fails closed on both. The sentence above is scoped to "exactly one
+// name" and "readable" on purpose: an earlier revision claimed parity for every
+// uid that HAS a row, which the ambiguity refusal falsifies outright (#6706
+// review r4/r5 F5).
 //
 // A cgo-enabled dev build loses NSS name resolution — and that affects the RBAC
 // CLASS DECISION, not merely the displayed prompt. An NSS-only account (LDAP,
@@ -57,8 +69,10 @@ package osident
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -173,57 +187,28 @@ func lookupPasswd(path string, uid int) (string, error) {
 	}
 	defer f.Close()
 
+	want := strconv.Itoa(uid)
 	var names []string
-	sc := bufio.NewScanner(f)
-	// A passwd line is short; the default 64KiB token cap is ample. Bound it
-	// explicitly so a pathological file cannot be turned into an allocation.
-	sc.Buffer(make([]byte, 0, 4096), 64*1024)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
+	rd := bufio.NewReader(f)
+	for {
+		row, whole, readErr := readPasswdRow(rd)
+		if whole {
+			// matchPasswdRow's second result, not `name != ""`, is what decides
+			// whether the row is an entry for this uid. A redundant emptiness
+			// filter here would MASK the empty-name term inside matchPasswdRow
+			// and leave it unbindable by any test — which is how that term
+			// survived a full mutation sweep at the previous head (#6706 review
+			// r5 F4).
+			if name, isEntry := matchPasswdRow(row, want); isEntry && !containsString(names, name) {
+				names = append(names, name)
+			}
 		}
-		// name:passwd:uid:gid:gecos:home:shell.
-		//
-		// These row filters MIRROR os/user's pure-Go matchUserIndexValue
-		// exactly, and every one of them is load-bearing rather than defensive.
-		// An earlier revision of this comment claimed NIS compat lines (`+`,
-		// `-`) and truncated rows "carry no parsable uid and are skipped by the
-		// Atoi below". That is false — `+alice::1000:...` yields "+alice" and
-		// `alice:x:1000` yields "alice" — and because this lookup fails CLOSED
-		// on ambiguity, a single stray row for a LIVE uid would have turned a
-		// legitimate operator into ReasonAmbiguousUID and denied them, where
-		// the standard library resolves the name fine (#6706 MINOR-4).
-		// Diverging from stdlib here does not narrow safely; it narrows into an
-		// availability failure, and it would falsify this package's own claim
-		// that for every uid with a local row the resolved name is identical.
-		//
-		//   - >= 7 fields: stdlib requires `bytes.Count(line, ':') >= 6`, so a
-		//     truncated row is not a passwd entry at all.
-		//   - name non-empty and not `+`/`-`: NIS compat lines are directives,
-		//     not accounts.
-		//   - uid compared as a STRING: stdlib does `parts[idx] != value`, so
-		//     `01000` does not match uid 1000. Atoi alone would accept it.
-		//   - uid and gid must both parse.
-		fields := strings.Split(line, ":")
-		if len(fields) < 7 || fields[0] == "" || fields[0][0] == '+' || fields[0][0] == '-' {
-			continue
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return "", readErr
 		}
-		if fields[2] != strconv.Itoa(uid) {
-			continue
-		}
-		if _, convErr := strconv.Atoi(fields[2]); convErr != nil {
-			continue
-		}
-		if _, convErr := strconv.Atoi(fields[3]); convErr != nil {
-			continue
-		}
-		if !containsString(names, fields[0]) {
-			names = append(names, fields[0])
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", err
 	}
 	switch len(names) {
 	case 0:
@@ -234,6 +219,143 @@ func lookupPasswd(path string, uid int) (string, error) {
 		return "", fmt.Errorf("%w: uid %d is shared by %s", errAmbiguousUID, uid,
 			strings.Join(names, ", "))
 	}
+}
+
+// passwdRowColons is the number of colons a passwd entry carries
+// (name:passwd:uid:gid:gecos:home:shell). It is the same figure os/user passes
+// to readColonFile as readCols, and it is the point at which a long row stops
+// being accumulated.
+const passwdRowColons = 6
+
+var passwdColon = []byte{':'}
+
+// readPasswdRow returns the next logical row from rd. whole reports whether
+// row is a complete row that should be parsed; a row cut short by EOF or by an
+// I/O error mid-line is dropped, which is what os/user's readColonFile does
+// with the same input. A non-nil err (io.EOF included) means stop after
+// handling row.
+//
+// WHY THIS IS NOT A bufio.Scanner. A Scanner has a fixed maximum token size and
+// ABORTS THE WHOLE SCAN with bufio.ErrTooLong on the first line that exceeds
+// it — the scan cannot be resumed past the offending row, so the error reaches
+// Current(), which reports ReasonLookupFailed, which pkg/cli treats as
+// unidentified. Under the previous 64KiB cap one pathological row for an
+// UNRELATED account therefore denied EVERY non-root operator. Measured at the
+// previous head with a 70KiB GECOS field on uid 4242: lookupPasswd(1000)
+// returned "" / "bufio.Scanner: token too long" where os/user still returned
+// "alice" (#6706 review r5 F6). Raising the cap only moves the cliff.
+//
+// os/user reads a row in CHUNKS instead: it accumulates only until the row has
+// the six colons a passwd entry needs, then discards the remainder, so no
+// single row can fail the lookup and the memory cost is bounded by the position
+// of the sixth colon rather than by the row's length. This does the same, which
+// is also what makes the package doc's parity claim true of the READER and not
+// merely of the row filters.
+func readPasswdRow(rd *bufio.Reader) (row string, whole bool, err error) {
+	var acc []byte
+	isPrefix := true
+	for isPrefix {
+		chunk, more, rerr := rd.ReadLine()
+		if rerr != nil {
+			// ReadLine returns a line or an error, never both, so whatever was
+			// accumulated is a partial row with no terminator. os/user drops it
+			// the same way.
+			return "", false, rerr
+		}
+		isPrefix = more
+		// ReadLine's slice is only valid until the next read, so this copy is
+		// load-bearing rather than idiomatic tidiness.
+		acc = append(acc, chunk...)
+		if bytes.Count(acc, passwdColon) >= passwdRowColons {
+			break
+		}
+	}
+	// Everything past the sixth colon is the shell field, which no filter in
+	// matchPasswdRow reads. Drain it without accumulating.
+	for isPrefix {
+		_, more, rerr := rd.ReadLine()
+		if rerr != nil {
+			// The row itself is complete: hand it back AND report the error, so
+			// the caller stops here rather than depending on the next read
+			// repeating it.
+			return string(acc), true, rerr
+		}
+		isPrefix = more
+	}
+	return string(acc), true, nil
+}
+
+// matchPasswdRow reports whether row is a passwd entry for wantUID (the uid as
+// strconv.Itoa renders it) and, if so, returns its account name. A comment, a
+// blank line, a row that is not an entry, or an entry for another uid all yield
+// ("", false).
+//
+// The name it returns is guaranteed NON-EMPTY — that is the whole job of the
+// `fields[0] == ""` term — and lookupPasswd relies on the boolean rather than on
+// the name being non-empty, so that term stays observable.
+//
+// These filters MIRROR os/user's pure-Go matchUserIndexValue exactly, and every
+// one of them is load-bearing rather than defensive. Each of the six terms
+// below was mutated out on its own, with `go build ./...` and `go vet ./...`
+// rc 0 in every case, and each produced a RED: five in TestLookupPasswdParsing
+// and one — the `-` prefix — only in TestPasswdReaderMatchesOsUser_6706's
+// "NIS minus directive" row, because the `-badnis` fixture line is caught by the
+// field-count term first. At the previous head two terms were bound by nothing
+// at all and a seventh was dead (#6706 review r5 F4).
+//
+// An earlier revision of this comment claimed NIS compat lines (`+`, `-`) and
+// truncated rows "carry no parsable uid and are skipped by the Atoi below".
+// That is false — `+alice::1000:...` yields "+alice" and `alice:x:1000` yields
+// "alice" — and because this lookup fails CLOSED on ambiguity, a single stray
+// row for a LIVE uid turned a legitimate operator into ReasonAmbiguousUID and
+// DENIED them, where the standard library resolves the name fine. Diverging
+// from stdlib here does not narrow safely; it narrows into an availability
+// failure.
+//
+//   - >= 7 fields: stdlib requires `bytes.Count(line, ':') >= 6`, so a
+//     truncated row is not a passwd entry at all.
+//   - name non-empty: an unnamed row is not an account.
+//   - name not `+`/`-`: NIS compat lines are directives, not accounts.
+//   - uid compared as a STRING: stdlib does `parts[idx] != value`, so `01000`
+//     does not match uid 1000. Atoi alone would accept it.
+//   - gid must parse.
+//
+// The `+`/`-` test is written with strings.HasPrefix where stdlib indexes
+// `parts[0][0]`. Same result on every non-empty name, but stdlib's form is
+// panic-safe only because the emptiness test sits to its left in the same `||`
+// chain — which would make removing the emptiness test show up as an index
+// PANIC rather than as the parity failure it is. Splitting them keeps each term
+// answerable by an assertion.
+//
+// stdlib also runs `strconv.Atoi(parts[2])` on the uid field. That branch is
+// DEAD once the uid is compared against strconv.Itoa's output — Itoa emits a
+// canonical decimal, which Atoi always accepts — so it is not reproduced here.
+// Re-adding it as a panic() and running the suite never fires it. Its absence
+// cannot change a result; keeping it would have been a term no mutation could
+// bind.
+func matchPasswdRow(row, wantUID string) (string, bool) {
+	line := strings.TrimSpace(row)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", false
+	}
+	fields := strings.Split(line, ":")
+	if len(fields) < 7 {
+		return "", false
+	}
+	name := fields[0]
+	if name == "" {
+		return "", false
+	}
+	if strings.HasPrefix(name, "+") || strings.HasPrefix(name, "-") {
+		return "", false
+	}
+	if fields[2] != wantUID {
+		return "", false
+	}
+	if _, convErr := strconv.Atoi(fields[3]); convErr != nil {
+		return "", false
+	}
+	return name, true
 }
 
 // containsString avoids pulling a generic slices dependency into this leaf for

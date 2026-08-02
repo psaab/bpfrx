@@ -576,3 +576,65 @@ func TestAmbiguousUIDFailsClosed_6706(t *testing.T) {
 		}
 	})
 }
+
+// TestRootAliasClassMatrix_6706 pins the uid-0 decision matrix that decision 1
+// of ResolveLoginClass's doc comment describes.
+//
+// That paragraph has now been wrong twice, in opposite directions: first
+// claiming an explicit class wins "for any uid including 0" (#6706 MINOR-5),
+// then that it "cannot win when the caller has no name" and that this is "false
+// in exactly one reachable case" (#6706 review r5 F7). Both halves of the real
+// rule are asserted here, so the next revision has to agree with something
+// executable rather than with a previous sentence:
+//
+//   - a stanza written for `root` DOES win at uid 0 with no resolved name,
+//     because candidateNames injects the literal "root";
+//   - a stanza written for an ALIAS does not — and that holds for EVERY
+//     unresolved Reason, not for ReasonAmbiguousUID alone. Three reachable
+//     Reasons, not one.
+func TestRootAliasClassMatrix_6706(t *testing.T) {
+	unresolved := []struct {
+		name   string
+		reason osident.Reason
+	}{
+		{"ambiguous uid", osident.ReasonAmbiguousUID},
+		{"no passwd entry", osident.ReasonNoPasswdEntry},
+		{"lookup failed", osident.ReasonLookupFailed},
+	}
+
+	for _, tc := range unresolved {
+		id := osident.Identity{UID: 0, Reason: tc.reason}
+
+		t.Run(tc.name+": a `root` stanza still wins with no resolved name", func(t *testing.T) {
+			got, reason := ResolveLoginClass(loginCfg([2]string{"root", "read-only"}), id)
+			if got != "read-only" {
+				t.Fatalf("class = %q, want %q — candidateNames offers the literal \"root\" for "+
+					"uid 0 precisely so an explicit stanza can be honoured without a resolved "+
+					"name (reason: %s)", got, "read-only", reason)
+			}
+		})
+
+		t.Run(tc.name+": an ALIAS stanza is dropped", func(t *testing.T) {
+			got, reason := ResolveLoginClass(loginCfg([2]string{"toor", "read-only"}), id)
+			if got != ClassRootDefault {
+				t.Fatalf("class = %q, want %q — with no resolved name there is nothing to match "+
+					"`user toor` against, so the root default applies (reason: %s)",
+					got, ClassRootDefault, reason)
+			}
+			if !strings.Contains(reason, "was NOT applied") {
+				t.Errorf("reason = %q, want it to say the configured class was not applied — "+
+					"silently dropping an operator's explicit restriction is the one thing that "+
+					"must not go unreported here", reason)
+			}
+		})
+	}
+
+	// The contrast row: once the alias IS resolved, its stanza wins.
+	t.Run("a resolved alias gets its own class", func(t *testing.T) {
+		got, reason := ResolveLoginClass(loginCfg([2]string{"toor", "read-only"}),
+			osident.Identity{UID: 0, Name: "toor"})
+		if got != "read-only" {
+			t.Fatalf("class = %q, want %q (reason: %s)", got, "read-only", reason)
+		}
+	})
+}

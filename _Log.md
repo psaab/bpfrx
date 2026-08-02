@@ -74224,3 +74224,124 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/osident/user_env_canary_test.go, pkg/osident/osident.go,
   pkg/osident/passwd_6706_test.go, pkg/cli/userclass_entrypoint_canary_test.go,
   pkg/cli/identity.go, _Log.md
+
+## 2026-08-01 — #6706 fold r6: one row must not deny everyone; make the last four guards bind
+
+- **Timestamp**: 2026-08-01 (round 6 — independent hostile re-gate folds)
+- **Action**: Fold all eight findings from the r5 hostile re-gate on PR #6706
+  at `d0c326082`. Six were material (one real runtime defect, four guards that
+  could not fire, one claim wider than its guard); two were prose. Every
+  finding was REPRODUCED at head before it was fixed, and every fix was proven
+  by mutation with `go build ./...` and `go vet ./...` rc 0 in BOTH states, so
+  no red below is a build break.
+- **F6 (MATERIAL — real runtime, fail-closed availability).** `lookupPasswd`
+  read the passwd database with a `bufio.Scanner` capped at 64KiB. A Scanner
+  aborts the WHOLE scan with `ErrTooLong` on the first over-long line and cannot
+  resume, so the error reached `Current()` as `ReasonLookupFailed`, which
+  pkg/cli treats as unidentified. One pathological row for an UNRELATED account
+  therefore denied EVERY non-root operator. REPRODUCED at head: with
+  `alice:x:1000:...` plus a 70KiB-GECOS row for uid 4242, `lookupPasswd(1000)`
+  returned `"" / bufio.Scanner: token too long` where os/user still returned
+  `alice`. Replaced with os/user's own chunked reader (`readPasswdRow`):
+  accumulate until the row has its six colons, then drain the tail without
+  accumulating. Memory is now bounded by the position of the sixth colon —
+  exactly the standard library's bound — instead of by a fixed cap whose only
+  effect was to move the cliff. PROVEN: restoring the Scanner (with `io.EOF`
+  kept referenced so the revert is an ASSERTION, not an unused-import build
+  break) reds the five oversized parity rows and
+  `TestOversizedRowDoesNotDenyEveryOperator_6706`, and leaves the other 30
+  parity rows green.
+- **F1 (MATERIAL — guard could not fire, security direction).** Both canary
+  walks skipped `node_modules`. cmd/go has NO such rule — `modload/search.go`
+  excludes exactly `.`-prefixed, `_`-prefixed and `testdata`, and prunes
+  `vendor` separately — so a package under `node_modules/` that `go build ./...`
+  genuinely compiles was invisible to all three #6701 canaries. REPRODUCED at
+  head with `node_modules/zzpkg/x.go` carrying BOTH defect shapes: `go list`
+  named the package, build and vet rc 0, all three canaries green. Dropped the
+  term; `skipCanaryDir` is now bit-for-bit the toolchain's directory rule in
+  both files. PROVEN: the same planted package now reds all three canaries by
+  file:line:col.
+- **F2 (MATERIAL — false red, half-closed at r5).** `./...` excludes `_`/`.`
+  prefixed FILES and build-constrained files too; the walks implemented the rule
+  for DIRECTORIES only. REPRODUCED at head: `pkg/osident/_scratch.go` (absent
+  even from `go list`'s IgnoredGoFiles) and `pkg/osident/zz_windows.go` each
+  produced a canary FAILURE with build and vet rc 0. Both walks now ask
+  `go/build`'s own matcher (`build.Default.MatchFile`) rather than restating its
+  rule, which covers the `_`/`.` prefix, `_GOOS`/`_GOARCH` suffixes and
+  `//go:build` constraints in one call. An unanswerable constraint (parse error)
+  SCANS the file — on an unanswerable question the guard should fire, not fall
+  silent. PROVEN: the same three planted files are now green.
+- **F3 (MATERIAL — allowlist bypass in the one file the allowlist fences).** The
+  entrypoint canary tracked a running `enclosing` key that was set on entering a
+  FuncDecl and never cleared, so a `*ast.GenDecl` appearing AFTER a function
+  inherited that function's key. REPRODUCED at head by appending
+  `var zzRogueSetter = zzRogueShell.SetUserClass` to the real
+  `pkg/daemon/cli_rbac.go`, after `applyCLILoginClass`: it took the allowlisted
+  key, and build rc 0, vet rc 0, both canaries ok. The predicate is now
+  `setUserClassRefs`, which iterates `f.Decls` and keys each reference on its
+  TOP-LEVEL declaration — a package-level reference gets
+  `<pkg>::<package-level declaration>`, a key no allowlist entry can hold. The
+  synthetic control now calls that same function instead of re-implementing it.
+  PROVEN twice: the planted bypass reds by file:line, and reverting the
+  predicate to a running `enclosing` reds the new
+  `TestPackageLevelClassWriteIsNotAllowlistedByANeighbour_6701`.
+- **F4 (MATERIAL — two parity terms bound by nothing, one dead).** REPRODUCED:
+  removing `fields[0] == ""` or the gid `Atoi` left `./pkg/osident/`,
+  `./pkg/cli/` and `./pkg/daemon/` all green. The gid term is not cosmetic —
+  without it `badgid:x:1000:NOTANUM::/h:/s` aliases uid 1000 and DENIES alice.
+  Fixture gained `badgid:...` and `:x:1000:1000::/h:/s`. The empty-name term
+  needed one more step: `lookupPasswd`'s own `name != ""` filter MASKED it, so
+  removing the term surfaced as an index panic rather than as a parity failure.
+  `matchPasswdRow` now returns `(name, isEntry)` and the caller keys on the
+  boolean, which makes the term answerable by an assertion. Swept all six terms
+  one at a time: each reds, build+vet rc 0 in every case. The seventh —
+  stdlib's `Atoi(parts[2])` — is DEAD once the uid is compared against
+  `strconv.Itoa`'s canonical output; re-added as a `panic()` it never fires, so
+  it is deleted rather than kept as a term no mutation can bind.
+- **F8 (claim wider than guard).** The r5 comment credited the
+  `filesScanned == 0` Fatal with catching a wrong root and a wrong suffix
+  filter. REPRODUCED as false for both: a wrong root is caught EARLIER by the
+  go.mod Fatal, `.go` -> `t.go` left 74 files scanned, and a PARTIAL directory
+  skip (adding `daemon` to the skip set, with a live `os.Getenv("USER")` planted
+  in pkg/daemon) left 680 files scanned and every canary green. Replaced the
+  floor with `traversalSentinels` — the three #6701 defect sites plus the
+  resolver and its identity source, named as repository-relative paths. PROVEN:
+  both defects now red all three canaries with the unscanned file named.
+- **F5 (prose).** The package doc claimed parity with os/user "for every uid
+  that HAS a local row", which the ambiguity refusal falsifies outright and the
+  64KiB cap falsified a second time. Scoped to "for a READABLE database, every
+  uid the file maps to exactly ONE account name", with the two deliberate
+  divergences listed. Rather than leave it as prose a fourth time, the claim is
+  now BOUND: `TestPasswdReaderMatchesOsUser_6706` runs 34 row shapes through
+  both this reader and a verbatim transcription of os/user's
+  `readColonFile` + `matchUserIndexValue`, and requires the names to agree.
+- **F7 (prose).** `identity.go` said an explicit class "cannot win when the
+  caller has no name". FALSIFIED firsthand by driving the real
+  `ResolveLoginClass`: `candidateNames` injects the literal `"root"` for uid 0,
+  so uid 0 with `ReasonAmbiguousUID` and `user root class read-only` resolves to
+  read-only. The same run refuted "false in exactly ONE reachable case" —
+  `ReasonNoPasswdEntry` and `ReasonLookupFailed` at uid 0 drop an alias class
+  identically, so it is three Reasons. Corrected to "cannot win when the caller
+  has no name AND the stanza is written for an alias other than `root`", and
+  pinned by the new `TestRootAliasClassMatrix_6706`.
+- **Validation**: `go build -buildvcs=false ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race -count=1 ./pkg/osident/... ./pkg/cli/... ./pkg/config/...
+  ./pkg/daemon/...` rc 0, `gofmt` clean on every touched file. Full
+  `go test ./...`: 68 packages, only `pkg/ddns` red, and NOT this PR's —
+  `TestSurfaceARealBackendForcedRefreshSucceeds` failed with
+  `tcp listen: listen tcp 127.0.0.1:52240: bind: address already in use`. The PR
+  touches zero files under pkg/ddns, and `go test ./pkg/ddns/` alone passes 3/3
+  at this head. Mechanism, checked firsthand: `newFakeDNSServer`
+  (`backend_rfc2136_test.go:85-94`) binds UDP on `127.0.0.1:0`, then binds TCP on
+  the port number the kernel handed the UDP socket — a port another listener can
+  take in between. That is the #6726 family (whose title names only
+  `TestRFC2136ReplaceOwnedAdoptsOwnNameOnReadd`); it is a port RACE rather than a
+  literal fixed port, and it reaches more functions than the issue lists.
+  Build and vet asserted
+  rc 0 under every mutation above; the one mutation that broke the build (a
+  first attempt at the uid-compare term) was redone as a compiling mutation
+  before its red was counted.
+- **File(s)**: pkg/osident/osident.go, pkg/osident/passwd_6706_test.go,
+  pkg/osident/user_env_canary_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/cli/identity.go,
+  pkg/cli/identity_6701_test.go, _Log.md

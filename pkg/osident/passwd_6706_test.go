@@ -1,12 +1,17 @@
 package osident
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -143,6 +148,8 @@ twin-b:x:2001:2001::/home/b:/bin/sh
 +alice::1000:1000:::
 shortbob:x:1000
 zeropad:x:01000:1000:Carol:/home/carol:/bin/sh
+badgid:x:1000:NOTANUM::/home/badgid:/bin/sh
+:x:1000:1000::/home/anon:/bin/sh
 `
 	path := filepath.Join(t.TempDir(), "passwd")
 	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
@@ -159,9 +166,11 @@ zeropad:x:01000:1000:Carol:/home/carol:/bin/sh
 		// alice must still resolve. This lookup fails CLOSED on ambiguity, so a
 		// row this parser accepts but os/user rejects does not merely add
 		// noise — it turns a legitimate operator into ReasonAmbiguousUID and
-		// DENIES them. The fixture therefore carries one of each stdlib-rejected
-		// shape at alice's OWN uid; before the parity fix each of these alone
-		// made "ordinary row" fail with errAmbiguousUID (#6706 MINOR-4).
+		// DENIES them. The fixture therefore carries one row for EACH term of
+		// matchPasswdRow, at alice's OWN uid, so removing any single term makes
+		// "ordinary row" fail with errAmbiguousUID (#6706 MINOR-4, completed for
+		// the two terms that were still unbound at r5 — see F4 there: dropping
+		// `fields[0] == ""` or the gid Atoi left the whole suite green).
 		{"ordinary row", 1000, "alice", nil},
 		{"duplicate identical row is one account", 1000, "alice", nil},
 		// `+alice::1000:1000:::` — a NIS compat directive, not an account.
@@ -172,6 +181,16 @@ zeropad:x:01000:1000:Carol:/home/carol:/bin/sh
 		// `zeropad:x:01000:...` — Atoi("01000") == 1000, but stdlib compares the
 		// uid field as a STRING, so it never matches uid 1000.
 		{"zero-padded uid does not alias the same numeric uid", 1000, "alice", nil},
+		// `badgid:x:1000:NOTANUM::/home/badgid:/bin/sh` — a real uid match with
+		// an unparsable GID. stdlib rejects it on `Atoi(parts[3])`. Binds the
+		// gid term: without it lookupPasswd(1000) returns
+		// "uid 1000 is shared by alice, badgid" and denies alice.
+		{"unparsable gid at a live uid does not alias it", 1000, "alice", nil},
+		// `:x:1000:1000::/home/anon:/bin/sh` — seven fields, matching uid, no
+		// NAME. stdlib rejects it on `parts[0] == ""`. Binds the empty-name
+		// term: without it the empty string is collected as a second account
+		// name for uid 1000 and alice is denied.
+		{"empty account name at a live uid does not alias it", 1000, "alice", nil},
 		{"uid 0", 0, "root", nil},
 		{"absent uid", 4242, "", errNoPasswdEntry},
 		{"two distinct names share a uid", 2001, "", errAmbiguousUID},
@@ -193,6 +212,248 @@ zeropad:x:01000:1000:Carol:/home/carol:/bin/sh
 				t.Errorf("error = %v, want one wrapping %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// osUserColon and the two functions below are a VERBATIM transcription of the
+// standard library's pure-Go passwd reader — readColonFile plus the uid half of
+// matchUserIndexValue — from $GOROOT/src/os/user/lookup_unix.go at go1.26.4.
+//
+// It has to be a copy: os/user offers no seam for pointing LookupId at a
+// fixture, so the only way to compare this package against the implementation
+// it claims parity with is to run that implementation over the same bytes. The
+// copy is the ORACLE, so it must not be "improved" — if the toolchain's reader
+// changes, this is what has to be re-transcribed, and
+// TestPasswdReaderMatchesOsUser_6706 is what will disagree.
+var osUserColon = []byte{':'}
+
+func osUserReadColonFile(r io.Reader, fn func(line []byte) (any, error), readCols int) (v any, err error) {
+	rd := bufio.NewReader(r)
+	for {
+		var isPrefix bool
+		var wholeLine []byte
+		for {
+			var line []byte
+			line, isPrefix, err = rd.ReadLine()
+			if err != nil {
+				if err == io.EOF {
+					err = nil
+				}
+				return nil, err
+			}
+			if !isPrefix && len(wholeLine) == 0 {
+				wholeLine = line
+				break
+			}
+			wholeLine = append(wholeLine, line...)
+			if !isPrefix || bytes.Count(wholeLine, osUserColon) >= readCols {
+				break
+			}
+		}
+		wholeLine = bytes.TrimSpace(wholeLine)
+		if len(wholeLine) == 0 || wholeLine[0] == '#' {
+			continue
+		}
+		v, err = fn(wholeLine)
+		if v != nil || err != nil {
+			return
+		}
+		for ; isPrefix; _, isPrefix, err = rd.ReadLine() {
+			if err != nil {
+				if err == io.EOF {
+					err = nil
+				}
+				return nil, err
+			}
+		}
+	}
+}
+
+func osUserMatchUID(value string) func(line []byte) (any, error) {
+	substr := []byte(":" + value + ":")
+	return func(line []byte) (v any, err error) {
+		if !bytes.Contains(line, substr) || bytes.Count(line, osUserColon) < 6 {
+			return
+		}
+		parts := strings.SplitN(string(line), ":", 7)
+		if len(parts) < 6 || parts[2] != value || parts[0] == "" ||
+			parts[0][0] == '+' || parts[0][0] == '-' {
+			return
+		}
+		if _, err := strconv.Atoi(parts[2]); err != nil {
+			return nil, nil
+		}
+		if _, err := strconv.Atoi(parts[3]); err != nil {
+			return nil, nil
+		}
+		return parts[0], nil
+	}
+}
+
+// osUserLookupUID resolves uid against path the way os/user would, returning ""
+// when os/user would report the uid unknown.
+func osUserLookupUID(t *testing.T, path string, uid int) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	defer f.Close()
+	v, err := osUserReadColonFile(f, osUserMatchUID(strconv.Itoa(uid)), 6)
+	if err != nil || v == nil {
+		return ""
+	}
+	return v.(string)
+}
+
+// writeRows writes rows to a fresh file and returns its path.
+func writeRows(t *testing.T, rows ...string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "passwd")
+	if err := os.WriteFile(path, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	return path
+}
+
+// TestPasswdReaderMatchesOsUser_6706 BINDS the parity claim the package doc
+// makes, instead of asserting it in prose.
+//
+// That claim — "for a readable database, every uid the file maps to exactly one
+// account name resolves to that same name here" — has now been falsified three
+// times by three different mechanisms (row filters that accepted rows stdlib
+// rejects; the ambiguity refusal; a 64KiB token cap that failed the whole
+// lookup on one long row). Each time it was found by a reader running the
+// comparison by hand. This runs it in the suite: every case below is fed to
+// lookupPasswd AND to the stdlib transcription above, and the two names must
+// agree.
+//
+// The DELIBERATE divergences are asserted separately, by
+// TestCurrentAmbiguousUIDFailsClosed_6701 and
+// TestCurrentIgnoresUSERWhenPasswdHasNoRow_6701, and the last case here pins
+// the ambiguity one directly so parity is never "fixed" by removing it.
+func TestPasswdReaderMatchesOsUser_6706(t *testing.T) {
+	const target = 1000
+	longGecos := strings.Repeat("G", 200*1024)
+	ordinary := "alice:x:1000:1000:Alice:/home/alice:/bin/bash"
+
+	cases := []struct {
+		name string
+		rows []string
+		uid  int
+	}{
+		{"canonical row", []string{ordinary}, target},
+		{"extra trailing field", []string{"alice:x:1000:1000:Alice:/home/alice:/bin/bash:extra"}, target},
+		{"trailing colon", []string{"alice:x:1000:1000:Alice:/home/alice:"}, target},
+		{"truncated to three fields", []string{"alice:x:1000"}, target},
+		{"truncated to six fields", []string{"alice:x:1000:1000:Alice:/home/alice"}, target},
+		{"NIS plus directive", []string{"+alice::1000:1000:::", ordinary}, target},
+		{"NIS minus directive", []string{"-alice::1000:1000:::", ordinary}, target},
+		{"NIS empty directive", []string{"+::::::"}, 0},
+		{"NIS netgroup directive", []string{"+@ops::1000:1000:::", ordinary}, target},
+		{"zero-padded uid", []string{"zeropad:x:01000:1000::/home/z:/bin/sh"}, target},
+		{"space-padded uid", []string{"spaced:x: 1000:1000::/home/s:/bin/sh"}, target},
+		{"plus-signed uid", []string{"plus:x:+1000:1000::/home/p:/bin/sh"}, target},
+		{"underscore-separated uid", []string{"under:x:1_000:1000::/home/u:/bin/sh"}, target},
+		{"near-miss uid", []string{"near:x:11000:1000::/home/n:/bin/sh"}, target},
+		{"trailing garbage on uid", []string{"garb:x:1000x:1000::/home/g:/bin/sh"}, target},
+		{"unparsable gid", []string{"badgid:x:1000:NOTANUM::/home/b:/bin/sh"}, target},
+		{"empty gid", []string{"nogid:x:1000:::/home/n:/bin/sh"}, target},
+		{"empty account name", []string{":x:1000:1000::/home/anon:/bin/sh"}, target},
+		{"leading whitespace", []string{"  " + ordinary}, target},
+		{"leading tab", []string{"\t" + ordinary}, target},
+		{"trailing whitespace", []string{ordinary + "   "}, target},
+		{"CR terminated", []string{ordinary + "\r"}, target},
+		{"comment", []string{"# alice:x:1000:1000::/h:/s"}, target},
+		{"indented comment", []string{"   # alice:x:1000:1000::/h:/s"}, target},
+		{"blank lines", []string{"", ordinary, "", ""}, target},
+		{"colons inside gecos", []string{"alice:x:1000:1000:A:B:C:/home/alice:/bin/sh"}, target},
+		{"uid 0", []string{"root:x:0:0:root:/root:/bin/bash", ordinary}, 0},
+		{"absent uid", []string{ordinary}, 4242},
+		{"identical duplicate rows", []string{ordinary, ordinary}, target},
+
+		// The #6706 review r5 F6 cases: a row longer than the retired 64KiB
+		// token cap must not fail the lookup. The first is the reported one —
+		// the long row belongs to an UNRELATED account, and the target still has
+		// to resolve.
+		{"oversized row on another account", []string{
+			ordinary,
+			"bulk:x:4242:4242:" + longGecos + ":/home/bulk:/bin/sh",
+		}, target},
+		{"oversized row on another account, target last", []string{
+			"bulk:x:4242:4242:" + longGecos + ":/home/bulk:/bin/sh",
+			ordinary,
+		}, target},
+		{"oversized row on the target account", []string{
+			"alice:x:1000:1000:" + longGecos + ":/home/alice:/bin/bash",
+		}, target},
+		{"oversized row with no colons at all", []string{longGecos, ordinary}, target},
+		{"oversized row truncated before the sixth colon", []string{
+			"trunc:x:1000:1000:" + longGecos,
+			ordinary,
+		}, target},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeRows(t, tc.rows...)
+			got, err := lookupPasswd(path, tc.uid)
+			want := osUserLookupUID(t, path, tc.uid)
+			if got != want {
+				t.Errorf("lookupPasswd(uid %d) = %q (err %v), os/user resolves %q — this package "+
+					"claims parity with os/user for a readable database that maps a uid to one "+
+					"name, and this row shape breaks it", tc.uid, got, err, want)
+			}
+		})
+	}
+
+	t.Run("ambiguity is the deliberate divergence", func(t *testing.T) {
+		path := writeRows(t,
+			"alice:x:1000:1000::/home/alice:/bin/sh",
+			"toor:x:1000:1000::/home/toor:/bin/sh",
+		)
+		got, err := lookupPasswd(path, target)
+		want := osUserLookupUID(t, path, target)
+		if got != "" || !errors.Is(err, errAmbiguousUID) {
+			t.Fatalf("lookupPasswd(uid %d) = %q / %v, want \"\" and errAmbiguousUID — the "+
+				"fail-closed refusal is the whole point of not reusing os/user here", target, got, err)
+		}
+		if want == "" {
+			t.Fatalf("os/user resolved a shared uid to %q — the transcription no longer models "+
+				"the file-order behaviour this package deliberately refuses", want)
+		}
+	})
+}
+
+// TestOversizedRowDoesNotDenyEveryOperator_6706 is the whole-identity
+// consequence of the reader change, at the level pkg/cli actually consumes.
+//
+// Before the chunked reader, lookupPasswd used a bufio.Scanner with a 64KiB
+// token cap. bufio.Scanner surfaces ErrTooLong from Err() and cannot resume, so
+// ONE over-long row anywhere in /etc/passwd — for an account with no relation to
+// the caller — made Current() report ReasonLookupFailed, which pkg/cli resolves
+// to ClassUnidentified. A stray service-account GECOS field denied every
+// non-root operator on the box (#6706 review r5 F6).
+//
+// FAIL-ON-REVERT: put `sc := bufio.NewScanner(f); sc.Buffer(..., 64*1024)` back
+// and this goes RED on Reason (ReasonLookupFailed instead of ReasonNone) with
+// the caller's own row untouched and first in the file.
+func TestOversizedRowDoesNotDenyEveryOperator_6706(t *testing.T) {
+	uid := os.Getuid()
+	writePasswd(t,
+		fmt.Sprintf("me:x:%d:%d:Me:/home/me:/bin/sh", uid, uid),
+		"bulk:x:424242:424242:"+strings.Repeat("G", 200*1024)+":/home/bulk:/bin/sh",
+	)
+
+	id := Current()
+
+	if id.Name != "me" {
+		t.Fatalf("Current().Name = %q (Reason %v) with a valid row for uid %d — one over-long "+
+			"row for an UNRELATED account must not make the caller unidentifiable, because "+
+			"pkg/cli denies an unidentified caller", id.Name, id.Reason, uid)
+	}
+	if id.Reason != ReasonNone {
+		t.Fatalf("Reason = %v, want ReasonNone", id.Reason)
 	}
 }
 

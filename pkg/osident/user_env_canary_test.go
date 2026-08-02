@@ -2,6 +2,7 @@ package osident
 
 import (
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -34,14 +35,15 @@ var identityEnvVars = map[string]bool{
 // sites (or add a fourth) and this test names the file, line and variable and
 // goes RED.
 //
-// Scope: every non-test .go file in the REPOSITORY, walked from the module
-// root rather than from pkg/ + cmd/ (#6706 MINOR-4 — a future top-level
-// production package, `internal/` or anything else a layout change adds, was
-// previously outside the walk and could read $USER unobserved). The allowlist
-// is EMPTY and is meant to stay that way — pkg/osident.Current() is the one
-// supported way to answer "who is running this", and it reads the kernel
-// credential. os.Getenv for anything that is not an identity (XPF_*, PATH,
-// TMPDIR, ...) is untouched: the check keys on the argument literal.
+// Scope: every non-test .go file in the REPOSITORY that the toolchain would
+// compile, walked from the module root rather than from pkg/ + cmd/ (#6706
+// MINOR-4 — a future top-level production package, `internal/` or anything else
+// a layout change adds, was previously outside the walk and could read $USER
+// unobserved). The allowlist is EMPTY and is meant to stay that way —
+// pkg/osident.Current() is the one supported way to answer "who is running
+// this", and it reads the kernel credential. os.Getenv for anything that is not
+// an identity (XPF_*, PATH, TMPDIR, ...) is untouched: the check keys on the
+// argument literal.
 func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 	repoRoot, absErr := filepath.Abs(filepath.Join("..", ".."))
 	if absErr != nil {
@@ -53,6 +55,7 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 	}
 	roots := []string{repoRoot}
 	var filesScanned int
+	scanned := map[string]bool{}
 	var hits []identityEnvHit
 
 	for _, root := range roots {
@@ -61,16 +64,7 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				return err
 			}
 			if d.IsDir() {
-				// Skip vendored / generated / VCS trees, and every dotted
-				// directory (.git, .github, agent scratch, nested worktrees).
-				if path != root && strings.HasPrefix(d.Name(), ".") {
-					return fs.SkipDir
-				}
-				// Skip directories `./...` itself excludes, so this canary
-				// cannot red on code `go build ./...` never compiles — that
-				// false red is what #6706 MINOR-7 was about, and an underscore
-				// directory reproduced it at the previous head.
-				if path != root && strings.HasPrefix(d.Name(), "_") {
+				if path != root && skipCanaryDir(d.Name()) {
 					return fs.SkipDir
 				}
 				// Skip NESTED GO MODULES — a directory below the root carrying
@@ -80,13 +74,12 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				if path != root && isNestedModuleRoot(path) {
 					return fs.SkipDir
 				}
-				switch d.Name() {
-				case "vendor", "testdata", "node_modules":
-					return fs.SkipDir
-				}
 				return nil
 			}
 			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			if !compiledByGoBuild(path) {
 				return nil
 			}
 			fset := token.NewFileSet()
@@ -95,6 +88,9 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				return nil // not our business to police unparsable files
 			}
 			filesScanned++
+			if rel, relErr := filepath.Rel(root, path); relErr == nil {
+				scanned[filepath.ToSlash(rel)] = true
+			}
 			hits = append(hits, identityEnvHits(fset, f)...)
 			return nil
 		})
@@ -103,8 +99,11 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 		}
 	}
 
-	if filesScanned == 0 {
-		t.Fatal("scanned no production files — the walk is not reaching the source it checks")
+	for _, want := range traversalSentinels {
+		if !scanned[want] {
+			t.Fatalf("the walk never scanned %s (it scanned %d files) — a canary that does not "+
+				"reach the #6701 defect sites reports nothing about them", want, filesScanned)
+		}
 	}
 
 	if len(hits) > 0 {
@@ -113,6 +112,72 @@ func TestNoIdentityFromEnvironment_6701(t *testing.T) {
 				"(real uid -> passwd), never from the caller's environment (#6701)", h.pos, h.env)
 		}
 	}
+}
+
+// traversalSentinels are repository-relative files the walk MUST have scanned.
+//
+// They are not a sample: they are the three #6701 defect sites plus this
+// package, i.e. exactly the files whose silence the canary's green result is
+// taken to mean something about.
+//
+// This exists because the previous head asserted only `filesScanned == 0`, and
+// claimed in a comment that a wrong root or a wrong suffix filter was "caught by
+// the filesScanned == 0 Fatal". Both halves were false (#6706 review r5 F8): a
+// wrong root is caught EARLIER, by the go.mod Fatal above; a wrong suffix filter
+// (`.go` -> `t.go`) leaves filesScanned in the hundreds, and a PARTIAL directory
+// skip — adding "daemon" to skipCanaryDir with a live os.Getenv("USER") planted
+// in pkg/daemon — left the Fatal inert and BOTH tests green. A total-wipeout
+// floor cannot bind a partial traversal defect; naming the files can.
+var traversalSentinels = []string{
+	"pkg/daemon/daemon_run.go", // #6701 site 1: the RBAC class
+	"pkg/cli/cli.go",           // #6701 site 2: the shell prompt
+	"cmd/cli/main.go",          // #6701 site 3: the remote prompt
+	"pkg/osident/osident.go",   // the replacement identity source
+}
+
+// skipCanaryDir reports directories the walk must not descend into.
+//
+// It is EXACTLY cmd/go's own directory rule, and the equality is the point.
+// modload/search.go excludes `.`-prefixed, `_`-prefixed and `testdata`
+// subdirectories, and prunes `vendor` separately; it has no other name-based
+// rule. The previous head also skipped `node_modules`, which cmd/go does NOT —
+// so a package under node_modules/ that `go build ./...` genuinely compiles was
+// invisible to all three #6701 canaries. Demonstrated at that head with a file
+// carrying both defect shapes (`os.Getenv("USER")` and
+// `SetUserClass("super-user")`): `go list ./...` reported it, build and vet were
+// rc 0, and every canary was green (#6706 review r5 F1).
+func skipCanaryDir(name string) bool {
+	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
+		return true
+	}
+	return name == "vendor" || name == "testdata"
+}
+
+// compiledByGoBuild reports whether the toolchain would compile path into the
+// package in its directory, asking go/build ITSELF rather than restating its
+// rule.
+//
+// `./...` excludes more than `_`/`.`-prefixed DIRECTORIES: go/build's matchFile
+// also drops `_`/`.`-prefixed FILES, files whose _GOOS/_GOARCH suffix does not
+// match, and files whose //go:build constraint is unsatisfied. The previous head
+// filtered on the `.go` suffix alone while its comment claimed the canary
+// "cannot red on code `go build ./...` never compiles". Both a
+// `pkg/osident/_scratch.go` (absent even from go list's IgnoredGoFiles) and a
+// `pkg/osident/zz_windows.go` reddened it with build and vet rc 0 — the exact
+// false red the directory half of the rule exists to prevent (#6706 review r5
+// F2).
+//
+// KNOWN LIMIT, named rather than implied: this binds the CURRENT build context.
+// A violation inside a `//go:build windows` file is not reported here — and is
+// not compiled into the appliance either, which is linux/amd64 only. A parse
+// error in the constraint means go/build cannot answer, so the file is SCANNED:
+// on an unanswerable question the guard should fire, not fall silent.
+func compiledByGoBuild(path string) bool {
+	ok, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+	if err != nil {
+		return true
+	}
+	return ok
 }
 
 // identityEnvHit is one production read of an identity-naming environment
@@ -173,12 +238,20 @@ func identityEnvHits(fset *token.FileSet, f *ast.File) []identityEnvHit {
 // of it — against a synthetic file that does read os.Getenv("USER"), and
 // requires both hits.
 //
-// What it does and does not cover, stated precisely because an earlier revision
-// of this comment claimed more: it binds the PREDICATE (selectors, literal
-// unquoting, and the identityEnvVars set — empty that map and this test reds).
-// It does NOT bind the walk's traversal. A wrong root or a wrong suffix filter
-// is caught by the `filesScanned == 0` Fatal in the test above; swallowed parse
-// errors are caught by nothing here, and remain a known gap.
+// What it does and does not cover, stated precisely because two revisions of
+// this comment have now claimed more than it checks:
+//
+//   - It binds the PREDICATE — selectors, literal unquoting, and the
+//     identityEnvVars set. Empty that map, or misspell the selectors, and this
+//     test reds while the repository walk stays green.
+//   - It does NOT bind the walk's TRAVERSAL. That is bound instead by
+//     traversalSentinels above, which names the files the walk must reach; a
+//     partial directory skip or a broken suffix filter reds there. The previous
+//     revision credited the `filesScanned == 0` Fatal with catching a wrong root
+//     and a wrong suffix filter, and it caught neither (#6706 review r5 F8).
+//   - Swallowed parse errors are caught by nothing, and remain a known gap. It
+//     is a self-limiting one: parser.ParseFile is the parser `go build` uses, so
+//     a file this walk cannot parse does not compile either.
 func TestUserEnvCanaryDetectsAViolation_6701(t *testing.T) {
 	const src = `package p
 

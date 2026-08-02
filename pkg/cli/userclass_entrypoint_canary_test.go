@@ -2,6 +2,7 @@ package cli
 
 import (
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -41,6 +42,7 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 	type call struct{ key, pos string }
 	var unexpected []call
 	seen := map[string]bool{}
+	scanned := map[string]bool{}
 	var filesScanned int
 
 	for _, root := range productionRoots(t) {
@@ -57,46 +59,30 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 				return nil
 			}
+			if !compiledByGoBuild(path) {
+				return nil
+			}
 			fset := token.NewFileSet()
 			f, perr := parser.ParseFile(fset, path, nil, 0)
 			if perr != nil {
 				return nil
 			}
 			filesScanned++
-			pkgRel := pkgRelKeyFor(path)
+			scanned[relKeyFor(root, path)] = true
 
-			var enclosing string
-			ast.Inspect(f, func(n ast.Node) bool {
-				if fn, ok := n.(*ast.FuncDecl); ok {
-					enclosing = funcKeyFor(pkgRel, fn)
-					return true
+			for _, ref := range setUserClassRefs(fset, f, pkgRelKeyFor(path)) {
+				seen[ref.key] = true
+				if _, allowed := allowedSetUserClassCallers[ref.key]; !allowed {
+					unexpected = append(unexpected, call{key: ref.key, pos: ref.pos})
 				}
-				// A SetUserClass selector in ANY position — called, or taken as
-				// a method value (`f := shell.SetUserClass`). The method-value
-				// form is a class write too, and matching only CallExpr.Fun
-				// let it walk straight past this allowlist (#6706 MINOR-4).
-				sel, ok := n.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "SetUserClass" {
-					return true
-				}
-				seen[enclosing] = true
-				if _, allowed := allowedSetUserClassCallers[enclosing]; !allowed {
-					unexpected = append(unexpected, call{
-						key: enclosing,
-						pos: fset.Position(sel.Pos()).String(),
-					})
-				}
-				return true
-			})
+			}
 			return nil
 		})
 		if err != nil {
 			t.Fatalf("walk %s: %v", root, err)
 		}
 	}
-	if filesScanned == 0 {
-		t.Fatal("scanned no production files — the walk is not reaching the source it checks")
-	}
+	requireTraversalSentinels(t, scanned, filesScanned)
 
 	for _, c := range unexpected {
 		t.Errorf("%s (%s) calls SetUserClass but is not allowlisted — every RBAC class write must "+
@@ -116,6 +102,66 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 	for _, key := range stale {
 		t.Errorf("allowlisted SetUserClass caller %q makes no such call — remove the stale entry", key)
 	}
+}
+
+// packageLevelKey is the attribution for a SetUserClass reference that is not
+// inside any function — a package-level `var x = shell.SetUserClass`. It is
+// deliberately not a valid Go identifier, so it can never collide with a
+// funcKeyFor result and can never be spelled in allowedSetUserClassCallers.
+const packageLevelKey = "<package-level declaration>"
+
+// classRef is one production reference to SetUserClass, attributed to the
+// top-level declaration that encloses it.
+type classRef struct{ key, pos string }
+
+// setUserClassRefs is THE allowlist predicate: every SetUserClass reference in
+// f, keyed by the TOP-LEVEL DECLARATION that encloses it. Both the repository
+// walk and the synthetic controls below call it, so breaking it reds the
+// controls rather than leaving them proving something about a copy (the same
+// vacuity #6706 MINOR-3 fixed for pkg/osident's canary).
+//
+// WHY IT ITERATES f.Decls INSTEAD OF TRACKING A RUNNING `enclosing`. The
+// previous version set `enclosing` on entering an *ast.FuncDecl during a single
+// ast.Inspect over the whole file and NEVER CLEARED IT. ast.Inspect visits
+// File.Decls in source order, so a *ast.GenDecl appearing after a FuncDecl was
+// attributed to that function. Appending
+//
+//	var zzRogueSetter = zzRogueShell.SetUserClass
+//	func zzBoot() { zzRogueSetter("super-user") }
+//
+// to pkg/daemon/cli_rbac.go — after the one allowlisted function — inherited the
+// key `daemon::applyCLILoginClass` and was SILENTLY ALLOWLISTED: build rc 0, vet
+// rc 0, both canaries ok. The identical declaration in a file of its own reds,
+// which isolates the cause to the carry-over rather than to the declaration form
+// (#6706 review r5 F3). The escape landed in the one file the allowlist exists
+// to fence, and the sibling dataflow canary cannot cover for it —
+// analyzeClassWrites iterates f.Decls for *ast.FuncDecl only, so a GenDecl is
+// invisible to it.
+//
+// Keying on the enclosing decl makes an unattributed reference unattributable to
+// an allowlisted key by construction, rather than by remembering to reset a
+// variable.
+func setUserClassRefs(fset *token.FileSet, f *ast.File, pkgRel string) []classRef {
+	var out []classRef
+	for _, decl := range f.Decls {
+		key := pkgRel + "::" + packageLevelKey
+		if fn, ok := decl.(*ast.FuncDecl); ok {
+			key = funcKeyFor(pkgRel, fn)
+		}
+		ast.Inspect(decl, func(n ast.Node) bool {
+			// A SetUserClass selector in ANY position — called, or taken as a
+			// method value (`f := shell.SetUserClass`). The method-value form is
+			// a class write too, and matching only CallExpr.Fun let it walk
+			// straight past this allowlist (#6706 MINOR-4).
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "SetUserClass" {
+				return true
+			}
+			out = append(out, classRef{key: key, pos: fset.Position(sel.Pos()).String()})
+			return true
+		})
+	}
+	return out
 }
 
 // classWrite is the per-function result of analyzeClassWrites.
@@ -284,10 +330,18 @@ func isResolveLoginClassCall(call *ast.CallExpr) bool {
 //
 // FAIL-ON-REVERT: replace the ResolveLoginClass call in applyCLILoginClass with
 // an inline equivalent, discard its result and pass a literal, or take a method
-// value of SetUserClass — each names the function and goes RED, while the
-// behavioural tests stay green.
+// value of SetUserClass INSIDE a function — each names the function and goes
+// RED, while the behavioural tests stay green.
+//
+// One shape this test does NOT catch, named rather than implied: a PACKAGE-LEVEL
+// `var f = shell.SetUserClass`. analyzeClassWrites iterates f.Decls for
+// *ast.FuncDecl only, so a GenDecl is invisible to it. That escape is caught by
+// the sibling allowlist canary above, which attributes such a reference to
+// `<pkg>::<package-level declaration>` — a key no allowlist entry can hold. It
+// was NOT caught by anything before #6706 review r5 F3.
 func TestSetUserClassCallersResolveThroughTheSharedResolver_6701(t *testing.T) {
 	writers := map[string]classWrite{}
+	scanned := map[string]bool{}
 	var filesScanned int
 
 	for _, root := range productionRoots(t) {
@@ -304,12 +358,16 @@ func TestSetUserClassCallersResolveThroughTheSharedResolver_6701(t *testing.T) {
 			if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 				return nil
 			}
+			if !compiledByGoBuild(path) {
+				return nil
+			}
 			fset := token.NewFileSet()
 			f, perr := parser.ParseFile(fset, path, nil, 0)
 			if perr != nil {
 				return nil
 			}
 			filesScanned++
+			scanned[relKeyFor(root, path)] = true
 			for key, cw := range analyzeClassWrites(fset, f, pkgRelKeyFor(path)) {
 				writers[key] = cw
 			}
@@ -320,9 +378,7 @@ func TestSetUserClassCallersResolveThroughTheSharedResolver_6701(t *testing.T) {
 		}
 	}
 
-	if filesScanned == 0 {
-		t.Fatal("scanned no production files — the walk is not reaching the source it checks")
-	}
+	requireTraversalSentinels(t, scanned, filesScanned)
 	if len(writers) == 0 {
 		t.Fatal("found no production caller of SetUserClass at all — the walk is not reaching " +
 			"the source it claims to check")
@@ -464,8 +520,9 @@ func recvTypeNameFor(expr ast.Expr) string {
 }
 
 // TestSetUserClassCanaryDetectsAnUnallowlistedCaller_6701 proves the walker
-// above is not vacuous: it runs the same predicate over a synthetic file that
-// reintroduces the #6701 default and requires a hit outside the allowlist.
+// above is not vacuous: it runs setUserClassRefs — the very function the walk
+// calls, not a copy of it — over a synthetic file that reintroduces the #6701
+// default, and requires a hit outside the allowlist.
 func TestSetUserClassCanaryDetectsAnUnallowlistedCaller_6701(t *testing.T) {
 	const src = `package rogue
 
@@ -484,21 +541,11 @@ func viaMethodValue(shell interface{ SetUserClass(string) }) {
 		t.Fatalf("parse synthetic: %v", err)
 	}
 	var hits []string
-	var enclosing string
-	ast.Inspect(f, func(n ast.Node) bool {
-		if fn, ok := n.(*ast.FuncDecl); ok {
-			enclosing = funcKeyFor("rogue", fn)
-			return true
+	for _, ref := range setUserClassRefs(fset, f, "rogue") {
+		if _, allowed := allowedSetUserClassCallers[ref.key]; !allowed {
+			hits = append(hits, ref.key)
 		}
-		sel, ok := n.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "SetUserClass" {
-			return true
-		}
-		if _, allowed := allowedSetUserClassCallers[enclosing]; !allowed {
-			hits = append(hits, enclosing)
-		}
-		return true
-	})
+	}
 	sort.Strings(hits)
 	want := []string{"rogue::boot", "rogue::viaMethodValue"}
 	if len(hits) != len(want) {
@@ -509,6 +556,59 @@ func viaMethodValue(shell interface{ SetUserClass(string) }) {
 		if hits[i] != want[i] {
 			t.Fatalf("synthetic detector found %v, want %v", hits, want)
 		}
+	}
+}
+
+// TestPackageLevelClassWriteIsNotAllowlistedByANeighbour_6701 is the regression
+// test for the allowlist BYPASS the #6706 r5 review demonstrated (F3).
+//
+// The synthetic source is the shape that escaped, reduced: the one allowlisted
+// function, followed in the SAME FILE by a package-level method value of
+// SetUserClass. With the old running-`enclosing` predicate the var inherited
+// `daemon::applyCLILoginClass`, matched the allowlist, and was reported by
+// nothing — appended to the real pkg/daemon/cli_rbac.go it gave build rc 0, vet
+// rc 0 and both canaries ok.
+//
+// FAIL-ON-REVERT: key setUserClassRefs on a running `enclosing` variable again
+// and this reds — the second reference is attributed to the allowlisted function
+// instead of to the package level.
+func TestPackageLevelClassWriteIsNotAllowlistedByANeighbour_6701(t *testing.T) {
+	const src = `package daemon
+
+func applyCLILoginClass(shell userClassSetter, cfg *config.Config, id osident.Identity) {
+	class, _ := cli.ResolveLoginClass(cfg.System.Login, id)
+	shell.SetUserClass(class)
+}
+
+var rogueSetter = rogueShell.SetUserClass
+
+func boot() { rogueSetter("super-user") }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parse synthetic: %v", err)
+	}
+
+	var keys []string
+	var unallowlisted []string
+	for _, ref := range setUserClassRefs(fset, f, "daemon") {
+		keys = append(keys, ref.key)
+		if _, allowed := allowedSetUserClassCallers[ref.key]; !allowed {
+			unallowlisted = append(unallowlisted, ref.key)
+		}
+	}
+	sort.Strings(keys)
+
+	wantKeys := []string{"daemon::" + packageLevelKey, "daemon::applyCLILoginClass"}
+	if len(keys) != len(wantKeys) || keys[0] != wantKeys[0] || keys[1] != wantKeys[1] {
+		t.Fatalf("setUserClassRefs attributed %v, want %v — a package-level SetUserClass "+
+			"reference must NOT inherit the key of the function declared above it, or the "+
+			"allowlist can be bypassed from inside the one file it exists to fence", keys, wantKeys)
+	}
+	if len(unallowlisted) != 1 || unallowlisted[0] != "daemon::"+packageLevelKey {
+		t.Fatalf("unallowlisted references = %v, want exactly [daemon::%s]",
+			unallowlisted, packageLevelKey)
 	}
 }
 
@@ -563,20 +663,69 @@ func isNestedModuleRoot(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// skipCanaryDir reports directories the canary walks must not descend into:
-// every dotted directory (.git, .github, and any tooling scratch or nested
-// worktree an agent leaves behind), plus the usual vendored/generated trees.
+// skipCanaryDir reports directories the canary walks must not descend into.
+//
+// It is EXACTLY cmd/go's own directory rule, and the equality is the point.
+// modload/search.go excludes `.`-prefixed, `_`-prefixed and `testdata`
+// subdirectories and prunes `vendor` separately; it has no other name-based
+// rule, in particular NO `node_modules` rule. Skipping node_modules made a
+// package `go build ./...` genuinely compiles invisible to all three #6701
+// canaries — demonstrated at the previous head with a file carrying both defect
+// shapes, `go list ./...` naming the package and every canary green (#6706
+// review r5 F1). Excluding the `_`/`.` trees is the other direction and is
+// correct: scanning them produces a red `go build ./...` and `go vet ./...`
+// disagree with (#6706 MINOR-7, reproduced with an `_scratch/` directory).
 func skipCanaryDir(name string) bool {
-	// Dotted AND underscored: `go list ./...` excludes both, so scanning either
-	// produces a red that `go build ./...` and `go vet ./...` disagree with —
-	// the same false-red class this skip exists to prevent (#6706 MINOR-7,
-	// reproduced at the previous head with an `_scratch/` directory).
 	if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") {
 		return true
 	}
-	switch name {
-	case "vendor", "testdata", "node_modules":
+	return name == "vendor" || name == "testdata"
+}
+
+// compiledByGoBuild reports whether the toolchain would compile path into the
+// package in its directory, asking go/build ITSELF rather than restating its
+// rule. Mirrors pkg/osident's copy — see it for why the `.go` suffix test alone
+// was not the `./...` rule (#6706 review r5 F2) and for the build-context limit.
+func compiledByGoBuild(path string) bool {
+	ok, err := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+	if err != nil {
 		return true
 	}
-	return false
+	return ok
+}
+
+// relKeyFor renders a walked path relative to root with forward slashes.
+func relKeyFor(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
+// traversalSentinels are repository-relative files both walks MUST have
+// scanned: the three #6701 defect sites plus the resolver and its identity
+// source. See pkg/osident's copy for why a `filesScanned == 0` floor does not
+// bind a PARTIAL traversal defect (#6706 review r5 F8).
+//
+// The allowlist's own stale-entry check already reds if pkg/daemon goes
+// unscanned, since `daemon::applyCLILoginClass` would stop being seen. This is
+// the same guarantee for the other three, and it fires with a message that names
+// the traversal rather than the allowlist.
+var traversalSentinels = []string{
+	"pkg/daemon/daemon_run.go",
+	"pkg/daemon/cli_rbac.go",
+	"pkg/cli/cli.go",
+	"pkg/cli/identity.go",
+	"cmd/cli/main.go",
+}
+
+func requireTraversalSentinels(t *testing.T, scanned map[string]bool, filesScanned int) {
+	t.Helper()
+	for _, want := range traversalSentinels {
+		if !scanned[want] {
+			t.Fatalf("the walk never scanned %s (it scanned %d files) — a canary that does not "+
+				"reach the #6701 sites reports nothing about them", want, filesScanned)
+		}
+	}
 }

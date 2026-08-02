@@ -73,14 +73,28 @@ const ClassRootDefault = "super-user"
 //  1. an EXPLICIT class on a matching `system login user` wins. An explicit
 //     class is an instruction, and honouring it can only narrow privilege.
 //
-//     "MATCHING" IS BY NAME, so this cannot win when the caller has no name.
-//     An earlier revision of this list said an explicit class wins "for any uid
-//     including 0", which is false in exactly one reachable case: uid 0 shared
-//     by two passwd accounts (the classic root/toor alias). osident then
-//     reports ReasonAmbiguousUID with an empty Name, configuredClass matches
-//     nothing, and decision 2 hands back ClassRootDefault — so
-//     `system login user toor class read-only` is NOT applied and the caller
-//     gets super-user (#6706 MINOR-5).
+//     "MATCHING" IS BY NAME — but "the caller has no name" does not mean "no
+//     match". For uid 0, candidateNames offers the literal "root" whether or
+//     not the passwd lookup resolved, precisely so that an explicit
+//     `system login user root class <c>` can still win. Driving the real
+//     resolver: uid 0 with ReasonAmbiguousUID and `user root class read-only`
+//     configured returns read-only.
+//
+//     Two earlier revisions of this list were wrong about this in opposite
+//     directions — first that an explicit class wins "for any uid including 0"
+//     (#6706 MINOR-5), then that it "cannot win when the caller has no name"
+//     (#6706 review r5 F7). The accurate statement is narrower than both: an
+//     explicit class cannot win when the caller has no name AND the stanza is
+//     written for an ALIAS other than `root`.
+//
+//     `system login user toor class read-only` on an unnamed uid 0 is not
+//     applied: configuredClass matches nothing and decision 2 hands back
+//     ClassRootDefault, so the caller gets super-user. That holds for EVERY
+//     unresolved Reason at uid 0 — ReasonAmbiguousUID, ReasonNoPasswdEntry and
+//     ReasonLookupFailed all drop the alias class identically — so it is three
+//     reachable Reasons, not the "exactly one" a previous revision claimed.
+//     TestRootAliasClassMatrix_6706 pins the whole matrix, because this
+//     paragraph has now been wrong twice.
 //
 //     This is left as-is rather than fixed, and the reason is the same one
 //     stated above: uid 0 already owns the config database, the daemon process
