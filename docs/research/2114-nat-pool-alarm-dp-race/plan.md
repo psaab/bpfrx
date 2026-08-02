@@ -1,10 +1,38 @@
 # #2114 (residual): publish `d.dp` through one synchronized accessor — plan-of-action
 
-- **Status**: DRAFT v92 — r89 folds: Codex's five minors (no
+- **Status**: DRAFT v93 — r90 folds: Codex's four minors (the
+  second consecutive all-minor round): minor-1's residual
+  "simply returns" (the corrected rule's own parenthetical
+  half-undid it — now "the `if ok` body does not run, the
+  nil-guard returns, OR the skip-and-continue proceeds", and the
+  bucket is renamed from "3 nil-guard reads" to "three
+  non-comma-ok single-value reads" — only `loader.go:591` is
+  syntactically a nil guard; `compiler.go:353` skips-and-
+  continues, `loader.go:700` is a comma-ok early return);
+  minor-2's Detach-qualification propagation (A3's and §5.1's
+  "cleanup always runs" summaries now carry the §9
+  `iface_zone_map`-seeding + absent-map-no-op qualification);
+  minor-3's signature falsehood (the mixed-method neutral-return
+  hosts are SINGLE-registry-access methods, four of six VOID —
+  `SeedNATPortCounters`, `SeedSessionIDCounter`, the two
+  internal helpers at `loader.go:909`/`:927`; only
+  `UpdatePolicyScheduleState` and `ClearZoneCounters` return
+  errors — and the v92 header's source pin is corrected: offset
+  reset `:399`, lookup `:400`); minor-4's stale count label
+  ("22 best-fit class-2 lookups" → METHODS). Codex's fold
+  results (fold-free): the census passes exactly (135 = 130
+  `m.maps` + 5 `m.programs`; 91 required + 41 optional + 3
+  writes; no stale "79 required"); fold-1/3/5 pass; the five-leg
+  hook semantics consistent. r90 verdicts: Codex
+  PLAN-NEEDS-MINOR (4m), AGY PLAN-READY, Claude SMR PLAN-READY;
+  pending convergence review r91.
+- **Prior**: DRAFT v92 — r89 folds: Codex's five minors (no
   MAJOR this round — the first all-minor Codex verdict since
   r68): minor-1's class-partition completion (`maps_nat.go:400`
   joins the class-3 hybrid assignment — `ClearNATRuleCounters`
-  resets offsets before its sole lookup at `:399`; and the
+  resets offsets (`:399`) before its sole lookup (`:400`; the
+  v92 header pin reversed these, corrected per r90 Codex
+  minor-3); and the
   "OTHER accesses are required" claim deleted — the five named
   methods each have ONLY one registry access); minor-2's
   per-site-outcome precision (the generic rule now says the
@@ -3386,7 +3414,11 @@
   references). v92 (r89 Codex's five minors: the class-3
   completion + the "other required" deletion; the per-site
   outcome precision; the §6/§8 pluralization; the Detach-oracle
-  seeding; the five-leg bookkeeping).
+  seeding; the five-leg bookkeeping). v93 (r90 Codex's four
+  minors: the "simply returns" residual + the bucket rename;
+  the Detach-qualification propagation to A3/§5.1; the
+  signature falsehood + the source-pin correction; the stale
+  "22 lookups" label).
 
 ---
 
@@ -3894,7 +3926,7 @@ class. The fold:
     master's retained behavior per class.
   - **Class 2 — neutral-outcome methods, ANY signature, WITH the
     synchronization rule (r71 Codex M1 — v72 specified the outcomes
-    but not the synchronization, leaving 22 best-fit class-2 lookups
+    but not the synchronization, leaving 22 best-fit class-2 METHODS
     racing Start)**: enter the registry helper; under `m.mu`
     classify + select atomically (the uniform rule — the
     acquire-load-then-return reading is deleted, r78 Codex M1: it
@@ -4008,7 +4040,12 @@ class. The fold:
     a `loaded`-gate would skip it, leaving stale claims a later
     `SetZone` consumes into a spurious re-flag (:851/:865). v76:
     NO `loaded` gate on this path — the delegation target is a
-    class-3-LIKE internal: the claim cleanup always runs, and its
+    class-3-LIKE internal: the claim cleanup always runs (with the
+    §9 qualification, propagated at v93 per r90 Codex minor-2: the
+    test seeds a usable `iface_zone_map`, and "always runs"
+    excludes master's absent-`iface_zone_map` no-op at
+    `loader.go:700` and the discovery-failure preservation paths),
+    and its
     `m.maps` lookups take scoped `m.mu` sections (the class-3
     mechanism). `DetachXDP`'s single manifest label is category G
     (its direct access is the construction link map) with the
@@ -4348,7 +4385,10 @@ convergence on the seed before any implementation of G/H/H2.
   helper scheme (trio + the `swapXDPEntryProg` :632 write under a
   scoped section, never whole-method); `DetachXDP`'s mixed shape
   (category-G absent-link nil + the class-3-LIKE delegation target —
-  scoped `m.mu` lookups, cleanup always runs, no `loaded` gate;
+  scoped `m.mu` lookups, cleanup always runs (with the same §9
+  qualification, propagated at v93 per r90 Codex minor-2 — a usable
+  `iface_zone_map` seeded, the absent-map no-op excluded), no
+  `loaded` gate;
   v76 corrected the v75 text's stale class-2 reference here, r75
   Codex m1);
   `SwapToUserspaceXDPShimEntryProgram` (:604) is class 1 (its
@@ -5099,8 +5139,12 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    syntactically a nil guard)). The matrix row governs a class-1
    method's
    REQUIRED accesses; an OPTIONAL access inside ANY class keeps
-   master's exact per-site outcome (the `if ok` body simply does
-   not run; the nil-guard simply returns) — only the helper wraps
+   master's exact per-site outcome — the `if ok` body does not
+   run, the nil-guard returns, OR the skip-and-continue proceeds
+   past the skipped block (v93 precision per r90 Codex minor-1 —
+   the parenthetical's "simply returns" half-undid the v92 rule
+   change; `compiler.go:353` CONTINUES past the skipped
+   redirect-map population) — only the helper wraps
    the lookup, never the outcome. THE MIXED-SITE INVENTORY (the
    complete MIXED / MULTI-ACCESS subset — 14 optional-if-ok reads +
    3 nil-guard reads = 17 sites; the count and the scoping
@@ -5124,12 +5168,19 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `SessionCount`) and `:337` (sessions_v6, same); and
    `loader.go:730` (vlan_iface_map, inside `setXDPAttachedFlag`,
    reached deferred from `AttachXDP`'s claim propagation); the
-   nil-guard reads `compiler.go:353`
-   (`redirect_capable`, inside the classified `Compile`),
+   three non-comma-ok single-value reads (v93 bucket rename per
+   r90 Codex minor-1 — v90 called all three "nil-guard reads",
+   but only `loader.go:591` is syntactically a nil guard):
+   `compiler.go:353`
+   (`redirect_capable`, inside the classified `Compile` — absent
+   SKIPS the redirect-map population and CONTINUES into the
+   attachment work at `:368`, it does not return),
    `loader.go:591` (`interface_counters`, inside
-   `seedInterfaceCounter`, called from `AttachXDP`/`AddTxPort`),
+   `seedInterfaceCounter`, called from `AttachXDP`/`AddTxPort` —
+   a true nil-guard return),
    and `loader.go:700` (`iface_zone_map`, inside
-   `setXDPAttachedFlag` — absent means early-boot no-op success,
+   `setXDPAttachedFlag` — a comma-ok early return: absent means
+   early-boot no-op success,
    the comment at :701-703 pins it). The composition matters
    (r87 Codex M1; the AttachXDP chain qualified at v91 per r88
    Codex M1 — the full sequence occurs on a SUCCESSFUL FRESH
@@ -5176,7 +5227,15 @@ vet, the full Go/Rust suites, smoke) run for BOTH units.*
    `maps_policy.go:253` policy_rules, `maps_session.go:612`
    session_id_gen, `loader.go:910`/`:928` iface_zone_map,
    `maps_counters.go:233` zone_counters) are inside
-   error-signature methods
+   single-registry-access methods (v93 correction per r90 Codex
+   minor-3 — v92's "inside error-signature methods" is FALSE for
+   four of the six hosts: `SeedNATPortCounters`
+   (`maps_nat.go:434`), `SeedSessionIDCounter`
+   (`maps_session.go:611`), and the two internal helpers
+   `clearNativeXDPFlags`/`clearNativeXDPFlagsForIfindexes`
+   (`loader.go:909`/`:927`) are VOID; only
+   `UpdatePolicyScheduleState` and `ClearZoneCounters` return
+   errors)
    (v92 correction per r89 Codex minor-1 — v91 said their "OTHER
    accesses are required", which is FALSE: `ClearNATRuleCounters`,
    `ClearZoneCounters`, `SeedNATPortCounters`,
@@ -5833,7 +5892,13 @@ Still open:
    (`maps_counters.go:181`/`:233` + `maps_nat.go:400`), the
    per-site outcome rule (skip/return/continue preserved), the
    Detach-oracle `iface_zone_map` seeding, and the five-leg
-   oracle set.
+   oracle set; r90's four minors (the "simply returns" residual,
+   the Detach-qualification propagation, the signature
+   falsehood, the stale count label) landed in v93. Each
+   reviewer: verify the per-site outcome rule's three-way
+   phrasing (skip / return / continue), the A3+§5.1+§9 Detach
+   consistency, the void-host enumeration, and the census
+   labels.
 
 ---
 
