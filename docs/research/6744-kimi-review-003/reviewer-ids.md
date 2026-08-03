@@ -109,3 +109,24 @@ SMR-method review returned `PLAN-NEEDS-MAJOR`. The blocking roots are confirm
 recovery classification/order, DDNS endpoint/provenance completeness, existing
 SNMP compatibility and rejected-only diagnostics, the RG product domain and
 mixed-version contract, and public `LoadOverride` behavior.
+
+### Round 6 - plan commit `cab8851171889b6e97d518d6fe9540341fc942f7`
+
+- Codex direct hostile review: process session `57655`; reviewer session
+  `019fc7f3-5ec3-7363-a309-c78d0d6b6e3b`; verdict
+  `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: valid output `/tmp/6744-agy-r6d.out`; verdict
+  `PLAN-NEEDS-MAJOR`. Three earlier invocations produced option-help or
+  permission-denied output and are not counted.
+- Claude Code CLI: process session `31570`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic verdict exists.
+- Independent SMR-method fallback: process session `97542`; reviewer session
+  `019fc7f3-a8e6-7991-b571-a6278971328a`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic model
+  review.
+
+Round 6 converged only on rejection, not on a terminal `PLAN-KILL`: all valid
+reviewers returned `PLAN-NEEDS-MAJOR`. The generalized DDNS teardown protocol,
+commit-confirm transaction, SNMP normalization transport, and RG control versus
+dataplane inventory require another design round. The narrow source-report
+fixes remain viable.
