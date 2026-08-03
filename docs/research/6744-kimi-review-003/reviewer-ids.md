@@ -228,3 +228,26 @@ repair, authority-generation races, setup-auth ambiguity, readiness callback
 ABA, request record-before-send, and unbounded request pressure. AGY's
 `PLAN-READY` missed these executable traces. Revision 11 incorporates every
 valid finding before another immutable review round.
+
+### Round 11 - plan commit `e316e5b0c193f844289a6a6aeb505929108a550a`
+
+- Codex direct hostile review: process session `65605`; reviewer session
+  `019fc8a5-a289-7480-88b9-e470983d8faf`; valid output
+  `/tmp/6744-codex-r11.out`; verdict `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: process session `48585`; valid output
+  `/tmp/6744-agy-r11b.out`; verdict `PLAN-READY`. Earlier session `29720` was
+  permission-denied before analysis and is not counted.
+- Claude Code CLI: process session `6546`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic-model verdict exists. An earlier
+  malformed invocation produced no review and is not counted.
+- Independent SMR-method fallback agent:
+  `019fc8a6-0743-7dd3-8f23-d26873d7c21b`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic-model
+  review.
+
+Round 11 did not converge. Codex and the independent SMR-method fallback found
+material config-replay ownership, all-RG authority, helper-status debt,
+setup/protocol-worker lifetime, cluster-comms restart, notifier ordering,
+exact bulk-token, callback self-transition, and raw-actuator gaps. AGY's
+`PLAN-READY` missed those source-backed executable traces. Revision 12 closes
+the complete union before another immutable review round.
