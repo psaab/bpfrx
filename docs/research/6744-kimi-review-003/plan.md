@@ -2,13 +2,13 @@
 
 ## 1. Status
 
-**DRAFT v10 - round-nine major findings addressed; pending round-ten review**
+**DRAFT v11 - round-ten major findings addressed; pending round-eleven review**
 
 - Issue: [#6744](https://github.com/psaab/xpf/issues/6744)
 - Source report: `/tmp/kimi-review-003.md`
 - Base: `origin/master` at `ad959117748181dabe46b8ddc2827de670380cea`
 - Branch: `research/6744-kimi-review-003`
-- Revision: 10
+- Revision: 11
 - Round-one plan SHA: `78891c3242a80b719bebdddc702087c07543e05b`
 - Round-two plan SHA: `01b67530e53016cf127d43c4a28c0582513718f8`
 - Round-one verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
@@ -96,6 +96,19 @@
   connection, joins cancellable reconciliation, fences every used outbound
   connection, makes capable cold sync receiver-requested, and splits activation
   into an inactive-first implementation stack.
+- Round-ten plan SHA:
+  `103acbfd28115993f8f6393ed6b55d632bcfb4ee`.
+- Round-ten verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
+  `PLAN-READY`; independent SMR-method fallback
+  `PLAN-NEEDS-MAJOR`. The Claude Code CLI again failed before analysis at the
+  account spend limit, so no Anthropic-model verdict is claimed. Round ten did
+  not converge; revision 11 moves transport restart and retirement outside
+  joined workers, makes config callbacks cancellable and authority-transactional,
+  separates raw RG0 election state from committed authority, serializes every
+  direct HA actuator with inventory debt, orders ACK/config writes, owns queued
+  peer requests, repairs both session directions after config, and closes
+  readiness, setup, request-send, and resync-pressure races found in the hostile
+  composition pass.
 - Mode: `/research`. Stop at `PLAN-READY` or `PLAN-KILL`. Do not write
   production code and do not open a pull request.
 
@@ -1143,7 +1156,8 @@ type haInventoryDebt struct {
     desiredConfigGeneration uint64
     desiredOwners           map[int]HAGroupState
     stagedHelperGroups      []HAGroupState
-    pinnedFencedSlots       bitset16
+    requiredFenceSlots      bitset16
+    confirmedFenceSlots     bitset16
     nextAttempt             time.Time
     backoff                 time.Duration
 }
@@ -1151,15 +1165,53 @@ type haInventoryDebt struct {
 
 The manager atomically installs or supersedes this whole debt under its HA
 state mutex; a newer desired config generation replaces the older snapshot,
-while an older retry can never publish over it. The userspace status/reconcile
+but its required fence set is recomputed from the last **published** inventory
+to the newest desired inventory and unions every older unconfirmed fence. It
+never drops an uncertain clear merely because an intermediate desired
+generation was superseded. The helper payload is always rebuilt from only the
+newest desired generation, and an older retry can never publish over it. The userspace status/reconcile
 loop is the sole retry consumer. While clustered debt exists, ordinary status
 refresh must not source helper state from `m.haGroups`, rearm active/watchdog
-state, publish forwarding ready, or advertise the staged inventory. It retries
-the debt's explicit payload after confirming every recorded fence. Success
+state, publish forwarding ready, or advertise the staged inventory. It first
+retries every `requiredFenceSlots - confirmedFenceSlots` clear (both inactive
+and watchdog writes are idempotent), sets a confirmed bit only after both writes
+succeed for that slot, and sends the helper
+replacement only after all required bits are confirmed. Success
 publishes `desiredOwners` and clears only the matching generation. Failure
 retains the full snapshot, advances bounded backoff, disarms the helper, and
 keeps forwarding degraded/fail-closed. Shutdown drains or persists no new disk
 format; it leaves all debt-owned slots fenced.
+
+A dedicated `haInventoryTxnMu` serializes initial transition, retry helper I/O,
+config-generation supersession, **and every** direct HA actuator/helper writer,
+including `UpdateRGActive`, `UpdateHAWatchdog`, status reconciliation, shutdown
+fencing, and readiness publication. Its only nested order is
+`haInventoryTxnMu -> manager HA state mutex`: code snapshots/updates debt,
+releases the state mutex, performs fences/helper RPC while retaining only the
+transaction mutex, then reacquires the state mutex only to publish the exact
+generation. A new config waits for an older helper
+RPC to finish before installing/superseding debt, so a late full-replacement RPC
+cannot overwrite a newer desired generation in the helper even if its Go
+completion is rejected. No map write may occur before acquiring this mutex.
+
+While debt exists, a direct positive active/watchdog request is rejected with a
+typed retryable `ErrHAInventoryTransition` **before** either pinned-map write or
+helper publication. The daemon retains its level-triggered desired RG state and
+re-drives it after the exact debt generation clears; the periodic watchdog path
+also naturally retries. A negative request may clear/fence a still-required
+slot, but it folds that result into the matching debt and never constructs a
+helper payload from the old published `m.haGroups`. A request for a slot absent
+from the newest desired inventory is rejected even if the slot remains present
+in the previous published inventory. Debt success wakes one level-triggered
+actuator reconciliation before forwarding-ready publication. Tests pause each
+direct writer both before and after its mutex acquisition while a removal debt
+is installed and prove no old active/watchdog/helper state can reappear.
+
+Normal status publication and helper backstops take the transaction mutex too;
+they either observe no debt and one published inventory or observe debt and emit
+only degraded/fenced state. A source canary enumerates every production writer
+of `rg_active`, `ha_watchdog`, `m.haGroups`, and `update_ha_state` and requires it
+to route through this transaction boundary.
 
 Only after every pinned fence and the full replacement succeed may the manager
 publish the new bound inventory and normal helper state. Retry never replays an
@@ -1228,8 +1280,11 @@ The method also installs config, peer, bulk, and role callbacks. It deep-copies
 map is not confused with an unwired runtime. `Start` fails before binding if the
 runtime, callbacks, role, or zone-owner snapshot has not been initialized.
 Initial config apply obtains the current `d.applyResult()` zone map and passes
-it into this method before `Start`; subsequent apply updates use the same typed
-setter. `BulkStart` is refused without ACK, callback, reconciliation, or
+it into this method before `Start`. Subsequent changes are transactional, not a
+reentrant setter: a local apply begins a gate transition before arming the new
+config and completes it only on full apply success; a peer callback returns the
+typed authority delta in `ConfigApplyOutcome` for the config loop to commit with
+the exact callback lease. `BulkStart` is refused without ACK, callback, reconciliation, or
 readiness if initialization is absent. Sweep and event-stream producers also
 start only after initialization and successful `Start`.
 
@@ -1259,6 +1314,7 @@ type configApplyLease struct {
     transportEpoch uint64
     peerProcessID  [16]byte
     roleGeneration uint64
+    authoritySerial uint64
     configGen      uint64
 }
 
@@ -1267,8 +1323,43 @@ type repairAttempt struct {
     transportEpoch        uint64
     connectionIncarnation uint64
     roleGeneration        uint64
+    authoritySerial       uint64
+    authorityGeneration   uint64
     debtGeneration        uint64
     deadline              time.Time
+    phase                 requestAttemptPhase // writing, awaiting, or bound
+}
+
+type pendingPeerBulkRequest struct {
+    requestID                    uint64
+    transportEpoch               uint64
+    connectionIncarnation        uint64
+    roleGeneration               uint64
+    authoritySerial              uint64
+    authorityGeneration          uint64
+    notBeforeAcceptedConfigGen   uint64
+}
+
+type SessionSyncAuthorityDelta struct {
+    ConfigSyncEnabled bool
+    ZoneOwners        map[uint16]bool
+}
+
+type ConfigApplyOutcome struct {
+    Authority          SessionSyncAuthorityDelta
+    RestartClusterComms bool
+}
+
+type ConfigApplyFailure struct {
+    Stage ConfigMutationStage // pre-promotion, promoted, or armed
+    Err   error
+}
+
+type transportRetireRequest struct {
+    transportEpoch uint64
+    connIncarnation uint64
+    wholeTransport bool
+    reason          transportRetireReason
 }
 
 type configInstallGate struct {
@@ -1280,17 +1371,26 @@ type configInstallGate struct {
     transitioning         bool
     drainingTransport     bool
     baselinePending       bool
+    continuityReady       bool
+    previousGoodContinuity bool
+    continuityEventSeq    uint64
     applying              *configApplyLease
     receiveWindow         *bulkReceiveWindow
     transportEpoch        uint64
     peerProcessID         [16]byte
     roleGeneration        uint64
     transitionSerial      uint64
+    managerAuthoritySerial uint64
+    outboundAuthorityGeneration uint64
     acceptedConfigGen     uint64
     inFlightInstalls      uint64
     debtGeneration        uint64
     completedDebt         uint64
-    awaitingAttempt       *repairAttempt
+    requestAttempt        *repairAttempt
+    pendingPeerRequest    *pendingPeerBulkRequest
+    pendingReceiveAck     *receiveAckCommit
+    authorityApplyFailed  bool
+    inboundBulkAuthorized bool
     outboundBulkAuthorized bool
 }
 
@@ -1301,6 +1401,8 @@ type bulkReceiveWindow struct {
     transportEpoch        uint64
     peerProcessID         [16]byte
     roleGeneration        uint64
+    authoritySerial       uint64
+    authorityGeneration   uint64
     configGen             uint64
     bulkEpoch             uint64
     requestID             uint64
@@ -1310,16 +1412,34 @@ type bulkReceiveWindow struct {
     zoneOwners            map[uint16]bool
     cancelReconcile       context.CancelFunc
 }
+
+type receiveAckCommit struct {
+    serial                uint64
+    connIncarnation       uint64
+    transportEpoch        uint64
+    peerProcessID         [16]byte
+    roleGeneration        uint64
+    authoritySerial       uint64
+    authorityGeneration   uint64
+    configGen             uint64
+    bulkEpoch             uint64
+    requestID             uint64
+    claimedDebtGeneration uint64
+}
 ```
 
 The connection registry and exact setup state remain under `s.mu`. The only
-permitted nested lock orders are `s.mu -> gate.mu` and
-`bulkSendMu -> producerMu`; no other mutex is nested. In particular, the gate
+permitted nested lock orders are `s.mu -> gate.mu`,
+`bulkSendMu -> producerMu`, and the narrowly bounded pre-write revalidation
+edge `writeMu -> s.mu -> gate.mu`; no other mutex is nested. No path waits for
+`writeMu` while holding `s.mu` or `gate.mu`. In particular, the gate
 is the sole owner of `receiveWindow`, membership, and reconciliation phase;
 `bulkMu` is removed as an independent authority. Writer, pending-ACK,
-delete-journal, and helper locks are acquired only after any gate/registry lock
-is released. No network/dataplane/helper I/O, callback, cancellation wait, or
-condition wait occurs while a mutex is held.
+delete-journal, and helper locks are otherwise acquired only after any
+gate/registry lock is released. The narrow revalidation releases both state
+locks before retaining `writeMu` for network output. No network/dataplane/helper
+I/O, callback, cancellation wait, or condition wait occurs while a state mutex
+is held.
 
 Frame admission takes `s.mu -> gate.mu`, verifies the exact registered
 connection, and returns an immutable lease. Session-install completion takes
@@ -1344,48 +1464,198 @@ separate automatic peer-loss doctrine; it cannot satisfy current continuity or
 manual readiness. Thus an old callback may finish as
 previous-good, but cannot overlap or clear the new transport's baseline.
 
-Every RG0 actuator path uses one daemon wrapper; direct positive RG0 actuation
-outside it is rejected by a source canary. This includes both
-`watchClusterEvents` and the dropped-event safety-net reconciliation path. The
-wrapper calls:
+That drain is owned by one lifecycle coordinator which is **not** a member of
+the data-worker wait group. Receive loops, heartbeat/write workers, protocol
+handlers, config callbacks, and bulk workers never call a joining retirement
+path inline. On EOF, protocol violation, or ambiguous write, they atomically
+record a bounded `transportRetireRequest`, wake the coordinator through a
+coalescing channel, and return to their per-worker completion handle. Under
+`s.mu -> gate.mu`, the coordinator removes the exact connection or marks the
+whole transport draining, prevents new worker registration/`WaitGroup.Add`,
+snapshots cancellation handles, then releases locks, cancels, and joins the
+closed worker set. Multiple requests for one epoch coalesce toward whole-
+transport retirement; an older epoch cannot retire a replacement.
+
+External `Stop` submits a terminal request, waits for the coordinator's reply,
+then joins the coordinator itself. The daemon post-config restart worker is also
+external to this ownership tree. This separates `dataWG` from
+`lifecycleDone`: a receive loop can cause its own retirement but can never wait
+for its deferred `Done`, and a config callback can request a future restart but
+cannot stop its own `SessionSync`. Registration, drain, and shutdown tests use
+per-worker handles rather than a timing-based five-second escape.
+
+Raw election state cannot be the authorization state. Add one immutable,
+atomically published `RG0AuthoritySnapshot` owned by `cluster.Manager`:
 
 ```go
-token := ss.BeginConfigAuthorityTransition(newRole, configSyncEnabled)
-// Demotion may apply idempotent fail-closed traffic fences here.
-err := ss.CompleteConfigAuthorityTransition(ctx, token)
-// Only a current successful token may publish role/ownership or positive acts.
+type RG0AuthoritySnapshot struct {
+    Serial        uint64
+    Desired       RG0AuthorityRole
+    Committed     RG0AuthorityRole
+    Transitioning bool
+}
 ```
 
-`Begin` increments a separate `transitionSerial`, marks transitioning, closes
-admission and outbound producers, cancels the old-role bulk/reconcile contexts,
-invalidates repair bindings, sets current continuity false, and returns that
-serial without waiting under a lock. It does **not** advance `roleGeneration`
-while an admitted config callback can still mutate the store. The callback may
-finish and publish under the unchanged old role; no new callback can enter.
-`Complete` first joins every old-role operation, then atomically verifies the
-transition serial and advances `roleGeneration` while committing the new role/
-protection state. On demotion, only
-negative traffic removal (inactive RG, blackhole, VIP withdrawal, VRRP resign)
-may run before completion; cluster role publication, store ownership, config
-acceptance, readiness, helper rearm, config push, and every positive act wait.
-Promotion performs no forwarding, VIP, VRRP, store, config-write, or config-push
-act before completion. Timeout leaves forwarding fenced and the transition
-pending without allowing a completion to straddle the role-generation change. A single
-level-triggered desired-RG0 slot is retried with bounded backoff; a newer desired
-state supersedes the target but must pass the same wrapper. Event and safety-net
-paths therefore cannot bypass each other or consume a failed transition.
+For RG0, the election state machine publishes a new nonzero serial with
+`Transitioning=true` **under the manager mutex before** it writes `rg.State` or
+emits the event. The snapshot retains the previous committed role for wire
+serialization, but `CommittedRG0Authority()` returns unknown/fail-closed while
+`Transitioning` on both promotion and demotion. Session frame/config
+admission reads this immutable snapshot without taking the manager mutex and
+requires the exact serial to match its gate lease. Every authority-sensitive
+consumer (config push/write, store ownership, heartbeat/readiness publication,
+forwarding/VIP/VRRP/helper positive act, and session admission) uses a new
+`CommittedRG0Authority()` accessor, never raw `IsLocalPrimary(0)`. Raw election
+state remains available only to election mechanics and explicitly labelled
+observability. A source canary enumerates and rejects raw RG0 role reads in all
+authority-sensitive packages.
+
+The RG0 heartbeat row is derived from the snapshot, not `rg.State`. During a
+transition it continues advertising the **previous committed** primary or
+secondary role until local drain/fencing and both exact commits complete; this
+prevents the peer from promoting on a demotion that has not yet removed local
+forwarding. Boot with no prior committed role advertises the existing
+`StateSecondaryHold`. After commit, heartbeat atomically switches to the new
+role. Other RG rows retain their existing encoding. Operational status shows
+desired/raw, transitioning serial, and committed/advertised RG0 state separately
+so the deliberate lag is diagnosable.
+
+The manager starts with an unknown, transitioning snapshot. Authority
+initialization reconciles the already-computed raw role into SessionSync before
+publishing the first committed snapshot, so boot cannot expose positive
+authority during wiring. A dropped event cannot restore authority: the
+level-triggered safety-net sees the pending serial directly from the manager.
+
+Every RG0 actuator path then uses one daemon coordinator shared by
+`watchClusterEvents` and that safety net:
+
+```go
+token := ss.BeginConfigAuthorityTransition(snapshot.Serial, snapshot.Desired,
+    configSyncEnabled)
+// Demotion may apply idempotent fail-closed traffic fences here.
+err := ss.CompleteConfigAuthorityTransition(ctx, token)
+err = cluster.CommitRG0Authority(snapshot.Serial, snapshot.Desired)
+// Only both exact commits may publish role ownership or positive acts.
+```
+
+`Begin` claims the manager-published serial, marks the SessionSync gate
+transitioning, closes admission and outbound producers, cancels the old-role
+bulk/reconcile contexts, invalidates repair bindings, sets current continuity
+false, increments `outboundAuthorityGeneration`, and returns without waiting
+under a lock. Config-sync-mode change and every local/received config authority
+transaction increment that same generation before canceling work. It does **not** advance
+`roleGeneration` while an admitted config callback can still mutate the store.
+The callback may finish under the unchanged old gate role, but raw election
+promotion still grants no authority because the shared manager snapshot is
+transitioning. `Complete` joins every old-role operation, atomically verifies
+the serial, and advances `roleGeneration`; only then may
+`CommitRG0Authority` publish the same serial as committed. If either token is
+superseded, both layers stay fail-closed and the level-triggered coordinator
+retries the newest desired snapshot.
+
+On demotion, only negative traffic removal (inactive RG, blackhole, VIP
+withdrawal, VRRP resign) may run before completion. Store ownership, config
+acceptance/readiness, helper rearm, config push, and every positive act wait for
+both commits. Promotion likewise performs no forwarding, VIP, VRRP, store,
+config-write, or config-push act before both commits. Timeout leaves forwarding
+fenced and the transition pending. One desired-RG0 slot coalesces newer serials
+and retries with bounded backoff; event and safety-net paths cannot bypass each
+other or consume a failed transition.
 
 The config handler resolves the exact source registration before changing any
 high-water. Admission closes the session gate and waits for admitted installs.
 Within one transport/process, nonzero config generations increase strictly;
 the first protected baseline in a new transport may establish a lower rebooted
 peer generation. Protected generation zero is never authoritative. A successful
-callback publishes through its `configApplyLease`; failure keeps baseline and
-previous-good state and blocks manual transfer. A config send on the authority
-side cancels/drains an outbound bulk, clears `outboundBulkAuthorized`, closes the
-producer gate, and sends the config before any session at the new generation.
-The receiver issues a fresh bulk request only after that exact config callback
-succeeds. The sender cannot use `OnPeerConnected` cold-prime as a substitute.
+callback has the internal signature
+`func(context.Context, string) (ConfigApplyOutcome, error)`, returns a
+`ConfigApplyOutcome`, and publishes the deep-copied
+authority delta through its exact `configApplyLease`; no callback invokes a
+SessionSync authority setter while it is itself admitted. The gate atomically
+commits `acceptedConfigGen`, `ConfigSyncEnabled`, and `ZoneOwners` only after the
+callback returns nil and the transport/process/role/manager-authority serial all
+still match. `acceptedConfigGen` is the authoritative high-water; the existing
+atomic last-applied value becomes an observability mirror updated inside that
+same closed-admission commit before the gate reopens. There is no interval in
+which session admission sees new authority with an old accepted generation (or
+the inverse). Failure keeps baseline and previous-good state, sets
+`authorityApplyFailed`, and leaves **all** config/session/bulk admission
+fail-closed until the same generation succeeds or the transport is retired. It
+does not restore old authority, because `SyncApply` may already have promoted or
+partially armed the incoming config. After recording diagnostics, a failed peer
+callback retires the transport so reconnect re-pushes the same unadvanced
+generation; it does not wait indefinitely for a future unrelated commit.
+
+The context belongs to the admitted apply lease. Last-fabric loss, role/config
+supersession, and Stop cancel it. `syncAndApply` passes that context to
+`applySem.Acquire`, `applyConfigLocked`, and every potentially blocking tail;
+it never substitutes `context.Background`. Local operations that cannot accept
+a context use an explicit bounded deadline. The callback returns a typed
+`ConfigApplyFailure` identifying whether cancellation/error happened before
+promotion, after `SyncApply` promotion, or after dataplane arm. Pre-promotion
+failure is mutation-free. A promoted/armed failure is never abandoned: all
+suboperations cease before callback return, the active digest remains unmarked,
+authority remains failed/closed, and reconnect must reapply that exact active
+text before establishing a baseline. No replacement authority may overlap a
+still-mutating callback, but bounded cancellation guarantees the join itself is
+not an unbounded dependency on an opaque operation.
+
+Local commit/rollback paths use the symmetric transaction: derive the delta
+from the compiled candidate, begin and drain the authority gate before arming
+it, then commit the delta only after the full apply succeeds. A fatal or
+best-effort tail error leaves the gate failed/closed and level-triggers a retry;
+no path publishes new zone ownership or config-sync mode midway through
+`applyConfigLocked`.
+
+Transport restart is an outcome, never an action performed from
+`OnConfigReceived`. After lease publication and high-water advancement, the
+config loop sends a nonblocking, level-triggered `ConfigCommitEvent` to a
+daemon-owned restart coordinator that is outside `SessionSync.wg`. The event is
+keyed by applied config generation/digest and carries only
+`RestartClusterComms`; the coordinator derives the latest transport from the
+active compiled config, coalesces newer events, then calls
+`stopClusterComms/startClusterComms`. The wake channel may coalesce but the
+desired state cannot be dropped. Consequently `Stop` can cancel and join the
+config loop without that loop synchronously waiting for itself. A stale event
+cannot restart an older transport over a newer applied generation.
+
+Config receive records the frame high-water only after exact source admission.
+If the ordered apply queue cannot accept that frame, the closed authority gate
+does not linger waiting for an unrelated commit: it records repair/error debt
+and asks the lifecycle coordinator to retire the transport, forcing the same
+unaccepted generation to be re-pushed on reconnect.
+
+A config send on the authority
+side first increments `outboundAuthorityGeneration` under `gate.mu`, clears
+both bulk-authorized directions, closes the producer gate, and snapshots/cancels
+any outbound bulk, inbound window, pending peer request, pending receive ACK,
+and request attempt. It also clears current continuity, retains
+previous-good, arms repair, and queues the ordered false notification. After
+releasing the gate it joins those
+workers, then writes the config followed on the **same exact connection** by a
+fresh nonzero type-29 request for the peer's post-config owned-session snapshot;
+that request attempt is recorded before either write.
+It holds the SessionSync `writeMu` once across both bounded writes so no other
+frame can separate their TCP order. The pair is one authority-write transaction:
+failure of either write retires the transport. BulkSync captures this generation in
+its immutable token and revalidates it before every barrier set and BulkStart;
+a config writer that wins any race therefore prevents the old bulk marker.
+
+Config-frame admission on the receiver performs the same local cancellation and
+increments the same `outboundAuthorityGeneration`, clears both authorization
+directions/current continuity, and invalidates pending ACK/request state before
+invoking the callback. Because the
+following request is received in TCP order, its sender tuple captures
+`notBeforeAcceptedConfigGen = lastRecvConfigGen` and cannot trigger an outbound
+bulk until that generation applies. After the exact config callback succeeds,
+the receiver (a) may service that pending peer request with its own post-config
+snapshot and (b) issues a reciprocal fresh request for the authority's snapshot.
+Thus active/active ownership converges both directions; failure leaves both
+producer/continuity gates closed. The sender cannot use `OnPeerConnected`
+cold-prime as a substitute.
+The paired request/producer closure applies only to a fully capable transport.
+Legacy mixed transport retains current config plus ordinary incremental
+behavior, emits no type 29/bulk, and remains continuity/manual-transfer unready.
 
 Session install admission precedes per-key ordering and membership. It rejects
 and increments repair debt when initialization/connection/transport/role is
@@ -1411,6 +1681,10 @@ connection, every upgraded build, keyed or unkeyed, writes one capability frame
 as its first post-auth frame and then reads the peer's first post-auth frame
 under a bounded setup deadline. A frame already consumed by authentication is
 staged into this same step. The frame is never dispatched before registration.
+If an unkeyed local no-op handshake encounters an old keyed peer's HELLO/PROOF
+in this step, the setup parser consumes it under the existing dual-accept rules
+and continues reading; auth frames neither classify the peer legacy nor enter
+`handleMessage`. Repeated/unexpected auth setup still shares the same deadline.
 The existing `beginSetup` admission slot remains held through capability
 resolution and `finishSetup` runs exactly once afterward; the new deadline
 therefore cannot create an unbounded post-auth setup/socket-buffer population.
@@ -1468,7 +1742,7 @@ authorization remains current; config send, role change, last-fabric loss, or
 capability/process change clears it. A repair request is pinned to the exact
 capable source connection. If that connection disappears, its request expires
 and the transport is retired; the sender never silently moves it to preferred
-fabric 0. `awaitingAttempt` has a bounded deadline; expiry re-arms the same debt
+fabric 0. `requestAttempt` has a bounded deadline; expiry re-arms the same debt
 generation and emits a new unique request on a current capable connection.
 
 The outbound queue is typed. One `producerMu` linearizes every session producer's
@@ -1489,6 +1763,8 @@ exact incarnation. Revalidate the frozen registry after all ACKs before writing
 BulkStart. A joining fabric cannot carry session traffic until the producer gate
 reopens. This fences late receive-loop ordering on both fabrics and prevents a
 frame written to a now-disconnected connection from appearing after the bulk.
+The same revalidation includes `outboundAuthorityGeneration`; config send can
+never land between the final fence proof and an old-generation BulkStart.
 
 The selected bulk connection is the request connection for a requested/repair
 bulk; an authorized request-ID-zero bulk may choose a still-frozen member.
@@ -1511,7 +1787,16 @@ All abort paths reopen producers and retain enough debt to force convergence.
 The gate is the sole receive-window state machine. BulkStart is authoritative
 only on an initialized, current, capable connection and only when admission is
 open. A requested bulk must echo the exact nonzero request ID; an ordinary
-request-ID-zero bulk is accepted only after current-transport authorization.
+request-ID-zero bulk is accepted only after independent
+`inboundBulkAuthorized` is true. Receiver authorization becomes true only when
+the ACK precommit for a matching requested bulk is installed. It is provisional
+and token-bound until ACK write success; write failure clears it and retires the
+transport. This lets traffic causally released by a delivered ACK enter without
+claiming continuity early. Config
+send and config-frame admission clear both authorization directions before
+write/apply. Role/config-sync change, last-fabric loss, or capability/process
+change also clears both before new traffic. Sender ACK success never directly sets the
+receiver bit, and receiver reconcile success never directly sets the sender bit.
 Repair BulkStart/BulkEnd use the exact 16-byte little-endian
 `{bulkEpoch uint64, requestID uint64}` form. Other marker lengths are malformed.
 
@@ -1528,7 +1813,13 @@ and the initialized zone snapshot, creates a SessionSync-owned child context,
 and runs reconciliation outside every lock in one joined worker. Extend the
 internal cluster-session adapter to
 `ReconcileClusterBulk(context.Context, ClusterBulkReconcileInput)`; every
-implementation must observe cancellation between iterator/delete operations.
+implementation must observe cancellation during iteration and between bounded
+delete chunks. The shared adapter checks `ctx.Err()` in each iterator callback,
+records cancellation after an early stop, and deletes stale rows in fixed
+256-entry v4/v6 chunks with a context check between chunks; each userspace
+helper request retains its existing RPC deadline. Cancellation returns a typed
+error even if the underlying iterator's early-stop return is nil. This replaces
+the current unbounded one-call `DeleteBatchKnownV4/V6(stale)` shape.
 `Stop` cancels and joins this worker before dataplane teardown and may not use
 the current five-second abandon path. Disconnect, config apply, and role change
 also cancel and join before admitting a replacement authority.
@@ -1538,16 +1829,50 @@ nested/mismatched marker, cancellation, iterator error, or delete error fails
 the window. Earlier valid installed members may remain, but failure publishes no
 BulkAck, `bulkEverCompleted`, bulk callback, continuity readiness, or debt
 completion. Successful completion reacquires `s.mu -> gate.mu` and publishes
-only if the complete window token and registration still match.
+no success directly; it may advance to the ACK precommit below only if the
+complete window token and registration still match.
+
+ACK completion has an explicit two-phase order. After successful reconciliation,
+the receiver revalidates the complete token, detaches `receiveWindow` into
+`pendingReceiveAck`, and reopens ordinary same-transport session admission while
+setting provisional token-bound inbound bulk authorization, retaining repair
+debt, and keeping continuity false. It then writes the exact ACK outside
+all locks. The ACK writer acquires SessionSync `writeMu`, then reacquires
+`s.mu -> gate.mu` only to revalidate the exact pending token and authority
+generation before releasing those state locks and writing. Config send/receive,
+role change, or disconnect invalidates the token before competing for
+`writeMu`; an ACK writer that loses that race therefore emits no stale ACK after
+the newer config/role frame. The writer never holds state locks during the
+network write. This precommit is required because the sender may enqueue its deferred
+tail immediately after reading the ACK; those valid ordinary frames must not hit
+a still-reconciling gate. ACK write success reacquires `s.mu -> gate.mu` and sets
+`bulkEverCompleted`, continuity, callback, and matching debt completion only if
+the pending token remains current. Failure, partial/ambiguous write, disconnect,
+config send/apply, or role transition invalidates the token, publishes none of
+those success effects, clears provisional inbound authorization, and retires
+the transport; any tail frame that happened
+to install remains ordinary nontransactional state and is converged by repair.
+All authority-transition and shutdown join sets include this ACK writer.
 
 Type 29 carries exactly one nonzero little-endian request ID. A request attempt
 captures connection, transport, process, role, debt generation, and deadline;
-write completion can move only that exact token to `awaitingAttempt`. Nil
-connection, short write, timeout, disconnect, or supersession leaves debt armed.
-The receiver binds only the matching echoed start/end on the same connection.
+record it under the gate in `writing` phase **before** the network write. A
+matching BulkStart may atomically bind either writing or awaiting phase, because
+the peer can respond before local `Write` returns. Write success changes only an
+unbound exact token to awaiting; a token already bound remains bound. Nil
+connection, short/ambiguous write, timeout, disconnect, or supersession retires
+the transport and leaves debt armed rather than erasing a causally triggered
+bulk. The receiver binds only the matching echoed start/end on the same connection.
 Newer debt creates a later unique request. The sender stores the exact source
 tuple; a newer unclaimed request supersedes an older one, while a request arriving
 after claim waits for the next bulk. Only the matching ACK clears the claim.
+Sender state is bounded to one claimed and one newest pending tuple per
+transport. A per-transport monotonic minimum-resync interval/backoff limits
+requested full snapshots; requests inside the interval only replace the single
+pending tuple and increment a coalesced counter. They never spawn a goroutine,
+allocate an unbounded queue, or reset backoff. Authentication remains the trust
+boundary when configured; unkeyed mode gains no claim that an on-link peer is
+trusted, so the same bound applies in both modes.
 
 Capable BulkAck carries exact `{bulkEpoch, requestID}`. Record pending outbound
 state before BulkEnd, require ACK on the exact connection/transport/process/role
@@ -1560,6 +1885,45 @@ Split the current overloaded readiness signal. `SetSyncReady`/`IsSyncReady`
 remain source-compatible but mean **validated session continuity only** and are
 set true solely by a successful current capable inbound bulk. Add a separate
 `electionTimeoutExpired` availability signal for the existing cold-start timer.
+
+```go
+func (m *Manager) SetSyncElectionTimeoutExpired(expired bool)
+func (m *Manager) SyncAutomaticElectionSessionAvailable() bool
+```
+
+These methods read/write manager state under `m.mu`; the availability method combines the
+three explicitly allowed session inputs below and is the only session-readiness
+input consumed by the election pipeline. Manager state adds
+`syncPreviousGood`, initially false. The exact
+successful capable-bulk path sets both `syncReady` and `syncPreviousGood` true;
+clearing current continuity leaves previous-good true until process restart.
+No timeout or legacy ACK sets previous-good. Status reports current continuity,
+previous-good, and timeout separately.
+SessionSync updates its gate-owned continuity/previous-good fields and increments
+a nonzero `continuityEventSeq`, then sends the event to one ordered notifier
+worker; bare `go OnBulkSyncReceived()` readiness callbacks are removed. The
+notifier payload is
+`ContinuityEvent{Seq, Ready, PreviousGood, TransportEpoch, RoleGeneration,
+Reason}` and one `OnContinuityChanged` callback handles both true and false
+edges. Existing bulk callbacks may retain metrics-only work but cannot mutate
+readiness or release VRRP holds.
+The worker delivers every edge in sequence from a fixed bounded queue and calls
+the daemon/Manager synchronously. It does **not** coalesce true/false edges; an
+edge is generated under the gate, enqueued after releasing state locks, and has
+an exact delivery acknowledgement. The internal Manager callback is bounded and
+performs no I/O. Queue backpressure occurs only outside locks and cannot be
+dropped. Last-fabric loss, config/role transition, and Stop
+wait for their false event's delivery acknowledgement before proceeding, so a
+previous bulk-success callback cannot arrive afterward and reopen readiness.
+Delivery and acknowledgement waits hold no SessionSync or Manager mutex; daemon
+callbacks may query snapshots without inversion. Stop joins the notifier.
+`SetSyncReady` remains source-compatible but is deprecated internally; a source
+canary permits production calls only from the ordered continuity adapter.
+`SetSyncReady(true)` sets both Manager current and previous-good; false clears
+only current continuity.
+Manual transfer reads the immediate SessionSync snapshot, and automatic election
+reads the ordered Manager mirror; neither synthesizes readiness from the other's
+timeout.
 The timer never calls `SetSyncReady(true)`, never fires the bulk callback, never
 clears repair/baseline state, and never releases manual-transfer or session
 continuity holds. Automatic peer-loss takeover may consult the timeout plus
@@ -1567,8 +1931,12 @@ previous-good state under the existing availability doctrine and must alarm
 that continuity is unproved; manual failover always requires continuity,
 baseline clear, and all repair generations complete.
 
-The timeout bit is scoped to the current cold-start/role generation and resets
-on new transport, config-authority transition, or config-sync-mode change. The
+The timeout bit is scoped to the current cold-start/role generation. Last-fabric
+loss stops the timer but preserves an already-expired bit long enough for the
+same generation's confirmed peer-loss decision; it never converts an unexpired
+timer into availability after disconnect. Registration of a new transport,
+config-authority transition, or config-sync-mode change clears the bit before
+arming any new timer. The
 automatic election input is true only when all existing non-session gates pass,
 peer loss is confirmed, and one of current continuity, retained previous-good
 continuity, or this generation's timeout is true. Fresh boot with neither a
@@ -1577,14 +1945,17 @@ stops the timer and supplies continuity directly; the timeout bit is not copied
 into a later generation.
 
 Extend `TransferReadinessSnapshot` additively with
-`ConfigBaselinePending`, `SessionRepairPending`, `TransportEpoch`,
+`SessionContinuityReady`, `SessionPreviousGood`, `ConfigBaselinePending`,
+`SessionRepairPending`, `TransportEpoch`,
 `RepairDebtGeneration`, and `RepairCompletedGeneration`. Populate one atomic
-gate snapshot. Reason ordering is baseline, receive repair, outbound repair,
-then timeout-only availability. No REST, gRPC, helper, BPF, persisted, or event
-wire schema changes.
+SessionSync-gate snapshot. `ReadyForManualFailover` requires current continuity
+and ignores previous-good/timeout. Reason ordering is continuity, baseline,
+receive repair, then outbound repair. The Manager's timeout field is exposed
+separately by cluster status, not folded into this manual-transfer snapshot. No
+REST, gRPC, helper, BPF, persisted, or event wire schema changes.
 
 `SessionRepairPending` is the conservative OR of refused/reconcile receive
-debt, an in-flight or awaiting type-29 attempt, a capability-refused prime,
+debt, `pendingReceiveAck`, an in-flight or awaiting type-29 attempt, a capability-refused prime,
 sender `forceResync`, deferred-tail loss, and an unacknowledged outbound bulk.
 Scheduling or writing BulkEnd clears none of these; only the exact successful
 reconcile/ACK and tail-flush transitions advance their matching generation.
@@ -1802,7 +2173,10 @@ methods remain source-compatible. `SetSyncReady`/`IsSyncReady` narrow their
 internal meaning to validated session continuity while a separate timeout
 availability bit preserves the explicit automatic-election doctrine. The
 internal cluster-session reconciliation adapter gains `context.Context`; every
-repository implementation migrates in I-c. No REST, gRPC, helper, BPF, event,
+repository implementation migrates in I-c. Internal config callbacks return a
+typed authority/restart outcome, and `cluster.Manager` gains an immutable RG0
+committed-authority snapshot/accessor; all repository consumers migrate in the
+same inactive-to-active stack. No REST, gRPC, helper, BPF, event,
 or persisted schema is changed. Existing authentication frame types remain
 unchanged; capability is the first **post-authentication** frame and auth
 HELLO/PROOF are expressly exempt from that ordering rule.
@@ -1865,11 +2239,13 @@ Intentional behavior changes are fail-loud validation, not API removal:
    inactive/unarmed in BPF and helper state before the new inventory publishes;
    unchanged slots survive the helper's one full-replacement transitional
    payload. Manager-owned clustered debt contains the complete desired
-   generation, owner map, helper payload, and fenced-slot set; the status loop
-   is its sole consumer. While debt exists, no ordinary status path may source
-   `m.haGroups`, rearm watchdog/active state, or publish forwarding ready. An
-   uncertain clear disarms the helper rather than replaying stale pins or an
-   older full map.
+   generation, owner map, helper payload, and required/confirmed fenced-slot
+   sets; the status loop is its sole retry consumer. Every direct actuator,
+   watchdog, status, shutdown, and helper writer linearizes through the same
+   inventory transaction before any map write. While debt exists, no path may
+   source old `m.haGroups`, positively rearm watchdog/active state, or publish
+   forwarding ready. An uncertain clear disarms the helper rather than replaying
+   stale pins or an older full map.
 8. **HA ordering:** an invalid live sync leaves active config, compiled config,
    helper maps, forwarding arm state, and applied-generation high-water
    unchanged. Fresh boot remains lifeline/default-deny. A mixed-version RG16+
@@ -1881,8 +2257,13 @@ Intentional behavior changes are fail-loud validation, not API removal:
    accepted config generation before incarnation-qualified ordering. A
    one-fabric replacement cannot discard an already-admitted successful config
    callback, while last-fabric loss drains it before a new baseline is exposed.
-   Both RG0 event and safety-net actuation pass through begin/complete authority
-   transitions. Capable cold sync is receiver-requested after baseline; sender
+   Raw RG0 election publication first marks a shared authority serial
+   transitioning; both event and safety-net actuation pass through exact
+   begin/complete and manager-commit authority transitions, and every positive
+   authority reader uses the committed accessor. Config callbacks return a
+   staged authority delta which publishes atomically with their exact successful
+   lease; failure remains fail-closed. Transport restart runs only from a
+   daemon-owned post-commit worker outside `SessionSync.wg`. Capable cold sync is receiver-requested after baseline; sender
    producers remain closed until the exact bulk ACK. BulkStart resets no
    ordering or config authority. Only a capable same-connection window with
    joined successful reconciliation can ACK, mark continuity ready, or discharge
@@ -1943,7 +2324,7 @@ Intentional behavior changes are fail-loud validation, not API removal:
 |---|---|---|---|
 | Behavioral regression | HIGH | Thirteen independent roots include security policy acceptance, SNMP auth, DDNS deletion, HA activation, and config loading | Separate PRs; fail-on-revert traces; strict/lenient paired tests; package-wide reruns after each config merge |
 | Lifetime / borrow-checker | LOW | Only K003-01 changes Rust and it passes a copied byte already present in metadata; no ownership or shared-lifetime change | Rust unit tests, clippy/build, and packet-path smoke |
-| Concurrency / lock ordering | HIGH | K003-16 repairs a map race, while I-d adds transport drain, producer fencing, role transitions, and joined reconciliation across two fabric loops | Exact two-edge lock graph; gate-owned receive state; no I/O/waits under locks; production-path race/deadlock tests; inactive scaffolding review before activation |
+| Concurrency / lock ordering | HIGH | K003-16 repairs a map race, while I-d adds transport drain, producer fencing, role transitions, ordered notifications, post-commit restart, and joined reconciliation across two fabric loops | Exact three-edge lock graph; gate-owned receive state; no state-locked I/O/waits; self-join, stale-ACK, raw-role-window, direct-actuator, and callback-transaction race tests; inactive scaffolding review before activation |
 | Performance regression | LOW | One copied byte on a rare flowless path; all other work is cold path | No new packet reads/allocations; userspace throughput baseline and perf smoke for K003-01 only |
 | State/ownership corruption | HIGH | DDNS wrong-family delete, malformed/legacy cross-surface state, crash-ambiguous claim release, routing ownership loss, stale RG pins, and interleaved session bulk/apply are explicitly stateful | Expected-surface validation including bounded pre-#2903 Surface A; exact same-family `fpb1`; classified claim release; full-generation clustered helper debt; initialized authority; transport-qualified gate; used-connection fences; cancellable joined reconcile; attempt-correlated repair; injected failure/retry tests |
 | HA compatibility | HIGH | RG bindings above the 16-slot dataplane domain were previously accepted; reconnect can reorder callbacks; old receivers ACK reconcile failures; and old senders cannot produce a provably uncontaminated bulk | Honest preflight/release note; standby-first rolling restriction; no legacy ACK proof; continuity/timeout split; receiver-requested cold bulk; fresh-boot, reconnect, previous-good, stale-pin, failed-reconcile, mixed-pair, and repair-ABA smoke |
@@ -2098,11 +2479,21 @@ passes on the fix and fails when the fix hunk is reverted.
   active}` -> new `{RG2 active, RG3 inactive}` proves one staged payload omits
   RG1, preserves RG2, and introduces RG3 fenced; retry replays that complete
   desired generation. Failure installs one `haInventoryDebt`; the status loop
-  is its sole consumer and cannot replay old `m.haGroups`, rearm watchdogs, or
+  is its sole retry consumer and cannot replay old `m.haGroups`, rearm watchdogs, or
   publish forwarding. A newer generation atomically supersedes the debt; a late
-  old retry cannot clear or publish over it. Success publishes the staged owner
+  old retry cannot clear or publish over it, and every older unconfirmed fence
+  remains required against the newest payload. Success publishes the staged owner
   inventory and clears only its exact generation. Shutdown leaves debt slots
-  fenced. Preflight invokes the
+  fenced. A blocked old helper RPC serializes against a newer config; after it
+  returns, the newer debt/fences run and no late old replacement can overwrite
+  them. Pause `UpdateRGActive`, `UpdateHAWatchdog`, the daemon watchdog tick,
+  status refresh, and shutdown fencing before/after transaction acquisition;
+  while debt exists no positive pinned write, old helper payload, readiness, or
+  removed-slot update escapes. Negative clears fold into the matching debt, and
+  exact debt completion wakes a level-triggered positive reconcile. Reverting
+  any production writer's transaction wrapper must fail a source canary. Lock
+  tests pin `haInventoryTxnMu -> HA state mutex` and no helper I/O under the
+  state mutex. Preflight invokes the
   staged binary against the same operator-designated unredacted artifact/hash
   for node 0 and node 1 and covers exit 0, exit 2, redacted input, and tool
   failure; a stale valid file is explicitly outside the command's detectable
@@ -2132,17 +2523,48 @@ passes on the fix and fails when the fix hunk is reverted.
   baseline and may accept a lower rebooted-peer generation. A stale old token
   cannot clear it. Last-fabric loss clears current continuity while retaining
   previous-good history only for timeout-governed automatic peer-loss. Config
-  failure retains previous-good and baseline debt.
+  failure retains previous-good and baseline debt, marks authority failed,
+  advances no high-water, and retires/reconnects so the same generation is
+  re-pushed. A G2 transport-address change returns a restart outcome, publishes
+  its lease/high-water, exits the callback, and only then lets the daemon-owned
+  worker call `Stop`; the old self-join trace is a bounded passing test. A newer
+  G3 outcome coalesces a queued G2 restart and the worker derives only G3's
+  active transport. Single-fabric EOF and inline protocol violation are raised
+  from production receive loops; each worker returns before the lifecycle
+  coordinator joins it. Concurrent duplicate/older retire requests coalesce,
+  cannot close a replacement epoch, and `Stop` joins data workers before the
+  coordinator without a timeout escape.
+
+  Config-transaction tests change zone ownership and config-sync mode, then
+  fail after each intermediate `applyConfigLocked` stage. The gate never sees
+  the delta before callback success and never reopens under old authority after
+  a promoted/partially armed failure. The successful exact callback atomically
+  publishes generation plus both authority fields. Local commit and rollback
+  use the same begin/success/failure contract without reentrant draining. Block
+  `applySem`, a post-promotion operation, and a post-arm tail, then cancel the
+  exact lease: the callback receives context cancellation, returns the correct
+  mutation stage within its deadline, performs no later mutation, leaves the
+  digest unmarked/gate failed, and reconnect re-applies the same generation
+  before baseline.
 
   Production daemon tests drive RG0 promotion and demotion through both
-  `watchClusterEvents` and dropped-event safety-net reconciliation. Begin closes
-  admission before any positive act. Demotion may fence traffic immediately but
-  defers role/store/config/readiness publication; promotion exposes nothing
-  until completion. Timeout retains one level-triggered desired state, and a
-  newer state supersedes then re-enters the same wrapper. Source canaries reject
-  direct RG0 positive actuators outside the wrapper. Race tests assert only
-  `s.mu -> gate.mu` and `bulkSendMu -> producerMu`, with no other nested lock,
-  callback, I/O, cancellation wait, or condition wait.
+  `watchClusterEvents` and dropped-event safety-net reconciliation. Election
+  publishes a transitioning authority serial before raw `rg.State`; a goroutine
+  paused in the old event-delivery window observes no committed positive
+  authority and SessionSync refuses admission. During a paused demotion,
+  heartbeat continues advertising the previous primary role until negative
+  fencing and exact commits finish; during promotion it continues advertising
+  the previous secondary role. Boot-without-commit advertises secondary-hold.
+  Demotion may fence traffic
+  immediately but defers store/config/readiness publication; promotion exposes
+  nothing until both the gate and exact manager serial commit. Timeout retains
+  one level-triggered desired state, and a newer serial supersedes then re-enters
+  the same coordinator. Source canaries reject direct RG0 positive actuators
+  outside the wrapper and raw `IsLocalPrimary(0)` reads in authority-sensitive
+  code. Boot remains unknown/fail-closed until initial authority reconciliation.
+  Race tests assert only `s.mu -> gate.mu`, `bulkSendMu -> producerMu`, and the
+  pre-write `writeMu -> s.mu -> gate.mu` revalidation edge; no reverse edge,
+  state-locked callback/I/O/cancellation wait, or condition wait exists.
   A callback blocked after store mutation completes under the old role before
   `roleGeneration` advances; the transition cannot strand its applied generation
   or let it finish inside the new role.
@@ -2150,6 +2572,8 @@ passes on the fix and fails when the fix hunk is reverted.
   Setup tests delay each peer independently and cover new/new, new/old, old/new,
   keyed/keyed, keyed dual-accept, and unkeyed. Auth HELLO/PROOF may precede the
   capability; capability is always the first post-auth frame from upgraded code.
+  An unkeyed upgraded side receiving an old keyed HELLO consumes setup frames
+  until the later legacy data frame and never dispatches auth into `handleMessage`.
   An auth-consumed legacy frame is staged until after registration and authority
   initialization. Exact length/version/flags, missing required bits, unknown
   bits, cross-fabric defined-bit mismatch, zero ID, duplicate,
@@ -2166,7 +2590,13 @@ passes on the fix and fails when the fix hunk is reverted.
   successful baseline. Sender session producers remain closed until the exact
   requested bulk ACK and deferred-tail flush. A config send and role transition
   clear authorization and close them again. Request-ID-zero maintenance bulk is
-  refused before current-transport authorization and accepted after it.
+  refused independently when either the sender's outbound or receiver's inbound
+  authorization is absent and accepted only after both ends complete their
+  respective requested-bulk ACK transition. Capable config send writes config
+  then a peer-snapshot request on one connection; receive captures the config
+  floor, applies, services that request, and emits the reciprocal request.
+  Active/active fixtures prove both ownership directions re-prime. Config send,
+  config receive, and role/transport changes clear both authorization bits.
   Simultaneous bidirectional initial requests complete without lock coupling or
   cluster-originated install/delete feedback into either outbound queue.
 
@@ -2180,6 +2610,9 @@ passes on the fix and fails when the fix hunk is reverted.
   overflow, direct-write failure, tail-flush failure, delete preservation,
   mandatory follow-up bulk, Stop cancellation, and producer reopening are
   fail-on-revert cases.
+  Config send is paused before and after drain/fence revalidation; its authority
+  generation always cancels/joins the old bulk before the config frame and no
+  old-generation BulkStart can follow it.
 
   Receive tests bind membership to one exact capable connection. A session frame
   on the other fabric while receiving or reconciling is a protocol violation,
@@ -2190,6 +2623,18 @@ passes on the fix and fails when the fix hunk is reverted.
   callback, continuity readiness, and debt discharge. A blocking fake proves
   `Stop` never uses the old five-second abandon path and no reconcile worker can
   touch a torn-down dataplane.
+  Large v4/v6 stale sets prove iteration observes cancellation, deletes run in
+  at most 256-row chunks, an early-stop nil iterator result is converted to
+  `ctx.Err()`, and partial chunk completion remains repairable.
+  ACK tests make the sender return a deferred tail immediately: receive
+  admission is already open, but continuity/debt remain pending until ACK write
+  success. Provisional inbound authorization accepts a causally immediate
+  request-ID-zero follow-up, then becomes durable on write success or clears on
+  failure. Failed, partial, and delivered-then-disconnect writes publish no
+  success and retire the transport without dropping an installed valid tail.
+  Pause an ACK writer before and after `writeMu`; a newer config/role transition
+  invalidates its pending token and no stale ACK can appear after the newer
+  authority frame. Stop joins that writer.
 
   Repair tests request on fabric 1 while fabric 0 remains preferred and prove
   the bulk is pinned to fabric 1. Unique request claim, duplicate/refusal, nil
@@ -2198,12 +2643,25 @@ passes on the fix and fails when the fix hunk is reverted.
   during an active bulk binds only a later bulk. BulkAck rejects wrong bulk,
   request, fabric, connection, transport, process, role, legacy length, and
   post-reconnect tuples; only the exact capable ACK plus tail flush clears debt.
+  An immediate peer returns BulkStart before the request write returns and binds
+  the record-before-send `writing` attempt; delayed write completion cannot
+  overwrite bound state. Ambiguous request-write failure retires the transport.
+  A high-rate authenticated and unkeyed type-29 flood retains one claimed plus
+  one latest pending tuple and cannot exceed the configured minimum bulk rate;
+  backoff and coalesced counters are deterministic under a fake clock.
 
   Readiness tests inject a reconcile error, then advance `syncReadyTimeout`.
   Continuity remains false, no bulk callback/VRRP continuity release occurs,
   baseline/repair debt stays visible, and manual transfer remains blocked. Only
   the separate timeout-availability bit changes; the existing explicit
   previous-good automatic peer-loss decision and alarm are tested independently.
+  A bulk-success readiness callback is blocked while disconnect queues a
+  higher-sequence false event; disconnect waits, then delivery occurs true ->
+  false and no later callback reopens Manager current continuity while
+  previous-good stays true. A full notifier queue applies backpressure only
+  outside locks and delivers every alternating edge/ack in order. Stop joins
+  the notifier without dropping its final false sequence. A source canary
+  rejects production `SetSyncReady` calls outside the ordered adapter.
   New-receiver/old-sender and new-sender/old-receiver matrices both remain
   continuity-unready, never accept an 8-byte ACK as proof, and document the
   standby-first upgrade sequence. A fully upgraded pair recovers through
@@ -2333,7 +2791,7 @@ deviation and returns to review.
 
 ## 11. Resolved adversarial decisions
 
-Rounds one through nine closed the design choices rather than delegating them
+Rounds one through ten closed the design choices rather than delegating them
 to implementors:
 
 1. Path A remains the recommendation. The config-heavy workstreams are separate
@@ -2356,8 +2814,11 @@ to implementors:
    before inventory publication, including process-start replay of persistent
    pins. The Rust helper receives one staged full replacement that preserves
    unchanged slots, omits removed slots, and introduces new slots inactive;
-   manager-owned clustered debt and its sole status-loop consumer own that whole
-   desired generation rather than per-slot patches or unpublished `m.haGroups`.
+   manager-owned clustered debt and its sole status-loop retry consumer own that
+   whole desired generation rather than per-slot patches or unpublished
+   `m.haGroups`. Every direct active/watchdog/status/helper writer serializes
+   through the inventory transaction before map I/O and refuses positive replay
+   while debt exists.
    Mixed-version high bindings reject fail-safe, block manual transfer,
    preserve previous-good automatic peer-loss takeover with an alarm, and
    require the two-node-view `xpfd check-config` content preflight. The command
@@ -2427,21 +2888,30 @@ to implementors:
     has no authentic legacy nested persistence fixture, so the permissive
     compiler fallback is removed instead of being enshrined by a new fixture.
 15. Session authority is fully initialized before network exposure. Protection
-    is `config sync enabled && RG0 secondary`, with enable/disable and both event
-    and safety-net RG0 changes routed through one split begin/complete actuator.
-    An admitted config callback is transport/process/role scoped so one-fabric
-    replacement cannot strand a store mutation; last-fabric loss drains it
-    before a new baseline. The gate alone owns receive state under the exact
-    `s.mu -> gate.mu` and `bulkSendMu -> producerMu` graph. Capability resolves
-    after auth but before registration. Capable cold bulk is receiver-requested
-    after baseline, fences every used/live connection, pins repair to the request
-    connection, and keeps producers closed through exact ACK/tail flush.
-    Reconciliation is cancellable and joined; earlier valid nontransactional
-    members may remain after failure, but no failure ACKs or publishes. Mixed
-    authoritative bulk is unsupported in both directions and rolling upgrade is
-    standby-first with manual transfer blocked. Timeout-based automatic-election
-    availability is distinct from validated continuity. I-a through I-c remain
-    inactive scaffolding; I-d alone activates these semantics after full smoke.
+    is `config sync enabled && committed RG0 secondary`. Raw election state first
+    publishes a fail-closed transition serial; all authority-sensitive readers
+    use the separately committed snapshot, and event plus safety-net paths drive
+    the same exact begin/complete/manager-commit coordinator. Config callbacks
+    accept a lease context and return a staged authority/restart outcome; only
+    exact success publishes generation plus authority, while mutation-classified
+    failure retires/retries fail-closed. Transport restart and idempotent
+    retirement are owned outside joined data workers, so config and receive
+    loops cannot self-join. One-fabric replacement can preserve an admitted
+    callback; last-fabric loss drains it before a new baseline. The gate alone
+    owns receive state under `s.mu -> gate.mu`, `bulkSendMu -> producerMu`, and
+    the narrow pre-write `writeMu -> s.mu -> gate.mu` validation edge.
+    Capability resolves after auth but before registration. Capable cold and
+    post-config repair are bidirectionally receiver-requested, fence every
+    used/live connection and authority generation, pin repair to the request
+    connection, and keep producers closed through exact ACK/tail flush.
+    Reconciliation and ACK writers are cancellable/joined; earlier valid
+    nontransactional members may remain after failure, but no failure ACKs or
+    publishes. Mixed authoritative bulk is unsupported in both directions and
+    rolling upgrade is standby-first with manual transfer blocked. Ordered
+    continuity notifications prevent callback ABA; timeout-based automatic-
+    election availability remains distinct from validated continuity. I-a
+    through I-c remain inactive scaffolding; I-d alone activates these semantics
+    after full smoke.
 
 Manual approval of this plan accepts those product choices. A material change to
 any one returns that child workstream to plan review rather than being improvised
