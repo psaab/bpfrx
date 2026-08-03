@@ -199,3 +199,32 @@ capability/authentication staging, nontransactional partial-install wording,
 all-capable-bulk authorization, and implementation-stack activation gaps.
 AGY's `PLAN-READY` missed these executable traces. Revision 10 incorporates
 all valid findings before another immutable review round.
+
+### Round 10 - plan commit `103acbfd28115993f8f6393ed6b55d632bcfb4ee`
+
+- Codex direct hostile review: process session `67056`; reviewer session
+  `019fc888-0e86-7740-bcc4-c039440a6af2`; valid output
+  `/tmp/6744-codex-r10.out`; verdict `PLAN-NEEDS-MAJOR`. The first direct
+  attempt used a malformed quoted reasoning-effort value and produced no
+  verdict; reviewer session `019fc885-9d97-7903-b4f4-e47f72598733` is not
+  counted.
+- AGY direct plan review: process session `6437`; valid output
+  `/tmp/6744-agy-r10.out`; verdict `PLAN-READY`.
+- Claude Code CLI: process session `98685`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent SMR-method fallback agent:
+  `019fc885-9a87-7402-8b13-8a3535ec2cae`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic-model
+  review.
+
+Round 10 did not converge. Codex and the independent SMR-method fallback
+converged on config-callback self-join, reentrant config-authority mutation,
+and RG0 publication-before-authority blockers. Codex additionally found direct
+HA actuator writers that bypass clustered helper debt. The fallback additionally
+found uncancellable post-promotion config mutation and receive-worker
+self-join. The orchestrator's hostile composition pass also found stale ACK
+write ordering, missing pending peer-request ownership, one-way post-config
+repair, authority-generation races, setup-auth ambiguity, readiness callback
+ABA, request record-before-send, and unbounded request pressure. AGY's
+`PLAN-READY` missed these executable traces. Revision 11 incorporates every
+valid finding before another immutable review round.
