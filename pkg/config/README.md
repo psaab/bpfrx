@@ -1210,11 +1210,16 @@ parent on `cfg.Applications.MixedDirectTermApps` and `validateApplicationStructu
 (`compiler_validate_strict.go`) hard-rejects it at commit (move the direct match
 into its own `term`). The same gate also rejects a single-valued (scalar) term
 leaf — `destination-port` / `source-port` / `inactivity-timeout` / `timeout` /
-`alg` — that appears more than once inside ONE inline term with a CONFLICTING
+`alg`, and since #6766 `icmp-type` / `icmp-code` — that appears more than once
+inside ONE inline term with a CONFLICTING
 value: the inline `term` is opaque to the `SchemaValidate` walk, so a repeat (via
 apply-groups, flat-set ordering, or hand authoring) was last-writer-wins,
 silently overriding the earlier value by token order; `parseApplicationTerms`
-records the offending leaf on `Application.DuplicateTermLeaves`. An IDEMPOTENT
+records the offending leaf on `Application.DuplicateTermLeaves`. (#6766: the
+#3366 framework omitted the ICMP leaves, so a conflicting `icmp-type` /
+`icmp-code` repeat overwrote the pointer with no record and a referenced DENY
+enforced only the LAST type/code — a silent narrowing of the deny match, the
+inline-term analogue of the #5574 direct-body ICMP tracking.) An IDEMPOTENT
 same-value repeat (e.g. the `timeout` / `inactivity-timeout` aliases both set to
 the same number) is harmless and accepted, and a repeated `protocol` is the
 documented multi-protocol-term syntax (one application per unique protocol) and

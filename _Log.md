@@ -1,3 +1,30 @@
+## 2026-08-03 — #6766: gate conflicting inline-term icmp-type / icmp-code repeats
+
+- **Timestamp**: 2026-08-03 (fix/6766-inline-icmp-dup, opus-review-001 R23)
+- **Action**: The #3366 inline-term duplicate-scalar framework tracked
+  destination-port / source-port / timeout / alg but declared no set flags for
+  the ICMP leaves, so a conflicting `icmp-type` / `icmp-code` repeat inside one
+  inline application `term` overwrote the pointer with no record — the term is
+  opaque to SchemaValidate, and the strict structure gate only sees
+  `Application.DuplicateTermLeaves`, so strict commit accepted the config and a
+  referenced DENY enforced only the LAST type/code (silent narrowing of the
+  deny match). Added `icmpTypeSet` / `icmpCodeSet` first-value tracking in
+  `parseApplicationTerms` mirroring the ports (and the #5574 direct-body ICMP
+  tracking): a conflicting repeat is recorded on `DuplicateTermLeaves`, an
+  idempotent same-value repeat stays accepted, malformed tokens keep the
+  existing `UnknownICMP` path. Strict error text, the
+  `validateApplicationStructureStrict` doc comment, the `DuplicateTermLeaves`
+  field doc, and the pkg/config README #3366 section now enumerate the ICMP
+  leaves. New fail-on-revert tests cover packed flat-set, hierarchical,
+  apply-groups, a referenced deny policy (strict rejects; lenient compiles with
+  only the last type — characterizing the narrowing), same-value idempotent
+  acceptance, and the lenient no-brick downgrade, for both leaves.
+- **File(s)**: `pkg/config/compiler_applications.go`,
+  `pkg/config/compiler_validate_strict_application.go`,
+  `pkg/config/types_security.go`,
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
