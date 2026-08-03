@@ -151,3 +151,24 @@ normalization and structured client semantics, surface-aware DDNS state and
 claim-release ordering, authoritative RG preflight and slot reuse, linearized
 config/session application plus bulk recovery, persisted confirm-tree shape,
 and the exact #6548 boundary.
+
+### Round 8 - plan commit `bebffd32c7a0c2956a7eabbf584a92c6604ec5b2`
+
+- Codex direct hostile review: process session `19554`; valid output
+  `/tmp/6744-codex-r8.out`; verdict `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: process session `73721`; valid output
+  `/tmp/6744-agy-r8b.out`; verdict `PLAN-READY`. Earlier session `26940` was
+  permission-denied and is not counted.
+- Claude Code CLI: process session `4248`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic verdict exists.
+- Independent SMR-method fallback agent:
+  `019fc83c-f89b-7493-b8bc-c47473cf6dd8`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic model
+  review.
+
+Round 8 did not converge. Codex, the independent SMR-method reviewer, and the
+orchestrator's adversarial source trace found material config-incarnation,
+legacy-zero, RG transition/full-replacement, authoritative-bulk,
+repair-correlation, reconcile-error, SNMP-secret, DDNS durability, and
+pre-#2903 compatibility gaps. AGY's `PLAN-READY` missed those traces. Revision
+9 incorporates all valid findings before another immutable review round.
