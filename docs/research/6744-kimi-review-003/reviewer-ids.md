@@ -275,3 +275,32 @@ missing local commit/rollback transaction APIs, ambiguous synchronous bulk
 membership, helper-wrapper reentrancy, and underspecified prepare-activation
 wire behavior. AGY's `PLAN-READY` missed these executable traces. Revision 13
 incorporates the complete valid union before another immutable review round.
+
+### Round 13 - plan commit `34619216673f66b1180274b50877f40628556999`
+
+- Immutable checkout:
+  `/home/ps/git/xpf-worktrees/6744-plan-r13-review`; detached, locked, and clean.
+- Round-start issue comment:
+  <https://github.com/psaab/xpf/issues/6744#issuecomment-5170899473>.
+- Codex direct hostile review: process session `81696`; reviewer session
+  `019fc922-7ab9-7541-a5f2-9dfe49e18b03`; valid output
+  `/tmp/6744-codex-r13.out`; verdict `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: valid output `/tmp/6744-agy-r13.out`; verdict
+  `PLAN-READY`.
+- Claude Code CLI: valid infrastructure attempt recorded in
+  `/tmp/6744-claude-r13.out`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent SMR-method fallback agent:
+  `019fc922-c521-77f3-a1d6-a4a78b20f01e`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic-model
+  review.
+
+Round 13 did not converge. Codex found urgent authority-mutator preemption,
+receipt-waiter self-join, authoritative userspace bulk-source, and sparse replay
+eviction blockers. The independent fallback converged on the bulk-source gap
+and additionally found that helper result/event lifetime ended before final
+generation-safe enqueue. The orchestrator's source audit also found that every
+Rust-helper process replacement empties session state without invalidating
+same-daemon continuity. AGY returned `PLAN-READY` with two valid nits for
+test-duration injection and warning deduplication. Revision 14 incorporates the
+complete valid union before another immutable review round.
