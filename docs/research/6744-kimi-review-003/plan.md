@@ -2,13 +2,18 @@
 
 ## 1. Status
 
-**DRAFT v1 - pending adversarial plan review**
+**DRAFT v2 - round-one major findings addressed; pending round-two review**
 
 - Issue: [#6744](https://github.com/psaab/xpf/issues/6744)
 - Source report: `/tmp/kimi-review-003.md`
 - Base: `origin/master` at `ad959117748181dabe46b8ddc2827de670380cea`
 - Branch: `research/6744-kimi-review-003`
-- Revision: 1
+- Revision: 2
+- Round-one plan SHA: `78891c3242a80b719bebdddc702087c07543e05b`
+- Round-one verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
+  `PLAN-NEEDS-MAJOR`; independent SMR-method fallback `PLAN-NEEDS-MAJOR`.
+  The Claude Code CLI was infrastructure-blocked before analysis, so no
+  Anthropic-model verdict is claimed.
 - Mode: `/research`. Stop at `PLAN-READY` or `PLAN-KILL`. Do not write
   production code and do not open a pull request.
 
@@ -55,7 +60,7 @@ adversarial traces in this matrix.
 | K003-02 | Local in-process CLI commits a partial terminal paste after Ctrl-C or read failure | **DUPLICATE** | High | Medium | Open [#6548](https://github.com/psaab/xpf/issues/6548) owns this exact `pkg/cli/cli_config.go` residual |
 | K003-03 | Disabling one DDNS family can withdraw through the other family's backend | **LIVE** | High | Medium | `pkg/ddns/manager.go:907-921` uses the cross-family `m.updater` despite per-family anchors added by #5814. The trigger is narrower than reported: it requires the family to become backend-less, both blocks to disappear, or backend construction to fail while withdrawal is needed |
 | K003-04 | `compileInterfaces` indexes `afNode.Keys[0]` on persisted malformed AST input | **LIVE** | High | Low | `pkg/config/compiler_interfaces.go:365`; closed #4827 fixed sibling firewall walks only. The report's HA-sync path is false because peer sync reparses text; reachability is malformed persisted JSON or a handcrafted tree |
-| K003-05 | Nested `from-zone X { to-zone Y { ... } }` is accepted and silently omitted | **DUPLICATE** | High | Medium | The omission is real, but the report's vSRX parity premise is false: Junos documents one combined `from-zone X to-zone Y` hierarchy. Open [#4313](https://github.com/psaab/xpf/issues/4313) owns fail-loud rejection of unsupported shapes under schema subtrees |
+| K003-05 | Nested `from-zone X { to-zone Y { ... } }` is accepted and silently omitted | **LIVE (honesty, not parity)** | High | Medium | The omission is real, but the report's vSRX parity premise is false: Junos documents one combined `from-zone X to-zone Y` hierarchy. Open [#4313](https://github.com/psaab/xpf/issues/4313) supplies the closed-world doctrine but explicitly delegates concrete domain gaps; Workstream M owns exact rejection of this unsupported shape |
 | K003-06 | Repeated top-level/global address-book blocks replace or ignore earlier entries | **LIVE** | High | Low | `pkg/config/compiler_security_addressbook.go:221-235`; #4706/#4818 fixed inner/sibling merge classes, not these containers |
 | K003-07 | Empty zone, zone-pair, global-scope, and policy identities commit and then reject or widen at runtime | **LIVE** | High | Medium | Empty string is a special token in `compiler_validate_strict_zones.go`; `sortDedupZones` strips it while Rust preflight rejects concrete empty references. #6455 and #6464 do not own the Go acceptance residual |
 | K003-08 | Route-map bounds count one referenced prefix-list name while rendering one row per IP family | **LIVE** | High | Medium | `pkg/config/routemap_seq_bound.go` disagrees with `pkg/frr/prefix_list_render.go`; the second report heading is the same root cause, not another finding |
@@ -66,12 +71,12 @@ adversarial traces in this matrix.
 | K003-13 | SNMPv3 configured protocol without required key material silently lowers the served security level | **LIVE** | High | Medium | Schema/compiler permit partial credentials; `pkg/snmp/v3.go` derives and enforces the floor from key presence rather than configured intent. This is a residual of #4897 |
 | K003-14 | SESSION_OPEN/CLOSE trace and REST/SSE surfaces render an intentionally meaningless wire action 0 as `deny` | **LIVE** | High | Low | Rust lifecycle producers intentionally write zero; `pkg/logging/trace.go` and `pkg/api/sse.go` expose it as a forwarding decision |
 | K003-15 | Binary SESSION_OPEN stores action 0 (`deny`) while only SESSION_CLOSE maps to `0xff` | **LIVE** | High | Low | `pkg/logging/ringbuf.go:1370-1379`; same semantic root as K003-14 and should be fixed in one workstream |
-| K003-16 | `vipWarnedIfaces` reset and mutation use unrelated synchronization | **LIVE** | High | High | `pkg/daemon/daemon_apply.go` resets the map under `applySem`; `daemon_ha_vip.go` accesses it under other call-path locks. A reset between lazy-init/check and assignment can panic with `assignment to entry in nil map` |
+| K003-16 | `vipWarnedIfaces` reset and mutation use unrelated synchronization | **LIVE** | High | Medium | `pkg/daemon/daemon_apply.go` resets the map under `applySem`; `daemon_ha_vip.go` accesses it under other call-path locks. A reset between lazy-init/check and assignment can panic with `assignment to entry in nil map`; no external exploit or persistent corruption is proved |
 | K003-C | 128 low-materiality cohort survivors | **UNACTIONABLE** | High | None | The report neither lists them nor preserves the batch artifacts. A number and category summary cannot be reproduced, deduplicated, or reviewed |
 
-Net result: 12 live claims, one partial claim, two current duplicates, one
+Net result: 13 live claims, one partial claim, one current duplicate, one
 refuted claim, and one unactionable cohort. K003-14 and K003-15 are one semantic
-root, leaving **12 independent retained root causes**.
+root, leaving **13 independent retained root causes**.
 
 ## 3. Honest scope and value framing
 
@@ -138,16 +143,17 @@ impact does not justify its independent code and test surface.
   surfaces. K003-14/K003-15 need one central semantic rule for all remaining
   formatters.
 
-### 4.2 Existing owner and rejected inputs
+### 4.2 Existing owner, related doctrine, and rejected inputs
 
 - K003-02 stays on open issue #6548. This research must not open a second issue
   or implementation PR for it. Before engineering, correct that issue's wording:
   `io.EOF` is the successful terminal-load terminator; `readline.ErrInterrupt`
   and every other read error abort and discard the partial body.
-- K003-05 stays on open umbrella #4313. This research must not create a
-  vSRX-parity implementation for a syntax shape the official hierarchy does not
-  define. The required behavior is fail-loud unsupported-shape handling under
-  #4313's per-subtree closed-world design.
+- K003-05 is related to, but not owned by, open umbrella #4313. That issue
+  defines the per-subtree closed-world doctrine and explicitly delegates
+  concrete domain gaps. K003-05 therefore gets its own child issue for
+  fail-loud rejection of the unsupported shape. It does not get a vSRX-parity
+  implementation because the official hierarchy does not define that syntax.
 - K003-12 is closed as refuted in this plan. A synthetic TLS stall test may be
   useful generally, but it cannot be justified as a fix for an unbounded
   handshake that does not exist.
@@ -173,7 +179,7 @@ Advantages:
 - each fix can be reverted independently;
 - smoke requirements match actual dataplane impact.
 
-Cost: 12 issues and PRs, plus explicit merge ordering for the compiler slices.
+Cost: 13 issues and PRs, plus explicit merge ordering for the compiler slices.
 
 #### Path B - one audit-batch PR
 
@@ -212,8 +218,8 @@ netlink, helper RPC, logging, or retry sleeps.
 
 ### 5.3 Workstream B - reject empty security identities before normalization (K003-07)
 
-Add an AST-level strict validator that runs before typed normalization can erase
-empty list elements. It must reject:
+Add one AST-level validator on the apply-groups-expanded tree that runs before
+typed normalization can erase empty list elements. It must detect:
 
 - an empty `security-zone` definition;
 - empty concrete `from-zone` and `to-zone` keys;
@@ -221,17 +227,31 @@ empty list elements. It must reject:
 - empty elements in global policy `match from-zone` / `to-zone` lists.
 
 Remove `""` from `policyZoneSpecialTokens`; retain only meaningful tokens such
-as `any` and `junos-host`. The lenient load/HA-sync path emits deterministic
-warnings and relies on the existing Rust fail-closed preflight. It must never
-turn an authored empty scope into `nil`/wildcard.
+as `any` and `junos-host`. This class is an explicit exception to the normal
+warning-only lenient doctrine: neither dropping a deny nor preserving a permit
+after scope normalization is action-agnostic safe. The same validator therefore
+returns an error on strict and tolerant compile paths.
+
+- Strict commit/check rejects the candidate with a scope-qualified diagnostic.
+- `Store.Load` retains the parsed tree for recovery but returns the existing
+  compile-failed class, so daemon bring-up enters bootstrap/lifeline mode with
+  no interface takeover and a fresh userspace helper remains default-deny.
+- `Store.SyncApply` rejects atomically and retains the previous active/compiled
+  snapshot; it never acknowledges the invalid peer generation.
+
+Do not rely on `sortDedupZones`, `Policy.LenientContentDropped`, or Rust
+preflight for this root. The first removes the evidence, the second does not
+cover every host-inbound actuator, and the third sees only the already-normalized
+snapshot. A zone definition with an empty quoted name is semantic invalidity,
+not malformed JSON structure; Workstream G must continue to accept the string
+at the persistence boundary so this validator can report it precisely.
 
 ```go
-func validateNonEmptySecurityIdentitiesStrict(root *Node) error
-func warnEmptySecurityIdentitiesLenient(root *Node) []string
+func validateNonEmptySecurityIdentities(root *ConfigTree) error
 ```
 
-The strict and lenient walkers should share one collector so their accepted
-identity grammar cannot drift.
+Both compile paths call the same function after inactive stripping and group
+expansion, so their accepted identity grammar cannot drift.
 
 ### 5.4 Workstream C - enforce SNMPv3 configured security intent (K003-13)
 
@@ -242,19 +262,39 @@ Validation rules:
   privacy password;
 - a password without its protocol is rejected rather than silently ignored.
 
-Strict commit rejects. Lenient persisted/peer loading warns and quarantines the
-invalid user instead of installing a lower-security user. Runtime remains a
-belt: calculate the required level from configured protocol intent before key
-derivation, and never register a user if the required key set is incomplete.
+Strict commit rejects. Lenient persisted/peer loading keeps the source config
+for diagnosis, appends a warning naming the user and missing field, and omits
+that user from the desired runtime USM table instead of installing a
+lower-security user. Runtime remains a belt: calculate the required level from
+configured protocol intent before key derivation, and never register a user if
+the required key set is incomplete.
 
 ```go
 type v3RequiredLevel uint8
+type v3UserRejection struct {
+    Name   string
+    Reason string
+}
 
-func requiredV3Level(cfg config.SNMPV3User) (v3RequiredLevel, error)
-func deriveV3User(cfg config.SNMPV3User, engineID []byte) (*usmUser, error)
+func requiredV3Level(cfg *config.SNMPv3User) (v3RequiredLevel, error)
+func (a *Agent) deriveV3User(cfg *config.SNMPv3User) (*usmUser, error)
+func (a *Agent) deriveV3Users(cfg *config.SNMPConfig) (
+    map[string]*usmUser,
+    []v3UserRejection,
+)
 ```
 
-Do not infer operator intent from `authKey != nil` or `privKey != nil`.
+`deriveV3Users` builds a complete replacement map and a sorted rejection list
+before taking `cfgMu`; then `UpdateConfig` swaps config plus users together as it
+does today. Consequently, a valid user changed to an invalid definition
+disappears in the same atomic swap: no request can observe the new config with
+the old valid key and no stale user survives under its old security level. The
+lenient compile warning is retained in `Config.Warnings`, and startup/day-2
+reconcile emits one structured warning with configured, installed, and omitted
+counts plus the sorted omitted user names. A config containing only invalid v3
+users may leave UDP/161 listening, but its empty USM table answers no request;
+that is fail-closed and observable. Do not infer operator intent from
+`authKey != nil` or `privKey != nil`.
 
 ### 5.5 Workstream D - restore flowless ICMP global admission (K003-01)
 
@@ -276,59 +316,94 @@ permitted.
 
 ### 5.6 Workstream E - bind DDNS withdrawal to record ownership (K003-03)
 
-Delete the cross-family `m.updater` fallback from family turn-off. For each owned
-record, select a withdrawal updater only when an updater fingerprint proves it
-is the backend that published that record:
+Delete the cross-family `m.updater` fallback from family turn-off. Replace the
+single previous-cycle slot with a per-family, fingerprint-keyed in-memory
+authority catalog:
 
 ```go
-func (m *Manager) updaterForOwnedWithdrawal(
+type withdrawalAuthority struct {
+    updater DNSUpdater
+}
+
+// [0] is IPv4 and [1] is IPv6; guarded by Manager.mu.
+withdrawalByFingerprint [2]map[string]withdrawalAuthority
+
+func (m *Manager) updaterForOwnedWithdrawalLocked(
     family int,
-    owned OwnedRecord,
+    owned ownedRecord,
     env reconcileEnv,
-) (Updater, bool)
+) (DNSUpdater, bool)
 ```
 
 Selection order:
 
-1. current family updater when its fingerprint equals
+1. the current updater for the record's own family when its fingerprint equals
    `owned.BackendFingerprint`;
-2. previous updater for that same family when `prevFP` equals the owned
-   fingerprint;
-3. no updater: retain ownership, increment the orphan/backend-mismatch alarm,
+2. the same-family catalog entry keyed by the exact owned fingerprint;
+3. no authority: retain ownership, increment the orphan/backend-mismatch alarm,
    and skip republish of the same identity this cycle.
 
-Never infer cleanup authority from a representative updater or from family
-alone. Advance `lastLiveUpdater[idx]` and `lastLiveFP[idx]` in lockstep only
-after updater resolution. This composes with #5814's transition behavior.
+Every successfully resolved live updater with a non-empty fingerprint is
+registered before the destructive diff. Keep its object, including credentials,
+while either (a) an owned record in that family references the fingerprint or
+(b) it is the current live backend. Garbage-collect an old entry only after a
+successful ownership-state save proves no record references it. A failed delete
+therefore retains both the ownership key and executable authority. This handles
+uninterrupted A -> B -> C transitions without replacing A's cleanup capability
+with B or C.
+
+The catalog is deliberately not persisted: serializing credentials into the
+DDNS ownership file would create a new secret store. After restart, a historical
+fingerprint that the current config cannot reconstruct has no executable
+authority; retain it and alarm exactly as #5814 already specifies. This
+workstream guarantees **never delete at an unproved endpoint**, not magical
+post-restart cleanup after the operator removes the only credential source.
+Unknown pre-fingerprint records likewise retain and alarm rather than using a
+representative updater. Catalog size is bounded by current backends plus the
+distinct fingerprints still referenced by owned records.
+
+The no-authority branch is side-effect free with respect to publication and
+catalog history: it never registers a fallback updater, advances an owned
+record's fingerprint, erases an older catalog entry, or saves ownership as if
+cleanup succeeded.
 
 ### 5.7 Workstream F - make `LoadOverride` format handling explicit and atomic (K003-09)
 
-Two viable local designs exist:
+Use constrained F1 and remove F2 as an implementation choice. `LoadOverride`
+already promises a complete flat `set` artifact, so honor that contract without
+pretending an edit transaction against an empty tree is a full configuration.
 
-- **F1, recommended:** honor the existing API documentation. Detect flat input,
-  replay every validated line into a new empty tree using the same helpers as
-  `LoadMergeAs`/`LoadSetAs`, and swap `s.candidate` only after all lines succeed.
-- **F2:** reject flat input with a line-numbered message directing callers to
-  `load set`, and correct the public documentation.
+The classifier scans every significant line before mutation. A significant
+flat line is neither blank nor a full-line `#`/`//` comment. Inline `#` or `//`
+comments and one optional trailing semicolon are accepted through the existing
+`ParseSetVerb` lexer contract. Multiline `/* ... */` comments are rejected in
+flat mode because replay is deliberately one command per physical line; they
+remain valid in hierarchical mode.
 
-F1 avoids a breaking behavior change and matches the current doc contract:
+1. If no line begins with a flat verb, parse the body as hierarchical config.
+2. If any line begins with a recognized flat verb, every significant line must
+   begin with a recognized flat verb. A typo such as `sett` is an unrecognized
+   flat verb at that line, not an implicit bare `set` path and not hierarchical
+   fallback.
+3. Flat override accepts only `set` and `deactivate`. Reject `delete` and
+   `activate` with a line-numbered diagnostic directing the caller to
+   `load set` or `load merge`; those are edit verbs with no unambiguous meaning
+   against a fresh replacement tree.
+4. Apply all `set` lines to a detached empty `ConfigTree`, then apply
+   `deactivate` lines so a canonical `show | display set` artifact is
+   order-independent. A missing deactivate target rejects the complete load.
+   Comments-only/empty input produces a valid empty tree.
+5. A flat/hierarchical mixture is an error at the first conflicting line.
 
 ```go
-func parseOverride(content string) (*config.Node, error) {
-    if detectFlatConfig(content) {
-        working := config.NewRoot()
-        if err := applyFlatLinesAtomically(working, content); err != nil {
-            return nil, err
-        }
-        return working, nil
-    }
-    return parseHierarchicalStrict(content)
-}
+func classifyOverride(content string) (overrideFormat, []flatOverrideLine, error)
+func parseFlatOverride(lines []flatOverrideLine) (*config.ConfigTree, error)
+func parseHierarchicalOverride(content string) (*config.ConfigTree, error)
 ```
 
-Format selection must reject mixed flat/hierarchical non-comment lines. Failed
-loads leave candidate bytes, generation, dirty state, and lease timestamp
-unchanged.
+Only after complete parse/replay succeeds does `LoadOverrideAs` swap the
+candidate and update generation/dirty/lease state. Every error leaves candidate
+bytes and metadata unchanged.
 
 ### 5.8 Workstream G - validate persisted AST shape and retain compiler belts (K003-04)
 
@@ -342,14 +417,23 @@ if len(afNode.Keys) >= 2 {
 ```
 
 The compiler guard is defense in depth, not the primary persisted-data contract.
-After JSON unmarshal and before a persisted candidate/active tree reaches any
-compiler, recursively validate the structural minimum that every `Node` has a
-non-empty `Keys` slice and non-empty first key. A malformed persisted tree
-returns a typed load error so daemon bring-up takes the existing safe bootstrap /
-lifeline path; it must not boot a partially omitted interface configuration.
+In `DB.ReadActiveMeta`, immediately after JSON unmarshal and before the tree is
+returned, recursively validate the actual persistence shape:
+
+- the `*ConfigTree` is non-nil (an empty object with no children remains valid);
+- every descendant pointer in `Children` is non-nil;
+- every descendant `Node` has `len(Keys) > 0`;
+- every child recursively satisfies the same rules.
+
+Do **not** require `Keys[0] != ""`: a quoted empty key is structurally valid AST
+data whose semantic rejection belongs to Workstream B and other strict schema
+gates. A structural violation is wrapped as `ErrConfigDBUnreadable`. Daemon
+bring-up must refuse startup and refuse overwrite of `active.json`; it does not
+enter compile-failed bootstrap/lifeline mode. That distinction is the existing
+#1917 persistence contract.
 
 ```go
-func ValidatePersistedNodeShape(root *Node) error
+func ValidatePersistedTreeShape(tree *ConfigTree) error
 ```
 
 Peer HA sync is out of this trace because it reparses text and cannot create an
@@ -358,53 +442,81 @@ unguarded `Keys[n]` reads, but do not turn this workstream into a parser rewrite
 
 ### 5.9 Workstream H - share exact route-map expansion cardinality (K003-08)
 
-The guard must use the same family expansion as the renderer. Move the family
-reference count into `pkg/config` or a dependency-neutral callback so `pkg/frr`
-and validation cannot implement separate formulas.
+The guard and renderer must use one family expansion owned by `pkg/config`.
+Move the current `prefixListFamilies` classification there and make `pkg/frr`
+consume it. For each `from prefix-list` name,
+the count contributes one reference for v4-only, v6-only, nil/undefined, or
+empty lists and two for a mixed-family list. Sum those expanded references
+before multiplying the other OR dimensions and route-filter family split.
 
 ```go
-func RouteMapSequenceCountExact(
+type PrefixListFamily uint8
+
+const (
+    PrefixListIPv4 PrefixListFamily = iota + 1
+    PrefixListIPv6
+)
+
+const MaxRouteMapTermSequences = 65535/10 - 1
+
+func PrefixListFamilies(pl *PrefixList) []PrefixListFamily
+func RouteMapTermSequenceCount(
     po *PolicyOptionsConfig,
     ps *PolicyStatement,
 ) uint64
-
-func ComposedChainSequenceCountExact(
+func ComposedRouteMapTermSequenceCount(
     po *PolicyOptionsConfig,
-    chain []*PolicyStatement,
+    chain []string,
 ) uint64
+func RouteMapHighestSequence(termCount uint64) uint64
+func RouteMapSequenceFits(termCount uint64) bool
 ```
 
-Retain existing exported signatures for source compatibility, but remove them
-from safety decisions. They may return a documented conservative upper bound
-(two references per non-empty prefix-list name) when no policy-options context
-is available. Strict gates and both FRR render belts must call the exact helpers.
-Saturating arithmetic and the trailing default sequence remain included.
+The two count functions return only emitted term sequences. The composed count
+stops after the first member with an explicit policy default, exactly where the
+renderer stops. Every rendered single or composed map then emits exactly one
+terminating/default sequence. `RouteMapHighestSequence` is the saturated value
+`10 * (termCount + 1)` and `RouteMapSequenceFits` compares that value with
+65535. This separates cardinality from the reserved terminal row instead of
+pretending the default is a term.
+
+Replace the existing exported helpers rather than retaining an estimate under
+an exact-sounding name. Repository search shows every caller is internal: the
+single-policy strict gate, composed-chain strict gate, single-policy FRR belt,
+composed-chain FRR belt, and tests. Migrate all of them in the same PR. No safety
+caller may use a context-free wrapper or compare a raw count directly with a
+separately derived maximum. Saturating arithmetic, undefined/empty-list
+single-family fallback, prefix-list family expansion, chain termination, and
+the one terminal reservation must be shared by gate and renderer.
 
 ### 5.10 Workstream I - align accepted RG IDs with dataplane capacity (K003-10)
 
-Two options exist:
-
-- **I1, recommended:** reject any RG definition or interface binding that can
-  reach userspace-shim HA state with ID outside 0..15. Add a shared Go capacity
-  constant and cross-language drift canaries for the BPF map and Rust epoch
-  domain. Lenient load warns and quarantines the invalid RG/interface binding;
-  runtime methods return an explicit capacity error before touching maps.
-- **I2:** widen BPF maps, pinned-map ABI, Go inventories, Rust arrays, epoch
-  encoding, helper protocol, and migration behavior to 256 entries.
-
-I2 is not a bug-fix-sized change and risks incompatible pinned maps. It should be
-a separate capacity enhancement only if product requirements need more than 16
-active groups. I1 closes the green-commit/permanent-blackhole behavior without a
-state migration.
+Select a global product limit of 16 groups, IDs 0..15. Userspace inventory seeds
+every configured RG, including an otherwise unused definition, so a narrower
+"dataplane-bound" reachability predicate is not real. Strict validation rejects
+every out-of-range `chassis cluster redundancy-group` definition before any
+interface/policy reachability analysis.
 
 ```go
+// pkg/config: lowest-layer product contract.
 const MaxDataplaneRedundancyGroups = 16
 
 func ValidateDataplaneRGID(id int) error
 ```
 
-The validation message must distinguish the 16-entry dataplane limit from the
-unrelated heartbeat uint8 limit and the RETH-derived VRID limit.
+`pkg/dataplane.MaxRedundancyGroups` becomes an alias of the config constant.
+Source/ABI canaries prove equality with BPF `MAX_REDUNDANCY_GROUPS`, shim map
+specs, and Rust `MAX_RG_EPOCHS`; widening remains a separately researched pinned
+map/protocol migration.
+
+On tolerant persisted/peer load, retain the config for diagnosis and emit a
+warning, but mark the userspace forwarding snapshot unsupported before any map
+or helper publication. The helper retains its previous-good snapshot; on fresh
+boot it remains default-deny and the node cannot arm HA forwarding. Do not
+selectively drop an RG or its interface bindings. Runtime `UpdateRGActive`,
+inventory build, map sync, and helper publication also reject IDs >=16 before
+partial mutation. The diagnostic distinguishes this product limit from the
+heartbeat uint8 and RETH-derived VRID limits.
 
 ### 5.11 Workstream J - merge repeated global address-book containers (K003-06)
 
@@ -416,10 +528,11 @@ func ensureGlobalAddressBook(sec *SecurityConfig) *AddressBook
 func compileGlobalAddressBooks(nodes []*Node, sec *SecurityConfig) error
 ```
 
-Preserve existing duplicate-name semantics. If duplicate definitions are
-illegal, the strict duplicate validator must reject them before merge; if
-repeated blocks are legal, entries merge in source order without replacing the
-container. Do not silently introduce last-wins behavior.
+Mandate the existing `parseAddressBookEntries` contract: repeated blocks form a
+union by object name; same-name address fields merge through `mergeAddressNode`;
+and address-set members are de-duplicated while preserving first-seen source
+order. The outer-container fix must not replace the accumulated book or invent a
+new duplicate-resolution rule.
 
 ### 5.12 Workstream K - retain routing ownership on transient lookup errors (K003-11)
 
@@ -447,15 +560,58 @@ Define one semantic predicate at the decoded-event boundary:
 
 ```go
 func eventHasForwardingAction(eventType uint8) bool
-func normalizedEventAction(evt Event) (name string, binary uint8, applicable bool)
+func normalizedEventAction(eventType, wireAction uint8) (
+    name string,
+    binary uint8,
+    applicable bool,
+)
 ```
 
-SESSION_OPEN and SESSION_CLOSE have no forwarding action. Trace and text output
-omit `action`; REST/SSE represent it as absent rather than `deny`; binary uses
-the existing `actionNotApplicable` value `0xff` for both. POLICY_DENY,
-FILTER_LOG, SCREEN_DROP, and any event carrying a real forwarding verdict retain
-their current action. Do not change the Rust event-stream wire layout or the
-intentional producer byte zero.
+SESSION_OPEN and SESSION_CLOSE have no forwarding action. Normalize both to
+`name="n/a"`, `binary=0xff`, and `applicable=false` at both EventRecord decode
+entry points. Plain/structured syslog and flow trace omit `action=` when false.
+REST, SSE JSON, gRPC, and CLI keep their existing required scalar field shape
+and expose the explicit string `"n/a"`; this avoids a JSON/protobuf presence
+change. Event filtering becomes exact and honest: `action=deny` excludes
+lifecycle records and `action=n/a` selects them. Binary uses 0xff for both.
+
+POLICY_DENY, FILTER_LOG, SCREEN_DROP, and any event carrying a real forwarding
+verdict retain their existing action and severity. Cover the live ring path and
+decode-only path so trace, buffer, API, filters, and binary cannot diverge. Do
+not change the Rust event-stream wire layout or the intentional producer byte
+zero.
+
+### 5.14 Workstream M - reject unsupported nested zone-policy containers (K003-05)
+
+Add an AST-shape gate after inactive stripping and apply-groups expansion but
+before `compilePolicies` can silently skip an unrecognized container. For every
+direct `security policies from-zone` child, the gate accepts only one of the two
+existing canonical representations:
+
+- the combined hierarchical node with exact keys
+  `from-zone <src> to-zone <dst>`; or
+- the flat `SetPath` chain whose `from-zone` node contains source instances,
+  each containing `to-zone` and destination instances.
+
+A hierarchical `from-zone <src> { to-zone <dst> { ... } }`, a partial combined
+key tuple, or a malformed flat chain is rejected with a path-qualified message
+that shows the supported combined syntax. Do not reinterpret or lower the
+unsupported hierarchy: Junos/vSRX does not document it, and accepting an
+approximation would turn an honesty fix into invented compatibility.
+
+```go
+func validateSecurityPolicyContainerShapes(root *ConfigTree) error
+```
+
+This is another action-agnostic fail-closed exception to tolerant warnings. A
+silently omitted nested deny under `default-policy permit-all` is a concrete
+scope widening, while silently omitted permit rules cause an unexplained
+outage. Strict and tolerant compile therefore return an error. `Store.Load`
+keeps the source tree for recovery but returns the existing compile-failed
+classification so boot stays in lifeline/default-deny without interface
+takeover. `Store.SyncApply` rejects the peer generation and retains the exact
+previous active and compiled snapshots. Workstream M links to #4313 for the
+closed-world doctrine but has its own child issue and rollback boundary.
 
 ### 5.15 Recommended issue and merge waves
 
@@ -465,12 +621,12 @@ one owner and close condition.
 | Wave | Parallel workstreams | Reason |
 |---|---|---|
 | 1 | A (VIP race), C (SNMP intent), D (flowless ICMP), E (DDNS ownership) | Highest security/availability value; disjoint packages and files |
-| 2a | B (empty identities), G (persisted AST bounds), J (address book) | Shared `pkg/config` surface; implement in separate worktrees but merge/rebase serially and rerun all config tests after each |
+| 2a | B (empty identities), G (persisted AST bounds), J (address book), M (nested policy shape) | Shared `pkg/config` surface; implement in separate worktrees but merge/rebase serially and rerun all config tests after each |
 | 2b | F (LoadOverride), H (route-map count), I (RG capacity) | Mostly independent, but H/I consume config APIs and must rebase after 2a |
 | 3 | K (routing ownership), L (lifecycle action) | Independent correctness/observability work with lower immediate blast radius |
 
-K003-02 remains with #6548, and K003-05 remains with #4313. K003-12 and
-K003-C create no child issue.
+K003-02 remains with #6548. K003-05 gets a child issue linked to #4313 but does
+not claim vSRX parity. K003-12 and K003-C create no child issue.
 
 ## 6. Public API preservation
 
@@ -486,18 +642,20 @@ The implementation plan preserves these signatures and wire contracts:
 - Rust event-stream record layout and event action byte;
 - binary event record length and field offsets;
 - BPF pinned map specifications and helper protocol in the recommended RG path;
-- existing `RouteMapSequenceCount` and `ComposedChainSequenceCount` exported
-  signatures, retained as compatibility wrappers while safety call sites move to
-  context-aware exact helpers.
+- route-map helpers intentionally become the context-aware term-count and
+  highest-sequence/fit APIs in Workstream H; all repository callers migrate
+  atomically because a context-free exact count is impossible.
 
 Intentional behavior changes are fail-loud validation, not API removal:
 
 - malformed empty security identities stop committing;
-- unsupported nested policy containers are handled by #4313, not this plan;
-- dataplane-bound RG IDs above 15 stop committing under I1;
+- unsupported nested policy containers stop committing under a child issue
+  linked to #4313;
+- every RG definition above 15 stops committing under the selected global limit;
 - mixed-format override input is rejected atomically;
 - invalid SNMPv3 credential combinations stop installing a downgraded user;
-- lifecycle APIs stop calling a non-applicable action `deny`.
+- lifecycle APIs stop calling a non-applicable action `deny` and return the
+  existing string field as `"n/a"`.
 
 ## 7. Hidden invariants the changes must preserve
 
@@ -516,9 +674,10 @@ Intentional behavior changes are fail-loud validation, not API removal:
 5. **Persisted AST integrity:** an invalid JSON node tree is rejected at the
    deserialization boundary and cannot reach an unsafe compiler walk; local
    indexing belts still remain length-safe.
-6. **Route-map guard equals renderer:** exact count includes every family
-   expansion, OR-product dimension, composed chain, and trailing default while
-   preserving saturating arithmetic.
+6. **Route-map guard equals renderer:** term count includes every family
+   expansion, OR-product dimension, and reachable composed-chain member, while
+   the shared highest-sequence/fit helper reserves exactly one terminal row.
+   Both layers preserve saturating arithmetic.
 7. **HA capacity consistency:** accepted IDs fit BPF arrays, Go inventories,
    Rust epoch state, helper messages, heartbeat fields, and derived VRIDs. A
    range error occurs before any partial state publication.
@@ -540,8 +699,13 @@ Intentional behavior changes are fail-loud validation, not API removal:
     contention.
 14. **Determinism:** strict validation and duplicate diagnostics remain stable
     across map iteration order, repeated blocks, and HA replay.
-15. **Tolerant-path no-brick rule:** malformed persisted state produces bounded,
-    attributable warnings and safe omission; it does not crash startup.
+15. **Tolerant-path safety classes:** legacy semantic violations normally warn,
+    but empty security identities return the existing compile-failed class and
+    enter lifeline/retain-previous behavior. Structurally malformed persisted
+    JSON returns `ErrConfigDBUnreadable` and startup refuses to overwrite it.
+16. **Unsupported policy shape is never omission:** canonical combined and flat
+    zone-pair containers compile identically; every other `from-zone` container
+    fails before typed policy construction on strict and tolerant paths.
 
 ## 8. Risk assessment
 
@@ -553,8 +717,8 @@ Intentional behavior changes are fail-loud validation, not API removal:
 | Performance regression | LOW | One copied byte on a rare flowless path; all other work is cold path | No new packet reads/allocations; userspace throughput baseline and perf smoke for K003-01 only |
 | State/ownership corruption | HIGH | DDNS wrong-backend delete and routing ownership loss are explicitly stateful | Fingerprint proof, retain-on-uncertainty, injected failure/retry tests |
 | HA compatibility | MEDIUM | RG acceptance changes and config leniency must be identical on both peers | Mixed strict/lenient tests, peer-snapshot tests, userspace HA smoke |
-| Public API regression | LOW-MEDIUM | Signatures remain, but invalid configs and lifecycle JSON semantics intentionally change | Compatibility wrappers, release notes, schema/golden tests |
-| Architectural mismatch | MEDIUM | Mega-batching repeats the #961/#946 Phase-2 dead-end pattern; RG widening would create a pinned-map migration project | Path A split; choose RG clamp I1; no broad parser or ABI redesign |
+| Public API regression | MEDIUM | Route-map Go helpers gain required context and lifecycle strings change from false `deny` to `n/a` | Migrate every repository caller atomically; release notes; REST/gRPC/CLI/filter golden tests |
+| Architectural mismatch | MEDIUM | Mega-batching repeats the #961/#946 Phase-2 dead-end pattern; RG widening would create a pinned-map migration project | Path A split; global RG clamp; no broad parser or ABI redesign |
 
 ## 9. Test and validation plan
 
@@ -563,44 +727,66 @@ Intentional behavior changes are fail-loud validation, not API removal:
 Every implementation PR begins with a red test or deterministic reproducer that
 passes on the fix and fails when the fix hunk is reverted.
 
-- **A / VIP race:** deterministic reset-between-check-and-write seam, concurrent
-  apply/HA event test, and `go test -race ./pkg/daemon`.
+- **A / VIP race:** helper-level atomicity under concurrent reset/mark/clear, a
+  source canary that permits no direct `vipWarnedIfaces` access outside the
+  helpers, concurrent apply/HA event coverage, and `go test -race ./pkg/daemon`.
 - **B / empty identities:** flat-set and hierarchical strict failures for empty
-  zone, pair side, policy name, and global list element; lenient warnings;
-  previous-good snapshot retention without scope widening.
+  zone, pair side, policy name, and global list element; persisted `Store.Load`
+  compile-failed boot classification; `SyncApply` rejection with byte-identical
+  previous active/compiled snapshot; no userspace or host-inbound publication.
 - **C / SNMP:** table of noAuth/auth/privacy protocol-password combinations;
-  strict and lenient compiler tests; packet tests proving noAuthNoPriv and
-  authNoPriv requests are rejected when configured intent is stronger.
+  strict and lenient compiler tests; valid-to-invalid hot reconfigure proves the
+  old user disappears atomically and warning/status names it; packet tests prove
+  noAuthNoPriv and authNoPriv requests are rejected when configured intent is
+  stronger.
 - **D / flowless ICMP:** IPv4 type 3/11/12 and IPv6 type 1/2/3/4 global admits;
   ND 133..137 where relevant; non-first fragment remains denied; unrelated ICMP
   remains denied; native-GRE and interface-NAT flowless entry coverage.
 - **E / DDNS:** distinct v4/v6 fake servers; explicit backend-less v6 disable;
   both blocks removed; retained-server disable (negative control that must still
   choose the correct updater); updater-construction failure; matching/mismatching
-  fingerprints; delete failure; no-op delete; restart with no prior updater;
-  ownership retained on ambiguity.
-- **F / LoadOverride:** flat valid input, hierarchical valid input, comments and
-  blanks, mixed format rejection, malformed mid-file command, candidate byte
-  equality and generation/dirty/lease invariance on failure.
+  fingerprints; A -> B -> C with A deletion failure; authority survives repeated
+  transitions and delete retry; catalog GC only after ownership save; restart
+  with no historical updater; unknown fingerprint; ownership retained on every
+  ambiguity; no secret serialized to the ownership file; fallback resolution
+  never registers an updater, changes a fingerprint, or erases older authority.
+- **F / LoadOverride:** flat valid input, hierarchical valid input, blank,
+  full-line and inline comments, optional trailing semicolon, multiline block
+  comment rejection in flat mode, set-before-deactivate normalization, missing
+  deactivate target, delete/activate rejection, mixed format rejection,
+  typoed/malformed mid-file command, empty override, candidate byte equality and
+  generation/dirty/lease invariance on failure.
 - **G / AST bounds:** malformed persisted JSON is rejected before compile;
-  handcrafted empty-Keys family node cannot panic the compiler; valid persisted
-  JSON still loads; peer text sync remains a negative reachability control; add
-  the malformed tree as a no-panic fuzz seed.
-- **H / route-map:** count equals actual rendered rows for v4-only, v6-only,
-  dual-stack, empty/undefined lists, route-filter family split, community and
-  AS-path products, composed chains, and 65535 boundary cases.
-- **I / RG:** strict IDs 0, 15, 16, 155, 156, and 255 across normal RETH,
-  private-election, no-RETH, unused definition, and interface binding; lenient
-  quarantine; runtime manager rejection before map/helper mutation; constant
-  drift canaries for Go/BPF/Rust capacity.
+  null child and empty-Keys descendant are `ErrConfigDBUnreadable`; quoted empty
+  `Keys[0]` remains structurally accepted for semantic validation; handcrafted
+  empty-Keys family node cannot panic the compiler; valid empty/populated JSON
+  still loads; peer text sync is a negative reachability control; add malformed
+  trees as no-panic fuzz seeds.
+- **H / route-map:** term count equals actual rendered term rows for v4-only,
+  v6-only, dual-stack, empty/undefined lists, mixed route-filter x mixed
+  referenced-list products, multiple referenced names, community and AS-path
+  products, and terminating/nonterminating composed chains; highest-sequence
+  separately equals the renderer's final row at 65535 boundaries; no
+  context-free safety caller or raw-count ceiling comparison remains.
+- **I / RG:** strict IDs -1, 0, 15, 16, 155, 156, 255, and 256 across normal RETH,
+  private-election, no-RETH, unused definition, and interface binding; tolerant
+  load preserves config but rejects the whole forwarding snapshot; runtime
+  rejection before map/helper mutation; constant drift canaries for
+  config/dataplane/BPF/shim/Rust capacity.
 - **J / address book:** repeated outer blocks, repeated global blocks, duplicate
   legal entries, duplicate illegal names, references to first and later blocks,
   deterministic diagnostics.
 - **K / routing:** genuine not-found, transient `LinkByName`, `LinkDel` failure,
   subsequent retry recovery, and ownership-map assertions for bond and tunnel.
 - **L / lifecycle action:** golden events originating from actual Rust wire bytes
-  for OPEN/CLOSE across trace, binary, REST, SSE, and standard text; real policy
-  deny/filter/screen events remain deny/reject/drop.
+  for OPEN/CLOSE across both decode paths, trace, binary, REST, SSE, gRPC, CLI,
+  standard/structured text, and exact action filters; real policy
+  deny/filter/screen events remain deny/reject/drop with unchanged severity.
+- **M / nested policy shape:** canonical combined hierarchical and flat
+  `SetPath` forms remain accepted; nested/partial/malformed containers fail in
+  both strict and tolerant compilers with the canonical syntax in the message;
+  persisted boot enters compile-failed lifeline/default-deny and `SyncApply`
+  retains a byte-identical previous active/compiled snapshot.
 
 ### 9.2 Required local gates
 
@@ -643,8 +829,8 @@ deviation and returns to review.
 
 - Engineering, production code, child issues, or pull requests during this
   `/research` run.
-- Reimplementing #6548's local CLI fix or #4313's unsupported-shape gate under
-  another issue.
+- Reimplementing #6548's local CLI fix or broadening #4313 beyond K003-05's
+  concrete security-policy-container gate.
 - A syslog handshake-deadline change based on K003-12.
 - Filing or engineering the undocumented 128-item cohort.
 - Broad AST/parser normalization across all configuration packages.
@@ -657,43 +843,42 @@ deviation and returns to review.
 - Unrelated DDNS ownership, SNMP feature expansion, FRR rendering, or routing
   reconciliation improvements discovered while implementing a child issue.
 
-## 11. Open questions for adversarial review
+## 11. Resolved adversarial decisions
 
-Each question may justify `PLAN-KILL` for the affected workstream or the whole
-batch split.
+Round one closed the design choices rather than delegating them to implementors:
 
-1. Is Path A sufficiently independent, or do any retained roots share an
-   invariant that requires one atomic implementation PR?
-2. Does any current open issue beyond #6548 already own one of the retained
-   source paths closely enough that this plan would duplicate work?
-3. Does #4313's per-subtree closed-world scope unambiguously own K003-05, or is a
-   narrowly linked child issue needed there without claiming feature parity?
-4. For K003-09, does honoring the existing flat-override API contract via F1
-   create dangerous `delete` semantics on a new empty tree, making F2 rejection
-   the safer choice?
-5. For K003-10, is 16 active RGs an intentional product limit that should be
-   documented and rejected globally, or is there a committed near-term need for
-   the I2 256-entry ABI migration?
-6. Can DDNS ever have more than one historical backend fingerprint represented
-   in owned records for a family? If yes, are the current one-cycle
-   `lastLiveUpdater` anchors sufficient, or must cleanup authority be persisted
-   per backend identity before K003-03 can be safely engineered?
-7. Should invalid SNMPv3 users be omitted entirely on lenient load, or retained
-   as disabled status objects so operators can diagnose them through show/API
-   surfaces without exposing a request handler?
-8. Is `null`/absent action acceptable for existing REST/SSE clients, or must the
-   API preserve a string field with an explicit `n/a` value while binary uses
-   `0xff`?
-9. Does a dedicated VIP warning mutex cover every access, including test seams
-   and reset paths, without establishing a lock-order edge to `directVIPMu` or
-   `applySem`?
-10. Are strict/lenient gates enough for malformed `Keys`, or should persisted
-    Node deserialization gain a global structural validator before any compiler
-    walk? If the latter is required, should K003-04 be killed as too narrow and
-    replaced by a separately researched parser-boundary project?
-11. Is a conservative compatibility wrapper for exported route-map counts safe,
-    or should the public signatures change in one release so every caller must
-    supply `PolicyOptionsConfig`?
-12. Does any retained Low-severity workstream (address-book merge or lifecycle
-    display) fail the value-to-churn bar and deserve `PLAN-KILL` rather than an
-    implementation issue?
+1. Path A remains the recommendation. The config-heavy workstreams are separate
+   PRs but merge serially in waves; no root needs an atomic cross-package batch.
+2. The current issue snapshot found exact ownership only for K003-02 (#6548).
+   K003-05 is a live honesty/security gap with its own child issue; #4313 is the
+   related doctrine umbrella, not an exact owner. The fix rejects rather than
+   implements the noncanonical nested hierarchy.
+3. Flat override accepts complete `set` plus `deactivate` artifacts and rejects
+   destructive `delete`/`activate` verbs. This honors the documented API without
+   inventing replacement-tree edit semantics.
+4. Sixteen RGs is the current global product limit. A 256-entry ABI/pinned-map
+   migration is out of scope and requires separate research if product demand
+   appears.
+5. DDNS uses a same-family, fingerprint-keyed in-memory authority catalog across
+   arbitrarily many uninterrupted transitions. Historical authority is not
+   persisted with secrets; restart uncertainty retains ownership and alarms.
+6. An invalid SNMPv3 user is omitted from runtime registration on tolerant load
+   and named in warnings/status. There is no disabled protocol object that could
+   accidentally answer requests.
+7. Lifecycle APIs preserve their scalar field shape with `"n/a"`; text formats
+   omit the key and binary uses 0xff.
+8. VIP warning state has one dedicated mutex and helper-only access. It adds no
+   lock-order edge to `directVIPMu` or `applySem`.
+9. Persisted JSON gets a global minimum structural validator; K003-04 still owns
+   the local compiler indexing belt and bounded persistence hardening.
+10. Route-map term counters require `PolicyOptionsConfig`, while one shared
+    highest-sequence/fit helper owns the terminal-row reservation. No
+    conservative wrapper or raw-count comparison remains in a safety decision.
+11. The two Low-severity roots remain worth bounded child issues: repeated
+    address-book blocks silently lose configured objects, and false lifecycle
+    deny values corrupt SIEM/forensic classification. Their independent PRs may
+    still receive `PLAN-KILL` if a new reproduction disproves those impacts.
+
+Manual approval of this plan accepts those product choices. A material change to
+any one returns that child workstream to plan review rather than being improvised
+inside implementation.
