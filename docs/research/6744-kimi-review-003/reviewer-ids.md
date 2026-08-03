@@ -251,3 +251,27 @@ setup/protocol-worker lifetime, cluster-comms restart, notifier ordering,
 exact bulk-token, callback self-transition, and raw-actuator gaps. AGY's
 `PLAN-READY` missed those source-backed executable traces. Revision 12 closes
 the complete union before another immutable review round.
+
+### Round 12 - plan commit `1f1325f3348c5904e451e1e3b4dcd8cc8ec71bc6`
+
+- Codex direct hostile review: process session `81167`; reviewer session
+  `019fc8db-e071-79a1-9d83-ff8b412c2840`; valid output
+  `/tmp/6744-codex-r12.out`; verdict `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: process session `54130`; valid output
+  `/tmp/6744-agy-r12.out`; verdict `PLAN-READY`.
+- Claude Code CLI: process session `18402`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent SMR-method fallback: process session `19503`; reviewer session
+  `019fc8dc-53d4-7fc0-9aba-51b25ac6b933`; valid output
+  `/tmp/6744-smr-fallback-r12.out`; verdict `PLAN-NEEDS-MAJOR`. This is
+  explicitly not represented as an Anthropic-model review.
+
+Round 12 did not converge. Codex and the independent fallback found material
+heartbeat-snapshot, config/process namespace, peer-config preparation,
+helper-request lifetime, final-fabric/setup, canonical-digest, counter
+exhaustion, replay-ledger, and deadline gaps. The orchestrator's independent
+composition pass additionally found lifecycle-coordinator self-membership,
+missing local commit/rollback transaction APIs, ambiguous synchronous bulk
+membership, helper-wrapper reentrancy, and underspecified prepare-activation
+wire behavior. AGY's `PLAN-READY` missed these executable traces. Revision 13
+incorporates the complete valid union before another immutable review round.
