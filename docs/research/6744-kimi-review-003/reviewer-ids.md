@@ -304,3 +304,56 @@ Rust-helper process replacement empties session state without invalidating
 same-daemon continuity. AGY returned `PLAN-READY` with two valid nits for
 test-duration injection and warning deduplication. Revision 14 incorporates the
 complete valid union before another immutable review round.
+
+### Round 14 - plan commit `df53c23111385e84178d4025788468e82b58d31a`
+
+- Immutable checkout:
+  `/home/ps/git/xpf-worktrees/6744-plan-r14-review`; detached, locked, and clean.
+- Round-start issue comment:
+  <https://github.com/psaab/xpf/issues/6744#issuecomment-5172060141>.
+- Codex direct hostile review: process session `16721`; reviewer session
+  `019fc994-5708-7cf2-b941-3a4bac5a70cf`; verdict
+  `PLAN-NEEDS-MAJOR`.
+- AGY direct hostile review: valid output `/tmp/6744-agy-r14.out`; verdict
+  `PLAN-READY`. Earlier malformed and permission-denied invocations produced no
+  review and are not counted.
+- Claude Code CLI: valid infrastructure attempt recorded in
+  `/tmp/6744-claude-r14.out`; failed before analysis with the account
+  monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent non-Anthropic SMR-method fallback agent:
+  `019fc995-e384-7373-a1fc-ee8cf891e0bd`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic-model
+  review.
+- Round synthesis:
+  <https://github.com/psaab/xpf/issues/6744#issuecomment-5172300761>.
+
+Round 14 did not converge. Codex found nonterminating legacy dual-publication,
+unsafe NAT-reservation rollback, unproved worker-local delta loss, and omitted
+static-DNAT/kernel-session capacity. The independent fallback found erased tail
+tuple dependencies, local-tunnel/peer-authority provenance confusion, and
+contradictory migration scope. AGY supplied valid migration-metric and SNMP
+warning-key nits. The orchestrator additionally found the already-partial
+legacy-map domain, cross-retry ambiguity-descriptor loss, and the causal early
+maintenance-start/TailAck race. Revision 15 incorporates the complete valid
+union before another immutable review round.
+
+### Revision 15 pre-commit hostile design passes
+
+- Design reviewer agent `019fc9b0-48a6-7ac1-a98b-666db50676aa` returned
+  `PLAN-NEEDS-MAJOR`. It found that restart recovery trusted stale pinned cache
+  rows, the rollback program identity was not crash-durable, replacement NAT
+  needed separate incumbent/attempted reservation tokens, one global ambiguity
+  journal could not represent concurrent admitted batches, and static-DNAT
+  transition errors were not transactional.
+- Protocol reviewer agent `019fc9af-ea73-7370-ad82-f954d9c94c24` returned
+  `PLAN-NEEDS-MAJOR`. It found that the terminal sequence did not atomically
+  partition the Go capture bank, private mutation events lacked pre-mutation
+  authority, receive-tail work lacked independent frame/byte bounds, the
+  proposed early-maintenance receive state was unreachable under the mandatory
+  barrier, and provenance did not define legacy identity or safe demotion.
+- The orchestrator incorporated the valid union before creating the immutable
+  round-15 commit. It also corrected the capacity negotiation so a survivor can
+  re-export both nodes' promoted authority to a restarted peer; local creation,
+  receiver baseline, and transient tail capacity are now distinct fields.
+
+These are pre-commit design reviews, not formal round-15 verdicts.

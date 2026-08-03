@@ -2,13 +2,13 @@
 
 ## 1. Status
 
-**DRAFT v14 - round-thirteen major findings addressed; pending round-fourteen review**
+**DRAFT v15 - round-fourteen major findings addressed; pending round-fifteen review**
 
 - Issue: [#6744](https://github.com/psaab/xpf/issues/6744)
 - Source report: `/tmp/kimi-review-003.md`
 - Base: `origin/master` at `ad959117748181dabe46b8ddc2827de670380cea`
 - Branch: `research/6744-kimi-review-003`
-- Revision: 14
+- Revision: 15
 - Round-one plan SHA: `78891c3242a80b719bebdddc702087c07543e05b`
 - Round-two plan SHA: `01b67530e53016cf127d43c4a28c0582513718f8`
 - Round-one verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
@@ -155,6 +155,22 @@
   capacity from the actual fully replicated worker/store, single-map alias,
   DNAT, ledger, and transient-tail surfaces with a fail-closed versioned shim-map
   migration.
+- Round-fourteen plan SHA:
+  `df53c23111385e84178d4025788468e82b58d31a`.
+- Round-fourteen verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY `PLAN-READY`;
+  independent non-Anthropic SMR-method fallback `PLAN-NEEDS-MAJOR`. The Claude
+  Code CLI again failed before analysis at the account spend limit, so no
+  Anthropic-model verdict is claimed. Round fourteen did not converge;
+  revision 15 terminates legacy-map dual publication at a durably journaled
+  local cutover, preserves only the legacy map's proved starting domain, escrows NAT ownership
+  across ambiguous mutation prefixes, adds origin-qualified ambiguity cleanup,
+  makes worker delta loss monotonic and export-fatal, includes static DNAT and
+  kernel session maps in capacity, distinguishes capable-process and ephemeral
+  legacy-transport authority while inventorying stale peer incarnations,
+  applies coalesced tail tuple transfers with dependency-preserving
+  release/acquire phases, proves that the TailAck write fence and mandatory
+  all-fabric barrier order every successor maintenance BulkStart after final
+  ACK postcommit, and reconciles every stale migration-scope statement.
 - Mode: `/research`. Stop at `PLAN-READY` or `PLAN-KILL`. Do not write
   production code and do not open a pull request.
 
@@ -472,6 +488,10 @@ The warning carries a stable code and canonical path. Commit preflight
 deduplicates identical warning keys across local and peer-effective prepared
 views while retaining genuinely node-specific diagnostics; one source alias in
 one commit never produces two indistinguishable operator warnings.
+The key for this global alias warning is exactly `{warningCode, canonicalPath}`
+and deliberately excludes the chassis/evaluation node; node identity remains a
+separate diagnostic field and participates in keys only for warnings whose
+cause is genuinely node-specific.
 
 Normalization is a first-class compiler-preparation result, not a warning-side
 effect or a synthetic node that section dispatch later forgets:
@@ -2195,6 +2215,7 @@ type configInstallGate struct {
     pendingOutboundBulk   *pendingOutboundBulk
     pendingReceiveAck     *receiveAckCommit
     tailReceiveWindow     *tailReceiveWindow
+    mutationJournals      *ambiguousMutationJournalRegistry
     failedConfigMutation  *failedConfigMutation
     authorityApplyFailed  bool
     inboundBulkAuthorized bool
@@ -2260,7 +2281,12 @@ type tailReceiveWindow struct {
     phase                 tailReceivePhase // bulkAckWriting, receiving, or tailAckWriting
     bulkAckWriteConfirmed bool
     deadline              time.Time
+    maxUniqueTailRows     uint64
+    maxTailFrames         uint64
+    maxTailWireBytes      uint64
+    chargedUniqueTailRows uint64
     receivedTailCount     uint64
+    receivedTailWireBytes uint64
     receivedTailDigest    [32]byte
     generationLedger      *capableGenerationLedger
     lastWireGeneration    uint64
@@ -2289,12 +2315,43 @@ type generationLedgerSlot[K comparable] struct {
     occupied bool
 }
 
+type ambiguousMutationJournal struct {
+    helperGeneration uint64
+    peerProcessID     [16]byte
+    batchID           uint64
+    records           [clusterSyncBatchCapacity]ambiguousMutationRecord
+    count             uint16
+}
+
+type ambiguousMutationJournalRegistry struct {
+    slots [clusterSyncBatchInFlightCapacity]ambiguousMutationJournal
+    used  [clusterSyncBatchInFlightCapacity]bool
+    // fixed reusable arena; no allocation after startup
+}
+
+type ambiguousMutationRecord struct {
+    family          uint8
+    key             canonicalSessionKey
+    wireGeneration  uint64
+    beforeValid     bool
+    before          derivedSurfaceCleanupDescriptor
+    attemptedValid  bool
+    attempted       derivedSurfaceCleanupDescriptor
+    incumbentReservationValid bool
+    incumbentReservation originQualifiedNATReservation
+    attemptedReservationValid bool
+    attemptedReservation originQualifiedNATReservation
+}
+
 type bulkMemberState struct {
     generation uint64
+    valueValid bool
+    value      canonicalSessionValue // exact last accepted peer value for cleanup/replay
     present    bool
     installed  bool
     ambiguous  bool // exact attempted key retained across a partial helper batch
     seenRepairSerial uint64
+    seenTailSerial uint64
 }
 
 const (
@@ -2318,10 +2375,12 @@ const (
     protocolDuplicateWaitersPerEntry = 8
     helperSnapshotWorkerQueueCapacity = 1024
     clusterSyncBatchCapacity        = 256
+    ambiguousMutationJournalRecordCapacity = clusterSyncBatchCapacity
+    ambiguousMutationJournalSlotCapacity = clusterSyncBatchInFlightCapacity
     clusterSyncBatchDeadline        = 5 * time.Second
     clusterSyncBatchInFlightCapacity = 64
     captureTailBankCount       = 2
-    captureTailTotalByteCapacity = 256 << 20 // shared fixed-record credit pool
+    captureTailTotalByteCapacity = 256 << 20 // shared generated coalescer-row credit
     captureTailMaxRows         = 262144
     ownerRGExportStartDeadline = 5 * time.Second
     allSessionsExportServerBudget  = 120 * time.Second
@@ -3374,22 +3433,25 @@ The existing `beginSetup` admission slot remains held through capability
 resolution and `finishSetup` runs exactly once afterward; the new deadline
 therefore cannot create an unbounded post-auth setup/socket-buffer population.
 
-`syncMsgCapabilities = 30` has exactly 42 payload bytes: little-endian
+`syncMsgCapabilities = 30` has exactly 50 payload bytes: little-endian
 `version uint16`, little-endian `flags uint64`, nonzero
-`peerProcessID [16]byte`, `maxAcceptedLogicalSessions uint64`, and
-`maxCapturedTailRows uint64`. Both ceilings are nonzero and checked against
-local integer/memory bounds whenever any complete-bulk bit is advertised. An
-upgraded endpoint whose capacity plan cannot support complete bulk emits both
-as zero with all four complete-protocol bits clear; that is a valid partial
-capability for legacy ordinary traffic, but zero with any required bit is a
-protocol violation. `maxAcceptedLogicalSessions` is the receiver's
+`peerProcessID [16]byte`, `maxLocallyCreatedLogicalSessions uint64`,
+`maxAcceptedLogicalSessions uint64`, and `maxCapturedTailRows uint64`. All
+three capacities are nonzero and checked against local integer/memory bounds
+whenever any complete-bulk bit is advertised. An upgraded endpoint whose
+capacity plan cannot support complete bulk emits all three as zero with all
+four complete-protocol bits clear; that is a valid partial capability for
+legacy ordinary traffic, but zero with any required bit is a protocol
+violation. `maxLocallyCreatedLogicalSessions` is the node's checked ceiling for
+new locally sourced forward authority before peer promotion.
+`maxAcceptedLogicalSessions` is the receiver's
 reserved maximum peer-owned **forward logical sessions**, not a worker-table or
 shared-map entry count. `maxCapturedTailRows` is additional temporary mutation
 headroom during the two-stage baseline/tail transaction; it is not reusable
 baseline credit. Before capability setup the applied helper builds one immutable
 `SessionCapacityPlan` with:
 
-- `localSourceForwardCeiling`, the checked sum of every worker's local SessionTable
+- `workerLocalCreationForwardCeiling`, the checked sum of every worker's local SessionTable
   entry ceiling. This deliberately over-reserves: a forward plus a locally
   materialized reverse may consume two of those entries, so the number of local
   forward logical sessions can never exceed the sum.
@@ -3399,13 +3461,35 @@ baseline credit. Before capability setup the applied helper builds one immutable
   and its 4,096-row refresh/prune threshold is not an admission bound. Admission
   above this cap fails with a dedicated drop/pressure metric before publishing
   shared/BPF/worker state.
-- `localPhysicalForwardReserve = localSourceForwardCeiling +
-  localAuxiliaryForwardCeiling`; all non-peer forward origins must be classified
-  into one of those bounded classes before they can enter the shared store.
+- `localCreationForwardCeiling = workerLocalCreationForwardCeiling +
+  localAuxiliaryForwardCeiling`; all newly created non-peer forward origins must
+  be classified into one of those bounded classes before they can enter the
+  shared store. This is the advertised
+  `maxLocallyCreatedLogicalSessions`.
 - `peerForwardReserve = maxAcceptedLogicalSessions` and
   `peerTailReserve = maxCapturedTailRows`.
-- `physicalLogicalReserve = localPhysicalForwardReserve + peerForwardReserve +
-  peerTailReserve`, using checked arithmetic throughout.
+- `authorityForwardReserve = peerForwardReserve`, one shared physical reserve
+  for the complete local-plus-peer authority set. Local and peer provenance are
+  disjoint classifications of rows in that set, not additive independent
+  maxima. Promotion changes provenance without adding a row.
+- `physicalLogicalReserve = authorityForwardReserve + peerTailReserve`, using
+  checked arithmetic throughout.
+
+After bilateral capability exchange, checked addition derives
+`clusterAuthorityForwardCeiling = localCreationForwardCeiling +
+peer.maxLocallyCreatedLogicalSessions`. Both nodes require that same sum to fit
+**both** advertised `maxAcceptedLogicalSessions` values before enabling the
+complete protocol. All current forward authority represented by local plus
+peer provenance must remain at or below that cluster ceiling. New local
+admission checks its class ceiling and the cluster total; promotion consumes no
+new row but carries the peer namespace in `LocalAuthoritySource::Promoted`, so
+takeover cannot erase the accounting class. This permits a node that has taken
+over both nodes' sessions to export the complete cluster authority back to a
+restarted peer. Merely proving one node's creation ceiling fits the peer reserve
+is explicitly insufficient. Independently, every local runtime enforces total
+local-plus-peer authority at or below its `authorityForwardReserve`; a peer bulk
+that temporarily owns the whole cluster and ordinary local admission therefore
+cannot consume the same physical credit twice.
 
 The planner validates the **actual receiving topology**, not the legacy map
 names or status approximation. Every worker receives replicas of all local and
@@ -3416,8 +3500,60 @@ two-entry-per-logical bound. There is one AF-agnostic userspace-XDP
 install at most four distinct redirect keys (canonical forward, translated
 forward, reverse wire, and reverse canonical), while its synthesized reverse is
 already one of that set. Its entry ceiling must therefore be at least
-`4 * physicalLogicalReserve`. Each v4 and v6 DNAT map must independently hold
-`physicalLogicalReserve`, because an all-one-family SNAT population is valid.
+`4 * physicalLogicalReserve`.
+
+The persistent kernel `sessions` and `sessions_v6` maps are separate production
+surfaces even though userspace forwarding does not consult them. The Go receive
+and status paths publish forward plus reverse rows there, so **each family**
+must independently reserve `2 * physicalLogicalReserve`; an all-v4 or all-v6
+population is valid. Failure on either map is a typed partial batch result and
+keeps continuity closed rather than silently degrading operator-visible session
+truth.
+
+Each `dnat_table` family shares one 10,000,000-row map between dynamic
+reverse-SNAT entries (`flags=0`) and compiler-owned static DNAT entries
+(`flags=1`). Define `staticDNATTransitionV4` and `staticDNATTransitionV6` as the
+checked cardinality of the union of the currently installed static keys and the
+exact prepared config's static keys, because `compileNAT` writes the new set
+before deleting stale rows. Each family independently requires
+`physicalLogicalReserve + staticDNATTransitionV{4,6} <= mapMaxEntries`.
+The daemon obtains one generation-bound `StaticDNATTransitionLease` from the
+helper before touching either map. The lease closes local/peer session and
+config admission, joins every in-flight dynamic DNAT publish/delete, and makes
+every exact worker ACK a packet-loop command that pauses new dynamic-map
+mutation for the bounded lease. Workers continue forwarding established rows
+but postpone expiry/removal rather than block or allocate; new session admission
+is already closed, so no new dynamic key can appear. Lease timeout aborts config
+apply and resumes workers under the old config. Helper replacement/config
+cancellation joins or invalidates it.
+Under that stable surface, typed map iteration reads the exact current static
+rows and authoritative dynamic key/digest. Iterator termination and every
+lookup error are errors, never end-of-map.
+
+Before mutation, the compiler stores a bounded rollback journal containing each
+touched key's exact prior absent/static value. Typed writes install the prepared
+static set, then typed compare-deletes remove stale static rows only when the
+full current value still equals the journaled `flags=1` value. Every write and
+delete error stops the transition. Success requires a complete post-readback
+whose static count/digest exactly equals the prepared set and whose dynamic
+count/digest still equals the lease; only then does the planner record the new
+static cardinality, release queued dynamic producers, and allow config
+promotion. On failure it restores prior static values and removes exact newly
+inserted rows, then proves the old static and dynamic digests before releasing
+the old config. If rollback/readback is incomplete, the applied config remains
+old but forwarding/session admission stays closed with typed map-repair debt;
+it never claims an operational rollback.
+
+This lease ensures a dynamic row cannot consume transition headroom. A prepared
+config that cannot satisfy either inequality fails before map/helper/config
+mutation and leaves the old applied config and transport capacity intact.
+Static rows are not peer session credit and are never advertised as such. The
+prepared static key set must also be disjoint from every currently authoritative
+dynamic reverse-NAT key in the leased snapshot; equal keys are a semantic
+collision even if raw map cardinality would not grow. A collision rejects
+prepared apply rather than overwriting an established session's `flags=0` row
+with static `flags=1` state.
+
 The shared NAT and forward-wire indexes use slot handles into the coordinator
 store and reserve their checked two-alias and one-alias maxima rather than
 cloning complete entries. The generation ledger separately reserves
@@ -3431,43 +3567,126 @@ the capable protocol against that pin. I-c introduces a generated, versioned
 `userspace_sessions_v2` hash with `BPF_F_NO_PREALLOC`, cross-language
 `USERSPACE_SESSION_MAP_MAX_ENTRIES = 10_000_000` (the same hard ceiling already
 used by each userspace DNAT family), and inactive capacity planning.
-I-d performs a fail-closed side-by-side migration: load the new map/program,
-close local and peer session admission, cancel/join bulk and session producers,
-and install a generation-bound dual-publish adapter that applies every required
-refresh/delete/GC mutation to both old and v2 maps with one typed result. It then
-populates v2 from the exact coordinator store under one migration/authority
-token and readbacks count/digest. A daemon restart
-does not pretend the old pin reconstructs lost Rust SessionTables: an empty new
-coordinator store yields an empty v2 map and continuity stays false until peer
-repair. An in-process migration holds the same store serial through bounded
-populate plus a sealed mutation tail, then takes a short mutation barrier for
-the final dual-map digest comparison; no live Open/Delete exists in only one map
-generation. Partial dual-write is a migration failure that preserves closed
-admission and rolls back only after repairing the failed map from coordinator
-truth. The manager obtains and retains the old program handle for every
-pinned link, updates every eligible interface to the already-proved v2 program,
-and treats the set as one transaction: both maps remain dual-written while
-interfaces temporarily span program generations, and any link-update failure
-rolls every changed link back to its retained old handle before admission can
-reopen. It
-publishes the v2 helper/map generation only after all links and readbacks agree.
-The logical helper/status map accessor resolves to the generation-selected map;
-no caller hard-codes either pin name. It never removes or resizes the current
-stateful pin in place. The old pin and program handles are released only after
-the new helper/link generation is committed, all old-program leases are joined,
-capable repair has established the new map's session state, and the dual-publish
-adapter has retired through its own barrier.
+I-d performs a fail-closed side-by-side migration. It loads the new map/program,
+closes new local/peer session admission, cancels and joins bulk/wire producers
+and new-session installers, and takes the coordinator mutation barrier before
+installing any dual-publish adapter. Existing-session refresh/delete/GC remains
+live only through that serialized adapter and its sealed mutation tail; the
+packet dataplane is not silently frozen. The legacy map is not assumed complete: today's
+`publish_live_session_entry` writes up to four aliases sequentially, so a prior
+failure can leave any strict subset. Under the barrier the manager captures a
+bounded immutable `legacyPreservationDomain` of every readable legacy key and
+an initial `legacyExpectedSet` containing those key/value pairs plus checked
+count/digest. The domain never expands. Refresh/delete/GC admitted while links
+span generations transactionally updates or removes only keys in that domain
+and advances the expected set/digest; no Open can add a legacy key. The
+coordinator is authoritative for v2 and is populated exactly; the old map is
+authoritative only for the evolved expected subset and is repaired only to that
+state. A mismatch counter and structured error distinguish legacy-subset repair
+from v2/coordinator disagreement.
 
-For this version the planner requests `peerForwardReserve =
-localSourceForwardCeiling` so a symmetric pair can always exchange its full supported
-source set, and requests `peerTailReserve = min(captureTailMaxRows,
-captureTailTotalByteCapacity / max(v4RecordSize, v6RecordSize))`. It activates
+The generation-bound dual-publish adapter applies every required refresh,
+delete, and GC mutation to v2 and, only for keys in
+`legacyPreservationDomain`, to the
+old map with one typed result. An in-process migration holds the same store
+serial through bounded v2 population plus a sealed mutation tail, then takes a
+short mutation barrier to prove v2 count/digest equality with coordinator truth
+and old count/digest equality with the current `legacyExpectedSet`. Partial dual-write is a
+migration failure: admission stays closed, v2 is repaired from coordinator
+truth, and the old map is repaired to its current expected subset before any rollback.
+A daemon restart does not pretend an old pin reconstructs lost Rust
+SessionTables; an empty new coordinator yields an empty v2 map and continuity
+stays false until ordinary capable repair.
+
+The manager retains the old program handle for every pinned link and updates
+every eligible interface to the already-proved v2 program as one transaction.
+Before the first link update it atomically writes and fsyncs a root-owned
+bounded migration record containing schema version, `preCutover` phase, old/v2
+program identities, helper/map generations, and the sorted eligible-link-set
+digest; it contains no session payload or secret. After every link selects v2,
+the old leases join, and the final local barrier succeeds, it atomically fsyncs
+phase `committed` before retiring the old adapter. Record write/fsync failure
+aborts before the corresponding irreversible step.
+
+Before persisting `preCutover`, the loader opens the exact old program with its
+existing map replacements, verifies its program tag and referenced old-map ID,
+and pins that program at a migration-only bpffs path recorded by identity in the
+journal. The journal never names only an in-process FD. Restart reopens and
+re-verifies that pin before touching any link; a missing/mismatched rollback
+program or map identity fails closed. The rollback-program pin is removed only
+after a proved old-only rollback has placed a live reference on every eligible
+link, or after committed v2 cleanup makes rollback forbidden.
+Pin creation precedes the journal but no link mutation may occur between them.
+If journal persistence fails, the process verifies that every eligible link is
+still old before removing the new rollback pin. On startup, a migration-only
+rollback pin with no journal is an orphan only when all links and the selected
+map are proved old and its program tag/map ID match the installed old program;
+then it may be removed. Any no-journal mixed link set, mismatched orphan, or v2
+selection fails closed instead of guessing whether cutover began.
+
+Startup resolves this journal before helper/session/network admission. A
+`preCutover` record selects rollback even if links are mixed or the link set
+changed: reopen the verified pinned old program, update every
+surviving/eligible link to it, and join v2 leases. A daemon restart has lost Rust
+coordinator truth, so it then runs the normal explicit userspace restart flush
+against the old shim map (including stale `PASS_TO_KERNEL` rows), clears
+inactive v2 state, and starts with empty helper/session authority plus
+continuity false. The pinned cache is never called session truth and no
+pre-crash session preservation is claimed. The journal clears only after links,
+map flush/readback, helper-empty state, and old-only selector agree. A missing,
+corrupt, or unknown record with
+mixed/ambiguous programs fails closed. A valid `committed` record requires every
+eligible link to select the exact v2 program; startup repairs any newly
+discovered or stale link to v2, never selects the old map, and may
+finish old-pin cleanup. Because a restarted Rust coordinator is empty, it then
+runs the same explicit flush/readback against v2 under closed admission and
+leaves continuity false until
+ordinary repair; it does not import stale pinned rows as Rust truth. Corrupt or
+unknown records fail closed with an operator-visible remediation error rather
+than guessing a generation.
+
+Both maps remain dual-published while links temporarily span generations. Any
+link-update failure rolls every changed link back to its retained old handle,
+repairs both map domains, retires the migration adapter, restores the original
+old-only writer, and may reopen the exact pre-migration operational state only
+after the lifecycle/link set is revalidated. The inactive v2 map remains
+unselected for a later retry. Interface add/remove/rebind is frozen by the same
+lifecycle token; movement before the final barrier aborts through this rollback.
+After every link selects
+v2, all old-program leases have joined, the final local v2/coordinator barrier
+succeeds, and the committed record is durable, the cutover is irreversible:
+retire and join the old-map adapter,
+publish the v2 helper/map generation, and only then reopen local admission. No
+post-cutover writer can touch the old map and no later peer-repair failure can
+roll links or the adapter back. Old-pin/program cleanup is a local lifecycle
+operation after that barrier and is never gated on a capable peer, so standalone
+and mixed-version nodes terminate migration instead of dual-writing forever and
+eventually filling the 262,144-entry legacy map. Capable repair may establish
+HA continuity afterward, but it is not a map-migration prerequisite. The
+logical helper/status accessor resolves to the selected generation; no caller
+hard-codes either pin name, and the current stateful pin is never removed or
+resized in place.
+
+For this version the planner requests checked `peerForwardReserve =
+2 * localCreationForwardCeiling` so a symmetric pair can return the combined
+authority of both nodes after takeover, and requests `peerTailReserve =
+min(captureTailMaxRows,
+captureTailTotalByteCapacity / max(v4CapturedMutationFootprint,
+v6CapturedMutationFootprint),
+maxTailRowsAllowedByEveryPhysicalSurface(peerForwardReserve,
+staticDNATTransitionV4, staticDNATTransitionV6))`, with every generated
+footprint including the first-before descriptor and final state. The final term
+uses checked inverse 1x/2x/4x capacity arithmetic and may reduce transient tail
+credit, but never the cluster baseline reserve. It activates
 the complete capability only if both nonzero requests fit every inequality
 above; it does not quietly lower baseline reserve and then claim full symmetric
 HA. Failure leaves the transport partial-capability/continuity-unready rather
-than publishing a deceptive ceiling: all complete bits and both capacity fields
-are zero. Source capacity is the checked local source-forward ceiling. Each side independently requires its source capacity to fit
-the peer's advertised baseline reserve before enabling the complete protocol. During a
+than publishing a deceptive ceiling: all complete bits and all three capacity
+fields are zero. Before negotiation, source creation capacity is the checked
+`localCreationForwardCeiling`. After negotiation, each side computes the exact
+combined cluster-authority ceiling from both advertised creation capacities and
+requires it to fit both baseline reserves before enabling the complete
+protocol. During a
 bulk, physical surfaces retain the additional tail reserve because cross-worker
 event sequencing may expose an Open before the compensating Delete. Before
 TailAck, the receiver requires the ledger's final `present=true` count to be at
@@ -3497,13 +3716,14 @@ never emitted or interpreted without that negotiated bit. Valid capability resol
 the connection `capable`. Any other first
 post-auth frame resolves it `legacy` and is staged until after registration.
 The complete new authority/replay protocol requires all four defined bits and
-bilateral capacity compatibility: each node's checked source maximum must fit
-the peer's advertised accepted maximum, and each sender limits
+bilateral capacity compatibility: the checked sum of both nodes' advertised
+local-creation maxima must fit each node's advertised accepted maximum, and each sender limits
 unique capture-tail rows to `min(localCaptureRows, peerMaxCapturedTailRows)`. A
 valid advertisement
 missing any bit may carry ordinary traffic but cannot request, send, accept,
 ACK, or satisfy continuity with a bulk. Fabrics in one transport must agree on
-the defined-bit set, process ID, and both ceilings; unknown bits do not participate.
+the defined-bit set, process ID, and all three capacity fields; unknown bits do
+not participate.
 `syncMsgBulkTailEnd = 31` and `syncMsgBulkTailAck = 32` are emitted or accepted
 only when that complete capable bit set is negotiated; their exact 96-byte
 payloads are defined with the baseline markers below. Either type on a legacy or
@@ -3520,7 +3740,7 @@ zero/weak ID or asymmetric half-capable setup is permitted. An unexported
 per-instance entropy seam supports tests, never a package global.
 
 Both fabrics in one transport must resolve to the same setup class. Capable
-fabrics must also advertise the same process ID and capacity ceilings. A
+fabrics must also advertise the same process ID and all capacity fields. A
 capable/legacy mix or process/capacity mismatch rejects the newcomer, marks continuity unready, and retires the
 transport before retry; frames from two process lifetimes never mix. The bounded
 setup timeout classifies a silent/old peer as legacy; any later capability on
@@ -3560,7 +3780,7 @@ behind a modular `afxdp/ha/session_store.rs` `SyncedSessionStore`: a
 `FastMap<SessionKey, slotID>` indexes paged stable slots containing the existing
 `SyncedSessionEntry`, a bounded free-slot stack permits reuse, `liveExtent`
 bounds scans, and a checked nonzero `peerInventorySerial` advances whenever a
-forward row enters, leaves, or changes the `origin.is_peer_synced()` inventory
+forward row enters, leaves, or changes the explicit peer-authority inventory
 domain. This replaces the current `FastMap<SessionKey,
 SyncedSessionEntry>` representation rather than adding a second full key or
 entry copy. The current `nat` and `forward_wire` maps also clone complete
@@ -3574,11 +3794,98 @@ existing coordinator, worker-launch, reconcile, and shared-lookup call sites
 receive narrow wrapper methods; no caller can mutate one index independently or
 retain a slot reference after releasing the store guard.
 
+`SessionOrigin` remains packet/install lineage; it is not authority provenance.
+That distinction is required because the local-origin tunnel path deliberately
+uses `SessionOrigin::SyncImport` to select the coordinator install family even
+though no peer supplied the row. Add an explicit non-optional field to each
+forward authority record:
+
+```rust
+enum PeerAuthorityNamespace {
+    Capable { peer_process_id: [u8; 16] },
+    Legacy {
+        transport_epoch: u64,
+        connection_incarnation: u64,
+    },
+}
+
+enum LocalAuthoritySource {
+    Worker { owner_worker: u16 },
+    Promoted {
+        from: PeerAuthorityNamespace,
+        handoff_serial: u64,
+    },
+}
+
+enum SessionAuthorityProvenance {
+    LocalAuthoritative { source: LocalAuthoritySource },
+    LocalAuxiliary { class: LocalAuxiliaryClass },
+    PeerSynced { namespace: PeerAuthorityNamespace },
+}
+```
+
+Reverse/alias rows inherit the forward record's provenance and cannot choose it
+independently. Local tunnel admission uses `LocalAuxiliary`, may continue to use
+the sync-family installation mechanics, consumes auxiliary capacity, is never
+exported as locally worker-owned, and is never inventoried as peer authority.
+Wire import alone creates `PeerSynced`: a capable frame uses the authenticated
+or correlated daemon `peerProcessID`, while a legacy frame uses the exact
+ephemeral `{transportEpoch, connectionIncarnation}` that admitted it. Legacy
+transport identity is never promoted into a process identity and is invalid as
+soon as that transport retires **for new wire mutation authority**; retained
+rows keep the old namespace as source evidence and remain eligible for gated
+local takeover or later stale cleanup.
+
+Legacy compatibility keeps its current single-configured-peer trust without
+claiming stronger identity. An accepted legacy Open/Delete is bound to the
+currently registered connection incarnation before helper mutation. A same-key
+Open may transactionally replace an older legacy namespace and a current legacy
+delete may remove it under that existing trust, but both record the current
+ephemeral namespace and can never create capable generation or continuity
+proof. A legacy BulkStart snapshots the current transport namespace; present
+members rebind to it and exact legacy BulkEnd reconciliation removes absent old
+legacy namespaces through the existing stale-session path. Disconnect cancels
+that window. A delayed frame from a retired incarnation cannot mutate or relabel
+the retained row. When a later capable process appears, every surviving legacy
+namespace enters its generation-zero inventory as described below.
+
+Promotion to local ownership is one gated provenance transition to
+`LocalAuthoritative::Promoted`, retaining the source namespace and a checked
+nonzero handoff serial before positive authority publication. Demotion does
+**not** relabel a row merely because raw RG state changed. The producer gate
+first closes, positive forwarding is removed, and the row remains quarantined
+local authority, ineligible for export or admission, until an exact capable
+handoff finishes TailAck against the target peer process and the matching
+ownership transition commits. Only that transaction may relabel it
+`PeerSynced::Capable`. A legacy peer, no peer, failed/ambiguous TailAck, or
+ownership invalidation keeps the quarantined local provenance and repair debt;
+it may be cleaned up, but it cannot be presented as authority learned from an
+unproved peer. This also prevents a demotion/reconnect from inventing a fresh
+peer namespace for an old row.
+
+A generated exhaustive transition table covers all eight current
+`SessionOrigin` variants, both peer namespace variants, both local-authority
+sources, and every forward/reverse/materialized replica. Illegal combinations
+fail before shared/BPF/worker mutation. Authority-sensitive code may call only
+`is_peer_authority()`/`is_exportable_local_authority()` on provenance plus the
+current authority gate; a source canary rejects `origin.is_peer_synced()` in
+inventory, export, ownership, capacity, reconcile, promotion/demotion, and
+delete-authority decisions. `is_peer_synced()` remains permitted only for
+explicitly enumerated replication/install mechanics.
+
 Inventory captures `(peerInventorySerial, liveExtent)` under the recovered shared-
 store lock, then repeatedly locks only long enough to revalidate the serial and
 copy at most 256 fixed records from stable slots into the private stream queue.
-It filters to forward entries with `origin.is_peer_synced()`; synthesized
-reverse and every local/shared-materialized origin are excluded. Any peer-domain mutation,
+It filters to every forward entry with `PeerSynced` provenance, regardless of
+which capable-process or legacy-transport namespace created it; synthesized
+reverse and every local-authoritative/local-auxiliary record are excluded even
+when their install lineage is `SyncImport`. Rows matching the current capable
+`peerProcessID` preserve their generation. Rows from a prior capable process or
+any legacy transport remain in the inventory as generation-zero stale
+candidates in the new capable namespace, so an empty replacement authority
+deletes them rather than hiding them. A legacy connection never runs this
+capable inventory protocol and therefore cannot preserve or reassign a capable
+generation. Any peer-domain mutation,
 slot corruption, serial exhaustion, cancellation, or capacity violation aborts
 the stream instead of returning a fuzzy inventory. A final lock/revalidation
 precedes Final. The same credential-bound fixed-record Header/member/Final
@@ -3589,15 +3896,22 @@ without holding the shared mutex across socket backpressure. Legacy/BPF adapters
 cannot advertise the capable protocol and need no new inventory behavior.
 Local-only slot insert/remove/reuse does not advance `peerInventorySerial` and
 cannot change the filtered peer set; every slice still reads slots while locked.
-Any origin transition into or out of peer-synced forward authority, including
-replacement at the same key, advances the serial and invalidates the scan.
+Any provenance transition into or out of peer-synced forward authority,
+including replacement at the same key or peer-namespace replacement, advances the
+serial and invalidates the scan.
 The iterator seeds the
 stable generation ledger in place with keys, current values/generations when
-they belong to the same peer-process namespace, and generation zero membership
-when transitioning from legacy or a different peer process. The iterator checks
+they belong to the same capable-process namespace, and generation-zero
+membership when transitioning from any legacy transport or a different capable
+process. The iterator checks
 cancellation and row capacity every 256 entries and allocates no second key
 vector. Only successful complete initialization permits the request and starts
 its five-second start timer; failure retains baseline debt and sends nothing.
+Every later successful Open replaces the ledger's exact canonical value and
+every successful Delete retains the last value until all derived cleanup is
+complete, so a Delete ambiguity never loses its before descriptor. Ledger
+capacity includes those fixed values; they are the sole Go-side authoritative
+copy and are not duplicated into a second cleanup map.
 The same inventory is mandatory again whenever a partial batch or reconcile
 marks `ledgerInventoryDirty`. Rebuild mutates the one ledger in place while
 retaining the peer process's scalar `maxObservedGeneration` and every
@@ -3725,8 +4039,10 @@ whichever comes first, then resumes packet work; production constants are
 benchmark-owned and tests use a per-instance budget seam. A qualifying locally
 owned forward session becomes one stack/fixed-record channel item. The generated
 eligibility predicate is parity-locked to the current authoritative export:
-forward only, local origin, not fabric-ingress, owner RG zero or currently
-active, and `ForwardCandidate`/`FabricRedirect` disposition. The same predicate
+forward only, `is_exportable_local_authority()` under the captured authority
+gate, not fabric-ingress, owner RG zero or currently active, and
+`ForwardCandidate`/`FabricRedirect` disposition. Local auxiliary and
+quarantined demotion rows are excluded regardless of their install origin. The same predicate
 is used by the legacy diagnostic export until that path is retired, and drift
 tests enumerate every exclusion. If the
 request-private channel is full, the worker abandons that export slice and
@@ -3738,11 +4054,26 @@ Opens. Slot deletion/reuse before or after its scan position is corrected by the
 captured final per-key event. Ordinary opens/deletes continue through their
 normal EventStream producer and never enter a request-private worker channel.
 
+Every worker owns a process-lifetime checked `sessionDeltaLossEpoch`. Every
+failure to enqueue a session delta increments it **before** returning failure,
+including a ring-full path that cannot allocate an EventStream sequence. The
+counter is never reset or consumed by resync; exhaustion is process-fatal under
+the same controlled fail-closed rule as wire-generation exhaustion. A Boolean
+loss latch may still schedule repair, but it is not proof of a lossless export.
+The export command captures each worker's starting epoch and registers one
+fixed-size shared `ExportLossState`. Any epoch movement while that token is live
+atomically marks the token failed directly, without requiring another ring
+event. WorkerDone, private Final, the Go pending-bulk token, and the final
+capture-seal proof all carry the exact epoch vector/digest. Any mismatch emits
+Abort when possible and suppresses BulkEnd/TailEnd; resync cannot clear it.
+
 Each worker then emits one private `MSG_EXPORT_BOUNDARY` through the **same
 lossless sequenced EventStream producer** used by its preceding ordinary session
-events. Its exact 20-byte payload is `{exportID uint64 LE, workerID uint32 LE,
-workerSetGeneration uint64 LE}` and the ordinary frame header supplies the
-boundary sequence. At final cursor completion, before the marker and before that
+events. Its exact 32-byte payload is `{exportID uint64 LE, workerID uint32 LE,
+phase uint8, reserved [3]byte, workerSetGeneration uint64 LE,
+lossEpoch uint64 LE}` and the ordinary frame header supplies the boundary
+sequence. Reserved bytes must be zero; phase 1 is scan completion and phase 2
+is final tail sealing. At final cursor completion, before the phase-1 marker and before that
 worker resumes its next packet batch, it drains and losslessly submits every
 pending session delta; inability to drain one fails the export. The worker
 reports completion only after that marker is
@@ -3755,8 +4086,8 @@ watermark.
 
 After a worker's final snapshot item is accepted by its SPSC channel, it performs
 the delta drain and EventStream-boundary enqueue above, then enqueues a
-`WorkerDone` item carrying that assigned boundary sequence on the same SPSC
-channel. A full channel delays WorkerDone to a later packet-loop iteration; it
+`WorkerDone` item carrying that assigned boundary sequence and unchanged
+start/current loss epoch on the same SPSC channel. A full channel delays WorkerDone to a later packet-loop iteration; it
 does not block the worker. The coordinator writes all preceding member records
 before the corresponding private `WorkerDone`; it computes a
 rolling source-member count and SHA-256 digest over the exact generated canonical
@@ -3764,8 +4095,8 @@ member payloads in actual stream order. It does not sort or retain a global key
 set. The helper writes `Final` only after every expected WorkerDone and its
 EventStream boundary have been successfully enqueued. Final carries
 `complete=true`, the exact worker-set generation/count, sorted
-`{workerID,boundarySequence}` digest and terminal sequence, and source-member
-count/digest. An Abort, EOF, timeout, missing/duplicate worker, count/capacity
+`{workerID,boundarySequence,lossEpoch}` digest and terminal sequence, and source-member
+count/digest. An Abort, EOF, timeout, changed loss epoch, missing/duplicate worker, count/capacity
 violation, nonzero legacy caller `max`, or incomplete Final is failure. Reading
 `next_seq` after worker ACKs is expressly forbidden because it proves no causal
 relationship to worker-local events.
@@ -3785,11 +4116,13 @@ Failure after any BulkStart retires the transport, because the peer may have a
 partial table; failure before BulkStart can cleanly abort the unchanged
 transport.
 
-After private Final, Go requires its source count/digest to match the incrementally
-observed source records. It then waits until EventStream has decoded the exact
-boundary set/digest and a contiguous sequence through Final's terminal sequence.
+After private Final, Go requires its source count/digest and loss-epoch digest
+to match the incrementally observed source records. It then waits until
+EventStream has decoded the exact boundary set/digest and a contiguous sequence
+through Final's terminal sequence.
 Only after both proofs and an exact peer-wire count/digest recomputation may the
-sender enter `endingBulk` and write BulkEnd. A gap, loss latch, missing/duplicate
+sender enter `endingBulk` and write BulkEnd. A gap, changed loss epoch, asserted
+loss state, missing/duplicate
 boundary, stale source or worker-set generation, timeout, capture overflow, or
 digest mismatch suppresses BulkEnd and retires a post-start transport. The
 boundary frame is control evidence, never a session member. Events duplicated by
@@ -3832,18 +4165,47 @@ the bulk first. A closed allowlist permits only heartbeat/ACK, clock,
 barrier/ACK, BulkAck/TailEnd/TailAck, IPsec-SA, and DHCP-lease full-set frames to
 interleave; a canary classifies every production writer.
 
+The co-versioned private Rust-to-Go EventStream session-mutation payload gains a
+generated fixed `before` projection; the public cluster session wire does not.
+Before any local SessionTable/allocator mutation, the producer copies
+`{present, canonical key/value, authority provenance, translated tuple and
+reservation identity}` from the incumbent entry. Open/rebind carries that
+projection plus its normal after-state; Close carries the removed entry rather
+than only its key/RG/zones. Absent is explicit. The fixed record is enqueued
+without allocation, and enqueue failure advances the worker loss epoch. Go's
+ordinary path may discard `before`, but capture mode requires it and rejects an
+old/malformed payload. This deliberately adds control-stream bytes and one
+fixed copy on session mutation, not a packet lookup or per-packet allocation;
+generated size/ring-capacity canaries and event-rate benchmarks gate it.
+
 Captured deltas, including every capture-mode event through and after the export
 watermark, form a bounded per-canonical-key coalescer rather than a 4,096-event
-FIFO. Each `capturedSessionMutation` is a generated fixed-size wire-ready value
-containing the final Open/Update/Delete and first/last EventStream sequence for
-the canonical key; no sender generation is allocated until flush. Because the
-streamed snapshot deliberately retains no baseline key set, a final Delete is
-never discarded merely because Go did not observe that key in a materialized
-set. Sending one idempotent later-generation Delete is the safe result. Repeated
-churn for one key still consumes one row and only its final state is emitted.
-Cross-key order carries no protocol dependency; flush order is stable by last
-event sequence and canonical key, while per-key sender generations remain
-strictly monotonic.
+FIFO. Each `capturedSessionMutation` is a generated fixed-size value containing
+the first observed before-state/tuple-release descriptor, final
+Open/Update/Delete, and first/last EventStream sequence for the canonical key;
+no sender generation is allocated until flush. Because the streamed snapshot
+deliberately retains no baseline key set, a final Delete is never discarded
+merely because Go did not observe that key in a materialized set. Repeated churn
+for one key still consumes one row, but coalescing may not erase a tuple-release
+dependency needed by another key.
+
+Each detached bank is planned as one bounded `TailFinalStateBatch` with a
+release phase and an acquire phase. The release phase emits at most one
+later-generation Delete for every touched key whose starting peer-owned tuple
+must be released or whose final state is absent. Only after every release frame
+is written does the acquire phase emit at most one final Open for each present
+key, in stable last-sequence/key order. Thus `Delete(B,T), Open(A,T), Open(B,U)`
+cannot collapse into the invalid `Open(A,T), Open(B,U)` order: B is released
+before either acquisition. Swaps and cycles use the same all-releases-first
+rule. The sender bank planner rejects duplicate final translated targets among
+its touched rows. The receiver's full allocator/coordinator preflight rejects a
+target held by an untouched peer key or any local/static owner; the sender never
+synthesizes a delete for those foreign owners. A key can therefore produce at most two
+wire frames, and byte/count capacity reserves that worst case while row credit
+remains per unique key. Partial release/acquire application is explicitly
+ambiguous and enters the cleanup/repair path; it is never rolled back as though
+the old tuple were still owned. Across banks, wire order remains causal and a
+later bank may release or reacquire a key with newer generations.
 
 Every capable baseline, tail, and ordinary Open/Delete draws a fresh checked
 nonzero value from the daemon-lifetime global sender counter, so global ordering
@@ -3856,14 +4218,16 @@ restart rule and cannot wrap.
 Exactly two lazily allocated banks share one checked fixed byte-credit pool,
 `captureTailTotalByteCapacity`; they do not each reserve aggregate session
 capacity and no snapshot-sized vector is counted or allocated. Credit is charged
-to active and detached rows until a detached row is successfully written and
-released. A separate tail-row credit is capped by the peer's advertised
+at the generated maximum fixed captured-mutation footprint to active and detached rows
+until a detached row is successfully written and released. A separate tail-row credit is capped by the peer's advertised
 `maxCapturedTailRows`. It charges the first insertion into each active bank and
 is not released until the bulk terminates; coalescing another mutation into that
 same bank row is free, while a key reappearing after its earlier bank detached
 conservatively consumes another row credit. This needs no unbounded cross-bank
 key set and guarantees receiver-unique growth cannot exceed the advertised
-credit even though repeated keys may overcount.
+credit even though repeated keys may overcount. The checked emitted-frame/count
+ceiling is independently `2 * chargedTailRows`, because release/acquire planning
+emits at most two frames per charged row.
 The implementation validates fixed record sizes and arithmetic at
 startup, publishes current/high-water/overflow telemetry, and refuses a new
 bulk if the credit pool cannot be reserved. Pre-snapshot unique churn or a
@@ -3877,14 +4241,35 @@ exact intermediate BulkAck, install a fresh absolute
 `authoritativeTailFlushTimeout`. Under
 `producerMu`, detach the active coalescer bank, install the empty second bank,
 and release the mutex. Directly write the detached bank on the exact bulk
-connection in stable order with later per-key generations and normal bounded
-write/token revalidation while computing a count/digest over every tail frame in
-wire order; duplicate keys across banks are valid later state, not a protocol
-duplicate. Events arriving meanwhile coalesce into the active bank. Repeat the
-bank swap/drain until the active bank is empty under `producerMu`. At that exact
-point seal capture, record one TailEnd token containing the bulk identity and
-tail count/digest, and route subsequent producers into the existing bounded
-ordinary queue with its writer still closed. Release `producerMu`, write the
+connection in complete release-then-acquire phase order with fresh per-key
+generations and normal bounded write/token revalidation while computing a
+count/digest over every tail frame in wire order; duplicate keys across banks
+are valid later state, not a protocol duplicate. Events arriving meanwhile
+coalesce into the active bank. Repeat the bank swap/drain until the active bank
+is empty under `producerMu`, mark the local token `finalizing`, release that
+mutex, and then issue one generation-bound
+`finalize_owner_rg_session_capture` helper command. Every captured worker drains
+pending deltas, emits its phase-2 boundary with the unchanged loss epoch, and
+the helper enqueues one lossless in-band `MSG_EXPORT_CAPTURE_SEAL` under
+`producer_seq_lock` after all those boundaries. Its exact 48-byte payload is
+`{exportID uint64, workerSetGeneration uint64, lossEpochDigest [32]byte}`; the
+ordinary EventStream header supplies terminal sequence S. The helper response
+echoes S/digest but is not the partition point.
+
+The single Go EventStream read loop processes the seal frame in sequence. Its
+callback validates every phase-2 boundary and loss epoch, acquires `producerMu`,
+detaches the active bank as the final `<=S` bank, switches capture routing to the
+closed ordinary queue, records S/digest, releases the mutex, and wakes the bulk
+worker **before** the read loop can decode S+1. Thus an S+1 mutation of the same
+key cannot overwrite/coalesce an S mutation. The bulk worker joins the helper
+response, waits for the seal callback, drains the detached final bank, and only
+then records one TailEnd token containing the bulk
+identity and tail count/digest. A phase-2 loss, epoch movement, sequence gap,
+seal mismatch/replay from another token, final-bank overflow, or finalize
+failure suppresses TailEnd. Loss after the
+terminal cut follows ordinary-stream loss handling and invalidates the pending
+continuity token; it cannot be hidden by clearing a Boolean latch. Release
+`producerMu`, write the
 exact 96-byte TailEnd on the bulk connection, and wait up to 20 seconds for its
 exact TailAck. Only TailAck opens the ordinary writer and publishes outbound
 repair completion, so no frame on another fabric can overtake TailEnd. No
@@ -3946,7 +4331,8 @@ bulk-completion budget.
 The same admission binds one working `capableGenerationLedger`. Its checked
 capacity is the receiver's advertised accepted logical-session ceiling plus the maximum
 unique tail rows it advertised in the bilateral capability frame
-(`captureTailMaxRows` in this version). The byte
+(`peerTailReserve`, already bounded by `captureTailMaxRows`, the generated
+coalescer footprint, and every physical-surface residual, in this version). The byte
 budget and row ceiling are both enforced; neither can be inferred from the
 other because v4/v6 fixed record sizes differ. The baseline
 membership map, generations, and later tail tombstones share this one
@@ -4034,7 +4420,13 @@ The result is successful only when `Complete=true`,
 the exact source/helper/authority lease remains current. The userspace adapter
 builds all 256 records from one sealed config snapshot, uses one bounded
 `sync_session_batch` helper request, and updates its BPF shim in the same bounded
-operation. The co-versioned Rust handler prevalidates the ordered operations
+operation. Before incrementing `inFlightInstalls` or issuing that request, Go
+reserves one slot in its fixed 64-slot `ambiguousMutationJournalRegistry` and
+fills up to 256 records from the exact accepted ledger before-value and the
+sealed attempted value, including every Go-owned kernel/shim/DNAT descriptor;
+registry exhaustion returns busy before mutation. Therefore a lost helper
+response cannot prevent cleanup. The co-versioned Rust
+handler prevalidates the ordered operations
 against one tentative map view, computes and reserves the batch's exact net
 new-key growth under the shared synced-map lock before mutation, and returns
 explicit applied/idempotent/stale/capacity/publish outcomes; it may
@@ -4052,10 +4444,35 @@ sent to the helper. For a translated Open, preflight also converts
 origin-qualified reservations. A matching local pool/prefix with an occupied
 translated tuple, an exhausted reverse-identity index, foreign pool provenance
 under an allegedly equal config digest, or allocator error rejects the logical
-operation before any session/BPF/worker mutation. Each successful tentative
-reservation is held in the batch token and rolled back if any later preflight or
-derived-surface operation fails; commit transfers it to normal session teardown.
+operation before any session/BPF/worker mutation. Replacement is a two-token
+transaction, not today's destructive `reserve_flow`: preflight captures the
+incumbent reservation and reserves the attempted tuple **without** releasing or
+mutating the incumbent. If the canonical tuple/provenance is unchanged, it uses
+one idempotent incumbent token and creates no second refcount. If the tuple
+changes, occupied/exhausted attempted state fails with the incumbent byte-for-
+byte intact; address-only and persistent/shared-lease modes may not silently
+return the old translation for a changed decision.
+
+Each successful tentative attempted reservation plus any incumbent token is
+held in the batch transaction. Either may be rolled back/released only while
+the entire operation is still preflight-only and the incumbent was never
+detached. Immediately before the first shared, BPF, kernel-map, or worker
+mutation for that operation, both move to non-reusable ambiguity escrow in the
+fixed journal described below. Whole-batch success transfers the attempted
+token to normal session teardown and releases the incumbent only after every
+derived surface commits. Any partial/unknown prefix keeps both escrowed until
+cleanup proves whether the old or new session survives; neither tuple is
+returned merely because the logical operation did not commit. Persistent lease
+and shared source-key refcounts follow the same two-token rule.
 Delete releases only the reservation owned by that exact peer-synced session.
+The Rust process owns a matching fixed registry entry keyed by exact
+`{helperGeneration,batchID}` before its first mutation; it contains allocator
+escrow plus shared/worker before/attempted state. An unambiguous preflight-only
+failure removes both journals, whole success transfers ownership and removes
+them, and any partial result or lost response retains them. A retry queries or
+cleans that exact ID; it cannot create a second reservation. Go's independently
+prepared descriptors remain sufficient to quarantine and clean external maps
+if the helper process disappears with its private registry.
 No capability count claims to predict tuple collisions: the count reserves
 memory/map slots, while this per-operation reservation is the fail-closed
 semantic gate. Every captured worker applies both entries for each logical operation
@@ -4109,20 +4526,45 @@ status, HA update, urgent fence, or unrelated session request is blocked on a
 worker ACK while holding global coordinator state.
 If a kernel-map or worker publication fails after a prefix crossed its mutation
 boundary, the result reports partial failure rather than claiming rollback;
-table taint plus `ledgerInventoryDirty` and mandatory origin-aware re-inventory/
-repair make that fail closed. The receiver keeps every key from the attempted
-batch in its already-reserved ledger slot with `ambiguous=true`, regardless of
-whether the operation was an Open or Delete and regardless of the helper's
-reported prefix. This is a conservative repair journal over the known bounded
-input, not trust in an ambiguous response. The shared authoritative inventory
-is merged into those rows; it never erases them. A fresh requested bulk must
-then idempotently apply the sender's truth for each encountered key and prepend
-a Delete for every unseen ambiguous key before reconciliation can clear the
-flag. Thus an Open that reached only BPF/one worker, or a Delete that left an
-orphan BPF/worker row after removal from the shared store, remains discoverable
-without a second unbounded key set. No retry or request-ID-zero maintenance bulk
-may reuse the speculative batch view. Ordinary incrementals
-retain the existing single-session API.
+table taint plus `ledgerInventoryDirty` and mandatory origin-aware cleanup and
+re-inventory make that fail closed. The receiver keeps every key from the
+attempted batch in its already-reserved ledger slot with `ambiguous=true` and
+retains that batch's already-reserved journal slot.
+Unlike the key-only generation ledger, each record owns the exact before and
+attempted derived-surface descriptors: forward/reverse and alias keys plus
+expected encoded values, worker replicas, dynamic-DNAT key/value/flags,
+peer-authority namespace, wire generation, and any escrowed SNAT/NAT64 token.
+Delete captures its pre-mutation descriptor before removing shared authority;
+therefore later inventory cannot erase the information needed to remove an
+orphan. The first ambiguous result closes new admission, but every already-
+admitted ordinary or bulk batch keeps its distinct slot until it finishes. The
+gate then joins all `inFlightInstalls` and discharges retained slots in checked
+batch-ID order. At most 64 x 256 records exist in the startup-sized reusable
+arena, matching the Rust wait registry; neither fabric can overwrite another
+batch or accumulate unbounded cleanup state.
+
+Discharge of all retained slots runs before peer re-inventory. In bounded chunks it compare-deletes
+both before and attempted peer-owned rows from every shared/BPF/kernel/worker
+surface. A shared or worker row must still carry the recorded peer namespace and
+generation/value; a dynamic DNAT row is removed only when `flags == 0` and its
+entire value equals the recorded dynamic value. Because kernel/shim/DNAT rows
+do not all encode provenance, cleanup first freezes config and local-session
+admission and resolves every descriptor against the coordinator/allocator
+authority snapshot. A key/tuple currently owned by a local or newer peer row is
+preserved and republished from that authority instead of compare-deleted; only
+unowned derived aliases are removed. Static DNAT (`flags == 1`), local
+provenance, a newer generation, and any foreign value are preserved and
+reported as a typed conflict. Config apply shares the same closed gate and
+cannot change static ownership mid-cleanup. Only after all surfaces prove absent may the
+allocator release the escrowed tuple and clear the full descriptor; the scalar
+`maxObservedGeneration` and key tombstone remain. Cleanup failure replaces the
+ambiguous helper generation and keeps admission closed. Before a replacement
+helper can admit local allocation, it rebuilds reservations for every surviving
+coordinator session and quarantines every still-journaled tuple; external-map
+cleanup then releases quarantine exactly once. A fresh authoritative inventory
+and requested bulk may proceed only after journal discharge, and only exact
+TailAck clears table taint. Ordinary incrementals retain the existing
+single-session API but use the same tentative-to-escrow mutation boundary.
 
 Baseline batch completion reacquires the same locks, decrements its token exactly once,
 revalidates the window, and only after exact whole-batch success commits the
@@ -4208,6 +4650,19 @@ from either fact alone. A failed/partial/ambiguous write
 retires the transport and leaves table taint/debt even if causally released tail
 frames arrived.
 
+When `tailReceiveWindow` is installed it freezes the receiver's advertised
+`maxUniqueTailRows`, checked `maxTailFrames = 2 * maxUniqueTailRows`, and checked
+`maxTailWireBytes = maxTailFrames * maxCapableSessionFrameBytes` from the
+immutable capability tuple. Before decoding a frame into a helper batch, the
+receive loop checked-increments frame and exact wire-byte counters and charges a
+row only on the first tail-transfer appearance of that canonical key. A checked
+nonzero `tailReceiveWindow.serial` compared with the ledger slot's
+`seenTailSerial` provides this bounded accounting without a second key set; a
+serial cannot wrap or be reused. The existing generation-ledger slot is not
+permission for unlimited same-key churn. Exceeding
+any limit or arithmetic overflow fails before helper/BPF/worker mutation and
+retires with taint. TailEnd's count must equal the bounded received frame count.
+
 The sender terminates tail transfer with an exact 96-byte
 `syncMsgBulkTailEnd`: the same bulk identity/config prefix followed by
 `{tailCount uint64, tailDigest [32]byte}` over every tail frame in wire order.
@@ -4216,19 +4671,42 @@ count/digest equality. Baseline reconciliation already removed every row absent
 from the repair serial before BulkAck, so no maximum-cardinality scan remains.
 The receiver changes the tail token to `tailAckWriting`, installs a
 record-before-send final ACK token, and provisionally opens ordinary
-same-transport admission plus token-bound inbound maintenance authorization;
-current continuity and taint remain unchanged. This precommit is safe because a
-sender can release ordinary frames only after receiving the TailAck.
+same-transport admission only; maintenance authorization, current continuity,
+and taint remain closed/unchanged. This precommit is safe because a sender can
+release ordinary frames only after receiving the TailAck. A request-ID-zero
+BulkStart additionally requires a fresh all-current-fabric producer barrier
+completed after that TailAck, so it is not admitted by this provisional edge.
 
-The TailAck writer uses the same write-fence/revalidation order and echoes the
-exact 96-byte TailEnd. After an unambiguous write, it enters the serialized
-continuity publisher, reserves an outbox slot, and reacquires
-`s.mu -> gate.mu`. Only if the complete final token remains current does it clear
-`bulkMutationTainted`, make inbound authorization durable, set
-`bulkEverCompleted`, current/previous-good continuity, callback, and matching
-debt completion, mark the fully reconciled working capable receiver-generation
-ledger authoritative, then commit the ordered true
-edge. Subsequent
+The TailAck writer first enters `continuityPublishMu` and reserves one fixed
+continuity-outbox slot, waiting/canceling outside every state and write lock. It
+then acquires `writeMu` before final-token revalidation and keeps that fence
+continuously through the exact 96-byte TailEnd echo, unambiguous write
+classification, `s.mu -> gate.mu` postcommit, reserved-outbox commit, and
+durable inbound-authorization publication. It holds no state mutex during
+socket I/O, but does not release `writeMu` between the write and postcommit. A
+stale token or pre-write failure releases the reservation without an edge. Once
+bytes are written unambiguously, postcommit performs no allocation or fallible
+external operation. Only if the complete final token remains current does it mark the
+fully reconciled working capable receiver-generation ledger authoritative,
+clear `bulkMutationTainted`, set `bulkEverCompleted`, current/previous-good
+continuity, callback, and matching debt completion and commit the already
+reserved ordered true edge.
+
+This fence provides the successor-bulk ordering without another receive state.
+After the peer consumes TailAck it may start the mandatory barriers, but every
+barrier-ACK writer on every currently registered capable fabric also requires
+this same `writeMu`. A barrier handler validates and copies its request under
+state locks, releases every state lock before waiting for `writeMu`, and then
+uses the established write-fence/revalidation order; it never waits for the
+fence while holding `s.mu` or `gate.mu`. Those ACKs cannot be written until TailAck postcommit and
+outbox commit finish. A maintenance BulkStart is valid only after the
+sender has received that complete exact barrier set, so it cannot validly reach
+the receiver before postcommit. A BulkStart lacking that completed barrier is a
+protocol violation rather than a deferred marker. Config/ownership
+invalidation that wins `writeMu` first suppresses TailAck; if TailAck wins, the
+invalidation and all barrier ACKs order after its postcommit.
+
+Subsequent
 capable ordinary operations validate and update that ledger around their exact
 dataplane result; a new-key capacity failure closes admission and requests a
 fresh authoritative bulk rather than degrading its generation guard. Failure,
@@ -4426,9 +4904,12 @@ acceptance:
    transactions, authority initialization, gate/incarnation/worker/replay types,
    capability parser/encoder, credential-bound snapshot-stream schema, budgeted
    worker export cursor, the stable-slot coordinator `SyncedSessionStore`,
+   explicit local-authoritative/local-auxiliary and capable/legacy-qualified
+   peer authority provenance,
    slot-handle auxiliary indexes, inactive `SessionCapacityPlan` and per-worker
    total-entry ceilings, generated `userspace_sessions_v2` no-prealloc map
-   schema/migration machinery, ordered mutation-batch types, context-aware
+   schema/subset-preserving one-way migration machinery, monotonic per-worker
+   delta-loss epochs, ordered mutation-batch and ambiguity-journal types, context-aware
    reconcile adapter, and observability fields behind a disabled activation
    constant; legacy behavior remains active and the old XDP program/pin remains
    selected.
@@ -4437,8 +4918,11 @@ acceptance:
    producer/barrier protocol, finite replay budgets, synchronous receive
    membership, private streaming export, bounded worker mutation batches,
    authoritative shared-store inventory, ambiguity-retaining working generation
-   ledger, side-by-side proved v2 session-map migration, enforced physical and
-   transient-tail capacity reservations, two-stage BulkAck/TailAck capture drain,
+   ledger plus all-surface cleanup/NAT escrow, side-by-side proved v2
+   session-map migration, enforced worker/coordinator/shim/kernel-session and
+   static-plus-dynamic-DNAT physical capacity plus transient-tail reservations,
+   dependency-preserving release/acquire tail banks, loss-epoch capture seal,
+   write-fence/barrier-ordered maintenance restart, two-stage BulkAck/TailAck capture drain,
    receiver-requested bulk/repair, readiness split, RG actuator wrapper,
    mixed-version restriction, and peer activation. This PR removes the temporary
    constant and carries the full HA smoke matrix.
@@ -4604,19 +5088,25 @@ The implementation plan preserves these signatures and wire contracts:
 - SNMP configuration field names and SNMPv3 wire protocol;
 - route manager public methods and netlink operation interfaces;
 - Rust event action byte and lifecycle payload semantics (I-d intentionally
-  versions the private helper envelope with a source-generation field and one
-  export-boundary control frame);
+  co-versions the private helper envelope with source generation, fixed
+  pre-mutation `before` projection, phase-1/phase-2 worker boundary frames, and
+  the in-band capture-seal frame);
 - binary RT_FLOW/security event record length and field offsets (the separately
   versioned private session-sync envelope/control frames change as stated);
-- BPF pinned map specifications (the private helper protocol gains the
-  generation-bearing event envelope and credential-bound owner-snapshot
-  stream);
+- every existing BPF pinned-map specification remains unchanged in place;
+  workstream I intentionally adds the versioned `userspace_sessions_v2` pin and
+  performs the fail-closed local side-by-side migration described above rather
+  than resizing or deleting `userspace_sessions` under a live program (the
+  private helper protocol also gains the generation-bearing before/after event
+  envelope, both worker boundaries, in-band capture seal, and credential-bound
+  owner-snapshot stream);
 - the HA wire protocol gains four additive message types:
   epoch-bearing `syncMsgBulkRequest`, versioned `syncMsgCapabilities`, and
   `syncMsgBulkTailEnd`/`syncMsgBulkTailAck`.
-  The capability payload is exactly 42 bytes and includes process identity plus
-  the two nonzero capacity ceilings; mixed ceilings across fabrics or bilateral
-  logical-capacity incompatibility prevents capable bulk authority.
+  The capability payload is exactly 50 bytes and includes process identity,
+  local-creation capacity, receiver-baseline capacity, and tail capacity;
+  mismatched fields across fabrics or failure of the combined cluster-authority
+  ceiling to fit either receiver prevents capable bulk authority.
   Fully capable peers also use a capability-gated config trailer carrying the
   sender-owned generation plus canonical SHA-256 digest; mixed/legacy peers are
   sent only the existing config payload, so an old decoder never sees the new
@@ -4814,8 +5304,11 @@ Intentional behavior changes are fail-loud validation, not API removal:
     Real deny/reject/drop records retain their decoded action and every
     formatter preserves its established real-action behavior; intentional
     per-surface omissions are not broadened.
-12. **Wire and pinned-state portability:** no public event ABI, BPF map size, or
-    pinned-map migration is introduced. The private co-versioned Rust/Go helper
+12. **Wire and pinned-state portability:** no public event ABI or in-place BPF
+    map resize/deletion is introduced. The one explicit exception is the
+    additive, versioned `userspace_sessions_v2` side-by-side migration with a
+    proved one-way local cutover; all other pinned maps retain their existing
+    specifications and lifecycle. The private co-versioned Rust/Go helper
     protocol adds source generation, the export-boundary message, plus a
     credential-bound fixed-record snapshot stream; startup
     rejects a helper with the old protocol before session authority opens. The
@@ -4931,8 +5424,11 @@ Intentional behavior changes are fail-loud validation, not API removal:
     bounded owner-session stream, one sequenced boundary from every exact worker,
     and their terminal event watermark; sampling a global sequence counter is
     not a worker-drain proof. The helper source and peer-wire count/digests are
-    independent end-to-end proofs. Its bounded per-key tail coalescer emits only
-    later final state, including idempotent deletes with no materialized baseline
+    independent end-to-end proofs. Monotonic per-worker loss epochs, not a
+    consumable Boolean latch, prove both scan and tail capture lossless. Its
+    bounded per-key tail coalescer retains first-before tuple dependencies and
+    emits each bank as all required peer-owned releases followed by final
+    acquisitions, including idempotent deletes with no materialized baseline
     set. A partial receive table is tainted and unavailable for takeover.
     Asynchronous `export_all_sessions` and shared delta buffers are never
     authoritative members.
@@ -4948,30 +5444,62 @@ Intentional behavior changes are fail-loud validation, not API removal:
     whose checked peer-inventory serial makes a bounded inventory either exact or
     aborted. Worker tables and BPF maps are derived surfaces. Every attempted
     non-complete batch key remains an ambiguous row in the receiver's already-
-    reserved generation ledger until a fresh full baseline and tail
-    idempotently converges that key on all derived surfaces. Re-inventory may
-    merge authoritative rows but cannot erase this bounded ambiguity journal;
-    neither a missing worker row nor a successful prefix response can be used as
-    proof of absence.
+    reserved generation ledger. A fixed 64-slot registry, one 256-record slot
+    per admitted batch, retains exact before/attempted derived descriptors and
+    both incumbent/attempted tuple escrow needed to clean aliases,
+    kernel/BPF/worker rows, and dynamic DNAT safely. Re-inventory may
+    merge authoritative rows but cannot erase that journal; cleanup completes
+    before another batch and releases tuple quarantine only after every surface
+    proves absent. Neither a missing worker row nor a successful prefix response
+    is proof of absence.
 29. **Capability capacity names real receiving surfaces:** the receiver reserves
-    exportable local, bounded auxiliary local-tunnel, peer-baseline, and
-    transient-tail logical credits together. Each
+    worker/auxiliary creation sublimits inside one shared local-plus-peer
+    authority reserve, then adds transient-tail logical credit. Each
     logical credit costs two rows in the coordinator store and every fully
     replicated worker, up to four distinct keys in the one AF-agnostic userspace
-    shim map, and one row in either DNAT family; the ledger reserves peer
+    shim map, two rows in each independently populated kernel
+    `sessions`/`sessions_v6` map, and one dynamic row plus the
+    current/prepared-static union in either DNAT family; the ledger reserves peer
     baseline plus tail rows. The current 262,144-entry pin and uncapped sync
     upsert are not treated as capacity. Activation requires the versioned
     no-prealloc v2 map, per-worker total caps, slot-handle shared indexes, and a
     checked `SessionCapacityPlan`; the formerly uncapped local-tunnel upsert
-    cannot borrow peer credit. Each sender separately proves its source
-    maximum fits the peer's baseline reserve. TailAck additionally proves final
+    cannot borrow peer credit. Capability advertises each node's local-creation
+    ceiling separately; both nodes prove their checked combined cluster
+    authority fits each baseline reserve. TailAck additionally proves final
     peer presence returned below that reserve. Count reservation never excuses a
     conflicting SNAT/NAT64 translated tuple: allocator reservations are typed,
-    batch-transactional, and must commit before ACK. The tuple is immutable only
+    tentative only before external mutation, and escrowed across any ambiguous
+    prefix. The tuple is immutable only
     within one transport epoch. A capacity change retires and renegotiates both
     fabrics; shrinking below any authoritative or derived-surface occupancy
     fails the prepared apply before mutation rather than truncating state or
     silently preserving an over-cap table.
+30. **Shim migration terminates locally:** the old map is preserved only within
+    its captured starting key domain and against the expected subset evolved by
+    in-domain refresh/delete/GC; v2 is proved against coordinator truth. Once all
+    links select v2, old leases join, the local v2 barrier passes, and the
+    committed migration record is durable, the old adapter retires before
+    admission reopens. A pre-cutover crash reopens the separately pinned old
+    program, rolls all links back, and explicitly flushes stale pinned session
+    cache state; a committed crash can select only v2 and flushes it against the
+    empty restarted coordinator. Peer repair neither gates cleanup
+    nor permits rollback, so standalone and mixed-version nodes cannot dual-write
+    until the old map fills.
+31. **Authority provenance is explicit:** packet/install `SessionOrigin` never
+    substitutes for local-authoritative, local-auxiliary, capable-process, or
+    ephemeral legacy-transport authority. Local tunnel rows may use sync-family
+    mechanics but cannot enter peer inventory, export, deletion, or capacity
+    classes. Promotion retains its source namespace and handoff serial;
+    demotion becomes peer authority only after an exact capable TailAck and
+    ownership commit, never from raw RG state.
+32. **ACK postcommit precedes every successor bulk:** the TailAck writer reserves
+    continuity-outbox credit before taking `writeMu`, then retains the fence
+    through final write classification, gate postcommit, and outbox commit.
+    Every required all-fabric barrier ACK uses
+    the same fence, and maintenance BulkStart requires that complete barrier
+    set. A valid successor therefore cannot exist before predecessor postcommit;
+    an unbarriered start is rejected rather than deferred.
 
 ## 8. Risk assessment
 
@@ -4980,8 +5508,8 @@ Intentional behavior changes are fail-loud validation, not API removal:
 | Behavioral regression | HIGH | Thirteen independent roots include security policy acceptance, SNMP auth, DDNS deletion, HA activation, and config loading | Separate PRs; fail-on-revert traces; strict/lenient paired tests; package-wide reruns after each config merge |
 | Lifetime / borrow-checker | MEDIUM | K003-01 copies an existing parsed byte, while I-d also makes Rust-helper/event-stream process lifetime explicit and must not retain old process-owned session or callback state | Rust unit tests, clippy/build, generation-bound close/join tests, and packet/helper-restart smoke |
 | Concurrency / lock ordering | HIGH | K003-16 repairs a map race, while I-d adds transport drain, all-RG producer fencing, preemptible state-mutating helper transactions, finite split protocol callbacks/replay, ordered notifications, post-commit restart, helper-session lifecycle, and joined reconciliation across two fabric loops | Enumerated lock graph including independent mutation/preemption lane, outer helper lifecycle, write fence, and continuity publisher; separate coordinator/setup/data/lifetime/event-stream ownership; setup-promotion veto; gate-owned synchronous receive state; no cross-domain or state-locked I/O/waits; self-join, stale-ACK, stale-helper-generation, urgent-mutator, raw-heartbeat-window, stale-helper-request, old-process-callback, saturation, direct-actuator, and callback-transaction race tests; inactive scaffolding review before activation |
-| Performance regression | MEDIUM | K003-01 copies one existing byte on a rare flowless path; I-c replaces the shared synced-session map with a stable-slot/index store; I-d adds one generation word to private session events, one boundary per worker/export, a budgeted cold-path full-session scan, bounded ref-counted mutation batches, and a two-bank fixed-credit per-key capture coalescer during repair | No new packet parse/map lookup or steady-state allocation; shared-store lookup/mutation p99 and max-RSS must stay within the explicit gate; worker export/import work is time-sliced away from packet processing; fixed stream/inbox/tail byte bounds, high-churn coalescing and export/import/poll-tail latency benchmarks; userspace throughput baseline and K003-01 perf smoke |
-| Stateful shim migration | HIGH | The current preallocated 262,144-entry `userspace_sessions` pin cannot satisfy the proved local+peer+tail alias bound, while in-place MaxEntries drift is intentionally rejected by the loader | Versioned `userspace_sessions_v2` with NO_PREALLOC; populate/readback proof before atomic link replacement; retain old program/pin on every injected failure; lease-fenced cleanup only after commit; generated Go/Rust ABI and alias-factor canaries |
+| Performance regression | MEDIUM | K003-01 copies one existing byte on a rare flowless path; I-c replaces the shared synced-session map with a stable-slot/index store; I-d adds loss/provenance words to private control state, two boundaries per worker/export, a budgeted cold-path full-session scan, bounded ref-counted mutation batches, and a two-bank fixed-credit dependency-preserving coalescer during repair | No new packet parse/map lookup or steady-state allocation; shared-store lookup/mutation p99 and max-RSS must stay within the explicit gate; worker export/import work is time-sliced away from packet processing; fixed stream/inbox/tail byte bounds, high-churn release/acquire coalescing and export/import/poll-tail latency benchmarks; userspace throughput baseline and K003-01 perf smoke |
+| Stateful shim migration | HIGH | The current preallocated 262,144-entry `userspace_sessions` pin cannot satisfy the proved local+peer+tail alias bound, may already contain only a sequential-publish subset, would fill if a standalone node dual-wrote until peer repair, and pinned links survive daemon crash | Versioned `userspace_sessions_v2` with NO_PREALLOC; capture/preserve only the old domain; prove full coordinator/v2 truth before transactional link replacement; fsynced pre-cutover/committed recovery record; retire old adapter after the local link/lease/barrier cutover independently of peer repair; generated Go/Rust ABI, subset, crash-boundary, and no-post-cutover-write canaries |
 | State/ownership corruption | HIGH | DDNS wrong-family delete, malformed/legacy cross-surface state, crash-ambiguous claim release, routing ownership loss, stale RG pins, interleaved session bulk/apply, and empty helper session tables after process replacement are explicitly stateful | Expected-surface validation including bounded pre-#2903 Surface A; exact same-family `fpb1`; classified claim release; full-generation clustered helper and helper-session debt; initialized authority; helper/transport-qualified gate; used-connection fences; cancellable joined reconcile; attempt-correlated repair; injected failure/retry tests |
 | HA compatibility | HIGH | RG bindings above the 16-slot dataplane domain were previously accepted; reconnect or helper replacement can reorder callbacks and erase runtime sessions; RG1+ ownership can move without RG0; old receivers ACK reconcile failures; and old senders cannot prove sender epoch plus canonical config equivalence or uncontaminated bulk | Honest preflight/release note; complete state/priority/weight authority rows; daemon-lifetime sender identity and metadata-free canonical digest; prepared config/debt transaction; standby-first rolling restriction; no legacy ACK proof; helper-generation invalidation; continuity/timeout split; receiver-requested bilateral bulk; fresh/full/helper restart, active/active RG migration, reconnect, exhaustion, previous-good, stale-pin, failed-reconcile, mixed-pair, and repair-ABA smoke |
 | Public API regression | MEDIUM | Route-map Go helpers gain required context, readiness gains additive diagnostics, and lifecycle strings change from false `deny` to `n/a` | Migrate every repository caller atomically; release notes; readiness/status tests; REST/gRPC/CLI/filter/action golden tests |
@@ -5634,10 +6162,11 @@ passes on the fix and fails when the fix hunk is reverted.
   An unkeyed upgraded side receiving an old keyed HELLO consumes setup frames
   until the later legacy data frame and never dispatches auth into `handleMessage`.
   An auth-consumed legacy frame is staged until after registration and authority
-  initialization. Exact 42-byte length/version/flags, missing each of the four
-  required bits, unknown bits, valid all-zero partial capability, zero capacity
-  with any complete bit, overflow capacity, local-maximum-greater-
-  than-peer capacity, cross-fabric defined-bit/process/capacity mismatch, zero
+  initialization. Exact 50-byte length/version/flags, missing each of the four
+  required bits, unknown bits, valid all-zero partial capability, any zero
+  capacity with a complete bit, overflow capacity, combined-cluster-maximum-
+  greater-than-either-peer-reserve, cross-fabric
+  defined-bit/process/capacity mismatch, zero
   ID, duplicate,
   late/mutated capability, setup timeout, and injected entropy failure are
   covered. A symmetric `net.Pipe` proves concurrent capability writes cannot
@@ -5647,16 +6176,31 @@ passes on the fix and fails when the fix hunk is reverted.
   same process ID; capable/legacy mixes and mismatches retire the transport.
   Setup admission remains charged until resolution and releases exactly once on
   success, timeout, auth failure, and capability failure.
-  Capacity goldens build the exact `SessionCapacityPlan` and prove that local,
-  bounded auxiliary local-tunnel, peer-baseline, and transient-tail credits are
-  simultaneously reserved: 2x
+  Capacity goldens build the exact `SessionCapacityPlan` and prove that worker
+  and bounded auxiliary creation sublimits share one local-plus-peer authority
+  reserve, with transient-tail credit added separately: 2x
   entries in every fully replicated worker and coordinator store, 4x distinct
-  keys in the single AF-agnostic `userspace_sessions_v2` map, 1x in each DNAT
-  family, bounded slot-handle auxiliary indexes, and baseline-plus-tail rows in
-  the generation ledger. Exhaustive NAT/no-NAT, v4/v6, NAT64, and equal-alias
+  keys in the single AF-agnostic `userspace_sessions_v2` map, 2x in **each**
+  persistent kernel `sessions`/`sessions_v6` map, dynamic peer rows plus the
+  current/prepared static-key union in each DNAT family, bounded slot-handle
+  auxiliary indexes, and baseline-plus-tail rows in the generation ledger.
+  An eight-worker concrete fixture proves that every worker independently gets
+  the full 2x reserve rather than dividing or multiplying the advertised peer
+  count incorrectly, and derives the nonzero transient-tail ceiling from the
+  tightest 1x/2x/4x residual rather than disabling the baseline because the
+  preferred 262,144-row tail does not fit. Populate local and peer provenance together to the exact
+  combined authority boundary, promote every peer row without changing total
+  physical occupancy, and prove exact-boundary admission succeeds while one additional
+  logical row fails before mutation on each physical surface. Exhaustive
+  NAT/no-NAT, v4/v6, NAT64, and equal-alias
   fixtures prove four is a safe maximum and that the synthesized reverse adds no
-  fifth shim key. A source maximum one row above the peer's advertised baseline
-  reserve refuses capable authority before BulkStart. A tail that transiently
+  fifth shim key. Advertise unequal local-creation ceilings, promote the peer's
+  complete authority after takeover, and prove the checked sum of both creation
+  ceilings must fit **each** baseline reserve before capable authority starts.
+  Exact combined-boundary export back to a restarted peer succeeds; one row
+  above either reserve refuses capable authority before BulkStart. Reverting to
+  a two-field capability or checking only the current node's creation ceiling
+  fails this trace. A tail that transiently
   Opens before a cross-worker compensating Delete fits its dedicated reserve;
   final TailAck is withheld if `present=true` remains above the baseline
   reserve. Increase and safe decrease retire
@@ -5667,6 +6211,29 @@ passes on the fix and fails when the fix hunk is reverted.
   transport/capacity operational. Overflow in worker-sum or any 1x/2x/4x
   conversion fails closed rather than saturating or advertising zero.
 
+  Populate each kernel family independently to its all-v4/all-v6 2x boundary
+  and prove a missing kernel-map row is a typed partial result, never successful
+  continuity. For each DNAT family, fill dynamic rows to the remaining capacity,
+  prepare a config whose new static set overlaps some old keys and adds the exact
+  union boundary, and prove compile succeeds only while session admission is
+  closed. One extra prepared static key rejects before writing any new row and
+  leaves the old config/map exact. A source canary requires capacity accounting
+  to call the compiler-owned static-key enumerator and include both
+  `sessions`/`sessions_v6`; hard-coded dynamic-only arithmetic fails.
+  Prepare a static key equal to an existing local and then peer dynamic
+  reverse-NAT key; both reject before map/config mutation even when total
+  cardinality is below the ceiling, and the established session row remains
+  byte-identical.
+  Inject iterator termination error and failure after every static write, stale
+  compare-delete, rollback write/delete, and post-readback step. Complete
+  rollback proves the old static/dynamic digests before reopening; incomplete
+  rollback retains old control config but keeps forwarding/session admission
+  closed with map-repair debt. While the bounded transition lease is held,
+  established packets continue, worker expiry is postponed without allocation,
+  and no dynamic key changes. Timeout/helper replacement joins the worker fence
+  and resumes only a proved old state. Reverting to the current void stale-
+  delete API or ignored iterator/delete errors fails the matrix.
+
   Drive `maybe_enqueue_local_tunnel_session` past its new auxiliary cap while
   normal workers and peer reserve are populated. The next new tunnel key fails
   before shared/BPF/worker publication, increments its dedicated metric, and
@@ -5675,23 +6242,87 @@ passes on the fix and fails when the fix hunk is reverted.
   origin to name either worker-local or auxiliary credit, so a future uncapped
   producer cannot bypass `SessionCapacityPlan`.
 
-  A migration test starts with only the old 262,144-entry `userspace_sessions`
-  pin populated, pauses after each admission-close, v2 populate, mutation-tail,
-  readback, helper-fd switch, per-interface link-swap, publication, and cleanup
-  boundary, and proves failure retains or restores the complete old program/pin
-  set. Inject failure on the second of three interfaces and prove the first is
-  rolled back before admission reopens. Concurrent new local Opens are rejected
-  by the closed gate; required refresh/delete/GC mutations are dual-published
-  and appear in the sealed tail. Inject one-map failure for each operation and
-  prove repair completes before rollback or commit; none is present in only one
-  generation at either exit. Success proves the v2 count
-  and digest match the coordinator store before link replacement, no packet sees
-  a map without its session aliases, and old-pin removal waits for the final old
-  program lease plus capable repair. Restart with no retained Rust store proves
-  v2 starts empty and continuity stays false rather than trusting old pin rows.
-  A stale/incompatible v2 pin fails closed; neither map is unlinked or resized as
+  Enumerate all eight current `SessionOrigin` values against worker local,
+  promoted local, local-auxiliary, capable-peer, and legacy-transport
+  provenance for forward, reverse, materialized, promoted, and worker-replica
+  records. Every legal combination
+  has the expected export, inventory, capacity, promotion, and delete authority;
+  every illegal combination fails before shared/BPF/worker mutation. In
+  particular a local tunnel row with `origin=SyncImport` and
+  `provenance=LocalAuxiliary` is counted locally, omitted from peer inventory,
+  cannot delete a peer row, and is not exported as a worker-owned session.
+  Changing only its origin cannot change those facts. A source canary rejects
+  `is_peer_synced()` in each authority-sensitive module while retaining an
+  explicit allowlist for install/replication mechanics.
+  Seed rows from the current and a replaced peer process: inventory includes
+  both capable-process provenance classes plus an old legacy-transport class,
+  preserves generation only for the current capable process, and makes absent
+  old-process/legacy rows stale candidates. An empty new peer bulk removes the
+  old rows; filtering only the current process fails the test. Promote a
+  capable-peer row and prove the resulting local provenance retains its source
+  namespace and checked handoff serial. Demote it through successful exact
+  capable TailAck and ownership commit and prove it becomes peer authority for
+  only that target process. Repeat with a legacy peer, no peer, failed TailAck,
+  ambiguous TailAck, and invalidated ownership: positive forwarding/export
+  closes, but provenance remains quarantined local authority with debt until
+  exact cleanup or handoff. Reconnect cannot relabel any of those rows under a
+  fresh process or transport namespace. For legacy reconnect, prove a member in
+  the exact current BulkStart/End window rebinds an old-transport row, absent
+  old rows reconcile away, and a delayed Open/Delete from the retired
+  incarnation cannot mutate either result. Ordinary current-transport legacy
+  replacement retains compatibility but never creates a capable generation or
+  continuity bit.
+
+  Migration tests start with a saturated old 262,144-entry
+  `userspace_sessions` pin whose rows are a deliberately partial subset of the
+  coordinator aliases, including one-, two-, and three-of-four prior publish
+  prefixes. After admission closes, capture that exact bounded legacy domain
+  and expected starting subset.
+  At every v2 populate, mutation-tail, readback, helper-fd switch,
+  per-interface link-swap, publication, and cleanup boundary, prove v2 equals
+  full coordinator truth while the old map equals only the expected subset
+  evolved by in-domain refresh/delete/GC; no migration step invents a missing
+  old alias. The mismatch metric identifies
+  old-subset versus v2/coordinator disagreement. Inject failure on the second of
+  three interfaces and prove the first rolls back, both map domains repair to
+  their distinct truths, and admission remains closed until the migration
+  adapter retires and the old-only link/writer state is revalidated; only then
+  may the exact pre-migration mode reopen. Inject interface add/remove/rebind at
+  every link boundary and require the same rollback. Concurrent local Opens are
+  rejected while migration is active; refresh/delete/GC updates the old expected
+  digest only for domain keys and affects v2 for every coordinator key.
+
+  Kill the daemon immediately after rollback-program pin creation but before
+  journal creation: with every link proved old, startup verifies and removes
+  the orphan; a mismatched orphan or any mixed/v2 link fails closed. Make
+  journal fsync fail and prove the same no-link-mutation cleanup. Then kill the
+  daemon after journal fsync and after every individual link update,
+  final barrier, committed-record rename/fsync, adapter retirement, selector
+  publication, and old-pin cleanup. Every `preCutover` restart returns all
+  eligible links to the separately pinned/reverified old program before
+  admission, even after the last old link vanished and even when the
+  saved/current link set differs. It then flushes stale old shim rows, including
+  seeded `PASS_TO_KERNEL`, and proves empty restarted helper/map truth rather
+  than preserving sessions from the cache. Every durable `committed` restart selects v2 for old and newly
+  discovered links, never reactivates old publication, reconciles the empty
+  restarted coordinator explicitly, and leaves HA continuity false. A torn,
+  corrupt, unknown-version, permission-failed, or all-v2-without-record state
+  fails closed with no guessed unlink or generation. Reverting either fsync
+  ordering makes the crash matrix fail.
+
+  Success proves all links select v2, all old-program leases join, and the final
+  local v2/coordinator barrier passes before the old adapter retires. Admission
+  reopens only after that retirement; subsequent Opens touch v2 alone and
+  cannot refill the old map. Inject peer absence, a legacy-only peer, and failed
+  capable repair after local cutover: standalone and mixed-version nodes still
+  finish local migration and old-pin/program cleanup, while HA continuity stays
+  false for its independent reason. No later repair failure rolls links or
+  dual-publish back. Restart with no retained Rust store proves v2 starts empty
+  and continuity stays false rather than trusting old pin rows. A stale or
+  incompatible v2 pin fails closed; neither map is unlinked or resized as
   remediation. The generated Go/Rust map-name, max-entry, flag, key-size,
-  alias-factor, active-accessor, and migration canaries fail on one-sided drift.
+  alias-factor, active-accessor, legacy-subset, cutover, and migration canaries
+  fail on one-sided drift.
 
   Cold-order tests prove no sender bulk occurs merely from `installConn` or
   `OnPeerConnected`. An unprotected or config-sync-disabled receiver requests
@@ -5778,6 +6409,18 @@ passes on the fix and fails when the fix hunk is reverted.
   reconcile snapshot/replay, and maximum-capacity memory against the current
   `FxHashMap`; reject more than 5% p99 regression or any extra full-entry copy.
 
+  Advance one worker's `sessionDeltaLossEpoch` before sequence assignment at
+  each point from export admission through scan boundary, private Final,
+  phase-2 capture seal, final-bank drain, TailEnd, and TailAck. Scan-phase
+  movement produces Abort/no BulkEnd; capture-phase movement produces no
+  TailEnd; post-terminal movement invalidates the pending ordinary/continuity
+  token and retires rather than being hidden by a resync that clears the Boolean
+  loss latch. Unchanged epoch vectors round-trip through Header, WorkerDone,
+  Final, boundary payloads, and Go token digest. Counter exhaustion takes the
+  controlled fail-closed process path. A fail-on-revert test sets then consumes
+  the old Boolean latch while leaving the epoch changed and still requires
+  failure.
+
   A worker timeout, missing/duplicate WorkerDone or boundary, nonzero legacy
   export cap, stale helper source, EventStream gap, capture overflow,
   response-without-stream, Final-without-watermark, source or peer-wire digest
@@ -5819,6 +6462,23 @@ passes on the fix and fails when the fix hunk is reverted.
   fails closed. Sustained churn through the absolute tail deadline retires the
   transport and preserves delete/repair debt; it never reports continuity or
   spins forever waiting for an empty bank.
+  Start from B owning translated tuple T, then capture `Delete(B,T)`,
+  `Open(A,T)`, `Open(B,U)`. The detached bank emits B's release before either
+  final Open and installs A/T plus B/U. Repeat with a two-key swap, a three-key
+  cycle, final Delete, same-key delete/reopen, and the same key returning in a
+  later bank. Generated private-event goldens prove Close carries B/T's exact
+  pre-delete descriptor and NAT-rebind/promotion Open carries both incumbent and
+  after state; reverting to today's key-only Close or after-only promotion fails
+  before coalescing. Duplicate final tuple claims, a tuple held by an untouched peer,
+  and local/static ownership reject without deleting the foreign row. Failure
+  after every release/acquire prefix enters ambiguity escrow and never returns a
+  possibly exposed tuple to local allocation. A fail-on-revert coalescer that
+  retains only final per-key states fails the B/T trace. Phase-2 worker
+  boundaries capture mutations racing the first empty-bank observation. Delay
+  the finalize control response, decode the in-band seal at sequence S, then
+  deliver S+1 and S+2 mutations of the same key: the seal callback detaches the
+  <=S bank before either later frame is decoded, and both later frames enter the
+  closed ordinary queue. Removing the in-band callback rotation fails the test.
   Advertise a peer tail-row ceiling smaller than the local byte budget and prove
   the next unique row fails before emission while an update to an existing row
   in the same active bank still coalesces without row credit. Reappearance after
@@ -5858,13 +6518,23 @@ passes on the fix and fails when the fix hunk is reverted.
   For pool SNAT, address-only SNAT, deterministic CGNAT, NAT64, and NAPT64,
   occupy the imported translated tuple with a different local flow and prove the
   peer Open returns a typed conflict before shared/BPF/worker mutation and emits
-  no ACK. Inject failure after each successful tentative allocator reservation
-  and prove rollback returns the exact port/reverse-identity token once; a
-  successful batch transfers ownership to normal peer-session teardown and a
-  same-key retry is idempotent. Foreign pool/prefix provenance under a claimed
+  no ACK. Inject failure after each successful tentative allocator reservation:
+  failures before the first external mutation roll back the exact token once,
+  while failures after shared/BPF/kernel/worker mutation move it to ambiguity
+  escrow and make it unavailable to concurrent local allocation. A successful
+  batch transfers ownership to normal peer-session teardown and a same-key
+  retry is idempotent. Foreign pool/prefix provenance under a claimed
   equal config digest is a hard config/repair failure, not the current silent
   skip. Concurrent local allocation cannot enter between reservation preflight
   and batch commit.
+  Replace translated tuple T with U while U is occupied and prove T plus every
+  incumbent persistent/shared-lease refcount remains exact. Repeat with T==U,
+  free U plus failure after every derived-surface prefix, changed address-only
+  translation, persistent source-key reuse, and NAT64 reverse identity. Success
+  releases T only after U is fully published; ambiguity quarantines both until
+  cleanup chooses or removes the surviving state. Reverting to destructive
+  `reserve_flow` or the address-only "return old tuple" shortcut fails these
+  tests.
   Old tombstones disappear only after the all-fabric-fenced TailAck; aborting
   before it preserves them. Fill the derived ledger capacity and prove the
   next new key fails before dataplane mutation, closes admission, and requests a
@@ -5877,13 +6547,24 @@ passes on the fix and fails when the fix hunk is reverted.
   outcomes; every non-complete result invalidates the window and retains taint.
   After a deliberately partial helper/BPF/worker result, assert
   `ledgerInventoryDirty`, refuse maintenance bulk, preserve the scalar maximum
-  generation, mark every attempted key ambiguous, and require a fresh origin-
-  aware shared-store inventory before the next nonzero request. Exercise both
+  generation, mark every attempted key ambiguous, and preserve one fixed
+  registry record per attempted key with complete before/attempted derived
+  descriptors and both incumbent/attempted escrow. Require bounded origin-aware cleanup **before** fresh
+  shared-store inventory or the next nonzero request. Exercise both
   an Open that reached only BPF/one worker and a Delete that disappeared from
   the shared store but remained in BPF/one worker. Re-inventory merges shared
-  rows without dropping either ambiguous input key; the next full source
-  replays or prepends the idempotent cleanup, and only exact TailAck clears the
-  flags. Seed the shared backend with an additional prefix the old speculative
+  rows without dropping either ambiguous input key; exact compare-delete removes
+  matching peer rows on every surface but preserves a same-key local row, newer
+  peer generation, foreign BPF value, and static DNAT flag/value. Only complete
+  cleanup releases NAT quarantine; helper replacement rebuilds all surviving
+  coordinator reservations and journal quarantine before local admission.
+  Admit disjoint ordinary operations concurrently on both fabrics, make several
+  results partial or response-lost, and prove each retains a distinct batch slot
+  after the first failure closes new admission. Join all prior admissions, clean
+  slots in batch-ID order, and reject a 65th simultaneous slot before mutation;
+  no result overwrites another. A new batch after failure is refused until the
+  retained registry is empty. The next full source
+  replays truth, and only exact TailAck clears taint. Seed the shared backend with an additional prefix the old speculative
   ledger did not record and prove re-inventory discovers it for stale selection.
   At helper level, prove one ref-counted descriptor rather than 256 per-member
   commands reaches each captured worker, and that success waits for the exact
@@ -5922,6 +6603,18 @@ passes on the fix and fails when the fix hunk is reverted.
   one key across three tail batches and prove each generation applies in wire
   order, the final Open survives, and all three frames contribute to the tail
   digest; baseline duplicate-key rejection must not leak into this tail path.
+  Freeze a receive window with advertised tail-row ceiling `R > 1`. Send
+  `2 * R` monotonically generated frames for one canonical key across repeated
+  batches and prove the exact frame boundary succeeds, charges one receiver
+  unique-key row, and requires TailEnd count `2 * R`; frame `2 * R + 1` rejects
+  before decode/helper mutation despite the existing ledger slot. Repeat with
+  `R` distinct keys and exactly two frames per key. A parameterized window-unit
+  test sets the frozen wire-byte ceiling to the exact encoded total and then one
+  byte less, proving checked byte accounting runs before helper dispatch and is
+  independent of key charging. Capability/window construction rejects `R`
+  values that overflow either `2 * R` or
+  `maxTailFrames * maxCapableSessionFrameBytes`. Wrong TailEnd count at every
+  boundary suppresses TailAck and retains taint.
   In the zero-tail case, pause the receiver's BulkAck write after the peer has
   consumed the bytes, let the peer return TailEnd, and verify the receive phase
   advances to `tailAckWriting` without restarting the preinstalled tail
@@ -5936,15 +6629,29 @@ passes on the fix and fails when the fix hunk is reverted.
   a still-unseen row. Pause final baseline reconciliation after one 256-row
   chunk and prove state locks/status remain live while BulkAck stays closed;
   cancellation retains taint. TailAck has no residual full-ledger scan.
-  TailAck precommit
-  provisionally opens ordinary admission and maintenance authorization so an
-  immediate causal normal frame/request-ID-zero bulk is not dropped; only
-  TailAck postcommit makes them durable and publishes readiness. Pause each ACK
+  TailAck precommit provisionally opens ordinary admission, so an immediate
+  causal normal frame is not dropped. Drive a real two-fabric sender through
+  this ordering instead of injecting a protocol state the sender cannot reach:
+  pause the receiver's TailAck writer after the peer consumes its bytes but
+  while it still holds `writeMu`; let the peer begin the next maintenance cycle
+  and send both required barrier requests. Both barrier-ACK writers block on
+  `writeMu`, the sender observes no complete barrier set, and no BulkStart is
+  emitted or accepted. Release TailAck postcommit and outbox commit; only
+  then may both barrier ACKs complete and the normally authorized BulkStart
+  create a second window. If config/ownership invalidation wins the fence,
+  TailAck is suppressed, the barriers cannot authorize a start, and the
+  transport retires. A fabricated BulkStart before the complete barrier is a
+  protocol violation, while an ordinary frame during provisional admission
+  remains valid. Pause each ACK
   writer before and after state revalidation. If it owns `writeMu`, config/
   ownership invalidation waits and the ACK linearizes first; if the invalidator
   owns the write fence, revalidation emits nothing. A transition between final
   write and postcommit orders false after true or suppresses stale true through
-  the continuity outbox. Stop joins both writers and any tail batch.
+  the continuity outbox. Fill that outbox before TailAck: no TailAck byte is
+  written until a slot is reserved; invalidation while waiting releases the
+  reservation and emits no stale ACK. After an unambiguous TailAck write,
+  injected allocation/error seams are unreachable and postcommit plus outbox
+  commit complete under the held write fence. Stop joins both writers and any tail batch.
 
   Repair tests request on fabric 1 while fabric 0 remains preferred and prove
   the bulk is pinned to fabric 1. Unique request claim, duplicate/refusal, nil
@@ -6113,8 +6820,9 @@ deviation and returns to review.
 - Broad AST/parser normalization across all configuration packages.
 - Supporting nested policy syntax as a vSRX feature; official Junos hierarchy
   uses the combined `from-zone X to-zone Y` container.
-- Widening dataplane owner capacity above slots 1..15 or migrating pinned BPF
-  maps. Control definitions remain supported through 255.
+- Widening dataplane owner capacity above slots 1..15 or migrating any pinned
+  BPF map other than the in-scope additive `userspace_sessions_v2` cutover.
+  Control definitions remain supported through 255.
 - Generalized DDNS namespace and teardown protocol: endpoint aliases/anycast,
   cross-Surface-A/B linearization, publication-versus-deletion races, durable
   claimant election, legacy `fp1` migration, HTTP-provider identity, and
@@ -6338,12 +7046,14 @@ to implementors:
     separate floor-covered completed cache. Nothing above a gap is evicted; only
     a result already made stale-safe by the floor can age out.
 20. Session-bearing helper APIs use a non-escapable consuming callback and
-    generation-qualified batch/stream, while private EventStream frames carry
-    their producing helper snapshot generation. Capable bulk authenticates one
-    request-private fixed-record owner-session stream, a sequenced boundary from
-    every exact worker, and terminal event watermark. It converts and writes
+    generation-qualified batch/stream, while private EventStream mutation frames
+    carry their producing helper snapshot generation plus fixed pre-mutation
+    and post-mutation authority projections. Capable bulk authenticates one
+    request-private fixed-record owner-session stream, scan and final-seal
+    boundaries plus monotonic loss epochs from every exact worker, and terminal event watermark. It converts and writes
     records directly between markers with source and peer-wire count/digest
-    proofs, then flushes a fixed-credit per-key final-state tail. It never
+    proofs, then flushes a fixed-credit per-key tail whose release phase
+    preserves cross-key tuple dependencies before final acquisitions. It never
     materializes a full Rust or Go vector. Shared delta buffers, global sequence
     sampling, and asynchronous all-session export are explicitly non-authoritative.
 21. Receive-side inventory reads the coordinator's shared synced-session
@@ -6351,28 +7061,50 @@ to implementors:
     stable-slot/index store with a checked mutation serial, so a streamed scan
     is exact-or-aborted without holding its mutex across backpressure or adding
     a second full entry vector. Its peer-domain serial ignores unrelated local-
-    only churn but changes on every forward peer-synced presence/value/origin
+    only churn but changes on every explicit peer-namespace provenance
     transition. Every key in a non-complete 256-operation helper
-    batch remains an ambiguous row in the already-reserved Go generation ledger.
-    Fresh inventory merges but cannot erase those rows; fresh authoritative
-    source truth must reapply or delete them on shared, BPF, and every worker
-    surface before final TailAck clears taint.
-22. Capability exposes two receiver reserves in forward-logical units: durable
-    peer-baseline rows and temporary unique tail mutations. One checked
-    `SessionCapacityPlan` reserves those together with the receiver's complete
-    exportable-local and bounded auxiliary local-tunnel ceilings across every
+    batch remains an ambiguous row in the already-reserved Go generation ledger
+    and a full before/attempted descriptor in the fixed one-batch cleanup
+    journal. Fresh inventory cannot erase those records; compare-delete cleanup
+    removes only matching peer-owned rows on shared, BPF, kernel, DNAT, and every
+    worker surface, and tuple escrow is released only after absence is proved.
+22. Capability exposes local-creation capacity plus two receiver reserves in
+    forward-logical units: durable peer-baseline rows and temporary unique tail
+    mutations. Bilateral setup proves the checked sum of both creation ceilings
+    fits either baseline reserve, including authority re-export after takeover.
+    One checked
+    `SessionCapacityPlan` treats worker/auxiliary creation as sublimits of the
+    shared local-plus-peer authority reserve and adds only tail credit across every
     real physical surface: 2x coordinator
-    and per-worker rows, 4x keys in the single shim session map, 1x in each DNAT
-    family, exact shared-index slots, and baseline-plus-tail ledger rows. Sender
-    source capacity is checked separately against the peer baseline reserve, and
+    and per-worker rows, 4x keys in the single shim session map, 2x in each
+    independently populated kernel session family, dynamic rows plus the
+    current/prepared static-key union in each DNAT family, exact shared-index
+    slots, and baseline-plus-tail ledger rows. Sender
+    source capacity is the negotiated combined cluster ceiling, and
     final TailAck requires peer presence at or below it. Per-tuple SNAT/NAT64
-    allocator reservations remain an independent transactional gate; collision
-    aborts rather than silently skipping protection. Capacity is transport-
+    allocator reservations remain an independent gate; collision aborts rather
+    than silently skipping protection, and any token exposed to a mutation
+    prefix remains escrowed through cleanup. Capacity is transport-
     epoch immutable, so rebind/config changes retire and renegotiate rather than
     mutate a live advertisement. The current pin is migrated side-by-side to a
-    versioned no-prealloc map; it is never resized or deleted in place. A
+    versioned no-prealloc map; the old starting subset is preserved until all
+    links and leases cross a local one-way barrier and a committed recovery
+    record is durable, then its adapter retires before admission independently
+    of peer repair. Pre-cutover crash recovery selects old; committed recovery
+    selects only v2. It is never resized or
+    deleted in place. A
     prepared shrink that cannot hold any current authoritative/derived row is
     rejected before helper/config mutation.
+23. Session authority is explicit provenance independent of `SessionOrigin`.
+    Local worker/promoted authority, local auxiliary authority, capable peer
+    process authority, and ephemeral legacy transport authority have an
+    exhaustive legal transition matrix; local-tunnel `SyncImport` never makes a
+    row peer inventory or delete authority. Demotion may create capable peer
+    authority only after exact handoff/TailAck and ownership commit.
+24. TailAck retains the global write fence through its complete postcommit and
+    continuity publication. Successor maintenance requires fresh ACKs from the
+    all-current-fabric barrier writers under that same fence, so no valid
+    BulkStart can precede the completed TailAck transaction.
 
 Manual approval of this plan accepts those product choices. A material change to
 any one returns that child workstream to plan review rather than being improvised
