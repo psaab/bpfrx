@@ -69,3 +69,23 @@ independent SMR-method review found material design gaps and returned
 Round 3 did not converge: AGY returned `PLAN-READY`; Codex and the independent
 SMR-method review returned `PLAN-NEEDS-MAJOR` with convergent RG, peer-effective,
 SNMP, DDNS, and confirm-recovery findings.
+
+### Round 4 - plan commit `26843cb0f4870b89c4849bcb1f24ff7dc0ec658d`
+
+- Codex direct hostile review: process session `69133`; reviewer session
+  `019fc7a6-106a-7210-8797-a6e63e869f18`; verdict
+  `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: process session `84223`; verdict `PLAN-READY`.
+- Claude Code CLI: process session `45341`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic verdict exists.
+- Independent SMR-method fallback agent:
+  `019fc7a6-0d99-7d23-964f-90014234a599`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic model
+  review.
+
+Round 4 did not converge: AGY returned `PLAN-READY`; Codex and the independent
+SMR-method review returned `PLAN-NEEDS-MAJOR`. Their source-grounded blockers
+cover DDNS fixed-mode and multi-cycle anchor authority, invalid persisted DDNS
+families, compiler-equivalent RG normalization and pre-effect validation,
+`FirstCommit` consistency plus confirm remediation, and the actual flat
+`system snmp` shape and rejection/runtime lifecycle.
