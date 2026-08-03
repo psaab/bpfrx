@@ -2,13 +2,13 @@
 
 ## 1. Status
 
-**DRAFT v4 - round-three major findings addressed; pending round-four review**
+**DRAFT v5 - round-four major findings addressed; pending round-five review**
 
 - Issue: [#6744](https://github.com/psaab/xpf/issues/6744)
 - Source report: `/tmp/kimi-review-003.md`
 - Base: `origin/master` at `ad959117748181dabe46b8ddc2827de670380cea`
 - Branch: `research/6744-kimi-review-003`
-- Revision: 4
+- Revision: 5
 - Round-one plan SHA: `78891c3242a80b719bebdddc702087c07543e05b`
 - Round-two plan SHA: `01b67530e53016cf127d43c4a28c0582513718f8`
 - Round-one verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
@@ -28,6 +28,15 @@
   analysis at the account spend limit, so no Anthropic-model verdict is
   claimed. Round three did not converge; revision 4 incorporates every valid
   source-grounded finding.
+- Round-four plan SHA:
+  `26843cb0f4870b89c4849bcb1f24ff7dc0ec658d`.
+- Round-four verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
+  `PLAN-READY`; independent SMR-method fallback
+  `PLAN-NEEDS-MAJOR`. The Claude Code CLI again failed before
+  analysis at the account spend limit, so no Anthropic-model verdict is
+  claimed. Round four did not converge; revision 5 closes the DDNS authority
+  lifetime, compiler-equivalent RG view, confirm-recovery state-machine, and
+  canonical SNMP-shape gaps found by the dissenting reviews.
 - Mode: `/research`. Stop at `PLAN-READY` or `PLAN-KILL`. Do not write
   production code and do not open a pull request.
 
@@ -265,11 +274,25 @@ at the persistence boundary so this validator can report it precisely.
 func validateNonEmptySecurityIdentities(root *ConfigTree) error
 ```
 
-Both compile paths call the same hard gate after inactive stripping and group
-expansion, so their accepted identity grammar cannot drift. A strict
-operator-driven commit on a cluster must also prove the peer-effective view.
-Extract the existing effective-tree preparation from the compiler and add one
-focused peer preflight:
+Both compile paths call the same hard gate on the compiler's canonical
+node-effective tree, so their accepted identity grammar cannot drift. Extract
+only the existing pre-`compileExpanded` preparation shared by generic/local/peer
+compiles: clone, strip inactive subtrees, and expand groups with `${node}`
+substitution. Do **not** move interface-range expansion earlier: its current
+position inside `runPreWalkGates` is observable through validator ordering,
+first errors, and warning order.
+
+Place B, C, and M plus I's explicit-binding syntax gate immediately after the
+existing `expandInterfaceRanges(tree)` call in `runPreWalkGates`. Normal and
+peer hard-gate compilation therefore see the same expanded members at the same
+phase without duplicating the range algorithm or reordering any existing gate.
+
+A strict operator-driven commit on a cluster must also prove the peer-effective
+view. Add a focused peer compilation mode that runs the normal section
+dispatcher and final typed lowering (therefore preserving repeated-root
+replacement semantics), keeps unrelated historical tolerant validators at
+their existing warning posture, but forces the B, C, I, and M gates to their
+hard setting:
 
 ```go
 type EffectiveHardGateResult struct {
@@ -277,38 +300,49 @@ type EffectiveHardGateResult struct {
 }
 
 func runEffectiveHardGates(
-    expanded *ConfigTree,
+    effective *ConfigTree,
     lenientSNMP bool,
 ) (EffectiveHardGateResult, error)
-func ValidatePeerEffectiveHardGatesStrict(
+func compilePeerEffectiveHardGateView(
     tree *ConfigTree,
-    localNodeID int,
-) error
+    peerNodeID int,
+) (*Config, error)
 ```
 
-`runEffectiveHardGates` owns the B, C, I, and M AST gates.
-`compileConfigWithOpts` invokes it on the exact local expanded tree
-with the compiler mode's SNMP leniency and carries its result into section
-lowering. B, I, and M always return errors; C returns a rejection result in
-lenient mode and an error in strict mode. The config-store strict promotion
-path invokes `ValidatePeerEffectiveHardGatesStrict` for the other
-node when `localNodeID` is 0 or 1. That helper uses the same
-strip-inactive, recursive apply-groups, and `${node}` substitution
-pipeline as normal compilation, then runs only these four action-agnostic hard
-gates; it does not turn every historical warning-only validator into a new peer
-commit gate. A peer-only failure names the effective node and rejects before
-promotion. Standalone node IDs are a no-op.
+`runEffectiveHardGates` owns the B, C, and M AST gates plus I's explicit-binding
+syntax check. `compileConfigWithOpts` invokes it after canonical preparation and
+carries its SNMP result into section lowering. B and M always return errors; C
+returns a rejection result in lenient mode and an error in strict mode. I's
+definition membership and repeated-root truth are checked on the final typed
+`Config`, not by unioning raw chassis roots.
+
+The config-store strict promotion path first compiles the local view normally,
+then invokes `compilePeerEffectiveHardGateView` for the other node when
+`localNodeID` is 0 or 1. The peer mode uses the same preparation, full
+`runPreWalkGates`, section dispatch, derivations, and typed RG validation as
+ordinary compilation.
+Only these four action-agnostic gates are forced hard; unrelated tolerant
+validators retain their current compatibility posture. A peer-only failure
+names the effective node and rejects before promotion. Standalone node IDs are
+a no-op. Fundamental parse/expansion/lowering errors still reject because no
+meaningful effective peer config exists.
 
 ### 5.4 Workstream C - enforce SNMPv3 configured security intent (K003-13)
 
-Configured intent must be validated on the apply-groups-expanded AST **before**
-`compileSNMPv3` lowers it. The typed `SNMPv3User` is too late: today a password
-is copied only when nested under a recognized protocol node, so legitimate
-noAuthNoPriv and malformed password-only syntax can collapse to the same typed
-object. The AST pass walks both accepted stanza locations: canonical top-level
-`snmp v3 usm local-engine user` and the accepted
-`system snmp ...` compiler path. It aggregates every occurrence by
-nonempty username without copying secret values into diagnostics:
+Configured intent must be validated on the canonical, node-effective AST
+**before** `compileSNMPv3` lowers it. The typed `SNMPv3User` is too late: today
+a password is copied only when nested under a recognized protocol node, so
+legitimate noAuthNoPriv and malformed password-only syntax can collapse to the
+same typed object.
+
+The only supported configuration root is the schema-linked Junos form,
+top-level `snmp v3 usm local-engine user`. The dead `compileSystem` fallback is
+removed. A direct `system snmp` child is an action-agnostic hard error on strict
+and tolerant paths with a diagnostic that points to canonical `set snmp ...`
+syntax. This is preferable to blessing an undocumented alias whose flat
+`SetPath` shape is a packed leaf rather than the child hierarchy
+`compileSNMP` expects. The intent pass aggregates every canonical occurrence by
+identity without copying secret values into diagnostics:
 
 - a nonempty username with no authentication or privacy declaration is valid
   noAuthNoPriv;
@@ -331,8 +365,9 @@ valid duplicate cannot hide a malformed one.
 
 ```go
 type SNMPv3UserRejection struct {
-    Name   string
-    Reason string // path/field only; never a secret value
+    Identity string // nonempty name, otherwise a stable path token
+    Path     string
+    Reason   string // field names only; never a secret value
 }
 
 type SNMPv3IntentResult struct {
@@ -340,15 +375,18 @@ type SNMPv3IntentResult struct {
     rejectedNames map[string]struct{} // internal, non-serialized lookup
 }
 
-func validateSNMPv3Intent(root *ConfigTree) SNMPv3IntentResult
+func validateSNMPv3Intent(
+    root *ConfigTree,
+    lenient bool,
+) (SNMPv3IntentResult, error)
 ```
 
 The dataflow is explicit, rather than hidden in a warning slice:
 
 1. `runEffectiveHardGates` returns the local
    `SNMPv3IntentResult` to `compileConfigWithOpts`.
-2. The section dispatcher passes that result through both
-   `compileSystem` and the top-level `compileSNMP` path.
+2. The section dispatcher passes that result only through the canonical
+   top-level `compileSNMP` path. `compileSystem` has no SNMP branch.
 3. `compileSNMPv3` takes the rejected-name set and skips every
    rejected username without mutating the source AST.
 4. After all SNMP stanza locations are lowered, the compiler attaches the
@@ -369,25 +407,46 @@ Runtime remains an independent belt:
 
 ```go
 type V3RuntimeRejection struct {
-    Name   string
-    Reason string
+    Identity string
+    Path     string
+    Reason   string
 }
+
+func HasInstallableV3Users(cfg *config.SNMPConfig) bool
 
 func (a *Agent) deriveV3Users(
     cfg *config.SNMPConfig,
 ) (map[string]*usmUser, []V3RuntimeRejection)
 ```
 
-`deriveV3Users` rejects empty names, empty declared keys, privacy
-without valid authentication, and every internally inconsistent hand-built
-typed user. `NewAgent` and `UpdateConfig` derive a complete
-valid table and sorted rejection list before taking `cfgMu`, then swap
-the config pointer, valid-user table, and runtime rejection snapshot together.
-A valid user changed to invalid therefore disappears in one atomic swap. One
-structured warning reports configured, installed, and omitted counts plus
-sorted names, never passwords. A config containing only rejected v3 users may
-leave UDP/161 listening, but its empty USM table answers no authenticated user
-request. Do not infer configured intent from derived key presence.
+`deriveV3Users` iterates sorted map keys and never dereferences a nil value. It
+rejects an empty map key, nil user, empty declared key, privacy without valid
+authentication, unknown protocol, and a `user.Name` that is empty or differs
+from its map key. The map key is the canonical installed identity; a malformed
+embedded name can never redirect or overwrite another user.
+
+Runtime rejection metadata is unioned with
+`SNMPConfig.RejectedV3Users` by stable identity (`Identity`, or `Path` when no
+name exists), with deterministic sorted field-only reasons. One logical user is
+counted once even if both compiler and runtime belts reject it. The resulting
+counts are exact: `configured = installed + omitted`; `omitted` is the size of
+that unique rejection union. `NewAgent` and `UpdateConfig` derive the complete
+valid table and union before taking `cfgMu`, then swap the config pointer,
+valid-user table, and rejection snapshot together. A valid user changed to
+invalid therefore disappears in one atomic swap. One structured warning reports
+configured, installed, and omitted counts plus sorted nonsecret identities.
+
+Listener behavior is not delegated to the implementor. `snmpEnabled` continues
+to require at least one valid community or installable v3 user. It calls
+`snmp.HasInstallableV3Users`, a zero-localization view over the exact same pure
+structural validator `deriveV3Users` uses before password-to-key work; the
+daemon and agent may not maintain separate acceptance predicates. A config
+whose only identities are rejected stops an existing agent (or declines
+startup) after publishing the compiler/runtime rejection diagnostic; it does
+not leave UDP/161 open with an empty USM table. The reconcile hash includes
+sorted compiler rejection metadata and all runtime-significant input, so a
+transition cannot hide behind the unchanged-hash shortcut. Do not infer
+configured intent from derived key presence.
 
 ### 5.5 Workstream D - restore flowless ICMP global admission (K003-01)
 
@@ -418,11 +477,19 @@ the only authority for one component. Credential-rotation fallback therefore
 requires separate operation-result research and is not necessary to stop a v6
 record from being deleted through v4.
 
-Remove the production use of the single representative `m.updater` at
-the family turn-off block and stop advancing it from whichever family happened
-to resolve last. Preserve it only as the fixed updater used by the existing
-constructor/test seam. Production factory mode resolves current and previous
-anchors per family exactly as #5814 already records them.
+Remove the production use of the single representative `m.updater` at the
+family turn-off block and stop advancing it from whichever family happened to
+resolve last. Preserve it only as the fixed updater used by the exported
+constructor compatibility seam. `reconcileEnv` carries an explicit
+`fixedUpdaterMode` bit (`m.newUpdater == nil`) so compatibility authority can
+never leak into production factory mode.
+
+Production factory mode resolves current and retained anchors independently per
+family. `dhcpBackendFingerprint` identifies an executable RFC2136 endpoint from
+backend/server/key-name/algorithm/bind identity even when publication policy is
+disabled. `enabled` controls whether leases are desired; it is not part of
+endpoint identity. A removed stanza or unusable factory still produces no
+current endpoint.
 
 Choose the delete updater for each owned row, not once for the family:
 
@@ -432,24 +499,53 @@ func (e *reconcileEnv) updaterForOwnedWithdrawal(
 ) (DNSUpdater, bool)
 ```
 
-The deterministic selection is:
+Reject an owned row before any family-array lookup or DNS operation unless its
+family is exactly 4 or 6 and its address family agrees with `Address`/`AddrText`
+and `ForwardType` (`A` for v4, `AAAA` for v6). The ownership loader applies the
+same semantic check and quarantines an invalid store. The selector repeats it
+as a belt so a handcrafted in-memory row cannot alias family 0 or 5 to the IPv4
+slot.
 
-1. If the current updater for `owned.Family` is live and its nonempty
+The deterministic authority selection is:
+
+1. In production factory mode, if the current updater for `owned.Family` is live and its nonempty
    fingerprint equals `owned.BackendFingerprint`, use it.
 2. Otherwise, if that family's previous-cycle updater is live and
    `prevFP` equals the nonempty owned fingerprint, use it. This is the
    normal disable, temporary factory-failure, and endpoint-transition cleanup
    path.
-3. Otherwise return no authority. Keep the durable ownership row, increment the
+3. In fixed-updater mode only, a non-nop caller-supplied updater is trusted to
+   withdraw a valid-family row whose `BackendFingerprint` is empty. This
+   preserves the public constructor's historical contract: its caller attests
+   that the one updater is authoritative for records that constructor created.
+   A nonempty fingerprint is never authorized by fixed mode.
+4. Otherwise return no authority. Keep the durable ownership row, increment the
    existing orphan/backend-mismatch alarm, and block republish of that identity
    for the pass.
 
-Every comparison is same-family and exact-fingerprint. An empty legacy
-fingerprint is uncertainty, not permission. The code never substitutes another
-family, a representative updater, or a merely non-nil backend. Capture
-`prevUpdater` and `prevFP` before advancing the per-family
-anchors, and advance those two arrays in lockstep only for a live current
-updater.
+Every production comparison is same-family and exact-fingerprint. An empty
+legacy production fingerprint is uncertainty, not permission. The code never
+substitutes another family, a representative updater, or a merely non-nil
+backend.
+
+Anchor lifetime is post-reconcile, not pass-start rotation. Capture the old
+updater/fingerprint pair before resolving the current endpoint and do not mutate
+`lastLiveUpdater`/`lastLiveFP` until the complete pass ends. After reconcile,
+scan the retained ownership rows for that family:
+
+- if any row still carries the old nonempty fingerprint and it differs from
+  the current fingerprint, keep the old pair unchanged for the next retry;
+- otherwise, install the live current updater and nonempty fingerprint in
+  lockstep;
+- if no current endpoint exists and no retained row depends on the old pair,
+  clear both slots in lockstep.
+
+Therefore A -> B followed by a successful forward delete and failed PTR delete
+retains A across later cycles. The next pass again selects A; only after the
+owned A row is fully deleted may B become the retained anchor. A third endpoint
+rotation while an older row still depends on A is alarmed and retained rather
+than guessed: the bounded one-old-anchor design does not claim automatic
+cleanup across multiple unresolved credential generations.
 
 There is deliberately no automatic second-credential retry. Any error surfaced
 by the selected updater, including a simulated partial forward/PTR failure,
@@ -462,9 +558,10 @@ inventing component authority that the current backend API cannot report.
 
 The no-authority branch never writes DNS, changes a fingerprint, drops
 ownership, or reports success. Restart after the operator removed the only
-backend cannot reconstruct an executable updater; it retains and alarms. No
-new secret, generation ID, map, catalog, memory cap, disk schema, or public API
-is introduced.
+backend cannot reconstruct an executable updater; it retains and alarms. The
+fixed-mode trust bit is in-memory constructor state, not persisted authority.
+No new secret, generation ID, map, catalog, memory cap, disk schema, or public
+API is introduced.
 
 ### 5.7 Workstream F - make `LoadOverride` format handling explicit and atomic (K003-09)
 
@@ -550,24 +647,65 @@ return an error; boot keeps the already loaded active config, does not re-arm a
 timer, does not roll back, and does not delete or rewrite the corrupt recovery
 record. This is an inert quarantine, not silent cleanup of forensic state.
 
-Semantic recovery is also checked before state mutation. For every
-non-`FirstCommit` record, `recoverPendingConfirmLocked`
-compiles `PrevTree` through the same node-local tolerant compile and
-action-agnostic hard gates used for persisted active state **before** assigning
-`s.active`, populating `confirmPrevTree`, or arming a
-timer. A structural or semantic failure preserves the already-loaded active and
-compiled config, retains the exact confirm file, and arms no timer. Expired and
-future records obey the same preflight-before-mutation order.
+Semantic recovery is also checked before state mutation. After the existing
+`GuardedHash` stale-record check (a stale record is durably removed and never
+interpreted), enforce the `FirstCommit` state invariant: `FirstCommit=true`
+requires a canonical empty `PrevTree` (`len(Children)==0`). A populated target
+under that flag is quarantined rather than promoted as a nil-compiled bootstrap
+config. `FirstCommit=false` may legitimately target an empty operator-committed
+config and still goes through tolerant compilation.
 
-Add `confirmRecoveryDegraded bool` under `Store.mu` and
-include it in `ConfigPersistDegraded()` so the existing
-`/health` 503 and
-`xpf_daemon_config_persist_degraded` metric surface the quarantine.
-Expose a focused accessor for tests and diagnostics. Set the latch on malformed
-`confirm.json` or a non-first-commit target that cannot compile. Clear
-it only after a later read proves the record valid/absent or an explicit
-confirm/remediation operation durably replaces or removes that record. A
-path-qualified journal/log diagnostic contains no config values or secrets.
+Extract one compatibility preparation helper:
+
+```go
+func (s *Store) preparePersistedTreeForLenientCompile(
+    raw *config.ConfigTree,
+    caller persistedTreeCaller,
+) (prepared *config.ConfigTree, compiled *config.Config, err error)
+```
+
+It clones the raw tree, applies the retired-dataplane rewrite, sanitizes control
+characters, and invokes the same node-local tolerant compiler. `Store.Load`,
+`Store.SyncApply`, and confirm recovery use this helper with caller-specific
+diagnostics. The raw `confirm.json` tree remains byte-for-byte forensic input;
+the prepared clone is the tree that is both compiled and, after successful
+validation, installed/persisted as the rollback target. This prevents recovery
+from compiling one representation and later promoting another.
+
+For every non-`FirstCommit` record,
+`recoverPendingConfirmLocked` prepares and compiles `PrevTree` through that
+helper **before** assigning `s.active`, populating `confirmPrevTree`, or arming a
+timer. For a valid first-commit record it prepares a canonical empty clone and
+keeps the compiled target nil. A structural, first-commit-consistency, or
+semantic failure preserves the already-loaded active and compiled config,
+retains the exact confirm file, and arms no timer. Expired and future records
+obey the same preflight-before-mutation order.
+
+Add `confirmRecoveryDegraded bool` under `Store.mu` and include it in
+`ConfigPersistDegraded()` so the existing `/health` 503 and
+`xpf_daemon_config_persist_degraded` metric surface the quarantine. Expose a
+focused accessor for diagnostics. Set the latch on malformed `confirm.json`, an
+inconsistent first-commit record, or a non-first-commit target that cannot be
+prepared and compiled. While latched, a new `CommitConfirmed` is rejected so it
+cannot overwrite the forensic record and silently launder the fault.
+
+The named remediation is `Store.DiscardQuarantinedConfirm()`, exposed as
+`request system configuration discard-quarantined-confirm` through the local
+CLI and the existing remote `SystemAction` channel. Because it does not mutate
+the shared candidate, it does not borrow the configuration lock; it is instead
+classified as a privileged maintenance action and requires the same explicit
+interactive confirmation discipline as other destructive `request system`
+operations. The store method refuses unless the recovery latch is set and no
+confirm timer is armed, then calls the existing durable `DB.DeleteConfirm`. It
+changes neither active nor candidate config. Only a successful
+unlink-plus-directory-fsync clears the latch; failure leaves health degraded
+and returns the error. The successful path writes a nonsecret
+`confirm_quarantine_discarded` journal entry. A process restart after an
+operator repairs the file naturally re-runs validation; there is no in-process
+"later read" claim and no background retry that can reinterpret changing
+forensic bytes.
+
+A path-qualified journal/log diagnostic contains no config values or secrets.
 
 ```go
 func ValidatePersistedTreeShape(tree *ConfigTree) error
@@ -637,10 +775,15 @@ semantics are different: value zero is the Go/BPF/Rust unbound or standalone
 sentinel, so an explicit interface/RETH dataplane binding is valid only in
 1..15 and must reference a definition present in the same node-effective tree.
 
-Validate the raw expanded AST before typed lowering can collapse an explicit
-binding zero into the ordinary zero-value "not configured." Reject malformed,
-zero, above-15, and orphan bindings. Definition zero remains legal for
-control-group election and monitoring; it is never emitted as a dataplane owner.
+Validate explicit binding syntax on the canonical node-effective AST after
+interface-range expansion, before typed lowering can collapse an explicit zero
+into the ordinary zero-value "not configured." Reject malformed, zero, and
+above-15 bindings there. Then validate definition range, final binding range,
+and membership on the fully lowered typed `Config`; this honors the compiler's
+current repeated-`chassis` replacement semantics rather than incorrectly
+unioning definitions from roots that do not survive lowering. Definition zero
+remains legal for control-group election and monitoring; it is never emitted as
+a dataplane owner.
 
 ```go
 // pkg/config: lowest-layer product contract.
@@ -648,7 +791,8 @@ const MaxDataplaneRedundancyGroups = 16
 
 func ValidateDataplaneRGDefinitionID(id int) error // 0..15
 func ValidateDataplaneRGBindingID(id int) error    // 1..15
-func validateDataplaneRGDefinitionsAndBindings(root *ConfigTree) error
+func validateDataplaneRGBindingSyntax(root *ConfigTree) error
+func ValidateDataplaneRGTyped(cfg *Config) error
 ```
 
 `pkg/dataplane.MaxRedundancyGroups` becomes an alias of the config constant.
@@ -657,14 +801,15 @@ specs, and Rust `MAX_RG_EPOCHS`; widening remains a separately researched pinned
 map/protocol migration.
 
 This is an action-agnostic semantic safety error, not a class-II capability.
-It participates in `runEffectiveHardGates` locally and in
-`ValidatePeerEffectiveHardGatesStrict` on operator commits, so a
-node1-only RG16, explicit binding zero, or orphan binding cannot commit on
-node0 and strand the standby. Strict and tolerant compilers return the same
-error before inventory, map, helper, HA-election, or acknowledgment side
-effects. Do **not** set `ForwardingSupported=false`: that value
-actively disarms a running helper and cannot represent "reject this generation
-and retain previous-good."
+The syntax half participates in `runEffectiveHardGates`; the typed half runs
+after section dispatch and derivation on local and peer hard-gate compiles. A
+node1-only RG16, explicit binding zero, orphan binding, interface-range-inherited
+binding, or binding resolved against repeated chassis roots therefore receives
+the same verdict as the config that would actually be published. Strict and
+tolerant compilers return the same error before config-store promotion or peer
+acknowledgment. Do **not** set `ForwardingSupported=false`: that value actively
+disarms a running helper and cannot represent "reject this generation and
+retain previous-good."
 
 - `Store.Load` keeps the parsed source for diagnosis but returns the existing
   compile-failed classification; a fresh boot stays in lifeline/default-deny
@@ -674,12 +819,19 @@ and retain previous-good."
 - A later valid generation compiles and applies normally; there is no sticky
   quarantine bit.
 
-Runtime `UpdateRGActive`, inventory build, map sync, and helper
-publication remain belts: definitions reject IDs outside 0..15; owner bindings
-treat zero as absent and reject positive IDs above 15 or absent from inventory
-before any partial mutation. Diagnostics distinguish definition range,
-binding range/membership, heartbeat uint8, and RETH-derived VRID limits. No path
-selectively drops an RG or one of its interface bindings.
+Runtime `UpdateRGActive`, inventory build, map sync, and helper publication
+remain belts. Most importantly, `userspace.Manager.Compile` calls exported
+`config.ValidateDataplaneRGTyped(cfg)` immediately after its nil/input check and
+**before the first side effect**: before deleting XDP link pins, selecting or
+compiling the userspace shim, deriving/bumping a snapshot generation,
+synchronizing XDP/TC attachments, seeding inventory, mutating maps, or issuing a
+helper request. Lower dataplane compilers call the same preflight before their
+own mutation. `UpdateRGActive` rejects an invalid ID before map or in-memory
+state changes. Definitions reject IDs outside 0..15; owner bindings treat zero
+as absent and reject positive IDs above 15 or absent from inventory. Diagnostics
+distinguish definition range, binding range/membership, heartbeat uint8, and
+RETH-derived VRID limits. No path selectively drops an RG or one of its
+interface bindings.
 
 ### 5.11 Workstream J - merge repeated global address-book containers (K003-06)
 
@@ -837,6 +989,13 @@ The implementation plan preserves these signatures and wire contracts:
   highest-sequence/fit APIs in Workstream H; all repository callers migrate
   atomically because a context-free exact count is impossible.
 
+Workstream G intentionally adds one bounded recovery API:
+
+- `(*configstore.Store).DiscardQuarantinedConfirm() error` and the corresponding
+  existing-channel `SystemAction` / operational CLI command. It can only
+  durably remove a quarantined, unarmed `confirm.json`; it cannot change active
+  or candidate configuration.
+
 Intentional behavior changes are fail-loud validation, not API removal:
 
 - malformed empty security identities stop committing;
@@ -847,6 +1006,8 @@ Intentional behavior changes are fail-loud validation, not API removal:
 - mixed-format override input is rejected atomically;
 - invalid SNMPv3 credential combinations stop installing a downgraded user and
   add nonsecret rejection metadata to existing config projections;
+- the undocumented, schema-unlinked `system snmp` path is rejected with the
+  canonical top-level `snmp` syntax rather than silently compiling empty;
 - lifecycle APIs stop calling a non-applicable action `deny` and return the
   existing string field as `"n/a"`.
 
@@ -858,20 +1019,26 @@ Intentional behavior changes are fail-loud validation, not API removal:
    permissive state as if apply succeeded.
 2. **Fail-closed without false deny:** unreadable ICMP fragments remain denied;
    readable ICMP errors in the established global class remain admitted.
-3. **DDNS cleanup authority:** only the current or retained previous updater
-   for the exact same family and nonempty endpoint fingerprint may delete an
-   owned RR. There is no cross-family, representative-updater, or
-   second-credential fallback. On uncertainty or any delete error, retain
-   ownership and alarm.
+3. **DDNS cleanup authority:** production deletes require the current or
+   retained previous updater for the exact same family and nonempty endpoint
+   fingerprint. The old anchor remains live while any retained row depends on
+   it. Fixed-constructor mode may act only on valid-family rows with empty
+   fingerprints under its explicit caller-trust contract. There is no
+   cross-family, representative-updater, or second-credential fallback. On
+   uncertainty or any delete error, retain ownership and alarm.
 4. **Atomic config load:** parsing/replay happens on a detached tree. On any
    error, candidate bytes, generation, dirty bit, lock lease, and active config
    remain unchanged.
 5. **Persisted AST integrity:** an invalid JSON node tree is rejected at every
    deserialization boundary (`active`, `candidate`, JSON rollback, and confirm
    rollback target) and cannot reach an unsafe compiler walk. A structurally
-   valid confirm rollback target also compiles before mutation or timer arming;
-   quarantine is visible through persistent degraded health. Local interface
-   and sampling indexing belts remain length-safe.
+   valid confirm rollback target receives the same compatibility preparation as
+   active load and compiles before mutation or timer arming; the prepared tree
+   is the tree later promoted. `FirstCommit` implies an empty target.
+   Quarantine is visible through persistent degraded health, cannot be
+   overwritten by a new confirmed commit, and clears only after the explicit
+   durable discard succeeds. Local interface and sampling indexing belts remain
+   length-safe.
 6. **Route-map guard equals renderer:** term count includes every family
    expansion, OR-product dimension, and reachable composed-chain member, while
    the shared highest-sequence/fit helper reserves exactly one terminal row.
@@ -904,8 +1071,10 @@ Intentional behavior changes are fail-loud validation, not API removal:
 14. **Determinism:** strict validation and duplicate diagnostics remain stable
    across map iteration order, repeated blocks, and HA replay.
 15. **Both-node commit safety:** action-agnostic security identity, SNMP, RG,
-    and policy-shape hard gates run on both node-effective expanded trees before
-    an operator commit is promoted.
+    and policy-shape hard gates run on both canonically prepared node-effective
+    trees before an operator commit is promoted. RG membership is checked on
+    each final typed config, including interface-range and repeated-root
+    semantics.
 16. **Tolerant-path safety classes:** legacy semantic violations normally warn,
     but empty security identities, unsupported policy containers, and
     out-of-range RG definitions/bindings or bindings to undefined groups return
@@ -917,6 +1086,10 @@ Intentional behavior changes are fail-loud validation, not API removal:
     four-key zone-pair shape compiles; every other `from-zone`
     container fails before typed policy construction on strict and tolerant
     paths.
+18. **SNMP intent is exact:** only canonical top-level `snmp` is accepted; every
+    invalid compiler or hand-built runtime identity is omitted from the USM
+    table, rejection metadata is a deterministic identity union, and a
+    rejected-only config leaves no stale listener running.
 
 ## 8. Risk assessment
 
@@ -928,7 +1101,7 @@ Intentional behavior changes are fail-loud validation, not API removal:
 | Performance regression | LOW | One copied byte on a rare flowless path; all other work is cold path | No new packet reads/allocations; userspace throughput baseline and perf smoke for K003-01 only |
 | State/ownership corruption | HIGH | DDNS wrong-backend delete and routing ownership loss are explicitly stateful | Same-family fingerprint proof, no credential fallback, retain-on-uncertainty, injected failure/retry tests |
 | HA compatibility | HIGH | RG and hard security gates must reject both node-effective views before Store promotion, helper/map mutation, election effects, or peer acknowledgment; `ForwardingSupported=false` would disarm live forwarding | Fresh-boot and previous-good sync state-machine tests, definition/binding/membership validation, peer-only group fixtures, userspace HA reject/recovery smoke |
-| Public API regression | MEDIUM | Route-map Go helpers gain required context and lifecycle strings change from false `deny` to `n/a` | Migrate every repository caller atomically; release notes; REST/gRPC/CLI/filter golden tests |
+| Public API regression | MEDIUM | Route-map Go helpers gain required context, lifecycle strings change from false `deny` to `n/a`, and confirm quarantine gains one bounded SystemAction | Migrate every repository caller atomically; release notes; REST/gRPC/CLI/filter/action golden tests |
 | Architectural mismatch | MEDIUM | Mega-batching repeats the #961/#946 Phase-2 dead-end pattern; RG widening would create a pinned-map migration project | Path A split; global RG clamp; no broad parser or ABI redesign |
 
 ## 9. Test and validation plan
@@ -946,25 +1119,36 @@ passes on the fix and fails when the fix hunk is reverted.
   compile-failed boot classification; `SyncApply` rejection with byte-identical
   previous active/compiled snapshot; peer-only group expansion fails the
   originating strict commit; no userspace or host-inbound publication.
-- **C / SNMP:** top-level and `system snmp` AST cases for nonempty
-  valid noAuthNoPriv, empty username, empty password, password-only,
+- **C / SNMP:** canonical top-level cases for nonempty valid noAuthNoPriv,
+  empty username, empty password, password-only,
   protocol-without-password, privacy-without-auth, privacy-without-password,
   conflicting protocols, repeated expanded-tree occurrences, and flat scalar
-  replacement semantics; strict and lenient compiler tests prove intent is
-  observed before lowering and a rejected name is omitted everywhere; peer-only
-  invalid users fail the originating strict commit; JSON/YAML projections and
-  reconcile hash carry sorted nonsecret metadata; valid-to-invalid hot
-  reconfigure and hand-built typed invalid input prove the old user disappears
-  atomically; packet tests prove noAuthNoPriv and authNoPriv requests are
-  rejected when configured intent is stronger.
+  replacement semantics. Production `SetPath`/flat-command tests, not a
+  hand-shaped AST alone, prove `set system snmp ...` fails on strict and
+  tolerant paths with canonical syntax. Strict and lenient compiler tests prove
+  intent is observed before lowering and a rejected identity is omitted
+  everywhere; peer-only invalid users fail the originating strict commit;
+  JSON/YAML projections and reconcile hash carry sorted nonsecret metadata.
+  Runtime tables cover nil map values, empty keys, embedded-name/key mismatch,
+  unknown protocols, compiler+runtime duplicate rejection, stable union/counts,
+  and valid-to-invalid atomic removal. A rejected-only day-2 config stops the
+  prior listener; a rejected-only boot never binds UDP/161. Packet tests prove
+  noAuthNoPriv and authNoPriv requests are rejected when configured intent is
+  stronger.
 - **D / flowless ICMP:** IPv4 type 3/11/12 and IPv6 type 1/2/3/4 global admits;
   ND 133..137 where relevant; non-first fragment remains denied; unrelated ICMP
   remains denied; native-GRE and interface-NAT flowless entry coverage.
 - **E / DDNS:** distinct v4/v6 fake servers; explicit backend-less v6 disable;
   both blocks removed; transient per-family factory failure; matching current
   fingerprint; matching previous-family fingerprint; mismatching and empty
-  fingerprints; old-endpoint A -> B transition; mixed-family owned rows in one
-  pass; and restart with no executable historical updater. Packet/operation
+  production fingerprints; disabled-but-configured endpoint identity; fixed
+  updater empty-fingerprint compatibility and nonempty-fingerprint refusal;
+  invalid family 0/5 plus family/address/type mismatch at load and selector;
+  mixed-family owned rows in one pass; and restart with no executable historical
+  updater. A multi-cycle A -> B trace injects a partial delete error, proves the
+  A anchor survives, retries A on the next pass, and advances to B only after
+  the A row is gone. An A -> B -> C rotation while A remains unresolved retains
+  and alarms rather than guessing. Packet/operation
   logs prove no v4 updater receives a v6 delete or vice versa. Any surfaced
   updater error, including simulated partial forward/PTR deletion, retains
   ownership and performs no second-credential retry; established PTR
@@ -985,10 +1169,18 @@ passes on the fix and fails when the fix hunk is reverted.
   `Keys[0]` remains structurally accepted for semantic validation; malformed
   confirm keeps active unchanged, sets degraded health/metric, and neither arms
   nor deletes the record; structurally valid but semantically uncompilable
-  future and expired `PrevTree` targets behave identically;
-  `FirstCommit`, legacy empty `GuardedHash`, and stale
-  guarded records retain existing behavior; explicit durable remediation clears
-  the latch; handcrafted empty-Keys interface and sampling family nodes cannot
+  future and expired `PrevTree` targets behave identically. A populated
+  `FirstCommit=true` target quarantines; a `FirstCommit=false` empty target
+  compiles normally. Retired-dataplane and control-character targets prove
+  active load and confirm recovery use the same prepared clone, and expiry
+  promotes exactly that clone. Legacy empty `GuardedHash` behavior remains;
+  a stale guarded record is resolved before target semantics are interpreted.
+  `CommitConfirmed` refuses while quarantined. The local and remote
+  `discard-quarantined-confirm` command requires privileged interactive
+  confirmation, refuses an armed or
+  nonquarantined record, leaves active/candidate byte-identical, and clears the
+  latch only after successful unlink plus directory fsync; injected unlink and
+  fsync failures retain the record/latch. Handcrafted empty-Keys interface and sampling family nodes cannot
   panic their compilers; valid empty/populated JSON still loads; peer text sync
   is a negative reachability control; add malformed trees as fuzz seeds.
 - **H / route-map:** term count equals actual rendered term rows for v4-only,
@@ -1000,10 +1192,15 @@ passes on the fix and fails when the fix hunk is reverted.
 - **I / RG:** definition IDs -1, 0, 15, 16, 155, 156, 255, and 256; explicit
   binding IDs 0, 1, 15, 16, malformed, and undefined; normal RETH,
   private-election, no-RETH, and unused definitions; node0-valid/node1-invalid
-  apply-group cases for out-of-range and orphan bindings. Tolerant fresh boot
+  apply-group cases for out-of-range and orphan bindings; interface-range
+  inherited/overridden bindings; and repeated `chassis` roots where only the
+  final typed definition set is authoritative. Tolerant fresh boot
   returns compile-failed and remains default-deny; previous-good -> invalid sync
   preserves active, compiled, maps, arm state, and acknowledgment -> valid
-  recovery applies; runtime belts reject before mutation; constant drift
+  recovery applies. A userspace compile seam snapshots link pins, shim selector
+  calls, generation, attachment calls, inventory, maps, and helper requests and
+  proves every value unchanged on typed RG rejection; lower compilers and
+  `UpdateRGActive` receive equivalent pre-mutation tests. Constant drift
   canaries cover config/dataplane/BPF/shim/Rust capacity and preserve RG0 as a
   definition-only control group.
 - **J / address book:** repeated outer blocks, repeated global blocks, duplicate
@@ -1080,7 +1277,11 @@ deviation and returns to review.
   uses the combined `from-zone X to-zone Y` container.
 - Widening RG capacity or migrating pinned BPF maps under the K003-10 bug fix.
 - Retrying DDNS withdrawal across credential generations or redesigning the
-  updater API to report separate forward/PTR component outcomes.
+  updater API to report separate forward/PTR component outcomes. The retained
+  single-old-anchor contract deliberately alarms rather than guesses across a
+  second unresolved endpoint rotation.
+- Adding `system snmp` as a schema alias; canonical top-level `snmp` remains the
+  only supported hierarchy.
 - Changing Rust event wire layout or retroactively assigning permit/deny to
   lifecycle events.
 - Refactoring all logging formatters beyond central action applicability.
@@ -1089,7 +1290,7 @@ deviation and returns to review.
 
 ## 11. Resolved adversarial decisions
 
-Rounds one through three closed the design choices rather than delegating them
+Rounds one through four closed the design choices rather than delegating them
 to implementors:
 
 1. Path A remains the recommendation. The config-heavy workstreams are separate
@@ -1108,16 +1309,20 @@ to implementors:
    remains the unbound/control-group sentinel. A 256-entry ABI/pinned-map
    migration is out of scope and requires separate research if product demand
    appears.
-5. DDNS uses only the exact same-family current or retained previous updater
-   whose nonempty endpoint fingerprint matches the owned row. There is no
+5. Production DDNS uses only the exact same-family current or retained previous
+   updater whose nonempty endpoint fingerprint matches the owned row. Anchor
+   rotation happens after reconciliation and is deferred while a retained row
+   depends on the old endpoint. Fixed-constructor mode is an explicit
+   compatibility authority only for its own empty-fingerprint rows. There is no
    representative-updater or credential-generation fallback. Partial
    forward/PTR credential fallback requires a different operation-result API
    and is deliberately out of scope; uncertainty retains ownership and alarms.
-6. SNMPv3 intent is validated across both accepted stanza locations before
-   compiler lowering can erase malformed presence. The result flows explicitly
-   through section lowering, nonsecret JSON/YAML metadata, reconcile hashing,
-   and an independently validated atomic runtime swap. A rejected user never
-   has a disabled protocol object that could accidentally answer requests.
+6. SNMPv3 intent is validated only at canonical top-level `snmp` before compiler
+   lowering can erase malformed presence; `system snmp` fails loudly. The
+   result flows through section lowering, nonsecret JSON/YAML metadata,
+   reconcile hashing, deterministic compiler/runtime rejection union, and an
+   independently validated atomic runtime swap. A rejected-only config stops
+   the listener instead of retaining an empty agent.
 7. Lifecycle action applicability is a positive event-type allowlist applied
    before daemon slog or record construction. Structured APIs preserve their
    scalar field shape with `"n/a"`; lifecycle human text omits the key
@@ -1125,12 +1330,13 @@ to implementors:
    events is preserved.
 8. VIP warning state has one dedicated mutex and helper-only access. It adds no
    lock-order edge to `directVIPMu` or `applySem`.
-9. Persisted JSON gets one minimum structural validator in
-   `readTreeMeta` plus the same check for
-   `confirmRecord.PrevTree`. Non-first-commit rollback targets also
-   compile before state mutation or timer arming; failure latches existing
-   degraded health while preserving active state and forensic bytes. K003-04
-   owns the interface and sampling indexing belts.
+9. Persisted JSON gets one minimum structural validator in `readTreeMeta` plus
+   the same check for `confirmRecord.PrevTree`. Confirm recovery shares active
+   load's retired-dataplane/control-character compatibility preparation, and
+   promotes the exact prepared clone it compiled. `FirstCommit` requires an
+   empty target. Failure latches degraded health while preserving active state
+   and forensic bytes; only the named durable discard operation clears it.
+   K003-04 owns the interface and sampling indexing belts.
 10. Route-map term counters require `PolicyOptionsConfig`, while one shared
     highest-sequence/fit helper owns the terminal-row reservation. No
     conservative wrapper or raw-count comparison remains in a safety decision.
@@ -1139,16 +1345,26 @@ to implementors:
     deny values corrupt SIEM/forensic classification. Their independent PRs may
     still receive `PLAN-KILL` if a new reproduction disproves those impacts.
 12. Out-of-range/orphan RG definitions and bindings are compile failures on
-    strict and tolerant paths. They never set
-    `ForwardingSupported=false`; invalid live sync retains the exact
-    previous generation and fresh boot remains lifeline/default-deny.
-13. The B/C/I/M action-agnostic hard gates run against both node-effective
-    expanded trees before strict promotion. This is a focused extension of the
+    strict and tolerant paths. Raw syntax is checked after canonical group and
+    interface-range expansion; range/membership is checked on the final typed
+    config. The exported runtime belt executes before pin, shim, generation,
+    attachment, inventory, map, or helper side effects. The failure never sets
+    `ForwardingSupported=false`; invalid live sync retains the exact previous
+    generation and fresh boot remains lifeline/default-deny.
+13. The B/C/I/M action-agnostic hard gates run against both canonically prepared
+    node-effective trees before strict promotion. Peer validation uses the same
+    section lowering and typed semantics as local compilation while unrelated
+    compatibility warnings remain lenient. This is a focused extension of the
     existing peer-effective SNAT precedent, not a global conversion of every
     lenient warning into a peer commit failure.
 14. Only the canonical four-key zone-pair AST is accepted. Repository history
     has no authentic legacy nested persistence fixture, so the permissive
     compiler fallback is removed instead of being enshrined by a new fixture.
+15. A quarantined confirm record is never silently overwritten. The explicit
+    `discard-quarantined-confirm` operation is a confirmed privileged
+    maintenance action, has no
+    active/candidate mutation, and clears degraded health only after durable
+    removal succeeds.
 
 Manual approval of this plan accepts those product choices. A material change to
 any one returns that child workstream to plan review rather than being improvised
