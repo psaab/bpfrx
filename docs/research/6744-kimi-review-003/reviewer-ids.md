@@ -172,3 +172,30 @@ legacy-zero, RG transition/full-replacement, authoritative-bulk,
 repair-correlation, reconcile-error, SNMP-secret, DDNS durability, and
 pre-#2903 compatibility gaps. AGY's `PLAN-READY` missed those traces. Revision
 9 incorporates all valid findings before another immutable review round.
+
+### Round 9 - plan commit `ff17e6351f0e0da4fc2ac0b45d0ecdd4c4b99be5`
+
+- Codex direct hostile review: the first process session `97129` was stopped
+  after it failed to produce a durable result; reviewer session
+  `019fc86b-609d-74c1-9729-c00e73f13042` was resumed in process session
+  `19413`. Valid output is `/tmp/6744-codex-r9-retry.out`; verdict
+  `PLAN-NEEDS-MAJOR`.
+- AGY direct plan review: process session `5046`; valid output
+  `/tmp/6744-agy-r9.out`; verdict `PLAN-READY`.
+- Claude Code CLI: process session `55161`; failed before analysis with the
+  monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent SMR-method fallback agent:
+  `019fc86b-95fb-7a83-94db-6df880ed0beb`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic model
+  review.
+
+Round 9 did not converge. Codex and the independent SMR-method reviewer found
+material one-fabric config-completion, readiness-timeout, old-receiver ACK,
+RG0 safety-net, startup-authority, clustered helper-debt, capability setup,
+repair-connection, and reconciliation-lifetime gaps. The orchestrator's
+source trace additionally found used-but-disconnected send ordering, receive
+lock ambiguity, cold-connect baseline ordering, config-sync protection,
+capability/authentication staging, nontransactional partial-install wording,
+all-capable-bulk authorization, and implementation-stack activation gaps.
+AGY's `PLAN-READY` missed these executable traces. Revision 10 incorporates
+all valid findings before another immutable review round.
