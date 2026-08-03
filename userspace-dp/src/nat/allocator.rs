@@ -60,6 +60,18 @@
 //   permanently shrink the reusable pool (062-10). The retain buffer
 //   allocates lazily only when a collision actually occurs.
 //
+// Aggregate construction budget (#6812): `PortAllocator::new` is the memory
+// heavyweight — one `AddressOccupancy` word array per pool address, sized to
+// the port range (one bit per port slot). Construction is therefore gated
+// TWICE upstream in `source.rs`: the Go #5877 strict commit gate rejects an
+// over-budget config outright, and `resolve_pool_allocators` enforces the
+// same budgets (pool count / total addresses / total port slots, charged
+// per distinct allocator key, reuse-before-build, nothing built for a
+// failed pool) at this apply boundary — the final backstop for a tolerated
+// (lenient-load / peer-synced) or hand-crafted snapshot. Three full-range
+// /16 pools would otherwise materialise 12,683,575,296 bitmap bits
+// (~1.48 GiB) during apply.
+//
 // Cross-submodule visibility (per #1542 plan v3):
 // - PortAllocator and PortAllocatorSnapshot are pub(crate) at definition
 //   (re-exported by nat/mod.rs).
@@ -808,6 +820,24 @@ impl PortAllocator {
     #[cfg(test)]
     pub(super) fn debug_live(&self) -> MutexGuard<'_, PortAllocatorLiveState> {
         self.shared.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Test-only: total occupancy-bitmap WORDS across every pool address.
+    /// The #6812 aggregate-budget tests assert a refused / failed pool
+    /// materialised ZERO words (no eager bitmap) while an admitted pool
+    /// carries `addresses x div_ceil(port_range, 64)` — the direct white-box
+    /// proof the bitmap was (or was not) allocated.
+    #[cfg(test)]
+    pub(super) fn debug_occupancy_words(&self) -> usize {
+        self.shared.occupancy.iter().map(|o| o.words.len()).sum()
+    }
+
+    /// Test-only: identity of the shared allocator state, for proving a
+    /// re-apply REUSED the previous allocator (same Arc) instead of building
+    /// a fresh bitmap (#6812 reuse-before-build).
+    #[cfg(test)]
+    pub(super) fn debug_shared_identity(&self) -> usize {
+        Arc::as_ptr(&self.shared) as usize
     }
 
     /// Test-only: mark a translated tuple as owned (set its occupancy bit)
@@ -2330,7 +2360,7 @@ pub(crate) struct PortAllocatorSnapshot {
     pub(crate) exhaustion_total: u64,
 }
 
-fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
+pub(super) fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> usize {
     if num_addresses == 0 || port_low == 0 || port_high == 0 || port_low > port_high {
         return 0;
     }

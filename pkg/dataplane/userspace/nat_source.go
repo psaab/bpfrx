@@ -24,6 +24,21 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
 	}
+	// #6812: poison the pools that do not fit the #5877 aggregate cardinality
+	// budget (opus-review-001 R73). A STRICT commit never reaches this builder
+	// with an over-budget config (the gate hard-rejects it), so this only ever
+	// fires for a TOLERATED config — lenient load / peer-sync, where the gate
+	// downgrades to a warning (#1960 no-brick). Before this poison the builder
+	// shipped the full pool set and the Rust apply boundary eagerly built
+	// every pool's per-address occupancy bitmap (three full-range /16 pools =
+	// 12,683,575,296 bitmap bits, ~1.48 GiB). The marked pools install nothing
+	// (fail-closed, matching the missing/empty/invalid markers below) and the
+	// Rust boundary independently refuses the same set — the first-fit
+	// admission rule is shared (SourceNATAggregateOverBudgetPools /
+	// resolve_pool_allocators), so Go and the dataplane agree on which pools
+	// live. The over-budget compile warning still tells the operator to shrink
+	// the config; this marker makes the degraded state per-pool visible.
+	overBudgetPools := config.SourceNATAggregateOverBudgetPools(cfg)
 	out := make([]SourceNATRuleSnapshot, 0)
 	for _, rs := range cfg.Security.NAT.Source {
 		if rs == nil {
@@ -122,6 +137,17 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 							"port_low", pool.PortLow, "port_high", pool.PortHigh)
 						poolUnusable = true
 						poolUnusableReason = "invalid_port_range"
+					}
+					// #6812: a pool that does not fit the #5877 aggregate
+					// cardinality budget on the TOLERANT path is marked
+					// unusable so the dataplane never builds its occupancy
+					// bitmap. Checked AFTER the more specific per-pool
+					// markers so those keep their precise reason.
+					if !poolUnusable && overBudgetPools[rule.Then.PoolName] {
+						slog.Warn("userspace snapshot: marking source NAT rule with over-budget aggregate pool unusable",
+							"rule", rule.Name, "pool", rule.Then.PoolName)
+						poolUnusable = true
+						poolUnusableReason = "aggregate_over_budget"
 					}
 					if pool.PersistentNAT != nil {
 						persistentNAT = true

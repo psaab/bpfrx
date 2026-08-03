@@ -53,6 +53,9 @@ mod tests_scope;
 #[cfg(test)]
 #[path = "tests_l4_match.rs"]
 mod tests_l4_match;
+#[cfg(test)]
+#[path = "tests_aggregate_budget.rs"]
+mod tests_aggregate_budget;
 
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches

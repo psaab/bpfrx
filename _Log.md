@@ -1,3 +1,49 @@
+## 2026-08-03 — #6812: cap the lenient SNAT aggregate eager bitmap at the apply boundary (opus-review-001 R73)
+
+- **Timestamp**: 2026-08-03 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: The #5877 aggregate cardinality gate hard-rejects an over-budget
+  source-NAT config at strict commit and only warns on the tolerant load /
+  peer-sync path (#1960 no-brick) — but a tolerated over-budget config still
+  reached the Rust apply boundary, which built every pool's per-address
+  occupancy bitmap EAGERLY: `PortAllocator::new` ran for every pool-mode rule
+  with `total_pool > 0` BEFORE the reuse maps were consulted, even when
+  `pool_failure` was already set, with no aggregate cap at the final
+  allocation boundary. Three full-range /16 pools materialise 12,683,575,296
+  bitmap bits (~1.48 GiB) — stall/OOM of the dataplane on upgrade boot or HA
+  convergence while processing the very config the tolerant path exists to
+  recover. Three coordinated changes: (1) Rust `parse_source_nat_rules_with_previous`
+  is split into parse + `resolve_pool_allocators` — reuse-before-build, nothing
+  built for a failed pool, and the Go-mirrored budgets (1024 pools /
+  1,048,576 addresses / 2^33 port slots) charged per distinct allocator key
+  (reused keys consume budget but are always accepted, so a no-op re-apply
+  preserves last-good state and a two-step apply cannot creep past the cap;
+  a non-fitting new key fails its rules closed with the new `OverBudget`
+  variant, `source_nat_pool_over_budget`); (2) the Go snapshot builder poisons
+  exactly the non-fitting pools (`SourceNATAggregateOverBudgetPools`, extracted
+  shared walk `sourceNATAggregateReferencedCharges` so validator and poison
+  cannot drift) with `aggregate_over_budget`; (3) the wire reason maps to
+  `OverBudget` (old helpers' catch-all maps it to `InvalidPool` — still
+  fail-closed, wire-skew safe). Folded in during implementation: with failed
+  pools building no allocator, the pool status view would have reported the
+  default 1024-65535 range for them — the configured range now rides on the
+  rule (`pool_port_low`/`pool_port_high`), read by both the status view and
+  the allocator key, so a failed pool's status keeps telling the truth.
+  Fail-on-revert verified both directions: gate-off simulation turns 5/7 new
+  Rust tests RED; poison-off simulation turns the userspace snapshot test RED.
+  Suites: full `pkg/config`, `pkg/dataplane/userspace`, nat (273) + nat64
+  (201) green; whole-repo `go build ./...` green; full `cargo test --release
+  --test-threads=1` green.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/allocator.rs`, `userspace-dp/src/nat/mod.rs`,
+  `userspace-dp/src/nat/status.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`,
+  `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

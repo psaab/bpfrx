@@ -4798,13 +4798,13 @@ reserved for whole-dataplane selection where a rewrite shim
     `MaxSourceNATPoolPrefixHosts = 65536`, a pool's port range to 1..65535), but
     nothing bounded the AGGREGATE across a whole config: pool COUNT, the SUM of
     every pool's address cardinality, or total port capacity. Snapshot/apply
-    builds a `PortAllocator` for each pool-mode source-NAT rule BEFORE reuse
-    dedup is known (`userspace-dp/src/nat/{source,allocator}.rs`) — every pool
-    address gets a per-address occupancy bitmap sized to the port range (one bit
-    per port) plus a per-address counter — so a large-but-syntactically-valid
-    config forces substantial memory + CPU during a security-critical
-    commit-apply (stalling commits, watchdogs, HA convergence, or the Rust
-    dataplane), and repeated applies magnify it.
+    builds a `PortAllocator` for each pool-mode source-NAT rule
+    (`userspace-dp/src/nat/{source,allocator}.rs`) — every pool address gets a
+    per-address occupancy bitmap sized to the port range (one bit per port)
+    plus a per-address counter — so a large-but-syntactically-valid config
+    forces substantial memory + CPU during a security-critical commit-apply
+    (stalling commits, watchdogs, HA convergence, or the Rust dataplane), and
+    repeated applies magnify it.
     `validateSourceNATAggregateCardinalityStrict` (`compiler_validate_strict_nat.go`)
     rejects an over-budget config at strict commit, fail-closed, before apply
     constructs any allocator. Three explicit budgets (`compiler_validate_strict_nat.go`):
@@ -4828,15 +4828,45 @@ reserved for whole-dataplane selection where a rewrite shim
     Runs AFTER the per-pool value/grammar gates so a single structurally broken
     pool still wins the first-error slot. It reuses the `lenientDestNATAddresses`
     downgrade (warn on load / peer-sync, #1960 no-brick: a config persisted
-    before this gate existed still boots — apply builds the state it always did
-    and the operator is warned to shrink it). Registered in the SNAT strict set,
-    so the #5876 peer-effective SNAT gate bounds the standby's identical
-    allocator build too. Fail-on-revert:
+    before this gate existed still boots, and the operator is warned to shrink
+    it). Registered in the SNAT strict set, so the #5876 peer-effective SNAT
+    gate bounds the standby's identical allocator build too.
+    **#6812 (opus-review-001 R73) — the tolerant path no longer builds the
+    over-budget state.** Before #6812, a tolerated (warning-only) over-budget
+    config still reached the Rust apply boundary, which built every pool's
+    occupancy bitmap EAGERLY — before the reuse maps were consulted, even for
+    an already-failed pool, and with no aggregate cap at the final allocation
+    boundary (three full-range /16 pools = 12,683,575,296 bitmap bits ≈
+    1.48 GiB, enough to stall or OOM the dataplane on upgrade boot / HA
+    convergence). Three coordinated changes close that: (1) the userspace
+    snapshot builder poisons exactly the pools that do not fit the budget
+    (`SourceNATAggregateOverBudgetPools` — the same referenced-pool walk and
+    saturating charge arithmetic as the strict validator, first-fit so a
+    refused pool does not starve later smaller pools), marking their rules
+    `PoolUnusable` with reason `aggregate_over_budget`; (2) the Rust apply
+    boundary (`resolve_pool_allocators` in `userspace-dp/src/nat/source.rs`)
+    independently enforces the same budgets per distinct allocator key —
+    reuse-before-build (a same-config re-apply no longer builds and discards
+    a full bitmap per pool), nothing built for a failed pool, reused keys
+    consume budget but are always accepted (a no-op re-apply never kills
+    live state, and a two-step apply cannot creep past the cap one
+    generation at a time), and a new key that does not fit fails its rules
+    closed with the `source_nat_pool_over_budget` dataplane diagnostic
+    instead of materialising the bitmap; (3) the `aggregate_over_budget`
+    wire reason maps to the new `OverBudget` failure variant (an older
+    helper's catch-all maps it to `InvalidPool` — still fail-closed, so the
+    marker is wire-skew safe). Fail-on-revert:
     `TestSourceNATAggregatePoolCountRejected` /
     `TestSourceNATAggregateAddressesRejected` /
     `TestSourceNATAggregatePortCapacityRejected` /
     `TestSourceNATAggregateLenientWarns`
-    (`pkg/config/compiler_nat_source_pool_aggregate_5877_test.go`).
+    (`pkg/config/compiler_nat_source_pool_aggregate_5877_test.go`),
+    `TestAggregateOverBudgetPools{PortCapacity,Addresses,Count,FirstFit,Unreferenced}_6812` /
+    `TestAggregateValidatorMatchesPoisonWalk_6812`
+    (`pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`),
+    `TestSourceNATSnapshotAggregate{OverBudgetPoisoned,AtBudgetUnaffected}_6812`
+    (`pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`), and
+    `nat::tests_aggregate_budget` (`userspace-dp/src/nat/tests_aggregate_budget.rs`).
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix
