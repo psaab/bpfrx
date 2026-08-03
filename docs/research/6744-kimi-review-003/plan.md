@@ -2,13 +2,13 @@
 
 ## 1. Status
 
-**DRAFT v8 - round-seven major findings addressed; pending round-eight review**
+**DRAFT v9 - round-eight major findings addressed; pending round-nine review**
 
 - Issue: [#6744](https://github.com/psaab/xpf/issues/6744)
 - Source report: `/tmp/kimi-review-003.md`
 - Base: `origin/master` at `ad959117748181dabe46b8ddc2827de670380cea`
 - Branch: `research/6744-kimi-review-003`
-- Revision: 8
+- Revision: 9
 - Round-one plan SHA: `78891c3242a80b719bebdddc702087c07543e05b`
 - Round-two plan SHA: `01b67530e53016cf127d43c4a28c0582513718f8`
 - Round-one verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
@@ -71,6 +71,17 @@
   RG slots, linearizes session install against config apply and bulk repair,
   validates the nested confirm rollback tree, and restores the exact #6548
   ownership boundary.
+- Round-eight plan SHA:
+  `bebffd32c7a0c2956a7eabbf584a92c6604ec5b2`.
+- Round-eight verdicts: Codex `PLAN-NEEDS-MAJOR`; AGY
+  `PLAN-READY`; independent SMR-method fallback
+  `PLAN-NEEDS-MAJOR`. The Claude Code CLI again failed before analysis at the
+  account spend limit, so no Anthropic-model verdict is claimed. Round eight
+  did not converge; revision 9 adds transport/role incarnation, fail-closed legacy-zero
+  admission, capability-gated causally fenced bulks, echoed repair request IDs,
+  reconcile-error failure, explicit readiness, full-replacement RG staging,
+  classified DDNS claim durability and pre-#2903 compatibility, and redacted
+  SNMP observation identities.
 - Mode: `/research`. Stop at `PLAN-READY` or `PLAN-KILL`. Do not write
   production code and do not open a pull request.
 
@@ -392,13 +403,18 @@ effect or a synthetic node that section dispatch later forgets:
 type preparedCompileView struct {
     Root               *ConfigTree
     NormalizedSNMPRoot *Node
-    SNMPSources         map[string][]SNMPSourceObservation
+    SNMPSources         map[SNMPObservationID][]SNMPSourceObservation
+}
+
+type SNMPObservationID struct {
+    Kind    SNMPObjectKind
+    Ordinal uint32 // stable first-appearance ordinal, never a secret-derived hash
 }
 
 type SNMPSourceObservation struct {
-    Identity string // community/trap/user semantic key
+    Identity string // username/trap name, or "community[N]"; never the community
     Field    string // keyword only; never a secret value
-    Path     string
+    Path     string // every secret token replaced with "<redacted>"
     Present  bool
     Empty    bool
     Conflict bool // distinct values/selectors observed; values are not retained
@@ -417,9 +433,17 @@ concatenation is forbidden because `compileSNMP` constructs a fresh
 `SNMPConfig` and a later trap-group occurrence overwrites the prior map row.
 The fold retains every source observation needed to reject malformed or
 conflicting duplicates; a one-path/last-writer carrier is forbidden. Secret
-values are compared in memory only long enough to set `Empty` or `Conflict`
-and are never copied into observations, warnings, config projections, hashes,
-or logs. The fold has these exact semantics:
+values are compared in memory only inside the preparation call. A private,
+function-local table may key the fold by the actual community so repeated
+occurrences correlate, but the returned carrier uses a first-appearance
+ordinal such as `community[2]`; its path replaces the community token with
+`<redacted>`. Every returned path uses the same secret-leaf classification as
+`ConfigTree.RedactedClone`, including authentication/privacy passwords; a
+source canary keeps those classifiers in lockstep rather than maintaining an
+SNMP-only keyword list. It never uses a secret-derived hash. Secret values and raw paths
+are never copied into observations, warnings, exported config projections, or
+logs. The normalized AST and typed `SNMPConfig` remain the required
+secret-bearing authorities. The fold has these exact semantics:
 
 - scalar `location`, `contact`, and `description` use the last explicit writer;
 - `community <name>`, `trap-group <name>`, and
@@ -522,6 +546,14 @@ The dataflow is explicit, rather than hidden in a warning slice:
    `RejectedV3Users`. The SNMP reconcile hash includes the sorted
    rejection metadata so a metadata-only transition cannot disappear behind
    the unchanged-hash shortcut.
+
+The existing private `snmpConfigHash` remains deliberately credential-aware:
+it consumes raw community strings and v3 passwords in process so credential
+rotation restarts or updates the listener. That nonexported value is never
+persisted, logged, returned by an API, or reused as an observation identity.
+This internal change detector is the sole exception to the no-secret-derived
+diagnostic rule; replacing it with the redacted projection would make password
+and community rotation invisible.
 
 Strict compile returns a path-qualified error and never lowers a rejected
 username. Lenient persisted loading keeps the source tree for diagnosis and
@@ -712,11 +744,21 @@ The interface/Surface-A matrix is: `Identity == surfaceAIdentity`;
 `Address`, `SubnetID`, `OwnerID`, `ClientID`, and `PTRName` empty;
 `PTRPending=false`; nonempty parseable `AddrText` with matching family and
 `A`/`AAAA`; a canonical lowercase/no-trailing-dot row FQDN; nonnil nonzero
-scope whose family matches and whose raw operator FQDN satisfies
-`surfaceAName(scope.FQDN) == row.FQDN`; and valid pending-state shape. Raw scope
-FQDN equality is deliberately **not** required because existing valid scopes
-preserve accepted uppercase and single-trailing-dot input while `buildHostRecord`
-stores the canonical wire name in the row. `PriorAddrText` is empty when
+scope whose family matches; and valid pending-state shape. A current-shape
+scope has a nonempty raw operator FQDN satisfying
+`surfaceAName(scope.FQDN) == row.FQDN`. Raw scope FQDN equality is deliberately
+**not** required because valid scopes preserve accepted uppercase and a single
+trailing dot while `buildHostRecord` stores the canonical wire name in the row.
+
+There is one bounded legacy exception: a Surface-A row satisfying every other
+condition above may have `scope.FQDN == ""`. That is the shipped pre-#2903 disk
+shape exercised by `TestSurfaceAFQDNMigrationAdoptsExistingRecord` and
+`TestSurfaceAFQDNMigrationStillAdoptsWithFingerprint`; quarantining it would
+turn a supported in-place migration into startup degradation. The exception
+does not apply to a zero scope, a Surface-B identity, an empty/noncanonical row
+FQDN, or any family/record-shape mismatch. Loading preserves the row and the
+existing Surface-A reconcile adopts it into the FQDN-bearing key without a wire
+delete. New writes always use the current shape. `PriorAddrText` is empty when
 `PublishPending=false`; when pending it is either empty or a parseable address
 of the same family. Existing optional backend fingerprint and settled/pending
 rows remain valid.
@@ -734,6 +776,22 @@ For each stale Surface-B row, order teardown exactly:
    check. If another claim exists, durably release only this Surface-B row and
    perform **zero** provider I/O. This claim-only release is safe with a nop or
    unavailable updater and is deliberately exempt from no-authority retention.
+   It uses a dedicated remove-and-save helper, not the end-of-pass durability
+   backstop:
+
+   - copy the owned row, remove it from the candidate state, and call
+     `ddnsState.save()` before publishing a reduced `WireRRClaims` snapshot or
+     incrementing the release-success counter;
+   - on a pre-rename save error, restore the copied row in memory, republish the
+     snapshot with the claimant still present, return the error, and perform no
+     provider I/O;
+   - on `*fsatomic.PostRenameSyncError`, converge memory and the claim snapshot
+     to the new visible file (claim removed), report the durability alarm, and
+     still perform no provider I/O. A crash may expose old or new state; old
+     state safely retries the same co-owner release, while new state has the
+     surviving claimant; and
+   - only save success or the classified post-rename outcome permits the claim
+     to disappear from the lock-free cross-surface snapshot.
 3. Only for the last claimant, select wire-delete authority using the rules
    below. No authority then retains the row and alarms.
 
@@ -874,8 +932,8 @@ if len(afNode.Keys) >= 2 {
 ```
 
 The compiler guard is defense in depth, not the primary persisted-data contract.
-Immediately after JSON unmarshal, recursively validate the actual persistence
-shape:
+Immediately after JSON unmarshal, validate the actual persistence shape with an
+explicit iterative node stack (not recursive descent over corrupt input):
 
 - the `*ConfigTree` is non-nil (an empty object with no children remains valid);
 - every descendant pointer in `Children` is non-nil;
@@ -1050,15 +1108,28 @@ inventory against the new one before any map replay:
   slot is introduced and stale pins from an earlier configuration are fenced;
 - unchanged bound slots may retain reconciled state.
 
-`clearHAOwnerSlotFailClosed` writes `rg_active[id]=0` first, then
-`ha_watchdog[id]=0`, then publishes the same inactive/unarmed state to a running
-helper. The new snapshot/inventory is not published until all required clears
-succeed. If any enforcement authority cannot be proved inactive, stop/disarm
-the helper and retain retry debt rather than replaying the pin; the apply
-returns degraded/fail-closed. A valid transition that encounters I/O failure
-may therefore leave an affected previous-good RG deliberately fenced, never
-stale-active. Typed-validation rejection still occurs before this transition
-and remains mutation-free.
+Helper `update_ha_state` is a **full replacement**, not a per-slot patch. The
+transition therefore has two explicit representations: per-slot pinned-map
+fences and one staged full helper inventory. First,
+`clearHAOwnerSlotFailClosed` writes `rg_active[id]=0` and then
+`ha_watchdog[id]=0` for every removed or introduced slot. It does not issue a
+one-row helper request. Next build a complete transitional helper payload from
+the final new inventory: preserve the reconciled state of every unchanged slot,
+include every introduced slot as inactive/unarmed, and omit every removed slot.
+On process start this one replacement also removes any helper-only stale slot
+not present in the new inventory.
+
+Send the staged payload through a helper method that accepts the explicit
+snapshot; it must not read the not-yet-published `m.haGroups`. Only after all
+pinned fences and that full replacement succeed may the manager publish the new
+bound inventory and normal helper state. Retry debt owns the desired generation
+and the entire staged payload, never a sequence of slot patches; a retry cannot
+replay an older full map or forget a prior clear. If any enforcement authority
+cannot be proved inactive, stop/disarm the helper and retain that full-snapshot
+debt. The apply returns degraded/fail-closed. A valid transition that encounters
+I/O failure may leave an affected previous-good RG deliberately fenced, never
+stale-active or an unchanged RG spuriously omitted. Typed-validation rejection
+still occurs before this transition and remains mutation-free.
 
 `userspace.Manager.Compile` calls `config.ValidateDataplaneRGTyped(cfg)`
 immediately after nil/input checks and before pin deletion, shim
@@ -1098,90 +1169,454 @@ that a stale but valid substitute can be detected. Manual `/engineer 6744`
 approval signs off this fail-safe operational restriction; it does not approve
 reducing legal unbound definitions.
 
-Session install and config apply share one linearization gate rather than
-independent atomics:
+Session install, config apply, reconnect, and repair share one explicit
+incarnation state machine rather than independent atomics. `transportEpoch` is
+a local monotonically increasing identifier for one continuously connected peer
+interval; both fabrics share it. It starts nonzero and advances only when the
+last fabric disappears. Independently, every accepted TCP connection receives a
+unique nonzero `connectionIncarnation`, so replacing one fabric while the other
+survives cannot inherit its asynchronous work. Both stamps travel on queued
+config/repair tokens:
 
 ```go
+type configApplyItem struct {
+    transportEpoch       uint64
+    connectionIncarnation uint64
+    roleGeneration       uint64
+    gen                  uint64
+    text                 string
+}
+
+type repairAttempt struct {
+    id                    uint64
+    transportEpoch        uint64
+    connectionIncarnation uint64
+    roleGeneration        uint64
+    debtGeneration        uint64
+}
+
 type configInstallGate struct {
-    mu              sync.Mutex
-    cond            *sync.Cond
-    protected       bool
-    baselinePending bool
-    applying        bool
-    acceptedEpoch   uint64
-    inFlight        uint64
-    debtGeneration  uint64
-    completedDebt   uint64
-    requestedDebt   uint64
-    requestInFlight bool
-    awaitingBulk    bool
+    mu                sync.Mutex
+    cond              *sync.Cond
+    protected         bool
+    transitioning     bool
+    baselinePending   bool
+    applying          bool
+    bulkReconciling   bool
+    applyingTransport uint64
+    transportEpoch    uint64
+    roleGeneration    uint64
+    acceptedConfigGen uint64
+    inFlight          uint64
+    debtGeneration    uint64
+    completedDebt     uint64
+    attemptSeq        uint64
+    inFlightAttempt   *repairAttempt
+    awaitingAttempt   *repairAttempt
+    boundRepair       *repairBulkBinding
+}
+
+type repairBulkBinding struct {
+    bulkStartSerial   uint64 // local receive-window identity; never sent
+    requestID             uint64 // exact echoed wire token
+    transportEpoch        uint64
+    connectionIncarnation uint64
+    roleGeneration        uint64
+    debtGeneration        uint64
+}
+
+type pendingOutboundBulk struct {
+    conn                  net.Conn
+    transportEpoch        uint64
+    connectionIncarnation uint64
+    roleGeneration        uint64
+    wireBulkEpoch         uint64
+    requestID             uint64
+    startedAt             time.Time
 }
 ```
 
+`SessionSync` keeps a connection-to-epoch registry under `s.mu`. The only
+cross-lock order is `s.mu -> gate.mu`; gate code never acquires `s.mu`, and no
+callback/helper I/O or condition wait occurs while either mutex is held. Frame
+admission snapshots both connection stamps under `s.mu`, then revalidates the
+exact registration under the gate before mutation. Disconnect invalidates
+queued work and delayed completions for that `connectionIncarnation`, even when
+the shared transport remains live on the other fabric. A last-fabric disconnect advances the gate's
+epoch, sets `baselinePending` in the protected direction, zeroes the
+**current-epoch observability mirrors** `lastRecvConfigGen` and
+`lastAppliedConfigGen`, and invalidates queued work from the prior epoch.
+`BulkStart` never resets either config mark.
+
 The daemon sets `protected` from the actual config-authority direction before
-session sync starts and before role transitions expose traffic; it is not
-inferred from a racy `lastRecvConfigGen != 0` observation. The active/active
-inverse direction is explicitly unprotected and retains its documented frozen
-nonzero-epoch admission.
+session sync starts: RG0 secondary (authority-to-receiver) is protected; RG0
+primary (receiver inverse) is unprotected. Split the current late RG0 hook. In
+`watchClusterEvents`, for RG0 call
+`SessionSync.PrepareConfigAuthorityTransition(ctx, newState)` immediately after
+classifying the event and **before** `rgStateMachine.SetCluster`,
+`HA.SetRGActive`, blackhole/VIP changes, VRRP force/resign, config-write
+enablement, or config push. The existing `applyRG0OwnershipTransition` retains
+its post-actuation store/IPsec/DHCP duties but does not control session
+admission.
 
-`beginSessionInstall(epoch)` runs before bulk membership and before the per-key
-generation guard. Under the gate mutex it rejects and increments recovery debt
-when `applying`, when a protected reconnect is awaiting a baseline, or when a
-protected nonzero epoch differs from `acceptedEpoch`; otherwise it increments
-`inFlight`. `endSessionInstall` decrements and signals the condition after the
-dataplane operation and generation bookkeeping finish. Legacy epoch zero is
-admitted only after a protected baseline exists and while no apply is active.
-Rejected frames consume neither per-key generation nor authoritative-bulk
-membership.
+The pre-actuation call sets `transitioning`, rejects new installs/applies,
+cancels the old-role outbound bulk context, invalidates any receive window and
+bound repair for that role generation, and prevents its delayed reconcile/ACK
+completion from publishing. Protected -> unprotected is promotion: it drains
+admitted installs, the single config callback, receive reconciliation, and the
+bulk sender before **any** forwarding, store-ownership, config-write/push, or
+readiness actuation. It cancels attempts but retains debt and previous-good
+state, then clears the baseline wait that the inverse direction can never
+satisfy and opens only after every old-role operation has quiesced.
 
-`beginConfigApply(gen)` closes the gate, sets `applying`, and waits for
-`inFlight==0` before `OnConfigReceived` may sweep or publish policy. No existing
-session, bulk, config-queue, or dataplane lock is held while waiting. The gate
-mutex is released during callback/helper I/O but remains logically closed. A
-successful callback publishes `acceptedEpoch=gen`, clears `baselinePending`,
-then reopens; failure retains the previous epoch and reopens only for matching
-previous-good traffic. Thus an install linearizes wholly before the sweep or is
-refused after gate closure; it cannot pass a check and land after the sweep.
+Unprotected -> protected is demotion. It cancels matching in-flight/awaited
+repair attempts without clearing debt, invalidates `acceptedConfigGen`, and
+sets `baselinePending`. Fail-closed traffic removal may proceed immediately,
+but the gate remains closed and store ownership, peer-config acceptance, and
+readiness publication wait until old-role installs/callback/bulk work drains.
+A callback, reconcile, barrier, and bulk completion token includes transport,
+connection incarnation where applicable, and role-transition generation, so an old-role completion cannot
+reopen or publish into the new role. Returning to protected later requires a
+fresh baseline and repairs retained debt.
 
-Split `resetRecvGen`: BulkStart resets only per-key session generations and
-full-set sequence state. It never clears config authority, accepted epoch,
-apply state, or recovery debt. A full both-fabric disconnect in the protected
-direction sets `baselinePending` and closes new installs. The first successful
-post-reconnect config may establish a lower rebooted-peer generation as a new
-baseline; bulk frames that race ahead are refused and create repair debt. The
-unprotected active/active inverse does not wait for a config it never receives.
+If drain/cancellation fails or times out, promotion is not actuated: keep
+forwarding fenced and mark RG0 not ready. `watchClusterEvents` retains that RG0
+event in a single pending slot and retries it on bounded backoff before
+actuating any later RG0 event; a newer queued RG0 state supersedes the pending
+target but still passes the same pre-actuation gate. This prevents a consumed
+promotion event from being lost merely because the drain timed out.
+Demotion closes the gate immediately and proceeds only with traffic removal even
+if the old callback is still unwinding; its token cannot reopen the gate, and
+the remaining demotion duties wait for its drain. Tests
+drive this exact daemon event order for both transitions, including active/
+active inverse traffic, rather than calling the gate alone. No racy
+`lastRecvConfigGen != 0` inference is permitted.
 
-An authoritative outbound bulk has an exact session-data barrier. Under
-`bulkSendMu`, set a producer gate so new session install/delete frames append to
-a bounded deferred journal, enqueue an in-band barrier token to `sendCh`, and
-wait until the send loop has written every pre-barrier session frame. Then take
-the session snapshot and directly write BulkStart, snapshot rows, and BulkEnd.
-Control/config/heartbeat frames may interleave because the receiver never adds
-them to the session set. After BulkEnd, release deferred session deltas to
-`sendCh` in original order and reopen producers. Overflow or write failure
-retains/journals deletes, arms `forceResync`, and never reports the bulk
-complete. This prevents a delayed ordinary incremental from entering the
-authoritative window while preserving post-snapshot churn after BulkEnd.
+Transition code marks the new role generation and snapshots cancellation
+handles while holding `gate.mu`, then releases it before cancelling, acquiring
+`bulkSendMu`/`bulkMu`, or waiting. Bulk/config/install completion reacquires only
+`gate.mu` to compare its immutable token and decrement its own in-flight class.
+No path waits for a bulk or callback while holding `s.mu`, `gate.mu`,
+`producerMu`, `bulkMu`, or `writeMu`; tests assert this lock graph under timeout,
+disconnect, and simultaneous role change.
 
-On receive, add a key to `bulkRecvV4/V6` only after its install passes the
-config gate and succeeds. A malformed or refused session marks that bulk
-invalid. Matching BulkEnd for an invalid bulk performs no stale-session
-reconcile, sends no success ACK, does not release readiness, and cannot clear
-recovery debt; it schedules another repair after an acceptable config
-baseline. A valid matching BulkEnd is the only recovery completion event.
+The `syncMsgConfig` handler resolves the source connection's epoch before
+updating receive high-water or enqueueing. `beginConfigApply(item)` rejects a
+stale-epoch item before `OnConfigReceived`, closes the install gate, and waits
+for `inFlight==0`. Within an established current epoch, nonzero generations are
+strictly increasing; legacy generation zero retains existing accept-always
+compatibility but cannot lower a nonzero mark. While `baselinePending`, the
+first **current-epoch** successful callback may establish any peer generation,
+including a lower rebooted-peer value. Its completion publishes
+`acceptedConfigGen`, replaces the current-epoch receive/applied high-water, and
+clears the baseline. A callback already running when disconnect occurs may
+finish as previous-good state, but its stale
+`(transportEpoch, connectionIncarnation, roleGeneration, gen)` token may
+not update current high-water or clear the new baseline; the single-consumer
+apply gate prevents a new callback from overlapping it. Queued stale items are
+dropped. Failure retains baseline/previous-good and keeps manual transfer
+blocked.
+
+`beginSessionInstall(transportEpoch, connectionIncarnation, roleGeneration,
+configGen)` runs before bulk membership and
+before per-key ordering. It rejects and increments recovery debt when the
+connection is stale, apply/transition is active, a protected baseline is
+pending, bulk reconciliation is active, or a protected nonzero config generation differs from
+`acceptedConfigGen`; otherwise it increments `inFlight`. `endSessionInstall`
+signals only after dataplane operation and ordering bookkeeping finish.
+Protected session config generation zero is **never** admitted, including inside
+an authoritative bulk. A queued zero-epoch session from pre-config policy can
+otherwise arrive after a stricter config sweep and recreate the stale permit;
+and bulk member installation is not transactional if a later member or stale
+reconciliation fails. Refusal invalidates the current bulk, consumes neither
+per-key ordering nor membership, and arms repair debt. Release notes require
+legacy zero-epoch sessions to drain or be explicitly cleared/re-established
+under a nonzero current generation before manual transfer can become ready; the
+plan does not silently bless them for hitless mixed-version continuity.
+
+Session and full-set ordering are incarnation-qualified. Store
+`(transportEpoch, peerProcessID, generation)` for v4/v6 per-key guards and
+`(transportEpoch, peerProcessID, wireIncarnation, senderSequence)` for
+IPsec/DHCP full-set guards; reject frames from unregistered/stale connections
+before comparing. A newer
+transport epoch may carry a lower rebooted-peer generation, while a delayed
+frame from an older connection can never overwrite it. **No BulkStart resets a
+global guard.** Therefore malformed, nested, mismatched, disconnected, or
+aborted bulks preserve all pre-bulk high-water state; independently valid
+session frames update their normal incarnation-qualified key only after a
+successful install. Full-set messages are never bulk members and receive no
+special bulk reset.
+
+Comparison is not lexicographic on the random process ID. A frame must match the
+current registered transport and process ID. The first valid frame in a newer
+transport establishes that transport's inner generation/sequence regardless of
+its numeric value; within the same transport/process, the existing strict
+generation or `(wireIncarnation, sequence)` rule applies. An older transport or
+different process ID is rejected before mutation.
+
+A capability-less peer is registered in a distinct local legacy namespace
+`(transportEpoch, zeroProcessID)`. That sentinel is never accepted from a
+capability payload and can never authorize a bulk, repair binding, or readiness
+release, but it preserves independently valid nonzero-generation session and
+IPsec/DHCP full-set traffic under the transport-qualified guards. A connection
+that advertises version 1 before its first data frame is promoted atomically to
+the advertised nonzero process ID; later capability mutation or a data frame
+that overtakes capability closes that connection rather than mixing namespaces.
+
+Mixed-version authoritative bulk is fail-safe through an additive capability
+advertisement. Add `syncMsgCapabilities = 30` with an exact 26-byte payload:
+little-endian `version uint16`, little-endian `flags uint64`, and a 16-byte
+`peerProcessID`. Version 1 defines separate
+`barriered-authoritative-bulk-v1` and `repair-token-v1` bits; unknown flag bits
+are ignored, while a wrong version, wrong length, or all-zero process ID closes
+the connection without changing shared transport state. Exactly one capability
+frame is allowed per connection and it must precede that connection's first
+data/control frame; a duplicate, mutation, or late advertisement closes the
+connection. Generate the process ID once
+per `SessionSync` lifetime with `crypto/rand`. Do not reuse the existing
+monotonic-clock `syncEpoch`: it can regress or collide across OS boots and is
+only a legacy wire-order field. Constructors retain their signatures; if secure
+ID generation fails, advertise no authoritative-bulk capability, alarm, and
+leave manual readiness fail-closed rather than substituting a weak ID.
+Inject the entropy reader through an unexported constructor/options seam used by
+tests; do not add a package-global mutable function variable.
+These messages and tails are additive/length-gated, so do not bump
+`SessionSyncWireVersion`; capability negotiation, not a blanket image-version
+refusal, gates the new authoritative semantics.
+
+A new node writes the capability synchronously on each connection before
+registering that connection as active; old peers ignore the unknown type. When
+sync PSK authentication is active, the capability frame is covered by the
+negotiated per-frame HMAC; in legacy dual-accept mode the ID is an ordering
+namespace, not an authenticated identity claim. Both fabrics in one transport
+interval must advertise the same nonzero process ID. A mismatch is fail-closed:
+reject the newcomer, mark continuity unready, and wait for the prior transport
+to drain rather than mixing frames
+from two process lifetimes. A receiver treats BulkStart as authoritative only
+when that exact connection advertised the bit earlier in TCP order. A
+capability-less old sender's bulk is refused without guard reset,
+reconciliation, ACK, or readiness
+release; ordinary independently valid incrementals may still install. Release
+notes state that during a rolling upgrade the upgraded standby cannot become
+manual-transfer ready until its sender peer is upgraded and completes one valid
+barriered bulk. Previous-good automatic peer-loss behavior retains the existing
+availability/security doctrine and raises the continuity alarm. A new sender's
+barriered bulk remains safe for an old receiver. The only existing-frame
+extension is the later-specified length-gated request ID tail on repair bulk
+markers; the original epoch prefix and ordinary meaning remain unchanged.
+
+The outbound queue becomes typed rather than encoding an in-process token as
+wire bytes:
+
+```go
+type outboundItem struct {
+    wire    []byte
+    barrier *outboundBarrier
+}
+type outboundBarrier struct {
+    transportEpoch uint64
+    roleGeneration uint64
+    drained        chan error
+}
+```
+
+One `producerMu` linearizes each session producer's gate check plus
+enqueue/defer operation with the bulk sender's gate close plus barrier enqueue.
+This is not a flag checked outside the channel operation. `QueueSessionV4/V6`,
+`QueueDeleteV4/V6`, delete-journal flush, and v4/v6 sweep replay are the complete
+production producer list and all route through that helper; a source canary
+rejects direct production `sendCh` sends outside the helper and barrier path.
+The helper returns an explicit queued/deferred/rejected result so a deferred
+delete is not also copied into the ordinary delete journal and send counters do
+not claim a wire enqueue prematurely.
+
+Under `bulkSendMu`, acquire `producerMu`, close the gate so every new
+install/delete delta enters a bounded FIFO deferred journal, and enqueue a local
+queue-drain barrier before releasing `producerMu`. A bounded enqueue may wait
+while the send loop drains the channel, but producers cannot pass the gate
+during that interval. Then wait with the SessionSync context plus a fixed
+timeout. `sendLoop` signals success only after every earlier queued frame has
+completed its write to whichever registered fabric it selected; it signals the
+first write failure instead of carrying the token across disconnect. This local
+token is never encoded as a sync frame.
+
+A queue drain alone is insufficient because the peer has independent receive
+loops per fabric. After it succeeds, snapshot **every** live connection in the
+current transport/process registry under `s.mu`, then release the lock. Register
+one unique connection-bound fence token per snapshot member, write an existing
+`syncMsgBarrier` directly on each member, and require its `syncMsgBarrierAck` on
+that exact connection incarnation and transport. TCP ordering then proves that every earlier
+session frame written on each fabric has been processed before the snapshot.
+An ACK on the other fabric, a connection replacement, membership change before
+all ACKs, timeout, or disconnect fails the fence; retire every fabric in that
+transport, reopen/journal through the abort path, and retry only in the new
+transport. A fabric joining after the snapshot cannot become the outbound
+session connection until the gate reopens. The wait holds no `writeMu`,
+producer, connection, or gate lock. Only after every fabric fence succeeds may
+BulkSync capture a still-registered connection and directly write BulkStart,
+snapshot rows, and BulkEnd. A capable peer gets the version-1 marker/ACK rules;
+a legacy receiver gets the original 8-byte markers and ACK but is still safe
+because the **new sender** performed the same producer and all-fabric fences.
+The config-send entry point and RG0 role
+transition cancel and drain the outbound bulk before their frame/actuation; if
+BulkStart was already written, the existing post-start abort path suppresses
+BulkEnd and retires the transport. Heartbeats, barrier ACKs, and unrelated
+full-set/clock replies may still interleave under `writeMu` because they cannot
+change session forwarding authority. Encode this as a closed internal allowlist:
+heartbeat/ack, clock sync, barrier/ack, BulkAck, IPsec SA, and DHCP lease full
+sets. Config and every failover-family/fence/prepare-activation frame are cancel-
+and-drain writers. A source canary classifies every production `writeMsg` call so a
+new authority-changing writer cannot silently enter the bulk window.
+
+After writing BulkEnd, keep the producer gate closed and continue deferring until
+the exact capable BulkAck proves stale reconciliation finished. The wait holds
+no mutex. On that ACK, reacquire `producerMu`, append deferred deltas to the
+normal queue in original order, then reopen producers before unlocking. New
+producers therefore cannot overtake the journal tail, and no post-snapshot
+incremental can race the peer's stale-delete pass. The flush is bounded; if it
+cannot enqueue the complete tail, preserve its deletes in the existing delete
+journal, drop only installs covered by a mandatory follow-up full bulk, set
+outbound repair pending, arm `forceResync`, and reopen. If the deferred
+journal overflows before BulkStart, abort, reopen, retain deletes in the
+existing delete journal, drop only installs covered by the mandatory full
+resync, set outbound repair pending, and arm `forceResync`. If overflow,
+cancellation, timeout, a direct write failure, or deferred overflow occurs after
+BulkStart but before BulkEnd, suppress BulkEnd and retire the whole transport so
+the receiver aborts that window. An ACK timeout or overflow after BulkEnd also
+retires the whole transport; the receiver may have completed that point-in-time
+snapshot, but cannot consume any deferred tail from the retired transport, and
+the new transport must run another baseline/repair before readiness. Then
+perform the same journal/reopen/rearm transition. No path can leave the producer
+gate closed.
+
+`producerMu` is never nested with `deleteJournalMu`: abort/flush paths detach the
+remaining deferred tail, reopen and release `producerMu`, and only then append
+captured deletes to the existing journal. No delete-journal path holds its mutex
+while entering the producer helper. This keeps the new barrier protocol out of
+the existing journal lock order.
+
+Receive state binds one authoritative window to the exact connection that has
+advertised both version-1 bits, its transport epoch/process ID, wire bulk epoch,
+echoed request ID, and a local monotonically increasing `bulkStartSerial`. The
+local serial is never wire correlation: it only prevents a delayed
+reconciliation completion from publishing into a later window that reused a
+wire epoch. An admitted BulkStart first acquires a gate lease spanning the whole
+receive window through stale reconciliation. If config apply or role transition
+already closed the gate, BulkStart is refused. A config frame arriving while the
+window is still receiving atomically invalidates it, releases that lease, and
+then enters normal apply; it must not wait on its own receive loop for a later
+BulkEnd. A config frame from the other fabric arriving after BulkEnd changed the
+window to reconciling waits for that bounded I/O phase. This prevents a config
+callback from changing the accepted policy generation during stale deletion
+without creating a same-loop deadlock. At BulkStart, an exact nonzero echoed
+request matching
+`awaitingAttempt` creates `boundRepair`; ordinary zero/absent request IDs create
+no debt binding. Completion compares the whole binding and detaches it before
+publishing; abort or disconnect invalidates only that exact binding and leaves
+its debt armed. Only session frames on that connection can become snapshot
+members; frames on the other fabric remain ordinary incrementals. Add a key to
+`bulkRecvV4/V6` only after its install passes the config/incarnation gates and
+succeeds. A malformed/refused member invalidates the window. Nested start,
+mismatched end, disconnect, or capability violation aborts it and retains
+repair debt. `reconcileStaleSessions` returns its result and error instead of
+logging-and-continuing. Any partial/delete/iterator error makes the bulk failed:
+no success ACK, readiness release, `bulkEverCompleted`, callback, or debt
+completion; arm another authoritative repair. Only an exact valid BulkEnd whose
+stale reconciliation succeeds may publish completion.
+
+BulkEnd atomically changes the matching window from receiving to reconciling
+and sets `gate.bulkReconciling` before detaching its membership maps and
+releasing `bulkMu`; no next BulkStart or session install is admitted during that
+phase. Reconciliation performs dataplane I/O without
+the mutex, then reacquires it and publishes only if the local serial,
+connection/transport/process, role generation, wire epoch, and request binding
+still match. Disconnect/transition invalidates that token. A late result may
+finish only while installs remain quiesced and cannot ACK, clear debt, or
+release readiness into a new window or role. If the last fabric disappears
+during reconciliation, mark the transport draining and do not register or admit
+frames from a reconnect until reconciliation returns and releases its gate
+lease. This prevents stale deletion from racing installs for the new transport.
 
 Refused protected installs increment `debtGeneration`. Add
-`syncMsgBulkRequest = 29`, an additive length-zero request. After a successful
-protected config apply (and again after reconnect), atomically claim the latest
-uncompleted debt generation, mark `requestInFlight`, and write outside the gate
-mutex. Nil connection, short/failed write, or disconnect clears in-flight state
-but leaves debt armed. A successful write moves the token to `awaitingBulk`;
-only a valid matching BulkEnd advances `completedDebt` through that token. If a
-new refusal increments debt during request or bulk, completion leaves the newer
-generation pending and emits another request. A new sender coalesces requests
-through the existing pre-bulk `forceResync` CAS; a request arriving during a
-bulk survives for the next bulk. An older peer ignores type 29, so debt and
-manual-transfer unready state remain visible rather than being falsely cleared.
+`syncMsgBulkRequest = 29` with an 8-byte request ID. Every send attempt gets a
+unique nonzero `attemptSeq` token carrying the current transport epoch and
+claimed debt generation plus the captured connection/role incarnations. Write
+outside the gate. Completion mutates state only if the full attempt token still
+matches; this prevents an old
+connection's delayed completion from marking a retry successful. Nil
+connection, short/failed write, timeout, or disconnect clears only the matching
+attempt and leaves debt armed. Success moves that exact token to
+`awaitingAttempt`.
+
+The sender binds the request on the wire, not by timing inference. A repair
+BulkStart and BulkEnd use the exact 16-byte little-endian
+`{bulkEpoch uint64, requestID uint64}` form. Ordinary bulks retain the exact
+legacy 8-byte epoch form or use a 16-byte form with request ID zero. Any other
+marker length is malformed. The extension is length-gated, so old receivers
+continue reading the original epoch and ignore the tail. A request received
+while a bulk is active is retained
+by `forceResync` for a **later** bulk carrying that ID; it never retags the
+current window. The receiver binds only an exact echoed request ID on the same
+current transport/capable connection, and requires BulkEnd to echo both bulk
+epoch and request ID. Thus a BulkStart already in flight but not yet processed
+cannot satisfy a newly sent request. Only that exact valid end plus successful
+stale reconciliation advances `completedDebt` through the attempt's claimed
+generation. Newer debt causes a fresh unique request. An older peer ignores type
+29 and cannot advertise capability 30, so debt and manual-transfer unready state
+remain visible rather than falsely clearing.
+
+Sender-side coalescing preserves the token, not merely a boolean. Under a
+dedicated short-lived mutex, type 29 validates exact length/nonzero ID and stores
+`pendingRepair = (sourceTransportEpoch, sourceConnectionIncarnation,
+sourceRoleGeneration, requestID)`. A newer request on that
+transport supersedes an unclaimed older ID. At BulkSync start, after
+`bulkSendMu`, atomically claim the then-current tuple and copy its ID into both
+markers. A request arriving after that claim remains pending for the next bulk;
+writing BulkEnd does not clear the claim. Only its exact capable BulkAck clears
+the exact claimed tuple, so it cannot erase a newer request. Pre-end failure
+requeues the claimed tuple on the same live transport. Disconnect drops pending
+and claimed tuples tied to the old transport; receiver debt causes a new ID
+after reconnect, while sender repair/readiness remains conservative until that
+new exchange. `forceResync` remains the scheduling CAS, while this tuple is the
+authoritative payload it must not coalesce away.
+
+Bulk acknowledgement uses the same causal identity. Before writing BulkEnd,
+publish one `pendingOutboundBulk` under a dedicated mutex (record-then-send).
+For a capable peer, BulkAck uses the exact 16-byte little-endian
+`{bulkEpoch, requestID}` form; the receiver echoes zero for an ordinary capable
+bulk and the nonzero request ID for a repair bulk. Legacy 8-byte ACK remains
+valid only for a connection that did not advertise version 1. The ACK handler
+requires the exact source connection registration, transport epoch, wire bulk
+epoch, and request ID. It does not retain the current `epoch >= pending`
+shortcut, accept an ACK on the other fabric, or let a legacy-length ACK clear a
+capable repair. Disconnect and send failure remove only the matching pending
+record. A valid exact ACK detaches that record atomically and wakes the bulk
+sender; only after the sender has safely flushed/reopened the deferred tail may
+it publish `outboundBulkAcked`, invoke callbacks, or clear outbound repair debt.
+An older delayed ACK cannot clear a newer bulk or a new transport's readiness.
+Only one outbound bulk may await ACK. A new cold-prime, repair request, or
+`forceResync` remains queued while that record exists; it cannot overwrite the
+pending tuple. ACK timeout retires the transport and re-arms the claimed repair
+before retry, while an exact ACK permits the next scheduled bulk. This also
+orders a mandatory post-flush follow-up behind acknowledgement of the snapshot
+whose deferred tail was lost.
+
+Extend `TransferReadinessSnapshot` with additive Go fields
+`ConfigBaselinePending`, `SessionRepairPending`, `TransportEpoch`,
+`RepairDebtGeneration`, and `RepairCompletedGeneration`. Populate them from one
+gate snapshot in `TransferReadiness`; `ReadyForManualFailover` requires both
+pending booleans false in addition to its existing checks, and `Reason` reports
+baseline before repair debt with the epoch/generation identifiers. Update the
+daemon manual-transfer errors, cluster status text, package README, and direct
+snapshot tests. This is an additive in-process Go/status contract, not a helper,
+BPF, REST, gRPC, or sync-wire schema change.
+
+`SessionRepairPending` is the conservative OR of receive refusal/reconcile debt,
+a capability-refused authoritative prime, and send-side `forceResync`/deferred
+loss. Send-side pending clears only after the follow-up authoritative bulk is
+successfully ACKed, not when it is merely scheduled or its BulkEnd is written.
+This prevents the peer from being promoted after a post-snapshot install was
+dropped but before the repair snapshot reached it.
 
 ### 5.11 Workstream J - merge repeated global address-book containers (K003-06)
 
@@ -1335,8 +1770,12 @@ The implementation plan preserves these signatures and wire contracts:
 - Rust event-stream record layout and event action byte;
 - binary event record length and field offsets;
 - BPF pinned map specifications and helper protocol in the recommended RG path;
-- the HA wire protocol gains only the additive, ignorable
-  `syncMsgBulkRequest`; no existing message changes shape or meaning;
+- the HA wire protocol gains only two additive, ignorable messages:
+  request-ID-bearing `syncMsgBulkRequest` and versioned
+  `syncMsgCapabilities`; repair BulkStart/BulkEnd append one length-gated
+  request-ID tail while preserving their original 8-byte epoch prefix and
+  ordinary meaning, and capable BulkAck echoes the same length-gated tail for
+  exact completion while legacy peers retain the 8-byte ACK;
 - route-map helpers intentionally become the context-aware term-count and
   highest-sequence/fit APIs in Workstream H; all repository callers migrate
   atomically because a context-free exact count is impossible.
@@ -1349,6 +1788,10 @@ per-family updater selection, claim-release order, and anchor lifetime;
 constructor signatures remain unchanged.
 Workstream C adds an internal `preparedCompileView` so validation and lowering
 consume one normalized SNMP root; it is not an API or wire type.
+Workstream I additively extends the exported Go `TransferReadinessSnapshot` and
+internal status text with baseline/repair diagnostics. Existing fields and
+methods remain source-compatible; no REST, gRPC, helper, BPF, or persisted
+schema is changed.
 
 Intentional behavior changes are fail-loud validation, not API removal:
 
@@ -1406,7 +1849,9 @@ Intentional behavior changes are fail-loud validation, not API removal:
    occurs before any snapshot or actuator mutation and never reuses
    `ForwardingSupported=false`. Removed and newly introduced bound slots are
    inactive/unarmed in BPF and helper state before the new inventory publishes;
-   an uncertain clear disarms the helper rather than replaying stale pins.
+   unchanged slots survive the helper's one full-replacement transitional
+   payload. Retry owns that complete desired generation; an uncertain clear
+   disarms the helper rather than replaying stale pins or an older full map.
 8. **HA ordering:** an invalid live sync leaves active config, compiled config,
    helper maps, forwarding arm state, and applied-generation high-water
    unchanged. Fresh boot remains lifeline/default-deny. A mixed-version RG16+
@@ -1414,11 +1859,14 @@ Intentional behavior changes are fail-loud validation, not API removal:
    use previous-good with a stale alarm. Legal unbound RG16..255 remains
    accepted. In the explicitly protected config-authority-to-receiver
    direction, the shared install/apply gate admits sessions only outside apply,
-   after reconnect baseline, and at the accepted epoch before per-key ordering.
-   Apply waits for admitted installs to finish before its policy sweep. The
-   explicitly unprotected active/active inverse retains its documented
-   admission. BulkStart cannot reset config authority; invalid bulks cannot
-   reconcile stale sessions or discharge generation-tracked repair debt.
+   after a current-transport baseline, and at the accepted config generation
+   before incarnation-qualified per-key ordering. Apply waits for admitted
+   installs to finish before its policy sweep. A stale queued/in-flight callback
+   cannot clear a newer transport's baseline. The explicitly unprotected
+   active/active inverse retains its documented admission. BulkStart resets no
+   ordering or config authority. Only a capable same-connection window with
+   successful stale reconciliation can ACK, release readiness, or discharge a
+   uniquely correlated repair attempt.
 9. **No lock-order expansion:** VIP warning-state helpers take only their own
    short-lived mutex and are never called while attempting to acquire
    `directVIPMu` internally.
@@ -1430,9 +1878,14 @@ Intentional behavior changes are fail-loud validation, not API removal:
     formatter preserves its established real-action behavior; intentional
     per-surface omissions are not broadened.
 12. **Wire and pinned-state portability:** no event ABI, helper protocol, BPF
-    map size, or pinned-map migration is introduced. The sole HA wire addition
-    is an ignorable zero-length resync request; older peers keep parsing all
-    existing traffic and may omit only the requested continuity repair.
+    map size, or pinned-map migration is introduced. The HA additions are an
+    ignorable request-ID resync message, a versioned capability advertisement,
+    and a length-gated request-ID tail on repair bulk markers and their capable
+    ACK. Older peers keep parsing the original epoch prefix and all existing
+    traffic. A new
+    receiver refuses an old sender's unbarriered bulk as authoritative and
+    stays manual-transfer unready; it never mistakes mixed-version traffic for
+    a complete snapshot.
 13. **Allocation and hot-path shape:** K003-01 uses existing parsed metadata;
     none of the other workstreams add packet-path allocation or shared-state
     contention.
@@ -1469,9 +1922,9 @@ Intentional behavior changes are fail-loud validation, not API removal:
 | Lifetime / borrow-checker | LOW | Only K003-01 changes Rust and it passes a copied byte already present in metadata; no ownership or shared-lifetime change | Rust unit tests, clippy/build, and packet-path smoke |
 | Concurrency / lock ordering | MEDIUM | K003-16 repairs a race but a careless lock reuse can deadlock direct VIP reconciliation | Dedicated mutex; helper-only access; race tests and lock-scope review |
 | Performance regression | LOW | One copied byte on a rare flowless path; all other work is cold path | No new packet reads/allocations; userspace throughput baseline and perf smoke for K003-01 only |
-| State/ownership corruption | HIGH | DDNS wrong-family delete, malformed cross-surface state, routing ownership loss, stale RG pins, and interleaved session bulk/apply are explicitly stateful | Expected-surface validation with canonical-equivalent Surface-A identity; exact same-family `fpb1` selection; no representative/credential fallback; post-pass anchor lifetime; RG slot clear/fence debt; linearized config/install gate; authoritative bulk barrier; generation-tracked repair; injected failure/retry tests |
-| HA compatibility | HIGH | RG bindings above the 16-slot dataplane domain were previously accepted; upgraded peers must reject without partial apply while definitions through 255 remain legal; older peers ignore the additive repair request | Honest operator-bound preflight/release note; fresh-boot, reconnect, previous-good, stale-pin, invalid-bulk, and repair-debt state-machine tests; definition/binding/membership validation; userspace HA reject/recovery smoke |
-| Public API regression | MEDIUM | Route-map Go helpers gain required context and lifecycle strings change from false `deny` to `n/a` | Migrate every repository caller atomically; release notes; REST/gRPC/CLI/filter/action golden tests |
+| State/ownership corruption | HIGH | DDNS wrong-family delete, malformed/legacy cross-surface state, crash-ambiguous claim release, routing ownership loss, stale RG pins, and interleaved session bulk/apply are explicitly stateful | Expected-surface validation including bounded pre-#2903 Surface A; exact same-family `fpb1`; classified pre/post-rename claim-release transitions; no representative/credential fallback; post-pass anchor lifetime; RG slot clear/fence debt; transport-qualified config/install gate; abortable authoritative bulk barrier; attempt-correlated repair; injected failure/retry tests |
+| HA compatibility | HIGH | RG bindings above the 16-slot dataplane domain were previously accepted; reconnect can reorder old config callbacks; an old sender cannot produce a provably uncontaminated authoritative bulk; older peers ignore repair/capability additions | Honest operator-bound preflight/release note; connection-incarnation and capability gates; manual-transfer refusal for mixed-version continuity; fresh-boot, reconnect, previous-good, stale-pin, invalid/reconcile-failed bulk, and repair-ABA tests; userspace HA reject/recovery smoke |
+| Public API regression | MEDIUM | Route-map Go helpers gain required context, readiness gains additive diagnostics, and lifecycle strings change from false `deny` to `n/a` | Migrate every repository caller atomically; release notes; readiness/status tests; REST/gRPC/CLI/filter/action golden tests |
 | Architectural mismatch | MEDIUM | Mega-batching repeats the #961/#946 Phase-2 dead-end pattern; RG owner widening would create a pinned-map migration project | Path A split; preserve 0..255 definitions but gate owner bindings to 1..15; no broad parser or ABI redesign |
 
 ## 9. Test and validation plan
@@ -1500,8 +1953,14 @@ passes on the fix and fails when the fix hunk is reverted.
   `FormatSet` artifact reloads identically. The shipped Incus fixture is
   migrated, while an old persisted copy still boots with identical effective
   SNMP. Equal client prefixes prove `restrict` wins independent of source order;
-  malformed clients never become unrestricted. Repeated user declarations
-  prove unknown/empty/conflicting auth or privacy observations survive folding
+  malformed clients never become unrestricted. Repeated community declarations
+  prove correlation uses stable ordinals while the actual community, raw AST
+  path, and any secret-derived hash are absent from observations, warnings,
+  JSON/YAML, logs, and operational output. Community, authentication-password,
+  and privacy-password sentinels prove observation-path redaction shares the
+  complete AST secret classifier. A credential-only rotation still
+  changes the private reconcile hash. Repeated user declarations prove
+  unknown/empty/conflicting auth or privacy observations survive folding
   without any secret value in diagnostics. Strict/lenient tests prove
   intent is observed before lowering and a rejected identity dominates every
   valid duplicate; peer-only invalid users fail the originating strict commit;
@@ -1528,10 +1987,13 @@ passes on the fix and fails when the fix hunk is reverted.
   forged PTR, Surface-A-only fields, and scope-family/FQDN mismatch before
   indexing or DNS I/O. Expected-Surface-A load accepts settled and pending
   router-self rows, including uppercase and single-trailing-dot scope names whose
-  `surfaceAName` equals the stored canonical row name, and rejects lease fields,
-  address-family mismatch, malformed prior address, noncanonical row FQDN, and
-  true canonical scope/FQDN mismatch. A valid row cannot be reclassified by
-  heuristics because each constructor supplies the expected store surface.
+  `surfaceAName` equals the stored canonical row name. It also loads both
+  existing pre-#2903 empty-scope-FQDN fixtures, reconciles/adopts them into the
+  current key, and proves no wire delete or degradation. It rejects zero-scope
+  lookalikes, lease fields, address-family mismatch, malformed prior address,
+  noncanonical row FQDN, and true nonempty canonical scope/FQDN mismatch. A
+  valid row cannot be reclassified by heuristics because each constructor
+  supplies the expected store surface.
   Fixed-updater tests preserve valid empty-fingerprint compatibility and refuse
   nonempty fingerprints.
   Stateful A -> B tests make forward deletion succeed and PTR deletion fail,
@@ -1541,7 +2003,11 @@ passes on the fix and fails when the fix hunk is reverted.
   Last-claimant no-authority asserts zero wire writes, retained row, non-nil
   error, failure counter, and alarm. Co-owned no-authority asserts claim-only
   durable release, zero provider calls, then Surface-A convergence after the B
-  claim disappears. Existing #6015 cross-surface ordering tests remain green;
+  claim disappears. Injected pre-rename save failure restores and republishes
+  the claimant; injected `PostRenameSyncError` converges memory/snapshot to the
+  visible removal while alarming. Crash/reload from both possible durability
+  outcomes performs zero wrong-owner provider I/O. Existing #6015 cross-surface
+  ordering tests remain green;
   this workstream adds no namespace/election claim. A source canary forbids
   production reads or writes of representative `m.updater` outside the fixed
   compatibility seam and forbids new generation/catalog state.
@@ -1604,33 +2070,93 @@ passes on the fix and fails when the fix hunk is reverted.
   unbound RG20 syncs normally. Active RG1 -> unbound -> process restart/rebind
   on a secondary proves stale pinned active/watchdog values are cleared before
   replay. New-slot, removed-slot, unchanged-slot, each map/helper clear failure,
-  retry debt, and helper-disarm behavior are executable. Preflight invokes the
+  retry debt, and helper-disarm behavior are executable. A production-shaped
+  helper fake performs full replacement, not patches: old `{RG1 active, RG2
+  active}` -> new `{RG2 active, RG3 inactive}` proves one staged payload omits
+  RG1, preserves RG2, and introduces RG3 fenced; retry replays that complete
+  desired generation. Preflight invokes the
   staged binary against the same operator-designated unredacted artifact/hash
   for node 0 and node 1 and covers exit 0, exit 2, redacted input, and tool
   failure; a stale valid file is explicitly outside the command's detectable
   contract and is not asserted rejected.
 
-  Protected-direction gate tests cover fresh boot, legacy zero after baseline,
-  exact match, future, older, apply-in-progress, and post-reconnect baseline for
-  v4 and v6. A barrier-controlled install that passed admission before apply
-  must finish before the sweep; one arriving after closure is refused before
-  per-key generation or bulk membership. Apply success/failure, lower rebooted
-  generation baseline, role transition, and the explicitly unprotected
-  active/active inverse are deterministic.
+  Every session-sync race test enters through encoded production receive paths
+  (`receiveLoop` or `handleMessage`) and the real config queue; direct calls to a
+  gate/reset/install/debt helper are insufficient. Protected-direction tests
+  cover fresh boot, exact/future/older config generations, apply-in-progress,
+  and post-reconnect baseline for v4 and v6. A legacy-zero row is refused both
+  as an ordinary incremental and as a capable authoritative-bulk member. A
+  direct config write overtaking an already queued zero-epoch session proves the
+  later incremental cannot recreate a swept permit, and an abort after one
+  zero-epoch bulk member proves no partial install survives. A
+  config queued before disconnect, a callback in flight across disconnect, and
+  a lower rebooted-peer generation prove only the current transport can clear
+  baseline/high-water. A separate trace replaces one fabric while the other
+  stays live and proves the old connection incarnation's queued/callback work
+  cannot publish into its replacement. The production daemon RG0 event path proves both role
+  transitions close/drain before `SetCluster`, `SetRGActive`, blackhole/VIP,
+  VRRP, store ownership, or config push; timeout retains/retries promotion
+  without exposure. The explicitly unprotected active/active inverse remains
+  deterministic. Lock and race tests assert `s.mu -> gate.mu` with no inverse
+  acquisition.
 
-  Bulk tests enqueue a pre-barrier incremental, churn installs/deletes while the
-  snapshot iterates, and prove only snapshot rows lie between markers while
-  deferred deltas retain order after BulkEnd. Queue overflow/write failure
-  re-arms authoritative repair. A refused/malformed bulk member invalidates the
-  bulk: no stale reconcile, success ACK, readiness release, or debt discharge.
-  `BulkStart` resets per-key/full-set ordering but preserves config authority.
+  Incarnation tests deliver generation 100, start malformed/aborted bulks, race
+  a delayed generation-50 frame from the other fabric, and prove neither
+  per-key nor IPsec/DHCP full-set high-water regresses. A full disconnect then
+  admits a lower current-transport generation; a stale old-connection frame is
+  refused. No BulkStart mutates a high-water.
 
-  Recovery-debt tests cover atomic claim, duplicate refusals, nil connection,
-  partial/failed write rearm, disconnect/reconnect retry, a refusal concurrent
-  with request, a refusal concurrent with bulk, valid BulkEnd token completion,
-  and another request when newer debt remains. Type-29 uniqueness, old-peer
-  unknown-message behavior, sender `forceResync` coalescing, and failed-G ->
-  successful-baseline -> valid-full-bulk recovery are pinned.
+  Outbound tests enqueue a pre-barrier incremental, churn installs/deletes while
+  the snapshot iterates, and prove only direct snapshot rows lie between markers
+  on the captured connection while deferred deltas retain order after BulkEnd.
+  A two-fabric test forces earlier frames onto both connections, delays each
+  receive loop independently, and proves BulkStart is impossible until both
+  connection-bound barrier ACKs arrive. Wrong-fabric ACK, one-fabric
+  replacement/join, timeout, and disconnect retire the whole old transport and
+  cannot retry the window until a new baseline/transport exists.
+  A paused producer at each `queueMessage` entrypoint (normal v4/v6 install,
+  normal delete, delete-journal flush, and sweep replay) loses the race to gate
+  closure and must defer before the barrier; no check/enqueue gap exists.
+  Barrier timeout/disconnect, queue overflow before and after BulkStart, direct
+  write failure, and Stop cancellation all reopen producers, preserve deletes,
+  suppress BulkEnd when required, retire the old transport, and arm
+  repair without deadlock. A bounded post-BulkEnd journal-flush failure keeps
+  `SessionRepairPending` true through scheduling and wire completion; only the
+  follow-up bulk ACK clears it.
+
+  Receive tests require capability 30 on the exact BulkStart connection and
+  prove an old/capability-less sender cannot reconcile, ACK, or release manual
+  readiness. Capability payload tests cover exact version/length/flags,
+  all-zero ID, unknown-bit tolerance, first-in-stream ordering, mutation, and
+  duplicate/replayed advertisements. A matching random process ID across two
+  fabrics is accepted;
+  conflicting IDs never mix and remain unready; injected `crypto/rand` failure
+  advertises no capability and stays fail-closed. Same-connection snapshot
+  frames become membership; concurrent
+  other-fabric incrementals do not. Malformed/refused members, nested start,
+  mismatched end, disconnect, and partial/iterator/delete errors from
+  `ReconcileClusterBulk` all fail the window with no success callback,
+  `bulkEverCompleted`, ACK, readiness release, or debt discharge. A config frame
+  interleaved during the receiving phase aborts the window and applies without a
+  same-loop wait; an other-fabric frame racing an already-started reconcile
+  waits for its lease. An apply already in progress refuses BulkStart without
+  opening a window.
+
+  Recovery-debt tests cover unique request-ID claim, duplicate refusals, nil
+  connection, partial/failed write rearm, disconnect/reconnect retry, and the
+  ABA trace where an old attempt completes after a retry. A request sent while
+  a bulk is active or already on wire but not yet processed cannot bind that
+  bulk; only a later same-transport BulkStart echoing the exact request ID can
+  bind, and its matching echoed valid/reconciled end completes the claimed
+  generation. BulkAck tests reject lower, higher, wrong-request, legacy-length,
+  wrong-fabric, stale-connection, and post-reconnect ACKs; only the exact
+  connection/transport/bulk/request tuple clears the recorded outbound bulk and
+  any send-side repair debt. Concurrent cold-prime/repair/force triggers cannot
+  overwrite one pending ACK; timeout retires the transport and re-arms the exact
+  claimed request. A newer refusal leaves newer debt and emits another request.
+  Type-29/30 uniqueness, old-peer unknown-message behavior, sender
+  `forceResync` coalescing, readiness fields/reason ordering, and failed-G ->
+  successful-current-baseline -> qualifying-full-bulk recovery are pinned.
 - **J / address book:** repeated outer blocks, repeated global blocks, duplicate
   legal entries, duplicate illegal names, references to first and later blocks,
   deterministic diagnostics.
@@ -1681,15 +2207,21 @@ adversarial test runs 5/5 without a flake.
   previous-good automatic peer-loss takeover remains available, and refused
   sessions are repaired by the post-success bulk request. Restart/rebind smoke
   also seeds stale active/watchdog values in removed and newly introduced slots
-  and proves they are fenced before publication; reconnect smoke races config
-  baseline with a bulk and proves an invalid bulk cannot reconcile, ACK,
-  release readiness, or clear repair debt.
+  and proves they are fenced before publication. Reconnect smoke queues config
+  on the old connection, drops both fabrics, races its callback with a lower
+  current-peer baseline and bulk, and proves only the current transport clears
+  baseline. A deliberately capability-less sender and invalid/reconcile-failed
+  bulks cannot reconcile, ACK, release readiness, or clear repair debt. A
+  request during an active bulk completes only after the next qualifying bulk;
+  manual transfer stays blocked throughout.
 - K003-07 requires apply/rollback validation proving a rejected commit cannot
   replace the previous helper policy snapshot.
 - K003-03 requires authoritative fake/isolated DNS endpoints with operation
   logs proving every Surface-B delete used the exact same-family updater whose
   `fpb1` matched the row, no cross-family fallback occurred, partial failure
-  retained the old anchor, and no-authority rows caused zero DNS writes.
+  retained the old anchor, and no-authority or failed claim-save rows caused
+  zero DNS writes. Restart with a pre-#2903 Surface-A store must migrate without
+  quarantine or wire delete.
 - K003-11 requires a netns or fake-netlink retry sequence proving the kernel and
   ownership view converge after a transient lookup failure.
 - Control-plane-only display and parser PRs do not require throughput smoke, but
@@ -1736,7 +2268,7 @@ deviation and returns to review.
 
 ## 11. Resolved adversarial decisions
 
-Rounds one through seven closed the design choices rather than delegating them
+Rounds one through eight closed the design choices rather than delegating them
 to implementors:
 
 1. Path A remains the recommendation. The config-heavy workstreams are separate
@@ -1757,7 +2289,10 @@ to implementors:
    definition; zero remains unbound/control. One bound-owner inventory feeds all
    fixed-slot paths. Newly introduced and removed slots are cleared/fenced
    before inventory publication, including process-start replay of persistent
-   pins. Mixed-version high bindings reject fail-safe, block manual transfer,
+   pins. The Rust helper receives one staged full replacement that preserves
+   unchanged slots, omits removed slots, and introduces new slots inactive;
+   retry owns that whole desired generation rather than per-slot patches.
+   Mixed-version high bindings reject fail-safe, block manual transfer,
    preserve previous-good automatic peer-loss takeover with an alarm, and
    require the two-node-view `xpfd check-config` content preflight. The command
    cannot prove artifact freshness; source-of-truth selection and config freeze
@@ -1767,8 +2302,11 @@ to implementors:
    previous updater whose nonempty existing `fpb1` matches the owned row. Anchor
    rotation happens after reconciliation and is deferred while a retained row
    depends on the old endpoint. The expected store surface is validated without
-   a new disk tag, and #6015 claim-only co-owner release occurs before
-   last-claimant authority selection. Fixed-constructor mode preserves its
+   a new disk tag and includes the exact pre-#2903 empty-scope-FQDN Surface-A
+   migration shape. #6015 claim-only co-owner release occurs before
+   last-claimant authority selection and becomes visible to the cross-surface
+   snapshot only after a classified durable-save outcome. Fixed-constructor
+   mode preserves its
    whole-store caller authority for valid empty-fingerprint rows; daemon
    production does not use that seam.
    There is no representative-updater or credential-generation fallback.
@@ -1777,7 +2315,10 @@ to implementors:
    Strict and tolerant input normalize every AST-equivalent `system snmp` form
    with a deprecation warning. Structured client rows preserve equal-prefix
    deny-wins, and multi-source observations prevent an invalid/conflicting
-   occurrence from disappearing in a last-writer fold. Compiler rejection
+   occurrence from disappearing in a last-writer fold. Community observations
+   use redacted paths and first-appearance ordinals, never the secret or a
+   secret-derived identity; the private in-memory reconcile hash remains
+   credential-aware so rotations apply. Compiler rejection
    dominates duplicates. One pure
    runtime evaluation supplies installable users, disjoint rejection union,
    exact counts, operational diagnostics, and listener decisions before Agent
@@ -1819,15 +2360,22 @@ to implementors:
 14. Only the canonical four-key zone-pair AST is accepted. Repository history
     has no authentic legacy nested persistence fixture, so the permissive
     compiler fallback is removed instead of being enshrined by a new fixture.
-15. In the explicitly protected authority-to-receiver direction, one gate
-    linearizes session installs against config apply, blocks reconnect traffic
-    until a successful baseline, and accepts exact applied epochs before
-    per-key bookkeeping. The explicit active/active inverse remains
-    unprotected. A send-side barrier prevents ordinary session deltas from
-    contaminating authoritative bulks. Generation-tracked refusal debt is
-    retried across write failure/reconnect and clears only at a fully valid
-    BulkEnd requested through additive type 29; old peers ignore the request
-    but cannot make readiness falsely green.
+15. In the explicitly protected authority-to-receiver direction, one
+    transport-incarnation gate linearizes session installs against config apply,
+    blocks reconnect traffic until a current-connection baseline, and rejects
+    stale queued/callback completions before they can satisfy it. Per-key and
+    full-set ordering are transport-qualified and never reset by BulkStart. The
+    RG0 production event closes/drains this gate before forwarding actuation;
+    the explicit active/active inverse remains unprotected. Protected legacy
+    zero-epoch sessions are rejected in every path; upgrade documentation
+    requires drain/clear and recreation under a current nonzero generation. A
+    typed, abortable
+    send-side barrier plus capability 30 prevents ordinary session deltas or an
+    old sender from masquerading as an authoritative snapshot. Reconcile error
+    is bulk failure. Unique type-29 request IDs are echoed by a later repair
+    BulkStart/BulkEnd and clear debt only at that exact valid/reconciled end;
+    additive readiness fields keep old-peer or failed-repair states visibly
+    unready.
 
 Manual approval of this plan accepts those product choices. A material change to
 any one returns that child workstream to plan review rather than being improvised
