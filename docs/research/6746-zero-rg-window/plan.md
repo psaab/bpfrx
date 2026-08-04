@@ -1,11 +1,19 @@
 # #6746 — zero-RG → first-RG clustered live apply: LocalDelivery fail-open window (falsification + residual hardening)
 
-**Status: DRAFT v1 — under hostile review (round 1)**
+**Status: DRAFT v2 — round 1 complete (AGY PLAN-READY 1 MINOR + 1 NIT;
+SMR DEMAND-REVISION 1 MAJOR + 3 MINOR + 1 NIT; Codex infra-blocked,
+usage-capped until Aug 10, two documented retries); v2 folds all r1
+findings; under round-2 review**
 
 - Issue: #6746 (opus-review-001 root R02, severity Medium, confidence High)
 - Research base: `ad9591177` (origin/master at worktree creation)
 - Research branch: `research/6746-zero-rg-window` (plan docs only — no
   production code in this branch)
+- v1 @ `cc6860d5d` (r1: AGY PLAN-READY; SMR DEMAND-REVISION — folds below);
+  v2 folds SMR MAJOR-1 (owner_rg>0 premise evidenced), MINOR-1 (deferred
+  path traced), MINOR-2 (empty-sender audit), MINOR-3 (operator-arm
+  interleaving), NIT-1/AGY-MINOR (M2 pin + no-empty-update assertion in
+  §9)
 
 ## 1. Status
 
@@ -103,6 +111,43 @@ sufficient to close the window.
   `owner_rg_id = 1` → `ha_state.get(&1)` → entry exists →
   `is_forwarding_active(now_secs)` false → `HAInactive` → **drop**.
   Fail-closed, precisely because the phantom entry occupies the key.
+- **The `owner_rg = 1` premise, evidenced (SMR r1 MAJOR-1 fold).** The
+  phantom-entry argument depends on the framed "RG-owned interface-NAT
+  local address" resolving with `owner_rg > 0`. The chain has three links,
+  each verified at base: (i) `interface_nat_local_resolution`
+  (`forwarding/nat.rs:137-160`) resolves the destination address to the
+  OWNING interface's ifindex — the map is populated per-interface at
+  `forwarding_build/interfaces.rs:157` (`state.interface_nat_v4.insert(
+  v4.addr(), iface.ifindex)`) for addresses in the NAT-exclusion set;
+  (ii) `owner_rg_for_resolution` → `owner_rg_for_flow` reads the egress
+  row for that ifindex; (iii) the egress row's `redundancy_group` is
+  populated from the snapshot interface at
+  `forwarding_build/interfaces.rs:334` (`redundancy_group:
+  iface.redundancy_group`) — for a reth in RG1 that value is 1. (The
+  `ha.rs:83-85` comment about a historical "RETH RG propagation fix" is
+  why §9 adds a Rust test arm asserting `owner_rg == 1` for an RG1 reth
+  interface-NAT resolution, guarding future propagation regressions.)
+- **Design-permit boundary (stated for blast-radius honesty).** For
+  `LocalDelivery` with `owner_rg_id <= 0`, the gate returns the resolution
+  UNCHANGED (`forwarding/ha.rs:86-94`) even when `ha_state` is non-empty:
+  node-local addresses on non-RG interfaces (management, loopback, plain
+  interfaces) are deliberately not owner-gated — there is no RG to own
+  them. This permit is out of the issue's frame (its trace is explicitly
+  an "RG-owned interface-NAT local address"), but it bounds what
+  "RG-owned" means: only addresses whose owning interface carries
+  `redundancy_group > 0` in the egress row are owner-gated at all.
+- **Empty-sender audit (SMR r1 MINOR-2 fold).** C2 additionally rests on
+  "no path publishes an EMPTY HA set while clustered". The only empty
+  `update_ha_state` sender is `clearHelperHAStateLocked`, and every call
+  site is `!m.clusterHA`-gated: the non-cluster else-branch at
+  `manager_compile.go:391`, the `pendingXSKStartup` `!m.clusterHA` branch
+  at `manager_compile.go:296`, and `retryPendingHAStateClearLocked`
+  (`manager_ha.go:145`: `if !m.pendingHAStateClear || m.clusterHA {
+  return }`). No empty publish is reachable on a clustered node; the
+  helper-side rebuild (`afxdp/ha/state.rs:4`) inserts every supplied group
+  unconditionally, and nothing else mutates `rg_runtime`
+  (`apply_snapshot` never touches it — constructed once at
+  `coordinator/ha_state.rs:39`, stored only from `ha/state.rs`).
 
 ### 3.2 Closing mechanism 2 — a zero-RG cluster node's desired forwarding state is DISARMED (kills C1)
 
@@ -160,27 +205,46 @@ sufficient to close the window.
 
 ### 3.4 Adjacent paths checked and also closed
 
+- **Deferred first-RG commit during XSK startup (SMR r1 MINOR-1 fold).**
+  If the first-RG apply takes the `pendingXSKStartup` early return
+  (`manager_compile.go:269-309` — second-or-later apply while XSK liveness
+  is unproven), the HA block is skipped and the publish resumes later via
+  the poll's `syncSnapshotLocked` (`process_status.go:10`), which sends no
+  HA state at all. The window still does not open: the helper already
+  holds `{0..15 inactive}` from the boot apply's full path (the first
+  apply has `publishedSnapshot == 0`, so `pendingXSKStartup` is false and
+  the boot apply always runs the HA block), nothing clears that map
+  (§3.1's empty-sender audit), and the same poll re-fabricates phantoms
+  (`process_status.go:211-212`) before its tail
+  `syncDesiredForwardingStateLocked` (`process_status.go:243`) arms. The
+  watchdog-sync skip (`newActiveSig == ""` when all groups are inactive)
+  is irrelevant: no publish is needed because the map was never emptied.
 - **Helper restart** (crash/unhealthy): `ensureProcessLocked`
   (`process.go:18`) only respawns inside the locked apply path, which
-  republishes snapshot → HA → arm in the same order. The poll's
-  `syncSnapshotLocked` (`process_status.go:10`) publishes a deferred
-  snapshot without an HA sync, but it runs on the same poll that
-  re-fabricates phantom groups first (`process_status.go:211-212`) and it
-  never sends an *empty* HA set; the arm at the poll tail
-  (`process_status.go:243`) therefore never precedes a non-empty HA map on
-  a clustered node.
+  republishes snapshot → HA → arm in the same order. The helper's
+  packet-path `rg_runtime` starts empty at process construction and is
+  repopulated by the apply's `update_ha_state` before any arm.
 - **RG0-only cluster** (control group configured, no data RGs): the
   RG0-primary node IS armed (RG0 active), but its helper `ha_state` is
   `{0:active, 1..15 inactive phantoms}` — non-empty, and the first-data-RG
   commit resolves RG1 `LocalDelivery` to `HAInactive` via the phantom
-  entry. Fail-closed.
+  entry. The flow-cache path is covered too: `cached_flow_decision_valid`
+  re-runs `enforce_ha_resolution_snapshot` and invalidates on any
+  `HAInactive` transition. Fail-closed.
 - **Standby with data RGs**: armed by design
   ("keep the helper armed on standby HA nodes", `manager_ha.go:376-381`),
   helper `ha_state` non-empty (phantoms + real RGs inactive), RG-owned
   `LocalDelivery` → `HAInactive`. Fail-closed.
-- **Deferred publish during XSK startup** (`pendingXSKStartup` early
-  return, `manager_compile.go:269-309`): resumes via `syncSnapshotLocked`;
-  see above.
+- **Operator-arm interleaving (SMR r1 MINOR-3 fold).** `request chassis
+  ... forwarding arm` (`cli_request_chassis.go:151-158`) and the gRPC
+  diag action (`server_diag_system_action.go:395-415`) let an operator arm
+  forwarding directly, defeating M2 by definition on a zero-RG node. The
+  window still does not open: M1 leaves the helper `ha_state` non-empty
+  (phantoms), and the ctrl gate independently withholds packet delivery —
+  `ctrl.Enabled=1` requires `status.Enabled` plus binding/neighbor
+  readiness plus the 15s `clusterHA` prewarm delay
+  (`maps_sync.go:420-424`), so even an operator-armed helper sees no
+  packets until long after the boot apply's phantom publish. Fail-closed.
 - **cluster→standalone**: `clearHelperHAStateWithDebtEnsureRetryLocked`
   sends an *empty* `update_ha_state`, but only on the non-cluster branch
   where the exemption is the intended standalone posture, and the topology
@@ -350,13 +414,28 @@ regression pin and the documented invariant, not a packet-path change.
    `update_ha_state` (non-empty) precedes any `set_forwarding_state
    {Armed:true}`, and assert the published HA set contains the new RG as
    inactive. Assert `desiredForwardingArmedLocked()==false` after the
-   zero-RG apply and `true` after the first-RG apply.
+   zero-RG apply and `true` after the first-RG apply (the M2 pin — AGY r1
+   MINOR / SMR r1 NIT-1 fold: assert the false value BOTH before and after
+   the zero-RG apply, matching
+   `manager_ha_test.go:786-802`). Add the no-empty-publish assertion
+   (SMR r1 NIT-1): across the whole scripted session, no
+   `update_ha_state` request with an empty group set is sent while
+   `m.clusterHA` is true — this pins §3.1's empty-sender audit against
+   future refactors. Add a deferred-path variant (SMR r1 MINOR-1): force
+   `pendingXSKStartup` on the first-RG apply (pre-set
+   `publishedSnapshot != 0`, `xskLivenessProven=false`) and assert the
+   poll-driven resume still never sends `set_forwarding_state{Armed:true}`
+   before the helper holds a non-empty HA set.
 2. **Rust unit test** (`userspace-dp/src/afxdp/forwarding/ha.rs` tests):
    build a `ForwardingState` with an interface-NAT local address on an
    RG1-owned interface and an `ha_state` of `{1: inactive}` (the phantom
    shape); assert `enforce_ha_resolution_snapshot` maps the `LocalDelivery`
-   resolution to `HAInactive`; control: empty map → permit (standalone);
-   `{1: active-lease}` → permit.
+   resolution to `HAInactive`; controls: empty map → permit (standalone);
+   `{1: active-lease}` → permit. Include the SMR r1 MAJOR-1 guard arm:
+   assert `owner_rg_for_resolution` for that interface-NAT resolution
+   returns 1 (i.e., the egress row's `redundancy_group` propagation is
+   exercised by the test, so a future RG-propagation regression fails
+   loudly instead of silently re-permitting).
 3. **Existing pins re-run**: `TestMergeHAStateFromMapsFabricatesGroupsFrom
    ArrayMap`, `TestDesiredForwardingArmedRequiresDataRGOrActiveLocalOnly
    Group`, `TestClusterTopologyDay2TransitionRejected`,
