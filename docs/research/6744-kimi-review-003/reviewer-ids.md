@@ -357,3 +357,151 @@ union before another immutable review round.
   receiver baseline, and transient tail capacity are now distinct fields.
 
 These are pre-commit design reviews, not formal round-15 verdicts.
+
+### Round 15 - plan commit `47b32a033e756316e5c24ba1e74442e58047968a`
+
+- Immutable checkout:
+  `/home/ps/git/xpf-worktrees/6744-plan-r15-review`; detached, locked, and clean.
+- Round-start issue comment:
+  <https://github.com/psaab/xpf/issues/6744#issuecomment-5172548142>.
+- Codex direct hostile review: process session `37657`; reviewer session
+  `019fc9d0-1acc-7f83-92ac-89ef061a8272`; verdict
+  `PLAN-NEEDS-MAJOR`.
+- AGY direct hostile review: process session `83588`; verdict `PLAN-READY`.
+- Claude Code CLI: process session `38071`; failed before analysis with the
+  account monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent non-Anthropic SMR-method fallback agent:
+  `019fc9d1-0baf-74a2-bc0d-f6e0a82d9ff7`; verdict
+  `PLAN-NEEDS-MAJOR`. This is explicitly not represented as an Anthropic-model
+  review.
+- Round synthesis:
+  <https://github.com/psaab/xpf/issues/6744#issuecomment-5172635027>.
+
+Round 15 did not converge. Codex found that sender-only release/acquire ordering
+was erased by the receiver's mixed 256-operation batch, demotion hid rows before
+the only valid handoff stream could export them, and static-DNAT transition was
+named but operationally unbounded. The independent fallback found that static
+DNAT was not atomic with config promotion, promoted replicas lacked one
+canonical export owner, and same-key ordinary mutations could overlap across
+the two fabrics. AGY returned `PLAN-READY`. Revision 16 incorporates the valid
+union before another immutable review round.
+
+### Revision 16 pre-commit hostile design passes
+
+- Protocol/capacity reviewer agent `019fc9e6-8dd1-73f3-a5c4-5319f5d151f5`
+  performed repeated hostile passes. Its initial pass found same-key releases
+  missing from replacement escrow, contradictory `N+R`/tombstone accounting,
+  persistent groups that could overflow the 384-operation request, and missing
+  cross-fabric tuple-predecessor ordering. After those revisions it returned
+  `PLAN-NEEDS-MAJOR` on five further traces: barrier-before-local-ACK stranded a
+  predecessor; terminal repair could never satisfy local replay; an invariant
+  incorrectly treated descriptor emission as remote proof; a full replacement
+  was impossible at `R=1` because decoded rows charged the ledger too early; and
+  one serial large-group plan deadlocked a two-group swap.
+- Static/dataplane reviewer agent `019fc9e6-8e48-77c2-89d8-db817dd18dcf`
+  performed repeated hostile passes. Its initial pass found mixed-generation
+  XDP/TC readers, an unverifiable predecessor-root fallback, and non-atomic
+  pin/manifest/control publication. After those revisions it returned
+  `PLAN-NEEDS-MAJOR` because historical pinned readers made legacy DNAT deletion
+  non-neutral, a prior-process orphan helper could race lookup/delete, and the
+  promised persisted BPF hash cursor had no crash-safe protocol.
+- The orchestrator independently corrected the capable barrier/ACK layout to
+  the repository's little-endian codec, removed reliance on a nonexistent BPF
+  compare-and-delete primitive, narrowed writes to a typed dynamic-only DNAT
+  API, changed cross-key dependency entries from owners to non-owning waiters,
+  required receiver-side aggregation of every frozen fabric marker before any
+  ACK, and source-verified that the active userspace compiler already discards
+  static-map writes while the separate historical static-NAT maps were never
+  pinned.
+- A later protocol pass found that generation barriers waited only on current
+  mutation owners, so a non-owning descriptor waiter could be omitted and then
+  mutate after ACK. The resulting draft allocates one generation-qualified
+  `receiveBarrierAdmissionToken` in the read loop for every peer-wire lane and
+  preserves it through waiter/dependency/owner transitions until final commit;
+  barrier ACK scans all such tokens through G.
+- A later static/dataplane pass closed the helper-retirement and cursor findings
+  but found the deeper execution-quiescence flaw: replacing an XDP/TC link does
+  not prove an old invocation has exited its RCU read-side critical section, so
+  any in-place legacy DNAT deletion remains unsafe. The draft now performs one
+  side-by-side forward-only migration of the v2 program, session map, and both
+  discriminator-free dynamic-DNAT maps. It populates all v2 maps only from a
+  stable coordinator serial, never reads or mutates old maps as authority,
+  resumes only forward after the durable `forwardOnly` phase, and unpins old
+  objects without lookup/update/delete. Historical invocations retain their
+  kernel references and unchanged bytes until return.
+- The orchestrator then source-verified that the retained userspace dataplane
+  attaches no TC program. The final hook contract now selects the v2 program
+  only for native/generic XDP and detaches every exactly owned legacy TC/TCX
+  reader. A generated complete map-reference manifest, explicit held-FD
+  `MapReplacements`, and full kernel program identities close implicit
+  `PinByName`, pathname-reopen, short-tag, program-ID-reuse, and unclassified-map
+  substitution paths.
+- The integrated migration no longer treats a persisted digest or BPF hash-map
+  iteration order as content proof. A fixed-credit walk requires every actual
+  key/value to match coordinator-derived authority and requires exact
+  cardinality; the stable-slot SHA-256 is diagnostic only.
+- New-process recovery now quarantines every exactly owned prior XDP/TC/TCX
+  hook with map-free typed drop programs before constructing a fresh XDP-only
+  successor from restarted coordinator state. The journal records kernel boot
+  identity and non-renewable `CLOCK_BOOTTIME` deadlines; expiry permits only
+  bounded quarantine until an exact root-only forward-resume command renews the
+  deadline. Old and superseded pins are unlinked only through a held root
+  directory FD after comparing the full journaled object identity.
+- The final protocol pre-commit pass returned `PLAN-NEEDS-MAJOR` because bounded
+  lane storage alone did not supply bounded execution: synchronous receive-loop
+  waiters could occupy both fabrics and prevent the predecessor Deletes that
+  would wake them. The integrated draft now gives each capable transport one
+  startup-owned 64-worker scheduler, an intrusive fixed ready FIFO, a fixed
+  deadline/barrier coordinator, and read loops that only admit and enqueue.
+  Dependency and same-key waiters consume no executor. Stop, replacement, and
+  migration close admission and join the complete scheduler generation;
+  migration additionally requires an empty arena/FIFO and zero ambiguity before
+  map freeze. Its focused re-review of that integrated contract returned
+  `PLAN-READY`.
+- The final static/dataplane pre-commit pass returned `PLAN-NEEDS-MAJOR` on four
+  historical-execution traces. Old XDP/TC programs can mutate session/DNAT maps
+  after hook replacement; the kernel clears PROG_ARRAY targets when the last
+  userspace reference disappears; the current in-place `bpf_link` update loses
+  durable attachment ownership if its fixed alias and final FD close; and the
+  draft had not defined a kernel-authoritative hook inventory. The integrated
+  draft now treats old maps as isolated rather than immutable, pins one complete
+  boot-scoped legacy root/map/PROG_ARRAY/tail-target capsule, gives every active
+  BPF link a proved generation-owned pin before removing a legacy alias, and
+  freezes a two-snapshot union of the root pin tree, BPF link IDs, RTM_GETLINK,
+  RTM_GETTFILTER, Manager handles, and compiled expected hooks. Tests pause real
+  tail-call fixtures before the call, close all ordinary references, permit a
+  late old-only packet mutation, and prove both the historical target and v2
+  isolation across every pin/link/journal crash boundary.
+- Its focused re-review found two remaining kernel-model errors. The historical
+  closure stopped at PROG_ARRAY and missed root -> CPUMAP/DEVMAP program edges
+  plus the CPUMAP program's private tail-call array. It also assigned namespace
+  identity from global `bpf_link_info`, which exposes ifindex but no netns. The
+  intermediate draft walked a generated fixed point over PROG_ARRAY, CPUMAP, DEVMAP,
+  DEVMAP_HASH, ARRAY_OF_MAPS, and HASH_OF_MAPS edges, rejecting unknown
+  program/map-bearing types. Hook discovery performs TCX `BPF_PROG_QUERY` and
+  RTM dumps inside the held namespace, correlates only the returned TCX link IDs
+  to global info, and initially required root-pin/current-Manager proof for an XDP BPF link;
+  same-ifindex cross-netns ambiguity fails closed.
+- The next focused pass correctly rejected that last XDP exception: RTM exposes
+  the program ID and global XDP link info exposes ifindex, but neither binds the
+  link ID to a netns, so even a root pin can name the other namespace's same-
+  ifindex/same-program link. The plan now requires a same-boot durable
+  `{linkID,netns identity,hook,program,pin}` provenance record created before a
+  new attachment becomes ready. A prior-process XDP BPF link without that record
+  cannot be adopted or quarantined online and requires a proved clean reboot.
+  The same pass also found and removed one stale `immutable-old-object` canary;
+  the replacement permits capsule-local packet mutation while rejecting any
+  userspace old-map access or v2/recovery effect. Its final focused re-review of
+  the fixed-point closure, durable XDP namespace provenance/clean-reboot rule,
+  cross-netns substitution test, and isolated-old-object contract returned
+  `PLAN-READY`.
+- The integrated draft also records remote barrier coverage independently of
+  local ACK order; adds a generation-qualified terminal local-replay receipt;
+  makes descriptors explicitly non-proofs; stages 128 incoming rows in the
+  fixed journal and overlays exact old-to-new slot transitions; parks completed
+  large groups before recycling the serial plan; and retires prior helper/socket
+  owners under one inherited lifecycle lease.
+
+These are pre-commit design reviews, not formal round-16 verdicts. The same two
+agents were re-dispatched against the integrated draft before the immutable
+round-16 commit.
