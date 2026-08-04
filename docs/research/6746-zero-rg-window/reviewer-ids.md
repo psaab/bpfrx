@@ -27,9 +27,29 @@
   audit into the plan, operator-arm interleaving; 1 NIT — §9 M2 pin +
   no-empty-update assertion, concurring with AGY's MINOR).
 
-## Round 2 (plan v2)
+## Round 2 (plan v2 @ 12182118f)
 
-- **Codex** — still usage-capped (see round 1); one further documented
-  retry before the final comment.
-- **AGY** — pending dispatch on v2.
-- **Claude SMR** — pending (r2 verifies the v2 folds).
+- **Codex** — third documented dispatch attempt (codex-companion
+  `task --fresh`, full round-2 prompt): identical hard usage-cap error
+  ("try again at Aug 10th, 2026 6:57 AM"). Codex participation this
+  session is not possible; convergence is 2-of-3 (SMR + AGY) per the
+  codex-infra-blocked exception. If Codex reviews post-hoc when the cap
+  lifts and finds a break, the issue reopens.
+- **AGY** — background bash task `bq1yyu92c`, direct `agy
+  --print-timeout 9m --print "$(cat /tmp/agy-6746-r2-prompt.txt)"`;
+  output `/tmp/agy-6746-r2.out`; verdict doc `agy-plan-r2.md`.
+  Verdict: PLAN-READY, zero findings. All six r1 folds
+  PRESENT-AND-ACCURATE; new attack (a) reth VLAN sub-unit egress-RG —
+  closed (interfaces.go:214-218/302 RG inheritance incl. synthetic
+  logical ifindexes; interfaces.rs:326-338 egress row carries RG);
+  new attack (b) post-liveness operator-arm — closed (M1 phantoms
+  persist; first-prewarm 15s delay unconditional on zero-RG nodes).
+- **Claude SMR** — `claude-smr-plan-r2.md`. Verdict: PLAN-READY, zero
+  remaining findings; folds re-verified against source, attacks (a)/(b)
+  independently traced to the same close.
+
+## Convergence
+
+Round 2 terminal: AGY PLAN-READY + SMR PLAN-READY, Codex infra-blocked
+(three documented retries). PLAN-READY at v2, Path A (kill as falsified +
+regression pin; tri-state hardening as a follow-up issue).

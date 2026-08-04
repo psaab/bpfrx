@@ -1,9 +1,10 @@
 # #6746 — zero-RG → first-RG clustered live apply: LocalDelivery fail-open window (falsification + residual hardening)
 
-**Status: DRAFT v2 — round 1 complete (AGY PLAN-READY 1 MINOR + 1 NIT;
-SMR DEMAND-REVISION 1 MAJOR + 3 MINOR + 1 NIT; Codex infra-blocked,
-usage-capped until Aug 10, two documented retries); v2 folds all r1
-findings; under round-2 review**
+**Status: PLAN-READY v2 — converged (round 2: AGY PLAN-READY zero
+findings; Claude SMR PLAN-READY zero remaining findings; Codex
+infra-blocked, hard account usage cap to Aug 10, three documented
+retries — 2-of-3 per the codex-infra-blocked exception); awaiting manual
+approval via `/engineer 6746`**
 
 - Issue: #6746 (opus-review-001 root R02, severity Medium, confidence High)
 - Research base: `ad9591177` (origin/master at worktree creation)
