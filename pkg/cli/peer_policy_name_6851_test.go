@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"sort"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/dataplane"
@@ -126,18 +127,20 @@ func TestCLISanitizePeerHandlesDegenerateShapes_6851(t *testing.T) {
 // Binding it behaviourally needs a live peer dial through c.dialPeer, so it is
 // bound structurally instead.
 //
-// SCOPE: this asserts only that fetchPeerSessions CONTAINS a call to the
-// sanitizer. It does not prove the call precedes every return, it cannot see a
-// sanitizer that was gutted, and it cannot see the argument — measured:
-// `sanitizePeerSessionPolicyNames(nil)` contains the call, bypasses the
-// sanitization entirely, and leaves every package green with the MAJOR fully
-// restored.
+// It asserts the call is present AND that its argument is the value
+// fetchPeerSessions actually returns. The argument half was added after both
+// review legs measured that `sanitizePeerSessionPolicyNames(nil)` contains the
+// call, bypasses sanitization entirely, and left every package green with the
+// MAJOR fully restored — a guard that cannot fire for an edit restoring the
+// exact defect it exists to prevent. The realistic form is not someone typing
+// `nil`; it is a refactor that builds the response in a different local and
+// sanitizes the wrong one, which the argument check catches and a name-only
+// check does not.
 //
-// That residual cell — "call present, argument neutered" — is the same one
-// disclosed for attachPeerSessions in grpcapi, and it is left uncovered
-// deliberately rather than papered over with a guard invented to satisfy a
-// reviewer. The class is covered from two other sides: deleting the call reds
-// this test, and gutting the sanitizer's body reds the behavioural tests above.
+// SCOPE — two residuals genuinely remain, and neither is cheap to close:
+// this does not prove the call precedes every return, and it cannot see a
+// sanitizer whose BODY was gutted. The behavioural tests above cover the second
+// from the other side.
 func TestCLIPeerFetchCallsSanitizer_6851(t *testing.T) {
 	const (
 		file   = "session_filter.go"
@@ -163,20 +166,67 @@ func TestCLIPeerFetchCallsSanitizer_6851(t *testing.T) {
 			"must bring it along rather than silently disarm it", target, file)
 	}
 
+	// The identifiers fetchPeerSessions actually returns (skipping the `nil`
+	// early-error paths). The sanitizer must be handed one of these — sanitizing
+	// anything else leaves the returned response untouched.
+	returned := map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		ret, ok := n.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		for _, r := range ret.Results {
+			if id, ok := r.(*ast.Ident); ok && id.Name != "nil" {
+				returned[id.Name] = true
+			}
+		}
+		return true
+	})
+	if len(returned) == 0 {
+		t.Fatalf("%s returns no named value; this canary keys the sanitizer's argument to "+
+			"what the function returns and cannot check anything otherwise", target)
+	}
+
 	called := false
+	sanitizesReturned := false
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
 			return true
 		}
-		if id, ok := call.Fun.(*ast.Ident); ok && id.Name == helper {
-			called = true
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok || id.Name != helper {
+			return true
+		}
+		called = true
+		if len(call.Args) == 1 {
+			if arg, ok := call.Args[0].(*ast.Ident); ok && returned[arg.Name] {
+				sanitizesReturned = true
+			}
 		}
 		return true
 	})
+
 	if !called {
 		t.Errorf("%s no longer calls %s. The on-box CLI dials the peer directly, so this is "+
 			"its ONLY sanitization point — without it a pre-#4626 peer's first configured "+
 			"policy is printed for every reserved-id session (#6851)", target, helper)
+		return
 	}
+	if !sanitizesReturned {
+		t.Errorf("%s calls %s, but not on a value it returns (returns %v). Sanitizing a "+
+			"different local — or nil — leaves the response the caller renders untouched, "+
+			"which restores the #6851 defect while this canary's call check still passes",
+			target, helper, keysOf(returned))
+	}
+}
+
+// keysOf renders a set deterministically for a failure message.
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
