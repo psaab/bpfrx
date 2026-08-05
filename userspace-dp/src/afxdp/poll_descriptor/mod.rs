@@ -41,7 +41,7 @@ mod filter;
 mod flow_cache_hit;
 mod flow_cache_seed;
 mod flowless_verdict;
-mod frag_assoc;
+pub(in crate::afxdp) mod frag_assoc;
 mod host_inbound_policy;
 mod nat64_icmp_error;
 mod nat_exception;
@@ -56,7 +56,8 @@ use embedded_icmp::{EmbeddedIcmpReversal, try_reverse_embedded_icmp_error};
 use flow_cache_hit::{FlowCacheOutcome, stage_flow_cache_hit};
 use flow_cache_seed::stage_flow_cache_seed;
 use frag_assoc::{
-    flowless_fragment_requires_nat_translation, nat64_consult_forward_fragment_assoc,
+    flowless_fragment_requires_nat_translation, frag_ingress_authority,
+    nat64_consult_forward_fragment_assoc,
     nat64_install_forward_fragment_assoc, nat_consult_forward_fragment_assoc,
     nat_install_forward_fragment_assoc,
 };
@@ -1428,6 +1429,17 @@ pub(super) fn poll_binding_process_descriptor(
                         // override so every zone-pair consumer below (this
                         // site, the NAT scope borrows, and the
                         // MissingNeighbor arm) sees the gated value.
+                        // #5798: capture the RAW zone-encoded fabric ingress stamp
+                        // BEFORE the RG gate shadows it. A fragment-association
+                        // AUTHORITY must be a pure INGRESS property: the gated value
+                        // below is a function of the RESOLUTION, which the non-first
+                        // fragment's CONSULT cannot know — resolving is exactly what
+                        // an association hit short-circuits. Keying install and
+                        // consult on the raw stamp keeps the two symmetric BY
+                        // CONSTRUCTION; stamping the gated value at install while the
+                        // consult can only see the raw one would desynchronize them
+                        // and turn legitimate same-domain fragments into misses.
+                        let frag_authority_zone_override = ingress_zone_override;
                         let ingress_zone_override = gate_fabric_zone_override_on_owner_rg(
                             worker_ctx.forwarding,
                             worker_ctx.ha_state,
@@ -2542,10 +2554,20 @@ pub(super) fn poll_binding_process_descriptor(
                                             // helpers self-gate (NAT64 vs ordinary
                                             // same-family), so exactly one fires for
                                             // a given committed first fragment.
+                                            // #5798: stamp the association with the
+                                            // ingress domain that ADMITTED this first
+                                            // fragment, so only a non-first fragment
+                                            // from the SAME domain can inherit it.
+                                            let frag_authority = frag_ingress_authority(
+                                                worker_ctx.forwarding,
+                                                meta,
+                                                frag_authority_zone_override,
+                                            );
                                             nat64_install_forward_fragment_assoc(
                                                 worker_ctx.forwarding,
                                                 l3_packet,
                                                 meta.addr_family as i32,
+                                                frag_authority,
                                                 &decision,
                                                 now_ns,
                                             );
@@ -2553,6 +2575,7 @@ pub(super) fn poll_binding_process_descriptor(
                                                 worker_ctx.forwarding,
                                                 l3_packet,
                                                 meta.addr_family as i32,
+                                                frag_authority,
                                                 &decision,
                                                 now_ns,
                                             );
@@ -3028,10 +3051,25 @@ pub(super) fn poll_binding_process_descriptor(
                         // unassociated NAT64 fragment fail-closed). The consult is
                         // gated on a non-first fragment carrying a NAT64-decision
                         // cache hit, so no other flowless traffic is touched.
+                        // #5798: consult under THIS fragment's OWN ingress
+                        // authority. A fragment from a different security domain
+                        // that merely reproduces (src, dst, ident) now builds a
+                        // DIFFERENT key, misses, and falls through to the full
+                        // enforcement arm below under its real identity — instead
+                        // of inheriting the first domain's permit + egress + NAT.
+                        // Here `ingress_zone_override` is still the RAW stamp (the
+                        // RG-gated shadow is bound later, in the miss arm), which
+                        // is the same value the install captured.
+                        let frag_authority = frag_ingress_authority(
+                            worker_ctx.forwarding,
+                            meta,
+                            ingress_zone_override,
+                        );
                         nat64_consult_forward_fragment_assoc(
                             worker_ctx.forwarding,
                             l3,
                             meta.addr_family as i32,
+                            frag_authority,
                             now_ns,
                         )
                         // #5689: fall back to the ORDINARY same-family NAT /
@@ -3047,11 +3085,62 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.forwarding,
                                 l3,
                                 meta.addr_family as i32,
+                                frag_authority,
                                 now_ns,
                             )
                         })
                     })
                 {
+                    // #5798 (required-fix #4): an association HIT may inherit the
+                    // first fragment's STATEFUL zone-policy permit + NAT
+                    // translation + egress route — but it must NOT inherit
+                    // per-packet INTERFACE INPUT FILTER semantics. The input
+                    // filter is evaluated per packet, and a non-first fragment
+                    // carries its own L3 identity, so a `from is-fragment then
+                    // discard` (or address / protocol) term must still catch it.
+                    //
+                    // Before this gate the filter ran ONLY in the miss `else`
+                    // branch below, so even a correctly-authority-scoped
+                    // SAME-domain hit skipped it entirely — the authority key
+                    // alone does NOT close this half of the defect.
+                    //
+                    // Evaluated with the SAME inputs, in the same shape, as the
+                    // miss branch's copy below (frame-derived `extra` carrying
+                    // is_fragment + l4_present=false, the RAW pre-RG-gate
+                    // `ingress_zone_override` that site also uses) so hit and
+                    // miss cannot diverge on what the filter sees. Screen /
+                    // IPsec are NOT repeated here: `stage_screen_check` already
+                    // runs earlier in this loop for every packet, hit or miss.
+                    let hit_l3_ctx = crate::afxdp::frame::l3_session_flow_from_meta(meta);
+                    if let Some(l3_flow) = hit_l3_ctx.as_ref() {
+                        let input_eval = evaluate_non_pbr_input_filter(
+                            worker_ctx.forwarding,
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
+                            Some(l3_flow),
+                            meta,
+                            ingress_zone_override,
+                            true,
+                        );
+                        if let Some(cached_log) = input_eval.cached_log {
+                            emit_input_filter_log_match(
+                                worker_ctx.forwarding,
+                                worker_ctx.event_stream,
+                                l3_flow,
+                                meta,
+                                cached_log,
+                                // A flowless deny is always a SILENT drop (no L4
+                                // to synthesize a reject from), so a `then reject`
+                                // term logs the truthful DENY — same contract as
+                                // the miss branch (#3615).
+                                false,
+                                now_ns,
+                            );
+                        }
+                        if input_eval.action != crate::filter::FilterAction::Accept {
+                            binding.scratch.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                    }
                     hit
                 } else {
                     // #6472: NAT64 (cross-family) ICMP error translation

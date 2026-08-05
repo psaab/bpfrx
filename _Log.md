@@ -1,3 +1,62 @@
+## 2026-08-05 — #5798: authority-scope the shared fragment-association cache
+
+- **Timestamp**: 2026-08-05 (fix/5798-nat64-frag-scope)
+- **Action**: STEP-0 against current `origin/master` (ad9591177) confirmed the
+  defect LIVE and WIDER than the issue body says. `Nat64FragKey` was still
+  exactly `{addr_family, src, dst, ident}` (`userspace-dp/src/nat64.rs`), and
+  the consult still sat in an `else if let Some(hit) { hit } else
+  { <input filter / PBR / zone policy> }` arm, so a hit returned the first
+  fragment's whole `SessionDecision` before any enforcement. Three corrections
+  to the issue's framing: (1) PR #6095 merged 2026-07-18, so the bypass now
+  covers ordinary SNAT/DNAT/static-NAT/NPTv6, not just NAT64; (2) every issue
+  #5798 lists as adjacent (#5689, #5146, #5447, #5624, #5467, #2562) is CLOSED,
+  so #5798 is the sole owner; (3) required-fix #1's modularization is already
+  half-done — `poll_descriptor/frag_assoc.rs` exists (#6386). Implemented the
+  PLAN-READY Path A+ from `research/5798-frag-assoc-authority`, both elements:
+  **Element 1** puts the upper-layer protocol AND a new `FragAuthority`
+  (effective logical ingress ifindex + VLAN, effective ingress zone after
+  override, routing instance) in the key, resolved by one SSOT helper
+  (`frag_ingress_authority`) that mirrors `prerouting_ingress_scope` field for
+  field so "same key <=> same enforcement domain" holds by construction. The
+  protocol is read from L3 only (IPv4 byte 9 / the IPv6 Fragment Header's Next
+  Header) — both present in every fragment, so no payload byte is read as L4.
+  The authority uses the RAW pre-RG-gate fabric stamp on BOTH sides: the gated
+  value is a function of the resolution, which the consult cannot know because
+  resolving is exactly what a hit short-circuits. The shard index deliberately
+  stays coarse. **Element 2** runs the per-packet non-PBR input filter on the
+  HIT path, not just the miss branch — the authority key alone leaves a
+  same-domain `from is-fragment then discard` term bypassed. Screen is not
+  repeated (`stage_screen_check` already runs earlier for every packet).
+- **Validation**: four mutations, each with `cargo build` at 0 errors FIRST so
+  every RED is an assertion. M1 constant authority -> 3 key-level tests RED
+  (protocol test correctly stays green). M2 protocol dropped -> the 2 protocol
+  tests RED (authority tests correctly stay green) — each mutation hits only
+  its own dimension. M3 neutralized `frag_ingress_authority` in PRODUCTION ->
+  the end-to-end cross-domain test RED, proving the authority is threaded at
+  the real call sites and not merely present in the key type. M4 neutralized
+  the hit-arm filter drop -> the Element-2 test RED. Restored + `touch`ed after
+  each; GREEN every time. Two honest corrections made during the work: my first
+  end-to-end test asserted the cross-domain drop was the #4617
+  `nat64_frag_dropped` path — measurement showed it is not (this fixture removes
+  the inet6 routes, so a missed fragment dies on no-route), so the claim was
+  replaced with the differential property the test actually proves; and the
+  Element-2 test initially passed VACUOUSLY because the shared NAT64 fixture
+  leaves `flow_{src,dst}_addr` zeroed, which makes `l3_session_flow_from_meta`
+  return None and skips the filter block entirely — caught by probing rather
+  than by trusting the green. Full `cargo test -- --test-threads=1`: 4240
+  passed, 0 failed, exit 0. The concurrent run's single failure is #6819's
+  documented victim (`current_generation_install_and_delete_still_apply_on_
+  poisoned_shared_mutex`), which is red ~60% of runs on pristine ad9591177 and
+  passes here both in isolation and serialized. NOTE: `cargo fmt` reformats 320
+  files on this tree — master is NOT rustfmt-clean — so it must not be run
+  crate-wide; that churn was reverted and only the five touched files kept.
+- **File(s)**: `userspace-dp/src/nat64.rs`,
+  `userspace-dp/src/nat64_tests.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/frag_assoc.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+  `userspace-dp/src/afxdp/tests_nat64_tunnel.rs`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

@@ -10,6 +10,48 @@ use super::*;
 use super::nat_exception::source_nat_would_translate_fragment;
 use super::prerouting_scope::prerouting_ingress_scope;
 
+/// #5798: resolve the INGRESS SECURITY AUTHORITY for a fragment, i.e. the
+/// domain whose enforcement a cached association is allowed to speak for.
+///
+/// This is the SSOT both the install and the consult go through, and it is
+/// deliberately derived from the SAME ingress inputs the flowless enforcement
+/// arm uses — `prerouting_ingress_scope` resolves the logical unit with
+/// `resolve_ingress_logical_ifindex` and lets a fabric/tunnel
+/// `zone_override` win over the unit's configured zone, so this mirrors it
+/// field for field. If the key were derived from different inputs than
+/// enforcement, "same key <=> same enforcement domain" would not hold and the
+/// fix would leak at the seam.
+///
+/// `ingress_vlan_id` is carried even though the LOGICAL ifindex normally
+/// already encodes the unit: `resolve_ingress_logical_ifindex` falls back to
+/// the PHYSICAL ifindex when a unit is unresolvable, and without the VLAN byte
+/// two VLAN siblings on one physical port would collapse onto the same
+/// authority in exactly that fallback. Keeping it closes that residual.
+#[inline]
+pub(in crate::afxdp) fn frag_ingress_authority(
+    forwarding: &ForwardingState,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<u16>,
+) -> crate::nat64::FragAuthority {
+    let physical = meta.ingress_ifindex as i32;
+    let logical =
+        resolve_ingress_logical_ifindex(forwarding, physical, meta.ingress_vlan_id)
+            .unwrap_or(physical);
+    // Zone precedence mirrors prerouting_ingress_scope: a fabric-encoded
+    // override wins, else the LOGICAL unit's configured zone (#5802). An
+    // unzoned ingress resolves to 0, which is itself a distinct authority —
+    // an unzoned interface must not inherit a zoned interface's permit.
+    let zone = ingress_zone_override
+        .or_else(|| forwarding.ifindex_to_zone_id.get(&logical).copied())
+        .unwrap_or(0);
+    crate::nat64::FragAuthority {
+        ingress_ifindex: logical as u32,
+        ingress_vlan_id: meta.ingress_vlan_id,
+        ingress_zone: zone,
+        routing_table: meta.routing_table,
+    }
+}
+
 /// #2562: on a FIRST NAT64 fragment that translated and will forward, install
 /// the fragment association keyed by `(family, src, dst, ip_id)` so its
 /// non-first fragments inherit `decision` (see `nat64::Nat64FragAssoc`). Gated
@@ -35,6 +77,7 @@ pub(super) fn nat64_install_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
+    authority: crate::nat64::FragAuthority,
     decision: &SessionDecision,
     now_ns: u64,
 ) {
@@ -50,7 +93,7 @@ pub(super) fn nat64_install_forward_fragment_assoc(
     {
         return;
     }
-    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family) {
+    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family, authority) {
         // #5624: stamp the association with the generation of the forwarding
         // state that admitted this first fragment. `build_generation` advances
         // on every config reload, so an association installed here is rejected
@@ -77,12 +120,13 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
+    authority: crate::nat64::FragAuthority,
     now_ns: u64,
 ) -> Option<SessionDecision> {
     if addr_family != libc::AF_INET6 {
         return None;
     }
-    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family)?;
+    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     // #5624: consult under the CURRENT forwarding state's generation. An
     // association installed under a prior generation (before a config commit
     // changed deny/NAT64 rules) is treated as a miss + evicted here, so the
@@ -124,6 +168,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
+    authority: crate::nat64::FragAuthority,
     decision: &SessionDecision,
     now_ns: u64,
 ) {
@@ -139,7 +184,7 @@ pub(super) fn nat_install_forward_fragment_assoc(
     {
         return;
     }
-    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family) {
+    if let Some(key) = crate::nat64::nat64_first_fragment_key(l3_packet, addr_family, authority) {
         forwarding.nat64.frag_assoc.install(
             key,
             *decision,
@@ -186,9 +231,10 @@ pub(super) fn nat_consult_forward_fragment_assoc(
     forwarding: &ForwardingState,
     l3_packet: &[u8],
     addr_family: i32,
+    authority: crate::nat64::FragAuthority,
     now_ns: u64,
 ) -> Option<SessionDecision> {
-    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family)?;
+    let key = crate::nat64::nat64_nonfirst_fragment_key(l3_packet, addr_family, authority)?;
     let (decision, _reverse) =
         forwarding
             .nat64
