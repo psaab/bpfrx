@@ -1,3 +1,48 @@
+## 2026-08-05 — #6735 r3: bind the gate ORDER, and fix two comments the tests disprove
+
+- **Timestamp**: 2026-08-05 (fold/6735-r2 -> fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Gate at 5b3d7e07b found no runtime defect; two non-runtime items.
+
+  **(1) The ordering claim was unbound.** r2 argued the packed-tail gate must
+  run BEFORE the non-empty gate, because they overlap on
+  `interfaces host-inbound-traffic ge-0/0/1.0;` and "names no interface" would
+  misdirect. Nothing tested WHICH gate rejected it — both return non-nil, so a
+  swap kept every test green while the operator silently got the worse message.
+  Worse, the packed-tail message happens to render the same zone / keyword /
+  dropped-token that the r2 assertion checked, because the non-empty message
+  renders those tokens too via `zoneInterfaceStanzaTokens` — so even the
+  three-token assertion could not separate the gates.
+
+  Fixed by giving each gate a named reason constant
+  (`zoneInterfacePackedTailReason`, `zoneInterfacesNonEmptyReason`) used
+  verbatim in its own message, so the rendered text is unchanged but a test can
+  assert gate IDENTITY rather than prose a reword would unbind.
+  `TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate` asserts BOTH
+  directions: the overlap shape must carry the packed-tail reason and NOT the
+  non-empty one, and a genuinely empty stanza must carry the non-empty reason
+  and NOT the packed-tail one. The second half is what stops a "fix" that makes
+  the packed-tail gate swallow everything.
+
+  **(2) Two comments contradicted the shape this PR's own tests pin.** Both said
+  SetPath "stores each member below it", implying a flat fan-out.
+  `TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning` proves otherwise:
+  a flat bracket list NESTS. The load-bearing claim in both places is narrower —
+  the STANZA node's Keys stay exactly `["interfaces"]` — so both now say that,
+  and explicitly disclaim any statement about how members are arranged below it.
+
+  Also repaired structure I broke in r2: the reorder left the #6525 non-empty
+  comment block stranded above the #6735 comment with its own code far below.
+  Each gate's comment now sits with its own code.
+
+- **Tests**: `TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate` (2
+  subtests, 3 cases). Proven by SWAPPING the two gate invocations: RED on the
+  reason assertion with `go build` = 0 and `go vet` = 0 (both orders compile, so
+  this is an assertion red, not a build break), GREEN on restore.
+- **File(s)**: `pkg/config/compiler_validate_strict_zones.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`, `_Log.md`
+
 ## 2026-08-05 — #6735 r2: reject the ambiguous zone-interface packed tail
 
 - **Timestamp**: 2026-08-05 (fold/6735-r2, PR #6735)

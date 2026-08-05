@@ -29,10 +29,15 @@ import (
 //
 // REACHABILITY (honest bound) — of THIS shape, the compact leaf: hierarchical
 // text ingest only, i.e. `load override` / `load merge` / the persisted config
-// file / HA SyncApply. NOT reachable from the `set` CLI (SetPath always makes
-// `interfaces` a container and stores each member below it, pinned by
-// TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf) and `show configuration
-// | display set` round-trips safely. Those are still the boot path and the
+// file / HA SyncApply. NOT reachable from the `set` CLI — SetPath always leaves
+// the STANZA node at Keys=["interfaces"] and puts the members underneath, which
+// is the whole load-bearing claim (pinned by
+// TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf). Note "underneath" is
+// NOT "one child per member": a flat bracket list NESTS
+// (`interfaces -> a -> leaf Keys=["b","c"]`, pinned by
+// TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning). Only the stanza's
+// own Keys tail distinguishes COMPACT from `set`. `show configuration | display
+// set` round-trips safely. Those are still the boot path and the
 // peer-sync path.
 //
 // Do NOT generalize that bound to the whole defect class. The sibling #6735
@@ -277,10 +282,15 @@ security {
 
 // TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf pins the reachability
 // bound this fix is documented under: no `set`-authored config can produce the
-// compact-leaf shape. SetPath descends the `interfaces` wildcard and stores each
-// member BELOW it, so the stanza node's Keys are always exactly ["interfaces"].
-// If that ever changes, the normalization's assumption (a Keys tail on the
-// stanza means the compact-leaf hierarchical shape) needs re-checking.
+// compact-leaf shape. SetPath descends the `interfaces` wildcard and puts the
+// members BELOW it, so the stanza node's Keys are always exactly ["interfaces"]
+// — which is the only property this test asserts, and the only one the
+// normalization depends on. It deliberately says nothing about how the members
+// are ARRANGED below the stanza: a flat bracket list nests them into a chain
+// rather than fanning them out one per child
+// (TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning). If the stanza
+// Keys assumption ever changes, the normalization's premise (a Keys tail means
+// the compact-leaf hierarchical shape) needs re-checking.
 func TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf(t *testing.T) {
 	for _, cmd := range []string{
 		"set security zones security-zone Z interfaces ge-0/0/0",

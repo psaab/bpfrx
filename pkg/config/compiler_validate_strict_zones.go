@@ -592,8 +592,9 @@ func validateZoneInterfacesNonEmptyStrict(tree *ConfigTree) error {
 						continue
 					}
 					return fmt.Errorf(
-						"security zone %q has an `interfaces` stanza (%s) that names no "+
-							"interface; the zone compiles with an EMPTY member set, so every "+
+						"security zone %q has an `interfaces` stanza (%s) "+
+							zoneInterfacesNonEmptyReason+
+							"; the zone compiles with an EMPTY member set, so every "+
 							"interface the stanza was meant to cover is left with no zone — the "+
 							"dataplane never binds it and no policy naming this zone applies to "+
 							"its traffic, while the zone-membership and zone-interface-defined "+
@@ -606,6 +607,26 @@ func validateZoneInterfacesNonEmptyStrict(tree *ConfigTree) error {
 	}
 	return nil
 }
+
+// zoneInterfacePackedTailReason and zoneInterfacesNonEmptyReason are the
+// distinguishing clause of each gate's reject message. They exist so a test can
+// assert WHICH of the two rejected a stanza rather than matching prose that a
+// later reword would silently unbind.
+//
+// This matters for exactly one shape. `interfaces host-inbound-traffic
+// ge-0/0/1.0;` is rejectable by BOTH gates — the keyword is first, so nothing
+// precedes it and the stanza also compiles to zero members — and
+// validateZoneInterfacePackedTailStrict runs FIRST so the operator is told
+// which token was dropped instead of "names no interface", which is true but
+// misdirecting. Nothing about the ORDER is otherwise observable: both paths
+// return a non-nil error, so a test that only asserted "rejected" would stay
+// green with the two gates swapped and the operator would silently get the
+// worse message. TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate
+// asserts on these markers in both directions and is what binds the order.
+const (
+	zoneInterfacePackedTailReason = "the bracket-list and packed-body readings of that statement disagree about zone membership"
+	zoneInterfacesNonEmptyReason  = "that names no interface"
+)
 
 // validateZoneInterfacePackedTailStrict rejects a `security zones security-zone
 // <z> interfaces` stanza in which a body keyword appears on a member's Keys with
@@ -666,8 +687,8 @@ func validateZoneInterfacePackedTailStrict(tree *ConfigTree) error {
 					}
 					return fmt.Errorf(
 						"security zone %q has an `interfaces` stanza (%s) with %q followed by %s; "+
-							"the bracket-list and packed-body readings of that statement disagree about "+
-							"zone membership and the lexer has already stripped the brackets that would "+
+							zoneInterfacePackedTailReason+
+							" and the lexer has already stripped the brackets that would "+
 							"tell them apart, so the compiler silently keeps only the names BEFORE the "+
 							"keyword — a trailing interface is left with no zone (never dataplane-bound, "+
 							"no policy naming this zone applies to it) and a trailing body is discarded "+

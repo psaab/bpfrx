@@ -413,3 +413,73 @@ func TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning(t *testing.T) {
 		t.Fatalf("membership = %v, want %v — the recursion must recover every nested member (#5248)", got, want)
 	}
 }
+
+// TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate binds the GATE
+// ORDER, which nothing else does.
+//
+// `interfaces host-inbound-traffic ge-0/0/1.0;` is rejectable by BOTH gates: the
+// keyword is first, so the truncator keeps nothing and the stanza also compiles
+// to zero members. validateZoneInterfacePackedTailStrict deliberately runs FIRST
+// so the operator is told which token was dropped, instead of "names no
+// interface" — true, but it sends someone who plainly wrote `ge-0/0/1.0` hunting
+// the wrong defect.
+//
+// That ordering was previously unbound. Both gates return a non-nil error for
+// this shape, so every test asserting only "rejected" — including the one in
+// this file — stayed green with the two swapped, and the operator silently got
+// the worse message. Worse, the packed-tail message happens to CONTAIN the zone,
+// the keyword and the dropped token, so even asserting those three does not
+// separate the gates: the non-empty message renders the same tokens via
+// zoneInterfaceStanzaTokens.
+//
+// So this asserts on each gate's distinguishing clause, in BOTH directions:
+// the overlap shape must carry the packed-tail reason and NOT the non-empty
+// reason, and a genuinely empty stanza must carry the non-empty reason and NOT
+// the packed-tail one. The second half is what stops a "fix" that simply makes
+// the packed-tail gate swallow everything.
+//
+// Fail-on-revert: swap the two gate invocations in
+// compiler_uniformgates_cluster_zone.go and the overlap subtest goes RED on the
+// reason assertion (an assertion, not a build break — both orders compile).
+func TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate(t *testing.T) {
+	t.Run("overlap shape reports the packed tail, not the empty stanza", func(t *testing.T) {
+		tree := parseHierarchical(t, zonePackedTailConfig(`interfaces host-inbound-traffic ge-0/0/1.0;`))
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("CompileConfig accepted the overlap shape; both gates should reject it")
+		}
+		if !strings.Contains(err.Error(), zoneInterfacePackedTailReason) {
+			t.Fatalf("overlap shape was rejected by the WRONG gate.\ngot:  %v\nwant it to carry the packed-tail reason: %q\n\nThe packed-tail gate must run BEFORE the non-empty gate: telling an operator who plainly wrote ge-0/0/1.0 that the stanza \"names no interface\" sends them hunting the wrong defect (#6735).",
+				err, zoneInterfacePackedTailReason)
+		}
+		if strings.Contains(err.Error(), zoneInterfacesNonEmptyReason) {
+			t.Fatalf("overlap shape reported the non-empty gate's reason %q as well: %v — the two messages must not be conflated",
+				zoneInterfacesNonEmptyReason, err)
+		}
+	})
+
+	// The other direction. Without this, "make the packed-tail gate fire on
+	// everything" would satisfy the subtest above.
+	t.Run("a genuinely empty stanza still reports the non-empty gate", func(t *testing.T) {
+		for _, stanza := range []string{
+			`interfaces host-inbound-traffic;`,
+			`interfaces { host-inbound-traffic { system-services ssh; } }`,
+		} {
+			t.Run(stanza, func(t *testing.T) {
+				tree := parseHierarchical(t, zonePackedTailConfig(stanza))
+				_, err := CompileConfig(tree)
+				if err == nil {
+					t.Fatalf("CompileConfig accepted %q, which names no interface", stanza)
+				}
+				if !strings.Contains(err.Error(), zoneInterfacesNonEmptyReason) {
+					t.Fatalf("stanza %q was not rejected by the non-empty gate.\ngot:  %v\nwant it to carry %q — the packed-tail gate must not swallow shapes that carry no trailing token",
+						stanza, err, zoneInterfacesNonEmptyReason)
+				}
+				if strings.Contains(err.Error(), zoneInterfacePackedTailReason) {
+					t.Fatalf("stanza %q was rejected by the PACKED-TAIL gate: %v — it has no token after the keyword, so that gate must stay silent (#4191 over-rejection class)",
+						stanza, err)
+				}
+			})
+		}
+	})
+}

@@ -208,22 +208,6 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
-	// #6525 zone-interfaces NON-EMPTY gate. Strict on commit / commit-check
-	// (hard-reject a `security zones security-zone <z> interfaces` stanza that
-	// carries content yet compiles to ZERO members — the hierarchical
-	// compact-leaf spelling `interfaces ge-0/0/1.0;` used to land the member
-	// name on the stanza's own Keys tail, which compileZones never read, so the
-	// zone bound no interface at all and the two gates above passed VACUOUSLY
-	// over the empty member set). Lenient on load / peer-sync (warn so an
-	// already-persisted or peer-synced config still boots — #1960 no-brick; the
-	// stanza contributed no members before this gate existed and still
-	// contributes none, so a leniently-loaded config forwards exactly as
-	// before). Runs on the group-expanded *ConfigTree, not the compiled
-	// *Config, because a compiled ZoneConfig cannot distinguish "no interfaces
-	// stanza" from "a stanza that compiled to nothing". Runs AFTER the
-	// zone-interface defined gate so a typo'd member still wins the first-error
-	// slot; by construction the two cannot both fire on one stanza (this one
-	// fires only on an EMPTY member set, which those two iterate away).
 	// #6735 zone-interface PACKED-TAIL gate. Strict on commit / commit-check
 	// (hard-reject a member statement in which `host-inbound-traffic` is
 	// followed by more tokens on the same Keys — bracket-list and packed-body
@@ -251,6 +235,22 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #6525 zone-interfaces NON-EMPTY gate. Strict on commit / commit-check
+	// (hard-reject a `security zones security-zone <z> interfaces` stanza that
+	// carries content yet compiles to ZERO members — the hierarchical
+	// compact-leaf spelling `interfaces ge-0/0/1.0;` used to land the member
+	// name on the stanza's own Keys tail, which compileZones never read, so the
+	// zone bound no interface at all and the two gates above passed VACUOUSLY
+	// over the empty member set). Lenient on load / peer-sync (warn so an
+	// already-persisted or peer-synced config still boots — #1960 no-brick; the
+	// stanza contributed no members before this gate existed and still
+	// contributes none, so a leniently-loaded config forwards exactly as
+	// before). Runs on the group-expanded *ConfigTree, not the compiled
+	// *Config, because a compiled ZoneConfig cannot distinguish "no interfaces
+	// stanza" from "a stanza that compiled to nothing". Runs AFTER the
+	// zone-interface defined gate so a typo'd member still wins the first-error
+	// slot; by construction the two cannot both fire on one stanza (this one
+	// fires only on an EMPTY member set, which those two iterate away).
 	if err := validateZoneInterfacesNonEmptyStrict(tree); err != nil {
 		if opts.lenientZoneInterfacesNonEmpty {
 			cfg.Warnings = append(cfg.Warnings,
