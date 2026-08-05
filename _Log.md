@@ -1,3 +1,78 @@
+## 2026-08-05 — #5716 (3/3): ring-guard fixtures could not reject a constant advance
+
+- **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening, PR #6832 review fold)
+- **Action**: The four reuse fixtures added in (1/2) drove only one- and
+  two-slot batches through their guards, and two batch sizes cannot separate
+  "advance by the committed count" from "advance by a constant":
+  `base_idx += 1` is correct for every one-slot batch and `base_idx += 2` for
+  every two-slot batch. Measured — each of the four advance sites in
+  `xsk_ffi.rs` mutated to a constant, against the ORIGINAL fixtures:
+
+  | advance site | `+= 1` | `+= 2` |
+  |---|---|---|
+  | `WriteTx::commit` (:1057) | GREEN | RED |
+  | `WriteFill::commit` (:1124) | GREEN | RED |
+  | `ReadRx::release` (:986) | RED | GREEN |
+  | `ReadComplete::release` (:1180) | RED | GREEN |
+
+  A perfect diagonal: every fixture admitted exactly one of the two constants,
+  so each pinned only that SOMETHING happens on the terminal op, not that the
+  cursor moves by the size of the batch the kernel just took.
+
+  Each fixture now drives three DISTINCT batch sizes (`REUSE_BATCHES =
+  [1, 3, 2]`) and asserts the base cursor after EVERY terminal op, not only at
+  the end. Both halves are load-bearing. Three sizes are needed because two
+  cannot discriminate. Asserting after every op is needed because three
+  applications of `+= 2` land on the same FINAL cursor as the correct advance
+  (2+2+2 == 1+3+2) — a constant is invisible to an end-state-only check and
+  shows up only at the intermediate checkpoints. A `const _: () = assert!`
+  pins the three sizes as pairwise distinct so a later tidy-up cannot keep the
+  shape of these fixtures while deleting their substance.
+
+  The batch sizes are producible through the production path: every insert
+  site passes a variable-length slice (`scratch_prepared_tx.len()`,
+  `scratch_fill.len()`, `offsets.len()` plus an arbitrary retry suffix) and
+  every release releases whatever its read loop consumed, so a three-slot
+  batch is an ordinary shape. The REUSE itself is not producible today — that
+  is precisely the forward-looking contract (1/2) states, so the fixture tests
+  the stated contract rather than inventing a shape. Both points are now in
+  the section header comment, since a reader will ask.
+
+  Two `None` assertions previously stood on the reader's failure default.
+  `ReadRx::read` / `ReadComplete::read` have no error path — the only `None`
+  is the `read_count >= peeked` bounds check — so the sole alternative cause
+  of an early `None` is a short peek. Both fixtures now assert
+  `peeked == REUSE_TOTAL` at the peek, which makes the terminal `None` mean
+  exhaustion with exactly one possible cause instead of leaving the reader to
+  assume it.
+
+  Also corrected a false claim in the (1/2) entry below — see the CORRECTION
+  note there.
+
+- **Tests**: the same four fixtures, reshaped. Mutation matrix after the
+  change — all eight cells RED:
+
+  | advance site | `+= 1` | `+= 2` |
+  |---|---|---|
+  | `WriteTx::commit` | RED | RED |
+  | `WriteFill::commit` | RED | RED |
+  | `ReadRx::release` | RED | RED |
+  | `ReadComplete::release` | RED | RED |
+
+  Every RED is an ASSERTION failure at an intermediate base checkpoint, not a
+  build break: `+= 1` dies after batch 2 (`left: 2, right: 4`) and `+= 2` dies
+  after batch 1 (`left: 2, right: 1`), each naming the guard in its message.
+  Mutations are applied BY LINE INDEX, never text substitution — the four
+  advance sites are pairwise byte-identical (`:1057`/`:1124` and
+  `:986`/`:1180`), so a substitution would silently hit the wrong site and
+  measure something other than what it reported. Every leg rebuilds the file
+  from a sha256-pinned pristine snapshot (so mutations cannot compound), and
+  the restore is sha256-verified. The four guard families are exercised by
+  DISJOINT test sets, which is what lets one combined run attribute per site;
+  spot-checked against three independent single-site legs, which agreed
+  cell-for-cell.
+- **File(s)**: `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
+
 ## 2026-08-05 — #5716 (2/2): rejected forwarding build pruned live zone counters
 
 - **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening)
@@ -65,11 +140,20 @@
   `DeviceQueue::push_comp_for_test` hermetic harness helper. The class has
   exactly four members and each is mutated INDEPENDENTLY — a full enumeration,
   not a sample. Each test runs at both `CURSOR_ORIGINS = [0, u32::MAX - 1]`:
-  at the second origin a 4-slot reservation straddles the `u32` wrap, so the
+  at the second origin the reservation straddles the `u32` wrap, so the
   terminal op's `wrapping_add` advance crosses `u32::MAX` mid-guard (libxdp
   masks the index, so a real cursor legitimately wraps). Every test also
-  asserts `cached_prod == *producer` / `cached_cons == *consumer` after drop,
-  which is where an off-by-one in the advance surfaces as a leaked ring slot.
+  asserts `cached_prod == *producer` / `cached_cons == *consumer` after drop.
+  CORRECTION (see the 3/3 entry above): that last pair does NOT catch an
+  off-by-one in the base-cursor advance, as this entry originally claimed —
+  measured, `WriteTx::commit` mutated to a constant `+= 1` left both
+  equalities intact and the whole suite GREEN. What they bind is the terminal
+  op's window bookkeeping (`reserved -= written` / `peeked -= read_count`),
+  because `Drop` cancels `reserved - written`: a terminal op that moved the
+  cursor but left the window unshrunk cancels slots the kernel already owns.
+  The cursor advance itself is bound by the per-batch checkpoints added in
+  3/3. (The bookkeeping half is derived from `Drop`'s arithmetic, not
+  separately mutation-proven — the in-loop `reserved` assertion fires first.)
 - **File(s)**: `userspace-dp/src/xsk_ffi.rs`,
   `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
 

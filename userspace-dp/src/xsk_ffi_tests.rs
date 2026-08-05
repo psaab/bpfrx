@@ -241,6 +241,25 @@ fn read_rx_release_advances_consumer_through_mut_ref() {
 // API-hardening guards: they pin the reuse contract before a caller
 // relies on it. The single-use path is unchanged and still covered by
 // the #2383/#4997 tests above.
+//
+// Two different producibility questions, with two different answers,
+// because someone will ask:
+//
+//   * The BATCH SIZES below are producible exactly as written. Every
+//     production insert passes a variable-length slice
+//     (`scratch_prepared_tx.len()` in tx/transmit/write.rs and four sites
+//     in cos/queue_service/service.rs, `scratch_fill.len()` in
+//     tx/rings.rs, `offsets.len()` plus an arbitrary retry suffix in
+//     bind.rs), and every release releases whatever its
+//     `while let Some(..) = read()` loop consumed (tx/rings.rs,
+//     poll_descriptor/mod.rs). Nothing caps a batch at one or two slots,
+//     so a three-slot batch is an ordinary shape rather than one invented
+//     for the fixture.
+//   * The REUSE ITSELF -- insert -> commit -> insert on one guard -- is
+//     NOT producible today. That is the point: it is the forward-looking
+//     contract this change states, so a fixture for it tests the stated
+//     contract rather than inventing a shape. If a future caller starts
+//     streaming through one guard, these are the tests that hold the line.
 
 /// Seed a producer ring so the next reservation begins at `at`. Lets a test
 /// place the guard's base cursor at the `u32` wrap boundary instead of only
@@ -266,42 +285,126 @@ fn seed_cons_at(ring: &mut XskRingCons, at: u32) {
 }
 
 /// The two cursor origins every reuse test runs at: mid-range (0) and the
-/// `u32` wrap boundary. At `u32::MAX - 1` a 4-slot reservation straddles the
-/// wrap, so the terminal op's `wrapping_add` advance crosses `u32::MAX` mid
-/// guard — the edge of the class these guards claim to cover.
+/// `u32` wrap boundary. At `u32::MAX - 1` the reservation straddles the wrap,
+/// so the terminal op's `wrapping_add` advance crosses `u32::MAX` mid guard —
+/// the edge of the class these guards claim to cover. With [`REUSE_BATCHES`]
+/// the wrap lands *inside* the second batch (indices `u32::MAX`, 0, 1) rather
+/// than between two guards.
 const CURSOR_ORIGINS: [u32; 2] = [0, u32::MAX - 1];
+
+/// Slot count of the hermetic rings the reuse fixtures run on.
+const REUSE_RING_CAPACITY: u32 = 8;
+
+/// The batch sizes each reuse fixture drives through its guard, in order.
+///
+/// Three **distinct** sizes is the load-bearing property, not a stylistic
+/// choice. A fixture built only from 1s and 2s cannot separate "advance by
+/// the committed count" from "advance by a constant": `base_idx += 1` is
+/// correct for every one-slot batch and `base_idx += 2` for every two-slot
+/// batch, so one of the two constants survives. Measured on the pre-#6832
+/// fixtures, each of the four guards admitted exactly one of them —
+/// `WriteTx`/`WriteFill` passed `+= 1`, `ReadRx`/`ReadComplete` passed
+/// `+= 2`. 1 -> 3 -> 2 defeats both.
+///
+/// The fixtures also assert the base cursor after **every** terminal op,
+/// including the last. That is necessary, not belt-and-braces: three
+/// applications of `+= 2` land on the same *final* cursor as the correct
+/// advance (2+2+2 == 1+3+2), so a constant is invisible to an
+/// end-state-only check and is caught only at the intermediate
+/// checkpoints. Delete those and the guard is gone while still looking
+/// like a guard.
+const REUSE_BATCHES: [u32; 3] = [1, 3, 2];
+
+/// Total slots a reuse fixture reserves / peeks: the sum of [`REUSE_BATCHES`].
+const REUSE_TOTAL: u32 = REUSE_BATCHES[0] + REUSE_BATCHES[1] + REUSE_BATCHES[2];
+
+// A later tidy-up that collapsed REUSE_BATCHES to uniform sizes would keep
+// the shape of these fixtures and delete their substance — they would still
+// read as "reuse across a terminal op" while no longer distinguishing a
+// count-sized advance from a constant one. Pin the real character.
+const _: () = assert!(
+    REUSE_BATCHES[0] != REUSE_BATCHES[1]
+        && REUSE_BATCHES[1] != REUSE_BATCHES[2]
+        && REUSE_BATCHES[0] != REUSE_BATCHES[2],
+    "reuse fixtures need three DISTINCT batch sizes to reject a constant advance"
+);
+// Each slot of a run must land in its own ring slot; otherwise a misplaced
+// write could alias onto the very value it was supposed to corrupt.
+const _: () = assert!(REUSE_TOTAL <= REUSE_RING_CAPACITY);
+
+/// Distinct non-zero payload for the `j`-th slot of a reuse run. Monotone in
+/// `j`, and never 0 (the test ring backing is zero-initialised), so a write
+/// that lands on the wrong slot is detectable both at the slot it corrupted
+/// and at the slot it skipped.
+fn reuse_payload(j: u32) -> u64 {
+    0xA000 + j as u64
+}
 
 #[test]
 fn write_tx_insert_after_commit_appends_past_the_committed_slots() {
     for origin in CURSOR_ORIGINS {
-        let mut tx = RingTx::new_for_test(-1, 8);
+        let mut tx = RingTx::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_prod_at(&mut tx.ring, origin);
         let producer = tx.ring.producer;
         let base;
         {
-            let mut w = tx.transmit(4);
+            let mut w = tx.transmit(REUSE_TOTAL);
             base = w.base_idx;
             assert_eq!(base, origin, "reservation must start at the seeded cursor");
-            assert_eq!(w.insert([desc(0xA0)].into_iter()), 1);
-            w.commit();
-            // The commit submitted slot base+0 to the kernel. The reservation
-            // shrinks by the committed count...
-            assert_eq!(w.reserved, 3, "commit must consume the submitted slots");
-            // ...and a further insert must land AFTER it.
-            assert_eq!(w.insert([desc(0xB1), desc(0xC2)].into_iter()), 2);
-            w.commit();
+            assert_eq!(
+                w.reserved, REUSE_TOTAL,
+                "the fixture needs the whole reservation up front — a short \
+                 reserve would silently shrink the batches below"
+            );
+            let mut submitted = 0u32;
+            for n in REUSE_BATCHES {
+                let first = submitted;
+                assert_eq!(
+                    w.insert((0..n).map(|k| desc(reuse_payload(first + k)))),
+                    n,
+                    "origin {origin}: a {n}-descriptor batch did not fit the \
+                     remaining reservation"
+                );
+                w.commit();
+                submitted += n;
+                // The commit handed `n` slots to the kernel, so the cursor must
+                // move by exactly `n`. Asserted after EVERY commit: a constant
+                // advance is invisible at the end (2+2+2 == 1+3+2) and shows up
+                // only here.
+                assert_eq!(
+                    w.base_idx,
+                    base.wrapping_add(submitted),
+                    "origin {origin}: after commits summing to {submitted} slots \
+                     the base cursor did not advance by the committed count"
+                );
+                assert_eq!(
+                    w.reserved,
+                    REUSE_TOTAL - submitted,
+                    "origin {origin}: commit must consume the submitted slots"
+                );
+            }
         }
-        assert_eq!(
-            tx_slot(&tx.ring, base).addr,
-            0xA0,
-            "origin {origin}: post-commit insert overwrote the descriptor the \
-             commit already submitted to the kernel"
-        );
-        assert_eq!(tx_slot(&tx.ring, base.wrapping_add(1)).addr, 0xB1);
-        assert_eq!(tx_slot(&tx.ring, base.wrapping_add(2)).addr, 0xC2);
-        // Both commits reached the kernel-facing producer pointer, and the
+        // Every slot holds its own descriptor: no batch overwrote a predecessor
+        // the kernel already owns, and none skipped a slot.
+        for j in 0..REUSE_TOTAL {
+            assert_eq!(
+                tx_slot(&tx.ring, base.wrapping_add(j)).addr,
+                reuse_payload(j),
+                "origin {origin}: slot {j} does not hold its own descriptor — a \
+                 post-commit insert landed on the wrong slot and corrupted a \
+                 descriptor already submitted to the kernel"
+            );
+        }
+        // Every commit reached the kernel-facing producer pointer, and the
         // drop-time cancel left cached_prod exactly there (no leaked slots).
-        assert_eq!(unsafe { *producer }, base.wrapping_add(3));
+        // NB: this pair binds the terminal op's `reserved -= written`
+        // bookkeeping, NOT the cursor advance — `Drop` cancels
+        // `reserved - written`, so a commit that moved the cursor but left the
+        // reservation unshrunk cancels slots the kernel already owns. A wrong
+        // *cursor* leaves both equalities intact (measured: `+= 1` here was
+        // GREEN before #6832), which is why the per-batch checkpoints above
+        // are the ones that bind it.
+        assert_eq!(unsafe { *producer }, base.wrapping_add(REUSE_TOTAL));
         assert_eq!(tx.ring.cached_prod, unsafe { *producer });
     }
 }
@@ -309,30 +412,56 @@ fn write_tx_insert_after_commit_appends_past_the_committed_slots() {
 #[test]
 fn write_fill_insert_after_commit_appends_past_the_committed_slots() {
     for origin in CURSOR_ORIGINS {
-        let mut dq = DeviceQueue::new_for_test(-1, 8);
+        let mut dq = DeviceQueue::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_prod_at(dq.rings.fill_mut(), origin);
         let producer = dq.rings.fill().producer;
         let base;
         {
-            let mut w = dq.fill(4);
+            let mut w = dq.fill(REUSE_TOTAL);
             base = w.base_idx;
             assert_eq!(base, origin, "reservation must start at the seeded cursor");
-            assert_eq!(w.insert([0xA0u64].into_iter()), 1);
-            w.commit();
-            assert_eq!(w.reserved, 3, "commit must consume the submitted slots");
-            assert_eq!(w.insert([0xB1u64, 0xC2u64].into_iter()), 2);
-            w.commit();
+            assert_eq!(
+                w.reserved, REUSE_TOTAL,
+                "the fixture needs the whole reservation up front — a short \
+                 reserve would silently shrink the batches below"
+            );
+            let mut submitted = 0u32;
+            for n in REUSE_BATCHES {
+                let first = submitted;
+                assert_eq!(
+                    w.insert((0..n).map(|k| reuse_payload(first + k))),
+                    n,
+                    "origin {origin}: a {n}-offset batch did not fit the \
+                     remaining reservation"
+                );
+                w.commit();
+                submitted += n;
+                // Asserted after EVERY commit — see the note in the WriteTx
+                // sibling: a constant advance survives an end-state-only check.
+                assert_eq!(
+                    w.base_idx,
+                    base.wrapping_add(submitted),
+                    "origin {origin}: after commits summing to {submitted} slots \
+                     the base cursor did not advance by the committed count"
+                );
+                assert_eq!(
+                    w.reserved,
+                    REUSE_TOTAL - submitted,
+                    "origin {origin}: commit must consume the submitted slots"
+                );
+            }
         }
         let ring = dq.rings.fill();
-        assert_eq!(
-            fill_slot(ring, base),
-            0xA0,
-            "origin {origin}: post-commit insert overwrote a fill offset already \
-             submitted to the kernel — two RX slots would alias one UMEM frame"
-        );
-        assert_eq!(fill_slot(ring, base.wrapping_add(1)), 0xB1);
-        assert_eq!(fill_slot(ring, base.wrapping_add(2)), 0xC2);
-        assert_eq!(unsafe { *producer }, base.wrapping_add(3));
+        for j in 0..REUSE_TOTAL {
+            assert_eq!(
+                fill_slot(ring, base.wrapping_add(j)),
+                reuse_payload(j),
+                "origin {origin}: slot {j} does not hold its own fill offset — a \
+                 post-commit insert overwrote an offset already submitted to the \
+                 kernel, and two RX slots would alias one UMEM frame"
+            );
+        }
+        assert_eq!(unsafe { *producer }, base.wrapping_add(REUSE_TOTAL));
         assert_eq!(ring.cached_prod, unsafe { *producer });
     }
 }
@@ -340,35 +469,65 @@ fn write_fill_insert_after_commit_appends_past_the_committed_slots() {
 #[test]
 fn read_complete_read_after_release_does_not_re_reap_released_entries() {
     for origin in CURSOR_ORIGINS {
-        let mut dq = DeviceQueue::new_for_test(-1, 8);
+        let mut dq = DeviceQueue::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_cons_at(dq.rings.comp_mut(), origin);
-        for addr in [0xC0u64, 0xC1, 0xC2, 0xC3] {
-            dq.push_comp_for_test(addr);
+        for j in 0..REUSE_TOTAL {
+            dq.push_comp_for_test(reuse_payload(j));
         }
         // Raw pointer captured before the guard borrows the ring (it models
         // kernel-owned mmap state, exactly as `test_cons_ring` sets it up).
         let consumer = dq.rings.comp().consumer;
         assert_eq!(unsafe { *consumer }, origin);
         {
-            let mut r = dq.complete(4);
+            let mut r = dq.complete(REUSE_TOTAL);
             assert_eq!(r.base_idx, origin, "peek must start at the seeded cursor");
-            assert_eq!(r.read(), Some(0xC0));
-            assert_eq!(r.read(), Some(0xC1));
-            r.release();
-            assert_eq!(unsafe { *consumer }, origin.wrapping_add(2));
-            // A reused reader must continue at the THIRD entry. Handing 0xC0
-            // back a second time would recycle one UMEM frame into the fill
-            // ring twice.
+            // Pin the window size at its source. `read()` has no error path —
+            // its only `None` is the `read_count >= peeked` bounds check — so
+            // the sole alternative cause of an early `None` is a short peek.
+            // With `peeked` pinned here, the terminal `None` below means
+            // exhaustion and nothing else.
+            assert_eq!(
+                r.peeked, REUSE_TOTAL,
+                "peek must cover every pushed completion entry"
+            );
+            let mut released = 0u32;
+            for n in REUSE_BATCHES {
+                for k in 0..n {
+                    // A reused reader must continue past what it released.
+                    // Handing an address back twice would recycle one UMEM
+                    // frame into the fill ring twice.
+                    assert_eq!(
+                        r.read(),
+                        Some(reuse_payload(released + k)),
+                        "origin {origin}: entry {} was not reaped in order — a \
+                         reused reader re-read an already-released completion \
+                         address",
+                        released + k
+                    );
+                }
+                r.release();
+                released += n;
+                assert_eq!(
+                    r.base_idx,
+                    origin.wrapping_add(released),
+                    "origin {origin}: after releases summing to {released} entries \
+                     the base cursor did not advance by the released count"
+                );
+                assert_eq!(
+                    unsafe { *consumer },
+                    origin.wrapping_add(released),
+                    "origin {origin}: release did not reach the kernel-facing \
+                     consumer pointer"
+                );
+            }
             assert_eq!(
                 r.read(),
-                Some(0xC2),
-                "origin {origin}: read after release re-reaped an \
-                 already-released completion address"
+                None,
+                "origin {origin}: the peek window was pinned at {} entries above \
+                 and all of them have been read, so the guard must report \
+                 exhaustion",
+                REUSE_TOTAL
             );
-            assert_eq!(r.read(), Some(0xC3));
-            assert_eq!(r.read(), None);
-            r.release();
-            assert_eq!(unsafe { *consumer }, origin.wrapping_add(4));
         }
         // Nothing peeked-but-unread survives: cached_cons matches the real
         // consumer, so no completion-ring slots were leaked.
@@ -379,33 +538,65 @@ fn read_complete_read_after_release_does_not_re_reap_released_entries() {
 #[test]
 fn read_rx_read_after_release_stays_releasable() {
     for origin in CURSOR_ORIGINS {
-        let mut rx = RingRx::new_for_test(-1, 8);
+        let mut rx = RingRx::new_for_test(-1, REUSE_RING_CAPACITY);
         seed_cons_at(&mut rx.ring, origin);
-        for addr in [0xAAu64, 0xBB, 0xCC, 0xDD] {
-            rx.push_for_test(desc(addr));
+        for j in 0..REUSE_TOTAL {
+            rx.push_for_test(desc(reuse_payload(j)));
         }
         let consumer = rx.ring.consumer;
         {
-            let mut r = rx.receive(4);
+            let mut r = rx.receive(REUSE_TOTAL);
             assert_eq!(r.base_idx, origin, "peek must start at the seeded cursor");
-            assert_eq!(r.read().expect("first descriptor").addr, 0xAA);
-            assert_eq!(r.read().expect("second descriptor").addr, 0xBB);
-            r.release();
-            assert_eq!(unsafe { *consumer }, origin.wrapping_add(2));
-            // Keep reading on the same guard. The descriptors advance either
-            // way (the positional cursor was already correct), but the SECOND
-            // release must still reach the kernel-facing consumer: pre-#5716 a
-            // sticky `released` flag swallowed it and those two slots were
-            // leaked for the life of the socket.
-            assert_eq!(r.read().expect("third descriptor").addr, 0xCC);
-            assert_eq!(r.read().expect("fourth descriptor").addr, 0xDD);
-            assert!(r.read().is_none(), "only four descriptors were pushed");
-            r.release();
+            // Same reasoning as the `read_complete_...` sibling: `ReadRx::read`
+            // has no error path either, so pinning `peeked` at its source is
+            // what lets the terminal `is_none()` below mean exhaustion rather
+            // than a short peek.
             assert_eq!(
-                unsafe { *consumer },
-                origin.wrapping_add(4),
-                "origin {origin}: the second release did not advance the \
-                 consumer — the post-release reads are permanently unreleasable"
+                r.peeked, REUSE_TOTAL,
+                "peek must cover every pushed descriptor"
+            );
+            let mut released = 0u32;
+            for n in REUSE_BATCHES {
+                for k in 0..n {
+                    assert_eq!(
+                        r.read()
+                            .expect("descriptor inside the pinned peek window")
+                            .addr,
+                        reuse_payload(released + k),
+                        "origin {origin}: descriptor {} was not read in order",
+                        released + k
+                    );
+                }
+                r.release();
+                released += n;
+                // Two independent failure modes are pinned here, and they are
+                // caught by different assertions. The base cursor catches an
+                // advance that is not the released count. The consumer pointer
+                // catches the pre-#5716 sticky `released` flag, which swallowed
+                // every release after the first and leaked those slots for the
+                // life of the socket — the descriptor reads above do NOT catch
+                // that one, because the positional cursor stayed correct under
+                // it.
+                assert_eq!(
+                    r.base_idx,
+                    origin.wrapping_add(released),
+                    "origin {origin}: after releases summing to {released} \
+                     descriptors the base cursor did not advance by the \
+                     released count"
+                );
+                assert_eq!(
+                    unsafe { *consumer },
+                    origin.wrapping_add(released),
+                    "origin {origin}: a release did not advance the consumer — \
+                     those descriptors are permanently unreleasable"
+                );
+            }
+            assert!(
+                r.read().is_none(),
+                "origin {origin}: the peek window was pinned at {} descriptors \
+                 above and all of them have been read, so the guard must report \
+                 exhaustion",
+                REUSE_TOTAL
             );
         }
         // Drop must land cached_cons on the real consumer. A leak shows up
