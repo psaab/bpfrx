@@ -66736,3 +66736,56 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-05 12:15
+- **Action**: #6722 round 7 — gate corroboration at 8839f9fdf (one head behind
+  the round-6 fix). Three items were still live at ad4f0c113; the fixture /
+  TunnelNameMap finding was already closed in round 6.
+
+  1. PROVENANCE (framing, verified firsthand before accepting). The gate's
+     summary: "already latent in the index-keyed `egress` map; this change does
+     not newly create it, but it fails to enforce the stated invariant and
+     routes more consumers through that incomplete resolver." Confirmed against
+     `origin/master`: `egress_zone_id` there is
+     `self.egress.get(i).map(|i| i.zone_id).unwrap_or(0)` with NO fallback, and
+     `populate_egress` already sourced the row's own zone last-write-wins. So
+     the WireGuard shape already adjudicated `vpnb` on master — #6713 widened
+     the blast radius rather than creating the hole. Recorded in the source
+     comment and the architecture doc so a bisect is not misled. The round-6
+     commit message is left as pushed (a force-push would invalidate the
+     in-flight gate); the caveat lives in the shipping artifact instead.
+
+  2. DOC STRONGER THAN CODE. `docs/userspace-dataplane-architecture.md` said the
+     logged and counted zones "cannot disagree" without the enumeration caveat
+     the source comment already carried. Now says "do not disagree", states that
+     it holds BY ENUMERATION not by construction, names the four pinned sites,
+     and names the zone-accounting readers that are NOT pinned.
+
+  3. HELPER PROVEN, CONSUMER DESCRIBED AS PROVEN. `poll_descriptor/filter.rs`
+     claimed its helper-level test "closes" the production call site; it never
+     drove `emit_cached_output_filter_log_tail`. Added
+     `cached_output_filter_log_reports_the_adjudicated_zone_6722`, which drives
+     the real caller and asserts the EMITTED event.
+
+     Two self-caught defects while writing it, both worth recording because they
+     are the same class the finding is about:
+     - The first version used ONLY the ambiguous ifindex and did NOT bind:
+       after the round-6 fix an ifindex WITH an egress row has a ledger-derived
+       `zone_id`, so the helper and a raw `state.egress` read agree by
+       construction and the revert-the-caller mutation stayed GREEN (18/18).
+       The MAC-less ZONED tunnel is the discriminator — no egress row, so the
+       helper resolves via the #6713 fallback while a raw read yields 0. Test
+       now adjudicates both ifindexes.
+     - Reusing one event-stream handle across both emissions made the second
+       `try_recv` return `Empty` (the stream is stateful per handle). Switched
+       to a fresh handle per emission so the assertion depends on the zone, not
+       on stream internals.
+
+  Guard G (the mutation the finding is about): re-open the `state.egress`-only
+  read INSIDE `emit_cached_output_filter_log_tail`, leaving the helper correct →
+  **1 RED**, the new consumer test ("left: 0 right: 7"), with BOTH
+  direct-helper tests staying GREEN. That green is the evidence: a helper test
+  cannot catch a consumer regression.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md

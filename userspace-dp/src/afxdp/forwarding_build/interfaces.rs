@@ -437,6 +437,15 @@ pub(super) fn populate_egress(
         // identical to the row's own zone, so an ordinary single-unit interface
         // is unaffected.
         //
+        // PROVENANCE, so a bisect is not misled: this ambiguity was already
+        // latent in the index-keyed `egress` map BEFORE #6713/#6722. On
+        // `origin/master` `egress_zone_id` was an `egress`-only read and
+        // `populate_egress` already took the row's own zone last-write-wins, so
+        // the WireGuard shape above already adjudicated `vpnb` there. #6713 did
+        // not create the defect; it added the fallback and routed more
+        // consumers through the same incomplete resolver. This change is what
+        // enforces the invariant across BOTH arms.
+        //
         // This also makes the `Some(0)` short-circuit in `egress_zone_id`
         // correct BY CONSTRUCTION rather than by emission-order luck. The
         // pre-#6722 behaviour pinned by

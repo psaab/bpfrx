@@ -907,6 +907,16 @@ Scope of the fallback:
   source and cannot disagree. Where the rows agree the value is identical to the
   row's own zone, so an ordinary single-unit interface is unaffected.
 
+  **Provenance, stated so a bisect is not misled.** This ambiguity was already
+  latent in the index-keyed `egress` map before #6713/#6722: on `origin/master`
+  `egress_zone_id` was an `egress`-only read and `populate_egress` already
+  sourced the row's own zone last-write-wins, so the WireGuard shape above
+  already adjudicated `vpnb` there. #6713 did not create the defect — it added
+  the fallback and routed more consumers through the same incomplete resolver,
+  widening the blast radius without enforcing the invariant it stated. What the
+  ledger adds is the enforcement: the gate now covers BOTH arms, so the
+  pre-existing case is closed rather than merely narrowed.
+
 - A row that exists carrying `zone_id == 0` still stays 0, so for every ifindex
   that HAS an egress row the resolved to-zone is bit-identical to the pre-#6713
   read. That short-circuit is **load-bearing, not defensive**: a zoned trunk
@@ -925,7 +935,19 @@ Scope of the fallback:
   the flow-cache-hit path via `filter_log_egress_zone_id` and
   `forward_request`'s own independent call), and the local-origin tunnel TX
   path's `SyncedSessionEntry` zones all route through it, so the adjudicated
-  zone and the logged/counted zone cannot disagree.
+  zone and the logged/counted zone do not disagree.
+
+  That holds **by enumeration of the callers, not by construction** — nothing
+  prevents a new site from reading `state.egress` directly and silently
+  reintroducing the #6713 split. Four sites are pinned by tests
+  (`zoned_macless_unit_still_reaches_policy_6713`,
+  `filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713`,
+  `cached_output_filter_log_reports_the_adjudicated_zone_6722` — which drives
+  the production `emit_cached_output_filter_log_tail` rather than the helper —
+  and `build_live_forward_request_logs_a_macless_egress_zone_6713`). The
+  zone-accounting readers (`disposition.rs`, `flow_cache_hit.rs`, the slow path)
+  are **not**, so a direct `state.egress` read added there would not be caught
+  by this suite. Route new consumers through the resolver.
 - The MAC-less interface is still ABSENT from `state.egress`, so nothing on the
   TX path changes: `session_glue::populate_egress_resolution` still leaves
   `src_mac = None` and `tx_ifindex = egress_ifindex` for it, and the packet still
