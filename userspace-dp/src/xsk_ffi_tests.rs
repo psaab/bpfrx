@@ -306,6 +306,18 @@ const REUSE_RING_CAPACITY: u32 = 8;
 /// `WriteTx`/`WriteFill` passed `+= 1`, `ReadRx`/`ReadComplete` passed
 /// `+= 2`. 1 -> 3 -> 2 defeats both.
 ///
+/// DETECTED is not BOUND, and that is why this reshape was necessary rather
+/// than tidy. The constants that *did* red before this change red on
+/// **payload** assertions, never on a cursor one — a re-read descriptor came
+/// back with the wrong address (`read_rx` caught `left: 0xBB` against
+/// `right: 0xCC`). So the cursor advance was not half-covered by the old
+/// fixtures; it was covered nowhere and merely *detected* in two of the
+/// four, through the data a wrong cursor happened to corrupt. That detection
+/// survives only while the aliased slots hold distinguishable payloads, and
+/// it says nothing whatever about the two guards whose surviving constant
+/// left the data intact. The per-batch checkpoints below are the first
+/// assertions in this file to bind the advance itself.
+///
 /// The fixtures also assert the base cursor after **every** terminal op,
 /// including the last. That is necessary, not belt-and-braces: three
 /// applications of `+= 2` land on the same *final* cursor as the correct
