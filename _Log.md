@@ -66654,3 +66654,85 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/tunnel.rs,
   pkg/dataplane/userspace/zone_propagation_6722_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-05 10:40
+- **Action**: #6722 round 6 — the resolver BYPASSED the ledger. Gate returned
+  MERGE-NEEDS-MAJOR at 8839f9fdf on a real runtime fail-open, verified
+  firsthand before folding.
+
+  `ForwardingState::egress_zone_id` reads `state.egress` FIRST and only falls
+  back to `ifindex_unambiguous_zone_id`. `populate_egress` wrote
+  `egress[ifindex].zone_id` from the ROW's own zone, last-write-wins per
+  ifindex. So on an ifindex several differently-zoned rows share, the LAST row
+  decided the to-zone and the agreement ledger was never consulted. Rounds 4-5
+  built the ledger correctly and proved four mutations against it (guards
+  A/B/D/E) — every one of them mutates ledger ARITHMETIC, and not one would
+  have caught this, because the resolver does not depend on the ledger for an
+  ifindex that has an egress row.
+
+  Reachable from a stable, non-racy config:
+
+      set interfaces wg0 tunnel mode wireguard
+      set interfaces wg0 unit 0 family inet address 10.5.5.1/30
+      set interfaces wg0 unit 1 family inet address 10.6.6.1/30
+      set security zones security-zone vpnb interfaces wg0.1
+
+  `TunnelNameMap` (`pkg/config/types.go`) maps every unit WITHOUT its own
+  tunnel stanza onto the interface device — the branch admits WireGuard despite
+  its empty GRE-style `source` — so `wg0`, `wg0.0`, `wg0.1` are ONE ifindex
+  (pinned by `pkg/dataplane/userspace/tunnels_test.go`, all three rows at
+  `LinuxName: "wg0", Ifindex: 42`). All carry `tunnel = true`, so
+  `populate_egress` admits them through `iface.tunnel.then_some([0; 6])` and
+  they DO get egress rows. `buildInterfaceZoneMap` stamps the base row `vpnb`,
+  `wg0.0` is left unzoned, `wg0.1` is zoned and emitted LAST → `egress[42]
+  .zone_id = vpnb` → transit routed out the deliberately-unzoned `wg0.0`
+  matched `from-zone lan to-zone vpnb permit`. Reproduced firsthand BEFORE
+  fixing: the new test red on the parent with "left: 7 right: 0".
+
+  Why the whole ambiguity suite was blind: every #6722 test asserted the
+  ifindex has NO egress row. The fixtures are MAC-less secure tunnels, which
+  by construction never get one, so the suite exercised only the fallback arm.
+
+  FIX, chosen deliberately between the two options. `populate_egress` now takes
+  `zone_id` from `ifindex_unambiguous_zone_id` instead of from the row. Both
+  arms of the resolver derive from ONE source and cannot disagree. Rejected the
+  alternative of gating the read inside `egress_zone_id`: that adds a second
+  map lookup to a per-packet path for no semantic gain. The #2391 unknown-zone
+  integrity check is retained as an explicit reject so an unresolvable zone NAME
+  still fails the snapshot closed.
+
+  Side effect worth recording: this makes the `Some(0)` short-circuit correct BY
+  CONSTRUCTION. `unzoned_interface_with_egress_row_stays_zone_zero_6713` held
+  only because the unzoned unit-0 row happened to be emitted last; reverse the
+  order, as the WireGuard shape does, and the zone won. Same latent
+  order-dependence guard E found in the ledger, one layer down.
+
+  Guard F (the mutation rounds 4-5 could not produce): egress row zone sourced
+  from the row again → **2 RED**, exactly the two new interface-level tunnel
+  tests, 15 others green. Reds through the EGRESS path, which A/B/D/E cannot.
+
+  B3, fixture producibility. My round-5 claim that a third row on one ifindex
+  cannot come from another unit — citing `TunnelNameMap` — was FALSE: I read the
+  per-unit branch (`gr-0-0-0u1`) and missed the interface-level branch directly
+  above it, which does the opposite. The recycling-based multi-row fixtures were
+  also unproducible for a second reason: they omitted base rows
+  `buildInterfaceSnapshots` necessarily emits. Removed all three
+  (`conflict_then_agreement`, `sentinel_before_zoned_row`,
+  `unanimous_three_row`) and their tests; the WireGuard shapes subsume them
+  exactly — `[Z, 0, Z]`, `[0, 0, Z]` and `[Z, Z, Z]` — and are producible AND
+  carry egress rows, which is the interaction that was unproven.
+  `reused_ifindex_snapshot_6722` is kept (two UNRELATED interfaces on a recycled
+  index is a distinct shape) with its missing `st0`/`st1` base rows added.
+
+  Scope control held: `unanimous_iface_tunnel_units_still_reach_policy_6722`
+  (`set security zones security-zone vpnb interfaces wg0`, three agreeing rows)
+  still resolves `vpnb`, Permit, non-default policy id. The gate did not
+  over-tighten into rejecting an ordinary WireGuard deployment.
+
+  Blast radius of the `populate_egress` change: NONE on the existing suite —
+  4248 passed, the only 2 failures being the #6819 poisoned-mutex flake. The
+  difference is observable only where rows on one ifindex disagree.
+- **File(s)**: userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md

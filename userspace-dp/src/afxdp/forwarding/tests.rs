@@ -5619,45 +5619,59 @@ fn reused_ifindex_across_two_zoned_interfaces_resolves_no_zone_6722() {
     );
 }
 
-/// #6722, the ABSORBING-CONFLICT property. Every other fixture puts at most TWO
-/// rows on a shared ifindex, so the agreement fold is only ever driven
-/// `Vacant -> Occupied-same` or `Vacant -> Occupied-different`; a third row
-/// arriving AFTER a conflict was recorded is untested by all of them. Once an
-/// ifindex is known ambiguous, no later row may re-arm it.
-///
-/// Three rows land on ifindex 42 as `vpnb` -> none -> `vpnb`. The third row is
-/// a RECYCLED index on an unrelated netdev, not another unit: `snapshotLinuxName`
-/// collapses only unit ZERO onto the base, so a `st0.2` row would carry its own
-/// ifindex and could never be the third element. See the fixture's provenance
-/// note. Unit 0 is still in no zone and two unrelated interfaces still share
-/// the index, so it names no single zone. A fold that treats the recorded
-/// conflict as merely "no opinion yet" and re-arms on the third row resolves
-/// `vpnb` here and reinstates the exact #6722 fail-open, while leaving every
-/// other test in this file green.
-#[test]
-fn a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722() {
-    let state = build_forwarding_state(&conflict_then_agreement_snapshot_6722());
+// ---------------------------------------------------------------------------
+// #6722 B1: the OTHER arm of `egress_zone_id`.
+//
+// Everything above reaches the fallback, because a MAC-less xfrmi gets no
+// `state.egress` row. But `egress_zone_id` consults `state.egress` FIRST, and
+// `populate_egress` writes that map last-write-wins per ifindex. An
+// interface-level WireGuard tunnel puts several differently-zoned units on ONE
+// ifindex and DOES give them egress rows, so the last row's zone was returned
+// without the agreement ledger ever being read — the #6722 fail-open, intact,
+// underneath a green ambiguity suite.
+//
+// The fix makes `populate_egress` take the egress row's `zone_id` FROM the
+// ledger rather than from the row's own zone, so both arms of the resolver
+// derive from one source and cannot disagree.
+// ---------------------------------------------------------------------------
 
-    // Precondition: THREE rows really do share this ifindex, and the third
-    // agrees with the first. Without that ordering the test is just another
-    // two-row conflict and proves nothing new.
-    let rows_on_shared: Vec<&str> = conflict_then_agreement_snapshot_6722()
-        .interfaces
-        .iter()
-        .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
-        .map(|i| if i.zone.is_empty() { "<none>" } else { "vpnb" })
-        .collect();
-    assert_eq!(
-        rows_on_shared,
-        vec!["vpnb", "<none>", "vpnb"],
-        "precondition: the fold must be driven agree -> conflict -> agree, in \
-         that order, or the absorbing-conflict path is not exercised"
+/// Assert the preconditions that make an interface-level tunnel case
+/// interesting: the ifindex HAS an egress row (so the fallback is NOT what is
+/// under test), and the ledger holds it ambiguous.
+fn assert_egress_row_ambiguous_preconditions_6722(state: &ForwardingState, ifindex: i32) {
+    assert!(
+        state.egress.contains_key(&ifindex),
+        "precondition: ifindex {ifindex} must HAVE an egress row -- that is the \
+         arm this test exists for; without it this is just another fallback test"
     );
+    assert!(
+        !state.ifindex_unambiguous_zone_id.contains_key(&ifindex),
+        "precondition: the ledger must hold ifindex {ifindex} ambiguous, or there \
+         is no disagreement for the egress row to override"
+    );
+}
 
-    assert_ambiguous_ifindex_preconditions_6722(
-        &state,
-        SHARED_TUNNEL_IFINDEX_6722,
-        TEST_SIBLING_VPN_ZONE_ID_6722,
+/// #6722 B1, the fail-open through `state.egress`. `wg0.0` is in NO security
+/// zone; its zoned sibling `wg0.1` shares the ifindex because an
+/// interface-level tunnel's units share the base device. `populate_egress` is
+/// last-write-wins, so the sibling's zone landed in `egress[42].zone_id` and
+/// was returned before the ledger was ever consulted.
+#[test]
+fn unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722() {
+    let state = build_forwarding_state(&wg_iface_tunnel_unzoned_unit_snapshot_6722());
+    assert_egress_row_ambiguous_preconditions_6722(&state, SHARED_TUNNEL_IFINDEX_6722);
+
+    // The specific value the fail-open produced, named so this cannot pass by
+    // resolving some other zone.
+    assert_eq!(
+        state
+            .egress
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
+            .map(|i| i.zone_id)
+            .unwrap_or(0),
+        0,
+        "the egress row of an AMBIGUOUS ifindex must carry the 0 sentinel, not \
+         whichever row `populate_egress` happened to write last"
     );
 
     let (to_id, result) =
@@ -5665,97 +5679,50 @@ fn a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722() {
 
     assert_eq!(
         to_id, 0,
-        "a recorded conflict is ABSORBING: a later row agreeing with the first \
-         must not restore the ifindex to the unambiguous map"
+        "transit out an interface the operator left in NO zone must not be \
+         adjudicated under a sibling unit's zone"
     );
-    assert_ne!(
-        to_id, TEST_SIBLING_VPN_ZONE_ID_6722,
-        "specifically NOT `vpnb` -- the value a re-arming fold would produce"
-    );
+    assert_ne!(to_id, TEST_SIBLING_VPN_ZONE_ID_6722, "specifically NOT `vpnb`");
     assert_eq!(result.action, PolicyAction::Deny);
     assert_eq!(
         result.policy_id,
         crate::policy::DEFAULT_POLICY_SENTINEL_ID,
-        "the verdict must come from the DEFAULT policy"
+        "the verdict must come from the DEFAULT policy, not the sibling's permit"
     );
-
-    // Scope: the sibling that owns its own ifindex is untouched by any of this.
-    let (unit1_to_id, unit1_result) =
-        adjudicate_lan_transit_6722(&state, "192.168.98.7", ZONED_TUNNEL_IFINDEX_6722);
-    assert_eq!(unit1_to_id, TEST_SIBLING_VPN_ZONE_ID_6722);
-    assert_eq!(unit1_result.action, PolicyAction::Permit);
 }
 
-/// #6722, the ZERO SENTINEL arriving FIRST. `sibling_tunnel_units_snapshot_6722`
-/// runs nonzero-then-sentinel on the shared ifindex; this is the mirror order.
-/// A fold that reads a recorded `Some(0)` as "no opinion yet" and lets a later
-/// nonzero row upgrade it is GREEN on every other test in this issue and
-/// resolves `vpnb` here, for an ifindex two unrelated interfaces share.
-///
-/// Order-dependence would be a latent bug even where it happens to give the
-/// operator's answer: `buildInterfaceSnapshots`' row order is not a contract
-/// the Rust side may lean on.
+/// #6722 B1, zero sentinel FIRST with egress rows. Two unzoned rows then a
+/// zoned one: `populate_egress`'s last write is the zone, so relying on
+/// emission order to land 0 -- which is what the pre-#6722 code did -- fails
+/// exactly here.
 #[test]
-fn a_zero_sentinel_row_is_not_upgraded_by_a_later_zoned_row_6722() {
-    let state = build_forwarding_state(&sentinel_before_zoned_row_snapshot_6722());
-
-    // Precondition: the sentinel really does come FIRST, or this is just the
-    // sibling fixture again.
-    let rows_on_shared: Vec<&str> = sentinel_before_zoned_row_snapshot_6722()
-        .interfaces
-        .iter()
-        .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
-        .map(|i| if i.zone.is_empty() { "<none>" } else { "vpnb" })
-        .collect();
-    assert_eq!(
-        rows_on_shared,
-        vec!["<none>", "vpnb"],
-        "precondition: the ZERO sentinel must be recorded BEFORE the nonzero row"
-    );
-
-    assert_ambiguous_ifindex_preconditions_6722(
-        &state,
-        SHARED_TUNNEL_IFINDEX_6722,
-        TEST_SIBLING_VPN_ZONE_ID_6722,
-    );
+fn iface_tunnel_egress_row_is_not_upgraded_by_a_later_zoned_unit_6722() {
+    let state = build_forwarding_state(&wg_iface_tunnel_sentinel_first_snapshot_6722());
+    assert_egress_row_ambiguous_preconditions_6722(&state, SHARED_TUNNEL_IFINDEX_6722);
 
     let (to_id, result) =
         adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
 
     assert_eq!(
         to_id, 0,
-        "a recorded `no zone` must CONFLICT with a later zoned row, not be \
-         upgraded by it"
+        "a zoned row emitted LAST must not decide the zone of an ifindex whose \
+         other rows name none"
     );
-    assert_ne!(to_id, TEST_SIBLING_VPN_ZONE_ID_6722, "not `vpnb`");
     assert_eq!(result.action, PolicyAction::Deny);
-    assert_eq!(
-        result.policy_id,
-        crate::policy::DEFAULT_POLICY_SENTINEL_ID
-    );
+    assert_eq!(result.policy_id, crate::policy::DEFAULT_POLICY_SENTINEL_ID);
 }
 
-/// #6722 scope, the over-trigger edge at THREE rows. "Unanimous" is a universal,
-/// and every other agreement test proves it only over a PAIR. Three rows that
-/// all name `vpnb` must still resolve -- a gate that grew stricter with row
-/// count would deny traffic the operator permitted, which is #6713 again.
+/// #6722 B1 SCOPE control, and the case the gate must NOT over-tighten:
+/// `set security zones security-zone vpnb interfaces wg0` fans out to every
+/// unit, so all three rows on the ifindex agree. An ordinary WireGuard
+/// deployment must keep resolving its zone and matching the operator's permit.
 #[test]
-fn a_unanimous_three_row_ifindex_still_resolves_its_zone_6722() {
-    let state = build_forwarding_state(&unanimous_three_row_ifindex_snapshot_6722());
+fn unanimous_iface_tunnel_units_still_reach_policy_6722() {
+    let state = build_forwarding_state(&wg_iface_tunnel_unanimous_snapshot_6722());
 
-    let rows_on_shared = unanimous_three_row_ifindex_snapshot_6722()
-        .interfaces
-        .iter()
-        .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
-        .count();
-    assert_eq!(
-        rows_on_shared, 3,
-        "precondition: THREE rows must share the ifindex, or this is the \
-         two-row unanimous case already covered"
-    );
     assert!(
-        !state.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
-        "precondition: MAC-less, so the fallback is the only resolver"
+        state.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+        "precondition: an interface-level tunnel HAS an egress row"
     );
     assert_eq!(
         state
@@ -5766,12 +5733,26 @@ fn a_unanimous_three_row_ifindex_still_resolves_its_zone_6722() {
         TEST_SIBLING_VPN_ZONE_ID_6722,
         "three rows that AGREE keep the ifindex in the unambiguous map"
     );
+    assert_eq!(
+        state
+            .egress
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
+            .map(|i| i.zone_id)
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "and the egress row must still carry that zone -- deriving it from the \
+         ledger must not blank an unambiguous interface"
+    );
 
     let (to_id, result) =
         adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
 
     assert_eq!(to_id, TEST_SIBLING_VPN_ZONE_ID_6722);
-    assert_eq!(result.action, PolicyAction::Permit);
+    assert_eq!(
+        result.action,
+        PolicyAction::Permit,
+        "an ordinary WireGuard deployment must keep forwarding"
+    );
     assert_ne!(
         result.policy_id,
         crate::policy::DEFAULT_POLICY_SENTINEL_ID,

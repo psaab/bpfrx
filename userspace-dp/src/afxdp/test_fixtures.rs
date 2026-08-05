@@ -1357,14 +1357,36 @@ pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
+            // BOTH base rows are present: `buildInterfaceSnapshots` emits a base
+            // row for every interface, so a shape that shows only the units is
+            // one the builder never produces. `st1`'s rows carry the RECYCLED
+            // index.
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 1,
+                ..Default::default()
+            },
             tunnel_unit_row_6722(
                 "st0.0",
                 "vpnb",
                 "st0",
                 SHARED_TUNNEL_IFINDEX_6722,
-                0,
+                SHARED_TUNNEL_IFINDEX_6722,
                 "10.5.5.1/30",
             ),
+            InterfaceSnapshot {
+                name: "st1".to_string(),
+                zone: "vpnc".to_string(),
+                linux_name: "st1".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 1,
+                ..Default::default()
+            },
             InterfaceSnapshot {
                 name: "st1.0".to_string(),
                 zone: "vpnc".to_string(),
@@ -1386,81 +1408,84 @@ pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
     }
 }
 
-/// THREE rows on one ifindex, agreeing -> disagreeing -> agreeing again.
+// ---------------------------------------------------------------------------
+// #6722 B1/B2: INTERFACE-LEVEL TUNNEL shapes — several units on ONE ifindex
+// that DO get `state.egress` rows.
+//
+// The xfrmi fixtures above are all MAC-less, so `populate_egress`'s `src_mac`
+// gate denies them an egress row and `egress_zone_id` reaches its fallback.
+// That made the whole ambiguity suite blind to the OTHER arm of the resolver:
+// `self.egress.get(..).map(|i| i.zone_id)` is consulted FIRST, and
+// `populate_egress` writes it last-write-wins per ifindex.
+//
+// A WireGuard interface-level tunnel produces exactly that. `TunnelNameMap`
+// (`pkg/config/types.go`) maps every unit WITHOUT its own tunnel stanza onto
+// the interface device — the branch explicitly admits WireGuard despite its
+// empty GRE-style `source` — so `wg0`, `wg0.0` and `wg0.1` are ONE netdev and
+// one ifindex (pinned by `pkg/dataplane/userspace/tunnels_test.go`, which
+// asserts all three rows at `LinuxName: "wg0", Ifindex: 42`). They carry
+// `tunnel = true`, so `populate_egress` admits them through
+// `iface.tunnel.then_some([0; 6])` rather than a real MAC.
+//
+// My round-5 comment claimed a third row on one ifindex could not come from
+// another unit, citing `TunnelNameMap`'s per-unit branch (`gr-0-0-0u1`). That
+// branch applies only to units that have their OWN tunnel stanza; the
+// interface-level branch does the opposite. The claim was false and it is what
+// hid this arm.
+// ---------------------------------------------------------------------------
+
+fn wg_row_6722(name: &str, zone: &str, address: Option<&str>) -> InterfaceSnapshot {
+    InterfaceSnapshot {
+        name: name.to_string(),
+        zone: zone.to_string(),
+        // Every unit of an interface-level tunnel resolves to the base device.
+        linux_name: "wg0".to_string(),
+        ifindex: SHARED_TUNNEL_IFINDEX_6722,
+        mtu: 1400,
+        tunnel: true,
+        addresses: address
+            .map(|a| {
+                vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: a.to_string(),
+                    scope: 0,
+                }]
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// `[vpnb, none, vpnb]` on one ifindex, WITH egress rows — the #6722 fail-open
+/// reached through `state.egress` instead of through the fallback.
 ///
-/// Every other fixture here puts at most TWO rows on a shared ifindex, which
-/// exercises the agreement fold's `Vacant -> Occupied-same` and
-/// `Vacant -> Occupied-different` transitions but never a third row arriving
-/// AFTER a conflict was recorded. The conflict state must be ABSORBING: once
-/// `zone_agreement[ifx] == None`, no later row may re-arm it. A two-row shape
-/// is STRUCTURALLY incapable of testing that -- it can only enter the state.
+/// ```text
+/// set interfaces wg0 tunnel mode wireguard
+/// set interfaces wg0 unit 0 family inet address 10.5.5.1/30   # no zone REF
+/// set interfaces wg0 unit 1 family inet address 10.6.6.1/30
+/// set security zones security-zone vpnb interfaces wg0.1      # unit 1 only
+/// ```
 ///
-/// PROVENANCE, because a fixture the builder cannot emit is not evidence. A
-/// third row cannot come from another unit: `snapshotLinuxName`
-/// (`pkg/dataplane/userspace/interfaces.go`) collapses only a non-VLAN unit
-/// ZERO onto the base netdev, and `TunnelNameMap` gives unit N>0 its own
-/// device (`gr-0-0-0u1`), so `st0.2` would carry `linux_name = "st0.2"` and a
-/// separate ifindex. The rows below therefore combine the two mechanisms this
-/// PR has already established:
+/// `buildInterfaceZoneMap` stamps the `wg0` BASE row with `vpnb` for the
+/// unit-suffixed reference, `wg0.0` is left in NO zone by the operator, and
+/// `wg0.1` carries `vpnb`. All three share ifindex 42. `populate_egress` is
+/// last-write-wins, so the final row's `vpnb` lands in `egress[42].zone_id` and
+/// `egress_zone_id` returns it WITHOUT consulting the agreement ledger —
+/// transit routed out the deliberately-unzoned `wg0.0` matches
+/// `from-zone lan to-zone vpnb permit`.
 ///
-///   1. `st0` base + `st0.0` share ifindex 42 by the unit-0 collapse;
-///   2. an unrelated `st1.0` lands on 42 by ifindex RECYCLING within one
-///      snapshot -- the kernel reuses an index after a netdev teardown and
-///      `buildLinkSnapshot` resolves each row independently
-///      (`interfaces.go`), the same mechanism
-///      [`reused_ifindex_snapshot_6722`] rests on.
-///
-/// So ifindex 42 is named by `vpnb` (base, via the Go `out[base]` write), then
-/// NONE (`st0.0`, which the operator left unzoned), then `vpnb` again (the
-/// recycled `st1.0`). Unit 0 is still in no zone and two unrelated interfaces
-/// still share the index, so it must stay ambiguous; a fold that re-arms on the
-/// third row hands it `vpnb` and reinstates the #6722 fail-open.
-pub(super) fn conflict_then_agreement_snapshot_6722() -> ConfigSnapshot {
+/// This is also the shape that shows the pre-#6722 `unzoned_interface_with_
+/// egress_row_stays_zone_zero_6713` behaviour was EMISSION-ORDER luck: there
+/// the unzoned unit-0 row happened to be emitted last and 0 won; here a zoned
+/// row is last and the zone wins.
+pub(super) fn wg_iface_tunnel_unzoned_unit_snapshot_6722() -> ConfigSnapshot {
     ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
-            InterfaceSnapshot {
-                name: "st0".to_string(),
-                zone: "vpnb".to_string(),
-                linux_name: "st0".to_string(),
-                ifindex: SHARED_TUNNEL_IFINDEX_6722,
-                mtu: 1400,
-                unit_count: 2,
-                ..Default::default()
-            },
-            tunnel_unit_row_6722(
-                "st0.0",
-                "",
-                "st0",
-                SHARED_TUNNEL_IFINDEX_6722,
-                SHARED_TUNNEL_IFINDEX_6722,
-                "10.5.5.1/30",
-            ),
-            // The THIRD row on ifindex 42, re-agreeing with the FIRST after the
-            // second disagreed. A RECYCLED index on an unrelated netdev -- the
-            // only producible way to get a third row here.
-            InterfaceSnapshot {
-                name: "st1.0".to_string(),
-                zone: "vpnb".to_string(),
-                linux_name: "st1".to_string(),
-                ifindex: SHARED_TUNNEL_IFINDEX_6722,
-                mtu: 1400,
-                addresses: vec![InterfaceAddressSnapshot {
-                    family: "inet".to_string(),
-                    address: "10.9.9.1/30".to_string(),
-                    scope: 0,
-                }],
-                ..Default::default()
-            },
-            tunnel_unit_row_6722(
-                "st0.1",
-                "vpnb",
-                "st0.1",
-                ZONED_TUNNEL_IFINDEX_6722,
-                SHARED_TUNNEL_IFINDEX_6722,
-                "10.6.6.1/30",
-            ),
+            wg_row_6722("wg0", "vpnb", None),
+            wg_row_6722("wg0.0", "", Some("10.5.5.1/30")),
+            wg_row_6722("wg0.1", "vpnb", Some("10.6.6.1/30")),
         ],
         routes: tunnel_routes_6722(),
         default_policy: "deny".to_string(),
@@ -1469,49 +1494,21 @@ pub(super) fn conflict_then_agreement_snapshot_6722() -> ConfigSnapshot {
     }
 }
 
-/// The ZERO SENTINEL arriving FIRST, with a nonzero row after it -- the mirror
-/// of [`sibling_tunnel_units_snapshot_6722`], whose rows on the shared ifindex
-/// run nonzero-then-sentinel.
+/// `[none, none, vpnb]` — the ZERO SENTINEL first, with egress rows.
 ///
-/// The fold must not treat a recorded `Some(0)` as "no opinion yet" and let a
-/// later nonzero row upgrade it. Order-dependence would be a latent bug on its
-/// own: `buildInterfaceSnapshots`' row order is not a contract the Rust side
-/// may lean on.
-///
-/// Producible: the base `st0` row arrives UNZONED (its zone lost a StableZoneID
-/// collision and `quarantineCollidingZones` blanked it), and an unrelated
-/// `st1.0` in a surviving zone lands on the same ifindex by recycling.
-///
-/// `st1.0` carries `10.5.5.1/30` because it is the only addressed row here, and
-/// the shared `tunnel_routes_6722` next hop `10.5.5.2` has to resolve out
-/// ifindex 42 for the transit to be adjudicable at all.
-pub(super) fn sentinel_before_zoned_row_snapshot_6722() -> ConfigSnapshot {
+/// Post-quarantine spelling: the zone that won `out["wg0"]` was the
+/// StableZoneID-colliding one, so the base and unit 0 arrive UNZONED while a
+/// later-sorting sibling keeps its zone. The zoned row is emitted LAST, so
+/// `populate_egress`'s last write is `vpnb` even though two of the three rows
+/// name no zone at all.
+pub(super) fn wg_iface_tunnel_sentinel_first_snapshot_6722() -> ConfigSnapshot {
     ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
-            InterfaceSnapshot {
-                name: "st0".to_string(),
-                zone: String::new(),
-                linux_name: "st0".to_string(),
-                ifindex: SHARED_TUNNEL_IFINDEX_6722,
-                mtu: 1400,
-                unit_count: 1,
-                ..Default::default()
-            },
-            InterfaceSnapshot {
-                name: "st1.0".to_string(),
-                zone: "vpnb".to_string(),
-                linux_name: "st1".to_string(),
-                ifindex: SHARED_TUNNEL_IFINDEX_6722,
-                mtu: 1400,
-                addresses: vec![InterfaceAddressSnapshot {
-                    family: "inet".to_string(),
-                    address: "10.5.5.1/30".to_string(),
-                    scope: 0,
-                }],
-                ..Default::default()
-            },
+            wg_row_6722("wg0", "", None),
+            wg_row_6722("wg0.0", "", Some("10.5.5.1/30")),
+            wg_row_6722("wg0.1", "vpnb", Some("10.6.6.1/30")),
         ],
         routes: tunnel_routes_6722(),
         default_policy: "deny".to_string(),
@@ -1520,47 +1517,28 @@ pub(super) fn sentinel_before_zoned_row_snapshot_6722() -> ConfigSnapshot {
     }
 }
 
-/// THREE rows on one ifindex that ALL agree, so "unanimous" is tested as a
-/// universal over three elements rather than as a pair. The gate must still
-/// resolve: over-triggering here would deny traffic the operator permitted.
+/// `[vpnb, vpnb, vpnb]` — THREE agreeing rows on one ifindex, with egress rows.
 ///
-/// Same producible basis as [`conflict_then_agreement_snapshot_6722`] -- base +
-/// unit-0 collapse, plus a recycled `st1.0` -- with every row in `vpnb`.
-pub(super) fn unanimous_three_row_ifindex_snapshot_6722() -> ConfigSnapshot {
+/// ```text
+/// set interfaces wg0 tunnel mode wireguard
+/// set interfaces wg0 unit 0 family inet address 10.5.5.1/30
+/// set interfaces wg0 unit 1 family inet address 10.6.6.1/30
+/// set security zones security-zone vpnb interfaces wg0        # BARE base ref
+/// ```
+///
+/// A base-named zone reference fans out to every unit, so all three rows carry
+/// `vpnb` and the ifindex names exactly one zone. This is the SCOPE control for
+/// the whole #6722 gate: it must keep resolving `vpnb` and reaching the
+/// operator's permit. Over-tightening into "several rows on one ifindex means
+/// no zone" would deny an ordinary WireGuard deployment.
+pub(super) fn wg_iface_tunnel_unanimous_snapshot_6722() -> ConfigSnapshot {
     ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
-            InterfaceSnapshot {
-                name: "st0".to_string(),
-                zone: "vpnb".to_string(),
-                linux_name: "st0".to_string(),
-                ifindex: SHARED_TUNNEL_IFINDEX_6722,
-                mtu: 1400,
-                unit_count: 1,
-                ..Default::default()
-            },
-            tunnel_unit_row_6722(
-                "st0.0",
-                "vpnb",
-                "st0",
-                SHARED_TUNNEL_IFINDEX_6722,
-                SHARED_TUNNEL_IFINDEX_6722,
-                "10.5.5.1/30",
-            ),
-            InterfaceSnapshot {
-                name: "st1.0".to_string(),
-                zone: "vpnb".to_string(),
-                linux_name: "st1".to_string(),
-                ifindex: SHARED_TUNNEL_IFINDEX_6722,
-                mtu: 1400,
-                addresses: vec![InterfaceAddressSnapshot {
-                    family: "inet".to_string(),
-                    address: "10.9.9.1/30".to_string(),
-                    scope: 0,
-                }],
-                ..Default::default()
-            },
+            wg_row_6722("wg0", "vpnb", None),
+            wg_row_6722("wg0.0", "vpnb", Some("10.5.5.1/30")),
+            wg_row_6722("wg0.1", "vpnb", Some("10.6.6.1/30")),
         ],
         routes: tunnel_routes_6722(),
         default_policy: "deny".to_string(),

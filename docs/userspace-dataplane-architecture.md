@@ -885,16 +885,41 @@ Scope of the fallback:
   post-quarantine unzoned base beside a surviving zoned child — so the
   userspace-dp fixtures modelling these shapes cannot drift to a snapshot the
   builder cannot emit.
+- **The egress row's `zone_id` comes from the ledger too (#6722 B1).**
+  `egress_zone_id` reads `state.egress` BEFORE the fallback, and
+  `populate_egress` writes that map **last-write-wins per ifindex**. While the
+  row's own zone was the source, a zoned row emitted last re-armed an ifindex
+  the ledger held ambiguous and the gate was bypassed entirely — the to-zone
+  never consulted the ledger at all.
+
+  That is not confined to MAC-less interfaces. An interface-level WireGuard
+  tunnel maps EVERY unit onto the base device (`TunnelNameMap`,
+  `pkg/config/types.go`, whose interface-level branch explicitly admits
+  WireGuard despite its empty GRE-style `source`), so `wg0`, `wg0.0` and
+  `wg0.1` are one netdev and one ifindex; they carry `tunnel = true`, so
+  `populate_egress`'s `src_mac` gate admits them via
+  `iface.tunnel.then_some([0; 6])` and they DO get egress rows. Zone only
+  `wg0.1` and transit routed out the deliberately-unzoned `wg0.0` matched
+  `from-zone lan to-zone vpnb permit`.
+
+  `populate_egress` therefore takes `zone_id` from
+  `ifindex_unambiguous_zone_id`, so both arms of the resolver derive from one
+  source and cannot disagree. Where the rows agree the value is identical to the
+  row's own zone, so an ordinary single-unit interface is unaffected.
+
 - A row that exists carrying `zone_id == 0` still stays 0, so for every ifindex
   that HAS an egress row the resolved to-zone is bit-identical to the pre-#6713
-  read. That short-circuit is **load-bearing, not defensive**. `populate_egress`
-  is last-write-wins across snapshot rows, so a zoned trunk with a declared but
-  unzoned unit 0 (`ge-0/0/9` zoned `lan`, `ge-0/0/9.0` in no zone, both MAC-ful,
-  both ifindex 90) ends up with `egress[90].zone_id == 0` while
-  `ifindex_to_zone_id[90] == lan`. Deleting the short-circuit changes the
-  adjudicated to-zone of every such interface;
-  `unzoned_interface_with_egress_row_stays_zone_zero_6713` builds exactly that
-  shape and reds on the removal.
+  read. That short-circuit is **load-bearing, not defensive**: a zoned trunk
+  with a declared but unzoned unit 0 (`ge-0/0/9` zoned `lan`, `ge-0/0/9.0` in no
+  zone, both MAC-ful, both ifindex 90) must resolve 0, and
+  `unzoned_interface_with_egress_row_stays_zone_zero_6713` reds on its removal.
+
+  Before #6722 B1 that outcome held only by EMISSION-ORDER luck — the unzoned
+  unit-0 row happened to be written last, so 0 won the last-write. Reverse the
+  order, as the WireGuard shape does, and the zone won instead. Sourcing the
+  egress row's zone from the ledger makes the short-circuit correct **by
+  construction**: an ifindex whose rows disagree carries 0 regardless of which
+  row the builder emits last.
 - `egress_zone_id` is the single egress-zone resolver: policy adjudication, the
   #3651 per-zone traffic counter, the filter-log `egress_zone_id` field (both
   the flow-cache-hit path via `filter_log_egress_zone_id` and

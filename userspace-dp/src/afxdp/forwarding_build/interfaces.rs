@@ -104,11 +104,12 @@ pub(super) fn populate_interfaces(
         // that happens to agree with the FIRST one cannot re-arm an ifindex
         // already known ambiguous. Rewriting it as
         // `if let Some(existing) = *slot.get() { ... } else { re-arm }` is
-        // green on every two-row fixture and reinstates the #6722 fail-open on
-        // a three-row one (`vpnb` -> unzoned -> `vpnb`);
-        // `a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722` is
-        // the only test that catches it, and it is the only test in this issue
-        // with three rows on one ifindex.
+        // green on every TWO-row fixture — two rows can only ENTER the state,
+        // never attempt to re-arm it — and reinstates the #6722 fail-open on a
+        // three-row one. The interface-level WireGuard fixtures are the
+        // three-row shapes that catch it
+        // (`unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722`,
+        // `vpnb` -> unzoned -> `vpnb` on one ifindex).
         //
         // The ledger is fed ONLY by what a row literally carries, never by the
         // child→parent propagation below, so it says what the SNAPSHOT said
@@ -403,20 +404,51 @@ pub(super) fn populate_egress(
         // #921: resolve zone name → u16 at build time.
         // #2391: a non-empty zone name absent from the zone table fails CLOSED
         // (consistent with populate_interfaces); an empty zone (unzoned
-        // interface) maps to 0, the legitimate "no zone" case.
-        let zone_id = if iface.zone.is_empty() {
-            0
-        } else {
-            match state.zone_name_to_id.get(&iface.zone).copied() {
-                Some(id) => id,
-                None => {
-                    return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
-                        interface: iface.name.clone(),
-                        zone: iface.zone.clone(),
-                    });
-                }
-            }
-        };
+        // interface) maps to 0, the legitimate "no zone" case. Kept as the
+        // integrity check even though the value below comes from the ledger:
+        // an unresolvable zone NAME must still reject the snapshot here.
+        if !iface.zone.is_empty() && !state.zone_name_to_id.contains_key(&iface.zone) {
+            return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
+                interface: iface.name.clone(),
+                zone: iface.zone.clone(),
+            });
+        }
+        // #6722 B1: take the row's zone from the AGREEMENT LEDGER, not from the
+        // row itself. `state.egress` is keyed by ifindex and written
+        // last-write-wins, so several units sharing one ifindex each overwrite
+        // the previous row's zone and the FINAL row decides — and
+        // `ForwardingState::egress_zone_id` reads this map BEFORE the ledger.
+        // Sourcing it from the row would therefore let a zoned sibling re-arm
+        // an ifindex the ledger holds ambiguous, entirely bypassing the #6722
+        // gate.
+        //
+        // That is not hypothetical and it is not limited to MAC-less xfrmis. An
+        // interface-level WireGuard tunnel maps EVERY unit onto the base device
+        // (`TunnelNameMap`, `pkg/config/types.go` — the branch admits WireGuard
+        // despite its empty GRE-style `source`), and those rows carry
+        // `tunnel = true`, so the `src_mac` gate above admits them via
+        // `iface.tunnel.then_some([0; 6])` and they DO get egress rows. Zone
+        // only `wg0.1` and the last write puts its zone on the ifindex that
+        // unzoned `wg0.0` shares.
+        //
+        // The ledger is absent for an ifindex whose rows disagree AND for one
+        // whose rows unanimously name no zone; both must resolve 0, so a plain
+        // `unwrap_or(0)` is exactly right. Where the rows AGREE the value is
+        // identical to the row's own zone, so an ordinary single-unit interface
+        // is unaffected.
+        //
+        // This also makes the `Some(0)` short-circuit in `egress_zone_id`
+        // correct BY CONSTRUCTION rather than by emission-order luck. The
+        // pre-#6722 behaviour pinned by
+        // `unzoned_interface_with_egress_row_stays_zone_zero_6713` — a zoned
+        // trunk with an unzoned unit 0 landing on 0 — held only because the
+        // unzoned row happened to be emitted last. Reverse the order, as the
+        // WireGuard shape does, and the zone won instead.
+        let zone_id = state
+            .ifindex_unambiguous_zone_id
+            .get(&iface.ifindex)
+            .copied()
+            .unwrap_or(0);
         state.egress.insert(
             iface.ifindex,
             EgressInterface {
