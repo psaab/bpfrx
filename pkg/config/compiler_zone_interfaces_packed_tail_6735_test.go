@@ -97,6 +97,22 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 				stanza:   `interfaces host-inbound-traffic ge-0/0/1.0;`,
 				wantLost: "ge-0/0/1.0",
 			},
+			{
+				// A body-only block is NOT automatically silent here, which is
+				// the correction this row pins. `system-services ssh` sits on
+				// the SAME Keys as the keyword, so it is a tail and this gate
+				// fires. Only the NESTED-block spelling
+				// `interfaces { host-inbound-traffic { system-services ssh; } }`
+				// — where the body's tokens are the keyword node's CHILDREN and
+				// its own Keys tail is empty — stays silent and falls through to
+				// the non-empty gate; that one is pinned by the sibling subtest
+				// in TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate.
+				// Without this row the two spellings look interchangeable and
+				// the gate's own doc comment said so.
+				name:     "body-only block packed onto the member's Keys",
+				stanza:   `interfaces { host-inbound-traffic system-services ssh; }`,
+				wantLost: "system-services ssh",
+			},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -126,12 +142,28 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 			stanza string
 			want   []string
 			// wantHIB is the per-interface host-inbound override the stanza
-			// must compile, keyed by member name. Asserting membership ALONE
-			// would let this table stay green while the override silently
-			// vanished — and two of these spellings are exactly what the reject
-			// message tells the operator to migrate INTO, so "it still
-			// compiles" has to mean the body compiles too, not just the names.
-			wantHIB []string
+			// must compile: member name -> the admission tokens that member
+			// ends up carrying, in compiled order. Two of these spellings are
+			// exactly what the reject message tells the operator to migrate
+			// INTO, so an accepted spelling has to admit what the operator
+			// wrote — not merely produce an entry under the right key.
+			//
+			// The VALUE is asserted, not just the key, because an override that
+			// compiles to a keyed-but-EMPTY HostInboundTraffic is the failure
+			// DEFAULT of this path: a body that parsed to nothing still leaves
+			// an entry behind. Measured — with cloneHostInbound(hib) replaced by
+			// &HostInboundTraffic{} (keys intact, values emptied) the key-only
+			// form of this assertion stayed GREEN, i.e. it was green for exactly
+			// the regression it names. Under the token form it goes RED.
+			//
+			// SCOPE, also measured, so nobody reads more into this than it
+			// carries: this assertion does NOT independently bind the override.
+			// That same empty-value edit reds 26 assertions that predate this
+			// branch (#6391 ×9, #5248, #3362, #3703, #4544, #4818, #3226,
+			// #4455), which already pin override CONTENT for these very shapes.
+			// It is here so the accept table states what it means; the binding
+			// is done elsewhere. See the mutation table in _Log.md.
+			wantHIB map[string][]string
 		}{
 			{
 				name:   "single compact member",
@@ -155,19 +187,36 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 				name:    "member with a body block",
 				stanza:  `interfaces ge-0/0/0.0 { host-inbound-traffic { system-services ssh; } }`,
 				want:    []string{"ge-0/0/0.0"},
-				wantHIB: []string{"ge-0/0/0.0"},
+				wantHIB: map[string][]string{"ge-0/0/0.0": {"system-services=ssh"}},
 			},
 			{
-				name:    "bracket members with a shared body block",
-				stanza:  `interfaces [ ge-0/0/0.0 ge-0/0/1.0 ] { host-inbound-traffic { system-services ssh; } }`,
-				want:    []string{"ge-0/0/0.0", "ge-0/0/1.0"},
-				wantHIB: []string{"ge-0/0/0.0", "ge-0/0/1.0"},
+				// A MULTI-token body on a bracket membership: both members get
+				// it, each with the full token set in authored order. The extra
+				// tokens are not decoration — a single-token body cannot tell a
+				// correct fan from one that keeps only the first service, and
+				// the two members cannot tell a correct clone from a shared
+				// backing store unless both carry the same non-trivial content.
+				name:   "bracket members with a shared body block",
+				stanza: `interfaces [ ge-0/0/0.0 ge-0/0/1.0 ] { host-inbound-traffic { system-services [ ssh ping ]; protocols ospf; } }`,
+				want:   []string{"ge-0/0/0.0", "ge-0/0/1.0"},
+				wantHIB: map[string][]string{
+					"ge-0/0/0.0": {"system-services=ssh", "system-services=ping", "protocols=ospf"},
+					"ge-0/0/1.0": {"system-services=ssh", "system-services=ping", "protocols=ospf"},
+				},
 			},
 			{
 				// Keyword with NOTHING after it: truncation loses nothing, so
 				// rejecting would be the #4191 over-rejection class. The packed
 				// body is NOT parsed into an override here — fail-CLOSED, the
 				// residual #6525 left open — so wantHIB is deliberately nil.
+				//
+				// This row is the one accept case with a DISTINGUISHING
+				// mutation, measured: widening the detector to fire whenever the
+				// keyword is not first (`i > 0 || len(tail) > 0`) reds this row
+				// and NOTHING else in the package. The obvious wider mutation —
+				// firing on any body keyword regardless of tail — is not the
+				// one to cite: it also reds pre-existing #6525 assertions, so it
+				// proves nothing about this row.
 				name:   "keyword last, empty body",
 				stanza: `interfaces ge-0/0/0.0 host-inbound-traffic;`,
 				want:   []string{"ge-0/0/0.0"},
@@ -184,13 +233,42 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 				if got := cfg.Security.Zones["Z"].Interfaces; !reflect.DeepEqual(got, tc.want) {
 					t.Fatalf("stanza %q compiled membership %v, want %v", tc.stanza, got, tc.want)
 				}
-				if got := hibKeys6525(cfg.Security.Zones["Z"].InterfaceHostInbound); !reflect.DeepEqual(got, tc.wantHIB) {
-					t.Fatalf("stanza %q scoped the per-interface host-inbound override to %v, want %v — the reject message tells operators to rewrite INTO the block spelling, so accepting it must also mean its body still compiles",
+				if got := hibTokens6735(cfg.Security.Zones["Z"].InterfaceHostInbound); !reflect.DeepEqual(got, tc.wantHIB) {
+					t.Fatalf("stanza %q compiled per-interface host-inbound %v, want %v — the reject message tells operators to rewrite INTO the block spelling, so an accepted spelling must ADMIT what the operator wrote; a keyed but empty override is the failure default this asserts against",
 						tc.stanza, got, tc.wantHIB)
 				}
 			})
 		}
 	})
+}
+
+// hibTokens6735 projects the compiled per-interface host-inbound overrides into
+// member name -> ["system-services=<tok>", "protocols=<tok>", ...], preserving
+// compiled order and multiplicity. It exists so an accept-table assertion binds
+// what an override ADMITS rather than merely that an entry exists under the
+// right key: the map keys alone are equal for a correct override, an empty one,
+// and one carrying the wrong services. Returns nil for no overrides so a "no
+// override expected" row is written as a nil want.
+func hibTokens6735(m map[string]*HostInboundTraffic) map[string][]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(m))
+	for name, hib := range m {
+		if hib == nil {
+			out[name] = nil
+			continue
+		}
+		var toks []string
+		for _, svc := range hib.SystemServices {
+			toks = append(toks, "system-services="+svc)
+		}
+		for _, proto := range hib.Protocols {
+			toks = append(toks, "protocols="+proto)
+		}
+		out[name] = toks
+	}
+	return out
 }
 
 // TestZoneInterfaces6735FlatSetReachesThePackedTail is the reachability
@@ -453,9 +531,20 @@ func TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning(t *testing.T) {
 // the packed-tail one. The second half is what stops a "fix" that simply makes
 // the packed-tail gate swallow everything.
 //
-// Fail-on-revert: swap the two gate invocations in
-// compiler_uniformgates_cluster_zone.go and the overlap subtest goes RED on the
-// reason assertion (an assertion, not a build break — both orders compile).
+// Fail-on-revert, measured: swap the two gate invocations in
+// compiler_uniformgates_cluster_zone.go and the failure set across the whole
+// package is exactly this test's overlap subtest — an assertion, not a build
+// break, and nothing else in pkg/config reds. That makes this the assertion
+// that binds the order.
+//
+// SCOPE — read this before "strengthening" it. What is observed is the rendered
+// REASON TEXT, not which function produced it. An overbroad packed-tail gate
+// that also swallowed the empty-member shapes and rendered the non-empty reason
+// for them would satisfy both directions here and pass. That is deliberate: the
+// operator-visible message is the contract, so a refactor that keeps every
+// rendered result identical is legitimate however the helpers are arranged. Do
+// NOT read this test as pinning which helper ran, and do not add an assertion
+// that tries to — it would convert a behavioural contract into a structural one.
 func TestZoneInterfaces6735OverlapShapeReportsThePackedTailGate(t *testing.T) {
 	t.Run("overlap shape reports the packed tail, not the empty stanza", func(t *testing.T) {
 		tree := parseHierarchical(t, zonePackedTailConfig(`interfaces host-inbound-traffic ge-0/0/1.0;`))

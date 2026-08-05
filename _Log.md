@@ -1,3 +1,66 @@
+## 2026-08-05 — #6735 r5: measure which added assertions actually BIND
+
+- **Timestamp**: 2026-08-05 (fold/6735-r3 -> fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Gate at ada155b42 = MERGE-NEEDS-MINOR, no runtime finding. The r4
+  entry claimed three mutations gave "every new assertion" a distinguishing one.
+  That was FALSE, and this round measures the truth instead of restating it.
+
+  **Definition used, so the claim stays checkable.** A mutation DISTINGUISHES an
+  assertion when, with that single production edit applied, the failure set
+  across the whole `pkg/config` package is that assertion ALONE. A mutation that
+  also reds assertions predating it proves those older assertions still work; it
+  proves nothing about the new one. Every row below is a measured failure set,
+  not an argument.
+
+  | mutation (production edit) | failing | distinguishes |
+  |---|---|---|
+  | M5 gate ignores the tail (`len(tail) > 0` -> `true`) | 10 | NOTHING — reds pre-branch `TestZoneInterfaces6525EmptyStanzaRejected` + 2 subtests |
+  | M6 override fans to no member | 35 | NOTHING — reds #6391 x9, #5248, #3362, #3703, #4544, #4818, #3226, #4455 |
+  | M7 packed-tail gate strict on the tolerant path | 1 | `…6735LenientPathWarnsInsteadOfRejecting` |
+  | A5 gate fires when the keyword is not FIRST (`i > 0 \|\| len(tail) > 0`) | 1 | `…6735PackedTail…/still_compiles/keyword last, empty body` |
+  | ORD swap the two gate invocations | 1 | `…6735OverlapShapeReportsThePackedTailGate/overlap shape…` |
+  | A6 override compiles to a keyed but EMPTY value | 26 -> 30 | NOTHING (see below) |
+
+  So THREE assertions this branch adds are independently binding, each with a
+  named edit that reds it and nothing else: the tolerant-path warning, the
+  keyword-last accept row, and the gate ORDER. M5 and M6 — two of the three r4
+  cited — distinguish nothing; A5 replaces M5 as the citation for the accept
+  row, and M6 has no replacement because none exists.
+
+  **The wantHIB assertion corroborates, it does not bind, and that is now stated
+  where it lives.** Codex measured that asserting override KEYS accepts an
+  override whose value is nil or empty — the failure DEFAULT of that path, so it
+  was green for exactly the regression it names. Fixed: the accept table now
+  asserts member -> admission TOKENS (`hibTokens6735`), and one row carries a
+  multi-token body (`[ ssh ping ]` + `protocols ospf`) across two bracket
+  members, so a fan that keeps only the first service, and a clone that shares a
+  backing store, both fail it. Proof it closed: the empty-value edit reds 26
+  assertions with the key-only form and 30 with the token form, the +4 being
+  exactly the two body-carrying accept rows. Proof it still does not BIND: all
+  26 are pre-branch (#6391/#5248/#3362/#3703/#4544/#4818/#3226/#4455 already pin
+  override CONTENT for these shapes). The scope note is in the struct comment.
+
+  **A comment the tests disprove — third one this PR.** The packed-tail gate's
+  doc said "a keyword with nothing after it, or a body-only block, leaves this
+  gate silent". A body-only block is NOT silent by virtue of being body-only:
+  `interfaces { host-inbound-traffic system-services ssh; }` carries
+  `system-services ssh` on the keyword's OWN Keys, so it is a tail and the gate
+  FIRES. Only the NESTED-block spelling
+  `interfaces { host-inbound-traffic { system-services ssh; } }` stays silent.
+  The comment now names nested-block explicitly, and the same-Keys spelling is a
+  new REJECT row so the corrected text is pinned rather than merely asserted.
+
+  Also noted in the overlap test that it observes rendered REASON TEXT, not
+  helper identity — an overbroad packed-tail gate rendering the non-empty reason
+  would pass it. That is deliberate (the operator-visible message is the
+  contract) but should not be mistaken for a structural pin.
+
+- **Tests**: `go build ./...` = 0 and `go vet ./...` = 0 in every mutated state
+  and restored; each RED above is an ASSERTION failure, never a build break.
+  Full unsandboxed `go test ./...` exit code recorded in the commit message.
+- **File(s)**: `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `pkg/config/compiler_validate_strict_zones.go`, `_Log.md`
+
 ## 2026-08-05 — #6735 r4: bind the accept table's OVERRIDE, not just its membership
 
 - **Timestamp**: 2026-08-05 (fix/6525-zone-compact-leaf, PR #6735)
@@ -15,10 +78,15 @@
   (`wantHIB`), with nil for the packed `keyword last, empty body` case, which is
   the documented fail-CLOSED #6525 residual rather than an oversight.
 
-  Three further mutations added so every new assertion has a distinguishing one:
-  a tail-insensitive gate (over-rejects the lossless keyword-last shape), an
-  override that fans to no member (the new wantHIB), and a packed-tail gate made
-  strict on the tolerant path (the #1960 no-brick warning).
+  Three further mutations added: a tail-insensitive gate (over-rejects the
+  lossless keyword-last shape), an override that fans to no member (the new
+  wantHIB), and a packed-tail gate made strict on the tolerant path (the #1960
+  no-brick warning).
+
+  CORRECTION (r5, entry above): this paragraph originally claimed those three
+  gave "every new assertion" a distinguishing mutation. That was false. Measured
+  per-mutation failure sets show only the third distinguishes anything; the
+  other two red assertions that predate them. The r5 entry carries the table.
 
 - **Tests**: mutation coverage for the whole #6735 set, each RED from an
   ASSERTION with `go build` = 0 and `go vet` = 0, GREEN on restore —

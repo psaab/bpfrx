@@ -662,8 +662,21 @@ const (
 // Both would fire; this one goes first because its message is the accurate one.
 // Telling an operator who plainly wrote `ge-0/0/1.0` that the stanza "names no
 // interface" sends them hunting the wrong defect. Everywhere else the two are
-// disjoint: a keyword with nothing after it, or a body-only block, leaves this
-// gate silent and still reaches the non-empty gate.
+// disjoint: a keyword with NOTHING after it (`interfaces a
+// host-inbound-traffic;`), or a NESTED-BLOCK body
+// (`interfaces { host-inbound-traffic { system-services ssh; } }`, where the
+// body's tokens are the keyword node's CHILDREN and its own Keys tail is empty),
+// leaves this gate silent and still reaches the non-empty gate.
+//
+// Note the qualifier "nested-block". A body-only block is NOT silent by virtue
+// of being body-only: the SAME-Keys spelling
+// `interfaces { host-inbound-traffic system-services ssh; }` carries
+// `system-services ssh` as a tail on the keyword's own Keys and therefore FIRES
+// this gate. Both spellings are pinned —
+// TestZoneInterfaces6735PackedTailRejectedAndPositiveControl rejects the
+// same-Keys one, and the overlap test's sibling subtest holds the nested-block
+// one on the non-empty gate — so the distinction is measured rather than
+// asserted here.
 func validateZoneInterfacePackedTailStrict(tree *ConfigTree) error {
 	if tree == nil {
 		return nil
