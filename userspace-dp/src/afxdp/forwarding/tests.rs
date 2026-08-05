@@ -5625,11 +5625,15 @@ fn reused_ifindex_across_two_zoned_interfaces_resolves_no_zone_6722() {
 /// arriving AFTER a conflict was recorded is untested by all of them. Once an
 /// ifindex is known ambiguous, no later row may re-arm it.
 ///
-/// Three rows land on ifindex 42 as `vpnb` -> none -> `vpnb`. Unit 0 is still in
-/// no zone, so the ifindex still names no single zone. A fold that treats the
-/// recorded conflict as merely "no opinion yet" and re-arms on the third row
-/// resolves `vpnb` here and reinstates the exact #6722 fail-open, while leaving
-/// every other test in this file green.
+/// Three rows land on ifindex 42 as `vpnb` -> none -> `vpnb`. The third row is
+/// a RECYCLED index on an unrelated netdev, not another unit: `snapshotLinuxName`
+/// collapses only unit ZERO onto the base, so a `st0.2` row would carry its own
+/// ifindex and could never be the third element. See the fixture's provenance
+/// note. Unit 0 is still in no zone and two unrelated interfaces still share
+/// the index, so it names no single zone. A fold that treats the recorded
+/// conflict as merely "no opinion yet" and re-arms on the third row resolves
+/// `vpnb` here and reinstates the exact #6722 fail-open, while leaving every
+/// other test in this file green.
 #[test]
 fn a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722() {
     let state = build_forwarding_state(&conflict_then_agreement_snapshot_6722());
@@ -5641,8 +5645,7 @@ fn a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722() {
         .interfaces
         .iter()
         .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
-        .map(|i| i.zone.as_str())
-        .map(|z| if z.is_empty() { "<none>" } else { "vpnb" })
+        .map(|i| if i.zone.is_empty() { "<none>" } else { "vpnb" })
         .collect();
     assert_eq!(
         rows_on_shared,
@@ -5681,6 +5684,99 @@ fn a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722() {
         adjudicate_lan_transit_6722(&state, "192.168.98.7", ZONED_TUNNEL_IFINDEX_6722);
     assert_eq!(unit1_to_id, TEST_SIBLING_VPN_ZONE_ID_6722);
     assert_eq!(unit1_result.action, PolicyAction::Permit);
+}
+
+/// #6722, the ZERO SENTINEL arriving FIRST. `sibling_tunnel_units_snapshot_6722`
+/// runs nonzero-then-sentinel on the shared ifindex; this is the mirror order.
+/// A fold that reads a recorded `Some(0)` as "no opinion yet" and lets a later
+/// nonzero row upgrade it is GREEN on every other test in this issue and
+/// resolves `vpnb` here, for an ifindex two unrelated interfaces share.
+///
+/// Order-dependence would be a latent bug even where it happens to give the
+/// operator's answer: `buildInterfaceSnapshots`' row order is not a contract
+/// the Rust side may lean on.
+#[test]
+fn a_zero_sentinel_row_is_not_upgraded_by_a_later_zoned_row_6722() {
+    let state = build_forwarding_state(&sentinel_before_zoned_row_snapshot_6722());
+
+    // Precondition: the sentinel really does come FIRST, or this is just the
+    // sibling fixture again.
+    let rows_on_shared: Vec<&str> = sentinel_before_zoned_row_snapshot_6722()
+        .interfaces
+        .iter()
+        .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
+        .map(|i| if i.zone.is_empty() { "<none>" } else { "vpnb" })
+        .collect();
+    assert_eq!(
+        rows_on_shared,
+        vec!["<none>", "vpnb"],
+        "precondition: the ZERO sentinel must be recorded BEFORE the nonzero row"
+    );
+
+    assert_ambiguous_ifindex_preconditions_6722(
+        &state,
+        SHARED_TUNNEL_IFINDEX_6722,
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(
+        to_id, 0,
+        "a recorded `no zone` must CONFLICT with a later zoned row, not be \
+         upgraded by it"
+    );
+    assert_ne!(to_id, TEST_SIBLING_VPN_ZONE_ID_6722, "not `vpnb`");
+    assert_eq!(result.action, PolicyAction::Deny);
+    assert_eq!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID
+    );
+}
+
+/// #6722 scope, the over-trigger edge at THREE rows. "Unanimous" is a universal,
+/// and every other agreement test proves it only over a PAIR. Three rows that
+/// all name `vpnb` must still resolve -- a gate that grew stricter with row
+/// count would deny traffic the operator permitted, which is #6713 again.
+#[test]
+fn a_unanimous_three_row_ifindex_still_resolves_its_zone_6722() {
+    let state = build_forwarding_state(&unanimous_three_row_ifindex_snapshot_6722());
+
+    let rows_on_shared = unanimous_three_row_ifindex_snapshot_6722()
+        .interfaces
+        .iter()
+        .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
+        .count();
+    assert_eq!(
+        rows_on_shared, 3,
+        "precondition: THREE rows must share the ifindex, or this is the \
+         two-row unanimous case already covered"
+    );
+    assert!(
+        !state.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+        "precondition: MAC-less, so the fallback is the only resolver"
+    );
+    assert_eq!(
+        state
+            .ifindex_unambiguous_zone_id
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "three rows that AGREE keep the ifindex in the unambiguous map"
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(to_id, TEST_SIBLING_VPN_ZONE_ID_6722);
+    assert_eq!(result.action, PolicyAction::Permit);
+    assert_ne!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the operator's rule must be the one that matched"
+    );
 }
 
 /// #6713 at a SHARED ifindex, and the guard that keeps the #6722 gate from

@@ -66568,6 +66568,14 @@ break — `go vet` confirmed passing under every revert.
     unit 0 unzoned gives rows `vpnb`→none→`vpnb` on ifindex 42 — so the guard
     fired but was scoped NARROWER than its "EVERY row agrees" claim. Found by
     re-deriving the mutation scope rather than by any reviewer.
+  - Guard E, a recorded zero sentinel UPGRADED by a later zoned row
+    (`if *slot.get() == Some(0) { slot.insert(Some(row_zone_id)) }`): **1 RED**,
+    `a_zero_sentinel_row_is_not_upgraded_by_a_later_zoned_row_6722`, the other
+    16 green. Every prior fixture ran nonzero-THEN-sentinel on the shared
+    ifindex; nothing tested the mirror order, so this mutation was invisible to
+    the entire suite. Order-dependence is a defect even where it happens to
+    yield the operator's answer — `buildInterfaceSnapshots` row order is not a
+    contract the Rust side may lean on.
   - Probe C, letting the child→parent propagation also teach the ledger:
     **0 RED, 14/14 green.** So the "kept out of the propagation arm" exclusion
     is a design property, NOT a demonstrated guard, and the source comment now
@@ -66575,6 +66583,48 @@ break — `go vet` confirmed passing under every revert.
     skip at the flush is labelled a map-size choice, not a safety gate:
     `egress_zone_id` ends in `.unwrap_or(0)`, so a stored `Some(0)` and an
     absent key resolve identically.
+
+  ABSORBING-STATE / UNIVERSAL-CLAIM sweep (prompted by the parent asking what
+  the mutation search actually covered, after guard D). A two-element fixture is
+  structurally incapable of testing an absorbing state — it can only ENTER the
+  state, never attempt to re-arm it — and "EVERY row agrees" is a universal that
+  a pair cannot exercise. Swept every such claim in the change:
+
+  - 3-row absorbing conflict: was untested, now `conflict_then_agreement_...`
+    (guard D above).
+  - Zero sentinel arriving BEFORE a nonzero row: was untested, now
+    `a_zero_sentinel_row_is_not_upgraded_by_a_later_zoned_row_6722` (guard E).
+  - Unanimity over THREE rows rather than a pair: was untested, now
+    `a_unanimous_three_row_ifindex_still_resolves_its_zone_6722`. NEGATIVE
+    RESULT, recorded as such: no mutation was found that this test catches and
+    the two-row unanimous case misses. It is coverage of the universal, not a
+    proven guard, and is labelled that way rather than credited as a guard.
+  - Quarantine with more than one blanked row: ALREADY covered — the fixture
+    blanks BOTH the base and the unit-0 row on ifindex 42, and the Go
+    `TestQuarantineUnzonesTheBaseRow_6722` asserts both. Bounded negative, no
+    change needed.
+  - Absolute phrasings in the new comments: the absorbing-conflict "no later row
+    may re-arm it" is now pinned by guard D; the propagation exclusion and the
+    `zone_id != 0` skip were already demoted to design notes. One survivor
+    corrected: `egress_zone_id`'s "the logged/counted zone can NEVER disagree"
+    is a completeness claim over CALL SITES that nothing enforces. It now says
+    "do not disagree", states that this holds BY ENUMERATION rather than by
+    construction, names which three sites are pinned by tests, and warns that
+    the zone-accounting readers are not — so a new direct `state.egress` read
+    there would not be caught by this suite.
+
+  FIXTURE-PROVENANCE DEFECT in my own guard-D test, caught by the same sweep and
+  fixed before push. The first version put a third row on the shared ifindex by
+  giving `st0.2` `linux_name = "st0"`. `snapshotLinuxName` collapses only a
+  non-VLAN unit ZERO onto the base, and `TunnelNameMap` gives unit N>0 its own
+  device (`gr-0-0-0u1`), so that row is one `buildInterfaceSnapshots` never
+  emits — precisely the evidence-free-fixture class this PR exists to fight, and
+  I had written its docstring claiming a config that does not produce it. A
+  third row on one ifindex is producible ONLY by ifindex RECYCLING within one
+  snapshot, the mechanism `reused_ifindex_snapshot_6722` already rests on. All
+  three new fixtures were rebuilt on base + unit-0 collapse plus a recycled
+  `st1.0`, and the provenance is now written into the fixture rather than
+  assumed. Guard D was re-proven on the corrected fixture.
 
   Self-caught over-claim, corrected in all three places it appeared
   (`types/forwarding.rs`, `forwarding/tests.rs`, the architecture doc): the

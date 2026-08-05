@@ -520,9 +520,21 @@ impl ForwardingState {
     /// #3651: the egress (to) zone id for `egress_ifindex`, or `0` when the
     /// interface is unknown / unzoned. THE single egress-zone resolver: the
     /// zone-pair resolver (`zone_pair_ids_for_flow_with_override`), the
-    /// per-zone traffic counter (`record_zone_traffic`) and the filter-log
-    /// egress-zone field all read through here, so the adjudicated zone and
-    /// the logged/counted zone can never disagree.
+    /// per-zone traffic counter (`record_zone_traffic`), the filter-log
+    /// egress-zone field (BOTH the flow-cache-hit path via
+    /// `filter_log_egress_zone_id` and `forward_request`'s own independent
+    /// call) and the local-origin tunnel `SyncedSessionEntry` zones all read
+    /// through here, so the adjudicated zone and the logged/counted zone do not
+    /// disagree.
+    ///
+    /// That is true BY ENUMERATION of the callers, not by construction —
+    /// nothing prevents a new site from reading `state.egress` directly and
+    /// silently reintroducing the #6713 split. Three of the sites are pinned by
+    /// tests (`zoned_macless_unit_still_reaches_policy_6713`,
+    /// `filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713`,
+    /// `build_live_forward_request_logs_a_macless_egress_zone_6713`); the
+    /// zone-accounting readers are not, so a new direct read there would not be
+    /// caught by this suite. Route new consumers through this fn.
     ///
     /// #6713: `egress` is NOT the authoritative ifindex -> zone map —
     /// `ifindex_to_zone_id` is. `populate_egress` skips any interface whose
