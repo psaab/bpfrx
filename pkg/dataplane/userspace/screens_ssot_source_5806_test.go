@@ -1,8 +1,11 @@
 package userspace
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -57,6 +60,9 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 			fragment, ScreenUnresolvedDisposition)
 	}
 
+	// Count OCCURRENCES, not files: a second copy in the SAME file is exactly as
+	// drift-prone as one in another file, and a file-level count would miss it.
+	total := 0
 	var hits []string
 	for _, sub := range []string{"pkg", "cmd"} {
 		err := filepath.Walk(filepath.Join(root, sub), func(p string, fi os.FileInfo, err error) error {
@@ -68,8 +74,9 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 			if rerr != nil {
 				return nil
 			}
-			if strings.Contains(string(b), fragment) {
-				hits = append(hits, p)
+			if n := strings.Count(string(b), fragment); n > 0 {
+				total += n
+				hits = append(hits, fmt.Sprintf("%s (x%d)", p, n))
 			}
 			return nil
 		})
@@ -78,30 +85,46 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 		}
 	}
 
-	if len(hits) != 1 {
+	if total != 1 {
 		t.Fatalf("the disposition sentence must exist as a literal EXACTLY ONCE (its "+
-			"const definition) so every surface shares one source; found %d: %v. "+
-			"A duplicated literal lets the metric HELP and the status block drift.",
-			len(hits), hits)
-	}
-	if !strings.HasSuffix(hits[0], filepath.Join("pkg", "dataplane", "userspace", "screens.go")) {
-		t.Errorf("the single literal must live in screens.go beside the builder; found %s", hits[0])
+			"const definition) so every surface shares one source; found %d occurrence(s) "+
+			"in %v. A duplicated literal — in any file, including this one's own — lets "+
+			"the metric HELP and the status block drift.", total, hits)
 	}
 
 	// And the consumers must reach it by identifier, not by their own copy.
+	// EVERY non-test file that renders the disposition must be listed here; the
+	// scan above cannot tell a shared const from a literal that was split across
+	// a `+` concatenation to dodge it, so this is the complementary check.
 	for _, consumer := range []string{
 		filepath.Join(root, "pkg", "api", "metrics_descriptors_global.go"),
 		filepath.Join(root, "pkg", "dataplane", "userspace", "screens.go"),
 	} {
-		b, err := os.ReadFile(consumer)
+		blob, err := os.ReadFile(consumer)
 		if err != nil {
 			t.Fatalf("read %s: %v", consumer, err)
 		}
-		if !strings.Contains(string(b), "ScreenUnresolvedDisposition") {
+		body := string(blob)
+		if !strings.Contains(body, "ScreenUnresolvedDisposition") {
 			t.Errorf("%s must reference the ScreenUnresolvedDisposition identifier", consumer)
+		}
+		// A split-concatenation copy: two adjacent quoted chunks that together
+		// reproduce the sentence. Normalising away Go string concatenation and
+		// re-counting catches it where the plain scan cannot.
+		normalised := concatSplice.ReplaceAllString(body, "")
+		if n := strings.Count(normalised, fragment); n > 0 && consumer != filepath.Join(
+			root, "pkg", "dataplane", "userspace", "screens.go") {
+			t.Errorf("%s appears to inline the disposition via a split string "+
+				"concatenation (%d occurrence(s) after splicing) instead of using the "+
+				"shared constant", consumer, n)
 		}
 	}
 }
+
+// concatSplice matches a Go source string-concatenation seam — `" +\n\t\t"` in any
+// spacing — so a literal deliberately broken across chunks can be rejoined and
+// compared against the shared sentence.
+var concatSplice = regexp.MustCompile(`"\s*\+\s*\n?\s*"`)
 
 // TestScreenMissingProfilesPublishedToSnapshot binds the publication path the
 // whole SSOT argument rests on (#5806): the metric and status block claim to
@@ -112,6 +135,12 @@ func TestScreenUnresolvedDispositionHasOneSource(t *testing.T) {
 // RED on revert: drop or misroute ScreenMissingProfiles in buildSnapshot and the
 // published set no longer matches the exported builder.
 func TestScreenMissingProfilesPublishedToSnapshot(t *testing.T) {
+	// buildSnapshot enumerates ip-rules through the real netlink stack
+	// (routes.go ruleListFn), which fails "operation not permitted" in a
+	// restricted sandbox — BEFORE reaching the screen assertion below, so
+	// without this the guard silently never runs.
+	stubRuleListHermetic(t)
+
 	cfg := unresolvedRefConfig()
 	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 1)
 	if err != nil {
@@ -129,6 +158,38 @@ func TestScreenMissingProfilesPublishedToSnapshot(t *testing.T) {
 	for i := range want {
 		if snap.ScreenMissingProfiles[i] != want[i] {
 			t.Fatalf("published ref %d = %+v, want %+v", i, snap.ScreenMissingProfiles[i], want[i])
+		}
+	}
+
+	// The Go struct being right is not enough: the SSOT claim is that the
+	// DATAPLANE was told the same set, and the dataplane reads JSON. A rename of
+	// the wire tag, or of the Rust-side field, breaks publication while leaving
+	// every Go-struct assertion above green. Marshal and check the wire key and
+	// its contents, and pin the names the Rust decoder expects
+	// (userspace-dp/src/protocol/snapshot.rs `screen_missing_profile_zones`,
+	// whose element carries `zone` / `profile`).
+	blob, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatalf("marshal snapshot: %v", err)
+	}
+	var wire struct {
+		Refs []struct {
+			Zone    string `json:"zone"`
+			Profile string `json:"profile"`
+		} `json:"screen_missing_profile_zones"`
+	}
+	if err := json.Unmarshal(blob, &wire); err != nil {
+		t.Fatalf("unmarshal snapshot wire: %v", err)
+	}
+	if len(wire.Refs) != len(want) {
+		t.Fatalf("wire key screen_missing_profile_zones carried %d refs, want %d — "+
+			"the Rust decoder reads this exact key, so a tag rename silently stops "+
+			"publishing while the Go struct stays correct", len(wire.Refs), len(want))
+	}
+	for i := range want {
+		if wire.Refs[i].Zone != want[i].Zone || wire.Refs[i].Profile != want[i].Profile {
+			t.Fatalf("wire ref %d = {zone:%q profile:%q}, want {zone:%q profile:%q}",
+				i, wire.Refs[i].Zone, wire.Refs[i].Profile, want[i].Zone, want[i].Profile)
 		}
 	}
 }

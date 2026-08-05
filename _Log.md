@@ -1,3 +1,69 @@
+## 2026-08-05 — #5806 fold r3: two MAJORs where the guard could not run or accepted a no-op
+
+- **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility, PR #6839)
+- **Action**: Six r2-gate findings.
+  **MAJOR-1, the publication guard could not execute.** `buildSnapshot`
+  enumerates ip-rules through real netlink, which dies "operation not permitted"
+  in a restricted sandbox BEFORE the screen assertion. Verified the mechanism
+  firsthand rather than taking it on report — a probe stubbing `ruleListFn` to
+  return an error reproduced `route snapshot: list ip-rules for family 2:
+  operation not permitted`. Wired the in-tree `stubRuleListHermetic`. Also
+  widened the guard past its real weakness: it only compared the GO struct, so
+  any break AFTER the struct is built (wire-tag rename, Rust field drift) passed.
+  It now marshals the snapshot and checks the `screen_missing_profile_zones` key
+  and its `zone`/`profile` members — the names the Rust decoder actually reads.
+  **MAJOR-2, the policy test accepted a no-op on the thing it tested.** Two
+  shapes. (a) It accepted any `Continue(_)`, which includes
+  `ScreenCheckOutcome::SynCookieChallenge` — an outcome that continues but
+  answers the packet with a challenge instead of carrying it to policy, i.e. does
+  NOT satisfy the claim. Narrowed to the exact `Continue(ScreenCheckOutcome::Pass)`.
+  (b) The missing-only subtest expected `warns == 0`, which is ALSO the failure
+  default if the missing-profile threading were deleted or
+  `update_missing_profiles` were a no-op — so it passed whether the mechanism
+  worked or did not exist. Fixed by ARMING the gate afterwards on the SAME state
+  (adding a resolved profile for an unrelated zone, `lan` reference untouched)
+  and requiring the warn to appear. That pair is what separates "the gate
+  suppresses a working mechanism" from "there is no mechanism".
+  **Three claim corrections.** My helper insertion had orphaned
+  `source_route_screen`'s doc comment onto `missing_only_screen`, so a
+  source-route description sat above a function containing only a missing
+  reference — reattached. The comment calling `StageOutcome::Continue`
+  necessarily unconsumed is contradicted by the SYN-cookie arm — corrected, and
+  it is now the stated reason the exact variant is asserted. And the "ONLY
+  signal" wording was an overstatement I wrote at the lead's prompting: other
+  reporting (tolerant-load configuration warnings, daemon logging) exists, so the
+  defensible claim is that the RUNTIME DATAPLANE WARN specifically cannot fire.
+  Narrowed in `pkg/api/metrics.go`, the Rust test comment,
+  `docs/feature-coverage.md`, and corrected on both #6860 and #5806 so the record
+  does not keep the stronger version.
+  **Test-acceptance items.** CLI tests now assert STRUCTURE — the heading exists,
+  exactly one row sits under it carrying both zone and profile, the disposition
+  appears exactly once after the rows — instead of token containment. The CLI
+  silence control no longer rests on absence alone (an aborted render also
+  contains no heading): it requires the healthy inventory to actually render.
+  The source-identity guard now counts OCCURRENCES rather than files (a same-file
+  duplicate is as drift-prone as a cross-file one) and adds a
+  split-concatenation check, since a literal broken across `+` chunks defeats a
+  plain substring scan.
+- **Validation**: four new mutations plus a re-gate of the prior set, each with a
+  0-error build first. M9 — `update_missing_profiles` made a no-op, the exact
+  escape the gate named — is now RED; it passed before. M11 wire-tag renamed
+  while the Go struct stays correct -> publication guard RED. M12 heading dropped
+  but rows kept -> CLI structural guard RED. Re-gates: M1 (collector below the
+  dataplane gate) RED; M3 (old wording + anchor drop) now RED in FOUR packages,
+  up from three, because the CLI guard picked it up too; M5 (CLI emit computed
+  but not printed) RED; M7 (publication nulled) RED. All restored + `touch`ed;
+  green after each. NOT demonstrated by mutation, stated rather than implied: the
+  `Continue(Pass)` narrowing. Producing a `SynCookieChallenge` for a
+  missing-profile zone would require contriving production code that cannot occur
+  there, so its escape is argued from the enum, not shown.
+  `go test ./...` exit 0; `cargo test --bins -- --test-threads=1` 4235 passed / 0
+  failed.
+- **File(s)**: `userspace-dp/src/afxdp/poll_stages_tests.rs`,
+  `pkg/dataplane/userspace/screens_ssot_source_5806_test.go`,
+  `pkg/cli/cli_show_screen_unresolved_5806_test.go`, `pkg/api/metrics.go`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-05 — #5806 fold r2: bind the five gate findings (incl. one claim the lead asked for)
 
 - **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility, PR #6839)

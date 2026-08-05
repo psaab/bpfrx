@@ -84,8 +84,48 @@ func TestShowScreenLocalCLIReportsUnresolvedReference(t *testing.T) {
 		}
 	})
 
-	if !strings.Contains(out, "trust") || !strings.Contains(out, "alpha") {
-		t.Fatalf("local CLI must name the zone and the undefined profile; got:\n%s", out)
+	// Assert STRUCTURE, not token containment. Checking that "trust" and "alpha"
+	// merely appear anywhere would pass on a renderer that printed them in an
+	// unrelated section, or that emitted the heading with no rows under it.
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	const heading = "Unresolved screen profile references:"
+	hIdx := -1
+	for i, l := range lines {
+		if strings.TrimSpace(l) == heading {
+			hIdx = i
+			break
+		}
+	}
+	if hIdx < 0 {
+		t.Fatalf("local CLI must emit the %q heading; got:\n%s", heading, out)
+	}
+	// Exactly one row, and it must be the line immediately under the heading, so
+	// the zone/profile are ASSOCIATED with it rather than floating elsewhere.
+	var rows []string
+	for _, l := range lines[hIdx+1:] {
+		if strings.HasPrefix(l, "  Zone ") {
+			rows = append(rows, l)
+			continue
+		}
+		if strings.HasPrefix(l, "  Disposition: ") {
+			break
+		}
+	}
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one unresolved row under the heading, got %d: %v", len(rows), rows)
+	}
+	if !strings.Contains(rows[0], "trust") || !strings.Contains(rows[0], "alpha") {
+		t.Fatalf("the row must name the zone AND the profile it references; got %q", rows[0])
+	}
+	// The disposition is ONE trailing line, after the rows.
+	dispCount := 0
+	for _, l := range lines[hIdx+1:] {
+		if strings.HasPrefix(l, "  Disposition: ") {
+			dispCount++
+		}
+	}
+	if dispCount != 1 {
+		t.Fatalf("disposition must appear exactly once after the rows, got %d", dispCount)
 	}
 	// The shared disposition string, so the CLI, the gRPC block and the metric
 	// HELP cannot drift into describing the behaviour differently.
@@ -129,5 +169,15 @@ security {
 	})
 	if strings.Contains(out, "Unresolved screen profile references") {
 		t.Fatalf("a resolved reference must not render the unresolved block; got:\n%s", out)
+	}
+	// Absence alone is the failure default — an aborted or empty render also
+	// contains no heading. Require the healthy inventory to actually be there, so
+	// this test cannot pass on a renderer that emitted nothing at all.
+	if !strings.Contains(out, "Screen profile: alpha") {
+		t.Fatalf("the resolved profile inventory must still render (absence of the "+
+			"unresolved heading is only meaningful if something WAS rendered); got:\n%s", out)
+	}
+	if !strings.Contains(out, "trust") {
+		t.Errorf("the zone using the resolved profile must still be listed; got:\n%s", out)
 	}
 }

@@ -1087,9 +1087,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// #5806: zones whose configured screen profile does NOT resolve. The active
 	// config claims a screen is attached while the dataplane enforces none of it
 	// (tolerant load / HA config-sync / rolling upgrade can reach this state),
-	// and until now a rate-limited runtime WARN was the ONLY signal — the issue's
-	// acceptance criterion is explicitly that one warning must not be the sole
-	// signal. Config-derived and independent of dataplane load, so emit it BEFORE
+	// and until now the only DATAPLANE-RUNTIME signal was a rate-limited WARN —
+	// the issue's acceptance criterion is explicitly that one warning must not be
+	// the sole signal. (Other reporting exists: tolerant-load configuration
+	// warnings and daemon logging. The precise claim is about the runtime WARN,
+	// which #6860 shows cannot fire at all when NO profile resolves.)
+	// Config-derived and independent of dataplane load, so emit it BEFORE
 	// the dataplane gate: a config-only / degraded boot is exactly when an
 	// unenforced security control must stay visible.
 	c.collectScreenUnresolvedProfileZones(ch)

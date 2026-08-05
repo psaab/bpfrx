@@ -170,11 +170,6 @@ fn tcp_v4_syn_meta_with_l2(frame: &[u8], vlan: Vlan) -> UserspaceDpMeta {
     }
 }
 
-/// Screen state with only the IP source-route check armed. The
-/// check fires on an actual LSRR/SSRR option decoded from the IPv4
-/// options region (post-#2973) read from the frame at the computed
-/// L3 offset, so the verdict is a direct probe of whether the screen
-/// stage parsed the IP header at the right offset.
 /// #5806: a ScreenState carrying ONLY an unresolved profile reference — the
 /// tolerant-load shape where the `security screen` definitions are gone
 /// entirely but a zone still names one. No resolved profile exists, so
@@ -207,6 +202,11 @@ fn missing_plus_resolved_screen() -> ScreenState {
     screen
 }
 
+/// Screen state with only the IP source-route check armed. The
+/// check fires on an actual LSRR/SSRR option decoded from the IPv4
+/// options region (post-#2973) read from the frame at the computed
+/// L3 offset, so the verdict is a direct probe of whether the screen
+/// stage parsed the IP header at the right offset.
 fn source_route_screen() -> ScreenState {
     let mut profiles = FxHashMap::default();
     profiles.insert(
@@ -447,22 +447,33 @@ fn session_miss_ack_stage_invokes_syn_cookie_runtime_validation() {
 // this zone; policy evaluation is unaffected". Go cannot demonstrate that — the
 // decision lives here — so it is bound at the stage where it is decidable.
 //
-// What "policy evaluation is unaffected" MEANS at this seam: the screen stage
-// must return `StageOutcome::Continue`, i.e. it neither drops the packet nor
-// consumes the descriptor, so the poll loop proceeds to the rest of the pipeline
-// (zone policy included). `RecycleAndContinue` is the drop outcome — that is what
-// this asserts against.
+// What "policy evaluation is unaffected" MEANS at this seam: the stage must
+// return `StageOutcome::Continue(ScreenCheckOutcome::Pass)` — the EXACT variant,
+// not merely `Continue(_)`. `Continue` alone is too weak: its sibling payload
+// `ScreenCheckOutcome::SynCookieChallenge` also continues, but the caller then
+// answers the packet with a challenge instead of carrying it on to policy, so
+// `Continue(_)` would accept an outcome that does NOT satisfy the claim.
+// `RecycleAndContinue` is the drop outcome.
 //
-// The second subtest records a REAL GAP found while binding this, not a property
-// of the fix: `stage_screen_check` short-circuits on `!screen.has_profiles()`
-// (poll_stages.rs), and `has_profiles()` is `!self.zones.is_empty()` — the
-// RESOLVED map only. So when the `security screen` stanza is absent ENTIRELY,
-// which is exactly the tolerant-load shape that strands a reference, the stage
-// returns before `maybe_warn_missing_profile` can run and the rate-limited
-// runtime WARN — the signal #3082 shipped and #5806 treats as existing — NEVER
-// FIRES. In that case the config-derived metric and `show security screen` block
-// added for #5806 are the ONLY signal. Asserted here so the gap is pinned rather
-// than described.
+// The second subtest records a REAL GAP found while binding this, filed as
+// #6860. It is NOT a property of this change: `stage_screen_check`
+// short-circuits on `!screen.has_profiles()` (poll_stages.rs), and
+// `has_profiles()` is `!self.zones.is_empty()` — the RESOLVED map only. So when
+// the `security screen` stanza is absent ENTIRELY, which is exactly the
+// tolerant-load shape that strands a reference, the stage returns before
+// `maybe_warn_missing_profile` can run and THE RATE-LIMITED RUNTIME WARN
+// specifically cannot fire. Stated precisely: other reporting still exists
+// (tolerant-load configuration warnings, daemon logging), so this is NOT "no
+// diagnostic anywhere" — it is that the runtime dataplane WARN #5806 relies on
+// is unreachable in that configuration.
+//
+// Asserting `warns == 0` alone would bind NOTHING: zero is also the failure
+// default if the missing-profile threading were deleted outright or
+// `update_missing_profiles` were a no-op. The subtest therefore ARMS the gate
+// afterwards on the SAME state — adding a resolved profile for an unrelated
+// zone, leaving the `lan` reference untouched — and requires the warn to
+// appear. That pair distinguishes "the gate suppresses a working mechanism"
+// from "there is no mechanism".
 //
 // RED on revert: make the missing-profile None branch drop instead of pass and
 // the first subtest fails; "fix" has_profiles to count missing zones without
@@ -541,7 +552,7 @@ fn unresolved_screen_profile_zone_continues_to_policy_5806() {
             &worker_ctx,
         );
         (
-            matches!(outcome, StageOutcome::Continue(_)),
+            matches!(outcome, StageOutcome::Continue(ScreenCheckOutcome::Pass)),
             screen.missing_profile_warn_count(),
         )
     };
@@ -576,7 +587,36 @@ fn unresolved_screen_profile_zone_continues_to_policy_5806() {
     );
     assert_eq!(
         warns, 0,
-        "#5806 GAP (pinned, not fixed here): when every screen definition is          absent — the exact tolerant-load shape that strands a reference — the          has_profiles() short-circuit means the rate-limited runtime WARN NEVER          fires, so the config-derived metric and `show security screen` block are          the only signal"
+        "#6860 GAP (pinned, not fixed here): when every screen definition is \
+         absent — the exact tolerant-load shape that strands a reference — the \
+         has_profiles() short-circuit means the rate-limited runtime WARN cannot \
+         fire at all"
+    );
+
+    // ...and prove that zero is the GATE, not an absent mechanism. Arm
+    // has_profiles() on the SAME state by adding a resolved profile for an
+    // UNRELATED zone; the `lan` reference is untouched. The identical packet now
+    // warns. Delete the missing-profile threading, or make
+    // update_missing_profiles a no-op, and this is 0 too — which is what makes
+    // the assertion above meaningful rather than a restatement of the default.
+    let mut armed = FxHashMap::default();
+    armed.insert(
+        "other".to_string(),
+        ScreenProfile {
+            source_route: true,
+            ..ScreenProfile::default()
+        },
+    );
+    only_missing.update_profiles(armed);
+    assert!(
+        only_missing.has_profiles(),
+        "adding a resolved profile must arm the gate"
+    );
+    let (_, warns_armed) = run(&mut only_missing);
+    assert_eq!(
+        warns_armed, 1,
+        "with the gate armed, the SAME unresolved `lan` reference must warn — \
+         otherwise the zero above proves nothing about the threading"
     );
 }
 
