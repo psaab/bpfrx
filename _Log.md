@@ -1,3 +1,50 @@
+## 2026-08-05 — #6814 fold round 6: two bare leaf sites my round-5 grep could not find
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, on top of a47afa165)
+- **Action**: An AGY leg running the full swapped-label matrix at true head found
+  TWO more bare leaf assertions — in the file THIS PR authored, not the
+  pre-existing ones round 5 swept.
+    - `compiler_application_term_icmp_dup_6766_test.go:277`
+      (`ReferencedDeny_StrictRejects_LenientNarrows`) and `:398`
+      (`Lenient_DowngradesToWarning`). Both now match the QUOTED form.
+    - **Why round 5 missed them, which is the reusable part.** My sweep grepped
+      for `strings.Contains(err.Error(), c.leaf)` — the table-driven form. These
+      two hardcode the literal `"icmp-type"` instead of taking it from a case
+      table, so a grep shaped around the variable form STRUCTURALLY cannot find
+      them. The mutation matrix finds every shape because it does not care how
+      the assertion is spelled. Grep finds what you already know the shape of;
+      the mutation finds what you do not.
+    - **The file header was consequently false.** It claimed the quoted form is
+      used "throughout this file" and that it "reds all three rejection tests".
+      There are FIVE leaf-identity sites: four rejection assertions (the three
+      table-driven ones plus ReferencedDeny, which hardcodes its leaf) and one
+      tolerant-path warning assertion. Header rewritten to state the count —
+      the count is what makes the claim checkable — and to record why the two
+      literal-form sites were quoted a round later than the table-driven ones.
+      Also records that the enumeration beside the identifying occurrence
+      renders UNQUOTED (`%q` of `DuplicateTermLeaves[0]` in
+      `compiler_validate_strict_application.go`), which is what makes quoting
+      discriminate at all.
+- **Validation**: Same swapped-label mutation, preflight build+vet clean, vet
+  clean under it. Full matrix: ALL FIVE leaf-identity sites RED — the six
+  table-driven rejection subtests, `ReferencedDeny`, and
+  `Lenient_DowngradesToWarning`. The four positive controls stay GREEN, as do
+  `Idempotent_Accepted` and `LenientKeepsLastCode` (no conflict authored, so no
+  label to swap, and the latter asserts a VALUE not a leaf name) — which is what
+  shows the mutation is scoped to leaf identity rather than breaking the
+  package. Negative control: `:277` and `:398` reverted to the bare form with
+  the mutation still applied both PASS (rc=0). Restored both files by
+  pristine-snapshot write-back plus `touch`; `compiler_applications.go`
+  confirmed byte-identical to HEAD afterwards. Gates from real exit codes on
+  this workstation: `GATE1_RC=0`, `FULL_RC=0`.
+- **Note**: the stale-SHA Codex verdict relayed for this PR was discarded, not
+  folded — every one of its five findings was already closed at
+  `a47afa165`, proven by grepping each flagged string across `1314dcb72` /
+  `274e24f23` / `a47afa165`. These two AGY findings are from the true head and
+  are unrelated to those five.
+- **File(s)**: `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `_Log.md`
+
 ## 2026-08-05 — #6814 fold round 5: the same weak leaf assertion in the three pre-existing rejection tests
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, separate commit on top of 274e24f23)

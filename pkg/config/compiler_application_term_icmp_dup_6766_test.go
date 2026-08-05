@@ -25,16 +25,32 @@ import (
 // group-authored packed term merged into the stanza). All three reassemble to
 // the same parseApplicationTerms token stream via applicationTermKeys.
 
-// #6814: the leaf name is matched in its QUOTED form throughout this file. The
-// rejection message ends with a STATIC enumeration of every trackable leaf —
-// "(destination-port / source-port / inactivity-timeout / timeout / alg /
-// icmp-type / icmp-code)" — so a bare substring check for the leaf name is
-// satisfied by that boilerplate no matter which leaf actually conflicted, and a
-// swapped label sails through. Only the identifying occurrence is quoted
-// (`conflicting duplicate "icmp-type" inside`), so the quotes are what make
-// "the error names the leaf" an assertion rather than a coincidence. Proven by
-// swapping the two recorded labels in parseApplicationTerms: the quoted form
-// reds all three rejection tests, the bare form passes them.
+// #6814: the leaf name is matched in its QUOTED form at every site in this file
+// that asserts WHICH leaf was flagged. The rejection message ends with a STATIC
+// enumeration of every trackable leaf — "(destination-port / source-port /
+// inactivity-timeout / timeout / alg / icmp-type / icmp-code)" — so a bare
+// substring check for the leaf name is satisfied by that boilerplate no matter
+// which leaf actually conflicted, and a swapped label sails through. Only the
+// identifying occurrence is quoted (`conflicting duplicate "icmp-type" inside`,
+// rendered by the `%q` of DuplicateTermLeaves[0] in
+// compiler_validate_strict_application.go — the enumeration beside it is
+// unquoted), so the quotes are what make "the error names the leaf" an
+// assertion rather than a coincidence.
+//
+// There are FIVE such sites, and the count is stated so this claim stays
+// checkable: four rejection assertions — the three table-driven ones plus
+// ReferencedDeny_StrictRejects_LenientNarrows, which hardcodes its leaf name
+// instead of taking it from a case table — and one tolerant-path warning
+// assertion in Lenient_DowngradesToWarning. The first three were quoted before
+// the other two, because a grep for the table-driven `c.leaf` form structurally
+// cannot find a hardcoded string literal; the swapped-label mutation finds
+// every shape.
+//
+// Proven by swapping the two recorded labels in parseApplicationTerms: with the
+// quoted form all five sites RED, with the bare form all five PASS. The
+// positive controls stay GREEN under that mutation — they author no conflict,
+// so they have no label to swap, which is what shows the mutation is scoped to
+// the leaf-identity path rather than breaking the package.
 //
 // Core fail-on-revert, packed flat-set shape: a conflicting icmp-type /
 // icmp-code repeat inside one inline term must be REJECTED at commit, with the
@@ -274,7 +290,7 @@ applications {
 	tree := hierTree(t, src)
 	if _, err := CompileConfig(tree); err == nil {
 		t.Fatalf("expected commit to REJECT a referenced deny app with a conflicting inline icmp-type")
-	} else if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), "icmp-type") {
+	} else if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"icmp-type"`) {
 		t.Fatalf("error should flag the conflicting icmp-type duplicate, got: %v", err)
 	}
 
@@ -395,7 +411,7 @@ func TestApplicationTermICMPDup_Lenient_DowngradesToWarning(t *testing.T) {
 	found := false
 	for _, w := range cfg.Warnings {
 		if strings.Contains(w, "application structure") && strings.Contains(w, "duplicate") &&
-			strings.Contains(w, "icmp-type") {
+			strings.Contains(w, `"icmp-type"`) {
 			found = true
 			break
 		}
