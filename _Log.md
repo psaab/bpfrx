@@ -67647,3 +67647,40 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
   pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_epoch.go,
   pkg/cluster/manager.go, _Log.md
+
+- **Timestamp**: 2026-08-05 10:12 PDT
+- **Action**: #6669 round 16b — finish the failure-path unpark class B4 opened,
+  at the three remaining sites the named ones did not cover.
+- **Why the class needed finishing rather than stopping at B4.** B4 named the
+  three REAL-FLOCK tests. Auditing every `= func(` seam in the package for a
+  blocking receive found three more that park a refine worker and release it
+  only at the end of the body, so a `Fatalf` in between escapes the worker for
+  the rest of the package run: `parkedRefineWorker` (the shared helper, used by
+  three Stop/join tests), `TestOverlappingRefineRequestIsCoalesced_6669` (a
+  two-stage park on `releasePass1`/`releasePass2`) and
+  `TestLateRefineRequestIsReclaimed_6669`. Half-fixing a hygiene class is worse
+  than either end of it.
+- **Severity, stated honestly: these are NOISE-AFTER-A-FAILURE, not the
+  package-wedging shape.** None of them parks in `epochRefineAfterLostClaim`,
+  so none holds `bootEpochRefineMu`; the two sites that could wedge every later
+  test in the package were `TestLateRefineRequestCannotBeStranded_6669` and the
+  new `TestJoinDoesNotBlockBehindAParkedRequester_6669`, both already closed in
+  round 14. What these three leak is a worker parked in `epochFlock` or the
+  release seam, which then reads package vars a later test assigns — a
+  cross-test race reported after an already-failing test.
+- **Fix.** `parkedRefineWorker` registers its own once-guarded release as a
+  `t.Cleanup` before returning it, so every caller is covered and the next one
+  cannot forget; the two inline sites get the same once-guard plus a single
+  cleanup. Callers that already `defer release()` are unaffected — the guard
+  makes the second call a no-op.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 15.4 s. B1's mutation
+  re-proved against THIS tree: RED with "8 goroutine(s) parked in the join after
+  8 timed-out calls" (an assertion, not a build break), restored GREEN over
+  `-count=5`, and `heartbeat_epoch.go` confirmed byte-identical to HEAD after
+  the restore. Because `TestLateRefineRequestIsReclaimed_6669` is one of the two
+  tests in Codex's race repro, that repro was re-run: rc 0 on three consecutive
+  `-count=100` runs, and the eight touched tests rc 0 on three runs at
+  `-count=10`.
+- **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md

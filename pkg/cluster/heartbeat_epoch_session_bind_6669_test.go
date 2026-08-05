@@ -252,6 +252,17 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 	}
 	t.Cleanup(func() { epochFlock = origFlock })
 
+	// UNPARK ON THE FAILURE PATH TOO: t.Fatalf runs runtime.Goexit and skips the
+	// explicit release(s) below, which would leave the parked worker in the seam
+	// for the rest of the package run, reading vars a later test assigns.
+	var p1Once, p2Once sync.Once
+	unparkPass1 := func() { p1Once.Do(func() { close(releasePass1) }) }
+	unparkPass2 := func() { p2Once.Do(func() { close(releasePass2) }) }
+	t.Cleanup(func() {
+		unparkPass1()
+		unparkPass2()
+	})
+
 	m.initHeartbeatEpochState()
 	select {
 	case <-entered:
@@ -261,7 +272,7 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 
 	// The request that must not be lost, made while pass 1 is in flight.
 	m.refreshBootEpoch()
-	close(releasePass1)
+	unparkPass1()
 
 	// Pass 1 runs to completion. Pass 2 must exist at all — that is the fix.
 	select {
@@ -281,7 +292,7 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strconv.FormatUint(raised, 10)+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	close(releasePass2)
+	unparkPass2()
 	waitBootEpochIdle(t, m)
 
 	if got := m.heartbeatBootEpoch(); got <= raised {
@@ -341,6 +352,13 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 	}
 	t.Cleanup(func() { epochRefineBeforeRelease = origHook })
 
+	// UNPARK ON THE FAILURE PATH TOO: t.Fatalf runs runtime.Goexit and skips the
+	// explicit release(s) below, which would leave the parked worker in the seam
+	// for the rest of the package run, reading vars a later test assigns.
+	var unparkOnce sync.Once
+	unparkWorker := func() { unparkOnce.Do(func() { close(releaseWorker) }) }
+	t.Cleanup(unparkWorker)
+
 	m.initHeartbeatEpochState()
 	select {
 	case <-atRelease:
@@ -367,7 +385,7 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strconv.FormatUint(raised, 10)+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	close(releaseWorker)
+	unparkWorker()
 
 	select {
 	case <-entered:

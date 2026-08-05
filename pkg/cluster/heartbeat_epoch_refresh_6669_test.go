@@ -361,7 +361,15 @@ func parkedRefineWorker(t *testing.T, m *Manager) (release func()) {
 	}
 
 	var releaseOnce sync.Once
-	return func() { releaseOnce.Do(func() { close(releaseWorker) }) }
+	release = func() { releaseOnce.Do(func() { close(releaseWorker) }) }
+	// UNPARK ON THE FAILURE PATH TOO, for every caller at once. Callers release
+	// in their bodies, and t.Fatalf runs runtime.Goexit and skips that, which
+	// would leave this worker parked in the seam for the rest of the package run
+	// — where it goes on to read the package vars a later test assigns. Released
+	// here rather than in each caller so the next one cannot forget; the release
+	// is once-guarded, so the body's own call still works.
+	t.Cleanup(release)
+	return release
 }
 
 // TestStopJoinsTheBootEpochRefineWorker_6669 pins the half of Manager.Stop that
