@@ -25,6 +25,17 @@ import (
 // group-authored packed term merged into the stanza). All three reassemble to
 // the same parseApplicationTerms token stream via applicationTermKeys.
 
+// #6814: the leaf name is matched in its QUOTED form throughout this file. The
+// rejection message ends with a STATIC enumeration of every trackable leaf —
+// "(destination-port / source-port / inactivity-timeout / timeout / alg /
+// icmp-type / icmp-code)" — so a bare substring check for the leaf name is
+// satisfied by that boilerplate no matter which leaf actually conflicted, and a
+// swapped label sails through. Only the identifying occurrence is quoted
+// (`conflicting duplicate "icmp-type" inside`), so the quotes are what make
+// "the error names the leaf" an assertion rather than a coincidence. Proven by
+// swapping the two recorded labels in parseApplicationTerms: the quoted form
+// reds all three rejection tests, the bare form passes them.
+//
 // Core fail-on-revert, packed flat-set shape: a conflicting icmp-type /
 // icmp-code repeat inside one inline term must be REJECTED at commit, with the
 // error naming the leaf. Revert the duplicate tracking and the second value
@@ -46,7 +57,7 @@ func TestApplicationTermICMPDup_FlatSet_Rejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected commit to REJECT conflicting duplicate %q inside a term", c.leaf)
 			}
-			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), c.leaf) {
+			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"`+c.leaf+`"`) {
 				t.Fatalf("error should name the duplicate leaf %q, got: %v", c.leaf, err)
 			}
 		})
@@ -99,7 +110,7 @@ func TestApplicationTermICMPDup_Hierarchical_Rejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected commit to REJECT conflicting duplicate %q inside a hierarchical term", c.leaf)
 			}
-			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), c.leaf) {
+			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"`+c.leaf+`"`) {
 				t.Fatalf("error should name the duplicate leaf %q, got: %v", c.leaf, err)
 			}
 		})
@@ -155,7 +166,7 @@ func TestApplicationTermICMPDup_ApplyGroups_Rejected(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected commit to REJECT an apply-groups term with conflicting %q", c.leaf)
 			}
-			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), c.leaf) {
+			if !strings.Contains(err.Error(), "duplicate") || !strings.Contains(err.Error(), `"`+c.leaf+`"`) {
 				t.Fatalf("error should name the duplicate leaf %q, got: %v", c.leaf, err)
 			}
 		})

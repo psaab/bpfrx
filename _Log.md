@@ -1,3 +1,33 @@
+## 2026-08-05 — #6814 fold round 5: the same weak leaf assertion in the three pre-existing rejection tests
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, separate commit on top of 274e24f23)
+- **Action**: Round 4 fixed the bare-substring leaf assertion in the two tests it
+  added. The identical defect was sitting in the THREE pre-existing #5797
+  rejection tests in the same file — `FlatSet_Rejected`,
+  `Hierarchical_Rejected`, `ApplyGroups_Rejected` — all using
+  `strings.Contains(err.Error(), c.leaf)`. Flagged rather than silently widened;
+  the lead scoped it in as a separate commit, on the reasoning that leaving it
+  fixes what bit us rather than the class, and leaves a reader unable to tell
+  which of the two forms in one file is deliberate.
+  All three now match the QUOTED occurrence, with one shared note explaining
+  why: the rejection message ends with a static enumeration of every trackable
+  leaf, so the bare form is satisfied by boilerplate regardless of which leaf
+  conflicted, and only the identifying occurrence is quoted.
+- **Validation**: Same swapped-label mutation as round 4 — the two recorded leaf
+  labels exchanged in `parseApplicationTerms`. Build and vet clean under it.
+  ALL SIX rejection subtests (three tests x icmp-type/icmp-code) go RED; the
+  four positive controls correctly stay GREEN, since they author no conflict and
+  so have no label to swap — which also confirms the mutation is scoped to the
+  rejection path and is not simply breaking the package. Negative control: the
+  three assertions reverted to the BARE form with the mutation still applied
+  PASS (rc=0), so quoting is what added the discrimination in these three too,
+  not a stricter-looking check. Restored both files by pristine-snapshot
+  write-back plus `touch`; production `compiler_applications.go` confirmed
+  byte-identical to HEAD afterwards. Gates from real exit codes on this
+  workstation: `GATE1_RC=0`, `FULL_RC=0`.
+- **File(s)**: `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `_Log.md`
+
 ## 2026-08-05 — #6814 fold round 4: correct four claims, quote the leaf assertion
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, gate at 1314dcb72)
