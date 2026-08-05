@@ -23,6 +23,15 @@ import (
 // the fake stops satisfying it and this file fails to compile — a loud, local
 // signal to update the daemon mirror, instead of a CLI command that silently
 // stops working on the next boot.
+//
+// DO NOT DELETE THIS AS REDUNDANT WITH THE DAEMON-SIDE ASSERTION. They guard
+// opposite halves of the same mirror: the daemon's assertion proves the FACADE
+// still implements the surface; this file proves the INTERFACE still has the
+// shape the daemon copied. A single cross-package assertion would cover both,
+// and is impossible — pkg/daemon imports pkg/cli, so the dependency cannot run
+// the other way. Removing either belt leaves one half unguarded, and the
+// failure mode is a CLI command that reports "unavailable" with a green suite
+// behind it.
 type fakeUserspaceControl5275 struct{}
 
 func (fakeUserspaceControl5275) Status() (dpuserspace.ProcessStatus, error) {

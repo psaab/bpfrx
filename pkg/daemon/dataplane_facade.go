@@ -112,6 +112,25 @@ type facadeBackend interface {
 // that fourth capture is a COMPILE-TIME fact. Without the assertion below,
 // dropping one of these methods leaves a green build and a CLI command that
 // quietly stopped working.
+//
+// THE ASYMMETRY THAT MAKES THIS NECESSARY — do not assume the other three
+// mirrors' protection extends here. apiDataPlane/grpcDataPlane/cliDataPlane are
+// each ASSIGNED into a downstream Config/constructor, so Go checks them at the
+// assignment site and drift is a build failure there; that is why
+// runtime_probes.go can say "signature drift surfaces as a compile error at the
+// call site". cliUserspaceControlProvider has NO assignment site — pkg/cli
+// type-asserts the handle it already holds, at RUNTIME, inside
+// userspaceDataplaneControl(). A handle that does not satisfy it compiles
+// perfectly and fails only when an operator runs the command. This declaration
+// plus the assertion below is what replaces the missing compile-time check.
+//
+// TWO BELTS, AND NEITHER IS REDUNDANT. This assertion proves the FACADE still
+// implements the surface. A sibling test in pkg/cli
+// (userspace_control_shape_5275_test.go) proves the INTERFACE still has the
+// shape this mirror copies. Both are needed because a single cross-package
+// assertion is impossible: pkg/daemon imports pkg/cli, so pkg/cli cannot import
+// pkg/daemon to assert against the facade directly. Deleting either belt leaves
+// one side of the mirror unguarded.
 type cliUserspaceControl interface {
 	Status() (dpuserspace.ProcessStatus, error)
 	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
