@@ -1811,12 +1811,16 @@ func ValidateConfig(cfg *Config) []string {
 	// compiled so they stop silently vanishing, but are ACCEPTED-ONLY today.
 	warnings = append(warnings, validateInterfaceParityWarnings(cfg)...)
 
-	// #4788's `tunnel mode ipip` advisory was REPLACED by a hard commit gate in
-	// #4785 half 1 (validateIpipTunnelUnimplementedStrict, wired in
-	// compiler_tailgates.go). An advisory was the wrong severity: the tunnel is
-	// dead in both directions, so the config cannot do what it says at all.
-	// The advisory text survives as the gate's lenient-path warning, which is
-	// the only path that still needs to tolerate it (#1960 load / peer-sync).
+	// #4788 + #4785 half 1: `tunnel mode ipip` is now HARD-REJECTED at commit
+	// (validateIpipTunnelUnimplementedStrict, compiler_tailgates.go), but the
+	// advisory MUST stay registered here. The alarm surfaces — `show system
+	// alarms` in the CLI and gRPC, plus the two security-alarm views —
+	// RECOMPUTE ValidateConfig from the ACTIVE config rather than reading
+	// cfg.Warnings, so removing it left a box already carrying a dead tunnel
+	// (committed by an older build, loaded leniently per #1960) reporting "No
+	// alarms currently active". The strict gate covers the next commit; this
+	// covers the config already on disk.
+	warnings = append(warnings, validateIpipTunnelDeadWarning(cfg)...)
 
 	// #4309 (fable-review-167 I-4): DHCP relay overrides accepted-only advisory.
 	warnings = append(warnings, validateDHCPRelayParityWarnings(cfg)...)

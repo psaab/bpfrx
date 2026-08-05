@@ -1,3 +1,61 @@
+## 2026-08-05 — #4785 half 1 round 2: resolve the EFFECTIVE tunnel mode, and put the advisory back on the alarm path
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: Two MAJORs from the gate, both real.
+  **The gate over-rejected an effective-GRE device.** Round 1 keyed on the
+  compiled mode rather than the interface name so an `ip-*` interface set
+  to GRE still commits (proved as M7), but it walked the compiled records
+  individually. An interface-level `tunnel` stanza and a `unit 0 tunnel`
+  stanza compile to TWO records carrying the SAME Linux device name — only
+  unit N>0 gets the "uN" suffix — and `routing.tunnelManager.Apply` keys
+  its desired set by `tc.Name` while `tunnelConfigsFor` appends the
+  interface record BEFORE the units, so for a shared name the UNIT record
+  is the one realized. Verified by probe, not inference:
+  `ip-0/0/0 tunnel source/destination` + `unit 0 tunnel mode gre`
+  compiles to iface=ipip, unit0=gre, both on device `ip-0-0-0` — a working
+  GRE tunnel that round 1 rejected. Replaced the per-record walk with
+  `effectiveIpipTunnelSites`, which resolves winner-per-device the way the
+  applier does and reports only winners. Unit N>0 is a different device and
+  shadows nothing, so an interface-level ipip stanza beside it is still
+  reported — pinned as its own counter-test so the over-rejection fix
+  cannot silently become an under-rejection.
+  Hardening found while fixing that: keying the winner map on the device
+  name collapses every record whose Name is empty onto one entry, which
+  UNDER-reports (the fail-open direction). Unnamed records now get unique
+  keys. The determinism test's fixture had exactly that shape — hand-built
+  `TunnelConfig`s with no Name — so it was made realistic rather than
+  worked around.
+  **The alarm surface regressed.** Round 1 removed the #4788 advisory from
+  `ValidateConfig`, reasoning the gate's lenient-path warning replaced it.
+  It does not: `cli_show_system.go`, `server_show_system.go`,
+  `server_show_security_text.go` and `cli_show_security_log.go` all
+  RECOMPUTE `ValidateConfig(cfg)` from the ACTIVE config rather than
+  reading `cfg.Warnings`. So a box already carrying a dead tunnel got a
+  one-time apply log and a standing "No alarms currently active" — the
+  strict gate never reaches that box, because its config was committed by
+  an older build and loads leniently. Advisory restored and re-registered,
+  now sharing `effectiveIpipTunnelSites` + `ipipUnimplementedText` with the
+  strict gate so the two cannot drift.
+  Also: added the WireGuard positive control the gate flagged as missing
+  (WireGuard is the mode the error message recommends, which would be a
+  poor recommendation if the gate rejected it); split the malformed
+  `docs/feature-coverage.md` row — the IPIP text had been appended AFTER
+  the row's closing pipe, making a third cell against a two-column header —
+  into its own two-cell row; and narrowed the rollback wording in this log
+  and in the PR body to what was actually verified (that path applies the
+  stashed compiled config directly, so no compile runs on it) rather than
+  the wider "no recompile at rollback".
+- **Validation**: ten-mutation matrix, snapshot-and-write-back restore with
+  byte-for-byte verify, every mutant required to compile. All ten RED,
+  including the two new ones: dropping the device-name shadowing (which
+  restores the over-rejection) and dropping the ValidateConfig advisory
+  registration (which restores the silent alarm surface). Full
+  `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/ipip_tunnel_reject_4785_test.go`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-05 — #4785 half 1: reject `tunnel mode ipip` at commit instead of accepting into a blackhole
 
 - **Timestamp**: 2026-08-05 (fix/4785-ipip-reject)
@@ -28,13 +86,17 @@
   the compiled MODE, not the interface name, so `ip-0/0/0 tunnel mode gre`
   still commits; a name-keyed gate would take working GRE tunnels down and
   is one of the mutations below.
-  Checked the no-brick surface the lead asked about rather than assuming
-  it: `Store.Load` and `Store.SyncApply` go through `compileTreeLenient` ->
+  Checked the no-brick surface rather than assuming it: `Store.Load` and
+  `Store.SyncApply` go through `compileTreeLenient` ->
   `CompileConfigLenient` -> `lenientCompileOpts()`, so the new opt makes
-  both warn. The commit-confirmed rollback needs no gate at all — the
-  target is `s.confirmPrevCfg`, which `PromoteRollback` returns as the
-  ALREADY-COMPILED active config stashed by reference at commit time, so
-  there is no recompile at rollback and a strict gate cannot fail it.
+  both warn. For commit-confirmed, what was VERIFIED is narrower than the
+  first wording claimed: `PromoteRollback` returns `s.confirmPrevCfg`,
+  which `CommitConfirmed` sets to `s.compiled` — the already-compiled
+  active config, stashed by reference — and the daemon applies that value
+  directly (`applyConfigLocked(prevCfg)`), so no compile runs on THAT
+  path and the new gate is not reached by it. That is a statement about
+  this rollback path only; it is not a claim that nothing anywhere
+  recompiles a rollback target.
   Three pre-existing tests (TestIPIPTunnelSetSyntax,
   TestIPIPTunnelExplicitMode, TestIPIPTunnelWithRoutingInstance) compiled
   IPIP through `CompileConfig` and expected success. Their subject is field
