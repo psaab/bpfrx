@@ -285,8 +285,18 @@ type Daemon struct {
 	// listener + authentication snapshot against the committed web-management
 	// config (make-before-break rebind on an endpoint change; live auth swap on
 	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
-	mgmt      *managementReconciler
-	snmpAgent *snmp.Agent
+	mgmt *managementReconciler
+	// staleCertHostName holds a kernel host name that applyHostname applied
+	// BEFORE mgmt existed, so the management-TLS staleness diagnostic can be
+	// delivered once the server is constructed (#6827). The boot config apply
+	// runs in startup phase 4 (setupDataplaneAndInitialConfig -> applyConfig)
+	// while startHTTPServer builds mgmt much later in Run, so a host name
+	// committed for the first boot would otherwise reach a nil reconciler and
+	// vanish. Guarded by staleCertMu — set on the apply path, drained on the
+	// startup path.
+	staleCertMu       sync.Mutex
+	staleCertHostName string
+	snmpAgent         *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in

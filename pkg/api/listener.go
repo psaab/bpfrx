@@ -37,6 +37,34 @@ type listenerLeg struct {
 	dead atomic.Bool
 }
 
+// serving reports whether this leg is actually carrying traffic right now: it
+// exists, holds a listener, its serve loop has not exited on its own
+// (`dead`), and no graceful retirement has been requested (`stopCh`).
+//
+// A non-nil leg pointer is NOT that question (#6827). An unexpected serve exit
+// only sets `dead` and leaves the leg INSTALLED in s.httpsLeg, and a requested
+// retirement only closes stopCh while the leg drains — in both states the
+// pointer is live and the socket is not. A caller that reads the leg to answer
+// "what is this box serving?" must test the state, not the pointer.
+//
+// Deliberately stricter than EffectiveHTTPAddr's inline check, which tests nil
+// / ln / dead but NOT stopCh: that one answers `show system services`, where a
+// leg draining under a requested shutdown should still report the address it is
+// finishing on. This one answers "is there a certificate in front of clients
+// right now?", where a leg on its way out must not be diagnosed. The two
+// questions differ, so they are not folded into one predicate.
+func (l *listenerLeg) serving() bool {
+	if l == nil || l.ln == nil || l.dead.Load() {
+		return false
+	}
+	select {
+	case <-l.stopCh:
+		return false // retirement requested; the leg is draining
+	default:
+		return true
+	}
+}
+
 // serveLegLocked launches srv on ln in a background goroutine registered on the
 // server wait group, and returns the leg. The goroutine serves until (a) the
 // listener terminates on its own, (b) the leg is explicitly retired

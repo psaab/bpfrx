@@ -1,3 +1,61 @@
+## 2026-08-05 — #6827 fold r3: two REACH findings — the hook's own boot ordering, and a dead leg treated as live
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded two runtime MAJORs from the gate at `78b70ed3f`. Both are
+  about WHETHER the diagnostic has something real to look at, not about the
+  narrowing heuristic (which the gate passed and I did not touch).
+  (1) **The hook was itself ordered before its dependency.** Verified the chain
+  first: the initial config apply is startup phase 4
+  (`daemon_run.go:170` → `setupDataplaneAndInitialConfig` →
+  `daemon_run_bringup.go:520` `applyConfig` → `applyTailReconciles` →
+  `applyHostname`), while `startHTTPServer` constructs `d.mgmt` at
+  `daemon_run_servers.go:475`, reached from `daemon_run.go:588`. So a
+  `system host-name` applied at boot reached a nil reconciler. A bare
+  nil-check-and-return would have reproduced the original silence exactly,
+  because the surviving fallback — the load path's INFERRED heuristic —
+  declines this very shape (cert `[localhost, oldfw.example.com]` qualified vs
+  new name `new-fw` unqualified). The name is now PARKED on the Daemon
+  (`staleCertHostName`, mutex-guarded) and delivered by
+  `drainDeferredStaleCertHostName` immediately after the boot management start,
+  still carrying `hostNameOperatorSet` evidence. The drain CONSUMES the name
+  unconditionally: with no serving leg there is nothing to be stale, and
+  holding it would let a later HTTPS enable replay an arbitrarily old rename as
+  though it just happened.
+  (2) **A terminated leg was still treated as live.** An unexpected serve exit
+  sets only `leg.dead` (`listener.go:69` — marking it under `lifeMu` would
+  deadlock a shutdown racing the exit) and leaves the leg INSTALLED in
+  `s.httpsLeg`; a leg retiring under a requested shutdown is likewise installed
+  while it drains, and on THAT path `dead` is never set. The r1 predicate was a
+  non-nil pointer test, so both states produced a warning about a certificate no
+  socket is presenting — the same false positive the construction template was
+  rejected for. Added `listenerLeg.serving()` (non-nil + listener + not `dead` +
+  no retirement requested) and switched the diagnostic to it. Deliberately
+  STRICTER than `EffectiveHTTPAddr`'s inline check, which omits the `stopCh`
+  test because `show system services` should still report a draining leg's
+  address; the two questions differ, so they are not folded into one predicate.
+- **Validation**: two mutations, each with `go build ./...` + `go vet` rc=0
+  first so the RED is an ASSERTION; each file restored from a byte snapshot and
+  re-verified with `sha256sum -c`.
+  (1) replace the park with `if d.mgmt == nil { return }` (the reviewed
+  anti-pattern) → `boot_rename_is_diagnosed_once_mgmt_is_up` FAILs with
+  `got ""` — the original silence, verbatim — plus
+  `last_name_wins_while_mgmt_is_down`;
+  (2) revert `serving()` to the r1 `s.httpsLeg != nil` → all three of
+  `dead_leg_is_not_diagnosed` / `draining_leg_is_not_diagnosed` /
+  `leg_without_a_listener_is_not_diagnosed` FAIL, each logging a full
+  host-name warning for a leg serving nothing.
+  Note the r1 api test helper built legs with no listener, so adopting
+  `serving()` correctly turned every positive subtest silent until the helper
+  was fixed to construct a genuinely SERVING leg — the predicate binding its own
+  fixtures.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/listener.go`,
+  `pkg/api/tls_stale_cert_6827_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
 ## 2026-08-05 — #6827 fold r2: write down the accepted residual of the narrowing heuristic
 
 - **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)

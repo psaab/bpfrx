@@ -214,4 +214,116 @@ func TestWarnStaleMgmtCertForHostNameWithoutServer_6827(t *testing.T) {
 	d := &Daemon{}
 	d.mgmt = newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
 	d.warnStaleMgmtCertForHostName("new-fw-6827")
+	d.drainDeferredStaleCertHostName()
+}
+
+// TestBootHostNameReachesTheDiagnostic_6827 is a FAIL-ON-REVERT guard for the
+// BOOT ordering of the hook itself.
+//
+// The hook was added to applyHostname to remove an ordering hazard, and at boot
+// it is ITSELF ordered before its dependency: the first config apply runs in
+// startup phase 4 (daemon_run.go -> setupDataplaneAndInitialConfig ->
+// applyConfig -> applyTailReconciles -> applyHostname) while startHTTPServer
+// constructs d.mgmt much later in Run. A `system host-name` applied at boot
+// therefore reaches a nil reconciler.
+//
+// Skipping on nil would reproduce the exact silence this diagnostic exists to
+// remove, because the fallback — the load path's INFERRED heuristic — declines
+// precisely this shape: a cert naming `oldfw.example.com` (qualified) next to a
+// new kernel name `new-fw` (unqualified) is silent there by design. So the name
+// is parked and delivered at construction with operator-set evidence.
+//
+// RED on revert: replace the park in warnStaleMgmtCertForHostName with
+// `if d.mgmt == nil { return }` and boot_rename_is_diagnosed_once_mgmt_is_up
+// logs nothing.
+func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
+	t.Run("boot_rename_is_diagnosed_once_mgmt_is_up", func(t *testing.T) {
+		// Phase 4: applyHostname runs with d.mgmt still nil.
+		d := &Daemon{}
+		restoreSet, restorePath := sethostname, hostnamePath
+		t.Cleanup(func() { sethostname, hostnamePath = restoreSet, restorePath })
+		var applied []string
+		sethostname = func(b []byte) error { applied = append(applied, string(b)); return nil }
+		hostnamePath = filepath.Join(t.TempDir(), "hostname")
+
+		bootOut := captureDaemonWarn(t, func() {
+			cfg := &config.Config{}
+			cfg.System.HostName = "new-fw-6827"
+			d.applyHostname(cfg)
+		})
+		if len(applied) != 1 || applied[0] != "new-fw-6827" {
+			t.Fatalf("boot apply did not set the kernel name: %v", applied)
+		}
+		if strings.Contains(bootOut, "does not cover the current host-name") {
+			t.Fatalf("nothing is serving a certificate yet; the boot apply must not warn: %q", bootOut)
+		}
+
+		// Later in Run: the management server is constructed with an HTTPS leg
+		// serving a certificate minted for the OLD name, and the parked name is
+		// delivered.
+		reg := newFakeReg()
+		m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
+		d.mgmt = m
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err != nil {
+			t.Fatalf("start HTTP leg: %v", err)
+		}
+		dir := t.TempDir()
+		seedDurableCert(t, dir, "old-fw-6827", "10.0.0.1")
+		m.srv.SetTLSCertDirForTest(dir)
+		if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.1:8443", nil)); err != nil {
+			t.Fatalf("enable HTTPS: %v", err)
+		}
+
+		out := captureDaemonWarn(t, func() { d.drainDeferredStaleCertHostName() })
+		if !strings.Contains(out, "does not cover the current host-name") {
+			t.Fatalf("a host name applied before the management server existed must still be "+
+				"diagnosed once it comes up; got %q", out)
+		}
+		if !strings.Contains(out, "new-fw-6827") {
+			t.Fatalf("the deferred diagnostic must name the host name that was applied; got %q", out)
+		}
+
+		// The parked name is CONSUMED: a second drain says nothing, so a later
+		// HTTPS enable cannot replay a rename from arbitrarily far in the past.
+		if again := captureDaemonWarn(t, func() { d.drainDeferredStaleCertHostName() }); again != "" {
+			t.Fatalf("the parked host name must be consumed by the first drain; got %q", again)
+		}
+	})
+
+	t.Run("drain_without_a_parked_name_is_silent", func(t *testing.T) {
+		reg := newFakeReg()
+		d := &Daemon{}
+		d.mgmt = newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
+		if out := captureDaemonWarn(t, func() { d.drainDeferredStaleCertHostName() }); out != "" {
+			t.Fatalf("a boot with no rename must not warn; got %q", out)
+		}
+	})
+
+	t.Run("last_name_wins_while_mgmt_is_down", func(t *testing.T) {
+		// Only the name the kernel actually ends on is worth diagnosing.
+		d := &Daemon{}
+		d.warnStaleMgmtCertForHostName("interim-fw-6827")
+		d.warnStaleMgmtCertForHostName("final-fw-6827")
+		d.staleCertMu.Lock()
+		got := d.staleCertHostName
+		d.staleCertMu.Unlock()
+		if got != "final-fw-6827" {
+			t.Fatalf("parked host name = %q, want the last one applied", got)
+		}
+	})
+}
+
+// captureDaemonWarn runs fn with slog redirected to a buffer and returns what
+// was logged at WARN or above.
+func captureDaemonWarn(t *testing.T, fn func()) string {
+	t.Helper()
+	restore := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(restore) })
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	fn()
+	slog.SetDefault(restore)
+	return buf.String()
 }

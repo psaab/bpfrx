@@ -1193,10 +1193,17 @@ func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hos
 // nothing to be stale — a no-op. It deliberately reads the LIVE leg only, never
 // the s.httpsServer construction template, which survives a TLS disable and
 // would otherwise produce warnings about a certificate nobody serves.
+//
+// "Live" is listenerLeg.serving(), not a non-nil pointer (#6827). A leg whose
+// serve loop exited unexpectedly stays INSTALLED in s.httpsLeg with only its
+// `dead` flag set, and a leg retiring under a requested shutdown is still
+// installed while it drains — diagnosing either would report a certificate that
+// no socket is presenting, which is the same false positive the construction
+// template was rejected for.
 func (s *Server) WarnStaleMgmtCertForHostName(hostName string) {
 	s.lifeMu.Lock()
 	var srv *http.Server
-	if s.httpsLeg != nil {
+	if s.httpsLeg.serving() {
 		srv = s.httpsLeg.srv
 	}
 	s.lifeMu.Unlock()

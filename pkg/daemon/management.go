@@ -260,15 +260,60 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 
 // warnStaleMgmtCertForHostName asks the live management server to re-run its
 // stale-certificate diagnostic for a host name that was JUST applied to the
-// kernel (#6827). A nil reconciler (API disabled) or a server that never bound
-// is a no-op.
+// kernel (#6827).
 //
 // This is deliberately NOT part of reconcile(): reconcile runs early in the
 // apply, before applyHostname, so it can only ever observe the OLD kernel name.
 // The rename call site owns this because it is the only one that runs after the
 // name is real.
+//
+// A nil reconciler is NOT simply skipped. The FIRST config apply happens in
+// startup phase 4 (setupDataplaneAndInitialConfig -> applyConfig ->
+// applyTailReconciles -> applyHostname) while startHTTPServer constructs mgmt
+// much later in Run, so at boot this call lands before its own dependency
+// exists. Returning here would reproduce exactly the silence this diagnostic
+// was added to remove: the appliance takes its configured name, the cert that
+// gets loaded moments later names something else, and the only surviving check
+// is the load path's INFERRED heuristic — which declines whenever the cert's
+// naming shape does not match the new name (SANs [localhost,
+// oldfw.example.com] + host `new-fw` is silent by design there). So the name is
+// PARKED and delivered at construction, where the evidence is still
+// hostNameOperatorSet.
 func (d *Daemon) warnStaleMgmtCertForHostName(hostName string) {
-	if d == nil || d.mgmt == nil {
+	if d == nil {
+		return
+	}
+	if d.mgmt == nil {
+		d.staleCertMu.Lock()
+		// Last writer wins: if the name moves again before the server comes up,
+		// only the name the kernel actually ends on is worth diagnosing.
+		d.staleCertHostName = hostName
+		d.staleCertMu.Unlock()
+		return
+	}
+	d.mgmt.warnStaleCertForHostName(hostName)
+}
+
+// drainDeferredStaleCertHostName delivers a host name parked by
+// warnStaleMgmtCertForHostName before mgmt existed (#6827). startHTTPServer
+// calls it once, immediately after the management server's boot start.
+//
+// It consumes the parked name unconditionally, including when the start failed
+// or HTTPS is off. That is correct rather than lossy: the diagnostic reports on
+// a certificate the box is SERVING, so if no HTTPS leg came up there is nothing
+// to be stale, and holding the name for some later enable would eventually
+// report a rename from arbitrarily far in the past as though it just happened.
+// A later HTTPS enable re-reads the cert through the load path, which sees the
+// by-then-current kernel name.
+func (d *Daemon) drainDeferredStaleCertHostName() {
+	if d == nil {
+		return
+	}
+	d.staleCertMu.Lock()
+	hostName := d.staleCertHostName
+	d.staleCertHostName = ""
+	d.staleCertMu.Unlock()
+	if hostName == "" || d.mgmt == nil {
 		return
 	}
 	d.mgmt.warnStaleCertForHostName(hostName)

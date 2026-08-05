@@ -387,6 +387,24 @@ under the daemon's errgroup. Nothing else imports this package.
         name — which is why this entry point takes the host name as a
         PARAMETER (the caller passes the name it just applied) instead of
         re-reading `os.Hostname()`.
+        At BOOT this hook runs before its own dependency exists: the first
+        config apply is startup phase 4 while `startHTTPServer` builds `d.mgmt`
+        later in `Run`. A nil reconciler therefore PARKS the name
+        (`Daemon.staleCertHostName`) and `drainDeferredStaleCertHostName`
+        delivers it right after the boot start — skipping on nil would
+        reproduce the original silence, because the load-path fallback declines
+        exactly this shape (see the narrowing rule below). The drain consumes
+        the name whether or not HTTPS came up: with no serving leg there is no
+        certificate to be stale, and holding it would let a later enable replay
+        a long-past rename as if it were fresh.
+      Both entry points read the LIVE HTTPS leg via `listenerLeg.serving()` —
+      not a non-nil pointer. An unexpected serve exit leaves the leg INSTALLED
+      with only `dead` set, and a leg retiring under a requested shutdown is
+      installed while it drains; diagnosing either reports a certificate no
+      socket is presenting. `serving()` is deliberately stricter than
+      `EffectiveHTTPAddr`'s inline check (which omits the `stopCh` test):
+      that one answers `show system services`, where a draining leg should
+      still report its address.
       Both parse the leaf ONCE and share these checks (`certCoversHost` — the
       same strict `x509.VerifyHostname` check a remote client applies):
       - **no SAN at all** (`certHasNoSANs`) — a pair persisted by an older build

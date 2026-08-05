@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -46,15 +47,34 @@ func mintCert(t *testing.T, hostname, bindHost string) tls.Certificate {
 	return cert
 }
 
+// stubLn is a minimal net.Listener so a hand-built listenerLeg satisfies
+// listenerLeg.serving() without binding a socket.
+type stubLn struct{ closed chan struct{} }
+
+func newStubLn() *stubLn                    { return &stubLn{closed: make(chan struct{})} }
+func (l *stubLn) Accept() (net.Conn, error) { <-l.closed; return nil, net.ErrClosed }
+func (l *stubLn) Close() error              { close(l.closed); return nil }
+func (l *stubLn) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// newLeg builds a listenerLeg in the SERVING state: a listener installed, the
+// serve loop not exited, no retirement requested. Constructing it directly
+// (rather than binding a socket) keeps the test deterministic —
+// WarnStaleMgmtCertForHostName reads only the leg state and srv.
+func newLeg(cert tls.Certificate, addr string) *listenerLeg {
+	return &listenerLeg{
+		srv: &http.Server{
+			Addr:      addr,
+			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		},
+		ln:     newStubLn(),
+		stopCh: make(chan struct{}),
+	}
+}
+
 // legServing returns a Server whose LIVE HTTPS leg serves cert at addr.
-// Constructing the leg directly (rather than binding a socket) keeps the test
-// deterministic: WarnStaleMgmtCertForHostName reads only httpsLeg.srv.
 func legServing(cert tls.Certificate, addr string) *Server {
 	s := &Server{}
-	s.httpsLeg = &listenerLeg{srv: &http.Server{
-		Addr:      addr,
-		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
-	}}
+	s.httpsLeg = newLeg(cert, addr)
 	return s
 }
 
@@ -300,6 +320,43 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 		out := captureWarn(t, func() { (&Server{}).WarnStaleMgmtCertForHostName("new-fw") })
 		if out != "" {
 			t.Fatalf("a server with no HTTPS leg serves no management cert; got %q", out)
+		}
+	})
+
+	t.Run("dead_leg_is_not_diagnosed", func(t *testing.T) {
+		// An UNEXPECTED serve exit sets only leg.dead and leaves the leg
+		// INSTALLED in s.httpsLeg (listener.go: marking it under lifeMu would
+		// deadlock a shutdown racing the exit). A non-nil pointer therefore does
+		// not mean a socket is presenting this certificate — diagnosing it would
+		// report a cert nobody serves, the same false positive the construction
+		// template was rejected for (#6827).
+		s := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+		s.httpsLeg.dead.Store(true)
+		out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
+		if out != "" {
+			t.Fatalf("a leg whose serve loop exited must not be diagnosed; got %q", out)
+		}
+	})
+
+	t.Run("draining_leg_is_not_diagnosed", func(t *testing.T) {
+		// A leg retiring under a requested shutdown (stopLegLocked closed stopCh)
+		// is also still installed while it drains. `dead` is NOT set on this path
+		// — the goroutine takes the stopCh branch — so testing `dead` alone would
+		// miss it.
+		s := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+		close(s.httpsLeg.stopCh)
+		out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
+		if out != "" {
+			t.Fatalf("a leg draining under a requested retirement must not be diagnosed; got %q", out)
+		}
+	})
+
+	t.Run("leg_without_a_listener_is_not_diagnosed", func(t *testing.T) {
+		s := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+		s.httpsLeg.ln = nil
+		out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
+		if out != "" {
+			t.Fatalf("a leg holding no listener must not be diagnosed; got %q", out)
 		}
 	})
 
