@@ -1,3 +1,65 @@
+## 2026-08-05 — #4785 half 1 round 3: gate on EMITTED endpoints; the round-2 shadowing fix was an under-rejection
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: The round-2 fix turned an over-rejection into an
+  UNDER-rejection — the sharp edge I had named and still walked into.
+  Reproduced against the round-2 head e3754bc4c BEFORE writing the fixture,
+  so it is not green on both sides: `ip-0/0/0 tunnel src/dst` +
+  `unit 0 tunnel mode gre` + a bare `unit 2` returned nil from
+  `CompileConfig`, produced ZERO `#4785` advisories (alarm surface silent),
+  and the emitter published BOTH `ip-0/0/0.0` gre and `ip-0/0/0.2` **ipip**.
+  The same input was correctly REJECTED one commit earlier.
+  Mechanism: my walk skipped units without their own tunnel stanza
+  (`unit.Tunnel == nil { continue }`), while the emitter hands those exact
+  units the interface-level tunnel — and says so in a comment directly
+  above the code, in the file I had cited in my own report. Unit 0's GRE
+  record shadowed the interface record on the shared device key, and the
+  inheriting sibling was never visited.
+  Root cause was deeper than the skip: the gate hand-rolled a model of
+  "which tunnels are real", naming `routing.tunnelManager` as the
+  authority. Under the userspace dataplane that is wrong — the anchor is
+  mode-INDEPENDENT; what decides `gre_decap_index` membership versus the
+  `TunnelKind::Unknown` drop arm is the EMITTED endpoint's mode. Deleted
+  the model and routed the gate through `EmitTunnelEndpointNames`, the
+  existing SSOT that `buildTunnelEndpointSnapshots` consumes and that the
+  sibling gate `validateTunnelEndpointIDCollisionAST` is already built on.
+  That single change closes B1 (inheritance handled by the emitter), B2
+  (right authority, same drift guarantee) and N4 (the emitter's
+  source/destination screen means a reported endpoint really is emitted, so
+  the indicative wording is now accurate and `tunnel destination` with no
+  source is no longer reported).
+  It also CORRECTS a rejection: `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel
+  mode gre` emits only `ip-0/0/0.1` gre, so nothing dead reaches the
+  dataplane and it now commits. Recorded as its own test — the previous
+  round rejected it, defensibly on a kernel-anchor argument but not for the
+  reason its error text gave.
+  Also corrected: my round-2 log entry claimed a WireGuard positive control
+  was added. It was added but could NOT fire — wrong syntax
+  (`tunnel listen-port` rather than `tunnel wireguard listen-port`), so
+  both fixtures were rejected earlier by the WireGuard validator, and the
+  assertion was only "the error is not mine", which that satisfies.
+  Mutating the gate to also flag `wireguard` left it PASSING. Rewritten to
+  assert `err == nil` on a fixture complete enough to compile. The entry
+  has been amended in place rather than left standing.
+  N1 (tolerant path emitted the ~500-char paragraph twice — `runTailGates`
+  folds `ValidateConfig` into `cfg.Warnings` before the gate runs, and the
+  lenient arm appended again), N3 (the 44-line doc block ran into the type
+  with no blank line, so godoc attached it to `ipipTunnelSite` and the
+  function had none — file rewritten with the doc on the function), N5
+  (advisory lists every dead endpoint, with an ordered-identity test rather
+  than a count), and N6 (the rejection test asserted only `#4785` and
+  `mode gre`; it now asserts the cause, the both-directions claim and WHICH
+  emitted endpoint is dead).
+- **Validation**: ten-mutation matrix retargeted to the emitter-based gate,
+  snapshot-and-write-back restore with byte-for-byte verify, every mutant
+  required to compile. The skip-inherited-unit mutant was first written
+  with `strings.HasSuffix` in a file that does not import `strings` — a
+  BUILD-BREAK is a false red, so it was re-expressed with slicing before
+  being scored. Full `go test ./pkg/... ./cmd/...` passes.
+  NOT run: cluster/smoke — config-layer change; scheduled centrally.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`
+  (rewritten), `pkg/config/ipip_tunnel_reject_4785_test.go`, `_Log.md`
+
 ## 2026-08-05 — #4785 half 1 round 2: resolve the EFFECTIVE tunnel mode, and put the advisory back on the alarm path
 
 - **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
@@ -36,9 +98,10 @@
   an older build and loads leniently. Advisory restored and re-registered,
   now sharing `effectiveIpipTunnelSites` + `ipipUnimplementedText` with the
   strict gate so the two cannot drift.
-  Also: added the WireGuard positive control the gate flagged as missing
-  (WireGuard is the mode the error message recommends, which would be a
-  poor recommendation if the gate rejected it); split the malformed
+  Also: added a WireGuard positive control (later found NOT to fire — it
+  used the wrong `tunnel listen-port` syntax and asserted only that the
+  error was somebody else's; corrected in the next round to assert the
+  config COMMITS); split the malformed
   `docs/feature-coverage.md` row — the IPIP text had been appended AFTER
   the row's closing pipe, making a third cell against a two-column header —
   into its own two-cell row; and narrowed the rollback wording in this log

@@ -41,8 +41,9 @@ func ipipTree(t *testing.T, cmds ...string) *ConfigTree {
 // loudly as gutting the gate body.
 func TestIpipTunnelRejectedAtCommit_4785(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		cmds []string
+		name         string
+		cmds         []string
+		wantEndpoint string
 	}{
 		{
 			// The inference case: the operator never types "ipip". An `ip-*`
@@ -53,6 +54,7 @@ func TestIpipTunnelRejectedAtCommit_4785(t *testing.T) {
 				"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
 				"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
 			},
+			wantEndpoint: "ip-0/0/0",
 		},
 		{
 			// Explicit mode on a gr-* interface: the name says GRE, the mode
@@ -63,6 +65,7 @@ func TestIpipTunnelRejectedAtCommit_4785(t *testing.T) {
 				"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
 				"set interfaces gr-0/0/0 tunnel mode ipip",
 			},
+			wantEndpoint: "gr-0/0/0",
 		},
 		{
 			name: "unit-level tunnel",
@@ -70,6 +73,7 @@ func TestIpipTunnelRejectedAtCommit_4785(t *testing.T) {
 				"set interfaces ip-0/0/1 unit 5 tunnel source 10.0.0.1",
 				"set interfaces ip-0/0/1 unit 5 tunnel destination 10.0.0.2",
 			},
+			wantEndpoint: "ip-0/0/1.5",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -79,12 +83,23 @@ func TestIpipTunnelRejectedAtCommit_4785(t *testing.T) {
 					"configured, UP interface that passes no traffic in either direction "+
 					"and no error to act on (#4785). cmds: %v", tc.cmds)
 			}
-			if !strings.Contains(err.Error(), "#4785") {
-				t.Errorf("rejection must cite the tracking issue so the operator can find "+
-					"the status of the unimplemented feature; got: %v", err)
-			}
-			if !strings.Contains(err.Error(), "mode gre") {
-				t.Errorf("rejection must name the working alternative; got: %v", err)
+			// #4785 re-gate: assert the message CONTENT, not just that some
+			// error occurred. A bare `err != nil` is one unrelated validator
+			// away from passing for the wrong reason — which is exactly how the
+			// WireGuard control in this file failed to fire.
+			for _, want := range []string{
+				"#4785",            // the tracking issue, so status is findable
+				"mode gre",         // the working alternative
+				"ipip",             // the cause
+				"NOT implemented",  // that it is unimplemented, not misconfigured
+				"either direction", // that it is dead both ways
+				tc.wantEndpoint,    // WHICH emitted endpoint is dead
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("rejection message is missing %q — an operator needs the cause, "+
+						"the affected endpoint and the alternative, not just a failure; "+
+						"got: %v", want, err)
+				}
 			}
 		})
 	}
@@ -173,14 +188,20 @@ func TestIpipTunnelRejectionDoesNotOverreach_4785(t *testing.T) {
 // reported error is stable across runs (Go map order is randomized) and both HA
 // nodes report identically on the same config.
 func TestIpipTunnelGateReportsDeterministically_4785(t *testing.T) {
-	cfg := &Config{}
-	// Device names are set the way compileInterfaces sets them: each interface
-	// owns a DISTINCT Linux device, so none shadows another. A fixture leaving
-	// Name empty would collapse all three onto one device and test nothing.
-	cfg.Interfaces.Interfaces = map[string]*InterfaceConfig{
-		"ip-0/0/9": {Name: "ip-0/0/9", Tunnel: &TunnelConfig{Name: "ip-0-0-9", Mode: "ipip"}},
-		"ip-0/0/0": {Name: "ip-0/0/0", Tunnel: &TunnelConfig{Name: "ip-0-0-0", Mode: "ipip"}},
-		"ip-0/0/5": {Name: "ip-0/0/5", Tunnel: &TunnelConfig{Name: "ip-0-0-5", Mode: "ipip"}},
+	// Endpoints need source AND destination: the emitter screens a non-WireGuard
+	// tunnel missing either, so a fixture without them emits nothing and the
+	// test would assert on an empty set.
+	tree := ipipTree(t,
+		"set interfaces ip-0/0/9 tunnel source 10.0.9.1",
+		"set interfaces ip-0/0/9 tunnel destination 10.0.9.2",
+		"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces ip-0/0/5 tunnel source 10.0.5.1",
+		"set interfaces ip-0/0/5 tunnel destination 10.0.5.2",
+	)
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
 	}
 
 	for i := 0; i < 50; i++ {
@@ -189,20 +210,22 @@ func TestIpipTunnelGateReportsDeterministically_4785(t *testing.T) {
 			t.Fatal("expected a rejection")
 		}
 		if !strings.Contains(err.Error(), `"ip-0/0/0"`) {
-			t.Fatalf("first reported interface must be the lowest sorted name on every "+
-				"run; iteration %d got: %v", i, err)
+			t.Fatalf("first reported endpoint must be the lowest sorted name on every run "+
+				"(Go map order is randomized, and both HA nodes must agree); iteration %d "+
+				"got: %v", i, err)
 		}
 	}
 
-	// On the lenient path every offender is reported, not just the first — an
-	// operator fixing a tolerated config should see the whole list at once.
-	warnings, err := validateIpipTunnelUnimplementedStrict(cfg, true)
-	if err != nil {
-		t.Fatalf("lenient path must not error: %v", err)
-	}
+	// The advisory reports every offender, in the same emitter order.
+	warnings := validateIpipTunnelDeadWarning(cfg)
 	if len(warnings) != 3 {
-		t.Errorf("lenient path reported %d warnings, want 3 (one per offending "+
-			"interface): %v", len(warnings), warnings)
+		t.Fatalf("advisory reported %d endpoints, want 3: %v", len(warnings), warnings)
+	}
+	for i, want := range []string{`"ip-0/0/0"`, `"ip-0/0/5"`, `"ip-0/0/9"`} {
+		if !strings.Contains(warnings[i], want) {
+			t.Errorf("advisory[%d] should name %s, got %q — ordered identities, not just a "+
+				"count", i, want, warnings[i])
+		}
 	}
 }
 
@@ -262,51 +285,183 @@ func TestIpipTunnelEffectiveGreStillCommits_4785(t *testing.T) {
 	}
 }
 
-// TestIpipTunnelUnitAboveZeroStillReported_4785 is the counter-case that keeps
-// the shadowing rule honest. Unit N>0 is a SEPARATE Linux device ("uN" suffix),
-// so it shadows nothing: an interface-level ipip stanza beside it is still a
-// real device that is created and is dead, and must still be rejected. A
-// shadowing rule that swallowed this would turn the over-rejection fix into an
-// under-rejection.
-func TestIpipTunnelUnitAboveZeroStillReported_4785(t *testing.T) {
-	_, err := CompileConfig(ipipTree(t,
+// TestIpipTunnelInheritedByTunnellessUnitIsReported_4785 is the counter-case
+// that keeps the shadowing fix honest, and it is the one the previous round got
+// wrong in the OTHER direction.
+//
+// A unit with no `tunnel` stanza of its own still INHERITS the interface-level
+// tunnel — EmitTunnelEndpointNames says so in a comment and emits it. The
+// previous gate skipped exactly those units, so this config committed clean
+// with the alarm surface silent, having been correctly rejected one commit
+// earlier: unit 0's GRE record shadowed the interface record on the shared
+// device key, and unit 2 — which emits ipip — was never visited.
+//
+// Measured at the pre-fix head e3754bc4c before this test was written:
+// CompileConfig returned nil, ValidateConfig returned zero #4785 advisories,
+// and the emitter published BOTH `ip-0/0/0.0` gre and `ip-0/0/0.2` ipip. A
+// fixture that was green before and after would prove nothing.
+func TestIpipTunnelInheritedByTunnellessUnitIsReported_4785(t *testing.T) {
+	cmds := []string{
+		"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces ip-0/0/0 unit 0 tunnel mode gre",
+		"set interfaces ip-0/0/2 unit 2 family inet address 10.5.5.1/30",
+	}
+	// unit 2 lives on the SAME interface — it inherits the ipip parent.
+	cmds[3] = "set interfaces ip-0/0/0 unit 2 family inet address 10.5.5.1/30"
+
+	tree := ipipTree(t, cmds...)
+
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("a tunnel-less unit inherits the interface-level ipip tunnel and IS emitted " +
+			"as an endpoint, so the config must be rejected. Accepting it commits a dead " +
+			"tunnel silently — the under-rejection the emitter-based gate exists to close " +
+			"(#4785)")
+	}
+	if !strings.Contains(err.Error(), "ip-0/0/0.2") {
+		t.Errorf("the error must name the EMITTED endpoint that is dead, so an operator knows "+
+			"which unit to fix; got: %v", err)
+	}
+
+	// The advisory path must report it too — that is the surface a box already
+	// carrying this config sees.
+	cfg, lerr := CompileConfigLenient(tree)
+	if lerr != nil {
+		t.Fatalf("tolerant compile: %v", lerr)
+	}
+	var found bool
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "ip-0/0/0.2") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ValidateConfig must report the inherited dead endpoint; warnings: %v",
+			ValidateConfig(cfg))
+	}
+}
+
+// TestIpipTunnelUnitOverrideEmitsNoIpipEndpoint_4785 records the semantics the
+// emitter-based gate CORRECTS. When an interface has units, the emitter emits
+// per-unit endpoints only — so `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel mode
+// gre` with no other unit publishes exactly one endpoint, `ip-0/0/0.1` gre. No
+// ipip endpoint reaches the dataplane, so there is nothing dead to reject.
+//
+// The previous round rejected this config. That rejection was defensible on a
+// kernel-anchor argument but not for the reason its error text gave, and it is
+// not what this gate claims to police: the claim is "reject exactly the
+// endpoints emission would emit as IPIP".
+func TestIpipTunnelUnitOverrideEmitsNoIpipEndpoint_4785(t *testing.T) {
+	tree := ipipTree(t,
 		"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
 		"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
 		"set interfaces ip-0/0/0 unit 1 tunnel mode gre",
-		"set interfaces ip-0/0/0 unit 1 tunnel source 10.0.0.1",
-	))
-	if err == nil {
-		t.Fatal("unit 1 is a DIFFERENT device (ip-0-0-0u1), so it does not shadow the " +
-			"interface-level ip-0-0-0 ipip device — that device is still created and " +
-			"still dead, and must still be rejected (#4785)")
+	)
+
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		if ep.Tunnel.Mode == "ipip" {
+			t.Fatalf("premise broken: the emitter published an ipip endpoint %q for a "+
+				"unit-override config; this test's whole point is that it does not", ep.Name)
+		}
+	}
+	if _, err := CompileConfig(tree); err != nil {
+		t.Errorf("no ipip endpoint is emitted, so nothing is dead and the config must "+
+			"commit: %v", err)
 	}
 }
 
 // TestIpipTunnelWireguardStillCommits_4785 is the WireGuard positive control.
-// The gate keys on the compiled mode, so the third tunnel kind must be
-// unaffected — and WireGuard is the one the error message recommends, which
-// would be a poor recommendation if the gate rejected it.
+//
+// The previous version could not fire. It used `tunnel listen-port`, which is
+// not the syntax (`tunnel wireguard listen-port` is), so both fixtures were
+// rejected EARLIER by the WireGuard validator and the ipip gate never ran on
+// them — and the assertion was only "the error is not mine", which that earlier
+// error satisfies. Mutating the gate to also flag `wireguard` left it PASSING.
+//
+// A positive control has to require the config to COMMIT. This asserts
+// err == nil on a fixture that is complete enough to compile (private key and
+// peer included, per tunnelid_test.go), so a gate that rejected WireGuard —
+// the very mode the error message recommends — fails here.
 func TestIpipTunnelWireguardStillCommits_4785(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		cmds []string
-	}{
-		{"interface-level wireguard", []string{
-			"set interfaces wg0 tunnel mode wireguard",
-			"set interfaces wg0 tunnel listen-port 51820",
-		}},
-		{"unit-level wireguard", []string{
-			"set interfaces wg0 unit 0 tunnel mode wireguard",
-			"set interfaces wg0 unit 0 tunnel listen-port 51820",
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := CompileConfig(ipipTree(t, tc.cmds...))
-			if err != nil && strings.Contains(err.Error(), "#4785") {
-				t.Fatalf("the ipip gate rejected a WireGuard tunnel — the very mode its own "+
-					"error message recommends: %v", err)
+	const (
+		privKey = "1111111111111111111111111111111111111111111111111111111111111111"
+		peerKey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+	tree := ipipTree(t,
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key "+privKey,
+		"set interfaces wg0 tunnel wireguard peer "+peerKey+" allowed-ips 10.0.0.0/24",
+		"set interfaces wg0 unit 0 family inet address 10.70.0.1/30",
+	)
+
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("a valid WireGuard tunnel must COMMIT — it is the mode the ipip error "+
+			"message recommends, which would be a poor recommendation if the gate rejected "+
+			"it: %v", err)
+	}
+
+	// And it must raise no standing alarm either.
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "#4785") {
+			t.Errorf("a WireGuard tunnel raised the ipip alarm: %q", w)
+		}
+	}
+}
+
+// TestIpipTunnelReportsEveryDeadEndpoint_4785 pins N5: the advisory lists ALL
+// dead endpoints, not just the first. An operator with two dead tunnels who
+// fixes one should not discover the second only on the next commit.
+func TestIpipTunnelReportsEveryDeadEndpoint_4785(t *testing.T) {
+	tree := ipipTree(t,
+		"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
+		"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
+		"set interfaces ip-0/0/1 tunnel source 10.0.1.1",
+		"set interfaces ip-0/0/1 tunnel destination 10.0.1.2",
+	)
+
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+
+	seen := map[string]bool{}
+	for _, w := range ValidateConfig(cfg) {
+		if !strings.Contains(w, "#4785") {
+			continue
+		}
+		for _, ep := range []string{"ip-0/0/0", "ip-0/0/1"} {
+			if strings.Contains(w, ep) {
+				seen[ep] = true
 			}
-		})
+		}
+	}
+	if len(seen) != 2 {
+		t.Errorf("advisory reported %d of 2 dead endpoints (%v); truncating to the first "+
+			"means an operator fixes one and finds the next only on the following commit",
+			len(seen), seen)
+	}
+
+	// The tolerant path must not DOUBLE-report either (#4785 re-gate N1): the
+	// lenient gate arm and the ValidateConfig registration both used to append.
+	dupes := 0
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "#4785") {
+			dupes++
+		}
+	}
+	if dupes != 2 {
+		t.Errorf("cfg.Warnings carries %d #4785 entries for 2 dead endpoints, want 2 — the "+
+			"lenient gate arm and the ValidateConfig advisory must not both append", dupes)
 	}
 }
 
