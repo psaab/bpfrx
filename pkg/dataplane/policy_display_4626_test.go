@@ -88,11 +88,20 @@ func TestSessionPolicyNameReservedIDs_4626(t *testing.T) {
 	})
 }
 
-// sessionPolicyNameDisplayPackages are the packages that render a SESSION ROW's
-// policy name. pkg/logging is deliberately absent: the RT_FLOW/event path owns
-// its own resolver (EventReader.resolvePolicyName, #3057) over a different map
-// instance, and folding the two is a separate change.
-var sessionPolicyNameDisplayPackages = []string{"cli", "api", "grpcapi"}
+// sessionPolicyNameDisplayPackages are the packages that turn a policy_id into
+// a policy NAME for an operator- or automation-visible surface.
+//
+// pkg/logging is in the list. An earlier revision excluded it, reasoning that
+// the RT_FLOW/event path "owns its own resolver ... and folding the two is a
+// separate change". That reasoning did not survive #6851: owning a resolver is
+// not exemption from the reserved ids. EventReader.resolvePolicyName took
+// DefaultPolicySentinelID (#3057) and then indexed the map, so id 0 resolved to
+// the first configured policy there too — the SEVENTH instance of the same
+// defect, and the one that matters most, because a log record is durable and
+// ships off-box. The exclusion is what let that site sit unguarded through the
+// first round: a package carved out of a canary is a package nothing checks, so
+// the carve-out needs the same evidence as the fix does.
+var sessionPolicyNameDisplayPackages = []string{"cli", "api", "grpcapi", "logging"}
 
 // TestSessionRowSurfacesUseSessionPolicyName_4626 is the render-site binding.
 //
@@ -104,12 +113,36 @@ var sessionPolicyNameDisplayPackages = []string{"cli", "api", "grpcapi"}
 // all six structurally, and any seventh added later, by refusing a direct map
 // index in the display packages.
 //
-// SCOPE, stated rather than implied: it rejects an index expression whose
-// operand is an identifier or field named `policyNames`/`PolicyNames` inside
-// pkg/cli, pkg/api and pkg/grpcapi production files. It does NOT prove those
-// packages resolve policy names correctly in general, and it cannot see a copy
-// of the map stored under another name first. It binds the specific regression
-// shape: re-inlining `policyNames[val.PolicyID]` at a session-row render site.
+// SCOPE, stated rather than implied. It rejects an index of an identifier or
+// field named `policyNames`/`PolicyNames` inside a production function of
+// pkg/cli, pkg/api, pkg/grpcapi or pkg/logging that never calls a reserved-id
+// helper. Three things it does NOT prove:
+//
+//   - that the helper call DOMINATES the index on every path. A function that
+//     consulted a helper in a dead branch and indexed the map on the live one
+//     would pass. The check is "this function knows about the reserved ids",
+//     not a dataflow proof.
+//   - that those packages resolve policy names correctly in general.
+//   - anything about a copy of the map stored under another name first.
+//
+// It binds the specific regression shape: re-inlining `policyNames[val.PolicyID]`
+// at a site with no reserved-id handling, which is what all seven instances of
+// this defect looked like.
+var reservedPolicyHelpers = []string{
+	"ReservedPolicyName", "SessionPolicyName", "PeerSessionPolicyName",
+}
+
+// isCallTo reports whether call invokes a function whose (possibly
+// package-qualified) name is fn — `fn(...)`, `pkg.fn(...)` or `x.fn(...)`.
+func isCallTo(call *ast.CallExpr, fn string) bool {
+	switch f := call.Fun.(type) {
+	case *ast.Ident:
+		return f.Name == fn
+	case *ast.SelectorExpr:
+		return f.Sel.Name == fn
+	}
+	return false
+}
 func TestSessionRowSurfacesUseSessionPolicyName_4626(t *testing.T) {
 	var violations []string
 	scanned := 0
@@ -130,26 +163,56 @@ func TestSessionRowSurfacesUseSessionPolicyName_4626(t *testing.T) {
 			if perr != nil {
 				t.Fatalf("parse %s: %v", path, perr)
 			}
-			ast.Inspect(f, func(n ast.Node) bool {
-				idx, ok := n.(*ast.IndexExpr)
-				if !ok {
+			// Walk per FUNCTION, because there are two legitimate shapes and a
+			// blanket "no index" rule rejects one of them:
+			//
+			//   (a) delegate wholly — SessionPolicyName(policyNames, id);
+			//   (b) take the reserved ids first, then index —
+			//       `if n, ok := ReservedPolicyName(id); ok { return n }`.
+			//
+			// (b) is what pkg/logging resolvePolicyName does, and it is correct:
+			// the index is only reached for an id that is not reserved. So an
+			// index is a violation only in a function that never consults a
+			// reserved-id helper at all.
+			for _, decl := range f.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Body == nil {
+					continue
+				}
+				var indexes []*ast.IndexExpr
+				guarded := false
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					switch node := n.(type) {
+					case *ast.CallExpr:
+						for _, h := range reservedPolicyHelpers {
+							if isCallTo(node, h) {
+								guarded = true
+							}
+						}
+					case *ast.IndexExpr:
+						name := ""
+						switch x := node.X.(type) {
+						case *ast.Ident:
+							name = x.Name
+						case *ast.SelectorExpr:
+							name = x.Sel.Name
+						}
+						if name == "policyNames" || name == "PolicyNames" {
+							indexes = append(indexes, node)
+						}
+					}
 					return true
+				})
+				if guarded {
+					continue
 				}
-				name := ""
-				switch x := idx.X.(type) {
-				case *ast.Ident:
-					name = x.Name
-				case *ast.SelectorExpr:
-					name = x.Sel.Name
+				for _, idx := range indexes {
+					violations = append(violations, fmt.Sprintf(
+						"%s:%d: %s indexes the policy-name map without consulting %v first",
+						path, fset.Position(idx.Pos()).Line, fn.Name.Name,
+						reservedPolicyHelpers))
 				}
-				if name != "policyNames" && name != "PolicyNames" {
-					return true
-				}
-				violations = append(violations, fmt.Sprintf(
-					"%s:%d: direct %s[...] index at a session-row display surface",
-					path, fset.Position(idx.Pos()).Line, name))
-				return true
-			})
+			}
 			return nil
 		})
 		if err != nil {

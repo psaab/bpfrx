@@ -1,3 +1,53 @@
+## 2026-08-05 — #6851: close the two gaps the round-2 fix left in its own canary
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: A concurrent lane had already fixed both review findings on
+  this branch (2e4ec3509) while I was fixing them independently. Theirs is
+  better placed and I dropped mine: the peer guard belongs at
+  `fetchPeerSessions` in grpcapi, where sanitizing the protobuf response
+  in place covers gRPC, the REST `peer` block and the CLI at one choke
+  point. I verified that claim rather than taking the comment's word —
+  `pkg/api` has no independent peer dial, and `writeSessionList` reaches
+  the peer through the same in-process `GetSessions`, so my
+  `sessionEntryFromPB` fix would have been a redundant second helper
+  duplicating theirs. Kept the superseded work on the local branch
+  `backup-mine-14af8e357` rather than deleting it unreviewed.
+  What their commit did NOT update was its own canary, so this adds only
+  that delta. Two gaps:
+  1. `sessionPolicyNameDisplayPackages` still excluded `pkg/logging` with
+     the very reasoning their fix disproved ("the RT_FLOW path owns its
+     own resolver ... folding the two is a separate change"). That
+     exclusion is what let the seventh resolver sit unguarded through
+     round 1. Added `logging`, and replaced the stale comment with why a
+     carve-out needs the same evidence as a fix.
+  2. `attachPeerSessions`' doc names a residual outright — "Replacing this
+     call with a bare `resp.Peer = peerResp` would not be caught here."
+     `TestPeerSessionFanOutGoesThroughAttach_6851` closes it structurally:
+     `fetchPeerSessions` must call the helper and must not assign
+     `resp.Peer` directly. Scoped to that ONE function on purpose — the
+     `resp.Peer` assignments at ~:927 and ~:1039 attach summary responses
+     carrying no per-session policy name, so routing them through a
+     session sanitizer would be wrong, not safer.
+  Fixing (1) surfaced a defect in my own canary rather than in their code:
+  a blanket "no `policyNames[...]` index" rule FALSE-POSITIVED on their
+  resolver, which correctly takes the reserved ids via
+  `ReservedPolicyName` and only then indexes for an unreserved id. There
+  are two legitimate shapes — delegate wholly, or guard-then-index — so
+  the canary now walks per function and reports an index only in a
+  function that never consults a reserved-id helper. Its limits are
+  stated: it does not prove the helper call DOMINATES the index on every
+  path, so a helper in a dead branch would pass.
+- **Validation**: two mutations, snapshot-and-write-back restore with
+  byte-for-byte verify, both required to compile. Reverting the logging
+  resolver to the sentinel-only form goes RED on the canary IN ADDITION
+  to their behavioural tests, which is the coverage the exclusion was
+  costing. Bypassing `attachPeerSessions` with a bare `resp.Peer =
+  peerResp` goes RED on the NEW canary ONLY — nothing else in the suite
+  catches it, which is precisely the residual their comment documented.
+  Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/dataplane/policy_display_4626_test.go`,
+  `pkg/grpcapi/peer_fanout_attach_6851_test.go` (new), `_Log.md`
+
 ## 2026-08-05 — #4626 L01: stop rendering `policy_id` 0 as the first configured policy
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero)
