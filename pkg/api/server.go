@@ -966,6 +966,96 @@ func certCoversHost(leaf *x509.Certificate, host string) bool {
 	return leaf.VerifyHostname(host) == nil
 }
 
+// certHasNoSANs reports whether leaf carries NO subjectAltName usable for
+// hostname verification — neither a DNS name nor an IP address. Such a
+// certificate covers NOTHING: every modern client (Go since 1.15, browsers,
+// curl) refuses to fall back to the legacy CommonName, so BOTH
+// `https://localhost` and `https://127.0.0.1` fail against a CN-only cert.
+//
+// The per-identity checks below cannot see this: their warnable predicates gate
+// out loopback and "localhost" on the assumption that the durable cert always
+// carries the loopback SANs. That assumption holds for a cert THIS mint path
+// produced, but the load path accepts whatever is on disk — a pair persisted by
+// an older build, or placed by an operator, can have no SAN extension at all,
+// and then the whole diagnostic goes silent on the most broken cert possible
+// (#6827). Other SAN forms (email, URI) are irrelevant here: VerifyHostname
+// consults only DNSNames and IPAddresses.
+func certHasNoSANs(leaf *x509.Certificate) bool {
+	return len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0
+}
+
+// hostNameEvidence tells the host-name diagnostic HOW the caller learned the
+// kernel host name, which decides how much benefit of the doubt that name gets
+// as a management ACCESS identity (#6827).
+type hostNameEvidence int
+
+const (
+	// hostNameInferred — a certificate (re)load read the kernel host name off
+	// the running system (boot, or an HTTPS enable/rebind). Nothing there proves
+	// an operator ever connects by that name, so hostNameLikelyAccessIdentity's
+	// heuristic applies.
+	hostNameInferred hostNameEvidence = iota
+	// hostNameOperatorSet — the operator's own `set system host-name` commit
+	// JUST moved the kernel host name (Daemon.applyHostname →
+	// Server.WarnStaleMgmtCertForHostName). The name is the identity they
+	// deliberately chose for this device, reported at the moment they chose it,
+	// so it is diagnosed unconditionally: this is the one call site where "is
+	// this an access identity?" has a real answer rather than a heuristic.
+	hostNameOperatorSet
+)
+
+// hostNameLikelyAccessIdentity reports whether the kernel host name is PLAUSIBLY
+// a management access identity, judged from the SANs the loaded cert already
+// carries. It exists so the diagnostic stops crying wolf (#6827): a box named
+// `fw` whose cert covers `mgmt.example.com` and its management IP is reachable
+// and strictly verifiable at every URL actually in use, and telling that
+// operator to re-mint churns remote clients' TOFU pins to fix nothing. A
+// diagnostic that fires on a healthy box gets muted, and the true positive dies
+// with it.
+//
+// THE RULE, and why the cert's own SANs are the best evidence available: this
+// package's mint path is the ONLY thing that puts a bare, UNQUALIFIED name into
+// a generated cert, and what it puts there is the kernel host name of the day
+// (the bind host is the other source, and a management bind is an address or a
+// domain-qualified name). So the qualification SHAPE of the cert's DNS SANs
+// tells us which naming scheme this device's TLS identity follows:
+//
+//   - an unqualified DNS SAN (`old-fw`) next to an unqualified kernel host name
+//     means the TLS identity IS the kernel name, and it has drifted — diagnose;
+//   - a qualified DNS SAN (`mgmt.example.com`) next to an unqualified kernel
+//     host name means the TLS identity is domain-scoped and INDEPENDENT of the
+//     short kernel name, which was therefore never an access identity — silent;
+//   - a cert with no non-loopback DNS SAN at all was never minted for name-based
+//     access — silent.
+//
+// An IP-literal kernel host name is judged the same way against IP SANs:
+// address-based access is evidenced by a non-loopback IP SAN.
+//
+// The heuristic is deliberately NOT applied to hostNameOperatorSet. It is a
+// heuristic precisely because a cert load has no way to know what an operator
+// types; a rename does know, and it is also the one moment the operator is
+// watching the commit output.
+func hostNameLikelyAccessIdentity(leaf *x509.Certificate, hostName string) bool {
+	if net.ParseIP(hostName) != nil {
+		for _, ip := range leaf.IPAddresses {
+			if !ip.IsLoopback() && !ip.IsUnspecified() {
+				return true
+			}
+		}
+		return false
+	}
+	qualified := strings.Contains(hostName, ".")
+	for _, n := range leaf.DNSNames {
+		if strings.EqualFold(n, "localhost") {
+			continue // always minted; carries no evidence either way
+		}
+		if strings.Contains(n, ".") == qualified {
+			return true
+		}
+	}
+	return false
+}
+
 // warnStaleLoadedCert emits a diagnostic for every management identity the
 // LOADED durable cert fails to cover. The cert is served AS-IS (#1916 D6: a
 // re-mint would churn remote clients' TOFU pins), so this is the ONLY signal an
@@ -983,35 +1073,137 @@ func certCoversHost(leaf *x509.Certificate, host string) bool {
 //     though the bind host was still covered so the bind-host warning never
 //     fired.
 //
-// The leaf is parsed ONCE and both checks share it. A parse failure or an empty
+// The leaf is parsed ONCE and every check shares it. A parse failure or an empty
 // chain is not reported here — the caller still serves the pair it loaded, and
 // this function's contract is diagnostics only, never a serving decision.
+//
+// This is only ONE of the two entry points. A `set system host-name` commit does
+// NOT reload the certificate (the HTTPS leg rebinds only on a TLS/bind change),
+// so the rename half of the diagnostic reaches the operator through
+// Server.WarnStaleMgmtCertForHostName instead (#6827).
 func warnStaleLoadedCert(cert tls.Certificate, bindHost string) {
 	if len(cert.Certificate) == 0 {
-		return
-	}
-	hostName, _ := tlsHostname()
-	warnBind := bindHostWarnable(bindHost)
-	warnHost := hostnameSANWarnable(hostName) && hostName != bindHost
-	if !warnBind && !warnHost {
 		return
 	}
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
 		return
 	}
-	if warnBind && !certCoversHost(leaf, bindHost) {
-		slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
-			"bind_host", bindHost,
-			"cert_dns_sans", leaf.DNSNames,
-			"cert_ip_sans", leaf.IPAddresses)
+	hostName, _ := tlsHostname()
+	if warnCertNoSANs(leaf, bindHost, hostName) {
+		return
 	}
-	if warnHost && !certCoversHost(leaf, hostName) {
-		slog.Warn("loaded management TLS cert does not cover the current host-name; clients verifying by host-name will fail — remove /etc/xpf/tls to re-mint",
-			"host_name", hostName,
-			"cert_dns_sans", leaf.DNSNames,
-			"cert_ip_sans", leaf.IPAddresses)
+	warnStaleBindHost(leaf, bindHost)
+	warnStaleHostName(leaf, hostName, bindHost, hostNameInferred)
+}
+
+// warnCertNoSANs emits the terminal "this certificate covers nothing"
+// diagnostic and reports whether it fired. It is terminal by design: when the
+// leaf has no SANs at all, the per-identity warnings below would each report
+// "does not cover X" for a cert that covers no X whatsoever, which buries the
+// actual finding under a list of symptoms.
+func warnCertNoSANs(leaf *x509.Certificate, bindHost, hostName string) bool {
+	if !certHasNoSANs(leaf) {
+		return false
 	}
+	slog.Warn("loaded management TLS cert carries NO subjectAltName, so it covers NOTHING — every modern client rejects it for every host name and address (CommonName is not consulted) — remove /etc/xpf/tls to re-mint",
+		"cert_common_name", leaf.Subject.CommonName,
+		"bind_host", bindHost,
+		"host_name", hostName)
+	return true
+}
+
+// warnStaleBindHost warns when the loaded cert does not cover the HTTPS
+// listener's own bind host. The bind host needs no plausibility test: the
+// operator configured the listener to answer there, so it is an access identity
+// by construction.
+func warnStaleBindHost(leaf *x509.Certificate, bindHost string) {
+	if !bindHostWarnable(bindHost) || certCoversHost(leaf, bindHost) {
+		return
+	}
+	slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
+		"bind_host", bindHost,
+		"cert_dns_sans", leaf.DNSNames,
+		"cert_ip_sans", leaf.IPAddresses)
+}
+
+// warnStaleHostName warns when the loaded cert does not cover the kernel host
+// name. Unlike the bind host, the kernel name is only SOMETIMES an access
+// identity, so ev + hostNameLikelyAccessIdentity gate it (#6827) and the message
+// is conditional rather than a bare instruction to re-mint: the SANs it prints
+// are exactly the identities the cert DOES cover, so an operator who reaches the
+// box by one of those can dismiss it in a single read.
+func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hostNameEvidence) {
+	if !hostnameSANWarnable(hostName) || hostName == bindHost {
+		return // uncoverable by any re-mint, or already reported as the bind host
+	}
+	if ev == hostNameInferred && !hostNameLikelyAccessIdentity(leaf, hostName) {
+		return
+	}
+	if certCoversHost(leaf, hostName) {
+		return
+	}
+	slog.Warn("loaded management TLS cert does not cover the current host-name; clients verifying by host-name will fail — if this device is reached by host-name, remove /etc/xpf/tls to re-mint (the SANs below are the identities it does cover)",
+		"host_name", hostName,
+		"cert_dns_sans", leaf.DNSNames,
+		"cert_ip_sans", leaf.IPAddresses)
+}
+
+// WarnStaleMgmtCertForHostName re-runs the stale-certificate diagnostic against
+// the certificate the LIVE HTTPS leg is serving, for an EXPLICITLY supplied
+// kernel host name. Daemon.applyHostname calls it immediately after a successful
+// `set system host-name` (#6827).
+//
+// It exists because the load-path diagnostic could never see a rename. Two
+// independent reasons, and a fix for either alone is not enough:
+//
+//  1. REACHABILITY. warnStaleLoadedCert runs only while a certificate is being
+//     loaded, and the HTTPS leg is rebuilt only when the TLS flag or the HTTPS
+//     bind address changes (managementReconciler.reconcileTo). A plain
+//     `set system host-name new-fw` on an unchanged bind reloads nothing, so the
+//     appliance stayed silent until the next restart or HTTPS rebind — the exact
+//     case the host-name check was written for.
+//  2. ORDERING. The management reconcile runs EARLY in applyConfigLocked (before
+//     the dataplane apply, so a credential revocation lands even on an aborting
+//     commit) while the kernel host name is set late, in the apply tail. So even
+//     a commit that DID change the HTTPS bind would have diagnosed the OLD
+//     kernel name. Taking the name as a parameter removes that hazard entirely:
+//     the caller passes the name it just applied, rather than this code racing
+//     os.Hostname() against the apply order.
+//
+// No live HTTPS leg means no management certificate is being served, so there is
+// nothing to be stale — a no-op. It deliberately reads the LIVE leg only, never
+// the s.httpsServer construction template, which survives a TLS disable and
+// would otherwise produce warnings about a certificate nobody serves.
+func (s *Server) WarnStaleMgmtCertForHostName(hostName string) {
+	s.lifeMu.Lock()
+	var srv *http.Server
+	if s.httpsLeg != nil {
+		srv = s.httpsLeg.srv
+	}
+	s.lifeMu.Unlock()
+	if srv == nil || srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+		return
+	}
+	cert := srv.TLSConfig.Certificates[0]
+	if len(cert.Certificate) == 0 {
+		return
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return
+	}
+	bindHost := ""
+	if h, _, err := net.SplitHostPort(srv.Addr); err == nil {
+		bindHost = h
+	}
+	if warnCertNoSANs(leaf, bindHost, hostName) {
+		return
+	}
+	// Only the host name is diagnosed here: the bind host did not change, so a
+	// stale one was already reported when the leg last bound, and repeating it on
+	// every rename is noise.
+	warnStaleHostName(leaf, hostName, bindHost, hostNameOperatorSet)
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate

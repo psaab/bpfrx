@@ -1,3 +1,70 @@
+## 2026-08-05 — #6827 fold: the stale-mgmt-cert diagnostic never fired on a rename
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded a MERGE-NEEDS-MAJOR review of the #5719 C001 stale-cert
+  diagnostic. Verified the reported chain before touching anything:
+  `warnStaleLoadedCert` is called ONLY from the cert-load path
+  (`pkg/api/server.go` `generateSelfSignedCertAt`); the HTTPS leg is rebuilt
+  only when TLS or the HTTPS bind changes (`pkg/daemon/management.go`
+  `reconcileTo`); and `reconcileWebManagement` runs at `daemon_apply.go:210`
+  while `applyHostname` runs in the apply tail (`daemon_apply_tail.go:73`). So
+  `set system host-name new-fw` on an unchanged bind reached nothing, and a
+  SIMULTANEOUS HTTPS change would have checked the OLD kernel name. Three
+  fixes:
+  (1) **Reach + ordering.** New `Server.WarnStaleMgmtCertForHostName(hostName)`
+  reads the LIVE HTTPS leg's served certificate (never the `httpsServer`
+  construction template, which survives a TLS disable) and diagnoses an
+  EXPLICIT host name; `applyHostname` calls it inline with a successful
+  `Sethostname`, passing `cfg.System.HostName`. Taking the name as a parameter
+  removes the ordering hazard by construction rather than by placement — the
+  caller supplies the name it just applied instead of racing `os.Hostname()`
+  against the apply order. `syscall.Sethostname` and `/etc/hostname` became
+  package seams so this is unit-testable without CAP_SYS_ADMIN.
+  (2) **No-SAN certificate.** A CN-only pair (persisted by an older build or
+  placed by an operator) matched neither warnable predicate, so the most broken
+  certificate possible produced total silence. `certHasNoSANs` now reports it
+  FIRST and TERMINALLY — the per-identity lines would each report "does not
+  cover X" for a cert that covers no X at all.
+  (3) **False positive.** The kernel host name was diagnosed unconditionally, so
+  a box named `fw` whose cert covers `mgmt.example.com` + its management IP —
+  verifiable at every URL in use — was told to re-mint, churning remote TOFU
+  pins for nothing. `hostNameLikelyAccessIdentity` narrows the LOAD path by
+  naming shape: this package's mint path is the only thing that puts a bare
+  unqualified name in a cert, and what it puts there is the kernel host name, so
+  an unqualified SAN next to an unqualified kernel name means the TLS identity
+  IS that name and drifted (diagnose), while a domain-qualified SAN next to a
+  short kernel name means the TLS identity is independent of it (stay quiet).
+  The RENAME entry point deliberately skips the heuristic — the operator just
+  chose the name, which is evidence, not inference. The remaining load-path
+  noise is bounded to one line per HTTPS bind and the message now names the
+  identities the cert DOES cover, so it can be dismissed in one read.
+  The overstated docs were corrected: `pkg/api/README.md` now describes two
+  entry points and the narrowing rule, and the 2026-08-05 entry below carries an
+  explicit correction of its "closes only the diagnostic half" claim.
+- **Validation**: five mutations, each with `go build ./...` + `go vet` rc=0
+  BEFORE the run so every RED is an ASSERTION, not a compile break; each file
+  restored from a byte-snapshot and re-verified with `sha256sum -c`.
+  (1) delete the `warnStaleMgmtCertForHostName` call in `applyHostname` →
+  `renamed_box_is_diagnosed` FAILs with `got log ""` (the pre-fix silence);
+  (2) pass the PRE-rename `current` instead of `cfg.System.HostName` →
+  "must observe the NEW kernel host name" FAILs (host_name=<test host>), plus
+  both silence controls;
+  (3) neutralize `certHasNoSANs` → `TestLoadedCertWithoutSANsWarns_6827` FAILs
+  with `got log ""` and the rename-path no-SAN subtest FAILs;
+  (4) delete the `hostNameLikelyAccessIdentity` gate →
+  `unused_qualified_cert_identity_is_silent` FAILs (the healthy box is told to
+  re-mint), while its matched positive control `drifted_short_name_warns` keeps
+  passing — the pair is the discrimination proof;
+  (5) pass `hostNameInferred` instead of `hostNameOperatorSet` on the rename
+  path → `operator_chosen_name_overrides_the_heuristic` FAILs with `got ""`.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped), `go test ./pkg/refactoraudit/` exit 0 (daemon_system.go 1889 →
+  1909, still [WATCH]); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/api/README.md`, `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/management.go`, `pkg/daemon/hostname_stale_cert_6827_test.go`,
+  `_Log.md`
+
 ## 2026-08-05 — #5719 C001 residual-2: the host-name half of the stale-cert diagnostic
 
 - **Timestamp**: 2026-08-05 (fix/5719-api-hardening)
@@ -19,7 +86,13 @@
   being DNS-encodable or an IP literal, so a `café` kernel host name — dropped
   from the SANs by design (`isDNSSANSafeHostname`, the #5058 no-abort guard) and
   uncoverable by any re-mint — does not warn on every reload. Re-minting itself
-  stays deferred; this closes only the diagnostic half. The third cohort item
+  stays deferred. **CORRECTION (#6827, entry above):** this entry claimed the
+  change "closes only the diagnostic half" — it did not close even that. The
+  check ran ONLY on the certificate LOAD path, and a `set system host-name`
+  commit on an unchanged HTTPS endpoint reloads nothing, so the case the
+  host-name half was written for stayed silent until a restart. The #6827 fold
+  adds the rename entry point (with the apply-ordering fix), the no-SAN case,
+  and the false-positive narrowing. The third cohort item
   (applied-nft truth projection) is NOT fixed here — scoping analysis posted to
   the issue: the state exists post-#5757 but is process-local to `pkg/daemon`
   with no exported accessor, and `ReadHostInboundDenyCounters` returns

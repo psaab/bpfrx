@@ -258,6 +258,34 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		endpointOf(next).summary(), joined)
 }
 
+// warnStaleMgmtCertForHostName asks the live management server to re-run its
+// stale-certificate diagnostic for a host name that was JUST applied to the
+// kernel (#6827). A nil reconciler (API disabled) or a server that never bound
+// is a no-op.
+//
+// This is deliberately NOT part of reconcile(): reconcile runs early in the
+// apply, before applyHostname, so it can only ever observe the OLD kernel name.
+// The rename call site owns this because it is the only one that runs after the
+// name is real.
+func (d *Daemon) warnStaleMgmtCertForHostName(hostName string) {
+	if d == nil || d.mgmt == nil {
+		return
+	}
+	d.mgmt.warnStaleCertForHostName(hostName)
+}
+
+// warnStaleCertForHostName forwards to the live api.Server under mu so it cannot
+// race a concurrent startTo/reconcileTo swapping the server pointer.
+func (m *managementReconciler) warnStaleCertForHostName(hostName string) {
+	m.mu.Lock()
+	srv := m.srv
+	m.mu.Unlock()
+	if srv == nil {
+		return
+	}
+	srv.WarnStaleMgmtCertForHostName(hostName)
+}
+
 // mgmtAddrIsLoopback reports whether a "host:port" bind is loopback, treating an
 // empty addr (no listener on that leg) as loopback and an unparseable host as
 // NON-loopback (fail-closed). Used to gate a nil-auth (remove-all-api-auth)

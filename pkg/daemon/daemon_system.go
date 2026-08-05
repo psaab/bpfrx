@@ -385,6 +385,15 @@ func (d *Daemon) stopAggregator() {
 	}
 }
 
+// sethostname and hostnamePath are the kernel/disk seams of applyHostname,
+// injectable so a unit test can exercise the post-rename management-TLS
+// diagnostic (#6827) without CAP_SYS_ADMIN and without rewriting the test host's
+// /etc/hostname.
+var (
+	sethostname  = syscall.Sethostname
+	hostnamePath = "/etc/hostname"
+)
+
 // applyHostname sets the system hostname from system { host-name } config.
 func (d *Daemon) applyHostname(cfg *config.Config) {
 	if cfg.System.HostName == "" {
@@ -396,17 +405,28 @@ func (d *Daemon) applyHostname(cfg *config.Config) {
 		return
 	}
 
-	if err := syscall.Sethostname([]byte(cfg.System.HostName)); err != nil {
+	if err := sethostname([]byte(cfg.System.HostName)); err != nil {
 		slog.Warn("failed to set hostname", "err", err)
 		return
 	}
 
 	// Persist to /etc/hostname (DurableState: node identity must survive
 	// a power cut so the box keeps its configured name across reboot).
-	if err := fsatomic.WriteFileDurable("/etc/hostname", []byte(cfg.System.HostName+"\n"), 0644); err != nil {
+	if err := fsatomic.WriteFileDurable(hostnamePath, []byte(cfg.System.HostName+"\n"), 0644); err != nil {
 		slog.Warn("failed to write /etc/hostname", "err", err)
 	}
 	slog.Info("hostname set", "hostname", cfg.System.HostName)
+
+	// The kernel host name is one of the two identities baked into the DURABLE
+	// management TLS cert (#1916 D6), and the cert is never re-minted, so this
+	// rename may have just made it stale. Diagnose it HERE, inline with the
+	// successful Sethostname, rather than anywhere earlier in the apply: the
+	// management reconcile that could reload a cert runs EARLY in
+	// applyConfigLocked (before the dataplane apply, so a credential revocation
+	// survives an aborting commit) and would therefore see the OLD name. This
+	// call site is both the only one a plain host-name commit reaches and the
+	// only one where the new name is already the truth (#6827).
+	d.warnStaleMgmtCertForHostName(cfg.System.HostName)
 }
 
 // isProcessDisabled checks if a Junos process name is in the disabled list.

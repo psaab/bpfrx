@@ -367,19 +367,43 @@ under the daemon's errgroup. Nothing else imports this package.
       wildcard (`:8443` → empty) / non-encodable bind host is skipped, and a
       value already present is coalesced. Like the hostname path this only ever
       ADDS an encodable SAN, so it never aborts generation.
-    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual):** a
-      later `set system host-name` (or a bind-address change) does NOT re-mint
-      an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
-      deferred (it needs a mint-ordering / invalidation hook and a decision on
-      churning the durable TOFU pin). What WAS a silent failure is now
-      diagnosed: on the load-success path `generateSelfSignedCertAt` calls
-      `warnStaleLoadedCert`, which parses the loaded leaf ONCE and checks
-      **both** identities the cert bakes in at first generation, each of which
-      can go stale independently (`certCoversHost` — the same strict
-      `x509.VerifyHostname` check a remote client applies):
+    - **Re-mint STILL deferred, but no longer SILENT (#5719 C001 residual,
+      #6827):** a later `set system host-name` (or a bind-address change) does
+      NOT re-mint an already-persisted cert, so its DNS/IP SANs can go stale.
+      Re-minting is deferred (it needs a mint-ordering / invalidation hook and a
+      decision on churning the durable TOFU pin). What WAS a silent failure is
+      diagnosed from **two** entry points, because one alone cannot reach every
+      way a cert goes stale:
+      - `generateSelfSignedCertAt` calls `warnStaleLoadedCert` on the
+        load-success path — boot, and any HTTPS enable/rebind;
+      - `Server.WarnStaleMgmtCertForHostName` is called by
+        `Daemon.applyHostname` immediately after a successful `set system
+        host-name`. The load path could never see a rename: the HTTPS leg is
+        rebuilt only when the TLS flag or the HTTPS bind address changes
+        (`managementReconciler.reconcileTo`), so a rename on an unchanged
+        endpoint reloads nothing. And `reconcileWebManagement` runs EARLY in
+        `applyConfigLocked` while the kernel name is set in the apply tail, so
+        even a commit that DID move the HTTPS bind would have diagnosed the OLD
+        name — which is why this entry point takes the host name as a
+        PARAMETER (the caller passes the name it just applied) instead of
+        re-reading `os.Hostname()`.
+      Both parse the leaf ONCE and share these checks (`certCoversHost` — the
+      same strict `x509.VerifyHostname` check a remote client applies):
+      - **no SAN at all** (`certHasNoSANs`) — a pair persisted by an older build
+        or placed by an operator can carry no subjectAltName, and then it covers
+        NOTHING: modern clients do not fall back to CommonName, so even
+        `https://localhost` fails. This case is reported first and is TERMINAL
+        (the per-identity lines below would each report "does not cover X" for a
+        cert that covers no X at all). The per-identity predicates gate out
+        loopback on the premise that the durable cert always carries the
+        loopback SANs, which is true only of certs this mint path produced — so
+        without this check the most broken certificate possible was the one that
+        warned least.
       - the **HTTPS bind host**, when it is a concrete non-loopback management
         host (`bindHostWarnable`) — stale after an A→B `web-management https
-        interface` rebind;
+        interface` rebind. It needs no plausibility test: the operator
+        configured the listener to answer there. The rename entry point does NOT
+        re-report it (the bind did not change).
       - the **kernel host name**, when it is one a re-mint could actually cover
         (`hostnameSANWarnable`) — stale after `set system host-name`. This half
         was previously UNCHECKED, and because renaming a firewall does not move
@@ -389,17 +413,34 @@ under the daemon's errgroup. Nothing else imports this package.
         DNS-encodable or an IP literal, so a `café` host name — which
         `isDNSSANSafeHostname` DROPS from the SANs by design and which no
         re-mint could ever cover — does not warn on every reload.
+        On the LOAD path it is additionally narrowed by
+        `hostNameLikelyAccessIdentity`: a box named `fw` whose cert covers
+        `mgmt.example.com` plus its management IP is verifiable at every URL in
+        use, and telling that operator to re-mint churns remote TOFU pins for
+        nothing. Since this package's mint path is the only thing that puts a
+        bare, unqualified name in a cert (and what it puts there is the kernel
+        host name), an unqualified DNS SAN next to an unqualified kernel name
+        means the TLS identity IS the kernel name and has drifted — diagnose; a
+        domain-qualified SAN next to a short kernel name means the TLS identity
+        is independent of it — stay quiet. The RENAME entry point skips that
+        heuristic: the operator just chose the name, which is direct evidence
+        rather than inference.
       Each uncovered identity emits its own `slog.Warn` naming the identity and
-      the cert's DNS/IP SANs, so an operator re-mints (remove `/etc/xpf/tls`)
-      instead of chasing a silent verification failure.
+      the cert's DNS/IP SANs — which are exactly the identities it DOES cover,
+      so an operator re-mints (remove `/etc/xpf/tls`) or dismisses the line in
+      one read, instead of chasing a silent verification failure.
     An already-persisted cert is NOT auto-regenerated — the #1916 D6
     durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
     pins survive a power loss; only freshly generated certs gain SANs (delete
     `cert.pem`/`key.pem` to force a regenerate). Pinned by
     `tls_san_5719_test.go` (SAN presence, hostname classification, the
     non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
-    `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings
-    for BOTH the rebind and the host-name-change paths), fail-on-revert.
+    `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings on
+    the rebind path) and `tls_stale_cert_6827_test.go` (the SAN-less cert, the
+    unused-kernel-name false positive and its matched positive control, and the
+    rename entry point), with the daemon-side wiring — a host-name commit on an
+    UNCHANGED HTTPS endpoint reaching the diagnostic with the NEW name — pinned
+    by `pkg/daemon/hostname_stale_cert_6827_test.go`. All fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during
