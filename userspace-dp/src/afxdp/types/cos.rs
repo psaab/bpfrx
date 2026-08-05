@@ -48,8 +48,20 @@ pub(in crate::afxdp) struct CoSInterfaceConfig {
     pub(in crate::afxdp) default_queue: u8,
     pub(in crate::afxdp) dscp_classifier: String,
     pub(in crate::afxdp) ieee8021_classifier: String,
+    /// #6847: the unit's bound `inet-precedence` classifier name, or empty.
+    /// Read by the `ba_reclassify` gate in `tx/cos_classify.rs` — a flow whose
+    /// queue is chosen by a behavior-aggregate classifier must be re-resolved
+    /// per packet, and an interface bound ONLY to an inet-precedence
+    /// classifier is exactly that case.
+    pub(in crate::afxdp) inet_precedence_classifier: String,
     pub(in crate::afxdp) dscp_queue_by_dscp: [u8; 64],
     pub(in crate::afxdp) ieee8021_queue_by_pcp: [u8; 8],
+    /// #6847: IP-precedence code-point (0..=7) → queue id, `u8::MAX` for an
+    /// unclassified code-point. Indexed by the top 3 bits of the DS field
+    /// (`(dscp >> 3) & 0x7`), which is the same byte `dscp_queue_by_dscp`
+    /// indexes on — hence the commit-time mutual exclusion between the two
+    /// bindings.
+    pub(in crate::afxdp) inet_precedence_queue_by_prec: [u8; 8],
     pub(in crate::afxdp) queue_by_forwarding_class: FastMap<String, u8>,
     pub(in crate::afxdp) queues: Vec<CoSQueueConfig>,
     /// #1614 A1: operator-selectable oversubscription policy.
@@ -91,6 +103,21 @@ pub(in crate::afxdp) struct CoSIEEE8021ClassifierConfig {
     pub(in crate::afxdp) lp_by_pcp: FastMap<u8, u8>,
 }
 
+/// #6847: an IP-precedence behavior-aggregate classifier, resolved from
+/// `CoSINetPrecedenceClassifierSnapshot`. Mirrors `CoSIEEE8021ClassifierConfig`
+/// (same 3-bit code-point domain) but reads the DS field rather than the
+/// 802.1Q tag, so it applies to untagged frames too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(in crate::afxdp) struct CoSINetPrecedenceClassifierConfig {
+    pub(in crate::afxdp) queue_by_prec: FastMap<u8, u8>,
+    /// Loss-priority assigned per IP-precedence code-point (index 0=low ..
+    /// 3=high). Parallel to `queue_by_prec` — without it a classifier entry's
+    /// `loss-priority` would be accepted at commit and silently ignored on
+    /// egress rewrite, the same accepted-but-inert failure #6847 removes from
+    /// the queue side.
+    pub(in crate::afxdp) lp_by_prec: FastMap<u8, u8>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::afxdp) struct CoSDSCPRewriteRuleConfig {
     /// #3995: egress DSCP rewrite keyed on `(forwarding_class, loss_priority)`.
@@ -116,6 +143,10 @@ pub(in crate::afxdp) struct CoSLossPriorityRewrite {
     pub(in crate::afxdp) dscp_lp_by_dscp: [u8; 64],
     /// Flattened 802.1p PCP → loss-priority (0..3). `u8::MAX` = unclassified.
     pub(in crate::afxdp) ieee8021_lp_by_pcp: [u8; 8],
+    /// #6847: flattened IP-precedence → loss-priority (0..3). `u8::MAX` =
+    /// unclassified. Consulted after `dscp_lp_by_dscp` and before
+    /// `ieee8021_lp_by_pcp`, matching the queue-selection order.
+    pub(in crate::afxdp) inet_precedence_lp_by_prec: [u8; 8],
     /// `(queue_id, loss_priority)` → egress DSCP code-point. Populated for the
     /// interface's materialized queues from the interface's rewrite-rule. The
     /// full loss-priority matrix (not just LOW) so a differentiated rule is

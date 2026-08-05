@@ -1016,8 +1016,14 @@ Important current behavior:
   the shaped interface's attached BA classifiers:
   - DSCP under
     `class-of-service interfaces <if> unit <u> classifiers dscp <name>`
+  - IP precedence under
+    `class-of-service interfaces <if> unit <u> classifiers inet-precedence <name>`
+    (#6847)
   - 802.1p under
     `class-of-service interfaces <if> unit <u> classifiers ieee-802.1 <name>`
+
+  consulted in that order: both L3 arms (which read the DS field) precede the
+  L2 802.1p arm (which needs a VLAN tag)
 - a BA classifier code-point that maps to a forwarding-class whose queue the
   interface does NOT materialize (the forwarding-class has no `scheduler-map`
   entry on that interface) falls back to the interface **default best-effort
@@ -1125,6 +1131,18 @@ Notes for this specific test:
   as a fallback behind any explicit firewall-filter DSCP rewrite action. The
   rewrite is keyed on `(forwarding-class, loss-priority)` (#3995) — see the
   loss-priority note below
+- `classifiers inet-precedence <name>` (#6847) is a fallback queue selector on
+  the same footing as the DSCP classifier, reading the top 3 bits of the DS
+  field (`(dscp >> 3) & 0x7` — IPv4 TOS and IPv6 traffic-class alike, matching
+  the family-agnostic DSCP arm). The entry's `loss-priority` feeds the egress
+  rewrite exactly as the dscp / 802.1p classifiers do. A unit may bind **at
+  most one** of `classifiers dscp` and `classifiers inet-precedence`: both read
+  the same DS field, so binding both is a contradiction rather than a
+  composition, and it is hard-rejected at commit (the tolerant load /
+  peer-sync path downgrades to a warning so a persisted config still boots, and
+  DSCP wins on that boot). Before #6847 the classifier was definable at the top
+  level but had NO unit binding site at all, so the bind line was rejected by
+  the schema
 - 802.1p BA classifiers are also available as a fallback queue selector on
   userspace interfaces; they use the ingress VLAN PCP preserved from tagged
   XDP traffic, including priority-tagged frames with VLAN ID 0

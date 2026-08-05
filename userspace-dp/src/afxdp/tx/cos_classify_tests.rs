@@ -10,9 +10,10 @@ use crate::filter::TermMatchExtra;
 use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
     CoSDSCPRewriteRuleEntrySnapshot, CoSDSCPRewriteRuleSnapshot, CoSForwardingClassSnapshot,
-    CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot, CoSSchedulerMapEntrySnapshot,
-    CoSSchedulerMapSnapshot, CoSSchedulerSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
-    ThreeColorPolicerSnapshot,
+    CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
+    CoSINetPrecedenceClassifierEntrySnapshot, CoSINetPrecedenceClassifierSnapshot,
+    CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
+    FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot,
 };
 
 // #hb166 T-4: an explicit request for a queue this interface does NOT
@@ -816,6 +817,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -927,6 +929,7 @@ fn flowless_packet_gets_ba_classification_from_dscp() {
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1046,6 +1049,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1200,6 +1204,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1320,6 +1325,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1439,6 +1445,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1577,6 +1584,7 @@ fn ingress_input_filter_rewalk_uses_prenat_key_5158() {
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1716,6 +1724,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -1799,6 +1808,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -2599,6 +2609,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -2693,6 +2704,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -2841,6 +2853,7 @@ fn resolve_cos_queue_id_falls_back_to_default_queue_without_filter_match() {
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -2934,6 +2947,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     codel_target_ns: 0,
                 },
             ],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3278,6 +3292,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3363,6 +3378,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
                     scheduler: "be-sched".into(),
                 }],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3544,6 +3560,7 @@ fn cos_dscp_rewrite_keys_on_forwarding_class_and_loss_priority() {
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -3961,6 +3978,7 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4315,6 +4333,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
             dscp_rewrite_rules: vec![],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     };
@@ -4513,6 +4532,7 @@ fn pbr_classify_then_route_snapshot() -> ConfigSnapshot {
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     }
@@ -4681,6 +4701,7 @@ fn count_fc_two_class_service() -> ClassOfServiceSnapshot {
                 },
             ],
         }],
+        inet_precedence_classifiers: vec![],
     }
 }
 
@@ -5252,6 +5273,7 @@ fn hb166_t3_middle_case_snapshot() -> ConfigSnapshot {
                     },
                 ],
             }],
+            inet_precedence_classifiers: vec![],
         }),
         ..Default::default()
     }
@@ -5343,6 +5365,8 @@ fn ieee8021_classifier_fails_closed_on_out_of_range_pcp() {
         oversubscription_policy: crate::afxdp::types::CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
     // Valid PCP 7 resolves to its configured queue.
     assert_eq!(
@@ -5363,5 +5387,341 @@ fn ieee8021_classifier_fails_closed_on_out_of_range_pcp() {
     assert_eq!(
         resolve_cos_ieee8021_classifier_queue_id(&iface, 7, false),
         None
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #6847 — inet-precedence behavior-aggregate classifier.
+//
+// These are RUNTIME assertions, not compile-and-store checks. Per the #6850
+// cohort doctrine a test asserting "the classifier is present in the snapshot"
+// passes identically whether or not the dataplane consumes it, which is exactly
+// the state this knob was in before #6847: definable, and (after the Go half)
+// bindable, with nothing behind it. Each test below drives a packet's DS field
+// through the real BA resolution chain and asserts the QUEUE it lands in.
+// ---------------------------------------------------------------------------
+
+/// Fixture: interface 202 with three MATERIALIZED queues — best-effort=0,
+/// voice=5, video=7 — and whichever classifiers the caller binds. Every
+/// forwarding class is in the scheduler-map on purpose: the #hb166 T-4
+/// materialized-queue fallback rewrites a classifier result that points at an
+/// unmaterialized queue to `default_queue`, which would silently turn a
+/// classification assertion into a default-queue assertion and hide a broken
+/// arm behind a passing test.
+fn inet_precedence_fixture(
+    dscp_classifier: &str,
+    inet_precedence_classifier: &str,
+    dscp_entries: Vec<CoSDSCPClassifierEntrySnapshot>,
+    prec_entries: Vec<CoSINetPrecedenceClassifierEntrySnapshot>,
+) -> ConfigSnapshot {
+    let sched = |name: &str| CoSSchedulerSnapshot {
+        name: name.into(),
+        transmit_rate_bytes: 3_000_000,
+        priority: "low".into(),
+        buffer_size_bytes: 64_000,
+        ..Default::default()
+    };
+    let map_entry = |forwarding_class: &str, scheduler: &str| CoSSchedulerMapEntrySnapshot {
+        forwarding_class: forwarding_class.into(),
+        scheduler: scheduler.into(),
+    };
+    ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_scheduler_map: "wan-map".into(),
+            cos_dscp_classifier: dscp_classifier.into(),
+            cos_inet_precedence_classifier: inet_precedence_classifier.into(),
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "voice".into(),
+                    queue: 5,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "video".into(),
+                    queue: 7,
+                },
+            ],
+            dscp_classifiers: if dscp_entries.is_empty() {
+                vec![]
+            } else {
+                vec![CoSDSCPClassifierSnapshot {
+                    name: "dscp-cl".into(),
+                    entries: dscp_entries,
+                }]
+            },
+            inet_precedence_classifiers: if prec_entries.is_empty() {
+                vec![]
+            } else {
+                vec![CoSINetPrecedenceClassifierSnapshot {
+                    name: "prec-cl".into(),
+                    entries: prec_entries,
+                }]
+            },
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    map_entry("best-effort", "be-sched"),
+                    map_entry("voice", "voice-sched"),
+                    map_entry("video", "video-sched"),
+                ],
+            }],
+            schedulers: vec![sched("be-sched"), sched("voice-sched"), sched("video-sched")],
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn prec_entry(
+    forwarding_class: &str,
+    loss_priority: &str,
+    precedences: Vec<u8>,
+) -> CoSINetPrecedenceClassifierEntrySnapshot {
+    CoSINetPrecedenceClassifierEntrySnapshot {
+        forwarding_class: forwarding_class.into(),
+        loss_priority: loss_priority.into(),
+        precedences,
+    }
+}
+
+fn inet_precedence_test_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    }
+}
+
+fn inet_precedence_queue_for_dscp(snapshot: &ConfigSnapshot, dscp: u8) -> Option<u8> {
+    let forwarding = build_forwarding_state(snapshot);
+    let key = inet_precedence_test_key();
+    resolve_cos_queue_id(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 999,
+            ingress_vlan_id: 0,
+            addr_family: libc::AF_INET as u8,
+            dscp,
+            ..Default::default()
+        },
+        Some(&key),
+    )
+}
+
+/// #6847 the headline runtime assertion: a packet whose IP precedence maps to a
+/// forwarding class lands in THAT class's queue.
+///
+/// DSCP 46 (EF) carries IP precedence 5 (46 >> 3). No DSCP classifier is bound,
+/// so the only thing that can steer this packet off the default queue is the
+/// inet-precedence arm.
+///
+/// FAIL-ON-REVERT: delete the
+/// `.or_else(|| resolve_cos_inet_precedence_classifier_queue_id(..))` link from
+/// the chain and the packet falls through to `iface.default_queue` (0), so the
+/// `Some(5)` assertion goes red — the pre-#6847 behaviour.
+#[test]
+fn inet_precedence_classifier_steers_packet_into_its_forwarding_class_queue() {
+    let snapshot = inet_precedence_fixture("", "prec-cl", vec![], vec![prec_entry("voice", "low", vec![5])]);
+    assert_eq!(
+        inet_precedence_queue_for_dscp(&snapshot, 46),
+        Some(5),
+        "IP precedence 5 must land in the voice queue"
+    );
+}
+
+/// #6847: the classifier reads the TOP THREE BITS of the DS field, not the
+/// bottom three and not the whole field. This pins the `(dscp >> 3) & 0x7`
+/// derivation against the plausible wrong shifts:
+///
+///   - `dscp & 0x7`   — 46 & 7 = 6, 40 & 7 = 0: neither is precedence 5, and
+///                      the two would disagree with each other.
+///   - `dscp >> 2`    — 46 >> 2 = 11: masked to 3 by the `& 0x7`, not 5.
+///   - no shift/mask  — indexes out of the 8-entry table.
+///
+/// DSCP 40 (CS5) and 46 (EF) are different code-points that share precedence 5,
+/// so they MUST agree; DSCP 24 (CS3) is precedence 3, which this classifier
+/// does not map, so it must fall through to the default queue. Asserting both
+/// directions is what makes this a shift test rather than a single-value one.
+#[test]
+fn inet_precedence_classifier_reads_the_top_three_bits_of_the_ds_field() {
+    let snapshot = inet_precedence_fixture("", "prec-cl", vec![], vec![prec_entry("voice", "low", vec![5])]);
+    for dscp in [40u8, 41, 46, 47] {
+        assert_eq!(
+            inet_precedence_queue_for_dscp(&snapshot, dscp),
+            Some(5),
+            "dscp {dscp} is IP precedence 5 and must classify identically"
+        );
+    }
+    for dscp in [0u8, 24, 39, 48] {
+        assert_eq!(
+            inet_precedence_queue_for_dscp(&snapshot, dscp),
+            Some(0),
+            "dscp {dscp} is NOT IP precedence 5 and must fall through to the default queue"
+        );
+    }
+}
+
+/// #6847: when a snapshot carries BOTH a dscp and an inet-precedence binding on
+/// one interface, DSCP wins.
+///
+/// A unit binding both is rejected at commit
+/// (`validateCoSUnitClassifierConflict`), so this combination only reaches the
+/// dataplane via the TOLERANT load / peer-sync path, where the Go side
+/// downgrades the rejection to a warning so an already-persisted config still
+/// boots (#1960). That warning tells the operator DSCP will win; this test is
+/// what makes the statement true. Reordering the two `.or_else` arms silently
+/// changes which classifier a booting box honours.
+#[test]
+fn dscp_classifier_wins_over_inet_precedence_when_both_are_bound() {
+    let snapshot = inet_precedence_fixture(
+        "dscp-cl",
+        "prec-cl",
+        vec![CoSDSCPClassifierEntrySnapshot {
+            forwarding_class: "voice".into(),
+            loss_priority: "low".into(),
+            dscp_values: vec![46],
+        }],
+        // Same packet, different answer: precedence 5 would say video (7).
+        vec![prec_entry("video", "low", vec![5])],
+    );
+    assert_eq!(
+        inet_precedence_queue_for_dscp(&snapshot, 46),
+        Some(5),
+        "DSCP must be consulted first, so the voice queue wins over video"
+    );
+    // Control: a code-point the DSCP classifier does NOT map still reaches the
+    // inet-precedence arm, so this is a precedence-ORDER result and not the
+    // inet-precedence arm being dead outright.
+    assert_eq!(
+        inet_precedence_queue_for_dscp(&snapshot, 40),
+        Some(7),
+        "an unmapped DSCP must fall through to the inet-precedence arm"
+    );
+}
+
+/// #6847: a flow on an interface bound ONLY to an inet-precedence classifier is
+/// marked for per-packet BA re-classification.
+///
+/// The flow cache freezes the seed packet's queue unless `ba_reclassify` is
+/// set, so leaving inet-precedence out of that gate would pin a flow to the
+/// class its FIRST packet happened to carry. That is not "not classifying" —
+/// it is classifying once and then silently ignoring every later marking
+/// change, which is the same wrong-queue outcome with a harder-to-see cause.
+///
+/// FAIL-ON-REVERT: drop `|| !iface.inet_precedence_classifier.is_empty()` from
+/// the `ba_reclassify` gate and this goes red.
+#[test]
+fn inet_precedence_classifier_marks_flow_for_ba_reclassification() {
+    let snapshot = inet_precedence_fixture("", "prec-cl", vec![], vec![prec_entry("voice", "low", vec![5])]);
+    let forwarding = build_forwarding_state(&snapshot);
+    let key = inet_precedence_test_key();
+    let descriptor = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 999,
+            addr_family: libc::AF_INET as u8,
+            dscp: 46,
+            ..Default::default()
+        },
+        Some(&key),
+    );
+    assert!(
+        descriptor.ba_reclassify,
+        "an inet-precedence-classified flow must re-resolve its queue per packet"
+    );
+    assert_eq!(descriptor.queue_id, Some(5));
+}
+
+/// #6847: an interface with NO classifier at all must NOT be marked for BA
+/// re-classification. Negative control for the gate above — without it, a gate
+/// hard-wired to `true` would pass that test.
+#[test]
+fn no_classifier_leaves_flow_without_ba_reclassification() {
+    let snapshot = inet_precedence_fixture("", "", vec![], vec![]);
+    let forwarding = build_forwarding_state(&snapshot);
+    let key = inet_precedence_test_key();
+    let descriptor = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 999,
+            addr_family: libc::AF_INET as u8,
+            dscp: 46,
+            ..Default::default()
+        },
+        Some(&key),
+    );
+    assert!(!descriptor.ba_reclassify);
+}
+
+/// #6847: the classifier entry's `loss-priority` drives the egress rewrite.
+///
+/// The queue arm alone would leave `loss-priority high` accepted at commit and
+/// silently applied as LOW on egress — an accepted-but-inert sub-knob inside
+/// the very feature this issue makes non-inert. The rewrite rule below is
+/// loss-priority-DIFFERENTIATED (voice/high -> 34, voice/low -> 10) so the two
+/// answers are distinguishable; a uniform rule would pass either way.
+///
+/// FAIL-ON-REVERT: remove the `inet_precedence_lp_by_prec` consult from
+/// `resolve_cos_loss_priority` and the loss-priority falls back to the LOW
+/// default, so the rewrite becomes `Some(10)`.
+#[test]
+fn inet_precedence_classifier_loss_priority_selects_the_egress_rewrite() {
+    let mut snapshot = inet_precedence_fixture(
+        "",
+        "prec-cl",
+        vec![],
+        vec![prec_entry("voice", "high", vec![5])],
+    );
+    snapshot.interfaces[0].cos_dscp_rewrite_rule = "voice-rw".into();
+    let cos = snapshot.class_of_service.as_mut().expect("fixture cos");
+    cos.dscp_rewrite_rules = vec![CoSDSCPRewriteRuleSnapshot {
+        name: "voice-rw".into(),
+        entries: vec![
+            CoSDSCPRewriteRuleEntrySnapshot {
+                forwarding_class: "voice".into(),
+                loss_priority: "high".into(),
+                dscp_value: 34,
+            },
+            CoSDSCPRewriteRuleEntrySnapshot {
+                forwarding_class: "voice".into(),
+                loss_priority: "low".into(),
+                dscp_value: 10,
+            },
+        ],
+    }];
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let key = inet_precedence_test_key();
+    let descriptor = resolve_cached_cos_tx_selection(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 999,
+            addr_family: libc::AF_INET as u8,
+            dscp: 40,
+            ..Default::default()
+        },
+        Some(&key),
+    );
+    assert_eq!(descriptor.queue_id, Some(5));
+    assert_eq!(
+        descriptor.dscp_rewrite,
+        Some(34),
+        "the entry's loss-priority high must select the high rewrite, not the low default"
     );
 }

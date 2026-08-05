@@ -25,10 +25,12 @@ var schemaClassOfService = &schemaNode{desc: "Class of service configuration", c
 				}},
 			}},
 		}},
-		// #4316 (fable-167 F-3b): IP-precedence classifier. Accepted for
-		// Junos compatibility (completion + ? help) but INERT — the userspace
-		// dataplane classifies only on dscp / ieee-802.1. A commit advisory
-		// surfaces the inertness.
+		// IP-precedence classifier. Added inert for Junos compatibility in
+		// #4316 (fable-167 F-3b); ENFORCED since #6847 — the entries compile,
+		// cross the wire as inet_precedence_classifiers, and the dataplane
+		// classifies on the top 3 bits of the DS field. The matching
+		// accepted-but-inert commit advisory was retracted with it. The
+		// `rewrite-rules inet-precedence` direction below is still inert.
 		"inet-precedence": {desc: "IP-precedence classifier (classify on the 3-bit IP precedence field)", args: 1, multi: true, placeholder: "<classifier-name>", children: map[string]*schemaNode{
 			"forwarding-class": {desc: "Forwarding class to assign to matching code points", args: 1, multi: true, placeholder: "<class-name>", children: map[string]*schemaNode{
 				"loss-priority": {desc: "Loss priority (accepted for Junos compatibility; not enforced by the userspace dataplane)", args: 1, multi: true, placeholder: "<level>", children: map[string]*schemaNode{

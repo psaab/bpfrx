@@ -174,6 +174,8 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
 
@@ -360,6 +362,8 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
 
@@ -606,6 +610,8 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
 
@@ -911,6 +917,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
 
@@ -1125,6 +1133,8 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
     oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
     oversubscription_guarantee_fraction: 0.0,
     priority_low_min_share_bytes: 0,
+    inet_precedence_classifier: String::new(),
+    inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
     forwarding.cos.interfaces.insert(80, make_iface_config());
     forwarding.cos.interfaces.insert(81, make_iface_config());
@@ -1339,6 +1349,8 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
 
@@ -1609,6 +1621,8 @@ fn build_worker_cos_fast_interfaces_flattens_owner_and_lease_state() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -1735,6 +1749,8 @@ fn build_worker_cos_fast_interfaces_keeps_low_rate_exact_queue_owner_local() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -1846,6 +1862,8 @@ fn build_worker_cos_fast_interfaces_high_iface_rate_shards_mid_rate_exact_queue(
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -1999,6 +2017,8 @@ fn build_worker_cos_fast_interfaces_matches_live_loss_ha_3_queue_shape() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     forwarding.egress.insert(
@@ -2130,6 +2150,8 @@ fn test_cos_iface_with_rate(shaping_bits: u64) -> CoSInterfaceConfig {
     oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
     oversubscription_guarantee_fraction: 0.0,
     priority_low_min_share_bytes: 0,
+    inet_precedence_classifier: String::new(),
+    inet_precedence_queue_by_prec: [u8::MAX; 8],
     }
 }
 
@@ -2383,6 +2405,8 @@ fn cos_runtime_config_changed_detects_queue_rate_change() {
     oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
     oversubscription_guarantee_fraction: 0.0,
     priority_low_min_share_bytes: 0,
+    inet_precedence_classifier: String::new(),
+    inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
     let mut current = ForwardingState::default();
     current.cos.interfaces.insert(12, iface.clone());
@@ -2440,6 +2464,8 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
 

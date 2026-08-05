@@ -1,3 +1,54 @@
+## 2026-08-05 — #6847: enforce the inet-precedence classifier end to end
+
+- **Timestamp**: 2026-08-05 (fix/6847-rust) — completes the WIP below.
+- **Action**: wired the `inet-precedence` classifier through the wire and the
+  dataplane so the binding site the Go half added actually does something.
+  Wire: `inet_precedence_classifiers` on the CoS snapshot and
+  `cos_inet_precedence_classifier` on the interface snapshot, additive on both
+  sides. Dataplane: an 8-entry `inet_precedence_queue_by_prec` table beside
+  `dscp_queue_by_dscp`, a `resolve_cos_inet_precedence_classifier_queue_id` arm
+  reading `(dscp >> 3) & 0x7`, inserted after the DSCP arm and before 802.1p at
+  all five call sites. Retracted the classifier half of the accepted-but-inert
+  advisory; the rewrite-rules half stays.
+- **Three gaps found while building on the inherited half**, each of which
+  would have left the feature dead in the common case:
+  1. `coSInterfaceUnitHasBinding` did not list `INetPrecedenceClassifier`, so a
+     unit binding ONLY that classifier was parsed and then DISCARDED, taking
+     the whole CoS interface with it. Nothing reached the snapshot.
+  2. The `useful_cos_state` gate (#1183) had no inet-precedence arm, so an
+     interface with no shaping-rate and no scheduler-map was skipped even once
+     the binding survived.
+  3. The `ba_reclassify` gate had no inet-precedence arm, so a flow's queue
+     would freeze on its seed packet's marking.
+  Also wired the entry's `loss-priority` into `resolve_cos_loss_priority`;
+  without it `loss-priority high` would compile and silently apply the LOW
+  egress rewrite — the same accepted-but-inert shape inside the fix.
+- **Validation**: 14 guards mutation-proved, each reverted individually and
+  observed RED with an ASSERTION (not a build break) — 7 Rust, 7 Go; harness
+  snapshots each file's bytes, restores verbatim, and verifies the restore.
+  MEASURED and recorded: the out-of-range bounds check exists at two sites
+  whose key sets are always identical, so mutating either alone leaves the test
+  GREEN; the fail-closed property binds only when both are mutated, and the
+  test comment states that scope rather than claiming each site is independently
+  load-bearing. Full Rust cargo suite and full `go test ./...` green;
+  `go test ./pkg/refactoraudit/` green. `protocol_wire_v1.json` regenerated —
+  diff is exactly three additive keys, 0 removed, 0 changed.
+- **File(s)**: `userspace-dp/src/protocol/cos.rs`,
+  `userspace-dp/src/protocol/snapshot.rs`, `userspace-dp/src/protocol/tests.rs`,
+  `userspace-dp/src/policy_snapshot_error.rs`,
+  `userspace-dp/src/afxdp/types/cos.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/cos.rs`,
+  `userspace-dp/src/afxdp/tx/cos_classify.rs`,
+  `userspace-dp/src/afxdp/tx/test_support.rs`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/protocol_cos.go`,
+  `pkg/dataplane/userspace/cos.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_warn.go`, `pkg/config/schema_cos.go`,
+  `docs/config-schema.md`, `docs/cos-traffic-shaping.md`, plus the new tests
+  and the struct-literal updates across the Rust test tree, `_Log.md`
+
 ## 2026-08-05 — #6847 WIP: inet-precedence classifier, Go config half
 
 - **Timestamp**: 2026-08-05 (fix/6847-inet-precedence-classifier) — **INCOMPLETE**

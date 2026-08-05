@@ -684,6 +684,8 @@ fn nonexact_queue_lease_conserved_across_teardown_5156() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
 
     // Drain a lease's full outstanding-credit capacity at a fixed clock.
@@ -843,6 +845,8 @@ fn unleased_nonexact_burst_survives_lease_swap_6272() {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
     };
 
     fn drain_capacity(lease: &SharedCoSQueueLease, now_ns: u64) -> u64 {

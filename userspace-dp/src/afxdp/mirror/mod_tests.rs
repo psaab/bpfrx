@@ -23,6 +23,8 @@ fn test_cos_interface(default_queue: u8) -> CoSInterfaceConfig {
         oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
         oversubscription_guarantee_fraction: 0.0,
         priority_low_min_share_bytes: 0,
+        inet_precedence_classifier: String::new(),
+        inet_precedence_queue_by_prec: [u8::MAX; 8],
     }
 }
 

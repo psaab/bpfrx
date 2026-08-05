@@ -827,8 +827,15 @@ func coSInterfaceUnitHasBinding(unit *CoSInterfaceUnit) bool {
 	if unit == nil {
 		return false
 	}
+	// #6847: INetPrecedenceClassifier belongs in this set. A unit that binds
+	// ONLY an inet-precedence classifier has a real binding; omitting it here
+	// made parseCoSInterfaceUnitBody record the binding and then DISCARD the
+	// whole unit (and, if it was the interface's only unit, the CoS interface
+	// with it), so nothing reached the snapshot and the dataplane arm was
+	// unreachable for the plain single-classifier config.
 	return unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" ||
 		unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" ||
+		unit.INetPrecedenceClassifier != "" ||
 		unit.DSCPRewriteRule != "" || unit.IEEE8021RewriteRule != "" ||
 		unit.OversubscriptionPolicy != "" ||
 		unit.PriorityLowMinShareBytes > 0 || unit.OutputTrafficControlProfile != ""

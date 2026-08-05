@@ -24,6 +24,7 @@ pub(super) struct ClassifierTables<'a> {
     pub class_to_queue: FastMap<String, u8>,
     pub dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
     pub ieee8021_classifiers: FastMap<String, CoSIEEE8021ClassifierConfig>,
+    pub inet_precedence_classifiers: FastMap<String, CoSINetPrecedenceClassifierConfig>,
     pub dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
     pub schedulers: FastMap<String, &'a CoSSchedulerSnapshot>,
     pub scheduler_maps: FastMap<String, &'a CoSSchedulerMapSnapshot>,
@@ -163,6 +164,68 @@ fn build_cos_dscp_lp_table(
     Ok(table)
 }
 
+/// #6847: build the per-interface IP-precedence code-point → queue table.
+/// Mirrors [`build_cos_ieee8021_queue_table`] (same 3-bit code-point domain,
+/// same fail-CLOSED on an out-of-range code-point, same #hb166 T-4
+/// materialized-queue fallback), but the code-point comes from the DS field
+/// rather than the 802.1Q tag.
+fn build_cos_inet_precedence_queue_table(
+    classifier_name: &str,
+    classifiers: &FastMap<String, CoSINetPrecedenceClassifierConfig>,
+    materialized_queues: &[u8],
+    default_queue: u8,
+) -> Result<[u8; 8], crate::policy::SnapshotIntegrityError> {
+    let mut table = [u8::MAX; 8];
+    if classifier_name.is_empty() {
+        return Ok(table);
+    }
+    if let Some(classifier) = classifiers.get(classifier_name) {
+        for (&precedence, &queue_id) in &classifier.queue_by_prec {
+            // A code-point outside the 3-bit IP-precedence domain fails the
+            // snapshot CLOSED rather than being masked with `& 0x7`, which
+            // would install the classifier for a DIFFERENT traffic class.
+            let Some(slot) = table.get_mut(usize::from(precedence)) else {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::CosInetPrecedenceCodePointOutOfRange {
+                        classifier: classifier_name.to_string(),
+                        precedence,
+                    },
+                );
+            };
+            *slot = materialized_queue_or_default(queue_id, materialized_queues, default_queue);
+        }
+    }
+    Ok(table)
+}
+
+/// #6847: flatten an IP-precedence classifier's `lp_by_prec` into a fixed
+/// 8-entry table. `u8::MAX` marks an unclassified code-point. Without this the
+/// entry's `loss-priority` would compile and be silently dropped before the
+/// egress rewrite keyed on it.
+fn build_cos_inet_precedence_lp_table(
+    classifier_name: &str,
+    classifiers: &FastMap<String, CoSINetPrecedenceClassifierConfig>,
+) -> Result<[u8; 8], crate::policy::SnapshotIntegrityError> {
+    let mut table = [u8::MAX; 8];
+    if classifier_name.is_empty() {
+        return Ok(table);
+    }
+    if let Some(classifier) = classifiers.get(classifier_name) {
+        for (&precedence, &lp) in &classifier.lp_by_prec {
+            let Some(slot) = table.get_mut(usize::from(precedence)) else {
+                return Err(
+                    crate::policy::SnapshotIntegrityError::CosInetPrecedenceCodePointOutOfRange {
+                        classifier: classifier_name.to_string(),
+                        precedence,
+                    },
+                );
+            };
+            *slot = lp;
+        }
+    }
+    Ok(table)
+}
+
 /// #3995: flatten an 802.1p classifier's `lp_by_pcp` into a fixed 8-entry
 /// table. `u8::MAX` marks an unclassified code-point.
 fn build_cos_ieee8021_lp_table(
@@ -222,6 +285,10 @@ fn build_cos_lp_rewrite(
     let dscp_lp_by_dscp = build_cos_dscp_lp_table(&cfg.dscp_classifier, &tables.dscp_classifiers)?;
     let ieee8021_lp_by_pcp =
         build_cos_ieee8021_lp_table(&cfg.ieee8021_classifier, &tables.ieee8021_classifiers)?;
+    let inet_precedence_lp_by_prec = build_cos_inet_precedence_lp_table(
+        &cfg.inet_precedence_classifier,
+        &tables.inet_precedence_classifiers,
+    )?;
     let mut dscp_rewrite_by_queue_lp: FastMap<(u8, u8), u8> = FastMap::default();
     if let Some(rule) = tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule) {
         for queue in &cfg.queues {
@@ -235,6 +302,7 @@ fn build_cos_lp_rewrite(
     Ok(CoSLossPriorityRewrite {
         dscp_lp_by_dscp,
         ieee8021_lp_by_pcp,
+        inet_precedence_lp_by_prec,
         dscp_rewrite_by_queue_lp,
     })
 }
@@ -425,6 +493,38 @@ pub(super) fn build_cos_classifier_tables(
             )
         })
         .collect::<FastMap<_, _>>();
+    // #6847: the IP-precedence classifier table. Structurally identical to the
+    // 802.1p one — same 3-bit code-point domain, same undefined-class skip —
+    // but the code-point is read from the DS field at classification time.
+    let inet_precedence_classifiers = cos
+        .inet_precedence_classifiers
+        .iter()
+        .filter(|classifier| !classifier.name.is_empty())
+        .map(|classifier| {
+            let mut queue_by_prec = FastMap::default();
+            let mut lp_by_prec = FastMap::default();
+            for entry in &classifier.entries {
+                if entry.forwarding_class.is_empty() {
+                    continue;
+                }
+                let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
+                    continue;
+                };
+                let lp = cos_loss_priority_index(&entry.loss_priority).unwrap_or(0);
+                for precedence in &entry.precedences {
+                    queue_by_prec.insert(*precedence, queue_id);
+                    lp_by_prec.insert(*precedence, lp);
+                }
+            }
+            (
+                classifier.name.clone(),
+                CoSINetPrecedenceClassifierConfig {
+                    queue_by_prec,
+                    lp_by_prec,
+                },
+            )
+        })
+        .collect::<FastMap<_, _>>();
     let dscp_rewrite_rules = cos
         .dscp_rewrite_rules
         .iter()
@@ -483,6 +583,7 @@ pub(super) fn build_cos_classifier_tables(
         class_to_queue,
         dscp_classifiers,
         ieee8021_classifiers,
+        inet_precedence_classifiers,
         dscp_rewrite_rules,
         schedulers,
         scheduler_maps,
@@ -693,6 +794,21 @@ pub(super) fn build_cos_iface_config(
         .get(&iface.cos_ieee8021_classifier)
         .map(|c| c.queue_by_pcp.values().any(|q| iface_queue_ids.contains(q)))
         .unwrap_or(false);
+    // #6847: an inet-precedence classifier admits the interface on exactly the
+    // same terms as the other two BA arms. Omitting it here would make the
+    // classifier inert on any interface that has no shaping-rate, no
+    // scheduler-map and no other classifier — i.e. the plain
+    // `set class-of-service interfaces <if> unit 0 classifiers inet-precedence
+    // <name>` config this issue exists to make work.
+    let inet_precedence_classifier_targets_iface_queue = tables
+        .inet_precedence_classifiers
+        .get(&iface.cos_inet_precedence_classifier)
+        .map(|c| {
+            c.queue_by_prec
+                .values()
+                .any(|q| iface_queue_ids.contains(q))
+        })
+        .unwrap_or(false);
     let dscp_rewrite_targets_iface_class = dscp_rewrite_rule
         .map(|r| {
             r.dscp_by_fc_lp
@@ -709,6 +825,7 @@ pub(super) fn build_cos_iface_config(
         || scheduler_map_resolved_to_queues
         || dscp_classifier_targets_iface_queue
         || ieee8021_classifier_targets_iface_queue
+        || inet_precedence_classifier_targets_iface_queue
         || dscp_rewrite_targets_iface_class;
     if !contributes_usable_cos_state {
         return Ok(None);
@@ -764,6 +881,12 @@ pub(super) fn build_cos_iface_config(
         &materialized_queues,
         default_queue,
     )?;
+    let inet_precedence_queue_by_prec = build_cos_inet_precedence_queue_table(
+        &iface.cos_inet_precedence_classifier,
+        &tables.inet_precedence_classifiers,
+        &materialized_queues,
+        default_queue,
+    )?;
     // #1614 A1: parse the operator-selectable oversubscription
     // policy. "" or "proportional" (default) maps to Proportional
     // (current scheduler unchanged); "guarantee-rate" activates the
@@ -782,8 +905,10 @@ pub(super) fn build_cos_iface_config(
         default_queue,
         dscp_classifier: iface.cos_dscp_classifier.clone(),
         ieee8021_classifier: iface.cos_ieee8021_classifier.clone(),
+        inet_precedence_classifier: iface.cos_inet_precedence_classifier.clone(),
         dscp_queue_by_dscp,
         ieee8021_queue_by_pcp,
+        inet_precedence_queue_by_prec,
         queue_by_forwarding_class,
         queues,
         oversubscription_policy,

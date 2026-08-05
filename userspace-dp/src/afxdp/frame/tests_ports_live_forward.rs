@@ -651,6 +651,8 @@ fn build_live_forward_request_meters_non_l4_metadata_flow() {
             oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
             oversubscription_guarantee_fraction: 0.0,
             priority_low_min_share_bytes: 0,
+            inet_precedence_classifier: String::new(),
+            inet_precedence_queue_by_prec: [u8::MAX; 8],
         },
     );
     let decision = SessionDecision {

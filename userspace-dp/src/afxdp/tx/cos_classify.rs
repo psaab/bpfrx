@@ -153,6 +153,7 @@ fn resolve_cached_cos_tx_selection_impl(
         // key, so those stay unset (as before).
         let queue_id = iface.map(|iface| {
             resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, meta.dscp))
                 .or_else(|| {
                     resolve_cos_ieee8021_classifier_queue_id(
                         iface,
@@ -366,6 +367,7 @@ fn resolve_cached_cos_tx_selection_impl(
     let queue_id = fc_queue.or_else(|| {
         iface.and_then(|iface| {
             resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, meta.dscp))
                 .or_else(|| {
                     resolve_cos_ieee8021_classifier_queue_id(
                         iface,
@@ -382,7 +384,16 @@ fn resolve_cached_cos_tx_selection_impl(
     // plain default-queue interface keeps the frozen queue (correct + free).
     let ba_reclassify = fc_queue.is_none()
         && iface.is_some_and(|iface| {
-            !iface.dscp_classifier.is_empty() || !iface.ieee8021_classifier.is_empty()
+            // #6847: inet-precedence is a per-packet BA classifier like the
+            // other two. Leaving it out of this gate would freeze the SEED
+            // packet's queue for the flow's lifetime, so a flow whose
+            // precedence marking changes mid-flow would keep the first
+            // packet's class — classification that silently stops tracking
+            // the packets, which is the same defect class as not classifying
+            // at all.
+            !iface.dscp_classifier.is_empty()
+                || !iface.ieee8021_classifier.is_empty()
+                || !iface.inet_precedence_classifier.is_empty()
         });
 
     // #3995: fold the loss-priority-aware CoS rewrite-rule DSCP for the chosen
@@ -443,6 +454,7 @@ pub(in crate::afxdp) fn reclassify_cached_ba_queue(
         .get(&egress_ifindex)
         .and_then(|iface| {
             resolve_cos_dscp_classifier_queue_id(iface, dscp)
+                .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, dscp))
                 .or_else(|| {
                     resolve_cos_ieee8021_classifier_queue_id(iface, ingress_pcp, ingress_vlan_present)
                 })
@@ -570,6 +582,7 @@ fn resolve_cos_tx_selection_internal(
         // default queue. Mirrors the cached-path None branch.
         let queue_id = iface.map(|iface| {
             resolve_cos_dscp_classifier_queue_id(iface, meta.dscp)
+                .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, meta.dscp))
                 .or_else(|| {
                     resolve_cos_ieee8021_classifier_queue_id(
                         iface,
@@ -849,7 +862,16 @@ fn resolve_cos_tx_selection_internal(
     };
     // Queue selection precedence: the output-filter forwarding-class, then the
     // ingress input-filter forwarding-class, then the DSCP behavior-aggregate
-    // classifier, then the 802.1p classifier, then the interface default queue.
+    // classifier, then the IP-precedence classifier (#6847), then the 802.1p
+    // classifier, then the interface default queue.
+    //
+    // DSCP before inet-precedence is load-bearing, not incidental: the two read
+    // the same DS field, so a unit binding both is rejected at commit
+    // (validateCoSUnitClassifierConflict) — but the tolerant Load / peer-sync
+    // path downgrades that to a warning so an already-persisted config still
+    // boots (#1960). On that boot this order is what makes "DSCP wins" true,
+    // which is what the Go warning tells the operator will happen. Both L3
+    // arms precede the L2 802.1p arm.
     let queue_id = output_result
         .forwarding_class
         .and_then(|forwarding_class| iface.queue_by_forwarding_class.get(forwarding_class).copied())
@@ -859,6 +881,7 @@ fn resolve_cos_tx_selection_internal(
             })
         })
         .or_else(|| resolve_cos_dscp_classifier_queue_id(iface, meta.dscp))
+        .or_else(|| resolve_cos_inet_precedence_classifier_queue_id(iface, meta.dscp))
         .or_else(|| {
             resolve_cos_ieee8021_classifier_queue_id(
                 iface,
@@ -902,6 +925,15 @@ fn resolve_cos_loss_priority(
     if dscp_lp != u8::MAX {
         return dscp_lp;
     }
+    // #6847: the IP-precedence classifier's loss-priority, in the same position
+    // in the chain as its queue arm. Skipping this would accept
+    // `loss-priority high` on an inet-precedence entry at commit and then apply
+    // the LOW rewrite on egress — an accepted-but-inert knob of exactly the
+    // kind #6847 removes from the queue side.
+    let prec_lp = lp.inet_precedence_lp_by_prec[usize::from((dscp >> 3) & 0x7)];
+    if prec_lp != u8::MAX {
+        return prec_lp;
+    }
     if vlan_present {
         if let Some(&pcp_lp) = lp.ieee8021_lp_by_pcp.get(usize::from(ingress_pcp)) {
             if pcp_lp != u8::MAX {
@@ -934,6 +966,25 @@ fn resolve_cos_queue_lp_rewrite(
 
 fn resolve_cos_dscp_classifier_queue_id(iface: &CoSInterfaceConfig, dscp: u8) -> Option<u8> {
     let queue_id = iface.dscp_queue_by_dscp[usize::from(dscp & 0x3f)];
+    (queue_id != u8::MAX).then_some(queue_id)
+}
+
+/// #6847: resolve the queue for this packet's IP precedence — the top 3 bits of
+/// the DS field, i.e. `(dscp >> 3)` where `dscp` is already the 6-bit field the
+/// frame parser extracted (`packet[1] >> 2` for IPv4 TOS, `traffic_class >> 2`
+/// for IPv6). The `& 0x7` is belt: a 6-bit input cannot exceed 7 after the
+/// shift, but the mask makes the 8-entry table index total regardless of what
+/// a future parser change puts in `meta.dscp`.
+///
+/// Family-agnostic, exactly like `resolve_cos_dscp_classifier_queue_id` above
+/// — this codebase has never split the DS-field classifier by address family
+/// (Junos models `dscp` and `dscp-ipv6` separately; we do not), and adding the
+/// split for inet-precedence alone would be a new inconsistency.
+fn resolve_cos_inet_precedence_classifier_queue_id(
+    iface: &CoSInterfaceConfig,
+    dscp: u8,
+) -> Option<u8> {
+    let queue_id = iface.inet_precedence_queue_by_prec[usize::from((dscp >> 3) & 0x7)];
     (queue_id != u8::MAX).then_some(queue_id)
 }
 
