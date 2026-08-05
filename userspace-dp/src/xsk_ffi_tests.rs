@@ -219,6 +219,206 @@ fn read_rx_release_advances_consumer_through_mut_ref() {
     assert_eq!(unsafe { *rx.ring.consumer }, 2);
 }
 
+// ── Terminal-op base-cursor advance (#5716) ──────────────────────
+//
+// All four ring guards stay usable after their terminal op
+// (`WriteTx::commit` / `WriteFill::commit` / `ReadRx::release` /
+// `ReadComplete::release`). Pre-#5716 none of them advanced `base_idx`
+// past the slots the terminal op had handed to the kernel, so a reused
+// guard silently aliased them:
+//
+//   * producers restarted at `base_idx + 0` and OVERWROTE the
+//     just-submitted descriptors / fill offsets;
+//   * `ReadComplete` restarted at `base_idx + 0` and RE-READ completion
+//     addresses it had already reaped;
+//   * `ReadRx` kept its positional cursor but sealed itself with a sticky
+//     `released` flag, so the post-release reads could never be released
+//     and `Drop`'s cancel under-counted — permanently leaking those RX
+//     ring slots (`cached_cons` stuck ahead of `*consumer`).
+//
+// No production caller crosses a terminal op today (every site is
+// `create -> insert/read* -> commit/release -> drop`), so these are
+// API-hardening guards: they pin the reuse contract before a caller
+// relies on it. The single-use path is unchanged and still covered by
+// the #2383/#4997 tests above.
+
+/// Seed a producer ring so the next reservation begins at `at`. Lets a test
+/// place the guard's base cursor at the `u32` wrap boundary instead of only
+/// at 0 (libxdp masks the index, so a ring index legitimately wraps `u32`).
+fn seed_prod_at(ring: &mut XskRingProd, at: u32) {
+    ring.cached_prod = at;
+    ring.cached_cons = at.wrapping_add(ring.size);
+    unsafe {
+        *ring.producer = at;
+        *ring.consumer = at;
+    }
+}
+
+/// Seed a consumer ring so the next peek begins at `at`. Same purpose as
+/// [`seed_prod_at`], for the RX / completion side.
+fn seed_cons_at(ring: &mut XskRingCons, at: u32) {
+    ring.cached_prod = at;
+    ring.cached_cons = at;
+    unsafe {
+        *ring.producer = at;
+        *ring.consumer = at;
+    }
+}
+
+/// The two cursor origins every reuse test runs at: mid-range (0) and the
+/// `u32` wrap boundary. At `u32::MAX - 1` a 4-slot reservation straddles the
+/// wrap, so the terminal op's `wrapping_add` advance crosses `u32::MAX` mid
+/// guard — the edge of the class these guards claim to cover.
+const CURSOR_ORIGINS: [u32; 2] = [0, u32::MAX - 1];
+
+#[test]
+fn write_tx_insert_after_commit_appends_past_the_committed_slots() {
+    for origin in CURSOR_ORIGINS {
+        let mut tx = RingTx::new_for_test(-1, 8);
+        seed_prod_at(&mut tx.ring, origin);
+        let producer = tx.ring.producer;
+        let base;
+        {
+            let mut w = tx.transmit(4);
+            base = w.base_idx;
+            assert_eq!(base, origin, "reservation must start at the seeded cursor");
+            assert_eq!(w.insert([desc(0xA0)].into_iter()), 1);
+            w.commit();
+            // The commit submitted slot base+0 to the kernel. The reservation
+            // shrinks by the committed count...
+            assert_eq!(w.reserved, 3, "commit must consume the submitted slots");
+            // ...and a further insert must land AFTER it.
+            assert_eq!(w.insert([desc(0xB1), desc(0xC2)].into_iter()), 2);
+            w.commit();
+        }
+        assert_eq!(
+            tx_slot(&tx.ring, base).addr,
+            0xA0,
+            "origin {origin}: post-commit insert overwrote the descriptor the \
+             commit already submitted to the kernel"
+        );
+        assert_eq!(tx_slot(&tx.ring, base.wrapping_add(1)).addr, 0xB1);
+        assert_eq!(tx_slot(&tx.ring, base.wrapping_add(2)).addr, 0xC2);
+        // Both commits reached the kernel-facing producer pointer, and the
+        // drop-time cancel left cached_prod exactly there (no leaked slots).
+        assert_eq!(unsafe { *producer }, base.wrapping_add(3));
+        assert_eq!(tx.ring.cached_prod, unsafe { *producer });
+    }
+}
+
+#[test]
+fn write_fill_insert_after_commit_appends_past_the_committed_slots() {
+    for origin in CURSOR_ORIGINS {
+        let mut dq = DeviceQueue::new_for_test(-1, 8);
+        seed_prod_at(dq.rings.fill_mut(), origin);
+        let producer = dq.rings.fill().producer;
+        let base;
+        {
+            let mut w = dq.fill(4);
+            base = w.base_idx;
+            assert_eq!(base, origin, "reservation must start at the seeded cursor");
+            assert_eq!(w.insert([0xA0u64].into_iter()), 1);
+            w.commit();
+            assert_eq!(w.reserved, 3, "commit must consume the submitted slots");
+            assert_eq!(w.insert([0xB1u64, 0xC2u64].into_iter()), 2);
+            w.commit();
+        }
+        let ring = dq.rings.fill();
+        assert_eq!(
+            fill_slot(ring, base),
+            0xA0,
+            "origin {origin}: post-commit insert overwrote a fill offset already \
+             submitted to the kernel — two RX slots would alias one UMEM frame"
+        );
+        assert_eq!(fill_slot(ring, base.wrapping_add(1)), 0xB1);
+        assert_eq!(fill_slot(ring, base.wrapping_add(2)), 0xC2);
+        assert_eq!(unsafe { *producer }, base.wrapping_add(3));
+        assert_eq!(ring.cached_prod, unsafe { *producer });
+    }
+}
+
+#[test]
+fn read_complete_read_after_release_does_not_re_reap_released_entries() {
+    for origin in CURSOR_ORIGINS {
+        let mut dq = DeviceQueue::new_for_test(-1, 8);
+        seed_cons_at(dq.rings.comp_mut(), origin);
+        for addr in [0xC0u64, 0xC1, 0xC2, 0xC3] {
+            dq.push_comp_for_test(addr);
+        }
+        // Raw pointer captured before the guard borrows the ring (it models
+        // kernel-owned mmap state, exactly as `test_cons_ring` sets it up).
+        let consumer = dq.rings.comp().consumer;
+        assert_eq!(unsafe { *consumer }, origin);
+        {
+            let mut r = dq.complete(4);
+            assert_eq!(r.base_idx, origin, "peek must start at the seeded cursor");
+            assert_eq!(r.read(), Some(0xC0));
+            assert_eq!(r.read(), Some(0xC1));
+            r.release();
+            assert_eq!(unsafe { *consumer }, origin.wrapping_add(2));
+            // A reused reader must continue at the THIRD entry. Handing 0xC0
+            // back a second time would recycle one UMEM frame into the fill
+            // ring twice.
+            assert_eq!(
+                r.read(),
+                Some(0xC2),
+                "origin {origin}: read after release re-reaped an \
+                 already-released completion address"
+            );
+            assert_eq!(r.read(), Some(0xC3));
+            assert_eq!(r.read(), None);
+            r.release();
+            assert_eq!(unsafe { *consumer }, origin.wrapping_add(4));
+        }
+        // Nothing peeked-but-unread survives: cached_cons matches the real
+        // consumer, so no completion-ring slots were leaked.
+        assert_eq!(dq.rings.comp().cached_cons, unsafe { *consumer });
+    }
+}
+
+#[test]
+fn read_rx_read_after_release_stays_releasable() {
+    for origin in CURSOR_ORIGINS {
+        let mut rx = RingRx::new_for_test(-1, 8);
+        seed_cons_at(&mut rx.ring, origin);
+        for addr in [0xAAu64, 0xBB, 0xCC, 0xDD] {
+            rx.push_for_test(desc(addr));
+        }
+        let consumer = rx.ring.consumer;
+        {
+            let mut r = rx.receive(4);
+            assert_eq!(r.base_idx, origin, "peek must start at the seeded cursor");
+            assert_eq!(r.read().expect("first descriptor").addr, 0xAA);
+            assert_eq!(r.read().expect("second descriptor").addr, 0xBB);
+            r.release();
+            assert_eq!(unsafe { *consumer }, origin.wrapping_add(2));
+            // Keep reading on the same guard. The descriptors advance either
+            // way (the positional cursor was already correct), but the SECOND
+            // release must still reach the kernel-facing consumer: pre-#5716 a
+            // sticky `released` flag swallowed it and those two slots were
+            // leaked for the life of the socket.
+            assert_eq!(r.read().expect("third descriptor").addr, 0xCC);
+            assert_eq!(r.read().expect("fourth descriptor").addr, 0xDD);
+            assert!(r.read().is_none(), "only four descriptors were pushed");
+            r.release();
+            assert_eq!(
+                unsafe { *consumer },
+                origin.wrapping_add(4),
+                "origin {origin}: the second release did not advance the \
+                 consumer — the post-release reads are permanently unreleasable"
+            );
+        }
+        // Drop must land cached_cons on the real consumer. A leak shows up
+        // here as cached_cons > *consumer.
+        assert_eq!(
+            rx.ring.cached_cons,
+            unsafe { *consumer },
+            "origin {origin}: cached_cons drifted ahead of the kernel consumer \
+             — leaked RX slots"
+        );
+    }
+}
+
 // ── libxdp ring ABI contract (#4976) ─────────────────────────────
 //
 // The authoritative guard is the `const _` block in `xsk_ffi.rs` (fails
