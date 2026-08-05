@@ -67603,3 +67603,44 @@ break — `go vet` confirmed passing under every revert.
   pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
+
+## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
+
+- **Timestamp**: 2026-08-05
+- **Action**: Two findings from reviewing the #5078 branch, plus the doc
+  half. (1) F-B: `TestSyncAuthHandshakeDowngradeGuardRejects` documented a
+  RED-on-revert that could not fire — flipping its only precondition
+  (`newAuthSync(t, key, true)` -> `false`) left it PASSING, because after
+  #5078 `syncAuthDecision` rejects every unkeyed peer on a keyed node
+  regardless of `peerAuthSeen`. It was a duplicate of
+  `TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer` wearing a
+  downgrade-guard name; deleted with a comment recording why. (2) F-A: the
+  sync-side downgrade guard it was named for was itself dead —
+  `syncPeerAuthSeen` had ZERO callers and `syncAuthedEver` was write-only
+  in effect (stored in `wrapSyncConn`, read only by the orphan). Go does
+  not flag unused methods, so it compiled green. Deleted, along with
+  `SyncAuthProvider.HeartbeatPeerAuthSeen()` (its only consumer through
+  the interface), the fake's implementation, and the now-meaningless
+  `authSeen` parameter of `newAuthSync`. (3) Docs: the `sync_auth.go`
+  package doc and the `pkg/cluster/README.md` PR-C section still described
+  keyed-node dual-accept, the deleted `pendingFrame` path, the removed
+  sync downgrade guard, and a two-method provider wiring.
+- **Scope verified, not assumed**: `Manager.HeartbeatPeerAuthSeen` is NOT
+  removed — still exported, still consumed by the gRPC fabric listener
+  (`pkg/grpcapi/fabric_auth.go`) and the control-link status string
+  (`status.go`). The #4107 HEARTBEAT downgrade guard is separate state
+  (`heartbeatAuthDecision` over `heartbeatAuthState.peerAuthenticated`),
+  so deleting the sync pair cannot disarm it;
+  `TestHeartbeatAuthDecision/key/legacy-after-peer-authed` and
+  `TestControlLinkAuthStatus` still pass.
+- **Not landed, deliberately**: my own `clusterCommsNeedRestart` guard +
+  `cluster_authkey_no_comms_restart_5078_test.go`. The branch already
+  carries `TestAuthKeyChangeDoesNotRestartClusterComms_5078`, which binds
+  the same property and additionally covers key ROTATION. A second test
+  for one property is noise.
+- **Validation**: `go build ./...` 0; `go vet ./pkg/cluster/ ./pkg/grpcapi/
+  ./pkg/daemon/` 0; `go test -count=1 ./pkg/cluster/ ./pkg/grpcapi/` 0;
+  full `go test ./pkg/... ./cmd/...` exit 0 (59 packages, zero failures).
+- **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
+  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md

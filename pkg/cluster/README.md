@@ -480,26 +480,37 @@ connection is authenticated, then seals every subsequent frame.
   Chose a signed per-frame trailer over a bare sequence because a sequence
   without a MAC is forgeable (an on-path attacker just uses seq+1); the MAC
   cost is negligible at realistic session-sync rates.
-- **Dual-accept (rolling upgrade).** A node with no key never handshakes
-  and is byte-for-byte a legacy peer; a keyed node that sees a
-  legacy/unkeyed peer (no HELLO, or `keyed=0`) negotiates
-  UNAUTHENTICATED — the stream stays legacy-compatible (no brick). The
-  legacy peer's first real frame, consumed by the handshake read, is
-  preserved as a `pendingFrame` and processed before the receive loop
-  starts. Enforcement engages only once BOTH nodes are keyed and signing —
-  and, for an ALREADY-ESTABLISHED connection, only after it is
-  re-established, because the handshake result is fixed at connect and
-  committing a key does not restart cluster comms (#6628; see "Operating
-  the control-link PSK" below).
-- **Downgrade-guard (`syncAuthDecision`, mirrors `heartbeatAuthDecision`).**
-  Once the peer has authenticated on the sync channel (sticky
-  `syncAuthedEver`) OR the heartbeat channel (`HeartbeatPeerAuthSeen`, arms
-  within ~200ms of a keyed peer coming up), a later UNAUTHENTICATED
-  connection from it is REJECTED — a downgrade to cleartext once both nodes
-  are known-keyed is an attack. Consulting the heartbeat closes the window
-  after a keyed node restarts before the first sync auth.
+- **Dual-accept, UNKEYED SIDE ONLY (as of #5078).** A node with no key never
+  handshakes and is byte-for-byte a legacy peer, so an unkeyed node still
+  accepts anything. A KEYED node does **not** dual-accept: it rejects a
+  legacy/unkeyed peer (no HELLO, or `keyed=0`) outright, with no
+  first-contact grace and no migration window — see "Session-sync
+  fail-closed authentication (#5078)" above, which supersedes the
+  paragraph this bullet used to contain. The `pendingFrame` mechanism that
+  carried a legacy peer's first frame out of the handshake is **deleted**,
+  not merely bypassed: with no accepting arm left it was unreachable, and
+  it executed that frame BEFORE the connection was admitted. Enforcement
+  still engages only once BOTH nodes are keyed and signing — and, for an
+  ALREADY-ESTABLISHED connection, only after it is re-established, because
+  the handshake result is fixed at connect and committing a key does not
+  restart cluster comms (#6628, pinned by
+  `TestAuthKeyChangeDoesNotRestartClusterComms_5078`; see "Operating the
+  control-link PSK" below).
+- **No sync-side downgrade-guard (removed in #5078).** There used to be one
+  here: once the peer had authenticated on the sync channel (sticky
+  `syncAuthedEver`) or the heartbeat channel, a later UNAUTHENTICATED
+  connection was rejected. A guard of that shape only matters where an
+  unkeyed peer would otherwise be ADMITTED, and on a keyed node none ever
+  is, so it became unreachable — `syncPeerAuthSeen` ended with zero callers
+  and `syncAuthedEver` write-only — and was deleted along with the
+  `HeartbeatPeerAuthSeen()` requirement on `SyncAuthProvider`. The **#4107
+  heartbeat downgrade-guard is separate state** (`heartbeatAuthDecision`
+  over `heartbeatAuthState.peerAuthenticated`) and is unchanged, as is the
+  #4357 fabric guard that arms off it via `Manager.HeartbeatPeerAuthSeen`
+  — that method is still exported and still consumed, just no longer by
+  this interface.
 - **Wiring.** `SessionSync.SetAuthProvider(*Manager)` (`daemon_ha_sync.go`)
-  supplies both `ControlLinkAuthKey()` and `HeartbeatPeerAuthSeen()`. No new
+  supplies `ControlLinkAuthKey()`. No new
   config leaf — the same `set chassis cluster authentication-key` secret
   authenticates the heartbeat (PR-A), the fabric gRPC (PR-B/#4357), and now
   the session-sync stream. LOW severity (matches Juniper's own
