@@ -44,8 +44,9 @@ sent while exact queues were still backlogged.
 
 `userspace-xdp/src/ipv6_ext_walk.rs` is guarded by
 `test/mutation/shim-ext-parity-acceptance.sh`, not by `make test` alone. The
-script mutates the walk across 12 mutation rows, bracketed by a green baseline
-(row 0) and a post-restore recheck (row 13), and requires the parity guards in
+script mutates the walk across 16 mutation rows plus one negative control,
+bracketed by a green baseline (row 0) and a post-restore recheck, and requires
+the parity guards in
 `userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs` to red on each edit. It
 prints per-row accounting at the end, so the evidence quoted in a PR body is
 checkable against the matrix rather than against a bare `PASS`.
@@ -54,6 +55,18 @@ One mutation per row, and one ARM per row where an edit applies to several: a
 row that mutated the GENERIC and AUTH revalidation bases together scored RED on
 either arm reding, so it could not support the claim about both that its label
 made.
+
+Rows 1-11 perturb an arm UNIFORMLY. Rows 12-15 are keyed on a SINGLE data value
+— `+8` only at `HdrExtLen == 4`, `+4` only at AH `HdrExtLen == 2`, Fragment
+advancing 7 only when `reserved != 0`, and the carried next-header UDP
+propagated as TCP. Each changes real packet classification and each was GREEN
+before the corpus gained its exhaustive dimension sweeps, because the corpus
+sampled 5 of 256 generic declared lengths, 3 of 256 AUTH ones, one value of the
+Fragment `reserved` byte, and declared TCP as the terminal in every single
+chain. A uniform-mutation matrix cannot find that class; only closing the
+dimension can. Row 16 is the same shape in a different axis — the post-advance
+revalidation skipped only for Routing(43) — and was green while the generic
+arm's eight next-header values shared one boundary witness between them.
 
 Run it whenever you change that walk. `make test` tells you the guards are
 green; it does not tell you they still bind, and this file has a history of the
@@ -90,7 +103,7 @@ as such.
 Scope of that check, precisely: exactly one path, `ipv6_ext_walk.rs`, because
 that is the file the script overwrites. The guard tests and the negative
 controls are NOT compared against git — they are covered behaviourally, by
-row 0 (green on the unmutated tree) and row 12 (a semantically null edit must
+row 0 (green on the unmutated tree) and the NEG-CTL row (a semantically null edit must
 SURVIVE). Neither is a claim that the working tree matches `HEAD`.
 
 The corpus builder also carries non-vacuity floors. The assertions that CONSUME
@@ -125,7 +138,59 @@ buffer, byte for byte — and, where the shape is behavioural, by MEASUREMENT
 with this crate's walker. The per-arm floor requires a WITNESS PAIR: the padded
 twin must resolve the terminal at exactly the advance target (proving the
 boundary was reached) and the tight twin, one byte shorter, must fail closed
-(attributing the refusal to the length check).
+(attributing the refusal to the length check). The tight twin's fail-closed is
+the failure DEFAULT of the reference walker, so it is only attributable once the
+twin is asserted to be the padded one minus exactly its last byte — otherwise a
+generator that made the two differ in a header byte as well as in length would
+satisfy the pair while isolating nothing.
+
+"Per-arm" was also per-arm-MEMBER coverage of exactly one member. Eight
+next-header values enter the shim's single GENERIC `match` arm and share its
+advance and its post-advance revalidation, but only DestOpt had a boundary pair
+— so a revalidation skipped when `protocol == ROUTING` was a fail-open of
+precisely the shape that pair exists to catch, invisible to it, and invisible to
+the 256-value sweep as well (those buffers carry 20 bytes of slack past the
+advance target, and only a packet ENDING at or before the target can observe a
+missing bounds check). Every generic member now carries a pair, and the check is
+stated over EVERY ADVANCING ARM rather than over the arm the defect was found in
+— naming GENERIC and stopping there would repeat the mistake one level up. The
+membership is enumerated by asking the reference walker to classify all 256
+next-header values: GENERIC has 8 members (0, 43, 60, 135, 139, 140, 253, 254),
+AUTH exactly 1 (51), FRAGMENT exactly 1 (44), so GENERIC was the only arm that
+could carry the defect — but that is an OUTPUT of the loop, not an assumption in
+it, and a ninth value added to any advancing arm reds. `NoNextHeader` (59) and
+the 244 terminal values are excluded on purpose: they neither read nor advance,
+so there is no bound to weaken and a boundary pair would witness nothing; their
+property is bound by the 256-value sweep and the classification negative
+control. The acceptance matrix carries the one-member mutation as its own row.
+
+**A witness pair is worth its error FAMILY, and no more.** The pair's derivation
+— an error `a*l + b` vanishing at two distinct declared lengths is identically
+zero — is a statement about errors AFFINE in the declared length, and nothing in
+the corpus enforces that premise. `+ 8` only when `HdrExtLen == 4` is not
+affine, is a real classification regression, and vanishes at both witnesses and
+at every one of the 251 declared lengths the corpus did not sample. A seventh
+floor therefore sweeps four dimensions COMPLETELY: generic declared lengths,
+AUTH ones, all 256 values of the Fragment `reserved` byte (that arm has no
+declared length, so a byte neither walker reads is the analogous hiding place),
+and all 256 values of the next-header an extension header CARRIES. Presence is
+not enough for the first three — 256 buffers that all fail closed would satisfy
+it — so each value is also measured to resolve its terminal at that arm's own
+advance target.
+
+**One of those four is JOINT and three are MARGINAL, and the difference is part
+of the claim.** A marginal sweep of A with B held fixed says nothing about an
+error conditioned on A *and* B — the same shape, one level up, as the
+non-affine error two witnesses could not see. 256⁴ is not enumerable, so the
+design covers the four marginals plus the one pair the arm's own code makes
+reachable: the generic sweep is joint over (entering next-header × declared
+length), 8 × 256 = 2048 cases, because the entering value selects the `match`
+arm while `opt[1]` feeds its advance. Explicitly NOT covered: (declared length ×
+carried next-header), which is 256 × 256 = 65536 buffers of up to 2 KB and was
+judged not worth the corpus; every 3-way combination; and an arm reached as a
+LATER header, since every sweep case is a single extension header at offset 40.
+An error keyed on `opt[0] == 17 && opt[1] == 4` survives this floor. What
+measures whether that gap matters is the acceptance matrix, not a bigger corpus.
 
 Nor do the five shape floors SUBSUME a coverage floor, which is what deleting
 the old `handcrafted >= 40` count assumed. Between them they require ten
@@ -401,6 +466,17 @@ Guard layers (`build-userspace-xdp.sh`):
      backs `TestShimCarriesFragHdrSizeAssertion`, where
      `const _: () = assert!(true); // mem::size_of::<FragHdr>() == 8`
      used to satisfy the check.
+     Of the two defences, the ANCHORING is what catches that mutation:
+     measured, with the comment filter edited to strip nothing, the
+     `true # sudo -n env ...` recipe still reds, because a line beginning
+     `true` does not begin `sudo`. The filter's own worth is narrower —
+     it stops a WHOLE-LINE comment satisfying a check — and narrower still
+     for the plain `XPF_SHIM_ALLOW_LOW_HEADROOM` mention assertion, which
+     the continuation lines of the recipe's multi-line `fail "..."`
+     diagnostics satisfy (the filter is line-oriented and does not carry
+     quote state across newlines). That assertion binds only that the
+     override is NAMED somewhere outside a comment; the two start-of-line
+     invocation checks are what bind the behaviour.
 
 **Recovery runbook** (symptom: `load Rust xdp_userspace collection:
 ... BPF program is too large. Processed 1000001 insn`, daemon in

@@ -92,10 +92,30 @@ func TestUserspaceShimHeadroomFloorBracketsKnownValues(t *testing.T) {
 // recipe's `0) ;;` arm installed an object no verifier ever saw. That is the
 // #1864 unverified-install path the script's own header says does not exist.
 //
+// WHAT IT IS WORTH, MEASURED RATHER THAN ASSUMED. The two invocation checks
+// below have TWO independent defences — this filter, and requiring the match at
+// the START of a line — and the anchoring is the one that catches the mutation
+// above: with this function edited to strip nothing, the `true # sudo -n env
+// ...` recipe STILL reds, because a line beginning `true` does not begin
+// `sudo`. So the filter's own value is narrower than "it is what makes those
+// checks work": it is what stops a WHOLE-LINE comment satisfying a check, and
+// it is bound directly by TestShellCodeLinesStripsCommentsButNotCode.
+//
+// It is worth less than that to the plain-mention check. Measured: stripping
+// XPF_SHIM_ALLOW_LOW_HEADROOM out of every executable line of the recipe left
+// that check GREEN with the filter enabled, because this function is
+// LINE-ORIENTED — quote state resets at each newline, so the continuation lines
+// of the recipe's multi-line `fail "..."` diagnostics (which mention the
+// override) read as ordinary code. The mention check therefore binds only
+// "something outside a whole-line comment names the override"; the two
+// start-of-line invocation checks are what bind the behaviour, and G3/G4 of the
+// round-9 mutation matrix are where that was measured.
+//
 // The comment rule is bash's: an unquoted `#` beginning a word starts a
-// comment. Quoting is tracked (single quotes literal, double quotes with
-// backslash escapes) well enough for this script; it is NOT a shell parser,
-// and a `#` inside a here-doc body would be stripped as a comment. That
+// comment. Quoting is tracked within a line (single quotes literal, double
+// quotes with backslash escapes) well enough for this script; it is NOT a shell
+// parser. It does not carry quote state across newlines (above), and a `#`
+// inside a here-doc body would be stripped as a comment. That
 // direction is the safe one — stripping too much can only make a check RED,
 // never green, and a red says "the recipe no longer contains this line",
 // which is a person's job to look at.
@@ -243,9 +263,15 @@ func TestBuildRecipeHandlesShimverifyExitCodes(t *testing.T) {
 		return ""
 	}
 	const shimverifyRef = `"${SHIMVERIFY}"`
+	// The WEAKEST of the three, kept for its message rather than its force:
+	// shellCodeLines is line-oriented, so the continuation lines of the
+	// recipe's multi-line `fail "..."` diagnostics — which name the override —
+	// satisfy it. Measured: stripping the override out of every executable line
+	// left this check green. What binds the behaviour is the two start-of-line
+	// invocation checks below.
 	if codeLine(func(l string) bool { return strings.Contains(l, "XPF_SHIM_ALLOW_LOW_HEADROOM") }) == "" {
-		t.Error("no EXECUTABLE line of build-userspace-xdp.sh mentions XPF_SHIM_ALLOW_LOW_HEADROOM; " +
-			"the documented override exists only in the script's prose")
+		t.Error("no line of build-userspace-xdp.sh outside a whole-line comment mentions " +
+			"XPF_SHIM_ALLOW_LOW_HEADROOM; the documented override is not even described here")
 	}
 	// sudo scrubs the environment: the override must be threaded across
 	// the sudo hop explicitly or it silently does nothing.

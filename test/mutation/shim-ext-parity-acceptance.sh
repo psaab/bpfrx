@@ -53,18 +53,21 @@
 #      script OVERWRITES and restores. The guard tests and the negative
 #      controls are NOT compared against git; they are covered BEHAVIOURALLY
 #      instead — row 0 requires them green on the unmutated tree (so a locally
-#      broken or unconditionally-red guard aborts the run) and row 12 requires
-#      them to SURVIVE a semantically null edit (so a guard rewritten to red on
-#      any change fails too). Neither of those is a claim that the working tree
-#      matches HEAD.
+#      broken or unconditionally-red guard aborts the run) and the NEG-CTL row
+#      requires them to SURVIVE a semantically null edit (so a guard rewritten
+#      to red on any change fails too). Neither of those is a claim that the
+#      working tree matches HEAD.
 #   3. RESTORE ON EXIT/INT/TERM, VERIFIED. A trap cannot catch SIGKILL, so the
 #      trap is not the safety property — property 2 is. The trap narrows the
 #      window; the `cmp` is what proves the restore happened.
 #   4. EVERY ROW CARRIES AN EXPECTATION. A row that must RED and a row that must
 #      SURVIVE are both checked, so a harness that reds unconditionally fails
-#      just as loudly as one that never reds. Row 12 is a semantically null
-#      edit to the mutated file: it must survive, which is what separates "the
-#      guard binds this BEHAVIOUR" from "the guard noticed the file changed".
+#      just as loudly as one that never reds. The NEG-CTL row is a semantically
+#      null edit to the mutated file: it must survive, which is what separates
+#      "the guard binds this BEHAVIOUR" from "the guard noticed the file
+#      changed". Rows are named, not numbered, in this prose — inserting a
+#      mutation renumbers every row after it, and a comment citing a stale
+#      number is the same defect in miniature as a check citing prose.
 #   5. ONE MUTATION PER ROW, and one arm per row where an edit could be
 #      applied to several. A row that mutates two arms at once scores RED on
 #      either one reding, so it cannot support a claim about both.
@@ -72,9 +75,9 @@
 # Usage:  test/mutation/shim-ext-parity-acceptance.sh
 # Requires: cargo + the pinned toolchain, python3; no root, no cluster, no
 # network.
-# Runtime: ~5 min per row — the mutated file is `#[path]`-included into the
-# userspace-dp test binary, so every row is a full release rebuild of that
-# crate.
+# Runtime: ~5 min per row, and there are 18 rows plus two preflights — the
+# mutated file is `#[path]`-included into the userspace-dp test binary, so
+# every row is a full release rebuild of that crate. Budget an hour and a half.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -115,7 +118,7 @@ flock -n 9 || { echo "another acceptance run holds ${LOCK}; refusing to interlea
 # GOLD at the top of the script and consulted git 138 lines later, so on any
 # tree git could not speak for, the capture had already happened: the script
 # printed "UNVERIFIED", accepted whatever bytes were on disk as the pristine
-# copy, ran all thirteen rows against them, and "restored" that state at the
+# copy, ran every row against them, and "restored" that state at the
 # end. Measured by replaying the real capture-then-precondition sequence
 # against an archive with no `.git`: it printed UNVERIFIED and continued with a
 # `(len+1)*8 -> (len+1)*16` mutation installed as GOLD.
@@ -354,6 +357,7 @@ AUTH_ARM='            EH_CLASS_AUTH => {
                 )?;
             }'
 FRAG_READ='                let frag = read_bytes(data, data_end, offset as usize, 8)?;'
+FRAG_ADV='                offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;'
 LOOP_HEAD='    for _ in 0..MAX_EXT_HDRS {'
 
 # Quoted patterns, so bash treats them literally rather than as globs.
@@ -409,6 +413,56 @@ m_semantically_null()    { spec "${GENERIC_ARM}"  "${GENERIC_RENAMED}"    | py_s
 m_generic_reval_l3_zero() { spec "${GENERIC_ARM}" "${GENERIC_REVAL_L3_0}" | py_sub 1; }
 m_auth_reval_l3_zero()    { spec "${AUTH_ARM}"    "${AUTH_REVAL_L3_0}"    | py_sub 1; }
 
+# --- DATA-KEYED mutations (rows 12-15) ------------------------------------
+#
+# Every mutation above perturbs an arm UNIFORMLY, which is the family two
+# boundary witnesses at distinct declared lengths can exclude. These four are
+# keyed on a SINGLE data value, so they are invisible at every other value and
+# no sampled corpus excludes them. They are here because they were GREEN before
+# the corpus gained its exhaustive dimension sweeps (floor 7): the generic arm
+# sampled 5 declared lengths of 256, AUTH 3 of 256, the Fragment `reserved`
+# byte 1 of 256, and every chain in the corpus declared TCP as its terminal so
+# the byte an extension header CARRIES took 4 values of 256.
+#
+# All four change real packet classification, so a row that stops reding here
+# means the sweep it depends on has been narrowed, not that the mutation became
+# harmless.
+GENERIC_ADV_AT_4="${GENERIC_ARM/"+ 1) * 8)?;"/"+ 1) * 8 + if opt[1] == 4 { 8 } else { 0 })?;"}"
+AUTH_ADV_AT_2="${AUTH_ARM/"+ 2) * 4)?;"/"+ 2) * 4 + if opt[1] == 2 { 4 } else { 0 })?;"}"
+FRAG_ADV_RESERVED="${FRAG_ADV/"as u16)?;"/"as u16 - if frag[1] != 0 { 1 } else { 0 })?;"}"
+# The carried next-header, corrupted for ONE value: UDP (17) is propagated as
+# TCP (6). Every session keyed off a UDP-over-extension-header flow would be
+# built with the wrong protocol.
+GENERIC_NEXT_UDP="${GENERIC_ARM/"protocol = opt[0];"/"protocol = if opt[0] == 17 { 6 } else { opt[0] };"}"
+
+# The revalidation skipped for ONE MEMBER of the generic class. Eight
+# next-header values share that `match` arm; before the per-member boundary
+# witnesses the arm's bound was exercised at DestOpt only, so this was GREEN —
+# a fail-open of exactly the shape row 2 catches, hidden behind a next-header
+# check. `protocol` is reassigned inside the arm, so the entering value is
+# captured first.
+GENERIC_REVAL_SKIP_ROUTING="${GENERIC_ARM/"                let opt = read_bytes"/"                let entered = protocol;
+                let opt = read_bytes"}"
+GENERIC_REVAL_SKIP_ROUTING="${GENERIC_REVAL_SKIP_ROUTING/"                read_bytes(
+                    data,
+                    data_end,
+                    l3_offset as usize,
+                    (offset - l3_offset) as usize,
+                )?;"/"                if entered != 43 {
+                    read_bytes(
+                        data,
+                        data_end,
+                        l3_offset as usize,
+                        (offset - l3_offset) as usize,
+                    )?;
+                }"}"
+
+m_generic_adv_at_len4()  { spec "${GENERIC_ARM}" "${GENERIC_ADV_AT_4}"    | py_sub 1; }
+m_generic_reval_routing() { spec "${GENERIC_ARM}" "${GENERIC_REVAL_SKIP_ROUTING}" | py_sub 1; }
+m_auth_adv_at_len2()     { spec "${AUTH_ARM}"    "${AUTH_ADV_AT_2}"       | py_sub 1; }
+m_frag_adv_on_reserved() { spec "${FRAG_ADV}"    "${FRAG_ADV_RESERVED}"   | py_sub 1; }
+m_generic_next_udp()     { spec "${GENERIC_ARM}" "${GENERIC_NEXT_UDP}"    | py_sub 1; }
+
 # --- the matrix -----------------------------------------------------------
 #
 # Rows are ACCOUNTED, not just aggregated into a final PASS/FAIL. A bare
@@ -460,17 +514,22 @@ row m_frag_read_7           red     " 8. FRAGMENT read 8 -> 7"
 row m_generic_reval_l3_zero red     " 9. GENERIC revalidation base l3_offset -> 0"
 row m_auth_reval_l3_zero    red     "10. AUTH revalidation base l3_offset -> 0"
 row m_stmt_outside_match    red     "11. statement inside the loop, outside the match"
-row m_semantically_null     survive "12. NEG-CTL semantically null rename (must survive)"
+row m_generic_adv_at_len4   red     "12. GENERIC advance +8 ONLY at HdrExtLen == 4"
+row m_auth_adv_at_len2      red     "13. AUTH advance +4 ONLY at HdrExtLen == 2"
+row m_frag_adv_on_reserved  red     "14. FRAGMENT advance 8 -> 7 ONLY when reserved != 0"
+row m_generic_next_udp      red     "15. GENERIC carried next-header UDP propagated as TCP"
+row m_generic_reval_routing red     "16. GENERIC revalidation skipped ONLY for Routing(43)"
+row m_semantically_null     survive "17. NEG-CTL semantically null rename (must survive)"
 
 cp "${GOLD}" "${WALK}"
 cmp -s "${GOLD}" "${WALK}" || fail "restore did not reproduce the pristine file"
 rows_total=$((rows_total + 1))
-if run "13. RESTORED"; then
+if run "18. RESTORED"; then
   rows_passed=$((rows_passed + 1))
-  row_names+=("13. RESTORED"); row_outcomes+=("PASS (green again)")
+  row_names+=("18. RESTORED"); row_outcomes+=("PASS (green again)")
 else
   rc=1
-  row_names+=("13. RESTORED"); row_outcomes+=("FAIL (tree not green after restore)")
+  row_names+=("18. RESTORED"); row_outcomes+=("FAIL (tree not green after restore)")
 fi
 
 echo "--- row accounting ---------------------------------------------------"

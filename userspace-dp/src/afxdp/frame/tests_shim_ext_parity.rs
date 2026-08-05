@@ -72,7 +72,7 @@
 #![allow(unused_imports)]
 
 use super::*;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 // IPv6 next-header values used throughout this file. TCP is the terminal
@@ -83,6 +83,15 @@ const AH: u8 = 51;
 const FRAG: u8 = 44;
 const DEST: u8 = 60;
 const MOBILITY: u8 = 135;
+// The rest of the GENERIC class (`eh_class` in ipv6_ext_walk.rs). They share
+// one `match` arm, so they share its advance and its revalidation — and an
+// error keyed on ONE of them is invisible to a witness pair written for
+// another. See `ARM_BOUNDARIES`.
+const ROUTING: u8 = 43;
+const HIP: u8 = 139;
+const SHIM6: u8 = 140;
+const EXP1: u8 = 253;
+const EXP2: u8 = 254;
 
 // Extension-header classes, mirroring EH_CLASS_* in
 // userspace-xdp/src/lib.rs and pkg/dataplane/userspace_xdp_facts.go.
@@ -554,8 +563,9 @@ fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
 ///
 /// Floor 5 in `parity_corpus` MEASURES the two non-zero values, by asking
 /// `frame_l3_offset` where L3 starts in the prefixes `at_l3` builds. It cannot
-/// measure `parse_l2` — see `SHIM_INTEGRATION_ASSERTED_NOT_RUN` for why, and
-/// for the other three claims in the same position.
+/// measure `parse_l2` — see the block comment immediately below, "WHAT THIS
+/// FILE ASSERTS ABOUT THE SHIM RATHER THAN RUNS", for why, and for the other
+/// three claims in the same position.
 const L3_OFFSETS: [usize; 3] = [0, 14, 18];
 
 // WHAT THIS FILE ASSERTS ABOUT THE SHIM RATHER THAN RUNS — all of it.
@@ -639,15 +649,26 @@ struct ArmBoundary {
 ///
 /// Two DISTINCT declared lengths for the two length-parameterised arms, one
 /// witness for the constant one — derived, not chosen. An arithmetic error in
-/// a length-parameterised arm is some `f'(l) = f(l) + a*l + b`; it is invisible
+/// a length-parameterised arm of the form `f'(l) = f(l) + a*l + b` is invisible
 /// at a declared length where `a*l + b == 0`, and an affine expression that
 /// vanishes at two distinct `l` is identically zero. So two distinct
-/// `hdr_len` values are necessary and sufficient to exclude that whole family,
+/// `hdr_len` values are necessary and sufficient to exclude that family,
 /// and floor 1 counts DISTINCT lengths rather than cases — two byte-identical
 /// witnesses are one magnitude, which is what the previous per-arm count
-/// missed. FRAGMENT's read and advance take no declared length, so its error
+/// missed. FRAGMENT's read and advance take no declared length, so ITS
 /// family is the constant `f' = f + b` and one witness excludes it; a second
 /// would be decoration.
+///
+/// THE PREMISE IS THE SCOPE, and this pair does not establish it. "Affine in
+/// the declared length" is a property of the mutation, not of the arm, and
+/// nothing here enforces it: an error keyed on a SINGLE magnitude — `+ 8` only
+/// when `HdrExtLen == 4` — is not affine, is a real packet-classification
+/// regression, and vanishes at all 255 other lengths including both witnesses.
+/// The witness pair is therefore worth exactly its family; what excludes the
+/// rest is floor 7's exhaustive declared-length sweeps, which leave no
+/// unsampled magnitude for such an error to key on. Neither would be enough
+/// alone: the sweeps do not isolate a one-byte boundary (that is the twins'
+/// job), and the twins do not cover a non-affine error (that is the sweeps').
 const ARM_BOUNDARIES: &[ArmBoundary] = &[
     ArmBoundary {
         arm: "GENERIC",
@@ -684,7 +705,81 @@ const ARM_BOUNDARIES: &[ArmBoundary] = &[
         hdr_len: 0,
         target: 48,
     },
+    // THE REST OF THE GENERIC CLASS, one boundary pair each.
+    //
+    // "Per-arm" coverage was per-arm-MEMBER coverage of exactly one member.
+    // The generic `match` arm is entered by eight next-header values, and a
+    // refusal keyed on one of them — a revalidation skipped only when
+    // `protocol == ROUTING` — is a fail-open of exactly the same shape the
+    // DestOpt pair exists to catch, invisible to it. The 256-value sweep does
+    // not reach it either: those buffers carry 20 bytes of slack past the
+    // advance target, and only a packet ENDING at or before the target can
+    // observe a missing bounds check.
+    //
+    // One declared length each is deliberate. The length dimension is swept
+    // exhaustively by floor 7 (on DestOpt); what these add is the BOUNDARY at
+    // each member, which is a different dimension.
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: HBH,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: ROUTING,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: MOBILITY,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: HIP,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: SHIM6,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: EXP1,
+        hdr_len: 0,
+        target: 48,
+    },
+    ArmBoundary {
+        arm: "GENERIC",
+        class: EH_CLASS_GENERIC,
+        proto: EXP2,
+        hdr_len: 0,
+        target: 48,
+    },
 ];
+
+/// Every next-header value the shim's `eh_class` files under GENERIC, so
+/// floor 1 can require a boundary pair for EACH — not just for the one the
+/// witnesses happened to be written with.
+///
+/// Kept as its own list rather than derived from `ARM_BOUNDARIES`: deriving it
+/// from the table the floor checks would make the check `X == X`, which is the
+/// defect this whole file is about. Floor 1 MEASURES each entry's class with
+/// this crate's walker rather than reading the shim's `eh_class`, so the floors
+/// stay shim-free and a new generic member without a witness reds.
+const GENERIC_MEMBERS: [u8; 8] = [HBH, ROUTING, DEST, MOBILITY, HIP, SHIM6, EXP1, EXP2];
 
 /// `IPv6 || (proto, hdr_len) || zeroes`, cut to exactly `total` bytes.
 ///
@@ -755,7 +850,7 @@ fn chain(headers: &[(u8, u8)], terminal: u8, trim: usize) -> Vec<u8> {
 /// not an oracle from another source: it defends against `chain` drifting
 /// alone, which is the reachable failure (one function edited, the floors
 /// unchanged), and it does NOT defend against someone editing both. That
-/// residual is what the acceptance matrix's row 12 covers from the other side —
+/// residual is what the acceptance matrix's NEG-CTL row covers from the other side —
 /// a semantically null edit must SURVIVE, so the guards are known to bind
 /// behaviour rather than bytes.
 ///
@@ -784,6 +879,69 @@ fn expect_chain(headers: &[(u8, u8)], terminal: u8, trim: usize) -> Vec<u8> {
     }
     b.resize(b.len() + 20, 0);
     b.truncate(b.len().saturating_sub(trim));
+    b
+}
+
+/// `IPv6 || (AH, hdr_len) || pad to the AUTH arm's `(hdr_len + 2) * 4` advance
+/// target || 20 bytes of L4`.
+///
+/// `chain` cannot build this. It lays every header out with the GENERIC
+/// `(len + 1) * 8` encoding, so an AH header built by it ends somewhere other
+/// than where the AUTH arm advances to, and the terminal is never AT the
+/// target — which is what the declared-length sweep needs to observe.
+fn ah_chain(hdr_len: u8) -> Vec<u8> {
+    let mut b = vec![0u8; 40];
+    b[0] = 0x60;
+    b[6] = AH;
+    b.extend_from_slice(&[TCP, hdr_len]);
+    b.resize(40 + (usize::from(hdr_len) + 2) * 4, 0);
+    b.extend_from_slice(&[0u8; 20]);
+    b
+}
+
+/// The same bytes as `ah_chain`, built INDEPENDENTLY, for the floors only.
+/// See `expect_chain` for why a floor must not rebuild with the generator that
+/// produced the corpus. Different mechanics again: the final length is computed
+/// first and every byte is written by index, rather than grown by `extend`.
+fn expect_ah_chain(hdr_len: u8) -> Vec<u8> {
+    let target = 40 + (usize::from(hdr_len) + 2) * 4;
+    let mut b = vec![0u8; target + 20];
+    b[0] = 0x60;
+    b[6] = AH;
+    b[40] = TCP;
+    b[41] = hdr_len;
+    b
+}
+
+/// `IPv6 || a COMPLETE 8-byte Fragment header || 20 bytes of L4`, with the
+/// header's `reserved` byte set to `reserved` and a first-fragment offset word.
+///
+/// `reserved` is a byte NEITHER walker reads, which is exactly what makes it
+/// the place a content-keyed advance can hide — see the sweep in
+/// `parity_corpus`.
+fn frag_reserved_case(reserved: u8) -> Vec<u8> {
+    let mut b = vec![0u8; 40];
+    b[0] = 0x60;
+    b[6] = FRAG;
+    // next, reserved, frag_off||M (0x0001 = offset 0, M set), identification.
+    b.extend_from_slice(&[TCP, reserved, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF]);
+    b.extend_from_slice(&[0u8; 20]);
+    b
+}
+
+/// The same bytes as `frag_reserved_case`, built INDEPENDENTLY, for the floors
+/// only. See `expect_chain`.
+fn expect_frag_reserved_case(reserved: u8) -> Vec<u8> {
+    let mut b = vec![0u8; 68];
+    b[0] = 0x60;
+    b[6] = FRAG;
+    b[40] = TCP;
+    b[41] = reserved;
+    b[43] = 0x01;
+    b[44] = 0xDE;
+    b[45] = 0xAD;
+    b[46] = 0xBE;
+    b[47] = 0xEF;
     b
 }
 
@@ -937,6 +1095,89 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
         cases.push((format!("first={p}"), chain(&[(p as u8, 0)], TCP, 0)));
     }
 
+    // --- EXHAUSTIVE DIMENSION SWEEPS ---------------------------------------
+    //
+    // The witness pairs above sample TWO declared lengths per length-driven arm
+    // and derive from that pair that the arm's whole error family is excluded.
+    // That derivation holds only for errors AFFINE in the declared length. An
+    // error keyed on ONE value — "advance (len+1)*8 + 8 when HdrExtLen == 4" —
+    // is not affine, is a real packet-classification regression, and was
+    // invisible to every case here: the generic arm sampled declared lengths
+    // {0,1,2,5,15} and the AUTH arm {0,1,3}, leaving 251 and 253 unsampled
+    // magnitudes to hide in. The same held for two more dimensions no case
+    // varied at all: every Fragment case carried `reserved == 0`, and EVERY
+    // chain in the corpus declared TCP as its terminal, so the next-header byte
+    // an extension header CARRIES (`opt[0]` in the shim's generic arm) only
+    // ever took the four values the multi-header cases produce — a mutation
+    // reading "propagate TCP whenever opt[0] is UDP" misclassifies real traffic
+    // and moves nothing.
+    //
+    // A wider sample would only move the hiding place. These sweep each
+    // dimension COMPLETELY, so within the shape swept there is no unsampled
+    // value left to key on.
+    //
+    // THREE OF THE FOUR ARE MARGINAL, and that is a real limit, not a
+    // formality: a sweep of dimension A with B held fixed says nothing about an
+    // error conditioned on A AND B, which is invisible to it in exactly the way
+    // the non-affine error was invisible to two sampled lengths. 256^4 is not
+    // enumerable, so the choice is which pair to make JOINT.
+    //
+    // The generic sweep below is joint over (entering next-header x declared
+    // length), because those are the two inputs the arm's own code reads: the
+    // entering value selects the `match` arm, `opt[1]` feeds the advance, and
+    // an error can be conditioned on both (`if entered == ROUTING && opt[1] ==
+    // 4`). 8 x 256 is 2048 cases, which is affordable; the pair is therefore
+    // covered exhaustively rather than sampled.
+    //
+    // NOT made joint, deliberately, and stated rather than left to be inferred:
+    // (declared length x CARRIED next-header) is 256 x 256 = 65536 buffers of
+    // up to 2 KB, and any 3-way interaction is larger still. Those combinations
+    // are NOT covered. The corpus binds the four marginals plus the one pair
+    // above; an error conditioned on `opt[0] == 17 && opt[1] == 4` survives it.
+    // What measures whether that gap matters is the acceptance matrix, not a
+    // bigger corpus.
+
+    // GENERIC: every member of the arm x all 256 declared lengths. Packet ends
+    // 20 bytes past the arm's `(len + 1) * 8` target, so each resolves TCP AT
+    // the target.
+    for proto in GENERIC_MEMBERS {
+        for len in 0u16..=255 {
+            cases.push((
+                format!("GENERIC sweep proto={proto} len={len} -> TCP"),
+                chain(&[(proto, len as u8)], TCP, 0),
+            ));
+        }
+    }
+    // AUTH: all 256 declared lengths, at the arm's own `(len + 2) * 4` target.
+    for len in 0u16..=255 {
+        cases.push((
+            format!("AUTH sweep AH(len={len}) -> TCP"),
+            ah_chain(len as u8),
+        ));
+    }
+    // FRAGMENT has no declared length — its read and advance are a fixed 8 —
+    // so there is no length dimension to sweep. Its `reserved` byte is the
+    // analogous hiding place: a byte inside the header that neither walker
+    // reads.
+    for reserved in 0u16..=255 {
+        cases.push((
+            format!("FRAGMENT sweep reserved={reserved} -> TCP"),
+            frag_reserved_case(reserved as u8),
+        ));
+    }
+    // TERMINAL: all 256 values of the next-header byte an extension header
+    // carries. Unlike the three above, most of these do NOT resolve — a
+    // terminal that is itself an extension-header type continues the walk into
+    // the 20 zero bytes and runs out of packet. That is the point: the floor
+    // requires the buffers, and the cross-walker comparison requires the two
+    // walkers to agree on whatever each one does with them.
+    for t in 0u16..=255 {
+        cases.push((
+            format!("terminal sweep DestOpt(len=0) -> {t}"),
+            chain(&[(DEST, 0)], t as u8, 0),
+        ));
+    }
+
     // --- NON-VACUITY FLOORS -------------------------------------------------
     //
     // Every assertion that CONSUMES this corpus is of the form "this collection
@@ -978,6 +1219,15 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //   deleted floor caught and floors 1-5 do not. Floor 6 closes that, by
     //   BLOCK rather than by count — the old threshold was arbitrary, and a
     //   count is what had a degenerate satisfier twice already.
+    //
+    //   Round 8's floors 1-6 were sound but SAMPLED: the generic arm's
+    //   declared length was covered at 5 magnitudes out of 256, AUTH's at 3,
+    //   the Fragment `reserved` byte at 1, and the carried next-header at 4.
+    //   Floor 1's two-witness derivation excludes only errors AFFINE in the
+    //   declared length, so `+ 8 when HdrExtLen == 4` — a real
+    //   packet-classification regression — was invisible to every case here.
+    //   Floor 7 sweeps each of those four dimensions completely; within the
+    //   shape swept there is no unsampled value left to key on.
     //
     // So each floor below binds its shape by CONSTRUCTION (the corpus must
     // contain a locally rebuilt reference buffer, byte for byte) and, where the
@@ -1021,15 +1271,21 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //
     //    Binds: per arm, that boundary coverage exists at >= `want` DISTINCT
     //    declared lengths (see `ARM_BOUNDARIES` for why 2/2/1 is derived rather
-    //    than chosen), that the corpus still carries those exact buffers, and
-    //    that the header each entry names really is classified into the arm it
-    //    claims.
+    //    than chosen), that the corpus still carries those exact buffers, that
+    //    the header each entry names really is classified into the arm it
+    //    claims, and that EVERY member of the generic class has a pair — eight
+    //    next-header values enter that one `match` arm, and a refusal keyed on
+    //    one of them is invisible to a witness written for another.
     //    Does NOT bind: boundary coverage of an arm reached as a LATER header in
     //    a multi-header chain — every witness here is a single-header packet, so
     //    an arm's bound is exercised only at offset 40 (plus the L3 prefix).
     //    Does NOT bind: any non-boundary shape (truncation, non-first fragment,
     //    over-long declared lengths); those are separate cases above, and only
     //    the acceptance matrix measures whether they are pulling their weight.
+    //    Does NOT bind: an advance error keyed on a declared length OTHER than
+    //    the two witnessed. Two points exclude an AFFINE family and nothing
+    //    wider — see `ARM_BOUNDARIES` — which is what floor 7's exhaustive
+    //    sweeps are for.
     for w in ARM_BOUNDARIES {
         let padded = boundary_case(w.proto, w.hdr_len, w.target);
         let tight = boundary_case(w.proto, w.hdr_len, w.target - 1);
@@ -1124,6 +1380,83 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
             lens.len(),
         );
     }
+    // EVERY MEMBER OF THE GENERIC CLASS HAS A BOUNDARY PAIR, not just the one
+    // the witnesses were written with. The eight values below share a single
+    // `match` arm, so they share its advance and its post-advance revalidation;
+    // a refusal keyed on one of them is a fail-open of exactly the shape the
+    // DestOpt pair exists to catch and is invisible to it. The 256-value sweep
+    // cannot see it either — those buffers carry slack past the advance target,
+    // and only a packet ENDING at or before the target observes a missing
+    // bounds check.
+    //
+    // EVERY MEMBER OF EVERY ADVANCING ARM HAS A PAIR — the membership ENUMERATED
+    // by measurement over all 256 next-header values, not asserted for the one
+    // arm the defect was found in.
+    //
+    // "Per-arm coverage" was per-arm-MEMBER coverage of exactly one member.
+    // Naming that for GENERIC and stopping there would repeat the mistake one
+    // level up, so the classes are enumerated instead: for each of the 256
+    // values, ask this crate's walker which class it lands in, and require a
+    // boundary pair for every value that reaches an arm which ADVANCES. As of
+    // this writing the answer is that GENERIC has 8 members (0, 43, 60, 135,
+    // 139, 140, 253, 254), AUTH has exactly 1 (51) and FRAGMENT exactly 1 (44)
+    // — so GENERIC was the only arm that could carry the defect — but that is
+    // an OUTPUT of this loop, not an assumption in it. A ninth value added to
+    // any advancing arm reds here.
+    //
+    // NONEXT (59) and TERMINAL (the other 244) are deliberately excluded: they
+    // neither read nor advance, so there is no bound to weaken and a boundary
+    // pair would witness nothing. Their property — stop here, report this
+    // protocol — is what floor 3's 256-value sweep and
+    // `shim_ext_parity_negative_control_unchanged_classifications` bind.
+    //
+    // Measured with this crate's classifier and not the shim's: every floor in
+    // this function reads only corpus bytes and `walk_ipv6_ext_chain`, so no
+    // shim-side mutation the acceptance matrix applies can move a floor — a
+    // floor red is a corpus defect, never a shim finding, and both negative
+    // controls stay attributable. That the two classifiers agree on all 256
+    // values is not assumed here; it is what the 256-value sweep plus the
+    // cross-walker comparison measure.
+    let mut arm_members: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    for p in 0u16..=255 {
+        let class = userspace_class(p as u8);
+        if class == EH_CLASS_GENERIC || class == EH_CLASS_AUTH || class == EH_CLASS_FRAGMENT {
+            arm_members.entry(class).or_default().push(p as u8);
+        }
+    }
+    for (class, protos) in &arm_members {
+        for proto in protos {
+            assert!(
+                ARM_BOUNDARIES.iter().any(|w| w.proto == *proto),
+                "#4555 corpus floor 1: next-header {proto} enters the {} arm — which advances — \
+                 but has no boundary witness pair. That arm's {} member(s) {protos:?} share one \
+                 advance and one post-advance revalidation, so without a pair for THIS value its \
+                 bound is exercised only through padded cases, which land inside the buffer with \
+                 or without the check. A revalidation skipped for exactly this next-header value \
+                 then resolves an L4 offset outside the packet with every guard in this file \
+                 green.",
+                class_name(*class),
+                protos.len(),
+            );
+        }
+    }
+    // The hand-written list the sweeps iterate must agree with the measurement.
+    // It is NOT derived from it — a sweep driven by the same enumeration the
+    // floor checks would be `X == X` — so the two are cross-checked here.
+    assert_eq!(
+        arm_members.get(&EH_CLASS_GENERIC).map(Vec::as_slice),
+        Some(&GENERIC_MEMBERS[..]),
+        "#4555 corpus floor 1: GENERIC_MEMBERS (which the declared-length sweep iterates) no \
+         longer matches the set of next-header values this crate classifies as generic. The \
+         sweep would then be sweeping the wrong arm's membership."
+    );
+
+    // That count reads the ARM_BOUNDARIES TABLE, not decoded corpus bytes —
+    // which would be a proxy if the table could name a buffer the corpus does
+    // not have. It cannot: the loop above requires BOTH twins of every entry
+    // present by byte identity, and each entry's `hdr_len` is byte 41 of the
+    // buffer it just proved present. So the distinct lengths counted here are
+    // distinct lengths of buffers the corpus is holding.
 
     // 2. THE RESOLVABLE-CHAIN-LENGTH BOUNDARY IS STRADDLED, BY CONSTRUCTION.
     //    `shim_ipv6_ext_walk_matches_userspace_walker` argues the shim's
@@ -1198,6 +1531,15 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    about, so it is deliberately absent.
     //    Does NOT bind: that each value is presented in more than one position;
     //    only the first-header position is swept, at one declared length.
+    //    Does NOT bind: that the classification is CORRECT. "Did not fail
+    //    closed" is the weakest statement that the walk RAN — a value
+    //    misclassified as terminal resolves `L4(40, p)`, which satisfies it.
+    //    That is deliberate: this floor's job is non-vacuity, and correctness
+    //    in this dimension is what the cross-walker comparison in
+    //    `shim_walk_and_userspace_walk_agree_over_a_corpus` measures. Asserting
+    //    a per-value expectation here would restate `userspace_class`, which
+    //    `shim_ext_parity_negative_control_unchanged_classifications` already
+    //    pins against a hand-written table.
     let mut missing: Vec<u16> = Vec::new();
     let mut unwalked: Vec<u16> = Vec::new();
     for p in 0u16..=255 {
@@ -1308,11 +1650,14 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    mutating the shim and requiring the guards to red. A block that never
     //    detects anything would still be required here; floors stop deletion,
     //    the matrix measures value.
-    //    Does NOT bind: the 256-value sweep (floor 3) or the boundary witness
-    //    pairs (floor 1), which are bound where they are constructed. The
-    //    chain-length and long-chain blocks below overlap floors 2 and 4; the
-    //    overlap is kept so this list is the complete account of the
-    //    hand-written corpus rather than the complement of four other floors.
+    //    Does NOT bind: the 256-value sweep (floor 3), the boundary witness
+    //    pairs (floor 1), or the four exhaustive dimension sweeps (floor 7),
+    //    each bound where it is constructed. The chain-length and long-chain
+    //    blocks below overlap floors 2 and 4; the overlap is kept so this list
+    //    is the complete account of the HAND-WRITTEN corpus rather than the
+    //    complement of four other floors. "Hand-written" is the scope: the
+    //    generated sweeps are floors 3 and 7's, and between the three lists
+    //    every case in this function is required by one of them.
     let ah_sweep_case = |len: u8| {
         let mut b = vec![0u8; 40];
         b[0] = 0x60;
@@ -1440,7 +1785,175 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
         );
     }
 
+    // 7. THE EXHAUSTIVE DIMENSION SWEEPS ARE COMPLETE, AND LAND WHERE CLAIMED.
+    //
+    //    Floor 1's two-witness derivation is sound only for errors AFFINE in
+    //    the declared length; the sweeps above are what excludes the rest of
+    //    the family, and a sweep with a hole in it is the whole hole. So each
+    //    is required here VALUE BY VALUE, rebuilt with the independent
+    //    `expect_*` builders rather than the corpus's own, and — for the three
+    //    dimensions where the arm's target is a function of the swept value —
+    //    each value's buffer is MEASURED to resolve the terminal at exactly
+    //    that arm's target. Presence alone would be satisfied by 256 buffers
+    //    that all fail closed.
+    //
+    //    THE SHAPE OF THE SWEEP IS PART OF THE CLAIM. One dimension is joint
+    //    and three are marginal; which is which is spelled out below, because
+    //    "swept exhaustively" reads as a statement about the joint space and is
+    //    not one.
+    //
+    //    Binds, JOINTLY: every (generic arm member x declared length) pair —
+    //    8 x 256 — is present AND lands at `(len + 1) * 8`. That pair is joint
+    //    rather than marginal because the entering value selects the `match`
+    //    arm while `opt[1]` feeds its advance, so an error can be conditioned
+    //    on both.
+    //    Binds, MARGINALLY: all 256 AUTH declared lengths, present and landing
+    //    at `(len + 2) * 4`; all 256 values of the Fragment `reserved` byte,
+    //    present and still resolving at 48, so an advance keyed on that byte
+    //    has nowhere to hide; all 256 values an extension header can CARRY,
+    //    present.
+    //
+    //    Does NOT bind: ANY OTHER INTERACTION. A marginal sweep of A with B
+    //    held fixed says nothing about an error conditioned on A and B — the
+    //    same shape as the non-affine error two witnesses could not see, one
+    //    level up. Specifically uncovered: (declared length x carried
+    //    next-header), which is 256 x 256 = 65536 buffers of up to 2 KB and was
+    //    judged not worth the corpus, and every 3-way combination. `opt[0] ==
+    //    17 && opt[1] == 4` survives this floor. 256^4 is not enumerable, so
+    //    the design is four marginals plus the one pair whose interaction the
+    //    arm's own code makes reachable; what measures whether the rest matters
+    //    is the acceptance matrix, not a bigger corpus.
+    //    Does NOT bind: an arm reached as a LATER header — every sweep case is
+    //    a single extension header at offset 40.
+    //    Does NOT bind: the Fragment header's other unread bytes. `reserved` is
+    //    swept; the fragment-offset word appears at four values (three
+    //    non-first cases plus this sweep's first-fragment word) and the
+    //    identification field at one, so an advance keyed on those still has
+    //    somewhere to hide. `reserved` was swept and they were not because it
+    //    is one byte and they are six.
+    //    Does NOT bind: a verdict for the TERMINAL sweep. Most of its values
+    //    are themselves extension-header types, whose walk continues into the
+    //    trailing zeros and refuses, so there is no single expectation to
+    //    state. What that sweep guarantees is that both walkers are FED all 256
+    //    carried values; that they agree on each is the guard's job.
+    let sweep_gaps = |build: &dyn Fn(u8) -> Vec<u8>| -> Vec<u16> {
+        (0u16..=255)
+            .filter(|&v| !contains(&build(v as u8)))
+            .collect()
+    };
+    let sweep_misplaced = |build: &dyn Fn(u8) -> Vec<u8>, target: &dyn Fn(u8) -> usize| {
+        (0u16..=255)
+            .filter_map(|v| {
+                let got = userspace_verdict(&build(v as u8), 0);
+                (got != Verdict::L4(target(v as u8), TCP)).then_some((v, got))
+            })
+            .collect::<Vec<_>>()
+    };
+    // The GENERIC dimension is JOINT, so it is checked as a product rather than
+    // through the per-value helper below: every (arm member, declared length)
+    // pair must be present AND land at that arm's target. A marginal check here
+    // would report the sweep complete while 7 of its 8 rows had been deleted.
+    for proto in GENERIC_MEMBERS {
+        let gaps: Vec<u16> = (0u16..=255)
+            .filter(|&l| !contains(&expect_chain(&[(proto, l as u8)], TCP, 0)))
+            .collect();
+        assert!(
+            gaps.is_empty(),
+            "#4555 corpus floor 7: the GENERIC (next-header x declared length) sweep is missing \
+             {} of the 256 lengths at proto={proto} ({:?}...). This pair is swept jointly because \
+             the entering value selects the `match` arm and `opt[1]` feeds its advance, so an \
+             error can be conditioned on both; a hole at one proto is a hole in the pair.",
+            gaps.len(),
+            &gaps[..gaps.len().min(8)],
+        );
+        let bad: Vec<(u16, Verdict)> = (0u16..=255)
+            .filter_map(|l| {
+                let got = userspace_verdict(&expect_chain(&[(proto, l as u8)], TCP, 0), 0);
+                (got != Verdict::L4(generic_target(l as u8), TCP)).then_some((l, got))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "#4555 corpus floor 7: {} of the GENERIC sweep's buffers at proto={proto} no longer \
+             resolve a TCP terminal at `(len + 1) * 8` ({:?}...). Present but not observing the \
+             arm — 256 cases that all fail closed would satisfy a presence check while measuring \
+             nothing.",
+            bad.len(),
+            &bad[..bad.len().min(4)],
+        );
+    }
+
+    for (dim, build, target, why) in [
+        (
+            "AUTH declared length",
+            &expect_ah_chain as &dyn Fn(u8) -> Vec<u8>,
+            Some(&auth_target as &dyn Fn(u8) -> usize),
+            "same, for `(len + 2) * 4`; the corpus sampled 3 of 256 magnitudes before this",
+        ),
+        (
+            "FRAGMENT reserved byte",
+            &expect_frag_reserved_case as &dyn Fn(u8) -> Vec<u8>,
+            Some(&frag_target as &dyn Fn(u8) -> usize),
+            "the Fragment arm takes no declared length, so its analogous hiding place is a byte \
+             inside the header that neither walker reads",
+        ),
+        (
+            "TERMINAL carried next-header",
+            &expect_chain_terminal as &dyn Fn(u8) -> Vec<u8>,
+            None,
+            "every other chain in this corpus declares TCP, so the byte an extension header \
+             CARRIES took four values out of 256 and a mutation keyed on any other one moved \
+             nothing",
+        ),
+    ] {
+        let gaps = sweep_gaps(build);
+        assert!(
+            gaps.is_empty(),
+            "#4555 corpus floor 7: the {dim} sweep is missing {} of its 256 values ({:?}...). \
+             {why}.",
+            gaps.len(),
+            &gaps[..gaps.len().min(8)],
+        );
+        if let Some(target) = target {
+            let bad = sweep_misplaced(build, target);
+            assert!(
+                bad.is_empty(),
+                "#4555 corpus floor 7: {} of the {dim} sweep's 256 values no longer resolve a TCP \
+                 terminal at this arm's advance target ({:?}...). The buffers are present but the \
+                 sweep is not observing the arm — 256 cases that all fail closed would satisfy a \
+                 presence check while measuring nothing.",
+                bad.len(),
+                &bad[..bad.len().min(4)],
+            );
+        }
+    }
+
     cases
+}
+
+/// Each arm's advance target as a function of the swept value. Free functions
+/// rather than closures so floor 7 can hold them in one table with the other
+/// dimensions' builders. GENERIC has no builder here: its sweep is JOINT over
+/// (next-header x declared length), so floor 7 checks it as a product rather
+/// than through the single-argument helper the marginal dimensions use.
+fn generic_target(hdr_len: u8) -> usize {
+    40 + (usize::from(hdr_len) + 1) * 8
+}
+
+fn auth_target(hdr_len: u8) -> usize {
+    40 + (usize::from(hdr_len) + 2) * 4
+}
+
+/// The FRAGMENT arm's advance is a fixed 8 and takes no parameter; the argument
+/// is the swept `reserved` byte, which must not change where the arm lands.
+fn frag_target(_reserved: u8) -> usize {
+    48
+}
+
+/// Floor 7's rebuild of one TERMINAL sweep case: one minimum-size DestOpt
+/// header CARRYING `terminal`.
+fn expect_chain_terminal(terminal: u8) -> Vec<u8> {
+    expect_chain(&[(DEST, 0)], terminal, 0)
 }
 
 /// The load-bearing behavioural guard: over a corpus of real chains, at every
