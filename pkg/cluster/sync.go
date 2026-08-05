@@ -457,19 +457,31 @@ type SessionSync struct {
 	// Armed once per overflow episode (CAS) by rejournalTail/journalDelete and
 	// consumed by whichever of the sweep loop (syncSweep) or the next reconnect
 	// (handleNewConnection) runs first.
-	forceResync          atomic.Bool
-	lastNewCounter       uint64
-	lastClosedCounter    uint64
-	lastSweepEmpty       bool
-	vrfDevice            string
-	peerClockOffset      atomic.Int64
-	clockSynced          atomic.Bool
-	zoneRGMu             sync.RWMutex
-	zoneRGMap            map[uint16]int
-	deleteJournalMu      sync.Mutex
-	deleteJournal        [][]byte
-	deleteJournalCap     int
-	lastPeerRxMono       atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+	forceResync       atomic.Bool
+	lastNewCounter    uint64
+	lastClosedCounter uint64
+	lastSweepEmpty    bool
+	vrfDevice         string
+	peerClockOffset   atomic.Int64
+	clockSynced       atomic.Bool
+	zoneRGMu          sync.RWMutex
+	zoneRGMap         map[uint16]int
+	deleteJournalMu   sync.Mutex
+	deleteJournal     [][]byte
+	deleteJournalCap  int
+	lastPeerRxMono    atomic.Int64 // CLOCK_MONOTONIC nanos of last inbound sync msg (#1792)
+	// peerHeartbeatAckEver latches when the CURRENTLY connected peer proves it
+	// understands syncMsgHeartbeat by replying syncMsgHeartbeatAck. It gates
+	// the two enforcement paths that would otherwise punish a legacy peer that
+	// simply never acks: the receiveLoop missed-heartbeat teardown
+	// (sync_conn_read.go) and PeerHealthy's silence window (below).
+	//
+	// #5718 C01a: this is peer-INCARNATION scoped, NOT SessionSync-lifetime.
+	// handleDisconnect clears it on full disconnect (alongside clockSynced) so
+	// a peer downgrade — new build acks, then rolls back to a build that never
+	// acks — cannot leave the flag latched and turn a healthy old peer into
+	// permanent connection churn plus a failover-readiness block. Do not
+	// promote this back to a set-once flag.
 	peerHeartbeatAckEver atomic.Bool
 	readDeadline         time.Duration
 	peerSilenceLimit     time.Duration

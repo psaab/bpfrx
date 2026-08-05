@@ -543,6 +543,21 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 			close(waiter.ch)
 		}
 		s.clockSynced.Store(false)
+		// #5718 C01a: peerHeartbeatAckEver is a capability probe of the peer
+		// PROCESS, not of this node, so it must be scoped to the peer
+		// incarnation exactly like clockSynced above. Full disconnect ends
+		// that incarnation: the peer that reconnects may be a DIFFERENT
+		// build. Leaving the flag latched across a peer downgrade (new peer
+		// acks -> latch true -> peer rolls back to a build that never sends
+		// syncMsgHeartbeatAck) makes both readers treat a healthy old peer as
+		// failing: receiveLoop counts missedHeartbeats and tears the
+		// connection down every 2 read deadlines (sync_conn_read.go), and
+		// PeerHealthy() demands recent inbound traffic the old peer never
+		// sends (sync.go), which blocks manual-failover readiness with
+		// "session sync disconnected". Clearing here restores the intended
+		// probe-then-enforce order for each new peer: assume healthy until
+		// the CURRENT peer proves it acks.
+		s.peerHeartbeatAckEver.Store(false)
 		s.pendingBulkAckEpoch.Store(0)
 		s.pendingBulkAckSince.Store(0)
 		s.bulkMu.Lock()

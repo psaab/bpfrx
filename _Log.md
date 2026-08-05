@@ -1548,6 +1548,85 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   `pkg/cluster/README.md`, `pkg/config/schema_chassis.go`,
   `pkg/config/types_chassis.go`, `pkg/config/compiler_system.go`,
   `pkg/config/testdata/golden_4406.json`, `_Log.md`
+## 2026-08-05 — #5718 C-HA cohort: five surviving hardening items
+
+- **Timestamp**: 2026-08-05 (fix/5718-ha-hardening)
+- **Action**: Implemented the five items the #5718 audit comment confirmed
+  still unimplemented on master (C01b/C01c shipped earlier in PR #6376).
+  Verified each against origin/master ad9591177 before writing code, per the
+  issue's own method note that a naive item-ID grep hits `docs/reviews/**` and
+  `_Log.md` for 100% of items and falsely reads as "all fixed".
+    - **C01a — heartbeat-ACK capability was process-sticky.**
+      `SessionSync.peerHeartbeatAckEver` latches when the peer proves it
+      understands `syncMsgHeartbeat`, and that latch arms two enforcement
+      paths: the `receiveLoop` missed-heartbeat teardown and `PeerHealthy()`'s
+      silence window (which gates manual-failover readiness). It was never
+      cleared, so it outlived the peer incarnation that earned it: on a peer
+      DOWNGRADE (new build acks, then rolls back to a build that never acks)
+      the stale latch turned a healthy old peer into connection churn every
+      two read deadlines plus a permanent "session sync disconnected"
+      failover block. Now cleared in `handleDisconnect`'s FULL-disconnect
+      block, directly beside `clockSynced` — the sibling peer-incarnation
+      capability that was already reset correctly. Deliberately NOT cleared on
+      a partial disconnect: one fabric link dropping while the other holds is
+      the same peer process, and resetting there would disarm both enforcement
+      paths on every link blip.
+    - **A6-b01-C1 — worker clamp cast before clamp.** `heartbeatZeroSlots`
+      did `uint32(maxInt(workers, 1))` BEFORE comparing against
+      `mapCap/heartbeatSlotsPerWorker`, so the narrowing happened before
+      either clamp could see the value. `workers = 1<<32` narrowed to 0, sailed
+      under the high clamp, and returned 0 — zero-initialising NOTHING and
+      leaving every worker on stale heartbeat data; `1<<32+5` narrowed to 5.
+      `workers` is a min-only schema leaf with no upper bound, so both are
+      reachable from config. Both clamps now run in int space and the cast
+      happens on an already-bounded value. The existing #4572 test stopped at
+      999999999, below the narrowing boundary, so it could not see either case.
+    - **A7-b01-C001 — networkd `Clear` forgot activation debt.** Removing the
+      managed files deactivates nothing until `networkctl reload` lands.
+      `Clear` recorded no `reloadPending` on reload failure and returned early
+      on an empty glob, so the second `Clear` found the files already gone and
+      reported a success it had not achieved while the removed addresses /
+      VRFs / bonds / renames stayed live. `Clear` now mirrors `Apply`'s #4954
+      debt contract on both halves: record on failure, and on an empty glob
+      re-run the idempotent reload when debt is outstanding instead of
+      short-circuiting.
+    - **A7-b02-C01 — partial test-manager `Close` panic.** `Manager.Close()`
+      called `m.tunnel.stopAll()` unguarded while `NewManagerWithRuleOpsForTest`
+      / `NewManagerWithRouteListerForTest` leave `m.tunnel` nil and their doc
+      comments promised "Close nil-guards it" (true only of `nlHandle`).
+      `stopAll` takes `t.mu` immediately, so the documented `defer m.Close()`
+      nil-dereferenced. Guarded, and the two stale comments corrected.
+    - **D-A6-b00-C1 — user app-set NAT guard false-passed.** The membership-only
+      `if !want[pp]` check with a length check is satisfied by any multiset
+      whose members are all in `want`, so two duplicate `tcp/4444` terms passed
+      while a missing `udp/5555` went undetected. Rewritten to consume with
+      `delete()` and assert the want set drains, matching the correct sibling
+      test in the same file, plus the per-term shape assertions that keep
+      `Ports[0]` from being an unchecked index.
+- **Validation**: Each guard mutation-proved — reverted individually, watched
+  the specific test go RED from an assertion (or, for the Close guard, the real
+  nil dereference at `routing.go:91`), restored with `touch`, watched it go
+  GREEN. `go vet` was clean under every mutation, so no RED was a build break;
+  build+vet were confirmed clean and disk free BEFORE any mutation so no RED
+  could be a stale-cache or full-disk artifact. C01a was mutated in BOTH
+  directions — dropping the reset fails the incarnation test, hoisting it to
+  every disconnect fails the partial-disconnect scope control — so the guard is
+  pinned to the peer incarnation, neither narrower nor broader than its claim.
+  The D-A6-b00-C1 proof is two-sided: with the duplicate+missing regression
+  injected, the strengthened guard FAILS and the pre-fix guard PASSES.
+  `go test -race ./pkg/cluster/... ./pkg/vrrp/...` and the full `go test ./...`
+  both clean. No cluster/incus/smoke tooling run — the issue notes promoting any
+  of these to material needs `test-failover`, which the campaign lead schedules.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/heartbeat_ack_incarnation_5718_test.go`,
+  `pkg/cluster/README.md`, `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/heartbeat_slots_narrowing_5718_test.go`,
+  `pkg/dataplane/userspace/nat_predefined_set_5629_test.go`,
+  `pkg/networkd/networkd.go`, `pkg/networkd/clear_reload_debt_5718_test.go`,
+  `pkg/networkd/README.md`, `pkg/routing/routing.go`,
+  `pkg/routing/test_seams.go`,
+  `pkg/routing/close_partial_manager_5718_test.go`,
+  `pkg/routing/README.md`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 

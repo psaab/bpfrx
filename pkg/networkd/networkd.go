@@ -418,9 +418,33 @@ func warnIfAllRPFilterOverrides(tunName string) {
 }
 
 // Clear removes all xpf-managed networkd files and reloads.
+//
+// #5718 A7-b01-C001: Clear participates in the #4954 reload-debt contract that
+// Apply owns. Removing the files is only half the job — until `networkctl
+// reload` succeeds the kernel still runs the config those files installed. The
+// pre-#5718 shape recorded no debt on reload failure and short-circuited on an
+// empty glob, so the SECOND Clear found nothing to remove, returned nil, and
+// reported a success it had not achieved while the removed addresses / VRFs /
+// renames stayed live. Clear now records the debt on failure and, on the empty
+// glob, discharges any outstanding debt by re-running the idempotent reload
+// instead of assuming "no files" means "nothing to activate".
 func (m *Manager) Clear() error {
 	matches, _ := filepath.Glob(filepath.Join(m.networkDir, filePrefix+"*"))
 	if len(matches) == 0 {
+		m.mu.Lock()
+		reloadDebt := m.reloadPending
+		m.mu.Unlock()
+		if !reloadDebt {
+			return nil
+		}
+		// Files are already gone but a prior activation never landed. Retry
+		// the reload rather than reporting a clear that the kernel never saw.
+		slog.Info("networkd clear re-running deferred reload after a prior failed reload")
+		if err := runNetworkctl("reload"); err != nil {
+			return fmt.Errorf("networkctl reload: %w", err)
+		}
+		m.setReloadPending(false)
+		restoreSlowPathRPFilter()
 		return nil
 	}
 
@@ -433,8 +457,13 @@ func (m *Manager) Clear() error {
 	}
 
 	if err := runNetworkctl("reload"); err != nil {
+		// The files are off disk but the kernel never re-read them; the next
+		// Clear/Apply MUST retry the activation instead of seeing an empty
+		// glob (or unchanged files) and returning a false success.
+		m.setReloadPending(true)
 		return fmt.Errorf("networkctl reload: %w", err)
 	}
+	m.setReloadPending(false)
 	restoreSlowPathRPFilter()
 	// #4900: a managed file that could not be removed must fail the Clear — a
 	// surviving 10-xpf-* unit re-applies removed host config (address / VRF /

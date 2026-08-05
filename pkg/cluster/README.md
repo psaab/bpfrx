@@ -1416,3 +1416,21 @@ outside the monitor loop:
   transition and prevents spurious failover churn. A nil receiver / unset seam
   reports not-fresh, so the no-receiver call paths behave exactly as before the
   re-check existed.
+
+- **The peer heartbeat-ack capability is peer-INCARNATION scoped, not
+  process-sticky (#5718 C01a).** `SessionSync.peerHeartbeatAckEver` latches
+  when the connected peer replies `syncMsgHeartbeatAck`, and that latch is what
+  switches two paths from "assume healthy" to "enforce": the `receiveLoop`
+  missed-heartbeat teardown (`sync_conn_read.go` — two read deadlines with no
+  traffic closes the connection) and `PeerHealthy()`'s silence window
+  (`sync.go`), which `computeUserspaceTransferReadiness` consults before
+  allowing a manual failover. The capability describes the PEER PROCESS, so
+  `handleDisconnect` clears it on FULL disconnect, right beside `clockSynced` —
+  same reason, same place. It must NOT be cleared on a partial disconnect (one
+  fabric link down, the other still up): that is the same peer process, and
+  clearing there would disarm both enforcement paths on every link blip.
+  Leaving it latched across a peer DOWNGRADE is the defect this replaced — new
+  build acks, peer rolls back to a build that never acks, and the stale latch
+  turns a healthy old peer into permanent connection churn plus a
+  failover-readiness block ("session sync disconnected"). Both directions are
+  pinned by `heartbeat_ack_incarnation_5718_test.go`.

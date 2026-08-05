@@ -96,6 +96,15 @@ Standard library only.
   still returns nil) but is likewise retried from `reconfigurePending`
   until it succeeds. Distinct from #2987 (write-error-fails-commit) and
   the stale-file sweep.
+  **`Clear()` owes the same debt (#5718 A7-b01-C001).** Removing the
+  managed files deactivates nothing until the reload lands, so a failed
+  reload in `Clear` records `reloadPending` too. The empty-glob case is
+  therefore NOT an unconditional `return nil`: with debt outstanding the
+  files are already gone but the kernel never re-read them, so `Clear`
+  re-runs the idempotent reload and reports failure until it succeeds.
+  Without this the SECOND `Clear` found nothing to remove and reported a
+  success it had not achieved while the removed addresses / VRFs / bonds
+  / renames stayed live.
 - **An empty desired set is NOT a no-op (#2988).** `Apply(nil)` (last
   managed interface removed) still runs the `10-xpf-*` stale-file sweep
   and requests a reload so old addresses/bonds/bridges/renames don't

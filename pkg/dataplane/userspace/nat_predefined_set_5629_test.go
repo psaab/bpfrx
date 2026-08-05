@@ -181,10 +181,32 @@ func TestSourceNATUserApplicationSetUnaffected_5629(t *testing.T) {
 	if len(terms) != len(want) {
 		t.Fatalf("user application-set expansion changed: got %+v, want tcp/4444 + udp/5555", terms)
 	}
+	// #5718 D-A6-b00-C1: consume each match with delete() and assert the want
+	// set drains. A membership-only `if !want[pp]` check is satisfied by ANY
+	// multiset whose members are all in want — with the len() check above
+	// holding the count at 2, two duplicate tcp/4444 terms passed while the
+	// missing udp/5555 went undetected, i.e. the guard could not observe the
+	// regression it exists to catch. The per-term shape assertions match the
+	// predefined-bundle sibling above and keep Ports[0] from being an
+	// unchecked index.
 	for _, term := range terms {
+		if term.Protocol == natProtoNever {
+			t.Fatalf("user-set term carries the natProtoNever sentinel %+v — "+
+				"the user application-set resolved to no terms", term)
+		}
+		if len(term.Ports) != 1 {
+			t.Fatalf("term %+v: want exactly one destination-port range", term)
+		}
+		if term.Ports[0].Low != term.Ports[0].High {
+			t.Fatalf("term %+v: want an exact port (Low==High)", term)
+		}
 		pp := protoPort{proto: term.Protocol, port: term.Ports[0].Low}
 		if !want[pp] {
-			t.Fatalf("unexpected user-set term %+v", term)
+			t.Fatalf("unexpected or duplicate user-set term %+v (proto %d port %d)", term, pp.proto, pp.port)
 		}
+		delete(want, pp)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing expected user application-set terms: %+v", want)
 	}
 }

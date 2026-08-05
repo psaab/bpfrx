@@ -80,8 +80,17 @@ func New() (*Manager, error) {
 // the domain split; there is no daemon caller of Close today). It drains
 // keepalive goroutines via tunnel.stopAll() BEFORE closing the handle so
 // no in-flight keepalive tick can use-after-close the handle (#848).
+// #5718 A7-b02-C01: the tunnel domain is nil-guarded for the same reason
+// nlHandle is. The partial test-manager constructors in test_seams.go
+// (NewManagerWithRuleOpsForTest, NewManagerWithRouteListerForTest) wire only
+// the domains their callers exercise and leave m.tunnel nil, so an unguarded
+// m.tunnel.stopAll() panics: stopAll takes t.mu on a nil *tunnelManager
+// (tunnel_keepalive_runner.go). A caller must be able to `defer m.Close()` on
+// any Manager this package hands out, including a partial one.
 func (m *Manager) Close() error {
-	m.tunnel.stopAll()
+	if m.tunnel != nil {
+		m.tunnel.stopAll()
+	}
 	if m.nlHandle != nil {
 		m.nlHandle.Close()
 	}

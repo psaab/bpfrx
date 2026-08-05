@@ -1828,12 +1828,23 @@ const heartbeatSlotsPerWorker = 2 * 16
 // iterations that hang the apply for hours (#4572). Clamping the worker
 // count to mapCap/heartbeatSlotsPerWorker before the multiply keeps the
 // returned slot count <= mapCap and never wraps.
+// #5718 A6-b01-C1: BOTH clamps run in int space, BEFORE the uint32 cast.
+// Casting first (the pre-#5718 shape, `w := uint32(maxInt(workers, 1))`) let a
+// worker count above the uint32 range narrow into the clamp's blind spot and
+// defeat the very bounds this function exists to enforce: `workers` is an int
+// from a min-only schema leaf, so `1<<32` narrows to 0 — under maxW, so the
+// high clamp passes it through — and the function returns 0 slots, zeroing
+// NOTHING and leaving stale heartbeat entries live for every worker. `1<<32+5`
+// narrows to 5 and silently zeroes 5 workers' slots no matter how large maxW
+// is. Clamping in int space keeps the low clamp (>=1) and the high clamp
+// (<=maxW) both binding for every int input, and the cast then happens on a
+// value already proven to be within [1, maxW].
 func heartbeatZeroSlots(workers int, mapCap uint32) uint32 {
-	w := uint32(maxInt(workers, 1))
-	if maxW := mapCap / heartbeatSlotsPerWorker; w > maxW {
+	w := maxInt(workers, 1)
+	if maxW := int(mapCap / heartbeatSlotsPerWorker); w > maxW {
 		w = maxW
 	}
-	return w * heartbeatSlotsPerWorker
+	return uint32(w) * heartbeatSlotsPerWorker
 }
 
 func maxInt(a, b int) int {

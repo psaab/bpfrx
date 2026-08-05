@@ -792,7 +792,13 @@ which paths a prefix load-balances over.
   `ReconcileVRFs` isn't re-entrant.
 - `Manager.Close()` is not safe to call concurrently with the public
   apply/read methods (single-threaded-shutdown contract; no daemon
-  caller of `Close` today).
+  caller of `Close` today). It IS safe to call on a PARTIAL Manager
+  (#5718 A7-b02-C01): the `*ForTest` constructors in `test_seams.go`
+  wire only the domains their callers exercise, so `Close` nil-guards
+  the tunnel domain exactly as it does `nlHandle` — an unguarded
+  `m.tunnel.stopAll()` takes `t.mu` on a nil `*tunnelManager` and
+  panics the caller that followed the documented `defer m.Close()`.
+  Any new domain teardown added to `Close` needs the same guard.
 - Keepalive runner goroutines drain on the `done` channel before the
   netlink handle is closed. Closing the handle while a goroutine still
   holds it would be a use-after-close.
