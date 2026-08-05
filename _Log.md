@@ -66266,3 +66266,32 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-08-05 — #6290 activeClusterTransport epoch guard
+
+- **Timestamp**: 2026-08-05
+- **Action**: Fold `activeClusterTransport` under the #4958 `clusterCommsMu`
+  epoch guard. The issue filed this as "NOT a race today", reasoning that the
+  boot `startClusterComms` completes before the gRPC/HTTP servers accept
+  commits. That accounts for the wrong readers: `applyConfig`'s own doc lists
+  DHCP callbacks, config-poll, feeds, the event engine and cluster sync recv as
+  callers, and the boot `applyConfig` starts the DHCP clients
+  (`reconcileDHCPClients`) with `onDHCPAddressChange` already wired — on
+  goroutines created BEFORE the write. Goroutine creation therefore orders them
+  the wrong way and supplies no happens-before, and `applySem` does not bridge
+  it because the boot writer never takes it. So the race was real on master,
+  the mirror of #5113 on `mgmtVRFInterfaces`. The write now goes through
+  `setActiveTransportIfCurrent(gen, key)` (epoch-gated like
+  `publishSessionSyncIfCurrent`, so a superseded concurrent start cannot land
+  last) and step 20 takes ONE `activeTransport()` snapshot for both its
+  comparison and its eight log fields.
+- **Validation**: `go test -race -count=1` on both new tests PASS. Mutation A
+  (drop both mutex guards = master's shape) -> `WARNING: DATA RACE`, write
+  attributed to `startClusterComms` daemon_ha_sync.go:706. Mutation B (drop the
+  `gen !=` check, keep the mutex) -> `TestSetActiveTransportDropsStaleEpoch`
+  FAILS without `-race` while the race test still passes, so each guard is
+  bound by its own test. `go vet` clean, `gofmt` clean,
+  `go test ./pkg/refactoraudit/` PASS (daemon_ha_sync.go at 1499 lines, one
+  under the 1500 threshold).
+- **File(s)**: pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_apply_tail.go,
+  pkg/daemon/cluster_transport_race_6290_test.go, pkg/daemon/README.md, _Log.md
