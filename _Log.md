@@ -1,3 +1,55 @@
+## 2026-08-05 — #6827 round 5: two absorbing start paths, a generation-unsafe debt clear, and three edits no test bound
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded the Codex gate at `2c569fb22`.
+  **MAJOR 1a** — a boot HTTP bind failure was ABSORBING: `startTo` assigns
+  `m.srv` only after `Start` succeeds, so every later reconcile returned at the
+  `m.srv == nil` early exit and clearing the cause never recovered. `startTo`
+  now retains the root context even on failure and `reconcileTo` retries the
+  construction (`startLocked`).
+  **MAJOR 1b** — `api.Server.Start` LOGS an HTTPS bind failure and returns
+  SUCCESS (HTTPS is best-effort at boot), but `startTo` recorded the HTTPS
+  fingerprint anyway, so an identical later reconcile saw no change and never
+  retried. Added `Server.HTTPSServing()`; `startLocked` leaves that leg's
+  fingerprint unrecorded when it did not bind, matching reconcileTo's retry-debt
+  posture. Checked the other caller of `Start` — only `management.go` — so no
+  other site trusts that return.
+  **MAJOR 2** — the debt clear was not generation-safe: delivery read the flag
+  under the mutex, ran the hostname read + certificate inspection UNLOCKED, then
+  cleared unconditionally, so a rename landing in that window was settled by the
+  older delivery. Added `staleCertGen`; the clear is conditioned on the claimed
+  generation still being current. `d.mgmt` is now published under `staleCertMu`,
+  the same mutex the delivery path reads it through.
+  **Fix 3** — `serving()` was still true during the up-to-5s graceful drain.
+  Decided drain does NOT count as serving (the listener is closed, no new client
+  can reach the certificate, and the process is going down) and recorded that on
+  the predicate. `stopping` is set at the top of both drain arms.
+  **The redundant flag was deleted.** Round 4 added `exited` from a defer; with
+  `stopping` covering both drain arms and `dead` covering self-termination,
+  every exit is already covered, so `exited` became unbindable — a mutation
+  deleting it left the suite green. Rather than keep an arm no test can drive
+  (the exact criticism of round 4's `stopCh`), it is removed.
+- **Validation**: the gate was right that three production edits were unbound.
+  Now: deleting the drain flag REDs
+  `TestDrainFlagIsSetByTheRealServeGoroutine_6827`, which starts a REAL leg,
+  cancels the root context and joins the goroutine rather than storing the flag
+  itself; noting before `Sethostname` REDs
+  `TestRenameIsNotedOnlyAfterSethostname_6827`.
+  **STILL UNBOUND, reported not papered over**: the per-reconcile retry call
+  site. Asserting on the warning text does not isolate it (the certificate LOAD
+  path emits the same message, so that version passed with the retry deleted);
+  asserting on the debt flag is right but a bare `&Daemon{}` resolves an empty
+  bind, so the reconcile DISABLES HTTPS before the retry runs. Binding it needs
+  a Daemon with a real configstore. A comment in the test file records exactly
+  this instead of a vacuous passing test.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code);
+  `go vet` clean; `gofmt -l` clean. `pkg/api/server.go` 1424 lines — 76 under
+  the 1500 audit threshold, unchanged this round.
+- **File(s)**: `pkg/api/listener.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/daemon/management.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
 ## 2026-08-05 — #6827 fold r4: three MAJORs — the debt was cleared on delivery, not on success
 
 - **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)

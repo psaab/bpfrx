@@ -35,16 +35,15 @@ type listenerLeg struct {
 	// goroutine waits on lifeMu before it can return -> Done). Storing atomically
 	// with no lock breaks that lock-ordering cycle (#6401 round-3 fix).
 	dead atomic.Bool
-	// exited is set when the serve goroutine RETURNS, for any reason: an
-	// unexpected serve error, a requested retirement, or root-context
-	// shutdown. `dead` covers only the first of those (#6401 needs to
-	// distinguish a self-termination), and `stopCh` covers only the second —
-	// the root-context path at the bottom of serveLegLocked drains and returns
-	// having set NEITHER, leaving the leg installed in s.httpsLeg forever with
-	// every flag clear (#6827). Set from a defer so no future exit path can be
-	// added without marking it. Atomic for the same lock-ordering reason as
-	// `dead`.
-	exited atomic.Bool
+	// stopping is set the moment a graceful drain BEGINS — before Shutdown, not
+	// after the goroutine returns. Between those two points the listener is
+	// already closed (Shutdown closes it) so no new client can reach the
+	// certificate, but `exited` is still false for up to the 5s drain window
+	// (#6827 round 5). For "is a certificate in front of clients right now?"
+	// the answer during a drain is NO: the process is on its way down and a
+	// staleness warning is noise. Callers that want "what address is this leg
+	// finishing on" (EffectiveHTTPAddr) deliberately do not consult this.
+	stopping atomic.Bool
 }
 
 // serving reports whether this leg is actually carrying traffic right now: it
@@ -57,14 +56,18 @@ type listenerLeg struct {
 // states the pointer is live and the socket is not. A caller that reads the leg
 // to answer "what is this box serving?" must test the state, not the pointer.
 //
-// It tests `exited` rather than `stopCh` on purpose. A requested retirement
+// It tests `stopping` rather than `stopCh` on purpose. A requested retirement
 // (stopLegLocked) is not observable through s.httpsLeg by construction: the
 // disable arm clears s.httpsLeg under lifeMu before retiring, and the rebind
 // arm installs the replacement before retiring the old one. So a stopCh test
 // would be an arm for a state that cannot occur — while the state that DOES
 // occur, root-context shutdown, sets no flag at all and would slip past it.
-// `exited` is set from a defer over the whole serve goroutine, so it covers
-// every exit including that one.
+// `stopping` is set at the TOP of both drain arms — requested retirement and
+// root-context shutdown — before Shutdown runs, so it covers that path from the
+// moment the listener closes through the goroutine's return. Together with
+// `dead` (self-termination) every exit is covered, which is why there is no
+// third defer-set flag: it would be unbindable, and an arm no test can drive is
+// the thing that made the previous round's predicate look complete.
 //
 // Deliberately stricter than EffectiveHTTPAddr's inline check, which tests nil
 // / ln / dead only: that one answers `show system services`, where a leg
@@ -72,7 +75,7 @@ type listenerLeg struct {
 // answers "is there a certificate in front of clients right now?" The two
 // questions differ, so they are not folded into one predicate.
 func (l *listenerLeg) serving() bool {
-	return l != nil && l.ln != nil && !l.dead.Load() && !l.exited.Load()
+	return l != nil && l.ln != nil && !l.dead.Load() && !l.stopping.Load()
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
@@ -87,12 +90,6 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		// #6827: mark the leg no-longer-serving on EVERY exit path. A defer is
-		// used deliberately rather than a store per branch: the root-context
-		// arm below previously returned without setting any flag, and a defer
-		// cannot be forgotten by a later edit.
-		defer leg.exited.Store(true)
-
 		serveErr := make(chan error, 1)
 		go func() {
 			if isTLS {
@@ -130,6 +127,7 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 		case <-leg.stopCh:
 		case <-rootDone:
 		}
+		leg.stopping.Store(true)
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(sctx)
@@ -208,6 +206,18 @@ func (s *Server) EffectiveHTTPAddr() string {
 		return ""
 	}
 	return s.httpLeg.ln.Addr().String()
+}
+
+// HTTPSServing reports whether an HTTPS leg is bound and serving right now
+// (#6827 round 5). Start() deliberately returns SUCCESS when the HTTPS bind
+// fails — HTTPS is best-effort at boot so a failure leaves the HTTP plane up —
+// which means a caller cannot infer from Start's error that HTTPS came up. A
+// caller that records a converged HTTPS fingerprint on that assumption pins
+// itself to a listener that does not exist and never retries.
+func (s *Server) HTTPSServing() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpsLeg.serving()
 }
 
 // ReconcileHTTP make-before-break rebinds ONLY the HTTP listener to addr (#5866),

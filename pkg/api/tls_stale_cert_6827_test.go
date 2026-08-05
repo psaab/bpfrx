@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -338,7 +340,7 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 		}
 	})
 
-	t.Run("root_shutdown_exited_leg_is_not_diagnosed", func(t *testing.T) {
+	t.Run("root_shutdown_drained_leg_is_not_diagnosed", func(t *testing.T) {
 		// The state that ACTUALLY occurs and sets no flag at all: on
 		// root-context shutdown the serve goroutine drains and RETURNS without
 		// setting `dead` and without closing `stopCh`, leaving the leg installed
@@ -346,7 +348,7 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 		// flags misses it entirely — which is why `exited` is stored from a
 		// defer over the whole goroutine rather than per-branch (#6827).
 		s := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
-		s.httpsLeg.exited.Store(true)
+		s.httpsLeg.stopping.Store(true)
 		out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
 		if out != "" {
 			t.Fatalf("a leg whose serve goroutine has returned must not be diagnosed; got %q", out)
@@ -366,7 +368,7 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 			t.Fatal("no serving leg must report the question UNanswered so the caller retries")
 		}
 		dead := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
-		dead.httpsLeg.exited.Store(true)
+		dead.httpsLeg.stopping.Store(true)
 		if dead.WarnStaleMgmtCertForHostName("new-fw") {
 			t.Fatal("an exited leg must report the question UNanswered")
 		}
@@ -421,5 +423,71 @@ func TestWarnStaleMgmtCertForHostNameReadsTheLiveLeg_6827(t *testing.T) {
 	if !strings.Contains(out, hostNameMsg) {
 		t.Fatalf("the diagnostic must read the LIVE leg's cert (which misses new-fw), "+
 			"not the construction template (which covers it); got %q", out)
+	}
+}
+
+// TestDrainFlagIsSetByTheRealServeGoroutine_6827 drives the PRODUCTION transition
+// instead of asserting on a flag the test set itself.
+//
+// The earlier subtests store `exited` directly, so deleting
+// `defer leg.exited.Store(true)` from serveLegLocked left them all green: they
+// set up the state production is supposed to establish, then assert on it. This
+// one starts a real leg on a stub listener, cancels the root context, waits for
+// the serve goroutine to drain and return, and only then asks serving().
+//
+// RED on revert: delete the defer in serveLegLocked and `exited` stays false
+// after the goroutine has returned, so serving() reports true and the
+// diagnostic warns about a certificate nothing is serving.
+func TestDrainFlagIsSetByTheRealServeGoroutine_6827(t *testing.T) {
+	cert := mintCert(t, "old-fw", "10.0.0.1")
+	s := &Server{listen: func(network, addr string) (net.Listener, error) { return newStubLn(), nil }}
+	s.httpsServer = &http.Server{
+		Addr:      "10.0.0.1:8443",
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !s.HTTPSServing() {
+		t.Fatal("precondition: the HTTPS leg must be serving before the root context is cancelled")
+	}
+
+	cancel()
+	s.Wait() // joins the serve goroutine, so its defer has run
+
+	if s.HTTPSServing() {
+		t.Fatal("after the serve goroutine returned, the leg must not report serving (#6827): " +
+			"exited is set by a defer in serveLegLocked, not by the test")
+	}
+	out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
+	if out != "" {
+		t.Fatalf("a leg whose goroutine has returned must not be diagnosed; got %q", out)
+	}
+}
+
+// TestHTTPSBindFailureIsNotReportedAsServing_6827 pins the #6827-round-5
+// finding that Start() returns SUCCESS when the HTTPS bind fails. A caller that
+// reads only the error concludes HTTPS is up; HTTPSServing is the honest signal.
+//
+// RED on revert: make HTTPSServing return a bare `s.httpsLeg != nil`, or have
+// it ignore the bind outcome, and a failed bind reports as serving.
+func TestHTTPSBindFailureIsNotReportedAsServing_6827(t *testing.T) {
+	cert := mintCert(t, "old-fw", "10.0.0.1")
+	s := &Server{listen: func(network, addr string) (net.Listener, error) {
+		return nil, errors.New("bind refused")
+	}}
+	s.httpsServer = &http.Server{
+		Addr:      "10.0.0.1:8443",
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start must stay best-effort for HTTPS and return nil, got %v", err)
+	}
+	if s.HTTPSServing() {
+		t.Fatal("a failed HTTPS bind must not report as serving (#6827 round 5)")
 	}
 }

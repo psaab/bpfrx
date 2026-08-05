@@ -63,10 +63,11 @@ type managementReconciler struct {
 	// stanza correctly reverts to the flag defaults.
 	baseCfg api.Config
 
-	mu     sync.Mutex
-	srv    *api.Server  // single long-lived server; its HTTP/HTTPS legs reconcile in place (nil until started)
-	cur    mgmtEndpoint // last-CONVERGED per-leg fingerprint (a leg field advances only on that leg's successful reconcile)
-	curSet bool
+	mu      sync.Mutex
+	rootCtx context.Context // retained so a failed boot start can be retried (#6827)
+	srv     *api.Server     // single long-lived server; its HTTP/HTTPS legs reconcile in place (nil until started)
+	cur     mgmtEndpoint    // last-CONVERGED per-leg fingerprint (a leg field advances only on that leg's successful reconcile)
+	curSet  bool
 	// lastHTTPAttempt is the most-recent HTTP bind address the reconciler tried
 	// (desired.Addr), recorded BEFORE the bind attempt so a boot bind FAILURE
 	// (curSet stays false) can report the address it could not bind as
@@ -129,14 +130,33 @@ func (m *managementReconciler) start(ctx context.Context) error {
 func (m *managementReconciler) startTo(ctx context.Context, next api.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Retain the root context even when the start FAILS, so a later reconcile
+	// can retry construction (#6827 round 5). Without it a boot bind failure was
+	// absorbing: m.srv stayed nil and reconcileTo returned early forever.
+	m.rootCtx = ctx
+	return m.startLocked(next)
+}
+
+// startLocked builds and starts the management server. Caller holds mu.
+func (m *managementReconciler) startLocked(next api.Config) error {
 	// Record the attempted HTTP bind BEFORE Start so a bind failure (curSet stays
 	// false) can report it as `(bind failed)` in `show system services` (#6401).
 	m.lastHTTPAttempt = next.Addr
 	srv := api.NewServer(next)
-	if err := srv.Start(ctx); err != nil {
+	if err := srv.Start(m.rootCtx); err != nil {
 		return err
 	}
 	m.srv, m.cur, m.curSet = srv, endpointOf(next), true
+	// #6827 round 5: api.Server.Start returns SUCCESS when the HTTPS bind fails
+	// (HTTPS is best-effort at boot; the HTTP plane stays up). Recording the
+	// HTTPS fingerprint anyway pinned this reconciler to a listener that does
+	// not exist — an identical later reconcile saw no change and never retried.
+	// Leave that leg's fingerprint UNRECORDED so the next reconcile treats it as
+	// a change and calls ReconcileHTTPS, the same retry-debt posture
+	// reconcileTo uses for a failed rebind.
+	if next.TLS && next.HTTPSAddr != "" && !srv.HTTPSServing() {
+		m.cur.tls, m.cur.httpsAddr = false, ""
+	}
 	return nil
 }
 
@@ -198,9 +218,15 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.srv == nil {
-		// API disabled (--api-addr empty) or a boot bind never succeeded: nothing
-		// live to reconcile.
-		return nil
+		// #6827 round 5: a boot HTTP bind failure used to be ABSORBING — m.srv
+		// stayed nil and every later reconcile returned here, so clearing the
+		// cause never recovered the management plane. Retry the construction
+		// instead. A genuinely disabled API (no root context, or no HTTP bind
+		// address) is still a no-op.
+		if m.rootCtx == nil || next.Addr == "" {
+			return nil
+		}
+		return m.startLocked(next)
 	}
 
 	var errs []error
@@ -273,6 +299,7 @@ func (d *Daemon) noteStaleMgmtCertHostName() {
 	}
 	d.staleCertMu.Lock()
 	d.staleCertPending = true
+	d.staleCertGen++
 	d.staleCertMu.Unlock()
 	d.deliverStaleMgmtCertDiagnosis()
 }
@@ -294,20 +321,27 @@ func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 		return
 	}
 	d.staleCertMu.Lock()
-	pending := d.staleCertPending
+	pending, gen, mgmt := d.staleCertPending, d.staleCertGen, d.mgmt
 	d.staleCertMu.Unlock()
-	if !pending || d.mgmt == nil {
+	if !pending || mgmt == nil {
 		return
 	}
 	hostName, err := osHostname()
 	if err != nil || hostName == "" {
 		return // cannot describe the current identity; stay in debt
 	}
-	if !d.mgmt.warnStaleCertForHostName(hostName) {
+	if !mgmt.warnStaleCertForHostName(hostName) {
 		return // nothing serving a certificate yet; the debt stands
 	}
+	// Clear ONLY the generation this delivery claimed (#6827 round 5). The
+	// hostname read and certificate inspection above run UNLOCKED, so a rename
+	// committed while they were in flight bumps the generation; an unconditional
+	// clear would settle that newer debt with an older delivery's evidence and
+	// lose it permanently.
 	d.staleCertMu.Lock()
-	d.staleCertPending = false
+	if d.staleCertGen == gen {
+		d.staleCertPending = false
+	}
 	d.staleCertMu.Unlock()
 }
 

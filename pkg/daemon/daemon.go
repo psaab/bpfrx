@@ -303,8 +303,14 @@ type Daemon struct {
 	// by design (see hostNameLikelyAccessIdentity's residual note).
 	//
 	// Guarded by staleCertMu.
+	// staleCertGen advances on every rename. A delivery claims a generation and
+	// clears the debt only if it is still current, so a rename landing while an
+	// in-flight delivery is unlocked is not settled by that older delivery
+	// (#6827 round 5). d.mgmt is published under staleCertMu too, so the
+	// delivery path's read of it is memory-model safe.
 	staleCertMu      sync.Mutex
 	staleCertPending bool
+	staleCertGen     uint64
 	snmpAgent        *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---

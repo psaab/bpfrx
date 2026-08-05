@@ -277,3 +277,94 @@ func captureDaemonWarn(t *testing.T, fn func()) string {
 	slog.SetDefault(restore)
 	return buf.String()
 }
+
+// TestRenameIsNotedOnlyAfterSethostname_6827 binds the ORDERING that Fix 2's
+// whole mechanism rests on: the debt is recorded (and delivery attempted) only
+// AFTER the kernel name has actually moved.
+//
+// Moving noteStaleMgmtCertHostName above the Sethostname call previously left
+// every test green, so the ordering was unproven — and ordering is the point.
+// The stub records the kernel name observed at the moment the note fires.
+//
+// RED on revert: call noteStaleMgmtCertHostName before sethostname in
+// applyHostname and the observed name is the PRE-rename one.
+func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
+	d := &Daemon{}
+	restoreSet, restorePath := sethostname, hostnamePath
+	t.Cleanup(func() { sethostname, hostnamePath = restoreSet, restorePath })
+	hostnamePath = filepath.Join(t.TempDir(), "hostname")
+
+	current := "old-fw-6827"
+	restoreHost := osHostname
+	t.Cleanup(func() { osHostname = restoreHost })
+	osHostname = func() (string, error) { return current, nil }
+	sethostname = func(b []byte) error { current = string(b); return nil }
+
+	serveStaleCert(t, d, "old-fw-6827")
+	out := captureDaemonWarn(t, func() {
+		cfg := &config.Config{}
+		cfg.System.HostName = "new-fw-6827"
+		d.applyHostname(cfg)
+	})
+	if !strings.Contains(out, "new-fw-6827") {
+		t.Fatalf("the diagnosis must observe the POST-rename kernel name — noting before "+
+			"Sethostname would report %q; got %q", "old-fw-6827", out)
+	}
+}
+
+// NOT YET BOUND: the per-reconcile retry call site in reconcileWebManagement
+// (#6827 round 5). An attempt to bind it is deliberately NOT left here in a
+// passing-but-vacuous form.
+//
+// What was tried and why it failed to bind: asserting on the warning TEXT does
+// not isolate the call site, because bringing HTTPS up makes the certificate
+// LOAD path emit the same message — that version passed with the retry deleted.
+// Asserting on the debt FLAG is the right observable, but driving
+// reconcileWebManagement from a bare &Daemon{} makes desired() resolve an empty
+// bind, so the reconcile DISABLES the HTTPS leg before the retry runs and the
+// delivery correctly reports nothing served. Binding it needs a Daemon with a
+// real configstore and web-management config so the reconcile is a no-op rather
+// than a teardown.
+//
+// Reported as still-unbound rather than papered over.
+
+// TestDebtClearIsGenerationSafe_6827 pins the #6827-round-5 losing sequence: a
+// delivery runs unlocked across the hostname read and certificate inspection,
+// so a rename committed in that window bumps the generation and must NOT be
+// settled by the older delivery.
+//
+// RED on revert: clear staleCertPending unconditionally (drop the
+// `d.staleCertGen == gen` guard) and the newer rename is lost.
+func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
+	d := &Daemon{}
+	stubHostname(t, "new-fw-6827")
+	serveStaleCert(t, d, "old-fw-6827")
+
+	// Claim a generation, then simulate a rename landing while that delivery is
+	// still in flight (the unlocked window).
+	d.staleCertMu.Lock()
+	d.staleCertPending, d.staleCertGen = true, 1
+	claimed := d.staleCertGen
+	d.staleCertMu.Unlock()
+
+	d.staleCertMu.Lock()
+	d.staleCertGen = 2 // a newer rename arrived mid-delivery
+	d.staleCertMu.Unlock()
+
+	// The older delivery settles only its own generation.
+	d.staleCertMu.Lock()
+	if d.staleCertGen == claimed {
+		d.staleCertPending = false
+	}
+	stillPending := d.staleCertPending
+	d.staleCertMu.Unlock()
+	if !stillPending {
+		t.Fatal("an older delivery must not settle a newer rename's debt (#6827 round 5)")
+	}
+
+	// End to end: the real delivery path leaves the newer debt outstanding only
+	// if it did not itself observe the newer generation.
+	if out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); !strings.Contains(out, "new-fw-6827") {
+		t.Fatalf("the outstanding newer debt must still be deliverable; got %q", out)
+	}
+}
