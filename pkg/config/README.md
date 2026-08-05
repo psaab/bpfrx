@@ -1219,7 +1219,13 @@ records the offending leaf on `Application.DuplicateTermLeaves`. (#6766: the
 #3366 framework omitted the ICMP leaves, so a conflicting `icmp-type` /
 `icmp-code` repeat overwrote the pointer with no record and a referenced DENY
 enforced only the LAST type/code — a silent narrowing of the deny match, the
-inline-term analogue of the #5574 direct-body ICMP tracking.) An IDEMPOTENT
+inline-term analogue of the #5574 direct-body ICMP tracking. On the TOLERANT
+path the conflict is only a warning, so whichever value survives is the one
+actually enforced: that keep-LAST outcome is pinned for both `icmp-type` and
+`icmp-code` at the verdict — the discarded value falling through to
+`default-policy permit-all` — in
+`pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`, and at the compiled
+struct in `compiler_application_term_icmp_dup_6766_test.go`.) An IDEMPOTENT
 same-value repeat (e.g. the `timeout` / `inactivity-timeout` aliases both set to
 the same number) is harmless and accepted, and a repeated `protocol` is the
 documented multi-protocol-term syntax (one application per unique protocol) and

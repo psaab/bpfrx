@@ -600,9 +600,19 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	// DIFFERENT value — via apply-groups, flat-set ordering, or hand authoring —
 	// was last-writer-wins: the loop below overwrote the earlier value with no
 	// validation, silently narrowing (or widening) the term to the final token by
-	// parse order. Track each scalar leaf's first assigned value so a CONFLICTING
-	// repeat (a new value that silently discards the earlier one) is recorded for
-	// the strict structure gate. An idempotent repeat (the same value again, e.g.
+	// parse order. Each scalar leaf carries a companion `<leaf>Set` flag and a
+	// `<leaf>Val` holding the MOST RECENTLY assigned value — not the first: every
+	// arm refreshes its comparison value after recording, so the check is
+	// "differs from its immediate predecessor", i.e. one record per TRANSITION.
+	// `8, 3, 8` therefore records TWO conflicts, where comparing every later value
+	// against the first would record one. Nothing observable depends on that
+	// difference: acceptance is identical (any sequence carrying more than one
+	// distinct value contains at least one transition, so the strict gate rejects
+	// it, and an idempotent run records nothing either way), and the gate reports
+	// only `DuplicateTermLeaves[0]` (compiler_validate_strict_application.go), so
+	// the extra records never reach the error text. Treat the slice as a
+	// non-empty/empty signal carrying one representative leaf name, NOT as a
+	// conflict tally. An idempotent repeat (the same value again, e.g.
 	// the `timeout` / `inactivity-timeout` aliases both set to 1800) is harmless
 	// and accepted. `protocol` is deliberately EXCLUDED — a repeated `protocol` is
 	// the documented multi-protocol-term syntax (one Application per unique

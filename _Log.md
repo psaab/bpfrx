@@ -1,3 +1,63 @@
+## 2026-08-05 — #6814 fold round 2: bind the icmp-code last-writer, add positive controls
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, PR #6814 head b21c7bd19)
+- **Action**: Folded the three review findings on the #6766 inline-term ICMP
+  duplicate gate. The production gate itself was confirmed sound and is
+  unchanged; every finding was about what the tests actually bind.
+    - **B1 — the `icmp-code` last-writer was unbound.** Conflicting `icmp-code`
+      was exercised only on strict REJECTION paths, which assert that a
+      conflict is refused but never which value survives when it is TOLERATED.
+      On the tolerant path (boot load / HA SyncApply) the reject is downgraded
+      to a warning and the surviving value is the one enforced, so a production
+      edit retaining the FIRST conflicting code instead of the last changed
+      which ICMP traffic a referenced deny covers while passing the whole file.
+      Verified by mutation: keep-FIRST on `icmp-code` left ALL six pre-existing
+      tests green. Now pinned twice — at the compiled struct
+      (`TestApplicationTermICMPDup_LenientKeepsLastCode`) and at the verdict.
+    - **B2 — a comment claimed more than its test.** The
+      `ReferencedDeny_StrictRejects_LenientNarrows` comment said the term
+      "demonstrably enforces ONLY the last type", but the test asserts on
+      `app.ICMPType` and drives no matcher. Fixed on BOTH sides: the comment now
+      states its real scope (compiled struct, no matcher) and points at the new
+      verdict-level test, and that new test drives `policymatch.Match` for real
+      — asserting the discarded type/code falls through to `default-policy
+      permit-all` while the surviving one hits the deny.
+    - **B3 — no rejection test had a positive control.** All three could not
+      distinguish "rejects the conflicting repeat" from "rejects this shape".
+      Added shape-matched valid cases to each. The apply-groups one gained the
+      CROSS-SOURCE case the originals never reached: a group value restated
+      locally is an apply-groups OVERRIDE, not a duplicate — it must commit,
+      the local value wins, and the group's `icmp-code` must not leak into
+      the merged term (empirically confirmed: the local `term` REPLACES the
+      group's outright rather than merging token streams).
+    - **Non-blocking comment fix.** `compiler_applications.go` claimed the
+      trackers keep each leaf's "first assigned value"; every arm refreshes its
+      comparison value after recording, so the check is "differs from its
+      immediate predecessor" — one record per TRANSITION, so `8, 3, 8` records
+      two where compare-against-first records one. Nothing observable depends on
+      it: acceptance is identical (any multi-value sequence contains a
+      transition) and the gate reports only `DuplicateTermLeaves[0]`, so the
+      extra records never reach the error text. Verified by running `8, 3, 8`
+      through the real gate — the error names `icmp-type` once. The comment now
+      says the slice is a non-empty/empty signal with one representative leaf
+      name, not a conflict tally.
+- **Validation**: Three mutations, each with build+vet clean under the mutation
+  and a preflight-clean build+vet before any of them.
+  (1) keep-FIRST on `icmp-code`: all six pre-existing tests PASS — the B1 gap
+  reproduced — while the two new guards go RED, the verdict one showing the real
+  inversion (code 2 `matched=false default_used=true`, code 1 DENIED).
+  (2) Over-broad gate (record a duplicate on EVERY `icmp-type`, including the
+  first): all four new positive controls FAIL while every rejection subtest still
+  PASSES — the exact blindness B3 described.
+  (3) Matcher ignores ICMP constraints: the new verdict guard FIRES while the
+  old struct-level test still PASSES — B2 proven two-sided.
+  `go test ./pkg/config/... ./pkg/policymatch/...` and the full `go test ./...`
+  both clean. No cluster tooling run.
+- **File(s)**: `pkg/config/compiler_applications.go`,
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `pkg/config/README.md`,
+  `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`, `_Log.md`
+
 ## 2026-08-03 — #6766: gate conflicting inline-term icmp-type / icmp-code repeats
 
 - **Timestamp**: 2026-08-03 (fix/6766-inline-icmp-dup, opus-review-001 R23)

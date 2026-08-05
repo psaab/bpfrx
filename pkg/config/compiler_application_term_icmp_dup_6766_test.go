@@ -51,6 +51,33 @@ func TestApplicationTermICMPDup_FlatSet_Rejected(t *testing.T) {
 			}
 		})
 	}
+
+	// Positive control (#6766 fold). A rejection test alone cannot distinguish
+	// "rejects the conflicting repeat" from "rejects this whole shape": a
+	// regression that refused every packed flat-set ICMP term would satisfy
+	// every assertion above. These shape-matched VALID terms — same packed
+	// one-line flat-set form, non-conflicting values — must still commit.
+	t.Run("positive control: valid packed flat-set terms still commit", func(t *testing.T) {
+		for _, c := range []struct {
+			name     string
+			term     string
+			wantType uint8
+			wantCode *uint8
+		}{
+			{"single icmp-type", "term t1 protocol icmp icmp-type 8", 8, nil},
+			{"icmp-type plus icmp-code", "term t1 protocol icmp icmp-type 3 icmp-code 1", 3, u8p(1)},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				tree := flatTreeFromSets(t, unrefAppOnly("okapp", c.term)...)
+				cfg, err := CompileConfig(tree)
+				if err != nil {
+					t.Fatalf("a NON-conflicting packed flat-set ICMP term must COMMIT — "+
+						"the gate rejects a conflicting repeat, not the shape: %v", err)
+				}
+				assertTermICMP(t, cfg, "okapp-t1", c.wantType, c.wantCode)
+			})
+		}
+	})
 }
 
 // Hierarchical shape: the same conflict authored as sibling statements inside a
@@ -77,6 +104,33 @@ func TestApplicationTermICMPDup_Hierarchical_Rejected(t *testing.T) {
 			}
 		})
 	}
+
+	// Positive control (#6766 fold). Without this, a shape-specific regression
+	// that rejected EVERY brace-block term — e.g. a reassembly change that
+	// mistook each sibling statement for a repeat of its predecessor — would
+	// pass the rejection assertions above while breaking all hierarchical ICMP
+	// terms. The valid sibling forms must still commit.
+	t.Run("positive control: valid hierarchical terms still commit", func(t *testing.T) {
+		for _, c := range []struct {
+			name     string
+			body     string
+			wantType uint8
+			wantCode *uint8
+		}{
+			{"single icmp-type", "term t1 { protocol icmp; icmp-type 8; }", 8, nil},
+			{"icmp-type plus icmp-code", "term t1 { protocol icmp; icmp-type 3; icmp-code 1; }", 3, u8p(1)},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				tree := hierTree(t, "applications {\n    application okapp {\n        "+c.body+"\n    }\n}\n")
+				cfg, err := CompileConfig(tree)
+				if err != nil {
+					t.Fatalf("a NON-conflicting hierarchical ICMP term must COMMIT — the "+
+						"gate rejects a conflicting repeat, not sibling statements: %v", err)
+				}
+				assertTermICMP(t, cfg, "okapp-t1", c.wantType, c.wantCode)
+			})
+		}
+	})
 }
 
 // apply-groups shape: a group-authored term carrying the conflicting repeat is
@@ -106,16 +160,63 @@ func TestApplicationTermICMPDup_ApplyGroups_Rejected(t *testing.T) {
 			}
 		})
 	}
+
+	// Positive control 1 (#6766 fold): a group-authored term with NO conflict
+	// must still be cloned in and commit. The rejection cases above carry both
+	// conflicting values inside the group, so on their own they cannot tell
+	// "rejects the conflict" from "rejects anything arriving via apply-groups".
+	t.Run("positive control: valid group-authored term still commits", func(t *testing.T) {
+		tree := flatTreeFromSets(t,
+			"set groups g applications application okapp term t1 protocol icmp icmp-type 3 icmp-code 1",
+			"set apply-groups g")
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("a NON-conflicting group-authored ICMP term must COMMIT: %v", err)
+		}
+		assertTermICMP(t, cfg, "okapp-t1", 3, u8p(1))
+	})
+
+	// Positive control 2 (#6766 fold) — the CROSS-SOURCE case the rejection
+	// tests never reach. A group value restated locally is not a duplicate: it
+	// is the documented apply-groups override, where the group supplies a
+	// default and the local stanza wins. The local `term t1` REPLACES the
+	// group's outright, so the group's icmp-code must not leak into the merged
+	// term either. An edit that folded the two sources into one token stream
+	// would both reject this (spurious duplicate) and surface icmp-code 5, and
+	// nothing else in this file would notice.
+	t.Run("positive control: local term overrides a group term without a false duplicate", func(t *testing.T) {
+		tree := flatTreeFromSets(t,
+			"set groups g applications application ovr term t1 protocol icmp icmp-type 8 icmp-code 5",
+			"set apply-groups g",
+			"set applications application ovr term t1 protocol icmp icmp-type 3")
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("a local term restating a group-inherited icmp-type is an apply-groups "+
+				"OVERRIDE, not a conflicting repeat, and must COMMIT: %v", err)
+		}
+		// Local wins; the group's icmp-code does not survive the replacement.
+		assertTermICMP(t, cfg, "ovr-t1", 3, nil)
+	})
 }
 
 // Fail-on-revert (security-adjacent): a REFERENCED deny application whose
 // inline term carries conflicting `icmp-type` values must be rejected at
 // commit. Revert the fix and the term silently keeps only the LAST value
-// (type 3), so the deny no longer covers echo (type 8) — that traffic falls
-// through to the default permit. Proven two ways: (1) strict CompileConfig
-// rejects; (2) on the lenient path (which still compiles, downgrading the
-// reject to a warning) the compiled term demonstrably enforces ONLY the last
-// type — the silent narrowing the strict gate exists to prevent.
+// (type 3), so the deny no longer covers echo (type 8).
+//
+// Scope of what this test proves (#6766 fold): (1) strict CompileConfig
+// rejects; (2) on the lenient path — which still compiles, downgrading the
+// reject to a warning — the compiled Application carries ONLY the last
+// authored value, for icmp-type AND icmp-code.
+//
+// It asserts on the COMPILED STRUCT, not on a policy decision. It does not
+// exercise either matcher, so it cannot by itself show that the surviving
+// value is what gets enforced or that the discarded value escapes the deny.
+// That enforcement claim is proven separately, at the verdict, in
+// pkg/policymatch/app_inline_term_icmp_dup_6766_test.go, which drives
+// policymatch.Match and asserts the discarded type/code falls through to
+// `default-policy permit-all`. Keep this comment's claim and that file's in
+// sync — do not restate the enforcement conclusion here.
 func TestApplicationTermICMPDup_ReferencedDeny_StrictRejects_LenientNarrows(t *testing.T) {
 	src := `
 security {
@@ -177,6 +278,46 @@ applications {
 		}
 		t.Fatalf("keep-last narrowing characterization: want ICMPType=3 (the silently-retained "+
 			"last value), got %s", got)
+	}
+}
+
+// The icmp-CODE analogue of the characterization above (#6766 fold). Before
+// this, conflicting `icmp-code` was exercised ONLY on strict rejection paths:
+// every test asserted that a conflict is refused, none asserted which value
+// survives when it is TOLERATED. A production edit that retained the FIRST
+// conflicting code instead of the last therefore passed the entire file while
+// changing which traffic a referenced deny covers. This pins the surviving
+// value; the matching verdict-level guard is in
+// pkg/policymatch/app_inline_term_icmp_dup_6766_test.go.
+func TestApplicationTermICMPDup_LenientKeepsLastCode(t *testing.T) {
+	tree := flatTreeFromSets(t, unrefAppOnly("dup",
+		"term t1 protocol icmp icmp-type 3 icmp-code 1 icmp-code 2")...)
+
+	// Strict still refuses the conflict.
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatalf("strict commit must REJECT a conflicting inline icmp-code")
+	}
+
+	cfg, lerr := CompileConfigLenient(tree)
+	if lerr != nil {
+		t.Fatalf("lenient path must NOT brick on a conflicting inline icmp-code: %v", lerr)
+	}
+	app := cfg.Applications.Applications["dup-t1"]
+	if app == nil {
+		t.Fatalf("term application dup-t1 missing on lenient path; have %v", appNames(cfg))
+	}
+	if app.ICMPCode == nil || *app.ICMPCode != 2 {
+		got := "nil"
+		if app.ICMPCode != nil {
+			got = strconv.Itoa(int(*app.ICMPCode))
+		}
+		t.Fatalf("keep-last narrowing characterization: want ICMPCode=2 (the silently-retained "+
+			"LAST value), got %s — a keep-FIRST regression reports 1 here and silently "+
+			"changes which ICMP traffic a referenced deny covers", got)
+	}
+	// The type is untouched by the code conflict.
+	if app.ICMPType == nil || *app.ICMPType != 3 {
+		t.Fatalf("ICMPType = %v, want 3 (unaffected by the icmp-code conflict)", app.ICMPType)
 	}
 }
 
@@ -242,5 +383,27 @@ func TestApplicationTermICMPDup_Lenient_DowngradesToWarning(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("lenient path must record a downgrade warning naming icmp-type; warnings: %v", cfg.Warnings)
+	}
+}
+
+// assertTermICMP checks the compiled inline-term application's ICMP constraints.
+// wantCode == nil asserts the term left icmp-code unconstrained.
+func assertTermICMP(t *testing.T, cfg *Config, appName string, wantType uint8, wantCode *uint8) {
+	t.Helper()
+	app := cfg.Applications.Applications[appName]
+	if app == nil {
+		t.Fatalf("term application %s missing; have %v", appName, appNames(cfg))
+	}
+	if app.ICMPType == nil || *app.ICMPType != wantType {
+		t.Fatalf("%s ICMPType = %v, want %d", appName, app.ICMPType, wantType)
+	}
+	if wantCode == nil {
+		if app.ICMPCode != nil {
+			t.Fatalf("%s ICMPCode = %d, want unconstrained (nil)", appName, *app.ICMPCode)
+		}
+		return
+	}
+	if app.ICMPCode == nil || *app.ICMPCode != *wantCode {
+		t.Fatalf("%s ICMPCode = %v, want %d", appName, app.ICMPCode, *wantCode)
 	}
 }
