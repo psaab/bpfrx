@@ -1,3 +1,42 @@
+## 2026-08-05 — #3651: restore the per-zone Prometheus surface
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface)
+- **Action**: #3651 shipped the per-zone traffic POPULATE path end to end (Rust
+  forward-path accounting -> `ProcessStatus.zone_traffic_counters` ->
+  `SetZoneCounterOffset`), but the Prometheus collector #3643 had deleted was
+  never brought back with it. `show security zones` and REST reported live
+  per-zone volume while Prometheus reported nothing — the one surface an
+  operator alerts on was the missing one. Restored `xpf_zone_packets_total` /
+  `xpf_zone_bytes_total` (labels unchanged from the pre-#3643 family, so
+  existing dashboards keep working) sourced from the Go-side SPARSE offset map,
+  so the dense-array OOB that produced #3643's per-zone-per-scrape false
+  read-error alert cannot recur. Added `xpf_zone_counters_unpopulated_zones`:
+  the helper's status snapshot drops all-zero rows, so
+  `ErrCounterNotPopulated` cannot distinguish a pre-#3651 helper, a
+  slot-overflowed zone and an idle zone — publishing 0 would be an
+  authoritative zero over an unknown, so the samples are OMITTED and the gauge
+  carries the count. Unpopulated deliberately does NOT bump
+  `xpf_counter_read_errors_total` (that routing is the #3643 false alert); a
+  genuine read error still skip-and-bumps per #3345/#3408. Corrected four stale
+  texts whose stated REASON had become false: the `metrics_counters.go` removal
+  comment, the plan §0 Prometheus claim, `pkg/api/README.md`, and the
+  `ReadZoneCounters` doc comment that still said the helper does not populate.
+  Per-zone FLOOD half remains deferred — untouched.
+- **Validation**: `go test ./pkg/api/... ./pkg/dataplane/...` green. Fail-on-
+  revert proven by mutation, not by reading: gutting the collector reds 5 of 6
+  tests with assertion failures; publishing 0 instead of omitting reds the
+  omission test; routing `ErrCounterNotPopulated` into `counterReadErrors` reds
+  the false-alert test. Build+vet clean at each mutation, so every RED is an
+  assertion, not a build break.
+- **File(s)**: `pkg/api/metrics_descriptors_zone.go` (new),
+  `pkg/api/zone_counters_metrics_test.go` (new, replaces
+  `pkg/api/zone_counters_hide_test.go`), `pkg/api/metrics.go`,
+  `pkg/api/metrics_descriptors.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptor_coverage_test.go`,
+  `pkg/api/zones_policies_counter_error_test.go`, `pkg/api/README.md`,
+  `pkg/dataplane/maps_counters.go`, `docs/research/3643-dead-counters/plan.md`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

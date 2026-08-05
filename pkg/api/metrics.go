@@ -101,6 +101,16 @@ type xpfCollector struct {
 	interfaceCounterReadErrorsTotal *prometheus.Desc
 	interfaceCounterReadErrors      atomic.Uint64
 
+	// Zone counters (#3651, restored after the #3643 HIDE). Sourced from the
+	// Go-side SPARSE zone-counter offset map, never a dense array indexed by
+	// zone id — see initZoneDescriptors for why that distinction is the whole
+	// point. zoneCountersUnpopulatedZones is the explicit "not yet known"
+	// signal that lets the per-zone samples be OMITTED rather than published
+	// as an authoritative 0.
+	zonePacketsTotal             *prometheus.Desc
+	zoneBytesTotal               *prometheus.Desc
+	zoneCountersUnpopulatedZones *prometheus.Desc
+
 	// Policy counters
 	policyHitsTotal *prometheus.Desc
 
@@ -646,6 +656,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
+	ch <- c.zonePacketsTotal
+	ch <- c.zoneBytesTotal
+	ch <- c.zoneCountersUnpopulatedZones
 	ch <- c.policyHitsTotal
 	ch <- c.filterHitsTotal
 	ch <- c.threeColorPolicerPacketsTotal
@@ -1129,6 +1142,15 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 
 	c.collectGlobalCounters(ch, dp)
 	c.collectInterfaceCounters(ch, dp)
+	// #3651: per-zone traffic volume, restored after the #3643 HIDE now that the
+	// populate path ships. It reads the SPARSE zone-counter offset map, so it
+	// cannot reintroduce the per-zone dense-array OOB that made the old
+	// collector bump counterReadErrors once per zone per scrape; an unpopulated
+	// zone is counted into xpf_zone_counters_unpopulated_zones instead of being
+	// treated as a read error. Ordered before the deferred emitCounterReadErrors
+	// (top of Collect) so a GENUINE per-zone read failure is reflected in THIS
+	// scrape's xpf_counter_read_errors_total (#3462 ordering).
+	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
 	c.collectFilterCounters(ch, dp, userspaceStatus)
 	// #3464: emit the per-interface scrape-error counter AFTER

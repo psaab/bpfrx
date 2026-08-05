@@ -109,11 +109,17 @@ func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, err
 // which the read surfaces mis-reported as a hard failure (REST 500, false
 // Prometheus read-error alert, CLI/gRPC error rows). This now keys a Go-side
 // sparse offset map -- the exact treatment #2255 gave nat_rule_counters -- and
-// NEVER indexes the dense array, so an id >= MaxZones can no longer OOB. The
-// userspace helper does not yet populate per-zone traffic counters (POPULATE
-// deferred, #3643 plan §5A), so the map is empty and this reports
-// ErrCounterNotPopulated; surfaces render "not available" rather than a
-// misleading 0.
+// NEVER indexes the dense array, so an id >= MaxZones can no longer OOB.
+//
+// #3651: the helper DOES now populate per-zone traffic counters (Rust forward-
+// path accounting -> ProcessStatus.ZoneTrafficCounters -> syncBPFCountersLocked
+// -> SetZoneCounterOffset), so this returns live volume for a zone the helper
+// has published. ErrCounterNotPopulated remains reachable and is NOT an error
+// condition: the helper's status snapshot is sparse and omits all-zero rows, so
+// the sentinel covers a pre-#3651 helper, a zone past the helper's hot-path
+// slot capacity, and a merely idle zone alike. Surfaces must render "not
+// available" (or omit the sample) rather than a misleading 0, and must not
+// treat it as a read failure -- see pkg/api/README.md.
 func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, error) {
 	if direction != 0 && direction != 1 {
 		return CounterValue{}, fmt.Errorf("invalid zone counter direction %d", direction)

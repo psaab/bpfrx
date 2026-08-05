@@ -629,16 +629,46 @@ under the daemon's errgroup. Nothing else imports this package.
   genuine-error contract is UNCHANGED for every other surface (global, policy,
   filter, interface, host-inbound): a real read failure — anything other than
   `ErrCounterNotPopulated` — still 500s / warns / bumps
-  `xpf_counter_read_errors_total`. The per-zone POPULATE path (sourcing real
-  per-zone volume + flood-event counts from the Rust helper) is DEFERRED; the
-  sparse offset map's setters are the populate hook. See
-  `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE) and
-  the deferred POPULATE tracker #3651 (the Rust per-zone counter-publish is the
-  outstanding prerequisite). Pinned by
-  `pkg/dataplane/zone_flood_counters_hide_test.go`,
-  `pkg/api/zone_counters_hide_test.go`,
+  `xpf_counter_read_errors_total`. See
+  `docs/research/3643-dead-counters/plan.md` (§5A POPULATE spec, §5B HIDE).
+  Pinned by `pkg/dataplane/zone_flood_counters_hide_test.go`,
   `pkg/cli/zone_flood_counters_hide_test.go`, and
   `pkg/grpcapi/zone_flood_counters_hide_test.go`.
+- **Per-zone TRAFFIC counters are populated again, and the Prometheus family is
+  back (#3651).** The reason #3643 dropped the metrics — nothing populated them
+  — no longer holds: the Rust helper accounts per-zone ingress/egress
+  packet+byte volume on the forward path
+  (`userspace-dp/src/afxdp/zone_counters.rs`), publishes it in
+  `ProcessStatus.zone_traffic_counters`, and the Go status poll mirrors each row
+  into the sparse offset map via `Manager.SetZoneCounterOffset`. `show security
+  zones` and REST `/security/zones` picked that up immediately;
+  `xpf_zone_packets_total` / `xpf_zone_bytes_total` (labels `zone`,
+  `direction` ∈ `{ingress,egress}` — unchanged from the pre-#3643 family, so
+  existing dashboards keep working) were restored separately in #3651, since
+  Prometheus is the surface an operator actually alerts on.
+  `collectZoneCounters` reads ONLY `ReadZoneCounters`, i.e. the sparse offset
+  map, so it cannot reintroduce the dense-array OOB read-error storm above.
+  Its three-way disposition:
+  - **populated** → emit ingress/egress packets and bytes.
+  - **`ErrCounterNotPopulated`** → **omit** all four samples and count the zone
+    into the `xpf_zone_counters_unpopulated_zones` gauge; do NOT bump
+    `xpf_counter_read_errors_total`. Unpopulated is a legitimate steady state,
+    and treating it as an error is exactly the per-scrape false alert #3643
+    removed the family to stop. The samples are omitted rather than published
+    as `0` because the helper's status snapshot is sparse and drops all-zero
+    rows, so this sentinel cannot distinguish a pre-#3651 helper, a zone past
+    the helper's 63 assignable hot-path slots (whose traffic really is
+    uncounted), and a merely idle zone — a `0` would be an authoritative zero
+    over an unknown. The gauge is always emitted (0 when healthy) and counts
+    exactly the zones REST reports `per_zone_counters_available:false` for.
+  - **any other error** → omit the samples and bump
+    `xpf_counter_read_errors_total` (the #3345/#3408 skip-and-bump contract is
+    intact — a degraded counter bridge stays alertable).
+
+  The per-zone FLOOD half remains DEFERRED (use the #3343 aggregate
+  `xpf_screen_drops_total` by reason); the flood offset map's setters remain
+  the populate hook for it. Pinned by `pkg/api/zone_counters_metrics_test.go`,
+  which replaced the `pkg/api` HIDE pin.
 - Per-interface counter read failures get a uniform unavailable/error
   contract across all four interface-counter surfaces (#3464). Interface
   counters are intentionally out of the #3345 SECURITY-counter contract

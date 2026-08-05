@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net"
 	"sort"
 
@@ -364,15 +365,117 @@ func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp 
 	}
 }
 
-// #3643: collectZoneCounters was removed. Per-zone traffic counters
-// (xpf_zone_packets_total / xpf_zone_bytes_total) were never populated in the
-// userspace era (the eBPF writers were deleted in #1476) and, worse, every
-// read of a stable-hash zone id >= MaxZones (#3075) OOB'd the dense BPF array
-// and bumped xpf_counter_read_errors_total once per zone per scrape -- a
-// permanent FALSE read-error alert (#3345 signal). The metrics are dropped
-// until the per-zone POPULATE path ships (deferred, see
-// docs/research/3643-dead-counters/plan.md §5A). Global, per-interface,
-// per-policy, and per-screen-reason counters remain live.
+// collectZoneCounters emits the per-zone traffic-volume family
+// (xpf_zone_packets_total / xpf_zone_bytes_total) plus the
+// xpf_zone_counters_unpopulated_zones gauge.
+//
+// #3643 REMOVED this collector, for a reason that no longer holds and a
+// conclusion that did. The reason: per-zone counters had no writer in the
+// userspace era (the eBPF writers were deleted in #1476), so the family was
+// permanently dead. That is now FALSE — #3651 shipped the populate path end to
+// end (per-zone accounting on the Rust forward path in
+// userspace-dp/src/afxdp/zone_counters.rs -> ProcessStatus.ZoneTrafficCounters
+// -> syncBPFCountersLocked -> Manager.SetZoneCounterOffset), and
+// `show security zones` and REST /security/zones have been reporting live
+// per-zone volume since. Only the Prometheus surface was left behind, which is
+// backwards: it is the one surface an operator actually alerts on. #3651
+// restores it.
+//
+// The conclusion that DID hold, and the constraint on this code: the old
+// collector read a DENSE MaxZones*2 per-CPU BPF array indexed by zone id.
+// Stable-hash zone ids live in [1,65533] (config.StableZoneID, #3075) and
+// MaxZones is 64, so essentially every real zone OOB'd the bounded Lookup and
+// the collector's err != nil branch bumped xpf_counter_read_errors_total once
+// per zone PER SCRAPE — a permanent false alert on the #3345 read-error signal,
+// which is why dropping the family was the right call at the time.
+//
+// This collector cannot reintroduce that, structurally: its ONLY read is
+// dp.ReadZoneCounters, which since #3643 keys a Go-side SPARSE
+// map[uint16][2]CounterValue offset map and never indexes a dense array by
+// position (pkg/dataplane/maps_counters.go). A large id is an ordinary map miss,
+// not an out-of-bounds access. It is also not treated as an error — see below.
+//
+// Three-way read disposition:
+//
+//   - ErrCounterNotPopulated -> OMIT all four samples, count the zone into
+//     xpf_zone_counters_unpopulated_zones, and do NOT bump counterReadErrors.
+//     Unpopulated is a legitimate steady state, not a failure; routing it to the
+//     error counter is exactly the #3643 false alert. It must stay non-erroring
+//     even though it is now the rarer case.
+//   - Any other error -> OMIT the samples and BUMP counterReadErrors. That is a
+//     real degraded read, and the #3345/#3408 skip-and-bump contract applies:
+//     never publish a 0 to stand in for a failed read.
+//   - Success -> emit ingress/egress packets and bytes.
+//
+// Why omit rather than publish 0 for the unpopulated case: the helper's status
+// snapshot is SPARSE and drops all-zero rows (ZoneCounterStore::snapshot), so
+// ErrCounterNotPopulated conflates a pre-#3651 helper, a zone past the helper's
+// 63 assignable hot-path slots whose traffic really is uncounted, and a merely
+// idle zone. A 0 sample would be right only for the last and would silently
+// understate the first two as "no traffic" — an authoritative zero over an
+// unknown. The gauge makes the omission explicit instead.
+func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
+	// The gauge is emitted on EVERY path through this function (0 when there is
+	// nothing to report), so `> 0` is alertable and its absence means the scrape
+	// did not run rather than "all zones healthy".
+	unpopulated := 0
+	defer func() {
+		ch <- prometheus.MustNewConstMetric(c.zoneCountersUnpopulatedZones,
+			prometheus.GaugeValue, float64(unpopulated))
+	}()
+
+	cfg := c.srv.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	cr := dataplane.LastApplyResultOf(dp)
+
+	// Iterate the CONFIGURED zone set (not cr.ZoneIDs) with the same nil-zone
+	// skip the REST handler uses (#3493 tolerant/HA-sync configs can carry a nil
+	// zone value), so this gauge counts exactly the zones REST reports
+	// per_zone_counters_available:false for. Pinned by
+	// TestZoneUnpopulatedGaugeMatchesRESTAvailability — the two surfaces must
+	// not drift.
+	for zoneName, zone := range cfg.Security.Zones {
+		if zone == nil {
+			continue
+		}
+		// No apply result, or a configured zone the last apply did not assign an
+		// id to: nothing has been published for it, which is the unpopulated
+		// state, not an error. REST leaves PerZoneCountersAvailable false here
+		// for the same reason.
+		if cr == nil {
+			unpopulated++
+			continue
+		}
+		zoneID, ok := cr.ZoneIDs[zoneName]
+		if !ok {
+			unpopulated++
+			continue
+		}
+
+		ingress, errIn := dp.ReadZoneCounters(zoneID, 0)
+		egress, errOut := dp.ReadZoneCounters(zoneID, 1)
+		switch {
+		case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
+			errors.Is(errOut, dataplane.ErrCounterNotPopulated):
+			unpopulated++
+			continue
+		case errIn != nil || errOut != nil:
+			c.counterReadErrors.Add(1)
+			continue
+		}
+
+		ch <- prometheus.MustNewConstMetric(c.zonePacketsTotal, prometheus.CounterValue,
+			float64(ingress.Packets), zoneName, "ingress")
+		ch <- prometheus.MustNewConstMetric(c.zonePacketsTotal, prometheus.CounterValue,
+			float64(egress.Packets), zoneName, "egress")
+		ch <- prometheus.MustNewConstMetric(c.zoneBytesTotal, prometheus.CounterValue,
+			float64(ingress.Bytes), zoneName, "ingress")
+		ch <- prometheus.MustNewConstMetric(c.zoneBytesTotal, prometheus.CounterValue,
+			float64(egress.Bytes), zoneName, "egress")
+	}
+}
 
 func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp apiRuntimeDataPlane) {
 	cfg := c.srv.store.ActiveConfig()
