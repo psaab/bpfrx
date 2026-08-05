@@ -505,3 +505,528 @@ union before another immutable review round.
 These are pre-commit design reviews, not formal round-16 verdicts. The same two
 agents were re-dispatched against the integrated draft before the immutable
 round-16 commit.
+
+### Round 16 - plan commit `0533766f6dda9f71268314e67dc83d5ff4d6bfbb`
+
+- Immutable checkout:
+  `/home/ps/git/xpf-worktrees/6744-plan-r16-review`; detached, locked, and clean.
+- Round-start issue comment:
+  <https://github.com/psaab/xpf/issues/6744#issuecomment-5174100507>.
+- Codex direct hostile review: process session `40295`; verdict
+  `PLAN-NEEDS-MAJOR`.
+- AGY direct hostile review: valid retry process session `69232`; verdict
+  `PLAN-READY`. The first invocation supplied flags in the wrong argument order
+  and returned a generic CLI-mode explanation; it is invalid and not counted.
+- Claude Code CLI: process session `11709`; failed before analysis with the
+  account monthly-spend-limit error; no Anthropic-model verdict exists.
+- Independent non-Anthropic SMR-method fallback agent:
+  `019fcab9-43f6-75c1-9e68-76c3dad9e54d`; verdict `PLAN-NEEDS-MAJOR`.
+  This is explicitly not represented as an Anthropic-model review.
+
+Round 16 did not converge. Codex found a mutable post-receipt historical object
+graph, missing last-owner semantics for shared BPF projections, contradictory
+baseline/tail execution ownership and heartbeat starvation, an unobservable
+`expectedAttachType` identity field, incomplete off-config hook discovery, no
+terminal dependency-waiter timeout transition, a nine-worker capacity overflow,
+and no implementable same-connection paired config/request write. The
+independent fallback additionally found destructive startup cleanup before
+inventory/capsule capture and the native mlx5 fresh-attach contradiction; its
+off-config hook finding converged with Codex. AGY returned `PLAN-READY`.
+Revision 17 incorporates the complete valid union before another immutable
+review round.
+
+### Revision 17 pre-commit architecture passes
+
+- Kernel/AF_XDP migration architect agent:
+  `019fcad0-089e-7293-b13b-fa79a511c037`; read-only against immutable round 16;
+  conditional `PLAN-READY` after requiring complete old/new map-ID disjointness,
+  non-destructive pre-`Manager.Load` recovery, finite runtime-semantic
+  historical manifests, full namespace hook inventory, the durable forward-only
+  journal state machine, and guard-plus-interface-down fresh XDP attachment with no retained-
+  link retarget operation.
+- HA/session protocol architect agent:
+  `019fcad0-090e-7b51-8316-ec61e1f209e1`; read-only against immutable round 16;
+  conditional `PLAN-READY` after requiring compatible shared-key owner counts,
+  admission-only receive loops with explicit chunk credit/control priority,
+  atomic not-started waiter transfer, fixed capacity behavior, and one bounded
+  same-connection config/request writer.
+- The orchestrator selected checked runtime map sizing with actual map-create
+  preflight rather than the second architect's proposed hard eight-worker HA
+  product limit. Revision 17 explicitly tests the nine-worker 10,485,764-row
+  boundary, rejects `MaxUint32`/memory/resource overflow before publication, and
+  leaves final acceptance of that tradeoff to the formal hostile reviewers.
+- Both architect agents were closed after their findings were incorporated; no
+  production file, issue, PR, or implementation was created.
+
+#### Revision 17 pre-commit hostile design review 1
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit.md`; SHA-256
+  `e687a32dfe27b57438fc9766d89c5a4f1b3fa1c99dc37c4e8ec0feaf127f3687`.
+- Kernel/dataplane design reviewer: `019fcae9-10c4-7500-8034-6268dee5716c`;
+  verdict `PLAN-NEEDS-MAJOR`. It required an exhaustive packet-authority map
+  classification, generation-disjoint map publication, independent physical-
+  interface and binding-readiness edges, explicit `PASS_TO_KERNEL` removal,
+  and raw classic-TC ingress/egress shared-block discovery.
+- HA/session design reviewer: `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`;
+  verdict `PLAN-NEEDS-MAJOR`. It required a Manager-created registry that owns
+  and joins the complete daemon runner epoch, feature-subepoch receipts for
+  day-2 changes, and one atomic peer-config transaction whose ACK follows both
+  packet-runtime and Manager publication.
+- Whole-plan/API design reviewer: `019fcae9-d9d7-74b2-8a9d-a78022f076e3`;
+  verdict `PLAN-NEEDS-MAJOR`. It required mutation-free Prepare separated from
+  a typed Begin outcome that always preserves post-negative recovery state,
+  and a Manager-owned terminal shutdown union that cannot reconstruct old
+  opaque receipts or make callers guess the live state class.
+- Follow-up design passes from the same three reviewers refined the required
+  API shapes. The orchestrator integrated their valid union, rejected an
+  alternate classifier-map sketch that used unsafe `BPF_F_NO_PREALLOC` and
+  published authority after control, then performed an independent consistency
+  audit. That audit also split physical-interface activation from per-binding
+  XSK readiness, chained runtime selection/publication receipts to the complete
+  map-set identity, and replaced the optional shutdown epoch-stop argument with
+  a Manager-minted terminal epoch-union receipt.
+
+#### Revision 17 pre-commit hostile design review 2
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-2.md`; SHA-256
+  `9f6bae7d67dce667c079cfc5ca1cdf1aa7c9154f4039b3f4eb21b73b671c6013`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It found volatile qdisc statistics in the ownership digest, an unspecified
+  mlx5 challenge-map/matcher contract plus contradictory timeout policy,
+  assertion-only AF_XDP owner absence, an impossible private Go receipt
+  constructor across `pkg/dataplane` and `pkg/dataplane/userspace`, two tests
+  that contradicted Linux map-in-map synchronization/quiescence, and a 48-byte
+  verification bound for the 56-byte v2 control row.
+- HA/session design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict
+  `PLAN-NEEDS-MAJOR`. It found normal replacement joining the daemon epoch
+  before Manager's shared negative activation edge, runner wake before the
+  activation release-store, peer callback lifetime ending before final
+  publication/ACK authority, no transport-independent post-commit recovery
+  owner, and feature rollback receipts that could not represent a fresh
+  predecessor branch.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict
+  `PLAN-NEEDS-MAJOR`. It independently found daemon producer closure before the
+  first Manager negative config edge, the same unrepresentable feature rollback,
+  and a config-authority Prepare API that required a SessionSync transport even
+  in unavailable, boot-empty, and standalone state classes.
+
+The integrated draft makes Manager retirement-begin the first replacement
+negative edge, preloads activation before waking runners, gives peer apply one
+Manager-created publisher and a daemon-lifetime recovery transfer, and prepares
+fresh target/rollback feature children before stopping the predecessor. Config
+authority is now transport-independent with exhaustive state-class behavior.
+Kernel migration now hashes canonical structural qdisc attributes while
+excluding named volatile statistics, defines exact expected/counter challenge
+map ABIs and one `deferredChallengeUnavailable` policy, proves AF_XDP ownership
+through stable `AF_XDP` socket-diag plus `/proc` correlation, and mints runtime
+receipts through a base-package issuer. The next hostile pass corrected the
+intermediate draft's kernel model; the final contract is recorded below.
+
+#### Revision 17 pre-commit hostile design review 3
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-3.md`; SHA-256
+  `1892644ae9468a5c640365132f359bdf0da9a974f1fb91680f322e8f6c9958e8`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It corrected the prior ledger's map-in-map claim: the outer pointer update
+  returns while a paused BPF reader retains the displaced inner, so syscall
+  completion is not a quiescence receipt. It also found that AF_XDP diag omits
+  `XSK_UNBOUND`, the bootstrap challenge referred to a runtime generation that
+  does not yet exist, queue-qualified challenge generation could miss RSS queue
+  swaps, classic-TC identity omitted protocol, and the challenge counter ABI and
+  lifecycle were incomplete.
+- HA/session design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that feature target selection could destroy rollback before the
+  irreversible authority decision, the daemon and Manager publication domains
+  had no single observable positive edge, recovery transfer could remove a
+  callback from transport join before its stack returned, daemon shutdown did
+  not join recovery workers, applied-without-ACK lacked a typed replay-only
+  transition, prepared/unarmed config handling was contradictory, and
+  no-feature-delta commits used the broad authority generation.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict `PLAN-NEEDS-MAJOR`.
+  It independently found destructive feature rollback ordering, fallible abort
+  work after positive gates opened, arbitrary callback-based positive
+  publication, unconstructible cross-package runtime-view types, unenforceable
+  exported value invariants, and the incorrect PR-count claim.
+
+The orchestrator self-corrected every valid finding before snapshot 4. The plan
+now uses a journaled nonzero bootstrap generation independent of later runtime
+authority; all-process AF_XDP FD plus conservative AF_UNIX rights-queue census;
+queue-independent RSS tuple/nonce cloning with Toeplitz targeting; complete
+classic-TC filter identity; preseeded checked per-CPU counters; and immediate
+map-in-map update completion followed by explicit production quiescence. It
+uses private-field configstore/cluster values, concrete Manager-owned transport
+and config publication cells with daemon preload before one positive CAS,
+durable ACK-outbox phases, split mutation/execution callback ownership, a
+daemon-lifetime recovery registry, typed applied-without-ACK replay, an
+irreversible target-decision receipt before branch retirement, fully fallible
+rollback before the previous cell reopens, and mandatory prepared/unarmed
+normalization before config Prepare. The child/PR topology is 13 child issues
+and 16 implementation PRs.
+
+#### Revision 17 pre-commit hostile design review 4
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-4.md`; SHA-256
+  `ce6fcd27b9ce7f699626eac42caa8270880ec123aae7e9897b8efcf960c3794a`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It live-grounded a zero-payload `SCM_RIGHTS` escape from the AF_UNIX queue
+  census, fixed and in-flight io_uring file-reference escapes, mutable nested
+  TC-action data in the proposed structural digest, and incomplete RSS/hash-
+  field plus pre-up corpus construction.
+- HA/session design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict `PLAN-NEEDS-MAJOR`.
+  It found a shutdown/adopted-callback deadlock, a recovery record unable to
+  carry its required opaque state, dynamic recovery workers incompatible with
+  the sealed lifetime registry, and recovered publication that could lose its
+  ACK obligation.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict `PLAN-NEEDS-MAJOR`.
+  It found self-attested publication preload, publicly mutable RG snapshots,
+  incomplete runtime-authority predecessor issuance, no bilateral-baseline
+  receipt issuer, a circular daemon-lifetime runner contract, stale test APIs,
+  and the decisive scope defect: K003-10 had absorbed a new HA protocol, session
+  store, map migration, helper lifecycle, capacity model, and binary floor that
+  do not share the reported invalid-binding root cause or rollback boundary.
+
+The orchestrator self-corrected the architecture rather than continuing to add
+proof types to an unjustified design. The expanded SessionSync, stateful-map,
+AF_XDP/hook, helper-lifecycle, ACK-outbox, migration-journal, and binary-floor
+work was removed in full. K003-10 is now one bounded child/PR: reject explicit
+dataplane owner bindings outside 1..15 before mutation, preserve legal unbound
+control definitions through 255, feed fixed-slot writers from one validated
+inventory, document the limit, and run RG15 plus rejection smoke. Snapshot-4
+findings against the removed architecture are therefore **moot, not fixed**;
+they remain research leads only if an independently evidenced future issue
+proposes those mechanisms. The plan topology is corrected to 13 child issues
+and 13 PRs.
+
+#### Revision 17 pre-commit hostile design review 5
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-5.md`; SHA-256
+  `43d836ec54a27178dab3c724d200545438a374aaf3668896115ddf7abb4b5fc5`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that legal control-only RGs still entered every daemon actuator loop,
+  creating permanent apply debt and watchdog log storms, and that the proposed
+  owner inventory had no generation-transactional publication or safe removal
+  protocol. It required separate candidate/applied inventories, previous+target
+  transition authority, clear-before-forget, post-ACK publication, and explicit
+  unbound-to-bound replay.
+- HA/compiler design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that typed zero cannot distinguish explicit RG0 from omission, a
+  target-only inventory cannot clear an old owner slot, both-node proof was not
+  wired through every compiler/store path, raw gates ignored repeated-section
+  reduction semantics, and stale peer configuration made any new takeover
+  unsafe. It also required smoke coverage for those exact transitions.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict `PLAN-NEEDS-MAJOR`.
+  It found a cyclic B/C compiler API and false independent-PR/revert claim,
+  unspecified SNMP evaluation constructor/update plumbing and copy ownership, a
+  public `RejectedV3Users` schema change that contradicted the preservation
+  contract, and independently confirmed the control-only RG actuator conflict.
+
+The live revision candidate now treats typed zero only as omission while the raw
+gate rejects explicit zero; reduces each raw section with its exact dispatcher
+semantics; routes every public compile/store path through one both-node prepared
+pipeline; and blocks all new takeover while peer-generation debt exists. RG
+actuation uses generation-stamped staged/applied inventories, a previous+target
+transition set, negative clear/readback before target publication, post-ACK
+commit, cleanup debt, and explicit unbound-to-bound replay across every daemon
+event/reconcile/watchdog/fence/shutdown loop. Compiler workstream B now owns a
+neutral prerequisite pipeline that does not name C/I/M types, incorporates the
+existing peer-effective SNAT proof without recursive compilation, and declares
+dependent merge/revert ordering. SNMP evaluation now has exact immutable,
+deep-copy constructor/update APIs and compatibility wrappers; production boot
+and day-2 callers consume one precomputed evaluation. Rejection metadata remains
+an internal Config sidecar plus existing warnings/logs, with no JSON/YAML/REST/
+gRPC/CLI schema change. These are candidate corrections pending snapshot-6
+hostile validation, not accepted closures.
+
+#### Revision 17 pre-commit hostile design review 6
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-6.md`; SHA-256
+  `2d2ab7f33e4ce9e49b2d94af834ffbe3c4943610f6f119aa741e608530f75ed2`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that a lost apply response can leave Rust on the target while Go
+  claims previous-good, that the proposed pre-ACK row clear had no executable
+  restore edge, that post-ACK errors discarded the target actuator inventory,
+  that slot 0 conflated BPF cleanup, Rust's internal epoch, and a helper row,
+  and that cold start trusted stale active pinned rows retained in the target.
+- HA/compiler design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that the compiler rewrite omitted the existing ordered raw
+  pre-expansion validators, contradicted strict duplicate-interface rejection,
+  could broaden the peer-SNAT compatibility wrapper through unrelated peer
+  strictness, had no executable pre/post-ACK result contract, and left config
+  rejection debt owned by replaceable SessionSync state.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict `PLAN-NEEDS-MAJOR`.
+  It independently found the omitted raw compiler phase and peer-SNAT contract,
+  identified undefined/uncopyable SNMP runtime types and private cache aliasing,
+  required a fingerprint over the evaluator-owned snapshot, and confirmed that
+  post-ACK errors could commit Rust while daemon authority remained previous.
+
+The live candidate now preserves a once-per-input raw compiler phase and exact
+generic result/fallback semantics, prepares validation-only node views without
+making unrelated peer checks strict, and keeps #5180 strict duplicate rejection
+ahead of tolerant final-occurrence reduction. SNMP defines every carrier,
+clones the private compiled client cache through `pkg/config`, and owns its
+credential-aware fingerprint. RG replacement changes no HA row before the
+snapshot decision, resolves lost ACKs through exact generation-bearing status,
+quarantines unresolved outcomes, commits target inventory before fallible
+follow-up, and returns a non-nil result with typed committed debt. Slot 0 is
+cleanup-only, cold start clears all physical rows before authoritative replay,
+and a daemon-owned durable nonsecret latch gates every new takeover after a
+peer config rejection. These corrections require another immutable hostile
+pass.
+
+#### Revision 17 pre-commit hostile design review 7
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-7.md`; SHA-256
+  `1c954ccf290d7dc6d056e8703b23912c233ec3e9d1faa90aa0158d3cd8e33ef9`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that pre-ACK classifier/hook mutation made previous-good restoration
+  incomplete, disarmed helper apply could ACK an unbuildable target, generation
+  equality did not prove workers live, helper commit was being confused with
+  full daemon convergence, and the proposed persisted takeover marker had
+  write-failure and downgrade holes.
+- HA/compiler design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict
+  `PLAN-NEEDS-MAJOR`. It found exported compile/load paths that mutate pins or
+  choose programs before the new validator, the same helper/full-convergence
+  conflation, a promotion race while peer validation was in progress, and a
+  crash window before the old rejection-only marker write.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict
+  `PLAN-NEEDS-MAJOR`. It additionally found that unconditional peer-SNAT
+  proof broadened tolerant-load behavior, apply outcome/error carriers were
+  undefined, actuator retry debt was unversioned and vulnerable to RG remove/
+  re-add ABA, and the persisted marker contradicted the claimed revert and
+  public-surface bounds.
+
+The live candidate removes the speculative generic apply-transaction redesign
+instead of adding more recovery states to K003-10. Every exported compiler,
+loader, and Manager entry must prove the prepared views before any pin, map,
+generation, program-selection, or hook side effect. Peer-SNAT remains limited
+to its existing strict/wrapper callers. RG owner replacement now composes with
+the existing fail-closed snapshot path: newly reachable rows are pre-cleared,
+the acknowledged inventory changes only on ACK, exact helper replacement and
+removed-row cleanup use generation-owned debt, and old debt cannot clear a
+re-added owner. Ordinary errors keep `ActiveApplied` and SessionSync high-water
+at the prior fully converged generation. The persisted marker and its rollback
+contract are deleted; a clustered process starts with an in-memory takeover veto
+closed, closes it before every peer apply, and opens only the exact fully
+converged attempt. Crash therefore restarts closed without new durable state.
+These are candidate corrections pending a fresh immutable pass.
+
+#### Revision 17 pre-commit hostile design review 8
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-8.md`; SHA-256
+  `e7949c9b6ddb7d5cef7a6eb5cb42d6a607f028b9992f6872627cb50e30517b2f`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that pending-XSK startup still returned success before snapshot ACK,
+  asynchronous actuator-debt convergence had no mandatory daemon replay
+  handoff, the sender did not actually resend a failed config on a stable
+  connection, and a readiness recheck did not serialize config invalidation
+  against ownership mutation.
+- HA/compiler design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict
+  `PLAN-NEEDS-MAJOR`. Its proof-carrier finding was already closed in the live
+  candidate by pure typed downstream belts. It additionally found an RG0
+  bootstrap cycle, no replay/rollback owner for a suppressed queued promotion,
+  and an inaccurate assumption that every currently admitted config-sync
+  transport is PSK-authenticated.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict
+  `PLAN-NEEDS-MAJOR`. It independently confirmed the proof-boundary and RG0
+  authority-cycle defects and required an exact receipt to cross the
+  asynchronous election-to-daemon-actuation boundary.
+
+The live candidate removes successful deferred publication: same-plan startup
+updates publish synchronously and changed binding/RG plans restart then publish.
+Post-ACK debt cannot arm until a daemon replay receipt read-backs the exact
+generation. SessionSync owns a bounded local pending-delivery retry state so a
+stable connection does not depend on a nonexistent resend/NACK. Configuration
+authority is represented by an explicit process-lifetime receipt: fully
+converged local config bootstraps RG0, sync-disabled mode is explicit, and a
+fully converged received config records its actual PSK or intentionally
+keyless/legacy trust mode. Secondary-to-primary state is pending until the
+daemon claims an epoch-bound activation lease; config invalidation waits for
+claimed leases, and stale events roll back/re-elect. These are candidate
+corrections pending another immutable pass.
+
+#### Revision 17 pre-commit hostile design review 9
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-9.md`; SHA-256
+  `ccb94a5fb645a1865b896a39e99236899b17e32692bdad9223bd52c28305428d`.
+- Kernel/dataplane design reviewer:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; verdict `PLAN-NEEDS-MAJOR`.
+  It proved a stale config replay could overwrite a concurrent demotion,
+  rollback could invalidate replay before proving the timer still owned a
+  target, helper status did not fence asynchronous worker HA commands across
+  remove/re-add, and queued VRRP/reconcile promotion lacked an authority epoch.
+- HA/compiler design reviewer:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; verdict
+  `PLAN-NEEDS-MAJOR`. It independently found that the compiler result types
+  could not preserve per-view outcomes, peer rejection/readiness and newer
+  delivery admission were contradictory, config replay raced demotion, RG0
+  config authority was not serialized, bootstrap could leave the standby
+  store writable, stale negative work lacked incarnation, and ordinary full
+  apply failures had no recovery owner.
+- Whole-plan/API design reviewer:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; verdict
+  `PLAN-NEEDS-MAJOR`. It independently confirmed the compiler-outcome,
+  rollback-order, connection-cancellation, stale replay, and workstream-scope
+  defects, and additionally found caller-forgeable readiness tokens and no
+  representable replay phase.
+
+The orchestrator accepted the shared scope finding rather than adding another
+generation/receipt layer. The applied-owner inventory, snapshot-ACK recovery,
+SessionSync callback/retry change, hard-readiness transaction, election intent,
+positive-actuation worker, and rollback supersession API were removed in full.
+K003-10 now makes configured RG0..15 the one honest appliance domain, rejects
+RG16+ definitions and bindings before mutation, and adds only first-operation
+typed validators plus fixed-slot runtime range belts. This matches the source
+report's bounded fix and turns every HA race above into a valid reason the
+deleted architecture must not ship, not a hidden follow-up inside K003-10.
+
+The compiler finding remained applicable outside that deletion. The live
+candidate now runs B/C/I/M on prepared effective roots before lowering, lowers
+only the requested view for ordinary compilation, and gives the existing
+SNAT-only compatibility wrapper a separate `peerSourceNATOutcome` containing
+both `Config` and `LoweringErr`. Error precedence and suppression policy are
+explicit, so no prose-only per-view result is claimed.
+
+#### Revision 17 pre-commit hostile design review 10
+
+- Immutable plan snapshot: `/tmp/6744-plan-r17-precommit-10.md`; SHA-256
+  `14b1dd652dc0a2ee2aa80b8c533901132e51e3e8bc1682ef124a23fe8d1d3460`.
+- Kernel/dataplane design reviewer agent:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; submission:
+  `019fcc73-770f-7223-bb26-e805af395341`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that an absent optional node1 group would become a new hard failure,
+  configless `Load` cannot satisfy the claimed typed-config dominator, rolling
+  upgrade had no staged config compatibility command before demotion, and the
+  frozen snapshot still contradicted current warning order. The live draft had
+  independently corrected warning order before results returned.
+- HA/compiler design reviewer agent:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; submission:
+  `019fcc73-7711-7e91-b6fe-3845decd694e`; verdict `PLAN-NEEDS-MAJOR`.
+  It found the inactive-RG rejection contradicted pruning semantics, daemon
+  config apply mutated multiple subsystems before the proposed runtime gate,
+  `cluster.Manager.UpdateConfig` remained an unguarded publication path, the
+  test matrix demanded errors for valid RG0/RG15 operations, and persisted
+  confirm recovery promoted invalid targets before checking them.
+- Whole-plan/API design reviewer agent:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; submission:
+  `019fcc73-7715-7fa3-9ca8-b89fbd6cf6ff`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that `NodeID int` aliased unspecified generic evaluation with node
+  0, independently confirmed inactive/rollback/upgrade gaps, and identified
+  source-breaking removal/renaming of exported route-map and heartbeat APIs.
+
+Revision 18 accepts the shared scope verdict. K003-10 remains confirmed but is
+now a dedicated follow-on `/research` child with no production PR authorized by
+this plan; its required comparison explicitly owns compiler, config-bearing
+startup, cluster publication, pending-confirm recovery, staged-binary upgrade,
+mixed-version, API, and smoke contracts. The remaining compiler pipeline now
+preserves an explicit `{ID,Set}` evaluation context, treats only the exact
+absent optional `${node}` validation view as unavailable, preserves current
+warning order, and removes I from B's implementation dependency. Workstream H
+retains deprecated exported compatibility wrappers while barring them from
+safety decisions. Snapshot-10 RG implementation findings are therefore
+**research requirements, not claimed code fixes**.
+
+#### Revision 18 pre-commit hostile design review 11
+
+- Immutable plan snapshot: `/tmp/6744-plan-r18-precommit-11.md`; SHA-256
+  `fa8cb8afb846ec89e64fd84d1c0825f0b1e98a1269e27e85a04a9c41669270ba`.
+- Kernel/dataplane design reviewer agent:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; submission:
+  `019fcc85-f61b-7161-a541-6f47ce935f28`; verdict `PLAN-NEEDS-MAJOR`.
+  It found that I-owned interface/chassis reductions still leaked into B, the
+  current configstore sequence had no executable prepare-once strict compiler
+  transaction, and the blanket no-double-expansion claim contradicted existing
+  bounded raw gates that independently expand node views.
+- HA/compiler design reviewer agent:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; submission:
+  `019fcc86-0d2d-7ae1-8930-8f0bebec0aaf`; verdict `PLAN-NEEDS-MAJOR`.
+  It independently confirmed the I-owned compiler leakage, proved that the
+  optional-peer exception was not distinguishable after variable substitution,
+  and required an exact compatibility rule for direct node IDs outside 0/1.
+- Whole-plan/API design reviewer agent:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; submission:
+  `019fcc86-22a2-7793-9ed6-fd1894777340`; verdict `PLAN-NEEDS-MAJOR`.
+  It independently confirmed the I-owned compiler leakage and proved that
+  expired and unexpired commit-confirm recovery can publish or arm an invalid
+  B/M rollback target after compilation fails.
+
+Revision 19 removes I's last production scaffolding, defines one strict
+`CompileConfigForCommit` transaction with preserved error precedence, narrows
+the expansion invariant to prepared views within that transaction, adds typed
+undefined-group provenance and non-0/1 compatibility behavior, and makes
+commit-confirm recovery fallible with explicit pending and first-commit state.
+
+#### Revision 19 pre-commit hostile design review 12
+
+- Immutable plan snapshot: `/tmp/6744-plan-r19-precommit-12.md`; SHA-256
+  `c16dd42bf96031de3c8a0f753f0e0e1e7c545ab605febce198e3cd3c87bb6470`.
+- Kernel/dataplane design reviewer agent:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; submission:
+  `019fcc93-d2e2-71d0-9754-860c45d48502`; verdict `PLAN-NEEDS-MAJOR`.
+  It proved blocked recovery still exposed a compiled active config to cluster
+  election and other startup managers, demotion could clear the blocked record,
+  and neither advertised recovery action completed a runtime transaction.
+- HA/compiler design reviewer agent:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; submission:
+  `019fcc93-d2e0-7000-b00c-edae24796884`; verdict `PLAN-NEEDS-MAJOR`.
+  It proved validation-only B/C/M errors could precede an existing requested
+  lowering error and required an explicit pending-state enum and complete
+  transition table rather than timer-plus-Boolean ownership.
+- Whole-plan/API design reviewer agent:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; submission:
+  `019fcc93-d2e4-7512-b627-9ffc5e0d13f8`; verdict `PLAN-NEEDS-MAJOR`.
+  It found indistinguishable prepared/alias/unavailable view states, the
+  invalid-active/valid-target upgrade ordering hole, nil-based first-commit
+  result callers and inconsistent persisted markers, the bootstrap recovery
+  dead end, and stale scope exclusions.
+
+Revision 20 defers every new hard-gate error behind existing requested and
+cross-check slots, adds node-indexed resolution states, prepares active and
+confirm artifacts before publication, restores valid rollback targets even
+when the unconfirmed active tree is newly invalid, publishes nil compiled state
+when blocked, migrates internal rollback callers to an explicit first-commit
+result, validates the persisted marker, and defines the complete
+none/armed/blocked transition matrix and bootstrap-only strict plain-commit
+recovery path.
+
+#### Revision 20 pre-commit hostile design review 13 - infrastructure blocked
+
+- Immutable plan snapshot: `/tmp/6744-plan-r20-precommit-13.md`; SHA-256
+  `825edf8ed010a506381938c734cffa7d4f4653f5d4998f1fb6882f8fa5a55c84`.
+- Kernel/dataplane design reviewer agent:
+  `019fcae9-10c4-7500-8034-6268dee5716c`; retry submission:
+  `019fcca1-8cb9-74b1-82c8-7a30d6ef67b7`.
+- HA/compiler design reviewer agent:
+  `019fcae9-70f6-7f20-88ff-1fe8cbb92da0`; retry submission:
+  `019fcca1-8cbc-7400-b9e2-71b04d29fd5b`.
+- Whole-plan/API design reviewer agent:
+  `019fcae9-d9d7-74b2-8a9d-a78022f076e3`; retry submission:
+  `019fcca1-8cbe-74d2-ab36-38fa2d551c6b`.
+
+All three submissions failed before analysis at the shared Codex usage limit.
+They produced no verdict and are not counted toward convergence. The live draft
+then received two orchestrator-only clarifications: successful typed rollback
+results must satisfy the first-commit/config XOR invariant, and blocked recovery
+must retain rollback history plus the parsed active tree for `EnterConfigure`.
+The next formal round therefore reviews a new immutable commit rather than
+claiming equivalence with this pre-commit snapshot.
