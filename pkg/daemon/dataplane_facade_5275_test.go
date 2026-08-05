@@ -4,11 +4,13 @@ import (
 	"errors"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // #5275 PR2 — the revocable dataplane facade.
@@ -96,6 +98,30 @@ func (f *fakeFacadeBackend) ReadZoneCounters(uint16, int) (dataplane.CounterValu
 }
 func (f *fakeFacadeBackend) SessionCount() (int, int) { f.hit(); return 3, 4 }
 
+// The CLI forwarding-control surface. These are the mutators #5275 §7 calls
+// directly exploitable on bootstrap-exit, so the revocation test below asserts
+// they stop at the facade like everything else.
+func (f *fakeFacadeBackend) Status() (dpuserspace.ProcessStatus, error) {
+	f.hit()
+	return dpuserspace.ProcessStatus{}, nil
+}
+func (f *fakeFacadeBackend) SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error) {
+	f.hit()
+	return dpuserspace.ProcessStatus{}, nil
+}
+func (f *fakeFacadeBackend) SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error) {
+	f.hit()
+	return dpuserspace.ProcessStatus{}, nil
+}
+func (f *fakeFacadeBackend) SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error) {
+	f.hit()
+	return dpuserspace.ProcessStatus{}, nil
+}
+func (f *fakeFacadeBackend) InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error) {
+	f.hit()
+	return dpuserspace.ProcessStatus{}, nil
+}
+
 // TestFacadeRevocationStopsEveryCall is the behavioural half. A revoked facade
 // must stop calls at the facade — not merely report an error while still
 // reaching the backend, which would leave the mutator paths (SetForwardingArmed
@@ -137,6 +163,21 @@ func TestFacadeRevocationStopsEveryCall(t *testing.T) {
 	if v4, v6 := f.SessionCount(); v4 != 0 || v6 != 0 {
 		t.Errorf("revoked SessionCount returned %d/%d — a stale count read as live is worse "+
 			"than an empty one", v4, v6)
+	}
+	// The #5275 §7 mutators specifically: these never traverse the apply gate,
+	// so a revoked facade that still forwarded them would leave the exact hole
+	// the facade exists to close.
+	if _, err := f.SetForwardingArmed(true); !errors.Is(err, errDataplaneFacadeRevoked) {
+		t.Errorf("revoked SetForwardingArmed returned %v, want errDataplaneFacadeRevoked", err)
+	}
+	if _, err := f.SetQueueState(0, true, true); !errors.Is(err, errDataplaneFacadeRevoked) {
+		t.Errorf("revoked SetQueueState returned %v, want errDataplaneFacadeRevoked", err)
+	}
+	if _, err := f.SetBindingState(0, true, true); !errors.Is(err, errDataplaneFacadeRevoked) {
+		t.Errorf("revoked SetBindingState returned %v, want errDataplaneFacadeRevoked", err)
+	}
+	if _, err := f.InjectPacket(dpuserspace.InjectPacketRequest{}); !errors.Is(err, errDataplaneFacadeRevoked) {
+		t.Errorf("revoked InjectPacket returned %v, want errDataplaneFacadeRevoked", err)
 	}
 	if be.reached != liveHits {
 		t.Fatalf("REVOCATION LEAKED: %d call(s) reached the backend after Revoke()",
@@ -227,41 +268,71 @@ func TestSetDataplaneRevokesThePreviousFacade(t *testing.T) {
 // not assert d.dp to a consumer mirror. If a fourth external consumer is added,
 // it belongs in this list.
 func TestEveryExternalConsumerHoldsTheFacade(t *testing.T) {
-	for _, tc := range []struct {
-		file     string
-		consumer string
-		mirror   string
-	}{
-		{"daemon_run_servers.go", "gRPC", "grpcDataPlane"},
-		{"daemon_run_servers.go", "REST", "apiDataPlane"},
-		{"daemon_run.go", "CLI", "cliDataPlane"},
-	} {
-		t.Run(tc.consumer, func(t *testing.T) {
-			src, err := os.ReadFile(tc.file)
-			if err != nil {
-				t.Fatalf("read %s: %v", tc.file, err)
-			}
-			text := string(src)
+	// DERIVED, not hand-maintained. The consumer mirrors are discovered by
+	// scanning runtime_probes.go for the interfaces the facade must satisfy,
+	// so adding a FIFTH external consumer mirror cannot pass by being absent
+	// from a list somebody forgot to extend — the scan finds it and then
+	// demands a construction site for it.
+	probes, err := os.ReadFile("runtime_probes.go")
+	if err != nil {
+		t.Fatalf("read runtime_probes.go: %v", err)
+	}
+	mirrorRe := regexp.MustCompile(`(?m)^type (\w*DataPlane) interface \{`)
+	var mirrors []string
+	for _, m := range mirrorRe.FindAllStringSubmatch(string(probes), -1) {
+		mirrors = append(mirrors, m[1])
+	}
+	sort.Strings(mirrors)
 
-			// The assignment must come from the facade.
-			assign := regexp.MustCompile(`(?m)^\s*var \w+ ` + tc.mirror + `\b`)
-			if !assign.MatchString(text) {
-				t.Fatalf("%s: no `var <x> %s` declaration found — this test is anchored on a "+
-					"construction shape that no longer exists and must be re-derived, not deleted",
-					tc.file, tc.mirror)
+	// Count assertion: an accidental narrowing of the scan (a changed regexp,
+	// a renamed declaration) must read as a FAILURE, not as a clean run over
+	// fewer files. Bump this deliberately when a consumer is genuinely added
+	// or removed.
+	const wantMirrors = 3
+	if len(mirrors) != wantMirrors {
+		t.Fatalf("discovered %d consumer mirrors %v, expected %d — if a consumer was genuinely "+
+			"added or removed, update wantMirrors AND give the new one a construction site; if "+
+			"not, the scan has narrowed and is no longer proving anything",
+			len(mirrors), mirrors, wantMirrors)
+	}
+
+	// Every discovered mirror must be constructed from the facade somewhere,
+	// and nowhere may re-assert the raw backend to it.
+	sources := map[string]string{}
+	for _, f := range []string{"daemon_run_servers.go", "daemon_run.go"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		sources[f] = string(b)
+	}
+
+	for _, mirror := range mirrors {
+		t.Run(mirror, func(t *testing.T) {
+			declRe := regexp.MustCompile(`(?m)^\s*var \w+ ` + mirror + `\b`)
+			rawRe := regexp.MustCompile(`d\.dp\.\(` + mirror + `\)`)
+
+			var constructedIn string
+			for f, text := range sources {
+				if rawRe.MatchString(text) {
+					t.Fatalf("%s asserts d.dp.(%s) — this consumer has been re-pointed at the "+
+						"raw backend, reinstating the un-revocable alias the facade removes (#5275)",
+						f, mirror)
+				}
+				if declRe.MatchString(text) {
+					constructedIn = f
+				}
 			}
-			if !strings.Contains(text, "d.dpFacade") {
+			if constructedIn == "" {
+				t.Fatalf("no construction site found for %s in %v — a consumer mirror exists with "+
+					"no wiring this test can verify; either it is dead and should be deleted, or "+
+					"its construction site must be added to the scanned set (#5275)",
+					mirror, []string{"daemon_run_servers.go", "daemon_run.go"})
+			}
+			if !strings.Contains(sources[constructedIn], "d.dpFacade") {
 				t.Fatalf("%s constructs a %s consumer but never reads d.dpFacade — the consumer "+
-					"is holding a raw backend alias that d.dp = nil cannot revoke (#5275)",
-					tc.file, tc.consumer)
-			}
-
-			// And must NOT re-assert the raw backend to this mirror.
-			raw := regexp.MustCompile(`d\.dp\.\(` + tc.mirror + `\)`)
-			if raw.MatchString(text) {
-				t.Fatalf("%s asserts d.dp.(%s) — the %s consumer has been re-pointed at the raw "+
-					"backend, reinstating the un-revocable alias the facade removes (#5275)",
-					tc.file, tc.mirror, tc.consumer)
+					"holds a raw backend alias that d.dp = nil cannot revoke (#5275)",
+					constructedIn, mirror)
 			}
 		})
 	}

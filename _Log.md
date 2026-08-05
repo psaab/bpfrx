@@ -66294,4 +66294,16 @@ break — `go vet` confirmed passing under every revert.
   construction sites, because a consumer re-pointed at the raw backend compiles
   and passes every behavioural test.
   **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_wiring.go, pkg/daemon/dataplane_facade_5275_test.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go, pkg/daemon/daemon_run_servers.go, pkg/daemon/daemon_run_bringup.go, pkg/daemon/daemon_run_naming.go, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR2 fix — the FOURTH capture. pkg/cli's
+  userspaceDataplaneControl() type-asserts the CONSTRUCTED handle at RUNTIME
+  against its own private cliUserspaceControlProvider, so routing the CLI
+  through a facade lacking those five methods silently disabled `request
+  chassis cluster data-plane userspace ...`. Added Status/SetForwardingArmed/
+  SetQueueState/SetBindingState/InjectPacket to the facade (gated), a
+  daemon-local mirror + compile assertion, and a pkg/cli shape test. Also made
+  the completeness test DERIVE its consumer set from runtime_probes.go and
+  assert the count, so a fifth consumer cannot pass by being absent from a
+  hand-maintained list.
+  **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_5275_test.go, pkg/cli/userspace_control_shape_5275_test.go
 

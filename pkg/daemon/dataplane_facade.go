@@ -6,6 +6,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // #5275 PR2 — the shared revocable dataplane facade.
@@ -89,6 +90,34 @@ type facadeBackend interface {
 	ReadPolicyCounters(uint32) (dataplane.CounterValue, error)
 	ReadZoneCounters(uint16, int) (dataplane.CounterValue, error)
 	SessionCount() (v4, v6 int)
+
+	// The CLI forwarding-control surface (#5275 §7). A FOURTH capture,
+	// distinct from cliDataPlane: pkg/cli's userspaceDataplaneControl() type-
+	// asserts the SAME handle the CLI was constructed with against its own
+	// package-private cliUserspaceControlProvider. Handing the CLI a facade
+	// that lacks these does not fail to compile — the assertion simply fails
+	// at runtime and `request chassis cluster data-plane userspace ...`
+	// reports the control unavailable. These also must be GATED, not merely
+	// present: they are exactly the mutators §7 calls directly exploitable on
+	// bootstrap-exit, because they never traverse the apply gate.
+	Status() (dpuserspace.ProcessStatus, error)
+	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+}
+
+// cliUserspaceControl mirrors pkg/cli's package-private
+// cliUserspaceControlProvider (pkg/cli/runtime.go) so the facade's coverage of
+// that fourth capture is a COMPILE-TIME fact. Without the assertion below,
+// dropping one of these methods leaves a green build and a CLI command that
+// quietly stopped working.
+type cliUserspaceControl interface {
+	Status() (dpuserspace.ProcessStatus, error)
+	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
+	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
+	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 }
 
 // dataplaneFacade is the single handle every external consumer holds.
@@ -331,6 +360,41 @@ func (f *dataplaneFacade) SessionCount() (v4, v6 int) {
 	return f.backend.SessionCount()
 }
 
+func (f *dataplaneFacade) Status() (dpuserspace.ProcessStatus, error) {
+	if !f.live() {
+		return dpuserspace.ProcessStatus{}, errDataplaneFacadeRevoked
+	}
+	return f.backend.Status()
+}
+
+func (f *dataplaneFacade) SetForwardingArmed(armed bool) (dpuserspace.ProcessStatus, error) {
+	if !f.live() {
+		return dpuserspace.ProcessStatus{}, errDataplaneFacadeRevoked
+	}
+	return f.backend.SetForwardingArmed(armed)
+}
+
+func (f *dataplaneFacade) SetQueueState(q uint32, registered, armed bool) (dpuserspace.ProcessStatus, error) {
+	if !f.live() {
+		return dpuserspace.ProcessStatus{}, errDataplaneFacadeRevoked
+	}
+	return f.backend.SetQueueState(q, registered, armed)
+}
+
+func (f *dataplaneFacade) SetBindingState(slot uint32, registered, armed bool) (dpuserspace.ProcessStatus, error) {
+	if !f.live() {
+		return dpuserspace.ProcessStatus{}, errDataplaneFacadeRevoked
+	}
+	return f.backend.SetBindingState(slot, registered, armed)
+}
+
+func (f *dataplaneFacade) InjectPacket(req dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error) {
+	if !f.live() {
+		return dpuserspace.ProcessStatus{}, errDataplaneFacadeRevoked
+	}
+	return f.backend.InjectPacket(req)
+}
+
 // Compile-time proof that the facade satisfies all THREE captured mirrors.
 //
 // These are the assertions that make the facade substitutable at the three
@@ -341,4 +405,8 @@ var (
 	_ apiDataPlane  = (*dataplaneFacade)(nil)
 	_ grpcDataPlane = (*dataplaneFacade)(nil)
 	_ cliDataPlane  = (*dataplaneFacade)(nil)
+	// The FOURTH capture. The CLI re-asserts its own handle to reach the
+	// forwarding-control mutators, so a facade missing these compiles cleanly
+	// and silently disables the command.
+	_ cliUserspaceControl = (*dataplaneFacade)(nil)
 )
