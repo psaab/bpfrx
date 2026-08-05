@@ -20,10 +20,21 @@ Mirror the existing #3366 value-aware duplicate tracking for the two ICMP
 leaves, in the same function, with the same semantics:
 
 1. `pkg/config/compiler_applications.go` `parseApplicationTerms`:
-   - add `icmpTypeSet` / `icmpCodeSet` bools plus first parsed values
+   - add `icmpTypeSet` / `icmpCodeSet` bools plus a companion value
      (`uint8`), exactly like the direct body's `itypeSet`/`icodeSet`;
-   - on a repeat whose parsed value differs from the first, append
-     `"icmp-type"` / `"icmp-code"` to `dupTermLeaves`;
+   - the companion holds the MOST RECENTLY parsed value, not the first —
+     every arm refreshes it after recording — so the check is "differs
+     from its immediate predecessor" and one record is appended per
+     TRANSITION. `icmp-type 8 icmp-type 3 icmp-type 8` therefore records
+     TWO conflicts, where comparing every later value against the first
+     would record one. Nothing observable depends on the difference:
+     acceptance is identical (any sequence carrying more than one
+     distinct value contains at least one transition), and the strict
+     gate reports only `DuplicateTermLeaves[0]`, so the extra records
+     never reach the error text. Treat the slice as a non-empty/empty
+     signal carrying one representative leaf name, NOT a conflict tally;
+   - on such a transition, append `"icmp-type"` / `"icmp-code"` to
+     `dupTermLeaves`;
    - an idempotent same-value repeat stays accepted (no record);
    - a malformed token keeps its current path (`badICMP` → `UnknownICMP` →
      strict specs gate) — duplicate tracking only applies to values that parse,
@@ -54,6 +65,9 @@ previously compiled to a silently narrowed constraint.
 - `pkg/config/compiler_applications.go` (parseApplicationTerms + comment)
 - `pkg/config/compiler_validate_strict_application.go` (error text + doc comment)
 - `pkg/config/compiler_application_term_icmp_dup_6766_test.go` (new tests)
+- `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go` (new tests — the
+  verdict-level half, added in the review fold; referenced below but omitted
+  from this list until #6814)
 - `pkg/config/README.md` (#3366 section: extend the tracked leaf list)
 - `docs/pr/6766-inline-icmp-dup/plan.md` (this file)
 - `_Log.md` (work log entry)

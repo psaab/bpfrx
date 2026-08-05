@@ -2,8 +2,9 @@
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, on top of a47afa165)
 - **Action**: An AGY leg running the full swapped-label matrix at true head found
-  TWO more bare leaf assertions — in the file THIS PR authored, not the
-  pre-existing ones round 5 swept.
+  TWO more bare leaf assertions — in the same file this PR authored, beyond the
+  three round 5 swept (all of them new in this PR; see the provenance
+  correction in the round-5 entry).
     - `compiler_application_term_icmp_dup_6766_test.go:277`
       (`ReferencedDeny_StrictRejects_LenientNarrows`) and `:398`
       (`Lenient_DowngradesToWarning`). Both now match the QUOTED form.
@@ -45,17 +46,28 @@
 - **File(s)**: `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `_Log.md`
 
-## 2026-08-05 — #6814 fold round 5: the same weak leaf assertion in the three pre-existing rejection tests
+## 2026-08-05 — #6814 fold round 5: the same weak leaf assertion in three more of this file's tests
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, separate commit on top of 274e24f23)
 - **Action**: Round 4 fixed the bare-substring leaf assertion in the two tests it
-  added. The identical defect was sitting in the THREE pre-existing #5797
-  rejection tests in the same file — `FlatSet_Rejected`,
-  `Hierarchical_Rejected`, `ApplyGroups_Rejected` — all using
-  `strings.Contains(err.Error(), c.leaf)`. Flagged rather than silently widened;
-  the lead scoped it in as a separate commit, on the reasoning that leaving it
-  fixes what bit us rather than the class, and leaves a reader unable to tell
-  which of the two forms in one file is deliberate.
+  added. The identical defect was sitting in three more tests in the SAME file
+  — `FlatSet_Rejected`, `Hierarchical_Rejected`, `ApplyGroups_Rejected` — all
+  using `strings.Contains(err.Error(), c.leaf)`. Flagged rather than silently
+  widened; the lead scoped it in as a separate commit, on the reasoning that
+  leaving it fixes what bit us rather than the class, and leaves a reader unable
+  to tell which of the two forms in one file is deliberate.
+
+  **Provenance correction (#6814).** This entry, its heading, the round-6
+  back-reference below, and the commit message of `a47afa165` all described
+  these three as "pre-existing #5797 rejection tests". That is FALSE.
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go` does not exist on
+  `origin/master` — `git diff --name-status origin/master...HEAD` reports it as
+  `A` (added), introduced by this PR's own first commit `b21c7bd19`. All three
+  tests are NEW in this PR. The distinction is not cosmetic: "swept a
+  pre-existing defect class inherited from another issue" and "fixed every site
+  in its own new file" are different claims about what the PR did, and only the
+  second is true. The `a47afa165` commit message is immutable and still carries
+  the wrong framing; this note and the PR body are the correction of record.
   All three now match the QUOTED occurrence, with one shared note explaining
   why: the rejection message ends with a static enumeration of every trackable
   leaf, so the bare form is satisfied by boilerplate regardless of which leaf

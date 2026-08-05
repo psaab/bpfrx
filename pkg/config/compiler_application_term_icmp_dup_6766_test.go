@@ -239,10 +239,19 @@ func TestApplicationTermICMPDup_ApplyGroups_Rejected(t *testing.T) {
 // commit. Revert the fix and the term silently keeps only the LAST value
 // (type 3), so the deny no longer covers echo (type 8).
 //
-// Scope of what this test proves (#6766 fold): (1) strict CompileConfig
-// rejects; (2) on the lenient path — which still compiles, downgrading the
-// reject to a warning — the compiled Application carries ONLY the last
-// authored value, for icmp-type AND icmp-code.
+// Scope of what this test proves (#6766 fold, narrowed in #6814): (1) strict
+// CompileConfig rejects; (2) on the lenient path — which still compiles,
+// downgrading the reject to a warning — the compiled Application carries ONLY
+// the last authored value.
+//
+// For icmp-TYPE only. This test's config authors a single conflicting leaf
+// (`icmp-type 8` then `icmp-type 3`), so it says nothing about icmp-code; an
+// earlier version of this comment claimed both, which a code-only keep-first
+// edit on the CODE arm would have satisfied. The icmp-code half is bound by
+// TestApplicationTermICMPDup_LenientKeepsLastCode below, and both leaves are
+// bound at the verdict in
+// pkg/policymatch/app_inline_term_icmp_dup_6766_test.go. The property is
+// covered; it is just not covered HERE, which is what the claim got wrong.
 //
 // It asserts on the COMPILED STRUCT, not on a policy decision. It does not
 // exercise either matcher, so it cannot by itself show that the surviving
@@ -296,8 +305,20 @@ applications {
 
 	// Characterize the underlying keep-last narrowing the gate protects against:
 	// the lenient path still compiles (no-brick), and the compiled term carries
-	// ONLY the last value — echo (type 8) is no longer denied, so it falls
-	// through to the default permit.
+	// ONLY the last value.
+	//
+	// #6814: this reads the compiled STRUCT and never invokes a matcher, so it
+	// cannot show what happens to echo (type 8) on the wire. An earlier version
+	// of this comment said echo "falls through to the default permit" — which
+	// contradicted this function's own header two dozen lines up, and the
+	// header was the correct half. A matcher edit that ignored ICMPType
+	// entirely would leave every assertion below green.
+	//
+	// That is worth naming rather than quietly rewording: it is the exact
+	// defect class this PR exists to fix — a claim that a check discriminates
+	// something it never reaches — turned inward on the PR's own test file. The
+	// fall-through IS proven, at the verdict, by
+	// pkg/policymatch/app_inline_term_icmp_dup_6766_test.go.
 	cfg, lerr := CompileConfigLenient(tree)
 	if lerr != nil {
 		t.Fatalf("lenient path must NOT brick on a conflicting inline icmp-type: %v", lerr)
