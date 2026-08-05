@@ -297,10 +297,21 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 	// leg someone might run.
 	//
 	// This line is the only one that names the invariant the running/pending bit
-	// design exists for: the request COALESCES ONTO THE RUNNING WORKER. Exactly
-	// one worker, so exactly one goroutine — a request that spawned its own,
-	// concurrently or redundantly, adds one here and is caught on an ownership
-	// statement rather than on arithmetic. Keep both.
+	// design exists for: the request COALESCES ONTO THE RUNNING WORKER. A
+	// request that spawned its own, concurrently or redundantly, adds a
+	// goroutine here and is caught on an ownership statement rather than on
+	// arithmetic. Keep both.
+	//
+	// "ONE WORKER MEANS ONE GOROUTINE" IS TRUE AT THIS CHECKPOINT, NOT IN
+	// GENERAL, and an earlier revision of this comment stated it as a flat
+	// production invariant. It is not one: releaseBootEpochRefine drops the
+	// in-flight bit BEFORE the outgoing goroutine's deferred handle-clear runs
+	// (see startBootEpochRefine's defer and its CAS), so a legitimate successor
+	// can overlap a retiring predecessor for those few instructions and two
+	// goroutines is correct. What makes the count exact HERE is the seam: pass 1
+	// is deterministically parked inside epochFlock across both reads, so no
+	// worker is retiring while they are taken. Anyone reusing this assertion
+	// outside such a checkpoint needs to re-establish that first.
 	if got := clusterGoroutines() - goBase; got != 1 {
 		t.Fatalf("%d package goroutines in flight after the overlapping request, want exactly "+
 			"1: the request did not coalesce onto the worker already running, it spawned "+
@@ -446,6 +457,127 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 	if got := m.heartbeatBootEpoch(); got <= raised {
 		t.Fatalf("published epoch = %d, want > %d — the re-claimed pass ran but did not chain "+
 			"from the value another incarnation left in the file", got, raised)
+	}
+}
+
+// TestThirdRequestCoalescesOntoTheLateReclaim_6669 is the THIRD element, and it
+// is the only one that tests the attempt to RE-ARM a decision already made.
+//
+// Two requests can only show the pending bit being SET. The order that nothing
+// else reaches is:
+//
+//  1. pass 1 has already run its pending check and is parked immediately before
+//     its release CAS (the epochRefineBeforeRelease seam sits between the two);
+//  2. request 2 lands there and establishes the late reclaim — it sets pending
+//     against a worker that has already looked;
+//  3. request 3 arrives AFTER that decision and must FOLD INTO it.
+//
+// WHAT THIS ADDS, STATED EXACTLY, because it is narrower than "the branch is
+// untested". Mutating the already-pending branch to re-arm a full-loop worker
+// (`return true` instead of `return false`) was measured against the whole
+// package at 20 runs each:
+//
+//   - TestOverlappingRefineRequestIsCoalesced_6669      GREEN
+//   - TestLateRefineRequestIsReclaimed_6669             GREEN
+//   - TestLateRefineRequestCannotBeStranded_6669        GREEN
+//   - TestInitHeartbeatEpochStateNeverBlocks_6169       GREEN
+//   - TestCoalescingDoesNotRatchetOnAHealthyNode_6669   RED (:794)
+//   - this test                                        RED
+//
+// So the already-pending branch is NOT unguarded — the twenty-request test
+// reaches it and its exact pass count catches the re-arm. What that test cannot
+// distinguish is the ORDER: its twenty requests all arrive EARLY, while the
+// worker is still inside its pass and has not yet run its own pending check, so
+// the follow-up is served by that check. Here the worker is parked PAST the
+// check, so the owed follow-up can only be served by its release CAS failing and
+// the loop re-reading the word. That is a different path to the same coalesce,
+// and this is the only test that drives a request into it.
+//
+// The two mutations are also not interchangeable: making the busy path claim
+// UNCONDITIONALLY is caught by the twenty-request test as well, but through the
+// early order. Neither mutation is caught by any of the four GREEN tests above,
+// which is the coverage this file was missing.
+//
+// RED-on-revert: in claimBootEpochRefine, make the `st&bootEpochPendingBit != 0`
+// branch return true instead of false, so a third request re-arms a worker
+// rather than coalescing.
+func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+
+	var passes atomic.Int64
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		passes.Add(1)
+		return origFlock(fd, how)
+	}
+	t.Cleanup(func() { epochFlock = origFlock })
+
+	// Park pass 1 between its pending check and its release CAS.
+	atRelease := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var once sync.Once
+	origHook := epochRefineBeforeRelease
+	epochRefineBeforeRelease = func() {
+		once.Do(func() {
+			close(atRelease)
+			<-releaseWorker
+		})
+	}
+	t.Cleanup(func() { epochRefineBeforeRelease = origHook })
+
+	// Unpark on the failure path too; t.Fatalf skips the explicit call below.
+	var unparkOnce sync.Once
+	unparkWorker := func() { unparkOnce.Do(func() { close(releaseWorker) }) }
+	t.Cleanup(unparkWorker)
+
+	goBase := clusterGoroutines()
+	m.initHeartbeatEpochState()
+	select {
+	case <-atRelease:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refine worker never reached its release point")
+	}
+	if got, want := m.bootEpochRefine.Load(), bootEpochRefiningBit; got != want {
+		t.Fatalf("refine word = %#x with pass 1 parked before release, want %#x; the schedule "+
+			"this test needs did not happen", got, want)
+	}
+	if got := clusterGoroutines() - goBase; got != 1 {
+		t.Fatalf("%d package goroutines with pass 1 parked, want exactly 1", got)
+	}
+
+	// STEP 2 — the late reclaim decision. This is where every other test stops.
+	m.refreshBootEpoch()
+	if got, want := m.bootEpochRefine.Load(), bootEpochRefiningBit|bootEpochPendingBit; got != want {
+		t.Fatalf("refine word = %#x after the LATE request, want %#x: it did not queue against "+
+			"a worker that had already run its pending check", got, want)
+	}
+
+	// STEP 3 — the request this test exists for. Pending is ALREADY set, so this
+	// one must fold into the follow-up that is already owed rather than arming a
+	// second. A bit is not a queue: two owed requests are still one pass.
+	m.refreshBootEpoch()
+	if got, want := m.bootEpochRefine.Load(), bootEpochRefiningBit|bootEpochPendingBit; got != want {
+		t.Fatalf("refine word = %#x after a request arriving on an ALREADY-PENDING word, want "+
+			"%#x", got, want)
+	}
+	if got := clusterGoroutines() - goBase; got != 1 {
+		t.Fatalf("%d package goroutines after the third request, want exactly 1: it re-armed a "+
+			"worker instead of coalescing onto the follow-up already owed", got)
+	}
+
+	unparkWorker()
+	waitBootEpochIdle(t, m)
+
+	// EXACTLY 2. Pass 1 plus ONE follow-up serving BOTH late requests. Three
+	// would mean the third request armed a pass of its own.
+	if got := passes.Load(); got != 2 {
+		t.Fatalf("%d locked refine passes ran for the initial resolve plus TWO late requests, "+
+			"want exactly 2: the second late request did not coalesce onto the follow-up "+
+			"the first had already made owed", got)
+	}
+	if got := m.bootEpochRefine.Load(); got != 0 {
+		t.Fatalf("refine word settled at %#x, want 0", got)
 	}
 }
 

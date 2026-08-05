@@ -67780,3 +67780,53 @@ break — `go vet` confirmed passing under every revert.
   confirmed identical to HEAD after each of the three restores. Flake: three
   runs at `-count=5` across the four affected tests, rc 0 throughout.
 - **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 13:02 PDT
+- **Action**: #6669 round 18 — add the THIRD-request element (a request arriving
+  on an already-pending word in the LATE order), and scope one overbroad
+  sentence. Includes a correction to the finding's own framing.
+- **THE NEGATIVE CONTROL PARTLY REFUTES THE FRAMING, and the test comment now
+  carries the measurement rather than the claim.** Mutating the already-pending
+  branch to re-arm a full-loop worker (`return true` for `return false`) was run
+  against each candidate at `-count=20`:
+  - `TestOverlappingRefineRequestIsCoalesced_6669` GREEN
+  - `TestLateRefineRequestIsReclaimed_6669` GREEN
+  - `TestLateRefineRequestCannotBeStranded_6669` GREEN
+  - `TestInitHeartbeatEpochStateNeverBlocks_6169` GREEN
+  - `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` **RED** at
+    `session_bind:794`, "21 locked refine passes ran ... want exactly 2"
+  The four named in the finding are blind exactly as reported. But the mutation
+  does NOT escape the package: the twenty-request test reaches the same branch
+  through the EARLY order and its exact pass count catches the re-arm. So
+  "the already-pending branch is unguarded" is too strong.
+- **What the new test actually adds, and why it is still worth having.** The
+  twenty requests all arrive while the worker is still inside its pass and has
+  not yet run its own pending check, so the follow-up is served BY that check.
+  `TestThirdRequestCoalescesOntoTheLateReclaim_6669` parks the worker PAST the
+  check, at the epochRefineBeforeRelease seam, so request 2 establishes the late
+  reclaim and request 3 lands on an already-pending word whose follow-up can only
+  be served by the release CAS failing and the loop re-reading. Same branch,
+  different path to the coalesce, and the only test that drives a request into
+  it. This is the third instance on this PR of a state whose ENTRY two elements
+  can show but whose RE-ARM needs a third.
+- **RED-on-revert (final tree).** `2 package goroutines after the third request,
+  want exactly 1: it re-armed a worker instead of coalescing onto the follow-up
+  already owed` (`session_bind:565`). Assertion, not a build break; restored with
+  `touch` and `heartbeat_epoch.go` confirmed identical to HEAD.
+- **One sentence scoped.** "Exactly one worker, so exactly one goroutine" was
+  written as a flat production invariant. It is not: `releaseBootEpochRefine`
+  drops the in-flight bit BEFORE the outgoing goroutine's deferred handle-clear,
+  so a legitimate successor may overlap a retiring predecessor and two goroutines
+  is correct. The count is exact only AT THIS CHECKPOINT, where pass 1 is
+  deterministically parked in `epochFlock` across both reads. The assertion is
+  unchanged — only its justification was overreaching.
+- **Confirmed NOT owed, per the gate.** The external-package escape cannot be
+  closed by a cluster-path matcher and the existing comment already states that
+  scope honestly; and `joinBootEpochRefine` must stay in `Manager.Stop` —
+  deleting it fails `TestStopJoinsTheBootEpochRefineWorker_6669` at
+  `heartbeat_epoch_refresh_6669_test.go:401`.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 19.5 s. New test green
+  over 10 consecutive runs before mutation; flake three runs at `-count=5`
+  across the four coalescing tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
