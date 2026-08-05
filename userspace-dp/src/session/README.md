@@ -877,11 +877,29 @@ inside the capture window.
 **That mechanism is measured, and the sanctioned gate cannot see it.** Reverting
 `import_cap_drops` to a static reds 24 of 60 parallel runs and 0 of 12 runs
 under `--test-threads=1`; reverting both stale counters reds 43 of 60 parallel
-and 0 of 5 single-threaded. `make test-rust` pins `-- --test-threads=1` (to dodge
+and 0 of 5 single-threaded.
+
+The strongest evidence is independent of this change and predates it. While
+gating an unrelated PR (#6843), a lane measured parallel
+`cargo test -- afxdp::ha` over 40 iterations and found **34 of 40 runs failing
+at that PR's HEAD — and 34 of 40 at a `origin/master` CONTROL** with the PR's
+own files reverted and its tests confirmed absent. Identical rate with and
+without the change under review, which is what identifies the flake as
+pre-existing and environmental to these counters rather than caused by any one
+PR. It root-caused the failures to exactly `SESSION_INSTALL_STALE_IGNORED` /
+`SESSION_DELETE_STALE_IGNORED` being process-global and asserted with
+`assert_eq!(total, before)`, so *any* concurrently-running test that refuses a
+stale op reds them — and observed it as a whole family
+(`stale_generation_install_refused_…`, `stale_generation_delete_refused_…`,
+`over_ceiling_import_rejected_…`), not a single test. Those are the counters
+this section is about.
+
+`make test-rust` pins `-- --test-threads=1` (to dodge
 an unrelated socket-test wedge in `__skb_wait_for_more_packets`, #6657), so a
-regression of this property would ship **green** through the gate. Delta-capture
-assertions cannot close that hole — under serial execution a process-global
-satisfies `before + 1` identically. The binding test is
+regression of this property would ship **green** through the gate. Note the
+coupling: the flag that hides this defect exists because of a *different* one.
+Delta-capture assertions cannot close that hole — under serial execution a
+process-global satisfies `before + 1` identically. The binding test is
 `refusal_counters_are_per_coordinator_not_process_global`, which asserts one
 `Coordinator`'s refusals are invisible to a second live instance and so reds at
 any thread count. Any new refusal counter needs an equivalent, or it is
