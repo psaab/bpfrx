@@ -1,3 +1,31 @@
+## 2026-08-05 — #6847 WIP: inet-precedence classifier, Go config half
+
+- **Timestamp**: 2026-08-05 (fix/6847-inet-precedence-classifier) — **INCOMPLETE**
+- **Action**: Go config half of enforcing the `inet-precedence` classifier.
+  Scope finding first: the issue described this as "accepted but inert", but the
+  unit-level `classifiers` schema had NO `inet-precedence` child at all, so the
+  classifier was definable at the top level and NOT BINDABLE — the bind line was
+  rejected by the schema. So the work is five layers, not three. Landed here:
+  typed entries (`CoSINetPrecedenceClassifier` + `...Entry`), the keyed
+  `INetPrecedenceClassifierDefs` map, the unit binding field, the unit-level
+  schema binding site, a 0..7 code-point collector, the classifier compile
+  mirroring dscp, interface->unit inheritance, and a dscp+inet-precedence
+  same-unit conflict gate (strict at commit, `lenientCoSUnitClassifierConflict`
+  downgrade on the tolerant Load/SyncApply path per #1960). Golden 4406
+  regenerated after verifying the diff was EXCLUSIVELY the new struct field —
+  18 keys added, 0 removed, 0 changed, all `INetPrecedenceClassifierDefs` — so
+  the regen masks no behavior change.
+- **NOT DONE — this branch must NOT merge as-is**: the wire fields and the Rust
+  classify arm are absent, so the binding site now EXISTS but does NOTHING. That
+  is worse than master, where the bind line is at least rejected outright. See
+  the commit body for the remaining work list.
+- **Validation**: `go test ./pkg/config/` green (real exit 0). No PR opened.
+- **File(s)**: `pkg/config/types_cos.go`, `pkg/config/schema_cos.go`,
+  `pkg/config/compiler_class_of_service.go`,
+  `pkg/config/compiler_validate_strict_cos.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cos_platform.go`,
+  `pkg/config/testdata/golden_4406.json`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

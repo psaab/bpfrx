@@ -180,6 +180,61 @@ var cosLossPriorityValues = map[string]struct{}{
 // binary — or synced from a peer — still boots (#1960 no-brick); the dataplane
 // applies the SAFE default on that boot. Entries are visited in sorted order so
 // commit-check surfaces a STABLE first-error message.
+// validateCoSUnitClassifierConflict rejects a logical unit that binds BOTH a
+// `dscp` and an `inet-precedence` classifier (#6847).
+//
+// The two read the SAME IPv4 TOS byte — IP precedence is its top 3 bits — so
+// binding both is a contradiction, not a composition. There is no defined
+// answer to "which wins", and the BA resolution chain would silently pick one
+// (DSCP is consulted first, so the inet-precedence binding would simply be
+// dead). A silently-dead classifier is the quiet-wrong-QoS failure this gate
+// family exists to stop, so reject at commit and make the operator choose.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientCoSUnitClassifierConflict) so a config persisted by an
+// older binary — which had NO inet-precedence binding site and so could not
+// have produced this combination, but might acquire it via a hand-edited or
+// peer-synced file — still boots (#1960 no-brick). On that boot the DSCP
+// classifier wins, matching the resolution order.
+//
+// Units are visited in sorted (interface, unit) order so commit-check surfaces
+// a STABLE first-error message.
+func validateCoSUnitClassifierConflict(cos *ClassOfServiceConfig) error {
+	if cos == nil {
+		return nil
+	}
+	ifaceNames := make([]string, 0, len(cos.Interfaces))
+	for name := range cos.Interfaces {
+		ifaceNames = append(ifaceNames, name)
+	}
+	sort.Strings(ifaceNames)
+	for _, ifaceName := range ifaceNames {
+		iface := cos.Interfaces[ifaceName]
+		if iface == nil {
+			continue
+		}
+		unitNums := make([]int, 0, len(iface.Units))
+		for unitNum := range iface.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := iface.Units[unitNum]
+			if unit == nil {
+				continue
+			}
+			if unit.DSCPClassifier != "" && unit.INetPrecedenceClassifier != "" {
+				return fmt.Errorf(
+					"class-of-service interfaces %s unit %d binds both a dscp classifier (%q) "+
+						"and an inet-precedence classifier (%q); they classify the same IPv4 "+
+						"TOS byte, so bind at most one",
+					ifaceName, unitNum, unit.DSCPClassifier, unit.INetPrecedenceClassifier)
+			}
+		}
+	}
+	return nil
+}
+
 func validateClassOfServiceLossPriorityStrict(cos *ClassOfServiceConfig) error {
 	if cos == nil {
 		return nil
