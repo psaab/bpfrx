@@ -1,3 +1,35 @@
+## 2026-08-05 — #6735 r4: bind the accept table's OVERRIDE, not just its membership
+
+- **Timestamp**: 2026-08-05 (fix/6525-zone-compact-leaf, PR #6735)
+- **Action**: Gate at a12967cbe = MERGE-NEEDS-MINOR; the runtime sections all
+  passed. Remaining question was which added assertions have a distinguishing
+  mutation, and what the tests still ACCEPT.
+
+  Audited my own additions and found one real gap. The positive-control table
+  asserted compiled MEMBERSHIP only, while two of its cases carry a
+  `host-inbound-traffic` body — and those are precisely the spellings the reject
+  message tells the operator to migrate INTO. So the table would have stayed
+  green if the block-spelling override were silently dropped, i.e. it accepted
+  the exact regression that would make the reject message's advice harmful.
+  Each accept case now also asserts the compiled per-interface override
+  (`wantHIB`), with nil for the packed `keyword last, empty body` case, which is
+  the documented fail-CLOSED #6525 residual rather than an oversight.
+
+  Three further mutations added so every new assertion has a distinguishing one:
+  a tail-insensitive gate (over-rejects the lossless keyword-last shape), an
+  override that fans to no member (the new wantHIB), and a packed-tail gate made
+  strict on the tolerant path (the #1960 no-brick warning).
+
+- **Tests**: mutation coverage for the whole #6735 set, each RED from an
+  ASSERTION with `go build` = 0 and `go vet` = 0, GREEN on restore —
+  M1 detector-off, M2 no-recursion, M3 members-nil, M4 filter-never-matches,
+  M5 tail-insensitive, M6 override-fans-to-nothing, M7 lenient->strict, plus the
+  gate-block SWAP for the ordering assertion. `…TruncatorLosesTheTrailingMember`
+  and `…FlatSetBracketNestsRatherThanFanning` are additionally bound by the two
+  reader-half mutations (first-key-only / no-recursion).
+- **File(s)**: `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `_Log.md`
+
 ## 2026-08-05 — #6735 r3: bind the gate ORDER, and fix two comments the tests disprove
 
 - **Timestamp**: 2026-08-05 (fold/6735-r2 -> fix/6525-zone-compact-leaf, PR #6735)

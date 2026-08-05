@@ -125,6 +125,13 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 			name   string
 			stanza string
 			want   []string
+			// wantHIB is the per-interface host-inbound override the stanza
+			// must compile, keyed by member name. Asserting membership ALONE
+			// would let this table stay green while the override silently
+			// vanished — and two of these spellings are exactly what the reject
+			// message tells the operator to migrate INTO, so "it still
+			// compiles" has to mean the body compiles too, not just the names.
+			wantHIB []string
 		}{
 			{
 				name:   "single compact member",
@@ -145,18 +152,22 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 				// Body as a CHILD node — unambiguous, and the override still
 				// compiles. This is the spelling the reject message recommends,
 				// so it had better work.
-				name:   "member with a body block",
-				stanza: `interfaces ge-0/0/0.0 { host-inbound-traffic { system-services ssh; } }`,
-				want:   []string{"ge-0/0/0.0"},
+				name:    "member with a body block",
+				stanza:  `interfaces ge-0/0/0.0 { host-inbound-traffic { system-services ssh; } }`,
+				want:    []string{"ge-0/0/0.0"},
+				wantHIB: []string{"ge-0/0/0.0"},
 			},
 			{
-				name:   "bracket members with a shared body block",
-				stanza: `interfaces [ ge-0/0/0.0 ge-0/0/1.0 ] { host-inbound-traffic { system-services ssh; } }`,
-				want:   []string{"ge-0/0/0.0", "ge-0/0/1.0"},
+				name:    "bracket members with a shared body block",
+				stanza:  `interfaces [ ge-0/0/0.0 ge-0/0/1.0 ] { host-inbound-traffic { system-services ssh; } }`,
+				want:    []string{"ge-0/0/0.0", "ge-0/0/1.0"},
+				wantHIB: []string{"ge-0/0/0.0", "ge-0/0/1.0"},
 			},
 			{
 				// Keyword with NOTHING after it: truncation loses nothing, so
-				// rejecting would be the #4191 over-rejection class.
+				// rejecting would be the #4191 over-rejection class. The packed
+				// body is NOT parsed into an override here — fail-CLOSED, the
+				// residual #6525 left open — so wantHIB is deliberately nil.
 				name:   "keyword last, empty body",
 				stanza: `interfaces ge-0/0/0.0 host-inbound-traffic;`,
 				want:   []string{"ge-0/0/0.0"},
@@ -172,6 +183,10 @@ func TestZoneInterfaces6735PackedTailRejectedAndPositiveControl(t *testing.T) {
 				}
 				if got := cfg.Security.Zones["Z"].Interfaces; !reflect.DeepEqual(got, tc.want) {
 					t.Fatalf("stanza %q compiled membership %v, want %v", tc.stanza, got, tc.want)
+				}
+				if got := hibKeys6525(cfg.Security.Zones["Z"].InterfaceHostInbound); !reflect.DeepEqual(got, tc.wantHIB) {
+					t.Fatalf("stanza %q scoped the per-interface host-inbound override to %v, want %v — the reject message tells operators to rewrite INTO the block spelling, so accepting it must also mean its body still compiles",
+						tc.stanza, got, tc.wantHIB)
 				}
 			})
 		}
