@@ -167,11 +167,14 @@ Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA St
   alongside, and in the `policy-name` field of RT_FLOW syslog records
   (#6851) — the one surface where the attribution is DURABLE, since those
   records ship off-box to a collector.
-- **Cluster peer sessions carry the same guarantee** (#6851). An
-  `include_peer` fan-out attaches the peer node's rows, and the peer
-  resolved those names itself; a peer on a pre-#4626 build sent the name
-  of ITS first configured policy for every reserved-index session. The
-  local node overrides the name for RESERVED indexes only. It deliberately
+- **Cluster peer sessions carry the same guarantee** (#6851), on every
+  surface that shows them: the gRPC and REST fan-outs sanitize in
+  `grpcapi fetchPeerSessions`, and the on-box interactive CLI — which dials
+  the peer daemon directly rather than going through that fan-out — does so
+  at its own ingress. The peer resolved those names itself; a peer on a
+  pre-#4626 build sent the name of ITS first configured policy for every
+  reserved-index session. The local node overrides the name for RESERVED
+  indexes only. It deliberately
   does NOT re-resolve an unreserved index against its own policy table:
   indexes are node-local, so the peer is authoritative for the names of
   its own sessions, and re-resolving would name whichever local policy

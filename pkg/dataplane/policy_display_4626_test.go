@@ -132,6 +132,58 @@ var reservedPolicyHelpers = []string{
 	"ReservedPolicyName", "SessionPolicyName", "PeerSessionPolicyName",
 }
 
+// scanPolicyNameScope reports unguarded policy-name map indexes inside ONE
+// function scope, then recurses into each nested function literal as its own
+// scope. A helper call in the parent does not guard a closure, and a helper
+// call in one closure does not guard its sibling (#6851).
+func scanPolicyNameScope(owner string, body ast.Node, path string, fset *token.FileSet, violations *[]string) {
+	var indexes []*ast.IndexExpr
+	var nested []*ast.FuncLit
+	guarded := false
+
+	var walk func(n ast.Node) bool
+	walk = func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.FuncLit:
+			if node.Body != body {
+				nested = append(nested, node)
+				return false // its contents belong to ITS scope, not this one
+			}
+		case *ast.CallExpr:
+			for _, h := range reservedPolicyHelpers {
+				if isCallTo(node, h) {
+					guarded = true
+				}
+			}
+		case *ast.IndexExpr:
+			name := ""
+			switch x := node.X.(type) {
+			case *ast.Ident:
+				name = x.Name
+			case *ast.SelectorExpr:
+				name = x.Sel.Name
+			}
+			if name == "policyNames" || name == "PolicyNames" {
+				indexes = append(indexes, node)
+			}
+		}
+		return true
+	}
+	ast.Inspect(body, walk)
+
+	if !guarded {
+		for _, idx := range indexes {
+			*violations = append(*violations, fmt.Sprintf(
+				"%s:%d: %s indexes the policy-name map without consulting %v first",
+				path, fset.Position(idx.Pos()).Line, owner, reservedPolicyHelpers))
+		}
+	}
+	for i, fl := range nested {
+		scanPolicyNameScope(fmt.Sprintf("%s closure #%d", owner, i+1), fl.Body,
+			path, fset, violations)
+	}
+}
+
 // isCallTo reports whether call invokes a function whose (possibly
 // package-qualified) name is fn — `fn(...)`, `pkg.fn(...)` or `x.fn(...)`.
 func isCallTo(call *ast.CallExpr, fn string) bool {
@@ -145,7 +197,7 @@ func isCallTo(call *ast.CallExpr, fn string) bool {
 }
 func TestSessionRowSurfacesUseSessionPolicyName_4626(t *testing.T) {
 	var violations []string
-	scanned := 0
+	perPkg := map[string]int{}
 
 	for _, pkg := range sessionPolicyNameDisplayPackages {
 		root := filepath.Join("..", pkg)
@@ -156,62 +208,40 @@ func TestSessionRowSurfacesUseSessionPolicyName_4626(t *testing.T) {
 			if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 				return nil
 			}
-			scanned++
+			perPkg[pkg]++
 
 			fset := token.NewFileSet()
 			f, perr := parser.ParseFile(fset, path, nil, 0)
 			if perr != nil {
 				t.Fatalf("parse %s: %v", path, perr)
 			}
-			// Walk per FUNCTION, because there are two legitimate shapes and a
-			// blanket "no index" rule rejects one of them:
+			// Walk per innermost FUNCTION SCOPE — a FuncDecl body, or a nested
+			// FuncLit body as its own scope.
+			//
+			// Two legitimate shapes exist and a blanket "no index" rule rejects
+			// one of them:
 			//
 			//   (a) delegate wholly — SessionPolicyName(policyNames, id);
 			//   (b) take the reserved ids first, then index —
 			//       `if n, ok := ReservedPolicyName(id); ok { return n }`.
 			//
 			// (b) is what pkg/logging resolvePolicyName does, and it is correct:
-			// the index is only reached for an id that is not reserved. So an
-			// index is a violation only in a function that never consults a
-			// reserved-id helper at all.
+			// the index is only reached for an id that is not reserved.
+			//
+			// #6851: the scope MUST be the innermost function, not the enclosing
+			// FuncDecl. pkg/cli showFlowSession is 557 lines and contains BOTH
+			// render sites inside separate printV4/printV6 closures, so a
+			// FuncDecl-scoped rule marked the whole function guarded from either
+			// closure's helper call — reverting exactly one site left the
+			// sibling's call satisfying the rule and the canary green. Measured:
+			// reverting only the v6 site passed both this canary and the full
+			// pkg/cli suite. Per-FuncLit, each closure stands on its own.
 			for _, decl := range f.Decls {
 				fn, ok := decl.(*ast.FuncDecl)
 				if !ok || fn.Body == nil {
 					continue
 				}
-				var indexes []*ast.IndexExpr
-				guarded := false
-				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					switch node := n.(type) {
-					case *ast.CallExpr:
-						for _, h := range reservedPolicyHelpers {
-							if isCallTo(node, h) {
-								guarded = true
-							}
-						}
-					case *ast.IndexExpr:
-						name := ""
-						switch x := node.X.(type) {
-						case *ast.Ident:
-							name = x.Name
-						case *ast.SelectorExpr:
-							name = x.Sel.Name
-						}
-						if name == "policyNames" || name == "PolicyNames" {
-							indexes = append(indexes, node)
-						}
-					}
-					return true
-				})
-				if guarded {
-					continue
-				}
-				for _, idx := range indexes {
-					violations = append(violations, fmt.Sprintf(
-						"%s:%d: %s indexes the policy-name map without consulting %v first",
-						path, fset.Position(idx.Pos()).Line, fn.Name.Name,
-						reservedPolicyHelpers))
-				}
+				scanPolicyNameScope(fn.Name.Name, fn.Body, path, fset, &violations)
 			}
 			return nil
 		})
@@ -220,11 +250,39 @@ func TestSessionRowSurfacesUseSessionPolicyName_4626(t *testing.T) {
 		}
 	}
 
-	// Guard the guard: a walk that silently scanned nothing would pass forever.
-	if scanned < 20 {
-		t.Fatalf("canary scanned only %d files across %v; the walk is broken and this test "+
-			"is not checking anything", scanned, sessionPolicyNameDisplayPackages)
+	// Guard the guard, PER PACKAGE (#6851). A total-file floor does not bind
+	// its own dimension: re-adding the pkg/logging carve-out AND reverting
+	// ringbuf.go together kept the total above the threshold, so the very
+	// regression this list exists to prevent went green. Each package must
+	// contribute scanned files of its own.
+	// The list itself is the thing being guarded, so assert MEMBERSHIP before
+	// coverage (#6851). A per-package file floor only fires for a package that
+	// IS listed and scanned nothing — removing "logging" from the list removes
+	// it from the loop, so the floor never runs for it and the carve-out
+	// reinstates silently. Measured: re-adding the carve-out alone went GREEN
+	// against the floor alone.
+	required := map[string]bool{"cli": true, "api": true, "grpcapi": true, "logging": true}
+	for _, pkg := range sessionPolicyNameDisplayPackages {
+		delete(required, pkg)
 	}
+	for pkg := range required {
+		t.Fatalf("pkg/%s was dropped from sessionPolicyNameDisplayPackages. Every one of "+
+			"these packages resolves a policy_id into a NAME on an operator- or "+
+			"automation-visible surface; carving one out is how the seventh resolver "+
+			"survived round 1, and the carve-out that did it was justified by an argument "+
+			"the same change disproved", pkg)
+	}
+
+	for _, pkg := range sessionPolicyNameDisplayPackages {
+		if perPkg[pkg] == 0 {
+			t.Fatalf("canary scanned ZERO files in pkg/%s. Dropping a package from "+
+				"sessionPolicyNameDisplayPackages — or pointing it at a path that no "+
+				"longer exists — silently removes its coverage while the rest of the "+
+				"walk still passes; that is exactly how the seventh resolver survived",
+				pkg)
+		}
+	}
+
 	if len(violations) > 0 {
 		t.Errorf("session-row policy names must resolve through dataplane.SessionPolicyName, "+
 			"which reserves id 0 (no policy admitted the session) and the default-policy "+

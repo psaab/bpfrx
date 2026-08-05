@@ -694,9 +694,19 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 		// re-resolving an unreserved peer id against the LOCAL map would be a
 		// fresh misattribution rather than a fix.
 		//
-		// This is the single choke point for the fan-out: REST reaches the peer
-		// through this same in-process response (writeSessionList reads
-		// `pr.GetPeer()`), so guarding here covers all three surfaces once.
+		// This is the choke point for the gRPC and REST surfaces: REST reaches
+		// the peer through this same in-process response (writeSessionList
+		// reads `pr.GetPeer()`), so guarding here covers both at once.
+		//
+		// It does NOT cover the on-box interactive CLI (#6851). `pkg/cli`
+		// dials the peer daemon itself (session_filter.go dialPeer) and sets no
+		// IncludePeer, so it neither passes through here nor triggers the
+		// peer's own fan-out. That surface sanitizes at its own ingress —
+		// sanitizePeerSessionPolicyNames — for the same reason and via the same
+		// dataplane.PeerSessionPolicyName decision. Two call sites, one
+		// decision function: a third normalization rule is what would rot.
+		// The REMOTE cli binary is not a third case; it sets IncludePeer and
+		// arrives here.
 		attachPeerSessions(resp, peerResp)
 	}
 }
@@ -707,8 +717,13 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 // The ATTACH lives inside the sanitizing function deliberately. Keeping them as
 // two statements at the call site would let a future edit drop the guard while
 // leaving the attach — the failure mode this whole PR is about, silent and
-// green. Fused, dropping the guard means dropping the attach, which makes peer
-// sessions vanish from every surface and fails loudly.
+// green. Fused, the two cannot be separated by deleting a line.
+//
+// SCOPED (#6851 review): "fused" is a shape argument, not an enforced one.
+// `attachPeerSessions(resp, nil)` still compiles, still satisfies the
+// structural canary, drops every peer session from all three surfaces, and
+// passes the suite. So this reads as loud to an OPERATOR (peer rows vanish),
+// not to CI. Do not cite it as test-enforced.
 //
 // Residual, stated rather than implied: the tests below drive this function, so
 // they bind the sanitize-and-attach pair. They do NOT bind `fetchPeerSessions`'

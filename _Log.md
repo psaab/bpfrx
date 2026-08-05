@@ -1,3 +1,64 @@
+## 2026-08-05 — #6851 round 3: the on-box CLI bypasses the choke point; the canary could not see it
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: MAJOR — `pkg/cli` has its OWN peer dialer. `(c *CLI)
+  fetchPeerSessions` calls `c.dialPeer()` straight to the peer daemon and
+  sets no `IncludePeer`, so it passes through neither the grpcapi fan-out
+  that sanitizes reserved policy ids nor the peer's own fan-out; the
+  response was rendered verbatim. Against a pre-#4626 peer, `show security
+  flow session` in cluster mode printed that peer's first configured policy
+  for every reserved-id session — the defect this branch closes, on the
+  surface an operator actually types. The remote `cli` binary and REST are
+  unaffected.
+  Sanitized at the CLI's own ingress rather than at the render site, so a
+  future render site cannot reintroduce the bypass. Same decision function
+  (`dataplane.PeerSessionPolicyName`) as grpcapi — two call sites, one
+  decision, because the two surfaces reach the peer by different routes.
+  Two SHIPPED claims were falsified by this and are corrected rather than
+  left: `server_sessions.go` said guarding there "covers all three surfaces
+  once" (it covers gRPC and REST), and `docs/junos-cli-reference.md` said
+  cluster peer sessions "carry the same guarantee" (now true, and it names
+  both sanitization points).
+  Canary — my own instrument was the reason this was invisible. The
+  per-FUNCTION rule scoped to the enclosing `FuncDecl`, and both CLI render
+  sites live inside the SAME 557-line `showFlowSession`, in separate
+  `printV4`/`printV6` closures. Either closure's helper call marked the
+  whole function guarded, so reverting exactly one site passed. Narrowed to
+  the innermost function scope: a nested `FuncLit` is its own scope, a
+  parent's helper call does not guard a closure, and one closure does not
+  guard its sibling.
+  Also: the `scanned < 20` floor counted TOTAL files, so it never bound its
+  own dimension — removing `logging` from the package list removed it from
+  the loop entirely, and the floor never ran for it. Replaced with a
+  membership assertion on the list plus a per-package file floor.
+  Scoped honestly rather than fixed: `attachPeerSessions(resp, nil)`
+  compiles, satisfies the structural canary, drops every peer session, and
+  passes the suite — so the "fails loudly" line is an operator-visible
+  claim, not a test-enforced one, and now says so. Map aliasing
+  (`m := policyNames; m[id]`) still defeats the identifier-keyed rule;
+  recorded as a known limit.
+  Correcting my own round-2 report: I wrote that the sentinel-only revert
+  redded "pre-existing behavioural tests". Every failing assertion was
+  authored by this branch —
+  `default_policy_sentinel_3057_test.go` is a pre-existing FUNCTION whose
+  assertion this branch inverted, and the mutation SATISFIES what master
+  asserted. Inverting it was right; describing the result as independent
+  prior coverage was not. A pre-existing file is not a pre-existing
+  assertion.
+- **Validation**: four-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile. All four
+  RED. Two were GREEN on the first run and are the reason two more tests
+  exist: dropping the CLI sanitize CALL (my tests drove the sanitizer
+  directly and left its one call site unbound — the same unit-bound /
+  call-site-unbound gap as #5103), and re-adding the logging carve-out
+  (the per-package floor cannot fire for a package that is no longer in
+  the list). Reverting ONLY the v6 CLI site — measured invisible before
+  the narrowing — now REDs. Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/cli/session_filter.go`,
+  `pkg/cli/peer_policy_name_6851_test.go` (new),
+  `pkg/dataplane/policy_display_4626_test.go`,
+  `pkg/grpcapi/server_sessions.go`, `docs/junos-cli-reference.md`, `_Log.md`
+
 ## 2026-08-05 — #6851: close the two gaps the round-2 fix left in its own canary
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
