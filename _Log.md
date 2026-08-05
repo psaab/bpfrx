@@ -67741,3 +67741,42 @@ break — `go vet` confirmed passing under every revert.
   tests, rc 0 throughout.
 - **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 12:04 PDT
+- **Action**: #6669 round 17b — item 1 folded after the lead ruled on the
+  negative control: keep the consequence assertions, ADD an ownership one, so
+  the concurrency detection no longer rests on a timing boundary.
+- **Why it was added even though the test already reds.** The three variants DO
+  fail today, but on things that can quietly stop working. Variants 1 and 2 are
+  caught by the epoch assertion, which turns on `epochOrderable(n+1, now)` —
+  `bootEpochMaxSkew` is exactly `60*60*1e9` and the test raises the file by
+  exactly `time.Hour`, so whether it fires depends on the wall clock advancing
+  past the published epoch between the raise and the read. Widen the skew
+  constant or loosen that assertion and the concurrency detection disappears
+  from a test still named `IsCoalesced`. Variant 3 is caught only by the race
+  detector, which is not in every leg. The new assertion states the invariant
+  the running/pending design exists for — the request coalesces ONTO the
+  running worker, so exactly one worker means exactly one goroutine — and its
+  comment says explicitly that it is NOT redundant with the assertions below,
+  so a later cleanup cannot read it as duplication and delete it.
+- **THE THREE VARIANTS NOW FAIL ON THE OWNERSHIP ASSERTION ITSELF, not on the
+  old detection.** All three fail at `session_bind_6669_test.go:305` in 0.02 s
+  with "2 package goroutines in flight after the overlapping request, want
+  exactly 1", ahead of the pass-exists assertion (:320) and the epoch assertion
+  (:335), and without needing the race detector:
+  1. no-coalesce + ad-hoc concurrent second worker -> :305
+  2. no-coalesce + concurrent second worker through the FULL normal loop -> :305
+  3. coalescing intact + REDUNDANT concurrent worker -> :305
+  Previously variants 1 and 2 landed at the epoch assertion and 3 only as a
+  `DATA RACE`, so the ownership assertion is doing the work on its own rather
+  than riding what was already there. A baseline check (exactly 1 goroutine with
+  pass 1 parked, :276) keeps the delta meaningful, since a count is only
+  evidence against a known starting point.
+- **Existing assertions kept**, per the ruling — the consequence assertions are
+  still worth having, they simply are not the load-bearing ones for ownership.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 18.4 s. The new assertion
+  held over 20 consecutive runs before mutation, and `heartbeat_epoch.go` was
+  confirmed identical to HEAD after each of the three restores. Flake: three
+  runs at `-count=5` across the four affected tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md

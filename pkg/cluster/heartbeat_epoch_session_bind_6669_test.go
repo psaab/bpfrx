@@ -263,15 +263,51 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 		unparkPass2()
 	})
 
+	// Baseline before any worker exists, for the ownership assertion below.
+	goBase := clusterGoroutines()
+
 	m.initHeartbeatEpochState()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("pass 1 never reached the lock")
 	}
+	if got := clusterGoroutines() - goBase; got != 1 {
+		t.Fatalf("%d package goroutines in flight with pass 1 parked, want exactly 1; the "+
+			"ownership assertion below is only meaningful against a known baseline", got)
+	}
 
 	// The request that must not be lost, made while pass 1 is in flight.
 	m.refreshBootEpoch()
+
+	// OWNERSHIP, ASSERTED DIRECTLY — and NOT redundant with the assertions that
+	// follow, however much it may look it.
+	//
+	// Everything below checks CONSEQUENCES of coalescing: that a second pass
+	// happens at all, and that the epoch chains from the raised file. Those do
+	// catch a concurrent second worker today — measured, three ways — but they
+	// catch it INCIDENTALLY. The epoch assertion turns on
+	// epochOrderable(n+1, now); bootEpochMaxSkew is exactly 60*60*1e9 and this
+	// test raises the file by exactly time.Hour, so whether it fires depends on
+	// the wall clock advancing past the published epoch between the raise and
+	// the worker's read. That is a scheduler-timing boundary. The day someone
+	// widens the skew constant or loosens that assertion, the concurrency
+	// detection vanishes silently from a test still named IsCoalesced. The third
+	// variant is caught only by the race detector, which is not present in every
+	// leg someone might run.
+	//
+	// This line is the only one that names the invariant the running/pending bit
+	// design exists for: the request COALESCES ONTO THE RUNNING WORKER. Exactly
+	// one worker, so exactly one goroutine — a request that spawned its own,
+	// concurrently or redundantly, adds one here and is caught on an ownership
+	// statement rather than on arithmetic. Keep both.
+	if got := clusterGoroutines() - goBase; got != 1 {
+		t.Fatalf("%d package goroutines in flight after the overlapping request, want exactly "+
+			"1: the request did not coalesce onto the worker already running, it spawned "+
+			"another. The flock still serialises their writes, so the epoch assertions "+
+			"further down can miss this — see the comment above", got)
+	}
+
 	unparkPass1()
 
 	// Pass 1 runs to completion. Pass 2 must exist at all — that is the fix.
