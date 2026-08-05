@@ -1,3 +1,44 @@
+## 2026-08-05 — #4785: the new ACCEPTANCE was argued from the same incomplete fact as the old rejection
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: Round 3 accepted `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel
+  mode gre` on the stated ground that "nothing dead reaches the
+  dataplane". Verified firsthand that the ground is incomplete:
+  `collectAppliedTunnels` appends the interface-level record whenever
+  `Source != ""` (or mode is wireguard), independent of mode and of whether
+  any endpoint is emitted for it, and the routing manager creates a
+  mode-INDEPENDENT Tuntap anchor. So emission publishes only
+  `ip-0/0/0.1` gre while the box still gets an `ip-0-0-0` device with
+  nothing routed through it.
+  That is the same defect class as the round-2 rejection, one round later
+  and with the opposite verdict: a verdict argued from a fact that does not
+  cover the anchor. The sentence would have read as settled to the next
+  auditor.
+  Resolved by ADVISORY, not by widening the strict gate. The strict gate
+  keeps its single-SSOT property — "reject exactly the endpoints emission
+  would emit as IPIP" — because keying it on `collectAppliedTunnels` would
+  reintroduce the second hand-rolled model that B2 was about. The new
+  `ipipAnchorOnlyWarnings` reports an interface-level ipip record that
+  creates an anchor but has no emitted endpoint. It detects that by POINTER
+  identity against the emitter's own output rather than re-deriving which
+  records emit, so it adds no competing model; it screens on
+  `Source != ""` to match the anchor-creation condition exactly, so a
+  record that creates nothing is not reported.
+  Non-blocking on purpose: the anchor carries no traffic but breaks
+  nothing, the per-unit tunnel is the likely intent, and rejecting would
+  re-import the over-rejection this gate has already swung through twice.
+  The acceptance test now asserts BOTH halves — the commit succeeds AND
+  the alarm names the orphan device — and its comment records why the
+  original justification was incomplete rather than quietly replacing it.
+- **Validation**: three targeted mutations, snapshot-and-write-back with
+  byte-for-byte verify, each required to compile. All RED: dropping the
+  advisory reds the acceptance test; dropping the `Source` screen reds the
+  no-anchor negative control; dropping the emitted-pointer check reds the
+  already-reported control plus two others. Full
+  `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`,
+  `pkg/config/ipip_tunnel_reject_4785_test.go`, `_Log.md`
+
 ## 2026-08-05 — #4785 half 1 round 3: gate on EMITTED endpoints; the round-2 shadowing fix was an under-rejection
 
 - **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)

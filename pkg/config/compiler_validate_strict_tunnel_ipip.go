@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"sort"
 )
 
 // ipipTunnelSite is one emitted tunnel endpoint whose mode is ipip, carrying
@@ -91,15 +92,79 @@ func ipipUnimplementedText(where string) string {
 // It reports EVERY dead endpoint, not just the first: an operator who fixes one
 // should not discover the next only on the following commit (#4785 re-gate N5).
 func validateIpipTunnelDeadWarning(cfg *Config) []string {
-	sites := effectiveIpipTunnelSites(cfg)
-	if len(sites) == 0 {
-		return nil
-	}
-	warnings := make([]string, 0, len(sites))
-	for _, s := range sites {
+	var warnings []string
+	for _, s := range effectiveIpipTunnelSites(cfg) {
 		warnings = append(warnings, ipipUnimplementedText(s.label))
 	}
-	return warnings
+	return append(warnings, ipipAnchorOnlyWarnings(cfg)...)
+}
+
+// ipipAnchorOnlyWarnings reports an interface-level ipip tunnel that creates a
+// kernel ANCHOR but has no emitted endpoint (#4785 re-gate follow-up).
+//
+// The strict gate deliberately keys on emitted endpoints only, and that is the
+// right property for it — but "no emitted endpoint" is not the same as "nothing
+// exists on the box". collectAppliedTunnels appends the interface-level record
+// whenever `Source != ""` (or the mode is wireguard) and hands it to the
+// routing manager, which creates a mode-INDEPENDENT Tuntap anchor. So for
+//
+//	set interfaces ip-0/0/0 tunnel source 10.0.0.1
+//	set interfaces ip-0/0/0 tunnel destination 10.0.0.2
+//	set interfaces ip-0/0/0 unit 1 tunnel mode gre
+//
+// emission publishes only `ip-0/0/0.1` gre — nothing dead reaches the dataplane
+// snapshot — while the box still gets an `ip-0-0-0` device with nothing routed
+// through it. An earlier round rejected that config, then a later one accepted
+// it "because nothing dead reaches the dataplane": both verdicts were argued
+// from a fact that did not cover the anchor.
+//
+// This is an ADVISORY, not a rejection, deliberately. The anchor carries no
+// traffic but breaks nothing, the operator may well have meant the unit-level
+// tunnel, and blocking the commit would re-import the over-rejection this gate
+// has already swung through twice. An alarm names it; a commit does not stop
+// for it.
+//
+// Detection is by POINTER identity against the emitter's output rather than by
+// re-deriving which records emit — that keeps the single-SSOT property the
+// strict gate has and avoids a second hand-rolled model of emission.
+func ipipAnchorOnlyWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	emitted := make(map[*TunnelConfig]bool)
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		emitted[ep.Tunnel] = true
+	}
+
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var out []string
+	for _, name := range names {
+		iface := cfg.Interfaces.Interfaces[name]
+		if iface == nil || iface.Tunnel == nil {
+			continue
+		}
+		if iface.Tunnel.Mode != "ipip" || emitted[iface.Tunnel] {
+			continue
+		}
+		// The anchor-creation screen in collectAppliedTunnels. A record that
+		// fails it creates nothing, so there is nothing to warn about.
+		if iface.Tunnel.Source == "" {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"interfaces %q tunnel mode ipip: no tunnel endpoint is emitted for the "+
+				"interface-level stanza (every unit overrides it), but it still creates a "+
+				"kernel anchor device %q with nothing routed through it — an interface an "+
+				"operator can see that carries no traffic (#4785). Remove the "+
+				"interface-level `tunnel` stanza if the per-unit tunnels are the intent.",
+			name, iface.Tunnel.Name))
+	}
+	return out
 }
 
 // validateIpipTunnelUnimplementedStrict hard-rejects a config that would emit a

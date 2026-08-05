@@ -342,17 +342,25 @@ func TestIpipTunnelInheritedByTunnellessUnitIsReported_4785(t *testing.T) {
 	}
 }
 
-// TestIpipTunnelUnitOverrideEmitsNoIpipEndpoint_4785 records the semantics the
-// emitter-based gate CORRECTS. When an interface has units, the emitter emits
-// per-unit endpoints only — so `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel mode
-// gre` with no other unit publishes exactly one endpoint, `ip-0/0/0.1` gre. No
-// ipip endpoint reaches the dataplane, so there is nothing dead to reject.
+// TestIpipTunnelUnitOverrideCommitsButRaisesAnchorAlarm_4785 records the
+// semantics the emitter-based gate corrects, AND the part the first version of
+// this test got wrong.
 //
-// The previous round rejected this config. That rejection was defensible on a
-// kernel-anchor argument but not for the reason its error text gave, and it is
-// not what this gate claims to police: the claim is "reject exactly the
-// endpoints emission would emit as IPIP".
-func TestIpipTunnelUnitOverrideEmitsNoIpipEndpoint_4785(t *testing.T) {
+// When an interface has units, emission publishes per-unit endpoints only — so
+// `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel mode gre` publishes exactly one
+// endpoint, `ip-0/0/0.1` gre. No ipip endpoint reaches the dataplane, so the
+// strict gate has nothing to reject and the config COMMITS.
+//
+// But "nothing dead reaches the dataplane" is a statement about the SNAPSHOT,
+// not about the box. collectAppliedTunnels appends the interface-level record
+// whenever Source != "" and the routing manager creates a mode-independent
+// Tuntap anchor, so `ip-0-0-0` IS created with nothing routed through it. The
+// acceptance was originally justified by a fact that did not cover that — the
+// same incompleteness as the rejection it replaced, one round apart.
+//
+// Resolution: commit (the anchor breaks nothing and the unit tunnel is the
+// likely intent) and raise a standing ADVISORY naming the orphan device.
+func TestIpipTunnelUnitOverrideCommitsButRaisesAnchorAlarm_4785(t *testing.T) {
 	tree := ipipTree(t,
 		"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
 		"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
@@ -365,13 +373,64 @@ func TestIpipTunnelUnitOverrideEmitsNoIpipEndpoint_4785(t *testing.T) {
 	}
 	for _, ep := range EmitTunnelEndpointNames(cfg) {
 		if ep.Tunnel.Mode == "ipip" {
-			t.Fatalf("premise broken: the emitter published an ipip endpoint %q for a "+
-				"unit-override config; this test's whole point is that it does not", ep.Name)
+			t.Fatalf("premise broken: the emitter published an ipip endpoint %q; this "+
+				"test's point is that it does not", ep.Name)
 		}
 	}
 	if _, err := CompileConfig(tree); err != nil {
-		t.Errorf("no ipip endpoint is emitted, so nothing is dead and the config must "+
+		t.Errorf("no ipip endpoint is emitted, so the strict gate must not block the "+
 			"commit: %v", err)
+	}
+
+	// ...but the orphan anchor must be named on the alarm surface.
+	var anchorWarned bool
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "kernel anchor device") && strings.Contains(w, "ip-0-0-0") {
+			anchorWarned = true
+		}
+	}
+	if !anchorWarned {
+		t.Errorf("the interface-level ipip stanza emits no endpoint but still creates the "+
+			"anchor device ip-0-0-0 with nothing routed through it; `show system alarms` "+
+			"must name it. warnings: %v", ValidateConfig(cfg))
+	}
+}
+
+// TestIpipAnchorAlarmDoesNotOverreach_4785 is the advisory's negative control.
+// The anchor warning must fire ONLY for an interface-level ipip record that
+// emits nothing yet still creates a device — not for one that is already
+// reported as a dead endpoint, not for GRE, and not for a record that creates
+// no anchor at all because it has no source.
+func TestIpipAnchorAlarmDoesNotOverreach_4785(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmds []string
+	}{
+		{"gre parent with a unit override", []string{
+			"set interfaces gr-0/0/0 tunnel source 10.0.0.1",
+			"set interfaces gr-0/0/0 tunnel destination 10.0.0.2",
+			"set interfaces gr-0/0/0 unit 1 tunnel mode gre",
+		}},
+		{"ipip parent that IS emitted (no units)", []string{
+			"set interfaces ip-0/0/0 tunnel source 10.0.0.1",
+			"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
+		}},
+		{"ipip parent with no source creates no anchor", []string{
+			"set interfaces ip-0/0/0 tunnel destination 10.0.0.2",
+			"set interfaces ip-0/0/0 unit 1 tunnel mode gre",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(ipipTree(t, tc.cmds...))
+			if err != nil {
+				t.Fatalf("tolerant compile: %v", err)
+			}
+			for _, w := range ValidateConfig(cfg) {
+				if strings.Contains(w, "kernel anchor device") {
+					t.Errorf("anchor advisory fired where no orphan anchor exists: %q", w)
+				}
+			}
+		})
 	}
 }
 
