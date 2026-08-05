@@ -301,7 +301,40 @@ type SessionSync struct {
 	mu        sync.Mutex
 	conn0     net.Conn
 	conn1     net.Conn
-	writeMu   sync.Mutex
+	// peerIncarnation identifies which run of the peer process the currently
+	// installed connections belong to, and conn0Gen/conn1Gen record the
+	// incarnation each slot's connection was installed under. All three are
+	// guarded by mu, alongside the conn0/conn1 they describe.
+	//
+	// #5718 C01a (fold F1b): slot membership alone cannot answer "does this
+	// connection speak for the CURRENT peer incarnation?" once there are TWO
+	// fabric slots. A peer that reboots hard sends no FIN/RST, so BOTH of its
+	// connections stay ESTABLISHED on our side; its new process dials in and
+	// supersedes one slot, and the OTHER slot still holds the dead
+	// incarnation's connection. An `s.conn0 == conn || s.conn1 == conn` test
+	// accepts an in-flight heartbeat-ack off that survivor and re-arms the
+	// capability the supersession just cleared — the previous incarnation
+	// enforced against the current one, which is the whole defect. Stamping
+	// each slot at install and comparing the stamp to peerIncarnation binds an
+	// ack to the incarnation it belongs to rather than to slot membership.
+	//
+	// The counter advances when a supersession replaces a connection that
+	// belonged to the CURRENT incarnation — evidence a new peer process took
+	// over. A supersession that merely evicts an ALREADY-STALE connection (the
+	// new incarnation reclaiming the second slot) is not a further incarnation
+	// change and must not advance it, or the connection that legitimately
+	// proved the capability would be stranded stale and could never re-arm.
+	//
+	// Residual, deliberately not closed here: a THIRD incarnation whose first
+	// dial lands on the slot still holding a stale connection is stamped into
+	// the current incarnation, because nothing on the wire distinguishes it.
+	// That is the same missing peer boot-incarnation field #5480 already tracks
+	// and defers ("the sync handshake carries no peer-cold / boot-incarnation /
+	// table-count signal"); closing it is a wire change, not a local one.
+	peerIncarnation uint64
+	conn0Gen        uint64
+	conn1Gen        uint64
+	writeMu         sync.Mutex
 	// authProvider supplies the shared control-link PSK for #4107 F23
 	// session-sync stream auth. Optional: nil (or an empty key) ⇒ legacy
 	// unauthenticated stream.

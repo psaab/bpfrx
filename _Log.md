@@ -68274,3 +68274,43 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
   pkg/routing/routing.go, pkg/routing/close_partial_manager_5718_test.go,
   pkg/routing/README.md, _Log.md
+- **Timestamp**: 2026-08-05 17:40
+- **Action**: #6825 review fold r2 (#5718 C-HA) — one MAJOR and two
+  test-acceptance findings against `b11e417f5`. **MAJOR (F1b)**: r1 closed the
+  same-slot supersession edge but not the TWO-FABRIC one. `noteHeartbeatAck`
+  accepted an ack from EITHER slot (`s.conn0 == conn || s.conn1 == conn`) while
+  the supersession clear was scoped to the slot being superseded, so after a
+  peer reboot — no FIN/RST, both sockets still ESTABLISHED, the new process
+  supersedes only the slot it dialled — an in-flight ack off the survivor in
+  the OTHER slot re-armed the capability microseconds after the clear. Same
+  defect one level up. Fixed with a per-slot incarnation stamp: `SessionSync`
+  gains `peerIncarnation` + `conn0Gen`/`conn1Gen` under `mu`, `installConn`
+  stamps each slot at install, and acceptance compares the stamp instead of
+  testing membership. The counter advances only when the SUPERSEDED connection
+  belonged to the current incarnation — evicting an already-stale one is the
+  new incarnation reclaiming its second slot, and advancing there would strand
+  the connection that proved the capability at a stale stamp, permanently
+  disarming both enforcement paths. Residual (a third incarnation whose first
+  dial lands on the stale slot) is the missing peer boot-incarnation wire field
+  #5480 already defers. **Test findings**: the F3 AST guard counted
+  `cfg.Workers` occurrences, which `w := cfg.Workers` defeats with a single
+  read — replaced with a data-flow guard binding the raw value as the
+  `planUserspaceWorkers` argument, one call bound to a name, both ctrl fields
+  and the zero-init bound read from that plan, and no direct clamp-helper call.
+  The rebuilt close test accepted two reversals: closing the handle BEFORE
+  draining keepalives (final state is identical either way) and swapping in a
+  fresh handle while leaking the original. The keepalive goroutine now records
+  whether the handle was still open at the moment it was cancelled — race-free
+  and deterministic in both orderings because `stopAll` blocks on
+  `<-runner.done` — and the original handle pointer is captured up front so
+  identity and closure are both asserted on it. Ten mutations, all `go vet`
+  clean; one (R3) came back GREEN and exposed that the reclaim test only
+  exercised the fabric-1 arm of a per-fabric switch, so both incarnation tests
+  now run in both fabric orderings. A negative control confirms adding
+  `d.wasDisconnected` back to the install clear is INERT — nothing observable
+  rejects it — so a premise test pins the reason instead: every way the
+  registry empties leaves the capability cleared.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
+  pkg/routing/close_partial_manager_5718_test.go, _Log.md

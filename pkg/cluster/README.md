@@ -1451,11 +1451,49 @@ outside the monitor loop:
 
   **Only a currently-installed connection may latch it (#5718 fold F1).**
   `handleMessage` routes `syncMsgHeartbeatAck` through `noteHeartbeatAck`,
-  which tests fabric-slot membership and stores under `s.mu` — atomic with
-  `installConn`'s clear. Without that ordering an ack already read off the
-  superseded connection re-arms the latch for the incoming incarnation right
-  after the clear, restoring the exact state the clear removed. It also means
-  the pre-install handshake-pending frame cannot arm an enforcement path: an
-  ack is never a legitimate FIRST frame, because we only send
-  `syncMsgHeartbeat` after a read deadline elapses on an established
-  connection.
+  which stores under `s.mu` — atomic with `installConn`'s clear. Without that
+  ordering an ack already read off the superseded connection re-arms the latch
+  for the incoming incarnation right after the clear, restoring the exact state
+  the clear removed. It also means the pre-install handshake-pending frame
+  cannot arm an enforcement path: an ack is never a legitimate FIRST frame,
+  because we only send `syncMsgHeartbeat` after a read deadline elapses on an
+  established connection.
+
+  **Slot membership is NOT sufficient — the slot carries an incarnation stamp
+  (#5718 fold F1b).** With TWO fabric slots, `s.conn0 == conn || s.conn1 ==
+  conn` asks only whether a connection sits in *either* slot, and after a peer
+  reboot the dead incarnation still occupies one of them: no FIN/RST means both
+  of its sockets stay ESTABLISHED while the new process supersedes just the
+  slot it dialled. An in-flight ack off that survivor passes a membership test
+  and re-arms the capability the supersession cleared — the previous
+  incarnation enforced against the current one, the same defect one level up.
+  `SessionSync` therefore carries `peerIncarnation` plus per-slot `conn0Gen` /
+  `conn1Gen` (all under `mu`): `installConn` stamps each slot at install, and
+  `connIsCurrentIncarnationLocked` accepts an ack only when the slot's stamp
+  equals `peerIncarnation`.
+
+  The counter advances when a supersession replaces a connection that belonged
+  to the CURRENT incarnation. A supersession that merely evicts an
+  ALREADY-STALE connection is the new incarnation reclaiming its second slot,
+  not a further change: advancing there would strand the connection that
+  legitimately proved the capability at a stale stamp, permanently disarming
+  both enforcement paths for the life of that connection. Both directions, and
+  both fabric orderings, are pinned in
+  `heartbeat_ack_incarnation_5718_test.go` — the classification and the
+  acceptance test each branch per fabric, so a single-fabric fixture would
+  leave one arm of each switch unbound.
+
+  Residual, deliberately open: a THIRD incarnation whose first dial lands on
+  the slot still holding a stale connection is stamped into the current
+  incarnation, because nothing on the wire distinguishes it. That is the same
+  missing peer boot-incarnation field #5480 already tracks and defers ("the
+  sync handshake carries no peer-cold / boot-incarnation / table-count
+  signal"); closing it is a wire change, not a local one.
+
+  `installConn` does NOT clear on the full-disconnect edge, because reaching an
+  empty registry implies `handleDisconnect`'s clear already ran —
+  `conn0`/`conn1` are nilled nowhere else. Adding the condition back is inert
+  rather than wrong, so no behavioural test can reject it; what the tests pin
+  instead is the PREMISE, that every way the registry empties leaves the
+  capability cleared. If a future teardown path empties a slot without
+  clearing, that guard fails and this narrowing must be revisited.

@@ -29,17 +29,45 @@ func (closeGuardRouteLister) RouteList(netlink.Link, int) ([]netlink.Route, erro
 func (closeGuardRouteLister) LinkByIndex(int) (netlink.Link, error)                { return nil, nil }
 func (closeGuardRouteLister) LinkByName(string) (netlink.Link, error)              { return nil, nil }
 
+// liveKeepalive is the observable state of a real keepalive goroutine planted
+// in the tunnel domain.
+type liveKeepalive struct {
+	done  <-chan struct{}
+	ticks atomic.Int64
+	// sawDrain records that the goroutine observed its cancellation, so a
+	// closed `done` cannot be satisfied by a goroutine that exited some other
+	// way.
+	sawDrain atomic.Bool
+	// handleOpenAtDrain records whether the shared netlink handle was still
+	// open at the moment the goroutine was cancelled. This is what binds the
+	// #848 ORDERING: stopAll drains BEFORE Close touches the handle, so a
+	// keepalive still in flight must never see a closed handle.
+	handleOpenAtDrain atomic.Bool
+}
+
 // installLiveKeepalive wires a REAL running keepalive goroutine into the
-// tunnel domain and returns its done channel plus a tick counter.
+// tunnel domain.
 //
 // The goroutine has the shape stopAllKeepalivesLocked depends on: it exits on
 // ctx.Done and closes `done` on the way out, so `<-runner.done` returning is
 // proof the goroutine actually left — not merely that cancel() was called.
-func installLiveKeepalive(t *testing.T, m *Manager, name string) (done <-chan struct{}, ticks *atomic.Int64) {
+//
+// On cancellation it touches the shared netlink handle exactly as a real
+// keepalive tick would, and records whether the handle was still usable. That
+// read is race-free in BOTH orderings and deterministic in both, because
+// stopAll blocks on `<-runner.done`:
+//
+//	drain-then-close: cancel -> this read -> close(done) -> Close() the handle
+//	close-then-drain: Close() the handle -> cancel -> this read
+//
+// so the context and the done channel supply the happens-before edge either
+// way, and the recorded answer differs between them.
+func installLiveKeepalive(t *testing.T, m *Manager, name string) *liveKeepalive {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
-	var counter atomic.Int64
+	ka := &liveKeepalive{done: doneCh}
+	handle := m.nlHandle
 
 	go func() {
 		defer close(doneCh)
@@ -48,9 +76,16 @@ func installLiveKeepalive(t *testing.T, m *Manager, name string) (done <-chan st
 		for {
 			select {
 			case <-ctx.Done():
+				if handle != nil {
+					socks, err := handle.GetSocketReceiveBufferSize()
+					ka.handleOpenAtDrain.Store(err == nil && len(socks) > 0)
+				} else {
+					ka.handleOpenAtDrain.Store(true)
+				}
+				ka.sawDrain.Store(true)
 				return
 			case <-tk.C:
-				counter.Add(1)
+				ka.ticks.Add(1)
 			}
 		}
 	}()
@@ -71,13 +106,31 @@ func installLiveKeepalive(t *testing.T, m *Manager, name string) (done <-chan st
 	// Prove it is genuinely running before Close is asked to stop it, so the
 	// post-Close assertion is not satisfied by a goroutine that never started.
 	deadline := time.Now().Add(2 * time.Second)
-	for counter.Load() == 0 {
+	for ka.ticks.Load() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("setup: the keepalive goroutine never ran")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	return doneCh, &counter
+	return ka
+}
+
+// assertDrained checks that Close cancelled the runner AND waited for it.
+func (ka *liveKeepalive) assertDrained(t *testing.T, what string) {
+	t.Helper()
+	select {
+	case <-ka.done:
+	default:
+		t.Fatalf("%s: Close returned without draining the keepalive runner (goroutine still "+
+			"running after %d ticks). stopAll must cancel it AND wait for it to exit before "+
+			"the netlink handle is closed, or an in-flight tick uses the closed handle (#848)",
+			what, ka.ticks.Load())
+	}
+	if !ka.sawDrain.Load() {
+		t.Fatalf("%s: the keepalive goroutine's done channel closed without it observing "+
+			"cancellation — it exited some other way, so nothing here proves stopAll ran",
+			what)
+	}
 }
 
 // TestCloseReleasesLiveHandleAndKeepalives_5718 is the positive half of the
@@ -94,9 +147,14 @@ func installLiveKeepalive(t *testing.T, m *Manager, name string) (done <-chan st
 //     and nils the map, so GetSocketReceiveBufferSize reports one entry per
 //     live socket before and none after. (A post-close LinkList is NOT an
 //     observable — the library silently falls back to a package-level socket.)
-//
-// #848 is the reason the order matters: stopAll drains BEFORE the handle
-// closes, so no in-flight keepalive tick can use-after-close it.
+//   - the ORDER: stopAll drains BEFORE the handle closes (#848), so an
+//     in-flight keepalive tick can never use-after-close it. Final state alone
+//     is identical under either order, so the ordering is observed from
+//     INSIDE the keepalive goroutine at the moment it is cancelled.
+//   - the IDENTITY: the handle that gets closed is the one the Manager was
+//     using. Asserting on m.nlHandle after Close would be satisfied by
+//     swapping in a fresh empty handle while leaking the original, so the
+//     original pointer is captured up front and both checks run against it.
 func TestCloseReleasesLiveHandleAndKeepalives_5718(t *testing.T) {
 	m, err := New()
 	if err != nil {
@@ -108,8 +166,11 @@ func TestCloseReleasesLiveHandleAndKeepalives_5718(t *testing.T) {
 	if m.tunnel == nil {
 		t.Fatal("setup: New() must wire the tunnel domain")
 	}
+	// Capture the handle the Manager is actually using, before Close can
+	// replace it.
+	origHandle := m.nlHandle
 
-	socketsBefore, err := m.nlHandle.GetSocketReceiveBufferSize()
+	socketsBefore, err := origHandle.GetSocketReceiveBufferSize()
 	if err != nil {
 		t.Fatalf("setup: reading the handle's sockets: %v", err)
 	}
@@ -117,25 +178,28 @@ func TestCloseReleasesLiveHandleAndKeepalives_5718(t *testing.T) {
 		t.Fatal("setup: the handle must own at least one live socket before Close")
 	}
 
-	done, ticks := installLiveKeepalive(t, m, "gr-close-5718")
+	ka := installLiveKeepalive(t, m, "gr-close-5718")
 
 	if err := m.Close(); err != nil {
 		t.Fatalf("Close on a fully wired Manager: %v", err)
 	}
 
-	// 1) The keepalive goroutine is gone. Close blocks on `<-runner.done`, so
-	//    by the time it returns this channel is closed — unless Close skipped
-	//    the drain entirely.
-	select {
-	case <-done:
-	default:
-		t.Fatalf("Close returned without draining the keepalive runner (goroutine still "+
-			"running after %d ticks). stopAll must cancel it AND wait for it to exit "+
-			"before the netlink handle is closed, or an in-flight tick uses the closed "+
-			"handle (#848)", ticks.Load())
+	// 1) The keepalive goroutine is gone, and it left by being cancelled.
+	ka.assertDrained(t, "fully wired Manager")
+
+	// 2) It was cancelled while the handle was still usable — the #848
+	//    ordering. Under the reverse order (close the handle, then drain) the
+	//    goroutine is still live when the sockets vanish, which is precisely
+	//    the use-after-close this ordering exists to prevent.
+	if !ka.handleOpenAtDrain.Load() {
+		t.Fatal("Close closed the netlink handle BEFORE draining the keepalive runner: the " +
+			"still-running goroutine observed a handle with no sockets. stopAll must drain " +
+			"first, or an in-flight keepalive tick touches a closed handle (#848). Final " +
+			"state is identical under either order, so only the goroutine's own view of the " +
+			"handle at cancellation time can tell them apart")
 	}
 
-	// 2) The runner is removed from the map, not left as a cancelled corpse
+	// 3) The runner is removed from the map, not left as a cancelled corpse
 	//    that GetKeepaliveState would still report.
 	m.tunnel.mu.Lock()
 	remaining := len(m.tunnel.keepalives)
@@ -144,14 +208,23 @@ func TestCloseReleasesLiveHandleAndKeepalives_5718(t *testing.T) {
 		t.Fatalf("Close left %d keepalive runner(s) registered", remaining)
 	}
 
-	// 3) The netlink handle's sockets are released.
-	socketsAfter, err := m.nlHandle.GetSocketReceiveBufferSize()
+	// 4) Close released the ORIGINAL handle rather than swapping in a fresh
+	//    one. Both halves matter: the identity check catches the swap, and the
+	//    socket check on the captured pointer catches the leak it would hide.
+	if m.nlHandle != origHandle {
+		t.Fatal("Close replaced m.nlHandle instead of closing it. A fresh handle satisfies " +
+			"any socket-count assertion made against m.nlHandle after the fact while the " +
+			"original's sockets stay open — the Manager is the sole owner and must release " +
+			"the handle it was using")
+	}
+	socketsAfter, err := origHandle.GetSocketReceiveBufferSize()
 	if err != nil {
 		t.Fatalf("reading the handle's sockets after Close: %v", err)
 	}
 	if len(socketsAfter) != 0 {
-		t.Fatalf("Close left %d of %d netlink socket(s) open: the Manager is the sole "+
-			"owner of the handle and must release it", len(socketsAfter), len(socketsBefore))
+		t.Fatalf("Close left %d of %d netlink socket(s) open on the handle the Manager was "+
+			"using: the Manager is the sole owner and must release it",
+			len(socketsAfter), len(socketsBefore))
 	}
 }
 
@@ -209,18 +282,12 @@ func TestClosePartialTestManagersDoesNotPanic_5718(t *testing.T) {
 		if m.tunnel == nil {
 			t.Fatal("setup: NewManagerWithLinkOpsForTest must wire the tunnel domain")
 		}
-		done, ticks := installLiveKeepalive(t, m, "gr-linkops-5718")
+		ka := installLiveKeepalive(t, m, "gr-linkops-5718")
 
 		if err := m.Close(); err != nil {
 			t.Fatalf("Close on a link-ops test manager: %v", err)
 		}
-		select {
-		case <-done:
-		default:
-			t.Fatalf("Close on a tunnel-wired partial Manager must still drain the "+
-				"keepalive runner; the goroutine is still running after %d ticks",
-				ticks.Load())
-		}
+		ka.assertDrained(t, "tunnel-wired partial Manager")
 		m.tunnel.mu.Lock()
 		remaining := len(m.tunnel.keepalives)
 		m.tunnel.mu.Unlock()

@@ -56,14 +56,43 @@ func (s *SessionSync) getActiveConn() net.Conn {
 // legitimately be a peer's FIRST frame (we only send syncMsgHeartbeat after a
 // read deadline elapses on an established connection), so an unsolicited ack
 // arriving before the connection is wired in must not arm an enforcement path.
+//
+// #5718 fold F1b: being installed is NOT sufficient — the slot's incarnation
+// stamp must also be current. `s.conn0 == conn || s.conn1 == conn` asks only
+// whether the connection sits in EITHER slot, and with two fabric links the
+// rebooted peer's other connection is still sitting in the other one: a hard
+// reboot sends no FIN/RST, so both of its sockets stay ESTABLISHED while its
+// new process supersedes just the slot it dialled. A membership-only test
+// accepts an in-flight ack off that survivor and re-arms the capability the
+// supersession cleared — the previous incarnation enforced against the current
+// one, the exact defect C01a exists to prevent, one level up. Comparing the
+// slot's stamp to peerIncarnation binds the ack to the incarnation that owns
+// the connection rather than to slot membership.
 func (s *SessionSync) noteHeartbeatAck(conn net.Conn) {
 	if conn == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.conn0 == conn || s.conn1 == conn {
-		s.peerHeartbeatAckEver.Store(true)
+	if !s.connIsCurrentIncarnationLocked(conn) {
+		return
+	}
+	s.peerHeartbeatAckEver.Store(true)
+}
+
+// connIsCurrentIncarnationLocked reports whether conn is installed in a fabric
+// slot AND that slot was stamped by the incarnation currently in force. The
+// caller must hold s.mu.
+func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
+	switch {
+	case conn == nil:
+		return false
+	case s.conn0 == conn:
+		return s.conn0Gen == s.peerIncarnation
+	case s.conn1 == conn:
+		return s.conn1Gen == s.peerIncarnation
+	default:
+		return false
 	}
 }
 func connRemoteAddrString(conn net.Conn) (remote string) {
@@ -274,21 +303,27 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	}
 	d.hadConn0 = s.conn0 != nil
 	d.hadConn1 = s.conn1 != nil
-	// #5718 C01a (fold F1): a SUPERSESSION starts a new peer incarnation just
-	// as much as a full-disconnect -> connect edge does, and it is the edge
-	// handleDisconnect structurally cannot see. Record it here, where the slot
-	// still holds the outgoing connection.
-	superseded := false
+	// #5718 C01a (fold F1): a SUPERSESSION is the incarnation edge
+	// handleDisconnect structurally cannot see. Classify it here, where the
+	// slot still holds the outgoing connection AND its incarnation stamp.
+	//
+	// supersededCurrent means the replaced connection belonged to the CURRENT
+	// incarnation — evidence that a new peer process took over. Replacing an
+	// ALREADY-STALE connection is the new incarnation reclaiming its second
+	// slot, not a further incarnation change (fold F1b): treating it as one
+	// would strand the connection that legitimately proved the capability at a
+	// stale stamp, so it could never re-arm.
+	supersededCurrent := false
 	switch fabricIdx {
 	case 0:
 		if s.conn0 != nil {
-			superseded = true
+			supersededCurrent = s.conn0Gen == s.peerIncarnation
 			s.conn0.Close()
 		}
 		s.conn0 = conn
 	case 1:
 		if s.conn1 != nil {
-			superseded = true
+			supersededCurrent = s.conn1Gen == s.peerIncarnation
 			s.conn1.Close()
 		}
 		s.conn1 = conn
@@ -322,13 +357,33 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	//   - a full-disconnect -> connect edge (d.wasDisconnected) needs nothing
 	//     here; going to zero connections ran handleDisconnect's clear already,
 	//     and re-clearing would discard a capability nothing could have set.
+	//     conn0/conn1 are nilled ONLY by handleDisconnect, so observing an
+	//     empty registry PROVES that clear already ran (or that no connection
+	//     ever existed) — the redundancy is structural, not incidental.
 	//   - a fabric link coming up into an EMPTY slot beside a surviving one is
 	//     not a supersession and must NOT clear: same peer process, the mirror
 	//     of the partial-disconnect scope control in handleDisconnect.
 	// Only a connection REPLACING a live one in its own slot ends an
 	// incarnation without a disconnect to observe.
-	if superseded {
+	//
+	// #5718 fold F1b: advancing peerIncarnation is what actually retires the
+	// old incarnation, because clearing the flag alone is not enough with TWO
+	// fabric slots. The rebooted peer's OTHER connection is still installed and
+	// still ESTABLISHED; an in-flight ack off it would re-arm the capability
+	// microseconds after this clear if acceptance were decided by slot
+	// membership. Stamping the incoming connection with the NEW incarnation
+	// leaves the survivor at the OLD one, so noteHeartbeatAck rejects it.
+	if supersededCurrent {
+		s.peerIncarnation++
 		s.peerHeartbeatAckEver.Store(false)
+	}
+	// Stamp the slot AFTER any advance, so this connection belongs to the
+	// incarnation it actually established.
+	switch fabricIdx {
+	case 0:
+		s.conn0Gen = s.peerIncarnation
+	case 1:
+		s.conn1Gen = s.peerIncarnation
 	}
 	d.becameActive = d.activeAfter == fabricIdx
 	// #4962: commit the decision under the lock. becameActive means this
@@ -536,10 +591,17 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	case s.conn0 != nil && s.conn0 == conn:
 		s.conn0.Close()
 		s.conn0 = nil
+		// #5718 fold F1b: retire the slot's incarnation stamp with the
+		// connection it described. The nil slot already makes
+		// connIsCurrentIncarnationLocked reject, so this is hygiene — it keeps
+		// a stale generation from being resurrected by a future edit that
+		// reuses the field before re-stamping it.
+		s.conn0Gen = 0
 		slog.Info("cluster sync: fabric 0 disconnected")
 	case s.conn1 != nil && s.conn1 == conn:
 		s.conn1.Close()
 		s.conn1 = nil
+		s.conn1Gen = 0
 		slog.Info("cluster sync: fabric 1 disconnected")
 	default:
 		slog.Debug("cluster sync: ignoring stale disconnect", "stale", fmt.Sprintf("%p", conn))

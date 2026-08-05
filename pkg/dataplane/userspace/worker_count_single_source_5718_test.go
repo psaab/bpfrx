@@ -3,7 +3,9 @@ package userspace
 import (
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
+	"strings"
 	"testing"
 )
 
@@ -102,60 +104,202 @@ func TestWorkerCountHasOneRepresentation_5718(t *testing.T) {
 	}
 }
 
-// TestProgramBootstrapReadsConfiguredWorkersOnce_5718 binds the CALL SITE, not
-// just the helper.
+// exprText renders a node's source text for assertion messages.
+func exprText(fset *token.FileSet, n ast.Node) string {
+	var sb strings.Builder
+	if err := printer.Fprint(&sb, fset, n); err != nil {
+		return "<unprintable>"
+	}
+	return sb.String()
+}
+
+// TestProgramBootstrapWorkerCountDataFlow_5718 binds the CALL SITE's DATA
+// FLOW, not just an occurrence count.
 //
 // planUserspaceWorkers can only guarantee one representation if
-// programBootstrapMapsLocked actually routes every use through it. The
-// pre-fold shape read cfg.Workers TWICE — once into the local `workers` the
-// ctrl fields were cast from, once straight into heartbeatZeroSlots — and that
-// second read is the whole defect. So the structural invariant is exactly
-// "the raw configured value is consumed once", and this test asserts it on the
-// function's AST: a re-introduced second read fails here even if every helper
-// unit test still passes.
-func TestProgramBootstrapReadsConfiguredWorkersOnce_5718(t *testing.T) {
+// programBootstrapMapsLocked actually routes every use through it. Counting
+// `cfg.Workers` occurrences and requiring one is too weak for that claim:
+// `w := cfg.Workers` reads the raw value ONCE and then lets `w` feed a second,
+// independent derivation downstream — the pre-fold defect exactly, with a
+// single occurrence. So the guard asserts the flow instead:
+//
+//  1. the one `cfg.Workers` read is an ARGUMENT to planUserspaceWorkers, so
+//     the raw value cannot be aliased into a local first;
+//  2. planUserspaceWorkers is called exactly once and bound to a name;
+//  3. ctrl.Workers and ctrl.QueueCount are both `<plan>.Workers`;
+//  4. the zero-init loop bound is `<plan>.HeartbeatSlots`;
+//  5. neither clamp helper is called directly here — reaching around the plan
+//     to effectiveWorkers or heartbeatZeroSlots is how a second representation
+//     re-appears without ever touching cfg.Workers again.
+func TestProgramBootstrapWorkerCountDataFlow_5718(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "maps_sync.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse maps_sync.go: %v", err)
 	}
 
-	var body *ast.BlockStmt
+	var fn *ast.FuncDecl
 	ast.Inspect(file, func(n ast.Node) bool {
-		fn, ok := n.(*ast.FuncDecl)
-		if ok && fn.Name.Name == "programBootstrapMapsLocked" {
-			body = fn.Body
+		d, ok := n.(*ast.FuncDecl)
+		if ok && d.Name.Name == "programBootstrapMapsLocked" {
+			fn = d
 			return false
 		}
 		return true
 	})
-	if body == nil {
+	if fn == nil {
 		t.Fatal("programBootstrapMapsLocked not found in maps_sync.go — if it was renamed, " +
 			"re-point this guard at the new name rather than deleting it")
 	}
+	body := fn.Body
 
-	reads := 0
-	var positions []string
+	isSel := func(n ast.Node, x, sel string) bool {
+		s, ok := n.(*ast.SelectorExpr)
+		if !ok || s.Sel.Name != sel {
+			return false
+		}
+		id, ok := s.X.(*ast.Ident)
+		return ok && id.Name == x
+	}
+
+	// (2) exactly one planUserspaceWorkers call, bound to a name.
+	var planVar string
+	planCalls := 0
 	ast.Inspect(body, func(n ast.Node) bool {
-		sel, ok := n.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Workers" {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 || len(as.Lhs) != 1 {
 			return true
 		}
-		ident, ok := sel.X.(*ast.Ident)
-		if !ok || ident.Name != "cfg" {
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
 			return true
 		}
-		reads++
-		positions = append(positions, fset.Position(sel.Pos()).String())
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok || id.Name != "planUserspaceWorkers" {
+			return true
+		}
+		planCalls++
+		if lhs, ok := as.Lhs[0].(*ast.Ident); ok {
+			planVar = lhs.Name
+		}
+		// (1) the raw configured value must be an ARGUMENT to this call.
+		rawIsArg := false
+		for _, arg := range call.Args {
+			if isSel(arg, "cfg", "Workers") {
+				rawIsArg = true
+			}
+		}
+		if !rawIsArg {
+			t.Fatalf("planUserspaceWorkers(%s) is not passed cfg.Workers directly. The raw "+
+				"configured value must flow straight into the single clamp — aliasing it "+
+				"into a local first (`w := cfg.Workers`) lets a second derivation feed off "+
+				"the raw value while cfg.Workers still appears only once (#5718 fold F3)",
+				exprText(fset, call))
+		}
+		return true
+	})
+	if planCalls != 1 || planVar == "" {
+		t.Fatalf("programBootstrapMapsLocked must call planUserspaceWorkers exactly once and "+
+			"bind the result to a name; found %d call(s), var %q", planCalls, planVar)
+	}
+
+	// (1, cont.) every cfg.Workers read must be that argument — one read, and
+	// it is the one already checked above.
+	rawReads := 0
+	var rawPos []string
+	ast.Inspect(body, func(n ast.Node) bool {
+		if isSel(n, "cfg", "Workers") {
+			rawReads++
+			rawPos = append(rawPos, fset.Position(n.Pos()).String())
+		}
+		return true
+	})
+	if rawReads != 1 {
+		t.Fatalf("programBootstrapMapsLocked reads cfg.Workers %d time(s) at %v; want exactly 1 "+
+			"(the planUserspaceWorkers argument). A second read is how the ctrl fields and the "+
+			"heartbeat loop came to describe the same quantity differently", rawReads, rawPos)
+	}
+
+	// (5) no direct clamp-helper call — every representation goes via the plan.
+	ast.Inspect(body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		id, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if id.Name == "heartbeatZeroSlots" || id.Name == "effectiveWorkers" {
+			t.Fatalf("programBootstrapMapsLocked calls %s directly at %s. Reaching around the "+
+				"plan re-creates an independent derivation of the worker count — the exact "+
+				"drift planUserspaceWorkers exists to prevent — without reading cfg.Workers "+
+				"a second time", id.Name, fset.Position(call.Pos()))
+		}
 		return true
 	})
 
-	if reads != 1 {
-		t.Fatalf("programBootstrapMapsLocked reads cfg.Workers %d time(s) at %v; want exactly 1. "+
-			"Every representation of the worker count — ctrl.Workers, ctrl.QueueCount and the "+
-			"heartbeat zero-init bound — must come from the single planUserspaceWorkers call. "+
-			"A second read of the raw configured value is how the ctrl fields and the heartbeat "+
-			"loop came to describe the same quantity differently (#5718 fold F3)", reads, positions)
+	// (3) ctrl.Workers and ctrl.QueueCount both read <plan>.Workers.
+	ctrlFields := map[string]bool{"Workers": false, "QueueCount": false}
+	ast.Inspect(body, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		if id, ok := lit.Type.(*ast.Ident); !ok || id.Name != "userspaceCtrlValue" {
+			return true
+		}
+		for _, el := range lit.Elts {
+			kv, ok := el.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := kv.Key.(*ast.Ident)
+			if !ok {
+				continue
+			}
+			if _, want := ctrlFields[key.Name]; !want {
+				continue
+			}
+			if !isSel(kv.Value, planVar, "Workers") {
+				t.Fatalf("userspaceCtrlValue.%s is %q; want %s.Workers. Every representation of "+
+					"the worker count must be read from the single plan, or the ctrl fields and "+
+					"the heartbeat bound can describe the same quantity differently (#5718 fold F3)",
+					key.Name, exprText(fset, kv.Value), planVar)
+			}
+			ctrlFields[key.Name] = true
+		}
+		return true
+	})
+	for name, seen := range ctrlFields {
+		if !seen {
+			t.Fatalf("userspaceCtrlValue.%s was not found in programBootstrapMapsLocked — if the "+
+				"field moved, re-point this guard rather than dropping the check", name)
+		}
+	}
+
+	// (4) the heartbeat zero-init bound is <plan>.HeartbeatSlots.
+	slotsBound := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		lhs, ok := as.Lhs[0].(*ast.Ident)
+		if !ok || lhs.Name != "slots" {
+			return true
+		}
+		if !isSel(as.Rhs[0], planVar, "HeartbeatSlots") {
+			t.Fatalf("the heartbeat zero-init bound is %q; want %s.HeartbeatSlots",
+				exprText(fset, as.Rhs[0]), planVar)
+		}
+		slotsBound = true
+		return true
+	})
+	if !slotsBound {
+		t.Fatal("the heartbeat zero-init bound (`slots := ...`) was not found in " +
+			"programBootstrapMapsLocked — if it was renamed, re-point this guard rather " +
+			"than dropping the check")
 	}
 }
 
