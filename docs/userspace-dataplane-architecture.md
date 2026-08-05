@@ -793,13 +793,13 @@ match side effects or counters.
 
 **Zone-pair resolution — the egress half (#6713).** `ingress_zone` and
 `egress_zone` above are u16 ids resolved by
-`forwarding::zone_pair_ids_for_flow_with_override`. Both halves now read the
-SAME authoritative source. The ingress half reads
+`forwarding::zone_pair_ids_for_flow_with_override`. The ingress half reads
 `ForwardingState::ifindex_to_zone_id`; the egress half calls
 `ForwardingState::egress_zone_id`, which prefers the denormalized
-`EgressInterface.zone_id` (one map lookup + a field load on the hot path) and
-falls back to `ifindex_to_zone_id` when the interface has **no `egress` row at
-all**.
+`EgressInterface.zone_id` (one map lookup + a field load on the hot path,
+**including when that field is 0** — see the short-circuit below) and falls back
+to `ForwardingState::ifindex_unambiguous_zone_id` when the interface has **no
+`egress` row at all**.
 
 That fallback is load-bearing, not defensive. `forwarding_build::populate_egress`
 builds an `EgressInterface` only for an interface whose link-layer address it can
@@ -818,41 +818,73 @@ to the implicit default policy — pointing every diagnostic at the wrong place.
 
 Scope of the fallback:
 
-- **An ifindex can carry several logical units, and the fallback resolves the
-  ifindex, not the unit (#6722).** `pkg/dataplane/userspace/interfaces.go`'s
-  `snapshotLinuxName` collapses a non-VLAN unit 0 onto its base netdev, so `st0`
-  and `st0.0` are ONE ifindex, as are `ge-0/0/1` and `ge-0/0/1.0`. And
-  `buildInterfaceZoneMap` (`pkg/dataplane/userspace/zones.go`) writes
-  `out[base]` for a unit-suffixed zone reference, so zoning `st0.1` zones `st0`
-  as well. The consequence, which is a behaviour and not an accident: **a
-  MAC-less unit that shares a base ifindex with a zoned sibling adjudicates
-  under that zone.** Two secure tunnels on one `st0` — `bind-interface st0`
-  (unit 0, addressed and routed, never named in a zone) plus `bind-interface
-  st0.1` (zoned `vpnb`) — put transit out unit 0 in the pair `(lan, vpnb)`, and
-  a `from-zone lan to-zone vpnb permit` applies to it.
+- **An ifindex is not a unit identity, so the fallback refuses to guess (#6722).**
+  `pkg/dataplane/userspace/interfaces.go`'s `snapshotLinuxName` collapses a
+  non-VLAN unit 0 onto its base netdev, so `st0` and `st0.0` are ONE ifindex, as
+  are `ge-0/0/1` and `ge-0/0/1.0`. And `buildInterfaceZoneMap`
+  (`pkg/dataplane/userspace/zones.go`) writes `out[base]` for a unit-suffixed
+  zone reference, so zoning `st0.1` zones `st0` as well. `ifindex_to_zone_id` is
+  therefore a per-NETDEV map: the last zoned row on that ifindex, plus the zone
+  `populate_interfaces` propagates from a zoned child unit onto
+  `parent_ifindex`.
 
-  That is defensible because it is the value the INGRESS half has always used
-  for that same ifindex: `ifindex_to_zone_id` is the from-zone source, so a
-  packet arriving on ifindex `st0` is from-zone `vpnb` too. Resolving the egress
-  half through the same map keeps **one ifindex answering one zone in both
-  directions**. Scoping the egress half to a narrower per-interface map — the
-  approach #6722 first attempted — makes egress return the 0 sentinel for an
-  ifindex ingress calls `vpnb`, and 0 matches no exact, wildcard or
-  `junos-global` rule, which is #6713 again for that config.
+  Reading it as the egress answer hands an interface a nonzero zone it was never
+  configured with — and a nonzero to-zone is exactly what makes an operator's
+  permit MATCH, so that direction is fail-OPEN. Three producible shapes do it:
 
-  Junos zones logical UNITS, so `st0.0` and `st0.1` sharing a zone is a genuine
-  parity gap. Closing it needs per-unit identity end to end — the snapshot's
-  unit-0 ifindex collapse, both halves of the zone resolver, and the AF_XDP bind
-  keying — and is tracked separately rather than papered over at this one read.
+  1. Zone only `st0.1`; the Go builder still stamps the `st0` BASE row with
+     `vpnb`, and `st0.0` — which the operator deliberately left in NO zone —
+     shares the base's ifindex.
+  2. Two units in DIFFERENT zones on one `st0` with unit 0 unzoned. The
+     `out[base]` write is first-write-wins over SORTED zone names, so unit 0's
+     ifindex carries the alphabetically-first sibling's zone.
+  3. StableZoneID quarantine (`zones_quarantine.go`), which blanks `Zone` on the
+     interfaces of a colliding zone AFTER `buildInterfaceSnapshots` ran,
+     precisely so they fail CLOSED. The base arrives unzoned beside a surviving
+     zoned child, the Rust child→parent propagation re-zones the parent ifindex,
+     and reading it would hand the quarantine's deliberate default-deny back the
+     survivor's zone.
+
+  So the fallback reads `ifindex_unambiguous_zone_id`, built in
+  `populate_interfaces` over ALL snapshot rows — zoned and unzoned alike. An
+  ifindex appears there only when EVERY row sharing it named the SAME nonzero
+  zone; disagreement (including "one row zoned, one row not") and unanimous "no
+  zone" are both absent, and `egress_zone_id` then resolves the **0 sentinel** —
+  the pre-#6713 answer, against which no exact, wildcard or `junos-global` rule
+  matches, so the default policy decides.
+
+  This deliberately makes the two DIRECTIONS disagree for an ambiguous ifindex:
+  ingress still attributes an arriving packet to `ifindex_to_zone_id`
+  (#921/#3618, unchanged), while egress answers 0. The asymmetry is justified by
+  DIRECTION, not by the ingress surface being unreachable — that is only true in
+  shape 3, where every row is unzoned and `interfaces.go`'s
+  `if iface.Zone == "" { continue }` gives the ifindex no AF_XDP bind target at
+  all. In shapes 1 and 2 the base row is zoned, so the ifindex *is* a bind
+  target and ingress really does answer `vpnb` for arriving traffic. What makes
+  the two halves different is that ingress answering wide is pre-existing
+  behaviour this change does not touch, while egress answering wide is a NEW
+  fail-open on the exact interface class #6713 routed through the fallback:
+  a to-zone is what makes a permit match. Whether the ingress half should be
+  narrowed the same way is a separate #921/#3618 question, not settled here.
+  Where the ifindex is UNambiguous — #6713's own shape, `bind-interface st0`
+  with its unit in the same zone — both halves still answer the same zone, so
+  #6713 is untouched.
+
+  Junos zones logical UNITS, so the remaining gap runs the other way: `st0.0`
+  and `st0.1` cannot be given DIFFERENT zones and both forward. Closing that
+  needs per-unit identity end to end — the snapshot's unit-0 ifindex collapse,
+  both halves of the zone resolver, and the AF_XDP bind keying — and is tracked
+  separately rather than papered over at this one read. Until then such a pair
+  fails closed rather than guessing.
 
   The Rust child→parent zone propagation in `populate_interfaces` is
-  **unreachable for a snapshot the Go builder produces** and is kept only as a
-  helper-boundary backstop: a zoned unit's parent row always arrives already
-  carrying a zone of its own (base rows are emitted before their units), so
-  `ifindex_to_zone_id` has no "propagated but not own" entries to distinguish.
-  `pkg/dataplane/userspace/zone_propagation_6722_test.go` pins both Go-side
-  facts this paragraph rests on, so the userspace-dp fixtures that model these
-  shapes cannot drift back to a snapshot the builder cannot emit.
+  **reachable** for a Go-produced snapshot: shape 3 above is the counterexample.
+  `pkg/dataplane/userspace/zone_propagation_6722_test.go` measures all of it —
+  the `out[base]` write, the unit-0 ifindex collapse, and (through the full
+  `buildSnapshot`, on the lenient load path the strict commit gate rejects) the
+  post-quarantine unzoned base beside a surviving zoned child — so the
+  userspace-dp fixtures modelling these shapes cannot drift to a snapshot the
+  builder cannot emit.
 - A row that exists carrying `zone_id == 0` still stays 0, so for every ifindex
   that HAS an egress row the resolved to-zone is bit-identical to the pre-#6713
   read. That short-circuit is **load-bearing, not defensive**. `populate_egress`
@@ -879,7 +911,9 @@ Scope of the fallback:
 where the code previously saw 0 changes more than the policy verdict. All are
 correct-direction — the zone the operator configured is finally the zone the
 dataplane uses — but they are behavior changes on a LAN→tunnel flow and are
-listed here so a bisect does not have to rediscover them:
+listed here so a bisect does not have to rediscover them. Every entry is scoped
+to an **unambiguous** ifindex; an ambiguous one still resolves 0, so none of
+these fire for it and its behaviour is bit-identical to pre-#6713:
 
 - **Source-NAT rule-set scoping** and the `MissingNeighborSeed` metadata now see
   the tunnel's zone; a rule-set scoped `to zone <vpn>` fires where it did not.

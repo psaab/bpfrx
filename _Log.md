@@ -66482,3 +66482,113 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
   pkg/dataplane/userspace/zone_propagation_6722_test.go,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-05 08:05
+- **Action**: #6722 round 4 — replace the round-3 "directional coherence"
+  justification with an AMBIGUITY GATE. Round 3 argued that resolving a MAC-less
+  egress interface's to-zone from `ifindex_to_zone_id` was defensible because
+  ingress and egress must answer the same zone for one ifindex. That argument is
+  wrong. Several logical units collapse onto one netdev (`snapshotLinuxName`
+  maps a non-VLAN unit 0 back onto its base), so an ifindex is not a unit
+  identity, and the wide answer hands an interface a zone the operator never
+  configured on it — a NONZERO to-zone is exactly what makes an operator's
+  permit MATCH, so that direction is fail-OPEN. Codex reviewed r3 at e6c962cc5
+  and returned MERGE-NEEDS-MAJOR on precisely this, plus a second case r3 had
+  ruled out by assertion.
+
+  New field `ForwardingState::ifindex_unambiguous_zone_id`, built in
+  `populate_interfaces` over ALL snapshot rows (zoned and unzoned alike): an
+  ifindex lands in it only when EVERY row sharing it named the SAME nonzero
+  zone. Disagreement — including "one row zoned, one row not" — leaves it absent
+  and `egress_zone_id` resolves the 0 sentinel, the pre-#6713 answer, against
+  which no exact/wildcard/`junos-global` rule matches and the default policy
+  decides. #6713's own shapes are untouched: there the rows agree.
+
+  The two directions now deliberately DISAGREE for an ambiguous ifindex. Ingress
+  still reads `ifindex_to_zone_id` (#921/#3618) on a surface an unzoned
+  interface never reaches — an empty-zone interface is not an AF_XDP ingress
+  bind target — while egress guessing wide would be a NEW fail-open on the exact
+  interface class #6713 routed through the fallback.
+
+  Codex findings folded:
+  - MAJOR 1 (unzoned unit inherits a zoned sibling's zone) — fixed by the gate;
+    `unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722`.
+  - MAJOR 2 (the deleted own-zone map was NOT inert: post-quarantine,
+    `zones_quarantine.go` blanks the base row's zone AFTER
+    `buildInterfaceSnapshots`, the Rust child→parent propagation re-zones the
+    parent ifindex, and reading it hands the quarantine's deliberate deny back
+    the survivor's zone) — fixed by the same gate;
+    `quarantine_unzoned_base_does_not_inherit_the_surviving_childs_zone_6722`,
+    and the r3 source comment claiming the propagation is unreachable for a
+    Go-produced snapshot is corrected in three places.
+  - Verification 3 (ifindex reuse WITHIN one Go snapshot) —
+    `reused_ifindex_across_two_zoned_interfaces_resolves_no_zone_6722`.
+  - Verification 6 (the r3 coherence test did not bind: its fixture already gave
+    the base row `vpnb`, so restoring the deleted map left it green) — the test
+    is deleted, not re-pointed; the four tests replacing it are mutation-proven
+    below.
+  - Verification 7 test integrity: the third hand-built `ForwardingState`
+    (`frame::tests_ports_live_forward`) now goes through the real
+    `build_forwarding_state` like the other two, and gained an ambiguous-ifindex
+    case because `forward_request.rs` calls the resolver independently of
+    `filter_log_egress_zone_id`; the Go test's `unit0.Ifindex != base.Ifindex`
+    checks (which pass as `0 == 0` when the stub resolves nothing) now pin the
+    primed 42/43/90/91; the empty-MAC assertions gained a positive control on
+    the LAN row's MAC through the SAME stub; `tunnel.rs`'s "GRE and WireGuard
+    reach this loop" is corrected to gre/ip6gre only
+    (`endpoint_attachment_valid` parks every other mode).
+  - New `TestQuarantineUnzonesTheBaseRow_6722` runs the FULL `buildSnapshot`
+    (not `buildInterfaceSnapshots` alone — which is exactly what let r3's
+    "unreachable" claim stand) and MEASURES the shape the Rust fixture models.
+    It also pins that the STRICT compiler rejects the z174/z214 collision, so
+    the lenient boot/HA-sync path is the only way a colliding snapshot reaches
+    the quarantine.
+
+  Mutation proofs (`cargo test --release -- 6722 6713`, 14 tests):
+  - Baseline GREEN 14/14.
+  - Guard A, `egress_zone_id` fallback re-pointed at `ifindex_to_zone_id`:
+    **6 RED** — all four forwarding tests plus both filter-log siblings; e.g.
+    `unzoned_macless_unit_...` "left: 7 right: 0". All EIGHT #6713 tests stayed
+    GREEN, so the gate is scoped to ambiguous ifindexes and does not re-break
+    #6713.
+  - Guard B, agreement ledger fed only by ZONED rows (an unzoned sibling loses
+    its opinion): **4 RED** — the two sibling-shape tests plus both log sites;
+    the quarantine and reused-ifindex tests correctly stay GREEN because their
+    ambiguity comes from a different source. The two ledger properties are
+    independently bound.
+  - Probe C, letting the child→parent propagation also teach the ledger:
+    **0 RED, 14/14 green.** So the "kept out of the propagation arm" exclusion
+    is a design property, NOT a demonstrated guard, and the source comment now
+    says exactly that instead of implying a red. Likewise the `zone_id != 0`
+    skip at the flush is labelled a map-size choice, not a safety gate:
+    `egress_zone_id` ends in `.unwrap_or(0)`, so a stored `Some(0)` and an
+    absent key resolve identically.
+
+  Self-caught over-claim, corrected in all three places it appeared
+  (`types/forwarding.rs`, `forwarding/tests.rs`, the architecture doc): the
+  first draft justified the ingress/egress asymmetry with "an empty-zone
+  interface is not an AF_XDP ingress bind target", which is only half true.
+  `buildUserspaceIngressInterfaces` (`interfaces.go:164`,
+  `if iface.Zone == "" { continue }`) does skip an unzoned row, so it holds for
+  the QUARANTINE shape where every row is unzoned — but in the sibling and
+  divergent shapes the BASE row is zoned, so the ifindex genuinely IS a bind
+  target and ingress really does answer `vpnb` for arriving traffic. The
+  asymmetry is justified by DIRECTION alone: ingress answering wide is
+  pre-existing and untouched, egress answering wide is new and turns a deny into
+  a permit. Whether #921/#3618's ingress half should be narrowed the same way is
+  left explicitly unsettled rather than implied away.
+
+  Examined and deliberately NOT changed: `buildInterfaceZoneMap`'s
+  first-write-wins over sorted zone names means zoning `st0` and then `st0.1`
+  separately silently drops the second reference. That is a Go-side
+  config-compilation behaviour affecting ingress and egress identically, it
+  predates #6713, and it is out of scope here.
+- **File(s)**: userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs,
+  userspace-dp/src/afxdp/tunnel.rs,
+  pkg/dataplane/userspace/zone_propagation_6722_test.go,
+  docs/userspace-dataplane-architecture.md, _Log.md
