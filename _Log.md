@@ -66266,3 +66266,6 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/types_system.go, pkg/config/compiler_system.go, pkg/config/compiler_opts.go, pkg/config/compiler_tailgates.go, pkg/config/login_class_deny_5831_test.go, pkg/config/login_custom_class_4304_test.go, docs/system-login.md

@@ -2035,6 +2035,20 @@ type compileOpts struct {
 	// (#5829); this closes the residual #5829 deferred to #5933.
 	lenientInterfaceUnitRef bool
 
+	// lenientLoginClassDeny (#5831) downgrades the custom-login-class
+	// restrictive-regex gate (deny-commands / deny-configuration, which xpf's
+	// coarse RBAC does not enforce) from a hard compile error to a
+	// cfg.Warnings entry PLUS a view-only fold of the affected class's mapped
+	// permissions. Set ONLY on the tolerant load / peer-sync paths so a config
+	// persisted before this gate existed — or synced from a peer running older
+	// code — still BOOTS (#1960 no-brick). Unlike most lenient flags this one
+	// is not warn-and-continue-unchanged: leaving the permission set intact
+	// would preserve exactly the fail-open the strict gate rejects, so the
+	// tolerant path resolves the un-enforceable restriction in the RESTRICTIVE
+	// direction instead. See foldLoginClassDenyToViewOnly for why that cannot
+	// brick the box.
+	lenientLoginClassDeny bool
+
 	// nodeAware / stampNodeID (#4329) carry the runtime cluster node
 	// identity (from /etc/xpf/node-id, or `-node-id` on `xpfd
 	// check-config`) into compileExpanded so it can be stamped onto the
@@ -2188,5 +2202,6 @@ func lenientCompileOpts() compileOpts {
 		lenientCoSNumericCodePoint:             true,
 		lenientNonNumericUnit:                  true,
 		lenientInterfaceUnitRef:                true,
+		lenientLoginClassDeny:                  true,
 	}
 }

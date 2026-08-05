@@ -86,10 +86,12 @@ compile (`LoginClass.MappedPermissions`, consulted at runtime by
 
 Because xpf's runtime RBAC is **coarse** (view/clear/control/config/maintenance/
 all) it cannot faithfully represent every fine-grained Junos permission or the
-per-command allow/deny regexes. The mapping is therefore
+per-command allow/deny regexes. The **permission mapping** is therefore
 **accept-with-advisory** — the commit succeeds and the compiler emits a
 per-class advisory (`show system commit` / warnings) describing exactly what
-maps and what does not:
+maps and what does not. That is the treatment for everything below EXCEPT the
+restrictive `deny-commands` / `deny-configuration` regexes, which are refused
+outright (#5831, see the next section):
 
 - `all` / `super-user` → `super-user` (PermAll); `maintenance` → maintenance;
   `clear` → clear; `control` / `reset` → control; `configure` → configure;
@@ -110,11 +112,55 @@ maps and what does not:
   but NOT enforced** by the coarse gate (dropping a whitelist extension or a
   session-lifetime knob cannot make the class more permissive); the advisory
   names them.
-- **`deny-commands` / `deny-configuration` are blacklists** — because xpf does
-  not enforce them, the denied verbs stay **allowed**, so the class is **more
-  permissive than the Junos config**, not merely "unenforced". The advisory
-  states this explicitly as a `WARNING` so the operator knows the security
-  posture is weaker. Full per-command deny enforcement is a follow-up.
+- **`deny-commands` / `deny-configuration` are HARD-REJECTED at commit**
+  (#5831) — see below.
+
+### Restrictive regexes are refused, not accepted-and-ignored (#5831)
+
+The four regex sub-statements are **not symmetric**, and xpf treats the two
+halves differently:
+
+| Leaf | Junos direction | Effect of xpf ignoring it | xpf behavior |
+|---|---|---|---|
+| `allow-commands`, `allow-configuration` | **additive** — grants access *in addition to* the permission bits | class gets a **subset** of what was written — fail-**closed** | accepted, advisory |
+| `deny-commands`, `deny-configuration` | **restrictive** — subtracts from the permission bits | denied verbs stay **allowed** — fail-**open** | **rejected at commit** |
+
+Until #5831, a class carrying `deny-commands` committed cleanly and enforced
+nothing: an operator writing
+
+```
+set system login class limited permissions all
+set system login class limited deny-commands "request system zeroize"
+```
+
+held a config saying the verb was denied and a box on which it was allowed. A
+security restriction accepted as inert state is worse than a refused one, so
+the strict `commit` / `commit-check` path now **hard-rejects** the class
+(`validateLoginClassDenyStrict`). Express the restriction with a narrower
+`permissions` set instead. Note that Junos gives `allow-commands` precedence
+over `deny-commands`, so a class pairing them is a deny-with-exceptions and is
+rejected on the deny leaf alone — no allow leaf makes a deny leaf safe to drop.
+
+Rejection keys off the **presence** of the leaf, not its value. `deny-commands
+""` and a valueless `deny-commands` both flatten to the empty string, so a
+value test would wave them through — yet an empty POSIX regex matches every
+command, i.e. denies *everything*, the most restrictive thing an operator can
+write.
+
+On the **tolerant** load / peer-sync path the rejection is downgraded so an
+already-persisted or peer-synced config still boots (#1960 no-brick) — but a
+bare warning would preserve exactly the fail-open the strict gate rejects, so
+that path additionally **folds the class to view-only**
+(`foldLoginClassDenyToViewOnly`): the operator asked for strictly less than
+`permissions` grants, xpf cannot compute how much less, so it resolves the
+ambiguity in the restrictive direction. The fold never *widens* — a class that
+granted nothing keeps granting nothing — and it cannot lock you out of the box,
+because `resolveClassPerms` consults the **built-in** classes first and the fold
+only ever touches a custom class.
+
+Full per-command deny **enforcement** (matching semantics plus coverage of
+every command and configuration dispatch point) remains open on #5831; this is
+the fail-closed half only.
 
 An undefined class (referenced by a user but never defined, and not a built-in)
 still **fails closed** at commit.

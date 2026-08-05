@@ -106,11 +106,21 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					case "allow-commands":
 						lc.AllowCommands = nodeVal(prop)
 					case "deny-commands":
+						// Record PRESENCE, not just the value (#5831): a
+						// quoted-empty or valueless deny-commands flattens to
+						// "" and would be invisible to a value test, yet an
+						// empty regex denies EVERY command in Junos. This
+						// switch already sees both AST shapes (the leaf node
+						// carries the name in Keys[0] either way), so keying
+						// the gate off the case arm is dual-shape safe by
+						// construction.
 						lc.DenyCommands = nodeVal(prop)
+						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, "deny-commands")
 					case "allow-configuration":
 						lc.AllowConfiguration = nodeVal(prop)
 					case "deny-configuration":
 						lc.DenyConfiguration = nodeVal(prop)
+						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, "deny-configuration")
 					}
 				}
 				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)
@@ -935,9 +945,15 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 	}
 	var warnings []string
 	for _, lc := range cfg.System.Login.Classes {
-		mapped, folded := mapJunosPermissions(lc.Permissions)
-		names := make([]string, 0, len(mapped))
-		for _, p := range mapped {
+		_, folded := mapJunosPermissions(lc.Permissions)
+		// Report the EFFECTIVE set (lc.MappedPermissions), not a fresh
+		// mapJunosPermissions call (#5831). The two are identical for every
+		// class the tolerant #5831 fold did not touch, so this changes no
+		// existing output; for a folded class the fresh call would report the
+		// pre-fold buckets and tell the operator the class still holds
+		// permissions it no longer has.
+		names := make([]string, 0, len(lc.MappedPermissions))
+		for _, p := range lc.MappedPermissions {
 			names = append(names, loginClassPermName(p))
 		}
 		mappedStr := "none"
@@ -967,21 +983,21 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 		if len(inert) > 0 {
 			msg += fmt.Sprintf("; %s accepted but NOT enforced by xpf's coarse RBAC", strings.Join(inert, "/"))
 		}
-		// SECURITY: deny-commands / deny-configuration are BLACKLISTS. Dropping
-		// them makes the class MORE PERMISSIVE than the Junos config — the
-		// denied verbs stay ALLOWED. State that explicitly so the operator
-		// knows the posture is WEAKER, not merely "not enforced" (per-command
-		// deny enforcement is a larger follow-up).
-		var deny []string
-		if lc.DenyCommands != "" {
-			deny = append(deny, "deny-commands")
-		}
-		if lc.DenyConfiguration != "" {
-			deny = append(deny, "deny-configuration")
-		}
-		if len(deny) > 0 {
-			msg += fmt.Sprintf("; WARNING: %s is NOT enforced, so this class is MORE PERMISSIVE than the Junos config (denied commands/configuration remain ALLOWED); per-command deny enforcement is a follow-up", strings.Join(deny, "/"))
-		}
+		// SECURITY: deny-commands / deny-configuration are BLACKLISTS, and the
+		// #4304 "accepted but MORE PERMISSIVE" advisory that used to be
+		// appended here is GONE (#5831) rather than reworded. Two reasons it
+		// could not stay:
+		//
+		//  1. It is no longer reachable on the strict path at all —
+		//     validateLoginClassDenyStrict rejects the commit outright.
+		//  2. On the tolerant path it would now be FALSE. That path folds the
+		//     class to view-only before this runs, so the class is MORE
+		//     restrictive than the Junos config, not less; repeating the old
+		//     text would tell the operator the exact opposite of what happened.
+		//
+		// foldLoginClassDenyToViewOnly emits the accurate per-class warning on
+		// that path, so this advisory stays out of the restrictive-regex
+		// business entirely and describes only the permission mapping.
 		warnings = append(warnings, msg)
 	}
 	return warnings
