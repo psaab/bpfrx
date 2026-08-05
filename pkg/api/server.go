@@ -936,6 +936,26 @@ func bindHostWarnable(bindHost string) bool {
 	return true
 }
 
+// hostnameSANWarnable reports whether the CURRENT kernel host name is an
+// identity worth warning about when a loaded on-disk cert does not cover it.
+//
+// It layers one extra condition on bindHostWarnable: the host name must be one
+// a re-mint COULD actually put in the SANs. generateSelfSignedCertAt
+// deliberately DROPS a non-ASCII / malformed host name from DNSNames rather
+// than hard-failing x509.CreateCertificate (see isDNSSANSafeHostname), so such
+// a name is uncoverable BY DESIGN — warning about it every reload would be
+// permanent noise advising a re-mint that cannot fix anything. An IP-literal
+// host name is warnable because it lands in IPAddresses.
+func hostnameSANWarnable(h string) bool {
+	if !bindHostWarnable(h) {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true // IP-literal host name → IPAddresses SAN
+	}
+	return isDNSSANSafeHostname(h)
+}
+
 // certCoversHost reports whether leaf's SANs cover host under the SAME strict
 // hostname check a remote TLS client applies: an IP-literal host must appear in
 // the cert's IPAddresses SANs, any other host in its DNSNames SANs (a CN-only
@@ -944,6 +964,54 @@ func bindHostWarnable(bindHost string) bool {
 // verifying the connection by host will reject the served cert.
 func certCoversHost(leaf *x509.Certificate, host string) bool {
 	return leaf.VerifyHostname(host) == nil
+}
+
+// warnStaleLoadedCert emits a diagnostic for every management identity the
+// LOADED durable cert fails to cover. The cert is served AS-IS (#1916 D6: a
+// re-mint would churn remote clients' TOFU pins), so this is the ONLY signal an
+// operator gets that strict remote verification will fail (#5719 C001).
+//
+// TWO identities are baked into the cert at first generation and BOTH can go
+// stale independently:
+//
+//   - the HTTPS listener bind host — stale after an A→B `web-management https
+//     interface` rebind;
+//   - the kernel host name — stale after `set system host-name`, which the
+//     durable cert does NOT re-mint for. Before this check that half was
+//     entirely SILENT: an operator connecting by the new host name got a bare
+//     "certificate is not valid for any names" with nothing in the log, even
+//     though the bind host was still covered so the bind-host warning never
+//     fired.
+//
+// The leaf is parsed ONCE and both checks share it. A parse failure or an empty
+// chain is not reported here — the caller still serves the pair it loaded, and
+// this function's contract is diagnostics only, never a serving decision.
+func warnStaleLoadedCert(cert tls.Certificate, bindHost string) {
+	if len(cert.Certificate) == 0 {
+		return
+	}
+	hostName, _ := tlsHostname()
+	warnBind := bindHostWarnable(bindHost)
+	warnHost := hostnameSANWarnable(hostName) && hostName != bindHost
+	if !warnBind && !warnHost {
+		return
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return
+	}
+	if warnBind && !certCoversHost(leaf, bindHost) {
+		slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
+			"bind_host", bindHost,
+			"cert_dns_sans", leaf.DNSNames,
+			"cert_ip_sans", leaf.IPAddresses)
+	}
+	if warnHost && !certCoversHost(leaf, hostName) {
+		slog.Warn("loaded management TLS cert does not cover the current host-name; clients verifying by host-name will fail — remove /etc/xpf/tls to re-mint",
+			"host_name", hostName,
+			"cert_dns_sans", leaf.DNSNames,
+			"cert_ip_sans", leaf.IPAddresses)
+	}
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate
@@ -975,24 +1043,16 @@ func generateSelfSignedCertAt(dir, certPath, keyPath, bindHost string) (tls.Cert
 	// first and errors on a key-only / mismatched state → falls through to
 	// regen, which restores a matching pair.
 	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: bindHost is
-		// deliberately NOT baked into a reload, so an A→B management-IP rebind
-		// keeps the original cert rather than churning remote clients' TOFU
-		// pins. But if the loaded cert's SANs do not cover the current bind
-		// host, strict remote verification by that host will silently fail —
-		// warn loudly (naming the bind host and the cert's SANs) so an operator
-		// can re-mint (remove /etc/xpf/tls) instead of chasing a silent
-		// verification failure. Re-minting here would violate the durable
-		// contract, so this is diagnostic only (#5719 C001 residual).
-		if bindHostWarnable(bindHost) {
-			if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil &&
-				!certCoversHost(leaf, bindHost) {
-				slog.Warn("loaded management TLS cert does not cover bind host; remote clients verifying by it will fail — remove /etc/xpf/tls to re-mint",
-					"bind_host", bindHost,
-					"cert_dns_sans", leaf.DNSNames,
-					"cert_ip_sans", leaf.IPAddresses)
-			}
-		}
+		// The on-disk cert is DURABLE (#1916 D6) and served AS-IS: neither the
+		// bind host NOR the kernel host name is re-baked on a reload, so an A→B
+		// management-IP rebind or a later `set system host-name` keeps the
+		// original cert rather than churning remote clients' TOFU pins. But a
+		// SAN the cert no longer covers makes strict remote verification fail
+		// silently — warn loudly (naming the uncovered identity and the cert's
+		// SANs) so an operator can re-mint (remove /etc/xpf/tls) instead of
+		// chasing a bare handshake failure. Re-minting here would violate the
+		// durable contract, so this is diagnostic only (#5719 C001 residual).
+		warnStaleLoadedCert(cert, bindHost)
 		return cert, nil
 	}
 

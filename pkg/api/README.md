@@ -372,21 +372,34 @@ under the daemon's errgroup. Nothing else imports this package.
       an already-persisted cert, so its DNS/IP SANs can go stale. Re-minting is
       deferred (it needs a mint-ordering / invalidation hook and a decision on
       churning the durable TOFU pin). What WAS a silent failure is now
-      diagnosed: on the load-success path `generateSelfSignedCertAt` parses the
-      loaded leaf and, when the current bind host is a concrete non-loopback
-      management host (`bindHostWarnable`) that the leaf's SANs do NOT cover
-      (`certCoversHost` — the same strict check a remote client applies), emits
-      a `slog.Warn` naming the bind host and the cert's SANs, so an operator
-      re-mints (remove `/etc/xpf/tls`) instead of chasing a silent
-      verification failure.
+      diagnosed: on the load-success path `generateSelfSignedCertAt` calls
+      `warnStaleLoadedCert`, which parses the loaded leaf ONCE and checks
+      **both** identities the cert bakes in at first generation, each of which
+      can go stale independently (`certCoversHost` — the same strict
+      `x509.VerifyHostname` check a remote client applies):
+      - the **HTTPS bind host**, when it is a concrete non-loopback management
+        host (`bindHostWarnable`) — stale after an A→B `web-management https
+        interface` rebind;
+      - the **kernel host name**, when it is one a re-mint could actually cover
+        (`hostnameSANWarnable`) — stale after `set system host-name`. This half
+        was previously UNCHECKED, and because renaming a firewall does not move
+        its management IP the bind-host check did not fire either: the operator
+        got a bare `certificate is not valid for any names` with nothing in the
+        log. `hostnameSANWarnable` additionally requires the name to be
+        DNS-encodable or an IP literal, so a `café` host name — which
+        `isDNSSANSafeHostname` DROPS from the SANs by design and which no
+        re-mint could ever cover — does not warn on every reload.
+      Each uncovered identity emits its own `slog.Warn` naming the identity and
+      the cert's DNS/IP SANs, so an operator re-mints (remove `/etc/xpf/tls`)
+      instead of chasing a silent verification failure.
     An already-persisted cert is NOT auto-regenerated — the #1916 D6
     durable-cert contract keeps the on-disk pair stable so remote clients' TOFU
     pins survive a power loss; only freshly generated certs gain SANs (delete
     `cert.pem`/`key.pem` to force a regenerate). Pinned by
     `tls_san_5719_test.go` (SAN presence, hostname classification, the
     non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
-    `buildHTTPSServer` host-extraction, and the stale-cert-on-rebind
-    mismatch warning), fail-on-revert.
+    `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings
+    for BOTH the rebind and the host-name-change paths), fail-on-revert.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

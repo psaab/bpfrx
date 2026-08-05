@@ -1,3 +1,45 @@
+## 2026-08-05 — #5719 C001 residual-2: the host-name half of the stale-cert diagnostic
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening)
+- **Action**: STEP-0 re-verification of the #5719 C-API cohort against current
+  `origin/master` (ad9591177) found two of the three named survivors already
+  fixed (unknown NAT stats selector — `pkg/grpcapi/server_nat.go:225-227`,
+  merged #6373; SAN-less generated cert base + management bind-IP threading —
+  merged #6373/#6378). The surviving gap was the SECOND identity the durable
+  cert bakes in. `generateSelfSignedCertAt` LOADS the on-disk pair as-is (#1916
+  D6 — a re-mint would churn remote TOFU pins) and warned only when the current
+  BIND HOST was uncovered. A later `set system host-name` leaves the cert's DNS
+  SAN naming the old host, and because renaming a firewall does not move its
+  management IP the bind-host check does not fire either — so the operator got a
+  bare "certificate is not valid for any names" with NOTHING in the log. Proved
+  empirically before writing the fix: mint as `old-fw`/bind `10.0.0.1`, reload
+  as `new-fw`/same bind → log output `""`. The load-success path now calls a
+  factored-out `warnStaleLoadedCert`, which parses the leaf ONCE and warns per
+  uncovered identity. `hostnameSANWarnable` gates the new check on the name
+  being DNS-encodable or an IP literal, so a `café` kernel host name — dropped
+  from the SANs by design (`isDNSSANSafeHostname`, the #5058 no-abort guard) and
+  uncoverable by any re-mint — does not warn on every reload. Re-minting itself
+  stays deferred; this closes only the diagnostic half. The third cohort item
+  (applied-nft truth projection) is NOT fixed here — scoping analysis posted to
+  the issue: the state exists post-#5757 but is process-local to `pkg/daemon`
+  with no exported accessor, and `ReadHostInboundDenyCounters` returns
+  `(nil, nil)` for BOTH a fenced table and an absent one, so REST/Prometheus
+  publish an authoritative "0 kernel denies" while a fail-closed fence is
+  actively dropping. Deciding which kernel state maps to which projection
+  channel is a design call, not a mechanical guard.
+- **Validation**: two mutations, each with `go build` + `go vet` rc=0 first so
+  the RED is an ASSERTION, not a compile break. (1) delete the host-name warn
+  branch → `host_name_change_warns` / `ip_literal_host_name_change_warns` /
+  `bind_host_warning_still_fires` FAIL, pre-existing
+  `TestLoadedCertBindHostMismatchWarns` still PASSES (mutation is scoped to the
+  new guard). (2) drop the encodability gate from `hostnameSANWarnable` →
+  `unencodable_host_name_is_silent` FAILs plus three
+  `TestHostnameSANWarnable` rows, proving the gate is not vacuous. Restored +
+  `touch`ed after each; GREEN both times. `go test ./pkg/api/...
+  ./pkg/grpcapi/...` and the full `go test ./...` exit 0; `gofmt -l` clean.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_san_5719_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)
