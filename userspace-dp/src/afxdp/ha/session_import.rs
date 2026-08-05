@@ -21,7 +21,14 @@ impl crate::afxdp::Coordinator {
     /// ceiling via the uncapped sync-import fan-out. Zero when no workers are
     /// registered (early boot / teardown) — the caller treats a zero ceiling as
     /// "bound disabled" so a transient window never rejects legitimate imports.
-    fn synced_import_cap(&self) -> usize {
+    /// Visible to `ha::tests` (#6819 §7) so the PRODUCTION arithmetic below can
+    /// be asserted directly. Both admission tests set
+    /// `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+    /// branch BEFORE this function's production expression is ever evaluated —
+    /// a test-only seam shadowing the real formula. With only those tests,
+    /// deleting the trailing `.saturating_mul(2)` here leaves every cap
+    /// assertion green.
+    pub(super) fn synced_import_cap(&self) -> usize {
         #[cfg(test)]
         if self.synced_import_cap_override != 0 {
             // The override expresses a LOGICAL session ceiling; double it to the

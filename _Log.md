@@ -66298,3 +66298,40 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/coordinator/status.rs,
   userspace-dp/src/afxdp/ha/session_import.rs,
   userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 14:52
+- **Action**: #6819 gate fold (§7 test-acceptance findings). Three findings,
+  each verified against the code before acting. (F1) Both #5674 admission
+  tests set `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+  branch of `synced_import_cap` BEFORE the production expression is evaluated —
+  a test-only seam shadowing the production path, so deleting its trailing
+  `.saturating_mul(2)` left both tests green. Made `synced_import_cap`
+  `pub(super)` (ha_tests is `crate::afxdp::ha::tests`, a SIBLING of
+  `session_import`, so a private fn was unreachable) and added
+  `synced_import_cap_production_formula_is_twice_the_logical_ceiling`, which
+  runs with the override at its default 0 and pins entry-cap == 2x logical
+  ceiling, plus `assert_ne!` against the bare ceiling (what dropping the 2x
+  yields) and a `DEFAULT_MAX_SESSIONS > 0` precondition so `0 == 2*0` cannot
+  make the claim vacuous. (F2) The two non-poison rejection tests accepted a
+  guard that refuses the WHOLE category while counting once, so each now
+  carries its own positive control (newer install applies and does not count;
+  applied equal-generation delete does not count). The two poison rejection
+  tests get scope comments naming the control test that supplies their
+  selectivity. (F3, priority) The poison negative control exercised only
+  NEWER/EQUAL operations with both stale expectations at the per-instance zero
+  baseline, so it accepted DELETING the generation guard outright — a negative
+  control that accepts removal of the thing it controls for. It now also probes
+  the stale direction after recovery (stale install and stale delete each
+  refused and counted exactly once), and the recoveries assertion tightened
+  from `> before` to `>= before + 4` (the poisoning count); kept a LOWER bound,
+  with the reason in the comment, because `SHARED_SESSION_POISON_RECOVERIES`
+  is the one counter still process-global (bumped inside `lock_shared_recover`,
+  which takes only the mutex and has no per-Coordinator home) so a concurrent
+  test can only push it up — `>=` cannot false-FAIL where `==` could.
+  Validation: four-cell mutation matrix, each mutation run against BOTH test
+  generations so a mutation the old tests already caught could not be credited
+  to the new one. Drop-the-2x PASSES both old cap tests and FAILS the new one;
+  delete-the-generation-guard PASSES the old negative control and FAILS the new
+  one. Full `cargo test --release` rc=0 (4234 passed, 0 failed), `go test
+  ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, _Log.md

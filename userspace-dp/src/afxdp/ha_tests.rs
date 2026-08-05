@@ -693,6 +693,26 @@ fn upsert_synced_session_refuses_stale_generation_install() {
         before + 1,
         "stale install should be counted"
     );
+
+    // #6819 §7 positive control. Without this leg the test accepts a guard
+    // that refuses EVERY generation-1 install, or every install whose
+    // generation differs from the stored one — rejecting the whole category
+    // still yields "stored stays 2, counter +1". Pin that the refusal is
+    // SELECTIVE, so the test carries its own control rather than depending on
+    // `upsert_synced_session_applies_equal_and_newer_generation` being read
+    // alongside it.
+    coordinator.upsert_synced_session(synced_entry_with_generation(3));
+    assert_eq!(
+        synced_generation(&coordinator, &key),
+        Some(3),
+        "a NEWER-generation install must still apply — the guard refuses only \
+         strictly-older generations, not every generation change"
+    );
+    assert_eq!(
+        coordinator.session_install_stale_ignored_total(),
+        before + 1,
+        "a legitimate newer install must not bump the stale-refusal counter"
+    );
 }
 
 // ── #5674: synced-import aggregate admission bound (coordinator) ──────
@@ -927,6 +947,73 @@ fn over_ceiling_import_rejected_on_poisoned_shared_mutex() {
     );
 }
 
+// #6819 §7: both admission tests above set `synced_import_cap_override`, which
+// returns from the `#[cfg(test)]` branch of `synced_import_cap` BEFORE the
+// production expression runs. That test-only seam SHADOWS the production
+// formula: with only those two tests, deleting the trailing
+// `.saturating_mul(2)` from the production path leaves every cap assertion
+// green, because no test ever evaluates it. This test leaves the override at
+// its default 0 so the production arithmetic is the thing under test.
+//
+// The 2x is the property being pinned, not an implementation detail: the cap
+// counts ENTRIES while the ceiling it must express is LOGICAL sessions, and
+// each admitted forward publishes a forward key AND a synthesized reverse
+// companion. A cap sized to the logical ceiling rejects ~half of a legitimate
+// full-peer failover import above ~50% peer load (the #5674 dual-entry
+// regression).
+#[test]
+fn synced_import_cap_production_formula_is_twice_the_logical_ceiling() {
+    let mut coordinator = Coordinator::new();
+    assert_eq!(
+        coordinator.synced_import_cap_override, 0,
+        "this test must exercise the PRODUCTION formula — a nonzero override \
+         short-circuits `synced_import_cap` before it is reached"
+    );
+    // A per-worker ceiling of zero would make the 2x assertion below vacuous
+    // (0 == 2*0), so pin that the multiplicand is real first.
+    let per_worker = crate::session::default_max_sessions();
+    assert!(
+        per_worker > 0,
+        "DEFAULT_MAX_SESSIONS must be positive or the ceiling assertions below \
+         cannot distinguish the logical ceiling from twice it"
+    );
+
+    // No workers registered (early boot / teardown): a zero ceiling DISABLES
+    // the bound, so a transient window never rejects legitimate imports.
+    assert_eq!(
+        coordinator.synced_import_cap(),
+        0,
+        "an unregistered-worker coordinator must report a zero (disabled) \
+         ceiling, not a nonzero cap that would reject during early boot"
+    );
+
+    const WORKERS: usize = 3;
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    for worker in 0..WORKERS {
+        coordinator.workers.records.insert(
+            worker as u32,
+            WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+        );
+    }
+
+    let logical_ceiling = WORKERS * per_worker;
+    assert_eq!(
+        coordinator.synced_import_cap(),
+        2 * logical_ceiling,
+        "the production ENTRY cap must be TWICE the logical ceiling \
+         (worker_count * DEFAULT_MAX_SESSIONS), because each admitted forward \
+         logical session publishes a forward key AND a synthesized reverse"
+    );
+    // Stated separately and explicitly: dropping the trailing 2x is the #5674
+    // regression, and it yields exactly the logical ceiling.
+    assert_ne!(
+        coordinator.synced_import_cap(),
+        logical_ceiling,
+        "the ENTRY cap must not equal the LOGICAL ceiling — that is the \
+         pre-#5674 sizing that silently under-syncs a peer above ~50% load"
+    );
+}
+
 // An equal- or newer-generation upsert must apply (equality is NOT refusal).
 #[test]
 fn upsert_synced_session_applies_equal_and_newer_generation() {
@@ -976,11 +1063,21 @@ fn delete_synced_session_gen_refuses_stale_generation() {
         before + 1
     );
 
-    // Equal-generation delete (gen=2) — applies.
+    // Equal-generation delete (gen=2) — applies. This is the positive control:
+    // without it the test accepts a guard that refuses EVERY generation-aware
+    // delete.
     coordinator.delete_synced_session_gen(key.clone(), 2);
     assert!(
         synced_generation(&coordinator, &key).is_none(),
         "equal-generation delete should remove the entry"
+    );
+    // #6819 §7: and the legitimate delete must not be counted either —
+    // otherwise "refuse everything, count once" still satisfies the pair above.
+    assert_eq!(
+        coordinator.session_delete_stale_ignored_total(),
+        before + 1,
+        "an applied equal-generation delete must not bump the stale-refusal \
+         counter"
     );
 }
 
@@ -1080,6 +1177,14 @@ fn stale_generation_install_refused_on_poisoned_shared_mutex() {
         before + 1,
         "the stale install must be REFUSED and counted, not silently applied"
     );
+    // #6819 §7 scope note: this test alone accepts a build that refuses EVERY
+    // nonzero-generation install once the mutex has been poisoned — rejecting
+    // the whole category also leaves the stored generation at 2 with the
+    // counter at +1. The selectivity is controlled by
+    // `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`,
+    // which asserts that newer/equal operations still APPLY across poisoning
+    // AND that stale ones are still refused. The two are a pair: deleting that
+    // control silently widens what this test accepts.
 }
 
 #[test]
@@ -1110,6 +1215,11 @@ fn stale_generation_delete_refused_on_poisoned_shared_mutex() {
         before + 1,
         "the stale delete must be REFUSED and counted, not silently applied"
     );
+    // #6819 §7 scope note: as with the install variant, this test alone accepts
+    // a build that refuses EVERY nonzero-generation delete after poisoning. The
+    // selectivity is controlled by
+    // `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`;
+    // deleting that control silently widens what this test accepts.
 }
 
 // NEGATIVE CONTROL: the fix must RECOVER the poison and keep evaluating the
@@ -1159,14 +1269,71 @@ fn current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex() 
         "a legitimate delete must not be counted as a stale refusal"
     );
 
+    // #6819 §7: the legs above only exercise NEWER/EQUAL operations, so on
+    // their own they accept DELETING the generation guard outright — a build
+    // that recovers the poison and then applies everything satisfies every
+    // assertion so far, and both stale-counter expectations are just the
+    // per-instance zero baseline. A negative control that accepts the removal
+    // of the thing it is controlling for is not controlling anything, so the
+    // selectivity of the recovery is asserted here directly: recovery must
+    // keep EVALUATING the guard, not bypass it.
+    let stale_key = test_key();
+    coordinator.upsert_synced_session(synced_entry_with_generation(9));
+    assert_eq!(
+        synced_generation_recovered(&coordinator, &stale_key),
+        Some(9),
+        "setup: the re-seeded entry must be stored before the stale probes"
+    );
+
+    poison_shared_synced(&coordinator);
+    coordinator.upsert_synced_session(synced_entry_with_generation(8));
+    assert_eq!(
+        synced_generation_recovered(&coordinator, &stale_key),
+        Some(9),
+        "poison recovery must not turn into accept-everything: a STALE \
+         install is still refused after the mutex is recovered"
+    );
+    assert_eq!(
+        coordinator.session_install_stale_ignored_total(),
+        stale_installs_before + 1,
+        "the stale install refused after recovery must be counted exactly once"
+    );
+
+    poison_shared_synced(&coordinator);
+    coordinator.delete_synced_session_gen(stale_key.clone(), 8);
+    assert_eq!(
+        synced_generation_recovered(&coordinator, &stale_key),
+        Some(9),
+        "poison recovery must not turn into accept-everything: a STALE \
+         delete is still refused after the mutex is recovered"
+    );
+    assert_eq!(
+        coordinator.session_delete_stale_ignored_total(),
+        stale_deletes_before + 1,
+        "the stale delete refused after recovery must be counted exactly once"
+    );
+
     // The panic that poisoned the mutex is OBSERVABLE: each recovery bumps
     // the shared counter and emits a journald line. Pre-fix the two guard
     // reads recovered nothing and logged nothing.
+    //
+    // This bound is >= rather than == on purpose, and it is the ONE assertion
+    // in this file that is still measured against a process-global
+    // (`SHARED_SESSION_POISON_RECOVERIES`, shared_ops.rs — bumped inside
+    // `lock_shared_recover`, which takes only the mutex and so has no
+    // per-Coordinator home to move to under #6819). A concurrent test's
+    // recovery can only push the observed value UP, so a lower bound cannot
+    // false-FAIL; an equality could. It can be satisfied by another test's
+    // bumps, which is why the precise claims above ride on the per-instance
+    // stale counters instead. `+ 4` is the number of poisonings this test
+    // performs: `> before` alone passed even if a single recovery served all
+    // of them.
+    const POISONINGS: u64 = 4;
     assert!(
         super::shared_ops::SHARED_SESSION_POISON_RECOVERIES.load(Ordering::Relaxed)
-            > recoveries_before,
-        "poison recoveries must be counted so the underlying worker panic \
-         is not silently self-healed"
+            >= recoveries_before + POISONINGS,
+        "each poisoning must be recovered and counted so the underlying worker \
+         panic is not silently self-healed"
     );
 }
 
