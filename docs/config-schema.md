@@ -981,10 +981,40 @@ and only one of them is reachable from `set`:
 
 | authored as | `interfaces` node | members live in |
 |---|---|---|
-| `interfaces { a; b; }` — BLOCK; also the ONLY shape `set` produces | `Keys=["interfaces"]` | `Children`, one node per member |
+| `interfaces { a; b; }` — BLOCK; `set` also always lands here | `Keys=["interfaces"]` | `Children` — one node per member for a block or a single `set`, but a flat bracket list NESTS (see below) |
 | `interfaces a;` — COMPACT LEAF | `Keys=["interfaces","a"]` | the stanza's own `Keys[1:]`; `Children` nil |
 | `interfaces [ a b ];` | `Keys=["interfaces","a","b"]` | ditto (the lexer strips the brackets, #2419) |
 | `interfaces a { host-inbound-traffic {...} }` | `Keys=["interfaces","a"]` | `Keys[1:]`; `Children` is the member's **BODY**, not more members |
+
+A flat-set bracket list does **not** fan out to one child per member. `set
+security zones security-zone Z interfaces [ a b c ]` produces a NESTED chain,
+because the schema models the interface name as a wildcard CONTAINER: `SetPath`
+descends the wildcard for `a`, then — the interface-name node has no wildcard of
+its own — collapses every remaining token onto ONE leaf beneath it.
+
+```
+interfaces            Keys=["interfaces"]  children=1
+  a                   Keys=["a"]           children=1
+    b c               Keys=["b","c"]       children=0
+```
+
+`zoneInterfaceMembers` RECURSES and reads every key at each level, so this is
+read correctly — but a reader that walked only `prop.Children` one level deep
+would see member `a` alone. Shape pinned by
+`TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning`.
+
+**A body keyword with tokens after it on the same `Keys` is REJECTED (#6735).**
+Because the lexer has already stripped the brackets, `interfaces [ a
+host-inbound-traffic b ]` and `interfaces a host-inbound-traffic system-services
+ssh` are indistinguishable, and their readings disagree about membership — the
+truncator keeps only the names BEFORE the keyword, dropping either a valid
+member (left with no zone, never dataplane-bound) or the whole override. The
+compiler refuses rather than guessing: `validateZoneInterfacePackedTailStrict`
+hard-rejects at commit and warns on the tolerant load / peer-sync path (#1960
+no-brick). Rewrite in the block spelling, which is unambiguous — `interfaces {
+a; b; }` for membership, `interfaces { a { host-inbound-traffic { ... } } }` for
+a per-interface body. A keyword with NOTHING after it is accepted: truncation
+loses nothing there.
 
 `compileZones` iterated `prop.Children`, so every compact spelling ran the loop
 body ZERO times and the zone compiled with NO interfaces — cleanly, with no

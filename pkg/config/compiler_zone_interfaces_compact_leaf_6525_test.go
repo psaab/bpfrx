@@ -27,12 +27,20 @@ import (
 // member — the member name was dropped AND its body keywords were compiled as
 // phantom interface names.
 //
-// REACHABILITY (honest bound): hierarchical text ingest only — `load override` /
-// `load merge` / the persisted config file / HA SyncApply. NOT reachable from
-// the `set` CLI (SetPath always makes `interfaces` a container and stores each
-// member below it, pinned by TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf)
-// and `show configuration | display set` round-trips safely. Those are still the
-// boot path and the peer-sync path.
+// REACHABILITY (honest bound) — of THIS shape, the compact leaf: hierarchical
+// text ingest only, i.e. `load override` / `load merge` / the persisted config
+// file / HA SyncApply. NOT reachable from the `set` CLI (SetPath always makes
+// `interfaces` a container and stores each member below it, pinned by
+// TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf) and `show configuration
+// | display set` round-trips safely. Those are still the boot path and the
+// peer-sync path.
+//
+// Do NOT generalize that bound to the whole defect class. The sibling #6735
+// shape — a body keyword with tokens AFTER it — IS reachable from the ordinary
+// `set` CLI, because SetPath collapses a bracket tail onto one NESTED leaf,
+// keyword included, and the truncator then runs on that nested member. See
+// TestZoneInterfaces6735FlatSetReachesThePackedTail, which pins the shape and
+// the dropped member.
 //
 // IMPORTANT (per CLAUDE.md): flat-set syntax is built with ParseSetCommand +
 // tree.SetPath in a loop, never NewParser; the hierarchical shape uses
@@ -289,15 +297,24 @@ func TestZoneInterfaces6525FlatSetNeverReachesCompactLeaf(t *testing.T) {
 				t.Fatalf("SetPath(%q): %v", cmd, err)
 			}
 			zonesNode := tree.FindChild("security").FindChild("zones")
+			// The Keys assertion below lives inside two filtered loops, so if
+			// SetPath ever stops emitting an `interfaces` property the loop body
+			// never runs and this test passes having asserted NOTHING. Count the
+			// stanzas actually examined and require at least one.
+			examined := 0
 			for _, inst := range namedInstances(zonesNode.FindChildren("security-zone")) {
 				for _, prop := range inst.node.Children {
 					if prop.Name() != "interfaces" {
 						continue
 					}
+					examined++
 					if len(prop.Keys) != 1 {
 						t.Fatalf("flat-set %q produced an `interfaces` stanza with Keys=%v; the compact-leaf shape was believed unreachable from `set`", cmd, prop.Keys)
 					}
 				}
+			}
+			if examined == 0 {
+				t.Fatalf("flat-set %q produced NO `interfaces` stanza to examine; this test asserted nothing — either SetPath changed shape or the config path is wrong", cmd)
 			}
 		})
 	}
@@ -353,6 +370,54 @@ security {
 			}
 		})
 	}
+
+	// POSITIVE CONTROL. Without it this test cannot distinguish "rejects a
+	// stanza that names no interface" from "rejects every stanza": a
+	// zoneInterfaceStanzaMembers that always returned nil would make EVERY
+	// stanza look empty and the reject table above would still pass, green and
+	// meaningless. Measured — that mutation builds clean, vets clean, and this
+	// test passed under it before this subtest existed.
+	t.Run("positive control: a stanza that names an interface still compiles", func(t *testing.T) {
+		for _, stanza := range []string{
+			`interfaces ge-0/0/0.0;`,
+			`interfaces { ge-0/0/0.0; }`,
+			`interfaces [ ge-0/0/0.0 ge-0/0/1.0 ];`,
+		} {
+			t.Run(stanza, func(t *testing.T) {
+				tree := parseHierarchical(t, `
+interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family inet {
+                address 10.0.0.1/24;
+            }
+        }
+    }
+    ge-0/0/1 {
+        unit 0 {
+            family inet {
+                address 10.0.1.1/24;
+            }
+        }
+    }
+}
+security {
+    zones {
+        security-zone Z {
+            `+stanza+`
+        }
+    }
+}`)
+				cfg, err := CompileConfig(tree)
+				if err != nil {
+					t.Fatalf("CompileConfig rejected %q, which names a defined interface: %v — the non-empty gate must fire only on a stanza that contributes NO members (#6525/#4191)", stanza, err)
+				}
+				if got := cfg.Security.Zones["Z"].Interfaces; len(got) == 0 {
+					t.Fatalf("stanza %q compiled to an EMPTY member set without erroring — the gate is reading a different member set than the compiler", stanza)
+				}
+			})
+		}
+	})
 }
 
 // TestZoneInterfaces6525VacuousStanzaAccepted is the over-rejection control for

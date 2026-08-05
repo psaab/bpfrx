@@ -1,3 +1,67 @@
+## 2026-08-05 — #6735 r2: reject the ambiguous zone-interface packed tail
+
+- **Timestamp**: 2026-08-05 (fold/6735-r2, PR #6735)
+- **Action**: Fold of the MERGE-NEEDS-MAJOR gate on #6735.
+
+  **B1 (RUNTIME).** `zoneInterfaceKeysBeforeBody` truncates a member's Keys at
+  the first body keyword and discards the rest. The lexer strips brackets
+  (#2419), so `interfaces [ a host-inbound-traffic b ]` and the packed body
+  `interfaces a host-inbound-traffic system-services ssh` reach the compiler
+  byte-identical — and their readings DISAGREE about membership. Truncation
+  silently drops either a valid member (`b`, left with Zone == "", never
+  dataplane-bound, no policy naming the zone applies to it) or the entire
+  override. The #6525 non-empty belt cannot see the first: one member survived.
+
+  Resolved by REFUSING, not guessing: `validateZoneInterfacePackedTailStrict`
+  hard-rejects at commit and warns on the tolerant load / peer-sync path (#1960
+  no-brick), naming the zone, the keyword, and the exact tokens that would have
+  been dropped, and pointing at the unambiguous block spelling. A keyword with
+  NOTHING after it is accepted (truncation is lossless there — #4191
+  over-rejection class). Deliberate consequence: the packed-body spelling used
+  to commit while silently discarding an authored host-inbound directive; that
+  is now loud, which is the point rather than collateral. Gate runs BEFORE the
+  non-empty gate so the one overlapping shape (`interfaces
+  host-inbound-traffic ge-0/0/1.0;`) gets the accurate message.
+
+  **REACHABILITY CORRECTION.** #6525 documented this defect class as
+  hierarchical-ingest only, "NOT reachable from the `set` CLI". That is true of
+  the compact-leaf shape but FALSE of this one. Measured: `set security zones
+  security-zone Z interfaces [ ge-0/0/0.0 ge-0/0/1.0 host-inbound-traffic
+  ge-0/0/2.0 ]` builds `interfaces -> ge-0/0/0.0 -> leaf
+  Keys=[ge-0/0/1.0, host-inbound-traffic, ge-0/0/2.0]`, and membership compiles
+  to `[ge-0/0/0.0 ge-0/0/1.0]` — `ge-0/0/2.0` silently dropped from the ordinary
+  operator CLI. The header comment is corrected and the shape is pinned.
+
+  **B2 (test binding).** Verified each claim rather than accepting it. The
+  headline claim was WRONG: reverting `zoneInterfaceMemberNodes` to
+  `prop.Children` fails NINE tests (build+vet clean), including the 4544
+  host-inbound tests and TestNat66SourceRules, which the gate said still pass.
+  Two claims were RIGHT and are fixed: `EmptyStanzaRejected` had no positive
+  control (a members reader returning nil always makes every stanza look empty —
+  measured, it passed under that mutation), and `FlatSetNeverReachesCompactLeaf`
+  asserted inside two filtered loops so it passed vacuously if no `interfaces`
+  stanza was produced.
+
+  **Doc fix.** "one child per member" was wrong for a flat bracket list, in both
+  the code comment and docs/config-schema.md. Empirically the shape is
+  `interfaces -> a(container) -> leaf Keys=[b,c]`. Corrected and pinned.
+
+- **Tests**: new `TestZoneInterfaces6735PackedTailRejectedAndPositiveControl`
+  (reject + accept tables in ONE function so neither can drift),
+  `TestZoneInterfaces6735FlatSetReachesThePackedTail`,
+  `TestZoneInterfaces6735TruncatorLosesTheTrailingMember`,
+  `TestZoneInterfaces6735LenientPathWarnsInsteadOfRejecting`,
+  `TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning`; positive control
+  + non-vacuity counter added to the two #6525 tests. Four mutations, each RED
+  from an ASSERTION with `go build` and `go vet` CLEAN, GREEN on restore.
+- **File(s)**: `pkg/config/compiler_security_zones.go`,
+  `pkg/config/compiler_validate_strict_zones.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_zone_interfaces_packed_tail_6735_test.go`,
+  `pkg/config/compiler_zone_interfaces_compact_leaf_6525_test.go`,
+  `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-01 — #6525: security-zone `interfaces` compact-leaf compiled ZERO interfaces
 
 - **Timestamp**: 2026-08-01 (fix/6525-zone-compact-leaf)
