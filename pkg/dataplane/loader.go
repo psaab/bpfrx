@@ -197,6 +197,11 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	if err := m.attachUserspaceShimXDP(result); err != nil {
 		return nil, err
 	}
+	// #5275 PR1: OBSERVE-ONLY arm-coverage proof. Runs after the attach so it
+	// sees real link state, reports what a gating build would have decided,
+	// and gates NOTHING — the return value is deliberately discarded.
+	m.lastCompile = result
+	m.ProveArmCoverage(result).LogArmCoverage("post-attach")
 
 	for ifidx := range result.genericXDPIfindexes {
 		if !result.tunnelIfindexes[ifidx] {
@@ -227,6 +232,11 @@ func (m *Manager) attachUserspaceShimXDP(result *CompileResult) error {
 				"impact", "higher CPU, ~6 Gbps cap; fix driver/firmware to restore driver-mode XDP")
 			m.DetachXDP(ifidx)
 			failedNativeXDP[ifidx] = true
+			// #5275: remember the fallback so the arm-coverage proof can
+			// report which surfaces are on skb-mode. Recorded, not gated.
+			if result.fallbackGenericIfindexes != nil {
+				result.fallbackGenericIfindexes[ifidx] = true
+			}
 		}
 	}
 	if len(failedNativeXDP) > 0 {

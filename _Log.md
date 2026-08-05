@@ -66266,3 +66266,13 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 — OBSERVE-ONLY dataplane arm-coverage proof. Computes
+  whether the dataplane is armed for the surfaces the config requires and
+  reports what a gating build would have decided; gates nothing. Records
+  native->generic fallback on the compile result so the skb-mode population is
+  measurable. Corrects the plan's §5/D1 native/generic binary to three-valued
+  coverage (direct / delegated / uncovered) — implemented as written it would
+  fail-close every VLAN deployment — and refreshes the appendix coordinates
+  re-verified at origin/master ad9591177.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go, pkg/dataplane/compiler.go, pkg/dataplane/loader.go, pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md

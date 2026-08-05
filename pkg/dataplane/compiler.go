@@ -78,6 +78,14 @@ type CompileResult struct {
 	tunnelIfindexes     map[int]bool // tunnel interfaces: XDP ingress only, no redirect
 	genericXDPIfindexes map[int]bool // interfaces that must use generic XDP only
 
+	// fallbackGenericIfindexes records surfaces whose NATIVE XDP attach failed
+	// and were re-attached in generic (skb) mode (#5275). attachUserspaceShimXDP
+	// treats that fallback as a warning, so without this the box reports itself
+	// armed with no record of which surfaces are on the slow path. Read by the
+	// observe-only arm-coverage proof (armproof.go); it does NOT reduce
+	// coverage — a generic shim still enforces policy.
+	fallbackGenericIfindexes map[int]bool
+
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
 	ManagedInterfaces []networkd.InterfaceConfig
@@ -184,22 +192,23 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	}
 
 	result := &CompileResult{
-		ZoneIDs:             make(map[string]uint16),
-		ScreenIDs:           make(map[string]uint16),
-		AddrIDs:             make(map[string]uint32),
-		AppIDs:              make(map[string]uint32),
-		PoolIDs:             make(map[string]uint8),
-		implicitSets:        make(map[string]uint32),
-		NATCounterIDs:       make(map[string]uint32),
-		FilterSpans:         make(map[string]FilterCounterSpan),
-		Lo0FilterV4:         0xFFFFFFFF, // sentinel: no lo0 filter
-		Lo0FilterV6:         0xFFFFFFFF,
-		ifCache:             make(map[string]*net.Interface),
-		linkCache:           make(map[string]netlink.Link),
-		linkIdxMap:          make(map[int]netlink.Link),
-		rxVlanOffCache:      make(map[string]bool),
-		ethtoolApplied:      make(map[string]bool),
-		genericXDPIfindexes: make(map[int]bool),
+		ZoneIDs:                  make(map[string]uint16),
+		ScreenIDs:                make(map[string]uint16),
+		AddrIDs:                  make(map[string]uint32),
+		AppIDs:                   make(map[string]uint32),
+		PoolIDs:                  make(map[string]uint8),
+		implicitSets:             make(map[string]uint32),
+		NATCounterIDs:            make(map[string]uint32),
+		FilterSpans:              make(map[string]FilterCounterSpan),
+		Lo0FilterV4:              0xFFFFFFFF, // sentinel: no lo0 filter
+		Lo0FilterV6:              0xFFFFFFFF,
+		ifCache:                  make(map[string]*net.Interface),
+		linkCache:                make(map[string]netlink.Link),
+		linkIdxMap:               make(map[int]netlink.Link),
+		rxVlanOffCache:           make(map[string]bool),
+		ethtoolApplied:           make(map[string]bool),
+		genericXDPIfindexes:      make(map[int]bool),
+		fallbackGenericIfindexes: make(map[int]bool),
 	}
 
 	// Phase 1: Assign STABLE zone IDs (#3075).

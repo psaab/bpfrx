@@ -357,3 +357,50 @@ reserved/ignored (the helper deserializes and drops it) to preserve the
 Use `binary.NativeEndian.Uint32(ip4)` for `__be32` BPF fields, **not**
 `BigEndian`. cilium/ebpf serializes map values in native endian; the IP
 bytes are already in network order on the wire.
+
+## Arm-coverage proof (#5275, observe-only)
+
+`armproof.go` computes whether the dataplane is genuinely armed for the
+surfaces the current config requires. **It gates nothing.** It reports what a
+gating build would have decided (`ArmCoverageReport.WouldGate`) so the
+divergence rate can be measured across real deployments before the gate is ever
+load-bearing — the eventual fix refuses to publish ownership, forwarding and
+route/VIP advertisement until the proof passes.
+
+Why a measurement phase: "armed" today is weaker than the proof.
+`attachUserspaceShimXDP` treats a **native** XDP attach failure as a warning —
+it detaches and re-attaches in generic (skb) mode, and only a *generic* failure
+returns an error. A box therefore reports itself armed while running the whole
+shim on the fallback path.
+
+Each required surface resolves to exactly one of three kinds. The two decisions
+below are stated deliberately, not left to emerge from how the readback happens
+to be written, because a later "tighten the proof" change would otherwise flip a
+supported deployment to fail-closed with nobody intending it. Both are pinned by
+tests in `armproof_5275_test.go`.
+
+| Kind | Meaning |
+|---|---|
+| `direct` | A shim instance is attached here. **Native and generic both count.** |
+| `delegated` | No attach is expected here by design; the **parent** covers it. |
+| `uncovered` | Nothing here and no proven delegate — including a failed readback. |
+
+- **Generic (skb-mode) counts as armed.** It still steers packets to
+  userspace-dp and still enforces policy, at roughly 16% CPU overhead from the
+  per-packet `sk_buff`. #5275 exists to prevent a *policy-free* kernel, and a
+  fallback box is not policy-free. iavf SR-IOV VFs have no native XDP support at
+  all, so this is a supported steady state — failing it closed would brick a
+  supported deployment to prevent a condition that is not occurring.
+- **VLAN sub-interfaces are delegated, and the delegation is resolved.** Under
+  the userspace shim a VLAN child is never attached (both attach loops skip it;
+  it is recorded in `Manager.VlanSubInterfaces`) because the parent's XDP sees
+  VLAN-tagged frames before kernel VLAN demuxing, and attaching the child breaks
+  IPv6 NDP under generic-mode `XDP_PASS`. Policy is enforced — at a different
+  attach point. A proof demanding an instance on every mapped attach point would
+  fail every VLAN deployment; one that skipped VLAN children would pass a
+  surface whose coverage was never checked. So the parent must itself be
+  directly covered, or the child reads as uncovered.
+
+`CoverageUncovered` is deliberately the zero value: an unpopulated entry must
+read as *not* covered, so a partially-built report can only ever be more
+conservative.
