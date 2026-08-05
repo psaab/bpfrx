@@ -1,3 +1,61 @@
+## 2026-08-05 — #5806 fold r2: bind the five gate findings (incl. one claim the lead asked for)
+
+- **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility, PR #6839)
+- **Action**: Folded five MERGE-NEEDS-MAJOR findings at 69d360c39.
+  **F5 (the "policy evaluation is unaffected" claim) is now BOUND, not
+  downgraded.** It is unreachable from Go — the decision lives in Rust — so it
+  is bound where it is decidable: a new
+  `unresolved_screen_profile_zone_continues_to_policy_5806` in
+  `userspace-dp/src/afxdp/poll_stages_tests.rs` drives the real
+  `stage_screen_check` and asserts an unresolved-profile zone yields
+  `StageOutcome::Continue` — neither dropped nor descriptor-consumed — which is
+  exactly what "the pipeline goes on to evaluate policy" means at that seam.
+  **That test also pinned a REAL GAP found while binding it, unrelated to this
+  PR's changes:** `stage_screen_check` short-circuits on `!screen.has_profiles()`
+  and `has_profiles()` is `!self.zones.is_empty()` — the RESOLVED map only. So
+  when the `security screen` stanza is absent ENTIRELY (exactly the tolerant-load
+  shape that strands a reference) the stage returns BEFORE
+  `maybe_warn_missing_profile`, and the rate-limited runtime WARN that #3082
+  shipped and #5806 treats as the existing signal NEVER FIRES. In that case the
+  config-derived metric and status block added here are the ONLY signal. Asserted
+  (`warns == 0`) so the gap is pinned rather than described.
+  **F1** — the local-CLI renderer had no test at all; deleting its emit passed
+  the whole suite. Added `pkg/cli/cli_show_screen_unresolved_5806_test.go` with
+  the same real tolerant-load fixture (stdout captured via `captureStdout`) plus
+  a negative control.
+  **F2** — the SSOT constant did not bind as an SSOT: the old tests checked value
+  containment, so replacing both uses with identical duplicated literals passed.
+  Added `TestScreenUnresolvedDispositionHasOneSource`, a SOURCE-IDENTITY guard
+  that scans non-test .go under pkg/ and cmd/ and requires the sentence to exist
+  as a literal EXACTLY ONCE (its const), with the consumers reaching it by
+  identifier. Scan scope is stated in the doc comment.
+  **F3** — added `TestScreenMissingProfilesPublishedToSnapshot`: the whole SSOT
+  argument rests on the snapshot actually carrying the set, and breaking that
+  wiring previously passed everything.
+  **F4** — added a file header to the pkg/api test naming which cases BIND and
+  which are negative controls, so the count is not over-trusted.
+- **Validation**: four new mutations, each preceded by a 0-error build.
+  M5 local-CLI emit removed -> the CLI guard RED. First attempt at M5 broke the
+  BUILD (unused import) which would have been a FALSE red; redone as
+  `_ = ScreenUnresolvedProfileLines(cfg)` so it compiles and the RED is an
+  assertion. M6 is the four-cell proof for F2: duplicating the literal PASSES
+  every old value-containment test and FAILS the new source-identity guard,
+  naming both files — the prescribed mutation escapes the old guard and is caught
+  only by the new one. M7 snapshot publication nulled -> the publication guard
+  RED. M8 the Rust None branch made to Drop instead of Pass -> the
+  policy-continuation guard RED. All restored + `touch`ed; GREEN each time.
+  Full `go test ./...` exit 0; `cargo test --bins -- --test-threads=1` 4235
+  passed / 0 failed.
+  Formatting note: `rustfmt` on the single touched .rs file still reformatted
+  ~97 pre-existing lines (46 hunks). Reverted and re-applied the two additions
+  onto the pristine file, giving 171 insertions / 0 deletions in 2 hunks. The
+  "format only files you touched" rule is not sufficient on this tree — even one
+  file carries unrelated churn.
+- **File(s)**: `userspace-dp/src/afxdp/poll_stages_tests.rs`,
+  `pkg/cli/cli_show_screen_unresolved_5806_test.go`,
+  `pkg/dataplane/userspace/screens_ssot_source_5806_test.go`,
+  `pkg/api/metrics_screen_unresolved_5806_test.go`, `_Log.md`
+
 ## 2026-08-05 — #5806 fold: derive-or-anchor the disposition, narrow its wording, drop the label
 
 - **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility, PR #6839)

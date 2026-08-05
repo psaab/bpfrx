@@ -1,5 +1,27 @@
 package api
 
+// #5806 metric guards. Which of these BIND the fix and which are coverage, so a
+// later reader does not over-trust the count:
+//
+//   - TestScreenUnresolvedProfileZonesEmittedOnTolerantLoad is the binding one.
+//     Its "want exactly one" positive control is what a collector that always
+//     emits nothing fails on, and its label-set + HELP-anchor assertions are what
+//     the label/wording regressions fail on.
+//   - TestScreenUnresolvedProfileZonesSilentWhenResolved and
+//     ...NilStoreNoPanic are NEGATIVE controls. They are necessary — without
+//     them the binding test could pass with a collector that emits a row for
+//     every zone — but neither fails if the collector goes silent, so on their
+//     own they are coverage, not guards.
+//
+// The SSOT/source-identity, snapshot-publication, local-CLI and gRPC renderer
+// guards live in their own packages; see
+// pkg/dataplane/userspace/screens_ssot_source_5806_test.go,
+// pkg/cli/cli_show_screen_unresolved_5806_test.go and
+// pkg/grpcapi/server_show_screen_unresolved_5806_test.go. The runtime claim that
+// policy evaluation still runs is bound in Rust, where the decision actually
+// lives: userspace-dp/src/afxdp/poll_stages_tests.rs
+// (unresolved_screen_profile_zone_continues_to_policy_5806).
+
 import (
 	"os"
 	"path/filepath"
