@@ -66939,3 +66939,114 @@ break — `go vet` confirmed passing under every revert.
   cmd/shimverify/main_test.go,
   pkg/dataplane/verify_userspace_shim_headroom_test.go,
   pkg/dataplane/README.md, _Log.md
+
+## 2026-08-01 — #4555 round 8: the tested function was not the binary's decision
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate at e2a85e311 returned MERGE-NEEDS-MAJOR with two
+  HIGHs, four MEDIUMs and a LOW — every one in the verification apparatus, none
+  in the shipped walk. `userspace-xdp/src/ipv6_ext_walk.rs` is byte-identical to
+  e2a85e311, the tracked object and manifest are unchanged, no `make generate`.
+  All seven reproduced BEFORE being fixed; none failed to reproduce.
+  - **(H1) THE GATE'S GUARD COULD NOT FIRE ON THE GATE.** Round 7 extracted
+    `decide(stats, overridden)` and unit-tested every combination — and left
+    `main` calling it and then INDEPENDENTLY repeating both predicates
+    (`!stats.Measured()` at main.go:83, `headroom < floor` at :111) to choose its
+    branch AND its `os.Exit`. Reproduced end to end: with `if false {` at :111,
+    `go build` rc 0, `go vet` rc 0, `go test ./cmd/shimverify/` **ok**, and a
+    scratch build with a 990796/1000000 stub printed
+    `LOW-HEADROOM ... headroom 0.92%` and **exited 0** — which the recipe's
+    `0) ;;` arm installs. That is origin/master's pre-#4555 fail-open restored
+    underneath a green suite, with the status word on stdout even saying
+    LOW-HEADROOM. Fixed by making `decide` the sole decision: it now carries a
+    `refusal` discriminant, `run(argv, stdout, stderr, getenv, verify)` presents
+    the verdict and returns `decision.exit` on every path, and `main` is
+    `os.Exit(run(...))` and nothing else. `TestShimverifyRun` drives the real
+    control flow with all four process boundaries injected and asserts the exit
+    status plus the stdout status word for eleven arms;
+    `TestShimverifyRunNeverExitsZeroWithoutMeasuredHeadroom` states the property
+    the codes exist for.
+  - **(H2) THE SUBSTRING BUG WAS FIXED AT THE POINT FOUND, NOT ACROSS ITS
+    CLASS.** Round 7 anchored the recipe's `case` arms so `6)` no longer matches
+    `66)`, and left the two assertions beside it substring-matching the same
+    file. Reproduced: replacing build-userspace-xdp.sh:129 with
+    `true # sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=..." "${SHIMVERIFY}" ...`
+    left `TestBuildRecipeHandlesShimverifyExitCodes` PASSING while non-root
+    `make generate` skipped verification entirely and installed through `0)` —
+    the unverified-install path the script's header says does not exist. Search
+    scope, enumerated rather than eyeballed: every `strings.`/`regexp.`/`bytes.`
+    call in the file (11 sites, 4 of them matching source text: the arm parser,
+    the override mention, the sudo hop, the FragHdr assertion), plus every Go
+    file in the repo that reads `build-userspace-xdp.sh` (11 — the other 10 use
+    it as a path, not as text) and every `_test.go` that names a `.sh` (11 — the
+    other 8 are unrelated scripts). Fixed by routing every recipe match through
+    `shellCodeLines`, a comment-stripping filter with its own two-direction test,
+    and requiring the invocation at the START of a code line in BOTH branches of
+    `run_verifier` — the root branch had no assertion at all, so commenting IT
+    out was invisible to the fix the finding asked for.
+  - **(H3) THE DELETED COUNT FLOOR WAS NOT SUBSUMED.** Round 7 deleted
+    `handcrafted >= 40` arguing the identity floors subsume it. Reproduced:
+    floors 1-4 require ten boundary buffers, two chain-length twins and two long
+    chains — 14 cases — so deleting the ten varied-HbH cases and the ten
+    truncation cases takes the hand-written count 55 -> 35 with every floor
+    green. Not restored as a count (the threshold was arbitrary and a count has
+    degenerate satisfiers): floor 6 binds the BLOCKS, rebuilding each of the
+    eight named categories locally and requiring every member by byte identity,
+    so deleting a category names that category in the failure. Blocks floored:
+    chain lengths 0..=10, declared lengths 0/1/2/5/15 (alone and followed by
+    DestOpt), long chains, truncation, minimal per-arm, non-first fragments,
+    Fragment composition, AH sweep + Mobility. Deliberately NOT floored there:
+    the 256-value sweep (floor 3) and the boundary witness pairs (floor 1),
+    bound where they are constructed.
+  - **(M1) the "every reachable combination" claim omitted the exact-floor
+    case.** `<` vs `<=` was indistinguishable to every fixture. Added
+    970000/1000000, which is exactly 3.00% in IEEE-754, to both decision tests.
+  - **(M2) THE 256-VALUE FLOOR WAS CIRCULAR.** Both the corpus entries and the
+    floor's expectations came from `chain`. Reproduced by reasoning through the
+    named edit: making `chain` write TCP at byte 6 for every one-header input
+    collapses the corpus to one distinct next-header value, moves no verdict on
+    either walker, and leaves the floor reporting 256 present because it rebuilt
+    the same degenerate bytes. Broken by `expect_chain`, an independent
+    reconstruction used by floors 2, 3, 4 and 6 — which is also what makes the
+    256 values distinct, since 256 buffers differing at byte 6 are 256 different
+    buffers and each must be present byte for byte. A separate
+    `distinct(b[6]) == 256` assertion was written and then deleted: the bytes it
+    counts are the ones the floor's own loop just wrote, so it was `X == X`.
+  - **(M3) asserted-not-executed integrations beyond `parse_l2`.** Confirmed
+    empirically that the shim's entry points cannot be run here:
+    `cargo build --target x86_64-unknown-linux-gnu` on userspace-xdp fails with
+    "unwinding panics are not supported without std". So the comment now
+    enumerates all four — `parse_l2`'s offsets, `parse_ipv6`'s arguments to the
+    walk, `parse_l4`'s catch-all behind the OverLimit fold, and the
+    manifest-to-object relationship — instead of naming one, which read as a
+    claim the rest were covered.
+  - **(M4) the acceptance harness's baseline was still fail-open.** Reproduced
+    twice against the real precondition block: an archive with no `.git` printed
+    `UNVERIFIED` and ran every row against a `*8 -> *16` mutation captured as
+    GOLD; and `git update-index --assume-unchanged` flipped
+    `git diff --quiet HEAD` from rc 1 to rc 0 with the mutation on disk, so the
+    check printed "matches git HEAD (index included)" — a positive claim that
+    was false. Fixed by moving the verification BEFORE the capture (it was 138
+    lines after it), aborting instead of warning when git cannot answer, and
+    requiring an `ls-files -v` tag of `H`. The tree-cleanliness prose no longer
+    overclaims: exactly one path is compared against git, and the guard/control
+    files are covered behaviourally by rows 0 and 12.
+  - **(L1) the FragHdr checker accepted a comment.**
+    `const _: () = assert!(true); // mem::size_of::<FragHdr>() == 8` satisfied
+    it; line comments are now stripped by `rustCodeLine` first.
+  - **Also**: the tight boundary witnesses' `FailClosed` is now attributed —
+    the tight twin must be the padded twin minus exactly its last byte, asserted
+    before the verdict is read. The truncated-Fragment `None` and the short-stub
+    `FailClosed` controls gained positive companions (a complete 8-byte Fragment
+    header must resolve at 48; a buffer of exactly 40 bytes must resolve at 40)
+    so neither rests on a failure default. `compared == cases * offsets` was
+    tautological — the counter incremented inside the loops it claimed to
+    measure — and is replaced by a visited-set of `(l3, name)` pairs recorded
+    after each comparison, checked against the cross product built independently,
+    plus a distinct-names assertion so the set comparison cannot collapse two
+    cases into one.
+- **File(s)**: cmd/shimverify/main.go, cmd/shimverify/main_test.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  test/mutation/shim-ext-parity-acceptance.sh,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/README.md, _Log.md

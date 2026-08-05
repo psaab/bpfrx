@@ -554,10 +554,51 @@ fn userspace_verdict(buf: &[u8], l3: usize) -> Verdict {
 ///
 /// Floor 5 in `parity_corpus` MEASURES the two non-zero values, by asking
 /// `frame_l3_offset` where L3 starts in the prefixes `at_l3` builds. It cannot
-/// measure `parse_l2`: that function is in the aya crate and does not link
-/// here. That the two agree on 14/18 is the documented claim above, and is the
-/// one thing in this file still asserted rather than run.
+/// measure `parse_l2` — see `SHIM_INTEGRATION_ASSERTED_NOT_RUN` for why, and
+/// for the other three claims in the same position.
 const L3_OFFSETS: [usize; 3] = [0, 14, 18];
+
+// WHAT THIS FILE ASSERTS ABOUT THE SHIM RATHER THAN RUNS — all of it.
+//
+// The walk itself is executed: `ipv6_ext_walk.rs` is `#[path]`-included and
+// driven on real buffers. Its CALLERS are not, and cannot be. The shim crate is
+// `#![no_std] #![no_main]` over `aya-ebpf`; building `userspace-xdp` for
+// `x86_64-unknown-linux-gnu` fails with "unwinding panics are not supported
+// without std" (and wants the `MAX_INTERFACES` build-time env var), so `lib.rs`
+// cannot be linked into this host test binary at all. Nothing here can be run
+// against it — measured, not assumed.
+//
+// A previous revision named `parse_l2` as "the one thing in this file still
+// asserted rather than run". That was wrong by three, and naming one of four
+// reads as a claim that the rest are covered. The complete list:
+//
+//   1. `parse_l2` produces L3 offsets 14 (untagged) and 18 (802.1Q/802.1ad),
+//      the two non-zero values in `L3_OFFSETS`. Floor 5 measures that THIS
+//      crate's `frame_l3_offset` produces them; that the shim's L2 parser
+//      agrees is read off `lib.rs` and believed.
+//   2. `parse_ipv6` calls the walk with `(data, data_end, l3_offset, ip6[6],
+//      l3_offset + 40)`, which is what `raw_shim_walk` below reproduces.
+//      Passing `TCP` in place of `protocol` at that call site would make
+//      production treat every IPv6 packet as TCP at the initial offset while
+//      every test in this file stayed green, because the direct call below is
+//      unchanged by it.
+//   3. `parse_l4` consumes the walk's `(offset, protocol)`, and its catch-all
+//      arm — yielding ports 0/0 for a protocol it does not parse — is what the
+//      `Verdict::OverLimit` fold rests on: the shim's walk does not fail closed
+//      on exhaustion, it returns the last extension-header protocol and
+//      `parse_l4` turns that into a session-key miss. The fold is a claim about
+//      `parse_l4`'s behaviour, made from its source.
+//   4. The manifest-to-OBJECT relationship. `read_shim_facts` parses
+//      `userspace_xdp_manifest.json`; it never touches
+//      `userspace_xdp_bpfel.o`. That the JSON describes the committed object is
+//      covered on the Go side by
+//      `TestUserspaceXDPShimObjectMatchesSourceManifest` (input hashes) and by
+//      the #1864 verify-then-install ordering in `build-userspace-xdp.sh` — not
+//      here.
+//
+// Closing any of these means running the shim's entry points, which means a
+// host-buildable extraction of them in the shape of `ipv6_ext_walk.rs`. Until
+// then this list is the honest scope.
 
 /// One arm's boundary WITNESS PAIR, DECLARED here and VERIFIED by floor 1.
 ///
@@ -695,6 +736,55 @@ fn chain(headers: &[(u8, u8)], terminal: u8, trim: usize) -> Vec<u8> {
     buf.extend_from_slice(&[0u8; 20]);
     buf.truncate(buf.len().saturating_sub(trim));
     buf
+}
+
+/// The same bytes as `chain`, built INDEPENDENTLY, for the floors only.
+///
+/// Every floor below asks "is this exact buffer still in the corpus?". Round 7
+/// answered that by calling `chain` — the corpus's own generator — and looking
+/// the result up in a corpus `chain` produced. That is `X == X` at the level of
+/// the generator: mutate `chain` to write TCP at byte 6 for every one-header
+/// input and the corpus collapses to a single distinct next-header value, every
+/// case resolves `L4(40, TCP)` on both walkers so no verdict moves, and floor 3
+/// still reports all 256 present — because it rebuilt the same degenerate bytes
+/// and found them. The cross-walker comparison catches a UNILATERAL
+/// misclassification; it cannot catch a COMMON-MODE change to the inputs both
+/// walkers are fed.
+///
+/// So the floors' expectations come from here. This is a second implementation,
+/// not an oracle from another source: it defends against `chain` drifting
+/// alone, which is the reachable failure (one function edited, the floors
+/// unchanged), and it does NOT defend against someone editing both. That
+/// residual is what the acceptance matrix's row 12 covers from the other side —
+/// a semantically null edit must SURVIVE, so the guards are known to bind
+/// behaviour rather than bytes.
+///
+/// Deliberately written with different mechanics (index arithmetic into one
+/// grown buffer, rather than building each header as its own vector), so a
+/// copy-paste of one into the other is visible in review.
+fn expect_chain(headers: &[(u8, u8)], terminal: u8, trim: usize) -> Vec<u8> {
+    let mut b = vec![0u8; 40];
+    b[0] = 0x60;
+    b[6] = if headers.is_empty() {
+        terminal
+    } else {
+        headers[0].0
+    };
+    for i in 0..headers.len() {
+        let len = headers[i].1;
+        let next = if i + 1 < headers.len() {
+            headers[i + 1].0
+        } else {
+            terminal
+        };
+        let at = b.len();
+        b.resize(at + (usize::from(len) + 1) * 8, 0);
+        b[at] = next;
+        b[at + 1] = len;
+    }
+    b.resize(b.len() + 20, 0);
+    b.truncate(b.len().saturating_sub(trim));
+    b
 }
 
 /// The corpus of L3-relative chains both walkers are run over.
@@ -850,12 +940,13 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     // --- NON-VACUITY FLOORS -------------------------------------------------
     //
     // Every assertion that CONSUMES this corpus is of the form "this collection
-    // is empty" or "this count equals cases.len() * L3_OFFSETS.len()", and BOTH
-    // hold trivially when the corpus is empty: an empty drift list is empty, an
-    // empty permissive list is empty, and `0 == 0 * 3`. Emptying this function
-    // was measured to leave all five tests reporting `ok` in 0.00s.
+    // is empty" or "the loop visited every (offset, case) pair", and BOTH hold
+    // trivially when the corpus is empty: an empty drift list is empty, an empty
+    // permissive list is empty, and an empty visited set equals an empty cross
+    // product. Emptying this function was measured to leave all five tests
+    // reporting `ok` in 0.00s.
     //
-    // Two earlier rounds of floors stood here and both were PROXIES.
+    // Three earlier rounds of floors stood here and all were PROXIES.
     //
     //   Round 5 was a single `cases.len() >= 200` whose message promised that no
     //   assertion in the file could pass vacuously. The 256-entry sweep above
@@ -875,12 +966,30 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //   corpus edit defeating all three while all five floors passed was
     //   measured, again with the generic revalidation deleted.
     //
+    //   Round 7 fixed those three and then DELETED the surviving coverage floor
+    //   (`handcrafted >= 40`), arguing the identity floors subsumed it. They do
+    //   not. Between them floors 1-4 require ten boundary buffers, two
+    //   chain-length twins and two long chains — 14 hand-written cases — so the
+    //   intermediate chain lengths, the varied declared lengths, the truncation
+    //   block, the minimal per-arm packets, the non-first fragments, the AH
+    //   sweep and the #4517 Mobility cases were all deletable with every floor
+    //   green. Measured: dropping the ten varied-length HbH cases and the ten
+    //   truncation cases takes the hand-written count 55 -> 35, which the
+    //   deleted floor caught and floors 1-5 do not. Floor 6 closes that, by
+    //   BLOCK rather than by count — the old threshold was arbitrary, and a
+    //   count is what had a degenerate satisfier twice already.
+    //
     // So each floor below binds its shape by CONSTRUCTION (the corpus must
     // contain a locally rebuilt reference buffer, byte for byte) and, where the
     // shape is behavioural, by MEASUREMENT with this crate's walker. A count of
     // cases satisfying a predicate is exactly what kept failing; a named buffer
     // that must be present, and must behave as claimed, does not have a
     // degenerate satisfier.
+    //
+    // The reference buffers come from `expect_chain`, NOT from the corpus's own
+    // `chain`: rebuilding an expectation with the generator that produced the
+    // corpus and then looking it up in that corpus is circular, and one edit to
+    // `chain` defeats every floor built on it at once. See `expect_chain`.
     //
     // None of them claims the corpus is ADEQUATE: adequacy is not a property of
     // a floor, it is what `test/mutation/shim-ext-parity-acceptance.sh` measures
@@ -947,6 +1056,34 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
             w.target,
             userspace_verdict(&padded, 0),
         );
+        // TWIN IDENTITY, asserted before the tight twin's verdict is read.
+        // `FailClosed` is the FAILURE DEFAULT of `userspace_verdict` — a
+        // buffer that is short, malformed, or built for a different arm
+        // entirely also produces it — so on its own it attributes nothing.
+        // It only means "the length check at `target` refused this" if the
+        // tight twin is the padded one minus its last byte and nothing else,
+        // which is what makes the pair a one-byte isolation rather than two
+        // unrelated packets that happen to disagree. The padded twin's
+        // `L4(target, TCP)` above is a POSITIVE observation and needs no such
+        // support; this one does.
+        assert_eq!(
+            tight.len(),
+            w.target - 1,
+            "#4555 corpus floor 1: the {} tight witness is {} bytes, not target-1 = {}",
+            w.arm,
+            tight.len(),
+            w.target - 1,
+        );
+        assert_eq!(
+            tight[..],
+            padded[..w.target - 1],
+            "#4555 corpus floor 1: the {} tight witness is not the padded witness minus its last \
+             byte. The two differ somewhere other than the final byte, so the tight twin's \
+             fail-closed cannot be attributed to the post-advance length check at target {} — it \
+             could be any earlier refusal.",
+            w.arm,
+            w.target,
+        );
         assert_eq!(
             userspace_verdict(&tight, 0),
             Verdict::FailClosed,
@@ -1005,8 +1142,8 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    Does NOT bind: the intermediate lengths, nor chains built from
     //    non-minimum-size or non-DestOpt headers.
     let at_max_hdrs = MAX_IPV6_EXT_HEADERS - 1;
-    let at_max = chain(&vec![(DEST, 0); at_max_hdrs], TCP, 0);
-    let over = chain(&vec![(DEST, 0); at_max_hdrs + 1], TCP, 0);
+    let at_max = expect_chain(&vec![(DEST, 0); at_max_hdrs], TCP, 0);
+    let over = expect_chain(&vec![(DEST, 0); at_max_hdrs + 1], TCP, 0);
     assert!(
         contains(&at_max) && contains(&over),
         "#4555 corpus floor 2: the corpus no longer contains BOTH the chain of exactly \
@@ -1045,12 +1182,26 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    rebuilt for each value and required by byte identity, and each is
     //    required NOT to fail closed, which is the direct statement that the
     //    walk got far enough to classify the value.
+    //
+    //    Round 7 rebuilt it with `chain`, the corpus's own generator, which is
+    //    circular: making `chain` write TCP at byte 6 for every one-header
+    //    input collapses the corpus to ONE distinct next-header value while
+    //    this floor rebuilds the same degenerate bytes, finds them, and reports
+    //    256 present. So the expectation is built by `expect_chain` (see its
+    //    doc), which writes `p` at byte 6 itself.
+    //
+    //    That is also what makes the values DISTINCT, without a separate count:
+    //    256 buffers differing at byte 6 are 256 different buffers, and each
+    //    must be present byte for byte. A `distinct(b[6]) == 256` assertion on
+    //    top of it would be `X == X` — the bytes it counts are the ones this
+    //    loop just wrote — which is the shape of defect this whole file is
+    //    about, so it is deliberately absent.
     //    Does NOT bind: that each value is presented in more than one position;
     //    only the first-header position is swept, at one declared length.
     let mut missing: Vec<u16> = Vec::new();
     let mut unwalked: Vec<u16> = Vec::new();
     for p in 0u16..=255 {
-        let want = chain(&[(p as u8, 0)], TCP, 0);
+        let want = expect_chain(&[(p as u8, 0)], TCP, 0);
         if !contains(&want) {
             missing.push(p);
         } else if userspace_verdict(&want, 0) == Verdict::FailClosed {
@@ -1078,7 +1229,7 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
     //    higher offset than these chains reach would survive. That is what the
     //    acceptance matrix measures, not this floor.
     for n in [3usize, 5] {
-        let long = chain(&vec![(DEST, 15); n], TCP, 0);
+        let long = expect_chain(&vec![(DEST, 15); n], TCP, 0);
         assert!(
             contains(&long),
             "#4555 corpus floor 4: the chain of {n} x DestOpt(len=15) is gone. A statement placed \
@@ -1127,6 +1278,168 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
          `walk_ipv6_ext_chain`'s other callers pass when they hand it an L3-relative slice"
     );
 
+    // 6. EVERY NAMED SHAPE BLOCK IS STILL HERE, BY CONSTRUCTION.
+    //
+    //    Floors 1-5 bind five shapes. Round 7 deleted a `handcrafted >= 40`
+    //    count floor arguing they SUBSUMED it. They do not, and the gap is
+    //    large: floors 1-4 require ten boundary buffers, the two chain-length
+    //    twins and the two long chains — 14 hand-written cases before the 256
+    //    sweep — so the intermediate chain lengths, the varied declared
+    //    lengths, the truncation block, the minimal per-arm packets, the
+    //    non-first fragments, the AH sweep and the #4517 Mobility cases could
+    //    ALL be deleted with every floor still green. Measured: deleting the
+    //    ten varied-length HbH cases and the ten truncation cases drops the
+    //    hand-written count 55 -> 35, which the old `>= 40` floor would have
+    //    caught and none of floors 1-5 does.
+    //
+    //    A count floor is the wrong repair — the old threshold was arbitrary,
+    //    and a count has degenerate satisfiers (round 5's `cases.len() >= 200`
+    //    was cleared by the 256-sweep alone). This binds the BLOCKS instead:
+    //    each named category is rebuilt here with `expect_chain` / explicit
+    //    bytes and required in the corpus in FULL, so deleting a whole category
+    //    — or a single case out of one — names the category in the failure.
+    //
+    //    Binds: presence, byte for byte, of every hand-written case. Deliberate
+    //    edits to the corpus must be mirrored here, which is the point: a
+    //    deletion becomes a two-file change a reviewer sees rather than a
+    //    silent narrowing between acceptance runs.
+    //    Does NOT bind: that any of these shapes is PULLING ITS WEIGHT. Only
+    //    `test/mutation/shim-ext-parity-acceptance.sh` measures that, by
+    //    mutating the shim and requiring the guards to red. A block that never
+    //    detects anything would still be required here; floors stop deletion,
+    //    the matrix measures value.
+    //    Does NOT bind: the 256-value sweep (floor 3) or the boundary witness
+    //    pairs (floor 1), which are bound where they are constructed. The
+    //    chain-length and long-chain blocks below overlap floors 2 and 4; the
+    //    overlap is kept so this list is the complete account of the
+    //    hand-written corpus rather than the complement of four other floors.
+    let ah_sweep_case = |len: u8| {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = AH;
+        b.extend_from_slice(&[TCP, len]);
+        b.extend_from_slice(&[0u8; 254]);
+        b
+    };
+    let non_first_frag_case = |frag_off: u16| {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = FRAG;
+        b.extend_from_slice(&[TCP, 0]);
+        b.extend_from_slice(&frag_off.to_be_bytes());
+        b.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        b.extend_from_slice(&[0x11; 20]);
+        b
+    };
+    let stub_case = |proto: u8, second: u8| {
+        let mut b = vec![0u8; 40];
+        b[0] = 0x60;
+        b[6] = proto;
+        b.extend_from_slice(&[TCP, second]);
+        b
+    };
+    let blocks: [(&str, Vec<Vec<u8>>, &str); 8] = [
+        (
+            "chain lengths 0..=10 across the resolvable boundary",
+            (0..=10usize)
+                .map(|n| expect_chain(&vec![(DEST, 0); n], TCP, 0))
+                .collect(),
+            "the only cases that walk each chain length; floor 2 pins just the two at the \
+             boundary, so the rest can vanish without it noticing",
+        ),
+        (
+            "declared lengths 0/1/2/5/15, alone and followed by DestOpt(len=1)",
+            [0u8, 1, 2, 5, 15]
+                .iter()
+                .flat_map(|&len| {
+                    [
+                        expect_chain(&[(HBH, len)], TCP, 0),
+                        expect_chain(&[(HBH, len), (DEST, 1)], TCP, 0),
+                    ]
+                })
+                .collect(),
+            "what separates the generic arm's `* 8` from any other multiplier: an advance \
+             error `a*l + b` is invisible at a single declared length",
+        ),
+        (
+            "long chains reaching large intermediate offsets",
+            [3usize, 5]
+                .iter()
+                .map(|&n| expect_chain(&vec![(DEST, 15); n], TCP, 0))
+                .collect(),
+            "the only shape that observes a statement inside the walk loop but outside the \
+             `match` (also floor 4)",
+        ),
+        (
+            "truncation: declared length runs past the packet",
+            [1usize, 8, 20, 21, 40]
+                .iter()
+                .flat_map(|&trim| {
+                    [
+                        expect_chain(&[(HBH, 5)], TCP, trim),
+                        expect_chain(&[(DEST, 15)], TCP, trim),
+                    ]
+                })
+                .collect(),
+            "without the post-advance revalidation these resolve an L4 offset outside the \
+             buffer instead of failing closed",
+        ),
+        (
+            "minimal per-arm packets (AH 42-byte, Fragment truncated to 2)",
+            vec![stub_case(AH, 3), stub_case(FRAG, 0)],
+            "the padded cases cannot see a deleted revalidation; only a packet ending at or \
+             before the advance target can",
+        ),
+        (
+            "NON-FIRST fragments",
+            [0x0008u16, 0x0010, 0x0100]
+                .iter()
+                .map(|&off| non_first_frag_case(off))
+                .collect(),
+            "the inputs behind the documented shim/userspace fragment-state asymmetry \
+             (#6704); both walkers resolve the same offset and only the fragment state \
+             differs",
+        ),
+        (
+            "Fragment composition",
+            vec![
+                expect_chain(&[(FRAG, 0)], TCP, 0),
+                expect_chain(&[(DEST, 0), (FRAG, 0)], TCP, 0),
+            ],
+            "the Fragment arm's fixed 8-byte advance, alone and reached as a LATER header",
+        ),
+        (
+            "AH declared-length sweep and #4517 Mobility",
+            vec![
+                ah_sweep_case(0),
+                ah_sweep_case(1),
+                ah_sweep_case(3),
+                expect_chain(&[(MOBILITY, 0)], TCP, 0),
+                expect_chain(&[(HBH, 0), (MOBILITY, 0)], TCP, 0),
+            ],
+            "the AH arm's `(len+2)*4` at three lengths, and the #4517 types that were missing \
+             from the shim's walked set entirely",
+        ),
+    ];
+    for (name, want, why) in &blocks {
+        let gone: Vec<usize> = want
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !contains(b))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "#4555 corpus floor 6: the corpus block \"{name}\" has lost {} of its {} cases (index \
+             {gone:?}). {why}. Floors 1-5 do not cover this block, so its deletion is invisible to \
+             every other assertion in this file — which is exactly how the round-5 corpus was cut \
+             to a 256-case sweep with the generic arm's revalidation deleted and all five tests \
+             still reporting `ok`.",
+            gone.len(),
+            want.len(),
+        );
+    }
+
     cases
 }
 
@@ -1153,24 +1466,52 @@ fn parity_corpus() -> Vec<(String, Vec<u8>)> {
 #[test]
 fn shim_walk_and_userspace_walk_agree_over_a_corpus() {
     let cases = parity_corpus();
+    // Distinct NAMES first: the visited-set check below is a set comparison, so
+    // two cases sharing a name would collapse into one entry on both sides and
+    // hide that one of them never ran.
+    let names: BTreeSet<&str> = cases.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names.len(),
+        cases.len(),
+        "#4555: the corpus has {} cases but only {} distinct names; a duplicated name makes the \
+         coverage accounting below collapse two cases into one",
+        cases.len(),
+        names.len(),
+    );
+
     let mut drift: Vec<String> = Vec::new();
-    let mut compared = 0usize;
+    // What actually got COMPARED, recorded after the comparison. A counter
+    // incremented inside these same loops is `X == X` — `compared += 1` and
+    // the work it claims to count are the same statement sequence, so any edit
+    // that skips one skips the other and the equality holds regardless. This
+    // records the (offset, case) pair only once both walkers have been run on
+    // it, and checks the result against the cross product built independently
+    // from the two inputs.
+    let mut visited: BTreeSet<(usize, &str)> = BTreeSet::new();
     for l3 in L3_OFFSETS {
         for (name, base) in &cases {
             let buf = at_l3(base, l3);
             let s = shim_verdict(&buf, l3);
             let u = userspace_verdict(&buf, l3);
-            compared += 1;
             if s != u {
                 drift.push(format!("[l3={l3}] {name}: shim={s:?} userspace={u:?}"));
             }
+            visited.insert((l3, name.as_str()));
         }
     }
+    let expected: BTreeSet<(usize, &str)> = L3_OFFSETS
+        .iter()
+        .flat_map(|&l3| names.iter().map(move |&n| (l3, n)))
+        .collect();
     assert_eq!(
-        compared,
-        cases.len() * L3_OFFSETS.len(),
-        "the #4555 corpus loop did not run every case at every L3 offset"
+        visited,
+        expected,
+        "the #4555 corpus loop did not run every case at every L3 offset: {} of {} pairs were \
+         never compared",
+        expected.difference(&visited).count(),
+        expected.len(),
     );
+    let compared = visited.len();
     assert!(
         drift.is_empty(),
         "#4555 BEHAVIOURAL parity drift between the shim's executed IPv6 extension-header walk \
@@ -1330,6 +1671,27 @@ fn shim_is_not_more_permissive() {
         "#4555: the shim must fail its 8-byte Fragment read rather than advance past a truncated \
          header"
     );
+    // `None` is `raw_shim_walk`'s FAILURE DEFAULT: a buffer too short for the
+    // fixed 40-byte header returns it before the walk starts, as does any other
+    // refusal. So pair it with the shortest buffer that DOES resolve — the same
+    // packet with the Fragment header's remaining 6 bytes present. That the
+    // 42-byte form refuses and the 48-byte form resolves attributes the refusal
+    // to the 8-byte Fragment read specifically, which is the invariant acceptance
+    // rows 7 and 8 (`read 8 -> 2`, `read 8 -> 7`) mutate.
+    let mut whole_frag_hdr = truncated.clone();
+    whole_frag_hdr.extend_from_slice(&[0u8; 6]);
+    assert_eq!(
+        whole_frag_hdr.len(),
+        48,
+        "#4555: the companion case is not a complete 8-byte Fragment header"
+    );
+    assert_eq!(
+        raw_shim_walk(&whole_frag_hdr, 0),
+        Some((48u16, TCP)),
+        "#4555: the shim no longer resolves a COMPLETE 8-byte Fragment header at offset 48, so \
+         the refusal asserted above cannot be attributed to the missing 6 bytes — every buffer \
+         would refuse and the assertion would hold for the wrong reason"
+    );
 
     // 3. In the dimension the shim DOES represent, it is not more permissive.
     //    The corpus asserts equality in both directions; this states the
@@ -1392,9 +1754,33 @@ fn shim_walk_corpus_negative_control() {
     assert_eq!(userspace_verdict(&plain, 0), Verdict::L4(40, TCP));
     assert_eq!(shim_verdict(&plain, 0), Verdict::L4(40, TCP));
     // A buffer too short for the fixed header fails closed on both sides.
+    // `FailClosed` is the failure default on both, so it is paired with the
+    // shortest buffer that does NOT fail: exactly 40 bytes, one byte more than
+    // the longest refusal. The pair attributes the refusal to the fixed
+    // header's length rather than to "everything refuses".
     let stub = vec![0u8; 12];
     assert_eq!(userspace_verdict(&stub, 0), Verdict::FailClosed);
     assert_eq!(shim_verdict(&stub, 0), Verdict::FailClosed);
+    let mut short_by_one = vec![0u8; 39];
+    short_by_one[0] = 0x60;
+    short_by_one[6] = TCP;
+    assert_eq!(userspace_verdict(&short_by_one, 0), Verdict::FailClosed);
+    assert_eq!(shim_verdict(&short_by_one, 0), Verdict::FailClosed);
+    let mut exactly_40 = vec![0u8; 40];
+    exactly_40[0] = 0x60;
+    exactly_40[6] = TCP;
+    assert_eq!(
+        userspace_verdict(&exactly_40, 0),
+        Verdict::L4(40, TCP),
+        "a buffer of exactly the fixed 40-byte header must resolve its declared terminal; \
+         without this the fail-closed assertions above hold for any walker that refuses \
+         everything"
+    );
+    assert_eq!(
+        shim_verdict(&exactly_40, 0),
+        Verdict::L4(40, TCP),
+        "the shim must resolve a buffer of exactly the fixed 40-byte header"
+    );
     // Userspace-only: asserting the shim's offset here would track the generic
     // advance and co-sign mutation 1.
     let one = chain(&[(DEST, 0)], TCP, 0);

@@ -64,20 +64,51 @@ error produced `BUILD rc=0 TEST rc=101` and was scored as "the guard fired".
 Two preflights run first and must themselves fail when broken — one proves the
 build gate really compiles the file under test, one proves a filter matching
 nothing is scored MISSING rather than `ok` (`cargo test` exits 0 on a filter that
-matches no test). The precondition check compares the walk against `HEAD`, index
-included; comparing against the index alone let a STAGED mutation be captured as
-the pristine gold copy and restored as such, which is the failure the check's own
-abort text describes.
+matches no test).
+
+The baseline is VERIFIED BEFORE IT IS CAPTURED, and an unverifiable baseline
+ABORTS. Three ways that used to fail open, all reproduced:
+
+* The gold copy was taken at the top of the script and git consulted 138 lines
+  later, so on a tree git could not speak for, the mutation had already become
+  the baseline. Replayed against an archive with no `.git`, the script printed
+  `UNVERIFIED` and ran every row against a `(len+1)*8 -> (len+1)*16` mutation
+  installed as "pristine", then "restored" it at the end.
+* "Not a git work tree" was a WARNING. It is now `ABORT` — a harness whose whole
+  subject is probes that report success without observing anything cannot make
+  an exception of itself.
+* `git diff` believes the INDEX for a path flagged `assume-unchanged` or
+  `skip-worktree`, so it never stats the file. `git update-index
+  --assume-unchanged` flipped `diff --quiet HEAD` from rc 1 to rc 0 with the
+  mutation still on disk, and the check reported "matches git HEAD (index
+  included)". The `ls-files -v` tag must now be `H`.
+
+The comparison is against `HEAD`, index included; comparing against the index
+alone let a STAGED mutation be captured as the pristine gold copy and restored
+as such.
+
+Scope of that check, precisely: exactly one path, `ipv6_ext_walk.rs`, because
+that is the file the script overwrites. The guard tests and the negative
+controls are NOT compared against git — they are covered behaviourally, by
+row 0 (green on the unmutated tree) and row 12 (a semantically null edit must
+SURVIVE). Neither is a claim that the working tree matches `HEAD`.
 
 The corpus builder also carries non-vacuity floors. The assertions that CONSUME
-the corpus are of the form "this collection is empty" or "this count equals
-cases * offsets", and both hold trivially on an empty corpus — the guards that
-read the manifest's emitted facts, and both negative controls, do not consume it
-and are unaffected.
+the corpus are of the form "this collection is empty" or "the loop visited every
+(offset, case) pair", and both hold trivially on an empty corpus — the guards
+that read the manifest's emitted facts, and both negative controls, do not
+consume it and are unaffected. (The coverage half used to be
+`compared == cases * offsets`, which was tautological: the counter incremented
+inside the loops it claimed to measure, so any edit that skipped a case skipped
+its increment too. It is now a visited set of `(l3, name)` pairs recorded AFTER
+each comparison, checked against a cross product built independently from the
+two inputs, plus a distinct-names assertion so the set cannot collapse two cases
+into one.)
 
 Those floors are named per SHAPE — per-arm boundary witness pairs, the
 chain-length boundary, the next-header sweep, the long-chain shape, the L3
-offsets — and not as one size threshold, because a size threshold did not bind:
+offsets, and each remaining named corpus BLOCK — and not as one size threshold,
+because a size threshold did not bind:
 a single `cases.len() >= 200` stood there while 256 of the ~310 cases came from
 one homogeneous next-header sweep, so cutting the corpus down to that sweep AND
 deleting the generic arm's post-advance bounds revalidation was measured to
@@ -96,10 +127,45 @@ twin must resolve the terminal at exactly the advance target (proving the
 boundary was reached) and the tight twin, one byte shorter, must fail closed
 (attributing the refusal to the length check).
 
+Nor do the five shape floors SUBSUME a coverage floor, which is what deleting
+the old `handcrafted >= 40` count assumed. Between them they require ten
+boundary buffers, the two chain-length twins and the two long chains — 14
+hand-written cases before the 256-value sweep — so the intermediate chain
+lengths, the varied declared lengths, the truncation block, the minimal per-arm
+packets, the non-first fragments, the AH sweep and the #4517 Mobility cases
+could all be deleted with every floor green. Measured: dropping the ten
+varied-length HbH cases and the ten truncation cases takes the hand-written
+count 55 -> 35, which the old count floor caught and none of the shape floors
+does. A sixth floor now binds the BLOCKS themselves — each named category
+rebuilt locally and required in the corpus in full, so deleting a category names
+that category in the failure. Not restored as a count: the old threshold was
+arbitrary, and a count has degenerate satisfiers.
+
+The floors' reference buffers are built by `expect_chain`, deliberately NOT by
+the corpus's own `chain` generator. Rebuilding with `chain` and then looking the
+result up in a corpus `chain` produced is circular at the level of the
+generator: making `chain` write TCP at byte 6 for every one-header input
+collapses the 256-value sweep to a single distinct next-header value, no verdict
+moves on either walker, and the floor still reports 256 present. The
+cross-walker comparison catches a unilateral misclassification; it cannot catch
+a common-mode change to the inputs both walkers are fed. The next-header floor
+additionally reads back the value each corpus buffer CARRIES at byte 6 and
+requires 256 distinct ones.
+
 A floor is worth its predicate, never the prose beside it, so each one also
 states what it does NOT cover. They stop a shape being deleted between
 acceptance runs; they do not establish that the corpus is adequate, which is
 what the matrix above measures.
+
+The parity file also states, as a list rather than as an example, everything it
+asserts about the shim rather than runs: `parse_l2`'s L3 offsets, `parse_ipv6`'s
+arguments to the walk, `parse_l4`'s catch-all (which the `OverLimit` fold rests
+on), and the manifest-to-object relationship. The shim crate is `#![no_std]`
+over `aya-ebpf` and does not build for the host — `cargo build --target
+x86_64-unknown-linux-gnu` fails with "unwinding panics are not supported without
+std" — so its entry points cannot be executed from that test binary at all. An
+accurate list of what is asserted is worth more than naming one item, which
+reads as a claim that the rest are covered.
 
 Note `ipv6_ext_walk.rs` is a hashed input of `userspace_xdp_manifest.json`, so
 even a comment edit there requires `make generate` and trips
@@ -304,7 +370,37 @@ Guard layers (`build-userspace-xdp.sh`):
      ambient environment and a value exported once would otherwise
      disarm the gate forever.
    - 3% is a tripwire, not a performance target: it says "the next change
-     here will not fit" while there is still room to plan.
+     here will not fit" while there is still room to plan. The comparison
+     is `<`, so an object leaving EXACTLY 3.00% passes;
+     `TestShimverifyDecision` carries a `970000/1000000` fixture, the only
+     one that distinguishes `<` from `<=`.
+   - **The decision lives in ONE place.** `decide()` maps
+     `(stats, override)` to the verdict, and `run()` only PRESENTS it —
+     `main()` is `os.Exit(run(...))` and nothing else. Before that, `main`
+     called `decide` and then independently REPEATED both predicates
+     (`!stats.Measured()`, `headroom < floor`) to pick its branch and its
+     `os.Exit`, so the unit-tested function was not the shipped gate:
+     rewriting main's low-headroom predicate to `if false` left `go build`,
+     `go vet` and the whole `cmd/shimverify` suite GREEN while a
+     990796/1000000 object printed `LOW-HEADROOM ... headroom 0.92%` and
+     exited **0**, which the recipe's `0) ;;` arm installs. `run` takes
+     argv, both streams, the environment and the verifier as parameters, so
+     `TestShimverifyRun` asserts the real exit status for every arm without
+     a kernel, root, or an object.
+   - **The recipe is matched as CODE, not as text.**
+     `TestBuildRecipeHandlesShimverifyExitCodes` reads
+     `build-userspace-xdp.sh` through a comment-stripping filter and
+     requires the verifier invocation at the START of a code line, in BOTH
+     branches of `run_verifier` (root and `sudo`). A plain
+     `strings.Contains` was satisfied by the script's own prose: replacing
+     the non-root invocation with
+     `true # sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=..." ...` left the
+     test green while a non-root `make generate` skipped verification
+     entirely and installed through the `0)` arm — the unverified-install
+     path this section says does not exist. The same filter (Rust flavour)
+     backs `TestShimCarriesFragHdrSizeAssertion`, where
+     `const _: () = assert!(true); // mem::size_of::<FragHdr>() == 8`
+     used to satisfy the check.
 
 **Recovery runbook** (symptom: `load Rust xdp_userspace collection:
 ... BPF program is too large. Processed 1000001 insn`, daemon in

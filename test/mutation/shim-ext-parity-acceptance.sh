@@ -38,13 +38,25 @@
 #      run's tree. The lock used to live under ${TMPDIR}, which this repo
 #      routinely varies, so two runs took two different locks and serialised
 #      nothing.
-#   2. GREEN BASELINE SELF-CHECK (row 0), plus a tree-cleanliness check. If the
-#      tree is not clean before the first mutation, every later row is void. An
-#      earlier run was killed mid-mutation, the next run captured the mutated
-#      tree as its "pristine" copy, and reported a clean tree as failing.
-#      Passing tests are NOT tree cleanliness: a mutation the guards do not
-#      detect would be captured as GOLD and restored as "pristine", so the file
-#      is compared against git as well.
+#   2. GREEN BASELINE SELF-CHECK (row 0), plus a VERIFIED-BEFORE-CAPTURED
+#      baseline. If the tree is not clean before the first mutation, every later
+#      row is void. An earlier run was killed mid-mutation, the next run
+#      captured the mutated tree as its "pristine" copy, and reported a clean
+#      tree as failing. Passing tests are NOT tree cleanliness: a mutation the
+#      guards do not detect would be captured as GOLD and restored as
+#      "pristine", so the file is compared against git as well — BEFORE the
+#      capture, and refusing to run at all when git cannot answer.
+#
+#      Scope, precisely, because an earlier revision of this comment said
+#      "a tree-cleanliness check" and meant something narrower: exactly ONE
+#      path is compared against git, ${WALK_REL}, because that is the file this
+#      script OVERWRITES and restores. The guard tests and the negative
+#      controls are NOT compared against git; they are covered BEHAVIOURALLY
+#      instead — row 0 requires them green on the unmutated tree (so a locally
+#      broken or unconditionally-red guard aborts the run) and row 12 requires
+#      them to SURVIVE a semantically null edit (so a guard rewritten to red on
+#      any change fails too). Neither of those is a claim that the working tree
+#      matches HEAD.
 #   3. RESTORE ON EXIT/INT/TERM, VERIFIED. A trap cannot catch SIGKILL, so the
 #      trap is not the safety property — property 2 is. The trap narrows the
 #      window; the `cmp` is what proves the restore happened.
@@ -96,6 +108,57 @@ ALL_TESTS=("${GUARDS[@]}" "${CONTROLS[@]}")
 
 exec 9>"${LOCK}"
 flock -n 9 || { echo "another acceptance run holds ${LOCK}; refusing to interleave"; exit 1; }
+
+# --- preconditions: the baseline is VERIFIED BEFORE IT IS CAPTURED -----------
+#
+# ORDER IS THE PROPERTY, and it used to be wrong. An earlier revision captured
+# GOLD at the top of the script and consulted git 138 lines later, so on any
+# tree git could not speak for, the capture had already happened: the script
+# printed "UNVERIFIED", accepted whatever bytes were on disk as the pristine
+# copy, ran all thirteen rows against them, and "restored" that state at the
+# end. Measured by replaying the real capture-then-precondition sequence
+# against an archive with no `.git`: it printed UNVERIFIED and continued with a
+# `(len+1)*8 -> (len+1)*16` mutation installed as GOLD.
+#
+# So a baseline that CANNOT be verified now ABORTS. "We could not check" is not
+# "it is fine": this file exists because a probe that reports success without
+# having observed anything is the defect that keeps regrowing in it, and a
+# harness cannot make an exception of itself.
+abort() { echo "ABORT: $*" >&2; rm -f "${GOLD}"; exit 1; }
+
+git -C "${REPO}" rev-parse --is-inside-work-tree >/dev/null 2>&1 || abort \
+"${REPO} is not a git work tree (or GIT_DIR points elsewhere), so the pristine copy of
+       ${WALK_REL} cannot be checked against a commit. Every row would run against whatever
+       bytes are on disk — including a mutation left behind by a killed run, which would be
+       captured as GOLD and restored as 'pristine' at the end. Run this from a checkout."
+
+# `diff --quiet HEAD --`, NOT `diff --quiet --`. The latter compares the
+# worktree against the INDEX, so a STAGED mutation is "no difference" and sails
+# through a check whose own abort text spells out the consequence: the mutation
+# is captured as GOLD, restored as pristine, and the whole matrix runs against a
+# poisoned baseline. `HEAD` compares against the commit, which is what "matches
+# git HEAD" claims and what the property needs.
+git -C "${REPO}" diff --quiet HEAD -- "${WALK}" || abort \
+"${WALK_REL} differs from git HEAD (staged or unstaged). A mutation the guards do NOT
+       detect would be captured as the pristine copy and restored as such; passing tests
+       are not tree cleanliness."
+
+# `git diff` believes the INDEX for a path flagged assume-unchanged (a lowercase
+# `ls-files -v` tag) or skip-worktree (`S`) — it does not stat the file — so a
+# MUTATED walker compares equal to HEAD and the check above prints a clean
+# result it did not establish. Measured: `git update-index --assume-unchanged`
+# flipped `diff --quiet HEAD` from rc 1 to rc 0 with the `* 16` mutation still
+# in the file, and the precondition then reported "matches git HEAD (index
+# included)". An empty tag (the path is untracked) aborts for the same reason.
+WALK_INDEX_FLAG="$(git -C "${REPO}" ls-files -v -- "${WALK}" 2>/dev/null | cut -c1)"
+[ "${WALK_INDEX_FLAG}" = "H" ] || abort \
+"${WALK_REL} carries the git index flag '${WALK_INDEX_FLAG:-<untracked>}', want 'H'.
+       assume-unchanged and skip-worktree make git diff ignore the file's real bytes, so the
+       HEAD comparison above cannot see a mutation and its clean result means nothing.
+       Clear it with:
+         git update-index --no-assume-unchanged --no-skip-worktree ${WALK_REL}"
+
+echo "PRECONDITION: ${WALK_REL} matches git HEAD (index included, no assume-unchanged/skip-worktree)"
 
 build_log="$(mktemp)"; test_log="$(mktemp)"; pysub="$(mktemp -t xpf4555sub.XXXXXX)"
 cp "${WALK}" "${GOLD}"
@@ -234,25 +297,6 @@ run() {
 }
 
 echo "=== #4555 acceptance: mutate the shim walk, the guards must red ==="
-
-# --- preconditions --------------------------------------------------------
-if git -C "${REPO}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  # `diff --quiet HEAD --`, NOT `diff --quiet --`. The latter compares the
-  # worktree against the INDEX, so a STAGED mutation is "no difference" and
-  # sails through a check whose own abort text spells out the consequence: the
-  # mutation is captured as GOLD, restored as pristine, and the whole matrix
-  # runs against a poisoned baseline. `HEAD` compares against the commit, which
-  # is what "matches git HEAD" claims and what the property needs.
-  if ! git -C "${REPO}" diff --quiet HEAD -- "${WALK}"; then
-    echo "ABORT: ${WALK_REL} differs from git HEAD (staged or unstaged). A mutation"
-    echo "       the guards do NOT detect would be captured as the pristine copy and"
-    echo "       restored as such; passing tests are not tree cleanliness."
-    exit 1
-  fi
-  echo "PRECONDITION: ${WALK_REL} matches git HEAD (index included)"
-else
-  echo "PRECONDITION: tree cleanliness UNVERIFIED — ${REPO} is not a git work tree"
-fi
 
 # --- P1: the build gate compiles the file this harness mutates ------------
 # Without this, every row's build column is a hardcoded claim. Measured, not
