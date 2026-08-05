@@ -999,6 +999,113 @@ fn interface_wins_over_pool_without_off_5717() {
     );
 }
 
+/// #5717 (#6820 re-gate): the OTHER half of the `interface` + `pool`
+/// precedence claim — the one where interface mode has nothing to translate to.
+///
+/// `interface_wins_over_pool_without_off_5717` above supplies a same-family
+/// egress address, so it exercises only the branch where interface translation
+/// SUCCEEDS. The claim it is cited for is two-sided: interface mode wins, and
+/// when the egress interface has no same-family address the rule takes the
+/// #5688 fail-closed belt (`Unavailable(InterfaceNoEgressAddress)`) instead of
+/// falling back to the authored pool. Nothing bound that second side.
+/// Mutation-measured: letting the no-egress arm fall through to the pool block
+/// when `rule.pool_mode` is set leaves every `5717` test AND both
+/// `interface_source_nat_no_v{4,6}_egress_addr_fails_closed` tests GREEN —
+/// those two carry NO pool, so there is no fallback for them to reach and they
+/// cannot see the interaction.
+///
+/// The difference is a security boundary. The belt exists because a
+/// `Matched`-with-`None`-rewrite forwarded the private source untranslated
+/// (#5688); falling through to the pool does not leak, but it silently
+/// translates onto a DIFFERENT public address than the rule's own terminal
+/// action names, resurrecting the discarded `pool` of a rule the strict gate
+/// rejects — a translation decision made by a fallback no operator authored.
+/// Fail closed and let the flow take the `nat_alloc_fail` drop.
+///
+/// Both families, because the belt resolves the egress address per PACKET
+/// family: the pool carries a usable address of each family, so the mutated
+/// fallback has somewhere real to land in both directions and a RED here is
+/// not an artifact of an unusable pool.
+#[test]
+fn interface_with_pool_no_egress_fails_closed_5717() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "contradictory-interface-pool-no-egress".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec![
+            "10.0.61.0/24".to_string(),
+            "2001:559:8585:ef00::/64".to_string(),
+        ],
+        // No `off`: `interface` + `pool`, the same shape as the test above.
+        interface_mode: true,
+        pool_name: "p1".to_string(),
+        // A usable address of BOTH families — the fallback the mutation would
+        // take is genuinely available in either direction.
+        pool_addresses: vec!["203.0.113.10".to_string(), "2001:db8:cafe::10".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+
+    // v4 packet, egress interface has NO v4 address. The v6 address present
+    // must not be used to translate a v4 packet, and the v4 POOL address must
+    // not be used either.
+    match match_source_nat_result(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress v6")),
+    ) {
+        SourceNatLookup::Unavailable(f) => {
+            assert_eq!(
+                f.reason,
+                SourceNatFailureReason::InterfaceNoEgressAddress,
+                "the no-egress arm must report the #5688 belt's own reason; a \
+                 different reason means the flow took some other failure path"
+            );
+        }
+        other => panic!(
+            "expected Unavailable(InterfaceNoEgressAddress), got {other:?} — an \
+             `interface` + `pool` rule with no same-family egress address must \
+             take the #5688 fail-closed belt, NOT fall back to the pool. A \
+             Matched-with-a-pool-rewrite here means the discarded `pool` action \
+             quietly became the translation for a rule the operator authored as \
+             interface-mode"
+        ),
+    }
+
+    // v6 packet, egress interface has NO v6 address — symmetric, and equally
+    // pool-capable (the pool carries 2001:db8:cafe::10).
+    match match_source_nat_result(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress v4")),
+        None,
+    ) {
+        SourceNatLookup::Unavailable(f) => {
+            assert_eq!(
+                f.reason,
+                SourceNatFailureReason::InterfaceNoEgressAddress,
+                "the v6 no-egress arm must report the #5688 belt's own reason"
+            );
+        }
+        other => panic!(
+            "expected Unavailable(InterfaceNoEgressAddress), got {other:?} — the \
+             v6 half of the belt must fail closed too; the family resolution is \
+             per-packet, so a v4-only egress cannot rescue a v6 packet and the \
+             v6 pool address must not be substituted"
+        ),
+    }
+}
+
 /// #5717 (#6820 gate): `off` precedence over BOTH other actions at once.
 ///
 /// The two pairwise tests above (`off` + `interface`, `off` + `pool`) do not
@@ -1040,12 +1147,20 @@ fn off_wins_over_all_three_actions_5717() {
          the pairwise tests cannot see"
     );
 
-    // NON-MATCHING control. Without this, a triple-action early return placed
+    // NON-MATCHING controls. Without them, a triple-action early return placed
     // ABOVE `rule.matches(...)` would satisfy the assertion above while
-    // exempting traffic OUTSIDE the rule's match prefix — an exemption is a
-    // no-translate decision, so widening one silently un-NATs sources the rule
-    // never covered. Asserting `None` here forces the triple-action handling to
-    // stay INSIDE the match gate.
+    // exempting traffic the rule never covered — an exemption is a no-translate
+    // decision, so widening one silently un-NATs those sources.
+    //
+    // TWO controls, because `rule.matches` is a conjunction over several axes
+    // and a control that varies only ONE of them is scoped narrower than the
+    // claim. The out-of-prefix control alone still passes an early exemption
+    // hoisted to just after the source-prefix check but before the zone /
+    // destination / L4 checks — a real shape, since the source prefix is the
+    // first thing a reader reaches for. The wrong-zone-inside-the-prefix
+    // control is what closes that: it holds the source prefix satisfied and
+    // varies only the zone, so it can only pass if the handling is inside the
+    // FULL match gate.
     assert_eq!(
         match_source_nat(
             &rules,
@@ -1062,5 +1177,24 @@ fn off_wins_over_all_three_actions_5717() {
         "a source OUTSIDE the rule's match prefix must not match at all — if this \
          reports an exemption, the three-action handling was hoisted above the \
          match gate and now un-NATs traffic the rule never covered"
+    );
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            // Wrong ingress zone; the rule is scoped lan -> wan.
+            "dmz",
+            "wan",
+            // INSIDE 10.0.61.0/24 — only the zone disqualifies this packet.
+            "10.0.61.102".parse().expect("src inside match prefix"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        None,
+        "a packet from the WRONG zone must not match even though its source is \
+         inside the rule's prefix — if this reports an exemption, the \
+         three-action handling sits after the source-prefix check but before \
+         the zone check, and now un-NATs a whole zone the rule never covered"
     );
 }

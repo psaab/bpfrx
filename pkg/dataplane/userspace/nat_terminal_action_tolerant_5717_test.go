@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -92,6 +93,10 @@ func sourceSnapByName5717(t *testing.T, snaps []SourceNATRuleSnapshot, name stri
 // the inverse of the authored action with no warning at the dataplane
 // boundary.
 //
+// Every sub-test here is `off`-BEARING, which is what the name asserts. The
+// `off`-less contradiction (`interface` + `pool`) resolves the other way and
+// lives in TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717.
+//
 // RED on revert: restoring the pre-#5628 `else if` chain in
 // compiler_nat_source.go's hierarchical branch makes the single-node
 // `source-nat { off; pool p1; }` resolve to ONE field, so the surviving-field
@@ -147,47 +152,6 @@ security {
 		}
 	})
 
-	t.Run("hierarchical single-node interface+pool (no off)", func(t *testing.T) {
-		// The Rust-side counterpart (interface_wins_over_pool_without_off_5717)
-		// constructs its snapshot DIRECTLY, so it cannot see a Go edit that
-		// drops PoolName whenever InterfaceMode is true — the Rust test would
-		// still pass, because interface mode wins there either way. This
-		// sub-test is what binds the Go builder: both fields must survive
-		// compile -> snapshot, so the contradiction stays visible to `show`,
-		// to the strict gate, and to anyone reading the published rule.
-		cfg := compileHierLenient5717(t, `
-security {
-  nat {
-    source {
-      pool p1 { address 203.0.113.10; }
-      rule-set rs1 {
-        from zone trust;
-        to zone untrust;
-        rule r1 {
-          match { source-address 10.0.0.0/24; }
-          then { source-nat { interface; pool p1; } }
-        }
-      }
-    }
-  }
-}`)
-		s := sourceSnapByName5717(t, buildSourceNATSnapshots(cfg, nil), "r1")
-		if !s.InterfaceMode {
-			t.Errorf("`interface; pool` snapshot InterfaceMode = false, want true: %+v", s)
-		}
-		if s.PoolName != "p1" {
-			t.Errorf("`interface; pool` snapshot PoolName = %q, want p1 — dropping the "+
-				"pool here hides the contradiction from the published rule; the Rust "+
-				"precedence test cannot catch it because interface mode wins regardless",
-				s.PoolName)
-		}
-		if s.Off {
-			t.Errorf("`interface; pool` snapshot Off = true, want false — there is no "+
-				"`off` in this rule and inventing one would flip a translation into an "+
-				"exemption: %+v", s)
-		}
-	})
-
 	t.Run("hierarchical single-node interface+off", func(t *testing.T) {
 		cfg := compileHierLenient5717(t, `
 security {
@@ -215,6 +179,105 @@ security {
 				"want true (pre-#5628 `else if` chain kept one field only)")
 		}
 	})
+}
+
+// TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717 pins the
+// `off`-LESS contradiction: `interface` + `pool p1`. It is a separate top-level
+// test rather than a sub-test of TestTolerantContradictorySNATCarriesOff_5717
+// because it asserts Off=false — nesting an Off=false case under a
+// "CarriesOff" parent misdescribes both.
+//
+// The Rust-side counterpart (interface_wins_over_pool_without_off_5717 and
+// interface_with_pool_no_egress_fails_closed_5717) constructs its snapshot
+// DIRECTLY, so it cannot see a Go edit that drops the pool whenever
+// InterfaceMode is true — the Rust tests would still pass, because interface
+// mode wins there either way. This test is what binds the Go builder.
+//
+// What surviving both fields buys, precisely: the published rule keeps the
+// contradiction, so the strict gate still counts TWO terminal actions and
+// rejects the rule on the next commit, and the Rust matcher still sees a
+// pool-mode rule whose `interface` precedence it must honour. It does NOT keep
+// the contradiction visible to `show`: both source-NAT renderers select ONE
+// action to display — pkg/cli/cli_show_nat.go initialises `action` as
+// "interface" and overwrites it with `pool <name>` whenever PoolName is
+// non-empty, and pkg/natshow/source.go does the same (with `off` as a third,
+// lower-precedence branch) — so an `interface` + `pool p1` rule renders as
+// `pool p1` and the operator sees no contradiction at all. The
+// operator-visible signal for this rule is the tolerant-path WARNING asserted
+// below, not the `show` output.
+func TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717(t *testing.T) {
+	cfg := compileHierLenient5717(t, `
+security {
+  nat {
+    source {
+      pool p1 { address 203.0.113.10; }
+      rule-set rs1 {
+        from zone trust;
+        to zone untrust;
+        rule r1 {
+          match { source-address 10.0.0.0/24; }
+          then { source-nat { interface; pool p1; } }
+        }
+      }
+    }
+  }
+}`)
+	s := sourceSnapByName5717(t, buildSourceNATSnapshots(cfg, nil), "r1")
+	if !s.InterfaceMode {
+		t.Errorf("`interface; pool` snapshot InterfaceMode = false, want true: %+v", s)
+	}
+	if s.PoolName != "p1" {
+		t.Errorf("`interface; pool` snapshot PoolName = %q, want p1 — dropping the "+
+			"pool here hides the contradiction from the published rule; the Rust "+
+			"precedence test cannot catch it because interface mode wins regardless",
+			s.PoolName)
+	}
+	// PoolAddresses is asserted separately from PoolName because the two are
+	// independently droppable and only this one decides pool_mode in Rust:
+	// `parse_source_nat_rules` sets pool_mode from
+	// `!pool_name.is_empty() || !pool_addresses.is_empty()`, and the resolved
+	// addresses are what an allocation would actually translate onto. A builder
+	// edit that kept PoolName but dropped the resolved addresses left the
+	// PoolName-only assertion GREEN (mutation-measured), so the "both fields
+	// survive" claim was only half-bound.
+	if len(s.PoolAddresses) != 1 || s.PoolAddresses[0] != "203.0.113.10" {
+		t.Errorf("`interface; pool` snapshot PoolAddresses = %v, want [203.0.113.10] — "+
+			"the resolved pool must survive too, not just its NAME: the Rust matcher "+
+			"derives pool_mode from either field and an allocation translates onto "+
+			"these addresses", s.PoolAddresses)
+	}
+	if s.Off {
+		t.Errorf("`interface; pool` snapshot Off = true, want false — there is no "+
+			"`off` in this rule and inventing one would flip a translation into an "+
+			"exemption: %+v", s)
+	}
+	// The snapshot assertions above all stay GREEN if the #5628 cardinality
+	// gate is deleted outright — the builder happily publishes both fields with
+	// no gate at all. The gate's tolerant-path warning is the ONLY thing that
+	// tells an operator this rule is malformed (see the `show` note above), so
+	// bind it here alongside the fields it is warning about.
+	requireCardinalityWarning5717(t, cfg, "r1")
+}
+
+// requireCardinalityWarning5717 asserts the tolerant compile recorded the #5628
+// terminal-action cardinality warning naming the given rule. The tolerant path
+// downgrades validateNATTerminalActionCardinalityStrict's hard error to a
+// cfg.Warnings entry (#1960 no-brick, compiler_uniformgates_firewall_nat2.go);
+// asserting the rule NAME as well as the prefix keeps this from passing on some
+// unrelated cardinality warning.
+func requireCardinalityWarning5717(t *testing.T, cfg *config.Config, rule string) {
+	t.Helper()
+	const prefix = "NAT terminal-action cardinality"
+	want := `rule "` + rule + `"`
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, prefix) && strings.Contains(w, want) {
+			return
+		}
+	}
+	t.Errorf("tolerant compile recorded no %q warning naming %s; got %d warnings: %v — "+
+		"without it a malformed rule loads silently and the operator has no signal "+
+		"at all, since `show` renders one selected action rather than the contradiction",
+		prefix, want, len(cfg.Warnings), cfg.Warnings)
 }
 
 // TestTolerantContradictoryDNATResolvesExempt_5717 pins the DNAT half, where

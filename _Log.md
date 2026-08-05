@@ -77237,3 +77237,53 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_uniformgates_firewall_nat2.go, docs/config-schema.md,
   pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
   userspace-dp/src/nat/tests_source.rs, _Log.md
+
+- **Timestamp**: 2026-08-05
+- **Action**: #6820 re-gate fold round 2 (MERGE-NEEDS-MINOR). The previous round
+  corrected three false comment claims and then wrote a fourth: docs/config-
+  schema.md cited `interface_wins_over_pool_without_off_5717` as the pin for the
+  qualified two-sided claim ("interface translation when a same-family egress
+  address exists, fail-closed `Unavailable(InterfaceNoEgressAddress)` when it
+  does not"), but that test supplies `Some(172.16.80.8)` and so only ever
+  exercises the SUCCEEDING half. Added
+  `interface_with_pool_no_egress_fails_closed_5717` (both families, pool carrying
+  a usable v4 AND v6 address so the fallback has somewhere real to land) and
+  re-pointed the doc + the gate comment at BOTH fixtures with an explicit note
+  that neither the citing test nor the generic
+  `interface_source_nat_no_v{4,6}_egress_addr_fails_closed` pair closes the gap —
+  those two carry no pool, so a belt that falls back to pool translation leaves
+  them green. Measured, not asserted: mutating the no-egress arm to fall through
+  to the pool block when `rule.pool_mode` is set REDs only the new test
+  (`Matched(rewrite_src: 203.0.113.10)` — the discarded pool silently becomes the
+  translation) while all 271 other `nat::` tests, including all five pre-existing
+  `5717` tests and both generic no-egress tests, stay GREEN. Also tightened two
+  controls. The Rust non-matching control varied only the source prefix, so a
+  triple-action exemption hoisted past the prefix check but before the zone check
+  survived it; added a wrong-zone packet INSIDE 10.0.61.0/24, and the prescribed
+  mutation now REDs on that assertion while the pre-existing out-of-prefix
+  assertion (which runs first) passes — the negative control is inline. The Go
+  builder control asserted PoolName but not PoolAddresses or cfg.Warnings; both
+  are now bound. Dropping only PoolAddresses REDs the new assertion with the
+  other three in the same test and every other test in
+  pkg/dataplane/userspace GREEN. On the warning: a BLANKET removal and a
+  shared-validator narrowing are both already caught by pre-existing pkg/config
+  tests, so the honest escape is narrower — suppressing the warning on the
+  TOLERANT branch for source-nat only leaves the whole pkg/config suite GREEN
+  (its lenient test uses a zero-action DNAT rule) and REDs only the new
+  assertion. Two structural corrections: the `interface + pool` case asserted
+  `Off=false` while nested under `TestTolerantContradictorySNATCarriesOff_5717`,
+  so it is now its own top-level test; and its comment claimed the surviving
+  fields keep the contradiction "visible to `show`", which is false — both
+  renderers select ONE action (`cli_show_nat.go` initialises interface then
+  overwrites with `pool <name>`; `natshow/source.go` the same), so an
+  `interface + pool p1` rule renders as `pool p1` and the tolerant-path warning
+  is the operator's only signal. Tests, comments and docs only; no production
+  change. Note for the next agent: `cargo fmt -- <file>` formats the WHOLE crate,
+  not just the named file — it dirtied 324 files here and tripped
+  TestHeatmapNotStale via an unrelated file crossing 1500 LOC; all 324 were
+  reverted and the gate re-verified green. Validation: `go test ./pkg/config/...
+  ./pkg/dataplane/userspace/...` ok; `go test ./pkg/refactoraudit/...` ok;
+  `cargo test --release --bins nat::` 272 passed, 0 failed.
+- **File(s)**: userspace-dp/src/nat/tests_source.rs,
+  pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
+  pkg/config/compiler_validate_strict_nat.go, docs/config-schema.md, _Log.md

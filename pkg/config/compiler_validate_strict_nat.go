@@ -2788,9 +2788,18 @@ func natThenTerminalActionCount(then NATThen) int {
 //     This is still a malformed rule the strict gate rejects; it is called out
 //     because "a contradiction resolves to the exemption" is TRUE ONLY when the
 //     contradiction contains `off`, and stating it unqualified is the same
-//     untested-safety-claim defect. Pinned by
-//     interface_wins_over_pool_without_off_5717.
-//     (userspace-dp/src/nat/tests_source.rs). Note the DNAT precedence is
+//     untested-safety-claim defect. Both halves are pinned, by SEPARATE
+//     fixtures: the translating half by interface_wins_over_pool_without_off_5717
+//     and the fail-closed half by interface_with_pool_no_egress_fails_closed_5717
+//     (both userspace-dp/src/nat/tests_source.rs). Do not cite only the first
+//     for the fail-closed half — it supplies a same-family egress address, so
+//     it never reaches the belt; and the generic
+//     interface_source_nat_no_v{4,6}_egress_addr_fails_closed pair does not
+//     close the gap either, because those rules carry no pool and so cannot
+//     detect a belt that falls back to pool translation. On the Go side
+//     TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717
+//     (pkg/dataplane/userspace) pins that the builder publishes BOTH actions
+//     plus this gate's tolerant-path warning. Note the DNAT precedence is
 //     decided in Go (the `isOff` short-circuit in nat_destination.go) and the
 //     SNAT precedence in Rust (the `rule.off` early return in
 //     nat/source.rs) — mutating either one publishes the exemption as a

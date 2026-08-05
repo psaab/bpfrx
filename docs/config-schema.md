@@ -3115,8 +3115,17 @@ there very differently, and the difference is load-bearing:
   (`InterfaceNoEgressAddress`) when it does not — the #5688 belt, which refuses
   to forward untranslated rather than leaking the private source. "A contradiction resolves to the exemption" is therefore true ONLY
   of the `off`-bearing case; stating it unqualified is the same
-  untested-safety-claim defect this section documents. Pinned by
-  `interface_wins_over_pool_without_off_5717`. Note a claim quantified over
+  untested-safety-claim defect this section documents. Both halves of this one
+  are pinned, and they need separate fixtures: the translating half by
+  `interface_wins_over_pool_without_off_5717`, the fail-closed half by
+  `interface_with_pool_no_egress_fails_closed_5717`. The generic no-egress
+  tests (`interface_source_nat_no_v{4,6}_egress_addr_fails_closed`) do not
+  cover the second half — they use interface mode with NO pool, so a fallback
+  from the belt into pool translation leaves them green. On the Go side
+  `TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717` pins that
+  the builder publishes BOTH actions (and the tolerant-path warning), since a
+  Rust test building its snapshot directly cannot see a Go edit that drops the
+  pool. Note a claim quantified over
   "2+ actions" cannot be discharged by pairwise fixtures alone — the three-action
   `interface` + `off` + `pool` shape is pinned separately by
   `off_wins_over_all_three_actions_5717`, because two pairwise tests both survive
