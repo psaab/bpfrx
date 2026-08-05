@@ -786,3 +786,163 @@ fn source_nat_all_valid_reports_no_parse_errors() {
     );
 }
 
+// === #5717 / #5628 tolerant-load parity: `off` PRECEDENCE over a contradictory
+// terminal action ===
+//
+// The #5628 commit gate hard-rejects a NAT rule whose `then` block carries two
+// mutually-exclusive terminal actions; the tolerant load / peer-sync path only
+// WARNS (#1960 no-brick), so a pre-#5628 persisted config — or a peer-synced
+// one — still reaches this matcher with BOTH fields set (the Go compiler's
+// independent-`if` setters record every action it finds, and the Go snapshot
+// builder forwards `off` + `interface_mode` / `pool_*` verbatim; see
+// pkg/dataplane/userspace/nat_source.go).
+//
+// The gate's contract comment states the resulting behavior is safe because
+// "the Rust dataplane's off-precedence governs (off wins -> exempt)". That is
+// the ONLY thing standing between a leniently-loaded contradictory rule and
+// publishing an authored EXEMPTION as a TRANSLATION — the exact inversion the
+// gate exists to prevent — and until #5717 nothing bound it.
+//
+// `off_rule_short_circuits_translation` above does NOT bind it: its rule sets
+// `off` ALONE, so it stays green under a mutation that moves the `rule.off`
+// check BELOW the `rule.interface_mode` block (a clean off rule has
+// interface_mode == false and pool_mode == false, so it still reaches the
+// relocated check). These two tests bind the precedence itself.
+
+/// #5717 fail-on-revert: a leniently-loaded rule carrying BOTH `off` and
+/// `interface` must resolve to the EXEMPTION. Moving the `rule.off` early
+/// return in `match_source_nat_result` below the `rule.interface_mode` block
+/// makes this rewrite the source to the egress address — the authored
+/// exemption published as a translation.
+#[test]
+fn off_wins_over_contradictory_interface_action_5717() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "contradictory-off-interface".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string()],
+        // Both terminal actions set — what the tolerant path publishes for
+        // `then { source-nat { interface; off; } }`.
+        off: true,
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            "10.0.61.102".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        Some(NatDecision::default()),
+        "a contradictory `off` + `interface` rule must resolve to the EXEMPTION \
+         (no rewrite); a rewrite means the authored exemption published as a \
+         translation — the #5628 inversion the tolerant path relies on \
+         off-precedence to prevent"
+    );
+}
+
+/// #5717 fail-on-revert: a leniently-loaded rule carrying BOTH `off` and a
+/// usable `pool` must resolve to the EXEMPTION and allocate nothing. Moving the
+/// `rule.off` early return below the pool block makes this take a pool
+/// allocation and rewrite the source.
+#[test]
+fn off_wins_over_contradictory_pool_action_5717() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "contradictory-off-pool".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string()],
+        // Both terminal actions set — what the tolerant path publishes for
+        // `then { source-nat { off; pool p1; } }`. The Go builder resolves and
+        // forwards the pool (probe-verified: PoolAddresses is populated), so
+        // the rule is genuinely pool-capable here.
+        off: true,
+        pool_name: "p1".to_string(),
+        pool_addresses: vec!["203.0.113.10".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            "10.0.61.102".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        Some(NatDecision::default()),
+        "a contradictory `off` + `pool` rule must resolve to the EXEMPTION (no \
+         rewrite, no pool allocation); a rewrite means the authored exemption \
+         published as a translation"
+    );
+}
+
+/// #5717: pin the ACTUAL tolerant-load behavior of a ZERO-action rule so the
+/// #5628 contract comment cannot drift back to calling it harmless.
+///
+/// A leniently-loaded actionless rule is NOT inert. The Go snapshot builder
+/// EMITS it (probe-verified: `Off=false Iface=false Pool=""`), it MATCHES here,
+/// and the `else` arm below the pool_mode check clears the tentative counter
+/// and `continue`s — so matching traffic falls through to the next, BROADER
+/// rule and is translated by it. That is the fail-open the strict gate's own
+/// rejection text names ("matching traffic falls through to a later broader
+/// rule — an intended exemption silently disappears").
+///
+/// This test asserts today's behavior, not a desired one. Making an actionless
+/// rule TERMINAL would be a migration-contract change (it would newly exempt
+/// traffic that deployed configs currently translate) and is tracked on #5717,
+/// not made here. Any such change must consciously update this test.
+#[test]
+fn actionless_rule_falls_through_to_later_broader_rule_5717() {
+    let rules = parse_source_nat_rules(&[
+        // Narrow, ACTIONLESS rule first — the shape a pre-#5628 config can
+        // still carry through a tolerant load.
+        SourceNATRuleSnapshot {
+            name: "actionless-narrow".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["10.0.61.0/24".to_string()],
+            ..SourceNATRuleSnapshot::default()
+        },
+        // Broader translating rule second.
+        SourceNATRuleSnapshot {
+            name: "broad-interface".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["10.0.0.0/8".to_string()],
+            interface_mode: true,
+            ..SourceNATRuleSnapshot::default()
+        },
+    ]);
+    let decision = match_source_nat(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        decision,
+        Some(NatDecision {
+            rewrite_src: Some("172.16.80.8".parse().expect("snat v4")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "an actionless rule must fall THROUGH to the later broader rule (today's \
+         behavior). If this now reports an exemption, the actionless disposition \
+         was changed to terminal — a migration-contract change that must be \
+         reviewed on #5717, not landed silently"
+    );
+}

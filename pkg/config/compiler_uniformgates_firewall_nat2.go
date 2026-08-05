@@ -207,9 +207,14 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// silently pick one by packed-key/child order (an exemption can publish as a
 	// translation — the inverse of the authored action). Strict on commit /
 	// commit-check (hard reject so the malformed rule is operator-visible);
-	// lenient on load / peer-sync (warn — #1960 no-brick; the dataplane is no
-	// worse than before the gate). Preserves #3850 duplicate-`then`-CONTAINER
-	// last-wins (the count reflects the winning block only).
+	// lenient on load / peer-sync (warn — #1960 no-brick). The two arities land
+	// differently on that tolerant path and only one of them is safe — a
+	// contradictory rule resolves to the EXEMPTION via `off` precedence, an
+	// actionless one FALLS THROUGH to a later broader rule. Both dispositions
+	// are spelled out and test-cited on validateNATTerminalActionCardinalityStrict
+	// (#5717); do not restate them as "inert" here. Preserves #3850
+	// duplicate-`then`-CONTAINER last-wins (the count reflects the winning block
+	// only).
 	if err := validateNATTerminalActionCardinalityStrict(cfg); err != nil {
 		if opts.lenientNATTerminalAction {
 			cfg.Warnings = append(cfg.Warnings,

@@ -2757,14 +2757,39 @@ func natThenTerminalActionCount(then NATThen) int {
 // rejected here — a rule with two `then` blocks each naming one action still
 // commits. Strict on commit / commit-check (hard reject so the malformed rule
 // is operator-visible); the caller downgrades to a warning on the tolerant load
-// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick) — a
-// leniently-loaded actionless rule is inert (installs nothing), and a
-// contradictory one now records BOTH fields (the else-if→if setter change), so
-// the Rust dataplane's off-precedence governs (off wins → exempt) — unifying
-// the hierarchical path with the pre-existing flat-set both-fields behavior
-// rather than the old Go single-field pick; only a malformed rule reaches this
-// path (the strict commit path rejects it). Rule-sets are walked in sorted name
-// order for a deterministic first-reported offender.
+// / peer-sync path (opts.lenientNATTerminalAction, #1960 no-brick). Only a
+// malformed rule reaches that path — the strict commit path rejects it — but
+// what happens there is NOT symmetric between the two arities (#5717):
+//
+//   - CONTRADICTORY (2+ actions): safe, and now bound by tests. The rule
+//     records BOTH fields (the else-if→if setter change) and the snapshot
+//     builders forward both, so `off` precedence governs and the rule resolves
+//     to the EXEMPTION — never the inverse. That precedence is the whole
+//     safety argument, so it is pinned on both sides: in Go by
+//     TestTolerantContradictory{SNAT,DNAT}*_5717
+//     (pkg/dataplane/userspace) and in Rust by
+//     off_wins_over_contradictory_{interface,pool}_action_5717
+//     (userspace-dp/src/nat/tests_source.rs). Note the DNAT precedence is
+//     decided in Go (the `isOff` short-circuit in nat_destination.go) and the
+//     SNAT precedence in Rust (the `rule.off` early return in
+//     nat/source.rs) — mutating either one publishes the exemption as a
+//     translation.
+//
+//   - ZERO actions: NOT inert, despite installing no translation. For source
+//     NAT the builder EMITS the actionless rule and the Rust matcher's `else`
+//     arm (nat/source.rs) then `continue`s to the next rule; for destination
+//     NAT the builder skips the rule. Either way the matched traffic FALLS
+//     THROUGH to a later, broader rule and is translated by it — exactly the
+//     fail-open this gate's own zero-action rejection text describes. Making
+//     an actionless rule terminal instead would newly exempt traffic that
+//     already-deployed configs translate, so it is a migration-contract
+//     decision tracked on #5717, not a mechanical fix.
+//     TestTolerantActionlessRuleIsNotInert_5717 and
+//     actionless_rule_falls_through_to_later_broader_rule_5717 pin today's
+//     disposition so the "inert" framing cannot silently return.
+//
+// Rule-sets are walked in sorted name order for a deterministic first-reported
+// offender.
 func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil

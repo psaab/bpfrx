@@ -3087,6 +3087,37 @@ picking one. Production tests:
 `compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
 zero/two/valid + #3850 last-wins preservation).
 
+*What the tolerant path actually does (#5717).* Only a malformed rule reaches
+the lenient arm — the strict commit path rejects it — but the two arities land
+there very differently, and the difference is load-bearing:
+
+- **Contradictory (2+ actions) resolves to the EXEMPTION.** Recording both
+  fields is what makes this safe: `off` takes precedence over `interface` /
+  `pool`, so a leniently-loaded contradiction can never publish the INVERSE of
+  the authored action. The precedence is split across the language boundary —
+  destination NAT decides it in Go (the `isOff` short-circuit in
+  `pkg/dataplane/userspace/nat_destination.go`, which must publish a pool-less
+  exemption entry) and source NAT decides it in Rust (the `rule.off` early
+  return in `userspace-dp/src/nat/source.rs`). Both halves are now pinned:
+  `TestTolerantContradictory{SNAT,DNAT}*_5717`
+  (`pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go`) and
+  `off_wins_over_contradictory_{interface,pool}_action_5717`
+  (`userspace-dp/src/nat/tests_source.rs`). The pre-existing
+  `off_rule_short_circuits_translation` does NOT cover this — its rule sets
+  `off` alone, so it stays green under a mutation that lets `interface` win.
+
+- **Zero actions is NOT inert.** It installs no translation, but the matched
+  traffic FALLS THROUGH to a later, broader rule and is translated by that —
+  the fail-open the gate's own zero-action rejection text describes. Source NAT
+  reaches it by emitting the actionless rule and letting the Rust matcher's
+  `else` arm `continue`; destination NAT reaches it by skipping the rule in the
+  builder. Making an actionless rule terminal would newly exempt traffic that
+  already-deployed configs translate, so that is a migration-contract decision
+  tracked on #5717 rather than a mechanical fix.
+  `TestTolerantActionlessRuleIsNotInert_5717` and
+  `actionless_rule_falls_through_to_later_broader_rule_5717` pin today's
+  disposition so the "inert" framing cannot silently return.
+
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`
 (`schema_security.go`), each after the same leaf-completeness audit — the

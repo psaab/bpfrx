@@ -77127,3 +77127,45 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
   _Log.md
+- **Timestamp**: 2026-08-05
+- **Action**: #5717 (C-CONFIG cohort) — bind the #5628 NAT terminal-action gate's
+  TOLERANT-path safety claim and correct the half of it that was false. The gate
+  hard-rejects a `then` block carrying zero or 2+ mutually-exclusive translation
+  actions at strict commit but only WARNS on the tolerant load / peer-sync path
+  (#1960 no-brick), and its contract comment justified that with two claims,
+  neither of which any test bound. Claim 1 — a contradictory rule is safe because
+  "the Rust dataplane's off-precedence governs (off wins -> exempt)" — is TRUE and
+  is now pinned on both sides of the language boundary: destination NAT decides it
+  in Go (the `isOff` short-circuit in nat_destination.go) and source NAT in Rust
+  (the `rule.off` early return in nat/source.rs). The pre-existing
+  `off_rule_short_circuits_translation` did NOT cover it: its rule sets `off`
+  ALONE, so it stays green under a mutation that lets `interface` win. Claim 2 —
+  "a leniently-loaded actionless rule is inert (installs nothing)" — is FALSE in
+  the way that matters: the source-NAT builder EMITS the actionless rule and the
+  Rust matcher's `else` arm then `continue`s, so matched traffic falls through to
+  a later BROADER rule and is translated by it (destination NAT reaches the same
+  outcome by skipping the rule). That is exactly the fail-open the gate's own
+  zero-action rejection text describes, so the comment told a future reader the
+  tolerant path was harmless while the gate said the opposite. Corrected the
+  contract comment + the runUniformGates call-site comment and documented the
+  asymmetry in docs/config-schema.md. Making an actionless rule TERMINAL would
+  newly exempt traffic that already-deployed configs translate — a
+  migration-contract decision, left scoped on #5717 rather than landed here.
+  Validation: five new tests, each proven RED under an isolating mutation —
+  off-check relocated below `interface_mode` (Rust interface test RED, clean-off
+  test still GREEN, i.e. the old guard is blind); `off && !pool_mode` (Rust pool
+  test RED, interface test GREEN); `else if` setter restored (all three Go SNAT
+  sub-tests RED, one showing `InterfaceMode:true Off:false` — the live
+  inversion); `!isOff` guard dropped (Go DNAT RED with `PoolAddress=10.0.0.5`);
+  builder skips actionless rules (Go pin RED). `go vet` clean under every
+  mutation, so each RED is an assertion, not a build break. Full `go test ./...`
+  exit 0; full `cargo test` exit 0. The cargo leg also surfaced an INTERMITTENT
+  failure in `afxdp::ha::tests::current_generation_install_and_delete_still_apply_
+  on_poisoned_shared_mutex`, verified pre-existing at pristine origin/master
+  (ad9591177) where it reproduces 3 of 5 runs — five ha_tests share two
+  process-global `AtomicU64` stale-ignored counters with no serialization. Filed
+  as #6819, not folded here.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
+  userspace-dp/src/nat/tests_source.rs, docs/config-schema.md, _Log.md
