@@ -1189,10 +1189,15 @@ func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hos
 //     the caller passes the name it just applied, rather than this code racing
 //     os.Hostname() against the apply order.
 //
-// No live HTTPS leg means no management certificate is being served, so there is
-// nothing to be stale — a no-op. It deliberately reads the LIVE leg only, never
-// the s.httpsServer construction template, which survives a TLS disable and
-// would otherwise produce warnings about a certificate nobody serves.
+// It returns whether it actually reached a certificate — false means no live
+// HTTPS leg was serving, so the question could not be answered and the CALLER
+// still owes the diagnosis (#6827). Returning false is NOT "nothing was wrong":
+// the durable certificate on disk outlives the listener, so a host name that
+// went stale while HTTPS was down is still stale when HTTPS comes back.
+//
+// It deliberately reads the LIVE leg only, never the s.httpsServer construction
+// template, which survives a TLS disable and would otherwise produce warnings
+// about a certificate nobody serves.
 //
 // "Live" is listenerLeg.serving(), not a non-nil pointer (#6827). A leg whose
 // serve loop exited unexpectedly stays INSTALLED in s.httpsLeg with only its
@@ -1200,7 +1205,7 @@ func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hos
 // installed while it drains — diagnosing either would report a certificate that
 // no socket is presenting, which is the same false positive the construction
 // template was rejected for.
-func (s *Server) WarnStaleMgmtCertForHostName(hostName string) {
+func (s *Server) WarnStaleMgmtCertForHostName(hostName string) bool {
 	s.lifeMu.Lock()
 	var srv *http.Server
 	if s.httpsLeg.serving() {
@@ -1208,27 +1213,31 @@ func (s *Server) WarnStaleMgmtCertForHostName(hostName string) {
 	}
 	s.lifeMu.Unlock()
 	if srv == nil || srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
-		return
+		return false
 	}
 	cert := srv.TLSConfig.Certificates[0]
 	if len(cert.Certificate) == 0 {
-		return
+		return false
 	}
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
-		return
+		// A live leg is serving a certificate we cannot parse. The question WAS
+		// reached; re-parsing it later will fail identically, so report it
+		// answered rather than making the caller retry forever.
+		return true
 	}
 	bindHost := ""
 	if h, _, err := net.SplitHostPort(srv.Addr); err == nil {
 		bindHost = h
 	}
 	if warnCertNoSANs(leaf, bindHost, hostName) {
-		return
+		return true
 	}
 	// Only the host name is diagnosed here: the bind host did not change, so a
 	// stale one was already reported when the leg last bound, and repeating it on
 	// every rename is noise.
 	warnStaleHostName(leaf, hostName, bindHost, hostNameOperatorSet)
+	return true
 }
 
 // generateSelfSignedCertAt creates or loads a self-signed TLS certificate

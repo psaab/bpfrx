@@ -338,16 +338,37 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 		}
 	})
 
-	t.Run("draining_leg_is_not_diagnosed", func(t *testing.T) {
-		// A leg retiring under a requested shutdown (stopLegLocked closed stopCh)
-		// is also still installed while it drains. `dead` is NOT set on this path
-		// — the goroutine takes the stopCh branch — so testing `dead` alone would
-		// miss it.
+	t.Run("root_shutdown_exited_leg_is_not_diagnosed", func(t *testing.T) {
+		// The state that ACTUALLY occurs and sets no flag at all: on
+		// root-context shutdown the serve goroutine drains and RETURNS without
+		// setting `dead` and without closing `stopCh`, leaving the leg installed
+		// in s.httpsLeg permanently. A predicate built from the paths that SET
+		// flags misses it entirely — which is why `exited` is stored from a
+		// defer over the whole goroutine rather than per-branch (#6827).
 		s := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
-		close(s.httpsLeg.stopCh)
+		s.httpsLeg.exited.Store(true)
 		out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
 		if out != "" {
-			t.Fatalf("a leg draining under a requested retirement must not be diagnosed; got %q", out)
+			t.Fatalf("a leg whose serve goroutine has returned must not be diagnosed; got %q", out)
+		}
+	})
+
+	t.Run("reports_whether_it_reached_a_certificate", func(t *testing.T) {
+		// The return value is the caller's debt signal: false means the question
+		// could not be answered, so the diagnosis is still owed. Clearing a
+		// pending diagnosis on a false return loses it permanently, because the
+		// durable certificate outlives the listener.
+		live := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+		if !live.WarnStaleMgmtCertForHostName("new-fw") {
+			t.Fatal("a live serving leg must report the question answered")
+		}
+		if (&Server{}).WarnStaleMgmtCertForHostName("new-fw") {
+			t.Fatal("no serving leg must report the question UNanswered so the caller retries")
+		}
+		dead := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+		dead.httpsLeg.exited.Store(true)
+		if dead.WarnStaleMgmtCertForHostName("new-fw") {
+			t.Fatal("an exited leg must report the question UNanswered")
 		}
 	})
 

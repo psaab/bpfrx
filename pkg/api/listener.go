@@ -35,34 +35,44 @@ type listenerLeg struct {
 	// goroutine waits on lifeMu before it can return -> Done). Storing atomically
 	// with no lock breaks that lock-ordering cycle (#6401 round-3 fix).
 	dead atomic.Bool
+	// exited is set when the serve goroutine RETURNS, for any reason: an
+	// unexpected serve error, a requested retirement, or root-context
+	// shutdown. `dead` covers only the first of those (#6401 needs to
+	// distinguish a self-termination), and `stopCh` covers only the second —
+	// the root-context path at the bottom of serveLegLocked drains and returns
+	// having set NEITHER, leaving the leg installed in s.httpsLeg forever with
+	// every flag clear (#6827). Set from a defer so no future exit path can be
+	// added without marking it. Atomic for the same lock-ordering reason as
+	// `dead`.
+	exited atomic.Bool
 }
 
 // serving reports whether this leg is actually carrying traffic right now: it
-// exists, holds a listener, its serve loop has not exited on its own
-// (`dead`), and no graceful retirement has been requested (`stopCh`).
+// exists, holds a listener, and its serve goroutine has neither self-terminated
+// (`dead`) nor returned for any other reason (`exited`).
 //
 // A non-nil leg pointer is NOT that question (#6827). An unexpected serve exit
-// only sets `dead` and leaves the leg INSTALLED in s.httpsLeg, and a requested
-// retirement only closes stopCh while the leg drains — in both states the
-// pointer is live and the socket is not. A caller that reads the leg to answer
-// "what is this box serving?" must test the state, not the pointer.
+// sets `dead` and leaves the leg INSTALLED in s.httpsLeg; the root-context
+// shutdown path sets NOTHING at all and also leaves it installed. In both
+// states the pointer is live and the socket is not. A caller that reads the leg
+// to answer "what is this box serving?" must test the state, not the pointer.
+//
+// It tests `exited` rather than `stopCh` on purpose. A requested retirement
+// (stopLegLocked) is not observable through s.httpsLeg by construction: the
+// disable arm clears s.httpsLeg under lifeMu before retiring, and the rebind
+// arm installs the replacement before retiring the old one. So a stopCh test
+// would be an arm for a state that cannot occur — while the state that DOES
+// occur, root-context shutdown, sets no flag at all and would slip past it.
+// `exited` is set from a defer over the whole serve goroutine, so it covers
+// every exit including that one.
 //
 // Deliberately stricter than EffectiveHTTPAddr's inline check, which tests nil
-// / ln / dead but NOT stopCh: that one answers `show system services`, where a
-// leg draining under a requested shutdown should still report the address it is
-// finishing on. This one answers "is there a certificate in front of clients
-// right now?", where a leg on its way out must not be diagnosed. The two
+// / ln / dead only: that one answers `show system services`, where a leg
+// finishing a graceful drain should still report the address it is on. This one
+// answers "is there a certificate in front of clients right now?" The two
 // questions differ, so they are not folded into one predicate.
 func (l *listenerLeg) serving() bool {
-	if l == nil || l.ln == nil || l.dead.Load() {
-		return false
-	}
-	select {
-	case <-l.stopCh:
-		return false // retirement requested; the leg is draining
-	default:
-		return true
-	}
+	return l != nil && l.ln != nil && !l.dead.Load() && !l.exited.Load()
 }
 
 // serveLegLocked launches srv on ln in a background goroutine registered on the
@@ -77,6 +87,11 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool) *
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		// #6827: mark the leg no-longer-serving on EVERY exit path. A defer is
+		// used deliberately rather than a store per branch: the root-context
+		// arm below previously returned without setting any flag, and a defer
+		// cannot be forgotten by a later edit.
+		defer leg.exited.Store(true)
 
 		serveErr := make(chan error, 1)
 		go func() {

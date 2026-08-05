@@ -1,3 +1,53 @@
+## 2026-08-05 — #6827 fold r4: three MAJORs — the debt was cleared on delivery, not on success
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded three runtime findings from the gate at `608e570d9`.
+  (1) **The r3 unconditional drain lost the diagnosis permanently.** Verified
+  both paths: an HTTP-start failure leaves `m.srv` nil and `management.go`'s
+  `if m.srv == nil { return nil }` means no later reconcile recovers it; and
+  with HTTPS off/bind-failed the drain cleared the parked name having emitted
+  nothing. In both cases the next boot's `applyHostname` returns early (name
+  already applied) and the load path's INFERRED heuristic declines cross-shape
+  drift — which this PR's own residual note at `server.go` already said. The
+  r3 trade was therefore not "a miss with a backstop" but a permanent loss.
+  Redesigned: `Daemon.staleCertPending` is a DEBT, `WarnStaleMgmtCertForHostName`
+  now RETURNS whether it reached a served certificate, and the debt clears only
+  on true. Retried at the rename, the boot start, and every web-management
+  reconcile.
+  (2) **The mark/deliver handoff was not atomic.** The old code branched on
+  `d.mgmt == nil` outside `staleCertMu` while `startHTTPServer` published
+  `d.mgmt` and drained separately. Fixed at the root rather than by widening the
+  lock: the host name is now read from the kernel AT DELIVERY (`osHostname`
+  seam) instead of stored at rename time, so a deferred diagnosis always
+  describes the current identity; and marking + attempting are one code path,
+  so there is no window to lose a rename in.
+  (3) **`serving()` missed the state that occurs and covered one that cannot.**
+  The root-context arm of `serveLegLocked` drains and RETURNS setting neither
+  `dead` nor `stopCh`, leaving the leg installed forever with every flag clear.
+  Meanwhile a requested retirement is unobservable through `s.httpsLeg` by
+  construction (disable clears the field before retiring; rebind installs the
+  replacement first). Replaced the `stopCh` arm with an `exited` atomic stored
+  from a DEFER over the whole serve goroutine, so no exit path — present or
+  future — can skip marking it.
+- **Validation**: two new mutations, each with `go build ./...` + `go vet` rc=0
+  first so the RED is an ASSERTION; files snapshotted and restored, verified
+  with `sha256sum -c`.
+  (1) clear the debt whenever delivery runs (the retracted r3 design) →
+  `debt_survives_a_delivery_that_reached_nothing` FAILs;
+  (2) drop `exited` from `serving()` (the r3 predicate) →
+  `root_shutdown_exited_leg_is_not_diagnosed` and
+  `reports_whether_it_reached_a_certificate` FAIL.
+  Note the r3 API test helper had to change again: `serving()` now also gates on
+  `exited`, and the earlier fixtures were still only as realistic as the
+  previous predicate demanded.
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `gofmt -l` clean on every touched file.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/listener.go`,
+  `pkg/api/tls_stale_cert_6827_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/daemon.go`, `pkg/daemon/management.go`,
+  `pkg/daemon/daemon_system.go`, `pkg/daemon/daemon_run_servers.go`,
+  `pkg/daemon/hostname_stale_cert_6827_test.go`, `_Log.md`
+
 ## 2026-08-05 — #6827 fold r3: two REACH findings — the hook's own boot ordering, and a dead leg treated as live
 
 - **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)

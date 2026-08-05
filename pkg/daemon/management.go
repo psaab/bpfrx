@@ -258,77 +258,70 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		endpointOf(next).summary(), joined)
 }
 
-// warnStaleMgmtCertForHostName asks the live management server to re-run its
-// stale-certificate diagnostic for a host name that was JUST applied to the
-// kernel (#6827).
+// noteStaleMgmtCertHostName records that the kernel host name just moved and
+// immediately attempts to deliver the management-TLS staleness diagnostic
+// (#6827). Marking and attempting are ONE path: the previous shape branched on
+// `d.mgmt == nil` outside staleCertMu while startHTTPServer published d.mgmt
+// and drained separately, so a rename landing in that window neither refreshed
+// the parked state nor got diagnosed.
 //
 // This is deliberately NOT part of reconcile(): reconcile runs early in the
 // apply, before applyHostname, so it can only ever observe the OLD kernel name.
-// The rename call site owns this because it is the only one that runs after the
-// name is real.
-//
-// A nil reconciler is NOT simply skipped. The FIRST config apply happens in
-// startup phase 4 (setupDataplaneAndInitialConfig -> applyConfig ->
-// applyTailReconciles -> applyHostname) while startHTTPServer constructs mgmt
-// much later in Run, so at boot this call lands before its own dependency
-// exists. Returning here would reproduce exactly the silence this diagnostic
-// was added to remove: the appliance takes its configured name, the cert that
-// gets loaded moments later names something else, and the only surviving check
-// is the load path's INFERRED heuristic — which declines whenever the cert's
-// naming shape does not match the new name (SANs [localhost,
-// oldfw.example.com] + host `new-fw` is silent by design there). So the name is
-// PARKED and delivered at construction, where the evidence is still
-// hostNameOperatorSet.
-func (d *Daemon) warnStaleMgmtCertForHostName(hostName string) {
-	if d == nil {
-		return
-	}
-	if d.mgmt == nil {
-		d.staleCertMu.Lock()
-		// Last writer wins: if the name moves again before the server comes up,
-		// only the name the kernel actually ends on is worth diagnosing.
-		d.staleCertHostName = hostName
-		d.staleCertMu.Unlock()
-		return
-	}
-	d.mgmt.warnStaleCertForHostName(hostName)
-}
-
-// drainDeferredStaleCertHostName delivers a host name parked by
-// warnStaleMgmtCertForHostName before mgmt existed (#6827). startHTTPServer
-// calls it once, immediately after the management server's boot start.
-//
-// It consumes the parked name unconditionally, including when the start failed
-// or HTTPS is off. That is correct rather than lossy: the diagnostic reports on
-// a certificate the box is SERVING, so if no HTTPS leg came up there is nothing
-// to be stale, and holding the name for some later enable would eventually
-// report a rename from arbitrarily far in the past as though it just happened.
-// A later HTTPS enable re-reads the cert through the load path, which sees the
-// by-then-current kernel name.
-func (d *Daemon) drainDeferredStaleCertHostName() {
+func (d *Daemon) noteStaleMgmtCertHostName() {
 	if d == nil {
 		return
 	}
 	d.staleCertMu.Lock()
-	hostName := d.staleCertHostName
-	d.staleCertHostName = ""
+	d.staleCertPending = true
 	d.staleCertMu.Unlock()
-	if hostName == "" || d.mgmt == nil {
+	d.deliverStaleMgmtCertDiagnosis()
+}
+
+// deliverStaleMgmtCertDiagnosis delivers a pending host-name staleness
+// diagnosis if one is owed and a management certificate is actually being
+// served, clearing the debt ONLY on success (#6827).
+//
+// Called from three places, all of them retry points rather than one-shot
+// drains: the rename itself, the boot management start, and every
+// web-management reconcile (so a later `web-management https` enable settles a
+// debt incurred while HTTPS was down).
+//
+// The host name is read from the kernel HERE, not stored at rename time. That
+// removes the "replayed a rename from arbitrarily far back" hazard at its
+// root: whenever this speaks, it describes the name the box has right now.
+func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
+	if d == nil {
 		return
 	}
-	d.mgmt.warnStaleCertForHostName(hostName)
+	d.staleCertMu.Lock()
+	pending := d.staleCertPending
+	d.staleCertMu.Unlock()
+	if !pending || d.mgmt == nil {
+		return
+	}
+	hostName, err := osHostname()
+	if err != nil || hostName == "" {
+		return // cannot describe the current identity; stay in debt
+	}
+	if !d.mgmt.warnStaleCertForHostName(hostName) {
+		return // nothing serving a certificate yet; the debt stands
+	}
+	d.staleCertMu.Lock()
+	d.staleCertPending = false
+	d.staleCertMu.Unlock()
 }
 
 // warnStaleCertForHostName forwards to the live api.Server under mu so it cannot
-// race a concurrent startTo/reconcileTo swapping the server pointer.
-func (m *managementReconciler) warnStaleCertForHostName(hostName string) {
+// race a concurrent startTo/reconcileTo swapping the server pointer. It reports
+// whether a served certificate was actually reached.
+func (m *managementReconciler) warnStaleCertForHostName(hostName string) bool {
 	m.mu.Lock()
 	srv := m.srv
 	m.mu.Unlock()
 	if srv == nil {
-		return
+		return false
 	}
-	srv.WarnStaleMgmtCertForHostName(hostName)
+	return srv.WarnStaleMgmtCertForHostName(hostName)
 }
 
 // mgmtAddrIsLoopback reports whether a "host:port" bind is loopback, treating an
@@ -373,5 +366,10 @@ func (d *Daemon) reconcileWebManagement(cfg *config.Config) error {
 	if d.mgmt == nil {
 		return nil
 	}
-	return d.mgmt.reconcile(cfg)
+	err := d.mgmt.reconcile(cfg)
+	// #6827: a reconcile may have just brought HTTPS up (enable, or a retried
+	// bind). If a host-name staleness diagnosis is still owed from a window
+	// when nothing was serving, settle it now rather than losing it.
+	d.deliverStaleMgmtCertDiagnosis()
+	return err
 }

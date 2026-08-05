@@ -392,6 +392,9 @@ func (d *Daemon) stopAggregator() {
 var (
 	sethostname  = syscall.Sethostname
 	hostnamePath = "/etc/hostname"
+	// osHostname reads the CURRENT kernel host name. The stale-cert diagnostic
+	// reads it at delivery rather than storing a name at rename time (#6827).
+	osHostname = os.Hostname
 )
 
 // applyHostname sets the system hostname from system { host-name } config.
@@ -426,7 +429,7 @@ func (d *Daemon) applyHostname(cfg *config.Config) {
 	// survives an aborting commit) and would therefore see the OLD name. This
 	// call site is both the only one a plain host-name commit reaches and the
 	// only one where the new name is already the truth (#6827).
-	d.warnStaleMgmtCertForHostName(cfg.System.HostName)
+	d.noteStaleMgmtCertHostName()
 }
 
 // isProcessDisabled checks if a Junos process name is in the disabled list.

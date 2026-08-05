@@ -484,7 +484,7 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// reconciler and parked itself. Deliver it now that an HTTPS leg may be
 	// serving — this is the earliest point at which the diagnostic has a real
 	// certificate to judge, and the name is still the one the operator set.
-	d.drainDeferredStaleCertHostName()
+	d.deliverStaleMgmtCertDiagnosis()
 	// Drain the management serve goroutines on daemon shutdown: ctx cancel
 	// triggers the api.Server bounded 5s graceful drain, and wait() joins every
 	// live + retiring listener goroutine so none leak past Run.

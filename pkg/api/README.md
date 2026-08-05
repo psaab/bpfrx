@@ -389,22 +389,39 @@ under the daemon's errgroup. Nothing else imports this package.
         re-reading `os.Hostname()`.
         At BOOT this hook runs before its own dependency exists: the first
         config apply is startup phase 4 while `startHTTPServer` builds `d.mgmt`
-        later in `Run`. A nil reconciler therefore PARKS the name
-        (`Daemon.staleCertHostName`) and `drainDeferredStaleCertHostName`
-        delivers it right after the boot start — skipping on nil would
-        reproduce the original silence, because the load-path fallback declines
-        exactly this shape (see the narrowing rule below). The drain consumes
-        the name whether or not HTTPS came up: with no serving leg there is no
-        certificate to be stale, and holding it would let a later enable replay
-        a long-past rename as if it were fresh.
+        later in `Run`. So a rename records a DEBT (`Daemon.staleCertPending`)
+        and `deliverStaleMgmtCertDiagnosis` retries it — at the rename, at the
+        boot management start, and on every web-management reconcile. Skipping
+        on nil would reproduce the original silence, because the load-path
+        fallback declines exactly this shape (see the narrowing rule below).
+        Two properties matter:
+        - **The debt clears only when a delivery actually reaches a served
+          certificate** (`WarnStaleMgmtCertForHostName` returns that). Clearing
+          it whenever the delivery merely RAN loses the diagnosis permanently
+          when the HTTP start failed or HTTPS is off: the next boot's
+          `applyHostname` sees the name already applied and returns early, and
+          the load path declines cross-shape drift by design. The certificate is
+          durable on disk, so the staleness outlives the listener and the debt
+          must outlive it too.
+        - **The host name is read from the kernel at DELIVERY, never stored at
+          rename time.** A deferred diagnosis therefore always describes the
+          name the box has now, so it can never replay an intermediate or
+          long-past rename — and marking the debt and attempting delivery are a
+          single path, so a rename racing `d.mgmt`'s publication cannot be
+          silently dropped.
       Both entry points read the LIVE HTTPS leg via `listenerLeg.serving()` —
       not a non-nil pointer. An unexpected serve exit leaves the leg INSTALLED
-      with only `dead` set, and a leg retiring under a requested shutdown is
-      installed while it drains; diagnosing either reports a certificate no
-      socket is presenting. `serving()` is deliberately stricter than
-      `EffectiveHTTPAddr`'s inline check (which omits the `stopCh` test):
-      that one answers `show system services`, where a draining leg should
-      still report its address.
+      with only `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed with
+      no flag set at all; diagnosing either reports a certificate no socket is
+      presenting. `serving()` therefore tests `exited`, stored from a defer over
+      the whole serve goroutine so every exit path marks it — including the one
+      that sets nothing. It does NOT test `stopCh`: a requested retirement is
+      unobservable through `s.httpsLeg` by construction (the disable arm clears
+      the field before retiring; the rebind arm installs the replacement first),
+      so that would be an arm for a state that cannot occur. `serving()` is
+      stricter than `EffectiveHTTPAddr`'s inline check, which answers
+      `show system services`, where a leg finishing a drain should still report
+      its address.
       Both parse the leaf ONCE and share these checks (`certCoversHost` — the
       same strict `x509.VerifyHostname` check a remote client applies):
       - **no SAN at all** (`certHasNoSANs`) — a pair persisted by an older build
