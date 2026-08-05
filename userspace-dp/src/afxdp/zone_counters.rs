@@ -168,6 +168,41 @@ impl ZoneCounterSlotMap {
     }
 }
 
+/// Select the rows publishable on `ProcessStatus.zone_traffic_counters`.
+///
+/// A row survives only when its zone is BOTH still configured AND holds a live
+/// hot-path slot. The second condition is the one that is easy to miss, because
+/// it is about a TRANSITION rather than a steady state.
+///
+/// The store outlives the slot map. Config apply carries the store forward and
+/// `reconcile` retains every still-configured zone, while
+/// [`ZoneCounterSlotMap::build`] assigns only [`ZONE_COUNTER_ASSIGNABLE_SLOTS`]
+/// slots in sorted zone-id order. So a zone that accumulated traffic and is
+/// then pushed past capacity by a later config — e.g. 63 lower-id zones added
+/// alongside it — remains configured, keeps its retained nonzero totals, and
+/// gets slot 0. It is no longer counted, but its old numbers are still in the
+/// store.
+///
+/// Publishing that row makes the Go side mirror a total that can never advance
+/// again: a FROZEN counter that under-reports every subsequent packet while
+/// looking perfectly alive. Omitting it instead makes the zone read as
+/// "not populated" end to end, which is the honest answer — its traffic really
+/// is uncounted — with `overflow_active` explaining why.
+///
+/// Reasoning about "a zone that was never counted" is not enough to establish
+/// this; the dangerous case is a zone that WAS counted and then stopped.
+pub(in crate::afxdp) fn publishable_zone_rows(
+    store: &ZoneCounterStore,
+    slot_map: &ZoneCounterSlotMap,
+    is_configured: impl Fn(u16) -> bool,
+) -> Vec<ZoneTrafficCounterStatus> {
+    store
+        .snapshot()
+        .into_iter()
+        .filter(|s| is_configured(s.zone_id) && slot_map.slot_of(s.zone_id) != 0)
+        .collect()
+}
+
 /// #5163: shared cumulative per-zone traffic totals as four `Relaxed` atomics.
 /// One block per configured zone id; the per-batch worker fold `fetch_add`s
 /// into it lock-free (the same lock-free shared-counter shape as
@@ -493,6 +528,109 @@ mod tests {
         // Exactly the capacity is assigned; the rest are slot 0.
         let assigned = (1..=65535u16).filter(|&z| map.slot_of(z) != 0).count();
         assert_eq!(assigned, ZONE_COUNTER_ASSIGNABLE_SLOTS);
+    }
+
+    /// #6843: a zone that was POPULATED and is then pushed past the hot-path
+    /// slot capacity by a later config must STOP being published.
+    ///
+    /// This is the transition the pre-existing overflow tests never reached.
+    /// They build an over-capacity map from scratch and check `slot_of == 0` +
+    /// `overflow_active` — true, but only about a zone that was never counted.
+    /// The dangerous zone is one that WAS counted: the store is carried forward
+    /// across applies and `reconcile` retains it (it is still configured), so
+    /// its nonzero totals survive while its slot does not. Publishing that row
+    /// mirrors a total that can never advance again — a frozen counter that
+    /// under-reports every subsequent packet while looking alive.
+    #[test]
+    fn populated_zone_stops_publishing_once_pushed_past_capacity() {
+        let store = ZoneCounterStore::default();
+
+        // Apply 1: one high-hash zone, alone and comfortably within capacity.
+        const Z: u16 = 50675; // config::StableZoneID("trust")
+        let map1 = ZoneCounterSlotMap::build(&[Z], &store);
+        assert_ne!(map1.slot_of(Z), 0, "Z must hold a slot in apply 1");
+        record_zone_traffic(&map1, Z, 0, 1500);
+        record_zone_traffic(&map1, Z, 0, 1500);
+        flush_recorded_zone_counters(&store, &map1);
+
+        let published = publishable_zone_rows(&store, &map1, |_| true);
+        assert_eq!(published.len(), 1, "apply 1 must publish Z: {published:?}");
+        assert_eq!(published[0].ingress_packets, 2);
+
+        // Apply 2: add enough LOWER ids to consume every assignable slot. Z is
+        // still configured, so reconcile keeps its accumulated totals — but
+        // sorted-order slot assignment exhausts capacity before reaching it.
+        let mut ids: Vec<u16> = (1..=(ZONE_COUNTER_ASSIGNABLE_SLOTS as u16)).collect();
+        ids.push(Z);
+        let configured: FxHashSet<u16> = ids.iter().copied().collect();
+        store.reconcile(&configured);
+        let map2 = ZoneCounterSlotMap::build(&ids, &store);
+
+        assert!(map2.overflow_active, "apply 2 must overflow");
+        assert_eq!(map2.slot_of(Z), 0, "Z must have lost its slot in apply 2");
+
+        // The retained totals are still in the store — this is the setup for
+        // the bug, and asserting it keeps the test honest: it is NOT passing
+        // because the data vanished.
+        let raw: Vec<_> = store
+            .snapshot()
+            .into_iter()
+            .filter(|s| s.zone_id == Z)
+            .collect();
+        assert_eq!(raw.len(), 1, "store must still retain Z's totals");
+        assert_eq!(raw[0].ingress_packets, 2);
+
+        // The publish filter must nevertheless drop it.
+        let published = publishable_zone_rows(&store, &map2, |zid| configured.contains(&zid));
+        assert!(
+            !published.iter().any(|s| s.zone_id == Z),
+            "a populated zone that lost its slot must STOP publishing — otherwise \
+             its retained total freezes and under-reports forever: {published:?}"
+        );
+    }
+
+    /// #6843 companion: the filter must not over-reach. A zone that still holds
+    /// a slot keeps publishing even when a SIBLING overflowed, so the fix
+    /// cannot be satisfied by dropping everything once `overflow_active` is set.
+    #[test]
+    fn slotted_zones_keep_publishing_while_a_sibling_overflows() {
+        let store = ZoneCounterStore::default();
+        let mut ids: Vec<u16> = (1..=(ZONE_COUNTER_ASSIGNABLE_SLOTS as u16)).collect();
+        const OVERFLOWED: u16 = 65533;
+        ids.push(OVERFLOWED);
+        let map = ZoneCounterSlotMap::build(&ids, &store);
+        assert!(map.overflow_active);
+        assert_eq!(map.slot_of(OVERFLOWED), 0);
+
+        // Move traffic on a zone that DID get a slot.
+        record_zone_traffic(&map, 1, 0, 64);
+        flush_recorded_zone_counters(&store, &map);
+
+        let published = publishable_zone_rows(&store, &map, |_| true);
+        assert!(
+            published.iter().any(|s| s.zone_id == 1),
+            "a slotted zone must keep publishing during overflow: {published:?}"
+        );
+        assert!(!published.iter().any(|s| s.zone_id == OVERFLOWED));
+    }
+
+    /// #6843: the configured filter is still independently load-bearing — an
+    /// unconfigured zone is dropped even while it holds a slot. Without this,
+    /// the slot check alone could be mistaken for the whole contract.
+    #[test]
+    fn unconfigured_zone_is_dropped_even_with_a_live_slot() {
+        let store = ZoneCounterStore::default();
+        let map = ZoneCounterSlotMap::build(&[10, 20], &store);
+        record_zone_traffic(&map, 10, 20, 100);
+        flush_recorded_zone_counters(&store, &map);
+
+        assert_ne!(map.slot_of(10), 0);
+        let published = publishable_zone_rows(&store, &map, |zid| zid != 10);
+        assert!(
+            !published.iter().any(|s| s.zone_id == 10),
+            "an unconfigured zone must be dropped regardless of its slot: {published:?}"
+        );
+        assert!(published.iter().any(|s| s.zone_id == 20));
     }
 
     #[test]

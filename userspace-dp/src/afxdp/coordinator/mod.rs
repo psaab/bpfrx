@@ -1058,17 +1058,42 @@ impl Coordinator {
     }
 
     /// #3651: per-zone ingress/egress traffic-volume snapshot for
-    /// `ProcessStatus.zone_traffic_counters`, filtered to currently-configured
-    /// zones so a zone removed between the worker fold and this status build
-    /// never surfaces. Empty when no configured zone has moved traffic yet.
+    /// `ProcessStatus.zone_traffic_counters`.
+    ///
+    /// TWO filters, and the second is not redundant. A row is published only
+    /// when its zone is BOTH (a) currently configured — so a zone removed
+    /// between the worker fold and this status build never surfaces — and (b)
+    /// holding a live hot-path slot.
+    ///
+    /// Filter (b) exists because the store OUTLIVES the slot map. Config apply
+    /// carries the store forward and `reconcile` retains every still-configured
+    /// zone (`forwarding_build/mod.rs`), while `ZoneCounterSlotMap::build`
+    /// assigns only `ZONE_COUNTER_ASSIGNABLE_SLOTS` slots in sorted zone-id
+    /// order. So a zone that accumulated traffic and is then pushed past
+    /// capacity by a later config — 63 lower-id zones added alongside it —
+    /// stays configured, keeps its retained nonzero totals, and gets slot 0.
+    /// Without this filter its stale row keeps publishing: the Go side mirrors
+    /// it, and Prometheus emits a FROZEN total forever while every subsequent
+    /// packet on that zone goes uncounted. That is strictly worse than omitting
+    /// the zone, because a frozen counter looks alive — an authoritative number
+    /// that is wrong, which is the exact failure the per-zone surface work
+    /// exists to prevent.
+    ///
+    /// Dropping the row makes such a zone read as `ErrCounterNotPopulated`
+    /// end-to-end, which is the honest answer: its traffic genuinely is not
+    /// being counted. `zone_counter_overflow_active` tells the operator why.
+    ///
+    /// NOTE: this is only half the fix. The Go status loop must REPLACE its
+    /// offset map from each snapshot rather than merge into it, or a row that
+    /// stops being published leaves a stale offset behind
+    /// (`Manager.ReplaceZoneCounterOffsets`).
     pub fn zone_traffic_counters(&self) -> Vec<crate::protocol::ZoneTrafficCounterStatus> {
         let configured = &self.forwarding.zone_id_to_name;
-        self.forwarding
-            .zone_counter_store
-            .snapshot()
-            .into_iter()
-            .filter(|s| configured.contains_key(&s.zone_id))
-            .collect()
+        crate::afxdp::zone_counters::publishable_zone_rows(
+            &self.forwarding.zone_counter_store,
+            &self.forwarding.zone_counter_slot_map,
+            |zone_id| configured.contains_key(&zone_id),
+        )
     }
 
     /// #3651: true when the configured zone count exceeded the hot-path slot

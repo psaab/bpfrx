@@ -147,6 +147,49 @@ func (m *Manager) SetZoneCounterOffset(zoneID uint16, ingress, egress CounterVal
 	m.mu.Unlock()
 }
 
+// ReplaceZoneCounterOffsets atomically replaces the ENTIRE per-zone offset map
+// with the rows the helper published in this status poll (#3651).
+//
+// Replace, not merge, and the distinction is load-bearing. The helper's
+// `zone_traffic_counters` block is a COMPLETE sparse set rebuilt from its store
+// on every poll, not a delta — so a zone absent from it is a zone the helper is
+// no longer reporting, and the correct Go-side state is "not populated".
+// SetZoneCounterOffset alone can only ever ADD or overwrite, so a row that
+// stops being published leaves its last value stranded in the map and every
+// read surface keeps serving a FROZEN total indefinitely.
+//
+// Three ways a row legitimately disappears, all of which this handles:
+//
+//   - The zone lost its hot-path slot. Config apply carries the store forward
+//     and retains still-configured zones, but a zone pushed past the helper's
+//     assignable slot capacity gets slot 0 and stops being counted; the helper
+//     drops it from the published set (coordinator zone_traffic_counters). Its
+//     retained totals are stale from that moment on.
+//   - The zone was deleted from the config (helper-side reconcile drops it).
+//   - The helper restarted, or was downgraded to a build with no per-zone
+//     block. Its store is empty, so it publishes nothing, and nothing is what
+//     the Go side should report.
+//
+// An empty rows slice therefore clears the map, which is correct in every case
+// above: "the helper published no per-zone volume" is exactly
+// ErrCounterNotPopulated. The sole call site (syncBPFCountersLocked) runs only
+// on a successfully decoded ProcessStatus, so an empty set here is a real
+// observation and never a failed fetch.
+func (m *Manager) ReplaceZoneCounterOffsets(rows map[uint16][2]CounterValue) {
+	m.mu.Lock()
+	if len(rows) == 0 {
+		m.zoneCounterOffsets = nil
+		m.mu.Unlock()
+		return
+	}
+	next := make(map[uint16][2]CounterValue, len(rows))
+	for id, vals := range rows {
+		next[id] = vals
+	}
+	m.zoneCounterOffsets = next
+	m.mu.Unlock()
+}
+
 // ClearZoneCounterOffsets drops all userspace-reported per-zone traffic offsets
 // (#3643), mirroring ClearNATRuleCounterOffsets. Wired into ClearZoneCounters.
 func (m *Manager) ClearZoneCounterOffsets() {

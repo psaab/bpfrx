@@ -510,3 +510,83 @@ func TestCollectDoesNotFalseAlertOnZoneReads(t *testing.T) {
 		}
 	}
 }
+
+// TestZoneMetricsFollowTheHelperAcrossSlotLoss is the #6843 end-to-end pin:
+// the retention fix must be visible at the METRIC, not just in the manager.
+//
+// Scenario the gate traced. A zone accumulates traffic and publishes. A later
+// config adds enough lower-id zones to exhaust the helper's hot-path slot
+// capacity; the zone stays configured but loses its slot, so the helper stops
+// publishing its row while its retained totals sit in the store. Prometheus
+// must stop emitting that zone's samples and start counting it as unpopulated.
+//
+// Before the fix the Go status loop only ever SET rows, so the last published
+// total stayed in the offset map and the collector kept emitting it forever —
+// a frozen counter that under-reports every subsequent packet while looking
+// alive. That is strictly worse than the omission this PR exists to produce.
+//
+// FAIL-ON-REVERT: make the status mirror merge instead of replace and the
+// post-transition assertions go RED — the sample is still emitted and the
+// unpopulated gauge stays 0.
+func TestZoneMetricsFollowTheHelperAcrossSlotLoss(t *testing.T) {
+	ids := fixtureZoneIDs(t)
+	mgr := dataplane.New()
+
+	// Poll N: both zones hold slots and publish.
+	mgr.ReplaceZoneCounterOffsets(map[uint16][2]dataplane.CounterValue{
+		ids["trust"]:   {{Packets: 10, Bytes: 1000}, {Packets: 11, Bytes: 1100}},
+		ids["untrust"]: {{Packets: 20, Bytes: 2000}, {Packets: 21, Bytes: 2100}},
+	})
+	srv := &Server{store: newDescriptorCoverageStore(t)}
+	dp := &zoneRealReadDP{&descriptorCoverageDP{
+		Manager: mgr,
+		apply:   &dataplane.ApplyResult{ZoneIDs: ids},
+	}}
+	srv.dp = dp
+	c := newCollector(srv)
+
+	got, unpopulated := zoneSamples(t, c, dp)
+	if got["xpf_zone_packets_total/trust/ingress"] != 10 {
+		t.Fatalf("poll N: trust ingress = %v, want 10; samples=%v",
+			got["xpf_zone_packets_total/trust/ingress"], got)
+	}
+	if unpopulated != 0 {
+		t.Fatalf("poll N: unpopulated = %v, want 0", unpopulated)
+	}
+
+	// Poll N+1: `trust` was pushed past slot capacity by a later config. It is
+	// still configured (still in ZoneIDs) but the helper no longer publishes
+	// it, so the sparse snapshot carries only `untrust`.
+	mgr.ReplaceZoneCounterOffsets(map[uint16][2]dataplane.CounterValue{
+		ids["untrust"]: {{Packets: 25, Bytes: 2500}, {Packets: 26, Bytes: 2600}},
+	})
+
+	got, unpopulated = zoneSamples(t, c, dp)
+	for _, k := range []string{
+		"xpf_zone_packets_total/trust/ingress",
+		"xpf_zone_bytes_total/trust/ingress",
+		"xpf_zone_packets_total/trust/egress",
+		"xpf_zone_bytes_total/trust/egress",
+	} {
+		if v, ok := got[k]; ok {
+			t.Errorf("sample %q still emitted (=%v) after the zone lost its hot-path "+
+				"slot; the helper stopped publishing it, so this value can never "+
+				"advance again — a FROZEN counter is worse than an omission because "+
+				"it looks alive", k, v)
+		}
+	}
+	if unpopulated != 1 {
+		t.Errorf("xpf_zone_counters_unpopulated_zones = %v, want 1 — the zone that "+
+			"lost its slot must be counted as not-known, not silently dropped",
+			unpopulated)
+	}
+	// The still-slotted zone keeps advancing: the fix must not blanket-drop.
+	if got["xpf_zone_packets_total/untrust/ingress"] != 25 {
+		t.Errorf("untrust ingress = %v, want 25 — a sibling losing its slot must not "+
+			"disturb a zone that is still reporting",
+			got["xpf_zone_packets_total/untrust/ingress"])
+	}
+	if err := c.counterReadErrors.Load(); err != 0 {
+		t.Errorf("counterReadErrors = %d; losing a slot is not a read error", err)
+	}
+}

@@ -1,3 +1,42 @@
+## 2026-08-05 — #6843 fold: overflow retention published a FROZEN counter
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Gate found a MAJOR that refutes a verification I made and reported
+  as firm. I checked that `ZoneCounterSlotMap::build` `break`s before
+  `store.zone_totals(zid)`, concluded an overflowed zone is never registered and
+  so reads as unpopulated, and stated it as a general fact. It holds only for a
+  zone that was ALWAYS overflowed. The store OUTLIVES the slot map: config apply
+  carries it forward and `reconcile` retains every still-configured zone, so a
+  zone that accumulated traffic and is then pushed past slot capacity by a later
+  config keeps its nonzero totals, gets slot 0, and — because the status
+  accessor filtered only by "still configured" — kept publishing. Go mirrored it
+  and Prometheus emitted a FROZEN total forever while every subsequent packet
+  went uncounted. Exactly the failure class this PR exists to prevent, and worse
+  than an omission because a frozen counter looks alive. Second retention hazard
+  in the same family: the Go loop only SET rows and never removed absent ones,
+  so a helper downgrade or a zone remove/re-add stranded a stale offset. Fixed
+  both — the helper now publishes a row only when the zone is configured AND
+  holds a live slot (`publishable_zone_rows`, extracted as a pure function so
+  the transition is unit-testable), and the Go mirror REPLACES the offset map
+  from each snapshot (`ReplaceZoneCounterOffsets`) instead of merging.
+- **Lesson recorded in the code comments**: verifying one `build` is not
+  verifying a claim about a structure carried forward across applies. "Never
+  inserted" is a statement about a single apply; the dangerous case is a zone
+  that WAS counted and then stopped.
+- **Validation**: full Go suite and full cargo suite both green, each scored
+  from a REAL exit code (GO_EXIT=0, RUST_EXIT=0). Three new Rust tests cross the
+  transition (populated-then-overflowed; slotted sibling keeps publishing;
+  unconfigured dropped despite a live slot), four new Go retention tests
+  (absent-zone drop, empty-clears, remove-then-readd, input-copy), and one
+  end-to-end Prometheus test asserting the sample disappears and the unpopulated
+  gauge increments across the transition. Mutation-proven.
+- **File(s)**: `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `pkg/dataplane/maps_counters.go`,
+  `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go` (new),
+  `pkg/api/zone_counters_metrics_test.go`, `pkg/api/README.md`, `_Log.md`
+
 ## 2026-08-05 — #3651: restore the per-zone Prometheus surface
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface)

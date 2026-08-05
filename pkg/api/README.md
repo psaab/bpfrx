@@ -661,6 +661,21 @@ under the daemon's errgroup. Nothing else imports this package.
     uncounted), and a merely idle zone — a `0` would be an authoritative zero
     over an unknown. The gauge is always emitted (0 when healthy) and counts
     exactly the zones REST reports `per_zone_counters_available:false` for.
+
+    **Retention (#6843).** "Not populated" must also be reachable *backwards* —
+    a zone that WAS reporting and stops. The helper's store outlives its slot
+    map: config apply carries the store forward and retains every
+    still-configured zone, so a zone pushed past the hot-path slot capacity by a
+    later config keeps its accumulated totals while no longer being counted. Two
+    guards keep that from becoming a frozen counter. The helper publishes a row
+    only when the zone is configured **and** holds a live slot
+    (`publishable_zone_rows`), and the Go status mirror **replaces** the whole
+    offset map from each snapshot rather than merging into it
+    (`Manager.ReplaceZoneCounterOffsets`). Both are required: without the first
+    the stale row keeps being published; without the second a row that stops
+    being published leaves its last value stranded. Either way the metric would
+    emit a total that can never advance — worse than an omission, because a
+    frozen counter looks alive.
   - **any other error** → omit the samples and bump
     `xpf_counter_read_errors_total` (the #3345/#3408 skip-and-bump contract is
     intact — a degraded counter bridge stays alertable).
