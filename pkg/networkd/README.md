@@ -88,23 +88,57 @@ Standard library only.
   an identical re-commit sees `writeIfChanged → (false, nil)` for every
   file (`changed==false`), skips the reload, and returns nil — a FALSE
   success masking a route leak / stranded NIC / management lockout. The
-  `Manager` now carries `reloadPending` / `reconfigurePending` debt: a
-  failed reload sets `reloadPending` and re-runs the idempotent reload on
-  the next `Apply` even with unchanged files, clearing the debt only on
-  success (and still returning the error until then). The per-interface
-  `networkctl reconfigure` follow-up is best-effort (warn-only, Apply
-  still returns nil) but is likewise retried from `reconfigurePending`
-  until it succeeds. Distinct from #2987 (write-error-fails-commit) and
-  the stale-file sweep.
+  A failed reload records the debt and re-runs the idempotent reload on
+  the next activation pass even with unchanged files, clearing the debt
+  only on success (and still returning the error until then). The
+  per-interface `networkctl reconfigure` follow-up is best-effort
+  (warn-only, Apply still returns nil) but is likewise retried from the
+  `Manager`'s `reconfigurePending` set until it succeeds. Distinct from
+  #2987 (write-error-fails-commit) and the stale-file sweep.
   **`Clear()` owes the same debt (#5718 A7-b01-C001).** Removing the
   managed files deactivates nothing until the reload lands, so a failed
-  reload in `Clear` records `reloadPending` too. The empty-glob case is
+  reload in `Clear` records the debt too. The empty-glob case is
   therefore NOT an unconditional `return nil`: with debt outstanding the
   files are already gone but the kernel never re-read them, so `Clear`
   re-runs the idempotent reload and reports failure until it succeeds.
   Without this the SECOND `Clear` found nothing to remove and reported a
   success it had not achieved while the removed addresses / VRFs / bonds
   / renames stayed live.
+- **The reload debt has ONE holder and EVERY reload owner records into
+  it (#5718 fold F2).** The debt is process-scoped (`reloadDebt` in
+  `networkd.go`), not a `Manager` field, because `networkctl reload` acts
+  on the single host `systemd-networkd` and this package is not its only
+  owner: `pkg/daemon`'s `networkctlReload` runs it directly from four
+  sites — linksetup's post-rename reload (warn-only), device-map's
+  rename and teardown reloads, and bootstrap's teardown and lifeline
+  reloads — all touching the same `10-xpf-*` files. A `Manager`-scoped
+  bool left those owners unable to record anything, and the disagreement
+  resolved in the dangerous direction: their failed reload left the files
+  on disk unactivated while the flag stayed false, so the next `Apply`
+  with identical content took the `changed==false && !debt` branch and
+  reported the #4954 false success. `pkg/daemon` now brackets its
+  shell-out with the exported `BeginReload` / `NoteReloadResult` pair.
+  The per-interface reconfigure debt stays `Manager` state — it names the
+  interfaces this Manager generated files for, and no other owner issues
+  a `networkctl reconfigure`.
+- **Discharging the debt is EPOCH-GUARDED, never a blind clear (#5718
+  fold F4).** The epoch advances every time debt is recorded, and a
+  successful reload may only clear the debt state it observed before it
+  started. Otherwise a concurrent owner's failure is lost: owner B's
+  reload re-reads the directory and succeeds, owner A then writes new
+  files and its reload fails and records the debt, and B — still between
+  its syscall and its bookkeeping — blind-stores `pending=false`. B's
+  reload provably predates A's files, so nothing activated them, yet A's
+  identical retry now sees `changed==false && !debt`, skips the reload
+  and returns nil. A debt cleared whose work never ran is a silent skip
+  of a reload the system believes it performed.
+- **`Manager.Clear()` has no production caller (#5718 fold).** It has
+  been exported and uncalled since this package was introduced (`git
+  log -S` finds no caller in history); the daemon uses only
+  `SetProtectedResolver` and `Apply`. Its contracts above are therefore
+  pinned by this package's tests alone, with no end-to-end consumer.
+  That is a live gap to close by wiring the teardown path that wants it
+  or retiring the method — not an endorsement of the current shape.
 - **An empty desired set is NOT a no-op (#2988).** `Apply(nil)` (last
   managed interface removed) still runs the `10-xpf-*` stale-file sweep
   and requests a reload so old addresses/bonds/bridges/renames don't

@@ -19,6 +19,7 @@ import (
 // operator the clear had succeeded while the removed config stayed live on the
 // box.
 func TestClear_ReloadDebtRetriedAfterFailure_5718(t *testing.T) {
+	resetReloadDebtForTest(t)
 	dir := t.TempDir()
 	m := NewInDir(dir)
 

@@ -39,6 +39,33 @@ func (s *SessionSync) getActiveConn() net.Conn {
 	defer s.mu.Unlock()
 	return s.activeConnLocked()
 }
+
+// noteHeartbeatAck latches the peer heartbeat-ack capability for the CURRENT
+// peer incarnation (#5718 C01a fold F1).
+//
+// The membership test and the store both run under s.mu, so they are atomic
+// with installConn's supersession clear and handleDisconnect's full-disconnect
+// clear. That ordering is the point: an ack frame already read off a
+// connection that is being superseded would otherwise re-arm the latch for the
+// incoming incarnation between the clear and the store, re-creating the stale
+// capability the clear just removed.
+//
+// A conn that is not (or is no longer) installed in a fabric slot cannot speak
+// for the current incarnation, so its ack is ignored. That also covers the
+// pre-install handshake-pending frame in handleNewConnection: an ack can never
+// legitimately be a peer's FIRST frame (we only send syncMsgHeartbeat after a
+// read deadline elapses on an established connection), so an unsolicited ack
+// arriving before the connection is wired in must not arm an enforcement path.
+func (s *SessionSync) noteHeartbeatAck(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.conn0 == conn || s.conn1 == conn {
+		s.peerHeartbeatAckEver.Store(true)
+	}
+}
 func connRemoteAddrString(conn net.Conn) (remote string) {
 	if conn == nil {
 		return "<nil>"
@@ -247,14 +274,21 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	}
 	d.hadConn0 = s.conn0 != nil
 	d.hadConn1 = s.conn1 != nil
+	// #5718 C01a (fold F1): a SUPERSESSION starts a new peer incarnation just
+	// as much as a full-disconnect -> connect edge does, and it is the edge
+	// handleDisconnect structurally cannot see. Record it here, where the slot
+	// still holds the outgoing connection.
+	superseded := false
 	switch fabricIdx {
 	case 0:
 		if s.conn0 != nil {
+			superseded = true
 			s.conn0.Close()
 		}
 		s.conn0 = conn
 	case 1:
 		if s.conn1 != nil {
+			superseded = true
 			s.conn1.Close()
 		}
 		s.conn1 = conn
@@ -271,6 +305,30 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// still sees the obligation even though it observes a non-empty registry.
 	if d.wasDisconnected {
 		s.needColdPrime.Store(true)
+	}
+	// #5718 C01a (fold F1): end the previous peer INCARNATION's heartbeat-ack
+	// capability at the one edge handleDisconnect structurally cannot see.
+	// When a peer reboots hard its TCP connection stays ESTABLISHED on our side
+	// (no FIN/RST), our fabricConnectLoop will not redial while it believes the
+	// slot is connected, and the peer's NEW process dials in and lands here. We
+	// close the old connection above, so its receiveLoop wakes and calls
+	// handleDisconnect — which finds the slot already holding the NEW conn and
+	// returns down the "ignoring stale disconnect" default branch WITHOUT
+	// clearing anything. The latch earned by the previous incarnation would
+	// otherwise be enforced against this one, which is exactly the peer
+	// DOWNGRADE failure C01a exists to prevent (see handleDisconnect).
+	//
+	// Scoped to SUPERSESSION only, deliberately:
+	//   - a full-disconnect -> connect edge (d.wasDisconnected) needs nothing
+	//     here; going to zero connections ran handleDisconnect's clear already,
+	//     and re-clearing would discard a capability nothing could have set.
+	//   - a fabric link coming up into an EMPTY slot beside a surviving one is
+	//     not a supersession and must NOT clear: same peer process, the mirror
+	//     of the partial-disconnect scope control in handleDisconnect.
+	// Only a connection REPLACING a live one in its own slot ends an
+	// incarnation without a disconnect to observe.
+	if superseded {
+		s.peerHeartbeatAckEver.Store(false)
 	}
 	d.becameActive = d.activeAfter == fabricIdx
 	// #4962: commit the decision under the lock. becameActive means this

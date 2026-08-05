@@ -68224,3 +68224,53 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+- **Timestamp**: 2026-08-05 10:45
+- **Action**: #6825 review fold r1 (#5718 C-HA) — four runtime findings plus two
+  test findings on `fix/5718-ha-hardening`. **F1**: the C01a heartbeat-ack
+  capability was scoped to the peer but not to which INCARNATION of it.
+  `handleDisconnect`'s full-disconnect clear structurally cannot see a
+  SUPERSESSION, which is the peer-reboot shape: a hard reboot sends no
+  FIN/RST, so our conn stays ESTABLISHED, `fabricConnectLoop` will not redial
+  a slot it thinks is connected, the peer's NEW process dials in, and
+  `installConn` swaps the slot — the old `receiveLoop`'s `handleDisconnect`
+  then finds the new conn in place and returns down the stale-disconnect
+  branch, clearing nothing. `installConn` now clears on supersession only (not
+  on the full-disconnect edge, which `handleDisconnect` already covers, and
+  not on a link filling an EMPTY slot beside a live one), and the ack latch
+  moved behind `noteHeartbeatAck`, which tests fabric-slot membership and
+  stores under `s.mu` — atomic with that clear, so an ack already read off the
+  superseded conn cannot re-arm the latch for the incoming incarnation.
+  **F2**: the #4954 reload debt had one Manager-scoped holder while
+  `pkg/daemon` runs `networkctl reload` directly from four sites (linksetup —
+  warn-only, device-map rename + teardown, bootstrap teardown + lifeline) over
+  the same `10-xpf-*` files; their failure was invisible, so the next Apply
+  with unchanged content skipped the reload and returned the #4954 false
+  success. The debt is now process-scoped in `pkg/networkd` and `pkg/daemon`
+  brackets its shell-out with the exported `BeginReload`/`NoteReloadResult`.
+  **F3**: `programBootstrapMapsLocked` read `cfg.Workers` TWICE under
+  different rules, so after the A6-b01-C1 narrowing fix the ctrl fields and the
+  heartbeat bound DISAGREED (`workers 4294967296` -> ctrl says 0 workers/0
+  queues, loop zeroes 128 workers' slots). `planUserspaceWorkers` returns both
+  from one clamp; an AST guard pins the single read. **F4**: the debt clear was
+  a blind store, so a reload that succeeded BEFORE another owner's files
+  existed could erase that owner's debt — a debt cleared whose work never ran.
+  The clear is now epoch-guarded. **Tests**: rebuilt
+  `close_partial_manager_5718_test.go`, which previously passed with
+  `Close` replaced by `return nil` (every expectation was the failure default
+  and the drain fixture had an empty map) — it now installs a live keepalive
+  goroutine and a real netlink handle and observes both released.
+  `networkd.Manager.Clear` has NO production caller and never has (`git log
+  -S`); surfaced at the declaration and in the README rather than papered over.
+  All twelve fixes mutation-proved: `go vet` clean under every mutation, each
+  RED an assertion (M11 a nil-deref panic, the correct mode for a nil guard).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/networkd/networkd.go, pkg/networkd/reload_debt_process_5718_test.go,
+  pkg/networkd/reload_debt_4954_test.go,
+  pkg/networkd/clear_reload_debt_5718_test.go, pkg/networkd/networkd_test.go,
+  pkg/networkd/README.md, pkg/daemon/linksetup.go,
+  pkg/daemon/networkctl_reload_debt_5718_test.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
+  pkg/routing/routing.go, pkg/routing/close_partial_manager_5718_test.go,
+  pkg/routing/README.md, _Log.md

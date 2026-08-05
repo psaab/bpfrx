@@ -294,7 +294,10 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			s.handleDisconnect(conn)
 		}
 	case syncMsgHeartbeatAck:
-		s.peerHeartbeatAckEver.Store(true)
+		// #5718 C01a (fold F1): bind the capability to the peer INCARNATION
+		// that proved it — only a currently-installed fabric connection can
+		// speak for the current one. See noteHeartbeatAck (sync_conn.go).
+		s.noteHeartbeatAck(conn)
 	case syncMsgConfig:
 		s.stats.ConfigsReceived.Add(1)
 		s.stats.LastConfigSyncTime.Store(time.Now().UnixNano())

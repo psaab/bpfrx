@@ -1434,3 +1434,28 @@ outside the monitor loop:
   turns a healthy old peer into permanent connection churn plus a
   failover-readiness block ("session sync disconnected"). Both directions are
   pinned by `heartbeat_ack_incarnation_5718_test.go`.
+
+  **The incarnation ends at TWO edges, not one (#5718 fold F1).**
+  `handleDisconnect`'s full-disconnect block cannot see a SUPERSESSION, and
+  supersession is precisely the peer-reboot shape: a peer that dies hard sends
+  no FIN/RST, so our TCP connection stays ESTABLISHED, `fabricConnectLoop` will
+  not redial a slot it believes is connected, and the peer's NEW process dials
+  in and lands in `installConn`. `installConn` closes the old connection and
+  takes the slot; the old `receiveLoop` then calls `handleDisconnect`, finds
+  the slot already holding the new conn, and returns down the "ignoring stale
+  disconnect" default branch without clearing anything. `installConn` therefore
+  clears the latch when it REPLACES a live connection in a fabric slot, as well
+  as on the full-disconnect edge. It deliberately does not clear when a link
+  comes up into an EMPTY slot beside a surviving one — that is the same peer
+  process, the mirror of the partial-disconnect scope control above.
+
+  **Only a currently-installed connection may latch it (#5718 fold F1).**
+  `handleMessage` routes `syncMsgHeartbeatAck` through `noteHeartbeatAck`,
+  which tests fabric-slot membership and stores under `s.mu` — atomic with
+  `installConn`'s clear. Without that ordering an ack already read off the
+  superseded connection re-arms the latch for the incoming incarnation right
+  after the clear, restoring the exact state the clear removed. It also means
+  the pre-install handshake-pending frame cannot arm an enforcement path: an
+  ack is never a legitimate FIRST frame, because we only send
+  `syncMsgHeartbeat` after a read deadline elapses on an established
+  connection.

@@ -799,6 +799,15 @@ which paths a prefix load-balances over.
   `m.tunnel.stopAll()` takes `t.mu` on a nil `*tunnelManager` and
   panics the caller that followed the documented `defer m.Close()`.
   Any new domain teardown added to `Close` needs the same guard.
+  The guard must not degrade `Close` into a no-op on a wired Manager, so
+  `close_partial_manager_5718_test.go` also drives a FULLY wired
+  `New()` Manager with a live keepalive goroutine installed and observes
+  both obligations discharged on real state (#5718 fold): the runner's
+  `done` channel closes (proof the goroutine returned, not merely that
+  `cancel` was called) and `nlHandle.GetSocketReceiveBufferSize()` drops
+  from one entry per live socket to none. A post-close `LinkList` is NOT
+  an observable — `vishvananda/netlink` silently falls back to a
+  package-level socket once `Handle.sockets` is nil.
 - Keepalive runner goroutines drain on the `done` channel before the
   netlink handle is closed. Closing the handle while a goroutine still
   holds it would be a use-after-close.
