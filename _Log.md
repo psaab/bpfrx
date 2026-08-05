@@ -925,6 +925,64 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #5078 PR1: fail-closed session-sync auth + no pre-admission frame execution
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth)
+- **Action**: First increment of the converged #5078 plan — Blocker 2 only
+  (§3.10). Re-verified the whole plan against master `ad9591177` first (plan
+  verified at `5e34920d1`, 2185 commits back): `pkg/cluster/sync_auth.go` is
+  BYTE-IDENTICAL, so the reflection construction is untouched; Blocker 1
+  (`pushConfigToPeer`, `daemon_ha_sync.go:355` → `ShowActive()` at `:366`,
+  unredacted) and Blocker 2 both reproduce. Only the `sync_conn.go` line
+  references rotted (that file was refactored -1506/+692 into five files); the
+  plan's `:494-496` is now `:122`. #5303 pre-closed most of §3.11. Rust does
+  NOT speak this wire (`session_sync.rs` encodes deltas carried INSIDE the Go
+  frame; nothing in `userspace-dp/` references `syncMagic`), so this leg is
+  Go-only.
+  Blocker 2 is exploitable with NO PSK and NO reflection, which is why it goes
+  first and alone. A keyed node dual-accepted an unkeyed peer whenever
+  `peerAuthSeen` had not armed — a window open on every fresh boot — and that
+  peer's first frame ran BEFORE `installConn`, so `syncMsgFence` reached
+  `OnFenceReceived` and disabled every RG; the connection then displaced the
+  legitimate peer and later guard-arming did not evict it.
+  Three changes: (1) `syncAuthDecision` no longer consults `peerAuthSeen` for
+  the unkeyed-peer branch — a keyed node REJECTS an unauthenticated peer;
+  (2) the pending first frame executes AFTER `installConn`, never before (it is
+  still processed, so no message is lost); (3) `set chassis cluster
+  authentication-migration-window <minutes>` is the explicit, default-off,
+  time-bounded, alarmed escape hatch. The knob is REQUIRED, not optional
+  polish: config-sync delivers the key over this same channel, so keying the
+  primary first would deadlock it out of ever reaching the unkeyed secondary.
+  The window relaxes only "peer is unkeyed" — a failed proof is still rejected.
+  Arming is in-memory, so a restart restarts the window; documented as a
+  deliberate choice over persisting a security-relaxation deadline.
+- **Validation**: three mutations, each with `go build ./...` + `go vet` rc=0
+  first so every RED is an ASSERTION; both files snapshotted and restored, each
+  verified with `sha256sum -c`.
+  (1) restore the first-contact grace → `TestSyncAuthHandshakeKeyedNodeRejects
+  LegacyPeer`, `TestSyncAuthHandshakeDowngradeGuardRejects`, and two
+  `TestSyncAuthDecisionMatrix` rows FAIL;
+  (2) move the pending-frame call back above `installConn` →
+  `TestPendingFrameExecutesOnlyAfterInstall_5078` FAILs on the observation that
+  the fence callback saw no installed connection;
+  (3) neutralize the migration window → the escape-hatch handshake test and two
+  matrix rows FAIL.
+  The pre-existing `TestSyncAuthHandshakeDualAcceptLegacyPeer` asserted the
+  OPPOSITE of the fix (it required a keyed node to dual-accept) and was
+  REPLACED, not deleted quietly — the replacement documents what it used to
+  claim and why that was wrong. The `golden_4406` baseline was regenerated;
+  verified the delta is exactly one added key (`"AuthMigrationWindow": 0`) and
+  no behaviour drift before accepting it.
+  `go build ./... && go vet ./...` clean; full `go test ./...` exit 0 (real
+  exit code, not piped) — 59 packages ok. `gofmt -l` clean on every touched
+  file. NOT yet smoke-tested: session-sync changes need loss-cluster
+  `make test-failover`, which the lead schedules.
+- **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/manager.go`, `pkg/cluster/group_state.go`,
+  `pkg/cluster/sync_auth_test.go`, `pkg/cluster/sync_preadmission_5078_test.go`,
+  `pkg/cluster/README.md`, `pkg/config/schema_chassis.go`,
+  `pkg/config/types_chassis.go`, `pkg/config/compiler_system.go`,
+  `pkg/config/testdata/golden_4406.json`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 

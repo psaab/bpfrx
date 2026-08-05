@@ -183,6 +183,49 @@ Two defenses, both fail-safe rather than manufacturing a false winner:
   conflict). Yielding both nodes to SECONDARY produces a clean, obvious,
   loudly-logged outage instead of subtle duplicate-address corruption.
 
+## Session-sync fail-closed authentication (#5078)
+
+The session-sync TCP stream (`sync_auth.go`) authenticates with the SAME
+control-link PSK. Until #5078, a node that HAD a key still **dual-accepted** an
+unkeyed or legacy peer on first contact: `syncAuthDecision` granted a grace
+whenever the sticky downgrade guard (`peerAuthSeen`) had not yet armed.
+
+That grace was not a compatibility affordance, it was an unauthenticated
+**active** bypass, and it did not depend on the reflection weakness this issue
+also tracks:
+
+- the window is open on **every fresh boot** — "before the guard arms" is
+  exactly when a node starts;
+- an admitted peer's first frame was executed **before** the connection was
+  installed (`handleNewConnection`), and `syncMsgFence` on that path reaches
+  `OnFenceReceived`, which disables every routing group;
+- the admitted connection then **displaces** the legitimate peer's connection,
+  and arming the guard later does not evict it.
+
+So a PSK-less host reaching the fabric could fence the node and hold the peer
+slot. Two changes close it:
+
+- **A keyed node requires an authenticated peer.** `syncAuthDecision` no longer
+  consults `peerAuthSeen` for the unkeyed-peer branch — it cannot, since the
+  whole exposure is the pre-arm window. An unkeyed/legacy peer is rejected.
+- **A pending first frame executes only after `installConn`.** It is still
+  processed (dropping it would lose a message and break stream order), but
+  under the same admission the receive loop has, so a rejected handshake
+  executes nothing.
+
+**Why the escape hatch exists.** Config-sync delivers the key over this very
+channel, so keying the primary first would leave it permanently unable to reach
+the still-unkeyed secondary — a deadlock, not a transient. `set chassis cluster
+authentication-migration-window <minutes>` re-opens dual-accept for a bounded
+period. It is default-off (0), it **disables session-sync authentication while
+open**, and it alarms both when armed and on every unauthenticated admission it
+permits. The arming point is in-memory, so a daemon restart restarts the
+window — a deliberate choice over persisting a security-relaxation deadline
+across reboots.
+
+The window relaxes only "the peer is unkeyed". A peer that claims a key and
+fails its proof is rejected inside the window too.
+
 ## Control-channel authentication (#4107, PR-A)
 
 The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds

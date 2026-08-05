@@ -120,7 +120,15 @@ type ClusterConfig struct {
 	// agnostic: the SAME key on both nodes, synced by config-sync. Secret-
 	// typed so it is redacted on every show/log/JSON/YAML path and never
 	// echoed into an error string.
-	ControlLinkAuthKey    Secret
+	ControlLinkAuthKey Secret
+	// AuthMigrationWindow (#5078) is the number of minutes a KEYED node keeps
+	// dual-accepting an UNAUTHENTICATED session-sync peer, so a rolling
+	// authentication-key deployment can converge. 0 (the default) means a keyed
+	// node requires an authenticated peer — the fail-closed posture. It exists
+	// because config-sync delivers the key over the very channel the key
+	// protects: key the primary first and, without this window, it can never
+	// reach the still-unkeyed secondary to push the key.
+	AuthMigrationWindow   int
 	NATStateSync          bool   // enable NAT state synchronization (session sync with NAT fields)
 	IPsecSASync           bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
 	DHCPLeaseSync         bool   // enable DHCP-server lease synchronization (#2239 PATH C: lease state held on standby, seeded into Kea on takeover)

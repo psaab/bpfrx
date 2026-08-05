@@ -109,6 +109,15 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 		// (ast_redact.go). Untyped value slot, mirroring the OSPF/IS-IS/
 		// RIP/interface authentication-key leaves.
 		"authentication-key": {desc: "Shared PSK authenticating cluster control messages (HMAC-SHA256; same key on both nodes)", args: 1, placeholder: "<key>", children: nil},
+		// #5078: the migration escape hatch for a rolling key deployment.
+		// A keyed node normally REJECTS an unauthenticated session-sync peer.
+		// That is correct, and it deadlocks the one case where the key is
+		// pushed BY config-sync: key the primary first and it can no longer
+		// reach the unkeyed secondary to deliver the key. This window
+		// re-enables dual-accept for a bounded period so the operator can
+		// converge both nodes. It DISABLES session-sync authentication while
+		// active and is alarmed once per minute for exactly that reason.
+		"authentication-migration-window": {desc: "Minutes to keep accepting UNAUTHENTICATED session-sync peers while rolling out authentication-key (0=off; DISABLES sync auth while active)", args: 1, placeholder: "<minutes>", children: nil},
 		// control-ports fpc/port: NOT typed — compileChassis never
 		// reads control-ports (compiled-leaf-only invariant).
 		"control-ports": {desc: "Control port assignments (accepted for Junos compatibility; ignored)", children: map[string]*schemaNode{

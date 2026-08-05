@@ -92,6 +92,23 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 		m.controlAuthKey = nil
 	}
 
+	// #5078: the bounded dual-accept window. Arm the clock only on the
+	// transition into a non-zero window, so a later unrelated commit does not
+	// silently EXTEND an open window — the operator's escape hatch must expire
+	// on the schedule they asked for, not on apply traffic. Setting it back to
+	// 0 closes it immediately.
+	if w := time.Duration(cfg.AuthMigrationWindow) * time.Minute; w <= 0 {
+		m.authMigrationWindow = 0
+		m.authMigrationArmedAt = time.Time{}
+	} else {
+		if m.authMigrationWindow <= 0 {
+			m.authMigrationArmedAt = time.Now()
+			slog.Warn("cluster: session-sync authentication migration window ARMED; UNAUTHENTICATED sync peers are accepted until it expires — remove `chassis cluster authentication-migration-window` as soon as both nodes carry the key",
+				"window_minutes", cfg.AuthMigrationWindow)
+		}
+		m.authMigrationWindow = w
+	}
+
 	// Update peer fencing config.
 	m.peerFencing = cfg.PeerFencing
 

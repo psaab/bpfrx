@@ -116,6 +116,10 @@ const (
 type SyncAuthProvider interface {
 	ControlLinkAuthKey() []byte
 	HeartbeatPeerAuthSeen() bool
+	// SyncAuthMigrationActive reports whether the #5078 bounded dual-accept
+	// window is open. It is the ONLY way a keyed node accepts an
+	// unauthenticated peer; absent a provider it reads false (fail-closed).
+	SyncAuthMigrationActive() bool
 }
 
 type syncAuthProviderBox struct{ p SyncAuthProvider }
@@ -134,6 +138,16 @@ func (s *SessionSync) authKey() []byte {
 		return box.p.ControlLinkAuthKey()
 	}
 	return nil
+}
+
+// syncAuthMigrationActive reports whether the #5078 bounded dual-accept window
+// is open. No provider ⇒ false, so the fail-closed policy is the default for
+// every caller that never wired one.
+func (s *SessionSync) syncAuthMigrationActive() bool {
+	if box := s.authProvider.Load(); box != nil && box.p != nil {
+		return box.p.SyncAuthMigrationActive()
+	}
+	return false
 }
 
 // syncPeerAuthSeen reports whether the peer has ever authenticated on EITHER
@@ -251,18 +265,30 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 //	peerKeyed      — the peer's HELLO advertised that it holds a key.
 //	proofOK        — the peer's challenge-response proof verified (meaningful
 //	                 only when both sides are keyed).
-//	peerAuthSeen   — sticky: the peer has previously authenticated on the sync
-//	                 OR heartbeat channel (so both nodes are keyed and an
-//	                 unauthenticated connection is now a downgrade attack).
+//
+//	migrationOpen  — the #5078 bounded dual-accept window is configured and
+//	                 still open (operator escape hatch for a rolling key
+//	                 rollout). It DISABLES authentication while true.
 //
 // Policy:
 //   - No local key: dual-accept — this node cannot verify and may be the
 //     not-yet-keyed side of a rolling upgrade.
 //   - Local key + peer keyed (proof exchanged): enforce — reject a bad proof.
-//   - Local key + peer legacy/unkeyed + peer never authenticated: dual-accept.
-//   - Local key + peer legacy/unkeyed + peer HAS authenticated: reject
-//     (downgrade attack once both nodes are known-keyed).
-func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK, peerAuthSeen bool) (mode syncAuthMode, accept bool, reason string) {
+//   - Local key + peer legacy/unkeyed: REJECT, unless the operator has opened
+//     the migration window.
+//
+// #5078: that last line used to grant a first-contact grace — a keyed node
+// dual-accepted an unkeyed peer whenever `peerAuthSeen` was still false. That
+// grace was an unauthenticated ACTIVE bypass, not a compatibility affordance,
+// and it did not need the reflection weakness to exploit: a PSK-less attacker
+// reaching the fabric on first contact was admitted, could fence the node
+// (disabling every RG), and displaced the legitimate peer connection — after
+// which arming the sticky guard did not evict it. `peerAuthSeen` is therefore
+// no longer consulted for this branch; it cannot be, because the whole window
+// is "before the guard arms". The rolling-rollout case it was trying to serve
+// is now an explicit, default-off, time-bounded, alarmed knob instead of an
+// implicit hole that is open on every fresh boot.
+func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK, migrationOpen bool) (mode syncAuthMode, accept bool, reason string) {
 	if !keyConfigured {
 		return syncAuthUnauthenticated, true, ""
 	}
@@ -272,10 +298,10 @@ func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK, peerAut
 		}
 		return syncAuthUnauthenticated, false, "hmac verification failed"
 	}
-	if peerAuthSeen {
-		return syncAuthUnauthenticated, false, "missing auth handshake (enforced: peer previously authenticated)"
+	if migrationOpen {
+		return syncAuthUnauthenticated, true, ""
 	}
-	return syncAuthUnauthenticated, true, ""
+	return syncAuthUnauthenticated, false, "missing auth handshake (enforced: this node is keyed)"
 }
 
 // pendingFrame carries a legacy/unkeyed peer's first real frame that was
@@ -358,11 +384,18 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 		return syncAuthUnauthenticated, nil, nil, werr
 	}
 
-	peerAuthSeen := s.syncPeerAuthSeen()
+	migrationOpen := s.syncAuthMigrationActive()
+	if migrationOpen {
+		// Alarm EVERY unauthenticated admission, not just the arming commit:
+		// the window disables session-sync authentication, and an operator who
+		// forgets to remove it must keep seeing that in the log. Handshakes are
+		// per-connection, not per-packet, so this cannot flood a healthy node.
+		slog.Warn("cluster sync: authentication-migration-window is OPEN — accepting an UNAUTHENTICATED session-sync peer; remove `chassis cluster authentication-migration-window` once both nodes carry the key")
+	}
 
 	if typ != syncMsgAuthHello {
 		// Peer sent a real frame, not a HELLO ⇒ legacy or unkeyed peer.
-		_, accept, reason := syncAuthDecision(true, false, false, false, peerAuthSeen)
+		_, accept, reason := syncAuthDecision(true, false, false, false, migrationOpen)
 		if !accept {
 			return syncAuthUnauthenticated, nil, nil, errors.New(reason)
 		}
@@ -377,7 +410,7 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 
 	if !peerKeyed {
 		// Peer is a new build but holds no key ⇒ it is not signing. Dual-accept.
-		_, accept, reason := syncAuthDecision(true, true, false, false, peerAuthSeen)
+		_, accept, reason := syncAuthDecision(true, true, false, false, migrationOpen)
 		if !accept {
 			return syncAuthUnauthenticated, nil, nil, errors.New(reason)
 		}
@@ -399,7 +432,7 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 	}
 
 	proofOK := ptyp == syncMsgAuthProof && hmac.Equal(ppayload, syncAuthProof(key, localNonce))
-	mode, accept, reason := syncAuthDecision(true, true, true, proofOK, peerAuthSeen)
+	mode, accept, reason := syncAuthDecision(true, true, true, proofOK, migrationOpen)
 	if !accept {
 		return syncAuthUnauthenticated, nil, nil, errors.New(reason)
 	}
