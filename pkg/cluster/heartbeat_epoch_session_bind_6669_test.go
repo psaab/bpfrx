@@ -395,6 +395,18 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 	}
 	waitBootEpochIdle(t, m)
 
+	// EXACTLY TWO, not "at least two". The select above takes any second entry,
+	// so an implementation that queues the request correctly AND ALSO spawns a
+	// redundant extra worker satisfies it — the pending bit is set, the follow-up
+	// runs, and the surplus pass is invisible. The re-claim is supposed to cost
+	// ONE extra pass; a count that only has a floor cannot tell "re-claimed" from
+	// "re-claimed and duplicated".
+	if got := passes.Load(); got != 2 {
+		t.Fatalf("%d locked refine passes ran for the initial resolve plus ONE queued "+
+			"request, want exactly 2: the request was re-claimed, but something also ran "+
+			"a surplus pass, so the slot is not serialising what it claims to", got)
+	}
+
 	if got := m.heartbeatBootEpoch(); got <= raised {
 		t.Fatalf("published epoch = %d, want > %d — the re-claimed pass ran but did not chain "+
 			"from the value another incarnation left in the file", got, raised)

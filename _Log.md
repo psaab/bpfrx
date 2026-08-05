@@ -67684,3 +67684,60 @@ break — `go vet` confirmed passing under every revert.
   `-count=10`.
 - **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 11:28 PDT
+- **Action**: #6669 round 17 — gate items 2 and 3 folded (exact pass count; a
+  positive control plus the production `Stop` path). Item 1 NOT folded: its
+  negative control refutes the framing, and the instruction was to report that
+  rather than build on it.
+- **ITEM 1 NEGATIVE CONTROL — THE FRAMING IS WRONG. The prescribed mutation does
+  NOT leave `TestOverlappingRefineRequestIsCoalesced_6669` green; it REDs, three
+  different ways.** Measured before touching the test, as instructed:
+  1. Suppress the pending-bit coalesce AND spawn a concurrent second worker
+     (ad-hoc): RED at the epoch-chaining assertion, `session_bind:299`.
+  2. Same, but the second worker runs the FULL normal loop so every watermark
+     and handle path is identical: RED, same assertion.
+  3. Coalescing left fully intact, plus a REDUNDANT concurrent worker: RED via
+     `WARNING: DATA RACE`.
+  Control on the isolate: suppressing the pending bit alone (the classic dropped
+  request, no second worker) REDs at `session_bind:284` — "only 1 refine
+  pass(es) ran" — so the test's own fail-on-revert gate still works and the
+  above are not an artifact of a broken harness.
+- **WHY IT REDS, AND WHY THE GATE'S CONCERN IS STILL PARTLY RIGHT.** Variants 1
+  and 2 fail on the epoch assertion, which sits on a KNIFE EDGE:
+  `bootEpochMaxSkew` is exactly `60 * 60 * 1e9`, and the test raises the file by
+  exactly `time.Hour`, so `epochOrderable(n+1, now)` turns on whether the wall
+  clock advanced past the published epoch between the raise and the worker's
+  read. That is a downstream CONSEQUENCE assertion, not an ownership one.
+  Variant 3 is caught by the race detector, not by an assertion. So the gate's
+  conclusion — nothing in this test binds "exactly one worker owns the
+  follow-up" — is STRUCTURALLY TRUE (it never counts workers or goroutines), but
+  its stated consequence, "an implementation spawning a concurrent second worker
+  can pass", is FALSE as measured. Left for the lead to rule on rather than
+  built on, per the explicit instruction.
+- **Item 2 — exact pass count.** `TestLateRefineRequestIsReclaimed_6669` waited
+  for ANY pass numbered at least two, so queueing the request correctly AND
+  running a surplus pass satisfied it. It now asserts exactly 2.
+  RED-on-revert: a surplus `refineBootEpoch` on the losing-claim path gives
+  "3 locked refine passes ran ... want exactly 2".
+- **Item 3 — zero was the not-bound default, and the seam was test-only.** Two
+  fixes. A POSITIVE CONTROL now parks 8 goroutines of the same shape as a
+  per-call forwarding helper and requires `clusterGoroutines` to see exactly 8
+  before the real zero is trusted; RED-on-revert (one letter of `clusterPkgPath`
+  transposed) gives "the positive control parked 8 goroutines and
+  clusterGoroutines saw 0". And the test now also drives `Manager.Stop` — the
+  production caller, which refuses spawns under `bootEpochRefineMu` first, tears
+  down sender/receiver, and joins on `bootEpochStopJoinBudget` rather than a
+  budget the test picked — asserting the same zero delta over the real path.
+- **Left alone deliberately.** `TestSecondStopIsANoOp_6669`, which the gate
+  credited; its nil expectations are defaults but the non-nil handle and
+  stopped-channel checks are what bind.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 18.7 s with `TMPDIR=/tmp`
+  — the socket/netlink denials the gate hit are its sandbox, not this tree.
+  Both new assertions watched RED then GREEN, each from an assertion rather than
+  a build break, restored with `touch` and `heartbeat_epoch.go` confirmed
+  identical to HEAD. Flake: three runs at `-count=5` over the three affected
+  tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md

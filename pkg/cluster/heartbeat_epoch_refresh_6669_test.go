@@ -736,8 +736,42 @@ func TestTimedOutJoinLeavesNoWaiterBehind_6669(t *testing.T) {
 	release := parkedRefineWorker(t, m)
 	defer release()
 
-	base := clusterGoroutines()
 	const calls = 8
+
+	// POSITIVE CONTROL, BECAUSE ZERO IS ALSO THE NOT-BOUND ANSWER. A delta of
+	// zero is what this assertion wants AND what a matcher that binds nothing
+	// returns — a typo in clusterPkgPath, or a stack format change, would read
+	// as "no leak" forever. So prove the matcher can SEE a leak of exactly this
+	// shape, at exactly this size, before trusting a zero from it. These
+	// goroutines park on a channel and are spawned by this package, which is the
+	// same shape a per-call forwarding helper has.
+	ctlBase := clusterGoroutines()
+	ctlGate := make(chan struct{})
+	var ctlWG sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		ctlWG.Add(1)
+		go func() {
+			defer ctlWG.Done()
+			<-ctlGate
+		}()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for clusterGoroutines()-ctlBase < calls && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if seen := clusterGoroutines() - ctlBase; seen != calls {
+		t.Fatalf("the positive control parked %d goroutines and clusterGoroutines saw %d: the "+
+			"matcher does not count a leak of the shape this test exists to catch, so the "+
+			"zero asserted below would mean nothing", calls, seen)
+	}
+	close(ctlGate)
+	ctlWG.Wait()
+	for clusterGoroutines() > ctlBase && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	// THE REAL CASE. Same matcher, same count, now over the join itself.
+	base := clusterGoroutines()
 	for i := 0; i < calls; i++ {
 		if m.joinBootEpochRefine(5 * time.Millisecond) {
 			t.Fatalf("join %d reported a wedged worker as joined", i)
@@ -747,6 +781,20 @@ func TestTimedOutJoinLeavesNoWaiterBehind_6669(t *testing.T) {
 		t.Fatalf("%d goroutine(s) parked in the join after %d timed-out calls, want 0: a helper "+
 			"spawned per call is not cancelled by the caller's timeout, so every join over a "+
 			"wedged store leaks one for the life of the process", leaked, calls)
+	}
+
+	// AND THROUGH Manager.Stop, which is the production caller. Everything above
+	// drives joinBootEpochRefine directly through a test-only parked-worker
+	// helper; Stop adds the parts that helper omits — it refuses further spawns
+	// under bootEpochRefineMu first, tears down the heartbeat sender/receiver,
+	// and then joins on bootEpochStopJoinBudget rather than a budget the test
+	// chose. A leak reachable only through that path would escape the loop
+	// above, so assert the same delta over the real one. It times out (the
+	// worker is still parked), which is the case that leaks.
+	stopBase := clusterGoroutines()
+	m.Stop()
+	if leaked := clusterGoroutines() - stopBase; leaked > 0 {
+		t.Fatalf("%d goroutine(s) left parked by Manager.Stop's timed-out join, want 0", leaked)
 	}
 }
 
