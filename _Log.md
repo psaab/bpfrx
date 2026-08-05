@@ -66266,3 +66266,35 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 09:41
+- **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
+  process-global `AtomicU64` statics as their before/after baseline, so cargo's
+  in-process parallelism made each test's assertion depend on what every other
+  test happened to do. Measured at pristine `origin/master` ad9591177 with a
+  bounded harness: `FAIL FAIL HUNG FAIL FAIL`, with a #6819 participant failing
+  in 5 of 5 runs. Moved `SESSION_INSTALL_STALE_IGNORED`,
+  `SESSION_DELETE_STALE_IGNORED` (#2170) and `SYNCED_IMPORT_CAP_DROPS` (#5674)
+  out of `bpf_map/metrics.rs` and onto `SessionManager` as per-Coordinator
+  fields (`install_stale_ignored`, `delete_stale_ignored`, `import_cap_drops`),
+  beside the existing per-instance `export_seq`. Every bump site
+  (`ha/session_import.rs`) and every read site (`coordinator/status.rs`)
+  already held a `&self` Coordinator, and production constructs exactly one
+  Coordinator (`server/lifecycle.rs`), so the gRPC/Prometheus values are
+  unchanged — this is a test-isolation fix with no production behaviour change.
+  `ha_tests.rs` is untouched: no assertion weakened, no `--test-threads=1`, no
+  `#[serial]`. The issue's own suggested fix — "make the assertions
+  DELTA-based" — was already in place and is not sufficient: the tests capture
+  `let before = ...` and assert `before + 1`, but a concurrent test's increment
+  lands INSIDE that capture window. Only a per-instance home removes the
+  dependency. After: 10 runs, a #6819 participant failed in 0 of 10. The suite
+  itself is 5 PASS / 2 FAIL / 3 HUNG — every residual failure is #6657
+  (CoS-lease seqlock `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, and an
+  unbounded blocking recv wedging at 7 threads in
+  `__skb_wait_for_more_packets`), a separate defect that this PR does not
+  touch. Red-on-revert: 7 of 7 tests go RED on an assertion when the guard each
+  one covers is reverted.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/metrics.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md

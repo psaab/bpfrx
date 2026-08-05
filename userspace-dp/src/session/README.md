@@ -788,7 +788,7 @@ cap is meant to prevent). `upsert_synced_session` now bounds the shared
 `synced` map (the single fan-out choke point) at this appliance's OWN
 aggregate **ENTRY** ceiling — `2 * worker_count * DEFAULT_MAX_SESSIONS`
 (`synced_import_cap()`) — and **drop-newest**-rejects a NEW over-ceiling
-FORWARD key: it bumps `SYNCED_IMPORT_CAP_DROPS`
+FORWARD key: it bumps `SessionManager::import_cap_drops`
 (`Coordinator::synced_import_cap_drops_total()`, Prometheus
 `xpf_userspace_synced_import_cap_drops_total`) and returns BEFORE the
 publish + fan-out, so a rejected import is never enqueued to any worker
@@ -842,9 +842,10 @@ halves.
 
 `upsert_synced_session` (`afxdp/ha.rs`) refuses a strictly-older-generation
 install (both generations non-zero) so the helper's stored generation never
-regresses (`SESSION_INSTALL_STALE_IGNORED`), mirroring the Go install guard.
-`delete_synced_session_gen(key, delete_gen)` refuses a strictly-older-generation
-delete (`SESSION_DELETE_STALE_IGNORED`); the plain `delete_synced_session(key)`
+regresses (`SessionManager::install_stale_ignored`), mirroring the Go install
+guard. `delete_synced_session_gen(key, delete_gen)` refuses a
+strictly-older-generation delete (`SessionManager::delete_stale_ignored`); the
+plain `delete_synced_session(key)`
 wrapper passes `delete_gen = 0` so helper-local purges (tunnel-remap, GC) stay
 unconditional. These helper-side guards are **belt-and-suspenders** — the
 authoritative guard lives in the Go cluster apply layer (`deleteClusterSynced*`),
@@ -852,6 +853,19 @@ which short-circuits both the BPF map delete and the helper. The counters are
 surfaced via `Coordinator::session_install_stale_ignored_total()` /
 `session_delete_stale_ignored_total()`. See `docs/sync-protocol.md` and
 `docs/research/2170-ha-deferred-delete/plan.md`.
+
+All three sync-import refusal counters (`install_stale_ignored`,
+`delete_stale_ignored`, `import_cap_drops`) are **per-`Coordinator` fields on
+`SessionManager`**, not process-global statics. Production builds exactly one
+`Coordinator`, so the gRPC/Prometheus values are identical either way; the
+distinction is that the test suite builds one `Coordinator` per `#[test]` and
+runs them concurrently in a single process. As globals, a test asserting on
+these counters was measuring every *other* test's stale-install/stale-delete/
+over-ceiling refusals as well as its own, which failed the cargo suite on
+unmodified master (#6819). Keep new refusal counters on `SessionManager` for
+the same reason — a delta capture (`let before = ...; assert_eq!(..., before +
+1)`) does **not** make a process-global safe here, because a concurrent test's
+increment lands inside the capture window.
 
 ### Per-policy log flags on the session-sync wire (#2785)
 

@@ -79,7 +79,9 @@ impl crate::afxdp::Coordinator {
             && entry.generation != 0
             && entry.generation < previous.generation
         {
-            SESSION_INSTALL_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            self.sessions
+                .install_stale_ignored
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         // #5674: aggregate synced-import admission bound. Locally-created
@@ -115,7 +117,9 @@ impl crate::afxdp::Coordinator {
         if previous_entry.is_none() && !entry.metadata.is_reverse {
             let synced_cap = self.synced_import_cap();
             if synced_cap != 0 && synced_len >= synced_cap {
-                SYNCED_IMPORT_CAP_DROPS.fetch_add(1, Ordering::Relaxed);
+                self.sessions
+                    .import_cap_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -275,7 +279,9 @@ impl crate::afxdp::Coordinator {
             && delete_gen != 0
             && delete_gen < entry.generation
         {
-            SESSION_DELETE_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            self.sessions
+                .delete_stale_ignored
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let reverse_key = removed_entry.as_ref().and_then(|entry| {
