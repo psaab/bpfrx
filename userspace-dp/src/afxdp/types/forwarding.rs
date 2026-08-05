@@ -133,6 +133,29 @@ pub(in crate::afxdp) struct ForwardingState {
     /// read u16 directly; slow-path display sites translate via
     /// `zone_id_to_name`. Unknown / dropped zones map to `0`.
     pub(in crate::afxdp) ifindex_to_zone_id: FastMap<i32, u16>,
+    /// #6722: ifindex → the nonzero zone id that EVERY snapshot interface row
+    /// on that ifindex agrees on. An ifindex is ABSENT here whenever the rows
+    /// sharing it disagree — including the case where one row carries a zone
+    /// and another carries none — and absent whenever they all agree on "no
+    /// zone".
+    ///
+    /// This is NOT `ifindex_to_zone_id` with fewer entries by accident; it
+    /// answers a different question. `ifindex_to_zone_id` answers "what zone
+    /// should a packet ARRIVING on this ifindex be attributed to", and it
+    /// deliberately takes the last zoned row plus the child→parent propagation
+    /// so a trunk parent inherits its unit's zone (#921/#3618). This map
+    /// answers "does this ifindex identify exactly one zone", which is the only
+    /// question the EGRESS half may safely ask: several logical units share one
+    /// ifindex (`snapshotLinuxName` collapses a non-VLAN unit 0 onto its base
+    /// netdev), so an ifindex that several differently-zoned units share
+    /// identifies no single zone at all, and guessing one adjudicates transit
+    /// under a policy the operator never wrote for that interface.
+    ///
+    /// Built in `forwarding_build::interfaces::populate_interfaces` from the
+    /// same validated `zone_name_to_id` lookup, over ALL rows (zoned and
+    /// unzoned alike) rather than only the zoned ones. Read only by
+    /// [`ForwardingState::egress_zone_id`].
+    pub(in crate::afxdp) ifindex_unambiguous_zone_id: FastMap<i32, u16>,
     pub(in crate::afxdp) zone_name_to_id: FastMap<String, u16>,
     pub(in crate::afxdp) zone_id_to_name: FastMap<u16, String>,
     /// #6458: zone ID → deduplicated redundancy-group IDs (> 0) of the
@@ -514,37 +537,73 @@ impl ForwardingState {
     /// no operator-authored permit could ever apply to LAN->tunnel transit and
     /// every packet fell to the default policy.
     ///
-    /// #6722, WHAT THE FALLBACK RESOLVES FOR A SHARED IFINDEX. Several logical
+    /// #6722, WHY THE FALLBACK IS NOT `ifindex_to_zone_id`. Several logical
     /// units can share ONE ifindex — `pkg/dataplane/userspace/interfaces.go`'s
     /// `snapshotLinuxName` collapses a non-VLAN unit 0 onto its base netdev, so
     /// `st0` and `st0.0` are one ifindex, as are `ge-0/0/1` and `ge-0/0/1.0`.
-    /// `ifindex_to_zone_id` is therefore a per-NETDEV map, not a per-unit one,
-    /// and it additionally carries the zone `populate_interfaces` propagates
-    /// from a zoned child unit onto `parent_ifindex`.
+    /// `ifindex_to_zone_id` is therefore a per-NETDEV map, not a per-unit one:
+    /// it holds the LAST zoned row's zone plus the zone `populate_interfaces`
+    /// propagates from a zoned child unit onto `parent_ifindex`. Reading it
+    /// here would hand an interface a nonzero zone it was never configured
+    /// with, which is the fail-OPEN direction — a permit the operator wrote for
+    /// a different interface would start matching this one's transit. Three
+    /// producible shapes:
     ///
-    /// The consequence, stated plainly because it IS a behaviour and not an
-    /// accident: **a MAC-less unit that shares a base ifindex with a zoned
-    /// sibling adjudicates under the base row's zone.** Zone only `st0.1` and
-    /// the Go builder still emits the `st0` BASE row carrying that zone
-    /// (`buildInterfaceZoneMap`, `pkg/dataplane/userspace/zones.go` — a
-    /// unit-suffixed zone reference writes `out[base]` as well), and unit 0
-    /// shares the base's ifindex. Transit routed out `st0.0` is adjudicated
-    /// `(from, vpnb)`, not `(from, 0)`.
+    /// 1. Zone only `st0.1` and the Go builder still emits the `st0` BASE row
+    ///    carrying that zone (`buildInterfaceZoneMap`,
+    ///    `pkg/dataplane/userspace/zones.go` — a unit-suffixed zone reference
+    ///    writes `out[base]` as well), while `st0.0` — which the operator left
+    ///    in NO zone — shares the base's ifindex. `ifindex_to_zone_id` says
+    ///    `vpnb` for that ifindex.
+    /// 2. Two units in DIFFERENT zones on one `st0` with unit 0 unzoned. The Go
+    ///    `out[base]` write is FIRST-write-wins over sorted zone names, so the
+    ///    base — and thus unit 0's ifindex — carries the alphabetically-first
+    ///    sibling's zone.
+    /// 3. StableZoneID quarantine (`zones_quarantine.go`). It unzones the
+    ///    interfaces of a colliding zone AFTER `buildInterfaceSnapshots` ran,
+    ///    precisely so they fail CLOSED. A base whose zone was quarantined
+    ///    arrives unzoned beside a surviving zoned child, the Rust child→parent
+    ///    propagation below re-zones the parent's ifindex, and reading
+    ///    `ifindex_to_zone_id` would hand the quarantine's deliberate
+    ///    default-deny back the survivor's zone.
     ///
-    /// That is defensible precisely because it is the value the INGRESS half
-    /// has always used for that same ifindex: a packet arriving on ifindex
-    /// `st0` is from-zone `vpnb` (`ifindex_to_zone_id`, the from-zone source),
-    /// so resolving the egress half through the same map keeps one ifindex
-    /// answering one zone in both directions. Scoping the egress half to a
-    /// narrower "own zone" map would make egress return the 0 sentinel for an
-    /// ifindex ingress calls `vpnb` — and 0 refuses to match ANY rule, which is
-    /// #6713 again for that config.
+    /// So the fallback reads `ifindex_unambiguous_zone_id`, which carries an
+    /// ifindex only when EVERY snapshot row on it agreed on one nonzero zone.
+    /// An ambiguous ifindex resolves to the 0 sentinel — the pre-#6713 answer,
+    /// against which no rule matches and the default policy decides.
     ///
-    /// Junos zones LOGICAL UNITS, so `st0.0` and `st0.1` being one zone here is
-    /// a genuine parity gap. Closing it needs per-unit identity end to end (the
-    /// snapshot's unit-0 ifindex collapse, both halves of the zone resolver, and
-    /// the AF_XDP bind keying) — it is tracked separately and deliberately NOT
-    /// papered over at this single read.
+    /// This deliberately makes the two DIRECTIONS disagree for an ambiguous
+    /// ifindex: ingress still attributes a packet arriving on it to
+    /// `ifindex_to_zone_id`'s zone (#921/#3618, unchanged here), while egress
+    /// answers 0. That asymmetry is the point, and the reason is NOT that the
+    /// ingress surface is unreachable — stated carefully, because it is only
+    /// unreachable in one of the two shapes:
+    ///
+    /// - In the QUARANTINE shape every row on the ifindex is unzoned, and
+    ///   `buildUserspaceIngressInterfaces` (`pkg/dataplane/userspace/
+    ///   interfaces.go`, `if iface.Zone == "" { continue }`) gives an unzoned
+    ///   row no AF_XDP bind target, so no packet ever ingresses there and only
+    ///   the PROPAGATED `ifindex_to_zone_id` entry exists.
+    /// - In the sibling / divergent shapes the BASE row is zoned, so the
+    ///   ifindex genuinely is a bind target and ingress really does answer
+    ///   `vpnb` for traffic arriving on it.
+    ///
+    /// The asymmetry is justified by direction, not by reachability: ingress
+    /// answering wide is PRE-EXISTING behaviour this change does not touch,
+    /// whereas egress answering wide is a NEW fail-open on the exact interface
+    /// class #6713 just routed through the fallback — a to-zone is what makes a
+    /// permit match. Whether the ingress half should be narrowed the same way is
+    /// a separate question about #921/#3618 and is not settled here. Where the
+    /// ifindex is UNambiguous — the #6713 case itself, `bind-interface st0` with
+    /// its unit in the same zone — both halves still answer the same zone.
+    ///
+    /// Junos zones LOGICAL UNITS, so two same-zone units sharing one ifindex is
+    /// still a parity gap in the other direction: `st0.0` and `st0.1` cannot be
+    /// given DIFFERENT zones and both forward. Closing that needs per-unit
+    /// identity end to end (the snapshot's unit-0 ifindex collapse, both halves
+    /// of the zone resolver, and the AF_XDP bind keying) — it is tracked
+    /// separately and deliberately NOT papered over at this single read. Until
+    /// then such a pair fails closed rather than guessing.
     ///
     /// A row that exists and carries `zone_id == 0` is still left at 0, and that
     /// short-circuit is LOAD-BEARING, not defensive: `populate_egress` is
@@ -560,7 +619,11 @@ impl ForwardingState {
         self.egress
             .get(&egress_ifindex)
             .map(|iface| iface.zone_id)
-            .or_else(|| self.ifindex_to_zone_id.get(&egress_ifindex).copied())
+            .or_else(|| {
+                self.ifindex_unambiguous_zone_id
+                    .get(&egress_ifindex)
+                    .copied()
+            })
             .unwrap_or(0)
     }
 

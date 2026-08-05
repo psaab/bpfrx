@@ -4,6 +4,9 @@
 //!
 //! 1. [`populate_interfaces`] — walks `snapshot.interfaces`,
 //!    populates `state.ifindex_to_*`, `state.ifindex_to_zone_id`,
+//!    `state.ifindex_unambiguous_zone_id` (#6722 — an ifindex only when
+//!    EVERY row sharing it named the same nonzero zone; see
+//!    `ForwardingState::egress_zone_id`),
 //!    `state.tunnel_interfaces`, `state.local_v[46]`,
 //!    `state.interface_nat_v[46]`, `state.connected_v[46]`. Returns
 //!    an [`IfaceIndex`] context with `name_to_ifindex` /
@@ -36,6 +39,10 @@ pub(super) fn populate_interfaces(
     let mut name_to_ifindex = BTreeMap::new();
     let mut linux_to_ifindex = BTreeMap::new();
     let mut mac_by_ifindex = BTreeMap::new();
+    // #6722: ifindex → the zone every row on it agrees on, or `None` once two
+    // rows disagreed. Flushed into `state.ifindex_unambiguous_zone_id` after
+    // the walk, because a conflict can be introduced by ANY later row.
+    let mut zone_agreement: BTreeMap<i32, Option<u16>> = BTreeMap::new();
 
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
@@ -59,17 +66,19 @@ pub(super) fn populate_interfaces(
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);
         }
-        if !iface.zone.is_empty() {
-            // #921: resolve zone NAME → u16 once at config build, so
-            // every read on the hot path is one HashMap lookup
-            // (ifindex → u16).
-            // #2391: a non-empty zone NAME that is not in the zone table
-            // (dropped at populate_zones for a u8-overflow id, or a
-            // version-drifted/hostile snapshot) must FAIL CLOSED instead of
-            // collapsing to zone 0 — collapsing bypasses every zone-pair policy
-            // (fail-open under a permit default). The Go commit-time cap is the
-            // primary gate; this is the helper-boundary backstop.
-            let zone_id = match state.zone_name_to_id.get(&iface.zone).copied() {
+        // #921: resolve zone NAME → u16 once at config build, so every read on
+        // the hot path is one HashMap lookup (ifindex → u16). An unzoned row
+        // resolves to 0, the "no zone" sentinel.
+        // #2391: a non-empty zone NAME that is not in the zone table
+        // (dropped at populate_zones for a u8-overflow id, or a
+        // version-drifted/hostile snapshot) must FAIL CLOSED instead of
+        // collapsing to zone 0 — collapsing bypasses every zone-pair policy
+        // (fail-open under a permit default). The Go commit-time cap is the
+        // primary gate; this is the helper-boundary backstop.
+        let row_zone_id: u16 = if iface.zone.is_empty() {
+            0
+        } else {
+            match state.zone_name_to_id.get(&iface.zone).copied() {
                 Some(id) => id,
                 None => {
                     return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
@@ -77,25 +86,70 @@ pub(super) fn populate_interfaces(
                         zone: iface.zone.clone(),
                     });
                 }
-            };
-            state.ifindex_to_zone_id.insert(iface.ifindex, zone_id);
-            // #6722: this propagation is UNREACHABLE for a snapshot the Go
-            // builder produces, and is kept only as a helper-boundary backstop.
-            // `buildInterfaceZoneMap` (`pkg/dataplane/userspace/zones.go`)
-            // already writes `out[base]` for a unit-suffixed zone reference and
-            // fans a base-named one out to every unit, so a zoned unit's parent
-            // row always arrives carrying a zone of its own and does its own
-            // insert above (rows are emitted base-first,
-            // `pkg/dataplane/userspace/interfaces.go`). Do NOT reason about
-            // `ifindex_to_zone_id` as "propagated vs own" — on every producible
-            // snapshot there is no difference to reason about.
+            }
+        };
+        // #6722: record what THIS row says about its ifindex, for every row —
+        // an unzoned row's "no zone" is an opinion that must be able to
+        // conflict with a zoned sibling's. `zone_agreement[ifx] == None` means
+        // the rows sharing `ifx` disagree, so the ifindex identifies no single
+        // zone and `ForwardingState::egress_zone_id` must refuse to guess one.
+        // Recording unzoned rows is LOAD-BEARING, and proven so: skip them and
+        // `unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722`,
+        // `divergently_zoned_sibling_units_do_not_pick_a_zone_6722` and both
+        // filter-log siblings go red, because the shared ifindex's only
+        // surviving opinion is the zoned base row's.
+        //
+        // The ledger is fed ONLY by what a row literally carries, never by the
+        // child→parent propagation below, so it says what the SNAPSHOT said
+        // rather than what the ingress map was derived to hold. That exclusion
+        // is a design property, not a demonstrated guard: teaching the ledger
+        // from the propagation arm too leaves every test in this issue green,
+        // because the arm is skipped whenever the parent already disagrees and
+        // a parent with no snapshot row of its own also has no child pointing
+        // at it (an unresolvable link yields `ifindex == 0` on both rows).
+        match zone_agreement.entry(iface.ifindex) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Some(row_zone_id));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if *slot.get() != Some(row_zone_id) {
+                    slot.insert(None);
+                }
+            }
+        }
+        // `row_zone_id != 0` is EXACTLY the pre-#6722 `!iface.zone.is_empty()`
+        // condition, not a narrowing of it: `zone_name_to_id_from_snapshot`
+        // (`policy.rs`) skips `zone.id == 0` outright, so a zone NAME that
+        // resolves at all resolves nonzero, and one that does not resolve
+        // already returned `InterfaceUnknownZone` above. `ifindex_to_zone_id`
+        // therefore receives the identical entries it did before this change.
+        if row_zone_id != 0 {
+            state.ifindex_to_zone_id.insert(iface.ifindex, row_zone_id);
+            // Propagate a zoned child unit's zone onto its parent's ifindex so
+            // a packet ARRIVING on a trunk parent with no zone of its own is
+            // attributed to its unit's zone (#921/#3618). This is REACHABLE for
+            // a Go-produced snapshot even though `buildInterfaceZoneMap`
+            // (`pkg/dataplane/userspace/zones.go`) writes `out[base]` for a
+            // unit-suffixed zone reference: the StableZoneID quarantine
+            // (`pkg/dataplane/userspace/zones_quarantine.go`) runs AFTER
+            // `buildInterfaceSnapshots` and blanks `Zone` on every row bound to
+            // a quarantined zone, so a base whose zone lost a collision arrives
+            // UNZONED beside a surviving zoned child and this arm fires.
+            //
+            // #6722: that is exactly why `egress_zone_id` must not read
+            // `ifindex_to_zone_id` — the quarantine unzoned those interfaces to
+            // make them fail CLOSED, and propagating a survivor's zone onto the
+            // parent would hand the egress half a zone the operator never
+            // configured there. The egress half reads
+            // `ifindex_unambiguous_zone_id` instead, which this arm never
+            // touches.
             if iface.parent_ifindex > 0 {
                 match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
-                    Some(existing) if *existing != zone_id => {}
+                    Some(existing) if *existing != row_zone_id => {}
                     _ => {
                         state
                             .ifindex_to_zone_id
-                            .insert(iface.parent_ifindex, zone_id);
+                            .insert(iface.parent_ifindex, row_zone_id);
                     }
                 }
             }
@@ -261,6 +315,25 @@ pub(super) fn populate_interfaces(
                 .ifindex_host_inbound
                 .entry(iface.ifindex)
                 .or_default();
+        }
+    }
+
+    // #6722: flush the agreement ledger. An ifindex lands here only when every
+    // row on it named the SAME nonzero zone; a conflict (`None`) and a
+    // unanimous "no zone" (`Some(0)`) are both left absent, and
+    // `ForwardingState::egress_zone_id` then resolves that ifindex to the 0
+    // sentinel — the pre-#6713 answer, against which no policy rule matches.
+    //
+    // The `zone_id != 0` skip is a map-size choice, NOT a safety gate, and is
+    // labelled as such so nobody mutates it expecting a red: `egress_zone_id`
+    // ends in `.unwrap_or(0)`, so a stored `Some(0)` and an absent key resolve
+    // identically. Keeping the key out confines the map to interfaces that
+    // actually name a zone.
+    for (ifindex, agreed) in zone_agreement {
+        if let Some(zone_id) = agreed {
+            if zone_id != 0 {
+                state.ifindex_unambiguous_zone_id.insert(ifindex, zone_id);
+            }
         }
     }
 
