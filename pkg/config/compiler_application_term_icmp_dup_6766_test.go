@@ -188,14 +188,22 @@ func TestApplicationTermICMPDup_ApplyGroups_Rejected(t *testing.T) {
 		tree := flatTreeFromSets(t,
 			"set groups g applications application ovr term t1 protocol icmp icmp-type 8 icmp-code 5",
 			"set apply-groups g",
-			"set applications application ovr term t1 protocol icmp icmp-type 3")
+			// The local value is deliberately 0 (echo-reply), the SCALAR ZERO of
+			// the compiled uint8 (#6814 gate). assertTermICMP rejects a nil
+			// ICMPType outright, so "committed the local 0" and "compiled
+			// nothing" cannot be confused here — the nil check carries the
+			// weight a non-zero value would otherwise have to. That makes this
+			// control bind the zero value itself: a compiler that dropped the
+			// local statement, or that let the group's 8 win, is caught, and so
+			// is one that treats a committed 0 as "unset".
+			"set applications application ovr term t1 protocol icmp icmp-type 0")
 		cfg, err := CompileConfig(tree)
 		if err != nil {
 			t.Fatalf("a local term restating a group-inherited icmp-type is an apply-groups "+
 				"OVERRIDE, not a conflicting repeat, and must COMMIT: %v", err)
 		}
 		// Local wins; the group's icmp-code does not survive the replacement.
-		assertTermICMP(t, cfg, "ovr-t1", 3, nil)
+		assertTermICMP(t, cfg, "ovr-t1", 0, nil)
 	})
 }
 

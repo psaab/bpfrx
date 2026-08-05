@@ -2,6 +2,7 @@ package policymatch
 
 import (
 	"net"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -35,8 +36,15 @@ import (
 
 // inlineICMPDupCfg builds a deny policy referencing an application whose single
 // inline term repeats an ICMP leaf with conflicting values, then compiles it on
-// the TOLERANT path (the strict path rejects it by design).
-func inlineICMPDupCfg(t *testing.T, appLine string) *config.Config {
+// the TOLERANT path.
+//
+// It also BINDS THE DUPLICATE RECORDING (#6814 gate): without the two checks
+// below, deleting the #6766 tracking outright leaves these tests green, because
+// the compiled values — and therefore every verdict — are identical whether or
+// not the conflict was recorded. The recording is what makes strict reject and
+// what puts the operator-visible warning on the tolerant path, so both are
+// asserted here rather than assumed.
+func inlineICMPDupCfg(t *testing.T, appLine, leaf string) *config.Config {
 	t.Helper()
 	tree := &config.ConfigTree{}
 	for _, cmd := range []string{
@@ -59,9 +67,35 @@ func inlineICMPDupCfg(t *testing.T, appLine string) *config.Config {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
+	// The conflict must be RECORDED: strict commit refuses it and names the leaf.
+	serr := func() error { _, e := config.CompileConfig(tree); return e }()
+	if serr == nil {
+		t.Fatalf("strict commit must REJECT the conflicting inline %q — if it does not, "+
+			"the #6766 duplicate recording is gone and the narrowing below is "+
+			"reachable through a green commit", leaf)
+	}
+	if !strings.Contains(serr.Error(), "duplicate") || !strings.Contains(serr.Error(), leaf) {
+		t.Fatalf("strict rejection should name the duplicate leaf %q, got: %v", leaf, serr)
+	}
+
 	cfg, err := config.CompileConfigLenient(tree)
 	if err != nil {
 		t.Fatalf("CompileConfigLenient must not brick on a conflicting inline ICMP repeat: %v", err)
+	}
+	// ...and the tolerant path must still SAY so. This is the only signal an
+	// operator gets on the path that keeps forwarding, so it is part of the
+	// contract these verdict tests characterize.
+	warned := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "duplicate") && strings.Contains(w, leaf) {
+			warned = true
+			break
+		}
+	}
+	if !warned {
+		t.Fatalf("tolerant path must record a downgrade warning naming %q — the "+
+			"narrowing asserted below is otherwise completely silent; warnings: %v",
+			leaf, cfg.Warnings)
 	}
 	return cfg
 }
@@ -80,10 +114,14 @@ func icmpQuery(icmpType, icmpCode *uint8) Query {
 func TestInlineTermICMPTypeDupNarrowsEnforcement_6766(t *testing.T) {
 	// Authored `icmp-type 8` then `icmp-type 3`: last-writer-wins keeps 3.
 	cfg := inlineICMPDupCfg(t,
-		"set applications application badapp term t1 protocol icmp icmp-type 8 icmp-type 3")
+		"set applications application badapp term t1 protocol icmp icmp-type 8 icmp-type 3",
+		"icmp-type")
 
 	t.Run("last authored type is the one enforced", func(t *testing.T) {
 		res := Match(cfg, icmpQuery(u8(3), nil))
+		if res.DefaultUsed {
+			t.Fatalf("ICMP type 3 must be denied by the POLICY, not by a default; got default_used=true action=%v", res.Action)
+		}
 		if !res.Matched || res.Action != config.PolicyDeny {
 			t.Fatalf("ICMP type 3 (the LAST authored icmp-type) must hit the deny; "+
 				"got matched=%v action=%v default_used=%v. If type 3 is NOT denied "+
@@ -95,15 +133,7 @@ func TestInlineTermICMPTypeDupNarrowsEnforcement_6766(t *testing.T) {
 
 	t.Run("first authored type escapes into default permit-all", func(t *testing.T) {
 		res := Match(cfg, icmpQuery(u8(8), nil))
-		if res.Matched && res.Action == config.PolicyDeny {
-			t.Fatalf("ICMP type 8 (the FIRST authored icmp-type) was DENIED — the term " +
-				"did not narrow to the last value, so this characterization is stale")
-		}
-		if res.Action != config.PolicyPermit {
-			t.Fatalf("ICMP type 8 must fall through to default-policy permit-all "+
-				"(this IS the silent narrowing the strict gate prevents); got action=%v "+
-				"matched=%v default_used=%v", res.Action, res.Matched, res.DefaultUsed)
-		}
+		assertFellThroughToDefaultPermit(t, res, "ICMP type 8 (the FIRST authored icmp-type)")
 	})
 }
 
@@ -113,10 +143,14 @@ func TestInlineTermICMPTypeDupNarrowsEnforcement_6766(t *testing.T) {
 func TestInlineTermICMPCodeDupNarrowsEnforcement_6766(t *testing.T) {
 	// Authored `icmp-code 1` then `icmp-code 2` under a fixed type 3.
 	cfg := inlineICMPDupCfg(t,
-		"set applications application badapp term t1 protocol icmp icmp-type 3 icmp-code 1 icmp-code 2")
+		"set applications application badapp term t1 protocol icmp icmp-type 3 icmp-code 1 icmp-code 2",
+		"icmp-code")
 
 	t.Run("last authored code is the one enforced", func(t *testing.T) {
 		res := Match(cfg, icmpQuery(u8(3), u8(2)))
+		if res.DefaultUsed {
+			t.Fatalf("ICMP type 3 code 2 must be denied by the POLICY, not by a default; got default_used=true action=%v", res.Action)
+		}
 		if !res.Matched || res.Action != config.PolicyDeny {
 			t.Fatalf("ICMP type 3 code 2 (the LAST authored icmp-code) must hit the deny; "+
 				"got matched=%v action=%v default_used=%v. A production edit that "+
@@ -127,15 +161,39 @@ func TestInlineTermICMPCodeDupNarrowsEnforcement_6766(t *testing.T) {
 
 	t.Run("first authored code escapes into default permit-all", func(t *testing.T) {
 		res := Match(cfg, icmpQuery(u8(3), u8(1)))
-		if res.Matched && res.Action == config.PolicyDeny {
-			t.Fatalf("ICMP type 3 code 1 (the FIRST authored icmp-code) was DENIED — " +
-				"the surviving code is the first, not the last, inverting the " +
-				"last-writer contract this test pins")
-		}
-		if res.Action != config.PolicyPermit {
-			t.Fatalf("ICMP type 3 code 1 must fall through to default-policy permit-all; "+
-				"got action=%v matched=%v default_used=%v",
-				res.Action, res.Matched, res.DefaultUsed)
-		}
+		assertFellThroughToDefaultPermit(t, res, "ICMP type 3 code 1 (the FIRST authored icmp-code)")
 	})
+}
+
+// assertFellThroughToDefaultPermit asserts that a query reached the configured
+// default policy and was permitted there.
+//
+// #6814 gate: `config.PolicyPermit` is the ZERO value of PolicyAction
+// (types_security.go), and so is `Matched=false`. An assertion built only on
+// "action is permit" is therefore satisfied by a Result that was never
+// populated at all — a path that produced NOTHING looks identical to a genuine
+// fall-through. `DefaultUsed` is the only field here that carries non-default
+// evidence: it is true ONLY because the default-policy branch actually ran. It
+// is asserted FIRST for that reason, and `Matched=false` is asserted explicitly
+// rather than left implied, which also rejects the
+// `Matched=true, DefaultUsed=false, Action=permit` shape — a concrete policy
+// PERMIT, which is a different (and equally wrong) outcome from falling
+// through.
+func assertFellThroughToDefaultPermit(t *testing.T, res Result, what string) {
+	t.Helper()
+	if !res.DefaultUsed {
+		t.Fatalf("%s must FALL THROUGH to default-policy permit-all: want DefaultUsed=true, "+
+			"got default_used=false matched=%v action=%v. DefaultUsed is the only "+
+			"non-zero-valued evidence that the default branch ran at all — permit and "+
+			"unmatched are both zero values and prove nothing on their own",
+			what, res.Matched, res.Action)
+	}
+	if res.Matched {
+		t.Fatalf("%s must not match a concrete policy: want Matched=false, got matched=true "+
+			"action=%v (a policy PERMIT is not the same outcome as falling through)",
+			what, res.Action)
+	}
+	if res.Action != config.PolicyPermit {
+		t.Fatalf("%s reached the default policy but was not permitted: action=%v", what, res.Action)
+	}
 }

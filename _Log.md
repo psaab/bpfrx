@@ -1,3 +1,59 @@
+## 2026-08-05 — #6814 fold round 3: assert the fall-through evidence, bind the recording
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, gate at 48bb63f54)
+- **Action**: Gate returned MERGE-NEEDS-MINOR on one family of defects — the
+  round-2 tests leaned on ZERO VALUES where the non-default evidence is what
+  proves the behaviour. All four items folded; production code is still
+  comment-only.
+    - **Fall-through was never actually asserted.** `config.PolicyPermit` is the
+      zero value of `PolicyAction` (`types_security.go:582`) and `Matched=false`
+      is a zero value too, so the discarded-value subtests were satisfied by a
+      `Result` that was never populated — a path producing NOTHING looked
+      identical to a genuine fall-through. New `assertFellThroughToDefaultPermit`
+      helper asserts `DefaultUsed=true` FIRST (the only non-default evidence that
+      the default branch ran), then `Matched=false` explicitly — which also
+      rejects the `Matched=true, DefaultUsed=false, Action=permit` shape, a
+      concrete policy PERMIT rather than a fall-through. The DENY legs gained a
+      matching `DefaultUsed=false` assertion so they cannot be satisfied by a
+      default either.
+    - **The duplicate RECORDING was not bound.** Verified firsthand before
+      fixing: with the #6766 tracking removed outright (strict stops rejecting)
+      both policymatch tests still PASSED, because the compiled values and every
+      verdict are identical whether or not the conflict was recorded. The shared
+      `inlineICMPDupCfg` fixture now asserts BOTH halves of the recording — that
+      strict `CompileConfig` rejects and names the leaf, and that the tolerant
+      path emits the warning naming it (the only signal an operator gets on the
+      path that keeps forwarding).
+    - **Scalar-zero override control (gate suggestion, taken).** The
+      apply-groups override control now commits `icmp-type 0` — the scalar zero
+      of the compiled `uint8`. `assertTermICMP` rejects a nil `ICMPType`
+      outright, so "committed the local 0" and "compiled nothing" cannot be
+      confused, and the control additionally binds a compiler that treats a
+      committed 0 as unset. Cheaper than reshaping the fixture and it keeps the
+      empirically-verified semantics (local term fully replaces the group's).
+    - Left alone per the gate: the positive controls that expect
+      `ICMPCode=nil`. Their companion non-nil type assertions and the
+      code-bearing controls keep the suite non-vacuous.
+- **Validation**: Four mutations, preflight build+vet clean, each vet-clean
+  under the mutation, each restored by writing back a pristine snapshot and
+  `touch`ing (never `git checkout --`), GREEN re-confirmed after each.
+  (1) Recording removed: both policymatch tests now RED at the strict-reject
+  assertion — they PASSED under this same mutation before the fold.
+  (2) Every default-branch `Result` leaves `DefaultUsed` unset: new assertion
+  RED with `default_used=false matched=false action=0`, and a throwaway
+  negative control running the PRE-fold assertion shape verbatim PASSED the
+  same mutation — the new evidence is what catches it.
+  (3) Default path also claims `Matched=true`: the `Matched` leg fires on its
+  own (it sits behind the `DefaultUsed` check, so it needed its own mutation).
+  (4) Committed `icmp-type 0` dropped as if unset: the override control RED
+  with `ovr-t1 ICMPType = <nil>, want 0` while its sibling subtests stay green.
+  Two mutation attempts were discarded as invalid rather than reported: one
+  broke the build (`declared and not used`) and one silently applied nothing
+  (a 2-occurrence anchor tripped the count assert), whose "PASS" was
+  meaningless. Gates scored from real exit codes: `GATE1_RC=0`, `FULL_RC=0`.
+- **File(s)**: `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`,
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go`, `_Log.md`
+
 ## 2026-08-05 — #6814 fold round 2: bind the icmp-code last-writer, add positive controls
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, PR #6814 head b21c7bd19)
