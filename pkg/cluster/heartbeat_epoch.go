@@ -791,7 +791,17 @@ func (m *Manager) claimBootEpochRefine() bool {
 
 // releaseBootEpochRefine ends one pass. It reports whether another pass is
 // owed; when it returns false the in-flight slot has been released and the
-// worker must return without touching Manager state again.
+// worker must return without doing any further REFINEMENT or touching the
+// epoch state — m.bootEpoch, m.bootEpochWrote and the state file are all off
+// limits from here, because a successor may already own the slot.
+//
+// "WITHOUT TOUCHING MANAGER STATE AGAIN" is what this said, and the round-14
+// exit handle made it false: the worker's outermost defer still runs
+// m.bootEpochWorker.CompareAndSwap(worker, nil) after this returns. That is
+// deliberate and is not a refinement — it is the worker publishing its own
+// death, and the CAS is what keeps an outgoing worker from clearing a
+// SUCCESSOR's handle in exactly the window this function opens by dropping the
+// in-flight bit before the goroutine has returned. See startBootEpochRefine.
 //
 // s.mu is not involved: the whole protocol is the one word. The release CAS
 // carries the pending bit's value at the instant of release, so a request that

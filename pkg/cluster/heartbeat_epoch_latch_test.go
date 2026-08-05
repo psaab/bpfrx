@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,6 +27,36 @@ import (
 // frame from it is refused. It is PROCESS-scoped: the routine restarts preserve
 // it and only a full daemon restart clears it, after which a live peer re-arms
 // it with its next heartbeat.
+
+// heldEpochLock takes the REAL advisory lock the persist path needs, for tests
+// that wedge the store rather than simulating a wedge, and returns a
+// once-guarded release.
+//
+// EVERY CALLER PAIRS IT WITH A CLEANUP that releases AND drains, because the
+// body's own release is on the happy path only: t.Fatalf runs runtime.Goexit
+// and skips the rest of the body, so an assertion firing while the lock is held
+// would otherwise leave a refine worker parked on it for the whole remaining
+// package run — where it goes on to read the package-var seams a later test
+// assigns, which is the cross-test race awaitFirstRefine exists to stop. The
+// pair must be one cleanup and in that order: t.Cleanup is LIFO, so a
+// separately registered drain would run BEFORE the release and simply wait out
+// its budget.
+func heldEpochLock(t *testing.T, path string) func() {
+	t.Helper()
+	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Registered FIRST so it runs LAST — after every release/drain below.
+	t.Cleanup(func() { lockFile.Close() })
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatalf("could not take the lock the test needs to hold: %v", err)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { _ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN) })
+	}
+}
 
 // latchEnv is an epochEnv plus the ability to model a FULL receiver daemon
 // restart (a brand-new Manager, so every in-memory tracker is gone).
@@ -458,17 +489,17 @@ func TestHeldFlockCannotCauseFalsePeerDeath_6169(t *testing.T) {
 	t.Cleanup(func() { bootEpochPath = orig })
 
 	// Hold the REAL advisory lock the persist path takes, for the whole test.
-	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lockFile.Close()
-	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
-		t.Fatalf("could not take the lock the test needs to hold: %v", err)
-	}
+	releaseLock := heldEpochLock(t, path)
 
 	// LINK 1 — the sender still has an epoch, immediately, with the lock held.
 	sender := NewManager(0, 42)
+	// Release AND drain on the FAILURE path too — the explicit release below is
+	// on the happy path only, and t.Fatalf skips it. One cleanup, in this order:
+	// t.Cleanup is LIFO, so a separate drain would run before the release.
+	t.Cleanup(func() {
+		releaseLock()
+		sender.joinBootEpochRefine(5 * time.Second)
+	})
 	start := time.Now()
 	epoch := sender.heartbeatBootEpoch()
 	elapsed := time.Since(start)
@@ -515,7 +546,7 @@ func TestHeldFlockCannotCauseFalsePeerDeath_6169(t *testing.T) {
 	// Release and drain the worker before the test ends, so its write cannot
 	// race t.TempDir() cleanup. This also demonstrates the self-heal the
 	// tie-break observed: the persist completes once the lock frees.
-	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	releaseLock()
 	awaitFirstRefine(t, sender, "the persist worker after the lock was released")
 	if sender.heartbeatBootEpoch() == 0 {
 		t.Fatal("the epoch went back to 0 after the persist completed")
@@ -660,19 +691,19 @@ func TestInitHeartbeatEpochStateNeverBlocks_6169(t *testing.T) {
 	t.Cleanup(func() { bootEpochPath = orig })
 
 	// Wedge the store by holding the lock the refine worker needs.
-	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lockFile.Close()
-	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
-		t.Fatalf("could not take the lock the test needs to hold: %v", err)
-	}
+	releaseLock := heldEpochLock(t, path)
 
 	m := NewManager(0, 42)
 	m.mu.Lock()
 	m.controlAuthKey = []byte("cluster-shared-secret") // keyed, so the epoch path engages
 	m.mu.Unlock()
+	// Release AND drain on the FAILURE path too — the explicit release below is
+	// on the happy path only, and t.Fatalf skips it. One cleanup, in this order:
+	// t.Cleanup is LIFO, so a separate drain would run before the release.
+	t.Cleanup(func() {
+		releaseLock()
+		m.joinBootEpochRefine(5 * time.Second)
+	})
 
 	// Three calls, as three routine restarts would make.
 	const budget = 250 * time.Millisecond // well under the 500ms dead-peer floor
@@ -702,7 +733,7 @@ func TestInitHeartbeatEpochStateNeverBlocks_6169(t *testing.T) {
 	// it: a data race that failed `go test -race ./pkg/cluster/` 20 times out of
 	// 20 when those two tests ran together, and intermittently in the full suite.
 	// awaitFirstRefine waits for ready AND drains, which is the actual join.
-	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	releaseLock()
 	awaitFirstRefine(t, m, "the refine worker after the lock was released")
 }
 
@@ -728,20 +759,20 @@ func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
 	t.Cleanup(func() { bootEpochPath = orig })
 
 	// Wedge the store for the whole of StartHeartbeat.
-	lockFile, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer lockFile.Close()
-	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX); err != nil {
-		t.Fatalf("could not take the lock the test needs to hold: %v", err)
-	}
+	releaseLock := heldEpochLock(t, path)
 
 	m := NewManager(0, 42)
 	m.mu.Lock()
 	m.controlAuthKey = []byte("cluster-shared-secret")
 	m.mu.Unlock()
 	t.Cleanup(m.StopHeartbeat)
+	// Release AND drain on the FAILURE path too — the explicit release below is
+	// on the happy path only, and t.Fatalf skips it. One cleanup, in this order:
+	// t.Cleanup is LIFO, so a separate drain would run before the release.
+	t.Cleanup(func() {
+		releaseLock()
+		m.joinBootEpochRefine(5 * time.Second)
+	})
 
 	start := time.Now()
 	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
@@ -771,7 +802,7 @@ func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
 	// Release and drain so the worker cannot outlive t.TempDir — or the seams a
 	// LATER test installs. bootEpochReady alone is not that drain; see
 	// awaitFirstRefine.
-	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+	releaseLock()
 	awaitFirstRefine(t, m, "the refinement worker after the lock was released")
 }
 

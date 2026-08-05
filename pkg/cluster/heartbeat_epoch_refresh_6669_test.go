@@ -631,14 +631,54 @@ func TestJoinDoesNotBlockBehindAParkedRequester_6669(t *testing.T) {
 	waitBootEpochIdle(t, m)
 }
 
-// joinWaiterGoroutines counts goroutines parked inside Manager.joinBootEpochRefine
-// itself, or in a sync.WaitGroup.Wait reached from this package.
+// clusterPkgPath is how every frame from this package prints in a stack dump,
+// including the trailing "created by <func> in goroutine N" line.
+const clusterPkgPath = "github.com/psaab/xpf/pkg/cluster"
+
+// clusterGoroutines counts every goroutine currently attributable to this
+// package: any frame in it, or spawned by it.
 //
-// BOTH shapes are counted because the defect is a helper OUTLIVING its caller,
-// not the primitive it happens to block on: reverting to a WaitGroup, or moving
-// the same `go func() { …; close(done) }()` into a differently-named helper,
-// must not slip past this.
-func joinWaiterGoroutines() int {
+// IT NAMES NO FUNCTION, and that is the whole point. An earlier revision
+// matched two literal frames — "cluster.(*Manager).joinBootEpochRefine" and a
+// sync.(*WaitGroup).Wait somewhere in this package — which quietly made it a
+// guard about WHICH FUNCTION IS ON THE STACK rather than about leaking, while
+// its own comment claimed that "moving the same go func into a differently-named
+// helper must not slip past this". The claim was right; the matcher did not
+// implement it.
+//
+// WHAT ACTUALLY DEFEATED IT is narrower than it first looks, and the difference
+// is worth recording because the obvious mutation does NOT defeat it. Moving
+// the goroutine's BODY into a package-level func while leaving the `go`
+// statement in joinBootEpochRefine is still caught, because runtime.Stack emits
+// a "created by" line naming the spawning function:
+//
+//	goroutine 22 [chan receive]:
+//	…cluster.forwardBootEpochDone(...)
+//	created by …cluster.(*Manager).joinBootEpochRefine in goroutine 20
+//
+// Moving the `go` STATEMENT itself into a differently-named function is what
+// escapes, because then neither line mentions joinBootEpochRefine:
+//
+//	goroutine 9 [chan receive]:
+//	…cluster.spawnDoneForwarder.func1()
+//	created by …cluster.spawnDoneForwarder in goroutine 7
+//
+// Measured: eight leaked goroutines, old matcher green, new matcher red.
+//
+// Matching the package PATH covers both, and covers a rename of
+// joinBootEpochRefine itself, which the old form would also have missed.
+//
+// ONLY MEANINGFUL AS A BEFORE/AFTER DELTA. This package legitimately has
+// goroutines parked at any instant — the wedged refine worker the caller
+// installs, for one — so the absolute count is neither zero nor stable.
+//
+// SCOPE, stated rather than implied: this sees a helper anywhere in
+// pkg/cluster under any name, and anything pkg/cluster spawns directly. A
+// helper moved into a DIFFERENT package that runs its own `go` statement would
+// carry no cluster frame on either line and would escape it. That is the limit
+// of what stack matching can see, and it is a much less plausible refactor than
+// the one that defeated the old matcher.
+func clusterGoroutines() int {
 	buf := make([]byte, 1<<16)
 	for {
 		n := runtime.Stack(buf, true)
@@ -650,8 +690,7 @@ func joinWaiterGoroutines() int {
 	}
 	n := 0
 	for _, g := range strings.Split(string(buf), "\n\n") {
-		if strings.Contains(g, "cluster.(*Manager).joinBootEpochRefine") ||
-			(strings.Contains(g, "sync.(*WaitGroup).Wait") && strings.Contains(g, "xpf/pkg/cluster")) {
+		if strings.Contains(g, clusterPkgPath) {
 			n++
 		}
 	}
@@ -679,21 +718,24 @@ func joinWaiterGoroutines() int {
 //	go func() { <-done; close(fwd) }()
 //	select { case <-fwd: return true; case <-timer.C: return false }
 //
-// and this fails with eight goroutines parked.
+// and this fails with eight goroutines parked. It fails just the same when the
+// `go` statement is hoisted into a package-level helper of its own — the
+// mutation the previous frame-name matcher walked straight through; see
+// clusterGoroutines.
 func TestTimedOutJoinLeavesNoWaiterBehind_6669(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 	m := keyedEpochManager(t, path)
 	release := parkedRefineWorker(t, m)
 	defer release()
 
-	base := joinWaiterGoroutines()
+	base := clusterGoroutines()
 	const calls = 8
 	for i := 0; i < calls; i++ {
 		if m.joinBootEpochRefine(5 * time.Millisecond) {
 			t.Fatalf("join %d reported a wedged worker as joined", i)
 		}
 	}
-	if leaked := joinWaiterGoroutines() - base; leaked > 0 {
+	if leaked := clusterGoroutines() - base; leaked > 0 {
 		t.Fatalf("%d goroutine(s) parked in the join after %d timed-out calls, want 0: a helper "+
 			"spawned per call is not cancelled by the caller's timeout, so every join over a "+
 			"wedged store leaks one for the life of the process", leaked, calls)

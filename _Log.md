@@ -67585,3 +67585,65 @@ break — `go vet` confirmed passing under every revert.
   -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 17.0 s.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 09:41 PDT
+- **Action**: #6669 round 16 — make the leak guard about LEAKING rather than
+  about which function is on the stack, correct two false comments (one of them
+  created by this fold), and give the real-flock tests a failure-path release.
+- **B1 — the finding is REAL, but its stated reproduction is NOT, and the
+  difference is recorded in the guard.** The old `joinWaiterGoroutines` matched
+  two literal frames. The proposed mutation — hoist the goroutine's BODY into a
+  package-level `forwardBootEpochDone` — does **not** defeat it, because
+  `runtime.Stack` emits a creator line and that line still named the spawner:
+  `created by …cluster.(*Manager).joinBootEpochRefine in goroutine 20`. Measured
+  directly with a throwaway probe that dumped the leaked goroutine's stack; the
+  old matcher went RED on that mutation (rc 1), so "matching neither string" was
+  wrong as written. What DOES defeat it is moving the `go` STATEMENT into a
+  differently-named function (`spawnDoneForwarder`), after which neither line
+  mentions `joinBootEpochRefine`:
+  `…cluster.spawnDoneForwarder.func1()` / `created by …cluster.spawnDoneForwarder`.
+  Against that variant the OLD matcher was GREEN while eight goroutines leaked,
+  and the NEW one is RED. So the fragility is genuine and the fix is
+  load-bearing; only the proposed repro needed correcting.
+- **Fix.** `clusterGoroutines` matches the package PATH
+  (`github.com/psaab/xpf/pkg/cluster`) anywhere in a goroutine's stack, naming
+  no function at all. That covers a helper anywhere in this package under any
+  name, anything this package spawns directly (via the creator line), AND a
+  rename of `joinBootEpochRefine` itself — which the old form would also have
+  missed. Scope is stated rather than implied: a helper moved into a DIFFERENT
+  package that runs its own `go` would carry no cluster frame on either line and
+  would escape, which is the limit of what stack matching can see. The count
+  remains a BEFORE/AFTER DELTA, because this package always has some goroutines
+  parked (the wedged worker the test installs, for one).
+- **B2 — the fold made a concurrency comment false.**
+  `releaseBootEpochRefine` said the worker "must return without touching Manager
+  state again". True before round 14; false after, because the worker's
+  outermost defer still runs `m.bootEpochWorker.CompareAndSwap(worker, nil)`.
+  Corrected to say what is actually forbidden — further refinement, and any
+  touch of `m.bootEpoch`, `m.bootEpochWrote` or the state file — and to explain
+  that the trailing CAS is the worker publishing its own death, with the
+  compare-and-swap being exactly what stops an outgoing worker clearing a
+  SUCCESSOR's handle in the window this function opens.
+- **B3 — two comments contradicted each other.** `manager.go` still said
+  "Tests use it to join the worker" about `bootEpochReady` while
+  `heartbeat_epoch.go` said "IT IS NOT A JOIN". The latter is correct; the
+  field comment now says so and points at `awaitFirstRefine` /
+  `waitBootEpochIdle`.
+- **B4 — folded in, it was cheap.** The three tests that hold the REAL advisory
+  lock released it only at the end of their bodies, so a `Fatalf` before that
+  point left a refine worker parked on the lock for the rest of the package run,
+  reading seams a later test assigns. `heldEpochLock` now returns a
+  once-guarded release, and each caller registers release-AND-drain as ONE
+  `t.Cleanup` — one cleanup and in that order, because `t.Cleanup` is LIFO and a
+  separately registered drain would run before the release and just wait out its
+  budget.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 16.7 s. B1 mutation
+  against the FINAL tree: RED with "8 goroutine(s) parked in the join after 8
+  timed-out calls"; restored GREEN over `-count=5`. Because B4 touched the latch
+  tests the race repro was re-run: Codex's `-count=100` pair rc 0 on three
+  consecutive runs, and the three real-flock tests rc 0 over three runs at
+  `-count=20`.
+- **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, _Log.md

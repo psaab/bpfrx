@@ -237,7 +237,15 @@ type Manager struct {
 	// bootEpochReady is closed once the first refinement attempt finishes.
 	// NOTHING in production waits on it — StartHeartbeat used to, which stalled
 	// a node whose heartbeat was already stopped, and that wait was removed
-	// (initHeartbeatEpochState). Tests use it to join the worker.
+	// (initHeartbeatEpochState).
+	//
+	// IT IS NOT A JOIN, and this comment used to offer it to tests as one. The
+	// worker closes it from INSIDE its loop and then still calls
+	// releaseBootEpochRefine — which reads a package-var test seam — and may run
+	// further coalesced passes before returning, so a test that stops here
+	// returns with a live worker that the next test's seam assignment races.
+	// Tests join with awaitFirstRefine or waitBootEpochIdle. See
+	// Manager.heartbeatBootEpoch, whose comment is the long form.
 	//
 	// bootEpochWrote is the epoch this incarnation last persisted. Refinement is
 	// RE-RUN on every later heartbeat start (Manager.refreshBootEpoch), because
