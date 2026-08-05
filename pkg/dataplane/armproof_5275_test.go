@@ -1,6 +1,7 @@
 package dataplane
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -220,5 +221,48 @@ func TestArmProofEmptySurfaceSetGatesNothing(t *testing.T) {
 	}
 	if rep := classifyArmCoverage(newProofResult([]int{1}), nil); rep.WouldGate {
 		t.Fatal("nil lookup must not report a gate")
+	}
+}
+
+// TestArmProofReportsBranchPerSurface pins that the record carries the branch
+// for EVERY surface, not only the failing ones. The whole point of the
+// observe-only phase is measuring the direct/delegated/uncovered mix across
+// real deployments; a pass/fail summary cannot answer that, and a report that
+// only names failures cannot distinguish a fleet of native boxes from a fleet
+// of VLAN boxes.
+func TestArmProofReportsBranchPerSurface(t *testing.T) {
+	r := newProofResult([]int{10, 20, 30, 40})
+	r.fallbackGenericIfindexes[30] = true // skb-mode fallback
+	vlanChild(r, 20, 10)                  // delegated to 10
+	// 40 is attached to nothing at all.
+	rep := classifyArmCoverage(r, lookupFrom(
+		map[int]uint32{10: 1, 30: 3}, map[int]bool{30: true}))
+
+	got := rep.SurfaceSummary()
+	for _, want := range []string{
+		"10:direct/native",
+		"20:delegated/via-10",
+		"30:direct/generic",
+		"40:uncovered",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("per-surface summary missing %q; got %q", want, got)
+		}
+	}
+}
+
+// TestArmProofDidGateIsDistinctFromWouldGate pins that the two are separate
+// fields. Reporting only would_gate makes "the proof said refuse" and "the
+// proof refused" indistinguishable in a log archive — and an absent
+// enforcement line is also indistinguishable from a proof that never ran.
+func TestArmProofDidGateIsDistinctFromWouldGate(t *testing.T) {
+	// A box the gating build would refuse.
+	rep := classifyArmCoverage(newProofResult([]int{10}), lookupFrom(nil, nil))
+	if !rep.WouldGate {
+		t.Fatal("precondition: an unattached surface must be would-gate")
+	}
+	if rep.DidGate {
+		t.Fatal("OBSERVE-ONLY VIOLATION: the proof reported that it actually withheld " +
+			"something — this phase must never gate")
 	}
 }

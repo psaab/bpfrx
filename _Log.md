@@ -66276,3 +66276,11 @@ break — `go vet` confirmed passing under every revert.
   fail-close every VLAN deployment — and refreshes the appendix coordinates
   re-verified at origin/master ad9591177.
   **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go, pkg/dataplane/compiler.go, pkg/dataplane/loader.go, pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 reporting — report the coverage branch PER SURFACE
+  (SurfaceSummary, one compact token per interface in the single apply-time log
+  line) and report DidGate separately from WouldGate, so the divergence rate is
+  readable directly instead of inferred from the ABSENCE of an enforcement line
+  (an absence is indistinguishable from a proof that never ran).
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go
+

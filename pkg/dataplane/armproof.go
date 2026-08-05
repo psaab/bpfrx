@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 )
 
 // #5275 PR1 — OBSERVE-ONLY dataplane arm-coverage proof.
@@ -84,6 +85,39 @@ type ArmCoverageReport struct {
 	// WouldGate reports whether a GATING build would have refused to release
 	// ownership on this proof. Observe-only: no caller may branch on it.
 	WouldGate bool
+	// DidGate reports whether anything was ACTUALLY withheld. It is
+	// unconditionally false in this phase, and is a distinct field rather than
+	// an omission on purpose: the divergence rate has to be readable directly
+	// from a record that says "would have gated, did not", not inferred from
+	// the ABSENCE of an enforcement line. An absence is indistinguishable from
+	// a proof that never ran. The gating PR is what makes this field vary.
+	DidGate bool
+}
+
+// SurfaceSummary renders one compact, greppable token per surface —
+// "<ifindex>:<branch>[/<detail>]" — so the per-surface branch is recoverable
+// from a single log line instead of requiring one line per interface on every
+// apply.
+func (rep ArmCoverageReport) SurfaceSummary() string {
+	if len(rep.Surfaces) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(rep.Surfaces))
+	for _, s := range rep.Surfaces {
+		switch s.Kind {
+		case CoverageDirect:
+			mode := "native"
+			if s.Generic {
+				mode = "generic"
+			}
+			parts = append(parts, fmt.Sprintf("%d:direct/%s", s.Ifindex, mode))
+		case CoverageDelegated:
+			parts = append(parts, fmt.Sprintf("%d:delegated/via-%d", s.Ifindex, s.Via))
+		default:
+			parts = append(parts, fmt.Sprintf("%d:uncovered", s.Ifindex))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // GENERIC XDP COUNTS AS ARMED — a stated decision, not an emergent property.
@@ -168,6 +202,9 @@ func classifyArmCoverage(result *CompileResult, lookup instanceLookup) ArmCovera
 		}
 	}
 	rep.WouldGate = rep.Uncovered > 0
+	// Observe-only phase: nothing is ever withheld. Set explicitly so the
+	// record carries the fact rather than leaving it to be inferred.
+	rep.DidGate = false
 	return rep
 }
 
@@ -254,18 +291,26 @@ func (rep ArmCoverageReport) LogArmCoverage(stage string) {
 	if len(rep.Surfaces) == 0 {
 		return
 	}
-	slog.Info("dataplane arm-coverage proof (observe-only; nothing gated)",
+	slog.Info("dataplane arm-coverage proof",
 		"issue", "#5275",
 		"stage", stage,
 		"direct", rep.Direct,
 		"delegated", rep.Delegated,
 		"uncovered", rep.Uncovered,
-		"would_gate", rep.WouldGate)
+		// Both are emitted every time. would_gate is the measurement;
+		// did_gate is the fact that nothing was withheld. Reporting only the
+		// first would make "the proof said refuse" and "the proof refused"
+		// indistinguishable in a log archive.
+		"would_gate", rep.WouldGate,
+		"did_gate", rep.DidGate,
+		// Per-surface branch, so the direct/delegated/uncovered mix is
+		// recoverable per box without one line per interface.
+		"surfaces", rep.SurfaceSummary())
 	// Only the surfaces a gating build would have refused on are worth a
 	// per-surface line; a fully-covered box stays at one line.
 	for _, s := range rep.Surfaces {
 		if s.Kind == CoverageUncovered {
-			slog.Warn("dataplane arm-coverage: surface WOULD fail a gating proof (not gated here)",
+			slog.Warn("dataplane arm-coverage: surface WOULD fail a gating proof (NOT gated in this build)",
 				"issue", "#5275",
 				"stage", stage,
 				"ifindex", s.Ifindex,
