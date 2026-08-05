@@ -71,11 +71,17 @@ New fail-on-revert table + guards in
 - **apply-groups**: a group restates the term with a conflicting value; the
   merged config rejects;
 - **deny-policy**: a referenced deny app with a conflicting inline `icmp-type`
-  rejects at strict compile; on the lenient path the compiled term demonstrably
-  enforces ONLY the last type (characterizes the silent narrowing the strict
-  gate prevents);
+  rejects at strict compile; on the lenient path the compiled Application
+  carries ONLY the last type. That test asserts on the compiled STRUCT and
+  drives no matcher, so it does not by itself show the surviving value is what
+  gets ENFORCED; the enforcement claim is proved at the verdict in
+  `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`, which drives
+  `policymatch.Match` and asserts the discarded type/code falls through to
+  `default-policy permit-all`;
 - **same-value idempotent**: `icmp-type 8 icmp-type 8` and
-  `icmp-code 0 icmp-code 0` commit cleanly;
+  `icmp-type 3 icmp-code 1 icmp-code 1` commit cleanly (the code fixture uses
+  1, not 0 — a committed `icmp-type 0` is used instead as the apply-groups
+  scalar-zero override control);
 - **lenient downgrade**: conflicting repeat downgrades to a warning, no brick.
 
 RED-first: the rejection tests fail against the pre-fix compiler (nothing

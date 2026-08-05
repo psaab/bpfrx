@@ -74,8 +74,16 @@ func inlineICMPDupCfg(t *testing.T, appLine, leaf string) *config.Config {
 			"the #6766 duplicate recording is gone and the narrowing below is "+
 			"reachable through a green commit", leaf)
 	}
-	if !strings.Contains(serr.Error(), "duplicate") || !strings.Contains(serr.Error(), leaf) {
-		t.Fatalf("strict rejection should name the duplicate leaf %q, got: %v", leaf, serr)
+	// The leaf name is matched in its QUOTED form. The rejection text ends with a
+	// static enumeration of every trackable leaf —
+	// "(destination-port / source-port / ... / icmp-type / icmp-code)" — so a bare
+	// substring check for the leaf is satisfied by that boilerplate no matter
+	// which leaf actually conflicted, and a swapped label would sail through.
+	// Only the identifying occurrence is quoted (`conflicting duplicate
+	// "icmp-type" inside`), so quoting is what makes "names the leaf" true.
+	if !strings.Contains(serr.Error(), "duplicate") || !strings.Contains(serr.Error(), `"`+leaf+`"`) {
+		t.Fatalf("strict rejection should name the duplicate leaf %q (quoted, so the "+
+			"static leaf enumeration in the message cannot satisfy this), got: %v", leaf, serr)
 	}
 
 	cfg, err := config.CompileConfigLenient(tree)
@@ -87,7 +95,8 @@ func inlineICMPDupCfg(t *testing.T, appLine, leaf string) *config.Config {
 	// contract these verdict tests characterize.
 	warned := false
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "duplicate") && strings.Contains(w, leaf) {
+		// Quoted, for the same reason as the strict assertion above.
+		if strings.Contains(w, "duplicate") && strings.Contains(w, `"`+leaf+`"`) {
 			warned = true
 			break
 		}
@@ -174,11 +183,17 @@ func TestInlineTermICMPCodeDupNarrowsEnforcement_6766(t *testing.T) {
 // populated at all — a path that produced NOTHING looks identical to a genuine
 // fall-through. `DefaultUsed` is the only field here that carries non-default
 // evidence: it is true ONLY because the default-policy branch actually ran. It
-// is asserted FIRST for that reason, and `Matched=false` is asserted explicitly
-// rather than left implied, which also rejects the
-// `Matched=true, DefaultUsed=false, Action=permit` shape — a concrete policy
-// PERMIT, which is a different (and equally wrong) outcome from falling
-// through.
+// is asserted FIRST for that reason.
+//
+// `Matched=false` is asserted explicitly rather than left implied, and the shape
+// it independently binds is `Matched=true, DefaultUsed=true, Action=permit` — a
+// Result claiming BOTH a concrete policy match and a default fall-through, which
+// is incoherent and would otherwise pass. It does NOT carry
+// `Matched=true, DefaultUsed=false`: that input fails at the `DefaultUsed` check
+// above and never reaches here. Stated precisely because the two legs look
+// redundant and are not — the mutation that proves this one sets Matched on the
+// default-branch Result, and a later reader trimming the "redundant" check would
+// delete the only assertion binding it.
 func assertFellThroughToDefaultPermit(t *testing.T, res Result, what string) {
 	t.Helper()
 	if !res.DefaultUsed {

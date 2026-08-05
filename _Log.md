@@ -1,3 +1,50 @@
+## 2026-08-05 — #6814 fold round 4: correct four claims, quote the leaf assertion
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, gate at 1314dcb72)
+- **Action**: Text round. The gate found no runtime findings; production code is
+  untouched this round (`compiler_applications.go` and `policymatch.go` are
+  byte-identical to the previous commit).
+    - **A wrong attribution in the fall-through helper.** The comment said the
+      explicit `Matched=false` check rejects `Matched=true, DefaultUsed=false,
+      Action=permit`. It does not — that input fails at the `DefaultUsed` check
+      above and never reaches the `Matched` one. The shape that leg
+      independently binds is `Matched=true, DefaultUsed=true, Action=permit`, a
+      Result claiming BOTH a concrete match and a default fall-through, which is
+      exactly what the round-3 mutation set. Corrected in the test comment and
+      in the round-3 log entry. Worth stating precisely rather than softening:
+      the two legs look redundant, and a reader trimming the "redundant" one
+      would delete the only assertion binding that shape.
+    - **"Names the leaf" was satisfied by boilerplate.** The rejection text ends
+      with a STATIC enumeration of every trackable leaf — `(destination-port /
+      source-port / inactivity-timeout / timeout / alg / icmp-type /
+      icmp-code)` — so a bare `strings.Contains(err, leaf)` is true no matter
+      which leaf actually conflicted. Rather than weaken the claim, made it
+      true: both the strict and tolerant assertions now match the QUOTED form
+      (`conflicting duplicate "icmp-type" inside`), which is the only
+      identifying occurrence. This is the one place this round goes beyond text,
+      and it is one predicate per assertion.
+    - **Two pre-existing false claims in the plan doc**, cheap to fix in place:
+      it said the compiled-struct test "demonstrably enforces" the last type
+      although it drives no matcher (now points at the verdict-level test that
+      does), and it described an `icmp-code 0 icmp-code 0` idempotent control
+      when the fixture is `icmp-type 3 icmp-code 1 icmp-code 1` (verified by
+      reading the fixture before correcting the claim).
+    - Named the environment on the round-3 `FULL_RC=0` line. A sandboxed runner
+      that blocks sockets/netlink exits non-zero on unrelated packages; that is
+      a runner limitation, not a contradiction of a run scored on a box that can
+      open sockets.
+- **Validation**: Swapped-label mutation — the two recorded leaf labels
+  exchanged, so an `icmp-type` conflict records `icmp-code` and vice versa.
+  Build and vet clean under it. The QUOTED assertion goes RED on both tests,
+  naming the wrong-leaf message it received. A throwaway control running the
+  BARE (pre-fix) assertion verbatim PASSED the same mutation (rc=0), so the
+  quoting is what added the discrimination rather than the check merely looking
+  stricter. Restored by pristine-snapshot write-back plus `touch`; GREEN
+  re-confirmed. Gates from real exit codes on this workstation (sockets and
+  netlink permitted): `GATE1_RC=0`, `FULL_RC=0`.
+- **File(s)**: `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`,
+  `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+
 ## 2026-08-05 — #6814 fold round 3: assert the fall-through evidence, bind the recording
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, gate at 48bb63f54)
@@ -11,19 +58,26 @@
       `Result` that was never populated — a path producing NOTHING looked
       identical to a genuine fall-through. New `assertFellThroughToDefaultPermit`
       helper asserts `DefaultUsed=true` FIRST (the only non-default evidence that
-      the default branch ran), then `Matched=false` explicitly — which also
-      rejects the `Matched=true, DefaultUsed=false, Action=permit` shape, a
-      concrete policy PERMIT rather than a fall-through. The DENY legs gained a
-      matching `DefaultUsed=false` assertion so they cannot be satisfied by a
-      default either.
+      the default branch ran), then `Matched=false` explicitly. The shape that
+      second leg independently binds is `Matched=true, DefaultUsed=true,
+      Action=permit` — a Result claiming BOTH a concrete match and a default
+      fall-through. It does NOT carry `Matched=true, DefaultUsed=false`: that
+      input fails at the `DefaultUsed` check and never reaches the `Matched`
+      one, which is why the leg needed its own mutation to prove. The DENY legs
+      gained a matching `DefaultUsed=false` assertion so they cannot be
+      satisfied by a default either.
     - **The duplicate RECORDING was not bound.** Verified firsthand before
       fixing: with the #6766 tracking removed outright (strict stops rejecting)
       both policymatch tests still PASSED, because the compiled values and every
       verdict are identical whether or not the conflict was recorded. The shared
       `inlineICMPDupCfg` fixture now asserts BOTH halves of the recording — that
-      strict `CompileConfig` rejects and names the leaf, and that the tolerant
-      path emits the warning naming it (the only signal an operator gets on the
-      path that keeps forwarding).
+      strict `CompileConfig` rejects and that the tolerant path emits the
+      warning (the only signal an operator gets on the path that keeps
+      forwarding). Both match the leaf name in its QUOTED form: the message
+      ends with a static enumeration of every trackable leaf, so a bare
+      substring check is satisfied by that boilerplate regardless of which leaf
+      conflicted. Proven by swapping the two recorded labels — the bare shape
+      accepts the swapped message, the quoted shape rejects it.
     - **Scalar-zero override control (gate suggestion, taken).** The
       apply-groups override control now commits `icmp-type 0` — the scalar zero
       of the compiled `uint8`. `assertTermICMP` rejects a nil `ICMPType`
@@ -50,7 +104,10 @@
   Two mutation attempts were discarded as invalid rather than reported: one
   broke the build (`declared and not used`) and one silently applied nothing
   (a 2-occurrence anchor tripped the count assert), whose "PASS" was
-  meaningless. Gates scored from real exit codes: `GATE1_RC=0`, `FULL_RC=0`.
+  meaningless. Gates scored from real exit codes on this workstation (Linux,
+  sockets and netlink permitted): `GATE1_RC=0`, `FULL_RC=0` across 59 packages.
+  A sandboxed runner that blocks sockets/netlink will exit non-zero on
+  unrelated packages; that is a runner limitation, not a contradiction.
 - **File(s)**: `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`, `_Log.md`
 
