@@ -5585,3 +5585,152 @@ fn build_cos_state_classifier_unmaterialized_queue_falls_back_to_default() {
     // The materialized best-effort code-point is unchanged.
     assert_eq!(iface.dscp_queue_by_dscp[0], 0);
 }
+
+// ── #5716: a rejected build must not prune the LIVE zone counters ─────
+//
+// `build_forwarding_state_with_policy_counters_and_previous` carries the
+// previous state's `ZoneCounterStore` forward. That store is `Arc`-backed,
+// so the carry-forward `clone()` is a handle on the SAME map the running
+// workers fold into — not a copy. Pre-#5716 the build ran the destructive
+// `reconcile()` (a `retain` to the incoming snapshot's zone set) in the
+// middle of the builder, ahead of the fallible `filter_state` and `cos`
+// steps. A snapshot that failed one of those was rejected by the
+// reconcile/refresh preflight ("keeping previous forwarding state") — but
+// the live store had already lost the removed zones' cumulative totals, so
+// an operator's `show security zones` traffic counters silently reset on a
+// commit that was never applied. The prune is now the last statement before
+// `Ok(state)`.
+
+/// Live state for the two tests below: zones 100 and 200 configured, with
+/// traffic folded into the shared store.
+fn zone_counter_prev_state() -> ForwardingState {
+    use crate::afxdp::zone_counters::{flush_recorded_zone_counters, record_zone_traffic};
+    let prev_snapshot = ConfigSnapshot {
+        zones: vec![
+            ZoneSnapshot {
+                name: "trust".into(),
+                id: 100,
+                ..Default::default()
+            },
+            ZoneSnapshot {
+                name: "untrust".into(),
+                id: 200,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let prev = build_forwarding_state(&prev_snapshot);
+    record_zone_traffic(&prev.zone_counter_slot_map, 100, 200, 64);
+    flush_recorded_zone_counters(&prev.zone_counter_store, &prev.zone_counter_slot_map);
+    assert_eq!(
+        prev.zone_counter_store.snapshot().len(),
+        2,
+        "both zones must be counting before the build under test"
+    );
+    prev
+}
+
+/// A snapshot that keeps only zone 100 and trips the #2410 CoS queue-id
+/// fail-closed belt — a fallible step that runs AFTER the zone-counter
+/// block in the builder.
+fn zone_counter_rejected_snapshot() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "trust".into(),
+            id: 100,
+            ..Default::default()
+        }],
+        interfaces: vec![InterfaceSnapshot {
+            ifindex: 60,
+            cos_shaping_rate_bytes_per_sec: 1,
+            ..Default::default()
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "voice".into(),
+                queue: 256, // outside u8 range — fails the build closed
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn rejected_build_does_not_prune_live_zone_counters() {
+    let prev = zone_counter_prev_state();
+
+    let err = build_forwarding_state_with_policy_counters_and_previous(
+        &zone_counter_rejected_snapshot(),
+        &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&prev),
+    )
+    .expect_err("an out-of-range CoS queue id must reject the snapshot");
+    assert!(
+        matches!(
+            err,
+            crate::policy::SnapshotIntegrityError::CosQueueIdOutOfRange { .. }
+        ),
+        "expected the CoS belt to be what rejected the build, got {err:?}"
+    );
+
+    // The rejected build must have left the LIVE store untouched: the
+    // preflight keeps the previous forwarding state, and zone 200's
+    // cumulative totals must survive with it.
+    let live = prev.zone_counter_store.snapshot();
+    assert_eq!(
+        live.len(),
+        2,
+        "a REJECTED build pruned the live zone-counter store; \
+         `show security zones` totals reset on a commit that never applied"
+    );
+    assert!(
+        live.iter().any(|z| z.zone_id == 200),
+        "zone 200's totals were dropped by a build that was rejected"
+    );
+}
+
+#[test]
+fn accepted_build_still_prunes_zone_counters_for_removed_zones() {
+    // Anti-over-fix control: deferring the prune must not DELETE it. The
+    // same zone set, on a snapshot that builds cleanly, still drops the
+    // removed zone — and the surviving zone keeps its carried-forward
+    // totals rather than resetting.
+    let prev = zone_counter_prev_state();
+    let good_snapshot = ConfigSnapshot {
+        zones: vec![ZoneSnapshot {
+            name: "trust".into(),
+            id: 100,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let next = build_forwarding_state_with_policy_counters_and_previous(
+        &good_snapshot,
+        &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
+        Some(&prev),
+    )
+    .expect("a clean snapshot must build");
+
+    let live = next.zone_counter_store.snapshot();
+    assert_eq!(
+        live.len(),
+        1,
+        "an ACCEPTED build must still prune the removed zone's totals"
+    );
+    assert_eq!(live[0].zone_id, 100);
+    assert!(
+        live[0].ingress_packets > 0,
+        "the surviving zone must keep its carried-forward totals"
+    );
+    // The prune is on the shared store, so the previous state's handle
+    // observes it too (same Arc).
+    assert_eq!(prev.zone_counter_store.snapshot().len(), 1);
+}

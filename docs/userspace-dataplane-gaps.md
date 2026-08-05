@@ -166,6 +166,19 @@ counters (see below).
   [`docs/research/3643-dead-counters/plan.md`](research/3643-dead-counters/plan.md)
   §5A.
 
+  **Prune ordering (#5716).** The store is `Arc`-backed, so the carry-forward
+  `clone()` in `build_forwarding_state_with_policy_counters_and_previous` is a
+  handle on the LIVE map, not a copy. The prune that drops totals for zones the
+  incoming snapshot no longer configures is therefore the **last statement
+  before `Ok(state)`** — every fallible builder step (`?`) above it returns with
+  the live store untouched, so a snapshot the reconcile/refresh preflight
+  REJECTS ("keeping previous forwarding state") cannot also zero an operator's
+  `show security zones` totals for a commit that never applied. Any new fallible
+  step must go above that prune;
+  `rejected_build_does_not_prune_live_zone_counters` (with its
+  `accepted_build_still_prunes_zone_counters_for_removed_zones` control) in
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs` is the guard.
+
 - **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting (the screen module holds per-zone
   rate-limiter state, not cumulative per-zone flood-event counters), and per the

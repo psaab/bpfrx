@@ -1,3 +1,78 @@
+## 2026-08-05 — #5716 (2/2): rejected forwarding build pruned live zone counters
+
+- **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening)
+- **Action**: codex-review-182 cohort C-RUST row `Z3-C01`, verified still live on
+  current origin/master (ad959117748) — not a stale fixed-not-closed row.
+  `ZoneCounterStore` is `Arc<Mutex<..>>`-backed, so the carry-forward `clone()`
+  in `build_forwarding_state_with_policy_counters_and_previous` is a handle on
+  the LIVE map. The destructive `reconcile()` (a `retain` to the incoming
+  snapshot's zone set) ran mid-builder, AHEAD of the fallible `filter_state`
+  and `cos` steps. Both preflights (`build_reconcile_forwarding`,
+  `refresh_runtime_snapshot`) pass `Some(&self.forwarding)` and on `Err`
+  discard the build "keeping previous forwarding state" — but the live store
+  had already lost the removed zones' cumulative totals, so `show security
+  zones` traffic counters reset on a commit that never applied. The prune is
+  now the last statement before `Ok(state)`, with the retained zone set carried
+  in a local; every `?` above it returns with the store untouched.
+
+  This is the RESIDUAL of #5171 rev-5605, not a duplicate: that fold saw the
+  same Arc-shared-store hazard but fixed only the VALIDATION build
+  (`validate_forwarding_buildable` passes `previous = None`). The REAL
+  reconcile/refresh builds must pass `Some(&coord.forwarding)` for WG-engine
+  and NAT-allocator carry-over, so their reject path stayed exposed.
+  `validate_forwarding_buildable`'s doc comment described the old mid-build
+  prune and is updated: #5716 narrows the hazard to ACCEPTED builds but does
+  not remove it, so `previous = None` there is still load-bearing.
+
+- **Tests**: `rejected_build_does_not_prune_live_zone_counters` (RED on revert:
+  moving the prune back into the early block →
+  `left: 1, right: 2`, "a REJECTED build pruned the live zone-counter store")
+  and its anti-over-fix control
+  `accepted_build_still_prunes_zone_counters_for_removed_zones` (RED on
+  deleting the prune → `left: 2, right: 1`). Both reds are ASSERTION failures,
+  not build breaks.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
+## 2026-08-05 — #5716 (1/2): AF_XDP ring guards advance their base cursor
+
+- **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening)
+- **Action**: codex-review-182 cohort C-RUST row `A1-b03-C01`, verified still
+  live on current origin/master (ad959117748). All four AF_XDP ring guards
+  stayed usable after `commit()`/`release()` while `base_idx` stood still, so a
+  reused guard aliased the slots it had just handed the kernel:
+  `WriteTx`/`WriteFill` restarted at `base_idx + 0` and OVERWROTE
+  just-submitted descriptors / fill offsets; `ReadComplete` restarted at
+  `base_idx + 0` and RE-READ completion addresses it had already reaped (one
+  UMEM frame recycled into the fill ring twice); `ReadRx` kept its positional
+  cursor but sealed itself with a sticky `released` flag, so post-release reads
+  could never be released and `Drop`'s `cancel(peeked - read_count)`
+  under-counted, leaving `cached_cons` permanently ahead of `*consumer` — RX
+  ring slots leaked for the life of the socket. Each terminal op now advances
+  `base_idx`; `ReadRx` drops the sticky flag for the advance-and-reset shape
+  `ReadComplete` already used. Every production call site is
+  `create -> insert/read* -> commit/release -> drop` (audited: bind.rs
+  prime_fill_ring, tx/rings.rs reap+refill, tx/transmit, cos/queue_service x4,
+  poll_descriptor), so nothing crosses a terminal op today — this is API
+  hardening, and the single-use path is bit-identical.
+
+- **Tests**: `write_tx_insert_after_commit_appends_past_the_committed_slots`,
+  `write_fill_insert_after_commit_appends_past_the_committed_slots`,
+  `read_complete_read_after_release_does_not_re_reap_released_entries`,
+  `read_rx_read_after_release_stays_releasable`, plus a new
+  `DeviceQueue::push_comp_for_test` hermetic harness helper. The class has
+  exactly four members and each is mutated INDEPENDENTLY — a full enumeration,
+  not a sample. Each test runs at both `CURSOR_ORIGINS = [0, u32::MAX - 1]`:
+  at the second origin a 4-slot reservation straddles the `u32` wrap, so the
+  terminal op's `wrapping_add` advance crosses `u32::MAX` mid-guard (libxdp
+  masks the index, so a real cursor legitimately wraps). Every test also
+  asserts `cached_prod == *producer` / `cached_cons == *consumer` after drop,
+  which is where an off-by-one in the advance surfaces as a leaked ring slot.
+- **File(s)**: `userspace-dp/src/xsk_ffi.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

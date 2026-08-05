@@ -419,17 +419,24 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
 /// `build_reconcile_forwarding` passes `Some(&coord.forwarding)` for
 /// carry-over (NAT/source-NAT allocator reuse, cold-path slot retention,
 /// zone-counter totals). But `ForwardingState::zone_counter_store` is a
-/// `Clone`-shares-the-inner-`Arc<Mutex>` store, and the build does
-/// `state.zone_counter_store = previous.zone_counter_store.clone();
-/// state.zone_counter_store.reconcile(&configured)` — an in-place `retain`
+/// `Clone`-shares-the-inner-`Arc<Mutex>` store, and the build ends with
+/// `state.zone_counter_store.reconcile(&configured)` — an in-place `retain`
 /// UNDER THE SHARED LOCK. With `Some(&coord.forwarding)` a VALIDATION build
 /// would prune the LIVE, published `coord.forwarding.zone_counter_store`,
 /// dropping cumulative per-zone traffic totals for any zone absent from the
 /// candidate snapshot — a mutation of the live observability surface
-/// (`show security zones` / REST / Prometheus) that fires even when
-/// validation later REJECTS, and that the fail-closed restore cannot undo.
+/// (`show security zones` / REST / Prometheus) that the discarded build's
+/// caller never intended, and that the fail-closed restore cannot undo.
 /// `None` gives the discarded build FRESH default counter stores, so it
-/// touches no live state. Verdict PARITY with reconcile is preserved: NONE
+/// touches no live state.
+///
+/// #5716 NARROWED this, it did NOT subsume it. That fix moved the prune to
+/// the last statement before `Ok(state)`, so a build that REJECTS the
+/// snapshot no longer prunes. A validation build that ACCEPTS still runs the
+/// prune to completion and would still hit the live store — and "accepted"
+/// is the common case here, since this gate exists to admit deferred applies.
+/// `previous = None` therefore remains load-bearing; do not relax it.
+/// Verdict PARITY with reconcile is preserved: NONE
 /// of the fallible integrity legs (duplicate-zone-id, tunnel TTL, interface
 /// address, egress, route family/preference, neighbor family, NPTv6, filter
 /// unresolvable-token, CoS queue-id) reads `previous` for its accept/reject
