@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 )
 
@@ -77,8 +78,29 @@ func (s *SessionSync) noteHeartbeatAck(conn net.Conn) {
 	if !s.connIsCurrentIncarnationLocked(conn) {
 		return
 	}
+	if hook := noteHeartbeatAckMidpointHook.Load(); hook != nil {
+		(*hook)()
+	}
 	s.peerHeartbeatAckEver.Store(true)
 }
+
+// noteHeartbeatAckMidpointHook is a test seam invoked between the incarnation
+// check and the capability store in noteHeartbeatAck, WHILE s.mu is held. It is
+// nil in production.
+//
+// It exists because the atomicity above is otherwise only a claim: a test that
+// calls installConn and handleMessage in sequence never opens the window the
+// lock is there to close, so "check and store are atomic" would hold no matter
+// how the function was written. Widening the observation point is the only way
+// to distinguish this implementation from one that checks under the lock,
+// releases it, and then stores — which lets a supersession land in between and
+// resurrect a capability that was just cleared.
+//
+// A test installs a hook that starts a competing installConn and waits for it:
+// under this implementation the competitor BLOCKS on s.mu until noteHeartbeatAck
+// returns, so it can never interleave; under the released-early shape it
+// completes inside the window and the stale ack overwrites its clear.
+var noteHeartbeatAckMidpointHook atomic.Pointer[func()]
 
 // connIsCurrentIncarnationLocked reports whether conn is installed in a fabric
 // slot AND that slot was stamped by the incarnation currently in force. The

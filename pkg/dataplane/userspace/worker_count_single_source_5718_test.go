@@ -278,28 +278,60 @@ func TestProgramBootstrapWorkerCountDataFlow_5718(t *testing.T) {
 		}
 	}
 
-	// (4) the heartbeat zero-init bound is <plan>.HeartbeatSlots.
-	slotsBound := false
+	// (4) The heartbeat zero-init loop counts against <plan>.HeartbeatSlots.
+	//
+	// This asserts the LOOP CONDITION, not an assignment. Checking `slots :=
+	// plan.HeartbeatSlots` binds nothing on its own: keeping that statement as
+	// a decoy and writing `for slot := 0; slot < plan.Workers; slot++` passes
+	// an assignment-shaped guard while production zeroes 6 Array entries
+	// instead of 192 at the default worker count, leaving 186 heartbeat slots
+	// holding stale data — the shim then refuses to redirect for workers whose
+	// slot never got initialised. The loop's own bound is the thing with the
+	// runtime consequence, so it is the thing checked.
+	//
+	// The loop is located by what it DOES (it writes heartbeatMap), so
+	// renaming variables cannot silently detach the guard from its subject.
+	loopChecked := false
 	ast.Inspect(body, func(n ast.Node) bool {
-		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+		fl, ok := n.(*ast.ForStmt)
+		if !ok {
 			return true
 		}
-		lhs, ok := as.Lhs[0].(*ast.Ident)
-		if !ok || lhs.Name != "slots" {
+		writesHeartbeat := false
+		ast.Inspect(fl.Body, func(bn ast.Node) bool {
+			call, ok := bn.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Update" {
+				if id, ok := sel.X.(*ast.Ident); ok && id.Name == "heartbeatMap" {
+					writesHeartbeat = true
+				}
+			}
+			return true
+		})
+		if !writesHeartbeat {
 			return true
 		}
-		if !isSel(as.Rhs[0], planVar, "HeartbeatSlots") {
-			t.Fatalf("the heartbeat zero-init bound is %q; want %s.HeartbeatSlots",
-				exprText(fset, as.Rhs[0]), planVar)
+		loopChecked = true
+		cond, ok := fl.Cond.(*ast.BinaryExpr)
+		if !ok || cond.Op != token.LSS {
+			t.Fatalf("the heartbeat zero-init loop condition is %q; want `slot < %s.HeartbeatSlots`",
+				exprText(fset, fl.Cond), planVar)
 		}
-		slotsBound = true
+		if !isSel(cond.Y, planVar, "HeartbeatSlots") {
+			t.Fatalf("the heartbeat zero-init loop counts against %q, not %s.HeartbeatSlots. "+
+				"That is the bound with the runtime consequence: counting against "+
+				"%s.Workers zeroes one Array entry per WORKER instead of per SLOT — 6 of "+
+				"192 at the default worker count — and every un-zeroed slot reads as a "+
+				"stale heartbeat, so the shim refuses to redirect for that worker "+
+				"(#5718 fold r3)", exprText(fset, cond.Y), planVar, planVar)
+		}
 		return true
 	})
-	if !slotsBound {
-		t.Fatal("the heartbeat zero-init bound (`slots := ...`) was not found in " +
-			"programBootstrapMapsLocked — if it was renamed, re-point this guard rather " +
-			"than dropping the check")
+	if !loopChecked {
+		t.Fatal("no loop writing heartbeatMap.Update was found in programBootstrapMapsLocked — " +
+			"if the zero-init moved, re-point this guard rather than dropping the check")
 	}
 }
 

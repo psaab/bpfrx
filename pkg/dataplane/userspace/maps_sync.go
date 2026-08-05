@@ -201,8 +201,15 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		// negative nor an absurd cfg.Workers can make this loop wrap uint32 or
 		// index past the map (#4572). Re-deriving it here from the raw
 		// cfg.Workers is what let the two descriptions diverge.
-		slots := plan.HeartbeatSlots
-		for slot := uint32(0); slot < slots; slot++ {
+		//
+		// #5718 fold r3: read plan.HeartbeatSlots INLINE in the loop condition
+		// rather than through a local. An intermediate `slots := ...` leaves a
+		// decoy an AST guard can be satisfied by while the loop counts against
+		// something else entirely — `slot < plan.Workers` zeroes 6 entries
+		// instead of 192 at the default worker count, leaving 186 heartbeat
+		// slots holding stale data. The bound the loop actually uses is the
+		// only thing worth pinning, so it is the only thing written.
+		for slot := uint32(0); slot < plan.HeartbeatSlots; slot++ {
 			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}
 	}

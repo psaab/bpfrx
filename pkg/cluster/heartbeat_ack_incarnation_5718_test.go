@@ -2,7 +2,13 @@ package cluster
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -332,6 +338,95 @@ func TestPeerHeartbeatAckStaleConnCannotRearm_5718(t *testing.T) {
 	}
 }
 
+// TestPeerHeartbeatAckStoreIsAtomicWithSupersession_5718 binds the ATOMICITY
+// that noteHeartbeatAck's doc claims (#5718 fold r3).
+//
+// Every other test here calls installConn and handleMessage in sequence, so
+// none of them ever opens the window the lock exists to close. That makes
+// "the check and the store both run under s.mu, so they are atomic" a comment
+// no test can contradict: an implementation that checks under the lock,
+// RELEASES it, and only then stores passes all of them, while allowing
+//
+//	ack: check passes (conn is current)
+//	     ...lock released...
+//	                          install: supersede the other slot, clear the latch
+//	ack: store(true)          <-- resurrects a capability that was just cleared
+//
+// which is the very fail-open the incarnation stamp was added to prevent.
+//
+// The midpoint hook widens the window to something observable. The competing
+// installConn is started from INSIDE it and then waited for:
+//
+//   - correct: the competitor blocks on s.mu until noteHeartbeatAck returns,
+//     so the wait times out, the store lands first, and the supersession's
+//     clear lands after it — final state CLEARED.
+//   - released-early: the competitor runs to completion inside the window and
+//     clears, then the stale store lands on top — final state LATCHED.
+//
+// The assertion is on the final state, so it is deterministic in both shapes;
+// only the (generous) wait is timing-based, and it is the correct
+// implementation that relies on it EXPIRING, never on it firing.
+func TestPeerHeartbeatAckStoreIsAtomicWithSupersession_5718(t *testing.T) {
+	ss := newAckTestSync(t)
+
+	// Peer incarnation A holds both fabric slots.
+	a0, a1 := pipeConn(t), pipeConn(t)
+	ss.installConn(0, a0)
+	ss.installConn(1, a1)
+
+	// The competing supersession: incarnation B takes fabric 1, which advances
+	// the incarnation and clears the capability.
+	b1 := pipeConn(t)
+	supersedeDone := make(chan struct{})
+
+	var once sync.Once
+	hook := func() {
+		once.Do(func() {
+			started := make(chan struct{})
+			go func() {
+				close(started)
+				ss.installConn(1, b1)
+				close(supersedeDone)
+			}()
+			<-started
+			// Give the supersession every chance to complete WHILE we are
+			// between the check and the store. Under the correct
+			// implementation it cannot: it is blocked on s.mu, which this
+			// goroutine holds.
+			select {
+			case <-supersedeDone:
+			case <-time.After(2 * time.Second):
+			}
+		})
+	}
+	noteHeartbeatAckMidpointHook.Store(&hook)
+	t.Cleanup(func() { noteHeartbeatAckMidpointHook.Store(nil) })
+
+	// a0 is current, so this ack passes the check and reaches the window.
+	ss.handleMessage(a0, syncMsgHeartbeatAck, nil)
+
+	// Let the competitor finish now that the lock is free.
+	select {
+	case <-supersedeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the competing installConn never completed")
+	}
+
+	if ss.peerHeartbeatAckEver.Load() {
+		t.Fatal("a supersession interleaved between the incarnation check and the " +
+			"capability store, so the ack resurrected a capability the supersession " +
+			"had already cleared. The check and the store must BOTH happen under the " +
+			"same s.mu hold — releasing the lock between them reopens exactly the " +
+			"stale-incarnation fail-open the per-slot stamp closes")
+	}
+
+	// The supersession really did happen, so the assertion above is about
+	// ordering and not about a supersession that silently did not run.
+	if got := ss.connInSlot(1); got != b1 {
+		t.Fatal("setup: the competing installConn must have taken fabric 1")
+	}
+}
+
 // TestPeerHeartbeatAckNotLatchedBeforeInstall_5718 covers the third writer
 // path: handleNewConnection processes a handshake-pending frame BEFORE the
 // connection is installed into a fabric slot.
@@ -437,6 +532,82 @@ func TestPeerHeartbeatAckClearedWheneverRegistryEmpties_5718(t *testing.T) {
 				"relies on this never happening")
 		}
 	})
+}
+
+// TestOnlyHandleDisconnectEmptiesTheRegistry_5718 is the STRUCTURAL half of
+// the premise above, and the part the behavioural test cannot reach.
+//
+// The behavioural premise test can only assert about the paths it invokes; it
+// says nothing about a path added later. Removing handleDisconnect's clear is
+// already caught by an older assertion, so the behavioural test adds no
+// sensitivity there — its unique job is this: the narrowing in installConn is
+// sound only while `conn0`/`conn1` are set to nil in exactly ONE function. A
+// new teardown that nils a slot elsewhere would empty the registry without
+// clearing the capability, and every behavioural test in this file would still
+// pass.
+//
+// So assert the ownership directly on the package's AST.
+func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
+	fset := token.NewFileSet()
+	pkgFiles, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+
+	type site struct{ fn, pos string }
+	var sites []site
+	for _, path := range pkgFiles {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for i, lhs := range as.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || (sel.Sel.Name != "conn0" && sel.Sel.Name != "conn1") {
+						continue
+					}
+					if i >= len(as.Rhs) {
+						continue
+					}
+					if id, ok := as.Rhs[i].(*ast.Ident); !ok || id.Name != "nil" {
+						continue
+					}
+					sites = append(sites, site{fn: fn.Name.Name, pos: fset.Position(as.Pos()).String()})
+				}
+				return true
+			})
+		}
+	}
+
+	if len(sites) == 0 {
+		t.Fatal("no `s.connN = nil` site found in package cluster — if the fabric registry " +
+			"was restructured, re-point this guard rather than deleting it")
+	}
+	for _, s := range sites {
+		if s.fn != "handleDisconnect" {
+			t.Fatalf("%s nils a fabric connection slot at %s. installConn deliberately does "+
+				"NOT clear peerHeartbeatAckEver on the full-disconnect edge, because "+
+				"reaching an empty registry is supposed to PROVE handleDisconnect's clear "+
+				"already ran. A second function that empties a slot breaks that premise: "+
+				"the registry can then go empty with the capability still latched, and the "+
+				"previous incarnation is enforced against the next peer. Either clear the "+
+				"capability there too, or restore the clear in installConn (#5718 fold r3)",
+				s.fn, s.pos)
+		}
+	}
 }
 
 // TestPeerHeartbeatAckEverSurvivesPartialDisconnect_5718 is the scope control

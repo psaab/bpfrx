@@ -68314,3 +68314,39 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
   pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
   pkg/routing/close_partial_manager_5718_test.go, _Log.md
+- **Timestamp**: 2026-08-05 19:20
+- **Action**: #6825 review fold r3 (#5718 C-HA) — Codex gate at `7b29c99b9`
+  found no defect in the incarnation-stamping runtime implementation; both
+  MAJORs were guards that check a proxy instead of the property.
+  **MAJOR 1**: `noteHeartbeatAck`'s doc claimed the incarnation check and the
+  capability store are atomic under `s.mu`, but every test called `installConn`
+  and `handleMessage` in sequence, so none ever opened the window — an
+  implementation that checks under the lock, releases it and only then stores
+  passed 20/20 while allowing a supersession to land in between and resurrect a
+  just-cleared capability. Added `noteHeartbeatAckMidpointHook` (nil in
+  production, `atomic.Pointer`) so a test can start a competing `installConn`
+  from inside that window: the competitor BLOCKS on `s.mu` under the real
+  implementation and completes under the released-early one, and the assertion
+  is on final state so it is deterministic in both. **MAJOR 2**: the F3 AST
+  guard asserted on the `slots := plan.HeartbeatSlots` assignment, which a
+  decoy satisfies — keeping the assignment and writing `slot < plan.Workers`
+  zeroes 6 Array entries instead of 192, leaving 186 heartbeat slots stale. The
+  intermediate variable is gone (the bound is read inline) and the guard now
+  locates the loop by the fact that it writes `heartbeatMap.Update` and asserts
+  on its CONDITION. **Green-by-skip**: r1's R8/R9 cells were scored against a
+  netlink-gated test that SKIPS where netlink is unavailable, and a skipped
+  test reports PASS — the cell is UNKNOWN, not GREEN. Added
+  `Manager.closeHandleFn`, bound in `New()` to the handle it created, so the
+  #848 ordering is now bound by a netlink-free test with an injected release
+  recorder; the real-handle test is relabelled supplementary and
+  environment-gated. Also added a structural guard asserting `conn0`/`conn1`
+  are nilled in exactly one function, which is the premise test's unique job
+  (removing `handleDisconnect`'s clear was already caught by an older
+  assertion). Six mutations C1-C6, all `go vet` clean, all RED with assertions,
+  none skipped.
+- **File(s)**: pkg/cluster/sync_conn.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
+  pkg/routing/routing.go, pkg/routing/close_partial_manager_5718_test.go,
+  pkg/routing/README.md, _Log.md

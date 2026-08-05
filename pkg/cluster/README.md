@@ -1494,6 +1494,24 @@ outside the monitor loop:
   empty registry implies `handleDisconnect`'s clear already ran —
   `conn0`/`conn1` are nilled nowhere else. Adding the condition back is inert
   rather than wrong, so no behavioural test can reject it; what the tests pin
-  instead is the PREMISE, that every way the registry empties leaves the
-  capability cleared. If a future teardown path empties a slot without
-  clearing, that guard fails and this narrowing must be revisited.
+  instead is the PREMISE. That has two halves, because the behavioural half
+  alone would be decorative (removing `handleDisconnect`'s clear already reds
+  an older assertion): `TestPeerHeartbeatAckClearedWheneverRegistryEmpties`
+  drives every emptying path it knows of, and
+  `TestOnlyHandleDisconnectEmptiesTheRegistry` asserts on the package AST that
+  `conn0`/`conn1` are assigned nil in exactly one function. A future teardown
+  that empties a slot elsewhere reds the structural guard even though every
+  behavioural test would still pass, and at that point this narrowing must be
+  revisited.
+
+  **Atomicity of the ack is bound, not merely asserted (#5718 fold r3).** Every
+  scenario test calls `installConn` and `handleMessage` in sequence, so none of
+  them opens the window `s.mu` exists to close — an implementation that checks
+  under the lock, releases it, and only then stores would pass all of them
+  while letting a supersession land in between and resurrect a just-cleared
+  capability. `noteHeartbeatAckMidpointHook` (nil in production) widens that
+  window so a test can start a competing `installConn` from inside it: under
+  the real implementation the competitor BLOCKS on `s.mu` until the ack
+  returns, so it cannot interleave. The assertion is on final state, so it is
+  deterministic in both shapes, and only the correct implementation depends on
+  the (generous) wait EXPIRING.

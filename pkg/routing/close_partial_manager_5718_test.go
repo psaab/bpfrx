@@ -64,10 +64,24 @@ type liveKeepalive struct {
 // way, and the recorded answer differs between them.
 func installLiveKeepalive(t *testing.T, m *Manager, name string) *liveKeepalive {
 	t.Helper()
+	handle := m.nlHandle
+	return installLiveKeepaliveWatching(t, m, name, func() bool {
+		if handle == nil {
+			return true
+		}
+		socks, err := handle.GetSocketReceiveBufferSize()
+		return err == nil && len(socks) > 0
+	})
+}
+
+// installLiveKeepaliveWatching is installLiveKeepalive with an explicit
+// "is the handle still usable?" probe, so a Manager with no netlink handle can
+// still bind the #848 ordering through an injected release recorder.
+func installLiveKeepaliveWatching(t *testing.T, m *Manager, name string, handleUsable func() bool) *liveKeepalive {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	doneCh := make(chan struct{})
 	ka := &liveKeepalive{done: doneCh}
-	handle := m.nlHandle
 
 	go func() {
 		defer close(doneCh)
@@ -76,12 +90,7 @@ func installLiveKeepalive(t *testing.T, m *Manager, name string) *liveKeepalive 
 		for {
 			select {
 			case <-ctx.Done():
-				if handle != nil {
-					socks, err := handle.GetSocketReceiveBufferSize()
-					ka.handleOpenAtDrain.Store(err == nil && len(socks) > 0)
-				} else {
-					ka.handleOpenAtDrain.Store(true)
-				}
+				ka.handleOpenAtDrain.Store(handleUsable())
 				ka.sawDrain.Store(true)
 				return
 			case <-tk.C:
@@ -133,10 +142,73 @@ func (ka *liveKeepalive) assertDrained(t *testing.T, what string) {
 	}
 }
 
-// TestCloseReleasesLiveHandleAndKeepalives_5718 is the positive half of the
-// #5718 A7-b02-C01 guard: Close must actually do its two jobs on a FULLY wired
-// Manager, so the nil guard added for the partial constructors cannot degrade
-// it into a no-op.
+// TestCloseDrainsBeforeReleasingHandle_5718 is the CI-PORTABLE guard for
+// Close's two obligations and, decisively, their ORDER (#5718 fold r3).
+//
+// The netlink-backed test below observes the same contract through a real
+// *netlink.Handle and therefore SKIPS wherever netlink is unavailable. A
+// skipped test reports PASS, which means it accepts every implementation in
+// that environment — a mutation run against it yields a cell that looks green
+// and proves nothing. So the binding guard is this one: it uses no netlink at
+// all, and the handle-release step is an injected recorder.
+//
+// What is asserted:
+//   - the keepalive runner is cancelled AND drained (its goroutine returned);
+//   - the handle release ran exactly once;
+//   - the release happened AFTER the drain (#848). Final state is identical
+//     under either order, so the ordering is observed from inside the
+//     keepalive goroutine at the moment it is cancelled: it records whether
+//     the release had already fired. stopAll blocks on <-runner.done, so this
+//     is deterministic and race-free in both orders —
+//     drain-then-release gives cancel -> read -> close(done) -> release, and
+//     release-then-drain gives release -> cancel -> read.
+func TestCloseDrainsBeforeReleasingHandle_5718(t *testing.T) {
+	m := NewManagerWithLinkOpsForTest(nil)
+	if m.tunnel == nil {
+		t.Fatal("setup: NewManagerWithLinkOpsForTest must wire the tunnel domain")
+	}
+
+	var releases atomic.Int64
+	m.closeHandleFn = func() { releases.Add(1) }
+
+	ka := installLiveKeepaliveWatching(t, m, "gr-order-5718", func() bool {
+		return releases.Load() == 0
+	})
+
+	if err := m.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ka.assertDrained(t, "link-ops Manager with an injected handle release")
+
+	if got := releases.Load(); got != 1 {
+		t.Fatalf("Close ran the handle release %d time(s); want exactly 1. A Close that "+
+			"skips it leaks the netlink handle the Manager solely owns", got)
+	}
+	if !ka.handleOpenAtDrain.Load() {
+		t.Fatal("Close released the netlink handle BEFORE draining the keepalive runner: " +
+			"the still-running goroutine observed the release had already fired. stopAll " +
+			"must drain first, or an in-flight keepalive tick touches a closed handle " +
+			"(#848). Final state is identical under either order, so only the goroutine's " +
+			"own view at cancellation time can tell them apart")
+	}
+
+	m.tunnel.mu.Lock()
+	remaining := len(m.tunnel.keepalives)
+	m.tunnel.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("Close left %d keepalive runner(s) registered", remaining)
+	}
+}
+
+// TestCloseReleasesLiveHandleAndKeepalives_5718 is the SUPPLEMENTARY,
+// environment-gated check: the same contract against a real *netlink.Handle.
+//
+// It SKIPS where netlink handle construction is unavailable, so it must not be
+// treated as the merge-gate guard and a mutation cell scored against it is
+// UNKNOWN, not GREEN, whenever it skipped. TestCloseDrainsBeforeReleasingHandle
+// above is the portable guard; this one adds that the real handle's sockets
+// actually go away, which no fake can show.
 //
 // Both obligations are observed on live state rather than inferred from a nil
 // error:
@@ -240,9 +312,15 @@ func TestCloseReleasesLiveHandleAndKeepalives_5718(t *testing.T) {
 // test rather than cleaning up.
 //
 // A constructor this package exports must produce a Manager that is safe to
-// Close, so this test drives Close on every partial constructor. The
-// fully-wired case is covered above, where the guard is proven not to have
-// turned Close into a no-op.
+// Close, so this test drives Close on every partial constructor.
+//
+// Scope, stated plainly: the rule-ops and route-lister subtests bind ONE thing
+// — that Close does not panic on a nil tunnel domain — and nothing else. A
+// Manager with no tunnel and no handle has no live state to observe, so those
+// two subtests also accept a `return nil` no-op. That no-op is caught by
+// TestCloseDrainsBeforeReleasingHandle_5718, which does have live state; the
+// suite binds both properties even though neither subtest binds both. Do not
+// read these two as guarding that Close still does its work.
 func TestClosePartialTestManagersDoesNotPanic_5718(t *testing.T) {
 	t.Run("rule ops manager", func(t *testing.T) {
 		m := NewManagerWithRuleOpsForTest(closeGuardRuleOps{})
