@@ -669,6 +669,92 @@ fn synced_generation(coordinator: &Coordinator, key: &SessionKey) -> Option<u64>
         .map(|entry| entry.generation)
 }
 
+// #6819 R3: the property the whole counter-scoping change exists to establish,
+// bound DETERMINISTICALLY.
+//
+// Every other assertion on these three counters is a DELTA capture (`let before
+// = ...` then `before + 1` or `== before`). A process-global satisfies every one
+// of them identically whenever tests do not interleave — and the sanctioned gate
+// (`make test-rust`) pins `-- --test-threads=1`, so WITHOUT this test, reverting
+// any of the three fields to a `static` leaves the entire gated suite GREEN.
+// That is measured, not assumed: reverting `import_cap_drops` reds 24 of 60
+// PARALLEL runs and 0 of 12 single-threaded ones; reverting both stale counters
+// reds 43 of 60 parallel and 0 of 5 single-threaded.
+//
+// This test does not depend on interleaving at all, so it reds at ANY thread
+// count including the gate's. It drives one refusal of each kind on a BUSY
+// coordinator and asserts that an IDLE coordinator, alive in the same process,
+// observed none of them. Under a process-global the idle instance reads the busy
+// instance's increments and every assertion in the final block fails.
+#[test]
+fn refusal_counters_are_per_coordinator_not_process_global() {
+    let mut busy = Coordinator::new();
+    let idle = Coordinator::new();
+
+    // Both instances start clean. (Also the reason the `== before` captures
+    // elsewhere in this file are now always `0 == 0` — see the note on
+    // `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`.)
+    assert_eq!(idle.session_install_stale_ignored_total(), 0);
+    assert_eq!(idle.session_delete_stale_ignored_total(), 0);
+    assert_eq!(idle.synced_import_cap_drops_total(), 0);
+
+    // Entry cap = 2 (logical override 1, doubled for the synthesized reverse).
+    busy.synced_import_cap_override = 1;
+    let commands = Arc::new(Mutex::new(VecDeque::new()));
+    busy.workers.records.insert(
+        0,
+        WorkerRuntimeRecord::for_test(test_worker_handle(commands.clone())),
+    );
+
+    let key = test_key();
+    busy.upsert_synced_session(synced_entry_with_generation(2));
+    // (a) stale install — refused, counted.
+    busy.upsert_synced_session(synced_entry_with_generation(1));
+    // (b) stale delete — refused, counted; the entry survives.
+    busy.delete_synced_session_gen(key.clone(), 1);
+    // (c) over-ceiling NEW forward — the map already holds the forward + its
+    // synthesized reverse, so it is at the entry cap. Refused, counted.
+    busy.upsert_synced_session(synced_entry_port(2000, 0));
+
+    assert_eq!(
+        busy.session_install_stale_ignored_total(),
+        1,
+        "setup: the busy coordinator must have refused exactly one stale install"
+    );
+    assert_eq!(
+        busy.session_delete_stale_ignored_total(),
+        1,
+        "setup: the busy coordinator must have refused exactly one stale delete"
+    );
+    assert_eq!(
+        busy.synced_import_cap_drops_total(),
+        1,
+        "setup: the busy coordinator must have refused exactly one over-ceiling \
+         import"
+    );
+
+    // THE BINDING ASSERTIONS. A process-global would have leaked all three of
+    // the refusals above into this second, untouched Coordinator.
+    assert_eq!(
+        idle.session_install_stale_ignored_total(),
+        0,
+        "a second Coordinator observed another instance's stale-install \
+         refusal — `install_stale_ignored` is process-global again (#6819)"
+    );
+    assert_eq!(
+        idle.session_delete_stale_ignored_total(),
+        0,
+        "a second Coordinator observed another instance's stale-delete \
+         refusal — `delete_stale_ignored` is process-global again (#6819)"
+    );
+    assert_eq!(
+        idle.synced_import_cap_drops_total(),
+        0,
+        "a second Coordinator observed another instance's over-ceiling import \
+         refusal — `import_cap_drops` is process-global again (#6819)"
+    );
+}
+
 // A stale-generation upsert (gen=1 after gen=2 is stored) must be refused so
 // the per-key stored generation never regresses (the delayed-stale-install
 // variant, SMR C3). Mirrors the Go install guard.
@@ -1258,6 +1344,20 @@ fn current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex() 
     );
 
     // Neither legitimate operation was counted as a stale refusal.
+    //
+    // #6819 note on what the per-instance scoping COST here: `..._before` is now
+    // always 0, because each `#[test]` owns its Coordinator. Under the previous
+    // process-global scheme these were genuine moving-baseline deltas — another
+    // test's refusals could make `stale_installs_before` nonzero — whereas now
+    // the two assertions immediately below are literally `0 == 0`, which is also
+    // what a never-incremented counter reads. Deleting the `fetch_add` bumps
+    // outright leaves THIS test passing in isolation. That is determinism bought
+    // at the cost of these two assertions' independence, and it is an acceptable
+    // trade only because the same mutation reds four other tests in this file
+    // (the two non-poison rejection tests, the two poison ones) plus
+    // `refusal_counters_are_per_coordinator_not_process_global`. The family is
+    // bound; this negative control is individually weak, which is normal for a
+    // negative control but should not be mistaken for coverage.
     assert_eq!(
         coordinator.session_install_stale_ignored_total(),
         stale_installs_before,

@@ -15,10 +15,14 @@ use super::*;
 /// `Coordinator::last_quiesce_ms` and the `force_worker_*` seams are: a
 /// process-global counter is observable by every other `Coordinator` in the
 /// process. Production builds exactly one `Coordinator` (`server::lifecycle`),
-/// so the Prometheus/gRPC values are unchanged — but the test suite builds one
-/// per `#[test]` and runs them concurrently in a single process, and a global
-/// made every assertion about these counters depend on what every other test
-/// happened to do (#6819).
+/// so the exported Prometheus value (`import_cap_drops`, via
+/// `server/helpers/status.rs` -> `protocol::control` -> the Go collector) is
+/// unchanged; the other two have no surface outside this binary at all — their
+/// accessors are called only from `ha_tests.rs`. (None of the three is in
+/// `proto/`: this crate has no gRPC dependency.) The change is observable only
+/// to tests, which build one `Coordinator` per `#[test]` and run them
+/// concurrently in a single process — as globals, every assertion about these
+/// counters depended on what every other test happened to do (#6819).
 pub(in crate::afxdp) struct SessionManager {
     pub(in crate::afxdp) synced: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     pub(in crate::afxdp) nat: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
