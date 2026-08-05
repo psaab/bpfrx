@@ -68,9 +68,15 @@ const nodeIDFile = "/etc/xpf/node-id"
 
 // Daemon is the main xpf daemon.
 type Daemon struct {
-	opts     Options
-	store    *configstore.Store
-	dp       dataplane.RuntimeDataPlane
+	opts  Options
+	store *configstore.Store
+	dp    dataplane.RuntimeDataPlane
+	// dpFacade is the revocable handle every EXTERNAL consumer (gRPC, REST,
+	// CLI) holds instead of dp itself (#5275). It MUST track dp exactly —
+	// assign both through setDataplane, never `d.dp = x` directly, or a
+	// consumer keeps a live handle to a backend the daemon has dropped, which
+	// is the whole defect the facade exists to close.
+	dpFacade *dataplaneFacade
 	networkd *networkd.Manager
 	routing  *routing.Manager
 	frr      *frr.Manager

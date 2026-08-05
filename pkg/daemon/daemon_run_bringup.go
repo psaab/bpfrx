@@ -445,7 +445,7 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 				"err", err,
 				"remediation", "set system dataplane-type userspace",
 			)
-			d.dp = nil
+			d.setDataplane(nil)
 		} else if errors.Is(err, dataplane.ErrEBPFBackendRetired) {
 			// #1476: mechanical source removal of the legacy
 			// eBPF dataplane. Behaviour mirrors the DPDK arm
@@ -461,12 +461,12 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 				"err", err,
 				"remediation", "set system dataplane-type userspace",
 			)
-			d.dp = nil
+			d.setDataplane(nil)
 		} else if err != nil {
 			slog.Error("failed to create dataplane", "type", dpType, "err", err)
 			return fmt.Errorf("create dataplane: %w", err)
 		} else {
-			d.dp = dp
+			d.setDataplane(dp)
 		}
 		// #1620: stamp the cold-path sample mask onto the userspace
 		// Manager so the next buildSnapshot includes it. Mask
@@ -494,7 +494,7 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 				if err := d.dp.Start(d.daemonCtx); err != nil {
 					slog.Warn("failed to start dataplane, running in config-only mode",
 						"err", err)
-					d.dp = nil
+					d.setDataplane(nil)
 				} else {
 					// natSeeder is satisfied by both *dataplane.Manager
 					// (legacy eBPF — SeedNATPortCounters in maps_nat.go,

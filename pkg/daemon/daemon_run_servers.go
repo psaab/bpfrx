@@ -113,11 +113,13 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// (pkg/grpcapi/runtime.go, #1516/#1554). Go duck-types the
 	// assignment to grpcapi.Config.DP at this site; signature
 	// drift surfaces as a compile error here.
+	// #5275: gRPC holds the REVOCABLE FACADE, never the backend alias. The
+	// nil-when-absent shape is preserved exactly — newDataplaneFacade returns
+	// nil for no/unsuitable backend, and a nil *dataplaneFacade must not be
+	// assigned into the interface (a typed-nil would read as non-nil here).
 	var grpcDP grpcDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(grpcDataPlane); ok {
-			grpcDP = probe
-		}
+	if d.dpFacade != nil {
+		grpcDP = d.dpFacade
 	}
 	grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 		Store:      d.store,
@@ -251,11 +253,11 @@ func (d *Daemon) startHTTPServer(ctx context.Context, wg *sync.WaitGroup, eventB
 	// package-private apiRuntimeDataPlane. Go duck-types the
 	// assignment to api.Config.DP at this site; signature drift
 	// surfaces as a compile error here.
+	// #5275: REST holds the REVOCABLE FACADE, never the backend alias. See the
+	// gRPC site above for why the typed-nil guard is not optional.
 	var apiDP apiDataPlane
-	if d.dp != nil {
-		if probe, ok := d.dp.(apiDataPlane); ok {
-			apiDP = probe
-		}
+	if d.dpFacade != nil {
+		apiDP = d.dpFacade
 	}
 	apiCfg := api.Config{
 		Addr:     d.opts.APIAddr,

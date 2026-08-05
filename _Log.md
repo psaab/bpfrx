@@ -66283,4 +66283,15 @@ break — `go vet` confirmed passing under every revert.
   readable directly instead of inferred from the ABSENCE of an enforcement line
   (an absence is indistinguishable from a proof that never ran).
   **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR2 — sealed revocable dataplane facade. gRPC/REST/CLI now
+  hold a revocable handle instead of a raw backend alias, so dropping the
+  dataplane actually reaches them. setDataplane keeps d.dp and the facade in
+  lockstep and REVOKES the outgoing facade. Facade is constructed LIVE and
+  nothing revokes it in production — pure indirection, behaviour-identical.
+  Explicit per-method delegation (NO interface embedding: embedding silently
+  forwards un-overridden methods and fails OPEN). Completeness test scans the
+  construction sites, because a consumer re-pointed at the raw backend compiles
+  and passes every behavioural test.
+  **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_wiring.go, pkg/daemon/dataplane_facade_5275_test.go, pkg/daemon/daemon.go, pkg/daemon/daemon_run.go, pkg/daemon/daemon_run_servers.go, pkg/daemon/daemon_run_bringup.go, pkg/daemon/daemon_run_naming.go, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md
 

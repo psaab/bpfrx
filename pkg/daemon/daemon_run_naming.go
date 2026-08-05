@@ -231,7 +231,7 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 		if err := d.dp.Start(d.daemonCtx); err != nil {
 			slog.Warn("bootstrap exit: failed to start dataplane, running in config-only mode",
 				"err", err)
-			d.dp = nil
+			d.setDataplane(nil)
 		} else {
 			if seeder, ok := d.dp.(natSeeder); ok {
 				seeder.SeedNATPortCounters()

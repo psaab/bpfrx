@@ -607,11 +607,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// package-private cliRuntime (pkg/cli/runtime.go, #1517).
 		// Go duck-types the assignment to cli.New's dp parameter at
 		// this site; signature drift surfaces as a compile error.
+		// #5275: the CLI holds the REVOCABLE FACADE, never the backend
+		// alias. Same typed-nil guard as the gRPC/REST sites.
 		var cliDP cliDataPlane
-		if d.dp != nil {
-			if probe, ok := d.dp.(cliDataPlane); ok {
-				cliDP = probe
-			}
+		if d.dpFacade != nil {
+			cliDP = d.dpFacade
 		}
 		shell := cli.New(d.store, cliDP, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
