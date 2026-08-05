@@ -423,9 +423,21 @@ func zoneInterfaceMemberKeys(iface *Node) []string {
 // The stanza reaches the compiler in two structurally different shapes:
 //
 //	BLOCK   `interfaces { a; b; }`  → Keys=["interfaces"], one child per member.
-//	                                  This is also the ONLY shape `set` can
-//	                                  produce: SetPath descends the `interfaces`
-//	                                  container and stores each member below it.
+//	                                  `set` also always leaves the stanza node at
+//	                                  Keys=["interfaces"] with its members under
+//	                                  Children — but NOT necessarily one child
+//	                                  each. A flat bracket list nests instead:
+//	                                  `set ... interfaces [ a b c ]` gives
+//	                                  `interfaces -> a(container) -> leaf
+//	                                  Keys=["b","c"]` (SetPath descends the
+//	                                  interface-name wildcard for `a`, then
+//	                                  collapses the rest onto one leaf — see the
+//	                                  zoneInterfaceMembers comment above).
+//	                                  zoneInterfaceMembers RECURSES, so both are
+//	                                  read correctly; only the stanza-level
+//	                                  Keys tail distinguishes COMPACT from `set`.
+//	                                  Shape pinned by
+//	                                  TestZoneInterfaces6735FlatSetBracketNestsRatherThanFanning.
 //	COMPACT `interfaces a;`         → Keys=["interfaces","a"], Children=nil
 //	        `interfaces [ a b ];`   → Keys=["interfaces","a","b"], Children=nil
 //	        `interfaces a { ... }`  → Keys=["interfaces","a"], Children=BODY
@@ -470,4 +482,92 @@ func zoneInterfaceStanzaMembers(prop *Node) []string {
 		names = append(names, zoneInterfaceMembers(iface)...)
 	}
 	return names
+}
+
+// zoneInterfaceMemberPackedTail reports whether a member node carries a body
+// keyword on its Keys with FURTHER TOKENS AFTER IT, and returns those trailing
+// tokens. It is the detector behind validateZoneInterfacePackedTailStrict
+// (#6735); it recurses exactly the nodes zoneInterfaceMembers recurses, so the
+// gate and the truncator can never disagree about which nodes are members.
+//
+// The shape it finds is IRREDUCIBLY AMBIGUOUS. The lexer strips brackets
+// (#2419), so these two statements parse to byte-identical Keys:
+//
+//	interfaces [ ge-0/0/0.0 host-inbound-traffic ge-0/0/1.0 ];
+//	interfaces ge-0/0/0.0 host-inbound-traffic system-services ssh;
+//
+// The first is a bracket MEMBER LIST whose author expects both interfaces in
+// the zone; the second is the PACKED BODY spelling whose author expects one
+// member plus a host-inbound override. `zoneInterfaceKeysBeforeBody` truncates
+// at the keyword, which silently discards the operator's intent in BOTH
+// readings — the trailing member in the first, the whole override in the
+// second. No amount of local cleverness distinguishes them, because the
+// distinguishing punctuation is gone before the compiler sees the node.
+//
+// So this is not resolved by guessing; it is resolved by REFUSING. A statement
+// whose two readings disagree about zone membership is rejected at commit and
+// the operator rewrites it in the block spelling, which is unambiguous and
+// fully supported:
+//
+//	interfaces { ge-0/0/0.0; ge-0/0/1.0; }                     // both members
+//	interfaces { ge-0/0/0.0 { host-inbound-traffic {...} } }   // member + body
+//
+// Deliberate consequence, and the reason this is a REJECT rather than a
+// warning: the packed-body spelling used to COMMIT, contributing membership
+// while silently dropping the override (the fail-closed residual #6525 left
+// open). Silently discarding an authored host-inbound directive is exactly the
+// class of quiet security loss #6525 was opened for, so making it loud is the
+// point rather than collateral. The tolerant load / peer-sync path still warns
+// instead of rejecting (#1960 no-brick), where behavior is unchanged from
+// before this gate.
+//
+// A body keyword with NOTHING after it (`interfaces a host-inbound-traffic;`)
+// is NOT flagged: truncation loses nothing there, and rejecting it would be the
+// #4191 over-rejection class. Neither is a body keyword arriving as a CHILD
+// node (`interfaces a { host-inbound-traffic {...} }`, and the bracket-list form
+// `interfaces [ a b ] { host-inbound-traffic {...} }`) — those spellings are
+// unambiguous, carry no tokens on Keys past a keyword, and compile their
+// override correctly today.
+func zoneInterfaceMemberPackedTail(iface *Node) (keyword string, tail []string, found bool) {
+	for i, k := range iface.Keys {
+		if k == "" {
+			continue
+		}
+		if !zoneInterfaceBodyKeywords[k] {
+			continue
+		}
+		for _, rest := range iface.Keys[i+1:] {
+			if rest != "" {
+				tail = append(tail, rest)
+			}
+		}
+		// Either way this node's CHILDREN are the body, not members, so the
+		// recursion below must not descend them — mirroring zoneInterfaceMembers,
+		// which returns as soon as hasBody is true. The matched keyword is
+		// returned rather than re-derived by the caller, so adding a second entry
+		// to zoneInterfaceBodyKeywords cannot leave the reject naming the wrong
+		// token.
+		return k, tail, len(tail) > 0
+	}
+	for _, child := range iface.Children {
+		if zoneInterfaceBodyKeywords[child.Name()] {
+			continue
+		}
+		if kw, tail, ok := zoneInterfaceMemberPackedTail(child); ok {
+			return kw, tail, true
+		}
+	}
+	return "", nil, false
+}
+
+// zoneInterfaceStanzaPackedTail is the stanza-level entry point for
+// zoneInterfaceMemberPackedTail, normalizing the stanza into member nodes the
+// same way zoneInterfaceStanzaMembers does (#6735).
+func zoneInterfaceStanzaPackedTail(prop *Node) (keyword string, tail []string, found bool) {
+	for _, iface := range zoneInterfaceMemberNodes(prop) {
+		if kw, tail, ok := zoneInterfaceMemberPackedTail(iface); ok {
+			return kw, tail, true
+		}
+	}
+	return "", nil, false
 }

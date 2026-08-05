@@ -224,6 +224,33 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 	// zone-interface defined gate so a typo'd member still wins the first-error
 	// slot; by construction the two cannot both fire on one stanza (this one
 	// fires only on an EMPTY member set, which those two iterate away).
+	// #6735 zone-interface PACKED-TAIL gate. Strict on commit / commit-check
+	// (hard-reject a member statement in which `host-inbound-traffic` is
+	// followed by more tokens on the same Keys — bracket-list and packed-body
+	// readings disagree about membership and the brackets that would tell them
+	// apart are already gone, so the compiler silently keeps only the names
+	// before the keyword and drops a valid member or a whole override).
+	// Lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960 no-brick; the trailing tokens were dropped
+	// before this gate existed and still are).
+	//
+	// Runs BEFORE the non-empty gate, deliberately. The two overlap on exactly
+	// one shape — `interfaces host-inbound-traffic ge-0/0/1.0;`, where the
+	// keyword is FIRST so nothing precedes it and the stanza also compiles to
+	// zero members. Both gates would fire; this one's message is strictly more
+	// accurate, because telling an operator who plainly named `ge-0/0/1.0` that
+	// the stanza "names no interface" sends them looking for the wrong problem.
+	// Every other non-empty case (a keyword with NOTHING after it, a body-only
+	// block) leaves this gate silent and still reaches that one.
+	if err := validateZoneInterfacePackedTailStrict(tree); err != nil {
+		if opts.lenientZoneInterfacePackedTail {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("zone interfaces packed tail (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return err
+		}
+	}
+
 	if err := validateZoneInterfacesNonEmptyStrict(tree); err != nil {
 		if opts.lenientZoneInterfacesNonEmpty {
 			cfg.Warnings = append(cfg.Warnings,
