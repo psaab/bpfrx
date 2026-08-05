@@ -142,26 +142,54 @@ func (m *Manager) DisableAndStopHelper() {
 //
 // The caller then performs the link DOWN/UP. Afterwards, NotifyLinkCycle
 // sends "rebind" to recreate workers with fresh AF_XDP sockets.
-func (m *Manager) PrepareLinkCycle() {
+func (m *Manager) PrepareLinkCycle() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil || m.proc.Process == nil {
-		return
+		// No helper running: there are no workers to join, so a link cycle
+		// cannot race one. This is a genuine success, not a swallowed
+		// failure.
+		return nil
 	}
 	// Disable ctrl BEFORE stopping workers. If the disable cannot be
 	// verified the wrapper clears all bindings fail-closed so the shim has
 	// no READY slot to redirect to while the workers are being joined.
-	_ = m.disableCtrlBeforeTeardownLocked()
+	//
+	// #5103: the error is RETURNED rather than discarded. But it must NOT
+	// short-circuit the worker join below — the join is the half that makes
+	// UMEM safe to unmap, and skipping it on a ctrl-disable failure would
+	// leave workers running through the very link cycle this function exists
+	// to protect. The wrapper has already cleared all binding rows fail-closed,
+	// so the shim has nothing READY to redirect into while the join proceeds.
+	ctrlErr := m.disableCtrlBeforeTeardownLocked()
 	// Tell the Rust helper to stop all workers. This joins worker
 	// threads so they stop touching UMEM before the NIC unmaps pages
 	// during link DOWN.
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "stop_workers"}, &status); err != nil {
-		slog.Warn("userspace: stop_workers before link cycle failed", "err", err)
-		return
+		// #5103: previously a Warn + bare return, which the void signature
+		// made invisible. A failed join means worker threads may still be
+		// touching UMEM, so the link MUST NOT be cycled.
+		slog.Error("userspace: stop_workers before link cycle failed; link cycle must not proceed",
+			"err", err)
+		return fmt.Errorf("userspace: stop_workers before link cycle: %w", err)
 	}
 	slog.Info("userspace: workers stopped before link cycle",
 		"bindings", len(status.Bindings))
+	// SCOPE of the error contract, deliberately narrow: it reports whether the
+	// WORKER JOIN succeeded, and nothing else. ctrlErr is logged (loudly, by
+	// disableCtrlBeforeTeardownLocked) and its own failure path has already
+	// cleared every binding row fail-closed, so the shim has nothing READY to
+	// redirect into — but it is NOT folded into the return.
+	//
+	// Propagating it was tried and is wrong: "userspace_ctrl map not loaded" is
+	// a legitimate state (no shim attached), and in that state there is no
+	// redirect path for the gate to protect. Failing there would block RETH MAC
+	// programming on a healthy deployment — an over-rejection in place of the
+	// under-rejection this change exists to fix. The caller's decision hinges
+	// on whether threads can still touch UMEM, which is exactly the join.
+	_ = ctrlErr
+	return nil
 }
 
 var linkCycleRebindSleep = time.Sleep

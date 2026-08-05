@@ -129,7 +129,12 @@ type Capabilities struct {
 
 type LinkController interface {
 	SetDeferWorkers(bool)
-	PrepareLinkCycle()
+	// PrepareLinkCycle joins the AF_XDP workers so no thread touches UMEM
+	// during a link DOWN/UP. It returns an error when the join could not be
+	// completed or verified; the caller MUST NOT cycle the link in that case
+	// (#5103). A void return made a failed join indistinguishable from a
+	// successful one, so the link cycled with workers still live.
+	PrepareLinkCycle() error
 	NotifyLinkCycle()
 }
 
@@ -275,7 +280,7 @@ type dataPlaneLinkController struct {
 
 func (c dataPlaneLinkController) SetDeferWorkers(bool) {}
 
-func (c dataPlaneLinkController) PrepareLinkCycle() {}
+func (c dataPlaneLinkController) PrepareLinkCycle() error { return nil }
 
 func (c dataPlaneLinkController) NotifyLinkCycle() {
 	if c.dp != nil {

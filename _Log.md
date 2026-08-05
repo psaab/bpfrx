@@ -1,3 +1,65 @@
+## 2026-08-05 — #5103: join the AF_XDP workers BEFORE the RETH MAC link cycle, not after
+
+- **Timestamp**: 2026-08-05 (fix/5103-reth-worker-join)
+- **Action**: Re-verified GENUINE on origin/master first (the file had moved
+  from `daemon_apply.go` to `daemon_apply_dataplane.go`, so the issue's
+  line references were stale but the defect was not): `programRethMAC`
+  runs the DOWN → set-MAC → UP cycle, and only afterwards, on
+  `linkCycled=true`, did the daemon call `PrepareLinkCycle()`. The code's
+  own comment conceded the workers "may have been accessing UMEM during
+  the DOWN/UP".
+  The join cannot simply be hoisted above `programRethMAC`: whether a
+  cycle is needed at all is only knowable by ATTEMPTING the live MAC set,
+  and joining unconditionally would impose a forwarding outage on every
+  RETH MAC apply on the drivers (mlx5, virtio — the cluster's own NICs)
+  that support IFF_LIVE_ADDR_CHANGE and need no cycle. So `programRethMAC`
+  takes a `beforeCycle func() error` hook, invoked on the fallback path
+  only: after the live set has been rejected, and before `setDown`, the
+  first mutation. A rejected live set does not change link state, so on a
+  hook error the function returns with nothing to unwind and the member
+  keeps its previous MAC — recoverable and retried next apply, unlike
+  cycling out from under live workers.
+  `PrepareLinkCycle()` gained an `error` return across the
+  `LinkController` interface and all five implementations. Its
+  `stop_workers` failure path was previously a `slog.Warn` + bare return,
+  which the void signature made invisible to the one caller that had to
+  decide whether the NIC could safely go down.
+  Two things the tests caught in my own work rather than in the original
+  defect. First, propagating the ctrl-disable error short-circuited the
+  worker join — skipping the very join the function exists for whenever
+  the ctrl map was unreadable; the join now always runs. Second, folding
+  that error into the RETURN was an over-rejection: "userspace_ctrl map
+  not loaded" is a legitimate state (no shim attached) in which there is
+  no redirect path for the gate to protect, so failing there would block
+  RETH MAC programming on a healthy deployment. The error contract is now
+  scoped explicitly to the worker join, with the reasoning recorded at the
+  return.
+- **Validation**: five-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile. All five
+  RED: move the join after the cycle (the original inversion); swallow the
+  hook's error so the link cycles anyway; fire the hook on every call
+  (the over-rejection); make `PrepareLinkCycle` swallow the stop_workers
+  failure again; and have the daemon pass `nil` for the hook. That last
+  one is why the structural canary exists — passing `nil` compiles, keeps
+  every producer-side ordering test green, and restores the defect whole.
+  An earlier matrix run had M4 and M6 GREEN, which is what prompted the
+  fail-closed and call-site tests; both are stated-scope rather than
+  claimed complete. Full `go test ./pkg/... ./cmd/...` passes.
+  NOT run: `make test-failover` and any cluster tooling. This touches the
+  RETH/VRRP MAC path, so cluster validation is owed before merge and is
+  scheduled centrally.
+- **File(s)**: `pkg/daemon/daemon_reth.go`,
+  `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/reth_worker_join_order_5103_test.go` (new),
+  `pkg/daemon/reth_hook_wired_5103_test.go` (new),
+  `pkg/daemon/daemon_reth_rename_up_test.go`,
+  `pkg/daemon/policy_scheduler_apply_test.go`,
+  `pkg/dataplane/apply.go`,
+  `pkg/dataplane/userspace/process_linkcycle.go`,
+  `pkg/dataplane/userspace/controllers.go`,
+  `pkg/dataplane/userspace/legacy_dataplane.go`,
+  `pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go` (new), `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

@@ -254,9 +254,14 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		cc := cfg.Chassis.Cluster
 		rethToPhys := cfg.RethToPhysical()
 
-		// PrepareLinkCycle is called on-demand after programRethMAC reports
-		// an actual link DOWN/UP cycle. Most drivers (mlx5, virtio) support
-		// IFF_LIVE_ADDR_CHANGE so no cycle is needed and workers keep running.
+		// #5103: the AF_XDP worker join is handed to programRethMAC as a
+		// beforeCycle hook rather than run after it returns. Whether a cycle
+		// is needed is only knowable by attempting the live MAC set, so the
+		// hook is the only place that both KNOWS a cycle is coming and still
+		// runs before the link is touched. Most drivers (mlx5, virtio)
+		// support IFF_LIVE_ADDR_CHANGE, so the hook never fires and workers
+		// keep running — the cost is paid only on the drivers that force a
+		// cycle.
 
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -282,18 +287,22 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			ensureRethLinkOriginalName(linuxName)
 			setRethIPv6Knobs(linuxName)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-			linkCycled, err := programRethMAC(linuxName, mac)
+			// beforeCycle runs only when a cycle is actually required, and
+			// before the link is touched. Returning an error aborts the MAC
+			// program with the link untouched: the member keeps its previous
+			// MAC (recoverable, and the next apply retries) rather than
+			// cycling out from under live workers (not recoverable).
+			beforeCycle := func() error {
+				if d.dp == nil {
+					return nil
+				}
+				slog.Info("userspace: stopping workers before RETH MAC link cycle",
+					"iface", linuxName)
+				return d.dp.Link().PrepareLinkCycle()
+			}
+			linkCycled, err := programRethMAC(linuxName, mac, beforeCycle)
 			if err != nil {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
-			}
-			if linkCycled && !needLinkCycleRecovery {
-				// First link cycle — stop workers NOW (they may have
-				// been accessing UMEM during the DOWN/UP). The rebind
-				// in NotifyLinkCycle will restart them.
-				if d.dp != nil {
-					slog.Info("userspace: stopping workers after RETH MAC link cycle")
-					d.dp.Link().PrepareLinkCycle()
-				}
 			}
 			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
 			clearDadFailed(linuxName)

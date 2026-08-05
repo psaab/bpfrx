@@ -464,12 +464,15 @@ func (a *LegacyDataPlaneAdapter) RecordDeferredWorkerArmDebt() {
 	m.RecordDeferredWorkerArmDebt()
 }
 
-func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() {
+func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() error {
 	m, err := a.managerOrErr()
 	if err != nil {
-		return
+		// #5103: surface the resolution failure rather than reporting a
+		// successful worker join. A caller that cycles the link on this
+		// return would do so with an unknown worker state.
+		return err
 	}
-	m.PrepareLinkCycle()
+	return m.PrepareLinkCycle()
 }
 
 func (a *LegacyDataPlaneAdapter) RegenerateNeighborSnapshot() {

@@ -235,7 +235,25 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 // programRethMAC sets a deterministic virtual MAC on a RETH member interface.
 // Skips if the interface already has the correct MAC.
 // The interface must be brought DOWN to change its MAC, then back UP.
-func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err error) {
+//
+// beforeCycle (#5103) is invoked at most once, on the ONLY path that cycles the
+// link, and strictly BEFORE the first mutation of that link. It exists because
+// whether a cycle is needed cannot be predicted: the live set is ATTEMPTED
+// first, and only its failure proves the driver lacks IFF_LIVE_ADDR_CHANGE. A
+// rejected live set does not change link state — the kernel refuses the address
+// change outright — so at the moment beforeCycle runs the link is still exactly
+// as it was found, and returning an error from it aborts with nothing to undo.
+//
+// The caller uses this to join the AF_XDP workers. Previously the join happened
+// AFTER programRethMAC returned linkCycled=true, so the workers were still
+// running through the DOWN/UP and could touch UMEM while the NIC unmapped its
+// pages. A nil beforeCycle means "no join needed" and is used by callers with
+// no dataplane attached.
+//
+// On a beforeCycle error programRethMAC returns (false, err) WITHOUT touching
+// the link: leaving the member on its old MAC is recoverable, cycling the link
+// out from under live workers is not.
+func programRethMAC(ifName string, mac net.HardwareAddr, beforeCycle func() error) (linkCycled bool, err error) {
 	ops := rethLinkOpsFn
 	link, err := ops.byName(ifName)
 	if err != nil {
@@ -257,6 +275,15 @@ func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err e
 	// Fallback: bring link down, set MAC, bring back up.
 	slog.Info("RETH MAC requires link cycle (driver does not support live change)",
 		"iface", ifName)
+	// #5103: the worker join belongs HERE — after the live-set attempt has
+	// proven a cycle is unavoidable, and before setDown, the first mutation.
+	// The barrier must precede the NIC queue/link teardown so no thread or DMA
+	// path is using the UMEM/rings the driver is about to unmap.
+	if beforeCycle != nil {
+		if err := beforeCycle(); err != nil {
+			return false, fmt.Errorf("prepare link cycle %s: %w", ifName, err)
+		}
+	}
 	if err := ops.setDown(link); err != nil {
 		return false, fmt.Errorf("link down %s: %w", ifName, err)
 	}

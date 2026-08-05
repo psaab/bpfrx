@@ -27,10 +27,11 @@ func (c userspaceLinkController) RecordDeferredWorkerArmDebt() {
 	}
 }
 
-func (c userspaceLinkController) PrepareLinkCycle() {
+func (c userspaceLinkController) PrepareLinkCycle() error {
 	if c.manager != nil {
-		c.manager.PrepareLinkCycle()
+		return c.manager.PrepareLinkCycle()
 	}
+	return nil
 }
 
 func (c userspaceLinkController) NotifyLinkCycle() {
