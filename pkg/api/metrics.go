@@ -52,23 +52,25 @@ type xpfCollector struct {
 	// xpf_screen_drops_total above cannot answer "which screen fired?"; this
 	// labeled series can, now that the userspace bridge populates the per-reason
 	// GlobalCtrScreen* counters.
-	screenDropsByReasonTotal    *prometheus.Desc
-	policyDeniesTotal           *prometheus.Desc
-	natAllocFailsTotal          *prometheus.Desc
-	nat64XlateTotal             *prometheus.Desc
-	hostInboundDeny             *prometheus.Desc
-	hostInboundKernelDenies     *prometheus.Desc
-	hostInboundJunosHostDenies  *prometheus.Desc
-	hostInboundICMPNDAccept     *prometheus.Desc
-	hostInboundAddresslessZones *prometheus.Desc
-	hostInboundAddresslessIface *prometheus.Desc
-	hostInboundAmbiguousAddrs   *prometheus.Desc
-	lo0CounterHits              *prometheus.Desc
-	pbrRulesInstalled           *prometheus.Desc
-	pbrDegradedTerms            *prometheus.Desc
-	tcEgressPacketsTotal        *prometheus.Desc
-	syncookieTotal              *prometheus.Desc
-	flowCacheTotal              *prometheus.Desc
+	screenDropsByReasonTotal *prometheus.Desc
+	// #5806: unresolved screen-profile references (see the descriptor).
+	screenUnresolvedProfileZones *prometheus.Desc
+	policyDeniesTotal            *prometheus.Desc
+	natAllocFailsTotal           *prometheus.Desc
+	nat64XlateTotal              *prometheus.Desc
+	hostInboundDeny              *prometheus.Desc
+	hostInboundKernelDenies      *prometheus.Desc
+	hostInboundJunosHostDenies   *prometheus.Desc
+	hostInboundICMPNDAccept      *prometheus.Desc
+	hostInboundAddresslessZones  *prometheus.Desc
+	hostInboundAddresslessIface  *prometheus.Desc
+	hostInboundAmbiguousAddrs    *prometheus.Desc
+	lo0CounterHits               *prometheus.Desc
+	pbrRulesInstalled            *prometheus.Desc
+	pbrDegradedTerms             *prometheus.Desc
+	tcEgressPacketsTotal         *prometheus.Desc
+	syncookieTotal               *prometheus.Desc
+	flowCacheTotal               *prometheus.Desc
 
 	// #3345/#3408: monotonic count of counter reads that failed during a
 	// scrape, across the global, per-zone, per-policy, and per-filter dataplane
@@ -626,6 +628,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.sessionsClosedTotal
 	ch <- c.screenDropsTotal
 	ch <- c.screenDropsByReasonTotal
+	ch <- c.screenUnresolvedProfileZones
 	ch <- c.policyDeniesTotal
 	ch <- c.natAllocFailsTotal
 	ch <- c.nat64XlateTotal
@@ -1081,6 +1084,16 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// independent of dataplane load, so emit it BEFORE the dataplane gate — the
 	// window can be open in a config-only / degraded boot too, and that is exactly
 	// when it must stay visible.
+	// #5806: zones whose configured screen profile does NOT resolve. The active
+	// config claims a screen is attached while the dataplane enforces none of it
+	// (tolerant load / HA config-sync / rolling upgrade can reach this state),
+	// and until now a rate-limited runtime WARN was the ONLY signal — the issue's
+	// acceptance criterion is explicitly that one warning must not be the sole
+	// signal. Config-derived and independent of dataplane load, so emit it BEFORE
+	// the dataplane gate: a config-only / degraded boot is exactly when an
+	// unenforced security control must stay visible.
+	c.collectScreenUnresolvedProfileZones(ch)
+
 	c.collectHostInboundAddresslessZones(ch)
 
 	// #3710: the per-interface/per-family refinement of the addressless-zone

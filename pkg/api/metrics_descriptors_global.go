@@ -66,6 +66,33 @@ func (c *xpfCollector) initGlobalDescriptors() {
 		"Total packets dropped by screen/IDS checks, by reason.",
 		[]string{"reason"}, nil,
 	)
+	// #5806: 1 per zone whose configured `screen ids-option` profile does NOT
+	// resolve to a defined profile. Strict commit rejects a dangling reference,
+	// but tolerant startup/recovery, HA config-sync from a schema-skewed peer,
+	// and rolling-upgrade intervals all downgrade it to a warning — and the
+	// dataplane then enforces NONE of that zone's screen checks (LAND, fragment,
+	// source-route, SYN/ICMP/UDP flood, scan/sweep, session-limit) while the
+	// active config still claims a screen is attached.
+	//
+	// The `disposition` label reports what the dataplane does with such a zone
+	// TODAY — `not-enforced-pass`, i.e. packets are passed unscreened. It is a
+	// factual statement of current behaviour, deliberately NOT a decision about
+	// the eventual fail-closed-vs-pass posture, which is the open design fork
+	// #5806 owns. If that posture changes, this label changes with it, and the
+	// series keeps meaning "the reference is unresolved" either way.
+	//
+	// Config-derived (no dataplane dependency), emitted BEFORE the dataplane gate
+	// in Collect. The series is present ONLY while a reference is unresolved
+	// (absent = every configured screen resolves), so `max_over_time(...)` alerts
+	// on any zone that was ever left unscreened.
+	c.screenUnresolvedProfileZones = prometheus.NewDesc(
+		"xpf_screen_unresolved_profile_zones",
+		"1 while a security zone references a screen ids-option profile that is "+
+			"not defined, so none of that zone's screen checks are enforced; "+
+			"labeled by zone, the referenced profile name, and the dataplane's "+
+			"current disposition for such a zone.",
+		[]string{"zone", "profile", "disposition"}, nil,
+	)
 	c.policyDeniesTotal = prometheus.NewDesc(
 		"xpf_policy_denies_total",
 		"Total packets denied by policy.",

@@ -1,3 +1,63 @@
+## 2026-08-05 — #5806: expose unresolved screen-profile references (metric + status)
+
+- **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility)
+- **Action**: Drove the POSTURE-INDEPENDENT half of #5806 — acceptance criterion
+  4, "runtime status and Prometheus expose the unresolved reference and
+  enforcement disposition; one warning is not the sole signal". STEP-0 against
+  origin/master ad9591177 found the criterion genuinely unmet: the missing-
+  profile set exists on the wire (`ConfigSnapshot.ScreenMissingProfiles`,
+  produced by `buildScreenMissingProfileRefs`) and drives a rate-limited runtime
+  WARN in the Rust screen runtime, but `git grep -ln screen_missing_profile_zones`
+  returns only pkg/dataplane/userspace/protocol.go and userspace-dp/** — NOTHING
+  in pkg/api, pkg/grpcapi or pkg/cli. So the WARN was the sole signal, which the
+  issue explicitly says is insufficient. Also confirmed #3082/#3908/#3066 are all
+  CLOSED, so the deferred fail-closed-vs-pass posture the screen/mod.rs:48-52
+  comment names as "the /research half of #3082" is orphaned and #5806 owns it.
+  Deliberately did NOT pick that posture.
+  Exported `ScreenMissingProfileRefs` as the shared SSOT (thin wrapper over the
+  existing snapshot builder, so the metric reports the exact set published to the
+  helper rather than a re-derived predicate) plus `ScreenUnresolvedProfileLines`
+  for the operator status block. Added the Prometheus gauge
+  `xpf_screen_unresolved_profile_zones{zone,profile,disposition}`, emitted BEFORE
+  the dataplane gate like its config-derived sibling
+  `collectHostInboundAddresslessZones` (the pattern this deliberately copies,
+  including its "same builder the daemon logs from" no-drift discipline). Wired
+  the status block into BOTH `show security screen` renderers. The important
+  placement detail: both renderers early-return "No screen profiles configured"
+  when `cfg.Security.Screen` is empty, which is EXACTLY the tolerant-load shape
+  that strands a reference — profile definitions gone, zone still claiming one —
+  so the block must be emitted BEFORE that return or the worst case reads as
+  "nothing was asked for". The `disposition` label reports today's behaviour
+  (`not-enforced-pass`) as a fact, not as a decision.
+- **Validation**: two mutations, each with `go build` + `go vet` rc=0 first so the
+  RED is an assertion. (1) Moving the collector BELOW the `dp == nil ||
+  !dp.IsLoaded()` gate empties the series on a config-only boot →
+  TestScreenUnresolvedProfileZonesEmittedOnTolerantLoad RED. (2) Moving the
+  status block inside the empty-Screen `else` → TestShowScreenReportsUnresolved-
+  ReferenceWithNoProfilesDefined RED. Restored + `touch`ed; GREEN both times.
+  Each guard is paired with a negative control (resolved reference emits nothing
+  / renders nothing) so neither can pass by firing unconditionally.
+  The pkg/api fixture reaches the defect through the REAL tolerant path rather
+  than faking it: strict commit rejects the dangling reference outright (verified
+  firsthand — "security zone \"trust\" references undefined screen profile"), so
+  the test commits a VALID config, externally modifies the persisted active.json
+  so the profile DEFINITION no longer parses (the `ids-option` path token occurs
+  exactly once and is renamed) while the zone's reference survives, then re-Loads
+  through `store.Load()`. The fixture asserts its own assumption (`ids-option`
+  count == 1) so it fails loudly rather than silently testing nothing if the
+  persisted shape changes. `go test ./...` exit 0; gofmt clean on every touched
+  file (5 pre-existing gofmt violations in pkg/dataplane/userspace/*_test.go are
+  untouched by this branch).
+- **File(s)**: `pkg/dataplane/userspace/screens.go`,
+  `pkg/dataplane/userspace/screens_unresolved_5806_test.go`,
+  `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_global.go`,
+  `pkg/api/metrics_screen_unresolved_5806_test.go`,
+  `pkg/cli/cli_show_security_screen.go`,
+  `pkg/grpcapi/server_show_security_text.go`,
+  `pkg/grpcapi/server_show_screen_unresolved_5806_test.go`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

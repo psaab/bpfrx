@@ -8,6 +8,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 )
 
@@ -16,6 +17,17 @@ func (c *CLI) showScreen() error {
 	if cfg == nil {
 		fmt.Println("no active configuration")
 		return nil
+	}
+
+	// #5806: report unresolved screen-profile references FIRST. A zone can
+	// claim a profile that is not defined (tolerant load / HA config-sync /
+	// rolling upgrade — strict commit rejects it, those paths only warn), and
+	// the dataplane then enforces NONE of that zone's screen checks. The
+	// early return below is the worst case for exactly this: when the profile
+	// definitions are absent entirely, it prints "No screen profiles
+	// configured" and returns, so the stranded reference is never mentioned.
+	for _, line := range dpuserspace.ScreenUnresolvedProfileLines(cfg) {
+		fmt.Println(line)
 	}
 
 	if len(cfg.Security.Screen) == 0 {

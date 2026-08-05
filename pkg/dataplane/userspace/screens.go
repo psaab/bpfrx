@@ -112,6 +112,59 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 	return out
 }
 
+// ScreenMissingProfileRefs is the EXPORTED single source of truth for "which
+// zones claim a screen profile that is not defined" (#5806). It is the same
+// function that builds ConfigSnapshot.ScreenMissingProfiles for the dataplane,
+// so the Prometheus series, the `show security screen` status line, and the
+// dataplane's runtime WARN are all derived from ONE computation and cannot
+// disagree about which references are unresolved — the same SSOT discipline
+// AddresslessEnforcingZones/Interfaces use for their metrics.
+//
+// Deriving these observability surfaces from the config is correct rather than a
+// desired-vs-applied gap: the defect this exposes is precisely that the ACTIVE
+// CONFIG claims a screen is attached while nothing enforces it, so the config is
+// the authoritative statement of the unresolved reference. Reusing this exact
+// builder (rather than re-deriving the predicate) additionally guarantees the
+// metric reports the same set that was published to the helper.
+func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
+	return buildScreenMissingProfileRefs(cfg)
+}
+
+// ScreenUnresolvedProfileLines renders the operator-facing status block for
+// every zone whose configured screen profile does not resolve (#5806). Returns
+// nil when every reference resolves, so a caller can append unconditionally.
+//
+// It exists so the local-CLI and gRPC `show security screen` renderers emit ONE
+// wording from ONE predicate — the same no-drift discipline
+// config.ScreenEnabledCheckList enforces for the enabled-check inventory. Both
+// renderers otherwise early-return "No screen profiles configured" when
+// cfg.Security.Screen is empty, which is EXACTLY the tolerant-load shape that
+// strands a zone's screen reference: the profile definitions are gone, the zone
+// still claims one, and the operator is told there is simply nothing configured.
+// Callers must therefore emit these lines BEFORE that early return.
+//
+// The disposition sentence states what the dataplane does with such a zone
+// TODAY (the verdict stays Pass, so traffic is forwarded unscreened). It does
+// not assert what it SHOULD do — the fail-closed-vs-pass posture is the open
+// design decision #5806 owns.
+func ScreenUnresolvedProfileLines(cfg *config.Config) []string {
+	refs := ScreenMissingProfileRefs(cfg)
+	if len(refs) == 0 {
+		return nil
+	}
+	lines := make([]string, 0, len(refs)+2)
+	lines = append(lines, "Unresolved screen profile references:")
+	for _, r := range refs {
+		lines = append(lines,
+			fmt.Sprintf("  Zone %s references undefined screen profile '%s' "+
+				"— NONE of this zone's screen checks are enforced", r.Zone, r.Profile))
+	}
+	lines = append(lines,
+		"  Disposition: traffic for these zones is currently forwarded UNSCREENED. "+
+			"Define the profile, or remove the reference, to restore enforcement.")
+	return lines
+}
+
 // buildScreenMissingProfileRefs records every zone that REFERENCES a screen
 // profile which is NOT defined in the config (#3082). buildScreenSnapshots
 // silently skips these zones (`sp == nil`), so without this the dataplane
@@ -120,6 +173,9 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 // lenient/HA-sync path where a dangling screen reference loads with only an
 // apply-time warning. The dataplane uses this to emit a rate-limited runtime
 // WARN; the verdict stays Pass (the fail-closed posture is deferred).
+//
+// #5806: exported through ScreenMissingProfileRefs so the observability
+// surfaces share this computation instead of re-deriving the predicate.
 func buildScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
