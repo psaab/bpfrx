@@ -1,3 +1,60 @@
+## 2026-08-05 — #4626 L01: stop rendering `policy_id` 0 as the first configured policy
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero)
+- **Action**: `policy_id` 0 is overloaded — `compilePolicies` assigns
+  `policySetID*MaxRulesPerPolicy + i`, so the first rule of the first
+  zone-pair really is id 0, while the userspace dataplane stamps 0 on
+  every session no policy admitted (host-inbound, neighbor-seed, fabric,
+  tunnel, all pre-#3056 sessions, and every session synced from an older
+  HA peer during a rolling upgrade — that last one is the peer's whole
+  table). Six session-row render sites indexed
+  `CompileResult.PolicyNames` directly, so all of those sessions were
+  reported as admitted by whichever policy happens to be configured
+  first. Added `dataplane.SessionPolicyName`, which takes both reserved
+  ids (0 and `DefaultPolicySentinelID`) before consulting the map, and
+  routed all six sites through it: `pkg/cli/cli_show_flow.go` printV4 and
+  printV6, `pkg/api/sessions.go` sessionEntryV4/V6, and
+  `pkg/grpcapi/server_sessions.go` sessionEntryV4/V6. The REST and gRPC
+  sites had no numeric fallback at all, so the wrong NAME was emitted
+  unconditionally into a structured field automation reads.
+  Chose a render-side guard over reserving the id space. Reserving is
+  what the issue's L01 text asks for, but it is a cross-plane change
+  (userspace-dp `policy.rs`, the #3056 stamping path, runtime-id
+  assignment, HA wire compatibility) with no approved research plan, and
+  it would NOT repair the case that matters most: an older peer keeps
+  sending a bare 0 through the whole upgrade window, so a render-side
+  guard is required either way and is not made redundant by that work.
+  Rendering 0 as `unattributed` is deliberately an UNDER-claim — the wire
+  value is ambiguous, so every rendering is wrong for one of the two
+  populations, and under-claiming is the safer error on a security
+  surface. It is also the direction the codebase already chose for this
+  identical overload on the behavioral path (`deletedPolicyRuntimeIDs`
+  excludes id 0 as a documented "fail-SAFE under-clear"). The numeric id
+  is still printed beside the name on every surface.
+  Scope note recorded in the code and the PR: this does NOT reserve the
+  id space, so it does not close L01 as the issue words it — it removes
+  the misattribution symptom and leaves the id-space work outstanding.
+- **Validation**: seven-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, each mutant required to compile so no RED is
+  a build break. All seven RED: reverting the CLI pair, the REST pair,
+  the gRPC pair, and all six at once; rewriting the guard to look the map
+  up FIRST and fall back (the plausible "cleanup" that looks like a guard
+  and guards nothing); dropping the reserved-zero arm; and blanking every
+  policy name (caught by the positive controls). The CLI pair is caught
+  only by the AST canary — those two sites are closures printing to real
+  stdout behind a live dataplane, which is stated as the canary's reason
+  to exist rather than left implicit. Full `pkg/dataplane`, `pkg/api`,
+  `pkg/grpcapi`, `pkg/cli`, `pkg/daemon`, `pkg/logging` and
+  `pkg/refactoraudit` suites pass; no existing golden asserted the old
+  attribution.
+- **File(s)**: `pkg/dataplane/policy_display.go` (new),
+  `pkg/dataplane/policy_display_4626_test.go` (new),
+  `pkg/cli/cli_show_flow.go`, `pkg/api/sessions.go`,
+  `pkg/api/sessions_policy_id_zero_4626_test.go` (new),
+  `pkg/grpcapi/server_sessions.go`,
+  `pkg/grpcapi/server_sessions_policy_id_zero_4626_test.go` (new),
+  `docs/junos-cli-reference.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

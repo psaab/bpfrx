@@ -1693,14 +1693,15 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		outIf = zoneNames[val.EgressZone]
 	}
 	se := &pb.SessionEntry{
-		SrcAddr:          net.IP(key.SrcIP[:]).String(),
-		DstAddr:          net.IP(key.DstIP[:]).String(),
-		SrcPort:          uint32(ntohs(key.SrcPort)),
-		DstPort:          uint32(ntohs(key.DstPort)),
-		Protocol:         protoName(key.Protocol),
-		State:            sessionStateName(val.State),
-		PolicyId:         val.PolicyID,
-		PolicyName:       policyNames[val.PolicyID],
+		SrcAddr:  net.IP(key.SrcIP[:]).String(),
+		DstAddr:  net.IP(key.DstIP[:]).String(),
+		SrcPort:  uint32(ntohs(key.SrcPort)),
+		DstPort:  uint32(ntohs(key.DstPort)),
+		Protocol: protoName(key.Protocol),
+		State:    sessionStateName(val.State),
+		PolicyId: val.PolicyID,
+		// #4626: reserved ids must not be resolved through the compiled map.
+		PolicyName:       dataplane.SessionPolicyName(policyNames, val.PolicyID),
 		IngressZone:      uint32(val.IngressZone),
 		EgressZone:       uint32(val.EgressZone),
 		IngressZoneName:  zoneNames[val.IngressZone],
@@ -1746,14 +1747,15 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		outIf = zoneNames[val.EgressZone]
 	}
 	se := &pb.SessionEntry{
-		SrcAddr:          net.IP(key.SrcIP[:]).String(),
-		DstAddr:          net.IP(key.DstIP[:]).String(),
-		SrcPort:          uint32(ntohs(key.SrcPort)),
-		DstPort:          uint32(ntohs(key.DstPort)),
-		Protocol:         protoName(key.Protocol),
-		State:            sessionStateName(val.State),
-		PolicyId:         val.PolicyID,
-		PolicyName:       policyNames[val.PolicyID],
+		SrcAddr:  net.IP(key.SrcIP[:]).String(),
+		DstAddr:  net.IP(key.DstIP[:]).String(),
+		SrcPort:  uint32(ntohs(key.SrcPort)),
+		DstPort:  uint32(ntohs(key.DstPort)),
+		Protocol: protoName(key.Protocol),
+		State:    sessionStateName(val.State),
+		PolicyId: val.PolicyID,
+		// #4626: reserved ids must not be resolved through the compiled map.
+		PolicyName:       dataplane.SessionPolicyName(policyNames, val.PolicyID),
 		IngressZone:      uint32(val.IngressZone),
 		EgressZone:       uint32(val.EgressZone),
 		IngressZoneName:  zoneNames[val.IngressZone],

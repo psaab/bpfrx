@@ -148,6 +148,23 @@ Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA St
   - `HA State: Active|Backup`
   - `Timeout: <seconds>`
   - `Session State: Valid|Invalid`
+- **Two policy indexes are RESERVED and do not name a configured policy**
+  (#4626). The index is always printed, so nothing is hidden:
+  - `unattributed/0` — no configured policy admitted this session.
+    Index `0` is carried by host-inbound, neighbor-seed, fabric and tunnel
+    installs, by any pre-#3056 session, and by every session synced from an
+    older HA peer during a rolling upgrade. It is ALSO the index of the
+    literal first configured policy, so the value is genuinely ambiguous on
+    the wire; the display deliberately under-claims rather than naming a
+    real rule that may never have seen the traffic. Retiring the overload
+    (reserving the id space so real policies start at 1) is the remaining
+    half of #4626.
+  - `default-policy/4294967295` — the implicit `security policies
+    default-policy` verdict admitted or denied this session, not a
+    configured rule (#3057).
+  The same two reserved indexes appear as `policy_name` on the REST
+  `/sessions` and gRPC `GetSessions` surfaces, which carry `policy_id`
+  alongside.
 - **In/Out lines:** Indented 2 spaces.
   - `In: <src_ip>/<src_port> --> <dst_ip>/<dst_port>;<proto>, Conn Tag: 0x0, If: <interface>, Pkts: <N>, Bytes: <N>, `
   - Note the trailing comma+space after Bytes value.
