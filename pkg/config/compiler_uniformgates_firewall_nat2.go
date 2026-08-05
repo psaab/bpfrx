@@ -210,8 +210,10 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// lenient on load / peer-sync (warn — #1960 no-brick). What happens on that
 	// tolerant path differs per shape: a contradiction CONTAINING `off`
 	// resolves to the EXEMPTION via `off` precedence; a contradiction WITHOUT
-	// `off` (source-NAT `interface` + `pool`) resolves to interface
-	// translation, silently discarding the pool; an actionless rule FALLS
+	// `off` (source-NAT `interface` + `pool`) gives INTERFACE MODE precedence,
+	// producing interface translation when a suitable same-family egress
+	// address exists and a fail-closed `Unavailable` otherwise, silently
+	// discarding the pool either way; an actionless rule FALLS
 	// THROUGH to a later broader rule. All three are spelled out and test-cited
 	// on validateNATTerminalActionCardinalityStrict (#5717). Do not restate
 	// them as "inert", and do not compress them to "a contradiction resolves to

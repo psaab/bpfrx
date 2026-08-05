@@ -77203,3 +77203,37 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/config/compiler_validate_strict_nat.go,
   pkg/config/compiler_uniformgates_firewall_nat2.go, docs/config-schema.md,
   userspace-dp/src/nat/tests_source.rs, _Log.md
+
+- **Timestamp**: 2026-08-05
+- **Action**: #6820 re-gate fold (MERGE-NEEDS-MINOR; "Compiled-output/enforcement
+  findings: none"). Three prose defects, all the same family the PR exists to
+  remove — a comment asserting something the code does not do. (1) "resolves to
+  INTERFACE TRANSLATION" was unqualified: interface mode takes PRECEDENCE, but
+  translation additionally requires a same-family egress address; without one the
+  matcher returns Unavailable(InterfaceNoEgressAddress) — the #5688 fail-closed
+  belt that refuses to forward untranslated. Reworded at all three sites to
+  "precedence, producing translation when a suitable egress address exists and a
+  fail-closed Unavailable otherwise". (2) "the snapshot builders forward them all"
+  is FALSE for destination NAT: nat_destination.go short-circuits on isOff, skips
+  pool resolution and publishes a pool-less Off=true entry — the outcome is right
+  but the stated mechanism is not, which is precisely the defect already fixed
+  once here; the comment now describes the two builders' DIFFERENT routes and
+  warns against the collapsed phrasing. (3) the brace citation
+  off_wins_over_contradictory_{interface,pool,all_three}_action_5717 expands to a
+  symbol that does not exist (the real name is off_wins_over_all_three_actions_
+  5717); replaced with the three literal names — a citation that reads as verified
+  and resolves to nothing is worse than none. Also closed the two coverage gaps
+  the gate recorded but did not require. Validation: mutation hoisting a
+  triple-action early return ABOVE `rule.matches(...)` passes the matching
+  assertion and fails the new NON-MATCHING control (an exemption widened past the
+  rule's prefix would un-NAT uncovered sources); mutation dropping PoolName
+  whenever InterfaceMode is set fails the new Go `interface+pool` sub-test with
+  PoolName="" — the Rust precedence test cannot catch that one because interface
+  mode wins either way, which is exactly why the Go-side binding was needed. Both
+  vet-clean. Tests and comments only, no production change. `go test
+  ./pkg/config/... ./pkg/dataplane/...` exit 0; `cargo test --bins` exit 0,
+  4239 passed, no #6819 flake this run.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go, docs/config-schema.md,
+  pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
+  userspace-dp/src/nat/tests_source.rs, _Log.md

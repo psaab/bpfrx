@@ -1039,4 +1039,28 @@ fn off_wins_over_all_three_actions_5717() {
          here means the authored exemption published as a translation on a shape \
          the pairwise tests cannot see"
     );
+
+    // NON-MATCHING control. Without this, a triple-action early return placed
+    // ABOVE `rule.matches(...)` would satisfy the assertion above while
+    // exempting traffic OUTSIDE the rule's match prefix — an exemption is a
+    // no-translate decision, so widening one silently un-NATs sources the rule
+    // never covered. Asserting `None` here forces the triple-action handling to
+    // stay INSIDE the match gate.
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            // Outside 10.0.61.0/24.
+            "10.0.99.7".parse().expect("src outside match"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        None,
+        "a source OUTSIDE the rule's match prefix must not match at all — if this \
+         reports an exemption, the three-action handling was hoisted above the \
+         match gate and now un-NATs traffic the rule never covered"
+    );
 }

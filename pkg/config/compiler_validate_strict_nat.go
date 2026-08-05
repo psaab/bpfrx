@@ -2763,21 +2763,32 @@ func natThenTerminalActionCount(then NATThen) int {
 //
 //   - CONTRADICTORY (2+ actions) CONTAINING `off`: resolves to the EXEMPTION,
 //     never the inverse. The rule records EVERY field (the else-if→if setter
-//     change) and the snapshot builders forward them all, so `off` precedence
-//     governs. That precedence is the whole safety argument, so it is pinned on
-//     both sides: in Go by TestTolerantContradictory{SNAT,DNAT}*_5717
-//     (pkg/dataplane/userspace) and in Rust by
-//     off_wins_over_contradictory_{interface,pool,all_three}_action_5717
+//     change). The two builders then reach that outcome by DIFFERENT routes,
+//     and the difference matters: source NAT forwards all three fields and lets
+//     the Rust matcher's `off` precedence decide (nat_source.go), whereas
+//     destination NAT decides in Go — `nat_destination.go` short-circuits on
+//     `isOff`, skips pool resolution entirely, and publishes a pool-less
+//     `Off=true` entry. Do not describe this as "the builders forward
+//     everything": that is true of SNAT only, and a justification naming a
+//     mechanism the code does not use is the exact defect this comment exists
+//     to remove. Pinned on both sides: in Go by
+//     TestTolerantContradictory{SNAT,DNAT}*_5717 (pkg/dataplane/userspace) and
+//     in Rust by off_wins_over_contradictory_interface_action_5717,
+//     off_wins_over_contradictory_pool_action_5717, and
+//     off_wins_over_all_three_actions_5717 (nat/tests_source.rs).
 //
-//   - CONTRADICTORY WITHOUT `off` — source NAT `interface` + `pool` — resolves
-//     to INTERFACE TRANSLATION, not to an exemption. There is no `off` to take
-//     precedence, and the Rust matcher checks off → interface_mode → pool_mode
-//     in that order (nat/source.rs), so the authored `pool` is silently
-//     discarded in favour of interface SNAT. This is still a malformed rule the
-//     strict gate rejects; it is called out because "a contradiction resolves
-//     to the exemption" is TRUE ONLY when the contradiction contains `off`, and
-//     stating it unqualified is the same untested-safety-claim defect this
-//     comment exists to remove. Pinned by
+//   - CONTRADICTORY WITHOUT `off` — source NAT `interface` + `pool`: INTERFACE
+//     MODE takes precedence, producing interface translation when the egress
+//     interface has a suitable same-family address and an `Unavailable`
+//     (fail-closed) result otherwise — the matcher returns
+//     `InterfaceNoEgressAddress` rather than forwarding untranslated
+//     (nat/source.rs, the #5688 belt). Either way the authored `pool` is
+//     silently discarded, because the matcher checks off → interface_mode →
+//     pool_mode in that order and there is no `off` here to take precedence.
+//     This is still a malformed rule the strict gate rejects; it is called out
+//     because "a contradiction resolves to the exemption" is TRUE ONLY when the
+//     contradiction contains `off`, and stating it unqualified is the same
+//     untested-safety-claim defect. Pinned by
 //     interface_wins_over_pool_without_off_5717.
 //     (userspace-dp/src/nat/tests_source.rs). Note the DNAT precedence is
 //     decided in Go (the `isOff` short-circuit in nat_destination.go) and the

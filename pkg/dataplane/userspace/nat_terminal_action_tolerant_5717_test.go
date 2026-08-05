@@ -147,6 +147,47 @@ security {
 		}
 	})
 
+	t.Run("hierarchical single-node interface+pool (no off)", func(t *testing.T) {
+		// The Rust-side counterpart (interface_wins_over_pool_without_off_5717)
+		// constructs its snapshot DIRECTLY, so it cannot see a Go edit that
+		// drops PoolName whenever InterfaceMode is true — the Rust test would
+		// still pass, because interface mode wins there either way. This
+		// sub-test is what binds the Go builder: both fields must survive
+		// compile -> snapshot, so the contradiction stays visible to `show`,
+		// to the strict gate, and to anyone reading the published rule.
+		cfg := compileHierLenient5717(t, `
+security {
+  nat {
+    source {
+      pool p1 { address 203.0.113.10; }
+      rule-set rs1 {
+        from zone trust;
+        to zone untrust;
+        rule r1 {
+          match { source-address 10.0.0.0/24; }
+          then { source-nat { interface; pool p1; } }
+        }
+      }
+    }
+  }
+}`)
+		s := sourceSnapByName5717(t, buildSourceNATSnapshots(cfg, nil), "r1")
+		if !s.InterfaceMode {
+			t.Errorf("`interface; pool` snapshot InterfaceMode = false, want true: %+v", s)
+		}
+		if s.PoolName != "p1" {
+			t.Errorf("`interface; pool` snapshot PoolName = %q, want p1 — dropping the "+
+				"pool here hides the contradiction from the published rule; the Rust "+
+				"precedence test cannot catch it because interface mode wins regardless",
+				s.PoolName)
+		}
+		if s.Off {
+			t.Errorf("`interface; pool` snapshot Off = true, want false — there is no "+
+				"`off` in this rule and inventing one would flip a translation into an "+
+				"exemption: %+v", s)
+		}
+	})
+
 	t.Run("hierarchical single-node interface+off", func(t *testing.T) {
 		cfg := compileHierLenient5717(t, `
 security {

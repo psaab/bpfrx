@@ -3106,11 +3106,14 @@ there very differently, and the difference is load-bearing:
   `off_rule_short_circuits_translation` does NOT cover this — its rule sets
   `off` alone, so it stays green under a mutation that lets `interface` win.
 
-- **Contradictory WITHOUT `off` resolves to INTERFACE TRANSLATION.** Source NAT
+- **Contradictory WITHOUT `off` gives INTERFACE MODE precedence.** Source NAT
   also admits `interface` + `pool`, which carries no `off` to take precedence.
   The Rust matcher checks `off` -> `interface_mode` -> `pool_mode` in that order
-  (`nat/source.rs`), so interface SNAT wins and the authored pool is silently
-  discarded. "A contradiction resolves to the exemption" is therefore true ONLY
+  (`nat/source.rs`), so interface mode wins and the authored pool is silently
+  discarded. That produces interface translation when the egress interface has a
+  suitable same-family address, and a fail-closed `Unavailable`
+  (`InterfaceNoEgressAddress`) when it does not — the #5688 belt, which refuses
+  to forward untranslated rather than leaking the private source. "A contradiction resolves to the exemption" is therefore true ONLY
   of the `off`-bearing case; stating it unqualified is the same
   untested-safety-claim defect this section documents. Pinned by
   `interface_wins_over_pool_without_off_5717`. Note a claim quantified over
