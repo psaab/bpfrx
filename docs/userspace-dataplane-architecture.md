@@ -917,12 +917,21 @@ Scope of the fallback:
   ledger adds is the enforcement: the gate now covers BOTH arms, so the
   pre-existing case is closed rather than merely narrowed.
 
-- A row that exists carrying `zone_id == 0` still stays 0, so for every ifindex
-  that HAS an egress row the resolved to-zone is bit-identical to the pre-#6713
-  read. That short-circuit is **load-bearing, not defensive**: a zoned trunk
-  with a declared but unzoned unit 0 (`ge-0/0/9` zoned `lan`, `ge-0/0/9.0` in no
-  zone, both MAC-ful, both ifindex 90) must resolve 0, and
+- A row that exists carrying `zone_id == 0` still stays 0. That short-circuit is
+  **load-bearing, not defensive**: a zoned trunk with a declared but unzoned
+  unit 0 (`ge-0/0/9` zoned `lan`, `ge-0/0/9.0` in no zone, both MAC-ful, both
+  ifindex 90) must resolve 0, and
   `unzoned_interface_with_egress_row_stays_zone_zero_6713` reds on its removal.
+
+  For an ifindex that HAS an egress row the resolved to-zone is **not**
+  universally bit-identical to the pre-#6713 read, and an earlier revision of
+  this section wrongly claimed it was. It is bit-identical for every ifindex
+  whose rows AGREE — which is every ordinary single-unit interface, and so the
+  overwhelming majority — and it is deliberately DIFFERENT where they disagree.
+  `[Z, 0, Z]` is the direct counterexample: the pre-#6713 read returned the last
+  row's `Z`, the ledger returns `0`. That change IS the point of #6722, not an
+  incidental side effect, and it is the one case where an egress-row interface's
+  adjudicated to-zone moves.
 
   Before #6722 B1 that outcome held only by EMISSION-ORDER luck — the unzoned
   unit-0 row happened to be written last, so 0 won the last-write. Reverse the
@@ -959,8 +968,11 @@ where the code previously saw 0 changes more than the policy verdict. All are
 correct-direction — the zone the operator configured is finally the zone the
 dataplane uses — but they are behavior changes on a LAN→tunnel flow and are
 listed here so a bisect does not have to rediscover them. Every entry is scoped
-to an **unambiguous** ifindex; an ambiguous one still resolves 0, so none of
-these fire for it and its behaviour is bit-identical to pre-#6713:
+to an **unambiguous** ifindex: an ambiguous one resolves 0, so none of these
+fire for it. Note that "resolves 0" is only bit-identical to pre-#6713 for an
+ambiguous ifindex with NO egress row; one that HAS an egress row previously
+resolved whichever zone `populate_egress` wrote last, so for it this is a
+deliberate change (see the `[Z, 0, Z]` counterexample above):
 
 - **Source-NAT rule-set scoping** and the `MissingNeighborSeed` metadata now see
   the tunnel's zone; a rule-set scoped `to zone <vpn>` fires where it did not.

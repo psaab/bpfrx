@@ -153,8 +153,22 @@ pub(in crate::afxdp) struct ForwardingState {
     ///
     /// Built in `forwarding_build::interfaces::populate_interfaces` from the
     /// same validated `zone_name_to_id` lookup, over ALL rows (zoned and
-    /// unzoned alike) rather than only the zoned ones. Read only by
-    /// [`ForwardingState::egress_zone_id`].
+    /// unzoned alike) rather than only the zoned ones. Read by BOTH arms of the
+    /// egress resolver: [`ForwardingState::egress_zone_id`]'s fallback, and
+    /// `forwarding_build::interfaces::populate_egress`, which sources each
+    /// `EgressInterface::zone_id` from here rather than from the row (#6722 B1
+    /// — `state.egress` is written last-write-wins per ifindex, so a row-sourced
+    /// zone let the final row re-arm an ifindex this ledger holds ambiguous).
+    ///
+    /// TEST-SCOPE LIMIT, recorded rather than left to be discovered. No public
+    /// test can distinguish an erroneous re-arm to `Some(0)` from a genuine
+    /// conflict: the flush omits BOTH from the map, and `egress_zone_id` ends in
+    /// `.unwrap_or(0)`, so both resolve to the same 0. The observable SECURITY
+    /// property — an ambiguous ifindex never adjudicates a zone — is pinned in
+    /// both arms, but this internal representation is not exhaustively
+    /// mutation-tested, and a mutation that turns a conflict into `Some(0)` will
+    /// not red. Anyone tightening this map should add an accessor before
+    /// relying on the distinction.
     pub(in crate::afxdp) ifindex_unambiguous_zone_id: FastMap<i32, u16>,
     pub(in crate::afxdp) zone_name_to_id: FastMap<String, u16>,
     pub(in crate::afxdp) zone_id_to_name: FastMap<u16, String>,

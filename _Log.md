@@ -66789,3 +66789,47 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: userspace-dp/src/afxdp/poll_descriptor/filter.rs,
   userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-05 13:30
+- **Action**: #6722 round 8 — gate MERGE-NEEDS-MINOR at ad4f0c113, NO runtime
+  findings ("wording/test-scope issues, not runtime failures"). Text only; no
+  logic touched.
+
+  Of the five cited claims, TWO were already closed in round 7 (the gate read
+  one head behind): the doc "cannot disagree" enumeration caveat (item 2), and
+  the filter.rs helper-vs-consumer scope claim (item 3) — round 7 both narrowed
+  the comment AND added
+  `cached_output_filter_log_reports_the_adjudicated_zone_6722`, which drives the
+  production `emit_cached_output_filter_log_tail`. The gate's remark that
+  replacing the production call still passes was true at ad4f0c113 and is false
+  at 1a7ff02d3: guard G reds it. So no new test is owed for that call site.
+
+  Three were live and are fixed:
+
+  1. The doc claimed every egress-row result stays "bit-identical to the
+     pre-#6713 read". FALSE, and `[Z, 0, Z]` is the counterexample — previously
+     the last row yielded `Z`, now the ledger yields `0`. Rewritten to say what
+     is true: bit-identical wherever the rows AGREE (every ordinary single-unit
+     interface), deliberately DIFFERENT where they disagree, and that difference
+     IS the point of the PR rather than a side effect.
+     Found a SECOND instance of the same false claim the gate did not cite (the
+     downstream-consumer preamble asserting an ambiguous ifindex is
+     "bit-identical to pre-#6713"); it is only bit-identical for an ambiguous
+     ifindex with NO egress row. Both corrected.
+  4. `ifindex_unambiguous_zone_id` was documented "Read only by
+     `egress_zone_id`". Stale as of my own round-6 change — `populate_egress`
+     reads it too. Now names both arms.
+  5. `forwarding/mod.rs` still said the resolver falls back to
+     `ifindex_to_zone_id`. Now names `ifindex_unambiguous_zone_id` and says why
+     the other map is the wrong source for a to-zone.
+
+  TEST-SCOPE LIMIT recorded next to the ledger, per the gate: no public test can
+  distinguish an erroneous re-arm to `Some(0)` from a genuine conflict — the
+  flush omits both and `egress_zone_id` ends in `.unwrap_or(0)`, so both resolve
+  0. The observable security property is pinned in BOTH arms; the internal
+  representation is not exhaustively mutation-tested, and a conflict→`Some(0)`
+  mutation will not red. Stated as a limit with the remedy (add an accessor
+  before relying on the distinction).
+- **File(s)**: docs/userspace-dataplane-architecture.md,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, _Log.md
