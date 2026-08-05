@@ -455,6 +455,24 @@ func TestLateRefineRequestCannotBeStranded_6669(t *testing.T) {
 	}
 	t.Cleanup(func() { epochRefineAfterLostClaim = origLost })
 
+	// UNPARK ON THE FAILURE PATH TOO, and this test is the one where it matters
+	// most. Its assertions fire while the REQUESTER is parked inside
+	// claimBootEpochRefine — which is to say, while it holds bootEpochRefineMu.
+	// t.Fatalf runs runtime.Goexit and skips the explicit closes below, so
+	// without these cleanups that goroutine keeps the mutex for the life of the
+	// process and EVERY later test in the package that starts or stops a refine
+	// worker blocks on it: one assertion failure turns into a package-wide
+	// `panic: test timed out` naming an unrelated test. The two unparks stay
+	// SEPARATE because the body deliberately releases the worker first and the
+	// requester later; these only backstop whichever the failure path skipped.
+	var unparkWorkerOnce, unparkRequesterOnce sync.Once
+	unparkWorker := func() { unparkWorkerOnce.Do(func() { close(releaseWorker) }) }
+	unparkRequester := func() { unparkRequesterOnce.Do(func() { close(resumeRequester) }) }
+	t.Cleanup(func() {
+		unparkWorker()
+		unparkRequester()
+	})
+
 	m.initHeartbeatEpochState()
 	select {
 	case <-atRelease:
@@ -478,7 +496,7 @@ func TestLateRefineRequestCannotBeStranded_6669(t *testing.T) {
 	// that could still re-claim — while the requester is still parked. The join
 	// is on the worker goroutine itself, so this is not a poll on a flag that
 	// clears a few instructions early.
-	close(releaseWorker)
+	unparkWorker()
 	if !m.joinBootEpochRefine(5 * time.Second) {
 		t.Fatal("the in-flight refine worker never exited")
 	}
@@ -494,7 +512,7 @@ func TestLateRefineRequestCannotBeStranded_6669(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	close(resumeRequester)
+	unparkRequester()
 	select {
 	case <-requested:
 	case <-time.After(5 * time.Second):
@@ -523,37 +541,91 @@ func TestLateRefineRequestCannotBeStranded_6669(t *testing.T) {
 }
 
 // TestCoalescingDoesNotRatchetOnAHealthyNode_6669 is the negative control for
-// the coalescing loop: the extra pass must still be idempotent.
+// the coalescing loop: many overlapping requests must collapse into ONE extra
+// pass, and that extra pass must still be idempotent.
 //
 // A worker that re-ran unconditionally would ratchet the epoch by one on every
 // heartbeat start, which is exactly what refineBootEpoch's `prev == lastWrote`
 // shortcut exists to prevent. Coalescing adds passes, so it is the change most
 // able to break that.
+//
+// THE OVERLAP IS IMPOSED, not hoped for. An earlier revision of this test fired
+// twenty refreshBootEpoch calls with no seam and asserted only that neither the
+// epoch nor the file moved — which twenty strictly SEQUENTIAL workers satisfy
+// just as well, so it said nothing about coalescing at all and would have passed
+// against a pending bit that did not exist. The worker is now parked inside its
+// first locked pass while every request lands, so all twenty provably arrive
+// while it is in flight; the word is asserted to be exactly
+// {refining|pending} at that point (one follow-up owed, not twenty, and no
+// second worker), and the LOCKED PASS COUNT is asserted to be exactly 2
+// afterwards.
 func TestCoalescingDoesNotRatchetOnAHealthyNode_6669(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 	m := keyedEpochManager(t, path)
 
-	m.initHeartbeatEpochState()
-	select {
-	case <-m.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the first refine never completed")
+	// Park pass 1 inside its lock, and count every locked pass.
+	var passes atomic.Int64
+	inPass1 := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var once sync.Once
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		if passes.Add(1) == 1 {
+			once.Do(func() {
+				close(inPass1)
+				<-releaseWorker
+			})
+		}
+		return origFlock(fd, how)
 	}
-	first := m.heartbeatBootEpoch()
-	firstFile := readPersistedEpoch(t, path)
+	t.Cleanup(func() { epochFlock = origFlock })
 
-	// Pile requests on: several land while a worker is in flight and coalesce.
+	// UNPARK ON THE FAILURE PATH TOO. t.Fatalf runs runtime.Goexit, which skips
+	// the explicit close below but still runs cleanups; without this, a failing
+	// assertion returns with pass 1 parked in the seam FOREVER, and that escaped
+	// worker goes on to read epochRefineBeforeRelease in releaseBootEpochRefine
+	// while a later test assigns it — the same cross-test race awaitFirstRefine
+	// exists to stop, reintroduced on the failure path.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseWorker) }) }
+	t.Cleanup(release)
+
+	m.initHeartbeatEpochState()
+	// Published synchronously, ahead of any I/O — so this is the value the
+	// passes below must leave alone.
+	first := m.heartbeatBootEpoch()
+	if first == 0 {
+		t.Fatal("no epoch published")
+	}
+	select {
+	case <-inPass1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first refine worker never reached the file lock")
+	}
+
+	// Pile requests on. Every one of them lands while pass 1 is in flight.
 	for i := 0; i < 20; i++ {
 		m.refreshBootEpoch()
 	}
+	if got, want := m.bootEpochRefine.Load(), bootEpochRefiningBit|bootEpochPendingBit; got != want {
+		t.Fatalf("refine word = %#x after 20 overlapping requests, want %#x: they did not "+
+			"coalesce onto the in-flight worker as a single owed follow-up", got, want)
+	}
+
+	release()
 	waitBootEpochIdle(t, m)
 
+	if got := passes.Load(); got != 2 {
+		t.Fatalf("%d locked refine passes ran for the initial resolve plus 20 overlapping "+
+			"requests, want exactly 2 (the initial pass and ONE coalesced follow-up)", got)
+	}
 	if got := m.heartbeatBootEpoch(); got != first {
 		t.Fatalf("published epoch moved from %d to %d under coalesced refreshes; a healthy "+
 			"node must not ratchet", first, got)
 	}
-	if got := readPersistedEpoch(t, path); got != firstFile {
-		t.Fatalf("state file moved from %d to %d under coalesced refreshes", firstFile, got)
+	if got := readPersistedEpoch(t, path); got != first {
+		t.Fatalf("state file holds %d after the coalesced passes, want the published %d",
+			got, first)
 	}
 }
 
@@ -635,9 +707,17 @@ func TestPostRenameSyncKeepsTheWatermark_6669(t *testing.T) {
 // other. TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669 shows the
 // recovery working; it makes A exit first, and that is load-bearing.
 //
-// Closing either needs state this design does not keep — a writer identity in
-// the file, or a lifetime-held liveness lock. Both are larger changes than the
-// epoch itself; see withEpochFileLock. Tracked as #6724.
+// THE TWO DO NOT NEED THE SAME MISSING STATE, and an earlier revision of this
+// comment (and of README.md) said they did. Only CONDITION 2 does: separating
+// "a concurrent newer incarnation wrote it" from "a predecessor wrote it after a
+// backward clock step" needs a writer identity in the file or a lifetime-held
+// liveness lock, which is where the leapfrog lives. CONDITION 1 needs neither —
+// the code already does the right thing on a RETRY (A's published value is
+// already b+1, so nothing ratchets and the WriteFileDurable is simply
+// re-attempted; once b+1 lands, B's next refresh reads it and raises to b+2).
+// What is missing there is only a TRIGGER for that retry, which is the "no
+// periodic re-check" half of #6724 and a materially smaller change. See
+// withEpochFileLock, whose comment is the accurate statement of both.
 func TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669(t *testing.T) {
 	t.Run("a_failed_write_strands_the_peer_across_every_restart", func(t *testing.T) {
 		dir := t.TempDir()
@@ -645,11 +725,7 @@ func TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669(t *testing.T) {
 		mB := keyedEpochManager(t, path)
 
 		mB.initHeartbeatEpochState()
-		select {
-		case <-mB.bootEpochReady:
-		case <-time.After(5 * time.Second):
-			t.Fatal("B's first refine never completed")
-		}
+		awaitFirstRefine(t, mB, "B's first refine")
 		b := mB.heartbeatBootEpoch()
 		if got := readPersistedEpoch(t, path); got != b {
 			t.Fatalf("persisted %d after B's refine, want %d", got, b)

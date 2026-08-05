@@ -516,11 +516,7 @@ func TestHeldFlockCannotCauseFalsePeerDeath_6169(t *testing.T) {
 	// race t.TempDir() cleanup. This also demonstrates the self-heal the
 	// tie-break observed: the persist completes once the lock frees.
 	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-	select {
-	case <-sender.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the persist worker never completed after the lock was released")
-	}
+	awaitFirstRefine(t, sender, "the persist worker after the lock was released")
 	if sender.heartbeatBootEpoch() == 0 {
 		t.Fatal("the epoch went back to 0 after the persist completed")
 	}
@@ -705,14 +701,9 @@ func TestInitHeartbeatEpochStateNeverBlocks_6169(t *testing.T) {
 	// (senderIncarnationAt, TestArchivedEpochPoisonsAFreshFloor_6711) overrode
 	// it: a data race that failed `go test -race ./pkg/cluster/` 20 times out of
 	// 20 when those two tests ran together, and intermittently in the full suite.
-	// waitBootEpochIdle polls the pending bit as well, which is the actual drain.
+	// awaitFirstRefine waits for ready AND drains, which is the actual join.
 	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-	select {
-	case <-m.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the refine worker never completed after the lock was released")
-	}
-	waitBootEpochIdle(t, m)
+	awaitFirstRefine(t, m, "the refine worker after the lock was released")
 }
 
 // TestStartHeartbeatReturnsWithAUsableEpoch_6169 answers the question deleting
@@ -777,13 +768,11 @@ func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
 		t.Fatal("the first frame after StartHeartbeat carries no epoch")
 	}
 
-	// Release and drain so the worker cannot outlive t.TempDir.
+	// Release and drain so the worker cannot outlive t.TempDir — or the seams a
+	// LATER test installs. bootEpochReady alone is not that drain; see
+	// awaitFirstRefine.
 	_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-	select {
-	case <-m.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the refinement worker never completed after the lock was released")
-	}
+	awaitFirstRefine(t, m, "the refinement worker after the lock was released")
 }
 
 // TestBackwardClockStepDoesNotKillALatchedPeer_6169 is the fail-on-revert gate

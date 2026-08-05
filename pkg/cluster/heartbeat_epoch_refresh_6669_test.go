@@ -3,6 +3,7 @@ package cluster
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,47 @@ func waitBootEpochIdle(t *testing.T, m *Manager) {
 	if !m.joinBootEpochRefine(5 * time.Second) {
 		t.Fatal("the boot-epoch refine worker goroutine never exited")
 	}
+}
+
+// awaitFirstRefine waits for the FIRST refine attempt to finish and then DRAINS
+// the worker. Every test that cares about the first attempt should use this.
+//
+// bootEpochReady IS NOT A DRAIN and never was. startBootEpochRefine closes it
+// as soon as the first pass returns, and the worker then goes on to call
+// releaseBootEpochRefine — which reads the epochRefineBeforeRelease package var
+// — and may run further coalesced passes before it exits. A test that stops at
+// the channel therefore RETURNS with that worker still live, and the next test
+// in the package assigns the seams it is reading.
+//
+// That is not hypothetical, and it is not a one-off:
+//
+//	go test -race ./pkg/cluster \
+//	  -run 'Test(HeldFlockCannotCauseFalsePeerDeath_6169|LateRefineRequestIsReclaimed_6669)$' \
+//	  -count=100
+//
+// reported a WRITE of epochRefineBeforeRelease by the second test against a READ
+// of it by the first test's escaped worker, inside releaseBootEpochRefine.
+//
+// The same confusion had already been fixed twice by hand — in
+// TestInitHeartbeatEpochStateNeverBlocks_6169 (the worker vs epochNowNanos) and
+// in startedIncarnation — each time only at the site where it had been caught,
+// which is why it was still live in five others. It lives here now so the next
+// test cannot re-derive it. Eleven sites hand-rolled the bare receive. Five had
+// nothing else joining the worker at all and so returned with a live one —
+// TestHeldFlockCannotCauseFalsePeerDeath_6169,
+// TestStartHeartbeatReturnsWithAUsableEpoch_6169, both subtests of
+// TestHeartbeatBootEpochRefinementCompletes_6169, and
+// TestBootEpochNeverBlocksOnStorage_6169. The rest survived only because
+// keyedEpochManager registers a t.Cleanup join behind them, which is a backstop
+// and not a reason to skip the drain.
+func awaitFirstRefine(t *testing.T, m *Manager, what string) {
+	t.Helper()
+	select {
+	case <-m.bootEpochReady:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s: the first boot-epoch refine attempt never completed", what)
+	}
+	waitBootEpochIdle(t, m)
 }
 
 // readPersistedEpoch reads the boot-epoch state file.
@@ -115,11 +157,7 @@ func TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669(t *testing.T) {
 
 	// --- B: the NEWER incarnation. It reaches the lock first and persists.
 	mB.initHeartbeatEpochState()
-	select {
-	case <-mB.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("B's first refine never completed")
-	}
+	awaitFirstRefine(t, mB, "B's first refine")
 	b := mB.heartbeatBootEpoch()
 	if b == 0 {
 		t.Fatal("B published no epoch")
@@ -189,11 +227,7 @@ func TestBootEpochRefreshIsIdempotent_6669(t *testing.T) {
 	m := keyedEpochManager(t, path)
 
 	m.initHeartbeatEpochState()
-	select {
-	case <-m.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the first refine never completed")
-	}
+	awaitFirstRefine(t, m, "the first refine")
 	first := m.heartbeatBootEpoch()
 	firstFile := readPersistedEpoch(t, path)
 
@@ -388,6 +422,17 @@ func TestStopJoinsTheBootEpochRefineWorker_6669(t *testing.T) {
 func TestStopDoesNotBlockOnAWedgedRefineWorker_6669(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
 	m := keyedEpochManager(t, path)
+
+	// Count locked passes. Installed BEFORE parkedRefineWorker so that its park
+	// hook wraps this one and every pass — parked or not — is counted.
+	var passes atomic.Int64
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		passes.Add(1)
+		return origFlock(fd, how)
+	}
+	t.Cleanup(func() { epochFlock = origFlock })
+
 	release := parkedRefineWorker(t, m)
 
 	start := time.Now()
@@ -415,13 +460,242 @@ func TestStopDoesNotBlockOnAWedgedRefineWorker_6669(t *testing.T) {
 	if !m.joinBootEpochRefine(5 * time.Second) {
 		t.Fatal("the wedged refine worker never exited after release")
 	}
-	before := m.bootEpochWrote.Load()
+	passesBefore := passes.Load()
+	if passesBefore != 1 {
+		t.Fatalf("%d locked pass(es) ran before the stopped-manager probe, want exactly 1; the "+
+			"count below is only meaningful against a known baseline", passesBefore)
+	}
+	wroteBefore := m.bootEpochWrote.Load()
 	m.refreshBootEpoch()
 	if got := m.bootEpochRefine.Load(); got != 0 {
 		t.Fatalf("refine word = %#x after a refresh on a STOPPED manager, want 0 — Stop's "+
 			"join is defeated by anything that can still spawn behind it", got)
 	}
-	if got := m.bootEpochWrote.Load(); got != before {
-		t.Fatalf("a stopped manager still persisted (watermark %d -> %d)", before, got)
+	// THE TWO ASSERTIONS ABOVE AND BELOW ARE FAILURE DEFAULTS ON THEIR OWN, and
+	// an earlier revision of this test stopped at them. A zero word is what an
+	// illegal worker that spawned AND finished before this line leaves behind
+	// (the claim is taken on the caller's goroutine, but the pass itself is
+	// idempotent and short once the store is healthy), and an idempotent pass
+	// returns the watermark it was handed, so the watermark does not move
+	// either. Both are exactly what a correctly-refused spawn produces. Join,
+	// then count the LOCKED PASSES, which nothing but a spawn can move.
+	if !m.joinBootEpochRefine(5 * time.Second) {
+		t.Fatal("a refine worker was still in flight after a refresh on a STOPPED manager")
+	}
+	if got := passes.Load(); got != passesBefore {
+		t.Fatalf("a stopped manager ran %d further locked refine pass(es) (%d -> %d); Stop's "+
+			"join is defeated by anything that can still spawn behind it",
+			got-passesBefore, passesBefore, got)
+	}
+	if got := m.bootEpochWrote.Load(); got != wroteBefore {
+		t.Fatalf("a stopped manager still persisted (watermark %d -> %d)", wroteBefore, got)
+	}
+}
+
+// TestJoinDoesNotBlockBehindAParkedRequester_6669 pins the one thing
+// joinBootEpochRefine must never do: wait on bootEpochRefineMu.
+//
+// Round 14 gave the worker an exit handle and, in its first form, read that
+// handle under bootEpochRefineMu. That mutex is held across
+// claimBootEpochRefine — and therefore across its epochRefineAfterLostClaim
+// seam, where a requester can be parked indefinitely — so the join, the
+// worker's own exit defer and the parked requester deadlocked against each
+// other in three goroutines. It was NOT caught by any single-test run; it
+// surfaced as a ten-minute `panic: test timed out` in
+// TestLateRefineRequestCannotBeStranded_6669, which drives exactly this
+// schedule for a different purpose. A hang is a bad failure mode: it costs the
+// full test timeout and reports no assertion. This test exists to make the same
+// defect a two-hundred-millisecond assertion.
+//
+// The join is bounded BY DESIGN — that is the whole reason it is not
+// wg.Wait() — so it must return on its own budget no matter who holds what.
+//
+// RED-on-revert: read the handle under m.bootEpochRefineMu
+// (`m.bootEpochRefineMu.Lock(); w := ...; m.bootEpochRefineMu.Unlock()`) and
+// the join below never returns.
+func TestJoinDoesNotBlockBehindAParkedRequester_6669(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+
+	// Park the worker at its release seam, so the in-flight bit is still held
+	// and the request below must LOSE the claim.
+	atRelease := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	var relOnce sync.Once
+	origRelease := epochRefineBeforeRelease
+	epochRefineBeforeRelease = func() {
+		relOnce.Do(func() {
+			close(atRelease)
+			<-releaseWorker
+		})
+	}
+	t.Cleanup(func() { epochRefineBeforeRelease = origRelease })
+
+	// Park the requester INSIDE claimBootEpochRefine — which is to say, while it
+	// holds bootEpochRefineMu.
+	lostClaim := make(chan struct{})
+	resumeRequester := make(chan struct{})
+	var lostOnce sync.Once
+	origLost := epochRefineAfterLostClaim
+	epochRefineAfterLostClaim = func() {
+		lostOnce.Do(func() {
+			close(lostClaim)
+			<-resumeRequester
+		})
+	}
+	t.Cleanup(func() { epochRefineAfterLostClaim = origLost })
+
+	// UNPARK ON THE FAILURE PATH TOO, or this test cannot report the very defect
+	// it exists for. t.Fatalf runs runtime.Goexit, which skips the explicit
+	// unwind at the end of the body but still runs cleanups. Without this, a
+	// failing assertion leaves the requester parked holding bootEpochRefineMu,
+	// keyedEpochManager's join cleanup blocks on that mutex forever, and the
+	// crisp message below is buffered and never printed: the run ends in
+	// `panic: test timed out` with no assertion — measured, and exactly the
+	// failure mode this test was written to replace.
+	//
+	// It also JOINS the requester goroutine, and the two must happen in that
+	// order on ONE cleanup rather than two: t.Cleanup runs LIFO, so a separately
+	// registered join would run BEFORE the unpark and wait on a goroutine
+	// nothing had released yet.
+	requested := make(chan struct{})
+	var unwindOnce sync.Once
+	unwind := func() {
+		unwindOnce.Do(func() {
+			close(resumeRequester)
+			close(releaseWorker)
+		})
+	}
+	t.Cleanup(func() {
+		unwind()
+		// Bounded: if the body failed before starting the requester, nothing
+		// ever closes this.
+		select {
+		case <-requested:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	m.initHeartbeatEpochState()
+	select {
+	case <-atRelease:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refine worker never reached its release point")
+	}
+	// JOIN THIS GOROUTINE, do not just wait for the word. waitBootEpochIdle
+	// polls bootEpochRefine, and there is a window where that word reads 0 while
+	// this requester is still inside startBootEpochRefine: the worker has
+	// released the slot but the unparked requester has not yet re-claimed it. A
+	// test that stopped at the word could therefore return and let its cleanups
+	// restore bootEpochPath and epochRefineBeforeRelease while this goroutine
+	// was still reading them — a flake that reproduced roughly 1 run in 8 at
+	// -count=5, and the same "a proxy is not a join" defect awaitFirstRefine
+	// exists to stop. keyedEpochManager's join cleanup is no backstop here: it
+	// joins a REGISTERED worker, and a requester that has not claimed yet is not
+	// one.
+	go func() {
+		defer close(requested)
+		m.refreshBootEpoch()
+	}()
+	select {
+	case <-lostClaim:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the requester never reached the lost-claim seam (refine word = %#x)",
+			m.bootEpochRefine.Load())
+	}
+
+	// bootEpochRefineMu is HELD by the parked requester from here.
+	joined := make(chan bool, 1)
+	start := time.Now()
+	go func() { joined <- m.joinBootEpochRefine(200 * time.Millisecond) }()
+	select {
+	case ok := <-joined:
+		if ok {
+			t.Fatal("the join reported a still-parked worker as joined")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("joinBootEpochRefine had not returned %v after its 200ms budget: it is "+
+			"waiting on bootEpochRefineMu, which claimBootEpochRefine holds across the "+
+			"epochRefineAfterLostClaim seam. The join, the worker's exit and the parked "+
+			"requester then deadlock, and a bounded join that can block forever is not "+
+			"a bounded join.", time.Since(start))
+	}
+
+	// Unwind: let the requester publish its bit, then let the worker serve it.
+	unwind()
+	select {
+	case <-requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refreshBootEpoch never returned after the unwind")
+	}
+	waitBootEpochIdle(t, m)
+}
+
+// joinWaiterGoroutines counts goroutines parked inside Manager.joinBootEpochRefine
+// itself, or in a sync.WaitGroup.Wait reached from this package.
+//
+// BOTH shapes are counted because the defect is a helper OUTLIVING its caller,
+// not the primitive it happens to block on: reverting to a WaitGroup, or moving
+// the same `go func() { …; close(done) }()` into a differently-named helper,
+// must not slip past this.
+func joinWaiterGoroutines() int {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	n := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "cluster.(*Manager).joinBootEpochRefine") ||
+			(strings.Contains(g, "sync.(*WaitGroup).Wait") && strings.Contains(g, "xpf/pkg/cluster")) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestTimedOutJoinLeavesNoWaiterBehind_6669 is the fail-on-revert gate for the
+// join's OWN resource lifetime, which neither Stop test above touches.
+//
+// The bound that keeps a shutdown off a dead disk returns the CALLER, and the
+// obvious way to write it — spawn `go func() { wg.Wait(); close(done) }()` and
+// select it against a timer — returns ONLY the caller. Nothing cancels a
+// WaitGroup.Wait, so the helper stays parked for as long as the worker is
+// wedged, which over a dead store is for the life of the process.
+//
+// "Small and bounded" is true of ONE terminal Stop and false across repeated
+// calls, and there are several: Stop is public, and waitBootEpochIdle and
+// keyedEpochManager join on every epoch test. Measured on the leaking shape:
+// eight timed-out joins, eight permanently parked waiters.
+//
+// RED-on-revert: put a helper back in joinBootEpochRefine — even one that only
+// forwards the worker's own channel —
+//
+//	fwd := make(chan struct{})
+//	go func() { <-done; close(fwd) }()
+//	select { case <-fwd: return true; case <-timer.C: return false }
+//
+// and this fails with eight goroutines parked.
+func TestTimedOutJoinLeavesNoWaiterBehind_6669(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+	release := parkedRefineWorker(t, m)
+	defer release()
+
+	base := joinWaiterGoroutines()
+	const calls = 8
+	for i := 0; i < calls; i++ {
+		if m.joinBootEpochRefine(5 * time.Millisecond) {
+			t.Fatalf("join %d reported a wedged worker as joined", i)
+		}
+	}
+	if leaked := joinWaiterGoroutines() - base; leaked > 0 {
+		t.Fatalf("%d goroutine(s) parked in the join after %d timed-out calls, want 0: a helper "+
+			"spawned per call is not cancelled by the caller's timeout, so every join over a "+
+			"wedged store leaks one for the life of the process", leaked, calls)
 	}
 }

@@ -666,9 +666,17 @@ func (m *Manager) heartbeatBootEpoch() uint64 {
 
 		// bootEpochReady is closed when the FIRST refine attempt finishes.
 		// Nothing in production waits on it — that wait was removed, see
-		// initHeartbeatEpochState — but tests use it to join the worker so a
-		// refinement cannot race their assertions or t.TempDir cleanup. Later
-		// refreshes do not signal it; they are joined with waitBootEpochIdle.
+		// initHeartbeatEpochState.
+		//
+		// IT IS NOT A JOIN, and an earlier revision of this comment offered it
+		// to tests as one ("tests use it to join the worker"). The worker closes
+		// it from INSIDE its loop and then calls releaseBootEpochRefine — which
+		// reads a package-var test seam — and may run further coalesced passes
+		// before it returns. A test that stops here returns with that worker
+		// still live, and the next test's seam assignment races it: exactly the
+		// data race the -race repro in awaitFirstRefine's comment reports. The
+		// join is joinBootEpochRefine, or waitBootEpochIdle/awaitFirstRefine in
+		// tests, which wait for the whole word AND the goroutine.
 		m.startBootEpochRefine(m.bootEpochReady)
 	})
 	return m.bootEpoch.Load()
@@ -700,6 +708,18 @@ func (m *Manager) refreshBootEpoch() {
 		return
 	}
 	m.startBootEpochRefine(nil)
+}
+
+// bootEpochRefineWorker is one refine worker's exit handle: done is closed by
+// that worker as its very last act. It is reached through an atomic.Pointer
+// rather than a mutex-guarded field because BOTH readers must make progress
+// while bootEpochRefineMu is held — Manager.joinBootEpochRefine exists to be
+// bounded, and the worker's own exit defer must never block — and that mutex is
+// held across claimBootEpochRefine's epochRefineAfterLostClaim seam, where a
+// requester can be parked indefinitely. Guarding it deadlocked the join, the
+// worker and the requester against each other in three goroutines.
+type bootEpochRefineWorker struct {
+	done chan struct{}
 }
 
 // The two bits of Manager.bootEpochRefine. Only three states are reachable —
@@ -808,21 +828,60 @@ func (m *Manager) releaseBootEpochRefine() bool {
 // that has just sent VRRP priority-0 and still has to stop session sync. So the
 // wait is bounded and the timeout is reported rather than hidden.
 //
-// WHAT THE TIMEOUT LEAVES BEHIND is small and bounded: the worker holds no
-// locks a caller can wait on and, after its final pass, touches only
-// m.bootEpoch and m.bootEpochWrote (both atomic) and the state file (written
-// through fsatomic, so a concurrent reader sees the old or the new value and
-// never a torn one). It cannot resurrect the heartbeat or re-enter election.
+// IT SPAWNS NOTHING, and that is what keeps a BOUNDED WAIT from becoming an
+// UNBOUNDED LEAK. The obvious shape is a helper goroutine —
+// `go func() { wg.Wait(); close(done) }()` — selected against a timer, and the
+// timeout then returns only the CALLER: nothing cancels a WaitGroup.Wait, so
+// the helper stays parked for as long as the worker does, which over a wedged
+// store is forever. One terminal Stop leaking one goroutine is easy to wave
+// through, but this is not called once — Stop is public, and waitBootEpochIdle
+// and keyedEpochManager join on every test — so N timed-out joins left N
+// permanent goroutines (measured: 8 calls, 8 parked waiters). The worker
+// publishes its OWN exit handle instead, so a join is a select on a channel
+// somebody else closes and a timeout costs nothing at all.
+//
+// IT ALSO TAKES NO LOCK, and that is not a micro-optimisation — reading the
+// handle under bootEpochRefineMu DEADLOCKED this function outright. That mutex
+// is held across claimBootEpochRefine, which contains the
+// epochRefineAfterLostClaim seam, so a requester parked at that seam holds it
+// for an unbounded time. A join is exactly the operation that must make
+// progress anyway (its whole purpose is to be bounded), and so is the worker's
+// own exit. Both therefore go through an atomic.Pointer:
+// startBootEpochRefine still PUBLISHES under bootEpochRefineMu, which is what
+// keeps Stop's refuse-then-join ordering airtight, but nothing has to take the
+// lock to observe or clear it.
+//
+// "THE WORKER", singular, is exact rather than approximate: bootEpochRefiningBit
+// admits one at a time, so the current worker IS every worker. The one seam is
+// that a worker releases that bit slightly before its exit channel closes, so a
+// successor can be spawned and publish its own handle while the outgoing one is
+// still returning — a join taken in that window follows the outgoing worker.
+// Neither caller can reach it: Stop sets bootEpochStopped first, and
+// waitBootEpochIdle waits for the whole word to reach 0 (no worker in flight and
+// none owed) before it joins.
+//
+// WHAT THE TIMEOUT LEAVES BEHIND is one worker goroutine, parked in the flock or
+// the fsync this bound exists for. It CAN still hold a lock a caller waits on,
+// and an earlier revision of this comment said it could not: withEpochFileLock
+// holds the state file's advisory lock across the whole read-modify-write
+// callback, so another INCARNATION's refine blocks behind it until this one
+// unwedges. Nothing in THIS process waits on it — the refine slot is the only
+// in-process serialization and it is a CAS word, not a lock — which is
+// presumably what the claim meant, but the flock is a real cross-process one and
+// the withEpochFileLock rationale is written around exactly that. Beyond it the
+// worker touches only m.bootEpoch and m.bootEpochWrote (both atomic) and the
+// state file (written through fsatomic, so a concurrent reader sees the old or
+// the new value and never a torn one). It cannot resurrect the heartbeat or
+// re-enter election.
 func (m *Manager) joinBootEpochRefine(budget time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		m.bootEpochWG.Wait()
-		close(done)
-	}()
+	w := m.bootEpochWorker.Load()
+	if w == nil {
+		return true
+	}
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	select {
-	case <-done:
+	case <-w.done:
 		return true
 	case <-timer.C:
 		return false
@@ -858,18 +917,22 @@ func (m *Manager) joinBootEpochRefine(budget time.Duration) bool {
 // release pair on ONE word (claimBootEpochRefine) is what makes that hold for
 // EVERY request rather than for every request but one.
 func (m *Manager) startBootEpochRefine(ready chan struct{}) {
-	// Claim the slot and register the worker under one lock. A concurrent
-	// Manager.Stop therefore either sees the registration and joins it, or
-	// refuses the spawn outright — it can never Add to a WaitGroup it is
-	// already waiting on. The lock is never held across I/O (the claim is a
+	// Claim the slot and publish the worker's exit handle under one lock. A
+	// concurrent Manager.Stop therefore either sees that handle and joins it,
+	// or refuses the spawn outright — it can never miss a worker that starts
+	// behind its own check. The lock is never held across I/O (the claim is a
 	// CAS loop), so this still cannot block a heartbeat start.
 	m.bootEpochRefineMu.Lock()
 	claimed := false
 	if !m.bootEpochStopped {
 		claimed = m.claimBootEpochRefine()
-		if claimed {
-			m.bootEpochWG.Add(1)
-		}
+	}
+	var worker *bootEpochRefineWorker
+	if claimed {
+		worker = &bootEpochRefineWorker{done: make(chan struct{})}
+		// Published under the lock so Stop cannot set bootEpochStopped between
+		// the claim and the publish and then join a worker it never saw.
+		m.bootEpochWorker.Store(worker)
 	}
 	m.bootEpochRefineMu.Unlock()
 
@@ -888,7 +951,20 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 	// override, and a worker reading it later would race the next test.
 	path := bootEpochPath
 	go func() {
-		defer m.bootEpochWG.Done()
+		// Registered FIRST so it runs LAST: a joiner selecting on this channel
+		// must not be released while any other deferred action is still to run.
+		//
+		// The handle is cleared with a CAS and NOT under bootEpochRefineMu: that
+		// mutex is held across the epochRefineAfterLostClaim seam by a requester
+		// that may be parked there indefinitely, and this exit path must not be
+		// able to wait on anything. The CAS also has the right semantics on its
+		// own — the in-flight bit is dropped inside releaseBootEpochRefine,
+		// before this defer runs, so a successor may already have published its
+		// own handle, and it must not be cleared by this one.
+		defer func() {
+			m.bootEpochWorker.CompareAndSwap(worker, nil)
+			close(worker.done)
+		}()
 		// `ready` keeps its documented meaning — closed when the FIRST attempt
 		// finishes — rather than being deferred to the end of a coalesced run.
 		// The deferred close covers the paths that leave the loop early.

@@ -963,20 +963,30 @@ peer liveness (`lastSeen`) or drive election.
        (`TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669`,
        `TestBootEpochRefreshIsIdempotent_6669`.)
 
-       **That recovery carries two conditions**, and both are the same missing
-       state as the mis-ordering itself. It re-reads the FILE, so it recovers
-       only what the file expresses. First, **the floor-raising epoch must have
-       reached the file**: refinement publishes a raise before persisting it
-       (deliberately — a node that has read a predecessor's higher value must
-       still order itself above it even when it cannot write), so the other
-       incarnation can EMIT `b+1` while the file still reads `b`. This node
-       then has no signal at all — it wrote `b`, the file says `b` — and every
-       restart returns at the idempotence shortcut, leaving it below the peer's
-       floor for its whole process lifetime. Second, **the other incarnation
-       must be gone**: while both run, each pass raises above the other and
-       rewrites the file, so they leapfrog indefinitely, alternately stranding
-       each other while the file ratchets.
+       **That recovery carries two conditions**, and they do NOT need the same
+       missing state — an earlier revision of this paragraph said both were the
+       same state as the mis-ordering itself. It re-reads the FILE, so it
+       recovers only what the file expresses. First, **the floor-raising epoch
+       must have reached the file**: refinement publishes a raise before
+       persisting it (deliberately — a node that has read a predecessor's higher
+       value must still order itself above it even when it cannot write), so the
+       other incarnation can EMIT `b+1` while the file still reads `b`. This
+       node then has no signal at all — it wrote `b`, the file says `b` — and
+       every restart returns at the idempotence shortcut, leaving it below the
+       peer's floor for its whole process lifetime. Second, **the other
+       incarnation must be gone**: while both run, each pass raises above the
+       other and rewrites the file, so they leapfrog indefinitely, alternately
+       stranding each other while the file ratchets.
        (`TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.)
+
+       Only the SECOND needs a writer identity in the file or a lifetime-held
+       liveness lock, which is where the leapfrog lives. The first needs nothing
+       but a **retry trigger**: on a retry A's published value is already `b+1`,
+       so `next := prev+1` does not exceed it, nothing ratchets, and the
+       `WriteFileDurable` is simply re-attempted — once `b+1` lands, B's next
+       refresh reads it and raises to `b+2`. What is missing is only something
+       to schedule that retry, which is the "no periodic re-check" half of
+       **#6724** and a materially smaller change than a writer identity.
 
        A refine requested while one is in flight used to be DROPPED, which lost
        exactly this recovery request — the in-flight worker's locked read can
@@ -1010,8 +1020,63 @@ peer liveness (`lastSeen`) or drive election.
        torn-down manager. `Stop` refuses new workers and waits
        `bootEpochStopJoinBudget` (2 s) for the one already running; the wait is
        bounded because the shutdown path has just sent VRRP priority-0 and must
-       not block on a dead disk. A timeout is logged, and leaves only atomic
-       stores and one `fsatomic` write behind.
+       not block on a dead disk. A timeout is logged, and leaves behind atomic
+       stores and **up to two** `fsatomic` writes: the wedged pass itself, plus
+       one coalesced follow-up if a request set the pending bit while it was
+       stuck, which the worker serves once it unblocks.
+
+       **The join spawns nothing, and takes no lock.** Writing it as
+       `go func() { wg.Wait(); close(done) }()` selected against a timer returns
+       only the CALLER — nothing cancels a `WaitGroup.Wait` — so each timed-out
+       join left one goroutine parked for as long as the store stayed wedged.
+       That is easy to wave through for a single terminal `Stop` and wrong
+       across repeated calls, and there are several (`Stop` is public; the tests
+       join on every epoch case). The worker publishes its own exit handle
+       (`Manager.bootEpochWorker`, an `atomic.Pointer`), so a join is a select
+       on a channel somebody else closes and a timeout costs nothing.
+       (`TestTimedOutJoinLeavesNoWaiterBehind_6669`.)
+
+       The handle is PUBLISHED under `bootEpochRefineMu`, which is what keeps
+       `Stop`'s refuse-then-join ordering airtight, but it is LOADED and CLEARED
+       without it — and that is a correctness requirement, not tidiness.
+       `bootEpochRefineMu` is held across `claimBootEpochRefine`, hence across
+       its `epochRefineAfterLostClaim` seam, where a requester can park
+       indefinitely; the join and the worker's own exit are precisely the two
+       operations that must make progress regardless. Guarding the handle with
+       that mutex deadlocked all three against each other, and a bounded join
+       that can block forever is not a bounded join.
+       (`TestJoinDoesNotBlockBehindAParkedRequester_6669`.)
+
+       It can also still hold a lock a caller waits on, which an earlier
+       revision of this section denied: `withEpochFileLock` holds the state
+       file's advisory lock across the whole read-modify-write, so another
+       INCARNATION's refine blocks behind a wedged worker until it unwedges.
+       Nothing in *this* process does — the refine slot is a CAS word, not a
+       lock.
+
+       **Three rules for tests in this area**, each of which was a real
+       cross-test failure before it was a rule:
+
+       1. `bootEpochReady` **is not a drain.** The worker closes it from inside
+          its loop and then still calls `releaseBootEpochRefine`, which reads a
+          package-var seam, and may run further coalesced passes. Use
+          `awaitFirstRefine`, which waits for the channel AND drains.
+       2. **Unpark every seam on the failure path**, from a `t.Cleanup` rather
+          than the end of the body. `t.Fatalf` runs `runtime.Goexit` and skips
+          the rest of the body, so an assertion that fires while a requester is
+          parked inside `claimBootEpochRefine` leaves that goroutine holding
+          `bootEpochRefineMu` for the life of the process — and every later test
+          that starts or stops a worker then blocks on it, turning one
+          assertion into a package-wide `panic: test timed out` naming an
+          unrelated test.
+       3. **Join a requester goroutine; do not poll the word for it.**
+          `waitBootEpochIdle` reads `bootEpochRefine`, and that word reads 0 in
+          the window after a worker releases the slot and before an unparked
+          requester re-claims it, so a test can return while the requester is
+          still inside `startBootEpochRefine` reading `bootEpochPath`.
+          `keyedEpochManager`'s cleanup join is no backstop: it joins a
+          REGISTERED worker, and a requester that has not claimed yet is not
+          one.
   - **No clone/bake requirement** (unlike the SNMPv3 engine-id, `pkg/snmp`).
     Epochs are compared per-PEER, never between the two nodes, so two chassis
     cloned from one image may hold identical persisted boot epochs harmlessly;

@@ -642,12 +642,22 @@ const heartbeatReplaySessions = 64
 //   - unbounded (pre-round-10) is the #6169 replay hole itself: 65 captured
 //     incarnations sharing one epoch churned the ring 1625/1625.
 //
-// Any finite bound keeps the security property, because the floor is monotone:
-// at most this many sessions are ever admitted at a given value, so an
-// attacker's capture set buys a finite ascending pass and NOTHING sustained.
-// The bound must not be refilled by anything an attacker can produce — in
-// particular not by the bound session going quiet, which is free (wait out the
-// dead-peer interval between captures) and restores unbounded admissions.
+// A bound that satisfies the k <= heartbeatReplaySessions invariant below keeps
+// the security property, because the floor is monotone: at most this many
+// sessions are ever admitted at a given value, so an attacker's capture set buys
+// a finite ascending pass and NOTHING sustained. The bound must not be refilled
+// by anything an attacker can produce — in particular not by the bound session
+// going quiet, which is free (wait out the dead-peer interval between captures)
+// and restores unbounded admissions.
+//
+// "ANY FINITE k" IS FALSE, and an earlier revision of this comment asserted it
+// twice. Finiteness is not the property; the invariant is. At k = 65 against a
+// 64-slot ring the sessions admissible at ONE value overflow the ring by
+// themselves: the 65th mark evicts the 1st, whose session is STILL BOUND, so
+// replaying it clears the epoch gate, reads as never-seen to the ring, and is
+// admitted — evicting the 2nd, and so on around. That is sustained churn at a
+// single epoch value, which is the #6169 hole this bound exists to close,
+// reintroduced by a bound that is perfectly finite.
 //
 // 2 admits a legitimate successor at an unchanged epoch ONLY when nothing else
 // has spent a slot, and it is far below heartbeatReplaySessions so the sessions
@@ -687,8 +697,11 @@ const heartbeatReplaySessions = 64
 // an availability floor, not a security one — k >= 2 is what admits a
 // legitimate successor at an unchanged epoch when nothing else has spent a slot.
 //
-// The SECURITY property holds for ANY finite k and is unaffected by the choice:
-// the floor stays monotone and the budget stays finite and non-refilling.
+// The SECURITY property is unaffected by the choice WITHIN that invariant: for
+// any k <= heartbeatReplaySessions the floor stays monotone and the budget stays
+// finite and non-refilling. It is NOT a consequence of finiteness alone — see
+// the k = 65 counterexample above, where a finite bound larger than the ring
+// restores exactly the sustained churn this constant closes.
 // See heartbeatAuthState.highEpochSessions for the rest of the cost.
 const heartbeatEpochSessionsPerEpoch = 2
 

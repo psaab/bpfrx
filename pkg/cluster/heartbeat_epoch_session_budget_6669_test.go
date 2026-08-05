@@ -70,18 +70,7 @@ func startedIncarnation(t *testing.T, what string) *Manager {
 	m.controlAuthKey = []byte("cluster-shared-secret")
 	m.mu.Unlock()
 	m.initHeartbeatEpochState()
-	select {
-	case <-m.bootEpochReady:
-	case <-time.After(5 * time.Second):
-		t.Fatalf("%s: the first refine never completed", what)
-	}
-	// bootEpochReady is NOT a drain: the worker closes it and then still reads
-	// the epochRefineBeforeRelease package var before clearing bootEpochRefining.
-	// Joining only ready lets this test return and a later test assign that var
-	// while the read is in flight — the same "ready is not a drain" shape the
-	// round-11 fix removed from TestInitHeartbeatEpochStateNeverBlocks_6169, so
-	// it must not be reintroduced here.
-	waitBootEpochIdle(t, m)
+	awaitFirstRefine(t, m, what)
 	return m
 }
 
@@ -172,13 +161,42 @@ func TestEqualEpochSuccessorIsAdmitted_6669(t *testing.T) {
 				len(distinct), heartbeatEpochSessionsPerEpoch)
 		}
 
-		// NOTHING SUSTAINED, and nothing refills the slots. Each round leaves
-		// every session silent for the whole of the rest of the round, which is
-		// exactly what an attacker does to age out a staleness-based rebind.
-		sustained := 0
-		for r := 0; r < 5; r++ {
+		// NOTHING SUSTAINED. Replaying the whole capture set five more times
+		// admits nothing, and the floor never moves.
+		//
+		// WHAT THIS DOES NOT MODEL, stated because an earlier revision of this
+		// comment claimed it did: the rounds below are silent but
+		// INSTANTANEOUS — no wall-clock interval elapses and no clock is
+		// injected — so they are not "aging out a staleness-based rebind" and
+		// could not detect one. Nothing to age out exists today:
+		// epochSessionAdmissible is a pure predicate over highEpochSessions,
+		// bindEpochSession is its only mutator, and neither reads a clock, so
+		// the budget is refilled by a floor RAISE and by nothing else (see the
+		// a_raise_resets_the_slots subtest). A future time-based refill would
+		// need its own gate and would escape this one.
+		//
+		// WHICH GATE refused what is asserted, not just the total, because
+		// 0-admitted is the FAILURE DEFAULT here: malformed frames, a wrong key,
+		// or a drifted floor would all produce it. The split is exact and the
+		// two halves are different mechanisms:
+		//
+		//   - the sessions NOT in the bound set are refused by the EPOCH budget
+		//     (EpochSessionCollision), which is the property under test;
+		//   - the heartbeatEpochSessionsPerEpoch sessions that ARE bound clear
+		//     the epoch gate and are refused by the RING, on their own stale
+		//     counters. Those must NOT show up as collisions — if they did, the
+		//     binding would have been dropped and the budget would be refilling.
+		const rounds = 5
+		bound := heartbeatEpochSessionsPerEpoch
+		wantCollisions := uint64(rounds * (n - bound) * epochFramesPerIncarnation)
+		wantRingRefused := rounds * bound * epochFramesPerIncarnation
+
+		collisionsBefore := e.m.HeartbeatStats().EpochSessionCollision
+		sustained, replayed := 0, 0
+		for r := 0; r < rounds; r++ {
 			for _, s := range sessions {
 				for _, f := range framesFor(e, s, shared, 1, epochFramesPerIncarnation) {
+					replayed++
 					if e.feed(f) {
 						sustained++
 					}
@@ -186,8 +204,22 @@ func TestEqualEpochSuccessorIsAdmitted_6669(t *testing.T) {
 			}
 		}
 		if sustained != 0 {
-			t.Fatalf("%d frames admitted across five replay rounds, want 0 — a shared-epoch "+
-				"capture set is sustaining forged peer liveness", sustained)
+			t.Fatalf("%d frames admitted across %d replay rounds, want 0 — a shared-epoch "+
+				"capture set is sustaining forged peer liveness", sustained, rounds)
+		}
+		gotCollisions := e.m.HeartbeatStats().EpochSessionCollision - collisionsBefore
+		if gotCollisions != wantCollisions {
+			t.Fatalf("the epoch budget refused %d of the %d replayed frames, want %d "+
+				"(%d unbound sessions x %d frames x %d rounds). 0 admitted does not "+
+				"establish that the per-value BUDGET is what held unless the budget is "+
+				"what did the refusing", gotCollisions, replayed, wantCollisions,
+				n-bound, epochFramesPerIncarnation, rounds)
+		}
+		if got := replayed - int(gotCollisions); got != wantRingRefused {
+			t.Fatalf("%d frames reached the ring, want %d (the %d BOUND sessions' own stale "+
+				"counters). A bound session refused by the epoch gate instead would mean the "+
+				"binding was dropped between rounds, i.e. the budget refilled", got,
+				wantRingRefused, bound)
 		}
 		if got := e.r.auth.peerEpochFloor(); got != shared {
 			t.Fatalf("floor = %d, want %d (a replay must never move the floor)", got, shared)
@@ -290,11 +322,21 @@ func TestEqualEpochSuccessorIsAdmitted_6669(t *testing.T) {
 // clock to climb past prev+1 AND another restart — up to however far the file
 // leads the clock, at most bootEpochMaxSkew.
 //
-// Closing it needs the sender to stop republishing one value, and the only local
-// source of distinctness is this incarnation's own entropy, so any such fix is
-// probabilistic and has nothing to draw on in the degenerate case (a clock at or
-// before the Unix epoch with no chainable file). A receiver-side bound is needed
-// either way; see highEpochSessions.
+// Closing it needs the sender to stop republishing one value, and ENTROPY IS NOT
+// WHAT IS MISSING — an earlier revision of this comment said the degenerate case
+// (a clock at or before the Unix epoch with no chainable file) had "nothing to
+// draw on". It has 64 crypto-random bits already: every Manager draws an
+// incarnation session id from crypto/rand at its first signed send
+// (randomSessionID, via Manager.heartbeatNonce), with no dependence on the clock
+// or on the file, and already carries it in every frame.
+//
+// What blocks using it is that the EPOCH is an ordering value, not an identity:
+// the receiver compares it with < and >, so folding random bits in produces a
+// successor that can land BELOW its predecessor, which admitAuthedLocked refuses
+// outright — trading a bounded stranding for an unbounded one. Distinctness
+// would have to come from something MONOTONE the sender can produce without the
+// file, and that is what the degenerate case does not have. A receiver-side
+// bound is needed either way; see highEpochSessions.
 func TestEqualEpochBoundStillStrandsTheNextSuccessor_6669(t *testing.T) {
 	_, fileVal := epochUnwritableStore(t, 30*time.Minute)
 

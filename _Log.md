@@ -67295,3 +67295,234 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/heartbeat.go, pkg/cluster/README.md,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 22:35 PDT
+- **Action**: #6669 round 14 — REPRODUCE and fix the cross-test data race the
+  round-13 entry only inferred; stop `joinBootEpochRefine` leaking a waiter per
+  timed-out call; make three tests assert something only working code produces;
+  correct four claims that were still internally inconsistent.
+- **Item 1 — the race is REPRODUCED, and round 13's explanation was incomplete.**
+  Round 13 closed one "ready is not a drain" site and recorded, honestly, that
+  the round-12 `-race` failure "did not recur" and that the fix was "an
+  inference and not a reproduction". It reproduces deterministically:
+
+      go test -race ./pkg/cluster \
+        -run 'Test(HeldFlockCannotCauseFalsePeerDeath_6169|LateRefineRequestIsReclaimed_6669)$' \
+        -count=100
+
+  fails on the first iteration with a WRITE of `epochRefineBeforeRelease` at
+  `heartbeat_epoch_session_bind_6669_test.go:336` (the SECOND test installing
+  its seam) against a READ at `heartbeat_epoch.go:791` by the FIRST test's
+  refine worker, inside `releaseBootEpochRefine`. The worker closes
+  `bootEpochReady` from inside its loop and only then reaches the release seam,
+  so receipt from that channel is not a join and the worker escapes the test.
+  Round 13 fixed the one site it had caught; five sites were still doing it
+  (`TestHeldFlockCannotCauseFalsePeerDeath_6169`,
+  `TestStartHeartbeatReturnsWithAUsableEpoch_6169`, both subtests of
+  `TestHeartbeatBootEpochRefinementCompletes_6169`, and
+  `TestBootEpochNeverBlocksOnStorage_6169`), and eleven hand-rolled the bare
+  receive in total. The drain now lives once, in `awaitFirstRefine`, which waits
+  for ready AND `waitBootEpochIdle`; the six remaining sites survived only on
+  `keyedEpochManager`'s `t.Cleanup` join, which is a backstop, not a drain.
+  `heartbeatBootEpoch`'s own comment had ADVERTISED the channel as a join
+  ("tests use it to join the worker") — that claim is what produced the bug and
+  it is corrected at the source.
+- **Item 2 — every timed-out join leaked a goroutine.**
+  `joinBootEpochRefine` spawned `go func() { m.bootEpochWG.Wait(); close(done) }()`
+  per call and its timeout returned only the CALLER. Nothing cancels a
+  `WaitGroup.Wait`, so over a wedged store each call left one goroutine parked
+  for the life of the process. "Small and bounded" holds for ONE terminal
+  `Stop`; it is not called once (`Stop` is public, and `waitBootEpochIdle` /
+  `keyedEpochManager` join on every epoch test). Measured on a parked worker:
+  8 timed-out joins, 8 permanent waiters. The `WaitGroup` is replaced by
+  `Manager.bootEpochWorkerDone` — the worker's own exit channel, published under
+  `bootEpochRefineMu` at spawn and closed as the worker's last act — so a join
+  is a select on a channel somebody else closes and a timeout costs nothing.
+  Same measurement after: 0. The comment claiming the worker "holds no locks a
+  caller can wait on" is also false and corrected: `withEpochFileLock` holds the
+  state file's advisory lock across the whole read-modify-write, so another
+  INCARNATION's refine blocks behind a wedged worker.
+- **Item 3 — three tests asserted their own failure default.**
+  (a) `TestStopDoesNotBlockOnAWedgedRefineWorker_6669` checked a zero refine word
+  and an unchanged watermark after a refresh on a stopped manager — both of which
+  an ILLEGAL worker that spawned and finished quickly also produces, since the
+  extra pass is idempotent. It now counts LOCKED PASSES through the `epochFlock`
+  seam and asserts the count does not move, after joining. (b)
+  `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` claimed twenty requests
+  overlapped and coalesced but imposed no seam and asserted no pass count —
+  twenty strictly sequential workers satisfied it. The worker is now parked
+  inside its first locked pass while all twenty land, the word is asserted to be
+  exactly `{refining|pending}`, and the pass count exactly 2. (c) the no-refill
+  subtest claimed to model waiting out a staleness interval while neither
+  advancing an injected clock nor sleeping. There is no clock to advance —
+  `epochSessionAdmissible` is a pure predicate and `bindEpochSession` its only
+  mutator — so the comment now says what the rounds ARE (silent but
+  instantaneous, and unable to detect a future time-based refill), and the
+  assertion is strengthened to split the 1625 refusals by GATE: 1575 by the
+  epoch budget and 50 (the two BOUND sessions' own stale counters) by the ring.
+  0-admitted was the failure default; the split is not.
+- **Item 4 — four corrected claims that were still inconsistent.** (1)
+  `heartbeatEpochSessionsPerEpoch` said the security property "holds for ANY
+  finite k", twice, while the invariant three paragraphs down is
+  `k <= heartbeatReplaySessions`. At k=65 against a 64-slot ring the admissible
+  sessions overflow the ring themselves — the 65th mark evicts the 1st, whose
+  session is still BOUND, so replaying it clears the epoch gate, reads as
+  never-seen, and is admitted, evicting the 2nd. Sustained churn from a finite
+  bound. (2) README.md and the recovery test said both refinement-recovery
+  conditions need the same missing state; `withEpochFileLock`'s comment is the
+  accurate one — condition 1 needs only a retry TRIGGER (A retries its failed
+  persist, B reads `b+1` and raises to `b+2`), which is the smaller half of
+  #6724. (3) README said a join timeout leaves "one `fsatomic` write"; it can
+  leave TWO, because a request that set the pending bit while the pass was
+  wedged is served as a follow-up once it unblocks. (4) the budget test said the
+  degenerate case has no source of distinctness; every Manager already draws 64
+  crypto-random bits (`randomSessionID`, via `heartbeatNonce`) with no
+  dependence on clock or file. What blocks using them is that the epoch is an
+  ORDER — random low bits produce a successor BELOW its predecessor, which
+  `admitAuthedLocked` refuses outright.
+- **Validation.** `go build ./...` rc 0, `go vet ./...` rc 0. Full Go suite
+  green. `go test -race ./pkg/cluster -count=5` clean. The Item-1 repro at
+  `-count=100`: 1 DATA RACE before, 0 after. Every fix mutated out by Edit and
+  confirmed RED with a real assertion (or, for Item 1, a real race report), with
+  `go build` and `go vet` clean in both states.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/manager.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_budget_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 23:20 PDT
+- **Action**: #6669 round 14 addendum — the Item-2 join rework INTRODUCED a
+  three-goroutine deadlock in `pkg/cluster`. Found by the full-package run,
+  established at the parent by measurement, fixed, and now guarded by an
+  assertion instead of a hang.
+- **What happened.** The first form of the Item-2 fix stored the worker's exit
+  channel in a plain `Manager` field and read it under `bootEpochRefineMu`. That
+  mutex is held across `claimBootEpochRefine` — and therefore across its
+  `epochRefineAfterLostClaim` seam, where a requester can be parked
+  indefinitely. `TestLateRefineRequestCannotBeStranded_6669` drives exactly that
+  schedule: it parks a requester at the seam and THEN calls
+  `joinBootEpochRefine`. Three goroutines deadlocked on the one mutex
+  (`0xc0002c1dcc` in the dump): the requester holding it at
+  `heartbeat_epoch.go:767`, the worker's exit defer blocked at `:937`, and the
+  join blocked at `:854`. `go test ./...` and `go test -race ./pkg/cluster
+  -count=5` both wedged 600 s and died on the 10-minute test timeout.
+- **It is MINE, and that is measured rather than argued.** The same test at the
+  parent `bb9ae0d75`, in a throwaway detached worktree
+  (`/var/tmp/probe6669parent`), passes 3/3 in 0.00 s. The parent's
+  `joinBootEpochRefine` used a `WaitGroup` and took no lock, and the parent's
+  worker exit was a bare `defer m.bootEpochWG.Done()` — neither touched
+  `bootEpochRefineMu`. Both acquisitions were introduced by round 14.
+- **Fix.** The handle is now an `atomic.Pointer[bootEpochRefineWorker]`. It is
+  still PUBLISHED under `bootEpochRefineMu`, which is what keeps `Stop`'s
+  refuse-then-join ordering airtight, but the join LOADS it and the worker's
+  exit CLEARS it (CAS) without the lock. The two operations that must always
+  make progress no longer wait on a mutex that a parked requester can hold.
+- **Process lesson, recorded because it is the actual defect.** F1 was validated
+  with a NARROW `-run` filter that did not include the one test driving this
+  schedule, and every new test was run individually. A lifecycle change must be
+  validated against the WHOLE package before anything else. It also failed as a
+  ten-minute timeout rather than an assertion, which is why
+  `TestJoinDoesNotBlockBehindAParkedRequester_6669` now exists: it drives the
+  same schedule and asserts in 200 ms that a bounded join returned.
+- **Validation.** `go build ./...` rc 0, `go vet ./...` rc 0. Whole
+  `pkg/cluster` package green in 12.7 s (was: wedged at 600 s).
+  Mutating the handle back under `bootEpochRefineMu` reds the new guard with
+  "joinBootEpochRefine had not returned 5.02325974s after its 200ms budget".
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/manager.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 07:52 PDT
+- **Action**: #6669 round 14 (continued) — salvage the killed 2026-08-01 lane's
+  uncommitted work, AUDIT it rather than trust it, and close three defects the
+  audit found in the round-14 changes themselves: a new guard that could not
+  report, the same hazard in two sibling tests, and a real cross-test flake in
+  the new deadlock guard.
+- **Provenance.** The worktree was found dirty with four-day-old uncommitted
+  work (+718/-134 across 10 files, mtimes 2026-08-01 22:20-22:28, no live
+  process) from the run that was killed mid-round. Every hunk was re-derived
+  against the Codex verdict at `bb9ae0d75` and every guard re-proved from
+  scratch; nothing was taken on the strength of the previous entry.
+- **Defect 1 — the deadlock guard could not report, and the 08-01 entry's
+  RED-on-revert claim was FALSE AS WRITTEN.** That entry states the mutation
+  "reds the new guard with `joinBootEpochRefine had not returned 5.02325974s
+  after its 200ms budget`". Measured at the same head, it does not. Reverting
+  the handle read back under `bootEpochRefineMu` produced
+  `panic: test timed out` with NO assertion at both `-timeout 60s` and
+  `-timeout 120s`. The goroutine dump gives the mechanism: the 5 s assertion DOES
+  fire, but `t.Fatalf` -> `FailNow` -> `runtime.Goexit` runs the cleanups, and
+  `keyedEpochManager`'s cleanup join (`heartbeat_epoch_refresh_6669_test.go:126`)
+  then blocks forever on the mutex the parked requester still holds — because
+  Goexit skipped the `close(resumeRequester)` at the end of the body. The
+  message is buffered and never flushed, so the guard reported the exact failure
+  mode its own comment says it exists to replace. Unparking now happens from a
+  `t.Cleanup`, and the same mutation fails cleanly:
+  `--- FAIL: TestJoinDoesNotBlockBehindAParkedRequester_6669 (5.03s)` carrying
+  the intended message.
+- **Defect 2 — the same hazard in two siblings.**
+  `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` asserts the refine word
+  while pass 1 is parked in the `epochFlock` seam; on failure that worker stayed
+  parked for the life of the binary and would later read
+  `epochRefineBeforeRelease` while another test assigned it — the very
+  cross-test race `awaitFirstRefine` exists to stop, reintroduced on the failure
+  path. `TestLateRefineRequestCannotBeStranded_6669` is worse: its assertions
+  fire while the REQUESTER is parked inside `claimBootEpochRefine` holding
+  `bootEpochRefineMu`, so one failure there would wedge every later test in the
+  package and surface as a timeout naming an unrelated test. This is the likely
+  mechanism behind the ten-minute `panic: test timed out` in that test recorded
+  on 08-01. Both now unpark from a `t.Cleanup`, via `sync.Once` so the
+  happy-path closes stay single.
+- **Defect 3 — a REAL FLAKE in the new guard, found by the 5x repeat.**
+  `TestJoinDoesNotBlockBehindAParkedRequester_6669` spawned
+  `go m.refreshBootEpoch()` and never joined that goroutine; `waitBootEpochIdle`
+  polls `bootEpochRefine`, and that word reads 0 in the window after the worker
+  releases the slot and before the unparked requester re-claims it. The test
+  could therefore return and let its cleanups restore `bootEpochPath` and
+  `epochRefineBeforeRelease` while the requester was still reading them.
+  Measured: 1 failure in 8 runs at `-count=5`, two data races per failure
+  (`heartbeat_epoch.go:952` vs `refresh_6669_test.go:115`, and
+  `heartbeat_epoch.go:811` vs `refresh_6669_test.go:532`).
+  `keyedEpochManager`'s join is no backstop — it joins a REGISTERED worker, and
+  a requester that has not claimed yet is not one. The test now joins the
+  goroutine itself, and the unpark-then-join pair is ONE cleanup because
+  `t.Cleanup` is LIFO and a separately registered join would run before the
+  unpark. After the fix: 15 iterations x `-count=5` (75 runs of each test), 0
+  failures.
+- **Guards re-proved from scratch, each watched RED then GREEN.**
+  1. `awaitFirstRefine` (the F1 race): reverting the drain in
+     `TestHeldFlockCannotCauseFalsePeerDeath_6169` reproduces Codex's race
+     exactly — WRITE at `session_bind_6669_test.go:336` vs READ at
+     `heartbeat_epoch.go:811` by the escaped worker; rc 1 -> restored rc 0.
+  2. `TestTimedOutJoinLeavesNoWaiterBehind_6669`: re-adding a per-call
+     forwarding helper fails with "8 goroutine(s) parked in the join after 8
+     timed-out calls" — the claimed count exactly.
+  3. `TestJoinDoesNotBlockBehindAParkedRequester_6669`: as above, 5.03 s clean
+     FAIL, re-proved against the FINAL test after the flake fix.
+  4. `TestStopDoesNotBlockOnAWedgedRefineWorker_6669`: Codex's own scenario —
+     removing the stopped guard AND letting the illegal worker COMPLETE leaves
+     the refine word 0 and the watermark unmoved, so both failure-default
+     assertions PASS and only the new locked-pass count catches it ("a stopped
+     manager ran 1 further locked refine pass(es) (1 -> 2)"). That is the
+     finding refuted directly.
+  5. `TestCoalescingDoesNotRatchetOnAHealthyNode_6669`, word assertion:
+     dropping a busy request instead of setting pending gives "refine word =
+     0x1 ... want 0x3".
+  6. Same test, pass-count assertion IN ISOLATION: an over-serving worker (the
+     locked pass run twice per iteration) is idempotent, so the word, the epoch
+     and the file are all unchanged and only the count moves — "4 locked refine
+     passes ... want exactly 2".
+  7. `TestEqualEpochSuccessorIsAdmitted_6669` per-gate split: dropping the
+     already-bound recognition in `epochSessionAdmissible` keeps `sustained ==
+     0` (the failure default Codex flagged) and is caught ONLY by the new
+     collision count — "the epoch budget refused 1625 of the 1625 replayed
+     frames, want 1575".
+- **Validation.** `go build ./...` rc 0; `go vet ./pkg/cluster/` rc 0; `gofmt
+  -l pkg/cluster/` empty. `go test -race ./pkg/cluster/...` rc 0 in 17.5 s with
+  `TMPDIR=/tmp` — the socket/netlink failures Codex hit under a restricted
+  environment did not occur. Codex's `-count=100` race repro: rc 0 on five
+  consecutive runs. Focused suite: 15 iterations x `-count=5`, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/README.md, _Log.md

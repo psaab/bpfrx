@@ -267,9 +267,21 @@ type Manager struct {
 	// caller that must not block cannot build an unbounded backlog of fsync-ing
 	// workers.
 	//
-	// bootEpochWG tracks the worker so Manager.Stop can join it (bounded);
-	// bootEpochStopped, under bootEpochRefineMu, keeps a spawn from Add-ing to a
-	// WaitGroup that Stop is already waiting on. See Manager.joinBootEpochRefine.
+	// bootEpochWorker is the CURRENT refine worker's exit handle — nil when none
+	// is running — so Manager.Stop can join it with a bound and WITHOUT spawning
+	// a waiter of its own. A per-call `go func() { wg.Wait(); close(done) }()`
+	// helper is not cancelled by the caller's timeout, so every timed-out join
+	// left one goroutine parked for as long as the worker was wedged, which is
+	// forever.
+	//
+	// It is an atomic.Pointer, NOT a field under bootEpochRefineMu: that mutex
+	// is held across claimBootEpochRefine (and so across its
+	// epochRefineAfterLostClaim seam, where a requester can park indefinitely),
+	// while the join and the worker's exit are precisely the two operations that
+	// must not block. It is PUBLISHED under the mutex all the same, which is
+	// what keeps Stop's refuse-then-join ordering airtight; bootEpochStopped,
+	// under that mutex, refuses a spawn once Stop has begun.
+	// See Manager.joinBootEpochRefine.
 	bootEpochOnce     sync.Once
 	bootEpoch         atomic.Uint64
 	bootEpochReady    chan struct{}
@@ -277,7 +289,7 @@ type Manager struct {
 	bootEpochRefine   atomic.Uint32
 	bootEpochRefineMu sync.Mutex
 	bootEpochStopped  bool
-	bootEpochWG       sync.WaitGroup
+	bootEpochWorker   atomic.Pointer[bootEpochRefineWorker]
 
 	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
 	// The rejection is operator-actionable — a peer rolled back to a pre-#6169
@@ -662,9 +674,10 @@ func (m *Manager) Start(ctx context.Context) {
 // simply skips the persistence refinement, which is the same degradation a
 // wedged store produces and which the design already treats as survivable.
 func (m *Manager) Stop() {
-	// Refuse new refine workers BEFORE waiting on the ones already registered,
-	// so the WaitGroup cannot be Add-ed to while joinBootEpochRefine waits on
-	// it. startBootEpochRefine claims and registers under this same lock.
+	// Refuse new refine workers BEFORE joining the one already running, so a
+	// spawn cannot slip in behind the join and outlive it. startBootEpochRefine
+	// claims the slot and publishes the worker's exit channel under this same
+	// lock, so the two orders cannot interleave.
 	m.bootEpochRefineMu.Lock()
 	m.bootEpochStopped = true
 	m.bootEpochRefineMu.Unlock()

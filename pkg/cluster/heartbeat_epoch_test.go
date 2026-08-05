@@ -714,12 +714,9 @@ func TestHeartbeatBootEpochRefinementCompletes_6169(t *testing.T) {
 		}
 		// JOIN the worker rather than polling for a value that is already set —
 		// this is what makes the test observe the refinement at all, and it also
-		// keeps the worker from outliving t.TempDir.
-		select {
-		case <-m.bootEpochReady:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the refinement worker never completed")
-		}
+		// keeps the worker from outliving t.TempDir. bootEpochReady on its own
+		// does NOT do the second half; see awaitFirstRefine.
+		awaitFirstRefine(t, m, "the refinement worker")
 
 		// It ran: the epoch reached disk.
 		raw, err := os.ReadFile(path)
@@ -755,11 +752,7 @@ func TestHeartbeatBootEpochRefinementCompletes_6169(t *testing.T) {
 
 		m := NewManager(0, 42)
 		published := m.heartbeatBootEpoch()
-		select {
-		case <-m.bootEpochReady:
-		case <-time.After(5 * time.Second):
-			t.Fatal("the refinement worker never completed")
-		}
+		awaitFirstRefine(t, m, "the refinement worker")
 		final := m.heartbeatBootEpoch()
 		if final <= published {
 			t.Fatalf("refinement did not raise the epoch: published %d, final %d "+
@@ -826,6 +819,12 @@ func TestBootEpochNeverBlocksOnStorage_6169(t *testing.T) {
 	if _, present := heartbeatFrameEpoch(frame, key); !present {
 		t.Fatal("a node with unwritable state emitted an epoch-less frame")
 	}
+
+	// DRAIN. The loop above stops at bootEpochReady, which the worker closes
+	// while it is still running — it goes on to read epochRefineBeforeRelease
+	// inside releaseBootEpochRefine, and a later test in this package assigns
+	// that var. See awaitFirstRefine.
+	waitBootEpochIdle(t, m)
 }
 
 // TestBootEpochRefinementRaisesAfterBackwardClockStep_6169 pins the other half:
