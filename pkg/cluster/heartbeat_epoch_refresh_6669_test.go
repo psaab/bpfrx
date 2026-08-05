@@ -32,11 +32,33 @@ import (
 // early.
 //
 // It waits for the WHOLE word to reach 0, which is both bits: a pass owed but
-// not yet started is not idle. It then joins the worker goroutine itself.
-// Clearing the word is the worker's last touch of Manager state, but the
-// goroutine has not necessarily RETURNED at that instant, and a test whose
-// t.Cleanup restores a package var the worker reads (epochFlock,
-// epochNowNanos, epochRefineBeforeRelease) races it if it only polls.
+// not yet started is not idle. Clearing the word is the worker's last touch of
+// Manager state, but the goroutine has not necessarily RETURNED at that
+// instant, and a test whose t.Cleanup restores a package var the worker reads
+// (epochFlock, epochNowNanos, epochRefineBeforeRelease) races it if it only
+// polls. So it then joins.
+//
+// WHAT THE JOIN OBSERVES IS THE HANDLE RETIRED AND done CLOSED — NOT that the
+// goroutine has returned. An earlier revision of this comment said "it then
+// joins the worker goroutine itself", and that is false in two ways, both
+// arising because the signal is published before the event it names:
+//
+//   - the worker's exit defer runs CompareAndSwap(worker, nil) BEFORE
+//     close(worker.done), and joinBootEpochRefine returns immediately on a nil
+//     handle — so a joiner arriving between those two statements reports
+//     "joined" with the goroutine still running;
+//   - even a joiner that does receive from done is woken by the close, which is
+//     itself still inside the deferred function. Measured: insert `select {}`
+//     immediately after close(worker.done) and the worker never exits, yet this
+//     helper and its callers stay green 20/20.
+//
+// It is still the right drain for what tests need, and that is the narrower
+// thing to rely on: after close(worker.done) the worker executes only the
+// return from that defer and the goroutine exit. It reads no package var and
+// touches no Manager state, so a t.Cleanup restoring a seam behind this call
+// cannot race it. A test that needs the GOROUTINE gone — rather than merely
+// harmless — must observe that itself; see currentGoroutineID and
+// clusterGoroutines.
 func waitBootEpochIdle(t *testing.T, m *Manager) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

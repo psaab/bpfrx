@@ -226,6 +226,19 @@ var epochNowNanos = func() int64 { return time.Now().UnixNano() }
 // No-op by default and never set outside tests.
 var epochRefineBeforeRelease = func() {}
 
+// epochRefineWorkerBeforeExit is a test seam in the ONE window that makes the
+// handle retire a CompareAndSwap rather than a Store: after
+// releaseBootEpochRefine has dropped the in-flight bit, and before this worker's
+// deferred clear runs. The slot is free in there, so a successor can claim it
+// and publish its own handle — and a retire written as Store(nil) would erase
+// that live successor, after which Stop observes nil and joins nothing.
+//
+// The window is a few instructions wide and closes on its own, so no amount of
+// hammering lands a successor inside it; the seam is what makes
+// TestRetiringWorkerDoesNotEraseASuccessor_6669 deterministic. Production cost
+// is one call to an empty func on a path that runs once per worker.
+var epochRefineWorkerBeforeExit = func() {}
+
 // epochRefineAfterLostClaim is the OTHER side of that same window, and it is a
 // seam for the same reason: the interleaving cannot be scheduled from a test
 // without one.
@@ -1024,6 +1037,7 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 				close(ready)
 			}
 			if !m.releaseBootEpochRefine() {
+				epochRefineWorkerBeforeExit()
 				return
 			}
 		}

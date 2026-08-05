@@ -263,19 +263,22 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 		unparkPass2()
 	})
 
-	// Baseline before any worker exists, for the ownership assertion below.
-	goBase := clusterGoroutines()
-
 	m.initHeartbeatEpochState()
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("pass 1 never reached the lock")
 	}
-	if got := clusterGoroutines() - goBase; got != 1 {
-		t.Fatalf("%d package goroutines in flight with pass 1 parked, want exactly 1; the "+
-			"ownership assertion below is only meaningful against a known baseline", got)
-	}
+	// ANCHORED ON THE PARKED WORKER, NOT ON A PRE-EXISTENCE BASELINE. Sampling
+	// before initHeartbeatEpochState counts whatever this package still has in
+	// flight from EARLIER tests, and if one of those exits before the check the
+	// delta reads one lower — observed once under concurrent-process stress as
+	// "0 package goroutines ... want exactly 1", never reproduced in isolation
+	// at -count=500. Every comparison below is instead between two samples taken
+	// while pass 1 is deterministically parked, so background drift before the
+	// park cannot reach them and the property asserted — that these requests add
+	// no goroutine — is the one actually measured.
+	goParked := clusterGoroutines()
 
 	// The request that must not be lost, made while pass 1 is in flight.
 	m.refreshBootEpoch()
@@ -312,11 +315,12 @@ func TestOverlappingRefineRequestIsCoalesced_6669(t *testing.T) {
 	// is deterministically parked inside epochFlock across both reads, so no
 	// worker is retiring while they are taken. Anyone reusing this assertion
 	// outside such a checkpoint needs to re-establish that first.
-	if got := clusterGoroutines() - goBase; got != 1 {
-		t.Fatalf("%d package goroutines in flight after the overlapping request, want exactly "+
-			"1: the request did not coalesce onto the worker already running, it spawned "+
-			"another. The flock still serialises their writes, so the epoch assertions "+
-			"further down can miss this — see the comment above", got)
+	if got := clusterGoroutines(); got != goParked {
+		t.Fatalf("package goroutines went %d -> %d across the overlapping request, want no "+
+			"change: the request did not coalesce onto the worker already running, it "+
+			"spawned another. The flock still serialises their writes, so the epoch "+
+			"assertions further down can miss this — see the comment above",
+			goParked, got)
 	}
 
 	unparkPass1()
@@ -559,7 +563,6 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 		unparkPass2()
 	})
 
-	goBase := clusterGoroutines()
 	m.initHeartbeatEpochState()
 	select {
 	case <-atRelease:
@@ -570,9 +573,16 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 		t.Fatalf("refine word = %#x with pass 1 parked before release, want %#x; the schedule "+
 			"this test needs did not happen", got, want)
 	}
-	if got := clusterGoroutines() - goBase; got != 1 {
-		t.Fatalf("%d package goroutines with pass 1 parked, want exactly 1", got)
-	}
+	// ANCHORED ON THE PARKED WORKER, NOT ON A PRE-EXISTENCE BASELINE. Sampling
+	// before initHeartbeatEpochState counts whatever this package still has in
+	// flight from EARLIER tests, and if one of those exits before the check the
+	// delta reads one lower — observed once under concurrent-process stress as
+	// "0 package goroutines ... want exactly 1", never reproduced in isolation
+	// at -count=500. Every comparison below is instead between two samples taken
+	// while pass 1 is deterministically parked, so background drift before the
+	// park cannot reach them and the property asserted — that these requests add
+	// no goroutine — is the one actually measured.
+	goParked := clusterGoroutines()
 	// The worker's own exit handle, used below to prove the SAME worker serves
 	// the follow-up rather than handing it to a successor.
 	w1 := m.bootEpochWorker.Load()
@@ -595,9 +605,10 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 		t.Fatalf("refine word = %#x after a request arriving on an ALREADY-PENDING word, want "+
 			"%#x", got, want)
 	}
-	if got := clusterGoroutines() - goBase; got != 1 {
-		t.Fatalf("%d package goroutines after the third request, want exactly 1: it re-armed a "+
-			"worker instead of coalescing onto the follow-up already owed", got)
+	if got := clusterGoroutines(); got != goParked {
+		t.Fatalf("package goroutines went %d -> %d across the third request, want no change: "+
+			"it re-armed a worker instead of coalescing onto the follow-up already owed",
+			goParked, got)
 	}
 
 	unparkWorker()
@@ -642,8 +653,9 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 			"own follow-up: a handle is published per CLAIMED WORKER, not per pass, and " +
 			"rotating it would release a joiner holding the old one early")
 	}
-	if got := clusterGoroutines() - goBase; got != 1 {
-		t.Fatalf("%d package goroutines while the follow-up runs, want exactly 1", got)
+	if got := clusterGoroutines(); got != goParked {
+		t.Fatalf("package goroutines went %d -> %d by the time the follow-up ran, want no "+
+			"change", goParked, got)
 	}
 	unparkPass2()
 	waitBootEpochIdle(t, m)
@@ -667,6 +679,129 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	}
 	if got := m.bootEpochRefine.Load(); got != 0 {
 		t.Fatalf("refine word settled at %#x, want 0", got)
+	}
+}
+
+// TestRetiringWorkerDoesNotEraseASuccessor_6669 is the fail-on-revert gate for
+// the handle retire being a COMPARE-AND-SWAP rather than a Store.
+//
+// The retirement assertion in TestThirdRequestCoalescesOntoTheLateReclaim_6669
+// catches DELETING the clear, but not degrading it: replacing
+// CompareAndSwap(worker, nil) with an unconditional Store(nil) passes it 200/200,
+// because that fixture never has a successor published while the outgoing worker
+// is retiring. Only this ordering distinguishes them:
+//
+//  1. the outgoing worker drops the in-flight bit (releaseBootEpochRefine
+//     returns false) — the slot is now FREE;
+//  2. a successor claims it and publishes its OWN handle;
+//  3. the outgoing worker runs its exit defer.
+//
+// At step 3 a CAS compares against a handle that is no longer current and does
+// nothing, leaving the successor published. A Store(nil) ERASES the live
+// successor — after which Manager.Stop loads nil, joins nothing, and returns
+// while a refine worker is still writing the state file. That is the hazard the
+// comparison exists for, and it is invisible without a successor in the window.
+//
+// The window is a few instructions wide and closes on its own, so hammering
+// cannot land in it; epochRefineWorkerBeforeExit makes it deterministic.
+//
+// RED-on-revert: change the exit defer's CompareAndSwap(worker, nil) to
+// m.bootEpochWorker.Store(nil).
+func TestRetiringWorkerDoesNotEraseASuccessor_6669(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+	m := keyedEpochManager(t, path)
+
+	// Park the SUCCESSOR inside its pass, so it is still live and published
+	// while the outgoing worker retires.
+	var passes atomic.Int64
+	inPass2 := make(chan struct{})
+	releasePass2 := make(chan struct{})
+	var pass2Once sync.Once
+	origFlock := epochFlock
+	epochFlock = func(fd int, how int) error {
+		if passes.Add(1) == 2 {
+			pass2Once.Do(func() {
+				close(inPass2)
+				<-releasePass2
+			})
+		}
+		return origFlock(fd, how)
+	}
+	t.Cleanup(func() { epochFlock = origFlock })
+
+	// Park the OUTGOING worker between dropping the in-flight bit and clearing
+	// its handle — the window a Store would misuse.
+	atExit := make(chan struct{})
+	releaseExit := make(chan struct{})
+	var exitOnce sync.Once
+	origExit := epochRefineWorkerBeforeExit
+	epochRefineWorkerBeforeExit = func() {
+		exitOnce.Do(func() {
+			close(atExit)
+			<-releaseExit
+		})
+	}
+	t.Cleanup(func() { epochRefineWorkerBeforeExit = origExit })
+
+	var unparkExitOnce, unparkPass2Once sync.Once
+	unparkExit := func() { unparkExitOnce.Do(func() { close(releaseExit) }) }
+	unparkPass2 := func() { unparkPass2Once.Do(func() { close(releasePass2) }) }
+	t.Cleanup(func() {
+		unparkExit()
+		unparkPass2()
+	})
+
+	m.initHeartbeatEpochState()
+	select {
+	case <-atExit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first refine worker never reached its exit seam")
+	}
+	w1 := m.bootEpochWorker.Load()
+	if w1 == nil {
+		t.Fatal("no handle published for the outgoing worker")
+	}
+	if got := m.bootEpochRefine.Load(); got != 0 {
+		t.Fatalf("refine word = %#x at the exit seam, want 0: the in-flight bit must already "+
+			"be dropped or a successor cannot claim, and the window under test never opens",
+			got)
+	}
+
+	// STEP 2 — a successor claims the free slot and publishes its own handle,
+	// while the outgoing worker is still parked before its clear.
+	go m.refreshBootEpoch()
+	select {
+	case <-inPass2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the successor never reached the file lock")
+	}
+	w2 := m.bootEpochWorker.Load()
+	if w2 == nil || w2 == w1 {
+		t.Fatalf("successor handle = %p, outgoing = %p: the successor did not publish a "+
+			"handle of its own, so this test cannot tell a CAS from a Store", w2, w1)
+	}
+
+	// STEP 3 — let the outgoing worker run its exit defer, and join it.
+	unparkExit()
+	select {
+	case <-w1.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the outgoing worker never finished retiring")
+	}
+
+	// THE ASSERTION. A CAS against a handle that is no longer current does
+	// nothing. A Store(nil) erases the live successor.
+	if got := m.bootEpochWorker.Load(); got != w2 {
+		t.Fatalf("published handle = %p after the outgoing worker retired, want the LIVE "+
+			"successor %p: the retire is not a compare-and-swap, so it erased a worker that "+
+			"is still running. Manager.Stop then loads nil, joins nothing, and returns while "+
+			"that worker is still writing the state file", got, w2)
+	}
+
+	unparkPass2()
+	waitBootEpochIdle(t, m)
+	if got := m.bootEpochWorker.Load(); got != nil {
+		t.Fatalf("handle = %p after every worker exited, want nil", got)
 	}
 }
 

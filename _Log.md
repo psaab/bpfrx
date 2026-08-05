@@ -67928,3 +67928,63 @@ break — `go vet` confirmed passing under every revert.
   `-count=10` across the six coalescing/reclaim/join tests, rc 0 throughout.
 - **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 16:44 PDT
+- **Action**: #6669 round 21 — two MAJORs. The drain's "joins the goroutine"
+  claim was false and is narrowed to what it observes; the handle retire's
+  CAS-vs-Store distinction is now bound by a fixture that opens the window.
+  Plus the goroutine-count flake and its root cause.
+- **MAJOR 1 — the signal is published before the event it names.** The worker's
+  exit defer runs `CompareAndSwap(worker, nil)` BEFORE `close(worker.done)`, and
+  `joinBootEpochRefine` returns immediately on a nil handle, so a joiner arriving
+  between those two statements reports "joined" with the goroutine still
+  running. Even a joiner released by `done` is woken by a close that is itself
+  still inside the deferred function: inserting `select {}` immediately after
+  `close(worker.done)` leaves the worker permanently parked and the helper and
+  its callers stay green 20/20. `waitBootEpochIdle`'s claim is now what it
+  actually observes — the handle retired and `done` closed — with the residual
+  stated: after that close the worker executes only the return from the defer
+  and the goroutine exit, reads no package var and touches no Manager state, so
+  a `t.Cleanup` restoring a seam behind the call cannot race it. A test needing
+  the GOROUTINE gone must observe that itself.
+- **MAJOR 2 — the retirement assertion caught deleting the clear, not degrading
+  it.** Replacing the CAS with `Store(nil)` passed
+  `TestThirdRequestCoalescesOntoTheLateReclaim_6669` 50/50 (measured), because
+  that fixture never has a successor published while the outgoing worker
+  retires. The hazard is real: outgoing worker drops the in-flight bit ->
+  successor claims and publishes its own handle -> outgoing worker's
+  `Store(nil)` ERASES the live successor -> `Stop` loads nil, joins nothing, and
+  returns while that worker is still writing the state file.
+- **The window is now openable.** `epochRefineWorkerBeforeExit` is a new seam
+  between `releaseBootEpochRefine` dropping the bit and the deferred clear — the
+  only place a successor can be published mid-retire. It is a few instructions
+  wide and closes on its own, so hammering cannot land in it; production cost is
+  one call to an empty func on a path that runs once per worker.
+  `TestRetiringWorkerDoesNotEraseASuccessor_6669` parks the outgoing worker
+  there, publishes a successor (parked in its own pass so it stays live), lets
+  the outgoing worker retire, and asserts the published handle is still the
+  SUCCESSOR. RED-on-revert: "published handle = 0x0 after the outgoing worker
+  retired, want the LIVE successor 0xc000102020".
+- **The flake, with its root cause rather than a retry.** `goBase` was sampled
+  BEFORE `initHeartbeatEpochState`, so it counted whatever this package still
+  had in flight from earlier tests; if one of those exited before the check the
+  delta read one lower — exactly the reported "0 package goroutines ... want
+  exactly 1". Both tests now compare two samples taken while pass 1 is
+  deterministically parked (`goParked`), so drift before the park cannot reach
+  them, and the assertion measures the property actually claimed: these requests
+  add no goroutine. Verified under the flake's own conditions — three CONCURRENT
+  processes x `-count=30` over the three affected tests, rc 0 on all three.
+- **Both earlier guards re-proved against the re-anchored counts**, since
+  changing a comparison can silently unbind it: the concurrent-second-worker
+  mutation still reds ("package goroutines went 2 -> 3 across the overlapping
+  request"), and the same-handle hand-off still reds on the goroutine id.
+- **Heatmap.** `pkg/cluster/heartbeat.go` is untouched at 1956 LOC (44 under the
+  REFACTOR tier); the seam added 14 lines to `heartbeat_epoch.go`, which sits at
+  1226, well under WATCH. `go test ./pkg/refactoraudit/` rc 0, so no regenerate
+  is owed.
+- **Validation, real exit codes.** `go build ./...` 0; `go vet ./pkg/cluster/`
+  0; `gofmt -l pkg/cluster/` 0; `git diff --check` 0; `go test -race
+  ./pkg/cluster/...` **0** in 21.3 s.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
