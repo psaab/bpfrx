@@ -161,37 +161,31 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 	}
 }
 
-// TestSyncAuthHandshakeDowngradeGuardRejects verifies the downgrade-guard: once
-// the peer has authenticated (here via the heartbeat channel, authSeen=true), a
-// later UNAUTHENTICATED connection from a legacy/unkeyed peer is REJECTED rather
-// than silently downgraded. RED on revert: without the guard the legacy peer is
-// dual-accepted.
-func TestSyncAuthHandshakeDowngradeGuardRejects(t *testing.T) {
-	a := newAuthSync(t, []byte("psk"), true) // heartbeat already saw the peer auth
-
-	ca, cb := net.Pipe()
-	defer ca.Close()
-	defer cb.Close()
-
-	ach := runHandshake(a, ca)
-
-	// Legacy peer: consume A's HELLO, then send a real frame with no handshake.
-	if _, _, err := readSyncFrameRaw(cb); err != nil {
-		t.Fatalf("legacy peer failed to read HELLO: %v", err)
-	}
-	var clockBuf [8]byte
-	binary.LittleEndian.PutUint64(clockBuf[:], 1)
-	// The peer may fail to write once A rejects and closes; ignore that error.
-	_ = writeMsg(cb, syncMsgClockSync, clockBuf[:])
-
-	ar := <-ach
-	if ar.err == nil {
-		t.Fatalf("downgrade-guard must reject an unauthenticated peer once authed, got mode=%d", ar.mode)
-	}
-	if ar.mode == syncAuthAuthenticated {
-		t.Fatalf("guard rejection must not authenticate")
-	}
-}
+// TestSyncAuthHandshakeDowngradeGuardRejects was DELETED here.
+//
+// It claimed to verify the downgrade-guard — "once the peer has authenticated
+// (here via the heartbeat channel, authSeen=true), a later UNAUTHENTICATED
+// connection is REJECTED rather than silently downgraded" — with a documented
+// "RED on revert: without the guard the legacy peer is dual-accepted".
+//
+// That was false by the time #5078 landed. Flipping its single precondition,
+// newAuthSync(t, []byte("psk"), true) -> false, left it PASSING: the guard was
+// disarmed and the assertion still held, because syncAuthDecision now rejects
+// EVERY unkeyed peer on a keyed node regardless of peerAuthSeen. The test was
+// therefore a duplicate of TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer
+// wearing a downgrade-guard name, and its stated RED-on-revert could not fire.
+//
+// A test whose documented failure mode cannot occur is worse than no test: it
+// reads as coverage for a property nothing checks. The unconditional rejection
+// it actually exercised is pinned by TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer
+// and by the legacy_peer_rejected_when_keyed / unkeyed_peer_rejected_when_keyed
+// rows of TestSyncAuthDecisionMatrix, so deleting it loses no coverage.
+//
+// The sync-side downgrade guard it was named for no longer exists — see the
+// removal of syncPeerAuthSeen / syncAuthedEver. The #4107 HEARTBEAT downgrade
+// guard is separate state (heartbeatAuthState.peerAuthenticated, reached via
+// Manager.HeartbeatPeerAuthSeen) and is unaffected; it keeps its own coverage
+// in heartbeat_auth_test.go.
 
 // TestSyncAuthDisabledNoHandshake verifies that with no auth provider (or no
 // key) the handshake is a no-op: no bytes are exchanged and the connection is
