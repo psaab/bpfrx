@@ -66556,6 +66556,18 @@ break — `go vet` confirmed passing under every revert.
     the quarantine and reused-ifindex tests correctly stay GREEN because their
     ambiguity comes from a different source. The two ledger properties are
     independently bound.
+  - Guard D, the conflict state made re-armable (`if let Some(existing) =
+    *slot.get() { ... } else { slot.insert(Some(row_zone_id)) }`): **1 RED**,
+    `a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722`
+    ("ifindex 42 is shared by rows that disagree about its zone, so it must not
+    appear in the unambiguous map at all"). The other 14 stayed GREEN, which is
+    the point: every earlier fixture put at most TWO rows on a shared ifindex,
+    so the fold was only ever driven `Vacant→Occupied-same` and
+    `Vacant→Occupied-different`, never a third row arriving after a conflict was
+    recorded. That gap admitted a producible fail-open — `st0` units 0/1/2 with
+    unit 0 unzoned gives rows `vpnb`→none→`vpnb` on ifindex 42 — so the guard
+    fired but was scoped NARROWER than its "EVERY row agrees" claim. Found by
+    re-deriving the mutation scope rather than by any reviewer.
   - Probe C, letting the child→parent propagation also teach the ledger:
     **0 RED, 14/14 green.** So the "kept out of the propagation arm" exclusion
     is a design property, NOT a demonstrated guard, and the source comment now

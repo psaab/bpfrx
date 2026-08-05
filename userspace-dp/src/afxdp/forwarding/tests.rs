@@ -5619,6 +5619,70 @@ fn reused_ifindex_across_two_zoned_interfaces_resolves_no_zone_6722() {
     );
 }
 
+/// #6722, the ABSORBING-CONFLICT property. Every other fixture puts at most TWO
+/// rows on a shared ifindex, so the agreement fold is only ever driven
+/// `Vacant -> Occupied-same` or `Vacant -> Occupied-different`; a third row
+/// arriving AFTER a conflict was recorded is untested by all of them. Once an
+/// ifindex is known ambiguous, no later row may re-arm it.
+///
+/// Three rows land on ifindex 42 as `vpnb` -> none -> `vpnb`. Unit 0 is still in
+/// no zone, so the ifindex still names no single zone. A fold that treats the
+/// recorded conflict as merely "no opinion yet" and re-arms on the third row
+/// resolves `vpnb` here and reinstates the exact #6722 fail-open, while leaving
+/// every other test in this file green.
+#[test]
+fn a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722() {
+    let state = build_forwarding_state(&conflict_then_agreement_snapshot_6722());
+
+    // Precondition: THREE rows really do share this ifindex, and the third
+    // agrees with the first. Without that ordering the test is just another
+    // two-row conflict and proves nothing new.
+    let rows_on_shared: Vec<&str> = conflict_then_agreement_snapshot_6722()
+        .interfaces
+        .iter()
+        .filter(|i| i.ifindex == SHARED_TUNNEL_IFINDEX_6722)
+        .map(|i| i.zone.as_str())
+        .map(|z| if z.is_empty() { "<none>" } else { "vpnb" })
+        .collect();
+    assert_eq!(
+        rows_on_shared,
+        vec!["vpnb", "<none>", "vpnb"],
+        "precondition: the fold must be driven agree -> conflict -> agree, in \
+         that order, or the absorbing-conflict path is not exercised"
+    );
+
+    assert_ambiguous_ifindex_preconditions_6722(
+        &state,
+        SHARED_TUNNEL_IFINDEX_6722,
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(
+        to_id, 0,
+        "a recorded conflict is ABSORBING: a later row agreeing with the first \
+         must not restore the ifindex to the unambiguous map"
+    );
+    assert_ne!(
+        to_id, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "specifically NOT `vpnb` -- the value a re-arming fold would produce"
+    );
+    assert_eq!(result.action, PolicyAction::Deny);
+    assert_eq!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the verdict must come from the DEFAULT policy"
+    );
+
+    // Scope: the sibling that owns its own ifindex is untouched by any of this.
+    let (unit1_to_id, unit1_result) =
+        adjudicate_lan_transit_6722(&state, "192.168.98.7", ZONED_TUNNEL_IFINDEX_6722);
+    assert_eq!(unit1_to_id, TEST_SIBLING_VPN_ZONE_ID_6722);
+    assert_eq!(unit1_result.action, PolicyAction::Permit);
+}
+
 /// #6713 at a SHARED ifindex, and the guard that keeps the #6722 gate from
 /// being a blanket "shared ifindex means no zone". `set security zones
 /// security-zone vpnb interfaces st0` fans out to every unit, so the `st0` base

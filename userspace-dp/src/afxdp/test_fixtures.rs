@@ -1385,3 +1385,77 @@ pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
         ..Default::default()
     }
 }
+
+/// THREE rows on one ifindex, agreeing -> disagreeing -> agreeing again.
+///
+/// Every other fixture here puts at most TWO rows on a shared ifindex, which
+/// exercises the agreement fold's `Vacant -> Occupied-same` and
+/// `Vacant -> Occupied-different` transitions but never a third row arriving
+/// AFTER a conflict was already recorded. The conflict state must be
+/// ABSORBING: once `zone_agreement[ifx] == None`, no later row may re-arm it.
+///
+/// ```text
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30   # no zone REF
+/// set interfaces st0 unit 1 family inet address 10.6.6.1/30
+/// set interfaces st0 unit 2 family inet address 10.7.7.1/30
+/// set security zones security-zone vpnb interfaces st0.1
+/// set security zones security-zone vpnb interfaces st0.2
+/// ```
+///
+/// The rows on ifindex 42 arrive `vpnb` (base, via the Go `out[base]` write),
+/// then NONE (`st0.0`, which the operator left unzoned), then `vpnb` again — a
+/// third row landing on the shared ifindex is what makes the ordering
+/// observable. Unit 0 is still in no zone, so the ifindex must stay ambiguous;
+/// a fold that re-arms on the third row hands it `vpnb` and reinstates the
+/// #6722 fail-open.
+///
+/// `THIRD_SHARED_ROW_UNIT` shares the base ifindex rather than taking its own
+/// because that is what `snapshotLinuxName` does for any row whose
+/// `linux_name` is the base netdev.
+pub(super) fn conflict_then_agreement_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 3,
+                ..Default::default()
+            },
+            tunnel_unit_row_6722(
+                "st0.0",
+                "",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.5.5.1/30",
+            ),
+            // The THIRD row on ifindex 42, re-agreeing with the FIRST after the
+            // second disagreed. This is the row every other fixture lacks.
+            tunnel_unit_row_6722(
+                "st0.2",
+                "vpnb",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.7.7.1/30",
+            ),
+            tunnel_unit_row_6722(
+                "st0.1",
+                "vpnb",
+                "st0.1",
+                ZONED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.6.6.1/30",
+            ),
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    }
+}

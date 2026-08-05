@@ -99,6 +99,17 @@ pub(super) fn populate_interfaces(
         // filter-log siblings go red, because the shared ifindex's only
         // surviving opinion is the zoned base row's.
         //
+        // `None` is ABSORBING: the `!=` below is deliberately written against
+        // the whole `Option`, not against an unwrapped zone id, so a later row
+        // that happens to agree with the FIRST one cannot re-arm an ifindex
+        // already known ambiguous. Rewriting it as
+        // `if let Some(existing) = *slot.get() { ... } else { re-arm }` is
+        // green on every two-row fixture and reinstates the #6722 fail-open on
+        // a three-row one (`vpnb` -> unzoned -> `vpnb`);
+        // `a_conflicted_ifindex_is_not_rearmed_by_a_later_agreeing_row_6722` is
+        // the only test that catches it, and it is the only test in this issue
+        // with three rows on one ifindex.
+        //
         // The ledger is fed ONLY by what a row literally carries, never by the
         // child→parent propagation below, so it says what the SNAPSHOT said
         // rather than what the ingress map was derived to hold. That exclusion
