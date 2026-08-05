@@ -953,33 +953,29 @@ fn build_live_forward_request_emits_output_filter_log_event() {
 }
 
 
-/// #6713 binding for `forward_request.rs`'s OWN `egress_zone_id` call.
+/// Build the #6722 secure-tunnel state through the REAL `build_forwarding_state`
+/// and drive `build_live_forward_request_from_frame` for a flow that ingresses
+/// the fixture's LAN interface and egresses `egress_ifindex`. Returns the built
+/// state plus the zone ids the emitted filter-log record carries.
 ///
-/// `build_live_forward_request` resolves the filter-log egress zone with a
-/// SECOND, independent call to the shared resolver -- it does not go through
-/// `filter_log_egress_zone_id`. Reverting just that line to the pre-#6713
-/// `state.egress`-only read left the entire suite green, because the sibling
-/// test above (`build_live_forward_request_emits_output_filter_log_event`) uses
-/// a MAC-FUL egress interface where both reads agree.
+/// The state is NOT hand-built. Round 3 hand-populated a `ForwardingState` here
+/// and in `poll_descriptor::filter`, which encoded a MAP LAYOUT rather than a
+/// snapshot: both hand-built states inserted into `ifindex_to_zone_id` alone, so
+/// they agreed with the resolver only by coincidence and went red on a builder
+/// change that was correct. One fixture, driven through the real builder, in all
+/// three test files that adjudicate these shapes.
 ///
-/// Same topology as that test, with ONE difference: the egress interface is
-/// MAC-less (an IPsec xfrmi), so `populate_egress`'s `src_mac` gate leaves it
-/// with NO `state.egress` row and the zone can only come from
-/// `ifindex_to_zone_id`. The emitted event must still carry the tunnel's real
-/// zone.
-///
-/// FIXTURE SCAFFOLDING, do not read as the invariant: the hand-built
-/// `ForwardingResolution` below carries `src_mac: Some(..)`, which the real
+/// FIXTURE SCAFFOLDING, do not read as the invariant: the `ForwardingResolution`
+/// below carries `src_mac: Some(..)`, which the real
 /// `session_glue::populate_egress_resolution` would leave `None` for a row-less
-/// interface. It is the house style for every fixture in this file, the field
-/// is not on the path under test, and the assertion this test makes is the
-/// logged `egress_zone_id`.
-#[test]
-fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
+/// interface. It is the house style for every fixture in this file, the field is
+/// not on the path under test, and what these tests assert is the logged
+/// `egress_zone_id`.
+fn live_forward_filter_log_zones_6722(egress_ifindex: i32) -> (ForwardingState, u16, u16) {
     let src_ip = Ipv4Addr::new(10, 0, 0, 1);
     let dst_ip = Ipv4Addr::new(198, 51, 100, 20);
     let meta = UserspaceDpMeta {
-        ingress_ifindex: 10,
+        ingress_ifindex: LAN_IFINDEX_6722 as u32,
         addr_family: libc::AF_INET as u8,
         protocol: PROTO_TCP,
         pkt_len: 64,
@@ -1014,7 +1010,7 @@ fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
         &[],
         &[crate::InterfaceSnapshot {
             name: "st0.0".into(),
-            ifindex: 12,
+            ifindex: egress_ifindex,
             filter_output_v4: "egress-log".into(),
             ..Default::default()
         }],
@@ -1022,26 +1018,25 @@ fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
         "",
     )
     .expect("filter state compiles");
-    let mut forwarding = ForwardingState {
-        filter_state,
-        tx_selection_enabled_v4: true,
-        ..ForwardingState::default()
-    };
-    forwarding.ifindex_to_zone_id.insert(10, TEST_LAN_ZONE_ID);
-    // The MAC-less tunnel: zoned in `ifindex_to_zone_id` (what
-    // `populate_interfaces` writes) and deliberately absent from `egress`
-    // (what `populate_egress`'s `src_mac` gate does to an xfrmi).
-    forwarding.ifindex_to_zone_id.insert(12, TEST_WAN_ZONE_ID);
+    let mut forwarding = crate::afxdp::forwarding_build::build_forwarding_state(
+        &sibling_tunnel_units_snapshot_6722(),
+    );
+    // The output filter and the v4 TX selector are the only things this call
+    // site needs beyond what the snapshot builder produces; the fixture carries
+    // no `firewall` stanza of its own.
+    forwarding.filter_state = filter_state;
+    forwarding.tx_selection_enabled_v4 = true;
     assert!(
-        !forwarding.egress.contains_key(&12),
-        "precondition: the MAC-less egress interface must have NO egress row"
+        !forwarding.egress.contains_key(&egress_ifindex),
+        "precondition: the MAC-less egress interface must have NO egress row -- \
+         without that hole the #6713 fallback never fires here"
     );
     let decision = SessionDecision {
         resolution: ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
             local_ifindex: 0,
-            egress_ifindex: 12,
-            tx_ifindex: 12,
+            egress_ifindex,
+            tx_ifindex: egress_ifindex,
             tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V4(dst_ip)),
             neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
@@ -1055,7 +1050,7 @@ fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
         queue_id: 0,
         worker_id: 0,
         interface: Arc::<str>::from("ge-0-0-1"),
-        ifindex: 10,
+        ifindex: LAN_IFINDEX_6722,
     };
     let (event_handle, event_rx) = crate::event_stream::test_worker_handle(
         8,
@@ -1096,11 +1091,75 @@ fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
         .decode_dataplane_event()
         .expect("filter-log payload");
     assert_eq!(filter_event.kind, DataplaneEventKind::FilterLog);
-    assert_eq!(filter_event.ingress_zone_id, TEST_LAN_ZONE_ID);
+    (
+        forwarding,
+        filter_event.ingress_zone_id,
+        filter_event.egress_zone_id,
+    )
+}
+
+/// #6713 binding for `forward_request.rs`'s OWN `egress_zone_id` call.
+///
+/// `build_live_forward_request` resolves the filter-log egress zone with a
+/// SECOND, independent call to the shared resolver -- it does not go through
+/// `filter_log_egress_zone_id`. Reverting just that line to the pre-#6713
+/// `state.egress`-only read left the entire suite green, because the sibling
+/// test above (`build_live_forward_request_emits_output_filter_log_event`) uses
+/// a MAC-FUL egress interface where both reads agree.
+///
+/// Same topology as that test, with ONE difference: the egress interface is
+/// MAC-less (an IPsec xfrmi on its OWN ifindex, `st0.1`), so `populate_egress`'s
+/// `src_mac` gate leaves it with NO `state.egress` row and the zone can only
+/// come from the fallback. The emitted event must still carry the tunnel's real
+/// zone.
+#[test]
+fn build_live_forward_request_logs_a_macless_egress_zone_6713() {
+    let (forwarding, ingress_zone_id, egress_zone_id) =
+        live_forward_filter_log_zones_6722(ZONED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(ingress_zone_id, TEST_LAN_ZONE_ID);
     assert_eq!(
-        filter_event.egress_zone_id, TEST_WAN_ZONE_ID,
+        egress_zone_id, TEST_SIBLING_VPN_ZONE_ID_6722,
         "the filter-log record for a flow egressing a MAC-less tunnel must carry \
          the tunnel's real zone, not the 0 'unknown' sentinel"
+    );
+    assert_eq!(
+        forwarding
+            .ifindex_unambiguous_zone_id
+            .get(&ZONED_TUNNEL_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "the zone must have come from the unambiguous map -- `st0.1` is one row \
+         on its own ifindex"
+    );
+}
+
+/// #6722 at the live-forward log site. `forward_request.rs` calls the resolver
+/// independently of `filter_log_egress_zone_id`, so the ambiguity gate has to be
+/// proven at BOTH log sites: a log field naming `vpnb` for transit the firewall
+/// denied under the default policy sends an operator hunting a `lan->vpnb` rule
+/// that never ran.
+#[test]
+fn build_live_forward_request_logs_no_zone_for_an_ambiguous_ifindex_6722() {
+    let (forwarding, ingress_zone_id, egress_zone_id) =
+        live_forward_filter_log_zones_6722(SHARED_TUNNEL_IFINDEX_6722);
+
+    assert_eq!(ingress_zone_id, TEST_LAN_ZONE_ID);
+    assert_eq!(
+        forwarding
+            .ifindex_to_zone_id
+            .get(&SHARED_TUNNEL_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_SIBLING_VPN_ZONE_ID_6722,
+        "precondition: the map this site must NOT read carries a real nonzero \
+         zone for the shared ifindex -- otherwise 'logs 0' would be \
+         indistinguishable from an empty state"
+    );
+    assert_eq!(
+        egress_zone_id, 0,
+        "the logged to-zone must be the adjudicated 0, not the sibling unit's zone"
     );
 }
 

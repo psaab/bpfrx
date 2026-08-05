@@ -993,3 +993,395 @@ pub(super) fn stamp_icmpv6_checksum(
     let csum = compute_icmpv6_checksum(frame, l3_start, l4_start, packet_end);
     frame[l4_start + 2..l4_start + 4].copy_from_slice(&csum.to_be_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// #6713 / #6722 secure-tunnel (MAC-less egress) zone fixtures.
+//
+// These live HERE, not in `afxdp::forwarding::tests`, because three test files
+// adjudicate the same shapes — the zone-pair resolver
+// (`afxdp::forwarding::tests`), the filter-log egress-zone field
+// (`afxdp::poll_descriptor::filter`) and the live-forward request builder
+// (`afxdp::frame::tests_ports_live_forward`). Round 3 kept a hand-built
+// `ForwardingState` in the latter two and claimed independently maintained
+// fixtures could not drift; they can and did — both hand-built states
+// populated `ifindex_to_zone_id` alone, so they went RED on a change that the
+// real builder made correct. One definition, driven through the real
+// `build_forwarding_state`, removes the class.
+//
+// The row shapes are MEASURED against the Go builders, not assumed:
+// `pkg/dataplane/userspace/zone_propagation_6722_test.go` runs
+// `buildInterfaceZoneMap` + `buildSnapshot` on these exact configs and pins
+// what they emit.
+// ---------------------------------------------------------------------------
+
+/// The zone the secure tunnel is put in. Aliases an existing id so nothing has
+/// to be added to `test_zone_ids`.
+pub(super) const TEST_SIBLING_VPN_ZONE_ID_6722: u16 = TEST_DMZ_ZONE_ID;
+/// A SECOND tunnel zone, for the two-units-in-different-zones shape.
+pub(super) const TEST_OTHER_VPN_ZONE_ID_6722: u16 = TEST_SFMIX_ZONE_ID;
+/// The LAN interface every transit in these fixtures ingresses on.
+pub(super) const LAN_IFINDEX_6722: i32 = 24;
+/// `st0` and `st0.0` share this ifindex (`snapshotLinuxName` collapses a
+/// non-VLAN unit 0 onto its base netdev).
+pub(super) const SHARED_TUNNEL_IFINDEX_6722: i32 = 42;
+/// `st0.1` gets its own netdev (`LinuxIfName("st0.1")`), hence its own ifindex.
+pub(super) const ZONED_TUNNEL_IFINDEX_6722: i32 = 43;
+/// `st0.2` in the divergent-zone shape.
+pub(super) const THIRD_TUNNEL_IFINDEX_6722: i32 = 44;
+
+fn lan_row_6722() -> InterfaceSnapshot {
+    InterfaceSnapshot {
+        name: "reth1.0".to_string(),
+        zone: "lan".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        ifindex: LAN_IFINDEX_6722,
+        mtu: 1500,
+        hardware_addr: "02:bf:72:01:00:01".to_string(),
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.0.61.1/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    }
+}
+
+fn tunnel_zones_6722() -> Vec<ZoneSnapshot> {
+    vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+            ..Default::default()
+        },
+        ZoneSnapshot {
+            name: "vpnb".to_string(),
+            id: TEST_SIBLING_VPN_ZONE_ID_6722,
+            ..Default::default()
+        },
+        ZoneSnapshot {
+            name: "vpnc".to_string(),
+            id: TEST_OTHER_VPN_ZONE_ID_6722,
+            ..Default::default()
+        },
+    ]
+}
+
+/// `192.168.99.0/24` -> unit 0's next hop (the SHARED ifindex);
+/// `192.168.98.0/24` -> unit 1's; `192.168.97.0/24` -> unit 2's.
+fn tunnel_routes_6722() -> Vec<RouteSnapshot> {
+    ["192.168.99.0/24", "192.168.98.0/24", "192.168.97.0/24"]
+        .iter()
+        .zip(["10.5.5.2", "10.6.6.2", "10.7.7.2"])
+        .map(|(dst, nh)| RouteSnapshot {
+            table: "inet.0".to_string(),
+            family: "inet".to_string(),
+            destination: (*dst).to_string(),
+            next_hops: vec![nh.to_string()],
+            discard: false,
+            next_table: String::new(),
+            preference: 5,
+        })
+        .collect()
+}
+
+/// `from-zone lan to-zone vpnb permit` + `from-zone lan to-zone vpnc permit`,
+/// under a `deny-all` default policy. Every fixture below shares these, so a
+/// to-zone that resolves to EITHER tunnel zone is Permit and a to-zone of 0 is
+/// the default deny — the two outcomes are cleanly separable.
+fn tunnel_policies_6722() -> Vec<PolicyRuleSnapshot> {
+    ["vpnb", "vpnc"]
+        .iter()
+        .map(|to| PolicyRuleSnapshot {
+            name: format!("lan-to-{to}"),
+            from_zone: "lan".to_string(),
+            to_zone: (*to).to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn tunnel_unit_row_6722(
+    name: &str,
+    zone: &str,
+    linux_name: &str,
+    ifindex: i32,
+    parent_ifindex: i32,
+    address: &str,
+) -> InterfaceSnapshot {
+    InterfaceSnapshot {
+        name: name.to_string(),
+        zone: zone.to_string(),
+        linux_name: linux_name.to_string(),
+        parent_linux_name: "st0".to_string(),
+        ifindex,
+        parent_ifindex,
+        mtu: 1400,
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: address.to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    }
+}
+
+/// AMBIGUOUS shared ifindex, the #6722 fail-open shape.
+///
+/// ```text
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30    # no zone REF
+/// set interfaces st0 unit 1 family inet address 10.6.6.1/30
+/// set security zones security-zone vpnb interfaces st0.1       # unit 1 only
+/// set routing-options static route 192.168.99.0/24 next-hop 10.5.5.2  # -> unit 0
+/// set routing-options static route 192.168.98.0/24 next-hop 10.6.6.2  # -> unit 1
+/// set security policies default-policy deny-all
+/// ```
+///
+/// The `st0` BASE row arrives carrying `vpnb`: `buildInterfaceZoneMap` writes
+/// `out["st0"]` when the only zone reference is `st0.1`. Unit 0 — which the
+/// operator deliberately left in NO zone — shares that base ifindex, so the
+/// rows on ifindex 42 DISAGREE (`vpnb` vs none) and the ifindex identifies no
+/// single zone. `st0.1` is on its own ifindex 43 and is unambiguous.
+///
+/// Both units are MAC-less, so NEITHER gets a `state.egress` row and the #6713
+/// fallback is the only thing that can resolve either to-zone.
+pub(super) fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 2,
+                ..Default::default()
+            },
+            tunnel_unit_row_6722(
+                "st0.0",
+                "",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.5.5.1/30",
+            ),
+            tunnel_unit_row_6722(
+                "st0.1",
+                "vpnb",
+                "st0.1",
+                ZONED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.6.6.1/30",
+            ),
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// UNAMBIGUOUS shared ifindex — #6713 in its plainest deployed spelling.
+///
+/// ```text
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30
+/// set security zones security-zone vpnb interfaces st0     # the BARE base ref
+/// ```
+///
+/// `buildInterfaceZoneMap` fans a base-named reference out to every unit, so
+/// BOTH rows on ifindex 42 carry `vpnb`. The ifindex names exactly one zone and
+/// the fallback must resolve it — this is the case a too-strict ambiguity gate
+/// would break, and the reason the gate keys on DISAGREEMENT rather than on
+/// "more than one row shares this ifindex".
+pub(super) fn unanimous_shared_ifindex_tunnel_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 1,
+                ..Default::default()
+            },
+            tunnel_unit_row_6722(
+                "st0.0",
+                "vpnb",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.5.5.1/30",
+            ),
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// Two units in DIFFERENT zones on one `st0`, with unit 0 in neither.
+///
+/// ```text
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30   # no zone REF
+/// set security zones security-zone vpnb interfaces st0.1
+/// set security zones security-zone vpnc interfaces st0.2
+/// ```
+///
+/// `buildInterfaceZoneMap`'s `out[base]` write is FIRST-write-wins over
+/// SORTED zone names, so the base row — and therefore unit 0's ifindex —
+/// carries `vpnb`, the alphabetically-first sibling's zone, purely because "b"
+/// sorts before "c". Reading `ifindex_to_zone_id` for the egress half would
+/// adjudicate unit 0's transit under a zone chosen by alphabetical accident.
+pub(super) fn divergent_zone_sibling_units_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: "vpnb".to_string(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 3,
+                ..Default::default()
+            },
+            tunnel_unit_row_6722(
+                "st0.0",
+                "",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.5.5.1/30",
+            ),
+            tunnel_unit_row_6722(
+                "st0.1",
+                "vpnb",
+                "st0.1",
+                ZONED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.6.6.1/30",
+            ),
+            tunnel_unit_row_6722(
+                "st0.2",
+                "vpnc",
+                "st0.2",
+                THIRD_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.7.7.1/30",
+            ),
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// POST-QUARANTINE shape: an UNZONED base beside a zoned child.
+///
+/// `quarantineCollidingZones` (`pkg/dataplane/userspace/zones_quarantine.go`)
+/// runs AFTER `buildInterfaceSnapshots` and blanks `Zone` on every row bound to
+/// a StableZoneID-colliding zone, expressly so those interfaces fail CLOSED. If
+/// the zone that won `out["st0"]` is the quarantined one and a later-sorting
+/// sibling's zone survives, the base and unit 0 arrive UNZONED while `st0.1`
+/// stays zoned:
+///
+/// ```text
+/// zones `mmm` and `aaa` collide on one StableZoneID -> `mmm` quarantined
+/// set security zones security-zone mmm interfaces st0.0    # -> blanked
+/// set security zones security-zone zzz interfaces st0.1    # survives
+/// ```
+///
+/// This is what makes `populate_interfaces`' child->parent propagation
+/// REACHABLE for a Go-produced snapshot (round 3 asserted it was not): the
+/// propagation writes `ifindex_to_zone_id[42] = vpnb` from `st0.1`. The egress
+/// half must NOT read that — handing the quarantine's deliberate default-deny
+/// back the survivor's zone is the fail-open the quarantine exists to prevent.
+pub(super) fn quarantined_base_tunnel_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            InterfaceSnapshot {
+                name: "st0".to_string(),
+                zone: String::new(),
+                linux_name: "st0".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                unit_count: 2,
+                ..Default::default()
+            },
+            tunnel_unit_row_6722(
+                "st0.0",
+                "",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.5.5.1/30",
+            ),
+            tunnel_unit_row_6722(
+                "st0.1",
+                "vpnb",
+                "st0.1",
+                ZONED_TUNNEL_IFINDEX_6722,
+                SHARED_TUNNEL_IFINDEX_6722,
+                "10.6.6.1/30",
+            ),
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// REUSED ifindex: two UNRELATED interfaces (no parent/child link) landing on
+/// one ifindex in differing zones. The kernel recycles an ifindex after a
+/// netdev teardown, and `buildLinkSnapshot` resolves each row independently, so
+/// a snapshot built across a teardown can name the recycled index twice. There
+/// is no basis whatsoever for picking one of the two zones, so the egress half
+/// must resolve 0 and let the default policy decide.
+pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: tunnel_zones_6722(),
+        interfaces: vec![
+            lan_row_6722(),
+            tunnel_unit_row_6722(
+                "st0.0",
+                "vpnb",
+                "st0",
+                SHARED_TUNNEL_IFINDEX_6722,
+                0,
+                "10.5.5.1/30",
+            ),
+            InterfaceSnapshot {
+                name: "st1.0".to_string(),
+                zone: "vpnc".to_string(),
+                linux_name: "st1".to_string(),
+                ifindex: SHARED_TUNNEL_IFINDEX_6722,
+                mtu: 1400,
+                addresses: vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: "10.9.9.1/30".to_string(),
+                    scope: 0,
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: tunnel_routes_6722(),
+        default_policy: "deny".to_string(),
+        policies: tunnel_policies_6722(),
+        ..Default::default()
+    }
+}

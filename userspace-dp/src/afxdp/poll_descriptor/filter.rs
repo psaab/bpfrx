@@ -1384,38 +1384,29 @@ mod filter_terminal_tests {
 #[cfg(test)]
 mod filter_log_egress_zone_tests {
     use super::*;
-    use crate::test_zone_ids::{TEST_DMZ_ZONE_ID, TEST_LAN_ZONE_ID};
+    use crate::afxdp::forwarding_build::build_forwarding_state;
+    use crate::afxdp::test_fixtures::{
+        LAN_IFINDEX_6722, SHARED_TUNNEL_IFINDEX_6722, TEST_SIBLING_VPN_ZONE_ID_6722,
+        ZONED_TUNNEL_IFINDEX_6722, sibling_tunnel_units_snapshot_6722,
+    };
+    use crate::test_zone_ids::TEST_LAN_ZONE_ID;
 
-    /// An ordinary MAC-ful zoned interface: `populate_egress` gives it a row.
-    const MACFUL_IFINDEX: i32 = 12;
-    /// A MAC-less zoned unit (`st0.1`). No `egress` row (the `src_mac` gate is
-    /// unconditional for an xfrmi) — the #6713 shape.
-    const MACLESS_ZONED_IFINDEX: i32 = 43;
-
-    /// Mirrors what `build_forwarding_state` produces for the secure-tunnel
-    /// topology in `afxdp::forwarding::tests::sibling_tunnel_units_snapshot_6722`:
-    /// no `egress` row for the MAC-less unit, its zone reachable only through
-    /// `ifindex_to_zone_id`.
+    /// #6722: build the state through the REAL `build_forwarding_state` from the
+    /// shared secure-tunnel fixture rather than hand-populating a
+    /// `ForwardingState`. The round-3 version hand-inserted into
+    /// `ifindex_to_zone_id` only, so it encoded a map layout instead of a
+    /// snapshot and went red on a builder change that was correct — it could
+    /// only ever agree with the resolver by coincidence.
+    ///
+    /// The fixture gives three ifindexes worth logging:
+    ///   - `LAN_IFINDEX_6722`   — MAC-ful and zoned, so it HAS an egress row;
+    ///   - `ZONED_TUNNEL_IFINDEX_6722` (`st0.1`) — MAC-less, zoned, its own
+    ///     ifindex, so no egress row and the #6713 fallback is the only
+    ///     resolver;
+    ///   - `SHARED_TUNNEL_IFINDEX_6722` (`st0`/`st0.0`) — MAC-less and
+    ///     AMBIGUOUS, so the #6722 gate holds it at 0.
     fn forwarding_with_macless_egress() -> ForwardingState {
-        let mut fw = ForwardingState::default();
-        fw.egress.insert(
-            MACFUL_IFINDEX,
-            EgressInterface {
-                bind_ifindex: MACFUL_IFINDEX,
-                vlan_id: 0,
-                mtu: 1500,
-                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
-                zone_id: TEST_LAN_ZONE_ID,
-                redundancy_group: 0,
-                primary_v4: None,
-                primary_v6: None,
-            },
-        );
-        fw.ifindex_to_zone_id
-            .insert(MACFUL_IFINDEX, TEST_LAN_ZONE_ID);
-        fw.ifindex_to_zone_id
-            .insert(MACLESS_ZONED_IFINDEX, TEST_DMZ_ZONE_ID);
-        fw
+        build_forwarding_state(&sibling_tunnel_units_snapshot_6722())
     }
 
     /// #6713 at the log site: a flow egressing a correctly-zoned MAC-less
@@ -1424,21 +1415,49 @@ mod filter_log_egress_zone_tests {
     fn filter_log_egress_zone_id_reports_a_macless_tunnels_zone_6713() {
         let fw = forwarding_with_macless_egress();
         assert!(
-            !fw.egress.contains_key(&MACLESS_ZONED_IFINDEX),
+            !fw.egress.contains_key(&ZONED_TUNNEL_IFINDEX_6722),
             "precondition: the MAC-less tunnel has NO egress row -- that hole is \
              what makes this call site interesting"
         );
         assert_eq!(
-            filter_log_egress_zone_id(&fw, MACLESS_ZONED_IFINDEX),
-            TEST_DMZ_ZONE_ID,
+            filter_log_egress_zone_id(&fw, ZONED_TUNNEL_IFINDEX_6722),
+            TEST_SIBLING_VPN_ZONE_ID_6722,
             "the logged to-zone must match the zone the policy plane adjudicated"
         );
         // Control: the MAC-ful interface is unaffected either way.
         assert_eq!(
-            filter_log_egress_zone_id(&fw, MACFUL_IFINDEX),
+            filter_log_egress_zone_id(&fw, LAN_IFINDEX_6722),
             TEST_LAN_ZONE_ID
         );
         // An ifindex in neither map is 0.
         assert_eq!(filter_log_egress_zone_id(&fw, 9999), 0);
+    }
+
+    /// #6722 at the log site: the log field is derived from the SAME resolver
+    /// the policy plane adjudicates with, so an AMBIGUOUS ifindex must log 0
+    /// here too. A log naming `vpnb` for transit the firewall denied under the
+    /// default policy would send an operator hunting a `lan->vpnb` rule that
+    /// never ran.
+    #[test]
+    fn filter_log_egress_zone_id_reports_no_zone_for_an_ambiguous_ifindex_6722() {
+        let fw = forwarding_with_macless_egress();
+        assert!(
+            !fw.egress.contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+            "precondition: MAC-less, so no egress row"
+        );
+        assert_eq!(
+            fw.ifindex_to_zone_id
+                .get(&SHARED_TUNNEL_IFINDEX_6722)
+                .copied()
+                .unwrap_or(0),
+            TEST_SIBLING_VPN_ZONE_ID_6722,
+            "precondition: the map the log site must NOT read carries a real \
+             nonzero zone for this ifindex"
+        );
+        assert_eq!(
+            filter_log_egress_zone_id(&fw, SHARED_TUNNEL_IFINDEX_6722),
+            0,
+            "the logged to-zone must be the adjudicated 0, not the sibling's zone"
+        );
     }
 }
