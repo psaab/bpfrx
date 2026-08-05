@@ -15,7 +15,30 @@
   zones slotted, so the slot predicate could be deleted — now includes an
   unslotted zone with retained totals), Go remove/re-add (input now mutated
   after the call), and Go input-copy (a second snapshot, without which
-  merge-only passed). Corrected two comments that became FALSE with this change
+  merge-only passed).
+
+  **CORRECTION (gate round 2, F3/F4) — two claims in the entry above and in my
+  report were wrong, and the correction matters more than the entry:**
+
+  - *"strengthened five assertions that a broken implementation satisfied"*
+    overstates it. The gate built the full mutation matrix at BOTH SHAs and every
+    one of the five mutations was ALREADY caught by a pre-existing sibling test.
+    No suite-level hole existed. What the strengthenings actually did is make
+    each test independently binding — exercising both predicates itself rather
+    than relying on a sibling to catch the other. That is worth doing, but it is
+    a different and smaller claim.
+  - My mutation table row *"S1 always-clear -> EmptyClearsAll RED (passed before
+    the repopulate leg)"* is FACTUALLY WRONG. The gate ran the counterfactual: at
+    `f7b9e820d`, EmptyClearsAll was ALREADY RED under always-clear, failing at
+    its own setup precondition. The repopulate leg did not close a gap; it made
+    the test fail for the RIGHT reason (its stated property) instead of at setup.
+    S2 (merge-only vs CopiesInput) was accurate as reported.
+
+  I ran those mutations only against the post-fold tree and inferred the "passed
+  before" half instead of running the counterfactual at the parent. A mutation
+  table is a claim about a DIFFERENCE between two trees, so it has to be measured
+  at both — asserting the before-state from memory is exactly the shortcut the
+  table exists to eliminate. Corrected two comments that became FALSE with this change
   — both claimed a cleared zone "reports 0" when it now reads as
   ErrCounterNotPopulated, a real behavioural difference a reader would reason
   wrongly from — plus a "slice"/"map" wording nit.

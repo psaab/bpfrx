@@ -19,7 +19,7 @@ import "github.com/prometheus/client_golang/prometheus"
 // Go-side SPARSE offset map (map[uint16][2]CounterValue) that is never indexed
 // by position, so a large id cannot OOB anything; #3651 shipped the populate
 // path (Rust per-zone accounting -> ProcessStatus.ZoneTrafficCounters ->
-// SetZoneCounterOffset). The metrics come back sourced from that map — see
+// ReplaceZoneCounterOffsets). The metrics come back sourced from that map — see
 // collectZoneCounters in metrics_counters.go for the read contract.
 func (c *xpfCollector) initZoneDescriptors() {
 	// Label set is unchanged from the pre-#3643 metric ({zone, direction},

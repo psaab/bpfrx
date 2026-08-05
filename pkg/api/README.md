@@ -640,7 +640,7 @@ under the daemon's errgroup. Nothing else imports this package.
   packet+byte volume on the forward path
   (`userspace-dp/src/afxdp/zone_counters.rs`), publishes it in
   `ProcessStatus.zone_traffic_counters`, and the Go status poll mirrors each row
-  into the sparse offset map via `Manager.SetZoneCounterOffset`. `show security
+  into the sparse offset map via `Manager.ReplaceZoneCounterOffsets`. `show security
   zones` and REST `/security/zones` picked that up immediately;
   `xpf_zone_packets_total` / `xpf_zone_bytes_total` (labels `zone`,
   `direction` ∈ `{ingress,egress}` — unchanged from the pre-#3643 family, so

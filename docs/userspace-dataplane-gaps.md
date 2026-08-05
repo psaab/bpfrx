@@ -161,7 +161,7 @@ counters (see below).
   `ProcessStatus`-level sparse per-zone block (`zone_traffic_counters`, layout
   version 1, only nonzero rows). The Go status poll
   (`syncBPFCountersLocked`) mirrors each row into the bpfShim offset map via
-  `SetZoneCounterOffset`, so `show security zones` Traffic statistics, the REST
+  `ReplaceZoneCounterOffsets`, so `show security zones` Traffic statistics, the REST
   `/security/zones` endpoint, and the Prometheus collector report live volume.
   A `clear_zone_counters` control IPC resets the helper's cumulative store (the
   Go `ClearZoneCounters` / `ClearAllCounters` overrides send it) so an operator

@@ -34,7 +34,8 @@ converged, the fork resolved as recommended:
   `userspace-dp/src/afxdp/zone_counters.rs`), pre-sums across workers into the
   `ProcessStatus.zone_traffic_counters` sparse block (layout version 1), and the
   Go status poll mirrors it into the zone-counter offset map via
-  `SetZoneCounterOffset` so `show security zones` and REST report live volume;
+  `ReplaceZoneCounterOffsets` so `show security zones` and REST report live
+  volume;
   a `clear_zone_counters` IPC resets the helper store.
 
   **Prometheus lagged the other surfaces and was restored separately.** The

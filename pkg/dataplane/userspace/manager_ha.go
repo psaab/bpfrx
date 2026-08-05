@@ -1035,8 +1035,7 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 	// `show security zones` Traffic statistics, REST /security/zones, and the
 	// Prometheus collector) reports live per-zone volume instead of
 	// ErrCounterNotPopulated ("not available"). The helper reports cumulative
-	// totals keyed by the stable zone id; SetZoneCounterOffset stores them
-	// absolutely (overwrite), reset-safe on helper restart.
+	// totals keyed by the stable zone id.
 	//
 	// REPLACE the whole map rather than setting row by row. The published block
 	// is a complete sparse set rebuilt each poll, so a zone that disappears from

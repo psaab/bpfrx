@@ -113,7 +113,7 @@ func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, err
 //
 // #3651: the helper DOES now populate per-zone traffic counters (Rust forward-
 // path accounting -> ProcessStatus.ZoneTrafficCounters -> syncBPFCountersLocked
-// -> SetZoneCounterOffset), so this returns live volume for a zone the helper
+// -> ReplaceZoneCounterOffsets), so this returns live volume for a zone the helper
 // has published. ErrCounterNotPopulated remains reachable and is NOT an error
 // condition: the helper's status snapshot is sparse and omits all-zero rows, so
 // the sentinel covers a pre-#3651 helper, a zone past the helper's hot-path
@@ -134,6 +134,15 @@ func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, 
 }
 
 // SetZoneCounterOffset records the absolute cumulative per-zone ingress/egress
+//
+// #6843: this has NO production callers. syncBPFCountersLocked now replaces the
+// whole offset map per status poll (ReplaceZoneCounterOffsets) rather than
+// setting row by row, because a per-row setter can only add or overwrite and so
+// strands the last value of any zone the helper stops publishing. This single-
+// row setter is retained for tests that seed one zone directly; production code
+// MUST use ReplaceZoneCounterOffsets, or a zone that disappears from the helper
+// snapshot keeps serving a frozen total.
+//
 // traffic counters reported by the userspace dataplane for zoneID (#3643
 // POPULATE hook, mirroring SetNATRuleCounterOffset). Values are absolute
 // (overwrite), matching the helper's cumulative-since-launch totals. Once set,

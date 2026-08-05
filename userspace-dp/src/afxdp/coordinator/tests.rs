@@ -4644,11 +4644,32 @@ fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
         "precondition: the store must still retain Z's totals"
     );
 
+    // Move traffic on a zone that KEPT its slot in apply 2, so the assertions
+    // below constrain both directions.
+    const SURVIVOR: u16 = 1;
+    let survivor_map = ZoneCounterSlotMap::build(&ids, &coord.forwarding.zone_counter_store);
+    record_zone_traffic(&survivor_map, SURVIVOR, 0, 64);
+    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &survivor_map);
+
     let published = coord.zone_traffic_counters();
     assert!(
         !published.iter().any(|r| r.zone_id == Z),
         "the coordinator kept publishing a zone that lost its slot: its total can \
          never advance again, so Prometheus would emit a FROZEN counter: {published:?}"
+    );
+    // #6843 gate F1: without this, a coordinator-level blanket
+    // `if overflow_active { return Vec::new() }` satisfies the assertion above
+    // and escapes the WHOLE suite -- the primitive sibling test that exists to
+    // stop exactly that over-reach drives `publishable_zone_rows` directly, so
+    // it cannot see an over-reach introduced HERE. Runtime consequence of the
+    // escape: at >=64 configured zones the entire per-zone Prometheus family
+    // vanishes for every zone and the unpopulated gauge jumps to the full zone
+    // count.
+    assert!(
+        published.iter().any(|r| r.zone_id == SURVIVOR),
+        "a zone that KEPT its slot stopped publishing once overflow became \
+         active: the filter must drop only the zones that lost their slot, not \
+         everything: {published:?}"
     );
 }
 

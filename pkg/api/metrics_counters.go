@@ -375,7 +375,7 @@ func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp 
 // permanently dead. That is now FALSE — #3651 shipped the populate path end to
 // end (per-zone accounting on the Rust forward path in
 // userspace-dp/src/afxdp/zone_counters.rs -> ProcessStatus.ZoneTrafficCounters
-// -> syncBPFCountersLocked -> Manager.SetZoneCounterOffset), and
+// -> syncBPFCountersLocked -> Manager.ReplaceZoneCounterOffsets), and
 // `show security zones` and REST /security/zones have been reporting live
 // per-zone volume since. Only the Prometheus surface was left behind, which is
 // backwards: it is the one surface an operator actually alerts on. #3651

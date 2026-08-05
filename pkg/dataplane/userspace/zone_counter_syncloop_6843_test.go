@@ -90,3 +90,49 @@ func TestSyncBPFCountersClearsZoneOffsetsWhenHelperStopsPublishing6843(t *testin
 		t.Errorf("an empty published block must clear the offsets; err=%v", err)
 	}
 }
+
+// TestSyncBPFCountersClearsZoneOffsetsOnLayoutVersionZero6843 covers the
+// HELPER-DOWNGRADE case, which layout version 0 is precisely how the wire
+// signals (protocol_status.go: "0/absent = pre-#3651 helper, no per-zone data").
+//
+// #6843 gate F2: both other tests in this file hard-code
+// ZoneCounterLayoutVersion 1, so a `if status.ZoneCounterLayoutVersion == 0 {
+// return }` guard added before the zone block escapes them AND the whole Go
+// suite. That guard reads as a natural optimisation — the field's own doc
+// invites it — but ReplaceZoneCounterOffsets names "the helper restarted, or
+// was downgraded to a build with no per-zone block" as one of the three
+// disappearance cases that MUST clear. Under such a guard a downgrade strands
+// the last offsets forever: the frozen-counter failure this PR exists to
+// prevent, reintroduced through the version field.
+//
+// Version 0 must therefore be handled like any other empty block: clear.
+func TestSyncBPFCountersClearsZoneOffsetsOnLayoutVersionZero6843(t *testing.T) {
+	m := New()
+	const id uint16 = 50675
+
+	// A populated poll from a current helper.
+	m.mu.Lock()
+	m.syncBPFCountersLocked(&ProcessStatus{
+		ZoneCounterLayoutVersion: 1,
+		ZoneTrafficCounters: []ZoneTrafficCounterStatus{
+			{ZoneID: id, IngressPackets: 11, IngressBytes: 1100},
+		},
+	})
+	m.mu.Unlock()
+	if v, err := m.bpfShim.ReadZoneCounters(id, 0); err != nil || v.Packets != 11 {
+		t.Fatalf("populated poll must be readable first: %+v err=%v", v, err)
+	}
+
+	// The helper restarts into an OLDER build: layout version 0, no per-zone
+	// block. The offsets must not survive.
+	m.mu.Lock()
+	m.syncBPFCountersLocked(&ProcessStatus{ZoneCounterLayoutVersion: 0})
+	m.mu.Unlock()
+	if _, err := m.bpfShim.ReadZoneCounters(id, 0); !errors.Is(err, dataplane.ErrCounterNotPopulated) {
+		v, _ := m.bpfShim.ReadZoneCounters(id, 0)
+		t.Errorf("a layout-version-0 (downgraded/restarted) helper left the previous "+
+			"offsets in place (%+v, err=%v); want ErrCounterNotPopulated — the old "+
+			"values can never advance again, which is the frozen counter this "+
+			"change exists to prevent", v, err)
+	}
+}
