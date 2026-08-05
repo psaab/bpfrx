@@ -1054,6 +1054,31 @@ peer liveness (`lastSeen`) or drive election.
        Nothing in *this* process does — the refine slot is a CAS word, not a
        lock.
 
+       **The timeout path deliberately does not release that flock.** The
+       descriptor is a local on the wedged worker's stack, and dropping the lock
+       while that worker is still mid-write would let another incarnation
+       interleave with a write in progress — trading a delay for the torn update
+       the lock exists to prevent. It does not need releasing: an flock dies
+       with the open file description, so the kernel drops it when the process
+       exits, SIGKILL included. Under the documented restart recovery (systemd
+       `Type=simple`, `TimeoutStopSec=20`) the old unit is reaped before the new
+       one starts, so a **restart never contends for this lock**. What can
+       contend is two concurrently running incarnations — the SO_REUSEPORT
+       overlap this lock was written for — and there the blocked party is the
+       other incarnation's refine worker, whose failure is already survivable:
+       it declines the persist and keeps the wall-clock epoch already on the
+       wire.
+
+  - **`Stop` is not idempotent by construction, only by call topology.** It has
+    no `sync.Once` and no early return; a repeat call re-executes the body and
+    survives only because it captures `hbSender`/`hbReceiver` under `mu` and
+    nils them there, while `Monitor.Stop` is independently idempotent through
+    the same idiom. Both `heartbeatSender.stop` and `heartbeatReceiver.stop`
+    open with a bare `close(stopCh)`, so a second call without that capture
+    panics. The manager is built once per process and stopped once, so the
+    repeat is unreachable today — but by topology, not by design, which is why
+    `TestSecondStopIsANoOp_6669` asserts it.
+
        **Three rules for tests in this area**, each of which was a real
        cross-test failure before it was a rule:
 

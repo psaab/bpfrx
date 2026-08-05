@@ -67526,3 +67526,62 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-05 08:34 PDT
+- **Action**: #6669 round 15 — resolve F1a as a comment correction (the leak is
+  ONE goroutine in production, not N), give F1b a reachability trace and an
+  exposure bound, and assert the double-`Stop` invariant that until now held
+  only by call topology.
+- **F1a is not material, and the comment now says WHY rather than asserting
+  boundedness.** `Stop` is once-per-process-per-Manager, each link verified:
+  `cluster.NewManager` has one production site
+  (`pkg/daemon/daemon_run_bringup.go`) and the manager is never rebuilt live —
+  a day-2 node-id / cluster-id or topology change is REFUSED at commit and
+  requires a process restart (`pkg/daemon/cluster_topology_preflight.go`); the
+  only production `Stop` is in `runShutdownSequence`
+  (`pkg/daemon/daemon_run_shutdown.go:204-205`, nil-guarded), reached from two
+  mutually exclusive returns in a `Run` that itself runs once
+  (`cmd/xpfd/main.go`). Codex's "repeated Stop leaves another permanent waiter"
+  therefore cannot occur in production. The previous revision of the join
+  comment overstated this as "this is not called once"; it now states the
+  topology and records that the repeated-join pressure is from the TESTS
+  (`waitBootEpochIdle`, `keyedEpochManager`), where 8 timed-out joins left 8
+  parked waiters.
+- **F1b — reachable, deliberately NOT released, and bounded.** Trace: the worker
+  enters `withEpochFileLock`, opens `<path>.lock`, takes `LOCK_EX`, and wedges
+  inside `fn()` — the read-modify-write, whose `WriteFileDurable` fsyncs — so it
+  holds the lock; `Stop` sets `bootEpochStopped`, joins for
+  `bootEpochStopJoinBudget` (2 s), times out, logs and returns. The claim at the
+  old `heartbeat_epoch.go:811` that the worker "holds no locks a caller can wait
+  on" was therefore FALSE, and is corrected. Releasing on the timeout path would
+  be WRONG, not merely awkward: the descriptor is a local on the wedged worker's
+  stack, and dropping the lock mid-write would let another incarnation interleave
+  with a write in progress — trading a delay for the torn update the lock exists
+  to prevent. It does not need releasing, because an flock dies with the open
+  file description: the kernel drops it at process exit, SIGKILL included. Under
+  the documented restart recovery (systemd `Type=simple`, `TimeoutStopSec=20`,
+  `test/incus/xpfd.service`) the old unit is reaped BEFORE the new one starts, so
+  a restart never contends for this lock. The case that can contend is two
+  concurrently running incarnations — the SO_REUSEPORT overlap the lock was
+  written for — and there the blocked party is the other incarnation's refine
+  WORKER, whose failure this file already treats as survivable: it declines the
+  persist and keeps the wall-clock epoch already on the wire.
+- **`Stop` is idempotent by CALL TOPOLOGY, not by construction — now asserted.**
+  It has no `sync.Once` and no early return, so a repeat call re-executes the
+  body; it survives only because it captures `hbSender`/`hbReceiver` under `mu`
+  and nils them in the same critical section, while `Monitor.Stop` is
+  independently idempotent through the same idiom. Both
+  `heartbeatSender.stop` (`heartbeat.go:1710`) and `heartbeatReceiver.stop`
+  (`heartbeat.go:1953`) open with a bare `close(stopCh)`, and closing a closed
+  channel panics. `pkg/lldp` and `pkg/natpoolalarm` both assert this for their
+  managers; `cluster.Manager` did not.
+  `TestSecondStopIsANoOp_6669` now does, and recovers the panic rather than
+  letting it take the binary down with no assertion.
+- **RED-on-revert (watched).** Replacing the capture-and-nil with direct field
+  reads (`if m.hbSender != nil { m.hbSender.stop() }`) fails with
+  "the second Manager.Stop panicked: close of closed channel"; restored, rc 0
+  over `-count=3`.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 17.0 s.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md

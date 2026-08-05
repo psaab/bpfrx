@@ -833,12 +833,27 @@ func (m *Manager) releaseBootEpochRefine() bool {
 // `go func() { wg.Wait(); close(done) }()` — selected against a timer, and the
 // timeout then returns only the CALLER: nothing cancels a WaitGroup.Wait, so
 // the helper stays parked for as long as the worker does, which over a wedged
-// store is forever. One terminal Stop leaking one goroutine is easy to wave
-// through, but this is not called once — Stop is public, and waitBootEpochIdle
-// and keyedEpochManager join on every test — so N timed-out joins left N
-// permanent goroutines (measured: 8 calls, 8 parked waiters). The worker
-// publishes its OWN exit handle instead, so a join is a select on a channel
-// somebody else closes and a timeout costs nothing at all.
+// store is forever.
+//
+// IN PRODUCTION THAT IS EXACTLY ONE GOROUTINE, and an earlier revision of this
+// comment overstated it as "this is not called once". The call topology is
+// once-per-process and each link was checked: cluster.NewManager runs at one
+// site (pkg/daemon/daemon_run_bringup.go) and the manager is never rebuilt live
+// — a day-2 node-id/cluster-id or topology change is REFUSED at commit and
+// requires a process restart (pkg/daemon/cluster_topology_preflight.go) — while
+// the only production Stop is in runShutdownSequence
+// (pkg/daemon/daemon_run_shutdown.go), reached from two mutually exclusive
+// returns in a Run that itself runs once (cmd/xpfd/main.go). So the leak was
+// one parked goroutine in a process that is already exiting, which is not on
+// its own worth a design change.
+//
+// WHAT MADE IT WORTH FIXING is that the shape is repeated where the joins ARE
+// repeated — waitBootEpochIdle and keyedEpochManager join on every epoch test,
+// and N timed-out joins left N permanent goroutines (measured: 8 calls, 8
+// parked waiters) — and that the replacement is strictly SMALLER than what it
+// replaced: a WaitGroup plus a goroutine per call become one pointer the worker
+// publishes. A join is then a select on a channel somebody else closes, and a
+// timeout costs nothing at all.
 //
 // IT ALSO TAKES NO LOCK, and that is not a micro-optimisation — reading the
 // handle under bootEpochRefineMu DEADLOCKED this function outright. That mutex
@@ -868,7 +883,25 @@ func (m *Manager) releaseBootEpochRefine() bool {
 // unwedges. Nothing in THIS process waits on it — the refine slot is the only
 // in-process serialization and it is a CAS word, not a lock — which is
 // presumably what the claim meant, but the flock is a real cross-process one and
-// the withEpochFileLock rationale is written around exactly that. Beyond it the
+// the withEpochFileLock rationale is written around exactly that.
+//
+// THE TIMEOUT PATH MUST NOT RELEASE IT, and the exposure is smaller than "the
+// next process blocks" suggests. Releasing is not merely awkward but WRONG: the
+// descriptor is a local in withEpochFileLock, on the wedged worker's stack, and
+// dropping the lock while that worker is still inside its read-modify-write
+// would let another incarnation interleave with a write in progress — trading a
+// delay for the torn update the lock exists to prevent. It does not need
+// releasing, because an flock dies with the open file description: the kernel
+// drops it when the process exits, SIGKILL included. Under the documented
+// restart recovery (systemd Type=simple, TimeoutStopSec=20) the old unit is
+// reaped — SIGTERM, then SIGKILL at 20 s — BEFORE the new one starts, so a
+// restart never contends for this lock at all. What can contend is two
+// CONCURRENTLY RUNNING incarnations, which is the SO_REUSEPORT overlap
+// withEpochFileLock was written for (see
+// TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669), and there the
+// blocked party is the other node's refine WORKER, whose failure this file
+// already treats as survivable: it declines the persist and keeps the
+// wall-clock epoch already on the wire. Beyond it the
 // worker touches only m.bootEpoch and m.bootEpochWrote (both atomic) and the
 // state file (written through fsatomic, so a concurrent reader sees the old or
 // the new value and never a torn one). It cannot resurrect the heartbeat or

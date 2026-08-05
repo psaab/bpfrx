@@ -699,3 +699,92 @@ func TestTimedOutJoinLeavesNoWaiterBehind_6669(t *testing.T) {
 			"wedged store leaks one for the life of the process", leaked, calls)
 	}
 }
+
+// TestSecondStopIsANoOp_6669 pins an invariant Manager.Stop holds only by
+// ACCIDENT OF ITS CALL TOPOLOGY, so that a second call site cannot be added
+// without something failing loudly.
+//
+// Stop has no sync.Once and no early return: every call re-executes the whole
+// body. It survives a repeat only because it CAPTURES m.hbSender and
+// m.hbReceiver under m.mu and NILS them in that same critical section, so a
+// second call captures nil and skips them. Nothing about that is decorative —
+// heartbeatSender.stop and heartbeatReceiver.stop each begin with a bare
+// close(stopCh), and closing a closed channel PANICS rather than being a
+// tolerated no-op. Manager.monitor is never nil'd, and is covered instead by
+// Monitor.Stop being independently idempotent through the same idiom.
+//
+// The second call is unreachable TODAY, and unreachable by topology rather than
+// by construction: cluster.NewManager runs exactly once per process
+// (pkg/daemon/daemon_run_bringup.go), the only production Stop is in
+// runShutdownSequence (pkg/daemon/daemon_run_shutdown.go), and that sequence is
+// reached from two mutually exclusive returns inside a Run that itself runs
+// once (cmd/xpfd/main.go). A distinction that fine is exactly what a later
+// refactor loses silently, and the sibling managers in pkg/lldp and
+// pkg/natpoolalarm both already assert it. This one did not.
+//
+// RED-on-revert: drop the capture-and-nil and call the fields directly —
+//
+//	if m.hbSender != nil {
+//		m.hbSender.stop()
+//	}
+//
+// — and the second Stop panics with "close of closed channel".
+func TestSecondStopIsANoOp_6669(t *testing.T) {
+	// Keep the refine worker off the real system path.
+	orig := bootEpochPath
+	bootEpochPath = filepath.Join(t.TempDir(), "ha-boot-epoch")
+	t.Cleanup(func() { bootEpochPath = orig })
+
+	m := NewManager(0, 1)
+	if err := m.StartHeartbeat("127.0.0.1", "127.0.0.1", ""); err != nil {
+		t.Fatalf("StartHeartbeat: %v", err)
+	}
+	m.mu.RLock()
+	s, r := m.hbSender, m.hbReceiver
+	m.mu.RUnlock()
+	if s == nil || r == nil {
+		t.Fatal("StartHeartbeat installed no sender/receiver, so a second Stop would skip " +
+			"them for the wrong reason and this test would prove nothing")
+	}
+
+	m.Stop()
+	if !senderStopped(s) || !receiverStopped(r) {
+		t.Fatalf("the first Stop left the heartbeat pair running (sender stopped=%v, "+
+			"receiver stopped=%v); the repeat below would then be testing nothing",
+			senderStopped(s), receiverStopped(r))
+	}
+
+	// RECOVER RATHER THAN LET IT CRASH. An unrecovered panic takes the whole
+	// test binary down and reports no assertion, which is the failure mode this
+	// package has already been bitten by; convert it into a message that names
+	// the mechanism.
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				t.Fatalf("the second Manager.Stop panicked: %v\n\nStop has no sync.Once and "+
+					"no early return, so it survives a repeat call ONLY by capturing "+
+					"m.hbSender/m.hbReceiver under m.mu and nilling them there. "+
+					"heartbeatSender.stop and heartbeatReceiver.stop both open with a bare "+
+					"close(stopCh), and a second close panics.", p)
+			}
+		}()
+		m.Stop()
+	}()
+
+	// And it is a no-op, not merely non-fatal: the pair stays stopped and the
+	// manager stays stopped.
+	if !senderStopped(s) || !receiverStopped(r) {
+		t.Fatal("the second Stop un-stopped the heartbeat pair")
+	}
+	m.mu.RLock()
+	stopped := m.stopped
+	sender, receiver := m.hbSender, m.hbReceiver
+	m.mu.RUnlock()
+	if !stopped {
+		t.Fatal("m.stopped is false after two Stops")
+	}
+	if sender != nil || receiver != nil {
+		t.Fatalf("Stop left a sender/receiver installed (sender=%v receiver=%v); a THIRD "+
+			"call would then reach stop() on a closed stopCh", sender != nil, receiver != nil)
+	}
+}
