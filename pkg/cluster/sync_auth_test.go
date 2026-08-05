@@ -10,15 +10,17 @@ import (
 	"time"
 )
 
-// fakeSyncAuthProvider is a test SyncAuthProvider that returns a fixed PSK and a
-// settable heartbeat downgrade-guard signal.
+// fakeSyncAuthProvider is a test SyncAuthProvider that returns a fixed PSK.
+//
+// #5078: it also carried a settable HeartbeatPeerAuthSeen, the cross-channel
+// downgrade-guard signal. That left the interface once syncPeerAuthSeen went,
+// and with it the only caller that ever passed authSeen=true — the deleted
+// TestSyncAuthHandshakeDowngradeGuardRejects.
 type fakeSyncAuthProvider struct {
-	key      []byte
-	authSeen bool
+	key []byte
 }
 
-func (f *fakeSyncAuthProvider) ControlLinkAuthKey() []byte  { return f.key }
-func (f *fakeSyncAuthProvider) HeartbeatPeerAuthSeen() bool { return f.authSeen }
+func (f *fakeSyncAuthProvider) ControlLinkAuthKey() []byte { return f.key }
 
 type handshakeResult struct {
 	mode syncAuthMode
@@ -35,11 +37,11 @@ func runHandshake(s *SessionSync, conn net.Conn) <-chan handshakeResult {
 	return ch
 }
 
-func newAuthSync(t *testing.T, key []byte, authSeen bool) *SessionSync {
+func newAuthSync(t *testing.T, key []byte) *SessionSync {
 	t.Helper()
 	s := NewSessionSync(":0", ":0", nil)
-	if key != nil || authSeen {
-		s.SetAuthProvider(&fakeSyncAuthProvider{key: key, authSeen: authSeen})
+	if key != nil {
+		s.SetAuthProvider(&fakeSyncAuthProvider{key: key})
 	}
 	return s
 }
@@ -51,8 +53,8 @@ func newAuthSync(t *testing.T, key []byte, authSeen bool) *SessionSync {
 // handshake there is no authentication and no derived key.
 func TestSyncAuthHandshakeBothKeyedAuthenticates(t *testing.T) {
 	key := []byte("shared-control-link-secret-key")
-	a := newAuthSync(t, key, false)
-	b := newAuthSync(t, key, false)
+	a := newAuthSync(t, key)
+	b := newAuthSync(t, key)
 
 	ca, cb := net.Pipe()
 	defer ca.Close()
@@ -98,8 +100,8 @@ func TestSyncAuthHandshakeBothKeyedAuthenticates(t *testing.T) {
 // no session data is accepted. RED on revert: without the handshake the
 // connection is accepted regardless of key.
 func TestSyncAuthHandshakeMismatchedKeyRejected(t *testing.T) {
-	a := newAuthSync(t, []byte("key-alpha"), false)
-	b := newAuthSync(t, []byte("key-bravo-different"), false)
+	a := newAuthSync(t, []byte("key-alpha"))
+	b := newAuthSync(t, []byte("key-bravo-different"))
 
 	ca, cb := net.Pipe()
 	defer ca.Close()
@@ -129,13 +131,16 @@ func TestSyncAuthHandshakeMismatchedKeyRejected(t *testing.T) {
 // dual-accept a legacy/unkeyed peer "so the stream stays legacy-compatible (no
 // brick)". That compatibility was an unauthenticated active bypass: the peer is
 // admitted with no proof of the PSK, its first frame reaches cluster state, and
-// it displaces the legitimate peer connection. A keyed node now rejects it, and
-// the legacy-compat need is served by the explicit migration window below.
+// it displaces the legitimate peer connection. A keyed node now rejects it.
+//
+// There is no migration window serving the legacy-compat need — an earlier
+// draft of #5078 shipped one and it was removed; a rolling key rollout is
+// handled by the procedure in pkg/cluster/README.md instead.
 //
 // RED on revert: restore the first-contact grace in syncAuthDecision and the
 // handshake accepts instead of erroring.
 func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
-	a := newAuthSync(t, []byte("psk"), false)
+	a := newAuthSync(t, []byte("psk"))
 
 	ca, cb := net.Pipe()
 	defer ca.Close()

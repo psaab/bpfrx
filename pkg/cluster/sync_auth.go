@@ -26,14 +26,21 @@ package cluster
 //     when BOTH peers are keyed each proves possession of the PSK with an
 //     HMAC over the OTHER side's nonce (mutual challenge-response). Fresh
 //     per-connection nonces make the proof replay-safe at setup.
-//   - Dual-accept (rolling upgrade): a node with no key never handshakes and
-//     is byte-for-byte a legacy peer; a keyed node that sees a legacy/unkeyed
-//     peer negotiates UNAUTHENTICATED and the stream stays legacy-compatible.
-//     Enforcement engages only once BOTH nodes are keyed and signing.
-//   - Downgrade-guard: once a peer has authenticated (on the sync channel OR
-//     the heartbeat channel, HeartbeatPeerAuthSeen), a later UNAUTHENTICATED
-//     connection from it is rejected — mirrors heartbeatAuthDecision / the
-//     #4357 fabric guard.
+//   - Dual-accept, UNKEYED SIDE ONLY: a node with no key never handshakes and
+//     is byte-for-byte a legacy peer, so an unkeyed node still accepts anything.
+//     A KEYED node does NOT dual-accept — #5078 removed that. It requires an
+//     authenticated peer and rejects a legacy/unkeyed one outright, with no
+//     first-contact grace and no migration window; see syncAuthDecision.
+//   - No sync-side downgrade-guard: there is nothing left for one to protect.
+//     A guard of that shape only matters where an unkeyed peer would otherwise
+//     be admitted, and on a keyed node none ever is. The former
+//     syncPeerAuthSeen / syncAuthedEver pair was removed once #5078 made the
+//     rejection unconditional — it had become unreachable, and a dead guard
+//     whose doc still asserts a live property is exactly the hazard #5078
+//     removed the pre-admission frame path for. The #4107 HEARTBEAT downgrade
+//     guard is SEPARATE state (heartbeatAuthState.peerAuthenticated, reached
+//     via Manager.HeartbeatPeerAuthSeen) and is unaffected, as is the #4357
+//     fabric guard that consumes it.
 //   - Per-frame seal (authConn.sealFrame / verifyFrame): on an authenticated
 //     connection every frame gets an 8-byte per-connection sequence + a
 //     32-byte HMAC (keyed by a per-connection key derived from the PSK and
@@ -108,14 +115,19 @@ const (
 	syncAuthAuthenticated                       // PSK handshake succeeded; frames sealed
 )
 
-// SyncAuthProvider supplies the shared control-link PSK and the cross-channel
-// downgrade-guard signal to the session-sync stream authenticator (#4107 F23).
-// *Manager satisfies it (ControlLinkAuthKey + HeartbeatPeerAuthSeen). It is
-// OPTIONAL: when no provider is wired, or the key is empty, the sync stream
-// runs in legacy unauthenticated mode (dual-accept), byte-identical to before.
+// SyncAuthProvider supplies the shared control-link PSK to the session-sync
+// stream authenticator (#4107 F23). *Manager satisfies it. It is OPTIONAL:
+// when no provider is wired, or the key is empty, the sync stream runs in
+// legacy unauthenticated mode, byte-identical to before.
+//
+// #5078: this used to also require HeartbeatPeerAuthSeen(), the cross-channel
+// downgrade-guard signal. Its only consumer was syncPeerAuthSeen, which the
+// unconditional keyed-node rejection made unreachable, so the requirement went
+// with it. Manager still EXPORTS HeartbeatPeerAuthSeen — the gRPC fabric
+// listener (pkg/grpcapi) and the control-link auth status string both consume
+// it — it is simply no longer part of this interface's contract.
 type SyncAuthProvider interface {
 	ControlLinkAuthKey() []byte
-	HeartbeatPeerAuthSeen() bool
 }
 
 type syncAuthProviderBox struct{ p SyncAuthProvider }
@@ -134,22 +146,6 @@ func (s *SessionSync) authKey() []byte {
 		return box.p.ControlLinkAuthKey()
 	}
 	return nil
-}
-
-// syncPeerAuthSeen reports whether the peer has ever authenticated on EITHER
-// the sync channel (this stream, sticky s.syncAuthedEver) or the heartbeat
-// channel (HeartbeatPeerAuthSeen). Either proves both nodes are keyed, so a
-// subsequent unauthenticated connection is a downgrade attack and must be
-// rejected. Consulting the heartbeat closes the window after a keyed node
-// restarts (heartbeats flow every ~200ms) before the first sync auth.
-func (s *SessionSync) syncPeerAuthSeen() bool {
-	if s.syncAuthedEver.Load() {
-		return true
-	}
-	if box := s.authProvider.Load(); box != nil && box.p != nil {
-		return box.p.HeartbeatPeerAuthSeen()
-	}
-	return false
 }
 
 // authConn wraps a session-sync connection after the setup handshake. When
@@ -444,7 +440,6 @@ func (s *SessionSync) wrapSyncConn(fabricIdx int, conn net.Conn, mode syncAuthMo
 	ac := &authConn{Conn: conn}
 	if mode == syncAuthAuthenticated {
 		ac.key = frameKey
-		s.syncAuthedEver.Store(true)
 		slog.Info("cluster sync: connection authenticated with control-link PSK",
 			"fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 	}
