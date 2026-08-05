@@ -686,6 +686,38 @@ const clusterPkgPath = "github.com/psaab/xpf/pkg/cluster"
 // carry no cluster frame on either line and would escape it. That is the limit
 // of what stack matching can see, and it is a much less plausible refactor than
 // the one that defeated the old matcher.
+// currentGoroutineID returns the id of the goroutine that calls it, parsed from
+// the header runtime.Stack writes ("goroutine 20 [running]:").
+//
+// GOROUTINE IDENTITY IS THE PROPERTY, and every cheaper stand-in for it is a
+// proxy that a hand-off can satisfy. Comparing the published
+// Manager.bootEpochWorker pointer looks like it proves "the same worker", but a
+// successor that INHERITS the predecessor's handle keeps that pointer equal
+// while running on a different goroutine — measured, 200/200 green against an
+// assertion written that way. Counting goroutines does not close it either: a
+// hand-off where the predecessor exits as the successor starts holds the count
+// at one.
+//
+// runtime.Stack with all=false dumps only the calling goroutine, so this is
+// cheap enough to call from inside a seam, and the id is stable for the life of
+// that goroutine. Go exposes no public API for this, which is why it is confined
+// to tests; the alternative was to keep asserting a proxy and describe it as
+// something it is not.
+func currentGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	s := strings.TrimPrefix(string(buf[:n]), "goroutine ")
+	i := strings.IndexByte(s, ' ')
+	if i <= 0 {
+		return 0
+	}
+	id, err := strconv.ParseUint(s[:i], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
 func clusterGoroutines() int {
 	buf := make([]byte, 1<<16)
 	for {

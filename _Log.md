@@ -67878,3 +67878,53 @@ break — `go vet` confirmed passing under every revert.
   green over 20 consecutive runs before mutation; flake three runs at
   `-count=10` across the five coalescing/reclaim tests, rc 0 throughout.
 - **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 15:26 PDT
+- **Action**: #6669 round 20 — bind GOROUTINE identity instead of asserting a
+  handle pointer and calling it worker identity; assert the handle is retired.
+- **The round-19 assertion proved the wrong thing, and it was the same shape as
+  the defect round 18 closed, one level down.** Round 19 closed
+  hand-off-with-a-DIFFERENT-handle. The escape left open is
+  hand-off-with-the-SAME-handle: a successor that inherits the predecessor's
+  handle keeps the published pointer equal, holds the in-flight bit
+  continuously, and takes over the final cleanup, while a different goroutine
+  serves pass 2. Measured on that mutation with only the new goroutine-id check
+  disabled: the pointer comparison AND the goroutine COUNT are both satisfied,
+  20/20 green. So "prove the SAME worker serves the follow-up" was a claim about
+  a proxy. It was also wrong in the other direction — a healthy worker that
+  rotated its handle per pass would have failed it.
+- **Goroutine identity IS cheaply observable, so the claim is now true rather
+  than narrowed.** `runtime.Stack(buf, false)` dumps only the calling goroutine
+  and its header carries the id ("goroutine 20 [running]:"), so
+  `currentGoroutineID` can be called from inside a seam. The epochFlock seam
+  records the id on pass 1 and again on pass 2 (before parking, so the test can
+  read it while pass 2 is held), and the test asserts they are equal. Go exposes
+  no public API for this and it stays confined to tests; the alternative was to
+  keep asserting a proxy and describe it as something it is not.
+- **Both checks kept, each described as what it actually says.** The ids bind
+  the WORKER; the handle pointer binds the HANDLE against rotation or
+  republication (a handle is published per claimed worker, not per pass, and
+  rotating it would release a joiner holding the old one early).
+- **RED-on-revert, both directions measured.**
+  - Gate's mutation (same handle inherited, in-flight bit held, fresh goroutine,
+    cleanup transferred): RED at `session_bind:635` — "the follow-up is running
+    on goroutine 22 but pass 1 ran on 21". With ONLY the id assertion disabled
+    the same mutation is GREEN 20/20, so the id check is the load-bearing one.
+  - Deleting the handle-clear `CompareAndSwap` from the worker's exit defer: RED
+    at `session_bind:664` — nothing else required the handle to be nil, since
+    the word is 0 and `done` is closed. `joinBootEpochRefine` short-circuits on
+    a nil handle, so a stale one makes a later join select on a channel whose
+    worker has already gone.
+  Both are assertions rather than build breaks; restored with `touch` and
+  `heartbeat_epoch.go` confirmed identical to HEAD.
+- **Cleared by the gate, recorded so it is not re-litigated.** Round 19 did not
+  merely relocate the unobserved window: `waitBootEpochIdle` joins
+  `worker.done`, which the worker closes as its very last act, so the original
+  live-worker window is genuinely closed. The two parks neither deadlock nor
+  flake.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 20.8 s. New assertions
+  green over 20 consecutive runs before mutation; flake three runs at
+  `-count=10` across the six coalescing/reclaim/join tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md

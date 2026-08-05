@@ -513,14 +513,21 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	m := keyedEpochManager(t, path)
 
 	var passes atomic.Int64
+	var gid1, gid2 atomic.Uint64
 	inPass2 := make(chan struct{})
 	releasePass2 := make(chan struct{})
 	var pass2Once sync.Once
 	origFlock := epochFlock
 	epochFlock = func(fd int, how int) error {
-		if passes.Add(1) == 2 {
-			// Park the FOLLOW-UP too, so who runs it is observable. Without
-			// this, everything from the unpark to waitBootEpochIdle is unseen.
+		switch passes.Add(1) {
+		case 1:
+			gid1.Store(currentGoroutineID())
+		case 2:
+			// Recorded BEFORE parking, so the test can read it while pass 2 is
+			// held. Park the FOLLOW-UP too, so who runs it is observable at all:
+			// without this, everything from the unpark to waitBootEpochIdle is
+			// unseen.
+			gid2.Store(currentGoroutineID())
 			pass2Once.Do(func() {
 				close(inPass2)
 				<-releasePass2
@@ -595,24 +602,45 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 
 	unparkWorker()
 
-	// THE FOLLOW-UP MUST BE THE SAME WORKER. Every count above is taken BEFORE
-	// the unpark, so without this the window from here to waitBootEpochIdle is
-	// unobserved and a HAND-OFF satisfies the test: worker 1 consumes pending,
-	// exits, and a successor runs the follow-up — leaving exactly two passes, a
-	// settled word, and both goroutine counts untouched.
-	// releaseBootEpochRefine's contract is stronger than that. It serves the
-	// follow-up with the in-flight bit STILL HELD, which is precisely what stops
-	// a second worker spawning at all, so pin identity and not just arithmetic.
+	// THE FOLLOW-UP MUST RUN ON THE SAME GOROUTINE. Every count above is taken
+	// BEFORE the unpark, so without an observation here the window from this
+	// point to waitBootEpochIdle is unseen and a HAND-OFF satisfies the test:
+	// worker 1 consumes pending, exits, and a successor runs the follow-up,
+	// leaving exactly two passes, a settled word and both goroutine counts
+	// untouched. releaseBootEpochRefine's contract is stronger than that — it
+	// serves the follow-up with the in-flight bit STILL HELD, which is precisely
+	// what keeps a second worker from spawning at all.
+	//
+	// THE GOROUTINE ID IS THE PROPERTY; THE HANDLE POINTER IS A PROXY FOR IT,
+	// and an earlier revision of this comment claimed the proxy proved it. A
+	// successor that INHERITS the predecessor's handle — same pointer, in-flight
+	// bit held continuously, cleanup transferred — passes the pointer comparison
+	// and the goroutine COUNT while a different goroutine serves pass 2:
+	// measured 200/200 green. It is wrong in the other direction too, since a
+	// healthy worker that rotated its handle per pass would fail it. Both checks
+	// are kept, but for what each actually says: the ids below bind the worker,
+	// the pointer below that binds the HANDLE against rotation or republication.
 	select {
 	case <-inPass2:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("the coalesced follow-up never reached the file lock (refine word = %#x)",
 			m.bootEpochRefine.Load())
 	}
+	g1, g2 := gid1.Load(), gid2.Load()
+	if g1 == 0 || g2 == 0 {
+		t.Fatalf("goroutine ids not captured (pass 1 = %d, pass 2 = %d); the assertion below "+
+			"would pass vacuously", g1, g2)
+	}
+	if g1 != g2 {
+		t.Fatalf("the follow-up is running on goroutine %d but pass 1 ran on %d: the owed pass "+
+			"was HANDED OFF to a successor instead of being served by the worker that still "+
+			"holds the in-flight bit, which is what keeps a second worker from spawning at "+
+			"all", g2, g1)
+	}
 	if m.bootEpochWorker.Load() != w1 {
-		t.Fatal("the follow-up is running on a DIFFERENT worker: the owed pass was handed to " +
-			"a successor instead of being served by the worker that still holds the " +
-			"in-flight bit, which is what keeps a second worker from spawning at all")
+		t.Fatal("the published worker handle changed while one worker was still serving its " +
+			"own follow-up: a handle is published per CLAIMED WORKER, not per pass, and " +
+			"rotating it would release a joiner holding the old one early")
 	}
 	if got := clusterGoroutines() - goBase; got != 1 {
 		t.Fatalf("%d package goroutines while the follow-up runs, want exactly 1", got)
@@ -626,6 +654,16 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 		t.Fatalf("%d locked refine passes ran for the initial resolve plus TWO late requests, "+
 			"want exactly 2: the second late request did not coalesce onto the follow-up "+
 			"the first had already made owed", got)
+	}
+	// AND THE HANDLE IS RETIRED. Nothing above requires it: the word is 0 and
+	// worker.done is closed, so deleting the CompareAndSwap in the worker's exit
+	// defer leaves a stale handle published and every other assertion here still
+	// passes. joinBootEpochRefine short-circuits on a nil handle, so a stale one
+	// makes a later join wait on a worker that has already gone.
+	if got := m.bootEpochWorker.Load(); got != nil {
+		t.Fatal("a worker handle is still published after the worker exited: the exit defer's " +
+			"CompareAndSwap did not retire it, so the next join selects on a channel belonging " +
+			"to a worker that is already gone")
 	}
 	if got := m.bootEpochRefine.Load(); got != 0 {
 		t.Fatalf("refine word settled at %#x, want 0", got)
