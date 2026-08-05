@@ -170,7 +170,7 @@ func (m *Manager) SetZoneCounterOffset(zoneID uint16, ingress, egress CounterVal
 //     block. Its store is empty, so it publishes nothing, and nothing is what
 //     the Go side should report.
 //
-// An empty rows slice therefore clears the map, which is correct in every case
+// An empty rows map therefore clears the offset map, which is correct in every case
 // above: "the helper published no per-zone volume" is exactly
 // ErrCounterNotPopulated. The sole call site (syncBPFCountersLocked) runs only
 // on a successfully decoded ProcessStatus, so an empty set here is a real

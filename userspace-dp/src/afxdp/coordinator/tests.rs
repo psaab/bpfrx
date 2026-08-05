@@ -4590,6 +4590,69 @@ fn validate_snapshot_buildable_matches_reconcile_5171() {
 /// Some(&coord.forwarding)` prunes zone B (absent from the candidate) from
 /// the live store → the `after.contains(B)` assertion FAILS.
 #[test]
+fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
+    // #6843 (Codex gate): drive the PRODUCTION publication accessor,
+    // `Coordinator::zone_traffic_counters`, not the extracted
+    // `publishable_zone_rows` primitive. The primitive tests in
+    // zone_counters.rs prove the filter; they do NOT prove the coordinator
+    // calls it, so reverting this accessor to its old inline
+    // "configured-only" body left them all green. This test binds the wiring.
+    use crate::afxdp::zone_counters::{
+        flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,
+        ZONE_COUNTER_ASSIGNABLE_SLOTS,
+    };
+    const Z: u16 = 50675; // config::StableZoneID("trust")
+
+    let mut coord = Coordinator::new();
+
+    // Apply 1: Z alone, holding a slot, moving traffic.
+    let map1 = ZoneCounterSlotMap::build(&[Z], &coord.forwarding.zone_counter_store);
+    record_zone_traffic(&map1, Z, 0, 1500);
+    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &map1);
+    coord.forwarding.zone_counter_slot_map = std::sync::Arc::new(map1);
+    coord.forwarding.zone_id_to_name.insert(Z, "trust".to_string());
+
+    let published = coord.zone_traffic_counters();
+    assert!(
+        published.iter().any(|r| r.zone_id == Z),
+        "apply 1: the coordinator must publish a slotted zone with traffic: {published:?}"
+    );
+
+    // Apply 2: enough lower ids to exhaust capacity. Z stays CONFIGURED and
+    // keeps its retained totals, but loses its slot.
+    let mut ids: Vec<u16> = (1..=(ZONE_COUNTER_ASSIGNABLE_SLOTS as u16)).collect();
+    ids.push(Z);
+    for id in &ids {
+        coord
+            .forwarding
+            .zone_id_to_name
+            .insert(*id, format!("z{id}"));
+    }
+    let map2 = ZoneCounterSlotMap::build(&ids, &coord.forwarding.zone_counter_store);
+    assert_eq!(map2.slot_of(Z), 0, "Z must lose its slot in apply 2");
+    coord.forwarding.zone_counter_slot_map = std::sync::Arc::new(map2);
+
+    // The store still retains Z's totals -- assert it, so this test cannot
+    // pass because the data vanished for an unrelated reason.
+    assert!(
+        coord
+            .forwarding
+            .zone_counter_store
+            .snapshot()
+            .iter()
+            .any(|r| r.zone_id == Z),
+        "precondition: the store must still retain Z's totals"
+    );
+
+    let published = coord.zone_traffic_counters();
+    assert!(
+        !published.iter().any(|r| r.zone_id == Z),
+        "the coordinator kept publishing a zone that lost its slot: its total can \
+         never advance again, so Prometheus would emit a FROZEN counter: {published:?}"
+    );
+}
+
+#[test]
 fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
     use crate::afxdp::zone_counters::{
         flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,

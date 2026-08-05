@@ -1109,9 +1109,15 @@ impl Coordinator {
     }
 
     /// #3651: operator clear of per-zone traffic counters. Resets the helper's
-    /// cumulative store so the Go side's absolute `SetZoneCounterOffset`
-    /// overwrite reports 0 instead of snapping the pre-clear total back on the
-    /// next 1 s status poll (the load-bearing half of the operator clear).
+    /// cumulative store so the pre-clear total is not snapped back on the next
+    /// 1 s status poll (the load-bearing half of the operator clear).
+    ///
+    /// #6843: a cleared zone then reads as NOT POPULATED rather than as zero.
+    /// `ZoneCounterStore::snapshot` omits all-zero rows, so a just-cleared zone
+    /// produces no row, and the Go side replaces its offset map from that
+    /// snapshot (`ReplaceZoneCounterOffsets`) rather than overwriting row by
+    /// row — so the offset is dropped, not set to 0. Surfaces render
+    /// "not available" until traffic repopulates the row.
     pub fn clear_zone_counters(&self) {
         self.forwarding.zone_counter_store.clear();
     }

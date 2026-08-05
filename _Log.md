@@ -1,3 +1,40 @@
+## 2026-08-05 — #6843 Codex fold: bind the two PRODUCTION call sites
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Codex MERGE-NEEDS-MINOR. The fix was sound; the tests bound the
+  extracted primitive and NOT its wiring, so three plausible reverts shipped
+  green: the coordinator reverting to inline configured-only publication, and
+  the Go status loop reverting to per-row setters (which the Prometheus test
+  also missed, because it injects replacement maps directly). Added one test per
+  side driving the REAL entry point — `Coordinator::zone_traffic_counters` and
+  `syncBPFCountersLocked` over two successive polls. Also strengthened five
+  assertions that a broken implementation satisfied: `EmptyClearsAll` (an
+  always-clears impl passed — now paired with a repopulate leg), the Rust
+  sibling test (`|_| true` let the configured predicate be deleted — now a real
+  configured set excluding a slotted zone), the Rust unconfigured test (all
+  zones slotted, so the slot predicate could be deleted — now includes an
+  unslotted zone with retained totals), Go remove/re-add (input now mutated
+  after the call), and Go input-copy (a second snapshot, without which
+  merge-only passed). Corrected two comments that became FALSE with this change
+  — both claimed a cleared zone "reports 0" when it now reads as
+  ErrCounterNotPopulated, a real behavioural difference a reader would reason
+  wrongly from — plus a "slice"/"map" wording nit.
+- **Test-authoring note**: the strengthened Rust test initially failed because
+  the pending accumulator is a shared THREAD-LOCAL — recording against two slot
+  maps before flushing once folds the first map's deltas through the second
+  map. Flush after each record, with the map the traffic was recorded against.
+- **Validation**: full Go suite REAL exit 0 (unsandboxed, first run). Full cargo
+  suite: run 1 hit `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`
+  (HA session mutex, unrelated subsystem); it PASSES isolated and run 2 was
+  exit 0 — non-deterministic, and this diff touches no HA session code.
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `pkg/dataplane/userspace/zone_counter_syncloop_6843_test.go` (new),
+  `pkg/dataplane/userspace/zonecounters.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `pkg/dataplane/maps_counters.go`, `_Log.md`
+
 ## 2026-08-05 — #6843 fold: overflow retention published a FROZEN counter
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

@@ -606,12 +606,24 @@ mod tests {
         record_zone_traffic(&map, 1, 0, 64);
         flush_recorded_zone_counters(&store, &map);
 
-        let published = publishable_zone_rows(&store, &map, |_| true);
+        // A REAL configured set, and one that excludes a slotted-with-traffic
+        // zone (2). `|_| true` here would let the configured predicate be
+        // deleted with this test still green — the assertion must exercise both
+        // predicates, not just the one the test is named for.
+        record_zone_traffic(&map, 2, 0, 64);
+        flush_recorded_zone_counters(&store, &map);
+        let configured: FxHashSet<u16> = [1u16, OVERFLOWED].into_iter().collect();
+        let published = publishable_zone_rows(&store, &map, |z| configured.contains(&z));
         assert!(
             published.iter().any(|s| s.zone_id == 1),
-            "a slotted zone must keep publishing during overflow: {published:?}"
+            "a slotted, configured zone must keep publishing during overflow: {published:?}"
         );
         assert!(!published.iter().any(|s| s.zone_id == OVERFLOWED));
+        assert!(
+            !published.iter().any(|s| s.zone_id == 2),
+            "zone 2 holds a slot and has traffic but is NOT configured, so the \
+             configured predicate must still drop it: {published:?}"
+        );
     }
 
     /// #6843: the configured filter is still independently load-bearing — an
@@ -620,17 +632,41 @@ mod tests {
     #[test]
     fn unconfigured_zone_is_dropped_even_with_a_live_slot() {
         let store = ZoneCounterStore::default();
-        let map = ZoneCounterSlotMap::build(&[10, 20], &store);
+        // Build over capacity so a THIRD zone (UNSLOTTED) also carries traffic.
+        // With only slotted zones present, the slot predicate could be deleted
+        // and this test would still pass — it must exercise both predicates.
+        const UNSLOTTED: u16 = 65533;
+        let mut ids: Vec<u16> = (1..=(ZONE_COUNTER_ASSIGNABLE_SLOTS as u16)).collect();
+        ids.push(UNSLOTTED);
+        let map = ZoneCounterSlotMap::build(&ids, &store);
+        assert_ne!(map.slot_of(10), 0, "10 must hold a slot");
+        assert_ne!(map.slot_of(20), 0, "20 must hold a slot");
+        assert_eq!(map.slot_of(UNSLOTTED), 0, "the third zone must be unslotted");
+
+        // Flush after EACH record, with the slot map the traffic was recorded
+        // against. The pending accumulator is a shared thread-local, so a flush
+        // folds whatever is pending through whichever slot map it is handed —
+        // recording against two maps before flushing once mis-attributes the
+        // first map's deltas and then resets them.
         record_zone_traffic(&map, 10, 20, 100);
         flush_recorded_zone_counters(&store, &map);
+        // Give the unslotted zone retained totals directly in the store, as a
+        // carried-forward apply would, so it is a real publish candidate.
+        let seed = ZoneCounterSlotMap::build(&[UNSLOTTED], &store);
+        record_zone_traffic(&seed, UNSLOTTED, 0, 64);
+        flush_recorded_zone_counters(&store, &seed);
 
-        assert_ne!(map.slot_of(10), 0);
         let published = publishable_zone_rows(&store, &map, |zid| zid != 10);
         assert!(
             !published.iter().any(|s| s.zone_id == 10),
             "an unconfigured zone must be dropped regardless of its slot: {published:?}"
         );
         assert!(published.iter().any(|s| s.zone_id == 20));
+        assert!(
+            !published.iter().any(|s| s.zone_id == UNSLOTTED),
+            "a configured zone with retained totals but NO slot must still be \
+             dropped, so the slot predicate stays bound here too: {published:?}"
+        );
     }
 
     #[test]

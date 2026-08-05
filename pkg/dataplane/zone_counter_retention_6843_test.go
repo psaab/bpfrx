@@ -81,6 +81,17 @@ func TestReplaceZoneCounterOffsetsEmptyClearsAll(t *testing.T) {
 	if _, err := m.ReadZoneCounters(id, 0); !errors.Is(err, ErrCounterNotPopulated) {
 		t.Errorf("empty (non-nil) snapshot must clear the map; got err = %v", err)
 	}
+
+	// An implementation that ALWAYS clears would satisfy every assertion above,
+	// so the clearing assertions alone are not a test: "emitted nothing" is the
+	// failure default of this path. Re-populate and require the value back.
+	m.ReplaceZoneCounterOffsets(map[uint16][2]CounterValue{
+		id: {{Packets: 7, Bytes: 700}, {Packets: 8, Bytes: 800}},
+	})
+	if v, err := m.ReadZoneCounters(id, 0); err != nil || v.Packets != 7 || v.Bytes != 700 {
+		t.Errorf("after re-populating = %+v err=%v, want {7,700} nil — an "+
+			"always-clears implementation must not pass this test", v, err)
+	}
 }
 
 // TestReplaceZoneCounterOffsetsRemoveThenReadd covers the second retention
@@ -99,9 +110,14 @@ func TestReplaceZoneCounterOffsetsRemoveThenReadd(t *testing.T) {
 	}
 
 	// Re-added; the helper's store was reconciled away, so it counts from zero.
-	m.ReplaceZoneCounterOffsets(map[uint16][2]CounterValue{
+	// The caller's map is MUTATED after the call below, so an implementation
+	// that stored it by reference (rather than copying) would be caught here as
+	// well as by TestReplaceZoneCounterOffsetsCopiesInput.
+	readd := map[uint16][2]CounterValue{
 		id: {{Packets: 1, Bytes: 64}, {Packets: 0, Bytes: 0}},
-	})
+	}
+	m.ReplaceZoneCounterOffsets(readd)
+	readd[id] = [2]CounterValue{{Packets: 4242, Bytes: 4242}, {}}
 	v, err := m.ReadZoneCounters(id, 0)
 	if err != nil {
 		t.Fatalf("after re-add: err = %v, want nil", err)
@@ -136,5 +152,21 @@ func TestReplaceZoneCounterOffsetsCopiesInput(t *testing.T) {
 	if err != nil || v.Packets != 7 || v.Bytes != 700 {
 		t.Errorf("stored offsets follow the caller's map after it was mutated: "+
 			"got %+v err=%v, want {7,700} nil", v, err)
+	}
+
+	// A SECOND snapshot that omits id. Without this leg a merge-only
+	// implementation passes everything above — one populated snapshot cannot
+	// distinguish replace from merge, and replace-not-merge is the whole point
+	// of this method.
+	const other uint16 = 20665
+	m.ReplaceZoneCounterOffsets(map[uint16][2]CounterValue{
+		other: {{Packets: 1, Bytes: 10}, {Packets: 2, Bytes: 20}},
+	})
+	if _, err := m.ReadZoneCounters(id, 0); !errors.Is(err, ErrCounterNotPopulated) {
+		t.Errorf("a zone omitted from the second snapshot survived: replace "+
+			"degenerated to merge; err=%v", err)
+	}
+	if v, err := m.ReadZoneCounters(other, 0); err != nil || v.Packets != 1 {
+		t.Errorf("second snapshot zone = %+v err=%v, want {1,10} nil", v, err)
 	}
 }
