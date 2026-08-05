@@ -946,3 +946,97 @@ fn actionless_rule_falls_through_to_later_broader_rule_5717() {
          reviewed on #5717, not landed silently"
     );
 }
+
+/// #5717 (#6820 gate): a contradictory rule WITHOUT `off` — source NAT
+/// `interface` + `pool` — resolves to INTERFACE TRANSLATION, not to an
+/// exemption.
+///
+/// This is the case that let a false safety claim survive review. The gate's
+/// replacement wording said a contradiction "resolves to the EXEMPTION", which
+/// is true only when the contradiction contains `off`. Here there is no `off`,
+/// the matcher checks off -> interface_mode -> pool_mode in that order, and
+/// interface SNAT wins while the authored pool is silently discarded.
+///
+/// Asserting today's behaviour, not endorsing it: the rule is malformed and the
+/// strict commit gate rejects it. The point is that nothing previously bound
+/// what the tolerant path does with it, so prose could claim anything.
+#[test]
+fn interface_wins_over_pool_without_off_5717() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "contradictory-interface-pool".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string()],
+        // No `off` — the two remaining terminal actions only.
+        interface_mode: true,
+        pool_name: "p1".to_string(),
+        pool_addresses: vec!["203.0.113.10".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            "10.0.61.102".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        Some(NatDecision {
+            rewrite_src: Some("172.16.80.8".parse().expect("egress snat")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "an `interface` + `pool` contradiction carries no `off`, so it must resolve \
+         to INTERFACE translation (the egress address) — NOT to an exemption, and \
+         NOT to the pool address. If this now reports an exemption or a pool \
+         rewrite, the precedence changed and every comment claiming \
+         off-precedence needs re-reading"
+    );
+}
+
+/// #5717 (#6820 gate): `off` precedence over BOTH other actions at once.
+///
+/// The two pairwise tests above (`off` + `interface`, `off` + `pool`) do not
+/// discharge a claim quantified over "2+ actions": both survive a predicate
+/// that mishandles only the three-action shape — e.g. `off && !(interface_mode
+/// && pool_mode)`, which is correct for every pair and wrong for the triple.
+/// Pairwise fixtures test pairs; ordering among three has to be bound directly.
+#[test]
+fn off_wins_over_all_three_actions_5717() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "contradictory-all-three".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string()],
+        // Every terminal action a source-NAT rule can carry, at once.
+        off: true,
+        interface_mode: true,
+        pool_name: "p1".to_string(),
+        pool_addresses: vec!["203.0.113.10".to_string()],
+        port_low: 1024,
+        port_high: 65535,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            "10.0.61.102".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        Some(NatDecision::default()),
+        "with all three terminal actions set, `off` must still win — the exemption \
+         is the safe resolution and the one every gate comment relies on. A rewrite \
+         here means the authored exemption published as a translation on a shape \
+         the pairwise tests cannot see"
+    );
+}

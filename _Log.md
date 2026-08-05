@@ -77169,3 +77169,37 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_uniformgates_firewall_nat2.go,
   pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
   userspace-dp/src/nat/tests_source.rs, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-05
+- **Action**: #6820 gate fold — the replacement wording introduced the SAME defect
+  it was written to remove, one level up. Round 1 corrected a false claim
+  ("a leniently-loaded actionless rule is inert") and replaced it with
+  "CONTRADICTORY (2+ actions): safe … resolves to the EXEMPTION". That is true
+  only when the contradiction CONTAINS `off`. Source NAT also admits
+  `interface` + `pool`, which carries no `off`: the compiler records both, the
+  builder forwards `InterfaceMode=true, PoolName=p1, Off=false`, and the Rust
+  matcher checks off → interface_mode → pool_mode in that order, so INTERFACE
+  TRANSLATION wins and the authored pool is silently discarded. The new claim was
+  broader than the truth and nothing tested the uncovered half — the same
+  untested-safety-claim shape, committed by the fix. Narrowed all three wording
+  sites (compiler_validate_strict_nat.go, compiler_uniformgates_firewall_nat2.go,
+  docs/config-schema.md) to say the exemption resolution holds only for an
+  `off`-bearing contradiction, and spelled out the `interface`+`pool` case
+  explicitly. Added the two missing Rust tests. The three-action one matters
+  structurally: a claim quantified over "2+ actions" cannot be discharged by
+  fixtures that only ever contain TWO — both pairwise `off` tests survive a
+  predicate that mishandles only the triple. Validation: mutation
+  `off && !(interface_mode && pool_mode)` — correct for EVERY pair, wrong for the
+  triple — leaves all five sibling tests GREEN and fails ONLY
+  off_wins_over_all_three_actions_5717, which is the demonstration that the
+  pairwise fixtures were insufficient; mutation `interface_mode && !pool_mode`
+  fails ONLY interface_wins_over_pool_without_off_5717 (pool address 203.0.113.10
+  instead of the egress 172.16.80.8). Tests and comments only — no production
+  change. `go test ./pkg/config/... ./pkg/dataplane/...` exit 0. Full cargo shows
+  ONLY the #6819 flake (`current_generation_install_and_delete_still_apply_on_
+  poisoned_shared_mutex`), verified as that pre-existing race: passes in
+  isolation, and the whole Rust diff is 254 test-only insertions to
+  nat/tests_source.rs with no production or HA code.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go, docs/config-schema.md,
+  userspace-dp/src/nat/tests_source.rs, _Log.md

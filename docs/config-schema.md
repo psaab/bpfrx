@@ -3091,9 +3091,9 @@ zero/two/valid + #3850 last-wins preservation).
 the lenient arm — the strict commit path rejects it — but the two arities land
 there very differently, and the difference is load-bearing:
 
-- **Contradictory (2+ actions) resolves to the EXEMPTION.** Recording both
-  fields is what makes this safe: `off` takes precedence over `interface` /
-  `pool`, so a leniently-loaded contradiction can never publish the INVERSE of
+- **Contradictory (2+ actions) CONTAINING `off` resolves to the EXEMPTION.**
+  Recording every field is what makes this safe: `off` takes precedence over
+  `interface` / `pool`, so such a contradiction can never publish the INVERSE of
   the authored action. The precedence is split across the language boundary —
   destination NAT decides it in Go (the `isOff` short-circuit in
   `pkg/dataplane/userspace/nat_destination.go`, which must publish a pool-less
@@ -3105,6 +3105,19 @@ there very differently, and the difference is load-bearing:
   (`userspace-dp/src/nat/tests_source.rs`). The pre-existing
   `off_rule_short_circuits_translation` does NOT cover this — its rule sets
   `off` alone, so it stays green under a mutation that lets `interface` win.
+
+- **Contradictory WITHOUT `off` resolves to INTERFACE TRANSLATION.** Source NAT
+  also admits `interface` + `pool`, which carries no `off` to take precedence.
+  The Rust matcher checks `off` -> `interface_mode` -> `pool_mode` in that order
+  (`nat/source.rs`), so interface SNAT wins and the authored pool is silently
+  discarded. "A contradiction resolves to the exemption" is therefore true ONLY
+  of the `off`-bearing case; stating it unqualified is the same
+  untested-safety-claim defect this section documents. Pinned by
+  `interface_wins_over_pool_without_off_5717`. Note a claim quantified over
+  "2+ actions" cannot be discharged by pairwise fixtures alone — the three-action
+  `interface` + `off` + `pool` shape is pinned separately by
+  `off_wins_over_all_three_actions_5717`, because two pairwise tests both survive
+  a predicate that mishandles only the three-action case.
 
 - **Zero actions is NOT inert.** It installs no translation, but the matched
   traffic FALLS THROUGH to a later, broader rule and is translated by that —

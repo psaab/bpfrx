@@ -2761,14 +2761,24 @@ func natThenTerminalActionCount(then NATThen) int {
 // malformed rule reaches that path — the strict commit path rejects it — but
 // what happens there is NOT symmetric between the two arities (#5717):
 //
-//   - CONTRADICTORY (2+ actions): safe, and now bound by tests. The rule
-//     records BOTH fields (the else-if→if setter change) and the snapshot
-//     builders forward both, so `off` precedence governs and the rule resolves
-//     to the EXEMPTION — never the inverse. That precedence is the whole
-//     safety argument, so it is pinned on both sides: in Go by
-//     TestTolerantContradictory{SNAT,DNAT}*_5717
+//   - CONTRADICTORY (2+ actions) CONTAINING `off`: resolves to the EXEMPTION,
+//     never the inverse. The rule records EVERY field (the else-if→if setter
+//     change) and the snapshot builders forward them all, so `off` precedence
+//     governs. That precedence is the whole safety argument, so it is pinned on
+//     both sides: in Go by TestTolerantContradictory{SNAT,DNAT}*_5717
 //     (pkg/dataplane/userspace) and in Rust by
-//     off_wins_over_contradictory_{interface,pool}_action_5717
+//     off_wins_over_contradictory_{interface,pool,all_three}_action_5717
+//
+//   - CONTRADICTORY WITHOUT `off` — source NAT `interface` + `pool` — resolves
+//     to INTERFACE TRANSLATION, not to an exemption. There is no `off` to take
+//     precedence, and the Rust matcher checks off → interface_mode → pool_mode
+//     in that order (nat/source.rs), so the authored `pool` is silently
+//     discarded in favour of interface SNAT. This is still a malformed rule the
+//     strict gate rejects; it is called out because "a contradiction resolves
+//     to the exemption" is TRUE ONLY when the contradiction contains `off`, and
+//     stating it unqualified is the same untested-safety-claim defect this
+//     comment exists to remove. Pinned by
+//     interface_wins_over_pool_without_off_5717.
 //     (userspace-dp/src/nat/tests_source.rs). Note the DNAT precedence is
 //     decided in Go (the `isOff` short-circuit in nat_destination.go) and the
 //     SNAT precedence in Rust (the `rule.off` early return in
