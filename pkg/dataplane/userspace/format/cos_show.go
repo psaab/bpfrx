@@ -8,6 +8,7 @@ package format
 //   - `show class-of-service classifier ...`     (from cfg.ClassOfService)
 //   - `show class-of-service scheduler-map [n]`  (from cfg.ClassOfService)
 //   - `show class-of-service forwarding-class`   (from cfg.ClassOfService)
+//   - `show class-of-service rewrite-rule ...`   (from cfg.ClassOfService)
 //
 // The renderers reuse the shared helpers in cos.go (formatCoSRate,
 // formatCoSBytes, emptyDash, yesNo). No dataplane change — the four commands
@@ -209,6 +210,175 @@ func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) str
 		for _, r := range blk.rows {
 			fmt.Fprintf(tw, "  %s\t%s\t%s\n",
 				codePointBinary(r.value, r.bits), emptyDash(r.fc), r.lp)
+		}
+		_ = tw.Flush()
+	}
+	return b.String()
+}
+
+// CoSRewriteRuleTypes is the set of `type` filter values FormatCoSRewriteRules
+// accepts, in the order rules are rendered. It is the SSOT this renderer and
+// the cmdtree `type` completion node agree on
+// (TestCoSRewriteRuleTypeFilterMatchesCmdtree pins that they cannot drift).
+// Exported so the cmdtree `type` completion node can be pinned against it
+// across the package boundary (TestCoSRewriteRuleTypeChildrenMatchRenderer).
+var CoSRewriteRuleTypes = []string{"dscp", "ieee-802.1", "inet-precedence", "exp"}
+
+// cosRewriteRuleEnforced reports whether the userspace dataplane actually
+// APPLIES a rewrite rule of this code-point type on egress.
+//
+// Only `dscp` is enforced. The other three commit clean and do nothing —
+// each carries an accepted-but-inert commit advisory
+// (pkg/config/compiler_validate_warn.go: ieee-802.1 at :1360, inet-precedence
+// at :1346, exp at :1350). That advisory fires ONCE, at commit; nothing
+// afterwards distinguishes a rule that is being applied from one that is not,
+// which is the operational hole `show class-of-service rewrite-rule` exists to
+// close (#6848). Rendering an inert rule identically to an enforced one would
+// reproduce the hole in the very command meant to expose it, so the enforcement
+// state is a column of the output, not a footnote.
+//
+// Keep this in step with the advisories: a type that starts being enforced must
+// flip here in the SAME change that drops its advisory, or this command will
+// report a working rewrite as inert.
+func cosRewriteRuleEnforced(cpType string) bool {
+	return cpType == "dscp"
+}
+
+// FormatCoSRewriteRules renders `show class-of-service rewrite-rule [name <n>]
+// [type <t>]` from the compiled config (#6848, #4228 Gap 7 residual).
+//
+// Four rewrite-rule families are modeled, and they do NOT all carry the same
+// depth of data — the renderer must not paper over that:
+//
+//   - `dscp` and `ieee-802.1` compile to full entry lists
+//     (forwarding-class, loss-priority, code-point), so their code points are
+//     rendered.
+//   - `inet-precedence` and `exp` record only rule NAMES
+//     (ClassOfServiceConfig.INetPrecedenceRewriteRules / EXPRewriteRules,
+//     #4316) — the compiler builds no runtime structure for them because
+//     nothing consumes one. There are no code points to print, and inventing a
+//     table for them would imply a fidelity the config does not have, so they
+//     render as a name + an explicit "code points not modeled" line.
+//
+// A nil/empty config yields the Junos-style "no rules configured" line rather
+// than an error: an unconfigured rewrite-rule set is a normal state.
+func FormatCoSRewriteRules(cfg *config.Config, nameFilter, typeFilter string) string {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return "No class-of-service rewrite-rules configured\n"
+	}
+	cos := cfg.ClassOfService
+	nameFilter = strings.TrimSpace(nameFilter)
+	typeFilter = strings.TrimSpace(strings.ToLower(typeFilter))
+
+	type cpRow struct {
+		fc    string
+		lp    string
+		value uint16
+		bits  int
+	}
+	type ruleBlock struct {
+		name   string
+		cpType string
+		rows   []cpRow
+		// modeled is false for the name-only families: the block renders its
+		// header and an explanatory line instead of an empty code-point table.
+		modeled bool
+	}
+	var blocks []ruleBlock
+
+	wantType := func(t string) bool { return typeFilter == "" || typeFilter == t }
+	wantName := func(n string) bool { return nameFilter == "" || n == nameFilter }
+
+	if wantType("dscp") {
+		for _, name := range sortedMapKeys(cos.DSCPRewriteRules) {
+			if !wantName(name) {
+				continue
+			}
+			blk := ruleBlock{name: name, cpType: "dscp", modeled: true}
+			for _, e := range cos.DSCPRewriteRules[name].Entries {
+				if e == nil {
+					continue
+				}
+				blk.rows = append(blk.rows, cpRow{
+					fc: e.ForwardingClass, lp: lossPriorityOrDefault(e.LossPriority),
+					value: uint16(e.DSCPValue), bits: 6,
+				})
+			}
+			blocks = append(blocks, blk)
+		}
+	}
+	if wantType("ieee-802.1") {
+		for _, name := range sortedMapKeys(cos.IEEE8021RewriteRules) {
+			if !wantName(name) {
+				continue
+			}
+			blk := ruleBlock{name: name, cpType: "ieee-802.1", modeled: true}
+			for _, e := range cos.IEEE8021RewriteRules[name].Entries {
+				if e == nil {
+					continue
+				}
+				blk.rows = append(blk.rows, cpRow{
+					fc: e.ForwardingClass, lp: lossPriorityOrDefault(e.LossPriority),
+					value: uint16(e.PCPValue), bits: 3,
+				})
+			}
+			blocks = append(blocks, blk)
+		}
+	}
+	// Name-only families. Sorted independently so the output order is stable
+	// regardless of config-file order (the slices preserve parse order).
+	appendNameOnly := func(cpType string, names []string) {
+		if !wantType(cpType) {
+			return
+		}
+		sorted := append([]string(nil), names...)
+		sort.Strings(sorted)
+		for _, name := range sorted {
+			if !wantName(name) {
+				continue
+			}
+			blocks = append(blocks, ruleBlock{name: name, cpType: cpType})
+		}
+	}
+	appendNameOnly("inet-precedence", cos.INetPrecedenceRewriteRules)
+	appendNameOnly("exp", cos.EXPRewriteRules)
+
+	if len(blocks) == 0 {
+		if nameFilter != "" || typeFilter != "" {
+			return "No class-of-service rewrite-rule matches the given filter\n"
+		}
+		return "No class-of-service rewrite-rules configured\n"
+	}
+
+	var b strings.Builder
+	for idx, blk := range blocks {
+		if idx > 0 {
+			b.WriteString("\n")
+		}
+		enforced := "yes"
+		if !cosRewriteRuleEnforced(blk.cpType) {
+			// Say what the operator loses, not just that a flag is off. This
+			// line is the whole point of the command for three of the four
+			// types.
+			enforced = "no (accepted for Junos compatibility; the dataplane rewrites dscp only)"
+		}
+		fmt.Fprintf(&b, "Rewrite rule: %s, Code point type: %s, Enforced: %s\n",
+			blk.name, blk.cpType, enforced)
+		if !blk.modeled {
+			fmt.Fprintf(&b, "  Code points not modeled — only the rule name is recorded\n")
+			continue
+		}
+		sort.SliceStable(blk.rows, func(i, j int) bool {
+			if blk.rows[i].fc != blk.rows[j].fc {
+				return blk.rows[i].fc < blk.rows[j].fc
+			}
+			return blk.rows[i].lp < blk.rows[j].lp
+		})
+		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  Forwarding class\tLoss priority\tCode point")
+		for _, r := range blk.rows {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\n",
+				emptyDash(r.fc), r.lp, codePointBinary(r.value, r.bits))
 		}
 		_ = tw.Flush()
 	}

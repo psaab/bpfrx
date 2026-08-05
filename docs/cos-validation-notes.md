@@ -49,10 +49,67 @@ userspace status) — with no dataplane change:
   transmit rate, priority, buffer, and exact flag plus the mapped queue.
 - `show class-of-service forwarding-class` — the forwarding-class to
   queue table (ID == queue, per the FC<->queue bijection).
+- `show class-of-service rewrite-rule [name <n>] [type <dscp|ieee-802.1|
+  inet-precedence|exp>]` (#6848) — the configured egress rewrite rules.
+  Added after the four above; see the next section for why it is not just
+  a fifth table.
 
 `clear class-of-service statistics` is deferred (#4228 Gap 7 note): the
 userspace CoS queue counters have no stat-reset RPC — they reset only on
 config change — so a reset path is a separate follow-up.
+
+## `show class-of-service rewrite-rule` and the inert-rule problem (#6848)
+
+The rewrite-rule view is the one Junos CoS show command the Gap 7 pass
+did not land, and it matters more now than it did then. When #4228 was
+written `rewrite-rules` held only `dscp`. Since then the config models
+three more families — `ieee-802.1` (#4228 Gap 4), `inet-precedence` and
+`exp` (#4316) — and **all three are accepted-but-inert**: they commit
+clean and have no runtime effect, because the userspace dataplane
+rewrites DSCP on egress only.
+
+That left an operator able to configure four kinds of rewrite rule,
+three of which do nothing, with no operational command to display any of
+them. The only signal was a commit-time advisory that scrolls past once
+(`pkg/config/compiler_validate_warn.go`: `ieee-802.1` at :1360,
+`inet-precedence` at :1346, `exp` at :1350).
+
+So the renderer reports **enforcement as a column**, not a footnote:
+
+```
+Rewrite rule: rw-dscp, Code point type: dscp, Enforced: yes
+  Forwarding class  Loss priority  Code point
+  best-effort       low            000000
+  premium           low            101110
+
+Rewrite rule: rw-pcp, Code point type: ieee-802.1, Enforced: no (accepted
+for Junos compatibility; the dataplane rewrites dscp only)
+  Forwarding class  Loss priority  Code point
+  premium           high           101
+```
+
+Two implementation facts worth knowing before changing this:
+
+- **The four families do not carry equal data.** `dscp` and `ieee-802.1`
+  compile to full entry lists (forwarding-class, loss-priority,
+  code-point). `inet-precedence` and `exp` record only rule NAMES
+  (`ClassOfServiceConfig.INetPrecedenceRewriteRules` / `EXPRewriteRules`)
+  — the compiler builds no runtime structure because nothing consumes
+  one. Those two render a `Code points not modeled` line rather than an
+  empty table, which would imply a fidelity the config does not have.
+  `TestShowTextCoSRewriteRuleNameOnlyFamiliesAreProducible6848` authors a
+  rule *with* a code point in real set syntax and asserts it does not
+  surface, so this stays honest if the compiler ever starts modeling
+  them.
+- **`format.CoSRewriteRuleTypes` is the SSOT for the `type` filter**, and
+  the cmdtree `type` completion node is pinned against it by
+  `TestCoSRewriteRuleTypeChildrenMatchRenderer`. Adding a family means
+  editing one list; the test fails if the other is not updated.
+
+`cosRewriteRuleEnforced` (`pkg/dataplane/userspace/format/cos_show.go`)
+is the enforced/inert mapping. **A family that starts being enforced must
+flip there in the same change that drops its commit advisory**, or this
+command will report a working rewrite as inert.
 
 Renderers live in `pkg/dataplane/userspace/format/cos_show.go` (the
 shared SSOT used by both the local CLI in `pkg/cli` and the gRPC

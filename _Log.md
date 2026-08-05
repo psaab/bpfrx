@@ -1,3 +1,41 @@
+## 2026-08-05 — #6848: `show class-of-service rewrite-rule` (#4228 Gap 7 residual)
+
+- **Timestamp**: 2026-08-05 (fix/6848-cos-show-rewrite-rule)
+- **Action**: Added the one Junos CoS show command the #4228 Gap 7 pass did not
+  land. It matters more now than at plan time: `rewrite-rules` has since grown
+  `ieee-802.1` (#4228 Gap 4), `inet-precedence` and `exp` (#4316), and all
+  three are accepted-but-inert — so an operator could configure four kinds of
+  rewrite rule, three of which do nothing at runtime, with no command to
+  display any of them and only a one-shot commit advisory as a signal. The
+  renderer therefore reports enforcement as a COLUMN, not a footnote; rendering
+  an inert rule identically to an enforced one would reproduce the silence
+  inside the command built to expose it. The four families do not carry equal
+  data — `dscp`/`ieee-802.1` compile to entry lists while `inet-precedence`/
+  `exp` record names only — so the latter render "Code points not modeled"
+  rather than an empty table that would imply a fidelity the config lacks.
+  Wired on BOTH surfaces (local CLI + gRPC/remote `cli`); a command on only one
+  works interactively and falls through to help text on the binary most
+  operators use. Also fixed a latent completion/behavior mismatch in the
+  pre-existing sibling: cmdtree offers rule names directly under the command,
+  but the keyword-only parser ignored a bare positional and dumped everything —
+  the shared parser now accepts it, so `classifier` and `rewrite-rule` match
+  what they advertise.
+- **Validation**: full `go test ./...` green, scored from a REAL exit code
+  (`REAL_EXIT=0`), not a pipe. The #6532 fabric secret-render audit canary
+  caught the new topic as peer-reachable over the cluster fabric and was
+  extended accordingly — a genuine cross-cutting catch, not a formality.
+  Fail-on-revert proven by mutation with build+vet clean at each step.
+- **File(s)**: `pkg/dataplane/userspace/format/cos_show.go`,
+  `pkg/dataplane/userspace/format/cos_rewrite_rule_show_test.go` (new),
+  `pkg/cmdtree/tree.go`, `pkg/cmdtree/cos_rewrite_rule_6848_test.go` (new),
+  `pkg/cli/show_services_cos.go`,
+  `pkg/cli/cos_rewrite_rule_args_6848_test.go` (new),
+  `pkg/grpcapi/server_show.go`, `pkg/grpcapi/server_show_interfaces_text.go`,
+  `pkg/grpcapi/server_show_cos_rewrite_rule_6848_test.go` (new),
+  `pkg/grpcapi/server_fabric_secret_render_6532_test.go`, `cmd/cli/show.go`,
+  `cmd/cli/cos_rewrite_rule_topic_6848_test.go` (new),
+  `docs/cos-validation-notes.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

@@ -359,8 +359,27 @@ func (s *Server) showInterfacesQueue(req *pb.ShowTextRequest, buf *strings.Build
 // [type <dscp|ieee-802.1>]` (#4228 Gap 7). Topic form is "cos-classifier" or
 // "cos-classifier:name=<n>,type=<t>".
 func (s *Server) showCoSClassifier(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
-	nameFilter, typeFilter := "", ""
-	params := strings.TrimPrefix(req.Topic, "cos-classifier")
+	nameFilter, typeFilter := parseCoSTopicNameType(req.Topic, "cos-classifier")
+	buf.WriteString(dpformat.FormatCoSClassifiers(cfg, nameFilter, typeFilter))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// showCoSRewriteRule renders `show class-of-service rewrite-rule [name <n>]
+// [type <dscp|ieee-802.1|inet-precedence|exp>]` (#6848). Topic form is
+// "cos-rewrite-rule" or "cos-rewrite-rule:name=<n>,type=<t>" — the same
+// encoding showCoSClassifier uses, so the two siblings share
+// parseCoSTopicNameType.
+func (s *Server) showCoSRewriteRule(req *pb.ShowTextRequest, cfg *config.Config, buf *strings.Builder) (*pb.ShowTextResponse, error) {
+	nameFilter, typeFilter := parseCoSTopicNameType(req.Topic, "cos-rewrite-rule")
+	buf.WriteString(dpformat.FormatCoSRewriteRules(cfg, nameFilter, typeFilter))
+	return &pb.ShowTextResponse{Output: buf.String()}, nil
+}
+
+// parseCoSTopicNameType extracts the `name=` / `type=` params from a
+// "<prefix>[:k=v,k=v]" ShowText topic, shared by the CoS classifier and
+// rewrite-rule handlers (#6848).
+func parseCoSTopicNameType(topic, prefix string) (nameFilter, typeFilter string) {
+	params := strings.TrimPrefix(topic, prefix)
 	params = strings.TrimPrefix(params, ":")
 	for _, kv := range strings.Split(params, ",") {
 		kv = strings.TrimSpace(kv)
@@ -376,8 +395,7 @@ func (s *Server) showCoSClassifier(req *pb.ShowTextRequest, cfg *config.Config, 
 			}
 		}
 	}
-	buf.WriteString(dpformat.FormatCoSClassifiers(cfg, nameFilter, typeFilter))
-	return &pb.ShowTextResponse{Output: buf.String()}, nil
+	return nameFilter, typeFilter
 }
 
 // showCoSSchedulerMap renders `show class-of-service scheduler-map [<name>]`

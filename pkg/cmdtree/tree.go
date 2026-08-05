@@ -265,6 +265,25 @@ var OperationalTree = map[string]*Node{
 				return names
 			}},
 			"forwarding-class": {Desc: "Show the forwarding-class to queue table"},
+			// #6848 (#4228 Gap 7 residual): the one Junos CoS show command the
+			// Gap 7 pass did not land. It matters more now than it did then —
+			// `rewrite-rules` has since grown ieee-802.1, inet-precedence and
+			// exp families, three of which are accepted-but-inert, so without
+			// this command an operator can configure four kinds of rewrite rule,
+			// three of which do nothing, and has no way to display any of them.
+			"rewrite-rule": {Desc: "Show configured CoS rewrite-rules", DynamicFn: func(cfg *config.Config) []string {
+				return cosRewriteRuleNames(cfg)
+			}, Children: map[string]*Node{
+				"name": {Desc: "Filter by rewrite-rule name", DynamicFn: func(cfg *config.Config) []string {
+					return cosRewriteRuleNames(cfg)
+				}},
+				"type": {Desc: "Filter by code-point type", Children: map[string]*Node{
+					"dscp":            {Desc: "DSCP rewrite-rules"},
+					"ieee-802.1":      {Desc: "IEEE 802.1p (PCP) rewrite-rules (accepted-but-inert)"},
+					"inet-precedence": {Desc: "IP-precedence rewrite-rules (accepted-but-inert)"},
+					"exp":             {Desc: "MPLS EXP rewrite-rules (accepted-but-inert)"},
+				}},
+			}},
 		}},
 		"configuration": {Desc: "Show active configuration", Children: map[string]*Node{
 			"applications":       {Desc: "Application protocol definitions"},
@@ -1588,6 +1607,33 @@ func cosClassifierNames(cfg *config.Config) []string {
 	for name := range cfg.ClassOfService.IEEE8021Classifiers {
 		names = append(names, name)
 	}
+	return names
+}
+
+// cosRewriteRuleNames returns every configured rewrite-rule name across all
+// four code-point families, for `show class-of-service rewrite-rule` completion
+// (#6848). It deliberately includes the accepted-but-inert families
+// (ieee-802.1, inet-precedence, exp): an operator who configured an inert rule
+// must be able to tab-complete it and SEE that it is inert — completing only
+// the enforced dscp rules would hide exactly the rules this command exists to
+// surface. The two name-only families are stored as slices, not maps
+// (ClassOfServiceConfig.INetPrecedenceRewriteRules / EXPRewriteRules).
+func cosRewriteRuleNames(cfg *config.Config) []string {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return nil
+	}
+	cos := cfg.ClassOfService
+	names := make([]string, 0,
+		len(cos.DSCPRewriteRules)+len(cos.IEEE8021RewriteRules)+
+			len(cos.INetPrecedenceRewriteRules)+len(cos.EXPRewriteRules))
+	for name := range cos.DSCPRewriteRules {
+		names = append(names, name)
+	}
+	for name := range cos.IEEE8021RewriteRules {
+		names = append(names, name)
+	}
+	names = append(names, cos.INetPrecedenceRewriteRules...)
+	names = append(names, cos.EXPRewriteRules...)
 	return names
 }
 

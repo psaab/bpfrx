@@ -132,27 +132,14 @@ func (c *ctl) handleShow(args []string) error {
 			case "classifier":
 				// #4228 Gap 7: encode optional `name <n>` / `type <t>`
 				// filters into the topic params.
-				var params []string
-				rest := args[2:]
-				for i := 0; i < len(rest); i++ {
-					switch rest[i] {
-					case "name":
-						if i+1 < len(rest) {
-							params = append(params, "name="+rest[i+1])
-							i++
-						}
-					case "type":
-						if i+1 < len(rest) {
-							params = append(params, "type="+rest[i+1])
-							i++
-						}
-					}
-				}
-				topic := "cos-classifier"
-				if len(params) > 0 {
-					topic += ":" + strings.Join(params, ",")
-				}
-				return c.showText(topic)
+				return c.showText(cosNameTypeTopic("cos-classifier", args[2:]))
+			case "rewrite-rule":
+				// #6848: identical filter grammar to `classifier`, so it shares
+				// the same topic builder. Without this arm the command works in
+				// the local CLI and silently falls through to the help text on
+				// the REMOTE cli binary, which is the surface most operators
+				// actually use.
+				return c.showText(cosNameTypeTopic("cos-rewrite-rule", args[2:]))
 			case "scheduler-map":
 				topic := "cos-scheduler-map"
 				if len(args) >= 3 {
@@ -512,4 +499,37 @@ func (c *ctl) showSystemInfo(typ string) error {
 	}
 	fmt.Print(resp.Output)
 	return nil
+}
+
+// cosNameTypeTopic encodes the `name <n>` / `type <t>` filters shared by
+// `show class-of-service classifier` and `show class-of-service rewrite-rule`
+// into a gRPC ShowText topic (#6848). A LEADING BARE TOKEN is taken as the
+// name, matching both the cmdtree completion (which offers rule names directly
+// under the command) and the local CLI's parseCoSNameTypeArgs — the remote and
+// local paths must accept the same grammar or the same keystrokes give
+// different answers depending on which binary the operator ran.
+func cosNameTypeTopic(prefix string, rest []string) string {
+	var params []string
+	if len(rest) > 0 && rest[0] != "name" && rest[0] != "type" {
+		params = append(params, "name="+rest[0])
+		rest = rest[1:]
+	}
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "name":
+			if i+1 < len(rest) {
+				params = append(params, "name="+rest[i+1])
+				i++
+			}
+		case "type":
+			if i+1 < len(rest) {
+				params = append(params, "type="+rest[i+1])
+				i++
+			}
+		}
+	}
+	if len(params) == 0 {
+		return prefix
+	}
+	return prefix + ":" + strings.Join(params, ",")
 }
