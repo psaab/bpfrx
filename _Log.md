@@ -66323,3 +66323,98 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-05 15:10
+- **Action**: #6851 fold — two MAJORs on the #4626 policy-id-zero guard, both
+  verified firsthand before folding.
+
+  MAJOR 1, the SEVENTH resolver. `EventReader.resolvePolicyName`
+  (`pkg/logging/ringbuf.go`) resolves RT_FLOW record names independently of the
+  six session-row builders and indexed `er.policyNames` directly. It already
+  special-cased `DefaultPolicySentinelID` (#3057) but not
+  `UnattributedPolicyID`, so every host-inbound / fabric / tunnel / pre-#3056 /
+  older-peer record named the FIRST configured policy. This is the surface that
+  matters most: RT_FLOW records go to syslog and ship off-box, so the wrong
+  attribution is durable and lands in what an auditor reads later.
+
+  MAJOR 2, peer fan-out. `fetchPeerSessions` did `resp.Peer = peerResp` — the
+  peer's response attached UNCHANGED, names included. The #4626 guard resolves a
+  name from a raw id for rows THIS node renders; it does not cover a name
+  arriving as DATA from an old peer that resolved it wrongly itself. REST
+  (`writeSessionList` → `pr.GetPeer()`), gRPC clients and the CLI all republish
+  that string, so `fetchPeerSessions` is the single choke point for all three.
+
+  DECISION on MAJOR 2, and why. Override the name for RESERVED ids only; keep
+  the peer's name for everything else. Policy ids are NODE-LOCAL
+  (`compilePolicies` assigns from the local config's rule ordering), so the peer
+  is authoritative for the names of its own sessions and re-resolving an
+  unreserved peer id against the LOCAL map would name whichever local policy
+  occupies that slot — a fresh misattribution firing on every mixed-config
+  cluster, not a fix. The two choices are identical against a same-version peer
+  (it already sends `unattributed`); they differ only for an older peer, which
+  is the population that needs correcting. Pinned by mutation M4.
+
+  STRUCTURE. Added `dataplane.ReservedPolicyName(id) (string, bool)` as the SSOT
+  for "which ids must never reach a name map", and expressed `SessionPolicyName`,
+  the new `PeerSessionPolicyName`, and the logging resolver through it. The
+  logging site keeps its own numeric fallback so it cannot call
+  `SessionPolicyName` directly; an earlier draft probed
+  `SessionPolicyName(nil, id)` for a non-empty result, which works only because
+  a nil map yields "" for unreserved ids — a property nobody is obliged to
+  preserve and whose loss would silently route unreserved ids away from the
+  caller's map. Replaced with the explicit predicate.
+
+  Also FUSED the peer guard with the attach it protects
+  (`attachPeerSessions` sanitizes AND assigns). Two statements at the call site
+  would let a future edit drop the guard and keep the attach — silent and green,
+  the exact failure mode of this PR. Fused, dropping the guard drops the
+  fan-out, which fails loudly.
+
+  ENUMERATION, re-run rather than inherited (the count has grown at every
+  count: briefed 2, previous lane 6, gate 7). Every `policyNames[...]` index in
+  the tree is now: the helper itself, `compilePolicies` building the map, and
+  the logging resolver (fixed). Six routed session builders + logging = SEVEN
+  resolvers; the peer pass-through is the only place a name arrives as data.
+  Checked and CLEARED as carrying no policy name: the other two peer fan-outs
+  (`GetSessionSummaryResponse` is counts only; `GetZonePairSummaryResponse` holds
+  `ZonePairSessionSummary`, which is zone pairs + protocol counts) — verified by
+  enumerating their generated struct fields, not by assuming. Downstream
+  consumers (`pkg/api/sse.go`, `server_show_events.go`,
+  `cli_show_security_log.go`, `monitor.go`, `cmd/cli/show_flow.go`) read an
+  already-resolved string and are fixed transitively.
+
+  MUTATIONS (each restored + re-verified green):
+  - M1 map-first, the shape that looks like a guard: reserved check moved AFTER
+    the map lookup in the logging resolver → RED on
+    `TestResolvePolicyNameZeroIsNotTheFirstPolicy_6851`. Note the
+    no-published-map test stays GREEN under it, which is why the OCCUPIED-map
+    fixture is the load-bearing one.
+  - M2 peer-name-first (trust a non-empty peer string before the reserved
+    check) → 3 RED.
+  - M3 guard dropped, attach kept → 3 RED; the fusion holds.
+  - M4 the REJECTED alternative (discard the peer's name for unreserved ids too,
+    as "re-resolve everything locally" would) → RED on the unreserved control.
+    The decision is pinned, not accidental.
+
+  SUPERSEDED #3057 ASSERTION, called out because the brief did not anticipate
+  it. Routing the logging resolver through the guard broke a PRE-EXISTING test:
+  `TestResolvePolicyNameSentinelRendersDefaultPolicy` asserted "a genuine policy
+  ID 0 still resolves to the first configured policy". That is precisely the
+  claim #4626 retires — the same claim the six session surfaces already stopped
+  making — so the assertion was updated, not the fix weakened. The test's actual
+  #3057 purpose (the sentinel must not alias the first policy) is untouched, and
+  I STRENGTHENED it in the other direction: id 0 must now also not render as
+  `default-policy`, so a "fix" collapsing both reserved ids onto one name would
+  fail rather than pass. The supersession is documented in the test comment.
+  Under mutation M1 that test now reds ALONGSIDE the new one.
+
+  SCOPE LIMIT, stated rather than implied: the tests drive `attachPeerSessions`,
+  so they bind the sanitize-and-attach pair. They do NOT bind
+  `fetchPeerSessions`' call to it — that needs a live `cluster.Manager` with
+  `PeerAlive()` plus an authenticated peer dial, neither reachable from a unit
+  test. Replacing the call with a bare `resp.Peer = peerResp` would not be
+  caught. Recorded in the source next to the function.
+- **File(s)**: pkg/dataplane/policy_display.go, pkg/logging/ringbuf.go,
+  pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
+  pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
+  _Log.md

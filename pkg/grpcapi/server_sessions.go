@@ -681,8 +681,62 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 	if err != nil {
 		slog.Warn("failed to fetch peer sessions", "err", err)
 	} else {
-		resp.Peer = peerResp
+		// #6851/#4626: the peer resolved these policy NAMES itself, so a peer
+		// running a pre-#4626 build sent the name of ITS first configured
+		// policy for every session carrying the reserved id 0 — host-inbound,
+		// fabric, tunnel, and its entire table if IT is in turn syncing from an
+		// older node. The #4626 guard covers rows THIS node renders from a raw
+		// id; it does not cover a name arriving as DATA. Without this, the
+		// misattribution is republished unchanged on every local surface: gRPC
+		// clients, the REST `peer` block (sessionListFromPB), and the CLI.
+		//
+		// Only RESERVED ids are overridden — see PeerSessionPolicyName for why
+		// re-resolving an unreserved peer id against the LOCAL map would be a
+		// fresh misattribution rather than a fix.
+		//
+		// This is the single choke point for the fan-out: REST reaches the peer
+		// through this same in-process response (writeSessionList reads
+		// `pr.GetPeer()`), so guarding here covers all three surfaces once.
+		attachPeerSessions(resp, peerResp)
 	}
+}
+
+// attachPeerSessions sanitizes a fan-out response's policy names and attaches
+// it (#6851).
+//
+// The ATTACH lives inside the sanitizing function deliberately. Keeping them as
+// two statements at the call site would let a future edit drop the guard while
+// leaving the attach — the failure mode this whole PR is about, silent and
+// green. Fused, dropping the guard means dropping the attach, which makes peer
+// sessions vanish from every surface and fails loudly.
+//
+// Residual, stated rather than implied: the tests below drive this function, so
+// they bind the sanitize-and-attach pair. They do NOT bind `fetchPeerSessions`'
+// call TO it — that needs a live cluster.Manager with PeerAlive() plus a real
+// authenticated peer dial, neither of which is reachable from a unit test.
+// Replacing this call with a bare `resp.Peer = peerResp` would not be caught
+// here.
+func attachPeerSessions(resp, peerResp *pb.GetSessionsResponse) {
+	sanitizePeerPolicyNames(peerResp)
+	resp.Peer = peerResp
+}
+
+// sanitizePeerPolicyNames rewrites the policy name of every peer session whose
+// id is reserved, in place.
+func sanitizePeerPolicyNames(peerResp *pb.GetSessionsResponse) {
+	if peerResp == nil {
+		return
+	}
+	for _, e := range peerResp.GetSessions() {
+		if e == nil {
+			continue
+		}
+		e.PolicyName = dataplane.PeerSessionPolicyName(e.GetPolicyName(), e.GetPolicyId())
+	}
+	// A peer that itself fanned out (it should not — include_peer is not
+	// forwarded, precisely to prevent recursion) would nest another response
+	// here. Guard it rather than assume the invariant holds across versions.
+	sanitizePeerPolicyNames(peerResp.GetPeer())
 }
 
 // getSessionsLegacy is the original limit/offset iteration path.

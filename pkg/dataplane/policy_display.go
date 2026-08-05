@@ -77,17 +77,76 @@ const UnattributedPolicyName = "unattributed"
 // pkg/logging resolvePolicyName treats the same sentinel for RT_FLOW records
 // (#3057).
 func SessionPolicyName(policyNames map[uint32]string, id uint32) string {
+	// LOAD-BEARING ORDERING: the reserved check must come BEFORE the map
+	// lookup, and must not be "rewritten" as a lookup with a fallback.
+	// `policyNames[0]` is POPULATED — it is the first configured policy — so
+	// any form that consults the map first silently restores the #4626
+	// misattribution while still looking like a guard.
+	if name, ok := ReservedPolicyName(id); ok {
+		return name
+	}
+	return policyNames[id]
+}
+
+// ReservedPolicyName reports whether `id` is one of the two reserved policy ids
+// and, if so, the fixed pseudo-policy name that must be rendered for it.
+//
+// This is the SSOT for "which ids must never reach a name map", shared by every
+// resolver: the session-row surfaces via SessionPolicyName, the cluster-peer
+// fan-out via PeerSessionPolicyName, and pkg/logging's RT_FLOW record resolver,
+// which keeps its own numeric fallback for an unreserved id and so cannot call
+// SessionPolicyName directly.
+//
+// Expressed as an explicit (name, ok) rather than leaving each caller to
+// re-derive the set: a caller that instead probed `SessionPolicyName(nil, id)`
+// for a non-empty result would get the right answer today only because a nil
+// map yields "" for every unreserved id — a property no one is obliged to
+// preserve, and whose loss would silently route unreserved ids away from the
+// caller's own map.
+func ReservedPolicyName(id uint32) (string, bool) {
 	switch id {
 	case UnattributedPolicyID:
-		// LOAD-BEARING: this arm must come BEFORE the map lookup, and must not
-		// be "rewritten" as a lookup with a fallback. `policyNames[0]` is
-		// populated — it is the first configured policy — so any form that
-		// consults the map first silently restores the #4626 misattribution
-		// while still looking like a guard.
-		return UnattributedPolicyName
+		return UnattributedPolicyName, true
 	case DefaultPolicySentinelID:
-		return DefaultPolicyName
+		return DefaultPolicyName, true
 	default:
-		return policyNames[id]
+		return "", false
 	}
+}
+
+// PeerSessionPolicyName resolves the policy name to render for a session
+// fetched from a CLUSTER PEER, given the name that peer already resolved and
+// the session's raw id.
+//
+// #6851: an include_peer fan-out attaches the peer's response and the peer
+// resolved the name itself. A peer running a pre-#4626 build resolved
+// UnattributedPolicyID through its own compiled map and therefore sent the name
+// of ITS first configured policy — so the local guard, which only covers
+// sessions this node renders, is bypassed entirely by a name arriving as DATA.
+// The wrong attribution is then republished on every local surface (gRPC
+// clients, the REST `peer` block via sessionListFromPB, and the CLI).
+//
+// The choice made here, and WHY it is not "re-resolve everything from the id":
+// policy ids are NODE-LOCAL. `compilePolicies` assigns them from the local
+// config's rule ordering, so the peer's id space is the peer's, and the peer is
+// authoritative for the names of its OWN sessions. Re-resolving an unreserved
+// peer id against the LOCAL policyNames map would name whichever local policy
+// happens to occupy that slot — a fresh misattribution, and one that fires on
+// every mixed-config cluster rather than only on an old peer.
+//
+// So only the RESERVED ids are overridden, and the peer's name is kept for
+// everything else. The two behave identically when the peer is the same
+// version (it already sends `unattributed` / `default-policy` for those ids);
+// they differ only for an older peer, which is exactly the population that
+// needs correcting. An empty peerName for an unreserved id stays empty, so a
+// caller's own not-found handling is unchanged.
+func PeerSessionPolicyName(peerName string, id uint32) string {
+	// Same LOAD-BEARING ordering as SessionPolicyName: the reserved check must
+	// precede any use of peerName. A form that trusts a non-empty peerName
+	// first restores the misattribution for exactly the old-peer population
+	// this exists for, while still looking like a guard.
+	if name, ok := ReservedPolicyName(id); ok {
+		return name
+	}
+	return peerName
 }

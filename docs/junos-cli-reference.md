@@ -164,7 +164,18 @@ Session ID: 17179902569, Policy name: allow-everything-out-not-logged/270, HA St
     configured rule (#3057).
   The same two reserved indexes appear as `policy_name` on the REST
   `/sessions` and gRPC `GetSessions` surfaces, which carry `policy_id`
-  alongside.
+  alongside, and in the `policy-name` field of RT_FLOW syslog records
+  (#6851) — the one surface where the attribution is DURABLE, since those
+  records ship off-box to a collector.
+- **Cluster peer sessions carry the same guarantee** (#6851). An
+  `include_peer` fan-out attaches the peer node's rows, and the peer
+  resolved those names itself; a peer on a pre-#4626 build sent the name
+  of ITS first configured policy for every reserved-index session. The
+  local node overrides the name for RESERVED indexes only. It deliberately
+  does NOT re-resolve an unreserved index against its own policy table:
+  indexes are node-local, so the peer is authoritative for the names of
+  its own sessions, and re-resolving would name whichever local policy
+  happened to occupy that slot.
 - **In/Out lines:** Indented 2 spaces.
   - `In: <src_ip>/<src_port> --> <dst_ip>/<dst_port>;<proto>, Conn Tag: 0x0, If: <interface>, Pkts: <N>, Bytes: <N>, `
   - Note the trailing comma+space after Bytes value.
