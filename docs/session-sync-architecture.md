@@ -755,6 +755,48 @@ source tuple (reply mis-delivery / a session-hijack surface).
   replies and a fresh local address-only flow could claim the same public
   identity. Like the port-bearing arm, a collision (a local flow already owns the
   identity) or a foreign pool address is skipped gracefully.
+- **Rule selection (#6211):** WHICH rule the reservation lands on mirrors the
+  ACTIVE node's choice. Two source-NAT rules can carry the SAME public pool
+  address in SEPARATE allocators — the allocator is shared per `allocator_key`
+  (pool name + addresses + port range, `SourceNatRule::allocator_key`), so
+  distinct `pool_name`s with a common member address give one address two
+  independent `PortAllocator`s. The original selection ("the first rule whose
+  pool CONTAINS `rewrite_src`") narrowed on no other axis, while the active
+  picked its rule by zone/policy match, so under that config the standby's
+  reservation could land in a DIFFERENT allocator than the active used for the
+  same session. After a failover a new local flow matching the OTHER rule then
+  missed the collision guard — the reverse-identity token sat in the wrong
+  allocator, reintroducing the ambiguity the token exists to prevent.
+
+  The fix is LOCAL, **not** a wire change: every input the active's rule match
+  consumes is already synced. The zone pair rides as
+  `ingress_zone_id`/`egress_zone_id` (`SessionSyncRequest` →
+  `SessionMetadata::ingress_zone`/`egress_zone`, with the legacy name strings as
+  the old-peer fallback) and the 5-tuple IS the session key, so
+  `reserve_synced_source_nat_allocation` re-runs the active's OWN predicate
+  (`SourceNatRule::matches_ignoring_scope`) rather than introducing a second
+  rule-identity scheme. Note that the flow key it already built is byte-identical
+  to the active's SNAT-match tuple (original source, POST-DNAT destination,
+  original ports — `nat_match_flow.forward_key` in `poll_descriptor`), and, like
+  `match_source_nat_result_for_tuple`, it takes the FIRST matching rule in
+  snapshot order (that order IS the #4161 Junos specificity precedence).
+
+  Only the #3096 interface / routing-instance scope is excluded: `NatScopeCtx` is
+  built from the LOCAL `ifindex_to_config_name` / `ifindex_to_routing_instance`
+  maps keyed on the ACTIVE's ingress/egress ifindices, which the standby does not
+  have. That axis is therefore treated as UNCONSTRAINED rather than as a
+  mismatch — rejecting an interface-scoped rule the standby cannot confirm would
+  push the selection PAST the rule the active actually used and onto a later one,
+  strictly worse than the first-pool-match it replaces.
+
+  A **fallback** to the original first-pool-match runs whenever the narrowed pass
+  reserves nothing: an unresolvable zone pair (an old peer, or a zone absent from
+  this node's snapshot), no confirmable match owning the address (NAT config
+  drift between the nodes), or every candidate refusing the reservation. This is
+  unconditional by design, so no configuration ends up with FEWER reservations
+  than before #6211 — the narrowing can only move a reservation to a
+  better-justified allocator, never remove one. Rolling-upgrade safe, and
+  single-rule / non-overlapping-pool configs are byte-identical either way.
 - **Release site:** the reservation uses the synced flow key, so the standard
   teardown — `release_source_nat_allocation`, already called on GC reap
   (`reap_expired_sessions`), on a peer delete-sync (`handle_delete_synced`), and

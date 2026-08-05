@@ -66266,3 +66266,54 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 13:12
+- **Action**: #6211 — the HA STANDBY's synced source-NAT reservation picked its
+  rule by "first rule whose pool CONTAINS the translated address", while the
+  ACTIVE node picked by zone/policy match. Two source-NAT rules can carry the
+  SAME public pool address in SEPARATE allocators (the allocator is shared per
+  `SourceNatRule::allocator_key` = pool name + addresses + port range, so
+  distinct `pool_name`s with a common member address give one address two
+  independent `PortAllocator`s), and under that config the standby's
+  reservation landed in a DIFFERENT allocator than the active used for the same
+  session — so after a failover a new local flow matching the OTHER rule missed
+  the collision guard, reintroducing the reverse-path ambiguity the token
+  exists to prevent. Pre-existing: byte-identical to the shipped port-bearing
+  arm (#4388/#5336); #6210 mirrored it for the address-only case (#5338)
+  without introducing it. Fixed LOCALLY, with NO wire change: every input the
+  active's rule match consumes is already synced — the zone pair rides as
+  `ingress_zone_id`/`egress_zone_id` (`SessionSyncRequest` →
+  `SessionMetadata::ingress_zone`/`egress_zone`, legacy name strings as the
+  old-peer fallback; Go sender `buildSessionSyncRequestV4/V6` in
+  `manager_ha.go`) and the 5-tuple IS the session key. So rather than inventing
+  a second rule-identity scheme (the `PolicyCounterStore` stable-`rule_id`
+  precedent applies only if the identity must ride the wire, which it need
+  not), `reserve_synced_source_nat_allocation` re-runs the active's OWN
+  predicate: `SourceNatRule::matches` was split into shared `zone_matches` /
+  `l4_matches` / `address_matches` axes plus a new `matches_ignoring_scope`,
+  and the flow key it already built is byte-identical to the active's
+  SNAT-match tuple (original source, POST-DNAT destination, original ports —
+  `nat_match_flow.forward_key` in `poll_descriptor`). The #3096 interface /
+  routing-instance scope is the one axis the standby cannot confirm
+  (`NatScopeCtx` derives from LOCAL ifindex maps keyed on the ACTIVE's
+  ifindices), so it is treated as UNCONSTRAINED, not as a mismatch — rejecting
+  an interface-scoped rule would push the selection PAST the rule the active
+  used. Both passes share one `reserve_synced_on_first_pool_owner` body so the
+  reservation semantics cannot drift; the pre-#6211 first-pool-match remains an
+  unconditional pass-2 fallback (unresolvable zone pair, no confirmable match,
+  or every candidate refusing), so no config ends up with FEWER reservations
+  than before. Validation: a RED probe on the parent (`ad9591177`) proved the
+  divergence (reservation landed in the `dmz->wan` allocator for a `lan->wan`
+  session, cargo exit 101) before any fix; 9 new tests (2 fail-on-revert, 4
+  negative controls, 3 axis guards) + a 6-mutation matrix (disable-pass-1,
+  scope-checked `matches`, no-fallback, drop-l4-axis, pre-DNAT dst,
+  drop-zone-axis) proving each guard fires.
+- **File(s)**: userspace-dp/src/nat/source.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md
+  (`docs/refactoring-audit-current.txt` NOT regenerated: source.rs grows
+  1765 -> 1895 lines but stays in the same `[WATCH]` tier (1500-1999), and
+  the canary compares tier by path, so `go test ./pkg/refactoraudit/` passes
+  clean — verified, exit 0.)

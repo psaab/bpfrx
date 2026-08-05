@@ -1,5 +1,32 @@
 use super::super::*;
 
+/// #6211: resolve the ACTIVE node's `(from_zone, to_zone)` NAME pair for a
+/// synced session, so the standby's source-NAT reservation lands on the rule
+/// the active actually matched rather than on the first rule whose pool merely
+/// CONTAINS the translated address (which diverges when two rules carry
+/// overlapping pool addresses in separate allocators).
+///
+/// The IDs come off the HA session-sync wire (`SessionSyncRequest`'s
+/// `ingress_zone_id`/`egress_zone_id`, with the legacy name strings resolved
+/// through `zone_name_to_id` for an older peer — see
+/// `build_synced_session_entry`), so this is a pure local lookup: no new wire
+/// field, and an old peer degrades to `None`.
+///
+/// `None` whenever EITHER side fails to resolve to a non-empty local zone name
+/// — an unknown/dropped zone, or config drift between the nodes. `populate_zones`
+/// never admits id 0 or an empty name, but the emptiness check is enforced here
+/// too rather than assumed: an empty `from_zone` would silently EXCLUDE every
+/// zone-scoped rule instead of leaving the axis unconstrained, which is the one
+/// way this narrowing could pick a worse rule than the pre-#6211 fallback.
+fn synced_source_nat_zone_pair<'a>(
+    forwarding: &'a ForwardingState,
+    metadata: &crate::session::SessionMetadata,
+) -> crate::nat::SyncedNatZones<'a> {
+    let from = forwarding.zone_id_to_name.get(&metadata.ingress_zone)?;
+    let to = forwarding.zone_id_to_name.get(&metadata.egress_zone)?;
+    (!from.is_empty() && !to.is_empty()).then_some((from.as_str(), to.as_str()))
+}
+
 /// Apply `WorkerCommand::UpsertSynced`: re-resolve the synced
 /// forward session with local egress (regardless of HA state — #326),
 /// upsert into the session table, and publish the kernel session-map
@@ -93,6 +120,11 @@ pub(in crate::afxdp::session_glue) fn handle_upsert_synced(
                 &key,
                 entry.decision.nat,
                 metadata.is_reverse,
+                // #6211: the active's zone pair, so the reservation lands in
+                // the allocator the active used when two rules share a pool
+                // address. `None` (old peer / unknown zone) keeps the
+                // pre-#6211 first-pool-match.
+                synced_source_nat_zone_pair(forwarding, &metadata),
             );
             // #4512: same treatment for NAT64. The translated `(pool v4, port)`
             // rides the synced `NatDecision` (`rewrite_src_port`), but the
