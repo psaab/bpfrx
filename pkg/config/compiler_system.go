@@ -1839,16 +1839,6 @@ func compileChassis(node *Node, ch *ChassisConfig) error {
 			ch.Cluster.ControlLinkAuthKey = Secret(v)
 		}
 	}
-	// #5078: the bounded dual-accept window for a rolling key rollout. Absent
-	// or unparseable leaves it 0 = fail-closed, which is the safe direction: a
-	// typo must not silently disable session-sync authentication.
-	if n := clusterNode.FindChild("authentication-migration-window"); n != nil {
-		if v := nodeVal(n); v != "" {
-			if mins, err := strconv.Atoi(v); err == nil && mins > 0 {
-				ch.Cluster.AuthMigrationWindow = mins
-			}
-		}
-	}
 	if n := clusterNode.FindChild("control-interface"); n != nil {
 		if v := nodeVal(n); v != "" {
 			ch.Cluster.ControlInterface = v

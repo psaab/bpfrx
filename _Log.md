@@ -925,6 +925,55 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #5078 PR1 r2: remove the migration window; the pre-admission path becomes unreachable and is deleted
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Gate returned three MAJORs, ALL of them against the
+  `authentication-migration-window` knob: (1) the window bounded a connection's
+  ADMISSION but not its LIFETIME, so a stream admitted while it was open stayed
+  pass-through after expiry and could still fence the node; (2) an admitted
+  peer could re-arm the window through config-sync (CONFIG(0) then CONFIG(N)) —
+  the relaxation letting in an attacker who then extends the relaxation; (3) the
+  in-memory arming point meant a crash loop granted a FRESH interval on every
+  restart, because the positive knob persists while the arming timestamp does
+  not. (3) inverts the trade I described and the lead endorsed.
+  **Root cause: my justification for the knob was wrong.** I told the lead a
+  rolling key rollout would DEADLOCK without it — config-sync delivers the key
+  over this channel, so keying the primary first strands it from the unkeyed
+  secondary. Re-checked: `authentication-key` is an ordinary config leaf, so the
+  operator commits it LOCALLY on each node; both-unkeyed still dual-accepts
+  unchanged, so sync works until the first node is keyed and is authenticated
+  once the second is. The gap is a brief operator-controlled sync outage, not a
+  deadlock. The knob was a convenience, and it needed three guards of its own.
+  **Removed entirely** — config leaf, typed field, compiler arm, manager state,
+  provider method, alarm. `golden_4406.json` is byte-identical to master again.
+  Removing it then made `pendingFrame` UNREACHABLE: its sole producer sits
+  behind `syncAuthDecision(true,false,false,false)`, which now always rejects.
+  So the pre-admission fix upgraded from a REORDER to a DELETION — the type,
+  the third return value of `performSyncHandshake`, and the call site are gone.
+  Unreachable code that mutates cluster state before admission is one edit from
+  being live again. The legacy arm now rejects UNCONDITIONALLY and consults
+  `syncAuthDecision` only for the reason string, so re-introducing a grace in
+  the decision cannot silently re-open the path; that is stated in the comment.
+  Net diff vs master is now 5 files, all in `pkg/cluster` plus two docs.
+- **Validation**: M1 (restore the grace) → `legacy_peer_rejected_when_keyed` and
+  `unkeyed_peer_rejected_when_keyed` FAIL, build+vet rc=0 first, restored and
+  `sha256sum -c` verified. **M2 no longer exists as a runtime mutation** and I
+  am not claiming one: the pre-admission path is gone from the TYPE SYSTEM, so
+  reordering it is a build break, not an assertion RED. Recorded honestly
+  rather than dressed up — the earlier r1 M2 passed after the fixture changed,
+  which is how the unreachability was discovered in the first place (the test
+  had gone vacuous: an unkeyed local node never produces a pending frame).
+  Full `go test ./...` on the branch surfaced an intermittent `pkg/ddns`
+  failure; established it is NOT this change (`git diff origin/master --
+  pkg/ddns pkg/config` is EMPTY, so that test binary is byte-identical, and
+  ddns does not import pkg/cluster), measured 0/8 on branch and 0/8+1 on
+  master when run alone, and FILED it as #6867 rather than re-running to green.
+- **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/sync_auth_test.go`, `pkg/cluster/README.md`, `_Log.md`
+  (config schema/types/compiler/golden reverted to master; deleted
+  `pkg/cluster/sync_preadmission_5078_test.go`)
+
 ## 2026-08-05 — #5078 PR1: fail-closed session-sync auth + no pre-admission frame execution
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth)

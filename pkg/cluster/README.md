@@ -208,23 +208,41 @@ slot. Two changes close it:
 - **A keyed node requires an authenticated peer.** `syncAuthDecision` no longer
   consults `peerAuthSeen` for the unkeyed-peer branch — it cannot, since the
   whole exposure is the pre-arm window. An unkeyed/legacy peer is rejected.
-- **A pending first frame executes only after `installConn`.** It is still
-  processed (dropping it would lose a message and break stream order), but
-  under the same admission the receive loop has, so a rejected handshake
-  executes nothing.
+- **The pre-admission frame mechanism is DELETED, not reordered.** A legacy
+  peer's first frame used to be carried out of the handshake as a
+  `pendingFrame` and executed BEFORE `installConn` — `syncMsgFence` on that
+  path reaches `OnFenceReceived` and disables every routing group, for a peer
+  that had proven nothing. Its only producer sat behind the dual-accept grace,
+  so once that grace is gone the arm can never accept and the mechanism is
+  unreachable. It is removed rather than left dormant: unreachable code that
+  mutates cluster state before admission is one edit away from being live
+  again. There is now no path by which an unadmitted connection executes
+  anything.
 
-**Why the escape hatch exists.** Config-sync delivers the key over this very
-channel, so keying the primary first would leave it permanently unable to reach
-the still-unkeyed secondary — a deadlock, not a transient. `set chassis cluster
-authentication-migration-window <minutes>` re-opens dual-accept for a bounded
-period. It is default-off (0), it **disables session-sync authentication while
-open**, and it alarms both when armed and on every unauthenticated admission it
-permits. The arming point is in-memory, so a daemon restart restarts the
-window — a deliberate choice over persisting a security-relaxation deadline
-across reboots.
+**No relaxation knob, deliberately.** An earlier draft of this fix shipped a
+bounded `authentication-migration-window` on the premise that a rolling key
+rollout would otherwise DEADLOCK — config-sync delivers the key over this very
+channel, so keying the primary first leaves it unable to reach the unkeyed
+secondary. That premise was wrong. `authentication-key` is an ordinary config
+leaf, so the operator commits it locally on each node; sync is unauthenticated
+and working until the first node is keyed, and authenticated once the second is.
+The gap is a brief operator-controlled sync outage, not a deadlock.
 
-The window relaxes only "the peer is unkeyed". A peer that claims a key and
-fails its proof is rejected inside the window too.
+The window was also a poor trade on its own terms. It had to bound a
+connection's LIFETIME rather than just its admission (an admitted pass-through
+stream outlived the deadline and could still fence the node), it had to stop an
+admitted peer re-arming it through config-sync, and its in-memory arming point
+meant a crash loop granted a fresh interval on every restart. A relaxation
+needing three guards of its own does not belong inside the fix that closes the
+hole.
+
+What remains is the property a security appliance should have: **a node must
+possess the key to join a keyed cluster.** A fresh or RMA node is keyed locally
+as part of the same bootstrap that gives it its node-id.
+
+**Rollout procedure.** Commit `authentication-key` locally on each node. Session
+sync is down between the two commits, so avoid a failover in that gap; do the
+standby first if you want the primary to keep serving throughout.
 
 ## Control-channel authentication (#4107, PR-A)
 

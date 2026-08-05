@@ -97,7 +97,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// closes the connection; the accept/connect loops retry, so this never
 	// bricks a keyed↔keyed reconnect during failover (both nodes are up and
 	// keyed → the handshake completes in milliseconds).
-	mode, frameKey, pending, err := s.performSyncHandshake(conn)
+	mode, frameKey, err := s.performSyncHandshake(conn)
 	// #5303: release the pre-auth admission slot (and the setup-tracking entry)
 	// the moment the handshake resolves — an admitted slot must cover only the
 	// brief pre-auth window, never the subsequent bulk sync. Post-auth the
@@ -122,18 +122,6 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// the decision's use, so the surviving connection could DROP cold-prime (see
 	// installConn / the needColdPrime doc in sync.go).
 	d := s.installConn(fabricIdx, conn)
-	// #5078: a legacy/unkeyed peer's first real frame was consumed by the
-	// handshake read, so it must still be processed before the receive loop
-	// starts or the message is lost. It is executed HERE, AFTER installConn,
-	// never before: the pre-admission call site let a connection that was never
-	// admitted still mutate cluster state, and `syncMsgFence` on that path
-	// reaches OnFenceReceived and disables every RG. A PSK-less peer could
-	// therefore fence the node on first contact with a single frame. Post-
-	// install the frame runs under exactly the same admission the receive loop
-	// has, so a rejected handshake executes nothing at all.
-	if pending != nil {
-		s.handleMessage(conn, pending.typ, pending.payload)
-	}
 	slog.Info("cluster sync: handling new connection", "fabric", fabricIdx, "remote", connRemoteAddrString(conn), "was_disconnected", d.wasDisconnected, "active_before", d.activeBefore, "active_after", d.activeAfter, "became_active", d.becameActive, "should_cold_prime", d.shouldColdPrime, "had_conn0", d.hadConn0, "had_conn1", d.hadConn1)
 	s.wg.Add(1)
 	go func() {

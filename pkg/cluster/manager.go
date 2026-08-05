@@ -210,26 +210,11 @@ type Manager struct {
 	// mutated in place) under m.mu on config apply; read via
 	// controlLinkAuthKey().
 	controlAuthKey []byte
-	// authMigrationWindow / authMigrationArmedAt implement the #5078 bounded
-	// dual-accept escape hatch. window is the configured duration (0 = off,
-	// the fail-closed default); armedAt is when a NON-ZERO window was first
-	// observed, so the window is measured from the commit that enabled it
-	// rather than restarting on every apply. Both are guarded by m.mu.
-	//
-	// The arming point is in-memory, so a daemon restart RESTARTS the window.
-	// That is a deliberate simplification over persisting a deadline: the
-	// window is an operator-driven maintenance action measured in minutes, and
-	// persisting a security-relaxation deadline across reboots is a worse
-	// failure mode than re-arming one the operator can see and remove. It is
-	// alarmed both when armed and on EVERY unauthenticated admission it
-	// permits, for exactly this reason.
-	authMigrationWindow  time.Duration
-	authMigrationArmedAt time.Time
-	hbInterval           time.Duration
-	hbThreshold          int
-	hbLocalAddr          string // last StartHeartbeat localAddr (for restart)
-	hbPeerAddr           string // last StartHeartbeat peerAddr (for restart)
-	hbVRFDevice          string // last StartHeartbeat vrfDevice (for restart)
+	hbInterval     time.Duration
+	hbThreshold    int
+	hbLocalAddr    string // last StartHeartbeat localAddr (for restart)
+	hbPeerAddr     string // last StartHeartbeat peerAddr (for restart)
+	hbVRFDevice    string // last StartHeartbeat vrfDevice (for restart)
 
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
@@ -448,21 +433,6 @@ func (m *Manager) controlLinkAuthKey() []byte {
 // be mutated, and must never be logged.
 func (m *Manager) ControlLinkAuthKey() []byte {
 	return m.controlLinkAuthKey()
-}
-
-// SyncAuthMigrationActive reports whether the #5078 bounded dual-accept window
-// is configured AND still open. While true, a keyed node accepts an
-// UNAUTHENTICATED session-sync peer — i.e. session-sync authentication is
-// DISABLED — so the caller must alarm on it. Returns false when no window is
-// configured (the default) or the window has expired, which is the fail-closed
-// posture.
-func (m *Manager) SyncAuthMigrationActive() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if m.authMigrationWindow <= 0 || m.authMigrationArmedAt.IsZero() {
-		return false
-	}
-	return time.Since(m.authMigrationArmedAt) < m.authMigrationWindow
 }
 
 // Events returns the event channel for state change notifications.

@@ -13,43 +13,33 @@ import (
 // fakeSyncAuthProvider is a test SyncAuthProvider that returns a fixed PSK and a
 // settable heartbeat downgrade-guard signal.
 type fakeSyncAuthProvider struct {
-	key       []byte
-	authSeen  bool
-	migration bool
+	key      []byte
+	authSeen bool
 }
 
-func (f *fakeSyncAuthProvider) ControlLinkAuthKey() []byte    { return f.key }
-func (f *fakeSyncAuthProvider) HeartbeatPeerAuthSeen() bool   { return f.authSeen }
-func (f *fakeSyncAuthProvider) SyncAuthMigrationActive() bool { return f.migration }
+func (f *fakeSyncAuthProvider) ControlLinkAuthKey() []byte  { return f.key }
+func (f *fakeSyncAuthProvider) HeartbeatPeerAuthSeen() bool { return f.authSeen }
 
 type handshakeResult struct {
-	mode    syncAuthMode
-	key     []byte
-	pending *pendingFrame
-	err     error
+	mode syncAuthMode
+	key  []byte
+	err  error
 }
 
 func runHandshake(s *SessionSync, conn net.Conn) <-chan handshakeResult {
 	ch := make(chan handshakeResult, 1)
 	go func() {
-		mode, key, pending, err := s.performSyncHandshake(conn)
-		ch <- handshakeResult{mode: mode, key: key, pending: pending, err: err}
+		mode, key, err := s.performSyncHandshake(conn)
+		ch <- handshakeResult{mode: mode, key: key, err: err}
 	}()
 	return ch
 }
 
 func newAuthSync(t *testing.T, key []byte, authSeen bool) *SessionSync {
 	t.Helper()
-	return newAuthSyncMigration(t, key, authSeen, false)
-}
-
-// newAuthSyncMigration is newAuthSync with the #5078 bounded dual-accept window
-// forced open, so a test can exercise the operator escape hatch.
-func newAuthSyncMigration(t *testing.T, key []byte, authSeen, migration bool) *SessionSync {
-	t.Helper()
 	s := NewSessionSync(":0", ":0", nil)
-	if key != nil || authSeen || migration {
-		s.SetAuthProvider(&fakeSyncAuthProvider{key: key, authSeen: authSeen, migration: migration})
+	if key != nil || authSeen {
+		s.SetAuthProvider(&fakeSyncAuthProvider{key: key, authSeen: authSeen})
 	}
 	return s
 }
@@ -82,9 +72,6 @@ func TestSyncAuthHandshakeBothKeyedAuthenticates(t *testing.T) {
 	}
 	if len(ar.key) == 0 || !bytes.Equal(ar.key, br.key) {
 		t.Fatalf("frame keys must be non-empty and equal: a=%x b=%x", ar.key, br.key)
-	}
-	if ar.pending != nil || br.pending != nil {
-		t.Fatalf("no pending frame expected on authenticated path")
 	}
 
 	// A sealed session frame must round-trip: seal on A's authConn, verify on
@@ -167,56 +154,10 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 
 	ar := <-ach
 	if ar.err == nil {
-		t.Fatalf("a keyed node must REJECT an unauthenticated peer, got mode=%d pending=%+v", ar.mode, ar.pending)
-	}
-	if ar.pending != nil {
-		t.Fatalf("a rejected handshake must surface no pending frame to execute, got %+v", ar.pending)
+		t.Fatalf("a keyed node must REJECT an unauthenticated peer, got mode=%d", ar.mode)
 	}
 	if ar.key != nil {
 		t.Fatalf("a rejected handshake must yield no frame key")
-	}
-}
-
-// TestSyncAuthHandshakeMigrationWindowAcceptsLegacyPeer pins the operator
-// escape hatch: with the bounded window open, the pre-#5078 dual-accept
-// behaviour returns so a rolling authentication-key rollout can converge. The
-// window is what makes the fail-closed default deployable — config-sync
-// delivers the key over this very channel, so keying the primary first would
-// otherwise leave it unable to reach the unkeyed secondary.
-//
-// RED on revert: ignore the migration flag in syncAuthDecision and this errors.
-func TestSyncAuthHandshakeMigrationWindowAcceptsLegacyPeer(t *testing.T) {
-	a := newAuthSyncMigration(t, []byte("psk"), false, true)
-
-	ca, cb := net.Pipe()
-	defer ca.Close()
-	defer cb.Close()
-
-	ach := runHandshake(a, ca)
-
-	// Legacy peer: consume A's HELLO (so A's concurrent HELLO write unblocks),
-	// then send a normal clock-sync as its first frame.
-	if _, _, err := readSyncFrameRaw(cb); err != nil {
-		t.Fatalf("legacy peer failed to read HELLO: %v", err)
-	}
-	var clockBuf [8]byte
-	binary.LittleEndian.PutUint64(clockBuf[:], 12345)
-	if err := writeMsg(cb, syncMsgClockSync, clockBuf[:]); err != nil {
-		t.Fatalf("legacy peer failed to send clock sync: %v", err)
-	}
-
-	ar := <-ach
-	if ar.err != nil {
-		t.Fatalf("dual-accept should not error: %v", ar.err)
-	}
-	if ar.mode != syncAuthUnauthenticated {
-		t.Fatalf("expected unauthenticated dual-accept, got mode=%d", ar.mode)
-	}
-	if ar.key != nil {
-		t.Fatalf("unauthenticated connection must have no frame key")
-	}
-	if ar.pending == nil || ar.pending.typ != syncMsgClockSync {
-		t.Fatalf("legacy peer's first frame must be preserved as pending, got %+v", ar.pending)
 	}
 }
 
@@ -266,8 +207,8 @@ func TestSyncAuthDisabledNoHandshake(t *testing.T) {
 	// watchdog guarantees the test fails loudly instead of hanging.
 	done := make(chan handshakeResult, 1)
 	go func() {
-		mode, key, pending, err := s.performSyncHandshake(ca)
-		done <- handshakeResult{mode: mode, key: key, pending: pending, err: err}
+		mode, key, err := s.performSyncHandshake(ca)
+		done <- handshakeResult{mode: mode, key: key, err: err}
 	}()
 
 	select {
@@ -275,7 +216,7 @@ func TestSyncAuthDisabledNoHandshake(t *testing.T) {
 		if r.err != nil {
 			t.Fatalf("disabled handshake errored: %v", r.err)
 		}
-		if r.mode != syncAuthUnauthenticated || r.key != nil || r.pending != nil {
+		if r.mode != syncAuthUnauthenticated || r.key != nil {
 			t.Fatalf("disabled handshake must be an unauthenticated no-op, got %+v", r)
 		}
 	case <-time.After(time.Second):
@@ -351,32 +292,25 @@ func TestSyncFrameSealVerifyRoundTripAndReplay(t *testing.T) {
 // explicit, default-off, time-bounded window instead.
 //
 // RED on revert: restore the `peerAuthSeen` grace (accept when the guard has
-// not armed) and legacy_peer_rejected_when_keyed / unkeyed_peer_rejected_when_
-// keyed fail.
+// not armed), or add any unconditional accept for an unkeyed peer, and
+// legacy_peer_rejected_when_keyed / unkeyed_peer_rejected_when_keyed fail.
 func TestSyncAuthDecisionMatrix(t *testing.T) {
 	cases := []struct {
-		name                                                  string
-		keyConfigured, peerAdv, peerKeyed, proofOK, migration bool
-		wantMode                                              syncAuthMode
-		wantAccept                                            bool
+		name                                       string
+		keyConfigured, peerAdv, peerKeyed, proofOK bool
+		wantMode                                   syncAuthMode
+		wantAccept                                 bool
 	}{
-		{"no local key accepts all", false, false, false, false, false, syncAuthUnauthenticated, true},
-		{"no local key ignores migration", false, false, false, false, true, syncAuthUnauthenticated, true},
-		{"both keyed good proof authenticates", true, true, true, true, false, syncAuthAuthenticated, true},
-		{"both keyed bad proof rejected", true, true, true, false, false, syncAuthUnauthenticated, false},
-		// The #5078 fix: a keyed node no longer grants a first-contact grace.
-		{"legacy_peer_rejected_when_keyed", true, false, false, false, false, syncAuthUnauthenticated, false},
-		{"unkeyed_peer_rejected_when_keyed", true, true, false, false, false, syncAuthUnauthenticated, false},
-		// ...unless the operator explicitly opened the migration window.
-		{"legacy peer accepted inside migration window", true, false, false, false, true, syncAuthUnauthenticated, true},
-		{"unkeyed peer accepted inside migration window", true, true, false, false, true, syncAuthUnauthenticated, true},
-		// A bad proof is rejected even inside the window: the window relaxes
-		// "peer is unkeyed", never "peer failed to prove the key it claims".
-		{"bad proof rejected even in migration window", true, true, true, false, true, syncAuthUnauthenticated, false},
+		{"no local key accepts all", false, false, false, false, syncAuthUnauthenticated, true},
+		{"both keyed good proof authenticates", true, true, true, true, syncAuthAuthenticated, true},
+		{"both keyed bad proof rejected", true, true, true, false, syncAuthUnauthenticated, false},
+		// The #5078 fix: a keyed node grants no grace at all.
+		{"legacy_peer_rejected_when_keyed", true, false, false, false, syncAuthUnauthenticated, false},
+		{"unkeyed_peer_rejected_when_keyed", true, true, false, false, syncAuthUnauthenticated, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mode, accept, reason := syncAuthDecision(tc.keyConfigured, tc.peerAdv, tc.peerKeyed, tc.proofOK, tc.migration)
+			mode, accept, reason := syncAuthDecision(tc.keyConfigured, tc.peerAdv, tc.peerKeyed, tc.proofOK)
 			if mode != tc.wantMode || accept != tc.wantAccept {
 				t.Fatalf("decision = (mode %d, accept %v, %q), want (mode %d, accept %v)", mode, accept, reason, tc.wantMode, tc.wantAccept)
 			}
