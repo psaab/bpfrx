@@ -1,3 +1,54 @@
+## 2026-08-05 — #6851 round 4: delete a comment's false coverage claim, and replace an assertion that could not fail
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: Re-gate returned no blocking findings; four comment/assertion
+  items, all folded.
+  **F1** — the CLI call-site canary's SCOPE note claimed it asserts
+  `fetchPeerSessions` "returns no response value that bypasses" the
+  sanitizer. It does not: the body only looks for a CallExpr by name.
+  Measured by the gate — `sanitizePeerSessionPolicyNames(nil)` contains the
+  call, bypasses sanitization, and leaves every package green with the
+  round-3 MAJOR fully restored. Deleted the clause rather than inventing a
+  guard: the residual cell is "call present, argument neutered", the same
+  one already disclosed for `attachPeerSessions`, and the class is covered
+  from two other sides (deleting the call reds this test; gutting the
+  sanitizer reds the behavioural tests). A comment claiming coverage that
+  does not exist is the defect this PR spent three rounds removing.
+  **F3** — an expectation equal to the failure default. The id-0 test
+  asserted `GetPolicyId() != 0` with "the raw wire value must still be
+  surfaced", but the INPUT id is 0, so "want 0" is also the zero value and
+  cannot distinguish preserved from clobbered. Removed it and moved the
+  surfacing claim to the sentinel sibling, where `0xFFFFFFFF` IS
+  distinguishable. Proved the replacement binds rather than assuming:
+  mutating the sanitizer to `e.PolicyId = 0` alongside the name rewrite
+  goes RED with the new assertion and would have gone GREEN under the old
+  one.
+  **F2** — `attachPeerSessions(resp, nil)` does NOT compile standalone
+  (`declared and not used: peerResp`); the substance holds with
+  `_ = peerResp` beside it. Wording corrected, point kept.
+  **F4** — the per-package floor's message cited "pointing it at a path
+  that no longer exists", but a nonexistent root makes WalkDir error and
+  the walk Fatals first. Rescoped to its real domain: directory exists,
+  yields zero production `.go` files.
+  Plus an observation recorded at the source: `PeerSessionPolicyName` has
+  no direct unit test in pkg/dataplane — its reserved-before-peer-name
+  ordering is bound transitively (reversing it reds pkg/cli and
+  pkg/grpcapi). Noted at the function so a future reader does not go
+  looking for the guard in the package that documents it.
+  Watch item checked: `pkg/grpcapi/server_sessions.go` is 1990 lines, ten
+  from the 2000 REFACTOR tier, and this round left it at 1990 — the F2 edit
+  was net-neutral.
+- **Validation**: full `go test ./pkg/... ./cmd/...` passes; gofmt and vet
+  clean. One targeted mutation (clobber `PolicyId` while rewriting the
+  name) confirms the F3 replacement assertion can fail.
+  NOTE for review: this delta is NOT comment-only — F3 removes one
+  assertion and adds another. That is called out rather than folded into a
+  "comment-only" claim.
+- **File(s)**: `pkg/cli/peer_policy_name_6851_test.go`,
+  `pkg/grpcapi/server_sessions.go`,
+  `pkg/dataplane/policy_display.go`,
+  `pkg/dataplane/policy_display_4626_test.go`, `_Log.md`
+
 ## 2026-08-05 — #6851 round 3: the on-box CLI bypasses the choke point; the canary could not see it
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)

@@ -140,6 +140,12 @@ func ReservedPolicyName(id uint32) (string, bool) {
 // they differ only for an older peer, which is exactly the population that
 // needs correcting. An empty peerName for an unreserved id stays empty, so a
 // caller's own not-found handling is unchanged.
+//
+// WHERE THIS IS BOUND (#6851 review): there is no direct unit test of this
+// function in pkg/dataplane. The reserved-before-peer-name ordering documented
+// above is bound TRANSITIVELY — reversing it reds pkg/cli and pkg/grpcapi while
+// pkg/dataplane stays green. The property is covered; it is just not covered in
+// the package where it is documented, so do not go looking for the guard here.
 func PeerSessionPolicyName(peerName string, id uint32) string {
 	// Same LOAD-BEARING ordering as SessionPolicyName: the reserved check must
 	// precede any use of peerName. A form that trusts a non-empty peerName

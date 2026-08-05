@@ -57,9 +57,10 @@ func TestCLISanitizesPeerReservedPolicyName_6851(t *testing.T) {
 	if got != dataplane.UnattributedPolicyName {
 		t.Errorf("policy_name = %q, want %q", got, dataplane.UnattributedPolicyName)
 	}
-	if id := resp.GetSessions()[0].GetPolicyId(); id != 0 {
-		t.Errorf("policy_id = %d, want 0 — the raw wire value must still be surfaced", id)
-	}
+	// NOTE: no policy_id assertion here. The input id IS 0, so "want 0" is also
+	// the zero value and cannot distinguish "preserved" from "zeroed" — an
+	// expectation equal to the failure default. The surfacing claim is asserted
+	// on the sentinel sibling below, where the value would differ.
 }
 
 // The default-policy sentinel is reserved on this path too: a pre-#3057 peer
@@ -70,6 +71,14 @@ func TestCLISanitizesPeerSentinelPolicyName_6851(t *testing.T) {
 
 	if got := resp.GetSessions()[0].GetPolicyName(); got != dataplane.DefaultPolicyName {
 		t.Errorf("sentinel policy_name = %q, want %q", got, dataplane.DefaultPolicyName)
+	}
+	// The raw wire id must SURVIVE the substitution. Asserted here rather than
+	// on the id-0 case because 0xFFFFFFFF is distinguishable from the zero
+	// value, so this assertion can actually fail if the sanitizer clobbers the
+	// id while rewriting the name.
+	if id := resp.GetSessions()[0].GetPolicyId(); id != dataplane.DefaultPolicySentinelID {
+		t.Errorf("policy_id = %d, want %d — the sanitizer rewrites the NAME only; the raw "+
+			"wire value must still be surfaced beside it", id, dataplane.DefaultPolicySentinelID)
 	}
 }
 
@@ -117,10 +126,18 @@ func TestCLISanitizePeerHandlesDegenerateShapes_6851(t *testing.T) {
 // Binding it behaviourally needs a live peer dial through c.dialPeer, so it is
 // bound structurally instead.
 //
-// SCOPE: this asserts fetchPeerSessions contains a call to the sanitizer and
-// returns no response value that bypasses it. It does not prove the call
-// precedes every return, and it cannot see a sanitizer that was gutted — the
-// behavioural tests above cover that half.
+// SCOPE: this asserts only that fetchPeerSessions CONTAINS a call to the
+// sanitizer. It does not prove the call precedes every return, it cannot see a
+// sanitizer that was gutted, and it cannot see the argument — measured:
+// `sanitizePeerSessionPolicyNames(nil)` contains the call, bypasses the
+// sanitization entirely, and leaves every package green with the MAJOR fully
+// restored.
+//
+// That residual cell — "call present, argument neutered" — is the same one
+// disclosed for attachPeerSessions in grpcapi, and it is left uncovered
+// deliberately rather than papered over with a guard invented to satisfy a
+// reviewer. The class is covered from two other sides: deleting the call reds
+// this test, and gutting the sanitizer's body reds the behavioural tests above.
 func TestCLIPeerFetchCallsSanitizer_6851(t *testing.T) {
 	const (
 		file   = "session_filter.go"

@@ -720,10 +720,10 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 // green. Fused, the two cannot be separated by deleting a line.
 //
 // SCOPED (#6851 review): "fused" is a shape argument, not an enforced one.
-// `attachPeerSessions(resp, nil)` still compiles, still satisfies the
-// structural canary, drops every peer session from all three surfaces, and
-// passes the suite. So this reads as loud to an OPERATOR (peer rows vanish),
-// not to CI. Do not cite it as test-enforced.
+// `attachPeerSessions(resp, nil)` on its own does NOT compile — peerResp goes
+// unused — but with `_ = peerResp` beside it the whole suite passes while every
+// peer session is dropped from all three surfaces. So this reads as loud to an
+// OPERATOR (peer rows vanish), not to CI. Do not cite it as test-enforced.
 //
 // Residual, stated rather than implied: the tests below drive this function, so
 // they bind the sanitize-and-attach pair. They do NOT bind `fetchPeerSessions`'

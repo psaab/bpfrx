@@ -275,11 +275,13 @@ func TestSessionRowSurfacesUseSessionPolicyName_4626(t *testing.T) {
 
 	for _, pkg := range sessionPolicyNameDisplayPackages {
 		if perPkg[pkg] == 0 {
-			t.Fatalf("canary scanned ZERO files in pkg/%s. Dropping a package from "+
-				"sessionPolicyNameDisplayPackages — or pointing it at a path that no "+
-				"longer exists — silently removes its coverage while the rest of the "+
-				"walk still passes; that is exactly how the seventh resolver survived",
-				pkg)
+			t.Fatalf("canary scanned ZERO files in pkg/%s. Its directory exists but "+
+				"yielded no production .go files, so every per-file check below is "+
+				"vacuously satisfied and the package contributes no coverage while the "+
+				"rest of the walk still passes. (A path that does not exist is a "+
+				"different case: WalkDir errors and the Fatalf above fires first.) "+
+				"Membership is asserted separately, because a package REMOVED from the "+
+				"list never reaches this loop at all", pkg)
 		}
 	}
 
