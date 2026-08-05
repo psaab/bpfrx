@@ -729,8 +729,12 @@ type LoginConfig struct {
 //   - deny-commands / deny-configuration are RESTRICTIVE — they subtract from
 //     the permission bits. Ignoring them hands the class MORE than the
 //     operator wrote, so they are hard-rejected at commit
-//     (validateLoginClassDenyStrict) and fold the class to view-only on the
-//     tolerant load / peer-sync path.
+//     (validateLoginClassDenyStrict) and, on the tolerant load / peer-sync
+//     path, fold the class down to the REPAIR FLOOR — {view, configure}
+//     intersected with what the class already held
+//     (foldLoginClassDenyToRepairableFloor). Not to view-only: the configured
+//     class can be bound to the console login, and a class that cannot enter
+//     `configure` cannot delete the statement that is blocking every commit.
 type LoginClass struct {
 	Name               string
 	Permissions        []string               // raw Junos permission tokens as written

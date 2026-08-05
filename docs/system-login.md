@@ -147,16 +147,74 @@ value test would wave them through — yet an empty POSIX regex matches every
 command, i.e. denies *everything*, the most restrictive thing an operator can
 write.
 
+#### Tolerant path: fold to the repair floor
+
 On the **tolerant** load / peer-sync path the rejection is downgraded so an
 already-persisted or peer-synced config still boots (#1960 no-brick) — but a
 bare warning would preserve exactly the fail-open the strict gate rejects, so
-that path additionally **folds the class to view-only**
-(`foldLoginClassDenyToViewOnly`): the operator asked for strictly less than
-`permissions` grants, xpf cannot compute how much less, so it resolves the
-ambiguity in the restrictive direction. The fold never *widens* — a class that
-granted nothing keeps granting nothing — and it cannot lock you out of the box,
-because `resolveClassPerms` consults the **built-in** classes first and the fold
-only ever touches a custom class.
+that path additionally **folds the class**
+(`foldLoginClassDenyToRepairableFloor`) to
+
+```
+{ view, configure }  ∩  the permissions the class already held
+```
+
+The operator asked for strictly less than `permissions` grants and xpf cannot
+compute how much less, so it resolves the ambiguity in the restrictive
+direction — **bounded by repairability**.
+
+Two properties:
+
+- **Never widens.** `view` / `configure` appear only if the class already held
+  that bucket (or held `all`, which subsumes both). A class that granted
+  nothing keeps granting nothing.
+- **Never folds below the repair floor.** `configure` is exactly what the
+  runtime gate requires to enter configuration mode, and there is no
+  per-statement gate inside it, so `configure` *is* the self-repair channel.
+  Taking it away is the one reduction that cannot be undone from the box.
+
+Everything else — `clear`, `control`, `maintenance`, and `all` itself — is
+dropped. So the motivating example above (`permissions all` + `deny-commands
+"request system zeroize"`) really does lose the ability to zeroize.
+
+> [!WARNING]
+> **This fold does not enforce `deny-configuration` at all.** xpf's coarse
+> model has exactly two configuration states — all or none — and "none" is the
+> state that strands repair, so the tolerant path keeps "all". A class carrying
+> `deny-configuration` can still edit the configuration it names until the
+> statement is removed. The strict gate is what forces the removal.
+
+**Why not fold to view-only.** It would strand the box. `pkg/daemon`
+assigns the *configured* class to any OS user whose name matches a `system
+login user`, and `root` is an accepted user name — account provisioning skips
+root, the CLI class assignment does not. So this previously-accepted config
+
+```
+set system login class noc-admin permissions [ view configure ]
+set system login class noc-admin deny-configuration "security policies"
+set system login user root class noc-admin
+```
+
+binds the **console** operator to `noc-admin`. A view-only collapse would take
+`configure` away from the only login that could delete the offending statement,
+while the strict gate rejects every commit until it *is* deleted. A
+configure-only class would collapse to an empty permission set, which is worse.
+Recovery would need an out-of-band shell. Built-ins-first lookup in
+`resolveClassPerms` does not rescue this: it only decides which table answers
+for a class *name*, not that any actual login is bound to a built-in.
+
+#### Recovery if you already committed such a config
+
+An upgraded box that loads a persisted config carrying these statements emits
+the warning above and keeps the class usable for repair:
+
+1. Log in and run `configure` (retained by the fold).
+2. `delete system login class <name> deny-configuration` (and/or
+   `deny-commands`).
+3. `commit` — this is the first commit the strict gate lets through.
+
+Nothing else about the box can be committed until that statement is gone; that
+is the forcing function, not an accident.
 
 Full per-command deny **enforcement** (matching semantics plus coverage of
 every command and configuration dispatch point) remains open on #5831; this is

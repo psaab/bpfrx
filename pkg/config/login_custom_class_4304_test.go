@@ -152,9 +152,10 @@ func TestCustomLoginClassNoPrivEsc(t *testing.T) {
 //
 // The #4304 intent — an operator must never silently get a class weaker than
 // they wrote — is preserved and strengthened here: strict rejects outright, and
-// the tolerant path folds the class to view-only rather than leaving it
-// MORE-permissive (see TestLoginClassDenyToleratedButFoldedToViewOnly and the
-// rest of login_class_deny_5831_test.go).
+// the tolerant path folds the class down to the repair floor rather than
+// leaving it MORE-permissive (see TestLoginClassDenyToleratedButFolded,
+// TestLoginClassDenyFoldKeepsTheRepairPath and the rest of
+// login_class_deny_5831_test.go).
 func TestCustomLoginClassDenyCommandsRejected(t *testing.T) {
 	tree := buildTree4303(t, []string{
 		"set system login class limited permissions all",

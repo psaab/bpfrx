@@ -10,9 +10,12 @@ import (
 // this gate such a config committed cleanly and enforced nothing: the operator
 // held a config saying a verb was denied and a box on which it was allowed.
 //
-// These tests pin the fail-closed half: strict commit REJECTS, the tolerant
-// load / peer-sync path folds the class to view-only, and neither over-reaches
-// onto the additive allow-* half or onto ordinary classes.
+// These tests pin the fail-closed half: strict commit REJECTS; the tolerant
+// load / peer-sync path folds the class down to the REPAIR FLOOR ({view,
+// configure} intersected with what it already held — see
+// TestLoginClassDenyFoldKeepsTheRepairPath for why it stops there and not at
+// view-only); and neither over-reaches onto the additive allow-* half or onto
+// ordinary classes.
 
 // buildLoginTree5831 builds a ConfigTree from flat `set` lines. It uses
 // ParseSetCommand + SetPath and NEVER NewParser: the parser treats newlines as
@@ -160,15 +163,17 @@ func TestLoginClassValidStillCommits(t *testing.T) {
 	}
 }
 
-// TestLoginClassDenyToleratedButFoldedToViewOnly pins the tolerant load /
-// peer-sync behavior. #1960 says an already-persisted or peer-synced config
-// must still BOOT, so the strict rejection cannot simply be re-run here.
+// TestLoginClassDenyToleratedButFolded pins the tolerant load / peer-sync
+// behavior. #1960 says an already-persisted or peer-synced config must still
+// BOOT, so the strict rejection cannot simply be re-run here.
 //
 // But a bare warning would leave the runtime fail-open exactly where it
 // started. So the tolerant path resolves the un-enforceable restriction in the
-// RESTRICTIVE direction: the class collapses to view-only. `permissions all` +
-// an unenforceable deny must NOT keep PermAll.
-func TestLoginClassDenyToleratedButFoldedToViewOnly(t *testing.T) {
+// RESTRICTIVE direction: `permissions all` + an unenforceable deny must NOT
+// keep PermAll, and must lose every operational-verb bucket the deny could
+// have targeted (clear / control / maintenance). What it keeps is the repair
+// floor — see TestLoginClassDenyFoldKeepsTheRepairPath.
+func TestLoginClassDenyToleratedButFolded(t *testing.T) {
 	tree := buildLoginTree5831(t, []string{
 		"set system login class limited permissions all",
 		`set system login class limited deny-commands "request system zeroize"`,
@@ -183,15 +188,17 @@ func TestLoginClassDenyToleratedButFoldedToViewOnly(t *testing.T) {
 	}
 	lc := cfg.System.Login.Classes[0]
 
-	for _, p := range lc.MappedPermissions {
-		if p == PermAll {
-			t.Fatalf("class kept PermAll despite an unenforceable deny-commands: %v — "+
-				"the persisted-config path preserved the fail-open the strict gate rejects",
-				lc.MappedPermissions)
+	// Every bucket that would let this class run `request system zeroize` — the
+	// exact verb the config says is denied — must be gone. PermAll matches any
+	// required permission, so it alone would re-open the hole.
+	for _, banned := range []LoginClassPermission{PermAll, PermMaint, PermControl, PermClear} {
+		for _, p := range lc.MappedPermissions {
+			if p == banned {
+				t.Fatalf("class kept %s despite an unenforceable deny-commands: %v — "+
+					"the persisted-config path preserved the fail-open the strict gate rejects",
+					loginClassPermName(banned), lc.MappedPermissions)
+			}
 		}
-	}
-	if len(lc.MappedPermissions) != 1 || lc.MappedPermissions[0] != PermView {
-		t.Fatalf("expected the class folded to view-only; got %v", lc.MappedPermissions)
 	}
 
 	var found string
@@ -214,29 +221,48 @@ func TestLoginClassDenyToleratedButFoldedToViewOnly(t *testing.T) {
 }
 
 // TestLoginClassDenyFoldNeverWidens pins the non-widening property of the fold
-// directly. A class granting NOTHING (`permissions unauthorized`) must not be
-// handed view access by the fold — assigning []LoginClassPermission{PermView}
-// unconditionally would do exactly that, turning a restriction gate into a
-// privilege GRANT.
+// directly. A class granting NOTHING must not be handed view or configure
+// access by the fold — returning a literal {PermView, PermConfig} would do
+// exactly that, turning a restriction gate into a privilege GRANT. This is the
+// edge that keeps the repair floor from becoming a floor for classes that were
+// never above it.
 func TestLoginClassDenyFoldNeverWidens(t *testing.T) {
 	t.Run("empty permission set stays empty", func(t *testing.T) {
-		if got := viewOnlyFold(nil); len(got) != 0 {
+		if got := repairableFloorFold(nil); len(got) != 0 {
 			t.Fatalf("fold GRANTED %v to a class that had no permissions at all", got)
 		}
-		if got := viewOnlyFold([]LoginClassPermission{}); len(got) != 0 {
+		if got := repairableFloorFold([]LoginClassPermission{}); len(got) != 0 {
 			t.Fatalf("fold GRANTED %v to a class that had no permissions at all", got)
 		}
 	})
-	t.Run("PermAll reduces to view", func(t *testing.T) {
-		got := viewOnlyFold([]LoginClassPermission{PermAll})
-		if len(got) != 1 || got[0] != PermView {
-			t.Fatalf("all should reduce to view; got %v", got)
+	t.Run("a set below the floor is not raised to it", func(t *testing.T) {
+		// clear/control/maintenance only: the class never held view or
+		// configure, so the fold must hand back neither. A literal-return fold
+		// would GRANT both.
+		got := repairableFloorFold([]LoginClassPermission{PermClear, PermControl, PermMaint})
+		if len(got) != 0 {
+			t.Fatalf("fold GRANTED %v to a class holding neither view nor configure", got)
 		}
 	})
-	t.Run("view survives, everything above it is dropped", func(t *testing.T) {
-		got := viewOnlyFold([]LoginClassPermission{PermView, PermClear, PermControl, PermConfig, PermMaint})
+	t.Run("view without configure stays view-only", func(t *testing.T) {
+		got := repairableFloorFold([]LoginClassPermission{PermView, PermClear})
 		if len(got) != 1 || got[0] != PermView {
-			t.Fatalf("expected view-only; got %v", got)
+			t.Fatalf("fold GRANTED configure to a view+clear class; got %v", got)
+		}
+	})
+	t.Run("PermAll reduces to the floor", func(t *testing.T) {
+		// PermAll subsumes both floor buckets (checkPermission returns nil on
+		// PermAll for every required permission), so all -> {view,configure} is
+		// a strict reduction, not a widening.
+		got := repairableFloorFold([]LoginClassPermission{PermAll})
+		if len(got) != 2 || got[0] != PermView || got[1] != PermConfig {
+			t.Fatalf("all should reduce to {view,configure}; got %v", got)
+		}
+	})
+	t.Run("everything above the floor is dropped", func(t *testing.T) {
+		got := repairableFloorFold([]LoginClassPermission{PermView, PermClear, PermControl, PermConfig, PermMaint})
+		if len(got) != 2 || got[0] != PermView || got[1] != PermConfig {
+			t.Fatalf("expected {view,configure}; got %v", got)
 		}
 	})
 
@@ -258,6 +284,150 @@ func TestLoginClassDenyFoldNeverWidens(t *testing.T) {
 	}
 	if got := lc.MappedPermissions; len(got) != 0 {
 		t.Fatalf("tolerant fold GRANTED %v to a class that held no permissions at all", got)
+	}
+}
+
+// TestLoginClassDenyFoldKeepsTheRepairPath is the counter-example to
+// "the fold cannot lock an operator out".
+//
+// pkg/daemon/daemon_run.go assigns the CONFIGURED login class to any OS user
+// whose name matches a `system login user` entry, and `root` is a name the
+// username validator accepts (account PROVISIONING skips root; the CLI class
+// assignment does not). So the config below binds the CONSOLE operator to a
+// custom class. If the tolerant fold collapsed that class to view-only, the
+// only login that can delete the offending statement would lose `configure` —
+// while validateLoginClassDenyStrict rejects every commit until it IS deleted.
+// Recovery would need an out-of-band shell.
+//
+// "resolveClassPerms consults the built-ins first" does not rescue this: that
+// only decides which table answers for a class NAME, not that any login is
+// bound to a built-in.
+//
+// Note what the operator wrote: `permissions [view configure]` plus
+// `deny-configuration` means "configure everything EXCEPT security policies".
+// Removing ALL configure is more restrictive than they asked for, in the one
+// direction that is unrecoverable.
+func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  []LoginClassPermission
+	}{
+		{
+			// The reviewer's example, verbatim.
+			name: "configured root, view+configure, deny-configuration",
+			lines: []string{
+				"set system login class noc-admin permissions [ view configure ]",
+				`set system login class noc-admin deny-configuration "security policies"`,
+				"set system login user root class noc-admin",
+			},
+			want: []LoginClassPermission{PermView, PermConfig},
+		},
+		{
+			// A configure-only class folds to the EMPTY set under a view-only
+			// collapse — strictly worse than the case above, because the
+			// operator cannot even read the config to find the statement.
+			name: "configure-only class must not fold to nothing",
+			lines: []string{
+				"set system login class cfg-only permissions configure",
+				`set system login class cfg-only deny-configuration "security policies"`,
+				"set system login user root class cfg-only",
+			},
+			want: []LoginClassPermission{PermConfig},
+		},
+		{
+			// `permissions all` keeps the repair floor too — and only that.
+			name: "permissions all folds down to the floor, not past it",
+			lines: []string{
+				"set system login class su-ish permissions all",
+				`set system login class su-ish deny-commands "request system zeroize"`,
+				"set system login user root class su-ish",
+			},
+			want: []LoginClassPermission{PermView, PermConfig},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(buildLoginTree5831(t, tc.lines))
+			if err != nil {
+				t.Fatalf("tolerant path must not brick an already-persisted config: %v", err)
+			}
+			lc := cfg.System.Login.Classes[0]
+			if len(lc.DenyLeavesPresent) == 0 {
+				t.Fatal("precondition: the deny leaf was not recorded, so the fold never ran")
+			}
+			// Guard the guard: the user->class binding that makes this a
+			// LOCKOUT rather than a mere downgrade must actually be in the
+			// compiled config.
+			var bound bool
+			for _, u := range cfg.System.Login.Users {
+				if u.Name == "root" && u.Class == lc.Name {
+					bound = true
+				}
+			}
+			if !bound {
+				t.Fatalf("precondition: `user root class %s` did not compile; users=%+v",
+					lc.Name, cfg.System.Login.Users)
+			}
+
+			hasConfig := false
+			for _, p := range lc.MappedPermissions {
+				if p == PermConfig {
+					hasConfig = true
+				}
+			}
+			if !hasConfig {
+				t.Fatalf("fold STRANDED the box: class %q held `configure` before the fold and "+
+					"lost it (%v), but root is bound to that class and every commit is rejected "+
+					"until the statement is deleted — there is no in-band way to delete it",
+					lc.Name, lc.MappedPermissions)
+			}
+			if len(lc.MappedPermissions) != len(tc.want) {
+				t.Fatalf("expected %v; got %v", tc.want, lc.MappedPermissions)
+			}
+			for i, p := range tc.want {
+				if lc.MappedPermissions[i] != p {
+					t.Fatalf("expected %v; got %v", tc.want, lc.MappedPermissions)
+				}
+			}
+		})
+	}
+}
+
+// TestLoginClassDenyFoldWarningStatesTheRecoveryPath pins the operator-facing
+// text. The fold deliberately leaves `deny-configuration` UNENFORCED (xpf's
+// coarse model has only all-or-nothing configuration, and "nothing" strands
+// repair), so the warning must not imply the restriction is now in force, and
+// it must name the way out. A warning that only says "folded" would leave an
+// operator believing the deny took effect.
+func TestLoginClassDenyFoldWarningStatesTheRecoveryPath(t *testing.T) {
+	cfg, err := CompileConfigLenient(buildLoginTree5831(t, []string{
+		"set system login class noc-admin permissions [ view configure ]",
+		`set system login class noc-admin deny-configuration "security policies"`,
+		"set system login user root class noc-admin",
+	}))
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	var w string
+	for _, cand := range cfg.Warnings {
+		if strings.Contains(cand, "noc-admin") && strings.Contains(cand, "deny-configuration") {
+			w = cand
+		}
+	}
+	if w == "" {
+		t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
+	}
+	// The post-fold set, so the operator can see what the class actually holds.
+	if !strings.Contains(w, "configure") {
+		t.Fatalf("warning does not name the retained `configure` permission: %q", w)
+	}
+	// The honest limit: the restriction is still not in force for config.
+	if !strings.Contains(w, "NOT in force") {
+		t.Fatalf("warning implies the restriction took effect; it did not for configuration: %q", w)
+	}
+	// The forcing function, so the operator knows repair is mandatory.
+	if !strings.Contains(w, "every commit is rejected") {
+		t.Fatalf("warning does not tell the operator that commits stay blocked until repair: %q", w)
 	}
 }
 

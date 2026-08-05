@@ -937,8 +937,12 @@ func loginClassPermName(p LoginClassPermission) string {
 // `system login class <name>` (#4304 S-2). The class is RECOGNIZED (a valid
 // vSRX RBAC config commits instead of being hard-rejected), but xpf's coarse
 // permission model cannot faithfully represent every Junos permission or the
-// per-command allow/deny regexes, so the advisory states exactly what maps and
-// what is recognized-but-not-enforced. Deterministic order for stable output.
+// per-command ADDITIVE regexes (allow-commands / allow-configuration), so the
+// advisory states exactly what maps and what is recognized-but-not-enforced.
+// It says nothing about the RESTRICTIVE regexes: #5831 moved deny-commands /
+// deny-configuration out of advisory territory entirely — strict rejects the
+// commit, and the tolerant path folds the class and emits its own warning
+// (compiler_login_deny.go). Deterministic order for stable output.
 func loginClassAdvisoryWarnings(cfg *Config) []string {
 	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) == 0 {
 		return nil
@@ -990,14 +994,20 @@ func loginClassAdvisoryWarnings(cfg *Config) []string {
 		//
 		//  1. It is no longer reachable on the strict path at all —
 		//     validateLoginClassDenyStrict rejects the commit outright.
-		//  2. On the tolerant path it would now be FALSE. That path folds the
-		//     class to view-only before this runs, so the class is MORE
-		//     restrictive than the Junos config, not less; repeating the old
-		//     text would tell the operator the exact opposite of what happened.
+		//  2. On the tolerant path it would now be misleading. That path folds
+		//     the class to the repair floor before this runs, dropping every
+		//     operational-verb bucket, so the class is MORE restrictive than
+		//     the Junos config on the half deny-commands targets; repeating
+		//     the old text would tell the operator the opposite of what
+		//     happened. (Configuration is the one half where the restriction
+		//     genuinely does not bind — the fold keeps `configure` so the
+		//     statement can be deleted — and the fold's own warning says so
+		//     precisely, which a blanket "MORE PERMISSIVE" cannot.)
 		//
-		// foldLoginClassDenyToViewOnly emits the accurate per-class warning on
-		// that path, so this advisory stays out of the restrictive-regex
-		// business entirely and describes only the permission mapping.
+		// foldLoginClassDenyToRepairableFloor emits the accurate per-class
+		// warning on that path, so this advisory stays out of the
+		// restrictive-regex business entirely and describes only the
+		// permission mapping.
 		warnings = append(warnings, msg)
 	}
 	return warnings

@@ -105,9 +105,9 @@ func validateLoginClassDenyStrict(cfg *Config) error {
 		r.class, strings.Join(r.leaves, " / "))
 }
 
-// foldLoginClassDenyToViewOnly is the tolerant load / peer-sync counterpart of
-// validateLoginClassDenyStrict (#5831). It returns one warning per affected
-// class and mutates cfg.
+// foldLoginClassDenyToRepairableFloor is the tolerant load / peer-sync
+// counterpart of validateLoginClassDenyStrict (#5831). It returns one warning
+// per affected class and mutates cfg.
 //
 // Why this path does MORE than warn. The #1960 no-brick rule says an
 // already-persisted or peer-synced config must still boot, so the strict
@@ -117,18 +117,41 @@ func validateLoginClassDenyStrict(cfg *Config) error {
 // reach pkg/cli/permissions.go with its full permission set and the deny
 // silently dropped. Warning about a hole is not closing it.
 //
-// So the tolerant path resolves the ambiguity in the RESTRICTIVE direction:
-// the operator asked for strictly less than `permissions` grants, we cannot
-// compute how much less, so the class collapses to view-only. That is the same
-// least-privilege fold mapJunosPermissions already applies to Junos permission
-// tokens with no precise coarse equivalent, so it is the established reading of
-// "we cannot model this exactly" in this file, not a new policy.
+// So the tolerant path resolves the ambiguity in the RESTRICTIVE direction —
+// the operator asked for strictly less than `permissions` grants and we cannot
+// compute how much less — BOUNDED BY REPAIRABILITY. That bound is the whole
+// reason this is not a collapse to view-only, and it is not a stylistic
+// preference; a view-only collapse strands the box:
 //
-// It cannot brick the box: resolveClassPerms consults the BUILT-IN classes
-// (super-user/operator/read-only/config-viewer) FIRST and this fold only ever
-// touches a custom class, so console super-user access is untouched and an
-// operator can always log in and remove the offending stanza.
-func foldLoginClassDenyToViewOnly(cfg *Config) []string {
+//	set system login class noc-admin permissions [ view configure ]
+//	set system login class noc-admin deny-configuration "security policies"
+//	set system login user root class noc-admin
+//
+// pkg/daemon/daemon_run.go assigns the CONFIGURED class to any OS user whose
+// name matches a `system login user` (`if u.Name == osUser {
+// shell.SetUserClass(u.Class) }`), and `root` is a name the username validator
+// accepts. Account PROVISIONING skips root (daemon_system.go); the CLI class
+// assignment does not. So the console operator above runs as `noc-admin`, and
+// a view-only collapse takes `configure` away from the only login that could
+// delete the offending stanza — while validateLoginClassDenyStrict rejects
+// every commit until it IS deleted. A configure-only class collapses to the
+// empty set, which is worse. Recovery would need an out-of-band shell.
+//
+// "The built-ins are consulted first" does NOT rescue that case: built-ins-first
+// lookup only decides which table answers for a class NAME, it does not
+// guarantee that any actual login is bound to a built-in.
+//
+// #1960's no-brick rule is therefore read as covering this: a config that
+// LOADS but revokes the access needed to repair itself is the same failure with
+// extra steps.
+//
+// RECOVERY PATH for an operator who already committed such a config: log in
+// (the class keeps `view` if it had it), run `configure`, `delete system login
+// class <name> deny-configuration` (and/or `deny-commands`), `commit`. That
+// commit is the FIRST one the strict gate lets through, which is exactly the
+// forcing function — nothing else about the box can be changed until the
+// unenforceable statement is gone.
+func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 	rejections := collectLoginClassDenyRejections(cfg)
 	if len(rejections) == 0 {
 		return nil
@@ -146,40 +169,84 @@ func foldLoginClassDenyToViewOnly(cfg *Config) []string {
 			continue
 		}
 		before := lc.MappedPermissions
-		lc.MappedPermissions = viewOnlyFold(before)
+		lc.MappedPermissions = repairableFloorFold(before)
 		warnings = append(warnings, fmt.Sprintf(
 			"system login class %q: %s is NOT enforced by xpf's coarse RBAC model "+
-				"(downgraded to warning on tolerant path); the class is folded to "+
-				"%s so it cannot be MORE permissive than the config states — "+
-				"remove the statement and re-express the restriction as a narrower "+
-				"`permissions` set",
-			r.class, strings.Join(r.leaves, " / "), describePerms(lc.MappedPermissions)))
+				"(downgraded to a warning on the tolerant load / peer-sync path). The "+
+				"class is folded from %s to %s so it cannot be MORE permissive than the "+
+				"config states, EXCEPT that `view`/`configure` are retained where the "+
+				"class already held them — otherwise this fold would remove the only "+
+				"access that can delete the statement. Any restriction the statement "+
+				"places on CONFIGURATION is therefore still NOT in force. Remove it and "+
+				"re-express the restriction as a narrower `permissions` set; every "+
+				"commit is rejected until you do.",
+			r.class, strings.Join(r.leaves, " / "),
+			describePerms(before), describePerms(lc.MappedPermissions)))
 	}
 	return warnings
 }
 
-// viewOnlyFold reduces a coarse permission set to view-only WITHOUT ever
-// widening it (#5831).
+// repairableFloorFold reduces a coarse permission set to the smallest set that
+// is BOTH never wider than the original AND still able to repair the config
+// that triggered the fold (#5831): the intersection of the original with
+// {PermView, PermConfig}.
 //
-// The non-widening argument, case by case:
-//   - contains PermAll — PermAll matches every required permission, so it
-//     strictly subsumes PermView. all -> view is a reduction.
-//   - contains PermView — view is retained, every other bucket is dropped.
-//     Identity or reduction.
-//   - contains NEITHER (an empty set from `permissions unauthorized`, or a
-//     hypothetical set with no view bucket) — returns nil, NOT PermView.
+// TWO properties, and the file's whole design tension lives between them.
 //
-// That last case is the whole reason this is not a one-line assignment to
-// []LoginClassPermission{PermView}: a class that today grants NOTHING would be
-// handed view access by such an assignment, which is a widening — the precise
-// fail-open direction this gate exists to prevent.
-func viewOnlyFold(perms []LoginClassPermission) []LoginClassPermission {
+// Never widens. PermView and PermConfig are emitted only when the input
+// already held that bucket, or held PermAll — and PermAll subsumes both
+// (pkg/cli/permissions.go checkPermission returns nil on `p == PermAll` for
+// EVERY required permission). An input with neither returns nil, NOT
+// PermView: a class that grants nothing today must not be handed view access
+// by a restriction gate. That is why this is not an assignment to a literal.
+//
+// Never folds below the repair floor. PermConfig is exactly what
+// requiredPermission demands for `configure` (permissions.go), and config mode
+// applies no further per-command permission gate — checkPermission runs only
+// on the operational dispatch path — so PermConfig IS the self-repair channel
+// in xpf's coarse model. Dropping it is the one reduction that cannot be
+// undone from the box. PermView rides along so the operator can read the
+// config to find the statement.
+//
+// The buckets that DO get dropped — PermClear, PermControl, PermMaint, and
+// PermAll itself — are the operational-verb buckets `deny-commands` targets.
+// The motivating #5831 example (`permissions all` + `deny-commands "request
+// system zeroize"`) therefore still loses PermAll and PermMaint, so zeroize is
+// genuinely denied after the fold. The fold keeps its teeth on that half.
+//
+// The honest limit, stated because it must not be discovered later: for
+// `deny-configuration` this fold enforces NOTHING. xpf's coarse model has
+// exactly two configuration states — all or none — and "none" is the state
+// that strands repair, so the tolerant path keeps "all" and leans on
+// validateLoginClassDenyStrict to force the statement out. Per-path
+// configuration RBAC (what Junos actually implements, and what would let this
+// be enforced properly) stays on #5831.
+//
+// Dropping Clear/Control/Maint even when only `deny-configuration` is present
+// is deliberate over-restriction in a dimension the operator did not restrict:
+// one rule that always errs restrictive is easier to reason about than a
+// per-leaf branch, and unlike the configure bucket, losing those verbs is
+// fully recoverable from the CLI.
+func repairableFloorFold(perms []LoginClassPermission) []LoginClassPermission {
+	var keepView, keepConfig bool
 	for _, p := range perms {
-		if p == PermView || p == PermAll {
-			return []LoginClassPermission{PermView}
+		switch p {
+		case PermAll:
+			keepView, keepConfig = true, true
+		case PermView:
+			keepView = true
+		case PermConfig:
+			keepConfig = true
 		}
 	}
-	return nil
+	var out []LoginClassPermission
+	if keepView {
+		out = append(out, PermView)
+	}
+	if keepConfig {
+		out = append(out, PermConfig)
+	}
+	return out
 }
 
 // describePerms renders a coarse permission set for an operator-facing

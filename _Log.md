@@ -66269,3 +66269,12 @@ break — `go vet` confirmed passing under every revert.
 - **Timestamp**: 2026-08-05
   **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
   **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/types_system.go, pkg/config/compiler_system.go, pkg/config/compiler_opts.go, pkg/config/compiler_tailgates.go, pkg/config/login_class_deny_5831_test.go, pkg/config/login_custom_class_4304_test.go, docs/system-login.md
+- **Timestamp**: 2026-08-05
+  **Action**: #6838 review fold — the tolerant view-only collapse stranded
+  `configure`, so it now folds to a REPAIR FLOOR ({view,configure} ∩ what the
+  class already held). `daemon_run.go` binds the configured class to any
+  matching OS user including root, so a configured-root class lost the only
+  access that could delete the offending statement while the strict gate
+  rejected every commit. Also corrected four comment/doc claims that still
+  described pre-PR behaviour.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_opts.go, pkg/config/compiler_system.go, pkg/config/compiler_tailgates.go, pkg/config/schema_system.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
