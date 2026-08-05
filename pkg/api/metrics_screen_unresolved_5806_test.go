@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/psaab/xpf/pkg/configstore"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // danglingScreenRefStore builds a store whose ACTIVE config contains a zone
@@ -107,22 +108,25 @@ func TestScreenUnresolvedProfileZonesEmittedOnTolerantLoad(t *testing.T) {
 		t.Fatalf("Gather: %v", err)
 	}
 
-	type series struct{ zone, profile, disposition string }
+	type series struct{ zone, profile string }
 	got := map[series]float64{}
+	var help string
+	var labelNames []string
 	for _, mf := range mfs {
 		if mf.GetName() != "xpf_screen_unresolved_profile_zones" {
 			continue
 		}
+		help = mf.GetHelp()
 		for _, m := range mf.GetMetric() {
 			var k series
+			labelNames = labelNames[:0]
 			for _, l := range m.GetLabel() {
+				labelNames = append(labelNames, l.GetName())
 				switch l.GetName() {
 				case "zone":
 					k.zone = l.GetValue()
 				case "profile":
 					k.profile = l.GetValue()
-				case "disposition":
-					k.disposition = l.GetValue()
 				}
 			}
 			got[k] = m.GetGauge().GetValue()
@@ -134,10 +138,36 @@ func TestScreenUnresolvedProfileZonesEmittedOnTolerantLoad(t *testing.T) {
 			"{trust, alpha} entry (config-only boot; the collector must run BEFORE "+
 			"the dataplane gate)", got)
 	}
-	want := series{zone: "trust", profile: "alpha", disposition: "not-enforced-pass"}
+	want := series{zone: "trust", profile: "alpha"}
 	if v, ok := got[want]; !ok || v != 1 {
 		t.Fatalf("series %+v = %v (present=%v), want 1; got map %v", want, v, ok, got)
 	}
+
+	// The label set is exactly {zone, profile}. The enforcement disposition is a
+	// GLOBAL statement about the implementation — identical for every series — so
+	// it belongs in HELP, not in a label: a label would carry no information and
+	// would hand us unbounded cardinality the day the prose starts to vary.
+	if len(labelNames) != 2 {
+		t.Errorf("label set = %v, want exactly [zone profile]", labelNames)
+	}
+	for _, l := range labelNames {
+		if l != "zone" && l != "profile" {
+			t.Errorf("unexpected label %q; the disposition must live in HELP, not a label", l)
+		}
+	}
+	// HELP must carry the disposition, and it must be the SHARED string so the
+	// metric and the `show security screen` block cannot drift apart.
+	if !strings.Contains(help, dpuserspace.ScreenUnresolvedDisposition) {
+		t.Errorf("HELP must carry the shared disposition string; got %q", help)
+	}
+	// The #5806 anchor is load-bearing: this describes a decision made in the Rust
+	// runtime that Go cannot derive, so when the posture is settled a grep for the
+	// issue number has to land here.
+	if !strings.Contains(help, "5806") {
+		t.Errorf("HELP disposition must carry the #5806 anchor so a posture change "+
+			"greps to this claim; got %q", help)
+	}
+
 	for k := range got {
 		if k.zone == "wan" {
 			t.Error("wan configures NO screen at all — it is not a dangling reference " +

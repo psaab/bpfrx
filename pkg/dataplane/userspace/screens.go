@@ -121,14 +121,45 @@ func buildScreenSnapshots(cfg *config.Config) []ScreenProfileSnapshot {
 // AddresslessEnforcingZones/Interfaces use for their metrics.
 //
 // Deriving these observability surfaces from the config is correct rather than a
-// desired-vs-applied gap: the defect this exposes is precisely that the ACTIVE
-// CONFIG claims a screen is attached while nothing enforces it, so the config is
-// the authoritative statement of the unresolved reference. Reusing this exact
-// builder (rather than re-deriving the predicate) additionally guarantees the
-// metric reports the same set that was published to the helper.
+// desired-vs-applied gap, and the distinction is worth keeping straight: the
+// defect this exposes IS a property of the configuration — the config claims a
+// screen is attached and none is enforced — so the config is the authoritative
+// statement of the unresolved reference. That is the opposite of #6828, where an
+// authoritative zero was published from config while a fence was actively
+// dropping; there the config was the wrong source, here it is the only correct
+// one.
+//
+// Callers MUST go through this function rather than re-deriving the predicate.
+// That is the stated contract, not an implementation convenience: this is the
+// same computation that fills ConfigSnapshot.ScreenMissingProfiles, so routing
+// every surface through it is what guarantees the metric and the status block
+// can never report a different set than the one the helper was actually told
+// about. A re-derived copy would be free to drift the moment either side's
+// notion of "unresolved" changes.
 func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 	return buildScreenMissingProfileRefs(cfg)
 }
+
+// ScreenUnresolvedDisposition describes what the dataplane CURRENTLY does with a
+// zone whose screen profile does not resolve. It is deliberately narrow: the
+// screen checks are skipped, and nothing else about the packet's treatment
+// changes. An earlier draft said the traffic "is forwarded UNSCREENED", which
+// reads as a permit — an operator could take it to mean the firewall is passing
+// traffic it would otherwise deny. It is not: zone security policy still
+// evaluates the packet normally.
+//
+// The #5806 tag in the text is load-bearing, NOT decoration. The decision this
+// sentence describes lives in the Rust runtime
+// (userspace-dp/src/screen/mod.rs returns ScreenVerdict::Pass on the None
+// branch) and is NOT derivable from the Go control plane, so this string is a
+// hardcoded claim about code that lives somewhere else — precisely the shape
+// that goes stale silently when the other side changes. The fail-closed-vs-pass
+// posture is an OPEN design decision owned by #5806; when it is settled, a grep
+// for 5806 must land on every place that asserts today's behaviour, including
+// this one.
+const ScreenUnresolvedDisposition = "the profile reference does not resolve, so no screen " +
+	"checks are applied to this zone; policy evaluation is unaffected (current " +
+	"behaviour, pending the #5806 enforcement-posture decision)"
 
 // ScreenUnresolvedProfileLines renders the operator-facing status block for
 // every zone whose configured screen profile does not resolve (#5806). Returns
@@ -143,10 +174,9 @@ func ScreenMissingProfileRefs(cfg *config.Config) []ScreenMissingProfileRef {
 // still claims one, and the operator is told there is simply nothing configured.
 // Callers must therefore emit these lines BEFORE that early return.
 //
-// The disposition sentence states what the dataplane does with such a zone
-// TODAY (the verdict stays Pass, so traffic is forwarded unscreened). It does
-// not assert what it SHOULD do — the fail-closed-vs-pass posture is the open
-// design decision #5806 owns.
+// The disposition is ONE trailing line, not a per-zone annotation: it is a
+// global statement about the current implementation, identical for every zone,
+// so repeating it per row would be noise.
 func ScreenUnresolvedProfileLines(cfg *config.Config) []string {
 	refs := ScreenMissingProfileRefs(cfg)
 	if len(refs) == 0 {
@@ -157,11 +187,9 @@ func ScreenUnresolvedProfileLines(cfg *config.Config) []string {
 	for _, r := range refs {
 		lines = append(lines,
 			fmt.Sprintf("  Zone %s references undefined screen profile '%s' "+
-				"— NONE of this zone's screen checks are enforced", r.Zone, r.Profile))
+				"— no screen checks are enforced for this zone", r.Zone, r.Profile))
 	}
-	lines = append(lines,
-		"  Disposition: traffic for these zones is currently forwarded UNSCREENED. "+
-			"Define the profile, or remove the reference, to restore enforcement.")
+	lines = append(lines, "  Disposition: "+ScreenUnresolvedDisposition+".")
 	return lines
 }
 

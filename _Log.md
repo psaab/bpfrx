@@ -1,3 +1,58 @@
+## 2026-08-05 — #5806 fold: derive-or-anchor the disposition, narrow its wording, drop the label
+
+- **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility, PR #6839)
+- **Action**: Folded three review corrections on top of the #5806 visibility work.
+  (1) **Wording.** "traffic is forwarded UNSCREENED" overstated the behaviour —
+  it reads as a permit, inviting an operator to think the firewall is passing
+  traffic it would otherwise deny. What is actually true is narrower: the screen
+  checks are skipped and nothing else changes. Now: "the profile reference does
+  not resolve, so no screen checks are applied to this zone; policy evaluation is
+  unaffected". Accurate and posture-neutral.
+  (2) **Derive-or-anchor.** Checked whether the skip decision is derivable from
+  the Go emitter: it is NOT — it lives in the Rust runtime (`screen/mod.rs`
+  returns `ScreenVerdict::Pass` on the `None` branch) and every Go mention is a
+  COMMENT asserting it, which is exactly the stale-claim shape that goes wrong
+  silently. So the string stays a constant but now carries a literal `#5806`
+  anchor, and the comment says why the anchor is load-bearing rather than
+  decorative: when the posture is settled, a grep for the issue number has to
+  land on every place asserting today's behaviour. Two tests assert the anchor
+  survives into the metric HELP and the rendered status text.
+  (3) **Label -> HELP.** The disposition was a metric LABEL; it is a global
+  statement about the implementation, identical for every series, so it carried
+  no information as a label and would have handed us unbounded cardinality the
+  day the prose varied. Label set is now exactly `{zone, profile}`; the
+  disposition rides in the descriptor HELP and in ONE trailing status line. Both
+  read the same exported `ScreenUnresolvedDisposition` constant, so the metric
+  and the CLI/gRPC block cannot drift into describing the behaviour differently.
+  Also strengthened the `ScreenMissingProfileRefs` doc comment to state the SSOT
+  reuse as the CONTRACT rather than an implementation convenience, and to record
+  why config-derived is correct here and was wrong in #6828 (there an
+  authoritative zero was published from config while a fence was actively
+  dropping; here the defect IS a property of the configuration).
+- **Validation**: re-gated EVERY mutation after the fold, not just the new ones —
+  a fold can introduce a regression. Each preceded by a 0-error build so the RED
+  is an assertion. M1 (collector below the dataplane gate) still reddens the
+  config-only-boot series. M2 (status block inside the empty-Screen else) still
+  reddens the worst-case renderer guard. M3 (restore the old overstated wording,
+  which also drops the anchor) reddens three guards across all three packages:
+  the HELP-anchor check, the "policy evaluation is unaffected" check, and the
+  rendered-anchor check. M4 (reintroduce the disposition label) reddens the
+  label-set guard with `label set = [disposition profile zone], want exactly
+  [zone profile]`. All restored + `touch`ed; GREEN each time.
+  One self-inflicted hazard worth recording: restoring a mutated file with
+  `git checkout --` reverts it to HEAD, which silently DISCARDED the fold's own
+  changes to `metrics_counters.go` (HEAD still had the pre-fold label-emitting
+  code). Caught by grepping the restored file rather than trusting the restore;
+  re-applied and re-verified. Restore from the pre-mutation snapshot, never from
+  HEAD, when the file already carries uncommitted work.
+  Full `go test ./...` exit 0; build + vet + gofmt clean.
+- **File(s)**: `pkg/dataplane/userspace/screens.go`,
+  `pkg/dataplane/userspace/screens_unresolved_5806_test.go`,
+  `pkg/api/metrics_counters.go`, `pkg/api/metrics_descriptors_global.go`,
+  `pkg/api/metrics_screen_unresolved_5806_test.go`,
+  `pkg/grpcapi/server_show_screen_unresolved_5806_test.go`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-05 — #5806: expose unresolved screen-profile references (metric + status)
 
 - **Timestamp**: 2026-08-05 (fix/5806-screen-unresolved-visibility)

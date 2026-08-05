@@ -1,6 +1,10 @@
 package api
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/prometheus/client_golang/prometheus"
+
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+)
 
 func (c *xpfCollector) initGlobalDescriptors() {
 	c.packetsTotal = prometheus.NewDesc(
@@ -70,16 +74,15 @@ func (c *xpfCollector) initGlobalDescriptors() {
 	// resolve to a defined profile. Strict commit rejects a dangling reference,
 	// but tolerant startup/recovery, HA config-sync from a schema-skewed peer,
 	// and rolling-upgrade intervals all downgrade it to a warning — and the
-	// dataplane then enforces NONE of that zone's screen checks (LAND, fragment,
+	// dataplane then applies NONE of that zone's screen checks (LAND, fragment,
 	// source-route, SYN/ICMP/UDP flood, scan/sweep, session-limit) while the
 	// active config still claims a screen is attached.
 	//
-	// The `disposition` label reports what the dataplane does with such a zone
-	// TODAY — `not-enforced-pass`, i.e. packets are passed unscreened. It is a
-	// factual statement of current behaviour, deliberately NOT a decision about
-	// the eventual fail-closed-vs-pass posture, which is the open design fork
-	// #5806 owns. If that posture changes, this label changes with it, and the
-	// series keeps meaning "the reference is unresolved" either way.
+	// The current enforcement disposition rides in the HELP text, NOT in a label.
+	// It is a global statement about the implementation — identical for every
+	// zone — so a label would carry no information, and a prose label value would
+	// hand us unbounded cardinality the day it starts to vary. The label set is
+	// exactly {zone, profile}: the two things that actually differ per series.
 	//
 	// Config-derived (no dataplane dependency), emitted BEFORE the dataplane gate
 	// in Collect. The series is present ONLY while a reference is unresolved
@@ -88,10 +91,9 @@ func (c *xpfCollector) initGlobalDescriptors() {
 	c.screenUnresolvedProfileZones = prometheus.NewDesc(
 		"xpf_screen_unresolved_profile_zones",
 		"1 while a security zone references a screen ids-option profile that is "+
-			"not defined, so none of that zone's screen checks are enforced; "+
-			"labeled by zone, the referenced profile name, and the dataplane's "+
-			"current disposition for such a zone.",
-		[]string{"zone", "profile", "disposition"}, nil,
+			"not defined, labeled by zone and the referenced profile name. "+
+			"Disposition: "+dpuserspace.ScreenUnresolvedDisposition+".",
+		[]string{"zone", "profile"}, nil,
 	)
 	c.policyDeniesTotal = prometheus.NewDesc(
 		"xpf_policy_denies_total",

@@ -67,7 +67,19 @@ func TestScreenUnresolvedProfileLinesNamesZoneProfileAndDisposition(t *testing.T
 		t.Fatal("a dangling reference must render a status block")
 	}
 	joined := strings.Join(lines, "\n")
-	for _, want := range []string{"trust", "missing", "UNSCREENED"} {
+	// The disposition is ONE trailing line, not a per-zone annotation: it is a
+	// global statement about the implementation, so repeating it per row is noise.
+	if n := strings.Count(joined, ScreenUnresolvedDisposition); n != 1 {
+		t.Errorf("disposition must appear exactly once (a global statement, not a "+
+			"per-zone annotation); got %d occurrences in:\n%s", n, joined)
+	}
+	// The #5806 anchor must survive into the rendered text: this asserts runtime
+	// behaviour that lives in Rust and Go cannot derive, so a posture change has
+	// to grep to it.
+	if !strings.Contains(joined, "5806") {
+		t.Errorf("rendered disposition must carry the #5806 anchor; got:\n%s", joined)
+	}
+	for _, want := range []string{"trust", "missing", ScreenUnresolvedDisposition} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("status block must mention %q; got:\n%s", want, joined)
 		}

@@ -182,16 +182,6 @@ func (c *xpfCollector) collectPBRStatus(ch chan<- prometheus.Metric) {
 // dependency), so Collect calls this BEFORE the dataplane gate. The SSOT for the
 // window is dpuserspace.AddresslessEnforcingZones, the same builder that drives
 // the daemon's state-transition warning log, so the metric and the log agree.
-// screenUnresolvedDisposition is the dataplane's CURRENT handling of a zone
-// whose screen profile does not resolve: the verdict stays
-// `ScreenVerdict::Pass`, so the packet is forwarded unscreened
-// (`userspace-dp/src/screen/mod.rs`). It is exported as a metric label so an
-// operator can see the enforcement disposition, not merely that a reference is
-// dangling. This constant DESCRIBES today's behaviour; choosing the eventual
-// posture (fail-closed / conservative default profile / partial enforcement) is
-// the open design decision #5806 owns, and is deliberately not made here.
-const screenUnresolvedDisposition = "not-enforced-pass"
-
 // collectScreenUnresolvedProfileZones emits xpf_screen_unresolved_profile_zones
 // (#5806): a 1 per {zone, profile} whose configured screen ids-option reference
 // does not resolve to a defined profile, so the dataplane enforces none of that
@@ -205,8 +195,13 @@ const screenUnresolvedDisposition = "not-enforced-pass"
 //
 // The SSOT is dpuserspace.ScreenMissingProfileRefs — the SAME builder whose
 // output is published to the helper as ConfigSnapshot.ScreenMissingProfiles and
-// drives the dataplane WARN, so the metric cannot report a different set than
-// the dataplane was told about.
+// drives the dataplane WARN. Going through it is the contract, not a shortcut:
+// it is what makes it impossible for this metric to report a different set than
+// the dataplane was actually told about.
+//
+// The enforcement disposition is carried in the descriptor's HELP text rather
+// than as a label — it is identical for every series, so a label would add
+// cardinality risk without information.
 //
 // Config-derived (no dataplane dependency), so Collect calls this BEFORE the
 // dataplane gate.
@@ -220,7 +215,7 @@ func (c *xpfCollector) collectScreenUnresolvedProfileZones(ch chan<- prometheus.
 	}
 	for _, r := range dpuserspace.ScreenMissingProfileRefs(cfg) {
 		ch <- prometheus.MustNewConstMetric(c.screenUnresolvedProfileZones,
-			prometheus.GaugeValue, 1, r.Zone, r.Profile, screenUnresolvedDisposition)
+			prometheus.GaugeValue, 1, r.Zone, r.Profile)
 	}
 }
 

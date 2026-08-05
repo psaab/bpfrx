@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // TestShowScreenReportsUnresolvedReferenceWithNoProfilesDefined is the #5806
@@ -35,9 +36,20 @@ func TestShowScreenReportsUnresolvedReferenceWithNoProfilesDefined(t *testing.T)
 	if !strings.Contains(out, "trust") || !strings.Contains(out, "gone") {
 		t.Fatalf("status must name the zone and the undefined profile it references; got:\n%s", out)
 	}
-	if !strings.Contains(out, "UNSCREENED") {
-		t.Fatalf("status must state the enforcement disposition, not just that a "+
-			"reference dangles; got:\n%s", out)
+	// The status must state the enforcement disposition, not merely that a
+	// reference dangles: "unresolved" alone cannot tell an operator whether they
+	// are currently exposed or currently over-blocked, and those demand opposite
+	// responses. It must be the SHARED string, so the metric HELP and this block
+	// cannot drift into describing the behaviour differently.
+	if !strings.Contains(out, dpuserspace.ScreenUnresolvedDisposition) {
+		t.Fatalf("status must carry the shared disposition string; got:\n%s", out)
+	}
+	// The wording must NOT read as a permit. "forwarded unscreened" invites an
+	// operator to think the firewall is passing traffic it would otherwise deny;
+	// policy evaluation is in fact unaffected.
+	if !strings.Contains(out, "policy evaluation is unaffected") {
+		t.Errorf("disposition must say policy evaluation is unaffected, so it is not "+
+			"read as a permit; got:\n%s", out)
 	}
 	if !strings.Contains(out, "No screen profiles configured") {
 		t.Errorf("the pre-existing empty-inventory line must still be rendered; got:\n%s", out)
