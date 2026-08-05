@@ -276,13 +276,12 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // TestAuthKeyChangeDoesNotRestartClusterComms_5078). Keying at provisioning,
 // before either node seats as secondary, avoids the question entirely.
 //
-// A bounded dual-accept window was shipped and then removed: it had to bound a
-// connection's lifetime, resist an admitted peer re-arming it through
-// config-sync, and survive a crash loop. That window then had to bound a connection's LIFETIME (an
-// admitted pass-through stream outlived the deadline), had to resist an
-// admitted peer re-arming it through config-sync, and could not survive a crash
-// loop without persisting its deadline. A relaxation that needs three guards of
-// its own does not belong in the fix that closes the hole.
+// A bounded dual-accept window was shipped and then removed. It had to bound a
+// connection's LIFETIME rather than just its admission (an admitted
+// pass-through stream outlived the deadline), it had to stop an admitted peer
+// re-arming it through config-sync, and it could not survive a crash loop
+// without persisting its deadline. A relaxation that needs three guards of its
+// own does not belong in the fix that closes the hole.
 //
 // The property this leaves is the right one for a security appliance: a node
 // must POSSESS the key to join a keyed cluster. A fresh or RMA node is keyed

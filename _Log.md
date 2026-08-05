@@ -67644,3 +67644,29 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
   pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-05 — #6865 gate fold: bind the call site, retarget two RED labels
+
+- **Timestamp**: 2026-08-05
+- **Action**: F1 — added `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078`.
+  The step-20 decision in `daemon_apply_tail.go` is INLINE, so the existing
+  struct test could not see it: adding `|| keyChanged` there, with
+  `clusterTransportKey`/`clusterTransportFromConfig` byte-identical, produced
+  the permanent deadlock with a green suite. New test observes
+  `clusterCommsGen` across a real `applyTailReconciles`. F2 — retargeted the
+  RED-on-revert on `...KeyedNodeRejectsLegacyPeer`: it claimed "restore the
+  grace in syncAuthDecision", which does NOT fail it (the arm discards the
+  accept bit); it actually binds the arm returning nil. F3 — matrix comment
+  still described the deleted migration window as current and named the
+  removed `peerAuthSeen` param. F4 — de-duplicated a doubled paragraph in
+  `sync_auth.go`. F6 — assert the `reason` substring, since nil key is the
+  failure default of every error path. README — procedure 2 can itself
+  produce the keyed-primary/unkeyed-secondary deadlock if the connection
+  drops mid-rollout.
+- **Validation**: `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0.
+  M2 (call-site `|| keyChanged`, struct untouched): struct test PASSES, new
+  call-site test FAILS, positive control passes. M4 (legacy arm returns nil):
+  `...KeyedNodeRejectsLegacyPeer` FAILS at the err==nil assertion.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
+  pkg/cluster/README.md, _Log.md

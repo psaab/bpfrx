@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -137,8 +138,18 @@ func TestSyncAuthHandshakeMismatchedKeyRejected(t *testing.T) {
 // draft of #5078 shipped one and it was removed; a rolling key rollout is
 // handled by the procedure in pkg/cluster/README.md instead.
 //
-// RED on revert: restore the first-contact grace in syncAuthDecision and the
-// handshake accepts instead of erroring.
+// RED on revert: make the legacy-peer ARM of performSyncHandshake return a nil
+// error (i.e. hand the frame back instead of dropping the connection) and this
+// test fails. This test is the SOLE catcher in pkg/cluster for that edit.
+//
+// It is deliberately NOT "restore the grace in syncAuthDecision" — that revert
+// does NOT fail here, and the earlier comment claiming it would was wrong. The
+// arm rejects unconditionally and discards the decision's accept bit (see
+// sync_auth.go, "This arm rejects UNCONDITIONALLY"), so relaxing syncAuthDecision
+// alone changes nothing on this path. That revert is caught instead by
+// TestSyncAuthDecisionMatrix's legacy_peer_rejected_when_keyed /
+// unkeyed_peer_rejected_when_keyed rows, and by nothing else. The two tests
+// therefore cover DIFFERENT edits and neither is redundant.
 func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 	a := newAuthSync(t, []byte("psk"))
 
@@ -160,6 +171,16 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 	ar := <-ach
 	if ar.err == nil {
 		t.Fatalf("a keyed node must REJECT an unauthenticated peer, got mode=%d", ar.mode)
+	}
+	// Assert the REASON, not just that some error occurred. A nil frame key is
+	// the failure default of every error path in performSyncHandshake — a read
+	// timeout, a short HELLO, a write failure all produce it — so `err != nil`
+	// plus `key == nil` would still pass if the connection died for an
+	// unrelated reason and never reached the legacy-peer arm at all. This
+	// string is also the operator-facing diagnostic that arm exists to emit.
+	if !strings.Contains(ar.err.Error(), "missing auth handshake") {
+		t.Fatalf("rejection must come from the legacy-peer arm and name the cause; "+
+			"got %q, want it to contain %q", ar.err.Error(), "missing auth handshake")
 	}
 	if ar.key != nil {
 		t.Fatalf("a rejected handshake must yield no frame key")
@@ -287,12 +308,17 @@ func TestSyncFrameSealVerifyRoundTripAndReplay(t *testing.T) {
 // the fabric on first contact was admitted, could fence the node, and displaced
 // the real peer — and it was open on every fresh boot, because "before the
 // guard arms" is exactly when a node starts. A keyed node now REJECTS an
-// unauthenticated peer, and the rolling-rollout case that grace served is an
-// explicit, default-off, time-bounded window instead.
+// unauthenticated peer. There is NO migration window: an earlier draft of
+// #5078 shipped a bounded dual-accept knob and it was deleted, so the
+// rolling-rollout case is served by the operator procedure in
+// pkg/cluster/README.md instead.
 //
-// RED on revert: restore the `peerAuthSeen` grace (accept when the guard has
-// not armed), or add any unconditional accept for an unkeyed peer, and
+// RED on revert: add any unconditional accept for an unkeyed peer on a keyed
+// node — the `peerAuthSeen` parameter this decision used to take is gone, so
+// the revert is now "return accept=true from the final arm" — and
 // legacy_peer_rejected_when_keyed / unkeyed_peer_rejected_when_keyed fail.
+// This matrix is the sole catcher for that edit; the handshake test above
+// catches a different one (the arm's own unconditional rejection).
 func TestSyncAuthDecisionMatrix(t *testing.T) {
 	cases := []struct {
 		name                                       string

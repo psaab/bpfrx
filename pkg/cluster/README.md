@@ -260,7 +260,20 @@ the HA-sync ingress path bypasses the gate).
    because committing the key does not restart cluster comms — the auth key is
    deliberately absent from `clusterTransportKey`, pinned by
    `TestAuthKeyChangeDoesNotRestartClusterComms_5078`. Do not add it there; see
-   that test for why it would create a permanent deadlock.
+   that test for why it would create a permanent deadlock. The step-20 decision
+   that must not fire on a key change is pinned separately by
+   `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` — the struct test alone
+   does not cover the call site.
+
+   **Procedure 2 carries the risk it is trying to avoid.** The key reaches the
+   secondary asynchronously, so if the session-sync connection drops in the
+   window between the primary committing and the secondary applying, you land in
+   exactly the keyed-primary / unkeyed-secondary state below — the now-keyed
+   primary rejects the unkeyed peer's reconnect, and the key can never be
+   delivered. Prefer procedure 1. If you must use procedure 2, confirm sync is
+   connected immediately before committing (`show chassis cluster status`) and
+   verify the secondary applied the key immediately after; treat a drop in that
+   window as requiring the recovery below.
 
 **Recovery, UNVERIFIED.** If a cluster does end up keyed-primary /
 unkeyed-secondary, the reasoned path is: remove the key on the primary → the
