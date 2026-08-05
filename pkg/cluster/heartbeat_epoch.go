@@ -1017,6 +1017,20 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 		// own — the in-flight bit is dropped inside releaseBootEpochRefine,
 		// before this defer runs, so a successor may already have published its
 		// own handle, and it must not be cleared by this one.
+		// THESE TWO STATEMENTS ARE ORDERED, AND THE ORDER IS LOAD-BEARING. The
+		// CAS runs FIRST so that "done is closed" implies "the handle is already
+		// retired": every observer released by done therefore sees a retired
+		// handle, which is what lets waitBootEpochIdle's caller assert
+		// bootEpochWorker is nil straight after it returns (see the retirement
+		// assertion in TestThirdRequestCoalescesOntoTheLateReclaim_6669).
+		//
+		// Swapping them does not fail any test — measured, 219 passes, 0
+		// failures — because the window it opens is a couple of instructions and
+		// an observer has to land inside it. Closing it mechanically would need
+		// a seam BETWEEN these two lines, which is production surface bought for
+		// a hazard that this comment and the one at the assertion already
+		// address. So it is bound by comment on both ends rather than by a test,
+		// deliberately, and that is the reason not to reorder them.
 		defer func() {
 			m.bootEpochWorker.CompareAndSwap(worker, nil)
 			close(worker.done)

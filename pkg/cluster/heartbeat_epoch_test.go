@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -750,8 +751,46 @@ func TestHeartbeatBootEpochRefinementCompletes_6169(t *testing.T) {
 		bootEpochPath = path
 		t.Cleanup(func() { bootEpochPath = orig })
 
+		// HOLD THE WORKER UNTIL `published` HAS BEEN READ. heartbeatBootEpoch
+		// spawns the refine worker inside bootEpochOnce.Do and only THEN returns
+		// m.bootEpoch.Load(), so a worker that wins that race has already raised
+		// the value: `published` captures the RAISED epoch, final == published,
+		// and the assertion below reds on a perfectly healthy tree. Measured
+		// before this park, six concurrent processes at -count=200: 41/1200.
+		//
+		// The park is on epochFlock, which sits INSIDE withEpochFileLock and
+		// therefore strictly before refineBootEpoch's read-modify-write — so
+		// while it is held no raise can have happened, and `published` is
+		// deterministically the unrefined seed.
+		atFlock := make(chan struct{})
+		releaseWorker := make(chan struct{})
+		var flockOnce sync.Once
+		origFlock := epochFlock
+		epochFlock = func(fd int, how int) error {
+			flockOnce.Do(func() {
+				close(atFlock)
+				<-releaseWorker
+			})
+			return origFlock(fd, how)
+		}
+		t.Cleanup(func() { epochFlock = origFlock })
+		var unparkOnce sync.Once
+		unpark := func() { unparkOnce.Do(func() { close(releaseWorker) }) }
+		t.Cleanup(unpark)
+
 		m := NewManager(0, 42)
 		published := m.heartbeatBootEpoch()
+		select {
+		case <-atFlock:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the refinement worker never reached the file lock")
+		}
+		if got := m.heartbeatBootEpoch(); got != published {
+			t.Fatalf("the epoch moved from %d to %d while the worker was parked BEFORE the "+
+				"file lock; nothing can raise it there, so the park is not where it is "+
+				"believed to be", published, got)
+		}
+		unpark()
 		awaitFirstRefine(t, m, "the refinement worker")
 		final := m.heartbeatBootEpoch()
 		if final <= published {

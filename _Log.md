@@ -67988,3 +67988,61 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go,
   pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
   pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 18:03 PDT
+- **Action**: #6669 round 22 — F1, the blocking flake this PR would have put INTO
+  master; F2, binding the load-bearing CAS/close order by comment at both ends;
+  F3/F4 comment accuracy.
+- **F1 — a 3-5% flake in a test that does not exist on origin/master.**
+  `TestHeartbeatBootEpochRefinementCompletes_6169/refinement_raises_after_a_backward_clock_step`.
+  `heartbeatBootEpoch` spawns the refine worker inside `bootEpochOnce.Do` and
+  only THEN returns `m.bootEpoch.Load()`, so a worker that wins the race has
+  already raised the value: `published` captures the RAISED epoch, `final ==
+  published`, and `final <= published` reds on a healthy tree.
+  REPRODUCED FIRST, at HEAD, in the gate's own shape — six concurrent processes
+  at `-count=200`: **41/1200, all six rc=1**. (Gate measured 65/1200.)
+- **Attribution vs consequence, stated because they differ.** It is not this
+  round's regression — the file is byte-identical at `4c5f4d9b3` and the parent
+  rate is indistinguishable. But `heartbeat_epoch_test.go` is +1030 lines that
+  do NOT exist on origin/master, so MERGING is what puts the flake into a
+  package every lane touches, where a 5% failure gets dismissed as environmental
+  for weeks. Pre-existing on the branch is not pre-existing on master.
+- **Fix and proof.** The worker is parked on `epochFlock` — which sits inside
+  `withEpochFileLock`, strictly before `refineBootEpoch`'s read-modify-write, so
+  no raise can have happened while it is held — until `published` has been read.
+  A second assertion checks the epoch did NOT move while parked, so a park that
+  drifts to the wrong place fails loudly rather than silently restoring the
+  race. Re-measured in the identical shape: **0/1200, all six rc=0**.
+- **F2 — the CAS-before-close order is load-bearing and now documented at BOTH
+  ends.** It is what makes "done closed => handle already retired" true, which
+  the retirement assertion depends on. Swapping the two lines fails nothing
+  (measured 219/0), and closing that mechanically needs a seam BETWEEN the two
+  statements — production surface for a hazard two comments already address. So
+  it is bound by comment, deliberately, and both the exit defer and the
+  assertion now say so and name each other. Recorded plainly as a comment-level
+  guard rather than dressed up as a test.
+- **F3 — the residual covered only one of two join paths.** The same comment
+  establishes a joiner can be released EARLY, at the nil handle, and for that
+  path `close(worker.done)` still remains to run. Both residuals are now stated;
+  neither reads a package var or touches Manager state, because every seam read
+  happens inside the loop before the release that clears the word, so the safety
+  conclusion holds for both.
+- **F4 — the package-var list was missing `epochRefineWorkerBeforeExit`**, added
+  with the round-21 seam. That list is what a reader consults to decide whether
+  a `t.Cleanup` is safe, so it has to stay complete.
+- **Corrections.** The `:783` line cited for the MAJOR-2 RED was wrong (it is a
+  blank line); the assertion is at `:802` after this round's edits, and the
+  quoted message text was always correct. It appeared only in the round-21
+  report, not in this log. Separately, the heatmap concern from round 21 is
+  withdrawn: `scripts/refactoring-audit.sh` documents the LOC column as an
+  advisory snapshot the tree is expected to outrun, and the gate compares file
+  set and tier, so the 1609-vs-1956 gap is expected and nothing was owed.
+- **Validation, real exit codes.** `gofmt -l pkg/cluster/` 0; `go build ./...`
+  0; `go vet ./pkg/cluster/` 0; `git diff --check` 0; `go test -race
+  ./pkg/cluster/...` **0** in 17.6 s. MAJOR-2 guard re-proved at its new line:
+  CAS -> Store(nil) reds at `:802`, restored with `heartbeat_epoch.go` back to
+  +14 lines over HEAD (the round-21 seam only).
+- **File(s)**: pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md

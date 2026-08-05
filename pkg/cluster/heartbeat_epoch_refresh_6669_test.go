@@ -35,8 +35,12 @@ import (
 // not yet started is not idle. Clearing the word is the worker's last touch of
 // Manager state, but the goroutine has not necessarily RETURNED at that
 // instant, and a test whose t.Cleanup restores a package var the worker reads
-// (epochFlock, epochNowNanos, epochRefineBeforeRelease) races it if it only
-// polls. So it then joins.
+// (epochFlock, epochNowNanos, epochRefineBeforeRelease,
+// epochRefineWorkerBeforeExit) races it if it only polls. So it then joins.
+// That list is what a reader consults to decide whether a t.Cleanup is safe, so
+// it has to stay complete: the fourth was added with the exit seam, and it is
+// read before both the CAS and the close, so it is covered by the same
+// reasoning as the other three.
 //
 // WHAT THE JOIN OBSERVES IS THE HANDLE RETIRED AND done CLOSED — NOT that the
 // goroutine has returned. An earlier revision of this comment said "it then
@@ -52,12 +56,21 @@ import (
 //     immediately after close(worker.done) and the worker never exits, yet this
 //     helper and its callers stay green 20/20.
 //
-// It is still the right drain for what tests need, and that is the narrower
-// thing to rely on: after close(worker.done) the worker executes only the
-// return from that defer and the goroutine exit. It reads no package var and
-// touches no Manager state, so a t.Cleanup restoring a seam behind this call
-// cannot race it. A test that needs the GOROUTINE gone — rather than merely
-// harmless — must observe that itself; see currentGoroutineID and
+// It is still the right drain for what tests need, and the safety argument has
+// to cover BOTH of those paths, not just the second — an earlier revision
+// stated the residual only for the done path, which is the one where least is
+// left to run:
+//
+//   - released by done: the worker executes only the return from that defer and
+//     the goroutine exit;
+//   - released by the nil handle: close(worker.done) ALSO still remains, since
+//     the CAS that made the handle nil runs immediately before it.
+//
+// Neither residual reads a package var or touches Manager state — the seam
+// reads all happen inside the loop, before the release that clears the word —
+// so a t.Cleanup restoring a seam behind this call cannot race either path. A
+// test that needs the GOROUTINE gone — rather than merely harmless — must
+// observe that itself; see currentGoroutineID and
 // clusterGoroutines.
 func waitBootEpochIdle(t *testing.T, m *Manager) {
 	t.Helper()

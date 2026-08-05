@@ -672,6 +672,13 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	// defer leaves a stale handle published and every other assertion here still
 	// passes. joinBootEpochRefine short-circuits on a nil handle, so a stale one
 	// makes a later join wait on a worker that has already gone.
+	//
+	// THIS DEPENDS ON THE ORDER OF THOSE TWO STATEMENTS, which is why the exit
+	// defer carries a matching note. waitBootEpochIdle returns once done is
+	// closed, and only because the CAS runs BEFORE the close is the handle
+	// guaranteed retired by then. Swap them and this assertion becomes
+	// intermittently red with nothing naming the cause — it would be reported as
+	// a flake in this test rather than as a reordering in the worker.
 	if got := m.bootEpochWorker.Load(); got != nil {
 		t.Fatal("a worker handle is still published after the worker exited: the exit defer's " +
 			"CompareAndSwap did not retire it, so the next join selects on a channel belonging " +
