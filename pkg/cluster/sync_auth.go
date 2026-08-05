@@ -268,13 +268,21 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // no longer consulted for this branch; it cannot be, because the whole window
 // is "before the guard arms".
 //
-// There is deliberately NO relaxation knob. A rolling key rollout does not need
-// one: `authentication-key` is an ordinary config leaf, so the operator commits
-// it locally on each node, and session sync is unauthenticated-but-working
-// until the FIRST node is keyed and authenticated once the SECOND is. The gap
-// is a brief sync outage the operator controls, not a deadlock — an earlier
-// draft of this fix claimed otherwise and shipped a bounded dual-accept window
-// on that premise. That window then had to bound a connection's LIFETIME (an
+// There is deliberately NO relaxation knob — but the rollout constraint is
+// sharper than an earlier revision of this comment claimed. A seated RG0
+// secondary CANNOT be keyed locally: applyHAState sets the store read-only on
+// StateSecondary/StateSecondaryHold and EnterConfigureSession then returns
+// ErrClusterReadOnly, so config-sync is the secondary's only writer. Keying a
+// LIVE cluster therefore means committing on the PRIMARY while sync is
+// connected and letting the established connection carry the key across — which
+// works only because the auth key is absent from clusterTransportKey, so a key
+// commit does not restart cluster comms (pinned by
+// TestAuthKeyChangeDoesNotRestartClusterComms_5078). Keying at provisioning,
+// before either node seats as secondary, avoids the question entirely.
+//
+// A bounded dual-accept window was shipped and then removed: it had to bound a
+// connection's lifetime, resist an admitted peer re-arming it through
+// config-sync, and survive a crash loop. That window then had to bound a connection's LIFETIME (an
 // admitted pass-through stream outlived the deadline), had to resist an
 // admitted peer re-arming it through config-sync, and could not survive a crash
 // loop without persisting its deadline. A relaxation that needs three guards of

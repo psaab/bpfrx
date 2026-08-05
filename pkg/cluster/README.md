@@ -219,30 +219,55 @@ slot. Two changes close it:
   again. There is now no path by which an unadmitted connection executes
   anything.
 
-**No relaxation knob, deliberately.** An earlier draft of this fix shipped a
-bounded `authentication-migration-window` on the premise that a rolling key
-rollout would otherwise DEADLOCK — config-sync delivers the key over this very
-channel, so keying the primary first leaves it unable to reach the unkeyed
-secondary. That premise was wrong. `authentication-key` is an ordinary config
-leaf, so the operator commits it locally on each node; sync is unauthenticated
-and working until the first node is keyed, and authenticated once the second is.
-The gap is a brief operator-controlled sync outage, not a deadlock.
+**No relaxation knob, deliberately** — but read the rollout constraint below
+before concluding that is easy.
 
-The window was also a poor trade on its own terms. It had to bound a
-connection's LIFETIME rather than just its admission (an admitted pass-through
-stream outlived the deadline and could still fence the node), it had to stop an
-admitted peer re-arming it through config-sync, and its in-memory arming point
-meant a crash loop granted a fresh interval on every restart. A relaxation
-needing three guards of its own does not belong inside the fix that closes the
-hole.
+An earlier draft shipped a bounded `authentication-migration-window`. It had to
+bound a connection's LIFETIME rather than just its admission (an admitted
+pass-through stream outlived the deadline and could still fence the node), it
+had to stop an admitted peer re-arming it through config-sync, and its
+in-memory arming meant a crash loop granted a fresh interval on every restart.
+A relaxation needing three guards of its own does not belong inside the fix that
+closes the hole, so it was removed.
 
 What remains is the property a security appliance should have: **a node must
-possess the key to join a keyed cluster.** A fresh or RMA node is keyed locally
-as part of the same bootstrap that gives it its node-id.
+possess the key to join a keyed cluster.**
 
-**Rollout procedure.** Commit `authentication-key` locally on each node. Session
-sync is down between the two commits, so avoid a failover in that gap; do the
-standby first if you want the primary to keep serving throughout.
+### Rollout: a seated secondary CANNOT be keyed locally
+
+Two earlier revisions of this document got this wrong in opposite directions —
+first claiming an unavoidable deadlock, then claiming the operator can simply
+"commit the key locally on each node". Neither is right, and the second is not
+performable:
+
+- `Daemon.applyHAState` calls `store.SetClusterReadOnly(true)` on
+  `StateSecondary` / `StateSecondaryHold` (`pkg/daemon/daemon_ha.go`).
+- `EnterConfigureSession` then returns `ErrClusterReadOnly` before doing
+  anything else (`pkg/configstore/store_lock.go`).
+
+So an operator cannot even open config mode on a seated RG0 secondary — this is
+not "the local commit gets overwritten by sync". **Config-sync is the
+secondary's only writer** (`TestClusterReadOnly_SyncApplyBypassesGate` pins that
+the HA-sync ingress path bypasses the gate).
+
+**Performable procedures:**
+
+1. **At provisioning / console, before the cluster forms.** `clusterReadOnly`
+   zero-values to `false`, so each node can be keyed independently before it
+   ever seats as secondary. This is the recommended path.
+2. **On a live cluster: commit on the PRIMARY while sync is connected.** The
+   established connection carries the key to the secondary. This works only
+   because committing the key does not restart cluster comms — the auth key is
+   deliberately absent from `clusterTransportKey`, pinned by
+   `TestAuthKeyChangeDoesNotRestartClusterComms_5078`. Do not add it there; see
+   that test for why it would create a permanent deadlock.
+
+**Recovery, UNVERIFIED.** If a cluster does end up keyed-primary /
+unkeyed-secondary, the reasoned path is: remove the key on the primary → the
+peer reconnects unkeyed → config-sync pushes → re-add the key. This is derived
+from the read-only gate and the fail-closed decision, **not executed on a
+cluster**. Treat it as a hypothesis until someone runs it; do not rely on it in
+a maintenance window without testing it first.
 
 ## Control-channel authentication (#4107, PR-A)
 

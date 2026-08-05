@@ -925,6 +925,47 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #5078 PR1 r3: my rollout correction was ALSO wrong; guard the transport key
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Second correction on the same point, and this one was caught by
+  another lane with runnable proof rather than by me.
+  r2 removed the migration window on the reasoning that "the operator commits
+  `authentication-key` locally on each node", so the rollout gap is an outage
+  rather than a deadlock. **A seated RG0 secondary cannot be configured locally
+  at all.** Verified: `Daemon.applyHAState` calls `store.SetClusterReadOnly(true)`
+  on StateSecondary/StateSecondaryHold (`pkg/daemon/daemon_ha.go:474`), and
+  `EnterConfigureSession` returns `ErrClusterReadOnly` before doing anything
+  else (`pkg/configstore/store_lock.go:26`). Not "the local commit is
+  overwritten" — config mode cannot be opened. `TestClusterReadOnly_
+  SyncApplyBypassesGate` pins the other half: HA-sync ingress bypasses the gate,
+  so config-sync is the secondary's ONLY writer.
+  So `pkg/cluster/README.md` and the `syncAuthDecision` comment documented a
+  procedure an operator physically cannot perform. Both rewritten with the
+  procedures that ARE performable — key at provisioning before the cluster
+  forms, or commit on the PRIMARY while sync is connected — and the recovery
+  path (remove key on primary → peer reconnects unkeyed → push → re-add) is
+  marked **UNVERIFIED**, because it is reasoned from the read-only gate and has
+  not been executed on a cluster. Two confident procedures have already been
+  wrong here; a third unlabelled one would be worse than none.
+  **New MAJOR, created by removing the window.** The live-cluster path works
+  ONLY because `clusterTransportKey` (`daemon_ha_sync.go:1421`) carries six
+  endpoint fields and NO auth key, so committing the key does not restart
+  cluster comms and the established connection survives to carry it across.
+  `grep clusterTransportKey --include=*_test.go` returned NOTHING. A future edit
+  adding `ControlLinkAuthKey` there looks obviously correct and would convert
+  every key rollout into a permanent deadlock with a green suite — and before
+  this PR the window was the fallback, so this PR is what makes it load-bearing.
+  Added `TestAuthKeyChangeDoesNotRestartClusterComms_5078`.
+- **Validation**: mutation — add `ControlLinkAuthKey` to `clusterTransportKey`
+  and populate it in `clusterTransportFromConfig`; build+vet rc=0 first, then
+  the test FAILs on the unkeyed-vs-keyed comparison. Restored from snapshot,
+  `sha256sum -c` verified. The test carries a POSITIVE CONTROL (an endpoint
+  change must still change the key) so the equality assertion cannot pass
+  vacuously. `go test ./pkg/cluster/ ./pkg/daemon/` exit 0.
+- **File(s)**: `pkg/daemon/cluster_transport_key_5078_test.go` (new),
+  `pkg/cluster/README.md`, `pkg/cluster/sync_auth.go`, `_Log.md`
+
 ## 2026-08-05 — #5078 PR1 r2: remove the migration window; the pre-admission path becomes unreachable and is deleted
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
