@@ -174,10 +174,36 @@ mutation):**
   removal, forwarding enable, and ownership release all happen ONLY after this final
   proof. The reapply/rebind must RETURN proof-or-failure, not record retry debt.
 
+**CORRECTION (2026-08-05, from #5275 PR1 — re-verified against origin/master
+`ad9591177`, 472 commits after this plan's base): coverage is THREE-valued, not a
+native/generic binary.** The wording below reads as "native or generic", and
+implemented that way the proof FAILS on every VLAN sub-interface: under the
+userspace shim a VLAN child is deliberately NEVER attached (both attach loops skip
+it — loader.go, and compiler.go's `isUserspaceShim` branch — and it is recorded in
+`Manager.VlanSubInterfaces`), because the PARENT's XDP sees VLAN-tagged frames
+before kernel VLAN demuxing and attaching the child breaks IPv6 NDP under
+generic-mode `XDP_PASS`. Policy IS enforced for those interfaces, at a different
+attach point. The loss cluster runs `reth0.50`/`reth0.80` and the standalone VM runs
+VLAN 50, so the binary reading fail-closes essentially every real deployment, on a
+boot path. Skipping VLAN children instead is equally wrong — it passes a surface
+whose coverage was never checked. A required surface therefore resolves to:
+
+  - **direct** — a shim instance is attached here. NATIVE and GENERIC (skb-mode)
+    BOTH count. `attachUserspaceShimXDP` treats a native failure as a warning and
+    re-attaches generic, iavf SR-IOV VFs have no native XDP at all, and a generic
+    shim still steers to userspace-dp and still enforces policy. #5275 prevents a
+    POLICY-FREE kernel; a fallback box is not policy-free.
+  - **delegated** — no attach expected here by design; coverage is the PARENT's and
+    MUST be resolved (the parent's own instance verified), never assumed.
+  - **uncovered** — anything else, including a failed readback. Unarmed.
+
+Implementation + rationale: `pkg/dataplane/armproof.go`; both decisions pinned in
+`pkg/dataplane/armproof_5275_test.go`. Read the corrected version below.
+
 **Coverage proof ingredients are PER-STAGE (§13-D1; readback-fail ⇒ unarmed) —
 NOT identical across both stages:** the PRELIMINARY stage proves only the attach-point
 INVENTORY + strict program INSTANCE identity (ID/tag) on every mapped attach point
-(native or generic) — because ready XSK bindings do not exist yet on the
+(direct, or — for a delegated surface — its delegate) — because ready XSK bindings do not exist yet on the
 deferred-worker path; the FINAL stage (after the last rebind/reapply) adds the exact
 candidate config digest + reconciled helper snapshot generation + ALL registered/
 armed/ready XSK bindings. Neither stage uses the global `ProbeForwardingArmed`
