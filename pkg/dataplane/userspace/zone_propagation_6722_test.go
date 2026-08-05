@@ -6,35 +6,65 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// #6722: pin the two Go-side facts the Rust egress-zone resolver's design rests
-// on. `ForwardingState::egress_zone_id` (userspace-dp/src/afxdp/types/forwarding.rs)
-// falls back to `ifindex_to_zone_id` for an interface with no `egress` row — a
-// MAC-less xfrmi — and the userspace-dp fixtures that exercise that path
-// (`sibling_tunnel_units_snapshot_6722`, `secure_tunnel_snapshot_6713` in
-// userspace-dp/src/afxdp/forwarding/tests.rs) hand-build ConfigSnapshot rows.
+// #6722: pin the Go-side facts the Rust egress-zone resolver's design rests on.
+// `ForwardingState::egress_zone_id` (userspace-dp/src/afxdp/types/forwarding.rs)
+// falls back for an interface with no `egress` row — a MAC-less xfrmi — and the
+// userspace-dp fixtures that exercise that path
+// (`sibling_tunnel_units_snapshot_6722` and its siblings in
+// userspace-dp/src/afxdp/test_fixtures.rs) hand-build ConfigSnapshot rows.
 // A hand-built row can model a snapshot this builder never emits, and a fixture
 // the builder cannot produce is not evidence — that is exactly how #6722's
 // first two rounds went wrong.
 //
-// The two facts:
+// The facts:
 //
 //  1. A unit-suffixed zone reference zones the BASE interface too
 //     (buildInterfaceZoneMap). Zoning st0.1 zones st0.
 //  2. A non-VLAN unit 0 COLLAPSES onto the base netdev (snapshotLinuxName), so
 //     the base row and the unit-0 row carry ONE ifindex.
+//  3. The StableZoneID quarantine runs AFTER buildInterfaceSnapshots and BLANKS
+//     Zone on every row bound to a quarantined zone, so a base whose zone lost a
+//     collision arrives UNZONED beside a surviving zoned child.
 //
-// Together they mean a MAC-less unit 0 sharing a base ifindex with a zoned
-// sibling adjudicates under that zone — the behaviour #6722 documents. They
-// also mean the Rust child→parent zone propagation in `populate_interfaces` is
-// unreachable for a snapshot produced here: a zoned unit's parent row always
-// arrives already carrying a zone of its own.
+// Facts 1 + 2 mean an ifindex is not a unit identity: a MAC-less unit 0 shares
+// its base's ifindex with a differently-zoned sibling. That is why the egress
+// half reads `ifindex_unambiguous_zone_id` — an ifindex whose rows DISAGREE
+// resolves the 0 sentinel rather than inheriting a zone the operator never
+// configured on it.
+//
+// Fact 3 is why the Rust child→parent zone propagation in `populate_interfaces`
+// is REACHABLE for a snapshot produced here. An earlier round of this file
+// claimed the opposite — that a zoned unit's parent row always arrives already
+// carrying a zone of its own — and TestQuarantineUnzonesTheBaseRow_6722 below is
+// the counterexample, built through the full buildSnapshot rather than through
+// buildInterfaceSnapshots alone (which is precisely what let the claim stand).
 //
 // FAIL-ON-REVERT: drop the `out[base] = zoneName` write in
 // buildInterfaceZoneMap (zones.go) — a plausible move toward Junos per-unit
 // zoning — and case A goes RED on the base row's zone. That is the signal to
 // revisit the Rust-side reasoning, not to re-point this test.
 
-func buildSnapshotsFromSet6722(t *testing.T, lines []string, ifindexOf map[string]int, macOf map[string]string) (map[string]string, []InterfaceSnapshot) {
+// compileWithStubbedLinks6722 installs the buildLinkSnapshot stub for the
+// duration of the test and compiles `lines` into a config. An interface absent
+// from ifindexOf resolves to ifindex 0 / empty MAC, exactly as an unresolvable
+// link does on the real path — which is why the callers pin the EXPECTED
+// ifindex rather than comparing two rows to each other.
+func treeFromSet6722(t *testing.T, lines []string) *config.ConfigTree {
+	t.Helper()
+	tree := &config.ConfigTree{}
+	for _, cmd := range lines {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	return tree
+}
+
+func compileWithStubbedLinks6722(t *testing.T, lines []string, ifindexOf map[string]int, macOf map[string]string, lenient bool) *config.Config {
 	t.Helper()
 	prev := buildLinkSnapshot
 	t.Cleanup(func() { buildLinkSnapshot = prev })
@@ -46,20 +76,23 @@ func buildSnapshotsFromSet6722(t *testing.T, lines []string, ifindexOf map[strin
 		return idx, 1500, macOf[linuxName], nil
 	}
 
-	tree := &config.ConfigTree{}
-	for _, cmd := range lines {
-		path, err := config.ParseSetCommand(cmd)
-		if err != nil {
-			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
-		}
-		if err := tree.SetPath(path); err != nil {
-			t.Fatalf("SetPath(%q): %v", cmd, err)
-		}
+	tree := treeFromSet6722(t, lines)
+	compile := config.CompileConfig
+	name := "CompileConfig"
+	if lenient {
+		compile = config.CompileConfigLenient
+		name = "CompileConfigLenient"
 	}
-	cfg, err := config.CompileConfig(tree)
+	cfg, err := compile(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("%s: %v", name, err)
 	}
+	return cfg
+}
+
+func buildSnapshotsFromSet6722(t *testing.T, lines []string, ifindexOf map[string]int, macOf map[string]string) (map[string]string, []InterfaceSnapshot) {
+	t.Helper()
+	cfg := compileWithStubbedLinks6722(t, lines, ifindexOf, macOf, false)
 	return buildInterfaceZoneMap(cfg), buildInterfaceSnapshots(cfg)
 }
 
@@ -94,26 +127,47 @@ func TestSiblingTunnelUnitsZoneTheBaseRow_6722(t *testing.T) {
 	base := snapByName6722(t, snaps, "st0")
 	unit0 := snapByName6722(t, snaps, "st0.0")
 	unit1 := snapByName6722(t, snaps, "st0.1")
+	lan := snapByName6722(t, snaps, "ge-0/0/1.0")
 
 	if base.Zone != "vpnb" {
 		t.Errorf("st0 base row Zone = %q, want %q: the userspace-dp fixture models "+
-			"this row as zoned, and a MAC-less unit 0 sharing its ifindex resolves "+
-			"its zone", base.Zone, "vpnb")
+			"this row as zoned, and it is what makes unit 0's shared ifindex "+
+			"AMBIGUOUS", base.Zone, "vpnb")
 	}
-	if unit0.Ifindex != base.Ifindex {
-		t.Errorf("st0.0 ifindex %d != st0 base ifindex %d: a non-VLAN unit 0 must "+
-			"collapse onto the base netdev", unit0.Ifindex, base.Ifindex)
+	// Pin the ifindexes to the values the stub was primed with, not merely to
+	// each other. `buildLinkSnapshot` returns 0 for a link it does not know, so
+	// a bare `unit0.Ifindex != base.Ifindex` check passes as 0 == 0 for a
+	// snapshot in which NEITHER row resolved — the failure default. The Rust
+	// fixtures use 42 for the shared ifindex and 43 for st0.1.
+	if base.Ifindex != 42 {
+		t.Errorf("st0 base ifindex = %d, want 42 (the value the buildLinkSnapshot "+
+			"stub was primed with): 0 here means the row resolved no link at all",
+			base.Ifindex)
+	}
+	if unit0.Ifindex != 42 {
+		t.Errorf("st0.0 ifindex = %d, want 42 == the base ifindex: a non-VLAN unit 0 "+
+			"must collapse onto the base netdev", unit0.Ifindex)
 	}
 	if unit0.Zone != "" {
 		t.Errorf("st0.0 Zone = %q, want empty: the operator referenced only st0.1, "+
-			"so unit 0 gets no direct entry", unit0.Zone)
+			"so unit 0 gets no direct entry — that DISAGREEMENT with the base row "+
+			"on one ifindex is what the Rust ambiguity gate keys on", unit0.Zone)
 	}
-	if unit1.Ifindex == base.Ifindex {
-		t.Errorf("st0.1 ifindex %d must NOT collapse onto the base (%d): "+
-			"bind-interface st0.1 is its own xfrmi netdev", unit1.Ifindex, base.Ifindex)
+	if unit1.Ifindex != 43 {
+		t.Errorf("st0.1 ifindex = %d, want 43 and NOT the base's 42: "+
+			"bind-interface st0.1 is its own xfrmi netdev", unit1.Ifindex)
 	}
 	if unit1.Zone != "vpnb" {
 		t.Errorf("st0.1 Zone = %q, want %q", unit1.Zone, "vpnb")
+	}
+	// POSITIVE CONTROL for the MAC assertions below. An empty HardwareAddr is
+	// also what the stub returns for a link it cannot resolve, so "the xfrmi
+	// rows are MAC-less" is only evidence once some row in the SAME snapshot,
+	// through the SAME stub, carries a non-empty MAC.
+	if lan.HardwareAddr != "02:bf:72:01:00:01" {
+		t.Fatalf("control: ge-0/0/1.0 HardwareAddr = %q, want %q — the MAC never "+
+			"reached the snapshot, so the empty xfrmi MACs below prove nothing",
+			lan.HardwareAddr, "02:bf:72:01:00:01")
 	}
 	if base.HardwareAddr != "" || unit0.HardwareAddr != "" || unit1.HardwareAddr != "" {
 		t.Errorf("the xfrmi rows must be MAC-less (ARPHRD_NONE) — that is what denies "+
@@ -147,18 +201,24 @@ func TestZonedTrunkEmitsUnzonedUnit0OnTheSharedIfindex_6722(t *testing.T) {
 	if unit0.Zone != "" {
 		t.Errorf("ge-0/0/9.0 Zone = %q, want empty", unit0.Zone)
 	}
-	if unit0.Ifindex != base.Ifindex {
-		t.Errorf("ge-0/0/9.0 ifindex %d != base %d: unit 0 must collapse onto the "+
-			"base netdev, which is what makes populate_egress overwrite the base "+
-			"row's zone_id with 0", unit0.Ifindex, base.Ifindex)
+	// Pinned to the primed values, not merely to each other: an unresolved link
+	// yields ifindex 0 from the stub, so `unit0.Ifindex != base.Ifindex` alone
+	// passes as 0 == 0 on a snapshot where nothing resolved.
+	if base.Ifindex != 90 {
+		t.Errorf("ge-0/0/9 base ifindex = %d, want 90 (the primed value)", base.Ifindex)
+	}
+	if unit0.Ifindex != 90 {
+		t.Errorf("ge-0/0/9.0 ifindex = %d, want 90 == base: unit 0 must collapse onto "+
+			"the base netdev, which is what makes populate_egress overwrite the base "+
+			"row's zone_id with 0", unit0.Ifindex)
 	}
 	if base.HardwareAddr == "" || unit0.HardwareAddr == "" {
 		t.Errorf("both rows on the shared ifindex must be MAC-ful so BOTH reach "+
 			"populate_egress: base=%q unit0=%q", base.HardwareAddr, unit0.HardwareAddr)
 	}
-	if unit100.Ifindex == base.Ifindex {
-		t.Errorf("the tagged unit must have its own ifindex, got %d == base %d",
-			unit100.Ifindex, base.Ifindex)
+	if unit100.Ifindex != 91 {
+		t.Errorf("the tagged unit must have its OWN ifindex, want the primed 91, got "+
+			"%d (base is %d)", unit100.Ifindex, base.Ifindex)
 	}
 	if unit100.Zone != "lan" {
 		t.Errorf("ge-0/0/9.100 Zone = %q, want %q", unit100.Zone, "lan")
@@ -179,5 +239,117 @@ func TestZonedTrunkEmitsUnzonedUnit0OnTheSharedIfindex_6722(t *testing.T) {
 		t.Errorf("emission order base=%d unit0=%d: the unit-0 row must follow its "+
 			"base row for populate_egress's last-write-wins to leave zone_id 0 on "+
 			"the shared ifindex", baseIdx, unit0Idx)
+	}
+}
+
+// C: the StableZoneID QUARANTINE shape, measured through the FULL buildSnapshot
+// rather than through buildInterfaceSnapshots alone. Mirrors
+// `quarantined_base_tunnel_snapshot_6722` in
+// userspace-dp/src/afxdp/test_fixtures.rs.
+//
+// quarantineCollidingZones runs AFTER buildInterfaceSnapshots (builder.go) and
+// blanks Zone on every row bound to the quarantined zone, expressly so those
+// interfaces fail CLOSED. Case A alone cannot see this: it stops at
+// buildInterfaceSnapshots, which is exactly why an earlier round could claim
+// the Rust child->parent zone propagation was unreachable for a Go-produced
+// snapshot. It is not — this test emits the counterexample.
+//
+// Zone names are chosen for their SORT order, which drives two independent
+// mechanisms:
+//   - z174/z214 collide on one StableZoneID and the later-sorting name (z214)
+//     is the one quarantined;
+//   - buildInterfaceZoneMap's out[base] write is first-write-wins over sorted
+//     zone names, and z214 sorts before zzzz, so the doomed zone is the one
+//     that lands on the st0 BASE row.
+//
+// Result: base + unit 0 arrive UNZONED beside a surviving zoned st0.1. In Rust,
+// populate_interfaces then propagates st0.1's zone onto the base ifindex, and
+// egress_zone_id must NOT read that — handing the quarantine's deliberate
+// default-deny back the survivor's zone is the fail-open the quarantine exists
+// to prevent.
+func TestQuarantineUnzonesTheBaseRow_6722(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	lines := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.61.1/24",
+		"set interfaces st0 unit 0 family inet address 10.5.5.1/30",
+		"set interfaces st0 unit 1 family inet address 10.6.6.1/30",
+		"set security zones security-zone lan interfaces ge-0/0/1.0",
+		"set security zones security-zone z174 host-inbound-traffic system-services ping",
+		"set security zones security-zone z214 interfaces st0.0",
+		"set security zones security-zone zzzz interfaces st0.1",
+		"set security policies default-policy deny-all",
+	}
+	// The quarantine can only ever see a colliding config on the LENIENT path.
+	// The strict compiler — the interactive `commit` gate — rejects the pair
+	// outright (#3075), which is why the shape below is reachable on boot, HA
+	// peer-sync and pre-#3075-persisted loads and nowhere else. Pinning the
+	// rejection here keeps the lenient compile from silently becoming the only
+	// path anyone tests.
+	if _, err := config.CompileConfig(treeFromSet6722(t, lines)); err == nil {
+		t.Fatalf("strict CompileConfig accepted the z174/z214 collision: the " +
+			"commit-time gate is gone and this test no longer describes the only " +
+			"way a colliding snapshot reaches the quarantine")
+	}
+	cfg := compileWithStubbedLinks6722(t, lines,
+		map[string]int{"ge-0-0-1": 24, "st0": 42, "st0.1": 43},
+		map[string]string{"ge-0-0-1": "02:bf:72:01:00:01"}, true)
+
+	// PRE-quarantine: the doomed zone is on the base row. Without this the test
+	// could pass on a config where z214 never reached st0 at all, and the
+	// post-quarantine empty Zone would be the failure default, not a scrub.
+	if got := buildInterfaceZoneMap(cfg)["st0"]; got != "z214" {
+		t.Fatalf("pre-quarantine buildInterfaceZoneMap[st0] = %q, want %q: the "+
+			"first-write-wins out[base] race must be won by the zone that is "+
+			"about to be quarantined, or this test measures nothing", got, "z214")
+	}
+
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if len(snap.zoneIDCollisions) == 0 {
+		t.Fatalf("no collision reported: the quarantine pass did not fire, so the "+
+			"rows below were never scrubbed (zones=%d)", len(snap.Zones))
+	}
+
+	base := snapByName6722(t, snap.Interfaces, "st0")
+	unit0 := snapByName6722(t, snap.Interfaces, "st0.0")
+	unit1 := snapByName6722(t, snap.Interfaces, "st0.1")
+
+	if base.Zone != "" {
+		t.Errorf("post-quarantine st0 base Zone = %q, want empty: the quarantine "+
+			"must strip the colliding zone off the base row", base.Zone)
+	}
+	if unit0.Zone != "" {
+		t.Errorf("post-quarantine st0.0 Zone = %q, want empty", unit0.Zone)
+	}
+	if unit1.Zone != "zzzz" {
+		t.Fatalf("post-quarantine st0.1 Zone = %q, want %q: the SURVIVING sibling "+
+			"must keep its zone, otherwise nothing is left to propagate and the "+
+			"Rust-side counterexample does not exist", unit1.Zone, "zzzz")
+	}
+	if base.Ifindex != 42 || unit0.Ifindex != 42 {
+		t.Errorf("st0 base / st0.0 ifindexes = %d / %d, want 42 each: the unzoned "+
+			"base and unit 0 must share ONE ifindex with no zone of their own",
+			base.Ifindex, unit0.Ifindex)
+	}
+	if unit1.Ifindex != 43 {
+		t.Errorf("st0.1 ifindex = %d, want 43 (its own netdev)", unit1.Ifindex)
+	}
+	// The zone that survives must still be published, or the Rust side would
+	// resolve it to InterfaceUnknownZone rather than propagating it.
+	surviving := false
+	for _, z := range snap.Zones {
+		if z.Name == "zzzz" {
+			surviving = true
+		}
+		if z.Name == "z214" {
+			t.Errorf("quarantined zone z214 is still published with id %d", z.ID)
+		}
+	}
+	if !surviving {
+		t.Errorf("surviving zone zzzz missing from the published zone set")
 	}
 }
