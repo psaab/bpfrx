@@ -66278,3 +66278,15 @@ break — `go vet` confirmed passing under every revert.
   rejected every commit. Also corrected four comment/doc claims that still
   described pre-PR behaviour.
   **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_opts.go, pkg/config/compiler_system.go, pkg/config/compiler_tailgates.go, pkg/config/schema_system.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
+- **Timestamp**: 2026-08-05
+  **Action**: #6838 review fold r2 — the repair floor retains {view,configure},
+  so a deny AIMED AT A RETAINED BUCKET is unenforceable AND unrestricted, but
+  the warning carved out CONFIGURATION only. `deny-commands "show interfaces"`
+  targets PermView, also retained, and was silently described as restricted.
+  The warning is now generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim cannot be wider than the
+  behaviour, and states plainly that the fold reduces blast radius rather than
+  enforcing anything. Also converted permission expectations to rendered
+  strings — `PermView` is the iota ZERO value, so slice expectations could be
+  satisfied by an uninitialised element.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md

@@ -8774,10 +8774,15 @@ blocking the whole config. This is accept-with-advisory now:
   `deny-commands ""` and a valueless `deny-commands` are caught too — an empty
   POSIX regex denies *everything*). On the tolerant load / peer-sync path
   (#1960 no-brick) `foldLoginClassDenyToRepairableFloor` **folds** the class to
-  `{view, configure} ∩ what it already held` and warns: every operational-verb
-  bucket the deny could target is dropped, `configure` is retained so the
-  statement can still be deleted from the box. Full per-command deny
-  enforcement is a follow-up on #5831.
+  `{view, configure} ∩ what it already held` and warns. That is a blast-radius
+  reduction, **not** enforcement: `clear` / `control` / `maintenance` / `all`
+  are dropped, but the two RETAINED buckets are levels at which the statement
+  does nothing — `deny-configuration` targets `configure`, and a
+  `deny-commands` naming `show` / `ping` / `traceroute` / `monitor` targets
+  `view`. Both are retained because they are what an operator needs to delete
+  the statement. The warning is generated FROM the retained set
+  (`loginClassDenyFoldWarning`) so the claim can never be wider than the
+  behaviour. Full per-command deny enforcement is a follow-up on #5831.
 - **runtime** — `pkg/cli/permissions.go` `resolveClassPerms` consults the
   built-ins first, then `store.ActiveConfig().System.Login.Classes`, so a
   custom-class user is enforced against the mapped permissions instead of

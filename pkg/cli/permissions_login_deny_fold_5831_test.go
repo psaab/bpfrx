@@ -115,6 +115,71 @@ func TestFoldedLoginClassCanStillReachConfigure(t *testing.T) {
 	}
 }
 
+// TestFoldedLoginClassDenyOnRetainedBucketIsANoOp documents the fold's LIMIT as
+// a tested property rather than a comment (#6838 review).
+//
+// The floor retains {view, configure}. Both are reachable deny targets:
+// `deny-configuration` aims at PermConfig, and a `deny-commands` naming
+// `show`/`ping`/`traceroute`/`monitor` aims at PermView. A deny aimed at either
+// is a COMPLETE no-op — the fold drops nothing that would stop it, and the
+// coarse gate never reads the regex.
+//
+// This test asserts that no-op deliberately. It is not endorsing the gap: it
+// pins the honest statement the warning now makes, so that if someone later
+// believes they have closed it, this test forces them to prove it here rather
+// than in prose. The real enforcement is validateLoginClassDenyStrict refusing
+// the commit; per-command RBAC stays on #5831.
+func TestFoldedLoginClassDenyOnRetainedBucketIsANoOp(t *testing.T) {
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	const synced = `
+system {
+    login {
+        class noc-admin {
+            permissions [ view configure ];
+            deny-commands "show interfaces";
+        }
+        user root {
+            class noc-admin;
+        }
+    }
+}
+`
+	if _, err := store.SyncApply(synced, nil); err != nil {
+		t.Fatalf("tolerant peer-sync must not reject a previously-accepted config: %v", err)
+	}
+	cfg := store.ActiveConfig()
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) != 1 ||
+		len(cfg.System.Login.Classes[0].DenyLeavesPresent) == 0 {
+		t.Fatalf("precondition: the fold never ran; cfg=%+v", cfg)
+	}
+
+	c := &CLI{store: store, userClass: "noc-admin"}
+
+	// The denied command itself. PermView is retained, so it runs.
+	if err := c.checkPermission([]string{"show", "interfaces"}); err != nil {
+		t.Fatalf("`show interfaces` denied after the fold (%v) — if this now fails, the "+
+			"fold has started enforcing view-level denies and the operator warning "+
+			"(loginClassDenyFoldWarning) must stop saying those levels are unrestricted", err)
+	}
+	// And the rest of the retained view bucket, so the claim is about the
+	// LEVEL, not one lucky command string.
+	for _, parts := range [][]string{{"ping", "10.0.0.1"}, {"traceroute", "10.0.0.1"}, {"monitor", "interface"}} {
+		if err := c.checkPermission(parts); err != nil {
+			t.Errorf("%q denied after the fold: %v — the warning claims the whole view "+
+				"level is unrestricted", strings.Join(parts, " "), err)
+		}
+	}
+	// `configure` likewise — the other retained bucket, and the repair channel.
+	if err := c.checkPermission([]string{"configure"}); err != nil {
+		t.Errorf("`configure` denied after the fold: %v", err)
+	}
+	// The control: a bucket the fold DROPS really is gone, so this class is not
+	// simply unfolded.
+	if err := c.checkPermission([]string{"request", "system", "zeroize"}); err == nil {
+		t.Error("`request system zeroize` ALLOWED — the fold dropped nothing at all")
+	}
+}
+
 // TestFoldedLoginClassBelowFloorIsNotRaised is the negative control for the
 // test above: the repair floor is an intersection, not a grant. A class that
 // never held `configure` must not be handed it by the fold — otherwise the

@@ -178,11 +178,22 @@ dropped. So the motivating example above (`permissions all` + `deny-commands
 "request system zeroize"`) really does lose the ability to zeroize.
 
 > [!WARNING]
-> **This fold does not enforce `deny-configuration` at all.** xpf's coarse
-> model has exactly two configuration states — all or none — and "none" is the
-> state that strands repair, so the tolerant path keeps "all". A class carrying
-> `deny-configuration` can still edit the configuration it names until the
-> statement is removed. The strict gate is what forces the removal.
+> **The fold reduces blast radius; it does not enforce the statement.** A
+> RETAINED bucket is a bucket where the deny does nothing, and the floor
+> retains two of them:
+>
+> - `configure` — so `deny-configuration <anything>` is a complete no-op. xpf's
+>   coarse model has only two configuration states, all or none, and "none" is
+>   the state that strands repair, so the tolerant path keeps "all".
+> - `view` — which gates `show`, `ping`, `traceroute` and `monitor`, so a
+>   `deny-commands` naming any of those (e.g. `deny-commands "show interfaces"`)
+>   is *equally* a complete no-op.
+>
+> Only denies aimed at `clear`, `control` or `maintenance` are actually stopped,
+> and then bluntly — the whole bucket goes, not the named command. **The
+> enforcement that exists is the strict gate refusing every commit** until the
+> statement is removed. The per-class warning names the retained set explicitly
+> so you can see which levels are unrestricted on your box.
 
 **Why not fold to view-only.** It would strand the box. `pkg/daemon`
 assigns the *configured* class to any OS user whose name matches a `system

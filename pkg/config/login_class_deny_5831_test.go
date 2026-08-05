@@ -227,42 +227,50 @@ func TestLoginClassDenyToleratedButFolded(t *testing.T) {
 // edge that keeps the repair floor from becoming a floor for classes that were
 // never above it.
 func TestLoginClassDenyFoldNeverWidens(t *testing.T) {
+	// NOTE on how these assert (#6838 review). `PermView` is the `iota` ZERO
+	// value (types_system.go), so an expectation written as `got[0] != PermView`
+	// is satisfied by an uninitialised element — a fold that returned a
+	// zero-filled slice would pass while producing nonsense. Every expectation
+	// below is therefore the RENDERED set (describePerms, the same function the
+	// operator warning uses), which is a non-default value: a spurious zero
+	// shows up as a duplicate "view" and fails the comparison. This also binds
+	// the rendering the warning depends on.
 	t.Run("empty permission set stays empty", func(t *testing.T) {
-		if got := repairableFloorFold(nil); len(got) != 0 {
-			t.Fatalf("fold GRANTED %v to a class that had no permissions at all", got)
-		}
-		if got := repairableFloorFold([]LoginClassPermission{}); len(got) != 0 {
-			t.Fatalf("fold GRANTED %v to a class that had no permissions at all", got)
+		for _, in := range [][]LoginClassPermission{nil, {}} {
+			if got := describePerms(repairableFloorFold(in)); got != "no permissions at all" {
+				t.Fatalf("fold GRANTED %s to a class that had no permissions at all", got)
+			}
 		}
 	})
 	t.Run("a set below the floor is not raised to it", func(t *testing.T) {
 		// clear/control/maintenance only: the class never held view or
 		// configure, so the fold must hand back neither. A literal-return fold
 		// would GRANT both.
-		got := repairableFloorFold([]LoginClassPermission{PermClear, PermControl, PermMaint})
-		if len(got) != 0 {
-			t.Fatalf("fold GRANTED %v to a class holding neither view nor configure", got)
+		got := describePerms(repairableFloorFold([]LoginClassPermission{PermClear, PermControl, PermMaint}))
+		if got != "no permissions at all" {
+			t.Fatalf("fold GRANTED %s to a class holding neither view nor configure", got)
 		}
 	})
 	t.Run("view without configure stays view-only", func(t *testing.T) {
-		got := repairableFloorFold([]LoginClassPermission{PermView, PermClear})
-		if len(got) != 1 || got[0] != PermView {
-			t.Fatalf("fold GRANTED configure to a view+clear class; got %v", got)
+		got := describePerms(repairableFloorFold([]LoginClassPermission{PermView, PermClear}))
+		if got != "{view}" {
+			t.Fatalf("expected {view}; got %s (a widening if it names configure)", got)
 		}
 	})
 	t.Run("PermAll reduces to the floor", func(t *testing.T) {
 		// PermAll subsumes both floor buckets (checkPermission returns nil on
 		// PermAll for every required permission), so all -> {view,configure} is
 		// a strict reduction, not a widening.
-		got := repairableFloorFold([]LoginClassPermission{PermAll})
-		if len(got) != 2 || got[0] != PermView || got[1] != PermConfig {
-			t.Fatalf("all should reduce to {view,configure}; got %v", got)
+		got := describePerms(repairableFloorFold([]LoginClassPermission{PermAll}))
+		if got != "{configure,view}" {
+			t.Fatalf("all should reduce to {configure,view}; got %s", got)
 		}
 	})
 	t.Run("everything above the floor is dropped", func(t *testing.T) {
-		got := repairableFloorFold([]LoginClassPermission{PermView, PermClear, PermControl, PermConfig, PermMaint})
-		if len(got) != 2 || got[0] != PermView || got[1] != PermConfig {
-			t.Fatalf("expected {view,configure}; got %v", got)
+		got := describePerms(repairableFloorFold(
+			[]LoginClassPermission{PermView, PermClear, PermControl, PermConfig, PermMaint}))
+		if got != "{configure,view}" {
+			t.Fatalf("expected {configure,view}; got %s", got)
 		}
 	})
 
@@ -308,10 +316,14 @@ func TestLoginClassDenyFoldNeverWidens(t *testing.T) {
 // Removing ALL configure is more restrictive than they asked for, in the one
 // direction that is unrecoverable.
 func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
+	// Expectations are the RENDERED set (describePerms), not raw slices:
+	// `PermView` is the iota zero value, so a slice expectation whose first
+	// element is PermView can be satisfied by an uninitialised element
+	// (#6838 review). The rendered form is non-default.
 	for _, tc := range []struct {
 		name  string
 		lines []string
-		want  []LoginClassPermission
+		want  string
 	}{
 		{
 			// The reviewer's example, verbatim.
@@ -321,7 +333,7 @@ func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
 				`set system login class noc-admin deny-configuration "security policies"`,
 				"set system login user root class noc-admin",
 			},
-			want: []LoginClassPermission{PermView, PermConfig},
+			want: "{configure,view}",
 		},
 		{
 			// A configure-only class folds to the EMPTY set under a view-only
@@ -333,7 +345,7 @@ func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
 				`set system login class cfg-only deny-configuration "security policies"`,
 				"set system login user root class cfg-only",
 			},
-			want: []LoginClassPermission{PermConfig},
+			want: "{configure}",
 		},
 		{
 			// `permissions all` keeps the repair floor too — and only that.
@@ -343,7 +355,7 @@ func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
 				`set system login class su-ish deny-commands "request system zeroize"`,
 				"set system login user root class su-ish",
 			},
-			want: []LoginClassPermission{PermView, PermConfig},
+			want: "{configure,view}",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,53 +393,134 @@ func TestLoginClassDenyFoldKeepsTheRepairPath(t *testing.T) {
 					"until the statement is deleted — there is no in-band way to delete it",
 					lc.Name, lc.MappedPermissions)
 			}
-			if len(lc.MappedPermissions) != len(tc.want) {
-				t.Fatalf("expected %v; got %v", tc.want, lc.MappedPermissions)
-			}
-			for i, p := range tc.want {
-				if lc.MappedPermissions[i] != p {
-					t.Fatalf("expected %v; got %v", tc.want, lc.MappedPermissions)
-				}
+			if got := describePerms(lc.MappedPermissions); got != tc.want {
+				t.Fatalf("expected %s; got %s", tc.want, got)
 			}
 		})
 	}
 }
 
-// TestLoginClassDenyFoldWarningStatesTheRecoveryPath pins the operator-facing
-// text. The fold deliberately leaves `deny-configuration` UNENFORCED (xpf's
-// coarse model has only all-or-nothing configuration, and "nothing" strands
-// repair), so the warning must not imply the restriction is now in force, and
-// it must name the way out. A warning that only says "folded" would leave an
-// operator believing the deny took effect.
-func TestLoginClassDenyFoldWarningStatesTheRecoveryPath(t *testing.T) {
-	cfg, err := CompileConfigLenient(buildLoginTree5831(t, []string{
-		"set system login class noc-admin permissions [ view configure ]",
-		`set system login class noc-admin deny-configuration "security policies"`,
-		"set system login user root class noc-admin",
-	}))
-	if err != nil {
-		t.Fatalf("lenient compile: %v", err)
-	}
-	var w string
-	for _, cand := range cfg.Warnings {
-		if strings.Contains(cand, "noc-admin") && strings.Contains(cand, "deny-configuration") {
-			w = cand
-		}
-	}
-	if w == "" {
-		t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
-	}
-	// The post-fold set, so the operator can see what the class actually holds.
-	if !strings.Contains(w, "configure") {
-		t.Fatalf("warning does not name the retained `configure` permission: %q", w)
-	}
-	// The honest limit: the restriction is still not in force for config.
-	if !strings.Contains(w, "NOT in force") {
-		t.Fatalf("warning implies the restriction took effect; it did not for configuration: %q", w)
-	}
-	// The forcing function, so the operator knows repair is mandatory.
-	if !strings.Contains(w, "every commit is rejected") {
-		t.Fatalf("warning does not tell the operator that commits stay blocked until repair: %q", w)
+// TestLoginClassDenyFoldWarningIsTrueForEveryDenyShape pins the operator-facing
+// text against the #6838 review finding.
+//
+// The floor retains {view, configure}. A deny AIMED AT A RETAINED BUCKET is
+// therefore a complete no-op — and both retained buckets are reachable targets:
+// `deny-configuration` targets PermConfig, and `deny-commands "show ..."` /
+// `"ping ..."` / `"monitor ..."` target PermView (requiredPermission). The
+// first revision of this warning carved out CONFIGURATION only, so the
+// view-level shape was described as restricted when it was not — the claim was
+// broader than the behaviour, which is the exact defect class #5831 is about.
+//
+// The warning is now generated from the retained set, so this test drives BOTH
+// shapes plus a control whose deny targets a DROPPED bucket, and requires the
+// same honest statement from all three.
+func TestLoginClassDenyFoldWarningIsTrueForEveryDenyShape(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		lines    []string
+		leaf     string
+		retained string // exactly what describePerms renders for the folded set
+	}{
+		{
+			name: "deny targets the retained CONFIGURE bucket",
+			lines: []string{
+				"set system login class noc-admin permissions [ view configure ]",
+				`set system login class noc-admin deny-configuration "security policies"`,
+			},
+			leaf:     "deny-configuration",
+			retained: "{configure,view}",
+		},
+		{
+			// The shape the first revision mis-described.
+			name: "deny targets the retained VIEW bucket",
+			lines: []string{
+				"set system login class noc-admin permissions [ view configure ]",
+				`set system login class noc-admin deny-commands "show interfaces"`,
+			},
+			leaf:     "deny-commands",
+			retained: "{configure,view}",
+		},
+		{
+			// Control: this deny targets PermMaint, which the fold DROPS. The
+			// warning must still not claim enforcement — the fold cannot know
+			// what the regex names.
+			name: "deny targets a DROPPED bucket",
+			lines: []string{
+				"set system login class noc-admin permissions all",
+				`set system login class noc-admin deny-commands "request system zeroize"`,
+			},
+			leaf:     "deny-commands",
+			retained: "{configure,view}",
+		},
+		{
+			// A DIFFERENT retained set. Without this case every expectation
+			// above is "{configure,view}", so a warning that hard-coded that
+			// string would pass the whole table while lying about any class
+			// that folds elsewhere. This is what makes "the message is derived
+			// from the retained set" a tested property rather than a claim.
+			name: "retained set is per-class, not a constant",
+			lines: []string{
+				"set system login class cfg-only permissions configure",
+				`set system login class cfg-only deny-configuration "security policies"`,
+			},
+			leaf:     "deny-configuration",
+			retained: "{configure}",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The class name is the 5th token of `set system login class <name>
+			// ...`; deriving it keeps the fixture and the lookup from drifting
+			// apart when a case uses a different class.
+			class := strings.Fields(tc.lines[0])[4]
+			lines := append([]string{}, tc.lines...)
+			lines = append(lines, "set system login user root class "+class)
+			cfg, err := CompileConfigLenient(buildLoginTree5831(t, lines))
+			if err != nil {
+				t.Fatalf("lenient compile: %v", err)
+			}
+			var w string
+			for _, cand := range cfg.Warnings {
+				if strings.Contains(cand, class) && strings.Contains(cand, tc.leaf) {
+					w = cand
+				}
+			}
+			if w == "" {
+				t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
+			}
+			// It must name the retained set IN THE CLAIM-BEARING SLOT.
+			//
+			// Anchoring on the bare set ("{configure}") is NOT enough: the
+			// message also renders the PRE-fold set, and for a class that was
+			// already at the floor the two strings are identical, so a bare
+			// Contains passes even when the claim slot is hard-coded to
+			// something else entirely. A mutation that replaced the retained
+			// rendering with a literal "{configure,view}" survived exactly that
+			// way. "gated at <set>" is unique to the claim.
+			if !strings.Contains(w, "gated at "+tc.retained+" is") {
+				t.Fatalf("warning does not claim the retained set %s is unrestricted — "+
+					"the levels it names must be the ones the fold actually kept: %q",
+					tc.retained, w)
+			}
+			// ...and the fold's own before->after report must agree with it, so
+			// the two renderings cannot drift apart either.
+			if !strings.Contains(w, "to "+tc.retained+".") {
+				t.Fatalf("warning's folded-to set disagrees with the retained set %s: %q",
+					tc.retained, w)
+			}
+			// It must say those levels are unrestricted, in every shape.
+			if !strings.Contains(w, "COMPLETELY UNRESTRICTED") {
+				t.Fatalf("warning does not tell the operator the retained levels are "+
+					"unrestricted — a deny aimed at one of them is a silent no-op: %q", w)
+			}
+			// It must NOT claim the statement is enforced.
+			if !strings.Contains(w, "does NOT "+"enforce the statement") {
+				t.Fatalf("warning does not disclaim enforcement: %q", w)
+			}
+			// The forcing function, so the operator knows repair is mandatory.
+			if !strings.Contains(w, "every commit is rejected") {
+				t.Fatalf("warning does not tell the operator that commits stay blocked until repair: %q", w)
+			}
+		})
 	}
 }
 

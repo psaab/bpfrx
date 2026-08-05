@@ -119,9 +119,16 @@ func validateLoginClassDenyStrict(cfg *Config) error {
 //
 // So the tolerant path resolves the ambiguity in the RESTRICTIVE direction —
 // the operator asked for strictly less than `permissions` grants and we cannot
-// compute how much less — BOUNDED BY REPAIRABILITY. That bound is the whole
-// reason this is not a collapse to view-only, and it is not a stylistic
-// preference; a view-only collapse strands the box:
+// compute how much less — BOUNDED BY REPAIRABILITY.
+//
+// Read that as blast-radius reduction, NOT as enforcement: the statement is
+// still honored at NO granularity, and every bucket the floor retains is a
+// bucket where it does nothing (see repairableFloorFold's LIMIT section, and
+// loginClassDenyFoldWarning, which states this to the operator per class).
+//
+// The repairability bound is the whole reason this is not a collapse to
+// view-only, and it is not a stylistic preference; a view-only collapse
+// strands the box:
 //
 //	set system login class noc-admin permissions [ view configure ]
 //	set system login class noc-admin deny-configuration "security policies"
@@ -169,21 +176,48 @@ func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 			continue
 		}
 		before := lc.MappedPermissions
-		lc.MappedPermissions = repairableFloorFold(before)
-		warnings = append(warnings, fmt.Sprintf(
-			"system login class %q: %s is NOT enforced by xpf's coarse RBAC model "+
-				"(downgraded to a warning on the tolerant load / peer-sync path). The "+
-				"class is folded from %s to %s so it cannot be MORE permissive than the "+
-				"config states, EXCEPT that `view`/`configure` are retained where the "+
-				"class already held them — otherwise this fold would remove the only "+
-				"access that can delete the statement. Any restriction the statement "+
-				"places on CONFIGURATION is therefore still NOT in force. Remove it and "+
-				"re-express the restriction as a narrower `permissions` set; every "+
-				"commit is rejected until you do.",
-			r.class, strings.Join(r.leaves, " / "),
-			describePerms(before), describePerms(lc.MappedPermissions)))
+		after := repairableFloorFold(before)
+		lc.MappedPermissions = after
+		warnings = append(warnings, loginClassDenyFoldWarning(r, before, after))
 	}
 	return warnings
+}
+
+// loginClassDenyFoldWarning renders the operator-facing warning for one folded
+// class (#6838 review).
+//
+// The message is derived MECHANICALLY from the RETAINED set rather than
+// written as prose, because the two must never drift: every permission level
+// the fold keeps is, by construction, a level at which the deny statement is
+// still completely unenforced. An earlier revision hard-coded a carve-out for
+// `deny-configuration` alone and so claimed more than the behaviour delivered
+// — a `deny-commands "show interfaces"` targets PermView, which the floor also
+// retains, and that shape was silently described as restricted when it was
+// not. Naming the retained set makes the claim exactly as wide as the fold.
+func loginClassDenyFoldWarning(r loginClassDenyRejection, before, after []LoginClassPermission) string {
+	leaves := strings.Join(r.leaves, " / ")
+	if len(after) == 0 {
+		return fmt.Sprintf(
+			"system login class %q: %s is NOT enforced by xpf's coarse RBAC model "+
+				"(downgraded to a warning on the tolerant load / peer-sync path). The "+
+				"class is folded from %s to no permissions at all, so it can run "+
+				"nothing and the statement has no remaining effect to enforce. Remove "+
+				"it and re-express the restriction as a narrower `permissions` set; "+
+				"every commit is rejected until you do.",
+			r.class, leaves, describePerms(before))
+	}
+	return fmt.Sprintf(
+		"system login class %q: %s is NOT enforced by xpf's coarse RBAC model "+
+			"(downgraded to a warning on the tolerant load / peer-sync path). The "+
+			"class is folded from %s to %s. That REDUCES BLAST RADIUS; it does NOT "+
+			"enforce the statement — xpf cannot honor a per-command or "+
+			"per-configuration deny at any granularity. Anything gated at %s is "+
+			"therefore still COMPLETELY UNRESTRICTED for this class, including any "+
+			"command or configuration this statement names: those levels are kept "+
+			"only because they are what an operator needs to delete it. Remove the "+
+			"statement and re-express the restriction as a narrower `permissions` "+
+			"set; every commit is rejected until you do.",
+		r.class, leaves, describePerms(before), describePerms(after), describePerms(after))
 }
 
 // repairableFloorFold reduces a coarse permission set to the smallest set that
@@ -214,13 +248,32 @@ func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 // system zeroize"`) therefore still loses PermAll and PermMaint, so zeroize is
 // genuinely denied after the fold. The fold keeps its teeth on that half.
 //
-// The honest limit, stated because it must not be discovered later: for
-// `deny-configuration` this fold enforces NOTHING. xpf's coarse model has
-// exactly two configuration states — all or none — and "none" is the state
-// that strands repair, so the tolerant path keeps "all" and leans on
-// validateLoginClassDenyStrict to force the statement out. Per-path
-// configuration RBAC (what Junos actually implements, and what would let this
-// be enforced properly) stays on #5831.
+// THE LIMIT — general, not a `deny-configuration` special case (#6838 review).
+// This fold is a BLAST-RADIUS REDUCTION, not enforcement. A retained bucket is
+// a bucket where the deny statement does nothing at all, and the floor retains
+// two of them:
+//
+//   - PermConfig gates `configure`, so `deny-configuration <anything>` is a
+//     complete no-op.
+//   - PermView gates `show` / `ping` / `traceroute` / `monitor`
+//     (requiredPermission), so a `deny-commands` naming any of those — e.g.
+//     `deny-commands "show interfaces"` — is equally a complete no-op.
+//
+// An earlier revision named only the first and so claimed more than it
+// delivered. The operator warning is now generated FROM the retained set
+// (loginClassDenyFoldWarning) precisely so this claim cannot drift wider than
+// the behaviour again.
+//
+// Tightening the floor to `{PermConfig}` would make view-level denies bite,
+// and is technically safe for repair — config mode applies no per-statement
+// gate, so `configure` alone completes the fix. It is rejected because the
+// cost lands on the wrong configs: a class whose deny targets `request` would
+// lose ALL of `show`/`ping`/`monitor`, and a view-only class would fold to
+// nothing. Trading a large, silent operational downgrade for partial
+// enforcement of a control xpf cannot honor anyway is the worse deal. The
+// enforcement that DOES exist is validateLoginClassDenyStrict refusing the
+// commit; per-command/per-path RBAC — what Junos implements, and what would
+// let these be honored properly — stays on #5831.
 //
 // Dropping Clear/Control/Maint even when only `deny-configuration` is present
 // is deliberate over-restriction in a dimension the operator did not restrict:
