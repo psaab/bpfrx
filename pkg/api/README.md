@@ -424,7 +424,14 @@ under the daemon's errgroup. Nothing else imports this package.
         domain-qualified SAN next to a short kernel name means the TLS identity
         is independent of it — stay quiet. The RENAME entry point skips that
         heuristic: the operator just chose the name, which is direct evidence
-        rather than inference.
+        rather than inference. **Accepted residual:** a rename that CROSSES the
+        qualified/unqualified boundary is diagnosed at the commit but not on any
+        later boot, so a box already in that state before this shipped is never
+        diagnosed. Shape-preserving drift (the ordinary case) is still caught on
+        every boot. Closing it would need upgrade-scoped persistent state for one
+        narrow class, and would re-fire the false positive on exactly the boxes
+        the heuristic cannot judge — weighed and declined, see the comment on
+        `hostNameLikelyAccessIdentity`.
       Each uncovered identity emits its own `slog.Warn` naming the identity and
       the cert's DNS/IP SANs — which are exactly the identities it DOES cover,
       so an operator re-mints (remove `/etc/xpf/tls`) or dismisses the line in

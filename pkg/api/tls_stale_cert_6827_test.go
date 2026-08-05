@@ -138,6 +138,14 @@ func TestLoadedCertWithoutSANsWarns_6827(t *testing.T) {
 // warnStaleHostName and unused_qualified_cert_identity_is_silent fails.
 // Deleting the whole host-name branch instead fails drifted_short_name_warns,
 // which is why both halves are asserted here.
+//
+// unused_qualified_cert_identity_is_silent is ALSO the executable statement of
+// the accepted residual documented on hostNameLikelyAccessIdentity: a box whose
+// rename crossed the qualified/unqualified boundary BEFORE this diagnostic
+// shipped (so no commit ever caught it) stays silent on every boot, because the
+// load path cannot distinguish it from the healthy configuration asserted here.
+// If that gap is ever closed, this subtest is the one that must change, and
+// changing it should be a deliberate decision rather than a surprise.
 func TestUnusedKernelHostNameIsSilent_6827(t *testing.T) {
 	// mintThenReload mints for mintHost/bind, then RELOADS as reloadHost with the
 	// bind UNCHANGED, returning what the reload logged.

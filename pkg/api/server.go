@@ -1035,6 +1035,24 @@ const (
 // heuristic precisely because a cert load has no way to know what an operator
 // types; a rename does know, and it is also the one moment the operator is
 // watching the commit output.
+//
+// KNOWN RESIDUAL, weighed and accepted rather than missed. A rename that also
+// CHANGES the naming shape (`old-fw` → `newfw.example.com`, or the reverse) is
+// diagnosed at the commit — the rename path skips this function — but never on
+// a later boot, because from then on the load path sees a shape mismatch and
+// stays quiet. For a box that was ALREADY in that state before this diagnostic
+// shipped there was no commit to catch it, so it is never diagnosed at all. The
+// gap is bounded on two sides: it needs drift that pre-dates the feature AND a
+// rename that crossed the qualified/unqualified boundary. Shape-PRESERVING
+// drift — unqualified → unqualified, the ordinary case, including the worked
+// `old-fw` → `new-fw` — is still caught on every boot.
+//
+// Closing it would take a one-shot sweep at the first boot after an upgrade,
+// which means upgrade-scoped persistent state (a marker file or version stamp)
+// for a single narrow class — and it would fire on exactly the boxes where this
+// function cannot tell whether the name is in use, reintroducing the false
+// positive at the least convenient moment. Not worth the mechanism; recorded
+// here so the next reader knows the choice was made deliberately.
 func hostNameLikelyAccessIdentity(leaf *x509.Certificate, hostName string) bool {
 	if net.ParseIP(hostName) != nil {
 		for _, ip := range leaf.IPAddresses {

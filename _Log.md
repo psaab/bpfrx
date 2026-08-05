@@ -1,3 +1,34 @@
+## 2026-08-05 — #6827 fold r2: write down the accepted residual of the narrowing heuristic
+
+- **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
+- **Action**: Documentation-only follow-up to the r1 fold, at the gate's
+  request. The `hostNameLikelyAccessIdentity` narrowing has a second edge that
+  r1 stated only in the hand-off, not in the shipping artifact: a rename that
+  CROSSES the qualified/unqualified boundary (`old-fw` → `newfw.example.com`)
+  is diagnosed at the commit — the rename path skips the heuristic — but never
+  on a later boot, because the load path then sees a shape mismatch and stays
+  quiet. For a box ALREADY in that state before this diagnostic shipped there
+  was no commit to catch it, so it is never diagnosed at all. The gap is bounded
+  on two sides (drift pre-dating the feature AND a shape-crossing rename);
+  shape-preserving drift, including the worked `old-fw` → `new-fw`, is still
+  caught on every boot. Closing it would take a one-shot sweep at first boot
+  after upgrade — upgrade-scoped persistent state for one narrow class, firing
+  on exactly the boxes where the heuristic cannot tell whether the name is in
+  use, so it would re-introduce the false positive at the least convenient
+  moment. Weighed and declined; the reasoning now lives on the function itself
+  rather than in a review thread. `TestUnusedKernelHostNameIsSilent_6827/
+  unused_qualified_cert_identity_is_silent` is the executable statement of the
+  residual — its doc comment now says so, so closing the gap later is a
+  deliberate edit to a named subtest rather than a surprise RED.
+- **Validation**: comments and prose only — no production statement changed
+  (`git diff` on `pkg/api/server.go` is entirely within a doc comment).
+  `TMPDIR=/tmp go test ./pkg/api/... ./pkg/daemon/...` exit 0 (real exit code,
+  not piped); `go test ./pkg/refactoraudit/` exit 0 — `pkg/api/server.go` 1390 →
+  1408, still below the 1500 audit-entry threshold, so no tier change and no
+  heatmap regeneration. `gofmt -l` clean on both touched Go files.
+- **File(s)**: `pkg/api/server.go`, `pkg/api/tls_stale_cert_6827_test.go`,
+  `pkg/api/README.md`, `_Log.md`
+
 ## 2026-08-05 — #6827 fold: the stale-mgmt-cert diagnostic never fired on a rename
 
 - **Timestamp**: 2026-08-05 (fix/5719-api-hardening, PR #6827)
