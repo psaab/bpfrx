@@ -1,3 +1,73 @@
+## 2026-08-05 — #4785 half 1: reject `tunnel mode ipip` at commit instead of accepting into a blackhole
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject)
+- **Action**: IPIP (ip-in-ip, proto-4/41) parses, compiles, creates a Tuntap
+  anchor and reaches the dataplane snapshot, but the userspace helper — the
+  only supported runtime — has no IPIP primitive in EITHER direction.
+  Verified firsthand rather than from the issue text:
+  `forwarding_build/tunnels.rs` enters an endpoint into `gre_decap_index`
+  only when `tunnel_mode_kind(&endpoint.mode) == TunnelKind::Gre`, and
+  `tunnel_mode_kind` maps only `gre`/`ip6gre`/`wireguard` — `ipip` falls to
+  `TunnelKind::Unknown`, which that enum's own doc names as the egress
+  dispatcher's fail-closed drop arm. So inbound has nothing to decap
+  against and outbound drops: the tunnel is created, comes UP, and passes
+  no traffic at all.
+  Until now that committed green with only the #4788 advisory. Replaced the
+  advisory with a hard gate, `validateIpipTunnelUnimplementedStrict`, wired
+  in `compiler_tailgates.go` beside `validateTunnelOuterFamilyStrict` whose
+  shape it mirrors: strict on the operator commit / commit-check path,
+  downgraded to a warning on the tolerant load / peer-sync paths via the
+  new `lenientIpipTunnelMode` opt. Removed `validateIpipTunnelDeadWarning`
+  and its `ValidateConfig` registration — the advisory text now survives as
+  the gate's lenient-path warning, which is the only path that still has to
+  tolerate it.
+  Two things worth recording. First, `mode ipip` is not only written
+  explicitly: `compileInterfaces` INFERS it from an `ip-*` interface name
+  (and `gre` from `gr-*`), so an operator who never typed "ipip" can hit
+  this — the error message names the inference. Second, the gate keys on
+  the compiled MODE, not the interface name, so `ip-0/0/0 tunnel mode gre`
+  still commits; a name-keyed gate would take working GRE tunnels down and
+  is one of the mutations below.
+  Checked the no-brick surface the lead asked about rather than assuming
+  it: `Store.Load` and `Store.SyncApply` go through `compileTreeLenient` ->
+  `CompileConfigLenient` -> `lenientCompileOpts()`, so the new opt makes
+  both warn. The commit-confirmed rollback needs no gate at all — the
+  target is `s.confirmPrevCfg`, which `PromoteRollback` returns as the
+  ALREADY-COMPILED active config stashed by reference at commit time, so
+  there is no recompile at rollback and a strict gate cannot fail it.
+  Three pre-existing tests (TestIPIPTunnelSetSyntax,
+  TestIPIPTunnelExplicitMode, TestIPIPTunnelWithRoutingInstance) compiled
+  IPIP through `CompileConfig` and expected success. Their subject is field
+  parsing and mode inference, not commit acceptance, so they now compile
+  through `CompileConfigLenient` — the path that still accepts this config
+  — each with a note saying why. Not a dismissal: they are now also the
+  tolerant-path canary, and two mutations below are caught by them. A first
+  pass over-applied that switch to three passing GRE tests
+  (TestGRETunnelRoutingInstanceDestination, TestPointToPointFlag,
+  TestInterfaceLevelTunnelLinuxName); those were reverted to strict
+  `CompileConfig`, which is the stronger assertion and the one they want.
+- **Validation**: eight-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile so no RED is
+  a build break. All eight RED: unwire the gate; wire it but swallow the
+  error; hardcode lenient (the pre-#4785 behaviour dressed as a gate);
+  hardcode strict (loses the #1960 downgrade — caught by the three
+  retargeted tests plus the new tolerant-path test); never set the tolerant
+  opt (the same brick by another route); drop the unit-level walk; key on
+  the `ip-` name prefix instead of the mode (over-rejects working GRE); and
+  walk the map unsorted (non-deterministic first error, so two HA nodes
+  disagree on one config). The name-keyed mutant first came back
+  BUILD-BREAK because the gate file has no `strings` import — that is a
+  false red by the project's own rule, so it was rewritten with slicing and
+  re-run to a real RED. Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go` (new),
+  `pkg/config/ipip_tunnel_reject_4785_test.go` (new),
+  `pkg/config/ipip_tunnel_dead_warn_4788_test.go` (deleted),
+  `pkg/config/compiler_tailgates.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/compiler_validate_warn_routing.go`,
+  `pkg/config/parser_routing_test.go`, `docs/feature-gaps.md`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
 - **Timestamp**: 2026-08-01 (fix/6588-interface-monitor-packed-leaf, PR #6658)

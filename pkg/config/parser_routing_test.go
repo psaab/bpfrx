@@ -2631,9 +2631,15 @@ func TestIPIPTunnelSetSyntax(t *testing.T) {
 			t.Fatalf("SetPath(%v): %v", path, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
+	// #4785 half 1: `mode ipip` is now REJECTED on the strict commit path, so
+	// this test compiles through the TOLERANT path — the one a persisted or
+	// peer-synced config still takes. The subject here is unchanged and is not
+	// commit acceptance: it is that the tunnel fields parse and the mode is
+	// inferred/honored correctly. Commit rejection is pinned by
+	// TestIpipTunnelRejectedAtCommit_4785.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	ifc := cfg.Interfaces.Interfaces["ip-0/0/0"]
 	if ifc == nil {
@@ -2669,9 +2675,15 @@ func TestIPIPTunnelExplicitMode(t *testing.T) {
 			t.Fatalf("SetPath(%v): %v", path, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
+	// #4785 half 1: `mode ipip` is now REJECTED on the strict commit path, so
+	// this test compiles through the TOLERANT path — the one a persisted or
+	// peer-synced config still takes. The subject here is unchanged and is not
+	// commit acceptance: it is that the tunnel fields parse and the mode is
+	// inferred/honored correctly. Commit rejection is pinned by
+	// TestIpipTunnelRejectedAtCommit_4785.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	ifc := cfg.Interfaces.Interfaces["gr-0/0/0"]
 	if ifc == nil {
@@ -3345,9 +3357,15 @@ func TestIPIPTunnelWithRoutingInstance(t *testing.T) {
 			t.Fatalf("SetPath(%v): %v", path, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
+	// #4785 half 1: `mode ipip` is now REJECTED on the strict commit path, so
+	// this test compiles through the TOLERANT path — the one a persisted or
+	// peer-synced config still takes. The subject here is unchanged and is not
+	// commit acceptance: it is that the tunnel fields parse and the mode is
+	// inferred/honored correctly. Commit rejection is pinned by
+	// TestIpipTunnelRejectedAtCommit_4785.
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	ifc := cfg.Interfaces.Interfaces["ip-0/0/0"]
 	if ifc == nil {

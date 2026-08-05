@@ -1121,6 +1121,20 @@ type compileOpts struct {
 	// non-WG row (fail-closed with a loud eprintln), so a leniently-loaded
 	// bad tunnel is inert. Same doctrine as lenientWireguardPeers.
 	lenientTunnelOuterFamily bool
+
+	// lenientIpipTunnelMode (#4785 half 1) downgrades the IPIP-unimplemented
+	// gate (validateIpipTunnelUnimplementedStrict) from a hard compile error to
+	// a cfg.Warnings entry. IPIP has no userspace decap stage and no egress
+	// encap arm — the endpoint is never entered into gre_decap_index and the
+	// egress dispatcher's TunnelKind::Unknown arm drops — so a `mode ipip`
+	// tunnel is created and passes NO traffic in either direction. The strict
+	// commit / commit-check path hard-rejects so an unimplemented feature fails
+	// loudly instead of succeeding into a blackhole; the tolerant load /
+	// peer-sync paths warn so a config an OLDER binary accepted (it was only an
+	// advisory before this gate) still BOOTS (#1960) — the runtime's own
+	// fail-closed arms keep the tunnel inert either way. Same doctrine as
+	// lenientTunnelOuterFamily.
+	lenientIpipTunnelMode bool
 	// lenientPolicyZoneRefs (#2401) downgrades the security-policy
 	// zone-pair reference gate (validatePolicyZoneReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -2132,6 +2146,7 @@ func lenientCompileOpts() compileOpts {
 		lenientDHCPStaticBindings:              true,
 		lenientWireguardPeers:                  true,
 		lenientTunnelOuterFamily:               true,
+		lenientIpipTunnelMode:                  true,
 		lenientPolicyZoneRefs:                  true,
 		lenientZoneCount:                       true,
 		lenientWebManagementAuth:               true,
