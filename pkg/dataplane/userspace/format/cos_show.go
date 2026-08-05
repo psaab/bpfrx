@@ -224,24 +224,69 @@ func FormatCoSClassifiers(cfg *config.Config, nameFilter, typeFilter string) str
 // across the package boundary (TestCoSRewriteRuleTypeChildrenMatchRenderer).
 var CoSRewriteRuleTypes = []string{"dscp", "ieee-802.1", "inet-precedence", "exp"}
 
-// cosRewriteRuleEnforced reports whether the userspace dataplane actually
-// APPLIES a rewrite rule of this code-point type on egress.
+// cosBoundDSCPRewriteRules returns the set of dscp rewrite-rule NAMES that at
+// least one logical unit actually binds (#6858 fold).
 //
-// Only `dscp` is enforced. The other three commit clean and do nothing —
-// each carries an accepted-but-inert commit advisory
-// (pkg/config/compiler_validate_warn.go: ieee-802.1 at :1360, inet-precedence
-// at :1346, exp at :1350). That advisory fires ONCE, at commit; nothing
-// afterwards distinguishes a rule that is being applied from one that is not,
-// which is the operational hole `show class-of-service rewrite-rule` exists to
-// close (#6848). Rendering an inert rule identically to an enforced one would
-// reproduce the hole in the very command meant to expose it, so the enforcement
-// state is a column of the output, not a footnote.
+// Scanning Units alone is sufficient and is not an oversight: the compiler
+// folds an interface-level binding into every configured unit
+// (applyCoSInterfaceLevelBindings), which `CoSInterface.Level` documents —
+// "the dataplane snapshot and `show class-of-service` — which both iterate
+// Units — need no interface-level awareness".
+func cosBoundDSCPRewriteRules(cfg *config.Config) map[string]bool {
+	bound := map[string]bool{}
+	if cfg == nil || cfg.ClassOfService == nil {
+		return bound
+	}
+	for _, iface := range cfg.ClassOfService.Interfaces {
+		if iface == nil {
+			continue
+		}
+		for _, unit := range iface.Units {
+			if unit == nil || unit.DSCPRewriteRule == "" {
+				continue
+			}
+			bound[unit.DSCPRewriteRule] = true
+		}
+	}
+	return bound
+}
+
+// cosRewriteRuleEnforcement renders the `Enforced:` value for one rewrite rule.
+//
+// There are THREE states, not two, and collapsing the middle one into
+// "enforced" is the defect this function exists to prevent (#6858 gate MAJOR):
+//
+//  1. `dscp` AND bound by some unit — actually applied on egress.
+//  2. `dscp` and bound by NOTHING — configured, but no runtime effect. The
+//     rewrite table is populated only for the rule an interface references
+//     (`tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`,
+//     forwarding_build/cos.rs), so an unbound rule rewrites nothing.
+//  3. Any other code-point type — the dataplane rewrites dscp only. Each
+//     carries an accepted-but-inert commit advisory
+//     (compiler_validate_warn.go: ieee-802.1 :1360, inet-precedence :1346,
+//     exp :1350) that fires ONCE at commit.
+//
+// State 2 was originally reported as state 1: an unbound rule printed
+// "Enforced: yes". That is strictly worse than having no command, because it
+// converts an unanswered question into a confidently wrong answer — and it is
+// the accepted-but-inert failure class one level in, inside the very command
+// written to expose that class.
+//
+// For an unsupported TYPE the type reason is reported even if the rule also
+// happens to be unbound: the type is the dominant, actionable fact, and such a
+// rule would not act however it were bound.
 //
 // Keep this in step with the advisories: a type that starts being enforced must
 // flip here in the SAME change that drops its advisory, or this command will
 // report a working rewrite as inert.
-func cosRewriteRuleEnforced(cpType string) bool {
-	return cpType == "dscp"
+func cosRewriteRuleEnforcement(cpType string, bound bool) string {
+	if cpType != "dscp" {
+		return "no (accepted for Junos compatibility; the dataplane rewrites dscp only)"
+	}
+	if !bound {
+		return "no (not bound — no interface unit references this rule)"
+	}
+	return "yes"
 }
 
 // FormatCoSRewriteRules renders `show class-of-service rewrite-rule [name <n>]
@@ -350,18 +395,16 @@ func FormatCoSRewriteRules(cfg *config.Config, nameFilter, typeFilter string) st
 		return "No class-of-service rewrite-rules configured\n"
 	}
 
+	boundDSCP := cosBoundDSCPRewriteRules(cfg)
+
 	var b strings.Builder
 	for idx, blk := range blocks {
 		if idx > 0 {
 			b.WriteString("\n")
 		}
-		enforced := "yes"
-		if !cosRewriteRuleEnforced(blk.cpType) {
-			// Say what the operator loses, not just that a flag is off. This
-			// line is the whole point of the command for three of the four
-			// types.
-			enforced = "no (accepted for Junos compatibility; the dataplane rewrites dscp only)"
-		}
+		// Say what the operator loses, not just that a flag is off. This line
+		// is the whole point of the command: it answers "will this rule act?".
+		enforced := cosRewriteRuleEnforcement(blk.cpType, boundDSCP[blk.name])
 		fmt.Fprintf(&b, "Rewrite rule: %s, Code point type: %s, Enforced: %s\n",
 			blk.name, blk.cpType, enforced)
 		if !blk.modeled {

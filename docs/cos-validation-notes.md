@@ -74,6 +74,30 @@ them. The only signal was a commit-time advisory that scrolls past once
 (`pkg/config/compiler_validate_warn.go`: `ieee-802.1` at :1360,
 `inet-precedence` at :1346, `exp` at :1350).
 
+So the renderer reports **enforcement as a column**, not a footnote — with
+**three** states, not two:
+
+1. **`dscp` and bound** by some unit — actually applied on egress.
+2. **`dscp` and bound by nothing** — configured, no runtime effect. The
+   dataplane builds the rewrite table only for the rule an interface
+   references (`tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`,
+   `forwarding_build/cos.rs`), so an unbound rule rewrites nothing.
+3. **Any other code-point type** — the dataplane rewrites dscp only.
+
+State 2 was originally collapsed into state 1: `Enforced` was computed from the
+code-point TYPE alone, so an unbound dscp rule printed `Enforced: yes`. That is
+the accepted-but-inert failure class one level in — reproduced inside the
+command written to expose it — and worse than having no command, because it
+turns an unanswered question into a confidently wrong answer. Both fixtures
+omitted the interface binding and asserted `Enforced: yes`, so the tests pinned
+the defect rather than the contract; `Enforced: yes` must be **earned** by a
+real binding.
+
+Scanning `CoSInterface.Units` alone is sufficient for the bound-rule set: the
+compiler folds an interface-level binding into every configured unit
+(`applyCoSInterfaceLevelBindings`), which is why the snapshot builder iterates
+Units too.
+
 So the renderer reports **enforcement as a column**, not a footnote:
 
 ```

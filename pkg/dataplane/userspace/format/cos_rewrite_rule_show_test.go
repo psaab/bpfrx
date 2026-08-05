@@ -44,6 +44,20 @@ func testCoSRewriteRuleConfig() *config.Config {
 	}
 	cfg.ClassOfService.INetPrecedenceRewriteRules = []string{"rw-prec"}
 	cfg.ClassOfService.EXPRewriteRules = []string{"rw-exp"}
+	// #6858 fold: BIND rw-dscp to the fixture's unit. Without this the rule is
+	// configured-but-unbound and must NOT report as enforced -- the original
+	// fixture omitted the binding and still asserted "Enforced: yes", so the
+	// test pinned the defect rather than the contract. `Enforced: yes` has to
+	// be earned by a real binding.
+	cfg.ClassOfService.Interfaces["reth0"].Units[80].DSCPRewriteRule = "rw-dscp"
+	return cfg
+}
+
+// testCoSRewriteRuleConfigUnbound is testCoSRewriteRuleConfig with the dscp
+// binding removed: the rule is configured but no unit references it.
+func testCoSRewriteRuleConfigUnbound() *config.Config {
+	cfg := testCoSRewriteRuleConfig()
+	cfg.ClassOfService.Interfaces["reth0"].Units[80].DSCPRewriteRule = ""
 	return cfg
 }
 
@@ -101,6 +115,51 @@ func TestFormatCoSRewriteRulesMarksInertTypes(t *testing.T) {
 			t.Errorf("rule %q inert marker must say WHAT the operator loses, not just "+
 				"that a flag is off; got header:\n%s", name, line)
 		}
+	}
+}
+
+// TestFormatCoSRewriteRulesUnboundDSCPIsNotEnforced is the #6858 gate MAJOR pin.
+//
+// Runtime DSCP rewriting happens only for the rule an egress interface
+// REFERENCES: the rewrite table is built from
+// `tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`
+// (forwarding_build/cos.rs), so a dscp rule no unit binds rewrites nothing.
+//
+// As first shipped, `Enforced` was computed from the code-point TYPE alone, so
+// an unbound dscp rule printed "Enforced: yes". That is the accepted-but-inert
+// failure class one level in — inside the command written to expose that very
+// class — and worse than having no command at all, because it turns an
+// unanswered question into a confidently wrong answer.
+//
+// FAIL-ON-REVERT: compute enforcement from cpType alone and the unbound rule
+// reports "Enforced: yes", failing here.
+func TestFormatCoSRewriteRulesUnboundDSCPIsNotEnforced(t *testing.T) {
+	out := FormatCoSRewriteRules(testCoSRewriteRuleConfigUnbound(), "rw-dscp", "")
+	line := ruleHeaderLine(t, out, "rw-dscp")
+	if strings.Contains(line, "Enforced: yes") {
+		t.Errorf("an UNBOUND dscp rewrite rule reported as enforced; no unit "+
+			"references it, so it rewrites nothing. header:\n%s", line)
+	}
+	if !strings.Contains(line, "not bound") {
+		t.Errorf("an unbound dscp rule must say WHY it will not act (no unit "+
+			"binds it), not merely that it is unenforced. header:\n%s", line)
+	}
+	// It must NOT borrow the unsupported-type wording: the type IS supported,
+	// the binding is missing. Conflating the two would send the operator to
+	// fix the wrong thing.
+	if strings.Contains(line, "rewrites dscp only") {
+		t.Errorf("unbound dscp rule reported with the unsupported-TYPE reason; "+
+			"the type is supported and the binding is what is missing:\n%s", line)
+	}
+}
+
+// TestFormatCoSRewriteRulesBoundDSCPIsEnforced is the positive control for the
+// test above: with a binding present the same rule DOES report enforced. Without
+// this, "never says yes" would satisfy the unbound assertion.
+func TestFormatCoSRewriteRulesBoundDSCPIsEnforced(t *testing.T) {
+	line := ruleHeaderLine(t, FormatCoSRewriteRules(testCoSRewriteRuleConfig(), "rw-dscp", ""), "rw-dscp")
+	if !strings.Contains(line, "Enforced: yes") {
+		t.Errorf("a BOUND dscp rewrite rule must report as enforced:\n%s", line)
 	}
 }
 

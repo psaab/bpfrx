@@ -1,3 +1,33 @@
+## 2026-08-05 — #6858 fold: `Enforced: yes` for an UNBOUND dscp rewrite rule
+
+- **Timestamp**: 2026-08-05 (fix/6848-cos-show-rewrite-rule, PR #6858)
+- **Action**: Gate MAJOR, and a self-inflicted one. `Enforced` was computed from
+  the code-point TYPE alone, but runtime DSCP rewriting happens only for the
+  rule an egress interface REFERENCES — the rewrite table is built from
+  `tables.dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule)`. So a dscp rule
+  no unit binds rewrites nothing, and the command printed `Enforced: yes` for
+  it. That is the accepted-but-inert failure class reproduced INSIDE the command
+  written to expose it, and worse than shipping no command at all: it converts
+  an unanswered question into a confidently wrong answer. Fixed by splitting
+  into THREE states — bound dscp / unbound dscp / unsupported type — with a
+  distinct reason for each. An unbound dscp rule deliberately does NOT borrow
+  the unsupported-type wording: the type is supported and the binding is what is
+  missing, and conflating them would send the operator to fix the wrong thing.
+- **BOTH fixtures pinned the defect**, not just the one the gate named. The gRPC
+  fixture bound no rewrite rule, and so did the format-level one (via
+  `testCoSConfig`, which binds classifiers but no rewrite rule) — both asserted
+  `Enforced: yes`. Surveyed every `Enforced:` assertion in the tree to confirm
+  those two are the complete set rather than assuming it. `Enforced: yes` is now
+  earned by a real binding in both.
+- **Validation**: full `go test ./...` green, real exit 0. New pins: unbound-is-
+  not-enforced (format + a producible gRPC case authored in real `set` syntax
+  with no bind line) plus a bound-IS-enforced positive control, without which
+  "never says yes" would satisfy the unbound assertion. Mutation-proven.
+- **File(s)**: `pkg/dataplane/userspace/format/cos_show.go`,
+  `pkg/dataplane/userspace/format/cos_rewrite_rule_show_test.go`,
+  `pkg/grpcapi/server_show_cos_rewrite_rule_6848_test.go`,
+  `docs/cos-validation-notes.md`, `_Log.md`
+
 ## 2026-08-05 — #6848: `show class-of-service rewrite-rule` (#4228 Gap 7 residual)
 
 - **Timestamp**: 2026-08-05 (fix/6848-cos-show-rewrite-rule)

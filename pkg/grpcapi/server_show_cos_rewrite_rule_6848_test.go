@@ -40,6 +40,12 @@ func newCoSRewriteRuleServer(t *testing.T) *Server {
 		"class-of-service rewrite-rules ieee-802.1 rw-pcp forwarding-class premium loss-priority high code-point 5",
 		"class-of-service rewrite-rules inet-precedence rw-prec forwarding-class premium loss-priority low code-point 5",
 		"class-of-service rewrite-rules exp rw-exp forwarding-class premium loss-priority low code-point 5",
+		// #6858 fold: BIND rw-dscp to a unit. Runtime DSCP rewriting happens
+		// only for the rule an interface references, so without this line the
+		// rule is configured-but-unbound and must not report as enforced. The
+		// original fixture omitted the binding and still asserted
+		// "Enforced: yes" -- it pinned the defect, not the contract.
+		"class-of-service interfaces ge-0-0-1 unit 0 rewrite-rules dscp rw-dscp",
 	} {
 		if err := store.SetFromInput(cmd); err != nil {
 			t.Fatalf("SetFromInput(%q) error = %v", cmd, err)
@@ -134,6 +140,47 @@ func TestShowTextCoSRewriteRuleNameOnlyFamiliesAreProducible6848(t *testing.T) {
 				"compiler discards — either the compiler now models them (render "+
 				"them) or the table is fabricated:\n%s", topic, out)
 		}
+	}
+}
+
+// TestShowTextCoSRewriteRuleUnboundDSCPNotEnforced6858 drives the gate MAJOR
+// through the REAL commit path: a dscp rewrite rule with no interface binding.
+//
+// This is the producible half of the unbound pin. The format-level test builds
+// the config struct directly; here the rule is authored in real `set` syntax
+// with no `interfaces ... rewrite-rules dscp` line, so the state is
+// demonstrably reachable from an operator config rather than only from a
+// hand-built fixture.
+func TestShowTextCoSRewriteRuleUnboundDSCPNotEnforced6858(t *testing.T) {
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	for _, cmd := range []string{
+		"class-of-service forwarding-classes queue 0 best-effort",
+		// Defined, never bound to any interface unit.
+		"class-of-service rewrite-rules dscp unused forwarding-class best-effort loss-priority low code-point be",
+	} {
+		if err := store.SetFromInput(cmd); err != nil {
+			t.Fatalf("SetFromInput(%q) error = %v", cmd, err)
+		}
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	s := &Server{store: store, dp: dataplane.New()}
+
+	out := showRewriteRuleText(t, s, "cos-rewrite-rule:name=unused")
+	if !strings.Contains(out, "Rewrite rule: unused") {
+		t.Fatalf("rule not rendered:\n%s", out)
+	}
+	if strings.Contains(out, "Enforced: yes") {
+		t.Errorf("an unbound dscp rewrite rule reported as enforced. No interface "+
+			"unit references it, so the dataplane builds no rewrite table for it "+
+			"and it rewrites nothing:\n%s", out)
+	}
+	if !strings.Contains(out, "not bound") {
+		t.Errorf("output must say the rule is not bound to any unit:\n%s", out)
 	}
 }
 
