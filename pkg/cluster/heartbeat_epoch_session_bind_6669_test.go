@@ -498,6 +498,13 @@ func TestLateRefineRequestIsReclaimed_6669(t *testing.T) {
 // early order. Neither mutation is caught by any of the four GREEN tests above,
 // which is the coverage this file was missing.
 //
+// STATED EXACTLY, so neither wrong reading survives: what is new here is THE
+// COMPOSITION OF THE ALREADY-COVERED PENDING COALESCE WITH THE ALREADY-COVERED
+// LATE RELEASE-CAS RETRY — not unique protection against the mutation above.
+// Delete the twenty-request test because "this one covers the branch" and the
+// early order goes unguarded; delete this one as "redundant" and the
+// composition does.
+//
 // RED-on-revert: in claimBootEpochRefine, make the `st&bootEpochPendingBit != 0`
 // branch return true instead of false, so a third request re-arms a worker
 // rather than coalescing.
@@ -506,9 +513,19 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	m := keyedEpochManager(t, path)
 
 	var passes atomic.Int64
+	inPass2 := make(chan struct{})
+	releasePass2 := make(chan struct{})
+	var pass2Once sync.Once
 	origFlock := epochFlock
 	epochFlock = func(fd int, how int) error {
-		passes.Add(1)
+		if passes.Add(1) == 2 {
+			// Park the FOLLOW-UP too, so who runs it is observable. Without
+			// this, everything from the unpark to waitBootEpochIdle is unseen.
+			pass2Once.Do(func() {
+				close(inPass2)
+				<-releasePass2
+			})
+		}
 		return origFlock(fd, how)
 	}
 	t.Cleanup(func() { epochFlock = origFlock })
@@ -527,9 +544,13 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	t.Cleanup(func() { epochRefineBeforeRelease = origHook })
 
 	// Unpark on the failure path too; t.Fatalf skips the explicit call below.
-	var unparkOnce sync.Once
+	var unparkOnce, unparkPass2Once sync.Once
 	unparkWorker := func() { unparkOnce.Do(func() { close(releaseWorker) }) }
-	t.Cleanup(unparkWorker)
+	unparkPass2 := func() { unparkPass2Once.Do(func() { close(releasePass2) }) }
+	t.Cleanup(func() {
+		unparkWorker()
+		unparkPass2()
+	})
 
 	goBase := clusterGoroutines()
 	m.initHeartbeatEpochState()
@@ -544,6 +565,12 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	}
 	if got := clusterGoroutines() - goBase; got != 1 {
 		t.Fatalf("%d package goroutines with pass 1 parked, want exactly 1", got)
+	}
+	// The worker's own exit handle, used below to prove the SAME worker serves
+	// the follow-up rather than handing it to a successor.
+	w1 := m.bootEpochWorker.Load()
+	if w1 == nil {
+		t.Fatal("no refine worker handle published with pass 1 in flight")
 	}
 
 	// STEP 2 — the late reclaim decision. This is where every other test stops.
@@ -567,6 +594,30 @@ func TestThirdRequestCoalescesOntoTheLateReclaim_6669(t *testing.T) {
 	}
 
 	unparkWorker()
+
+	// THE FOLLOW-UP MUST BE THE SAME WORKER. Every count above is taken BEFORE
+	// the unpark, so without this the window from here to waitBootEpochIdle is
+	// unobserved and a HAND-OFF satisfies the test: worker 1 consumes pending,
+	// exits, and a successor runs the follow-up — leaving exactly two passes, a
+	// settled word, and both goroutine counts untouched.
+	// releaseBootEpochRefine's contract is stronger than that. It serves the
+	// follow-up with the in-flight bit STILL HELD, which is precisely what stops
+	// a second worker spawning at all, so pin identity and not just arithmetic.
+	select {
+	case <-inPass2:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the coalesced follow-up never reached the file lock (refine word = %#x)",
+			m.bootEpochRefine.Load())
+	}
+	if m.bootEpochWorker.Load() != w1 {
+		t.Fatal("the follow-up is running on a DIFFERENT worker: the owed pass was handed to " +
+			"a successor instead of being served by the worker that still holds the " +
+			"in-flight bit, which is what keeps a second worker from spawning at all")
+	}
+	if got := clusterGoroutines() - goBase; got != 1 {
+		t.Fatalf("%d package goroutines while the follow-up runs, want exactly 1", got)
+	}
+	unparkPass2()
 	waitBootEpochIdle(t, m)
 
 	// EXACTLY 2. Pass 1 plus ONE follow-up serving BOTH late requests. Three

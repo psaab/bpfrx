@@ -67830,3 +67830,51 @@ break — `go vet` confirmed passing under every revert.
   over 10 consecutive runs before mutation; flake three runs at `-count=5`
   across the four coalescing tests, rc 0 throughout.
 - **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 14:11 PDT
+- **Action**: #6669 round 19 — close what the round-18 test would still ACCEPT
+  (a hand-off of the owed follow-up) and adopt the gate's framing of the
+  novelty verbatim.
+- **What the test still accepted.** Every count in it was taken BEFORE the
+  unpark, so the window from `unparkWorker()` to `waitBootEpochIdle` was
+  unobserved. A HAND-OFF satisfied it exactly: worker 1 consumes the pending
+  bit, exits, and a SUCCESSOR runs the follow-up — two locked passes, a settled
+  word, and both goroutine counts untouched, because the successor is spawned
+  after the last one is read. `releaseBootEpochRefine`'s contract is stronger
+  than that: it serves the follow-up with the in-flight bit STILL HELD, which is
+  exactly what keeps a second worker from spawning at all. Arithmetic could not
+  express that; identity can.
+- **Fix.** The `epochFlock` seam now parks PASS 2 as well, so who runs the
+  follow-up is observable. While it is parked the test asserts the published
+  worker handle is the SAME pointer captured with pass 1 in flight, and that the
+  package goroutine count is still exactly 1.
+- **RED-on-revert, with the escape measured both ways.** Handing the owed
+  follow-up to a successor worker — word protocol and pass count preserved
+  exactly, only the identity changed — fails at `session_bind:613`: "the
+  follow-up is running on a DIFFERENT worker: the owed pass was handed to a
+  successor instead of being served by the worker that still holds the in-flight
+  bit". Against the SAME mutation,
+  `TestOverlappingRefineRequestIsCoalesced_6669`,
+  `TestLateRefineRequestIsReclaimed_6669` and
+  `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` are all GREEN at
+  `-count=10`, so the hand-off escapes every other test in the file and only
+  this assertion catches it. Restored with `touch`; `heartbeat_epoch.go`
+  confirmed identical to HEAD.
+- **The gate's description of the novelty adopted verbatim**, because it is more
+  precise than the one this file carried: what is new is THE COMPOSITION OF THE
+  ALREADY-COVERED PENDING COALESCE WITH THE ALREADY-COVERED LATE RELEASE-CAS
+  RETRY — not unique protection against the reported mutation. The comment now
+  spells out both wrong readings it forecloses: delete the twenty-request test
+  because "this one covers the branch" and the EARLY order goes unguarded;
+  delete this one as "redundant" and the COMPOSITION does.
+- **Noted, not chased.** Under `-count=20` in ONE process against an
+  intentionally broken tree, a predecessor from the malformed two-worker state
+  can retire across the next iteration's baseline and add a late failure at the
+  baseline line. Every iteration is still RED and a healthy tree does not show
+  it, so it is an artifact of repeating a broken tree in a single process rather
+  than a flake in the test.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 19.4 s. New assertion
+  green over 20 consecutive runs before mutation; flake three runs at
+  `-count=10` across the five coalescing/reclaim tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
