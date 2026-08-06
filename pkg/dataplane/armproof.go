@@ -400,9 +400,45 @@ func classifyArmCoverage(result *CompileResult, lookup instanceLookup) ArmCovera
 // isDelegatedSurface reports whether ifidx is a VLAN sub-interface, which the
 // userspace shim covers from the parent rather than attaching to directly.
 // This is exactly how compiler_iface.go marks them.
+//
+// It reports what the COMPILER INTENDED, not what the netdev is: the sole
+// production writer of genericXDPIfindexes (compiler_iface.go, the VLAN-child
+// site) records whatever ifindex ensureVLANSubInterface returned, and that
+// function adopts an existing "<phys>.<vid>" without checking its kind. So a
+// true answer here means "the compiler filed this as a VLAN child", and
+// coverDelegated must still verify the kind against the kernel.
 func isDelegatedSurface(result *CompileResult, ifidx int) bool {
 	return result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx]
 }
+
+// vlanLinkKind is netlink's kind string for an 802.1Q device — what
+// (*netlink.Vlan).Type() returns, and what the kernel reports in
+// IFLA_INFO_KIND. Compared as a string rather than type-asserting
+// *netlink.Vlan so the decision and the operator-facing detail come from one
+// call and cannot drift apart.
+//
+// WHAT THIS PROVES, exactly. Once the kind is "vlan", ParentIndex is the
+// kernel's own real_dev for the 8021q device, so every downstream branch is
+// reading a genuine VLAN-over-parent relationship, and the SKIPPED promotion's
+// premise ("a VLAN cannot pass traffic while its real device is DOWN") holds
+// against the device that actually carries it.
+//
+// WHAT IT DOES NOT PROVE, stated so a later reader does not assume more. A
+// genuine vlan whose real_dev was moved to another network namespace keeps its
+// kind and keeps a ParentIndex that now refers to a FOREIGN ifindex. Verified
+// in a namespace against this netlink version: such an orphan is forced
+// admin-DOWN, LinkSetUp fails ENETDOWN, and it cannot transmit — so it is not
+// a live forwarding surface and classifying it from a same-numbered local
+// record is not the under-count this belt exists to stop.
+//
+// Nor does it prove the resolved parent is the CONFIGURED one. An adopted vlan
+// stacked on a different device delegates to that device instead. The verdict
+// stays honest either way — the parent's XDP really does see that child's
+// tagged frames, and a down parent really does stop it — so this belt is
+// scoped to the kind. Binding the configured parent needs the compiler to
+// record it per child, which is a CompileResult data-model change and not part
+// of an observe-only phase.
+const vlanLinkKind = "vlan"
 
 // coverDirect classifies one attach point that must carry its own instance.
 func coverDirect(lookup instanceLookup, ifidx int) SurfaceCoverage {
@@ -457,6 +493,9 @@ func unarmedByIfindex(result *CompileResult) map[int]UnarmedSurface {
 //
 // `unarmed` is the one case where a parent OUTSIDE the required set is not a
 // hole in the proof: see the PROVEN-DOWN PARENT note below.
+//
+// EVERY branch here reads ParentIndex as a VLAN delegation, so the link must be
+// PROVEN to be an 802.1Q device first — see vlanLinkKind.
 func coverDelegated(
 	result *CompileResult,
 	direct map[int]SurfaceCoverage,
@@ -473,6 +512,37 @@ func coverDelegated(
 	}
 	if lnk == nil {
 		s.Detail = "vlan child: parent unresolvable: no link"
+		return s
+	}
+	if kind := lnk.Type(); kind != vlanLinkKind {
+		// NOT AN 802.1Q DEVICE — so ParentIndex is not a delegation.
+		//
+		// vishvananda/netlink folds IFLA_LINK into LinkAttrs.ParentIndex in the
+		// COMMON attribute loop, for every link kind, not just vlan. What
+		// IFLA_LINK means is per-kind: a macvlan/ipvlan's lower device, a
+		// tunnel's bound device, and — the sharp one — a veth's PEER, which for
+		// a cross-namespace pair is an ifindex in the FOREIGN namespace and can
+		// numerically alias any local interface. Reading that as a parent lets
+		// an unrelated local interface answer for this surface: alias a
+		// proven-down one and the child inherits SKIPPED; alias a covered
+		// required one and it inherits DELEGATED. Both are UNDER-counts, and an
+		// under-count hides a live forwarding surface with no shim on it, which
+		// is worse for #5275 than the over-count this file already removed.
+		//
+		// Reachable because ensureVLANSubInterface adopts ANY existing device
+		// named "<phys>.<vid>" without checking its kind, and the unmanaged
+		// sweep skips any name whose prefix before '.' is managed — so a
+		// foreign or wrong-kind squatter at that name is recorded as a
+		// delegated child, skipped by the userspace attach loop, and never
+		// cleaned up. That adoption is a separate production defect; this
+		// belt only stops the PROOF from laundering it into a covered count.
+		//
+		// UNCOVERED is the honest reading: nothing here proves a shim covers
+		// this surface. Via is deliberately left ZERO — naming a bogus parent
+		// in the record would repeat the same confusion in the operator's log.
+		s.Detail = fmt.Sprintf(
+			"vlan child: ifindex %d is a %q link, not an 802.1Q vlan — its ParentIndex is not a "+
+				"vlan delegation and proves nothing about this surface", ifidx, kind)
 		return s
 	}
 	parent := lnk.Attrs().ParentIndex

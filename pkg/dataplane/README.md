@@ -419,6 +419,31 @@ a test in `armproof_5275_test.go`.
   link that merely happens to be tracked is not enough, because an
   enabled→disabled commit leaves the old parent link in place while the parent
   is admin-DOWN and about to be torn down.
+- **The delegate's `ParentIndex` is only read once the child is proven to be an
+  802.1Q device.** vishvananda/netlink folds `IFLA_LINK` into
+  `LinkAttrs.ParentIndex` in the *common* attribute loop, for every link kind —
+  and what `IFLA_LINK` means is per-kind: a macvlan/ipvlan's lower device, a
+  tunnel's bound device, and, the sharp one, a **veth's peer**, which for a
+  cross-namespace pair is an ifindex in the *foreign* namespace that can
+  numerically alias any local interface. Both branches that can make a child
+  read as covered — the proven-down promotion to `skipped` and the delegation to
+  a covered required parent — would then let an unrelated local interface answer
+  for it, and both directions are **under**-counts that hide a live forwarding
+  surface with no shim. It is reachable: `ensureVLANSubInterface` adopts *any*
+  existing device named `<phys>.<vid>` without checking its kind, the ifindex is
+  recorded as a delegated child, the userspace attach loop skips it, and the
+  unmanaged sweep will not remove it because the name's prefix before `.` is a
+  managed interface. So `coverDelegated` requires `Link.Type() == "vlan"`
+  (`vlanLinkKind`) and otherwise reports `uncovered` with `Via` left zero —
+  naming a bogus parent would repeat the same confusion in the log. Two limits
+  are stated rather than assumed: a genuine VLAN whose real device was moved to
+  another namespace keeps its kind, but the kernel forces it admin-DOWN and
+  `LinkSetUp` fails `ENETDOWN`, so it is not a live surface; and the check binds
+  the *kind*, not the *configured* parent — an adopted VLAN stacked on a
+  different device delegates to that device, which stays honest because the
+  parent's XDP really does see its tagged frames. The adoption itself is a
+  separate production defect; this belt only stops the proof from laundering it
+  into a covered count.
 - **A surface the compiler declined to arm is not silently absent.**
   `compiler_iface.go` soft-skips **four** ways, each behind a `slog` line, each
   leaving the compile *successful* and the surface out of `pendingXDP`: the

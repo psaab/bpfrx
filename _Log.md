@@ -1,3 +1,88 @@
+## 2026-08-06 — #6864 round 2: ParentIndex is not a VLAN parent for every link kind
+
+- **Timestamp**: 2026-08-06 (fix/5275-arm-failclosed, PR #6864)
+- **Action**: Close a reproducible false-`SKIPPED`/false-`DELEGATED` path in
+  `coverDelegated` — the observe-only proof read `LinkAttrs.ParentIndex` as a
+  VLAN delegation without proving the child was an 802.1Q device.
+- **File(s)**: `pkg/dataplane/armproof.go`,
+  `pkg/dataplane/armproof_5275_test.go`, `pkg/dataplane/README.md`
+
+**The defect inverted the fix's value.** Round 1 turned an OVER-count into a
+correct count. This path turned it into an UNDER-count, which silently hides a
+real uncovered surface — strictly worse than what it replaced. An over-count
+inflates a baseline an operator can see; an under-count reports a live
+forwarding interface with no shim on it as covered.
+
+**Mechanism, in three links.** `ensureVLANSubInterface` (`compiler_iface.go`)
+blindly adopts ANY existing device named `<phys>.<vid>` — no check of link
+kind, VLAN ID, configured parent, or namespace. That ifindex is then recorded
+as a delegated VLAN child, and the userspace attach loop SKIPS it
+(`compiler.go`, `genericXDPIfindexes && !tunnelIfindexes`), so it never gets a
+shim. `coverDelegated` then read `lnk.Attrs().ParentIndex` and treated it as a
+VLAN-parent relationship — but vishvananda/netlink folds `IFLA_LINK` into
+`ParentIndex` in the COMMON attribute loop, for every link kind, and what
+`IFLA_LINK` means is per-kind. For a cross-namespace veth it is the FOREIGN
+peer's ifindex, which can numerically alias any local interface. The unmanaged
+sweep does not clean the squatter up either: it skips any name whose prefix
+before `.` is a managed interface.
+
+**Both covered-reading branches were affected**, so closing one would have left
+the other live: a parent that aliases a proven-down record promoted the child
+to `skipped`, and one that aliases a covered required surface promoted it to
+`delegated`. Neither is a hole in one arm — they are two arms of the same hole.
+
+**Fix.** `coverDelegated` now requires `lnk.Type() == vlanLinkKind` ("vlan")
+before reading `ParentIndex` at all; anything else reports `uncovered` with
+`Via` left ZERO, because naming a bogus parent in the record would repeat the
+same confusion in the operator's log. Scoped to the PROOF: the blind adoption
+in `ensureVLANSubInterface` is a real, pre-existing production defect but is
+outside #5275 PR1's observe-only scope and is filed separately.
+
+**Domain parity, verified firsthand in a network namespace** against this
+netlink version rather than inferred:
+
+| device | `Type()` | `ParentIndex` |
+|---|---|---|
+| genuine vlan `p0.100@p0` | `vlan` | real_dev |
+| cross-ns veth `p0.100@if6` | `veth` | PEER, in the FOREIGN namespace |
+| macvlan `r0.300@r0` | `macvlan` | lower device |
+| bond slave | `dummy` | 0 — bond membership is `IFLA_MASTER`/`MasterIndex` |
+
+Two limits are written into the code rather than assumed. A genuine vlan whose
+real_dev is moved to another namespace KEEPS its kind and its now-foreign
+`ParentIndex` — but the kernel forces it admin-DOWN, `LinkSetUp` fails
+`ENETDOWN`, and it cannot transmit, so it is not a live forwarding surface and
+the type check is sufficient. And the belt binds the KIND, not the CONFIGURED
+parent: an adopted vlan stacked on a different device delegates to that device,
+which stays honest (that parent's XDP really does see its tagged frames, and a
+down parent really does stop it). Binding the configured parent needs the
+compiler to record it per child — a `CompileResult` data-model change, not part
+of an observe-only phase.
+
+**Tests.** `TestArmProofNonVLANChildNeverInheritsItsParentIndex` is the
+fail-on-revert binding: 2 arms (proven-down parent, covered required parent) x
+2 real kinds (cross-namespace veth, macvlan) = 4 cells, each asserting
+`uncovered`, `Via == 0` and `WouldGate`. Deleting the production hunk reds all
+four with the assertion message, `go vet` exit 0 — an assertion failure, not a
+build break (`vlanLinkKind` simply becomes an unused const, which Go permits).
+`TestArmProofVLANKindIsTheDiscriminator` is the over-reach guard and negative
+control: the SAME fixture, same ifindexes, same aliasing, same unarmed record,
+varying ONLY the child's kind to a genuine vlan — both arms must still reach
+`skipped` and `delegated`. It stays GREEN under the revert, which is what
+separates it from a restatement of the fix; without it, "make every delegated
+child uncovered" would pass the red test while re-breaking every VLAN
+deployment round 1 fixed.
+
+**Validation.** `go build ./...` rc=0; `go vet ./pkg/dataplane/` rc=0;
+`go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` rc=0;
+`go test ./pkg/refactoraudit/ -count=1` rc=0. Under the revert exactly ONE test
+moves — the new one — while all five named guards
+(`TestArmProofVLANChildOfProvenDownParentIsSkipped`,
+`TestArmProofVLANChildOfUnprovenParentStaysUncovered`,
+`TestArmProofDelegateMustBeARequiredSurface`,
+`TestArmProofProvenDownRecordCoversOnlyItsOwnChild`) and the widened AST canary
+(`TestArmProofEverySurfaceDroppingBranchRecords`) stay green.
+
 ## 2026-08-05 — #6865 round 5: the sweep stopped at the package boundary
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)

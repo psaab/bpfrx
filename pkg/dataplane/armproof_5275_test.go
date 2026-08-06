@@ -459,6 +459,202 @@ func TestArmProofProvenDownRecordCoversOnlyItsOwnChild(t *testing.T) {
 	}
 }
 
+// The link kinds a "<phys>.<vid>" name can actually hold. Each constructor
+// builds what netlink.LinkByIndex deserialises that device to, and every
+// ParentIndex below is a shape verified against this netlink version in a
+// network namespace — not a hypothetical.
+//
+//	genuine vlan  p0.100@p0  -> type=vlan     parentIdx=<real_dev>
+//	cross-ns veth p0.100@if6 -> type=veth     parentIdx=<PEER, foreign ns>
+//	macvlan       r0.300@r0  -> type=macvlan  parentIdx=<lower dev>
+//
+// The veth is the sharp one: its ParentIndex is an ifindex in ANOTHER
+// namespace, so it carries no relationship at all to the same-numbered local
+// interface it collides with.
+func genuineVlanLink(ifidx, parent int) netlink.Link {
+	return &netlink.Vlan{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent}, VlanId: 50}
+}
+
+func foreignPeerVethLink(ifidx, parent int) netlink.Link {
+	return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent}}
+}
+
+func lowerDevMacvlanLink(ifidx, parent int) netlink.Link {
+	return &netlink.Macvlan{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent}}
+}
+
+// delegatedChild registers ifidx as a surface the COMPILER filed as a VLAN
+// child of parent — genericXDPIfindexes set, not a tunnel, exactly as
+// compiler_iface.go marks them — while letting the caller choose what the
+// netdev at that ifindex actually IS.
+//
+// That split is the whole point: the compiler's marking comes from
+// ensureVLANSubInterface, which adopts any existing "<phys>.<vid>" device
+// without checking its kind, so "filed as a VLAN child" and "is a VLAN" are
+// independent facts and the fixture must be able to vary one without the other.
+func delegatedChild(r *CompileResult, ifidx, parent int, kind func(int, int) netlink.Link) {
+	r.genericXDPIfindexes[ifidx] = true
+	r.linkIdxMap[ifidx] = kind(ifidx, parent)
+}
+
+// TestArmProofNonVLANChildNeverInheritsItsParentIndex is the belt against the
+// proof UNDER-counting, which is strictly worse than the over-count this file
+// already removed: an over-count inflates a baseline, an under-count silently
+// hides a live forwarding surface with no shim on it.
+//
+// vishvananda/netlink folds IFLA_LINK into LinkAttrs.ParentIndex in the COMMON
+// attribute loop, for every link kind. Both branches that can make a child read
+// as covered — the proven-down promotion to SKIPPED and the delegation to a
+// covered required parent — read that field as a VLAN parent. For a
+// cross-namespace veth, IFLA_LINK is the PEER's ifindex in the foreign
+// namespace, which can numerically alias any local interface; for a macvlan it
+// is a lower device that demuxes nothing. Either way an unrelated local
+// interface answers for a surface it has no relationship to.
+//
+// It is reachable, not theoretical: ensureVLANSubInterface adopts ANY existing
+// device named "<phys>.<vid>", the ifindex is then recorded as a delegated VLAN
+// child, the userspace attach loop skips it so it never gets a shim, and the
+// unmanaged sweep will not remove it because the name's prefix before '.' is a
+// managed interface. The device stays UP and forwarding with no XDP.
+func TestArmProofNonVLANChildNeverInheritsItsParentIndex(t *testing.T) {
+	// The two arms are the two ways a child can end up counted as covered.
+	// Both must be closed: closing one leaves the other as a live under-count.
+	arms := []struct {
+		name string
+		// setup makes ifindex 10 the thing the defect would have delegated to.
+		setup func(*CompileResult)
+		// wrong is the kind the defect produced for the CHILD.
+		wrong  SurfaceCoverageKind
+		lookup instanceLookup
+	}{
+		{
+			name: "parent_proven_down_would_promote_to_skipped",
+			setup: func(r *CompileResult) {
+				// A clean `disable` of an unrelated LOCAL interface that just
+				// happens to sit at the ifindex the child's IFLA_LINK names.
+				r.recordUnarmedSurface(disabledSurfaceRecord("ge-0-0-2", 10, nil, nil))
+			},
+			wrong:  CoverageSkipped,
+			lookup: lookupFrom(nil, nil),
+		},
+		{
+			name: "parent_required_and_covered_would_delegate",
+			setup: func(r *CompileResult) {
+				// ifindex 10 is a required, directly-covered surface — an
+				// entirely healthy interface elsewhere on the box.
+				r.pendingXDP = append(r.pendingXDP, 10)
+			},
+			wrong:  CoverageDelegated,
+			lookup: lookupFrom(map[int]uint32{10: 55}, nil),
+		},
+	}
+	kinds := []struct {
+		name string
+		make func(int, int) netlink.Link
+	}{
+		{"cross_namespace_veth", foreignPeerVethLink},
+		{"macvlan", lowerDevMacvlanLink},
+	}
+
+	for _, arm := range arms {
+		for _, kind := range kinds {
+			t.Run(arm.name+"/"+kind.name, func(t *testing.T) {
+				r := newProofResult([]int{20})
+				delegatedChild(r, 20, 10, kind.make)
+				arm.setup(r)
+
+				rep := classifyArmCoverage(r, arm.lookup)
+
+				var child SurfaceCoverage
+				found := false
+				for _, s := range rep.Surfaces {
+					if s.Ifindex == 20 && s.Name == "" {
+						child, found = s, true
+					}
+				}
+				if !found {
+					t.Fatalf("the child surface vanished from the report; got %s", rep.SurfaceSummary())
+				}
+				if child.Kind != CoverageUncovered {
+					t.Fatalf("a %s is NOT an 802.1Q child, so its ParentIndex names no parent — it "+
+						"must read UNCOVERED, not %s. Reading it as %s lets ifindex 10 answer for a "+
+						"surface it has no relationship to, and hides a live interface forwarding "+
+						"with no shim on it; got %+v (%s)",
+						kind.name, child.Kind, arm.wrong, child, rep.SurfaceSummary())
+				}
+				if child.Via != 0 {
+					t.Fatalf("the record must NOT name ifindex %d as a covering parent — it is not "+
+						"one, and printing it repeats the same confusion in the operator's log; "+
+						"got via=%d", child.Via, child.Via)
+				}
+				if !rep.WouldGate {
+					t.Fatalf("a live, XDP-less forwarding surface is exactly the policy-free-router "+
+						"condition #5275 measures and MUST drive would-gate; got %+v (%s)",
+						rep, rep.SurfaceSummary())
+				}
+				if rep.Uncovered != 1 {
+					t.Fatalf("expected exactly the child uncovered; got %+v (%s)", rep, rep.SurfaceSummary())
+				}
+			})
+		}
+	}
+}
+
+// TestArmProofVLANKindIsTheDiscriminator is the OVER-REACH GUARD for the test
+// above, and its negative control.
+//
+// It drives the SAME two arms over the SAME fixture — same ifindexes, same
+// aliasing, same unarmed record, same lookup — varying ONE thing: the child is
+// a genuine 802.1Q device. Both arms must still reach their covered readings.
+//
+// Without this, "make every delegated child uncovered" passes the test above
+// while re-breaking every VLAN deployment the previous fold fixed: the loss
+// cluster's reth0.50/reth0.80 and the standalone VM's VLAN 50 would go back to
+// driving would-gate on a clean operator action. It is the kind that
+// discriminates, not the delegation.
+func TestArmProofVLANKindIsTheDiscriminator(t *testing.T) {
+	t.Run("parent_proven_down_still_skips", func(t *testing.T) {
+		r := newProofResult([]int{20})
+		delegatedChild(r, 20, 10, genuineVlanLink)
+		r.recordUnarmedSurface(disabledSurfaceRecord("ge-0-0-2", 10, nil, nil))
+
+		rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+
+		if rep.Surfaces[0].Kind != CoverageSkipped {
+			t.Fatalf("a GENUINE vlan over a proven-down parent cannot forward and must stay "+
+				"SKIPPED — the kind is what disqualifies a squatter, not the delegation itself; "+
+				"got %+v (%s)", rep.Surfaces[0], rep.SurfaceSummary())
+		}
+		if rep.WouldGate {
+			t.Fatalf("a clean `disable` must stay OUT of would-gate; got %+v (%s)", rep, rep.SurfaceSummary())
+		}
+	})
+
+	t.Run("parent_required_and_covered_still_delegates", func(t *testing.T) {
+		r := newProofResult([]int{20})
+		delegatedChild(r, 20, 10, genuineVlanLink)
+		r.pendingXDP = append(r.pendingXDP, 10)
+
+		rep := classifyArmCoverage(r, lookupFrom(map[int]uint32{10: 55}, nil))
+
+		var child SurfaceCoverage
+		for _, s := range rep.Surfaces {
+			if s.Ifindex == 20 {
+				child = s
+			}
+		}
+		if child.Kind != CoverageDelegated || child.Via != 10 || child.ProgramID != 55 {
+			t.Fatalf("a GENUINE vlan whose parent carries a shim IS covered by it — the parent's "+
+				"XDP sees the tagged frames before kernel demuxing; got %+v (%s)",
+				child, rep.SurfaceSummary())
+		}
+		if rep.WouldGate {
+			t.Fatalf("a plain VLAN-over-covered-parent deployment must not drive would-gate; "+
+				"got %+v (%s)", rep, rep.SurfaceSummary())
+		}
+	})
+}
+
 // TestArmProofDeclinedSurfaceLogsAtInfo pins the two per-surface LEVELS apart.
 //
 // WARN is the would-gate set — the surfaces a gating build would refuse on. A
