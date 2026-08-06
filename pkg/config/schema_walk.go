@@ -319,10 +319,15 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		// dormant since the day the sentence was written, and it mis-scoped a
 		// lane that trusted it. A comment stating
 		// how much of a mechanism is in use is a coverage claim, and it rots
-		// silently. The armed set is exactly whatever carries
-		// `closedWorld: true` — grep for it, or read the
+		// silently. The armed set is exactly whatever sets the closedWorld
+		// field to true in a schema_*.go node — count those, or read the
 		// schema_closedworld_*_4313_test.go files, each of which pins one
 		// subtree. Do not restate the number here.
+		//
+		// This paragraph deliberately does not spell that field-and-value as a
+		// contiguous literal: doing so made this comment a false positive in
+		// the very grep it tells you to run, inflating the count by one. An
+		// instruction that corrupts its own measurement is worse than none.
 		//
 		// Strict-vs-tolerant, since it is asked every round and is written
 		// nowhere else: this rejects at the OPERATOR boundary, where the
