@@ -1,6 +1,8 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r7 — Codex's r5 findings are now **fixed in the design**, not merely
+**Revision:** v6-r8 — folds r7 (Claude SMR + AGY, both PLAN-NEEDS-REVISION; Codex r7 pending). **The v6-r7 claim that no upgrade-gate change is needed was REFUTED — see §4.3b-bis, and §3a's PLAN-KILL argument is RESTORED and WIDENED.**
+
+**Superseded v6-r7 header:** Codex's r5 findings are now **fixed in the design**, not merely
 recorded. §7a is re-derived on the correct ifindex axis (§0a), §4.3b is **cheaper**
 (§0b), and §4.3c is **redesigned** around per-entry provenance (§0c). Awaiting round 7
 from all three reviewers.
@@ -322,12 +324,17 @@ derivation, a rolling-compatible version bump, a flush on the enforcement transi
 and one change to the upgrade-compatibility predicate.** That is materially smaller
 than the basis AGY assessed, because r4 removed the interner it objected to.
 
-**The counter-case for PLAN-KILL that survived v6-r5 is now WITHDRAWN.** It was that
-changing `parseHAProtocolCompatible` relaxes the rolling-upgrade gate for every future
-release. **v6-r7 does not touch that predicate at all** (§4.3b): the mixed-base gate
-already honours the `MinCompat` floor, and the real blocker is fixed by pinning
-`SessionSyncWireVersion` — which the constant's own doc comment prescribes. The
-upgrade-gate blast-radius row in §8 is withdrawn accordingly.
+**The counter-case for PLAN-KILL is RESTORED in v6-r8, and is now STRONGER than at
+v6-r5.** v6-r7 briefly withdrew it, believing no gate change was needed. **AGY r7
+refuted that** (§4.3b-bis): bumping `CurrentHAProtocolVersion` trips **two**
+exact-equality predicates — `parseHAProtocolCompatible` (aborting rolling upgrade via
+`rolling.go:141`) and `HAProtocolVersionMismatch` (failing userspace transfer readiness
+via `daemon_ha_userspace_readiness.go:93`). Both must be relaxed to a declared floor.
+
+So the objection is not one predicate but **two, plus a readiness path** — a wider
+upgrade-path blast radius than any previous revision priced. A maintainer may
+reasonably decline to relax the gates that decide whether a release is
+rolling-upgradable, for a config that is niche and already warned about.
 
 **What remains as a PLAN-KILL case** is narrower and purely a cost judgement: ~297
 mostly-test literal sites plus a per-entry provenance bit, for a config that is niche
@@ -521,20 +528,40 @@ requires changing `parseHAProtocolCompatible`. **Both are wrong**, per Codex r5:
 **The correction makes the plan CHEAPER, and this must be stated plainly so a later
 reviewer does not re-raise the retired flag-day objection:**
 
-1. **Decouple and PIN `SessionSyncWireVersion`.** #2387's payload change is *additive*
-   (§4.3), so the sync wire schema does **not** change incompatibly and its version
-   **must not move**. The constant's own doc comment anticipates exactly this: *"If the
-   sync wire format ever diverges from the HA protocol version, replace this with its
-   own counter."* This is the change the codebase already told us to make.
+1. **Decouple and PIN `SessionSyncWireVersion` — WITH a replacement safety property
+   (§4.3b-ter).** #2387's payload change is *additive* (§4.3), so the sync wire schema
+   does **not** change incompatibly and its version **must not move**. The constant's own
+   doc comment anticipates exactly this: *"If the sync wire format ever diverges from the
+   HA protocol version, replace this with its own counter."*
 2. **Bump `CurrentHAProtocolVersion` → 2, set `MinCompatHAProtocolVersion` = 1.** The
    mixed-base gate already honours that floor — no gate change needed.
-3. **`parseHAProtocolCompatible` is NOT touched.**
+3. ~~`parseHAProtocolCompatible` is NOT touched.~~ **REFUTED by AGY r7 — see §4.3b-bis.**
 
-**Consequences:** the upgrade stays rolling through *both* gates; the ISSU
-compatibility predicate is untouched, so the "blast radius across every future release"
-concern is **withdrawn**; and §3a's *strongest surviving PLAN-KILL argument disappears*.
-What remains is one decoupled constant plus a version bump the existing window already
-absorbs.
+### 4.3b-bis. Step 3 was WRONG: there are TWO exact-equality gates, not zero
+
+AGY r7 refuted step 3 and I verified it. Pinning `SessionSyncWireVersion` is **necessary
+but not sufficient**: bumping `CurrentHAProtocolVersion` trips **two** separate
+exact-equality predicates on the HA protocol version itself.
+
+| Gate | Predicate | Reached via | Effect at local=2 / peer=1 |
+|---|---|---|---|
+| `parseHAProtocolCompatible` (`pkg/upgrade/cluster_cli.go:274`) | `local == peer` | `cl.HAProtocolCompatible()` → `pkg/upgrade/rolling.go:141` | **rolling upgrade aborts** (`rolling.go:145`) |
+| `HAProtocolVersionMismatch` (`pkg/cluster/peer_state.go:107`) | `local != peer` → mismatch | `userspaceTransferReadiness` → `pkg/daemon/daemon_ha_userspace_readiness.go:93` | **transfer readiness reports UNREADY** |
+
+I verified the second first-hand: `peer_state.go:115` returns `local != peer, local, peer`
+and `daemon_ha_userspace_readiness.go:93` acts on it.
+
+**Both must be changed to evaluate against the `MinCompat` floor**
+(`peer >= minCompat && peer <= current`) rather than exact equality.
+
+**Consequence — §3a's PLAN-KILL argument is RESTORED, and is now STRONGER than at
+v6-r5.** v6-r7 withdrew it on the belief that no gate change was needed. That was wrong.
+The change is required, and it is **two** predicates plus a readiness path, not the one
+predicate v6-r5 priced. The §8 upgrade-gate blast-radius row is reinstated.
+
+**This is the third time a remedy in this plan has been refuted after being adopted**
+(Path D → interner → version gate → now the "no gate change" claim). The pattern is
+stated at the top of this document for a reason.
 
 **Consequently §11 Q2 lands on (i), not (ii):** #2387 must carry the capability signal
 **for its own correctness**, not as a favour to #5804. That also disposes of the
@@ -545,6 +572,39 @@ its reject-not-widen requirement; that remains its own scope.
 **Cost consequence for this plan:** v6-r1 priced the capability question at zero and
 v6-r2 left it open. It is neither. C-P3 carries a protocol-version bump plus a change
 to the ISSU compatibility predicate.
+
+### 4.3b-ter. Pinning deletes an automatic safety property Copilot already protected
+
+**Claude SMR r7.** The coupling `SessionSyncWireVersion = uint16(CurrentHAProtocolVersion)`
+is not accidental — it is an *automatic* guarantee that the session-sync gate moves
+whenever the HA protocol does, so an author who changes the sync format cannot forget to
+bump it. The constant's doc comment (`pkg/cluster/sync.go:21-36`) says verbatim:
+
+> *"Deriving from the fixed Legacy constant would silently pin the gate to the stale
+> schema version after an HA bump (Copilot)."*
+
+**Pinning is exactly what that note warns against.** A prior reviewer already caught this
+failure mode on this exact line. The risk is not to #2387 — it is to the **next** change:
+afterwards, someone who alters `syncMsg*`/`syncHeader` incompatibly gets **no signal**,
+while `GateMixedBaseSwap` declares a mixed-base swap safe and the frames do not decode.
+
+**Pinning is still right, but the safety property must be REPLACED, not removed:**
+
+1. give `SessionSyncWireVersion` its **own explicit literal** with the bump rule stated in
+   the comment;
+2. add a **guard test that fails when the sync wire layout changes without a bump**,
+   anchored on the existing golden fixture
+   `userspace-dp/tests/fixtures/protocol_wire_v1.json`. Without it the constant silently
+   rots;
+3. note that the four `sync_protocol.go` comments asserting a change "does NOT bump
+   SessionSyncWireVersion" (`:688`, `:733`, `:846`, `:931`) become the *only* remaining
+   documentation of the rule — the guard is what makes them enforceable rather than
+   aspirational.
+
+Also: the constant is exported by `cmd/xpfd/main.go:199` as
+`session-sync-protocol-version` and read by the Python deploy gate
+(`scripts/deploy/xpf-deploy.py:2150`), so pinning changes a value that crosses into
+deploy tooling.
 
 ### 4.3c The version gate fixes the steady state; the TRANSITION needs an action
 
@@ -611,6 +671,21 @@ transition no amount of steady-state reasoning can see.
 > the first bulk that carried authoritative domains (`bulkEverCompleted`,
 > `sync_conn_read.go:205-247`), flush the remaining non-authoritative peer-imported rows
 > via `SessionOrigin::is_peer_synced()` (`session/entry.rs:245`).
+>
+> **BOUND CAVEAT (Claude SMR r7 + AGY r7) — "bounded" is CONDITIONAL.** The bound exists
+> only if a first authoritative bulk **completes**. If the peer never upgrades, or the
+> bulk fails before `BulkEnd`, `bulkEverCompleted` never sets and non-authoritative rows
+> persist **indefinitely**. In a never-upgraded cluster that equals today's status quo
+> (not a regression), but AGY is right that for a **security** fix an
+> unbounded-if-bulk-fails window cannot be called bounded. **Required:** an explicit TTL
+> or timeout on non-authoritative entries as a backstop, plus a counter/log for resident
+> non-authoritative rows so the exposure is observable rather than inferred.
+>
+> **ATOMICITY (AGY r7).** Iterate-and-delete over the Rust `SessionTable` is **not**
+> atomic with respect to fast-path worker threads; a packet can observe a partially
+> flushed table. The flush must specify its locking/sharding semantics — and note the
+> table is per-worker plus shared maps under `Mutex`, so "one global write lock" is not
+> free on the hot path.
 >
 > This is the **synthesis of the r4 FLUSH-vs-MARK argument**, and it resolves it rather
 > than picking a side: **MARK supplies correctness** (race-free, and it was Codex's
@@ -834,7 +909,7 @@ mismatch, **drop + increment a dedicated counter** — do not fall through to in
 
 **Cost:** ~297 struct-literal edits (most in test files), +4 B/key, one extra
 `write_u32` per hash, an additive wire append, **a rolling-compatible
-`CurrentHAProtocolVersion` bump plus the `parseHAProtocolCompatible` change (§4.3b)**,
+`CurrentHAProtocolVersion` bump plus the **two** compatibility-gate changes (§4.3b-bis)**,
 a **pure-function domain derivation reusing existing machinery** (§5 — no persistent
 state), the enforcement-transition flush (§4.3c), and a mandatory `make test-failover`.
 **Delivers:** the issue's literal ask and vendor parity.
@@ -982,7 +1057,7 @@ Path C is a **PR series**, not one PR:
 |---|---|---|---|
 | **C-P0** | dense static interning of RI names → `routing_domain: u32`; populate the dead `meta.routing_table` slot at **every** ingress producer (native ingress, local delivery, GRE decap, fabric ingress). **No behaviour change** — nothing reads it yet. | no | unit |
 | **C-P2** | add `routing_domain` to `SessionKey` + the four transforms in `session/key.rs`; store ingress **and** egress domain in `SessionMetadata`; fabric exemption. | no | RED-on-revert + negative control |
-| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **pin `SessionSyncWireVersion` + `CurrentHAProtocolVersion` → 2 with `MinCompat` = 1 (§4.3b — `parseHAProtocolCompatible` NOT touched)**; **per-entry provenance + BulkEnd flush (§4.3c)**. | yes | `make test-failover` + short-payload decode + the three provenance assertions + the four race tests |
+| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **pin `SessionSyncWireVersion` (with the §4.3b-ter guard) + `CurrentHAProtocolVersion` → 2 with `MinCompat` = 1 + relax BOTH exact-equality gates (§4.3b-bis)**; **per-entry provenance + BulkEnd flush (§4.3c)**. | yes | `make test-failover` + short-payload decode + the three provenance assertions + the four race tests |
 
 **C-P0 additionally owns** the pure-function domain derivation and the extension of the
 existing commit collision gate to cover it (§5). Because the derivation is stateless,
@@ -1086,9 +1161,19 @@ logical = resolve_ingress_logical_ifindex(forwarding, physical_ifindex, ingress_
 domain  = intern(ifindex_to_routing_instance[logical])
 ```
 
-An untagged port has no `(parent, vlan)` entry, so `logical == physical` and the result
-is byte-identical to the naive form — which is precisely why the error is invisible on
-every non-trunk topology.
+**The divergence condition is `parent_ifindex > 0` — NOT tagged-vs-untagged
+(Claude SMR r7).** `forwarding_build/interfaces.rs:291-295` inserts
+`(bind_ifindex, vlan_id) -> iface.ifindex` whenever **`iface.parent_ifindex > 0`**,
+*regardless of VLAN id*. The existing test at `forwarding_build/tests.rs:1250` asserts it
+for VLAN **0**: `ingress_logical_ifindex.get(&(10, 0)) == Some(&11)`.
+
+So a **parented unit-0 subinterface diverges too** — including **`reth1.0`**, the LAN
+interface on the actual loss smoke cluster (`docs/ha-cluster-userspace.conf`). Only an
+interface with **no parent** resolves `logical == physical`.
+
+Two consequences, both currently understated: the naive derivation is wrong on **more**
+topologies than a tagged-only reading suggests, so the fix is more load-bearing; and the
+**test matrix must include a parented VLAN-0 unit**, not only two tagged units.
 
 > #### TEST AXIS — state this, do not leave it implied
 >
@@ -1119,7 +1204,7 @@ while making it less true.
 | Behavioural regression | NONE | MED — a mis-derived domain drops a legitimate flow (self-DoS) | MED-HIGH — a mis-derived domain either fails to match (self-DoS) or cross-matches |
 | HA mixed-version | NONE | NONE (value-only, no sync semantics) | **LOW-MED** — payload additive; C-P3 pins `SessionSyncWireVersion` and bumps `CurrentHAProtocolVersion` into the window the mixed-base gate already accepts. **Rolling through both gates.** Mixed-version correctness rests on per-entry provenance (§4.3c), not on a global version predicate. |
 | Wire / struct | NONE | NONE | LOW-MED — +4 B key, two additive trailing wire fields, golden fixture regen |
-| Upgrade-gate blast radius | NONE | NONE | **NONE — WITHDRAWN in v6-r7.** `parseHAProtocolCompatible` is no longer touched: the mixed-base gate already honours the `MinCompat` floor, and the real blocker is fixed by pinning `SessionSyncWireVersion` (§4.3b). |
+| Upgrade-gate blast radius | NONE | NONE | **MED-HIGH — REINSTATED and WIDENED in v6-r8 (AGY r7).** Two exact-equality predicates must be relaxed to a declared floor: `parseHAProtocolCompatible` (gates rolling upgrade) and `HAProtocolVersionMismatch` (gates userspace transfer readiness). Wider than the single predicate v6-r5 priced. This is now the strongest PLAN-KILL argument. |
 | Performance | NONE | NONE | **UNMEASURED** — one extra `write_u32`/hash, +4 B/entry; must be benchmarked (§4.4) |
 | Security posture | leaves a hijack surface | closes hijack, opens a co-tenant DoS | closes hijack without opening a DoS |
 | Semantics | contradicts shipped A.1 text | contradicts shipped A.1 text + Junos parity | matches both |
