@@ -478,7 +478,45 @@ func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
 		slog.Warn("failed to fetch peer sessions", "err", err)
 		return nil
 	}
+	// #6851/#4626: the on-box CLI dials the peer DIRECTLY (dialPeer above), so
+	// it never passes through the grpcapi fan-out that sanitizes reserved
+	// policy ids — and it sets no IncludePeer, so the peer skips its own
+	// fan-out too. Against a pre-#4626 peer the response therefore carries
+	// that peer's FIRST CONFIGURED POLICY as the name for every session
+	// stamped with reserved id 0 (host-inbound, fabric, tunnel, and its whole
+	// table if it is in turn syncing from an older node), and `show security
+	// flow session` printed it verbatim.
+	//
+	// Sanitizing HERE rather than at the render site is deliberate: this is the
+	// CLI's own single ingress for peer sessions, so a future render site
+	// cannot reintroduce the bypass by forgetting to call the helper.
+	sanitizePeerSessionPolicyNames(resp)
 	return resp
+}
+
+// sanitizePeerSessionPolicyNames rewrites the policy name of every peer session
+// carrying a RESERVED id, in place (#6851).
+//
+// It mirrors grpcapi sanitizePeerPolicyNames — the two exist because the two
+// surfaces reach the peer by different routes, not because they disagree. Both
+// delegate the decision to dataplane.PeerSessionPolicyName, which is the single
+// place that knows which ids are reserved; neither re-resolves an unreserved id
+// against the LOCAL map, because the peer's own resolution is authoritative for
+// the peer's sessions.
+func sanitizePeerSessionPolicyNames(resp *pb.GetSessionsResponse) {
+	if resp == nil {
+		return
+	}
+	for _, e := range resp.GetSessions() {
+		if e == nil {
+			continue
+		}
+		e.PolicyName = dataplane.PeerSessionPolicyName(e.GetPolicyName(), e.GetPolicyId())
+	}
+	// A peer that itself fanned out would nest another response here. The CLI
+	// does not request that (no IncludePeer), but guard it rather than rely on
+	// an invariant that holds only for the current peer version.
+	sanitizePeerSessionPolicyNames(resp.GetPeer())
 }
 
 // peerSessionsTotal returns the "Total sessions" count to render for a
