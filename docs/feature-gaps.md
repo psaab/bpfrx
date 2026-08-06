@@ -477,6 +477,14 @@ install on node1 with no strict check anywhere. `ValidatePeerEffectiveStrict`
 effective compile at the ORIGIN's commit. `SyncApply` stays lenient, so a config
 already on disk still boots.
 
+**Operator cost.** `compileTreeStrict` evaluates the WHOLE candidate, so a box
+whose active config already carries an emitted IPIP endpoint boots fine (the
+ingress is lenient) but is then refused on EVERY subsequent commit — including
+entirely unrelated ones — until the stanza is deleted. That is inherent to any
+whole-candidate strict gate rather than specific to this one, but it is the
+visible cost of the change: the first commit after an upgrade is where an
+operator meets it.
+
 A stanza that emits NO endpoint is not rejected — there is nothing dead in the
 dataplane snapshot — but it can still create a kernel ANCHOR device, because
 `collectAppliedTunnels` screens the interface level only on `tunnel source` and

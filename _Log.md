@@ -68909,3 +68909,42 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+
+## 2026-08-06 — #6861 fold r2 (gate F1 / F2 NIT)
+
+- **Timestamp**: 2026-08-06 06:40 PDT
+- **Action**: F1 — bind the #1960 no-brick claim at the INGRESS. The tolerant
+  test drove CompileConfigLenient directly, but no-brick is a property of
+  Store.SyncApply / Store.Load, and nothing in the suite drove an IPIP config
+  through either; route SyncApply through the strict compile, or register the
+  gate outside lenientCompileOpts(), and every compiler-level test stays green
+  while a booting node is bricked and HA config sync alarm-loops. New
+  store-level test asserts SyncApply ACCEPTS the config, PRESERVES the stanza,
+  and warns EXACTLY once — standalone plus both cluster ingress views of the
+  peer-only `${node}` tree. F2 — documented the operator cost of a
+  whole-candidate strict gate in docs/feature-gaps.md.
+- **File(s)**: pkg/configstore/ipip_no_brick_4785_test.go (new),
+  docs/feature-gaps.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./pkg/config ./pkg/configstore
+  rc=0; go test ./pkg/config ./pkg/configstore ./pkg/daemon -count=1 rc=0;
+  `-run 'Ipip|PeerEffective'` across config+configstore = 47 `=== RUN` / 47
+  PASS / 0 FAIL, up from 42 at fe3ce8708; gofmt clean.
+- **NOTE — both prescribed mutations RED as ASSERTIONS, `go vet ./pkg/config
+  ./pkg/configstore` rc=0 on each.** (a) SyncApply routed through
+  `s.compileTree` (strict): all three subtests fail at "SyncApply REJECTED a
+  config carrying a dead IPIP tunnel". (b) `lenientIpipTunnelMode` dropped from
+  `lenientCompileOpts()`: standalone and the node1 view fail the same way while
+  the node0 view correctly stays PASS — node0's effective view carries no
+  endpoint, so there is nothing for a strict gate to reject there, and the
+  per-view subtest structure is what makes that discrimination visible.
+- **NOTE — (b) also reddened the r1 peer-gate test, which is a real coupling.**
+  `ValidatePeerEffectiveStrict` builds the peer view with
+  `CompileConfigForNodeLenient`; with the lenient switch gone that compile
+  hard-fails, so the gate takes its "peer view will not compile at all →
+  out of scope" arm and returns nil, and
+  TestCompileTreeStrict_RejectsPeerOnlyIpip_4785 goes RED. The lenient switch is
+  therefore load-bearing for the STRICT peer gate as well as for boot safety —
+  worth knowing before anyone tightens it.
+- **NOT CHANGED**: registry order (first-failure-wins) and its comment, per the
+  reviewer's judgement that it matches compileTreeStrict's existing
+  return-on-first-error contract.
