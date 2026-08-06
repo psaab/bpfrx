@@ -68502,3 +68502,77 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+
+## 2026-08-06 — #4960 ID probe: run the phases it claims to (#6894 r4)
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r4 gate finding on PR #6894. r3 widened `idProbeConfig`
+  for the SHIM-coverage test; the ID DRIVER did not widen with it, so three of
+  the dimensions `TestPrePassDoesNotPerturbIDAssignment_4960` compares were
+  structurally unable to differ. `compileIDsOnce` ran address book ->
+  applications -> NAT -> finalize, while the real pre-pass runs policies, nat,
+  static nat and nat64. `{}` DeepEquals `{}`, so each omission passed silently.
+  Measured before the change: `implicitSets len=0`; `PoolIDs len=3
+  [pool-a pool-b pool-v6]` with `pool-nat64` absent; `NATCounterIDs len=5`
+  with no `static/` key at all.
+  Fix. The driver now runs CompileConfig Phases 3, 4, 5, 6, 6.5, the
+  finalization and 6.6 IN PRODUCTION ORDER — `compilePolicies`,
+  `compileStaticNAT`, `finalizeNATCounterIDs`, `compileNAT64`. `compileNPTv6`
+  (6.7) stays out: it takes no `*CompileResult` and assigns no IDs.
+  `implicitSets` needed a SECOND, fixture-side half: `resolveAddrList` filters
+  `any` out entirely and returns a lone surviving name through the direct-ID
+  branch, so the old policy's `["any"]` / `["servers"]` lists built no set even
+  once `compilePolicies` ran. The fixture's `p-multi` policy now carries
+  genuinely multi-valued lists (`web`+`db`, `dns`+`servers`); `p-single` is
+  kept alongside as the negative control for the two shapes that build nothing.
+  Assertions. `NextPoolID` joins the compared set (a scalar: an off-by-one in
+  the NAT64 auto-assign branch leaves every map identical while the next pool
+  collides). Non-vacuity assertions now name the SPECIFIC entries expected —
+  one counter key per NAT type including both static ones, both implicit-set
+  cache keys, `pool-nat64` in `PoolIDs`, and `NextPoolID > pool-nat64`'s id —
+  rather than only checking a map is non-empty, which a partial regression
+  would still satisfy.
+  The finalize POSITION is asserted as a PRECONDITION, not through the output.
+  Measured: moving `finalizeNATCounterIDs` above `compileStaticNAT` left the
+  whole test GREEN, because finalization only changes an id under a base-hash
+  collision and this fixture has none. What the position buys is that the
+  sorted re-derivation sees every NAT type's keys, so the driver now asserts
+  exactly that, with the expectation derived from the CONFIG
+  (`staticNATCounterKeys`) and compared against the COMPILER's map.
+- **Validation**: uid 1000 throughout. `go build ./...` exit 0.
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. `go vet ./pkg/dataplane/`
+  exit 0. `gofmt -l` on the one file touched: clean. No hangs.
+  BEFORE -> AFTER: `implicitSets` 0 -> 2 (`db,web:5`, `dns,servers:6`);
+  `PoolIDs` 3 -> 4 (`pool-nat64` present), `NextPoolID` 4;
+  `NATCounterIDs` 5 -> 7 (`static/rs-static/s-v4`, `static/rs-static/s-v6`).
+  PERTURBATION PROOF, each injecting a PROCESS-GLOBAL drift into one
+  ID-assignment site — the exact state class a discarded double-compile would
+  expose — each grepped back in before the run and every file restored
+  byte-identical after: drift in `resolveAddrList`'s implicit-set id, in
+  `finalizeNATCounterIDs` for `static/`-prefixed keys, and in `compileNAT64`'s
+  auto-assign allocator. At head bf7b0291e all three leave the WHOLE
+  `pkg/dataplane` package GREEN. At this head all three RED on their own
+  dimension: "implicitSets differs between pass 1 and pass 2",
+  "NATCounterIDs differs ...", "PoolIDs differs ...".
+  NON-VACUITY PROOF, one driver/fixture knockout per cell, all RED with their
+  own message: drop `compilePolicies` -> `implicit address-set "db,web" is
+  absent`; drop `compileStaticNAT` -> `finalizeNATCounterIDs is about to run
+  without "static/rs-static/s-v4" in the key set`; drop `compileNAT64` ->
+  `pool-nat64 is absent from PoolIDs`; move the finalize above static NAT ->
+  same precondition message (GREEN before this assertion existed); revert
+  `p-multi` to the single/`any` shapes -> `implicit address-set "db,web" is
+  absent`, which is the fixture half of the fix. Neutering
+  `staticNATCounterKeys` AND dropping `compileStaticNAT` together reds the
+  hardcoded key assertion instead, so it is not dead weight behind the
+  precondition.
+  DELETE-ONE-OVERRIDE MATRIX RE-RUN, all 40 `discardingDataPlane` overrides
+  against the whole package: 40 RED / 0 GREEN / 0 SKIP. Widening the ID driver
+  did not weaken the shim-coverage test. 16 red via
+  `TestPrePassShimCoversTheCalledSurface_4960`; the rest via
+  `TestValidConfigStillReachesZoneCompile_4960` /
+  `TestNoHostMutationWhenALaterPhaseFails_4960`, `IsLoaded` among them
+  (compiler.go:182).
+  No doc change: this round is test-only — no production file is touched and
+  no compile behaviour changes, so the `pkg/dataplane/README.md` pre-pass
+  entry added in r3 still describes the shipped behaviour exactly.
+- **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md

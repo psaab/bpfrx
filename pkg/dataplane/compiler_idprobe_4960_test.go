@@ -150,18 +150,38 @@ func idProbeConfig() *config.Config {
 			},
 		},
 	}
-	// A security policy, so compilePolicies reaches SetZonePairPolicy and
-	// SetPolicyRule. Neither was reached by this fixture before r3.
+	// Security policies, so compilePolicies reaches SetZonePairPolicy and
+	// SetPolicyRule (neither was reached before r3) and so resolveAddrList
+	// builds IMPLICIT ADDRESS SETS (implicitSets was empty before r4).
+	//
+	// p-multi is what populates implicitSets, and its address lists have to be
+	// MULTI-valued to do it: resolveAddrList (compiler.go:723) filters "any"
+	// out entirely and returns a single remaining name through the direct-ID
+	// branch, so both of p-single's lists resolve without building a set. Only
+	// two-or-more surviving names take the implicit-set branch that writes
+	// result.implicitSets. p-single is kept alongside precisely because those
+	// two shapes are the ones that do NOT populate it — a negative control for
+	// the assertion in TestPrePassDoesNotPerturbIDAssignment_4960 that the
+	// expected set keys are present.
 	cfg.Security.Policies = []*config.ZonePairPolicies{
 		{
 			FromZone: "trust", ToZone: "untrust",
 			Policies: []*config.Policy{
 				{
-					Name: "p-probe",
+					Name: "p-multi",
+					Match: config.PolicyMatch{
+						SourceAddresses:      []string{"web", "db"},
+						DestinationAddresses: []string{"dns", "servers"},
+						Applications:         []string{"app-ssh", "app-http"},
+					},
+					Action: config.PolicyPermit,
+				},
+				{
+					Name: "p-single",
 					Match: config.PolicyMatch{
 						SourceAddresses:      []string{"any"},
 						DestinationAddresses: []string{"servers"},
-						Applications:         []string{"app-ssh", "app-http"},
+						Applications:         []string{"app-dns"},
 					},
 					Action: config.PolicyPermit,
 				},
@@ -264,6 +284,29 @@ func idProbeConfig() *config.Config {
 // is the ID-assigning subset PLUS finalizeNATCounterIDs, which the pre-pass
 // does not call. The question here is ID stability across two compiles, not
 // pre-pass coverage (#6894 r1 F5).
+//
+// The subset and its ORDER are CompileConfig's, and both matter (#6894 r4).
+// Until r4 this ran address book -> applications -> NAT -> finalize, which
+// left three of the ID dimensions it compares structurally unable to differ:
+//
+//   - implicitSets was ALWAYS empty. Its only writer is resolveAddrList
+//     (compiler.go:771), reached through compilePolicies, which was not
+//     called. An empty map compares equal to an empty map, so that column of
+//     the DeepEqual proved nothing.
+//   - The static-NAT counter keys were never assigned. compileStaticNAT
+//     assigns them (compiler_nat.go:1013) and production finalizes AFTER it
+//     (compiler.go:245-254); finalizing straight after compileNAT measured
+//     neither the assignment nor its effect on the collision re-derivation.
+//   - pool-nat64 never entered PoolIDs and NextPoolID never advanced.
+//     compileNAT64's auto-assign branch (compiler_nat.go:1243-1245) is what
+//     does both, and it was not called.
+//
+// So the phases below are CompileConfig Phases 3, 4, 5, 6, 6.5, the
+// finalization, and 6.6, in that order. compileNPTv6 (Phase 6.7) is
+// deliberately absent: it takes no *CompileResult and assigns no IDs.
+// Re-check that when adding a phase — running a phase out of order here is as
+// wrong as not running it, because finalizeNATCounterIDs' position is itself
+// part of what is being measured.
 func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 	t.Helper()
 	dp := idProbeDP{}
@@ -285,10 +328,39 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 	if err := compileApplications(dp, cfg, result); err != nil {
 		t.Fatalf("compileApplications: %v", err)
 	}
+	if err := compilePolicies(dp, cfg, result); err != nil {
+		t.Fatalf("compilePolicies: %v", err)
+	}
 	if err := compileNAT(dp, cfg, result); err != nil {
 		t.Fatalf("compileNAT: %v", err)
 	}
+	if err := compileStaticNAT(dp, cfg, result); err != nil {
+		t.Fatalf("compileStaticNAT: %v", err)
+	}
+	// Production finalizes HERE — after static NAT has recorded its counter
+	// keys and before NAT64 runs (compiler.go:245-254).
+	//
+	// The POSITION is asserted as a PRECONDITION rather than through the
+	// output, because the output cannot see it. finalizeNATCounterIDs only
+	// changes an id when two keys share a base hash; with no collision in this
+	// fixture the re-derived id equals the streaming one, so finalizing too
+	// early produces byte-identical maps. Measured: moving this call above
+	// compileStaticNAT left the whole test GREEN. What the position actually
+	// buys is that the sorted re-derivation sees EVERY NAT type's keys, so
+	// check exactly that. The expectation is derived from the CONFIG and
+	// compared against the COMPILER's map — the two sides are independent.
+	for _, k := range staticNATCounterKeys(cfg) {
+		if _, ok := result.NATCounterIDs[k]; !ok {
+			t.Fatalf("finalizeNATCounterIDs is about to run without %q in the "+
+				"key set — this driver's phase order has drifted from "+
+				"CompileConfig's, which finalizes AFTER Phase 6.5 so the sorted "+
+				"re-derivation covers every NAT type (#6894 r4)", k)
+		}
+	}
 	finalizeNATCounterIDs(result)
+	if err := compileNAT64(dp, cfg, result); err != nil {
+		t.Fatalf("compileNAT64: %v", err)
+	}
 	return map[string]any{
 		"ZoneIDs":       result.ZoneIDs,
 		"ScreenIDs":     result.ScreenIDs,
@@ -297,6 +369,10 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 		"PoolIDs":       result.PoolIDs,
 		"NATCounterIDs": result.NATCounterIDs,
 		"implicitSets":  result.implicitSets,
+		// Scalar, not a map: an off-by-one in the NAT64 auto-assign branch
+		// would leave every map above identical while the next pool allocated
+		// collides with an existing one.
+		"NextPoolID": result.NextPoolID,
 	}
 }
 
@@ -316,7 +392,7 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	second := compileIDsOnce(t, cfg) // the real pass that programs the dataplane
 
 	for _, k := range []string{"ZoneIDs", "ScreenIDs", "AddrIDs", "AppIDs",
-		"PoolIDs", "NATCounterIDs", "implicitSets"} {
+		"PoolIDs", "NATCounterIDs", "implicitSets", "NextPoolID"} {
 		if !reflect.DeepEqual(first[k], second[k]) {
 			t.Errorf("%s differs between pass 1 and pass 2 — a discarded "+
 				"validate pre-pass would PERTURB the IDs the live dataplane is "+
@@ -324,22 +400,105 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 				k, first[k], second[k])
 		}
 	}
+
+	// NON-VACUITY. Everything above is a DeepEqual, and {} equals {}: a
+	// dimension the driver never populates compares clean forever. Three of
+	// them did exactly that until r4 (implicitSets empty, no static-NAT counter
+	// keys, no pool-nat64), so each dimension below asserts the SPECIFIC entry
+	// the fixture is supposed to produce — not merely that the map is
+	// non-empty, which a partial regression would still satisfy.
 	if len(first["ZoneIDs"].(map[string]uint16)) == 0 {
 		t.Fatal("fixture assigned no zone IDs — the comparison would be vacuous")
 	}
 	if len(first["AppIDs"].(map[string]uint32)) == 0 {
 		t.Fatal("fixture assigned no application IDs — comparison vacuous")
 	}
-	// The NAT counter IDs are THE dimension this probe exists for: #5099 made
-	// their streaming assignment compile-order dependent on a hash collision,
-	// which is the one place "compile twice" is not obviously free. An empty
-	// map compares equal to an empty map, so assert the fixture actually
-	// populated them or the DeepEqual above proved nothing here.
-	if len(first["NATCounterIDs"].(map[string]uint32)) == 0 {
-		t.Fatal("fixture assigned no NAT counter IDs — the #5099 dimension of " +
-			"this comparison is VACUOUS; add NAT rules to the fixture")
-	}
 	if len(first["PoolIDs"].(map[string]uint8)) == 0 {
 		t.Fatal("fixture assigned no NAT pool IDs — comparison vacuous there")
 	}
+
+	// The NAT counter IDs are THE dimension this probe exists for: #5099 made
+	// their streaming assignment compile-order dependent on a hash collision,
+	// which is the one place "compile twice" is not obviously free.
+	counters := first["NATCounterIDs"].(map[string]uint32)
+	if len(counters) == 0 {
+		t.Fatal("fixture assigned no NAT counter IDs — the #5099 dimension of " +
+			"this comparison is VACUOUS; add NAT rules to the fixture")
+	}
+	// One key per NAT type. The static pair is the r4 addition: compileStaticNAT
+	// assigns them and production finalizes AFTER it, so a driver that finalized
+	// straight after compileNAT measured neither.
+	for _, want := range []string{
+		NATCounterKey(NATCounterTypeSource, "rs-trust-untrust", "r-web"),
+		NATCounterKey(NATCounterTypeDest, "rs-dnat", "d-v4"),
+		NATCounterKey(NATCounterTypeStatic, "rs-static", "s-v4"),
+		NATCounterKey(NATCounterTypeStatic, "rs-static", "s-v6"),
+	} {
+		if _, ok := counters[want]; !ok {
+			t.Errorf("NAT counter key %q is absent, so that NAT type is NOT "+
+				"measured by the stability comparison — the driver is not "+
+				"running the phase that assigns it, or is finalizing before it "+
+				"(#6894 r4)\n  have: %v", want, sortedKeys(counters))
+		}
+	}
+
+	// implicitSets: written only by resolveAddrList's multi-address branch,
+	// reached only through compilePolicies. Assert the two the fixture's
+	// p-multi policy builds — the cache key is the sorted member names joined
+	// by commas (compiler.go:753).
+	sets := first["implicitSets"].(map[string]uint32)
+	for _, want := range []string{"db,web", "dns,servers"} {
+		if _, ok := sets[want]; !ok {
+			t.Errorf("implicit address-set %q is absent, so implicitSets is not "+
+				"measured — either compilePolicies is not being run or the "+
+				"fixture's policy address lists collapsed to the single-name / "+
+				"all-\"any\" branches that build no set (#6894 r4)\n  have: %v",
+				want, sortedKeys(sets))
+		}
+	}
+
+	// The NAT64 auto-assign branch is the only writer of both of these for a
+	// pool no SNAT rule references. Asserting NextPoolID > the SNAT high-water
+	// binds the ADVANCE, not merely that the pool got an id.
+	pools := first["PoolIDs"].(map[string]uint8)
+	nat64ID, ok := pools["pool-nat64"]
+	if !ok {
+		t.Errorf("pool-nat64 is absent from PoolIDs, so compileNAT64's "+
+			"auto-assign branch is not running in this driver (#6894 r4)"+
+			"\n  have: %v", sortedKeys(pools))
+	}
+	if next := first["NextPoolID"].(uint8); next <= nat64ID {
+		t.Errorf("NextPoolID is %d but pool-nat64 took id %d — the auto-assign "+
+			"branch did not advance the allocator, so the next pool would "+
+			"collide with it (#6894 r4)", next, nat64ID)
+	}
+}
+
+// staticNATCounterKeys derives, FROM THE CONFIG, the per-rule counter keys
+// compileStaticNAT is expected to record. NPTv6 rules are excluded because
+// compileStaticNAT skips them (compiler_nat.go:961) and compileNPTv6 assigns
+// no counter. Deriving from cfg rather than hardcoding keeps the precondition
+// correct when the fixture changes; the assertion that consumes it compares
+// against the COMPILER's map, so the two sides stay independent.
+func staticNATCounterKeys(cfg *config.Config) []string {
+	var keys []string
+	for _, rs := range cfg.Security.NAT.Static {
+		for _, r := range rs.Rules {
+			if r.IsNPTv6 {
+				continue
+			}
+			keys = append(keys, NATCounterKey(NATCounterTypeStatic, rs.Name, r.Name))
+		}
+	}
+	return keys
+}
+
+// sortedKeys renders a map's keys in a stable order for failure messages.
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
