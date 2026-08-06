@@ -960,14 +960,32 @@
      an explicit note that "armed" is load-bearing, is not restated elsewhere in
      the file, and must not be re-derived there.
   5. "Both are being closed" (three sites) — unsupported. #6889 and #6890 are
-     OPEN, unassigned, no milestone, no PR. Replaced with "OPEN and unscheduled"
-     everywhere; a doc must not assert a fix date nobody has committed to.
-  Method note for the next reader: the sweep this round is BEHAVIOURAL. Searching
-  the claim (`secondary.*read-only|cannot be keyed|only writer|only.*RG0
-  primary.*writ`) and excluding the qualified forms now returns exactly ONE hit,
-  `pkg/configstore/README.md:810` — the out-of-package site deliberately scoped
-  out and filed as #6896. That is a sweep whose completeness can be re-run, which
-  the round-7 grep was not.
+     OPEN, unassigned, no milestone, no PR. Two sites now say "OPEN and
+     unscheduled"; the third (cluster_transport_key_5078_test.go) says "Those
+     are open bugs, not routes" — same live status, different wording, and the
+     round-8 entry originally claimed the identical phrase went everywhere.
+     Corrected here: a doc must not assert a fix date nobody has committed to,
+     and a log entry must not overstate the edit it describes.
+  Method note, CORRECTED by the round-8 gate. This entry originally claimed the
+  sweep was "re-runnable" because searching the claim and "excluding the
+  qualified forms" returned exactly one hit. That claim was wrong twice over and
+  the correction is the useful part:
+    - "excluding the qualified forms" has NO EXECUTABLE RULE. It is a judgement
+      applied by eye after the grep, so the result is not reproducible and the
+      word "re-runnable" was doing no work. The raw regex actually returns seven
+      qualified hits, one acknowledged, and four unrelated false positives
+      (`daemon_dns.go`, `dhcprelay/relay.go`, two in `lease_sync_test.go`).
+    - Being line-oriented, it MISSED three substantive unqualified assertions,
+      all in `pkg/configstore` SOURCE rather than docs:
+      `envelope.go` ("NOT the RG0 primary (a read-only secondary)" / "stays
+      read-only until it is promoted"), `store.go` ("secondary nodes reject
+      config mutations"), and `store_lock.go` (equating read-only mode with "a
+      non-RG0-primary / secondary node").
+  Those three are out of this PR's packages and were NOT in #6896, which listed
+  only the configstore README and two `docs/` files. #6896 has been expanded to
+  name them. The transferable lesson: a sweep is only re-runnable if its
+  EXCLUSION is executable too — a grep plus human judgement is a measurement
+  whose second run can differ from its first.
 - **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_auth.go,
   pkg/daemon/daemon_ha.go, pkg/daemon/cluster_transport_key_5078_test.go,
   _Log.md
