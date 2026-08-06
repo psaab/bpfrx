@@ -69899,3 +69899,36 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-06 — #4408 increment 3a: lift the waterfill epoch refill (Option B')
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 epoch refill out of
+  `select_exact_cos_guarantee_queue_waterfill` into
+  `refill_waterfill_epoch(root, now_ns)`, `#[inline(always)]`, same
+  module. Pure motion: the 74 moved lines diff clean against master's
+  `:1000-1073` once leading whitespace is stripped, and the only
+  non-motion edit is the doc comment de-indenting from `    //` to `//`
+  as it becomes the helper's header. The block stays ATOMIC — the order
+  of the `waterfill_epochs` bump, the `epoch_boundary`-gated
+  honored-bitset clear, and `waterfill_epoch_wrap_pending = false` is
+  the #1743 r3 livelock fix, and the helper's header says so.
+- **Scope honesty**: this does NOT move the committed modularity metric.
+  `docs/refactoring-audit-current.txt` gates on file set and tier;
+  `queue_service/mod.rs` was 2166 `[REFACTOR]` and stays above the 2000
+  floor, so the tier is unchanged and `TestHeatmapNotStale` neither
+  fires nor needs a regenerated artifact (`go test
+  ./pkg/refactoraudit/...` ok). The value is reviewability of a state
+  machine, and nothing else.
+- **Validation**: call-edge baseline REGENERATED at this head, not
+  inherited from the plan (`docs/research/4408-hotpath-split/plan.md`
+  §2's artifacts are from `dd23119aa`). Raw, zero-normalisation Tier 1
+  on `service_exact_guarantee_queue_direct_with_info` (the symbol the
+  waterfill inlines into) — 32 edges, diff exit 0; on the untouched
+  `enqueue_pending_forwards` control — 51 edges, diff exit 0. `nm`:
+  neither the waterfill nor `refill_waterfill_epoch` is present, and
+  `service_exact_guarantee_queue_direct_with_info` holds at 0x619b.
+  Negative control: flipping the helper to `#[inline(never)]` puts it in
+  `nm` at 0x1eb and the Tier-1 diff reports the new edge — the gate is
+  watched failing, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs, _Log.md
