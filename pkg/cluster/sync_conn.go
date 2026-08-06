@@ -25,13 +25,56 @@ func shouldInitiateFabricDial(localAddr, peerAddr string) bool {
 	return local.Port() < peer.Port()
 }
 
-// activeConnLocked returns the preferred active connection. fab0 is preferred;
-// fab1 is used only when fab0 is down. The caller must hold s.mu.
-func (s *SessionSync) activeConnLocked() net.Conn {
-	if s.conn0 != nil {
-		return s.conn0
+// preferredFabricLocked returns the fabric index whose connection should carry
+// outbound sync traffic, or -1 when nothing is installed. The caller must hold
+// s.mu.
+//
+// #5718 fold r4 BLOCKER 1: a CURRENT-incarnation connection wins over a stale
+// one, and only then does the historical fab0-before-fab1 preference apply.
+// Slot preference alone is wrong once a slot can hold a connection to a peer
+// process that no longer exists: when the peer reboots and its replacement
+// dials FABRIC 1, conn0 still holds the dead incarnation's socket (no FIN/RST
+// on a hard reboot) while conn1 holds the live one. Picking conn0 because it
+// is non-nil hands every sender — bulk sync, config sync, failover requests and
+// acks, session writes; 18 call sites through getActiveConn — a socket
+// connected to nothing. doBulkSync pins it once and streams the entire session
+// table into it.
+//
+// The r2 stamp made "installed" and "current" different things for the ack
+// path; this is the same distinction on the SEND path, which was left behind.
+//
+// When no installed connection is current (the incarnation advanced and its
+// connection has since dropped, leaving only a stale sibling) the old slot
+// preference still applies rather than returning nil: writing to the stale
+// socket fails and drives handleDisconnect, which cleans it up. That is the
+// pre-existing self-correcting behaviour, and this change does not alter it.
+func (s *SessionSync) preferredFabricLocked() int {
+	if s.conn0 != nil && s.conn0Gen == s.peerIncarnation {
+		return 0
 	}
-	return s.conn1
+	if s.conn1 != nil && s.conn1Gen == s.peerIncarnation {
+		return 1
+	}
+	if s.conn0 != nil {
+		return 0
+	}
+	if s.conn1 != nil {
+		return 1
+	}
+	return -1
+}
+
+// activeConnLocked returns the preferred active connection: a
+// current-incarnation connection first, fab0 before fab1. The caller must hold
+// s.mu.
+func (s *SessionSync) activeConnLocked() net.Conn {
+	switch s.preferredFabricLocked() {
+	case 0:
+		return s.conn0
+	case 1:
+		return s.conn1
+	}
+	return nil
 }
 
 // getActiveConn returns the active connection while taking s.mu.
@@ -318,11 +361,7 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	defer s.mu.Unlock()
 	d := connColdPrimeDecision{activeBefore: -1, activeAfter: -1}
 	d.wasDisconnected = s.conn0 == nil && s.conn1 == nil
-	if s.conn0 != nil {
-		d.activeBefore = 0
-	} else if s.conn1 != nil {
-		d.activeBefore = 1
-	}
+	d.activeBefore = s.preferredFabricLocked()
 	d.hadConn0 = s.conn0 != nil
 	d.hadConn1 = s.conn1 != nil
 	// #5718 C01a (fold F1): a SUPERSESSION is the incarnation edge
@@ -350,19 +389,8 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 		}
 		s.conn1 = conn
 	}
-	if s.conn0 != nil {
-		d.activeAfter = 0
-	} else if s.conn1 != nil {
-		d.activeAfter = 1
-	}
 	s.stats.Connected.Store(true)
 	s.lastPeerRxMono.Store(MonotonicNanos())
-	// #4962: arm the cold-prime obligation on a full-disconnect -> connect edge.
-	// The latch outlives this goroutine so a superseding same-fabric accept
-	// still sees the obligation even though it observes a non-empty registry.
-	if d.wasDisconnected {
-		s.needColdPrime.Store(true)
-	}
 	// #5718 C01a (fold F1): end the previous peer INCARNATION's heartbeat-ack
 	// capability at the one edge handleDisconnect structurally cannot see.
 	// When a peer reboots hard its TCP connection stays ESTABLISHED on our side
@@ -406,6 +434,31 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 		s.conn0Gen = s.peerIncarnation
 	case 1:
 		s.conn1Gen = s.peerIncarnation
+	}
+	// #5718 fold r4 BLOCKER 1: compute the post-install preference AFTER the
+	// advance and the stamp, so it agrees with what getActiveConn will hand the
+	// senders. Computing it from raw slot occupancy made the cold-prime
+	// decision disagree with where the data would actually go: on a fabric-1
+	// supersession the stale conn0 kept activeAfter at 0, becameActive went
+	// false, and the bulk was skipped for a peer that had just replaced itself.
+	d.activeAfter = s.preferredFabricLocked()
+	// #4962: arm the cold-prime obligation on a full-disconnect -> connect edge.
+	// The latch outlives this goroutine so a superseding same-fabric accept
+	// still sees the obligation even though it observes a non-empty registry.
+	//
+	// #5718 fold r4 BLOCKER 1: a supersession of a CURRENT connection arms it
+	// too. That edge is positive evidence of a new peer process — the thing
+	// #5480 says the survivor cannot otherwise detect ("the sync handshake
+	// carries no peer-cold / boot-incarnation / table-count signal"), which is
+	// why it re-primes unconditionally on the full-disconnect edge. A rebooted
+	// peer has an EMPTY session table, so without re-arming here the standby
+	// ends up with no synced sessions and blackholes every established flow on
+	// the next failover to it — the #5480 blackhole, reached through the
+	// supersession edge instead of the disconnect edge. Re-priming is
+	// idempotent (the receiver upserts and prunes), so the cost of being wrong
+	// is one redundant bulk.
+	if d.wasDisconnected || supersededCurrent {
+		s.needColdPrime.Store(true)
 	}
 	d.becameActive = d.activeAfter == fabricIdx
 	// #4962: commit the decision under the lock. becameActive means this

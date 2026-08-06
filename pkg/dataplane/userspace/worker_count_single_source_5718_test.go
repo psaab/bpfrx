@@ -283,11 +283,13 @@ func TestProgramBootstrapWorkerCountDataFlow_5718(t *testing.T) {
 	// This asserts the LOOP CONDITION, not an assignment. Checking `slots :=
 	// plan.HeartbeatSlots` binds nothing on its own: keeping that statement as
 	// a decoy and writing `for slot := 0; slot < plan.Workers; slot++` passes
-	// an assignment-shaped guard while production zeroes 6 Array entries
-	// instead of 192 at the default worker count, leaving 186 heartbeat slots
-	// holding stale data — the shim then refuses to redirect for workers whose
-	// slot never got initialised. The loop's own bound is the thing with the
-	// runtime consequence, so it is the thing checked.
+	// an assignment-shaped guard while production zeroes one Array entry per
+	// WORKER instead of per SLOT — 1 of 32 at the default worker count
+	// (capabilities.go seeds Workers: 1) and 6 of 192 on the six-worker loss
+	// cluster. Every un-zeroed slot keeps a stale value, and the shim refuses
+	// to redirect for a worker whose slot never got initialised. The loop's own
+	// bound is the thing with the runtime consequence, so it is the thing
+	// checked.
 	//
 	// The loop is located by what it DOES (it writes heartbeatMap), so
 	// renaming variables cannot silently detach the guard from its subject.
@@ -323,7 +325,8 @@ func TestProgramBootstrapWorkerCountDataFlow_5718(t *testing.T) {
 			t.Fatalf("the heartbeat zero-init loop counts against %q, not %s.HeartbeatSlots. "+
 				"That is the bound with the runtime consequence: counting against "+
 				"%s.Workers zeroes one Array entry per WORKER instead of per SLOT — 6 of "+
-				"192 at the default worker count — and every un-zeroed slot reads as a "+
+				"192 on the six-worker loss cluster, 1 of 32 at the default of one "+
+				"worker — and every un-zeroed slot reads as a "+
 				"stale heartbeat, so the shim refuses to redirect for that worker "+
 				"(#5718 fold r3)", exprText(fset, cond.Y), planVar, planVar)
 		}

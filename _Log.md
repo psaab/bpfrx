@@ -68350,3 +68350,40 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
   pkg/routing/routing.go, pkg/routing/close_partial_manager_5718_test.go,
   pkg/routing/README.md, _Log.md
+- **Timestamp**: 2026-08-06 07:10
+- **Action**: #6825 review fold r4 (#5718 C-HA) — two RUNTIME blockers, both
+  regressions my own earlier rounds introduced. **BLOCKER 1**: the r2
+  incarnation stamp taught the ACK path that an installed connection can belong
+  to a dead peer, but left the SEND path on raw slot occupancy.
+  `activeConnLocked` returned `conn0` whenever non-nil, so after a peer reboot
+  whose replacement dialled FABRIC 1 the dead incarnation's still-ESTABLISHED
+  socket was handed to all 18 senders reached through `getActiveConn` — bulk
+  sync pins it once and streams the whole session table into it.
+  `preferredFabricLocked` now prefers a CURRENT-incarnation connection, then the
+  historical fab0-before-fab1 order, falling back to the old preference when
+  nothing is current so the self-correcting write-fail path is unchanged.
+  `installConn` computes `activeAfter` from the same helper AFTER the advance
+  and stamp, and `needColdPrime` re-arms on a supersession of a CURRENT
+  connection: that edge is the new-peer signal #5480 records as unavailable on
+  the wire, and without it a rebooted peer's empty table leaves the standby with
+  no synced sessions and blackholes every established flow on the next failover.
+  **BLOCKER 2**: process-scoping the reload debt (fold F2) collapsed two
+  obligations into one flag. "The kernel re-read the directory" is global, but
+  Apply's TAIL — the per-interface `networkctl reconfigure` and
+  `restoreSlowPathRPFilter` — only Apply can run, and both sit behind
+  `needReload`. When Apply's own reload FAILED (returning early, before the
+  tail, recording no reconfigure debt) and `pkg/daemon` then ran a successful
+  reload, the global debt cleared and the next unchanged Apply skipped the block
+  entirely: addresses never reconfigured, rp_filter left at networkd's default
+  silently dropping locally-originated traffic via the slow-path TUN, and nil
+  returned. `Manager.activationPending` is set on entry and cleared only after
+  the tail, so no external owner can discharge it. Also corrected a miscount in
+  two comments: "6 of 192 at the default worker count" cited the six-worker loss
+  cluster, while `capabilities.go` seeds `Workers: 1` (so 1 of 32 at the
+  default). Seven mutations B1a-B1d/B2a-B2c, all `go vet` clean, all RED with
+  assertions, none skipped.
+- **File(s)**: pkg/cluster/sync_conn.go,
+  pkg/cluster/active_conn_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/networkd/networkd.go, pkg/networkd/activation_tail_5718_test.go,
+  pkg/networkd/README.md, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go, _Log.md

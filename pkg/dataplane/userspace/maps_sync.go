@@ -205,10 +205,12 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		// #5718 fold r3: read plan.HeartbeatSlots INLINE in the loop condition
 		// rather than through a local. An intermediate `slots := ...` leaves a
 		// decoy an AST guard can be satisfied by while the loop counts against
-		// something else entirely — `slot < plan.Workers` zeroes 6 entries
-		// instead of 192 at the default worker count, leaving 186 heartbeat
-		// slots holding stale data. The bound the loop actually uses is the
-		// only thing worth pinning, so it is the only thing written.
+		// something else entirely — `slot < plan.Workers` zeroes one entry per
+		// WORKER instead of per SLOT: 1 of 32 at the default worker count
+		// (capabilities.go seeds Workers: 1), and 6 of 192 on the six-worker
+		// loss cluster. Every un-zeroed slot keeps whatever stale value it
+		// held. The bound the loop actually uses is the only thing worth
+		// pinning, so it is the only thing written.
 		for slot := uint32(0); slot < plan.HeartbeatSlots; slot++ {
 			_ = heartbeatMap.Update(slot, zeroHB, ebpf.UpdateAny)
 		}

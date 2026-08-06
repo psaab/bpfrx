@@ -132,6 +132,23 @@ Standard library only.
   identical retry now sees `changed==false && !debt`, skips the reload
   and returns nil. A debt cleared whose work never ran is a silent skip
   of a reload the system believes it performed.
+- **The reload debt is global; Apply's TAIL is not (#5718 fold r4).**
+  Process-scoping the reload debt was right for the reload itself, but it
+  collapsed two obligations into one flag. "The kernel re-read the
+  directory" is global — any owner's successful `networkctl reload`
+  discharges it. Apply's activation pass also has a tail only Apply can
+  run: the per-interface `networkctl reconfigure` that applies bond/VLAN
+  addresses, and `restoreSlowPathRPFilter`. Both sit behind
+  `needReload`. So when Apply's own reload FAILED (returning early,
+  before the tail, and therefore recording no reconfigure debt) and
+  `pkg/daemon` then ran a successful reload, the global debt cleared and
+  the next unchanged Apply skipped the block entirely — addresses never
+  reconfigured, `rp_filter` left at networkd's default, silently
+  dropping locally-originated traffic via the slow-path TUN, and `nil`
+  returned. `Manager.activationPending` is set when Apply enters the
+  pass and cleared only after the tail completes, so no other owner can
+  discharge it. The write-error path is unaffected: it always returns a
+  non-nil error, so it can never report a false success.
 - **`Manager.Clear()` has no production caller (#5718 fold).** It has
   been exported and uncalled since this package was introduced (`git
   log -S` finds no caller in history); the daemon uses only

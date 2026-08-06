@@ -99,6 +99,31 @@ type Manager struct {
 	// interface names that still owe a reconfigure; the next activation pass
 	// retries them and clears the set on success.
 	reconfigurePending map[string]bool
+	// activationPending records that THIS Manager began an activation pass and
+	// did not finish it. It is deliberately NOT the process-wide reload debt.
+	//
+	// #5718 fold r4 BLOCKER 2: making the reload debt process-scoped collapsed
+	// two different obligations into one flag. "The kernel re-read the
+	// directory" is genuinely global — any owner's successful `networkctl
+	// reload` discharges it. But Apply's activation pass has a TAIL that only
+	// Apply can run: the per-interface `networkctl reconfigure` that applies
+	// bond/VLAN addresses, and restoreSlowPathRPFilter, which re-disables
+	// rp_filter on the userspace dataplane's slow-path TUN after networkd
+	// resets it. Both sit behind `needReload`.
+	//
+	// So when Apply's own reload FAILED (it returns early, before the tail, and
+	// therefore never records reconfigure debt) and pkg/daemon then ran a
+	// SUCCESSFUL reload of its own, the global debt cleared — and the next
+	// Apply with byte-identical files saw changed==false, no reload debt and no
+	// reconfigure debt, skipped the whole block, and returned nil. The kernel
+	// had re-read the files, but the addresses were never reconfigured and
+	// rp_filter was left at networkd's default, silently dropping
+	// locally-originated traffic via the TUN. An external owner discharged a
+	// postcondition it had no way to perform.
+	//
+	// This flag is set when Apply enters its activation pass and cleared only
+	// once that pass completes its tail, so no other owner can discharge it.
+	activationPending bool
 }
 
 // reloadDebt is the #4954 `networkctl reload` activation debt: a reload that
@@ -384,10 +409,21 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 	debtOwed := reloadDebtOutstanding()
 	m.mu.Lock()
 	reconfDebt := len(m.reconfigurePending) > 0
+	activationOwed := m.activationPending
 	m.mu.Unlock()
 
 	needReload := changed || debtOwed
-	if needReload || reconfDebt {
+	// #5718 fold r4 BLOCKER 2: activationOwed keeps this Manager's own tail —
+	// the per-interface reconfigure and restoreSlowPathRPFilter — reachable
+	// even when another reload owner discharged the global debt on our behalf.
+	// Without it, an external successful reload turns the next unchanged Apply
+	// into a no-op that skips postconditions only Apply can perform.
+	if needReload || reconfDebt || activationOwed {
+		// Mark the pass in flight BEFORE the reload can fail out, so an early
+		// return leaves the obligation recorded.
+		m.mu.Lock()
+		m.activationPending = true
+		m.mu.Unlock()
 		if needReload {
 			if changed {
 				slog.Info("networkd config updated, reloading", "interfaces", len(interfaces))
@@ -430,6 +466,11 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 			m.setReconfigurePending(nil)
 		}
 		restoreSlowPathRPFilter()
+		// The tail completed, so this Manager owes nothing further. Cleared
+		// LAST and only here: every early return above leaves it set.
+		m.mu.Lock()
+		m.activationPending = false
+		m.mu.Unlock()
 	}
 
 	return nil

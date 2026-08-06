@@ -1504,6 +1504,34 @@ outside the monitor loop:
   behavioural test would still pass, and at that point this narrowing must be
   revisited.
 
+  **The SEND path is incarnation-aware too (#5718 fold r4).** The stamp
+  originally taught only the ACK path that an installed connection can belong
+  to a dead peer. `activeConnLocked` still picked by raw slot occupancy, so
+  after a peer reboot whose replacement dials FABRIC 1, `conn0` — the dead
+  incarnation's still-ESTABLISHED socket — was handed to every sender reached
+  through `getActiveConn`: bulk sync (which pins it once and streams the whole
+  session table), config sync, failover requests and acks, the session writer.
+  `preferredFabricLocked` now prefers a CURRENT-incarnation connection and only
+  then applies the historical fab0-before-fab1 order. When nothing is current
+  it falls back to the old preference rather than returning nil, so the
+  pre-existing self-correcting path (write fails -> `handleDisconnect`) is
+  unchanged.
+
+  `installConn` computes `activeAfter` from the same helper, AFTER the
+  incarnation advance and the slot stamp — otherwise the cold-prime decision
+  disagrees with where the data will actually be sent.
+
+  **A supersession re-arms the cold prime (#5718 fold r4).** `needColdPrime`
+  was armed only on the full-disconnect edge. Superseding a CURRENT connection
+  is positive evidence of a new peer process — the signal #5480 records as
+  unavailable on the wire, which is why that path re-primes unconditionally. A
+  rebooted peer has an EMPTY session table, so leaving the obligation unarmed
+  leaves the standby with no synced sessions and blackholes every established
+  flow on the next failover to it. Re-priming is idempotent, so the cost of
+  being wrong is one redundant bulk. A link filling an EMPTY slot beside a live
+  one does NOT re-arm: same peer, and re-priming there would re-bulk on every
+  routine fabric flap (#466).
+
   **Atomicity of the ack is bound, not merely asserted (#5718 fold r3).** Every
   scenario test calls `installConn` and `handleMessage` in sequence, so none of
   them opens the window `s.mu` exists to close — an implementation that checks
