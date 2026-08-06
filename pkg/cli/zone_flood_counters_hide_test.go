@@ -47,6 +47,24 @@ func TestShowZonesDisplayZoneCountersNotAvailable(t *testing.T) {
 	if !strings.Contains(out, "Traffic statistics: not available") {
 		t.Fatalf("show security zones lacks the per-zone 'not available' marker; got:\n%s", out)
 	}
+
+	// #6843 M3: bind the CAUSE clause, not just the invariant prefix. Reverting
+	// the parenthetical to the pre-#6843 "(per-zone accounting not implemented
+	// in the userspace dataplane)" left both packages green, because the only
+	// assertion matched "Traffic statistics: not available". That wording is now
+	// actively wrong -- #3651 shipped per-zone accounting -- and with 64+ zones
+	// one command prints real byte counts for slotted zones and "not
+	// implemented" for overflowed ones, sending the operator after a feature gap
+	// that does not exist. Assert the reason, and assert the retracted claim is
+	// absent.
+	if !strings.Contains(out, "no per-zone volume published for this zone") {
+		t.Errorf("the unavailable line must name the CAUSE (nothing published "+
+			"for this zone), not just report unavailability:\n%s", out)
+	}
+	if strings.Contains(out, "not implemented") {
+		t.Errorf("the unavailable line still claims per-zone accounting is not "+
+			"implemented; #3651 shipped it, so this names the wrong cause:\n%s", out)
+	}
 	if strings.Contains(out, "0 packets, 0 bytes") {
 		t.Fatalf("show security zones printed a misleading 0/0 per-zone block; got:\n%s", out)
 	}
