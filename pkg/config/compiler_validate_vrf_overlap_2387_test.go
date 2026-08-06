@@ -201,10 +201,14 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 // check. One suffix comparison forbids appending, truncating, and rewording the
 // tail at once, and needs no maintenance as new promise spellings are invented.
 //
-// It deliberately starts AFTER the "…discriminator, so " clause. That keeps this
-// test scoped to the PROMISE dimension: stripping the diagnosis has to red
-// TestVRFOverlapWarningKeepsDiagnosticSubstance and only that test, which is
-// what makes the two tests separable rather than two spellings of one check.
+// It deliberately starts AFTER the "…discriminator, so " clause. That makes the
+// two tests SEPARABLE — not orthogonal, and the difference is measured. Deleting
+// the diagnosis reds TestVRFOverlapWarningKeepsDiagnosticSubstance and only that
+// test, so the substance check is not a second spelling of this one. The converse
+// does NOT hold: the tail carries the substantive polarity word ("may"), so
+// flipping it to "cannot" reds BOTH — this test on the suffix compare, the
+// substance test on its own phrase list. So read a red here as "the tail changed",
+// not as "someone made a promise"; a polarity edit lands in both columns at once.
 const vrfOverlapStatusTail = "colliding 5-tuples may cross-forward. " +
 	"See #2387 for the status of this limitation"
 
@@ -353,13 +357,21 @@ func vrfOverlapBothFormStrings(t *testing.T) (equal, unequal string) {
 	return eq[0], un[0]
 }
 
-// TestVRFOverlapWarningStatesStatusNotPromise pins that BOTH format strings
-// describe the current limitation and point at the tracking issue, without
-// forecasting EITHER outcome. Despite the name, "NotPromise" is shorthand for
-// "neither promises nor forecloses": the contract on validateVRFOverlap is
-// symmetric, so the test is too. Two layers, in order of strength: the message
-// must END with vrfOverlapStatusTail verbatim, and the message must carry none
-// of the known forecasting spellings — forward or backward — anywhere.
+// TestVRFOverlapWarningStatesStatusNotPromise pins two properties of BOTH format
+// strings: the message ENDS with vrfOverlapStatusTail verbatim, and the message
+// carries none of the KNOWN forecasting spellings — forward or backward —
+// anywhere. Despite the name, "NotPromise" is shorthand for "neither promises nor
+// forecloses": the contract on validateVRFOverlap is symmetric, so the test is
+// too.
+//
+// What that does NOT amount to is "the text cannot forecast either outcome". The
+// suffix compare is absolute but reaches only the tail; everything before it is
+// governed by two token BLOCKLISTS, which are incomplete by construction. Nine
+// foreclosing and nine promising sentences, each spliced before the tail in a
+// spelling nobody listed, left the whole package suite GREEN. Treat a green as
+// "the tail is intact and no listed spelling appears" — not as a proof of
+// neutrality. Do not respond by growing the lists; see the doctrine note at the
+// blocklist itself.
 //
 // Restoring the old "…may cross-forward until the session identity is VRF-aware"
 // wording reds this twice over: the suffix no longer matches, and "until" is on
