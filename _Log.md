@@ -925,6 +925,44 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 round 6: row 2 was still categorical, and the doc already knew why
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Round 5 made recovery path 3 conditional but left path 2 —
+  "Console on the seated secondary — CLOSED … `ErrClusterReadOnly` however the
+  operator reached the box" — as a bare absolute. It has a counterexample, and
+  the same section was already citing it: #6890 was listed as a *precondition
+  of path 3*, which it is not.
+  Verified firsthand on `origin/master` rather than taken from the gate report,
+  three greps, all three premises confirmed:
+  `git grep -n 'SetClusterReadOnly' -- 'pkg/**/*.go'` returns exactly two
+  production call sites, both in `pkg/daemon/daemon_ha.go` (`:442` false, `:474`
+  true), and both live inside `applyRG0OwnershipTransition`, whose only
+  production caller is the RG0 event consumer at `daemon_ha.go:419`. A new
+  redundancy group is constructed with `State: StateSecondary` directly in
+  `pkg/cluster/group_state.go` with no `sendEvent` — every `sendEvent` call site
+  is inside an election/failover transition. `Store.clusterReadOnly` is a plain
+  bool defaulting to false. So a node that cold-starts, seats as RG0 secondary
+  and never transitions leaves the gate unarmed. And
+  `git grep -n 'EnterConfigureSession' -- 'pkg/**/*.go'` shows the REST caller
+  at `pkg/api/config.go:110` has no cluster check, where the gRPC caller at
+  `pkg/grpcapi/server_config.go:76` guards with `IsLocalPrimary(0)`.
+  Changes, all documentation, no production Go touched:
+  1. Row 2 restated as "CLOSED only where the gate is actually ARMED", with the
+     arming mechanism, the cold-start case, and the REST/CLI/gRPC asymmetry
+     spelled out, and #6890/#6889 cited on the row they actually refute.
+  2. The #6890 bullet removed from path 3's precondition list — an unarmed gate
+     does not block promotion, it means the gate being cleared was never closed
+     — with a parenthetical saying so, and "depends on all three" corrected to
+     "both" to match the two bullets that remain.
+  3. The section opener no longer says "exactly one path works". That was the
+     third absolute in a row where the log already records two refuted ones;
+     it is now "no path is unconditional", and the closing sentence is scoped to
+     the recovery you can plan for rather than asserting recoverability.
+- **File(s)**: pkg/cluster/README.md, _Log.md
+- **Validation**: documentation only — `git diff --quiet HEAD -- '*.go'` rc=0.
+  `go build ./...` and `go test ./pkg/cluster ./pkg/daemon ./pkg/configstore
+  -count=1` re-run to confirm the tree is unchanged behaviourally.
 ## 2026-08-05 — #6865 round 5: stop summarizing recovery; the claim's SHAPE was wrong
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)

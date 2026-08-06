@@ -275,11 +275,13 @@ the HA-sync ingress path bypasses the gate).
    verify the secondary applied the key immediately after; treat a drop in that
    window as requiring the recovery below.
 
-**Recovery: exactly one path works, and it costs a controlled outage.** Two
-earlier revisions of this section got this wrong in opposite directions — one
-proposed a primary-only rekey and labelled it UNVERIFIED, the next said no
-recovery existed at all. Both were overclaims. The three candidate paths, stated
-individually so the next reader does not have to take a verdict on trust:
+**Recovery: no path is unconditional, and the one you can plan around costs a
+controlled outage.** Three earlier revisions of this section got this wrong in
+three different directions — one proposed a primary-only rekey and labelled it
+UNVERIFIED, the next said no recovery existed at all, the third said exactly one
+path works. Each replaced a hedge with an absolute and each was refuted. So the
+three candidate paths are stated individually, with their preconditions, rather
+than summarised into a verdict:
 
 1. **Primary-only rekey — CLOSED.** "Remove the key on the primary, let the peer
    reconnect unkeyed, config-sync pushes, re-add the key" cannot start: an
@@ -288,9 +290,19 @@ individually so the next reader does not have to take a verdict on trust:
    `validateClusterAuthKeyStrict`. This document says the same thing under "Do
    not try to return to dual-accept by clearing the key first". Tracked as
    **#6630**.
-2. **Console on the seated secondary — CLOSED.** The read-only gate is on the
-   **config store**, not the transport, so `EnterConfigureSession` returns
-   `ErrClusterReadOnly` however the operator reached the box.
+2. **Console on the seated secondary — CLOSED only where the gate is actually
+   ARMED.** The gate is on the **config store**, not the transport, so *when it
+   is armed* `EnterConfigureSession` returns `ErrClusterReadOnly` regardless of
+   which entry point the operator used — console, remote CLI, gRPC or REST.
+   Arming is not automatic, and that is the whole caveat: `SetClusterReadOnly(true)`
+   is reached only from the RG0 **transition** handler, so a node that cold-starts,
+   seats as secondary and never transitions still has a **writable** store. On
+   such a node this row is OPEN, and REST is the way in — `pkg/api/config.go`
+   enters a configure session with no RG0 check of its own, where the interactive
+   CLI (`pkg/cli/cli_dispatch.go`) and gRPC (`IsLocalPrimary(0)`) each have one.
+   Tracked as **#6890**; the dropped-event variant of the same unarmed-gate
+   failure is **#6889**. Do not treat this row as CLOSED on a node whose RG0
+   state you have not checked.
 3. **Controlled RG0 promotion — the only path that can work, and it is
    CONDITIONAL.** Stop `xpfd` on the keyed primary; *if* the secondary wins the
    election, `applyRG0OwnershipTransition(StatePrimary)` calls
@@ -305,15 +317,20 @@ individually so the next reader does not have to take a verdict on trust:
    - the promotion **event must be delivered**. `Manager.sendEvent` is
      non-blocking and drops on a full channel, and the dropped-event fallback
      does not reconcile `Store.ClusterReadOnly` — so the manager can report RG0
-     primary while the store stays read-only. Tracked as **#6889**;
-   - relatedly, a cold-start standby may never have had `SetClusterReadOnly(true)`
-     called at all, and REST has no RG0 check of its own. Tracked as **#6890**.
+     primary while the store stays read-only. Tracked as **#6889**.
+
+   (The unarmed-gate case from row 2 — **#6890** — is *not* a precondition here.
+   It does not block promotion; it means the gate you are trying to clear was
+   never closed on that node, so the recovery was never needed there. It is
+   listed under row 2, where it belongs, rather than padding this list.)
 
    So do not read this row as a procedure. It is the path that exists; whether
-   it is available on a given cluster at a given moment depends on all three.
+   it is available on a given cluster at a given moment depends on both.
 
-So the state is recoverable, but only by deliberately failing the cluster over —
-you have turned a config commit into an outage. That is why committing
+So the recovery you can actually plan for is a deliberate cluster failover —
+you have turned a config commit into an outage. (A node that happens to fall in
+the row-2 unarmed-gate case is writable without any of that, but you cannot
+design a procedure around a gap that is being closed.) That is why committing
 `authentication-key` must never restart cluster comms: the fallback exists, and
 it is one you would have to schedule.
 `TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
