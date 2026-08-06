@@ -1223,7 +1223,8 @@ type Application struct {
 	// (#3352).
 	UnknownTermLeaves []string
 	// DuplicateTermLeaves records the names of single-valued (scalar) leaves
-	// (destination-port / source-port / inactivity-timeout / timeout / alg) that
+	// (destination-port / source-port / inactivity-timeout / timeout / alg /
+	// icmp-type / icmp-code) that
 	// appeared MORE THAN ONCE with a CONFLICTING (different) value inside one
 	// inline `application <a> term <t>`. The inline term is opaque to the
 	// SchemaValidate walk, so a repeated scalar leaf — via apply-groups, flat-set
@@ -1236,7 +1237,9 @@ type Application struct {
 	// multi-protocol-term syntax. Mirroring UnknownTermLeaves, the offending leaf
 	// name is recorded and the deferred gate (validateApplicationStructureStrict)
 	// hard-rejects the first one on the strict commit path / warns on the tolerant
-	// load / peer-sync path (#3366).
+	// load / peer-sync path (#3366; icmp-type / icmp-code added in #6766 — their
+	// omission let a conflicting repeat silently narrow a referenced deny to the
+	// LAST type/code).
 	DuplicateTermLeaves []string
 	// DuplicateDirectLeaves records the names of single-valued (scalar) DIRECT
 	// match leaves (protocol / destination-port / source-port / inactivity-timeout
