@@ -70881,3 +70881,53 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   them divergently now describes a state production cannot reach. F5 ordering:
   r7 moved the row to first and derives the order from `CompileConfig`, which
   makes the claim true and bound rather than merely dropped.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 9 — accept fold6894b's `939405da3` and record MY OWN
+  verification of it, rather than its self-report. It is a clean descendant of
+  `fdc19cab2` (`git merge-base --is-ancestor` confirms), so there is no union
+  merge and no conflict to resolve; this entry adds the checks the merging lane
+  owes.
+  **_Log.md STRUCTURAL CHECK (the one that silently ate 66 lines on their
+  side).** Compared the file at `fdc19cab2` against `939405da3`: 70812 -> 70883
+  lines, delta +71, and the older file is an EXACT PREFIX of the newer
+  (`b.startswith(a)`). Nothing of the r8 entry was dropped. Line-count growth
+  alone is NOT sufficient — a union that both adds and silently drops can still
+  grow — so the prefix property is what was checked. Worth keeping as the test:
+  in a rebase `--theirs` means your OWN commit, not upstream, which is how a
+  union loses the side it was supposed to preserve.
+  **PRODUCIBILITY CHECK on the fixture widening — mine to run, not theirs to
+  assert.** I declined `PolicyScheduleRuleSlots` in r6 because `compiler.go`
+  appends only under `if pol.SchedulerName != ""` and no probe policy set it, so
+  the column would compare nil to nil. Their commit removes that premise by
+  giving `p-single` a `SchedulerName`. Verified the widening actually REACHES
+  the writer rather than assuming it: the column now yields ONE real slot,
+  `PolicySetID=0 RuleIndex=2 RuleID=2 PolicyName="p-single"
+  SchedulerName="sched-6894"`. Only with that confirmed is the column
+  non-vacuous, so the addition is accepted.
+  **THE SIX INFO SITES — the runtime regression this round exists for.**
+  `isValidationPass` gating expands from 9 to 20 non-test occurrences. The six
+  named sites (flow timeouts compiled / source NAT off rule / persistent NAT
+  pool registered / source NAT v6 rule / static NAT rule / static NAT
+  compilation complete) are all gated, plus nptv6 and two `count > 0 &&`
+  summaries. The defect was introduced BY THIS PR's own pre-pass: every commit
+  double-logged all six, and a config the pre-pass then REJECTED still logged
+  "persistent NAT pool registered" and "static NAT compilation complete" for
+  work that never happened. `TestPrePassLogsNoSuccessForWorkItDidNotDo_4960`
+  binds it and `TestRealPassStillLogsItsSuccesses_4960` is the over-reach arm —
+  both retained, because without the second a gate widened to suppress BOTH
+  passes would pass the first.
+  **BOTH ID-DRIVER TREATMENTS KEPT, not either.** Their derivation (the compared
+  key set derived from `compileIDsOnce`'s return map) is what stops the r8
+  defect recurring — a parallel list you must remember to edit fell out of sync
+  exactly once already. My per-column mutation proof is what shows it currently
+  binds. RE-RUN on the merged result, `go vet` rc=0 on every cell: `PolicyNames
+  differs`, `AppNames differs`, `PolicySets differs`, and now
+  `PolicyScheduleRuleSlots differs`. Four columns, four independent reds. The
+  two lanes were running DIFFERENT experiments, not disagreeing: one mutation
+  can only move the columns it touches, which is why their single-seed probe
+  moved two of three.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean.
+- **File(s)**: _Log.md
