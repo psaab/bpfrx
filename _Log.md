@@ -70384,3 +70384,81 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_peer_effective.go,
   pkg/config/ipip_anchor_only_4785_test.go,
   pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #4785 fold r4: Codex MERGE-NEEDS-MAJOR — five findings (#6861 F1-F5)
+
+- **Timestamp**: 2026-08-06
+- **Action** (F1, blocking): the BARE-interface arm of the device derivation was
+  `LinuxIfName(ep.Name)`, which is NOT what `snapshotLinuxName` does — its
+  no-unit arm resolves a `reth*` name through `ResolveReth` first. So an emitted
+  `reth0` endpoint was recorded live under device `reth0` when the snapshot
+  binds it to the physical member `ge-0-0-0`. The harm is a FALSE POSITIVE on a
+  DIFFERENT record: `ge-0/0/0` carrying its own unemitted ipip stanza has anchor
+  device `ge-0-0-0`, so with the wrong derivation that device is missing from
+  the live set and the advisory calls a live, traffic-carrying device dead —
+  this gate's own defect class surviving in its fallback arm. Fixed by splitting
+  `resolveBareKernelIfName` out of `ResolveKernelIfName` (the sanctioned
+  config-side twin of `snapshotLinuxName`, drift-guarded in the userspace
+  package) and routing the bare arm through it.
+- **Action** (F1b): the predicate is now `!emitted[t] && !live[t.Name]` — the
+  emitted-POINTER test restored ALONGSIDE the device-name test, not instead of
+  it. A record that is itself emitted belongs to the strict gate and the
+  dead-endpoint advisory, which is this advisory's stated contract and what
+  `TestIpipEmittedUnitIsNotDoubleReported_4785` already asserted. Device-name
+  alone reported the emitted `reth0` record with a structurally false cause
+  ("every unit overrides it" on an interface with no units).
+- **Action** (F2, major): the peer-effective gate is now handed the tree AFTER
+  `rewriteRetiredDataplaneType`, on a CLONE. Peer ingestion (Store.SyncApply)
+  strips a retired `system dataplane-type` leaf BEFORE compiling, so a
+  `groups node1` block carrying BOTH a retired leaf and a complete `ip-*` tunnel
+  failed the unconditional retirement validator on the raw tree —
+  `ValidatePeerEffectiveStrict` treats a peer view that will not compile as out
+  of scope and returns nil, so the gate returned SUCCESS WITHOUT EVER RUNNING
+  its IPIP subject. Reproduced end to end before the fix: node0 committed green,
+  node1's SyncApply installed `ip-0/0/0` mode ipip. The clone matters — mutating
+  the candidate would strip the operator's own leaf out of the tree being
+  committed and out of what syncs.
+- **Action** (F3): the device lookup is now STRUCTURAL, keyed on the
+  (interface, unit) pair each emitted ref came from, rather than parsing the ref
+  string. `ip-0/0/0.0` is a legal authored interface name and collides with the
+  synthesized unit ref for unit 0 of `ip-0/0/0`. See the mutation note below —
+  this fix has no end-to-end consequence today and the test says so.
+- **Action** (F4): the incomplete-endpoint remediation for a unit under an
+  interface-level `tunnel mode wireguard` stanza recommended "configure both
+  endpoints (and use `mode gre`…)", which is INEFFECTIVE — the emitter publishes
+  only the LOWEST unit and continues past every other per-unit record, so a
+  completed or GRE-converted unit still emits nothing (verified by compiling
+  exactly that). Both WireGuard-slot arms now share
+  `ipipWireguardSlotRemovalAdvice`, which names the one action that works and
+  marks both tempting alternatives as ineffective / destructive. A fourth
+  instance of the same family, so the set is not assumed closed: the
+  complete-but-not-under-WireGuard arm now renders an explicit "cause not
+  recognised — inspect, do not delete" rather than inheriting WireGuard's.
+- **Action** (F5): four assertions overstated what they bind. `unit 5` is a
+  strict PREFIX of `unit 50`, so the "EXACT" unit assertion stayed green under a
+  wrong-unit formatter; both it and the WireGuard twin now anchor on
+  `interfaces %q unit %d tunnel mode ipip`. The shared-device test never asserted
+  the UNEMITTED candidate was ipip (flipping it to gre left the subtest green for
+  the wrong reason). `TestIpipTunnelUnitOverrideCommitsButRaisesAnchorAlarm_4785`
+  looped over "whatever exists", so zero endpoints satisfied it; it now asserts
+  the count and the identity.
+- **Validation**: five disjoint mutations, each compiled (`go vet` 0) before
+  scoring, each restored byte-identical (sha256). R4-M1 (bare arm back to
+  `LinuxIfName`) REDs the reth guard at `device "ge-0-0-0" was declared DEAD but
+  that device carries the emitted reth0 endpoint`. R4-M2 (ref-first lookup) REDs
+  the F3 derivation test at `device "ip-0-0-0.0" is missing from the live set`.
+  R4-M3 (restore the shared incomplete text) REDs at `the advisory still
+  recommends completing the endpoints as though that would help`. R4-M4 (raw
+  tree to the peer gate) REDs at `node0 COMMITTED a config that gives node1 a
+  dead IPIP tunnel`. R4-M5 (`u*10`) REDs the exact-unit assertions, which the
+  pre-F5 `unit 5` form survived.
+  **F3 scope, recorded rather than dressed up**: reverting the structural walk
+  changes NO advisory, because the record whose device was being stolen is
+  itself emitted and the F1b pointer test skips it first. The string-keying
+  defect is unreachable end to end; the test binds the derivation's own output
+  and states that limit in its doc comment.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/types.go, pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/config/ipip_tunnel_reject_4785_test.go, pkg/configstore/store.go,
+  pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md

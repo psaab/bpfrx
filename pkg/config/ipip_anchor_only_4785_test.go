@@ -93,7 +93,7 @@ func TestIpipUnitAnchorStillAlarms_4785(t *testing.T) {
 			// The F2 shape verbatim: destination only, no source.
 			name:     "destination_only",
 			cmds:     []string{"set interfaces ip-0/0/0 unit 5 tunnel destination 10.0.0.2"},
-			wantUnit: `interfaces "ip-0/0/0" unit 5`,
+			wantUnit: `interfaces "ip-0/0/0" unit 5 tunnel mode ipip`,
 			want:     "no `tunnel source` is configured",
 		},
 		{
@@ -102,7 +102,7 @@ func TestIpipUnitAnchorStillAlarms_4785(t *testing.T) {
 			// this is an anchor too.
 			name:     "source_only",
 			cmds:     []string{"set interfaces ip-0/0/1 unit 3 tunnel source 10.0.0.1"},
-			wantUnit: `interfaces "ip-0/0/1" unit 3`,
+			wantUnit: `interfaces "ip-0/0/1" unit 3 tunnel mode ipip`,
 			want:     "no `tunnel destination` is configured",
 		},
 	} {
@@ -116,6 +116,12 @@ func TestIpipUnitAnchorStillAlarms_4785(t *testing.T) {
 					tc.cmds)
 			}
 			joined := strings.Join(warns, "\n")
+			// The trailing " tunnel mode ipip" is part of the wanted string on
+			// purpose (#6861 F5): production formats `interfaces %q unit %d`, so
+			// a bare `unit 5` is a strict PREFIX of `unit 50` and a Contains
+			// check on it stays GREEN when the formatter reports the wrong unit
+			// as long as the right one is a prefix. Anchoring on the next token
+			// closes that.
 			if !strings.Contains(joined, tc.wantUnit) {
 				t.Errorf("the advisory must name the EXACT interface and unit the dead "+
 					"anchor belongs to, want %q; an advisory naming some other unit sends "+
@@ -148,7 +154,13 @@ func TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861(t *testing.T) {
 		cmds       []string
 		wantRef    string // the emitted endpoint ref
 		wantDevice string // the device that ref resolves to
-		why        string
+		// candidate is the UNEMITTED ipip record whose suppression is under
+		// test. Asserting it is really ipip is not redundant (#6861 F5):
+		// without it, flipping this record to gre leaves the subtest GREEN —
+		// silent for the MODE reason instead of the shared-device reason, so
+		// the assertion below would no longer be measuring anything.
+		candidate func(*Config) *TunnelConfig
+		why       string
 	}{
 		{
 			// compiler_interfaces.go gives unit 0's per-unit tunnel the BASE
@@ -164,6 +176,9 @@ func TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861(t *testing.T) {
 			},
 			wantRef:    "ip-0/0/0.0",
 			wantDevice: "ip-0-0-0",
+			candidate: func(c *Config) *TunnelConfig {
+				return c.Interfaces.Interfaces["ip-0/0/0"].Tunnel
+			},
 			why: "the interface-level ipip record and unit 0's GRE record carry the " +
 				"SAME Linux device name, and that device is the one the working GRE " +
 				"tunnel runs on",
@@ -183,6 +198,9 @@ func TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861(t *testing.T) {
 			),
 			wantRef:    "wg0.3",
 			wantDevice: "wg0u3",
+			candidate: func(c *Config) *TunnelConfig {
+				return c.Interfaces.Interfaces["wg0"].Units[3].Tunnel
+			},
 			why: "the sole unit is the lowest, so the emitted WireGuard endpoint is " +
 				"keyed to it and resolves to the unit's own device — live WireGuard " +
 				"infrastructure, not a dead IPIP anchor",
@@ -206,6 +224,18 @@ func TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861(t *testing.T) {
 			if eps[0].Tunnel.Mode == "ipip" {
 				t.Fatalf("fixture's EMITTED endpoint is itself ipip; that makes this the "+
 					"strict gate's subject, not the anchor advisory's: %+v", eps[0])
+			}
+			cand := tc.candidate(cfg)
+			if cand == nil || cand.Mode != "ipip" {
+				t.Fatalf("fixture precondition: the UNEMITTED record under test must "+
+					"carry mode ipip, else this subtest passes because the advisory "+
+					"skips it on MODE and proves nothing about the shared device: %+v",
+					cand)
+			}
+			if cand.Name != tc.wantDevice {
+				t.Fatalf("fixture precondition: the unemitted record's anchor device "+
+					"must be %q — the same device the emitted endpoint binds to — or "+
+					"there is no collision to suppress; got %q", tc.wantDevice, cand.Name)
 			}
 			if got := cfg.TunnelNameMap()[tc.wantRef]; got != tc.wantDevice {
 				t.Fatalf("fixture precondition: the emitted ref %q must resolve to device "+
@@ -372,7 +402,7 @@ func TestIpipRemediationsNeverInstructTrafficLoss_6861(t *testing.T) {
 			t.Errorf("the advisory still offers the deletion of the interface-level "+
 				"WireGuard stanza as an alternative remediation (#6861 F1b): %q", warns[0])
 		}
-		if !strings.Contains(warns[0], "Do NOT remove the interface-level") {
+		if !strings.Contains(warns[0], "do NOT remove that interface-level stanza") {
 			t.Errorf("the advisory does not warn the operator off the parent removal, "+
 				"leaving the more destructive of the two obvious moves unmarked: %q",
 				warns[0])
@@ -577,7 +607,9 @@ func TestIpipUnitUnderWireguardNamesTheSlotCause_6861(t *testing.T) {
 	}
 	got := warns[0]
 
-	if !strings.Contains(got, `unit 3`) {
+	// Anchored past the number for the same reason as F5 above: bare `unit 3`
+	// is a prefix of `unit 30`.
+	if !strings.Contains(got, `interfaces "wg0" unit 3 tunnel mode ipip`) {
 		t.Errorf("the advisory does not name the unit it is about: %q", got)
 	}
 	// The three ways the shared interface text was wrong here.
@@ -594,6 +626,13 @@ func TestIpipUnitUnderWireguardNamesTheSlotCause_6861(t *testing.T) {
 	if !strings.Contains(got, "Remove THIS UNIT's `tunnel` stanza") {
 		t.Errorf("the advisory does not offer the remediation that actually drops "+
 			"this dead anchor (#6861 F1): %q", got)
+	}
+	// #6861 F4: completing the endpoints is INEFFECTIVE here, and the advisory
+	// must say so rather than leaving it as an implied option.
+	if !strings.Contains(got, "does NOT make it emit") {
+		t.Errorf("the advisory leaves \"just complete the endpoints\" open as an "+
+			"apparent remedy; under interface-level WireGuard it cannot work "+
+			"(#6861 F4): %q", got)
 	}
 	// The advisory must still carry what it always did: the anchor device name
 	// and the #4785 reference.
@@ -632,5 +671,202 @@ func TestIpipIncompleteUnitStillNamesTheMissingHalf_6861(t *testing.T) {
 	if strings.Contains(warns[0], "takes the") {
 		t.Errorf("the slot cause displaced the missing-half cause; the incomplete "+
 			"check must stay FIRST: %q", warns[0])
+	}
+}
+
+// ipipRethMemberShape is the #6861 F1 fixture: an emitted `reth0` tunnel
+// endpoint whose device is the PHYSICAL MEMBER `ge-0-0-0`, plus a separate
+// unemitted ipip record on that member whose anchor device is that same
+// `ge-0-0-0`.
+//
+// The member's ipip record is unemitted because its unit overrides it, so it is
+// exactly the kind of record the anchor advisory inspects — and its device is
+// carrying reth0's working GRE tunnel.
+func ipipRethMemberShape() []string {
+	return []string{
+		"set chassis cluster redundancy-group 1 node 0 priority 100",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
+		"set interfaces ge-0/0/0 tunnel mode ipip",
+		"set interfaces ge-0/0/0 tunnel source 10.5.5.1",
+		"set interfaces ge-0/0/0 tunnel destination 10.5.5.2",
+		"set interfaces ge-0/0/0 unit 1 tunnel mode gre",
+		"set interfaces ge-0/0/0 unit 1 tunnel source 10.5.5.1",
+		"set interfaces ge-0/0/0 unit 1 tunnel destination 10.5.5.3",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 tunnel mode gre",
+		"set interfaces reth0 tunnel source 10.0.0.1",
+		"set interfaces reth0 tunnel destination 10.0.0.2",
+	}
+}
+
+// TestIpipBareRefResolvesLikeTheSnapshot_6861 is the fail-on-revert guard for
+// #6861 F1: the BARE-interface arm of the device derivation must be
+// snapshotLinuxName's bare arm, not `LinuxIfName(ref)`.
+//
+// snapshotLinuxName resolves a `reth*` interface through ResolveReth to its
+// physical member (pkg/dataplane/userspace/interfaces.go), so an emitted `reth0`
+// endpoint occupies device `ge-0-0-0`. `LinuxIfName("reth0")` returns "reth0"
+// instead — a device nothing binds — so `ge-0-0-0` is missing from the live set
+// and the member's own unemitted ipip anchor, which sits on that device, is
+// reported as carrying no traffic. That is a false alarm against the device
+// reth0's tunnel is running on: the same defect class as the rest of this PR,
+// surviving in the fallback arm.
+//
+// RED-on-revert: restore `LinuxIfName(ep.Name)` for the bare arm and this fails
+// at "declared DEAD ... but that device carries the emitted reth0 endpoint".
+func TestIpipBareRefResolvesLikeTheSnapshot_6861(t *testing.T) {
+	cfg, err := CompileConfigLenient(ipipTree(t, ipipRethMemberShape()...))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// PRECONDITIONS. reth0 must really emit, its device must really be the
+	// member, and the member's ipip record must really sit on that device.
+	var rethDevice string
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		if ep.Name == "reth0" {
+			rethDevice = cfg.ResolveKernelIfName(ep.Name)
+		}
+	}
+	if rethDevice != "ge-0-0-0" {
+		t.Fatalf("fixture precondition: the emitted reth0 endpoint must resolve to "+
+			"the physical member device \"ge-0-0-0\" (that is what makes the bare arm "+
+			"observably different from LinuxIfName); got %q", rethDevice)
+	}
+	member := cfg.Interfaces.Interfaces["ge-0/0/0"]
+	if member == nil || member.Tunnel == nil || member.Tunnel.Mode != "ipip" ||
+		member.Tunnel.Name != "ge-0-0-0" {
+		t.Fatalf("fixture precondition: the member must carry an ipip record whose "+
+			"anchor device is the same \"ge-0-0-0\": %+v", member)
+	}
+
+	var warns []string
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "kernel anchor device") && strings.Contains(w, "ge-0-0-0\"") {
+			warns = append(warns, w)
+		}
+	}
+	if len(warns) != 0 {
+		t.Errorf("device \"ge-0-0-0\" was declared DEAD but that device carries the "+
+			"emitted reth0 endpoint — the bare-interface arm must resolve a reth "+
+			"name through ResolveReth exactly as snapshotLinuxName does, or the live "+
+			"set misses the member device entirely (#6861 F1): %v", warns)
+	}
+}
+
+// TestIpipDottedInterfaceNameResolvesToItsOwnDevice_6861 binds #6861 F3 at the
+// DERIVATION, and is explicit that it is not an end-to-end guard.
+//
+// `ip-0/0/0.0` is a legal AUTHORED interface name, and both it and unit 0 of
+// `ip-0/0/0` are emitted under the identical ref "ip-0/0/0.0". Keying the device
+// lookup on that string made the bare interface consume the UNIT's TunnelNameMap
+// entry, so the bare interface's own device "ip-0-0-0.0" never entered the live
+// set at all. The structural walk resolves each emitted ref from the (interface,
+// unit) pair it came from, so both devices are recorded.
+//
+// HONEST SCOPE — read before trusting this as a fail-on-revert guard. Reverting
+// to the ref-keyed lookup does NOT change any advisory, and no fixture makes it
+// do so. The record whose device was being stolen is itself EMITTED, and
+// ipipAnchorOnlyWarnings skips every emitted record on pointer identity before
+// the device set is consulted. So the string-keying defect is currently
+// unreachable end to end; what is asserted here is the derivation's own output,
+// which does differ. Reverting the structural walk fails THIS test and nothing
+// else — that is the honest extent of the binding, and it is recorded rather
+// than dressed up as behavioural coverage.
+func TestIpipDottedInterfaceNameResolvesToItsOwnDevice_6861(t *testing.T) {
+	cfg, err := CompileConfigLenient(ipipTree(t,
+		"set interfaces ip-0/0/0 unit 0 tunnel mode gre",
+		"set interfaces ip-0/0/0 unit 0 tunnel source 10.0.0.1",
+		"set interfaces ip-0/0/0 unit 0 tunnel destination 10.0.0.2",
+		"set interfaces ip-0/0/0.0 tunnel source 10.9.9.1",
+		"set interfaces ip-0/0/0.0 tunnel destination 10.9.9.2",
+	))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// PRECONDITION: the collision must actually exist — two DIFFERENT records
+	// emitted under one ref, carrying two DIFFERENT devices.
+	var devices []string
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		if ep.Name != "ip-0/0/0.0" {
+			t.Fatalf("fixture precondition: both records must emit under the single "+
+				"colliding ref \"ip-0/0/0.0\"; got %q", ep.Name)
+		}
+		devices = append(devices, ep.Tunnel.Name)
+	}
+	if len(devices) != 2 {
+		t.Fatalf("fixture precondition: expected 2 endpoints colliding on one ref, "+
+			"got %d (%v)", len(devices), devices)
+	}
+
+	live := emittedTunnelDeviceNames(cfg)
+	for _, want := range []string{"ip-0-0-0", "ip-0-0-0.0"} {
+		if !live[want] {
+			t.Errorf("device %q is missing from the live set. Both an authored "+
+				"interface named \"ip-0/0/0.0\" and unit 0 of \"ip-0/0/0\" emit under "+
+				"that one ref, so a lookup keyed on the ref STRING records only "+
+				"whichever the map happens to hold and silently drops the other. "+
+				"Resolution must come from the (interface, unit) pair (#6861 F3). "+
+				"live=%v", want, live)
+		}
+	}
+}
+
+// TestIpipWireguardSlotRemediationIsAchievable_6861 is the fail-on-revert guard
+// for #6861 F4: an INCOMPLETE unit under an interface-level WireGuard stanza was
+// told to "configure both endpoints (and use mode gre or mode wireguard…)".
+// That is factually ineffective — the emitter publishes only the LOWEST unit and
+// continues past every other per-unit record — so an operator who complies gets
+// the same dead anchor and no endpoint.
+//
+// RED-on-revert: restore the shared incomplete-branch text and this fails at
+// "still recommends completing the endpoints".
+func TestIpipWireguardSlotRemediationIsAchievable_6861(t *testing.T) {
+	incomplete := append(ipipWgIfaceStanza(),
+		"set interfaces wg0 unit 1 family inet address 10.1.1.1/30",
+		"set interfaces wg0 unit 3 tunnel mode ipip",
+		"set interfaces wg0 unit 3 tunnel source 10.0.0.1",
+	)
+	cfg, err := CompileConfig(ipipTree(t, incomplete...))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	warns := ipipAnchorOnlyWarnings(cfg)
+	if len(warns) != 1 {
+		t.Fatalf("expected exactly 1 anchor advisory, got %d: %v", len(warns), warns)
+	}
+	got := warns[0]
+
+	// The missing half is still the reported CAUSE — that part was correct.
+	if !strings.Contains(got, "no `tunnel destination` is configured") {
+		t.Errorf("the incomplete cause was lost: %q", got)
+	}
+	if !strings.Contains(got, "does NOT make it emit") {
+		t.Errorf("the advisory still recommends completing the endpoints as though "+
+			"that would help; under interface-level WireGuard the unit can never be "+
+			"emitted no matter how it is completed (#6861 F4): %q", got)
+	}
+
+	// THE PROOF. Follow the old advice to the letter — complete BOTH endpoints
+	// AND switch to `mode gre`, the two things it recommended — and show the
+	// unit still emits nothing.
+	followed := append(ipipWgIfaceStanza(),
+		"set interfaces wg0 unit 1 family inet address 10.1.1.1/30",
+		"set interfaces wg0 unit 3 tunnel mode gre",
+		"set interfaces wg0 unit 3 tunnel source 10.0.0.1",
+		"set interfaces wg0 unit 3 tunnel destination 10.0.0.2",
+	)
+	fixed, err := CompileConfig(ipipTree(t, followed...))
+	if err != nil {
+		t.Fatalf("compile after following the advice: %v", err)
+	}
+	for _, ep := range EmitTunnelEndpointNames(fixed) {
+		if ep.Name == "wg0.3" {
+			t.Fatalf("this test's premise is stale: after completing the endpoints and "+
+				"switching to gre, unit 3 DID emit (%+v). The old advice would then "+
+				"have been effective and the assertion above is measuring nothing — "+
+				"re-derive before trusting it", ep)
+		}
 	}
 }

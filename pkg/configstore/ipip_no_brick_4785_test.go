@@ -265,3 +265,131 @@ func TestSyncApplyIpipDoesNotRelaxTheStrictCommit_4785(t *testing.T) {
 		t.Errorf("CommitCheck must reject for the IPIP reason, not some unrelated one: %v", err)
 	}
 }
+
+// ipipPeerRetiredPlusIpip is the #6861 F2 shape: node1's `${node}` group carries
+// BOTH a retired `system dataplane-type` leaf AND a complete `ip-*` tunnel.
+//
+// Real peer ingestion strips the retired leaf (rewriteRetiredDataplaneType,
+// SyncCaller) BEFORE compiling, so node1 boots and installs the tunnel. The
+// peer-effective gate used to be handed the RAW tree, where the unconditional
+// retirement validator fails the compile — and ValidatePeerEffectiveStrict
+// treats a peer view that will not compile as out of scope and returns nil.
+const ipipPeerRetiredPlusIpip = `groups {
+    node0 {
+        interfaces {
+            ge-0/0/9 {
+                unit 0 {
+                    family inet {
+                        address 10.7.7.1/24;
+                    }
+                }
+            }
+        }
+    }
+    node1 {
+        system {
+            dataplane-type dpdk;
+        }
+        interfaces {
+            ip-0/0/0 {
+                tunnel {
+                    source 10.9.9.1;
+                    destination 10.9.9.2;
+                }
+            }
+        }
+    }
+}
+apply-groups "${node}";`
+
+// TestPeerGateSeesTheTreeThePeerCompiles_4785 is the fail-on-revert guard for
+// #6861 F2: the peer-effective gate must evaluate the tree the standby will
+// ACTUALLY compile, not the raw candidate.
+//
+// Without the rewrite the gate did not merely pass — it never RAN its IPIP
+// subject at all, which is a different and worse failure than a subject that
+// evaluated and was satisfied. The r2 work closed "the gate ran and passed";
+// this closes "the gate never ran".
+//
+// The second half asserts the consequence rather than trusting the mechanism:
+// node1's tolerant ingest really does install the endpoint, so a green commit on
+// node0 really does strand a dead tunnel on the peer.
+//
+// RED-on-revert: pass the raw `tree` to ValidatePeerEffectiveStrict again and
+// this fails at "node0 COMMITTED a config that gives node1 a dead IPIP tunnel".
+func TestPeerGateSeesTheTreeThePeerCompiles_4785(t *testing.T) {
+	// The consequence, established FIRST so the assertion below is anchored to
+	// a demonstrated outcome rather than to the gate's own bookkeeping.
+	peer := newTestStoreAt(t, filepath.Join(t.TempDir(), "peer"))
+	peer.SetNodeID(1)
+	peerCfg, err := peer.SyncApply(ipipPeerRetiredPlusIpip, nil)
+	if err != nil {
+		t.Fatalf("precondition: node1's tolerant ingest must ACCEPT this tree "+
+			"(#1960 no-brick) — that is what makes the origin's gate the only place "+
+			"it can be caught: %v", err)
+	}
+	ifc := peerCfg.Interfaces.Interfaces["ip-0/0/0"]
+	if ifc == nil || ifc.Tunnel == nil || ifc.Tunnel.Mode != "ipip" {
+		t.Fatalf("precondition: node1 must actually INSTALL the dead endpoint, else "+
+			"there is nothing for the origin gate to prevent: %+v", ifc)
+	}
+
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	s.SetNodeID(0)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.LoadOverride(ipipPeerRetiredPlusIpip); err != nil {
+		t.Fatalf("LoadOverride: %v", err)
+	}
+	_, err = s.CommitCheck()
+	if err == nil {
+		t.Fatal("node0 COMMITTED a config that gives node1 a dead IPIP tunnel. The " +
+			"peer-effective gate was handed the RAW tree, whose node1 view fails the " +
+			"unconditional retired-dataplane validator, so ValidatePeerEffectiveStrict " +
+			"took its out-of-scope arm and returned success WITHOUT EVER RUNNING the " +
+			"IPIP subject. Production strips that leaf before compiling, so the gate " +
+			"must be given the rewritten tree (#6861 F2)")
+	}
+	if !strings.Contains(err.Error(), "mode ipip") {
+		t.Errorf("the rejection must be the IPIP subject firing, not some unrelated "+
+			"failure — a gate that rejects for the wrong reason is not the gate "+
+			"running: %v", err)
+	}
+	if !strings.Contains(err.Error(), "peer node1") {
+		t.Errorf("the rejection must name the PEER whose view carries the defect: %v", err)
+	}
+}
+
+// TestPeerGateRewriteDoesNotMutateTheCandidate_4785 is the over-reach guard for
+// the F2 fix: modelling the peer's ingest must not edit the tree being
+// committed.
+//
+// rewriteRetiredDataplaneType mutates in place, so passing the candidate
+// directly would silently strip the operator's own `dataplane-type` leaf out of
+// the committed config — turning a gate into an undeclared config rewrite, and
+// removing the leaf that must still SYNC so the standby's own tolerance handles
+// it.
+//
+// Stays GREEN under the revert (the raw-tree version never rewrote anything).
+func TestPeerGateRewriteDoesNotMutateTheCandidate_4785(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	s.SetNodeID(0)
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := s.LoadOverride(ipipPeerRetiredPlusIpip); err != nil {
+		t.Fatalf("LoadOverride: %v", err)
+	}
+	if _, err := s.CommitCheck(); err == nil {
+		t.Fatal("precondition: this tree must be rejected for the peer's IPIP endpoint")
+	}
+	shown := s.ShowCandidate()
+	if !strings.Contains(shown, "dataplane-type dpdk") {
+		t.Errorf("the peer-gate rewrite leaked into the CANDIDATE: the operator's "+
+			"`dataplane-type dpdk` leaf is gone from the tree they are committing. "+
+			"The rewrite models the standby's ingest and must run on a CLONE — the "+
+			"leaf has to survive to sync so the standby's own tolerance handles it "+
+			"(#6861 F2). candidate:\n%s", shown)
+	}
+}

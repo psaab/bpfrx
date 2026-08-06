@@ -371,11 +371,16 @@ func TestIpipTunnelUnitOverrideCommitsButRaisesAnchorAlarm_4785(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tolerant compile: %v", err)
 	}
-	for _, ep := range EmitTunnelEndpointNames(cfg) {
-		if ep.Tunnel.Mode == "ipip" {
-			t.Fatalf("premise broken: the emitter published an ipip endpoint %q; this "+
-				"test's point is that it does not", ep.Name)
-		}
+	// The COUNT is asserted, not just the modes (#6861 F5): a loop over
+	// "whatever exists" is satisfied by ZERO endpoints, so an emitter that
+	// published nothing at all would score this premise green and the rest of
+	// the test would then be measuring an empty config.
+	eps := EmitTunnelEndpointNames(cfg)
+	if len(eps) != 1 || eps[0].Name != "ip-0/0/0.1" || eps[0].Tunnel.Mode != "gre" {
+		t.Fatalf("premise broken: this fixture must publish EXACTLY the one gre "+
+			"endpoint ip-0/0/0.1 — an ipip endpoint would make it the strict gate's "+
+			"subject, and zero endpoints would make the rest of this test vacuous. "+
+			"got %d: %+v", len(eps), eps)
 	}
 	if _, err := CompileConfig(tree); err != nil {
 		t.Errorf("no ipip endpoint is emitted, so the strict gate must not block the "+

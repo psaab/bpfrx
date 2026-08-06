@@ -68,21 +68,65 @@ func effectiveIpipTunnelSites(cfg *Config) []ipipTunnelSite {
 // which for a unit with its own tunnel stanza is that UNIT's device even when
 // the emitted endpoint carries the interface-level object.
 //
-// TunnelNameMap is therefore the derivation used here rather than a second
-// hand-rolled one — the same reason effectiveIpipTunnelSites delegates to
-// EmitTunnelEndpointNames. It keys unit refs ("ip-0/0/0.0") only; an
-// interface-level tunnel on an interface with NO units is emitted under the
-// bare interface ref, which resolves through LinuxIfName exactly as
-// snapshotLinuxName's no-unit arm does.
+// Resolution is STRUCTURAL — keyed on the (interface, unit) pair the emitter
+// emitted from — not on parsing the emitted ref string (#6861 F1/F3). Two
+// defects came from parsing the string, both reproduced before this fix:
+//
+//   - `LinuxIfName(ep.Name)` was NOT what snapshotLinuxName does for a bare
+//     interface ref. Its no-unit arm resolves a `reth*` name through ResolveReth
+//     first, so an emitted `reth0` endpoint was recorded live under "reth0"
+//     when the snapshot actually binds it to the physical member "ge-0-0-0".
+//     The harm is a FALSE POSITIVE on a different record: `ge-0/0/0` (reth0's
+//     member) carrying its own unemitted ipip stanza has anchor device
+//     "ge-0-0-0" — the very device reth0's endpoint runs on — so with the wrong
+//     derivation that device is absent from the live set and the advisory calls
+//     a live, traffic-carrying device dead. That is this gate's own defect class
+//     surviving in its fallback arm.
+//   - Looking the ref up in TunnelNameMap first let an interface whose AUTHORED
+//     name contains a dot consume an unrelated unit's entry: `ip-0/0/0.0` is a
+//     legal interface name, and both it and unit 0 of `ip-0/0/0` are emitted
+//     under the identical ref "ip-0/0/0.0". Production collides on that too
+//     (buildTunnelEndpointSnapshots keys ifaceByName by the same string), so
+//     which device is live is genuinely undecidable here — and marking BOTH
+//     live is the correct failure mode for an ADVISORY, whose harm is a false
+//     "this device is dead" aimed at live config.
+//
+// The device derivation itself is still delegated: resolveBareKernelIfName and
+// ResolveKernelIfName (pkg/config/types.go) are the sanctioned config-side twin
+// of snapshotLinuxName, carrying a drift-guard test in the userspace package.
+// What this function owns is only the structural walk — which (interface, unit)
+// pair each emitted ref came from — mirroring how buildInterfaceSnapshots names
+// its rows.
 func emittedTunnelDeviceNames(cfg *Config) map[string]bool {
-	refToDevice := cfg.TunnelNameMap()
-	out := make(map[string]bool)
+	if cfg == nil {
+		return nil
+	}
+	emittedRefs := make(map[string]bool)
 	for _, ep := range EmitTunnelEndpointNames(cfg) {
-		if device, ok := refToDevice[ep.Name]; ok && device != "" {
-			out[device] = true
+		emittedRefs[ep.Name] = true
+	}
+
+	out := make(map[string]bool)
+	for name, iface := range cfg.Interfaces.Interfaces {
+		if iface == nil {
 			continue
 		}
-		out[LinuxIfName(ep.Name)] = true
+		// The bare interface row. EmitTunnelEndpointNames publishes this ref
+		// only for an interface-level tunnel on an interface with no units.
+		if emittedRefs[name] {
+			out[cfg.resolveBareKernelIfName(name)] = true
+		}
+		for unitNum, unit := range iface.Units {
+			if unit == nil {
+				continue
+			}
+			// Synthesized from the STRUCTURE, so this is unambiguously the
+			// unit arm even when `name` itself contains a dot.
+			ref := fmt.Sprintf("%s.%d", name, unitNum)
+			if emittedRefs[ref] {
+				out[cfg.ResolveKernelIfName(ref)] = true
+			}
+		}
 	}
 	return out
 }
@@ -191,6 +235,10 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 		return nil
 	}
 	live := emittedTunnelDeviceNames(cfg)
+	emitted := make(map[*TunnelConfig]bool)
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		emitted[ep.Tunnel] = true
+	}
 
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
@@ -204,13 +252,13 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 		if iface == nil {
 			continue
 		}
-		if t := iface.Tunnel; t != nil && t.Mode == "ipip" && !live[t.Name] &&
+		if t := iface.Tunnel; t != nil && t.Mode == "ipip" && !emitted[t] && !live[t.Name] &&
 			// The interface-level anchor screen in collectAppliedTunnels. A
 			// record that fails it creates nothing, so there is nothing to warn
 			// about.
 			t.Source != "" {
 			out = append(out, ipipAnchorOnlyText(
-				fmt.Sprintf("interfaces %q", name), t, false))
+				fmt.Sprintf("interfaces %q", name), t, false, false))
 		}
 
 		unitNums := make([]int, 0, len(iface.Units))
@@ -225,11 +273,12 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 			}
 			// No source screen here, on purpose: collectAppliedTunnels has none
 			// for units, so ANY non-nil unit tunnel becomes an anchor.
-			if unit.Tunnel.Mode != "ipip" || live[unit.Tunnel.Name] {
+			if unit.Tunnel.Mode != "ipip" || emitted[unit.Tunnel] || live[unit.Tunnel.Name] {
 				continue
 			}
 			out = append(out, ipipAnchorOnlyText(
-				fmt.Sprintf("interfaces %q unit %d", name, u), unit.Tunnel, true))
+				fmt.Sprintf("interfaces %q unit %d", name, u), unit.Tunnel, true,
+				iface.Tunnel != nil && iface.Tunnel.Mode == "wireguard"))
 		}
 	}
 	return out
@@ -256,6 +305,29 @@ const ipipInterfaceStanzaRemovalAdvice = "Removing the interface-level `tunnel` 
 	"`tunnel source` and `tunnel destination` INHERITS them from this stanza and " +
 	"would stop emitting an endpoint altogether — give those units explicit " +
 	"endpoints first, then remove it."
+
+// ipipWireguardSlotRemovalAdvice is the ONLY remediation offered for a unit
+// anchor sitting under an interface-level `tunnel mode wireguard` stanza,
+// whether that unit's endpoint is complete or incomplete (#6861 F1b/F4).
+//
+// Removing the unit's own stanza is the single action that both drops the dead
+// anchor and cannot cost traffic. The two alternatives an operator would
+// otherwise reach for are each unsafe, and both were offered before:
+//
+//   - Removing the interface-level WireGuard stanza deletes the working
+//     WireGuard tunnel AND exposes the unit's ipip endpoint, which the strict
+//     gate then rejects.
+//   - Completing the unit's endpoints is simply INEFFECTIVE. The emitter
+//     publishes one endpoint keyed by the LOWEST unit and continues past every
+//     other per-unit record (tunnelemit.go), so a completed — or GRE-converted
+//     — unit still emits nothing. Verified by compiling exactly that config.
+const ipipWireguardSlotRemovalAdvice = "Remove THIS UNIT's `tunnel` stanza to " +
+	"drop the dead anchor — it is the only action that helps. Completing this " +
+	"unit's endpoints, or switching it to `mode gre`, does NOT make it emit: " +
+	"the interface-level WireGuard stanza holds the interface's single endpoint " +
+	"slot. And do NOT remove that interface-level stanza to free the slot: it " +
+	"deletes the working WireGuard tunnel AND exposes this ipip endpoint, which " +
+	"the commit gate then rejects."
 
 // ipipAnchorOnlyText renders one anchor-only advisory, naming the ACTUAL reason
 // the endpoint was not emitted. isUnit selects the fallback wording, and is
@@ -295,29 +367,54 @@ const ipipInterfaceStanzaRemovalAdvice = "Removing the interface-level `tunnel` 
 // says explicitly why removing the interface-level WireGuard stanza is not the
 // alternative it was previously presented as (it deletes a working tunnel and
 // exposes a complete ipip endpoint the commit gate then rejects).
-func ipipAnchorOnlyText(where string, t *TunnelConfig, isUnit bool) string {
+func ipipAnchorOnlyText(where string, t *TunnelConfig, isUnit, underIfaceWireguard bool) string {
 	var cause, fix string
-	if isUnit {
+	switch {
+	case isUnit && underIfaceWireguard:
 		cause = "the interface-level `tunnel mode wireguard` stanza takes the " +
 			"interface's single tunnel endpoint, so this unit's own endpoint is " +
 			"never emitted even though it is fully configured"
-		fix = "Remove THIS UNIT's `tunnel` stanza to drop the dead anchor. Do NOT " +
-			"remove the interface-level `tunnel mode wireguard` stanza to free the " +
-			"endpoint slot: that deletes the working WireGuard tunnel AND exposes " +
-			"this complete ipip endpoint, which the commit gate then rejects."
-	} else {
+		fix = ipipWireguardSlotRemovalAdvice
+	case isUnit:
+		// Enumerated against the emitter, a COMPLETE unit record reaches here
+		// ONLY under an interface-level WireGuard short-circuit, so this arm is
+		// currently unreachable. It exists so that a future mode gaining its own
+		// short-circuit produces an honest "cause unknown" rather than silently
+		// inheriting WireGuard's — the failure this whole family of fixes is
+		// about is confident advice that is wrong.
+		cause = "no tunnel endpoint is emitted for this unit, and the reason is " +
+			"not one this check recognises"
+		fix = "Inspect the interface-level `tunnel` stanza and this unit's own; " +
+			"one of them is suppressing the other. Do not delete either before " +
+			"establishing which."
+	default:
 		cause = "no tunnel endpoint is emitted for the interface-level stanza " +
 			"(every unit overrides it)"
 		fix = ipipInterfaceStanzaRemovalAdvice
 	}
 	if missing := ipipMissingEndpointHalves(t); missing != "" {
 		cause = fmt.Sprintf("%s, so no tunnel endpoint is emitted", missing)
-		fix = "Configure both endpoints (and use `mode gre` or `mode wireguard` " +
-			"for a tunnel that carries traffic)"
-		if isUnit {
-			fix += ", or remove THIS UNIT's `tunnel` stanza."
-		} else {
-			fix += ". " + ipipInterfaceStanzaRemovalAdvice
+		switch {
+		case isUnit && underIfaceWireguard:
+			// #6861 F4: the missing half is a TRUE cause, but "configure both
+			// endpoints" is an INEFFECTIVE remedy here and was offered as the
+			// first recommendation. Interface-level WireGuard emits only the
+			// LOWEST unit and never visits the others (tunnelemit.go), so
+			// completing this unit's endpoints — with or without switching it to
+			// `mode gre` — still emits nothing. Verified by compiling exactly
+			// that: the emitted set stays the single WireGuard endpoint.
+			cause += " — and completing it would not help, because the " +
+				"interface-level `tunnel mode wireguard` stanza already holds the " +
+				"interface's only tunnel endpoint"
+			fix = ipipWireguardSlotRemovalAdvice
+		case isUnit:
+			fix = "Configure both endpoints (and use `mode gre` or `mode " +
+				"wireguard` for a tunnel that carries traffic), or remove THIS " +
+				"UNIT's `tunnel` stanza."
+		default:
+			fix = "Configure both endpoints (and use `mode gre` or `mode " +
+				"wireguard` for a tunnel that carries traffic). " +
+				ipipInterfaceStanzaRemovalAdvice
 		}
 	}
 	return fmt.Sprintf(

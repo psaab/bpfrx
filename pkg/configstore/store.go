@@ -425,7 +425,27 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	// CompileConfigForNodeLenient transform the standby applies) so a peer-only
 	// error is rejected here, at the one strict gate that ever sees this config.
 	// Standalone (nodeID < 0) has no peer and is a no-op.
-	if err := config.ValidatePeerEffectiveStrict(tree, nodeID); err != nil {
+	//
+	// #6861 F2: the gate must be handed the tree the PEER will actually
+	// compile, not the raw candidate. Store.SyncApply runs
+	// rewriteRetiredDataplaneType BEFORE compileTreeLenient, so a peer
+	// `groups nodeN` block carrying a retired `system dataplane-type` leaf
+	// compiles fine on the standby but fails the unconditional retirement
+	// validator here. ValidatePeerEffectiveStrict treats a peer view that
+	// will not compile as out of scope and returns nil — so the gate
+	// returned SUCCESS WITHOUT EVER RUNNING ITS IPIP SUBJECT, and the
+	// standby then stripped the retired leaf and installed the dead tunnel.
+	// Reproduced end-to-end before this fix: node0 committed green, node1's
+	// SyncApply installed `ip-0/0/0` mode ipip.
+	//
+	// The rewrite is applied to a CLONE. Mutating the candidate here would
+	// silently strip the operator's own leaf out of the tree being
+	// committed — the strict local path must keep rejecting it, and the
+	// peer group's leaf must survive to sync so the standby's own
+	// tolerance is what handles it.
+	peerTree := tree.Clone()
+	rewriteRetiredDataplaneType(peerTree, SyncCaller)
+	if err := config.ValidatePeerEffectiveStrict(peerTree, nodeID); err != nil {
 		return nil, err
 	}
 	return compiled, nil
