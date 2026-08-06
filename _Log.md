@@ -66352,3 +66352,22 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/session_glue/tests.rs,
   userspace-dp/src/afxdp/session_glue/README.md,
   docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-05 22:40
+- **Action**: #6211 fold r2 — bind the delete-sync teardown END TO END. A
+  call-site deletion matrix over all four `release_source_nat_allocation`
+  call sites found TWO unbound: `handle_delete_synced` (exit 101 but ONLY the
+  known-flaky `shared_cos_lease` / `wg::engine` families failed, so not
+  attributable to the mutation — the full suite at head had zero failures) and
+  the GC reap in `worker/loop_body/mod.rs` (exit 0, zero failures). The r1 leak
+  test called `release_source_nat_allocation` DIRECTLY, binding the function and
+  leaving the wiring deletable. Added
+  `delete_synced_frees_both_allocators_end_to_end_6211`, which drives the whole
+  story through the REAL entry points: `handle_upsert_synced` twice (the second
+  against a snapshot that shares the allocators via the Arc-backed
+  `PortAllocator` clone but has lost `zone_id_to_name`, i.e. a zone
+  delete/renumber) to reach the two-allocator state, then
+  `handle_delete_synced`. Its `(1, 1)` precondition proves the leak state is
+  reachable through the real import path, not only via the direct call. The GC
+  reap gap is PRE-EXISTING and unrelated to #6211, so it was FILED as #6901
+  rather than folded in.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/tests.rs, _Log.md

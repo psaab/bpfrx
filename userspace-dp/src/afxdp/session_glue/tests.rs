@@ -7065,3 +7065,142 @@ fn handle_upsert_synced_resolves_active_zone_pair_for_snat_reserve_6211() {
     );
     let _ = &key;
 }
+
+// #6211 FAIL-ON-REVERT (delete-sync teardown, END TO END): the leak and its fix
+// driven entirely through the REAL entry points — `handle_upsert_synced` twice,
+// then `handle_delete_synced`.
+//
+// The `nat/tests_pool.rs` leak test calls `reserve_synced_source_nat_allocation`
+// and `release_source_nat_allocation` DIRECTLY, so it binds those functions'
+// internals and leaves the WIRING free to be deleted. Deleting the
+// `release_source_nat_allocation` call from `handle_delete_synced` left the
+// whole package green (the only failures were the known-flaky `shared_cos_lease`
+// / `wg::engine` families, not the mutation). This test closes that: it reaches
+// the release through `handle_delete_synced` itself.
+//
+// It also exercises the leak on the genuinely SYNCED path — both reservations
+// are created by the import (`reserve_flow` on a pre-computed wire tuple), never
+// by a local `allocate_translation`.
+#[test]
+fn delete_synced_frees_both_allocators_end_to_end_6211() {
+    let mut forwarding = ForwardingState::default();
+    forwarding.source_nat_rules = crate::nat::parse_source_nat_rules(&[
+        crate::SourceNATRuleSnapshot {
+            name: "snat-dmz".to_string(),
+            from_zone: "dmz".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-dmz".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+        crate::SourceNATRuleSnapshot {
+            name: "snat-lan".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["0.0.0.0/0".to_string()],
+            pool_name: "pool-lan".to_string(),
+            pool_addresses: vec!["203.0.113.10/32".to_string()],
+            port_low: 20000,
+            port_high: 20099,
+            ..crate::SourceNATRuleSnapshot::default()
+        },
+    ]);
+    forwarding.zone_id_to_name.insert(1, "lan".to_string());
+    forwarding.zone_id_to_name.insert(2, "wan".to_string());
+
+    // A SECOND snapshot that shares the same allocators (the `PortAllocator`
+    // clone is `Arc`-backed) but has LOST the zone names — a zone delete or
+    // renumber. This is what flips the selection outcome between upserts.
+    let mut forwarding_after_zone_drop = forwarding.clone();
+    forwarding_after_zone_drop.zone_id_to_name.clear();
+
+    let key = crate::session::SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: "10.0.61.50".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40000,
+        dst_port: 443,
+    };
+    let mut decision = test_decision();
+    decision.nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+    let make_entry = || SyncedSessionEntry {
+        key: key.clone(),
+        decision,
+        metadata: SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            is_reverse: false,
+            ..test_metadata()
+        },
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+        generation: 0,
+        session_id: 0,
+    };
+
+    let mut sessions = SessionTable::new();
+    let ha_state: BTreeMap<i32, HAGroupRuntime> = BTreeMap::new();
+    let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+
+    // Upsert #1 — zones resolve, so the reserve lands in the lan rule.
+    crate::afxdp::session_glue::commands::handle_upsert_synced(
+        &mut sessions,
+        -1,
+        &forwarding,
+        &ha_state,
+        &dynamic_neighbors,
+        make_entry(),
+        1_000,
+        1,
+    );
+    // Upsert #2 — the SAME live session re-synced (HA reconnect / resync) after
+    // the zone drop, so the reserve lands in the dmz rule instead.
+    crate::afxdp::session_glue::commands::handle_upsert_synced(
+        &mut sessions,
+        -1,
+        &forwarding_after_zone_drop,
+        &ha_state,
+        &dynamic_neighbors,
+        make_entry(),
+        2_000,
+        2,
+    );
+
+    let before = crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules);
+    assert_eq!(
+        (before[0].used_ports, before[1].used_ports),
+        (1, 1),
+        "precondition: the re-upsert put the SAME session in BOTH independent \
+         allocators — this is the state the first-hit `break` used to strand"
+    );
+
+    // Teardown through the REAL delete-sync entry point.
+    let mut deleted_keys: Vec<crate::session::SessionKey> = Vec::new();
+    crate::afxdp::session_glue::commands::handle_delete_synced(
+        &mut sessions,
+        -1,
+        &forwarding_after_zone_drop,
+        key.clone(),
+        3_000,
+        &mut deleted_keys,
+    );
+
+    let after = crate::nat::source_nat_pool_statuses(&forwarding.source_nat_rules);
+    assert_eq!(
+        (after[0].used_ports, after[1].used_ports),
+        (0, 0),
+        "#6211: delete-sync must free the reservation from EVERY allocator — \
+         deleting the release call from handle_delete_synced, or restoring the \
+         first-hit `break`, strands one of them"
+    );
+    assert_eq!(deleted_keys, vec![key], "control: the key was recorded (#6457)");
+}
