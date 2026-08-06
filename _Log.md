@@ -66307,3 +66307,33 @@ break — `go vet` confirmed passing under every revert.
   hand-maintained list.
   **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_5275_test.go, pkg/cli/userspace_control_shape_5275_test.go
 
+- **Timestamp**: 2026-08-06
+  **Action**: #5275 PR2 fold — the facade NARROWED the dynamic type and 11 of 27
+  runtime capability probes across pkg/api, pkg/cli and pkg/grpcapi were failing.
+  *dataplaneFacade embeds nothing, so four methods it did not name vanished from
+  the type consumers type-assert against: AppliedNATView (deterministic
+  source-NAT #5794 returned Available:false on all three surfaces),
+  PolicySchedulerActiveState (a FAIL-OPEN display — a policy the dataplane was
+  SKIPPING rendered as enabled on CLI+gRPC while REST, which reads d.dp through a
+  daemon closure, disagreed), and IterateSessionsFrom/V6From (REST/gRPC cursor
+  paging degraded to the offset path, and filtered clear fell back to the O(N^2)
+  rescan #4719 replaced because it can starve the HA watchdog). All four are now
+  carried and gated. The enumeration was not the fix: added
+  dataplane_facade_probes.go with a daemon-side mirror per probe SHAPE plus
+  compile-time assertions, and a go/ast scan (TestFacadeCoversEveryConsumerProbe)
+  that re-derives every `X.dp.(T)` probe from consumer source and fails when one
+  names a method the facade lacks — so a fifth omission cannot ship silently. The
+  probes file states what that proof does and does NOT cover (grep-spelling
+  scope; signatures proved transitively via the backend assertion).
+  Also: added `var _ facadeBackend = (*LegacyDataPlaneAdapter)(nil)` so a rename
+  on the one reachable backend is a build error instead of a green build with
+  every management surface blanked, and made an unsatisfied union log
+  slog.Error instead of returning nil in silence. The union is KEPT rather than
+  degraded to read-only — with the assertion in place a partial backend cannot
+  exist in-tree, and a partial facade would reproduce exactly the silent
+  degradation this fold is fixing. Corrected the false "nothing revokes the
+  facade" claim in the code comment: runBootstrapExitStartup reaches
+  setDataplane(nil) after the servers hold it. Replaced the 12-of-36 hand-picked
+  revocation sample with a reflection walk asserting both directions on every
+  delegator.
+  **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_probes.go, pkg/daemon/dataplane_facade_5275_test.go, pkg/daemon/dataplane_facade_probe_coverage_5275_test.go, pkg/daemon/dataplane_facade_consumer_binding_5275_test.go, pkg/dataplane/retirement_boundary_canary_test.go, docs/pr/1373-retire-ebpf-dataplane/README.md
