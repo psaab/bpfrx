@@ -46,10 +46,16 @@ func newProofResult(pending []int) *CompileResult {
 
 // vlanChild registers ifidx as a VLAN sub-interface of parent, exactly as
 // compiler_iface.go marks them: genericXDPIfindexes set, not a tunnel.
+//
+// NetNsID is netnsIDLocal because that is what LinkDeserialize produces for a
+// vlan whose real_dev shares its namespace — the ordinary case. The zero value
+// of a hand-built netlink.LinkAttrs is 0, which is a REAL foreign nsid, so
+// leaving it unset would model a link production never hands back and would
+// quietly route every fixture through the foreign-parent belt.
 func vlanChild(r *CompileResult, ifidx, parent int) {
 	r.genericXDPIfindexes[ifidx] = true
 	r.linkIdxMap[ifidx] = &netlink.Vlan{
-		LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent},
+		LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent, NetNsID: netnsIDLocal},
 	}
 }
 
@@ -463,26 +469,53 @@ func TestArmProofProvenDownRecordCoversOnlyItsOwnChild(t *testing.T) {
 
 // The link kinds a "<phys>.<vid>" name can actually hold. Each constructor
 // builds what netlink.LinkByIndex deserialises that device to, and every
-// ParentIndex below is a shape verified against this netlink version in a
-// network namespace — not a hypothetical.
+// ParentIndex/NetNsID pair below is a shape verified against this netlink
+// version in a network namespace — not a hypothetical.
 //
-//	genuine vlan  p0.100@p0  -> type=vlan     parentIdx=<real_dev>
-//	cross-ns veth p0.100@if6 -> type=veth     parentIdx=<PEER, foreign ns>
-//	macvlan       r0.300@r0  -> type=macvlan  parentIdx=<lower dev>
+//	genuine vlan   p0.100@p0  -> type=vlan     parentIdx=<real_dev>          netnsid=-1
+//	orphan vlan    p0.100@if5 -> type=vlan     parentIdx=<real_dev, FOREIGN> netnsid=0
+//	cross-ns veth  p0.100@if6 -> type=veth     parentIdx=<PEER, foreign ns>  netnsid=0
+//	macvlan        r0.300@r0  -> type=macvlan  parentIdx=<lower dev>         netnsid=-1
 //
-// The veth is the sharp one: its ParentIndex is an ifindex in ANOTHER
-// namespace, so it carries no relationship at all to the same-numbered local
-// interface it collides with.
+// Two of these are sharp, for the same reason: their ParentIndex is an ifindex
+// in ANOTHER namespace, so it carries no relationship at all to the
+// same-numbered local interface it collides with. The veth is caught by the
+// KIND belt. The orphan vlan is not — it really is an 802.1Q device — which is
+// why the namespace belt exists.
+//
+// NetNsID is set explicitly on every one of them. LinkDeserialize seeds -1 and
+// overwrites it only from IFLA_LINK_NETNSID, which the kernel emits exactly
+// when link_net != dev_net; a hand-built LinkAttrs zero-values it to 0, which
+// is a real foreign nsid. An unset field here would silently be the FOREIGN
+// case.
 func genuineVlanLink(ifidx, parent int) netlink.Link {
-	return &netlink.Vlan{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent}, VlanId: 50}
+	return &netlink.Vlan{
+		LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent, NetNsID: netnsIDLocal},
+		VlanId:    50,
+	}
+}
+
+// foreignParentVlanLink is the orphan: a genuine 802.1Q device whose real_dev
+// was left behind in another namespace. Measured shape — type "vlan",
+// ParentIndex naming an ifindex in that other namespace, netnsid 0 (NOT a
+// positive id, which is why the belt tests `!= -1`). It is a LIVE surface: it
+// refuses LinkSetUp only while the foreign real_dev is down, and comes up and
+// forwards once that device is up in its own namespace.
+func foreignParentVlanLink(ifidx, parent int) netlink.Link {
+	return &netlink.Vlan{
+		LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent, NetNsID: 0},
+		VlanId:    50,
+	}
 }
 
 func foreignPeerVethLink(ifidx, parent int) netlink.Link {
-	return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent}}
+	return &netlink.Veth{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent, NetNsID: 0}}
 }
 
 func lowerDevMacvlanLink(ifidx, parent int) netlink.Link {
-	return &netlink.Macvlan{LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent}}
+	return &netlink.Macvlan{
+		LinkAttrs: netlink.LinkAttrs{Index: ifidx, ParentIndex: parent, NetNsID: netnsIDLocal},
+	}
 }
 
 // delegatedChild registers ifidx as a surface the COMPILER filed as a VLAN
@@ -507,17 +540,21 @@ func delegatedChild(r *CompileResult, ifidx, parent int, kind func(int, int) net
 // vishvananda/netlink folds IFLA_LINK into LinkAttrs.ParentIndex in the COMMON
 // attribute loop, for every link kind. Both branches that can make a child read
 // as covered — the proven-down promotion to SKIPPED and the delegation to a
-// covered required parent — read that field as a VLAN parent. For a
+// covered required parent — read that field as a LOCAL VLAN parent. For a
 // cross-namespace veth, IFLA_LINK is the PEER's ifindex in the foreign
 // namespace, which can numerically alias any local interface; for a macvlan it
-// is a lower device that demuxes nothing. Either way an unrelated local
-// interface answers for a surface it has no relationship to.
+// is a lower device that demuxes nothing; and for an ORPHAN VLAN — a genuine
+// 802.1Q device whose real_dev was left in another namespace — it is that
+// real_dev's ifindex over there, which aliases just as freely while the KIND
+// belt waves it through. Either way an unrelated local interface answers for a
+// surface it has no relationship to.
 //
 // It is reachable, not theoretical: ensureVLANSubInterface adopts ANY existing
-// device named "<phys>.<vid>", the ifindex is then recorded as a delegated VLAN
-// child, the userspace attach loop skips it so it never gets a shim, and the
-// unmanaged sweep will not remove it because the name's prefix before '.' is a
-// managed interface. The device stays UP and forwarding with no XDP.
+// device named "<phys>.<vid>", without checking its kind OR where its real_dev
+// lives; the ifindex is then recorded as a delegated VLAN child, the userspace
+// attach loop skips it so it never gets a shim, and the unmanaged sweep will
+// not remove it because the name's prefix before '.' is a managed interface.
+// The device stays UP and forwarding with no XDP.
 func TestArmProofNonVLANChildNeverInheritsItsParentIndex(t *testing.T) {
 	// The two arms are the two ways a child can end up counted as covered.
 	// Both must be closed: closing one leaves the other as a live under-count.
@@ -556,6 +593,17 @@ func TestArmProofNonVLANChildNeverInheritsItsParentIndex(t *testing.T) {
 	}{
 		{"cross_namespace_veth", foreignPeerVethLink},
 		{"macvlan", lowerDevMacvlanLink},
+		// The orphan vlan passes the KIND belt — it IS an 802.1Q device — so
+		// only the namespace belt stops it. Its ParentIndex is an ifindex in
+		// the namespace its real_dev was left in, free to collide with any
+		// local one. Unlike the two above, this row cannot be dismissed as an
+		// inert device: measured on this kernel, the orphan refuses LinkSetUp
+		// only while that foreign real_dev is DOWN (rc=2, ENETDOWN) and comes
+		// up and forwards the moment it is brought up there (rc=0,
+		// up|broadcast|running). An earlier revision of the source comment
+		// asserted the opposite; that experiment had simply left the real_dev
+		// down.
+		{"foreign_namespace_vlan", foreignParentVlanLink},
 	}
 
 	for _, arm := range arms {
@@ -578,10 +626,10 @@ func TestArmProofNonVLANChildNeverInheritsItsParentIndex(t *testing.T) {
 					t.Fatalf("the child surface vanished from the report; got %s", rep.SurfaceSummary())
 				}
 				if child.Kind != CoverageUncovered {
-					t.Fatalf("a %s is NOT an 802.1Q child, so its ParentIndex names no parent — it "+
-						"must read UNCOVERED, not %s. Reading it as %s lets ifindex 10 answer for a "+
-						"surface it has no relationship to, and hides a live interface forwarding "+
-						"with no shim on it; got %+v (%s)",
+					t.Fatalf("a %s carries no LOCAL 802.1Q parent, so its ParentIndex names nothing "+
+						"in this namespace — it must read UNCOVERED, not %s. Reading it as %s lets "+
+						"ifindex 10 answer for a surface it has no relationship to, and hides a "+
+						"live interface forwarding with no shim on it; got %+v (%s)",
 						kind.name, child.Kind, arm.wrong, child, rep.SurfaceSummary())
 				}
 				if child.Via != 0 {
@@ -607,13 +655,19 @@ func TestArmProofNonVLANChildNeverInheritsItsParentIndex(t *testing.T) {
 //
 // It drives the SAME two arms over the SAME fixture — same ifindexes, same
 // aliasing, same unarmed record, same lookup — varying ONE thing: the child is
-// a genuine 802.1Q device. Both arms must still reach their covered readings.
+// an ordinary LOCAL 802.1Q device (kind "vlan", NetNsID netnsIDLocal, i.e. the
+// exact shape LinkDeserialize returns for reth0.50 on the loss cluster). Both
+// arms must still reach their covered readings.
 //
-// Without this, "make every delegated child uncovered" passes the test above
-// while re-breaking every VLAN deployment the previous fold fixed: the loss
-// cluster's reth0.50/reth0.80 and the standalone VM's VLAN 50 would go back to
-// driving would-gate on a clean operator action. It is the kind that
-// discriminates, not the delegation.
+// It is the negative control for BOTH belts in coverDelegated, and it is what
+// stops either from being widened into "make every delegated child uncovered":
+// that mutation passes the test above while re-breaking every VLAN deployment
+// the earlier fold fixed — the loss cluster's reth0.50/reth0.80 and the
+// standalone VM's VLAN 50 would go back to driving would-gate on a clean
+// operator action. What discriminates is the kind AND the parent's locality,
+// never the delegation itself. It is also why the namespace belt is spelled
+// `!= netnsIDLocal` rather than a positive-id test: this control fixture
+// carries -1, and the orphan it must reject carries 0.
 func TestArmProofVLANKindIsTheDiscriminator(t *testing.T) {
 	t.Run("parent_proven_down_still_skips", func(t *testing.T) {
 		r := newProofResult([]int{20})

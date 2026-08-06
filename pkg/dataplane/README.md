@@ -437,14 +437,32 @@ a test in `armproof_5275_test.go`.
   unmanaged sweep will not remove it because the name's prefix before `.` is a
   managed interface. So `coverDelegated` requires `Link.Type() == "vlan"`
   (`vlanLinkKind`) and otherwise reports `uncovered` with `Via` left zero —
-  naming a bogus parent would repeat the same confusion in the log. Two limits
-  are stated rather than assumed: a genuine VLAN whose real device was moved to
-  another namespace keeps its kind, but the kernel forces it admin-DOWN and
-  `LinkSetUp` fails `ENETDOWN`, so it is not a live surface; and the check binds
-  the *kind*, not the *configured* parent — an adopted VLAN stacked on a
-  different device delegates to that device, which stays honest because the
-  parent's XDP really does see its tagged frames. The adoption itself is a
-  separate production defect; this belt only stops the proof from laundering it
+  naming a bogus parent would repeat the same confusion in the log.
+- **…and only once the parent is proven to be in THIS namespace.** The kind
+  belt is necessary, not sufficient: a genuine 802.1Q device whose `real_dev`
+  was left in another namespace keeps kind `"vlan"` and keeps a `ParentIndex`
+  that now names an ifindex *over there*, aliasing local ifindexes just as
+  freely. `coverDelegated` therefore also requires
+  `LinkAttrs.NetNsID == netnsIDLocal` (`-1`). The kernel emits
+  `IFLA_LINK_NETNSID` exactly when `link_net != dev_net`, and netlink seeds
+  `-1` and overwrites it only from that attribute, so `-1` means "local
+  parent". The test is `!= -1`, **not** `> 0`: a foreign parent's nsid is
+  commonly **zero** (measured), and netlink parses the wire `s32` unsigned
+  (`int(native.Uint32(...))`), so a wire `-1` arrives as `4294967295` — which
+  `!= -1` still rejects, conservatively.
+  - An earlier revision of this document claimed such an orphan is forced
+    admin-DOWN, that `LinkSetUp` fails `ENETDOWN`, and that it is therefore not
+    a live surface. **That was wrong**, and the experiment behind it only
+    reproduced because it left the foreign `real_dev` DOWN. Re-measured: with
+    the `real_dev` down, `LinkSetUp` does fail (rc=2, `ENETDOWN`, oper=down);
+    bring it **up in its own namespace** and the orphan comes up
+    (`up|broadcast|running`, oper=up) and forwards. `vlan_dev_open` refuses only
+    while the `real_dev` is down.
+- One limit is stated rather than assumed: the checks bind the *kind* and the
+  parent's *namespace*, not the *configured* parent — an adopted VLAN stacked on
+  a different local device delegates to that device, which stays honest because
+  the parent's XDP really does see its tagged frames. The adoption itself is a
+  separate production defect; these belts only stop the proof from laundering it
   into a covered count.
 - **A surface the compiler declined to arm is not silently absent.**
   `compiler_iface.go` soft-skips **four** ways, each leaving the compile

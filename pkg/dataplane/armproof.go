@@ -448,13 +448,25 @@ func isDelegatedSurface(result *CompileResult, ifidx int) bool {
 // premise ("a VLAN cannot pass traffic while its real device is DOWN") holds
 // against the device that actually carries it.
 //
-// WHAT IT DOES NOT PROVE, stated so a later reader does not assume more. A
-// genuine vlan whose real_dev was moved to another network namespace keeps its
-// kind and keeps a ParentIndex that now refers to a FOREIGN ifindex. Verified
-// in a namespace against this netlink version: such an orphan is forced
-// admin-DOWN, LinkSetUp fails ENETDOWN, and it cannot transmit — so it is not
-// a live forwarding surface and classifying it from a same-numbered local
-// record is not the under-count this belt exists to stop.
+// WHAT IT DOES NOT PROVE, stated so a later reader does not assume more. The
+// kind alone does NOT prove the parent is LOCAL. A genuine vlan whose real_dev
+// lives in another network namespace keeps kind "vlan" and keeps a ParentIndex
+// that now names an ifindex in the FOREIGN namespace — so it passes this belt
+// and its parent key is meaningless here. That is why netnsIDLocal exists; see
+// below.
+//
+// An earlier revision of this comment disposed of that case by asserting such
+// an orphan is forced admin-DOWN, that LinkSetUp fails ENETDOWN, and that it
+// cannot transmit. That is FALSE, and the experiment it came from only
+// reproduced because it left the foreign real_dev DOWN. Re-measured on this
+// kernel with three namespaces, moving the child out and leaving the real_dev
+// behind: with the real_dev DOWN, LinkSetUp does fail (rc=2, ENETDOWN,
+// flags=broadcast, oper=down) — but bring that real_dev UP in ITS OWN
+// namespace and the orphan comes up (rc=0, flags=up|broadcast|running,
+// oper=up) and forwards. `vlan_dev_open` refuses only while the real_dev is
+// down; nothing pins it down permanently. So the orphan IS a live forwarding
+// surface, and letting a same-numbered local record answer for it is exactly
+// the under-count this belt exists to stop.
 //
 // Nor does it prove the resolved parent is the CONFIGURED one. An adopted vlan
 // stacked on a different device delegates to that device instead. The verdict
@@ -464,6 +476,44 @@ func isDelegatedSurface(result *CompileResult, ifidx int) bool {
 // record it per child, which is a CompileResult data-model change and not part
 // of an observe-only phase.
 const vlanLinkKind = "vlan"
+
+// netnsIDLocal is the LinkAttrs.NetNsID value meaning "this link's real_dev
+// lives in MY namespace", i.e. its ParentIndex is a local ifindex.
+//
+// The kernel emits IFLA_LINK_NETNSID only when the link's link_net differs
+// from its dev_net (rtnl_fill_link_netnsid); for an 8021q device link_net is
+// dev_net(real_dev). So the attribute is present EXACTLY when the parent is
+// foreign. vishvananda/netlink pre-seeds -1 in LinkDeserialize
+// (link_linux.go:2064) and overwrites it only from that attribute
+// (link_linux.go:2304), so -1 means "not emitted" means "local parent".
+//
+// The comparison MUST be `!= -1`, never `> 0` or `>= 0`. Two reasons, both
+// measured rather than reasoned:
+//
+//  1. A foreign parent's nsid is commonly ZERO — the reproduction below read
+//     netnsid=0 on the orphan — so `> 0` would let exactly the case this belt
+//     exists for straight through.
+//  2. netlink parses the wire s32 UNSIGNED: `int(native.Uint32(...))`. A wire
+//     NETNSA_NSID_NOT_ASSIGNED (-1), which peernet2id_alloc can return when
+//     the peer net is not alive, therefore arrives as 4294967295 on a 64-bit
+//     build, not as -1. `!= -1` still catches it, in the conservative
+//     direction; a signed-minded check would not.
+//
+// Measured on this kernel with this netlink version (dummy real_dev p0 + vlan
+// child p0.100, child moved to a peer netns, probed through
+// netlink.LinkByIndex):
+//
+//	p0.100  type="vlan" parentIndex=5 netnsid=0   real_dev DOWN -> LinkSetUp rc=2 (ENETDOWN)
+//	p0.100  type="vlan" parentIndex=5 netnsid=0   real_dev UP   -> LinkSetUp rc=0, up|running
+//	loc0.100 type="vlan" parentIndex=7 netnsid=-1 (local control, up|running)
+//
+// The middle row is the whole point: the orphan is a LIVE forwarding surface
+// whose ParentIndex(5) is an ifindex in another namespace, free to collide
+// with any local interface. Note the zero value of a hand-built
+// netlink.LinkAttrs is 0, NOT -1 — only LinkDeserialize seeds -1 — so a test
+// fixture must set this explicitly or it models a link production cannot
+// produce.
+const netnsIDLocal = -1
 
 // coverDirect classifies one attach point that must carry its own instance.
 func coverDirect(lookup instanceLookup, ifidx int) SurfaceCoverage {
@@ -519,8 +569,12 @@ func unarmedByIfindex(result *CompileResult) map[int]UnarmedSurface {
 // `unarmed` is the one case where a parent OUTSIDE the required set is not a
 // hole in the proof: see the PROVEN-DOWN PARENT note below.
 //
-// EVERY branch here reads ParentIndex as a VLAN delegation, so the link must be
-// PROVEN to be an 802.1Q device first — see vlanLinkKind.
+// EVERY branch here reads ParentIndex as a LOCAL VLAN delegation, so the link
+// must be PROVEN to be an 802.1Q device (vlanLinkKind) AND proven to have a
+// same-namespace real_dev (netnsIDLocal) before that field means anything. The
+// kind alone is not enough: an orphan vlan whose real_dev was left in another
+// namespace keeps kind "vlan" and a foreign ParentIndex, and it is a live
+// forwarding surface, not an inert one.
 func coverDelegated(
 	result *CompileResult,
 	direct map[int]SurfaceCoverage,
@@ -568,6 +622,35 @@ func coverDelegated(
 		s.Detail = fmt.Sprintf(
 			"vlan child: ifindex %d is a %q link, not an 802.1Q vlan — its ParentIndex is not a "+
 				"vlan delegation and proves nothing about this surface", ifidx, kind)
+		return s
+	}
+	if nsid := lnk.Attrs().NetNsID; nsid != netnsIDLocal {
+		// A GENUINE 802.1Q device whose real_dev is in ANOTHER namespace.
+		//
+		// The kind belt above passes it — it really is a vlan — but its
+		// ParentIndex is an ifindex in that foreign namespace, so using it as a
+		// key into isRequired/unarmed/direct lets an unrelated LOCAL interface
+		// that happens to hold the same number answer for this surface: alias a
+		// proven-down one and the child inherits SKIPPED, alias a covered
+		// required one and it inherits DELEGATED. Both are UNDER-counts, which
+		// is the direction that hides a live forwarding surface with no shim.
+		//
+		// And it IS live: the orphan is refused only while its foreign real_dev
+		// is DOWN. Bring that real_dev up in its own namespace and the child
+		// comes up and forwards — measured, see netnsIDLocal. Reachable by the
+		// same route as the wrong-kind squatter: ensureVLANSubInterface adopts
+		// any existing "<phys>.<vid>" without checking where its real_dev
+		// lives, the userspace attach loop skips it as a delegated child, and
+		// the unmanaged sweep leaves it alone because the name's prefix before
+		// '.' is managed.
+		//
+		// Via stays ZERO for the same reason as the wrong-kind branch: printing
+		// a foreign ifindex as a covering parent repeats the confusion in the
+		// operator's log.
+		s.Detail = fmt.Sprintf(
+			"vlan child: ifindex %d is an 802.1Q vlan whose real_dev is in ANOTHER namespace "+
+				"(link-netnsid %d) — its ParentIndex names a foreign ifindex and proves nothing "+
+				"about this surface", ifidx, nsid)
 		return s
 	}
 	parent := lnk.Attrs().ParentIndex

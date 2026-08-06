@@ -68426,3 +68426,80 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md,
   docs/research/5275-arm-failclosed/plan.md, _Log.md
+
+## 2026-08-06 — #6864 fold r5: the foreign-netns orphan VLAN is a LIVE surface; close it
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold, one MAJOR — a claim in my own r3 comment
+  was refuted by reproduction, and the residual it dismissed is real.
+
+  **The refuted claim.** The `vlanLinkKind` "WHAT IT DOES NOT PROVE" block (and
+  the matching README sentence) disposed of the foreign-namespace orphan by
+  asserting that a genuine vlan whose `real_dev` moved to another netns "is
+  forced admin-DOWN, LinkSetUp fails ENETDOWN, and it cannot transmit — so it
+  is not a live forwarding surface". Reproduced firsthand on this kernel with
+  `unshare -rn` (dummy `p0` + vlan child `p0.100`, child moved to a peer netns,
+  probed through `netlink.LinkByIndex`):
+
+      real_dev DOWN : LinkSetUp rc=2 ENETDOWN, flags=broadcast, oper=down
+      real_dev UP   : LinkSetUp rc=0, flags=up|broadcast|running, oper=up
+      both legs     : Type()="vlan"  ParentIndex=5 (FOREIGN ns)  NetNsID=0
+      local control : loc0.100 Type()="vlan" ParentIndex=7 NetNsID=-1, up
+
+  The original experiment only reproduced because it left the foreign `real_dev`
+  DOWN. `vlan_dev_open` refuses only while the real device is down; nothing pins
+  the orphan down. So it IS live, its kind IS "vlan" so it passes the r3 kind
+  belt, and its `ParentIndex` is a foreign ifindex used as a bare numeric key
+  into `isRequired` / `unarmed[parent]` / `direct[parent]` — aliasing a local
+  record yields SKIPPED or DELEGATED, both UNDER-counts that hide a live
+  XDP-less forwarding surface. Reachable by the same route as the wrong-kind
+  squatter: `ensureVLANSubInterface` adopts any `<phys>.<vid>` without checking
+  its kind OR where its real_dev lives.
+
+  **Closed in code, not just in prose.** The r4 reasoning for declining a code
+  fix was that the bad state is unproducible; this one is PROVEN producible, so
+  the same reasoning points the other way. `coverDelegated` now also requires
+  `LinkAttrs.NetNsID == netnsIDLocal` after the kind check. The kernel emits
+  `IFLA_LINK_NETNSID` exactly when `link_net != dev_net` and netlink seeds -1,
+  overwriting only from that attribute, so -1 means "local parent" — one extra
+  condition on an `Attrs()` call already being made, no new syscall.
+
+  **The comparison is `!= -1`, never `> 0`**, and both reasons were measured
+  rather than reasoned: (i) a foreign parent's nsid is commonly ZERO — the
+  orphan above read 0 — so `> 0` lets exactly the target case through; (ii)
+  netlink parses the wire s32 UNSIGNED (`int(native.Uint32(...))`,
+  link_linux.go:2304), so a wire `NETNSA_NSID_NOT_ASSIGNED` (-1) arrives as
+  4294967295 on this 64-bit build — verified by running the same expression —
+  which `!= -1` still rejects, conservatively.
+
+  Test fixtures now set `NetNsID` EXPLICITLY on every hand-built link. The zero
+  value of a `netlink.LinkAttrs` is 0, which is a real FOREIGN nsid; only
+  `LinkDeserialize` seeds -1. Leaving it unset modelled a link production never
+  returns and would have routed every existing VLAN fixture through the new
+  belt.
+- **Validation**: `id -u` 1000 (non-root). `go build ./...` exit 0;
+  `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0;
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. A 3-mutation matrix, each cell
+  `go vet`-clean first so every RED is an ASSERTION, each mutation grepped back
+  out and the file `cmp`'d identical after restore:
+
+      cell                          foreign_ns_vlan rows | veth+macvlan | local-VLAN control
+      M0 baseline                   PASS                 | PASS         | PASS
+      M1 belt removed               FAIL (both arms)     | PASS         | PASS
+      M2 belt always fires          PASS                 | PASS         | FAIL (both arms)
+      M3 `> 0` instead of `!= -1`   FAIL (both arms)     | PASS         | PASS
+
+  M1 reds with the two concrete under-counts (`Kind:skipped Via:10` and
+  `Kind:delegated Via:10 ProgramID:55`). M2 is the over-reach control the parent
+  asked for — "make every delegated child uncovered" reds BOTH negative-control
+  arms while the new rows stay green, so the belt cannot be widened into
+  re-breaking `reth0.50`/`reth0.80`. M3 is the decisive sign cell: the nsid-0
+  orphan slips a `> 0` test while the control stays green, so `!= -1` is
+  load-bearing and not interchangeable.
+
+  OUT OF SCOPE, deliberately untouched: `pkg/dataplane/compiler.go:474` reads
+  `link.Attrs().ParentIndex` for the VLAN-child generic-attach decision with the
+  identical aliasing exposure. Unchanged by this PR; a separate follow-up issue.
+- **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/README.md, _Log.md
