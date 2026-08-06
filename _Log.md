@@ -1,3 +1,48 @@
+## 2026-08-05 — #6829 round 9: the assign-half guard was a clean miss at BOTH sites
+
+- **Timestamp**: 2026-08-05 (fix/5797-syslog-selector-failclosed, PR #6829)
+- **Action**: Bind the `haveFacility` assign-half guard with per-site tests in
+  pkg/cli and pkg/daemon. No production change.
+- **File(s)**: `pkg/cli/syslog_facility_checked_6829_test.go` (new subtests),
+  `pkg/daemon/syslog_facility_default_6829_test.go` (new)
+
+`haveFacility` keeps a stream naming NO facility on the constructor default
+`FacilityLocal0` (16) instead of overwriting it with the zero value of the
+`facility` local (0 = `FacilityKern`). Forcing `if haveFacility` to
+`if true || haveFacility` at both sites left pkg/cli, pkg/daemon AND
+pkg/logging entirely green. Dropping the guard outright does not compile
+(`declared and not used`) — a build break is not an assertion, so the
+always-true form is the one that proves anything.
+
+The existing unmapped-facility subtest looks like it covers this and does not:
+`ParseFacilityChecked` returns `FacilityLocal0` for an unknown name, so its
+`Facility == FacilityLocal0` assertion holds whether the guard runs or not. The
+value coincides; the check cannot fail for this failure mode. Every other
+subtest in the file passes a NON-empty facility, so `haveFacility` is true in
+all of them.
+
+Per-site mutation matrix — the guard is duplicated across two packages, so one
+test binding both would leave either free to drift:
+
+| Mutation | pkg/cli test | pkg/daemon test |
+|---|---|---|
+| baseline | ok | ok |
+| guard always-true in pkg/cli ONLY | FAIL | ok |
+| guard always-true in pkg/daemon ONLY | ok | FAIL |
+
+Under the pkg/cli mutation the failing subtest is the unset case reading
+`Facility = 0 (FacilityKern)`; the `named facility still overrides` positive
+control PASSES, so the failure is the guard and not a hardcode.
+
+Impact: receivers filter on facility and kern is conventionally reserved for
+kernel messages, so a silent local0 -> kern shift sends every record from a
+facility-less stream to the wrong bucket while `show system syslog` still
+reports the stream as configured. The daemon site is the path the running
+daemon takes; pkg/cli is the local-console commit mirror.
+
+Validation: `go test ./pkg/cli/ ./pkg/daemon/ ./pkg/logging/ -count=1` all ok;
+`gofmt -l` clean on both test files.
+
 ## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

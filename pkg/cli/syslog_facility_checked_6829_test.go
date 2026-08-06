@@ -177,3 +177,73 @@ func TestBuildSyslogClientsWarnsOnUnmappedFacility_6829(t *testing.T) {
 		}
 	})
 }
+
+// TestBuildSyslogClientsKeepsDefaultFacilityWhenUnset_6829 binds the ASSIGN
+// half's guard — the one thing in the compute/assign split that the rest of
+// this file cannot observe.
+//
+// `haveFacility` exists so that a stream naming NO facility keeps the
+// constructor default (FacilityLocal0 = 16) instead of being overwritten with
+// the zero value of the `facility` local (0 = FacilityKern). Every other
+// subtest here passes a NON-empty facility, so `haveFacility` is true in all of
+// them and forcing the guard always-true changes nothing they measure.
+//
+// The unmapped-facility subtest above looks like it covers this and does not:
+// ParseFacilityChecked returns FacilityLocal0 for an unknown name, so its
+// `Facility == FacilityLocal0` assertion holds whether the guard runs or not.
+// The value coincides; the check cannot fail for this failure mode.
+//
+// Measured: forcing `if haveFacility` to `if true || haveFacility` at BOTH
+// sites left pkg/cli, pkg/daemon and pkg/logging entirely green before this
+// test existed. With it, the unset case reads 0 (kern) and goes RED.
+//
+// Why it matters beyond a number: receivers filter on facility, and kern is
+// conventionally reserved for kernel messages. A silent local0 -> kern shift
+// sends every record from a facility-less stream to the wrong bucket, or to
+// none, while `show system syslog` still reports the stream as configured.
+func TestBuildSyslogClientsKeepsDefaultFacilityWhenUnset_6829(t *testing.T) {
+	// One stream per build: with two in the map, `clients` order follows map
+	// iteration and an index-keyed assertion would be nondeterministic.
+	build := func(t *testing.T, facility string) *logging.SyslogClient {
+		t.Helper()
+		cfg := &config.Config{}
+		cfg.Security.Log.Streams = map[string]*config.SyslogStream{
+			"audit": {
+				Name: "audit", Host: "127.0.0.1", Port: 514,
+				Facility: facility, Severity: "info",
+			},
+		}
+		clients := buildSyslogClients(cfg)
+		if len(clients) != 1 {
+			t.Fatalf("want exactly one installed client for facility %q, got %d", facility, len(clients))
+		}
+		return clients[0]
+	}
+
+	t.Run("unset facility keeps the constructor default", func(t *testing.T) {
+		got := build(t, "").Facility
+		if got == logging.FacilityKern {
+			t.Fatalf("Facility = %d (FacilityKern) — the assign-half guard was dropped, so a "+
+				"stream naming no facility got the zero value of the `facility` local instead "+
+				"of the constructor default FacilityLocal0 (%d). Records would leave under "+
+				"kern, which receivers reserve for the kernel",
+				got, logging.FacilityLocal0)
+		}
+		if got != logging.FacilityLocal0 {
+			t.Errorf("Facility = %d, want FacilityLocal0 (%d): a stream naming no facility must "+
+				"keep the constructor default", got, logging.FacilityLocal0)
+		}
+	})
+
+	// Positive control. Without it, the subtest above is satisfied by hardcoding
+	// local0 at the assign site and ignoring the configured value entirely —
+	// which would be a far worse bug than the one being guarded against.
+	t.Run("named facility still overrides the default", func(t *testing.T) {
+		got := build(t, "auth").Facility
+		if got != logging.FacilityAuth {
+			t.Fatalf("Facility = %d, want FacilityAuth (%d) — a named facility must still reach "+
+				"the client; the unset-case guard must not have become an unconditional "+
+				"local0", got, logging.FacilityAuth)
+		}
+	})
+}
