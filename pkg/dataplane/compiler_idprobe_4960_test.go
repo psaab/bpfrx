@@ -320,7 +320,7 @@ func idProbeConfig() *config.Config {
 // just ScreenIDs, and reading it wrong overstates all of them. The test
 // compares two passes of the SAME phases over the SAME config, so it detects
 // perturbation ACROSS passes: state outliving a CompileResult — a
-// process-global, a counter on the DataPlane, an interned table — which is the
+// process-global, a package-level sequence, an interned table — which is the
 // #4960 question, since the pre-pass compiles twice and throws the first result
 // away. It does NOT detect incorrect assignment WITHIN a pass. Anything applied
 // identically to both passes (a wrong seed, a wrong sort key, a wrong id
@@ -392,9 +392,15 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 // #4960: the validate-pre-pass compiles the config twice and throws the first
 // result away. That is only free if the SECOND pass assigns byte-identical IDs
 // to what a single pass would have. If any assignment read or mutated state
-// outliving a CompileResult -- a process-global, a counter on the DataPlane, an
+// outliving a CompileResult -- a process-global, a package-level sequence, an
 // interned table -- pass two would differ and the pre-pass would silently
 // change what the live dataplane is programmed with.
+//
+// "a counter on the DataPlane" was listed here as an example and is INAPT
+// (#6894 r5): compileIDsOnce constructs a fresh stateless idProbeDP{} per
+// invocation, so per-instance DataPlane state is not something this driver
+// could observe in the first place. The examples that hold are the ones whose
+// lifetime is the PROCESS, not the dataplane object.
 //
 // Measured rather than reasoned about: #6819's counters also "looked"
 // per-instance until someone constructed two instances.
@@ -446,7 +452,7 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	// AddrIDs was protected only BY ACCIDENT: the implicitSets assertion above
 	// demands "db,web" and "dns,servers", which cannot be built without those
 	// AddrIDs entries. That covers ONE of the map's two writers. compileNAT's
-	// interface-SNAT branch is the other — resolveSNATMatchAddr synthesizes a
+	// named-pool rule path is the other — resolveSNATMatchAddr synthesizes a
 	// "_snat_match_<cidr>" entry per SNAT match CIDR (compiler_nat.go:36) — and
 	// nothing pinned it, so that half could stop contributing with the column
 	// still comparing clean. Name entries from BOTH writers.

@@ -312,10 +312,28 @@ func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) [
 		{"nat64", func() error { return compileNAT64(dp, cfg, result) }},
 		{"nptv6", func() error { return compileNPTv6(dp, cfg) }},
 		{"screen profiles", func() error { return compileScreenProfiles(dp, cfg, result) }},
+		// #6894 r5: the zone -> screen-profile REFERENCE, which the row above
+		// does not cover. compileScreenProfiles compiles the profile SET; what
+		// aborts is a zone naming a profile the set lacks, and that is resolved
+		// per zone inside compileZones — after an earlier zone has already been
+		// through SetZoneConfig and, if it carries interfaces, real netlink and
+		// /proc/sys writes. Ordered directly after "screen profiles" because it
+		// reads result.ScreenIDs, which assignScreenIDs populates before the
+		// table runs and compileScreenProfiles confirms.
+		{"zone screen references", func() error { return validateZoneScreenReferences(cfg, result) }},
 		{"default policy", func() error { return compileDefaultPolicy(dp, cfg) }},
 		{"flow timeouts", func() error { return compileFlowTimeouts(dp, cfg) }},
-		// #6894 r1 F2: the ONE config-shape hard error still reachable after the
-		// mutation point. validateFilterProtocols is the first FALLIBLE
+		// #6894 r1 F2: a config-shape hard error that was reachable after the
+		// mutation point. It was described here as the ONE such error, and that
+		// was wrong — the zone -> screen-profile reference was a second, and the
+		// paragraph below acknowledged it while simultaneously claiming nothing
+		// reached the dataplane. Both could not be true; the sweep added in
+		// #6894 r5 ("zone screen references", above) is what makes the second
+		// half true. Do not restore the "ONE" claim without re-deriving it: a
+		// count stated in a comment is what let a live half-mutation hide for
+		// four rounds.
+		//
+		// validateFilterProtocols is the first FALLIBLE
 		// statement of Phase 10 -- one local map init precedes it
 		// (compiler_filter.go:19), so it is not literally the first statement --
 		// and is purely a function of cfg: no result, no dp, no logging. So
@@ -331,9 +349,17 @@ func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) [
 		// with an unknown screen-profile ref AND `from protocol bogus-proto`
 		// now reports the filter error, where it previously reported
 		// `compile zones: screen profile ... not found`. Both are hard errors
-		// and both abort the same apply, so nothing reaches the dataplane
-		// either way -- only the message changes. Do not "fix" this by moving
-		// the row later; the ordering is what keeps the mutation point clean.
+		// and both abort the same apply, so only the message changes. Do not
+		// "fix" this by moving the row later; the ordering is what keeps the
+		// mutation point clean.
+		//
+		// That "nothing reaches the dataplane either way" was true only for the
+		// filter-protocol half. The screen-reference half DID reach it:
+		// programZoneMaps ranges a map, so an unknown reference on the second
+		// zone visited aborted after the first was already through
+		// SetZoneConfig and its interfaces' netlink / procfs writes. The "zone
+		// screen references" row plus the sweep at the top of compileZones is
+		// what makes the sentence true for both halves.
 		{"firewall filter protocols", func() error { return validateFilterProtocols(cfg) }},
 		{"flow config", func() error { return compileFlowConfig(dp, cfg, result) }},
 	}

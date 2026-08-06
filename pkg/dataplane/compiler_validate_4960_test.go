@@ -307,7 +307,8 @@ func TestNoHostMutationWhenNATPhaseFails_4960(t *testing.T) {
 func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 	want := []string{
 		"address book", "applications", "policies", "nat", "static nat",
-		"nat64", "nptv6", "screen profiles", "default policy", "flow timeouts",
+		"nat64", "nptv6", "screen profiles", "zone screen references",
+		"default policy", "flow timeouts",
 		"firewall filter protocols", "flow config",
 	}
 	got := validationPhases(discardingDataPlane{}, &config.Config{}, newValidationResult())
@@ -642,6 +643,21 @@ func TestEachValidationPhaseRowRunsItsOwnCompiler_4960(t *testing.T) {
 				}
 			}),
 			want: "set screen config sp-6894",
+		},
+		{
+			// #6894 r5. Distinct from the row above on purpose: the profile SET
+			// here is empty and VALID (compileScreenProfiles passes over it), and
+			// what rejects is a ZONE naming a profile that does not exist. That
+			// is the reference compileZones used to resolve mid-loop, after an
+			// earlier zone had already mutated the host.
+			phase: "zone screen references",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				c.Security.Zones = map[string]*config.ZoneConfig{
+					"trust": {Name: "trust", ScreenProfile: "no-such-screen-6894"},
+				}
+			}),
+			want: "no-such-screen-6894",
 		},
 		{
 			phase: "default policy",

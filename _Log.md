@@ -68975,11 +68975,15 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   columns that were vacuous because the driver never RAN the phase that
   populates them; `ScreenIDs` failed one level lower. The driver
   RE-IMPLEMENTED Phase 1.5 instead of calling production, so that column
-  compared `compileIDsOnce`'s own loop against itself. Three verbatim copies
-  of the screen-ID prelude existed — `CompileConfig` (compiler.go:245-254),
+  compared `compileIDsOnce`'s own loop against itself. Three ALPHA-EQUIVALENT
+  copies of the screen-ID prelude existed — `CompileConfig` (compiler.go:245-254),
   `validateBeforeMutateWithResult` (compiler_validate_4960.go:254-263), and
-  the driver (compiler_idprobe_4960_test.go:315-324) — token-identical modulo
-  identifier names: same `uint16(1)` seed, same `cfg.Security.Screen` source,
+  the driver (compiler_idprobe_4960_test.go:315-324). (Corrected in r6: this
+  said "verbatim ... token-identical", which is literally false — the driver's
+  copy used the locals `names`/`n` where production used `screenNames`/`name`.
+  The loops were alpha-equivalent and behaviour-identical, so the conclusion
+  stands, but the wording overstated what was measured.) Same `uint16(1)`
+  seed, same `cfg.Security.Screen` source,
   same `sort.Strings`, same 1-based increment, all three against a
   `newValidationResult()`-allocated map behind their own nil-cfg guard.
   Collapsing them is therefore a cleanup, not a behaviour change.
@@ -69077,3 +69081,67 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   screen-ID prelude, and this round alters only comment prose.
 - **File(s)**: pkg/dataplane/compiler.go,
   pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+## 2026-08-06 — #6894 fold r6 (gate BLOCKER + three text corrections)
+
+- **Timestamp**: 2026-08-06 07:40 PDT
+- **Action**: BLOCKER — a stale zone `screen-profile` reference escaped the
+  #4960 validate-before-mutate pre-pass and aborted `compileZones` MID-LOOP.
+  `programZoneMaps` ranges `cfg.Security.Zones` (a Go MAP) and per zone calls
+  `buildZoneConfig` (which resolves the reference) then `SetZoneConfig`, then
+  iterates that zone's interfaces into `mapZoneInterface` where the netlink and
+  `/proc/sys` writes live. An unknown reference on a zone visited second or
+  later therefore aborts AFTER earlier zones are already programmed — the
+  half-reconfigured host #4960 exists to prevent, via the mechanism it claims
+  to close. Added the pure `validateZoneScreenReferences`, called at the TOP of
+  `compileZones` (so no zone can mutate before every reference is checked,
+  whatever the caller did) and registered as the `zone screen references`
+  pre-pass row (so the pre-pass reports it with sibling precedence).
+- **File(s)**: pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go (new), _Log.md
+- **Validation**: go build ./... rc=0; go vet ./pkg/dataplane rc=0; go test
+  ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race rc=0; go test
+  ./pkg/refactoraudit/ -count=1 rc=0; gofmt clean on every touched file.
+- **NOTE — the generalising question, answered.** There are TWO config-shaped
+  aborts inside the zone loop, not one, and a fix hoisting only the first would
+  still abort mid-loop: `buildZoneConfig` (compiler_iface.go:364) resolves the
+  reference against `result.ScreenIDs` (the COMPILED id map), and
+  `mapZoneInterface` (compiler_iface.go:584) resolves the SAME reference against
+  `cfg.Security.Screen` (the CONFIG map) on the VLAN sub-interface path, after
+  several host mutations. The sweep checks BOTH sources. Every other error
+  return in that loop — `set vlan_iface_info`, `set zone`, `add tx port`, and
+  the address-reconcile tail — is a dataplane/netlink I/O failure, not a
+  config-shape one, so it is not pre-validatable against a discarding shim and
+  is out of scope for this class.
+- **NOTE — the revert probe is multi-trial ON PURPOSE.** Map iteration order is
+  randomised per range, so with the fix reverted the bad zone is visited first
+  about 1/N of the time and the compile aborts before any mutation — which
+  looks exactly like a pass. A single-run probe would be FLAKY, reporting green
+  on broken code a fraction of the time. The fixture uses 8 valid
+  interface-carrying zones + 1 offender and runs 24 trials: a reverted build
+  slips through with probability 8^-24. Measured with BOTH halves of the fix
+  removed: `go vet ./pkg/dataplane` rc=0 (an ASSERTION failure, not a build
+  break) and `go test -run 'StaleZoneScreenRef|ValidZoneScreenRef|
+  ZoneScreenSweepSkips'` rc=1, failing at "compileZones programmed 1 zone(s)
+  before rejecting the stale screen reference" on trial 0. The three over-reach
+  guards stayed GREEN under that revert. Restored and `cmp`-verified against a
+  pristine copy of both production files.
+- **NOTE — three text corrections, all to claims that overstated.**
+  (1) `compiler_validate_4960.go` called filter protocols "the ONE config-shape
+  hard error still reachable after the mutation point" and, in the same block,
+  acknowledged the unknown screen reference while asserting "nothing reaches
+  the dataplane either way". Both could not be true; that self-contradiction is
+  how the blocker survived four rounds. Corrected, with a note not to restore
+  a bare count. (2) The ID-stability comment offered "a counter on the
+  DataPlane" as an example of state the driver could observe — inapt, because
+  `compileIDsOnce` constructs a fresh stateless `idProbeDP{}` per invocation;
+  replaced with "a package-level sequence" and the reason recorded. (3) The r5
+  entry above called the three screen-ID preludes "verbatim ... token-identical";
+  the driver's copy used the locals `names`/`n` where production used
+  `screenNames`/`name`, so they were ALPHA-EQUIVALENT. The conclusion stands;
+  the wording did not. Also corrected the `AddrIDs` floor comment, which named
+  the synthetic writer as the "interface-SNAT branch" when the pinned keys come
+  from named-pool rules.
