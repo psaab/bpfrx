@@ -173,7 +173,7 @@ type ProcessStatus struct {
 	// across every worker/binding by the helper (ProcessStatus-level
 	// pre-summed sparse block, one row per zone with nonzero traffic keyed by
 	// the stable zone id). syncBPFCountersLocked mirrors each row into the
-	// legacy bpfShim zone-counter offset map via SetZoneCounterOffset so
+	// legacy bpfShim zone-counter offset map via ReplaceZoneCounterOffsets so
 	// Manager.ReadZoneCounters (and thus `show security zones` Traffic
 	// statistics, REST /security/zones, and the Prometheus collector) reports
 	// live per-zone volume instead of ErrCounterNotPopulated ("not

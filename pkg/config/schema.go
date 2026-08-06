@@ -98,9 +98,26 @@ type schemaNode struct {
 	// modeled), otherwise it false-rejects a valid-but-not-yet-modeled
 	// config. The flag is threaded down the walker (walkSchemaNode's
 	// `closed` param): once a subtree sets it, every descendant level
-	// inherits closed-world enforcement. No production subtree sets this
-	// yet — the per-subtree flips are follow-ups gated on a leaf-
-	// completeness audit (see docs/config-schema.md).
+	// inherits closed-world enforcement.
+	//
+	// Production subtrees DO set this — it is not an inert mechanism, and
+	// this comment used to say otherwise. Do not deduce the armed set from
+	// prose that rots; find it with
+	//
+	//	git grep -n 'closedWorld: true' -- 'pkg/config/schema_*.go'
+	//
+	// The `schema_*.go` glob is deliberate: it excludes THIS file, so the
+	// command does not match the line you are reading. Dropping it returns
+	// one extra hit — this comment — and a reader counting results would be
+	// off by one against any number stated elsewhere.
+	//
+	// The armed set is deliberately NOT enumerated here for the same reason
+	// walkSchemaNode declines to state a count: a list in a comment drifts
+	// away from the flags it describes, and the next reader trusts the list.
+	// Remaining flips stay gated on a per-subtree leaf-completeness audit
+	// (see docs/config-schema.md); each is driven per-domain, not as a
+	// blanket change — a blanket flip would break the deliberate
+	// accept-with-advisory knobs (#2078/#4231).
 	closedWorld bool
 
 	// Typed-leaf metadata (#1319). The zero value (valueType==ValueAny,
