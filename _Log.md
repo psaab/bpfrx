@@ -1,3 +1,162 @@
+## 2026-08-05 — #6304: bind the LIVE mirror call site in stage_flow_cache_hit (salvage + independent verification)
+
+- **Timestamp**: 2026-08-05 (fix/6304-mirror-callsite-bound-sv)
+- **Action**: Salvage verification. The implementing lane was killed mid-task by
+  a spend limit with its work complete but uncommitted; it was committed as-is
+  at `02ffefd5d` and is rebased here onto `86927d23c`. Nothing was rewritten —
+  the diff is the dead lane's, re-verified firsthand end to end, plus the doc
+  update it missed.
+  The gap: the #6114 sample-before-CAS tests reach the shared
+  `sample_then_admit_mirror_clone` (`mirror/resolver.rs`) through
+  `enqueue_sampled_mirror_clone_to_live`, a wrapper that is DEAD in non-test
+  builds. The LIVE call site is inside `stage_flow_cache_hit`
+  (`poll_descriptor/flow_cache_hit.rs`), and `stage_flow_cache_hit` had no test
+  reference anywhere in the tree — so a revert of the live call site alone,
+  leaving the helper correct, was invisible. Classic unit-bound /
+  call-site-unbound. `flow_cache_hit_tests.rs` drives `stage_flow_cache_hit`
+  itself: a hairpin in-place-rewrite cached flow with a cross-worker mirror
+  target whose clone queue is at its cap, and a NON-sampled packet (rate=2,
+  counter=1). Two positive controls assert the in-place rewrite actually
+  succeeded, because the mirror result is recorded only inside that branch — a
+  fixture whose rewrite silently failed would read 0 drops under both the
+  correct and the reverted call site.
+  Completeness sweep beyond the issue's ask: `sample_then_admit_mirror_clone`
+  has exactly two callers (the dead wrapper, and the now-bound live site), and
+  the second live copy of the ordering — `enqueue_sampled_mirror_clone`'s
+  cross-worker arm, which inlines the sampler rather than calling the helper —
+  is separately bound, proven by mutation rather than by reading.
+  Round 2 (gate M1): the salvaged lane ported ONE of #6114's TWO fail-on-revert
+  tests. Its fixture pins `mirror_sample_counter = 1` at `rate = 2`, so
+  `MirrorSampleAdmission::NotSampled` short-circuits and everything downstream
+  of `Sampled(..)` at the live site stayed unbound — the SELECTED arm, which the
+  same thesis condemns. Two companions close it, and the second was NOT
+  redundant: the gate's prescribed test (SELECTED + FULL queue) is green under
+  `Sampled(Ok(_)) => None`, because a full queue never yields `Ok`. Verified
+  before adopting the prescription rather than after. The admitted-clone test
+  also turns the mirror WIRING into a standing assertion: the non-sampled test
+  asserts the drop counters are ZERO, so nothing in it depends on the target
+  being present, cross-worker, or full — a `MirrorTargetMap` re-keying would
+  leave it passing and binding nothing. A "right reason" that lives only in a
+  mutation transcript is not maintained by anything.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs (new),
+  docs/userspace-dataplane-gaps.md, _Log.md
+- **Validation**: every cell run in `/var/tmp/sv6304` with
+  `CARGO_TARGET_DIR=/dev/shm/ct-sv6304 TMPDIR=/dev/shm`; the tree was restored
+  byte-clean (md5 + empty `git status --porcelain`) after each mutation.
+  - `cargo check --release --tests` at HEAD -> rc=0
+  - baseline `cargo test --release --no-fail-fast -- --test-threads=1` -> rc=0,
+    0 FAILED across all 7 binaries (4234 + 60 + 8 + 22 + 31 + 1 + 2 passed)
+  - `go build ./...` -> rc=0; `go test ./...` -> rc=0, 0 FAIL, 59 ok
+    (includes `pkg/refactoraudit`, which the +9-line growth of
+    `flow_cache_hit.rs` could otherwise trip)
+  - DEADNESS (behavioural, not grep): drop the
+    `#[cfg_attr(not(test), allow(dead_code))]` from
+    `enqueue_sampled_mirror_clone_to_live` and `cargo build --release` ->
+    "warning: function `enqueue_sampled_mirror_clone_to_live` is never used".
+    The issue's premise holds; the wrapper has no production caller.
+  - FAIL-ON-REVERT (live call site only — `flow_cache_hit.rs` restored to its
+    exact pre-#6114 form from `1810cb7e7`, `resolver.rs` untouched):
+    `cargo check --release --tests` -> rc=0 (compiles; not a build break, 0
+    `^error[` lines), then `cargo test` -> rc=101 with
+    `live_flow_cache_callsite_nonsampled_does_not_reserve_full_queue_6304`
+    FAILED on `assertion left == right failed: #6304: a NON-sampled packet on
+    the LIVE flow-cache path must not reserve the full clone queue ... left: 1
+    right: 0`. `left: 1` also proves the fixture genuinely reaches
+    `admit_mirror_clone_to_live` on a FULL cross-worker target (a mis-wired
+    target would have recorded NoBinding, not QueueFullCrossWorker).
+  - ISOLATION CONTROL (the load-bearing cell) — AS MEASURED IN ROUND 1, when
+    this file held ONE test: under that SAME revert, run with `--no-fail-fast`
+    over every binary -> exactly ONE failure tree-wide, the new test.
+    `flow_cache_nonsampled_does_not_reserve_full_queue_6114` and
+    `sampled_live_mirror_queue_full_advances_sampler_for_selected_6114` both
+    stayed `ok`. The pre-existing suite could not catch this mutation.
+    SUPERSEDED COUNT: with the round-2 companions present the same revert reds
+    TWO tests, per the matrix below — the "exactly one" is a round-1 artifact of
+    there being only one test, not a claim about this head.
+  - RE-EXPRESSION CONTROL: hand-inline the shared helper at the live call site
+    (same ordering, same deferred counter commit, no
+    `sample_then_admit_mirror_clone` call) -> rc=0, 0 FAILED. The test binds the
+    invariant, not the helper call.
+  - SWEEP CONTROL: flip `enqueue_sampled_mirror_clone`'s cross-worker arm
+    (`mirror/fast_path.rs`) to admit-before-sample -> rc=101,
+    `cross_worker_nonsampled_does_not_reserve_full_queue_5167` and
+    `cross_worker_sampled_reports_queue_full_5167` FAILED on assertions. The
+    other live copy of the ordering is already bound; there is no second
+    unbound site.
+  Round-2 mutation matrix (each `cargo check --release --tests` rc=0 first, so
+  every red is an assertion; each row is a full `--no-fail-fast` run over all 7
+  binaries, and the listed reds are the COMPLETE tree-wide failure set):
+  | mutation at the live call site | nonsampled | selected+full | selected+admitted | #6114 |
+  |---|---|---|---|---|
+  | A pre-#6114 revert (`1810cb7e7`) | RED | RED | green | GREEN |
+  | B commit counter on NotSampled/Sampled(Ok), not Sampled(Err) | green | RED | green | GREEN |
+  | C `Sampled(Ok(_)) => None` | green | green | RED | GREEN |
+  | D capture `mirror_frame` AFTER the rewrite (pure code motion) | green | green | RED | GREEN |
+  Row D is round-3 and was GREEN in every column until the fixture was fixed —
+  see the aliasing note below.
+  Coverage honesty, so a later reader does not mistake this for redundancy and
+  delete a test: the SALVAGED non-sampled test is never the SOLE detector in any
+  row — row A also reds `selected_full`, and rows B/C/D leave it green. It is
+  still not redundant: it asserts a property none of the others do, that a
+  DECLINED packet produces NO shared-CAS side effect at all, which is the actual
+  #5167/#6114 invariant. The others all assert what a SELECTED packet must do.
+  Q5b is the load-bearing row: it escapes BOTH the salvaged test and the gate's
+  prescribed one, and would have shipped a silent total loss of port mirroring
+  on this path. Assertions seen: "a NON-sampled packet ... must not reserve the
+  full clone queue" left 1 right 0; "the SELECTED packet advances the sampler
+  before the full-queue admit fails" left 0 right 1; "a SELECTED packet whose
+  cross-worker target has room must have its clone enqueued" left 0 right 1.
+  The #6114 isolation control held GREEN in every row.
+  Pre-existing failure, attributed not dismissed: one full-suite run at machine
+  load ~35 reddened
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  ("readers must have validated at least one snapshot (test not vacuous)",
+  `shared_cos_lease_tests.rs:2496`) — a CPU-starvation liveness assertion, from
+  the SAME unrebuilt binary that had already passed it three times. Attributed
+  at like-for-like scope (full suite, alternating arms) against a detached
+  `origin/master@86927d23c` worktree: 4/4 clean on each arm at load 17-26; under
+  32 synthetic spinners (load 42-50) it fails on MASTER with the identical
+  assertion and line, and master's second loaded run failed instead on
+  `afxdp::wg::engine::engine_internal_tests::install_session_serializes_with_reconcile_removal`
+  ("reconcile loop must have completed at least one full add/remove cycle") —
+  the known parallel-unsafe WG engine family. Same class, both reproduce on
+  master, neither is reachable from this diff (two .md files over a test-only
+  change in `poll_descriptor/`).
+  Round 3 (gate item 1) — an assertion that was true for free. `clone.bytes ==
+  frame` ("the clone carries the full L2 frame verbatim") could not fail as
+  originally written. At the live site the clone is captured BEFORE the in-place
+  rewrite, and in production `packet_frame` ALIASES the UMEM
+  (`poll_descriptor/mod.rs`: `unsafe { &*area }.slice(desc.addr, desc.len)`),
+  which `apply_rewrite_descriptor` then mutates — so the capture-before-rewrite
+  ordering is load-bearing. The fixture had passed the heap `frame` as
+  `raw_frame` while the UMEM copy lived at offset 4096: two different objects,
+  so the assertion held either way. Measured, not argued — mutation D (move the
+  `mirror_frame` capture inside the `if let Some(rewrite_result)` block; pure
+  code motion) compiled rc=0 and the FULL serial suite was rc=0 with zero
+  failures. In production that ships a TTL-63, checksum-adjusted copy to the
+  analyzer port instead of the ingress copy, silently and forever.
+  Fixed by giving all three fixtures production's aliasing: `raw_frame` is now
+  `area.slice(frame_offset, frame.len())`, a borrow INTO the UMEM, while `frame`
+  stays pristine as the comparison value. Under mutation D the same assertion
+  now reds with the rewrite visible in the bytes — index 22 (TTL) 63 vs 64,
+  index 24 (IPv4 checksum) 1 vs 0.
+  Residual, disclosed not closed: the tests drive `stage_flow_cache_hit`
+  directly, so `poll_descriptor/mod.rs:321` — the wiring of the stage into the
+  per-descriptor poll loop — stays unbound one level up. That is outside #6304's
+  claim, which is the mirror call site INSIDE the stage. Concretely, swapping
+  `&mut binding.mirror_sample_counter` (`mod.rs:326`) for a fresh local would
+  make every flow-cache-hit packet re-sample from 0, so `rate=N` would mirror
+  EVERY packet on this path — an N-fold clone flood — and nothing in the tree
+  would red. The SELECTED-arm residual that stood after round 1 is CLOSED.
+  Fixture note (not changed): `test_meta` sets `pkt_len: (frame.len() - 14)`,
+  the verbatim convention of every sibling fixture in this module tree
+  (`cookie_reply_tests.rs`, `reject_reply_tests.rs`, `frame/tests_*`), whereas
+  the shim stamps `pkt_len = data_end - data` (full frame incl. Ethernet). On
+  this path `pkt_len` only feeds byte counters — it cannot reach the mirror
+  admission decision — so the deviation is immaterial here and is a tree-wide
+  fixture drift to raise separately, not something to fork this diff over.
+
 ## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)

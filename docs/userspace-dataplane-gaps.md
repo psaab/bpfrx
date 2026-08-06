@@ -93,8 +93,11 @@ neighbor-resolution-retry). #6114 (#5167) fixes the remaining LIVE site, the
 ESTABLISHED-FLOW HOT PATH (`poll_descriptor/flow_cache_hit.rs`), which dominates
 sustained high-PPS mirror, plus the `enqueue_sampled_mirror_clone_to_live` sibling
 that shares it. Both now route the ordering through one shared
-`sample_then_admit_mirror_clone` (`mirror/resolver.rs`) so the invariant has a
-single tested home and cannot silently diverge again. Intent note: the earlier
+`sample_then_admit_mirror_clone` (`mirror/resolver.rs`), so the invariant has a
+single IMPLEMENTATION — but a single tested home bounds the HELPER, not its
+wiring, and the live call site needed its own binding (see the #6304 note
+below; the original "cannot silently diverge again" claim here was wrong).
+Intent note: the earlier
 "admit-first preserves sample budget on a full queue" behavior (documented by
 `sampled_live_mirror_queue_full_does_not_advance_sampler`) was adjudicated a
 SECOND instance of the #5167 bug, not a real requirement — budget preservation
@@ -102,7 +105,34 @@ only matters during a pressure event where clones are already dropped, is
 statistically irrelevant to a 1-in-N decimation of a lossy clone stream, and cost
 an O(PPS) shared-CAS hit on the dominant path; the test is flipped to assert
 sample-first (a SELECTED packet advances the sampler, then reports the full-queue
-pressure).** The
+pressure).** **#6304 call-site binding:** "a single tested home" bounds the
+HELPER, not its wiring. The #6114 tests reach `sample_then_admit_mirror_clone`
+through `enqueue_sampled_mirror_clone_to_live`, which is DEAD in non-test builds
+(drop its `allow(dead_code)` and `cargo build --release` reports the function
+"is never used"), so reverting ONLY the live `stage_flow_cache_hit` call site to
+reserve-before-sample left the entire Rust suite green — the unit was bound and
+the wiring was not. `poll_descriptor/flow_cache_hit_tests.rs` closes that by
+driving `stage_flow_cache_hit` itself, covering BOTH arms of
+`MirrorSampleAdmission` at the live site, since #6114's two tests split the same
+way and only one of them was ported first: a NON-sampled packet must not reserve
+the full queue; a SELECTED packet on a full queue must advance the sampler
+BEFORE reporting the pressure (revert that and the hot path pins itself at the
+sampler's first slot, restoring the O(PPS) shared-CAS hit); and a SELECTED
+packet whose target has room must actually land its clone (drop the
+`Sampled(Ok)` arm and port mirroring silently stops delivering on this path —
+green under both other tests). Each of these reds under its own call-site-only
+mutation while both #6114 tests stay green, which is the whole point. The
+mirror clone is captured BEFORE the in-place rewrite and `packet_frame` ALIASES
+the UMEM, so the fixtures slice `raw_frame` out of the UMEM as the poll loop
+does: hand them a detached heap buffer instead and "the clone carries the
+pre-rewrite frame" becomes true for free, and deferring the capture past the
+rewrite — which ships a TTL-decremented, checksum-adjusted copy to the analyzer
+port — goes unnoticed. The dispatch-path copy of the ordering
+(`enqueue_sampled_mirror_clone`'s cross-worker
+arm, which inlines the sampler rather than calling the shared helper) is
+separately bound: flipping it to admit-first reds
+`cross_worker_nonsampled_does_not_reserve_full_queue_5167` and
+`cross_worker_sampled_reports_queue_full_5167`. The
 `deriveUserspaceCapabilities()` gate has been removed; #1376 is closed for the
 feature-gap audit, and the #1477 final-validation artifact set is closed.
 Any further mirror-fidelity and pressure-survival work is production hardening,
