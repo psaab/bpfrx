@@ -97,6 +97,18 @@ func TestIpipUnitAnchorStillAlarms_4785(t *testing.T) {
 			want:     "no `tunnel source` is configured",
 		},
 		{
+			// #6861 F4: NEITHER half. This was covered by the deleted
+			// TestIpipTunnelDeadWarning and was lost in the relocation — the
+			// two cases above are source-only and destination-only, so a unit
+			// loop that skipped records with both halves empty stayed green
+			// across the whole suite. Production warns correctly; only the
+			// guard was missing.
+			name:     "neither_source_nor_destination",
+			cmds:     []string{"set interfaces ip-0/0/2 unit 7 tunnel mode ipip"},
+			wantUnit: `interfaces "ip-0/0/2" unit 7 tunnel mode ipip`,
+			want:     "neither `tunnel source` nor `tunnel destination` is configured",
+		},
+		{
 			// The mirror: source only. collectAppliedTunnels screens the
 			// INTERFACE level on Source != "" but screens units on nothing, so
 			// this is an anchor too.

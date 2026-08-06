@@ -70529,3 +70529,44 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
 - **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
   pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+
+## 2026-08-06 — #6861 r6: two guards whose evidence did not reach the property they name
+
+- **Timestamp**: 2026-08-06
+- **Context**: a Codex leg at `7f8681369` (one commit behind head) returned four
+  findings. Its F1 (IRB/XFRM ordering) and F2 (missing emitted-record test) were
+  already closed by r5 at `25c6cb705` — VERIFIED against Codex's own verbatim
+  reproducer rather than assumed: its IRB config now yields `live={irb}` and
+  ZERO anchor advisories, and the r5 C2 cell already reds the pointer clause.
+  Its F2 also independently corroborates the (a)/(b) split r5 landed on. The two
+  remaining findings are both the same shape — a guard whose evidence does not
+  reach the property it names — and neither was a production defect.
+- **Action** (F3): `TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName` exists
+  to catch drift between `ResolveKernelIfName` and `snapshotLinuxName`, but the
+  whole `TunnelNameMap()` block could be DELETED from `ResolveKernelIfName` with
+  the guard still green. Every case in its fixture used a config where the map
+  answer and the fallback COINCIDE — `gr-0/0/0` carried only unit 0, whose map
+  answer (`gr-0-0-0`) equals the fallback's `unit.Number == 0 -> kernelBase`. The
+  fallback silently supplied the right answer, so the lookup was unobservable.
+  Added unit 1: a NONZERO unit under an interface-level tunnel is the shape where
+  they split (map/runtime `gr-0-0-0`, fallback `gr-0-0-0.1`).
+- **Action** (F4): the deleted `TestIpipTunnelDeadWarning` covered a unit-level
+  ipip tunnel with NEITHER source nor destination; its stated replacement
+  `TestIpipUnitAnchorStillAlarms_4785` covered only source-only and
+  destination-only. A unit loop that skipped records with both halves empty
+  therefore stayed green across the whole suite. Production warns correctly —
+  only the guard was lost in the relocation. Added the
+  `neither_source_nor_destination` subtest.
+- **Validation**: three cells, each compiled (`go vet` 0), each restored
+  byte-identical. F2 cell (drop `!emitted[t] &&`) REDs
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` at `the record was reported as
+  a DEAD ANCHOR even though its endpoint is emitted`. F3 cell (delete the
+  `TunnelNameMap()` block) REDs the drift guard at `drift: ref "gr-0/0/0.1" ...
+  got "gr-0-0-0.1", want "gr-0-0-0"` — it did NOT red before this round. F4 cell
+  (skip units with both halves empty) REDs the new subtest at `a unit-level ipip
+  stanza creates a kernel anchor device the operator can see, but raised NO
+  alarm`. `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
+- **Docs**: none. Both changes are test-only; no behaviour, config surface or
+  operator-visible output changed this round.
+- **File(s)**: pkg/dataplane/userspace/interfaces_test.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
