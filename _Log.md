@@ -66898,3 +66898,43 @@ break — `go vet` confirmed passing under every revert.
   pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
+- **Timestamp**: 2026-08-05 20:41
+- **Action**: #4960 (bounded increment) — `CompileConfig` runs at APPLY time,
+  after commit already succeeded (`pkg/configstore` has ZERO `pkg/dataplane`
+  imports, so `commit check` validates only the pure `pkg/config.CompileConfig`;
+  the two share a name). Phase 2 `compileZones` then performs the first and only
+  destructive host netlink mutation — `ensureVLANSubInterface` (create + link
+  up) and `reconcileInterfaceAddresses` (delete + add) — and every later phase
+  is a bare `return nil, err` with no undo. `userspace/flow.go:139` documents
+  the reachable input class: a malformed application-set reference or app_id
+  overflow (#3438 H4) makes compileApplications (Phase 4) hard-error and abort
+  the apply, leaving VLANs created and addresses reconciled on the live host.
+  Added `validateBeforeMutate`: runs the eleven fallible HOST-PURE phases
+  against a `discardingDataPlane` BEFORE `compileZones`. ADDITIVE, not a
+  reorder — moving the real phases ahead of Phase 2 would be a silent
+  fail-open, because `compileFirewallFilters`/`compilePortMirroring` resolve
+  VLAN SUB-INTERFACE names that only exist because Phase 2 created them and a
+  miss there is `slog.Warn; continue`, so filters would go unassigned on EVERY
+  apply. Excluded those two phases from the pre-pass for the same reason and
+  named the residual. Also factored CompileConfig's inline result init into a
+  shared `newValidationResult()` so the two passes cannot drift.
+  Correction to prior art: `research/4960-apply-txn` §4.4 says destructive host
+  mutation is in "exactly two phases — compileZones and compilePortMirroring
+  (netlink at :1758/:1811)". Verified wrong at 86927d23c: compilePortMirroring
+  (1704-1748) contains NO `netlink.` reference — only `dp.ClearMirrorConfigs`/
+  `SetMirrorConfig` map writes — and :1758/:1816 are `netlink.LinkByName` READS
+  inside `getPermAddr`/`getOriginalKernelName`. It is ONE phase, which is why a
+  single pre-pass covers all host mutation. §4.4's middle-phase purity claim
+  agrees with my independent enumeration.
+  Validation: `TestNoHostMutationWhenALaterPhaseFails_4960` (host-unmutated
+  property), `TestValidConfigStillReachesZoneCompile_4960` (control — a valid
+  config still reaches compileZones), `TestPrePassDoesNotPerturbIDAssignment_4960`
+  (two passes assign byte-identical IDs incl. the #5099 NAT-counter family;
+  proven sensitive by injecting drift AFTER finalizeNATCounterIDs' re-derive).
+  Revert cell: removing the pre-pass REDs the property test with "compileZones
+  RAN before the failing phase was caught (2 SetZoneConfig calls)".
+  `go test ./...` rc=0.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md

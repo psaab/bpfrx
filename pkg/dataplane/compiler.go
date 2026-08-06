@@ -183,24 +183,7 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		return nil, fmt.Errorf("dataplane not loaded")
 	}
 
-	result := &CompileResult{
-		ZoneIDs:             make(map[string]uint16),
-		ScreenIDs:           make(map[string]uint16),
-		AddrIDs:             make(map[string]uint32),
-		AppIDs:              make(map[string]uint32),
-		PoolIDs:             make(map[string]uint8),
-		implicitSets:        make(map[string]uint32),
-		NATCounterIDs:       make(map[string]uint32),
-		FilterSpans:         make(map[string]FilterCounterSpan),
-		Lo0FilterV4:         0xFFFFFFFF, // sentinel: no lo0 filter
-		Lo0FilterV6:         0xFFFFFFFF,
-		ifCache:             make(map[string]*net.Interface),
-		linkCache:           make(map[string]netlink.Link),
-		linkIdxMap:          make(map[int]netlink.Link),
-		rxVlanOffCache:      make(map[string]bool),
-		ethtoolApplied:      make(map[string]bool),
-		genericXDPIfindexes: make(map[int]bool),
-	}
+	result := newValidationResult()
 
 	// Phase 1: Assign STABLE zone IDs (#3075).
 	assignZoneIDs(result, cfg)
@@ -218,7 +201,19 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		screenID++
 	}
 
-	// Phase 2: Compile zones
+	// #4960: validate every fallible HOST-PURE phase against a discarding
+	// dataplane BEFORE Phase 2 touches the host. compileZones below is the
+	// first and only destructive netlink mutation in this function (VLAN
+	// create/link-up, address delete/add) and nothing after it has an undo
+	// path, so a config that trips a later phase must be rejected here rather
+	// than half-applied. See compiler_validate_4960.go for what is and is not
+	// covered, and why this is additive rather than a reordering.
+	if err := validateBeforeMutate(cfg); err != nil {
+		return nil, err
+	}
+
+	// Phase 2: Compile zones — FIRST HOST MUTATION. Everything above this line
+	// must be non-destructive.
 	if err := compileZones(dp, cfg, result); err != nil {
 		return nil, fmt.Errorf("compile zones: %w", err)
 	}
