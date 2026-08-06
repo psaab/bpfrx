@@ -68675,3 +68675,18 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #6829 fold r3 (hostile-gate F1/F2)
+
+- **Timestamp**: 2026-08-06 01:35 PDT
+- **Action**: Bind the third syslog facility site's DEFAULT INITIALIZER
+  (`applySystemSyslog`), which no test reached; document the bare-`*`
+  facility behaviour change instead of widening the selector belt.
+- **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
+  pkg/logging/README.md
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/logging
+  ./pkg/cli ./pkg/config -count=1 rc=0. Mutation `facility :=
+  logging.FacilityDaemon` -> `var facility int` now REDs as an assertion at
+  syslog_selector_render_5797_test.go:547 (Facility = 0 (FacilityKern), want
+  FacilityDaemon (3)); the same mutation left all four packages GREEN before
+  this subtest.

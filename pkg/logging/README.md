@@ -235,6 +235,19 @@ connectionless and exempt:
   and a written rsyslog directive, so it is bound at the render site by
   `pkg/daemon/syslog_selector_render_5797_test.go`, not only by the
   predicate's own unit tests.
+
+  **Behaviour change on upgrade: a bare `*` in the facility position now
+  loses its destination.** `[A-Za-z0-9-]` excludes `*`, so a pre-existing
+  `set system syslog file messages * info` is skipped with a warning and
+  its managed drop-in is reconciled away. This spelling commits clean both
+  before and after, so it is a real regression for anyone who authored it —
+  but it is deliberately NOT rescued by admitting `*` to the belt. Junos
+  spells all-facilities `any`, which is this repo's own fixture, is
+  unaffected, and still renders `*` in the emitted selector. `*` in the
+  facility position is an undocumented non-Junos spelling; widening a
+  security belt to accommodate it trades a real injection boundary against
+  a config nobody was told to write, and the failure is loud rather than
+  silent. Operators hitting it should switch to `any`.
 - **Lazy connect — receiver down at apply does not disable the stream
   (#3351).** A TCP/TLS receiver that is unreachable at config-apply or
   boot must NOT permanently silence the stream. `NewSyslogClientTransport`

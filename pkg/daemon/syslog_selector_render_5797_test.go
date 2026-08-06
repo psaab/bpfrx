@@ -516,6 +516,45 @@ func TestApplySystemSyslogFacilityReachesClient_6829(t *testing.T) {
 				got, logging.FacilityLocal0)
 		}
 	})
+
+	// The third element of the compute/assign shape: the DEFAULT INITIALIZER.
+	//
+	// The two subtests above bind `facility = f` and `c.Facility = facility`.
+	// Neither reaches `facility := logging.FacilityDaemon`, because both supply
+	// a Facilities entry and so take the branch that overwrites it. Replacing
+	// the initializer with `var facility int` left pkg/logging, pkg/cli,
+	// pkg/daemon and pkg/config all green — the same free-initializer gap the
+	// haveFacility guards close on the other two syslog paths, one site over.
+	//
+	// A host with no `<facility> <severity>` child at all is ordinary config:
+	// `set system syslog host 10.0.0.1` alone commits clean. It must keep the
+	// daemon default rather than the zero value, which is kern — the bucket
+	// receivers reserve for the kernel.
+	t.Run("host naming no facility at all keeps the daemon default", func(t *testing.T) {
+		d := &Daemon{slogHandler: logging.NewSyslogSlogHandler(slog.Default().Handler())}
+		t.Cleanup(func() { d.slogHandler.SetClients(nil) })
+		cfg := &config.Config{}
+		cfg.System.Syslog = &config.SystemSyslogConfig{
+			Hosts: []*config.SyslogHostConfig{{Address: "192.0.2.10"}},
+		}
+		d.applySystemSyslog(cfg)
+		cs := d.slogHandler.Clients()
+		if len(cs) != 1 {
+			t.Fatalf("want exactly one installed client, got %d", len(cs))
+		}
+		got := cs[0].Facility
+		if got == logging.FacilityKern {
+			t.Fatalf("installed client Facility = %d (FacilityKern) — the default initializer "+
+				"was dropped, so a host naming no facility got the zero value of the "+
+				"`facility` local instead of FacilityDaemon (%d). Every record from that "+
+				"host would be misfiled into the kernel bucket",
+				got, logging.FacilityDaemon)
+		}
+		if got != logging.FacilityDaemon {
+			t.Errorf("installed client Facility = %d, want FacilityDaemon (%d)",
+				got, logging.FacilityDaemon)
+		}
+	})
 }
 
 // TestApplySystemSyslogWildcardFacilityDoesNotWarn_6829 pins A3: `any` is the
