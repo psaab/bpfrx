@@ -413,6 +413,25 @@ func programZoneMaps(dp DataPlane, cfg *config.Config, result *CompileResult) (*
 		// deref below (ScreenProfile, HostInboundTraffic, Interfaces)
 		// would otherwise panic the apply-path interface reconcile.
 		if zone == nil {
+			// #5275: mapZoneInterface is the SOLE writer of st.xdpIfindexes,
+			// which becomes result.pendingXDP, so skipping the zone drops
+			// EVERY interface in it from the required set while the compile
+			// succeeds — the same silent-absence hole as the three per-
+			// interface soft skips, one frame up, and reachable on the HA
+			// config-sync path.
+			//
+			// The record is ZONE-level and cannot be resolved to per-interface
+			// coverage: zone.Interfaces is precisely the deref the guard above
+			// exists to prevent, so the surfaces are unknowable here. It is
+			// therefore reported as SKIPPED, not uncovered — an enumeration
+			// gap the measurement can now see rather than a proven policy-free
+			// router. The gating PR has to decide whether an unenumerable zone
+			// fails closed; this phase only has to stop hiding it.
+			result.recordUnarmedSurface(UnarmedSurface{
+				Name: "zone:" + name,
+				Reason: "nil zone slot — every interface in this zone was dropped from the " +
+					"required set and none can be enumerated",
+			})
 			continue
 		}
 		zid := result.ZoneIDs[name]
@@ -453,12 +472,10 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 			"interface", physName, "zone", name, "err", err)
 		// #5275: the config demanded this surface and the compile still
 		// succeeds without it. Record it so the arm-coverage proof can tell a
-		// declined surface from one that armed. The netdev does not exist, so
-		// nothing forwards through it.
-		result.recordUnarmedSurface(UnarmedSurface{
-			Name:   physName,
-			Reason: fmt.Sprintf("interface not found in zone %s: %v", name, err),
-		})
+		// declined surface from one that armed. missingInterfaceRecord decides
+		// whether the absence is PROVEN — a netdev-enumeration failure is not
+		// the same as a netdev that does not exist.
+		result.recordUnarmedSurface(missingInterfaceRecord(physName, name, err))
 		return nil
 	}
 
@@ -649,23 +666,20 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		isDisabled := false
 		// #5275: a disable whose LinkSetDown did NOT take leaves the netdev UP,
 		// still address-reconciled, still in a zone, still forwarded through by
-		// the kernel — with no XDP attached. That is the sharp variant the
-		// arm-coverage proof has to see, so track whether the down actually
-		// happened rather than only warning about it.
-		linkDownFailed := false
+		// the kernel — with no XDP attached. Keep LinkSetDown's own error so
+		// disabledSurfaceRecord can tell a proven-down netdev from one that
+		// merely got a warning; a bool computed here would be a second place to
+		// get that judgement wrong.
+		var downErr error
 		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.Disable {
 			isDisabled = true
 			if nlErr == nil {
-				if err := netlink.LinkSetDown(nl); err != nil {
+				if downErr = netlink.LinkSetDown(nl); downErr != nil {
 					slog.Warn("failed to bring disabled interface down",
-						"name", physName, "err", err)
-					linkDownFailed = true
+						"name", physName, "err", downErr)
 				} else {
 					slog.Info("interface administratively disabled", "name", physName)
 				}
-			} else {
-				// The link never resolved, so it was never brought down.
-				linkDownFailed = true
 			}
 		} else if nlErr == nil {
 			if err := netlink.LinkSetUp(nl); err != nil {
@@ -679,19 +693,12 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		if isDisabled {
 			slog.Info("skipping XDP/TC attachment for disabled interface",
 				"name", physName, "ifindex", physIface.Index)
-			// #5275: record the declined surface. StillForwarding promotes it
-			// from "skipped" to "uncovered" when the link-down did not take —
-			// an UP, zoned, XDP-less netdev is the policy-free-router state.
-			reason := "administratively disabled (netdev brought down)"
-			if linkDownFailed {
-				reason = "administratively disabled but link-down FAILED — netdev may still be UP and forwarding with no XDP"
-			}
-			result.recordUnarmedSurface(UnarmedSurface{
-				Name:            physName,
-				Ifindex:         physIface.Index,
-				Reason:          reason,
-				StillForwarding: linkDownFailed,
-			})
+			// #5275: record the declined surface. Both errors are threaded
+			// through so disabledSurfaceRecord can promote it from "skipped" to
+			// "uncovered" when the netdev was not proven down — an UP, zoned,
+			// XDP-less netdev is the policy-free-router state.
+			result.recordUnarmedSurface(
+				disabledSurfaceRecord(physName, physIface.Index, nlErr, downErr))
 		} else {
 			// Defer actual XDP/TC attachment to after all compile phases
 			// so link.Update() switches to programs with fully-populated maps.

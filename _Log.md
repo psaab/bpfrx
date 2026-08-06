@@ -66313,3 +66313,33 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
   pkg/dataplane/loader.go, pkg/dataplane/apply.go, pkg/dataplane/README.md,
   docs/research/5275-arm-failclosed/plan.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 fold round 2 — eight GREEN cells authored by the re-gate
+  at ed28086c8. (1, MAJOR) The compiler half of `StillForwarding` was bound by
+  nothing: setting it to `false`, or deleting the never-resolved-link leg, was
+  whole-suite GREEN. The judgement moved into a pure `disabledSurfaceRecord`
+  (linkErr, downErr -> proven-down or not), unit-tested across all four
+  combinations, and the WIRE is bound by an AST canary asserting both errors are
+  threaded as identifiers rather than `nil`. `linkDownFailed` is gone — the
+  netdev is proven down only when both errors are nil. (2) The call-site canary
+  was satisfied by four inert edits; it now asserts the statement is a
+  TOP-LEVEL element of the body, that the receiver is `m`, that the argument is
+  `result`, and that its index EXCEEDS the `attachUserspaceShimXDP` call's.
+  (3) A FOURTH surface-dropping soft skip existed — `if zone == nil { continue }`
+  in `programZoneMaps`, which drops every interface in a zone and is reachable on
+  the HA config-sync path — now recorded at zone level. The message allowlist is
+  replaced by a STRUCTURAL enumeration: every early `return nil` in
+  `mapZoneInterface` and every `continue` in `programZoneMaps` must record, so a
+  new soft skip with an unguessed message no longer passes. (4) README no longer
+  claims `skipped` means nothing forwards — it is the third unknown, and
+  `WouldGate` excludes it. `missingInterfaceRecord` distinguishes a genuine
+  absence from a netlink DUMP failure (wrapped `syscall.Errno`) instead of
+  inferring absence from an error it never inspected. `XDP_ATTACHED_MULTI` now
+  counts as generic (reachable via the discarded `DetachXDP` error), via a pure
+  `xdpModeIsGeneric` covered by a five-mode table. `nextApplyGeneration` and both
+  probe bodies gained tests. `recordUnarmedSurface` dedupes by (name, ifindex)
+  and never downgrades a classification — the count is the deliverable.
+  `swapArmProbes` documents its no-parallel constraint.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md

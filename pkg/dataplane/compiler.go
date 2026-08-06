@@ -183,8 +183,25 @@ func (r *CompileResult) peekLinkByIndex(idx int) (netlink.Link, error) {
 
 // recordUnarmedSurface notes an attach point the compiler declined to arm while
 // still returning success (#5275). See UnarmedSurface.
+//
+// One record per surface. mapZoneInterface runs once per ZONE REFERENCE, and
+// the per-phys dedup (st.attached) sits far below the soft skips, so an
+// interface named by two zones reaches the skip twice — and the count is the
+// deliverable of this phase, so a double count is a wrong number rather than a
+// cosmetic wart. A repeat sighting never downgrades the classification: if
+// either one could not prove the netdev down, the surface keeps the
+// conservative reading.
 func (r *CompileResult) recordUnarmedSurface(u UnarmedSurface) {
 	if r == nil {
+		return
+	}
+	for i := range r.unarmedSurfaces {
+		if r.unarmedSurfaces[i].Name != u.Name || r.unarmedSurfaces[i].Ifindex != u.Ifindex {
+			continue
+		}
+		if u.StillForwarding && !r.unarmedSurfaces[i].StillForwarding {
+			r.unarmedSurfaces[i] = u
+		}
 		return
 	}
 	r.unarmedSurfaces = append(r.unarmedSurfaces, u)

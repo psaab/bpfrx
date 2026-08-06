@@ -2,11 +2,15 @@ package dataplane
 
 import (
 	"bytes"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"net"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/cilium/ebpf/link"
@@ -62,6 +66,12 @@ func lookupFrom(covered map[int]uint32, generic map[int]bool) instanceLookup {
 // reads. Neither is reachable from a unit test otherwise: XDP cannot be
 // attached without CAP_NET_ADMIN, and link.Link carries an unexported method so
 // no fake can satisfy it. A nil argument leaves that probe alone.
+//
+// These are PACKAGE-level vars, so a caller MUST NOT t.Parallel(): the swap
+// would be visible to every other test running at the same time. It is safe
+// today only because Go resumes parallel tests after the serial ones finish and
+// no parallel test in this package reads a probe — do not rely on that
+// accident, mark the constraint here instead.
 func swapArmProbes(t *testing.T, mode func(int) bool, progID func(link.Link) (uint32, bool)) {
 	t.Helper()
 	oldMode, oldID := xdpLinkModeGeneric, xdpLinkProgramID
@@ -443,6 +453,192 @@ func TestArmProofSoftSkippedSurfaceIsDistinguishable(t *testing.T) {
 	}
 }
 
+// TestArmProofDisabledSurfaceClassification pins the judgement the compiler
+// site cannot express in a unit test: WHEN a disabled interface is proven down.
+//
+// `set interfaces ge-0-0-1 disable` whose netlink.LinkSetDown fails is a
+// slog.Warn and nothing else — the netdev stays UP, address reconciliation
+// still runs (that call sits outside the disable guard), it is still in a zone,
+// the kernel still forwards through it, and no XDP is attached. The link never
+// resolving is the same condition by a different route: LinkSetDown was never
+// even attempted. Only a clean resolve AND a clean down prove the netdev is
+// down.
+func TestArmProofDisabledSurfaceClassification(t *testing.T) {
+	linkErr := errors.New("no such device")
+	downErr := errors.New("device or resource busy")
+
+	for _, tc := range []struct {
+		name             string
+		linkErr, downErr error
+		wantForwarding   bool
+	}{
+		{"clean disable", nil, nil, false},
+		{"link-down failed", nil, downErr, true},
+		{"link never resolved", linkErr, nil, true},
+		{"both failed", linkErr, downErr, true},
+	} {
+		got := disabledSurfaceRecord("ge-0-0-1", 12, tc.linkErr, tc.downErr)
+		if got.StillForwarding != tc.wantForwarding {
+			t.Fatalf("%s: StillForwarding=%v, want %v — this is the whole difference between "+
+				"a benign operator action and an UP, zoned, XDP-less netdev the kernel forwards "+
+				"through; detail=%q", tc.name, got.StillForwarding, tc.wantForwarding, got.Reason)
+		}
+		if got.Name != "ge-0-0-1" || got.Ifindex != 12 {
+			t.Fatalf("%s: record lost its identity: %+v", tc.name, got)
+		}
+		// End to end: the classification must reach the report's verdict.
+		r := newProofResult(nil)
+		r.recordUnarmedSurface(got)
+		rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+		if rep.WouldGate != tc.wantForwarding {
+			t.Fatalf("%s: WouldGate=%v, want %v; got %+v",
+				tc.name, rep.WouldGate, tc.wantForwarding, rep)
+		}
+	}
+}
+
+// TestArmProofMissingInterfaceClassification pins that "not found" is not
+// assumed from an error the code never inspected.
+//
+// net.InterfaceByName reports a genuine absence and a netlink DUMP failure
+// (ENOBUFS / ENOMEM / EINTR) through the same *net.OpError. Only the first
+// proves nothing forwards through the netdev; a dump failure says nothing at
+// all about whether it exists, and treating it as absence is a fail-OPEN
+// classification on an interface that may be live and UP.
+func TestArmProofMissingInterfaceClassification(t *testing.T) {
+	absent := &net.OpError{Op: "route", Net: "ip+net", Err: errors.New("no such network interface")}
+	if got := missingInterfaceRecord("ge-0-0-9", "trust", absent); got.StillForwarding {
+		t.Fatalf("a proven absence must not read as still-forwarding; got %+v", got)
+	}
+
+	dumpFailed := &net.OpError{Op: "route", Net: "ip+net", Err: os.NewSyscallError("recvmsg", syscall.ENOBUFS)}
+	got := missingInterfaceRecord("ge-0-0-9", "trust", dumpFailed)
+	if !got.StillForwarding {
+		t.Fatalf("a netdev ENUMERATION failure does not prove the interface is absent — it may "+
+			"be live, UP and in a zone; got %+v", got)
+	}
+	r := newProofResult(nil)
+	r.recordUnarmedSurface(got)
+	if rep := classifyArmCoverage(r, lookupFrom(nil, nil)); !rep.WouldGate {
+		t.Fatalf("an unproven absence must reach the verdict as would-gate; got %+v", rep)
+	}
+}
+
+// TestArmProofXDPModeClassification pins every kernel attach mode, including
+// the two a test cannot produce.
+//
+// XDP_ATTACHED_MULTI is reachable: attachUserspaceShimXDP DISCARDS
+// m.DetachXDP's error on the native fallback path, so a failed detach followed
+// by the generic re-attach leaves programs in two modes. Reading it as native
+// undercounts the skb-mode population — the same direction as the defect that
+// moved this flag to the kernel in the first place.
+func TestArmProofXDPModeClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		attached bool
+		mode     uint32
+		want     bool
+	}{
+		{"not attached", false, xdpAttachedNone, false},
+		{"driver/native", true, xdpAttachedDrv, false},
+		{"generic/skb", true, xdpAttachedSKB, true},
+		{"hardware offload", true, xdpAttachedHW, false},
+		{"multi-mode", true, xdpAttachedMulti, true},
+		{"mode set but not attached", false, xdpAttachedSKB, false},
+	} {
+		if got := xdpModeIsGeneric(tc.attached, tc.mode); got != tc.want {
+			t.Fatalf("%s: xdpModeIsGeneric(%v, %d)=%v, want %v",
+				tc.name, tc.attached, tc.mode, got, tc.want)
+		}
+	}
+}
+
+// TestArmProofLiveProbesReadRealState exercises the production probe bodies,
+// which every other test in this file replaces.
+//
+// Loopback is ifindex 1 in every Linux network namespace and carries no XDP, so
+// the "attached=false means not generic" leg runs against the real kernel; a
+// bogus ifindex exercises the error leg. Without this the six-line netlink body
+// and the nil-link guard are unbound.
+func TestArmProofLiveProbesReadRealState(t *testing.T) {
+	if xdpLinkModeGeneric(1) {
+		t.Fatal("loopback carries no XDP program; the probe must not report skb-mode for it")
+	}
+	if xdpLinkModeGeneric(0x7ffffff) {
+		t.Fatal("an unresolvable ifindex must not report skb-mode")
+	}
+	if id, ok := xdpLinkProgramID(nil); ok || id != 0 {
+		t.Fatalf("a nil tracked link is not proof of coverage; got id=%d ok=%v", id, ok)
+	}
+}
+
+// TestArmProofApplyGenerationAdvances pins that the stage label's sequence
+// actually moves. A constant would collapse the RETH deferred-MAC path's two
+// records onto one label, which is the thing the label exists to prevent.
+func TestArmProofApplyGenerationAdvances(t *testing.T) {
+	m := New()
+	first := m.nextApplyGeneration()
+	if first == 0 {
+		t.Fatal("the first compile's sequence must not be zero — a constant 0 is indistinguishable " +
+			"from a stubbed accessor")
+	}
+	if again := m.nextApplyGeneration(); again != first {
+		t.Fatalf("nextApplyGeneration must not itself advance the counter; got %d then %d", first, again)
+	}
+	m.recordApplyResult(&ApplyResult{})
+	if next := m.nextApplyGeneration(); next != first+1 {
+		t.Fatalf("the sequence must advance once per recorded apply; got %d, want %d", next, first+1)
+	}
+}
+
+// TestArmProofUnarmedSurfacesAreDeduplicated pins that one surface counts once.
+//
+// mapZoneInterface runs once per ZONE REFERENCE and the per-phys dedup sits far
+// below the soft skips, so an interface named by two zones reaches the skip
+// twice. The count is this phase's deliverable, so a double count is a wrong
+// number. A repeat sighting must never DOWNGRADE the classification.
+func TestArmProofUnarmedSurfacesAreDeduplicated(t *testing.T) {
+	r := newProofResult(nil)
+	r.recordUnarmedSurface(UnarmedSurface{Name: "ge-0-0-9", Reason: "not found in zone trust"})
+	r.recordUnarmedSurface(UnarmedSurface{Name: "ge-0-0-9", Reason: "not found in zone dmz"})
+
+	rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+	if rep.Skipped != 1 || len(rep.Surfaces) != 1 {
+		t.Fatalf("one missing interface named by two zones is ONE unarmed surface; got %+v", rep)
+	}
+
+	// A later, more conservative sighting must win.
+	r.recordUnarmedSurface(UnarmedSurface{Name: "ge-0-0-9", Reason: "enumeration failed", StillForwarding: true})
+	rep = classifyArmCoverage(r, lookupFrom(nil, nil))
+	if rep.Uncovered != 1 || rep.Skipped != 0 || !rep.WouldGate {
+		t.Fatalf("a repeat sighting must never downgrade a surface to benign; got %+v", rep)
+	}
+}
+
+// TestArmProofNilZoneSlotIsRecorded pins the FOURTH surface-dropping soft skip.
+//
+// programZoneMaps skips a nil zone value — reachable on the tolerant and
+// HA-peer-sync config paths — and mapZoneInterface is the only writer of
+// pendingXDP, so EVERY interface in that zone leaves the required set while the
+// compile succeeds. Before this the proof logged skipped=0 uncovered=0
+// would_gate=false for it, biasing the divergence rate optimistic on exactly
+// the HA path.
+func TestArmProofNilZoneSlotIsRecorded(t *testing.T) {
+	r := newProofResult(nil)
+	r.recordUnarmedSurface(UnarmedSurface{
+		Name:   "zone:untrust",
+		Reason: "nil zone slot — every interface in this zone was dropped",
+	})
+
+	rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+	if rep.Skipped != 1 {
+		t.Fatalf("a dropped zone must be visible in the report; got %+v", rep)
+	}
+	if got := rep.SurfaceSummary(); !strings.Contains(got, "zone:untrust:skipped") {
+		t.Fatalf("the summary must name the dropped zone; got %q", got)
+	}
+}
+
 // TestArmProofSkippedButStillForwardingIsUncovered pins the sharp variant.
 //
 // `set interfaces ge-0-0-1 disable` whose netlink.LinkSetDown then FAILS is a
@@ -651,113 +847,230 @@ func selectorName(e ast.Expr) string {
 	return ""
 }
 
+// identName returns the name when e is a bare identifier.
+func identName(e ast.Expr) string {
+	if id, ok := e.(*ast.Ident); ok {
+		return id.Name
+	}
+	return ""
+}
+
+// stmtCallsFunc reports whether stmt contains a call to a method named name.
+func stmtCallsFunc(stmt ast.Stmt, name string) bool {
+	found := false
+	ast.Inspect(stmt, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && selectorName(call.Fun) == name {
+			found = true
+		}
+		return !found
+	})
+	return found
+}
+
+// blockRecords reports whether a block directly calls recordUnarmedSurface.
+func blockRecords(block *ast.BlockStmt) bool {
+	for _, stmt := range block.List {
+		expr, ok := stmt.(*ast.ExprStmt)
+		if !ok {
+			continue
+		}
+		if call, ok := expr.X.(*ast.CallExpr); ok && selectorName(call.Fun) == "recordUnarmedSurface" {
+			return true
+		}
+	}
+	return false
+}
+
+// isReturnNil reports whether stmt is `return nil`.
+func isReturnNil(stmt ast.Stmt) bool {
+	ret, ok := stmt.(*ast.ReturnStmt)
+	return ok && len(ret.Results) == 1 && identName(ret.Results[0]) == "nil"
+}
+
 // TestArmProofIsInvokedFromCompileUserspaceShim binds the production call site.
+//
+// A shape check is only worth the shapes it REJECTS. Each assertion below
+// corresponds to an edit that leaves the call textually present while making
+// the measurement permanently dead, and every one of them passed the first
+// version of this test: wrapping the statement in a dead branch; calling it on
+// a nil *Manager (the m == nil guard then reports ran=false forever); handing
+// it a fresh &CompileResult{} (uncovered=0 on every box forever); and moving it
+// ABOVE attachUserspaceShimXDP, which makes every surface uncovered and
+// contradicts the comment at the call site that states the ordering as the
+// reason the proof means anything.
 func TestArmProofIsInvokedFromCompileUserspaceShim(t *testing.T) {
 	_, file := parseDataplaneFile(t, "loader.go")
 	fn := findFuncDecl(t, file, "CompileUserspaceShim")
 
-	var found bool
-	var seqIsConstant bool
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || selectorName(call.Fun) != "LogArmCoverage" {
-			return true
+	proofIdx, attachIdx := -1, -1
+	var proof *ast.CallExpr
+	for i, stmt := range fn.Body.List {
+		if attachIdx < 0 && stmtCallsFunc(stmt, "attachUserspaceShimXDP") {
+			attachIdx = i
 		}
-		// The receiver must be the proof itself, not a stashed report.
-		recv, ok := call.Fun.(*ast.SelectorExpr)
+		expr, ok := stmt.(*ast.ExprStmt)
 		if !ok {
-			return true
+			continue
 		}
-		inner, ok := recv.X.(*ast.CallExpr)
-		if !ok || selectorName(inner.Fun) != "ProveArmCoverage" {
-			return true
+		call, ok := expr.X.(*ast.CallExpr)
+		if !ok || selectorName(call.Fun) != "LogArmCoverage" {
+			continue
 		}
-		found = true
-		if len(call.Args) == 2 {
-			if _, isLit := call.Args[1].(*ast.BasicLit); isLit {
-				seqIsConstant = true
-			}
-		}
-		return false
-	})
-
-	if !found {
-		t.Fatal("CompileUserspaceShim no longer calls ProveArmCoverage(...).LogArmCoverage(...) — " +
-			"the #5275 measurement is not wired to any production path, and every other test " +
-			"in this file drives the classifier directly so nothing else notices")
+		proofIdx, proof = i, call
 	}
-	if seqIsConstant {
-		t.Fatal("the arm-coverage sequence argument is a literal — the RETH deferred-MAC path " +
-			"compiles twice per apply, and a constant makes the two records indistinguishable")
+
+	if proofIdx < 0 {
+		t.Fatal("CompileUserspaceShim has no TOP-LEVEL ProveArmCoverage(...).LogArmCoverage(...) " +
+			"statement — the #5275 measurement is either unwired or buried in a branch, and every " +
+			"other test in this file drives the classifier directly so nothing else notices")
+	}
+	if attachIdx < 0 {
+		t.Fatal("CompileUserspaceShim no longer calls attachUserspaceShimXDP — this canary's " +
+			"ordering assertion has nothing to anchor to")
+	}
+	if proofIdx < attachIdx {
+		t.Fatalf("the proof runs BEFORE attachUserspaceShimXDP (stmt %d vs %d) — it would report "+
+			"every surface uncovered, which is the opposite of the ordering the call site's own "+
+			"comment gives as the reason the proof is meaningful", proofIdx, attachIdx)
+	}
+
+	recv, ok := proof.Fun.(*ast.SelectorExpr)
+	if !ok {
+		t.Fatal("LogArmCoverage is not called as a method")
+	}
+	inner, ok := recv.X.(*ast.CallExpr)
+	if !ok || selectorName(inner.Fun) != "ProveArmCoverage" {
+		t.Fatal("LogArmCoverage's receiver is not a live ProveArmCoverage call — a stashed or " +
+			"hand-built report measures nothing")
+	}
+	innerSel, ok := inner.Fun.(*ast.SelectorExpr)
+	if !ok || identName(innerSel.X) != "m" {
+		t.Fatalf("ProveArmCoverage is not called on the live Manager `m` — a nil receiver makes "+
+			"the m == nil guard report ran=false forever; got %q", identName(innerSel.X))
+	}
+	if len(inner.Args) != 1 || identName(inner.Args[0]) != "result" {
+		t.Fatal("ProveArmCoverage is not passed the compile's own `result` — a fresh CompileResult " +
+			"has no pendingXDP, so the proof reports uncovered=0 on every box forever")
+	}
+	if len(proof.Args) != 2 {
+		t.Fatalf("LogArmCoverage takes a stage and a sequence; got %d args", len(proof.Args))
+	}
+	if _, isCall := proof.Args[1].(*ast.CallExpr); !isCall {
+		t.Fatal("the arm-coverage sequence argument is not a live call — the RETH deferred-MAC " +
+			"path compiles twice per apply, and a constant makes the two records indistinguishable")
 	}
 }
 
-// surfaceSkipSites are the compiler's SOFT SKIPS: branches that drop a
-// configured attach point from the required set while the compile still
-// succeeds. Each must record the surface, or the proof cannot tell a declined
-// surface from an armed one.
+// TestArmProofEverySurfaceDroppingBranchRecords enumerates the compiler's
+// surface-dropping branches STRUCTURALLY.
 //
-// A new soft skip belongs here AND needs a recordUnarmedSurface call. The
-// entries below are deliberately NOT every "skipping" log in the function —
-// "skipping tx_port for tunnel interface" and "skipping TC for tunnel
-// interface" both still arm XDP on the surface, so they are not surface skips.
-var surfaceSkipSites = []string{
-	"interface not found, skipping",
-	"VLAN sub-interface failed, skipping",
-	"skipping XDP/TC attachment for disabled interface",
-}
-
-// TestArmProofSoftSkipSitesRecordTheSurface binds the three recording sites.
-func TestArmProofSoftSkipSitesRecordTheSurface(t *testing.T) {
+// The first version of this test matched three hand-written log messages, so it
+// could only ever check spellings already guessed: a fourth soft skip carrying a
+// new message passed it unnoticed, and there WAS a fourth (the nil zone slot in
+// programZoneMaps). Control flow is what actually drops a surface, so control
+// flow is what is enumerated.
+//
+// mapZoneInterface is the SOLE writer of st.xdpIfindexes, which becomes
+// result.pendingXDP, so every early `return nil` in it drops a configured attach
+// point while the compile SUCCEEDS. programZoneMaps sits one frame up and its
+// `continue` drops every interface in a whole zone.
+func TestArmProofEverySurfaceDroppingBranchRecords(t *testing.T) {
 	_, file := parseDataplaneFile(t, "compiler_iface.go")
-	fn := findFuncDecl(t, file, "mapZoneInterface")
 
-	seen := make(map[string]bool, len(surfaceSkipSites))
+	// mapZoneInterface: every early `return nil` must record.
+	fn := findFuncDecl(t, file, "mapZoneInterface")
+	final := fn.Body.List[len(fn.Body.List)-1]
+	dropping := 0
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		block, ok := n.(*ast.BlockStmt)
 		if !ok {
 			return true
 		}
-		msg := ""
-		records := false
 		for _, stmt := range block.List {
-			expr, ok := stmt.(*ast.ExprStmt)
-			if !ok {
+			if stmt == final || !isReturnNil(stmt) {
 				continue
 			}
-			call, ok := expr.X.(*ast.CallExpr)
-			if !ok {
-				continue
-			}
-			switch selectorName(call.Fun) {
-			case "Warn", "Info":
-				if len(call.Args) == 0 {
-					continue
-				}
-				lit, ok := call.Args[0].(*ast.BasicLit)
-				if !ok {
-					continue
-				}
-				for _, want := range surfaceSkipSites {
-					if strings.Contains(lit.Value, want) {
-						msg = want
-					}
-				}
-			case "recordUnarmedSurface":
-				records = true
+			dropping++
+			if !blockRecords(block) {
+				t.Errorf("mapZoneInterface has an early `return nil` at line %d that records no "+
+					"unarmed surface — the compile succeeds, the surface vanishes from pendingXDP, "+
+					"and the proof reports Uncovered=0 for an attach point it never looked at",
+					stmt.Pos())
 			}
 		}
-		if msg != "" && records {
-			seen[msg] = true
+		return true
+	})
+	// Vacuity guard, not a correctness claim: if a refactor moves the soft
+	// skips out of this function the walk above silently checks nothing.
+	if dropping < 2 {
+		t.Fatalf("found only %d early `return nil` in mapZoneInterface — this canary has gone "+
+			"vacuous; re-point it at wherever the soft skips now live", dropping)
+	}
+
+	// programZoneMaps: every `continue` drops a whole zone's interfaces.
+	zoneFn := findFuncDecl(t, file, "programZoneMaps")
+	continues := 0
+	ast.Inspect(zoneFn.Body, func(n ast.Node) bool {
+		block, ok := n.(*ast.BlockStmt)
+		if !ok {
+			return true
+		}
+		for _, stmt := range block.List {
+			br, ok := stmt.(*ast.BranchStmt)
+			if !ok || br.Tok != token.CONTINUE {
+				continue
+			}
+			continues++
+			if !blockRecords(block) {
+				t.Errorf("programZoneMaps skips a zone at line %d without recording it — "+
+					"mapZoneInterface is the only writer of pendingXDP, so EVERY interface in "+
+					"that zone is dropped from the required set while the compile succeeds",
+					stmt.Pos())
+			}
+		}
+		return true
+	})
+	if continues < 1 {
+		t.Fatal("found no `continue` in programZoneMaps — this canary has gone vacuous")
+	}
+}
+
+// TestArmProofDisabledSiteThreadsBothErrors binds the WIRE for StillForwarding.
+//
+// disabledSurfaceRecord's classification is bound behaviourally below, but the
+// compiler half — that the real link and link-down errors reach it — is not
+// reachable from any unit test: producing the condition needs a live netdev
+// whose LinkSetDown fails. Passing nil for either argument makes every disabled
+// interface read as a benign, proven-down operator action forever, and the
+// whole-suite result is unchanged. That is the exact edit this asserts against.
+func TestArmProofDisabledSiteThreadsBothErrors(t *testing.T) {
+	_, file := parseDataplaneFile(t, "compiler_iface.go")
+	fn := findFuncDecl(t, file, "mapZoneInterface")
+
+	var calls []*ast.CallExpr
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok && identName(call.Fun) == "disabledSurfaceRecord" {
+			calls = append(calls, call)
 		}
 		return true
 	})
 
-	for _, want := range surfaceSkipSites {
-		if !seen[want] {
-			t.Fatalf("the soft skip %q does not record the surface it drops — the compile "+
-				"succeeds, the surface vanishes from pendingXDP, and the proof reports "+
-				"Uncovered=0 for an attach point it never looked at", want)
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one disabledSurfaceRecord call in mapZoneInterface; got %d — "+
+			"the administratively-disabled skip is the sharp one and must classify in one place",
+			len(calls))
+	}
+	call := calls[0]
+	if len(call.Args) != 4 {
+		t.Fatalf("disabledSurfaceRecord takes name, ifindex, linkErr, downErr; got %d args", len(call.Args))
+	}
+	for i, what := range map[int]string{2: "the link-resolution error", 3: "LinkSetDown's error"} {
+		name := identName(call.Args[i])
+		if name == "" || name == "nil" {
+			t.Fatalf("%s is not threaded into disabledSurfaceRecord (arg %d is %q) — every "+
+				"administratively disabled interface would then read as proven-down and benign, "+
+				"including one whose netdev is still UP, zoned, forwarded through and carrying "+
+				"no XDP, which is the policy-free router this PR exists to measure", what, i, name)
 		}
 	}
 }

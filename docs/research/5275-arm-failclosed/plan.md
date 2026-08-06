@@ -203,16 +203,23 @@ divergence rate it emits is a LOWER BOUND on what the FINAL-stage gate will see.
 It is phase PR0 in §10, not PR1.
 
 A **fourth** kind fell out of implementing it, which the classification above
-still misses: **skipped**. Three soft skips in `compiler_iface.go` — interface
-not found, VLAN child create failed, administratively disabled — drop a
-configured attach point from `pendingXDP` while the compile SUCCEEDS, so a
-surface the compiler declined to arm is indistinguishable from one it armed. The
-sharp variant is `set interfaces <if> disable` whose `netlink.LinkSetDown` then
-fails (a `slog.Warn` and nothing else): the netdev stays UP, is still
+still misses: **skipped**. FOUR soft skips drop a configured attach point while
+the compile SUCCEEDS, so a surface the compiler declined to arm is
+indistinguishable from one it armed — three per-interface in `mapZoneInterface`
+(interface not found, VLAN child create failed, administratively disabled) and
+one per-ZONE in `programZoneMaps` (`if zone == nil { continue }`, reachable on
+the tolerant and HA-peer-sync config paths, which drops every interface in that
+zone and cannot be resolved to per-interface coverage because `zone.Interfaces`
+is the deref the guard prevents).
+
+The sharp variant is `set interfaces <if> disable` whose `netlink.LinkSetDown`
+then fails (a `slog.Warn` and nothing else): the netdev stays UP, is still
 address-reconciled, is still in a zone, is still forwarded through by the
-kernel, and carries no XDP. The gating PR must treat that as **uncovered**; a
+kernel, and carries no XDP. **The gating PR must treat that as uncovered**; a
 skip whose netdev genuinely went down is a legitimate operator action and must
-not fail the box closed.
+not fail the box closed. PR0 reports `skipped` for everything else — including
+the nil zone — so PR1 inherits an explicit, unresolved decision rather than a
+silent zero. `WouldGate` in PR0 deliberately excludes `skipped`.
 
 **Coverage proof ingredients are PER-STAGE (§13-D1; readback-fail ⇒ unarmed) —
 NOT identical across both stages:** the PRELIMINARY stage proves only the attach-point

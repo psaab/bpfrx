@@ -391,8 +391,8 @@ a test in `armproof_5275_test.go`.
 |---|---|
 | `direct` | A shim instance is attached here. **Native and generic both count.** |
 | `delegated` | No attach is expected here by design; the **parent** covers it, and the parent is a required surface that itself classified `direct`. |
-| `skipped` | The **compiler** declined to arm this surface and the compile still succeeded — and nothing forwards through it. |
-| `uncovered` | Nothing here and no proven delegate — including a failed readback, and a declined surface whose netdev is still up and forwarding. |
+| `skipped` | The **compiler** declined to arm this surface and the compile still succeeded. A **third, distinct unknown**: neither proven covered nor proven forwarding-without-policy. `WouldGate` deliberately excludes it — see below. |
+| `uncovered` | Nothing here and no proven delegate — including a failed readback, and a declined surface whose netdev was not proven down. |
 
 - **Generic (skb-mode) counts as armed.** It still steers packets to
   userspace-dp and still enforces policy, at roughly 16% CPU overhead from the
@@ -420,13 +420,41 @@ a test in `armproof_5275_test.go`.
   enabled→disabled commit leaves the old parent link in place while the parent
   is admin-DOWN and about to be torn down.
 - **A surface the compiler declined to arm is not silently absent.**
-  `compiler_iface.go` soft-skips three ways — interface not found, VLAN child
-  create failed, administratively disabled — each behind a `slog` line, each
-  leaving the compile *successful* and the surface out of `pendingXDP`. Each now
-  records an `UnarmedSurface`. The sharp case is a `disable` whose
-  `netlink.LinkSetDown` fails: the netdev stays up, still address-reconciled,
-  still in a zone, still forwarded through, with no XDP — that is reported
-  `uncovered`, not `skipped`.
+  `compiler_iface.go` soft-skips **four** ways, each behind a `slog` line, each
+  leaving the compile *successful* and the surface out of `pendingXDP`: the
+  interface was not found, the VLAN child could not be created, the interface is
+  administratively disabled, and — one frame up in `programZoneMaps` — the zone
+  slot is nil. Each records an `UnarmedSurface`.
+  - `skipped` is **not** a claim that nothing forwards. It is the third unknown:
+    the compiler did not look, so the proof cannot say. `WouldGate` excludes it
+    because a clean `disable` is a legitimate operator action and folding every
+    one into would-gate would swamp the measurement this phase exists to take.
+    **PR1 must decide** what a declined surface means to a gate.
+  - The sharp case is promoted: a `disable` whose `netlink.LinkSetDown` fails
+    (or whose link never resolved, so the down was never attempted) leaves the
+    netdev up, still address-reconciled, still in a zone, still forwarded
+    through, with no XDP — reported `uncovered`. `disabledSurfaceRecord` makes
+    that judgement, split out so it is unit-testable; producing the condition
+    needs `CAP_NET_ADMIN`, deciding what it *means* does not.
+  - Absence is not assumed from an error nobody read. `net.InterfaceByName`
+    reports a genuine absence and a netlink **dump failure** through the same
+    `*net.OpError`; a dump failure proves nothing about whether the netdev
+    exists, so `missingInterfaceRecord` treats a wrapped `syscall.Errno` as
+    possibly-still-forwarding.
+  - The nil zone slot is recorded at **zone** level (`zone:<name>`) and stays
+    `skipped`: `zone.Interfaces` is precisely the deref the nil guard prevents,
+    so its surfaces are unknowable there. It is an enumeration gap the
+    measurement can now see — and it is reachable on the HA config-sync path,
+    where the rate was previously biased optimistic.
+  - One record per surface. `mapZoneInterface` runs once per *zone reference*
+    and the per-phys dedup sits below the skips, so an interface named by two
+    zones would otherwise be counted twice; a repeat sighting never downgrades
+    the classification.
+- **`XDP_ATTACHED_MULTI` counts as generic.** It means programs are attached in
+  more than one mode, and it is reachable — `attachUserspaceShimXDP` discards
+  `DetachXDP`'s error on the native-fallback path. Reading it as native would
+  undercount the slow-path population, the same direction as the defect that
+  moved the flag to the kernel.
 
 `CoverageUncovered` is deliberately the zero value: an unpopulated entry must
 read as *not* covered, so a partially-built report can only ever be more

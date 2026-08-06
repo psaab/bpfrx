@@ -1,11 +1,13 @@
 package dataplane
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
@@ -242,6 +244,65 @@ type UnarmedSurface struct {
 	StillForwarding bool
 }
 
+// disabledSurfaceRecord classifies an administratively disabled interface.
+//
+// Split out of mapZoneInterface deliberately. The only judgement in it is
+// StillForwarding, which is the whole difference between a benign operator
+// action and a policy-free router — and producing the condition in a test
+// (a real netdev whose LinkSetDown fails) needs CAP_NET_ADMIN, while deciding
+// what such a failure MEANS does not. In the caller it was unbindable; here it
+// is four table rows.
+//
+// linkErr is the netlink link-resolution error: non-nil means no handle was
+// ever obtained, so LinkSetDown was never even attempted. downErr is
+// LinkSetDown's own error. The netdev is proven down only when BOTH are nil.
+// Anything else leaves it possibly UP, still address-reconciled (that call sits
+// outside the disable guard), still in a zone, still forwarded through by the
+// kernel, and carrying no XDP.
+func disabledSurfaceRecord(name string, ifindex int, linkErr, downErr error) UnarmedSurface {
+	s := UnarmedSurface{Name: name, Ifindex: ifindex}
+	switch {
+	case linkErr != nil:
+		s.Reason = fmt.Sprintf("administratively disabled but the link never resolved (%v) — "+
+			"never brought down, may still be UP and forwarding with no XDP", linkErr)
+		s.StillForwarding = true
+	case downErr != nil:
+		s.Reason = fmt.Sprintf("administratively disabled but link-down FAILED (%v) — "+
+			"netdev may still be UP and forwarding with no XDP", downErr)
+		s.StillForwarding = true
+	default:
+		s.Reason = "administratively disabled (netdev brought down)"
+	}
+	return s
+}
+
+// missingInterfaceRecord classifies a zone interface the compiler could not
+// resolve.
+//
+// "Not found" is NOT the only thing net.InterfaceByName reports through this
+// error. It wraps a genuine absence (its own errNoSuchInterface) and a netlink
+// DUMP failure (ENOBUFS / ENOMEM / EINTR, surfaced as a syscall.Errno) in the
+// same *net.OpError. Only the first proves nothing forwards through the netdev;
+// a dump failure says nothing at all about whether it exists, and it may be
+// live, UP and in a zone. errNoSuchInterface is unexported, so the distinction
+// is drawn from the WRAPPED type — a syscall.Errno means the enumeration
+// failed, not that the interface is absent — and an unrecognised error falls to
+// the absence branch only because that is what every non-errno error from this
+// call means today.
+func missingInterfaceRecord(name, zone string, err error) UnarmedSurface {
+	s := UnarmedSurface{
+		Name:   name,
+		Reason: fmt.Sprintf("interface not found in zone %s: %v", zone, err),
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		s.Reason = fmt.Sprintf("interface lookup FAILED in zone %s (%v) — "+
+			"the netdev enumeration errored, so absence is unproven and it may be UP and forwarding", zone, err)
+		s.StillForwarding = true
+	}
+	return s
+}
+
 // ProveArmCoverage computes the arm-coverage proof for the surfaces result
 // requires, WITHOUT gating anything (#5275 PR1, observe-only).
 //
@@ -444,9 +505,32 @@ func unarmedCoverage(result *CompileResult) []SurfaceCoverage {
 	return out
 }
 
-// xdpAttachedSKB is the kernel's XDP_ATTACHED_SKB attach mode — generic
-// (skb) XDP, as opposed to XDP_ATTACHED_DRV (native). See nl/link_linux.go.
-const xdpAttachedSKB = 2
+// Kernel XDP attach modes (uapi/linux/if_link.h, mirrored in nl/link_linux.go).
+const (
+	xdpAttachedNone  = 0 // no program attached
+	xdpAttachedDrv   = 1 // XDP_ATTACHED_DRV — driver (native) mode
+	xdpAttachedSKB   = 2 // XDP_ATTACHED_SKB — generic (skb) mode
+	xdpAttachedHW    = 3 // XDP_ATTACHED_HW  — hardware offload
+	xdpAttachedMulti = 4 // XDP_ATTACHED_MULTI — programs in more than one mode
+)
+
+// xdpModeIsGeneric decides whether a kernel attach mode counts as skb-mode for
+// the coverage measurement. Pure, so every mode including the ones a test
+// cannot produce is covered by a table.
+//
+// XDP_ATTACHED_MULTI counts as GENERIC. It means programs are attached in more
+// than one mode, so the kernel cannot report a single one — and it is reachable
+// here: attachUserspaceShimXDP DISCARDS m.DetachXDP's error on the native
+// fallback path, so a failed detach followed by the generic re-attach leaves
+// two links on the interface. Reading MULTI as native would undercount the
+// slow-path population, which is the same direction as the defect that made
+// this flag come from the kernel in the first place.
+func xdpModeIsGeneric(attached bool, mode uint32) bool {
+	if !attached {
+		return false
+	}
+	return mode == xdpAttachedSKB || mode == xdpAttachedMulti
+}
 
 // xdpLinkModeGeneric reports whether ifindex currently carries an XDP program
 // in GENERIC (skb) mode, read from the KERNEL.
@@ -469,10 +553,10 @@ var xdpLinkModeGeneric = func(ifindex int) bool {
 		return false
 	}
 	xdp := l.Attrs().Xdp
-	if xdp == nil || !xdp.Attached {
+	if xdp == nil {
 		return false
 	}
-	return xdp.AttachMode == xdpAttachedSKB
+	return xdpModeIsGeneric(xdp.Attached, xdp.AttachMode)
 }
 
 // xdpLinkProgramID reads back the program instance bound to a tracked bpf_link.
