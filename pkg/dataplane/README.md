@@ -373,17 +373,26 @@ it detaches and re-attaches in generic (skb) mode, and only a *generic* failure
 returns an error. A box therefore reports itself armed while running the whole
 shim on the fallback path.
 
-Each required surface resolves to exactly one of three kinds. The two decisions
-below are stated deliberately, not left to emerge from how the readback happens
-to be written, because a later "tighten the proof" change would otherwise flip a
-supported deployment to fail-closed with nobody intending it. Both are pinned by
-tests in `armproof_5275_test.go`.
+**Which stage this measures.** The plan's §5 takes the *final* proof after the
+last mutation that can invalidate it — networkd, the RETH MAC link-cycle, and
+the AF_XDP rebind / deferred-worker reapply. This proof runs inside
+`CompileUserspaceShim`, i.e. at the **preliminary** attachment stage: it proves
+the attach-point inventory and program-instance identity, and cannot see XSK
+binding readiness. The number it emits is therefore the *preliminary-stage*
+divergence rate, a lower bound on the gate's — not the gate's own rate.
+
+Each surface resolves to exactly one of four kinds. The decisions below are
+stated deliberately, not left to emerge from how the readback happens to be
+written, because a later "tighten the proof" change would otherwise flip a
+supported deployment to fail-closed with nobody intending it. Each is pinned by
+a test in `armproof_5275_test.go`.
 
 | Kind | Meaning |
 |---|---|
 | `direct` | A shim instance is attached here. **Native and generic both count.** |
-| `delegated` | No attach is expected here by design; the **parent** covers it. |
-| `uncovered` | Nothing here and no proven delegate — including a failed readback. |
+| `delegated` | No attach is expected here by design; the **parent** covers it, and the parent is a required surface that itself classified `direct`. |
+| `skipped` | The **compiler** declined to arm this surface and the compile still succeeded — and nothing forwards through it. |
+| `uncovered` | Nothing here and no proven delegate — including a failed readback, and a declined surface whose netdev is still up and forwarding. |
 
 - **Generic (skb-mode) counts as armed.** It still steers packets to
   userspace-dp and still enforces policy, at roughly 16% CPU overhead from the
@@ -391,6 +400,13 @@ tests in `armproof_5275_test.go`.
   fallback box is not policy-free. iavf SR-IOV VFs have no native XDP support at
   all, so this is a supported steady state — failing it closed would brick a
   supported deployment to prevent a condition that is not occurring.
+- **The attach mode is read from the kernel, never from compile bookkeeping.**
+  The native→generic fallback happens once and the resulting `m.xdpLinks` entry
+  survives every later compile, so `AttachXDP` short-circuits on "already
+  attached" and a per-compile record is empty from compile #2 onward while the
+  box is still on skb-mode. Sourcing the flag from such a record would log "went
+  native" on every commit after the first, on precisely the population this
+  phase exists to count.
 - **VLAN sub-interfaces are delegated, and the delegation is resolved.** Under
   the userspace shim a VLAN child is never attached (both attach loops skip it;
   it is recorded in `Manager.VlanSubInterfaces`) because the parent's XDP sees
@@ -398,9 +414,33 @@ tests in `armproof_5275_test.go`.
   IPv6 NDP under generic-mode `XDP_PASS`. Policy is enforced — at a different
   attach point. A proof demanding an instance on every mapped attach point would
   fail every VLAN deployment; one that skipped VLAN children would pass a
-  surface whose coverage was never checked. So the parent must itself be
-  directly covered, or the child reads as uncovered.
+  surface whose coverage was never checked. So the parent must be a **required**
+  surface that itself classified `direct`, or the child reads as uncovered — a
+  link that merely happens to be tracked is not enough, because an
+  enabled→disabled commit leaves the old parent link in place while the parent
+  is admin-DOWN and about to be torn down.
+- **A surface the compiler declined to arm is not silently absent.**
+  `compiler_iface.go` soft-skips three ways — interface not found, VLAN child
+  create failed, administratively disabled — each behind a `slog` line, each
+  leaving the compile *successful* and the surface out of `pendingXDP`. Each now
+  records an `UnarmedSurface`. The sharp case is a `disable` whose
+  `netlink.LinkSetDown` fails: the netdev stays up, still address-reconciled,
+  still in a zone, still forwarded through, with no XDP — that is reported
+  `uncovered`, not `skipped`.
 
 `CoverageUncovered` is deliberately the zero value: an unpopulated entry must
 read as *not* covered, so a partially-built report can only ever be more
 conservative.
+
+**Observe-only, stated exactly.** The proof writes no Go state — not the
+`Manager`, and not the `CompileResult` it is proving (link resolution uses the
+non-memoising `peekLinkByIndex`, not `cachedLinkByIndex`). It does read live
+kernel and bpf state: one `RTM_GETLINK` for the attach mode plus one bpf_link
+info call per required surface.
+
+**One line per compile, not per apply.** A single daemon apply compiles twice on
+the RETH deferred-MAC path (`reapplyAfterDeferredMAC`), so the apply generation
+is folded into the stage label (`stage=post-attach#7`) to keep the two records
+apart. The line is emitted even when the proof enumerated nothing, carrying
+`ran=true`: suppressing it would make "nothing to arm", "the proof never ran"
+and "this build has no proof" identical in a log archive.

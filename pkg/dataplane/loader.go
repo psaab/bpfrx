@@ -199,9 +199,11 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	}
 	// #5275 PR1: OBSERVE-ONLY arm-coverage proof. Runs after the attach so it
 	// sees real link state, reports what a gating build would have decided,
-	// and gates NOTHING — the return value is deliberately discarded.
-	m.lastCompile = result
-	m.ProveArmCoverage(result).LogArmCoverage("post-attach")
+	// and gates NOTHING — the return value is deliberately discarded. It reads
+	// `result` directly and publishes nothing: hoisting the m.lastCompile
+	// assignment to feed it would expose a half-observed CompileResult through
+	// the exported LastCompileResult() for a diagnostic's benefit.
+	m.ProveArmCoverage(result).LogArmCoverage("post-attach", m.nextApplyGeneration())
 
 	for ifidx := range result.genericXDPIfindexes {
 		if !result.tunnelIfindexes[ifidx] {
@@ -232,11 +234,6 @@ func (m *Manager) attachUserspaceShimXDP(result *CompileResult) error {
 				"impact", "higher CPU, ~6 Gbps cap; fix driver/firmware to restore driver-mode XDP")
 			m.DetachXDP(ifidx)
 			failedNativeXDP[ifidx] = true
-			// #5275: remember the fallback so the arm-coverage proof can
-			// report which surfaces are on skb-mode. Recorded, not gated.
-			if result.fallbackGenericIfindexes != nil {
-				result.fallbackGenericIfindexes[ifidx] = true
-			}
 		}
 	}
 	if len(failedNativeXDP) > 0 {
@@ -488,7 +485,7 @@ func xdpAttachModeMatches(ifindex int, wantGeneric bool) bool {
 	if xdp == nil || !xdp.Attached {
 		return true
 	}
-	isGeneric := xdp.AttachMode == 2 /* XDP_ATTACHED_SKB */
+	isGeneric := xdp.AttachMode == xdpAttachedSKB
 	return isGeneric == wantGeneric
 }
 

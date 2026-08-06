@@ -196,7 +196,23 @@ deployment. A required surface resolves to exactly one of:
   - **uncovered** — anything else, including a readback that failed. Unarmed.
 
 See `pkg/dataplane/armproof.go` (observe-only implementation + rationale) and
-`armproof_5275_test.go` (both decisions pinned).
+`armproof_5275_test.go` (both decisions pinned). **That implementation is the
+PRELIMINARY stage, not the FINAL one** — it runs inside `CompileUserspaceShim`,
+before networkd, the RETH MAC link-cycle and the AF_XDP rebind, so the
+divergence rate it emits is a LOWER BOUND on what the FINAL-stage gate will see.
+It is phase PR0 in §10, not PR1.
+
+A **fourth** kind fell out of implementing it, which the classification above
+still misses: **skipped**. Three soft skips in `compiler_iface.go` — interface
+not found, VLAN child create failed, administratively disabled — drop a
+configured attach point from `pendingXDP` while the compile SUCCEEDS, so a
+surface the compiler declined to arm is indistinguishable from one it armed. The
+sharp variant is `set interfaces <if> disable` whose `netlink.LinkSetDown` then
+fails (a `slog.Warn` and nothing else): the netdev stays UP, is still
+address-reconciled, is still in a zone, is still forwarded through by the
+kernel, and carries no XDP. The gating PR must treat that as **uncovered**; a
+skip whose netdev genuinely went down is a legitimate operator action and must
+not fail the box closed.
 
 **Coverage proof ingredients are PER-STAGE (§13-D1; readback-fail ⇒ unarmed) —
 NOT identical across both stages:** the PRELIMINARY stage proves only the attach-point
@@ -340,6 +356,19 @@ gated machinery — the half-start gap).
 Codex r4 is right that "multi-PR" is honest but "each PR independently correct" was
 not. Corrected phasing, each a real architecture increment gated by smoke:
 
+- **PR0 — pre-PR1 MEASUREMENT (observe-only), gates nothing:** the coverage
+  classification of §5 implemented as a pure diagnostic, run at the PRELIMINARY
+  attachment stage inside `CompileUserspaceShim`, reporting what a gating build
+  would have decided (`WouldGate`) and that nothing was withheld (`DidGate`). No
+  arm-state machine, no facade, no barrier, no apply gate — none of PR1's
+  architecture. It exists because "armed" today is materially weaker than the
+  proof PR1 will enforce (`attachUserspaceShimXDP` treats a NATIVE attach failure
+  as a warning and re-attaches generic; iavf SR-IOV VFs have no native XDP at
+  all), so the divergence rate has to be known before the gate is load-bearing.
+  What it measures is the PRELIMINARY-stage rate — a lower bound on the FINAL
+  stage's, which PR1 owns. `pkg/dataplane/armproof.go`, shipped as #6864.
+  This phase was NOT in the original plan; the word "observe" appears nowhere
+  else in this document, and PR1 below is a gate, not a diagnostic.
 - **PR1 — foundation (standalone), INERT under cluster config:** the daemon-owned
   arm-state machine (§2), the revocable sealed-until-armed runtime facade + quarantine
   + hardened teardown (§7), the bridge+flowtable+FORWARD barrier (§6), deferred

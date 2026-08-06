@@ -66284,3 +66284,32 @@ break — `go vet` confirmed passing under every revert.
   (an absence is indistinguishable from a proof that never ran).
   **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go
 
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 fold round 1 — seven findings from an independent
+  hostile gate at 65f5a588b. (F1) The attach mode is now read from the KERNEL
+  (`xdpLinkModeGeneric`, RTM_GETLINK, XDP_ATTACHED_SKB) instead of a per-compile
+  fallback record: the record was empty from compile #2 onward — every later
+  compile short-circuits on "already attached" while the link stays on skb-mode
+  — so the proof reported "went native" on exactly the iavf population it exists
+  to count. `CompileResult.fallbackGenericIfindexes` and its loader recording
+  are deleted. (F2) The three compiler soft skips (interface not found, VLAN
+  child create failed, administratively disabled) now record an
+  `UnarmedSurface`, reported as a distinct `skipped` branch — or as `uncovered`
+  when the disable's `LinkSetDown` failed and the netdev may still be UP,
+  zoned and forwarding with no XDP. `LogArmCoverage` now emits unconditionally
+  with a `ran` field, so "nothing to arm" and "the proof never ran" are
+  distinguishable. (F3) Tests now bind the Manager path — a second compile still
+  reports skb-mode — plus AST canaries on the `CompileUserspaceShim` call site
+  and the three recording sites. (F4) The `m.lastCompile` hoist is gone and link
+  resolution uses the non-memoising `peekLinkByIndex`, so "observe-only" is
+  literally true. (F5) Delegation now requires the parent to be a REQUIRED
+  surface that itself classified `direct`. (F6) The apply generation is folded
+  into the stage label, so the RETH deferred-MAC path's two compiles per apply
+  are distinguishable. (F7) Plan §10 gains a PR0 measurement phase and §5 states
+  this is the PRELIMINARY stage. (F8) The delegated token carries the delegate's
+  attach mode. Eleven mutations, each restored byte-for-byte with sha256
+  verification, all ASSERTION-RED with `go vet` exit 0.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/loader.go, pkg/dataplane/apply.go, pkg/dataplane/README.md,
+  docs/research/5275-arm-failclosed/plan.md

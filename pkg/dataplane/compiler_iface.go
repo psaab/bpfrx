@@ -451,6 +451,14 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 	if err != nil {
 		slog.Warn("interface not found, skipping",
 			"interface", physName, "zone", name, "err", err)
+		// #5275: the config demanded this surface and the compile still
+		// succeeds without it. Record it so the arm-coverage proof can tell a
+		// declined surface from one that armed. The netdev does not exist, so
+		// nothing forwards through it.
+		result.recordUnarmedSurface(UnarmedSurface{
+			Name:   physName,
+			Reason: fmt.Sprintf("interface not found in zone %s: %v", name, err),
+		})
 		return nil
 	}
 
@@ -460,6 +468,13 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		if err != nil {
 			slog.Warn("VLAN sub-interface failed, skipping",
 				"parent", physName, "vlan_id", vlanID, "zone", name, "err", err)
+			// #5275: same as above — the child was never created, so nothing
+			// forwards through it, but the config asked for it and the compile
+			// succeeds regardless.
+			result.recordUnarmedSurface(UnarmedSurface{
+				Name:   fmt.Sprintf("%s.%d", physName, vlanID),
+				Reason: fmt.Sprintf("VLAN sub-interface create failed in zone %s: %v", name, err),
+			})
 			return nil
 		}
 
@@ -632,15 +647,25 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		// driver. DPDK ports are disabled by not including them in the
 		// worker's poll set (the zone map lookup will miss, causing drop).
 		isDisabled := false
+		// #5275: a disable whose LinkSetDown did NOT take leaves the netdev UP,
+		// still address-reconciled, still in a zone, still forwarded through by
+		// the kernel — with no XDP attached. That is the sharp variant the
+		// arm-coverage proof has to see, so track whether the down actually
+		// happened rather than only warning about it.
+		linkDownFailed := false
 		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.Disable {
 			isDisabled = true
 			if nlErr == nil {
 				if err := netlink.LinkSetDown(nl); err != nil {
 					slog.Warn("failed to bring disabled interface down",
 						"name", physName, "err", err)
+					linkDownFailed = true
 				} else {
 					slog.Info("interface administratively disabled", "name", physName)
 				}
+			} else {
+				// The link never resolved, so it was never brought down.
+				linkDownFailed = true
 			}
 		} else if nlErr == nil {
 			if err := netlink.LinkSetUp(nl); err != nil {
@@ -654,6 +679,19 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		if isDisabled {
 			slog.Info("skipping XDP/TC attachment for disabled interface",
 				"name", physName, "ifindex", physIface.Index)
+			// #5275: record the declined surface. StillForwarding promotes it
+			// from "skipped" to "uncovered" when the link-down did not take —
+			// an UP, zoned, XDP-less netdev is the policy-free-router state.
+			reason := "administratively disabled (netdev brought down)"
+			if linkDownFailed {
+				reason = "administratively disabled but link-down FAILED — netdev may still be UP and forwarding with no XDP"
+			}
+			result.recordUnarmedSurface(UnarmedSurface{
+				Name:            physName,
+				Ifindex:         physIface.Index,
+				Reason:          reason,
+				StillForwarding: linkDownFailed,
+			})
 		} else {
 			// Defer actual XDP/TC attachment to after all compile phases
 			// so link.Update() switches to programs with fully-populated maps.

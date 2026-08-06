@@ -4,7 +4,11 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/cilium/ebpf/link"
+	"github.com/vishvananda/netlink"
 )
 
 // #5275 PR1 — OBSERVE-ONLY dataplane arm-coverage proof.
@@ -20,8 +24,21 @@ import (
 // GATE ANYTHING. It computes the proof and reports what a gating build would
 // have decided, so the divergence rate can be measured across the real fleet
 // before the gate is ever load-bearing. `WouldGate` is a diagnostic, never a
-// control input; nothing in this file mutates Manager state or returns an error
-// that any caller acts on.
+// control input; nothing here returns an error that any caller acts on.
+//
+// SIDE EFFECTS, stated exactly (an "observe-only" claim that is not literally
+// true is worse than no claim): the proof writes NO Go state — not the Manager,
+// not the CompileResult it is proving — and it READS live kernel and bpf state,
+// one RTM_GETLINK plus one BPF_OBJ_GET_INFO per required surface. It runs once
+// per compile, never per packet or per poll tick.
+//
+// STAGE. The plan's §5 takes the FINAL proof after the last mutation that can
+// invalidate it (networkd, the RETH MAC link-cycle, the AF_XDP rebind /
+// deferred-worker reapply). This proof runs inside CompileUserspaceShim, i.e.
+// at the PRELIMINARY attachment stage — it proves the attach-point inventory
+// and program-instance identity, and it cannot see XSK binding readiness. The
+// divergence rate it measures is therefore the PRELIMINARY-stage rate, which is
+// a lower bound on the gate's.
 //
 // The measurement matters because "armed" today is weaker than the proof:
 // attachUserspaceShimXDP treats a NATIVE attach failure as a warning, detaches,
@@ -47,6 +64,10 @@ const (
 	// CoverageDelegated — no attach is expected here BY DESIGN; the parent
 	// interface's program covers this surface.
 	CoverageDelegated
+	// CoverageSkipped — the COMPILER declined to arm this surface and still
+	// returned success. Neither proven covered nor proven forwarding-without-
+	// policy; a third, distinct unknown. See UnarmedSurface.
+	CoverageSkipped
 )
 
 func (k SurfaceCoverageKind) String() string {
@@ -55,6 +76,8 @@ func (k SurfaceCoverageKind) String() string {
 		return "direct"
 	case CoverageDelegated:
 		return "delegated"
+	case CoverageSkipped:
+		return "skipped"
 	default:
 		return "uncovered"
 	}
@@ -63,17 +86,34 @@ func (k SurfaceCoverageKind) String() string {
 // SurfaceCoverage is the proof outcome for one required attach point.
 type SurfaceCoverage struct {
 	Ifindex int
-	Kind    SurfaceCoverageKind
-	// Via is the covering parent ifindex when Kind is CoverageDelegated.
+	// Name is the CONFIGURED interface name. Populated only for a surface the
+	// compiler declined to arm, where the ifindex may not exist at all (the
+	// netdev was missing, or the VLAN child was never created).
+	Name string
+	Kind SurfaceCoverageKind
+	// Via is the covering parent ifindex when Kind is CoverageDelegated. It is
+	// also set on an UNCOVERED VLAN child whose delegate was rejected, so the
+	// record names the parent that failed to cover it.
 	Via int
 	// ProgramID is the attached program INSTANCE (bpf_link readback) for a
 	// direct surface, or the delegate's instance for a delegated one. Zero
 	// means the readback did not yield one — reported, never inferred.
 	ProgramID uint32
 	// Generic records that this surface is covered in skb-mode rather than
-	// driver-mode XDP. Informational: it does NOT reduce coverage.
+	// driver-mode XDP. Informational: it does NOT reduce coverage. Read from
+	// the KERNEL, not from compile bookkeeping — see xdpLinkModeGeneric.
 	Generic bool
 	Detail  string
+}
+
+// label renders the surface identity for the compact per-surface token: the
+// configured name when the proof has one (an unarmed surface may have no
+// ifindex at all), otherwise the ifindex.
+func (s SurfaceCoverage) label() string {
+	if s.Name != "" {
+		return s.Name
+	}
+	return strconv.Itoa(s.Ifindex)
 }
 
 // ArmCoverageReport is the whole-surface outcome of one proof run.
@@ -81,7 +121,13 @@ type ArmCoverageReport struct {
 	Surfaces  []SurfaceCoverage
 	Direct    int
 	Delegated int
+	Skipped   int
 	Uncovered int
+	// Ran reports that the proof executed against real inputs. False means it
+	// did not run at all (no compile result, or no instance lookup) — which is
+	// a DIFFERENT unknown from "ran and enumerated nothing", and by this file's
+	// own DidGate rationale the two must never be indistinguishable.
+	Ran bool
 	// WouldGate reports whether a GATING build would have refused to release
 	// ownership on this proof. Observe-only: no caller may branch on it.
 	WouldGate bool
@@ -95,9 +141,9 @@ type ArmCoverageReport struct {
 }
 
 // SurfaceSummary renders one compact, greppable token per surface —
-// "<ifindex>:<branch>[/<detail>]" — so the per-surface branch is recoverable
-// from a single log line instead of requiring one line per interface on every
-// apply.
+// "<ifindex|name>:<branch>[/<detail>]" — so the per-surface branch is
+// recoverable from a single log line instead of requiring one line per
+// interface on every apply.
 func (rep ArmCoverageReport) SurfaceSummary() string {
 	if len(rep.Surfaces) == 0 {
 		return ""
@@ -106,18 +152,28 @@ func (rep ArmCoverageReport) SurfaceSummary() string {
 	for _, s := range rep.Surfaces {
 		switch s.Kind {
 		case CoverageDirect:
-			mode := "native"
-			if s.Generic {
-				mode = "generic"
-			}
-			parts = append(parts, fmt.Sprintf("%d:direct/%s", s.Ifindex, mode))
+			parts = append(parts, fmt.Sprintf("%s:direct/%s", s.label(), attachModeName(s.Generic)))
 		case CoverageDelegated:
-			parts = append(parts, fmt.Sprintf("%d:delegated/via-%d", s.Ifindex, s.Via))
+			// The delegate's attach mode is rendered too: a VLAN child behind
+			// an skb-mode parent IS on the slow path, and without the mode it
+			// is indistinguishable from one behind a native parent — which is
+			// exactly the population this phase exists to count.
+			parts = append(parts, fmt.Sprintf("%s:delegated/via-%d/%s",
+				s.label(), s.Via, attachModeName(s.Generic)))
+		case CoverageSkipped:
+			parts = append(parts, fmt.Sprintf("%s:skipped", s.label()))
 		default:
-			parts = append(parts, fmt.Sprintf("%d:uncovered", s.Ifindex))
+			parts = append(parts, fmt.Sprintf("%s:uncovered", s.label()))
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+func attachModeName(generic bool) string {
+	if generic {
+		return "generic"
+	}
+	return "native"
 }
 
 // GENERIC XDP COUNTS AS ARMED — a stated decision, not an emergent property.
@@ -151,16 +207,51 @@ func (rep ArmCoverageReport) SurfaceSummary() string {
 // deployment. The opposite shortcut, skipping VLAN children unconditionally, is
 // just as wrong: it would pass a surface whose coverage was never checked.
 //
-// Delegation is therefore RESOLVED, not assumed: the parent must itself be
-// directly covered, or the child is uncovered.
+// Delegation is therefore RESOLVED, not assumed, and resolved against the
+// proof's OWN classification of the parent: the parent must be a REQUIRED
+// surface and must itself classify as CoverageDirect, or the child is
+// uncovered. A link that merely happens to be tracked is not enough — an
+// enabled->disabled commit leaves the previous parent link in place while the
+// parent is admin-DOWN and about to be torn down, and delegating to that would
+// report a covered child with nothing enforcing its traffic.
+
+// UnarmedSurface records an attach point the CONFIG required but the compiler
+// DECLINED to arm, while the compile itself still SUCCEEDED (#5275).
+//
+// Three soft skips in compiler_iface.go remove a surface from the required set
+// behind nothing but a slog.Warn: the interface was not found, the VLAN
+// sub-interface could not be created, and the interface is administratively
+// disabled. Without a record the proof cannot tell "the compiler declined to
+// arm this" from "this was armed successfully" — both read as clean, because
+// the surface is simply absent from pendingXDP.
+type UnarmedSurface struct {
+	// Name is the configured interface ("ge-0-0-1", or "ge-0-0-2.50" for a
+	// VLAN child). Always set: the ifindex may not exist.
+	Name string
+	// Ifindex is the resolved ifindex, or 0 when the surface has none.
+	Ifindex int
+	// Reason is the compiler's own reason for declining.
+	Reason string
+	// StillForwarding marks the sharp variant: the surface was skipped but the
+	// netdev is (or may still be) UP, in a security zone, and forwarded through
+	// by the kernel with NO XDP attached. `set interfaces <if> disable` whose
+	// netlink.LinkSetDown then fails is exactly that — the disable branch logs
+	// the failure at WARN and continues, and address reconciliation runs
+	// regardless. That is the policy-free-router condition #5275 exists to
+	// prevent, so it reads as UNCOVERED rather than merely skipped.
+	StillForwarding bool
+}
 
 // ProveArmCoverage computes the arm-coverage proof for the surfaces result
 // requires, WITHOUT gating anything (#5275 PR1, observe-only).
 //
-// It is a pure read of compile state plus bpf_link readback: it takes no locks
-// beyond the readback, mutates nothing, and never returns an error a caller
-// acts on. A readback failure degrades that surface to uncovered and is
-// reported — the conservative direction, matching what a gating build would do.
+// It writes no Go state: not the Manager, and not the CompileResult it is
+// proving (the link resolution deliberately uses peekLinkByIndex, which does
+// not memoise, so the result's caches are untouched). It does READ live kernel
+// and bpf state — one RTM_GETLINK for the attach mode plus one bpf_link info
+// call per required surface — and never returns an error a caller acts on. A
+// readback failure degrades that surface to uncovered and is reported, the
+// conservative direction, matching what a gating build would do.
 func (m *Manager) ProveArmCoverage(result *CompileResult) ArmCoverageReport {
 	if m == nil {
 		return ArmCoverageReport{}
@@ -179,24 +270,54 @@ type instanceLookup func(ifidx int) (progID uint32, generic bool, ok bool)
 // exercised directly.
 func classifyArmCoverage(result *CompileResult, lookup instanceLookup) ArmCoverageReport {
 	var rep ArmCoverageReport
-	if result == nil || lookup == nil || len(result.pendingXDP) == 0 {
+	if result == nil || lookup == nil {
+		// Ran stays false: this proof did NOT run, which must not read the
+		// same as a proof that ran and found nothing wrong.
 		return rep
 	}
+	rep.Ran = true
 
 	// Deterministic order so the log line is stable across boots and two
 	// reports can be diffed.
 	required := append([]int(nil), result.pendingXDP...)
 	sort.Ints(required)
-
+	isRequired := make(map[int]bool, len(required))
 	for _, ifidx := range required {
-		rep.Surfaces = append(rep.Surfaces, coverSurface(result, lookup, ifidx))
+		isRequired[ifidx] = true
 	}
+
+	// Pass 1 classifies every DIRECT surface, because a delegated surface
+	// resolves against the parent's OWN classification and must not race the
+	// order of the required slice.
+	direct := make(map[int]SurfaceCoverage, len(required))
+	for _, ifidx := range required {
+		if isDelegatedSurface(result, ifidx) {
+			continue
+		}
+		direct[ifidx] = coverDirect(lookup, ifidx)
+	}
+
+	// Pass 2 emits in ifindex order, resolving delegation against pass 1.
+	for _, ifidx := range required {
+		if s, ok := direct[ifidx]; ok {
+			rep.Surfaces = append(rep.Surfaces, s)
+			continue
+		}
+		rep.Surfaces = append(rep.Surfaces, coverDelegated(result, direct, isRequired, ifidx))
+	}
+
+	// Surfaces the compiler declined to arm are NOT in pendingXDP at all. They
+	// are appended last so the required-surface ordering above is unchanged.
+	rep.Surfaces = append(rep.Surfaces, unarmedCoverage(result)...)
+
 	for _, s := range rep.Surfaces {
 		switch s.Kind {
 		case CoverageDirect:
 			rep.Direct++
 		case CoverageDelegated:
 			rep.Delegated++
+		case CoverageSkipped:
+			rep.Skipped++
 		default:
 			rep.Uncovered++
 		}
@@ -208,41 +329,19 @@ func classifyArmCoverage(result *CompileResult, lookup instanceLookup) ArmCovera
 	return rep
 }
 
-// coverSurface classifies one required attach point.
-func coverSurface(result *CompileResult, lookup instanceLookup, ifidx int) SurfaceCoverage {
+// isDelegatedSurface reports whether ifidx is a VLAN sub-interface, which the
+// userspace shim covers from the parent rather than attaching to directly.
+// This is exactly how compiler_iface.go marks them.
+func isDelegatedSurface(result *CompileResult, ifidx int) bool {
+	return result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx]
+}
+
+// coverDirect classifies one attach point that must carry its own instance.
+func coverDirect(lookup instanceLookup, ifidx int) SurfaceCoverage {
 	s := SurfaceCoverage{Ifindex: ifidx}
-
-	// Delegated: a VLAN sub-interface under the userspace shim carries no
-	// program of its own by design. Resolve the parent rather than assuming
-	// either outcome.
-	if result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx] {
-		lnk, err := result.cachedLinkByIndex(ifidx)
-		if err != nil {
-			s.Detail = fmt.Sprintf("vlan child: parent unresolvable: %v", err)
-			return s
-		}
-		parent := lnk.Attrs().ParentIndex
-		if parent <= 0 {
-			s.Detail = "vlan child: no parent ifindex"
-			return s
-		}
-		progID, generic, ok := lookup(parent)
-		if !ok {
-			s.Via = parent
-			s.Detail = fmt.Sprintf("vlan child: delegate ifindex %d carries no shim instance", parent)
-			return s
-		}
-		s.Kind = CoverageDelegated
-		s.Via = parent
-		s.ProgramID = progID
-		s.Generic = generic
-		s.Detail = fmt.Sprintf("covered by parent ifindex %d", parent)
-		return s
-	}
-
-	// Direct: an instance attached here. Native and generic both count.
 	progID, generic, ok := lookup(ifidx)
 	if !ok {
+		s.Generic = generic
 		s.Detail = "no shim instance attached"
 		return s
 	}
@@ -257,45 +356,191 @@ func coverSurface(result *CompileResult, lookup instanceLookup, ifidx int) Surfa
 	return s
 }
 
-// attachedInstance reads back the program instance bound at ifidx.
+// coverDelegated classifies one VLAN sub-interface against its parent.
 //
-// ok=false means no link is tracked for this ifindex, or the readback failed —
-// both degrade the surface to uncovered rather than being papered over. The
-// generic flag comes from Manager state rather than being inferred from the
-// link, so a surface deliberately kept on skb-mode is not mistaken for a
-// native attach that silently fell back.
-func (m *Manager) attachedInstance(ifidx int) (progID uint32, generic bool, ok bool) {
-	l, exists := m.xdpLinks[ifidx]
-	if !exists || l == nil {
-		return 0, false, false
+// The parent must be a REQUIRED surface and must itself have classified as
+// CoverageDirect. Accepting any tracked link would let a child report covered
+// against a parent nothing proves is armed — see the DELEGATED COVERAGE note.
+//
+// The `direct` map already encodes both conditions (it holds exactly the
+// required, non-delegated surfaces), so the explicit isRequired check does not
+// change the verdict — it sharpens the recorded REASON, which is the whole
+// output of an observe-only phase.
+func coverDelegated(
+	result *CompileResult,
+	direct map[int]SurfaceCoverage,
+	isRequired map[int]bool,
+	ifidx int,
+) SurfaceCoverage {
+	s := SurfaceCoverage{Ifindex: ifidx}
+
+	lnk, err := result.peekLinkByIndex(ifidx)
+	if err != nil {
+		s.Detail = fmt.Sprintf("vlan child: parent unresolvable: %v", err)
+		return s
 	}
-	if lc := m.lastCompile; lc != nil {
-		generic = lc.fallbackGenericIfindexes[ifidx] || lc.tunnelIfindexes[ifidx]
+	if lnk == nil {
+		s.Detail = "vlan child: parent unresolvable: no link"
+		return s
+	}
+	parent := lnk.Attrs().ParentIndex
+	if parent <= 0 {
+		s.Detail = "vlan child: no parent ifindex"
+		return s
+	}
+	s.Via = parent
+
+	if !isRequired[parent] {
+		s.Detail = fmt.Sprintf(
+			"vlan child: delegate ifindex %d is not a required surface — nothing proves it armed", parent)
+		return s
+	}
+	pc, ok := direct[parent]
+	if !ok {
+		s.Detail = fmt.Sprintf(
+			"vlan child: delegate ifindex %d is not itself a direct surface", parent)
+		return s
+	}
+	if pc.Kind != CoverageDirect {
+		s.Detail = fmt.Sprintf(
+			"vlan child: delegate ifindex %d carries no shim instance", parent)
+		return s
+	}
+
+	s.Kind = CoverageDelegated
+	s.ProgramID = pc.ProgramID
+	s.Generic = pc.Generic
+	s.Detail = fmt.Sprintf("covered by parent ifindex %d", parent)
+	return s
+}
+
+// unarmedCoverage renders the surfaces the compiler declined to arm.
+//
+// Ordered by name so two reports of the same box are diffable; the ifindex is
+// not a usable sort key here because a missing interface has none.
+func unarmedCoverage(result *CompileResult) []SurfaceCoverage {
+	if len(result.unarmedSurfaces) == 0 {
+		return nil
+	}
+	out := make([]SurfaceCoverage, 0, len(result.unarmedSurfaces))
+	for _, u := range result.unarmedSurfaces {
+		s := SurfaceCoverage{
+			Ifindex: u.Ifindex,
+			Name:    u.Name,
+			Kind:    CoverageSkipped,
+			Detail:  u.Reason,
+		}
+		if u.StillForwarding {
+			s.Kind = CoverageUncovered
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Ifindex < out[j].Ifindex
+	})
+	return out
+}
+
+// xdpAttachedSKB is the kernel's XDP_ATTACHED_SKB attach mode — generic
+// (skb) XDP, as opposed to XDP_ATTACHED_DRV (native). See nl/link_linux.go.
+const xdpAttachedSKB = 2
+
+// xdpLinkModeGeneric reports whether ifindex currently carries an XDP program
+// in GENERIC (skb) mode, read from the KERNEL.
+//
+// Ground truth, deliberately, and not control-plane bookkeeping. The
+// native->generic fallback in attachUserspaceShimXDP happens ONCE, and the
+// resulting m.xdpLinks entry SURVIVES across compiles — syncInterfaceAttachments
+// detaches only ifindexes outside the allowed ingress set, and the pin sweep in
+// userspace/manager_compile.go deletes link PINS, not the map. So every later
+// compile short-circuits on "already attached" and any per-compile record of
+// the fallback is empty while the box is still on skb-mode. A proof that read
+// that record would report "went native" on every commit after the first, on
+// precisely the population (iavf SR-IOV VFs) whose measurement is the point of
+// this phase.
+//
+// A package-level var because a unit test cannot attach XDP.
+var xdpLinkModeGeneric = func(ifindex int) bool {
+	l, err := netlink.LinkByIndex(ifindex)
+	if err != nil || l == nil {
+		return false
+	}
+	xdp := l.Attrs().Xdp
+	if xdp == nil || !xdp.Attached {
+		return false
+	}
+	return xdp.AttachMode == xdpAttachedSKB
+}
+
+// xdpLinkProgramID reads back the program instance bound to a tracked bpf_link.
+//
+// A package-level var because link.Link carries an unexported method and cannot
+// be implemented outside cilium/ebpf, so Manager.attachedInstance is otherwise
+// unreachable from a unit test.
+var xdpLinkProgramID = func(l link.Link) (progID uint32, ok bool) {
+	if l == nil {
+		return 0, false
 	}
 	info, err := l.Info()
 	if err != nil || info == nil {
+		return 0, false
+	}
+	return uint32(info.Program), true
+}
+
+// attachedInstance reads back the program instance bound at ifidx.
+//
+// ok=false means no link is tracked for this ifindex, or the readback failed —
+// both degrade the surface to uncovered rather than being papered over.
+//
+// The generic flag is the LIVE kernel attach mode (xdpLinkModeGeneric), not
+// anything this compile recorded, because the mode persists across compiles and
+// the per-compile record does not.
+func (m *Manager) attachedInstance(ifidx int) (progID uint32, generic bool, ok bool) {
+	l, exists := m.xdpLinks[ifidx]
+	if !exists {
+		return 0, false, false
+	}
+	generic = xdpLinkModeGeneric(ifidx)
+	progID, ok = xdpLinkProgramID(l)
+	if !ok {
 		// A tracked link whose identity cannot be read is NOT proof of
 		// coverage; report it with a zero instance so the divergence is
 		// visible rather than assumed benign.
 		return 0, generic, false
 	}
-	return uint32(info.Program), generic, true
+	return progID, generic, true
 }
 
 // LogArmCoverage emits the observe-only proof result (#5275 PR1).
 //
-// One line per apply, never per packet or per poll tick. It states plainly that
-// nothing was gated, so an operator reading a WOULD-GATE line does not believe
-// traffic was affected.
-func (rep ArmCoverageReport) LogArmCoverage(stage string) {
-	if len(rep.Surfaces) == 0 {
-		return
-	}
+// One line per COMPILE — never per packet or per poll tick. Not one line per
+// apply: a single daemon apply compiles TWICE on the RETH deferred-MAC path
+// (daemon_apply_dataplane.go calls reapplyAfterDeferredMAC), so seq is folded
+// into the stage label to keep the two records distinguishable.
+//
+// The line is emitted UNCONDITIONALLY, including when the proof enumerated no
+// surfaces at all. Suppressing it would make "nothing to arm", "the proof did
+// not run" and "the build has no proof" identical in a log archive — the very
+// failure mode this file's DidGate rationale exists to reject. `ran` separates
+// the first two; the absence of the line separates the third.
+//
+// It states plainly that nothing was gated, so an operator reading a WOULD-GATE
+// line does not believe traffic was affected.
+func (rep ArmCoverageReport) LogArmCoverage(stage string, seq uint64) {
+	// One label for the whole proof run, so the summary line and every
+	// per-surface line below correlate to the SAME compile.
+	label := fmt.Sprintf("%s#%d", stage, seq)
 	slog.Info("dataplane arm-coverage proof",
 		"issue", "#5275",
-		"stage", stage,
+		"stage", label,
+		"ran", rep.Ran,
 		"direct", rep.Direct,
 		"delegated", rep.Delegated,
+		"skipped", rep.Skipped,
 		"uncovered", rep.Uncovered,
 		// Both are emitted every time. would_gate is the measurement;
 		// did_gate is the fact that nothing was withheld. Reporting only the
@@ -303,17 +548,26 @@ func (rep ArmCoverageReport) LogArmCoverage(stage string) {
 		// indistinguishable in a log archive.
 		"would_gate", rep.WouldGate,
 		"did_gate", rep.DidGate,
-		// Per-surface branch, so the direct/delegated/uncovered mix is
+		// Per-surface branch, so the direct/delegated/skipped/uncovered mix is
 		// recoverable per box without one line per interface.
 		"surfaces", rep.SurfaceSummary())
 	// Only the surfaces a gating build would have refused on are worth a
-	// per-surface line; a fully-covered box stays at one line.
+	// per-surface line; a fully-covered box stays at one line. A SKIPPED
+	// surface gets one too — the compiler declined to arm it and said so only
+	// at WARN, so the proof restates it in its own terms.
 	for _, s := range rep.Surfaces {
-		if s.Kind == CoverageUncovered {
+		switch s.Kind {
+		case CoverageUncovered:
 			slog.Warn("dataplane arm-coverage: surface WOULD fail a gating proof (NOT gated in this build)",
 				"issue", "#5275",
-				"stage", stage,
-				"ifindex", s.Ifindex,
+				"stage", label,
+				"surface", s.label(),
+				"detail", s.Detail)
+		case CoverageSkipped:
+			slog.Warn("dataplane arm-coverage: compiler DECLINED to arm this surface (compile still succeeded)",
+				"issue", "#5275",
+				"stage", label,
+				"surface", s.label(),
 				"detail", s.Detail)
 		}
 	}
