@@ -2434,39 +2434,6 @@ picking one. Production tests:
 `compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
 zero/two/valid + #3850 last-wins preservation).
 
-**`snmp community` closed (#4313).** `system snmp community <name>` now sets
-`closedWorld:true` (`schema_system.go`) after modeling the three leaves that put
-it on the PR-C SKIP list ("snmp community (Junos view / client-list-name /
-routing-instance unmodeled)"). This is the same add-then-arm order `security ike
-proposal` used when a single missing `description` leaf was all that blocked it,
-and it is the readiness heuristic the whole rollout has followed:
-
-1. Enumerate the subtree's full Junos child set.
-2. If the modeled set already equals it, arm.
-3. If it is short by a small, well-understood number of leaves, MODEL THEM and
-   then arm — that is a flip, not a rewrite.
-4. If the subtree is free-form (`static-nat then`) or deliberately open
-   (`screen ids-option`), it is a permanent skip, not a backlog item.
-
-The missing leaf was found by MEASUREMENT, not audit-by-reading: arming the
-subtree first and running the corpus failed `TestSNMPInertKnobAdvisories` on
-`set snmp community <name> view myview`, a real Junos leaf a committed fixture
-carries. Note the method's limit, which matters for the next candidate — the
-corpus surfaced `view` only because a fixture used it, and could not have
-surfaced `client-list-name` or `routing-instance`, which no fixture exercises.
-A corpus run bounds what you can OBSERVE, not what EXISTS; the remaining two
-came from the Junos grammar recorded in the skip note. Measure to find what you
-did not know to look for, then still audit the grammar.
-
-All three added leaves are ACCEPTED-INERT: modeled so a valid Junos config
-commits and closed-world cannot false-reject, but the compiler does not act on
-them (`TestSNMPInertKnobAdvisories` is the advisory that says so). Modeling a
-leaf and enforcing it are separate questions and this flip settles only the
-first. Tests: `schema_closedworld_snmp_community_4313_test.go` — rejection,
-the every-modeled-leaf negative control that stops the guard degenerating into
-"reject everything here", and the tolerant-path leg proving a peer-synced or
-persisted config still loads.
-
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`
 (`schema_security.go`), each after the same leaf-completeness audit — the
@@ -2770,7 +2737,29 @@ Junos, the #4191 class). Both the remaining per-subtree flips and the
 blanket-flip doctrine decision remain tracked on #4313.
 
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
-`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
+`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE,
+and MORE incomplete than this note used to say. A #4313 attempt to close it was
+reverted in PR #6887 after the gate measured four defects; treat these as the
+entry criteria for any future attempt:
+  1. `routing-instance` is a CONTAINER in Junos, not a scalar — it nests a
+     `clients { … }` block. Modeling it as a bare leaf and closing the subtree
+     hard-rejects `snmp community <c> routing-instance <ri> clients <prefix>`,
+     which is valid config. Measured: an SNMP-scoped-to-a-VRF node could not
+     commit ANY change, including an emergency one, until the operator deleted
+     valid Junos.
+  2. `logical-system` is a SIXTH child this note omits —
+     `[edit snmp community <c> logical-system <ls>] routing-instance <ri>`.
+  3. There are TWO ingestion surfaces. The compiler reads snmp from
+     `compiler_dispatch.go` (top-level `snmp {}`) AND from `compiler_system.go`
+     via `FindChild("snmp")` (`system { snmp {} }`), but `setSchema` anchors
+     `snmp` only at the top level. Measured: the same typo is rejected under
+     `snmp {}` and silently accepted under `system { snmp {} }` — and
+     `test/incus/xpf-test.conf` uses the accepted spelling. Closing one surface
+     leaves #4289 live on the one our own reference config uses.
+  4. `client-list-name` and `routing-instance` produce NO inert-knob advisory
+     (only `view` does). Modeling them without one makes the CLI advertise a
+     source-IP restriction the firewall accepts, applies nothing for, and warns
+     nobody about.
 Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;
 `security nat static … then static-nat` —
 UNSAFE: `static-nat` is a free-form leaf and the Junos hierarchical form

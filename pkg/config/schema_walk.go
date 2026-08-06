@@ -104,7 +104,8 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	vc := &walkContext{cfg: cfg, refs: refs}
 	// closed=false: the top-level walk is open-world. The per-subtree
 	// closed-world flag (#4313) is inherited from schemaNode.closedWorld as
-	// the walker descends; no production subtree sets it today.
+	// the walker descends. No count here — see the keyword-resolution gate
+	// below for why prose must not state how many subtrees are armed.
 	return walkSchemaChildren(tree.Children, setSchema, nil, vc, false)
 }
 
@@ -295,7 +296,7 @@ func walkSchemaChildren(nodes []*Node, parent *schemaNode, path []string, vc *wa
 //   - closed:   closed-world enforcement flag (#4313). When true, an
 //     unmodeled child keyword is REJECTED instead of silently accepted.
 //     Inherited from any ancestor subtree whose schemaNode.closedWorld is
-//     set; false (open-world) everywhere in production today.
+//     set; false (open-world) for any subtree that has not opted in.
 func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkContext, siblings []*Node, closed bool) error {
 	keyword := node.Keys[0]
 

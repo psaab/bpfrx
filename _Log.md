@@ -1,50 +1,48 @@
-## 2026-08-05 — #4313: close `snmp community`, and stop the mechanism lying about itself
+## 2026-08-05 — #4313: REVERT the snmp arm; keep and finish the stale-claim fix
 
-- **Timestamp**: 2026-08-05 (fix/4313-closed-world-arm, off master 86927d23c)
-- **Action**: The lane was dispatched as "the closed-world gate is built and
-  armed on nothing". **That premise was false.** Ten production subtrees carry
-  `closedWorld: true`, rolled out across seven commits since 2026-07-06, each
-  with its own `schema_closedworld_*_4313_test.go`. Reported before writing any
-  code.
-    - **Why the premise was wrong is the finding.** The screen quoted
-      `schema_walk.go`'s own comment — "no production subtree does so today" —
-      written in the mechanism commit `49fef7174` (2026-07-06) when it was
-      true. The first flip landed the SAME DAY (`feb2af22b`); `master-password`
-      07-07; NAT64 07-08. Nobody updated the comment. Verified with `git log -S`
-      on both the comment string and the arming rather than by reading either.
-      `docs/config-schema.md` carried the identical stale claim.
-    - **Both de-rotted, and deliberately with NO count.** Replacing "none" with
-      "ten" is the same bug with a fresh number. Both now state the mechanism
-      and point at `closedWorld: true` / the per-subtree test files as the
-      enumeration. A comment that makes no countable claim cannot rot into a
-      false one.
-    - **Documented the strict-vs-tolerant asymmetry** in the mechanism comment,
-      since it is asked every round and was written nowhere: reject at the
-      operator boundary, warn on `Store.Load` / `Store.SyncApply` where
-      refusing means an outage.
-    - **Armed `snmp community`** after modeling the three leaves that put it on
-      the PR-C skip list (`view`, `client-list-name`, `routing-instance`), the
-      same add-then-arm order `security ike proposal` used. Named the readiness
-      heuristic explicitly in the docs rather than leaving it implicit in seven
-      commit messages.
-- **Method note worth keeping**: the missing leaf was found by MEASUREMENT —
-  arming first and running the corpus failed `TestSNMPInertKnobAdvisories` on
-  `view`, a real leaf a committed fixture carries. But the corpus surfaced
-  `view` only because a fixture used it, and could NOT have surfaced
-  `client-list-name` / `routing-instance`, which no fixture exercises. A corpus
-  run bounds what you can observe, not what exists; those two came from the
-  Junos grammar in the skip note. Both halves are recorded in the docs so the
-  next candidate is not measured with false confidence.
-- **Validation**, each `go vet ./pkg/config/` then
-  `go test -count=1 -run <re> ./pkg/config/`:
-  M1 disarm `closedWorld` — rejection test rc=1 (RED, the guard is bound) while
-  the accept test stays rc=0 (correct: disarming does not break valid config).
-  M2 drop one modeled leaf — the every-modeled-leaf negative control rc=1,
-  catching the #4191 false-reject class the leaf-completeness audit exists to
-  prevent. vet=0 on both, so neither red is a build break.
-- **File(s)**: `pkg/config/schema_system.go`, `pkg/config/schema_walk.go`,
-  `pkg/config/schema_closedworld_snmp_community_4313_test.go`,
-  `docs/config-schema.md`, `_Log.md`
+- **Timestamp**: 2026-08-05 (fix/4313-closed-world-arm, gate MERGE-NEEDS-MAJOR)
+- **Action**: The gate found the arm hard-rejects valid Junos. **Reverted the
+  flip and the three leaf additions.** Kept the stale-claim work, which is
+  independent and was the finding that mis-scoped this lane in the first place.
+- **Why revert rather than model my way out** — my leaf-completeness audit was
+  wrong in two independent ways and the target has a second, unarmed surface:
+    - **F1 (verified firsthand)**: `routing-instance` is a CONTAINER in Junos
+      nesting a `clients {}` block; I modeled it as a bare scalar. Closed-world
+      inherits into container descent, so
+      `snmp community public routing-instance InBand clients 10.0.0.0/8` — valid
+      config — is REJECTED. An SNMP-scoped-to-a-VRF node could not commit ANY
+      change until the operator deleted working configuration. That is exactly
+      the #4191 false-reject class the leaf-completeness audit exists to prevent,
+      and my audit produced it.
+    - **F2**: `logical-system` is a sixth Junos child I did not model, and my
+      test enshrined the false-reject as correct — a future lane would have had
+      to delete a test case defending the defect.
+    - **F3 (verified firsthand)**: TWO ingestion surfaces. The same typo is
+      rejected under `snmp {}` and returns `<nil>` under `system { snmp {} }`
+      (`compiler_system.go:512` `FindChild("snmp")`), and
+      `test/incus/xpf-test.conf` uses the uncovered spelling. Even a correct arm
+      would have been half a fix while the docs claimed full coverage.
+    - **F4**: the leaves I added are inert with NO advisory (only `view` has
+      one), so merely modeling them makes the CLI advertise a source-IP
+      restriction that is accepted, unapplied, and unwarned. Composed with F1,
+      the error message walks the operator into removing their remaining
+      restriction — the fix path leads to the fail-open.
+- **The lesson, mine**: my mutation proof was green and proved the WRONG THING.
+  Disarming red the rejection test; dropping a modeled leaf red the negative
+  control. Both show the guard BINDS. Neither asks whether what it binds is
+  CORRECT — whether the modeled set actually equals the Junos grammar. A
+  negative control built from my own model of the grammar can only confirm my
+  model, not test it. For a closed-world flip the binding proof is necessary and
+  the grammar audit is the load-bearing half, and I treated the first as
+  evidence for the second.
+- **Kept and finished**: the stale-claim fix, which the gate found was 1-of-3.
+  `schema_walk.go` carried the same false "no production subtree / everywhere in
+  production today" claim at three sites — the keyword gate, the top-level walk
+  doc (:107) and the walkSchemaNode param doc (:298). All three now state the
+  mechanism with no count. The docs contradiction resolved itself once the flip
+  was reverted, and the skip note is upgraded from a name-list into the four
+  measured entry criteria above so the next attempt starts from evidence.
+- **File(s)**: `pkg/config/schema_walk.go`, `docs/config-schema.md`, `_Log.md`
 
 ## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
 
