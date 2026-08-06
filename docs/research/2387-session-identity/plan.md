@@ -1,8 +1,108 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r5 — incorporates r4 reviews. **AGY r4 = PLAN-READY** (reversing its
-own r3 PLAN-KILL). Claude SMR r4 = PLAN-NEEDS-REVISION, both items resolved below.
-Codex: see the reviewer ledger.
+**Revision:** v6-r6 — **NOT CONVERGED.** Codex landed **PLAN-NEEDS-MAJOR-REVISION**
+after Claude SMR r5 and AGY r4 had both reached PLAN-READY, and **Codex is right on
+three architecture-level items that both other reviewers missed.** The r5 PLAN-READY
+is **WITHDRAWN**. See §0 below.
+
+## 0. Codex's late refutation — three things the 2-of-3 convergence got WRONG
+
+Codex ran long and delivered after the other two reviewers converged. Its findings are
+not nits; two of them would have shipped a fix that **does not fix this issue**.
+
+### 0a. §7a's native-ingress row was WRONG, and wrong in the issue's own scenario
+
+§7a said native ingress derives the domain from
+`ifindex_to_routing_instance[ingress_ifindex]`. **`ifindex_to_routing_instance` is keyed
+by the LOGICAL UNIT ifindex, and `meta.ingress_ifindex` is the RAW PHYSICAL ifindex.**
+Verified at `userspace-dp/src/afxdp/poll_descriptor/prerouting_scope.rs:32-59`, which
+states it outright: *"a VLAN sub-interface's physical bind ifindex maps only to its
+parent's FIRST unit"*, and documents #5802 fixing exactly this class of scope-escape
+for NAT.
+
+**Consequence:** on a VLAN trunk — which is precisely #2387's headline scenario, two
+VLAN sub-units on one parent in different routing-instances — **both units would derive
+the SAME domain (the parent's first unit's RI)**, and the widened key would silently
+fail to discriminate them. The fix as specified would not have fixed the bug it was
+written for, and would have passed a test that used two physical ports.
+
+**Correction:** C-P0 must resolve the logical unit FIRST —
+`resolve_ingress_logical_ifindex(forwarding, physical_ifindex, ingress_vlan_id)` — and
+look up the RI from that, mirroring `prerouting_ingress_scope` (#5802/#3021). The
+RED-on-revert test **must** use two VLAN units on one parent, never two physical ports.
+
+### 0b. `MinCompatHAProtocolVersion` is NOT vestigial — and the real blocker is elsewhere
+
+§4.3b claimed the constant has no non-test consumer. **Wrong.** My grep was scoped to
+`pkg/` and matched only Go symbol references, missing that it is exported as text by
+`cmd/xpfd/main.go:195` (`ha-protocol-min-compat=%d`) and **parsed and enforced** by
+`pkg/upgrade/imageversions.go:70` → `GateMixedBaseSwap:156`, which already applies it as
+a **floor**: `peerHAProtocol < newImg.HAProtocolMinCompat || peerHAProtocol >
+newImg.HAProtocol`. So the mixed-base gate **already honours a compatibility window**;
+`parseHAProtocolCompatible`'s exact-equality is a *second, separate* predicate.
+
+**The real blocker Codex found, which I missed entirely:**
+`SessionSyncWireVersion = uint16(CurrentHAProtocolVersion)` (`pkg/cluster/sync.go:36`),
+and `GateMixedBaseSwap` compares session-sync **exact-match**
+(`imageversions.go:170`: `peerSessionSync != newImg.SessionSyncProtocol` → fail).
+**So bumping `CurrentHAProtocolVersion` bumps `SessionSyncWireVersion` and makes the
+release non-rolling through the session-sync gate — regardless of anything done to
+`parseHAProtocolCompatible`.**
+
+**Correction — and it is cleaner than v6-r5's design.** #2387's payload change is
+*additive*, so the sync wire schema does **not** change incompatibly and
+`SessionSyncWireVersion` **should not move**. Decouple it from
+`CurrentHAProtocolVersion` and pin it — which the constant's own doc comment explicitly
+anticipates: *"If the sync wire format ever diverges from the HA protocol version,
+replace this with its own counter."* Then bump only the HA protocol version, whose
+mixed-base gate already accepts a floor. **This removes the need to touch
+`parseHAProtocolCompatible` at all** — which was §3a's strongest PLAN-KILL argument.
+
+### 0c. The version gate has real races
+
+Codex identified concrete windows §4.3c does not close: heartbeat and session-sync start
+independently (`pkg/daemon/daemon_ha_sync.go:767-792`); v1-imported domainless sessions
+survive a sync disconnect (`:109-118`); the first v2 heartbeat overwrites the peer
+version immediately (`heartbeat_manager.go:314-325`) while authoritative replacement only
+completes at `BulkEnd` (`sync_conn_read.go:205-247`) — so enforcement can engage while
+retained domain-0 rows are still live. Reverse race: `StopHeartbeat` leaves the cached
+version intact (`heartbeat_manager.go:148-163`), and heartbeat timeout clears it then
+enters single-node election (`:425-447`) — disabling isolation exactly during takeover.
+
+**Correction:** the gate cannot be a global per-packet predicate over a mutable peer
+version. It must key off the **sync incarnation** (per-entry provenance tied to the bulk
+that imported it) with an **atomic authoritative-bulk transition**, and the plan must
+explicitly choose fail-open continuity or fail-closed session loss for legacy rows.
+**This is a redesign of §4.3b/§4.3c, not a wording fix.**
+
+### 0d. Codex also caught a self-contradictory test
+
+The v6-r3 test asked for behaviour "byte-identical to today" **and** that a same-5-tuple
+default-domain packet not match a legacy row. Those are contradictory: with enforcement
+off, it *would* match. The test spec was impossible as written and is withdrawn pending
+the §0c redesign.
+
+### 0e. What Codex confirmed
+
+C1 (heartbeat carries the version unconditionally, unlike the PSK-gated handshake) and
+C2 (`parseHAProtocolCompatible` is exact-equality) are **CONFIRMED**. The VXLAN /
+IP-in-IP absence is **CONFIRMED** (tunnel kinds are GRE, WireGuard, Unknown only —
+`forwarding_build/tunnels.rs:143-168`), though the plan's wording that `PROTO_IPIP`
+appears "only in `policy.rs`" is too narrow. §7a also misses **local-origin GRE traffic
+read from the tunnel TUN** (`afxdp/tunnel.rs:344-381`, installing sessions at `:595-654`).
+
+### 0f. Status
+
+**The plan is NOT converged.** Two reviewers reached PLAN-READY on a design that Codex
+then showed would not fix the issue's own scenario (§0a) and whose rolling-upgrade
+story rested on a mis-scoped grep (§0b). §0b's correction makes the plan *cheaper*;
+§0a and §0c require real revision. A further review round is required before any
+`/engineer`.
+
+---
+
+**Superseded revision header (v6-r5):** incorporated r4 reviews; AGY r4 = PLAN-READY
+(reversing its own r3 PLAN-KILL), Claude SMR r5 = PLAN-READY. Both withdrawn by §0.
 
 **v6-r5 changelog — I lost both of my own r4 findings, and that is the right outcome:**
 - **SMR-12 (FLUSH vs MARK) — CONCEDED to AGY.** I argued flushing opens an

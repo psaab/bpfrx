@@ -18,7 +18,7 @@ objection that drove the v4 PLAN-DEFER.
 | r4 | Claude SMR | `claude-smr-plan-r4.md` | PLAN-NEEDS-REVISION |
 | r4 | AGY | `agy-plan-r4.md` | **PLAN-READY** (reversing its own r3 PLAN-KILL) |
 | r5 | Claude SMR | `claude-smr-plan-r5.md` | **PLAN-READY** |
-| — | Codex | `codex-plan-r1.md` | see below |
+| r5 | Codex | `codex-plan-r1.md` | **PLAN-NEEDS-MAJOR-REVISION** (landed late, after the other two converged) |
 
 ## Shape of the review — worth recording
 
@@ -39,7 +39,7 @@ once its own finding removed the cost it had priced, and Claude SMR conceded bot
 its r4 findings. That two-way movement is the signal the review was adversarial
 rather than performative.
 
-## Codex
+## Codex — delivered late, and overturned the convergence
 
 Codex was **not infra-blocked** — it ran and produced output — but it was
 **pathologically slow** on this plan. Run 1 was given the full 7-question brief
@@ -70,3 +70,35 @@ indistinguishable from a real run until you check the byte count.
   child**. Use the harness's own background mechanism.
 
 Always smoke `2+2` before trusting an empty result, and always check `wc -c`.
+
+## Post-hoc correction — the 2-of-3 convergence was WRONG
+
+Codex delivered **after** Claude SMR r5 and AGY r4 had both reached PLAN-READY, and it
+**overturned that convergence**. This is the single most important entry in this ledger.
+
+Codex found three architecture-level defects both other reviewers missed:
+
+1. **§7a's native-ingress row derived the domain from the RAW PHYSICAL ifindex**, while
+   `ifindex_to_routing_instance` is keyed by the **LOGICAL UNIT** ifindex. On a VLAN
+   trunk — *this issue's own headline scenario* — both units would have derived the same
+   domain, so the widened key would not have discriminated them. **The fix as specified
+   would not have fixed the bug**, and would still have passed a test written with two
+   physical ports.
+2. **`MinCompatHAProtocolVersion` is not vestigial.** My grep was scoped to `pkg/` and
+   matched only Go symbol references; the constant is exported as text by `cmd/xpfd` and
+   parsed/enforced by `GateMixedBaseSwap`. The real rolling-upgrade blocker is
+   `SessionSyncWireVersion = uint16(CurrentHAProtocolVersion)` compared **exact-match**
+   by that gate — which no one else spotted.
+3. **The version gate has concrete races** (heartbeat vs session-sync start ordering,
+   BulkEnd timing, `StopHeartbeat` retaining a stale version, single-node election
+   clearing it during takeover).
+
+**Lesson for this project's review discipline:** two reviewers converging is not the
+same as a claim being verified, and a *late* reviewer is not a redundant one. Both of the
+converged reviewers accepted §7a's ifindex row and the "vestigial constant" claim without
+independently checking either — AGY explicitly marked §7a "VERIFIED" in r3. The defect
+in (2) traces to a **mis-scoped grep of mine** (`pkg/` only, symbol-only) that both
+reviewers then inherited rather than re-derived.
+
+Codex's slowness nearly cost the pass its most important findings: it was terminated once
+as stale and proceeded 2-of-3. **The 2-of-3 exception is a real risk, not a free pass.**
