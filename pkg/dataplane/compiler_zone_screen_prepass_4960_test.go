@@ -20,14 +20,31 @@ import (
 // host #4960 exists to prevent, produced by the mechanism it claims to close.
 //
 // WHY THIS TEST RUNS THE COMPILE MANY TIMES. Map iteration order is randomised
-// per range, so a single run is a coin flip: with the fix reverted, the bad zone
-// is visited first roughly 1/N of the time and the compile then aborts before
-// any mutation, which looks exactly like a pass. One iteration would therefore
-// be a FLAKY revert probe that reports green on broken code most-but-not-all of
-// the time. With N zones and k trials the probability of a reverted build
-// slipping through is N^-k; at N=8 and k=24 that is ~10^-21. The randomisation
-// is not noise to be suppressed here — it is half the finding, because it means
-// the defect's blast radius differs run to run on the same config.
+// per range, so with the fix reverted the offending zone is sometimes visited
+// FIRST; the compile then aborts before any mutation, which looks exactly like
+// a pass. One iteration would therefore be a FLAKY revert probe that reports
+// green on broken code a fraction of the time.
+//
+// The per-trial slip rate is MEASURED, not derived (#6894 r5 F3). Both of the
+// numbers this comment used to carry were wrong, in opposite directions. It is
+// not a "coin flip" — that would be 0.5. Nor is it the uniformity-derived 1/N:
+// the fixture holds NINE zones (eight valid plus the offender), and Go's map
+// range picks a random start bucket and a random offset within it, so which key
+// lands first is not uniform over the nine. Reverting BOTH halves of the fix
+// and running the single-trial compile 200,000 times gives
+//
+//	slip = 12632/200000 = 0.0632 per trial      (uniform 1/9 would be 0.1111)
+//
+// so k=24 trials leaves a reverted build passing with probability ~0.0632^24,
+// about 1e-29. The old text said "N^-k; at N=8 ... ~10^-21", which had the
+// wrong denominator (8, counting only the valid zones) AND the wrong model.
+// The guard is in fact stronger than the claim it used to make, but a guard
+// whose stated strength is not the measured one is not a guard anyone can
+// reason about.
+//
+// The randomisation is not noise to be suppressed here — it is half the
+// finding, because it means the defect's blast radius differs run to run on the
+// same config.
 
 // zoneScreenPrePassConfig builds a config with EIGHT valid, interface-carrying
 // zones and ONE whose screen-profile reference does not resolve.
@@ -79,6 +96,38 @@ func zoneScreenPrePassConfig() *config.Config {
 // trials.
 func TestStaleZoneScreenRefRejectedBeforeAnyZoneIsProgrammed_4960(t *testing.T) {
 	const trials = 24
+
+	// FIXTURE FLOOR (#6894 r5 F3). Nothing tied the trial count to the fixture,
+	// so the probe's whole premise — that a REVERTED build has zones left to
+	// program before it reaches the offender — rested on the zone loop above
+	// staying populated. Trim that loop to zero and the map holds only the
+	// offender: it is visited first every time, `zoneConfigCalls` is always 0,
+	// and this test passes 24/24 on BROKEN code. The randomised order that makes
+	// the probe need many trials is exactly what makes it silently vacuous when
+	// the fixture shrinks, so assert the shape the trial count was chosen for
+	// rather than trusting it.
+	probe := zoneScreenPrePassConfig()
+	const wantValidZones = 8
+	if got := len(probe.Security.Zones); got != wantValidZones+1 {
+		t.Fatalf("fixture carries %d zones, expected %d (%d valid + 1 offender) — "+
+			"the 0.0632 per-trial slip rate and the %d-trial count were both "+
+			"derived for that shape, and with fewer valid zones the offender is "+
+			"visited first more often (at zero valid zones, ALWAYS), so this probe "+
+			"would pass on a reverted build",
+			got, wantValidZones+1, wantValidZones, trials)
+	}
+	programmable := 0
+	for name, z := range probe.Security.Zones {
+		if name != "zone-bad-screen" && z != nil && len(z.Interfaces) > 0 {
+			programmable++
+		}
+	}
+	if programmable != wantValidZones {
+		t.Fatalf("only %d of the valid zones carry interfaces, expected %d — a zone "+
+			"with no interfaces is programmed without reaching mapZoneInterface, so "+
+			"it cannot witness the host mutation this probe exists to catch",
+			programmable, wantValidZones)
+	}
 
 	for i := 0; i < trials; i++ {
 		dp := &recordingDP{}
@@ -155,5 +204,58 @@ func TestZoneScreenSweepSkipsEmptyAndNilZones_4960(t *testing.T) {
 	if err := validateZoneScreenReferences(cfg, newValidationResult()); err != nil {
 		t.Fatalf("the sweep rejected a zone with no screen-profile and/or a nil zone "+
 			"slot, both of which programZoneMaps tolerates: %v", err)
+	}
+}
+
+// TestPrePassReportsTheSamePhaseProductionWould_4960 binds the phase-table
+// ORDER behaviourally, which TestValidationPhaseTableMatchesDocumentedCoverage
+// structurally cannot (#6894 r5 F5).
+//
+// That test compares validationPhases against a hand-written `want` list. Both
+// are written by the same person in the same round, so when the table's order
+// diverged from CompileConfig's the two agreed with each other and were wrong
+// together — the table said "in the same order CompileConfig runs them" while
+// "zone screen references" sat eighth, behind "address book", even though
+// production reaches it first (validateZoneScreenReferences is the first thing
+// inside compileZones, and compileZones is the first phase).
+//
+// This asserts the property the order exists FOR, against a config that trips
+// BOTH phases at once: the pre-pass must name the phase production would have
+// aborted in. With the row misplaced, the pre-pass blames "address book" for a
+// config production would reject on the screen reference, so the operator is
+// pointed at the wrong stanza.
+//
+// RED on revert: move the "zone screen references" row back after "screen
+// profiles" and this fails with the address-book phase in the error.
+func TestPrePassReportsTheSamePhaseProductionWould_4960(t *testing.T) {
+	cfg := zoneScreenPrePassConfig()
+	// Second defect, in a phase whose row sits EARLY in the table. An
+	// address-book entry whose value is not parseable as a prefix is rejected by
+	// compileAddressBook's own resolution, independent of the dataplane.
+	cfg.Security.AddressBook = &config.AddressBook{
+		AddressSets: map[string]*config.AddressSet{
+			"set-with-missing-member": {
+				Name:      "set-with-missing-member",
+				Addresses: []string{"no-such-address-4960"},
+			},
+		},
+	}
+
+	err := validateBeforeMutate(cfg)
+	if err == nil {
+		t.Fatal("a config with BOTH a stale zone screen reference and a broken " +
+			"address-book set passed the pre-pass — neither phase rejected, so " +
+			"this test cannot observe which one reports first")
+	}
+
+	// PRODUCTION's order: compileZones runs first, and validateZoneScreenReferences
+	// runs at the top of it, so the screen reference is what an un-pre-passed
+	// apply would abort on. Assert the pre-pass agrees.
+	if !strings.Contains(err.Error(), "zone screen references") {
+		t.Errorf("the pre-pass reported %q, but production aborts in compileZones "+
+			"on the zone screen reference before it ever reaches compileAddressBook "+
+			"— the phase table's order has drifted from CompileConfig's and the "+
+			"pre-pass now names a different phase than the operator would otherwise "+
+			"have seen (#6894 r5 F5)", err.Error())
 	}
 }

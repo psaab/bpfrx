@@ -94,7 +94,7 @@ func (idProbeDP) GetPersistentNAT() *PersistentNATTable                         
 // an interface-SNAT rule that yields an egress IP, and a security policy.
 //
 // Keep it able to reach all 39 pre-pass-reachable overrides when adding to it;
-// the 40th, IsLoaded, is called by CompileConfig itself (compiler.go:182),
+// the 40th, IsLoaded, is called by CompileConfig itself (compiler.go:268),
 // above the pre-pass, so no config can reach it from validateBeforeMutate.
 //
 // Interface names are deliberately outside the vSRX scheme. The zone interface
@@ -295,7 +295,7 @@ func idProbeConfig() *config.Config {
 //     the DeepEqual proved nothing.
 //   - The static-NAT counter keys were never assigned. compileStaticNAT
 //     assigns them (compiler_nat.go:1013) and production finalizes AFTER it
-//     (compiler.go:245-254); finalizing straight after compileNAT measured
+//     (compiler.go:330); finalizing straight after compileNAT measured
 //     neither the assignment nor its effect on the collision re-derivation.
 //   - pool-nat64 never entered PoolIDs and NextPoolID never advanced.
 //     compileNAT64's auto-assign branch (compiler_nat.go:1243-1245) is what
@@ -351,7 +351,7 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 		t.Fatalf("compileStaticNAT: %v", err)
 	}
 	// Production finalizes HERE — after static NAT has recorded its counter
-	// keys and before NAT64 runs (compiler.go:245-254).
+	// keys and before NAT64 runs (compiler.go:330).
 	//
 	// The POSITION is asserted as a PRECONDITION rather than through the
 	// output, because the output cannot see it. finalizeNATCounterIDs only

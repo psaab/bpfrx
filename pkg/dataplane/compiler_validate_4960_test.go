@@ -301,13 +301,21 @@ func TestNoHostMutationWhenNATPhaseFails_4960(t *testing.T) {
 // SCOPE, because this test's claim was overstated at r1 (#6894 r2 F3): it
 // asserts on got[i].name and NOTHING else, so it binds INDEX -> NAME. Replacing
 // the BODY of a row with `func() error { return nil }`, leaving names and order
-// intact, was measured to keep the whole package GREEN for ten of the twelve
+// intact, was measured to keep the whole package GREEN for ten of the thirteen
 // rows. TestEachValidationPhaseRowRunsItsOwnCompiler_4960 below is what binds
 // NAME -> BODY; neither test substitutes for the other.
 func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
+	// #6894 r5 F5: "zone screen references" leads, because compileZones is
+	// CompileConfig's first phase and validateZoneScreenReferences is the first
+	// thing inside it. It used to sit eighth, which broke the property the whole
+	// ordering exists for — and this list could not detect that, because it is a
+	// hand-written copy compared against another hand-written list. Anyone
+	// reordering here must check CompileConfig, not just make the two lists
+	// agree again.
 	want := []string{
+		"zone screen references",
 		"address book", "applications", "policies", "nat", "static nat",
-		"nat64", "nptv6", "screen profiles", "zone screen references",
+		"nat64", "nptv6", "screen profiles",
 		"default policy", "flow timeouts",
 		"firewall filter protocols", "flow config",
 	}
@@ -341,7 +349,7 @@ func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 // set to 39 of 40. Instrumented count, measured by overriding all 40 with a
 // name recorder: 38 from the first leg below, plus SetSNATEgressIP from the
 // second. The 40th is IsLoaded, which CompileConfig calls itself
-// (compiler.go:182) before the pre-pass runs, so no config can reach it from
+// (compiler.go:268) before the pre-pass runs, so no config can reach it from
 // here.
 //
 // The second leg exists because SetSNATEgressIP is the one covered write that

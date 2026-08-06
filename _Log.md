@@ -69122,7 +69122,13 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   looks exactly like a pass. A single-run probe would be FLAKY, reporting green
   on broken code a fraction of the time. The fixture uses 8 valid
   interface-carrying zones + 1 offender and runs 24 trials: a reverted build
-  slips through with probability 8^-24. Measured with BOTH halves of the fix
+  slips through with probability 8^-24. [CORRECTED in #6894 r5 F3: that
+  denominator counted only the eight VALID zones, and the model assumed
+  uniformity. The map holds NINE keys and Go's range is not uniform over which
+  lands first. Measured over 200,000 single-trial compiles with both halves
+  reverted: 12632/200000 = 0.0632 per trial, so 24 trials give ~1e-29, not
+  8^-24 ~ 2e-22. The guard is stronger than this entry claimed, but the number
+  was not measured when written.] Measured with BOTH halves of the fix
   removed: `go vet ./pkg/dataplane` rc=0 (an ASSERTION failure, not a build
   break) and `go test -run 'StaleZoneScreenRef|ValidZoneScreenRef|
   ZoneScreenSweepSkips'` rc=1, failing at "compileZones programmed 1 zone(s)
@@ -69145,3 +69151,84 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   the wording did not. Also corrected the `AddrIDs` floor comment, which named
   the synthetic writer as the "interface-SNAT branch" when the pinned keys come
   from named-pool rules.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 5. Codex returned MERGE-NEEDS-MAJOR at `b0c74194c`
+  with six findings. Two of them invert on measurement, and this entry records
+  why rather than quietly not doing them.
+  **F1 (raised as BLOCKING) is a FALSE POSITIVE, and its prescribed fix would
+  be a regression.** The claim was that `discardingDataPlane.SetAddressBookEntry`
+  returns nil unconditionally while "the real backend" calls `net.ParseCIDR`
+  (`maps_policy.go`), so an empty address-book prefix could clear the pre-pass,
+  let compileZones mutate the host, and then fail. That `ParseCIDR` belongs to
+  `(*dataplane.Manager)` — the RETIRED eBPF backend. `NewDataPlane` and
+  `NewRuntimeDataPlane` both refuse `TypeEBPF` with `ErrEBPFBackendRetired`
+  (`dataplane.go`), so no apply reaches it. Production passes
+  `userspaceShimCompileDataplane` (`loader.go`), via
+  `userspace.Manager.ApplyConfig -> .Compile -> bpfShim.CompileUserspaceShim`.
+  Measured across the whole surface, not spot-checked: all 55 shim methods have
+  a bare `return nil`/empty body, and all 38 methods shared with the fake are
+  byte-identical. So `compileAddressBook` cannot fail from an empty `Value` on
+  the only supported runtime path. Teaching the fake to ParseCIDR would make the
+  PRE-PASS STRICTER than production and reject at commit what the runtime
+  accepts — empty `value` is a deliberate WARNING (#2229), and this gate has
+  already swung through over-rejection twice.
+  Instead of the prescribed change, added
+  `TestPrePassFakeIsNoMorePermissiveThanProduction_4960`: an AST scan asserting
+  every `userspaceShimCompileDataplane` method is still a no-op, with a floor
+  (>=40 methods seen) so a rename cannot make the scan vacuous. That turns the
+  one-off measurement into a standing guard and catches the REAL version of the
+  concern — someone adding a validating method to the production shim.
+  PROVEN TO FIRE: giving the shim a ParseCIDR body reds it on
+  "non-no-op body: [SetAddressBookEntry]", with `go vet` rc=0 so it is an
+  assertion, not a build break.
+  **F2 also inverts.** "Neither screen-resolution site is independently bound"
+  is true but not closable: `result.ScreenIDs` is built by `assignScreenIDs`
+  FROM `cfg.Security.Screen`, so the two key sets are identical by construction
+  and no real config separates them; and since `c3497a64a` hoisted
+  `validateZoneScreenReferences` to the top of `compileZones`, both sites are
+  backstops the sweep pre-empts. Binding them independently would need a
+  hand-built `result` disagreeing with `cfg` — a state production cannot
+  produce. Documented rather than faked.
+  **F3 (probability math) fixed with MEASURED numbers.** The comment called a
+  single run "a coin flip" (0.5) and gave `8^-24` from a uniformity assumption
+  over the wrong denominator. The fixture holds NINE zones, and Go's map range
+  is not uniform over which key lands first. Reverting both halves and running
+  200,000 single-trial compiles: 12632/200000 = 0.0632 per trial, versus 0.1111
+  for uniform 1/9 — so 24 trials give ~1e-29. Corrected in the test comment AND
+  in the r5-1 `_Log.md` entry above. Also closed the vacuity hole: nothing tied
+  the trial count to the fixture, so trimming the valid-zone loop to zero left
+  only the offender, which is then visited first every time and makes the probe
+  pass 24/24 on BROKEN code. Added a fixture floor asserting 8 valid +
+  1 offender and that all 8 carry interfaces. PROVEN TO FIRE: shrinking the loop
+  to zero reds it, `go vet` rc=0.
+  **F5 (my own prior error, and worse than reported).** The phase table claimed
+  "in the same order CompileConfig runs them" while `zone screen references` sat
+  EIGHTH. Production reaches it FIRST — `validateZoneScreenReferences` is the
+  first statement in `compileZones`, and `compileZones` is the first phase. A
+  config with both a stale screen reference and a broken address-book set was
+  therefore reported by the pre-pass as "address book" while production would
+  abort on the screen reference, pointing the operator at the wrong stanza.
+  Fixed by MOVING the row to first, making the documented claim true rather than
+  weakening it. The coverage test could not have caught this — it compares the
+  table against another hand-written list, so both were wrong together — so
+  added `TestPrePassReportsTheSamePhaseProductionWould_4960`, which drives a
+  config tripping BOTH phases and asserts the pre-pass names the one production
+  would. PROVEN TO FIRE: moving the row back to eighth while keeping the
+  index list consistent reds the new test and leaves the coverage test GREEN,
+  which is exactly the discrimination that was missing. Also corrected the row
+  count ("five of the twelve" and "ten of the twelve" -> thirteen) and four
+  rotting line references (`compiler.go:182` -> `:268` for the IsLoaded check,
+  x3 files; `compiler.go:245-254` -> `:330` for the NAT finalize, x2 sites).
+  **NOT DONE, and owed:** F4 (widen the ID driver to PolicySetID / RuleID /
+  PolicyNames / scheduler slots) and F6 (success logs emitted for no-op
+  validation-pass operations). Both are coverage/log-noise, neither is a runtime
+  defect; they are not started, not partially done.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages ok); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md

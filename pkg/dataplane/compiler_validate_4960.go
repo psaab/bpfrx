@@ -101,7 +101,7 @@ import (
 // called by no test in the package. Any one of them could be deleted with the
 // whole suite green, while an ordinary `security nat destination` stanza
 // nil-panicked the daemon on apply. The fixture now reaches 39; the 40th,
-// IsLoaded, is called by CompileConfig itself (compiler.go:182) above the
+// IsLoaded, is called by CompileConfig itself (compiler.go:268) above the
 // pre-pass and is bound by the CompileConfig-driving tests instead. Adding an
 // override without a config shape that REACHES it re-opens the same hole.
 type discardingDataPlane struct{ DataPlane }
@@ -211,7 +211,7 @@ func validateBeforeMutate(cfg *config.Config) error {
 // discardingDataPlane{}; the seam exists so a test can fail exactly ONE
 // dataplane method and prove which ROW of the table surfaces it.
 //
-// That is not a convenience. Five of the twelve rows -- nptv6, screen
+// That is not a convenience. Five of the thirteen rows -- nptv6, screen
 // profiles, default policy, flow timeouts, flow config -- have NO
 // config-shaped hard error at all: every bad input inside them is a
 // `slog.Warn(...); continue`, so their only `return err` is a dataplane
@@ -299,11 +299,39 @@ type validationPhase struct {
 // CompileConfig runs them, so a config that fails several reports the same
 // phase it would have reported post-mutation.
 //
+// "The same order" is a claim about PRODUCTION's order, not about this list's
+// internal logic, and the two came apart once (#6894 r5 F5 — see the first
+// row). When adding a row, place it where CompileConfig reaches it, including
+// checks hoisted INSIDE a phase: compileZones is the first phase, so anything
+// it validates up front sorts ahead of every compileX row here.
+//
 // The name set is asserted by TestValidationPhaseTableMatchesDocumentedCoverage_4960.
 // Adding or removing a row without updating that test -- and the coverage
 // paragraph above -- is a test failure by construction.
 func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) []validationPhase {
 	return []validationPhase{
+		// FIRST, because compileZones is CompileConfig's first phase and
+		// validateZoneScreenReferences is the first thing inside it
+		// (compiler_iface.go). #6894 r5 F5: this row sat eighth, directly after
+		// "screen profiles", on the reasoning that it reads result.ScreenIDs and
+		// so belongs after the row that confirms the profile set. That reasoning
+		// was about a data dependency the table does not have — assignScreenIDs
+		// populates ScreenIDs before the table runs at all — and it broke the
+		// property the ordering exists for. A config with BOTH a bad address-book
+		// entry and a stale zone screen reference was reported by the pre-pass as
+		// "address book" while production would abort in compileZones on the
+		// screen reference, so the pre-pass named a different phase than the one
+		// the operator would otherwise have seen. Nothing caught it: the coverage
+		// test compares this list against another hand-written list, so the two
+		// were wrong together.
+		//
+		// It covers the zone -> profile REFERENCE, which "screen profiles" does
+		// not: compileScreenProfiles compiles the profile SET, while what aborts
+		// is a zone naming a profile the set lacks, resolved per zone inside
+		// compileZones after an earlier zone has already been through
+		// SetZoneConfig and, if it carries interfaces, real netlink and
+		// /proc/sys writes.
+		{"zone screen references", func() error { return validateZoneScreenReferences(cfg, result) }},
 		{"address book", func() error { return compileAddressBook(dp, cfg, result) }},
 		{"applications", func() error { return compileApplications(dp, cfg, result) }},
 		{"policies", func() error { return compilePolicies(dp, cfg, result) }},
@@ -312,15 +340,6 @@ func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) [
 		{"nat64", func() error { return compileNAT64(dp, cfg, result) }},
 		{"nptv6", func() error { return compileNPTv6(dp, cfg) }},
 		{"screen profiles", func() error { return compileScreenProfiles(dp, cfg, result) }},
-		// #6894 r5: the zone -> screen-profile REFERENCE, which the row above
-		// does not cover. compileScreenProfiles compiles the profile SET; what
-		// aborts is a zone naming a profile the set lacks, and that is resolved
-		// per zone inside compileZones — after an earlier zone has already been
-		// through SetZoneConfig and, if it carries interfaces, real netlink and
-		// /proc/sys writes. Ordered directly after "screen profiles" because it
-		// reads result.ScreenIDs, which assignScreenIDs populates before the
-		// table runs and compileScreenProfiles confirms.
-		{"zone screen references", func() error { return validateZoneScreenReferences(cfg, result) }},
 		{"default policy", func() error { return compileDefaultPolicy(dp, cfg) }},
 		{"flow timeouts", func() error { return compileFlowTimeouts(dp, cfg) }},
 		// #6894 r1 F2: a config-shape hard error that was reachable after the
