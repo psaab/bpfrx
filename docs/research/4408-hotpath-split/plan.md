@@ -1,16 +1,31 @@
 # #4408 — Rust hot-path god-functions: `enqueue_pending_forwards` + waterfill
 
-**Status:** PLAN-READY (r2) — recommending **Option B** (Increments 1 + 3),
-explicitly **rejecting** the arm-decomposition shape that #4404 killed.
+**Status:** PLAN-READY (r3) on a **narrowed scope** — recommending
+**Option B′: the waterfill split ONLY** (Increments 3a + 3b). The dispatch
+de-duplication (Increment 1) is **DEFERRED, not rejected**, with its evidence
+preserved in §5-A for whoever picks it up. The arm-decomposition shape that
+#4404 killed remains explicitly rejected (§5-D).
 
-r2 folds seven findings from the hostile Claude SMR pass
-(`claude-smr-plan-r1.md`), two of them load-bearing: **F1** — r1's §7 demanded
-parent-RED for a behaviour-preserving refactor, which is unsatisfiable by
-construction and is replaced by a mutation grid; **F2** — r1's call-edge gate
-command produced up to 5 false failures because it did not strip LLVM CGU-hash
-suffixes (verified against the real binary). Also corrected: the Increment-1
-LOC arithmetic (F3), the new helper's parameter count (F4), the Phase-1 borrow
-floor (F5), the `nm`-absence wording (F6), and the comment-merge checklist (F7).
+**Convergence so far (2 reviewers, same conclusion on the narrowed scope).**
+Codex returned PLAN-NEEDS-MAJOR on r2: it declined to kill the waterfill split
+— *"Its refill, Phase 1, and Phase 2 boundaries are real state-machine
+boundaries, and its value survives this review"* — and blocked only Option B's
+dispatch half — *"The de-dup is safe, but its benefit is not strong enough to
+override the current hottest-path churn and validation gaps."* That is the same
+place my own r1 SMR landed unprompted (*"if forced to ship exactly one thing:
+Increment 3"*). r3 states the convergence rather than treating the two passes
+as disagreeing.
+
+**Round history — read §8a before trusting any gate in this doc.**
+
+| r | What changed | Where the defects were |
+|---|---|---|
+| r1 | first draft | — |
+| r2 | folded 7 SMR findings | **2 load-bearing, both in the GATE**: unsatisfiable parent-RED (F1); call-edge command missing the `.llvm` strip (F2) |
+| r3 | narrowed scope; **gate made instance-aware** | **1 load-bearing, again in the GATE**: the inherited Rust-hash strip **over-collapsed** three distinct `VecDeque::grow` monomorphisations into one identity (F8) |
+
+Three consecutive rounds, three gate defects, zero defects found in the refactor
+design itself. §8a treats that as evidence, not coincidence.
 Base: `origin/master` `dd23119aa7a6ea5bd118b2f788faa1cf68ce7a42`.
 Branch: `research/4408-hotpath-split`. No production code touched.
 
@@ -141,7 +156,25 @@ inside a comment:
 awk 'NR>=589 && NR<=1295' userspace-dp/src/afxdp/tx/dispatch/mod.rs \
   | grep -n 'continue\|return\|recycle_ingress_frame'
 # → 11 hits, all inside `//` comments
+#   (absolute lines 702, 859, 878, 902, 906, 909, 988, 1195, 1213, 1237, 1240)
 ```
+
+**One executable `break` does exist in the region, at :661 — and a reader
+running that grep will not see it, so it is recorded here explicitly rather
+than left as an unexplained hole.** It is the `break` inside
+`for frame in segmented { … }` (loop opened :641, closed :688):
+
+```rust
+record_exception_owned(…);
+build_failed = true;
+break;              // :661 — exits the inner segmentation loop only
+```
+
+It terminates the per-segment loop and resumes at :689
+(`copied_source_frame = true;`) **inside the same region**. It is not an escape
+from the extraction boundary, and it does not reach any recycle site. Codex
+independently confirmed both the 11 comment matches and — via commit
+`29defb24d7` — that #2208 replaced four cp1/cp2 `continue`s with flag-setting.
 
 This is not luck. #2208 deliberately converted the interior's bare `continue`s
 into `build_failed` / `fallback_to_slow_path` flag sets **so that the epilogue
@@ -192,9 +225,13 @@ The Vec-copy fallback is written **twice, verbatim**:
 - :819–956 — reached when in-place rewrite returned `None`
 - :1155–1279 — reached when direct-TX was unavailable
 
-After stripping comments and indentation and normalising the one differing
-local name (`cp1_len` / `cp2_len`), both normalise to **102 identical lines**.
-The only diff is the enclosing `None => match …` vs a bare `match …`:
+After stripping comment-only lines and indentation and normalising the one
+differing local name (`cp1_len` / `cp2_len`), both become **102-line blocks that
+agree on 100 of 102 lines**. The two differences are the enclosing
+`None => match …` vs a bare `match …` and its closing `},` vs `}`:
+
+*(r1/r2 said "102 identical lines". That was imprecise — 102 lines each,
+agreeing on 100. Corrected here rather than left to a reviewer to catch.)*
 
 ```bash
 cd userspace-dp
@@ -268,6 +305,9 @@ on these symbols"*. That objection is **obsolete**: #6386/PR #6392 established
 the replacement (`objdump`/`nm` call-edge comparison) and shipped it. Both
 tools are present on this host. Here is the gate, run against `dd23119aa`:
 
+**r3 redesigned this gate. Read §2c-bis for why the r2 version was wrong.**
+The extraction command is now:
+
 ```bash
 cd userspace-dp/target/release
 BIN=xpf-userspace-dp
@@ -275,38 +315,97 @@ ADDR=$(nm $BIN | grep -E ' t _ZN.*enqueue_pending_forwards17h[0-9a-f]+E$' | awk 
 objdump -d --no-show-raw-insn $BIN \
  | awk -v a="^$ADDR <" '$0 ~ a {f=1} f&&/^$/{if(seen)exit} f{seen=1;print}' \
  | grep -oP 'call\s+[0-9a-f]+ <\K[^>]+' | sed 's/+0x.*//' \
- | sed -E 's/\.llvm\.[0-9]+$//; s/17h[0-9a-f]{16}E?$//' \
- | sort -u
+ | sort -u                      # <-- NO normalisation. This is Tier 1.
 ```
 
-**The two `sed` normalisations are both load-bearing (SMR F2).** The symbol
-address is resolved from `nm` at gate time, never hard-coded. And **5 of the 51
-baseline edges carry a `.llvm.<20-digit>` CGU-content hash** — measured, not
-hypothesised:
-
-```
-…publish_binding_debug_state17h7f010bd79b36908cE.llvm.15104266154738188186
-…nat64::nat64_v6_translation_ineligible17h45dae7fd1de716f1E.llvm.17871286219147243839
-…VecDeque<T,A>::grow17h…E.llvm.17702975328697826035   (×3, distinct Rust hashes)
-```
-
-Adding a function to `dispatch/mod.rs` changes that CGU's content, so those
-suffixes change. Without the `.llvm.` strip the gate reports up to 5 spurious
-"new call edges" on a diff that is pure motion — which would either sink a
-correct refactor or, worse, teach the next reader to hand-wave the gate's
-output. **The comparison key is the demangled symbol path without hashes**, so
-the gate detects a genuinely *new callee*, not a relabelled one.
+The symbol address is resolved from `nm` at gate time, never hard-coded.
 
 The baseline, with the command above run verbatim against `dd23119aa`, is
-**49 normalised call edges** out of `enqueue_pending_forwards` (51 raw; the
-three `VecDeque::grow` monomorphisations collapse to one under normalisation).
-They include
+**51 raw call edges** out of `enqueue_pending_forwards`, checked in as
+`callgraph-baseline-dd23119aa.txt`. They include
 `build_forwarded_frame_from_frame`, `build_nat64_forwarded_frame`,
 `segment_forwarded_tcp_frames_into_prepared`,
 `enqueue_local_request_to_target_or_owner`, `recycle_ingress_frame`,
 `apply_shared_recycles`, `handle_forward_build_failure`,
 `classify_generated_reply`, `drain_pending_fill`. That set is the **baseline
 artifact**; the PR must reproduce it byte-for-byte after the split.
+
+### 2c-bis. Why r2's normalisation was wrong, and what replaced it
+
+r2 normalised with two `sed` rules. **The `.llvm.<N>` strip was correct and
+necessary in principle** — 5 of the 51 edges carry a CGU-content hash
+(`publish_binding_debug_state`, `nat64_v6_translation_ineligible`, and three
+`VecDeque::grow`). **The inherited Rust-hash strip `s/17h[0-9a-f]{16}E?$//` was
+a blind spot**: it collapses the three distinct `VecDeque::grow`
+monomorphisations into **one** identity, so the gate could not see a change
+that swapped one generic instantiation for another. That is the r2 defect
+fixed one rule over from the r2 fix.
+
+Measured, and reproducible from the checked-in baseline:
+
+```
+distinct `grow` keys, Tier 1 (raw)      : 3
+distinct `grow` keys, r2 rule (stripped): 1
+```
+
+**Two firsthand stability probes changed the design.** Codex reported a second
+binary in which all five `.llvm.` suffixes moved while Rust hashes held. I could
+not reproduce that for the change class this refactor belongs to. In a scratch
+worktree (built, measured, then deleted — never pushed) I perturbed
+`dispatch/mod.rs` twice and re-extracted:
+
+| Probe | Perturbation | Raw 51-edge diff |
+|---|---|---|
+| P1 | added a dead `#[inline(always)] fn` | **0 lines** (weak — dead-stripped before CGU partitioning) |
+| P2 | **moved an existing item within the file** (`copy_frame_is_oversized` → end of file) — the same in-file-motion class as the extraction, and not strippable | **0 lines** |
+
+Neither the Rust hashes **nor** the `.llvm.<N>` suffixes moved. For this change
+class the raw set is stable, so **normalising nothing is both the most sensitive
+and the empirically-safe choice**. (The probes do not prove `.llvm.` can *never*
+move — a cross-module move or a toolchain change plausibly would — which is why
+the classifier below exists instead of a blanket strip.)
+
+**Tier 1 (primary gate, must be empty):** raw 51-edge diff. No normalisation.
+Distinguishes all three `grow` instances by construction.
+
+**Tier 2 (diagnostic — consulted ONLY when Tier 1 is non-empty, never as an
+auto-pass):** classify the failure so a red is actionable rather than
+mystifying.
+
+```bash
+# 2a: is it CGU relabelling only?
+diff <(sed -E 's/\.llvm\.[0-9]+$//' base.txt | sort -u) \
+     <(sed -E 's/\.llvm\.[0-9]+$//' new.txt  | sort -u)
+#   empty  -> CGU-relabel only. Record it in the PR body with the before/after
+#             suffixes. NOT an automatic pass — a reviewer signs it off.
+# 2b: same paths, different instantiation? (the `grow` class)
+diff <(sed -E 's/\.llvm\.[0-9]+$//; s/17h[0-9a-f]{16}E?$//' base.txt | sort -u) \
+     <(sed -E 's/\.llvm\.[0-9]+$//; s/17h[0-9a-f]{16}E?$//' new.txt  | sort -u)
+#   empty  -> same callee paths, DIFFERENT monomorphisation. A real signal
+#             that needs an explanation, never a shrug.
+#   non-empty -> a genuinely new or removed callee. HARD FAIL.
+```
+
+**Proof the new rule fixes the blind spot** (rerunnable against the checked-in
+baseline; a synthetic swap of one `grow` hash for a *valid lowercase* 16-hex
+instantiation):
+
+| Rule | Verdict on an instantiation swap |
+|---|---|
+| **Tier 1 (r3)** | **DETECTED** |
+| r2 rule (both strips) | **MISSED** — blind spot confirmed |
+
+**Negative control** (so the table above is not "everything fails"): a pure
+`.llvm.<N>` relabel with no path change is **DETECTED** by Tier 1 and then
+**correctly classified** by Tier 2a — the stripped diff vanishes, identifying it
+as a relabel rather than a new callee. The two rows discriminate, which is what
+makes the grid evidence.
+
+*Method note:* the first attempt at this proof used an **uppercase** synthetic
+hash, which the `[0-9a-f]{16}` strip does not match — so it appeared to show the
+r2 rule catching the swap when the rule was simply not applying. Recorded because
+it is the same self-deceiving-demonstration class the mutation grid in §7.2(c)
+guards against.
 
 ### 2d. The safety principle that distinguishes this plan from the killed ones
 
@@ -351,6 +450,15 @@ This is where #4408 differs most sharply from #4404, whose kill partly rested on
 | `tests/cos_shared_exact.rs` | 6 | 218 | #1598 shared-exact owner policy |
 | `tests/shared_recycle.rs` | 6 | 110 | cross-binding post-recycle |
 
+**r3 caveat — this table is a test *inventory*, not a coverage proof.** Codex's
+blocking objection to Increment 1 is precisely that the header comment at
+`tests/enqueue_failure.rs:180` ("drive `enqueue_pending_forwards` through the
+cp2 copy fallback") establishes *intent*, not that a named assertion would fail
+if the cp1/cp2 or NAT64-attribution logic changed. Under Option B′ nothing here
+is load-bearing — the dispatch half is deferred. When Increment 1 is
+un-deferred, the §7.2 deferred grid is what converts this inventory into
+coverage, and any cell without a named failing test must be written.
+
 **The waterfill is bound by 18 tests** in `queue_service/tests/waterfill.rs` plus
 `tests/refund.rs`, and — critically — **every one of them calls through the
 wrapper** `select_exact_cos_guarantee_queue_with_lease_telemetry`, never the
@@ -365,11 +473,11 @@ machine (epoch refill, honored-bitset persistence, phase2-cursor continuity,
 
 | Invariant | Source | How this plan preserves it |
 |---|---|---|
-| **No-alloc / zero-copy on the non-NAT64 hot path** | issue | No extraction introduces a `Vec`, `clone`, or by-value move of a frame. The in-place and direct-TX arms are **not** extracted (they stay in the cascade). The one extracted arm (Vec-copy fallback) already allocates by definition — that is what it is. NAT64's per-packet `Vec` is untouched and accepted. |
-| **Single-recycle invariant** | #2208/#4041 | All 8 `recycle_ingress_frame` sites are in the prologue/epilogue, **outside** every extracted region (§1b table). The extracted regions contain zero `continue`/`return`. `free_tx_frames.push_front` recycling inside the direct-TX arm (the #4041 double-recycle) is likewise untouched. Bound by `tests/enqueue_failure.rs` + `tests/shared_recycle.rs`. |
+| **No-alloc / zero-copy on the non-NAT64 hot path** | issue | **Trivially held under B′: the TX frame-build path is not opened at all.** No extraction introduces a `Vec`, `clone`, or by-value move of a frame; the waterfill split moves no data (all state is `root` fields threaded by one `&mut`). *(Deferred Increment 1: the in-place and direct-TX arms stay in the cascade; the one extracted arm — Vec-copy fallback — allocates by definition. NAT64's per-packet `Vec` untouched and accepted.)* |
+| **Single-recycle invariant** | #2208/#4041 | **Untouched under B′** — no ingress descriptor or TX frame is recycled anywhere in `queue_service`'s waterfill selector. *(Deferred Increment 1: all 8 `recycle_ingress_frame` sites are in the prologue/epilogue, outside the extracted region (§1b); the region contains zero executable `continue`/`return`, and the one `break` at :661 stays inside it; `free_tx_frames.push_front` in the direct-TX arm — the #4041 double-recycle — is likewise untouched.)* |
 | **CoS guarantee-guard (shaped-class-held-under-BE-flood, #4246 class)** | issue | The waterfill split threads a single `&mut CoSInterfaceRuntime` through refill → phase1 → phase2 in the original order. No state is copied, snapshotted, or reordered. The #1743-r3 refill ordering is kept as one atomic block (§1a). Bound by the 18 unchanged waterfill tests. |
 | **`trigger_kernel_arp_probe` allocation-freedom** | issue | **Out of scope** — it is not in either target function (grep: not in `dispatch/mod.rs` nor `queue_service/mod.rs`). Stated so the reviewer does not assume silent coverage; if the leader wants it re-verified that is a separate, cheap check. |
-| **NAT64 drop attribution (#5625 ext-header, #2562 fragment)** | code | *Improved*: today it exists in two copies (:942–954 and :1264–1276); Increment 1 gives it one owner. |
+| **NAT64 drop attribution (#5625 ext-header, #2562 fragment)** | code | **Unchanged under B′** — it stays in two copies (:942–954 and :1264–1276). Fixing that was Increment 1's whole value, and it is deferred. Recorded as a *known, un-remediated* duplication hazard, not as a win this plan delivers. |
 
 ---
 
@@ -378,7 +486,16 @@ machine (epoch refill, honored-bitset persistence, phase2-cursor continuity,
 Scoring: **Value** = LOC removed from the god-function + defect-class reduction.
 **Risk** = probability of a behavioural or codegen regression that the gates miss.
 
-### Option A — De-duplicate the copy-fallback only (Increment 1)
+### Option A — De-duplicate the copy-fallback only (Increment 1) — **DEFERRED in r3**
+
+**Disposition: deferred, NOT rejected.** Codex: *"The de-dup is safe, but its
+benefit is not strong enough to override the current hottest-path churn and
+validation gaps."* The blocking condition is concrete and satisfiable — the
+cp1/cp2 and NAT64-attribution coverage in §7.2's mutation grid must be
+demonstrated to exist (or be added) **before** this increment is dispatched, not
+asserted from the fact that `tests/enqueue_failure.rs:180` names the cp2 path.
+The evidence below is preserved verbatim so whoever picks it up does not
+re-derive it.
 
 Extract :819–956 / :1155–1279 into one `#[inline(always)] fn
 enqueue_copy_fallback_frame(...) -> (bool /*build_failed*/, bool /*fallback*/)`
@@ -389,10 +506,13 @@ in the same module.
   `enqueue_pending_forwards` 1074 → **~840** LOC; the *file* 1608 → **~1524**
   (the ~150-line helper stays in it). (SMR F3 — r1 quoted ~940, which was
   simply wrong.)
-- Removes a **proven 102-normalised-line duplication** and gives the NAT64
+- Removes a **proven 100-of-102-line duplication** and gives the NAT64
   attribution one owner
 - No control-flow change; both call sites already set the same two flags
-- Already covered by `tests/enqueue_failure.rs` (which explicitly drives cp2)
+- `tests/enqueue_failure.rs:180` states it drives the cp2 copy fallback — but
+  r3 treats that as a *claim to verify*, not coverage. Codex's blocking
+  condition is exactly this: the cp1/cp2 and NAT64-attribution cells of §7.2's
+  grid must be **demonstrated**, and any missing cell added, before dispatch.
 - **Caveat (SMR F4):** the helper needs ~11 parameters (`target_binding`,
   `source_frame`, `request`, `expected_ports`, `is_nat64`, `&mut flow_key`,
   `dbg`, `counters`, `recent_exceptions`, `ingress_ident`, `forwarding`) —
@@ -404,20 +524,32 @@ in the same module.
 
 **Value 7 / Risk 2.** Best value-per-risk in the set.
 
-### Option B — A + waterfill 3-way phase split (Increments 1 + 3) ← **RECOMMENDED**
+### Option B — A + waterfill 3-way phase split (Increments 1 + 3) — **superseded by B′**
 
-Adds: `refill_waterfill_epoch` (74) + `waterfill_phase1_select` (181) +
+r2's recommendation. Blocked by Codex on its Option-A half only; the waterfill
+half survived review intact. Retained here for the scoring comparison.
+
+### Option B′ — waterfill 3-way phase split ONLY (Increments 3a + 3b) ← **RECOMMENDED (r3)**
+
+`refill_waterfill_epoch` (74) + `waterfill_phase1_select` (181) +
 `waterfill_phase2_select` (108), all `#[inline(always)]`, same module, with a
-~30-LOC orchestrator.
+~30-LOC orchestrator. **Touches `cos/queue_service/mod.rs` only — the TX
+hot-path file is not opened at all**, which is what retires the
+"hottest-path churn" objection rather than arguing with it.
 
 - waterfill 432 → **~30** LOC orchestrator + three named, individually
   reviewable phases
 - `queue_service/mod.rs` stays ~2166 LOC (a split does not shrink a file) — the
   win is the *function*, not the file. Stated honestly.
-- **Zero test edits**; 18 existing tests are the RED-on-revert gate
+- **Zero test edits**; 18 existing tests + `tests/refund.rs` bind the fairness
+  state machine, and every one calls through the wrapper
 - Exact `Option`-encoded control-flow correspondence (§1a)
+- Codex, on r2: *"I would not kill the waterfill split. Its refill, Phase 1, and
+  Phase 2 boundaries are real state-machine boundaries, and its value survives
+  this review."*
 
-**Value 9 / Risk 3.**
+**Value 8 / Risk 3.** (Down from B's 9 because the dispatch de-dup's
+defect-class win is deferred out — the risk is unchanged.)
 
 ### Option C — B + hoist the whole build region :589–1295 into one helper (Increment 2b)
 
@@ -461,28 +593,25 @@ adding more does not address the modularity defect the issue filed.
 
 ---
 
-## 6. Recommended increment sequence (Option B)
+## 6. Recommended increment sequence (Option B′)
 
-Each increment is a separate commit; the PR is one branch.
+Two commits, one branch, **one file** (`cos/queue_service/mod.rs`).
 
-1. **Increment 1 — `enqueue_copy_fallback_frame`.** Extract the duplicated
-   Vec-copy fallback. Body byte-identical to :819–956 modulo the `cp1_len` →
-   `cp_len` rename; both call sites replaced by one call. `#[inline(always)]`,
-   same module. Verify with `git diff --color-moved=dimmed-zebra`.
-   **Checklist item (SMR F7):** arm D carries 37 comment lines and arm E 23;
-   the *code* is identical but the rationales are phrased for different callers
-   (in-place-`None` vs direct-TX-unavailable). The merged helper must carry
-   **both** rationales, not whichever copy the engineer's editor had open.
-2. **Increment 3a — `refill_waterfill_epoch`.** One block, unsplit (§1a hazard).
-3. **Increment 3b — `waterfill_phase1_select` + `waterfill_phase2_select`.**
+1. **Increment 3a — `refill_waterfill_epoch`.** One block, unsplit (§1a
+   ordering hazard: the `waterfill_epochs` bump / `epoch_boundary`-gated bitset
+   clear / `epoch_wrap_pending = false` order is the #1743-r3 livelock fix).
+2. **Increment 3b — `waterfill_phase1_select` + `waterfill_phase2_select`.**
    Both return `Option<ExactCoSQueueSelection>`; the wrap tail stays in the
    orchestrator.
 
-Deliberately **not** sequenced: Options C, C′, D.
+**Deferred, with evidence preserved (§5-A):** Increment 1, the dispatch de-dup.
+Its release condition is the §7.2 grid's cp1/cp2 + NAT64-attribution cells
+being demonstrated to bind. **Not** sequenced: Options C, C′, D.
 
-Sequencing note: this touches `tx/dispatch/mod.rs` and
-`cos/queue_service/mod.rs`. Check for in-flight PRs against either file before
-dispatch (`feedback_screen_for_contradicting_in_flight_pr`).
+Sequencing note: Option B′ touches **only** `cos/queue_service/mod.rs` — check
+for in-flight PRs against that file before dispatch
+(`feedback_screen_for_contradicting_in_flight_pr`). `tx/dispatch/mod.rs` is not
+opened, so the TX-side collision surface is zero.
 
 ---
 
@@ -513,16 +642,27 @@ dispatch (`feedback_screen_for_contradicting_in_flight_pr`).
    mutations minimum per helper, because one fixture binds one match arm
    (`feedback_one_fixture_binds_one_match_arm`):
 
+   **In scope for Option B′:**
+
+   | Helper | Mutation | Must fail |
+   |---|---|---|
+   | `refill_waterfill_epoch` | remove the `epoch_boundary` gate on the bitset clear | the #1743-r3 livelock test |
+   | `refill_waterfill_epoch` | reset `waterfill_phase2_cursor` in the refill | the #1630-r4 cursor-continuity test |
+   | `waterfill_phase1_select` | drop the honored-bit set | the #1732 at-most-once-per-epoch test |
+   | `waterfill_phase1_select` | charge `send_budget` instead of `phase1_cost` | the #1743-Hunk-B stable-quantum test |
+   | `waterfill_phase2_select` | ignore the honored bitset | the descending-residual test |
+   | `waterfill_phase2_select` | reset the cursor to 0 on each entry | the #1630-r4 continuity test (a *distinct* assertion from the refill cell above) |
+
+   **Deferred with Increment 1 — this grid IS Codex's release condition for the
+   de-dup** (§5-A). Each cell must be demonstrated, and any cell with no named
+   failing test must be *added* before that increment is dispatched:
+
    | Helper | Mutation | Must fail |
    |---|---|---|
    | `enqueue_copy_fallback_frame` | delete the `nat64_exthdr_ineligible` attribution | the #5625 ext-header counter assertion |
    | `enqueue_copy_fallback_frame` | delete the `nat64_frag_dropped` attribution | a *distinct* named assertion (the #2562 arm — separate `else if` branch) |
    | `enqueue_copy_fallback_frame` | invert `copy_frame_is_oversized` | the #2208 oversized drop-and-recycle assertion |
    | `enqueue_copy_fallback_frame` | drop `fallback_to_slow_path = true` on enqueue-`Err` | the #2208 slow-path-reinject assertion |
-   | `refill_waterfill_epoch` | remove the `epoch_boundary` gate on the bitset clear | the #1743-r3 livelock test |
-   | `refill_waterfill_epoch` | reset `waterfill_phase2_cursor` in the refill | the #1630-r4 cursor-continuity test |
-   | `waterfill_phase1_select` | drop the honored-bit set | the #1732 at-most-once-per-epoch test |
-   | `waterfill_phase2_select` | ignore the honored bitset | the descending-residual test |
 
    A helper for which **no** mutation produces a named failure is a helper whose
    contents are unbound. That must be **reported in the PR body**, not papered
@@ -535,14 +675,18 @@ dispatch (`feedback_screen_for_contradicting_in_flight_pr`).
    increments — so a reader can tell the grid measures the code rather than
    reporting "everything fails".
 
-3. **Codegen gate, both halves:**
+3. **Codegen gate.** For Option B′ the CoS half is the one that matters; the
+   dispatch edge set is a *control* (Option B′ does not open that file, so it
+   must be bit-identical — a change there means something unexpected happened).
    - `nm` — `select_exact_cos_guarantee_queue_waterfill` and its three new
      helpers **absent**;
      `service_exact_guarantee_queue_direct_with_info` size within ±2% of
      24,987 B.
-   - `objdump` — the **49 normalised call edges** out of
-     `enqueue_pending_forwards` are unchanged, using the §2c command verbatim
-     (dynamic address + both `sed` normalisations).
+   - `objdump` — **Tier 1**: the **51 raw call edges** out of
+     `enqueue_pending_forwards` match `callgraph-baseline-dd23119aa.txt`
+     byte-for-byte, using the §2c command verbatim (dynamic address, **no**
+     normalisation). Any non-empty diff goes to the §2c-bis Tier-2 classifier
+     and is written up; it is never auto-passed.
 4. **Negative control (§2e)** — recorded evidence that flipping one helper to
    `#[inline(never)]` makes gate 3 **fail**, then reverted.
 5. **Throughput smoke** — `make cluster-deploy` + sustained v4 **and** v6 iperf3
@@ -557,51 +701,92 @@ dispatch (`feedback_screen_for_contradicting_in_flight_pr`).
 
 | Class | Level | Rationale |
 |---|---|---|
-| Behavioural regression — dispatch | **LOW** | Increment 1 is a de-dup of two byte-identical blocks with no control-flow change; 4-value export set verified; all 8 recycle sites outside the extraction; ~40 existing direct-drive tests. |
+| Behavioural regression — dispatch | **N/A under B′** | Increment 1 is deferred; `tx/dispatch/mod.rs` is not opened. (Were it taken: LOW — a de-dup of two blocks agreeing on 100 of 102 lines, no control-flow change, 4-value export set verified, all 8 recycle sites outside the extraction — but gated on the §7.2 deferred grid, which is Codex's blocking condition.) |
 | Behavioural regression — waterfill | **LOW-MED** | Fairness invariants are dense (#1743/#1732/#1630/#1628), but all state is on `root` and threaded in original order; refill kept atomic; 18 unchanged tests bind it. MED not LOW because the invariants are subtle enough that a reviewer must actually re-derive the `Option` correspondence rather than trust §1a. |
-| Codegen regression | **LOW-MED** | Same-module only (no CGU migration); `#[inline(always)]` throughout; no coldness claim anywhere; executable `nm` + `objdump` gate with a proven-to-fire negative control. Residual: register allocation / stack frame may shift even with inlining preserved — covered only by the smoke leg. |
+| Codegen regression | **LOW-MED** | Same-module only (no CGU migration); `#[inline(always)]` throughout; no coldness claim anywhere; executable `nm` + `objdump` gate with a proven-to-fire negative control, plus two firsthand stability probes (§2c-bis) showing the raw edge set unmoved by an in-file item move. Residual: register allocation / stack frame may shift even with inlining preserved — covered only by the smoke leg. |
 | Scope mismatch with #4404 kill | **LOW** | §1c rejects the arm-decomposition shape explicitly; §2c retires the "no executable gate" objection with the #6386/PR-6392 methodology. |
-| "Refactor does not reach the threshold" | **ACKNOWLEDGED** | After Option B, `enqueue_pending_forwards` is still ~840 LOC and `queue_service/mod.rs` is still ~2166 LOC. Neither crosses a threshold. §9. |
-| Gate is unsatisfiable / gate cries wolf | **CLOSED in r2** | r1 shipped both defects: an unsatisfiable parent-RED (SMR F1) and a call-edge command with up to 5 false failures (SMR F2). Both replaced with verified-executable gates (§7.2, §2c). Listed here because "the plan's own gate was broken" is exactly the class a reviewer should assume is still present. |
+| "Refactor does not reach the threshold" | **ACKNOWLEDGED** | B′ does not reduce `enqueue_pending_forwards` at all (stays 1074) and `queue_service/mod.rs` stays ~2166. Only the *function* shrinks, 432 → ~30. §9. |
+| **Gate defect (any kind)** | **HIGH — the live risk in this plan** | Three rounds, three gate defects, zero refactor-design defects. See §8a; this is now the dominant risk class and the main argument for shipping small. |
 
 ---
 
+## 8a. Three rounds, three gate defects, zero refactor defects
+
+Worth stating plainly because it is the strongest argument in this document,
+and it argues for a *smaller* increment rather than a bolder one.
+
+| Round | Defect | Class | Would it have shipped a wrong binary? |
+|---|---|---|---|
+| r1 → r2 | parent-RED demanded for a behaviour-preserving refactor — **unsatisfiable** | gate | No — it would have blocked a correct refactor, or pushed an engineer to fake a RED |
+| r1 → r2 | call-edge command missing the `.llvm.<N>` strip — **up to 5 false failures** on a pure-motion diff | gate | No — but it teaches the reader to hand-wave the gate, which is worse |
+| r2 → r3 | inherited Rust-hash strip **collapses 3 `VecDeque::grow` instantiations to 1** — blind to an instantiation swap | gate | **Yes** — this one is a false *negative*. It would have passed a real change |
+| any | a defect in the decomposition design itself | — | **None found in three rounds**, by me or by Codex |
+
+Two things follow.
+
+**The gate is the fragile artifact, not the refactor.** The escape-free interior
+(§1b), the four-value export set, the `Option` control-flow correspondence
+(§1a) and the `root`-only state ownership have all survived adversarial review
+unchanged across three rounds and two reviewers. Every correction has landed on
+the *instrument*, not the thing being measured. A plan whose measuring apparatus
+has been wrong three times running should not be asked to carry a large change.
+
+**Each fix has landed one rule away from the next defect.** r2 fixed the
+`.llvm.` noise and inherited a blind spot in the adjacent rule; that is the
+literal shape of this failure mode. r3's response is to stop normalising in the
+primary key at all (§2c-bis Tier 1) — the sensitivity default — and push all
+tolerance into an explicit, reviewer-signed classifier rather than a silent
+`sed`. The correction to make next round is therefore most likely in the Tier-2
+classifier, and a reviewer should look there first.
+
+This is also why §7.2(c)'s negative control is not ceremony: the first attempt
+at r3's own proof used an uppercase synthetic hash that the strip regex never
+matched, and *appeared* to vindicate the r2 rule. A demonstration that cannot
+fail proves nothing, and this document has now produced one.
+
 ## 9. The honest limitation
 
-**Option B does not make #4408 "done" by any LOC threshold.** After it,
-`enqueue_pending_forwards` is ~840 LOC — still more than eight times the
-`docs/engineering-style.md` god-function line. The plan's claim is narrower and,
-I think, more defensible:
+**Option B′ addresses one of #4408's two targets and leaves the other
+untouched.** `enqueue_pending_forwards` stays at **1074 LOC** — the plan no
+longer proposes to reduce it at all in this pass. What B′ claims is narrower and
+fully supported:
 
-- the **waterfill half is genuinely finished** (432 → ~30 orchestrator + three
-  named phases), and
-- the **dispatch half gets its one provable defect-class win** (a 102-line
-  duplication with a two-copy NAT64 drop-attribution hazard), after which the
-  residual joins #4404's *irreducible per-packet dispatch core* class.
+- the **waterfill half is genuinely finished** — 432 → a ~30-LOC orchestrator
+  plus three named, individually reviewable phases, with zero test edits and 18
+  existing tests holding the fairness invariants;
+- the **dispatch half is deferred with its analysis banked** (§5-A): a proven
+  100-of-102-line duplication carrying the NAT64 drop attribution in two copies,
+  an escape-free interior, and a four-value export set. None of that has to be
+  re-derived by whoever picks it up.
 
-The right disposition is therefore to ship Option B and then **re-scope #4408**:
-close the waterfill half, and either close the dispatch half into the #4404
-irreducible-core class or leave a narrowly-worded successor issue. Leaving
-#4408 open indefinitely against a target that will never reach a threshold is
-the outcome to avoid.
+`cos/queue_service/mod.rs` also stays at ~2166 LOC — splitting a function does
+not shrink a file. The win is the *function*, not the file, and #4408's file
+threshold is not met by this plan either.
 
-If the leader's judgement is that a ~840-LOC residual makes the whole exercise
-not worth the churn, **Increment 3 alone (waterfill) is still worth shipping**
-and is the cleanest single deliverable in this plan.
+**Disposition on merge:** re-scope #4408. Close the waterfill half with
+evidence; keep the dispatch half open as a narrowly-worded successor whose
+release condition is the §7.2 deferred grid — or fold it into #4404's
+irreducible-core class if the coverage turns out not to exist. Leaving #4408
+open indefinitely against a target this plan no longer proposes to touch is the
+outcome to avoid.
 
-The SMR pass is candid about where Increment 1 is weakest: its value rests on a
-**maintenance** argument (one owner for the NAT64 attribution) rather than a
-measurable one. That argument is real — #5625 and #2562 each had to edit two
-copies — but a reviewer who weighs churn-in-the-hottest-TX-function above
-duplication-risk could reasonably land on "not worth it", and that reviewer
-would not be wrong. Increment 3 has no such weakness.
+**Where this plan is weakest.** Increment 1's value always rested on a
+*maintenance* argument (one owner for the NAT64 attribution) rather than a
+measurable one. Codex weighed that against hottest-path churn and unverified
+coverage and came down against it; my own r1 SMR had already flagged the same
+weakness unprompted. Two independent passes landing on the same line is the
+reason r3 defers rather than argues. The waterfill split has no equivalent
+weakness — and if even it is judged not worth the churn, the correct outcome is
+PLAN-KILL of #4408 in full, not a smaller compromise.
 
 ---
 
 ## 10. Files
 
-- `userspace-dp/src/afxdp/tx/dispatch/mod.rs` — Increment 1
-- `userspace-dp/src/afxdp/cos/queue_service/mod.rs` — Increments 3a/3b
+- `userspace-dp/src/afxdp/cos/queue_service/mod.rs` — Increments 3a/3b. **The
+  only production file Option B′ opens.**
+- `userspace-dp/src/afxdp/tx/dispatch/mod.rs` — **not touched** by B′
+  (Increment 1 deferred). Its call-edge set is a *control* in §7.3.
 - `docs/` — no module-doc change identified: neither
   `pkg/dataplane/README.md` nor `docs/fairness-regimes.md` describes these
   functions' internal structure, and no documented behaviour changes. Per
@@ -610,8 +795,14 @@ would not be wrong. Increment 3 has no such weakness.
 
 ## 11. Open questions for the leader
 
-1. Take Option C′ (segmentation hoist, 940 → ~824) or not? Scored 4/3 — a
-   genuine call, not a recommendation.
-2. On merge, re-scope #4408 per §9 — close-with-evidence on the waterfill half,
-   and decide whether the dispatch residual becomes a successor issue or folds
-   into #4404's irreducible-core class.
+1. **Does the deferred dispatch de-dup get a successor issue, or fold into
+   #4404's irreducible-core class?** §9 recommends a successor whose release
+   condition is the §7.2 deferred grid, but this is a scoping call, not a
+   technical one.
+2. **Option C′ (segmentation hoist) is now moot under B′** — it is a
+   `tx/dispatch/mod.rs` change and B′ does not open that file. It rides with
+   Increment 1 whenever that is un-deferred, or it is dropped. No action needed
+   unless the leader wants it revived on its own.
+3. Tier-2 of the §2c-bis classifier is the least-exercised part of this gate —
+   it has a synthetic proof and a negative control, but no real failure has ever
+   run through it. §8a argues that is where the next defect most likely lives.
