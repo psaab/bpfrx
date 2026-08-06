@@ -212,8 +212,10 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 const vrfOverlapStatusTail = "colliding 5-tuples may cross-forward. " +
 	"See #2387 for the status of this limitation"
 
-// vrfOverlapForwardLookingTokens are the wordings that turn the advisory from a
-// statement of the CURRENT limitation into a promise about a future one. #2387
+// vrfOverlapForwardLookingTokens are SPELLINGS that commonly appear when an
+// advisory stops stating the CURRENT limitation and starts promising a future
+// one. They are not themselves promises, and the check that uses them cannot
+// tell the difference — see the both-directions note below. #2387
 // is held on a maintainer risk-appetite call: neither candidate end-state (the
 // hard-reject posture, or the VRF-aware session key) is decided, so the warning
 // must not assert that either one arrives. The original text said colliding
@@ -232,6 +234,22 @@ const vrfOverlapStatusTail = "colliding 5-tuples may cross-forward. " +
 // documents. The entries below the first group were each added after a review
 // demonstrated it passing the test while reintroducing a promise, so treat any
 // addition the same way: prove it green first, then add it.
+//
+// It is WRONG IN BOTH DIRECTIONS, and the second direction is easy to miss.
+// These are substring matches, so a hit proves a spelling APPEARS — never that
+// the sentence containing it forecasts anything. Eight accurate, deliberately
+// non-forecasting sentences were measured tripping this list: "#2387 leaves
+// both future end-states open" (via "future"), "the #2387 roadmap records no
+// selected end-state" (via "roadmap"), "operators must never infer either
+// end-state from this warning" (via "never"), and five more. Every one of them
+// is exactly the neutrality the contract asks for, and every one is rejected.
+//
+// That direction is fail-SAFE — it blocks correct text rather than admitting
+// wrong text — but it is not free: the pressure it puts on an author is toward
+// vaguer operator wording, which costs the diagnostic the substance
+// TestVRFOverlapWarningKeepsDiagnosticSubstance exists to protect. If you hit a
+// false red, reword around the spelling. Do not carve an exception into the
+// list, and do not water down the message to get past it.
 //
 // Adding a whole DIRECTION is a different act from growing this list, and
 // vrfOverlapForeclosingTokens below is that: not one more spelling of a covered
@@ -282,8 +300,11 @@ var vrfOverlapForwardLookingTokens = []string{
 	"tracked for",
 }
 
-// vrfOverlapForeclosingTokens are the mirror image: wordings that rule a fix
-// OUT. The contract on validateVRFOverlap is symmetric — the text "must not
+// vrfOverlapForeclosingTokens are the mirror image: spellings that commonly
+// appear when a text rules a fix OUT. The same both-directions caveat applies —
+// a hit proves the spelling is present, not that an outcome was foreclosed;
+// "operators must never infer either end-state from this warning" trips "never"
+// while foreclosing nothing. The contract on validateVRFOverlap is symmetric — the text "must not
 // promise a fix, nor rule one out" — because #2387 is held on a maintainer
 // risk-appetite call whose two candidate end-states are BOTH still open. A
 // warning saying the collision is permanent and by design is exactly as wrong as
@@ -392,13 +413,21 @@ func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 			verb   string
 			tokens []string
 		}{
-			{"promises a fix", vrfOverlapForwardLookingTokens},
-			{"rules a fix OUT", vrfOverlapForeclosingTokens},
+			{"forward-looking", vrfOverlapForwardLookingTokens},
+			{"foreclosing", vrfOverlapForeclosingTokens},
 		} {
 			for _, tok := range grp.tokens {
 				if strings.Contains(lower, tok) {
-					t.Errorf("%s form %s via %q; #2387 is an open decision, so the warning must state the "+
-						"limitation and point at the issue without forecasting EITHER outcome: %s",
+					// Report the SPELLING, not a verdict about meaning. This is a
+					// substring test: a hit proves %q appears, NOT that the sentence
+					// containing it forecasts anything. Accurate neutral prose can
+					// trip it — "#2387 leaves both future end-states open" is caught
+					// by "future" while forecasting nothing. Saying "this promises a
+					// fix" would be a claim the check cannot support.
+					t.Errorf("%s form contains the %s spelling %q. #2387 is an open decision, so the "+
+						"warning must state the limitation and point at the issue without forecasting "+
+						"either outcome. If this text IS neutral, reword to avoid the spelling — do not "+
+						"add an exception to the list: %s",
 						tc.form, grp.verb, tok, tc.warn)
 				}
 			}
