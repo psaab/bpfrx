@@ -68224,3 +68224,52 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
+  and blocked on #5480. Seven review rounds established that the fence keys on
+  `syncConnID`, a total ORDER over connections, when the predicate it needs is
+  an EQUIVALENCE ("same peer boot?"), because config generations are comparable
+  only within one sender incarnation. A ranking cannot express an equivalence,
+  so the floor has no correct setting: never descending locks out a live
+  same-incarnation sibling that merely connected earlier, and descending
+  re-admits departed older-incarnation connections and makes the floor a mutable
+  target an in-flight `resetRecvGen` can reclaim. The decisive finding is that
+  the fence's drop is a `continue` that skips the generation gate, so a dropped
+  payload's generation never enters the high-water and HEAD ended up applying a
+  stale payload `origin/master` REFUSES; closing that means recording the
+  dropped generation, which is a pre-reboot (higher) value and wedges the
+  standby permanently. One scalar high-water cannot serve two incarnations.
+  What ships instead is the one defect that is real on master with or without
+  the fence: the reconnect RESET of the config-generation marks was not atomic
+  against their ADVANCE. Both marks are advanced by a load/compare/store and
+  cleared to 0 by `resetRecvGen` from a DIFFERENT goroutine — the clear runs on
+  a receive loop, the applied mark advances on `configApplyLoop`, and the
+  received mark advances on a receive loop of which there are TWO. A clear
+  landing inside an advance was LOST and the store re-raised the mark it had
+  just zeroed, leaving a pre-reboot generation that refuses every generation the
+  reconnected peer can produce — silently, permanently, since the marks are
+  monotone-max. New `configGenMu` covers the reset and all four advance sites;
+  readers stay lock-free. Two false contracts corrected at their sites
+  ("called ONLY from the single-consumer configApplyLoop" ignored the clear;
+  "the receiveLoop is single-threaded per connection" is true per connection but
+  there are two of them).
+- **Validation**: 2x2 mutation grid, disjoint cells. M1 (remove `configGenMu`
+  from the advances and the reset) REDs both binders as ASSERTIONS —
+  "the reconnect reset was LOST: the applied config high-water is 1800000000123
+  (the peer's PRE-REBOOT generation) instead of 0.
+  reset_completed_inside_the_advance_window=true" and the received-mark twin —
+  and leaves `TestConfigGenAdvanceStaysMonotone` GREEN. M2 (drop the
+  `gen > current` comparison for a bare Store) REDs only the monotone guard,
+  both subtests ("the applied high-water must never regress: publishing
+  12000000456 after 1800000000123 pulled it down to 12000000456"), and leaves
+  both binders GREEN. Each monotone subtest carries a negative control (a
+  strictly higher generation must still advance), so the assertion pins
+  regression rather than "never moves". `go build ./...` 0,
+  `go vet ./pkg/cluster ./pkg/daemon` 0,
+  `go test ./pkg/cluster ./pkg/daemon -count=1 -race` 0,
+  `go test ./pkg/cluster -run <5084 cohort> -count=5 -race` 0.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go,
+  pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/sync_config_gen_reset_race_5084_test.go,
+  pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
