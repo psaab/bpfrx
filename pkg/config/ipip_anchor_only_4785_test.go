@@ -199,3 +199,140 @@ func TestIpipEmittedUnitIsNotDoubleReported_4785(t *testing.T) {
 			warns)
 	}
 }
+
+// #6861 F1: the COMPLETE-but-unemitted fallback was shared between the
+// interface and unit call sites, so a unit record was reported with the
+// interface record's cause and remediation.
+//
+// The interface-level `tunnel mode wireguard` stanza short-circuits the
+// emitter to ONE endpoint keyed by the lowest unit (#1910) and never visits
+// the per-unit records, while collectAppliedTunnels applies EVERY non-nil
+// unit.Tunnel with no screen at all — so a unit overriding to `mode ipip`
+// with both endpoints set is complete, unemitted, and still gets a kernel
+// anchor. It used to be told "no tunnel endpoint is emitted for the
+// interface-level stanza (every unit overrides it)", which named a unit and
+// then explained the interface, inverted the direction of the suppression, and
+// pointed remediation at a stanza that is not the one to touch first.
+//
+// TestIpipOverriddenAnchorKeepsTheOverrideCause_4785 above is the reason this
+// went unnoticed: it drives the INTERFACE branch, where that same default text
+// is CORRECT. It stays green under the revert; this one does not.
+func TestIpipUnitUnderWireguardNamesTheSlotCause_6861(t *testing.T) {
+	// Fixture producibility: a WireGuard stanza only compiles with a
+	// listen-port, a decodable private key, and at least one peer. The
+	// endpoint-bearing unit is a genuine override — both halves set — so
+	// ipipMissingEndpointHalves returns "" and the COMPLETE fallback is what
+	// renders. `tunnel wireguard listen-port` is the real syntax; a bare
+	// `tunnel listen-port` parses into a leaf nothing reads and would leave
+	// the fixture unable to compile.
+	cfg, err := CompileConfig(ipipTree(t,
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key "+
+			"1111111111111111111111111111111111111111111111111111111111111111",
+		"set interfaces wg0 tunnel wireguard peer "+
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "+
+			"allowed-ips 10.0.0.0/24",
+		"set interfaces wg0 unit 3 tunnel mode ipip",
+		"set interfaces wg0 unit 3 tunnel source 10.0.0.1",
+		"set interfaces wg0 unit 3 tunnel destination 10.0.0.2",
+	))
+	if err != nil {
+		t.Fatalf("compile must SUCCEED — the ipip unit emits nothing, so the strict "+
+			"gate is silent for it by design: %v", err)
+	}
+
+	// PRECONDITION, so a fixture that drifts into some other shape fails loudly
+	// instead of passing for the wrong reason. Exactly one endpoint is emitted,
+	// it is the interface-level WireGuard object keyed by the lowest unit, and
+	// the unit's own ipip endpoint is NOT among them.
+	eps := EmitTunnelEndpointNames(cfg)
+	if len(eps) != 1 || eps[0].Name != "wg0.3" || eps[0].Tunnel.Mode != "wireguard" {
+		t.Fatalf("fixture must emit exactly the interface-level WireGuard endpoint "+
+			"keyed by the lowest unit; the unit's ipip endpoint being emitted would "+
+			"make this the strict gate's subject, not the advisory's. got %d: %+v",
+			len(eps), eps)
+	}
+	unit := cfg.Interfaces.Interfaces["wg0"].Units[3]
+	if unit == nil || unit.Tunnel == nil || unit.Tunnel.Mode != "ipip" ||
+		unit.Tunnel.Source == "" || unit.Tunnel.Destination == "" {
+		t.Fatalf("fixture must leave unit 3 carrying a COMPLETE ipip override — an "+
+			"incomplete one takes the missing-halves branch and this test would be "+
+			"measuring the wrong arm: %+v", unit)
+	}
+
+	// Drive the REAL alarm entry point, not ipipAnchorOnlyWarnings, so the
+	// ValidateConfig wiring is bound too.
+	var warns []string
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "ipip") {
+			warns = append(warns, w)
+		}
+	}
+	if len(warns) != 1 {
+		t.Fatalf("expected exactly 1 ipip advisory for the anchor-only unit, got %d: %v",
+			len(warns), warns)
+	}
+	got := warns[0]
+
+	if !strings.Contains(got, `unit 3`) {
+		t.Errorf("the advisory does not name the unit it is about: %q", got)
+	}
+	// The three ways the shared interface text was wrong here.
+	if strings.Contains(got, "every unit overrides it") {
+		t.Errorf("a UNIT record was given the INTERFACE record's cause: the "+
+			"interface-level stanza suppressed this unit, not the units overriding "+
+			"the interface — the direction is inverted (#6861 F1): %q", got)
+	}
+	if !strings.Contains(got, "interface-level `tunnel mode wireguard` stanza takes the") {
+		t.Errorf("the advisory does not name the interface-level WireGuard stanza "+
+			"that took the interface's single endpoint slot, which is the ACTUAL "+
+			"reason this complete unit endpoint went unemitted (#6861 F1): %q", got)
+	}
+	if !strings.Contains(got, "Remove this unit's `tunnel` stanza") {
+		t.Errorf("the advisory does not offer the remediation that actually drops "+
+			"this dead anchor (#6861 F1): %q", got)
+	}
+	// The advisory must still carry what it always did: the anchor device name
+	// and the #4785 reference.
+	if !strings.Contains(got, `"wg0u3"`) || !strings.Contains(got, "#4785") {
+		t.Errorf("the advisory lost the anchor device name or the issue "+
+			"reference: %q", got)
+	}
+}
+
+// TestIpipIncompleteUnitStillNamesTheMissingHalf_6861 pins the PRECEDENCE the
+// isUnit branch must not disturb. A unit record that is ALSO incomplete has two
+// true causes at once; the missing half is the one to report, because it keeps
+// the endpoint unemitted even if the interface-level stanza went away.
+//
+// Stays GREEN under the revert — the incomplete branch is unchanged by this
+// fold, and that is exactly what this asserts.
+func TestIpipIncompleteUnitStillNamesTheMissingHalf_6861(t *testing.T) {
+	cfg, err := CompileConfig(ipipTree(t,
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key "+
+			"1111111111111111111111111111111111111111111111111111111111111111",
+		"set interfaces wg0 tunnel wireguard peer "+
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "+
+			"allowed-ips 10.0.0.0/24",
+		"set interfaces wg0 unit 3 tunnel mode ipip",
+		"set interfaces wg0 unit 3 tunnel source 10.0.0.1",
+	))
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	warns := ipipAnchorOnlyWarnings(cfg)
+	if len(warns) != 1 {
+		t.Fatalf("expected exactly 1 anchor advisory, got %d: %v", len(warns), warns)
+	}
+	if !strings.Contains(warns[0], "no `tunnel destination` is configured") {
+		t.Errorf("an incomplete unit endpoint must still report the MISSING HALF, "+
+			"which outlives the slot cause: %q", warns[0])
+	}
+	if strings.Contains(warns[0], "takes the") {
+		t.Errorf("the slot cause displaced the missing-half cause; the incomplete "+
+			"check must stay FIRST: %q", warns[0])
+	}
+}

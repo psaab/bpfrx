@@ -161,7 +161,7 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 			// about.
 			t.Source != "" {
 			out = append(out, ipipAnchorOnlyText(
-				fmt.Sprintf("interfaces %q", name), t))
+				fmt.Sprintf("interfaces %q", name), t, false))
 		}
 
 		unitNums := make([]int, 0, len(iface.Units))
@@ -180,25 +180,54 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 				continue
 			}
 			out = append(out, ipipAnchorOnlyText(
-				fmt.Sprintf("interfaces %q unit %d", name, u), unit.Tunnel))
+				fmt.Sprintf("interfaces %q unit %d", name, u), unit.Tunnel, true))
 		}
 	}
 	return out
 }
 
 // ipipAnchorOnlyText renders one anchor-only advisory, naming the ACTUAL reason
-// the endpoint was not emitted.
+// the endpoint was not emitted. isUnit selects the fallback wording, and is
+// passed explicitly by the caller rather than sniffed out of `where` — the
+// prefix string is a display detail and must not become a control input.
 //
 // The earlier single-cause wording always said "every unit overrides it"
 // (#4785 fold F3). For a stanza the emitter suppressed because its endpoint is
-// incomplete — which is the ONLY way a unit record reaches here, and the way an
-// interface record with no units reaches it — that diagnosis is false, and the
-// per-unit remediation it implies is the wrong advice. Distinguish the two.
-func ipipAnchorOnlyText(where string, t *TunnelConfig) string {
+// incomplete that diagnosis is false, and the per-unit remediation it implies
+// is the wrong advice, so the incomplete cause is checked FIRST: it is shared
+// by both kinds of record and takes precedence for either, because an endpoint
+// missing a half stays unemitted even once any other suppressor is gone.
+//
+// The two COMPLETE-but-unemitted fallbacks are genuinely different causes, and
+// collapsing them into the interface wording was wrong three ways for a unit —
+// it named a unit and then explained the interface-level stanza, inverted the
+// direction (the interface-level stanza suppressed the unit, not the units
+// overriding the interface), and pointed remediation at the wrong stanza
+// (#6861 F1). Enumerated against the emitter, a COMPLETE record reaches here
+// only via:
+//
+//   - INTERFACE, with units: EmitTunnelEndpointNames walks the units and emits
+//     each unit's own TunnelConfig (#5635), so the interface-level object is
+//     never published. "every unit overrides it" is exactly right.
+//   - UNIT, under an interface-level `tunnel mode wireguard` stanza: that mode
+//     short-circuits to ONE endpoint keyed by the lowest unit (#1910,
+//     tunnelemit.go) and the per-unit records are never visited. With
+//     iface.Tunnel nil, or non-WireGuard, a complete unit record IS emitted and
+//     never reaches here — so WireGuard is the whole of this branch. If another
+//     mode ever gains a short-circuit, this wording needs revisiting with it.
+func ipipAnchorOnlyText(where string, t *TunnelConfig, isUnit bool) string {
 	cause := "no tunnel endpoint is emitted for the interface-level stanza " +
 		"(every unit overrides it)"
 	fix := "Remove the interface-level `tunnel` stanza if the per-unit tunnels " +
 		"are the intent."
+	if isUnit {
+		cause = "the interface-level `tunnel mode wireguard` stanza takes the " +
+			"interface's single tunnel endpoint, so this unit's own endpoint is " +
+			"never emitted even though it is fully configured"
+		fix = "Remove this unit's `tunnel` stanza to drop the dead anchor, or " +
+			"remove the interface-level `tunnel` stanza if the per-unit tunnels " +
+			"are the intent."
+	}
 	if missing := ipipMissingEndpointHalves(t); missing != "" {
 		cause = fmt.Sprintf("%s, so no tunnel endpoint is emitted", missing)
 		fix = "Configure both endpoints (and use `mode gre` or `mode wireguard` " +
@@ -220,7 +249,11 @@ func ipipAnchorOnlyText(where string, t *TunnelConfig) string {
 // "" is reachable for a record that is complete yet still unemitted — a unit
 // tunnel under an interface-level WireGuard stanza, where the emitter publishes
 // one endpoint keyed by the lowest unit and never visits the per-unit records.
-// The caller falls back to a neutral cause there rather than inventing one.
+// The caller's fallback there is NOT a neutral placeholder, and reading it as
+// one is what let a unit record be reported with the interface-level cause
+// (#6861 F1): "" means "complete, so some OTHER suppressor is responsible", and
+// which suppressor that is differs between an interface record and a unit one.
+// ipipAnchorOnlyText branches on isUnit to say which.
 func ipipMissingEndpointHalves(t *TunnelConfig) string {
 	switch {
 	case t.Source == "" && t.Destination == "":

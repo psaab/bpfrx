@@ -68948,3 +68948,83 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **NOT CHANGED**: registry order (first-failure-wins) and its comment, per the
   reviewer's judgement that it matches compileTreeStrict's existing
   return-on-first-error contract.
+
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the F1 gate finding on PR #6861. `ipipAnchorOnlyText`
+  (compiler_validate_strict_tunnel_ipip.go) has two call sites — an
+  interface-level one and a unit-level one — that SHARED the
+  complete-but-unemitted fallback text. For a unit that text is wrong three
+  ways: it names a unit and then explains the interface-level stanza, it
+  inverts the direction of the suppression (the interface-level stanza
+  suppressed the unit, not the units overriding the interface), and its
+  remediation points at the wrong stanza.
+  REACHABILITY, verified against the emitter rather than taken from the
+  finding: `EmitTunnelEndpointNames` short-circuits an interface-level
+  `tunnel mode wireguard` stanza to ONE endpoint keyed by the lowest unit
+  (#1910, tunnelemit.go) and never visits the per-unit records, while
+  `collectAppliedTunnels` (pkg/daemon/daemon_run_routehelpers.go) applies
+  EVERY non-nil `unit.Tunnel` with no completeness or mode screen. So a unit
+  overriding to `mode ipip` with BOTH endpoints set is complete, unemitted,
+  and still gets a real kernel anchor. Enumerated the other two shapes to
+  confirm this is the whole branch: with `iface.Tunnel == nil` every non-nil
+  unit tunnel goes through `add` and a complete one IS emitted; with a
+  non-WireGuard interface-level stanza the emitter walks the units and emits
+  each unit's own TunnelConfig (#5635). Neither reaches the fallback. That is
+  why the new text names WireGuard specifically instead of "a different mode".
+  Added an explicit `isUnit bool` parameter rather than sniffing the `where`
+  string — the prefix is a display detail and must not become a control
+  input. Kept the incomplete-endpoint check FIRST: that cause is shared, and
+  an endpoint missing a half stays unemitted even once the slot cause is gone.
+  Corrected two comments that were themselves the reason this went unnoticed:
+  `ipipAnchorOnlyText`'s claim that an incomplete endpoint is "the ONLY way a
+  unit record reaches here" (false — it is the finding), and
+  `ipipMissingEndpointHalves`'s description of the `""` fallback as "a neutral
+  cause" (it is not neutral; it is the interface-branch cause, and reading it
+  as neutral is what let a unit be reported with it).
+  RENDERED TEXT, unit branch. BEFORE: `interfaces "wg0" unit 3 tunnel mode
+  ipip: no tunnel endpoint is emitted for the interface-level stanza (every
+  unit overrides it), ... Remove the interface-level `tunnel` stanza if the
+  per-unit tunnels are the intent.` AFTER: `... the interface-level `tunnel
+  mode wireguard` stanza takes the interface's single tunnel endpoint, so this
+  unit's own endpoint is never emitted even though it is fully configured, ...
+  Remove this unit's `tunnel` stanza to drop the dead anchor, or remove the
+  interface-level `tunnel` stanza if the per-unit tunnels are the intent.`
+  The interface branch renders BYTE-IDENTICAL before and after.
+  TEST. `TestIpipUnitUnderWireguardNamesTheSlotCause_6861` builds the shape the
+  finding describes and drives `ValidateConfig`, the real alarm entry point, so
+  the wiring is bound and not just the renderer. It asserts a precondition
+  first — exactly one endpoint emitted, it is the interface-level WireGuard
+  object keyed by the lowest unit, and unit 3 still carries a COMPLETE ipip
+  override — so a fixture that drifts into the missing-halves arm fails loudly
+  instead of measuring the wrong branch. Fixture producibility was checked the
+  hard way: a WireGuard stanza needs `tunnel wireguard listen-port` (a bare
+  `tunnel listen-port` is not the syntax and parses into a leaf nothing reads —
+  the trap an earlier round already hit), a decodable 64-hex private key, and
+  at least one peer.
+  REVERT PROBE. Deleted ONLY the `isUnit` branch body, leaving the signature
+  and both call sites intact, inside a throwaway `git archive` extract; the
+  worktree tree hash was verified identical before and after. `go vet` under
+  the revert exits 0, so an unused PARAMETER (legal in Go) cannot masquerade as
+  a build break. The new test then fails on THREE assertions, not a compile
+  error: "a UNIT record was given the INTERFACE record's cause ... the
+  direction is inverted", "the advisory does not name the interface-level
+  WireGuard stanza that took the interface's single endpoint slot", and "the
+  advisory does not offer the remediation that actually drops this dead
+  anchor". Exit 1.
+  OVER-REACH CONTROLS, run under the SAME revert, whole `4785|6861` set: 1
+  FAIL / 7 PASS. `TestIpipOverriddenAnchorKeepsTheOverrideCause_4785` — the
+  interface branch, where the shared default text is CORRECT, and the reason
+  this defect survived — stays GREEN, so the interface wording did not move.
+  The new `TestIpipIncompleteUnitStillNamesTheMissingHalf_6861` also stays
+  GREEN under the revert: it pins the PRECEDENCE, asserting that a unit that is
+  both incomplete and slot-suppressed still reports the missing half.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/config` rc=0;
+  `go test ./pkg/config ./pkg/configstore ./pkg/daemon -count=1` rc=0;
+  `gofmt -l` clean on both touched files.
+  No doc change: the advisory text appears in no operator or module doc
+  (grep over docs/ outside the review/issue archives finds nothing), the alarm
+  is discovered through `show system alarms` rather than documented verbatim,
+  and no behaviour outside the rendered string changed — the set of records
+  that raise the advisory is identical.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
