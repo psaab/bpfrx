@@ -8,6 +8,23 @@ import (
 	"testing"
 )
 
+// activationTailIfaces extends debtTestIfaces() with a bond MEMBER, which the
+// activation tail must EXCLUDE from `networkctl reconfigure` (reconfiguring a
+// member can eject it from its bond; its Bond= directive is picked up by the
+// reload instead). The shared debtTestIfaces() fixture has only one managed,
+// non-member interface, which cannot distinguish an intact exclusion from a
+// deleted one — both yield the same one-element argv. Kept local to this file
+// so the reload-debt tests that share debtTestIfaces() are unaffected.
+func activationTailIfaces() []InterfaceConfig {
+	return append(debtTestIfaces(),
+		InterfaceConfig{
+			Name:       "lag0m",
+			MACAddress: "52:54:00:aa:bb:dd",
+			BondMaster: "ae0",
+		},
+	)
+}
+
 // rpFilterFixture points procSysNetRoot at a temp tree with the slow-path TUN's
 // rp_filter pre-set to networkd's post-reload default, and returns a reader for
 // it. restoreSlowPathRPFilter writes "0"; anything else means it never ran.
@@ -99,7 +116,7 @@ func TestApplyTailSurvivesExternalDebtDischarge_5718(t *testing.T) {
 	}
 	t.Cleanup(func() { runNetworkctl = orig })
 
-	ifaces := debtTestIfaces()
+	ifaces := activationTailIfaces()
 
 	// 1) Apply writes the files; its reload fails, so it returns early and
 	//    never reaches the tail.
@@ -129,12 +146,21 @@ func TestApplyTailSurvivesExternalDebtDischarge_5718(t *testing.T) {
 		t.Fatalf("Apply should succeed: %v", err)
 	}
 
-	// The tail must reconfigure the interface this Apply actually wrote a file
-	// for. debtTestIfaces() declares exactly one managed, non-bond-member
-	// interface, so the production argv is fully determined: ["reconfigure",
-	// "trust0"]. Spelled out rather than derived from the fixture — deriving
-	// the expectation from the same source the production code reads would
-	// make this assertion true by construction.
+	// The tail must reconfigure the interfaces this Apply actually wrote files
+	// for, and ONLY those. The fixture carries a bond MEMBER alongside the
+	// managed interface precisely so the exclusion at networkd.go:461 is load
+	// bearing here: `networkctl reconfigure` on a bond member can eject it from
+	// its bond, so the member must not appear. With a single-interface fixture
+	// this assertion could not tell an intact exclusion from a deleted one —
+	// dropping the check would have produced the same one-element argv, and an
+	// INVERTED predicate would have produced zero calls, which the old
+	// count-only assertion already caught. The member is what distinguishes
+	// them.
+	//
+	// Spelled out rather than derived — deriving it by filtering the fixture
+	// with the production predicate would be circular. (Hardcoding is not the
+	// only non-circular option; `[]string{"reconfigure", ifaces[0].Name}` would
+	// also work. It is simply the clearest.)
 	wantArgs := []string{"reconfigure", "trust0"}
 	if len(reconfigureArgs) != 1 || !slices.Equal(reconfigureArgs[0], wantArgs) {
 		t.Fatalf("the activation tail must run %v exactly once; got %v. An address "+
@@ -181,7 +207,7 @@ func TestApplyTailNotRepeatedOnceComplete_5718(t *testing.T) {
 	}
 	t.Cleanup(func() { runNetworkctl = orig })
 
-	ifaces := debtTestIfaces()
+	ifaces := activationTailIfaces()
 
 	// A clean first Apply completes its tail.
 	if err := m.Apply(ifaces); err != nil {

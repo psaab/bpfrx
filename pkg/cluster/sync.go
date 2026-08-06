@@ -328,7 +328,13 @@ type SessionSync struct {
 	// Residual, deliberately not closed here. This used to be described as a
 	// THIRD incarnation dialling into the slot that still held a stale
 	// connection — fold r4b's eviction made that shape unreachable, because no
-	// stale connection is left installed for a later incarnation to land on.
+	// RETIRED-STAMPED connection remains installed after a recognized
+	// supersession for a later incarnation to land on. (Precisely that: the
+	// accepted residual below can still leave a semantically dead connection
+	// installed carrying a falsely-CURRENT stamp, and a third incarnation can
+	// physically land on that corpse — but it is then classified as replacing a
+	// current connection, which advances the incarnation and evicts, so it does
+	// not reach the old no-advance outcome.)
 	//
 	// The residual that survives is narrower to state and wider in effect: a
 	// peer whose replacement enters through an EMPTY alternate slot is never

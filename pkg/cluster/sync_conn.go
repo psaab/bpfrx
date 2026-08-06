@@ -240,7 +240,7 @@ func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
 	// satisfy it today. installConn installs before it evicts, so keepIdx
 	// currently always names an occupied slot — but that is a call-site
 	// accident. A future caller passing an out-of-range keepIdx, or naming a
-	// slot it has not filled yet, would evict every OTHER slot and leave the
+	// slot it has not filled yet, could evict every OTHER slot and leave the
 	// registry empty. Neither guard would fire: the AST guard allowlists this
 	// function by NAME, and TestInstallConnNeverLeavesTheRegistryEmpty_5718
 	// drives the existing call site, so a new one is invisible to both.
@@ -249,6 +249,15 @@ func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
 	// slot actually holds a connection; then whatever else is evicted, that
 	// connection is still installed on return, and the registry is non-empty by
 	// construction for EVERY caller.
+	//
+	// The exact property is "cannot cause the nonempty-to-empty TRANSITION",
+	// not "always returns a nonempty registry": an already-empty registry stays
+	// empty, which is fine, because installConn's proof only reads the
+	// transition. And an empty keep slot does not by itself mean eviction WOULD
+	// empty the registry — with an empty conn0 and a CURRENT conn1 nothing is
+	// stale, so nothing would be evicted anyway. The refusal is not a
+	// prediction about this particular call; it is a refusal to proceed when
+	// the postcondition cannot be established.
 	var keep net.Conn
 	switch keepIdx {
 	case 0:
@@ -258,8 +267,8 @@ func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
 	}
 	if keep == nil {
 		slog.Error("cluster sync: refusing to evict retired-incarnation connections — "+
-			"the keep slot is empty, so evicting would leave the fabric registry with no "+
-			"connection at all (this is a caller bug: install before evicting)",
+			"the keep slot holds nothing, so this call cannot guarantee it leaves a "+
+			"connection installed (this is a caller bug: install before evicting)",
 			"keep_idx", keepIdx, "peer_incarnation", s.peerIncarnation)
 		return false
 	}

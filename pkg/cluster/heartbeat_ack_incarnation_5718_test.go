@@ -184,7 +184,12 @@ func TestPeerHeartbeatAckEverClearedOnSupersession_5718(t *testing.T) {
 // the same defect C01a exists to prevent, one level up.
 //
 // The per-slot incarnation stamp is what closes it: the survivor keeps the old
-// stamp, so it is no longer current even though it is still installed.
+// stamp, so it is no longer current. Since fold r4b the survivor is also
+// EVICTED rather than left installed, so on the live path this test now drives
+// a state production tears down in the same critical section. It is kept
+// because the stamp comparison is still what rejects an ack already in flight
+// when the eviction runs, and because it is the belt if eviction is ever
+// narrowed.
 //
 // Both fabric orderings run. The install and acceptance paths each branch on
 // the fabric index, so a fixture that only ever supersedes slot 0 leaves the
@@ -550,17 +555,20 @@ func TestPeerHeartbeatAckClearedWheneverRegistryEmpties_5718(t *testing.T) {
 // says nothing about a path added later. Removing handleDisconnect's clear is
 // already caught by an older assertion, so the behavioural test adds no
 // sensitivity there — its unique job is this: the narrowing in installConn is
-// sound only while `conn0`/`conn1` are set to nil in exactly ONE function. A
-// new teardown that nils a slot elsewhere would empty the registry without
-// clearing the capability, and every behavioural test in this file would still
-// pass.
+// sound only while `handleDisconnect` is the sole function that can take the
+// registry from nonempty to EMPTY. That is not the same as "only one function
+// nils a slot" — since fold r4b the allowlist below carries two names — so the
+// invariant a second slot-niller has to satisfy is intrinsic preservation of an
+// occupied slot, which is what the eviction's keep-slot refusal supplies. A new
+// teardown without that property could empty the registry without clearing the
+// capability, and every behavioural test in this file would still pass.
 //
 // So assert the ownership directly on the package's AST.
 //
 // #5718 fold r4b widens the allowlist by exactly one name.
 // evictStaleIncarnationConnsLocked also nils a slot — that is its job — but it
-// provably cannot EMPTY the registry, for two reasons that are both properties
-// of the function itself:
+// provably cannot cause the nonempty-to-EMPTY transition, for two reasons that
+// are both properties of the function itself:
 //
 //   - it never touches the keep slot (keepIdx), and
 //   - it refuses to evict anything at all unless that keep slot is occupied.

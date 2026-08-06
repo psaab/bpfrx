@@ -1483,12 +1483,18 @@ outside the monitor loop:
   acceptance test each branch per fabric, so a single-fabric fixture would
   leave one arm of each switch unbound.
 
-  Residual, deliberately open: a THIRD incarnation whose first dial lands on
-  the slot still holding a stale connection is stamped into the current
-  incarnation, because nothing on the wire distinguishes it. That is the same
-  missing peer boot-incarnation field #5480 already tracks and defers ("the
-  sync handshake carries no peer-cold / boot-incarnation / table-count
-  signal"); closing it is a wire change, not a local one.
+  Residual, deliberately open. This was previously described as a THIRD
+  incarnation dialling into the slot that still held a stale connection. Fold
+  r4b's eviction made that shape unreachable: no stale connection is left
+  installed for a later incarnation to land on.
+
+  The residual that survives it is the empty-alternate-slot reboot — a peer
+  whose replacement enters through a slot that is already empty is never
+  classified as a supersession at all, so the incarnation never advances and
+  none of this machinery runs. It is described in full below and in
+  `evictStaleIncarnationConnsLocked`'s KNOWN-INCOMPLETE note. Both shapes need
+  the same thing: a peer-supplied boot incarnation on the wire, which #5480
+  tracks and #6669 implements. Closing it is a wire change, not a local one.
 
   `installConn` does NOT clear on the full-disconnect edge, because reaching an
   empty registry implies `handleDisconnect`'s clear already ran. Note the

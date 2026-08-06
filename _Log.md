@@ -68521,3 +68521,24 @@ break — `go vet` confirmed passing under every revert.
   control): M1 (neutralise the keep-slot refusal) reds only
   TestEvictionRefusesToEmptyTheRegistry_5718; M2 (reconfigure a wrong but
   nonempty interface) reds only the two activation-tail argv assertions.
+
+## 2026-08-06 — #6825 fold r8 (Codex r7 findings, all against my own r6 fold)
+
+- **Timestamp**: 2026-08-06 01:55 PDT
+- **Action**: Both r6 guards were narrower than their claims. The eviction
+  refusal test populated only conn1, so the `case 1` keep-slot arm was
+  unbound; the argv fixture had one eligible interface, so the bond-member
+  exclusion the comment advertised was untested. Fixed both, and corrected
+  five overstated invariants (four of them mine).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/README.md, pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go,
+  pkg/networkd/activation_tail_5718_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/cluster ./pkg/networkd
+  ./pkg/daemon -count=1 -race rc=0. M4 (neutralise the keep-slot refusal)
+  now reds ALL THREE subtests including keep_slot_1_empty, with
+  TestInstallConnNeverLeavesTheRegistryEmpty_5718 and
+  TestOnlyHandleDisconnectEmptiesTheRegistry_5718 GREEN as the negative
+  control. M3 (drop the bond-member exclusion) now reds both activation-tail
+  tests with `[reconfigure trust0 lag0m]` vs `[reconfigure trust0]`; before
+  the fixture change that mutation passed.

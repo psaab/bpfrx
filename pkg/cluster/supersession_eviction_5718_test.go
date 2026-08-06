@@ -156,16 +156,24 @@ func TestInstallConnNeverLeavesTheRegistryEmpty_5718(t *testing.T) {
 // So drive the helper directly, in the two shapes a caller can get wrong, and
 // assert it declines. Reverting the keep-slot refusal reds both subtests.
 func TestEvictionRefusesToEmptyTheRegistry_5718(t *testing.T) {
+	// The keep-slot lookup is a two-armed switch, so a fixture that only ever
+	// populates ONE slot leaves the other arm free: a regression confined to
+	// `case 1` would pass while `case 0` still refused. Each case below places
+	// the stale connection in the slot the caller is NOT keeping, so keepIdx=0
+	// exercises the conn0 arm and keepIdx=1 exercises the conn1 arm, both with
+	// their keep slot genuinely empty.
 	for _, tc := range []struct {
-		name    string
-		keepIdx int
+		name     string
+		keepIdx  int
+		staleIdx int
 	}{
 		// The keep slot names a real fabric, but the caller has not installed
 		// into it yet. Only the OTHER slot is occupied, and it is stale.
-		{"keep slot empty", 0},
-		// The keep slot names no fabric at all, so neither skip applies and
-		// both occupied slots are eviction candidates.
-		{"keep index out of range", 2},
+		{"keep slot 0 empty", 0, 1},
+		{"keep slot 1 empty", 1, 0},
+		// The keep slot names no fabric at all, so neither skip applies and the
+		// one occupied slot is an eviction candidate with nothing to preserve.
+		{"keep index out of range", 2, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ss := newAckTestSync(t)
@@ -175,8 +183,12 @@ func TestEvictionRefusesToEmptyTheRegistry_5718(t *testing.T) {
 			// Stand up the state a wrong caller would hand the helper: a
 			// connection stamped with a retired incarnation, and no connection
 			// in the slot the caller claims to be keeping.
-			ss.conn1 = stale
-			ss.conn1Gen = 1
+			switch tc.staleIdx {
+			case 0:
+				ss.conn0, ss.conn0Gen = stale, 1
+			case 1:
+				ss.conn1, ss.conn1Gen = stale, 1
+			}
 			ss.peerIncarnation = 2
 			ss.mu.Unlock()
 
@@ -188,7 +200,8 @@ func TestEvictionRefusesToEmptyTheRegistry_5718(t *testing.T) {
 				t.Errorf("evictStaleIncarnationConnsLocked reported an eviction with keepIdx=%d, "+
 					"whose keep slot holds nothing. The only justification for exempting this "+
 					"function from TestOnlyHandleDisconnectEmptiesTheRegistry_5718 is that it "+
-					"cannot empty the registry; evicting here does exactly that", tc.keepIdx)
+					"cannot cause the nonempty-to-empty transition; evicting here does exactly "+
+					"that", tc.keepIdx)
 			}
 			c0, c1 := ss.installedFabrics()
 			if c0 == nil && c1 == nil {
@@ -199,9 +212,10 @@ func TestEvictionRefusesToEmptyTheRegistry_5718(t *testing.T) {
 					"incarnation's capability latch is then enforced against the next peer",
 					tc.keepIdx)
 			}
-			if c1 != stale {
-				t.Errorf("the stale connection must be left installed when the helper declines; " +
-					"declining has to be a no-op, not a partial eviction")
+			if got := ss.connInSlot(tc.staleIdx); got != stale {
+				t.Errorf("the stale connection must be left installed in fabric %d when the "+
+					"helper declines; declining has to be a no-op, not a partial eviction",
+					tc.staleIdx)
 			}
 		})
 	}
