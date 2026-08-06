@@ -336,8 +336,9 @@ pub struct Coordinator {
     #[cfg(test)]
     pub(crate) force_worker_healthy_stub: bool,
     /// #5674 test seam (per-instance, NOT a process-global): when nonzero,
-    /// `synced_import_cap()` returns this value INSTEAD of the real
-    /// `worker_count * DEFAULT_MAX_SESSIONS` aggregate ceiling. Lets a test
+    /// `synced_import_cap()` returns TWICE this value (the override expresses a
+    /// LOGICAL ceiling; `synced_import_cap()` doubles it) instead of the real
+    /// `2 * worker_count * DEFAULT_MAX_SESSIONS` ENTRY ceiling. Lets a test
     /// exercise the synced-import admission boundary without inserting
     /// `DEFAULT_MAX_SESSIONS` (131072) entries. Always 0 in release builds
     /// (the field does not exist); per-instance so parallel tests never race.
