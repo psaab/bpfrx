@@ -1,3 +1,251 @@
+## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: Round 4 deleted the CLI canary's false "returns no response value
+  that bypasses it" clause and DISCLOSED the residual rather than closing it.
+  Round 5 closes it. The gate had measured that
+  `sanitizePeerSessionPolicyNames(nil)` keeps the call present, bypasses
+  sanitization entirely, and leaves every package green with the round-3 MAJOR
+  fully restored — a guard whose admitted cell restores the whole defect is not
+  a narrow guard, it is a guard that does not work, and disclosure is no
+  substitute when closing costs three lines on a node already in hand.
+  The check keys the argument to the identifiers `fetchPeerSessions` actually
+  RETURNS (skipping the `nil` early-error paths) rather than to a hardcoded
+  `resp`, so renaming the local does not silently disarm it.
+  Two residuals are kept and stated, because closing them is not cheap: it does
+  not prove the call precedes every return (that needs control-flow analysis),
+  and it cannot see a gutted sanitizer body (covered from the other side by the
+  behavioural tests).
+- **File(s)**: pkg/cli/peer_policy_name_6851_test.go
+- **Validation**: Parent mutation proof over the WHOLE `pkg/cli` package, not a
+  filtered subset — the failure set must be the new assertion alone or the
+  mutation does not distinguish it:
+  - baseline `go test ./pkg/cli/ -count=1` -> rc=0, `ok`
+  - `sanitizePeerSessionPolicyNames(nil)` -> rc=1, failure set exactly
+    `[TestCLIPeerFetchCallsSanitizer_6851]`
+  - sanitize a DIFFERENT local while still `return resp` (the realistic
+    refactor slip, not "someone types nil") -> rc=1, same single failure
+  - delete the call -> rc=1, same single failure
+  Worktree restored byte-clean after each cell.
+
+## 2026-08-05 — #6851 round 4: delete a comment's false coverage claim, and replace an assertion that could not fail
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: Re-gate returned no blocking findings; four comment/assertion
+  items, all folded.
+  **F1** — the CLI call-site canary's SCOPE note claimed it asserts
+  `fetchPeerSessions` "returns no response value that bypasses" the
+  sanitizer. It does not: the body only looks for a CallExpr by name.
+  Measured by the gate — `sanitizePeerSessionPolicyNames(nil)` contains the
+  call, bypasses sanitization, and leaves every package green with the
+  round-3 MAJOR fully restored. Deleted the clause rather than inventing a
+  guard: the residual cell is "call present, argument neutered", the same
+  one already disclosed for `attachPeerSessions`, and the class is covered
+  from two other sides (deleting the call reds this test; gutting the
+  sanitizer reds the behavioural tests). A comment claiming coverage that
+  does not exist is the defect this PR spent three rounds removing.
+  **F3** — an expectation equal to the failure default. The id-0 test
+  asserted `GetPolicyId() != 0` with "the raw wire value must still be
+  surfaced", but the INPUT id is 0, so "want 0" is also the zero value and
+  cannot distinguish preserved from clobbered. Removed it and moved the
+  surfacing claim to the sentinel sibling, where `0xFFFFFFFF` IS
+  distinguishable. Proved the replacement binds rather than assuming:
+  mutating the sanitizer to `e.PolicyId = 0` alongside the name rewrite
+  goes RED with the new assertion and would have gone GREEN under the old
+  one.
+  **F2** — `attachPeerSessions(resp, nil)` does NOT compile standalone
+  (`declared and not used: peerResp`); the substance holds with
+  `_ = peerResp` beside it. Wording corrected, point kept.
+  **F4** — the per-package floor's message cited "pointing it at a path
+  that no longer exists", but a nonexistent root makes WalkDir error and
+  the walk Fatals first. Rescoped to its real domain: directory exists,
+  yields zero production `.go` files.
+  Plus an observation recorded at the source: `PeerSessionPolicyName` has
+  no direct unit test in pkg/dataplane — its reserved-before-peer-name
+  ordering is bound transitively (reversing it reds pkg/cli and
+  pkg/grpcapi). Noted at the function so a future reader does not go
+  looking for the guard in the package that documents it.
+  Watch item checked: `pkg/grpcapi/server_sessions.go` is 1990 lines, ten
+  from the 2000 REFACTOR tier, and this round left it at 1990 — the F2 edit
+  was net-neutral.
+- **Validation**: full `go test ./pkg/... ./cmd/...` passes; gofmt and vet
+  clean. One targeted mutation (clobber `PolicyId` while rewriting the
+  name) confirms the F3 replacement assertion can fail.
+  NOTE for review: this delta is NOT comment-only — F3 removes one
+  assertion and adds another. That is called out rather than folded into a
+  "comment-only" claim.
+- **File(s)**: `pkg/cli/peer_policy_name_6851_test.go`,
+  `pkg/grpcapi/server_sessions.go`,
+  `pkg/dataplane/policy_display.go`,
+  `pkg/dataplane/policy_display_4626_test.go`, `_Log.md`
+
+## 2026-08-05 — #6851 round 3: the on-box CLI bypasses the choke point; the canary could not see it
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: MAJOR — `pkg/cli` has its OWN peer dialer. `(c *CLI)
+  fetchPeerSessions` calls `c.dialPeer()` straight to the peer daemon and
+  sets no `IncludePeer`, so it passes through neither the grpcapi fan-out
+  that sanitizes reserved policy ids nor the peer's own fan-out; the
+  response was rendered verbatim. Against a pre-#4626 peer, `show security
+  flow session` in cluster mode printed that peer's first configured policy
+  for every reserved-id session — the defect this branch closes, on the
+  surface an operator actually types. The remote `cli` binary and REST are
+  unaffected.
+  Sanitized at the CLI's own ingress rather than at the render site, so a
+  future render site cannot reintroduce the bypass. Same decision function
+  (`dataplane.PeerSessionPolicyName`) as grpcapi — two call sites, one
+  decision, because the two surfaces reach the peer by different routes.
+  Two SHIPPED claims were falsified by this and are corrected rather than
+  left: `server_sessions.go` said guarding there "covers all three surfaces
+  once" (it covers gRPC and REST), and `docs/junos-cli-reference.md` said
+  cluster peer sessions "carry the same guarantee" (now true, and it names
+  both sanitization points).
+  Canary — my own instrument was the reason this was invisible. The
+  per-FUNCTION rule scoped to the enclosing `FuncDecl`, and both CLI render
+  sites live inside the SAME 557-line `showFlowSession`, in separate
+  `printV4`/`printV6` closures. Either closure's helper call marked the
+  whole function guarded, so reverting exactly one site passed. Narrowed to
+  the innermost function scope: a nested `FuncLit` is its own scope, a
+  parent's helper call does not guard a closure, and one closure does not
+  guard its sibling.
+  Also: the `scanned < 20` floor counted TOTAL files, so it never bound its
+  own dimension — removing `logging` from the package list removed it from
+  the loop entirely, and the floor never ran for it. Replaced with a
+  membership assertion on the list plus a per-package file floor.
+  Scoped honestly rather than fixed: `attachPeerSessions(resp, nil)`
+  compiles, satisfies the structural canary, drops every peer session, and
+  passes the suite — so the "fails loudly" line is an operator-visible
+  claim, not a test-enforced one, and now says so. Map aliasing
+  (`m := policyNames; m[id]`) still defeats the identifier-keyed rule;
+  recorded as a known limit.
+  Correcting my own round-2 report: I wrote that the sentinel-only revert
+  redded "pre-existing behavioural tests". Every failing assertion was
+  authored by this branch —
+  `default_policy_sentinel_3057_test.go` is a pre-existing FUNCTION whose
+  assertion this branch inverted, and the mutation SATISFIES what master
+  asserted. Inverting it was right; describing the result as independent
+  prior coverage was not. A pre-existing file is not a pre-existing
+  assertion.
+- **Validation**: four-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile. All four
+  RED. Two were GREEN on the first run and are the reason two more tests
+  exist: dropping the CLI sanitize CALL (my tests drove the sanitizer
+  directly and left its one call site unbound — the same unit-bound /
+  call-site-unbound gap as #5103), and re-adding the logging carve-out
+  (the per-package floor cannot fire for a package that is no longer in
+  the list). Reverting ONLY the v6 CLI site — measured invisible before
+  the narrowing — now REDs. Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/cli/session_filter.go`,
+  `pkg/cli/peer_policy_name_6851_test.go` (new),
+  `pkg/dataplane/policy_display_4626_test.go`,
+  `pkg/grpcapi/server_sessions.go`, `docs/junos-cli-reference.md`, `_Log.md`
+
+## 2026-08-05 — #6851: close the two gaps the round-2 fix left in its own canary
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: A concurrent lane had already fixed both review findings on
+  this branch (2e4ec3509) while I was fixing them independently. Theirs is
+  better placed and I dropped mine: the peer guard belongs at
+  `fetchPeerSessions` in grpcapi, where sanitizing the protobuf response
+  in place covers gRPC, the REST `peer` block and the CLI at one choke
+  point. I verified that claim rather than taking the comment's word —
+  `pkg/api` has no independent peer dial, and `writeSessionList` reaches
+  the peer through the same in-process `GetSessions`, so my
+  `sessionEntryFromPB` fix would have been a redundant second helper
+  duplicating theirs. Kept the superseded work on the local branch
+  `backup-mine-14af8e357` rather than deleting it unreviewed.
+  What their commit did NOT update was its own canary, so this adds only
+  that delta. Two gaps:
+  1. `sessionPolicyNameDisplayPackages` still excluded `pkg/logging` with
+     the very reasoning their fix disproved ("the RT_FLOW path owns its
+     own resolver ... folding the two is a separate change"). That
+     exclusion is what let the seventh resolver sit unguarded through
+     round 1. Added `logging`, and replaced the stale comment with why a
+     carve-out needs the same evidence as a fix.
+  2. `attachPeerSessions`' doc names a residual outright — "Replacing this
+     call with a bare `resp.Peer = peerResp` would not be caught here."
+     `TestPeerSessionFanOutGoesThroughAttach_6851` closes it structurally:
+     `fetchPeerSessions` must call the helper and must not assign
+     `resp.Peer` directly. Scoped to that ONE function on purpose — the
+     `resp.Peer` assignments at ~:927 and ~:1039 attach summary responses
+     carrying no per-session policy name, so routing them through a
+     session sanitizer would be wrong, not safer.
+  Fixing (1) surfaced a defect in my own canary rather than in their code:
+  a blanket "no `policyNames[...]` index" rule FALSE-POSITIVED on their
+  resolver, which correctly takes the reserved ids via
+  `ReservedPolicyName` and only then indexes for an unreserved id. There
+  are two legitimate shapes — delegate wholly, or guard-then-index — so
+  the canary now walks per function and reports an index only in a
+  function that never consults a reserved-id helper. Its limits are
+  stated: it does not prove the helper call DOMINATES the index on every
+  path, so a helper in a dead branch would pass.
+- **Validation**: two mutations, snapshot-and-write-back restore with
+  byte-for-byte verify, both required to compile. Reverting the logging
+  resolver to the sentinel-only form goes RED on the canary IN ADDITION
+  to their behavioural tests, which is the coverage the exclusion was
+  costing. Bypassing `attachPeerSessions` with a bare `resp.Peer =
+  peerResp` goes RED on the NEW canary ONLY — nothing else in the suite
+  catches it, which is precisely the residual their comment documented.
+  Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/dataplane/policy_display_4626_test.go`,
+  `pkg/grpcapi/peer_fanout_attach_6851_test.go` (new), `_Log.md`
+
+## 2026-08-05 — #4626 L01: stop rendering `policy_id` 0 as the first configured policy
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero)
+- **Action**: `policy_id` 0 is overloaded — `compilePolicies` assigns
+  `policySetID*MaxRulesPerPolicy + i`, so the first rule of the first
+  zone-pair really is id 0, while the userspace dataplane stamps 0 on
+  every session no policy admitted (host-inbound, neighbor-seed, fabric,
+  tunnel, all pre-#3056 sessions, and every session synced from an older
+  HA peer during a rolling upgrade — that last one is the peer's whole
+  table). Six session-row render sites indexed
+  `CompileResult.PolicyNames` directly, so all of those sessions were
+  reported as admitted by whichever policy happens to be configured
+  first. Added `dataplane.SessionPolicyName`, which takes both reserved
+  ids (0 and `DefaultPolicySentinelID`) before consulting the map, and
+  routed all six sites through it: `pkg/cli/cli_show_flow.go` printV4 and
+  printV6, `pkg/api/sessions.go` sessionEntryV4/V6, and
+  `pkg/grpcapi/server_sessions.go` sessionEntryV4/V6. The REST and gRPC
+  sites had no numeric fallback at all, so the wrong NAME was emitted
+  unconditionally into a structured field automation reads.
+  Chose a render-side guard over reserving the id space. Reserving is
+  what the issue's L01 text asks for, but it is a cross-plane change
+  (userspace-dp `policy.rs`, the #3056 stamping path, runtime-id
+  assignment, HA wire compatibility) with no approved research plan, and
+  it would NOT repair the case that matters most: an older peer keeps
+  sending a bare 0 through the whole upgrade window, so a render-side
+  guard is required either way and is not made redundant by that work.
+  Rendering 0 as `unattributed` is deliberately an UNDER-claim — the wire
+  value is ambiguous, so every rendering is wrong for one of the two
+  populations, and under-claiming is the safer error on a security
+  surface. It is also the direction the codebase already chose for this
+  identical overload on the behavioral path (`deletedPolicyRuntimeIDs`
+  excludes id 0 as a documented "fail-SAFE under-clear"). The numeric id
+  is still printed beside the name on every surface.
+  Scope note recorded in the code and the PR: this does NOT reserve the
+  id space, so it does not close L01 as the issue words it — it removes
+  the misattribution symptom and leaves the id-space work outstanding.
+- **Validation**: seven-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, each mutant required to compile so no RED is
+  a build break. All seven RED: reverting the CLI pair, the REST pair,
+  the gRPC pair, and all six at once; rewriting the guard to look the map
+  up FIRST and fall back (the plausible "cleanup" that looks like a guard
+  and guards nothing); dropping the reserved-zero arm; and blanking every
+  policy name (caught by the positive controls). The CLI pair is caught
+  only by the AST canary — those two sites are closures printing to real
+  stdout behind a live dataplane, which is stated as the canary's reason
+  to exist rather than left implicit. Full `pkg/dataplane`, `pkg/api`,
+  `pkg/grpcapi`, `pkg/cli`, `pkg/daemon`, `pkg/logging` and
+  `pkg/refactoraudit` suites pass; no existing golden asserted the old
+  attribution.
+- **File(s)**: `pkg/dataplane/policy_display.go` (new),
+  `pkg/dataplane/policy_display_4626_test.go` (new),
+  `pkg/cli/cli_show_flow.go`, `pkg/api/sessions.go`,
+  `pkg/api/sessions_policy_id_zero_4626_test.go` (new),
+  `pkg/grpcapi/server_sessions.go`,
+  `pkg/grpcapi/server_sessions_policy_id_zero_4626_test.go` (new),
+  `docs/junos-cli-reference.md`, `_Log.md`
 ## 2026-08-05 — #6814 fold round 6: two bare leaf sites my round-5 grep could not find
 
 - **Timestamp**: 2026-08-05 (fold/6814-r2, on top of a47afa165)
@@ -66555,3 +66803,98 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-05 15:10
+- **Action**: #6851 fold — two MAJORs on the #4626 policy-id-zero guard, both
+  verified firsthand before folding.
+
+  MAJOR 1, the SEVENTH resolver. `EventReader.resolvePolicyName`
+  (`pkg/logging/ringbuf.go`) resolves RT_FLOW record names independently of the
+  six session-row builders and indexed `er.policyNames` directly. It already
+  special-cased `DefaultPolicySentinelID` (#3057) but not
+  `UnattributedPolicyID`, so every host-inbound / fabric / tunnel / pre-#3056 /
+  older-peer record named the FIRST configured policy. This is the surface that
+  matters most: RT_FLOW records go to syslog and ship off-box, so the wrong
+  attribution is durable and lands in what an auditor reads later.
+
+  MAJOR 2, peer fan-out. `fetchPeerSessions` did `resp.Peer = peerResp` — the
+  peer's response attached UNCHANGED, names included. The #4626 guard resolves a
+  name from a raw id for rows THIS node renders; it does not cover a name
+  arriving as DATA from an old peer that resolved it wrongly itself. REST
+  (`writeSessionList` → `pr.GetPeer()`), gRPC clients and the CLI all republish
+  that string, so `fetchPeerSessions` is the single choke point for all three.
+
+  DECISION on MAJOR 2, and why. Override the name for RESERVED ids only; keep
+  the peer's name for everything else. Policy ids are NODE-LOCAL
+  (`compilePolicies` assigns from the local config's rule ordering), so the peer
+  is authoritative for the names of its own sessions and re-resolving an
+  unreserved peer id against the LOCAL map would name whichever local policy
+  occupies that slot — a fresh misattribution firing on every mixed-config
+  cluster, not a fix. The two choices are identical against a same-version peer
+  (it already sends `unattributed`); they differ only for an older peer, which
+  is the population that needs correcting. Pinned by mutation M4.
+
+  STRUCTURE. Added `dataplane.ReservedPolicyName(id) (string, bool)` as the SSOT
+  for "which ids must never reach a name map", and expressed `SessionPolicyName`,
+  the new `PeerSessionPolicyName`, and the logging resolver through it. The
+  logging site keeps its own numeric fallback so it cannot call
+  `SessionPolicyName` directly; an earlier draft probed
+  `SessionPolicyName(nil, id)` for a non-empty result, which works only because
+  a nil map yields "" for unreserved ids — a property nobody is obliged to
+  preserve and whose loss would silently route unreserved ids away from the
+  caller's map. Replaced with the explicit predicate.
+
+  Also FUSED the peer guard with the attach it protects
+  (`attachPeerSessions` sanitizes AND assigns). Two statements at the call site
+  would let a future edit drop the guard and keep the attach — silent and green,
+  the exact failure mode of this PR. Fused, dropping the guard drops the
+  fan-out, which fails loudly.
+
+  ENUMERATION, re-run rather than inherited (the count has grown at every
+  count: briefed 2, previous lane 6, gate 7). Every `policyNames[...]` index in
+  the tree is now: the helper itself, `compilePolicies` building the map, and
+  the logging resolver (fixed). Six routed session builders + logging = SEVEN
+  resolvers; the peer pass-through is the only place a name arrives as data.
+  Checked and CLEARED as carrying no policy name: the other two peer fan-outs
+  (`GetSessionSummaryResponse` is counts only; `GetZonePairSummaryResponse` holds
+  `ZonePairSessionSummary`, which is zone pairs + protocol counts) — verified by
+  enumerating their generated struct fields, not by assuming. Downstream
+  consumers (`pkg/api/sse.go`, `server_show_events.go`,
+  `cli_show_security_log.go`, `monitor.go`, `cmd/cli/show_flow.go`) read an
+  already-resolved string and are fixed transitively.
+
+  MUTATIONS (each restored + re-verified green):
+  - M1 map-first, the shape that looks like a guard: reserved check moved AFTER
+    the map lookup in the logging resolver → RED on
+    `TestResolvePolicyNameZeroIsNotTheFirstPolicy_6851`. Note the
+    no-published-map test stays GREEN under it, which is why the OCCUPIED-map
+    fixture is the load-bearing one.
+  - M2 peer-name-first (trust a non-empty peer string before the reserved
+    check) → 3 RED.
+  - M3 guard dropped, attach kept → 3 RED; the fusion holds.
+  - M4 the REJECTED alternative (discard the peer's name for unreserved ids too,
+    as "re-resolve everything locally" would) → RED on the unreserved control.
+    The decision is pinned, not accidental.
+
+  SUPERSEDED #3057 ASSERTION, called out because the brief did not anticipate
+  it. Routing the logging resolver through the guard broke a PRE-EXISTING test:
+  `TestResolvePolicyNameSentinelRendersDefaultPolicy` asserted "a genuine policy
+  ID 0 still resolves to the first configured policy". That is precisely the
+  claim #4626 retires — the same claim the six session surfaces already stopped
+  making — so the assertion was updated, not the fix weakened. The test's actual
+  #3057 purpose (the sentinel must not alias the first policy) is untouched, and
+  I STRENGTHENED it in the other direction: id 0 must now also not render as
+  `default-policy`, so a "fix" collapsing both reserved ids onto one name would
+  fail rather than pass. The supersession is documented in the test comment.
+  Under mutation M1 that test now reds ALONGSIDE the new one.
+
+  SCOPE LIMIT, stated rather than implied: the tests drive `attachPeerSessions`,
+  so they bind the sanitize-and-attach pair. They do NOT bind
+  `fetchPeerSessions`' call to it — that needs a live `cluster.Manager` with
+  `PeerAlive()` plus an authenticated peer dial, neither reachable from a unit
+  test. Replacing the call with a bare `resp.Peer = peerResp` would not be
+  caught. Recorded in the source next to the function.
+- **File(s)**: pkg/dataplane/policy_display.go, pkg/logging/ringbuf.go,
+  pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
+  pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
+  _Log.md
