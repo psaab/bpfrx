@@ -282,7 +282,7 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	// first and only destructive netlink mutation in this function -- VLAN
 	// create/link-up and address delete/add, AND netlink.LinkDel /
 	// LinkSetDown on unmanaged interfaces via stripUnmanagedInterfaces
-	// (compiler_iface.go:1256/1284), plus ethtool and /proc/sys writes
+	// (compiler_iface.go, stripUnmanagedInterfaces' netlink.LinkDel / LinkSetDown), plus ethtool and /proc/sys writes
 	// (#6894 r1 F5: the earlier parenthetical understated this) -- and
 	// nothing after it has an undo path, so a config that trips a later phase must be rejected here rather
 	// than half-applied. See compiler_validate_4960.go for what is and is not

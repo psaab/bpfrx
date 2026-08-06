@@ -101,7 +101,7 @@ import (
 // called by no test in the package. Any one of them could be deleted with the
 // whole suite green, while an ordinary `security nat destination` stanza
 // nil-panicked the daemon on apply. The fixture now reaches 39; the 40th,
-// IsLoaded, is called by CompileConfig itself (compiler.go:268) above the
+// IsLoaded, is called by CompileConfig itself (compiler.go, CompileConfig's IsLoaded gate) above the
 // pre-pass and is bound by the CompileConfig-driving tests instead. Adding an
 // override without a config shape that REACHES it re-opens the same hole.
 type discardingDataPlane struct{ DataPlane }

@@ -22,7 +22,7 @@ import (
 // via net.Interfaces() and, for every link that is not `lo`, not in this config
 // and not daemon-owned, runs netlink.AddrDel then netlink.LinkSetDown -- and
 // netlink.LinkDel outright for a bond. Measured, not inferred: an instrumented
-// panic at compiler_iface.go:1255 fired on `eno2` through
+// panic at compiler_iface.go, stripUnmanagedInterfaces fired on `eno2` through
 // TestValidConfigStillReachesZoneCompile_4960 -> CompileConfig -> compileZones,
 // with 50+ further links behind it. Unprivileged those netlink calls fail with
 // EPERM; as ROOT the test black-holes the host's networking (#6894 r2 F1).
@@ -52,7 +52,7 @@ var errStopBeforeHostReconcile = errors.New(
 // safety property into a runtime assertion instead of a structural argument",
 // and they do not (#6894 r3 F2). Measured by driving programZoneMaps directly
 // with the tripwire neutralised -- which is safe, because
-// stripUnmanagedInterfaces is in compileZones (compiler_iface.go:287), not in
+// stripUnmanagedInterfaces is in compileZones (compiler_iface.go, compileZones' stripUnmanagedInterfaces call), not in
 // programZoneMaps:
 //
 //	WITH tripwire:    zoneConfigCalls=1 vlanIfaceInfoCall=0 ifaceSetupCalls=0
@@ -66,7 +66,7 @@ var errStopBeforeHostReconcile = errors.New(
 // vlanIfaceInfoCall and ifaceSetupCalls are DEFENCE IN DEPTH. Each is reached
 // only from inside mapZoneInterface (SetVlanIfaceInfo right after a successful
 // ensureVLANSubInterface, SetZone/AddTxPort during the one-time per-phys host
-// setup), and mapZoneInterface returns early at compiler_iface.go:450-454 when
+// setup), and mapZoneInterface returns early at compiler_iface.go, mapZoneInterface's early return when
 // cachedInterfaceByName misses -- which it always does here, because
 // xpft4960a/xpft4960b exist on no host. They would therefore fire only if this
 // fixture's interface names ever started resolving. Keep them, and do NOT
@@ -349,7 +349,7 @@ func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 // set to 39 of 40. Instrumented count, measured by overriding all 40 with a
 // name recorder: 38 from the first leg below, plus SetSNATEgressIP from the
 // second. The 40th is IsLoaded, which CompileConfig calls itself
-// (compiler.go:268) before the pre-pass runs, so no config can reach it from
+// (compiler.go, CompileConfig's IsLoaded gate) before the pre-pass runs, so no config can reach it from
 // here.
 //
 // The second leg exists because SetSNATEgressIP is the one covered write that

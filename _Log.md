@@ -70584,3 +70584,70 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 6 — fold the three minors from the MERGE-NEEDS-MINOR
+  re-gate at `10b592047`. No blocking findings; no production behaviour changes.
+  **F1 — the pin I added in r5b did NOT cover the shape its own comment named,
+  and the reviewer is right.** `TestScreenIDsKeySetMirrorsConfig_4960` calls
+  `assignScreenIDs` and compares its output against `cfg.Security.Screen`, so it
+  fires when the divergence is introduced INSIDE that function — which is where
+  my r5b mutation put it. A realistic second writer (synced peer, cached
+  snapshot) is a SEPARATE SITE writing after `assignScreenIDs` returns.
+  Reproduced firsthand: inserting `result.ScreenIDs["synced-from-peer"] = 0xfffe`
+  at BOTH production call sites left the whole package GREEN, so the comment's
+  "this test is what fails at that moment" was false for the shape it described.
+  Added `TestAssignScreenIDsIsTheSoleWriter_4960`: an AST scan over every
+  non-test .go file in pkg/dataplane for index-assignments and `delete()` on
+  `.ScreenIDs`, asserting exactly one enclosing function and that it is
+  `assignScreenIDs`. Satisfiable today — `compiler.go` carries the only write;
+  the other three non-test mentions are reads. Two floors (>=10 files scanned,
+  >0 writers found) so a rename cannot make it vacuous.
+  PROVEN TO FIRE on the exact previously-GREEN mutation: `result.ScreenIDs is
+  written from [CompileConfig assignScreenIDs validateBeforeMutateWithResult],
+  expected only assignScreenIDs` with per-site file:line, `go vet` rc=0.
+  **F2 — the hoist's own claim was unbound.** `compileZones` opens with
+  `validateZoneScreenReferences` and the comment says that makes it
+  "structurally impossible for any zone to mutate ... whatever the caller did
+  first". Deleting the hoist while keeping the pre-pass row left the package
+  GREEN, because `compileZones` has one production caller and the pre-pass
+  rejects ahead of it. Added
+  `TestCompileZonesRejectsStaleScreenRefWhateverTheCallerDid_4960`, which calls
+  `compileZones` DIRECTLY (the idiom `compiler_rxvlan_failclosed_5268_test.go`
+  already uses), bypassing CompileConfig and therefore the pre-pass. PROVEN TO
+  FIRE on the previously-GREEN hoist deletion: `compileZones programmed 1
+  zone(s) before rejecting`, `go vet` rc=0. Note the measured count is 1, which
+  corroborates the reviewer over the PR body's stale "2 SetZoneConfig calls".
+  **F3 — three ID-driver dimensions added, one deliberately NOT.** `PolicyNames`
+  (4 entries), `PolicySets` (1) and `AppNames` (92) are all written by
+  `compilePolicies` / `compileApplications`, both already in the driver, so they
+  were omitted rather than unreachable. Each has a floor: the
+  `DefaultPolicySentinelID` key plus a >=2 count for PolicyNames, non-zero for
+  PolicySets, non-empty for AppNames. `PolicyScheduleRuleSlots` is NOT added —
+  `idProbeConfig` declares no scheduler, so the slice is empty and the column
+  would be empty-vs-empty, the exact vacuity the r4 round removed from three
+  other columns. Recorded in the test with what to do first (add a
+  `then schedule` to the fixture).
+  **NITs.** PR body corrected: "Eleven of thirteen" -> Thirteen, "all seven
+  maps" -> eight, "2 SetZoneConfig calls" -> 1. README: "no longer a zones-phase
+  fault at all" described only the pre-pass half and read as though the
+  zones-phase check had been removed — it has not, #6894 hoisted it there.
+  TWELVE rotted file:line citations de-rotted, and per the re-gate's habit note
+  they are now SYMBOL citations rather than re-pinned numbers, because these
+  keep rotting inside this PR: `compiler_iface.go:1256/1284` ->
+  stripUnmanagedInterfaces' LinkDel/LinkSetDown, `compiler.go:723/771/753` ->
+  resolveAddrList and its implicitSets write / cacheKey join,
+  `compiler_iface.go:1255/287/450-454`, and `compiler.go:268/330`. Two of those
+  (`:268`, `:330`) were still CORRECT at this head — verified before touching —
+  and were converted anyway so the next shift cannot rot them; one
+  (`compiler_iface.go:287` -> 310) had rotted since r5 because MY OWN hoist
+  insertion shifted it, which is the habit note earning itself.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_screenids_solewriter_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/compiler.go,
+  pkg/dataplane/README.md, _Log.md

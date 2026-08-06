@@ -94,7 +94,7 @@ func (idProbeDP) GetPersistentNAT() *PersistentNATTable                         
 // an interface-SNAT rule that yields an egress IP, and a security policy.
 //
 // Keep it able to reach all 39 pre-pass-reachable overrides when adding to it;
-// the 40th, IsLoaded, is called by CompileConfig itself (compiler.go:268),
+// the 40th, IsLoaded, is called by CompileConfig itself (compiler.go, CompileConfig's IsLoaded gate),
 // above the pre-pass, so no config can reach it from validateBeforeMutate.
 //
 // Interface names are deliberately outside the vSRX scheme. The zone interface
@@ -155,7 +155,7 @@ func idProbeConfig() *config.Config {
 	// builds IMPLICIT ADDRESS SETS (implicitSets was empty before r4).
 	//
 	// p-multi is what populates implicitSets, and its address lists have to be
-	// MULTI-valued to do it: resolveAddrList (compiler.go:723) filters "any"
+	// MULTI-valued to do it: resolveAddrList (compiler.go, resolveAddrList) filters "any"
 	// out entirely and returns a single remaining name through the direct-ID
 	// branch, so both of p-single's lists resolve without building a set. Only
 	// two-or-more surviving names take the implicit-set branch that writes
@@ -290,12 +290,12 @@ func idProbeConfig() *config.Config {
 // left three of the ID dimensions it compares structurally unable to differ:
 //
 //   - implicitSets was ALWAYS empty. Its only writer is resolveAddrList
-//     (compiler.go:771), reached through compilePolicies, which was not
+//     (compiler.go, resolveAddrList's implicitSets write), reached through compilePolicies, which was not
 //     called. An empty map compares equal to an empty map, so that column of
 //     the DeepEqual proved nothing.
 //   - The static-NAT counter keys were never assigned. compileStaticNAT
 //     assigns them (compiler_nat.go:1013) and production finalizes AFTER it
-//     (compiler.go:330); finalizing straight after compileNAT measured
+//     (compiler.go, the finalizeNATCounterIDs call); finalizing straight after compileNAT measured
 //     neither the assignment nor its effect on the collision re-derivation.
 //   - pool-nat64 never entered PoolIDs and NextPoolID never advanced.
 //     compileNAT64's auto-assign branch (compiler_nat.go:1243-1245) is what
@@ -351,7 +351,7 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 		t.Fatalf("compileStaticNAT: %v", err)
 	}
 	// Production finalizes HERE — after static NAT has recorded its counter
-	// keys and before NAT64 runs (compiler.go:330).
+	// keys and before NAT64 runs (compiler.go, the finalizeNATCounterIDs call).
 	//
 	// The POSITION is asserted as a PRECONDITION rather than through the
 	// output, because the output cannot see it. finalizeNATCounterIDs only
@@ -382,6 +382,15 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 		"PoolIDs":       result.PoolIDs,
 		"NATCounterIDs": result.NATCounterIDs,
 		"implicitSets":  result.implicitSets,
+		// #6894 r6 F3: the policy/application NAME + set-count dimensions.
+		// compilePolicies and compileApplications are both in this driver, so
+		// these were omitted rather than unreachable. PolicyNames is
+		// rule-id -> policy name and PolicySets is a running count, so an
+		// order-dependent id or a double-increment shows here and nowhere else
+		// in this comparison.
+		"PolicyNames": result.PolicyNames,
+		"PolicySets":  result.PolicySets,
+		"AppNames":    result.AppNames,
 		// Scalar, not a map: an off-by-one in the NAT64 auto-assign branch
 		// would leave every map above identical while the next pool allocated
 		// collides with an existing one.
@@ -431,6 +440,35 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	}
 	if len(first["AppIDs"].(map[string]uint32)) == 0 {
 		t.Fatal("fixture assigned no application IDs — comparison vacuous")
+	}
+
+	// #6894 r6 F3 floors. These three dimensions were omitted from the driver
+	// even though compilePolicies and compileApplications already run in it.
+	// PolicyScheduleRuleSlots is deliberately NOT compared: idProbeConfig
+	// declares no scheduler, so the slice is empty and an empty slice equals an
+	// empty slice — the exact vacuity the r4 round removed from three other
+	// columns. Add a `then schedule` to the fixture before adding that column,
+	// or it is a comparison that cannot fail.
+	policyNames := first["PolicyNames"].(map[uint32]string)
+	if _, ok := policyNames[DefaultPolicySentinelID]; !ok {
+		t.Errorf("PolicyNames lacks the default-policy sentinel %#x — compilePolicies "+
+			"seeds it unconditionally (compiler.go), so its absence means the phase "+
+			"did not run and this column compares empty against empty\n  have: %v",
+			DefaultPolicySentinelID, policyNames)
+	}
+	if n := len(policyNames); n < 2 {
+		t.Errorf("PolicyNames holds %d entries; the fixture's policies should add real "+
+			"rule-id -> name pairs on top of the sentinel, or the column measures only "+
+			"a constant", n)
+	}
+	if ps := first["PolicySets"].(int); ps == 0 {
+		t.Error("PolicySets is 0 — compilePolicies increments it per compiled set, so " +
+			"zero means no set was compiled and a double-increment regression could " +
+			"not show here")
+	}
+	if n := len(first["AppNames"].(map[uint16]string)); n == 0 {
+		t.Error("AppNames is empty — compileApplications populates it for every " +
+			"catalogued app, so this column would compare empty against empty")
 	}
 
 	// ScreenIDs had no floor at all until the assignScreenIDs extraction: the
@@ -506,7 +544,7 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	// implicitSets: written only by resolveAddrList's multi-address branch,
 	// reached only through compilePolicies. Assert the two the fixture's
 	// p-multi policy builds — the cache key is the sorted member names joined
-	// by commas (compiler.go:753).
+	// by commas (compiler.go, resolveAddrList's cacheKey join).
 	sets := first["implicitSets"].(map[string]uint32)
 	for _, want := range []string{"db,web", "dns,servers"} {
 		if _, ok := sets[want]; !ok {

@@ -330,3 +330,56 @@ func TestScreenIDsKeySetMirrorsConfig_4960(t *testing.T) {
 		})
 	}
 }
+
+// TestCompileZonesRejectsStaleScreenRefWhateverTheCallerDid_4960 binds the
+// hoist's OWN claim (#6894 r6 F2).
+//
+// `compileZones` opens with `validateZoneScreenReferences`, and its comment says
+// that placement "makes it structurally impossible for any zone to mutate before
+// every zone's reference has been checked, WHATEVER THE CALLER DID FIRST".
+// Nothing bound that. Deleting the hoist and keeping only the pre-pass row left
+// the whole package GREEN, because `compileZones` has exactly one production
+// caller and the pre-pass runs ahead of it — so every existing test reaches
+// compileZones through a path that already rejected.
+//
+// That makes the hoist genuinely redundant TODAY and load-bearing for the claim:
+// it is what keeps the guarantee true for a future second caller, or if the
+// pre-pass row is ever reordered or dropped. A claim of structural impossibility
+// needs a test that fails when the structure changes, so this calls
+// `compileZones` DIRECTLY — the idiom `compiler_rxvlan_failclosed_5268_test.go`
+// already uses — bypassing CompileConfig and therefore the pre-pass entirely.
+//
+// RED on revert: delete the `validateZoneScreenReferences` call at the top of
+// compileZones (leaving the pre-pass row intact) and this fails, because the
+// direct call then reaches programZoneMaps and programs zones before the stale
+// reference aborts it.
+func TestCompileZonesRejectsStaleScreenRefWhateverTheCallerDid_4960(t *testing.T) {
+	cfg := zoneScreenPrePassConfig()
+	result := newValidationResult()
+	// Phase 1/1.5 as CompileConfig runs them: the sweep reads ScreenIDs, which
+	// only assignScreenIDs populates, so without this the zone-good references
+	// would be unresolvable too and the test would reject for the wrong reason.
+	assignZoneIDs(result, cfg)
+	assignScreenIDs(result, cfg)
+
+	dp := &recordingDP{}
+	err := compileZones(dp, cfg, result)
+
+	if err == nil {
+		t.Fatal("#6894 r6: compileZones accepted a stale zone screen reference when " +
+			"called DIRECTLY. The guarantee is that its own top-of-function sweep " +
+			"rejects whatever the caller did first; reached without the pre-pass, " +
+			"nothing checked it")
+	}
+	if dp.zoneConfigCalls != 0 {
+		t.Fatalf("#6894 r6: compileZones programmed %d zone(s) before rejecting the "+
+			"stale screen reference. The pre-pass masks this for the single "+
+			"production caller, but the hoist's comment claims the property holds "+
+			"WHATEVER THE CALLER DID FIRST — reached directly, it does not",
+			dp.zoneConfigCalls)
+	}
+	if !strings.Contains(err.Error(), "no-such-screen-4960") {
+		t.Fatalf("#6894 r6: compileZones rejected for the wrong reason, so this test "+
+			"does not bind the hoist: %v", err)
+	}
+}

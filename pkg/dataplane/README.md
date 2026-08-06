@@ -538,10 +538,14 @@ then stays green.
     position — but it does change WHICH error an operator sees when a config
     carries more than one fault. Precedence is the pre-pass ROW ORDER, because
     the pre-pass returns on the first failing row. An unknown screen-profile
-    reference is no longer a zones-phase fault at all: it is a pre-pass row
-    (`zone screen references`) sitting EARLIER in the table than
-    `firewall filter protocols`, so it is the error reported when a config
-    carries both. Read the order off `validationPhases` rather than trusting this
+    reference is now reported by a pre-pass row (`zone screen references`)
+    sitting FIRST in the table, so it is the error an operator sees when a
+    config carries it alongside any other pre-pass fault. It remains a
+    zones-phase fault as well — #6894 hoisted `validateZoneScreenReferences`
+    to the top of `compileZones`, so a caller reaching that phase without the
+    pre-pass still rejects before any zone is programmed. The earlier wording
+    ("no longer a zones-phase fault at all") described only the pre-pass half
+    and read as though the zones-phase check had been removed. Read the order off `validationPhases` rather than trusting this
     sentence — the previous wording had the two the wrong way round. That file
     states what the pre-pass
     does and does not cover; the coverage table is not the whole compile.
