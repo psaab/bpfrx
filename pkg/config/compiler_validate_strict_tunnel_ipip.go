@@ -205,11 +205,38 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // has already swung through twice. An alarm names it; a commit does not stop
 // for it.
 //
-// Detection is by RUNTIME DEVICE NAME, not by *TunnelConfig pointer identity
-// (#6861 F1b). Pointer identity answers "is THIS record the object the emitter
-// published"; the advisory's actual claim is about a Linux device — "an
-// interface an operator can see that carries no traffic" — and several records
-// share one device with an emitted one:
+// A record is skipped when EITHER of two independent tests passes:
+//
+//	!emitted[t] && !live[t.Name]
+//
+// This conjunction is a deliberate two-clause design, NOT a leftover — do not
+// "simplify" it to one clause (#6861 F1b/r4). Neither subsumes the other, and
+// each was, at one point, the whole predicate and wrong on its own:
+//
+//   - `emitted[t]` is POINTER identity: "is this record the object the emitter
+//     published". It is the advisory's stated contract — a record with no
+//     emitted endpoint. Alone it is wrong, because several unemitted records
+//     SHARE a device with an emitted one (below), and it declared those live
+//     devices dead.
+//   - `live[t.Name]` is DEVICE identity: "is this record's kernel device claimed
+//     by something the emitter published". Alone it is also wrong: an emitted
+//     record whose own device name differs from where its endpoint binds —
+//     `reth0`, whose endpoint resolves to the physical member `ge-0-0-0` — gets
+//     reported as a dead anchor. That record is already covered, correctly, by
+//     the dead-endpoint advisory (ipipUnimplementedText), so this would be a
+//     SECOND diagnosis of one record, with a structurally false cause ("every
+//     unit overrides it" on an interface that has no units) pointing the
+//     operator at the wrong stanza.
+//
+// The orphan `reth0` device in that second case is real, but it is not this
+// gate's subject: the same orphan appears with `mode gre`, where #4785 is
+// deliberately silent, so #4785 is not its cause. It is the routing-vs-dataplane
+// name divergence tracked in #6941 (routing keys its desired set by
+// TunnelConfig.Name; the dataplane binds via snapshotLinuxName).
+//
+// Why the DEVICE clause has to exist at all: the advisory's claim is about a
+// Linux device — "an interface an operator can see that carries no traffic" —
+// and these records share one device with an emitted one:
 //
 //   - GRE/IPIP UNIT 0. compiler_interfaces.go gives unit 0's per-unit tunnel
 //     the BASE Linux name, identical to the interface-level record's, and

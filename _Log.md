@@ -70462,3 +70462,26 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/types.go, pkg/config/ipip_anchor_only_4785_test.go,
   pkg/config/ipip_tunnel_reject_4785_test.go, pkg/configstore/store.go,
   pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #6861 r4a: the two-clause anchor predicate carries its own rationale
+
+- **Timestamp**: 2026-08-06
+- **Action**: doc-only. After r4 restored the emitted-POINTER test alongside the
+  device-name test, `ipipAnchorOnlyWarnings`' doc comment still read "Detection
+  is by RUNTIME DEVICE NAME, **not** by *TunnelConfig pointer identity" — which
+  contradicted the code it sits above and reads as licence to delete the
+  `!emitted[t]` conjunct as a leftover. Rewritten to state that
+  `!emitted[t] && !live[t.Name]` is a deliberate two-clause design, that neither
+  clause subsumes the other, and that EACH was once the whole predicate and
+  wrong alone: pointer-only declared live shared devices dead (the original
+  #6861 defect); device-only reports an emitted `reth0` as a dead anchor with a
+  structurally false cause, duplicating a record the dead-endpoint advisory
+  already covers correctly. Also records the scope test that puts the orphan
+  `reth0` device in #6941 rather than #4785 — the same orphan appears under
+  `mode gre`, where #4785 is deliberately silent, so #4785 is not its cause.
+- **Rationale**: the shipping artifact has to carry the caveat. This reasoning
+  existed only in review correspondence; the next reviewer reading the code
+  would have found a comment arguing against one of its own clauses.
+- **Validation**: comment-only, no behaviour change. `go build ./...` 0;
+  `go test ./pkg/config ./pkg/configstore` 0.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go, _Log.md
