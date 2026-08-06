@@ -13,11 +13,20 @@ import (
 // RenderPersistent renders the persistent-NAT bindings table with
 // remaining timeout per binding.
 func RenderPersistent(w io.Writer, dp Reader) {
-	if dp == nil || dp.GetPersistentNAT() == nil {
+	// Fetch ONCE and check the fetched value (#5275): a Reader may be the
+	// daemon's revocable dataplane facade, whose GetPersistentNAT starts
+	// returning nil the moment the dataplane is dropped. A second call can
+	// therefore return nil when the guard's call did not, and All() takes the
+	// table's RLock with no nil-receiver guard.
+	var table *dataplane.PersistentNATTable
+	if dp != nil {
+		table = dp.GetPersistentNAT()
+	}
+	if table == nil {
 		io.WriteString(w, "Persistent NAT table not available\n")
 		return
 	}
-	bindings := dp.GetPersistentNAT().All()
+	bindings := table.All()
 	if len(bindings) == 0 {
 		io.WriteString(w, "No persistent NAT bindings\n")
 		return
@@ -39,11 +48,17 @@ func RenderPersistent(w io.Writer, dp Reader) {
 // RenderPersistentDetail renders per-binding detail for persistent-NAT
 // bindings, including current session counts per (NAT IP, NAT port).
 func RenderPersistentDetail(w io.Writer, dp Reader) {
-	if dp == nil || dp.GetPersistentNAT() == nil {
+	// Fetch ONCE — see RenderPersistent for why the per-use form crashes
+	// through the revocable facade (#5275).
+	var table *dataplane.PersistentNATTable
+	if dp != nil {
+		table = dp.GetPersistentNAT()
+	}
+	if table == nil {
 		io.WriteString(w, "Persistent NAT table not available\n")
 		return
 	}
-	bindings := dp.GetPersistentNAT().All()
+	bindings := table.All()
 	if len(bindings) == 0 {
 		io.WriteString(w, "No persistent NAT bindings\n")
 		return

@@ -149,6 +149,13 @@ var _ facadeBackend = (*dpuserspace.LegacyDataPlaneAdapter)(nil)
 type dataplaneFacade struct {
 	backend facadeBackend
 	state   atomic.Int32
+
+	// afterGetPersistentNAT is a TEST-ONLY seam, nil in production and never
+	// set by newDataplaneFacade. See GetPersistentNAT for why it exists. It is
+	// per-instance rather than package-level so a test setting it cannot race
+	// or leak into another test's facade; set it at construction, before any
+	// consumer can reach the facade, and treat it as read-only after that.
+	afterGetPersistentNAT func()
 }
 
 // newDataplaneFacade wraps backend in a LIVE facade, or returns nil when there
@@ -287,11 +294,51 @@ func (f *dataplaneFacade) GetMapStats() []dataplane.MapStats {
 	return f.backend.GetMapStats()
 }
 
+// GetPersistentNAT is the ONE delegator whose gate changes a guarantee callers
+// were relying on, so read this before touching a consumer of it.
+//
+// The backend it replaced is `return m.PersistentNAT` (pkg/dataplane/loader.go)
+// — a plain field read, non-nil for the life of a loaded dataplane. Four
+// consumers were written against that and called the getter once PER USE:
+// `if dp.GetPersistentNAT() == nil { ... }` and then `dp.GetPersistentNAT().Len()`.
+// Through the facade the second call can return nil when the first did not,
+// because revocation lands in between — and PersistentNATTable's methods take
+// its mutex with no nil-receiver guard (Len/Clear/All are all `t.mu.*Lock()`),
+// so the dereference PANICS. The window is real, not theoretical: the daemon
+// revokes from runBootstrapExitStartup while handler goroutines are serving,
+// and the gRPC server chains no panic-recovery interceptor, so a handler panic
+// takes down xpfd.
+//
+// The four consumers now fetch ONCE and check the fetched value, which is what
+// they always meant. Do not reintroduce the per-use form — it is not merely
+// redundant here, it is a crash.
+//
+// Deliberately NOT fixed by adding nil-receiver guards to PersistentNATTable: a
+// nil-receiver Clear() that silently succeeds would report "Cleared 0
+// persistent NAT bindings" for a revoked dataplane, which is a false success —
+// worse than the panic in the one respect that matters, because it lies to the
+// operator. TestPersistentNATIsFetchedOncePerFunction pins the fetch-once shape
+// mechanically so a future consumer cannot drift back.
+//
+// This is the only delegator with that shape. GetMapStats returns a nil SLICE
+// (len/range only, elements are values), PolicySchedulerActiveState a nil MAP
+// (read-only at both consumers), Compile's sole consumer discards the result
+// and checks the error, AppliedNATView is a value struct whose three consumers
+// all test Available and Config != nil, and every ProcessStatus consumer checks
+// the error first. Verified by reading each call site, not by inference.
 func (f *dataplaneFacade) GetPersistentNAT() *dataplane.PersistentNATTable {
 	if !f.live() {
 		return nil
 	}
-	return f.backend.GetPersistentNAT()
+	t := f.backend.GetPersistentNAT()
+	// Test-only seam (nil in production, never set by newDataplaneFacade): lets
+	// a test land a revocation in the window between a consumer's nil guard and
+	// its dereference deterministically, instead of racing a sleep and passing
+	// on broken code whenever it loses.
+	if f.afterGetPersistentNAT != nil {
+		f.afterGetPersistentNAT()
+	}
+	return t
 }
 
 func (f *dataplaneFacade) GetSessionV4(a0 dataplane.SessionKey) (dataplane.SessionValue, error) {

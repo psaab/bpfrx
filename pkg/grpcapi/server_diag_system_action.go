@@ -259,11 +259,26 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 		return &pb.SystemActionResponse{Message: "NAT translation statistics cleared"}, nil
 
 	case "clear-persistent-nat":
-		if s.dp == nil || s.dp.GetPersistentNAT() == nil {
+		// Fetch the table ONCE and check the fetched value (#5275). Per-use
+		// calls were safe against the raw backend (a plain field read) but the
+		// revocable facade can return nil on a later call when the guard's call
+		// did not, and PersistentNATTable's mutex-taking methods have no
+		// nil-receiver guard — so Len() on that nil panics this handler, and
+		// the server chains no panic-recovery interceptor.
+		//
+		// Written as two early returns rather than a typed local so this file
+		// does not have to import the root pkg/dataplane just to name the
+		// variable: the #1451 retirement-boundary canary tracks every such
+		// importer, and a nil check is not a reason to widen that surface.
+		if s.dp == nil {
 			return &pb.SystemActionResponse{Message: "Persistent NAT table not available"}, nil
 		}
-		count := s.dp.GetPersistentNAT().Len()
-		s.dp.GetPersistentNAT().Clear()
+		table := s.dp.GetPersistentNAT()
+		if table == nil {
+			return &pb.SystemActionResponse{Message: "Persistent NAT table not available"}, nil
+		}
+		count := table.Len()
+		table.Clear()
 		return &pb.SystemActionResponse{
 			Message: fmt.Sprintf("Cleared %d persistent NAT bindings", count),
 		}, nil

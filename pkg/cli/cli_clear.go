@@ -750,12 +750,22 @@ func (c *CLI) handleClearDHCP(args []string) error {
 }
 
 func (c *CLI) clearPersistentNAT() error {
-	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
+	// Fetch the table ONCE and check the fetched value (#5275). Calling the
+	// getter again per use was safe against the raw backend, whose
+	// GetPersistentNAT is a plain field read, but the revocable facade can
+	// return nil on a later call when the guard's call returned non-nil — and
+	// PersistentNATTable's methods take its mutex with no nil-receiver guard,
+	// so Len() on that nil would panic the daemon.
+	var table *dataplane.PersistentNATTable
+	if c.dp != nil {
+		table = c.dp.GetPersistentNAT()
+	}
+	if table == nil {
 		fmt.Println("Persistent NAT table not available")
 		return nil
 	}
-	count := c.dp.GetPersistentNAT().Len()
-	c.dp.GetPersistentNAT().Clear()
+	count := table.Len()
+	table.Clear()
 	fmt.Printf("Cleared %d persistent NAT bindings\n", count)
 	return nil
 }
