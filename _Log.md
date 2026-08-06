@@ -69232,3 +69232,74 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/compiler_idprobe_4960_test.go,
   pkg/dataplane/compiler_zone_screen_prepass_4960_test.go,
   pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 5b. The lead confirmed the F1 refutation firsthand and
+  asked for two hardenings; acting on the first found a REAL divergence my r5
+  claim had missed, so this entry corrects that claim as well as implementing
+  the asks.
+  **MY r5 CLAIM WAS TOO STRONG.** r5 said the fake and
+  `userspaceShimCompileDataplane` are equivalent because "all 38 shared methods
+  are byte-identical". True, but incomplete: the shim EMBEDS `*Manager`, so any
+  DataPlane method it does not override is PROMOTED to the retired-eBPF
+  implementation. Reflection says DataPlane has 130 methods while the shim
+  declares 55 — about 75 promote. Comparing the pre-pass CALL SURFACE (the 41
+  methods `discardingDataPlane` declares) against the shim's 55 finds THREE the
+  shim does not override, and one of them is live:
+  `GetPersistentNAT`. The fake returns a typed-nil `*PersistentNATTable`; the
+  shim promotes to `(*Manager).GetPersistentNAT`, which returns the live
+  `m.PersistentNAT`. It is called on the compile path, inside `compileNAT`
+  (`compiler_nat.go` twice). Both sites nil-guard, so the PRE-PASS SKIPS
+  `ClearPoolConfigs` and `SetPoolConfig` while production RUNS them. Neither
+  returns an error, so nothing can escape the pre-pass into the post-mutation
+  window and the F1 refutation stands — but "the pre-pass sees what the real
+  compile sees" was not true, and nothing pinned it. `IsLoaded` diverges too
+  (fake true, shim promoted) but is checked at the top of CompileConfig before
+  any mutation, so it cannot half-apply. `xpfValidationPass` is not a DataPlane
+  method.
+  **The equivalence guard is rebuilt around the correct invariant**, per the
+  lead's ask to enumerate dynamically rather than from a hardcoded list. It is
+  hybrid by necessity: REFLECTION enumerates the DataPlane method set (so a
+  method added later is automatically in scope), and AST classifies bodies and
+  declared-vs-promoted, because reflection CANNOT distinguish the two — Go
+  synthesizes a wrapper on the outer type for an embedded pointer, so a promoted
+  method and an overridden one have different func pointers and look identical.
+  A first attempt compared `sm.Func.Pointer()` against `mm.Func.Pointer()` and
+  reported 0 promoted out of 130, which is how that trap presents.
+  Four checks: (1) every shim-declared method is a no-op; (2) every method on
+  the pre-pass call surface is also overridden by the shim, or allowlisted in
+  `prePassShimDivergence` WITH an argument; (3) the allowlist is MINIMAL, so a
+  stale exemption cannot wave a future divergence through; (4) the shim
+  satisfies every DataPlane method, with a >=100 floor so the reflection half
+  cannot go vacuous.
+  MUTATION GRID, all in throwaway `git archive` extracts, `go vet` rc=0 on every
+  cell so each RED is an assertion and not a build break:
+  A — give the shim a validating `SetAddressBookEntry` (a ParseCIDR body):
+  **RED**, "non-no-op body: [SetAddressBookEntry]".
+  B — delete the `GetPersistentNAT` allowlist entry: **RED**, "discardingDataPlane
+  overrides [GetPersistentNAT], but userspaceShimCompileDataplane does NOT — so
+  in production those calls PROMOTE to the embedded *Manager".
+  C (negative control) — delete the shim's `AddTxPort` override, a method the
+  pre-pass never calls: **GREEN**, correctly, because a method outside the call
+  surface cannot cause a pre-pass/production divergence.
+  D — delete the shim's `SetAddressBookEntry` override so it promotes to the
+  validating eBPF Manager: **RED** on the same PROMOTE message. D is the
+  review's original F1 chain made real, and the guard catches it.
+  **F2's construction invariant is now pinned**, per the lead's caveat. The
+  argument that the two zone->screen resolution sites are redundant rests on
+  `assignScreenIDs` populating `result.ScreenIDs` BY RANGING
+  `cfg.Security.Screen`, which was implicit.
+  `TestScreenIDsKeySetMirrorsConfig_4960` asserts the two key sets agree in both
+  directions over three fixtures (empty / one / several). PROVEN TO FIRE: adding
+  a single `ScreenIDs["synced-from-peer"]` key that no config declares reds it,
+  `go vet` rc=0. Without this the comment claiming independent binding is
+  "structurally impossible" would silently become false the day ScreenIDs gains
+  a second source.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on both touched files.
+  STILL OWED, unchanged: F4 (widen the ID driver to PolicySetID / RuleID /
+  PolicyNames / scheduler slots) and F6 (success logs for no-op validation-pass
+  operations). Neither started.
+- **File(s)**: pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_zone_screen_prepass_4960_test.go, _Log.md

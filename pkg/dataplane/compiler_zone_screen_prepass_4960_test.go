@@ -259,3 +259,74 @@ func TestPrePassReportsTheSamePhaseProductionWould_4960(t *testing.T) {
 			"have seen (#6894 r5 F5)", err.Error())
 	}
 }
+
+// TestScreenIDsKeySetMirrorsConfig_4960 pins the construction invariant that
+// makes the two zone->screen resolution sites REDUNDANT (#6894 r5 F2).
+//
+// buildZoneConfig (compiler_iface.go) resolves a zone's screen-profile
+// reference against result.ScreenIDs; mapZoneInterface resolves the SAME
+// reference against cfg.Security.Screen. A review round observed that neither
+// site is independently bound — remove either and the suite stays green — and
+// asked for a test that separates them.
+//
+// It cannot be written honestly, and this test is why. assignScreenIDs
+// (compiler.go) populates ScreenIDs BY RANGING cfg.Security.Screen, so the two
+// key sets are identical by construction and no real config distinguishes the
+// sites. Separating them would need a hand-built CompileResult whose ScreenIDs
+// disagrees with cfg — a state production cannot produce, i.e. a fixture that
+// looks like coverage while testing nothing. (Since validateZoneScreenReferences
+// was hoisted to the top of compileZones and checks BOTH sources, both sites are
+// additionally backstops the sweep pre-empts.)
+//
+// The redundancy is therefore load-bearing, and it was implicit. If someone
+// later populates ScreenIDs from a second source — a synced peer, a cached
+// snapshot, an id reserved for a profile not in this config — the two sites stop
+// being redundant, the "structurally impossible to bind independently" reasoning
+// above becomes FALSE, and the missing independent binding becomes a real gap.
+// This test is what fails at that moment instead of the comment quietly rotting.
+func TestScreenIDsKeySetMirrorsConfig_4960(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		screens map[string]*config.ScreenProfile
+	}{
+		{"empty", map[string]*config.ScreenProfile{}},
+		{"one", map[string]*config.ScreenProfile{"a": {Name: "a"}}},
+		{"several", map[string]*config.ScreenProfile{
+			"zeta": {Name: "zeta"}, "alpha": {Name: "alpha"}, "mid": {Name: "mid"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Security.Screen = tc.screens
+			result := newValidationResult()
+			assignScreenIDs(result, cfg)
+
+			if len(result.ScreenIDs) != len(cfg.Security.Screen) {
+				t.Fatalf("ScreenIDs has %d entries, cfg.Security.Screen has %d — the "+
+					"two key sets have diverged, so the zone->screen reference no "+
+					"longer resolves identically against the compiled map and the raw "+
+					"config. The two resolution sites (compiler_iface.go) are no "+
+					"longer redundant and each now needs its own binding (#6894 r5 F2)",
+					len(result.ScreenIDs), len(cfg.Security.Screen))
+			}
+			for name := range cfg.Security.Screen {
+				if _, ok := result.ScreenIDs[name]; !ok {
+					t.Errorf("profile %q is in cfg.Security.Screen but not ScreenIDs — a "+
+						"zone naming it resolves at the raw-config site and FAILS at the "+
+						"compiled-map site, so which site runs first now changes the "+
+						"verdict (#6894 r5 F2)", name)
+				}
+			}
+			for name := range result.ScreenIDs {
+				if _, ok := cfg.Security.Screen[name]; !ok {
+					t.Errorf("ScreenIDs carries %q, which cfg.Security.Screen does not — "+
+						"ScreenIDs is being populated from a SECOND source. The two "+
+						"resolution sites are no longer redundant: a zone naming %q now "+
+						"passes the compiled-map check and fails the raw-config one. "+
+						"Give each site its own test and correct the redundancy "+
+						"reasoning above (#6894 r5 F2)", name, name)
+				}
+			}
+		})
+	}
+}
