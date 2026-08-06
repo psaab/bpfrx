@@ -429,7 +429,20 @@ a test in `armproof_5275_test.go`.
     the compiler did not look, so the proof cannot say. `WouldGate` excludes it
     because a clean `disable` is a legitimate operator action and folding every
     one into would-gate would swamp the measurement this phase exists to take.
-    **PR1 must decide** what a declined surface means to a gate.
+    **The gating PR must decide** what a declined surface means to a gate; PR1
+    only has to stop hiding it.
+  - A VLAN child whose parent was declined and **proven down** inherits
+    `skipped`, not `uncovered`. `compiler_iface.go` appends the child ~130 lines
+    *above* the `isDisabled` check and never appends a disabled parent, so a
+    clean `set interfaces ge-0-0-2 disable` leaves `ge-0-0-2.50` in the required
+    set with its delegate outside it. Reading that as uncovered would drive
+    would-gate on a legitimate operator action, on precisely the interface shape
+    both reference deployments run (`reth0.50`/`reth0.80` on the loss cluster,
+    VLAN 50 on the standalone VM) — an inflated baseline is the failure this
+    phase exists to prevent. A VLAN device cannot pass traffic while its real
+    device is DOWN, so a proven-down parent proves the child is not forwarding
+    either. If the parent's `LinkSetDown` *failed*, the child rides a netdev that
+    may still be up, zoned and XDP-less, so it stays `uncovered`.
   - The sharp case is promoted: a `disable` whose `netlink.LinkSetDown` fails
     (or whose link never resolved, so the down was never attempted) leaves the
     netdev up, still address-reconciled, still in a zone, still forwarded
@@ -463,8 +476,13 @@ conservative.
 **Observe-only, stated exactly.** The proof writes no Go state — not the
 `Manager`, and not the `CompileResult` it is proving (link resolution uses the
 non-memoising `peekLinkByIndex`, not `cachedLinkByIndex`). It does read live
-kernel and bpf state: one `RTM_GETLINK` for the attach mode plus one bpf_link
-info call per required surface.
+kernel and bpf state, and the cost is per surface *kind* rather than uniform: a
+`direct` surface with a tracked link costs one `RTM_GETLINK` for the attach mode
+plus one bpf_link info call for the program identity, and nothing at all when no
+link is tracked; a `delegated` surface costs at most one `RTM_GETLINK` to
+resolve its parent and never a bpf_link call, because it reuses the parent's
+already-computed classification; a declined surface is rendered from its
+recorded struct and costs nothing.
 
 **One line per compile, not per apply.** A single daemon apply compiles twice on
 the RETH deferred-MAC path (`reapplyAfterDeferredMAC`), so the apply generation

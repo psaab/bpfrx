@@ -68222,3 +68222,49 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold — F1 (MATERIAL): a VLAN child whose parent
+  was cleanly `disable`d landed `CoverageUncovered` and drove `WouldGate`.
+  `compiler_iface.go` appends the child to `pendingXDP` ~130 lines ABOVE the
+  `isDisabled` check and never appends a disabled parent, so `coverDelegated`'s
+  "delegate is not a required surface" branch caught it — on precisely the
+  shape both reference deployments run (loss cluster `reth0.50`/`reth0.80`,
+  standalone VLAN 50), inflating the very baseline this phase exists to
+  measure and contradicting the README's own rule that a clean `disable` stays
+  out of would-gate. `coverDelegated` now consults `unarmedByIfindex`: a
+  parent the compiler declined AND proved down (`StillForwarding == false`)
+  makes the child `CoverageSkipped` naming that parent; a parent whose
+  `LinkSetDown` FAILED still leaves the child `CoverageUncovered`, because the
+  child rides that same possibly-UP, zoned, XDP-less netdev. F2 (MATERIAL):
+  the structural canary's `ast.Inspect` matched only `*ast.BlockStmt`, but
+  `ast.CaseClause.Body`/`ast.CommClause.Body` are bare `[]ast.Stmt` — a real
+  early `return nil` inside a `switch { case ...: }` in `mapZoneInterface`
+  escaped it entirely while the byte-identical `if` form was caught. Added
+  `stmtBody` + `stmtListRecords` and repointed both halves (the
+  `mapZoneInterface` `return nil` walk and the `programZoneMaps` `continue`
+  walk). F3: README named PR1 as the phase that decides what a declined
+  surface means to a gate; `armproof.go` had it right (the gating PR does).
+  NITs: a proven-down declined surface now logs at INFO, not WARN alongside
+  the would-gate set; the "one RTM_GETLINK + one bpf_link info per required
+  surface" cost claim was wrong for DELEGATED surfaces (RTM_GETLINK via
+  `peekLinkByIndex`, no bpf_link call) and is now stated per surface kind.
+  DECLINED the ifindex→name NIT: `xdpLinkModeGeneric` is a `func(int) bool`
+  package var swapped by `swapArmProbes`, so threading a name changes that
+  seam plus `instanceLookup`/`coverDirect` and moves seven pinned summary
+  tokens (`10:direct/native`, `20:delegated/via-10/native`, …) — not the
+  "costs nothing" the review conditioned it on.
+- **Validation**: `go build ./...` exit 0; `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race`
+  exit 0; `go test ./pkg/refactoraudit/ -count=1` exit 0. Six mutations, all
+  RED via ASSERTION with `go vet` exit 0 first: M1 drop the proven-down
+  branch → `...VLANChildOfProvenDownParentIsSkipped` fails, and all three
+  over-reach guards stay GREEN; M2 drop the `!u.StillForwarding` condition →
+  `...VLANChildOfUnprovenParentStaysUncovered` fails; M3 `return nil` inside a
+  switch case in `mapZoneInterface` → canary fails (GREEN before this fold);
+  M4 `continue` inside a switch case in `programZoneMaps` → canary fails, and
+  the PR-head canary was re-run against M4 and confirmed GREEN; M5 revert the
+  skip log to WARN → `...DeclinedSurfaceLogsAtInfo` fails; M6 drop the parent
+  NAME from the child's detail → the naming assertion fails.
+- **File(s)**: pkg/dataplane/armproof.go,
+  pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md, _Log.md

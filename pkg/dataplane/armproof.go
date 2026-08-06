@@ -30,9 +30,15 @@ import (
 //
 // SIDE EFFECTS, stated exactly (an "observe-only" claim that is not literally
 // true is worse than no claim): the proof writes NO Go state — not the Manager,
-// not the CompileResult it is proving — and it READS live kernel and bpf state,
-// one RTM_GETLINK plus one BPF_OBJ_GET_INFO per required surface. It runs once
-// per compile, never per packet or per poll tick.
+// not the CompileResult it is proving — and it READS live kernel and bpf state.
+// The read cost is per surface KIND, not uniform: a DIRECT surface with a
+// tracked link costs one RTM_GETLINK for the attach mode plus one
+// BPF_OBJ_GET_INFO for the program identity, and nothing at all when no link is
+// tracked; a DELEGATED surface costs at most one RTM_GETLINK to resolve its
+// parent and never a bpf_link call, because it reuses the parent's
+// already-computed classification; a declined surface is rendered from its
+// recorded struct and costs nothing. It runs once per compile, never per packet
+// or per poll tick.
 //
 // STAGE. The plan's §5 takes the FINAL proof after the last mutation that can
 // invalidate it (networkd, the RETH MAC link-cycle, the AF_XDP rebind /
@@ -309,8 +315,8 @@ func missingInterfaceRecord(name, zone string, err error) UnarmedSurface {
 // It writes no Go state: not the Manager, and not the CompileResult it is
 // proving (the link resolution deliberately uses peekLinkByIndex, which does
 // not memoise, so the result's caches are untouched). It does READ live kernel
-// and bpf state — one RTM_GETLINK for the attach mode plus one bpf_link info
-// call per required surface — and never returns an error a caller acts on. A
+// and bpf state — see the SIDE EFFECTS note at the top of this file for the
+// per-kind cost — and never returns an error a caller acts on. A
 // readback failure degrades that surface to uncovered and is reported, the
 // conservative direction, matching what a gating build would do.
 func (m *Manager) ProveArmCoverage(result *CompileResult) ArmCoverageReport {
@@ -359,12 +365,13 @@ func classifyArmCoverage(result *CompileResult, lookup instanceLookup) ArmCovera
 	}
 
 	// Pass 2 emits in ifindex order, resolving delegation against pass 1.
+	unarmed := unarmedByIfindex(result)
 	for _, ifidx := range required {
 		if s, ok := direct[ifidx]; ok {
 			rep.Surfaces = append(rep.Surfaces, s)
 			continue
 		}
-		rep.Surfaces = append(rep.Surfaces, coverDelegated(result, direct, isRequired, ifidx))
+		rep.Surfaces = append(rep.Surfaces, coverDelegated(result, direct, isRequired, unarmed, ifidx))
 	}
 
 	// Surfaces the compiler declined to arm are NOT in pendingXDP at all. They
@@ -417,6 +424,26 @@ func coverDirect(lookup instanceLookup, ifidx int) SurfaceCoverage {
 	return s
 }
 
+// unarmedByIfindex indexes the surfaces the compiler declined to arm by their
+// RESOLVED ifindex, for the delegation check in coverDelegated.
+//
+// Only entries with a real ifindex are indexed. A missing netdev, a VLAN child
+// that was never created, and a nil zone slot all record Ifindex 0 by
+// construction — they have no ifindex to record — and folding them onto one key
+// would let any of them answer for some other surface's parent.
+func unarmedByIfindex(result *CompileResult) map[int]UnarmedSurface {
+	if len(result.unarmedSurfaces) == 0 {
+		return nil
+	}
+	out := make(map[int]UnarmedSurface, len(result.unarmedSurfaces))
+	for _, u := range result.unarmedSurfaces {
+		if u.Ifindex > 0 {
+			out[u.Ifindex] = u
+		}
+	}
+	return out
+}
+
 // coverDelegated classifies one VLAN sub-interface against its parent.
 //
 // The parent must be a REQUIRED surface and must itself have classified as
@@ -427,10 +454,14 @@ func coverDirect(lookup instanceLookup, ifidx int) SurfaceCoverage {
 // required, non-delegated surfaces), so the explicit isRequired check does not
 // change the verdict — it sharpens the recorded REASON, which is the whole
 // output of an observe-only phase.
+//
+// `unarmed` is the one case where a parent OUTSIDE the required set is not a
+// hole in the proof: see the PROVEN-DOWN PARENT note below.
 func coverDelegated(
 	result *CompileResult,
 	direct map[int]SurfaceCoverage,
 	isRequired map[int]bool,
+	unarmed map[int]UnarmedSurface,
 	ifidx int,
 ) SurfaceCoverage {
 	s := SurfaceCoverage{Ifindex: ifidx}
@@ -452,6 +483,35 @@ func coverDelegated(
 	s.Via = parent
 
 	if !isRequired[parent] {
+		// PROVEN-DOWN PARENT. A clean `set interfaces ge-0-0-2 disable` leaves
+		// the child in pendingXDP and the parent out of it: compiler_iface.go
+		// appends the VLAN child ~130 lines ABOVE the isDisabled check and
+		// never appends a disabled parent. Read as "delegate not required" the
+		// child lands UNCOVERED and drives WouldGate — on a legitimate
+		// operator action, on precisely the interface shape both reference
+		// deployments run (the loss cluster's reth0.50/reth0.80, the
+		// standalone VM's VLAN 50). That is the inflated baseline this phase
+		// exists to avoid, and it contradicts the stated rule that a clean
+		// disable stays out of would-gate.
+		//
+		// It is not a hole in the proof either: a VLAN device cannot pass
+		// traffic while its real device is DOWN, so a proven-down parent
+		// proves the child is not forwarding. The child inherits SKIPPED — the
+		// same third unknown the parent's own record carries, counted once per
+		// surface.
+		//
+		// StillForwarding is the whole condition. A disable whose LinkSetDown
+		// FAILED (or whose link never resolved, so it was never attempted)
+		// leaves the parent possibly UP, zoned and carrying no XDP, and the
+		// child rides that same netdev — so it stays UNCOVERED, which is the
+		// policy-free-router reading both records should have.
+		if u, ok := unarmed[parent]; ok && !u.StillForwarding {
+			s.Kind = CoverageSkipped
+			s.Detail = fmt.Sprintf(
+				"vlan child: delegate %s (ifindex %d) was declined by the compiler and proven "+
+					"down — %s", u.Name, parent, u.Reason)
+			return s
+		}
 		s.Detail = fmt.Sprintf(
 			"vlan child: delegate ifindex %d is not a required surface — nothing proves it armed", parent)
 		return s
@@ -638,7 +698,14 @@ func (rep ArmCoverageReport) LogArmCoverage(stage string, seq uint64) {
 	// Only the surfaces a gating build would have refused on are worth a
 	// per-surface line; a fully-covered box stays at one line. A SKIPPED
 	// surface gets one too — the compiler declined to arm it and said so only
-	// at WARN, so the proof restates it in its own terms.
+	// in its own terms, so the proof restates it in the proof's.
+	//
+	// The two levels are not cosmetic. WARN is the would-gate set: a surface a
+	// gating build would refuse on. A skip is the benign branch — the dominant
+	// member is a clean `disable`, which is a legitimate operator action and is
+	// excluded from would_gate for exactly that reason — so it is INFO. Logging
+	// it at WARN would put a routine commit's expected output at the same level
+	// as the policy-free-router condition and train operators to ignore both.
 	for _, s := range rep.Surfaces {
 		switch s.Kind {
 		case CoverageUncovered:
@@ -648,7 +715,7 @@ func (rep ArmCoverageReport) LogArmCoverage(stage string, seq uint64) {
 				"surface", s.label(),
 				"detail", s.Detail)
 		case CoverageSkipped:
-			slog.Warn("dataplane arm-coverage: compiler DECLINED to arm this surface (compile still succeeded)",
+			slog.Info("dataplane arm-coverage: compiler DECLINED to arm this surface (compile still succeeded)",
 				"issue", "#5275",
 				"stage", label,
 				"surface", s.label(),

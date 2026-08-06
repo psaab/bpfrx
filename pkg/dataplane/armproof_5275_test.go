@@ -310,16 +310,25 @@ func TestArmProofDelegationIsResolvedNotAssumed(t *testing.T) {
 // documented invariant — "the parent must itself be DIRECTLY covered" — which a
 // bare "does a link exist for the parent" check does not deliver.
 //
-// Concrete input: `set interfaces ge-0-0-2 disable` with ge-0-0-2.50 still in a
-// zone. compiler_iface.go appends the CHILD unconditionally (the VLAN block
-// runs before the isDisabled check) and never appends the parent, so the parent
-// is not a required surface. On an enabled->disabled commit the parent's
-// previous link is still tracked, so a lookup on it succeeds — and the child
-// would report covered by a parent that is admin-DOWN, unproven, and about to
-// be torn down.
+// The case this covers is an UNACCOUNTED-FOR parent: the child is required, the
+// parent is outside the required set, and the compiler recorded NOTHING about
+// it — so nothing in the whole compile says what happened to it. A stale
+// bpf_link from a previous compile still reads back an instance (the
+// enabled->disabled transition leaves the old link in place while the parent is
+// admin-DOWN and about to be torn down), and taking that as proof would report
+// a covered child with nothing enforcing its traffic. It stays UNCOVERED.
+//
+// The sibling case — the compiler DID record the parent, and proved it down —
+// is TestArmProofVLANChildOfProvenDownParentIsSkipped. The difference is the
+// record: an unaccounted-for parent is a hole in the proof, a proven-down one
+// is an answer. Both are reachable from `set interfaces ge-0-0-2 disable` with
+// ge-0-0-2.50 still in a zone, because compiler_iface.go appends the CHILD ~130
+// lines above the isDisabled check and never appends a disabled parent.
 func TestArmProofDelegateMustBeARequiredSurface(t *testing.T) {
 	r := newProofResult([]int{20}) // ONLY the child is required
 	vlanChild(r, 20, 10)
+	// Deliberately NO unarmed record for the parent: nothing in this compile
+	// accounts for ifindex 10 at all.
 
 	// The parent's stale link still reads back an instance.
 	rep := classifyArmCoverage(r, lookupFrom(map[int]uint32{10: 55}, nil))
@@ -335,6 +344,151 @@ func TestArmProofDelegateMustBeARequiredSurface(t *testing.T) {
 	}
 	if rep.Surfaces[0].Via != 10 {
 		t.Fatalf("the record must still name the parent that failed to cover it; got via=%d", rep.Surfaces[0].Via)
+	}
+}
+
+// TestArmProofVLANChildOfProvenDownParentIsSkipped pins the classification of
+// the interface shape BOTH reference deployments run.
+//
+// `set interfaces ge-0-0-2 disable` with ge-0-0-2.50 still in a zone leaves the
+// child in pendingXDP and the parent out of it — compiler_iface.go appends the
+// VLAN child ~130 lines ABOVE the isDisabled check and never appends a disabled
+// parent. Classified purely on "is the delegate required", the child lands
+// UNCOVERED and drives WouldGate on a clean operator action, on exactly the
+// shape the loss cluster (reth0.50/reth0.80) and the standalone VM (VLAN 50)
+// both run. This PR's deliverable is a NUMBER that calibrates a later gate's
+// threshold, so a baseline inflated by legitimate configs is the failure it
+// exists to prevent — and it contradicts this file's own stated rule that a
+// clean disable stays out of would-gate.
+//
+// It is not a hole in the proof either: a VLAN device cannot pass traffic while
+// its real device is DOWN, so the parent's proven-down record answers for the
+// child too. SKIPPED, the third unknown, is that answer.
+func TestArmProofVLANChildOfProvenDownParentIsSkipped(t *testing.T) {
+	r := newProofResult([]int{20}) // ONLY the child is required
+	vlanChild(r, 20, 10)
+	// The compiler's OWN record for a CLEAN disable: the link resolved and
+	// LinkSetDown succeeded, so the netdev is proven down.
+	r.recordUnarmedSurface(disabledSurfaceRecord("ge-0-0-2", 10, nil, nil))
+
+	// Nothing is attached anywhere — a disabled parent never gets a shim.
+	rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+
+	if rep.Uncovered != 0 {
+		t.Fatalf("a VLAN child whose parent the compiler declined and PROVED down must not read "+
+			"uncovered — the parent netdev is down, so nothing forwards through the child either, "+
+			"and reading it uncovered inflates the baseline on every VLAN-over-parent deployment; "+
+			"got %+v (%s)", rep, rep.SurfaceSummary())
+	}
+	if rep.WouldGate {
+		t.Fatalf("a clean `disable` must stay OUT of would-gate — this file's own stated rule for "+
+			"a legitimate operator action; got %+v (%s)", rep, rep.SurfaceSummary())
+	}
+	// The child and the parent's own record: two surfaces, counted once each.
+	if rep.Skipped != 2 {
+		t.Fatalf("expected the child AND the parent record as 2 skipped surfaces; got %+v (%s)",
+			rep, rep.SurfaceSummary())
+	}
+	child := rep.Surfaces[0]
+	if child.Kind != CoverageSkipped || child.Via != 10 {
+		t.Fatalf("the child's record must be skipped and still name the parent; got %+v", child)
+	}
+	if !strings.Contains(child.Detail, "ge-0-0-2") {
+		t.Fatalf("the child's detail must NAME the proven-down parent, not just its ifindex, or an "+
+			"operator cannot tell which interface answered for it; got %q", child.Detail)
+	}
+}
+
+// TestArmProofVLANChildOfUnprovenParentStaysUncovered is the OVER-REACH GUARD
+// for the test above: the promotion is conditioned on the netdev being PROVEN
+// down, not merely on the compiler having declined it.
+//
+// Same operator action, but netlink.LinkSetDown FAILED. The disable branch logs
+// that at WARN and continues, address reconciliation runs regardless, and the
+// parent is left possibly UP, still in a zone, still forwarded through by the
+// kernel with no XDP — the policy-free-router condition #5275 exists to
+// prevent. The VLAN child rides that same netdev, so it must NOT inherit the
+// benign reading.
+func TestArmProofVLANChildOfUnprovenParentStaysUncovered(t *testing.T) {
+	r := newProofResult([]int{20})
+	vlanChild(r, 20, 10)
+	r.recordUnarmedSurface(disabledSurfaceRecord("ge-0-0-2", 10, nil, errors.New("device or resource busy")))
+
+	rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+
+	if rep.Uncovered != 2 {
+		t.Fatalf("a parent whose link-down FAILED is the policy-free-router condition and the child "+
+			"rides the same netdev — BOTH must read uncovered; got %+v (%s)", rep, rep.SurfaceSummary())
+	}
+	if rep.Skipped != 0 {
+		t.Fatalf("nothing here is a benign skip; got %+v (%s)", rep, rep.SurfaceSummary())
+	}
+	if !rep.WouldGate {
+		t.Fatalf("an unproven-down parent carrying a zoned, XDP-less netdev must be reported "+
+			"WOULD-GATE; got %+v", rep)
+	}
+}
+
+// TestArmProofProvenDownRecordCoversOnlyItsOwnChild is the second OVER-REACH
+// GUARD: a proven-down record answers for the VLAN children delegating to THAT
+// ifindex and for nothing else. An ordinary direct surface with no instance is
+// still the policy-free-router condition no matter what else on the box was
+// cleanly disabled.
+func TestArmProofProvenDownRecordCoversOnlyItsOwnChild(t *testing.T) {
+	// 20 is a VLAN child of the proven-down 10; 30 is an unrelated direct
+	// surface with nothing attached.
+	r := newProofResult([]int{20, 30})
+	vlanChild(r, 20, 10)
+	r.recordUnarmedSurface(disabledSurfaceRecord("ge-0-0-2", 10, nil, nil))
+
+	rep := classifyArmCoverage(r, lookupFrom(nil, nil))
+
+	var thirty SurfaceCoverage
+	for _, s := range rep.Surfaces {
+		if s.Ifindex == 30 {
+			thirty = s
+		}
+	}
+	if thirty.Kind != CoverageUncovered {
+		t.Fatalf("a direct surface with no instance stays uncovered however many OTHER surfaces "+
+			"were proven down; got %+v (%s)", thirty, rep.SurfaceSummary())
+	}
+	if !rep.WouldGate {
+		t.Fatalf("an unattached direct surface must still drive would-gate; got %+v (%s)",
+			rep, rep.SurfaceSummary())
+	}
+}
+
+// TestArmProofDeclinedSurfaceLogsAtInfo pins the two per-surface LEVELS apart.
+//
+// WARN is the would-gate set — the surfaces a gating build would refuse on. A
+// declined surface is the benign branch, and its dominant member is a clean
+// `disable`, which this file deliberately excludes from would_gate. Emitting it
+// at WARN puts a routine commit's expected output at the same level as the
+// policy-free-router condition, which trains operators to ignore both.
+func TestArmProofDeclinedSurfaceLogsAtInfo(t *testing.T) {
+	buf := captureLogs(t)
+
+	r := newProofResult([]int{40}) // 40 is attached to nothing -> uncovered
+	r.recordUnarmedSurface(disabledSurfaceRecord("ge-0-0-2", 10, nil, nil))
+	classifyArmCoverage(r, lookupFrom(nil, nil)).LogArmCoverage("post-attach", 9)
+
+	for _, line := range strings.Split(buf.String(), "\n") {
+		switch {
+		case strings.Contains(line, "DECLINED to arm"):
+			if !strings.Contains(line, "level=INFO") {
+				t.Fatalf("a declined surface is the benign branch and must log at INFO, not "+
+					"alongside the would-gate set; got %q", line)
+			}
+		case strings.Contains(line, "WOULD fail a gating proof"):
+			if !strings.Contains(line, "level=WARN") {
+				t.Fatalf("a would-gate surface must stay at WARN — demoting it hides the "+
+					"policy-free-router condition this PR exists to measure; got %q", line)
+			}
+		}
+	}
+	if !strings.Contains(buf.String(), "DECLINED to arm") || !strings.Contains(buf.String(), "WOULD fail a gating proof") {
+		t.Fatalf("this cell needs BOTH per-surface lines present to compare their levels; got %q", buf.String())
 	}
 }
 
@@ -867,9 +1021,10 @@ func stmtCallsFunc(stmt ast.Stmt, name string) bool {
 	return found
 }
 
-// blockRecords reports whether a block directly calls recordUnarmedSurface.
-func blockRecords(block *ast.BlockStmt) bool {
-	for _, stmt := range block.List {
+// stmtListRecords reports whether a statement list directly calls
+// recordUnarmedSurface.
+func stmtListRecords(list []ast.Stmt) bool {
+	for _, stmt := range list {
 		expr, ok := stmt.(*ast.ExprStmt)
 		if !ok {
 			continue
@@ -879,6 +1034,28 @@ func blockRecords(block *ast.BlockStmt) bool {
 		}
 	}
 	return false
+}
+
+// stmtBody returns the statement list a node carries, if it carries one.
+//
+// A *ast.BlockStmt is the obvious carrier, and matching only that is what the
+// previous version of this walk did — but ast.CaseClause.Body and
+// ast.CommClause.Body are BARE []ast.Stmt with no enclosing block node. So a
+// `return nil` or `continue` written inside a `switch { case ...: }` or a
+// `select { case ...: }` arm was invisible to the canary while the
+// byte-identical statement written under a plain `if` was caught. That gap was
+// demonstrated, not theorised: a real early `return nil` inserted into a switch
+// case in mapZoneInterface left `go vet` and the whole ArmProof suite green.
+func stmtBody(n ast.Node) ([]ast.Stmt, bool) {
+	switch b := n.(type) {
+	case *ast.BlockStmt:
+		return b.List, true
+	case *ast.CaseClause:
+		return b.Body, true
+	case *ast.CommClause:
+		return b.Body, true
+	}
+	return nil, false
 }
 
 // isReturnNil reports whether stmt is `return nil`.
@@ -974,6 +1151,10 @@ func TestArmProofIsInvokedFromCompileUserspaceShim(t *testing.T) {
 // result.pendingXDP, so every early `return nil` in it drops a configured attach
 // point while the compile SUCCEEDS. programZoneMaps sits one frame up and its
 // `continue` drops every interface in a whole zone.
+//
+// "Control flow" means every statement list a branch can live in, not just
+// *ast.BlockStmt — see stmtBody. Matching blocks alone let a `return nil` in a
+// switch case escape the enumeration entirely.
 func TestArmProofEverySurfaceDroppingBranchRecords(t *testing.T) {
 	_, file := parseDataplaneFile(t, "compiler_iface.go")
 
@@ -982,16 +1163,16 @@ func TestArmProofEverySurfaceDroppingBranchRecords(t *testing.T) {
 	final := fn.Body.List[len(fn.Body.List)-1]
 	dropping := 0
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		block, ok := n.(*ast.BlockStmt)
+		body, ok := stmtBody(n)
 		if !ok {
 			return true
 		}
-		for _, stmt := range block.List {
+		for _, stmt := range body {
 			if stmt == final || !isReturnNil(stmt) {
 				continue
 			}
 			dropping++
-			if !blockRecords(block) {
+			if !stmtListRecords(body) {
 				t.Errorf("mapZoneInterface has an early `return nil` at line %d that records no "+
 					"unarmed surface — the compile succeeds, the surface vanishes from pendingXDP, "+
 					"and the proof reports Uncovered=0 for an attach point it never looked at",
@@ -1011,17 +1192,17 @@ func TestArmProofEverySurfaceDroppingBranchRecords(t *testing.T) {
 	zoneFn := findFuncDecl(t, file, "programZoneMaps")
 	continues := 0
 	ast.Inspect(zoneFn.Body, func(n ast.Node) bool {
-		block, ok := n.(*ast.BlockStmt)
+		body, ok := stmtBody(n)
 		if !ok {
 			return true
 		}
-		for _, stmt := range block.List {
+		for _, stmt := range body {
 			br, ok := stmt.(*ast.BranchStmt)
 			if !ok || br.Tok != token.CONTINUE {
 				continue
 			}
 			continues++
-			if !blockRecords(block) {
+			if !stmtListRecords(body) {
 				t.Errorf("programZoneMaps skips a zone at line %d without recording it — "+
 					"mapZoneInterface is the only writer of pendingXDP, so EVERY interface in "+
 					"that zone is dropped from the required set while the compile succeeds",
