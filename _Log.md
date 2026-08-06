@@ -1,3 +1,306 @@
+## 2026-08-06 — #6902 round 5: the neutrality contract was guarded in one direction
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold two findings from the hostile review leg, plus a precision
+  correction to the round-4 comment. Test-file-only; production warning strings
+  still byte-identical to round 1, `cmp`-verified after every cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**ADD-1 — the reverse direction had NO guard.** The contract at
+`compiler_validate_vrf_overlap.go:58-59` is symmetric: the text "must not promise
+a fix, nor rule one out". All 31 blocklist entries were forward-looking, so
+appending `". #2387 is closed wontfix; this is by design and permanent"` passed
+the whole suite while foreclosing an outcome that is still the maintainer's to
+decide. That is the more dangerous half: an operator who reads "by design" stops
+treating an overlapping-VRF topology as a hazard to revisit.
+
+Added `vrfOverlapForeclosingTokens` and widened the test to scan both groups.
+Adding a DIRECTION is not the same act as growing a list — one covers an axis
+with zero coverage, the other chases an infinite tail — and the comment now says
+so, so the two do not get confused later.
+
+**ADD-2 — helper doc.** Already folded in round 4: `vrf2387Warnings` now
+documents that it selects on the diagnosis phrase, deliberately not on `#2387`.
+
+**Correction to round 4's own comment.** It said the control defends against
+"wholesale" deletion being caught elsewhere; the reviewer's framing is sharper
+and the round-4 text was imprecise in the other direction — it asserted the gut
+"reds only this test", which is false. Measured below: the gut also reds
+`TestVRFOverlapWarnsOnOverlappingRIs`, because that gut drops "NOT
+session-isolated". The cell where the control is the ONLY red in the file is the
+discriminator-clause strip. The comment now states exactly that.
+
+| Mutation | subs | Promise | Substance | 6 pre-existing |
+|---|---|---|---|---|
+| baseline | 0 | GREEN | GREEN | ALL GREEN |
+| APPEND foreclosing (wontfix/by design/permanent) | 2 | RED `wontfix` | GREEN | ALL GREEN |
+| SPLICE foreclosing BEFORE the tail | 2 | RED `by design` | GREEN | ALL GREEN |
+| SPLICE forward-looking BEFORE the tail | 2 | RED `planned` | GREEN | ALL GREEN |
+| APPEND the disclosed-escape wording | 2 | RED (suffix) | GREEN | ALL GREEN |
+| SPLICE the disclosed-escape wording before the tail | 2 | GREEN | GREEN | ALL GREEN |
+| GUT to a bare issue reference | 2 | GREEN | RED | 1 RED |
+| WHOLESALE delete the advisory | 2 | RED (helper) | RED (helper) | 2 RED |
+| literal FULL revert of both arms to master | 2 | RED `until` | RED | ALL GREEN |
+| strip every `#2387`, diagnosis intact | 4 | RED (suffix) | GREEN | ALL GREEN |
+| round-4 cells R4a-R4e, re-run | 2 ea | unchanged | unchanged | ALL GREEN |
+
+The two mid-message SPLICE cells are what prove each blocklist load-bearing in
+the span the suffix pin cannot reach; both fire naming a token from the intended
+group. Negative control for the prescribed addition: with
+`vrfOverlapForeclosingTokens` emptied, the foreclosing splice goes GREEN — so the
+new group, not something incidental, is what catches it.
+
+Two rows are honest limits rather than wins. Splicing the disclosed-escape
+wording (`the VRF-aware session key fixes this`) BEFORE the tail leaves both
+tests GREEN — that is the blocklist incompleteness the test file already
+discloses, and the suffix pin only reaches the append form of it. And the
+`#2387`-strip cell now fires at the suffix assertion rather than at the old
+issue-reference check; the defect did not move and the round-3 filter change
+stays.
+
+## 2026-08-06 — #6902 round 4: the assertions bound VOCABULARY, not the CLAIM
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three test-contract findings plus two comment corrections.
+  Test-file-only — the production warning strings are byte-identical to rounds
+  1 through 3, verified with `cmp` against a pristine copy after every
+  mutation cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**F1a — the substance test was polarity-insensitive.** It asserted the bare
+noun `"cross-forward"`. Rewriting `may cross-forward` to `cannot cross-forward`
+inverts the diagnosis — the operator is told the topology IS session-isolated,
+so the hazard reads as a reassurance — and both tests stayed GREEN. Verified
+firsthand at HEAD 690dba2c8 before the fix. A bare noun cannot carry polarity;
+the assertions now hold the claim as contiguous spans: `"the session identity
+carries no routing-instance discriminator"` and `"colliding 5-tuples may
+cross-forward"` (subject + modality + verb).
+
+**F1b — the promise test was a token blocklist, and only a blocklist.**
+Appending `"A fix is guaranteed."` to both arms reintroduces an explicit promise
+that no listed spelling matches; both tests stayed GREEN. Growing the list is
+the trap the list itself documents, so the fix is structural: a new
+`vrfOverlapStatusTail` constant that both arms must END with, verbatim. One
+suffix comparison forbids appending, truncating, and rewording the tail at once.
+The blocklist is retained as the secondary layer and its doc now says what it
+still uniquely covers — a promise spliced into the span BEFORE the tail — and
+that it must not be grown.
+
+**F2 — the PR's own new sentence was unpinned.** The assertion checked only for
+the presence of any `#2387`, and the message carried a `(#2387)` before this PR.
+Deleting the entire new tail — `"See #2387 for the status of this limitation"` —
+left the earlier reference in place and both tests GREEN. The deliverable, going
+unbound. `vrfOverlapStatusTail` pins the sentence, not the reference.
+
+| Mutation (production warning strings) | subs | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|---|
+| baseline | 0 | GREEN | GREEN |
+| `may cross-forward` -> `cannot cross-forward` | 2 | RED | RED |
+| append `A fix is guaranteed.` | 2 | RED | GREEN |
+| delete the `See #2387 …limitation` tail, keep earlier `(#2387)` | 2 | RED | GREEN |
+| restore `until the session identity is VRF-aware` (tail only) | 2 | RED | GREEN |
+| strip the `no routing-instance discriminator` clause, keep tail | 2 | GREEN | RED |
+| wholesale-delete the advisory text (F3 probe) | 2 | RED (helper) | RED (helper) |
+
+Every cell reports the substitutions APPLIED before its result was read: a
+pattern that silently matches nothing is a no-op wearing a passing guard, and it
+bit this exact matrix once — the clause-strip regex matched only the unequal arm
+(1 of 2) because the word "session" falls on a different concatenation line in
+each arm. Both isolating cells fire on BOTH arms. Every RED is an assertion
+message, never a build break; production restored from a pristine copy and
+`cmp`-verified after each cell. The first three rows were re-run against the
+pre-fix test file and measured GREEN/GREEN, which is what makes them findings
+rather than hypotheses.
+
+**F3 — a false claim in the test's own comment, endorsed in my brief.** The
+comment said that without the substance control, the promise test "is satisfied
+just as well by deleting the warning text wholesale". It is not:
+`vrfOverlapBothFormStrings` requires the diagnosis selector to match, exactly one
+warning per fixture, and both arm markers, so wholesale deletion reds the promise
+test at the helper first. Measured — the F3 probe row above fails at
+`compiler_validate_vrf_overlap_2387_test.go:311`, the fixture-count assertion, in
+BOTH tests. The control's real value is against PARTIAL stripping: text that
+still passes the selector and still ends with the exact tail but has lost the
+cause, the consequence, or the pairing. The comment now says that.
+
+**F4 — two stale comments.** The `vrf2387Warnings` doc still said it "returns
+the compile warnings that mention #2387"; it has filtered on the diagnosis
+phrase since round 3 (deliberately — filtering on `#2387` made the tracking-issue
+assertion unreachable). And the arg-count claim corrected in the round-3 entry
+above.
+
+No production behaviour change: the warning fires on the same configurations,
+with the same severity, and still commits. No module doc needs updating — this
+round changes test assertions and comments only, and the operator-visible
+warning text is unchanged from round 1, whose doc updates already landed.
+
+## 2026-08-05 — #6902 round 3: the identity assertions bound PRESENCE, not ASSOCIATION
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold four re-gate findings. Test-file-only — production warning
+  strings byte-identical to rounds 1 and 2.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F3 — the finding worth the round.** Round 2 added per-form identity
+assertions, but as a LIST OF TOKENS. Presence and association are different
+properties and only the second is useful: every identifier stays in the string
+while attached to the WRONG object. Both format strings interleave the two
+instances' identifiers — the equal-prefix arm substitutes FIVE arguments (two
+name/origin pairs plus the single prefix they share), the unequal arm SIX (a
+full (name, origin, prefix) triple each) — precisely where a transposition
+happens, and `go vet` cannot see it, because every argument is a string or
+Stringer feeding %q/%s. (Round 4 correction: this paragraph originally called
+both arms "6-argument Sprintf calls carrying three (name, origin, prefix)
+triples", which is wrong on both counts for the equal-prefix arm.)
+
+Measured on the round-2 form: swapping the two origins, the two RI names, or the
+two prefixes each left `go test ./pkg/config/ -count=1` fully GREEN and
+`go vet ./pkg/config/` silent, while the operator was sent to the wrong
+interface or told the wrong prefix sits on the wrong instance — the same
+"told the hazard but not where" failure round 2 was written to prevent, one
+level down. Replaced with ORDERED PAIRINGS held as one contiguous substring. A
+strict replacement, not an addition: a strip breaks the pairing too.
+
+| Mutation (arg transposition in the Sprintf) | substance test |
+|---|---|
+| baseline | GREEN |
+| equal arm, origins swapped | RED |
+| equal arm, RI names swapped | RED |
+| unequal arm, origins swapped | RED |
+| unequal arm, prefixes swapped | RED |
+
+**F4 — an assertion that could not fail.** The `#2387` check was unreachable:
+the helper pre-filtered on the same substring, so every warning reaching it had
+already been selected for containing it. Dropping #2387 failed the fixture's
+COUNT assertion instead, with a message about the wrong thing. The helper now
+filters on the diagnosis phrase ("overlapping L3 across routing-instances"),
+which both arms carry and no other warning does. Verified: removing BOTH #2387
+occurrences from the unequal arm now fires the intended assertion with the
+intended message. (One occurrence is not enough — the tail carries a second.)
+
+**F2 — one of my unmeasured guesses was off-target.** Round 2 added six sibling
+tokens on top of four measured escapes. "work is under way" fires only on that
+exact four-word spelling and misses "underway" and "in progress" — the phrasing
+actually measured. "temporarily" was a good add ("temporary" is not a substring
+of it). Added the eleven still-escaping spellings the review measured, and kept
+"work is under way" with a comment recording it as the worked example of
+reaching for an imagined phrase instead of an observed one.
+
+**F5 — not folded, recorded here instead.** The round-1 COMMIT MESSAGE says "No
+runtime behaviour changes". The operator-facing warning TEXT changed, which is
+runtime output — it is the entire PR. The clause after the dash is right; only
+the headline overstates. The commit is pushed and rewriting it would move the
+PR head for a prose fix, so the correction lives here and in the PR body: the
+accurate statement is "no behaviour change beyond the warning text".
+
+**F6 — validation record was incomplete, not wrong.** Rounds 1-2 claimed only Go
+legs. `userspace-dp/tests/vrf_session_identity_doc_guard.rs` asserts on BOTH
+docs round 1 edited, including plan anchors on the very bullets it rewrote, and
+`make test` runs both legs (#4006). Ran it: `cargo test --test
+vrf_session_identity_doc_guard` -> ok, 2 passed, 0 failed. No defect; the record
+just never named the leg the diff put at risk.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; `cargo test --test vrf_session_identity_doc_guard` ok
+(2 passed); every restore verified byte-identical with `cmp`.
+
+## 2026-08-05 — #6902 round 2: the mutation recipe in the shipping comment was false
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three hostile-review findings. Test-only — the production
+  warning strings are byte-identical to round 1.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F1 — the recipe did not do what it said.** The header comment claimed that
+"restoring the old …until the session identity is VRF-aware wording" reds the
+promise test while the substance test stays GREEN. Reproduced firsthand: a
+LITERAL revert to the pre-PR string reds BOTH. The old string also lacked the
+"no routing-instance discriminator" clause, so reverting changes two things at
+once — re-adds the promise AND removes the diagnosis. The isolating mutation is
+a TAIL-ONLY substitution that keeps the discriminator clause; the comment now
+prescribes exactly that and warns not to read a both-red result as "the tests do
+not separate". Worth keeping: that the old text trips the substance test proves
+the replacement is strictly more informative than what it replaced.
+
+**F2 — the blocklist was a guess, and the review measured the escapes.** Four
+spellings reintroduced a promise while the test stayed GREEN: "not yet",
+"pending", "temporary", "in a later release". Added those plus siblings
+("temporarily", "for now", "interim", "to be addressed", "work is under way",
+"soon"), each re-verified RED after injection. The list comment now states
+plainly that a blocklist is incomplete by construction — green means "contains
+none of these", NOT "contains no promise" — and that any addition must be shown
+green before being listed.
+
+**F3 — the diagnosis was identified by nobody.** The substance test asserted
+only the explanatory prose, so the RI names, the config origins and the prefixes
+were all strippable with `pkg/config` fully green: an operator would be told a
+cross-forwarding hazard exists but not where. Added per-form identity
+assertions, including BOTH prefixes on the unequal-overlap arm — printing only
+one loses the overlap that arm exists to report.
+
+Mutation matrix, each dimension binding independently:
+
+| Mutation | promise test | substance test |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| tail-only promise restore (the isolating one) | RED | GREEN |
+| blank the RI name, equal-prefix arm | GREEN | RED |
+| duplicate the prefix, unequal-overlap arm | GREEN | RED |
+| literal full revert | RED | RED (expected — two changes) |
+
+Each of the four F2 escapes verified RED after being listed. All arg-count-
+preserving mutations, so every red is an assertion and not a build break.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; restores verified byte-identical with `cmp`.
+
+## 2026-08-05 — #2387 A.1: the warning promised an outcome #2387 has not decided
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording)
+- **Action**: Reword the `validateVRFOverlap` commit warning so it states the
+  CURRENT limitation and points at #2387, instead of promising that the session
+  identity becomes VRF-aware. Add two tests that keep forward-looking wording
+  out of both format strings without letting the diagnostic be gutted.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `pkg/config/compiler_tailgates.go`,
+  `docs/research/2387-vrf-flow-identity/plan.md`,
+  `userspace-dp/src/afxdp/forwarding/README.md`
+
+The shipped text said colliding 5-tuples may cross-forward "until the session
+identity is VRF-aware". #2387 is held on a maintainer risk-appetite call and
+neither candidate end-state — the hard-reject posture, or the VRF-aware session
+key (Track B) — is decided, so that clause asserted an outcome that may never
+arrive. It was also circular: the #2387 plan cited the warning text back as
+evidence that the widening was already settled, while the warning had been
+written from the plan's assumption. Both sides are now decoupled; the plan
+bullet that leaned on the warning records that the argument is retired and is
+evidence for neither branch.
+
+Mutation proof (a guard is worthless until watched to fail), 2x2, orthogonal:
+
+| Mutation | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| restore "until…VRF-aware" in both format strings | RED (both arms) | GREEN |
+| strip diagnostic substance, keep no-promise wording | GREEN | RED |
+
+The second row is the negative control: without it, the no-promise test is
+satisfied just as well by deleting the warning text wholesale. The fixture
+helper asserts each arm was actually reached (`both carry` vs `carry
+overlapping L3`) before asserting on it — a single fixture binds one match arm,
+so a "both format strings" claim made from one fixture would be vacuous.
+
+A first mutation attempt was a no-op: the substitution anchored on the wrong
+tab depth, matched nothing, and the suite stayed green — which is
+indistinguishable from a passing guard. Counting the applied substitutions
+before reading the result is what caught it.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.9s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean on all three Go files; post-mutation restore verified
+byte-identical with `cmp`.
 ## 2026-08-06 — #6864 round 2: ParentIndex is not a VLAN parent for every link kind
 
 - **Timestamp**: 2026-08-06 (fix/5275-arm-failclosed, PR #6864)
@@ -68308,6 +68611,43 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
 
+## 2026-08-06 — #2387: state what the VRF-overlap tests actually enforce
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct two high-level comments that overclaimed the guard (comment-only)
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+A Codex gate and a hostile Claude gate reached the same finding by different
+routes: the DETAILED blocklist comments are honest about being incomplete, but
+the two HIGH-LEVEL summaries above them claim a semantic guarantee the tests do
+not provide.
+
+Codex measured the escape set rather than arguing it. Nine distinct foreclosing
+sentences and nine distinct promising sentences, none using a listed spelling,
+were each spliced before the status tail in both warning arms; all eighteen left
+`go test ./pkg/config` GREEN. Mechanism by shape, measured:
+
+| shape | suffix pin | token lists |
+|---|---|---|
+| APPEND after the tail | always catches | also, if listed |
+| REWORD inside the tail | always catches | also, if listed |
+| SPLICE before the tail | BLIND | listed spellings only |
+| PREPEND at the front | BLIND | listed spellings only |
+
+So the test-file header's "(5) ... with no forecast in EITHER direction before
+it" and the production comment's "keeps forward-looking wording out of BOTH
+format strings" both overstate. Corrected to state the split: the tail is pinned
+verbatim so nothing can be appended, reworded or dropped there; mid-message
+wording is caught only in spellings someone listed. The shipped text is neutral
+because it was written to be, not because the test would stop an author.
+
+Neither list is grown — that is the completeness trap the file's own doctrine
+note refuses, and growing it would trade a disclosed limit for a hidden one.
+
+Comment-only: every changed line is `//` or blank, verified by stripping the
+diff markers and filtering. `gofmt -l` clean, `go vet ./pkg/config/` 0,
+`go test ./pkg/config -run TestVRFOverlap -count=1` 0.
 - **Timestamp**: 2026-08-06
 - **Action**: #5275 PR1 review fold — F1 (MATERIAL): a VLAN child whose parent
   was cleanly `disable`d landed `CoverageUncovered` and drove `WouldGate`.
