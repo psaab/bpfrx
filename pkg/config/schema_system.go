@@ -1014,7 +1014,39 @@ func dhcpStaticBindingSchema() *schemaNode {
 }
 
 var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*schemaNode{
-	"community": {desc: "SNMP community", args: 1, placeholder: "<community-name>", children: map[string]*schemaNode{
+	// #4313: closed-world. Leaf-completeness audit gating the flip — the Junos
+	// `snmp community <name>` child set is authorization / clients / view /
+	// client-list-name / routing-instance, and all five are now modeled below.
+	// The last three were the documented reason this subtree was SKIPPED in the
+	// PR-C rollout ("snmp community (Junos view / client-list-name /
+	// routing-instance unmodeled)"); modeling them is what makes the flip safe,
+	// the same add-then-arm order `security ike proposal` followed when a
+	// missing `description` leaf was all that blocked it.
+	//
+	// All three are ACCEPTED-INERT: xpf models them so a valid Junos config
+	// commits and so closed-world cannot false-reject, but the compiler does
+	// not act on them — `TestSNMPInertKnobAdvisories` is the advisory that says
+	// so. Modeling a leaf and enforcing it are separate questions, and this
+	// flip only settles the first.
+	"community": {desc: "SNMP community", args: 1, placeholder: "<community-name>", closedWorld: true, children: map[string]*schemaNode{
+		"view": {
+			desc:        "MIB view name granted to this community (accepted-inert)",
+			args:        1,
+			placeholder: "<view-name>",
+			children:    nil,
+		},
+		"client-list-name": {
+			desc:        "Named client list authorized for this community (accepted-inert)",
+			args:        1,
+			placeholder: "<client-list-name>",
+			children:    nil,
+		},
+		"routing-instance": {
+			desc:        "Routing instance this community is reachable in (accepted-inert)",
+			args:        1,
+			placeholder: "<instance-name>",
+			children:    nil,
+		},
 		"authorization": {
 			desc:          "Authorization level",
 			args:          1,

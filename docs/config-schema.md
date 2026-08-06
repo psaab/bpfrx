@@ -2356,9 +2356,17 @@ dormant MECHANISM in PR-A:
   `closed` is true AND the keyword is unmodeled (`childSchema == nil`), the
   walker returns a `typedLeafErrorf` reject ("unknown configuration keyword
   … under closed-world subtree"), mirroring the existing modifier-level
-  unknown-keyword rejects. When `closed` is false — the state for EVERY
-  production subtree today — behaviour is byte-identical to pre-#4313
-  (return nil, silent-accept).
+  unknown-keyword rejects. When `closed` is false, behaviour is
+  byte-identical to pre-#4313 (return nil, silent-accept) — which remains the
+  default for every subtree that has not opted in.
+
+  This paragraph deliberately carries NO count of armed subtrees. It used to
+  say "the state for EVERY production subtree today", which was true when
+  written and silently false a month later once the rollout began; the same
+  stale claim in `schema_walk.go` mis-scoped a later lane that trusted it. The
+  armed set is whatever carries `closedWorld: true` in `pkg/config/schema_*.go`
+  — grep it, or read the `schema_closedworld_*_4313_test.go` files, one per
+  closed subtree. A count in prose is a coverage claim and it rots.
 
 PR-A landed the mechanism DORMANT (no production subtree set `closedWorld`,
 zero false-reject risk). It is white-box tested with a SYNTHETIC subtree
@@ -2425,6 +2433,39 @@ so the count reflects the winning block) and are NOT rejected. The
 picking one. Production tests:
 `compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
 zero/two/valid + #3850 last-wins preservation).
+
+**`snmp community` closed (#4313).** `system snmp community <name>` now sets
+`closedWorld:true` (`schema_system.go`) after modeling the three leaves that put
+it on the PR-C SKIP list ("snmp community (Junos view / client-list-name /
+routing-instance unmodeled)"). This is the same add-then-arm order `security ike
+proposal` used when a single missing `description` leaf was all that blocked it,
+and it is the readiness heuristic the whole rollout has followed:
+
+1. Enumerate the subtree's full Junos child set.
+2. If the modeled set already equals it, arm.
+3. If it is short by a small, well-understood number of leaves, MODEL THEM and
+   then arm — that is a flip, not a rewrite.
+4. If the subtree is free-form (`static-nat then`) or deliberately open
+   (`screen ids-option`), it is a permanent skip, not a backlog item.
+
+The missing leaf was found by MEASUREMENT, not audit-by-reading: arming the
+subtree first and running the corpus failed `TestSNMPInertKnobAdvisories` on
+`set snmp community <name> view myview`, a real Junos leaf a committed fixture
+carries. Note the method's limit, which matters for the next candidate — the
+corpus surfaced `view` only because a fixture used it, and could not have
+surfaced `client-list-name` or `routing-instance`, which no fixture exercises.
+A corpus run bounds what you can OBSERVE, not what EXISTS; the remaining two
+came from the Junos grammar recorded in the skip note. Measure to find what you
+did not know to look for, then still audit the grammar.
+
+All three added leaves are ACCEPTED-INERT: modeled so a valid Junos config
+commits and closed-world cannot false-reject, but the compiler does not act on
+them (`TestSNMPInertKnobAdvisories` is the advisory that says so). Modeling a
+leaf and enforcing it are separate questions and this flip settles only the
+first. Tests: `schema_closedworld_snmp_community_4313_test.go` — rejection,
+the every-modeled-leaf negative control that stops the guard degenerating into
+"reject everything here", and the tolerant-path leg proving a peer-synced or
+persisted config still loads.
 
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`

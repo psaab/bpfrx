@@ -307,7 +307,27 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		// garbage that would commit clean and be silently dropped. Reject it,
 		// mirroring the modifier-level unknown-keyword rejects below. Only a
 		// subtree that opted in (schemaNode.closedWorld, inherited via closed)
-		// reaches this branch; no production subtree does so today.
+		// reaches this branch.
+		//
+		// Deliberately NO count of armed subtrees here. The previous wording
+		// ("no production subtree does so today") was written when that was
+		// true and was never updated as the rollout proceeded; a month later it
+		// was still asserting a dormant mechanism while ten subtrees were
+		// closed, and it mis-scoped a lane that trusted it. A comment stating
+		// how much of a mechanism is in use is a coverage claim, and it rots
+		// silently. The armed set is exactly whatever carries
+		// `closedWorld: true` — grep for it, or read the
+		// schema_closedworld_*_4313_test.go files, each of which pins one
+		// subtree. Do not restate the number here.
+		//
+		// Strict-vs-tolerant, since it is asked every round and is written
+		// nowhere else: this rejects at the OPERATOR boundary, where the
+		// alternative is a silent drop. It is NOT a reject on the paths where
+		// refusing would mean an outage — configstore's Store.Load (boot) and
+		// Store.SyncApply (HA peer sync) downgrade schema violations to a
+		// warning (pkg/configstore/store.go), so a config an older build
+		// persisted, or a peer sends, still loads. Strict where the operator
+		// can fix it, tolerant where refusing would brick the node.
 		if closed {
 			return typedLeafErrorf(path, "unknown configuration keyword %q under closed-world subtree", keyword)
 		}
