@@ -603,6 +603,30 @@ monotonic counter restarts lower — is accepted instead of refused as stale
 config after a reconnect is always the peer's *current* config
 (`pushConfigToPeer` sends `ShowActive`), so the newest content still wins.
 
+**That reset is atomic against every advance of the marks (#5084).** Both
+high-waters are advanced by a non-atomic read-modify-write — load, compare,
+store — and `resetRecvGen` clears them from a *different* goroutine: the clear
+runs on a receive loop (the `BulkStart` handler), the applied mark is advanced
+by the single `configApplyLoop` consumer, and the received mark is advanced by a
+receive loop, of which there are **two** (`conn0`/`conn1`). Nothing ordered
+them, so a clear landing between an advance's load and its store was simply
+LOST, and the store then re-raised the mark the reset had just zeroed.
+
+That is not a transient. The marks are monotone-max and the whole reason the
+reset exists is that a rebooted peer restarts its counter LOWER, so a surviving
+pre-reboot generation refuses *every* generation the reconnected peer can
+produce: on `lastAppliedConfigGen` the standby silently keeps running the
+pre-reboot config, and on `lastRecvConfigGen` the readiness comparison below
+inverts. Neither self-clears short of another accepted re-prime. `configGenMu`
+now covers the reset and every advance (`recordAppliedConfigGen`,
+`recordRecvConfigGen`, `beginConfigApply`/`endConfigApply`); readers stay
+lock-free, since a reader racing a writer only ever observes one side of a
+single monotone step. Two prior comments stated the contract wrongly and are
+corrected at their sites — the applied advance claimed it is "called ONLY from
+the single-consumer `configApplyLoop`", which ignores the clear, and the
+received advance claimed "the receiveLoop is single-threaded per connection",
+which is true per connection but there are two of them.
+
 **Manual-failover config-staleness gate (#5563).** A second high-water mark,
 `lastRecvConfigGen`, records the highest generation this node has *received*
 from the peer (advanced in the `syncMsgConfig` handler at enqueue, BEFORE
