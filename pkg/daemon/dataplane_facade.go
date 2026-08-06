@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync/atomic"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -23,12 +25,25 @@ import (
 // Revoking it stops all of them at once, and the revocation is sticky and
 // atomic against concurrent calls.
 //
-// WHAT THIS PR DOES NOT DO. The facade is constructed LIVE and nothing revokes
-// it. That is deliberate: this PR is pure indirection, behaviour-identical, and
-// cannot leave the system half-armed. The plan's "starts SEALED, opened at the
-// final arm proof" is a change to the CONSTRUCTOR and to the release path, and
-// belongs with the PR that actually gates. Revoke() is implemented and tested
-// here so the mechanism is proven before anything depends on it.
+// WHAT THIS PR DOES NOT DO. It does not SEAL the facade. The plan's "starts
+// SEALED, opened at the final arm proof" is a change to the CONSTRUCTOR and to
+// the release path, and belongs with the PR that actually gates; here the facade
+// is constructed LIVE and stays live until the daemon drops the dataplane.
+//
+// IT DOES REVOKE, AND ON A LIVE PATH — do not read the paragraph above as
+// "nothing calls Revoke()". setDataplane revokes the outgoing facade at every
+// one of its five call sites, and one of them runs after the servers exist:
+// runBootstrapExitStartup (daemon_run_naming.go) calls setDataplane(nil) when
+// the bootstrap-exit dataplane arm FAILS, long after gRPC/REST/CLI were started
+// and captured the handle. The other four are in bringup, which completes before
+// any server is constructed, so they revoke a facade nobody holds.
+//
+// So this PR is NOT behaviour-identical on that one path, and the difference is
+// the point of #5275: an arm failure at bootstrap exit used to leave management
+// holding a live backend alias — including the ungated mutators below — and now
+// revokes it. Every other path is pure indirection. Stating this here rather
+// than only in the PR body is deliberate: the safety argument has to survive in
+// the artifact that ships.
 //
 // WHY NOT EMBED THE BACKEND INTERFACE. Embedding would let this file be ~10
 // lines: embed the interface, override the few methods that need gating. It is
@@ -57,11 +72,13 @@ const (
 	facadeRevoked
 )
 
-// facadeBackend is the union of the three captured mirrors in runtime_probes.go
-// (apiDataPlane, grpcDataPlane, cliDataPlane). It is declared here so the set of
-// methods reachable by an external consumer is stated in ONE place; the three
-// mirrors keep their own declarations and their own compile-time drift checks at
-// their assignment sites.
+// facadeBackend is the union of everything an external consumer can reach: the
+// three captured mirrors in runtime_probes.go (apiDataPlane, grpcDataPlane,
+// cliDataPlane) plus every runtime capability PROBE those consumers assert
+// against the handle (dataplane_facade_probes.go). It is declared here so the
+// reachable surface is stated in ONE place; the three mirrors keep their own
+// declarations and their own compile-time drift checks at their assignment
+// sites, and the probes get theirs in dataplane_facade_probes.go.
 type facadeBackend interface {
 	ClearAllCounters() error
 	ClearAllSessions() (int, int, error)
@@ -91,53 +108,42 @@ type facadeBackend interface {
 	ReadZoneCounters(uint16, int) (dataplane.CounterValue, error)
 	SessionCount() (v4, v6 int)
 
-	// The CLI forwarding-control surface (#5275 §7). A FOURTH capture,
-	// distinct from cliDataPlane: pkg/cli's userspaceDataplaneControl() type-
-	// asserts the SAME handle the CLI was constructed with against its own
-	// package-private cliUserspaceControlProvider. Handing the CLI a facade
-	// that lacks these does not fail to compile — the assertion simply fails
-	// at runtime and `request chassis cluster data-plane userspace ...`
-	// reports the control unavailable. These also must be GATED, not merely
-	// present: they are exactly the mutators §7 calls directly exploitable on
+	// THE RUNTIME CAPABILITY PROBES. Everything below is reached by a type
+	// ASSERTION on the handle rather than through an assigned mirror, so a
+	// method missing here does not fail to compile anywhere — the assertion
+	// simply fails at runtime and the consumer takes its silent fallback.
+	// Each shape, its call sites and what its loss costs are documented on the
+	// matching mirror in dataplane_facade_probes.go; the compile-time proof
+	// that the facade satisfies them lives there too.
+	//
+	// The forwarding-control mutators additionally must be GATED, not merely
+	// present: they are the ones #5275 §7 calls directly exploitable on
 	// bootstrap-exit, because they never traverse the apply gate.
 	Status() (dpuserspace.ProcessStatus, error)
 	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
 	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
+
+	AppliedNATView() dpuserspace.AppliedNATView
+	PolicySchedulerActiveState() map[string]bool
+	IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
 }
 
-// cliUserspaceControl mirrors pkg/cli's package-private
-// cliUserspaceControlProvider (pkg/cli/runtime.go) so the facade's coverage of
-// that fourth capture is a COMPILE-TIME fact. Without the assertion below,
-// dropping one of these methods leaves a green build and a CLI command that
-// quietly stopped working.
+// Compile-time proof that the ONE backend production can put behind the facade
+// actually satisfies the union. Without this, renaming a control method on the
+// adapter leaves a green build, a green suite, and newDataplaneFacade returning
+// nil at boot — every management surface reporting "dataplane not loaded".
 //
-// THE ASYMMETRY THAT MAKES THIS NECESSARY — do not assume the other three
-// mirrors' protection extends here. apiDataPlane/grpcDataPlane/cliDataPlane are
-// each ASSIGNED into a downstream Config/constructor, so Go checks them at the
-// assignment site and drift is a build failure there; that is why
-// runtime_probes.go can say "signature drift surfaces as a compile error at the
-// call site". cliUserspaceControlProvider has NO assignment site — pkg/cli
-// type-asserts the handle it already holds, at RUNTIME, inside
-// userspaceDataplaneControl(). A handle that does not satisfy it compiles
-// perfectly and fails only when an operator runs the command. This declaration
-// plus the assertion below is what replaces the missing compile-time check.
-//
-// TWO BELTS, AND NEITHER IS REDUNDANT. This assertion proves the FACADE still
-// implements the surface. A sibling test in pkg/cli
-// (userspace_control_shape_5275_test.go) proves the INTERFACE still has the
-// shape this mirror copies. Both are needed because a single cross-package
-// assertion is impossible: pkg/daemon imports pkg/cli, so pkg/cli cannot import
-// pkg/daemon to assert against the facade directly. Deleting either belt leaves
-// one side of the mirror unguarded.
-type cliUserspaceControl interface {
-	Status() (dpuserspace.ProcessStatus, error)
-	SetForwardingArmed(bool) (dpuserspace.ProcessStatus, error)
-	SetQueueState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
-	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
-}
+// *dataplane.Manager is deliberately NOT asserted here even though it satisfies
+// all three runtime_probes.go mirrors: it has none of the probe surface above,
+// and it is unreachable as a backend. buildRuntimeDataPlane (daemon_run.go)
+// resolves TypeUserspace to dpuserspace.Boot() and every other type to a
+// retirement sentinel (#1476/#1525) that the caller turns into
+// setDataplane(nil). If a future backend is wired in, add its assertion here —
+// a type that reaches setDataplane without one gets no facade at all.
+var _ facadeBackend = (*dpuserspace.LegacyDataPlaneAdapter)(nil)
 
 // dataplaneFacade is the single handle every external consumer holds.
 type dataplaneFacade struct {
@@ -150,16 +156,33 @@ type dataplaneFacade struct {
 //
 // Returning nil — rather than a facade over a nil backend — preserves today's
 // exact semantics: each consumer's DP field is left nil when the daemon has no
-// dataplane (NoDataplane mode) or when the backend does not satisfy the surface,
-// and every consumer already handles a nil DP. A non-nil facade wrapping nothing
-// would flip those nil checks and change behaviour in a PR whose whole claim is
-// that it changes none.
+// dataplane (NoDataplane mode), and every consumer already handles a nil DP. A
+// non-nil facade wrapping nothing would flip those nil checks and change
+// behaviour on a path this change is not meant to touch.
+//
+// WHY THE SURFACE CHECK IS ALL-OR-NOTHING. A backend that satisfies the read
+// mirrors but not the probes could be served a partial facade instead of none.
+// It is not, for two reasons. First, such a backend cannot exist in-tree: the
+// assertion under facadeBackend proves the only reachable backend satisfies the
+// whole union, so a partial path would be dead code shipped untested. Second,
+// partial construction reproduces the failure mode this change exists to remove
+// — a consumer whose read probes succeed and whose capability probes fail
+// degrades SILENTLY, which is exactly how four capabilities were lost in the
+// first cut of this PR. One loud failure beats several quiet ones.
+//
+// So the rejection is LOUD. It is a boot-time misconfiguration that blanks every
+// management surface at once; it must not be inferable only from the symptom.
 func newDataplaneFacade(backend any) *dataplaneFacade {
 	if backend == nil {
 		return nil
 	}
 	b, ok := backend.(facadeBackend)
 	if !ok {
+		slog.Error("dataplane backend does not satisfy the external-consumer surface; "+
+			"gRPC, REST and the CLI will all report the dataplane as unavailable",
+			"backend_type", fmt.Sprintf("%T", backend),
+			"remediation", "add a compile-time facadeBackend assertion for this type in "+
+				"pkg/daemon/dataplane_facade.go and implement the missing methods")
 		return nil
 	}
 	f := &dataplaneFacade{backend: b}
@@ -414,18 +437,61 @@ func (f *dataplaneFacade) InjectPacket(req dpuserspace.InjectPacketRequest) (dpu
 	return f.backend.InjectPacket(req)
 }
 
+// AppliedNATView has no error channel, so a revoked facade reports the view as
+// UNAVAILABLE. That is the same value the deterministic-NAT lookup already
+// produces when the dataplane is absent or has applied nothing (#5794), and
+// every caller checks v.Available before reading v.Config — so this fails closed
+// into an existing, tested branch rather than handing out a stale snapshot of a
+// generation that is no longer applied.
+func (f *dataplaneFacade) AppliedNATView() dpuserspace.AppliedNATView {
+	if !f.live() {
+		return dpuserspace.AppliedNATView{Available: false}
+	}
+	return f.backend.AppliedNATView()
+}
+
+// PolicySchedulerActiveState returns nil once revoked. Read the SSOT predicate
+// before "simplifying" that: PolicyInactive treats a NIL map as "state not
+// published — a scheduled policy is INACTIVE" (#3414,
+// pkg/dataplane/userspace/policies_scheduler.go). So nil is the fail-CLOSED
+// value on both surfaces that consume it — the policy-detail display renders
+// "State: inactive" and match-policies refuses to certify a scheduled policy as
+// active — which is what a revoked dataplane should say. Returning a
+// last-known map instead would let the display keep asserting "enabled" for a
+// dataplane that is no longer there.
+func (f *dataplaneFacade) PolicySchedulerActiveState() map[string]bool {
+	if !f.live() {
+		return nil
+	}
+	return f.backend.PolicySchedulerActiveState()
+}
+
+func (f *dataplaneFacade) IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	if !f.live() {
+		return errDataplaneFacadeRevoked
+	}
+	return f.backend.IterateSessionsFrom(cursor, fn)
+}
+
+func (f *dataplaneFacade) IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	if !f.live() {
+		return errDataplaneFacadeRevoked
+	}
+	return f.backend.IterateSessionsV6From(cursor, fn)
+}
+
 // Compile-time proof that the facade satisfies all THREE captured mirrors.
 //
 // These are the assertions that make the facade substitutable at the three
 // construction sites. If a mirror gains a method the facade does not implement,
 // this fails to compile HERE — before anyone can quietly hand a consumer the
 // raw backend again to make it build.
+//
+// The RUNTIME capability probes get the same treatment, one file over in
+// dataplane_facade_probes.go, which also documents what that proof does and does
+// not cover.
 var (
 	_ apiDataPlane  = (*dataplaneFacade)(nil)
 	_ grpcDataPlane = (*dataplaneFacade)(nil)
 	_ cliDataPlane  = (*dataplaneFacade)(nil)
-	// The FOURTH capture. The CLI re-asserts its own handle to reach the
-	// forwarding-control mutators, so a facade missing these compiles cleanly
-	// and silently disables the command.
-	_ cliUserspaceControl = (*dataplaneFacade)(nil)
 )

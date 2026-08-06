@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -122,10 +123,112 @@ func (f *fakeFacadeBackend) InjectPacket(dpuserspace.InjectPacketRequest) (dpuse
 	return dpuserspace.ProcessStatus{}, nil
 }
 
+// The runtime capability probes. Each returns a value distinguishable from its
+// revoked/absent counterpart so a test can tell "reached the backend" from
+// "stopped at the facade" without counting hits.
+func (f *fakeFacadeBackend) AppliedNATView() dpuserspace.AppliedNATView {
+	f.hit()
+	return dpuserspace.AppliedNATView{Available: true}
+}
+func (f *fakeFacadeBackend) PolicySchedulerActiveState() map[string]bool {
+	f.hit()
+	return map[string]bool{"sched1": true}
+}
+func (f *fakeFacadeBackend) IterateSessionsFrom(*dataplane.SessionKey, func(dataplane.SessionKey, dataplane.SessionValue) bool) error {
+	f.hit()
+	return nil
+}
+func (f *fakeFacadeBackend) IterateSessionsV6From(*dataplane.SessionKeyV6, func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error {
+	f.hit()
+	return nil
+}
+
+// TestFacadeEveryGateIsBound is the EXHAUSTIVE half of the revocation proof.
+//
+// It exists because the hand-written assertions below name a dozen methods out
+// of ~36 delegators, and a hand-picked sample is a coverage claim nobody can
+// check: the other two dozen `if !f.live()` guards could be deleted with a green
+// suite. Rather than restate the list and get it wrong again, this walks the
+// facade's method set by reflection and drives BOTH directions on every method:
+//
+//	LIVE     -> the call must REACH the backend (a gate stuck closed is a
+//	            silently dead capability, which is F1's failure mode again);
+//	REVOKED  -> the call must NOT reach the backend.
+//
+// A delegator added without a live() guard fails the revoked direction; one
+// whose guard never opens fails the live direction. Adding a method to the
+// facade extends this test automatically — there is no list to forget.
+func TestFacadeEveryGateIsBound(t *testing.T) {
+	facadeType := reflect.TypeOf((*dataplaneFacade)(nil))
+
+	// Revoke is the gate's own control surface, not a delegator: it has no
+	// backend call to stop and is asserted separately below.
+	const controlMethod = "Revoke"
+
+	var checked int
+	for i := 0; i < facadeType.NumMethod(); i++ {
+		m := facadeType.Method(i)
+		if m.Name == controlMethod {
+			continue
+		}
+		checked++
+		t.Run(m.Name, func(t *testing.T) {
+			// Zero-valued arguments are safe for every signature here: the
+			// facade either returns before touching them, or hands them to the
+			// fake, which ignores them. Nil callbacks and nil cursors are the
+			// point — nothing must dereference them.
+			args := func(recv *dataplaneFacade) []reflect.Value {
+				in := []reflect.Value{reflect.ValueOf(recv)}
+				for a := 1; a < m.Type.NumIn(); a++ {
+					in = append(in, reflect.New(m.Type.In(a)).Elem())
+				}
+				return in
+			}
+
+			live := &fakeFacadeBackend{}
+			f := newDataplaneFacade(live)
+			if f == nil {
+				t.Fatal("precondition: a satisfying backend must produce a facade")
+			}
+			m.Func.Call(args(f))
+			if live.reached != 1 {
+				t.Fatalf("%s did NOT reach the backend while LIVE (%d calls) — this gate is "+
+					"stuck closed, so the capability is dead even with a healthy dataplane",
+					m.Name, live.reached)
+			}
+
+			f.Revoke()
+			before := live.reached
+			m.Func.Call(args(f))
+			if live.reached != before {
+				t.Fatalf("%s REACHED THE BACKEND after Revoke() — this delegator has no live() "+
+					"guard, so a consumer holding the revoked handle still drives the dataplane (#5275)",
+					m.Name)
+			}
+		})
+	}
+
+	// A narrowed walk (a receiver typo, a method set that stopped resolving)
+	// must read as a FAILURE rather than a clean run over nothing. Bump this
+	// deliberately when the facade genuinely gains or loses a delegator.
+	const wantDelegators = 36
+	if checked != wantDelegators {
+		t.Fatalf("walked %d delegators, expected %d — if the facade genuinely changed, update "+
+			"wantDelegators; if not, the reflection walk has narrowed and is proving less than "+
+			"it claims", checked, wantDelegators)
+	}
+}
+
 // TestFacadeRevocationStopsEveryCall is the behavioural half. A revoked facade
 // must stop calls at the facade — not merely report an error while still
 // reaching the backend, which would leave the mutator paths (SetForwardingArmed
 // and friends) live for a consumer that captured the handle earlier.
+//
+// TestFacadeEveryGateIsBound above proves NO delegator reaches the backend once
+// revoked. This one proves the returned VALUES are right, which reflection
+// cannot judge: the sentinel error where there is an error channel, and the
+// fail-closed value where there is not (SessionCount 0/0, AppliedNATView
+// unavailable, a nil scheduler map that the SSOT predicate reads as inactive).
 func TestFacadeRevocationStopsEveryCall(t *testing.T) {
 	be := &fakeFacadeBackend{}
 	f := newDataplaneFacade(be)
@@ -179,6 +282,23 @@ func TestFacadeRevocationStopsEveryCall(t *testing.T) {
 	if _, err := f.InjectPacket(dpuserspace.InjectPacketRequest{}); !errors.Is(err, errDataplaneFacadeRevoked) {
 		t.Errorf("revoked InjectPacket returned %v, want errDataplaneFacadeRevoked", err)
 	}
+	// The capability probes. Two of the four have no error channel, so their
+	// revoked VALUE is the whole fail-closed contract.
+	if v := f.AppliedNATView(); v.Available {
+		t.Error("revoked AppliedNATView reports Available — the deterministic-NAT lookup " +
+			"would answer from a generation that is no longer applied")
+	}
+	if st := f.PolicySchedulerActiveState(); st != nil {
+		t.Errorf("revoked PolicySchedulerActiveState returned %v, want nil — nil is the SSOT's "+
+			"'state unpublished, treat scheduled policies as inactive' value (#3414), and a "+
+			"non-nil map would let the detail display keep rendering a policy enabled", st)
+	}
+	if err := f.IterateSessionsFrom(nil, nil); !errors.Is(err, errDataplaneFacadeRevoked) {
+		t.Errorf("revoked IterateSessionsFrom returned %v, want errDataplaneFacadeRevoked", err)
+	}
+	if err := f.IterateSessionsV6From(nil, nil); !errors.Is(err, errDataplaneFacadeRevoked) {
+		t.Errorf("revoked IterateSessionsV6From returned %v, want errDataplaneFacadeRevoked", err)
+	}
 	if be.reached != liveHits {
 		t.Fatalf("REVOCATION LEAKED: %d call(s) reached the backend after Revoke()",
 			be.reached-liveHits)
@@ -230,6 +350,28 @@ func TestFacadeAbsentBackendStaysNil(t *testing.T) {
 	}
 	if f := newDataplaneFacade(struct{ NotADataplane bool }{}); f != nil {
 		t.Fatal("a backend that does not satisfy the surface must produce a NIL facade")
+	}
+}
+
+// TestProductionBackendSatisfiesTheFacadeUnion pins the F2 half of the
+// construction gate at RUNTIME as well as at compile time.
+//
+// newDataplaneFacade returns nil when the backend does not satisfy the whole
+// union, and a nil facade nils the dataplane for gRPC AND REST AND the CLI at
+// once — every management surface reporting "dataplane not loaded", from a
+// green build and a green suite. `var _ facadeBackend =
+// (*dpuserspace.LegacyDataPlaneAdapter)(nil)` in dataplane_facade.go is the
+// primary belt; this asserts the same fact through the CONSTRUCTOR, so deleting
+// that line to make a build pass does not silently delete the protection with
+// it.
+//
+// The adapter is used zero-valued on purpose: the union check reads the method
+// SET and calls nothing, so no helper process or socket is involved.
+func TestProductionBackendSatisfiesTheFacadeUnion(t *testing.T) {
+	if f := newDataplaneFacade(&dpuserspace.LegacyDataPlaneAdapter{}); f == nil {
+		t.Fatal("the production dataplane backend (*dpuserspace.LegacyDataPlaneAdapter) does " +
+			"NOT satisfy facadeBackend, so newDataplaneFacade returns nil at boot and gRPC, " +
+			"REST and the CLI would all report the dataplane as unavailable (#5275)")
 	}
 }
 
