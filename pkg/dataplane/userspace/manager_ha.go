@@ -1035,15 +1035,26 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 	// `show security zones` Traffic statistics, REST /security/zones, and the
 	// Prometheus collector) reports live per-zone volume instead of
 	// ErrCounterNotPopulated ("not available"). The helper reports cumulative
-	// totals keyed by the stable zone id; SetZoneCounterOffset stores them
-	// absolutely (overwrite), reset-safe on helper restart.
+	// totals keyed by the stable zone id.
+	//
+	// REPLACE the whole map rather than setting row by row. The published block
+	// is a complete sparse set rebuilt each poll, so a zone that disappears from
+	// it must disappear here too: a per-row SetZoneCounterOffset can only add or
+	// overwrite, which strands the last value of any zone the helper stops
+	// reporting and leaves every read surface serving a FROZEN total. That is
+	// reachable in normal operation — a zone pushed past the helper's hot-path
+	// slot capacity by a later config keeps its retained totals but stops being
+	// counted, so its row drops out while the zone stays configured. See
+	// ReplaceZoneCounterOffsets for the full disappearance taxonomy.
+	zoneRows := make(map[uint16][2]dataplane.CounterValue, len(status.ZoneTrafficCounters))
 	for i := range status.ZoneTrafficCounters {
 		z := &status.ZoneTrafficCounters[i]
-		m.bpfShim.SetZoneCounterOffset(z.ZoneID,
-			dataplane.CounterValue{Packets: z.IngressPackets, Bytes: z.IngressBytes},
-			dataplane.CounterValue{Packets: z.EgressPackets, Bytes: z.EgressBytes},
-		)
+		zoneRows[z.ZoneID] = [2]dataplane.CounterValue{
+			{Packets: z.IngressPackets, Bytes: z.IngressBytes},
+			{Packets: z.EgressPackets, Bytes: z.EgressBytes},
+		}
 	}
+	m.bpfShim.ReplaceZoneCounterOffsets(zoneRows)
 }
 
 // safeDelta returns cur - prev. On counter reset (prev > cur), returns cur

@@ -571,7 +571,10 @@ pub(crate) struct ProcessStatus {
     /// pre-summed sparse block — one row per zone with nonzero traffic, keyed
     /// by the stable zone id). The Go control plane mirrors each row into the
     /// legacy `dataplane.Manager` zone-counter offset map via
-    /// `SetZoneCounterOffset`, so `show security zones` (Traffic statistics),
+    /// `ReplaceZoneCounterOffsets` (#6843: the whole map is replaced per poll,
+    /// so a zone the helper stops publishing stops being reported rather than
+    /// freezing at its last value), so `show security zones` (Traffic
+    /// statistics),
     /// the REST `/security/zones` endpoint, and the Prometheus collector report
     /// live per-zone volume instead of `ErrCounterNotPopulated` ("not
     /// available"). `zone_counter_layout_version` selects the decode path
