@@ -330,9 +330,10 @@ var vrfOverlapForwardLookingTokens = []string{
 // This axis had NO guard until now. Every one of the 31 entries above is
 // forward-looking, so appending ". #2387 is closed wontfix; this is by design
 // and permanent" passed the whole suite while foreclosing the outcome the
-// comment forbids foreclosing. vrfOverlapStatusTail now reds any APPEND in
-// either direction; these tokens cover the same span the forward list does — the
-// message BEFORE the tail — and inherit the same disclosed incompleteness.
+// comment forbids foreclosing. vrfOverlapStatusTail now reds that append — and
+// any other that does not itself re-terminate with the tail — in either
+// direction; these tokens cover the same span the forward list does, the message
+// BEFORE the tail, and inherit the same disclosed incompleteness.
 //
 // The entries are checked against the shipped text: none is a substring of the
 // current warning, so this list starts from a real green.

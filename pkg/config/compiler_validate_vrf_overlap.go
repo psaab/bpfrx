@@ -62,8 +62,11 @@ const (
 // and which the #2387 plan then cited back as evidence for that same outcome.
 // TestVRFOverlapWarningStatesStatusNotPromise enforces that in BOTH format
 // strings below — but enforces it PARTIALLY, and the difference matters if you
-// are editing this text. It pins the closing status sentence verbatim, so
-// nothing can be appended, reworded or dropped there. Wording spliced into the
+// are editing this text. It pins the closing status sentence verbatim, so the
+// tail cannot be reworded or dropped, and nothing can be appended after it
+// EXCEPT text that itself re-terminates with the tail verbatim — a contrived
+// escape, recorded so nobody reasons from "appends are impossible". Wording
+// spliced into the
 // MIDDLE of the message is caught only if it uses a spelling on that test's
 // token lists, which are blocklists and incomplete by construction. A forecast
 // in either direction, phrased in a way nobody listed, will commit green. The
