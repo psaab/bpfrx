@@ -161,8 +161,9 @@ func buildSyslogClients(cfg *config.Config) []*logging.SyslogClient {
 			// `show system syslog` still reports the authored name.
 			f, known := logging.ParseFacilityChecked(stream.Facility)
 			if !known && !logging.FacilityIsWildcard(stream.Facility) {
-				slog.Warn("security log: unmapped facility name; forwarding under local0 — "+
-					"records will carry a facility the configuration does not name (#5797)",
+				slog.Warn("security log: unmapped facility name; local0 selected — if this "+
+					"stream's client is installed, its records will carry a facility the "+
+					"configuration does not name (#5797)",
 					"facility", stream.Facility, "using", "local0")
 			}
 			facility, haveFacility = f, true

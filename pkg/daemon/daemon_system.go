@@ -152,8 +152,9 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 			// `show system syslog` still reports the authored name.
 			f, known := logging.ParseFacilityChecked(stream.Facility)
 			if !known && !logging.FacilityIsWildcard(stream.Facility) {
-				slog.Warn("security log: unmapped facility name; forwarding under local0 — "+
-					"records will carry a facility the configuration does not name (#5797)",
+				slog.Warn("security log: unmapped facility name; local0 selected — if this "+
+					"stream's client is installed, its records will carry a facility the "+
+					"configuration does not name (#5797)",
 					"facility", stream.Facility, "using", "local0")
 			}
 			facility, haveFacility = f, true
@@ -968,8 +969,9 @@ func (d *Daemon) applySystemSyslog(cfg *config.Config) {
 			// facility on purpose — warning about it is a false alarm on a
 			// correct config.
 			if !known && !logging.FacilityIsWildcard(raw) {
-				slog.Warn("system syslog: unmapped facility name; forwarding under local0 — "+
-					"records will carry a facility the configuration does not name (#5797)",
+				slog.Warn("system syslog: unmapped facility name; local0 selected — if this "+
+					"host's client is installed, its records will carry a facility the "+
+					"configuration does not name (#5797)",
 					"host", host.Address, "facility", raw, "using", "local0")
 			}
 			facility = f
@@ -1027,9 +1029,10 @@ func (d *Daemon) applySyslogFiles(cfg *config.Config) {
 // rewrite it.
 //
 // Split out of applySyslogFiles (#5797 review) so the belts below are testable
-// at the site that actually consults them. Testing syslogSelectorTokenSafe in
-// isolation proves the predicate, not that the render path calls it; that gap
-// is exactly how a belt gets deleted with a green suite.
+// at the site that actually consults them. Testing syslogSelectorFacilitySafe
+// / syslogSelectorSeveritySafe in isolation proves the predicates, not that the
+// render path calls them; that gap is exactly how a belt gets deleted with a
+// green suite.
 // syslog_selector_render_5797_test.go drives this function.
 func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 	desired := make(map[string]string) // filename -> content
@@ -1076,7 +1079,13 @@ func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 			// ...) — an operator-visible mapping decision tracked on #5797, not
 			// something to guess at here. The shape check is correct regardless
 			// of how that lands.
-			if !syslogSelectorTokenSafe(f.Facility) || !syslogSelectorTokenSafe(f.Severity) {
+			//
+			// The shape is POSITION-AWARE: rsyslog's facility position takes a
+			// comma list and a bare `*`, its priority position takes `*` and the
+			// `=`/`!`/`!=` modifiers, and neither position's native syntax is
+			// the other's. One allowlist applied to both would have to be the
+			// intersection, which drops working destinations.
+			if !syslogSelectorFacilitySafe(f.Facility) || !syslogSelectorSeveritySafe(f.Severity) {
 				slog.Warn("skipping syslog file destination with unsafe selector token (#5797)",
 					"name", f.Name, "facility", f.Facility, "severity", f.Severity)
 				continue
@@ -1119,8 +1128,11 @@ func syslogDropinContents(cfg *config.Config, prefix string) map[string]string {
 			// #5797 render belt: same rsyslog-selector interpolation as the file
 			// destinations above, and the same asymmetry — the severity is
 			// enum-gated at commit, the facility is an unvalidated wildcard KEY
-			// and reaches here verbatim from an ordinary commit.
-			if !syslogSelectorTokenSafe(u.Facility) || !syslogSelectorTokenSafe(u.Severity) {
+			// and reaches here verbatim from an ordinary commit. Same
+			// position-aware pair of predicates, deliberately kept identical to
+			// the file site: a destination that renders as a file must render as
+			// a user, and vice versa.
+			if !syslogSelectorFacilitySafe(u.Facility) || !syslogSelectorSeveritySafe(u.Severity) {
 				slog.Warn("skipping syslog user destination with unsafe selector token (#5797)",
 					"user", u.User, "facility", u.Facility, "severity", u.Severity)
 				continue
@@ -2030,27 +2042,28 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 	return retErr
 }
 
-// syslogSelectorTokenSafe reports whether a Junos syslog facility or severity
-// token can be interpolated into an rsyslog selector line without escaping it
+// syslogSelectorAtomSafe reports whether a single selector ATOM — one facility
+// name, or one severity name — is inert inside an rsyslog selector line
 // (#5797).
 //
 // syslogDropinContents builds `<facility>.<severity>\t<target>` and writes it
 // to a managed drop-in under /etc/rsyslog.d. #4902 already belts the file NAME
 // and the user TOKEN on that same line, but left the two selector tokens
-// unchecked — a newline, a `;` (rsyslog statement separator), a `.`/`*`
-// (selector grammar) or a control byte in either one escapes the intended
-// selector and injects rsyslog configuration.
+// unchecked — a `;` (rsyslog statement separator), a `.` (selector grammar), a
+// space (selector/action separator) or a control byte in either one escapes the
+// intended selector and injects rsyslog configuration.
 //
 // The severity reaches this only on the tolerant load / peer-sync path (it is
 // an enum leaf at commit). The FACILITY reaches it from an ordinary commit: it
 // is the schema's wildcard KEY and has no key validator, so
 // `set system syslog file audit "daemon;*.* /tmp/pwn" info` commits clean.
 //
-// Empty is SAFE and expected: both call sites map an empty token to the `*`
-// wildcard before building the selector, so an unset facility/severity is
-// ordinary configuration, not an omission to reject.
+// An atom is never empty: emptiness is a POSITION-level question (an unset
+// facility folds to `*` at the render site, an empty member of a comma list is
+// a malformed list), so the two position predicates below decide it and this
+// one rejects it.
 //
-// What actually reaches this token, measured rather than assumed. A literal
+// What actually reaches these tokens, measured rather than assumed. A literal
 // NEWLINE cannot: the lexer normalizes \n and \t inside a quoted value to a
 // space, in both the hierarchical-quoted and the flat-set/peer-sync paths, so
 // the classic "terminate the line and write a fresh directive" injection is
@@ -2069,16 +2082,16 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 // is more than a merely wrong selector, and the belt closes it either way by
 // rejecting the space along with the metacharacters.
 //
-// Every real Junos facility and severity — `daemon`, `authorization`,
+// Every real Junos facility and severity NAME — `daemon`, `authorization`,
 // `change-log`, `interactive-commands`, `local0`..`local7`, `any`, `none`,
 // `emergency`..`debug` — is ASCII letters, digits and hyphen, so this accepts
 // the whole legitimate vocabulary (including the Junos names the runtime does
 // not yet MAP) while rejecting anything that could alter the file's structure.
 // It deliberately does NOT decide which facility NAMES are honoured; that is
 // the deferred mapping question on #5797.
-func syslogSelectorTokenSafe(tok string) bool {
-	if tok == "" {
-		return true
+func syslogSelectorAtomSafe(atom string) bool {
+	if atom == "" {
+		return false
 	}
 	// LOAD-BEARING: the ordinary SPACE is the byte this guard exists for, not
 	// the control characters it superficially resembles a check for. A newline
@@ -2088,8 +2101,8 @@ func syslogSelectorTokenSafe(tok string) bool {
 	// and start admitting the space — the guard would look intact and stop
 	// guarding anything. TestSyslogSelectorTokenSpaceIsUnsafe_5797 fails on
 	// exactly that edit. #5797.
-	for i := 0; i < len(tok); i++ {
-		c := tok[i]
+	for i := 0; i < len(atom); i++ {
+		c := atom[i]
 		switch {
 		case c >= 'a' && c <= 'z':
 		case c >= 'A' && c <= 'Z':
@@ -2100,4 +2113,111 @@ func syslogSelectorTokenSafe(tok string) bool {
 		}
 	}
 	return true
+}
+
+// syslogSelectorFacilitySafe reports whether a facility token can be
+// interpolated into the FACILITY position of an rsyslog selector without
+// escaping it (#5797).
+//
+// The belt is position-aware because rsyslog's selector grammar is
+// (rsyslog.conf(5), sysklogd format): the selector is
+// `<facility>.<priority>`; `*` "stands for all facilities or all priorities,
+// depending on where it is used (before or after the period)"; and "you can
+// specify multiple facilities with the same priority pattern in one statement
+// using the comma (`,`) operator". Both of those are NATIVE syntax in this
+// position, and an earlier revision of this belt — a single byte-allowlist
+// applied to both positions — rejected them.
+//
+// That was not a conservative choice, it was a silent regression. Both
+// spellings pass SchemaValidate and compile verbatim (the facility is the
+// schema's unvalidated wildcard KEY), and both rendered a working drop-in
+// before the belt existed, so rejecting them made a strict-commit-clean,
+// rsyslog-valid destination be warned-and-reconciled-AWAY on upgrade.
+//
+// Admitting them costs nothing, because neither can carry a payload:
+//
+//   - `*` is accepted only as the WHOLE token. `*` is one byte and the render
+//     is `fmt.Sprintf("%s.%s", facility, severity)`, so it can only ever
+//     produce `*.<severity>` — there is no room for an embedded `;`, space, or
+//     second selector. It is not admitted as a list member (`*,auth`), which
+//     is degenerate anyway: `*` already means every facility.
+//   - a comma list is accepted only when EVERY member is a nonempty safe atom,
+//     so `auth,authpriv` renders `auth,authpriv.info` while `auth,`, `,auth`
+//     and `auth,,authpriv` are rejected. An empty member is malformed rsyslog,
+//     and accepting it would let the length of the accepted set stop being a
+//     function of the bytes in it.
+//
+// Everything the single allowlist rejected for structural reasons — `;`, `.`,
+// `:`, whitespace, control bytes, arbitrary punctuation — is still rejected,
+// in every position. `daemon;*.* /tmp/pwn` is still dropped; that is the
+// injection this belt exists for.
+//
+// Empty is SAFE and expected: the call sites fold an empty facility to the `*`
+// wildcard before building the selector, so an unset facility is ordinary
+// configuration, not an omission to reject. `any` needs no special case — it
+// is a safe atom, and the call sites fold it to `*` too.
+//
+// Note what this does NOT do, unchanged from the deferred #5797 mapping
+// question: the render site's `change-log` -> `local6` remap and the
+// `any` -> `*` fold are whole-token comparisons, so a LIST member spelled
+// `change-log` or `any` is passed through verbatim and rsyslog will reject that
+// selector. That is pre-existing behaviour (before any belt existed the whole
+// facility rendered verbatim), and this belt deliberately does not decide
+// facility NAMES.
+func syslogSelectorFacilitySafe(tok string) bool {
+	if tok == "" || tok == "*" {
+		return true
+	}
+	for _, atom := range strings.Split(tok, ",") {
+		if !syslogSelectorAtomSafe(atom) {
+			return false
+		}
+	}
+	return true
+}
+
+// syslogSelectorSeveritySafe reports whether a severity token can be
+// interpolated into the PRIORITY position of an rsyslog selector without
+// escaping it (#5797).
+//
+// The priority position has a different grammar from the facility position,
+// which is why this is a separate predicate rather than the same one applied
+// twice. Per rsyslog.conf(5): `*` stands for all priorities here too, and
+// rsyslog extends BSD syslog with the modifiers `=` ("specify only this single
+// priority and not any of the above"), `!` ("ignore all that priorities"), and
+// the two combined — with the constraint that "the exclamation mark must occur
+// before the equals sign". So `=info`, `!info` and `!=info` are native, and
+// `=!info` is not; stripping only the three legal prefixes rejects the illegal
+// ordering for free.
+//
+// A comma list is deliberately NOT accepted here. The comma operator is
+// defined on the facility side only — rsyslog.conf(5) specifies multiple
+// facilities "with the same priority pattern", and the priority itself is a
+// single keyword. Multiple priorities are expressed by joining whole selectors
+// with `;` (`kern.*;kern.!err`), and `;` is precisely the statement separator
+// this belt exists to reject. So admitting a severity comma list would widen
+// the accept set without recovering any working configuration: `daemon.info,err`
+// was never a valid selector, on this branch or before the belt existed.
+//
+// Empty is SAFE for the same reason as the facility: the call sites fold it to
+// `*`.
+func syslogSelectorSeveritySafe(tok string) bool {
+	if tok == "" {
+		return true
+	}
+	// Order matters: `!=` must be stripped before `!`, or the `=` is left in
+	// the atom and a legitimate `!=info` is rejected.
+	rest := tok
+	switch {
+	case strings.HasPrefix(rest, "!="):
+		rest = rest[2:]
+	case strings.HasPrefix(rest, "!"), strings.HasPrefix(rest, "="):
+		rest = rest[1:]
+	}
+	// A bare modifier with no priority after it (`!`, `=`, `!=`) leaves an
+	// empty atom, which syslogSelectorAtomSafe rejects.
+	if rest == "*" {
+		return true
+	}
+	return syslogSelectorAtomSafe(rest)
 }

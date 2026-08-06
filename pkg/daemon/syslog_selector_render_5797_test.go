@@ -2,13 +2,14 @@ package daemon
 
 // #5797 render-site binding.
 //
-// syslog_selector_token_5797_test.go proves the PREDICATE
-// (syslogSelectorTokenSafe) classifies tokens correctly. That is scaffolding:
+// syslog_selector_token_5797_test.go proves the PREDICATES
+// (syslogSelectorFacilitySafe / syslogSelectorSeveritySafe) classify tokens
+// correctly, per position. That is scaffolding:
 // it stays green if both belt call sites are deleted, because nothing in it
 // reaches production. This file binds the CONSUMER — it drives
 // syslogDropinContents, the function that actually renders the rsyslog
 // drop-ins, and asserts on the rendered bytes. Removing either
-// `if !syslogSelectorTokenSafe(...)` guard turns these RED.
+// `if !syslogSelector...Safe(...)` guard turns these RED.
 //
 // Four properties, one per failure the belt exists to prevent:
 //
@@ -57,7 +58,7 @@ func renderedFor(cfg *config.Config, confFile string) (string, bool) {
 // a "reject everything" implementation fails just as loudly as a "reject
 // nothing" one.
 //
-// Reverting `if !syslogSelectorTokenSafe(f.Facility) || ...` in
+// Reverting `if !syslogSelectorFacilitySafe(f.Facility) || ...` in
 // syslogDropinContents renders `10-xpf-evil.conf` and this fails, printing the
 // rsyslog directive that would have been written.
 func TestSyslogRenderOmitsUnsafeFileToken_5797(t *testing.T) {
@@ -70,6 +71,17 @@ func TestSyslogRenderOmitsUnsafeFileToken_5797(t *testing.T) {
 		{"facility statement separator", "daemon;*.* /tmp/pwn", "info"},
 		{"facility pushes an action field", "* @@collector.example:514", "info"},
 		{"facility selector dot", "daemon.info", "info"},
+		// #6829: ISOLATED metacharacters, one unsafe byte per row. The rows
+		// above each carry several, so a mutation admitting exactly one of them
+		// leaves the whole table green — measured: adding `case c == ';'` to
+		// syslogSelectorAtomSafe reddened only the `both unsafe` row below,
+		// because every other `;` row is also rejected for its `*`, `.` or
+		// space. These rows make each byte bind on its own.
+		{"facility statement separator alone", "daemon;x", "info"},
+		{"facility space alone", "daemon local7", "info"},
+		{"facility slash alone", "var/log/pwn", "info"},
+		{"severity statement separator alone", "daemon", "info;y"},
+		{"severity space alone", "daemon", "info warning"},
 		// Tolerant-load / peer-sync only: the severity is enum-gated at commit.
 		{"severity pushes an action field", "daemon", "* @@collector.example:514"},
 		{"severity statement separator", "daemon", "info;*.*"},
@@ -171,6 +183,122 @@ func TestSyslogRenderSafeTokensReachOutput_5797(t *testing.T) {
 			}
 			if want := "# Managed by xpf — do not edit\n" + tc.want; body != want {
 				t.Errorf("rendered drop-in = %q, want %q", body, want)
+			}
+		})
+	}
+}
+
+// TestSyslogRenderNativeSelectorSyntaxReachesOutput_6829 is the regression
+// guard for the belt's own scope. It asserts the EMITTED SELECTOR TEXT for the
+// two rsyslog spellings an earlier revision of this belt rejected, because "no
+// warning fired" is not the property that matters — the property is that the
+// operator's destination still routes the records they asked for.
+//
+// Both spellings are strict-commit-clean: `auth,authpriv` and `*` pass
+// SchemaValidate (measured — the facility is the schema's unvalidated wildcard
+// KEY, see TestSyslogRenderUnsafeFacilityIsCommitReachable_5797 for the same
+// chain driven end to end) and compile verbatim. Before any belt existed both
+// rendered a working drop-in. A belt that dropped them therefore did not
+// harden the render path, it deleted a working destination on upgrade — the
+// drop-in is not merely left unwritten, reconcileSyslogDropins REMOVES the one
+// a previous apply wrote.
+//
+// RED-on-revert: narrow either position predicate back to a single
+// `[A-Za-z0-9-]` allowlist and every row here fails with the rendered-vs-want
+// diff, naming the selector that no longer reaches disk.
+func TestSyslogRenderNativeSelectorSyntaxReachesOutput_6829(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		facility string
+		severity string
+		want     string
+	}{
+		// The facility comma list: rsyslog's native multiple-facility operator.
+		{"comma facility list", "auth,authpriv", "info", "auth,authpriv.info"},
+		{"three-member facility list", "auth,authpriv,daemon", "warning", "auth,authpriv,daemon.warning"},
+		// The bare `*`. Distinct from the `any` -> `*` fold already covered by
+		// TestSyslogRenderSafeTokensReachOutput_5797: this is the operator
+		// AUTHORING `*`, which commits clean and must survive the belt on its
+		// own rather than by being rewritten.
+		{"bare wildcard facility", "*", "info", "*.info"},
+		// The priority position's own syntax.
+		{"wildcard severity", "daemon", "*", "daemon.*"},
+		{"exact-priority modifier", "daemon", "=info", "daemon.=info"},
+		{"exclude-priority modifier", "daemon", "!info", "daemon.!info"},
+		{"exclude-exact modifier", "daemon", "!=info", "daemon.!=info"},
+		// Both positions at once.
+		{"list facility and modified severity", "auth,authpriv", "!=debug", "auth,authpriv.!=debug"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := syslogCfg([]*config.SyslogFileConfig{
+				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+			}, []*config.SyslogUserConfig{
+				{User: "root", Facility: tc.facility, Severity: tc.severity},
+			})
+
+			// The FILE call site.
+			body, ok := renderedFor(cfg, renderPrefix+"d.conf")
+			if !ok {
+				t.Fatalf("facility=%q severity=%q rendered NO file drop-in. This spelling is "+
+					"native rsyslog syntax and commits clean, so dropping it deletes a working "+
+					"destination on upgrade rather than hardening anything (#5797/#6829)",
+					tc.facility, tc.severity)
+			}
+			if want := "# Managed by xpf — do not edit\n" + tc.want + "\t/var/log/d\n"; body != want {
+				t.Errorf("rendered file drop-in = %q, want %q", body, want)
+			}
+
+			// The USER call site is a separate `if !syslogSelector...` pair;
+			// widening only one leaves the other deleting destinations.
+			ubody, uok := renderedFor(cfg, renderPrefix+"user-root.conf")
+			if !uok {
+				t.Fatalf("facility=%q severity=%q rendered NO user drop-in — the user call site "+
+					"did not get the same position-aware predicates as the file site",
+					tc.facility, tc.severity)
+			}
+			if want := "# Managed by xpf — do not edit\n" + tc.want + "\t:omusrmsg:root\n"; ubody != want {
+				t.Errorf("rendered user drop-in = %q, want %q", ubody, want)
+			}
+		})
+	}
+}
+
+// TestSyslogRenderOmitsMalformedFacilityList_6829 is the over-reach guard for
+// the comma admission above. Accepting `auth,authpriv` must not degrade into
+// "a comma makes the token safe": the list is admitted PER MEMBER, so an empty
+// member (a malformed list) and a member carrying a payload are both still
+// dropped at the render site.
+//
+// Each row pairs the rejected destination with a safe sibling, so a belt that
+// regressed to rejecting everything fails just as loudly as one that regressed
+// to accepting everything.
+func TestSyslogRenderOmitsMalformedFacilityList_6829(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		facility string
+	}{
+		{"trailing empty member", "auth,"},
+		{"leading empty member", ",auth"},
+		{"interior empty member", "auth,,authpriv"},
+		{"comma only", ","},
+		// The load-bearing pair: the comma must not carry an injection in.
+		{"member carries a statement separator", "auth,authpriv;*.* /tmp/pwn"},
+		{"member carries a space", "auth,authpriv @@collector.example:514"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := syslogCfg([]*config.SyslogFileConfig{
+				{Name: "evil", Facility: tc.facility, Severity: "info"},
+				{Name: "audit", Facility: "auth,authpriv", Severity: "info"},
+			}, nil)
+
+			if body, ok := renderedFor(cfg, renderPrefix+"evil.conf"); ok {
+				t.Errorf("facility %q RENDERED an rsyslog drop-in. The comma operator is "+
+					"admitted per MEMBER, not as a blanket pass on any token containing a "+
+					"comma (#6829).\nwritten content:\n%s", tc.facility, body)
+			}
+			if _, ok := renderedFor(cfg, renderPrefix+"audit.conf"); !ok {
+				t.Errorf("the well-formed sibling list `auth,authpriv` was dropped too — a " +
+					"malformed list must skip ONLY its own destination")
 			}
 		})
 	}

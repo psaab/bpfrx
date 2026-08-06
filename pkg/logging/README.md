@@ -217,37 +217,59 @@ connectionless and exempt:
   configuration does not name" — is false for it. `logging.FacilityIsWildcard`
   is the single definition all three call sites share; it suppresses the
   warning only, and does not change what `ParseFacility` returns.
-- **rsyslog selector tokens are shape-checked (#5797).** The `file` and
-  `user` destinations do not use `SyslogClient` at all — the daemon builds
-  an rsyslog selector `<facility>.<severity>` and writes a managed drop-in.
-  #4902 belted the file NAME and user TOKEN on that line but not the two
-  selector tokens, so a newline or an rsyslog metacharacter in either one
-  escaped the selector and injected configuration.
-  `syslogSelectorTokenSafe` (pkg/daemon) rejects anything outside
-  `[A-Za-z0-9-]`, which admits the entire legitimate Junos vocabulary —
-  including the names the mapper cannot yet resolve — so the belt does not
-  pre-empt the mapping decision above. The two tokens do not share a threat
-  model: the severity is enum-gated at commit and so only arrives unsafe on
-  the tolerant load / peer-sync path, while the unvalidated facility
-  reaches the render site verbatim from an ORDINARY commit
-  (`set system syslog file audit "daemon;*.* /tmp/pwn" info` passes
+- **rsyslog selector tokens are grammar-checked, per POSITION (#5797).** The
+  `file` and `user` destinations do not use `SyslogClient` at all — the
+  daemon builds an rsyslog selector `<facility>.<severity>` and writes a
+  managed drop-in. #4902 belted the file NAME and user TOKEN on that line
+  but not the two selector tokens, so an rsyslog metacharacter in either
+  one escaped the selector and injected configuration. The two tokens do
+  not share a threat model: the severity is enum-gated at commit and so
+  only arrives unsafe on the tolerant load / peer-sync path, while the
+  unvalidated facility reaches the render site verbatim from an ORDINARY
+  commit (`set system syslog file audit "daemon;*.* /tmp/pwn" info` passes
   commit-check). The belt is the only thing standing between that string
   and a written rsyslog directive, so it is bound at the render site by
   `pkg/daemon/syslog_selector_render_5797_test.go`, not only by the
-  predicate's own unit tests.
+  predicates' own unit tests.
 
-  **Behaviour change on upgrade: a bare `*` in the facility position now
-  loses its destination.** `[A-Za-z0-9-]` excludes `*`, so a pre-existing
-  `set system syslog file messages * info` is skipped with a warning and
-  its managed drop-in is reconciled away. This spelling commits clean both
-  before and after, so it is a real regression for anyone who authored it —
-  but it is deliberately NOT rescued by admitting `*` to the belt. Junos
-  spells all-facilities `any`, which is this repo's own fixture, is
-  unaffected, and still renders `*` in the emitted selector. `*` in the
-  facility position is an undocumented non-Junos spelling; widening a
-  security belt to accommodate it trades a real injection boundary against
-  a config nobody was told to write, and the failure is loud rather than
-  silent. Operators hitting it should switch to `any`.
+  The belt is **position-aware**, because rsyslog's two selector positions
+  have different grammars (rsyslog.conf(5), sysklogd format) and a single
+  allowlist applied to both is necessarily their intersection:
+
+  | position | accepted | rendered example |
+  |---|---|---|
+  | facility | empty (folds to `*`), `any` (folds to `*`), exact `*`, or a comma-separated list of `[A-Za-z0-9-]` names | `auth,authpriv.info`, `*.info` |
+  | severity | empty (folds to `*`), a `[A-Za-z0-9-]` name, exact `*`, or one of the `=` / `!` / `!=` priority modifiers in front of a name or `*` | `daemon.*`, `daemon.=info`, `daemon.!=debug` |
+
+  The comma is admitted **per member**: `auth,authpriv` renders, while
+  `auth,`, `,auth`, `auth,,authpriv` and `auth,authpriv;*.* /tmp/pwn` do
+  not. The comma operator is deliberately NOT accepted in the severity
+  position — rsyslog defines it for multiple facilities "with the same
+  priority pattern", and multiple priorities are written as `;`-joined
+  selectors, so `daemon.info,err` was never a valid selector and admitting
+  it would widen the accept set without recovering any working config.
+
+  Everything rejected for structural reasons is still rejected in **both**
+  positions: whitespace, `.`, `;`, `:`, `/`, control bytes, and arbitrary
+  punctuation. `daemon;*.* /tmp/pwn` is dropped; that is the injection
+  #5797 exists for. The space is the load-bearing byte rather than the
+  newline — a literal newline cannot reach these tokens (the lexer folds it
+  to a space), while a space pushes attacker-chosen text into the rsyslog
+  ACTION position.
+
+  Accepting `*` and the comma list costs nothing, which is why they are in
+  rather than out. The render is `fmt.Sprintf("%s.%s", facility, severity)`,
+  so a whole-token `*` can only ever produce `*.<severity>` — one byte, no
+  room for a payload — and each list member is checked individually. Both
+  spellings pass commit-check and both rendered a working drop-in before
+  any belt existed, so rejecting them would not have hardened the render
+  path: it would have warned-and-reconciled-AWAY an operator's working
+  destination on upgrade (the drop-in is not merely left unwritten,
+  `reconcileSyslogDropins` removes it). What the belt still refuses to do
+  is decide which facility NAMES are honoured — that is the deferred
+  mapping question above, and the `change-log` → `local6` remap and
+  `any` → `*` fold remain whole-token comparisons, so a list member spelled
+  `change-log` or `any` is passed through verbatim.
 - **Lazy connect — receiver down at apply does not disable the stream
   (#3351).** A TCP/TLS receiver that is unreachable at config-apply or
   boot must NOT permanently silence the stream. `NewSyslogClientTransport`

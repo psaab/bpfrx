@@ -68690,3 +68690,51 @@ break — `go vet` confirmed passing under every revert.
   syslog_selector_render_5797_test.go:547 (Facility = 0 (FacilityKern), want
   FacilityDaemon (3)); the same mutation left all four packages GREEN before
   this subtest.
+
+## 2026-08-06 — #6829 fold r4 (position-aware selector grammar)
+
+- **Timestamp**: 2026-08-06 09:20 PDT
+- **Action**: Replace the single `syslogSelectorTokenSafe` byte-allowlist with
+  a POSITION-AWARE grammar (`syslogSelectorAtomSafe` +
+  `syslogSelectorFacilitySafe` + `syslogSelectorSeveritySafe`). The r3 belt
+  was the INTERSECTION of rsyslog's two selector grammars, so it dropped
+  native syntax from each: `auth,authpriv` (rsyslog's multiple-facility comma
+  operator) and a bare `*` in the facility position, plus severity `*` and the
+  `=`/`!`/`!=` priority modifiers. `auth,authpriv` was measured to pass
+  SchemaValidate, compile verbatim, and render nothing at r3 — a
+  strict-commit-clean, rsyslog-valid destination reconciled AWAY on upgrade,
+  not the "loud failure" the r3 README claimed. Facility now accepts empty /
+  `*` / a comma list of nonempty `[A-Za-z0-9-]` atoms; severity accepts empty
+  / `*` / an atom behind an optional `=`, `!` or `!=`. No comma in the
+  severity position: rsyslog defines the comma for facilities "with the same
+  priority pattern" and spells multiple priorities as `;`-joined selectors, so
+  `daemon.info,err` was never valid. Also reworded the three pre-dial
+  unmapped-facility warnings — construction DIALS and can `continue`, so
+  "forwarding under local0" claimed forwarding that may never happen; they now
+  say local0 was SELECTED.
+- **File(s)**: pkg/daemon/daemon_system.go, pkg/cli/apply.go,
+  pkg/daemon/syslog_selector_token_5797_test.go,
+  pkg/daemon/syslog_selector_render_5797_test.go, pkg/logging/README.md,
+  _Log.md
+- **Validation**: `go build ./...` rc=0; `go test ./pkg/daemon ./pkg/logging
+  ./pkg/cli ./pkg/config -count=1` rc=0; `go vet ./pkg/daemon ./pkg/cli` rc=0.
+  Five mutations, each RED as an ASSERTION (never a build break), marker
+  grepped back out of the file before each run:
+  M1a (facility predicate -> old single allowlist): 4 tests RED, e.g.
+  `facility="auth,authpriv" ... rendered NO file drop-in`; every injection
+  guard stayed GREEN (over-reach control).
+  M1b (severity predicate -> old single allowlist): 4 tests RED on `daemon.*`,
+  `daemon.=info`, `daemon.!info`, `daemon.!=info`.
+  M2 (`case c == ';'` admitted to the atom): `TestSyslogSelectorTokenRejects\
+  Injection_5797/statement_separator_alone` and the two render rows RED.
+  NOTE: M2 initially reddened ONLY the byte-exhaustive test and one render
+  row, because every named `;` fixture also carried a `*`, `.` or space and so
+  was rejected four times over. Added ISOLATED one-unsafe-byte rows (`daemon;x`,
+  `auth;authpriv`, `var/log/pwn`, `daemon local7`, `info;y`, `info warning`) so
+  each metacharacter binds on its own rather than being masked by a neighbour.
+  M3 (empty atom accepted): the four malformed-list rows RED at both the
+  predicate and render levels, plus the bare-modifier rows (`!`, `=`, `!=`).
+  M4 (severity delegates to facility — the "reuse one predicate" shape):
+  `TestSyslogSelectorPositionsAreNotInterchangeable_6829` RED in BOTH
+  directions.
+  M5 (`!=` case dropped so `!` strips first): `!=info` / `!=debug` RED.
