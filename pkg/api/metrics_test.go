@@ -74,11 +74,12 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	// #1782 Step-1 cold-start CoS instruments (wheel sum counter +
 	// wheel max gauge + 6 per-cause under-grant counters = 8) = 29 +
 	// #1861 install-refusal trio (create drops + admission refused +
-	// install partial counters) = 32.
+	// install partial counters) = 32 +
+	// #4800 per-worker transit new-flow install counter = 33.
 	// Per-slot/per-bucket metrics need non-empty Vec fields which
 	// these test fixtures don't populate, so they're zero here.
-	if len(got) != 3*32 {
-		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*32, len(got))
+	if len(got) != 3*33 {
+		t.Fatalf("emitWorkerRuntime: want %d metrics for 3 workers, got %d", 3*33, len(got))
 	}
 
 	// Gather just the dead-gauge entries, keyed by worker_id label.
@@ -309,7 +310,9 @@ func newCollectorWithWorkerDescsOnly() *xpfCollector {
 		workerSessionCreateDrops:             mk("xpf_userspace_worker_session_create_drops_total"),
 		workerSessionInstallAdmissionRefused: mk("xpf_userspace_worker_session_install_admission_refused_total"),
 		workerSessionInstallPartial:          mk("xpf_userspace_worker_session_install_partial_total"),
-		workerDead:                           mk("xpf_userspace_worker_dead"),
+		// #4800 per-worker transit new-flow installs.
+		workerNewFlowInstalls: mk("xpf_userspace_worker_new_flow_installs_total"),
+		workerDead:            mk("xpf_userspace_worker_dead"),
 		// #1621 cold-path descriptors.
 		workerColdPathBucket:              mkBucket("xpf_userspace_worker_cold_path_ns_bucket"),
 		workerColdPathSamples:             mkSlot("xpf_userspace_worker_cold_path_samples_total"),
@@ -380,7 +383,9 @@ func collectFromEmitWorkerRuntime(
 		c.workerSessionCreateDrops:             {},
 		c.workerSessionInstallAdmissionRefused: {},
 		c.workerSessionInstallPartial:          {},
-		c.workerDead:                           {},
+		// #4800 per-worker transit new-flow installs.
+		c.workerNewFlowInstalls: {},
+		c.workerDead:            {},
 		// #1621 cold-path descriptors.
 		c.workerColdPathBucket:              {},
 		c.workerColdPathSamples:             {},
@@ -766,6 +771,19 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 			[]string{"pool", "rule"},
 			nil,
 		),
+		// #4800: the residual live-state mutex (denominator, contended) pair.
+		userspaceSNATPoolLiveLockAcquisitionsTotal: prometheus.NewDesc(
+			"xpf_userspace_source_nat_pool_live_lock_acquisitions_total",
+			"live lock acquisitions",
+			[]string{"pool", "rule"},
+			nil,
+		),
+		userspaceSNATPoolLiveLockContendedTotal: prometheus.NewDesc(
+			"xpf_userspace_source_nat_pool_live_lock_contended_total",
+			"live lock contended",
+			[]string{"pool", "rule"},
+			nil,
+		),
 	}
 	status := dpuserspace.ProcessStatus{
 		SourceNATPools: []dpuserspace.SourceNATPoolStatus{{
@@ -777,6 +795,10 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 			AllocationsTotal: 3,
 			ReusesTotal:      5,
 			ExhaustionTotal:  7,
+			// #4800: distinct from each other and from every other field
+			// above, so a mis-wired collector cannot pass by coincidence.
+			LiveLockAcquisitionsTotal: 11,
+			LiveLockContendedTotal:    4,
 		}},
 	}
 
@@ -789,8 +811,9 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	if len(got) != 6 {
-		t.Fatalf("emitUserspaceSourceNATPoolMetrics: want 6 metrics, got %d", len(got))
+	// 6 pre-#4800 series + the live-lock (denominator, contended) pair.
+	if len(got) != 8 {
+		t.Fatalf("emitUserspaceSourceNATPoolMetrics: want 8 metrics, got %d", len(got))
 	}
 
 	labels := map[string]string{"pool": "pool-a", "rule": "snat-a"}
@@ -800,6 +823,12 @@ func TestEmitUserspaceSourceNATPoolMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceSNATPoolAllocationsTotal, labels, 3)
 	assertCounterClose(t, got, c.userspaceSNATPoolReusesTotal, labels, 5)
 	assertCounterClose(t, got, c.userspaceSNATPoolExhaustionsTotal, labels, 7)
+	// #4800: both legs of the pair carry through to Prometheus. Distinct
+	// fixture values so a collector that emitted the same field twice
+	// (acquisitions into the contended series, or vice versa) fails here
+	// rather than passing on a coincidence.
+	assertCounterClose(t, got, c.userspaceSNATPoolLiveLockAcquisitionsTotal, labels, 11)
+	assertCounterClose(t, got, c.userspaceSNATPoolLiveLockContendedTotal, labels, 4)
 }
 
 func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
@@ -825,6 +854,50 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		userspaceSessionPublishErrors: prometheus.NewDesc(
 			"xpf_userspace_session_publish_errors_total",
 			"session publish errors",
+			nil,
+			nil,
+		),
+		// #4800: publish + replication legs of the new-flow-install
+		// contention surface.
+		userspaceSharedSessionPublishes: prometheus.NewDesc(
+			"xpf_userspace_shared_session_publishes_total",
+			"shared session publishes",
+			nil,
+			nil,
+		),
+		userspaceSharedSessionPublishLockAcquired: prometheus.NewDesc(
+			"xpf_userspace_shared_session_publish_lock_acquisitions_total",
+			"shared session publish lock acquisitions",
+			nil,
+			nil,
+		),
+		userspaceSharedSessionPublishLockBlocked: prometheus.NewDesc(
+			"xpf_userspace_shared_session_publish_lock_contended_total",
+			"shared session publish lock contended",
+			nil,
+			nil,
+		),
+		userspaceSessionReplicationUpserts: prometheus.NewDesc(
+			"xpf_userspace_session_replication_upserts_total",
+			"session replication upserts",
+			nil,
+			nil,
+		),
+		userspaceSessionReplicationEnqueued: prometheus.NewDesc(
+			"xpf_userspace_session_replication_enqueued_total",
+			"session replication enqueued",
+			nil,
+			nil,
+		),
+		userspaceSessionReplicationLockBlocked: prometheus.NewDesc(
+			"xpf_userspace_session_replication_lock_contended_total",
+			"session replication lock contended",
+			nil,
+			nil,
+		),
+		userspaceSessionReplicationQueueDepthMax: prometheus.NewDesc(
+			"xpf_userspace_session_replication_queue_depth_max",
+			"session replication queue depth high-water",
 			nil,
 			nil,
 		),
@@ -962,6 +1035,18 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		MaxSessions:         100,
 		// #1789: publish-error counter emitted unconditionally.
 		SessionPublishErrorsTotal: 6,
+		// #4800: publish + replication contention surface. Seven values,
+		// all distinct from one another and from every other field in this
+		// fixture, so a collector that crossed two of these wires (emitting
+		// acquisitions into the contended series, say) fails an assertion
+		// instead of passing on a coincidence.
+		SharedSessionPublishesTotal:               101,
+		SharedSessionPublishLockAcquisitionsTotal: 103,
+		SharedSessionPublishLockContendedTotal:    107,
+		SessionReplicationUpsertsTotal:            109,
+		SessionReplicationEnqueuedTotal:           113,
+		SessionReplicationLockContendedTotal:      127,
+		SessionReplicationQueueDepthMax:           131,
 		// #2244: dnat_table reverse-NAT publish-error counter emitted
 		// unconditionally.
 		DnatPublishErrorsTotal: 7,
@@ -1056,9 +1141,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// packet_too_big / reject) = 21 + the #3657 source-split reject trio
 	// (sent / reply-budget / output-filter) × 2 sources = 27 + the #3661
 	// source-split reject rate-limit drop leg × 2 sources = 29 + the #5674
-	// synced_import_cap_drops_total counter (= 30).
-	if len(got) != 30 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 30 metrics, got %d", len(got))
+	// synced_import_cap_drops_total counter (= 30) + the #4800 new-flow
+	// contention surface (publish call count + publish lock pair +
+	// replication upserts/enqueued/contended + replication queue depth
+	// high-water = 7) = 37.
+	if len(got) != 37 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 37 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1068,6 +1156,20 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisions, nil, 0)
 	// #1789: publish-error counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionPublishErrors, nil, 6)
+	// #4800: every leg of the new-flow-install contention surface reaches
+	// Prometheus carrying ITS OWN value. Both halves of each pair are
+	// asserted separately — a denominator that silently went missing (or
+	// got wired to the contended field) would leave the ratio the
+	// connection-rate harness computes quietly wrong rather than absent.
+	assertCounterClose(t, got, c.userspaceSharedSessionPublishes, nil, 101)
+	assertCounterClose(t, got, c.userspaceSharedSessionPublishLockAcquired, nil, 103)
+	assertCounterClose(t, got, c.userspaceSharedSessionPublishLockBlocked, nil, 107)
+	assertCounterClose(t, got, c.userspaceSessionReplicationUpserts, nil, 109)
+	assertCounterClose(t, got, c.userspaceSessionReplicationEnqueued, nil, 113)
+	assertCounterClose(t, got, c.userspaceSessionReplicationLockBlocked, nil, 127)
+	// Depth is a high-water GAUGE, not a counter — asserted as such so a
+	// future change to CounterValue is caught here.
+	assertGaugeClose(t, got, c.userspaceSessionReplicationQueueDepthMax, nil, 131)
 	// #2244: dnat_table reverse-NAT publish-error counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceDnatPublishErrors, nil, 7)

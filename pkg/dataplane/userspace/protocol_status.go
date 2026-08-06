@@ -245,6 +245,35 @@ type ProcessStatus struct {
 	// as xpf_userspace_session_publish_errors_total. Omitempty for wire
 	// compat with older helpers.
 	SessionPublishErrorsTotal uint64 `json:"session_publish_errors_total,omitempty"`
+	// #4800 new-flow-install contention surface. These six counters plus
+	// the depth high-water are what let a connection-rate run name the
+	// saturated cross-worker synchronization point rather than infer one
+	// from a flattened new-flows/sec curve.
+	//
+	// SharedSessionPublishesTotal is the publish-leg new-flow rate.
+	// SharedSessionPublishLock{Acquisitions,Contended}Total are the
+	// shared-map mutex pair scoped to publish_shared_session alone; their
+	// ratio is the publish leg's blocked fraction.
+	// SessionReplication{Upserts,Enqueued}Total give the replication call
+	// rate and, as Enqueued/Upserts, the N-way sibling fan-out multiplier.
+	// SessionReplicationLockContendedTotal is the blocked subset of those
+	// enqueues (denominator: Enqueued).
+	// SessionReplicationQueueDepthMax is a MONOTONIC HIGH-WATER GAUGE, not
+	// a counter — never rate() it. Contention means producers collided on
+	// the queue mutex; depth means the consuming worker is not draining as
+	// fast as producers enqueue. Different failure modes, different fixes.
+	//
+	// The NAT-allocator leg of the same question is per pool and lives on
+	// SourceNATPoolStatus.LiveLock*, not here. Omitempty for wire compat
+	// with older helpers; JSON tags MUST match the Rust serde rename(...)
+	// exactly (protocol/control.rs).
+	SharedSessionPublishesTotal               uint64 `json:"shared_session_publishes_total,omitempty"`
+	SharedSessionPublishLockAcquisitionsTotal uint64 `json:"shared_session_publish_lock_acquisitions_total,omitempty"`
+	SharedSessionPublishLockContendedTotal    uint64 `json:"shared_session_publish_lock_contended_total,omitempty"`
+	SessionReplicationUpsertsTotal            uint64 `json:"session_replication_upserts_total,omitempty"`
+	SessionReplicationEnqueuedTotal           uint64 `json:"session_replication_enqueued_total,omitempty"`
+	SessionReplicationLockContendedTotal      uint64 `json:"session_replication_lock_contended_total,omitempty"`
+	SessionReplicationQueueDepthMax           uint64 `json:"session_replication_queue_depth_max,omitempty"`
 	// DnatPublishErrorsTotal counts failed dnat_table reverse-SNAT BPF-map
 	// publishes across userspace workers (#2244). The dnat_table is the
 	// reverse lookup the embedded-ICMP NAT path consults to map an inbound
@@ -513,6 +542,13 @@ type WorkerRuntimeStatus struct {
 	SessionCreateDrops             uint64 `json:"session_create_drops,omitempty"`
 	SessionInstallAdmissionRefused uint64 `json:"session_install_admission_refused,omitempty"`
 	SessionInstallPartial          uint64 `json:"session_install_partial,omitempty"`
+	// #4800: cumulative locally-learned transit forward-flow installs on
+	// this worker — its share of the SNAT-allocate / publish_shared_session
+	// / replicate_session_upsert path. Divided by the run window this is
+	// the worker's new-flows/sec; compared ACROSS workers it separates a
+	// genuine cross-worker lock bound from one saturated RX queue.
+	// omitempty for mixed-version back-compat.
+	NewFlowInstalls uint64 `json:"new_flow_installs,omitempty"`
 	// #925 Phase 1+2 (catch+report+observe): Dead == true means the
 	// worker_loop panicked and the supervisor caught it. Set-only
 	// today — cleared only by daemon restart. Phase 2 surfaces this
