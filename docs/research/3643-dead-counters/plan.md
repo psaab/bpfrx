@@ -24,7 +24,8 @@ converged, the fork resolved as recommended:
   `xpf_zone_packets_total` / `xpf_zone_bytes_total` Prometheus metrics were
   dropped. Pinned by the `zone_flood_counters_hide_test.go` /
   `zone_counters_hide_test.go` suites in `pkg/dataplane`, `pkg/api`,
-  `pkg/cli`, and `pkg/grpcapi`.
+  `pkg/cli`, and `pkg/grpcapi`. (The `pkg/api` half of that pin was replaced by
+  `zone_counters_metrics_test.go` when #3651 restored the metrics — see below.)
 
 - **POPULATE traffic (§5A) SHIPPED under #3651; per-zone flood still deferred.**
   This document is its design of record. The Rust helper now accounts per-zone
@@ -33,9 +34,28 @@ converged, the fork resolved as recommended:
   `userspace-dp/src/afxdp/zone_counters.rs`), pre-sums across workers into the
   `ProcessStatus.zone_traffic_counters` sparse block (layout version 1), and the
   Go status poll mirrors it into the zone-counter offset map via
-  `SetZoneCounterOffset` so `show security zones` / REST / Prometheus report
-  live volume; a `clear_zone_counters` IPC resets the helper store. The lower-
-  value per-zone FLOOD half stays deferred (lean on the #3343 aggregate). The
+  `ReplaceZoneCounterOffsets` so `show security zones` and REST report live
+  volume;
+  a `clear_zone_counters` IPC resets the helper store.
+
+  **Prometheus lagged the other surfaces and was restored separately.** The
+  dataplane and Go populate path shipped first, but the collector #3643 had
+  deleted was not brought back with them, so for a period `show security zones`
+  and REST reported live per-zone volume while Prometheus — the surface an
+  operator actually alerts on — reported nothing at all. The
+  `xpf_zone_packets_total` / `xpf_zone_bytes_total` family is now live again
+  (`collectZoneCounters`, `pkg/api/metrics_counters.go`), sourced from the
+  sparse offset map and never from a dense array, so it cannot reintroduce the
+  per-scrape read-error storm that motivated the HIDE. Because the helper's
+  status snapshot is sparse and drops all-zero rows,
+  `ErrCounterNotPopulated` cannot distinguish a pre-#3651 helper, a
+  slot-overflowed zone, and an idle zone; the collector therefore OMITS the
+  samples for such a zone rather than publishing an authoritative `0`, and
+  counts it into the `xpf_zone_counters_unpopulated_zones` gauge — explicitly
+  "not known", and explicitly not a read error.
+
+  The lower-value per-zone FLOOD half stays deferred (lean on the #3343
+  aggregate). The
   historical VERIFY-FIRST note below described the pre-#3651 master where the
   userspace dataplane did **not** publish per-zone traffic or flood counters. `ProcessStatus`
   (`pkg/dataplane/userspace/protocol.go`) carries no per-zone block, and the

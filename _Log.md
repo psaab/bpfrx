@@ -1,3 +1,348 @@
+## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Third gate at `290035ded` returned **no runtime finding**. It
+  verified all three counts independently from the code (3 increment branches,
+  6 HELP causes, 3 sentinel meanings), confirmed the ordering claim directly
+  (both pre-read increments `continue` before the first `ReadZoneCounters`), ran
+  four discrimination mutations each producing exactly its own assertion, and
+  proved the delta comment-only with an **AST-based comment stripper** — a
+  stronger check than the line-filter grep used here, since it cannot be fooled
+  by `//` inside a string and, because the phrase list is a composite literal,
+  its identity also proves no assertion moved. It also verified phrase
+  uniqueness empirically across all 298 described descriptors.
+  Two findings, both documentation, both this PR's own thesis defect standing in
+  surfaces the delta did not reach. Fixed inline.
+  1. **`pkg/api/README.md` was frozen at FOUR causes** and still carried the
+     literal "triages toward three causes" sentence that round 6 deleted from the
+     Go comment. Byte-identical to `e08a3c74f`. It is the doc
+     `docs/userspace-dataplane-gaps.md` explicitly redirects operators to, and it
+     was maintained by four of this PR's eight commits — it stopped being updated
+     exactly when the list grew past four. An operator following the redirect
+     would check four causes, find none applies, and never reach (f), which this
+     PR's own comment calls the cause an operator is LEAST likely to guess.
+     Rewritten to state NO count, defer to the HELP as the authority, name (e)
+     and (f) explicitly, and record that the paragraph itself rotted.
+  2. **The "Counted, not pattern-matched" partition counted eight of NINE
+     pre-gate collectors.** The missing one, `collectFlowExportMetrics`, touches
+     `c.srv` and does NOT guard — so it belongs to neither claimed set and
+     falsifies the two-way split. A comment that advertises having counted is
+     the last place an enumeration should be short. Now a three-way partition,
+     with the third member named and its safety explained.
+     The gate also refuted the paragraph's premise: `Collect()` dereferences
+     `c.srv` unconditionally before either position, so the below-gate position
+     never "implicitly ruled out" a nil server. The guard is real but it buys the
+     direct-call test path, not nil-safety. Said so.
+  3. NIT: "(a)-(d) read as inapplicable while the gauge sits at 1" is true only
+     of (f). (e)'s branch fires for EVERY configured zone, so it reads N. The
+     magnitude difference is itself a triage hint and is now stated.
+  4. NIT: a 22-column orphan line left by the round-6 re-wrap.
+- **File(s)**: pkg/api/README.md, pkg/api/metrics_counters.go,
+  pkg/api/metrics_descriptors_zone.go, pkg/api/zone_counters_metrics_test.go,
+  _Log.md
+- **Validation**: comment-only in BOTH production and test — each diff filtered
+  to non-comment lines is empty. `go build ./...` rc=0; `go vet ./pkg/api/` rc=0;
+  `go test ./pkg/api/ ./pkg/dataplane/ -count=1` rc=0; `gofmt -l` clean.
+## 2026-08-05 — #6843 round 6: the enumeration grew, the header did not
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: The round-5 gate returned MERGE-NEEDS-MINOR with **zero runtime
+  findings** — the HELP is correctly bound (the test exact-matches
+  `fqName == "xpf_zone_counters_unpopulated_zones"` before inspecting
+  `Desc.String()`, which is what stops a substring from resolving against a
+  sibling metric), two independent discrimination mutations each failed only
+  their own assertion, all six causes are complete with no seventh and none
+  unreachable, and the full suite is rc=0. Five comment/doc items remained.
+  Fixed inline rather than by another agent round, per the materiality rule.
+  1. `metrics_descriptors_zone.go` still said "FOUR distinct reasons"
+     immediately before enumerating six, and "triages toward three causes"
+     below it. **The list grew and its header did not** — the exact rot this
+     PR exists to remove, committed by the fix for it. Now SIX, plus the
+     distinction the gate drew: six CAUSES reached through THREE increment
+     branches. Those are different quantities and the text now says so.
+  2. `maps_counters.go` said the family "is not sourced by the userspace
+     dataplane" — false for traffic since #3651 — and, worse, the round-5
+     clause split introduced a NEW false statement: that the sentinel can mean
+     "no loaded dataplane / no apply result yet". It cannot. On both of those
+     the collector increments BEFORE it ever calls `ReadZoneCounters`, so no
+     read occurs and no sentinel is produced. The sentinel has exactly three
+     meanings; the GAUGE has six causes; the doc now separates them and warns
+     against reading the HELP list as a list of sentinel meanings.
+  3. `loader.go` — the round-5 insertion severed a sentence: `go doc -all -u
+     ./pkg/dataplane Manager` rendered "The #6843: the two maps ...", a
+     dangling article. Third distinct variant of the insertion-vs-doc-block
+     class on this PR (steal, cut-in-half, now dangle). Re-anchored as its own
+     paragraph; verified by re-running `go doc` and grepping for the fragment.
+  4. Flood absolutes ("no writer exists", "reads report this unconditionally",
+     the map "stays empty") are true of production and false of the API —
+     `SetFloodCounterOffset` is exported and a test populates it. Scoped to
+     production in both files rather than deleted; the conclusion holds.
+  5. The new test comment called six causes "SIX membership branches". Six
+     causes, three branches. Corrected, and the reason the phrases must be
+     unique to this gauge is now stated where the phrase list is.
+- **File(s)**: pkg/api/metrics_descriptors_zone.go,
+  pkg/api/zone_counters_metrics_test.go, pkg/dataplane/maps_counters.go,
+  pkg/dataplane/loader.go, _Log.md
+- **Validation**: comment-only — the production diff filtered to non-comment
+  lines is empty. `go build ./...` rc=0; `go test ./pkg/api/ ./pkg/dataplane/
+  -count=1` rc=0 (both `ok`); `gofmt -l` clean on all four files; `go doc`
+  confirms the severed sentence is gone.
+## 2026-08-05 — #6843 gate round 5: the fold re-committed both classes it closed
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Five items, and the structural finding is that round 4 re-committed
+  in two places the two classes it was dispatched to close. **Item 1 (the M3
+  defect one round later):** the M1 HELP fix shipped with NO assertion — reverting
+  it to the three-cause wording left `./pkg/api` green. I had applied exactly that
+  standard to two operator strings the round before and not to this one. Bound by
+  a per-cause assertion on the gauge's OWN `Desc().String()` (not a scrape-wide
+  substring — `Desc.String()` embeds HELP, so a loose match can be satisfied by a
+  sibling metric's help; that is the trap that made the first `zoneSamples` draft
+  misread counters as the gauge). **Item 2 (material):** the cause list still
+  under-enumerated by TWO REACHABLE paths — `loaded && cr == nil` (shim loaded by
+  LoadUserspaceShim, `lastApply` set only by recordApplyResult, so the window
+  before first apply and PERMANENTLY after a failed first apply) and
+  `cr != nil && !ok` (the collector reads `store.ActiveConfig()` but commitAndApply
+  promotes the store BEFORE the apply, so a commit adding a zone whose apply fails
+  leaves store=N+1, cr.ZoneIDs=N). Six causes now, in the HELP, the (a)-(f) block,
+  and types.go. **Items 3+4 (the premise sweep one round later):** my stated method
+  was "search the premise, not the symbol" — right method, stopped short of the
+  CANONICAL DEFINITION. `ErrCounterNotPopulated`'s own godoc, and the
+  `zoneCounterOffsets` field comment on the very map this PR rewrites, both still
+  said the POPULATE path is deferred. Both cover traffic AND flood in one
+  sentence, so the fix is a clause split — flood genuinely IS still deferred and
+  its half must stay. **Item 5:** the corrected citation replaced one pattern-match
+  with a smaller one; measured it — 3 of 6 collectHostInbound* touch c.srv, named
+  those three.
+- **Validation**: `go vet ./...` REAL exit 0; `go test ./... -count=1` REAL exit 0;
+  `go test ./pkg/refactoraudit/` exit 0. Item 1 mutation-proven: reverting the HELP
+  reds all three missing causes with build+vet clean, restore green.
+- **File(s)**: `pkg/api/metrics_descriptors_zone.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/types.go`, `pkg/api/zone_counters_metrics_test.go`,
+  `pkg/dataplane/maps_counters.go`, `pkg/dataplane/loader.go`, `_Log.md`
+
+## 2026-08-05 — #6843 gate round 4: the hoist changed the gauge's MEANING
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Five items. **M1 (semantic):** hoisting the collector above the
+  dataplane gate added a FOURTH membership cause the HELP did not name — "no
+  loaded dataplane". Before the hoist the three ErrCounterNotPopulated causes
+  were exhaustive; after it the gauge reads the full configured zone count when
+  the dataplane fails to arm, and with no `xpf_dataplane_loaded` series to
+  disambiguate an operator paging on `> 0` would triage toward three causes none
+  of which applies. Named in the HELP string, the (a)-(d) block, and
+  pkg/api/README.md. **Changing WHEN a metric is emitted changed WHAT it means**
+  — availability and semantics are not separable for a gauge whose HELP
+  enumerates its causes. **M2:** the D-sweep was still incomplete — four sites
+  carried the refuted premise, two of them in files this PR edits, and two the
+  structured mirrors of the text surfaces R2 fixed. A SYMBOL grep finds none of
+  them; searching the restated PREMISE finds all four — the same lexical-vs-
+  behavioural gap that made F5 incomplete, recurring. Plus a fifth doc-block
+  defect: my #6843 note was inserted INSIDE the opening godoc sentence, severing
+  it, so `go doc` rendered a fragment as the synopsis. **M3:** R2's wording fix
+  was entirely unbound — reverting both operator strings left both packages
+  green, because the only assertion matched the invariant prefix. Both hide
+  tests now assert the cause clause AND the absence of the retracted claim.
+  Plus five NITs including a citation I got wrong by pattern-matching
+  (collectLo0Counters needs no nil guard; it reads neither field).
+- **Validation**: full Go suite REAL exit 0; full cargo `--test-threads=1` REAL
+  exit 0. M3 mutation-proven (the revert Codex demonstrated now REDs).
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_zone.go`, `pkg/api/types.go`,
+  `pkg/api/security.go`, `pkg/api/README.md`, `pkg/grpcapi/server_show_zones.go`,
+  `pkg/grpcapi/zone_flood_counters_hide_test.go`,
+  `pkg/cli/zone_flood_counters_hide_test.go`, `pkg/dataplane/maps_counters.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`, `_Log.md`
+
+## 2026-08-05 — #6843 gate round 3: hoist the gauge, correct a correction, finish the sweep
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Seven items. **R1 (only operational one):** the unpopulated gauge
+  is documented as ALWAYS emitted so `> 0` is alertable and its absence cannot be
+  mistaken for a scrape that failed — but `collectZoneCounters` sat BELOW the
+  `dp == nil || !dp.IsLoaded()` gate, so on a degraded/config-only boot no sample
+  was emitted and the alert silently stopped evaluating exactly when per-zone
+  volume was most unavailable: the literal failure the comment said cannot
+  happen. Hoisted above the gate (it is config-derived and degrades correctly),
+  added the not-loaded branch, and added a nil-store guard the below-gate
+  position had implicitly provided — a real nil-pointer panic the full suite
+  caught after the hoist. No existing fixture could see any of this:
+  `descriptorCoverageDP.IsLoaded()` is hardcoded true, so a `notLoadedDP` was
+  needed. **T1:** my own F3 correction shipped an unmeasured claim. **D4:**
+  inserting my test directly below a doc block silently reassigned that block to
+  it, leaving the #5171 test undocumented — moved my test below. **R2:** two
+  operator-facing surfaces still printed "per-zone accounting not implemented"
+  while this PR's own code says the helper populates them; with 64+ zones one
+  `show security zones` printed real bytes for slotted zones and "not
+  implemented" for overflowed ones, naming the wrong cause. **D1/D2/D3/D5, T2:**
+  finished the sweep, including a refuted premise and three Rust mirrors of a
+  sentence I had already fixed twice on the Go side.
+- **Validation**: full Go suite REAL exit 0; full cargo `--test-threads=1` REAL
+  exit 0; `pkg/refactoraudit` ok.
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_zone.go`, `pkg/api/zone_counters_metrics_test.go`,
+  `pkg/cli/cli_show_security_zones.go`, `pkg/grpcapi/server_show_zones_text.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/handlers/mod.rs`, `_Log.md`
+
+## 2026-08-05 — #6843 Codex fold: bind the two PRODUCTION call sites
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Codex MERGE-NEEDS-MINOR. The fix was sound; the tests bound the
+  extracted primitive and NOT its wiring, so three plausible reverts shipped
+  green: the coordinator reverting to inline configured-only publication, and
+  the Go status loop reverting to per-row setters (which the Prometheus test
+  also missed, because it injects replacement maps directly). Added one test per
+  side driving the REAL entry point — `Coordinator::zone_traffic_counters` and
+  `syncBPFCountersLocked` over two successive polls. Also strengthened five
+  assertions that a broken implementation satisfied: `EmptyClearsAll` (an
+  always-clears impl passed — now paired with a repopulate leg), the Rust
+  sibling test (`|_| true` let the configured predicate be deleted — now a real
+  configured set excluding a slotted zone), the Rust unconfigured test (all
+  zones slotted, so the slot predicate could be deleted — now includes an
+  unslotted zone with retained totals), Go remove/re-add (input now mutated
+  after the call), and Go input-copy (a second snapshot, without which
+  merge-only passed).
+
+  **CORRECTION (gate round 2, F3/F4) — two claims in the entry above and in my
+  report were wrong, and the correction matters more than the entry:**
+
+  - *"strengthened five assertions that a broken implementation satisfied"*
+    overstates it. The gate built the full mutation matrix at BOTH SHAs and every
+    one of the five mutations was ALREADY caught by a pre-existing sibling test.
+    No suite-level hole existed. What the strengthenings actually did is make
+    each test independently binding — exercising both predicates itself rather
+    than relying on a sibling to catch the other. That is worth doing, but it is
+    a different and smaller claim.
+  - My mutation table row *"S1 always-clear -> EmptyClearsAll RED (passed before
+    the repopulate leg)"* is FACTUALLY WRONG. The gate ran the counterfactual: at
+    `f7b9e820d`, EmptyClearsAll was ALREADY RED under always-clear, failing at
+    its own setup precondition. S2 (merge-only vs CopiesInput) was accurate as
+    reported.
+
+    **CORRECTION TO THE CORRECTION (gate round 3, T1).** The sentence above
+    originally continued "...it made the test fail for the RIGHT reason instead
+    of at setup". That was ALSO unmeasured, and also false: measured at BOTH
+    trees, the always-clear mutation fails at the identical line for the
+    identical reason (`:73 setup read failed`) — `t.Fatalf` Goexits before the
+    repopulate leg runs, so the fold changed nothing about that mutation. The
+    leg is still load-bearing, but for a NARROWER property the gate identified:
+    a STICKY clear (clear correctly, never repopulate) reds it. Comment
+    rewritten to name that instead.
+
+    The generalizable lesson, and the reason this is recorded twice: **a
+    correction is itself a claim and needs the same measurement discipline as
+    the thing it corrects.** I fixed an inferred table row by measuring at both
+    trees, and in the same breath wrote an inferred sentence about what the fix
+    accomplished.
+
+  I ran those mutations only against the post-fold tree and inferred the "passed
+  before" half instead of running the counterfactual at the parent. A mutation
+  table is a claim about a DIFFERENCE between two trees, so it has to be measured
+  at both — asserting the before-state from memory is exactly the shortcut the
+  table exists to eliminate. Corrected two comments that became FALSE with this change
+  — both claimed a cleared zone "reports 0" when it now reads as
+  ErrCounterNotPopulated, a real behavioural difference a reader would reason
+  wrongly from — plus a "slice"/"map" wording nit.
+- **Test-authoring note**: the strengthened Rust test initially failed because
+  the pending accumulator is a shared THREAD-LOCAL — recording against two slot
+  maps before flushing once folds the first map's deltas through the second
+  map. Flush after each record, with the map the traffic was recorded against.
+- **Validation**: full Go suite REAL exit 0 (unsandboxed, first run). Full cargo
+  suite: run 1 hit `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`
+  (HA session mutex, unrelated subsystem); it PASSES isolated and run 2 was
+  exit 0 — non-deterministic, and this diff touches no HA session code.
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `pkg/dataplane/userspace/zone_counter_syncloop_6843_test.go` (new),
+  `pkg/dataplane/userspace/zonecounters.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `pkg/dataplane/maps_counters.go`, `_Log.md`
+
+## 2026-08-05 — #6843 fold: overflow retention published a FROZEN counter
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Gate found a MAJOR that refutes a verification I made and reported
+  as firm. I checked that `ZoneCounterSlotMap::build` `break`s before
+  `store.zone_totals(zid)`, concluded an overflowed zone is never registered and
+  so reads as unpopulated, and stated it as a general fact. It holds only for a
+  zone that was ALWAYS overflowed. The store OUTLIVES the slot map: config apply
+  carries it forward and `reconcile` retains every still-configured zone, so a
+  zone that accumulated traffic and is then pushed past slot capacity by a later
+  config keeps its nonzero totals, gets slot 0, and — because the status
+  accessor filtered only by "still configured" — kept publishing. Go mirrored it
+  and Prometheus emitted a FROZEN total forever while every subsequent packet
+  went uncounted. Exactly the failure class this PR exists to prevent, and worse
+  than an omission because a frozen counter looks alive. Second retention hazard
+  in the same family: the Go loop only SET rows and never removed absent ones,
+  so a helper downgrade or a zone remove/re-add stranded a stale offset. Fixed
+  both — the helper now publishes a row only when the zone is configured AND
+  holds a live slot (`publishable_zone_rows`, extracted as a pure function so
+  the transition is unit-testable), and the Go mirror REPLACES the offset map
+  from each snapshot (`ReplaceZoneCounterOffsets`) instead of merging.
+- **Lesson recorded in the code comments**: verifying one `build` is not
+  verifying a claim about a structure carried forward across applies. "Never
+  inserted" is a statement about a single apply; the dangerous case is a zone
+  that WAS counted and then stopped.
+- **Validation**: full Go suite and full cargo suite both green, each scored
+  from a REAL exit code (GO_EXIT=0, RUST_EXIT=0). Three new Rust tests cross the
+  transition (populated-then-overflowed; slotted sibling keeps publishing;
+  unconfigured dropped despite a live slot), four new Go retention tests
+  (absent-zone drop, empty-clears, remove-then-readd, input-copy), and one
+  end-to-end Prometheus test asserting the sample disappears and the unpopulated
+  gauge increments across the transition. Mutation-proven.
+- **File(s)**: `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `pkg/dataplane/maps_counters.go`,
+  `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go` (new),
+  `pkg/api/zone_counters_metrics_test.go`, `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-05 — #3651: restore the per-zone Prometheus surface
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface)
+- **Action**: #3651 shipped the per-zone traffic POPULATE path end to end (Rust
+  forward-path accounting -> `ProcessStatus.zone_traffic_counters` ->
+  `SetZoneCounterOffset`), but the Prometheus collector #3643 had deleted was
+  never brought back with it. `show security zones` and REST reported live
+  per-zone volume while Prometheus reported nothing — the one surface an
+  operator alerts on was the missing one. Restored `xpf_zone_packets_total` /
+  `xpf_zone_bytes_total` (labels unchanged from the pre-#3643 family, so
+  existing dashboards keep working) sourced from the Go-side SPARSE offset map,
+  so the dense-array OOB that produced #3643's per-zone-per-scrape false
+  read-error alert cannot recur. Added `xpf_zone_counters_unpopulated_zones`:
+  the helper's status snapshot drops all-zero rows, so
+  `ErrCounterNotPopulated` cannot distinguish a pre-#3651 helper, a
+  slot-overflowed zone and an idle zone — publishing 0 would be an
+  authoritative zero over an unknown, so the samples are OMITTED and the gauge
+  carries the count. Unpopulated deliberately does NOT bump
+  `xpf_counter_read_errors_total` (that routing is the #3643 false alert); a
+  genuine read error still skip-and-bumps per #3345/#3408. Corrected four stale
+  texts whose stated REASON had become false: the `metrics_counters.go` removal
+  comment, the plan §0 Prometheus claim, `pkg/api/README.md`, and the
+  `ReadZoneCounters` doc comment that still said the helper does not populate.
+  Per-zone FLOOD half remains deferred — untouched.
+- **Validation**: `go test ./pkg/api/... ./pkg/dataplane/...` green. Fail-on-
+  revert proven by mutation, not by reading: gutting the collector reds 5 of 6
+  tests with assertion failures; publishing 0 instead of omitting reds the
+  omission test; routing `ErrCounterNotPopulated` into `counterReadErrors` reds
+  the false-alert test. Build+vet clean at each mutation, so every RED is an
+  assertion, not a build break.
+- **File(s)**: `pkg/api/metrics_descriptors_zone.go` (new),
+  `pkg/api/zone_counters_metrics_test.go` (new, replaces
+  `pkg/api/zone_counters_hide_test.go`), `pkg/api/metrics.go`,
+  `pkg/api/metrics_descriptors.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptor_coverage_test.go`,
+  `pkg/api/zones_policies_counter_error_test.go`, `pkg/api/README.md`,
+  `pkg/dataplane/maps_counters.go`, `docs/research/3643-dead-counters/plan.md`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
 ## 2026-08-05 — #4313: REVERT the snmp arm; keep and finish the stale-claim fix
 
 - **Timestamp**: 2026-08-05 (fix/4313-closed-world-arm, gate MERGE-NEEDS-MAJOR)
