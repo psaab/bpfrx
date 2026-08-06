@@ -80,6 +80,547 @@ Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
 - **Validation**: comment-only — production diff filtered to non-comment lines is
   empty. `go build ./...` rc=0; `go test ./pkg/dataplane/ -count=1` rc=0;
   `gofmt -l` clean.
+## 2026-08-05 — #6865 round 5: the sweep stopped at the package boundary
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Fold three documentation-contract findings from the re-gate.
+  Comment/doc only — zero non-comment production-Go changed lines.
+- **File(s)**: `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/compiler_validate_strict_cluster_auth.go`,
+  `docs/config-schema.md`, `pkg/cluster/status.go`, `pkg/cluster/sync_auth.go`,
+  `pkg/cluster/README.md`
+
+**F1 — four surfaces outside pkg/cluster still described the procedure #5078
+kills.** All four said the dual-accept grace lets an operator roll the key out
+one node at a time. #5078 removed dual-accept from SESSION SYNC: key node A
+only and A rejects B's handshake outright (B is unkeyed, sends no HELLO, hits
+the no-HELLO arm), so session sync is DOWN until both nodes are keyed AND both
+have restarted. The heartbeat and fabric gRPC channels do still dual-accept, so
+"without dropping the cluster" survives — "in all three mechanisms" does not.
+
+The sharpest instance: `docs/config-schema.md` made the claim NINE LINES above
+a pointer to `pkg/cluster/README.md`, whose "Rolling it onto a live unkeyed
+cluster" section this very branch had already marked **STALE** (#6881). The
+schema doc contradicted the document it cites.
+
+The earlier sweep was deliberate and thorough — it filed #6881, marked the
+README section stale, added a scope note. It stopped at the package boundary.
+That is the lesson worth keeping: a behaviour change's doc contract is not
+bounded by the package whose code changed.
+
+**F2 — `status.go` named a gate this PR deleted.** Its comment said the posture
+derives from "the SAME two facts syncAuthDecision / heartbeatAuthDecision gate
+on", including the sticky `HeartbeatPeerAuthSeen`. This PR removed
+`peerAuthSeen` from `syncAuthDecision` (now 4 params), so for the sync channel
+the string IS a separate estimate — exactly what the comment denied. The
+operator-facing hazard was already defused by a README scope note; what
+remained was a stale claim at the definition site, in the package the PR swept,
+about a signature the PR changed. Now scoped to the heartbeat, with the
+sync-channel exclusion stated.
+
+**F3 — #6906 cited as OPEN in two places.** True when written: head e7d89fa27
+is 23:33:05, #6906 closed 23:36:00 — three minutes later. Collapsed both to
+#6628, which covers any auth-key CHANGE and subsumes the narrower
+unkeyed→keyed case. `_Log.md`'s own historical entries still name #6906 and are
+left alone: they record what was true when written.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/cluster ./pkg/config -count=1`
+both ok; `gofmt -l` clean on all seven changed files (three unrelated
+`pkg/config` test files are unformatted on origin/master too — pre-existing,
+untouched); Go diff verified comment-only with a non-comment line filter.
+
+## 2026-08-05 — #5078 round 9: the hardening was applied to one of two symmetric arms
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: A ninth gate at `4d097df7d` again returned **no runtime defect**
+  — it re-verified the three #5078 removals (`syncAuthedEver`,
+  `HeartbeatPeerAuthSeen` consumers, the deleted `pendingFrame` path) and found
+  all three sound. It did find that the round-8 hardening landed on only ONE of
+  `performSyncHandshake`'s two unauthenticated-admission arms.
+  1. **F1 (fixed).** The no-HELLO arm was hardened to reject UNCONDITIONALLY,
+     with a comment explaining that "unreachable code that mutates cluster state
+     pre-admission is one edit away from being live again". Its sibling — the
+     `!peerKeyed` arm, reached when a peer sends a well-formed HELLO advertising
+     `keyed=0` — still read "Dual-accept.", still branched on
+     `syncAuthDecision`'s accept bit, and had **no handshake-level test at all**.
+     That is the worse of the two to leave soft: it is literally the
+     rolling-upgrade shape (a new build not yet keyed), so it is the arm an
+     operator restoring rolling-upgrade compatibility edits first. Proven unbound
+     by mutation BEFORE the fix: replacing the whole arm body with
+     `return syncAuthUnauthenticated, nil, nil` left the **entire `pkg/cluster`
+     suite GREEN**. A PSK-less peer admitted there reaches `syncMsgFence`, which
+     disables every routing group. The arm now has the sibling's shape —
+     hardcoded rejection, `syncAuthDecision` consulted only for the reason
+     string.
+  2. **The missing test.** `TestSyncAuthHandshakeKeyedNodeRejectsUnkeyedHelloPeer`
+     hand-builds a `HELLO{version:1, keyed:0, nonce}` — a fixture the real
+     handshake cannot produce on either end, since `performSyncHandshake` returns
+     early when unkeyed and otherwise always advertises `keyed=1` — and asserts
+     both the rejection and its operator-facing reason string. Neither existing
+     test reaches this arm: `TestSyncAuthDecisionMatrix` drives
+     `syncAuthDecision` directly and never runs a handshake, and
+     `...RejectsLegacyPeer` sends a real frame, so it exits at the
+     `typ != syncMsgAuthHello` arm and never evaluates `peerKeyed`.
+  3. **Over-reach guard.** `TestSyncAuthHandshakeKeyedHelloPeerStillAuthenticates`
+     drives the same hand-built HELLO writer down the same pipe with exactly one
+     byte changed (keyed 0 -> 1), completes the challenge-response, and asserts
+     the derived frame key equals `syncDeriveFrameKey(key, serverNonce,
+     peerNonce)`. It pins that the rejection is attributable to the keyed=0
+     ADVERTISEMENT rather than to a malformed fixture that never reached the
+     handshake, and that the fail-closed change did not over-reach into the keyed
+     path. It stays GREEN under the accepting mutation.
+  4. **Mutation matrix (all run firsthand).** (A) arm accepts → new rejection
+     test RED at `sync_auth_test.go:255`, "a keyed node must REJECT a peer
+     advertising keyed=0"; guard GREEN; `TestSyncAuthDecisionMatrix` GREEN,
+     confirming the new test is the SOLE catcher. (B) restore the grace inside
+     `syncAuthDecision` → both matrix rows RED plus both handshake reason
+     assertions RED (the relaxed decision returns an empty reason). (C) the
+     LITERAL revert of the hardening — restoring the old
+     `if !accept { reject }` shape — is **GREEN, by construction**: the
+     hardening is behavior-preserving, exactly like its sibling. What it buys is
+     that the accepting edit in (A) is no longer one deleted `if` away; what the
+     new test buys is that the edit is no longer silent. Recorded here rather
+     than dressed up as a red.
+  5. **F2 (comment only).** The `syncAuthDecision` doc asserted without
+     qualification that "a node must POSSESS the key to join a keyed cluster".
+     That is false for a connection established BEFORE keying: verification is
+     gated per-connection on `ac.authed()`, fixed at handshake time, so such a
+     connection stays unauthenticated for its whole lifetime and its frames keep
+     being accepted with no HMAC. The claim is now scoped to connections
+     established AFTER keying, and the residual is named. Note the residual has
+     TWO open issue numbers: **#6628** ("never re-handshakes on an auth-key
+     CHANGE", older, also covers a key ROTATION) and **#6906** (the narrower
+     unkeyed->keyed re-filing). `pkg/cluster/README.md` on this branch already
+     cited #6628 for exactly this; the brief named #6906. Rather than pick one
+     blind, both surfaces now cite BOTH and say which is broader — flagged to
+     the parent as a probable duplicate to close. The same unqualified claim was
+     standing in `pkg/cluster/README.md` line 233 and is qualified there too;
+     leaving it in the sibling surface is the defect pattern this PR already
+     corrected once (`5f85960b6`, "sweep the refuted premise, not just one
+     row"). Both are PRE-EXISTING (master behaves identically). The behaviour
+     fix belongs to that issue alone: it is a change on a security path and
+     needs its own gate.
+- **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_auth_test.go`,
+  `pkg/cluster/README.md`, `_Log.md`
+## 2026-08-05 — #4313: the closed-world comment said no subtree was armed; ten are
+
+- **Timestamp**: 2026-08-05 (fix/4313-closedworld-comment)
+- **Action**: Correct a false claim in the `closedWorld` doc comment. Comment-only.
+- **File(s)**: `pkg/config/schema.go`
+
+`schemaNode.closedWorld` carried "No production subtree sets this yet — the
+per-subtree flips are follow-ups". `git grep -n 'closedWorld: true' pkg/config/`
+returns TEN production subtrees: NAT `then`, `nat64`, `natv6v4`, IKE `proposal`,
+IKE `dead-peer-detection`, IPsec `proposal`, IPsec `dead-peer-detection`,
+`vpn-monitor`, `traffic-selector` (all `schema_security.go`) and
+`master-password` (`schema_system.go`). Six dedicated
+`schema_closedworld_*_4313_test.go` files pin them.
+
+The comment is what a maintainer reads before touching the walker. Believing the
+mechanism inert, they could change `walkSchemaNode`'s keyword-resolution gate
+without realising ten security subtrees already depend on it rejecting.
+
+Fixed by stating that production subtrees DO set it and giving the grep, rather
+than by enumerating them: an enumerated list in a comment drifts the same way
+the count did, and the next reader trusts the list. This matches the reasoning
+already recorded a few lines away in `walkSchemaNode`, which deliberately
+declines to state how many subtrees are armed.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
+`gofmt -l` clean; diff verified comment-only.
+
+## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Third gate at `290035ded` returned **no runtime finding**. It
+  verified all three counts independently from the code (3 increment branches,
+  6 HELP causes, 3 sentinel meanings), confirmed the ordering claim directly
+  (both pre-read increments `continue` before the first `ReadZoneCounters`), ran
+  four discrimination mutations each producing exactly its own assertion, and
+  proved the delta comment-only with an **AST-based comment stripper** — a
+  stronger check than the line-filter grep used here, since it cannot be fooled
+  by `//` inside a string and, because the phrase list is a composite literal,
+  its identity also proves no assertion moved. It also verified phrase
+  uniqueness empirically across all 298 described descriptors.
+  Two findings, both documentation, both this PR's own thesis defect standing in
+  surfaces the delta did not reach. Fixed inline.
+  1. **`pkg/api/README.md` was frozen at FOUR causes** and still carried the
+     literal "triages toward three causes" sentence that round 6 deleted from the
+     Go comment. Byte-identical to `e08a3c74f`. It is the doc
+     `docs/userspace-dataplane-gaps.md` explicitly redirects operators to, and it
+     was maintained by four of this PR's eight commits — it stopped being updated
+     exactly when the list grew past four. An operator following the redirect
+     would check four causes, find none applies, and never reach (f), which this
+     PR's own comment calls the cause an operator is LEAST likely to guess.
+     Rewritten to state NO count, defer to the HELP as the authority, name (e)
+     and (f) explicitly, and record that the paragraph itself rotted.
+  2. **The "Counted, not pattern-matched" partition counted eight of NINE
+     pre-gate collectors.** The missing one, `collectFlowExportMetrics`, touches
+     `c.srv` and does NOT guard — so it belongs to neither claimed set and
+     falsifies the two-way split. A comment that advertises having counted is
+     the last place an enumeration should be short. Now a three-way partition,
+     with the third member named and its safety explained.
+     The gate also refuted the paragraph's premise: `Collect()` dereferences
+     `c.srv` unconditionally before either position, so the below-gate position
+     never "implicitly ruled out" a nil server. The guard is real but it buys the
+     direct-call test path, not nil-safety. Said so.
+  3. NIT: "(a)-(d) read as inapplicable while the gauge sits at 1" is true only
+     of (f). (e)'s branch fires for EVERY configured zone, so it reads N. The
+     magnitude difference is itself a triage hint and is now stated.
+  4. NIT: a 22-column orphan line left by the round-6 re-wrap.
+- **File(s)**: pkg/api/README.md, pkg/api/metrics_counters.go,
+  pkg/api/metrics_descriptors_zone.go, pkg/api/zone_counters_metrics_test.go,
+  _Log.md
+- **Validation**: comment-only in BOTH production and test — each diff filtered
+  to non-comment lines is empty. `go build ./...` rc=0; `go vet ./pkg/api/` rc=0;
+  `go test ./pkg/api/ ./pkg/dataplane/ -count=1` rc=0; `gofmt -l` clean.
+## 2026-08-05 — #6843 round 6: the enumeration grew, the header did not
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: The round-5 gate returned MERGE-NEEDS-MINOR with **zero runtime
+  findings** — the HELP is correctly bound (the test exact-matches
+  `fqName == "xpf_zone_counters_unpopulated_zones"` before inspecting
+  `Desc.String()`, which is what stops a substring from resolving against a
+  sibling metric), two independent discrimination mutations each failed only
+  their own assertion, all six causes are complete with no seventh and none
+  unreachable, and the full suite is rc=0. Five comment/doc items remained.
+  Fixed inline rather than by another agent round, per the materiality rule.
+  1. `metrics_descriptors_zone.go` still said "FOUR distinct reasons"
+     immediately before enumerating six, and "triages toward three causes"
+     below it. **The list grew and its header did not** — the exact rot this
+     PR exists to remove, committed by the fix for it. Now SIX, plus the
+     distinction the gate drew: six CAUSES reached through THREE increment
+     branches. Those are different quantities and the text now says so.
+  2. `maps_counters.go` said the family "is not sourced by the userspace
+     dataplane" — false for traffic since #3651 — and, worse, the round-5
+     clause split introduced a NEW false statement: that the sentinel can mean
+     "no loaded dataplane / no apply result yet". It cannot. On both of those
+     the collector increments BEFORE it ever calls `ReadZoneCounters`, so no
+     read occurs and no sentinel is produced. The sentinel has exactly three
+     meanings; the GAUGE has six causes; the doc now separates them and warns
+     against reading the HELP list as a list of sentinel meanings.
+  3. `loader.go` — the round-5 insertion severed a sentence: `go doc -all -u
+     ./pkg/dataplane Manager` rendered "The #6843: the two maps ...", a
+     dangling article. Third distinct variant of the insertion-vs-doc-block
+     class on this PR (steal, cut-in-half, now dangle). Re-anchored as its own
+     paragraph; verified by re-running `go doc` and grepping for the fragment.
+  4. Flood absolutes ("no writer exists", "reads report this unconditionally",
+     the map "stays empty") are true of production and false of the API —
+     `SetFloodCounterOffset` is exported and a test populates it. Scoped to
+     production in both files rather than deleted; the conclusion holds.
+  5. The new test comment called six causes "SIX membership branches". Six
+     causes, three branches. Corrected, and the reason the phrases must be
+     unique to this gauge is now stated where the phrase list is.
+- **File(s)**: pkg/api/metrics_descriptors_zone.go,
+  pkg/api/zone_counters_metrics_test.go, pkg/dataplane/maps_counters.go,
+  pkg/dataplane/loader.go, _Log.md
+- **Validation**: comment-only — the production diff filtered to non-comment
+  lines is empty. `go build ./...` rc=0; `go test ./pkg/api/ ./pkg/dataplane/
+  -count=1` rc=0 (both `ok`); `gofmt -l` clean on all four files; `go doc`
+  confirms the severed sentence is gone.
+## 2026-08-05 — #6843 gate round 5: the fold re-committed both classes it closed
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Five items, and the structural finding is that round 4 re-committed
+  in two places the two classes it was dispatched to close. **Item 1 (the M3
+  defect one round later):** the M1 HELP fix shipped with NO assertion — reverting
+  it to the three-cause wording left `./pkg/api` green. I had applied exactly that
+  standard to two operator strings the round before and not to this one. Bound by
+  a per-cause assertion on the gauge's OWN `Desc().String()` (not a scrape-wide
+  substring — `Desc.String()` embeds HELP, so a loose match can be satisfied by a
+  sibling metric's help; that is the trap that made the first `zoneSamples` draft
+  misread counters as the gauge). **Item 2 (material):** the cause list still
+  under-enumerated by TWO REACHABLE paths — `loaded && cr == nil` (shim loaded by
+  LoadUserspaceShim, `lastApply` set only by recordApplyResult, so the window
+  before first apply and PERMANENTLY after a failed first apply) and
+  `cr != nil && !ok` (the collector reads `store.ActiveConfig()` but commitAndApply
+  promotes the store BEFORE the apply, so a commit adding a zone whose apply fails
+  leaves store=N+1, cr.ZoneIDs=N). Six causes now, in the HELP, the (a)-(f) block,
+  and types.go. **Items 3+4 (the premise sweep one round later):** my stated method
+  was "search the premise, not the symbol" — right method, stopped short of the
+  CANONICAL DEFINITION. `ErrCounterNotPopulated`'s own godoc, and the
+  `zoneCounterOffsets` field comment on the very map this PR rewrites, both still
+  said the POPULATE path is deferred. Both cover traffic AND flood in one
+  sentence, so the fix is a clause split — flood genuinely IS still deferred and
+  its half must stay. **Item 5:** the corrected citation replaced one pattern-match
+  with a smaller one; measured it — 3 of 6 collectHostInbound* touch c.srv, named
+  those three.
+- **Validation**: `go vet ./...` REAL exit 0; `go test ./... -count=1` REAL exit 0;
+  `go test ./pkg/refactoraudit/` exit 0. Item 1 mutation-proven: reverting the HELP
+  reds all three missing causes with build+vet clean, restore green.
+- **File(s)**: `pkg/api/metrics_descriptors_zone.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/types.go`, `pkg/api/zone_counters_metrics_test.go`,
+  `pkg/dataplane/maps_counters.go`, `pkg/dataplane/loader.go`, `_Log.md`
+
+## 2026-08-05 — #6843 gate round 4: the hoist changed the gauge's MEANING
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Five items. **M1 (semantic):** hoisting the collector above the
+  dataplane gate added a FOURTH membership cause the HELP did not name — "no
+  loaded dataplane". Before the hoist the three ErrCounterNotPopulated causes
+  were exhaustive; after it the gauge reads the full configured zone count when
+  the dataplane fails to arm, and with no `xpf_dataplane_loaded` series to
+  disambiguate an operator paging on `> 0` would triage toward three causes none
+  of which applies. Named in the HELP string, the (a)-(d) block, and
+  pkg/api/README.md. **Changing WHEN a metric is emitted changed WHAT it means**
+  — availability and semantics are not separable for a gauge whose HELP
+  enumerates its causes. **M2:** the D-sweep was still incomplete — four sites
+  carried the refuted premise, two of them in files this PR edits, and two the
+  structured mirrors of the text surfaces R2 fixed. A SYMBOL grep finds none of
+  them; searching the restated PREMISE finds all four — the same lexical-vs-
+  behavioural gap that made F5 incomplete, recurring. Plus a fifth doc-block
+  defect: my #6843 note was inserted INSIDE the opening godoc sentence, severing
+  it, so `go doc` rendered a fragment as the synopsis. **M3:** R2's wording fix
+  was entirely unbound — reverting both operator strings left both packages
+  green, because the only assertion matched the invariant prefix. Both hide
+  tests now assert the cause clause AND the absence of the retracted claim.
+  Plus five NITs including a citation I got wrong by pattern-matching
+  (collectLo0Counters needs no nil guard; it reads neither field).
+- **Validation**: full Go suite REAL exit 0; full cargo `--test-threads=1` REAL
+  exit 0. M3 mutation-proven (the revert Codex demonstrated now REDs).
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_zone.go`, `pkg/api/types.go`,
+  `pkg/api/security.go`, `pkg/api/README.md`, `pkg/grpcapi/server_show_zones.go`,
+  `pkg/grpcapi/zone_flood_counters_hide_test.go`,
+  `pkg/cli/zone_flood_counters_hide_test.go`, `pkg/dataplane/maps_counters.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`, `_Log.md`
+
+## 2026-08-05 — #6843 gate round 3: hoist the gauge, correct a correction, finish the sweep
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Seven items. **R1 (only operational one):** the unpopulated gauge
+  is documented as ALWAYS emitted so `> 0` is alertable and its absence cannot be
+  mistaken for a scrape that failed — but `collectZoneCounters` sat BELOW the
+  `dp == nil || !dp.IsLoaded()` gate, so on a degraded/config-only boot no sample
+  was emitted and the alert silently stopped evaluating exactly when per-zone
+  volume was most unavailable: the literal failure the comment said cannot
+  happen. Hoisted above the gate (it is config-derived and degrades correctly),
+  added the not-loaded branch, and added a nil-store guard the below-gate
+  position had implicitly provided — a real nil-pointer panic the full suite
+  caught after the hoist. No existing fixture could see any of this:
+  `descriptorCoverageDP.IsLoaded()` is hardcoded true, so a `notLoadedDP` was
+  needed. **T1:** my own F3 correction shipped an unmeasured claim. **D4:**
+  inserting my test directly below a doc block silently reassigned that block to
+  it, leaving the #5171 test undocumented — moved my test below. **R2:** two
+  operator-facing surfaces still printed "per-zone accounting not implemented"
+  while this PR's own code says the helper populates them; with 64+ zones one
+  `show security zones` printed real bytes for slotted zones and "not
+  implemented" for overflowed ones, naming the wrong cause. **D1/D2/D3/D5, T2:**
+  finished the sweep, including a refuted premise and three Rust mirrors of a
+  sentence I had already fixed twice on the Go side.
+- **Validation**: full Go suite REAL exit 0; full cargo `--test-threads=1` REAL
+  exit 0; `pkg/refactoraudit` ok.
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_zone.go`, `pkg/api/zone_counters_metrics_test.go`,
+  `pkg/cli/cli_show_security_zones.go`, `pkg/grpcapi/server_show_zones_text.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/handlers/mod.rs`, `_Log.md`
+
+## 2026-08-05 — #6843 Codex fold: bind the two PRODUCTION call sites
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Codex MERGE-NEEDS-MINOR. The fix was sound; the tests bound the
+  extracted primitive and NOT its wiring, so three plausible reverts shipped
+  green: the coordinator reverting to inline configured-only publication, and
+  the Go status loop reverting to per-row setters (which the Prometheus test
+  also missed, because it injects replacement maps directly). Added one test per
+  side driving the REAL entry point — `Coordinator::zone_traffic_counters` and
+  `syncBPFCountersLocked` over two successive polls. Also strengthened five
+  assertions that a broken implementation satisfied: `EmptyClearsAll` (an
+  always-clears impl passed — now paired with a repopulate leg), the Rust
+  sibling test (`|_| true` let the configured predicate be deleted — now a real
+  configured set excluding a slotted zone), the Rust unconfigured test (all
+  zones slotted, so the slot predicate could be deleted — now includes an
+  unslotted zone with retained totals), Go remove/re-add (input now mutated
+  after the call), and Go input-copy (a second snapshot, without which
+  merge-only passed).
+
+  **CORRECTION (gate round 2, F3/F4) — two claims in the entry above and in my
+  report were wrong, and the correction matters more than the entry:**
+
+  - *"strengthened five assertions that a broken implementation satisfied"*
+    overstates it. The gate built the full mutation matrix at BOTH SHAs and every
+    one of the five mutations was ALREADY caught by a pre-existing sibling test.
+    No suite-level hole existed. What the strengthenings actually did is make
+    each test independently binding — exercising both predicates itself rather
+    than relying on a sibling to catch the other. That is worth doing, but it is
+    a different and smaller claim.
+  - My mutation table row *"S1 always-clear -> EmptyClearsAll RED (passed before
+    the repopulate leg)"* is FACTUALLY WRONG. The gate ran the counterfactual: at
+    `f7b9e820d`, EmptyClearsAll was ALREADY RED under always-clear, failing at
+    its own setup precondition. S2 (merge-only vs CopiesInput) was accurate as
+    reported.
+
+    **CORRECTION TO THE CORRECTION (gate round 3, T1).** The sentence above
+    originally continued "...it made the test fail for the RIGHT reason instead
+    of at setup". That was ALSO unmeasured, and also false: measured at BOTH
+    trees, the always-clear mutation fails at the identical line for the
+    identical reason (`:73 setup read failed`) — `t.Fatalf` Goexits before the
+    repopulate leg runs, so the fold changed nothing about that mutation. The
+    leg is still load-bearing, but for a NARROWER property the gate identified:
+    a STICKY clear (clear correctly, never repopulate) reds it. Comment
+    rewritten to name that instead.
+
+    The generalizable lesson, and the reason this is recorded twice: **a
+    correction is itself a claim and needs the same measurement discipline as
+    the thing it corrects.** I fixed an inferred table row by measuring at both
+    trees, and in the same breath wrote an inferred sentence about what the fix
+    accomplished.
+
+  I ran those mutations only against the post-fold tree and inferred the "passed
+  before" half instead of running the counterfactual at the parent. A mutation
+  table is a claim about a DIFFERENCE between two trees, so it has to be measured
+  at both — asserting the before-state from memory is exactly the shortcut the
+  table exists to eliminate. Corrected two comments that became FALSE with this change
+  — both claimed a cleared zone "reports 0" when it now reads as
+  ErrCounterNotPopulated, a real behavioural difference a reader would reason
+  wrongly from — plus a "slice"/"map" wording nit.
+- **Test-authoring note**: the strengthened Rust test initially failed because
+  the pending accumulator is a shared THREAD-LOCAL — recording against two slot
+  maps before flushing once folds the first map's deltas through the second
+  map. Flush after each record, with the map the traffic was recorded against.
+- **Validation**: full Go suite REAL exit 0 (unsandboxed, first run). Full cargo
+  suite: run 1 hit `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`
+  (HA session mutex, unrelated subsystem); it PASSES isolated and run 2 was
+  exit 0 — non-deterministic, and this diff touches no HA session code.
+- **File(s)**: `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `pkg/dataplane/userspace/zone_counter_syncloop_6843_test.go` (new),
+  `pkg/dataplane/userspace/zonecounters.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `pkg/dataplane/maps_counters.go`, `_Log.md`
+
+## 2026-08-05 — #6843 fold: overflow retention published a FROZEN counter
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Gate found a MAJOR that refutes a verification I made and reported
+  as firm. I checked that `ZoneCounterSlotMap::build` `break`s before
+  `store.zone_totals(zid)`, concluded an overflowed zone is never registered and
+  so reads as unpopulated, and stated it as a general fact. It holds only for a
+  zone that was ALWAYS overflowed. The store OUTLIVES the slot map: config apply
+  carries it forward and `reconcile` retains every still-configured zone, so a
+  zone that accumulated traffic and is then pushed past slot capacity by a later
+  config keeps its nonzero totals, gets slot 0, and — because the status
+  accessor filtered only by "still configured" — kept publishing. Go mirrored it
+  and Prometheus emitted a FROZEN total forever while every subsequent packet
+  went uncounted. Exactly the failure class this PR exists to prevent, and worse
+  than an omission because a frozen counter looks alive. Second retention hazard
+  in the same family: the Go loop only SET rows and never removed absent ones,
+  so a helper downgrade or a zone remove/re-add stranded a stale offset. Fixed
+  both — the helper now publishes a row only when the zone is configured AND
+  holds a live slot (`publishable_zone_rows`, extracted as a pure function so
+  the transition is unit-testable), and the Go mirror REPLACES the offset map
+  from each snapshot (`ReplaceZoneCounterOffsets`) instead of merging.
+- **Lesson recorded in the code comments**: verifying one `build` is not
+  verifying a claim about a structure carried forward across applies. "Never
+  inserted" is a statement about a single apply; the dangerous case is a zone
+  that WAS counted and then stopped.
+- **Validation**: full Go suite and full cargo suite both green, each scored
+  from a REAL exit code (GO_EXIT=0, RUST_EXIT=0). Three new Rust tests cross the
+  transition (populated-then-overflowed; slotted sibling keeps publishing;
+  unconfigured dropped despite a live slot), four new Go retention tests
+  (absent-zone drop, empty-clears, remove-then-readd, input-copy), and one
+  end-to-end Prometheus test asserting the sample disappears and the unpopulated
+  gauge increments across the transition. Mutation-proven.
+- **File(s)**: `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `pkg/dataplane/maps_counters.go`,
+  `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go` (new),
+  `pkg/api/zone_counters_metrics_test.go`, `pkg/api/README.md`, `_Log.md`
+
+## 2026-08-05 — #3651: restore the per-zone Prometheus surface
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface)
+- **Action**: #3651 shipped the per-zone traffic POPULATE path end to end (Rust
+  forward-path accounting -> `ProcessStatus.zone_traffic_counters` ->
+  `SetZoneCounterOffset`), but the Prometheus collector #3643 had deleted was
+  never brought back with it. `show security zones` and REST reported live
+  per-zone volume while Prometheus reported nothing — the one surface an
+  operator alerts on was the missing one. Restored `xpf_zone_packets_total` /
+  `xpf_zone_bytes_total` (labels unchanged from the pre-#3643 family, so
+  existing dashboards keep working) sourced from the Go-side SPARSE offset map,
+  so the dense-array OOB that produced #3643's per-zone-per-scrape false
+  read-error alert cannot recur. Added `xpf_zone_counters_unpopulated_zones`:
+  the helper's status snapshot drops all-zero rows, so
+  `ErrCounterNotPopulated` cannot distinguish a pre-#3651 helper, a
+  slot-overflowed zone and an idle zone — publishing 0 would be an
+  authoritative zero over an unknown, so the samples are OMITTED and the gauge
+  carries the count. Unpopulated deliberately does NOT bump
+  `xpf_counter_read_errors_total` (that routing is the #3643 false alert); a
+  genuine read error still skip-and-bumps per #3345/#3408. Corrected four stale
+  texts whose stated REASON had become false: the `metrics_counters.go` removal
+  comment, the plan §0 Prometheus claim, `pkg/api/README.md`, and the
+  `ReadZoneCounters` doc comment that still said the helper does not populate.
+  Per-zone FLOOD half remains deferred — untouched.
+- **Validation**: `go test ./pkg/api/... ./pkg/dataplane/...` green. Fail-on-
+  revert proven by mutation, not by reading: gutting the collector reds 5 of 6
+  tests with assertion failures; publishing 0 instead of omitting reds the
+  omission test; routing `ErrCounterNotPopulated` into `counterReadErrors` reds
+  the false-alert test. Build+vet clean at each mutation, so every RED is an
+  assertion, not a build break.
+- **File(s)**: `pkg/api/metrics_descriptors_zone.go` (new),
+  `pkg/api/zone_counters_metrics_test.go` (new, replaces
+  `pkg/api/zone_counters_hide_test.go`), `pkg/api/metrics.go`,
+  `pkg/api/metrics_descriptors.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptor_coverage_test.go`,
+  `pkg/api/zones_policies_counter_error_test.go`, `pkg/api/README.md`,
+  `pkg/dataplane/maps_counters.go`, `docs/research/3643-dead-counters/plan.md`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+## 2026-08-05 — #4313: REVERT the snmp arm; keep and finish the stale-claim fix
+
+- **Timestamp**: 2026-08-05 (fix/4313-closed-world-arm, gate MERGE-NEEDS-MAJOR)
+- **Action**: The gate found the arm hard-rejects valid Junos. **Reverted the
+  flip and the three leaf additions.** Kept the stale-claim work, which is
+  independent and was the finding that mis-scoped this lane in the first place.
+- **Why revert rather than model my way out** — my leaf-completeness audit was
+  wrong in two independent ways and the target has a second, unarmed surface:
+    - **F1 (verified firsthand)**: `routing-instance` is a CONTAINER in Junos
+      nesting a `clients {}` block; I modeled it as a bare scalar. Closed-world
+      inherits into container descent, so
+      `snmp community public routing-instance InBand clients 10.0.0.0/8` — valid
+      config — is REJECTED. An SNMP-scoped-to-a-VRF node could not commit ANY
+      change until the operator deleted working configuration. That is exactly
+      the #4191 false-reject class the leaf-completeness audit exists to prevent,
+      and my audit produced it.
+    - **F2**: `logical-system` is a sixth Junos child I did not model, and my
+      test enshrined the false-reject as correct — a future lane would have had
+      to delete a test case defending the defect.
+    - **F3 (verified firsthand)**: TWO ingestion surfaces. The same typo is
+      rejected under `snmp {}` and returns `<nil>` under `system { snmp {} }`
+      (`compiler_system.go:512` `FindChild("snmp")`), and
+      `test/incus/xpf-test.conf` uses the uncovered spelling. Even a correct arm
+      would have been half a fix while the docs claimed full coverage.
+    - **F4**: the leaves I added are inert with NO advisory (only `view` has
+      one), so merely modeling them makes the CLI advertise a source-IP
+      restriction that is accepted, unapplied, and unwarned. Composed with F1,
+      the error message walks the operator into removing their remaining
+      restriction — the fix path leads to the fail-open.
+- **The lesson, mine**: my mutation proof was green and proved the WRONG THING.
+  Disarming red the rejection test; dropping a modeled leaf red the negative
+  control. Both show the guard BINDS. Neither asks whether what it binds is
+  CORRECT — whether the modeled set actually equals the Junos grammar. A
+  negative control built from my own model of the grammar can only confirm my
+  model, not test it. For a closed-world flip the binding proof is necessary and
+  the grammar audit is the load-bearing half, and I treated the first as
+  evidence for the second.
+- **Kept and finished**: the stale-claim fix, which the gate found was 1-of-3.
+  `schema_walk.go` carried the same false "no production subtree / everywhere in
+  production today" claim at three sites — the keyword gate, the top-level walk
+  doc (:107) and the walkSchemaNode param doc (:298). All three now state the
+  mechanism with no count. The docs contradiction resolved itself once the flip
+  was reverted, and the skip note is upgraded from a name-list into the four
+  measured entry criteria above so the next attempt starts from evidence.
+- **File(s)**: `pkg/config/schema_walk.go`, `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
@@ -616,6 +1157,479 @@ Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 round 8: stop restating the premise; point at it
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Round-7 gate: "gate passed. No runtime findings." Every runtime
+  premise substantiated again. But it found a FIFTH absolute and three more
+  restatement sites, and it refuted my own round-7 completeness claim — the
+  `_Log.md` line saying the premise sweep returned nothing "does not
+  substantiate completeness", because I grepped the six phrasings I had just
+  fixed rather than the premise. That is the exact error the round-7 commit
+  message describes, committed one layer down while describing it.
+  So round 8 changes METHOD, not just text. Three rounds of per-sentence
+  patching kept regrowing absolutes because every passage restated the premise
+  independently. Now there is ONE authoritative statement
+  (`pkg/cluster/README.md` "Recovery") and every other site says "assumes an
+  armed gate, see there" and explicitly declines to re-derive it. A passage that
+  points cannot drift out of sync with what it points at.
+  Sites:
+  1. `README.md` "the fallback exists" — fifth absolute; row 3 had just
+     established eligibility and event delivery as real preconditions. Now
+     CONDITIONAL, with a line telling the reader not to read an existence claim
+     off that sentence, because that is the absolute this section keeps
+     regrowing.
+  2. `README.md` rollout — "the delete cannot be done", "the second delete
+     requires a promotion", "ONE safe order". All three assume an armed gate;
+     on the row-2 unarmed node the second delete needs no promotion. The
+     subsection now states the assumption once at its head and says it will not
+     restate it; "ONE safe order" became "one safe order you can RELY on".
+  3. `pkg/daemon/daemon_ha.go` — "(only RG0 primary may write config)" stated the
+     gate's INTENT as fact, in the doc comment of the very function that is the
+     only thing that arms it. Now says so, and points at the README.
+  4. `cluster_transport_key_5078_test.go` — "A seated RG0 secondary is config
+     read-only ... the secondary cannot be keyed locally". Scoped to ARMED, with
+     an explicit note that "armed" is load-bearing, is not restated elsewhere in
+     the file, and must not be re-derived there.
+  5. "Both are being closed" (three sites) — unsupported. #6889 and #6890 are
+     OPEN, unassigned, no milestone, no PR. Two sites now say "OPEN and
+     unscheduled"; the third (cluster_transport_key_5078_test.go) says "Those
+     are open bugs, not routes" — same live status, different wording, and the
+     round-8 entry originally claimed the identical phrase went everywhere.
+     Corrected here: a doc must not assert a fix date nobody has committed to,
+     and a log entry must not overstate the edit it describes.
+  Method note, CORRECTED by the round-8 gate. This entry originally claimed the
+  sweep was "re-runnable" because searching the claim and "excluding the
+  qualified forms" returned exactly one hit. That claim was wrong twice over and
+  the correction is the useful part:
+    - "excluding the qualified forms" has NO EXECUTABLE RULE. It is a judgement
+      applied by eye after the grep, so the result is not reproducible and the
+      word "re-runnable" was doing no work. The raw regex actually returns seven
+      qualified hits, one acknowledged, and four unrelated false positives
+      (`daemon_dns.go`, `dhcprelay/relay.go`, two in `lease_sync_test.go`).
+    - Being line-oriented, it MISSED three substantive unqualified assertions,
+      all in `pkg/configstore` SOURCE rather than docs:
+      `envelope.go` ("NOT the RG0 primary (a read-only secondary)" / "stays
+      read-only until it is promoted"), `store.go` ("secondary nodes reject
+      config mutations"), and `store_lock.go` (equating read-only mode with "a
+      non-RG0-primary / secondary node").
+  Those three are out of this PR's packages and were NOT in #6896, which listed
+  only the configstore README and two `docs/` files. #6896 has been expanded to
+  name them. The transferable lesson: a sweep is only re-runnable if its
+  EXCLUSION is executable too — a grep plus human judgement is a measurement
+  whose second run can differ from its first.
+- **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_auth.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/cluster_transport_key_5078_test.go,
+  _Log.md
+- **Validation**: comment-only — production diff filtered to non-comment lines is
+  empty. `go build ./...` rc=0; `go test ./pkg/cluster ./pkg/daemon
+  ./pkg/configstore -count=1` rc=0 (all three `ok`); `gofmt -l` clean.
+## 2026-08-05 — #6865 round 7: I fixed the row I was looking at, not the premise
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The round-6 gate substantiated every runtime premise the round-6
+  edit asserted — all six checked at the cited file:line, zero runtime findings —
+  and then found that the edit itself was incomplete in exactly the way this
+  campaign keeps re-learning: **a symbol grep is not a premise sweep.** Round 6
+  corrected recovery row 2 and left nine other places restating the same refuted
+  claim in different words, including the row-3 TITLE seven lines below the
+  corrected row.
+  Fixed in this PR's own packages:
+  1. `README.md` row-3 title said "the only path that can work" immediately
+     after row 2 was changed to say an unarmed secondary has a writable store
+     and is OPEN. That was the fourth absolute in a section whose log already
+     records three refuted ones. Now "the only path you can PLAN for", with a
+     parenthetical saying why the distinction is not pedantic. The trailing
+     "It is the path that exists" went the same way.
+  2. The whole `### Rollout:` section (heading + mechanism bullets + conclusion)
+     asserted that a seated secondary cannot be keyed locally, cannot open
+     config mode, and that config-sync is its only writer — all true only where
+     the gate is ARMED. Restated with the precondition, plus an explicit
+     paragraph that arming comes from an RG0 transition event alone, so a
+     cold-started standby is writable and REST has no RG0 check (#6890, #6889).
+     Framed as a bug not to build on, not as a route.
+  3. That section also cited `Daemon.applyHAState`, which **does not exist** —
+     `grep -rn 'func.*applyHAState' pkg/` returns nothing. The real symbol is
+     `applyRG0OwnershipTransition`. Corrected at all three sites that named it.
+  4. "would create a permanent deadlock" -> "would deadlock with no
+     self-recovery", with the reason: the hypothetical destroys the cluster's
+     ability to converge on its own; an operator can still break it out of band.
+  5. "only the RG0 primary is writable" -> "treat only the RG0 primary as
+     writable (that is the intent; see the #6890 caveat)".
+  6. The stale pointer to the deleted heading "Recovery: exactly one path works".
+  7. `pkg/cluster/sync_auth.go` and
+     `pkg/daemon/cluster_transport_key_5078_test.go` carried structural mirrors
+     of the same sentence, both naming the nonexistent `applyHAState`. Both
+     rewritten; both changes are comment-only, verified by filtering the diff to
+     non-comment lines (empty).
+  Deliberately NOT fixed here: `pkg/configstore/README.md`,
+  `docs/feature-coverage.md` and `docs/phases.md` carry the same premise in
+  other packages' docs. Widening a round-7 PR into three unrelated doc trees is
+  how a fold introduces a regression; filed separately instead.
+- **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_auth.go,
+  pkg/daemon/cluster_transport_key_5078_test.go, _Log.md
+- **Validation**: `go build ./...` rc=0; `go test ./pkg/cluster ./pkg/daemon
+  ./pkg/configstore -count=1` rc=0 (all three `ok`); `gofmt -l` clean on both
+  touched Go files; premise sweep `grep -rn` over `pkg/` for six distinct
+  phrasings returns nothing.
+## 2026-08-05 — #6865 round 6: row 2 was still categorical, and the doc already knew why
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Round 5 made recovery path 3 conditional but left path 2 —
+  "Console on the seated secondary — CLOSED … `ErrClusterReadOnly` however the
+  operator reached the box" — as a bare absolute. It has a counterexample, and
+  the same section was already citing it: #6890 was listed as a *precondition
+  of path 3*, which it is not.
+  Verified firsthand on `origin/master` rather than taken from the gate report,
+  three greps, all three premises confirmed:
+  `git grep -n 'SetClusterReadOnly' -- 'pkg/**/*.go'` returns exactly two
+  production call sites, both in `pkg/daemon/daemon_ha.go` (`:442` false, `:474`
+  true), and both live inside `applyRG0OwnershipTransition`, whose only
+  production caller is the RG0 event consumer at `daemon_ha.go:419`. A new
+  redundancy group is constructed with `State: StateSecondary` directly in
+  `pkg/cluster/group_state.go` with no `sendEvent` — every `sendEvent` call site
+  is inside an election/failover transition. `Store.clusterReadOnly` is a plain
+  bool defaulting to false. So a node that cold-starts, seats as RG0 secondary
+  and never transitions leaves the gate unarmed. And
+  `git grep -n 'EnterConfigureSession' -- 'pkg/**/*.go'` shows the REST caller
+  at `pkg/api/config.go:110` has no cluster check, where the gRPC caller at
+  `pkg/grpcapi/server_config.go:76` guards with `IsLocalPrimary(0)`.
+  Changes, all documentation, no production Go touched:
+  1. Row 2 restated as "CLOSED only where the gate is actually ARMED", with the
+     arming mechanism, the cold-start case, and the REST/CLI/gRPC asymmetry
+     spelled out, and #6890/#6889 cited on the row they actually refute.
+  2. The #6890 bullet removed from path 3's precondition list — an unarmed gate
+     does not block promotion, it means the gate being cleared was never closed
+     — with a parenthetical saying so, and "depends on all three" corrected to
+     "both" to match the two bullets that remain.
+  3. The section opener no longer says "exactly one path works". That was the
+     third absolute in a row where the log already records two refuted ones;
+     it is now "no path is unconditional", and the closing sentence is scoped to
+     the recovery you can plan for rather than asserting recoverability.
+- **File(s)**: pkg/cluster/README.md, _Log.md
+- **Validation**: documentation only — `git diff --quiet HEAD -- '*.go'` rc=0.
+  `go build ./...` and `go test ./pkg/cluster ./pkg/daemon ./pkg/configstore
+  -count=1` re-run to confirm the tree is unchanged behaviourally.
+## 2026-08-05 — #6865 round 5: stop summarizing recovery; the claim's SHAPE was wrong
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The round-4 gate returned MERGE-NEEDS-MAJOR on the recovery
+  enumeration — the fourth wrong version of one claim. Rather than write a
+  fifth, the claim is removed from the test comment entirely.
+  **G1 — the enumeration read as categorical and every row has preconditions.**
+  "Controlled RG0 promotion — OPEN" is conditional: `election.go` returns early
+  on `m.kernelUpgradeHold` and promotes only when `rg.Weight > 0`, so with zero
+  weight or an active hold no promotion happens. And even a manager-level
+  promotion may not clear the store gate — `Manager.sendEvent` is NON-BLOCKING
+  and drops on a full channel, while the dropped-event fallback never reconciles
+  `Store.ClusterReadOnly`. Filed as **#6889**.
+  **G2 — "console on the seated secondary — CLOSED" has a counterexample.** The
+  store starts WRITABLE, a new RG starts already secondary, and
+  `SetClusterReadOnly(true)` fires only on a TRANSITION — so a non-preempt
+  cold-start standby never gets it. REST calls `EnterConfigureSession` with no
+  RG0 check of its own. Filed as **#6890**.
+  **The fix is structural, not another rewrite.** Four attempts — "console
+  access only", a README path the commit gate closes, "no recovery at all", and
+  an enumeration — were each refuted, and each read as MORE authoritative than
+  the last. A claim about what an operator can do to recover a distributed
+  system has too many preconditions to survive as prose in a unit-test comment.
+  The comment now says so and points at pkg/cluster/README.md, which carries the
+  conditional account with the two issues inline.
+  What step 20 needs is the narrow, stable part: the cluster cannot recover on
+  its own, so a key commit that restarts comms turns a routine config change
+  into an operator-visible incident. That argument never depended on the
+  recovery details.
+  **G3/G4 — "permanent deadlock" wording** (3 sites) softened to match, and the
+  round-3 `_Log.md` entry corrected in place: it still said "none of them now
+  mutates `d`" after round 4 established they DO mutate `d` (stopClusterComms
+  increments the counter each subtest measures) and only do not REWRITE
+  `d.activeClusterTransport`.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go, pkg/cluster/README.md, _Log.md
+- **Validation**: `go vet ./pkg/daemon/` rc=0; `go test` rc=0 for pkg/daemon and
+  pkg/cluster. `git diff --quiet HEAD -- '*.go' ':(exclude)**/*_test.go'` rc=0 —
+  production untouched in rounds 2, 3, 4 and 5. The round-4 gate found NO
+  runtime or guard-coverage findings; every finding since has been about what
+  the artifacts CLAIM.
+
+## 2026-08-05 — #6865 round 4: three revisions of one claim, wrong in three directions
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The round-3 re-gate returned NO runtime or guard-coverage findings
+  — the keyed assertion still fires, the deleted seating assignment was not
+  load-bearing, both orderings behave identically, and both disclosed escapes
+  reproduce exactly. Three comment findings remain, all mine.
+  **G1 — "Recovery: there is none today" is false; controlled failover works.**
+  Verified firsthand rather than taken on report:
+  `applyRG0OwnershipTransition(StatePrimary)` calls
+  `d.store.SetClusterReadOnly(false)` and logs "became primary for RG0, enabling
+  config writes". So stopping xpfd on the keyed primary lets the secondary
+  promote and accept a local commit of the same key. The README already
+  documents this stop-one-node shape for `configuration-synchronize`.
+  This is the THIRD version of this sentence and the third one wrong: round 2
+  said "recoverable only by console access", the round-2 fix deferred to a
+  README path that is closed, round 3 said no recovery exists. Every one
+  replaced a hedge with an absolute. Rewritten as an ENUMERATION of the three
+  candidate paths with each marked CLOSED or OPEN, so the next reader checks a
+  list instead of trusting a verdict. The argument for step 20 survives and is
+  stronger for being true: the escape exists but is a deliberate single-node
+  outage, so a key commit that restarts comms silently becomes a failover.
+  **G2 — "none of them mutates `d`" is too broad.** The subtests DO mutate `d`:
+  applyTailReconciles reaches stopClusterComms, which increments
+  `d.clusterCommsGen` — the very thing each subtest measures. The accurate claim
+  is that none REWRITES `d.activeClusterTransport`. Corrected here and in the
+  round-3 log entry.
+  **G3 — the README rollout section describes removed dual-accept**, and my new
+  recovery section now contradicts it directly ~500 lines up. Marked STALE
+  inline with a pointer to the correct enumeration; the rewrite plus three
+  matching `sync_auth.go` comments are filed as #6881.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go, pkg/cluster/README.md, _Log.md
+- **Validation**: `go vet ./pkg/daemon/` rc=0; `go test` rc=0 for pkg/daemon,
+  pkg/cluster, pkg/configstore, pkg/refactoraudit.
+  `git diff --quiet HEAD -- '*.go' ':(exclude)**/*_test.go'` rc=0 — production
+  untouched in rounds 2, 3 and 4.
+  Gate cells at round 3, all reproduced by the reviewer: load-bearing mutation
+  vet rc=0 then rc=1 failing exactly `keyed_endpoint_change_must_still_restart`;
+  original test blob from `826cd48db` under the same mutation rc=0; transport-key
+  mutation RED identically in source order AND keyed-first order; both disclosed
+  escapes GREEN as documented.
+
+## 2026-08-05 — #6865 gate round 3: my own round-2 fold shipped a false comment and a no-op
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The Codex leg found four defects in the round-2 fold, three of
+  them introduced BY that fold. Folding them here.
+  **F1 — a no-op with a comment claiming otherwise.** The new keyed subtest
+  opened by seating a "keyed active transport":
+  `d.activeClusterTransport = clusterTransportFromConfig(keyedBase)`, commented
+  "The active transport must also be keyed". `clusterTransportKey` carries six
+  ENDPOINT fields and NOT the auth key — which is the invariant this entire file
+  exists to pin — so that assignment is byte-identical to the unkeyed one. The
+  block did nothing and the comment asserted something the function cannot do.
+  Worse, it wrote SHARED daemon state from inside a subtest: under a mutation
+  that DOES add ControlLinkAuthKey to clusterTransportKey, running the keyed
+  subtest first masked `key_commit_must_not_restart` (Codex measured both
+  orders). Deleted; the three subtests are order-independent only because none
+  of them REWRITES `d.activeClusterTransport` (they DO mutate `d` — stopClusterComms
+  increments the counter each subtest measures; corrected in round 4).
+  **F2 — two measured escapes, disclosed not closed.** A keyed check derived
+  from `d.store.ActiveConfig()` rather than the candidate `cfg` leaves the whole
+  package green (the fixture's store holds no committed cluster stanza, while a
+  real commit promotes config BEFORE apply). And all three subtests observe
+  `clusterCommsGen`, which stopClusterComms bumps FIRST, so deleting
+  `d.startClusterComms(...)` is invisible — they prove teardown, not restart.
+  Closing either needs a different fixture, not another assertion, so both are
+  stated in the scope comment and filed as #6878.
+  **F3 — the round-2 recovery hedge was wrong in the safe-looking direction.**
+  It deferred to a pkg/cluster/README.md path marked UNVERIFIED. That path is
+  not unverified, it is CLOSED: the same README says clearing the key leaves an
+  unkeyed `chassis cluster`, "exactly what the commit gate rejects, so that path
+  does not exist" (#6630), and `validateClusterAuthKeyStrict` enforces it.
+  Console access is not a fallback either — the read-only gate is on the CONFIG
+  STORE, so EnterConfigureSession returns ErrClusterReadOnly however the box was
+  reached. Corrected in the test comment AND in the README passage itself, which
+  contradicted its own later section.
+  **F4 — a repro that cannot be run.** The round-2 log recorded the negative
+  control as restored with `git show <pr-head>:...`, a placeholder rather than a
+  revision. Replaced with the literal `826cd48db`.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go, pkg/cluster/README.md, _Log.md
+- **Validation**: `go vet ./pkg/daemon/` rc=0; `go test` rc=0 for pkg/daemon,
+  pkg/cluster, pkg/configstore, pkg/refactoraudit. Production untouched in this
+  round and the previous one — `git diff --quiet 826cd48db..HEAD -- '*.go'
+  ':(exclude)**/*_test.go'` was rc=0 at the gate.
+- **Note**: the AGY leg returned MERGE-READY and missed all four. It checked the
+  README passage the comment cited and stopped there, so it never saw the
+  contradiction 540 lines further down. Codex's leg is the one that held.
+
+## 2026-08-05 — #6865 gate fold: close the keyed positive-control gap, hedge the recovery claim
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Two review findings, both in the test file; no production change.
+  **MINOR-1 (guard scope).** The `endpoint_change_must_restart` positive
+  control builds `moved` from `transport()`, which sets no
+  `ControlLinkAuthKey`. It therefore could not distinguish "restarts on an
+  endpoint change" from "restarts on an endpoint change ONLY WHILE UNKEYED" —
+  and the latter is the most plausible over-correction of this very issue,
+  since "don't restart comms when a key is involved" is the obvious wrong way
+  to satisfy `key_commit_must_not_restart`. Added a third subtest,
+  `keyed_endpoint_change_must_still_restart`, which seats a KEYED active
+  transport and then moves the peer address, so the key is held constant and
+  the endpoint move is the only variable.
+  **MINOR-2 (claim wording).** The comment stated flatly that the deadlock is
+  "recoverable only by console access to the secondary", while
+  `pkg/cluster/README.md` documents a reasoned recovery path that runs entirely
+  from the primary and explicitly marks it UNVERIFIED. A shipping code comment
+  must not out-claim the doc that carries the hedge; both sites now point at
+  the README and say the escape route is not established.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go
+- **Validation**: Parent mutation proof of MINOR-1, with the negative control
+  taken from git rather than from a snapshot — a snapshot captured after the
+  edit restores the edit, which silently turns the control into a second copy
+  of the treatment cell:
+  - mutation (suppress step 20 whenever a key is configured):
+    `keyedMut := cfg != nil && cfg.Chassis.Cluster != nil &&
+    cfg.Chassis.Cluster.ControlLinkAuthKey != ""`, then
+    `if !keyedMut && d.activeClusterTransport != ...`
+  - `go vet ./pkg/daemon/` -> rc=0 under the mutation, so a red is an
+    assertion and not a build break
+  - CELL A, mutation + new subtest -> rc=1, failing subtest exactly
+    `keyed_endpoint_change_must_still_restart`
+  - CELL B, mutation + the ORIGINAL test file restored from
+    `git show 826cd48db:pkg/daemon/cluster_transport_key_5078_test.go` ->
+    rc=0, `ok github.com/psaab/xpf/pkg/daemon`.
+    The gap was real: the whole package was green under a mutation that
+    silently stops every KEYED cluster from restarting comms on a real
+    endpoint move.
+  Unmutated: `go vet` rc=0; `go test` rc=0 for pkg/daemon, pkg/cluster,
+  pkg/configstore and pkg/refactoraudit.
+
+## 2026-08-05 — #5078 PR1 r3: my rollout correction was ALSO wrong; guard the transport key
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Second correction on the same point, and this one was caught by
+  another lane with runnable proof rather than by me.
+  r2 removed the migration window on the reasoning that "the operator commits
+  `authentication-key` locally on each node", so the rollout gap is an outage
+  rather than a deadlock. **A seated RG0 secondary cannot be configured locally
+  at all.** Verified: `Daemon.applyHAState` calls `store.SetClusterReadOnly(true)`
+  on StateSecondary/StateSecondaryHold (`pkg/daemon/daemon_ha.go:474`), and
+  `EnterConfigureSession` returns `ErrClusterReadOnly` before doing anything
+  else (`pkg/configstore/store_lock.go:26`). Not "the local commit is
+  overwritten" — config mode cannot be opened. `TestClusterReadOnly_
+  SyncApplyBypassesGate` pins the other half: HA-sync ingress bypasses the gate,
+  so config-sync is the secondary's ONLY writer.
+  So `pkg/cluster/README.md` and the `syncAuthDecision` comment documented a
+  procedure an operator physically cannot perform. Both rewritten with the
+  procedures that ARE performable — key at provisioning before the cluster
+  forms, or commit on the PRIMARY while sync is connected — and the recovery
+  path (remove key on primary → peer reconnects unkeyed → push → re-add) is
+  marked **UNVERIFIED**, because it is reasoned from the read-only gate and has
+  not been executed on a cluster. Two confident procedures have already been
+  wrong here; a third unlabelled one would be worse than none.
+  **New MAJOR, created by removing the window.** The live-cluster path works
+  ONLY because `clusterTransportKey` (`daemon_ha_sync.go:1421`) carries six
+  endpoint fields and NO auth key, so committing the key does not restart
+  cluster comms and the established connection survives to carry it across.
+  `grep clusterTransportKey --include=*_test.go` returned NOTHING. A future edit
+  adding `ControlLinkAuthKey` there looks obviously correct and would convert
+  every key rollout into a permanent deadlock with a green suite — and before
+  this PR the window was the fallback, so this PR is what makes it load-bearing.
+  Added `TestAuthKeyChangeDoesNotRestartClusterComms_5078`.
+- **Validation**: mutation — add `ControlLinkAuthKey` to `clusterTransportKey`
+  and populate it in `clusterTransportFromConfig`; build+vet rc=0 first, then
+  the test FAILs on the unkeyed-vs-keyed comparison. Restored from snapshot,
+  `sha256sum -c` verified. The test carries a POSITIVE CONTROL (an endpoint
+  change must still change the key) so the equality assertion cannot pass
+  vacuously. `go test ./pkg/cluster/ ./pkg/daemon/` exit 0.
+- **File(s)**: `pkg/daemon/cluster_transport_key_5078_test.go` (new),
+  `pkg/cluster/README.md`, `pkg/cluster/sync_auth.go`, `_Log.md`
+
+## 2026-08-05 — #5078 PR1 r2: remove the migration window; the pre-admission path becomes unreachable and is deleted
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Gate returned three MAJORs, ALL of them against the
+  `authentication-migration-window` knob: (1) the window bounded a connection's
+  ADMISSION but not its LIFETIME, so a stream admitted while it was open stayed
+  pass-through after expiry and could still fence the node; (2) an admitted
+  peer could re-arm the window through config-sync (CONFIG(0) then CONFIG(N)) —
+  the relaxation letting in an attacker who then extends the relaxation; (3) the
+  in-memory arming point meant a crash loop granted a FRESH interval on every
+  restart, because the positive knob persists while the arming timestamp does
+  not. (3) inverts the trade I described and the lead endorsed.
+  **Root cause: my justification for the knob was wrong.** I told the lead a
+  rolling key rollout would DEADLOCK without it — config-sync delivers the key
+  over this channel, so keying the primary first strands it from the unkeyed
+  secondary. Re-checked: `authentication-key` is an ordinary config leaf, so the
+  operator commits it LOCALLY on each node; both-unkeyed still dual-accepts
+  unchanged, so sync works until the first node is keyed and is authenticated
+  once the second is. The gap is a brief operator-controlled sync outage, not a
+  deadlock. The knob was a convenience, and it needed three guards of its own.
+  **Removed entirely** — config leaf, typed field, compiler arm, manager state,
+  provider method, alarm. `golden_4406.json` is byte-identical to master again.
+  Removing it then made `pendingFrame` UNREACHABLE: its sole producer sits
+  behind `syncAuthDecision(true,false,false,false)`, which now always rejects.
+  So the pre-admission fix upgraded from a REORDER to a DELETION — the type,
+  the third return value of `performSyncHandshake`, and the call site are gone.
+  Unreachable code that mutates cluster state before admission is one edit from
+  being live again. The legacy arm now rejects UNCONDITIONALLY and consults
+  `syncAuthDecision` only for the reason string, so re-introducing a grace in
+  the decision cannot silently re-open the path; that is stated in the comment.
+  Net diff vs master is now 5 files, all in `pkg/cluster` plus two docs.
+- **Validation**: M1 (restore the grace) → `legacy_peer_rejected_when_keyed` and
+  `unkeyed_peer_rejected_when_keyed` FAIL, build+vet rc=0 first, restored and
+  `sha256sum -c` verified. **M2 no longer exists as a runtime mutation** and I
+  am not claiming one: the pre-admission path is gone from the TYPE SYSTEM, so
+  reordering it is a build break, not an assertion RED. Recorded honestly
+  rather than dressed up — the earlier r1 M2 passed after the fixture changed,
+  which is how the unreachability was discovered in the first place (the test
+  had gone vacuous: an unkeyed local node never produces a pending frame).
+  Full `go test ./...` on the branch surfaced an intermittent `pkg/ddns`
+  failure; established it is NOT this change (`git diff origin/master --
+  pkg/ddns pkg/config` is EMPTY, so that test binary is byte-identical, and
+  ddns does not import pkg/cluster), measured 0/8 on branch and 0/8+1 on
+  master when run alone, and FILED it as #6867 rather than re-running to green.
+- **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/sync_auth_test.go`, `pkg/cluster/README.md`, `_Log.md`
+  (config schema/types/compiler/golden reverted to master; deleted
+  `pkg/cluster/sync_preadmission_5078_test.go`)
+
+## 2026-08-05 — #5078 PR1: fail-closed session-sync auth + no pre-admission frame execution
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth)
+- **Action**: First increment of the converged #5078 plan — Blocker 2 only
+  (§3.10). Re-verified the whole plan against master `ad9591177` first (plan
+  verified at `5e34920d1`, 2185 commits back): `pkg/cluster/sync_auth.go` is
+  BYTE-IDENTICAL, so the reflection construction is untouched; Blocker 1
+  (`pushConfigToPeer`, `daemon_ha_sync.go:355` → `ShowActive()` at `:366`,
+  unredacted) and Blocker 2 both reproduce. Only the `sync_conn.go` line
+  references rotted (that file was refactored -1506/+692 into five files); the
+  plan's `:494-496` is now `:122`. #5303 pre-closed most of §3.11. Rust does
+  NOT speak this wire (`session_sync.rs` encodes deltas carried INSIDE the Go
+  frame; nothing in `userspace-dp/` references `syncMagic`), so this leg is
+  Go-only.
+  Blocker 2 is exploitable with NO PSK and NO reflection, which is why it goes
+  first and alone. A keyed node dual-accepted an unkeyed peer whenever
+  `peerAuthSeen` had not armed — a window open on every fresh boot — and that
+  peer's first frame ran BEFORE `installConn`, so `syncMsgFence` reached
+  `OnFenceReceived` and disabled every RG; the connection then displaced the
+  legitimate peer and later guard-arming did not evict it.
+  Three changes: (1) `syncAuthDecision` no longer consults `peerAuthSeen` for
+  the unkeyed-peer branch — a keyed node REJECTS an unauthenticated peer;
+  (2) the pending first frame executes AFTER `installConn`, never before (it is
+  still processed, so no message is lost); (3) `set chassis cluster
+  authentication-migration-window <minutes>` is the explicit, default-off,
+  time-bounded, alarmed escape hatch. The knob is REQUIRED, not optional
+  polish: config-sync delivers the key over this same channel, so keying the
+  primary first would deadlock it out of ever reaching the unkeyed secondary.
+  The window relaxes only "peer is unkeyed" — a failed proof is still rejected.
+  Arming is in-memory, so a restart restarts the window; documented as a
+  deliberate choice over persisting a security-relaxation deadline.
+- **Validation**: three mutations, each with `go build ./...` + `go vet` rc=0
+  first so every RED is an ASSERTION; both files snapshotted and restored, each
+  verified with `sha256sum -c`.
+  (1) restore the first-contact grace → `TestSyncAuthHandshakeKeyedNodeRejects
+  LegacyPeer`, `TestSyncAuthHandshakeDowngradeGuardRejects`, and two
+  `TestSyncAuthDecisionMatrix` rows FAIL;
+  (2) move the pending-frame call back above `installConn` →
+  `TestPendingFrameExecutesOnlyAfterInstall_5078` FAILs on the observation that
+  the fence callback saw no installed connection;
+  (3) neutralize the migration window → the escape-hatch handshake test and two
+  matrix rows FAIL.
+  The pre-existing `TestSyncAuthHandshakeDualAcceptLegacyPeer` asserted the
+  OPPOSITE of the fix (it required a keyed node to dual-accept) and was
+  REPLACED, not deleted quietly — the replacement documents what it used to
+  claim and why that was wrong. The `golden_4406` baseline was regenerated;
+  verified the delta is exactly one added key (`"AuthMigrationWindow": 0`) and
+  no behaviour drift before accepting it.
+  `go build ./... && go vet ./...` clean; full `go test ./...` exit 0 (real
+  exit code, not piped) — 59 packages ok. `gofmt -l` clean on every touched
+  file. NOT yet smoke-tested: session-sync changes need loss-cluster
+  `make test-failover`, which the lead schedules.
+- **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/manager.go`, `pkg/cluster/group_state.go`,
+  `pkg/cluster/sync_auth_test.go`, `pkg/cluster/sync_preadmission_5078_test.go`,
+  `pkg/cluster/README.md`, `pkg/config/schema_chassis.go`,
+  `pkg/config/types_chassis.go`, `pkg/config/compiler_system.go`,
+  `pkg/config/testdata/golden_4406.json`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
@@ -66885,6 +67899,172 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 09:41
+- **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
+  process-global `AtomicU64` statics as their before/after baseline, so cargo's
+  in-process parallelism made each test's assertion depend on what every other
+  test happened to do. Measured at pristine `origin/master` ad9591177 with a
+  bounded harness: `FAIL FAIL HUNG FAIL FAIL`, with a #6819 participant failing
+  in 5 of 5 runs. Moved `SESSION_INSTALL_STALE_IGNORED`,
+  `SESSION_DELETE_STALE_IGNORED` (#2170) and `SYNCED_IMPORT_CAP_DROPS` (#5674)
+  out of `bpf_map/metrics.rs` and onto `SessionManager` as per-Coordinator
+  fields (`install_stale_ignored`, `delete_stale_ignored`, `import_cap_drops`),
+  beside the existing per-instance `export_seq`. Every bump site
+  (`ha/session_import.rs`) and every read site (`coordinator/status.rs`)
+  already held a `&self` Coordinator, and production constructs exactly one
+  Coordinator (`server/lifecycle.rs`), so the exported values are unchanged —
+  this is a test-isolation fix with no production behaviour change.
+  [CORRECTED 2026-08-05 16:10, gate fold: this entry originally said "the
+  gRPC/Prometheus values are unchanged", which was wrong twice. This crate has
+  NO gRPC dependency and none of the three counters is in `proto/`; and only
+  `import_cap_drops` reaches Prometheus (`server/helpers/status.rs` ->
+  `protocol::control` -> the Go status struct ->
+  `xpf_userspace_synced_import_cap_drops_total`). The two stale counters have
+  no wire or metric surface at all — their accessors are reachable only from
+  `ha_tests.rs`.]
+  `ha_tests.rs` is untouched: no assertion weakened, no `--test-threads=1`, no
+  `#[serial]`. The issue's own suggested fix — "make the assertions
+  DELTA-based" — was already in place and is not sufficient: the tests capture
+  `let before = ...` and assert `before + 1`, but a concurrent test's increment
+  lands INSIDE that capture window. Only a per-instance home removes the
+  dependency. After: 10 runs, a #6819 participant failed in 0 of 10. The suite
+  itself is 5 PASS / 2 FAIL / 3 HUNG — every residual failure is #6657
+  (CoS-lease seqlock `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, and an
+  unbounded blocking recv wedging at 7 threads in
+  `__skb_wait_for_more_packets`), a separate defect that this PR does not
+  touch. Red-on-revert: 7 of 7 tests go RED on an assertion when the guard each
+  one covers is reverted.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/metrics.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 14:52
+- **Action**: #6819 gate fold (§7 test-acceptance findings). Three findings,
+  each verified against the code before acting. (F1) Both #5674 admission
+  tests set `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+  branch of `synced_import_cap` BEFORE the production expression is evaluated —
+  a test-only seam shadowing the production path, so deleting its trailing
+  `.saturating_mul(2)` left both tests green. Made `synced_import_cap`
+  `pub(super)` (ha_tests is `crate::afxdp::ha::tests`, a SIBLING of
+  `session_import`, so a private fn was unreachable) and added
+  `synced_import_cap_production_formula_is_twice_the_logical_ceiling`, which
+  runs with the override at its default 0 and pins entry-cap == 2x logical
+  ceiling, plus `assert_ne!` against the bare ceiling (what dropping the 2x
+  yields) and a `DEFAULT_MAX_SESSIONS > 0` precondition so `0 == 2*0` cannot
+  make the claim vacuous. (F2) The two non-poison rejection tests accepted a
+  guard that refuses the WHOLE category while counting once, so each now
+  carries its own positive control (newer install applies and does not count;
+  applied equal-generation delete does not count). The two poison rejection
+  tests get scope comments naming the control test that supplies their
+  selectivity. (F3, priority) The poison negative control exercised only
+  NEWER/EQUAL operations with both stale expectations at the per-instance zero
+  baseline, so it accepted DELETING the generation guard outright — a negative
+  control that accepts removal of the thing it controls for. It now also probes
+  the stale direction after recovery (stale install and stale delete each
+  refused and counted exactly once), and the recoveries assertion tightened
+  from `> before` to `>= before + 4` (the poisoning count); kept a LOWER bound,
+  with the reason in the comment, because `SHARED_SESSION_POISON_RECOVERIES`
+  is the one counter still process-global (bumped inside `lock_shared_recover`,
+  which takes only the mutex and has no per-Coordinator home) so a concurrent
+  test can only push it up — `>=` cannot false-FAIL where `==` could.
+  Validation: four-cell mutation matrix, each mutation run against BOTH test
+  generations so a mutation the old tests already caught could not be credited
+  to the new one. Drop-the-2x PASSES both old cap tests and FAILS the new one;
+  delete-the-generation-guard PASSES the old negative control and FAILS the new
+  one. Full `cargo test --release` rc=0 (4234 passed, 0 failed), `go test
+  ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, _Log.md
+- **Timestamp**: 2026-08-05 16:24
+- **Action**: #6819 gate fold round 2 (R3 + doc accuracy). (R3) The gated suite
+  could not detect a regression of the fix. Every assertion on the three
+  counters is a DELTA capture (`before + 1` / `== before`), and `make test-rust`
+  pins `-- --test-threads=1` (Makefile:114-116, adopted to dodge the #6657
+  `__skb_wait_for_more_packets` socket wedge) — under serial execution a
+  process-global satisfies every one of those identically, so reverting any
+  counter to a static shipped GREEN. Added
+  `refusal_counters_are_per_coordinator_not_process_global`: drives one refusal
+  of each kind on a BUSY Coordinator and asserts an IDLE one, live in the same
+  process, saw none of them. It does not depend on interleaving, so it reds at
+  any thread count. Proof under the gate flag: reverting
+  `install_stale_ignored` to its original `metrics.rs` static REDS the new test
+  while the other 29 `ha::` tests run and pass — the pre-existing suite
+  genuinely cannot see the revert. WHICH assertion reds depends on the run
+  mode, and the original claim of `ha_tests.rs:738` was only true of the
+  ISOLATED run: libtest orders alphabetically under `--test-threads=1`, so
+  `current_generation_…`/`delete_synced_session_gen_…`/`over_ceiling_import_…`
+  all bump the restored global BEFORE `refusal_counters_…` runs, and the
+  PRECONDITION at the top of the test trips first. Fixed in the 2026-08-05
+  18:05 entry by giving the preconditions the same diagnostic as the payload
+  assertions, so the message is reachable in the mode the gate actually uses. (DOC) Corrected the
+  export-surface claim at three sites: this crate has NO gRPC dependency and
+  none of the three counters is in `proto/`; only `import_cap_drops` reaches
+  Prometheus (`server/helpers/status.rs:102` -> `protocol/control.rs:334` ->
+  `protocol_status.go:279` -> `metrics_userspace.go:672`), and the two stale
+  counters have no wire or metric surface — their accessors are reachable only
+  from `ha_tests.rs`. The earlier 2026-08-05 09:41 entry carries an inline
+  correction. (README) Recorded that the concurrency mechanism is MEASURED
+  (revert reds 24/60 parallel vs 0/12 serial for the cap counter; 43/60 vs 0/5
+  for the stale pair) AND that the sanctioned gate structurally cannot observe
+  it. (NOTE) Documented that per-instance scoping makes every `..._before`
+  capture 0, degenerating three `== before` assertions to `0 == 0` — recorded
+  where those assertions live, with why the family is still bound.
+  Gates: `cargo test --release --bins --tests -- --test-threads=1` rc=0
+  (4235 passed, 0 failed, 2 ignored), `go test ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 17:38
+- **Action**: #6819 README — cited the independent cross-PR measurement of the
+  counter flake. While gating #6843, a lane measured parallel `cargo test --
+  afxdp::ha` over 40 iterations: 34/40 FAILED at that PR's HEAD and 34/40 at an
+  `origin/master` CONTROL with the PR's files reverted and its tests confirmed
+  absent. The identical rate with and without the change under review is what
+  identifies the flake as pre-existing and specific to these counters rather
+  than caused by any one PR, and it root-caused the failures to
+  `SESSION_INSTALL_STALE_IGNORED`/`SESSION_DELETE_STALE_IGNORED` being
+  process-global under `assert_eq!(total, before)` — as a family, not one test.
+  That is unmutated evidence from a lane with no stake in #6862, stronger than
+  the mutation numbers already cited. Also recorded the coupling explicitly:
+  the `--test-threads=1` that hides this defect exists to dodge a DIFFERENT one
+  (#6657).
+  NOTE ON THE GATE RUN: `cargo test --release --bins --tests --
+  --test-threads=1` returned rc=101 on this README-only change, failing
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`.
+  That is NOT this change — the diff since the previous green gate is one .md
+  file and no test reads it. Characterized it instead of re-running for green:
+  the test fails 2 of 10 runs ALONE in the process under `--test-threads=1`, so
+  its race is INTERNAL to the test (it spawns its own threads, which
+  `--test-threads=1` does not serialize). That distinguishes it from #6819
+  (cross-test, masked by serial execution) and from the #6657 wg-engine hang.
+  Reported to the #6657 owner.
+- **File(s)**: userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 18:05
+- **Action**: #6819 gate fold round 3 (two MINORs). (M1) The `#6819`
+  diagnostics in `refusal_counters_are_per_coordinator_not_process_global` were
+  UNREACHABLE in the mode the gate actually runs. libtest executes
+  alphabetically under `--test-threads=1`, so `current_generation_…` (c),
+  `delete_synced_session_gen_…` (d) and `over_ceiling_import_…` (o) all bump a
+  restored global BEFORE `refusal_counters_…` (r) runs — the bare
+  `assert_eq!(x, 0)` PRECONDITIONS tripped first and reported `left: 1,
+  right: 0` with no explanation, while the carefully-worded payload assertions
+  forty lines below fired only when the test was run in ISOLATION. Gave the
+  three preconditions the same named diagnostic, so a future engineer who
+  reintroduces the regression reads why in either run mode. Generalisable: a
+  diagnostic is only as good as the run mode that REACHES it — when a test has
+  a precondition and a payload assertion, check which fires under the
+  SANCTIONED invocation, not the filtered one used while developing. (M2)
+  Corrected the `ha_tests.rs:738` line cite: under the conditions stated
+  alongside it (the other 29 `ha::` tests running) the revert reds at the
+  precondition, not 738; 738 is the isolated-run line. Corrected in the
+  2026-08-05 16:24 entry and in the PR body.
+  NOT FOLDED: #6891 — a live cross-test counter flake of exactly the shape this
+  PR's README rule warns about (`GRE_DECAP_CHECKSUM_INVALID_DROPS`, equality
+  assert, 18/60 RED at this branch's HEAD and 16/40 at the merge base — equal
+  rate, so pre-existing). Filed separately; it raises #6891's priority, not
+  this PR's scope.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs, _Log.md
 
 - **Timestamp**: 2026-08-05 15:10
 - **Action**: #6851 fold — two MAJORs on the #4626 policy-id-zero guard, both
@@ -67062,3 +68242,70 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/compiler_nat.go,
   pkg/dataplane/compiler_iface.go, _Log.md
+
+## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
+
+- **Timestamp**: 2026-08-05
+- **Action**: Two findings from reviewing the #5078 branch, plus the doc
+  half. (1) F-B: `TestSyncAuthHandshakeDowngradeGuardRejects` documented a
+  RED-on-revert that could not fire — flipping its only precondition
+  (`newAuthSync(t, key, true)` -> `false`) left it PASSING, because after
+  #5078 `syncAuthDecision` rejects every unkeyed peer on a keyed node
+  regardless of `peerAuthSeen`. It was a duplicate of
+  `TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer` wearing a
+  downgrade-guard name; deleted with a comment recording why. (2) F-A: the
+  sync-side downgrade guard it was named for was itself dead —
+  `syncPeerAuthSeen` had ZERO callers and `syncAuthedEver` was write-only
+  in effect (stored in `wrapSyncConn`, read only by the orphan). Go does
+  not flag unused methods, so it compiled green. Deleted, along with
+  `SyncAuthProvider.HeartbeatPeerAuthSeen()` (its only consumer through
+  the interface), the fake's implementation, and the now-meaningless
+  `authSeen` parameter of `newAuthSync`. (3) Docs: the `sync_auth.go`
+  package doc and the `pkg/cluster/README.md` PR-C section still described
+  keyed-node dual-accept, the deleted `pendingFrame` path, the removed
+  sync downgrade guard, and a two-method provider wiring.
+- **Scope verified, not assumed**: `Manager.HeartbeatPeerAuthSeen` is NOT
+  removed — still exported, still consumed by the gRPC fabric listener
+  (`pkg/grpcapi/fabric_auth.go`) and the control-link status string
+  (`status.go`). The #4107 HEARTBEAT downgrade guard is separate state
+  (`heartbeatAuthDecision` over `heartbeatAuthState.peerAuthenticated`),
+  so deleting the sync pair cannot disarm it;
+  `TestHeartbeatAuthDecision/key/legacy-after-peer-authed` and
+  `TestControlLinkAuthStatus` still pass.
+- **Not landed, deliberately**: my own `clusterCommsNeedRestart` guard +
+  `cluster_authkey_no_comms_restart_5078_test.go`. The branch already
+  carries `TestAuthKeyChangeDoesNotRestartClusterComms_5078`, which binds
+  the same property and additionally covers key ROTATION. A second test
+  for one property is noise.
+- **Validation**: `go build ./...` 0; `go vet ./pkg/cluster/ ./pkg/grpcapi/
+  ./pkg/daemon/` 0; `go test -count=1 ./pkg/cluster/ ./pkg/grpcapi/` 0;
+  full `go test ./pkg/... ./cmd/...` exit 0 (59 packages, zero failures).
+- **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
+  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-05 — #6865 gate fold: bind the call site, retarget two RED labels
+
+- **Timestamp**: 2026-08-05
+- **Action**: F1 — added `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078`.
+  The step-20 decision in `daemon_apply_tail.go` is INLINE, so the existing
+  struct test could not see it: adding `|| keyChanged` there, with
+  `clusterTransportKey`/`clusterTransportFromConfig` byte-identical, produced
+  the permanent deadlock with a green suite. New test observes
+  `clusterCommsGen` across a real `applyTailReconciles`. F2 — retargeted the
+  RED-on-revert on `...KeyedNodeRejectsLegacyPeer`: it claimed "restore the
+  grace in syncAuthDecision", which does NOT fail it (the arm discards the
+  accept bit); it actually binds the arm returning nil. F3 — matrix comment
+  still described the deleted migration window as current and named the
+  removed `peerAuthSeen` param. F4 — de-duplicated a doubled paragraph in
+  `sync_auth.go`. F6 — assert the `reason` substring, since nil key is the
+  failure default of every error path. README — procedure 2 can itself
+  produce the keyed-primary/unkeyed-secondary deadlock if the connection
+  drops mid-rollout.
+- **Validation**: `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0.
+  M2 (call-site `|| keyChanged`, struct untouched): struct test PASSES, new
+  call-site test FAILS, positive control passes. M4 (legacy arm returns nil):
+  `...KeyedNodeRejectsLegacyPeer` FAILS at the err==nil assertion.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
+  pkg/cluster/README.md, _Log.md
