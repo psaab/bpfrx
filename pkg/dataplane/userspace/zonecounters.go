@@ -18,11 +18,18 @@ import (
 //     Rust helper's cumulative ZoneCounterStore is reset.
 //
 // Step 2 is the load-bearing half. The helper reports cumulative totals on
-// every 1/s status poll, and syncBPFCountersLocked writes them into the offset
-// map ABSOLUTELY (SetZoneCounterOffset overwrites). Without resetting the
-// helper store, the next poll would restore the cumulative total and the
-// cleared value would snap back within <=1s. After the IPC clear the helper
-// reports 0, so the offset stays 0.
+// every 1/s status poll, and syncBPFCountersLocked REPLACES the offset map from
+// that snapshot (ReplaceZoneCounterOffsets, #6843). Without resetting the helper
+// store, the next poll would restore the cumulative total and the cleared value
+// would snap back within <=1s.
+//
+// After the IPC clear the zone reads as NOT POPULATED, not as zero. The helper's
+// snapshot is sparse and omits all-zero rows (ZoneCounterStore::snapshot), so a
+// just-cleared zone produces no row at all, and the Go replacement drops its
+// offset — ReadZoneCounters then returns ErrCounterNotPopulated and the surfaces
+// render "not available". That is a real behavioural difference from "reports
+// 0": traffic after the clear repopulates the row and the counters resume from
+// zero, but until then there is nothing to report rather than a zero to report.
 func (m *Manager) ClearZoneCounters() error {
 	var errs []error
 	if m.bpfShim != nil {

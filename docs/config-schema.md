@@ -918,6 +918,36 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**A multi-value leaf can be PRESENT and still carry NOTHING — presence must be
+decided by VALUES, never by the leaf NAME (#6526).** `firewallMatchValues`
+skips blank tokens, and its doc comment states the contract: *an empty result
+means "criterion absent"*. A gate that instead decides presence from the leaf
+name (`present[child.Name()] = true`) is asserting something about VALUES using
+a check on NAMES, and the two disagree for exactly one input — the leaf written
+with **no operand**:
+
+```
+match { source-address; }                                # hierarchical
+set security policies from-zone t to-zone u policy p match source-address
+```
+
+Both shapes yield `Keys=["source-address"]` with no children, so
+`firewallMatchValues` returns nothing and the dimension compiles to the
+**byte-identical empty slice the OMITTED form produces** — which the userspace
+matcher reads as match-ANY. Under `then permit` that is a fail-open: an
+operator who hits enter one token early commits a permit-any policy. Because
+`multi: true` leaves are UNTYPED (no `validator`) and `schema_walk.go`
+deliberately declines minimum arity (see "Trailing-token arity on scalar value
+leaves", #3332 — the arity gate is scoped strictly to EXCESS tokens and only
+runs for `scalar: true` leaves), `SchemaValidate` cannot catch this: in
+`pkg/config` a leaf that opts out of typing opts out of every value check.
+`policyValuelessMatchDimensions` (`compiler_policy_missing_match.go`) closes it
+for the five value-bearing security-policy match dimensions by asking
+`firewallMatchValues` — the SAME reader `compilePolicy` uses — whether the
+dimension carries anything; see the #6526 section below. RULE OF THUMB: when a
+gate's claim is *"this dimension constrains something"*, evaluate it with the
+compiler's own value reader, not with a name lookup.
+
 **Bracketed lists on a WILDCARD container collapse differently — a NESTED
 chain, not `Keys[1:]` (#5248).** The contract above assumes a `multi: true`
 value leaf, whose surplus bracket tokens land on ONE leaf's `Keys`. A
@@ -2125,7 +2155,12 @@ path (`lenientClusterAuthKey`, #1960 no-brick) — that downgrade **is** the
 IN-PLACE upgrade path: a cluster that was unkeyed before this gate existed
 keeps its config DB, loads it through `CompileConfigLenient` at daemon start,
 boots, keeps forwarding, and is keyed on the operator's next commit;
-dual-accept then lets the key roll out one node at a time. Because the
+the heartbeat and fabric gRPC dual-accept then lets the key roll out one node
+at a time without dropping the cluster — but **not** session sync, whose
+dual-accept #5078 removed: a keyed node rejects an unkeyed peer, so session sync
+stays down until both nodes are keyed and both have restarted (see
+`pkg/cluster/README.md` -> "Rolling it onto a live unkeyed cluster", which marks
+the old sequence STALE, #6881). Because the
 unattended paths above fail closed, the migration has a REQUIRED ORDER: **key
 the running cluster first, then re-provision / reimage / rebuild a day-0
 drive.** `pkg/cluster/README.md` -> "Operating the control-link PSK (#6611)"
@@ -2326,9 +2361,17 @@ dormant MECHANISM in PR-A:
   `closed` is true AND the keyword is unmodeled (`childSchema == nil`), the
   walker returns a `typedLeafErrorf` reject ("unknown configuration keyword
   … under closed-world subtree"), mirroring the existing modifier-level
-  unknown-keyword rejects. When `closed` is false — the state for EVERY
-  production subtree today — behaviour is byte-identical to pre-#4313
-  (return nil, silent-accept).
+  unknown-keyword rejects. When `closed` is false, behaviour is
+  byte-identical to pre-#4313 (return nil, silent-accept) — which remains the
+  default for every subtree that has not opted in.
+
+  This paragraph deliberately carries NO count of armed subtrees. It used to
+  say "the state for EVERY production subtree today", which was true when
+  written and silently false a month later once the rollout began; the same
+  stale claim in `schema_walk.go` mis-scoped a later lane that trusted it. The
+  armed set is whatever carries `closedWorld: true` in `pkg/config/schema_*.go`
+  — grep it, or read the `schema_closedworld_*_4313_test.go` files, one per
+  closed subtree. A count in prose is a coverage claim and it rots.
 
 PR-A landed the mechanism DORMANT (no production subtree set `closedWorld`,
 zero false-reject risk). It is white-box tested with a SYNTHETIC subtree
@@ -2699,7 +2742,29 @@ Junos, the #4191 class). Both the remaining per-subtree flips and the
 blanket-flip doctrine decision remain tracked on #4313.
 
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
-`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
+`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE,
+and MORE incomplete than this note used to say. A #4313 attempt to close it was
+reverted in PR #6887 after the gate measured four defects; treat these as the
+entry criteria for any future attempt:
+  1. `routing-instance` is a CONTAINER in Junos, not a scalar — it nests a
+     `clients { … }` block. Modeling it as a bare leaf and closing the subtree
+     hard-rejects `snmp community <c> routing-instance <ri> clients <prefix>`,
+     which is valid config. Measured: an SNMP-scoped-to-a-VRF node could not
+     commit ANY change, including an emergency one, until the operator deleted
+     valid Junos.
+  2. `logical-system` is a SIXTH child this note omits —
+     `[edit snmp community <c> logical-system <ls>] routing-instance <ri>`.
+  3. There are TWO ingestion surfaces. The compiler reads snmp from
+     `compiler_dispatch.go` (top-level `snmp {}`) AND from `compiler_system.go`
+     via `FindChild("snmp")` (`system { snmp {} }`), but `setSchema` anchors
+     `snmp` only at the top level. Measured: the same typo is rejected under
+     `snmp {}` and silently accepted under `system { snmp {} }` — and
+     `test/incus/xpf-test.conf` uses the accepted spelling. Closing one surface
+     leaves #4289 live on the one our own reference config uses.
+  4. `client-list-name` and `routing-instance` produce NO inert-knob advisory
+     (only `view` does). Modeling them without one makes the CLI advertise a
+     source-IP restriction the firewall accepts, applies nothing for, and warns
+     nobody about.
 Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;
 `security nat static … then static-nat` —
 UNSAFE: `static-nat` is a free-form leaf and the Junos hierarchical form
@@ -6585,6 +6650,86 @@ Regression coverage:
 `pkg/dataplane/userspace/policy_global_zone_3148_test.go`, the Rust
 `global_policy_*` tests in `userspace-dp/src/policy_tests.rs`, and
 `pkg/policymatch/scoped_global_zonelocal_test.go` (#3287).
+
+### #6526 — A policy `match` leaf with NO OPERAND widens the dimension to match-ANY
+
+The #3044 required-match gate (`validatePolicyRequiredMatchStrict`) decided
+whether a Junos-mandatory dimension was present from the leaf **name**:
+
+```go
+for _, m := range policyMatchChildren(polNode) { present[m.Name()] = true }
+```
+
+while the reader the compiler actually uses — `firewallMatchValues` — skips
+blank tokens, so *an empty result means "criterion absent"*. A dimension
+written with **no operand** therefore satisfied the gate and compiled to the
+**byte-identical empty slice the OMITTED form produces**, which the userspace
+matcher reads as match-ANY:
+
+| `match` stanza | before #6526 | after #6526 |
+|---|---|---|
+| `source-address 10.0.0.0/8;` | ACCEPTED, `SourceAddresses=[10.0.0.0/8]` | unchanged |
+| `source-address;` (no operand) | **ACCEPTED, `SourceAddresses=[]` → match-ANY** | REJECTED (#6526) |
+| omitted entirely | REJECTED (#3044) | unchanged |
+
+`then permit` on the middle row permits **every** source. It was reachable
+through the CLI's own `set` path — `set security policies from-zone trust
+to-zone untrust policy p1 match source-address` with the value left off — so
+an operator hitting enter one token early shipped a permit-any policy. It also
+bypassed the #5575 `LenientContentDropped` poison, which used the same
+name-based predicate. The schema cannot catch it (see "A multi-value leaf can
+be PRESENT and still carry NOTHING" above): the five match dimensions are
+untyped `args: 1, multi: true` leaves with no `validator`, and minimum arity is
+deliberately out of scope for `schema_walk.go`.
+
+`policyValuelessMatchDimensions(polNode, isGlobal)`
+(`compiler_policy_missing_match.go`) is the shared predicate. It flags a
+dimension that is present by name but whose values, **unioned across every
+`match {}` block** (#3842 parity, via `policyMatchChildren`), are empty —
+precisely the condition under which the compiled slice is empty and the
+dimension widens. All **five** value-bearing dimensions are covered:
+`source-address`, `destination-address`, `application`, plus the scoped-global
+`from-zone` / `to-zone`, whose empty set collapses a global policy to the
+all-zones wildcard (a fix that closed only `source-address` would leave that
+half open). Deliberately excluded: `source-address-excluded` /
+`destination-address-excluded`, which are boolean MODIFIER leaves that
+legitimately carry no operand. `from-zone`/`to-zone` are inspected only under a
+global policy — under a zone-pair policy they are not match siblings at all and
+the #3113 unsupported-leaf gate (which runs first) owns them, so one typo is
+never double-attributed.
+
+Enforcement follows the #1960 no-brick split, and the finding is emitted from
+the SAME walk as #3044 (so the duplicate-block / dual-AST scope coverage can
+never diverge between the two) but with a **distinct message** under a
+**distinct lenient flag** (`lenientPolicyValuelessMatch`), so "you did not
+write the criterion" stays distinguishable from "you wrote it and left the
+value off":
+
+- **Strict (commit / commit-check)** — hard reject, naming the policy scope,
+  the policy, and every valueless dimension. The operator authored this
+  candidate, so surfacing it is the safe choice and matches Junos, where the
+  stanza cannot commit.
+- **Tolerant (`Store.Load` / HA `SyncApply` peer-sync)** — warn and continue,
+  so an already-persisted or peer-synced config an older binary silently
+  accepted still BOOTS instead of blacking out the node or alarm-looping config
+  sync. There the policy is additionally **poisoned to never-match** by
+  `compilePolicy`'s #5575 `LenientContentDropped` flag, so the dataplane
+  publishes the rule with the `__unsupported__` sentinel rather than the
+  widened permit — the warning is not the only protection on that path.
+
+When a policy trips BOTH findings, the omitted-dimension (#3044) message is
+reported first as the more fundamental authoring error.
+
+Regression coverage:
+`pkg/config/compiler_policy_valueless_match_6526_test.go` — all five dimensions
+through BOTH the flat `ParseSetCommand` + `SetPath` path and the hierarchical
+`NewParser` path; a three-way differential (`normal` accepted with its value /
+no-operand rejected by #6526 / omitted rejected by #3044) that asserts each
+gate's OWN message and forbids the other's, so a finding can never be silently
+re-attributed; the lenient warn + `LenientContentDropped` poison; and
+false-positive controls for the `-excluded` modifiers, bracketed lists,
+duplicate match blocks that supply the value, explicit `any`, and a global
+policy that simply omits `from-zone`/`to-zone`.
 
 ### #3075 — Stable zone ids (supersedes the #2391 u8 count cap)
 

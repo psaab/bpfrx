@@ -1293,9 +1293,15 @@ type compileOpts struct {
 	// entire control channel unauthenticated. The tolerant load / peer-sync
 	// paths downgrade to a warning so a cluster that was already unkeyed
 	// before this gate existed still BOOTS after the upgrade (#1960 no-brick)
-	// — that is the migration path; the dual-accept grace in all three
-	// mechanisms then lets the key be rolled out one node at a time without
-	// dropping the cluster. Same doctrine as lenientChassisRG.
+	// — that is the migration path. NOTE the grace is no longer uniform: #5078
+	// removed dual-accept from SESSION SYNC, so a keyed node now rejects an
+	// unkeyed peer's connection outright. The heartbeat and fabric gRPC
+	// channels still dual-accept, so the cluster does not drop, but keying one
+	// node at a time takes SESSION SYNC DOWN until both nodes are keyed and
+	// both have restarted (a connection only picks the key up on a new
+	// handshake). See pkg/cluster/README.md -> "Rolling it onto a live unkeyed
+	// cluster", which marks the old one-node-at-a-time sequence STALE (#6881).
+	// Same doctrine as lenientChassisRG.
 	lenientClusterAuthKey bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
@@ -1780,6 +1786,37 @@ type compileOpts struct {
 	// must write `any` for an intentional wildcard (Junos parity). Same
 	// doctrine as lenientPolicyMatchLeaves.
 	lenientPolicyMissingMatch bool
+	// lenientPolicyValuelessMatch (#6526) downgrades the security-policy
+	// VALUELESS-match-dimension gate — the second finding emitted by
+	// validatePolicyRequiredMatchStrict — from a hard compile error to a
+	// cfg.Warnings entry. A `match` dimension written with NO OPERAND
+	// (`source-address;`, or a `set ... match source-address` line with the
+	// value left off) satisfied the #3044 name-based required-dimension gate
+	// yet compiled to the BYTE-IDENTICAL empty slice the omitted form
+	// produces, which the userspace matcher reads as match-ANY: `then permit`
+	// then permits every source, and a scoped-global `match from-zone` /
+	// `to-zone` collapses to the all-zones wildcard. The strict commit /
+	// commit-check path hard-rejects so the typo is operator-visible (naming
+	// the policy scope, the policy, and every valueless dimension); the
+	// tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config an older binary silently
+	// accepted still BOOTS (#1960 fail-closed-on-load class) — and there the
+	// policy is additionally poisoned by compilePolicy's #5575
+	// LenientContentDropped flag rather than published as a widened permit —
+	// but ONLY on the userspace dataplane, which is the sole plane that reads
+	// that flag. The kernel host-inbound actuator (junos_host_deny.go ->
+	// daemon_apply_tail.go) does NOT consult it, so a poisoned `junos-host`
+	// policy still projects to nft with an empty source list read as
+	// source-any: it becomes permitAll and suppresses a following deny. That
+	// gap is PRE-EXISTING (the OMITTED spelling reaches it identically on
+	// master) and is tracked as #6705, not introduced here. The runtime
+	// consequences of the snapshot rejection itself — the transit window, HA
+	// divergence, and a poisoned commit-confirmed rollback target — are
+	// likewise pre-existing and tracked as #6707.
+	// Kept as its own flag (not folded into lenientPolicyMissingMatch) so the
+	// two findings stay independently attributable. Same doctrine as
+	// lenientPolicyMissingMatch.
+	lenientPolicyValuelessMatch bool
 	// lenientPolicyCommunityRef (#2881) downgrades the policy community
 	// cross-reference gate (validatePolicyCommunityReferencesStrict) from a
 	// hard compile error to a cfg.Warnings entry. A policy term's
@@ -2143,6 +2180,7 @@ func lenientCompileOpts() compileOpts {
 		lenientPolicyThenReject:                true,
 		lenientPolicyThenDeny:                  true,
 		lenientPolicyMissingMatch:              true,
+		lenientPolicyValuelessMatch:            true,
 		lenientPolicyCommunityRef:              true,
 		lenientPolicyReservedRedistName:        true,
 		lenientPolicyReservedChainName:         true,
