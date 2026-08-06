@@ -311,10 +311,24 @@ func idProbeConfig() *config.Config {
 // ScreenIDs was a FOURTH vacuous dimension, failing one level below the r4
 // three: the driver did run Phase 1.5, but by RE-IMPLEMENTING it rather than
 // calling production, so that column compared this function's own loop against
-// itself. Measured: drifting the assignment at either production site left the
-// whole package green. The prelude is now the single assignScreenIDs
-// (compiler.go) that both production sites call. Call production phases here;
-// never restate one.
+// itself. Measured: seeding that assignment from a package-level counter, at
+// either production site, left the whole package green. The prelude is now the
+// single assignScreenIDs (compiler.go) that both production sites call. Call
+// production phases here; never restate one.
+//
+// WHAT A GREEN HERE DOES AND DOES NOT MEAN — this applies to EVERY column, not
+// just ScreenIDs, and reading it wrong overstates all of them. The test
+// compares two passes of the SAME phases over the SAME config, so it detects
+// perturbation ACROSS passes: state outliving a CompileResult — a
+// process-global, a counter on the DataPlane, an interned table — which is the
+// #4960 question, since the pre-pass compiles twice and throws the first result
+// away. It does NOT detect incorrect assignment WITHIN a pass. Anything applied
+// identically to both passes (a wrong seed, a wrong sort key, a wrong id
+// formula) produces two identical maps and stays green by construction. A green
+// says "compiling twice is free", not "the ids are right"; the correctness of
+// each assignment is owned by that phase's own tests. The non-vacuity floors
+// below are a separate matter again — they only keep a column from being an
+// empty-vs-empty comparison.
 func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 	t.Helper()
 	dp := idProbeDP{}

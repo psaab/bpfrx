@@ -69039,3 +69039,41 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/dataplane/compiler.go,
   pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: Narrow an overclaim in the #6894 r5 comments. COMMENT-ONLY — no
+  production or test behaviour changes.
+  `TestPrePassDoesNotPerturbIDAssignment_4960` compares two passes of the same
+  phases over the same config, so what it detects is perturbation ACROSS
+  passes: state outliving a `CompileResult` (a process-global, a counter on the
+  DataPlane, an interned table), which is the #4960 question because the
+  pre-pass compiles twice and discards the first result. It does NOT detect
+  incorrect assignment WITHIN a pass — anything applied identically to both
+  passes (a wrong seed, a wrong sort key, a wrong id formula) yields two
+  identical maps and stays green by construction. The r5 wording said the
+  ScreenIDs column "could not observe a production drift", which claims the
+  stronger property; it could not observe a CROSS-PASS drift.
+  Reworded three places: `assignScreenIDs`'s doc (compiler.go) now says
+  cross-pass and describes the measured mutation as seeding the assignment from
+  a package-level counter rather than the vaguer "drifting"; `compileIDsOnce`'s
+  doc likewise; and a new paragraph in `compileIDsOnce` states the general form
+  ONCE, explicitly scoped to EVERY column rather than to ScreenIDs, since a
+  reader who takes a green as "the ids are right" is misreading all of them.
+  That paragraph also separates the third mechanism in this test so the three
+  are not conflated: the DeepEqual binds cross-pass stability, the phase list
+  binds which dimensions exist at all, and the non-vacuity floors only keep a
+  column from being an empty-vs-empty comparison.
+  COMMENT-ONLY PROOF, stronger than reading the diff: both touched files were
+  compared against HEAD (420e37c1e) with blank lines and whole-line `//`
+  comments stripped from each side. compiler.go 1377 non-comment lines
+  identical; compiler_idprobe_4960_test.go 330 identical. That covers the
+  floors, the driver's phase list and its order, `assignScreenIDs`'s body, and
+  all three call sites — none moved.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... -count=1` rc=0 (4 packages ok); `gofmt -l` clean
+  on both touched files. The r5 mutation grid is not re-run and does not need
+  to be: no line it exercises changed.
+  No doc change, for the same reason as r5 — no live module doc describes the
+  screen-ID prelude, and this round alters only comment prose.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md

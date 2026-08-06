@@ -233,11 +233,18 @@ func assignZoneIDs(result *CompileResult, cfg *config.Config) {
 // to exist — here, in validateBeforeMutateWithResult, and in the ID-stability
 // probe's own driver (compiler_idprobe_4960_test.go) — and the third copy is
 // what made TestPrePassDoesNotPerturbIDAssignment_4960's ScreenIDs column
-// unable to observe anything: the probe re-implemented the assignment instead
-// of calling it, so that column compared the test's own loop against itself.
-// Measured at the time: drifting the assignment at EITHER production site left
-// the whole package green. Keep every caller on this function; a fourth copy
-// re-opens the hole.
+// unable to observe a CROSS-PASS drift: the probe re-implemented the
+// assignment instead of calling it, so that column compared the test's own
+// loop against itself. Measured at the time: seeding this assignment from a
+// package-level counter, at EITHER production site, left the whole package
+// green. Keep every caller on this function; a fourth copy re-opens the hole.
+//
+// Note the limit of what that column can bind, which is narrower than "the ids
+// are right" — see compileIDsOnce's doc. The probe compares two passes, so a
+// change applied identically to both (a different seed, a different sort key)
+// leaves pass 1 == pass 2 and stays green by construction. What it detects is
+// state outliving a CompileResult. Correctness of the assignment itself is not
+// measured here.
 func assignScreenIDs(result *CompileResult, cfg *config.Config) {
 	screenID := uint16(1)
 	screenNames := make([]string, 0, len(cfg.Security.Screen))
