@@ -21,11 +21,23 @@ import (
 // diagnostic any of its substance.
 //
 // fail-on-revert: removing the validateVRFOverlap call (or its detection body)
-// drops the warning, so TestVRFOverlapWarnsOnOverlappingRIs goes RED. Restoring
-// the old "…may cross-forward until the session identity is VRF-aware" wording
-// reds TestVRFOverlapWarningStatesStatusNotPromise on the "until" token, while
-// TestVRFOverlapWarningKeepsDiagnosticSubstance stays GREEN — that pair is what
-// distinguishes "the promise is gone" from "the diagnostic is gone".
+// drops the warning, so TestVRFOverlapWarnsOnOverlappingRIs goes RED.
+//
+// The mutation that ISOLATES the promise dimension is a TAIL-ONLY substitution:
+// replace "…may cross-forward. See #2387 for the status of this limitation"
+// with "…may cross-forward until the session identity is VRF-aware", KEEPING
+// the "the session identity carries no routing-instance discriminator, so"
+// clause. That reds TestVRFOverlapWarningStatesStatusNotPromise on the "until"
+// token while TestVRFOverlapWarningKeepsDiagnosticSubstance stays GREEN, which
+// is what distinguishes "the promise is gone" from "the diagnostic is gone".
+//
+// A LITERAL revert to the pre-PR string reds BOTH, and that is correct, not a
+// failure of the pair: the old string ALSO lacked the discriminator clause, so
+// reverting changes two things at once — it re-adds the promise AND removes the
+// diagnosis. Do not read a both-red result as "the tests do not separate"; run
+// the tail-only mutation above to see them separate. (That the old text trips
+// the substance test at all is the useful part: the replacement is strictly
+// more informative than what it replaced, and this test is what pins that.)
 
 // vrf2387Warnings returns the compile warnings that mention #2387.
 func vrf2387Warnings(t *testing.T, cmds []string) []string {
@@ -150,6 +162,13 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 // 5-tuples may cross-forward "until the session identity is VRF-aware", and the
 // #2387 plan then cited that sentence back as evidence the widening was already
 // settled — a promise the open decision may never keep.
+// This list is a BLOCKLIST and is therefore incomplete by construction: it
+// catches the spellings someone thought of, and a future author can always
+// phrase a promise a way it does not match. Do not read a green result as
+// "the warning contains no promise" — read it as "the warning contains none of
+// these". The entries below the first group were added after a review
+// demonstrated each one passing the test while reintroducing a promise, so
+// treat any addition the same way: prove it green first, then add it.
 var vrfOverlapForwardLookingTokens = []string{
 	"until",
 	"will be",
@@ -160,6 +179,18 @@ var vrfOverlapForwardLookingTokens = []string{
 	"roadmap",
 	"once the session",
 	"when the session",
+	// Measured escapes — each of these was inserted into the warning and
+	// observed to leave the test GREEN before it was listed here.
+	"not yet",
+	"pending",
+	"temporary",
+	"temporarily",
+	"in a later release",
+	"for now",
+	"interim",
+	"to be addressed",
+	"work is under way",
+	"soon",
 }
 
 // vrfOverlapBothFormStrings returns one warning from EACH of the two format
@@ -244,10 +275,35 @@ func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 	for _, tc := range []struct {
 		form string
 		warn string
+		// ident is the WHICH of the diagnosis: which routing-instances, reached
+		// through which config source, over which prefix. Asserting only the
+		// explanatory prose leaves every one of these strippable with the whole
+		// package still green — an operator would be told a cross-forwarding
+		// hazard exists but not where, which is not a usable diagnostic.
+		ident []string
 	}{
-		{"equal-prefix", equal},
-		{"unequal-overlap", unequal},
+		{
+			form: "equal-prefix",
+			warn: equal,
+			ident: []string{
+				`"RI-A"`, `"RI-B"`,
+				`interface "ge-0/0/1.0"`, `interface "ge-0/0/2.0"`,
+				"10.0.0.0/24",
+			},
+		},
+		{
+			form: "unequal-overlap",
+			warn: unequal,
+			ident: []string{
+				`"RI-A"`, `"RI-B"`,
+				`interface "ge-0/0/1.0"`, `interface "ge-0/0/2.0"`,
+				// BOTH prefixes: the unequal form's whole reason to exist is
+				// that the two differ, so printing only one loses the overlap.
+				"10.0.0.0/24", "10.0.0.0/25",
+			},
+		},
 	} {
+		// The explanation: what is wrong and what follows from it.
 		for _, want := range []string{
 			"NOT session-isolated",
 			"no routing-instance discriminator",
@@ -255,6 +311,14 @@ func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 		} {
 			if !strings.Contains(tc.warn, want) {
 				t.Errorf("%s form lost diagnostic substance %q: %s", tc.form, want, tc.warn)
+			}
+		}
+		// The identification: which objects the explanation is about.
+		for _, want := range tc.ident {
+			if !strings.Contains(tc.warn, want) {
+				t.Errorf("%s form no longer identifies %q — the warning explains the hazard "+
+					"but not which routing-instances, source or prefix it concerns: %s",
+					tc.form, want, tc.warn)
 			}
 		}
 	}

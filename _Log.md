@@ -1,3 +1,53 @@
+## 2026-08-05 — #6902 round 2: the mutation recipe in the shipping comment was false
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three hostile-review findings. Test-only — the production
+  warning strings are byte-identical to round 1.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F1 — the recipe did not do what it said.** The header comment claimed that
+"restoring the old …until the session identity is VRF-aware wording" reds the
+promise test while the substance test stays GREEN. Reproduced firsthand: a
+LITERAL revert to the pre-PR string reds BOTH. The old string also lacked the
+"no routing-instance discriminator" clause, so reverting changes two things at
+once — re-adds the promise AND removes the diagnosis. The isolating mutation is
+a TAIL-ONLY substitution that keeps the discriminator clause; the comment now
+prescribes exactly that and warns not to read a both-red result as "the tests do
+not separate". Worth keeping: that the old text trips the substance test proves
+the replacement is strictly more informative than what it replaced.
+
+**F2 — the blocklist was a guess, and the review measured the escapes.** Four
+spellings reintroduced a promise while the test stayed GREEN: "not yet",
+"pending", "temporary", "in a later release". Added those plus siblings
+("temporarily", "for now", "interim", "to be addressed", "work is under way",
+"soon"), each re-verified RED after injection. The list comment now states
+plainly that a blocklist is incomplete by construction — green means "contains
+none of these", NOT "contains no promise" — and that any addition must be shown
+green before being listed.
+
+**F3 — the diagnosis was identified by nobody.** The substance test asserted
+only the explanatory prose, so the RI names, the config origins and the prefixes
+were all strippable with `pkg/config` fully green: an operator would be told a
+cross-forwarding hazard exists but not where. Added per-form identity
+assertions, including BOTH prefixes on the unequal-overlap arm — printing only
+one loses the overlap that arm exists to report.
+
+Mutation matrix, each dimension binding independently:
+
+| Mutation | promise test | substance test |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| tail-only promise restore (the isolating one) | RED | GREEN |
+| blank the RI name, equal-prefix arm | GREEN | RED |
+| duplicate the prefix, unequal-overlap arm | GREEN | RED |
+| literal full revert | RED | RED (expected — two changes) |
+
+Each of the four F2 escapes verified RED after being listed. All arg-count-
+preserving mutations, so every red is an assertion and not a build break.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; restores verified byte-identical with `cmp`.
+
 ## 2026-08-05 — #2387 A.1: the warning promised an outcome #2387 has not decided
 
 - **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording)
