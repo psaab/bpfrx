@@ -1,3 +1,49 @@
+## 2026-08-05 — #4313: REVERT the snmp arm; keep and finish the stale-claim fix
+
+- **Timestamp**: 2026-08-05 (fix/4313-closed-world-arm, gate MERGE-NEEDS-MAJOR)
+- **Action**: The gate found the arm hard-rejects valid Junos. **Reverted the
+  flip and the three leaf additions.** Kept the stale-claim work, which is
+  independent and was the finding that mis-scoped this lane in the first place.
+- **Why revert rather than model my way out** — my leaf-completeness audit was
+  wrong in two independent ways and the target has a second, unarmed surface:
+    - **F1 (verified firsthand)**: `routing-instance` is a CONTAINER in Junos
+      nesting a `clients {}` block; I modeled it as a bare scalar. Closed-world
+      inherits into container descent, so
+      `snmp community public routing-instance InBand clients 10.0.0.0/8` — valid
+      config — is REJECTED. An SNMP-scoped-to-a-VRF node could not commit ANY
+      change until the operator deleted working configuration. That is exactly
+      the #4191 false-reject class the leaf-completeness audit exists to prevent,
+      and my audit produced it.
+    - **F2**: `logical-system` is a sixth Junos child I did not model, and my
+      test enshrined the false-reject as correct — a future lane would have had
+      to delete a test case defending the defect.
+    - **F3 (verified firsthand)**: TWO ingestion surfaces. The same typo is
+      rejected under `snmp {}` and returns `<nil>` under `system { snmp {} }`
+      (`compiler_system.go:512` `FindChild("snmp")`), and
+      `test/incus/xpf-test.conf` uses the uncovered spelling. Even a correct arm
+      would have been half a fix while the docs claimed full coverage.
+    - **F4**: the leaves I added are inert with NO advisory (only `view` has
+      one), so merely modeling them makes the CLI advertise a source-IP
+      restriction that is accepted, unapplied, and unwarned. Composed with F1,
+      the error message walks the operator into removing their remaining
+      restriction — the fix path leads to the fail-open.
+- **The lesson, mine**: my mutation proof was green and proved the WRONG THING.
+  Disarming red the rejection test; dropping a modeled leaf red the negative
+  control. Both show the guard BINDS. Neither asks whether what it binds is
+  CORRECT — whether the modeled set actually equals the Junos grammar. A
+  negative control built from my own model of the grammar can only confirm my
+  model, not test it. For a closed-world flip the binding proof is necessary and
+  the grammar audit is the load-bearing half, and I treated the first as
+  evidence for the second.
+- **Kept and finished**: the stale-claim fix, which the gate found was 1-of-3.
+  `schema_walk.go` carried the same false "no production subtree / everywhere in
+  production today" claim at three sites — the keyword gate, the top-level walk
+  doc (:107) and the walkSchemaNode param doc (:298). All three now state the
+  mechanism with no count. The docs contradiction resolved itself once the flip
+  was reverted, and the skip note is upgraded from a name-list into the four
+  measured entry criteria above so the next attempt starts from evidence.
+- **File(s)**: `pkg/config/schema_walk.go`, `docs/config-schema.md`, `_Log.md`
+
 ## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
