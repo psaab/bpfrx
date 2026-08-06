@@ -756,7 +756,16 @@ source tuple (reply mis-delivery / a session-hijack surface).
   identity. Like the port-bearing arm, a collision (a local flow already owns the
   identity) or a foreign pool address is skipped gracefully.
 - **Rule selection (#6211):** WHICH rule the reservation lands on mirrors the
-  ACTIVE node's choice. Two source-NAT rules can carry the SAME public pool
+  ACTIVE node's choice.
+
+  **Scope:** the motivating config is NOT reachable through a supported commit
+  — #5144 hard-rejects duplicate source-NAT pool addresses at strict commit
+  (`TestNAT5144ExactDuplicateSourcePools`). The live surface is the two paths
+  that BYPASS the strict compiler: a pre-#5144 persisted config, and the
+  tolerant load / peer-sync path (#1960 no-brick). That bounds the severity —
+  this is not an ordinary operator configuration.
+
+  Two source-NAT rules can carry the SAME public pool
   address in SEPARATE allocators — the allocator is shared per `allocator_key`
   (pool name + addresses + port range, `SourceNatRule::allocator_key`), so
   distinct `pool_name`s with a common member address give one address two
@@ -797,6 +806,24 @@ source tuple (reply mis-delivery / a session-hijack surface).
   than before #6211 — the narrowing can only move a reservation to a
   better-justified allocator, never remove one. Rolling-upgrade safe, and
   single-rule / non-overlapping-pool configs are byte-identical either way.
+
+  **Release sweeps every allocator (#6211).** Because selection is no longer a
+  pure function of `rules`, a session re-upserted after the selection outcome
+  changes (a zone delete/renumber flips the pair to unresolvable; a rule-set
+  `from zone` / `match` edit moves the candidate set) reserves a SECOND time in
+  a DIFFERENT, independent allocator — `reserve_flow`'s idempotence is per
+  allocator, so it does not short-circuit. Every live session re-upserts on HA
+  session-sync reconnect and on a post-delete-journal-overflow resync. So
+  `release_source_nat_allocation` no longer stops at the first allocator that
+  reports the flow released; it frees from EVERY pool-mode rule. Stopping at
+  the first hit stranded the other reservation permanently — nothing reaps it
+  (`live_by_flow` is removed only by `release_flow` / `rollback_flow` / the
+  stale-tuple replace in `reserve_flow`; `gc_expired_chunked` sweeps persistent
+  LEASES, not live flows), a config edit does not rebuild the allocator
+  (carryover is keyed on `allocator_key()` alone), and the orphan counts
+  against `max_tracked_flows` until the pool reports `AllocatorExhausted`. The
+  sweep cannot over-free: `release_flow` / `rollback_flow` return false unless
+  the stored translated tuple matches this one.
 - **Release site:** the reservation uses the synced flow key, so the standard
   teardown — `release_source_nat_allocation`, already called on GC reap
   (`reap_expired_sessions`), on a peer delete-sync (`handle_delete_synced`), and

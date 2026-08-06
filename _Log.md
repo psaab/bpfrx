@@ -66314,6 +66314,41 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/session_glue/README.md,
   docs/session-sync-architecture.md, _Log.md
   (`docs/refactoring-audit-current.txt` NOT regenerated: source.rs grows
-  1765 -> 1895 lines but stays in the same `[WATCH]` tier (1500-1999), and
+  1765 -> 1896 lines but stays in the same `[WATCH]` tier (1500-1999), and
   the canary compares tier by path, so `go test ./pkg/refactoraudit/` passes
   clean — verified, exit 0.)
+- **Timestamp**: 2026-08-05 21:05
+- **Action**: #6211 fold r1 — the rev6876 gate found a MAJOR that the PR itself
+  INTRODUCED, plus an unbound production call site. (1) LEAK: the two-pass
+  selection is not a pure function of `rules`, so a session re-upserted after
+  the selection outcome changes (zone delete/renumber -> `synced_zones` becomes
+  `None`; a rule-set `from zone`/`match` edit moves pass 1's candidate set)
+  reserves a SECOND time in a different, independent allocator —
+  `reserve_flow`'s idempotence is per-allocator and does not short-circuit —
+  and every live session re-upserts on HA session-sync reconnect and on a
+  post-delete-journal-overflow resync. `release_source_nat_allocation` stopped
+  at the FIRST allocator reporting released, stranding the other reservation
+  permanently; nothing reaps it (`live_by_flow` is removed only by
+  `release_flow`/`rollback_flow`/the stale-tuple replace, and
+  `gc_expired_chunked` sweeps LEASES not live flows), a config edit does not
+  rebuild the allocator (carryover keyed on `allocator_key()` alone), and the
+  orphan counts against `max_tracked_flows` to eventual `AllocatorExhausted`.
+  Fixed by dropping the first-hit `break` so release frees from EVERY pool-mode
+  rule; that cannot over-free because `release_flow`/`rollback_flow` return
+  false unless the stored translated tuple matches. The session_glue README had
+  asserted the OPPOSITE ("it locates the reservation wherever the reserve put
+  it") — true for one reservation, and this change is what made two possible;
+  corrected. (2) The only production call site was completely unbound: all nine
+  tests called `reserve_synced_source_nat_allocation` directly with a literal
+  `Some(("lan","wan"))`, so passing `None` at the call site or inverting
+  ingress/egress inside `synced_source_nat_zone_pair` both kept the suite green.
+  Added a `handle_upsert_synced` test driving the real entry point. Also bounded
+  the scope in code + docs (#5144 hard-rejects the motivating config at strict
+  commit — the live surface is pre-#5144 persisted configs and the tolerant
+  load / peer-sync path only), corrected the heatmap line count to 1896, and
+  used the unit-qualified `ge-0/0/1.0` the Go snapshot builder actually ships.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests_pool.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/session_glue/README.md,
+  docs/session-sync-architecture.md, _Log.md

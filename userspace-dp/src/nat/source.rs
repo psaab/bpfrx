@@ -853,17 +853,45 @@ fn release_source_nat_allocation_with_mode(
         src_port: key.src_port,
         dst_port: key.dst_port,
     };
+    // #6211: free from EVERY allocator that holds this exact
+    // `(flow, translated)` — do NOT stop at the first.
+    //
+    // Before #6211 the reserve was a pure function of `rules`, so a re-upsert
+    // of the same session always re-entered the SAME allocator and
+    // short-circuited on `reserve_flow`'s idempotence: at most one allocator
+    // could ever hold a given flow, and a first-hit `break` was sufficient.
+    // The #6211 two-pass selection breaks that invariant — pass 1 and pass 2
+    // can choose DIFFERENT rules for the same session at different times (a
+    // zone delete/renumber, or a rule-set `from zone` / `match` edit, flips
+    // `synced_zones` to `None` or moves pass 1's candidate set), and the two
+    // rules' allocators are independent. A re-upsert then reserves the flow a
+    // SECOND time in a different allocator (every live session re-upserts on
+    // HA session-sync reconnect and on a post-delete-journal-overflow
+    // resync). With a first-hit `break` the teardown freed one and left the
+    // other holding its `(pool_addr, port)` forever: a permanent standby pool
+    // leak that also counted against `max_tracked_flows` until the allocator
+    // reported `AllocatorExhausted`. Nothing reaps it — `live_by_flow` is only
+    // removed by `release_flow` / `rollback_flow` / the stale-tuple replace in
+    // `reserve_flow`, and `gc_expired_chunked` sweeps persistent LEASES, not
+    // live flows. A config change does not rebuild the allocator either:
+    // carryover is keyed on `allocator_key()` (pool name + addresses + port
+    // range), so the very edit that flips pass 1's outcome preserves the leak.
+    //
+    // Sweeping every rule is safe and cannot over-free: `release_flow` /
+    // `rollback_flow` return false unless `live_by_flow[flow].translated`
+    // equals THIS `translated` tuple, so an allocator holding a different
+    // flow — or the same flow under a different translation — is untouched.
+    // For the single-reservation case (every pre-#6211 config, and every
+    // config where selection never moved) the outcome is bit-identical; only
+    // the early exit is gone, on a cold teardown path.
     for rule in rules {
         if !rule.pool_mode {
             continue;
         }
-        let released = if rollback {
-            rule.pool_allocator.rollback_flow(flow, translated, now_ns)
+        if rollback {
+            rule.pool_allocator.rollback_flow(flow, translated, now_ns);
         } else {
-            rule.pool_allocator.release_flow(flow, translated, now_ns)
-        };
-        if released {
-            break;
+            rule.pool_allocator.release_flow(flow, translated, now_ns);
         }
     }
 }
@@ -918,7 +946,17 @@ pub(crate) type SyncedNatZones<'a> = Option<(&'a str, &'a str)>;
 /// `reserve_address_only` regardless of the pool's allocation mode.
 ///
 /// #6211: WHICH rule the reservation lands on now mirrors the active node's
-/// choice. Two source-NAT rules may carry the SAME pool ADDRESS in SEPARATE
+/// choice.
+///
+/// SCOPE — the motivating config is NOT reachable through a supported commit.
+/// #5144 hard-rejects duplicate source-NAT pool addresses at strict commit
+/// (`TestNAT5144ExactDuplicateSourcePools` asserts `CompileConfig` refuses
+/// exactly this shape), so the live surface is the two paths that BYPASS the
+/// strict compiler: a pre-#5144 persisted config, and the tolerant
+/// load / peer-sync path (#1960 no-brick). That bounds the original defect's
+/// severity — it is not an ordinary operator configuration.
+///
+/// Two source-NAT rules may carry the SAME pool ADDRESS in SEPARATE
 /// allocators (distinct `pool_name` / port range => distinct `allocator_key`),
 /// and the pre-#6211 selection — "the first rule whose pool CONTAINS
 /// `rewrite_src`" — narrowed on NO other axis, while the active picked its rule

@@ -4694,6 +4694,105 @@ fn synced_address_only_token_follows_active_zone_match_6211() {
     );
 }
 
+// #6211 FAIL-ON-REVERT (leak): a session re-upserted under a DIFFERENT
+// `synced_zones` outcome lands in a SECOND allocator, and the teardown must
+// free BOTH.
+//
+// The two-pass selection is not a pure function of `rules`: pass 1 and pass 2
+// can pick different rules for the same session at different times. A zone
+// delete/renumber flips `synced_source_nat_zone_pair` to `None`; a rule-set
+// `from zone` / `match` edit moves pass 1's candidate set. Every live session
+// re-upserts on HA session-sync reconnect (and on a post-delete-journal-overflow
+// resync), and `upsert_synced_with_origin` removes + re-inserts, so
+// `handle_upsert_synced` re-runs the reserve. The two rules' allocators are
+// independent, so the second reserve SUCCEEDS rather than short-circuiting on
+// `reserve_flow`'s idempotence.
+//
+// With the pre-fix first-hit `break` in `release_source_nat_allocation` the
+// teardown freed `pool-dmz` and stopped, leaving `pool-lan` holding port 20000
+// forever — a permanent standby pool leak that also counts against
+// `max_tracked_flows`. Restoring that `break` makes the "both freed" assertion
+// RED.
+#[test]
+fn synced_reservation_double_upsert_across_zone_outcomes_frees_both_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+
+    // Upsert #1: the zone pair resolves -> pass 1 -> the `lan->wan` rule.
+    reserve_synced_source_nat_allocation(
+        &rules,
+        &synced_key,
+        synced_nat,
+        false,
+        Some(("lan", "wan")),
+    );
+    // Upsert #2 (same live session re-synced) AFTER a zone delete/renumber, so
+    // the pair no longer resolves -> pass 2 -> the `dmz->wan` rule.
+    reserve_synced_source_nat_allocation(&rules, &synced_key, synced_nat, false, None);
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20000)
+            && rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "precondition: the re-upsert reserved the SAME session in a SECOND \
+         allocator (they are independent, so idempotence does not apply)"
+    );
+
+    release_source_nat_allocation(&rules, &synced_key, synced_nat, false, 2_000);
+
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 20000),
+        "teardown must free the dmz-rule reservation"
+    );
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "#6211 LEAK: teardown must ALSO free the lan-rule reservation — a \
+         first-hit `break` in release_source_nat_allocation strands it forever"
+    );
+}
+
+// #6211 CONTROL for the release sweep: dropping the first-hit `break` must not
+// over-free. A DIFFERENT flow holding a reservation in another rule's allocator
+// is untouched by this flow's teardown — `release_flow` returns false unless
+// the stored translated tuple matches.
+#[test]
+fn synced_release_sweep_does_not_free_an_unrelated_flow_6211() {
+    let rules = overlapping_pool_rules_6211();
+    let mine = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let mine_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20000),
+        ..NatDecision::default()
+    };
+    let other = session_key_from_src("10.0.61.99", 40099, "8.8.8.8", 443);
+    let other_nat = NatDecision {
+        rewrite_src: Some("203.0.113.10".parse().unwrap()),
+        rewrite_src_port: Some(20050),
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation(&rules, &mine, mine_nat, false, Some(("lan", "wan")));
+    reserve_synced_source_nat_allocation(&rules, &other, other_nat, false, None);
+    assert!(rules[1].pool_allocator.debug_is_port_occupied(0, 20000));
+    assert!(rules[0].pool_allocator.debug_is_port_occupied(0, 20050));
+
+    release_source_nat_allocation(&rules, &mine, mine_nat, false, 2_000);
+
+    assert!(
+        !rules[1].pool_allocator.debug_is_port_occupied(0, 20000),
+        "this flow's own reservation is freed"
+    );
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 20050),
+        "the sweep must NOT free an UNRELATED flow's reservation in another \
+         rule's allocator"
+    );
+}
+
 // #6211 NEGATIVE CONTROL (mixed-version / unresolvable zone): with NO zone pair
 // available — an old peer that carried neither a zone id nor a resolvable zone
 // name, or config drift — the reservation falls back to the pre-#6211
@@ -4868,7 +4967,7 @@ fn synced_reservation_ignores_unconfirmable_interface_scope_6211() {
             from_zone: "lan".to_string(),
             to_zone: "wan".to_string(),
             // #3096 scope: node-local, and NOT carried on the sync wire.
-            from_interface: "ge-0/0/1".to_string(),
+            from_interface: "ge-0/0/1.0".to_string(),
             source_addresses: vec!["0.0.0.0/0".to_string()],
             pool_name: "pool-if".to_string(),
             pool_addresses: vec!["203.0.113.10/32".to_string()],
@@ -4889,7 +4988,7 @@ fn synced_reservation_ignores_unconfirmable_interface_scope_6211() {
         },
     ]);
     assert_eq!(
-        rules[0].from_interface, "ge-0/0/1",
+        rules[0].from_interface, "ge-0/0/1.0",
         "precondition: the first rule carries an interface scope"
     );
     let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
