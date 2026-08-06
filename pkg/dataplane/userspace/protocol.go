@@ -252,11 +252,21 @@ type InterfaceSnapshot struct {
 	// across VRF boundaries (#2388). Additive: an old Rust helper that does
 	// not know the field treats every interface as the default instance
 	// (the pre-#2388 global behavior); an old Go binary omits it.
-	RoutingInstance           string                     `json:"routing_instance,omitempty"`
-	LinuxName                 string                     `json:"linux_name,omitempty"`
-	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
-	Ifindex                   int                        `json:"ifindex,omitempty"`
-	ParentIfindex             int                        `json:"parent_ifindex,omitempty"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
+	LinuxName       string `json:"linux_name,omitempty"`
+	ParentLinuxName string `json:"parent_linux_name,omitempty"`
+	Ifindex         int    `json:"ifindex,omitempty"`
+	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
+	// StableID is the #4983 CLUSTER-STABLE interface identity:
+	// config.InterfaceStableID(cfg, Name) — an FNV-1a fold of the name after
+	// resolving a reth MEMBER to its redundant parent. Unlike Ifindex (and
+	// unlike the member's own name) it is identical on both cluster nodes, so
+	// a session that records it still names the right interface when it is
+	// read on the peer after a failover. The Rust side declares
+	// `#[serde(rename = "stable_id", default)]`; omitempty is safe because 0
+	// is the reserved "no identity carried" sentinel an old helper decodes
+	// anyway, and 0 falls back to the zone approximation.
+	StableID                  uint32                     `json:"stable_id,omitempty"`
 	LogicalOnly               bool                       `json:"logical_only,omitempty"`
 	RXQueues                  int                        `json:"rx_queues,omitempty"`
 	VLANID                    int                        `json:"vlan_id,omitempty"`

@@ -56,6 +56,20 @@ pub(crate) struct InterfaceSnapshot {
     pub ifindex: i32,
     #[serde(rename = "parent_ifindex", default)]
     pub parent_ifindex: i32,
+    /// #4983: the CLUSTER-STABLE identity of this interface — Go's
+    /// `config.InterfaceStableID`, an FNV-1a fold of the interface's
+    /// redundant-parent-resolved name (`ge-0/0/1` -> `reth1`). Unlike
+    /// `ifindex`, which is node-local, this names the same interface on both
+    /// chassis-cluster nodes, so a session that records it keeps a meaningful
+    /// ingress-interface identity after a failover. Stamped onto a session at
+    /// install and resolved back to a name by the CLI, which recomputes the
+    /// same fold from its own config.
+    ///
+    /// Additive via serde default: absent on a snapshot from an old Go binary,
+    /// in which case it is `0` — the "no identity carried" sentinel — and the
+    /// CLI falls back to the zone approximation, bit-identical to pre-#4983.
+    #[serde(rename = "stable_id", default)]
+    pub stable_id: u32,
     #[serde(rename = "rx_queues", default)]
     pub rx_queues: usize,
     #[serde(rename = "vlan_id", default)]

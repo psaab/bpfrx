@@ -224,6 +224,11 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			ParentLinuxName: "",
 			Ifindex:         ifindex,
 			ParentIfindex:   0,
+			// #4983: the cluster-stable identity. Ifindex above is node-local
+			// and so is a reth MEMBER's name, so neither survives a failover;
+			// this fold resolves the member to its redundant parent first and
+			// is therefore identical on both nodes.
+			StableID:        config.InterfaceStableID(cfg, name),
 			RXQueues:        userspaceRXQueueCount(linuxName),
 			VLANID:          0,
 			LocalFabric:     iface.LocalFabricMember,
@@ -288,13 +293,16 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			}
 			addresses = mergeInterfaceAddressSnapshots(addresses, buildConfiguredAddressSnapshots(unit.Addresses))
 			out = append(out, InterfaceSnapshot{
-				Name:                      unitName,
-				Zone:                      zoneByInterface[unitName],
-				RoutingInstance:           ifaceRoutingInstance[unitName],
-				LinuxName:                 linuxUnit,
-				ParentLinuxName:           parentLinux,
-				Ifindex:                   ifindex,
-				ParentIfindex:             parentIfindex,
+				Name:            unitName,
+				Zone:            zoneByInterface[unitName],
+				RoutingInstance: ifaceRoutingInstance[unitName],
+				LinuxName:       linuxUnit,
+				ParentLinuxName: parentLinux,
+				Ifindex:         ifindex,
+				ParentIfindex:   parentIfindex,
+				// #4983: cluster-stable identity, unit suffix carried onto the
+				// redundant parent (`ge-0/0/2.50` -> `reth0.50`).
+				StableID:                  config.InterfaceStableID(cfg, unitName),
 				LogicalOnly:               logicalOnly,
 				RXQueues:                  rxQueues,
 				VLANID:                    unit.VlanID,

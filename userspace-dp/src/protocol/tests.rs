@@ -2467,3 +2467,32 @@ fn session_sync_request_policy_fields_roundtrip_3301() {
         "missing inactivity_timeout defaults to 0"
     );
 }
+
+// #4983 both-sides wire check: the Go control plane declares
+// `StableID uint32 \`json:"stable_id,omitempty"\`` on InterfaceSnapshot, and
+// this side must read exactly that key. A field added on one side only is the
+// #1961 no-transit hazard, so the key is asserted literally rather than
+// assumed to match.
+//
+// The `serde(default)` half matters just as much: a snapshot from a pre-#4983
+// Go binary carries no `stable_id` at all, and it must decode to the reserved
+// `0` "no identity carried" sentinel — never a garbage id that would name some
+// unrelated interface on the CLI side.
+#[test]
+fn interface_snapshot_reads_go_stable_id_key_4983() {
+    let with_id: InterfaceSnapshot =
+        serde_json::from_str(r#"{"name":"reth0.50","stable_id":3735928559}"#)
+            .expect("snapshot carrying stable_id must deserialize");
+    assert_eq!(
+        with_id.stable_id, 3_735_928_559,
+        "the Go side writes the key \"stable_id\"; reading any other name leaves every \
+         session with no ingress identity and silently degrades to the zone approximation"
+    );
+
+    let legacy: InterfaceSnapshot = serde_json::from_str(r#"{"name":"reth0.50"}"#)
+        .expect("a pre-#4983 snapshot with no stable_id must still deserialize");
+    assert_eq!(
+        legacy.stable_id, 0,
+        "an absent stable_id must decode to the 0 no-identity sentinel (rolling-upgrade safe)"
+    );
+}
