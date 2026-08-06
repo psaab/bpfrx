@@ -19,22 +19,25 @@ import (
 // the pre-pass and then fails after compileZones has mutated the host.
 var prePassShimDivergence = map[string]string{
 	"IsLoaded": "the fake returns true unconditionally; the shim promotes to " +
-		"(*Manager).IsLoaded. CompileConfig checks it at the very top " +
-		"(compiler.go), BEFORE newValidationResult and long before compileZones, " +
-		"so a production false aborts with 'dataplane not loaded' having mutated " +
-		"nothing. The fake being more permissive here cannot produce a " +
-		"half-applied host.",
+		"(*Manager).IsLoaded. Stronger than 'harmless': CompileConfig's single " +
+		"IsLoaded call is on the REAL dp, above the pre-pass, so the fake's " +
+		"answer is never consulted on a path that could half-apply.",
 	"GetPersistentNAT": "the fake returns a typed-nil *PersistentNATTable; the " +
 		"shim promotes to (*Manager).GetPersistentNAT, which returns the live " +
-		"m.PersistentNAT. Both compile-path call sites nil-guard " +
-		"(compiler_nat.go, in compileNAT), so the pre-pass SKIPS " +
-		"ClearPoolConfigs and SetPoolConfig while production runs them. Neither " +
-		"returns an error, so no failure can escape the pre-pass into the " +
-		"post-mutation window -- but the branch is genuinely unexercised by the " +
-		"pre-pass, and if either ever gains an error return this entry must go " +
-		"and the fake must model the table.",
-	"xpfValidationPass": "not a DataPlane method at all -- the marker " +
-		"isValidationPass keys on, defined only on the fake by construction.",
+		"m.PersistentNAT. Every compile-path call site nil-guards, so the " +
+		"pre-pass SKIPS the whole persistent-NAT block that production runs. " +
+		"No method it would have called can return an error -- asserted " +
+		"mechanically by TestPrePassPersistentNATCallsCannotFail_4960 rather " +
+		"than by naming them here, because naming them goes stale the moment a " +
+		"fourth call is added (#6894 r7 F8).\n\n" +
+		"The typed nil is load-bearing in the SAFE direction, which inverts the " +
+		"obvious 'improvement'. Teaching the fake to model a real table would " +
+		"make the pre-pass CLEAR and REPOPULATE the LIVE persistent-NAT table " +
+		"from a compile whose result is then discarded, blanking poolConfigs / " +
+		"natIPToPool for any concurrent LookupPool. Under master compileNAT ran " +
+		"once against the real dp; under the pre-pass it is skipped and then run " +
+		"once by the real pass, so the live table sees an identical sequence. Do " +
+		"not 'fix' this by modelling the table.",
 }
 
 // #6894 r5 F1: the pre-pass fake must not be MORE PERMISSIVE than the dataplane
@@ -113,6 +116,14 @@ func TestPrePassFakeIsNoMorePermissiveThanProduction_4960(t *testing.T) {
 		if shimDecl[name] {
 			continue
 		}
+		// #6894 r7 C2: xpfValidationPass is NOT a DataPlane method at all — it is
+		// the unexported marker isValidationPass keys on, defined only on the
+		// fake by construction. It never had a production counterpart, so it is
+		// not a fake-vs-shim divergence and does not belong in the allowlist on
+		// the same footing as the two that are.
+		if name == "xpfValidationPass" {
+			continue
+		}
 		if _, ok := prePassShimDivergence[name]; !ok {
 			undocumented = append(undocumented, name)
 		}
@@ -130,21 +141,39 @@ func TestPrePassFakeIsNoMorePermissiveThanProduction_4960(t *testing.T) {
 			undocumented)
 	}
 
-	// (3) The allowlist must stay MINIMAL: an entry that is in fact overridden
-	//     is stale, and a stale entry is how a future real divergence gets
-	//     waved through by a reason written for a different situation.
-	var stale []string
-	for name := range prePassShimDivergence {
-		if shimDecl[name] && fakeDecl[name] {
-			stale = append(stale, name)
+	// (3) The allowlist must stay MINIMAL, and every entry must correspond to a
+	//     REAL, CURRENTLY-DIVERGING method (#6894 r7 C2). The earlier check only
+	//     flagged an entry when BOTH types declared it, so a nonexistent name, a
+	//     non-interface name, or an empty rationale all passed silently —
+	//     measured: an arbitrary bogus exemption left this test green. That
+	//     matters because a name can be pre-added, and a later fake stub plus
+	//     compile call is then silently excused while production promotes the
+	//     fallible Manager implementation.
+	//
+	//     A legitimate entry is exactly: on the pre-pass CALL SURFACE (the fake
+	//     declares it) and NOT overridden by the shim (so it really does
+	//     promote).
+	var bogus []string
+	for name, why := range prePassShimDivergence {
+		switch {
+		case strings.TrimSpace(why) == "":
+			bogus = append(bogus, name+" (empty rationale — an exemption with no "+
+				"argument excuses nothing)")
+		case !fakeDecl[name]:
+			bogus = append(bogus, name+" (not on the pre-pass call surface: "+
+				"discardingDataPlane does not declare it, so there is no divergence "+
+				"to excuse and the entry can only serve to pre-excuse a future one)")
+		case shimDecl[name]:
+			bogus = append(bogus, name+" (the shim DOES override it now, so it no "+
+				"longer promotes — the exemption is stale)")
 		}
 	}
-	if len(stale) > 0 {
-		sort.Strings(stale)
-		t.Errorf("prePassShimDivergence lists %v, but the shim DOES override them "+
-			"now, so there is no divergence to excuse. Remove the entries — a "+
-			"stale exemption is a hole waiting for the next method to fall into "+
-			"it.", stale)
+	if len(bogus) > 0 {
+		sort.Strings(bogus)
+		t.Errorf("prePassShimDivergence has entries that do not correspond to a real, "+
+			"currently-diverging method:\n  %s\n\nEvery entry is a hole in "+
+			"\"the pre-pass sees what the real compile sees\". Remove it, or make it "+
+			"describe an actual divergence.", strings.Join(bogus, "\n  "))
 	}
 
 	// (4) The reflection half: every DataPlane method must be satisfied, and the
@@ -224,4 +253,107 @@ func returnsOnlyNilOrNothing(ret *ast.ReturnStmt) bool {
 		}
 	}
 	return true
+}
+
+// TestPrePassPersistentNATCallsCannotFail_4960 discharges the GetPersistentNAT
+// exemption's obligation MECHANICALLY (#6894 r7 F8).
+//
+// The exemption says the pre-pass may skip the persistent-NAT block because
+// nothing in it can fail. Stating that in prose under-described it: the
+// rationale named ClearPoolConfigs and SetPoolConfig and said "neither returns
+// an error" — a two-item word for a set that also contains RegisterNATIP, which
+// compileNAT calls twice. The conclusion held, but a reviewer re-checking the
+// premise would have verified two of three methods and never looked at the
+// third.
+//
+// Naming three would have the same decay, one call later. So derive the set:
+// find every method called on `pnat` inside compileNAT, then assert each of
+// those methods is declared with an EMPTY result list. A fourth call is covered
+// the moment it is written.
+//
+// It also discharges an obligation that previously had NO consumer at all. The
+// exemption said "if either ever gains an error return this entry must go" —
+// but both call sites are bare statements, so adding an error return compiles
+// silently at both and nothing observes the transition. This assertion fires on
+// the declaration, not on anyone remembering to check a result.
+func TestPrePassPersistentNATCallsCannotFail_4960(t *testing.T) {
+	fset := token.NewFileSet()
+	natFile, err := parser.ParseFile(fset, "compiler_nat.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse compiler_nat.go: %v", err)
+	}
+
+	called := map[string]bool{}
+	for _, d := range natFile.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "compileNAT" || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "pnat" {
+				called[sel.Sel.Name] = true
+			}
+			return true
+		})
+	}
+
+	// FLOOR: the exemption is only meaningful while compileNAT actually calls
+	// into the table. Zero found means the scan broke, not that the risk went
+	// away — and a silently empty scan would vouch for nothing.
+	if len(called) == 0 {
+		t.Fatal("found no pnat.* calls in compileNAT. Either the receiver was " +
+			"renamed or the block moved; this assertion is now blind and the " +
+			"GetPersistentNAT exemption is unbacked until it is taught the new shape")
+	}
+
+	natTable, err := parser.ParseFile(fset, "persistent_nat.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse persistent_nat.go: %v", err)
+	}
+	declared := map[string]*ast.FuncDecl{}
+	for _, d := range natTable.Decls {
+		if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv != nil {
+			declared[fn.Name.Name] = fn
+		}
+	}
+
+	var fallible, unresolved []string
+	for name := range called {
+		fn, ok := declared[name]
+		if !ok {
+			unresolved = append(unresolved, name)
+			continue
+		}
+		if fn.Type.Results != nil && len(fn.Type.Results.List) > 0 {
+			fallible = append(fallible, name)
+		}
+	}
+	sort.Strings(fallible)
+	sort.Strings(unresolved)
+
+	if len(unresolved) > 0 {
+		t.Errorf("compileNAT calls pnat.%v, which is not declared in "+
+			"persistent_nat.go — this assertion cannot vouch for a method it "+
+			"cannot find, so the GetPersistentNAT exemption is unbacked for it",
+			unresolved)
+	}
+	if len(fallible) > 0 {
+		t.Errorf("compileNAT calls pnat.%v, which now RETURN something.\n\n"+
+			"The GetPersistentNAT exemption in prePassShimDivergence rests on the "+
+			"pre-pass being able to skip the whole persistent-NAT block because "+
+			"nothing in it can fail. With a result to return, the real pass can "+
+			"now reject where the pre-pass silently did nothing — a config clears "+
+			"the pre-pass, compileZones mutates the host, and the real compileNAT "+
+			"then fails. That is the #4960 shape.\n\nRemove the exemption and make "+
+			"discardingDataPlane model the table, or establish that the new result "+
+			"cannot be non-nil for any config reaching it.", fallible)
+	}
 }

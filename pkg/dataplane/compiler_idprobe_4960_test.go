@@ -8,7 +8,16 @@ package dataplane
 // state outliving a single CompileResult -- a process-global, a counter on the
 // DataPlane, an interned table. A fresh result isolates state IN the result and
 // nothing else, so this is measured rather than reasoned about: run the
-// ID-assigning phases twice against the same dp and compare every ID map.
+// ID-assigning phases twice and compare every ID map.
+//
+// NOT "against the same dp" (#6894 r7 C5): compileIDsOnce constructs a FRESH
+// idProbeDP{} per invocation, so a per-instance counter on the dataplane would
+// reset between the two passes and both snapshots would compare equal. The
+// header used to claim the same-object shape while the implementation did the
+// opposite, with a later comment admitting the limitation — the file
+// contradicted itself. What this probe detects is state outliving a
+// CompileResult that is NOT per-dp-instance: a package-level sequence, an
+// interned table, a process global.
 //
 // The fake embeds the DataPlane interface (the userspace LegacyDataPlaneAdapter
 // idiom) so it satisfies all 130 methods while overriding only the 34 the pure

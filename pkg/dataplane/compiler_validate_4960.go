@@ -220,11 +220,20 @@ func validateBeforeMutate(cfg *config.Config) error {
 // would stay green (#6894 r2 F3). `validationPhases` was already
 // dp-parameterised for the same reason; this completes it.
 //
-// Any dp passed here MUST embed discardingDataPlane so it keeps the
-// xpfValidationPass marker (isValidationPass) and the never-write override
-// set. That is enforced rather than asked for (#6894 r3 F4): a dp without the
-// marker is rejected below, because a pre-pass running against a REAL
-// dataplane would program the live tables from a discarded compile.
+// Any dp passed here must keep the xpfValidationPass marker
+// (isValidationPass) and the never-write override set, so in practice it should
+// embed discardingDataPlane.
+//
+// What is actually checked is the MARKER, not the embedding (#6894 r7 C4). The
+// earlier wording said embedding "is enforced"; it is not. An in-package type
+// can implement `xpfValidationPass() bool { return true }` while delegating
+// SetAddressBookEntry to a LIVE dataplane, and this function would accept it
+// and program live state from a compile whose result is discarded. Production
+// is safe because the only caller constructs discardingDataPlane{} directly,
+// and the marker is unexported so the hole is in-package only — but that is a
+// property of the call site, not an enforced invariant, and claiming
+// enforcement here would let a future in-package caller believe it was
+// covered.
 func validateBeforeMutateWith(dp DataPlane, cfg *config.Config) error {
 	return validateBeforeMutateWithResult(dp, cfg, newValidationResult())
 }

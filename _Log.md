@@ -70651,3 +70651,95 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/compiler_validate_4960_test.go, pkg/dataplane/compiler.go,
   pkg/dataplane/README.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 7 — fold Codex's MERGE-NEEDS-MAJOR (C2-C5) plus the
+  re-gate's F8. Two Major findings; both are guards that did not bind what their
+  claims asserted. No production behaviour changes.
+  **C3 (Major) — the ordering claim was TRUE but UNBOUND, and this supersedes a
+  reading I was given as settled.** `validationPhases` says it lists phases "in
+  the same order CompileConfig runs them". Two guards both missed it: the
+  structural test compares the table against a hand-written `want` list (both
+  written together, so both can be wrong together — which is exactly what
+  happened when the zone-screen row sat eighth), and
+  `TestPrePassReportsTheSamePhaseProductionWould_4960` calls only
+  `validateBeforeMutate`, so CompileConfig is never on its path. Moving the
+  TABLE reds that test; swapping the PRODUCTION calls does not. Codex mutated
+  the thing the claim is about and it stayed green.
+  Added `TestPrePassRowOrderMatchesCompileConfig_4960`, which DERIVES the order
+  from CompileConfig's source by AST and compares it to the table, with a
+  per-row map to the production symbol whose position defines that row's
+  precedence (`zone screen references` -> compileZones, because the sweep is
+  hoisted to its top; `firewall filter protocols` -> compileFirewallFilters,
+  because the row runs a pure check production performs inside that phase).
+  Floors on both the derived count and the row count so a rename cannot make it
+  vacuous. PROVEN TO FIRE on Codex's own mutation — swapping compileNAT and
+  compileStaticNAT in CompileConfig: `row 4 is "nat" (production compileNAT),
+  but CompileConfig runs compileStaticNAT in that position`, `go vet` rc=0, and
+  no other ordering test reds, which is the point.
+  **C2 (Major) — allowlist minimality was far weaker than "proven to fire".**
+  The stale check was `shimDecl[name] && fakeDecl[name]`, so a NONEXISTENT
+  method, a non-interface name, an empty rationale, or a declaration that moved
+  outside either scanned file all passed silently. Measured: an arbitrary bogus
+  entry left the fidelity test green. That matters because a name can be
+  pre-added and a later fake stub plus compile call is then silently excused
+  while production promotes the fallible Manager implementation. Replaced with a
+  positive test of legitimacy — an entry must be on the pre-pass call surface
+  (the fake declares it) AND not overridden by the shim (so it really does
+  promote) AND carry a non-empty rationale. PROVEN TO FIRE on
+  `ClearNATPoolConfigs`, the pre-added nonexistent name Codex used.
+  Also per C2: `xpfValidationPass` is NOT a fake-vs-production DataPlane
+  divergence — it is the unexported marker, absent from the DataPlane interface
+  (verified) — so it is scoped out of the call-surface comparison rather than
+  sitting in the allowlist on the same footing as the two real entries.
+  **F8 — the exemption vouched for two methods; the pre-pass skips three.**
+  `compileNAT` makes FOUR `pnat.*` calls over THREE methods —
+  `ClearPoolConfigs`, `SetPoolConfig`, and `RegisterNATIP` (twice). The
+  rationale named two and said "neither returns an error", a two-item word for a
+  three-item set. The conclusion held (all three have empty result lists) but
+  the artifact under-described what it vouched for, and a reviewer re-checking
+  the premise would have verified two of three.
+  Took the self-maintaining fix rather than naming three:
+  `TestPrePassPersistentNATCallsCannotFail_4960` derives the method set by AST
+  from `compileNAT`'s `pnat.*` calls, then asserts each is declared in
+  persistent_nat.go with an EMPTY result list. A fourth call is covered the
+  moment it is written. It also discharges an obligation that previously had NO
+  consumer: the exemption said "if either ever gains an error return this entry
+  must go", but both call sites are bare statements, so adding a result compiles
+  silently at both and nothing observed the transition. This fires on the
+  DECLARATION. PROVEN TO FIRE: giving `RegisterNATIP` an error return reds it —
+  and note it caught the method the old prose never named.
+  Recorded in the exemption, because it inverts the reader's instinct: the typed
+  nil is load-bearing in the SAFE direction. Under master `compileNAT` ran once
+  against the real dp; under the pre-pass it is skipped and then run once by the
+  real pass, so the live table sees an identical sequence. Had the fake modelled
+  a real table, the PRE-PASS would have cleared and repopulated the LIVE
+  persistent-NAT table from a compile whose result is discarded, blanking
+  poolConfigs/natIPToPool for any concurrent LookupPool. The obvious
+  "improvement" is the harmful change — the same shape as the original F1
+  refutation.
+  **C4 (Medium) — a false enforcement claim.** `validateBeforeMutateWith` said
+  any dp "MUST embed discardingDataPlane ... That is enforced". It is not: the
+  implementation checks the unexported MARKER. An in-package type can return
+  true from `xpfValidationPass()` while delegating writes to a live dataplane
+  and would be accepted. Production is safe because the only caller constructs
+  `discardingDataPlane{}` directly and the marker is unexported, so the hole is
+  in-package — but that is a property of the call site, not an enforced
+  invariant. Claim corrected to say what is checked.
+  **C5 (Minor) — the ID-probe header contradicted its own implementation.** It
+  said the phases run "twice against the same dp"; `compileIDsOnce` constructs a
+  fresh `idProbeDP{}` per invocation, so a per-instance counter would reset and
+  both snapshots would compare equal. Header now states what the probe actually
+  detects: state outliving a CompileResult that is not per-dp-instance.
+  NOT RE-LITIGATED, per the brief: the F1 ParseCIDR refutation (independently
+  confirmed), the absence of function-pointer comparison in any guard, and the
+  probability work — `trials = 24` is extrapolation over a fixture whose eight
+  programmable zones plus one offender ARE asserted, so removing valid elements
+  fails deterministically. F3-probability closed.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/dataplane/compiler_prepass_order_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
