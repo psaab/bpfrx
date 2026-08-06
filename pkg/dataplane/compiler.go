@@ -78,13 +78,14 @@ type CompileResult struct {
 	tunnelIfindexes     map[int]bool // tunnel interfaces: XDP ingress only, no redirect
 	genericXDPIfindexes map[int]bool // interfaces that must use generic XDP only
 
-	// fallbackGenericIfindexes records surfaces whose NATIVE XDP attach failed
-	// and were re-attached in generic (skb) mode (#5275). attachUserspaceShimXDP
-	// treats that fallback as a warning, so without this the box reports itself
-	// armed with no record of which surfaces are on the slow path. Read by the
-	// observe-only arm-coverage proof (armproof.go); it does NOT reduce
-	// coverage — a generic shim still enforces policy.
-	fallbackGenericIfindexes map[int]bool
+	// unarmedSurfaces records attach points the CONFIG required but the
+	// compiler DECLINED to arm while still returning success (#5275) — the
+	// three soft skips in compiler_iface.go (interface not found, VLAN child
+	// create failed, administratively disabled). They are absent from
+	// pendingXDP, so without this record the observe-only arm-coverage proof
+	// (armproof.go) cannot tell a declined surface from one armed
+	// successfully. Appended lazily; nil is a valid empty state.
+	unarmedSurfaces []UnarmedSurface
 
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
@@ -163,6 +164,49 @@ func (r *CompileResult) cachedLinkByIndex(idx int) (netlink.Link, error) {
 	return link, nil
 }
 
+// peekLinkByIndex resolves idx WITHOUT writing to the result's link caches.
+//
+// cachedLinkByIndex memoises into linkIdxMap and linkCache. The observe-only
+// arm-coverage proof (armproof.go) must not mutate the CompileResult it is
+// proving: a diagnostic that writes into the object it observes cannot honestly
+// call itself observe-only, and a CompileResult reachable by another goroutine
+// would take a concurrent map write for a measurement nobody asked to persist.
+func (r *CompileResult) peekLinkByIndex(idx int) (netlink.Link, error) {
+	if r == nil {
+		return nil, fmt.Errorf("nil compile result")
+	}
+	if link, ok := r.linkIdxMap[idx]; ok {
+		return link, nil
+	}
+	return netlink.LinkByIndex(idx)
+}
+
+// recordUnarmedSurface notes an attach point the compiler declined to arm while
+// still returning success (#5275). See UnarmedSurface.
+//
+// One record per surface. mapZoneInterface runs once per ZONE REFERENCE, and
+// the per-phys dedup (st.attached) sits far below the soft skips, so an
+// interface named by two zones reaches the skip twice — and the count is the
+// deliverable of this phase, so a double count is a wrong number rather than a
+// cosmetic wart. A repeat sighting never downgrades the classification: if
+// either one could not prove the netdev down, the surface keeps the
+// conservative reading.
+func (r *CompileResult) recordUnarmedSurface(u UnarmedSurface) {
+	if r == nil {
+		return
+	}
+	for i := range r.unarmedSurfaces {
+		if r.unarmedSurfaces[i].Name != u.Name || r.unarmedSurfaces[i].Ifindex != u.Ifindex {
+			continue
+		}
+		if u.StillForwarding && !r.unarmedSurfaces[i].StillForwarding {
+			r.unarmedSurfaces[i] = u
+		}
+		return
+	}
+	r.unarmedSurfaces = append(r.unarmedSurfaces, u)
+}
+
 // assignZoneIDs populates result.ZoneIDs with a STABLE, name-derived id for
 // every configured security zone (#3075). The id is config.StableZoneID(name)
 // — a pure FNV-1a fold of the zone NAME into [1, ZoneIDReservedMin-1], never a
@@ -192,23 +236,22 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	}
 
 	result := &CompileResult{
-		ZoneIDs:                  make(map[string]uint16),
-		ScreenIDs:                make(map[string]uint16),
-		AddrIDs:                  make(map[string]uint32),
-		AppIDs:                   make(map[string]uint32),
-		PoolIDs:                  make(map[string]uint8),
-		implicitSets:             make(map[string]uint32),
-		NATCounterIDs:            make(map[string]uint32),
-		FilterSpans:              make(map[string]FilterCounterSpan),
-		Lo0FilterV4:              0xFFFFFFFF, // sentinel: no lo0 filter
-		Lo0FilterV6:              0xFFFFFFFF,
-		ifCache:                  make(map[string]*net.Interface),
-		linkCache:                make(map[string]netlink.Link),
-		linkIdxMap:               make(map[int]netlink.Link),
-		rxVlanOffCache:           make(map[string]bool),
-		ethtoolApplied:           make(map[string]bool),
-		genericXDPIfindexes:      make(map[int]bool),
-		fallbackGenericIfindexes: make(map[int]bool),
+		ZoneIDs:             make(map[string]uint16),
+		ScreenIDs:           make(map[string]uint16),
+		AddrIDs:             make(map[string]uint32),
+		AppIDs:              make(map[string]uint32),
+		PoolIDs:             make(map[string]uint8),
+		implicitSets:        make(map[string]uint32),
+		NATCounterIDs:       make(map[string]uint32),
+		FilterSpans:         make(map[string]FilterCounterSpan),
+		Lo0FilterV4:         0xFFFFFFFF, // sentinel: no lo0 filter
+		Lo0FilterV6:         0xFFFFFFFF,
+		ifCache:             make(map[string]*net.Interface),
+		linkCache:           make(map[string]netlink.Link),
+		linkIdxMap:          make(map[int]netlink.Link),
+		rxVlanOffCache:      make(map[string]bool),
+		ethtoolApplied:      make(map[string]bool),
+		genericXDPIfindexes: make(map[int]bool),
 	}
 
 	// Phase 1: Assign STABLE zone IDs (#3075).

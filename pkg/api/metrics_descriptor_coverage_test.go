@@ -527,6 +527,9 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 	names := gatheredNames(mfs)
 	want := []string{
 		"xpf_packets_total",                                                // collectGlobalCounters
+		"xpf_zone_packets_total",                                           // collectZoneCounters (#3651)
+		"xpf_zone_bytes_total",                                             // collectZoneCounters (#3651)
+		"xpf_zone_counters_unpopulated_zones",                              // collectZoneCounters (#3651)
 		"xpf_policy_hits_total",                                            // collectPolicyCounters
 		"xpf_filter_hits_total",                                            // collectFilterCounters
 		"xpf_nat_pool_total_ports",                                         // collectNATPoolMetrics

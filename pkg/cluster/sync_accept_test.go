@@ -31,7 +31,7 @@ func TestSyncHandshakeTimeoutIsShort(t *testing.T) {
 // never accepted and B's read times out.
 func TestAcceptLoopHandshakeDoesNotBlockOthers(t *testing.T) {
 	key := []byte("shared-control-link-secret-key")
-	s := newAuthSync(t, key, false)
+	s := newAuthSync(t, key)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

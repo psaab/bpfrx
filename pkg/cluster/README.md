@@ -183,6 +183,193 @@ Two defenses, both fail-safe rather than manufacturing a false winner:
   conflict). Yielding both nodes to SECONDARY produces a clean, obvious,
   loudly-logged outage instead of subtle duplicate-address corruption.
 
+## Session-sync fail-closed authentication (#5078)
+
+The session-sync TCP stream (`sync_auth.go`) authenticates with the SAME
+control-link PSK. Until #5078, a node that HAD a key still **dual-accepted** an
+unkeyed or legacy peer on first contact: `syncAuthDecision` granted a grace
+whenever the sticky downgrade guard (`peerAuthSeen`) had not yet armed.
+
+That grace was not a compatibility affordance, it was an unauthenticated
+**active** bypass, and it did not depend on the reflection weakness this issue
+also tracks:
+
+- the window is open on **every fresh boot** — "before the guard arms" is
+  exactly when a node starts;
+- an admitted peer's first frame was executed **before** the connection was
+  installed (`handleNewConnection`), and `syncMsgFence` on that path reaches
+  `OnFenceReceived`, which disables every routing group;
+- the admitted connection then **displaces** the legitimate peer's connection,
+  and arming the guard later does not evict it.
+
+So a PSK-less host reaching the fabric could fence the node and hold the peer
+slot. Two changes close it:
+
+- **A keyed node requires an authenticated peer.** `syncAuthDecision` no longer
+  consults `peerAuthSeen` for the unkeyed-peer branch — it cannot, since the
+  whole exposure is the pre-arm window. An unkeyed/legacy peer is rejected.
+- **The pre-admission frame mechanism is DELETED, not reordered.** A legacy
+  peer's first frame used to be carried out of the handshake as a
+  `pendingFrame` and executed BEFORE `installConn` — `syncMsgFence` on that
+  path reaches `OnFenceReceived` and disables every routing group, for a peer
+  that had proven nothing. Its only producer sat behind the dual-accept grace,
+  so once that grace is gone the arm can never accept and the mechanism is
+  unreachable. It is removed rather than left dormant: unreachable code that
+  mutates cluster state before admission is one edit away from being live
+  again. There is now no path by which an unadmitted connection executes
+  anything.
+
+**No relaxation knob, deliberately** — but read the rollout constraint below
+before concluding that is easy.
+
+An earlier draft shipped a bounded `authentication-migration-window`. It had to
+bound a connection's LIFETIME rather than just its admission (an admitted
+pass-through stream outlived the deadline and could still fence the node), it
+had to stop an admitted peer re-arming it through config-sync, and its
+in-memory arming meant a crash loop granted a fresh interval on every restart.
+A relaxation needing three guards of its own does not belong inside the fix that
+closes the hole, so it was removed.
+
+What remains is the property a security appliance should have: **for a
+connection established AFTER keying, a node must possess the key to join a
+keyed cluster.**
+
+That qualifier is not pedantry. Verification is gated per-connection on
+`ac.authed()`, fixed at handshake time, so a connection established BEFORE the
+key was committed stays unauthenticated for its whole lifetime and keeps having
+its frames accepted with no HMAC. See "Rolling it onto a live unkeyed cluster"
+below for the operator consequence — the restart there is not optional — and
+**#6628** for the open residual — it covers any auth-key CHANGE and subsumes
+the narrower unkeyed→keyed case. It is PRE-EXISTING, not introduced by #5078.
+
+### Rollout: a secondary whose gate is ARMED cannot be keyed locally
+
+Three earlier revisions of this document got this wrong in three directions —
+first claiming an unavoidable deadlock, then claiming the operator can simply
+"commit the key locally on each node", then claiming the gate covers every entry
+point unconditionally. The mechanism, stated with its precondition:
+
+- `applyRG0OwnershipTransition` calls `store.SetClusterReadOnly(true)` on
+  `StateSecondary` / `StateSecondaryHold` (`pkg/daemon/daemon_ha.go`). It is
+  driven by an RG0 **transition event** and by nothing else — there is no
+  startup arming and no reconcile that re-derives the flag.
+- Once armed, `EnterConfigureSession` returns `ErrClusterReadOnly` before doing
+  anything else (`pkg/configstore/store_lock.go`), whichever entry point the
+  operator used.
+
+So on a secondary whose gate is armed, config mode cannot be opened at all —
+this is not "the local commit gets overwritten by sync", and **config-sync is
+that node's only writer** (`TestClusterReadOnly_SyncApplyBypassesGate` pins that
+the HA-sync ingress path bypasses the gate).
+
+**But arming is not universal, so do not read the heading as unconditional.** A
+node that cold-starts, seats as RG0 secondary and never transitions never
+reaches that call, and `Store.clusterReadOnly` starts false — so its store is
+writable. REST enters a configure session with no RG0 check of its own
+(`pkg/api/config.go`), where gRPC guards on `IsLocalPrimary(0)` and the
+interactive CLI has its own check. That gap is **#6890**; the dropped-event
+variant is **#6889**. Both are OPEN and neither is scheduled — do not read a
+fix date into this sentence. The design intent is what this
+section describes; treat the gap as a bug to avoid, never as a rollout
+procedure.
+
+**Performable procedures:**
+
+1. **At provisioning / console, before the cluster forms.** `clusterReadOnly`
+   zero-values to `false`, so each node can be keyed independently before it
+   ever seats as secondary. This is the recommended path.
+2. **On a live cluster: commit on the PRIMARY while sync is connected.** The
+   established connection carries the key to the secondary. This works only
+   because committing the key does not restart cluster comms — the auth key is
+   deliberately absent from `clusterTransportKey`, pinned by
+   `TestAuthKeyChangeDoesNotRestartClusterComms_5078`. Do not add it there; see
+   that test for why it would deadlock with no self-recovery. ("Deadlock", not
+   "permanent deadlock" — an operator can still break it out of band, by the
+   controlled promotion in row 3 or, on a node whose gate was never armed, by
+   the #6890 hole. What the hypothetical destroys is the cluster's ability to
+   converge on its own.) The step-20 decision
+   that must not fire on a key change is pinned separately by
+   `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` — the struct test alone
+   does not cover the call site.
+
+   **Procedure 2 carries the risk it is trying to avoid.** The key reaches the
+   secondary asynchronously, so if the session-sync connection drops in the
+   window between the primary committing and the secondary applying, you land in
+   exactly the keyed-primary / unkeyed-secondary state below — the now-keyed
+   primary rejects the unkeyed peer's reconnect, and the key can never be
+   delivered. Prefer procedure 1. If you must use procedure 2, confirm sync is
+   connected immediately before committing (`show chassis cluster status`) and
+   verify the secondary applied the key immediately after; treat a drop in that
+   window as requiring the recovery below.
+
+**Recovery: no path is unconditional, and the one you can plan around costs a
+controlled outage.** Three earlier revisions of this section got this wrong in
+three different directions — one proposed a primary-only rekey and labelled it
+UNVERIFIED, the next said no recovery existed at all, the third said exactly one
+path works. Each replaced a hedge with an absolute and each was refuted. So the
+three candidate paths are stated individually, with their preconditions, rather
+than summarised into a verdict:
+
+1. **Primary-only rekey — CLOSED.** "Remove the key on the primary, let the peer
+   reconnect unkeyed, config-sync pushes, re-add the key" cannot start: an
+   unkeyed `chassis cluster` is what the commit gate rejects, so `delete chassis
+   cluster authentication-key; commit` is refused by
+   `validateClusterAuthKeyStrict`. This document says the same thing under "Do
+   not try to return to dual-accept by clearing the key first". Tracked as
+   **#6630**.
+2. **Console on the seated secondary — CLOSED only where the gate is actually
+   ARMED.** The gate is on the **config store**, not the transport, so *when it
+   is armed* `EnterConfigureSession` returns `ErrClusterReadOnly` regardless of
+   which entry point the operator used — console, remote CLI, gRPC or REST.
+   Arming is not automatic, and that is the whole caveat: `SetClusterReadOnly(true)`
+   is reached only from the RG0 **transition** handler, so a node that cold-starts,
+   seats as secondary and never transitions still has a **writable** store. On
+   such a node this row is OPEN, and REST is the way in — `pkg/api/config.go`
+   enters a configure session with no RG0 check of its own, where the interactive
+   CLI (`pkg/cli/cli_dispatch.go`) and gRPC (`IsLocalPrimary(0)`) each have one.
+   Tracked as **#6890**; the dropped-event variant of the same unarmed-gate
+   failure is **#6889**. Do not treat this row as CLOSED on a node whose RG0
+   state you have not checked.
+3. **Controlled RG0 promotion — the only path you can PLAN for, and it is
+   CONDITIONAL.** ("Plan for", not "that works": row 2 is open on an unarmed
+   node, so a path exists there too — it is just a bug you must not build a
+   procedure on.) Stop `xpfd` on the keyed primary; *if* the secondary wins the
+   election, `applyRG0OwnershipTransition(StatePrimary)` calls
+   `d.store.SetClusterReadOnly(false)` and the now-primary node accepts a local
+   commit of the same key. Restart the old primary and the pair converges keyed.
+   Same stop-one-node shape documented above for `configuration-synchronize`.
+
+   **Each "if" is a real precondition, not a formality:**
+   - the secondary must be eligible — `election.go` returns early on
+     `m.kernelUpgradeHold`, and promotes only when `rg.Weight > 0`. Zero weight
+     or an active upgrade hold and no promotion happens at all;
+   - the promotion **event must be delivered**. `Manager.sendEvent` is
+     non-blocking and drops on a full channel, and the dropped-event fallback
+     does not reconcile `Store.ClusterReadOnly` — so the manager can report RG0
+     primary while the store stays read-only. Tracked as **#6889**.
+
+   (The unarmed-gate case from row 2 — **#6890** — is *not* a precondition here.
+   It does not block promotion; it means the gate you are trying to clear was
+   never closed on that node, so the recovery was never needed there. It is
+   listed under row 2, where it belongs, rather than padding this list.)
+
+   So do not read this row as a procedure. It is the path you would design
+   around; whether it is available on a given cluster at a given moment depends
+   on both preconditions above.
+
+So the recovery you can actually plan for is a deliberate cluster failover —
+you have turned a config commit into an outage. (A node that happens to fall in
+the row-2 unarmed-gate case is writable without any of that, but you cannot
+design a procedure around a gap that is merely FILED.) That is why committing
+`authentication-key` must never restart cluster comms: the fallback is
+CONDITIONAL on everything row 3 lists, and even when available it is one you
+would have to schedule. Do not read "a fallback exists" off this sentence —
+that is exactly the absolute this section keeps regrowing.
+`TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
+`TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` pin the no-restart
+behaviour; if either reds, the change under your hand is the one that forces
+that outage.
+
 ## Control-channel authentication (#4107, PR-A)
 
 The cluster heartbeat drives election: `handlePeerHeartbeat` rebuilds
@@ -394,26 +581,37 @@ connection is authenticated, then seals every subsequent frame.
   Chose a signed per-frame trailer over a bare sequence because a sequence
   without a MAC is forgeable (an on-path attacker just uses seq+1); the MAC
   cost is negligible at realistic session-sync rates.
-- **Dual-accept (rolling upgrade).** A node with no key never handshakes
-  and is byte-for-byte a legacy peer; a keyed node that sees a
-  legacy/unkeyed peer (no HELLO, or `keyed=0`) negotiates
-  UNAUTHENTICATED — the stream stays legacy-compatible (no brick). The
-  legacy peer's first real frame, consumed by the handshake read, is
-  preserved as a `pendingFrame` and processed before the receive loop
-  starts. Enforcement engages only once BOTH nodes are keyed and signing —
-  and, for an ALREADY-ESTABLISHED connection, only after it is
-  re-established, because the handshake result is fixed at connect and
-  committing a key does not restart cluster comms (#6628; see "Operating
-  the control-link PSK" below).
-- **Downgrade-guard (`syncAuthDecision`, mirrors `heartbeatAuthDecision`).**
-  Once the peer has authenticated on the sync channel (sticky
-  `syncAuthedEver`) OR the heartbeat channel (`HeartbeatPeerAuthSeen`, arms
-  within ~200ms of a keyed peer coming up), a later UNAUTHENTICATED
-  connection from it is REJECTED — a downgrade to cleartext once both nodes
-  are known-keyed is an attack. Consulting the heartbeat closes the window
-  after a keyed node restarts before the first sync auth.
+- **Dual-accept, UNKEYED SIDE ONLY (as of #5078).** A node with no key never
+  handshakes and is byte-for-byte a legacy peer, so an unkeyed node still
+  accepts anything. A KEYED node does **not** dual-accept: it rejects a
+  legacy/unkeyed peer (no HELLO, or `keyed=0`) outright, with no
+  first-contact grace and no migration window — see "Session-sync
+  fail-closed authentication (#5078)" above, which supersedes the
+  paragraph this bullet used to contain. The `pendingFrame` mechanism that
+  carried a legacy peer's first frame out of the handshake is **deleted**,
+  not merely bypassed: with no accepting arm left it was unreachable, and
+  it executed that frame BEFORE the connection was admitted. Enforcement
+  still engages only once BOTH nodes are keyed and signing — and, for an
+  ALREADY-ESTABLISHED connection, only after it is re-established, because
+  the handshake result is fixed at connect and committing a key does not
+  restart cluster comms (#6628, pinned by
+  `TestAuthKeyChangeDoesNotRestartClusterComms_5078`; see "Operating the
+  control-link PSK" below).
+- **No sync-side downgrade-guard (removed in #5078).** There used to be one
+  here: once the peer had authenticated on the sync channel (sticky
+  `syncAuthedEver`) or the heartbeat channel, a later UNAUTHENTICATED
+  connection was rejected. A guard of that shape only matters where an
+  unkeyed peer would otherwise be ADMITTED, and on a keyed node none ever
+  is, so it became unreachable — `syncPeerAuthSeen` ended with zero callers
+  and `syncAuthedEver` write-only — and was deleted along with the
+  `HeartbeatPeerAuthSeen()` requirement on `SyncAuthProvider`. The **#4107
+  heartbeat downgrade-guard is separate state** (`heartbeatAuthDecision`
+  over `heartbeatAuthState.peerAuthenticated`) and is unchanged, as is the
+  #4357 fabric guard that arms off it via `Manager.HeartbeatPeerAuthSeen`
+  — that method is still exported and still consumed, just no longer by
+  this interface.
 - **Wiring.** `SessionSync.SetAuthProvider(*Manager)` (`daemon_ha_sync.go`)
-  supplies both `ControlLinkAuthKey()` and `HeartbeatPeerAuthSeen()`. No new
+  supplies `ControlLinkAuthKey()`. No new
   config leaf — the same `set chassis cluster authentication-key` secret
   authenticates the heartbeat (PR-A), the fabric gRPC (PR-B/#4357), and now
   the session-sync stream. LOW severity (matches Juniper's own
@@ -573,7 +771,11 @@ them unchanged — so neither is an example of this order; you have to
 remove the line from your own config first. On a new build or during a
 maintenance window you were taking anyway, this costs nothing.
 
-*On a LIVE pair the delete cannot be done without the sync undoing it.*
+*On a LIVE pair whose secondary gate is ARMED, the delete cannot be done
+without the sync undoing it.* (Everything in this subsection assumes an armed
+gate; on the row-2 unarmed node the second delete needs no promotion at all.
+That is the #6890 hole, not a supported route — see the Recovery section. This
+subsection does not restate the caveat again.)
 `configuration-synchronize` is committed from the RG0 primary. Delete it
 there and the SECONDARY still has it enabled — so the moment that secondary
 is promoted, reconciliation (`daemon_ha.go:444`) sees sync enabled in its
@@ -582,7 +784,7 @@ former primary (`daemon_ha_sync.go:462`), restoring the very line you just
 deleted. You cannot simply "delete on both nodes": the second delete
 requires a promotion, and the promotion re-adds the first.
 
-There is ONE safe order on a live pair, and it is a controlled
+There is one safe order you can RELY on for a live pair, and it is a controlled
 single-node outage — not a two-command sequence, and NOT a link cut:
 
 ```
@@ -636,15 +838,25 @@ A physical cut also races disconnect detection, so a promotion issued
 immediately after it can still find the session established.
 
 Once BOTH nodes have sync disabled, ongoing config management is manual and
-paired: only the RG0 primary is writable, so every change is a controlled
-RG0 promotion, an edit, verification on both stores, and a failback. That
+paired: treat only the RG0 primary as writable (that is the intent; see the
+#6890 caveat above for where the gate is not actually armed), so every change is
+a controlled RG0 promotion, an edit, verification on both stores, and a
+failback. That
 cost is the reason #6629 (redaction or transport encryption for the
 config-sync payload) is the real fix, and why this is documented as a
 constraint rather than recommended practice.
 
 ### Rolling it onto a live unkeyed cluster
 
-Dual-accept makes the forward direction non-disruptive:
+**STALE — dual-accept was removed by #5078; the sequence below no longer works
+as written.** It is kept for the shape of the problem, not as a procedure. Step 2
+asks the operator to commit the key on the *other* node: on an RG0 secondary
+whose read-only gate is armed that returns `ErrClusterReadOnly`, and if sync
+drops before step 2 the keyed side rejects the unkeyed reconnect outright. See
+the "Recovery" discussion above for what is actually available and under which
+preconditions. Rewriting this section is tracked as **#6881**.
+
+Dual-accept made the forward direction non-disruptive:
 
 1. Set the key on one node and commit. It now signs; the unkeyed peer has no
    key, so it accepts everything, and the keyed node has not armed

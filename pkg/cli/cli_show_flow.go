@@ -342,7 +342,10 @@ func (c *CLI) showFlowSession(args []string) error {
 			return
 		}
 
-		polName := policyNames[val.PolicyID]
+		// #4626: reserved ids (0 = no policy admitted this session,
+		// DefaultPolicySentinelID = implicit default) must not be resolved
+		// through the compiled map — id 0 IS the first configured policy there.
+		polName := dataplane.SessionPolicyName(policyNames, val.PolicyID)
 		if polName == "" {
 			polName = fmt.Sprintf("%d", val.PolicyID)
 		}
@@ -469,7 +472,10 @@ func (c *CLI) showFlowSession(args []string) error {
 			return
 		}
 
-		polName := policyNames[val.PolicyID]
+		// #4626: reserved ids (0 = no policy admitted this session,
+		// DefaultPolicySentinelID = implicit default) must not be resolved
+		// through the compiled map — id 0 IS the first configured policy there.
+		polName := dataplane.SessionPolicyName(policyNames, val.PolicyID)
 		if polName == "" {
 			polName = fmt.Sprintf("%d", val.PolicyID)
 		}

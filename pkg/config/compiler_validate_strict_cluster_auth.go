@@ -55,8 +55,12 @@ import (
 // or peer-synced unkeyed config still BOOTS with a warning (#1960 no-brick).
 // That is what preserves the IN-PLACE upgrade path — a cluster that was unkeyed
 // before the upgrade keeps its config DB, loads it through CompileConfigLenient,
-// comes up, and keeps forwarding. The dual-accept grace in all three mechanisms
-// means a key can then be rolled out one node at a time.
+// comes up, and keeps forwarding. The heartbeat and fabric gRPC dual-accept
+// grace means a key can then be rolled out one node at a time without dropping
+// the cluster. SESSION SYNC is the exception: #5078 removed its dual-accept, so
+// a keyed node rejects an unkeyed peer and session sync stays DOWN until both
+// nodes are keyed AND both have restarted. pkg/cluster/README.md -> "Rolling it
+// onto a live unkeyed cluster" marks the old sequence STALE (#6881).
 //
 // The key is compared only for emptiness and is never echoed into the error —
 // the whole point of Secret (compiler_system.go) is that it never reaches a log

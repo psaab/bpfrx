@@ -196,7 +196,30 @@ deployment. A required surface resolves to exactly one of:
   - **uncovered** — anything else, including a readback that failed. Unarmed.
 
 See `pkg/dataplane/armproof.go` (observe-only implementation + rationale) and
-`armproof_5275_test.go` (both decisions pinned).
+`armproof_5275_test.go` (both decisions pinned). **That implementation is the
+PRELIMINARY stage, not the FINAL one** — it runs inside `CompileUserspaceShim`,
+before networkd, the RETH MAC link-cycle and the AF_XDP rebind, so the
+divergence rate it emits is a LOWER BOUND on what the FINAL-stage gate will see.
+It is phase PR0 in §10, not PR1.
+
+A **fourth** kind fell out of implementing it, which the classification above
+still misses: **skipped**. FOUR soft skips drop a configured attach point while
+the compile SUCCEEDS, so a surface the compiler declined to arm is
+indistinguishable from one it armed — three per-interface in `mapZoneInterface`
+(interface not found, VLAN child create failed, administratively disabled) and
+one per-ZONE in `programZoneMaps` (`if zone == nil { continue }`, reachable on
+the tolerant and HA-peer-sync config paths, which drops every interface in that
+zone and cannot be resolved to per-interface coverage because `zone.Interfaces`
+is the deref the guard prevents).
+
+The sharp variant is `set interfaces <if> disable` whose `netlink.LinkSetDown`
+then fails (a `slog.Warn` and nothing else): the netdev stays UP, is still
+address-reconciled, is still in a zone, is still forwarded through by the
+kernel, and carries no XDP. **The gating PR must treat that as uncovered**; a
+skip whose netdev genuinely went down is a legitimate operator action and must
+not fail the box closed. PR0 reports `skipped` for everything else — including
+the nil zone — so PR1 inherits an explicit, unresolved decision rather than a
+silent zero. `WouldGate` in PR0 deliberately excludes `skipped`.
 
 **Coverage proof ingredients are PER-STAGE (§13-D1; readback-fail ⇒ unarmed) —
 NOT identical across both stages:** the PRELIMINARY stage proves only the attach-point
@@ -340,6 +363,19 @@ gated machinery — the half-start gap).
 Codex r4 is right that "multi-PR" is honest but "each PR independently correct" was
 not. Corrected phasing, each a real architecture increment gated by smoke:
 
+- **PR0 — pre-PR1 MEASUREMENT (observe-only), gates nothing:** the coverage
+  classification of §5 implemented as a pure diagnostic, run at the PRELIMINARY
+  attachment stage inside `CompileUserspaceShim`, reporting what a gating build
+  would have decided (`WouldGate`) and that nothing was withheld (`DidGate`). No
+  arm-state machine, no facade, no barrier, no apply gate — none of PR1's
+  architecture. It exists because "armed" today is materially weaker than the
+  proof PR1 will enforce (`attachUserspaceShimXDP` treats a NATIVE attach failure
+  as a warning and re-attaches generic; iavf SR-IOV VFs have no native XDP at
+  all), so the divergence rate has to be known before the gate is load-bearing.
+  What it measures is the PRELIMINARY-stage rate — a lower bound on the FINAL
+  stage's, which PR1 owns. `pkg/dataplane/armproof.go`, shipped as #6864.
+  This phase was NOT in the original plan; the word "observe" appears nowhere
+  else in this document, and PR1 below is a gate, not a diagnostic.
 - **PR1 — foundation (standalone), INERT under cluster config:** the daemon-owned
   arm-state machine (§2), the revocable sealed-until-armed runtime facade + quarantine
   + hardened teardown (§7), the bridge+flowtable+FORWARD barrier (§6), deferred
@@ -460,6 +496,19 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   (ID/tag) per required surface; *final* (after the last rebind/reapply) proves the
   candidate digest + reconciled helper generation + ALL registered/armed/ready
   bindings. Only the FINAL proof triggers release.
+
+  **Delivered so far (PR1, observe-only).** `pkg/dataplane/armproof.go` implements
+  the INVENTORY half. It *reports* the program instance each tracked `bpf_link`
+  carries but does **not** compare it against `m.programs[m.XDPEntryProgram()]`,
+  and does not check `Info.XDP().Ifindex`. That is deliberate for a diagnostic:
+  the mismatch is not a state this tree can produce (every writer of
+  `m.xdpLinks` installs the entry program, `m.programs` has one shim writer
+  post-#1476, and nothing outside the package can reach a tracked link), so the
+  comparison would measure nothing while adding a new way to report a false
+  `uncovered` — an unreadable expected program. **The ID/tag comparison lands
+  with the GATING PR**, which must also resolve the direction PR1 has no
+  evidence for: whether an unreadable expected program fails closed. Residual
+  written down at `xdpLinkProgramID` and in `pkg/dataplane/README.md`.
 
 - **D2 — networkd link/address phase split (Codex r6 §2; `pkg/networkd` now in the
   blast radius).** `networkd.Apply` writes link+address and reloads (can bounce the
