@@ -66440,3 +66440,41 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-08-06 — #5798: the RG-transition residual's bound is IDLE, not absolute
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct the disclosed window on a security residual (comment-only)
+- **File(s)**: `userspace-dp/src/nat64.rs`
+
+The hostile gate found the residual paragraph this PR added understates its own
+window. It said a post-RG-transition fragment can inherit a stale permit "for up
+to the ~2s association TTL", "bounded here by a far shorter lifetime" than the
+session table's equivalent.
+
+`Nat64FragAssoc::lookup` re-stamps `deadline_ns` on every hit, so 2s is an IDLE
+timeout. A stream of non-first fragments sharing the same
+(src, dst, ident, protocol, authority) spaced under 2s renews the association
+indefinitely — and the Fragment Identification is attacker-chosen, so producing
+such a stream is trivial. The real window is "as long as fragments of that
+datagram keep arriving". For a legitimate sender, which uses a fresh
+Identification per datagram, it genuinely is ~2s, which is presumably where the
+figure came from.
+
+Refresh-on-hit is PRE-EXISTING (verified on `origin/master`, from #2562/#5624).
+This PR did not introduce the behaviour — it introduced the sentence that
+mis-bounds it. That distinction is why this is a doc fix and not a runtime one.
+
+The gate also confirmed nothing else bounds it: `build_generation` does not move
+on an RG transition (it is a CONFIG fence and the residual is about runtime HA
+state), eviction lives in `install` so a pure-consult stream never triggers it,
+`retain` only prunes already-expired entries, and the input filter this PR runs
+on a hit is the INTERFACE filter — it does not re-apply zone policy or the
+owner-RG gate. All four are now stated at the site.
+
+This matters more than a typical comment fix: the residual was disclosed
+precisely so a later reader could judge the risk, and the stated ceiling
+understated it by however long an attacker chooses to keep sending.
+
+Comment-only: every changed line is `///` or blank, verified by stripping the
+diff markers and filtering. `cargo check` exit 0.

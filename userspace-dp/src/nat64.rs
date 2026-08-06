@@ -425,9 +425,27 @@ pub(crate) struct FragAuthority {
     /// an RG that stops forwarding locally between a first and a non-first
     /// fragment leaves the association keyed on a stamp the post-gate
     /// enforcement would now ignore, so the non-first fragment can inherit a
-    /// permit for up to the ~2s association TTL. That is the same
+    /// permit the current enforcement would refuse.
+    ///
+    /// Be precise about the WINDOW, because the obvious reading is wrong and an
+    /// earlier revision of this paragraph got it wrong. `NAT64_FRAG_TTL_NS` is
+    /// 2s, but `Nat64FragAssoc::lookup` RE-STAMPS `deadline_ns` on every hit
+    /// (pre-existing, #2562/#5624 — not introduced here), so it is an IDLE
+    /// timeout, not an absolute lifetime. A stream of non-first fragments
+    /// carrying the same (src, dst, ident, protocol, authority) spaced under
+    /// 2s renews the association indefinitely, and the Fragment Identification
+    /// is attacker-chosen. So the window is "as long as fragments of that
+    /// datagram keep arriving", NOT ~2s. For a legitimate sender, which uses a
+    /// fresh Identification per datagram, it really is ~2s — which is where
+    /// that number came from.
+    ///
+    /// Nothing else bounds it: the config fence (`build_generation`) does not
+    /// move on an RG transition, eviction lives in `install` so a pure-consult
+    /// stream never triggers it, `retain` only prunes already-expired entries,
+    /// and the input filter this PR runs on a hit is the INTERFACE filter — it
+    /// does not re-apply zone policy or the owner-RG gate. This is the same
     /// already-admitted-flow property the flow-backed session table has across
-    /// an RG transition, bounded here by a far shorter lifetime.
+    /// an RG transition; do not describe it as bounded by a shorter lifetime.
     pub(crate) ingress_zone: u16,
     /// Routing instance / VRF the ingress resolves in.
     pub(crate) routing_table: u32,
