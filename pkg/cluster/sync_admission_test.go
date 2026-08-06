@@ -142,7 +142,7 @@ func TestPreAuthDefersBufferSizingUntilAuth(t *testing.T) {
 	defer func() { configureConnFn = orig }()
 
 	// Keyed node — a handshake is attempted (and here, forced to fail).
-	s := newAuthSync(t, []byte("psk-secret-key-for-5303-deferral-test"), false)
+	s := newAuthSync(t, []byte("psk-secret-key-for-5303-deferral-test"))
 
 	cli, srv := net.Pipe()
 	// Mirror the accept path: register the inbound connection, then run setup.
@@ -187,7 +187,7 @@ func TestPreAuthDefersBufferSizingUntilAuth(t *testing.T) {
 // RED on revert: removing the s.closeSetupConns() call from Stop() leaves the
 // in-flight setup connections open and this assertion goes RED.
 func TestStopClosesInFlightSetupConns(t *testing.T) {
-	s := newAuthSync(t, nil, false)
+	s := newAuthSync(t, nil)
 
 	conns := make([]*preAuthTestConn, 0, 3)
 	for i := 0; i < 3; i++ {
