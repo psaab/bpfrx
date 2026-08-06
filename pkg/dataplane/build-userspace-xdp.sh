@@ -119,10 +119,14 @@ trap 'rm -f "${SHIMVERIFY}"' EXIT
 ) || fail "failed to build cmd/shimverify"
 
 run_verifier() {
+	# XPF_SHIM_ALLOW_LOW_HEADROOM (#4555) must survive the sudo hop —
+	# sudo scrubs the environment, so pass it explicitly via `env` or the
+	# documented override silently does nothing.
+	local allow_low="${XPF_SHIM_ALLOW_LOW_HEADROOM:-0}"
 	if [[ "$(id -u)" -eq 0 ]]; then
-		"${SHIMVERIFY}" "${CANDIDATE}"
+		XPF_SHIM_ALLOW_LOW_HEADROOM="${allow_low}" "${SHIMVERIFY}" "${CANDIDATE}"
 	elif sudo -n true 2>/dev/null; then
-		sudo -n "${SHIMVERIFY}" "${CANDIDATE}"
+		sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=${allow_low}" "${SHIMVERIFY}" "${CANDIDATE}"
 	else
 		return 99
 	fi
@@ -132,8 +136,23 @@ set +e
 run_verifier
 VERIFY_RC=$?
 set -e
+# #4555/#6923: how the install line below describes the gate. Only rc=0 is a
+# measured PASS; rc=6 installed because the operator suppressed the floor, and
+# saying "PASS" for it prints the one word an operator greps for to confirm the
+# gate was satisfied. The warning on stderr is not enough: stdout and stderr are
+# routinely read apart (CI log panes, `2>/dev/null`), so the verdict has to be
+# correct in the line that carries it.
+VERIFY_VERDICT="verifier PASS"
 case "${VERIFY_RC}" in
 0) ;;
+6)
+	VERIFY_VERDICT="verifier headroom gate OVERRIDDEN (XPF_SHIM_ALLOW_LOW_HEADROOM=1), NOT a measured pass"
+	# #4555: the headroom gate was OVERRIDDEN. Install (the operator asked
+	# for it) but never silently: a distinct code exists so this is
+	# distinguishable from a measured PASS without reading stderr.
+	echo "build-userspace-xdp.sh: WARNING: installing ${OUT_FILE} with the #4555 headroom gate
+  OVERRIDDEN via XPF_SHIM_ALLOW_LOW_HEADROOM=1. See the shimverify banner above for which
+  condition was suppressed. This object ships without a satisfied headroom check." >&2 ;;
 99)
 	fail "cannot run the BPF verifier gate (need root or passwordless sudo).
   The candidate object was built at:
@@ -147,6 +166,22 @@ case "${VERIFY_RC}" in
 	fail "kernel verifier REJECTED the candidate object — the tracked ${OUT_FILE} was NOT updated.
   This is the #1864 failure mode (toolchain codegen drift). Do not commit or deploy.
   Pinned toolchain: ${PINNED_TOOLCHAIN}; this build used: ${TOOLCHAIN}." ;;
+4)
+	fail "the candidate LOADS but is below the #4555 verifier-headroom floor — the tracked
+  ${OUT_FILE} was NOT updated. See the shimverify message above for the measured
+  numbers. This is the early-warning tripwire, not a kernel rejection: the shim
+  previously reached 0.92% headroom with every gate green, and the next edit to its
+  parsing paths then hit the 1M processed-insn wall. Reduce verifier cost, or re-run
+  with XPF_SHIM_ALLOW_LOW_HEADROOM=1 to install anyway with the risk understood." ;;
+5)
+	fail "the candidate LOADS but its verifier headroom could NOT be measured — the tracked
+  ${OUT_FILE} was NOT updated. This kernel's verifier log carried no
+  'processed N insns (limit M)' line, so the #4555 floor could not be applied and how
+  close this object sits to the 1M wall is UNKNOWN. Unmeasurable is refused on purpose:
+  a gate that switches itself off when the log format changes is exactly how the shim
+  crept to 0.92% headroom unnoticed in the first place. If this kernel genuinely reports
+  differently, re-run with XPF_SHIM_ALLOW_LOW_HEADROOM=1 — an explicit acknowledgement
+  that the object shipped unmeasured." ;;
 *)
 	fail "shimverify failed (rc=${VERIFY_RC}) — the tracked ${OUT_FILE} was NOT updated." ;;
 esac
@@ -159,7 +194,7 @@ if [[ "${UNPINNED}" -eq 1 && "${XPF_SHIM_ALLOW_UNPINNED_INSTALL:-0}" != "1" ]]; 
 fi
 
 install -m 0644 "${CANDIDATE}" "${OUT_FILE}"
-echo "build-userspace-xdp.sh: verifier PASS — installed ${OUT_FILE} (toolchain ${TOOLCHAIN}, bpf-linker ${BPF_LINKER_VERSION})"
+echo "build-userspace-xdp.sh: ${VERIFY_VERDICT} — installed ${OUT_FILE} (toolchain ${TOOLCHAIN}, bpf-linker ${BPF_LINKER_VERSION})"
 
 # --- Refresh the source→object freshness manifest (#4977). ---
 # `make build` never runs `make generate`, and `make test` never
