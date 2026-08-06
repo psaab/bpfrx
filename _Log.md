@@ -1,3 +1,118 @@
+## 2026-08-06 — #6835 fold r1 SALVAGE: independent re-verification
+
+- **Timestamp**: 2026-08-06 (fold/6835-r1 @ 19c905e6e, uncommitted work
+  recovered after the authoring lane died mid-verification)
+- **Action**: The r1 fold below was left UNCOMMITTED in its worktree when its
+  lane died. Recovered and independently re-verified rather than
+  re-implemented. **One real defect found in the recovered state**: a live
+  mutation probe was still applied to production —
+  `Nat64FragAssoc::lookup` opened with `if std::hint::black_box(true) { return
+  None; }`, forcing every association consult to MISS. The lane died between
+  applying that probe and restoring it, so committing the worktree as found
+  would have shipped a dataplane in which non-first fragments never inherit
+  (every one taking the #4617 fail-closed drop). Removed; a repo-wide
+  `black_box` grep now returns nothing. With it gone the `nat64.rs` diff is
+  comment-only. Also removed a stray double blank line in tests_fragment.rs
+  and corrected the `ingress_route_table_override` flowless-miss line cited
+  below (:3331 -> :3345, verified against the miss `else` arm that opens at
+  :3159).
+- **Completeness**: enumerated the fragment-association surface by grepping
+  the shape rather than trusting the diff's file list. Production has exactly
+  four key/install/consult sites — `nat64_install_forward_fragment_assoc`
+  (mod.rs:2566) and `nat_install_forward_fragment_assoc` (:2574), both keyed
+  by `nat64_first_fragment_key` under one `frag_ingress_authority` resolved at
+  :2561; `nat64_consult_forward_fragment_assoc` (:3068) and
+  `nat_consult_forward_fragment_assoc` (:3084), both keyed by
+  `nat64_nonfirst_fragment_key` under one resolution at :3063. All four carry
+  the authority. Both `Nat64FragKey { .. }` literals live inside the single
+  funnel `nat64_fragment_fields`, which REQUIRES `authority: FragAuthority`,
+  so an unscoped key is a compile error rather than a silent default. No
+  missed site.
+- **Validation** (all builds exit 0 before each mutation, so every RED is an
+  assertion and not a build break; files restored and `cmp`-verified
+  byte-identical):
+  - Baseline: build exit 0; full suite exit 101 with 4243 passed / 1 failed.
+  - The single failure is
+    `afxdp::ha::tests::current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`,
+    PROVEN pre-existing by running the full suite at the pristine base SHA
+    ad9591177 in a detached worktree: exit 101, 4233 passed / 1 failed, the
+    SAME test. It passes in isolation (exit 0) and is already fixed on
+    origin/master by e80db2eae (#6819), which post-dates this PR's base.
+    Net effect of the branch: +10 tests, all green.
+  - MUTATION 1 (the fold's only production code change): restore
+    `routing_eval_follows = true` on the association-hit filter call. RED,
+    assertion: "the association HIT is the SOLE counter owner for its fragment
+    and must count on the Accept exit — RED on revert
+    (`routing_eval_follows = true`) leaves this at 1, the count deferred to a
+    routing evaluator that never runs on a hit", left: 1, right: 2. Exactly
+    ONE test failed; the other five #5798 tests stayed GREEN (over-reach
+    guards).
+  - MUTATION 2 (negative control for the test-strength claim): force
+    `Nat64FragAssoc::lookup` to always miss. The two key-level guards fail at
+    their NEW positive controls (nat64_tests.rs:5629 and :5733). Swapping in
+    the HEAD version of `nat64_tests.rs` under the SAME mutation, both tests
+    PASS — proving the recovered positive controls are load-bearing and that
+    the two guards really were vacuous before this fold.
+- **File(s)**: `_Log.md`, `userspace-dp/src/nat64.rs`,
+  `userspace-dp/src/afxdp/tests_fragment.rs`
+
+## 2026-08-05 — #6835 fold r1: the association hit owns its filter counters
+
+- **Timestamp**: 2026-08-05 (fold/6835-r1 off fix/5798-nat64-frag-scope @
+  19c905e6e)
+- **Action**: Folded a MERGE-NEEDS-MINOR review. ONE runtime defect, four
+  test-strength gaps, six stale comments. **Runtime**: the association-hit
+  input-filter call passed `routing_eval_follows = true`. That flag picks the
+  #2620 counter-ownership policy and asserts "an Accept verdict here proceeds
+  to `ingress_route_table_override`, which counts these same terms" — true on
+  the session-MISS arm, FALSE on the hit arm, which returns the cached
+  decision and never reaches it (`ingress_route_table_override` has exactly
+  three call sites: the flow-backed miss at mod.rs:1328, the flowless miss at
+  :3345, and the PBR helper itself — none reachable from the hit arm). So for
+  any route-lookup-affecting input filter the hit path selected
+  `OnlyTerminalNonAccept` and deferred every accepted fragment's `then count`
+  to an evaluator that never ran: a datagram whose FIRST fragment counted
+  correctly had all its remaining fragments silently uncounted. The
+  session-HIT re-eval one function away
+  (`evaluate_dscp_sensitive_input_filter_on_session_hit`) already passes
+  `false` for exactly this reason. **Tests**: (a) two key-level guards passed
+  against a cache that never returns a hit — "no association" is the correct
+  answer often enough here that a broken lookup is indistinguishable from a
+  discriminating one — so both gained a positive control ordered BEFORE the
+  negative assertion plus a still-live check after; (b) the e2e cross-domain
+  test moved ifindex+VLAN+zone in one step, so a new test perturbs ONE
+  dimension per case and proves the single-dimension claim through the
+  production resolver rather than the meta literals (varying interface
+  without zone needed a second `lan` interface in the fixture; zone alone
+  cannot be moved through the production path — one logical ifindex maps to
+  one zone — so it stays pinned at the key level and the test says so);
+  (c) the hit-filter test only exercised the NAT64 consult, so it stayed
+  green if the shared `{ hit }` arm's filter were gated to NAT64 — a new
+  interface-SNAT case covers the #5689 same-family consult; (d) no test
+  submitted three fragments, so a new one runs first-A -> middle-A hit ->
+  last-B refused -> last-A replay. **Comments**: corrected, not deleted —
+  the `(family, src, dst, ip_id)` tuple in nat64.rs and both frag_assoc.rs
+  install sites predates #5798's widening; the Element-2 test claimed a
+  "consult reorder" that did not happen (the fix ADDS a hit-arm evaluation);
+  feature-coverage.md called the fragment ID 32-bit when IPv4 Identification
+  is 16; and `FragAuthority::ingress_zone` was described as the effective
+  post-override zone when it is deliberately the RAW pre-#6458-gate stamp.
+  Writing that last one honestly surfaced a bounded residual now stated in
+  the type's own doc: the owner-RG gate is runtime HA state, so
+  `build_generation` (a CONFIG fence) does not invalidate an association
+  across an RG transition — remaining fragments can inherit for up to the
+  ~2s TTL.
+- **Validation**: MUTATION-PROVEN (see the fold report). `cargo build` clean
+  before every mutation so every RED is an assertion, not a build break.
+  Files snapshotted byte-for-byte, restored verbatim, `touch`ed, and
+  md5-verified after each restore.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/frag_assoc.rs`,
+  `userspace-dp/src/nat64.rs`, `userspace-dp/src/nat64_tests.rs`,
+  `userspace-dp/src/afxdp/tests_nat64_tunnel.rs`,
+  `userspace-dp/src/afxdp/tests_fragment.rs`,
+  `docs/feature-coverage.md`, `_Log.md`
+
 ## 2026-08-05 — #5798: authority-scope the shared fragment-association cache
 
 - **Timestamp**: 2026-08-05 (fix/5798-nat64-frag-scope)

@@ -3119,7 +3119,21 @@ pub(super) fn poll_binding_process_descriptor(
                             Some(l3_flow),
                             meta,
                             ingress_zone_override,
-                            true,
+                            // #2620 counter ownership: `routing_eval_follows =
+                            // false`. An association HIT returns the cached
+                            // decision directly and NEVER reaches
+                            // `ingress_route_table_override` (that call lives in
+                            // the miss `else` arm below), so this evaluator is
+                            // the SOLE per-packet counter for the fragment —
+                            // exactly like the session-HIT re-eval in
+                            // `evaluate_dscp_sensitive_input_filter_on_session_hit`.
+                            // Passing `true` here would select
+                            // `OnlyTerminalNonAccept` whenever the input filter
+                            // is route-lookup-affecting, deferring this
+                            // fragment's `then count` terms to a routing
+                            // evaluator that never runs — every accepted
+                            // fragment of the datagram would go uncounted.
+                            false,
                         );
                         if let Some(cached_log) = input_eval.cached_log {
                             emit_input_filter_log_match(

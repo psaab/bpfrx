@@ -290,9 +290,14 @@ pub(crate) struct Nat64ReverseInfo {
 // traverses NAT64 end-to-end and reassembles at the receiver.
 //
 // Design (converged /research pass; see issue #2562 / PR #4686):
-//   * Key is PORT-FREE `(addr_family, src, dst, ip_id)` so ALL fragments of one
-//     datagram co-locate (the #2344 invariant — payload bytes are NEVER read as
-//     L4 ports).
+//   * Key is PORT-FREE — `(addr_family, src, dst, ip_id, protocol,
+//     ingress-authority)` since #5798 — so ALL fragments of one datagram
+//     co-locate (the #2344 invariant — payload bytes are NEVER read as L4
+//     ports). Every added dimension is an L3 field present in EVERY fragment
+//     (`protocol` is the IPv4 Protocol byte / the IPv6 Fragment Header's Next
+//     Header) or a property of the INGRESS, so widening the key did not cost
+//     the co-location property: first and non-first fragments of one datagram
+//     arriving on one interface still build the identical key.
 //   * Value is the first fragment's FULL, per-flow `SessionDecision`
 //     (resolution + NatDecision) — data-sufficient for the forward direction
 //     (`decision.nat` carries this flow's snat_v4/dst_v4) — plus the optional
@@ -402,8 +407,27 @@ pub(crate) struct FragAuthority {
     /// Effective ingress VLAN (0 = untagged); part of the LOGICAL interface
     /// identity, so two VLAN siblings on one physical port never alias.
     pub(crate) ingress_vlan_id: u16,
-    /// Effective ingress security zone AFTER any override (fabric / tunnel
-    /// ingress can re-home a packet's zone).
+    /// Ingress security zone after the RAW zone-encoded fabric/tunnel stamp
+    /// (`ingress_zone_override`), which can re-home a packet's zone; otherwise
+    /// the logical unit's configured zone.
+    ///
+    /// This is the RAW stamp, NOT the post-#6458 value. The flowless arm later
+    /// re-binds `ingress_zone_override` through
+    /// `gate_fabric_zone_override_on_owner_rg`, which DISCARDS the stamp when
+    /// the resolution's owner RG is not forwarding-active locally — but that
+    /// gate takes a RESOLVED forwarding decision, which does not exist yet at
+    /// the association install/consult sites (resolving one is the very work a
+    /// hit skips). Install and consult both read the same pre-gate value, so
+    /// the key stays symmetric and "same key <=> same ingress authority" holds.
+    ///
+    /// Residual, stated rather than implied: because the owner-RG gate is
+    /// runtime HA state (not config, so `build_generation` does not fence it),
+    /// an RG that stops forwarding locally between a first and a non-first
+    /// fragment leaves the association keyed on a stamp the post-gate
+    /// enforcement would now ignore, so the non-first fragment can inherit a
+    /// permit for up to the ~2s association TTL. That is the same
+    /// already-admitted-flow property the flow-backed session table has across
+    /// an RG transition, bounded here by a far shorter lifetime.
     pub(crate) ingress_zone: u16,
     /// Routing instance / VRF the ingress resolves in.
     pub(crate) routing_table: u32,

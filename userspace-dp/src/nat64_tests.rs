@@ -5565,6 +5565,12 @@ fn frag_assoc_cross_domain_nonfirst_fragment_does_not_inherit_permit() {
 /// whole struct could pass while three of the four fields were ignored, so this
 /// perturbs one field at a time against a fixed baseline.
 ///
+/// Every iteration carries a POSITIVE CONTROL: the same-authority non-first
+/// fragment must HIT the very entry the perturbed one missed. Without it the
+/// whole test is satisfied by a cache that never returns a hit — "no
+/// association" is the correct answer here often enough that a totally broken
+/// lookup would look identical to a correctly discriminating one.
+///
 /// RED on revert: delete any single field from `FragAuthority` (or from the
 /// key's `PartialEq`) and that field's iteration hits.
 #[test]
@@ -5593,15 +5599,51 @@ fn frag_assoc_every_authority_dimension_is_load_bearing() {
     ];
 
     for (dimension, other) in perturbations {
+        // Exactly ONE field differs from the baseline — assert that here rather
+        // than trusting the struct-update literals above, so a future edit that
+        // accidentally perturbs two fields cannot make a weaker test look like
+        // this one.
+        let differing = [
+            other.ingress_ifindex != base.ingress_ifindex,
+            other.ingress_vlan_id != base.ingress_vlan_id,
+            other.ingress_zone != base.ingress_zone,
+            other.routing_table != base.routing_table,
+        ]
+        .into_iter()
+        .filter(|d| *d)
+        .count();
+        assert_eq!(
+            differing, 1,
+            "{dimension}: the perturbation must vary exactly one dimension"
+        );
+
         let cache = Nat64FragAssoc::new();
         let kf = nat64_first_fragment_key(&first, libc::AF_INET6, base).expect("first key");
         cache.install(kf, decision, None, 1_000, 1);
+
+        // POSITIVE CONTROL FIRST: the baseline non-first fragment HITS. Ordered
+        // before the negative assertion so a lookup that never returns anything
+        // fails here rather than passing the "must not inherit" check for free.
+        let kn_base =
+            nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, base).expect("baseline key");
+        assert!(
+            cache.lookup(&kn_base, 1_100, 1).is_some(),
+            "{dimension} control: the SAME-authority non-first fragment must inherit — without \
+             this the negative assertion below is also satisfied by a cache that never hits"
+        );
+
         let kn =
             nat64_nonfirst_fragment_key(&nonfirst, libc::AF_INET6, other).expect("non-first key");
         assert!(
             cache.lookup(&kn, 1_100, 1).is_none(),
             "{dimension} must be part of the association authority; a fragment differing only \
              in it inherited the permit"
+        );
+        // And the entry the perturbed fragment failed to match is still LIVE —
+        // it MISSED, rather than the lookup above having consumed or expired it.
+        assert!(
+            cache.lookup(&kn_base, 1_200, 1).is_some(),
+            "{dimension}: the baseline association must survive the cross-authority miss"
         );
     }
 }
@@ -5646,6 +5688,10 @@ fn frag_assoc_protocol_collision_does_not_alias() {
 /// The IPv4 side reads its protocol from the header's Protocol byte, which is
 /// present in EVERY fragment (unlike the L4 header, which only the first
 /// carries). Guards the v4 arm of the same SSOT builder.
+///
+/// The key comparisons alone would all hold against a cache that never serves a
+/// hit, so the second half drives the SAME keys through a real `Nat64FragAssoc`
+/// — same-domain HIT (the positive control) then cross-domain MISS.
 #[test]
 fn frag_assoc_v4_key_carries_protocol_and_authority() {
     let server_v4 = Ipv4Addr::new(192, 0, 2, 9);
@@ -5675,5 +5721,25 @@ fn frag_assoc_v4_key_carries_protocol_and_authority() {
     assert_ne!(
         kf, kn_other,
         "a v4 fragment from another domain must build a different key"
+    );
+
+    // Drive the same keys through a real cache. Everything above compares keys
+    // and would hold verbatim against a `Nat64FragAssoc` that never returns a
+    // hit, so the discrimination below needs a positive control to mean
+    // anything: same-domain HITS, other-domain MISSES, and the entry the
+    // other-domain fragment failed to match is still live afterwards.
+    let cache = Nat64FragAssoc::new();
+    cache.install(kf, frag_v6_decision(), None, 1_000, 1);
+    assert!(
+        cache.lookup(&kn, 1_100, 1).is_some(),
+        "control: the same-domain v4 non-first fragment must inherit"
+    );
+    assert!(
+        cache.lookup(&kn_other, 1_100, 1).is_none(),
+        "a v4 non-first fragment from another domain must NOT inherit"
+    );
+    assert!(
+        cache.lookup(&kn, 1_200, 1).is_some(),
+        "the v4 association must survive the cross-domain miss (it missed, it did not vanish)"
     );
 }

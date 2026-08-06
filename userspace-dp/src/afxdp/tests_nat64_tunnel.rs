@@ -1426,9 +1426,11 @@ fn nat64_cross_domain_nonfirst_fragment_does_not_inherit_5798() {
 // per-packet INTERFACE INPUT FILTER.
 //
 // The authority key (Element 1) closes cross-domain permit inheritance, but it
-// does NOT close this: before the consult reorder the input filter ran ONLY in
-// the miss `else` branch, so even a correctly-scoped SAME-DOMAIN hit skipped a
-// `from is-fragment then discard` term entirely. Required-fix #4 says a hit may
+// does NOT close this: the input filter ran ONLY in the miss `else` branch —
+// the hit arm returned the cached decision directly — so even a correctly-scoped
+// SAME-DOMAIN hit skipped a `from is-fragment then discard` term entirely. The
+// fix ADDS a filter evaluation to the hit arm; the consult itself was not
+// reordered. Required-fix #4 says a hit may
 // inherit the first fragment's STATEFUL zone-policy permit + NAT translation +
 // egress route, but must still be subject to per-packet filter semantics.
 //
@@ -1594,5 +1596,449 @@ fn nat64_association_hit_still_runs_interface_input_filter_5798() {
     assert_eq!(
         xlate_filtered, 0,
         "#5798: the filtered fragment must not be NAT64-translated"
+    );
+}
+
+/// #5798: a second interface in the SAME zone as `reth1.0`, so an end-to-end
+/// test can vary the ingress INTERFACE without also varying the ingress ZONE.
+/// Zone and interface are otherwise coupled in a forwarding state (a logical
+/// ifindex maps to exactly one zone), which is precisely why keying on zone
+/// alone would alias two interfaces that can carry DIFFERENT input filters.
+fn nat64_frag_snapshot_with_second_lan_iface() -> ConfigSnapshot {
+    let mut snapshot = nat64_frag_snapshot();
+    snapshot.interfaces.push(crate::protocol::InterfaceSnapshot {
+        name: "reth1.1".to_string(),
+        zone: "lan".to_string(),
+        linux_name: "ge-0-0-1.1".to_string(),
+        ifindex: 25,
+        redundancy_group: 2,
+        hardware_addr: "02:bf:72:01:00:02".to_string(),
+        addresses: vec![crate::protocol::InterfaceAddressSnapshot {
+            family: "inet6".to_string(),
+            address: "2001:559:8585:ef01::1/64".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot
+}
+
+// #5798 FAIL-ON-REVERT: EVERY authority dimension must be threaded end to end,
+// ONE AT A TIME.
+//
+// `nat64_cross_domain_nonfirst_fragment_does_not_inherit_5798` above changes the
+// ingress ifindex AND the VLAN AND (consequently) the zone in a single step, so
+// it would still pass if production keyed on the ifindex alone and ignored VLAN,
+// zone and routing instance. This test perturbs exactly ONE dimension per case
+// against a fixed baseline and PROVES the single-dimension claim by comparing
+// the two `frag_ingress_authority` results field by field — a later fixture edit
+// that silently perturbs two dimensions fails the `differing == 1` assertion
+// rather than quietly weakening the guard.
+//
+//   - ifindex only: `reth1.1` (ifindex 25) is in the SAME `lan` zone as
+//     `reth1.0` (ifindex 24), so the zone byte is IDENTICAL and only the
+//     interface differs. This is the case zone-keying alone would alias.
+//   - VLAN only: same physical ifindex 24, VLAN 80. `(24, 80)` resolves to no
+//     logical unit, so `frag_ingress_authority` falls back to the PHYSICAL
+//     ifindex — the exact fallback the `ingress_vlan_id` field exists to cover
+//     (without it two VLAN siblings on one port collapse onto one authority).
+//   - routing-instance only: same interface, same VLAN, `routing_table` 1.
+//
+// `ingress_zone` alone cannot be varied through the production path here: a
+// forwarding state maps a logical ifindex to exactly one zone, so the only way
+// to move the zone without moving the interface is a fabric/tunnel zone stamp,
+// which this fixture has no ingress for. That dimension is pinned in isolation
+// by `frag_assoc_every_authority_dimension_is_load_bearing` (nat64_tests.rs),
+// which drives the key builder directly.
+//
+// RED on revert: drop any one of the three fields from `FragAuthority` (or stop
+// threading it in `frag_ingress_authority`) and that case's fragment inherits →
+// its `tx == 0` assertion goes RED.
+#[test]
+fn nat64_frag_authority_dimensions_are_threaded_end_to_end_5798() {
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let ident: u32 = 0x5798_0100;
+    let first = nat64_v6_frag_frame(0x0001, ident, src, dst, 12345, 443);
+    let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
+
+    let base_meta = nat64_v6_frag_meta(non_first.len());
+    let ifindex_only = UserspaceDpMeta {
+        ingress_ifindex: 25,
+        ..base_meta
+    };
+    let vlan_only = UserspaceDpMeta {
+        ingress_vlan_id: 80,
+        ..base_meta
+    };
+    let vrf_only = UserspaceDpMeta {
+        routing_table: 1,
+        ..base_meta
+    };
+
+    for (dimension, perturbed) in [
+        ("logical ingress interface (same zone)", ifindex_only),
+        ("ingress VLAN (physical-ifindex fallback)", vlan_only),
+        ("routing instance / VRF", vrf_only),
+    ] {
+        let forwarding = build_forwarding_state(&nat64_frag_snapshot_with_second_lan_iface());
+        let ha_state = txn_ha_state();
+        let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+        binding.interface = Arc::<str>::from("reth1.0");
+        let mut sessions = SessionTable::new();
+        sessions.set_max_sessions_for_test(16);
+
+        // Prove the SINGLE-dimension claim through the production resolver, not
+        // by inspecting the meta literals: resolve both authorities and count
+        // the fields that differ.
+        let base_authority = crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(
+            &forwarding,
+            base_meta,
+            None,
+        );
+        let other_authority = crate::afxdp::poll_descriptor::frag_assoc::frag_ingress_authority(
+            &forwarding,
+            perturbed,
+            None,
+        );
+        let differing = [
+            base_authority.ingress_ifindex != other_authority.ingress_ifindex,
+            base_authority.ingress_vlan_id != other_authority.ingress_vlan_id,
+            base_authority.ingress_zone != other_authority.ingress_zone,
+            base_authority.routing_table != other_authority.routing_table,
+        ]
+        .into_iter()
+        .filter(|d| *d)
+        .count();
+        assert_eq!(
+            differing, 1,
+            "{dimension}: the production authority resolver must differ in EXACTLY one \
+             dimension for this case to be a single-dimension guard (base {base_authority:?}, \
+             perturbed {other_authority:?})"
+        );
+
+        // Domain A installs off a real committed first fragment.
+        let (_b1, dbg1) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &first,
+            nat64_v6_frag_meta(first.len()),
+        );
+        assert_eq!(
+            dbg1.tx, 1,
+            "{dimension}: the baseline first fragment must translate + forward"
+        );
+        assert_eq!(
+            forwarding.nat64.frag_assoc.len(),
+            1,
+            "{dimension}: exactly one association is published"
+        );
+
+        // Same frame bytes, one dimension of ingress authority changed.
+        let (b2, dbg2) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &non_first,
+            perturbed,
+        );
+        assert_eq!(
+            dbg2.tx, 0,
+            "#5798: {dimension} must be load-bearing end to end — a non-first fragment \
+             differing ONLY in it inherited the permit + egress + NAT64 translation"
+        );
+        assert_eq!(
+            b2.nat64_translations, 0,
+            "#5798: {dimension} — the refused fragment must not be NAT64-translated"
+        );
+        assert_eq!(
+            forwarding.nat64.frag_assoc.len(),
+            1,
+            "{dimension}: the baseline association must still be live (the fragment MISSED; \
+             the entry did not expire or get evicted)"
+        );
+
+        // Positive control per case: the UNPERTURBED fragment still inherits, so
+        // the negative assertion above cannot be satisfied by a cache/consult
+        // that simply never returns a hit.
+        let (b3, dbg3) = txn_run_descriptor(
+            &mut binding,
+            &mut sessions,
+            &forwarding,
+            &ha_state,
+            &non_first,
+            base_meta,
+        );
+        assert_eq!(
+            dbg3.tx, 1,
+            "{dimension} control: the baseline-authority fragment must still inherit + forward"
+        );
+        assert_eq!(
+            b3.nat64_translations, 1,
+            "{dimension} control: the baseline fragment is still NAT64-translated"
+        );
+    }
+}
+
+// #5798 FAIL-ON-REVERT: the ORDERING property, over a real THREE-fragment
+// datagram.
+//
+// Two fragments can show an association being created and consumed. They cannot
+// show that state DECIDED by one domain is still refused to another domain after
+// the association has already been used — which is the property this change
+// exists to establish. So this submits three DISTINCT production descriptors
+// with three distinct fragment offsets, in order:
+//
+//   1. first-A   (offset 0, MF=1)  — domain A, installs the association
+//   2. middle-A  (offset 1, MF=1)  — domain A, HITS and forwards (positive)
+//   3. last-B    (offset 2, MF=0)  — domain B, must be REFUSED
+//
+// Step 2 matters: it proves the refusal in step 3 is not just "the cache was
+// never usable", and it exercises the refusal AFTER a hit has already refreshed
+// the entry's TTL and touched its LRU position.
+//
+// RED on revert: pass a constant authority (or drop `authority` from the key)
+// and step 3's `tx == 0` goes RED while steps 1-2 stay green.
+#[test]
+fn nat64_third_fragment_from_another_domain_refused_after_a_same_domain_hit_5798() {
+    let forwarding = build_forwarding_state(&nat64_frag_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(16);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let ident: u32 = 0x5798_0003;
+
+    // Three DISTINCT fragments of one datagram. The IPv6 Fragment Header
+    // offset/flags word is `offset << 3 | MF`, so 0x0001 = offset 0 + MF,
+    // 0x0009 = offset 1 + MF, 0x0010 = offset 2, MF clear (the last fragment).
+    let frag1_first = nat64_v6_frag_frame(0x0001, ident, src, dst, 12345, 443);
+    let frag2_middle = nat64_v6_frag_frame(0x0009, ident, src, dst, 0, 0);
+    let frag3_last = nat64_v6_frag_frame(0x0010, ident, src, dst, 0, 0);
+    assert_ne!(
+        frag2_middle, frag3_last,
+        "the middle and last fragments must be DISTINCT descriptors, not the same bytes twice"
+    );
+
+    // (1) first-A installs.
+    let (_b1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frag1_first,
+        nat64_v6_frag_meta(frag1_first.len()),
+    );
+    assert_eq!(dbg1.tx, 1, "the domain-A first fragment must translate + forward");
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "the committed first fragment publishes exactly one association"
+    );
+
+    // (2) middle-A HITS — the state is now not merely created but USED.
+    let (b2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frag2_middle,
+        nat64_v6_frag_meta(frag2_middle.len()),
+    );
+    assert_eq!(
+        dbg2.tx, 1,
+        "the SECOND domain-A fragment must inherit the association and forward"
+    );
+    assert_eq!(
+        b2.nat64_translations, 1,
+        "the inherited middle fragment is NAT64-translated"
+    );
+
+    // (3) last-B — same datagram identity, different security domain. Must be
+    //     refused even though the association is live AND has just been hit.
+    let mut meta_b = nat64_v6_frag_meta(frag3_last.len());
+    meta_b.ingress_ifindex = 12;
+    meta_b.ingress_vlan_id = 80;
+    let (b3, dbg3) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frag3_last,
+        meta_b,
+    );
+    assert_eq!(
+        dbg3.tx, 0,
+        "#5798: a THIRD fragment from another security domain must be refused even after \
+         the association has already served a same-domain hit"
+    );
+    assert_eq!(
+        b3.nat64_translations, 0,
+        "#5798: the cross-domain last fragment must not be NAT64-translated"
+    );
+    assert_eq!(
+        forwarding.nat64.frag_assoc.len(),
+        1,
+        "the association must still be live — the third fragment MISSED it"
+    );
+
+    // (4) And domain A can STILL use it afterwards: the refusal did not poison
+    //     or evict the entry.
+    let (b4, dbg4) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frag3_last,
+        nat64_v6_frag_meta(frag3_last.len()),
+    );
+    assert_eq!(
+        dbg4.tx, 1,
+        "control: the same LAST fragment, from domain A, must inherit and forward"
+    );
+    assert_eq!(
+        b4.nat64_translations, 1,
+        "control: the domain-A last fragment is still NAT64-translated"
+    );
+}
+
+// #5798 counter-ownership FAIL-ON-REVERT: an association HIT is the SOLE counter
+// owner for its fragment, so it must count on EVERY exit — including Accept.
+//
+// `evaluate_non_pbr_input_filter`'s `routing_eval_follows` selects the #2620
+// counter-ownership policy. `true` means "an Accept verdict here proceeds to
+// `ingress_route_table_override`, which counts the same terms" and so defers the
+// Accept-exit count to that evaluator (`OnlyTerminalNonAccept`) whenever the
+// filter is route-lookup-affecting. That is correct on the association-MISS arm,
+// which really does call the routing evaluator — and WRONG on the hit arm, which
+// returns the cached decision and never reaches it. Passing `true` there sends
+// every accepted fragment's `then count` to an evaluator that never runs.
+//
+// The filter here is route-lookup-affecting (a `routing-instance` term is
+// present) but that term is scoped to UDP while the fragments are TCP, so it
+// never matches and never steers a route — the filter's PBR-affecting FLAG is
+// what selects the counter policy, which is exactly the input under test.
+//
+// RED on revert: restore `routing_eval_follows = true` on the association-hit
+// call in `poll_descriptor/mod.rs` and the counter stays at 1 for a 2-fragment
+// datagram.
+#[test]
+fn nat64_frag_assoc_hit_counts_route_lookup_affecting_input_filter_5798() {
+    use std::sync::atomic::Ordering;
+
+    let mut snapshot = nat64_frag_snapshot();
+    let iface = snapshot
+        .interfaces
+        .iter_mut()
+        .find(|i| i.name == "reth1.0")
+        .expect("reth1.0 in the fixture");
+    iface.filter_input_v6 = "pbr-count6".to_string();
+    snapshot.filters.push(crate::protocol::FirewallFilterSnapshot {
+        name: "pbr-count6".to_string(),
+        family: "inet6".to_string(),
+        terms: vec![
+            // Makes the filter route-lookup-affecting. Scoped to UDP, so it
+            // never matches these TCP fragments and never steers a route.
+            crate::protocol::FirewallTermSnapshot {
+                name: "steer-udp".to_string(),
+                protocols: vec!["udp".to_string()],
+                routing_instance: "scrub".to_string(),
+                action: "accept".to_string(),
+                ..Default::default()
+            },
+            crate::protocol::FirewallTermSnapshot {
+                name: "count-all".to_string(),
+                action: "accept".to_string(),
+                count: "c-frag6".to_string(),
+                ..Default::default()
+            },
+        ],
+    });
+
+    let forwarding = build_forwarding_state(&snapshot);
+    assert!(
+        crate::filter::interface_filter_affects_route_lookup(&forwarding.filter_state, 24, true),
+        "precondition: the fixture filter must be route-lookup-affecting, or the buggy \
+         counter policy is never selected and this test cannot fail"
+    );
+    let counter = forwarding
+        .filter_state
+        .iface_filter_v6_fast
+        .get(&24)
+        .expect("input filter compiled for ifindex 24")
+        .terms
+        .get(1)
+        .expect("the count term")
+        .counter
+        .clone();
+    assert_eq!(counter.packets.load(Ordering::Relaxed), 0);
+
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+    sessions.set_max_sessions_for_test(16);
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let ident: u32 = 0x5798_0004;
+
+    // Fragment 1 (first): flow-backed cold path. Its Accept exit legitimately
+    // defers to the routing evaluator, which DOES run there and counts.
+    let first = nat64_v6_frag_frame(0x0001, ident, src, dst, 12345, 443);
+    let (_b1, dbg1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &first,
+        nat64_v6_frag_meta(first.len()),
+    );
+    assert_eq!(dbg1.tx, 1, "the first fragment must translate + forward");
+    assert_eq!(
+        counter.packets.load(Ordering::Relaxed),
+        1,
+        "the first fragment counts once (the routing evaluator owns its Accept-exit count)"
+    );
+
+    // Fragment 2 (non-first): association HIT. No routing evaluator follows, so
+    // the hit-path filter evaluation must count this packet itself.
+    let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
+    let mut meta = nat64_v6_frag_meta(non_first.len());
+    // The shared NAT64 fragment fixture leaves `flow_{src,dst}_addr` zeroed;
+    // `l3_session_flow_from_meta` returns None for an unspecified address and
+    // the hit-arm filter block is gated on it, so without these the block is
+    // skipped and the test would pass vacuously. Production always has them
+    // stamped by the shim.
+    meta.flow_src_addr = src.octets();
+    meta.flow_dst_addr = dst.octets();
+    let (b2, dbg2) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &non_first,
+        meta,
+    );
+    assert_eq!(
+        dbg2.tx, 1,
+        "the non-first fragment must inherit the association and forward"
+    );
+    assert_eq!(
+        b2.nat64_translations, 1,
+        "the inherited fragment is NAT64-translated"
+    );
+    assert_eq!(
+        counter.packets.load(Ordering::Relaxed),
+        2,
+        "#5798: the association HIT is the SOLE counter owner for its fragment and must count \
+         on the Accept exit — RED on revert (`routing_eval_follows = true`) leaves this at 1, \
+         the count deferred to a routing evaluator that never runs on a hit"
     );
 }

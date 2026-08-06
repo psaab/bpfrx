@@ -53,7 +53,8 @@ pub(in crate::afxdp) fn frag_ingress_authority(
 }
 
 /// #2562: on a FIRST NAT64 fragment that translated and will forward, install
-/// the fragment association keyed by `(family, src, dst, ip_id)` so its
+/// the fragment association keyed by `(family, src, dst, ip_id, protocol,
+/// authority)` (#5798 widened the original `(family, src, dst, ip_id)`) so its
 /// non-first fragments inherit `decision` (see `nat64::Nat64FragAssoc`). Gated
 /// on a resolved ForwardCandidate — a decision that will NOT forward (no route,
 /// missing neighbor) is never cached, so a non-first fragment then misses and
@@ -147,7 +148,8 @@ pub(super) fn nat64_consult_forward_fragment_assoc(
 
 /// #5689: on a FIRST fragment of an ORDINARY same-family NAT / NPTv6 flow that
 /// translated and will forward, install a fragment association keyed by
-/// `(family, src, dst, ip_id)` so its non-first fragments inherit `decision`
+/// `(family, src, dst, ip_id, protocol, authority)` (#5798 widened the original
+/// `(family, src, dst, ip_id)`) so its non-first fragments inherit `decision`
 /// and translate L3-only (address-only rewrite) instead of being forwarded
 /// UNTRANSLATED (the #5689 leak). Mirrors [`nat64_install_forward_fragment_assoc`]
 /// but for the SNAT / DNAT / static-NAT / NPTv6 path. It REUSES the generic
