@@ -345,13 +345,28 @@ func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) [
 		//
 		// PRECEDENCE, deliberate: hoisting this changes which error an operator
 		// SEES when a config carries both a Phase-2 fault and a bad filter
-		// protocol. The whole pre-pass runs before compileZones, so a config
-		// with an unknown screen-profile ref AND `from protocol bogus-proto`
-		// now reports the filter error, where it previously reported
-		// `compile zones: screen profile ... not found`. Both are hard errors
-		// and both abort the same apply, so only the message changes. Do not
-		// "fix" this by moving the row later; the ordering is what keeps the
-		// mutation point clean.
+		// protocol. The whole pre-pass runs before compileZones, and the pre-pass
+		// returns on the FIRST failing row — so precedence is row order, not
+		// phase order.
+		//
+		// MEASURED at this head, not reasoned: `zone screen references` sits
+		// EARLIER in validationPhases than `firewall filter protocols`, so a
+		// config carrying an unknown screen-profile ref AND
+		// `from protocol bogus-proto` reports the SCREEN error. An earlier
+		// revision of this paragraph asserted the opposite — that the filter
+		// error now wins where the screen error used to — and both halves were
+		// wrong once the screen sweep joined the table ahead of it.
+		//
+		// Stated as an ORDER, deliberately, not as row numbers: the indices shift
+		// whenever a row is inserted, and two readers already disagreed on whether
+		// to count them from 0 or 1. If you add a row, re-derive this example by
+		// reading the table, not by editing the prose around it — a precedence
+		// claim written from intent rather than from the table is exactly what
+		// went stale here.
+		//
+		// Both are hard errors and both abort the same apply, so only the message
+		// changes. Do not "fix" this by moving the row later; the ordering is
+		// what keeps the mutation point clean.
 		//
 		// That "nothing reaches the dataplane either way" was true only for the
 		// filter-protocol half. The screen-reference half DID reach it:

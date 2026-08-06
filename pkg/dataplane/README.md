@@ -267,9 +267,14 @@ then stays green.
     mutated instead of half-applied with no undo path. It can therefore fail
     the whole compile on its own. It is additive — every real phase keeps its
     position — but it does change WHICH error an operator sees when a config
-    carries more than one fault: a bad `firewall filter` protocol is hoisted
-    into the pre-pass, so it is now reported ahead of a zones-phase fault such
-    as an unknown screen-profile reference. That file states what the pre-pass
+    carries more than one fault. Precedence is the pre-pass ROW ORDER, because
+    the pre-pass returns on the first failing row. An unknown screen-profile
+    reference is no longer a zones-phase fault at all: it is a pre-pass row
+    (`zone screen references`) sitting EARLIER in the table than
+    `firewall filter protocols`, so it is the error reported when a config
+    carries both. Read the order off `validationPhases` rather than trusting this
+    sentence — the previous wording had the two the wrong way round. That file
+    states what the pre-pass
     does and does not cover; the coverage table is not the whole compile.
 - `CompileResult` — `compiler.go`. Zone/policy/NAT/app IDs, compiled
   policy-scheduler rule slots, and the per-interface networkd configs.
