@@ -68450,3 +68450,67 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #6827 gate fold r2: bind the generation fence and listener recovery
+
+- **Timestamp**: 2026-08-06
+- **Action**: F1 — `TestDebtClearIsGenerationSafe_6827` was a TAUTOLOGY. It
+  re-implemented `d.staleCertGen == gen` in its own body and asserted on its
+  own arithmetic (`2 == 1` is false, so `stillPending` was true
+  unconditionally); the production comparison was never called. Measured:
+  `if true || d.staleCertGen == gen` left `pkg/api` + `pkg/daemon` GREEN. It
+  now drives `deliverStaleMgmtCertDiagnosis` for real and bumps the generation
+  from INSIDE the unlocked window via the `osHostname` seam (which
+  `management.go` reads at exactly that point), then asserts the debt survives.
+  A second subtest is the negative control: with no concurrent rename the debt
+  MUST settle, so the pair distinguishes the fence from both an unconditional
+  clear and a never-clear.
+- **Action**: F2 — two runtime behaviour changes in the merge range were
+  wholly unbound. (a) `reconcileTo` used to `return nil` when `m.srv == nil`,
+  making a boot HTTP bind failure ABSORBING; it now retries construction via
+  `startLocked`. (b) `startLocked` now unrecords `cur.tls`/`cur.httpsAddr`
+  when the boot HTTPS bind failed, so a later IDENTICAL reconcile issues
+  `ReconcileHTTPS` instead of seeing "no change". Both could be reverted
+  wholesale with the suite green — `TestHTTPSBindFailureIsNotReportedAsServing_6827`
+  binds the `HTTPSServing` predicate but calls it DIRECTLY, so the
+  reconciler's USE of it was unbound. New
+  `TestMgmtListenerRecoversFromAFailedStart_6827` binds both at the call site,
+  with an over-reach guard on each side (a disabled API must NOT be
+  constructed by a reconcile; a SUCCESSFUL boot HTTPS bind must still record
+  its fingerprint). Behaviour unchanged — the retry builds from
+  `desired(cfg)` with the #4047/#5127 loopback clamp intact and retains no
+  prior listener.
+- **Action**: F3 — `pkg/api/README.md` and three `listener.go` comments
+  documented a field named `exited` "stored from a defer over the whole serve
+  goroutine". No such field exists: the shipped predicate tests `dead` and
+  `stopping`, and `stopping` is stored EXPLICITLY at the top of the drain arm,
+  before `Shutdown`. Corrected there and in four `tls_stale_cert_6827_test.go`
+  sites, one of which gave a "RED on revert: delete the defer in
+  serveLegLocked" recipe for code that is not there. The replacement recipe
+  was verified firsthand. Two adjacent clauses claiming root-context shutdown
+  "sets no flag at all" were also corrected — it sets `stopping`.
+- **Action**: DOCS — `pkg/daemon/README.md` had NO coverage of this work and
+  was untouched by the PR even though `pkg/daemon/management.go` gained ~120
+  lines. Added the boot-start recovery bullet (both halves) and a
+  stale-certificate-diagnosis subsection covering the debt, the delivery-time
+  kernel read, and the generation fence.
+- **Validation**: `go build ./...` 0; `go test ./pkg/api ./pkg/daemon
+  ./pkg/config -count=1` 0; `go test -race ./pkg/api ./pkg/daemon -count=1` 0;
+  `go vet ./pkg/api ./pkg/daemon` 0; `go test ./pkg/refactoraudit/...` 0.
+  Mutation grid, every red an ASSERTION (no build breaks), production restored
+  byte-identical after each (`git diff` empty on `management.go`):
+  `if true || d.staleCertGen == gen` → F1 subtest 1 FAILS
+  ("an older delivery settled a rename that landed AFTER it sampled the
+  generation"), subtest 2 PASSES. `if false && d.staleCertGen == gen` →
+  subtest 1 PASSES, subtest 2 FAILS ("must settle the debt — the generation
+  fence must not suppress the clear"). `if true || m.rootCtx == nil ||
+  next.Addr == ""` → `boot_http_bind_failure_recovers_on_a_later_reconcile`
+  FAILS, other three subtests PASS. `if false && next.TLS && ...
+  !srv.HTTPSServing()` → `boot_https_bind_failure_retries_on_an_identical_reconcile`
+  FAILS, other three PASS. Deleting `leg.stopping.Store(true)` →
+  `TestDrainFlagIsSetByTheRealServeGoroutine_6827` FAILS, confirming the F3
+  recipe text.
+- **File(s)**: pkg/daemon/hostname_stale_cert_6827_test.go,
+  pkg/daemon/management_recovery_6827_test.go, pkg/daemon/README.md,
+  pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/api/README.md, _Log.md

@@ -38,21 +38,22 @@ type listenerLeg struct {
 	// stopping is set the moment a graceful drain BEGINS — before Shutdown, not
 	// after the goroutine returns. Between those two points the listener is
 	// already closed (Shutdown closes it) so no new client can reach the
-	// certificate, but `exited` is still false for up to the 5s drain window
-	// (#6827 round 5). For "is a certificate in front of clients right now?"
-	// the answer during a drain is NO: the process is on its way down and a
-	// staleness warning is noise. Callers that want "what address is this leg
-	// finishing on" (EffectiveHTTPAddr) deliberately do not consult this.
+	// certificate, yet a flag stored only when the goroutine RETURNS would stay
+	// false for up to the 5s drain window (#6827 round 5). For "is a certificate
+	// in front of clients right now?" the answer during a drain is NO: the
+	// process is on its way down and a staleness warning is noise. Callers that
+	// want "what address is this leg finishing on" (EffectiveHTTPAddr)
+	// deliberately do not consult this.
 	stopping atomic.Bool
 }
 
 // serving reports whether this leg is actually carrying traffic right now: it
 // exists, holds a listener, and its serve goroutine has neither self-terminated
-// (`dead`) nor returned for any other reason (`exited`).
+// (`dead`) nor begun a graceful drain (`stopping`).
 //
 // A non-nil leg pointer is NOT that question (#6827). An unexpected serve exit
-// sets `dead` and leaves the leg INSTALLED in s.httpsLeg; the root-context
-// shutdown path sets NOTHING at all and also leaves it installed. In both
+// sets `dead` and leaves the leg INSTALLED in s.httpsLeg; a root-context
+// shutdown sets `stopping` (never `dead`) and also leaves it installed. In both
 // states the pointer is live and the socket is not. A caller that reads the leg
 // to answer "what is this box serving?" must test the state, not the pointer.
 //
@@ -61,7 +62,7 @@ type listenerLeg struct {
 // disable arm clears s.httpsLeg under lifeMu before retiring, and the rebind
 // arm installs the replacement before retiring the old one. So a stopCh test
 // would be an arm for a state that cannot occur — while the state that DOES
-// occur, root-context shutdown, sets no flag at all and would slip past it.
+// occur, root-context shutdown, closes no stopCh and would slip past it.
 // `stopping` is set at the TOP of both drain arms — requested retirement and
 // root-context shutdown — before Shutdown runs, so it covers that path from the
 // moment the listener closes through the goroutine's return. Together with

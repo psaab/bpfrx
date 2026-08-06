@@ -341,12 +341,12 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 	})
 
 	t.Run("root_shutdown_drained_leg_is_not_diagnosed", func(t *testing.T) {
-		// The state that ACTUALLY occurs and sets no flag at all: on
-		// root-context shutdown the serve goroutine drains and RETURNS without
-		// setting `dead` and without closing `stopCh`, leaving the leg installed
-		// in s.httpsLeg permanently. A predicate built from the paths that SET
-		// flags misses it entirely — which is why `exited` is stored from a
-		// defer over the whole goroutine rather than per-branch (#6827).
+		// The state a root-context shutdown ACTUALLY leaves behind: the serve
+		// goroutine drains and RETURNS without ever setting `dead` and without
+		// `stopCh` being closed, leaving the leg installed in s.httpsLeg
+		// permanently. A predicate built from `dead` alone misses it entirely —
+		// which is why the drain arm stores `stopping` before `Shutdown`, so the
+		// root-context path is marked too (#6827).
 		s := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
 		s.httpsLeg.stopping.Store(true)
 		out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
@@ -367,10 +367,10 @@ func TestWarnStaleMgmtCertForHostName_6827(t *testing.T) {
 		if (&Server{}).WarnStaleMgmtCertForHostName("new-fw") {
 			t.Fatal("no serving leg must report the question UNanswered so the caller retries")
 		}
-		dead := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
-		dead.httpsLeg.stopping.Store(true)
-		if dead.WarnStaleMgmtCertForHostName("new-fw") {
-			t.Fatal("an exited leg must report the question UNanswered")
+		draining := legServing(mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+		draining.httpsLeg.stopping.Store(true)
+		if draining.WarnStaleMgmtCertForHostName("new-fw") {
+			t.Fatal("a draining leg must report the question UNanswered")
 		}
 	})
 
@@ -429,15 +429,15 @@ func TestWarnStaleMgmtCertForHostNameReadsTheLiveLeg_6827(t *testing.T) {
 // TestDrainFlagIsSetByTheRealServeGoroutine_6827 drives the PRODUCTION transition
 // instead of asserting on a flag the test set itself.
 //
-// The earlier subtests store `exited` directly, so deleting
-// `defer leg.exited.Store(true)` from serveLegLocked left them all green: they
-// set up the state production is supposed to establish, then assert on it. This
-// one starts a real leg on a stub listener, cancels the root context, waits for
-// the serve goroutine to drain and return, and only then asks serving().
+// The earlier subtests store `stopping` directly, so deleting
+// `leg.stopping.Store(true)` from serveLegLocked left them all green: they set
+// up the state production is supposed to establish, then assert on it. This one
+// starts a real leg on a stub listener, cancels the root context, waits for the
+// serve goroutine to drain and return, and only then asks serving().
 //
-// RED on revert: delete the defer in serveLegLocked and `exited` stays false
-// after the goroutine has returned, so serving() reports true and the
-// diagnostic warns about a certificate nothing is serving.
+// RED on revert: delete `leg.stopping.Store(true)` from serveLegLocked's drain
+// arm and `stopping` stays false after the goroutine has returned, so serving()
+// reports true and the diagnostic warns about a certificate nothing is serving.
 func TestDrainFlagIsSetByTheRealServeGoroutine_6827(t *testing.T) {
 	cert := mintCert(t, "old-fw", "10.0.0.1")
 	s := &Server{listen: func(network, addr string) (net.Listener, error) { return newStubLn(), nil }}
@@ -459,7 +459,7 @@ func TestDrainFlagIsSetByTheRealServeGoroutine_6827(t *testing.T) {
 
 	if s.HTTPSServing() {
 		t.Fatal("after the serve goroutine returned, the leg must not report serving (#6827): " +
-			"exited is set by a defer in serveLegLocked, not by the test")
+			"stopping is set by serveLegLocked's drain arm, not by the test")
 	}
 	out := captureWarn(t, func() { s.WarnStaleMgmtCertForHostName("new-fw") })
 	if out != "" {

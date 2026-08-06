@@ -329,42 +329,97 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 // Reported as still-unbound rather than papered over.
 
 // TestDebtClearIsGenerationSafe_6827 pins the #6827-round-5 losing sequence: a
-// delivery runs unlocked across the hostname read and certificate inspection,
-// so a rename committed in that window bumps the generation and must NOT be
-// settled by the older delivery.
+// delivery runs UNLOCKED across the hostname read and the certificate
+// inspection, so a rename committed in that window bumps the generation and
+// must NOT be settled by the older delivery's evidence.
 //
-// RED on revert: clear staleCertPending unconditionally (drop the
-// `d.staleCertGen == gen` guard) and the newer rename is lost.
+// The race is reachable: applySem serializes commits with each other, but the
+// boot delivery (daemon_run_servers.go, on the Run goroutine) runs OUTSIDE it
+// while cluster comms are already up (started inside the phase-4 boot apply),
+// so a peer SyncApply -> applyHostname can bump the generation while the boot
+// delivery sits in its unlocked window.
+//
+// Both subtests drive the PRODUCTION comparison — an earlier version of this
+// test re-implemented `d.staleCertGen == gen` in its own body and asserted on
+// its own arithmetic, so the fence could be replaced by an unconditional clear
+// with the whole suite still green.
+//
+// RED on revert: `if true || d.staleCertGen == gen` (unconditional clear) fails
+// the first subtest; `if false && d.staleCertGen == gen` (never clear) fails the
+// second. Neither direction passes both.
 func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
-	d := &Daemon{}
-	stubHostname(t, "new-fw-6827")
-	serveStaleCert(t, d, "old-fw-6827")
+	t.Run("a_rename_landing_mid_delivery_is_not_settled", func(t *testing.T) {
+		d := &Daemon{}
+		serveStaleCert(t, d, "old-fw-6827")
 
-	// Claim a generation, then simulate a rename landing while that delivery is
-	// still in flight (the unlocked window).
-	d.staleCertMu.Lock()
-	d.staleCertPending, d.staleCertGen = true, 1
-	claimed := d.staleCertGen
-	d.staleCertMu.Unlock()
+		// osHostname is read INSIDE the unlocked window, so stubbing it is the
+		// seam that lands a rename exactly where the race is: after this delivery
+		// sampled the generation, before it decides whether to clear. It fires
+		// ONCE, so the surviving debt is deliverable on a later attempt.
+		restore := osHostname
+		t.Cleanup(func() { osHostname = restore })
+		var raced bool
+		osHostname = func() (string, error) {
+			if !raced {
+				raced = true
+				d.staleCertMu.Lock()
+				d.staleCertGen++ // a newer `set system host-name` commits mid-delivery
+				d.staleCertMu.Unlock()
+			}
+			return "new-fw-6827", nil
+		}
 
-	d.staleCertMu.Lock()
-	d.staleCertGen = 2 // a newer rename arrived mid-delivery
-	d.staleCertMu.Unlock()
+		d.staleCertMu.Lock()
+		d.staleCertPending, d.staleCertGen = true, 1
+		d.staleCertMu.Unlock()
 
-	// The older delivery settles only its own generation.
-	d.staleCertMu.Lock()
-	if d.staleCertGen == claimed {
-		d.staleCertPending = false
-	}
-	stillPending := d.staleCertPending
-	d.staleCertMu.Unlock()
-	if !stillPending {
-		t.Fatal("an older delivery must not settle a newer rename's debt (#6827 round 5)")
-	}
+		out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
+		if !strings.Contains(out, "does not cover the current host-name") {
+			t.Fatalf("the delivery itself must still run and diagnose; got %q", out)
+		}
+		if !raced {
+			t.Fatal("the stub never fired, so no rename landed in the unlocked window and " +
+				"this subtest proves nothing")
+		}
+		d.staleCertMu.Lock()
+		pending, gen := d.staleCertPending, d.staleCertGen
+		d.staleCertMu.Unlock()
+		if gen != 2 {
+			t.Fatalf("generation = %d, want the mid-delivery bump to 2", gen)
+		}
+		if !pending {
+			t.Fatal("an older delivery settled a rename that landed AFTER it sampled the " +
+				"generation — the newer debt is lost permanently (#6827 round 5)")
+		}
 
-	// End to end: the real delivery path leaves the newer debt outstanding only
-	// if it did not itself observe the newer generation.
-	if out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); !strings.Contains(out, "new-fw-6827") {
-		t.Fatalf("the outstanding newer debt must still be deliverable; got %q", out)
-	}
+		// The surviving debt is still deliverable (the fence defers it, not drops it).
+		if again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); !strings.Contains(again, "new-fw-6827") {
+			t.Fatalf("the outstanding newer debt must still be deliverable; got %q", again)
+		}
+	})
+
+	t.Run("an_unraced_delivery_settles_the_debt", func(t *testing.T) {
+		// OVER-REACH GUARD (negative control): the fence must NARROW the clear to
+		// the generation the delivery claimed, not suppress clearing. Stays GREEN
+		// under the unconditional-clear mutation and RED under a never-clear one,
+		// so the pair distinguishes the fence from both neighbours.
+		d := &Daemon{}
+		stubHostname(t, "new-fw-6827")
+		serveStaleCert(t, d, "old-fw-6827")
+
+		out := captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() })
+		if !strings.Contains(out, "new-fw-6827") {
+			t.Fatalf("the rename must be diagnosed; got %q", out)
+		}
+		d.staleCertMu.Lock()
+		pending := d.staleCertPending
+		d.staleCertMu.Unlock()
+		if pending {
+			t.Fatal("a delivery that reached a served certificate with NO concurrent rename " +
+				"must settle the debt — the generation fence must not suppress the clear")
+		}
+		if again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); again != "" {
+			t.Fatalf("a settled debt must not re-warn; got %q", again)
+		}
+	})
 }

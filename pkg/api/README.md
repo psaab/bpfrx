@@ -411,11 +411,14 @@ under the daemon's errgroup. Nothing else imports this package.
           silently dropped.
       Both entry points read the LIVE HTTPS leg via `listenerLeg.serving()` —
       not a non-nil pointer. An unexpected serve exit leaves the leg INSTALLED
-      with only `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed with
-      no flag set at all; diagnosing either reports a certificate no socket is
-      presenting. `serving()` therefore tests `exited`, stored from a defer over
-      the whole serve goroutine so every exit path marks it — including the one
-      that sets nothing. It does NOT test `stopCh`: a requested retirement is
+      with `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed with
+      `stopping` set; diagnosing either reports a certificate no socket is
+      presenting. `serving()` therefore tests BOTH: `dead` for a
+      self-termination, and `stopping` — stored explicitly at the top of both
+      drain arms (requested retirement AND root-context shutdown), before
+      `Shutdown`, so it covers the leg from the moment the listener closes
+      through the goroutine's return. It does NOT test `stopCh`: a requested
+      retirement is
       unobservable through `s.httpsLeg` by construction (the disable arm clears
       the field before retiring; the rebind arm installs the replacement first),
       so that would be an arm for a state that cannot occur. `serving()` is

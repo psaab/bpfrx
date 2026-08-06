@@ -240,6 +240,29 @@ credential revocation is enforced even on an apply that returns early
   next commit retries (retry debt), and log the error. This does not brick an
   otherwise-successful commit (same posture as `reconcileSNMP` bind-failure
   retry).
+- **Failed BOOT start** → **recoverable, not absorbing** (#6827). A boot bind
+  failure leaves NO `api.Server` at all, which is a different state from a
+  failed day-2 rebind (there is no previous leg to retain), and the reconciler
+  used to `return nil` on every later commit — so clearing the cause never
+  brought management back without a daemon restart. Two halves:
+  - **HTTP**: `startTo` retains the root context even when the start FAILS, and
+    a reconcile that finds no live server RETRIES construction. The retry builds
+    from `desired(cfg)`, so the #4047/#5127 loopback clamp is re-applied and no
+    prior listener is carried over — it cannot produce a non-loopback no-auth
+    listener. A genuinely disabled API (no root context because `Daemon.Run`
+    never started one, or an empty `--api-addr`) is still a no-op.
+  - **HTTPS**: `api.Server.Start` returns SUCCESS when only the HTTPS bind fails
+    (HTTPS is best-effort at boot so the HTTP plane stays up), so the error is
+    not a usable signal. `startLocked` asks `api.Server.HTTPSServing()` and
+    leaves the HTTPS fingerprint UNRECORDED when that leg never came up — the
+    same retry-debt posture as a failed rebind. Recording it wholesale pinned
+    the reconciler to a listener that does not exist, and an IDENTICAL later
+    reconcile then saw "no change" and never issued `ReconcileHTTPS`.
+
+  Pinned by `TestMgmtListenerRecoversFromAFailedStart_6827`, whose over-reach
+  guards also hold the two non-retry cases: a disabled API must not be
+  constructed by a reconcile, and a SUCCESSFUL boot HTTPS bind must still record
+  its fingerprint so an identical reconcile is a genuine no-op.
 - **Auth ordering — revocation decoupled from the HTTPS leg**: auth publishes as
   soon as the HTTP leg is at its desired bind (`httpOK`), INDEPENDENT of the
   HTTPS-leg outcome — a committed credential revocation must not be blocked by an
@@ -256,6 +279,46 @@ credential revocation is enforced even on an apply that returns early
   applied to a retained non-loopback listener — no fail-open). The reconcile is
   serialized by its mutex and the apply semaphore, so a newer generation never
   completes behind an older one.
+
+#### Stale management-TLS-certificate diagnosis on rename (#6827)
+
+The auto-generated management HTTPS certificate is DURABLE on disk and is NOT
+re-minted by a later `set system host-name`, so its SANs go stale and clients
+verifying by host name start failing. `pkg/api`'s own load-path diagnostic
+cannot see a plain rename — the HTTPS leg is rebuilt only when the TLS flag or
+the HTTPS bind address changes, so a rename on an unchanged endpoint reloads
+nothing. `Daemon.noteStaleMgmtCertHostName` closes that gap from the apply side.
+It is called from `applyHostname` AFTER `Sethostname` succeeds (ordering is the
+point: before it, the diagnostic would read the OLD kernel name), and it is
+deliberately NOT part of `reconcile()`, which runs early in the apply and can
+only ever see the old name.
+
+Marking and delivering are ONE path (`deliverStaleMgmtCertDiagnosis`), because
+at BOOT the hook runs before its own dependency exists — the first config apply
+is startup phase 4 while `startHTTPServer` publishes `d.mgmt` later in `Run`.
+Three properties carry the mechanism:
+
+- **A debt, not a one-shot.** `staleCertPending` clears only when a delivery
+  actually REACHED a served certificate (`WarnStaleMgmtCertForHostName` reports
+  that). Clearing it whenever the delivery merely RAN loses the diagnosis
+  permanently when HTTPS is off or its bind failed: the next boot's
+  `applyHostname` sees the name already applied and returns early, and the load
+  path's inferred heuristic declines this shape by design. Delivery is retried
+  at the rename, at the boot management start, and on every web-management
+  reconcile (so a later `web-management https` enable settles an old debt).
+- **The name is read from the kernel at DELIVERY**, never stored at rename time,
+  so a deferred diagnosis always describes the name the box has now and can
+  never replay an intermediate or long-past rename.
+- **The clear is generation-fenced.** The hostname read and the certificate
+  inspection run UNLOCKED, so `staleCertGen` is sampled before them and the
+  clear applies only if it still matches. A rename landing in that window (the
+  boot delivery runs on the `Run` goroutine outside `applySem`, while cluster
+  comms — started inside the phase-4 boot apply — can drive a peer `SyncApply`
+  into `applyHostname`) therefore survives instead of being settled by the older
+  delivery's evidence. Pinned by `TestDebtClearIsGenerationSafe_6827`, whose
+  second subtest is the negative control: with no concurrent rename the debt
+  MUST settle, so the fence is proven to narrow the clear rather than suppress
+  it.
 
 #### Effective-listener snapshot for `show system services` (#6385/#6401)
 
