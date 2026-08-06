@@ -29,9 +29,8 @@ import (
 // connection at the moment it became keyed, the secondary would still be
 // unkeyed, and — since #5078 makes a keyed node reject an unkeyed peer, with no
 // migration window — the cluster could never converge. The cluster cannot get
-// itself out of that state, and neither can an operator: see the recovery note
-// below, where both candidate escapes are shown to be CLOSED, not merely
-// untested.
+// itself out of that state. An operator can, but only by deliberately failing
+// the cluster over — see the enumerated recovery paths below.
 //
 // Adding `ControlLinkAuthKey` to clusterTransportKey looks obviously correct
 // ("restart comms when the key changes") and would silently create that
@@ -108,24 +107,27 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 // primary then rejects its handshake forever, and the secondary cannot be keyed
 // locally.
 //
-// There is NO established recovery, and the two paths one would reach for are
-// both closed (#6865 review round 2 — an earlier version of this comment cited
-// the first of them as a hedged possibility, which was wrong):
+// Recovery: exactly ONE path works, and it costs a controlled outage. Three
+// revisions of this comment got it wrong in three different directions — first
+// "console access to the standby", then a README path that is closed, then "no
+// recovery at all". Each replaced a hedge with an absolute. So the paths are
+// enumerated here individually rather than summarized into a verdict:
 //
-//   - Primary-only rekey does not exist. pkg/cluster/README.md sketches
-//     "remove the key on the primary, let the peer reconnect unkeyed,
-//     config-sync pushes, re-add the key" — but the SAME file later states it
-//     outright: clearing the key leaves an unkeyed `chassis cluster`, which is
-//     "exactly what the commit gate rejects, so that path does not exist"
-//     (tracked as #6630). `validateClusterAuthKeyStrict` enforces it, so
-//     `delete chassis cluster authentication-key; commit` is refused.
-//   - Console access to the standby does not help either. The read-only gate is
-//     on the CONFIG STORE, not on the transport: EnterConfigureSession returns
-//     ErrClusterReadOnly regardless of how the operator reached the box.
+//   - Primary-only rekey — CLOSED. Clearing the key leaves an unkeyed
+//     `chassis cluster`, which is what the commit gate rejects, so
+//     `delete chassis cluster authentication-key; commit` is refused by
+//     `validateClusterAuthKeyStrict` (#6630).
+//   - Console on the seated secondary — CLOSED. The read-only gate is on the
+//     CONFIG STORE, not the transport, so EnterConfigureSession returns
+//     ErrClusterReadOnly however the operator reached the box.
+//   - Controlled RG0 promotion — OPEN. Stop xpfd on the keyed primary; the
+//     secondary wins the election and applyRG0OwnershipTransition(StatePrimary)
+//     calls store.SetClusterReadOnly(false), so it accepts a local commit of
+//     the same key. Restart the old primary and the pair converges keyed.
 //
-// So the deadlock is genuinely unrecovered, not merely unverified. That is the
-// reason step 20 must never restart comms on a key commit — there is no second
-// chance to fall back on.
+// So step 20 must never restart comms on a key commit not because the state is
+// unrecoverable, but because the only way out is a deliberate single-node
+// outage — a config commit that silently becomes a failover.
 //
 // Observable: clusterCommsGen. stopClusterComms bumps it before anything else,
 // and startClusterComms bumps it via beginClusterCommsEpoch, so an unchanged
@@ -258,7 +260,11 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 		// inside a subtest: under a mutation that DOES add ControlLinkAuthKey
 		// to clusterTransportKey, that write masked key_commit_must_not_restart
 		// when this subtest ran first (measured). The three subtests are
-		// order-independent only because none of them mutates `d`.
+		// order-independent because none of them REWRITES `d.activeClusterTransport`.
+		// They do mutate `d` — applyTailReconciles reaches stopClusterComms, which
+		// increments d.clusterCommsGen, and that is the very thing each subtest
+		// measures. The distinction matters: a shared counter every subtest reads
+		// before and after is fine; a shared field one subtest overwrites is not.
 		//
 		// "Keyed" here therefore means the CANDIDATE config is keyed while the
 		// active transport is unchanged — which is exactly the production shape

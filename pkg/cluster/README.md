@@ -275,24 +275,39 @@ the HA-sync ingress path bypasses the gate).
    verify the secondary applied the key immediately after; treat a drop in that
    window as requiring the recovery below.
 
-**Recovery: there is none today. Do not plan around one.** An earlier revision
-of this section proposed removing the key on the primary → peer reconnects
-unkeyed → config-sync pushes → re-add the key, and labelled it UNVERIFIED. That
-was worse than unverified: it is **closed**, and this same document says so
-below under "Do not try to return to dual-accept by clearing the key first" —
-an unkeyed `chassis cluster` is exactly what the commit gate rejects
-(`validateClusterAuthKeyStrict`), so `delete chassis cluster
-authentication-key; commit` is refused. Tracked as **#6630**.
+**Recovery: exactly one path works, and it costs a controlled outage.** Two
+earlier revisions of this section got this wrong in opposite directions — one
+proposed a primary-only rekey and labelled it UNVERIFIED, the next said no
+recovery existed at all. Both were overclaims. The three candidate paths, stated
+individually so the next reader does not have to take a verdict on trust:
 
-Console access to the standby does not substitute for it either: the read-only
-gate is on the **config store**, not the transport, so `EnterConfigureSession`
-returns `ErrClusterReadOnly` however the operator reached the box.
+1. **Primary-only rekey — CLOSED.** "Remove the key on the primary, let the peer
+   reconnect unkeyed, config-sync pushes, re-add the key" cannot start: an
+   unkeyed `chassis cluster` is what the commit gate rejects, so `delete chassis
+   cluster authentication-key; commit` is refused by
+   `validateClusterAuthKeyStrict`. This document says the same thing under "Do
+   not try to return to dual-accept by clearing the key first". Tracked as
+   **#6630**.
+2. **Console on the seated secondary — CLOSED.** The read-only gate is on the
+   **config store**, not the transport, so `EnterConfigureSession` returns
+   `ErrClusterReadOnly` however the operator reached the box.
+3. **Controlled RG0 promotion — OPEN, and this is the one.** Stop `xpfd` on the
+   keyed primary. The secondary times it out, wins the election, and
+   `applyRG0OwnershipTransition(StatePrimary)` calls
+   `d.store.SetClusterReadOnly(false)` ("became primary for RG0, enabling config
+   writes"). The now-primary node accepts a local commit of the same key;
+   restart the old primary and the pair converges keyed. This is the same
+   stop-one-node shape already documented above for
+   `configuration-synchronize`.
 
-So keyed-primary / unkeyed-secondary is an unrecovered state. That is precisely
-why committing `authentication-key` must never restart cluster comms — there is
-no fallback to land on. `TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
-`TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` pin that; if either reds,
-the change under your hand is the one that creates this state.
+So the state is recoverable, but only by deliberately failing the cluster over —
+you have turned a config commit into an outage. That is why committing
+`authentication-key` must never restart cluster comms: the fallback exists, and
+it is one you would have to schedule.
+`TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
+`TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` pin the no-restart
+behaviour; if either reds, the change under your hand is the one that forces
+that outage.
 
 ## Control-channel authentication (#4107, PR-A)
 
@@ -766,7 +781,15 @@ constraint rather than recommended practice.
 
 ### Rolling it onto a live unkeyed cluster
 
-Dual-accept makes the forward direction non-disruptive:
+**STALE — dual-accept was removed by #5078; the sequence below no longer works
+as written.** It is kept for the shape of the problem, not as a procedure. Step 2
+asks the operator to commit the key on the *other* node: on a seated RG0
+secondary that returns `ErrClusterReadOnly`, and if sync drops before step 2 the
+keyed side rejects the unkeyed reconnect outright. See "Recovery: exactly one
+path works" above for what is actually available. Rewriting this section is
+tracked as **#6881**.
+
+Dual-accept made the forward direction non-disruptive:
 
 1. Set the key on one node and commit. It now signs; the unkeyed peer has no
    key, so it accepts everything, and the keyed node has not armed

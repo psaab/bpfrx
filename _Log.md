@@ -925,6 +925,48 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 round 4: three revisions of one claim, wrong in three directions
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The round-3 re-gate returned NO runtime or guard-coverage findings
+  — the keyed assertion still fires, the deleted seating assignment was not
+  load-bearing, both orderings behave identically, and both disclosed escapes
+  reproduce exactly. Three comment findings remain, all mine.
+  **G1 — "Recovery: there is none today" is false; controlled failover works.**
+  Verified firsthand rather than taken on report:
+  `applyRG0OwnershipTransition(StatePrimary)` calls
+  `d.store.SetClusterReadOnly(false)` and logs "became primary for RG0, enabling
+  config writes". So stopping xpfd on the keyed primary lets the secondary
+  promote and accept a local commit of the same key. The README already
+  documents this stop-one-node shape for `configuration-synchronize`.
+  This is the THIRD version of this sentence and the third one wrong: round 2
+  said "recoverable only by console access", the round-2 fix deferred to a
+  README path that is closed, round 3 said no recovery exists. Every one
+  replaced a hedge with an absolute. Rewritten as an ENUMERATION of the three
+  candidate paths with each marked CLOSED or OPEN, so the next reader checks a
+  list instead of trusting a verdict. The argument for step 20 survives and is
+  stronger for being true: the escape exists but is a deliberate single-node
+  outage, so a key commit that restarts comms silently becomes a failover.
+  **G2 — "none of them mutates `d`" is too broad.** The subtests DO mutate `d`:
+  applyTailReconciles reaches stopClusterComms, which increments
+  `d.clusterCommsGen` — the very thing each subtest measures. The accurate claim
+  is that none REWRITES `d.activeClusterTransport`. Corrected here and in the
+  round-3 log entry.
+  **G3 — the README rollout section describes removed dual-accept**, and my new
+  recovery section now contradicts it directly ~500 lines up. Marked STALE
+  inline with a pointer to the correct enumeration; the rewrite plus three
+  matching `sync_auth.go` comments are filed as #6881.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go, pkg/cluster/README.md, _Log.md
+- **Validation**: `go vet ./pkg/daemon/` rc=0; `go test` rc=0 for pkg/daemon,
+  pkg/cluster, pkg/configstore, pkg/refactoraudit.
+  `git diff --quiet HEAD -- '*.go' ':(exclude)**/*_test.go'` rc=0 — production
+  untouched in rounds 2, 3 and 4.
+  Gate cells at round 3, all reproduced by the reviewer: load-bearing mutation
+  vet rc=0 then rc=1 failing exactly `keyed_endpoint_change_must_still_restart`;
+  original test blob from `826cd48db` under the same mutation rc=0; transport-key
+  mutation RED identically in source order AND keyed-first order; both disclosed
+  escapes GREEN as documented.
+
 ## 2026-08-05 — #6865 gate round 3: my own round-2 fold shipped a false comment and a no-op
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
