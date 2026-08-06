@@ -2299,3 +2299,348 @@ fn shim_walk_corpus_negative_control() {
     let one = chain(&[(DEST, 0)], TCP, 0);
     assert_eq!(userspace_verdict(&one, 0), Verdict::L4(48, TCP));
 }
+
+// ---------------------------------------------------------------------------
+// #6923: the OVER-LIMIT refusal, end to end.
+//
+// Everything above compares the two WALKS. This section is about what happens
+// after one of them gives up, because that is where the walk's own doc comment
+// makes a claim it cannot see: exhausting `MAX_EXT_HDRS` "returns the last
+// declared next-header value, ... the session key misses, and the packet is
+// redirected to userspace — the fail-closed path for an over-limit chain."
+//
+// The miss is not a property of the shim. It is a property of the session MAP,
+// which userspace writes. The claim is only true if no writer can produce
+// `(AF_INET6, <a next-header the walk traverses>, src, dst, 0, 0)` — and before
+// #6923 the ORDINARY packet path could: `metadata_tuple_complete` accepted every
+// non-TCP/UDP metadata tuple, so the residual extension-header protocol with
+// ports 0/0 became a `SessionFlow`, `flow.is_none()` went false, the #4743
+// over-limit drop was skipped, an `application any` permit matched (no ports to
+// fail on), and the resulting key was installed and published. The next packet
+// of that chain then HIT.
+//
+// These tests run the REAL shim walk to build the fixture — the chain length is
+// derived from the shim's own `MAX_EXT_HDRS` and the residual protocol is
+// whatever the shim actually returns, not a hand-written 60 — and then drive the
+// production flow parser the install path uses.
+// ---------------------------------------------------------------------------
+
+/// Every next-header value the walk TRAVERSES, taken from the SHIM's classifier
+/// rather than restated: `eh_class` files exactly these under GENERIC / AUTH /
+/// FRAGMENT. No-Next-Header (59) is excluded because it is a terminal verdict on
+/// both sides, not a header either walker steps past.
+fn shim_traversable_protocols() -> Vec<u8> {
+    (0u8..=255)
+        .filter(|p| {
+            matches!(
+                shim_walk::eh_class(*p),
+                EH_CLASS_GENERIC | EH_CLASS_AUTH | EH_CLASS_FRAGMENT
+            )
+        })
+        .collect()
+}
+
+const WITNESS_SRC: [u8; 16] = [
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11,
+];
+const WITNESS_DST: [u8; 16] = [
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x22,
+];
+
+/// A full Ethernet frame — `eth(14) || IPv6 || n × 8-byte `proto` header || TCP`
+/// — carrying real routable-looking addresses and a correct `payload_len`, so
+/// the production parsers accept it as an ordinary transit packet and only the
+/// chain length is unusual.
+///
+/// Each of the `n` headers is `[next, 0, 0, 0, 0, 0, 0, 0]`, which is the minimum
+/// 8-byte form of ALL THREE traversable arms at once: GENERIC reads
+/// `HdrExtLen = 0` and advances `(0 + 1) * 8`, AUTH reads `len = 0` and advances
+/// `(0 + 2) * 4`, Fragment advances its fixed 8 with offset/M zero (so it is a
+/// FIRST fragment and no fragment predicate diverts the packet). One generator
+/// therefore builds a real chain for every member of the traversable set.
+fn ext_chain_frame(proto: u8, n: usize) -> Vec<u8> {
+    let mut frame = vec![0u8; 14];
+    frame[12] = 0x86;
+    frame[13] = 0xDD;
+    let payload_len = (n * 8 + 20) as u16;
+    let mut ip6 = vec![0u8; 40];
+    ip6[0] = 0x60;
+    ip6[4..6].copy_from_slice(&payload_len.to_be_bytes());
+    ip6[6] = if n == 0 { TCP } else { proto };
+    ip6[7] = 64;
+    ip6[8..24].copy_from_slice(&WITNESS_SRC);
+    ip6[24..40].copy_from_slice(&WITNESS_DST);
+    frame.extend_from_slice(&ip6);
+    for i in 0..n {
+        let next = if i + 1 == n { TCP } else { proto };
+        frame.extend_from_slice(&[next, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    // A syntactically valid 20-byte TCP header: ports 0x1234/0x5678 and a data
+    // offset of 5 words, which is what the shim's `parse_l4` requires before it
+    // will report ports. A resolvable chain therefore yields REAL ports, so the
+    // within-limit control below is a genuine flow and not another 0/0 tuple.
+    let mut tcp = vec![0u8; 20];
+    tcp[0..2].copy_from_slice(&0x1234u16.to_be_bytes());
+    tcp[2..4].copy_from_slice(&0x5678u16.to_be_bytes());
+    tcp[12] = 0x50;
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+/// The metadata the SHIM stamps for `frame`, MEASURED by running its walk and
+/// then applying `parse_l4` the way `parse_ipv6` does — `l4_offset` and
+/// `protocol` are the walk's own return values, and the ports are `parse_l4`'s
+/// catch-all `(l4_offset, 0, 0, 0, 0)` for anything that is not TCP/UDP/ICMP.
+///
+/// Nothing here is a model of the shim: the two fields the finding turns on come
+/// out of `walk_ipv6_ext_headers` itself.
+fn shim_meta_for(frame: &[u8], l3: usize) -> UserspaceDpMeta {
+    let (l4_offset, protocol) = raw_shim_walk(frame, l3).expect("the shim's walk must not refuse");
+    let (src_port, dst_port) = match protocol {
+        TCP => (0x1234u16, 0x5678u16),
+        // `parse_l4`'s catch-all: no ports are read for any other protocol.
+        _ => (0, 0),
+    };
+    UserspaceDpMeta {
+        addr_family: libc::AF_INET6 as u8,
+        protocol,
+        l3_offset: l3 as u16,
+        l4_offset,
+        flow_src_addr: WITNESS_SRC,
+        flow_dst_addr: WITNESS_DST,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// The key the SHIM probes `USERSPACE_SESSIONS` with for `meta` — the same six
+/// fields `session_map_key` (`afxdp/bpf_map/mod.rs`) copies verbatim out of the
+/// `SessionKey` the install path publishes, so a `SessionKey` equal to this one
+/// IS a hit.
+fn shim_probe_key(meta: UserspaceDpMeta) -> SessionKey {
+    SessionKey {
+        addr_family: meta.addr_family,
+        protocol: meta.protocol,
+        src_ip: IpAddr::V6(Ipv6Addr::from(meta.flow_src_addr)),
+        dst_ip: IpAddr::V6(Ipv6Addr::from(meta.flow_dst_addr)),
+        src_port: meta.flow_src_port,
+        dst_port: meta.flow_dst_port,
+    }
+}
+
+/// #6923 — the blocking one. For EVERY next-header value the shim's walk
+/// traverses, a chain one longer than the shim can resolve must not become a
+/// session flow.
+///
+/// The chain length comes from `shim_walk::MAX_EXT_HDRS`, so this fixture is
+/// over-limit by construction and stays over-limit if the bound moves; the
+/// residual protocol comes from the shim's own walk, so the key asserted about
+/// is the key the shim will really probe with.
+///
+/// Fails on revert with "must NOT become a session flow" — before #6923
+/// `parse_session_flow_from_bytes` returned `Some` here, keyed on the residual
+/// extension-header protocol with ports 0/0.
+#[test]
+fn over_limit_chain_never_becomes_a_session_flow() {
+    let traversable = shim_traversable_protocols();
+    assert_eq!(
+        traversable.len(),
+        10,
+        "#6923: the shim's traversable set changed size; the sweep below is only as wide as \
+         `eh_class` says it is, so a new member must be understood before this test is retuned"
+    );
+    for proto in traversable {
+        let n = shim_walk::MAX_EXT_HDRS + 1;
+        let frame = ext_chain_frame(proto, n);
+        let meta = shim_meta_for(&frame, 14);
+
+        // The fixture really is over-limit: the shim EXHAUSTED its loop and is
+        // still holding an extension-header type, and this crate's independent
+        // walker agrees. Without this pair the refusal below could be a
+        // refusal of a truncated or malformed packet instead.
+        assert_ne!(
+            shim_walk::eh_class(meta.protocol),
+            EH_CLASS_TERMINAL,
+            "#6923: proto={proto}: the shim resolved a terminal for a chain of {n} headers, so \
+             this fixture does not exceed MAX_EXT_HDRS and proves nothing about the over-limit \
+             path"
+        );
+        assert_eq!(
+            walk_ipv6_ext_chain(&frame, 14).outcome,
+            ExtChainOutcome::OverLimit,
+            "#6923: proto={proto}: this crate's walker must call a {n}-header chain OverLimit"
+        );
+
+        // The metadata arm CAN still build the colliding key — the shim really
+        // does hand up a complete-looking tuple, and this states which key it
+        // is rather than leaving it implied.
+        assert_eq!(
+            parse_session_flow_from_meta(meta).map(|f| f.forward_key),
+            Some(shim_probe_key(meta)),
+            "#6923: proto={proto}: the metadata tuple the shim stamps is not the key it probes \
+             with, so this test is not demonstrating the collision it claims"
+        );
+        assert_eq!(
+            meta.flow_src_port, 0,
+            "#6923: proto={proto}: parse_l4's catch-all must leave the ports at 0/0"
+        );
+        assert_eq!(meta.flow_dst_port, 0);
+
+        // THE BINDING ASSERTION: the production entry point the install path
+        // calls must refuse it, so `flow.is_none()` holds and the #4743 gate
+        // fires.
+        assert_eq!(
+            parse_session_flow_from_bytes(&frame, meta),
+            None,
+            "#6923: proto={proto}: an over-limit IPv6 extension-header chain must NOT become a \
+             session flow. It did, keyed on protocol {} with ports 0/0 — the exact key the shim \
+             probes for the next packet of this chain, so the over-limit refusal the walk \
+             documents becomes conditional on policy instead of unconditional",
+            meta.protocol
+        );
+        assert!(
+            ipv6_ext_chain_over_limit(&frame, libc::AF_INET6 as u8),
+            "#6923: proto={proto}: with no flow derived, the #4743 drop gate must recognise the \
+             chain as over-limit — otherwise the packet is forwarded flowless instead of dropped"
+        );
+    }
+}
+
+/// NEGATIVE CONTROL for the refusal above, and the proof that the pipeline it
+/// drives is the one that publishes session keys.
+///
+/// The same generator, one header SHORTER — the longest chain the shim resolves
+/// — must still produce a flow, and that flow's `forward_key` must be exactly
+/// the key the shim probes with. So the machinery under test genuinely turns a
+/// shim-stamped tuple into a published session identity; the over-limit case
+/// above is a refusal, not a dead pipeline.
+///
+/// Stays GREEN under the #6923 revert: nothing here is over-limit.
+#[test]
+fn at_limit_chain_still_publishes_the_key_the_shim_probes() {
+    for proto in shim_traversable_protocols() {
+        let n = shim_walk::MAX_EXT_HDRS;
+        let frame = ext_chain_frame(proto, n);
+        let meta = shim_meta_for(&frame, 14);
+        assert_eq!(
+            meta.protocol, TCP,
+            "#6923: proto={proto}: the shim must resolve a chain of exactly MAX_EXT_HDRS ({n}) \
+             headers to its terminal; if it does not, the control is not at the limit"
+        );
+        let flow = parse_session_flow_from_bytes(&frame, meta).unwrap_or_else(|| {
+            panic!(
+                "#6923: proto={proto}: a resolvable {n}-header chain must still produce a session \
+                 flow — the over-limit refusal must not over-reach onto chains at the bound"
+            )
+        });
+        assert_eq!(
+            flow.forward_key,
+            shim_probe_key(meta),
+            "#6923: proto={proto}: the published key must be the key the shim probes with"
+        );
+        assert_eq!(flow.forward_key.src_port, 0x1234);
+        assert_eq!(flow.forward_key.dst_port, 0x5678);
+    }
+}
+
+/// OVER-REACH GUARD: the refusal is scoped to the traversable set on IPv6, and
+/// to nothing else. Every one of these stays GREEN under the #6923 revert —
+/// that is what makes it a guard rather than a restatement of the fix.
+#[test]
+fn over_limit_refusal_does_not_over_reach() {
+    // (a) ESP (50) is deliberately NOT traversable on either side: the payload
+    //     is encrypted and the inner next-header unreadable, so it is a
+    //     RESOLVED terminal. An IPsec flow must keep its metadata tuple.
+    assert_eq!(
+        shim_walk::eh_class(50),
+        EH_CLASS_TERMINAL,
+        "#6923: ESP must stay a terminal on the shim side"
+    );
+    let esp = ext_chain_frame(DEST, 1);
+    let mut esp_meta = shim_meta_for(&esp, 14);
+    esp_meta.protocol = 50;
+    esp_meta.flow_src_port = 0;
+    esp_meta.flow_dst_port = 0;
+    assert_eq!(
+        parse_session_flow_from_bytes(&esp, esp_meta).map(|f| f.forward_key.protocol),
+        Some(50),
+        "#6923: an ESP flow carries ports 0/0 too, and must NOT be caught by the refusal"
+    );
+
+    // (b) No-Next-Header (59) is a terminal verdict, not a traversed header.
+    assert_eq!(shim_walk::eh_class(59), EH_CLASS_NONEXT);
+    let mut nonext_meta = esp_meta;
+    nonext_meta.protocol = 59;
+    assert_eq!(
+        parse_session_flow_from_bytes(&esp, nonext_meta).map(|f| f.forward_key.protocol),
+        Some(59),
+        "#6923: No-Next-Header is a resolved terminal on both sides, not an unresolved chain"
+    );
+
+    // (c) IPv4 is untouched: 0/43/44/51/60/135/... are ordinary IPv4 protocol
+    //     numbers with no extension-header meaning, and the same values must
+    //     still form complete IPv4 metadata tuples.
+    for proto in shim_traversable_protocols() {
+        let mut v4 = vec![0u8; 14];
+        v4[12] = 0x08;
+        v4[13] = 0x00;
+        let mut ip4 = vec![0u8; 20];
+        ip4[0] = 0x45;
+        ip4[2..4].copy_from_slice(&24u16.to_be_bytes());
+        ip4[8] = 64;
+        ip4[9] = proto;
+        ip4[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        ip4[16..20].copy_from_slice(&[192, 0, 2, 2]);
+        v4.extend_from_slice(&ip4);
+        v4.extend_from_slice(&[0u8; 4]);
+        let meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol: proto,
+            l3_offset: 14,
+            l4_offset: 34,
+            flow_src_addr: {
+                let mut a = [0u8; 16];
+                a[..4].copy_from_slice(&[192, 0, 2, 1]);
+                a
+            },
+            flow_dst_addr: {
+                let mut a = [0u8; 16];
+                a[..4].copy_from_slice(&[192, 0, 2, 2]);
+                a
+            },
+            ..UserspaceDpMeta::default()
+        };
+        assert_eq!(
+            parse_session_flow_from_bytes(&v4, meta).map(|f| f.forward_key.protocol),
+            Some(proto),
+            "#6923: IPv4 protocol {proto} has no extension-header meaning and must not be refused"
+        );
+    }
+}
+
+/// The refused set and the shim's traversable set are the SAME set, checked
+/// against `eh_class` over all 256 values.
+///
+/// This is what makes the class set load-bearing in both directions: teaching
+/// either walker a new extension-header type without teaching
+/// `ipv6_ext_header_is_traversable` about it reds here, and so does the reverse.
+/// Without it the refusal could silently stop covering a type the shim keeps
+/// walking past — which is exactly the shape of the defect it fixes.
+#[test]
+fn refused_protocol_set_equals_the_shim_traversable_set() {
+    for proto in 0u8..=255 {
+        let shim_traverses = matches!(
+            shim_walk::eh_class(proto),
+            EH_CLASS_GENERIC | EH_CLASS_AUTH | EH_CLASS_FRAGMENT
+        );
+        assert_eq!(
+            crate::afxdp::ipv6_ext_header_is_traversable(proto),
+            shim_traverses,
+            "#6923: proto={proto}: the set userspace refuses as an unresolved IPv6 chain must be \
+             exactly the set the shim's walk traverses ({}), or an over-limit chain of this type \
+             still mints an installable key",
+            class_name(shim_walk::eh_class(proto))
+        );
+    }
+}
