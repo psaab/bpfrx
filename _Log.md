@@ -68454,3 +68454,52 @@ break — `go vet` confirmed passing under every revert.
   pkg/networkd/networkd.go, pkg/networkd/reload_debt_process_5718_test.go,
   pkg/networkd/README.md, pkg/daemon/linksetup.go,
   pkg/daemon/networkctl_reload_debt_5718_test.go, _Log.md
+- **Timestamp**: 2026-08-06 03:40
+- **Action**: #6825 review fold r5 (#5718 C-HA) — DOCUMENTATION ONLY, no
+  behaviour change. The gate returned a THIRD hole in the same area: a rebooted
+  peer whose replacement enters through an EMPTY alternate slot. Sequence: A
+  holds conn0 with conn1 already down; A hard-reboots leaving conn0 half-open;
+  A' connects on fabric 1; `installConn` sees a non-empty registry but an EMPTY
+  target slot, so BOTH `wasDisconnected` and `supersededCurrent` are false — no
+  incarnation advance, no eviction, no capability clear, no cold-prime arm; A'
+  is stamped with the SAME incarnation as dead conn0, so
+  `preferredFabricLocked` picks the corpse; and when conn0 drops, conn1 keeps
+  `connected` true so the full-disconnect path never runs and A' is never
+  primed. Reproduced firsthand with a throwaway test before writing anything
+  (`activeConn_is_dead_conn0=true`, `shouldColdPrime=false`, and after the conn0
+  drop `Connected=true PeerHealthy=true`); the scratch file was deleted, not
+  committed. **Not fixed locally, deliberately**: step 4 is observationally
+  identical to the routine case (same peer bringing up its second fabric after a
+  link flap) and nothing on the wire distinguishes them — the missing
+  peer-cold/boot-incarnation signal #5480 already records and defers. Any local
+  heuristic that reads it as a reboot also reads every routine second-fabric
+  recovery as one, re-priming the whole session table on each link blip and
+  destroying the #466 flap suppression. Filed as #6910, blocked on #6669 (boot
+  epoch signed into the heartbeat). **One correction to the finding, verified
+  before documenting**: its two halves do NOT decay alike. Step 5 (dead conn0
+  preferred) is TIME-BOUNDED for an ack-capable peer at ~2 read deadlines (~20s
+  at the 10s default) — because this path performs no incarnation advance,
+  `peerHeartbeatAckEver` is NOT cleared, so `receiveLoop`'s missed-heartbeat
+  teardown stays ARMED. That is the exact inverse of the two-fabric supersession
+  case, where the advance clears the latch and disarms the teardown, which is
+  why THAT case needed eviction and this one partly self-heals. Step 6 (A' never
+  primed) is NOT bounded: when conn0 drops, `handleDisconnect` takes the `else
+  if !s.outboundBulkAcked` branch, so A' is re-primed only if our outbound bulk
+  to the OLD A had never been acked — in steady state it had, so nothing fires.
+  Step 6 is the half that genuinely needs #6669. Documented in
+  `pkg/cluster/README.md` (full six-step sequence, why it is locally
+  undecidable, the bounded/unbounded split, #6910 + #6669), at the
+  `supersededCurrent` classification site and in
+  `evictStaleIncarnationConnsLocked` (so a maintainer reading either does not
+  rediscover the limit), and on `TestSecondFabricComingUpIsNotEvicted_5718` and
+  `TestRoutineInstallDoesNotReArmColdPrime_5718`, which now say they pin the
+  ROUTINE reading deliberately and must not be "fixed" into failing. Rebased
+  onto master 5d20e13de: `_Log.md` union-resolved (0 deletions against master
+  AND against the pre-rebase branch; all five PR rounds present) plus one real
+  code conflict in `pkg/cluster/sync.go`, where #5078/#6865 had rewritten the
+  `authProvider` doc — resolved keeping BOTH master's updated comment and this
+  branch's `peerIncarnation`/`conn0Gen`/`conn1Gen` fields. No assertion, no
+  classification and no heuristic changed. Advances #5718.
+- **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md

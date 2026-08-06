@@ -223,6 +223,15 @@ func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 // took, and it CONVERGES — the pre-eviction shape did not, because the retired
 // socket stayed installed and un-evictable until TCP finally gave up
 // retransmitting, which is minutes.
+//
+// KNOWN-INCOMPLETE (#6910, blocked on #6669): this only fires when installConn
+// classifies a SUPERSESSION, and occupancy-based classification cannot see a
+// reboot whose replacement enters through an EMPTY alternate slot — the target
+// slot is empty, so supersededCurrent is false, nothing is evicted and no
+// cold-prime is armed. That shape is observationally identical to the routine
+// case (the same process bringing up its second fabric), so it is not fixable
+// here: it needs the peer-supplied boot epoch #6669 signs into the heartbeat.
+// See pkg/cluster/README.md for the full sequence and which half self-heals.
 func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
 	evicted := false
 	if keepIdx != 0 && s.conn0 != nil && s.conn0Gen != s.peerIncarnation {
@@ -458,6 +467,19 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// slot, not a further incarnation change (fold F1b): treating it as one
 	// would strand the connection that legitimately proved the capability at a
 	// stale stamp, so it could never re-arm.
+	//
+	// LIMIT OF THIS CLASSIFICATION (#6910, blocked on #6669): wasDisconnected
+	// and supersededCurrent between them detect a reboot only when it lands on
+	// an OCCUPIED slot or an empty registry. A reboot whose replacement dials
+	// the EMPTY alternate slot, while the dead process's socket sits
+	// ESTABLISHED in the other one, satisfies NEITHER — so it advances no
+	// incarnation, evicts nothing, clears no capability and arms no cold prime,
+	// and the replacement is stamped current alongside the corpse (which then
+	// wins fab0 preference if it holds slot 0). Nothing observable locally
+	// separates that from the same peer bringing up its second fabric after a
+	// link flap, so do NOT add a heuristic here — it needs the peer-supplied
+	// boot epoch #6669 signs into the heartbeat. Full sequence, and which half
+	// self-heals, in pkg/cluster/README.md under "ACCEPTED RESIDUAL".
 	supersededCurrent := false
 	switch fabricIdx {
 	case 0:

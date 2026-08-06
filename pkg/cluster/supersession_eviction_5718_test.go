@@ -146,6 +146,14 @@ func TestInstallConnNeverLeavesTheRegistryEmpty_5718(t *testing.T) {
 // process taking its second link. Evicting there would tear down a healthy
 // fabric on every routine link recovery. Both orderings run so neither arm of
 // the eviction check can be mutated to fire unconditionally unnoticed.
+//
+// This pins the ROUTINE reading DELIBERATELY. A peer that REBOOTED and whose
+// replacement enters through this same empty slot is observationally identical
+// here — no local signal separates them — and it is tracked as #6910, blocked
+// on #6669's peer-supplied boot epoch. Do not "fix" this test into failing to
+// close that case: making the empty-slot install evict would tear down a
+// healthy fabric on every link flap. See pkg/cluster/README.md, "ACCEPTED
+// RESIDUAL".
 func TestSecondFabricComingUpIsNotEvicted_5718(t *testing.T) {
 	for _, tc := range []struct{ first, second int }{{0, 1}, {1, 0}} {
 		t.Run(fabricPairName(tc.first, tc.second), func(t *testing.T) {

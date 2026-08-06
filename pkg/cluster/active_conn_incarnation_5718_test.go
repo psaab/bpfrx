@@ -181,6 +181,14 @@ func TestSupersessionReArmsColdPrime_5718(t *testing.T) {
 // a new peer. A fabric link coming up into an EMPTY slot beside a live one is
 // the same peer process, and re-priming there would re-run a full bulk on every
 // routine fabric flap — the #466 flap-suppression the existing code preserves.
+//
+// This pins the ROUTINE reading DELIBERATELY. A peer that REBOOTED and whose
+// replacement enters through this same empty slot presents identically to a
+// local observer, and it is the one reboot shape occupancy-based classification
+// cannot see — tracked as #6910, blocked on #6669's peer-supplied boot epoch.
+// Do not "fix" this test into failing to close that case: arming the cold prime
+// on every empty-slot install re-bulks the whole session table on every link
+// flap. See pkg/cluster/README.md, "ACCEPTED RESIDUAL".
 func TestRoutineInstallDoesNotReArmColdPrime_5718(t *testing.T) {
 	ss := newAckTestSync(t)
 

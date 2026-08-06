@@ -1573,6 +1573,58 @@ outside the monitor loop:
   pre-eviction shape did not, because the retired socket stayed installed and
   un-evictable until TCP gave up retransmitting, which is minutes.
 
+  **ACCEPTED RESIDUAL: a rebooted peer entering through an EMPTY alternate slot
+  (#6910, blocked on #6669).** Everything above keys off `installConn`'s
+  occupancy-based classification, and there is one reboot shape that
+  classification cannot see:
+
+  1. Peer A holds `conn0`; `conn1` is already down/empty.
+  2. A hard-reboots. `conn0` stays ESTABLISHED locally — no FIN/RST.
+  3. A's replacement A' connects first (or only) on fabric 1.
+  4. `installConn` sees a NON-empty registry but an EMPTY target slot, so
+     `wasDisconnected` is false and `supersededCurrent` is false. No incarnation
+     advance, no eviction, no capability clear, no cold-prime arm.
+  5. A' is stamped with the SAME incarnation as the dead `conn0`, so both look
+     current and `preferredFabricLocked` picks dead fabric 0 over live fabric 1.
+  6. When `conn0` eventually drops, `conn1` keeps `connected` true, so the
+     full-disconnect path never runs and A' never receives the survivor's
+     session table. The next failover to it can blackhole.
+
+  **Why this is not fixed locally.** Step 4 is observationally IDENTICAL to the
+  routine case — the same peer process bringing up its second fabric after a
+  link flap. Both present as "an empty slot filled while another slot is
+  occupied", and nothing on the wire distinguishes them: the sync handshake
+  carries no peer-cold / boot-incarnation / table-count signal (the same gap
+  #5480 records and defers). Any local heuristic that treats step 4 as a reboot
+  necessarily also treats every routine second-fabric recovery as one, which
+  re-primes the entire session table on every link blip and destroys the #466
+  flap suppression #5480 deliberately preserved.
+  `TestSecondFabricComingUpIsNotEvicted_5718` and
+  `TestRoutineInstallDoesNotReArmColdPrime_5718` pin the ROUTINE reading on
+  purpose. They are correct as written; do NOT "fix" them into failing to close
+  this residual. The separating signal is a peer-supplied boot epoch, which
+  #6669 introduces (signed in the heartbeat) and #6910 consumes.
+
+  **What is and is not bounded, since the two halves differ.** Steps 5 and 6 do
+  not decay at the same rate:
+
+  - Step 5 (dead `conn0` preferred) is TIME-BOUNDED for an ack-capable peer, and
+    for a reason specific to this path: no incarnation advance happens here, so
+    `peerHeartbeatAckEver` is NOT cleared and `receiveLoop`'s missed-heartbeat
+    teardown stays ARMED. `conn0` is closed after 2 read deadlines (~20s at the
+    10s default). This is the opposite of the two-fabric supersession case
+    above, where the advance clears the latch and disarms that teardown — which
+    is exactly why THAT case needed eviction and this one partially self-heals.
+    For a peer that never proved ack support the latch is false, enforcement is
+    intentionally disabled, and no bound applies.
+  - Step 6 (A' never primed) is NOT bounded and does not self-heal. When
+    `conn0` finally drops, `handleDisconnect` takes the `else if
+    !s.outboundBulkAcked` branch — so A' is re-primed ONLY if our outbound bulk
+    to the OLD A had never been acked. In steady state it had been, so no
+    re-drive fires and A' keeps an empty session table indefinitely. This is the
+    half that genuinely requires #6669's boot epoch, and it is the half #6910
+    must close.
+
   **A supersession re-arms the cold prime (#5718 fold r4).** `needColdPrime`
   was armed only on the full-disconnect edge. Superseding a CURRENT connection
   is positive evidence of a new peer process — the signal #5480 records as
