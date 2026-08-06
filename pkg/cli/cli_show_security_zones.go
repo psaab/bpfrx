@@ -85,12 +85,20 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 			switch {
 			case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
 				errors.Is(errOut, dataplane.ErrCounterNotPopulated):
-				// #3643 HIDE: per-zone traffic counters are not sourced by the
-				// userspace dataplane. Say so explicitly rather than printing a
-				// misleading 0 (or, before #3643, erroring on the stable-hash
-				// zone id OOB).
+				// #6843: per-zone accounting IS implemented and populated
+				// (#3651). ErrCounterNotPopulated now means the helper has
+				// published nothing for THIS zone, which has three causes: a
+				// pre-#3651 helper, a zone past the helper's hot-path slot
+				// capacity (its traffic really is uncounted), or an idle zone.
+				// Naming "not implemented" was accurate under the #3643 HIDE
+				// and is now actively misleading — with 64+ zones one `show
+				// security zones` prints real byte counts for slotted zones and
+				// "not implemented" for overflowed ones, pointing the operator
+				// at the wrong cause.
 				fmt.Println("  Traffic statistics: not available " +
-					"(per-zone accounting not implemented in the userspace dataplane)")
+					"(no per-zone volume published for this zone: helper predates " +
+					"per-zone accounting, the zone exceeded the dataplane's " +
+					"hot-path slot capacity, or the zone is idle)")
 			case errIn == nil && errOut == nil:
 				fmt.Println("  Traffic statistics:")
 				fmt.Printf("    Input:  %d packets, %d bytes\n",
