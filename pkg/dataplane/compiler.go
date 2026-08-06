@@ -224,6 +224,33 @@ func assignZoneIDs(result *CompileResult, cfg *config.Config) {
 	}
 }
 
+// assignScreenIDs populates result.ScreenIDs with 1-based ids for every
+// configured screen profile, in sorted-name order so the assignment is
+// deterministic. Id 0 is reserved for "no profile", which is why the counter
+// starts at 1.
+//
+// This is a single site DELIBERATELY. Three verbatim copies of this loop used
+// to exist — here, in validateBeforeMutateWithResult, and in the ID-stability
+// probe's own driver (compiler_idprobe_4960_test.go) — and the third copy is
+// what made TestPrePassDoesNotPerturbIDAssignment_4960's ScreenIDs column
+// unable to observe anything: the probe re-implemented the assignment instead
+// of calling it, so that column compared the test's own loop against itself.
+// Measured at the time: drifting the assignment at EITHER production site left
+// the whole package green. Keep every caller on this function; a fourth copy
+// re-opens the hole.
+func assignScreenIDs(result *CompileResult, cfg *config.Config) {
+	screenID := uint16(1)
+	screenNames := make([]string, 0, len(cfg.Security.Screen))
+	for name := range cfg.Security.Screen {
+		screenNames = append(screenNames, name)
+	}
+	sort.Strings(screenNames)
+	for _, name := range screenNames {
+		result.ScreenIDs[name] = screenID
+		screenID++
+	}
+}
+
 // CompileConfig translates a typed Config into dataplane table entries.
 // It works with any DataPlane backend (eBPF or DPDK) via the interface.
 // The isRecompile flag triggers FIB generation bump for hitless restarts.
@@ -241,17 +268,7 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	assignZoneIDs(result, cfg)
 
 	// Phase 1.5: Assign screen profile IDs (1-based; 0 = no profile).
-	// Sorted for deterministic IDs.
-	screenID := uint16(1)
-	screenNames := make([]string, 0, len(cfg.Security.Screen))
-	for name := range cfg.Security.Screen {
-		screenNames = append(screenNames, name)
-	}
-	sort.Strings(screenNames)
-	for _, name := range screenNames {
-		result.ScreenIDs[name] = screenID
-		screenID++
-	}
+	assignScreenIDs(result, cfg)
 
 	// #4960: validate every fallible HOST-PURE phase against a discarding
 	// dataplane BEFORE Phase 2 touches the host. compileZones below is the

@@ -68969,3 +68969,73 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   no compile behaviour changes, so the `pkg/dataplane/README.md` pre-pass
   entry added in r3 still describes the shipped behaviour exactly.
 - **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r5 gate finding on PR #6894. r4 fixed the ID-probe
+  columns that were vacuous because the driver never RAN the phase that
+  populates them; `ScreenIDs` failed one level lower. The driver
+  RE-IMPLEMENTED Phase 1.5 instead of calling production, so that column
+  compared `compileIDsOnce`'s own loop against itself. Three verbatim copies
+  of the screen-ID prelude existed — `CompileConfig` (compiler.go:245-254),
+  `validateBeforeMutateWithResult` (compiler_validate_4960.go:254-263), and
+  the driver (compiler_idprobe_4960_test.go:315-324) — token-identical modulo
+  identifier names: same `uint16(1)` seed, same `cfg.Security.Screen` source,
+  same `sort.Strings`, same 1-based increment, all three against a
+  `newValidationResult()`-allocated map behind their own nil-cfg guard.
+  Collapsing them is therefore a cleanup, not a behaviour change.
+  Extracted `assignScreenIDs(result, cfg)` next to `assignZoneIDs` in
+  compiler.go and pointed all three sites at it; dropped the now-unused
+  `"sort"` import from compiler_validate_4960.go (it had exactly one use, the
+  prelude — compiler.go keeps its four, the idprobe test keeps its
+  `sortedKeys` use). Added two per-column non-emptiness floors: `ScreenIDs`
+  (naming `alpha`, `mid`, `zeta`) and `AddrIDs`, which had been protected only
+  BY ACCIDENT — the implicitSets assertion demands `db,web` / `dns,servers`,
+  which cannot exist without their AddrIDs entries, but that covers only ONE
+  of the map's two writers. The floor now names entries from both:
+  compileAddressBook's `db dns servers web` and compileNAT ->
+  resolveSNATMatchAddr's `_snat_match_10.1.0.0/16`, `_snat_match_10.2.0.0/16`,
+  `_snat_match_2001:db8:1::/64`. Measured full key set before writing the
+  floor, not assumed.
+  MUTATION GRID, whole `pkg/dataplane` package, `-count=1`, every mutation
+  applied only inside a throwaway `git archive` extract and restored by
+  re-extraction (never reverse-substitution); the worktree tree hash was
+  verified byte-identical before and after the grid. Each cell run at BOTH the
+  base commit (4ae41d85d) and this head, so every claim is a measured flip
+  rather than a one-sided red:
+  D/E — seed the screen-ID assignment from a package-level counter, so pass 1
+  and pass 2 differ (the cross-pass-state defect class this test names in its
+  own doc comment). At base, applied to the compiler.go inline prelude: GREEN.
+  At base, applied to the compiler_validate_4960.go inline prelude: GREEN.
+  Both production sites could drift with the suite passing. At this head,
+  applied inside `assignScreenIDs`: RED, `ScreenIDs differs between pass 1 and
+  pass 2` (compiler_idprobe_4960_test.go:396). D and E are one cell now
+  because there is one site.
+  F — fixture drops the three screen profiles: GREEN at base (no floor
+  existed; `{}` DeepEquals `{}`), RED at this head with three messages,
+  `screen profile "alpha"/"mid"/"zeta" is absent from ScreenIDs`. Note the
+  DeepEqual stays quiet in this cell — the floor is what fires, which is the
+  point of having it.
+  G (negative control) — drift `assignZoneIDs`: RED, `ZoneIDs differs between
+  pass 1 and pass 2`. The harness can red on a dimension this change did not
+  touch.
+  H — delete `result.AddrIDs[synthName] = addrID` from resolveSNATMatchAddr
+  (compiler_nat.go:36), emptying the compileNAT half of AddrIDs: GREEN at base
+  — the whole package passed with that writer silently contributing nothing,
+  confirming the by-accident protection — and RED at this head with three
+  messages, `address id "_snat_match_..." is absent`.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` rc=0;
+  `go test ./pkg/refactoraudit/ -count=1` rc=0 (the new production function in
+  compiler.go does not trip the heatmap gate); `go test ./pkg/dataplane/ -run
+  4960 -count=10 -race` rc=0. `gofmt -l` clean on all three touched files.
+  No doc change: no live module doc describes the screen-ID prelude or its
+  call sites (grep over docs/ finds only archived review transcripts and a
+  `docs/config-schema.md` reference to `assignZoneIDs` about STABLE ZONE ids,
+  which this change does not touch). The rationale for the single site is
+  carried in the `assignScreenIDs` doc comment and the driver's, which is
+  where the next person reading either would look. The
+  `pkg/dataplane/README.md` pre-pass entry added in r3 still describes the
+  shipped behaviour exactly — compile behaviour is unchanged.
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md

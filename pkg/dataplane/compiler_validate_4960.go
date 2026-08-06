@@ -67,7 +67,6 @@ package dataplane
 import (
 	"fmt"
 	"net"
-	"sort"
 
 	"github.com/vishvananda/netlink"
 
@@ -251,16 +250,7 @@ func validateBeforeMutateWithResult(dp DataPlane, cfg *config.Config, result *Co
 
 	// Phases 1 / 1.5 are pure and produce the IDs the later phases read.
 	assignZoneIDs(result, cfg)
-	screenID := uint16(1)
-	screenNames := make([]string, 0, len(cfg.Security.Screen))
-	for name := range cfg.Security.Screen {
-		screenNames = append(screenNames, name)
-	}
-	sort.Strings(screenNames)
-	for _, name := range screenNames {
-		result.ScreenIDs[name] = screenID
-		screenID++
-	}
+	assignScreenIDs(result, cfg)
 
 	for _, phase := range validationPhases(dp, cfg, result) {
 		if err := phase.run(); err != nil {

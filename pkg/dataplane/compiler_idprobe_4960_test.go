@@ -307,21 +307,20 @@ func idProbeConfig() *config.Config {
 // Re-check that when adding a phase — running a phase out of order here is as
 // wrong as not running it, because finalizeNATCounterIDs' position is itself
 // part of what is being measured.
+//
+// ScreenIDs was a FOURTH vacuous dimension, failing one level below the r4
+// three: the driver did run Phase 1.5, but by RE-IMPLEMENTING it rather than
+// calling production, so that column compared this function's own loop against
+// itself. Measured: drifting the assignment at either production site left the
+// whole package green. The prelude is now the single assignScreenIDs
+// (compiler.go) that both production sites call. Call production phases here;
+// never restate one.
 func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 	t.Helper()
 	dp := idProbeDP{}
 	result := newValidationResult()
 	assignZoneIDs(result, cfg)
-	screenID := uint16(1)
-	names := make([]string, 0, len(cfg.Security.Screen))
-	for n := range cfg.Security.Screen {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
-		result.ScreenIDs[n] = screenID
-		screenID++
-	}
+	assignScreenIDs(result, cfg)
 	if err := compileAddressBook(dp, cfg, result); err != nil {
 		t.Fatalf("compileAddressBook: %v", err)
 	}
@@ -412,6 +411,48 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	}
 	if len(first["AppIDs"].(map[string]uint32)) == 0 {
 		t.Fatal("fixture assigned no application IDs — comparison vacuous")
+	}
+
+	// ScreenIDs had no floor at all until the assignScreenIDs extraction: the
+	// driver re-implemented Phase 1.5, so the column was doubly unable to
+	// observe anything — it compared this test's own loop against itself, and
+	// nothing asserted the fixture still carried profiles to assign. Name all
+	// three the fixture declares; dropping cfg.Security.Screen would otherwise
+	// leave the column an empty-vs-empty DeepEqual forever.
+	screens := first["ScreenIDs"].(map[string]uint16)
+	for _, want := range []string{"alpha", "mid", "zeta"} {
+		if _, ok := screens[want]; !ok {
+			t.Errorf("screen profile %q is absent from ScreenIDs, so the screen "+
+				"ID dimension is NOT measured — either the fixture no longer "+
+				"declares it or assignScreenIDs is not being run (#6894 r5)"+
+				"\n  have: %v", want, sortedKeys(screens))
+		}
+	}
+
+	// AddrIDs was protected only BY ACCIDENT: the implicitSets assertion above
+	// demands "db,web" and "dns,servers", which cannot be built without those
+	// AddrIDs entries. That covers ONE of the map's two writers. compileNAT's
+	// interface-SNAT branch is the other — resolveSNATMatchAddr synthesizes a
+	// "_snat_match_<cidr>" entry per SNAT match CIDR (compiler_nat.go:36) — and
+	// nothing pinned it, so that half could stop contributing with the column
+	// still comparing clean. Name entries from BOTH writers.
+	addrs := first["AddrIDs"].(map[string]uint32)
+	for _, want := range []string{
+		// compileAddressBook: the three addresses and the one address-set.
+		"db", "dns", "servers", "web",
+		// compileNAT -> resolveSNATMatchAddr: one synthesized entry per
+		// distinct SNAT match CIDR in the fixture, v4 and v6.
+		"_snat_match_10.1.0.0/16",
+		"_snat_match_10.2.0.0/16",
+		"_snat_match_2001:db8:1::/64",
+	} {
+		if _, ok := addrs[want]; !ok {
+			t.Errorf("address id %q is absent, so that WRITER's contribution to "+
+				"AddrIDs is not measured — compileAddressBook and compileNAT's "+
+				"synthesized-address branch each populate this map and a floor "+
+				"naming only one of them leaves the other unpinned (#6894 r5)"+
+				"\n  have: %v", want, sortedKeys(addrs))
+		}
 	}
 	if len(first["PoolIDs"].(map[string]uint8)) == 0 {
 		t.Fatal("fixture assigned no NAT pool IDs — comparison vacuous there")
