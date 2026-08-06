@@ -1,3 +1,106 @@
+## 2026-08-06 — #5718 round 7: two obligations that could never be paid
+
+- **Timestamp**: 2026-08-06 (fix/5718-ha-hardening, PR #6825)
+- **Action**: An independent Claude review and an independent AGY review had
+  BOTH cleared this commit with zero runtime findings; a Codex leg then found
+  two runtime holes underneath them. Both are the same shape at different
+  scales — an obligation is recorded, and the thing that was supposed to
+  discharge it cannot reach it.
+  - **(1) BLOCKING: the write/remove-error branch NEVER ARMED the activation
+    tail.** Not "skipped" — `activationPending = true` had exactly ONE
+    assignment, in Apply's success path, which that branch returns before
+    reaching. The distinction is the whole finding: the branch DOES arm the
+    GLOBAL reload debt, and the global debt is discharged by ANY reload owner.
+    So a transient stale-marker removal failure plus a failed reload arms the
+    global debt; the next commit's device-map teardown removes that marker and
+    reloads successfully (`pkg/daemon/linksetup.go`), clearing the global debt
+    while performing neither tail operation; and the byte-identical Apply that
+    follows sees no change, no global debt, no reconfigure debt and no
+    activation debt — returning `nil` having run neither the per-interface
+    `networkctl reconfigure` nor `restoreSlowPathRPFilter`. Bond/VLAN addresses
+    unapplied, `xpf-usp0`'s rp_filter left at 2, slow-path traffic silently
+    dropped. Armed now BEFORE the branch's own reload (like the success path),
+    and deliberately NOT cleared when that reload succeeds: the reload is half
+    the tail and the reconfigure half still has not run.
+  - **(2) BLOCKING: an owed cold-prime with no firing edge.** `needColdPrime`
+    had exactly one consumer — `shouldColdPrime` in `installConn` — so its only
+    edge was a connection INSTALL that becomes active. The survivor re-drive in
+    `handleDisconnect`, the one other path that could pay it, was gated solely
+    on `!outboundBulkAcked`, and that flag is sticky for the life of the
+    PROCESS: written true once in `sync_conn_read.go` and cleared NOWHERE — not
+    on a full disconnect, not on a supersession. So an ack earned by a PRIOR
+    peer incarnation suppresses the re-drive for the CURRENT one. Reachable
+    sequence: a new incarnation supersedes fabric 0, arming needColdPrime and
+    starting a bulk; the same peer's fabric 1 joins passively while that bulk
+    runs; fabric 0's write fails and BulkSync disconnects it. The obligation is
+    armed, every connection that could fire it is already installed, and the old
+    incarnation's ack suppresses the alternative. It stays armed forever. The
+    incremental sweep only ships sessions newer than its watermark, so
+    established flows are never repaired and a failover to that peer blackholes
+    them.
+    - THE PRINCIPLE, stated in the code: an obligation whose firing edge is an
+      event that has ALREADY PASSED is not deferred, it is lost. The gate keys
+      on the OBLIGATION (`|| needColdPrime`) rather than on the staleness.
+      Clearing `outboundBulkAcked` on supersession would close this path but
+      only this path — an owed cold-prime armed by the FULL-DISCONNECT edge and
+      then failed, with a survivor installed, is the same lost-edge shape with
+      no supersession in it anywhere.
+    - Three parts, each independently load-bearing (each proved by its own
+      revert): the gate, the goroutine's mirrored re-check (bailing on
+      `outboundBulkAcked` alone would make the gate inert — the prior
+      incarnation's ack is true in both places), and a DISCHARGE on success
+      (without it the latch that now triggers the re-drive stays armed after
+      satisfying it, so every later survivor disconnect re-bulks an
+      already-primed peer — a lost obligation traded for one that can never be
+      paid off).
+  - **STICKY-FLAG SURVEY** (asked for explicitly; the shape is a latch that
+    describes a PRIOR incarnation and gates a recovery whose only other edge may
+    have passed). `outboundBulkAcked` was the only one:
+    - `bulkEverCompleted` — equally sticky and never cleared, but #5480 already
+      removed its suppressor role in this package; its remaining cluster-side
+      read only selects log wording. Its `pkg/daemon` readers are outside this
+      diff.
+    - `syncBackfillNeeded`, `forceResync` — both also consumed by the PERIODIC
+      SWEEP (`sync_conn_sweep.go`), a recurring timer edge, so neither can be
+      stranded by a connection edge that already passed. That recurring edge is
+      exactly what `needColdPrime` lacked.
+    - `clockSynced`, `peerHeartbeatAckEver` — cleared on the incarnation-ending
+      edges (full disconnect / supersession).
+    - `bulkRedriveInFlight` — a CAS in-flight guard reset by `defer`.
+  - **Docs.** `pkg/networkd/README.md` carried the exact reasoning error that
+    produced (1): "the write-error path is unaffected: it always returns a
+    non-nil error, so it can never report a false success". The error return is
+    truthful for THAT Apply; what it never did was record the obligation for the
+    NEXT one. Corrected, and the paragraph now says which half of the tail the
+    branch's reload does and does not cover. Also DISCLOSED (not fixed): the
+    reload debt is a package variable, so a daemon restart between a failed
+    reload and its retry drops it with files on disk unactivated — the LOST
+    direction. Not a regression (the pre-PR `Manager.reloadPending` field had the
+    same process lifetime), but a reader just told the debt has "ONE holder" and
+    is "process-scoped" can read that as a durability claim, and it is not one.
+  - **NOT fixed here, deliberately**: #6930 (the `heartbeatZeroSlots`
+    multiply-before-cap) is filed and unreachable with the production 4096-entry
+    shim Array. It is its own issue.
+  - **Revert probes**, each in a throwaway `git archive` extract restored by
+    re-extraction, each an ASSERTION failure at `go test` exit **1**: remove the
+    error-branch arm -> `Manager-only activation tail was lost: reconfigure=0
+    rp_filter="2"`; restore the gate to `!outboundBulkAcked` -> `an owed
+    cold-prime had no firing edge`; restore the goroutine re-check to bail on
+    that flag alone -> the same message (so the mirror is load-bearing, not
+    decorative); remove the discharge -> `a successful re-drive must DISCHARGE
+    needColdPrime`. Over-reach guards stayed GREEN in all four: a successful
+    Apply leaves no activation debt, and a survivor disconnect with NO
+    cold-prime owed still does not re-bulk (#466 flap suppression).
+  - **Test attribution** (the end state alone would not have bound it): the
+    cold-prime test samples `pendingBulkAckEpoch` INSIDE the bulk override,
+    which `doBulkSync` runs before stamping its own epoch. The re-drive
+    goroutine zeroes that field immediately before driving and is the only
+    reachable path here that does. A first draft sampled it AFTER the bulk and
+    read the bulk's own fresh epoch — green for the wrong reason.
+- **File(s)**: pkg/networkd/networkd.go, pkg/networkd/activation_tail_5718_test.go,
+  pkg/networkd/README.md, pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
+  _Log.md
+
 ## 2026-08-05 — #6865 round 5: the sweep stopped at the package boundary
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
