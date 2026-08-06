@@ -17,13 +17,20 @@ import (
 // do NOT warn (no false positive); (3) a single RI / no RI does NOT warn;
 // (4) the PBR-term source (`then routing-instance`) also feeds the overlap set;
 // (5) the warning ENDS with the exact status sentence, verbatim, so nothing can
-// be appended after it, the tail cannot be reworded, and the status sentence
-// itself cannot be dropped; and (6) losing the promise did not cost the
-// diagnostic any of its substance, polarity included.
+// be appended after it that does not ITSELF re-terminate with the tail, the tail
+// cannot be reworded, and the status sentence itself cannot be dropped; and
+// (6) losing the promise did not cost the diagnostic any of its substance,
+// polarity included.
 //
 // (5) is deliberately NOT "no forecast in either direction". Measured: the
 // suffix pin catches APPEND-after-tail and REWORD-inside-tail in both
-// directions, always. It is BLIND to a forecast SPLICED before the tail or
+// directions, with one contrived exception — an append that duplicates the whole
+// 84-character tail at its end satisfies `HasSuffix` again, so
+// "…limitation. A fix is guaranteed. Meanwhile, <tail verbatim>" passes, and
+// "guaranteed" is on neither list. That is defeating the guard, not stumbling
+// past it, and every SIMPLE append is caught; it is recorded so nobody reasons
+// from "appends are impossible" when deciding a spelling is not worth listing.
+// The pin is BLIND to a forecast SPLICED before the tail or
 // PREPENDED at the front — there, the token lists are the only defence, and a
 // blocklist is incomplete by construction. Nine distinct foreclosing sentences
 // and nine distinct promising sentences, none using a listed spelling, were
@@ -202,8 +209,12 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 // the message carries a second "#2387". And no token list can forbid text being
 // APPENDED after the sentence: "…status of this limitation. A fix is
 // guaranteed." reintroduces an explicit promise while matching every token
-// check. One suffix comparison forbids appending, truncating, and rewording the
-// tail at once, and needs no maintenance as new promise spellings are invented.
+// check. One suffix comparison forbids truncating and rewording the tail
+// outright, and forbids appending anything that does not re-terminate with the
+// tail verbatim — and it needs no maintenance as new promise spellings are
+// invented. Re-terminating is the one hole: repeating the whole tail after an
+// appended promise satisfies `HasSuffix` again. It takes deliberate effort, so
+// treat it as a limit on what the pin PROVES rather than a gap to plug.
 //
 // It deliberately starts AFTER the "…discriminator, so " clause. That makes the
 // two tests SEPARABLE — not orthogonal, and the difference is measured. Deleting
@@ -443,7 +454,8 @@ func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 		if !strings.HasSuffix(tc.warn, vrfOverlapStatusTail) {
 			t.Errorf("%s form does not END with the status sentence %q — the advisory must close "+
 				"by stating the consequence and pointing at the open decision, with nothing "+
-				"appended after it: %s",
+				"appended after it (an append that re-terminates with the tail verbatim would "+
+				"satisfy this check; do not do that): %s",
 				tc.form, vrfOverlapStatusTail, tc.warn)
 		}
 	}
