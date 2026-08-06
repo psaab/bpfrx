@@ -606,8 +606,13 @@ func (d *notLoadedDP) IsLoaded() bool { return false }
 // TestZoneUnpopulatedGaugeHelpEnumeratesEveryCause is the #6843 round-5 pin on
 // the HELP text itself.
 //
-// The gauge's HELP enumerates the causes an operator triages from, and
-// collectZoneCounters has SIX membership branches. A HELP that lists fewer
+// The gauge's HELP enumerates the causes an operator triages from. There are
+// SIX such causes, reached through THREE increment branches in
+// collectZoneCounters — the unloaded and loaded-with-no-apply-result cases
+// share a branch, and (a)-(c) all arrive via the ErrCounterNotPopulated
+// sentinel. The HELP is keyed to CAUSES, because that is what an operator
+// triages; do not read the phrase list below as a branch count. A HELP that
+// lists fewer causes
 // sends the operator after causes that do not apply — which is the whole
 // failure the cause list exists to prevent. Reverting the HELP to any shorter
 // enumeration was green before this test: nothing asserted on the string.
@@ -633,8 +638,10 @@ func TestZoneUnpopulatedGaugeHelpEnumeratesEveryCause(t *testing.T) {
 		t.Fatal("xpf_zone_counters_unpopulated_zones not declared by Describe()")
 	}
 
-	// One phrase per membership branch in collectZoneCounters. Each is chosen
-	// to be unique to this gauge's help, not shared with a sibling metric.
+	// One phrase per membership CAUSE (six), not per increment branch (three).
+	// Each is chosen to be unique to this gauge's help, not shared with a
+	// sibling metric — Desc.String() embeds the HELP, so a phrase that also
+	// appears in another metric's help would match the wrong descriptor.
 	for _, want := range []string{
 		"predates the per-zone populate path", // (a) pre-#3651 helper
 		"hot-path slot capacity",              // (b) slot overflow

@@ -1,3 +1,47 @@
+## 2026-08-05 — #6843 round 6: the enumeration grew, the header did not
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: The round-5 gate returned MERGE-NEEDS-MINOR with **zero runtime
+  findings** — the HELP is correctly bound (the test exact-matches
+  `fqName == "xpf_zone_counters_unpopulated_zones"` before inspecting
+  `Desc.String()`, which is what stops a substring from resolving against a
+  sibling metric), two independent discrimination mutations each failed only
+  their own assertion, all six causes are complete with no seventh and none
+  unreachable, and the full suite is rc=0. Five comment/doc items remained.
+  Fixed inline rather than by another agent round, per the materiality rule.
+  1. `metrics_descriptors_zone.go` still said "FOUR distinct reasons"
+     immediately before enumerating six, and "triages toward three causes"
+     below it. **The list grew and its header did not** — the exact rot this
+     PR exists to remove, committed by the fix for it. Now SIX, plus the
+     distinction the gate drew: six CAUSES reached through THREE increment
+     branches. Those are different quantities and the text now says so.
+  2. `maps_counters.go` said the family "is not sourced by the userspace
+     dataplane" — false for traffic since #3651 — and, worse, the round-5
+     clause split introduced a NEW false statement: that the sentinel can mean
+     "no loaded dataplane / no apply result yet". It cannot. On both of those
+     the collector increments BEFORE it ever calls `ReadZoneCounters`, so no
+     read occurs and no sentinel is produced. The sentinel has exactly three
+     meanings; the GAUGE has six causes; the doc now separates them and warns
+     against reading the HELP list as a list of sentinel meanings.
+  3. `loader.go` — the round-5 insertion severed a sentence: `go doc -all -u
+     ./pkg/dataplane Manager` rendered "The #6843: the two maps ...", a
+     dangling article. Third distinct variant of the insertion-vs-doc-block
+     class on this PR (steal, cut-in-half, now dangle). Re-anchored as its own
+     paragraph; verified by re-running `go doc` and grepping for the fragment.
+  4. Flood absolutes ("no writer exists", "reads report this unconditionally",
+     the map "stays empty") are true of production and false of the API —
+     `SetFloodCounterOffset` is exported and a test populates it. Scoped to
+     production in both files rather than deleted; the conclusion holds.
+  5. The new test comment called six causes "SIX membership branches". Six
+     causes, three branches. Corrected, and the reason the phrases must be
+     unique to this gauge is now stated where the phrase list is.
+- **File(s)**: pkg/api/metrics_descriptors_zone.go,
+  pkg/api/zone_counters_metrics_test.go, pkg/dataplane/maps_counters.go,
+  pkg/dataplane/loader.go, _Log.md
+- **Validation**: comment-only — the production diff filtered to non-comment
+  lines is empty. `go build ./...` rc=0; `go test ./pkg/api/ ./pkg/dataplane/
+  -count=1` rc=0 (both `ok`); `gofmt -l` clean on all four files; `go doc`
+  confirms the severed sentence is gone.
 ## 2026-08-05 — #6843 gate round 5: the fold re-committed both classes it closed
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

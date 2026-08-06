@@ -42,8 +42,10 @@ func (c *xpfCollector) initZoneDescriptors() {
 	// #3651: the explicit "not yet known" signal, and the reason the collector
 	// can omit samples without the omission being ambiguous.
 	//
-	// A zone is counted here for FOUR distinct reasons, and they are
-	// indistinguishable from the Go side.
+	// A zone is counted here for SIX distinct reasons, and they are
+	// indistinguishable from the Go side. Six CAUSES, reached through THREE
+	// increment branches in the collector — the two counts are different
+	// quantities and neither substitutes for the other.
 	//
 	// Three come from dataplane.ErrCounterNotPopulated, because the helper's
 	// snapshot is sparse and drops all-zero rows (ZoneCounterStore::snapshot,
@@ -83,8 +85,11 @@ func (c *xpfCollector) initZoneDescriptors() {
 	//
 	// There is no xpf_dataplane_loaded series to disambiguate against, so (d)
 	// must be named in the HELP or an operator paging on `> 0` triages toward
-	// three causes none of which is true. Availability and meaning are not
-	// separable for a gauge whose HELP enumerates its causes.
+	// causes none of which is true. Availability and meaning are not
+	// separable for a gauge whose HELP enumerates its causes — and that is
+	// why this block states no count of the causes it does not list: an
+	// enumeration that claims to be exhaustive has to actually be, and the
+	// number is the part that rots first.
 	//
 	// #6843: the earlier wording here said build "never registers the zone with
 	// the store". That holds only for a zone that was ALWAYS overflowed. The

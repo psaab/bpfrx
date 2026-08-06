@@ -13,8 +13,10 @@ import (
 // (policy, filter, NAT, flood) live in their own domain files; ClearAllCounters
 // calls those domain clears via same-package method dispatch.
 
-// ErrCounterNotPopulated reports that a counter family is safely readable but
-// is not sourced by the userspace dataplane (#3643). It is DISTINCT from a
+// ErrCounterNotPopulated reports that a READ returned no value for this key --
+// the family is safely readable, but nothing published a row here (#3643). It
+// deliberately does NOT say the family is unsourced: per-zone traffic IS
+// sourced since #3651, and only flood remains unsourced. It is DISTINCT from a
 // genuine read failure (a missing map or a degraded IPC bridge, which must
 // still bump the #3345 xpf_counter_read_errors_total signal) and DISTINCT from
 // a real zero. Read surfaces treat it as "not available" -- never a 500, never
@@ -24,13 +26,19 @@ import (
 // and conflating them is what made the pre-#6843 wording wrong:
 //
 //   - Per-zone TRAFFIC counters ARE populated (#3651 shipped the userspace
-//     POPULATE path). This sentinel now means the helper published no row for
-//     THIS zone -- a pre-#3651 helper, a zone past the helper's hot-path slot
-//     capacity, an idle zone, or no loaded dataplane / no apply result yet.
-//     See the xpf_zone_counters_unpopulated_zones HELP for the full list.
-//   - Per-zone FLOOD counters are still genuinely deferred: no writer exists,
-//     so they report this unconditionally (#3643 plan §5A, leaning on the
-//     #3343 aggregate).
+//     POPULATE path). This sentinel means the helper published no row for THIS
+//     zone -- a pre-#3651 helper, a zone past the helper's hot-path slot
+//     capacity, or an idle zone whose all-zero row the sparse snapshot drops.
+//     Those are the ONLY three. "No loaded dataplane" and "no apply result
+//     yet" are NOT meanings of this sentinel: on both, the collector
+//     increments before it ever calls ReadZoneCounters, so no read happens and
+//     no sentinel is produced. They are causes of the UNPOPULATED GAUGE, which
+//     is a wider set -- see the xpf_zone_counters_unpopulated_zones HELP, and
+//     do not read that list as a list of sentinel meanings.
+//   - Per-zone FLOOD counters are still deferred: no PRODUCTION writer exists,
+//     so in a running firewall they report this on every read (#3643 plan §5A,
+//     leaning on the #3343 aggregate). Not an API-wide absolute --
+//     SetFloodCounterOffset is exported and tests do populate it.
 var ErrCounterNotPopulated = errors.New("counter not populated in userspace dataplane")
 
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
