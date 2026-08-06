@@ -104,7 +104,12 @@ type schemaNode struct {
 	// this comment used to say otherwise. Do not deduce the armed set from
 	// prose that rots; find it with
 	//
-	//	git grep -n 'closedWorld: true' pkg/config/
+	//	git grep -n 'closedWorld: true' -- 'pkg/config/schema_*.go'
+	//
+	// The `schema_*.go` glob is deliberate: it excludes THIS file, so the
+	// command does not match the line you are reading. Dropping it returns
+	// one extra hit — this comment — and a reader counting results would be
+	// off by one against any number stated elsewhere.
 	//
 	// The armed set is deliberately NOT enumerated here for the same reason
 	// walkSchemaNode declines to state a count: a list in a comment drifts
