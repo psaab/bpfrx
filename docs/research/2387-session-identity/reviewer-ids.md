@@ -19,6 +19,26 @@ objection that drove the v4 PLAN-DEFER.
 | r4 | AGY | `agy-plan-r4.md` | **PLAN-READY** (reversing its own r3 PLAN-KILL) |
 | r5 | Claude SMR | `claude-smr-plan-r5.md` | **PLAN-READY** |
 | r5 | Codex | `codex-plan-r1.md` | **PLAN-NEEDS-MAJOR-REVISION** (landed late, after the other two converged) |
+| r7 | Claude SMR | `claude-smr-plan-r7.md` | PLAN-NEEDS-REVISION |
+| r7 | AGY | `agy-plan-r7.md` | PLAN-NEEDS-REVISION |
+| r7 | Codex | — | **did not deliver** (~35 min, zero claims answered; output frozen, worker CPU 31→32s) |
+
+**Terminal state: NOT CONVERGED, stood down after round 7 by coordinator decision.**
+The remaining blocker is a maintainer risk-appetite judgement, not a technical defect:
+*is relaxing two rolling-upgrade compatibility gates justified for a niche,
+already-warned-about config?* Round 8 was explicitly declined as work for its own sake.
+
+### The pattern, restated because it is the most useful output of this pass
+
+**Eight revisions. Every round found its defect in the FIX, never in the diagnosis.**
+Four remedies were adopted and then refuted: Path D, the allocate-once interner, the
+global version gate, and the "no upgrade-gate change needed" claim. The diagnosis —
+reachability via the PBR ordering, wire additivity, forward/reply asymmetry
+disqualifying ifindex and zone — survived all eight intact and is confirmed at
+file:line by all three reviewers.
+
+A design space in which *every* adopted remedy fails on re-measurement is itself
+evidence, independent of any individual refutation.
 
 ## Shape of the review — worth recording
 

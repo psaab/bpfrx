@@ -344,10 +344,23 @@ rounds has now been either fixed or withdrawn.
 
 **The counter-case against PLAN-KILL:** the shipped A.1 warning text tells the operator
 their config is not session-isolated *"until the session identity is VRF-aware"* — a
-written promise that the isolation is coming. PLAN-KILL would make that text
-permanently misleading, so a PLAN-KILL **must** be accompanied by rewriting A.1's
-warning into a statement of permanent non-support. That is a small, concrete
-obligation and it should not be skipped.
+written promise that the isolation is coming.
+
+> ### The A.1 warning text is owed a correction under EITHER outcome
+>
+> Earlier revisions framed this as a PLAN-KILL-only obligation. **That framing is too
+> narrow.** The warning's *"until the session identity is VRF-aware"* implies a fix is
+> scheduled. After eight revisions without convergence — and with the terminal decision
+> now resting on a maintainer risk-appetite judgement rather than on any remaining
+> technical defect — **that implication is unsupported whichever way the call goes.**
+>
+> The text should state the current situation plainly and point at #2387, rather than
+> promise a future. Under PLAN-KILL it becomes a statement of permanent non-support;
+> under PLAN-READY it should still not promise a delivery it cannot date.
+>
+> This is a small, concrete, standalone change to
+> `pkg/config/compiler_validate_vrf_overlap.go:214-224`. It is **independent of the
+> #2387 decision** and should not be held hostage to it.
 
 ## 4. What I verified first-hand
 
