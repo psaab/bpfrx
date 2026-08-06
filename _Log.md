@@ -68738,3 +68738,58 @@ break — `go vet` confirmed passing under every revert.
   `TestSyslogSelectorPositionsAreNotInterchangeable_6829` RED in BOTH
   directions.
   M5 (`!=` case dropped so `!` strips first): `!=info` / `!=debug` RED.
+
+## 2026-08-06 — #6829 round 3: exhaustive scans for the MULTI-CHARACTER selector contexts
+
+- **Timestamp**: 2026-08-06
+- **Action**: The 0..255 scan added in round 2 constructs
+  `string([]byte{byte(b)})` — ONE byte, no positional syntax — so it is
+  complete by construction only for the unmodified priority and the
+  single-atom facility. Every MULTI-CHARACTER context repeated the masking
+  defect round 2 fixed at the single-byte level: no scan existed behind the
+  `=`/`!`/`!=` priority modifiers, there was no invalid `!=<suffix>` fixture at
+  all, `!=*` (which the grammar accepts) had no positive, and every comma-list
+  negative carried four or five forbidden bytes at once. Added three exhaustive
+  scans plus a one-byte-at-a-time fixture test, and a `!=*` positive.
+- **File(s)**: pkg/daemon/syslog_selector_token_5797_test.go, _Log.md
+- **Validation**: `GOCACHE=/var/tmp/gc-6829h GOTMPDIR=/tmp go build ./...`
+  rc=0; `go test ./pkg/daemon ./pkg/logging ./pkg/cli ./pkg/config -count=1`
+  rc=0; `go test ./pkg/daemon -run 5797 -v` rc=0 with 67 `=== RUN` lines (11
+  top-level); `-run '5797|6829' -v` rc=0 with 124 `=== RUN` (24 top-level);
+  `go vet ./pkg/daemon` rc=0; `go test ./pkg/refactoraudit/...` rc=0.
+  TWO mutations, each confirmed to pass the PRE-round-3 suite and then to go
+  RED as an ASSERTION (never a build break); the production file was restored
+  from a pristine copy and `cmp`-verified plus grepped for the marker before
+  every run.
+  MUT-A (`!=` arm -> `return len(rest) > 2`, i.e. accept ANY nonempty suffix —
+  the escape the reviewer constructed): passed `go test ./pkg/daemon
+  ./pkg/logging ./pkg/cli ./pkg/config -count=1` rc=0 on the round-2 suite.
+  Now RED in `TestSyslogSelectorSeverityModifierSuffixExhaustive_6829`
+  (`severity "!=;" = true, want false: byte 0x3b rode in behind the "!="
+  modifier`) and `TestSyslogSelectorPayloadsOneByteAtATime_6829`
+  (`severity "!=info;" accepted`). The facility scans stayed GREEN — the
+  mutation is severity-side and the guards are scoped, not blanket.
+  MUT-B (facility list members strip `;` before the atom check, but only when
+  the token has >1 member — a list-specific relaxation): also passed the
+  round-2 suite rc=0, because `daemon;x` / `auth;authpriv` have no comma and
+  every existing list negative is rejected for its `*`, `.`, space or `/`
+  regardless of the `;`. Now RED at ALL THREE member positions in
+  `TestSyslogSelectorFacilityListMemberExhaustive_6829` (`facility
+  "priv;log,auth,daemon"` / `"auth,priv;log,daemon"` / `"auth,daemon,priv;log"`
+  `= true, want false`) and on three
+  `TestSyslogSelectorPayloadsOneByteAtATime_6829` rows. The severity scans and
+  every injection guard stayed GREEN.
+  NOTE on scope: a scan over the FIRST member alone would not have caught
+  MUT-B's middle/last cells, and the BARE-member scan does not catch MUT-B at
+  all (stripping `;` from a lone `;` member leaves an empty member, which is
+  rejected anyway) — the byte has to be embedded INSIDE an otherwise-safe
+  member. Both contexts are therefore scanned at all three positions.
+  Each scan asserts the FULL accept/reject partition, and the partitions differ
+  by context on purpose: `*` is legal as a whole suffix (`!=*`) but not infix
+  (`!=in*fo`); `,` is legal infix in a facility (it splits the token into two
+  safe members) but never in a priority; `*` is never a list member (`auth,*`).
+- **Docs**: no documentation change. The predicates are byte-identical to the
+  round-2 head — `sha256(pkg/daemon/daemon_system.go)` is unchanged at
+  `167c976ca10fddfb…` — so the operator-visible accept set, the belt's own
+  doc comments and pkg/logging/README.md all still describe the shipped
+  behaviour exactly. This round adds regression coverage only.
