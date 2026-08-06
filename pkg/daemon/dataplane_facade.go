@@ -320,6 +320,23 @@ func (f *dataplaneFacade) GetMapStats() []dataplane.MapStats {
 // operator. TestPersistentNATIsFetchedOncePerFunction pins the fetch-once shape
 // mechanically so a future consumer cannot drift back.
 //
+// WHAT FETCH-ONCE TRADES, stated because a later PR will need to know. It does
+// not make the operation atomic with revocation; it makes revocation
+// IN-FLIGHT-TOLERANT. A caller that fetched microseconds before Revoke() runs
+// its Len()/Clear()/All() against a table belonging to a dataplane the daemon
+// has just dropped. That is consistent with Revoke's contract as written — "a
+// call that has already passed live() completes against the backend" — and it is
+// bounded: nothing caches the returned pointer, so the exposure is one function
+// scope, not the process lifetime.
+//
+// But note what makes this delegator different. Every other one returns a VALUE
+// or an error; this is the only one that hands out a RAW POINTER which outlives
+// its gate for the caller's duration. If the sealing work in a later #5275 PR
+// ever needs revocation to be immediate rather than in-flight-tolerant — a
+// clear that MUST NOT land after the dataplane is dropped — this is the site to
+// revisit, and the fix is a different shape (route the mutation through the
+// facade so the gate is checked at the operation, not at the handle).
+//
 // This is the only delegator with that shape. GetMapStats returns a nil SLICE
 // (len/range only, elements are values), PolicySchedulerActiveState a nil MAP
 // (read-only at both consumers), Compile's sole consumer discards the result

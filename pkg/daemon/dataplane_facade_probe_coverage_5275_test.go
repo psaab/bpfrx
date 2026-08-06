@@ -273,6 +273,36 @@ func interfaceMethodNames(t *testing.T, pkg, file string, line int, it *ast.Inte
 // nil-receiver Clear() that silently succeeds would report "Cleared 0
 // persistent NAT bindings" for a revoked dataplane, replacing a loud crash with
 // a quiet lie to the operator.
+//
+// WHAT ESCAPES THIS SCAN. It matches a syntactic shape, so it is a blocklist,
+// and a blocklist cannot be made complete. These get through today, and the
+// escapes are NOT closed on purpose — chasing them would grow the pattern list
+// while leaving the next unlisted form open, which is the failure mode this
+// project keeps finding. Know them instead:
+//
+//   - HELPER EXTRACTION. `func (c *CLI) natTable() *T { return
+//     c.dp.GetPersistentNAT() }` called twice leaves every FuncDecl at one direct
+//     call, and wantCallers is unchanged because the helper replaces the site it
+//     was extracted from. Green, window restored.
+//   - FETCH IN THE CALLEE. The caller fetches and guards, then hands `dp` to a
+//     helper that fetches again. Two functions, one call each.
+//   - METHOD VALUE — the one to actually worry about, because an author reaches
+//     for it innocently and it defeats the scan SILENTLY. `get :=
+//     c.dp.GetPersistentNAT; t1 := get(); t2 := get()` is invisible: the scan
+//     counts CallExpr whose Fun is a SelectorExpr, and a method value's call has
+//     an Ident there. Both calls vanish, and in a new function the caller floor
+//     is untouched too.
+//   - A FIFTH CONSUMER PACKAGE. persistentNATConsumerPackages is a hardcoded
+//     four; anything outside contributes zero to the floor and is never read.
+//
+// SO: this is a SUPPLEMENTARY belt, not the binding one. A green run here is not
+// evidence the class is gone. The real binding is behavioural —
+// TestFacadeRevocationMidCallDoesNotPanicTheClearPath and
+// ...TheRenderPath drive real consumers with a real facade and land a revocation
+// inside the window deterministically; they catch any of the escapes above that
+// actually reaches a consumer entry point they exercise. This scan's job is
+// narrower and still worth having: it makes the ONE form that keeps getting
+// written by hand fail fast, at a glance, in every package at once.
 func TestPersistentNATIsFetchedOncePerFunction(t *testing.T) {
 	const getter = "GetPersistentNAT"
 

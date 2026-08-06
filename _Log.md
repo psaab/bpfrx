@@ -68708,3 +68708,33 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   whole Go suite green. The old text asserted the opposite two paragraphs after
   recording the counter-example.
   **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_probes.go, pkg/daemon/dataplane_facade_consumer_binding_5275_test.go, pkg/daemon/dataplane_facade_probe_coverage_5275_test.go, pkg/cli/cli_clear.go, pkg/grpcapi/server_diag_system_action.go, pkg/natshow/persistent.go
+- **Timestamp**: 2026-08-06
+  **Action**: #5275 PR2 fold r3 (COMMENT-ONLY) — name what the fetch-once canary
+  does NOT catch, and record what fetch-once trades. The canary's doc explained
+  the hazard but not its escapes, which is the same gap this project keeps
+  correcting elsewhere. Four are now stated and deliberately NOT closed (a
+  blocklist-shaped scan cannot be made complete, and growing the pattern list
+  while the next unlisted form stays open is the failure mode): helper
+  extraction, fetch-in-the-callee, METHOD VALUE, and a fifth consumer package
+  outside the hardcoded four. The method-value escape (`get :=
+  c.dp.GetPersistentNAT; get(); get()`) is the one an author reaches for
+  innocently — the scan counts CallExpr whose Fun is a SelectorExpr, and a
+  method value's Fun is an Ident, so both calls are invisible. VERIFIED
+  EMPIRICALLY, not asserted: a temporary two-call method-value function added to
+  pkg/natshow compiled and the canary passed exit 0 with the caller floor
+  untouched. The doc now says plainly that the scan is a SUPPLEMENTARY belt and
+  the two behavioural mid-call-revocation tests are the real binding, so a green
+  canary is not evidence the class is gone.
+  Also recorded at GetPersistentNAT what fetch-once actually buys: revocation
+  becomes IN-FLIGHT-TOLERANT, not atomic. A caller that fetched microseconds
+  before Revoke() runs Clear() against a table whose dataplane the daemon just
+  dropped — consistent with Revoke's documented contract, and bounded to one
+  function scope because nothing caches the pointer. But this is the only
+  delegator handing out a RAW POINTER that outlives its gate for the caller's
+  duration, so if later sealing work needs revocation to be immediate, this is
+  the site to revisit and the fix is a different shape (gate at the operation,
+  not at the handle).
+  Comment-only, proven two ways: no non-comment line appears in the diff, and
+  the comment/blank-stripped source of both files is byte-identical to the
+  previous commit.
+  **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_probe_coverage_5275_test.go
