@@ -29,8 +29,9 @@ import (
 // connection at the moment it became keyed, the secondary would still be
 // unkeyed, and — since #5078 makes a keyed node reject an unkeyed peer, with no
 // migration window — the cluster could never converge. The cluster cannot get
-// itself out of that state; see the recovery note below, which is reasoned but
-// UNVERIFIED, so do not assume a particular escape route is available.
+// itself out of that state, and neither can an operator: see the recovery note
+// below, where both candidate escapes are shown to be CLOSED, not merely
+// untested.
 //
 // Adding `ControlLinkAuthKey` to clusterTransportKey looks obviously correct
 // ("restart comms when the key changes") and would silently create that
@@ -107,13 +108,24 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 // primary then rejects its handshake forever, and the secondary cannot be keyed
 // locally.
 //
-// Recovery from that state is NOT established. pkg/cluster/README.md reasons
-// out a path that runs entirely from the primary — remove the key there, let
-// the peer reconnect unkeyed, config-sync pushes, re-add the key — and marks it
-// UNVERIFIED, derived from the read-only gate and the fail-closed decision
-// rather than executed on a cluster. Console access to the standby is the
-// fallback if that path does not hold. Do not state either as fact here: the
-// README carries the hedge and this comment must not out-claim it.
+// There is NO established recovery, and the two paths one would reach for are
+// both closed (#6865 review round 2 — an earlier version of this comment cited
+// the first of them as a hedged possibility, which was wrong):
+//
+//   - Primary-only rekey does not exist. pkg/cluster/README.md sketches
+//     "remove the key on the primary, let the peer reconnect unkeyed,
+//     config-sync pushes, re-add the key" — but the SAME file later states it
+//     outright: clearing the key leaves an unkeyed `chassis cluster`, which is
+//     "exactly what the commit gate rejects, so that path does not exist"
+//     (tracked as #6630). `validateClusterAuthKeyStrict` enforces it, so
+//     `delete chassis cluster authentication-key; commit` is refused.
+//   - Console access to the standby does not help either. The read-only gate is
+//     on the CONFIG STORE, not on the transport: EnterConfigureSession returns
+//     ErrClusterReadOnly regardless of how the operator reached the box.
+//
+// So the deadlock is genuinely unrecovered, not merely unverified. That is the
+// reason step 20 must never restart comms on a key commit — there is no second
+// chance to fall back on.
 //
 // Observable: clusterCommsGen. stopClusterComms bumps it before anything else,
 // and startClusterComms bumps it via beginClusterCommsEpoch, so an unchanged
@@ -210,19 +222,47 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 	// -- left the ENTIRE pkg/daemon package green, both subtests above
 	// included, while every keyed cluster silently stopped restarting comms on
 	// a real endpoint move. This subtest is the one that reds it.
+	//
+	// SCOPE, and the two escapes MEASURED against it (#6865 review round 2).
+	// Both are disclosed rather than closed because closing either needs a
+	// different harness, not another assertion:
+	//
+	//  1. It binds a keyed decision derived from the CANDIDATE `cfg` only.
+	//     Deriving it from `d.store.ActiveConfig()` instead escapes — the whole
+	//     package stays green — because this fixture's store deliberately holds
+	//     NO committed cluster config (see the comment on `d` above: that is
+	//     what makes startClusterComms early-return so a unit test need not
+	//     stand up sockets). A real commit promotes the new config BEFORE apply
+	//     (store_commit.go / daemon_apply.go), so a store-derived check would
+	//     see the key in production. Binding that needs a fixture with a
+	//     committed keyed cluster stanza.
+	//
+	//  2. All three subtests observe `clusterCommsGen`, which stopClusterComms
+	//     bumps FIRST. So they prove TEARDOWN, not that comms came back up:
+	//     deleting `d.startClusterComms(d.daemonCtx)` from step 20 leaves vet
+	//     and the entire package green. Binding restart COMPLETION needs a
+	//     fixture where startClusterComms does not early-return.
+	//
+	// Tracked as #6878. Do not read "must still restart" as bound end to end.
 	t.Run("keyed_endpoint_change_must_still_restart", func(t *testing.T) {
 		movedKeyed := transport()
 		movedKeyed.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
 		movedKeyed.Chassis.Cluster.PeerAddress = "10.99.0.9"
 
-		// The active transport must also be keyed, or the key itself is the
-		// change under test rather than the endpoint move.
-		d.clusterCommsMu.Lock()
-		keyedBase := transport()
-		keyedBase.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
-		d.activeClusterTransport = clusterTransportFromConfig(keyedBase)
-		d.clusterCommsMu.Unlock()
-
+		// NOTE: there is deliberately no "seat a keyed active transport" step
+		// here. `clusterTransportKey` carries the six ENDPOINT fields and not
+		// the auth key — that is the invariant this whole file exists to pin —
+		// so `clusterTransportFromConfig` of a keyed config is byte-identical
+		// to the unkeyed one and such a step would be a no-op whose comment
+		// claimed otherwise. It would also write shared daemon state from
+		// inside a subtest: under a mutation that DOES add ControlLinkAuthKey
+		// to clusterTransportKey, that write masked key_commit_must_not_restart
+		// when this subtest ran first (measured). The three subtests are
+		// order-independent only because none of them mutates `d`.
+		//
+		// "Keyed" here therefore means the CANDIDATE config is keyed while the
+		// active transport is unchanged — which is exactly the production shape
+		// after a key commit, since the key never entered the transport key.
 		before := gen()
 		_ = d.applyTailReconciles(movedKeyed, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 		if after := gen(); after == before {

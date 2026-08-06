@@ -275,12 +275,24 @@ the HA-sync ingress path bypasses the gate).
    verify the secondary applied the key immediately after; treat a drop in that
    window as requiring the recovery below.
 
-**Recovery, UNVERIFIED.** If a cluster does end up keyed-primary /
-unkeyed-secondary, the reasoned path is: remove the key on the primary → the
-peer reconnects unkeyed → config-sync pushes → re-add the key. This is derived
-from the read-only gate and the fail-closed decision, **not executed on a
-cluster**. Treat it as a hypothesis until someone runs it; do not rely on it in
-a maintenance window without testing it first.
+**Recovery: there is none today. Do not plan around one.** An earlier revision
+of this section proposed removing the key on the primary → peer reconnects
+unkeyed → config-sync pushes → re-add the key, and labelled it UNVERIFIED. That
+was worse than unverified: it is **closed**, and this same document says so
+below under "Do not try to return to dual-accept by clearing the key first" —
+an unkeyed `chassis cluster` is exactly what the commit gate rejects
+(`validateClusterAuthKeyStrict`), so `delete chassis cluster
+authentication-key; commit` is refused. Tracked as **#6630**.
+
+Console access to the standby does not substitute for it either: the read-only
+gate is on the **config store**, not the transport, so `EnterConfigureSession`
+returns `ErrClusterReadOnly` however the operator reached the box.
+
+So keyed-primary / unkeyed-secondary is an unrecovered state. That is precisely
+why committing `authentication-key` must never restart cluster comms — there is
+no fallback to land on. `TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
+`TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` pin that; if either reds,
+the change under your hand is the one that creates this state.
 
 ## Control-channel authentication (#4107, PR-A)
 

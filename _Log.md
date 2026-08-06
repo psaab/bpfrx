@@ -925,6 +925,52 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 gate round 3: my own round-2 fold shipped a false comment and a no-op
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The Codex leg found four defects in the round-2 fold, three of
+  them introduced BY that fold. Folding them here.
+  **F1 — a no-op with a comment claiming otherwise.** The new keyed subtest
+  opened by seating a "keyed active transport":
+  `d.activeClusterTransport = clusterTransportFromConfig(keyedBase)`, commented
+  "The active transport must also be keyed". `clusterTransportKey` carries six
+  ENDPOINT fields and NOT the auth key — which is the invariant this entire file
+  exists to pin — so that assignment is byte-identical to the unkeyed one. The
+  block did nothing and the comment asserted something the function cannot do.
+  Worse, it wrote SHARED daemon state from inside a subtest: under a mutation
+  that DOES add ControlLinkAuthKey to clusterTransportKey, running the keyed
+  subtest first masked `key_commit_must_not_restart` (Codex measured both
+  orders). Deleted; the three subtests are order-independent only because none
+  of them now mutates `d`.
+  **F2 — two measured escapes, disclosed not closed.** A keyed check derived
+  from `d.store.ActiveConfig()` rather than the candidate `cfg` leaves the whole
+  package green (the fixture's store holds no committed cluster stanza, while a
+  real commit promotes config BEFORE apply). And all three subtests observe
+  `clusterCommsGen`, which stopClusterComms bumps FIRST, so deleting
+  `d.startClusterComms(...)` is invisible — they prove teardown, not restart.
+  Closing either needs a different fixture, not another assertion, so both are
+  stated in the scope comment and filed as #6878.
+  **F3 — the round-2 recovery hedge was wrong in the safe-looking direction.**
+  It deferred to a pkg/cluster/README.md path marked UNVERIFIED. That path is
+  not unverified, it is CLOSED: the same README says clearing the key leaves an
+  unkeyed `chassis cluster`, "exactly what the commit gate rejects, so that path
+  does not exist" (#6630), and `validateClusterAuthKeyStrict` enforces it.
+  Console access is not a fallback either — the read-only gate is on the CONFIG
+  STORE, so EnterConfigureSession returns ErrClusterReadOnly however the box was
+  reached. Corrected in the test comment AND in the README passage itself, which
+  contradicted its own later section.
+  **F4 — a repro that cannot be run.** The round-2 log recorded the negative
+  control as restored with `git show <pr-head>:...`, a placeholder rather than a
+  revision. Replaced with the literal `826cd48db`.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go, pkg/cluster/README.md, _Log.md
+- **Validation**: `go vet ./pkg/daemon/` rc=0; `go test` rc=0 for pkg/daemon,
+  pkg/cluster, pkg/configstore, pkg/refactoraudit. Production untouched in this
+  round and the previous one — `git diff --quiet 826cd48db..HEAD -- '*.go'
+  ':(exclude)**/*_test.go'` was rc=0 at the gate.
+- **Note**: the AGY leg returned MERGE-READY and missed all four. It checked the
+  README passage the comment cited and stopped there, so it never saw the
+  contradiction 540 lines further down. Codex's leg is the one that held.
+
 ## 2026-08-05 — #6865 gate fold: close the keyed positive-control gap, hedge the recovery claim
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
@@ -959,7 +1005,8 @@
   - CELL A, mutation + new subtest -> rc=1, failing subtest exactly
     `keyed_endpoint_change_must_still_restart`
   - CELL B, mutation + the ORIGINAL test file restored from
-    `git show <pr-head>:...` -> rc=0, `ok github.com/psaab/xpf/pkg/daemon`.
+    `git show 826cd48db:pkg/daemon/cluster_transport_key_5078_test.go` ->
+    rc=0, `ok github.com/psaab/xpf/pkg/daemon`.
     The gap was real: the whole package was green under a mutation that
     silently stops every KEYED cluster from restarting comms on a real
     endpoint move.
