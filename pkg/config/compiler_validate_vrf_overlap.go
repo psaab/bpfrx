@@ -60,8 +60,15 @@ const (
 // say colliding 5-tuples may cross-forward "until the session identity is
 // VRF-aware", which asserted an outcome the open decision may never produce —
 // and which the #2387 plan then cited back as evidence for that same outcome.
-// TestVRFOverlapWarningStatesStatusNotPromise keeps forward-looking wording out
-// of BOTH format strings below.
+// TestVRFOverlapWarningStatesStatusNotPromise enforces that in BOTH format
+// strings below — but enforces it PARTIALLY, and the difference matters if you
+// are editing this text. It pins the closing status sentence verbatim, so
+// nothing can be appended, reworded or dropped there. Wording spliced into the
+// MIDDLE of the message is caught only if it uses a spelling on that test's
+// token lists, which are blocklists and incomplete by construction. A forecast
+// in either direction, phrased in a way nobody listed, will commit green. The
+// text is neutral today because it was written to be, not because the test
+// would stop you.
 //
 // Detection builds routing-instance -> set-of-prefixes from two sources:
 //  1. native RI membership — each member interface unit's configured addresses

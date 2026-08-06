@@ -68448,3 +68448,41 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #2387: state what the VRF-overlap tests actually enforce
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct two high-level comments that overclaimed the guard (comment-only)
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+A Codex gate and a hostile Claude gate reached the same finding by different
+routes: the DETAILED blocklist comments are honest about being incomplete, but
+the two HIGH-LEVEL summaries above them claim a semantic guarantee the tests do
+not provide.
+
+Codex measured the escape set rather than arguing it. Nine distinct foreclosing
+sentences and nine distinct promising sentences, none using a listed spelling,
+were each spliced before the status tail in both warning arms; all eighteen left
+`go test ./pkg/config` GREEN. Mechanism by shape, measured:
+
+| shape | suffix pin | token lists |
+|---|---|---|
+| APPEND after the tail | always catches | also, if listed |
+| REWORD inside the tail | always catches | also, if listed |
+| SPLICE before the tail | BLIND | listed spellings only |
+| PREPEND at the front | BLIND | listed spellings only |
+
+So the test-file header's "(5) ... with no forecast in EITHER direction before
+it" and the production comment's "keeps forward-looking wording out of BOTH
+format strings" both overstate. Corrected to state the split: the tail is pinned
+verbatim so nothing can be appended, reworded or dropped there; mid-message
+wording is caught only in spellings someone listed. The shipped text is neutral
+because it was written to be, not because the test would stop an author.
+
+Neither list is grown — that is the completeness trap the file's own doctrine
+note refuses, and growing it would trade a disclosed limit for a hidden one.
+
+Comment-only: every changed line is `//` or blank, verified by stripping the
+diff markers and filtering. `gofmt -l` clean, `go vet ./pkg/config/` 0,
+`go test ./pkg/config -run TestVRFOverlap -count=1` 0.

@@ -16,10 +16,21 @@ import (
 // interface units WARN, naming both RIs + the prefix; (2) non-overlapping RIs
 // do NOT warn (no false positive); (3) a single RI / no RI does NOT warn;
 // (4) the PBR-term source (`then routing-instance`) also feeds the overlap set;
-// (5) the warning ENDS with the exact status sentence — stating the current
-// limitation and pointing at the tracking issue, with no forecast in EITHER
-// direction before it and nothing appended after it — and (6) losing the promise
-// did not cost the diagnostic any of its substance, polarity included.
+// (5) the warning ENDS with the exact status sentence, verbatim, so nothing can
+// be appended after it, the tail cannot be reworded, and the status sentence
+// itself cannot be dropped; and (6) losing the promise did not cost the
+// diagnostic any of its substance, polarity included.
+//
+// (5) is deliberately NOT "no forecast in either direction". Measured: the
+// suffix pin catches APPEND-after-tail and REWORD-inside-tail in both
+// directions, always. It is BLIND to a forecast SPLICED before the tail or
+// PREPENDED at the front — there, the token lists are the only defence, and a
+// blocklist is incomplete by construction. Nine distinct foreclosing sentences
+// and nine distinct promising sentences, none using a listed spelling, were
+// each spliced before the tail and left the whole package suite GREEN. So what
+// is enforced is "no forecast in any spelling we listed, anywhere, plus no
+// tampering with the tail at all" — not "no forecast". Do not grow the lists
+// toward completeness; see the doctrine note at the blocklist itself.
 //
 // "Either direction" is load-bearing in (5). The contract on validateVRFOverlap
 // is that the text must not promise a fix "nor rule one out", and until now only
