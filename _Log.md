@@ -66356,8 +66356,15 @@ break — `go vet` confirmed passing under every revert.
   process, saw none of them. It does not depend on interleaving, so it reds at
   any thread count. Proof under the gate flag: reverting
   `install_stale_ignored` to its original `metrics.rs` static REDS the new test
-  (ha_tests.rs:738) while the other 29 `ha::` tests run and pass — the
-  pre-existing suite genuinely cannot see the revert. (DOC) Corrected the
+  while the other 29 `ha::` tests run and pass — the pre-existing suite
+  genuinely cannot see the revert. WHICH assertion reds depends on the run
+  mode, and the original claim of `ha_tests.rs:738` was only true of the
+  ISOLATED run: libtest orders alphabetically under `--test-threads=1`, so
+  `current_generation_…`/`delete_synced_session_gen_…`/`over_ceiling_import_…`
+  all bump the restored global BEFORE `refusal_counters_…` runs, and the
+  PRECONDITION at the top of the test trips first. Fixed in the 2026-08-05
+  18:05 entry by giving the preconditions the same diagnostic as the payload
+  assertions, so the message is reachable in the mode the gate actually uses. (DOC) Corrected the
   export-surface claim at three sites: this crate has NO gRPC dependency and
   none of the three counters is in `proto/`; only `import_cap_drops` reaches
   Prometheus (`server/helpers/status.rs:102` -> `protocol/control.rs:334` ->
@@ -66400,3 +66407,28 @@ break — `go vet` confirmed passing under every revert.
   (cross-test, masked by serial execution) and from the #6657 wg-engine hang.
   Reported to the #6657 owner.
 - **File(s)**: userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 18:05
+- **Action**: #6819 gate fold round 3 (two MINORs). (M1) The `#6819`
+  diagnostics in `refusal_counters_are_per_coordinator_not_process_global` were
+  UNREACHABLE in the mode the gate actually runs. libtest executes
+  alphabetically under `--test-threads=1`, so `current_generation_…` (c),
+  `delete_synced_session_gen_…` (d) and `over_ceiling_import_…` (o) all bump a
+  restored global BEFORE `refusal_counters_…` (r) runs — the bare
+  `assert_eq!(x, 0)` PRECONDITIONS tripped first and reported `left: 1,
+  right: 0` with no explanation, while the carefully-worded payload assertions
+  forty lines below fired only when the test was run in ISOLATION. Gave the
+  three preconditions the same named diagnostic, so a future engineer who
+  reintroduces the regression reads why in either run mode. Generalisable: a
+  diagnostic is only as good as the run mode that REACHES it — when a test has
+  a precondition and a payload assertion, check which fires under the
+  SANCTIONED invocation, not the filtered one used while developing. (M2)
+  Corrected the `ha_tests.rs:738` line cite: under the conditions stated
+  alongside it (the other 29 `ha::` tests running) the revert reds at the
+  precondition, not 738; 738 is the isolated-run line. Corrected in the
+  2026-08-05 16:24 entry and in the PR body.
+  NOT FOLDED: #6891 — a live cross-test counter flake of exactly the shape this
+  PR's README rule warns about (`GRE_DECAP_CHECKSUM_INVALID_DROPS`, equality
+  assert, 18/60 RED at this branch's HEAD and 16/40 at the merge base — equal
+  rate, so pre-existing). Filed separately; it raises #6891's priority, not
+  this PR's scope.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs, _Log.md

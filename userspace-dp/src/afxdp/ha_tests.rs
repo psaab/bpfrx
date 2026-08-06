@@ -694,9 +694,37 @@ fn refusal_counters_are_per_coordinator_not_process_global() {
     // Both instances start clean. (Also the reason the `== before` captures
     // elsewhere in this file are now always `0 == 0` — see the note on
     // `current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`.)
-    assert_eq!(idle.session_install_stale_ignored_total(), 0);
-    assert_eq!(idle.session_delete_stale_ignored_total(), 0);
-    assert_eq!(idle.synced_import_cap_drops_total(), 0);
+    //
+    // These carry the SAME diagnostic as the payload assertions at the bottom,
+    // because under the sanctioned gate they are what actually fires. libtest
+    // runs alphabetically at `--test-threads=1`, so `current_generation_…` (c),
+    // `delete_synced_session_gen_…` (d) and `over_ceiling_import_…` (o) all
+    // execute BEFORE `refusal_counters_…` (r) and would have already bumped a
+    // restored global. A bare `assert_eq!(x, 0)` here reports `left: 1,
+    // right: 0` with no explanation, forty lines above the sentence that
+    // explains it — and the payload assertions below are reachable only when
+    // this test is run in isolation, which is not how `make test-rust` runs it.
+    assert_eq!(
+        idle.session_install_stale_ignored_total(),
+        0,
+        "precondition: a fresh Coordinator must read zero stale-install \
+         refusals — a nonzero value here means an EARLIER test's refusal leaked \
+         in, i.e. `install_stale_ignored` is process-global again (#6819)"
+    );
+    assert_eq!(
+        idle.session_delete_stale_ignored_total(),
+        0,
+        "precondition: a fresh Coordinator must read zero stale-delete \
+         refusals — a nonzero value here means an EARLIER test's refusal leaked \
+         in, i.e. `delete_stale_ignored` is process-global again (#6819)"
+    );
+    assert_eq!(
+        idle.synced_import_cap_drops_total(),
+        0,
+        "precondition: a fresh Coordinator must read zero cap drops — a nonzero \
+         value here means an EARLIER test's refusal leaked in, i.e. \
+         `import_cap_drops` is process-global again (#6819)"
+    );
 
     // Entry cap = 2 (logical override 1, doubled for the synthesized reverse).
     busy.synced_import_cap_override = 1;
