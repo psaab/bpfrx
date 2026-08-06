@@ -239,8 +239,8 @@ That qualifier is not pedantry. Verification is gated per-connection on
 key was committed stays unauthenticated for its whole lifetime and keeps having
 its frames accepted with no HMAC. See "Rolling it onto a live unkeyed cluster"
 below for the operator consequence — the restart there is not optional — and
-**#6628** / **#6906** for the open residual. Both are PRE-EXISTING, not
-introduced by #5078.
+**#6628** for the open residual — it covers any auth-key CHANGE and subsumes
+the narrower unkeyed→keyed case. It is PRE-EXISTING, not introduced by #5078.
 
 ### Rollout: a secondary whose gate is ARMED cannot be keyed locally
 

@@ -280,8 +280,10 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 	// sessions). Lenient on load / peer-sync (warn so an already-persisted or
 	// peer-synced unkeyed config still boots — #1960 no-brick; this is the
 	// upgrade path for a cluster that was unkeyed before the gate existed, and
-	// the dual-accept grace in all three mechanisms lets the key then be rolled
-	// out one node at a time). Runs LAST in the cluster-zone segment so every
+	// the heartbeat and fabric gRPC grace lets the key then be rolled out one
+	// node at a time WITHOUT dropping the cluster -- but not without dropping
+	// SESSION SYNC, whose dual-accept #5078 removed; see pkg/cluster/README.md
+	// -> "Rolling it onto a live unkeyed cluster", #6881). Runs LAST in the cluster-zone segment so every
 	// structural cluster error still wins the first-error slot — an operator
 	// fixing a malformed redundancy-group should not be handed the auth message
 	// first. Runs on the fully-compiled *Config (ControlLinkAuthKey populated by

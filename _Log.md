@@ -1,3 +1,53 @@
+## 2026-08-05 — #6865 round 5: the sweep stopped at the package boundary
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Fold three documentation-contract findings from the re-gate.
+  Comment/doc only — zero non-comment production-Go changed lines.
+- **File(s)**: `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_cluster_zone.go`,
+  `pkg/config/compiler_validate_strict_cluster_auth.go`,
+  `docs/config-schema.md`, `pkg/cluster/status.go`, `pkg/cluster/sync_auth.go`,
+  `pkg/cluster/README.md`
+
+**F1 — four surfaces outside pkg/cluster still described the procedure #5078
+kills.** All four said the dual-accept grace lets an operator roll the key out
+one node at a time. #5078 removed dual-accept from SESSION SYNC: key node A
+only and A rejects B's handshake outright (B is unkeyed, sends no HELLO, hits
+the no-HELLO arm), so session sync is DOWN until both nodes are keyed AND both
+have restarted. The heartbeat and fabric gRPC channels do still dual-accept, so
+"without dropping the cluster" survives — "in all three mechanisms" does not.
+
+The sharpest instance: `docs/config-schema.md` made the claim NINE LINES above
+a pointer to `pkg/cluster/README.md`, whose "Rolling it onto a live unkeyed
+cluster" section this very branch had already marked **STALE** (#6881). The
+schema doc contradicted the document it cites.
+
+The earlier sweep was deliberate and thorough — it filed #6881, marked the
+README section stale, added a scope note. It stopped at the package boundary.
+That is the lesson worth keeping: a behaviour change's doc contract is not
+bounded by the package whose code changed.
+
+**F2 — `status.go` named a gate this PR deleted.** Its comment said the posture
+derives from "the SAME two facts syncAuthDecision / heartbeatAuthDecision gate
+on", including the sticky `HeartbeatPeerAuthSeen`. This PR removed
+`peerAuthSeen` from `syncAuthDecision` (now 4 params), so for the sync channel
+the string IS a separate estimate — exactly what the comment denied. The
+operator-facing hazard was already defused by a README scope note; what
+remained was a stale claim at the definition site, in the package the PR swept,
+about a signature the PR changed. Now scoped to the heartbeat, with the
+sync-channel exclusion stated.
+
+**F3 — #6906 cited as OPEN in two places.** True when written: head e7d89fa27
+is 23:33:05, #6906 closed 23:36:00 — three minutes later. Collapsed both to
+#6628, which covers any auth-key CHANGE and subsumes the narrower
+unkeyed→keyed case. `_Log.md`'s own historical entries still name #6906 and are
+left alone: they record what was true when written.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/cluster ./pkg/config -count=1`
+both ok; `gofmt -l` clean on all seven changed files (three unrelated
+`pkg/config` test files are unformatted on origin/master too — pre-existing,
+untouched); Go diff verified comment-only with a non-comment line filter.
+
 ## 2026-08-05 — #5078 round 9: the hardening was applied to one of two symmetric arms
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)

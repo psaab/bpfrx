@@ -300,10 +300,10 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // was committed stays unauthenticated for its whole lifetime and keeps having
 // its frames accepted with no HMAC — the key never applies retroactively to an
 // established stream. That residual is PRE-EXISTING (master behaves
-// identically) and is tracked by #6628 (the broader "never re-handshakes on an
-// auth-key CHANGE", which also covers a key ROTATION) and by #6906 (the
-// narrower unkeyed→keyed re-filing); both are OPEN. Do not read the sentence
-// above as claiming either is closed. pkg/cluster/README.md, "Rolling it onto
+// identically) and is tracked by #6628 — the broader "never re-handshakes on
+// an auth-key CHANGE", which also covers a key ROTATION and subsumes the
+// narrower unkeyed→keyed case. It is OPEN. Do not read the sentence above as
+// claiming it is closed. pkg/cluster/README.md, "Rolling it onto
 // a live unkeyed cluster", spells out the operator consequence: the restart in
 // step 3 is not optional.
 func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK bool) (mode syncAuthMode, accept bool, reason string) {
