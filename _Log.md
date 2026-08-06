@@ -68503,3 +68503,39 @@ break — `go vet` confirmed passing under every revert.
   identical aliasing exposure. Unchanged by this PR; a separate follow-up issue.
 - **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
   pkg/dataplane/README.md, _Log.md
+
+## 2026-08-06 — #5275 PR1: correct three false claims in the arm-proof comments
+
+- **Timestamp**: 2026-08-06
+- **Action**: make the decline's justification true (comment-only)
+- **File(s)**: `pkg/dataplane/armproof.go`
+
+Two independent gates reached the same three findings by different routes — a
+hostile Claude review that ran an unprescribed mutation cell, and a Codex leg
+that reasoned from the value domain and the shipped architecture. All three are
+false statements in the shipping artifact, none changes behaviour:
+
+1. "nothing outside the package can reach a tracked link at all — `Program(name)`
+   is a read-only getter and `m.xdpLinks` has no accessor." FALSE.
+   `Manager.XDPLinks()` returns the LIVE map by reference and `Manager.Program()`
+   returns a live `*ebpf.Program` handle. The two current out-of-package callers
+   (`userspace/manager_compile.go`, `userspace/maps_sync.go`) read only `len` and
+   keys, so the CONCLUSION holds — but it is upheld by the call sites, not by
+   encapsulation, and a future caller in `pkg/dataplane/userspace` could falsify
+   it without an API change. The comment now says that, and frames the missing
+   comparison as DEFERRED to the gating PR rather than impossible. Also records
+   the two `swapXDPEntryProg` states the old text omitted: it skips VLAN
+   sub-interfaces, and it returns on the first per-link `Update` error without
+   advancing `m.xdpEntryProg`.
+2. "The comparison MUST be `!= -1`, never `> 0` or `>= 0`." Half false. `> 0` is
+   genuinely wrong (it misses a foreign nsid of 0). `>= 0` is indistinguishable
+   from `!= -1` for every producible value — the seed is the only negative one
+   and the wire parse is unsigned. `!= -1` stays, as the spelling that says what
+   it means, but the claim that `>= 0` would be a defect is withdrawn.
+3. "only `LinkDeserialize` seeds -1." `NewLinkAttrs()` does too. The
+   load-bearing point is unchanged — a bare composite literal, which is what
+   fixtures use, still zero-values it to 0, and 0 is a real FOREIGN nsid.
+
+Comment-only: every changed line in `armproof.go` is `//` or blank, verified by
+stripping the diff markers and filtering. `gofmt -l` clean, `go build ./...` 0,
+`go vet ./pkg/dataplane/` 0, `go test ./pkg/dataplane/ -count=1` 0, non-root.

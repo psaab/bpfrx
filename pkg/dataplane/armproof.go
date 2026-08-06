@@ -487,7 +487,11 @@ const vlanLinkKind = "vlan"
 // (link_linux.go:2064) and overwrites it only from that attribute
 // (link_linux.go:2304), so -1 means "not emitted" means "local parent".
 //
-// The comparison MUST be `!= -1`, never `> 0` or `>= 0`. Two reasons, both
+// The comparison MUST be `!= -1`, never `> 0`: a foreign nsid of 0 is a real
+// value and `> 0` misses it. (`>= 0` happens to be indistinguishable from
+// `!= -1` for every producible value — the seed is the only negative one and
+// the wire parse is unsigned — but `!= -1` is the spelling that says what it
+// means, so keep it.) Two reasons, both
 // measured rather than reasoned:
 //
 //  1. A foreign parent's nsid is commonly ZERO — the reproduction below read
@@ -510,9 +514,12 @@ const vlanLinkKind = "vlan"
 // The middle row is the whole point: the orphan is a LIVE forwarding surface
 // whose ParentIndex(5) is an ifindex in another namespace, free to collide
 // with any local interface. Note the zero value of a hand-built
-// netlink.LinkAttrs is 0, NOT -1 — only LinkDeserialize seeds -1 — so a test
-// fixture must set this explicitly or it models a link production cannot
-// produce.
+// netlink.LinkAttrs is 0, NOT -1. The -1 seed comes from netlink's own
+// constructors — LinkDeserialize (which every production path here goes
+// through) and NewLinkAttrs — never from a bare composite literal, which is
+// what fixtures use. So a fixture must set this explicitly or it models a link
+// production cannot produce, and 0 is not a harmless default: it is a real
+// FOREIGN nsid that this belt rejects.
 const netnsIDLocal = -1
 
 // coverDirect classifies one attach point that must carry its own instance.
@@ -819,15 +826,32 @@ var xdpLinkModeGeneric = func(ifindex int) bool {
 // (link.XDPOptions{Program: prog}) and its pinned-link reuse (existing.Update
 // (prog), the pin dropped and re-attached when that fails), and swapXDPEntryProg,
 // which updates the tracked links and only then makes XDPEntryProgram() name
-// the program it installed. Post-#1476 m.programs has one writer for the shim
-// (loader_userspace_shim.go) and the legacy entry program is never loaded, so
-// there is a single candidate to compare against; and nothing outside the
-// package can reach a tracked link at all — Program(name) is a read-only
-// getter and m.xdpLinks has no accessor. A mismatch is therefore not a state
-// this tree can produce, which is why adding the comparison HERE would measure
-// nothing while introducing a new way to report a false uncovered (an
-// unreadable expected program), and why the fixture binding it would have to
-// be fabricated.
+// the program it installed — though note it SKIPS VLAN sub-interfaces
+// (loader.go, m.VlanSubInterfaces), and it returns on the FIRST per-link
+// Update error without advancing m.xdpEntryProg, so a partial swap leaves some
+// links on the new program while XDPEntryProgram() still names the old one.
+// Neither state is reachable through today's daemon lifecycle: only the shim is
+// loaded, it is selected before attachment, and the swap calls are guarded.
+// Post-#1476 m.programs has one writer for the shim (loader_userspace_shim.go)
+// and the legacy entry program is never loaded, so there is a single candidate
+// to compare against.
+//
+// Be precise about WHY that holds, because an earlier revision of this comment
+// was wrong and the gate must not inherit the error. It is NOT encapsulation:
+// Manager.XDPLinks() (loader.go) returns the LIVE m.xdpLinks map by reference,
+// and Manager.Program(name) returns a live *ebpf.Program handle, so an
+// out-of-package holder of a *Manager can reach a tracked link and Update it.
+// The two current out-of-package callers — userspace/manager_compile.go and
+// userspace/maps_sync.go — read only len and keys, never the link values. So
+// the invariant is upheld by the CALL SITES, not by the API, and a future
+// caller in pkg/dataplane/userspace could falsify it without touching any
+// signature. (A shallow map copy would not fix that either; the link.Link
+// values stay mutable. A key-only snapshot API would.)
+//
+// On that basis the comparison is deliberately DEFERRED to the gating PR
+// rather than claimed impossible: at this head it would measure nothing, while
+// introducing a new way to report a false uncovered (an unreadable expected
+// program), and the fixture binding it would have to be fabricated.
 //
 // The GATE must still add it. A build that withholds ownership, forwarding and
 // route/VIP advertisement must not rest its refusal on an invariant upheld by
