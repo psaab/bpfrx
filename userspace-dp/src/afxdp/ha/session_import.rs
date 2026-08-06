@@ -21,7 +21,14 @@ impl crate::afxdp::Coordinator {
     /// ceiling via the uncapped sync-import fan-out. Zero when no workers are
     /// registered (early boot / teardown) — the caller treats a zero ceiling as
     /// "bound disabled" so a transient window never rejects legitimate imports.
-    fn synced_import_cap(&self) -> usize {
+    /// Visible to `ha::tests` (#6819 §7) so the PRODUCTION arithmetic below can
+    /// be asserted directly. Both admission tests set
+    /// `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+    /// branch BEFORE this function's production expression is ever evaluated —
+    /// a test-only seam shadowing the real formula. With only those tests,
+    /// deleting the trailing `.saturating_mul(2)` here leaves every cap
+    /// assertion green.
+    pub(super) fn synced_import_cap(&self) -> usize {
         #[cfg(test)]
         if self.synced_import_cap_override != 0 {
             // The override expresses a LOGICAL session ceiling; double it to the
@@ -79,7 +86,9 @@ impl crate::afxdp::Coordinator {
             && entry.generation != 0
             && entry.generation < previous.generation
         {
-            SESSION_INSTALL_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            self.sessions
+                .install_stale_ignored
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         // #5674: aggregate synced-import admission bound. Locally-created
@@ -115,7 +124,9 @@ impl crate::afxdp::Coordinator {
         if previous_entry.is_none() && !entry.metadata.is_reverse {
             let synced_cap = self.synced_import_cap();
             if synced_cap != 0 && synced_len >= synced_cap {
-                SYNCED_IMPORT_CAP_DROPS.fetch_add(1, Ordering::Relaxed);
+                self.sessions
+                    .import_cap_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -275,7 +286,9 @@ impl crate::afxdp::Coordinator {
             && delete_gen != 0
             && delete_gen < entry.generation
         {
-            SESSION_DELETE_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            self.sessions
+                .delete_stale_ignored
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let reverse_key = removed_entry.as_ref().and_then(|entry| {

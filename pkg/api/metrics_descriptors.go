@@ -6,6 +6,7 @@ func newCollector(srv *Server) *xpfCollector {
 	c.initHostInboundDescriptors()
 	c.initForwardingDescriptors()
 	c.initInterfaceDescriptors()
+	c.initZoneDescriptors()
 	c.initPolicyDescriptors()
 	c.initSessionDescriptors()
 	c.initNATDescriptors()
