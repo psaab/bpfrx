@@ -1,19 +1,44 @@
 # #4408 — Rust hot-path god-functions: `enqueue_pending_forwards` + waterfill
 
-**Status:** PLAN-READY (r4) on a **narrowed scope** — recommending
-**Option B′: the waterfill split ONLY** (Increments 3a + 3b), and
-**PLAN-KILL of #4408's dispatch half as scoped**, with the de-duplication
-re-filed as a maintenance-hazard issue on its own merits (§12.4). r3 had
-DEFERRED that half behind a coverage precondition; r4's judgement is that a
-deferral nobody owns is how an issue stays open for a year, and that the
-framing — "decompose a god-function" — is one that **no available option
-satisfies at a risk the hottest TX path should accept**. The arm-decomposition
-shape that #4404 killed remains explicitly rejected (§5-D).
+**Status: PLAN-READY (r5). #4408 is SCOPE-REDUCED — not killed — to its
+waterfill half.** The leader accepted r4's analysis and decided the disposition:
+
+- **#4408 stays OPEN, narrowed to Option B′** (the waterfill split, Increments
+  3a + 3b). It is the only half this plan now proposes.
+- **The dispatch half has MOVED OUT to #6922**, filed as a *maintenance-hazard*
+  issue rather than a modularity one: "the NAT64 build-`None` drop attribution is
+  implemented twice and must be edited in lockstep". §5-A's evidence, its
+  11-param caveat, and its coverage release condition all travel with it.
+- Nothing is being killed, so no `plan-kill` label is in play. One half
+  proceeds; the other moves to an issue that judges it on the right axis.
+
+The arm-decomposition shape that #4404 killed remains explicitly rejected
+(§5-D).
+
+> ### ⚠ Two things an implementer MUST read before touching code
+>
+> **1. Do not argue B′ as "addresses the modularity audit". That claim is
+> measurably false.** The project's own committed modularity metric —
+> `docs/refactoring-audit-current.txt`, enforced by `pkg/refactoraudit` at a
+> 1500 audit floor and a 2000 `[REFACTOR]` floor — **does not move for this
+> work**. The waterfill split is intra-file and shrinks no file at all;
+> `queue_service/mod.rs` stays 2166 and stays `[REFACTOR]`. B′'s value is
+> **reviewability of a state machine** — three named phases a reviewer can hold
+> in their head instead of one 432-line body — and nothing else. §12.3 has the
+> measurement.
+>
+> **2. §2's codegen artifacts are STALE and §7.3's call-edge baseline MUST be
+> regenerated at the implementation head.** Every artifact in §2 was produced at
+> `dd23119aa`. The two target files are byte-identical at `d77583fe5` (§12.1),
+> so the *inputs* are unchanged — but the toolchain and the rest of the crate
+> are not, and a baseline is a property of the whole build, not of one file.
+> **Do not inherit §2's numbers.** §8a's own record is three gate defects in
+> three rounds, all in the gate and none in the design; a stale baseline is
+> precisely the next instance of that pattern.
 
 **Read §12 first if you only read one section.** It re-verifies every number at
 a newer master, corrects the responsibility count, and records the measurement
-no prior round made: the project's own modularity gate does not move for either
-increment.
+no prior round made.
 
 **Convergence so far (2 reviewers, same conclusion on the narrowed scope).**
 Codex returned PLAN-NEEDS-MAJOR on r2: it declined to kill the waterfill split
@@ -33,6 +58,7 @@ as disagreeing.
 | r2 | folded 7 SMR findings | **2 load-bearing, both in the GATE**: unsatisfiable parent-RED (F1); call-edge command missing the `.llvm` strip (F2) |
 | r3 | narrowed scope; **gate made instance-aware** | **1 load-bearing, again in the GATE**: the inherited Rust-hash strip **over-collapsed** three distinct `VecDeque::grow` monomorphisations into one identity (F8) |
 | r4 | re-verified at a new master; **sharpened the dispatch disposition from DEFER to KILL-as-scoped + re-file** (§12) | none in the design; one **measurement gap**: no round had checked whether the project's own modularity gate actually moves (§12.3 — it does not, for either increment) |
+| r5 | leader decisions folded (§12.6): #4408 **scope-reduced** to B′, dispatch half moved to **#6922**, the two implementer warnings promoted to the header | none — a disposition round, no new analysis |
 
 Three consecutive rounds, three gate defects, zero defects found in the refactor
 design itself. §8a treats that as evidence, not coincidence.
@@ -799,7 +825,8 @@ PLAN-KILL of #4408 in full, not a smaller compromise.
 - `userspace-dp/src/afxdp/cos/queue_service/mod.rs` — Increments 3a/3b. **The
   only production file Option B′ opens.**
 - `userspace-dp/src/afxdp/tx/dispatch/mod.rs` — **not touched** by B′
-  (Increment 1 deferred). Its call-edge set is a *control* in §7.3.
+  (the dispatch half moved to **#6922**, r5). Its call-edge set is a *control*
+  in §7.3.
 - `docs/` — no module-doc change identified: neither
   `pkg/dataplane/README.md` nor `docs/fairness-regimes.md` describes these
   functions' internal structure, and no documented behaviour changes. Per
@@ -808,10 +835,11 @@ PLAN-KILL of #4408 in full, not a smaller compromise.
 
 ## 11. Open questions for the leader
 
-1. **Does the deferred dispatch de-dup get a successor issue, or fold into
-   #4404's irreducible-core class?** §9 recommends a successor whose release
-   condition is the §7.2 deferred grid, but this is a scoping call, not a
-   technical one.
+1. ~~**Does the deferred dispatch de-dup get a successor issue, or fold into
+   #4404's irreducible-core class?**~~ **ANSWERED (r5): a successor issue —
+   #6922 — framed as a maintenance hazard, not as modularity.** See §12.6. The
+   framing was the substantive half of the answer: the same finding filed as
+   modularity gets measured in LOC and dies on the audit-tier test §12.3 ran.
 2. **Option C′ (segmentation hoist) is now moot under B′** — it is a
    `tx/dispatch/mod.rs` change and B′ does not open that file. It rides with
    Increment 1 whenever that is un-deferred, or it is dropped. No action needed
@@ -938,6 +966,13 @@ Two consequences worth carrying forward:
   artifact is regenerated in the same commit. Whoever eventually ships a
   dispatch-side reduction should expect that and regenerate.
 
+  **This is a trap, not a footnote.** The de-dup itself is safe (1608 → ~1524,
+  still `[WATCH]`, canary silent). It is the *next* dispatch-side change — by
+  someone who never read this plan, shaving what looks like 25 harmless lines —
+  that turns a green run red, in a package they did not touch, with a failure
+  message about a heatmap. It is carried on **#6922** so it is in front of the
+  person who will hit it.
+
 ### 12.4 Disposition: KILL the dispatch half *as scoped*, re-file the de-dup
 
 r3 deferred Increment 1 behind a coverage precondition. r4's judgement is that
@@ -982,6 +1017,11 @@ r4 does not recommend it — the waterfill work is genuinely ready and twice
 reviewed — but it is a defensible read and is cheaper to administer than a
 half-open issue.
 
+> **r5 — decided.** The leader took neither the full kill nor a half-open
+> issue: **#4408 is SCOPE-REDUCED** to the waterfill half and the dispatch half
+> moved out to **#6922**. Nothing is killed, so the `plan-kill` label question
+> never arises. See §12.6.
+
 ### 12.5 What r4 did NOT do
 
 - **No cargo, no test run.** r4 is a reading exercise; every number above comes
@@ -995,3 +1035,61 @@ half-open issue.
 - **No independent re-derivation of §2's monomorphisation classifier.** r4 read
   §2c-bis and has no finding on it. §11 q3's warning stands unaddressed: Tier-2
   is the least-exercised part of the gate.
+
+### 12.6 r5 — the disposition, decided
+
+r4 recommended; the leader decided, after independently re-running §12.3's
+measurement against `pkg/refactoraudit/doc.go` and master's
+`docs/refactoring-audit-current.txt` rather than taking it on report. The
+decisions, and what each one changes in this document:
+
+**1. #4408 is SCOPE-REDUCED to the waterfill half — it is not killed.**
+Increments 3a + 3b (Option B′) remain the recommendation and remain on #4408.
+r4's §12.4 framed this as "PLAN-KILL the dispatch half as scoped"; the leader's
+framing is better and is now the doc's: the issue's title covers both halves, so
+removing one half is a **scope reduction**, not a kill. Nothing is killed, the
+`plan-kill` label is not in play, and the issue stays open against work that is
+genuinely ready.
+
+**2. The dispatch half is now #6922, framed as a maintenance hazard.**
+Not as modularity. The reasoning the leader gave, which is worth preserving
+because it generalises: *the defect is a correctness risk — two copies that must
+be edited in lockstep — and filed as modularity it gets measured in LOC, fails
+the audit-tier test §12.3 just ran, and dies for a reason that has nothing to do
+with why it is bad.* Framing decides the axis of judgement, and the wrong axis
+kills a real finding.
+
+#6922 carries §5-A's evidence, §5-A's 11-param caveat, §7.2's coverage release
+condition, and §12.3's audit-floor trap. Whoever picks it up should not need to
+re-derive any of it.
+
+**3. §1c's responsibility count is corrected in the doc, prominently.**
+§12.2 stands as written and is the doc's position: **four** responsibilities, not
+one and not the issue's eight. The substantive half is that the **`Prebuilt` fast
+path (:395–474) is not part of the 2–4 pipeline at all** — it resolves, enqueues,
+recycles and `continue`s without ever reaching the cascade, and shares no local
+state with it.
+
+Stated as plainly as the leader asked: **the Prebuilt path is the one region of
+this function that is neither the #4404-killed arm-split nor the #6922
+de-duplication.** A reader who takes §1c's "one responsibility" as "the body is
+atomic" would conclude that no decomposition exists anywhere in this function,
+and that is false.
+
+**This plan deliberately does not propose extracting it.** Not because it cannot
+be done — of the three candidate shapes it is the only one that is neither
+rejected nor deferred — but because ~80 lines already reading as a self-contained
+unit is not worth opening the hottest TX path for. Recording the option and
+declining it is the point: the next pass gets the analysis instead of the
+conclusion.
+
+**4. The two implementer warnings are promoted out of §12 into the header.**
+The stale-baseline caveat (§12.5) and the "B′ is reviewability, never audit
+compliance" constraint (§12.3) were findings buried at the end of a 900-line
+document. They are now a callout block at the top, because both are things an
+implementer must know *before* starting, and neither survives being an appendix.
+
+**Not changed by r5:** every technical section. §1a's waterfill separability,
+§1b's escape-free interior, §1d's duplication measurement, §2's gate design, §5's
+scoring, §6's increment sequence, §7's validation plan. r5 is a disposition round;
+it moved where things live and what they are called, and it re-derived nothing.
