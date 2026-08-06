@@ -26,7 +26,7 @@ import (
 // else. Config-sync is that node's only writer. Arming comes from an RG0
 // TRANSITION event alone, so a cold-started standby that never transitioned is
 // writable and REST has no RG0 check — #6890, with #6889 the dropped-event
-// variant. Those are bugs being closed, not routes. So the supported way to key
+// variant. Those are open bugs, not routes. So the supported way to key
 // a live cluster is to commit on the
 // primary while sync is connected and let the existing connection carry the key
 // across. If a key change restarted comms, the primary would drop the
@@ -103,14 +103,18 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 // `activeClusterTransport` or "restarting comms" across *_test.go returned
 // nothing.
 //
-// Why the cluster cannot self-recover. A seated RG0 secondary is config read-only
-// (SetClusterReadOnly(true) on demotion; EnterConfigureSession returns
-// ErrClusterReadOnly), and config-sync rides the SAME SessionSync stream this
-// PR fail-closes. So the key reaches the secondary ONLY over the already
-// established connection. Restart comms at the moment the primary becomes keyed
-// and that connection drops while the peer is still unkeyed; the now-keyed
-// primary then rejects its handshake forever, and the secondary cannot be keyed
-// locally.
+// Why the cluster cannot self-recover. An RG0 secondary whose gate is ARMED is
+// config read-only (SetClusterReadOnly(true) on demotion; EnterConfigureSession
+// returns ErrClusterReadOnly), and config-sync rides the SAME SessionSync
+// stream this PR fail-closes. So on that node the key arrives only over the
+// already established connection. Restart comms at the moment the primary
+// becomes keyed and that connection drops while the peer is still unkeyed; the
+// now-keyed primary then rejects its handshake forever.
+//
+// "Armed" is load-bearing and is NOT restated anywhere else in this file: the
+// gate is armed only by an RG0 transition, so a cold-started standby is
+// writable. pkg/cluster/README.md "Recovery" is the single authoritative
+// statement of that, with #6890 and #6889. Do not re-derive it here.
 //
 // Recovery is CONDITIONAL and is NOT described here. Four revisions of this
 // comment tried to summarize it and all four were refuted — "console access

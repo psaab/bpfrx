@@ -925,6 +925,55 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 round 8: stop restating the premise; point at it
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Round-7 gate: "gate passed. No runtime findings." Every runtime
+  premise substantiated again. But it found a FIFTH absolute and three more
+  restatement sites, and it refuted my own round-7 completeness claim — the
+  `_Log.md` line saying the premise sweep returned nothing "does not
+  substantiate completeness", because I grepped the six phrasings I had just
+  fixed rather than the premise. That is the exact error the round-7 commit
+  message describes, committed one layer down while describing it.
+  So round 8 changes METHOD, not just text. Three rounds of per-sentence
+  patching kept regrowing absolutes because every passage restated the premise
+  independently. Now there is ONE authoritative statement
+  (`pkg/cluster/README.md` "Recovery") and every other site says "assumes an
+  armed gate, see there" and explicitly declines to re-derive it. A passage that
+  points cannot drift out of sync with what it points at.
+  Sites:
+  1. `README.md` "the fallback exists" — fifth absolute; row 3 had just
+     established eligibility and event delivery as real preconditions. Now
+     CONDITIONAL, with a line telling the reader not to read an existence claim
+     off that sentence, because that is the absolute this section keeps
+     regrowing.
+  2. `README.md` rollout — "the delete cannot be done", "the second delete
+     requires a promotion", "ONE safe order". All three assume an armed gate;
+     on the row-2 unarmed node the second delete needs no promotion. The
+     subsection now states the assumption once at its head and says it will not
+     restate it; "ONE safe order" became "one safe order you can RELY on".
+  3. `pkg/daemon/daemon_ha.go` — "(only RG0 primary may write config)" stated the
+     gate's INTENT as fact, in the doc comment of the very function that is the
+     only thing that arms it. Now says so, and points at the README.
+  4. `cluster_transport_key_5078_test.go` — "A seated RG0 secondary is config
+     read-only ... the secondary cannot be keyed locally". Scoped to ARMED, with
+     an explicit note that "armed" is load-bearing, is not restated elsewhere in
+     the file, and must not be re-derived there.
+  5. "Both are being closed" (three sites) — unsupported. #6889 and #6890 are
+     OPEN, unassigned, no milestone, no PR. Replaced with "OPEN and unscheduled"
+     everywhere; a doc must not assert a fix date nobody has committed to.
+  Method note for the next reader: the sweep this round is BEHAVIOURAL. Searching
+  the claim (`secondary.*read-only|cannot be keyed|only writer|only.*RG0
+  primary.*writ`) and excluding the qualified forms now returns exactly ONE hit,
+  `pkg/configstore/README.md:810` — the out-of-package site deliberately scoped
+  out and filed as #6896. That is a sweep whose completeness can be re-run, which
+  the round-7 grep was not.
+- **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_auth.go,
+  pkg/daemon/daemon_ha.go, pkg/daemon/cluster_transport_key_5078_test.go,
+  _Log.md
+- **Validation**: comment-only — production diff filtered to non-comment lines is
+  empty. `go build ./...` rc=0; `go test ./pkg/cluster ./pkg/daemon
+  ./pkg/configstore -count=1` rc=0 (all three `ok`); `gofmt -l` clean.
 ## 2026-08-05 — #6865 round 7: I fixed the row I was looking at, not the premise
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)

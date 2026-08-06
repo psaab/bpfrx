@@ -259,7 +259,8 @@ reaches that call, and `Store.clusterReadOnly` starts false — so its store is
 writable. REST enters a configure session with no RG0 check of its own
 (`pkg/api/config.go`), where gRPC guards on `IsLocalPrimary(0)` and the
 interactive CLI has its own check. That gap is **#6890**; the dropped-event
-variant is **#6889**. Both are being closed. The design intent is what this
+variant is **#6889**. Both are OPEN and neither is scheduled — do not read a
+fix date into this sentence. The design intent is what this
 section describes; treat the gap as a bug to avoid, never as a rollout
 procedure.
 
@@ -350,9 +351,11 @@ than summarised into a verdict:
 So the recovery you can actually plan for is a deliberate cluster failover —
 you have turned a config commit into an outage. (A node that happens to fall in
 the row-2 unarmed-gate case is writable without any of that, but you cannot
-design a procedure around a gap that is being closed.) That is why committing
-`authentication-key` must never restart cluster comms: the fallback exists, and
-it is one you would have to schedule.
+design a procedure around a gap that is merely FILED.) That is why committing
+`authentication-key` must never restart cluster comms: the fallback is
+CONDITIONAL on everything row 3 lists, and even when available it is one you
+would have to schedule. Do not read "a fallback exists" off this sentence —
+that is exactly the absolute this section keeps regrowing.
 `TestAuthKeyChangeDoesNotRestartClusterComms_5078` and
 `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` pin the no-restart
 behaviour; if either reds, the change under your hand is the one that forces
@@ -759,7 +762,11 @@ them unchanged — so neither is an example of this order; you have to
 remove the line from your own config first. On a new build or during a
 maintenance window you were taking anyway, this costs nothing.
 
-*On a LIVE pair the delete cannot be done without the sync undoing it.*
+*On a LIVE pair whose secondary gate is ARMED, the delete cannot be done
+without the sync undoing it.* (Everything in this subsection assumes an armed
+gate; on the row-2 unarmed node the second delete needs no promotion at all.
+That is the #6890 hole, not a supported route — see the Recovery section. This
+subsection does not restate the caveat again.)
 `configuration-synchronize` is committed from the RG0 primary. Delete it
 there and the SECONDARY still has it enabled — so the moment that secondary
 is promoted, reconciliation (`daemon_ha.go:444`) sees sync enabled in its
@@ -768,7 +775,7 @@ former primary (`daemon_ha_sync.go:462`), restoring the very line you just
 deleted. You cannot simply "delete on both nodes": the second delete
 requires a promotion, and the promotion re-adds the first.
 
-There is ONE safe order on a live pair, and it is a controlled
+There is one safe order you can RELY on for a live pair, and it is a controlled
 single-node outage — not a two-command sequence, and NOT a link cut:
 
 ```

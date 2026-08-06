@@ -273,7 +273,8 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // driven by an RG0 TRANSITION event and nothing else, so a node that
 // cold-starts into secondary and never transitions is still writable, and REST
 // has no RG0 check of its own — see #6890 (and #6889 for the dropped-event
-// variant). Both are being closed; do not design a rollout around either.
+// variant). Both are OPEN and unscheduled; do not design a rollout around
+// either, and do not assume they are fixed.
 // Keying a LIVE cluster therefore means committing on the PRIMARY while sync is
 // connected and letting the established connection carry the key across — which
 // works only because the auth key is absent from clusterTransportKey, so a key
