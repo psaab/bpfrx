@@ -470,9 +470,14 @@ func TestPeerHeartbeatAckNotLatchedBeforeInstall_5718(t *testing.T) {
 // that lets installConn scope its clear to supersession alone.
 //
 // installConn deliberately does not clear on a full-disconnect -> connect edge
-// (`d.wasDisconnected`), on the grounds that reaching an empty registry always
-// means handleDisconnect's full-disconnect clear already ran. That is a claim
-// about the rest of the package, not about installConn, and adding the
+// (`d.wasDisconnected`), on the grounds that whenever the registry is empty the
+// capability is already clear. Note the precise form: NOT "an empty registry
+// always means handleDisconnect's clear ran" — the `fresh SessionSync` subtest
+// below is empty having never seen a disconnect at all. The invariant is that
+// an empty registry implies a CLEAR capability, reached either by
+// initialization or because handleDisconnect owns the nonempty-to-empty
+// transition. That is a claim about the rest of the package, not about
+// installConn, and adding the
 // condition back is INERT rather than wrong — which is exactly why no
 // behavioural test can reject it. What can go wrong is the premise: a future
 // teardown path that empties conn0/conn1 without clearing would silently make
@@ -639,9 +644,10 @@ func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
 	for _, s := range sites {
 		if !allowed[s.fn] {
 			t.Fatalf("%s nils a fabric connection slot at %s. installConn deliberately does "+
-				"NOT clear peerHeartbeatAckEver on the full-disconnect edge, because "+
-				"reaching an empty registry is supposed to PROVE handleDisconnect's clear "+
-				"already ran. A second function that empties a slot breaks that premise: "+
+				"NOT clear peerHeartbeatAckEver on the full-disconnect edge, because an "+
+				"empty registry is supposed to imply a CLEAR capability — by initialization, "+
+				"or because handleDisconnect owns the nonempty-to-empty transition. A second "+
+				"function that can perform that transition breaks the premise: "+
 				"the registry can then go empty with the capability still latched, and the "+
 				"previous incarnation is enforced against the next peer. Either clear the "+
 				"capability there too, or restore the clear in installConn (#5718 fold r3). "+

@@ -1485,8 +1485,13 @@ outside the monitor loop:
 
   Residual, deliberately open. This was previously described as a THIRD
   incarnation dialling into the slot that still held a stale connection. Fold
-  r4b's eviction made that shape unreachable: no stale connection is left
-  installed for a later incarnation to land on.
+  r4b's eviction made that shape unreachable: no RETIRED-STAMPED connection
+  remains installed after a recognized supersession for a later incarnation to
+  land on. (Precisely that — the accepted residual below can still leave a
+  semantically dead connection installed under a falsely-CURRENT stamp, and a
+  third incarnation can physically land on that corpse; it is then classified as
+  replacing a current connection, which advances the incarnation and evicts, so
+  it does not reach the old no-advance outcome.)
 
   The residual that survives it is the empty-alternate-slot reboot — a peer
   whose replacement enters through a slot that is already empty is never
@@ -1496,8 +1501,10 @@ outside the monitor loop:
   the same thing: a peer-supplied boot incarnation on the wire, which #5480
   tracks and #6669 implements. Closing it is a wire change, not a local one.
 
-  `installConn` does NOT clear on the full-disconnect edge, because reaching an
-  empty registry implies `handleDisconnect`'s clear already ran. Note the
+  `installConn` does NOT clear on the full-disconnect edge, because whenever the
+  registry is empty the capability is already clear — reached either by
+  initialization (a fresh `SessionSync` is empty having never seen a disconnect)
+  or because `handleDisconnect` owns the nonempty-to-empty transition. Note the
   reason is NOT that `conn0`/`conn1` are nilled nowhere else — since fold r4b
   `evictStaleIncarnationConnsLocked` nils them too. It is that eviction cannot
   leave the registry EMPTY (below), so an empty one still implicates

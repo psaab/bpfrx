@@ -68542,3 +68542,22 @@ break — `go vet` confirmed passing under every revert.
   control. M3 (drop the bond-member exclusion) now reds both activation-tail
   tests with `[reconfigure trust0 lag0m]` vs `[reconfigure trust0]`; before
   the fixture change that mutation passed.
+
+## 2026-08-06 — #6825 fold r10 (Codex r9 prose findings)
+
+- **Timestamp**: 2026-08-06 02:50 PDT
+- **Action**: Correct three remaining categorical claims, all mine from r8.
+  Comment/string-literal only — zero executable Go lines changed.
+- **File(s)**: pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md
+- **Validation**: go build ./... rc=0; go test ./pkg/cluster ./pkg/networkd
+  -count=1 rc=0; gofmt clean. Codex r9 stated plainly that its gate failed on
+  invariant prose, not runtime behaviour, and separately re-verified the two r8
+  guards: a mutation confined to the switch's `case 1` arm reds ONLY
+  keep_slot_1_empty, and deleting `&& ifc.BondMaster == ""` reds both
+  activation-tail tests with [reconfigure trust0 lag0m].
+- **Known-unbound, recorded not fixed**: three other wrong-interface
+  regressions on the activation tail remain unbound and were mutation-proven
+  to exit 0 — a hardcoded "trust0", removal of the unmanaged/disabled
+  filtering, and reversed multi-interface accumulation/order. The fixture
+  closes the bond-member arm only; the comment claims only that arm.

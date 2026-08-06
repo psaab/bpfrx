@@ -149,12 +149,16 @@ func TestInstallConnNeverLeavesTheRegistryEmpty_5718(t *testing.T) {
 // TestOnlyHandleDisconnectEmptiesTheRegistry_5718 weaker than it reads: the
 // exemption is by function NAME, so a second call site inherits it without
 // inheriting the property it was granted for. A caller naming a slot it had not
-// filled would evict every other slot and return with the registry empty —
-// exactly the state the structural guard exists to forbid — and all three
-// existing tests would stay green.
+// filled COULD evict every other slot and return with the registry empty —
+// whenever those other slots hold retired-stamped connections — exactly the
+// state the structural guard exists to forbid, and all three existing tests
+// would stay green. (Not "would": with an empty keep slot and a CURRENT
+// connection in the other slot nothing is stale, so nothing is evicted and the
+// registry stays nonempty. The refusal is not a prediction about the call, it
+// is a refusal to proceed when the postcondition cannot be established.)
 //
-// So drive the helper directly, in the two shapes a caller can get wrong, and
-// assert it declines. Reverting the keep-slot refusal reds both subtests.
+// So drive the helper directly, in the shapes a caller can get wrong, and
+// assert it declines. Reverting the keep-slot refusal reds all three subtests.
 func TestEvictionRefusesToEmptyTheRegistry_5718(t *testing.T) {
 	// The keep-slot lookup is a two-armed switch, so a fixture that only ever
 	// populates ONE slot leaves the other arm free: a regression confined to
