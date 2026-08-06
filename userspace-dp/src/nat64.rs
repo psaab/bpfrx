@@ -358,7 +358,12 @@ pub(crate) struct Nat64ReverseInfo {
 //     refreshed. Memory is separately bounded (16 shards x 64 entries).
 //
 // Miss (reorder / orphan / eviction / cross-node failover) falls to a
-// fail-closed drop (`nat64_frag_dropped`), never a wrong-source forward.
+// fail-closed drop (`nat64_frag_dropped`) when the packet would otherwise have
+// been FORWARDED — that is the disposition the Pref64 gate is scoped to
+// (`ForwardCandidate`). It is not a blanket claim over every disposition:
+// NoRoute, MissingNeighbor, HAInactive and LocalDelivery reach their own arms,
+// none of which emits the packet natively, so they are safe for their own
+// reasons rather than by this gate (#6927 r2).
 // #6927: that was an ASPIRATION until the Pref64-destination gate on the
 // flowless arm (`poll_descriptor/mod.rs`) existed. `nat64_consult_forward_fragment_assoc`
 // returning `None` only means "no association"; the packet then resolved like
@@ -434,12 +439,23 @@ pub(crate) struct FragAuthority {
     /// hit skips). Install and consult both read the same pre-gate value, so
     /// the key stays symmetric and "same key <=> same ingress authority" holds.
     ///
-    /// Residual, stated rather than implied: because the owner-RG gate is
-    /// runtime HA state (not config, so `build_generation` does not fence it),
-    /// an RG that stops forwarding locally between a first and a non-first
-    /// fragment leaves the association keyed on a stamp the post-gate
-    /// enforcement would now ignore, so the non-first fragment can inherit a
-    /// permit the current enforcement would refuse.
+    /// Residual, NARROWED in #6927 r2 because the original wording outlived the
+    /// fix. Because the owner-RG gate is runtime HA state (not config, so
+    /// `build_generation` does not fence it), an RG that stops forwarding
+    /// locally between a first and a non-first fragment leaves the association
+    /// keyed on a stamp the post-gate enforcement would now ignore.
+    ///
+    /// What that no longer implies is that the fragment is FORWARDED under the
+    /// stale authority. #6927 runs `enforce_ha_resolution_snapshot` on the hit
+    /// arm (poll_descriptor/mod.rs), so an inactive owner is demoted to
+    /// `HAInactive` on the very next fragment and the shared safety net
+    /// fabric-redirects it to the node that now owns the egress RG. Measured:
+    /// deleting that call makes the inactive leg of
+    /// `nat64_frag_assoc_hit_reenforces_owner_rg_6927` forward again.
+    ///
+    /// What genuinely remains is the ZONE-POLICY half: a hit still inherits the
+    /// first fragment's permit and re-runs only the INTERFACE filter, so a
+    /// policy change between fragments is not re-applied.
     ///
     /// Be precise about the WINDOW, because the obvious reading is wrong and an
     /// earlier revision of this paragraph got it wrong. `NAT64_FRAG_TTL_NS` is
@@ -457,7 +473,11 @@ pub(crate) struct FragAuthority {
     /// move on an RG transition, eviction lives in `install` so a pure-consult
     /// stream never triggers it, `retain` only prunes already-expired entries,
     /// and the input filter this PR runs on a hit is the INTERFACE filter — it
-    /// does not re-apply zone policy or the owner-RG gate. This is the same
+    /// does not re-apply zone policy. (It DOES re-apply the owner-RG gate:
+    /// #6927 added `enforce_ha_resolution_snapshot` to the hit arm,
+    /// poll_descriptor/mod.rs. An earlier revision of this sentence said
+    /// otherwise and contradicted the module header above, which had it right.)
+    /// This is the same
     /// already-admitted-flow property the flow-backed session table has across
     /// an RG transition; do not describe it as bounded by a shorter lifetime.
     pub(crate) ingress_zone: u16,

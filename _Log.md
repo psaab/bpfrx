@@ -68922,3 +68922,65 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6835 round 2 — fold the Codex verdict at `e8c2403a5`. No runtime
+  defect and no guard unable to fire; the diff is comment text, test assertion
+  messages and one test LABEL. Verified: no non-comment production line changed.
+  **THE MATERIAL QUESTION ANSWERED: the B2 re-enforcement test is SOUND.** The
+  doc claimed "the SAME cached association" replayed under two HA runtimes, but
+  the two legs pass DIFFERENT fragment identifiers (`0x6927_0002` /
+  `0x6927_0003`) and therefore mint two distinct entries. That could have made
+  the test vacuous — if the inactive leg MISSED, its `tx == 0` would come from
+  the flowless drop rather than the hit arm. It does not. The closure installs
+  from a first fragment under `&active` in BOTH legs and asserts `dbg1.tx == 1`,
+  so the association exists; and measured directly, deleting
+  `enforce_ha_resolution_snapshot` from the hit arm makes the inactive leg
+  forward (`left: 1, right: 0`). The differing idents are BETTER isolation than
+  a shared entry, which would let the active leg's consult re-stamp the deadline
+  before the inactive leg ran. Comment corrected to say what the fixture does;
+  the fixture is untouched.
+  **F-A, the fabricated input.** `FragAuthority.routing_table` is INERT in
+  production: the only two assignments are literal zero, the XDP writer
+  (`userspace-xdp/src/lib.rs`) and the Default impl (`afxdp/types/mod.rs`), so
+  no real packet carries a non-zero value into `frag_ingress_authority`. The E2E
+  case fabricates `routing_table: 1`, so it demonstrates that the field
+  participates in key equality — NOT that a routing instance reaches the key.
+  The case is relabelled to say exactly that.
+  The more interesting half: real VRF discrimination IS covered, by a different
+  field. Routing-instance membership is per-INTERFACE
+  (`config.RoutingInstanceConfig.Interfaces []string`), so two fragments in
+  different instances necessarily arrive on different interfaces and already
+  differ in `ingress_ifindex` — which is the FIRST dimension in the same table.
+  The field is kept (the key is then ready if the shim ever stamps it) with a
+  note to relabel and drive from a real ingress if it is made live.
+  **Ten further comment corrections, each measured at this head rather than
+  inferred.** Two of them were mutually contradictory in the same file:
+  `nat64.rs` module header said the hit arm re-runs
+  `enforce_ha_resolution_snapshot` every packet (true), while the
+  `ingress_zone` doc said the hit "does not re-apply zone policy or the owner-RG
+  gate" (false for the owner-RG half). Corrected, and the residual paragraph
+  narrowed: what genuinely remains is the ZONE-POLICY half, since a hit inherits
+  the permit and re-runs only the INTERFACE filter.
+  The rest: "No routing evaluator follows" (one does now); the counter
+  assertion message, which named `true` as the revert when `true` is what ships
+  and predicted 1 when the measured revert value is 3; `filter.rs`
+  "`routing_eval_follows` is true ONLY on the session-MISS path" (there is now a
+  `true` HIT site); `eval.rs` "the only external call site", twice (three
+  pairings now); two fixture comments claiming no v6 route / that the fixture
+  removes inet6 routes, when it deliberately RETAINS `::/0` — that deletion was
+  what hid the #6927 leak, so the drop is the Pref64 gate, not an absent route;
+  and two blanket fail-closed claims (`nat64.rs` and
+  `docs/feature-coverage.md`) narrowed to the `ForwardCandidate` disposition the
+  gate is actually scoped to, since NoRoute / MissingNeighbor / HAInactive /
+  LocalDelivery reach their own arms.
+  TEST RUN. `cargo test --release`, fresh target dir. One run showed a single
+  failure in `afxdp::types::shared_cos_lease::tests::
+  v8_epoch_seqlock_snapshot_never_tears_tag_grace` — a CoS seqlock test in a
+  subsystem this diff does not touch. It did NOT reproduce: 5/5 CLEAN at this
+  head and 5/5 CLEAN at unmodified `e8c2403a5`. Recorded as a load-sensitive
+  flake, not attributed to this change and not claimed as proven-pre-existing on
+  one sighting.
+- **File(s)**: userspace-dp/src/afxdp/tests_nat64_tunnel.rs,
+  userspace-dp/src/nat64.rs, userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+  userspace-dp/src/filter/engine/eval.rs, docs/feature-coverage.md, _Log.md

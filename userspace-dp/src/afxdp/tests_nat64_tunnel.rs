@@ -1314,8 +1314,10 @@ fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
     );
     assert_eq!(
         dbg2.tx, 0,
-        "#5146: with no association to inherit and no v6 route for the synthetic NAT64 \
-         prefix, the missed non-first fragment drops fail-closed (#4617)"
+        "#5146/#6927: with no association to inherit, the missed non-first fragment drops \
+         fail-closed. The fixture DOES carry a v6 default route now — deleting it is what hid \
+         the #6927 leak — so the drop is the Pref64-destination gate on the flowless arm, NOT \
+         an absent route"
     );
     assert_eq!(
         forwarding.nat64.frag_assoc.len(),
@@ -1349,10 +1351,11 @@ fn nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146() {
 //
 // What is NOT pinned, stated so a later reader does not over-read this test: the
 // exact gate that finally discards the missed fragment. Measured firsthand, it
-// is NOT the #4617 `nat64_frag_dropped` translate-path counter — in this fixture
-// `nat64_frag_snapshot` deliberately removes the inet6 routes (see its own
-// comment) precisely so an unassociated NAT64 v6 fragment has no v6 route and
-// dies fail-closed there. The same convention is used by the sibling
+// is NOT the #4617 `nat64_frag_dropped` translate-path counter. That reasoning
+// described the PRE-#6927 fixture, which deleted the inet6 routes so an
+// unassociated NAT64 v6 fragment died for want of a route. `nat64_frag_snapshot`
+// now deliberately RETAINS `::/0` — the deletion was hiding a real leak — so the
+// missed fragment is stopped by the Pref64-destination gate instead. The same convention is used by the sibling
 // `nat64_rolled_back_first_fragment_publishes_no_frag_assoc_5146` miss test,
 // which also asserts tx/translations rather than a drop-reason counter.
 //
@@ -1686,6 +1689,21 @@ fn nat64_frag_authority_dimensions_are_threaded_end_to_end_5798() {
         ingress_vlan_id: 80,
         ..base_meta
     };
+    // #6927 r2 (F-A): `routing_table` is INERT in production today. The only two
+    // assignments are literal zero — the XDP writer (userspace-xdp/src/lib.rs)
+    // and the Default impl (afxdp/types/mod.rs) — so no real packet ever carries
+    // a non-zero value into `frag_ingress_authority`. This input is FABRICATED,
+    // and the case is labelled for what it actually demonstrates: that the field
+    // participates in the key's equality, not that a routing instance reaches
+    // the key.
+    //
+    // Real VRF discrimination is nonetheless covered, by a different field.
+    // Routing-instance membership is per-INTERFACE
+    // (config.RoutingInstanceConfig.Interfaces), so two fragments in different
+    // instances necessarily arrive on different interfaces and already differ in
+    // `ingress_ifindex` — the first case below. The field is kept because the
+    // key is then ready if the shim ever stamps it; if it is ever made live,
+    // relabel this case and drive it from a real ingress instead.
     let vrf_only = UserspaceDpMeta {
         routing_table: 1,
         ..base_meta
@@ -1694,7 +1712,7 @@ fn nat64_frag_authority_dimensions_are_threaded_end_to_end_5798() {
     for (dimension, perturbed) in [
         ("logical ingress interface (same zone)", ifindex_only),
         ("ingress VLAN (physical-ifindex fallback)", vlan_only),
-        ("routing instance / VRF", vrf_only),
+        ("routing_table field participates in the key (FABRICATED input — inert in production)", vrf_only),
     ] {
         let forwarding = build_forwarding_state(&nat64_frag_snapshot_with_second_lan_iface());
         let ha_state = txn_ha_state();
@@ -2034,8 +2052,12 @@ fn nat64_frag_assoc_hit_counts_route_lookup_affecting_input_filter_5798() {
         "the first fragment counts once (the routing evaluator owns its Accept-exit count)"
     );
 
-    // Fragment 2 (non-first): association HIT. No routing evaluator follows, so
-    // the hit-path filter evaluation must count this packet itself.
+    // Fragment 2 (non-first): association HIT. #6927 added a routing evaluator
+    // to this arm (`ingress_route_table_override`, poll_descriptor/mod.rs), so
+    // the hit path passes `routing_eval_follows = true` and the ROUTING walk
+    // owns the Accept-exit count — the same ownership the miss arm has. The
+    // count still lands once per fragment; what changed is which evaluator
+    // records it.
     let non_first = nat64_v6_frag_frame(0x0008, ident, src, dst, 0, 0);
     let mut meta = nat64_v6_frag_meta(non_first.len());
     // The shared NAT64 fragment fixture leaves `flow_{src,dst}_addr` zeroed;
@@ -2064,9 +2086,11 @@ fn nat64_frag_assoc_hit_counts_route_lookup_affecting_input_filter_5798() {
     assert_eq!(
         counter.packets.load(Ordering::Relaxed),
         2,
-        "#5798: the association HIT is the SOLE counter owner for its fragment and must count \
-         on the Accept exit — RED on revert (`routing_eval_follows = true`) leaves this at 1, \
-         the count deferred to a routing evaluator that never runs on a hit"
+        "#5798/#6927: the hit fragment must be counted exactly ONCE. Shipped value is \
+         `routing_eval_follows = true`, which defers the Accept-exit count to the routing \
+         evaluator that now runs on this arm. MEASURED on revert to `false`: this reaches 3, \
+         not 2 — `Always` counts here AND the routing walk counts again, double-counting the \
+         second fragment only (the first takes the miss arm, where `true` was already right)"
     );
 }
 
@@ -2236,9 +2260,20 @@ fn nat64_frag_assoc_hit_applies_matching_pbr_discard_6927() {
 /// ran only on the miss path's freshly-resolved decision, never on the cached
 /// one.
 ///
-/// The pair is the point: the SAME cached association, replayed against an
-/// ACTIVE and an INACTIVE HA runtime, must give different outcomes. The active
-/// leg is what excludes "the fragment stopped forwarding for some other reason".
+/// The pair is the point: the same association SHAPE, installed under the ACTIVE
+/// runtime in both legs and then replayed against an ACTIVE and an INACTIVE one,
+/// must give different outcomes. The active leg is what excludes "the fragment
+/// stopped forwarding for some other reason".
+///
+/// The two legs use DIFFERENT fragment identifiers, so they mint two distinct
+/// entries rather than sharing one (#6927 r2). That is deliberate isolation, not
+/// an oversight: a shared entry would let the active leg's consult re-stamp the
+/// deadline before the inactive leg ran. It does not weaken the test, because
+/// the closure installs from a first fragment under `&active` in BOTH legs and
+/// asserts `dbg1.tx == 1`, so the inactive leg is provably consulting a LIVE
+/// association rather than missing. Measured: removing
+/// `enforce_ha_resolution_snapshot` from the hit arm makes the inactive leg
+/// forward (`left: 1, right: 0`), so the drop is that guard and nothing else.
 ///
 /// RED on revert: drop the `enforce_ha_resolution_snapshot` call from the hit arm
 /// and the inactive leg forwards (`tx == 1`) exactly like the active one.
