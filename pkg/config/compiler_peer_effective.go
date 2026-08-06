@@ -87,6 +87,13 @@ var peerEffectiveStrictSubjects = []peerEffectiveStrictSubject{
 // broader structural problem left to the peer's own load path rather than a
 // false-reject of the origin commit.
 //
+// That makes the tolerant-path opts load-bearing HERE, not just at the two
+// ingresses whose names they carry: tightening one (e.g. lenientIpipTunnelMode)
+// turns the peer compile into an error, the `err != nil -> return nil` arm below
+// swallows it, and this gate silently stops rejecting the very configs it was
+// written for. The flag declarations in compiler_opts.go carry the matching
+// warning (#6861 F3).
+//
 // Standalone (localNodeID < 0) has no peer and is a no-op — zero behaviour
 // change off a cluster. The verdict is deterministic: CompileConfigForNodeLenient
 // is a pure function of the candidate tree and every reused validator walks its

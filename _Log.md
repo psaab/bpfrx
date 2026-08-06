@@ -69076,3 +69076,78 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-06 — #4785 fold r3: the IPIP anchor advisory keys on the RUNTIME DEVICE NAME (#6861 F1b/F2b/F2c/F3)
+
+- **Timestamp**: 2026-08-06
+- **Action**: `ipipAnchorOnlyWarnings` decided "unused anchor" by `*TunnelConfig`
+  POINTER identity against the emitter's output. Runtime identity for a tunnel is
+  the Linux DEVICE name, and several records share a device with an emitted
+  endpoint, so the advisory declared live traffic-carrying devices dead and told
+  the operator to delete them. Two shapes, both reproduced on this branch before
+  the fix:
+    - `ip-0/0/0 tunnel source/destination` + `unit 0 tunnel mode gre`. Unit 0's
+      per-unit tunnel takes the BASE Linux name (`compiler_interfaces.go`), the
+      same name the interface record carries, and `pkg/routing/tunnel.go` keys
+      its desired set by name — one device. The emitter publishes the unit's GRE
+      pointer (#5635), so the interface pointer is unemitted and `ip-0-0-0` was
+      reported as "nothing routed through it" while carrying the working GRE
+      tunnel.
+    - Interface-level `tunnel mode wireguard` with a sole `unit 3`. The emitter
+      keys ONE endpoint to the lowest unit carrying the INTERFACE-level pointer
+      (#1910), but `TunnelNameMap` resolves `wg0.3` to the UNIT's `wg0u3` — which
+      is what `snapshotLinuxName` writes into `InterfaceSnapshot.LinuxName` and
+      therefore what the tunnel endpoint (and the Rust WireGuard TUN behind it)
+      binds to. `wg0u3` is live WireGuard infrastructure; it was reported as a
+      dead IPIP anchor.
+  Detection now goes through `emittedTunnelDeviceNames`, built from
+  `cfg.TunnelNameMap()` — the same map `snapshotLinuxName` consults — so the
+  advisory cannot drift from the device the dataplane opens.
+- **Action**: both remediations corrected. They reach the boot/apply log and the
+  standing `show system alarms` surfaces, so an operator acts on them, and both
+  instructed a deletion that costs traffic. The interface branch's unconditional
+  "Remove the interface-level `tunnel` stanza" is replaced by
+  `ipipInterfaceStanzaRemovalAdvice`, which states the inheritance hazard
+  (`cloneForUnit` runs before a unit's own overrides, so a unit carrying only
+  `mode gre` holds INHERITED endpoints and stops emitting entirely) and the safe
+  ordering. The WireGuard-unit branch no longer offers removing the parent
+  stanza at all and says why: it deletes the working WireGuard tunnel AND exposes
+  the complete ipip endpoint underneath, which the strict gate then rejects. The
+  incomplete-endpoint branch is shared by both sites and carried the same
+  ambiguity, so it now scopes its deletion per site.
+- **Action**: three review follow-ups. `TestIpipUnitAnchorStillAlarms_4785`
+  asserted only the bare word `unit`, so it passed with the WRONG unit number —
+  now asserts `interfaces "ip-0/0/0" unit 5` exactly. `pkg/configstore`'s
+  no-brick test claimed to bind `Load` AND `SyncApply` but drove only SyncApply;
+  `TestLoadToleratesIpip_4785` adds the disk-boot half, persisting via
+  `db.WriteActiveMarker` (not SyncApply) so a strict-compile mutation lands on
+  its OWN `Store.Load REFUSED` assertion rather than a borrowed precondition.
+  The `lenientIpipTunnelMode` doc, `CompileConfigForNodeLenient`'s doc, and
+  `ValidatePeerEffectiveStrict`'s doc now record that the peer gate compiles
+  leniently from a STRICT commit path on purpose — tightening the flag turns the
+  peer compile into an error that the `err != nil -> return nil` arm swallows,
+  silently disarming the gate.
+- **Validation**: four disjoint mutations, each compiled (`go vet` 0) before
+  scoring, each restored to a byte-identical file (sha256 verified).
+  M1 (restore pointer identity) REDs only
+  `TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861`, both subtests,
+  as ASSERTIONS — `device "ip-0-0-0" was declared DEAD ("carries no traffic")
+  but that device carries the emitted endpoint "ip-0/0/0.0"` and the `wg0u3` /
+  `wg0.3` twin — and leaves all 40 other cells in the IPIP cohort GREEN,
+  including `TestIpipOverriddenAnchorKeepsTheOverrideCause_4785` (a genuinely
+  dead distinct-name anchor must still warn — the over-reach guard).
+  M2 (restore the interface remediation) REDs the inheritance arm and the
+  incomplete arm, leaving the WireGuard arm GREEN. M3 (restore the WireGuard
+  alternative) REDs only the WireGuard arm. M4 (production reports `u+1`) REDs
+  the new exact-unit assertion, which the old bare-word form survived. M5 (set
+  `lenientIpipTunnelMode: false`) REDs `TestLoadToleratesIpip_4785` at its own
+  assertion. Both remediation arms carry a behavioural PROOF of the hazard
+  rather than a wording assertion alone: removing the interface stanza is shown
+  to emit ZERO endpoints, and removing the WireGuard stanza is shown to make
+  `CompileConfig` reject `tunnel endpoint "wg0.3" has mode ipip`.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (59 packages).
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/compiler_opts.go, pkg/config/compiler.go,
+  pkg/config/compiler_peer_effective.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md

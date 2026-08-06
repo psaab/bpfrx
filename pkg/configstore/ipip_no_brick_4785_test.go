@@ -4,17 +4,27 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
-// #4785 fold r2 F1: the #1960 no-brick property, bound at the INGRESS.
+// #4785 fold r2 F1: the #1960 no-brick property, bound at BOTH ingresses.
 //
 // The tolerant-path test in pkg/config drives CompileConfigLenient directly.
 // That binds the compiler's behaviour, not the property — #1960 no-brick is a
 // property of Store.SyncApply / Store.Load, and nothing drove an IPIP config
-// through either. Route SyncApply through the strict compile, or register the
+// through either. Route either through the strict compile, or register the
 // gate outside lenientCompileOpts(), and every compiler-level test stays green
 // while an already-persisted config stops booting and HA config sync
 // alarm-loops.
+//
+// #6861 F2c: the two ingresses are covered by two tests, because they are two
+// separate call sites reaching compileTreeLenient. TestSyncApplyToleratesIpip_4785
+// covers the HA peer-sync ingress; TestLoadToleratesIpip_4785 covers the
+// disk-boot one. Until #6861 only SyncApply was exercised while the comment
+// above claimed both — the Load path was correct in code but had no regression
+// of its own, so a future change that made Store.Load compile strictly (the
+// literal boot brick this file exists to prevent) would have shipped green.
 //
 // This is the same argument peer_effective_ipip_4785_test.go makes for the
 // STRICT path ("pkg/config's own tests drive the validator directly, which
@@ -165,6 +175,68 @@ func TestSyncApplyToleratesIpip_4785(t *testing.T) {
 					"warnings: %v", got, want, cfg.Warnings)
 			}
 		})
+	}
+}
+
+// TestLoadToleratesIpip_4785 is the DISK-BOOT half of the no-brick guard
+// (#6861 F2c): a node whose already-committed config carries a dead IPIP tunnel
+// must still boot.
+//
+// This is the failure the SyncApply test's own message invokes ("the same path
+// backs Store.Load, so a node whose already-committed config carries this stanza
+// would fail to boot") but never drove. It is the higher-stakes of the two: a
+// rejected peer sync alarm-loops one standby, whereas a rejected Load leaves
+// ActiveConfig() nil and pushes the daemon into the #1922 bootstrap/lifeline
+// state — an operator-visible outage on a box that was working before the
+// upgrade.
+//
+// The tree is written straight to active.json with the committed marker set
+// (DB.WriteActiveMarker), NOT through SyncApply. That is deliberate on two
+// counts. It models the real scenario — bytes an OLDER binary committed, before
+// any gate existed — rather than a config this binary just accepted. And it
+// keeps the persistence step off the lenient compile path, so a mutation that
+// makes the tolerant compile strict lands on THIS test's own Load assertion
+// instead of tripping a precondition borrowed from the SyncApply test; a RED
+// that only ever fires in a shared setup step proves nothing about Load.
+//
+// RED-on-revert: route Store.Load through compileTreeStrict, or drop
+// lenientIpipTunnelMode from lenientCompileOpts(), and this fails at
+// "Store.Load REFUSED a persisted config".
+func TestLoadToleratesIpip_4785(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config")
+	tree, errs := config.NewParser(ipipSyncConfig).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("precondition: the fixture must parse: %v", errs[0])
+	}
+	if err := newTestStoreAt(t, path).db.WriteActiveMarker(tree, true); err != nil {
+		t.Fatalf("precondition: persisting the stanza must succeed: %v", err)
+	}
+
+	booted := newTestStoreAt(t, path)
+	if err := booted.Load(); err != nil {
+		t.Fatalf("Store.Load REFUSED a persisted config carrying a dead IPIP tunnel. "+
+			"A config an older binary committed must still BOOT (#1960): a compile "+
+			"failure here leaves ActiveConfig() nil, which is exactly the signal that "+
+			"forces the daemon into the bootstrap/lifeline state — the box loses its "+
+			"config over a tunnel that was already inert: %v", err)
+	}
+
+	cfg := booted.ActiveConfig()
+	if cfg == nil {
+		t.Fatal("Store.Load returned no error but left ActiveConfig() nil; the daemon " +
+			"reads that as an uncompiled config and refuses takeover, so a silent nil " +
+			"is the same brick as an error")
+	}
+	// TOLERATED, not dropped: a node that silently lost the stanza would
+	// diverge from its peer on the next config comparison.
+	ifc := cfg.Interfaces.Interfaces["ip-0/0/0"]
+	if ifc == nil || ifc.Tunnel == nil || ifc.Tunnel.Mode != "ipip" {
+		t.Fatalf("the tolerant boot must PRESERVE the tunnel config, got %+v", ifc)
+	}
+	if got := countIpip4785Warnings(cfg.Warnings); got != 1 {
+		t.Errorf("#4785 warnings after boot = %d, want 1. Zero is a silently tolerated "+
+			"dead tunnel (the pre-#4785 behaviour); two is the re-gate N1 double "+
+			"registration. warnings: %v", got, cfg.Warnings)
 	}
 }
 

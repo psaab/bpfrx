@@ -1134,6 +1134,20 @@ type compileOpts struct {
 	// advisory before this gate) still BOOTS (#1960) — the runtime's own
 	// fail-closed arms keep the tunnel inert either way. Same doctrine as
 	// lenientTunnelOuterFamily.
+	//
+	// #6861 F3 — "load / peer-sync" is NOT the whole set of readers, and the
+	// omission is a trap for whoever tightens this next. The peer-effective
+	// commit gate (ValidatePeerEffectiveStrict, compiler_peer_effective.go)
+	// also compiles LENIENTLY, from a STRICT commit path, on purpose: it must
+	// MODEL the standby's tolerant SyncApply ingest before applying its own
+	// strict subjects to the resulting *Config. That makes this leniency
+	// load-bearing in the opposite direction from how the paragraph above
+	// reads. Set it false and CompileConfigForNodeLenient starts returning an
+	// error for exactly the configs the peer gate exists to catch;
+	// ValidatePeerEffectiveStrict's `err != nil -> return nil` arm swallows it,
+	// and the gate silently stops rejecting peer-only dead tunnels. Any
+	// tightening here must be reviewed against that call site, not only
+	// against Store.Load and Store.SyncApply.
 	lenientIpipTunnelMode bool
 	// lenientPolicyZoneRefs (#2401) downgrades the security-policy
 	// zone-pair reference gate (validatePolicyZoneReferencesStrict) from a

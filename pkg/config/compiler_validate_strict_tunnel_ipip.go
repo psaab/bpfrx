@@ -57,6 +57,36 @@ func effectiveIpipTunnelSites(cfg *Config) []ipipTunnelSite {
 	return sites
 }
 
+// emittedTunnelDeviceNames returns the set of Linux DEVICE names the emitted
+// tunnel endpoints bind to at runtime.
+//
+// Runtime identity for a tunnel is the device name, not the *TunnelConfig
+// pointer: routing keys its desired set by TunnelConfig.Name
+// (pkg/routing/tunnel.go), so two records sharing a name are ONE kernel device,
+// and the dataplane resolves an emitted endpoint ref to a device through
+// snapshotLinuxName -> cfg.TunnelNameMap() (pkg/dataplane/userspace/interfaces.go),
+// which for a unit with its own tunnel stanza is that UNIT's device even when
+// the emitted endpoint carries the interface-level object.
+//
+// TunnelNameMap is therefore the derivation used here rather than a second
+// hand-rolled one — the same reason effectiveIpipTunnelSites delegates to
+// EmitTunnelEndpointNames. It keys unit refs ("ip-0/0/0.0") only; an
+// interface-level tunnel on an interface with NO units is emitted under the
+// bare interface ref, which resolves through LinuxIfName exactly as
+// snapshotLinuxName's no-unit arm does.
+func emittedTunnelDeviceNames(cfg *Config) map[string]bool {
+	refToDevice := cfg.TunnelNameMap()
+	out := make(map[string]bool)
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		if device, ok := refToDevice[ep.Name]; ok && device != "" {
+			out[device] = true
+			continue
+		}
+		out[LinuxIfName(ep.Name)] = true
+	}
+	return out
+}
+
 // ipipUnimplementedText is the shared operator-facing explanation, used by BOTH
 // the strict commit gate and the ValidateConfig alarm advisory so the two can
 // never drift.
@@ -131,17 +161,36 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // has already swung through twice. An alarm names it; a commit does not stop
 // for it.
 //
-// Detection is by POINTER identity against the emitter's output rather than by
-// re-deriving which records emit — that keeps the single-SSOT property the
-// strict gate has and avoids a second hand-rolled model of emission.
+// Detection is by RUNTIME DEVICE NAME, not by *TunnelConfig pointer identity
+// (#6861 F1b). Pointer identity answers "is THIS record the object the emitter
+// published"; the advisory's actual claim is about a Linux device — "an
+// interface an operator can see that carries no traffic" — and several records
+// share one device with an emitted one:
+//
+//   - GRE/IPIP UNIT 0. compiler_interfaces.go gives unit 0's per-unit tunnel
+//     the BASE Linux name, identical to the interface-level record's, and
+//     routing keys its desired set by that name (pkg/routing/tunnel.go), so
+//     the two records are one device. With `ip-0/0/0 tunnel source/destination`
+//     plus `unit 0 tunnel mode gre`, the emitter publishes the unit's GRE
+//     pointer (#5635) and the interface pointer is unemitted — but the device
+//     it names is the one carrying the working GRE tunnel. The pointer test
+//     declared that live device dead.
+//   - A UNIT under an interface-level WireGuard stanza. The emitter publishes
+//     ONE endpoint keyed by the lowest unit carrying the INTERFACE-level
+//     pointer (#1910), while TunnelNameMap resolves that same unit ref to the
+//     UNIT's own device — which is what snapshotLinuxName, and therefore the
+//     tunnel-endpoint snapshot, binds the WireGuard TUN to. The unit's pointer
+//     is unemitted; its device is live WireGuard infrastructure.
+//
+// The name comes from cfg.TunnelNameMap() — the same map
+// pkg/dataplane/userspace/interfaces.go:snapshotLinuxName consults to fill
+// InterfaceSnapshot.LinuxName — so there is ONE source of truth for the device
+// name and the advisory cannot drift from what the dataplane opens.
 func ipipAnchorOnlyWarnings(cfg *Config) []string {
 	if cfg == nil {
 		return nil
 	}
-	emitted := make(map[*TunnelConfig]bool)
-	for _, ep := range EmitTunnelEndpointNames(cfg) {
-		emitted[ep.Tunnel] = true
-	}
+	live := emittedTunnelDeviceNames(cfg)
 
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
@@ -155,7 +204,7 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 		if iface == nil {
 			continue
 		}
-		if t := iface.Tunnel; t != nil && t.Mode == "ipip" && !emitted[t] &&
+		if t := iface.Tunnel; t != nil && t.Mode == "ipip" && !live[t.Name] &&
 			// The interface-level anchor screen in collectAppliedTunnels. A
 			// record that fails it creates nothing, so there is nothing to warn
 			// about.
@@ -176,7 +225,7 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 			}
 			// No source screen here, on purpose: collectAppliedTunnels has none
 			// for units, so ANY non-nil unit tunnel becomes an anchor.
-			if unit.Tunnel.Mode != "ipip" || emitted[unit.Tunnel] {
+			if unit.Tunnel.Mode != "ipip" || live[unit.Tunnel.Name] {
 				continue
 			}
 			out = append(out, ipipAnchorOnlyText(
@@ -185,6 +234,28 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 	}
 	return out
 }
+
+// ipipInterfaceStanzaRemovalAdvice is the ONLY wording allowed to suggest
+// removing an INTERFACE-level `tunnel` stanza (#6861 F1b).
+//
+// The unconditional "Remove the interface-level `tunnel` stanza if the per-unit
+// tunnels are the intent" it replaces was unsafe advice. A unit tunnel is built
+// by cloneForUnit FROM the interface-level record and only then takes its own
+// overrides (compiler_interfaces.go), so a unit carrying just `tunnel mode gre`
+// holds INHERITED source/destination — and the emitter suppresses any
+// non-WireGuard endpoint missing either half (tunnelemit.go). An operator who
+// complied would therefore stop a working per-unit GRE tunnel from emitting at
+// all. These advisories reach the boot/apply log and the standing
+// `show system alarms` surfaces, so they are acted on; a remediation that
+// silently drops traffic is strictly worse than no remediation.
+//
+// The safe ordering is stated instead of the deletion, so the sentence is still
+// actionable rather than merely a refusal.
+const ipipInterfaceStanzaRemovalAdvice = "Removing the interface-level `tunnel` " +
+	"stanza would drop this anchor, but any unit that does not set its OWN " +
+	"`tunnel source` and `tunnel destination` INHERITS them from this stanza and " +
+	"would stop emitting an endpoint altogether — give those units explicit " +
+	"endpoints first, then remove it."
 
 // ipipAnchorOnlyText renders one anchor-only advisory, naming the ACTUAL reason
 // the endpoint was not emitted. isUnit selects the fallback wording, and is
@@ -215,23 +286,39 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 //     iface.Tunnel nil, or non-WireGuard, a complete unit record IS emitted and
 //     never reaches here — so WireGuard is the whole of this branch. If another
 //     mode ever gains a short-circuit, this wording needs revisiting with it.
+//
+// Every REMEDIATION here is constrained by one rule (#6861 F1b): it must never
+// instruct the operator to delete config that is carrying traffic. Removing an
+// interface-level stanza is only ever offered through
+// ipipInterfaceStanzaRemovalAdvice, which states the inheritance hazard and the
+// safe ordering; the unit branch offers removing the UNIT's stanza only, and
+// says explicitly why removing the interface-level WireGuard stanza is not the
+// alternative it was previously presented as (it deletes a working tunnel and
+// exposes a complete ipip endpoint the commit gate then rejects).
 func ipipAnchorOnlyText(where string, t *TunnelConfig, isUnit bool) string {
-	cause := "no tunnel endpoint is emitted for the interface-level stanza " +
-		"(every unit overrides it)"
-	fix := "Remove the interface-level `tunnel` stanza if the per-unit tunnels " +
-		"are the intent."
+	var cause, fix string
 	if isUnit {
 		cause = "the interface-level `tunnel mode wireguard` stanza takes the " +
 			"interface's single tunnel endpoint, so this unit's own endpoint is " +
 			"never emitted even though it is fully configured"
-		fix = "Remove this unit's `tunnel` stanza to drop the dead anchor, or " +
-			"remove the interface-level `tunnel` stanza if the per-unit tunnels " +
-			"are the intent."
+		fix = "Remove THIS UNIT's `tunnel` stanza to drop the dead anchor. Do NOT " +
+			"remove the interface-level `tunnel mode wireguard` stanza to free the " +
+			"endpoint slot: that deletes the working WireGuard tunnel AND exposes " +
+			"this complete ipip endpoint, which the commit gate then rejects."
+	} else {
+		cause = "no tunnel endpoint is emitted for the interface-level stanza " +
+			"(every unit overrides it)"
+		fix = ipipInterfaceStanzaRemovalAdvice
 	}
 	if missing := ipipMissingEndpointHalves(t); missing != "" {
 		cause = fmt.Sprintf("%s, so no tunnel endpoint is emitted", missing)
 		fix = "Configure both endpoints (and use `mode gre` or `mode wireguard` " +
-			"for a tunnel that carries traffic), or remove the `tunnel` stanza."
+			"for a tunnel that carries traffic)"
+		if isUnit {
+			fix += ", or remove THIS UNIT's `tunnel` stanza."
+		} else {
+			fix += ". " + ipipInterfaceStanzaRemovalAdvice
+		}
 	}
 	return fmt.Sprintf(
 		"%s tunnel mode ipip: %s, but it still creates a kernel anchor device %q "+
