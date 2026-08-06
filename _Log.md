@@ -68249,3 +68249,54 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/userspace/process_linkcycle.go,
   pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go,
   pkg/dataplane/userspace/legacy_dataplane.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5103 review round 3 (F-A MAJOR / F-B / F-C) — the rollback keyed
+  on the wrong condition, so a half-applied prepare escaped it. `joinFailed` was
+  set only inside the hook's error path, but after a SUCCESSFUL
+  `PrepareLinkCycle` two more fallible steps follow inside `programRethMAC`
+  (`setDown`, and the cycled `setHardwareAddr`), and both return
+  `linkCycled=false`. In both, `joinFailed` stayed false, so
+  `programRethMACWithWorkerJoin` returned `(false, nil)`: `ctrl` disabled,
+  `stop_workers` sent, workers joined, cycle NOT completed, `NotifyLinkCycle`
+  never fired, step 2.6b2's rebind skipped (gated on `linkCycled`),
+  `reapplyAfterDeferredMAC` skipped (gated on `rethMACPending`) — and the commit
+  reported SUCCESS over a node dropping transit. On master this triple was
+  harmless because `PrepareLinkCycle` was never called on that path at all; the
+  ordering fix made it a forwarding outage under a green commit. F-A fix: gate on
+  whether the hook RAN, not whether it failed — `joinRan` is set after the
+  `d.dp == nil` guard (so the `d.dp.Link()` deref stays unreachable with no
+  dataplane) and any subsequent failure rolls back. A cycle that COMPLETED and
+  failed only on `link-up` (`linkCycled=true`) now fails the commit too but does
+  NOT roll back here: step 2.6b2 already rebinds off `linkCycled`, and a second
+  rebind is the one that gets EBUSY on mlx5 zero-copy queues. Reworded
+  `errRethPrepareLinkCycle` from "af_xdp worker join before link cycle" to "link
+  cycle failed after the af_xdp worker join" — the class is a prepare not
+  followed by a clean cycle, not a failed join (no `errors.Is` call site reads
+  the text). F-B — noted at the call site that the rollback's `NotifyLinkCycle`
+  is inside the per-member RETH loop and opens with a 1s NIC-settle sleep, worst
+  case N extra seconds of `applySem` hold (N = RETH count, 2 on the loss
+  cluster). F-C — corrected the `rethMACPending` phrasing in both the code
+  comment and `docs/reth-mac.md`: it is one bool for the whole apply set by a
+  `break`, not per member, so a multi-RETH apply where a DIFFERENT member was
+  present with the wrong MAC does set it. NOT closed: step 2.6b's VIP reconcile
+  is also gated on `linkCycled`, so a cycled-MAC-write failure still skips it —
+  identical on master, documented in `docs/reth-mac.md`, filed separately.
+- **Validation**: `go build ./...` exit 0; `go vet ./...` exit 0; `go test
+  ./pkg/daemon ./pkg/cluster ./pkg/vrrp ./pkg/dataplane/... -count=1 -race` exit
+  0; `go test ./pkg/refactoraudit/...` exit 0; `go test ./pkg/daemon -run 5103
+  -v` 12/12 (the prior 10 plus the two new). RED-on-revert: restoring the
+  `joinFailed` gate REDs `...AbortRebindsWhenCycleFailsAfterJoin_5103` in BOTH
+  subtests at "NotifyLinkCycle calls = 0, want 1: the worker join SUCCEEDED and
+  the cycle then aborted..." and "the commit must FAIL: the dataplane was
+  deliberately torn down...", and REDs
+  `...LinkUpFailureFailsCommitWithoutDoubleRebind_5103` at "the commit must FAIL:
+  the member is left administratively DOWN...". All assertion failures, not
+  build breaks — the package compiled and the other ten 5103 tests passed in the
+  same run. Over-reach guards GREEN under the revert:
+  `...NoRollbackWhenJoinSucceeds_5103`, `...NoJoinOrRollbackOnLiveSet_5103`,
+  `...OrdinaryFailureStaysWarnOnly_5103`, and the `notifyCalls == 0` half of the
+  new link-up test. Restored file verified byte-identical to the pre-mutation
+  copy.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go, docs/reth-mac.md, _Log.md

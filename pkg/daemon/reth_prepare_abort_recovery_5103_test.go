@@ -25,9 +25,14 @@ import (
 // linkCycled was true and NotifyLinkCycle rebound the sockets.
 //
 // The state these tests observe is that intermediate one: live set rejected,
-// join failed, cycle aborted. A fixture that lets the MAC program complete
+// the join RAN, cycle aborted. A fixture that lets the MAC program complete
 // cannot distinguish the fix, because then the ordinary post-cycle rebind runs
 // and the rollback is indistinguishable from it.
+//
+// "the join RAN" is the gate, not "the join FAILED": PrepareLinkCycle disables
+// ctrl and stops the workers whether it goes on to succeed or fail, and setDown
+// and the cycled MAC write can then abort the cycle underneath a SUCCESSFUL
+// join. TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103 covers those two.
 
 // abortRecoveryLinkController counts both halves of the link-cycle protocol so a
 // test can tell a rollback rebind from no rebind at all.
@@ -107,6 +112,170 @@ func TestRethMACAbortRebindsAfterFailedJoin_5103(t *testing.T) {
 	}
 	if !strings.Contains(commitErr.Error(), "stop_workers") {
 		t.Errorf("commit error should name the underlying cause; got %v", commitErr)
+	}
+}
+
+// failStep names the step of the cycle that fails AFTER a successful worker
+// join, in the F-A tests below.
+type failStep int
+
+const (
+	failSetDown       failStep = iota // ENODEV between the LinkByName and the down
+	failSetMACCycled                  // the down succeeded, the cycled MAC write did not
+	failSetUpAfterMAC                 // the whole cycle ran; only link-up failed
+)
+
+// newFailAfterJoinOps wraps the recording seam so one step of the cycle fails
+// after the join has already succeeded. All three are real netlink failures on a
+// driver without IFF_LIVE_ADDR_CHANGE: the link can be moved or removed by
+// udev/networkd between programRethMAC's own LinkByName and its setDown — the
+// same rename window step 2.6's pre-check handles, and the one
+// TestRethMACOrdinaryFailureStaysWarnOnly_5103 cites — and a MAC write or an UP
+// on a link that just went away fails the same way.
+func newFailAfterJoinOps(t *testing.T, events *[]string, step failStep) rethLinkOps {
+	t.Helper()
+	ops := newRecordingRethOps(t, events, curMAC5103, true /* force the cycle */)
+	markFailed := func(err error) error {
+		(*events)[len(*events)-1] += "-FAILED"
+		return err
+	}
+	switch step {
+	case failSetDown:
+		inner := ops.setDown
+		ops.setDown = func(l netlink.Link) error {
+			_ = inner(l)
+			return markFailed(errors.New("ENODEV: no such device"))
+		}
+	case failSetMACCycled:
+		inner := ops.setHardwareAddr
+		ops.setHardwareAddr = func(l netlink.Link, m net.HardwareAddr) error {
+			if err := inner(l, m); err != nil {
+				return err // the live attempt, already rejected by the seam
+			}
+			return markFailed(errors.New("EADDRNOTAVAIL: cannot assign requested address"))
+		}
+	case failSetUpAfterMAC:
+		inner := ops.setUp
+		ops.setUp = func(l netlink.Link) error {
+			_ = inner(l)
+			return markFailed(errors.New("ENODEV: no such device"))
+		}
+	}
+	return ops
+}
+
+// TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103 is the F-A guard: the
+// rollback must key on whether the join RAN, not on whether it FAILED.
+//
+// PrepareLinkCycle succeeds here, so it has definitively disabled ctrl and joined
+// every worker — the member is not forwarding. Two fallible steps follow it
+// inside programRethMAC, and BOTH return linkCycled=false, so both land in the
+// same state the failed-join abort does: prepare applied, cycle not completed,
+// step 2.6b2's rebind skipped (linkCycled false) and reapplyAfterDeferredMAC
+// skipped (rethMACPending false for a member this apply renamed into its config
+// name). Gating the rollback on the hook's OWN error let both escape with a nil
+// commit error, so the commit reported SUCCESS over a node dropping transit.
+//
+// RED-on-revert: restore the joinFailed gate in programRethMACWithWorkerJoin and
+// both subtests fail at "NotifyLinkCycle calls = 0, want 1" and "the commit must
+// FAIL".
+func TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		step      failStep
+		wantSeq   string
+		wantCause string
+	}{
+		{
+			name:      "set_down_fails",
+			step:      failSetDown,
+			wantSeq:   "set-mac-live,link-down-FAILED",
+			wantCause: "link down",
+		},
+		{
+			name:      "cycled_mac_write_fails",
+			step:      failSetMACCycled,
+			wantSeq:   "set-mac-live,link-down,set-mac-cycled-FAILED,link-up",
+			wantCause: "set mac",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var events []string
+			withRethOps(t, newFailAfterJoinOps(t, &events, tc.step))
+			d, lc := newAbortRecoveryDaemon(nil /* the join SUCCEEDS */)
+
+			linkCycled, commitErr := d.programRethMACWithWorkerJoin("ge-0-0-1", virtMAC5103)
+
+			if lc.prepareCalls != 1 {
+				t.Fatalf("PrepareLinkCycle calls = %d, want 1 — the fixture must reach the "+
+					"hook and have it SUCCEED, otherwise this test is just the failed-join "+
+					"case again", lc.prepareCalls)
+			}
+			if got := strings.Join(events, ","); got != tc.wantSeq {
+				t.Fatalf("link sequence = %q, want %q — the fixture must fail the step it "+
+					"claims to", got, tc.wantSeq)
+			}
+			if linkCycled {
+				t.Error("linkCycled must be false when the cycle did not complete")
+			}
+			if lc.notifyCalls != 1 {
+				t.Errorf("NotifyLinkCycle calls = %d, want 1: the worker join SUCCEEDED and "+
+					"the cycle then aborted, so ctrl is off and every worker is stopped with "+
+					"nothing to re-arm them — linkCycled is false so step 2.6b2's rebind is "+
+					"skipped, and rethMACPending is false for a member renamed into existence "+
+					"by this apply. Forwarding stays down on this node", lc.notifyCalls)
+			}
+			if commitErr == nil {
+				t.Fatal("the commit must FAIL: the dataplane was deliberately torn down and " +
+					"the cycle that was supposed to justify it did not complete. Reporting " +
+					"commit SUCCESS here hides a forwarding outage")
+			}
+			if !errors.Is(commitErr, errRethPrepareLinkCycle) {
+				t.Errorf("commit error must carry errRethPrepareLinkCycle so the caller can "+
+					"fail the commit closed on this class alone; got %v", commitErr)
+			}
+			if !strings.Contains(commitErr.Error(), tc.wantCause) {
+				t.Errorf("commit error should name the underlying cause %q; got %v",
+					tc.wantCause, commitErr)
+			}
+		})
+	}
+}
+
+// TestRethMACLinkUpFailureFailsCommitWithoutDoubleRebind_5103 covers the one
+// member of the class whose cycle COMPLETED: only link-up failed, so
+// linkCycled=true and step 2.6b2 already owns the rebind. The commit must still
+// fail — the member is administratively down after a deliberate teardown — but
+// the rollback must NOT fire, or the member is rebound twice.
+//
+// The notifyCalls half is an over-reach guard and stays green under the revert;
+// the commitErr half is what the revert breaks.
+func TestRethMACLinkUpFailureFailsCommitWithoutDoubleRebind_5103(t *testing.T) {
+	var events []string
+	withRethOps(t, newFailAfterJoinOps(t, &events, failSetUpAfterMAC))
+	d, lc := newAbortRecoveryDaemon(nil /* the join SUCCEEDS */)
+
+	linkCycled, commitErr := d.programRethMACWithWorkerJoin("ge-0-0-1", virtMAC5103)
+
+	if got := strings.Join(events, ","); got != "set-mac-live,link-down,set-mac-cycled,link-up-FAILED" {
+		t.Fatalf("link sequence = %q — the fixture must complete the cycle and fail only "+
+			"the UP", got)
+	}
+	if !linkCycled {
+		t.Fatal("a completed DOWN/set/UP attempt must report linkCycled=true so step 2.6b2 " +
+			"reconciles the VIPs and rebinds")
+	}
+	if lc.notifyCalls != 0 {
+		t.Errorf("NotifyLinkCycle calls = %d, want 0: linkCycled is true, so step 2.6b2 "+
+			"rebinds this member. Rebinding here too makes it twice — the spurious rebind "+
+			"that gets EBUSY on mlx5 zero-copy queues", lc.notifyCalls)
+	}
+	if commitErr == nil {
+		t.Fatal("the commit must FAIL: the member is left administratively DOWN after its " +
+			"workers were joined for the cycle")
+	}
+	if !errors.Is(commitErr, errRethPrepareLinkCycle) {
+		t.Errorf("commit error must carry errRethPrepareLinkCycle; got %v", commitErr)
 	}
 }
 
