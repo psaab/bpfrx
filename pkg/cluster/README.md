@@ -1367,7 +1367,25 @@ outside the monitor loop:
   sender→receiver #3931 namespace, so the comparison is meaningful across nodes.
   `epoch == 0` (legacy peer / local-origin) disables the check (rolling-upgrade
   safe); the reconnect `resetRecvGen` zeroes `lastAppliedConfigGen` so a
-  rebooted-peer bulk re-prime is never falsely rejected. **The guard is
+  rebooted-peer bulk re-prime is never falsely rejected. **That zeroing is
+  serialized against every advance of the mark by `configGenMu` (#5084)** — the
+  advance is a load/compare/store and the clear runs on a different goroutine
+  (a receive loop, versus `configApplyLoop` for the applied mark and the *other*
+  receive loop for the received mark), so a clear could land inside an advance
+  and be lost, leaving a pre-reboot generation that refuses every generation the
+  reconnected peer can produce. Writers of the three config-generation marks:
+
+  | writer | mark(s) | goroutine | synchronisation |
+  |---|---|---|---|
+  | `recordAppliedConfigGen` | applied | `configApplyLoop` | `configGenMu` |
+  | `recordRecvConfigGen` | received | receive loop (×2) | `configGenMu` |
+  | `beginConfigApply` / `endConfigApply` | applying fence | `configApplyLoop` | `configGenMu` |
+  | `resetRecvGen` | all three, clear to 0 | receive loop (×2) | `configGenMu` |
+  | `initGenState` | all three | `NewSessionSync` | none — pre-`Start`, no goroutines yet |
+
+  Readers stay lock-free (the marks are atomics and `configEpochStale` runs per
+  synced session install); a reader racing a writer observes one side of a
+  single monotone step, which is the tolerance the marks already had. **The guard is
   Go-cluster-authoritative** — the userspace helper's `config_generation` is a
   *local* commit counter (`Manager.bumpGeneration`) that is not cross-node
   comparable, so the receiver rejects the stale install BEFORE forwarding it to

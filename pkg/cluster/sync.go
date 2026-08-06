@@ -675,6 +675,54 @@ type SessionSync struct {
 	lastRecvConfigGen atomic.Uint64
 	configApplyCh     chan configApplyItem
 
+	// configGenMu makes the reconnect RESET of the three config-generation
+	// marks above atomic with respect to every ADVANCE of them (#5084).
+	//
+	// Each mark is advanced by a non-atomic read-modify-write — load, compare,
+	// store — and each is cleared to 0 by resetRecvGen on a peer bulk re-prime.
+	// Those run on DIFFERENT goroutines: resetRecvGen is called from the
+	// syncMsgBulkStart handler on a receive loop, while the applied mark is
+	// advanced by the single configApplyLoop consumer and the received mark by
+	// a receive loop. Nothing ordered them, so a clear could land between an
+	// advance's load and its store and be lost — the store then re-raises the
+	// mark the reset just cleared.
+	//
+	// That is not benign, which is what the pre-#5084 comments assumed. The
+	// whole point of the reset is that a peer which OS-rebooted restarts its
+	// monotonic configGenCounter LOWER; a pre-reboot generation surviving the
+	// reset means every one of the reconnected peer's CURRENT generations is
+	// refused as stale. On lastAppliedConfigGen that silently strands the
+	// standby on the pre-reboot config; on lastRecvConfigGen it poisons the
+	// readiness comparison (PeerConfigGen > AppliedConfigGen) so the node can
+	// report ready while running the wrong policy. Neither self-clears: the
+	// marks are monotone-max, so only another accepted re-prime or ~1.8e12
+	// commits would move them back down.
+	//
+	// Two prior comments stated the contract wrongly and are corrected at their
+	// sites: recordAppliedConfigGen claimed it is "called ONLY from the
+	// single-consumer configApplyLoop", which ignores resetRecvGen's clear; and
+	// the received-mark raise claimed "the receiveLoop is single-threaded per
+	// connection", which is true per connection but there are TWO of them
+	// (conn0/conn1), so a raise on one fabric races a reset on the other.
+	//
+	// Every WRITER takes this mutex; READERS stay lock-free, because they are on
+	// hot paths (configEpochStale runs per synced session install) and a reader
+	// racing a writer only observes one side of a single monotone step, which is
+	// the same tolerance the marks already had.
+	//
+	// LOCK ORDER: configGenMu is a LEAF. No site takes another lock while
+	// holding it, and resetRecvGen takes it strictly after releasing recvGenMu.
+	configGenMu sync.Mutex
+	// configGenAdvanceBarrierFn is a test injection seam (nil in production,
+	// #5084). recordAppliedConfigGen / recordRecvConfigGen call it after reading
+	// the current mark and before storing the advanced value — the exact window
+	// in which a concurrent clear used to be lost. A lost update cannot be
+	// driven deterministically any other way: without a seam the test would have
+	// to race a sleep against the window and would pass on broken code whenever
+	// it lost that race. A test parks a reset in the window and asserts the
+	// clear survives.
+	configGenAdvanceBarrierFn func()
+
 	// Config-sync APPLY health tracking (#6387). These drive the time-based CF
 	// monitor-failure edge. Unlike the loop-local high-water logic they are NOT
 	// single-goroutine-owned: an independent grace-expiry timer

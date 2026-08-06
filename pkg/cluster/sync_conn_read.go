@@ -309,12 +309,14 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// gates manual-failover readiness against lastAppliedConfigGen. Record it
 		// even if the enqueue below drops the payload (queue full) so the standby
 		// stays flagged config-stale until the apply actually lands on a re-push.
-		// The receiveLoop is single-threaded per connection, so the load/store
-		// pair needs no CAS; guard on gen>current to keep it a monotonic max
-		// against a reordered older frame.
-		if gen > s.lastRecvConfigGen.Load() {
-			s.lastRecvConfigGen.Store(gen)
-		}
+		// It stays a monotonic max so a reordered older frame cannot pull it
+		// down. #5084: the load/compare/store moved into recordRecvConfigGen and
+		// is taken under configGenMu — the prior justification here ("the
+		// receiveLoop is single-threaded per connection, so the load/store pair
+		// needs no CAS") holds per connection but there are TWO receive loops,
+		// so a raise driven by one fabric raced resetRecvGen's clear driven by
+		// the other and could re-raise the mark that clear had just zeroed.
+		s.recordRecvConfigGen(gen)
 		// #3931: enqueue onto the single-consumer ordered apply queue instead
 		// of spawning a racing `go OnConfigReceived`. The receiveLoop is
 		// single-threaded per connection, so this preserves receive order;
