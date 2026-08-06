@@ -99,24 +99,31 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 	return append(warnings, ipipAnchorOnlyWarnings(cfg)...)
 }
 
-// ipipAnchorOnlyWarnings reports an interface-level ipip tunnel that creates a
-// kernel ANCHOR but has no emitted endpoint (#4785 re-gate follow-up).
+// ipipAnchorOnlyWarnings reports an ipip tunnel record that creates a kernel
+// ANCHOR but has no emitted endpoint (#4785 re-gate follow-up).
 //
 // The strict gate deliberately keys on emitted endpoints only, and that is the
 // right property for it — but "no emitted endpoint" is not the same as "nothing
-// exists on the box". collectAppliedTunnels appends the interface-level record
-// whenever `Source != ""` (or the mode is wireguard) and hands it to the
-// routing manager, which creates a mode-INDEPENDENT Tuntap anchor. So for
+// exists on the box". collectAppliedTunnels (pkg/daemon/daemon_run_routehelpers.go)
+// hands records to the routing manager, which creates a mode-INDEPENDENT Tuntap
+// anchor, and its two screens are NOT the emitter's:
 //
-//	set interfaces ip-0/0/0 tunnel source 10.0.0.1
-//	set interfaces ip-0/0/0 tunnel destination 10.0.0.2
-//	set interfaces ip-0/0/0 unit 1 tunnel mode gre
+//   - INTERFACE level: appended whenever `Source != ""` (or the mode is
+//     wireguard). So an interface record with a source but no destination —
+//     which the emitter suppresses — still gets an anchor.
+//   - UNIT level: appended for EVERY non-nil `unit.Tunnel`, with no
+//     completeness screen at all. A unit carrying only a destination emits
+//     nothing and still gets an anchor.
 //
-// emission publishes only `ip-0/0/0.1` gre — nothing dead reaches the dataplane
-// snapshot — while the box still gets an `ip-0-0-0` device with nothing routed
-// through it. An earlier round rejected that config, then a later one accepted
-// it "because nothing dead reaches the dataplane": both verdicts were argued
-// from a fact that did not cover the anchor.
+// Both shapes must be walked. The unit half is not optional and not new: the
+// #4788 advisory this gate replaced walked units, and dropping it meant
+//
+//	set interfaces ip-0/0/0 unit 5 tunnel destination 10.0.0.2
+//
+// committed with NEITHER the strict rejection (nothing is emitted, so the gate
+// is silent by design) NOR any standing alarm, while still creating a visible
+// `ip-0-0-0u5` device that carries nothing. That directly contradicts the
+// reason the advisory is registered at all.
 //
 // This is an ADVISORY, not a rejection, deliberately. The anchor carries no
 // traffic but breaks nothing, the operator may well have meant the unit-level
@@ -145,26 +152,85 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 	var out []string
 	for _, name := range names {
 		iface := cfg.Interfaces.Interfaces[name]
-		if iface == nil || iface.Tunnel == nil {
+		if iface == nil {
 			continue
 		}
-		if iface.Tunnel.Mode != "ipip" || emitted[iface.Tunnel] {
-			continue
+		if t := iface.Tunnel; t != nil && t.Mode == "ipip" && !emitted[t] &&
+			// The interface-level anchor screen in collectAppliedTunnels. A
+			// record that fails it creates nothing, so there is nothing to warn
+			// about.
+			t.Source != "" {
+			out = append(out, ipipAnchorOnlyText(
+				fmt.Sprintf("interfaces %q", name), t))
 		}
-		// The anchor-creation screen in collectAppliedTunnels. A record that
-		// fails it creates nothing, so there is nothing to warn about.
-		if iface.Tunnel.Source == "" {
-			continue
+
+		unitNums := make([]int, 0, len(iface.Units))
+		for u := range iface.Units {
+			unitNums = append(unitNums, u)
 		}
-		out = append(out, fmt.Sprintf(
-			"interfaces %q tunnel mode ipip: no tunnel endpoint is emitted for the "+
-				"interface-level stanza (every unit overrides it), but it still creates a "+
-				"kernel anchor device %q with nothing routed through it — an interface an "+
-				"operator can see that carries no traffic (#4785). Remove the "+
-				"interface-level `tunnel` stanza if the per-unit tunnels are the intent.",
-			name, iface.Tunnel.Name))
+		sort.Ints(unitNums)
+		for _, u := range unitNums {
+			unit := iface.Units[u]
+			if unit == nil || unit.Tunnel == nil {
+				continue
+			}
+			// No source screen here, on purpose: collectAppliedTunnels has none
+			// for units, so ANY non-nil unit tunnel becomes an anchor.
+			if unit.Tunnel.Mode != "ipip" || emitted[unit.Tunnel] {
+				continue
+			}
+			out = append(out, ipipAnchorOnlyText(
+				fmt.Sprintf("interfaces %q unit %d", name, u), unit.Tunnel))
+		}
 	}
 	return out
+}
+
+// ipipAnchorOnlyText renders one anchor-only advisory, naming the ACTUAL reason
+// the endpoint was not emitted.
+//
+// The earlier single-cause wording always said "every unit overrides it"
+// (#4785 fold F3). For a stanza the emitter suppressed because its endpoint is
+// incomplete — which is the ONLY way a unit record reaches here, and the way an
+// interface record with no units reaches it — that diagnosis is false, and the
+// per-unit remediation it implies is the wrong advice. Distinguish the two.
+func ipipAnchorOnlyText(where string, t *TunnelConfig) string {
+	cause := "no tunnel endpoint is emitted for the interface-level stanza " +
+		"(every unit overrides it)"
+	fix := "Remove the interface-level `tunnel` stanza if the per-unit tunnels " +
+		"are the intent."
+	if missing := ipipMissingEndpointHalves(t); missing != "" {
+		cause = fmt.Sprintf("%s, so no tunnel endpoint is emitted", missing)
+		fix = "Configure both endpoints (and use `mode gre` or `mode wireguard` " +
+			"for a tunnel that carries traffic), or remove the `tunnel` stanza."
+	}
+	return fmt.Sprintf(
+		"%s tunnel mode ipip: %s, but it still creates a kernel anchor device %q "+
+			"with nothing routed through it — an interface an operator can see that "+
+			"carries no traffic (#4785). %s",
+		where, cause, t.Name, fix)
+}
+
+// ipipMissingEndpointHalves names which halves of a non-WireGuard tunnel
+// endpoint are absent, or "" when both are present. It mirrors the emitter's
+// own suppression screen (tunnelemit.go: a non-WireGuard tunnel without BOTH
+// Source and Destination is never emitted), so the reason reported is the
+// reason emission actually failed.
+//
+// "" is reachable for a record that is complete yet still unemitted — a unit
+// tunnel under an interface-level WireGuard stanza, where the emitter publishes
+// one endpoint keyed by the lowest unit and never visits the per-unit records.
+// The caller falls back to a neutral cause there rather than inventing one.
+func ipipMissingEndpointHalves(t *TunnelConfig) string {
+	switch {
+	case t.Source == "" && t.Destination == "":
+		return "neither `tunnel source` nor `tunnel destination` is configured"
+	case t.Source == "":
+		return "no `tunnel source` is configured"
+	case t.Destination == "":
+		return "no `tunnel destination` is configured"
+	}
+	return ""
 }
 
 // validateIpipTunnelUnimplementedStrict hard-rejects a config that would emit a

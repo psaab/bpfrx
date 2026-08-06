@@ -412,18 +412,20 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := crossCheckRAIntervals(compiled); err != nil {
 		return nil, err
 	}
-	// #5876: a chassis-cluster commit must prove BOTH node-effective source-NAT
-	// views are representable before promotion, not only the submitting node's.
+	// #5876 + #4785: a chassis-cluster commit must prove BOTH node-effective
+	// views are installable before promotion, not only the submitting node's.
 	// This gate compiles for the local node alone (CompileConfigForNode above),
 	// so a ${node} apply-group substitution / per-node rewrite that selects a
-	// source-NAT pool or reference valid on the origin but invalid on the peer
-	// passes green — then the standby lenient-loads the synced snapshot and
-	// silently fails its SNAT closed. Re-run the strict SOURCE-NAT validators
-	// against the peer's effective compile (the same CompileConfigForNodeLenient
-	// transform the standby applies) so a peer-only pool/reference error is
-	// rejected here, at the one strict gate that ever sees this config.
+	// source-NAT pool valid on the origin but invalid on the peer — or a
+	// peer-only `ip-*` interface whose inferred `mode ipip` the dataplane drops
+	// in both directions — passes green. What synchronises is the RAW group
+	// tree, and the standby ingests it leniently (Store.SyncApply), so the
+	// defect installs on the peer with no strict check anywhere. Re-run the
+	// registered strict subjects against the peer's effective compile (the same
+	// CompileConfigForNodeLenient transform the standby applies) so a peer-only
+	// error is rejected here, at the one strict gate that ever sees this config.
 	// Standalone (nodeID < 0) has no peer and is a no-op.
-	if err := config.ValidatePeerEffectiveSourceNATStrict(tree, nodeID); err != nil {
+	if err := config.ValidatePeerEffectiveStrict(tree, nodeID); err != nil {
 		return nil, err
 	}
 	return compiled, nil

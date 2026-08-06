@@ -16,7 +16,7 @@ import (
 // where the strict SNAT gate is downgraded to a warning and the dataplane fails
 // the translation closed. A green commit stranded the standby's SNAT.
 //
-// The fix (ValidatePeerEffectiveSourceNATStrict, wired into
+// The fix (ValidatePeerEffectiveStrict, wired into
 // configstore.compileTreeStrict) re-runs the strict SOURCE-NAT validators
 // against the PEER node's effective compile — the same
 // CompileConfigForNodeLenient transform the standby applies — so a peer-only
@@ -50,10 +50,10 @@ func peerDivergentSNATPortRange() []string {
 // TestPeerOnlySNATPortRangeRejectedAtOriginCommit_5876 is the core RED-on-revert
 // case. node0's local compile is CLEAN (green commit today), yet the peer node1
 // effective view carries a reversed source-pool port range that would strand the
-// standby. ValidatePeerEffectiveSourceNATStrict(tree, 0) must REJECT, naming the
+// standby. ValidatePeerEffectiveStrict(tree, 0) must REJECT, naming the
 // peer node and the offending pool.
 //
-// FAIL-ON-REVERT: revert ValidatePeerEffectiveSourceNATStrict to `return nil`
+// FAIL-ON-REVERT: revert ValidatePeerEffectiveStrict to `return nil`
 // (or drop its call from compileTreeStrict) and node0 compiles clean — this
 // assertion goes RED because the peer-only error is never surfaced.
 func TestPeerOnlySNATPortRangeRejectedAtOriginCommit_5876(t *testing.T) {
@@ -67,7 +67,7 @@ func TestPeerOnlySNATPortRangeRejectedAtOriginCommit_5876(t *testing.T) {
 
 	// The peer-effective gate run at a node0 commit must reject the node1-only
 	// reversed range.
-	err := ValidatePeerEffectiveSourceNATStrict(tree, 0)
+	err := ValidatePeerEffectiveStrict(tree, 0)
 	if err == nil {
 		t.Fatal("node0 commit ACCEPTED a peer-only source-NAT reversed port range (node1 view) — the #5876 divergent-commit fail-open")
 	}
@@ -82,7 +82,7 @@ func TestPeerOnlySNATPortRangeRejectedAtOriginCommit_5876(t *testing.T) {
 // issue enumerates: a per-node pool ADDRESS error and a top-level rule that
 // references a pool only the peer's `groups` block defines (a dangling reference
 // in the peer view). In every case node0's own view is clean and the peer
-// (node1) view is unrepresentable, so ValidatePeerEffectiveSourceNATStrict(tree,
+// (node1) view is unrepresentable, so ValidatePeerEffectiveStrict(tree,
 // 0) rejects while the node0 local compile succeeds.
 func TestPeerOnlySNATDivergenceVectors_5876(t *testing.T) {
 	cases := []struct {
@@ -150,7 +150,7 @@ func TestPeerOnlySNATDivergenceVectors_5876(t *testing.T) {
 			if _, err := CompileConfigForNode(tree, 0); err != nil {
 				t.Fatalf("node0 local compile must be clean: %v", err)
 			}
-			err := ValidatePeerEffectiveSourceNATStrict(tree, 0)
+			err := ValidatePeerEffectiveStrict(tree, 0)
 			if err == nil {
 				t.Fatalf("node0 commit ACCEPTED a peer-only source-NAT error (%s)", tc.name)
 			}
@@ -176,7 +176,7 @@ func TestPeerEffectiveSNATSymmetry_5876(t *testing.T) {
 	}
 	// The peer gate run at a node1 commit checks node0's view (clean) — no
 	// false-reject.
-	if err := ValidatePeerEffectiveSourceNATStrict(tree, 1); err != nil {
+	if err := ValidatePeerEffectiveStrict(tree, 1); err != nil {
 		t.Fatalf("node1 commit peer gate false-rejected node0's clean source-NAT view: %v", err)
 	}
 }
@@ -201,7 +201,7 @@ func TestPeerEffectiveSNATBothViewsValidClean_5876(t *testing.T) {
 		if _, err := CompileConfigForNode(tree, nodeID); err != nil {
 			t.Fatalf("node%d local compile of a both-valid config failed: %v", nodeID, err)
 		}
-		if err := ValidatePeerEffectiveSourceNATStrict(tree, nodeID); err != nil {
+		if err := ValidatePeerEffectiveStrict(tree, nodeID); err != nil {
 			t.Fatalf("node%d peer gate false-rejected a config valid on both nodes: %v", nodeID, err)
 		}
 	}
@@ -215,11 +215,11 @@ func TestPeerEffectiveSNATStandaloneNoOp_5876(t *testing.T) {
 		"set security nat source pool P address 203.0.113.5/32",
 		"set security nat source pool P port range 5000 to 100", // reversed, but standalone → no peer
 	})
-	if err := ValidatePeerEffectiveSourceNATStrict(tree, -1); err != nil {
+	if err := ValidatePeerEffectiveStrict(tree, -1); err != nil {
 		t.Fatalf("standalone (nodeID -1) must be a no-op, got: %v", err)
 	}
 	// An out-of-cluster node id with no defined 2-node peer is also a no-op.
-	if err := ValidatePeerEffectiveSourceNATStrict(tree, 5); err != nil {
+	if err := ValidatePeerEffectiveStrict(tree, 5); err != nil {
 		t.Fatalf("nodeID 5 has no 2-node peer, must be a no-op, got: %v", err)
 	}
 }

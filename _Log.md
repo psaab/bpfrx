@@ -68380,3 +68380,61 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #6861 fold r1 (gate F1 BLOCKING / F2 REGRESSION / F3)
+
+- **Timestamp**: 2026-08-06 05:10 PDT
+- **Action**: F1 — the hard IPIP gate was bypassable on the peer. The strict
+  commit gate compiles only the submitting node (CompileConfigForNode), the RAW
+  group tree is what config-sync sends, and the standby ingests it leniently, so
+  a `${node}` config whose IPIP endpoint resolves only in `groups node1`
+  committed GREEN on node0 and installed the dead tunnel on node1. Generalised
+  the #5876 peer-effective mechanism into a SUBJECT REGISTRY that compiles the
+  peer view ONCE and runs every registered strict concern against it, and
+  registered the IPIP gate as the second subject. F2 — restored unit-level
+  coverage in ipipAnchorOnlyWarnings: collectAppliedTunnels applies every
+  non-nil unit tunnel with NO completeness screen, so a unit-level stanza still
+  builds a kernel anchor; the deleted #4788 validator warned on it and the
+  replacement did not, leaving that shape with neither rejection nor alarm.
+  F3 — the advisory's cause is now derived, so an incomplete endpoint is not
+  diagnosed as "every unit overrides it" when there are no units.
+- **File(s)**: pkg/config/compiler_peer_effective.go (new),
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_peer_effective_4785_test.go (new),
+  pkg/config/ipip_anchor_only_4785_test.go (new),
+  pkg/configstore/store.go,
+  pkg/configstore/peer_effective_ipip_4785_test.go (new),
+  pkg/config/compiler_peer_effective_snat_5876_test.go,
+  pkg/config/compiler_nat_pool_overlap_5144_test.go,
+  pkg/config/compiler_zone_scoped_snat_pool_5875_test.go,
+  pkg/configstore/peer_effective_snat_5876_test.go, docs/config-schema.md,
+  docs/feature-gaps.md, docs/feature-coverage.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./... rc=0; go test ./pkg/config
+  ./pkg/configstore ./pkg/daemon -count=1 rc=0; `-run 4785` across pkg/config +
+  pkg/configstore = 40 `=== RUN` / 40 PASS, up from 25 at the PR head (measured
+  by moving the three new test files aside and re-counting); gofmt clean on
+  every touched file.
+- **NOTE — generalised rather than bolted on, deliberately.** A second
+  standalone peer entry point would run CompileConfigForNodeLenient — a FULL
+  compile — twice on every cluster commit, and the next concern three times.
+  ValidatePeerEffectiveSourceNATStrict is therefore renamed to
+  ValidatePeerEffectiveStrict; the 11 test call sites are a pure rename with no
+  assertion or fixture changes, and the source-NAT wrapper wording is
+  byte-identical so #5876's message assertions are untouched.
+- **NOTE — mutation matrix, 9 cells, every one an ASSERTION failure with
+  `go vet ./pkg/config ./pkg/configstore` rc=0.** Tunnel subject dropped from
+  the registry; store call dropped from compileTreeStrict; unit walk dropped;
+  cause split reverted to the single hard-coded string; unit walk stops keying
+  on mode; unit walk stops skipping EMITTED endpoints; peer id hard-coded to 1;
+  peer-node framing dropped from the wrapper; peerNodeID accepting ids with no
+  2-node peer. The over-reach guards — peer-only GRE still commits (both at the
+  validator and at compileTreeStrict), standalone is a no-op, the genuine
+  every-unit-overrides shape keeps its original diagnosis and remediation, a GRE
+  unit record raises nothing, an EMITTED unit endpoint is not double-reported —
+  stayed GREEN under the F1/F2/F3 reverts. The PR's own pre-existing negative
+  control (TestIpipAnchorAlarmDoesNotOverreach_4785) also fired under the
+  ignore-mode mutation. Each cell was grepped back out before its result was
+  believed and restored with a filecmp check against a pristine copy. An early
+  attempt at the framing mutation was a BUILD break (unused "fmt"); it was
+  rewritten to keep the import live so the cell is a real assertion.

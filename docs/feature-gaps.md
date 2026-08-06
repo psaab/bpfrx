@@ -468,6 +468,22 @@ operator-visible error instead of a silent blackhole. Note an `ip-*` interface
 defaults to `mode ipip` even without an explicit `mode` statement. Half 2 of
 #4785 implements the decap stage; use `mode gre` or `mode wireguard` until then.
 
+On a chassis cluster the rejection also covers the PEER's effective view. The
+strict commit gate compiles only the submitting node, the RAW group tree is what
+config-sync sends, and the standby ingests it leniently — so a `mode ipip`
+endpoint that only `groups node1` resolves would commit green on node0 and
+install on node1 with no strict check anywhere. `ValidatePeerEffectiveStrict`
+(`pkg/config/compiler_peer_effective.go`) re-runs the gate against the peer's
+effective compile at the ORIGIN's commit. `SyncApply` stays lenient, so a config
+already on disk still boots.
+
+A stanza that emits NO endpoint is not rejected — there is nothing dead in the
+dataplane snapshot — but it can still create a kernel ANCHOR device, because
+`collectAppliedTunnels` screens the interface level only on `tunnel source` and
+screens units on nothing at all. Those get a standing advisory
+(`ipipAnchorOnlyWarnings`) naming the device and the actual reason no endpoint
+was emitted, covering interface-level AND unit-level records.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | **Done** -- OSPF (v2) and OSPFv3 (`protocols ospf3 area ... interface ... bfd-liveness-detection`, renders `ipv6 ospf6 bfd`, #2474) BFD with interval/multiplier via FRR profiles, IS-IS BFD support with optional interval/multiplier, BGP BFD multiplier configurable. |
