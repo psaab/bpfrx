@@ -1,3 +1,33 @@
+## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
+
+- **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
+- **Action**: Round 4 deleted the CLI canary's false "returns no response value
+  that bypasses it" clause and DISCLOSED the residual rather than closing it.
+  Round 5 closes it. The gate had measured that
+  `sanitizePeerSessionPolicyNames(nil)` keeps the call present, bypasses
+  sanitization entirely, and leaves every package green with the round-3 MAJOR
+  fully restored — a guard whose admitted cell restores the whole defect is not
+  a narrow guard, it is a guard that does not work, and disclosure is no
+  substitute when closing costs three lines on a node already in hand.
+  The check keys the argument to the identifiers `fetchPeerSessions` actually
+  RETURNS (skipping the `nil` early-error paths) rather than to a hardcoded
+  `resp`, so renaming the local does not silently disarm it.
+  Two residuals are kept and stated, because closing them is not cheap: it does
+  not prove the call precedes every return (that needs control-flow analysis),
+  and it cannot see a gutted sanitizer body (covered from the other side by the
+  behavioural tests).
+- **File(s)**: pkg/cli/peer_policy_name_6851_test.go
+- **Validation**: Parent mutation proof over the WHOLE `pkg/cli` package, not a
+  filtered subset — the failure set must be the new assertion alone or the
+  mutation does not distinguish it:
+  - baseline `go test ./pkg/cli/ -count=1` -> rc=0, `ok`
+  - `sanitizePeerSessionPolicyNames(nil)` -> rc=1, failure set exactly
+    `[TestCLIPeerFetchCallsSanitizer_6851]`
+  - sanitize a DIFFERENT local while still `return resp` (the realistic
+    refactor slip, not "someone types nil") -> rc=1, same single failure
+  - delete the call -> rc=1, same single failure
+  Worktree restored byte-clean after each cell.
+
 ## 2026-08-05 — #6851 round 4: delete a comment's false coverage claim, and replace an assertion that could not fail
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)
@@ -216,6 +246,294 @@
   `pkg/grpcapi/server_sessions.go`,
   `pkg/grpcapi/server_sessions_policy_id_zero_4626_test.go` (new),
   `docs/junos-cli-reference.md`, `_Log.md`
+## 2026-08-05 — #6814 fold round 6: two bare leaf sites my round-5 grep could not find
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, on top of a47afa165)
+- **Action**: An AGY leg running the full swapped-label matrix at true head found
+  TWO more bare leaf assertions — in the same file this PR authored, beyond the
+  three round 5 swept (all of them new in this PR; see the provenance
+  correction in the round-5 entry).
+    - `compiler_application_term_icmp_dup_6766_test.go:277`
+      (`ReferencedDeny_StrictRejects_LenientNarrows`) and `:398`
+      (`Lenient_DowngradesToWarning`). Both now match the QUOTED form.
+    - **Why round 5 missed them, which is the reusable part.** My sweep grepped
+      for `strings.Contains(err.Error(), c.leaf)` — the table-driven form. These
+      two hardcode the literal `"icmp-type"` instead of taking it from a case
+      table, so a grep shaped around the variable form STRUCTURALLY cannot find
+      them. The mutation matrix finds every shape because it does not care how
+      the assertion is spelled. Grep finds what you already know the shape of;
+      the mutation finds what you do not.
+    - **The file header was consequently false.** It claimed the quoted form is
+      used "throughout this file" and that it "reds all three rejection tests".
+      There are FIVE leaf-identity sites: four rejection assertions (the three
+      table-driven ones plus ReferencedDeny, which hardcodes its leaf) and one
+      tolerant-path warning assertion. Header rewritten to state the count —
+      the count is what makes the claim checkable — and to record why the two
+      literal-form sites were quoted a round later than the table-driven ones.
+      Also records that the enumeration beside the identifying occurrence
+      renders UNQUOTED (`%q` of `DuplicateTermLeaves[0]` in
+      `compiler_validate_strict_application.go`), which is what makes quoting
+      discriminate at all.
+- **Validation**: Same swapped-label mutation, preflight build+vet clean, vet
+  clean under it. Full matrix: ALL FIVE leaf-identity sites RED — the six
+  table-driven rejection subtests, `ReferencedDeny`, and
+  `Lenient_DowngradesToWarning`. The four positive controls stay GREEN, as do
+  `Idempotent_Accepted` and `LenientKeepsLastCode` (no conflict authored, so no
+  label to swap, and the latter asserts a VALUE not a leaf name) — which is what
+  shows the mutation is scoped to leaf identity rather than breaking the
+  package. Negative control: `:277` and `:398` reverted to the bare form with
+  the mutation still applied both PASS (rc=0). Restored both files by
+  pristine-snapshot write-back plus `touch`; `compiler_applications.go`
+  confirmed byte-identical to HEAD afterwards. Gates from real exit codes on
+  this workstation: `GATE1_RC=0`, `FULL_RC=0`.
+- **Note**: the stale-SHA Codex verdict relayed for this PR was discarded, not
+  folded — every one of its five findings was already closed at
+  `a47afa165`, proven by grepping each flagged string across `1314dcb72` /
+  `274e24f23` / `a47afa165`. These two AGY findings are from the true head and
+  are unrelated to those five.
+- **File(s)**: `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `_Log.md`
+
+## 2026-08-05 — #6814 fold round 5: the same weak leaf assertion in three more of this file's tests
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, separate commit on top of 274e24f23)
+- **Action**: Round 4 fixed the bare-substring leaf assertion in the two tests it
+  added. The identical defect was sitting in three more tests in the SAME file
+  — `FlatSet_Rejected`, `Hierarchical_Rejected`, `ApplyGroups_Rejected` — all
+  using `strings.Contains(err.Error(), c.leaf)`. Flagged rather than silently
+  widened; the lead scoped it in as a separate commit, on the reasoning that
+  leaving it fixes what bit us rather than the class, and leaves a reader unable
+  to tell which of the two forms in one file is deliberate.
+
+  **Provenance correction (#6814).** This entry, its heading, the round-6
+  back-reference below, and the commit message of `a47afa165` all described
+  these three as "pre-existing #5797 rejection tests". That is FALSE.
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go` does not exist on
+  `origin/master` — `git diff --name-status origin/master...HEAD` reports it as
+  `A` (added), introduced by this PR's own first commit `b21c7bd19`. All three
+  tests are NEW in this PR. The distinction is not cosmetic: "swept a
+  pre-existing defect class inherited from another issue" and "fixed every site
+  in its own new file" are different claims about what the PR did, and only the
+  second is true. The `a47afa165` commit message is immutable and still carries
+  the wrong framing; this note and the PR body are the correction of record.
+  All three now match the QUOTED occurrence, with one shared note explaining
+  why: the rejection message ends with a static enumeration of every trackable
+  leaf, so the bare form is satisfied by boilerplate regardless of which leaf
+  conflicted, and only the identifying occurrence is quoted.
+- **Validation**: Same swapped-label mutation as round 4 — the two recorded leaf
+  labels exchanged in `parseApplicationTerms`. Build and vet clean under it.
+  ALL SIX rejection subtests (three tests x icmp-type/icmp-code) go RED; the
+  four positive controls correctly stay GREEN, since they author no conflict and
+  so have no label to swap — which also confirms the mutation is scoped to the
+  rejection path and is not simply breaking the package. Negative control: the
+  three assertions reverted to the BARE form with the mutation still applied
+  PASS (rc=0), so quoting is what added the discrimination in these three too,
+  not a stricter-looking check. Restored both files by pristine-snapshot
+  write-back plus `touch`; production `compiler_applications.go` confirmed
+  byte-identical to HEAD afterwards. Gates from real exit codes on this
+  workstation: `GATE1_RC=0`, `FULL_RC=0`.
+- **File(s)**: `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `_Log.md`
+
+## 2026-08-05 — #6814 fold round 4: correct four claims, quote the leaf assertion
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, gate at 1314dcb72)
+- **Action**: Text round. The gate found no runtime findings; production code is
+  untouched this round (`compiler_applications.go` and `policymatch.go` are
+  byte-identical to the previous commit).
+    - **A wrong attribution in the fall-through helper.** The comment said the
+      explicit `Matched=false` check rejects `Matched=true, DefaultUsed=false,
+      Action=permit`. It does not — that input fails at the `DefaultUsed` check
+      above and never reaches the `Matched` one. The shape that leg
+      independently binds is `Matched=true, DefaultUsed=true, Action=permit`, a
+      Result claiming BOTH a concrete match and a default fall-through, which is
+      exactly what the round-3 mutation set. Corrected in the test comment and
+      in the round-3 log entry. Worth stating precisely rather than softening:
+      the two legs look redundant, and a reader trimming the "redundant" one
+      would delete the only assertion binding that shape.
+    - **"Names the leaf" was satisfied by boilerplate.** The rejection text ends
+      with a STATIC enumeration of every trackable leaf — `(destination-port /
+      source-port / inactivity-timeout / timeout / alg / icmp-type /
+      icmp-code)` — so a bare `strings.Contains(err, leaf)` is true no matter
+      which leaf actually conflicted. Rather than weaken the claim, made it
+      true: both the strict and tolerant assertions now match the QUOTED form
+      (`conflicting duplicate "icmp-type" inside`), which is the only
+      identifying occurrence. This is the one place this round goes beyond text,
+      and it is one predicate per assertion.
+    - **Two pre-existing false claims in the plan doc**, cheap to fix in place:
+      it said the compiled-struct test "demonstrably enforces" the last type
+      although it drives no matcher (now points at the verdict-level test that
+      does), and it described an `icmp-code 0 icmp-code 0` idempotent control
+      when the fixture is `icmp-type 3 icmp-code 1 icmp-code 1` (verified by
+      reading the fixture before correcting the claim).
+    - Named the environment on the round-3 `FULL_RC=0` line. A sandboxed runner
+      that blocks sockets/netlink exits non-zero on unrelated packages; that is
+      a runner limitation, not a contradiction of a run scored on a box that can
+      open sockets.
+- **Validation**: Swapped-label mutation — the two recorded leaf labels
+  exchanged, so an `icmp-type` conflict records `icmp-code` and vice versa.
+  Build and vet clean under it. The QUOTED assertion goes RED on both tests,
+  naming the wrong-leaf message it received. A throwaway control running the
+  BARE (pre-fix) assertion verbatim PASSED the same mutation (rc=0), so the
+  quoting is what added the discrimination rather than the check merely looking
+  stricter. Restored by pristine-snapshot write-back plus `touch`; GREEN
+  re-confirmed. Gates from real exit codes on this workstation (sockets and
+  netlink permitted): `GATE1_RC=0`, `FULL_RC=0`.
+- **File(s)**: `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`,
+  `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+
+## 2026-08-05 — #6814 fold round 3: assert the fall-through evidence, bind the recording
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, gate at 48bb63f54)
+- **Action**: Gate returned MERGE-NEEDS-MINOR on one family of defects — the
+  round-2 tests leaned on ZERO VALUES where the non-default evidence is what
+  proves the behaviour. All four items folded; production code is still
+  comment-only.
+    - **Fall-through was never actually asserted.** `config.PolicyPermit` is the
+      zero value of `PolicyAction` (`types_security.go:582`) and `Matched=false`
+      is a zero value too, so the discarded-value subtests were satisfied by a
+      `Result` that was never populated — a path producing NOTHING looked
+      identical to a genuine fall-through. New `assertFellThroughToDefaultPermit`
+      helper asserts `DefaultUsed=true` FIRST (the only non-default evidence that
+      the default branch ran), then `Matched=false` explicitly. The shape that
+      second leg independently binds is `Matched=true, DefaultUsed=true,
+      Action=permit` — a Result claiming BOTH a concrete match and a default
+      fall-through. It does NOT carry `Matched=true, DefaultUsed=false`: that
+      input fails at the `DefaultUsed` check and never reaches the `Matched`
+      one, which is why the leg needed its own mutation to prove. The DENY legs
+      gained a matching `DefaultUsed=false` assertion so they cannot be
+      satisfied by a default either.
+    - **The duplicate RECORDING was not bound.** Verified firsthand before
+      fixing: with the #6766 tracking removed outright (strict stops rejecting)
+      both policymatch tests still PASSED, because the compiled values and every
+      verdict are identical whether or not the conflict was recorded. The shared
+      `inlineICMPDupCfg` fixture now asserts BOTH halves of the recording — that
+      strict `CompileConfig` rejects and that the tolerant path emits the
+      warning (the only signal an operator gets on the path that keeps
+      forwarding). Both match the leaf name in its QUOTED form: the message
+      ends with a static enumeration of every trackable leaf, so a bare
+      substring check is satisfied by that boilerplate regardless of which leaf
+      conflicted. Proven by swapping the two recorded labels — the bare shape
+      accepts the swapped message, the quoted shape rejects it.
+    - **Scalar-zero override control (gate suggestion, taken).** The
+      apply-groups override control now commits `icmp-type 0` — the scalar zero
+      of the compiled `uint8`. `assertTermICMP` rejects a nil `ICMPType`
+      outright, so "committed the local 0" and "compiled nothing" cannot be
+      confused, and the control additionally binds a compiler that treats a
+      committed 0 as unset. Cheaper than reshaping the fixture and it keeps the
+      empirically-verified semantics (local term fully replaces the group's).
+    - Left alone per the gate: the positive controls that expect
+      `ICMPCode=nil`. Their companion non-nil type assertions and the
+      code-bearing controls keep the suite non-vacuous.
+- **Validation**: Four mutations, preflight build+vet clean, each vet-clean
+  under the mutation, each restored by writing back a pristine snapshot and
+  `touch`ing (never `git checkout --`), GREEN re-confirmed after each.
+  (1) Recording removed: both policymatch tests now RED at the strict-reject
+  assertion — they PASSED under this same mutation before the fold.
+  (2) Every default-branch `Result` leaves `DefaultUsed` unset: new assertion
+  RED with `default_used=false matched=false action=0`, and a throwaway
+  negative control running the PRE-fold assertion shape verbatim PASSED the
+  same mutation — the new evidence is what catches it.
+  (3) Default path also claims `Matched=true`: the `Matched` leg fires on its
+  own (it sits behind the `DefaultUsed` check, so it needed its own mutation).
+  (4) Committed `icmp-type 0` dropped as if unset: the override control RED
+  with `ovr-t1 ICMPType = <nil>, want 0` while its sibling subtests stay green.
+  Two mutation attempts were discarded as invalid rather than reported: one
+  broke the build (`declared and not used`) and one silently applied nothing
+  (a 2-occurrence anchor tripped the count assert), whose "PASS" was
+  meaningless. Gates scored from real exit codes on this workstation (Linux,
+  sockets and netlink permitted): `GATE1_RC=0`, `FULL_RC=0` across 59 packages.
+  A sandboxed runner that blocks sockets/netlink will exit non-zero on
+  unrelated packages; that is a runner limitation, not a contradiction.
+- **File(s)**: `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`,
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go`, `_Log.md`
+
+## 2026-08-05 — #6814 fold round 2: bind the icmp-code last-writer, add positive controls
+
+- **Timestamp**: 2026-08-05 (fold/6814-r2, PR #6814 head b21c7bd19)
+- **Action**: Folded the three review findings on the #6766 inline-term ICMP
+  duplicate gate. The production gate itself was confirmed sound and is
+  unchanged; every finding was about what the tests actually bind.
+    - **B1 — the `icmp-code` last-writer was unbound.** Conflicting `icmp-code`
+      was exercised only on strict REJECTION paths, which assert that a
+      conflict is refused but never which value survives when it is TOLERATED.
+      On the tolerant path (boot load / HA SyncApply) the reject is downgraded
+      to a warning and the surviving value is the one enforced, so a production
+      edit retaining the FIRST conflicting code instead of the last changed
+      which ICMP traffic a referenced deny covers while passing the whole file.
+      Verified by mutation: keep-FIRST on `icmp-code` left ALL six pre-existing
+      tests green. Now pinned twice — at the compiled struct
+      (`TestApplicationTermICMPDup_LenientKeepsLastCode`) and at the verdict.
+    - **B2 — a comment claimed more than its test.** The
+      `ReferencedDeny_StrictRejects_LenientNarrows` comment said the term
+      "demonstrably enforces ONLY the last type", but the test asserts on
+      `app.ICMPType` and drives no matcher. Fixed on BOTH sides: the comment now
+      states its real scope (compiled struct, no matcher) and points at the new
+      verdict-level test, and that new test drives `policymatch.Match` for real
+      — asserting the discarded type/code falls through to `default-policy
+      permit-all` while the surviving one hits the deny.
+    - **B3 — no rejection test had a positive control.** All three could not
+      distinguish "rejects the conflicting repeat" from "rejects this shape".
+      Added shape-matched valid cases to each. The apply-groups one gained the
+      CROSS-SOURCE case the originals never reached: a group value restated
+      locally is an apply-groups OVERRIDE, not a duplicate — it must commit,
+      the local value wins, and the group's `icmp-code` must not leak into
+      the merged term (empirically confirmed: the local `term` REPLACES the
+      group's outright rather than merging token streams).
+    - **Non-blocking comment fix.** `compiler_applications.go` claimed the
+      trackers keep each leaf's "first assigned value"; every arm refreshes its
+      comparison value after recording, so the check is "differs from its
+      immediate predecessor" — one record per TRANSITION, so `8, 3, 8` records
+      two where compare-against-first records one. Nothing observable depends on
+      it: acceptance is identical (any multi-value sequence contains a
+      transition) and the gate reports only `DuplicateTermLeaves[0]`, so the
+      extra records never reach the error text. Verified by running `8, 3, 8`
+      through the real gate — the error names `icmp-type` once. The comment now
+      says the slice is a non-empty/empty signal with one representative leaf
+      name, not a conflict tally.
+- **Validation**: Three mutations, each with build+vet clean under the mutation
+  and a preflight-clean build+vet before any of them.
+  (1) keep-FIRST on `icmp-code`: all six pre-existing tests PASS — the B1 gap
+  reproduced — while the two new guards go RED, the verdict one showing the real
+  inversion (code 2 `matched=false default_used=true`, code 1 DENIED).
+  (2) Over-broad gate (record a duplicate on EVERY `icmp-type`, including the
+  first): all four new positive controls FAIL while every rejection subtest still
+  PASSES — the exact blindness B3 described.
+  (3) Matcher ignores ICMP constraints: the new verdict guard FIRES while the
+  old struct-level test still PASSES — B2 proven two-sided.
+  `go test ./pkg/config/... ./pkg/policymatch/...` and the full `go test ./...`
+  both clean. No cluster tooling run.
+- **File(s)**: `pkg/config/compiler_applications.go`,
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `pkg/config/README.md`,
+  `pkg/policymatch/app_inline_term_icmp_dup_6766_test.go`, `_Log.md`
+
+## 2026-08-03 — #6766: gate conflicting inline-term icmp-type / icmp-code repeats
+
+- **Timestamp**: 2026-08-03 (fix/6766-inline-icmp-dup, opus-review-001 R23)
+- **Action**: The #3366 inline-term duplicate-scalar framework tracked
+  destination-port / source-port / timeout / alg but declared no set flags for
+  the ICMP leaves, so a conflicting `icmp-type` / `icmp-code` repeat inside one
+  inline application `term` overwrote the pointer with no record — the term is
+  opaque to SchemaValidate, and the strict structure gate only sees
+  `Application.DuplicateTermLeaves`, so strict commit accepted the config and a
+  referenced DENY enforced only the LAST type/code (silent narrowing of the
+  deny match). Added `icmpTypeSet` / `icmpCodeSet` first-value tracking in
+  `parseApplicationTerms` mirroring the ports (and the #5574 direct-body ICMP
+  tracking): a conflicting repeat is recorded on `DuplicateTermLeaves`, an
+  idempotent same-value repeat stays accepted, malformed tokens keep the
+  existing `UnknownICMP` path. Strict error text, the
+  `validateApplicationStructureStrict` doc comment, the `DuplicateTermLeaves`
+  field doc, and the pkg/config README #3366 section now enumerate the ICMP
+  leaves. New fail-on-revert tests cover packed flat-set, hierarchical,
+  apply-groups, a referenced deny policy (strict rejects; lenient compiles with
+  only the last type — characterizing the narrowing), same-value idempotent
+  acceptance, and the lenient no-brick downgrade, for both leaves.
+- **File(s)**: `pkg/config/compiler_applications.go`,
+  `pkg/config/compiler_validate_strict_application.go`,
+  `pkg/config/types_security.go`,
+  `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
+  `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
