@@ -2155,7 +2155,12 @@ path (`lenientClusterAuthKey`, #1960 no-brick) — that downgrade **is** the
 IN-PLACE upgrade path: a cluster that was unkeyed before this gate existed
 keeps its config DB, loads it through `CompileConfigLenient` at daemon start,
 boots, keeps forwarding, and is keyed on the operator's next commit;
-dual-accept then lets the key roll out one node at a time. Because the
+the heartbeat and fabric gRPC dual-accept then lets the key roll out one node
+at a time without dropping the cluster — but **not** session sync, whose
+dual-accept #5078 removed: a keyed node rejects an unkeyed peer, so session sync
+stays down until both nodes are keyed and both have restarted (see
+`pkg/cluster/README.md` -> "Rolling it onto a live unkeyed cluster", which marks
+the old sequence STALE, #6881). Because the
 unattended paths above fail closed, the migration has a REQUIRED ORDER: **key
 the running cluster first, then re-provision / reimage / rebuild a day-0
 drive.** `pkg/cluster/README.md` -> "Operating the control-link PSK (#6611)"
@@ -2356,9 +2361,17 @@ dormant MECHANISM in PR-A:
   `closed` is true AND the keyword is unmodeled (`childSchema == nil`), the
   walker returns a `typedLeafErrorf` reject ("unknown configuration keyword
   … under closed-world subtree"), mirroring the existing modifier-level
-  unknown-keyword rejects. When `closed` is false — the state for EVERY
-  production subtree today — behaviour is byte-identical to pre-#4313
-  (return nil, silent-accept).
+  unknown-keyword rejects. When `closed` is false, behaviour is
+  byte-identical to pre-#4313 (return nil, silent-accept) — which remains the
+  default for every subtree that has not opted in.
+
+  This paragraph deliberately carries NO count of armed subtrees. It used to
+  say "the state for EVERY production subtree today", which was true when
+  written and silently false a month later once the rollout began; the same
+  stale claim in `schema_walk.go` mis-scoped a later lane that trusted it. The
+  armed set is whatever carries `closedWorld: true` in `pkg/config/schema_*.go`
+  — grep it, or read the `schema_closedworld_*_4313_test.go` files, one per
+  closed subtree. A count in prose is a coverage claim and it rots.
 
 PR-A landed the mechanism DORMANT (no production subtree set `closedWorld`,
 zero false-reject risk). It is white-box tested with a SYNTHETIC subtree
@@ -2729,7 +2742,29 @@ Junos, the #4191 class). Both the remaining per-subtree flips and the
 blanket-flip doctrine decision remain tracked on #4313.
 
 **Remaining per-subtree flips (future PRs, tracked on #4313).** Turning
-`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE:
+`closedWorld` on for the other umbrella candidates (`snmp community` — INCOMPLETE,
+and MORE incomplete than this note used to say. A #4313 attempt to close it was
+reverted in PR #6887 after the gate measured four defects; treat these as the
+entry criteria for any future attempt:
+  1. `routing-instance` is a CONTAINER in Junos, not a scalar — it nests a
+     `clients { … }` block. Modeling it as a bare leaf and closing the subtree
+     hard-rejects `snmp community <c> routing-instance <ri> clients <prefix>`,
+     which is valid config. Measured: an SNMP-scoped-to-a-VRF node could not
+     commit ANY change, including an emergency one, until the operator deleted
+     valid Junos.
+  2. `logical-system` is a SIXTH child this note omits —
+     `[edit snmp community <c> logical-system <ls>] routing-instance <ri>`.
+  3. There are TWO ingestion surfaces. The compiler reads snmp from
+     `compiler_dispatch.go` (top-level `snmp {}`) AND from `compiler_system.go`
+     via `FindChild("snmp")` (`system { snmp {} }`), but `setSchema` anchors
+     `snmp` only at the top level. Measured: the same typo is rejected under
+     `snmp {}` and silently accepted under `system { snmp {} }` — and
+     `test/incus/xpf-test.conf` uses the accepted spelling. Closing one surface
+     leaves #4289 live on the one our own reference config uses.
+  4. `client-list-name` and `routing-instance` produce NO inert-knob advisory
+     (only `view` does). Modeling them without one makes the CLI advertise a
+     source-IP restriction the firewall accepts, applies nothing for, and warns
+     nobody about.
 Junos allows `view` / `client-list-name` / `routing-instance`, unmodeled;
 `security nat static … then static-nat` —
 UNSAFE: `static-nat` is a free-form leaf and the Junos hierarchical form

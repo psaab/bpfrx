@@ -97,10 +97,14 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 					switch {
 					case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
 						errors.Is(errOut, dataplane.ErrCounterNotPopulated):
-						// #3643 HIDE: per-zone traffic counters are not sourced
-						// by the userspace dataplane. Leave the counter fields
-						// unset (proto3 omit) rather than Internal-erroring the
-						// RPC on the structural stable-hash-id OOB.
+						// #6843: per-zone counters ARE sourced (#3651). This
+						// branch means the dataplane published nothing for THIS
+						// zone -- pre-#3651 helper, a zone past the helper's
+						// hot-path slot capacity (traffic genuinely uncounted),
+						// or an idle zone.
+						// Leave the counter fields unset (proto3 omit) rather
+						// than Internal-erroring the RPC on the structural
+						// stable-hash-id OOB.
 					case errIn != nil:
 						if readErr == nil {
 							readErr = errIn
