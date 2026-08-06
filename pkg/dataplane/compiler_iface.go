@@ -413,6 +413,25 @@ func programZoneMaps(dp DataPlane, cfg *config.Config, result *CompileResult) (*
 		// deref below (ScreenProfile, HostInboundTraffic, Interfaces)
 		// would otherwise panic the apply-path interface reconcile.
 		if zone == nil {
+			// #5275: mapZoneInterface is the SOLE writer of st.xdpIfindexes,
+			// which becomes result.pendingXDP, so skipping the zone drops
+			// EVERY interface in it from the required set while the compile
+			// succeeds — the same silent-absence hole as the three per-
+			// interface soft skips, one frame up, and reachable on the HA
+			// config-sync path.
+			//
+			// The record is ZONE-level and cannot be resolved to per-interface
+			// coverage: zone.Interfaces is precisely the deref the guard above
+			// exists to prevent, so the surfaces are unknowable here. It is
+			// therefore reported as SKIPPED, not uncovered — an enumeration
+			// gap the measurement can now see rather than a proven policy-free
+			// router. The gating PR has to decide whether an unenumerable zone
+			// fails closed; this phase only has to stop hiding it.
+			result.recordUnarmedSurface(UnarmedSurface{
+				Name: "zone:" + name,
+				Reason: "nil zone slot — every interface in this zone was dropped from the " +
+					"required set and none can be enumerated",
+			})
 			continue
 		}
 		zid := result.ZoneIDs[name]
@@ -451,6 +470,15 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 	if err != nil {
 		slog.Warn("interface not found, skipping",
 			"interface", physName, "zone", name, "err", err)
+		// #5275: the config demanded this surface and the compile still
+		// succeeds without it. Record it so the arm-coverage proof can tell a
+		// declined surface from one that armed. missingInterfaceRecord decides
+		// whether the absence is PROVEN — a netdev-enumeration failure is not
+		// the same as a netdev that does not exist — and vlanID is threaded so
+		// the record names the CONFIGURED surface: physName is already the
+		// resolved parent here, and every VLAN child of one absent parent
+		// would otherwise dedup onto that single name.
+		result.recordUnarmedSurface(missingInterfaceRecord(physName, vlanID, name, err))
 		return nil
 	}
 
@@ -460,6 +488,13 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		if err != nil {
 			slog.Warn("VLAN sub-interface failed, skipping",
 				"parent", physName, "vlan_id", vlanID, "zone", name, "err", err)
+			// #5275: same as above — the child was never created, so nothing
+			// forwards through it, but the config asked for it and the compile
+			// succeeds regardless.
+			result.recordUnarmedSurface(UnarmedSurface{
+				Name:   fmt.Sprintf("%s.%d", physName, vlanID),
+				Reason: fmt.Sprintf("VLAN sub-interface create failed in zone %s: %v", name, err),
+			})
 			return nil
 		}
 
@@ -632,12 +667,19 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		// driver. DPDK ports are disabled by not including them in the
 		// worker's poll set (the zone map lookup will miss, causing drop).
 		isDisabled := false
+		// #5275: a disable whose LinkSetDown did NOT take leaves the netdev UP,
+		// still address-reconciled, still in a zone, still forwarded through by
+		// the kernel — with no XDP attached. Keep LinkSetDown's own error so
+		// disabledSurfaceRecord can tell a proven-down netdev from one that
+		// merely got a warning; a bool computed here would be a second place to
+		// get that judgement wrong.
+		var downErr error
 		if ifCfg, ok := cfg.Interfaces.Interfaces[cfgName]; ok && ifCfg != nil && ifCfg.Disable {
 			isDisabled = true
 			if nlErr == nil {
-				if err := netlink.LinkSetDown(nl); err != nil {
+				if downErr = netlink.LinkSetDown(nl); downErr != nil {
 					slog.Warn("failed to bring disabled interface down",
-						"name", physName, "err", err)
+						"name", physName, "err", downErr)
 				} else {
 					slog.Info("interface administratively disabled", "name", physName)
 				}
@@ -654,6 +696,12 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		if isDisabled {
 			slog.Info("skipping XDP/TC attachment for disabled interface",
 				"name", physName, "ifindex", physIface.Index)
+			// #5275: record the declined surface. Both errors are threaded
+			// through so disabledSurfaceRecord can promote it from "skipped" to
+			// "uncovered" when the netdev was not proven down — an UP, zoned,
+			// XDP-less netdev is the policy-free-router state.
+			result.recordUnarmedSurface(
+				disabledSurfaceRecord(physName, physIface.Index, nlErr, downErr))
 		} else {
 			// Defer actual XDP/TC attachment to after all compile phases
 			// so link.Update() switches to programs with fully-populated maps.
