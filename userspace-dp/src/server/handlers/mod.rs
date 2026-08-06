@@ -205,7 +205,9 @@ pub(crate) fn handle_stream(
             // #3651: reset the helper-side cumulative per-zone traffic totals.
             // Load-bearing half of the operator `clear` (the Go side also
             // drops its zone-counter offset map): the helper reports cumulative
-            // totals every poll and the Go side mirrors them ABSOLUTELY via
+            // totals every poll and the Go side REPLACES its map from that
+            // snapshot (#6843), so a cleared zone reads as not-populated rather
+            // than as zero. Historically the Go side mirrored them absolutely via
             // SetZoneCounterOffset, so without this reset the cleared value
             // would snap back on the next poll.
             "clear_zone_counters" => {
