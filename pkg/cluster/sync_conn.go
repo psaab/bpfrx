@@ -932,7 +932,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()
 		}
-	} else if !s.outboundBulkAcked.Load() {
+	} else if !s.outboundBulkAcked.Load() || s.needColdPrime.Load() {
 		// #4090: a survivor fabric is still up but the cold-start bulk
 		// never completed. The bulk streams over a SINGLE connection
 		// (BulkSync pins s.getActiveConn once); if that
@@ -947,6 +947,33 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// bulkEverCompleted but says nothing about whether the peer
 		// received our table, so keying on the shared flag would wrongly
 		// suppress the re-drive of a stranded outbound bulk.
+		//
+		// #5718 fold r7 BLOCKER 2: `|| needColdPrime`, because an obligation
+		// whose firing edge is an event that has ALREADY PASSED is not
+		// deferred — it is lost. `needColdPrime` had exactly one consumer,
+		// `shouldColdPrime` in installConn, so its only edge was a connection
+		// INSTALL that becomes active. Reach the state where the obligation is
+		// armed and every connection that could fire it is already installed
+		// and there is nothing left to trigger it, ever.
+		//
+		// `outboundBulkAcked` is what removes the edge, because it is sticky
+		// for the life of the PROCESS: written true once (sync_conn_read.go)
+		// and cleared nowhere — not on a full disconnect, not on a
+		// supersession. So an ack earned by a PRIOR peer incarnation suppresses
+		// this re-drive for the CURRENT one. Concretely: a new incarnation
+		// supersedes fabric 0, which arms needColdPrime and starts a bulk;
+		// fabric 1 of the same new peer joins passively while that bulk runs;
+		// fabric 0's write then fails and BulkSync disconnects it. The
+		// obligation stays armed, the survivor is already installed, the old
+		// incarnation's ack suppresses this branch — and the incremental sweep
+		// only ships sessions newer than its watermark, so established flows
+		// are never repaired. Failover to that peer blackholes them.
+		//
+		// Keying on the OBLIGATION rather than on the staleness is deliberate.
+		// Clearing `outboundBulkAcked` on supersession would also close this
+		// path, but only this path: an owed cold-prime armed by the
+		// full-disconnect edge and then failed, with a survivor installed, is
+		// the same lost-edge shape with no supersession anywhere in it.
 		//
 		// This MUST be a goroutine, not inline: handleDisconnect holds
 		// s.mu, and doBulkSync -> BulkSync -> getActiveConn
@@ -967,7 +994,11 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 				// used — bulkEverCompleted may be true from an inbound bulk
 				// while our outbound bulk is still un-acked, and bailing on
 				// it here would make the fix inert.
-				if s.outboundBulkAcked.Load() {
+				// #5718 fold r7 BLOCKER 2: mirror the widened gate. Bailing on
+				// outboundBulkAcked alone would make the `|| needColdPrime`
+				// above inert for exactly the case it was added for — the
+				// prior incarnation's sticky ack is true in both places.
+				if s.outboundBulkAcked.Load() && !s.needColdPrime.Load() {
 					return
 				}
 				// Reset the stranded pending-ack epoch so the re-run's fresh
@@ -977,6 +1008,15 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 				s.pendingBulkAckSince.Store(0)
 				if err := s.doBulkSync(); err != nil {
 					slog.Warn("cluster sync: cold-start bulk re-drive failed", "err", err)
+				} else {
+					// #5718 fold r7 BLOCKER 2: DISCHARGE the obligation here
+					// too. Without this the latch that now triggers the
+					// re-drive would stay armed after the re-drive satisfied
+					// it, so every later survivor disconnect would re-bulk a
+					// peer that is already primed — trading a lost obligation
+					// for one that can never be paid off. Same discharge, same
+					// success-only condition, as the installConn path.
+					s.needColdPrime.Store(false)
 				}
 			}()
 		}
