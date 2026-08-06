@@ -865,16 +865,51 @@ pub(super) fn apply_worker_commands(
 }
 
 
+/// #4800: calls to [`replicate_session_upsert`] (one per new flow), and the
+/// total number of `UpsertSynced` commands those calls enqueued — the
+/// second is `calls * sibling_worker_count`, so the ratio recovers the
+/// N-way fan-out multiplier without the analysis layer having to know the
+/// worker count out of band.
+pub(crate) static SESSION_REPLICATION_UPSERTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SESSION_REPLICATION_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+
+/// #4800: sibling worker-queue mutex acquisitions in
+/// [`replicate_session_upsert`] that found the queue already held. The
+/// denominator is `SESSION_REPLICATION_ENQUEUED` (one acquisition per
+/// enqueue).
+pub(crate) static SESSION_REPLICATION_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// #4800: high-water sibling-queue depth observed at replication push time
+/// (monotonic max, never reset). Contention says workers collided on the
+/// mutex; DEPTH says the consuming worker is not draining as fast as the
+/// producers enqueue — a different failure mode with a different fix, and
+/// the one that distinguishes "replication is the bottleneck" from
+/// "replication is merely busy".
+///
+/// Sampled once per call (the max across this call's siblings) rather than
+/// once per enqueue, so the cost is O(1) in the sibling count.
+pub(crate) static SESSION_REPLICATION_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+
 pub(super) fn replicate_session_upsert(
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     entry: &SyncedSessionEntry,
 ) {
     let replica = synced_replica_entry(entry);
+    // #4800: two O(1) counter updates per call rather than per sibling.
+    SESSION_REPLICATION_UPSERTS.fetch_add(1, Ordering::Relaxed);
+    SESSION_REPLICATION_ENQUEUED.fetch_add(worker_commands.len() as u64, Ordering::Relaxed);
+    let mut deepest = 0u64;
     for commands in worker_commands {
         // #1807: recover-and-push — `if let Ok` silently DROPPED the
         // UpsertSynced replica for a poisoned worker queue.
-        let mut pending = worker_queue::lock_recover(commands);
+        // #4800: ...and count the acquisitions that had to block.
+        let mut pending =
+            worker_queue::lock_recover_counting(commands, &SESSION_REPLICATION_LOCK_CONTENDED);
         pending.push_back(WorkerCommand::UpsertSynced(replica.clone()));
+        deepest = deepest.max(pending.len() as u64);
+    }
+    if deepest != 0 {
+        SESSION_REPLICATION_QUEUE_DEPTH_MAX.fetch_max(deepest, Ordering::Relaxed);
     }
 }
 
@@ -1418,3 +1453,9 @@ pub(super) fn enforce_session_ha_resolution(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+// #4800: publish + sibling-replication contention accounting for the
+// new-flow-install ceiling harness. Kept in its own file rather than
+// appended to `tests.rs` (already ~7k lines).
+#[cfg(test)]
+#[path = "newflow_contention_tests.rs"]
+mod newflow_contention_tests;

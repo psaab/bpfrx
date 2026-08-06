@@ -1261,6 +1261,25 @@ fn refresh_worker_cos_queue_lease_runtime_counters(
     counters.cos_queue_lease_undergrant = undergrant;
 }
 
+/// #4800: sum this worker's per-binding new-flow install counts onto its
+/// runtime counters, on the same ~1s publish cadence as the CoS lease
+/// counters above. A worker owns its bindings, so the sum is the worker's
+/// share of the transit new-flow install path.
+fn refresh_worker_new_flow_install_counters(
+    counters: &mut super::worker_runtime::WorkerRuntimeCounters,
+    bindings: &[BindingWorker],
+) {
+    counters.new_flow_installs = bindings
+        .iter()
+        .map(|binding| {
+            binding
+                .live
+                .new_flow_installs
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .fold(0u64, |acc, v| acc.wrapping_add(v));
+}
+
 fn apply_worker_shaped_tx_requests(
     bindings: &mut [BindingWorker],
     forwarding: &ForwardingState,
