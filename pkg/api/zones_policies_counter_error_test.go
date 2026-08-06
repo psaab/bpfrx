@@ -166,11 +166,18 @@ func TestCollectFilterCountersSkipsSampleOnConfigReadError(t *testing.T) {
 	}
 }
 
-// #3643: TestCollectZoneCountersCountsReadErrors was removed with the
-// collectZoneCounters collector. Per-zone traffic metrics
-// (xpf_zone_packets_total / xpf_zone_bytes_total) were never populated in the
-// userspace era and every stable-hash zone id >= MaxZones read OOB'd the dense
+// #3643 removed TestCollectZoneCountersCountsReadErrors along with the
+// collectZoneCounters collector: per-zone traffic metrics had no writer in the
+// userspace era, and every stable-hash zone id >= MaxZones read OOB'd the dense
 // BPF array, bumping xpf_counter_read_errors_total once per zone per scrape --
-// a permanent FALSE alert. The metrics + collector are gone (HIDE) until the
-// per-zone POPULATE path ships. See TestZonesHandlerZoneCountersNotAvailable /
-// TestCollectDoesNotFalseAlertOnZoneReads for the HIDE contract.
+// a permanent FALSE alert.
+//
+// #3651 shipped the populate path and restored the collector, so the per-zone
+// read-error contract is under test again -- in zone_counters_metrics_test.go
+// rather than here, since it now needs the populated/unpopulated/failed
+// three-way disposition rather than a single error case:
+// TestCollectZoneCountersBumpsOnGenuineReadError (a genuine failure still
+// skip-and-bumps, #3345/#3408), TestCollectZoneCountersOmitsUnpopulated
+// RatherThanPublishingZero (ErrCounterNotPopulated must NOT bump -- that is the
+// #3643 false alert), and TestCollectDoesNotFalseAlertOnZoneReads (the same
+// guarantee at whole-Collect level, where the storm manifested).

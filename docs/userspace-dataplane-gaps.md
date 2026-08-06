@@ -137,7 +137,10 @@ counters (see below).
   dense array (so a stable-hash zone id `>= MaxZones` no longer OOB-errors the
   read), returning the distinct `dataplane.ErrCounterNotPopulated` sentinel
   while unpopulated. The always-erroring `xpf_zone_packets_total` /
-  `xpf_zone_bytes_total` Prometheus metrics were dropped.
+  `xpf_zone_bytes_total` Prometheus metrics were dropped — and restored later
+  in #3651, once the populate path below made them meaningful again (see
+  `pkg/api/README.md` for the collector's populated / not-populated / failed
+  disposition and the `xpf_zone_counters_unpopulated_zones` gauge).
 
 - **POPULATE traffic (#3651) is what now ships.** The Rust helper accounts
   per-zone traffic on the forward hot path via a flat direct-index
@@ -158,7 +161,7 @@ counters (see below).
   `ProcessStatus`-level sparse per-zone block (`zone_traffic_counters`, layout
   version 1, only nonzero rows). The Go status poll
   (`syncBPFCountersLocked`) mirrors each row into the bpfShim offset map via
-  `SetZoneCounterOffset`, so `show security zones` Traffic statistics, the REST
+  `ReplaceZoneCounterOffsets`, so `show security zones` Traffic statistics, the REST
   `/security/zones` endpoint, and the Prometheus collector report live volume.
   A `clear_zone_counters` control IPC resets the helper's cumulative store (the
   Go `ClearZoneCounters` / `ClearAllCounters` overrides send it) so an operator
