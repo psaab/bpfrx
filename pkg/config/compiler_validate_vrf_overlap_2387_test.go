@@ -16,9 +16,10 @@ import (
 // interface units WARN, naming both RIs + the prefix; (2) non-overlapping RIs
 // do NOT warn (no false positive); (3) a single RI / no RI does NOT warn;
 // (4) the PBR-term source (`then routing-instance`) also feeds the overlap set;
-// (5) the warning states the CURRENT limitation and points at the tracking
-// issue instead of promising a fix, and (6) losing the promise did not cost the
-// diagnostic any of its substance.
+// (5) the warning ENDS with the exact status sentence — stating the current
+// limitation and pointing at the tracking issue, with no promise before it and
+// nothing appended after it — and (6) losing the promise did not cost the
+// diagnostic any of its substance, polarity included.
 //
 // fail-on-revert: removing the validateVRFOverlap call (or its detection body)
 // drops the warning, so TestVRFOverlapWarnsOnOverlappingRIs goes RED.
@@ -27,9 +28,12 @@ import (
 // replace "…may cross-forward. See #2387 for the status of this limitation"
 // with "…may cross-forward until the session identity is VRF-aware", KEEPING
 // the "the session identity carries no routing-instance discriminator, so"
-// clause. That reds TestVRFOverlapWarningStatesStatusNotPromise on the "until"
-// token while TestVRFOverlapWarningKeepsDiagnosticSubstance stays GREEN, which
-// is what distinguishes "the promise is gone" from "the diagnostic is gone".
+// clause. That reds TestVRFOverlapWarningStatesStatusNotPromise twice over — the
+// message no longer ends with vrfOverlapStatusTail, and "until" is on the
+// blocklist — while TestVRFOverlapWarningKeepsDiagnosticSubstance stays GREEN,
+// which is what distinguishes "the promise is gone" from "the diagnostic is
+// gone". The converse isolation is stripping the "…carries no routing-instance
+// discriminator, so " clause and keeping the tail: substance RED, promise GREEN.
 //
 // A LITERAL revert to the pre-PR string reds BOTH, and that is correct, not a
 // failure of the pair: the old string ALSO lacked the discriminator clause, so
@@ -39,7 +43,10 @@ import (
 // the substance test at all is the useful part: the replacement is strictly
 // more informative than what it replaced, and this test is what pins that.)
 
-// vrf2387Warnings returns the compile warnings that mention #2387.
+// vrf2387Warnings returns the compile warnings carrying the cross-VRF overlap
+// diagnosis. It selects on the diagnosis phrase, NOT on "#2387" — see the
+// comment on the filter below for why the issue reference cannot be the
+// selector.
 func vrf2387Warnings(t *testing.T, cmds []string) []string {
 	t.Helper()
 	tree := buildTree(t, cmds)
@@ -50,13 +57,14 @@ func vrf2387Warnings(t *testing.T, cmds []string) []string {
 	var out []string
 	for _, w := range cfg.Warnings {
 		// Filter on the DIAGNOSIS, not on "#2387". Filtering on the issue
-		// reference made the "points at the tracking issue" assertion below
-		// unreachable: every warning reaching it had already been selected for
-		// containing the very substring it then checked for. Dropping #2387
-		// from a format string failed the fixture's count assertion instead,
-		// with a message about the wrong thing. This phrase is carried by both
-		// overlap format strings and by neither the truncation notice nor any
-		// other warning, so the selection stays arm-neutral.
+		// reference made the status-sentence assertion below unreachable: every
+		// warning reaching it had already been selected for containing the very
+		// substring the sentence ends with. Dropping #2387 from a format string
+		// failed the fixture's count assertion instead, with a message about the
+		// wrong thing. This phrase is carried by both overlap format strings and
+		// by neither the truncation notice nor any other warning, so the
+		// selection stays arm-neutral, and it appears nowhere inside
+		// vrfOverlapStatusTail, so it cannot pre-satisfy that assertion either.
 		if strings.Contains(w, "overlapping L3 across routing-instances") {
 			out = append(out, w)
 		}
@@ -162,6 +170,27 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 	}
 }
 
+// vrfOverlapStatusTail is the exact wording BOTH overlap format strings must
+// END with. It is this PR's actual deliverable: the sentence that replaced the
+// old "until the session identity is VRF-aware" promise with a pointer to the
+// still-open decision.
+//
+// Asserted as an exact TERMINAL substring, not as tokens, because every weaker
+// form measured GREEN while the deliverable was gone. A bare `Contains("#2387")`
+// passed with this whole sentence deleted, since the diagnosis clause earlier in
+// the message carries a second "#2387". And no token list can forbid text being
+// APPENDED after the sentence: "…status of this limitation. A fix is
+// guaranteed." reintroduces an explicit promise while matching every token
+// check. One suffix comparison forbids appending, truncating, and rewording the
+// tail at once, and needs no maintenance as new promise spellings are invented.
+//
+// It deliberately starts AFTER the "…discriminator, so " clause. That keeps this
+// test scoped to the PROMISE dimension: stripping the diagnosis has to red
+// TestVRFOverlapWarningKeepsDiagnosticSubstance and only that test, which is
+// what makes the two tests separable rather than two spellings of one check.
+const vrfOverlapStatusTail = "colliding 5-tuples may cross-forward. " +
+	"See #2387 for the status of this limitation"
+
 // vrfOverlapForwardLookingTokens are the wordings that turn the advisory from a
 // statement of the CURRENT limitation into a promise about a future one. #2387
 // is held on a maintainer risk-appetite call: neither candidate end-state (the
@@ -170,13 +199,18 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 // 5-tuples may cross-forward "until the session identity is VRF-aware", and the
 // #2387 plan then cited that sentence back as evidence the widening was already
 // settled — a promise the open decision may never keep.
-// This list is a BLOCKLIST and is therefore incomplete by construction: it
-// catches the spellings someone thought of, and a future author can always
-// phrase a promise a way it does not match. Do not read a green result as
-// "the warning contains no promise" — read it as "the warning contains none of
-// these". The entries below the first group were added after a review
-// demonstrated each one passing the test while reintroducing a promise, so
-// treat any addition the same way: prove it green first, then add it.
+//
+// This list is the SECONDARY layer, and it is a BLOCKLIST: incomplete by
+// construction. vrfOverlapStatusTail above is the primary binding and pins the
+// message from "colliding 5-tuples" to its last character exactly, so the only
+// region where these tokens are the sole defence is the span BEFORE the tail — a
+// promise spliced between "NOT session-isolated (#2387) —" and the diagnosis
+// clause. Do not read a green result as "the warning contains no promise"; read
+// it as "the tail is exactly right and the head contains none of these
+// spellings". Do not grow this list toward completeness — that is the trap it
+// documents. The entries below the first group were each added after a review
+// demonstrated it passing the test while reintroducing a promise, so treat any
+// addition the same way: prove it green first, then add it.
 var vrfOverlapForwardLookingTokens = []string{
 	"until",
 	"will be",
@@ -268,9 +302,11 @@ func vrfOverlapBothFormStrings(t *testing.T) (equal, unequal string) {
 
 // TestVRFOverlapWarningStatesStatusNotPromise pins that BOTH format strings
 // describe the current limitation and point at the tracking issue, without
-// asserting that any particular fix arrives. Restoring the old "…may
-// cross-forward until the session identity is VRF-aware" wording reds this on
-// the "until" token.
+// asserting that any particular fix arrives. Two layers, in order of strength:
+// the message must END with vrfOverlapStatusTail verbatim, and the message must
+// carry none of the known promise spellings anywhere. Restoring the old "…may
+// cross-forward until the session identity is VRF-aware" wording reds both — the
+// suffix no longer matches, and "until" is on the list.
 func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 	equal, unequal := vrfOverlapBothFormStrings(t)
 	for _, tc := range []struct {
@@ -287,8 +323,11 @@ func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 					tc.form, tok, tc.warn)
 			}
 		}
-		if !strings.Contains(tc.warn, "#2387") {
-			t.Errorf("%s form does not point at the tracking issue: %s", tc.form, tc.warn)
+		if !strings.HasSuffix(tc.warn, vrfOverlapStatusTail) {
+			t.Errorf("%s form does not END with the status sentence %q — the advisory must close "+
+				"by stating the consequence and pointing at the open decision, with nothing "+
+				"appended after it: %s",
+				tc.form, vrfOverlapStatusTail, tc.warn)
 		}
 	}
 }
@@ -296,10 +335,17 @@ func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 // TestVRFOverlapWarningKeepsDiagnosticSubstance is the negative control for
 // TestVRFOverlapWarningStatesStatusNotPromise. Dropping the promise must not
 // cost the operator the diagnosis: the warning still has to say WHAT is wrong
-// (no routing-instance discriminator in the session identity) and WHAT the
-// consequence is (colliding 5-tuples may cross-forward). Without this pair, the
-// forward-looking-token test above is satisfied just as well by deleting the
-// warning text wholesale.
+// (no routing-instance discriminator in the session identity) and WHAT follows
+// from it (colliding 5-tuples MAY cross-forward).
+//
+// What this control actually defends against is PARTIAL diagnostic stripping —
+// text that still passes the helper's selector and still ends with the exact
+// status tail, but has lost the cause, the consequence, or the pairing that says
+// which instance sits on which source and prefix. It is NOT what stops wholesale
+// deletion of the warning text: that reds StatesStatusNotPromise first, because
+// vrfOverlapBothFormStrings requires the diagnosis selector to match, exactly one
+// warning per fixture, and both arm markers before any assertion here is reached.
+// An earlier revision of this comment claimed the opposite; it was wrong.
 func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 	equal, unequal := vrfOverlapBothFormStrings(t)
 	for _, tc := range []struct {
@@ -312,9 +358,11 @@ func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 		// list of tokens to find somewhere in the message. Presence and
 		// association are different properties, and only the second is useful:
 		// a token list is satisfied while every identifier is attached to the
-		// WRONG object. Both format strings are 6-argument Sprintf calls
-		// carrying three (name, origin, prefix) triples, which is exactly where
-		// an argument transposition happens — and `go vet` cannot see it,
+		// WRONG object. Both format strings interleave the two instances'
+		// identifiers — the equal-prefix arm substitutes FIVE arguments (two
+		// name/origin pairs plus the single prefix they share), the unequal arm
+		// SIX (a full (name, origin, prefix) triple each) — which is exactly
+		// where an argument transposition happens, and `go vet` cannot see it,
 		// because every argument is a string or Stringer feeding %q/%s, so the
 		// printf checker reports nothing.
 		//
@@ -349,11 +397,17 @@ func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 			},
 		},
 	} {
-		// The explanation: what is wrong and what follows from it.
+		// The explanation: what is wrong and what follows from it. Each entry
+		// carries its own POLARITY, because a bare noun does not. "cross-forward"
+		// alone was satisfied by "colliding 5-tuples CANNOT cross-forward", which
+		// tells the operator the exact opposite of the truth — the hazard reads as
+		// a reassurance and the topology looks safe. Assert the claim, not the
+		// vocabulary: subject + modality + verb as one contiguous span, and the
+		// cause with the "no" that makes it a cause.
 		for _, want := range []string{
 			"NOT session-isolated",
-			"no routing-instance discriminator",
-			"cross-forward",
+			"the session identity carries no routing-instance discriminator",
+			"colliding 5-tuples may cross-forward",
 		} {
 			if !strings.Contains(tc.warn, want) {
 				t.Errorf("%s form lost diagnostic substance %q: %s", tc.form, want, tc.warn)

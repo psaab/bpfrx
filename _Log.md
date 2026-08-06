@@ -1,3 +1,80 @@
+## 2026-08-06 — #6902 round 4: the assertions bound VOCABULARY, not the CLAIM
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three test-contract findings plus two comment corrections.
+  Test-file-only — the production warning strings are byte-identical to rounds
+  1 through 3, verified with `cmp` against a pristine copy after every
+  mutation cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**F1a — the substance test was polarity-insensitive.** It asserted the bare
+noun `"cross-forward"`. Rewriting `may cross-forward` to `cannot cross-forward`
+inverts the diagnosis — the operator is told the topology IS session-isolated,
+so the hazard reads as a reassurance — and both tests stayed GREEN. Verified
+firsthand at HEAD 690dba2c8 before the fix. A bare noun cannot carry polarity;
+the assertions now hold the claim as contiguous spans: `"the session identity
+carries no routing-instance discriminator"` and `"colliding 5-tuples may
+cross-forward"` (subject + modality + verb).
+
+**F1b — the promise test was a token blocklist, and only a blocklist.**
+Appending `"A fix is guaranteed."` to both arms reintroduces an explicit promise
+that no listed spelling matches; both tests stayed GREEN. Growing the list is
+the trap the list itself documents, so the fix is structural: a new
+`vrfOverlapStatusTail` constant that both arms must END with, verbatim. One
+suffix comparison forbids appending, truncating, and rewording the tail at once.
+The blocklist is retained as the secondary layer and its doc now says what it
+still uniquely covers — a promise spliced into the span BEFORE the tail — and
+that it must not be grown.
+
+**F2 — the PR's own new sentence was unpinned.** The assertion checked only for
+the presence of any `#2387`, and the message carried a `(#2387)` before this PR.
+Deleting the entire new tail — `"See #2387 for the status of this limitation"` —
+left the earlier reference in place and both tests GREEN. The deliverable, going
+unbound. `vrfOverlapStatusTail` pins the sentence, not the reference.
+
+| Mutation (production warning strings) | subs | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|---|
+| baseline | 0 | GREEN | GREEN |
+| `may cross-forward` -> `cannot cross-forward` | 2 | RED | RED |
+| append `A fix is guaranteed.` | 2 | RED | GREEN |
+| delete the `See #2387 …limitation` tail, keep earlier `(#2387)` | 2 | RED | GREEN |
+| restore `until the session identity is VRF-aware` (tail only) | 2 | RED | GREEN |
+| strip the `no routing-instance discriminator` clause, keep tail | 2 | GREEN | RED |
+| wholesale-delete the advisory text (F3 probe) | 2 | RED (helper) | RED (helper) |
+
+Every cell reports the substitutions APPLIED before its result was read: a
+pattern that silently matches nothing is a no-op wearing a passing guard, and it
+bit this exact matrix once — the clause-strip regex matched only the unequal arm
+(1 of 2) because the word "session" falls on a different concatenation line in
+each arm. Both isolating cells fire on BOTH arms. Every RED is an assertion
+message, never a build break; production restored from a pristine copy and
+`cmp`-verified after each cell. The first three rows were re-run against the
+pre-fix test file and measured GREEN/GREEN, which is what makes them findings
+rather than hypotheses.
+
+**F3 — a false claim in the test's own comment, endorsed in my brief.** The
+comment said that without the substance control, the promise test "is satisfied
+just as well by deleting the warning text wholesale". It is not:
+`vrfOverlapBothFormStrings` requires the diagnosis selector to match, exactly one
+warning per fixture, and both arm markers, so wholesale deletion reds the promise
+test at the helper first. Measured — the F3 probe row above fails at
+`compiler_validate_vrf_overlap_2387_test.go:311`, the fixture-count assertion, in
+BOTH tests. The control's real value is against PARTIAL stripping: text that
+still passes the selector and still ends with the exact tail but has lost the
+cause, the consequence, or the pairing. The comment now says that.
+
+**F4 — two stale comments.** The `vrf2387Warnings` doc still said it "returns
+the compile warnings that mention #2387"; it has filtered on the diagnosis
+phrase since round 3 (deliberately — filtering on `#2387` made the tracking-issue
+assertion unreachable). And the arg-count claim corrected in the round-3 entry
+above.
+
+No production behaviour change: the warning fires on the same configurations,
+with the same severity, and still commits. No module doc needs updating — this
+round changes test assertions and comments only, and the operator-visible
+warning text is unchanged from round 1, whose doc updates already landed.
+
 ## 2026-08-05 — #6902 round 3: the identity assertions bound PRESENCE, not ASSOCIATION
 
 - **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
@@ -8,10 +85,14 @@
 **F3 — the finding worth the round.** Round 2 added per-form identity
 assertions, but as a LIST OF TOKENS. Presence and association are different
 properties and only the second is useful: every identifier stays in the string
-while attached to the WRONG object. Both format strings are 6-argument Sprintf
-calls carrying three (name, origin, prefix) triples — precisely where a
-transposition happens — and `go vet` cannot see it, because every argument is a
-string or Stringer feeding %q/%s.
+while attached to the WRONG object. Both format strings interleave the two
+instances' identifiers — the equal-prefix arm substitutes FIVE arguments (two
+name/origin pairs plus the single prefix they share), the unequal arm SIX (a
+full (name, origin, prefix) triple each) — precisely where a transposition
+happens, and `go vet` cannot see it, because every argument is a string or
+Stringer feeding %q/%s. (Round 4 correction: this paragraph originally called
+both arms "6-argument Sprintf calls carrying three (name, origin, prefix)
+triples", which is wrong on both counts for the equal-prefix arm.)
 
 Measured on the round-2 form: swapping the two origins, the two RI names, or the
 two prefixes each left `go test ./pkg/config/ -count=1` fully GREEN and
