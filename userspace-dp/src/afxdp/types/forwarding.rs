@@ -340,6 +340,19 @@ pub(in crate::afxdp) struct ForwardingState {
     /// (`forwarding_build`) keeps totals alive until the operator
     /// `clear_zone_counters` IPC resets them.
     pub(in crate::afxdp) zone_counter_store: crate::afxdp::zone_counters::ZoneCounterStore,
+    /// #3651: flat zone-id → slot LUT for the per-zone SYN/ICMP/UDP flood-event
+    /// counters, rebuilt from the same configured zone set as
+    /// `zone_counter_slot_map` at each config apply. Read on a screen DROP (not
+    /// on the forward path) via `record_zone_flood_drop`. Rotated via the
+    /// ForwardingState ArcSwap alongside its siblings.
+    pub(in crate::afxdp) flood_counter_slot_map:
+        std::sync::Arc<crate::afxdp::flood_counters::FloodCounterSlotMap>,
+    /// #3651: coordinator-owned cumulative per-zone flood-event totals. Keyed by
+    /// stable zone id, `Clone` shares the inner `Arc<Mutex>`, so cloning this
+    /// state (worker publish) and carrying it forward across config applies
+    /// keeps totals alive until the operator `clear_flood_counters` IPC resets
+    /// them.
+    pub(in crate::afxdp) flood_counter_store: crate::afxdp::flood_counters::FloodCounterStore,
 }
 
 /// #3070/#3405: a zone's compiled host-inbound-traffic admission set. Built from

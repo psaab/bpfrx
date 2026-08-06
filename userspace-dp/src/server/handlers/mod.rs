@@ -215,6 +215,20 @@ pub(crate) fn handle_stream(
                 refresh_status(&mut guard);
                 persist_state = true;
             }
+            // #3651: reset the helper-side cumulative per-zone FLOOD-event
+            // totals. Load-bearing half of the operator `clear` for the same
+            // reason as clear_zone_counters above: the Go side drops its flood
+            // offset map, but the helper reports cumulative totals every poll
+            // and the Go side REPLACES its map from that snapshot, so without
+            // this reset the cleared counts would snap back within <=1 s. A
+            // cleared zone then reads as not-populated rather than as zero.
+            // One-time (operator `clear firewall all` / REST / gRPC stats
+            // reset) — never a periodic caller on this shared socket.
+            "clear_flood_counters" => {
+                guard.afxdp.clear_flood_counters();
+                refresh_status(&mut guard);
+                persist_state = true;
+            }
             "set_queue_state" => {
                 queue::set(&mut guard, request.queue, &mut response, &mut persist_state)
             }

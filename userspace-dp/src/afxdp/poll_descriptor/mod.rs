@@ -1589,7 +1589,11 @@ pub(super) fn poll_binding_process_descriptor(
                                     reason,
                                     event_now_ns_from_secs(now_secs),
                                 );
-                                telemetry.counters.record_screen_drop(reason);
+                                telemetry.counters.record_screen_drop(
+                                    reason,
+                                    from_zone_id,
+                                    &worker_ctx.forwarding.flood_counter_slot_map,
+                                );
                                 binding.scratch.scratch_recycle.push(desc.addr);
                                 continue;
                             }
@@ -1645,7 +1649,11 @@ pub(super) fn poll_binding_process_descriptor(
                                 | ForwardingDisposition::MissingNeighbor
                         ) && strict_syn_check_drops_new_flow(meta.protocol, meta.tcp_flags)
                         {
-                            telemetry.counters.record_screen_drop("strict-syn-check");
+                            telemetry.counters.record_screen_drop(
+                                "strict-syn-check",
+                                from_zone_id,
+                                &worker_ctx.forwarding.flood_counter_slot_map,
+                            );
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }

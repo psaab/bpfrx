@@ -185,15 +185,30 @@ type ProcessStatus struct {
 	ZoneCounterLayoutVersion  uint32                     `json:"zone_counter_layout_version,omitempty"`
 	ZoneCounterOverflowActive bool                       `json:"zone_counter_overflow_active,omitempty"`
 	ZoneTrafficCounters       []ZoneTrafficCounterStatus `json:"zone_traffic_counters,omitempty"`
-	ThreeColorPolicerCounters []ThreeColorPolicerStatus  `json:"three_color_policer_counters,omitempty"`
-	SourceNATPools            []SourceNATPoolStatus      `json:"source_nat_pools,omitempty"`
-	LastResolution            *PacketResolution          `json:"last_resolution,omitempty"`
-	SlowPath                  SlowPathStatus             `json:"slow_path,omitempty"`
-	LastCacheFlushAt          uint64                     `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
-	DataplaneMode             string                     `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
-	ConfiguredMode            string                     `json:"configured_mode,omitempty"`        // Desired mode from config
-	EntryPrograms             map[int]string             `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
-	DegradedPathCounters      map[string]uint64          `json:"degraded_path_counters,omitempty"` // reason_name -> count
+	// #3651: per-zone SYN/ICMP/UDP flood-EVENT counts, summed across every
+	// worker by the helper (a second ProcessStatus-level pre-summed sparse
+	// block, one row per zone with nonzero flood drops keyed by the stable zone
+	// id). syncBPFCountersLocked mirrors each row into the legacy bpfShim
+	// flood-counter offset map via ReplaceFloodCounterOffsets so
+	// Manager.ReadFloodCounters (and thus `show security screen ids-option
+	// statistics`) reports live per-zone flood counts instead of
+	// ErrCounterNotPopulated ("not available"). FloodCounterLayoutVersion
+	// selects the decode path (0/absent = helper with no per-zone flood
+	// accounting); FloodCounterOverflowActive means the configured zone count
+	// exceeded the helper's dense slot capacity so some zones went uncounted.
+	// JSON tags MUST match the Rust serde rename(...) exactly.
+	FloodCounterLayoutVersion  uint32                    `json:"flood_counter_layout_version,omitempty"`
+	FloodCounterOverflowActive bool                      `json:"flood_counter_overflow_active,omitempty"`
+	ZoneFloodCounters          []ZoneFloodCounterStatus  `json:"zone_flood_counters,omitempty"`
+	ThreeColorPolicerCounters  []ThreeColorPolicerStatus `json:"three_color_policer_counters,omitempty"`
+	SourceNATPools             []SourceNATPoolStatus     `json:"source_nat_pools,omitempty"`
+	LastResolution             *PacketResolution         `json:"last_resolution,omitempty"`
+	SlowPath                   SlowPathStatus            `json:"slow_path,omitempty"`
+	LastCacheFlushAt           uint64                    `json:"last_cache_flush_at,omitempty"`    // monotonic secs (#312)
+	DataplaneMode              string                    `json:"dataplane_mode,omitempty"`         // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode             string                    `json:"configured_mode,omitempty"`        // Desired mode from config
+	EntryPrograms              map[int]string            `json:"entry_programs,omitempty"`         // ifindex -> attached XDP program name
+	DegradedPathCounters       map[string]uint64         `json:"degraded_path_counters,omitempty"` // reason_name -> count
 	// #1636 option C: proactive-neighbor-warm telemetry. WarmDrops counts
 	// warm requests dropped because the bounded warmer queue was full
 	// (transient); WarmDisconnected counts requests dropped because the

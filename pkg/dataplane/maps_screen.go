@@ -81,10 +81,19 @@ func (m *Manager) ClearSessionCounts() error {
 // #3643: like ReadZoneCounters, this keys a Go-side sparse offset map instead
 // of indexing the dense flood_counters BPF array (MaxZones entries), so a
 // stable-hash zone id >= MaxZones can no longer OOB the bounded Lookup and
-// surface as a hard read failure. The userspace helper does not yet populate
-// per-zone flood counters (POPULATE deferred, #3643 plan §5A), so the map is
-// empty and this reports ErrCounterNotPopulated; surfaces render "not
-// available" rather than a misleading 0.
+// surface as a hard read failure.
+//
+// #3651: the helper DOES now populate per-zone flood counters (Rust screen-drop
+// path accounting -> ProcessStatus.ZoneFloodCounters -> syncBPFCountersLocked ->
+// ReplaceFloodCounterOffsets), so this returns live SYN/ICMP/UDP flood-event
+// counts for a zone the helper has published. Only SynCount/ICMPCount/UDPCount
+// are sourced; the legacy WindowStart/SynproxyActive fields belonged to the
+// deleted eBPF rate-limiter state and stay zero (no surface reads them).
+// ErrCounterNotPopulated remains reachable and is NOT an error condition: the
+// helper's snapshot is sparse and omits all-zero rows, so the sentinel covers a
+// helper with no per-zone flood accounting, a zone past the helper's slot
+// capacity, and a zone that has simply never tripped a flood check alike.
+// Surfaces must render "not available" rather than a misleading 0.
 func (m *Manager) ReadFloodCounters(zoneID uint16) (FloodState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -99,12 +108,66 @@ func (m *Manager) ReadFloodCounters(zoneID uint16) (FloodState, error) {
 // counts reported by the userspace dataplane for zoneID (#3643 POPULATE hook,
 // mirroring SetZoneCounterOffset). Once set, ReadFloodCounters returns it (nil
 // error) instead of ErrCounterNotPopulated.
+//
+// #3651: this has NO production callers. syncBPFCountersLocked replaces the
+// whole offset map per status poll (ReplaceFloodCounterOffsets) rather than
+// setting row by row, because a per-row setter can only add or overwrite and so
+// strands the last value of any zone the helper stops publishing. This single-
+// row setter is retained for tests that seed one zone directly; production code
+// MUST use ReplaceFloodCounterOffsets, or a zone that disappears from the helper
+// snapshot keeps serving a frozen total.
 func (m *Manager) SetFloodCounterOffset(zoneID uint16, fs FloodState) {
 	m.mu.Lock()
 	if m.floodCounterOffsets == nil {
 		m.floodCounterOffsets = make(map[uint16]FloodState)
 	}
 	m.floodCounterOffsets[zoneID] = fs
+	m.mu.Unlock()
+}
+
+// ReplaceFloodCounterOffsets atomically replaces the ENTIRE per-zone flood
+// offset map with the rows the helper published in this status poll (#3651).
+//
+// Replace, not merge, and the distinction is load-bearing — the exact same
+// argument as ReplaceZoneCounterOffsets. The helper's `zone_flood_counters`
+// block is a COMPLETE sparse set rebuilt from its store on every poll, not a
+// delta, so a zone absent from it is a zone the helper is no longer reporting
+// and the correct Go-side state is "not populated". SetFloodCounterOffset alone
+// can only ever ADD or overwrite, so a row that stops being published leaves its
+// last value stranded in the map and every read surface keeps serving a FROZEN
+// flood count indefinitely — a number that looks alive while under-reporting
+// every subsequent attack, which is strictly worse than an honest
+// "not available".
+//
+// Three ways a row legitimately disappears, all of which this handles:
+//
+//   - The zone lost its hot-path slot. Config apply carries the helper's store
+//     forward and retains still-configured zones, but a zone pushed past the
+//     helper's assignable slot capacity gets slot 0 and stops being counted; the
+//     helper drops it from the published set (coordinator zone_flood_counters).
+//     Its retained counts are stale from that moment on.
+//   - The zone was deleted from the config (helper-side reconcile drops it).
+//   - The helper restarted, was cleared (clear_flood_counters), or was
+//     downgraded to a build with no per-zone flood block. Its store is empty, so
+//     it publishes nothing, and nothing is what the Go side should report.
+//
+// An empty rows map therefore clears the offset map, which is correct in every
+// case above: "the helper published no per-zone flood counts" is exactly
+// ErrCounterNotPopulated. The sole call site (syncBPFCountersLocked) runs only
+// on a successfully decoded ProcessStatus, so an empty set here is a real
+// observation and never a failed fetch.
+func (m *Manager) ReplaceFloodCounterOffsets(rows map[uint16]FloodState) {
+	m.mu.Lock()
+	if len(rows) == 0 {
+		m.floodCounterOffsets = nil
+		m.mu.Unlock()
+		return
+	}
+	next := make(map[uint16]FloodState, len(rows))
+	for id, fs := range rows {
+		next[id] = fs
+	}
+	m.floodCounterOffsets = next
 	m.mu.Unlock()
 }
 

@@ -400,6 +400,22 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids, &store));
         state.zone_counter_store = store;
     }
+    // #3651: the same treatment for the per-zone FLOOD-event counters. Built
+    // from the identical `zone_ids` list, so the two families slot the same
+    // zones (see the FLOOD_COUNTER_SLOTS static assert). Separate store because
+    // the operator clears are separate families.
+    {
+        use crate::afxdp::flood_counters::{FloodCounterSlotMap, FloodCounterStore};
+        let zone_ids: Vec<u16> = snapshot.zones.iter().map(|z| z.id).collect();
+        let store = previous
+            .map(|p| p.flood_counter_store.clone())
+            .unwrap_or_else(FloodCounterStore::default);
+        let configured: rustc_hash::FxHashSet<u16> = zone_ids.iter().copied().collect();
+        store.reconcile(&configured);
+        state.flood_counter_slot_map =
+            std::sync::Arc::new(FloodCounterSlotMap::build(&zone_ids, &store));
+        state.flood_counter_store = store;
+    }
     // Build filter state from snapshot. #2505: this is fallible — an
     // unresolvable `from protocol` token raises a SnapshotIntegrityError that
     // propagates here, aborting the reconcile preflight (before teardown /

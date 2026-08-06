@@ -63,6 +63,29 @@ pub(crate) struct ZoneTrafficCounterStatus {
     pub egress_bytes: u64,
 }
 
+/// #3651: one per-zone flood-EVENT row inside the `ProcessStatus`-level
+/// `zone_flood_counters` sparse block — the sibling of
+/// [`ZoneTrafficCounterStatus`] for the other dead per-zone counter family.
+/// `zone_id` is the stable name-hash zone id (`StableZoneID`, matching
+/// `ZoneSnapshot.id`); the three counts are cumulative screen DROPS attributed
+/// to that zone for the `syn-flood`, `icmp-flood`, and `udp-flood` checks,
+/// since helper start (or the last `clear_flood_counters` IPC). The Go mirror
+/// is `ZoneFloodCounterStatus` with json tags
+/// `zone_id`/`syn_flood_events`/`icmp_flood_events`/`udp_flood_events`, which
+/// `syncBPFCountersLocked` maps onto `dataplane.FloodState`
+/// `SynCount`/`ICMPCount`/`UDPCount`.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct ZoneFloodCounterStatus {
+    #[serde(rename = "zone_id", default)]
+    pub zone_id: u16,
+    #[serde(rename = "syn_flood_events", default)]
+    pub syn_flood_events: u64,
+    #[serde(rename = "icmp_flood_events", default)]
+    pub icmp_flood_events: u64,
+    #[serde(rename = "udp_flood_events", default)]
+    pub udp_flood_events: u64,
+}
+
 /// Maximum accepted size, in bytes, of a single newline-delimited
 /// control-socket request body before it is decoded (#2523).
 ///
@@ -599,6 +622,34 @@ pub(crate) struct ProcessStatus {
     pub zone_counter_overflow_active: bool,
     #[serde(rename = "zone_traffic_counters", default)]
     pub zone_traffic_counters: Vec<ZoneTrafficCounterStatus>,
+    /// #3651: per-zone SYN/ICMP/UDP flood-EVENT counts, summed across every
+    /// worker by the helper (one `ProcessStatus`-level pre-summed sparse block,
+    /// one row per zone with nonzero flood drops, keyed by the stable zone id).
+    /// The Go control plane mirrors each row into the legacy
+    /// `dataplane.Manager` flood-counter offset map via
+    /// `ReplaceFloodCounterOffsets` (the whole map is replaced per poll, so a
+    /// zone the helper stops publishing stops being reported rather than
+    /// freezing at its last value), so `show security screen ids-option
+    /// statistics` reports live per-zone flood counts instead of
+    /// `ErrCounterNotPopulated` ("not available").
+    /// `flood_counter_layout_version` selects the decode path (0/absent =
+    /// helper with no per-zone flood accounting); a true
+    /// `flood_counter_overflow_active` means the configured zone count exceeded
+    /// the helper's dense slot capacity and some zones went uncounted.
+    #[serde(
+        rename = "flood_counter_layout_version",
+        default,
+        skip_serializing_if = "crate::protocol::u32_is_zero"
+    )]
+    pub flood_counter_layout_version: u32,
+    #[serde(
+        rename = "flood_counter_overflow_active",
+        default,
+        skip_serializing_if = "crate::protocol::bool_is_false"
+    )]
+    pub flood_counter_overflow_active: bool,
+    #[serde(rename = "zone_flood_counters", default)]
+    pub zone_flood_counters: Vec<ZoneFloodCounterStatus>,
     #[serde(rename = "three_color_policer_counters", default)]
     pub three_color_policer_counters: Vec<ThreeColorPolicerStatus>,
     #[serde(rename = "source_nat_pools", default)]

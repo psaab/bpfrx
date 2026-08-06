@@ -4188,6 +4188,7 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
     assertion (`left == right` 0 vs 2); restored → GREEN.
 - **File(s)**: userspace-dp/src/afxdp/coordinator/worker_manager.rs,
   userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/teardown.rs,
   userspace-dp/src/afxdp/coordinator/status.rs,
@@ -6842,6 +6843,7 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   a reload between them (Arc swap → `build_generation` advances) invalidates.
 - **File(s)**: userspace-dp/src/nat64.rs,
   userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/nat64_tests.rs, docs/feature-coverage.md
 - **Validation**: `cargo build` clean; 179 nat64 tests + full nat/forwarding/
@@ -69006,3 +69008,221 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-06 — #3651 per-zone FLOOD counters: populate the second half
+
+- **Timestamp**: 2026-08-06
+- **Action**: Close the deferred FLOOD half of #3651 (design of record:
+  `docs/research/3643-dead-counters/plan.md` §5A). `show security screen
+  ids-option statistics` rendered "Per-zone flood counters: not available" on
+  every zone because nothing sourced `dataplane.FloodState` — the #3643 HIDE
+  read-path fix shipped, the traffic half of POPULATE shipped, and the flood
+  half was explicitly deferred with `SetFloodCounterOffset` sourced only by
+  tests. Four parts:
+  1. **Rust tally.** New `userspace-dp/src/afxdp/flood_counters.rs` mirrors
+     `zone_counters.rs`: flat `[u8; 65536]` zone-id → slot LUT built from the
+     same configured zone set (a `const _: () = assert!(...)` pins the two
+     capacities equal, so a zone is slotted for both families or neither),
+     per-worker thread-local coalescer, lock-free per-RX-batch fold into
+     per-zone `AtomicU64` blocks the slot map cached at build time, sparse
+     snapshot, in-place `clear`, `reconcile`, and a `publishable_flood_rows`
+     filter that drops a zone that lost its slot (its retained counts can never
+     advance again — a frozen counter that looks alive). The tally is invoked
+     from INSIDE `BatchCounters::record_screen_drop`, which now takes the
+     ingress `zone_id` and the flood slot map, so the aggregate, the #3343
+     per-reason ordinal, and the per-zone family cannot drift at the many drop
+     sites. Deliberate departure from the §5A sketch: NOT a `fetch_add` at the
+     drop site. §5A called `record_screen_drop` "already off the fast path",
+     true of the forwarding path but not of load — a SYN flood IS the primary
+     `screen_drops` trigger, so at attack rate every worker would hammer the
+     ONE zone's cache line per packet, the #1187 constraint `stage_screen_check`
+     already documents for the aggregate.
+  2. **Wire.** One ProcessStatus-level pre-summed sparse block
+     `zone_flood_counters` (nonzero rows only) plus
+     `flood_counter_layout_version` / `flood_counter_overflow_active`, all
+     `#[serde(default)]` + `omitempty`, Rust `ZoneFloodCounterStatus` mirrored
+     by Go `ZoneFloodCounterStatus`. Golden wire fixture regenerated (additive).
+  3. **Go populate.** `Manager.ReplaceFloodCounterOffsets` (whole-map REPLACE,
+     never per-row set — a per-row setter can only add or overwrite, so a zone
+     the helper stops publishing keeps serving a FROZEN total forever), wired at
+     the SAME `syncBPFCountersLocked` poll site as `ReplaceZoneCounterOffsets`.
+  4. **Clear.** `clear_flood_counters` control IPC + helper reset handler, sent
+     from `Manager.ClearAllCounters` (the one-time operator path that already
+     drops the Go flood offsets). Clearing only the Go map snaps back within
+     <=1s. No new periodic control-socket caller.
+  Also corrected the now-false "per-zone flood accounting not implemented in the
+  userspace dataplane" cause clause on all four CLI/gRPC "not available" render
+  sites (the #6843 M3 lesson applied to the flood half).
+- **Validation**: four disjoint fail-on-revert cells, each verified firsthand as
+  an ASSERTION failure (never a build break):
+  (1) drop the `record_zone_flood_drop` call from `record_screen_drop` →
+  `record_screen_drop_attributes_flood_reasons_to_the_ingress_zone` panics
+  "trust zone must have per-zone flood counts after record_screen_drop", while
+  the over-reach guard `record_screen_drop_populates_per_reason_counters` stays
+  GREEN;
+  (2) rename the Go `syn_flood_events` json tag →
+  `TestZoneFloodCounterStatusWireRoundTrip` fails "Rust flood row mismatch:
+  {ZoneID:7 SynFloodEvents:0 ICMPFloodEvents:3 UDPFloodEvents:4}", and the
+  Rust-side twin (rename the serde tag) fails
+  `wire_invariant_default_specimens` "wire-format drift detected vs
+  protocol_wire_v1.json";
+  (3) swap the poll-site `ReplaceFloodCounterOffsets` for a per-row
+  `SetFloodCounterOffset` loop →
+  `TestSyncBPFCountersReplacesFloodOffsetsAcrossPolls3651` fails "the status
+  loop left a stale flood offset for a zone the helper stopped publishing
+  ({SynCount:90 ...}); want ErrCounterNotPopulated";
+  (4) drop `clearHelperFloodCountersLocked` from `ClearAllCounters` →
+  `TestClearAllCountersSendsFloodClearIPCAndIsDurable` fails "helper never
+  received the clear_flood_counters IPC".
+  `go build ./...` 0, `gofmt -l <touched>` clean,
+  `go test ./...` 0 (59 packages, zero FAIL), `cargo test --release --bins
+  --tests -- --test-threads=1` 0. All FOUR render paths that carry the reworded
+  cause clause (CLI single-zone + all-zones, gRPC text single-zone + all-zones)
+  now have both an unavailable-arm and a populated-arm test; the two single-zone
+  paths had no coverage at all before this change.
+  The disappearance fixture uses an ABSENT row in poll N+1, not a row reporting
+  0 -- "reported 0" and "not reported" are the two states the frozen-total bug
+  confuses, so a zero-valued fixture would pass with the defect present. (A
+  zero-valued row cannot occur anyway: FloodCounterStore::snapshot omits
+  all-zero rows at the source.)
+  No serialization guard is taken in the Rust tests, and that is deliberate:
+  there is NO process-global counter here (each test builds its own
+  FloodCounterStore), and the one piece of state that looks shared -- the
+  FLOOD_PENDING thread-local -- is per-test in practice. Verified rather than
+  assumed: a probe pair in which the first test recorded WITHOUT flushing and
+  the second flushed into a fresh store observed DISTINCT thread ids
+  (ThreadId(2)/ThreadId(3)) and ZERO leaked rows under --test-threads=1. A mutex
+  would protect nothing, so the finding is recorded in the test module's own doc
+  comment instead. Trial-merged onto master b8b39a16a in a scratch worktree
+  (master had moved from the e864bc9af base and touched afxdp/mod.rs): merged
+  Rust build 0, merged Go build 0, flood suites green on the merged result.
+
+  ROUND 2 (hostile review, B1 blocking, test-only additive): the Rust
+  COORDINATOR call site was unbound. `Coordinator::zone_flood_counters` had ZERO
+  test callers -- its only reference was the production wiring at
+  server/helpers/status.rs:321, while all 13 Rust flood tests drove the
+  `publishable_flood_rows` PRIMITIVE. A primitive test cannot see an over-reach
+  introduced at the coordinator, which is exactly the asymmetry #6843 closed on
+  the traffic half (its `zone_traffic_counters` accessor carries gates F1/R3 in
+  coordinator/tests.rs); the lesson had been learned on the Go plane and not
+  carried to Rust. Ported both gates as
+  `zone_flood_counters_drops_a_zone_that_lost_its_slot_3651`, mirroring the
+  traffic twin: apply 1 slots Z and publishes it; apply 2 exhausts capacity so Z
+  loses its slot while staying configured and RETAINING its counts (asserted, so
+  the test cannot pass by the data vanishing); a SURVIVOR that kept its slot must
+  keep publishing; then SURVIVOR is removed from the configured set and must stop.
+  THREE mutations, each verified firsthand as a DISTINCT assertion failure (cargo
+  exit 101 = assertion, never a compile error):
+    M1 `|zone_id| configured.contains_key(&zone_id)` -> `|_| true`
+       -> tests.rs:4869 "a zone dropped from the configured set kept publishing:
+       the configured predicate must hold independently of the slot predicate:
+       [ZoneFloodCounterStatus { zone_id: 1, ..., udp_flood_events: 1 }]"
+    M2 blanket `if overflow_active { return Vec::new(); }` (the #6843 F1
+       over-reach verbatim) -> tests.rs:4855 "a zone that KEPT its slot stopped
+       publishing once overflow became active: the filter must drop only the
+       zones that lost their slot, not everything: []"
+    M3 live slot map -> `FloodCounterSlotMap::default()` -> tests.rs:4802
+       "apply 1: the coordinator must publish a slotted zone with flood events
+       (a default/empty slot map publishes nothing): []"
+  Three different assertions catch the three mutations, so the cells are disjoint
+  rather than one assertion absorbing all of them. Round 2 changed NO production
+  code -- `git diff HEAD -- coordinator/mod.rs` is empty after restore.
+  NOT folded: the reviewer's non-blocking N1 (FloodPending::reset clears the full
+  1536 B on every touched flush; a dirty-slot bitmask would avoid it). It is a
+  hot-path change in a round whose blocker is test-only, and `ZonePending` in the
+  shipped traffic half has the IDENTICAL shape -- the two modules are
+  deliberately mirrored down to a static assert tying their capacities, so
+  optimising one alone creates an unexplained asymmetry -- worse, it leaves that
+  static assert implying the two are coupled when their hot paths have diverged.
+  Filed as ONE follow-up covering both accumulators: #6946 (touched-slot u64
+  bitmask shrinks BOTH the reset and the O(64) fold scan to O(touched), in both
+  modules, in the same commit).
+
+  ROUND 3 (re-gate at 3db17c318: MERGE-NEEDS-MINOR, zero runtime defects; F1 +
+  a NIT, both test-only).
+
+  F1 -- the CONFIG-APPLY block that PRODUCES both per-zone families was unbound.
+  `forwarding_build/mod.rs` is the only place `flood_counter_slot_map` /
+  `flood_counter_store` (and their traffic twins) are populated from a
+  ConfigSnapshot, and EVERY other test reference to those fields was a
+  hand-assignment -- so deleting either build block verbatim left the whole cargo
+  suite green. The undetected runtime consequence is total: an unbuilt slot map
+  is `empty()`, every zone resolves to slot 0, `record_zone_flood_drop` /
+  `record_zone_traffic` return at their `slot == 0` guard for every packet on
+  every zone, nothing publishes, and every surface reports
+  ErrCounterNotPopulated -- bit-for-bit the pre-#3651 state this work exists to
+  close, reachable with a green suite. NOT an asymmetry this PR introduced: the
+  already-merged TRAFFIC block at the same site is equally unbound, so this is an
+  inherited pattern and one test closes both cells.
+  `config_apply_builds_both_per_zone_counter_slot_maps_3651`
+  (forwarding_build/tests.rs) calls the real `build_forwarding_state` on a
+  two-zone snapshot and asserts BOTH families slot BOTH zones (two zones, because
+  a one-zone assertion passes on an off-by-one that slots only one), neither
+  claims overflow, and then -- second leg -- re-applies with `previous =
+  Some(&first)` after seeding a count and asserts the totals SURVIVE, which is
+  what makes per-zone counters survive a config commit.
+  TWO REDs, both clean assertions at tests.rs:5643, cargo exit 101:
+    delete the FLOOD build block   -> "config apply did not build the flood slot
+      map: zone TRUST resolves to slot 0, so every packet on it takes the
+      `slot == 0` early return and the zone can never publish -- the pre-#3651
+      not-populated state, with a green suite"  (left: 0)
+    delete the merged TRAFFIC block -> same assertion, "traffic" arm (left: 0)
+  So the one test kills the new cell AND the inherited one.
+
+  NIT -- `flood_reason_index_tracks_the_screen_reason_strings` asserted ORDINAL
+  EQUALITY (`flood_reason_index(r) == screen_reason_drop_index(r)`) while the
+  module doc says the match is deliberately independent. Reworded to
+  `is_some()` on both sides. The coupling was actively wrong, not just
+  inconsistent: the screen ordinals index a 15-wide Go-facing array while
+  `flood_reason_index` indexes a 3-wide accumulator whose layout IS the wire's
+  syn/icmp/udp triple, so a legitimate renumber of the screen ordinals would have
+  red HERE and invited "fixing" flood_reason_index -- silently permuting the
+  flood wire fields. Verified the reworded assertion still catches the hazard it
+  exists for: renaming "syn-flood" in screen/mod.rs REDs with "flood reason
+  \"syn-flood\" is no longer a known screen reason -- a rename in screen/mod.rs
+  has un-wired the per-zone flood tally while leaving the aggregate counting".
+
+  Round 3 changed NO production code: the delta is forwarding_build/tests.rs plus
+  a flood_counters.rs hunk proven (by line-offset check against the
+  `#[cfg(test)]` boundary at line 433) to lie entirely inside the test module.
+
+  PAYLOAD MEASUREMENT CORRECTED. My earlier "+24 B per 1/s status poll" had the
+  right size and the WRONG DENOMINATOR. `zone_flood_counters()` is called from
+  `refresh_status`, which has ~29 call sites -- including
+  server/handlers/session_deltas.rs, the bulk-session-sync path -- so the added
+  mutex acquisition and <=63-row Vec+sort ride EVERY control request that
+  refreshes status, not once per second. Correct statement: +24 B per status
+  REFRESH, ~29 refresh sites, <=8.5 KiB when 63 zones are populated. Magnitude
+  still trivial and NOT a new frequency class (the merged `zone_traffic_counters()`
+  sits on the identical path with the identical shape, so this doubles a small
+  existing per-refresh cost rather than introducing one) -- but a prediction with
+  the wrong denominator can be "falsified" by a result that is actually fine,
+  which is why the correction matters more than the number. N2 (counts lost if the loop exits between
+  record and flush, bounded by one batch) is inherent and matches the traffic
+  half; no action.
+- **File(s)**: userspace-dp/src/afxdp/flood_counters.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/tests_slow_path_disposition.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/helpers/status.rs, userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/maps_screen.go, pkg/dataplane/flood_counter_retention_3651_test.go,
+  pkg/dataplane/userspace/protocol_counters.go,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/floodcounters.go,
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/flood_counter_syncloop_3651_test.go,
+  pkg/dataplane/userspace/zone_flood_counters_status_test.go,
+  pkg/dataplane/userspace/flood_counter_clear_3651_test.go,
+  pkg/cli/cli_show_security_screen.go, pkg/cli/zone_flood_counters_hide_test.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/grpcapi/zone_flood_counters_hide_test.go, pkg/api/README.md,
+  docs/userspace-dataplane-gaps.md, docs/research/3643-dead-counters/plan.md,
+  _Log.md
