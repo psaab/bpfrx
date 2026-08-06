@@ -925,6 +925,54 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 round 7: I fixed the row I was looking at, not the premise
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The round-6 gate substantiated every runtime premise the round-6
+  edit asserted — all six checked at the cited file:line, zero runtime findings —
+  and then found that the edit itself was incomplete in exactly the way this
+  campaign keeps re-learning: **a symbol grep is not a premise sweep.** Round 6
+  corrected recovery row 2 and left nine other places restating the same refuted
+  claim in different words, including the row-3 TITLE seven lines below the
+  corrected row.
+  Fixed in this PR's own packages:
+  1. `README.md` row-3 title said "the only path that can work" immediately
+     after row 2 was changed to say an unarmed secondary has a writable store
+     and is OPEN. That was the fourth absolute in a section whose log already
+     records three refuted ones. Now "the only path you can PLAN for", with a
+     parenthetical saying why the distinction is not pedantic. The trailing
+     "It is the path that exists" went the same way.
+  2. The whole `### Rollout:` section (heading + mechanism bullets + conclusion)
+     asserted that a seated secondary cannot be keyed locally, cannot open
+     config mode, and that config-sync is its only writer — all true only where
+     the gate is ARMED. Restated with the precondition, plus an explicit
+     paragraph that arming comes from an RG0 transition event alone, so a
+     cold-started standby is writable and REST has no RG0 check (#6890, #6889).
+     Framed as a bug not to build on, not as a route.
+  3. That section also cited `Daemon.applyHAState`, which **does not exist** —
+     `grep -rn 'func.*applyHAState' pkg/` returns nothing. The real symbol is
+     `applyRG0OwnershipTransition`. Corrected at all three sites that named it.
+  4. "would create a permanent deadlock" -> "would deadlock with no
+     self-recovery", with the reason: the hypothetical destroys the cluster's
+     ability to converge on its own; an operator can still break it out of band.
+  5. "only the RG0 primary is writable" -> "treat only the RG0 primary as
+     writable (that is the intent; see the #6890 caveat)".
+  6. The stale pointer to the deleted heading "Recovery: exactly one path works".
+  7. `pkg/cluster/sync_auth.go` and
+     `pkg/daemon/cluster_transport_key_5078_test.go` carried structural mirrors
+     of the same sentence, both naming the nonexistent `applyHAState`. Both
+     rewritten; both changes are comment-only, verified by filtering the diff to
+     non-comment lines (empty).
+  Deliberately NOT fixed here: `pkg/configstore/README.md`,
+  `docs/feature-coverage.md` and `docs/phases.md` carry the same premise in
+  other packages' docs. Widening a round-7 PR into three unrelated doc trees is
+  how a fold introduces a regression; filed separately instead.
+- **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_auth.go,
+  pkg/daemon/cluster_transport_key_5078_test.go, _Log.md
+- **Validation**: `go build ./...` rc=0; `go test ./pkg/cluster ./pkg/daemon
+  ./pkg/configstore -count=1` rc=0 (all three `ok`); `gofmt -l` clean on both
+  touched Go files; premise sweep `grep -rn` over `pkg/` for six distinct
+  phrasings returns nothing.
 ## 2026-08-05 — #6865 round 6: row 2 was still categorical, and the doc already knew why
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)

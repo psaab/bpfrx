@@ -265,11 +265,16 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // is "before the guard arms".
 //
 // There is deliberately NO relaxation knob — but the rollout constraint is
-// sharper than an earlier revision of this comment claimed. A seated RG0
-// secondary CANNOT be keyed locally: applyHAState sets the store read-only on
+// sharper than an earlier revision of this comment claimed. An RG0 secondary
+// whose read-only gate is ARMED cannot be keyed locally:
+// applyRG0OwnershipTransition sets the store read-only on
 // StateSecondary/StateSecondaryHold and EnterConfigureSession then returns
-// ErrClusterReadOnly, so config-sync is the secondary's only writer. Keying a
-// LIVE cluster therefore means committing on the PRIMARY while sync is
+// ErrClusterReadOnly, so config-sync is that node's only writer. Arming is
+// driven by an RG0 TRANSITION event and nothing else, so a node that
+// cold-starts into secondary and never transitions is still writable, and REST
+// has no RG0 check of its own — see #6890 (and #6889 for the dropped-event
+// variant). Both are being closed; do not design a rollout around either.
+// Keying a LIVE cluster therefore means committing on the PRIMARY while sync is
 // connected and letting the established connection carry the key across — which
 // works only because the auth key is absent from clusterTransportKey, so a key
 // commit does not restart cluster comms (pinned by

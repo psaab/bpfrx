@@ -19,11 +19,15 @@ import (
 // tearing down and rebuilding heartbeat + session sync; the auth key is
 // deliberately absent, so a key commit leaves the established connection up.
 //
-// Why that matters now. A seated RG0 secondary CANNOT be configured locally:
-// `Daemon.applyHAState` calls `store.SetClusterReadOnly(true)` on
-// StateSecondary/StateSecondaryHold, and `EnterConfigureSession` then returns
-// ErrClusterReadOnly before doing anything else. Config-sync is the secondary's
-// only writer. So the ONLY way to key a live cluster is to commit on the
+// Why that matters now. An RG0 secondary whose read-only gate is ARMED cannot
+// be configured locally: `applyRG0OwnershipTransition` calls
+// `store.SetClusterReadOnly(true)` on StateSecondary/StateSecondaryHold, and
+// `EnterConfigureSession` then returns ErrClusterReadOnly before doing anything
+// else. Config-sync is that node's only writer. Arming comes from an RG0
+// TRANSITION event alone, so a cold-started standby that never transitioned is
+// writable and REST has no RG0 check — #6890, with #6889 the dropped-event
+// variant. Those are bugs being closed, not routes. So the supported way to key
+// a live cluster is to commit on the
 // primary while sync is connected and let the existing connection carry the key
 // across. If a key change restarted comms, the primary would drop the
 // connection at the moment it became keyed, the secondary would still be

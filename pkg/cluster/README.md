@@ -233,22 +233,35 @@ closes the hole, so it was removed.
 What remains is the property a security appliance should have: **a node must
 possess the key to join a keyed cluster.**
 
-### Rollout: a seated secondary CANNOT be keyed locally
+### Rollout: a secondary whose gate is ARMED cannot be keyed locally
 
-Two earlier revisions of this document got this wrong in opposite directions —
+Three earlier revisions of this document got this wrong in three directions —
 first claiming an unavoidable deadlock, then claiming the operator can simply
-"commit the key locally on each node". Neither is right, and the second is not
-performable:
+"commit the key locally on each node", then claiming the gate covers every entry
+point unconditionally. The mechanism, stated with its precondition:
 
-- `Daemon.applyHAState` calls `store.SetClusterReadOnly(true)` on
-  `StateSecondary` / `StateSecondaryHold` (`pkg/daemon/daemon_ha.go`).
-- `EnterConfigureSession` then returns `ErrClusterReadOnly` before doing
-  anything else (`pkg/configstore/store_lock.go`).
+- `applyRG0OwnershipTransition` calls `store.SetClusterReadOnly(true)` on
+  `StateSecondary` / `StateSecondaryHold` (`pkg/daemon/daemon_ha.go`). It is
+  driven by an RG0 **transition event** and by nothing else — there is no
+  startup arming and no reconcile that re-derives the flag.
+- Once armed, `EnterConfigureSession` returns `ErrClusterReadOnly` before doing
+  anything else (`pkg/configstore/store_lock.go`), whichever entry point the
+  operator used.
 
-So an operator cannot even open config mode on a seated RG0 secondary — this is
-not "the local commit gets overwritten by sync". **Config-sync is the
-secondary's only writer** (`TestClusterReadOnly_SyncApplyBypassesGate` pins that
+So on a secondary whose gate is armed, config mode cannot be opened at all —
+this is not "the local commit gets overwritten by sync", and **config-sync is
+that node's only writer** (`TestClusterReadOnly_SyncApplyBypassesGate` pins that
 the HA-sync ingress path bypasses the gate).
+
+**But arming is not universal, so do not read the heading as unconditional.** A
+node that cold-starts, seats as RG0 secondary and never transitions never
+reaches that call, and `Store.clusterReadOnly` starts false — so its store is
+writable. REST enters a configure session with no RG0 check of its own
+(`pkg/api/config.go`), where gRPC guards on `IsLocalPrimary(0)` and the
+interactive CLI has its own check. That gap is **#6890**; the dropped-event
+variant is **#6889**. Both are being closed. The design intent is what this
+section describes; treat the gap as a bug to avoid, never as a rollout
+procedure.
 
 **Performable procedures:**
 
@@ -260,7 +273,11 @@ the HA-sync ingress path bypasses the gate).
    because committing the key does not restart cluster comms — the auth key is
    deliberately absent from `clusterTransportKey`, pinned by
    `TestAuthKeyChangeDoesNotRestartClusterComms_5078`. Do not add it there; see
-   that test for why it would create a permanent deadlock. The step-20 decision
+   that test for why it would deadlock with no self-recovery. ("Deadlock", not
+   "permanent deadlock" — an operator can still break it out of band, by the
+   controlled promotion in row 3 or, on a node whose gate was never armed, by
+   the #6890 hole. What the hypothetical destroys is the cluster's ability to
+   converge on its own.) The step-20 decision
    that must not fire on a key change is pinned separately by
    `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078` — the struct test alone
    does not cover the call site.
@@ -303,8 +320,10 @@ than summarised into a verdict:
    Tracked as **#6890**; the dropped-event variant of the same unarmed-gate
    failure is **#6889**. Do not treat this row as CLOSED on a node whose RG0
    state you have not checked.
-3. **Controlled RG0 promotion — the only path that can work, and it is
-   CONDITIONAL.** Stop `xpfd` on the keyed primary; *if* the secondary wins the
+3. **Controlled RG0 promotion — the only path you can PLAN for, and it is
+   CONDITIONAL.** ("Plan for", not "that works": row 2 is open on an unarmed
+   node, so a path exists there too — it is just a bug you must not build a
+   procedure on.) Stop `xpfd` on the keyed primary; *if* the secondary wins the
    election, `applyRG0OwnershipTransition(StatePrimary)` calls
    `d.store.SetClusterReadOnly(false)` and the now-primary node accepts a local
    commit of the same key. Restart the old primary and the pair converges keyed.
@@ -324,8 +343,9 @@ than summarised into a verdict:
    never closed on that node, so the recovery was never needed there. It is
    listed under row 2, where it belongs, rather than padding this list.)
 
-   So do not read this row as a procedure. It is the path that exists; whether
-   it is available on a given cluster at a given moment depends on both.
+   So do not read this row as a procedure. It is the path you would design
+   around; whether it is available on a given cluster at a given moment depends
+   on both preconditions above.
 
 So the recovery you can actually plan for is a deliberate cluster failover —
 you have turned a config commit into an outage. (A node that happens to fall in
@@ -802,8 +822,10 @@ A physical cut also races disconnect detection, so a promotion issued
 immediately after it can still find the session established.
 
 Once BOTH nodes have sync disabled, ongoing config management is manual and
-paired: only the RG0 primary is writable, so every change is a controlled
-RG0 promotion, an edit, verification on both stores, and a failback. That
+paired: treat only the RG0 primary as writable (that is the intent; see the
+#6890 caveat above for where the gate is not actually armed), so every change is
+a controlled RG0 promotion, an edit, verification on both stores, and a
+failback. That
 cost is the reason #6629 (redaction or transport encryption for the
 config-sync payload) is the real fix, and why this is documented as a
 constraint rather than recommended practice.
@@ -812,11 +834,11 @@ constraint rather than recommended practice.
 
 **STALE — dual-accept was removed by #5078; the sequence below no longer works
 as written.** It is kept for the shape of the problem, not as a procedure. Step 2
-asks the operator to commit the key on the *other* node: on a seated RG0
-secondary that returns `ErrClusterReadOnly`, and if sync drops before step 2 the
-keyed side rejects the unkeyed reconnect outright. See "Recovery: exactly one
-path works" above for what is actually available. Rewriting this section is
-tracked as **#6881**.
+asks the operator to commit the key on the *other* node: on an RG0 secondary
+whose read-only gate is armed that returns `ErrClusterReadOnly`, and if sync
+drops before step 2 the keyed side rejects the unkeyed reconnect outright. See
+the "Recovery" discussion above for what is actually available and under which
+preconditions. Rewriting this section is tracked as **#6881**.
 
 Dual-accept made the forward direction non-disruptive:
 
