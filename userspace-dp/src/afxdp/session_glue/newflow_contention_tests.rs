@@ -14,11 +14,19 @@
 //
 // NOTE on process-global statics: these counters are process-wide, and cargo
 // runs tests in parallel inside one process, so a sibling test that publishes
-// or replicates can inflate any reading taken here. Every assertion is
-// therefore a DELTA with a `>=` bound in the direction pollution can only
-// push — never an equality on an absolute value. That is deliberate: an
-// equality here would be a flake generator (#6819), and `>=` still binds,
-// because under the revert the counters never move at all and the delta is 0.
+// or replicates can inflate any reading taken here. Two disciplines keep that
+// from becoming a flake generator (#6819):
+//
+//   * PUBLISH-side assertions are DELTAS with a `>=` bound in the direction
+//     pollution can only push. Never an equality on an absolute value. `>=`
+//     still binds, because under the revert the counters do not move at all
+//     and the delta is 0.
+//   * REPLICATION-side assertions may be exact, but only because
+//     `replication_counter_test_guard` below serializes every test in the
+//     process that touches those counters. Exactness is required there: a
+//     `>=` bound cannot distinguish the per-call WORST sibling depth from the
+//     sum ACROSS siblings, and getting that wrong inflates the analyzer's
+//     mean by the fan-out so every run reads as backlogged.
 
 use super::*;
 use crate::afxdp::shared_ops::{
@@ -31,6 +39,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const PROTO_TCP_LOCAL: u8 = 6;
 const TCP_FLAG_ACK_LOCAL: u8 = 0x10;
+
+/// Serialize every test that READS the process-global replication counters
+/// against every test that MOVES them.
+///
+/// The counters are process-wide and cargo runs tests in parallel inside one
+/// process, so a sibling test replicating a session between two readings
+/// turns an exact delta into a flake (#6819). The depth-sum assertions need
+/// exactness: a `>=` bound cannot distinguish the per-call WORST sibling
+/// depth from the sum ACROSS siblings, and confusing those inflates the
+/// analyzer's mean by the fan-out so every run reads as backlogged.
+///
+/// EVERY test that calls `replicate_session_upsert` or
+/// `replicate_session_delete` must hold this guard, not only the ones that
+/// assert on a counter — a mover without the guard defeats it just as
+/// thoroughly as a reader without it. Today that is this file plus the two
+/// poisoned-queue tests in `tests.rs`, which reach it as
+/// `super::newflow_contention_tests::replication_counter_test_guard()`.
+pub(super) fn replication_counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn key(src_port: u16) -> SessionKey {
     SessionKey {
@@ -150,6 +179,7 @@ struct ReplicationCounters {
     upserts: u64,
     enqueued: u64,
     contended: u64,
+    depth_sum: u64,
     depth_max: u64,
 }
 
@@ -158,6 +188,7 @@ fn replication_counters() -> ReplicationCounters {
         upserts: SESSION_REPLICATION_UPSERTS.load(Ordering::Relaxed),
         enqueued: SESSION_REPLICATION_ENQUEUED.load(Ordering::Relaxed),
         contended: SESSION_REPLICATION_LOCK_CONTENDED.load(Ordering::Relaxed),
+        depth_sum: SESSION_REPLICATION_QUEUE_DEPTH_SUM.load(Ordering::Relaxed),
         depth_max: SESSION_REPLICATION_QUEUE_DEPTH_MAX.load(Ordering::Relaxed),
     }
 }
@@ -297,6 +328,9 @@ fn remove_shared_session_is_not_counted_as_a_publish() {
 /// leaves every delta at 0 and the fan-out assertion fails on its message.
 #[test]
 fn replicate_session_upsert_counts_fanout_and_queue_depth() {
+    // #4800: serialize against every other test that moves the
+    // process-global replication counters (#6819 flake class).
+    let _g = replication_counter_test_guard();
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..3)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
@@ -340,6 +374,9 @@ fn replicate_session_upsert_counts_fanout_and_queue_depth() {
 /// assertion fails on its message.
 #[test]
 fn replicate_session_upsert_counts_a_blocked_enqueue() {
+    // #4800: serialize against every other test that moves the
+    // process-global replication counters (#6819 flake class).
+    let _g = replication_counter_test_guard();
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
@@ -380,16 +417,118 @@ fn replicate_session_upsert_counts_a_blocked_enqueue() {
     );
 }
 
-/// The depth high-water must actually track a BACKLOG, not just report 1 for
-/// every push. A queue that already holds undrained commands is exactly the
-/// "consumer is not keeping up" condition the depth counter exists to
-/// distinguish from mutex contention, so pushing onto a pre-loaded queue must
-/// move the high-water above what an empty queue produces.
+/// The depth SUM is the differenceable backlog statistic — the only one the
+/// analysis layer may key a verdict on.
+///
+/// The high-water max next to it is a process-lifetime `fetch_max`: it never
+/// falls, so across any window `after - before == 0` spans everything from
+/// "no backlog" to "a backlog up to the previous all-time high", and one
+/// spike leaves the absolute value elevated for the life of the helper.
+/// Reading it as a window value made every cell after the first spike report
+/// a replication backlog. The SUM carries no history: divided by the upsert
+/// count over the same window it is the mean worst-sibling depth for THAT
+/// window and nothing else.
+///
+/// RED on revert: dropping the `fetch_add` leaves the sum at 0 and the
+/// backlog assertion fails on its message.
+#[test]
+fn replicate_session_upsert_depth_sum_accumulates_per_call_backlog() {
+    // #4800: serialize against every other test that moves the
+    // process-global replication counters (#6819 flake class).
+    let _g = replication_counter_test_guard();
+    let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..3)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+
+    // Seed an uneven backlog: the SUM must take the per-call MAX across
+    // siblings (the worst one), not their total, so the mean it feeds is a
+    // depth and not a depth-times-fanout.
+    for (i, depth) in [3usize, 11, 7].iter().enumerate() {
+        let mut q = queues[i].lock().expect("seed queue");
+        for n in 0..*depth {
+            q.push_back(WorkerCommand::UpsertSynced(entry(60_000 + n as u16)));
+        }
+    }
+
+    let before = replication_counters();
+    replicate_session_upsert(&queues, &entry(40007));
+    let after = replication_counters();
+
+    // Post-push depths are 4 / 12 / 8; the worst is 12.
+    // Exact, and sound because the guard above excludes every concurrent
+    // mover of this counter.
+    assert_eq!(
+        after.depth_sum - before.depth_sum,
+        12,
+        "the depth sum must accumulate the per-call WORST sibling depth (12), \
+         not the sum across siblings (24) — otherwise the mean the analyzer \
+         derives is inflated by the fan-out and every run looks backlogged"
+    );
+    assert_eq!(
+        after.upserts - before.upserts,
+        1,
+        "one call, so sum/upserts is exactly the worst-sibling depth"
+    );
+}
+
+/// OVER-REACH GUARD for the counter shapes themselves: the SUM must keep
+/// rising across calls (it is a running total) while the MAX must NOT rise
+/// when a later call is shallower than an earlier one (it is a high-water).
+/// Getting these backwards is what produced the stale-verdict bug: a
+/// "max" that accumulated, or a "sum" that saturated, would each break the
+/// analyzer's differencing in a way that reads as a real backlog.
+///
+/// Stays GREEN under the revert of either counter's update (both deltas go
+/// to zero, and zero is neither a rise nor a spurious rise).
+#[test]
+fn depth_sum_accumulates_while_depth_max_stays_a_high_water() {
+    // #4800: serialize against every other test that moves the
+    // process-global replication counters (#6819 flake class).
+    let _g = replication_counter_test_guard();
+    let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> =
+        vec![Arc::new(Mutex::new(VecDeque::new()))];
+
+    // Deep call first: seeds a high high-water.
+    {
+        let mut q = queues[0].lock().expect("seed queue");
+        for n in 0..200 {
+            q.push_back(WorkerCommand::UpsertSynced(entry(61_000 + n as u16)));
+        }
+    }
+    replicate_session_upsert(&queues, &entry(40008));
+    let after_deep = replication_counters();
+
+    // Now drain to empty and replicate again — a SHALLOW call.
+    queues[0].lock().expect("drain queue").clear();
+    replicate_session_upsert(&queues, &entry(40009));
+    let after_shallow = replication_counters();
+
+    assert!(
+        after_shallow.depth_sum > after_deep.depth_sum,
+        "the SUM must keep accumulating on every call ({} -> {})",
+        after_deep.depth_sum,
+        after_shallow.depth_sum
+    );
+    assert_eq!(
+        after_shallow.depth_max, after_deep.depth_max,
+        "the MAX is a high-water: a shallower later call must not move it. \
+         (It also must not FALL — which is exactly why it cannot be \
+         differenced across a window, and why the analyzer keys the backlog \
+         verdict on the sum instead.)"
+    );
+}
+
+/// The high-water max must actually track a BACKLOG, not just report 1 for
+/// every push — a max that never exceeds 1 would be useless even as the
+/// operator gauge it is kept for.
 ///
 /// RED on revert: without the `fetch_max` the high-water never rises and the
 /// assertion fails on its message.
 #[test]
 fn replicate_session_upsert_depth_high_water_tracks_backlog() {
+    // #4800: serialize against every other test that moves the
+    // process-global replication counters (#6819 flake class).
+    let _g = replication_counter_test_guard();
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..1)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
@@ -430,6 +569,9 @@ fn replicate_session_upsert_depth_high_water_tracks_backlog() {
 /// nothing" still holds).
 #[test]
 fn replicate_session_delete_is_not_counted_as_an_upsert() {
+    // #4800: serialize against every other test that moves the
+    // process-global replication counters (#6819 flake class).
+    let _g = replication_counter_test_guard();
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..3)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();

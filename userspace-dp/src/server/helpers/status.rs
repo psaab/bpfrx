@@ -103,6 +103,8 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.afxdp.session_replication_enqueued_total();
     state.status.session_replication_lock_contended_total =
         state.afxdp.session_replication_lock_contended_total();
+    state.status.session_replication_queue_depth_sum =
+        state.afxdp.session_replication_queue_depth_sum();
     state.status.session_replication_queue_depth_max =
         state.afxdp.session_replication_queue_depth_max();
     // #2244: total failed dnat_table reverse-SNAT BPF-map publishes. The

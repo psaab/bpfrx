@@ -116,15 +116,29 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"excluded (#4800).",
 		nil, nil,
 	)
+	c.userspaceSessionReplicationQueueDepthSum = prometheus.NewDesc(
+		"xpf_userspace_session_replication_queue_depth_sum",
+		"Sum of the per-call deepest sibling command-queue depth observed at "+
+			"session-replication push time. Divided by "+
+			"..._replication_upserts_total over the same window this is the "+
+			"MEAN worst-sibling depth per replicated flow — the "+
+			"differenceable backlog statistic, and the only depth reading a "+
+			"verdict may rest on. DEPTH says the consuming worker is not "+
+			"draining as fast as producers enqueue, which is a different "+
+			"failure from producers colliding on the queue mutex and has a "+
+			"different remedy (#4800).",
+		nil, nil,
+	)
 	c.userspaceSessionReplicationQueueDepthMax = prometheus.NewDesc(
 		"xpf_userspace_session_replication_queue_depth_max",
-		"Monotonic HIGH-WATER sibling command-queue depth observed at "+
-			"session-replication push time. A GAUGE, never reset — do not "+
-			"rate() it. Contention says producers collided on the queue "+
-			"mutex; DEPTH says the consuming worker is not draining as fast "+
-			"as producers enqueue. Distinct failure modes with distinct "+
-			"remedies, and the pair is what separates \"replication is the "+
-			"bottleneck\" from \"replication is merely busy\" (#4800).",
+		"Monotonic PROCESS-LIFETIME high-water sibling command-queue depth "+
+			"observed at session-replication push time. OPERATOR CONTEXT "+
+			"ONLY. Do not rate() it, and do not difference it either: it "+
+			"cannot fall, so a zero delta means \"no backlog\" OR \"a "+
+			"backlog up to the previous all-time high\", and one spike "+
+			"leaves the absolute value elevated for the life of the helper. "+
+			"Use ..._queue_depth_sum / ..._upserts_total for any per-window "+
+			"backlog question (#4800).",
 		nil, nil,
 	)
 	c.userspaceSessionPublishErrors = prometheus.NewDesc(

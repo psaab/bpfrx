@@ -879,12 +879,39 @@ pub(crate) static SESSION_REPLICATION_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 /// enqueue).
 pub(crate) static SESSION_REPLICATION_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
 
+/// #4800: sum of the per-call deepest sibling-queue depth observed at
+/// replication push time. Divided by `SESSION_REPLICATION_UPSERTS` over the
+/// same window this is the MEAN worst-sibling depth per replicated flow —
+/// the queue-backlog statistic the analysis layer actually uses.
+///
+/// This exists because the high-water max below CANNOT be differenced. A
+/// process-lifetime `fetch_max` never falls, so across any window
+/// `after - before == 0` means either "no backlog" or "a backlog up to the
+/// previous all-time high" — ambiguous over the entire useful range — while
+/// the absolute value stays elevated forever after one spike. Reading the
+/// max as a window value made every cell after the first spike report a
+/// replication backlog, which is exactly the site the #2852 Phase-2
+/// decision turns on: a systematic bias toward the wrong answer. A SUM is
+/// differenceable by construction and carries no history into the next
+/// window.
+///
+/// Contention and depth remain distinct findings: contention says producers
+/// collided on the mutex, depth says the consuming worker is not draining as
+/// fast as producers enqueue. Different failures, different remedies.
+///
+/// Accumulated once per call (the max across this call's siblings) rather
+/// than once per enqueue, so the cost stays O(1) in the sibling count.
+pub(crate) static SESSION_REPLICATION_QUEUE_DEPTH_SUM: AtomicU64 = AtomicU64::new(0);
+
 /// #4800: high-water sibling-queue depth observed at replication push time
-/// (monotonic max, never reset). Contention says workers collided on the
-/// mutex; DEPTH says the consuming worker is not draining as fast as the
-/// producers enqueue — a different failure mode with a different fix, and
-/// the one that distinguishes "replication is the bottleneck" from
-/// "replication is merely busy".
+/// (monotonic max, never reset).
+///
+/// OPERATOR GAUGE ONLY — "the deepest this queue has ever been since the
+/// helper started". It is deliberately NOT an input to any harness verdict:
+/// see `SESSION_REPLICATION_QUEUE_DEPTH_SUM` above for why a lifetime max
+/// cannot answer a per-window question. Do not wire it back into an
+/// attribution; `newflow_ceiling_analyze.py` has a guard test asserting it
+/// cannot produce a culprit.
 ///
 /// Sampled once per call (the max across this call's siblings) rather than
 /// once per enqueue, so the cost is O(1) in the sibling count.
@@ -909,6 +936,9 @@ pub(super) fn replicate_session_upsert(
         deepest = deepest.max(pending.len() as u64);
     }
     if deepest != 0 {
+        // The SUM is the differenceable statistic the harness reads; the MAX
+        // is the operator's all-time high-water and is never a verdict input.
+        SESSION_REPLICATION_QUEUE_DEPTH_SUM.fetch_add(deepest, Ordering::Relaxed);
         SESSION_REPLICATION_QUEUE_DEPTH_MAX.fetch_max(deepest, Ordering::Relaxed);
     }
 }

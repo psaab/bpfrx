@@ -223,6 +223,10 @@ impl super::Coordinator {
         crate::afxdp::session_glue::SESSION_REPLICATION_LOCK_CONTENDED.load(Ordering::Relaxed)
     }
 
+    pub fn session_replication_queue_depth_sum(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_QUEUE_DEPTH_SUM.load(Ordering::Relaxed)
+    }
+
     pub fn session_replication_queue_depth_max(&self) -> u64 {
         crate::afxdp::session_glue::SESSION_REPLICATION_QUEUE_DEPTH_MAX.load(Ordering::Relaxed)
     }

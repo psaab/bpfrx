@@ -895,6 +895,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceSessionReplicationQueueDepthSum: prometheus.NewDesc(
+			"xpf_userspace_session_replication_queue_depth_sum",
+			"session replication queue depth sum",
+			nil,
+			nil,
+		),
 		userspaceSessionReplicationQueueDepthMax: prometheus.NewDesc(
 			"xpf_userspace_session_replication_queue_depth_max",
 			"session replication queue depth high-water",
@@ -1046,6 +1052,7 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		SessionReplicationUpsertsTotal:            109,
 		SessionReplicationEnqueuedTotal:           113,
 		SessionReplicationLockContendedTotal:      127,
+		SessionReplicationQueueDepthSum:           137,
 		SessionReplicationQueueDepthMax:           131,
 		// #2244: dnat_table reverse-NAT publish-error counter emitted
 		// unconditionally.
@@ -1144,9 +1151,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// synced_import_cap_drops_total counter (= 30) + the #4800 new-flow
 	// contention surface (publish call count + publish lock pair +
 	// replication upserts/enqueued/contended + replication queue depth
-	// high-water = 7) = 37.
-	if len(got) != 37 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 37 metrics, got %d", len(got))
+	// high-water = 7, plus the depth SUM added when the lifetime max was
+	// demoted to operator context = 8) = 38.
+	if len(got) != 38 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 38 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -1167,8 +1175,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceSessionReplicationUpserts, nil, 109)
 	assertCounterClose(t, got, c.userspaceSessionReplicationEnqueued, nil, 113)
 	assertCounterClose(t, got, c.userspaceSessionReplicationLockBlocked, nil, 127)
-	// Depth is a high-water GAUGE, not a counter — asserted as such so a
-	// future change to CounterValue is caught here.
+	// The depth SUM is a COUNTER (differenceable — the analyzer's backlog
+	// input); the lifetime max is a GAUGE. Asserted as their distinct types
+	// so swapping them is caught here: differencing a high-water gauge is
+	// exactly the defect that made every cell after one spike report a
+	// replication backlog.
+	assertCounterClose(t, got, c.userspaceSessionReplicationQueueDepthSum, nil, 137)
 	assertGaugeClose(t, got, c.userspaceSessionReplicationQueueDepthMax, nil, 131)
 	// #2244: dnat_table reverse-NAT publish-error counter emitted
 	// unconditionally.

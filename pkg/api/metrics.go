@@ -383,6 +383,7 @@ type xpfCollector struct {
 	userspaceSessionReplicationUpserts        *prometheus.Desc
 	userspaceSessionReplicationEnqueued       *prometheus.Desc
 	userspaceSessionReplicationLockBlocked    *prometheus.Desc
+	userspaceSessionReplicationQueueDepthSum  *prometheus.Desc
 	userspaceSessionReplicationQueueDepthMax  *prometheus.Desc
 	userspaceSessionCreateDrops               *prometheus.Desc
 	userspaceSessionInstallAdmissionRefused   *prometheus.Desc
@@ -816,6 +817,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSessionReplicationUpserts
 	ch <- c.userspaceSessionReplicationEnqueued
 	ch <- c.userspaceSessionReplicationLockBlocked
+	ch <- c.userspaceSessionReplicationQueueDepthSum
 	ch <- c.userspaceSessionReplicationQueueDepthMax
 	ch <- c.userspaceSessionCreateDrops
 	ch <- c.userspaceSessionInstallAdmissionRefused

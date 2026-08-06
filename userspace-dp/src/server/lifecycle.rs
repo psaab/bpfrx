@@ -233,6 +233,7 @@ pub(crate) fn run() -> Result<(), String> {
             session_replication_upserts_total: 0,
             session_replication_enqueued_total: 0,
             session_replication_lock_contended_total: 0,
+            session_replication_queue_depth_sum: 0,
             session_replication_queue_depth_max: 0,
             dnat_publish_errors_total: 0,
             synced_import_cap_drops_total: 0,

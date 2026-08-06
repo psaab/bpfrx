@@ -4629,6 +4629,9 @@ fn apply_worker_commands_recovers_poisoned_queue_and_processes_commands() {
 
 #[test]
 fn replicate_session_upsert_delivers_to_poisoned_queue() {
+    // #4800: hold the replication-counter guard — this test MOVES the
+    // process-global counters that newflow_contention_tests asserts on.
+    let _g = super::newflow_contention_tests::replication_counter_test_guard();
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
@@ -4652,6 +4655,9 @@ fn replicate_session_upsert_delivers_to_poisoned_queue() {
 
 #[test]
 fn replicate_session_delete_delivers_to_poisoned_queue() {
+    // #4800: hold the replication-counter guard — this test MOVES the
+    // process-global counters that newflow_contention_tests asserts on.
+    let _g = super::newflow_contention_tests::replication_counter_test_guard();
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();

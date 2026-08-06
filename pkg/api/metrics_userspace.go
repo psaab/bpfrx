@@ -707,6 +707,11 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SessionReplicationLockContendedTotal),
 	)
 	ch <- prometheus.MustNewConstMetric(
+		c.userspaceSessionReplicationQueueDepthSum,
+		prometheus.CounterValue,
+		float64(status.SessionReplicationQueueDepthSum),
+	)
+	ch <- prometheus.MustNewConstMetric(
 		c.userspaceSessionReplicationQueueDepthMax,
 		prometheus.GaugeValue,
 		float64(status.SessionReplicationQueueDepthMax),

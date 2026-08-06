@@ -258,10 +258,19 @@ type ProcessStatus struct {
 	// rate and, as Enqueued/Upserts, the N-way sibling fan-out multiplier.
 	// SessionReplicationLockContendedTotal is the blocked subset of those
 	// enqueues (denominator: Enqueued).
-	// SessionReplicationQueueDepthMax is a MONOTONIC HIGH-WATER GAUGE, not
-	// a counter — never rate() it. Contention means producers collided on
-	// the queue mutex; depth means the consuming worker is not draining as
-	// fast as producers enqueue. Different failure modes, different fixes.
+	// SessionReplicationQueueDepthSum accumulates the per-call deepest
+	// sibling-queue depth. Divided by SessionReplicationUpsertsTotal over
+	// the same window it is the MEAN worst-sibling depth per replicated
+	// flow — the differenceable backlog statistic, and the only one any
+	// verdict may rest on.
+	// SessionReplicationQueueDepthMax is a MONOTONIC PROCESS-LIFETIME
+	// high-water gauge — never rate() it, and never difference it either:
+	// it cannot fall, so a zero delta means "no backlog" OR "a backlog up
+	// to the previous all-time high", and one spike leaves the absolute
+	// value elevated for the life of the helper. It is operator context
+	// only. Contention means producers collided on the queue mutex; depth
+	// means the consuming worker is not draining as fast as producers
+	// enqueue. Different failure modes, different fixes.
 	//
 	// The NAT-allocator leg of the same question is per pool and lives on
 	// SourceNATPoolStatus.LiveLock*, not here. Omitempty for wire compat
@@ -273,6 +282,7 @@ type ProcessStatus struct {
 	SessionReplicationUpsertsTotal            uint64 `json:"session_replication_upserts_total,omitempty"`
 	SessionReplicationEnqueuedTotal           uint64 `json:"session_replication_enqueued_total,omitempty"`
 	SessionReplicationLockContendedTotal      uint64 `json:"session_replication_lock_contended_total,omitempty"`
+	SessionReplicationQueueDepthSum           uint64 `json:"session_replication_queue_depth_sum,omitempty"`
 	SessionReplicationQueueDepthMax           uint64 `json:"session_replication_queue_depth_max,omitempty"`
 	// DnatPublishErrorsTotal counts failed dnat_table reverse-SNAT BPF-map
 	// publishes across userspace workers (#2244). The dnat_table is the
