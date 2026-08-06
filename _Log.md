@@ -1,3 +1,37 @@
+## 2026-08-05 — #6843 gate round 5: the fold re-committed both classes it closed
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Five items, and the structural finding is that round 4 re-committed
+  in two places the two classes it was dispatched to close. **Item 1 (the M3
+  defect one round later):** the M1 HELP fix shipped with NO assertion — reverting
+  it to the three-cause wording left `./pkg/api` green. I had applied exactly that
+  standard to two operator strings the round before and not to this one. Bound by
+  a per-cause assertion on the gauge's OWN `Desc().String()` (not a scrape-wide
+  substring — `Desc.String()` embeds HELP, so a loose match can be satisfied by a
+  sibling metric's help; that is the trap that made the first `zoneSamples` draft
+  misread counters as the gauge). **Item 2 (material):** the cause list still
+  under-enumerated by TWO REACHABLE paths — `loaded && cr == nil` (shim loaded by
+  LoadUserspaceShim, `lastApply` set only by recordApplyResult, so the window
+  before first apply and PERMANENTLY after a failed first apply) and
+  `cr != nil && !ok` (the collector reads `store.ActiveConfig()` but commitAndApply
+  promotes the store BEFORE the apply, so a commit adding a zone whose apply fails
+  leaves store=N+1, cr.ZoneIDs=N). Six causes now, in the HELP, the (a)-(f) block,
+  and types.go. **Items 3+4 (the premise sweep one round later):** my stated method
+  was "search the premise, not the symbol" — right method, stopped short of the
+  CANONICAL DEFINITION. `ErrCounterNotPopulated`'s own godoc, and the
+  `zoneCounterOffsets` field comment on the very map this PR rewrites, both still
+  said the POPULATE path is deferred. Both cover traffic AND flood in one
+  sentence, so the fix is a clause split — flood genuinely IS still deferred and
+  its half must stay. **Item 5:** the corrected citation replaced one pattern-match
+  with a smaller one; measured it — 3 of 6 collectHostInbound* touch c.srv, named
+  those three.
+- **Validation**: `go vet ./...` REAL exit 0; `go test ./... -count=1` REAL exit 0;
+  `go test ./pkg/refactoraudit/` exit 0. Item 1 mutation-proven: reverting the HELP
+  reds all three missing causes with build+vet clean, restore green.
+- **File(s)**: `pkg/api/metrics_descriptors_zone.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/types.go`, `pkg/api/zone_counters_metrics_test.go`,
+  `pkg/dataplane/maps_counters.go`, `pkg/dataplane/loader.go`, `_Log.md`
+
 ## 2026-08-05 — #6843 gate round 4: the hoist changed the gauge's MEANING
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

@@ -426,10 +426,14 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 
 	// #6843 R1: running ABOVE the dataplane-loaded gate means this can now be
 	// reached with a nil server/store, which the below-gate position implicitly
-	// ruled out. The pre-gate collectors that touch c.srv/c.srv.store guard the
-	// same way: collectPBRStatus and the collectHostInbound* family.
-	// (collectLo0Counters is NOT an example -- it reads neither, so it needs no
-	// guard; citing it would be pattern-matching rather than checking.)
+	// ruled out. Counted, not pattern-matched: of the pre-gate collectors, the
+	// ones that actually touch c.srv/c.srv.store and therefore guard the same
+	// way are collectPBRStatus, collectHostInboundAddresslessZones,
+	// collectHostInboundAddresslessInterfaces and
+	// collectHostInboundAmbiguousAddresses. collectLo0Counters and the
+	// collectHostInbound{KernelDenies,JunosHostDenies,ICMPNDAccepts} readers
+	// touch NEITHER field and need no guard -- naming "the collectHostInbound*
+	// family" would have been a smaller pattern-match, not a check.
 	var cfg *config.Config
 	if c.srv != nil && c.srv.store != nil {
 		cfg = c.srv.store.ActiveConfig()

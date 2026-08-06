@@ -161,9 +161,15 @@ type ZoneInfo struct {
 	//
 	// #6843: the userspace POPULATE path is NOT deferred any more -- #3651
 	// shipped it, so this is false for a per-zone reason, not because the
-	// feature is missing: the helper predates the populate path, the zone
-	// exceeded the helper's hot-path slot capacity (its traffic really is
-	// uncounted), the zone is idle, or the dataplane is not loaded.
+	// feature is missing. The full cause list (kept in step with the
+	// xpf_zone_counters_unpopulated_zones HELP, which counts the same set):
+	// the helper predates the populate path; the zone exceeded the helper's
+	// hot-path slot capacity (its traffic really is uncounted); the zone is
+	// idle; the dataplane is not loaded; the dataplane is loaded but has no
+	// apply result yet (shim loaded, first apply pending or failed); or the
+	// zone is in the active config but absent from the last apply result (the
+	// store is promoted before the dataplane apply, so a commit whose apply
+	// failed leaves a newly-added zone in this state).
 	// It exists so an operator/automation can tell "no per-zone accounting" from
 	// "genuinely zero traffic"; without it the endpoint reported a misleading 0
 	// (or, for a stable-hash zone id >= MaxZones, 500'd the whole response).

@@ -18,9 +18,19 @@ import (
 // genuine read failure (a missing map or a degraded IPC bridge, which must
 // still bump the #3345 xpf_counter_read_errors_total signal) and DISTINCT from
 // a real zero. Read surfaces treat it as "not available" -- never a 500, never
-// a false read-error alert, never a bare misleading 0. Per-zone traffic and
-// flood counters currently report this because the eBPF writers were deleted
-// in #1476 and the userspace POPULATE path is deferred (#3643 plan §5A).
+// a false read-error alert, never a bare misleading 0.
+//
+// The two per-zone families that return this reach it for DIFFERENT reasons,
+// and conflating them is what made the pre-#6843 wording wrong:
+//
+//   - Per-zone TRAFFIC counters ARE populated (#3651 shipped the userspace
+//     POPULATE path). This sentinel now means the helper published no row for
+//     THIS zone -- a pre-#3651 helper, a zone past the helper's hot-path slot
+//     capacity, an idle zone, or no loaded dataplane / no apply result yet.
+//     See the xpf_zone_counters_unpopulated_zones HELP for the full list.
+//   - Per-zone FLOOD counters are still genuinely deferred: no writer exists,
+//     so they report this unconditionally (#3643 plan §5A, leaning on the
+//     #3343 aggregate).
 var ErrCounterNotPopulated = errors.New("counter not populated in userspace dataplane")
 
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.

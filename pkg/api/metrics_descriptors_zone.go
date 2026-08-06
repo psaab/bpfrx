@@ -53,13 +53,33 @@ func (c *xpfCollector) initZoneDescriptors() {
 	// (the helper stops publishing its row -- see below), and (c) a zone that
 	// is simply idle.
 	//
-	// #6843 R1 added a FOURTH: (d) there is NO LOADED DATAPLANE (or no apply
-	// result), so nothing could have been published for any zone. This
-	// collector runs ABOVE the dataplane-loaded gate precisely so the gauge
-	// survives a degraded / config-only boot — but that availability CHANGED
-	// WHAT THE GAUGE MEANS. Before the hoist (a)-(c) were exhaustive; now the
-	// gauge reads N (every configured zone) when the dataplane failed to arm,
-	// which is a different operational situation from N idle zones.
+	// #6843 R1 added a FOURTH, and the round-5 gate found two MORE that this
+	// collector's own pre-read branches produce (metrics_counters.go):
+	//
+	//   (d) NO LOADED DATAPLANE. This collector runs ABOVE the
+	//       dataplane-loaded gate precisely so the gauge survives a degraded /
+	//       config-only boot — but that availability CHANGED WHAT THE GAUGE
+	//       MEANS. Before the hoist (a)-(c) were exhaustive; now the gauge
+	//       reads N (every configured zone) when the dataplane failed to arm,
+	//       which is a different operational situation from N idle zones.
+	//   (e) LOADED BUT NO APPLY RESULT YET. `m.loaded` is set by
+	//       LoadUserspaceShim (dataplane/loader.go) while `lastApply` is set
+	//       only by recordApplyResult (dataplane/apply.go) — so between shim
+	//       load and the first apply, and PERMANENTLY if that first apply
+	//       fails, IsLoaded() is true and LastApplyResult() is nil.
+	//   (f) ZONE IN THE ACTIVE CONFIG BUT NOT IN THE APPLY RESULT.
+	//       assignZoneIDs is total over the config BEING APPLIED, but this
+	//       collector reads store.ActiveConfig(), and commitAndApply promotes
+	//       the store BEFORE the apply (daemon/daemon_apply_commit.go). A
+	//       commit that adds a zone and then fails its dataplane apply leaves
+	//       the store with N+1 zones and cr.ZoneIDs with N.
+	//
+	// (e) and (f) matter because they are the causes an operator is LEAST
+	// likely to guess: the helper is current, the zone count is nowhere near
+	// the slot capacity, the zone carries traffic, and the dataplane IS loaded
+	// — so every one of (a)-(d) reads as inapplicable while the gauge sits at
+	// 1. Under-enumerating here reproduces exactly the mis-triage (d) was
+	// added to prevent.
 	//
 	// There is no xpf_dataplane_loaded series to disambiguate against, so (d)
 	// must be named in the HELP or an operator paging on `> 0` triages toward
@@ -98,9 +118,14 @@ func (c *xpfCollector) initZoneDescriptors() {
 			"a zone is counted here when the dataplane has published no volume "+
 			"for it: the helper predates the per-zone populate path, the zone "+
 			"exceeded the helper's hot-path slot capacity, the zone is idle, "+
-			"OR there is no loaded dataplane at all (degraded / config-only "+
+			"there is no loaded dataplane at all (degraded / config-only "+
 			"boot -- this gauge is emitted above the dataplane gate, so it "+
-			"reads the full configured zone count in that state). Matches the "+
+			"reads the full configured zone count in that state), the dataplane "+
+			"is loaded but has no apply result yet (shim loaded, first apply "+
+			"pending or failed), OR the zone is in the active config but absent "+
+			"from the last apply result (the config store is promoted before the "+
+			"dataplane apply, so a commit whose apply failed leaves a newly "+
+			"added zone counted here). Matches the "+
 			"zones REST reports per_zone_counters_available false for. Genuine "+
 			"read failures bump xpf_counter_read_errors_total instead "+
 			"(#3651, #6843).",

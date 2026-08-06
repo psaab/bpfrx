@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -601,6 +602,54 @@ func TestZoneMetricsFollowTheHelperAcrossSlotLoss(t *testing.T) {
 type notLoadedDP struct{ *descriptorCoverageDP }
 
 func (d *notLoadedDP) IsLoaded() bool { return false }
+
+// TestZoneUnpopulatedGaugeHelpEnumeratesEveryCause is the #6843 round-5 pin on
+// the HELP text itself.
+//
+// The gauge's HELP enumerates the causes an operator triages from, and
+// collectZoneCounters has SIX membership branches. A HELP that lists fewer
+// sends the operator after causes that do not apply — which is the whole
+// failure the cause list exists to prevent. Reverting the HELP to any shorter
+// enumeration was green before this test: nothing asserted on the string.
+//
+// Asserted against THIS gauge's own Desc().String() rather than a scrape-wide
+// substring search: Desc.String() embeds the HELP, so a loose match can be
+// satisfied by a different metric's help text (the same trap that made the
+// first draft of zoneSamples misread counters as the gauge).
+//
+// FAIL-ON-REVERT: drop any clause below from the HELP and the matching
+// assertion reds.
+func TestZoneUnpopulatedGaugeHelpEnumeratesEveryCause(t *testing.T) {
+	c := newCollector(&Server{store: newDescriptorCoverageStore(t)})
+
+	var help string
+	for d := range describedSet(c) {
+		if descFQName(d.String()) == "xpf_zone_counters_unpopulated_zones" {
+			help = d.String()
+			break
+		}
+	}
+	if help == "" {
+		t.Fatal("xpf_zone_counters_unpopulated_zones not declared by Describe()")
+	}
+
+	// One phrase per membership branch in collectZoneCounters. Each is chosen
+	// to be unique to this gauge's help, not shared with a sibling metric.
+	for _, want := range []string{
+		"predates the per-zone populate path", // (a) pre-#3651 helper
+		"hot-path slot capacity",              // (b) slot overflow
+		"the zone is idle",                    // (c) idle
+		"no loaded dataplane at all",          // (d) unloaded
+		"no apply result yet",                 // (e) loaded, first apply pending/failed
+		"absent from the last apply result",   // (f) store promoted before apply
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("gauge HELP does not name the cause %q; an operator paging on "+
+				"`> 0` triages from this list, so an unlisted cause is a "+
+				"mis-triage by construction.\nHELP: %s", want, help)
+		}
+	}
+}
 
 // TestZoneUnpopulatedGaugeEmittedOnDegradedBoot is the #6843 R1 pin.
 //
