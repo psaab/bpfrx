@@ -68617,3 +68617,56 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+
+## 2026-08-06 — #4800 new-flow-ceiling instrumentation + harness
+
+- **Timestamp**: 2026-08-06
+- **Action**: Add per-site contention accounting for the three cross-worker
+  synchronization points on the new-flow install path — the SNAT pool
+  allocator's residual `live` map mutex, `publish_shared_session`, and the
+  N-way `replicate_session_upsert` fan-out — plus a per-worker transit
+  new-flow install counter, a tested attribution layer, a connection-rate
+  generator, and the loss-cluster harness that drives them. This is the
+  measurement #2852 Phase-2 SNAT-allocator sharding is gated on: a
+  new-flows/sec plateau alone cannot say WHICH site saturated, and #4800's
+  own conclusion is that allocator sharding is insufficient because publish
+  and replication serialize every new flow regardless.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/status.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_newflow_lock.rs (new),
+  userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/worker_queue.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs (new),
+  userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker_runtime.rs,
+  userspace-dp/src/afxdp/worker_runtime_tests.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/{nat,control,binding}.rs,
+  userspace-dp/src/server/{lifecycle.rs,helpers/status.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/{protocol_counters,protocol_status}.go,
+  pkg/api/{metrics,metrics_userspace,metrics_descriptors_nat,
+  metrics_descriptors_worker,metrics_descriptors_userspace_session,
+  metrics_test}.go, test/incus/newflow_ceiling_analyze.py (new),
+  test/incus/newflow_ceiling_analyze_test.py (new),
+  test/incus/newflow-gen/ (new crate),
+  test/incus/newflow-ceiling-harness.sh (new),
+  docs/userspace-newflow-ceiling.md (new), docs/README.md, Makefile
+- **Validation**: Fail-on-revert proven per leg by reverting only the
+  production hunk (via Edit, never `git checkout`) and re-running: each
+  reverted counter leaves its assertion RED with the assertion's own
+  message, never a compile error. The over-reach guards — status polling
+  must not inflate the acquisition denominator; `remove_shared_session` is
+  not a publish; `replicate_session_delete` is not an upsert — stay GREEN
+  under every revert, since each asserts an UNCHANGED counter and the
+  reverted code pins all counters at zero. `cargo test` (userspace-dp,
+  newflow-gen), `go build ./...`, `go test ./pkg/api ./pkg/dataplane/...`,
+  `python3 -m unittest newflow_ceiling_analyze_test`, `shellcheck -S
+  warning`. The wire golden `protocol_wire_v1.json` was regenerated; its
+  diff is 10 additive zero-valued keys with no existing key changed.
+  **The loss-cluster measurement itself has NOT been performed** — this
+  change ships the instrumentation and the harness; the number is owed.
