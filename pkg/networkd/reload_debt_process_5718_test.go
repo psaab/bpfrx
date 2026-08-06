@@ -23,6 +23,32 @@ func resetReloadDebtForTest(t *testing.T) {
 	t.Cleanup(clear)
 }
 
+// debtTestIfaces is the fixture for the debt tests below. It is deliberately
+// ONE plain interface, and that narrowness is the limit of what those tests
+// prove about the activation tail.
+//
+// READ THIS BEFORE TREATING A GREEN RUN AS COVERAGE. The tests using this
+// fixture bind the DEBT mechanism — armed on a failed reload, discharged only
+// by a matching-epoch success, never silently dropped. They do NOT bind how the
+// activation tail selects or filters interfaces. Three wrong-interface
+// regressions were each injected and measured to leave this package GREEN:
+//
+//   - hardcoding "trust0" in the tail instead of reading the caller's set —
+//     invisible, because the fixture only ever contains "trust0";
+//   - deleting the unmanaged/disabled filtering — invisible, because nothing
+//     here is unmanaged or disabled;
+//   - reversing multi-interface accumulation and order — invisible, because
+//     one element has no order.
+//
+// The only activation-tail arm this fixture closes is the bond-member one
+// (`&& ifc.BondMaster == ""`), whose deletion reds the activation-tail tests
+// with [reconfigure trust0 lag0m]. That arm is closed because a SEPARATE
+// fixture supplies a bond member; this one does not.
+//
+// Widening this fixture to catch the three above is a real improvement, not a
+// no-op — but it changes the call-count assertions in every test that uses it,
+// so it is its own change. Until then, do not read a pass here as "the tail
+// picks the right interfaces".
 func debtTestIfaces() []InterfaceConfig {
 	return []InterfaceConfig{
 		{Name: "trust0", MACAddress: "52:54:00:aa:bb:cc", Addresses: []string{"10.0.1.10/24"}},
