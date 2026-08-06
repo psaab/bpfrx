@@ -233,6 +233,91 @@
   `pkg/config/compiler_validate_warn_routing.go`,
   `pkg/config/parser_routing_test.go`, `docs/feature-gaps.md`,
   `docs/feature-coverage.md`, `_Log.md`
+## 2026-08-06 — #6864 round 2: ParentIndex is not a VLAN parent for every link kind
+
+- **Timestamp**: 2026-08-06 (fix/5275-arm-failclosed, PR #6864)
+- **Action**: Close a reproducible false-`SKIPPED`/false-`DELEGATED` path in
+  `coverDelegated` — the observe-only proof read `LinkAttrs.ParentIndex` as a
+  VLAN delegation without proving the child was an 802.1Q device.
+- **File(s)**: `pkg/dataplane/armproof.go`,
+  `pkg/dataplane/armproof_5275_test.go`, `pkg/dataplane/README.md`
+
+**The defect inverted the fix's value.** Round 1 turned an OVER-count into a
+correct count. This path turned it into an UNDER-count, which silently hides a
+real uncovered surface — strictly worse than what it replaced. An over-count
+inflates a baseline an operator can see; an under-count reports a live
+forwarding interface with no shim on it as covered.
+
+**Mechanism, in three links.** `ensureVLANSubInterface` (`compiler_iface.go`)
+blindly adopts ANY existing device named `<phys>.<vid>` — no check of link
+kind, VLAN ID, configured parent, or namespace. That ifindex is then recorded
+as a delegated VLAN child, and the userspace attach loop SKIPS it
+(`compiler.go`, `genericXDPIfindexes && !tunnelIfindexes`), so it never gets a
+shim. `coverDelegated` then read `lnk.Attrs().ParentIndex` and treated it as a
+VLAN-parent relationship — but vishvananda/netlink folds `IFLA_LINK` into
+`ParentIndex` in the COMMON attribute loop, for every link kind, and what
+`IFLA_LINK` means is per-kind. For a cross-namespace veth it is the FOREIGN
+peer's ifindex, which can numerically alias any local interface. The unmanaged
+sweep does not clean the squatter up either: it skips any name whose prefix
+before `.` is a managed interface.
+
+**Both covered-reading branches were affected**, so closing one would have left
+the other live: a parent that aliases a proven-down record promoted the child
+to `skipped`, and one that aliases a covered required surface promoted it to
+`delegated`. Neither is a hole in one arm — they are two arms of the same hole.
+
+**Fix.** `coverDelegated` now requires `lnk.Type() == vlanLinkKind` ("vlan")
+before reading `ParentIndex` at all; anything else reports `uncovered` with
+`Via` left ZERO, because naming a bogus parent in the record would repeat the
+same confusion in the operator's log. Scoped to the PROOF: the blind adoption
+in `ensureVLANSubInterface` is a real, pre-existing production defect but is
+outside #5275 PR1's observe-only scope and is filed separately.
+
+**Domain parity, verified firsthand in a network namespace** against this
+netlink version rather than inferred:
+
+| device | `Type()` | `ParentIndex` |
+|---|---|---|
+| genuine vlan `p0.100@p0` | `vlan` | real_dev |
+| cross-ns veth `p0.100@if6` | `veth` | PEER, in the FOREIGN namespace |
+| macvlan `r0.300@r0` | `macvlan` | lower device |
+| bond slave | `dummy` | 0 — bond membership is `IFLA_MASTER`/`MasterIndex` |
+
+Two limits are written into the code rather than assumed. A genuine vlan whose
+real_dev is moved to another namespace KEEPS its kind and its now-foreign
+`ParentIndex` — but the kernel forces it admin-DOWN, `LinkSetUp` fails
+`ENETDOWN`, and it cannot transmit, so it is not a live forwarding surface and
+the type check is sufficient. And the belt binds the KIND, not the CONFIGURED
+parent: an adopted vlan stacked on a different device delegates to that device,
+which stays honest (that parent's XDP really does see its tagged frames, and a
+down parent really does stop it). Binding the configured parent needs the
+compiler to record it per child — a `CompileResult` data-model change, not part
+of an observe-only phase.
+
+**Tests.** `TestArmProofNonVLANChildNeverInheritsItsParentIndex` is the
+fail-on-revert binding: 2 arms (proven-down parent, covered required parent) x
+2 real kinds (cross-namespace veth, macvlan) = 4 cells, each asserting
+`uncovered`, `Via == 0` and `WouldGate`. Deleting the production hunk reds all
+four with the assertion message, `go vet` exit 0 — an assertion failure, not a
+build break (`vlanLinkKind` simply becomes an unused const, which Go permits).
+`TestArmProofVLANKindIsTheDiscriminator` is the over-reach guard and negative
+control: the SAME fixture, same ifindexes, same aliasing, same unarmed record,
+varying ONLY the child's kind to a genuine vlan — both arms must still reach
+`skipped` and `delegated`. It stays GREEN under the revert, which is what
+separates it from a restatement of the fix; without it, "make every delegated
+child uncovered" would pass the red test while re-breaking every VLAN
+deployment round 1 fixed.
+
+**Validation.** `go build ./...` rc=0; `go vet ./pkg/dataplane/` rc=0;
+`go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` rc=0;
+`go test ./pkg/refactoraudit/ -count=1` rc=0. Under the revert exactly ONE test
+moves — the new one — while all five named guards
+(`TestArmProofVLANChildOfProvenDownParentIsSkipped`,
+`TestArmProofVLANChildOfUnprovenParentStaysUncovered`,
+`TestArmProofDelegateMustBeARequiredSurface`,
+`TestArmProofProvenDownRecordCoversOnlyItsOwnChild`) and the widened AST canary
+(`TestArmProofEverySurfaceDroppingBranchRecords`) stay green.
+
 ## 2026-08-05 — #6865 round 5: the sweep stopped at the package boundary
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
@@ -68052,6 +68137,83 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 — OBSERVE-ONLY dataplane arm-coverage proof. Computes
+  whether the dataplane is armed for the surfaces the config requires and
+  reports what a gating build would have decided; gates nothing. Records
+  native->generic fallback on the compile result so the skb-mode population is
+  measurable. Corrects the plan's §5/D1 native/generic binary to three-valued
+  coverage (direct / delegated / uncovered) — implemented as written it would
+  fail-close every VLAN deployment — and refreshes the appendix coordinates
+  re-verified at origin/master ad9591177.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go, pkg/dataplane/compiler.go, pkg/dataplane/loader.go, pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 reporting — report the coverage branch PER SURFACE
+  (SurfaceSummary, one compact token per interface in the single apply-time log
+  line) and report DidGate separately from WouldGate, so the divergence rate is
+  readable directly instead of inferred from the ABSENCE of an enforcement line
+  (an absence is indistinguishable from a proof that never ran).
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go
+
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 fold round 1 — seven findings from an independent
+  hostile gate at 65f5a588b. (F1) The attach mode is now read from the KERNEL
+  (`xdpLinkModeGeneric`, RTM_GETLINK, XDP_ATTACHED_SKB) instead of a per-compile
+  fallback record: the record was empty from compile #2 onward — every later
+  compile short-circuits on "already attached" while the link stays on skb-mode
+  — so the proof reported "went native" on exactly the iavf population it exists
+  to count. `CompileResult.fallbackGenericIfindexes` and its loader recording
+  are deleted. (F2) The three compiler soft skips (interface not found, VLAN
+  child create failed, administratively disabled) now record an
+  `UnarmedSurface`, reported as a distinct `skipped` branch — or as `uncovered`
+  when the disable's `LinkSetDown` failed and the netdev may still be UP,
+  zoned and forwarding with no XDP. `LogArmCoverage` now emits unconditionally
+  with a `ran` field, so "nothing to arm" and "the proof never ran" are
+  distinguishable. (F3) Tests now bind the Manager path — a second compile still
+  reports skb-mode — plus AST canaries on the `CompileUserspaceShim` call site
+  and the three recording sites. (F4) The `m.lastCompile` hoist is gone and link
+  resolution uses the non-memoising `peekLinkByIndex`, so "observe-only" is
+  literally true. (F5) Delegation now requires the parent to be a REQUIRED
+  surface that itself classified `direct`. (F6) The apply generation is folded
+  into the stage label, so the RETH deferred-MAC path's two compiles per apply
+  are distinguishable. (F7) Plan §10 gains a PR0 measurement phase and §5 states
+  this is the PRELIMINARY stage. (F8) The delegated token carries the delegate's
+  attach mode. Eleven mutations, each restored byte-for-byte with sha256
+  verification, all ASSERTION-RED with `go vet` exit 0.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/loader.go, pkg/dataplane/apply.go, pkg/dataplane/README.md,
+  docs/research/5275-arm-failclosed/plan.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 fold round 2 — eight GREEN cells authored by the re-gate
+  at ed28086c8. (1, MAJOR) The compiler half of `StillForwarding` was bound by
+  nothing: setting it to `false`, or deleting the never-resolved-link leg, was
+  whole-suite GREEN. The judgement moved into a pure `disabledSurfaceRecord`
+  (linkErr, downErr -> proven-down or not), unit-tested across all four
+  combinations, and the WIRE is bound by an AST canary asserting both errors are
+  threaded as identifiers rather than `nil`. `linkDownFailed` is gone — the
+  netdev is proven down only when both errors are nil. (2) The call-site canary
+  was satisfied by four inert edits; it now asserts the statement is a
+  TOP-LEVEL element of the body, that the receiver is `m`, that the argument is
+  `result`, and that its index EXCEEDS the `attachUserspaceShimXDP` call's.
+  (3) A FOURTH surface-dropping soft skip existed — `if zone == nil { continue }`
+  in `programZoneMaps`, which drops every interface in a zone and is reachable on
+  the HA config-sync path — now recorded at zone level. The message allowlist is
+  replaced by a STRUCTURAL enumeration: every early `return nil` in
+  `mapZoneInterface` and every `continue` in `programZoneMaps` must record, so a
+  new soft skip with an unguessed message no longer passes. (4) README no longer
+  claims `skipped` means nothing forwards — it is the third unknown, and
+  `WouldGate` excludes it. `missingInterfaceRecord` distinguishes a genuine
+  absence from a netlink DUMP failure (wrapped `syscall.Errno`) instead of
+  inferring absence from an error it never inspected. `XDP_ATTACHED_MULTI` now
+  counts as generic (reachable via the discarded `DetachXDP` error), via a pure
+  `xdpModeIsGeneric` covered by a five-mode table. `nextApplyGeneration` and both
+  probe bodies gained tests. `recordUnarmedSurface` dedupes by (name, ifindex)
+  and never downgrades a classification — the count is the deliverable.
+  `swapArmProbes` documents its no-parallel constraint.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md
 - **Timestamp**: 2026-08-05 09:41
 - **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
   process-global `AtomicU64` statics as their before/after baseline, so cargo's
@@ -68438,3 +68600,312 @@ break — `go vet` confirmed passing under every revert.
   believed and restored with a filecmp check against a pristine copy. An early
   attempt at the framing mutation was a BUILD break (unused "fmt"); it was
   rewritten to keep the import live so the cell is a real assertion.
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold — F1 (MATERIAL): a VLAN child whose parent
+  was cleanly `disable`d landed `CoverageUncovered` and drove `WouldGate`.
+  `compiler_iface.go` appends the child to `pendingXDP` ~130 lines ABOVE the
+  `isDisabled` check and never appends a disabled parent, so `coverDelegated`'s
+  "delegate is not a required surface" branch caught it — on precisely the
+  shape both reference deployments run (loss cluster `reth0.50`/`reth0.80`,
+  standalone VLAN 50), inflating the very baseline this phase exists to
+  measure and contradicting the README's own rule that a clean `disable` stays
+  out of would-gate. `coverDelegated` now consults `unarmedByIfindex`: a
+  parent the compiler declined AND proved down (`StillForwarding == false`)
+  makes the child `CoverageSkipped` naming that parent; a parent whose
+  `LinkSetDown` FAILED still leaves the child `CoverageUncovered`, because the
+  child rides that same possibly-UP, zoned, XDP-less netdev. F2 (MATERIAL):
+  the structural canary's `ast.Inspect` matched only `*ast.BlockStmt`, but
+  `ast.CaseClause.Body`/`ast.CommClause.Body` are bare `[]ast.Stmt` — a real
+  early `return nil` inside a `switch { case ...: }` in `mapZoneInterface`
+  escaped it entirely while the byte-identical `if` form was caught. Added
+  `stmtBody` + `stmtListRecords` and repointed both halves (the
+  `mapZoneInterface` `return nil` walk and the `programZoneMaps` `continue`
+  walk). F3: README named PR1 as the phase that decides what a declined
+  surface means to a gate; `armproof.go` had it right (the gating PR does).
+  NITs: a proven-down declined surface now logs at INFO, not WARN alongside
+  the would-gate set; the "one RTM_GETLINK + one bpf_link info per required
+  surface" cost claim was wrong for DELEGATED surfaces (RTM_GETLINK via
+  `peekLinkByIndex`, no bpf_link call) and is now stated per surface kind.
+  DECLINED the ifindex→name NIT: `xdpLinkModeGeneric` is a `func(int) bool`
+  package var swapped by `swapArmProbes`, so threading a name changes that
+  seam plus `instanceLookup`/`coverDirect` and moves seven pinned summary
+  tokens (`10:direct/native`, `20:delegated/via-10/native`, …) — not the
+  "costs nothing" the review conditioned it on.
+- **Validation**: `go build ./...` exit 0; `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race`
+  exit 0; `go test ./pkg/refactoraudit/ -count=1` exit 0. Six mutations, all
+  RED via ASSERTION with `go vet` exit 0 first: M1 drop the proven-down
+  branch → `...VLANChildOfProvenDownParentIsSkipped` fails, and all three
+  over-reach guards stay GREEN; M2 drop the `!u.StillForwarding` condition →
+  `...VLANChildOfUnprovenParentStaysUncovered` fails; M3 `return nil` inside a
+  switch case in `mapZoneInterface` → canary fails (GREEN before this fold);
+  M4 `continue` inside a switch case in `programZoneMaps` → canary fails, and
+  the PR-head canary was re-run against M4 and confirmed GREEN; M5 revert the
+  skip log to WARN → `...DeclinedSurfaceLogsAtInfo` fails; M6 drop the parent
+  NAME from the child's detail → the naming assertion fails.
+- **File(s)**: pkg/dataplane/armproof.go,
+  pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md, _Log.md
+
+## 2026-08-06 — #6864 fold r4: name the identity residual, stop the missing-parent count collapse
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold, two findings.
+
+  **F1 (docs) — the artifact claimed a proof it does not perform.** The README
+  and plan §13/D1 both said the preliminary proof establishes "program-instance
+  identity". It does not: `xdpLinkProgramID` accepts ANY readable program id,
+  never compares it against `m.programs[m.XDPEntryProgram()]`, and never checks
+  `Info.XDP().Ifindex` — the two symbols do not appear in `armproof.go` at all.
+  CHOSE to correct the documents rather than implement the comparison, on the
+  evidence that in this tree the comparison can only ever answer "match":
+  every writer of `m.xdpLinks` installs `m.programs[m.XDPEntryProgram()]`
+  (`AttachXDP`'s fresh attach and its pinned-link `Update` reuse, which drops
+  the pin and re-attaches when `Update` fails; `swapXDPEntryProg`, which updates
+  the links and only then renames the entry program), post-#1476 `m.programs`
+  has one shim writer (`loader_userspace_shim.go`) with the legacy entry program
+  never loaded, and nothing outside the package can reach a tracked link
+  (`Program(name)` is a read-only getter; `m.xdpLinks` has no accessor). So the
+  brief's premise that update-capable handles are exported does not hold. Adding
+  the check to a DIAGNOSTIC would measure nothing while adding a reachable way
+  to report a false `uncovered` (an unreadable expected program — a nil entry is
+  literally exercised by `...GenericModeSurvivesASecondCompile`), and binding it
+  would need a fabricated fixture. It also forces the fail-closed direction for
+  an unreadable expected program to be picked in a phase with no evidence for
+  it. The residual is now written down in three places — at `xdpLinkProgramID`,
+  in `pkg/dataplane/README.md`, and as a "delivered so far" note under plan
+  §13/D1 — each naming the specific unchecked thing so the GATING PR closes it.
+
+  **F2 (runtime) — the unarmed-surface count changed with an unrelated
+  condition.** `mapZoneInterface` resolves `reth0.50` to its PARENT before the
+  netdev lookup, and passed that parent as `missingInterfaceRecord`'s `Name`.
+  `recordUnarmedSurface` dedups on exactly `(Name, Ifindex)` and every child of
+  an absent parent has Ifindex 0, so `p0.50`, `p0.80` and the parent's own
+  reference collapsed into ONE record — while a parent that RESOLVES yields one
+  record per surface. The same configured topology reported a different surface
+  count depending on whether the parent happened to resolve, always in the UNDER
+  direction, and the count is this phase's whole deliverable. Fixed at the
+  RECORD, not by weakening the dedup (which is correct and deliberate — an
+  interface named by two zones legitimately reaches the skip twice):
+  `missingInterfaceRecord` now takes the VLAN id and names `<parent>.<vid>`,
+  keeping the parent in the Reason where an operator needs it.
+
+  Also corrected two overstatements the same review flagged: the README said all
+  FOUR soft skips sit behind a `slog` line (the nil-zone branch at
+  `compiler_iface.go:415` records and continues with no log — only the proof's
+  own per-surface line makes it visible), and "one line per compile" is true of
+  the SUMMARY line only (uncovered surfaces add a WARN each, skipped an INFO).
+- **Validation**: `id -u` 1000 (non-root). `go build ./...` exit 0;
+  `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0;
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. Three mutations, each RED via
+  ASSERTION with the build still clean, each grepped back out afterwards and the
+  file `cmp`'d against its pre-mutation copy: M1 drop the `vlanID > 0` branch
+  from `missingInterfaceRecord` while KEEPING the signature (so the failure
+  cannot be a build break) → `...AbsentParentRecordsEachVlanChildSeparately`
+  fails with "two configured VLAN children of one absent parent produced 1
+  unarmed record(s) [ge-9-0-9], want 2", and the over-reach guard
+  `...OneSurfaceNamedByTwoZonesStaysOneRecord` stays GREEN; M2 disable the
+  `recordUnarmedSurface` dedup → that over-reach guard FIRES ("got 2
+  [ge-9-0-8.50 ge-9-0-8.50]"), proving it is a guard and not a restatement, and
+  the F2 binding test stays GREEN; M3 add a gate-style expected-program check to
+  `attachedInstance` → the F1 residual pin
+  `...ReportsTheReadbackInstanceWithoutVerifyingIt` fires, so the docs cannot
+  silently outlive the code in either direction. The F2 tests drive the REAL
+  `programZoneMaps` → `mapZoneInterface` path (the caller is where the identity
+  is chosen, so a test on the record helper alone would leave the defect
+  unbound) and assert the fixture's premise — the netdev must not exist —
+  rather than skipping.
+- **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md,
+  docs/research/5275-arm-failclosed/plan.md, _Log.md
+
+## 2026-08-06 — #6864 fold r5: the foreign-netns orphan VLAN is a LIVE surface; close it
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold, one MAJOR — a claim in my own r3 comment
+  was refuted by reproduction, and the residual it dismissed is real.
+
+  **The refuted claim.** The `vlanLinkKind` "WHAT IT DOES NOT PROVE" block (and
+  the matching README sentence) disposed of the foreign-namespace orphan by
+  asserting that a genuine vlan whose `real_dev` moved to another netns "is
+  forced admin-DOWN, LinkSetUp fails ENETDOWN, and it cannot transmit — so it
+  is not a live forwarding surface". Reproduced firsthand on this kernel with
+  `unshare -rn` (dummy `p0` + vlan child `p0.100`, child moved to a peer netns,
+  probed through `netlink.LinkByIndex`):
+
+      real_dev DOWN : LinkSetUp rc=2 ENETDOWN, flags=broadcast, oper=down
+      real_dev UP   : LinkSetUp rc=0, flags=up|broadcast|running, oper=up
+      both legs     : Type()="vlan"  ParentIndex=5 (FOREIGN ns)  NetNsID=0
+      local control : loc0.100 Type()="vlan" ParentIndex=7 NetNsID=-1, up
+
+  The original experiment only reproduced because it left the foreign `real_dev`
+  DOWN. `vlan_dev_open` refuses only while the real device is down; nothing pins
+  the orphan down. So it IS live, its kind IS "vlan" so it passes the r3 kind
+  belt, and its `ParentIndex` is a foreign ifindex used as a bare numeric key
+  into `isRequired` / `unarmed[parent]` / `direct[parent]` — aliasing a local
+  record yields SKIPPED or DELEGATED, both UNDER-counts that hide a live
+  XDP-less forwarding surface. Reachable by the same route as the wrong-kind
+  squatter: `ensureVLANSubInterface` adopts any `<phys>.<vid>` without checking
+  its kind OR where its real_dev lives.
+
+  **Closed in code, not just in prose.** The r4 reasoning for declining a code
+  fix was that the bad state is unproducible; this one is PROVEN producible, so
+  the same reasoning points the other way. `coverDelegated` now also requires
+  `LinkAttrs.NetNsID == netnsIDLocal` after the kind check. The kernel emits
+  `IFLA_LINK_NETNSID` exactly when `link_net != dev_net` and netlink seeds -1,
+  overwriting only from that attribute, so -1 means "local parent" — one extra
+  condition on an `Attrs()` call already being made, no new syscall.
+
+  **The comparison is `!= -1`, never `> 0`**, and both reasons were measured
+  rather than reasoned: (i) a foreign parent's nsid is commonly ZERO — the
+  orphan above read 0 — so `> 0` lets exactly the target case through; (ii)
+  netlink parses the wire s32 UNSIGNED (`int(native.Uint32(...))`,
+  link_linux.go:2304), so a wire `NETNSA_NSID_NOT_ASSIGNED` (-1) arrives as
+  4294967295 on this 64-bit build — verified by running the same expression —
+  which `!= -1` still rejects, conservatively.
+
+  Test fixtures now set `NetNsID` EXPLICITLY on every hand-built link. The zero
+  value of a `netlink.LinkAttrs` is 0, which is a real FOREIGN nsid; only
+  `LinkDeserialize` seeds -1. Leaving it unset modelled a link production never
+  returns and would have routed every existing VLAN fixture through the new
+  belt.
+- **Validation**: `id -u` 1000 (non-root). `go build ./...` exit 0;
+  `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0;
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. A 3-mutation matrix, each cell
+  `go vet`-clean first so every RED is an ASSERTION, each mutation grepped back
+  out and the file `cmp`'d identical after restore:
+
+      cell                          foreign_ns_vlan rows | veth+macvlan | local-VLAN control
+      M0 baseline                   PASS                 | PASS         | PASS
+      M1 belt removed               FAIL (both arms)     | PASS         | PASS
+      M2 belt always fires          PASS                 | PASS         | FAIL (both arms)
+      M3 `> 0` instead of `!= -1`   FAIL (both arms)     | PASS         | PASS
+
+  M1 reds with the two concrete under-counts (`Kind:skipped Via:10` and
+  `Kind:delegated Via:10 ProgramID:55`). M2 is the over-reach control the parent
+  asked for — "make every delegated child uncovered" reds BOTH negative-control
+  arms while the new rows stay green, so the belt cannot be widened into
+  re-breaking `reth0.50`/`reth0.80`. M3 is the decisive sign cell: the nsid-0
+  orphan slips a `> 0` test while the control stays green, so `!= -1` is
+  load-bearing and not interchangeable.
+
+  OUT OF SCOPE, deliberately untouched: `pkg/dataplane/compiler.go:474` reads
+  `link.Attrs().ParentIndex` for the VLAN-child generic-attach decision with the
+  identical aliasing exposure. Unchanged by this PR; a separate follow-up issue.
+- **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-06 — #5275 PR1: correct three false claims in the arm-proof comments
+
+- **Timestamp**: 2026-08-06
+- **Action**: make the decline's justification true (comment-only)
+- **File(s)**: `pkg/dataplane/armproof.go`
+
+Two independent gates reached the same three findings by different routes — a
+hostile Claude review that ran an unprescribed mutation cell, and a Codex leg
+that reasoned from the value domain and the shipped architecture. All three are
+false statements in the shipping artifact, none changes behaviour:
+
+1. "nothing outside the package can reach a tracked link at all — `Program(name)`
+   is a read-only getter and `m.xdpLinks` has no accessor." FALSE.
+   `Manager.XDPLinks()` returns the LIVE map by reference and `Manager.Program()`
+   returns a live `*ebpf.Program` handle. The two current out-of-package callers
+   (`userspace/manager_compile.go`, `userspace/maps_sync.go`) read only `len` and
+   keys, so the CONCLUSION holds — but it is upheld by the call sites, not by
+   encapsulation, and a future caller in `pkg/dataplane/userspace` could falsify
+   it without an API change. The comment now says that, and frames the missing
+   comparison as DEFERRED to the gating PR rather than impossible. Also records
+   the two `swapXDPEntryProg` states the old text omitted: it skips VLAN
+   sub-interfaces, and it returns on the first per-link `Update` error without
+   advancing `m.xdpEntryProg`.
+2. "The comparison MUST be `!= -1`, never `> 0` or `>= 0`." Half false. `> 0` is
+   genuinely wrong (it misses a foreign nsid of 0). `>= 0` is indistinguishable
+   from `!= -1` for every producible value — the seed is the only negative one
+   and the wire parse is unsigned. `!= -1` stays, as the spelling that says what
+   it means, but the claim that `>= 0` would be a defect is withdrawn.
+3. "only `LinkDeserialize` seeds -1." `NewLinkAttrs()` does too. The
+   load-bearing point is unchanged — a bare composite literal, which is what
+   fixtures use, still zero-values it to 0, and 0 is a real FOREIGN nsid.
+
+Comment-only: every changed line in `armproof.go` is `//` or blank, verified by
+stripping the diff markers and filtering. `gofmt -l` clean, `go build ./...` 0,
+`go vet ./pkg/dataplane/` 0, `go test ./pkg/dataplane/ -count=1` 0, non-root.
+## 2026-08-06 — #6413 userspace-dp synced-import-cap doc corrections
+
+- **Timestamp**: 2026-08-06 02:20 PDT
+- **Action**: Correct the #5674 reverse-ride SOURCE framing (local mirror, not
+  peer), document the +1 orphan corner, and align two HELP strings to the
+  2N-ENTRIES bound. Comment-only, no behaviour change.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs
+- **Validation**: the .rs diff contains ZERO executable lines (every changed
+  line is `//` or `///`); `cargo check` exit 0. Each claim verified against
+  origin/master before editing: SetClusterSyncedSessionV4 at manager_ha.go:1136
+  early-returns for a reverse and writes only the BPF mirror; mirrorSessionPairV4
+  at :1115 dispatches the reverse as a SEPARATE upsert with IsReverse=1;
+  session_import.rs:103 already states the cap as 2 * worker_count *
+  DEFAULT_MAX_SESSIONS while status.rs/control.rs stated the logical bound.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6413 amend — three doc corrections found by review, two of
+  which are this PR's own subject matter (a cross-reference PR must not ship
+  a bad cross-reference). (1) The `#6413:` block this PR ADDED to
+  `coordinator/status.rs` cited `bpf_map/metrics.rs` as documenting the ENTRY
+  ceiling. It documents no ceiling — `grep -nE
+  'ceiling|2 \*|worker_count|max_sessions'` over
+  `userspace-dp/src/afxdp/bpf_map/metrics.rs` exits 1, and all that survives
+  there is a redirect at :275-284 saying the counters moved to
+  `coordinator/session_manager.rs`. metrics.rs did hold the formula at
+  `c8d7559cc`, with the OLD un-doubled wording, until `83df45377` (#6819)
+  moved it out. Repointed at `coordinator/session_manager.rs`, whose :45-56
+  does state `2 * worker_count * DEFAULT_MAX_SESSIONS` — verified before
+  writing the pointer, so the fix does not repeat the defect in the other
+  direction. (2) `coordinator/mod.rs:338-343`, the fourth site this PR's
+  sweep missed, still carried both errors it fixes elsewhere: the un-doubled
+  `worker_count * DEFAULT_MAX_SESSIONS`, and "returns this value", which is
+  false — `ha/session_import.rs:33-37` returns `override.saturating_mul(2)`
+  and says so. (3) `ha/session_import.rs:124-126` and
+  `session/README.md:826-829` named only `mirrorSessionPairV4` as the
+  producer of the lone reverse; the IPv6 twin `mirrorSessionPairV6`
+  (`pkg/dataplane/userspace/manager_ha.go:1246`, `revVal.IsReverse = 1` at
+  :1258) reaches the SAME gate — the control handler
+  (`server/handlers/sync_session.rs:22`) is family-agnostic and calls
+  `upsert_synced_session` once for any `upsert`. Both sites now read
+  `mirrorSessionPairV4`/`V6`. Comment-only, no behaviour change.
+- **Validation**: `cargo check --manifest-path userspace-dp/Cargo.toml` exit
+  0 (161 warnings, all pre-existing). Comment-only re-proved after the edit
+  the same way the review proved it: strip the +/- marker from every changed
+  `.rs` line in `origin/master...HEAD` and confirm nothing remains that is
+  not `//`, `///`, or blank — the residual grep exits 1.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-06 — #6304/#6413: retire the `afxdp/ha.rs` path in session/README.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct three stale module pointers surfaced by the #6913 gate
+- **File(s)**: `userspace-dp/src/session/README.md`
+
+The gate's cross-reference sweep covered pre-existing references inside the
+blocks this PR edits, and found `session/README.md` still citing
+`afxdp/ha.rs` — a file that no longer exists. Commit `18c4ba7fd` split it
+into the `afxdp/ha/` module. Three citations, all pre-existing on
+`origin/master`, all in or adjacent to the "Sync-family aggregate ceiling"
+section this PR rewrites:
+
+- `:640` `afxdp/ha.rs::update_ha_state` -> `afxdp/ha/state.rs::update_ha_state`
+  (verified: `fn update_ha_state` is at `afxdp/ha/state.rs:4`)
+- `:781` and `:866` `upsert_synced_session` (`afxdp/ha.rs`) ->
+  (`afxdp/ha/session_import.rs`) (verified: `pub fn upsert_synced_session`
+  is at `afxdp/ha/session_import.rs:46`)
+
+Both replacement targets were resolved before writing the pointer rather
+than after, so this does not repeat the defect it corrects. The enclosing
+paragraph was rewrapped to 72 columns because the longer path overflowed;
+no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
+`.rs` file is touched — this PR stays comment/doc-only.
