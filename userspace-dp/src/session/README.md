@@ -953,6 +953,60 @@ omits the fields decodes to `false` (no per-policy log) — bit-identical to
 pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
 `protocol/binding.rs`) carries the same fields at parity with the binary frame.
 
+### True ingress-interface identity on the session (#4983)
+
+A session records the interface its FIRST packet arrived on. At install
+`afxdp/poll_descriptor` stamps `SessionMetadata::ingress_ifindex` and
+`ingress_vlan_id` from the frame's `UserspaceDpMeta` — the binding the packet
+was actually received on plus its 802.1Q tag — and
+`afxdp/bpf_map/publish_conntrack` mirrors both into the conntrack value
+(`session_value.ingress_ifindex` / `ingress_vlan_id`), where the Go control
+plane reads them as `dataplane.SessionValue.IngressIfindex` /
+`IngressVlanID`.
+
+Before this the session carried only its ingress ZONE, so
+`show security flow session interface <name>` and the matching `clear` had to
+ask "is `<name>` bound to the session's ingress zone?". A session on interface
+X therefore matched a filter for EVERY sibling interface Y of that zone.
+(#4792 widened the CLI's zone map from one interface to all of them, which is
+as precise as a zone-derived answer can be; this is the datum that makes it
+exact.) `pkg/cli/session_filter.go`'s `resolveIngressIfaces` now resolves the
+recorded pair through the very same `{parent ifindex, VLAN}` map the EGRESS
+side already uses (`buildSessionEgressIfaces`), so one map defines one
+interface identity for both directions and two units of a single trunk NIC —
+`reth0.50` vs `reth0.80` — do not alias onto the parent.
+
+The identity is stamped ONCE and never re-derived from the zone; re-deriving
+is the approximation it exists to remove.
+
+**`0` means "no ingress identity carried" and is never a valid ifindex.** Three
+populations legitimately carry `0`, and the CLI falls back to the zone
+approximation for all of them — never "matches nothing" (which would hide them
+from `show`/`clear`), never "matches everything":
+
+1. the REVERSE companion — its true ingress is the forward flow's egress
+   interface, unresolved at install;
+2. a PEER-SYNCED session — an ifindex is NODE-LOCAL, so node 0's `ge-0-0-1`
+   and node 1's `ge-7-0-1` are different numbers for the same logical RETH
+   member. The identity is deliberately NOT carried across the cluster wire:
+   shipping the peer's number would render a confidently WRONG interface name
+   locally, strictly worse than approximating;
+3. a session installed by a pre-#4983 helper, mid rolling upgrade.
+
+A NON-ZERO ifindex the running config cannot name (an interface deleted since
+install, a tunnel/fabric ingress with no config unit) falls back the same way.
+
+**ABI note.** The two fields are part of the shared C conntrack struct, not the
+sync-only trailing fields: `session_value` grows 136 -> 144 and
+`session_value_v6` 184 -> 192 (the u32 lands on the existing 8-byte boundary
+and the u16 inside the tail pad it forces, so the pair costs 8 bytes, not 16).
+`sessions`/`sessions_v6` are PINNED maps, so — exactly as for the #5460 flags
+widen — a rolling deploy cannot cross this: the pre-flight
+(`validateUserspaceShimLivePins`) refuses while the old daemon still forwards,
+and the remediation is a full dataplane reload with brief downtime. Sizes are
+asserted in lockstep at `afxdp/bpf_map_tests.rs` and
+`pkg/dataplane/bpf_session_value_test.go`.
+
 ### Admitting policy ID on the session (#3056)
 
 A policy-admitted session stamps the admitting policy's ID onto

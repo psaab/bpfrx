@@ -68617,3 +68617,66 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+
+## 2026-08-06 — #4983: true ingress-interface identity on sessions
+
+- **Timestamp**: 2026-08-06
+- **Action**: Record the ingress binding on the session and match on it in the
+  session filter, replacing the zone approximation
+- **File(s)**: `bpf/headers/xpf_conntrack.h`,
+  `userspace-dp/src/afxdp/bpf_map/mod.rs`,
+  `userspace-dp/src/afxdp/bpf_map/publish_conntrack.rs`,
+  `userspace-dp/src/afxdp/bpf_map_tests.rs`,
+  `userspace-dp/src/session/entry.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/mod.rs` (+ 27 files carrying the new
+  `SessionMetadata` fields), `pkg/dataplane/types.go`,
+  `pkg/dataplane/bpf_session_value.go`,
+  `pkg/dataplane/bpf_session_value_test.go`, `pkg/cli/session_filter.go`,
+  `pkg/cli/session_filter_ingress_identity_4983_test.go`,
+  `pkg/cli/session_display_test.go`, `userspace-dp/src/session/README.md`,
+  `docs/session-sync-architecture.md`, `_Log.md`
+
+A session carried only its ingress ZONE, so
+`show security flow session interface <name>` and the matching `clear` could
+only ask whether `<name>` was bound to that zone — a session on interface X
+matched a filter for every sibling interface Y of the same zone. #4792 widened
+the CLI's zone map from the first bound interface to all of them, which is as
+precise as a zone-derived answer can be. This adds the real datum.
+
+`SessionMetadata` gains `ingress_ifindex` + `ingress_vlan_id`, stamped ONCE at
+install in `poll_descriptor` from the frame's `UserspaceDpMeta` (the binding it
+actually arrived on, plus its 802.1Q tag) and never re-derived from the zone.
+`publish_conntrack` mirrors both into the conntrack value; `pkg/cli`'s new
+`resolveIngressIfaces` resolves the pair through the SAME `{parent ifindex,
+VLAN}` map the egress side already uses, so one map defines one interface
+identity for both directions and `reth0.50` / `reth0.80` on one trunk NIC stop
+aliasing onto the parent. `cli_clear.go` needed no edit — it shares
+`matchesV4`/`V6` and already calls `populateIfaceMaps`.
+
+`0` = no identity carried, and the CLI falls back to the zone approximation for
+it — never "matches nothing" (which would hide sessions from `show`/`clear`),
+never "matches everything". Three populations legitimately carry 0: the reverse
+companion (its ingress is the forward flow's egress, unresolved at install), a
+peer-synced session, and a pre-#4983 helper's session. The peer case is a
+DESIGN choice, not an omission: an ifindex is node-local, so node 0's
+`ge-0-0-1` and node 1's `ge-7-0-1` are different numbers for the same logical
+RETH member and shipping the peer's value would name the wrong interface
+locally. The identity is therefore deliberately not carried on the cluster
+wire.
+
+ABI: the fields join the shared C conntrack struct (not the sync-only trailing
+fields), growing it 136 -> 144 / 184 -> 192 — the u32 on the existing 8-byte
+boundary, the u16 inside the tail pad it forces, so the pair costs 8 bytes not
+16. Sizes bumped in lockstep in `bpf_map_tests.rs` and
+`bpf_session_value_test.go`. `sessions`/`sessions_v6` are pinned, so as with
+the #5460 flags widen a rolling deploy cannot cross this: the #5307 pre-flight
+refuses while the old daemon still forwards and the remediation is a full
+dataplane reload with brief downtime.
+
+Validation: Go `pkg/cli` tests RED on assertion with the two
+`resolveIngressIfaces` call sites reverted (`go vet` still exit 0 — not a build
+break) and GREEN restored; Rust `build_conntrack_value_*_4983` RED on
+assertion (`left: 0, right: 24`) with the publish hunk reverted. The
+over-reach guards — `TestIngressIdentityDoesNotDisturbEgressMatching4983` and
+`ingress_identity_does_not_occupy_the_fib_egress_slots_4983` — stayed GREEN
+under both reverts.
