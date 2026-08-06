@@ -68539,3 +68539,81 @@ false statements in the shipping artifact, none changes behaviour:
 Comment-only: every changed line in `armproof.go` is `//` or blank, verified by
 stripping the diff markers and filtering. `gofmt -l` clean, `go build ./...` 0,
 `go vet ./pkg/dataplane/` 0, `go test ./pkg/dataplane/ -count=1` 0, non-root.
+## 2026-08-06 — #6413 userspace-dp synced-import-cap doc corrections
+
+- **Timestamp**: 2026-08-06 02:20 PDT
+- **Action**: Correct the #5674 reverse-ride SOURCE framing (local mirror, not
+  peer), document the +1 orphan corner, and align two HELP strings to the
+  2N-ENTRIES bound. Comment-only, no behaviour change.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs
+- **Validation**: the .rs diff contains ZERO executable lines (every changed
+  line is `//` or `///`); `cargo check` exit 0. Each claim verified against
+  origin/master before editing: SetClusterSyncedSessionV4 at manager_ha.go:1136
+  early-returns for a reverse and writes only the BPF mirror; mirrorSessionPairV4
+  at :1115 dispatches the reverse as a SEPARATE upsert with IsReverse=1;
+  session_import.rs:103 already states the cap as 2 * worker_count *
+  DEFAULT_MAX_SESSIONS while status.rs/control.rs stated the logical bound.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6413 amend — three doc corrections found by review, two of
+  which are this PR's own subject matter (a cross-reference PR must not ship
+  a bad cross-reference). (1) The `#6413:` block this PR ADDED to
+  `coordinator/status.rs` cited `bpf_map/metrics.rs` as documenting the ENTRY
+  ceiling. It documents no ceiling — `grep -nE
+  'ceiling|2 \*|worker_count|max_sessions'` over
+  `userspace-dp/src/afxdp/bpf_map/metrics.rs` exits 1, and all that survives
+  there is a redirect at :275-284 saying the counters moved to
+  `coordinator/session_manager.rs`. metrics.rs did hold the formula at
+  `c8d7559cc`, with the OLD un-doubled wording, until `83df45377` (#6819)
+  moved it out. Repointed at `coordinator/session_manager.rs`, whose :45-56
+  does state `2 * worker_count * DEFAULT_MAX_SESSIONS` — verified before
+  writing the pointer, so the fix does not repeat the defect in the other
+  direction. (2) `coordinator/mod.rs:338-343`, the fourth site this PR's
+  sweep missed, still carried both errors it fixes elsewhere: the un-doubled
+  `worker_count * DEFAULT_MAX_SESSIONS`, and "returns this value", which is
+  false — `ha/session_import.rs:33-37` returns `override.saturating_mul(2)`
+  and says so. (3) `ha/session_import.rs:124-126` and
+  `session/README.md:826-829` named only `mirrorSessionPairV4` as the
+  producer of the lone reverse; the IPv6 twin `mirrorSessionPairV6`
+  (`pkg/dataplane/userspace/manager_ha.go:1246`, `revVal.IsReverse = 1` at
+  :1258) reaches the SAME gate — the control handler
+  (`server/handlers/sync_session.rs:22`) is family-agnostic and calls
+  `upsert_synced_session` once for any `upsert`. Both sites now read
+  `mirrorSessionPairV4`/`V6`. Comment-only, no behaviour change.
+- **Validation**: `cargo check --manifest-path userspace-dp/Cargo.toml` exit
+  0 (161 warnings, all pre-existing). Comment-only re-proved after the edit
+  the same way the review proved it: strip the +/- marker from every changed
+  `.rs` line in `origin/master...HEAD` and confirm nothing remains that is
+  not `//`, `///`, or blank — the residual grep exits 1.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-06 — #6304/#6413: retire the `afxdp/ha.rs` path in session/README.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct three stale module pointers surfaced by the #6913 gate
+- **File(s)**: `userspace-dp/src/session/README.md`
+
+The gate's cross-reference sweep covered pre-existing references inside the
+blocks this PR edits, and found `session/README.md` still citing
+`afxdp/ha.rs` — a file that no longer exists. Commit `18c4ba7fd` split it
+into the `afxdp/ha/` module. Three citations, all pre-existing on
+`origin/master`, all in or adjacent to the "Sync-family aggregate ceiling"
+section this PR rewrites:
+
+- `:640` `afxdp/ha.rs::update_ha_state` -> `afxdp/ha/state.rs::update_ha_state`
+  (verified: `fn update_ha_state` is at `afxdp/ha/state.rs:4`)
+- `:781` and `:866` `upsert_synced_session` (`afxdp/ha.rs`) ->
+  (`afxdp/ha/session_import.rs`) (verified: `pub fn upsert_synced_session`
+  is at `afxdp/ha/session_import.rs:46`)
+
+Both replacement targets were resolved before writing the pointer rather
+than after, so this does not repeat the defect it corrects. The enclosing
+paragraph was rewrapped to 72 columns because the longer path overflowed;
+no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
+`.rs` file is touched — this PR stays comment/doc-only.
