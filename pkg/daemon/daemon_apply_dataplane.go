@@ -289,17 +289,8 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			ensureRethLinkOriginalName(linuxName)
 			setRethIPv6Knobs(linuxName)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-			linkCycled, prepareErr := d.programRethMACWithWorkerJoin(linuxName, mac)
-			if prepareErr != nil {
-				// #5103: only the failed-worker-join class reaches here (an
-				// ordinary MAC-set failure stays warn-only, as it always has).
-				// Joined into networkdErr — the same tail-commit channel the
-				// device-map teardown (#5309) and the management-VRF rebind
-				// (#5700) use — so the commit reports FAILURE instead of
-				// success over a dataplane left mid-teardown.
-				networkdErr = errors.Join(networkdErr, prepareErr)
-			}
-			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
+			networkdErr, needLinkCycleRecovery = d.programRethMemberMAC(
+				linuxName, mac, networkdErr, needLinkCycleRecovery)
 			clearDadFailed(linuxName)
 			removeAutoLinkLocal(linuxName)
 			// Re-add link-local if this parent interface has IPv6 on unit 0.
@@ -463,6 +454,36 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 // MAC — ctrl is off and the workers are joined, so it is not forwarding.
 var errRethPrepareLinkCycle = errors.New("reth mac: link cycle failed after the af_xdp worker join")
 
+// programRethMemberMAC programs ONE RETH member's virtual MAC through the
+// #5103 worker-join wrapper and folds that member's outcome into the two
+// accumulators step 2.6 carries across its loop: the commit error (networkdErr,
+// the tail-commit channel the device-map teardown (#5309) and the management-VRF
+// rebind (#5700) also use) and needLinkCycleRecovery (step 2.6b2's rebind gate).
+// It returns both, updated.
+//
+// Only the failed-worker-join class produces a commit error; an ordinary MAC-set
+// failure stays warn-only, as it always has. errors.Join, not assignment: an
+// error already accumulated by an earlier step or an earlier member must not be
+// clobbered by this one. The recovery gate is ORed, not assigned: a member that
+// needs no cycle must not clear a gate an earlier member armed.
+//
+// This is a function rather than three inline statements so the fail-closed
+// plumbing is BEHAVIOURALLY testable (reth_commit_fold_5103_test.go). Inline it
+// was reachable only through applyDataplaneAndHACore, which needs a live cluster
+// manager, a wired dataplane, a networkd writer and real netlink members, so the
+// only available guard was a structural canary over the AST — and a structural
+// canary is satisfied by an assignment that is unreachable, shadowed, or jumped
+// over. Here the fold runs against the same fake link seam and fake dataplane the
+// wrapper's own tests use.
+func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
+	commitErr error, needLinkCycleRecovery bool) (error, bool) {
+	linkCycled, prepareErr := d.programRethMACWithWorkerJoin(ifName, mac)
+	if prepareErr != nil {
+		commitErr = errors.Join(commitErr, prepareErr)
+	}
+	return commitErr, needLinkCycleRecovery || linkCycled
+}
+
 // programRethMACWithWorkerJoin programs a RETH member's virtual MAC with the
 // #5103 worker-join hook, and unwinds that join when the rest of the cycle then
 // failed. It returns whether the link was cycled and a COMMIT error, non-nil
@@ -549,12 +570,36 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 		// Leave the rebind to step 2.6b2, which owns it for every cycled
 		// member. Note that suppression is per-MEMBER while 2.6b2's gate
 		// (needLinkCycleRecovery) is a per-APPLY accumulator, so an apply that
-		// mixes a cycled member with an aborted one pays BOTH this rollback's
-		// rebind and 2.6b2's. That is benign: the first rebind recreates
-		// workers, so tear_down's had_live_workers is true and the 500ms
-		// zero-copy quiesce IS armed on the second (the #1921 EBUSY-loop
-		// condition is had_live_workers == false), and each NotifyLinkCycle
-		// carries its own 1s settle.
+		// mixes a cycled member with an aborted one pays BOTH the aborted
+		// member's rollback rebind and 2.6b2's.
+		//
+		// Which of those two arms the 500ms zero-copy quiesce depends on the
+		// order the members are visited in, and that order is a Go map range
+		// (rethToPhys, step 2.6) — so state both. tear_down samples
+		// had_live_workers = !coord.workers.records.is_empty()
+		// (coordinator/reconcile/teardown.rs), and every stop_workers empties
+		// records (handlers/stop_workers.rs -> afxdp.stop() -> stop_inner ->
+		// WorkerManager::stop_and_clear, which joins each worker thread and
+		// then records.clear()s). So:
+		//
+		//   - aborted member FIRST: its rollback rebind sees an empty records
+		//     (its own stop_workers just cleared it) and skips the quiesce, then
+		//     recreates the workers. The cycled member's stop_workers then joins
+		//     and clears them AGAIN, so 2.6b2's rebind ALSO sees false and ALSO
+		//     skips it.
+		//   - cycled member FIRST: its stop_workers clears records and nothing
+		//     recreates them before the aborted member's own stop_workers, so
+		//     the rollback rebind skips the quiesce and recreates the workers —
+		//     and 2.6b2's rebind, with nothing clearing them in between, sees
+		//     had_live_workers TRUE and DOES arm it.
+		//
+		// Both are safe, and not because of the quiesce: the quiesce (#1921)
+		// covers a rebind that rebuilds the same queue set IMMEDIATELY after a
+		// teardown it did not itself wait on. Here every rebind is preceded by a
+		// stop_workers that JOINED the worker threads synchronously before
+		// returning, and NotifyLinkCycle pays an unconditional 1s NIC settle
+		// (pkg/dataplane/userspace/process_linkcycle.go) before it sends the
+		// rebind at all — twice the 500ms it may skip.
 		return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err)
 	}
 	slog.Warn("userspace: RETH MAC link cycle did not complete after the worker join; "+

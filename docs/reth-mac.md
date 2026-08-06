@@ -112,9 +112,23 @@ one bool for the whole apply, not per member: a multi-RETH apply where a
 *different* member was already present with the wrong MAC does set it, and that
 apply does re-apply.) `programRethMACWithWorkerJoin` therefore sends the documented
 inverse of `stop_workers` — `rebind`, via `NotifyLinkCycle()` — and returns a
-`errRethPrepareLinkCycle`-classified error that the caller joins into the commit
-error, so the commit reports FAILURE instead of success over a half-torn-down
+`errRethPrepareLinkCycle`-classified error. Its caller, `programRethMemberMAC`,
+`errors.Join`s that into the accumulated commit error (the same `networkdErr`
+channel the device-map teardown (#5309) and the management-VRF rebind (#5700)
+use), so the commit reports FAILURE instead of success over a half-torn-down
 dataplane. Ordinary netlink MAC-set failures stay warn-only, as they always have.
+
+`programRethMemberMAC` exists as a function, rather than as three statements
+inline in step 2.6's loop, so that fold is unit-testable: inline it was reachable
+only through `applyDataplaneAndHACore`, which needs a live cluster manager, a
+wired dataplane, a networkd writer and real netlink members, and the only
+available guard was an AST canary over the call site — which is satisfied by an
+assignment that is unreachable, shadowed, or jumped over.
+`reth_commit_fold_5103_test.go` drives it against the same fake link seam and
+fake dataplane the wrapper's own tests use. It folds BOTH per-member
+accumulators: the commit error (joined, so an earlier step's error survives) and
+`needLinkCycleRecovery` (ORed, so a member needing no cycle cannot clear a gate
+an earlier member armed).
 
 **The gate is "the hook RAN", not "the hook FAILED".** `PrepareLinkCycle`
 disables `ctrl` and stops the workers whether it then succeeds or fails, so a
@@ -146,6 +160,24 @@ administratively DOWN after a deliberate teardown. Note that step 2.6b's VIP
 reconcile is likewise gated on `linkCycled`, so a cycled-MAC-write failure still
 skips it; that gap predates #5103 and is unchanged here.
 
+Suppression is per-MEMBER, while step 2.6b2's gate is a per-APPLY accumulator, so
+an apply that mixes an aborted member with a cycled one pays two rebinds. Which
+of the two arms the 500ms zero-copy quiesce depends on the order step 2.6 visits
+the members in, and that order is a Go map range — so both orders hold. Every
+`stop_workers` empties `coord.workers.records`
+(`WorkerManager::stop_and_clear` joins each worker thread, then `clear()`s), and
+`tear_down` samples `had_live_workers` from exactly that. If the ABORTED member
+is visited first, its rollback rebind recreates the workers but the cycled
+member's own `stop_workers` clears them again, so step 2.6b2's rebind sees
+`had_live_workers == false` and SKIPS the quiesce; if the CYCLED member is
+visited first, nothing recreates workers before the aborted member's rollback
+rebind does, so step 2.6b2's rebind sees `true` and arms it. Both are safe, and
+not because of the quiesce: it covers a rebind that rebuilds the same queue set
+immediately after a teardown it did not itself wait on, and here every rebind
+follows a `stop_workers` that joined the worker threads synchronously plus
+`NotifyLinkCycle`'s own unconditional 1s NIC settle — twice the 500ms it may
+skip.
+
 The rollback's `NotifyLinkCycle()` sits inside the per-member RETH loop and opens
 with a 1s NIC-settle sleep, where step 2.6b2 pays that second at most once
 outside the loop — worst case *N* extra seconds of `applySem` hold when every
@@ -156,6 +188,7 @@ path where this node's forwarding is already down.
 |------|----------|
 | `pkg/daemon/daemon_reth.go` | `programRethMAC(ifName, mac, beforeCycle)` — invokes the hook on the cycle path only, aborts without touching the link |
 | `pkg/daemon/daemon_apply_dataplane.go` | `programRethMACWithWorkerJoin()` — builds the hook, rolls back a prepare whose cycle then failed, classifies the commit error |
+| `pkg/daemon/daemon_apply_dataplane.go` | `programRethMemberMAC()` — step 2.6's per-member fold: joins the classified error into the commit error, ORs `linkCycled` into step 2.6b2's rebind gate |
 | `pkg/dataplane/userspace/process_linkcycle.go` | `Manager.PrepareLinkCycle()` — ctrl disable + `stop_workers`, returns the join error |
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.PrepareLinkCycle()` — the live production adapter from the daemon hook to the manager |
 | `userspace-dp/src/server/handlers/stop_workers.rs` | helper side of the join; `rebind.rs` is its inverse |

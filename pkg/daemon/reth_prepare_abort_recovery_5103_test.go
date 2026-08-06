@@ -339,17 +339,7 @@ func TestRethMACNoJoinOrRollbackOnLiveSet_5103(t *testing.T) {
 // an interface is renamed or removed between the caller's LinkByName and this
 // call.
 func TestRethMACOrdinaryFailureStaysWarnOnly_5103(t *testing.T) {
-	withRethOps(t, rethLinkOps{
-		interfaces: func() ([]net.Interface, error) { return nil, nil },
-		byName: func(string) (netlink.Link, error) {
-			return nil, errors.New("Link not found")
-		},
-		byIndex:         func(int) (netlink.Link, error) { return nil, errors.New("Link not found") },
-		setDown:         func(netlink.Link) error { return nil },
-		setUp:           func(netlink.Link) error { return nil },
-		setName:         func(netlink.Link, string) error { return nil },
-		setHardwareAddr: func(netlink.Link, net.HardwareAddr) error { return nil },
-	})
+	withRethOps(t, ordinaryFailureRethOps())
 	d, lc := newAbortRecoveryDaemon(errors.New("stop_workers: helper did not respond"))
 
 	linkCycled, commitErr := d.programRethMACWithWorkerJoin("ge-0-0-1", virtMAC5103)

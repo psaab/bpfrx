@@ -68320,3 +68320,36 @@ break — `go vet` confirmed passing under every revert.
   CONDITION is exactly the binary expression `prepareErr != nil`, so a
   `false &&` wrapper (Op == token.LAND) fails it. Both mutations now red:
   neutralising the condition, and deleting the join outright.
+
+## 2026-08-06 — #6871 fold r5 (gate F1 BLOCKING / F2)
+
+- **Timestamp**: 2026-08-06 03:55 PDT
+- **Action**: Replace the r4 AST canary over the commit-error fold with real
+  BEHAVIOURAL coverage. Extract step 2.6's per-member fold into
+  `programRethMemberMAC`, which joins the wrapper's classified error into the
+  accumulated commit error and ORs `linkCycled` into step 2.6b2's rebind gate.
+  New `reth_commit_fold_5103_test.go` drives it against the existing fake link
+  seam + fake dataplane. Shrink the canary to three call-shape claims and add a
+  constant-false reachability check plus a `token.ASSIGN` check. Reword the
+  double-rebind comment: which rebind arms the 500ms quiesce depends on the map
+  visit order, so both orders are now stated.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_commit_fold_5103_test.go,
+  pkg/daemon/reth_hook_wired_5103_test.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go, docs/reth-mac.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./... rc=0; go test ./pkg/daemon
+  ./pkg/cluster ./pkg/vrrp ./pkg/dataplane/... -count=1 -race rc=0; go test
+  ./pkg/refactoraudit/... rc=0; `-run 5103` = 20 `=== RUN` lines (was 14);
+  gofmt clean on every touched file.
+- **NOTE — the r4 canary had three escapes, all vet-clean.** Wrapping the
+  accepted `if` in `if false { ... }`, preceding the assignment with a
+  duplicate-condition early return, and shadowing the target with `:=` each
+  left the matched AST nodes in place while the fold did nothing. Tightening
+  the matcher would have bought one clause per escape shape. Ten mutations were
+  run against the replacement; all ten are ASSERTION failures with `go vet
+  ./pkg/daemon` rc=0: fold deleted, the three r4 escapes, gate assigned instead
+  of ORed, error assigned instead of joined, and four call-site escapes
+  (constant-false `if`, `:=` shadow, result discarded, commit error dropped).
+  The three over-reach guards — completed program, ordinary warn-only failure,
+  and the `prepareCalls`/`notifyCalls` counts — stayed GREEN under the fold
+  revert. Restore verified with `cmp` against a pristine copy after each cell.
