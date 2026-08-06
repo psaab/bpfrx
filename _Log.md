@@ -1,3 +1,113 @@
+## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
+
+- **Timestamp**: 2026-08-06 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate at `42b2c8733` returned DO-NOT-MERGE on ONE
+  blocking finding, and it is not in either walk — it is in the sentence the
+  walk's own doc comment uses to justify exhaustion. Traced end to end and
+  confirmed real before changing anything; the two walks themselves are
+  untouched and the regenerated object is byte-identical.
+  - **(1) BLOCKING: an over-limit chain could INSTALL the exact key the shim
+    probes.** `walk_ipv6_ext_headers` exits by EXHAUSTING `MAX_EXT_HDRS` and
+    returns the residual extension-header type; `parse_l4`'s catch-all
+    (`lib.rs:1518`) stamps ports 0/0. The doc comment then asserted "the session
+    key misses, and the packet is redirected to userspace — the fail-closed path
+    for an over-limit chain", and `pkg/dataplane/README.md` repeated it as "it
+    costs that flow the XDP fast path permanently, nothing more". Both were
+    FALSE. The miss is a property of the session MAP, which userspace writes,
+    and `metadata_tuple_complete` (`frame/inspect.rs`) accepted EVERY non-TCP/UDP
+    metadata tuple — so `(AF_INET6, <residual ext type>, src, dst, 0, 0)` became
+    a `SessionFlow`. Three consequences, in order: `flow.is_none()` went false,
+    so the #4743 over-limit drop in the poll loop was SKIPPED; an
+    `application any` permit matched a flow with no ports to fail on; and the
+    key was installed and published to `USERSPACE_SESSIONS`. The next packet of
+    the same chain then HIT and took the fast path. The unconditional over-limit
+    refusal was in fact conditional on policy.
+    - FIX, at the chokepoint that mints the false tuple:
+      `metadata_tuple_complete` now declines an IPv6 tuple whose protocol is one
+      the walk TRAVERSES. The frame arm already declined (`parse_flow_ports` has
+      no case for an extension-header protocol) and so does the meta-offset
+      fallback, so `parse_session_flow_from_bytes` returns `None` — which is
+      exactly the input the existing #4743 gate needs to fire and DROP. No new
+      gate, no reordering of the poll loop: the old gate stops being
+      accidentally-correct.
+    - The refused set is `ipv6_ext_header_is_traversable` (GENERIC ∪ AUTH ∪
+      FRAGMENT). No-Next-Header 59 is deliberately NOT a member — it is a
+      terminal verdict both walkers resolve to, not a header either steps past —
+      and ESP 50 is not either, so IPsec transit keeps its portless tuple.
+  - **(2) The map has a SECOND writer, and it took arbitrary protocols.**
+    `build_synced_session_key` (`server/helpers/session_sync.rs`) rebuilds a peer
+    key straight off the wire. The session map is global and the shim probes
+    whatever row is present regardless of who wrote it, so closing only the
+    packet path would have left the invariant false. It now rejects the same
+    set, and the caller surfaces the error on the control response instead of
+    importing the row. This also closes the reviewer's finding 5 exploitation
+    path: `USERSPACE_SESSION_ACTION_PASS_TO_KERNEL` is published ONLY via
+    `uses_kernel_local_session_map_entry`, which requires `origin.is_peer_synced()`
+    — so a synced LocalDelivery row was the one way
+    `classify_native_gre_inner_ipv6` could return the kernel-delivery verdict for
+    an extension-header protocol. It can no longer be imported.
+  - **(3) Finding 6: "verifier PASS" was printed for an OVERRIDE.**
+    `build-userspace-xdp.sh` accepts shimverify rc=6 (headroom gate suppressed
+    via `XPF_SHIM_ALLOW_LOW_HEADROOM=1`) and then printed the unconditional
+    `verifier PASS — installed ...`. `PASS` is the one word an operator greps
+    for to confirm the gate was satisfied, and the warning is on stderr, which
+    is routinely read apart from stdout. The verdict is now carried in
+    `VERIFY_VERDICT` and rc=6 says
+    "verifier headroom gate OVERRIDDEN ..., NOT a measured pass".
+  - **(4) NOT folded — finding 5's classifier restructuring, SPLIT.**
+    `classify_native_gre_inner_ipv6` (`lib.rs:931`) still rejects only the
+    pre-#4555 five (HOP/ROUTING/DEST/AUTH/FRAGMENT), so for inner
+    135/139/140/253/254 it builds a fixed `inner IPv6 + 40` key using the
+    extension value as the protocol instead of walking. After (1)+(2) its worst
+    outcome is a session-map MISS falling through to XSK — the safe direction —
+    because no writer can produce a key with those protocols. Making it agree
+    with the canonical class set, or fold the shared walker, is a shim CODEGEN
+    change: a new `.o`, which owes a loss-userspace cluster smoke this lane is
+    not permitted to run. Verifier headroom measured at this head for whoever
+    picks it up: **947,188 / 1,000,000 insns, 5.28% free** (floor is 3%).
+  - **Tests.** `over_limit_chain_never_becomes_a_session_flow` sweeps all ten
+    traversable types, sizing each chain from `shim_walk::MAX_EXT_HDRS + 1` and
+    taking the residual protocol from the REAL shim walk, so the fixture exceeds
+    the shim's own limit by construction and the key asserted about is the key
+    the shim will really probe. Its companion
+    `at_limit_chain_still_publishes_the_key_the_shim_probes` is the negative
+    control: one header shorter, the SAME pipeline produces a flow whose
+    `forward_key` IS the shim's probe key — so the machinery under test really
+    is the one that publishes session identities, and the over-limit case is a
+    refusal rather than a dead path. `refused_protocol_set_equals_the_shim_traversable_set`
+    holds the refused set equal to the shim's `eh_class` non-terminal set over
+    all 256 values, and `traversable_predicate_matches_walker_behaviour_over_all_256_values`
+    holds it equal to what `walk_ipv6_ext_chain` measurably does — so a new
+    extension-header type taught to either walker reds unless the refusal learns
+    it too. Over-reach guards (ESP, No-Next-Header, all-IPv4, at-limit chains,
+    the pre-existing TCP/UDP port rule) stay GREEN under both reverts.
+  - **Revert probes**, run firsthand, restored after each: dropping the
+    `metadata_tuple_complete` clause → `cargo test` exit **101**, RED on
+    `#6923: proto=0: an over-limit IPv6 extension-header chain must NOT become a
+    session flow ... left: Some(SessionFlow { ... protocol: 0, src_port: 0,
+    dst_port: 0 })`; neutering `reject_unresolved_ipv6_ext_protocol` → exit
+    **101**, RED on `#6923: a synced IPv6 session keyed on extension-header
+    protocol 0 must be REFUSED`. Both are ASSERTION failures, not build breaks,
+    and each left the other's tests green.
+  - **`make generate` ran** and is disclosed rather than hidden: the two
+    corrected texts live in `userspace-xdp/src/ipv6_ext_walk.rs` (a doc comment)
+    and `pkg/dataplane/build-userspace-xdp.sh` (an echo), and BOTH are hashed
+    inputs of the #4977 freshness manifest, so the gate went RED. Neither edit
+    can change codegen, and the rebuild confirmed it: the object came back
+    **byte-identical** (`29fc6d783f74b3b9a27275aec67492dcc1f071a841c71cd51e505fdc35daf268`
+    before and after), verifier PASS at 5.28% headroom, manifest refreshed.
+    Hand-running `cmd/shim-manifest` would have been the cheaper route and was
+    deliberately NOT taken — it is precisely the laundering path that gate
+    exists to catch.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/server/helpers/session_sync.rs,
+  userspace-dp/src/afxdp/frame/inspect_tests.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-dp/src/main_tests.rs, userspace-xdp/src/ipv6_ext_walk.rs,
+  pkg/dataplane/build-userspace-xdp.sh, pkg/dataplane/README.md,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
+
 ## 2026-08-01 — #4555 round 6: unfake the parity comparison, unfake the harness
 
 - **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
