@@ -637,7 +637,7 @@ context is built in `afxdp/worker/loop_body/mod.rs` right before the
 expire call.
 
 The self-heal edge is made airtight by the **epoch-before-publish
-ordering** in `afxdp/ha.rs::update_ha_state`: `rg_epochs` for every
+ordering** in `afxdp/ha/state.rs::update_ha_state`: `rg_epochs` for every
 activated/demoted RG (and the node-level `rg_epochs[0]` on any activation)
 is bumped BEFORE `rg_runtime.store`, so a worker that observes the active
 `rg_runtime` always observes the bumped epoch (never new-rg + old-epoch).
@@ -776,15 +776,15 @@ record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
 `upsert_synced_with_origin` stays uncapped (the infallibility contract
 above), but the sync family is no longer *unbounded*: the row-I11 cap
-arbitration is now enforced ONE level up, at the coordinator's
-peer-sync entry point (`Coordinator::upsert_synced_session`,
-`afxdp/ha.rs`). Before #5674 a peer-synced session was published to the
-shared `synced` map and fanned out to EVERY worker command queue+table
-with no cap, so a peer under session-table pressure — or a
-malicious/compromised peer — could drive this node past its own
-aggregate session ceiling and multiply that state across all workers
-(an availability/DoS the per-worker `install_with_protocol_with_origin`
-cap is meant to prevent). `upsert_synced_session` now bounds the shared
+arbitration is now enforced ONE level up, at the coordinator's peer-sync
+entry point (`Coordinator::upsert_synced_session`,
+`afxdp/ha/session_import.rs`). Before #5674 a peer-synced session was
+published to the shared `synced` map and fanned out to EVERY worker
+command queue+table with no cap, so a peer under session-table pressure
+— or a malicious/compromised peer — could drive this node past its own
+aggregate session ceiling and multiply that state across all workers (an
+availability/DoS the per-worker `install_with_protocol_with_origin` cap
+is meant to prevent). `upsert_synced_session` now bounds the shared
 `synced` map (the single fan-out choke point) at this appliance's OWN
 aggregate **ENTRY** ceiling — `2 * worker_count * DEFAULT_MAX_SESSIONS`
 (`synced_import_cap()`) — and **drop-newest**-rejects a NEW over-ceiling
@@ -863,7 +863,7 @@ missing-neighbor seed) leave it 0. The synthesized reverse companion inherits
 the forward entry's generation so a delete refusal is consistent across both
 halves.
 
-`upsert_synced_session` (`afxdp/ha.rs`) refuses a strictly-older-generation
+`upsert_synced_session` (`afxdp/ha/session_import.rs`) refuses a strictly-older-generation
 install (both generations non-zero) so the helper's stored generation never
 regresses (`SessionManager::install_stale_ignored`), mirroring the Go install
 guard. `delete_synced_session_gen(key, delete_gen)` refuses a

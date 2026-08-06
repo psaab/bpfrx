@@ -68199,3 +68199,28 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/ha/session_import.rs,
   userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-06 — #6304/#6413: retire the `afxdp/ha.rs` path in session/README.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct three stale module pointers surfaced by the #6913 gate
+- **File(s)**: `userspace-dp/src/session/README.md`
+
+The gate's cross-reference sweep covered pre-existing references inside the
+blocks this PR edits, and found `session/README.md` still citing
+`afxdp/ha.rs` — a file that no longer exists. Commit `18c4ba7fd` split it
+into the `afxdp/ha/` module. Three citations, all pre-existing on
+`origin/master`, all in or adjacent to the "Sync-family aggregate ceiling"
+section this PR rewrites:
+
+- `:640` `afxdp/ha.rs::update_ha_state` -> `afxdp/ha/state.rs::update_ha_state`
+  (verified: `fn update_ha_state` is at `afxdp/ha/state.rs:4`)
+- `:781` and `:866` `upsert_synced_session` (`afxdp/ha.rs`) ->
+  (`afxdp/ha/session_import.rs`) (verified: `pub fn upsert_synced_session`
+  is at `afxdp/ha/session_import.rs:46`)
+
+Both replacement targets were resolved before writing the pointer rather
+than after, so this does not repeat the defect it corrects. The enclosing
+paragraph was rewrapped to 72 columns because the longer path overflowed;
+no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
+`.rs` file is touched — this PR stays comment/doc-only.
