@@ -1,9 +1,27 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r6 — **NOT CONVERGED.** Codex landed **PLAN-NEEDS-MAJOR-REVISION**
-after Claude SMR r5 and AGY r4 had both reached PLAN-READY, and **Codex is right on
-three architecture-level items that both other reviewers missed.** The r5 PLAN-READY
-is **WITHDRAWN**. See §0 below.
+**Revision:** v6-r7 — Codex's r5 findings are now **fixed in the design**, not merely
+recorded. §7a is re-derived on the correct ifindex axis (§0a), §4.3b is **cheaper**
+(§0b), and §4.3c is **redesigned** around per-entry provenance (§0c). Awaiting round 7
+from all three reviewers.
+
+> ## Where to aim, if you are reviewing this
+>
+> **Across six revisions, every single round found its defect in the FIX, never in the
+> diagnosis.** The diagnosis — that the bare 5-tuple is insufficient, that the collision
+> is reachable via PBR, that ifindex and zone are disqualified on forward/reply
+> asymmetry — has survived three reviewers and six revisions unchanged, and each of
+> those claims has now been independently confirmed at file:line by at least two
+> reviewers.
+>
+> What has broken, every time, is the remedy: Path D, then the allocate-once interner,
+> then the version gate, then the ifindex axis. **Do not spend your round
+> re-litigating whether the 5-tuple is insufficient.** Aim at:
+> 1. **the discriminator derivation** — which ifindex, which map, which axis;
+> 2. **the wire and version path** — what the upgrade gates actually compare;
+> 3. **the test axis** — whether the proposed fixture varies the dimension the defect
+>    actually lives on (§0a is the cautionary tale: the natural fixture passes against
+>    the broken design).
 
 ## 0. Codex's late refutation — three things the 2-of-3 convergence got WRONG
 
@@ -304,12 +322,18 @@ derivation, a rolling-compatible version bump, a flush on the enforcement transi
 and one change to the upgrade-compatibility predicate.** That is materially smaller
 than the basis AGY assessed, because r4 removed the interner it objected to.
 
-**The counter-case for PLAN-KILL that survives:** the `parseHAProtocolCompatible`
-change has blast radius beyond this issue — it relaxes the rolling-upgrade gate for
-every future release. A reviewer may reasonably judge that a niche, warned-about
-config does not justify touching that gate. **That is the strongest remaining argument
-for PLAN-KILL and this plan does not claim to refute it** — it is a judgement about
-risk appetite, and it belongs to the maintainer.
+**The counter-case for PLAN-KILL that survived v6-r5 is now WITHDRAWN.** It was that
+changing `parseHAProtocolCompatible` relaxes the rolling-upgrade gate for every future
+release. **v6-r7 does not touch that predicate at all** (§4.3b): the mixed-base gate
+already honours the `MinCompat` floor, and the real blocker is fixed by pinning
+`SessionSyncWireVersion` — which the constant's own doc comment prescribes. The
+upgrade-gate blast-radius row in §8 is withdrawn accordingly.
+
+**What remains as a PLAN-KILL case** is narrower and purely a cost judgement: ~297
+mostly-test literal sites plus a per-entry provenance bit, for a config that is niche
+and already warned about. That is a maintainer risk-appetite call. It is a materially
+weaker case than at v6-r5, because every *architectural* objection raised across seven
+rounds has now been either fixed or withdrawn.
 
 **The counter-case against PLAN-KILL:** the shipped A.1 warning text tells the operator
 their config is not session-isolated *"until the session identity is VRF-aware"* — a
@@ -475,28 +499,42 @@ speak it. The signal already exists and, crucially, is **not PSK-gated**:
   `pkg/cluster/heartbeat.go:286` and decoded at `:374`. Unlike the F23 handshake this
   is unconditional — an unkeyed cluster still exchanges it.
 
-**The catch, and the scope it implies.** The ISSU driver requires the two versions to
-be **exactly equal**: `parseHAProtocolCompatible` (`pkg/upgrade/cluster_cli.go:253`)
-is documented *"Compatible iff N == M … a bump means the wire semantics changed and
-the release is NOT rolling-upgradable"*. So a naive bump would make the release
-non-rolling — reviving the very objection §4.3 retired.
+**The catch — and v6-r6 got it wrong in BOTH directions. Read this before re-raising
+the flag-day objection.**
 
-But `MinCompatHAProtocolVersion` (`heartbeat.go:46`) **exists for precisely this case**
-— *"the OLDEST HA protocol version `CurrentHAProtocolVersion` can still interoperate
-with"* — and it is currently **vestigial: it has no non-test consumer in the tree**
-(verified). The design is therefore:
+v6-r6 claimed (a) `MinCompatHAProtocolVersion` is vestigial, and (b) the fix therefore
+requires changing `parseHAProtocolCompatible`. **Both are wrong**, per Codex r5:
 
-1. bump `CurrentHAProtocolVersion` → 2, set `MinCompatHAProtocolVersion` = 1;
-2. change `parseHAProtocolCompatible` to honour the declared floor (`peer >=
-   MinCompat`) instead of exact equality;
-3. enforce domain matching only when the peer advertises >= 2.
+- **`MinCompatHAProtocolVersion` is already wired.** My grep was scoped to `pkg/` and
+  matched only Go symbol references. It is exported as text by `cmd/xpfd/main.go:195`
+  (`ha-protocol-min-compat=%d`), parsed at `pkg/upgrade/imageversions.go:70`, and
+  **enforced as a floor** by `GateMixedBaseSwap` (`imageversions.go:156`):
+  `peerHAProtocol < newImg.HAProtocolMinCompat || peerHAProtocol > newImg.HAProtocol`.
+  The mixed-base gate **already accepts a compatibility window.**
+- **The real blocker is elsewhere, and nobody but Codex saw it.**
+  `SessionSyncWireVersion = uint16(CurrentHAProtocolVersion)` (`pkg/cluster/sync.go:36`),
+  and `GateMixedBaseSwap` compares session-sync **exact-match**
+  (`imageversions.go:170`). So bumping the HA protocol version drags
+  `SessionSyncWireVersion` with it and fails the **session-sync** gate — making the
+  release non-rolling *regardless of anything done to `parseHAProtocolCompatible`.*
 
-Result: no fail-open, no session loss, and the upgrade **stays rolling** — but via a
-declared-compatibility contract rather than by avoiding the version bump.
+**The correction makes the plan CHEAPER, and this must be stated plainly so a later
+reviewer does not re-raise the retired flag-day objection:**
 
-**This is real, high-consequence scope: it modifies the upgrade safety gate.** It is
-well-founded (the constant exists for this and is unused), but it must be priced, and
-it must not be smuggled in as a one-liner.
+1. **Decouple and PIN `SessionSyncWireVersion`.** #2387's payload change is *additive*
+   (§4.3), so the sync wire schema does **not** change incompatibly and its version
+   **must not move**. The constant's own doc comment anticipates exactly this: *"If the
+   sync wire format ever diverges from the HA protocol version, replace this with its
+   own counter."* This is the change the codebase already told us to make.
+2. **Bump `CurrentHAProtocolVersion` → 2, set `MinCompatHAProtocolVersion` = 1.** The
+   mixed-base gate already honours that floor — no gate change needed.
+3. **`parseHAProtocolCompatible` is NOT touched.**
+
+**Consequences:** the upgrade stays rolling through *both* gates; the ISSU
+compatibility predicate is untouched, so the "blast radius across every future release"
+concern is **withdrawn**; and §3a's *strongest surviving PLAN-KILL argument disappears*.
+What remains is one decoupled constant plus a version bump the existing window already
+absorbs.
 
 **Consequently §11 Q2 lands on (i), not (ii):** #2387 must carry the capability signal
 **for its own correctness**, not as a favour to #5804. That also disposes of the
@@ -534,7 +572,58 @@ The gate cannot close this, because it is evaluated per packet against the peer'
 **State admitted under the old regime is carried forward into the new one** — a
 transition no amount of steady-state reasoning can see.
 
-**Required — the flip must be a transition with an action.** Two options:
+> ### REDESIGNED in v6-r7 — a global predicate cannot express this
+>
+> Codex r5 showed the global "enforce iff peer version >= 2" gate has **four concrete
+> races**, because it evaluates a *mutable global* per packet while rows persist across
+> its changes:
+>
+> 1. heartbeat and session-sync start **independently** (`daemon_ha_sync.go:767-792`);
+> 2. v1-imported domainless sessions **survive a sync disconnect** (`:109-118`);
+> 3. the first v2 heartbeat **overwrites the peer version immediately**
+>    (`heartbeat_manager.go:314-325`) while authoritative replacement only completes at
+>    **`BulkEnd`** (`sync_conn_read.go:205`) — so enforcement can engage while retained
+>    domain-0 rows are still live;
+> 4. in reverse, `StopHeartbeat` leaves the cached version intact (`:148-163`), and a
+>    heartbeat timeout clears it then enters **single-node election** (`:425-447`) —
+>    disabling isolation *precisely during takeover*.
+>
+> **The mechanism is per-entry provenance, not a global predicate.** Each session
+> carries whether its domain is authoritative:
+>
+> - **locally-created** sessions → always authoritative;
+> - **peer-imported** sessions → authoritative **iff the sync frame carried the domain
+>   field** (known at decode time from the length-gate, §4.3);
+> - the fast path compares domains **only when the matched entry is authoritative**;
+>   a non-authoritative entry matches on the 5-tuple alone, exactly as today.
+>
+> **This structurally eliminates all four races**, because no row's behaviour depends on
+> a global that can change under it: race 1 and 2 become irrelevant (rows carry their
+> own truth), race 3 cannot mis-fire (an imported row is authoritative only if its own
+> frame carried the field), and race 4 cannot disable isolation for
+> *locally-created* rows during takeover — which is the case that actually matters,
+> since a node entering single-node election is the one still forwarding.
+>
+> **The explicit choice Codex demanded — fail-open continuity, BOUNDED.** Between import
+> and the first authoritative bulk, legacy rows match on the 5-tuple alone: continuity
+> is preserved, and the residual fail-open is confined to pre-existing rows in an
+> overlapping-VRF config. **The bound is the atomic transition:** at the `BulkEnd` of
+> the first bulk that carried authoritative domains (`bulkEverCompleted`,
+> `sync_conn_read.go:205-247`), flush the remaining non-authoritative peer-imported rows
+> via `SessionOrigin::is_peer_synced()` (`session/entry.rs:245`).
+>
+> This is the **synthesis of the r4 FLUSH-vs-MARK argument**, and it resolves it rather
+> than picking a side: **MARK supplies correctness** (race-free, and it was Codex's
+> objection to the global gate that re-opened it after I conceded to AGY), while
+> **FLUSH-at-BulkEnd supplies AGY's duration bound** — the exposure ends at a
+> well-defined atomic event rather than persisting for a session lifetime. Crucially the
+> flush is now tied to **BulkEnd**, an atomic local event, not to a mutable peer version
+> — which is what made the v6-r6 flush racy.
+>
+> **Cost:** one bit (or an `Option<u32>` domain) per session entry, set at admission.
+> No new wire field — authoritativeness is *derived* from the existing length-gate.
+
+**Superseded v6-r6 text — the flip must be a transition with an action.** Two options:
 
 - **Flush** every peer-imported session admitted while the peer was < v2. The cluster
   already performs a bulk resync on connect, so the cost is one resync during an
@@ -893,7 +982,7 @@ Path C is a **PR series**, not one PR:
 |---|---|---|---|
 | **C-P0** | dense static interning of RI names → `routing_domain: u32`; populate the dead `meta.routing_table` slot at **every** ingress producer (native ingress, local delivery, GRE decap, fabric ingress). **No behaviour change** — nothing reads it yet. | no | unit |
 | **C-P2** | add `routing_domain` to `SessionKey` + the four transforms in `session/key.rs`; store ingress **and** egress domain in `SessionMetadata`; fabric exemption. | no | RED-on-revert + negative control |
-| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **`CurrentHAProtocolVersion` → 2 + `MinCompat` = 1 + the `parseHAProtocolCompatible` change + version-gated enforcement (§4.3b)**. | yes | `make test-failover` + short-payload decode + **mixed-version enforcement-off** test |
+| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **pin `SessionSyncWireVersion` + `CurrentHAProtocolVersion` → 2 with `MinCompat` = 1 (§4.3b — `parseHAProtocolCompatible` NOT touched)**; **per-entry provenance + BulkEnd flush (§4.3c)**. | yes | `make test-failover` + short-payload decode + the three provenance assertions + the four race tests |
 
 **C-P0 additionally owns** the pure-function domain derivation and the extension of the
 existing commit collision gate to cover it (§5). Because the derivation is stateless,
@@ -953,10 +1042,15 @@ slot. A missed producer leaves domain 0 on a real VRF flow, which under Path C m
 **silent failure to match** — a self-DoS, not a security hole, but a production outage
 all the same. The inventory:
 
+> **CORRECTED in v6-r7 (Codex r5).** The v6-r6 table derived the domain from
+> `ifindex_to_routing_instance[meta.ingress_ifindex]`. That is **wrong**, and wrong in
+> this issue's own headline scenario. See the axis note below the table.
+
 | Ingress producer | Domain source | Note |
 |---|---|---|
-| native interface ingress | `ifindex_to_routing_instance[ingress_ifindex]` → interned id | the common case |
+| native interface ingress | resolve the **logical unit** first, then look up the RI from it | **corrected** — see below |
 | PBR-steered | the PBR-resolved routing-instance (`ingress_route_table_override`) | must agree with the FIB table actually used |
+| **local-origin GRE from the tunnel TUN** | the tunnel endpoint's RI | **added (Codex r5)** — `afxdp/tunnel.rs:344-381` reads the TUN and installs forward+reverse sessions at `:595-654`. A genuine producer v6-r6 missed entirely. |
 | GRE decap | the **tunnel logical** interface's RI | `gre.rs:760` already rebinds `ingress_ifindex` to `endpoint.logical_ifindex`, so this falls out of the native rule — **verified** |
 | fabric cross-chassis | **exempt** — do not compare | `packet_fabric_ingress` is already a parameter at `poll_descriptor/mod.rs:448` |
 | local delivery / host-inbound | default domain | `forwarding/host_inbound.rs` |
@@ -964,6 +1058,52 @@ all the same. The inventory:
 | **host-generated ICMP error state** (ICMP unreachable / time-exceeded / PTB) | inherit the **triggering packet's** domain — do **not** fall back to 0 | `afxdp/icmp_embed/`, `afxdp/icmp_ptb.rs` — AGY r2 |
 | **NAT64 / NPTv6 synthetic translation flows** | the domain of the admitting side | `nat64.rs` — AGY r2; interacts with the cross-family key transform |
 | peer-synced sessions | the wire field; absent → **do not enforce** (§4.3b), not "0 = default" | corrected in v6-r3 |
+
+#### The ifindex axis — and why the natural test passes against the broken design
+
+`ifindex_to_routing_instance` is keyed by the **LOGICAL UNIT** ifindex.
+`meta.ingress_ifindex` is the **RAW PHYSICAL** ifindex. They are not the same key
+space, and `poll_descriptor/prerouting_scope.rs:32-59` states the consequence outright:
+
+> *"a VLAN sub-interface's physical bind ifindex maps only to its parent's FIRST unit"*
+
+That file exists because #5802 fixed **exactly this class of scope-escape** for
+pre-routing NAT: scoping against the raw physical ifindex on a trunk whose VLAN units
+sit in distinct routing-instances let a packet on one unit match another unit's scoped
+rule.
+
+**Applied to #2387 this is not a degradation, it is a total failure of the fix.** This
+issue's headline scenario is *two VLAN sub-units on one parent in different
+routing-instances*. Under the v6-r6 derivation **both units resolve to the parent's
+first unit's RI, so both get the SAME domain** — the widened key discriminates nothing,
+and the collision survives untouched.
+
+**Correct derivation** — mirror `prerouting_ingress_scope`:
+
+```
+logical = resolve_ingress_logical_ifindex(forwarding, physical_ifindex, ingress_vlan_id)
+              .unwrap_or(physical_ifindex)          // forwarding/mod.rs:114
+domain  = intern(ifindex_to_routing_instance[logical])
+```
+
+An untagged port has no `(parent, vlan)` entry, so `logical == physical` and the result
+is byte-identical to the naive form — which is precisely why the error is invisible on
+every non-trunk topology.
+
+> #### TEST AXIS — state this, do not leave it implied
+>
+> **The fixture MUST vary the VLAN-unit axis on ONE shared parent.** That is the axis
+> the defect lives on, because it is the only axis on which the physical and logical
+> ifindex diverge.
+>
+> **A fixture that varies the physical-port axis — two RIs on two separate NICs —
+> PASSES against the broken design**, because there `logical == physical` and the naive
+> lookup happens to be right. Such a test would have shipped a fix that does not fix
+> this issue while showing green, and would have survived RED-on-revert (reverting the
+> field still breaks it, so the revert-check gives no warning either).
+>
+> Any reviewer of the eventual PR should check this axis **first**, before reading the
+> implementation.
 
 **Two producers AGY r2 asked for were verified NOT to exist and are deliberately
 omitted:** **VXLAN decap** (no VXLAN implementation in `userspace-dp/src` — the sole
@@ -977,9 +1117,9 @@ while making it less true.
 | Class | Path A | Path B (DENY) | Path C (ISOLATE) |
 |---|---|---|---|
 | Behavioural regression | NONE | MED — a mis-derived domain drops a legitimate flow (self-DoS) | MED-HIGH — a mis-derived domain either fails to match (self-DoS) or cross-matches |
-| HA mixed-version | NONE | NONE (value-only, no sync semantics) | **MED** — the *payload* is additive, but §4.3b's fail-open at domain 0 forces version-gated enforcement, so C-P3 carries a `CurrentHAProtocolVersion` bump **and** a change to the ISSU compatibility predicate. Still **rolling** (via the declared `MinCompat` floor), so v4's "HIGH / non-rolling flag day" rating remains withdrawn — but v6-r1's "LOW / no version bump" was too optimistic. |
+| HA mixed-version | NONE | NONE (value-only, no sync semantics) | **LOW-MED** — payload additive; C-P3 pins `SessionSyncWireVersion` and bumps `CurrentHAProtocolVersion` into the window the mixed-base gate already accepts. **Rolling through both gates.** Mixed-version correctness rests on per-entry provenance (§4.3c), not on a global version predicate. |
 | Wire / struct | NONE | NONE | LOW-MED — +4 B key, two additive trailing wire fields, golden fixture regen |
-| Upgrade-gate blast radius | NONE | NONE | **MED (new in v6-r3)** — `parseHAProtocolCompatible` decides whether *any* release is rolling-upgradable. Loosening it to a declared floor is what the unused `MinCompatHAProtocolVersion` was written for, but it widens what the gate permits for every future release, not just this one. |
+| Upgrade-gate blast radius | NONE | NONE | **NONE — WITHDRAWN in v6-r7.** `parseHAProtocolCompatible` is no longer touched: the mixed-base gate already honours the `MinCompat` floor, and the real blocker is fixed by pinning `SessionSyncWireVersion` (§4.3b). |
 | Performance | NONE | NONE | **UNMEASURED** — one extra `write_u32`/hash, +4 B/entry; must be benchmarked (§4.4) |
 | Security posture | leaves a hijack surface | closes hijack, opens a co-tenant DoS | closes hijack without opening a DoS |
 | Semantics | contradicts shipped A.1 text | contradicts shipped A.1 text + Junos parity | matches both |
@@ -1001,11 +1141,23 @@ cross-domain packet does not match, and an intra-domain reply still does.
   positional/derived interning scheme, which is exactly the defect v6-r2 shipped.
   A second case: delete an RI and assert its id is **not reissued** to a new RI, and
   that its sessions were flushed.
-- **Mixed-version enforcement-off (new in v6-r3):** with the peer advertising
-  `HAProtocolVersion` 1, assert the upgraded node performs **no** domain comparison —
-  i.e. behaviour is byte-identical to today, and specifically that a domain-0 packet
-  does **not** match a legacy-synced session that would have collided under §4.3b's
-  refuted trace.
+- **Mixed-version provenance (REPLACES the withdrawn v6-r3 test).** Codex r5 caught that
+  the v6-r3 version of this test was **self-contradictory**: it demanded behaviour
+  "byte-identical to today" *and* that a same-5-tuple default-domain packet not match a
+  legacy row — with enforcement off it necessarily *would* match. Replaced with three
+  separate assertions on the §4.3c provenance design:
+  1. a peer-imported row whose frame **lacked** the domain field is non-authoritative,
+     and a same-5-tuple domain-0 packet **does** match it (fail-open continuity — the
+     deliberate, bounded choice);
+  2. a peer-imported row whose frame **carried** the field is authoritative, and a
+     cross-domain packet does **not** match it;
+  3. at the `BulkEnd` of the first authoritative bulk, the remaining non-authoritative
+     peer-imported rows are **flushed**, so assertion (1) no longer holds afterwards.
+     This is the bound, and it is the assertion that proves the exposure is finite.
+- **Race coverage for §4.3c** — a test per Codex race: sync-before-heartbeat start
+  order; a sync disconnect that retains v1 rows; a v2 heartbeat arriving *before*
+  `BulkEnd`; and `StopHeartbeat`/timeout entering single-node election, asserting
+  **locally-created** rows stay authoritative and isolated throughout.
 - **RED-on-revert, the issue's stated regression:** two VLAN sub-units on one parent,
   two routing-instances, each with PBR `then routing-instance`, identical 5-tuples,
   differing policy/NAT ⇒ assert **no** session reuse across the boundary **and**
