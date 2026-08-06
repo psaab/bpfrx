@@ -21,10 +21,14 @@ import (
 //
 // SCOPE, stated rather than implied. This asserts that the single
 // programRethMAC call site in pkg/daemon passes a third argument that is not
-// the literal `nil`. It does NOT prove the hook reaches
-// Link().PrepareLinkCycle(), and it cannot see a hook that is non-nil but
-// returns nil unconditionally. It binds the specific regression shape: quietly
-// dropping the hook at the consumer while the producer's tests stay green.
+// the literal `nil`, and that the apply loop reaches it through
+// programRethMACWithWorkerJoin — the wrapper the behavioural tests in
+// reth_prepare_abort_recovery_5103_test.go drive, which is where the hook is
+// built and where an aborted cycle is rolled back. It cannot see a hook that is
+// non-nil but returns nil unconditionally, and it does not see the
+// `networkdErr = errors.Join(...)` line that carries the wrapper's commit error
+// into the tail. It binds the specific regression shape: quietly dropping the
+// hook, or the wrapper, at the consumer while the producer's tests stay green.
 func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
 	const file = "daemon_apply_dataplane.go"
 
@@ -35,9 +39,16 @@ func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
 	}
 
 	calls := 0
+	wrapperCalls := 0
 	ast.Inspect(f, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			if sel.Sel.Name == "programRethMACWithWorkerJoin" {
+				wrapperCalls++
+			}
 			return true
 		}
 		id, ok := call.Fun.(*ast.Ident)
@@ -65,5 +76,14 @@ func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("expected exactly 1 programRethMAC call site in %s, found %d — this canary "+
 			"is keyed to that call site and is not checking anything otherwise", file, calls)
+	}
+	// The apply loop must go through the wrapper, not around it: calling
+	// programRethMAC directly from the loop would keep the hook and lose the
+	// rollback of an aborted cycle (#5103 F4), with every behavioural test in
+	// reth_prepare_abort_recovery_5103_test.go still green because they drive
+	// the wrapper.
+	if wrapperCalls != 1 {
+		t.Fatalf("expected exactly 1 programRethMACWithWorkerJoin call site in %s, found %d",
+			file, wrapperCalls)
 	}
 }

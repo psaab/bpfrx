@@ -464,6 +464,15 @@ func (a *LegacyDataPlaneAdapter) RecordDeferredWorkerArmDebt() {
 	m.RecordDeferredWorkerArmDebt()
 }
 
+// PrepareLinkCycle on the adapter is NOT the live path. The daemon reaches the
+// manager through Link(), which resolves a nil/unavailable manager to
+// dataplane.NewDataPlaneLinkController(nil) — a no-op controller that returns nil
+// ("nothing to join, proceed"). This method answers the same condition with an
+// error ("worker state unknown, abort") and is retained for the retirement
+// canary's LegacyDataPlaneAdapter surface. The divergence is deliberate: a nil
+// manager reached via Link() means no userspace dataplane is wired at all, while a
+// managerOrErr failure here means one was expected and could not be resolved. A
+// future caller must pick Link() unless it specifically wants the second reading.
 func (a *LegacyDataPlaneAdapter) PrepareLinkCycle() error {
 	m, err := a.managerOrErr()
 	if err != nil {

@@ -68206,3 +68206,46 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #6871 gate fold: bind the production adapter, restore the aborted-cycle recovery
+
+- **Timestamp**: 2026-08-06
+- **Action**: F1 — the fail-closed tests drove `Manager.PrepareLinkCycle`
+  directly, leaving `userspaceLinkController.PrepareLinkCycle` (the ONLY
+  production path from the daemon's `beforeCycle` hook to the manager) unbound:
+  `_ = c.manager.PrepareLinkCycle()` there still detected and logged the failed
+  join, handed the caller nil, and restored #5103 whole with the whole suite
+  green. All three now call through `m.Link()`, plus a new nil-manager guard.
+  F2 — `process_linkcycle.go` claimed the ctrl-disable error "is RETURNED rather
+  than discarded" directly above the block that discards it; reworded to
+  CAPTURED, pointing at the scope note at the return. F3 — `docs/reth-mac.md`
+  gained a "#5103" section covering the join -> cycle -> rebind contract, the
+  abort-without-touching-the-link semantics and the rollback; the #5134 table
+  still pointed `reapplyAfterDeferredMAC` at `daemon_apply.go` (moved in #4407).
+  F4 (REGRESSION) — a `beforeCycle` failure aborts with ctrl already disabled
+  and workers possibly joined, and nothing re-armed them: the post-cycle rebind
+  is gated on `linkCycled` (false) and `reapplyAfterDeferredMAC` on
+  `rethMACPending`, computed BEFORE `networkd.Apply` and false for a member
+  renamed into existence by the same apply. Before this PR the triple self-healed
+  because the cycle ran regardless. New `programRethMACWithWorkerJoin` owns the
+  hook, sends the documented inverse of `stop_workers` (`rebind`, via
+  `NotifyLinkCycle`) on the abort, and returns an `errRethPrepareLinkCycle`
+  commit error the loop joins into `networkdErr`; ordinary MAC-set failures stay
+  warn-only. NIT — named which of the two `PrepareLinkCycle` implementations is
+  the live path.
+- **Validation**: `go build ./...` exit 0; `go test ./pkg/daemon ./pkg/cluster
+  ./pkg/vrrp ./pkg/dataplane/... -count=1 -race` exit 0. Mutations: M1 (drop the
+  `NotifyLinkCycle` rollback) REDs `...AbortRebindsAfterFailedJoin_5103` at
+  "NotifyLinkCycle calls = 0, want 1"; M2 (return nil instead of the classified
+  error) REDs the same test at "a failed worker join must reach the commit";
+  M3 (escalate every MAC error) REDs `...OrdinaryFailureStaysWarnOnly_5103`;
+  M4 (call `programRethMAC(.., nil)` from the loop) REDs the AST canary on both
+  the nil-hook and call-count assertions. F1 mutation (`_ =` in the adapter)
+  REDs `...ErrorsWhenStopWorkersFails_5103` at `:41`. Every over-reach guard
+  stayed GREEN under M1/M2.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/reth_hook_wired_5103_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/link_cycle_failclosed_5103_test.go,
+  pkg/dataplane/userspace/legacy_dataplane.go, docs/reth-mac.md, _Log.md

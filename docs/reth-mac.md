@@ -67,6 +67,60 @@ also restores that function's live-address-change detection, which
 requires an UP link to distinguish `IFF_LIVE_ADDR_CHANGE` drivers from
 those that need a cycle.
 
+## The AF_XDP Worker Join Precedes the Link Cycle (#5103)
+
+`PrepareLinkCycle`'s contract is that **no thread touches UMEM once it
+returns** — it disables `ctrl` so the XDP shim stops redirecting to XSK, then
+sends `stop_workers` so the Rust helper joins every worker thread. That barrier
+therefore has to land **before** the NIC tears down its queues, not after: a
+worker still reading UMEM while the driver unmaps those pages is a
+use-after-unmap.
+
+It cannot simply be hoisted above `programRethMAC`. Whether a cycle happens at
+all is only knowable by **attempting** the live MAC set — success means the
+driver has `IFF_LIVE_ADDR_CHANGE` and no cycle occurs. Joining unconditionally
+would impose a forwarding outage on every RETH MAC apply on mlx5 and virtio (the
+cluster's own NICs), to protect a path they never take.
+
+So the join is a hook. `programRethMAC` takes a `beforeCycle func() error` and
+invokes it **at most once, on the fallback path only** — after the live set has
+been rejected, before `setDown`:
+
+```
+set-mac-live (rejected) → beforeCycle (stop_workers) → link-down → set-mac → link-up → rebind
+```
+
+`PrepareLinkCycle` returns an `error` across `LinkController` and every
+implementation. A void return made a failed join indistinguishable from a
+successful one, so the link cycled with workers still live.
+
+**Abort semantics.** A rejected live set does not change link state — the kernel
+refuses the address change outright — so when `beforeCycle` returns an error the
+link is exactly as it was found. `programRethMAC` returns `(false, err)` **without
+touching the link**: the member keeps its previous MAC, which the next apply
+retries; cycling out from under live workers is not recoverable.
+
+**The abort is not side-effect-free, and owns its own rollback.** By the time the
+hook fails, `PrepareLinkCycle` has already disabled `ctrl` (and cleared every
+binding row if that disable could not be verified), and the helper may or may not
+have joined its workers. Nothing downstream re-arms that: the post-cycle rebind is
+gated on `linkCycled` (false — the cycle was aborted), and
+`reapplyAfterDeferredMAC` is gated on `rethMACPending`, which is computed *before*
+`networkd.Apply` and is false for a member that the same apply renamed into
+existence. `programRethMACWithWorkerJoin` therefore sends the documented inverse of
+`stop_workers` — `rebind`, via `NotifyLinkCycle()` — and returns a
+`errRethPrepareLinkCycle`-classified error that the caller joins into the commit
+error, so the commit reports FAILURE instead of success over a half-torn-down
+dataplane. Ordinary netlink MAC-set failures stay warn-only, as they always have.
+
+| File | Function |
+|------|----------|
+| `pkg/daemon/daemon_reth.go` | `programRethMAC(ifName, mac, beforeCycle)` — invokes the hook on the cycle path only, aborts without touching the link |
+| `pkg/daemon/daemon_apply_dataplane.go` | `programRethMACWithWorkerJoin()` — builds the hook, rolls back an aborted prepare, classifies the commit error |
+| `pkg/dataplane/userspace/process_linkcycle.go` | `Manager.PrepareLinkCycle()` — ctrl disable + `stop_workers`, returns the join error |
+| `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.PrepareLinkCycle()` — the live production adapter from the daemon hook to the manager |
+| `userspace-dp/src/server/handlers/stop_workers.rs` | helper side of the join; `rebind.rs` is its inverse |
+
 ## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
 
 Programming the virtual MAC can happen two ways:
@@ -104,8 +158,8 @@ node never terminally publishes a workerless snapshot while reporting success.
 
 | File | Function |
 |------|----------|
-| `pkg/daemon/daemon_apply.go` | `reapplyAfterDeferredMAC()` — mandatory re-apply; records debt on failure |
-| `pkg/daemon/daemon_apply.go` | `recordDataplaneWorkerArmDebt()` — routes the debt to the dataplane |
+| `pkg/daemon/daemon_apply_dataplane.go` | `reapplyAfterDeferredMAC()` — mandatory re-apply; records debt on failure (moved from `daemon_apply.go` in #4407) |
+| `pkg/daemon/daemon_apply_dataplane.go` | `recordDataplaneWorkerArmDebt()` — routes the debt to the dataplane |
 | `pkg/dataplane/userspace/manager_worker_arm_5134.go` | `RecordDeferredWorkerArmDebt()` / `retryDeferredWorkerArmLocked()` |
 | `pkg/dataplane/userspace/process_status.go` | status loop drives the retry each tick |
 
@@ -125,7 +179,7 @@ node never terminally publishes a workerless snapshot while reporting success.
 | `pkg/cluster/reth.go` | `RethMAC(clusterID, rgID)` -- returns deterministic MAC |
 | `pkg/cluster/reth.go` | `IsVirtualRethMAC(mac)` -- detects virtual RETH pattern |
 | `pkg/daemon/daemon_reth.go` | `renameRethMember()` -- renames a member found by virtual MAC (down → rename → **up**, #3920) |
-| `pkg/daemon/daemon_reth.go` | `programRethMAC()` -- sets MAC via netlink (step 2.6 in applyConfig) |
+| `pkg/daemon/daemon_reth.go` | `programRethMAC()` -- sets MAC via netlink (step 2.6 in applyConfig); takes the mandatory `beforeCycle` AF_XDP worker-join hook (#5103) |
 | `pkg/dataplane/compiler.go` | Skips `.link` file when RETH member has virtual MAC |
 
 ## Impact

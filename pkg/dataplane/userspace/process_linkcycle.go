@@ -155,12 +155,14 @@ func (m *Manager) PrepareLinkCycle() error {
 	// verified the wrapper clears all bindings fail-closed so the shim has
 	// no READY slot to redirect to while the workers are being joined.
 	//
-	// #5103: the error is RETURNED rather than discarded. But it must NOT
-	// short-circuit the worker join below — the join is the half that makes
-	// UMEM safe to unmap, and skipping it on a ctrl-disable failure would
-	// leave workers running through the very link cycle this function exists
-	// to protect. The wrapper has already cleared all binding rows fail-closed,
-	// so the shim has nothing READY to redirect into while the join proceeds.
+	// #5103: the ctrl-disable error is CAPTURED rather than acted on here (see
+	// the scope note at the return — it is deliberately NOT folded into this
+	// function's error). Above all it must NOT short-circuit the worker join
+	// below — the join is the half that makes UMEM safe to unmap, and skipping
+	// it on a ctrl-disable failure would leave workers running through the very
+	// link cycle this function exists to protect. The wrapper has already
+	// cleared all binding rows fail-closed, so the shim has nothing READY to
+	// redirect into while the join proceeds.
 	ctrlErr := m.disableCtrlBeforeTeardownLocked()
 	// Tell the Rust helper to stop all workers. This joins worker
 	// threads so they stop touching UMEM before the NIC unmaps pages

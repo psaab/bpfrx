@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strings"
 	"time"
 
@@ -261,7 +262,8 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		// runs before the link is touched. Most drivers (mlx5, virtio)
 		// support IFF_LIVE_ADDR_CHANGE, so the hook never fires and workers
 		// keep running — the cost is paid only on the drivers that force a
-		// cycle.
+		// cycle. programRethMACWithWorkerJoin owns the hook and the rollback
+		// of a prepare whose cycle then aborted.
 
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -287,22 +289,15 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			ensureRethLinkOriginalName(linuxName)
 			setRethIPv6Knobs(linuxName)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-			// beforeCycle runs only when a cycle is actually required, and
-			// before the link is touched. Returning an error aborts the MAC
-			// program with the link untouched: the member keeps its previous
-			// MAC (recoverable, and the next apply retries) rather than
-			// cycling out from under live workers (not recoverable).
-			beforeCycle := func() error {
-				if d.dp == nil {
-					return nil
-				}
-				slog.Info("userspace: stopping workers before RETH MAC link cycle",
-					"iface", linuxName)
-				return d.dp.Link().PrepareLinkCycle()
-			}
-			linkCycled, err := programRethMAC(linuxName, mac, beforeCycle)
-			if err != nil {
-				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
+			linkCycled, prepareErr := d.programRethMACWithWorkerJoin(linuxName, mac)
+			if prepareErr != nil {
+				// #5103: only the failed-worker-join class reaches here (an
+				// ordinary MAC-set failure stays warn-only, as it always has).
+				// Joined into networkdErr — the same tail-commit channel the
+				// device-map teardown (#5309) and the management-VRF rebind
+				// (#5700) use — so the commit reports FAILURE instead of
+				// success over a dataplane left mid-teardown.
+				networkdErr = errors.Join(networkdErr, prepareErr)
 			}
 			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
 			clearDadFailed(linuxName)
@@ -458,6 +453,76 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	}
 
 	return commitOverlay, networkdErr, applyErr, nil
+}
+
+// errRethPrepareLinkCycle classifies a programRethMAC failure whose cause was
+// the #5103 AF_XDP worker-join hook. It exists so the caller can fail the commit
+// closed on exactly that class: an ordinary netlink MAC-set failure has always
+// been warn-only and stays so, because it disturbs nothing but the member's MAC.
+var errRethPrepareLinkCycle = errors.New("reth mac: af_xdp worker join before link cycle")
+
+// programRethMACWithWorkerJoin programs a RETH member's virtual MAC with the
+// #5103 worker-join hook, and unwinds that join when the hook is what aborted
+// the MAC program. It returns whether the link was cycled and a COMMIT error,
+// non-nil only for the failed-join class.
+//
+// The hook runs only when a cycle is actually required — programRethMAC calls it
+// after the live MAC set has been rejected and before setDown, the first
+// mutation — so aborting there leaves the LINK exactly as it was found and the
+// member on its previous MAC, which the next apply retries.
+//
+// The DATAPLANE is not left as it was found. By the time PrepareLinkCycle
+// returns an error it has already disabled ctrl (and cleared every binding row
+// if that disable could not be verified), and the helper may or may not have
+// joined its workers — "the outcome is unknown" is precisely the failure. That
+// half-applied prepare has no other owner on the abort path:
+//
+//   - the post-cycle rebind (step 2.6b2) is gated on linkCycled, which the abort
+//     makes false; and
+//   - reapplyAfterDeferredMAC is gated on rethMACPending, which is computed
+//     BEFORE networkd.Apply — and is false for a member that this same apply
+//     renamed into existence.
+//
+// Before #5103 that triple self-healed for the wrong reason: the cycle ran
+// whether or not the workers had been joined, so linkCycled was true and
+// NotifyLinkCycle rebound the sockets. Aborting the cycle is the correct
+// behaviour, but it must keep the recovery. "rebind" is the documented inverse of
+// "stop_workers" (userspace-dp/src/server/handlers/stop_workers.rs: "The
+// subsequent rebind request ... recreates workers with fresh sockets"), and
+// NotifyLinkCycle is what sends it — so the rollback is that same call, driven by
+// the abort instead of by a cycle that never happened. Its 1s NIC-settle sleep is
+// paid only here.
+//
+// Reachability is narrow — a driver without IFF_LIVE_ADDR_CHANGE (not the
+// cluster's mlx5/virtio NICs) plus a control-socket failure in the same window —
+// and the direction is fail-CLOSED throughout: ctrl is off, so transit is dropped,
+// never passed.
+func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAddr) (linkCycled bool, commitErr error) {
+	joinFailed := false
+	beforeCycle := func() error {
+		if d.dp == nil {
+			return nil
+		}
+		slog.Info("userspace: stopping workers before RETH MAC link cycle", "iface", ifName)
+		if err := d.dp.Link().PrepareLinkCycle(); err != nil {
+			joinFailed = true
+			return err
+		}
+		return nil
+	}
+	linkCycled, err := programRethMAC(ifName, mac, beforeCycle)
+	if err != nil {
+		slog.Warn("failed to set RETH MAC", "iface", ifName, "mac", mac, "err", err)
+	}
+	if err == nil || !joinFailed {
+		return linkCycled, nil
+	}
+	// joinFailed implies the hook ran past its d.dp == nil guard.
+	slog.Warn("userspace: RETH MAC link cycle aborted after the worker join failed; "+
+		"rebinding AF_XDP sockets so the prepare is not left half-applied",
+		"iface", ifName, "err", err)
+	d.dp.Link().NotifyLinkCycle()
+	return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err)
 }
 
 func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {

@@ -14,6 +14,15 @@ import (
 //
 // These bind the error return itself. Without them the signature could carry an
 // error that is never non-nil, which is the same fail-open wearing a type.
+//
+// They call through m.Link() — the userspaceLinkController adapter — rather than
+// m.PrepareLinkCycle() directly, because that adapter is the ONLY production path
+// from the daemon's beforeCycle hook down to the manager
+// (daemon_apply_dataplane.go -> dataplane.LinkController.PrepareLinkCycle ->
+// Manager.PrepareLinkCycle). Driving the manager directly leaves the adapter
+// unbound: dropping its return (`_ = c.manager.PrepareLinkCycle()`) still detects
+// and logs the failed join inside the manager, still hands the caller nil, and so
+// restores #5103 whole — with every one of these tests green.
 
 // TestPrepareLinkCycleErrorsWhenStopWorkersFails_5103 is the fail-closed guard.
 // The control server is given NO responses, so the stop_workers request fails,
@@ -27,7 +36,7 @@ func TestPrepareLinkCycleErrorsWhenStopWorkersFails_5103(t *testing.T) {
 	// so the stop_workers request cannot complete. That is exactly the
 	// condition under which the workers have NOT been joined.
 
-	err := m.PrepareLinkCycle()
+	err := m.Link().PrepareLinkCycle()
 	if err == nil {
 		t.Fatal("PrepareLinkCycle returned nil after the stop_workers request failed. The " +
 			"workers were not joined, so the caller would take the NIC down while threads " +
@@ -52,7 +61,7 @@ func TestPrepareLinkCycleSucceedsWhenWorkersJoin_5103(t *testing.T) {
 		{PID: 4242, Bindings: []BindingStatus{{Slot: 1, Ifindex: 2, QueueID: 0, Ready: true}}},
 	})
 
-	if err := m.PrepareLinkCycle(); err != nil {
+	if err := m.Link().PrepareLinkCycle(); err != nil {
 		t.Fatalf("PrepareLinkCycle must return nil when the workers join cleanly; got %v", err)
 	}
 	first := nextLinkCycleControlEvent(t, events)
@@ -67,7 +76,21 @@ func TestPrepareLinkCycleSucceedsWhenWorkersJoin_5103(t *testing.T) {
 // here would block RETH MAC programming on every non-userspace deployment.
 func TestPrepareLinkCycleNoHelperIsNotAnError_5103(t *testing.T) {
 	m := New()
-	if err := m.PrepareLinkCycle(); err != nil {
+	if err := m.Link().PrepareLinkCycle(); err != nil {
 		t.Errorf("no running helper means no workers to join; got %v", err)
+	}
+}
+
+// TestPrepareLinkCycleNilManagerAdapterIsNotAnError_5103 pins the adapter's own
+// nil-manager branch. It is the one place the adapter is allowed to answer nil
+// without consulting a manager, and it must stay that way: an adapter that
+// reported an error here would abort RETH MAC programming on every deployment
+// with no userspace manager wired. Together with the guard above, this is the
+// negative control for the fail-closed assertion — an adapter that always
+// returned an error would satisfy that one and fail these two.
+func TestPrepareLinkCycleNilManagerAdapterIsNotAnError_5103(t *testing.T) {
+	var c userspaceLinkController // manager == nil
+	if err := c.PrepareLinkCycle(); err != nil {
+		t.Errorf("a nil manager means no workers to join; got %v", err)
 	}
 }
