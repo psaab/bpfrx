@@ -48,6 +48,7 @@ def snap(
     rep_upserts=0,
     rep_enqueued=0,
     rep_blocked=0,
+    rep_depth_sum=0,
     rep_depth=0,
     workers=None,
     helper_pid=4242,
@@ -70,6 +71,7 @@ def snap(
             "upserts_total": rep_upserts,
             "enqueued_total": rep_enqueued,
             "lock_contended_total": rep_blocked,
+            "queue_depth_sum": rep_depth_sum,
             "queue_depth_max": rep_depth,
         },
         "workers": workers if workers is not None else {},
@@ -262,8 +264,8 @@ class QueueDepthIsItsOwnFinding(unittest.TestCase):
         """Depth and contention are different failures.
 
         Producers never collide (0 blocked enqueues) but the consuming worker
-        is 4000 commands behind. Reporting only the mutex ratio would call
-        this run clean.
+        is ~4000 commands behind on average. Reporting only the mutex ratio
+        would call this run clean.
         """
         a = analyze(
             snap(0.0, workers=six_even_workers(0)),
@@ -277,6 +279,8 @@ class QueueDepthIsItsOwnFinding(unittest.TestCase):
                 rep_upserts=200_000,
                 rep_enqueued=1_200_000,
                 rep_blocked=0,
+                # 200k replications averaging depth 4000.
+                rep_depth_sum=800_000_000,
                 rep_depth=4_000,
                 workers=six_even_workers(200_000),
             ),
@@ -284,6 +288,7 @@ class QueueDepthIsItsOwnFinding(unittest.TestCase):
         self.assertEqual(a.verdict, VALID, a.reasons)
         self.assertIn("replicate_session_upsert_queue_backlog", a.culprits)
         self.assertNotIn("replicate_session_upsert", a.culprits)
+        self.assertAlmostEqual(a.replication_queue_depth_mean, 4_000.0)
 
     def test_shallow_queue_is_not_a_backlog(self):
         a = analyze(
@@ -298,10 +303,93 @@ class QueueDepthIsItsOwnFinding(unittest.TestCase):
                 rep_upserts=200_000,
                 rep_enqueued=1_200_000,
                 rep_blocked=0,
+                rep_depth_sum=1_200_000,  # mean depth 6
                 rep_depth=6,
                 workers=six_even_workers(200_000),
             ),
         )
+        self.assertEqual(a.culprits, [])
+
+    def test_stale_lifetime_high_water_cannot_manufacture_a_backlog(self):
+        """THE regression this class exists for.
+
+        `..._queue_depth_max` is a process-lifetime `fetch_max`: it never
+        falls. An earlier cell (or an earlier test run in the same helper
+        process) that spiked to 50k leaves it pinned at 50k forever. Reading
+        that absolute value as a window reading made EVERY subsequent cell
+        report a replication backlog — and it poisoned them by naming the
+        replication queue, which is precisely the site the #2852 Phase-2
+        decision turns on. A systematic bias toward the wrong answer, wearing
+        a VALID verdict.
+
+        Here the lifetime max is already 50_000 at window START and does not
+        move; depth SUM is flat, so the true mean depth this window is ~0.
+
+        RED on revert: keying the backlog off `replication_queue_depth_max`
+        again fails the assertNotIn on its message.
+        """
+        already_high = 50_000
+        a = analyze(
+            snap(
+                0.0,
+                rep_depth_sum=0,
+                rep_depth=already_high,
+                workers=six_even_workers(0),
+            ),
+            snap(
+                10.0,
+                allocations=200_000,
+                nat_acq=400_000,
+                nat_blocked=40,
+                pub_acq=600_000,
+                pub_blocked=60,
+                rep_upserts=200_000,
+                rep_enqueued=1_200_000,
+                rep_blocked=0,
+                # Depth summed to 200_000 over 200_000 replications: a mean
+                # of 1.0, i.e. the consumer kept up perfectly.
+                rep_depth_sum=200_000,
+                rep_depth=already_high,  # unchanged — no new record
+                workers=six_even_workers(200_000),
+            ),
+        )
+        self.assertEqual(a.verdict, VALID, a.reasons)
+        self.assertNotIn(
+            "replicate_session_upsert_queue_backlog",
+            a.culprits,
+            "a stale process-lifetime high-water must not name a culprit for a "
+            "window in which the queue never backed up",
+        )
+        self.assertEqual(a.culprits, [])
+        self.assertAlmostEqual(a.replication_queue_depth_mean, 1.0)
+        # The lifetime value is still REPORTED — operators want it — it just
+        # cannot vote. And this window set no new record.
+        self.assertEqual(a.replication_queue_depth_max_lifetime, already_high)
+        self.assertFalse(a.replication_queue_depth_new_record)
+
+    def test_new_record_is_reported_as_context_but_still_does_not_vote(self):
+        """A new all-time high with a healthy MEAN is not a backlog.
+
+        One transient spike in an otherwise-drained window is exactly the
+        thing a peak would over-report and a mean correctly does not.
+        """
+        a = analyze(
+            snap(0.0, rep_depth=100, rep_depth_sum=0, workers=six_even_workers(0)),
+            snap(
+                10.0,
+                allocations=200_000,
+                nat_acq=400_000,
+                pub_acq=600_000,
+                rep_upserts=200_000,
+                rep_enqueued=1_200_000,
+                rep_depth_sum=400_000,  # mean 2.0 — drained fine
+                rep_depth=9_999,  # one spike set a new all-time high
+                workers=six_even_workers(200_000),
+            ),
+        )
+        self.assertEqual(a.verdict, VALID, a.reasons)
+        self.assertTrue(a.replication_queue_depth_new_record)
+        self.assertEqual(a.replication_queue_depth_max_lifetime, 9_999)
         self.assertEqual(a.culprits, [])
 
     def test_fanout_multiplier_is_recovered_from_the_counter_pair(self):
@@ -356,19 +444,24 @@ class ValidityGates(unittest.TestCase):
         self.assertTrue(any("helper restarted" in r for r in a.reasons))
 
     def test_counter_regression_is_invalid(self):
-        """A backwards counter means the scrape crossed helper processes even
-        if the pid happened to be unavailable."""
+        """A backwards counter is caught even when the pid did NOT change.
+
+        Same pid on both sides, so the restart comparison passes cleanly and
+        the monotonicity check is unambiguously what fires — the belt behind
+        the pid check, for a restart that reused a pid or a scrape that
+        crossed processes some other way.
+        """
         before = snap(
-            0.0, helper_pid=None, allocations=900_000, nat_acq=2_000_000,
+            0.0, helper_pid=777, allocations=900_000, nat_acq=2_000_000,
             workers=six_even_workers(0),
         )
         after = snap(
-            10.0, helper_pid=None, allocations=1_000, nat_acq=2_000,
+            10.0, helper_pid=777, allocations=1_000, nat_acq=2_000,
             workers=six_even_workers(1_000),
         )
         a = analyze(before, after)
         self.assertEqual(a.verdict, INVALID)
-        self.assertTrue(any("went backwards" in r for r in a.reasons))
+        self.assertTrue(any("went backwards" in r for r in a.reasons), a.reasons)
 
     def test_non_positive_window_is_invalid(self):
         a = analyze(
@@ -493,9 +586,141 @@ class ValidityGates(unittest.TestCase):
         self.assertAlmostEqual(a.max_worker_share, 0.8)
         self.assertTrue(any("single-worker-bound" in r for r in a.reasons))
 
-    def test_missing_series_raises_rather_than_scoring_zero(self):
-        before = snap(0.0)
-        after = snap(10.0, allocations=1_000)
+    def test_zero_offered_rate_is_invalid_not_an_unratioed_pass(self):
+        """A broken generator must not yield a firewall number.
+
+        The shell derived the offered rate from `generator.json`; an
+        unparseable report arrived here as `--offered-rate 0`. Zero is falsy,
+        so `accept_ratio` stayed None, and the generator-bound INCONCLUSIVE
+        check tests `accept_ratio is not None` — so the check that exists to
+        catch a broken generator was DISABLED BY THE BROKEN GENERATOR, and
+        the cell came back VALID.
+
+        RED on revert: restoring the falsy `if offered_flows_per_sec:` guard
+        without the explicit <= 0 refusal makes this VALID.
+        """
+        healthy_after = snap(
+            10.0,
+            allocations=1_000_000,
+            nat_acq=2_000_000,
+            pub_acq=3_000_000,
+            rep_upserts=1_000_000,
+            rep_enqueued=6_000_000,
+            rep_depth_sum=1_000_000,
+            workers=six_even_workers(1_000_000),
+        )
+        a = analyze(
+            snap(0.0, workers=six_even_workers(0)),
+            healthy_after,
+            offered_flows_per_sec=0.0,
+        )
+        self.assertEqual(a.verdict, INVALID)
+        self.assertTrue(any("not a measurement" in r for r in a.reasons))
+
+        # Negative offered rates are refused the same way.
+        b = analyze(
+            snap(0.0, workers=six_even_workers(0)),
+            healthy_after,
+            offered_flows_per_sec=-1.0,
+        )
+        self.assertEqual(b.verdict, INVALID)
+
+        # ...while OMITTING the offered rate entirely stays a legitimate mode
+        # (a manual run with no generator report). It just cannot be
+        # generator-gated, and says so by leaving accept_ratio None.
+        c = analyze(
+            snap(0.0, workers=six_even_workers(0)),
+            healthy_after,
+            offered_flows_per_sec=None,
+        )
+        self.assertEqual(c.verdict, VALID, c.reasons)
+        self.assertIsNone(c.accept_ratio)
+
+    def test_missing_timestamp_is_invalid_not_an_inflated_window(self):
+        """A missing `t` used to default to 0.0.
+
+        With `before.t` absent and `after.t` a real unix timestamp, the window
+        became ~1.7e9 seconds: past the minimum-window gate, with a rate of
+        essentially zero that still read VALID.
+        """
+        before = snap(0.0, workers=six_even_workers(0))
+        del before["t"]
+        after = snap(
+            1.75e9,
+            allocations=1_000_000,
+            nat_acq=2_000_000,
+            pub_acq=3_000_000,
+            rep_upserts=1_000_000,
+            rep_enqueued=6_000_000,
+            workers=six_even_workers(1_000_000),
+        )
+        a = analyze(before, after)
+        self.assertEqual(a.verdict, INVALID)
+        self.assertTrue(any("before.t" in r for r in a.reasons))
+
+    def test_missing_helper_pid_is_invalid_not_a_skipped_restart_check(self):
+        """`helper_pid` is the only direct restart detector.
+
+        Absent on either side, the comparison used to be skipped outright —
+        and the shell manufactured that absence whenever `pidof` failed.
+        """
+        before = snap(0.0, workers=six_even_workers(0))
+        before["helper_pid"] = None
+        after = snap(
+            10.0,
+            allocations=1_000_000,
+            nat_acq=2_000_000,
+            pub_acq=3_000_000,
+            rep_upserts=1_000_000,
+            rep_enqueued=6_000_000,
+            workers=six_even_workers(1_000_000),
+        )
+        a = analyze(before, after)
+        self.assertEqual(a.verdict, INVALID)
+        self.assertTrue(any("before.helper_pid" in r for r in a.reasons))
+
+    def test_absent_worker_series_is_invalid_not_two_skipped_gates(self):
+        """The worst of the three: an empty `workers` map disabled BOTH
+        cross-worker gates.
+
+        `if installs and ...` guarded the RSS-distribution check and
+        `max_worker_share is not None` guarded the skew check. With no
+        per-worker series, neither ran — so a run steered entirely onto one
+        RX queue would sail through as a cross-worker lock bound, the exact
+        mis-attribution the gates exist to prevent.
+        """
+        empty = {}
+        a = analyze(
+            snap(0.0, workers=empty),
+            snap(
+                10.0,
+                allocations=1_000_000,
+                nat_acq=2_000_000,
+                nat_blocked=1_000_000,
+                pub_acq=3_000_000,
+                pub_blocked=1_500_000,
+                rep_upserts=1_000_000,
+                rep_enqueued=6_000_000,
+                rep_blocked=3_000_000,
+                workers=empty,
+            ),
+        )
+        self.assertEqual(a.verdict, INVALID)
+        self.assertTrue(
+            any("RSS-distribution and worker-skew gates" in r for r in a.reasons)
+        )
+        self.assertEqual(a.culprits, [])
+
+    def test_missing_counter_series_raises_rather_than_scoring_zero(self):
+        """A missing COUNTER is an error, not a zero.
+
+        Every REQUIRED_SNAPSHOT_KEY is present here, so this reaches the
+        counter reads and proves `_get` still refuses to invent a value —
+        scoring an absent contention series as 0 would report a clean site
+        that was never measured.
+        """
+        before = snap(0.0, workers=six_even_workers(0))
+        after = snap(10.0, allocations=1_000, workers=six_even_workers(1_000))
         del after["publish"]["lock_contended_total"]
         with self.assertRaises(SnapshotError):
             analyze(before, after)
@@ -518,6 +743,7 @@ xpf_userspace_shared_session_publish_lock_contended_total 900000
 xpf_userspace_session_replication_upserts_total 1000000
 xpf_userspace_session_replication_enqueued_total 6000000
 xpf_userspace_session_replication_lock_contended_total 1200000
+xpf_userspace_session_replication_queue_depth_sum 2500000
 xpf_userspace_session_replication_queue_depth_max 17
 xpf_userspace_worker_new_flow_installs_total{worker_id="0"} 170000
 xpf_userspace_worker_new_flow_installs_total{worker_id="1"} 166000
@@ -539,6 +765,7 @@ class ScrapeParsing(unittest.TestCase):
         self.assertEqual(s["pool"]["live_lock_acquisitions_total"], 2_000_000)
         self.assertEqual(s["pool"]["live_lock_contended_total"], 40_000)
         self.assertEqual(s["publish"]["lock_contended_total"], 900_000)
+        self.assertEqual(s["replicate"]["queue_depth_sum"], 2_500_000)
         self.assertEqual(s["replicate"]["queue_depth_max"], 17)
         self.assertEqual(s["workers"], {"0": 170000, "1": 166000, "2": 164000})
         self.assertEqual(s["helper_pid"], 7)

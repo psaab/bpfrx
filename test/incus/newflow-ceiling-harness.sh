@@ -162,8 +162,16 @@ scrape() { # scrape <output-path>
         || fail "metrics scrape failed on $ACTIVE_FW ($METRICS_URL)"
 }
 
+# The helper pid is the analyzer's only direct restart detector, so a failed
+# lookup must fail the cell rather than be papered over with a 0 — a snapshot
+# without it would silently skip the restart comparison.
 helper_pid() {
-    incus_cmd exec "$ACTIVE_FW" -- pidof xpf-userspace-dp 2>/dev/null | awk '{print $1}'
+    local pid
+    pid="$(incus_cmd exec "$ACTIVE_FW" -- pidof xpf-userspace-dp 2>/dev/null | awk '{print $1}')"
+    if [[ -z "$pid" ]]; then
+        return 1
+    fi
+    printf '%s' "$pid"
 }
 
 # --- rate sweep -----------------------------------------------------------
@@ -178,7 +186,11 @@ for rate in "${RATE_LIST[@]}"; do
     # cell's teardown (RST-closed sessions are held 2s, #4800 H1).
     sleep "$SETTLE_SEC"
 
-    pid_before="$(helper_pid)"
+    if ! pid_before="$(helper_pid)"; then
+        echo "  helper pid not readable before the cell — cell refused" >&2
+        overall_rc=1
+        continue
+    fi
     scrape "$cell/before.prom"
     t_before="$(date +%s.%N)"
 
@@ -190,7 +202,12 @@ for rate in "${RATE_LIST[@]}"; do
 
     t_after="$(date +%s.%N)"
     scrape "$cell/after.prom"
-    pid_after="$(helper_pid)"
+    if ! pid_after="$(helper_pid)"; then
+        echo "  helper pid not readable after the cell (helper died?) —" \
+             "cell refused" >&2
+        overall_rc=1
+        continue
+    fi
 
     if [[ $gen_rc -ne 0 ]]; then
         echo "  generator exited $gen_rc — cell refused, see $cell/generator.err" >&2
@@ -202,7 +219,7 @@ for rate in "${RATE_LIST[@]}"; do
     # Pool selection, monotonicity, validity and attribution all live on the
     # Python side; this step only reshapes.
     python3 - "$cell" "$POOL_NAME" "$RULE_NAME" "$t_before" "$t_after" \
-        "${pid_before:-0}" "${pid_after:-0}" "$ANALYZER" <<'PY' \
+        "$pid_before" "$pid_after" "$ANALYZER" <<'PY' \
         || fail "snapshot normalization failed for $cell (see $cell/*.prom)"
 import json, os, sys
 
@@ -217,7 +234,7 @@ for name, ts, pid in (("before", t0, pid0), ("after", t1, pid1)):
             timestamp=float(ts),
             pool_name=pool,
             rule_name=rule,
-            helper_pid=int(pid) or None,
+            helper_pid=int(pid),
         )
     with open(os.path.join(cell, name + ".json"), "w", encoding="utf-8") as f:
         json.dump(snap, f, indent=2)
@@ -226,10 +243,24 @@ PY
     # Offered rate = the generator's own achieved handshake rate, not the
     # requested one. Comparing accepted flows against a rate the generator
     # never actually produced would blame the firewall for client shortfall.
-    offered="$(python3 -c '
+    #
+    # An unparseable report FAILS THE CELL. It must never degrade to 0: the
+    # analyzer's generator-bound check is keyed on this value, so a silent 0
+    # would disable the very check that catches a broken generator, and the
+    # cell would come back VALID with a firewall number behind it.
+    if ! offered="$(python3 -c '
 import json, sys
-print(json.load(open(sys.argv[1]))["established_per_sec"])
-' "$cell/generator.json" 2>/dev/null || echo 0)"
+d = json.load(open(sys.argv[1]))
+v = float(d["established_per_sec"])
+if v <= 0:
+    raise SystemExit("generator established no connections")
+print(v)
+' "$cell/generator.json")"; then
+        echo "  generator report unparseable or reported zero established" \
+             "connections — cell refused, see $cell/generator.json" >&2
+        overall_rc=1
+        continue
+    fi
 
     python3 "$ANALYZER" "$cell/before.json" "$cell/after.json" \
         --offered-rate "$offered" --json > "$cell/analysis.json"

@@ -33,13 +33,37 @@ generator that never reached its offered rate, traffic landing on too few RX
 queues). Only `VALID` results may be used to argue about the install path,
 and even then `saturated=False` with an empty culprit list is a real and
 common answer.
+
+No refusal may be disabled by its own input going missing
+---------------------------------------------------------
+Every gate here is only as trustworthy as the value it reads, and the
+recurring bug shape is a MISSING INPUT DEGRADING INTO A VALUE THAT HAPPENS
+TO SKIP THE CHECK rather than trip it. Five instances were found and closed
+together:
+
+* the sibling queue depth was read as a process-lifetime high-water, so one
+  spike in an earlier cell made every later cell report a replication
+  backlog — biased toward naming the exact site the #2852 Phase-2 decision
+  turns on. Now keyed on a differenceable window MEAN;
+* an unparseable generator report reached here as `--offered-rate 0`, which
+  left `accept_ratio` at None and skipped the generator-bound check, so a
+  broken generator produced a firewall number. Now INVALID;
+* a missing `t` defaulted to 0.0, which either killed the window or inflated
+  it to ~1.7e9 seconds and yielded a near-zero rate that still read VALID;
+* a missing `helper_pid` skipped the restart comparison outright;
+* an absent per-worker series left `installs` empty, and the `if installs`
+  guards skipped BOTH cross-worker gates — the two that stop a run steered
+  onto a single RX queue reading as a cross-worker lock bound.
+
+The last three are refused up front by `REQUIRED_SNAPSHOT_KEYS`. When adding
+a gate, add its input there too, and ask what an absent value does: if the
+answer is "the gate does not run", the gate fails open.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import sys
 from dataclasses import dataclass, field
@@ -56,11 +80,20 @@ from typing import Dict, List, Mapping, Optional, Sequence
 #: with its ratio but not named a culprit.
 DEFAULT_SATURATION_RATIO = 0.10
 
-#: The sibling replication queue counts as backlogged at this observed depth
-#: high-water. Steady-state depth is O(1) — the consuming worker drains every
-#: poll — so a triple-digit high-water means the consumer fell behind, which
-#: is a different failure from producers colliding on the queue mutex.
-DEFAULT_QUEUE_DEPTH_BACKLOG = 64
+#: The sibling replication queue counts as backlogged at this MEAN
+#: worst-sibling depth per replicated flow (`Δqueue_depth_sum / Δupserts`).
+#: Steady-state depth is O(1) — the consuming worker drains every poll — so a
+#: double-digit mean means the consumer is persistently behind, which is a
+#: different failure from producers colliding on the queue mutex.
+#:
+#: A MEAN, deliberately, not a peak. The helper's `..._queue_depth_max` is a
+#: process-lifetime high-water: it never falls, so it cannot be differenced
+#: across a window and one spike leaves it elevated for the life of the
+#: process. Reading it as a window value made every cell after the first
+#: spike report a replication backlog — a systematic bias toward naming the
+#: exact site the #2852 Phase-2 decision turns on. The sum is differenceable
+#: by construction and carries nothing into the next window.
+DEFAULT_QUEUE_DEPTH_BACKLOG = 16.0
 
 #: Minimum measurement window. Shorter windows let one status-poll jitter
 #: dominate the rate.
@@ -129,8 +162,20 @@ MONOTONIC_FIELDS = (
     "replicate.upserts_total",
     "replicate.enqueued_total",
     "replicate.lock_contended_total",
+    "replicate.queue_depth_sum",
     "replicate.queue_depth_max",
 )
+
+#: Snapshot keys that are REQUIRED to be present and usable, over and above
+#: the counters above. Each one gates a refusal, and a gate whose own input
+#: can go missing is a gate that fails open — the failure mode this whole
+#: layer exists to prevent. `t` bounds the window (a missing one silently
+#: becomes 0.0 and either kills the window or inflates it to ~1.7e9 seconds,
+#: yielding a rate near zero that still reads VALID); `helper_pid` is the
+#: only direct restart detector; `workers` is the sole input to BOTH
+#: cross-worker gates, so an absent per-worker series would let a run steered
+#: onto a single RX queue pass as a cross-worker lock bound.
+REQUIRED_SNAPSHOT_KEYS = ("t", "helper_pid", "workers")
 
 
 def _get(snapshot: Mapping, dotted: str) -> int:
@@ -187,7 +232,15 @@ class Analysis:
     #: interesting real-world answer is "publish and replicate both saturated
     #: before NAT did", and a single-winner report would hide half of it.
     culprits: List[str] = field(default_factory=list)
-    replication_queue_depth_max: int = 0
+    #: Mean worst-sibling queue depth per replicated flow over THIS window
+    #: (Δqueue_depth_sum / Δupserts). The only depth reading any verdict
+    #: rests on. None when nothing replicated.
+    replication_queue_depth_mean: Optional[float] = None
+    #: Process-lifetime high-water. OPERATOR CONTEXT ONLY — see the module
+    #: docstring; it cannot be differenced and must never gate a culprit.
+    replication_queue_depth_max_lifetime: int = 0
+    #: Whether THIS window set a new all-time depth record.
+    replication_queue_depth_new_record: bool = False
     replication_fanout: Optional[float] = None
     worker_installs: Dict[str, int] = field(default_factory=dict)
     active_workers: int = 0
@@ -208,7 +261,9 @@ class Analysis:
             "saturated": self.saturated,
             "culprits": list(self.culprits),
             "sites": [s.as_dict() for s in self.sites],
-            "replication_queue_depth_max": self.replication_queue_depth_max,
+            "replication_queue_depth_mean": self.replication_queue_depth_mean,
+            "replication_queue_depth_max_lifetime": self.replication_queue_depth_max_lifetime,
+            "replication_queue_depth_new_record": self.replication_queue_depth_new_record,
             "replication_fanout": self.replication_fanout,
             "worker_installs": dict(self.worker_installs),
             "active_workers": self.active_workers,
@@ -222,7 +277,7 @@ def analyze(
     *,
     offered_flows_per_sec: Optional[float] = None,
     saturation_ratio: float = DEFAULT_SATURATION_RATIO,
-    queue_depth_backlog: int = DEFAULT_QUEUE_DEPTH_BACKLOG,
+    queue_depth_backlog: float = DEFAULT_QUEUE_DEPTH_BACKLOG,
     min_window_s: float = DEFAULT_MIN_WINDOW_S,
     min_accept_ratio: float = DEFAULT_MIN_ACCEPT_RATIO,
     min_active_workers: int = DEFAULT_MIN_ACTIVE_WORKERS,
@@ -235,7 +290,49 @@ def analyze(
     ``verdict`` is the first thing a caller must read: only ``VALID`` results
     describe the install path.
     """
-    elapsed = float(after.get("t", 0.0)) - float(before.get("t", 0.0))
+    # --- inputs the refusals below depend on --------------------------------
+    # FIRST, before anything reads them. Every check further down is only as
+    # trustworthy as its input, and each of these previously degraded to a
+    # default that DISABLED its check rather than tripping it: a missing `t`
+    # became 0.0 (window either zero or ~1.7e9 seconds), a missing
+    # `helper_pid` skipped the restart comparison outright, and an absent
+    # `workers` map skipped BOTH cross-worker gates. Absent input is a
+    # collection failure, and a collection failure is not a measurement.
+    missing = []
+    for snap_name, snap in (("before", before), ("after", after)):
+        for k in REQUIRED_SNAPSHOT_KEYS:
+            if snap.get(k) is None:
+                missing.append(f"{snap_name}.{k}")
+    if missing:
+        return Analysis(
+            verdict=INVALID,
+            reasons=[
+                "snapshot is missing input(s) that gate a refusal, so those "
+                "refusals could not run: " + ", ".join(missing)
+            ],
+        )
+    if not after["workers"] and not before["workers"]:
+        return Analysis(
+            verdict=INVALID,
+            reasons=[
+                "no per-worker new-flow install series in either snapshot: the "
+                "RSS-distribution and worker-skew gates have no input, so a "
+                "run steered onto a single RX queue could not be distinguished "
+                "from a genuine cross-worker result"
+            ],
+        )
+    if offered_flows_per_sec is not None and offered_flows_per_sec <= 0:
+        return Analysis(
+            verdict=INVALID,
+            reasons=[
+                f"offered rate is {offered_flows_per_sec}: zero (or negative) "
+                "offered load is not a measurement. A generator that produced "
+                "no parseable output must fail the cell, not silently disable "
+                "the generator-bound check"
+            ],
+        )
+
+    elapsed = float(after["t"]) - float(before["t"])
 
     # --- structural validity ------------------------------------------------
     # Checked before any rate is computed, so an invalid run never gets to
@@ -247,9 +344,9 @@ def analyze(
             elapsed_s=elapsed,
         )
 
-    before_pid = before.get("helper_pid")
-    after_pid = after.get("helper_pid")
-    if before_pid is not None and after_pid is not None and before_pid != after_pid:
+    before_pid = before["helper_pid"]
+    after_pid = after["helper_pid"]
+    if before_pid != after_pid:
         return Analysis(
             verdict=INVALID,
             reasons=[
@@ -322,15 +419,27 @@ def analyze(
             )
         )
 
-    # Depth is a monotonic high-water GAUGE, so the meaningful reading is the
-    # absolute `after` value, not the delta. It is reported alongside the
-    # replication lock ratio because the two say different things: contention
-    # means producers collided, depth means the consumer never caught up.
-    result.replication_queue_depth_max = _get(after, "replicate.queue_depth_max")
-
     upserts = deltas["replicate.upserts_total"]
     if upserts > 0:
         result.replication_fanout = deltas["replicate.enqueued_total"] / upserts
+        # THE backlog statistic: mean worst-sibling depth per replicated flow
+        # over THIS window. Differenceable by construction, so nothing an
+        # earlier cell did can leak into this one.
+        result.replication_queue_depth_mean = (
+            deltas["replicate.queue_depth_sum"] / upserts
+        )
+
+    # Reported for operators, never a verdict input. A process-lifetime
+    # high-water cannot be differenced (it never falls, so a zero delta spans
+    # "no backlog" through "a backlog up to the previous all-time high") and
+    # its absolute value stays elevated for the life of the helper after one
+    # spike. `replication_queue_depth_new_record` says only whether THIS
+    # window set a new all-time high — context for the mean above, not a
+    # substitute for it.
+    result.replication_queue_depth_max_lifetime = _get(
+        after, "replicate.queue_depth_max"
+    )
+    result.replication_queue_depth_new_record = deltas["replicate.queue_depth_max"] > 0
 
     # Culprits: every saturated site, ratio-descending. Ties keep LOCK_SITES
     # order so the output is deterministic.
@@ -339,9 +448,13 @@ def analyze(
         key=lambda s: (-(s.ratio or 0.0), [n for n, _, _ in LOCK_SITES].index(s.name)),
     )
     result.culprits = [s.name for s in ordered]
-    if result.replication_queue_depth_max >= queue_depth_backlog:
+    if (
+        result.replication_queue_depth_mean is not None
+        and result.replication_queue_depth_mean >= queue_depth_backlog
+    ):
         # A distinct culprit from the replication MUTEX: same subsystem,
-        # different remedy (drain rate vs. lock sharding).
+        # different remedy (drain rate vs. lock sharding). Keyed on the
+        # WINDOW MEAN, never on the lifetime high-water.
         result.culprits.append("replicate_session_upsert_queue_backlog")
 
     # --- worker distribution -------------------------------------------------
@@ -474,10 +587,17 @@ def parse_prometheus_text(
             )
         return int(rows[0][1])
 
-    workers = {
-        labels.get("worker_id", "?"): int(value)
-        for labels, value in _samples(text, "xpf_userspace_worker_new_flow_installs_total")
-    }
+    worker_rows = _samples(text, "xpf_userspace_worker_new_flow_installs_total")
+    if not worker_rows:
+        # An absent per-worker series is a collection failure, not "zero
+        # workers". Returning {} here would leave both cross-worker gates
+        # with no input, and a gate with no input is a gate that does not run.
+        raise SnapshotError(
+            "scrape has no xpf_userspace_worker_new_flow_installs_total series: "
+            "the RSS-distribution and worker-skew gates would have nothing to "
+            "evaluate. Check the helper build carries the #4800 counters"
+        )
+    workers = {labels.get("worker_id", "?"): int(value) for labels, value in worker_rows}
 
     return {
         "t": float(timestamp),
@@ -517,6 +637,9 @@ def parse_prometheus_text(
             "lock_contended_total": _scalar(
                 text, "xpf_userspace_session_replication_lock_contended_total"
             ),
+            "queue_depth_sum": _scalar(
+                text, "xpf_userspace_session_replication_queue_depth_sum"
+            ),
             "queue_depth_max": _scalar(
                 text, "xpf_userspace_session_replication_queue_depth_max"
             ),
@@ -549,8 +672,20 @@ def render(a: Analysis) -> str:
         lines.append(
             f"  {s.name:<26} {s.contended_delta:>12} / {s.acquisitions_delta:<14} {ratio}{flag}"
         )
+    mean = (
+        "n/a"
+        if a.replication_queue_depth_mean is None
+        else f"{a.replication_queue_depth_mean:.1f}"
+    )
+    lines.append(f"  replication queue depth, WINDOW MEAN: {mean}   <- the verdict input")
+    record = " (new record set this window)" if a.replication_queue_depth_new_record else ""
     lines.append(
-        f"  replication queue depth high-water: {a.replication_queue_depth_max}"
+        f"  replication queue depth, process-lifetime high-water: "
+        f"{a.replication_queue_depth_max_lifetime}{record}"
+    )
+    lines.append(
+        "    ^ operator context only — a lifetime max cannot be differenced "
+        "and never gates a culprit"
     )
     if a.replication_fanout is not None:
         lines.append(f"  replication fan-out (enqueued/upserts): {a.replication_fanout:.2f}")
@@ -582,7 +717,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="generator-reported offered new flows/sec, if known",
     )
     p.add_argument("--saturation-ratio", type=float, default=DEFAULT_SATURATION_RATIO)
-    p.add_argument("--queue-depth-backlog", type=int, default=DEFAULT_QUEUE_DEPTH_BACKLOG)
+    p.add_argument("--queue-depth-backlog", type=float, default=DEFAULT_QUEUE_DEPTH_BACKLOG)
     p.add_argument("--min-window", type=float, default=DEFAULT_MIN_WINDOW_S)
     p.add_argument("--min-accept-ratio", type=float, default=DEFAULT_MIN_ACCEPT_RATIO)
     p.add_argument("--min-active-workers", type=int, default=DEFAULT_MIN_ACTIVE_WORKERS)
