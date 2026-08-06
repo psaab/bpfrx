@@ -925,6 +925,47 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 round 5: stop summarizing recovery; the claim's SHAPE was wrong
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: The round-4 gate returned MERGE-NEEDS-MAJOR on the recovery
+  enumeration — the fourth wrong version of one claim. Rather than write a
+  fifth, the claim is removed from the test comment entirely.
+  **G1 — the enumeration read as categorical and every row has preconditions.**
+  "Controlled RG0 promotion — OPEN" is conditional: `election.go` returns early
+  on `m.kernelUpgradeHold` and promotes only when `rg.Weight > 0`, so with zero
+  weight or an active hold no promotion happens. And even a manager-level
+  promotion may not clear the store gate — `Manager.sendEvent` is NON-BLOCKING
+  and drops on a full channel, while the dropped-event fallback never reconciles
+  `Store.ClusterReadOnly`. Filed as **#6889**.
+  **G2 — "console on the seated secondary — CLOSED" has a counterexample.** The
+  store starts WRITABLE, a new RG starts already secondary, and
+  `SetClusterReadOnly(true)` fires only on a TRANSITION — so a non-preempt
+  cold-start standby never gets it. REST calls `EnterConfigureSession` with no
+  RG0 check of its own. Filed as **#6890**.
+  **The fix is structural, not another rewrite.** Four attempts — "console
+  access only", a README path the commit gate closes, "no recovery at all", and
+  an enumeration — were each refuted, and each read as MORE authoritative than
+  the last. A claim about what an operator can do to recover a distributed
+  system has too many preconditions to survive as prose in a unit-test comment.
+  The comment now says so and points at pkg/cluster/README.md, which carries the
+  conditional account with the two issues inline.
+  What step 20 needs is the narrow, stable part: the cluster cannot recover on
+  its own, so a key commit that restarts comms turns a routine config change
+  into an operator-visible incident. That argument never depended on the
+  recovery details.
+  **G3/G4 — "permanent deadlock" wording** (3 sites) softened to match, and the
+  round-3 `_Log.md` entry corrected in place: it still said "none of them now
+  mutates `d`" after round 4 established they DO mutate `d` (stopClusterComms
+  increments the counter each subtest measures) and only do not REWRITE
+  `d.activeClusterTransport`.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go, pkg/cluster/README.md, _Log.md
+- **Validation**: `go vet ./pkg/daemon/` rc=0; `go test` rc=0 for pkg/daemon and
+  pkg/cluster. `git diff --quiet HEAD -- '*.go' ':(exclude)**/*_test.go'` rc=0 —
+  production untouched in rounds 2, 3, 4 and 5. The round-4 gate found NO
+  runtime or guard-coverage findings; every finding since has been about what
+  the artifacts CLAIM.
+
 ## 2026-08-05 — #6865 round 4: three revisions of one claim, wrong in three directions
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
@@ -983,7 +1024,8 @@
   that DOES add ControlLinkAuthKey to clusterTransportKey, running the keyed
   subtest first masked `key_commit_must_not_restart` (Codex measured both
   orders). Deleted; the three subtests are order-independent only because none
-  of them now mutates `d`.
+  of them REWRITES `d.activeClusterTransport` (they DO mutate `d` — stopClusterComms
+  increments the counter each subtest measures; corrected in round 4).
   **F2 — two measured escapes, disclosed not closed.** A keyed check derived
   from `d.store.ActiveConfig()` rather than the candidate `cfg` leaves the whole
   package green (the fixture's store holds no committed cluster stanza, while a

@@ -29,8 +29,9 @@ import (
 // connection at the moment it became keyed, the secondary would still be
 // unkeyed, and — since #5078 makes a keyed node reject an unkeyed peer, with no
 // migration window — the cluster could never converge. The cluster cannot get
-// itself out of that state. An operator can, but only by deliberately failing
-// the cluster over — see the enumerated recovery paths below.
+// itself out of that state; whether an OPERATOR can, and under which
+// preconditions, is in pkg/cluster/README.md — deliberately not summarized
+// here (see the note on the sibling test below).
 //
 // Adding `ControlLinkAuthKey` to clusterTransportKey looks obviously correct
 // ("restart comms when the key changes") and would silently create that
@@ -92,13 +93,13 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 //	}
 //
 // so a `|| keyChanged` clause added THERE, leaving clusterTransportKey and
-// clusterTransportFromConfig byte-identical, produces exactly the permanent
+// clusterTransportFromConfig byte-identical, produces exactly the
 // deadlock this PR exists to prevent — and the whole suite stays green. Before
 // this test there was no coverage of that site at all: grep for
 // `activeClusterTransport` or "restarting comms" across *_test.go returned
 // nothing.
 //
-// Why the deadlock is permanent. A seated RG0 secondary is config read-only
+// Why the cluster cannot self-recover. A seated RG0 secondary is config read-only
 // (SetClusterReadOnly(true) on demotion; EnterConfigureSession returns
 // ErrClusterReadOnly), and config-sync rides the SAME SessionSync stream this
 // PR fail-closes. So the key reaches the secondary ONLY over the already
@@ -107,27 +108,23 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 // primary then rejects its handshake forever, and the secondary cannot be keyed
 // locally.
 //
-// Recovery: exactly ONE path works, and it costs a controlled outage. Three
-// revisions of this comment got it wrong in three different directions — first
-// "console access to the standby", then a README path that is closed, then "no
-// recovery at all". Each replaced a hedge with an absolute. So the paths are
-// enumerated here individually rather than summarized into a verdict:
+// Recovery is CONDITIONAL and is NOT described here. Four revisions of this
+// comment tried to summarize it and all four were refuted — "console access
+// only", then a README path the commit gate closes, then "no recovery exists",
+// then an enumeration that read as categorical when every row has preconditions
+// (RG0 weight, kernel-upgrade hold, whether the promotion event was delivered
+// at all — see #6889 and #6890, both found while checking this very comment).
 //
-//   - Primary-only rekey — CLOSED. Clearing the key leaves an unkeyed
-//     `chassis cluster`, which is what the commit gate rejects, so
-//     `delete chassis cluster authentication-key; commit` is refused by
-//     `validateClusterAuthKeyStrict` (#6630).
-//   - Console on the seated secondary — CLOSED. The read-only gate is on the
-//     CONFIG STORE, not the transport, so EnterConfigureSession returns
-//     ErrClusterReadOnly however the operator reached the box.
-//   - Controlled RG0 promotion — OPEN. Stop xpfd on the keyed primary; the
-//     secondary wins the election and applyRG0OwnershipTransition(StatePrimary)
-//     calls store.SetClusterReadOnly(false), so it accepts a local commit of
-//     the same key. Restart the old primary and the pair converges keyed.
+// The lesson, kept because it is the transferable part: a claim about what an
+// operator can do to recover a distributed system does not belong in a unit
+// test comment. It has too many preconditions to state in prose that stays
+// true, and each attempt read as more authoritative than the last.
 //
-// So step 20 must never restart comms on a key commit not because the state is
-// unrecoverable, but because the only way out is a deliberate single-node
-// outage — a config commit that silently becomes a failover.
+// pkg/cluster/README.md holds the current conditional account. Go there.
+//
+// What step 20 needs from all of this is only the narrow part, which IS stable:
+// the cluster cannot recover on its own, so a key commit that restarts comms
+// converts a routine config change into an operator-visible incident.
 //
 // Observable: clusterCommsGen. stopClusterComms bumps it before anything else,
 // and startClusterComms bumps it via beginClusterCommsEpoch, so an unchanged
@@ -187,7 +184,7 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 				"(clusterCommsGen %d -> %d): that drops the established session-sync "+
 				"connection at the moment the primary becomes keyed, and it is the ONLY "+
 				"path by which the key can reach a config read-only secondary — the "+
-				"rollout then deadlocks permanently (#5078)", before, after)
+				"rollout then deadlocks (#5078)", before, after)
 		}
 	})
 

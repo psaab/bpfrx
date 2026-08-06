@@ -291,14 +291,26 @@ individually so the next reader does not have to take a verdict on trust:
 2. **Console on the seated secondary — CLOSED.** The read-only gate is on the
    **config store**, not the transport, so `EnterConfigureSession` returns
    `ErrClusterReadOnly` however the operator reached the box.
-3. **Controlled RG0 promotion — OPEN, and this is the one.** Stop `xpfd` on the
-   keyed primary. The secondary times it out, wins the election, and
-   `applyRG0OwnershipTransition(StatePrimary)` calls
-   `d.store.SetClusterReadOnly(false)` ("became primary for RG0, enabling config
-   writes"). The now-primary node accepts a local commit of the same key;
-   restart the old primary and the pair converges keyed. This is the same
-   stop-one-node shape already documented above for
-   `configuration-synchronize`.
+3. **Controlled RG0 promotion — the only path that can work, and it is
+   CONDITIONAL.** Stop `xpfd` on the keyed primary; *if* the secondary wins the
+   election, `applyRG0OwnershipTransition(StatePrimary)` calls
+   `d.store.SetClusterReadOnly(false)` and the now-primary node accepts a local
+   commit of the same key. Restart the old primary and the pair converges keyed.
+   Same stop-one-node shape documented above for `configuration-synchronize`.
+
+   **Each "if" is a real precondition, not a formality:**
+   - the secondary must be eligible — `election.go` returns early on
+     `m.kernelUpgradeHold`, and promotes only when `rg.Weight > 0`. Zero weight
+     or an active upgrade hold and no promotion happens at all;
+   - the promotion **event must be delivered**. `Manager.sendEvent` is
+     non-blocking and drops on a full channel, and the dropped-event fallback
+     does not reconcile `Store.ClusterReadOnly` — so the manager can report RG0
+     primary while the store stays read-only. Tracked as **#6889**;
+   - relatedly, a cold-start standby may never have had `SetClusterReadOnly(true)`
+     called at all, and REST has no RG0 check of its own. Tracked as **#6890**.
+
+   So do not read this row as a procedure. It is the path that exists; whether
+   it is available on a given cluster at a given moment depends on all three.
 
 So the state is recoverable, but only by deliberately failing the cluster over —
 you have turned a config commit into an outage. That is why committing
