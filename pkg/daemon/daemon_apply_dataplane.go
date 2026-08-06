@@ -539,8 +539,22 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 	}
 	if linkCycled {
 		// The cycle completed and only link-up failed. Fail the commit — the
-		// member is administratively down — but leave the rebind to step 2.6b2,
-		// which owns it for every cycled member.
+		// member is administratively down, and NOTHING repairs it: the MAC
+		// write succeeded, so every later apply early-returns on
+		// bytes.Equal(current, mac) and never attempts setUp again, and the
+		// only other nlLinkSetUp on a RETH member runs at daemon start. It
+		// stays down until a restart while step 2.6b2 rebinds AF_XDP sockets
+		// onto it.
+		//
+		// Leave the rebind to step 2.6b2, which owns it for every cycled
+		// member. Note that suppression is per-MEMBER while 2.6b2's gate
+		// (needLinkCycleRecovery) is a per-APPLY accumulator, so an apply that
+		// mixes a cycled member with an aborted one pays BOTH this rollback's
+		// rebind and 2.6b2's. That is benign: the first rebind recreates
+		// workers, so tear_down's had_live_workers is true and the 500ms
+		// zero-copy quiesce IS armed on the second (the #1921 EBUSY-loop
+		// condition is had_live_workers == false), and each NotifyLinkCycle
+		// carries its own 1s settle.
 		return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err)
 	}
 	slog.Warn("userspace: RETH MAC link cycle did not complete after the worker join; "+

@@ -68300,3 +68300,23 @@ break — `go vet` confirmed passing under every revert.
   copy.
 - **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
   pkg/daemon/reth_prepare_abort_recovery_5103_test.go, docs/reth-mac.md, _Log.md
+
+## 2026-08-06 — #6871 fold r4 (gate MINOR-1 / MINOR-2)
+
+- **Timestamp**: 2026-08-06 04:20 PDT
+- **Action**: Bind the errors.Join line that carries the wrapper's commit error
+  into the tail — the entire payload of the fail-the-commit widening, and
+  previously unbound. Correct the double-rebind comment: the suppression is
+  per-MEMBER while step 2.6b2's gate is a per-APPLY accumulator.
+- **File(s)**: pkg/daemon/reth_hook_wired_5103_test.go,
+  pkg/daemon/daemon_apply_dataplane.go
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/cluster
+  ./pkg/vrrp ./pkg/dataplane/... -count=1 -race rc=0; gofmt clean.
+- **NOTE — the first attempt at this guard did not bind.** A presence-only AST
+  walk for the AssignStmt passed under `if false && prepareErr != nil`, because
+  the node is still present, merely unreachable. That is the shape-not-effect
+  failure this canary exists to catch, and it was found only by RUNNING the
+  reported mutation rather than assuming. The guard now asserts the guarding
+  CONDITION is exactly the binary expression `prepareErr != nil`, so a
+  `false &&` wrapper (Op == token.LAND) fails it. Both mutations now red:
+  neutralising the condition, and deleting the join outright.
