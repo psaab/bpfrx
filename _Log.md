@@ -70485,3 +70485,47 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **Validation**: comment-only, no behaviour change. `go build ./...` 0;
   `go test ./pkg/config ./pkg/configstore` 0.
 - **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go, _Log.md
+
+## 2026-08-06 — #6861 r5: every clause of the anchor predicate is now measured
+
+- **Timestamp**: 2026-08-06
+- **Context**: a parent mutation grid found the emitted-POINTER clause UNBOUND at
+  both sites — deletable from either predicate with the whole suite green — while
+  the r4 comment asserted it was load-bearing and told the next reader not to
+  simplify it. A comment was the only thing preventing the simplification. Both
+  resolutions were left open: the clause is real and untested, or it is redundant
+  and the comment is wrong.
+- **Action** (interface site — the clause is REAL, answer (a)): reproduced the
+  shape the comment claimed. A bare `reth0` with an interface-level ipip stanza
+  emits, and `snapshotLinuxName` binds that endpoint to the physical member
+  `ge-0-0-0` while the record's own anchor name stays `reth0`, so on the device
+  clause alone `reth0` is absent from the live set and is reported as a dead
+  anchor — a SECOND diagnosis of a record the dead-endpoint advisory already
+  covers, carrying the cause "every unit overrides it" on an interface with no
+  units. `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` now binds it.
+- **Action** (unit site — the clause is REDUNDANT, answer (b)): removed. Not
+  "could not find a case": TunnelNameMap keys a unit's device BY
+  `unit.Tunnel.Name`, and compiler_interfaces.go always assigns a non-empty Name
+  at construction, so an emitted unit record's device IS its own name and the
+  device clause necessarily holds it. The predicate is now deliberately
+  ASYMMETRIC and the comment says which site carries what, and why.
+- **Action** (a defect found while measuring): the unit arm deferred to
+  `ResolveKernelIfName` unconditionally, but that answers XFRM (`st<N>`) and IRB
+  refs BEFORE consulting the tunnel map, while `snapshotLinuxName` — which fills
+  the LinuxName the dataplane binds — consults the map first and has neither arm.
+  So `st0.1` resolved to `st0.1` instead of the unit's `st0u1`, and `irb.0` under
+  a bridge domain to `br-bd0` instead of `irb`: a device the dataplane never
+  opens entered the live set and the real one was left out. Fixed by consulting
+  TunnelNameMap first, mirroring snapshotLinuxName's ordering. This is what made
+  the unit-site pointer clause redundant — before the fix it was masking these
+  two mis-derivations.
+- **Validation**: four cells, each compiled (`go vet` 0), each restored
+  byte-identical. C1 drop iface device clause → RED (shared-device + reth-member
+  guards). C2 drop iface pointer clause → RED
+  (`TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861`). C3 drop unit device clause →
+  RED (three guards). C4 drop the TunnelNameMap-first ordering → RED
+  (`TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861`, both st and irb subtests).
+  No clause remains unmeasured: every one either reds a cell or was deleted.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md

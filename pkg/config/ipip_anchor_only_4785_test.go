@@ -870,3 +870,173 @@ func TestIpipWireguardSlotRemediationIsAchievable_6861(t *testing.T) {
 		}
 	}
 }
+
+// TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861 binds the EMITTED-POINTER
+// clause of the anchor predicate (#6861 r5).
+//
+// The device clause alone is not sufficient. An interface whose endpoint IS
+// emitted can still have a device name that differs from where that endpoint
+// binds: snapshotLinuxName resolves a bare `reth*` through ResolveReth, so
+// `reth0`'s endpoint occupies the physical member `ge-0-0-0` while the record's
+// own anchor name stays `reth0`. On the device test alone `reth0` is absent from
+// the live set and gets reported as a dead anchor — a SECOND diagnosis of a
+// record the dead-endpoint advisory already covers correctly, carrying the
+// cause "every unit overrides it" on an interface that has no units at all,
+// which sends the operator to a stanza that does not exist.
+//
+// This is the test the r4 comment asserted the need for without measuring; the
+// clause was unbound at this site until now.
+//
+// The orphan `reth0` device is real but is NOT this gate's subject — the same
+// orphan appears under `mode gre` where #4785 is deliberately silent, so #4785
+// is not its cause. It is tracked as the routing-vs-dataplane name divergence
+// in #6941.
+//
+// RED-on-revert: drop `!emitted[t] &&` from the interface predicate and this
+// fails at "was reported as a DEAD ANCHOR even though its endpoint is emitted".
+func TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861(t *testing.T) {
+	cfg, err := CompileConfigLenient(ipipTree(t,
+		"set chassis cluster redundancy-group 1 node 0 priority 100",
+		"set interfaces ge-0/0/0 gigether-options redundant-parent reth0",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 tunnel mode ipip",
+		"set interfaces reth0 tunnel source 10.0.0.1",
+		"set interfaces reth0 tunnel destination 10.0.0.2",
+	))
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+
+	// PRECONDITIONS. The record must be EMITTED, and its own anchor name must
+	// genuinely differ from the device its endpoint binds to — without that
+	// divergence the device clause would cover it and this test would prove
+	// nothing about the pointer clause.
+	eps := EmitTunnelEndpointNames(cfg)
+	if len(eps) != 1 || eps[0].Name != "reth0" {
+		t.Fatalf("fixture precondition: expected exactly the emitted \"reth0\" "+
+			"endpoint, got %d: %+v", len(eps), eps)
+	}
+	record := cfg.Interfaces.Interfaces["reth0"].Tunnel
+	if eps[0].Tunnel != record {
+		t.Fatalf("fixture precondition: the emitted endpoint must carry the very " +
+			"record under test, else the pointer clause is not what suppresses it")
+	}
+	device := cfg.ResolveKernelIfName("reth0")
+	if device != "ge-0-0-0" || record.Name != "reth0" {
+		t.Fatalf("fixture precondition: the record's anchor name (%q) must DIFFER "+
+			"from the device its endpoint binds to (%q); with no divergence the "+
+			"device clause alone would suppress it and this test would be vacuous",
+			record.Name, device)
+	}
+	if emittedTunnelDeviceNames(cfg)[record.Name] {
+		t.Fatalf("fixture precondition: %q must be ABSENT from the live set — that "+
+			"absence is precisely what the device clause would trip on", record.Name)
+	}
+
+	// The dead-endpoint advisory MUST fire: this record is genuinely a dead IPIP
+	// endpoint and the operator has to hear about it exactly once.
+	var deadEndpoint, anchor []string
+	for _, w := range ValidateConfig(cfg) {
+		switch {
+		case strings.Contains(w, "kernel anchor device"):
+			anchor = append(anchor, w)
+		case strings.Contains(w, "tunnel endpoint \"reth0\" has mode ipip"):
+			deadEndpoint = append(deadEndpoint, w)
+		}
+	}
+	if len(deadEndpoint) != 1 {
+		t.Fatalf("the dead-endpoint advisory must report this record exactly once "+
+			"(it IS an emitted ipip endpoint); got %d: %v", len(deadEndpoint), deadEndpoint)
+	}
+	if len(anchor) != 0 {
+		t.Errorf("the record was reported as a DEAD ANCHOR even though its endpoint "+
+			"is emitted — a second diagnosis of one record, and its cause is "+
+			"structurally false (it blames units on an interface that has none). An "+
+			"emitted record belongs to the strict gate and the dead-endpoint "+
+			"advisory; the anchor advisory is for records with NO emitted endpoint "+
+			"(#6861 r5): %v", anchor)
+	}
+}
+
+// TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861 binds the unit-arm
+// derivation ORDER (#6861 r5).
+//
+// ResolveKernelIfName is the right derivation but answers XFRM (`st<N>`) and IRB
+// refs BEFORE consulting the tunnel map, while snapshotLinuxName — which fills
+// the InterfaceSnapshot.LinuxName the dataplane actually binds — consults
+// TunnelNameMap first and has no XFRM or IRB arm at all. Deferring to
+// ResolveKernelIfName unconditionally therefore recorded a device the dataplane
+// never opens and omitted the real one, for exactly the refs where the two
+// disagree.
+//
+// RED-on-revert: drop the TunnelNameMap-first lookup from the unit arm and both
+// cases fail at "resolved to ... which is not the device the dataplane binds".
+func TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cmds       []string
+		ref        string
+		wantDevice string // what snapshotLinuxName yields: TunnelNameMap first
+		viaResolve string // what ResolveKernelIfName yields, taking its own arm first
+	}{
+		{
+			name: "xfrm_st_unit",
+			cmds: []string{
+				"set interfaces st0 unit 1 tunnel mode ipip",
+				"set interfaces st0 unit 1 tunnel source 10.0.0.1",
+				"set interfaces st0 unit 1 tunnel destination 10.0.0.2",
+			},
+			ref: "st0.1", wantDevice: "st0u1", viaResolve: "st0.1",
+		},
+		{
+			name: "irb_unit_under_a_bridge_domain",
+			cmds: []string{
+				"set bridge-domains bd0 vlan-id 10",
+				"set bridge-domains bd0 routing-interface irb.0",
+				"set interfaces irb unit 0 tunnel mode ipip",
+				"set interfaces irb unit 0 tunnel source 10.0.0.1",
+				"set interfaces irb unit 0 tunnel destination 10.0.0.2",
+			},
+			ref: "irb.0", wantDevice: "irb", viaResolve: "br-bd0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(ipipTree(t, tc.cmds...))
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+
+			// PRECONDITIONS: the ref must be emitted, and the two derivations
+			// must genuinely disagree — otherwise the ordering is unobservable
+			// and this case proves nothing.
+			eps := EmitTunnelEndpointNames(cfg)
+			if len(eps) != 1 || eps[0].Name != tc.ref {
+				t.Fatalf("fixture precondition: expected the single emitted ref %q, "+
+					"got %d: %+v", tc.ref, len(eps), eps)
+			}
+			if got := cfg.TunnelNameMap()[tc.ref]; got != tc.wantDevice {
+				t.Fatalf("fixture precondition: TunnelNameMap must yield %q for %q "+
+					"(that is snapshotLinuxName's answer); got %q",
+					tc.wantDevice, tc.ref, got)
+			}
+			if got := cfg.ResolveKernelIfName(tc.ref); got != tc.viaResolve {
+				t.Fatalf("fixture precondition: the two derivations must DISAGREE for "+
+					"this ref, else the ordering is unobservable — ResolveKernelIfName "+
+					"was expected to yield %q, got %q", tc.viaResolve, got)
+			}
+
+			live := emittedTunnelDeviceNames(cfg)
+			if !live[tc.wantDevice] {
+				t.Errorf("the emitted endpoint %q resolved to a device the dataplane "+
+					"never binds: the live set is %v but snapshotLinuxName binds this "+
+					"endpoint to %q. The unit arm must consult TunnelNameMap FIRST, as "+
+					"snapshotLinuxName does (#6861 r5)", tc.ref, live, tc.wantDevice)
+			}
+			if live[tc.viaResolve] {
+				t.Errorf("the live set contains %q, which is ResolveKernelIfName's "+
+					"answer taken from an arm snapshotLinuxName does not have. A device "+
+					"nothing binds must not mark anything live: %v", tc.viaResolve, live)
+			}
+		})
+	}
+}

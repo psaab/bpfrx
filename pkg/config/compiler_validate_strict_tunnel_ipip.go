@@ -105,6 +105,7 @@ func emittedTunnelDeviceNames(cfg *Config) map[string]bool {
 	for _, ep := range EmitTunnelEndpointNames(cfg) {
 		emittedRefs[ep.Name] = true
 	}
+	refToDevice := cfg.TunnelNameMap()
 
 	out := make(map[string]bool)
 	for name, iface := range cfg.Interfaces.Interfaces {
@@ -123,9 +124,27 @@ func emittedTunnelDeviceNames(cfg *Config) map[string]bool {
 			// Synthesized from the STRUCTURE, so this is unambiguously the
 			// unit arm even when `name` itself contains a dot.
 			ref := fmt.Sprintf("%s.%d", name, unitNum)
-			if emittedRefs[ref] {
-				out[cfg.ResolveKernelIfName(ref)] = true
+			if !emittedRefs[ref] {
+				continue
 			}
+			// TunnelNameMap FIRST, matching snapshotLinuxName's unit arm
+			// ordering. ResolveKernelIfName is the right derivation but not in
+			// the right ORDER for this question: it answers XFRM (`st<N>`) and
+			// IRB refs BEFORE consulting the tunnel map, while snapshotLinuxName
+			// — which is what actually fills InterfaceSnapshot.LinuxName —
+			// consults the map first and has no XFRM or IRB arm at all (its own
+			// doc records the IRB delta as intentional). Deferring to
+			// ResolveKernelIfName unconditionally therefore mis-derived exactly
+			// the refs where the two disagree: `st0.1` resolved to "st0.1"
+			// instead of the unit's "st0u1" device, and `irb.0` under a bridge
+			// domain to "br-bd0" instead of "irb". Both put a device the
+			// dataplane never binds into the live set, and left the real one
+			// out.
+			if device, ok := refToDevice[ref]; ok && device != "" {
+				out[device] = true
+				continue
+			}
+			out[cfg.ResolveKernelIfName(ref)] = true
 		}
 	}
 	return out
@@ -205,13 +224,15 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // has already swung through twice. An alarm names it; a commit does not stop
 // for it.
 //
-// A record is skipped when EITHER of two independent tests passes:
+// The predicate is ASYMMETRIC between the two sites, and both shapes are
+// measured rather than assumed (#6861 r5):
 //
-//	!emitted[t] && !live[t.Name]
+//	interface: !emitted[t] && !live[t.Name]
+//	unit:                    !live[unit.Tunnel.Name]
 //
-// This conjunction is a deliberate two-clause design, NOT a leftover — do not
-// "simplify" it to one clause (#6861 F1b/r4). Neither subsumes the other, and
-// each was, at one point, the whole predicate and wrong on its own:
+// The interface site's conjunction is deliberate — do not "simplify" it to one
+// clause. Neither clause subsumes the other, and each was at one point the whole
+// predicate and wrong on its own:
 //
 //   - `emitted[t]` is POINTER identity: "is this record the object the emitter
 //     published". It is the advisory's stated contract — a record with no
@@ -227,6 +248,13 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 //     SECOND diagnosis of one record, with a structurally false cause ("every
 //     unit overrides it" on an interface that has no units) pointing the
 //     operator at the wrong stanza.
+//
+// The UNIT site carries only the device clause, because the pointer clause there
+// is provably redundant rather than merely unmeasured: TunnelNameMap keys a
+// unit's device BY unit.Tunnel.Name, and compiler_interfaces.go always assigns a
+// non-empty Name at construction, so an emitted unit record's device is its own
+// name and live[] necessarily holds it. Dropping it reds nothing; dropping the
+// interface one reds TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861.
 //
 // The orphan `reth0` device in that second case is real, but it is not this
 // gate's subject: the same orphan appears with `mode gre`, where #4785 is
@@ -300,7 +328,17 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 			}
 			// No source screen here, on purpose: collectAppliedTunnels has none
 			// for units, so ANY non-nil unit tunnel becomes an anchor.
-			if unit.Tunnel.Mode != "ipip" || emitted[unit.Tunnel] || live[unit.Tunnel.Name] {
+			// No emitted-POINTER clause here, unlike the interface site above:
+			// it is provably redundant (#6861 r5). TunnelNameMap keys a unit's
+			// device BY unit.Tunnel.Name, and the compiler always assigns a
+			// non-empty Name at construction, so an emitted unit record's
+			// device IS its own name and live[] already holds it. The interface
+			// site has no such identity — snapshotLinuxName resolves a bare
+			// `reth*` through ResolveReth, so an emitted reth0 record's device
+			// is the physical member and NOT t.Name. Measured, not assumed:
+			// dropping the clause here reds nothing, dropping it there reds
+			// TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861.
+			if unit.Tunnel.Mode != "ipip" || live[unit.Tunnel.Name] {
 				continue
 			}
 			out = append(out, ipipAnchorOnlyText(
