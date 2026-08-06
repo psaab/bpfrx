@@ -61,7 +61,8 @@ Process-global, on `ProcessStatus`:
 | `xpf_userspace_session_replication_upserts_total` | replication calls |
 | `xpf_userspace_session_replication_enqueued_total` | individual sibling enqueues; `enqueued/upserts` **is** the N-way fan-out multiplier |
 | `xpf_userspace_session_replication_lock_contended_total` | sibling-queue acquisitions that blocked |
-| `xpf_userspace_session_replication_queue_depth_max` | monotonic **high-water gauge** of sibling-queue depth at push time — never `rate()` it |
+| `xpf_userspace_session_replication_queue_depth_sum` | sum of the per-call **worst** sibling-queue depth; `Δsum / Δupserts` is the mean depth per replicated flow — **the backlog statistic** |
+| `xpf_userspace_session_replication_queue_depth_max` | process-lifetime high-water. **Operator context only** — see below |
 
 Per worker:
 
@@ -88,6 +89,18 @@ collided on a mutex; depth says the consuming worker is not draining as fast
 as producers enqueue. They have different remedies (sharding vs. drain rate),
 so the harness reports both and the analyzer can name them separately.
 
+**Depth is measured as a window MEAN, never as the lifetime peak.** The
+`..._queue_depth_max` gauge is a process-lifetime `fetch_max`: it never
+falls, so it cannot be differenced across a window — a zero delta spans
+everything from "no backlog" to "a backlog up to the previous all-time high"
+— and one spike leaves the absolute value elevated for the life of the
+helper. Reading it as a window value made every cell after the first spike
+report a replication backlog, which is a systematic bias toward naming the
+exact site the #2852 decision turns on. The analyzer keys the backlog verdict
+on `Δqueue_depth_sum / Δupserts`, which is differenceable by construction and
+carries nothing into the next cell; the lifetime max is reported for
+operators and never votes.
+
 ### Analysis (`test/incus/newflow_ceiling_analyze.py`)
 
 Turns two counter snapshots into a rate **and** an attribution. Tested
@@ -113,7 +126,22 @@ Verdicts, and the exit codes the harness propagates:
 `INVALID`: non-positive or sub-minimum window; helper restarted mid-window
 (pid change or a backwards counter); **zero pool-mode SNAT allocations** —
 which means the pool-mode rule was not in effect or no new flows reached it,
-and is emphatically *not* a measured rate of zero.
+and is emphatically *not* a measured rate of zero; an **offered rate of zero
+or below**, since a generator that produced no parseable report is not a
+measurement; and any **missing required snapshot input** (`t`, `helper_pid`,
+`workers`).
+
+That last class is worth stating on its own, because it is the recurring bug
+shape in this layer: **a missing input degrading into a value that happens to
+skip a check rather than trip it.** Five instances were found and closed
+together — the sticky lifetime high-water above; `--offered-rate 0` leaving
+`accept_ratio` at None and thereby skipping the generator-bound check; a
+missing `t` defaulting to 0.0 and inflating the window to ~1.7e9 seconds; a
+missing `helper_pid` skipping the restart comparison; and an absent
+per-worker series leaving `installs` empty so that **both** cross-worker
+gates were skipped. When adding a gate, add its input to
+`REQUIRED_SNAPSHOT_KEYS` and ask what an absent value does: if the answer is
+"the gate does not run", the gate fails open.
 
 `INCONCLUSIVE`: pool port exhaustion (a capacity ceiling, not a lock one);
 accepted flows below 95% of the generator's own achieved rate (the generator,
@@ -193,11 +221,16 @@ Per cell, under `artifacts/newflow-ceiling/<UTC>/rate-<N>/`:
 2. `analysis.json` shows a non-zero `new_flows_per_sec` derived from a
    non-zero pool-allocation delta (proving the pool-mode SNAT rule was
    actually in effect and actually carried the traffic).
-3. `active_workers >= 3` and `max_worker_share <= 0.60` (proving the
+3. `replication_queue_depth_mean` is present and is what any backlog culprit
+   rests on. `replication_queue_depth_max_lifetime` is context only; if it is
+   high but the mean is low, the peak predates this cell and says nothing
+   about it (`replication_queue_depth_new_record` tells you whether this
+   window set the record).
+4. `active_workers >= 3` and `max_worker_share <= 0.60` (proving the
    cross-worker path was genuinely exercised).
-4. `replication_fanout` reads back as the real sibling worker count.
-5. `accept_ratio >= 0.95` against the generator's own achieved rate.
-6. `generator.json` accounts for every attempt:
+5. `replication_fanout` reads back as the real sibling worker count.
+6. `accept_ratio >= 0.95` against the generator's own achieved rate.
+7. `generator.json` accounts for every attempt:
    `attempted == established + refused + timed_out + other_errors`.
 
 **The ceiling** is the highest cell that came back `VALID` and unsaturated,

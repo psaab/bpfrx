@@ -68670,3 +68670,57 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   diff is 10 additive zero-valued keys with no existing key changed.
   **The loss-cluster measurement itself has NOT been performed** — this
   change ships the instrumentation and the harness; the number is owed.
+
+## 2026-08-06 — #4800 fold r1: the analyzer could report a confident wrong answer
+
+- **Timestamp**: 2026-08-06
+- **Action**: Close five instances of one bug shape — a missing or stale
+  input degrading into a value that SKIPS a refusal rather than tripping it.
+  Two were blocking review findings; a sweep for the same shape found three
+  more. All five biased the instrument toward a confident wrong answer, which
+  is the exact failure the harness exists to prevent.
+  (1) The sibling queue-depth verdict read `..._queue_depth_max`, a
+  process-lifetime `fetch_max`. It never falls, so one spike in an earlier
+  cell left every later cell naming `replicate_session_upsert_queue_backlog`
+  with a VALID verdict — a systematic bias toward the site the #2852 Phase-2
+  decision turns on. A lifetime max cannot be differenced (a zero delta spans
+  "no backlog" through "a backlog up to the previous all-time high"), so the
+  COUNTER shape was changed rather than patched in the analyzer: a new
+  `session_replication_queue_depth_sum` accumulates the per-call WORST
+  sibling depth, and `Δsum / Δupserts` is the window mean the verdict now
+  rests on. The lifetime max is retained as operator context and can no
+  longer vote. (2) An unparseable `generator.json` reached the analyzer as
+  `--offered-rate 0`; zero is falsy, so `accept_ratio` stayed None and the
+  generator-bound check — the one that catches a broken generator — was
+  disabled BY the broken generator. Now INVALID at the analyzer and a
+  refused cell in the shell. (3) A missing `t` defaulted to 0.0, inflating
+  the window to ~1.7e9s and yielding a near-zero rate that still read VALID.
+  (4) A missing `helper_pid` skipped the restart comparison outright, and the
+  shell manufactured that absence whenever `pidof` failed. (5) An absent
+  per-worker series left `installs` empty, and the `if installs` guards
+  skipped BOTH cross-worker gates — the two that stop a single-RX-queue run
+  reading as a cross-worker lock bound. (3)(4)(5) are now refused up front by
+  `REQUIRED_SNAPSHOT_KEYS`.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/server/{lifecycle.rs,helpers/status.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/api/{metrics,metrics_userspace,metrics_descriptors_userspace_session,
+  metrics_test}.go, test/incus/newflow_ceiling_analyze.py,
+  test/incus/newflow_ceiling_analyze_test.py,
+  test/incus/newflow-ceiling-harness.sh, docs/userspace-newflow-ceiling.md
+- **Validation**: Six new tests, each revert-probed at assertion level. The
+  B1 regression case (lifetime max already 50_000 at window START, depth sum
+  flat through the window) asserts NO backlog culprit — the cell that was
+  previously wrong. The exact depth-sum assertions required a new
+  `replication_counter_test_guard` in `session_glue/mod.rs`: the counters are
+  process-global and two sibling tests in `tests.rs` also replicate, so an
+  exact delta without serialization would have been a #6819-class flake
+  generator rather than a test. Two pre-existing tests deliberately passed
+  absent inputs (`helper_pid=None`, an unpopulated `workers`) and were
+  updated to supply real ones so they still exercise their own targets rather
+  than the new gate. The measurement remains OWED.
