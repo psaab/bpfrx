@@ -118,6 +118,7 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
         metadata: SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -264,6 +265,7 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
         SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -542,6 +544,7 @@ fn poll_descriptor_embedded_icmp_reversal_reachable_on_flowless_path_5690() {
         SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -712,6 +715,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
         SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -760,6 +764,7 @@ fn n6472_install_sessions(sessions: &mut SessionTable, now_ns: u64) {
         SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: true,
@@ -1153,6 +1158,7 @@ fn poll_descriptor_same_family_reversal_not_stolen_by_nat64_arm_6472() {
         SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1277,6 +1283,7 @@ fn n6474_install_snat_session(
         SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1575,6 +1582,7 @@ fn embedded_icmp_outbound_snat_marker_scoping_6474() {
         SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -2412,6 +2420,7 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -2830,6 +2839,7 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
     let local_metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_LAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,

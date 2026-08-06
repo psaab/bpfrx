@@ -121,6 +121,20 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     pub(in crate::afxdp) ifindex_to_name: FastMap<i32, String>,
     pub(in crate::afxdp) ifindex_to_config_name: FastMap<i32, String>,
+    /// #4983: ifindex → the CLUSTER-STABLE interface id Go computed for that
+    /// interface (`InterfaceSnapshot::stable_id`, a fold of the name after
+    /// resolving a reth MEMBER to its redundant parent). Keyed by the same
+    /// ifindex space `ingress_logical_ifindex` resolves into, so a bondless
+    /// RETH VLAN unit whose ifindex is SYNTHETIC resolves here too — both come
+    /// from the one snapshot.
+    ///
+    /// Stamped onto a session at install as its ingress-interface identity.
+    /// Unlike a raw ifindex it means the same thing on both cluster nodes, so
+    /// it survives the HA session-sync wire; unlike `ifindex_to_config_name` it
+    /// does not depend on which row happened to be inserted last for a shared
+    /// ifindex. An ifindex absent here yields `0` — the "no identity carried"
+    /// sentinel — and the CLI answers from the zone approximation.
+    pub(in crate::afxdp) ifindex_to_stable_iface_id: FastMap<i32, u32>,
     /// #3096: ifindex → routing-instance (VRF) name. Built at config-commit
     /// from each interface snapshot's `routing_instance` ("" = the default
     /// instance). Used by the NAT match path to enforce a

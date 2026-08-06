@@ -412,6 +412,7 @@ impl crate::afxdp::Coordinator {
         let metadata = SessionMetadata {
             ingress_zone: 1,
             egress_zone: 3,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,

@@ -1919,6 +1919,19 @@ pub(super) fn poll_binding_process_descriptor(
                             let local_metadata = SessionMetadata {
                                 ingress_zone: from_zone_id,
                                 egress_zone: to_zone_id,
+                                // #4983: stamp the CLUSTER-STABLE identity of the interface this
+                                // flow actually arrived on. Resolved from the frame's ingress
+                                // binding through the LOGICAL unit, so a tagged frame names
+                                // `reth0.50` rather than the parent NIC, and recorded ONCE here —
+                                // never re-derived from the zone, which is the approximation
+                                // `show`/`clear security flow session interface <name>` is being
+                                // freed from. Being reth-relative rather than an ifindex, it also
+                                // still names the right interface on the peer after a failover.
+                                ingress_iface_id: crate::afxdp::forwarding::resolve_ingress_iface_id(
+                                    worker_ctx.forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    meta.ingress_vlan_id,
+                                ),
                                 owner_rg_id: 0,
                                 fabric_ingress: false,
                                 is_reverse: false,
@@ -2407,6 +2420,19 @@ pub(super) fn poll_binding_process_descriptor(
                                     let forward_metadata = SessionMetadata {
                                         ingress_zone: from_zone_id,
                                         egress_zone: to_zone_id,
+                                        // #4983: stamp the CLUSTER-STABLE identity of the interface this
+                                        // flow actually arrived on. Resolved from the frame's ingress
+                                        // binding through the LOGICAL unit, so a tagged frame names
+                                        // `reth0.50` rather than the parent NIC, and recorded ONCE here —
+                                        // never re-derived from the zone, which is the approximation
+                                        // `show`/`clear security flow session interface <name>` is being
+                                        // freed from. Being reth-relative rather than an ifindex, it also
+                                        // still names the right interface on the peer after a failover.
+                                        ingress_iface_id: crate::afxdp::forwarding::resolve_ingress_iface_id(
+                                            worker_ctx.forwarding,
+                                            meta.ingress_ifindex as i32,
+                                            meta.ingress_vlan_id,
+                                        ),
                                         owner_rg_id,
                                         fabric_ingress,
                                         is_reverse: false,
@@ -2735,6 +2761,12 @@ pub(super) fn poll_binding_process_descriptor(
                                     let reverse_metadata = SessionMetadata {
                                         ingress_zone: to_zone_id,
                                         egress_zone: from_zone_id,
+                                        // #4983: the reverse companion has NO ingress identity of its own.
+                                        // Its real ingress is the FORWARD flow's egress interface, which is
+                                        // not resolved at install time, and stamping the forward frame's
+                                        // ingress here would name the wrong side. Left 0 = "no identity
+                                        // carried"; the CLI falls back to the zone approximation for it.
+                                        ingress_iface_id: 0,
                                         owner_rg_id,
                                         fabric_ingress,
                                         is_reverse: true,

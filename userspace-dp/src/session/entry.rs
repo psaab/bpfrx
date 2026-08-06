@@ -24,6 +24,28 @@ pub(crate) struct SessionDecision {
 pub(crate) struct SessionMetadata {
     pub(crate) ingress_zone: u16,
     pub(crate) egress_zone: u16,
+    /// #4983: the CLUSTER-STABLE identity of the interface this session's FIRST
+    /// packet arrived on — `config.InterfaceStableID`, a fold of the interface
+    /// name after resolving a reth MEMBER to its redundant parent. Stamped ONCE
+    /// at install from the frame's ingress binding (via
+    /// `resolve_ingress_iface_id`, which resolves the LOGICAL unit so a tagged
+    /// frame names `reth0.50` rather than the parent NIC) and never re-derived
+    /// from `ingress_zone` afterwards — re-deriving is precisely the
+    /// approximation this field exists to remove.
+    ///
+    /// It is deliberately NOT an ifindex. An ifindex, and a reth member's own
+    /// NAME, are both node-local: node 0's `ge-0/0/1` and node 1's `ge-7/0/1`
+    /// are the same member slot of the same `reth1`. This id is identical on
+    /// both nodes, so it stays meaningful across the HA session-sync wire and a
+    /// peer-PROMOTED session still names the right interface after a failover.
+    ///
+    /// `0` means "no ingress identity carried" and is never a valid id. The
+    /// REVERSE companion carries it (its true ingress is the forward flow's
+    /// egress, unresolved at install), as does any session whose ingress
+    /// binding has no `stable_id` (an old Go binary, or a binding with no
+    /// config row). Consumers fall back to the zone approximation for those —
+    /// never "matches nothing", never "matches everything".
+    pub(crate) ingress_iface_id: u32,
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
@@ -135,6 +157,7 @@ impl PartialEq for SessionMetadata {
     fn eq(&self, other: &Self) -> bool {
         self.ingress_zone == other.ingress_zone
             && self.egress_zone == other.egress_zone
+            && self.ingress_iface_id == other.ingress_iface_id
             && self.owner_rg_id == other.owner_rg_id
             && self.fabric_ingress == other.fabric_ingress
             && self.is_reverse == other.is_reverse
@@ -172,6 +195,7 @@ impl SessionMetadata {
         Self {
             ingress_zone: self.ingress_zone,
             egress_zone: self.egress_zone,
+            ingress_iface_id: self.ingress_iface_id,
             owner_rg_id: self.owner_rg_id,
             fabric_ingress: self.fabric_ingress,
             is_reverse: self.is_reverse,

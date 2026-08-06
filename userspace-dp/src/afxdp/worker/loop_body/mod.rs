@@ -1806,6 +1806,7 @@ mod flow_cache_invalidation_tests {
         SessionMetadata {
             ingress_zone: 1,
             egress_zone: 2,
+            ingress_iface_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,

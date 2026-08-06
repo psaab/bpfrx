@@ -110,7 +110,6 @@ pub(super) fn allow_unsolicited_dns_reply(
         && flow.forward_key.src_port == 53
 }
 
-
 pub(super) fn resolve_ingress_logical_ifindex(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -120,6 +119,34 @@ pub(super) fn resolve_ingress_logical_ifindex(
         .ingress_logical_ifindex
         .get(&(ingress_ifindex, ingress_vlan_id))
         .copied()
+}
+
+/// #4983: resolve the CLUSTER-STABLE ingress-interface identity for a frame —
+/// the id stamped onto a session as "the interface this flow arrived on".
+///
+/// It resolves the LOGICAL ingress unit first (so a tagged frame on a trunk
+/// names `reth0.50`, not the parent NIC) and then maps that ifindex through
+/// `ifindex_to_stable_iface_id`. Going via the logical unit is what makes a
+/// bondless-RETH VLAN unit work: its ifindex may be SYNTHETIC, but both the
+/// resolution and the id map are built from the same config snapshot, so they
+/// agree by construction.
+///
+/// Returns `0` — the reserved "no ingress identity carried" sentinel — when the
+/// interface is not in the map (an old Go binary that sends no `stable_id`, or
+/// a binding with no config row). The CLI answers `0` from the zone
+/// approximation, exactly as it did before #4983.
+pub(super) fn resolve_ingress_iface_id(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    ingress_vlan_id: u16,
+) -> u32 {
+    let logical = resolve_ingress_logical_ifindex(forwarding, ingress_ifindex, ingress_vlan_id)
+        .unwrap_or(ingress_ifindex);
+    forwarding
+        .ifindex_to_stable_iface_id
+        .get(&logical)
+        .copied()
+        .unwrap_or(0)
 }
 
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.

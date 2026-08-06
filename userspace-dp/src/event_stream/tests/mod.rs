@@ -102,6 +102,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
         metadata: SessionMetadata {
             ingress_zone: 1,
             egress_zone: 2,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,

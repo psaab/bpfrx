@@ -50,6 +50,12 @@ pub(super) fn populate_interfaces(
         state
             .ifindex_to_config_name
             .insert(iface.ifindex, iface.name.clone());
+        // #4983: the cluster-stable ingress-interface identity. `0` (an old Go
+        // binary that does not send the field) is stored as-is: it is the
+        // "no identity carried" sentinel the session and the CLI both read.
+        state
+            .ifindex_to_stable_iface_id
+            .insert(iface.ifindex, iface.stable_id);
         // #3096: record the interface's routing instance for NAT rule-set
         // `from`/`to routing-instance` scope matching ("" = default VRF).
         state

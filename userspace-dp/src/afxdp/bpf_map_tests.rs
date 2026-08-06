@@ -30,6 +30,7 @@ fn synced_forward_metadata() -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_TRUST_ZONE_ID,
         egress_zone: TEST_TRUST_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 1,
         fabric_ingress: false,
         is_reverse: false,
@@ -269,6 +270,7 @@ fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 1,
         fabric_ingress: false,
         is_reverse: false,
@@ -465,6 +467,7 @@ fn refresh_bpf_conntrack_last_seen_is_budgeted_across_slices() {
         let metadata = SessionMetadata {
             ingress_zone: TEST_LAN_ZONE_ID,
             egress_zone: TEST_WAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,

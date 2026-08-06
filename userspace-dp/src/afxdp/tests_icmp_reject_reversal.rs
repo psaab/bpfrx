@@ -315,6 +315,7 @@ fn icmp_te_nat_reversal_v4_rewrites_outer_dst_and_embedded_src() {
         metadata: SessionMetadata {
             ingress_zone: TEST_UNTRUST_ZONE_ID,
             egress_zone: TEST_TRUST_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -447,6 +448,7 @@ fn icmp_te_nat_reversal_v4_with_port_snat() {
         metadata: SessionMetadata {
             ingress_zone: TEST_UNTRUST_ZONE_ID,
             egress_zone: TEST_TRUST_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -572,6 +574,7 @@ fn icmp_dest_unreach_nat_reversal_v4() {
         metadata: SessionMetadata {
             ingress_zone: TEST_UNTRUST_ZONE_ID,
             egress_zone: TEST_TRUST_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -853,6 +856,7 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
         metadata: SessionMetadata {
             ingress_zone: TEST_UNTRUST_ZONE_ID,
             egress_zone: TEST_TRUST_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
@@ -1293,6 +1297,7 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -1416,6 +1421,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
     let forward_metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -1452,6 +1458,7 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
     let reverse_metadata = SessionMetadata {
         ingress_zone: TEST_WAN_ZONE_ID,
         egress_zone: TEST_LAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: true,

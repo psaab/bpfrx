@@ -1475,6 +1475,7 @@ fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -1533,6 +1534,7 @@ fn embedded_icmp_no_route_uses_zone_encoded_fabric_redirect() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -1591,6 +1593,7 @@ fn embedded_icmp_discard_route_uses_zone_encoded_fabric_redirect() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -1645,6 +1648,7 @@ fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
         metadata: SessionMetadata {
             ingress_zone: TEST_WAN_ZONE_ID,
             egress_zone: TEST_LAN_ZONE_ID,
+            ingress_iface_id: 0,
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: false,
@@ -2322,6 +2326,7 @@ fn helper_local_session_on_miss_stays_out_of_shared_alias_maps() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -2392,6 +2397,7 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
     let metadata = SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 0,
         fabric_ingress: false,
         is_reverse: false,
@@ -4904,5 +4910,85 @@ fn fabric_link_empty_peer_mac_is_skipped_as_unresolved_peer() {
     assert!(
         after > before,
         "an unresolved fabric peer must bump FABRIC_LINK_UNRESOLVED_PEER"
+    );
+}
+
+// #4983 FAIL-ON-REVERT: a session's ingress identity must be resolved through
+// the LOGICAL ingress unit, not the physical binding.
+//
+// On a trunk NIC the parent and each VLAN unit are different interfaces —
+// `reth0.50` and `reth0.80` on the loss cluster's WAN NIC sit in one zone —
+// so resolving the physical ifindex would name the parent for both and
+// reproduce exactly the cross-interface match #4983 removes. Reverting
+// `resolve_ingress_iface_id` to look the PHYSICAL ifindex up directly reds
+// this on an assertion.
+#[test]
+fn resolve_ingress_iface_id_uses_the_logical_unit_4983() {
+    const PHYS: i32 = 14;
+    const UNIT_50: i32 = 101;
+    const UNIT_80: i32 = 102;
+    // Ids as Go's config.StableInterfaceID would hand them over: opaque
+    // nonzero folds, deliberately unrelated to the ifindexes.
+    const PARENT_ID: u32 = 0x9f2c_1a44;
+    const ID_50: u32 = 0x2b71_e903;
+    const ID_80: u32 = 0x77aa_051c;
+
+    let mut forwarding = ForwardingState::default();
+    forwarding
+        .ifindex_to_stable_iface_id
+        .insert(PHYS, PARENT_ID);
+    forwarding.ifindex_to_stable_iface_id.insert(UNIT_50, ID_50);
+    forwarding.ifindex_to_stable_iface_id.insert(UNIT_80, ID_80);
+    forwarding
+        .ingress_logical_ifindex
+        .insert((PHYS, 50), UNIT_50);
+    forwarding
+        .ingress_logical_ifindex
+        .insert((PHYS, 80), UNIT_80);
+
+    assert_eq!(
+        resolve_ingress_iface_id(&forwarding, PHYS, 50),
+        ID_50,
+        "a frame tagged VLAN 50 on the trunk must resolve the .50 UNIT's identity; \
+         resolving the physical parent would make a filter for .50 match .80 too (#4983)"
+    );
+    assert_eq!(
+        resolve_ingress_iface_id(&forwarding, PHYS, 80),
+        ID_80,
+        "the two units of one trunk NIC must resolve to DIFFERENT identities (#4983)"
+    );
+
+    // Over-reach guards: these stay GREEN if the logical resolution is
+    // reverted, so they pin behaviour #4983 does not change rather than
+    // restating the fix.
+    assert_eq!(
+        resolve_ingress_iface_id(&forwarding, PHYS, 0),
+        PARENT_ID,
+        "an UNTAGGED frame has no logical unit to resolve and must fall back to the \
+         binding's own identity, not to nothing"
+    );
+    assert_eq!(
+        resolve_ingress_iface_id(&forwarding, 4242, 0),
+        0,
+        "a binding with no config row must yield the 0 no-identity sentinel so the CLI \
+         falls back to the zone approximation — never a stale or guessed id"
+    );
+}
+
+// #4983: an interface whose snapshot carries no stable_id (a pre-#4983 Go
+// binary) must yield the 0 sentinel rather than being treated as identified.
+// This is the rolling-upgrade arm, and it must NOT be conflated with "the
+// interface is unknown" — both legitimately answer 0, and both fall back.
+#[test]
+fn resolve_ingress_iface_id_absent_stable_id_is_the_zero_sentinel_4983() {
+    const PHYS: i32 = 9;
+    let mut forwarding = ForwardingState::default();
+    // Present in the map, but the Go side sent no id for it.
+    forwarding.ifindex_to_stable_iface_id.insert(PHYS, 0);
+    assert_eq!(
+        resolve_ingress_iface_id(&forwarding, PHYS, 0),
+        0,
+        "an interface the control plane sent no stable_id for carries no identity; \
+         0 must survive as 0 (rolling-upgrade safe)"
     );
 }

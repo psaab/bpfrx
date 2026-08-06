@@ -201,6 +201,7 @@ pub(crate) fn build_synced_session_entry(
             },
         },
         metadata: crate::session::SessionMetadata {
+            ingress_iface_id: 0,
             // #919: prefer the wire u16 IDs when populated; fall back
             // to name lookup for older peers that only sent strings.
             ingress_zone: if req.ingress_zone_id != 0 {

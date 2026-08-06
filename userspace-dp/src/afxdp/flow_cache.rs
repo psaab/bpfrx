@@ -618,6 +618,7 @@ impl FlowCacheEntry {
             metadata: SessionMetadata {
                 ingress_zone: ingress_zone.unwrap_or(0),
                 egress_zone: 0,
+                ingress_iface_id: 0,
                 owner_rg_id,
                 fabric_ingress: false,
                 is_reverse: false,

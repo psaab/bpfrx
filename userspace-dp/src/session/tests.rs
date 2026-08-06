@@ -65,6 +65,7 @@ fn metadata() -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_LAN_ZONE_ID,
         egress_zone: TEST_WAN_ZONE_ID,
+        ingress_iface_id: 0,
         owner_rg_id: 1,
         fabric_ingress: false,
         is_reverse: false,
@@ -695,6 +696,7 @@ fn nat_flow_reverse_activity_keeps_forward_half_alive() {
 /// application term's `inactivity-timeout`.
 fn metadata_with_app_timeout(ns: u64) -> SessionMetadata {
     SessionMetadata {
+        ingress_iface_id: 0,
         inactivity_timeout_ns: Some(ns),
         policy_counter_idx: 0,
         policy_counter: None,
@@ -2113,6 +2115,7 @@ fn half_open_session_reaps_at_opening_timeout() {
 /// half-open override tests.
 fn metadata_with_zone(zone: u16) -> SessionMetadata {
     SessionMetadata {
+        ingress_iface_id: 0,
         ingress_zone: zone,
         ..metadata()
     }
@@ -7260,6 +7263,7 @@ fn seeded_session_table_round_trips_lookup() {
 /// A reverse SessionMetadata mirrors `metadata()` with `is_reverse: true`.
 fn metadata_reverse() -> SessionMetadata {
     SessionMetadata {
+        ingress_iface_id: 0,
         is_reverse: true,
         ..metadata()
     }
