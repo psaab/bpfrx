@@ -139,10 +139,11 @@ type Manager struct {
 // Manager-scoped, because `networkctl reload` acts on the single
 // systemd-networkd instance for the whole host and this Manager is not its
 // only owner. pkg/daemon shells out to `networkctl reload` directly through
-// its own networkctlReload helper from four call sites — linksetup's
-// post-rename reload (warn-only), the device-map rename and teardown reloads,
-// and the bootstrap teardown / lifeline reloads — all writing or removing the
-// same 10-xpf-* files this package generates. With a per-Manager bool those
+// its own networkctlReload helper from FIVE production call sites —
+// linksetup's post-rename reload (warn-only, linksetup.go), the device-map
+// rename and teardown reloads (device_map.go, via networkctlReloadFn), and the
+// bootstrap teardown and lifeline reloads (bootstrap.go) — all writing or
+// removing the same 10-xpf-* files this package generates. With a per-Manager bool those
 // owners could disagree with the Manager, and the disagreement resolves in the
 // dangerous direction: a daemon-side reload that fails leaves the files on
 // disk unactivated while the Manager's flag stays false, so the next Apply
@@ -226,6 +227,18 @@ func NoteReloadResult(epoch uint64, err error) {
 	}
 	noteReloadSucceeded(epoch)
 }
+
+// ReloadDebtOutstanding reports whether a `networkctl reload` activation is
+// still owed process-wide. It exists so the other reload owners can assert the
+// POSTCONDITION of their reporting — a failure is carried forward, a success
+// discharges — rather than the proxy of whether the debt epoch happened to
+// move, which is unchanged both when a success is reported correctly and when
+// reporting it is omitted entirely.
+//
+// It does NOT report a Manager's own activation debt: `networkctl reconfigure`
+// and the slow-path rp_filter restore are Manager-scoped obligations no
+// external reload owner performs. See Manager.activationPending.
+func ReloadDebtOutstanding() bool { return reloadDebtOutstanding() }
 
 // SetProtectedResolver registers the management protected-set provider so
 // Apply can exempt the lifeline's files from the stale-file sweep. Called once

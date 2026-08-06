@@ -19,20 +19,35 @@ import (
 //
 // Both fabric orderings run: the preference is a two-armed decision and a
 // single-direction fixture would leave one arm free.
+//
+// #5718 fold r4b: this is now a BELT test on a directly-constructed state. The
+// eviction added in r4b removes a retired incarnation's connections when the
+// incarnation advances, so `installConn` can no longer leave a stale-stamped
+// connection in a slot and no behavioural fixture can produce one. The
+// selection guard is kept because it governs a different failure than the
+// eviction does — an install path added later that forgets to evict would hand
+// the senders a dead socket — so the state is built by hand here rather than
+// driven, and the test is labelled a belt: it proves the guard fires, not that
+// production still reaches the state.
 func TestActiveConnPrefersCurrentIncarnation_5718(t *testing.T) {
 	for _, tc := range []struct{ superseded, survivor int }{{1, 0}, {0, 1}} {
 		t.Run(fabricPairName(tc.superseded, tc.survivor), func(t *testing.T) {
 			ss := newAckTestSync(t)
 
-			// Peer incarnation A holds both fabric slots.
-			aSup, aSurv := pipeConn(t), pipeConn(t)
-			ss.installConn(tc.superseded, aSup)
-			ss.installConn(tc.survivor, aSurv)
-
-			// A reboots; its replacement dials one fabric and supersedes only
-			// that slot. The survivor slot still holds A's dead socket.
-			b := pipeConn(t)
-			ss.installConn(tc.superseded, b)
+			// Hand-build the post-supersession registry as it would look if the
+			// eviction had not run: the current incarnation's connection in one
+			// slot, the retired incarnation's still installed in the other.
+			aSurv, b := pipeConn(t), pipeConn(t)
+			ss.mu.Lock()
+			ss.peerIncarnation = 2
+			if tc.superseded == 0 {
+				ss.conn0, ss.conn0Gen = b, 2
+				ss.conn1, ss.conn1Gen = aSurv, 1
+			} else {
+				ss.conn1, ss.conn1Gen = b, 2
+				ss.conn0, ss.conn0Gen = aSurv, 1
+			}
+			ss.mu.Unlock()
 
 			if got := ss.connInSlot(tc.survivor); got != aSurv {
 				t.Fatalf("setup: the dead incarnation's fabric-%d connection must still be "+
@@ -87,16 +102,18 @@ func TestActiveConnFallsBackWhenNothingIsCurrent_5718(t *testing.T) {
 		}
 	})
 
+	// #5718 fold r4b: hand-built, for the same reason as the belt test above —
+	// the eviction means installConn cannot leave a stale-stamped connection in
+	// a slot, so this shape is unreachable by driving the production path. It
+	// still pins that the fallback exists: a selection guard that returned nil
+	// instead would be a behaviour change on a registry the old code served.
 	t.Run("only a stale connection remains", func(t *testing.T) {
 		ss := newAckTestSync(t)
-		a0, a1 := pipeConn(t), pipeConn(t)
-		ss.installConn(0, a0)
-		ss.installConn(1, a1)
-		// B supersedes fabric 0, advancing the incarnation; a1 goes stale.
-		b0 := pipeConn(t)
-		ss.installConn(0, b0)
-		// B's own connection then drops, leaving only the stale a1.
-		ss.handleDisconnect(b0)
+		a1 := pipeConn(t)
+		ss.mu.Lock()
+		ss.peerIncarnation = 2
+		ss.conn1, ss.conn1Gen = a1, 1
+		ss.mu.Unlock()
 
 		if got := ss.connInSlot(1); got != a1 {
 			t.Fatal("setup: the stale fabric-1 connection must still be installed")

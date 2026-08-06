@@ -68387,3 +68387,70 @@ break — `go vet` confirmed passing under every revert.
   pkg/networkd/networkd.go, pkg/networkd/activation_tail_5718_test.go,
   pkg/networkd/README.md, pkg/dataplane/userspace/maps_sync.go,
   pkg/dataplane/userspace/worker_count_single_source_5718_test.go, _Log.md
+- **Timestamp**: 2026-08-06 01:10
+- **Action**: #6825 review fold r4b (#5718 C-HA) — a second lane had folded the
+  same two r4 blockers concurrently and pushed first (`13d72300c`). Its
+  networkd fix is substantively identical to the one this lane built
+  independently (a Manager-scoped `activationPending` armed before the first
+  shell-out, cleared only after the tail), so that work was DISCARDED rather
+  than duplicated. For BLOCKER 1 the two lanes took different designs, so this
+  entry records the reconciliation. `13d72300c` made SELECTION
+  incarnation-aware (`preferredFabricLocked`) and re-armed `needColdPrime` on
+  the supersession edge, which fixes where outbound traffic goes. It leaves the
+  retired incarnation's connection INSTALLED, and three other paths read raw
+  slot occupancy rather than the stamp — verified by a regression written
+  against `13d72300c` unmodified, which reds three assertions in both fabric
+  directions: (1) `handleDisconnect` computes `connected := s.conn0 != nil ||
+  s.conn1 != nil`, so when the one LIVE connection later drops it takes the
+  "still connected" branch — `stats.Connected` stays true and `PeerHealthy()`
+  reports a healthy peer with ZERO live connections (the incarnation advance
+  already cleared the latch that gates its silence check), barrier and failover
+  waiters are never released with `failoverAckDisconnected`,
+  `OnPeerDisconnected` never fires, the in-progress bulk receive is never
+  reset; (2) `fabricConnectLoop` skips a fabric whose slot is non-nil, so the
+  link to the new peer process is never redialled and the cluster silently runs
+  on one fabric; (3) `d.wasDisconnected` needs BOTH slots nil, so the
+  full-disconnect cold-prime edge is unreachable while the corpse occupies a
+  slot. Nothing removes it either — `receiveLoop`'s missed-heartbeat teardown
+  is gated on `peerHeartbeatAckEver`, which the advance clears, so identifying
+  the connection as retired is what disarmed its only eviction path. Layered
+  `evictStaleIncarnationConnsLocked` on top: `installConn` closes and clears
+  every slot other than the one just filled whose stamp is stale, restoring the
+  invariant all three readers assume. Both generation checks
+  (`preferredFabricLocked`, `connIsCurrentIncarnationLocked`) are KEPT and
+  re-documented as fail-closed belts against an install path added later that
+  forgets to evict — neither can substitute for the eviction, since each
+  governs one reader and the three above come through neither. Because the
+  eviction makes "installed but stale-stamped" unreachable, the two tests that
+  drove that state through `installConn` were converted to hand-built BELT
+  tests and labelled as such rather than left asserting an impossible fixture.
+  **Also folded**: the AST guard forbidding a second `conn0`/`conn1` nil site
+  gains one exemption, backed by `TestInstallConnNeverLeavesTheRegistryEmpty_5718`
+  (the eviction runs after the incoming conn is installed and skips its slot, so
+  it cannot empty the registry) rather than left as a bare allowlist entry; the
+  "four call sites" comments were a miscount, there are FIVE production
+  `networkctlReload` invocations (linksetup 1, device-map 2, bootstrap 2); the
+  partial-disconnect and empty-slot scope controls were one-sided (fabric-0
+  loss, fabric-1 addition) and now run both orderings; and the daemon success
+  test asserted only that the debt epoch did not move — a proxy unchanged
+  whether a success is reported correctly or not reported at all — so it now
+  asserts the debt STATE via the new exported `networkd.ReloadDebtOutstanding`
+  and drives a concurrent owner's failure from inside the shell-out to bind
+  that `BeginReload` is snapshotted before it. **Validation**: three revert
+  probes, each an ASSERTION not a build break — eviction removed reds "the
+  retired incarnation's fabric-N connection is still INSTALLED" plus the
+  Connected and PeerHealthy assertions; `BeginReload` moved after the shell-out
+  reds the concurrent-owner debt-loss assertion; the success report dropped
+  reds the discharge assertion. Over-reach guards stayed GREEN under the
+  eviction revert: a second fabric into an EMPTY slot is not evicted, and
+  `13d72300c`'s own selection, fallback and cold-prime tests are unaffected.
+  `go test -race -count=1` green on pkg/cluster, pkg/networkd, pkg/daemon,
+  pkg/routing, pkg/dataplane/userspace; pkg/refactoraudit and `go vet` clean.
+  Advances #5718.
+- **File(s)**: pkg/cluster/sync_conn.go,
+  pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/active_conn_incarnation_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/networkd/networkd.go, pkg/networkd/reload_debt_process_5718_test.go,
+  pkg/networkd/README.md, pkg/daemon/linksetup.go,
+  pkg/daemon/networkctl_reload_debt_5718_test.go, _Log.md

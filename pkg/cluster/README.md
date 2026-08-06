@@ -1498,11 +1498,18 @@ outside the monitor loop:
   alone would be decorative (removing `handleDisconnect`'s clear already reds
   an older assertion): `TestPeerHeartbeatAckClearedWheneverRegistryEmpties`
   drives every emptying path it knows of, and
-  `TestOnlyHandleDisconnectEmptiesTheRegistry` asserts on the package AST that
-  `conn0`/`conn1` are assigned nil in exactly one function. A future teardown
-  that empties a slot elsewhere reds the structural guard even though every
-  behavioural test would still pass, and at that point this narrowing must be
-  revisited.
+  `TestOnlyHandleDisconnectEmptiesTheRegistry` asserts on the package AST which
+  functions may assign `conn0`/`conn1` nil. A future teardown that empties a
+  slot elsewhere reds the structural guard even though every behavioural test
+  would still pass, and at that point this narrowing must be revisited.
+
+  `evictStaleIncarnationConnsLocked` is the one exemption in that allowlist. It
+  nils a slot, but it provably cannot EMPTY the registry: `installConn` calls it
+  only after the incoming connection has been written into its slot, and it
+  skips that slot. The exemption is not a rubber stamp —
+  `TestInstallConnNeverLeavesTheRegistryEmpty_5718` asserts the behaviour that
+  makes it sound, so losing the `keepIdx` skip reds there instead of passing the
+  allowlist unnoticed.
 
   **The SEND path is incarnation-aware too (#5718 fold r4).** The stamp
   originally taught only the ACK path that an installed connection can belong
@@ -1520,6 +1527,51 @@ outside the monitor loop:
   `installConn` computes `activeAfter` from the same helper, AFTER the
   incarnation advance and the slot stamp — otherwise the cold-prime decision
   disagrees with where the data will actually be sent.
+
+  **Selection was not enough — the retired connection is EVICTED (#5718 fold
+  r4b).** `preferredFabricLocked` fixed where traffic GOES. It did not change
+  what is INSTALLED, and three other paths read raw slot occupancy, so the dead
+  incarnation's socket (ESTABLISHED forever — a hard reboot sends no FIN/RST)
+  kept speaking for a process that no longer exists:
+
+  - `handleDisconnect` computes `connected := s.conn0 != nil || s.conn1 != nil`.
+    When the one LIVE connection later dropped it took the "still connected"
+    branch: `stats.Connected` stayed true — so `PeerHealthy()` reported a
+    healthy peer with ZERO live connections, the incarnation advance having
+    already cleared the capability latch that gates its silence check — barrier
+    and failover waiters were never released with `failoverAckDisconnected` and
+    blocked until their own timeouts, `OnPeerDisconnected` never fired, and the
+    in-progress bulk receive was never reset.
+  - `fabricConnectLoop` skips a fabric whose slot is non-nil, so the link to the
+    new peer process was never redialled there and the cluster silently ran on
+    one fabric.
+  - `installConn`'s `d.wasDisconnected` needs BOTH slots nil, so the
+    full-disconnect cold-prime edge was unreachable while the corpse sat in a
+    slot.
+
+  Nothing else removed it either: `receiveLoop`'s missed-heartbeat teardown is
+  gated on `peerHeartbeatAckEver`, which the incarnation advance clears —
+  identifying the connection as retired is precisely what disarmed its only
+  eviction path. `installConn` therefore calls
+  `evictStaleIncarnationConnsLocked`, closing and clearing every slot other than
+  the one just filled whose stamp is no longer current, restoring in one place
+  the invariant all three readers already assume: *installed* means *belongs to
+  the peer incarnation in force*.
+
+  Consequence for the two generation checks: a slot can no longer hold a
+  stale-stamped connection, so `preferredFabricLocked`'s and
+  `connIsCurrentIncarnationLocked`'s comparisons are fail-closed BELTS for an
+  install path added later that forgets to evict, not the load-bearing gates.
+  Their tests build that state by hand and say so, rather than pretending to
+  drive it. Note neither belt could substitute for the eviction: both govern one
+  reader each, and the three readers above never come through either.
+
+  Cost of a false positive: a supersession that is really the same peer process
+  re-dialling a half-open socket also drops the other fabric, which
+  `fabricConnectLoop` redials within a second, plus one redundant authoritative
+  bulk. That is the trade #5480 already took, and it CONVERGES — the
+  pre-eviction shape did not, because the retired socket stayed installed and
+  un-evictable until TCP gave up retransmitting, which is minutes.
 
   **A supersession re-arms the cold prime (#5718 fold r4).** `needColdPrime`
   was armed only on the full-disconnect edge. Superseding a CURRENT connection

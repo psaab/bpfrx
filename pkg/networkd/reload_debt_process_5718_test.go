@@ -34,8 +34,8 @@ func debtTestIfaces() []InterfaceConfig {
 // owner in the process records into.
 //
 // This package is not the only owner of `networkctl reload`. pkg/daemon shells
-// out to it directly from four sites — linksetup's post-rename reload
-// (warn-only), device-map's rename and teardown reloads, and bootstrap's
+// out to it directly from FIVE production sites — linksetup's post-rename
+// reload (warn-only), device-map's rename and teardown reloads, and bootstrap's
 // teardown and lifeline reloads — all of them writing or removing the same
 // 10-xpf-* files this package generates. With a Manager-scoped debt those
 // owners could not record anything, and the disagreement resolved in the

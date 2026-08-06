@@ -529,10 +529,10 @@ func renameInterface(oldName, newName string) error {
 
 // networkctlReload calls networkctl reload to apply .link/.network changes.
 //
-// This is the process's OTHER `networkctl reload` owner: every daemon-side
-// reload goes through here (the post-rename reload above, device-map's rename
-// and teardown reloads via networkctlReloadFn, and bootstrap's teardown and
-// lifeline reloads), and all of them write or remove the same 10-xpf-* files
+// This is the process's OTHER `networkctl reload` owner: all FIVE daemon-side
+// reload sites go through here (the post-rename reload above, device-map's
+// rename and teardown reloads via networkctlReloadFn, and bootstrap's teardown
+// and lifeline reloads), and all of them write or remove the same 10-xpf-* files
 // pkg/networkd generates. #5718 fold F2: report the outcome into networkd's
 // process-scoped #4954 activation debt so the two owners cannot disagree. A
 // failure here leaves those files on disk unactivated; without the report,

@@ -43,11 +43,20 @@ func shouldInitiateFabricDial(localAddr, peerAddr string) bool {
 // The r2 stamp made "installed" and "current" different things for the ack
 // path; this is the same distinction on the SEND path, which was left behind.
 //
-// When no installed connection is current (the incarnation advanced and its
-// connection has since dropped, leaving only a stale sibling) the old slot
-// preference still applies rather than returning nil: writing to the stale
-// socket fails and drives handleDisconnect, which cleans it up. That is the
-// pre-existing self-correcting behaviour, and this change does not alter it.
+// When no installed connection is current the old slot preference still applies
+// rather than returning nil: writing to a stale socket fails and drives
+// handleDisconnect, which cleans it up. That is the pre-existing
+// self-correcting behaviour, and this change does not alter it.
+//
+// #5718 fold r4b: since installConn now EVICTS a retired incarnation's
+// connections at the moment the incarnation advances, a slot can no longer hold
+// a stale-stamped connection, so the generation test above is a fail-closed
+// belt rather than the load-bearing gate — it keeps an install path added later
+// that forgets to evict from silently handing the senders a dead socket. The
+// belt is deliberately not sufficient on its own: it governs SELECTION only,
+// and the readers that made eviction necessary (handleDisconnect's connectivity
+// test, fabricConnectLoop's redial gate, d.wasDisconnected) all read raw slot
+// occupancy and never come through here.
 func (s *SessionSync) preferredFabricLocked() int {
 	if s.conn0 != nil && s.conn0Gen == s.peerIncarnation {
 		return 0
@@ -148,6 +157,14 @@ var noteHeartbeatAckMidpointHook atomic.Pointer[func()]
 // connIsCurrentIncarnationLocked reports whether conn is installed in a fabric
 // slot AND that slot was stamped by the incarnation currently in force. The
 // caller must hold s.mu.
+//
+// #5718 fold r4b: with installConn evicting stale-stamped slots, membership now
+// IMPLIES a current stamp, so the comparison below is a fail-closed belt rather
+// than the sole gate. It is kept deliberately — an install path added later
+// that forgets to evict would otherwise silently re-admit a retired
+// incarnation's acks — and pinned directly by
+// TestConnIsCurrentIncarnationRejectsAStaleStamp_5718, which builds that state
+// by hand because the production path can no longer reach it.
 func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 	switch {
 	case conn == nil:
@@ -160,6 +177,73 @@ func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 		return false
 	}
 }
+
+// evictStaleIncarnationConnsLocked closes and clears every fabric slot other
+// than keepIdx whose incarnation stamp is no longer current, and reports whether
+// it evicted anything. The caller must hold s.mu and must have already advanced
+// peerIncarnation; keepIdx is the slot holding the connection that caused the
+// advance, which has not been stamped yet.
+//
+// #5718 fold r4b. preferredFabricLocked fixed which connection outbound traffic
+// SELECTS. It did not change what is installed, and three other paths read raw
+// slot occupancy — so the retired incarnation's socket, ESTABLISHED forever
+// because a hard reboot sends no FIN/RST, keeps speaking for a dead process:
+//
+//   - handleDisconnect computes `connected := s.conn0 != nil || s.conn1 != nil`.
+//     When the one LIVE connection later drops it therefore takes the "still
+//     connected" branch: stats.Connected stays true (so PeerHealthy reports a
+//     healthy peer with zero live connections, since the incarnation advance
+//     already cleared the capability latch that gates its silence check),
+//     barrier and failover waiters are never released with
+//     failoverAckDisconnected and block until their own timeouts,
+//     OnPeerDisconnected never fires, and the in-progress bulk receive is never
+//     reset.
+//   - fabricConnectLoop skips a fabric whose slot is non-nil, so the link to
+//     the new peer process is never redialled there and the cluster silently
+//     runs on one fabric.
+//   - installConn's d.wasDisconnected needs BOTH slots nil, so the
+//     full-disconnect cold-prime edge cannot be reached while the corpse sits
+//     in a slot.
+//
+// Nothing else removes it either: receiveLoop's missed-heartbeat teardown is
+// gated on peerHeartbeatAckEver, which the incarnation advance just cleared, so
+// identifying the connection as retired is precisely what disarmed its only
+// eviction path. Evicting here restores the invariant all three readers already
+// assume — installed means "belongs to the peer incarnation in force" — in one
+// place, instead of teaching each reader separately to consult a generation.
+//
+// The evicted connection's receiveLoop wakes on the closed socket and calls
+// handleDisconnect, which finds the slot already cleared and returns down its
+// stale-disconnect branch, so the eviction is not double-counted.
+//
+// Cost of a false positive: a supersession that is really the same peer process
+// re-dialling a half-open socket also drops the other fabric, which
+// fabricConnectLoop redials within a second, plus one redundant authoritative
+// bulk. That is the same "correctness over the optimization" trade #5480 already
+// took, and it CONVERGES — the pre-eviction shape did not, because the retired
+// socket stayed installed and un-evictable until TCP finally gave up
+// retransmitting, which is minutes.
+func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
+	evicted := false
+	if keepIdx != 0 && s.conn0 != nil && s.conn0Gen != s.peerIncarnation {
+		slog.Warn("cluster sync: evicting fabric 0 connection from a retired peer incarnation",
+			"remote", connRemoteAddrString(s.conn0), "conn_incarnation", s.conn0Gen, "peer_incarnation", s.peerIncarnation)
+		s.conn0.Close()
+		s.conn0 = nil
+		s.conn0Gen = 0
+		evicted = true
+	}
+	if keepIdx != 1 && s.conn1 != nil && s.conn1Gen != s.peerIncarnation {
+		slog.Warn("cluster sync: evicting fabric 1 connection from a retired peer incarnation",
+			"remote", connRemoteAddrString(s.conn1), "conn_incarnation", s.conn1Gen, "peer_incarnation", s.peerIncarnation)
+		s.conn1.Close()
+		s.conn1 = nil
+		s.conn1Gen = 0
+		evicted = true
+	}
+	return evicted
+}
+
 func connRemoteAddrString(conn net.Conn) (remote string) {
 	if conn == nil {
 		return "<nil>"
@@ -423,9 +507,16 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	// microseconds after this clear if acceptance were decided by slot
 	// membership. Stamping the incoming connection with the NEW incarnation
 	// leaves the survivor at the OLD one, so noteHeartbeatAck rejects it.
+	//
+	// #5718 fold r4b: refusing its acks and out-ranking it in
+	// preferredFabricLocked still leaves it INSTALLED, and slot occupancy is
+	// what several other paths read. Evict it — see
+	// evictStaleIncarnationConnsLocked for the three readers that otherwise
+	// keep believing in a process that no longer exists.
 	if supersededCurrent {
 		s.peerIncarnation++
 		s.peerHeartbeatAckEver.Store(false)
+		s.evictStaleIncarnationConnsLocked(fabricIdx)
 	}
 	// Stamp the slot AFTER any advance, so this connection belongs to the
 	// incarnation it actually established.

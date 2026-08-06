@@ -213,21 +213,19 @@ func TestPeerHeartbeatAckTwoFabricStaleSurvivorCannotRearm_5718(t *testing.T) {
 				t.Fatal("setup: the supersession must clear the capability")
 			}
 
-			// aSurv is STILL installed and still passes a membership test. Its
-			// in-flight ack must not speak for the incarnation that replaced it.
-			if got := ss.connInSlot(tc.survivor); got != aSurv {
-				t.Fatalf("setup: the rebooted peer's fabric-%d connection must still be "+
-					"installed — that survivor is the whole point of this test", tc.survivor)
-			}
+			// aSurv's socket is still ESTABLISHED and its receiveLoop may already
+			// hold an ack frame read before the reboot. That frame must not speak
+			// for the incarnation that replaced it — whether acceptance rejects it
+			// on the slot's incarnation stamp (fold F1b) or because the r4b
+			// eviction removed it from the registry outright, the observable is
+			// the same: the latch stays clear.
 			ss.handleMessage(aSurv, syncMsgHeartbeatAck, nil)
 			if ss.peerHeartbeatAckEver.Load() {
-				t.Fatalf("an ack from the PREVIOUS incarnation's surviving fabric-%d connection "+
-					"must not re-arm the capability. It is still installed, so a "+
-					"membership-only test (`s.conn0 == conn || s.conn1 == conn`) accepts it "+
-					"and restores the latch microseconds after the supersession cleared it — "+
-					"the old incarnation enforced against the new one. Acceptance must "+
-					"compare the slot's incarnation stamp, not merely find the connection "+
-					"in a slot", tc.survivor)
+				t.Fatalf("an ack from the PREVIOUS incarnation's fabric-%d connection re-armed "+
+					"the capability microseconds after the supersession cleared it — the old "+
+					"incarnation enforced against the new one. A membership-only acceptance "+
+					"test (`s.conn0 == conn || s.conn1 == conn`) accepts that frame for as "+
+					"long as the connection sits in a slot", tc.survivor)
 			}
 
 			// The current incarnation's own connection still arms it.
@@ -244,8 +242,13 @@ func TestPeerHeartbeatAckTwoFabricStaleSurvivorCannotRearm_5718(t *testing.T) {
 // a CURRENT connection, not by any supersession at all.
 //
 // After the new incarnation takes one slot, it eventually dials the other
-// fabric and supersedes the dead incarnation's leftover connection there. That
-// is the SAME peer reclaiming its second slot, not a third incarnation.
+// fabric too. That is the SAME peer taking its second link, not a third
+// incarnation.
+//
+// #5718 fold r4b changes HOW that slot is free, not what must happen: the
+// eviction removed the dead incarnation's leftover connection when the
+// incarnation advanced, so the reclaim now installs into an EMPTY slot rather
+// than superseding a stale one. The requirement is unchanged.
 // Advancing on it would clear a capability this peer legitimately proved and —
 // worse — strand its first connection at a now-stale stamp, so that connection
 // could never re-arm the capability again: a permanent disarm of both
@@ -272,14 +275,20 @@ func TestPeerHeartbeatAckReclaimingStaleSlotKeepsCapability_5718(t *testing.T) {
 				t.Fatal("setup: incarnation B must latch the capability")
 			}
 
-			// B now reclaims the other fabric, evicting A's stale connection.
+			// B now takes the other fabric. A's connection there was evicted
+			// when the incarnation advanced (fold r4b), so this lands in an
+			// empty slot; before that it superseded a stale one.
+			if got := ss.connInSlot(tc.reclaimed); got != nil {
+				t.Fatalf("setup: fabric %d must be free of the retired incarnation's "+
+					"connection before B reclaims it", tc.reclaimed)
+			}
 			bReclaimed := pipeConn(t)
 			ss.installConn(tc.reclaimed, bReclaimed)
 
 			if !ss.peerHeartbeatAckEver.Load() {
-				t.Fatalf("reclaiming fabric %d, still held by an ALREADY-STALE connection, is "+
-					"the current peer taking its second fabric link, not a new incarnation. "+
-					"Clearing here discards a capability this peer proved", tc.reclaimed)
+				t.Fatalf("reclaiming fabric %d is the current peer taking its second fabric "+
+					"link, not a new incarnation. Clearing here discards a capability this "+
+					"peer proved", tc.reclaimed)
 			}
 
 			// And B's original connection must still count as current — the
@@ -547,7 +556,20 @@ func TestPeerHeartbeatAckClearedWheneverRegistryEmpties_5718(t *testing.T) {
 // pass.
 //
 // So assert the ownership directly on the package's AST.
+//
+// #5718 fold r4b widens the allowlist by exactly one name.
+// evictStaleIncarnationConnsLocked also nils a slot — that is its job — but it
+// provably cannot EMPTY the registry: installConn calls it only after the
+// incoming connection has been written into its slot, and it skips that slot
+// (keepIdx). The premise this guard protects therefore still holds. The
+// exemption is not a rubber stamp: TestInstallConnNeverLeavesTheRegistryEmpty_5718
+// asserts the behaviour that makes it sound, so losing the keepIdx skip reds
+// there instead of passing this allowlist unnoticed.
 func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
+	allowed := map[string]bool{
+		"handleDisconnect":                 true,
+		"evictStaleIncarnationConnsLocked": true,
+	}
 	fset := token.NewFileSet()
 	pkgFiles, err := filepath.Glob("*.go")
 	if err != nil {
@@ -597,14 +619,17 @@ func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
 			"was restructured, re-point this guard rather than deleting it")
 	}
 	for _, s := range sites {
-		if s.fn != "handleDisconnect" {
+		if !allowed[s.fn] {
 			t.Fatalf("%s nils a fabric connection slot at %s. installConn deliberately does "+
 				"NOT clear peerHeartbeatAckEver on the full-disconnect edge, because "+
 				"reaching an empty registry is supposed to PROVE handleDisconnect's clear "+
 				"already ran. A second function that empties a slot breaks that premise: "+
 				"the registry can then go empty with the capability still latched, and the "+
 				"previous incarnation is enforced against the next peer. Either clear the "+
-				"capability there too, or restore the clear in installConn (#5718 fold r3)",
+				"capability there too, or restore the clear in installConn (#5718 fold r3). "+
+				"evictStaleIncarnationConnsLocked is exempt ONLY because it always leaves "+
+				"the just-installed connection in place; a new site has no such argument "+
+				"until one is written down and tested",
 				s.fn, s.pos)
 		}
 	}
@@ -619,35 +644,41 @@ func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
 // missed-heartbeat teardown and the silence window on every fabric-link blip —
 // a fail-open that a reset-on-every-disconnect implementation would exhibit
 // and the tests above alone would not catch.
+// #5718 fold r4b: both directions run. handleDisconnect classifies the dropped
+// connection in a per-slot switch, so a fixture that only ever drops fabric 0
+// leaves the fabric-1 arm free — a branch-local regression there would pass.
 func TestPeerHeartbeatAckEverSurvivesPartialDisconnect_5718(t *testing.T) {
-	ss := newAckTestSync(t)
+	for _, tc := range []struct{ dropped, survivor int }{{0, 1}, {1, 0}} {
+		t.Run(fabricPairName(tc.dropped, tc.survivor), func(t *testing.T) {
+			ss := newAckTestSync(t)
 
-	conn0 := pipeConn(t)
-	conn1 := pipeConn(t)
+			dropped, survivor := pipeConn(t), pipeConn(t)
 
-	// Both fabric links up to one peer incarnation, which proves ack support.
-	ss.installConn(0, conn0)
-	ss.installConn(1, conn1)
-	ss.handleMessage(conn0, syncMsgHeartbeatAck, nil)
-	if !ss.peerHeartbeatAckEver.Load() {
-		t.Fatal("setup: capability must be latched before the partial disconnect")
-	}
+			// Both fabric links up to one peer incarnation, which proves ack
+			// support.
+			ss.installConn(tc.dropped, dropped)
+			ss.installConn(tc.survivor, survivor)
+			ss.handleMessage(dropped, syncMsgHeartbeatAck, nil)
+			if !ss.peerHeartbeatAckEver.Load() {
+				t.Fatal("setup: capability must be latched before the partial disconnect")
+			}
 
-	// Fabric 0 drops; fabric 1 survives. Same peer process, so the capability
-	// it proved is still true.
-	ss.handleDisconnect(conn0)
+			// One fabric drops; the other survives. Same peer process, so the
+			// capability it proved is still true.
+			ss.handleDisconnect(dropped)
 
-	ss.mu.Lock()
-	stillConnected := ss.conn1 != nil
-	ss.mu.Unlock()
-	if !stillConnected {
-		t.Fatal("setup: fabric 1 must survive a fabric 0 disconnect")
-	}
-	if !ss.peerHeartbeatAckEver.Load() {
-		t.Fatal("a PARTIAL disconnect (one fabric link down, the other still up) " +
-			"must NOT clear peerHeartbeatAckEver: the peer process never " +
-			"changed. Clearing on any disconnect disarms the missed-heartbeat " +
-			"teardown and PeerHealthy's silence window on every link blip")
+			if got := ss.connInSlot(tc.survivor); got != survivor {
+				t.Fatalf("setup: fabric %d must survive a fabric %d disconnect",
+					tc.survivor, tc.dropped)
+			}
+			if !ss.peerHeartbeatAckEver.Load() {
+				t.Fatalf("a PARTIAL disconnect (fabric %d down, fabric %d still up) "+
+					"must NOT clear peerHeartbeatAckEver: the peer process never "+
+					"changed. Clearing on any disconnect disarms the missed-heartbeat "+
+					"teardown and PeerHealthy's silence window on every link blip",
+					tc.dropped, tc.survivor)
+			}
+		})
 	}
 }
 
@@ -659,25 +690,87 @@ func TestPeerHeartbeatAckEverSurvivesPartialDisconnect_5718(t *testing.T) {
 // peer process that is already acking on the other link. Clearing there would
 // disarm both enforcement paths every time a flapped fabric link came back —
 // the mirror image of the partial-disconnect fail-open above.
+// #5718 fold r4b: both directions run. installConn's supersession
+// classification is a per-fabric switch, so a fixture that only ever adds
+// fabric 1 leaves the fabric-0 arm free to be mutated into an unconditional
+// clear.
 func TestPeerHeartbeatAckEverSurvivesSecondFabricComingUp_5718(t *testing.T) {
-	ss := newAckTestSync(t)
+	for _, tc := range []struct{ first, second int }{{0, 1}, {1, 0}} {
+		t.Run(fabricPairName(tc.first, tc.second), func(t *testing.T) {
+			ss := newAckTestSync(t)
 
-	conn0 := pipeConn(t)
-	ss.installConn(0, conn0)
-	ss.handleMessage(conn0, syncMsgHeartbeatAck, nil)
-	if !ss.peerHeartbeatAckEver.Load() {
-		t.Fatal("setup: capability must be latched before fabric 1 comes up")
+			firstConn := pipeConn(t)
+			ss.installConn(tc.first, firstConn)
+			ss.handleMessage(firstConn, syncMsgHeartbeatAck, nil)
+			if !ss.peerHeartbeatAckEver.Load() {
+				t.Fatalf("setup: capability must be latched before fabric %d comes up", tc.second)
+			}
+
+			// The second fabric comes up into an EMPTY slot beside the live one.
+			secondConn := pipeConn(t)
+			ss.installConn(tc.second, secondConn)
+
+			if !ss.peerHeartbeatAckEver.Load() {
+				t.Fatalf("fabric %d coming up into an EMPTY slot beside the live fabric %d "+
+					"must NOT clear peerHeartbeatAckEver: nothing was superseded and the "+
+					"peer process never changed. Clearing on every install disarms the "+
+					"missed-heartbeat teardown and PeerHealthy's silence window whenever "+
+					"a flapped fabric link returns", tc.second, tc.first)
+			}
+		})
 	}
+}
 
-	// Fabric 1 comes up into an EMPTY slot beside the live fabric 0.
-	conn1 := pipeConn(t)
-	ss.installConn(1, conn1)
+// TestConnIsCurrentIncarnationRejectsAStaleStamp_5718 pins the ACK-acceptance
+// belt directly, on a state the production install path can no longer produce.
+//
+// Since fold r4b evicts a retired incarnation's connections when the
+// incarnation advances, "installed in a slot but stamped by a retired
+// incarnation" is unreachable through installConn — which is why no behavioural
+// test can bind the stamp comparison in connIsCurrentIncarnationLocked any
+// more. That comparison is a fail-closed belt for an install path added later
+// that forgets to evict, and this test hand-builds the state it defends against
+// so the belt is not silently weakened to a membership test. It is labelled a
+// belt deliberately: it proves the guard fires, not that the state occurs in
+// production today.
+func TestConnIsCurrentIncarnationRejectsAStaleStamp_5718(t *testing.T) {
+	for _, fabricIdx := range []int{0, 1} {
+		t.Run(fmt.Sprintf("fabric%d", fabricIdx), func(t *testing.T) {
+			ss := newAckTestSync(t)
+			conn := pipeConn(t)
 
-	if !ss.peerHeartbeatAckEver.Load() {
-		t.Fatal("a fabric link coming up into an EMPTY slot beside a live one must " +
-			"NOT clear peerHeartbeatAckEver: nothing was superseded and the peer " +
-			"process never changed. Clearing on every install disarms the " +
-			"missed-heartbeat teardown and PeerHealthy's silence window whenever " +
-			"a flapped fabric link returns")
+			ss.mu.Lock()
+			ss.peerIncarnation = 7
+			if fabricIdx == 0 {
+				ss.conn0, ss.conn0Gen = conn, 6
+			} else {
+				ss.conn1, ss.conn1Gen = conn, 6
+			}
+			current := ss.connIsCurrentIncarnationLocked(conn)
+			ss.mu.Unlock()
+
+			if current {
+				t.Fatalf("a connection installed in fabric slot %d with incarnation stamp 6 was "+
+					"accepted as current while the peer incarnation is 7. The acceptance test "+
+					"has degenerated to slot membership, so a retired incarnation's in-flight "+
+					"ack would re-arm the capability for its successor", fabricIdx)
+			}
+
+			// Direction control: the same slot at the CURRENT stamp is accepted,
+			// so the assertion above is not satisfied by a helper that rejects
+			// everything.
+			ss.mu.Lock()
+			if fabricIdx == 0 {
+				ss.conn0Gen = 7
+			} else {
+				ss.conn1Gen = 7
+			}
+			current = ss.connIsCurrentIncarnationLocked(conn)
+			ss.mu.Unlock()
+			if !current {
+				t.Fatalf("a connection installed in fabric slot %d at the CURRENT incarnation "+
+					"stamp must be accepted", fabricIdx)
+			}
+		})
 	}
 }

@@ -108,16 +108,21 @@ Standard library only.
   it (#5718 fold F2).** The debt is process-scoped (`reloadDebt` in
   `networkd.go`), not a `Manager` field, because `networkctl reload` acts
   on the single host `systemd-networkd` and this package is not its only
-  owner: `pkg/daemon`'s `networkctlReload` runs it directly from four
-  sites — linksetup's post-rename reload (warn-only), device-map's
-  rename and teardown reloads, and bootstrap's teardown and lifeline
-  reloads — all touching the same `10-xpf-*` files. A `Manager`-scoped
+  owner: `pkg/daemon`'s `networkctlReload` runs it directly from FIVE
+  production sites — linksetup's post-rename reload (warn-only),
+  device-map's rename and teardown reloads, and bootstrap's teardown and
+  lifeline reloads — all touching the same `10-xpf-*` files. A `Manager`-scoped
   bool left those owners unable to record anything, and the disagreement
   resolved in the dangerous direction: their failed reload left the files
   on disk unactivated while the flag stayed false, so the next `Apply`
   with identical content took the `changed==false && !debt` branch and
   reported the #4954 false success. `pkg/daemon` now brackets its
-  shell-out with the exported `BeginReload` / `NoteReloadResult` pair.
+  shell-out with the exported `BeginReload` / `NoteReloadResult` pair,
+  and `ReloadDebtOutstanding` lets it assert the POSTCONDITION of that
+  reporting rather than the debt epoch — an epoch is unchanged both when
+  a success is reported correctly and when reporting it is omitted
+  entirely, so the epoch could not see a dropped success report or a
+  `BeginReload()` moved after the shell-out (#5718 fold r4b).
   The per-interface reconfigure debt stays `Manager` state — it names the
   interfaces this Manager generated files for, and no other owner issues
   a `networkctl reconfigure`.
