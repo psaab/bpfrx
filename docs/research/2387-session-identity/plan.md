@@ -1,6 +1,25 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r3 — incorporates r2 reviews (Claude SMR + AGY; Codex pending)
+**Revision:** v6-r4 — incorporates r3 reviews (Claude SMR + AGY; Codex pending)
+
+**v6-r4 changelog — the plan got materially CHEAPER:**
+- **AGY r3 refuted my rejection of hashing, and it was right.** The tree already
+  has `StableRoutingInstanceTableID(name)` — a pure FNV-1a function of the RI
+  name — **plus a commit gate that rejects colliding configs**, already wired at
+  `pkg/config/compiler.go:229`. Verified. **This deletes the entire allocate-once
+  interner, its config-carried table, the never-reissue rule, the flush-on-delete
+  path and the rollback design** that v6-r3 introduced (§5). A pure function of
+  the name gives cluster agreement, restart persistence, rollback coherence and
+  immunity to add/delete renumbering *for free*.
+- **Claude SMR r3 (SMR-10) + AGY r3 R2(b) independently:** §4.3b's version gate
+  fixes the steady state but leaves the **off→on transition** open — sessions
+  imported while the peer was v1 carry `routing_domain = 0` and re-run the exact
+  fail-open trace when enforcement engages. New §4.3c.
+- AGY r3 **VERIFIED** the §7a VXLAN/IP-in-IP rejections (conceding its own r2
+  suggestion was wrong) and **VERIFIED** the C-P2 key.rs signatures as
+  implementable.
+- AGY r3 returned **PLAN-KILL** on cost/benefit. §3a answers it — including the
+  part of its cost basis that its own R1 finding removes.
 
 **v6-r3 changelog — two defects found in v6-r2, both in the fix rather than the bug:**
 - **AGY r2 REFUTED §4.3a's fail-closed claim.** It is fail-closed for domain-N
@@ -148,6 +167,43 @@ across ~300 literal sites and two wire surfaces.
 A PLAN-KILL here would rest **solely** on cost/benefit, not on unreachability: the
 collision is live, and I have the ordering proof. A PLAN-KILL should then say so
 explicitly and leave the shipped A.1 warning as the permanent operator contract.
+
+## 3a. AGY r3 returned PLAN-KILL — the case, and the answer
+
+AGY r3's verdict, verbatim in substance: the trigger config is a niche edge case
+already mitigated by the shipped A.1 warning and A.2 flow-cache keying, and the
+accumulated cost — *"widening `SessionKey` across ~297 literal sites, introducing an
+unworkable stateful interner, bumping `CurrentHAProtocolVersion`, and altering the core
+`parseHAProtocolCompatible` upgrade gate predicate"* — outweighs the benefit.
+
+**This is a serious verdict and it must not be argued away. Two of its four cost items
+are real; two are not.**
+
+| AGY's cost item | Status after v6-r4 |
+|---|---|
+| ~297 struct-literal sites | **real**, though most are test fixtures and most of the 743 references need no edit |
+| "unworkable stateful interner" | **removed** — by AGY's own R1 finding. The interner is a pure function of the RI name reusing existing machinery (§5). AGY's verdict priced a cost that its own review had just deleted. |
+| `CurrentHAProtocolVersion` bump | **real**, but rolling-compatible via the declared floor |
+| altering `parseHAProtocolCompatible` | **real, and the sharpest objection in the review** — it is the gate deciding whether *any* release is rolling-upgradable |
+
+So the honest post-r4 cost is: **~297 mostly-test literal edits, a pure-function domain
+derivation, a rolling-compatible version bump, a flush on the enforcement transition,
+and one change to the upgrade-compatibility predicate.** That is materially smaller
+than the basis AGY assessed, because r4 removed the interner it objected to.
+
+**The counter-case for PLAN-KILL that survives:** the `parseHAProtocolCompatible`
+change has blast radius beyond this issue — it relaxes the rolling-upgrade gate for
+every future release. A reviewer may reasonably judge that a niche, warned-about
+config does not justify touching that gate. **That is the strongest remaining argument
+for PLAN-KILL and this plan does not claim to refute it** — it is a judgement about
+risk appetite, and it belongs to the maintainer.
+
+**The counter-case against PLAN-KILL:** the shipped A.1 warning text tells the operator
+their config is not session-isolated *"until the session identity is VRF-aware"* — a
+written promise that the isolation is coming. PLAN-KILL would make that text
+permanently misleading, so a PLAN-KILL **must** be accompanied by rewriting A.1's
+warning into a statement of permanent non-support. That is a small, concrete
+obligation and it should not be skipped.
 
 ## 4. What I verified first-hand
 
@@ -338,6 +394,53 @@ its reject-not-widen requirement; that remains its own scope.
 **Cost consequence for this plan:** v6-r1 priced the capability question at zero and
 v6-r2 left it open. It is neither. C-P3 carries a protocol-version bump plus a change
 to the ISSU compatibility predicate.
+
+### 4.3c The version gate fixes the steady state; the TRANSITION needs an action
+
+Claude SMR r3 and AGY r3 independently found the same hole in §4.3b. The gate is
+specified as a steady-state predicate ("enforce when peer >= 2"), but it gates on a
+**peer state that changes over time**, and each transition needs handling.
+
+**(a) Unknown peer version → NOT-ENFORCING, explicitly.** On a fresh boot or after a
+heartbeat gap the peer's version is unknown. The default must be **not to enforce**,
+because "unknown" is indistinguishable from "legacy peer". This is the opposite of the
+usual fail-closed instinct, which is exactly why it must be written down: an
+implementer reaching for "fail closed on unknown" produces a self-DoS, and one
+reaching for "enforce by default" produces the fail-open. Neither is right by accident.
+
+**(b) Carried-forward sessions — the real hole.** Sessions imported from the peer while
+it was still v1 **do not disappear when the peer upgrades**. They sit in the table
+carrying `routing_domain = 0` — a value that was never sent and never meant anything.
+When enforcement flips on, AGY r2's original refuted trace runs again in full: a
+genuine default-VRF flow with a matching 5-tuple hits a session that belongs to
+tenant-a. AGY r3 adds the mirror case: domain-N packets *fail* against those same
+sessions, dropping legitimate VRF traffic.
+
+The gate cannot close this, because it is evaluated per packet against the peer's
+*current* version while the poisoned sessions were admitted under the *previous* one.
+**State admitted under the old regime is carried forward into the new one** — a
+transition no amount of steady-state reasoning can see.
+
+**Required — the flip must be a transition with an action.** Two options:
+
+- **Flush** every peer-imported session admitted while the peer was < v2. The cluster
+  already performs a bulk resync on connect, so the cost is one resync during an
+  upgrade — a window that is already disruptive by definition.
+- **Mark** each imported session at admission with whether its domain was
+  authoritative, and exempt non-authoritative entries from domain comparison for their
+  lifetime. Cheaper at the moment of transition, but adds a per-session bit and a
+  second matching path that must itself be tested.
+
+**This plan chooses FLUSH**, because the window is an upgrade, bulk resync is already
+the cluster's normal recovery behaviour, and a per-session exemption bit is a second
+mechanism to get wrong on the security-critical path.
+
+**(c) Every off→on transition, not just the first.** A peer version regression
+(rollback, or flapping heartbeats) turns enforcement off; the subsequent re-upgrade
+re-opens case (b). The flush obligation attaches to **every** off→on transition. The
+plan should also require a **dampener** on the enforcement flip so a flapping peer
+cannot drive repeated flushes — this project already has the pattern in the GARP
+dampener.
 
 ### 4.4 Hot-path cost — measured where measurable, unmeasured where not (Q4)
 
@@ -533,7 +636,50 @@ session, and deriving it from a config-analysis result cannot guarantee that.
 
 **Path D is withdrawn.**
 
-#### The replacement, stated as an invariant — because v6-r2's version of it was also defective
+#### RESOLVED in v6-r4: the mechanism already exists in the tree
+
+**Everything in the two subsections below is retained for the record but is now
+SUPERSEDED.** v6-r2 and v6-r3 spent two review rounds designing an allocate-once
+interner because I assumed a name-hash was unsafe. **AGY r3 refuted that, and I
+verified the refutation:**
+
+- `StableRoutingInstanceTableID(name)` (`pkg/config/routinginstanceid.go:48`) maps an
+  RI name into a reserved band via **FNV-1a**, xor-folding the high half so the modulo
+  samples the whole hash. It is explicitly *"a pure function of the name"*.
+- `validateRoutingInstanceTableIDCollisionAST` (`:126`) is a **strict commit gate**
+  that **rejects** any config where two routing-instances collide. It is wired into the
+  compiler at `pkg/config/compiler.go:229` **and** `:397`, and it unions names across
+  every `routing-instances` root and every `groups` block, including the per-node
+  cluster expansions.
+
+So the project already solved exactly this problem, and solved it the way I argued
+against: **hash, then reject collisions at commit.** My collision objection was wrong
+because it assumed collisions would be silent; they are not — they are a commit error.
+
+**C-P0 therefore becomes: derive `routing_domain` as a pure function of the
+routing-instance name, reusing the existing stable-id machinery, and extend the
+existing collision gate to cover the domain-id derivation.** What this deletes,
+entirely:
+
+| v6-r3 scope | Status in v6-r4 |
+|---|---|
+| monotonic allocate-once allocator | **deleted** — pure function |
+| name→id table carried in the config | **deleted** — nothing to persist |
+| never-reissue-after-delete rule | **deleted** — a name always maps to the same id |
+| flush-on-RI-delete | **deleted** — no stale id can be reused |
+| daemon-restart persistence | **deleted** — recomputed |
+| `rollback` coherence design | **deleted** — pure function of the config text |
+| SMR-7's add/delete renumbering hazard | **cannot occur** — no positional derivation |
+| AGY r2's HA interner divergence | **cannot occur** — both nodes compute the same value |
+
+AGY also argued the config-carried table was *unworkable* (auto-mutating human-edited
+Junos text, split-brain on out-of-order commits, rollback restoring text without the
+table). I agree, and that objection is now moot rather than merely answered.
+
+**This is the single largest cost reduction across the whole v6 series, and it came
+from a reviewer refuting me.** The two subsections below are the superseded design.
+
+#### [SUPERSEDED] The replacement, stated as an invariant — because v6-r2's version of it was also defective
 
 v6-r2 said only "static and deterministic interning across all routing-instances".
 **Claude SMR r2 and AGY r2 independently found that this is not sufficient**, and the
