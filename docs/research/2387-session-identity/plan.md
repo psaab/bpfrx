@@ -646,8 +646,9 @@ mismatch, **drop + increment a dedicated counter** — do not fall through to in
 **Cost:** ~297 struct-literal edits (most in test files), +4 B/key, one extra
 `write_u32` per hash, an additive wire append, **a rolling-compatible
 `CurrentHAProtocolVersion` bump plus the `parseHAProtocolCompatible` change (§4.3b)**,
-the allocate-once interner and its config-carried table (§5), and a mandatory
-`make test-failover`. **Delivers:** the issue's literal ask and vendor parity.
+a **pure-function domain derivation reusing existing machinery** (§5 — no persistent
+state), the enforcement-transition flush (§4.3c), and a mandatory `make test-failover`.
+**Delivers:** the issue's literal ask and vendor parity.
 
 ### ~~Path D — ISOLATE-narrow~~ — WITHDRAWN in v6-r2
 
@@ -778,12 +779,13 @@ rollout-safety value Path D was reaching for, without the hazard.
 
 ### Recommendation (to be tested by review, not asserted)
 
-**Path C, staged, with static deterministic interning** (Path D's rollout discipline
-is withdrawn; its *goal* — non-VRF deployments behaviourally identical — is preserved
-by domain 0). Rationale: the cost objection that drove the v4 deferral is retired
-(§4.3); Path B is structurally forced into a cross-tenant fault by the 1:1
-`key_to_handle` map, not merely semantically inferior; Path A contradicts the shipped
-A.1 warning text.
+**Path C, staged, with a pure-function domain derivation** (Path D is withdrawn; its
+*goal* — non-VRF deployments behaviourally identical — is preserved by domain 0, which
+is mathematically disjoint from every derived id). Rationale: the cost objection that
+drove the v4 deferral is retired (§4.3); the interner objection that drove AGY's r3
+PLAN-KILL is retired by reusing `StableRoutingInstanceTableID`'s method (§5); Path B is
+structurally forced into a cross-tenant fault by the 1:1 `key_to_handle` map, not
+merely semantically inferior; Path A contradicts the shipped A.1 warning text.
 
 Path C is a **PR series**, not one PR:
 
@@ -793,9 +795,10 @@ Path C is a **PR series**, not one PR:
 | **C-P2** | add `routing_domain` to `SessionKey` + the four transforms in `session/key.rs`; store ingress **and** egress domain in `SessionMetadata`; fabric exemption. | no | RED-on-revert + negative control |
 | **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **`CurrentHAProtocolVersion` → 2 + `MinCompat` = 1 + the `parseHAProtocolCompatible` change + version-gated enforcement (§4.3b)**. | yes | `make test-failover` + short-payload decode + **mixed-version enforcement-off** test |
 
-**C-P0 additionally owns** the allocate-once/never-reissue interner, its
-config-carried name→id table, and the flush-on-RI-delete path (§5). That is more than
-"plumbing" and should not be under-scoped.
+**C-P0 additionally owns** the pure-function domain derivation and the extension of the
+existing commit collision gate to cover it (§5). Because the derivation is stateless,
+C-P0 is genuinely a plumbing PR — this is the change that made the whole series
+tractable, and it is why C-P0 is a safe place to start.
 
 **C-P2's signature changes, made explicit** (AGY r2 required this). `SessionKey`
 carries the *ingress* domain, so the reverse/translated transforms cannot derive the
