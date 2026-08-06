@@ -4,7 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
 	"testing"
@@ -134,5 +133,3 @@ func rowNames(rows []validationPhase) []string {
 	}
 	return out
 }
-
-var _ = strings.TrimSpace

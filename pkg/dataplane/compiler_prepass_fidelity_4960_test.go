@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -80,8 +81,17 @@ var prePassShimDivergence = map[string]string{
 //   - Every divergence is allowlisted WITH a reason, and the allowlist is
 //     asserted MINIMAL, so it cannot rot into a dumping ground.
 func TestPrePassFakeIsNoMorePermissiveThanProduction_4960(t *testing.T) {
-	shimDecl, shimNonNoop := declaredMethods(t, "loader.go", "userspaceShimCompileDataplane")
-	fakeDecl, _ := declaredMethods(t, "compiler_validate_4960.go", "discardingDataPlane")
+	// #6894 r8 F3: scan the whole package, not two named files. Both halves used
+	// to read `loader.go` and `compiler_validate_4960.go` by name, so moving
+	// `SetFilterRule` into a sibling file WITH A REJECTING BODY left this
+	// PASSING — and compileFirewallFilters is a late phase, after compileZones
+	// has mutated the host, which is precisely the #4960 shape. The
+	// `len(shimDecl) < 40` floor only catches a wholesale move: with 55 methods
+	// today, fifteen can migrate before it trips, and a partial split is
+	// realistic under the 2000-LOC discipline. The sole-writer canary already
+	// scans by directory; these now agree.
+	shimDecl, shimNonNoop := declaredMethodsInPackage(t, "userspaceShimCompileDataplane")
+	fakeDecl, _ := declaredMethodsInPackage(t, "discardingDataPlane")
 
 	// FLOOR: a rename or file move would empty either scan and pass vacuously.
 	if len(shimDecl) < 40 || len(fakeDecl) < 30 {
@@ -193,39 +203,55 @@ func TestPrePassFakeIsNoMorePermissiveThanProduction_4960(t *testing.T) {
 	}
 }
 
-// declaredMethods returns the set of methods DECLARED on recv in file (promoted
-// ones are absent by construction, which is the distinction this test needs),
-// plus the names of those whose body is not a bare no-op.
-func declaredMethods(t *testing.T, file, recv string) (map[string]bool, []string) {
+// declaredMethodsInPackage returns the set of methods DECLARED on recv anywhere
+// in the package (promoted ones are absent by construction, which is the
+// distinction this test needs), plus the names of those whose body is not a
+// bare no-op. Directory-scoped on purpose: a per-file scan is evaded by moving
+// a declaration to a sibling (#6894 r8 F3).
+func declaredMethodsInPackage(t *testing.T, recv string) (map[string]bool, []string) {
 	t.Helper()
-	f, err := parser.ParseFile(token.NewFileSet(), file, nil, parser.ParseComments)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse %s: %v", file, err)
+		t.Fatalf("read package dir: %v", err)
 	}
 	decl := map[string]bool{}
 	var nonNoop []string
-	for _, d := range f.Decls {
-		fn, ok := d.(*ast.FuncDecl)
-		if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
+	files := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		if !strings.Contains(exprTypeName(fn.Recv.List[0].Type), recv) {
-			continue
+		f, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
 		}
-		decl[fn.Name.Name] = true
-		if fn.Body == nil || len(fn.Body.List) == 0 {
-			continue
-		}
-		if len(fn.Body.List) == 1 {
-			if ret, isRet := fn.Body.List[0].(*ast.ReturnStmt); isRet && returnsOnlyNilOrNothing(ret) {
+		files++
+		for _, d := range f.Decls {
+			fn, ok := d.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
 				continue
 			}
+			if exprTypeName(fn.Recv.List[0].Type) != recv {
+				continue
+			}
+			decl[fn.Name.Name] = true
+			if fn.Body == nil || len(fn.Body.List) == 0 {
+				continue
+			}
+			if len(fn.Body.List) == 1 {
+				if ret, isRet := fn.Body.List[0].(*ast.ReturnStmt); isRet && returnsOnlyNilOrNothing(ret) {
+					continue
+				}
+			}
+			if recv == "userspaceShimCompileDataplane" {
+				nonNoop = append(nonNoop, fn.Name.Name)
+			}
 		}
-		// The fake's stubs may spell a typed nil over two statements; that is
-		// still a no-op for this purpose. Only the SHIM's bodies are policed.
-		if recv == "userspaceShimCompileDataplane" {
-			nonNoop = append(nonNoop, fn.Name.Name)
-		}
+	}
+	if files < 10 {
+		t.Fatalf("scanned only %d non-test .go files looking for %s — the scan is "+
+			"not reaching the package", files, recv)
 	}
 	return decl, nonNoop
 }
@@ -283,6 +309,40 @@ func TestPrePassPersistentNATCallsCannotFail_4960(t *testing.T) {
 		t.Fatalf("parse compiler_nat.go: %v", err)
 	}
 
+	// Which identifiers hold the table? Derived, so a rename cannot silently
+	// shrink coverage.
+	pnatIdents := map[string]bool{}
+	for _, d := range natFile.Decls {
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "compileNAT" || fn.Body == nil {
+			continue
+		}
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			as, ok := n.(*ast.AssignStmt)
+			if !ok {
+				return true
+			}
+			for i, rhs := range as.Rhs {
+				call, ok := rhs.(*ast.CallExpr)
+				if !ok {
+					continue
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "GetPersistentNAT" || i >= len(as.Lhs) {
+					continue
+				}
+				if id, ok := as.Lhs[i].(*ast.Ident); ok {
+					pnatIdents[id.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	if len(pnatIdents) == 0 {
+		t.Fatal("found no `x := dp.GetPersistentNAT()` assignment in compileNAT — " +
+			"the derivation is blind, so the exemption is unbacked")
+	}
+
 	called := map[string]bool{}
 	for _, d := range natFile.Decls {
 		fn, ok := d.(*ast.FuncDecl)
@@ -298,31 +358,46 @@ func TestPrePassPersistentNATCallsCannotFail_4960(t *testing.T) {
 			if !ok {
 				return true
 			}
-			if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "pnat" {
+			if recv, ok := sel.X.(*ast.Ident); ok && pnatIdents[recv.Name] {
 				called[sel.Sel.Name] = true
 			}
 			return true
 		})
 	}
 
-	// FLOOR: the exemption is only meaningful while compileNAT actually calls
-	// into the table. Zero found means the scan broke, not that the risk went
-	// away — and a silently empty scan would vouch for nothing.
-	if len(called) == 0 {
-		t.Fatal("found no pnat.* calls in compileNAT. Either the receiver was " +
-			"renamed or the block moved; this assertion is now blind and the " +
-			"GetPersistentNAT exemption is unbacked until it is taught the new shape")
+	// FLOOR, EXACT (#6894 r8 F2). A `> 0` floor was evaded by renaming the
+	// receiver in one of compileNAT's TWO pnat blocks: coverage dropped 3
+	// methods to 1 and the floor still passed, so a genuinely fallible
+	// RegisterNATIP would have gone unnoticed. The receiver identifiers are now
+	// DERIVED from the `... := dp.GetPersistentNAT()` assignments rather than
+	// matched by the literal name `pnat`, and the count is exact — the same
+	// discipline the ordering guard uses.
+	const wantPnatMethods = 3
+	if len(called) != wantPnatMethods {
+		t.Fatalf("found %d distinct methods called on the persistent-NAT table in "+
+			"compileNAT (%v), expected %d. A DROP means the scan stopped seeing a "+
+			"call block and the GetPersistentNAT exemption is silently unbacked for "+
+			"whatever it no longer sees; a RISE means a new call whose fallibility "+
+			"this assertion has not been told about. Re-derive, then update the "+
+			"count deliberately.", len(called), sortedSet(called), wantPnatMethods)
 	}
 
 	natTable, err := parser.ParseFile(fset, "persistent_nat.go", nil, 0)
 	if err != nil {
 		t.Fatalf("parse persistent_nat.go: %v", err)
 	}
+	// Keyed by RECEIVER+name: persistent_nat.go has one receiver today, but a
+	// bare name key is last-declaration-wins the moment a second appears.
 	declared := map[string]*ast.FuncDecl{}
 	for _, d := range natTable.Decls {
-		if fn, ok := d.(*ast.FuncDecl); ok && fn.Recv != nil {
-			declared[fn.Name.Name] = fn
+		fn, ok := d.(*ast.FuncDecl)
+		if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
+			continue
 		}
+		if exprTypeName(fn.Recv.List[0].Type) != "PersistentNATTable" {
+			continue
+		}
+		declared[fn.Name.Name] = fn
 	}
 
 	var fallible, unresolved []string
@@ -356,4 +431,13 @@ func TestPrePassPersistentNATCallsCannotFail_4960(t *testing.T) {
 			"discardingDataPlane model the table, or establish that the new result "+
 			"cannot be non-nil for any config reaching it.", fallible)
 	}
+}
+
+func sortedSet(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

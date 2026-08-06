@@ -428,8 +428,17 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	first := compileIDsOnce(t, cfg)  // the discarded validate pass
 	second := compileIDsOnce(t, cfg) // the real pass that programs the dataplane
 
+	// #6894 r8 F1: PolicyNames / PolicySets / AppNames were ADDED to the driver's
+	// return map a round earlier and never added HERE, so nothing read them. A
+	// package-level counter perturbing result.PolicyNames across passes left this
+	// test PASSING while the identical mutation shape on implicitSets — a
+	// compared column — reds. Three columns were requested, three columns
+	// appeared, and the property stayed unmeasured. When adding a column to a
+	// comparison-driven test the acceptance check is a MUTATION IN THAT COLUMN,
+	// never the column's presence.
 	for _, k := range []string{"ZoneIDs", "ScreenIDs", "AddrIDs", "AppIDs",
-		"PoolIDs", "NATCounterIDs", "implicitSets", "NextPoolID"} {
+		"PoolIDs", "NATCounterIDs", "implicitSets", "NextPoolID",
+		"PolicyNames", "PolicySets", "AppNames"} {
 		if !reflect.DeepEqual(first[k], second[k]) {
 			t.Errorf("%s differs between pass 1 and pass 2 — a discarded "+
 				"validate pre-pass would PERTURB the IDs the live dataplane is "+

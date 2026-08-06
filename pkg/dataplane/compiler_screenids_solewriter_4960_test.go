@@ -1,11 +1,11 @@
 package dataplane
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -31,12 +31,20 @@ import (
 // call sites left the whole package GREEN. The comment claimed "this test is
 // what fails at that moment"; for the shape it named, it was not.
 //
-// So bind the structural property the reasoning actually rests on: that
-// `assignScreenIDs` is the ONLY thing that writes the map. It is today —
-// compiler.go carries the single `result.ScreenIDs[name] = screenID`, and every
-// other non-test mention is a read. A second writer anywhere makes the
-// key sets separable, at which point the two resolution sites stop being
-// redundant and each needs its own binding.
+// So bind the structural property the reasoning actually rests on, as far as an
+// AST canary can: that no OTHER function contains a direct index-assignment or
+// `delete` on a `.ScreenIDs` selector. It is satisfied today — compiler.go
+// carries the single `result.ScreenIDs[name] = screenID`, and every other
+// non-test mention is a read.
+//
+// SCOPE, stated because the earlier header overclaimed it (#6894 r8 F4). This
+// binds two SYNTACTIC FORMS, not "a second writer anywhere". A local alias
+// (`m := result.ScreenIDs; m[k] = v`) and a helper taking the map as a
+// parameter both evade it, demonstrated. Those escapes are inherent to a
+// canary of this kind and are not chased; what matters is that the header does
+// not promise coverage the check does not have. The realistic regression — a
+// second `result.ScreenIDs[...] = ...` added beside the first — is caught, and
+// that is what the redundancy argument is actually exposed to.
 func TestAssignScreenIDsIsTheSoleWriter_4960(t *testing.T) {
 	writers := map[string][]string{} // enclosing func -> file:line
 	scanned := 0
@@ -68,7 +76,7 @@ func TestAssignScreenIDsIsTheSoleWriter_4960(t *testing.T) {
 					for _, lhs := range st.Lhs {
 						if isScreenIDsIndex(lhs) {
 							writers[fn.Name.Name] = append(writers[fn.Name.Name],
-								filepath.Join(name)+":"+itoa(fset.Position(st.Pos()).Line))
+								fmt.Sprintf("%s:%d", name, fset.Position(st.Pos()).Line))
 						}
 					}
 				case *ast.CallExpr:
@@ -76,7 +84,7 @@ func TestAssignScreenIDsIsTheSoleWriter_4960(t *testing.T) {
 					if id, ok := st.Fun.(*ast.Ident); ok && id.Name == "delete" &&
 						len(st.Args) == 2 && isScreenIDsSelector(st.Args[0]) {
 						writers[fn.Name.Name] = append(writers[fn.Name.Name],
-							filepath.Join(name)+":"+itoa(fset.Position(st.Pos()).Line))
+							fmt.Sprintf("%s:%d", name, fset.Position(st.Pos()).Line))
 					}
 				}
 				return true
@@ -130,16 +138,4 @@ func isScreenIDsIndex(e ast.Expr) bool {
 func isScreenIDsSelector(e ast.Expr) bool {
 	sel, ok := e.(*ast.SelectorExpr)
 	return ok && sel.Sel != nil && sel.Sel.Name == "ScreenIDs"
-}
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b []byte
-	for i > 0 {
-		b = append([]byte{byte('0' + i%10)}, b...)
-		i /= 10
-	}
-	return string(b)
 }

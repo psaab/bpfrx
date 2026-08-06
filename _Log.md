@@ -70743,3 +70743,70 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
   pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6894 round 8 — fold the scoped re-gate at `e42fa044c`. One
+  BLOCKING item, in my own r6 work, plus three minors and four NITs.
+  **F1 (BLOCKING, and my defect) — three columns added, never compared.** r6
+  added `PolicyNames` / `PolicySets` / `AppNames` to `compileIDsOnce`'s return
+  map with a comment claiming an order-dependent id "shows here and nowhere else
+  in this comparison". The `reflect.DeepEqual` loop still listed EIGHT keys and
+  none of the three. Nothing read them. Reproduced: a package-level counter
+  perturbing `result.PolicyNames` across passes left the test PASSING, while the
+  same mutation shape on `implicitSets` — a compared column — reds.
+  This is the shape my own notes name and I walked into it: a prescribed test
+  FORM can be satisfied with the defect intact. Three columns were asked for,
+  three columns appeared, the property stayed unmeasured. The acceptance check
+  for adding a column to a comparison-driven test is a MUTATION IN THAT COLUMN,
+  never the column's presence — now recorded at the loop.
+  Fixed by appending the three keys. PROVEN PER COLUMN, `go vet` rc=0 on each:
+  `PolicyNames differs between pass 1 and pass 2`, `AppNames differs ...`,
+  `PolicySets differs ...`. (First attempt injected the drift at the top of
+  `compilePolicies` and nil-map-panicked — `PolicyNames`/`AppNames` are NOT
+  allocated by `newValidationResult`; they are made inside their phases. Moved
+  the injection after the allocation. A panic is not a red.)
+  The `PolicyScheduleRuleSlots` refusal was independently verified CORRECT:
+  `compiler.go` appends only under `if pol.SchedulerName != ""` and neither
+  probe policy sets it, so it would be nil-vs-nil.
+  **F2 — the pnat guard's floor was `>0`, not exact.** It matched the literal
+  receiver name `pnat`; `compileNAT` has TWO such blocks, so renaming the inner
+  one dropped coverage 3 methods -> 1 while the floor still passed, and a
+  genuinely fallible `RegisterNATIP` would have gone unnoticed. Now the receiver
+  identifiers are DERIVED from the `x := dp.GetPersistentNAT()` assignments (so
+  a rename is no longer an evasion — verified: renaming one block keeps the
+  count at 3 and the test correctly stays green) and the floor is EXACT, the
+  same discipline the ordering guard already uses. PROVEN TO FIRE on a real
+  coverage drop — deleting one whole pnat block: `found 2 distinct methods ...
+  expected 3`, `go vet` rc=0.
+  **F3 — both halves of the fidelity guard were single-file scoped.** They read
+  `loader.go` and `compiler_validate_4960.go` BY NAME, so moving `SetFilterRule`
+  to a sibling file with a REJECTING body left the guard passing — and
+  `compileFirewallFilters` is a late phase, after `compileZones` has mutated the
+  host, which is exactly the #4960 shape. The `<40` floor only catches a
+  wholesale move; with 55 methods, fifteen can migrate first. Now scans the
+  package DIRECTORY, matching the sole-writer canary's discipline, with an exact
+  receiver-name match instead of a substring. PROVEN TO FIRE on the
+  demonstrated escape — `SetAddressBookEntry` moved to a sibling with a
+  rejecting body: `non-no-op body: [SetAddressBookEntry]`, `go vet` rc=0.
+  **F4 — the sole-writer canary's header overclaimed.** It said `assignScreenIDs`
+  is "the ONLY thing that writes the map" and "a second writer ANYWHERE". It
+  binds two SYNTACTIC FORMS: a local alias and a helper taking the map as a
+  parameter both evade it. Escapes are inherent to an AST canary and are not
+  chased; the header now states the scope, and says the realistic regression
+  (a second index-assignment beside the first) is what the redundancy argument
+  is actually exposed to.
+  NITs: `declared` in the pnat assertion was keyed by bare method name across
+  all receivers (last-declaration-wins if a second appears) — now filtered to
+  `PersistentNATTable`; removed `var _ = strings.TrimSpace` and its dead import;
+  replaced single-arg `filepath.Join` and the hand-rolled `itoa` with
+  `fmt.Sprintf`.
+  NOT RE-LITIGATED per the brief: the source-derived ordering guard, all three
+  legitimacy arms of the divergence check, the pnat assertion's derivation, and
+  all twelve citation conversions — each attacked and each held.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/dataplane` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
+  packages); `gofmt -l` clean.
+- **File(s)**: pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
+  pkg/dataplane/compiler_prepass_order_4960_test.go,
+  pkg/dataplane/compiler_screenids_solewriter_4960_test.go, _Log.md
