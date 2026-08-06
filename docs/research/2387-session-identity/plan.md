@@ -1,6 +1,19 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r4 — incorporates r3 reviews (Claude SMR + AGY; Codex pending)
+**Revision:** v6-r5 — incorporates r4 reviews. **AGY r4 = PLAN-READY** (reversing its
+own r3 PLAN-KILL). Claude SMR r4 = PLAN-NEEDS-REVISION, both items resolved below.
+Codex: see the reviewer ledger.
+
+**v6-r5 changelog — I lost both of my own r4 findings, and that is the right outcome:**
+- **SMR-12 (FLUSH vs MARK) — CONCEDED to AGY.** I argued flushing opens an
+  availability window; AGY's rebuttal is better and is adopted. The entries are
+  standby replicas, so no live traffic is interrupted, and the decisive asymmetry is
+  duration: FLUSH exposes a seconds-long resync window, MARK exposes a fail-open for
+  the whole remaining lifetime of every affected session. FLUSH stands, scoped via the
+  verified `SessionOrigin::is_peer_synced()`.
+- **SMR-13 (900k id band) — WITHDRAWN.** A config whose RIs collide in that band is
+  already rejected today, so reusing the value adds no new commit failure. Demoted to
+  a stated preference for reusing the method over the value.
 
 **v6-r4 changelog — the plan got materially CHEAPER:**
 - **AGY r3 refuted my rejection of hashing, and it was right.** The tree already
@@ -431,9 +444,28 @@ transition no amount of steady-state reasoning can see.
   lifetime. Cheaper at the moment of transition, but adds a per-session bit and a
   second matching path that must itself be tested.
 
-**This plan chooses FLUSH**, because the window is an upgrade, bulk resync is already
-the cluster's normal recovery behaviour, and a per-session exemption bit is a second
-mechanism to get wrong on the security-critical path.
+**This plan chooses FLUSH.** I argued against this in Claude SMR r4 — on the grounds
+that flushing opens an availability window during an upgrade, exactly when a failover
+is most likely — and **AGY r4 rebutted it with the better argument, which I accept:**
+
+- The entries being flushed are **peer-imported standby replicas**. Flushing them on
+  the receiving node does **not** interrupt live traffic; it removes the backup copy,
+  and the peer immediately re-streams its active sessions carrying the new field.
+- The decisive asymmetry is **duration**. FLUSH's exposure is a resync window measured
+  in seconds. MARK's exposure is a fail-open that persists for the **entire remaining
+  lifetime of every affected session** — hours or days for a long-lived TCP flow. For a
+  cross-tenant hijack, a long self-clearing security exposure is worse than a short
+  availability one, and #2387 is a security issue.
+- Scoping is already available: `SessionOrigin::is_peer_synced()`
+  (`userspace-dp/src/session/entry.rs:245`, over the `SyncImport` variant at `:221`) —
+  **verified** — so the flush targets peer-imported entries precisely and never touches
+  locally-created sessions.
+
+**The availability consideration is not dismissed, it is bounded and recorded:** the
+flush must be scoped to peer-imported entries only, and the dampener in (c) below is
+what keeps a flapping peer from turning a bounded window into a repeated one. If the
+resync window is later measured to be long enough to matter, MARK remains available as
+a fallback — but it should not be the first choice.
 
 **(c) Every off→on transition, not just the first.** A peer version regression
 (rollback, or flapping heartbeats) turns enforcement off; the subsequent re-upgrade
@@ -658,8 +690,29 @@ because it assumed collisions would be silent; they are not — they are a commi
 
 **C-P0 therefore becomes: derive `routing_domain` as a pure function of the
 routing-instance name, reusing the existing stable-id machinery, and extend the
-existing collision gate to cover the domain-id derivation.** What this deletes,
-entirely:
+existing collision gate to cover the domain-id derivation.**
+
+**Reuse the METHOD; reusing the VALUE is acceptable but not preferred.**
+`StableRoutingInstanceTableID` maps into a reserved band of **900,000** values
+(`Base = 100000`, `Span = 900000`, `routinginstanceid.go:22-23`), not the full `u32`.
+I initially flagged this as a birthday-collision hazard at scale; that objection is
+**withdrawn**, because a config whose RIs collide in that band is **already rejected
+today** by the existing gate, so reusing the value adds **no new commit failure**. Two
+points survive and are preferences, not blockers:
+
+- reusing the *value* couples session identity to the kernel table-id space, so a
+  future change to the band or span made for routing reasons would silently change
+  every session's domain;
+- domain **0** must stay reserved for the default routing-instance. That is safe with
+  either choice: the band starts at 100000, so 0 is **mathematically disjoint** from
+  every derived id (AGY r4 — verified).
+
+Preference: derive by the same *method* (FNV-1a of the name + the existing
+collision-gate pattern) into its own `u32` space. All the properties that made this
+finding valuable — pure function ⇒ cluster agreement, restart persistence, rollback
+coherence, no add/delete renumbering — belong to the **method**, not to the value.
+
+What this deletes, entirely:
 
 | v6-r3 scope | Status in v6-r4 |
 |---|---|
