@@ -423,8 +423,11 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 }
 
 // applyRG0OwnershipTransition reacts to a RG0 ownership change: it toggles the
-// store's cluster read-only gate (only RG0 primary may write config) and, on
-// promotion, re-initiates synced IPsec SAs and nudges DHCP lease-sync.
+// store's cluster read-only gate (whose INTENT is that only the RG0 primary
+// writes config -- this function is the only thing that arms it, so a node that
+// never transitions is not gated at all; see pkg/cluster/README.md "Recovery"
+// and #6890) and, on promotion, re-initiates synced IPsec SAs and nudges DHCP
+// lease-sync.
 //
 // #4378: on DEMOTION it also confirms any in-flight `commit confirmed` window
 // BEFORE going read-only. The committing node had already pushed the committed
