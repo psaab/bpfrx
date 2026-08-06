@@ -1134,6 +1134,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// configured zone as unpopulated when there is no apply result or no loaded
 	// dataplane), so it degrades correctly above the gate, like collectPBRStatus
 	// and the lo0/host-inbound families hoisted above for the same reason.
+	// #3462 ordering, restated at the new position: a GENUINE per-zone read
+	// failure bumps counterReadErrors, and the deferred emitCounterReadErrors at
+	// the top of Collect runs at function exit — after this — so a failure this
+	// scrape is reflected in THIS scrape's xpf_counter_read_errors_total rather
+	// than lagging one behind. Moving the collector earlier preserves that: it
+	// is still upstream of the deferred emit.
 	c.collectZoneCounters(ch, c.srv.dp)
 
 	dp := c.srv.dp

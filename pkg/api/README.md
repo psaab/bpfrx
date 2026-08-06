@@ -662,6 +662,19 @@ under the daemon's errgroup. Nothing else imports this package.
     over an unknown. The gauge is always emitted (0 when healthy) and counts
     exactly the zones REST reports `per_zone_counters_available:false` for.
 
+    **Emitted ABOVE the dataplane-loaded gate (#6843 R1), which adds a fourth
+    membership cause.** The gauge is contractually always emitted so `> 0` is
+    alertable and its absence is not confusable with a scrape that failed to
+    run — which means it must also be emitted on a degraded / config-only boot,
+    where per-zone volume is least available. So `collectZoneCounters` runs
+    before the `dp == nil || !dp.IsLoaded()` early return, alongside
+    `collectPBRStatus` and the host-inbound families. Consequence: a zone is
+    counted unpopulated for a **fourth** reason — no loaded dataplane at all —
+    on top of the three `ErrCounterNotPopulated` causes. That is named in the
+    metric HELP, because there is no `xpf_dataplane_loaded` series to
+    disambiguate against and an operator paging on `> 0` would otherwise triage
+    toward three causes none of which applies.
+
     **Retention (#6843).** "Not populated" must also be reachable *backwards* —
     a zone that WAS reporting and stops. The helper's store outlives its slot
     map: config apply carries the store forward and retains every

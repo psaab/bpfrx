@@ -155,11 +155,15 @@ type ZoneInfo struct {
 	IngressBytes         uint64                     `json:"ingress_bytes"`
 	EgressPackets        uint64                     `json:"egress_packets"`
 	EgressBytes          uint64                     `json:"egress_bytes"`
-	// PerZoneCountersAvailable (#3643) is false when the per-zone traffic
-	// counters above are NOT sourced by the userspace dataplane. In that case
-	// the four counter fields are meaningless zeros rather than real traffic
-	// volume -- the eBPF per-zone writers were deleted in #1476 and the
-	// userspace POPULATE path is deferred (see docs/research/3643-dead-counters).
+	// PerZoneCountersAvailable (#3643) is false when the dataplane has published
+	// no per-zone volume for THIS zone. In that case the four counter fields are
+	// meaningless zeros rather than real traffic volume.
+	//
+	// #6843: the userspace POPULATE path is NOT deferred any more -- #3651
+	// shipped it, so this is false for a per-zone reason, not because the
+	// feature is missing: the helper predates the populate path, the zone
+	// exceeded the helper's hot-path slot capacity (its traffic really is
+	// uncounted), the zone is idle, or the dataplane is not loaded.
 	// It exists so an operator/automation can tell "no per-zone accounting" from
 	// "genuinely zero traffic"; without it the endpoint reported a misleading 0
 	// (or, for a stable-hash zone id >= MaxZones, 500'd the whole response).

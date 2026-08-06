@@ -93,8 +93,10 @@ func TestReplaceZoneCounterOffsetsEmptyClearsAll(t *testing.T) {
 		id: {{Packets: 7, Bytes: 700}, {Packets: 8, Bytes: 800}},
 	})
 	if v, err := m.ReadZoneCounters(id, 0); err != nil || v.Packets != 7 || v.Bytes != 700 {
-		t.Errorf("after re-populating = %+v err=%v, want {7,700} nil — an "+
-			"always-clears implementation must not pass this test", v, err)
+		t.Errorf("after re-populating = %+v err=%v, want {7,700} nil — a STICKY "+
+			"clear (clears correctly but never repopulates) must not pass. "+
+			"Always-clear is caught upstream by this test's setup precondition, "+
+			"not here", v, err)
 	}
 }
 

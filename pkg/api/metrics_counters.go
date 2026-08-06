@@ -426,8 +426,10 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 
 	// #6843 R1: running ABOVE the dataplane-loaded gate means this can now be
 	// reached with a nil server/store, which the below-gate position implicitly
-	// ruled out. Every other pre-gate collector guards the same way
-	// (collectPBRStatus, collectLo0Counters).
+	// ruled out. The pre-gate collectors that touch c.srv/c.srv.store guard the
+	// same way: collectPBRStatus and the collectHostInbound* family.
+	// (collectLo0Counters is NOT an example -- it reads neither, so it needs no
+	// guard; citing it would be pattern-matching rather than checking.)
 	var cfg *config.Config
 	if c.srv != nil && c.srv.store != nil {
 		cfg = c.srv.store.ActiveConfig()

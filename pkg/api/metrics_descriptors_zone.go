@@ -42,14 +42,29 @@ func (c *xpfCollector) initZoneDescriptors() {
 	// #3651: the explicit "not yet known" signal, and the reason the collector
 	// can omit samples without the omission being ambiguous.
 	//
-	// dataplane.ErrCounterNotPopulated conflates THREE states that are
-	// indistinguishable from the Go side, because the helper's snapshot is
-	// sparse and drops all-zero rows (ZoneCounterStore::snapshot,
+	// A zone is counted here for FOUR distinct reasons, and they are
+	// indistinguishable from the Go side.
+	//
+	// Three come from dataplane.ErrCounterNotPopulated, because the helper's
+	// snapshot is sparse and drops all-zero rows (ZoneCounterStore::snapshot,
 	// userspace-dp/src/afxdp/zone_counters.rs): (a) a pre-#3651 helper that
 	// publishes no per-zone block at all, (b) a zone past the helper's 63
 	// assignable hot-path slots, whose traffic genuinely goes uncounted
 	// (the helper stops publishing its row -- see below), and (c) a zone that
 	// is simply idle.
+	//
+	// #6843 R1 added a FOURTH: (d) there is NO LOADED DATAPLANE (or no apply
+	// result), so nothing could have been published for any zone. This
+	// collector runs ABOVE the dataplane-loaded gate precisely so the gauge
+	// survives a degraded / config-only boot — but that availability CHANGED
+	// WHAT THE GAUGE MEANS. Before the hoist (a)-(c) were exhaustive; now the
+	// gauge reads N (every configured zone) when the dataplane failed to arm,
+	// which is a different operational situation from N idle zones.
+	//
+	// There is no xpf_dataplane_loaded series to disambiguate against, so (d)
+	// must be named in the HELP or an operator paging on `> 0` triages toward
+	// three causes none of which is true. Availability and meaning are not
+	// separable for a gauge whose HELP enumerates its causes.
 	//
 	// #6843: the earlier wording here said build "never registers the zone with
 	// the store". That holds only for a zone that was ALWAYS overflowed. The
@@ -81,11 +96,14 @@ func (c *xpfCollector) initZoneDescriptors() {
 			"are not populated this scrape, so no xpf_zone_packets_total / "+
 			"xpf_zone_bytes_total samples were emitted for them. Not an error: "+
 			"a zone is counted here when the dataplane has published no volume "+
-			"for it (helper predates the per-zone populate path, the zone "+
-			"exceeded the helper's hot-path slot capacity, or the zone is "+
-			"idle). Matches the zones REST reports per_zone_counters_available "+
-			"false for. Genuine read failures bump "+
-			"xpf_counter_read_errors_total instead (#3651).",
+			"for it: the helper predates the per-zone populate path, the zone "+
+			"exceeded the helper's hot-path slot capacity, the zone is idle, "+
+			"OR there is no loaded dataplane at all (degraded / config-only "+
+			"boot -- this gauge is emitted above the dataplane gate, so it "+
+			"reads the full configured zone count in that state). Matches the "+
+			"zones REST reports per_zone_counters_available false for. Genuine "+
+			"read failures bump xpf_counter_read_errors_total instead "+
+			"(#3651, #6843).",
 		nil, nil,
 	)
 }

@@ -1,3 +1,38 @@
+## 2026-08-05 — #6843 gate round 4: the hoist changed the gauge's MEANING
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Five items. **M1 (semantic):** hoisting the collector above the
+  dataplane gate added a FOURTH membership cause the HELP did not name — "no
+  loaded dataplane". Before the hoist the three ErrCounterNotPopulated causes
+  were exhaustive; after it the gauge reads the full configured zone count when
+  the dataplane fails to arm, and with no `xpf_dataplane_loaded` series to
+  disambiguate an operator paging on `> 0` would triage toward three causes none
+  of which applies. Named in the HELP string, the (a)-(d) block, and
+  pkg/api/README.md. **Changing WHEN a metric is emitted changed WHAT it means**
+  — availability and semantics are not separable for a gauge whose HELP
+  enumerates its causes. **M2:** the D-sweep was still incomplete — four sites
+  carried the refuted premise, two of them in files this PR edits, and two the
+  structured mirrors of the text surfaces R2 fixed. A SYMBOL grep finds none of
+  them; searching the restated PREMISE finds all four — the same lexical-vs-
+  behavioural gap that made F5 incomplete, recurring. Plus a fifth doc-block
+  defect: my #6843 note was inserted INSIDE the opening godoc sentence, severing
+  it, so `go doc` rendered a fragment as the synopsis. **M3:** R2's wording fix
+  was entirely unbound — reverting both operator strings left both packages
+  green, because the only assertion matched the invariant prefix. Both hide
+  tests now assert the cause clause AND the absence of the retracted claim.
+  Plus five NITs including a citation I got wrong by pattern-matching
+  (collectLo0Counters needs no nil guard; it reads neither field).
+- **Validation**: full Go suite REAL exit 0; full cargo `--test-threads=1` REAL
+  exit 0. M3 mutation-proven (the revert Codex demonstrated now REDs).
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_zone.go`, `pkg/api/types.go`,
+  `pkg/api/security.go`, `pkg/api/README.md`, `pkg/grpcapi/server_show_zones.go`,
+  `pkg/grpcapi/zone_flood_counters_hide_test.go`,
+  `pkg/cli/zone_flood_counters_hide_test.go`, `pkg/dataplane/maps_counters.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`, `_Log.md`
+
 ## 2026-08-05 — #6843 gate round 3: hoist the gauge, correct a correction, finish the sweep
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

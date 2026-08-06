@@ -317,7 +317,7 @@ impl ZoneCounterStore {
     /// poll. Load-bearing half of the operator clear.
     ///
     /// #6843: a cleared zone then reads as NOT POPULATED, not as zero -- the
-    /// snapshot below omits all-zero rows and the Go side replaces its offset
+    /// snapshot above omits all-zero rows and the Go side replaces its offset
     /// map from that snapshot, so the row is dropped rather than set to 0.
     ///
     /// #5163: resets each block IN PLACE rather than clearing the map, because a

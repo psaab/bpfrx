@@ -1060,10 +1060,14 @@ impl Coordinator {
     /// #3651: per-zone ingress/egress traffic-volume snapshot for
     /// `ProcessStatus.zone_traffic_counters`.
     ///
-    /// TWO filters, and the second is not redundant. A row is published only
-    /// when its zone is BOTH (a) currently configured — so a zone removed
-    /// between the worker fold and this status build never surfaces — and (b)
-    /// holding a live hot-path slot.
+    /// TWO filters. A row is published only when its zone is BOTH (a) currently
+    /// configured and (b) holding a live hot-path slot.
+    ///
+    /// (b) is load-bearing — see the carried-forward-store case below. (a) is
+    /// DEFENCE IN DEPTH: no reachable runtime divergence has been demonstrated
+    /// for it (apply-time `reconcile` prunes unconfigured zones and the
+    /// reserved-id path is filtered identically in policy.rs), so it is kept and
+    /// tested as a belt, not claimed as a live guard.
     ///
     /// Filter (b) exists because the store OUTLIVES the slot map. Config apply
     /// carries the store forward and `reconcile` retains every still-configured

@@ -134,6 +134,10 @@ func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, 
 }
 
 // SetZoneCounterOffset records the absolute cumulative per-zone ingress/egress
+// traffic counters reported by the userspace dataplane for zoneID (#3643
+// POPULATE hook, mirroring SetNATRuleCounterOffset). Values are absolute
+// (overwrite), matching the helper's cumulative-since-launch totals. Once set,
+// ReadZoneCounters returns them (nil error) instead of ErrCounterNotPopulated.
 //
 // #6843: this has NO production callers. syncBPFCountersLocked now replaces the
 // whole offset map per status poll (ReplaceZoneCounterOffsets) rather than
@@ -142,11 +146,6 @@ func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, 
 // row setter is retained for tests that seed one zone directly; production code
 // MUST use ReplaceZoneCounterOffsets, or a zone that disappears from the helper
 // snapshot keeps serving a frozen total.
-//
-// traffic counters reported by the userspace dataplane for zoneID (#3643
-// POPULATE hook, mirroring SetNATRuleCounterOffset). Values are absolute
-// (overwrite), matching the helper's cumulative-since-launch totals. Once set,
-// ReadZoneCounters returns them (nil error) instead of ErrCounterNotPopulated.
 func (m *Manager) SetZoneCounterOffset(zoneID uint16, ingress, egress CounterValue) {
 	m.mu.Lock()
 	if m.zoneCounterOffsets == nil {
