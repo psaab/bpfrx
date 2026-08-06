@@ -69932,3 +69932,58 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `nm` at 0x1eb and the Tier-1 diff reports the new edge — the gate is
   watched failing, not assumed.
 - **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs, _Log.md
+
+## 2026-08-06 — #4408 increment 3b: split the waterfill's two selection walks
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 ascending walk and the Phase-2
+  descending residual walk into `waterfill_phase1_select` /
+  `waterfill_phase2_select`, both `#[inline(always)]` and same-module,
+  leaving `select_exact_cos_guarantee_queue_waterfill` a 59-line
+  orchestrator (from 432) over refill -> Phase 1 -> Phase 2 -> wrap
+  tail. Pure motion: 175 + 108 moved lines diff clean against master's
+  `:1094-1268` and `:1280-1387` after stripping leading whitespace.
+  `Option` is a faithful encoding, not an invented protocol — every
+  non-selecting exit of each walk already converged on the same
+  successor in the original body.
+- **Finding (the reason this took a second pass)**: the plan's §7.2
+  mutation grid caught that `waterfill_phase2_select` was **completely
+  unbound**. Both prescribed cells — M5 "Phase 2 ignores the honored
+  bitset" and M6 "Phase 2 resets the cursor on each entry" — left the
+  full waterfill + refund suite GREEN. Every pre-existing fixture enters
+  Phase 2 with the largest class UN-honored (Phase 1 walks ascending and
+  runs out of budget before reaching it), so the descending walk lands
+  on an eligible queue at cursor 0 and neither the honored-skip nor the
+  cursor arithmetic is ever exercised. Two tests now bind it, built on a
+  fixture that honors the LARGEST class first by emptying the two small
+  queues so Phase 1 skips them, then refilling them so the next call
+  breaks into Phase 2 with ordinal bit 2 set.
+- **Validation**: 6-of-6 mutation grid, each cell a NAMED failing test
+  with an ASSERTION (never a build break), plus a negative control.
+  M1 (drop the `epoch_boundary` gate) REDs
+  `waterfill_exact_fit_honor_does_not_livelock_phase1`; M2 (reset the
+  cursor in the refill) REDs
+  `waterfill_exhausted_refill_does_not_reset_phase2_cursor` — "the
+  exhausted refill path must PRESERVE the Phase-2 cursor"; M3 (drop the
+  honored-bit set) REDs 8 tests incl. the #1732 distribution test; M4
+  (charge `send_budget` not `phase1_cost`) REDs 5 incl.
+  `waterfill_phase1_honor_charge_is_configured_quantum_not_tokens`;
+  M5 REDs both new Phase-2 tests; M6 REDs ONLY
+  `waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest`
+  — "Phase 2 must RESUME the descending walk from the stored cursor",
+  left 1 right 0 — so the two new tests discriminate rather than
+  restate each other. The negative control (hoisting the
+  `waterfill_epochs` bump earlier inside the same block, semantically
+  null) stays GREEN, so the grid measures the code rather than
+  reporting "everything fails".
+- **Codegen**: raw zero-normalisation Tier-1 call-edge sets unchanged on
+  `service_exact_guarantee_queue_direct_with_info` (32 edges) and on the
+  untouched `enqueue_pending_forwards` control (51 edges).
+  `service_exact_guarantee_queue_direct_with_info` grows 0x619b ->
+  0x61cf (+52 B, +0.21%) with an identical call-edge set — scheduling
+  drift, not a new or lost callee. Negative control fires for all three
+  helpers. Three whole-binary residuals in modules this PR does not
+  open are classified in the PR body.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
+  docs/cos-validation-notes.md, _Log.md

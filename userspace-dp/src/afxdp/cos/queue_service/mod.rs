@@ -980,26 +980,87 @@ fn select_exact_cos_guarantee_queue_waterfill(
     // epoch-boundary gate on the honored bitset, and the #1743 r2/r3
     // ordering hazard that keeps that block atomic.
     refill_waterfill_epoch(root, now_ns);
-    // Phase 1: ascending-rate walk. Pick the first runnable queue
-    // whose secondary_budget ≤ pass1_remaining that has NOT already been
-    // honored this epoch.
-    //
-    // #1732: the honored set is the persistent `waterfill_honored_epoch_bits`
-    // on `root`, keyed by the ASCENDING-VEC ORDINAL `i` (NOT `queue_idx`).
-    // It is read by BOTH phases and cleared at the epoch refill above, so
-    // each queue is honored at most once per epoch: without the Phase-1 skip
-    // the smallest-rate queue would be re-honored on every selector call and
-    // monopolise the Phase-1 budget (the lowest-rate skew this fix targets).
-    // Iterating by index over the persistent vec avoids the per-call heap
-    // clone the old code used solely to dodge the `&mut root.queues` borrow
-    // conflict; `queue_idx` is copied out (a `Copy` `usize`) before the
-    // `&mut` borrow, so borrow-split holds with no allocation.
     let ascending_len = root.exact_queues_by_rate_ascending.len();
     debug_assert!(
         ascending_len <= 64,
         "waterfill honored bitset is u64; >64 exact guarantee queues on one \
          interface is unsupported (ordinal bit range overflow)"
     );
+    // Phase 1: ascending-rate walk (#4408 Increment 3b). `None` means
+    // "budget exhausted or nothing eligible" — both of the original body's
+    // non-selecting Phase-1 exits — and falls through to Phase 2.
+    if let Some(selection) = waterfill_phase1_select(
+        root,
+        queue_fast_path,
+        now_ns,
+        lease_telemetry,
+        queue_count,
+        ascending_len,
+    ) {
+        return Some(selection);
+    }
+    // Phase 2: descending-rate residual walk (#4408 Increment 3b). `None`
+    // means the descending cycle serviced nothing, which is the genuine
+    // Phase-2 WRAP handled by the tail below.
+    if let Some(selection) = waterfill_phase2_select(
+        root,
+        queue_fast_path,
+        now_ns,
+        lease_telemetry,
+        queue_count,
+        ascending_len,
+    ) {
+        return Some(selection);
+    }
+    // Genuine Phase-2 WRAP: a full descending cycle serviced nothing, so the
+    // epoch is fully consumed. Reset the Phase-1 budget and the cursor for
+    // the next call, and arm `epoch_wrap_pending` so the refill above clears
+    // the honored bitset (a true epoch boundary). #1743 (Codex r3): this is
+    // the ONLY place that arms the honored-bits clear besides the time tick —
+    // a bare mid-walk `pass1 == 0` does not, which avoids the all-min-quantum
+    // re-honor livelock.
+    root.waterfill_pass1_remaining_bytes = 0;
+    root.waterfill_phase2_cursor = 0;
+    root.waterfill_epoch_wrap_pending = true;
+    None
+}
+
+// Phase 1: ascending-rate walk. Pick the first runnable queue
+// whose secondary_budget ≤ pass1_remaining that has NOT already been
+// honored this epoch.
+//
+// #1732: the honored set is the persistent `waterfill_honored_epoch_bits`
+// on `root`, keyed by the ASCENDING-VEC ORDINAL `i` (NOT `queue_idx`).
+// It is read by BOTH phases and cleared at the epoch refill above, so
+// each queue is honored at most once per epoch: without the Phase-1 skip
+// the smallest-rate queue would be re-honored on every selector call and
+// monopolise the Phase-1 budget (the lowest-rate skew this fix targets).
+// Iterating by index over the persistent vec avoids the per-call heap
+// clone the old code used solely to dodge the `&mut root.queues` borrow
+// conflict; `queue_idx` is copied out (a `Copy` `usize`) before the
+// `&mut` borrow, so borrow-split holds with no allocation.
+//
+// #4408 Increment 3b: lifted verbatim out of
+// `select_exact_cos_guarantee_queue_waterfill`. Every non-selecting exit of
+// this walk — the `break` and loop exhaustion alike — already converged on
+// the SAME successor in the original body, so `None` encodes them faithfully
+// rather than inventing an outcome protocol. `#[inline(always)]` +
+// same-module keeps the post-inline IR the shape it was (plan §2d); no
+// coldness claim is made or needed.
+//
+// The interior of this walk is NOT further decomposable: `queue`'s `&mut`
+// borrow of `root.queues` coexists with reads of the disjoint `root.tokens`
+// and then ends so `count_park_reason`/`park_cos_queue` can take `&mut root`
+// whole. That is NLL-precise; splitting inside would have to re-derive it.
+#[inline(always)]
+fn waterfill_phase1_select(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
+    queue_count: usize,
+    ascending_len: usize,
+) -> Option<ExactCoSQueueSelection> {
     for i in 0..ascending_len {
         let queue_idx = root.exact_queues_by_rate_ascending[i];
         // #1732: at-most-once Phase-1 honor per epoch. Skip a queue already
@@ -1175,17 +1236,37 @@ fn select_exact_cos_guarantee_queue_waterfill(
             }),
         });
     }
-    // Phase 2: descending-rate walk over queues NOT honored in Phase 1
-    // this epoch.
-    //
-    // #1732: this reads the SAME persistent `waterfill_honored_epoch_bits`
-    // that Phase 1 sets, keyed by the ascending-vec ORDINAL `pos_from_end`,
-    // so it correctly skips queues that already took their Phase-1 guarantee
-    // this epoch and serves the residual to the larger un-honored queues —
-    // the documented descending-residual intent. (Previously this checked an
-    // empty function-local `honored_mask`, which is why the old comment here
-    // admitted it only "approximated".) Iterating `exact_queues_by_rate_
-    // ascending` by index avoids the heap clone the old code used.
+    None
+}
+
+// Phase 2: descending-rate walk over queues NOT honored in Phase 1
+// this epoch.
+//
+// #1732: this reads the SAME persistent `waterfill_honored_epoch_bits`
+// that Phase 1 sets, keyed by the ascending-vec ORDINAL `pos_from_end`,
+// so it correctly skips queues that already took their Phase-1 guarantee
+// this epoch and serves the residual to the larger un-honored queues —
+// the documented descending-residual intent. (Previously this checked an
+// empty function-local `honored_mask`, which is why the old comment here
+// admitted it only "approximated".) Iterating `exact_queues_by_rate_
+// ascending` by index avoids the heap clone the old code used.
+//
+// #4408 Increment 3b: lifted verbatim out of
+// `select_exact_cos_guarantee_queue_waterfill`. Every non-selecting exit of
+// this walk — the `break` and loop exhaustion alike — already converged on
+// the SAME successor in the original body, so `None` encodes them faithfully
+// rather than inventing an outcome protocol. `#[inline(always)]` +
+// same-module keeps the post-inline IR the shape it was (plan §2d); no
+// coldness claim is made or needed.
+#[inline(always)]
+fn waterfill_phase2_select(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
+    queue_count: usize,
+    ascending_len: usize,
+) -> Option<ExactCoSQueueSelection> {
     let mut phase2_idx = root.waterfill_phase2_cursor;
     if phase2_idx >= ascending_len {
         phase2_idx = 0;
@@ -1294,16 +1375,6 @@ fn select_exact_cos_guarantee_queue_waterfill(
             phase1_honor: None,
         });
     }
-    // Genuine Phase-2 WRAP: a full descending cycle serviced nothing, so the
-    // epoch is fully consumed. Reset the Phase-1 budget and the cursor for
-    // the next call, and arm `epoch_wrap_pending` so the refill above clears
-    // the honored bitset (a true epoch boundary). #1743 (Codex r3): this is
-    // the ONLY place that arms the honored-bits clear besides the time tick —
-    // a bare mid-walk `pass1 == 0` does not, which avoids the all-min-quantum
-    // re-honor livelock.
-    root.waterfill_pass1_remaining_bytes = 0;
-    root.waterfill_phase2_cursor = 0;
-    root.waterfill_epoch_wrap_pending = true;
     None
 }
 
