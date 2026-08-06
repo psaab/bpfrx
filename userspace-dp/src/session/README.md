@@ -825,7 +825,7 @@ mirror, so only FORWARD peer imports transit the helper, which then
 synthesizes their reverse companion locally
 (`synthesized_synced_reverse_entry`). The only `is_reverse=1` entry that
 reaches the gate is the **local mirror** companion that
-`mirrorSessionPairV4` (#310) pre-installs as a SEPARATE `upsert`,
+`mirrorSessionPairV4`/`V6` (#310) pre-install as a SEPARATE `upsert`,
 dispatched via `server/handlers/sync_session.rs`, which calls
 `upsert_synced_session` unconditionally for any `is_reverse`.
 

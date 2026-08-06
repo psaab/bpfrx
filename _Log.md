@@ -68163,3 +68163,39 @@ break — `go vet` confirmed passing under every revert.
   at :1115 dispatches the reverse as a SEPARATE upsert with IsReverse=1;
   session_import.rs:103 already states the cap as 2 * worker_count *
   DEFAULT_MAX_SESSIONS while status.rs/control.rs stated the logical bound.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6413 amend — three doc corrections found by review, two of
+  which are this PR's own subject matter (a cross-reference PR must not ship
+  a bad cross-reference). (1) The `#6413:` block this PR ADDED to
+  `coordinator/status.rs` cited `bpf_map/metrics.rs` as documenting the ENTRY
+  ceiling. It documents no ceiling — `grep -nE
+  'ceiling|2 \*|worker_count|max_sessions'` over
+  `userspace-dp/src/afxdp/bpf_map/metrics.rs` exits 1, and all that survives
+  there is a redirect at :275-284 saying the counters moved to
+  `coordinator/session_manager.rs`. metrics.rs did hold the formula at
+  `c8d7559cc`, with the OLD un-doubled wording, until `83df45377` (#6819)
+  moved it out. Repointed at `coordinator/session_manager.rs`, whose :45-56
+  does state `2 * worker_count * DEFAULT_MAX_SESSIONS` — verified before
+  writing the pointer, so the fix does not repeat the defect in the other
+  direction. (2) `coordinator/mod.rs:338-343`, the fourth site this PR's
+  sweep missed, still carried both errors it fixes elsewhere: the un-doubled
+  `worker_count * DEFAULT_MAX_SESSIONS`, and "returns this value", which is
+  false — `ha/session_import.rs:33-37` returns `override.saturating_mul(2)`
+  and says so. (3) `ha/session_import.rs:124-126` and
+  `session/README.md:826-829` named only `mirrorSessionPairV4` as the
+  producer of the lone reverse; the IPv6 twin `mirrorSessionPairV6`
+  (`pkg/dataplane/userspace/manager_ha.go:1246`, `revVal.IsReverse = 1` at
+  :1258) reaches the SAME gate — the control handler
+  (`server/handlers/sync_session.rs:22`) is family-agnostic and calls
+  `upsert_synced_session` once for any `upsert`. Both sites now read
+  `mirrorSessionPairV4`/`V6`. Comment-only, no behaviour change.
+- **Validation**: `cargo check --manifest-path userspace-dp/Cargo.toml` exit
+  0 (161 warnings, all pre-existing). Comment-only re-proved after the edit
+  the same way the review proved it: strip the +/- marker from every changed
+  `.rs` line in `origin/master...HEAD` and confirm nothing remains that is
+  not `//`, `///`, or blank — the residual grep exits 1.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md

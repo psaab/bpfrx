@@ -122,9 +122,10 @@ impl crate::afxdp::Coordinator {
         // imports transit the helper — which then synthesizes their reverse
         // companion locally (`synthesized_synced_reverse_entry`). The only
         // `is_reverse=1` entry that reaches this gate is the LOCAL mirror
-        // companion `mirrorSessionPairV4` (#310) pre-installs as a SEPARATE
-        // upsert, dispatched through `server/handlers/sync_session.rs`, which
-        // calls `upsert_synced_session` unconditionally for any `is_reverse`.
+        // companion `mirrorSessionPairV4`/`V6` (#310) pre-install as a
+        // SEPARATE upsert, dispatched through
+        // `server/handlers/sync_session.rs`, which calls
+        // `upsert_synced_session` unconditionally for any `is_reverse`.
         //
         // #6413 corner, documented rather than implied away: if the shared
         // `synced` map is AT the 2N entry cap and that local mirror's FORWARD is

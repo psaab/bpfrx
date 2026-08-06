@@ -223,7 +223,8 @@ impl super::Coordinator {
     /// peer exceeded this appliance's ceiling.
     ///
     /// #6413: state that ceiling in ENTRIES, matching `synced_import_cap` and
-    /// `bpf_map/metrics.rs` — it is `2 * worker_count * DEFAULT_MAX_SESSIONS`,
+    /// `coordinator/session_manager.rs` — it is
+    /// `2 * worker_count * DEFAULT_MAX_SESSIONS`,
     /// not the LOGICAL `worker_count * DEFAULT_MAX_SESSIONS`. Each admitted
     /// forward publishes TWO keys into `sessions.synced` (the forward and its
     /// synthesized reverse companion), so N logical sessions arrive as 2N
