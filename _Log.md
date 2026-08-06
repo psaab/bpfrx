@@ -68353,3 +68353,76 @@ break — `go vet` confirmed passing under every revert.
   NAME from the child's detail → the naming assertion fails.
 - **File(s)**: pkg/dataplane/armproof.go,
   pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md, _Log.md
+
+## 2026-08-06 — #6864 fold r4: name the identity residual, stop the missing-parent count collapse
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold, two findings.
+
+  **F1 (docs) — the artifact claimed a proof it does not perform.** The README
+  and plan §13/D1 both said the preliminary proof establishes "program-instance
+  identity". It does not: `xdpLinkProgramID` accepts ANY readable program id,
+  never compares it against `m.programs[m.XDPEntryProgram()]`, and never checks
+  `Info.XDP().Ifindex` — the two symbols do not appear in `armproof.go` at all.
+  CHOSE to correct the documents rather than implement the comparison, on the
+  evidence that in this tree the comparison can only ever answer "match":
+  every writer of `m.xdpLinks` installs `m.programs[m.XDPEntryProgram()]`
+  (`AttachXDP`'s fresh attach and its pinned-link `Update` reuse, which drops
+  the pin and re-attaches when `Update` fails; `swapXDPEntryProg`, which updates
+  the links and only then renames the entry program), post-#1476 `m.programs`
+  has one shim writer (`loader_userspace_shim.go`) with the legacy entry program
+  never loaded, and nothing outside the package can reach a tracked link
+  (`Program(name)` is a read-only getter; `m.xdpLinks` has no accessor). So the
+  brief's premise that update-capable handles are exported does not hold. Adding
+  the check to a DIAGNOSTIC would measure nothing while adding a reachable way
+  to report a false `uncovered` (an unreadable expected program — a nil entry is
+  literally exercised by `...GenericModeSurvivesASecondCompile`), and binding it
+  would need a fabricated fixture. It also forces the fail-closed direction for
+  an unreadable expected program to be picked in a phase with no evidence for
+  it. The residual is now written down in three places — at `xdpLinkProgramID`,
+  in `pkg/dataplane/README.md`, and as a "delivered so far" note under plan
+  §13/D1 — each naming the specific unchecked thing so the GATING PR closes it.
+
+  **F2 (runtime) — the unarmed-surface count changed with an unrelated
+  condition.** `mapZoneInterface` resolves `reth0.50` to its PARENT before the
+  netdev lookup, and passed that parent as `missingInterfaceRecord`'s `Name`.
+  `recordUnarmedSurface` dedups on exactly `(Name, Ifindex)` and every child of
+  an absent parent has Ifindex 0, so `p0.50`, `p0.80` and the parent's own
+  reference collapsed into ONE record — while a parent that RESOLVES yields one
+  record per surface. The same configured topology reported a different surface
+  count depending on whether the parent happened to resolve, always in the UNDER
+  direction, and the count is this phase's whole deliverable. Fixed at the
+  RECORD, not by weakening the dedup (which is correct and deliberate — an
+  interface named by two zones legitimately reaches the skip twice):
+  `missingInterfaceRecord` now takes the VLAN id and names `<parent>.<vid>`,
+  keeping the parent in the Reason where an operator needs it.
+
+  Also corrected two overstatements the same review flagged: the README said all
+  FOUR soft skips sit behind a `slog` line (the nil-zone branch at
+  `compiler_iface.go:415` records and continues with no log — only the proof's
+  own per-surface line makes it visible), and "one line per compile" is true of
+  the SUMMARY line only (uncovered surfaces add a WARN each, skipped an INFO).
+- **Validation**: `id -u` 1000 (non-root). `go build ./...` exit 0;
+  `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0;
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. Three mutations, each RED via
+  ASSERTION with the build still clean, each grepped back out afterwards and the
+  file `cmp`'d against its pre-mutation copy: M1 drop the `vlanID > 0` branch
+  from `missingInterfaceRecord` while KEEPING the signature (so the failure
+  cannot be a build break) → `...AbsentParentRecordsEachVlanChildSeparately`
+  fails with "two configured VLAN children of one absent parent produced 1
+  unarmed record(s) [ge-9-0-9], want 2", and the over-reach guard
+  `...OneSurfaceNamedByTwoZonesStaysOneRecord` stays GREEN; M2 disable the
+  `recordUnarmedSurface` dedup → that over-reach guard FIRES ("got 2
+  [ge-9-0-8.50 ge-9-0-8.50]"), proving it is a guard and not a restatement, and
+  the F2 binding test stays GREEN; M3 add a gate-style expected-program check to
+  `attachedInstance` → the F1 residual pin
+  `...ReportsTheReadbackInstanceWithoutVerifyingIt` fires, so the docs cannot
+  silently outlive the code in either direction. The F2 tests drive the REAL
+  `programZoneMaps` → `mapZoneInterface` path (the caller is where the identity
+  is chosen, so a test on the record helper alone would leave the defect
+  unbound) and assert the fixture's premise — the netdev must not exist —
+  rather than skipping.
+- **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md,
+  docs/research/5275-arm-failclosed/plan.md, _Log.md

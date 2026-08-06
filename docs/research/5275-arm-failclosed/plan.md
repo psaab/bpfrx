@@ -497,6 +497,19 @@ resolved below with a recommended choice (the human approves/overrides at `/engi
   candidate digest + reconciled helper generation + ALL registered/armed/ready
   bindings. Only the FINAL proof triggers release.
 
+  **Delivered so far (PR1, observe-only).** `pkg/dataplane/armproof.go` implements
+  the INVENTORY half. It *reports* the program instance each tracked `bpf_link`
+  carries but does **not** compare it against `m.programs[m.XDPEntryProgram()]`,
+  and does not check `Info.XDP().Ifindex`. That is deliberate for a diagnostic:
+  the mismatch is not a state this tree can produce (every writer of
+  `m.xdpLinks` installs the entry program, `m.programs` has one shim writer
+  post-#1476, and nothing outside the package can reach a tracked link), so the
+  comparison would measure nothing while adding a new way to report a false
+  `uncovered` — an unreadable expected program. **The ID/tag comparison lands
+  with the GATING PR**, which must also resolve the direction PR1 has no
+  evidence for: whether an unreadable expected program fails closed. Residual
+  written down at `xdpLinkProgramID` and in `pkg/dataplane/README.md`.
+
 - **D2 — networkd link/address phase split (Codex r6 §2; `pkg/networkd` now in the
   blast radius).** `networkd.Apply` writes link+address and reloads (can bounce the
   link, networkd.go:130). Resolution: split into a **link-only pre-proof phase**

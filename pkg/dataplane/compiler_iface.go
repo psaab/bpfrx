@@ -474,8 +474,11 @@ func (st *zoneMapState) mapZoneInterface(dp DataPlane, cfg *config.Config, resul
 		// succeeds without it. Record it so the arm-coverage proof can tell a
 		// declined surface from one that armed. missingInterfaceRecord decides
 		// whether the absence is PROVEN — a netdev-enumeration failure is not
-		// the same as a netdev that does not exist.
-		result.recordUnarmedSurface(missingInterfaceRecord(physName, name, err))
+		// the same as a netdev that does not exist — and vlanID is threaded so
+		// the record names the CONFIGURED surface: physName is already the
+		// resolved parent here, and every VLAN child of one absent parent
+		// would otherwise dedup onto that single name.
+		result.recordUnarmedSurface(missingInterfaceRecord(physName, vlanID, name, err))
 		return nil
 	}
 

@@ -43,10 +43,11 @@ import (
 // STAGE. The plan's §5 takes the FINAL proof after the last mutation that can
 // invalidate it (networkd, the RETH MAC link-cycle, the AF_XDP rebind /
 // deferred-worker reapply). This proof runs inside CompileUserspaceShim, i.e.
-// at the PRELIMINARY attachment stage — it proves the attach-point inventory
-// and program-instance identity, and it cannot see XSK binding readiness. The
-// divergence rate it measures is therefore the PRELIMINARY-stage rate, which is
-// a lower bound on the gate's.
+// at the PRELIMINARY attachment stage — it proves the attach-point INVENTORY
+// and REPORTS the program instance each tracked bpf_link carries; it does NOT
+// verify that instance is the shim's (see xdpLinkProgramID), and it cannot see
+// XSK binding readiness. The divergence rate it measures is therefore the
+// PRELIMINARY-stage rate, which is a lower bound on the gate's.
 //
 // The measurement matters because "armed" today is weaker than the proof:
 // attachUserspaceShimXDP treats a NATIVE attach failure as a warning, detaches,
@@ -105,7 +106,9 @@ type SurfaceCoverage struct {
 	Via int
 	// ProgramID is the attached program INSTANCE (bpf_link readback) for a
 	// direct surface, or the delegate's instance for a delegated one. Zero
-	// means the readback did not yield one — reported, never inferred.
+	// means the readback did not yield one — reported, never inferred. It is
+	// REPORTED, not verified: nothing here compares it against the shim
+	// program the Manager holds. See xdpLinkProgramID.
 	ProgramID uint32
 	// Generic records that this surface is covered in skb-mode rather than
 	// driver-mode XDP. Informational: it does NOT reduce coverage. Read from
@@ -285,6 +288,23 @@ func disabledSurfaceRecord(name string, ifindex int, linkErr, downErr error) Una
 // missingInterfaceRecord classifies a zone interface the compiler could not
 // resolve.
 //
+// The record names the SURFACE THE CONFIG ASKED FOR, not the netdev whose
+// lookup failed. They differ for a VLAN child: mapZoneInterface resolves
+// "reth0.50" to its PARENT before the lookup, so the failure arrives here
+// carrying only the parent's name. Filing the child under the parent's name
+// makes recordUnarmedSurface's (Name, Ifindex) dedup fold every child of one
+// absent parent — and the parent's own record — into a SINGLE entry, while a
+// parent that resolves yields one record per surface. The count is this
+// phase's deliverable, so the same configured topology would report a
+// different number of surfaces depending on a condition unrelated to how many
+// surfaces exist, and always in the UNDER direction. The parent stays in the
+// Reason, which is where an operator needs it: the child is missing BECAUSE
+// its real device is.
+//
+// vlanID is the child's 802.1Q id, 0 for a physical/unit-0 reference — the
+// same value mapZoneInterface uses to build the child's name, so the two sites
+// cannot spell one surface two ways.
+//
 // "Not found" is NOT the only thing net.InterfaceByName reports through this
 // error. It wraps a genuine absence (its own errNoSuchInterface) and a netlink
 // DUMP failure (ENOBUFS / ENOMEM / EINTR, surfaced as a syscall.Errno) in the
@@ -295,15 +315,20 @@ func disabledSurfaceRecord(name string, ifindex int, linkErr, downErr error) Una
 // failed, not that the interface is absent — and an unrecognised error falls to
 // the absence branch only because that is what every non-errno error from this
 // call means today.
-func missingInterfaceRecord(name, zone string, err error) UnarmedSurface {
+func missingInterfaceRecord(physName string, vlanID int, zone string, err error) UnarmedSurface {
+	name, subject := physName, "interface"
+	if vlanID > 0 {
+		name = fmt.Sprintf("%s.%d", physName, vlanID)
+		subject = fmt.Sprintf("parent interface %s", physName)
+	}
 	s := UnarmedSurface{
 		Name:   name,
-		Reason: fmt.Sprintf("interface not found in zone %s: %v", zone, err),
+		Reason: fmt.Sprintf("%s not found in zone %s: %v", subject, zone, err),
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
-		s.Reason = fmt.Sprintf("interface lookup FAILED in zone %s (%v) — "+
-			"the netdev enumeration errored, so absence is unproven and it may be UP and forwarding", zone, err)
+		s.Reason = fmt.Sprintf("%s lookup FAILED in zone %s (%v) — "+
+			"the netdev enumeration errored, so absence is unproven and it may be UP and forwarding", subject, zone, err)
 		s.StillForwarding = true
 	}
 	return s
@@ -694,6 +719,39 @@ var xdpLinkModeGeneric = func(ifindex int) bool {
 // A package-level var because link.Link carries an unexported method and cannot
 // be implemented outside cilium/ebpf, so Manager.attachedInstance is otherwise
 // unreachable from a unit test.
+//
+// WHAT IS NOT PROVEN — the residual this observe-only phase leaves for the
+// gate, named so nobody reads more into the ProgramID than it carries.
+//
+// This accepts ANY readable program id. It does not compare it against
+// m.programs[m.XDPEntryProgram()] (the program AttachXDP installs), and it does
+// not check Info.XDP().Ifindex against the ifindex the surface is being proved
+// for. So the proof shows an instance EXISTS and reports which one; it does not
+// show it is the shim's, nor that the link is attached where the Manager
+// believes.
+//
+// It is sound TODAY, by an invariant that lives entirely in other functions —
+// which is exactly why the gate cannot inherit it. Every writer of m.xdpLinks
+// installs m.programs[m.XDPEntryProgram()]: AttachXDP's fresh attach
+// (link.XDPOptions{Program: prog}) and its pinned-link reuse (existing.Update
+// (prog), the pin dropped and re-attached when that fails), and swapXDPEntryProg,
+// which updates the tracked links and only then makes XDPEntryProgram() name
+// the program it installed. Post-#1476 m.programs has one writer for the shim
+// (loader_userspace_shim.go) and the legacy entry program is never loaded, so
+// there is a single candidate to compare against; and nothing outside the
+// package can reach a tracked link at all — Program(name) is a read-only
+// getter and m.xdpLinks has no accessor. A mismatch is therefore not a state
+// this tree can produce, which is why adding the comparison HERE would measure
+// nothing while introducing a new way to report a false uncovered (an
+// unreadable expected program), and why the fixture binding it would have to
+// be fabricated.
+//
+// The GATE must still add it. A build that withholds ownership, forwarding and
+// route/VIP advertisement must not rest its refusal on an invariant upheld by
+// callers elsewhere in the package — and the gate has to decide the direction
+// this phase has no evidence for: whether an UNREADABLE expected program fails
+// closed. That decision belongs where it withholds traffic, not in a
+// diagnostic. Plan §13/D1 carries the same split.
 var xdpLinkProgramID = func(l link.Link) (progID uint32, ok bool) {
 	if l == nil {
 		return 0, false
@@ -731,10 +789,13 @@ func (m *Manager) attachedInstance(ifidx int) (progID uint32, generic bool, ok b
 
 // LogArmCoverage emits the observe-only proof result (#5275 PR1).
 //
-// One line per COMPILE — never per packet or per poll tick. Not one line per
-// apply: a single daemon apply compiles TWICE on the RETH deferred-MAC path
-// (daemon_apply_dataplane.go calls reapplyAfterDeferredMAC), so seq is folded
-// into the stage label to keep the two records distinguishable.
+// One SUMMARY line per COMPILE — never per packet or per poll tick — plus one
+// line for each surface a gating build would refuse on and each the compiler
+// declined to arm (the loop at the tail). A fully-covered box stays at the one
+// line. Not one line per apply: a single daemon apply compiles TWICE on the
+// RETH deferred-MAC path (daemon_apply_dataplane.go calls
+// reapplyAfterDeferredMAC), so seq is folded into the stage label to keep the
+// two records distinguishable.
 //
 // The line is emitted UNCONDITIONALLY, including when the proof enumerated no
 // surfaces at all. Suppressing it would make "nothing to arm", "the proof did

@@ -377,9 +377,11 @@ shim on the fallback path.
 last mutation that can invalidate it — networkd, the RETH MAC link-cycle, and
 the AF_XDP rebind / deferred-worker reapply. This proof runs inside
 `CompileUserspaceShim`, i.e. at the **preliminary** attachment stage: it proves
-the attach-point inventory and program-instance identity, and cannot see XSK
-binding readiness. The number it emits is therefore the *preliminary-stage*
-divergence rate, a lower bound on the gate's — not the gate's own rate.
+the attach-point **inventory** and *reports* the program instance each tracked
+`bpf_link` carries — it does **not** verify that instance is the shim's (see
+the residual below) — and cannot see XSK binding readiness. The number it emits
+is therefore the *preliminary-stage* divergence rate, a lower bound on the
+gate's — not the gate's own rate.
 
 Each surface resolves to exactly one of four kinds. The decisions below are
 stated deliberately, not left to emerge from how the readback happens to be
@@ -445,11 +447,13 @@ a test in `armproof_5275_test.go`.
   separate production defect; this belt only stops the proof from laundering it
   into a covered count.
 - **A surface the compiler declined to arm is not silently absent.**
-  `compiler_iface.go` soft-skips **four** ways, each behind a `slog` line, each
-  leaving the compile *successful* and the surface out of `pendingXDP`: the
-  interface was not found, the VLAN child could not be created, the interface is
-  administratively disabled, and — one frame up in `programZoneMaps` — the zone
-  slot is nil. Each records an `UnarmedSurface`.
+  `compiler_iface.go` soft-skips **four** ways, each leaving the compile
+  *successful* and the surface out of `pendingXDP`: the interface was not found,
+  the VLAN child could not be created, the interface is administratively
+  disabled, and — one frame up in `programZoneMaps` — the zone slot is nil. Each
+  records an `UnarmedSurface`. The first three also emit a compiler-side `slog`
+  line; the nil zone slot emits none, so the proof's own per-surface line is the
+  only place it becomes visible.
   - `skipped` is **not** a claim that nothing forwards. It is the third unknown:
     the compiler did not look, so the proof cannot say. `WouldGate` excludes it
     because a clean `disable` is a legitimate operator action and folding every
@@ -484,15 +488,41 @@ a test in `armproof_5275_test.go`.
     so its surfaces are unknowable there. It is an enumeration gap the
     measurement can now see — and it is reachable on the HA config-sync path,
     where the rate was previously biased optimistic.
-  - One record per surface. `mapZoneInterface` runs once per *zone reference*
-    and the per-phys dedup sits below the skips, so an interface named by two
-    zones would otherwise be counted twice; a repeat sighting never downgrades
-    the classification.
+  - One record per surface, keyed on `(Name, Ifindex)`. `mapZoneInterface` runs
+    once per *zone reference* and the per-phys dedup sits below the skips, so an
+    interface named by two zones would otherwise be counted twice; a repeat
+    sighting never downgrades the classification. The key is why the record must
+    name the **configured** surface: `mapZoneInterface` resolves `reth0.50` to
+    its parent *before* the lookup, so filing a missing child under the parent's
+    name folds every child of one absent parent — and the parent's own record —
+    into a single entry, while a parent that resolves yields one record per
+    surface. `missingInterfaceRecord` therefore takes the VLAN id and names
+    `<parent>.<vid>`, keeping the parent in the reason.
 - **`XDP_ATTACHED_MULTI` counts as generic.** It means programs are attached in
   more than one mode, and it is reachable — `attachUserspaceShimXDP` discards
   `DetachXDP`'s error on the native-fallback path. Reading it as native would
   undercount the slow-path population, the same direction as the defect that
   moved the flag to the kernel.
+- **Residual: the program instance is reported, not verified.**
+  `xdpLinkProgramID` accepts **any** readable program id. It does not compare
+  it against `m.programs[m.XDPEntryProgram()]` — the program `AttachXDP`
+  installs — and does not check `Info.XDP().Ifindex` against the ifindex being
+  proved. A `direct` verdict therefore means *an instance exists here and this
+  is its id*, not *the shim covers this surface*. It is sound today only by an
+  invariant held **elsewhere**: every writer of `m.xdpLinks` installs
+  `m.programs[m.XDPEntryProgram()]` (`AttachXDP`'s fresh attach and its
+  pinned-link `Update` reuse, plus `swapXDPEntryProg`, which updates the links
+  and only then renames the entry program), post-#1476 `m.programs` has a single
+  shim writer with the legacy entry program never loaded, and nothing outside the
+  package can reach a tracked link (`Program(name)` is a read-only getter;
+  `m.xdpLinks` has no accessor). So a mismatch is not a state this tree can
+  produce, and adding the comparison to a *diagnostic* would measure nothing
+  while adding a new way to report a false `uncovered` — an unreadable expected
+  program. **The gating PR must add it**: a build that withholds ownership,
+  forwarding and route/VIP advertisement cannot rest its refusal on an invariant
+  upheld by its callers, and it has to decide the direction this phase has no
+  evidence for — whether an unreadable expected program fails closed. Plan
+  §13/D1 carries the same split.
 
 `CoverageUncovered` is deliberately the zero value: an unpopulated entry must
 read as *not* covered, so a partially-built report can only ever be more
@@ -509,9 +539,14 @@ resolve its parent and never a bpf_link call, because it reuses the parent's
 already-computed classification; a declined surface is rendered from its
 recorded struct and costs nothing.
 
-**One line per compile, not per apply.** A single daemon apply compiles twice on
-the RETH deferred-MAC path (`reapplyAfterDeferredMAC`), so the apply generation
-is folded into the stage label (`stage=post-attach#7`) to keep the two records
-apart. The line is emitted even when the proof enumerated nothing, carrying
-`ran=true`: suppressing it would make "nothing to arm", "the proof never ran"
-and "this build has no proof" identical in a log archive.
+**One summary line per compile, not per apply.** A single daemon apply compiles
+twice on the RETH deferred-MAC path (`reapplyAfterDeferredMAC`), so the apply
+generation is folded into the stage label (`stage=post-attach#7`) to keep the
+two records apart. The summary line is emitted even when the proof enumerated
+nothing, carrying `ran=true`: suppressing it would make "nothing to arm", "the
+proof never ran" and "this build has no proof" identical in a log archive.
+Beyond the summary, `uncovered` surfaces add one `WARN` each and `skipped`
+surfaces one `INFO` each — a fully-covered box stays at the single line, and
+the two levels are deliberate: `WARN` is the would-gate set, while a skip's
+dominant member is a clean `disable`, so logging it at `WARN` would train
+operators to ignore both.

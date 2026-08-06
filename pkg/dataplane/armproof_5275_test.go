@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/cilium/ebpf/link"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 )
 
@@ -857,12 +859,12 @@ func TestArmProofDisabledSurfaceClassification(t *testing.T) {
 // classification on an interface that may be live and UP.
 func TestArmProofMissingInterfaceClassification(t *testing.T) {
 	absent := &net.OpError{Op: "route", Net: "ip+net", Err: errors.New("no such network interface")}
-	if got := missingInterfaceRecord("ge-0-0-9", "trust", absent); got.StillForwarding {
+	if got := missingInterfaceRecord("ge-0-0-9", 0, "trust", absent); got.StillForwarding {
 		t.Fatalf("a proven absence must not read as still-forwarding; got %+v", got)
 	}
 
 	dumpFailed := &net.OpError{Op: "route", Net: "ip+net", Err: os.NewSyscallError("recvmsg", syscall.ENOBUFS)}
-	got := missingInterfaceRecord("ge-0-0-9", "trust", dumpFailed)
+	got := missingInterfaceRecord("ge-0-0-9", 0, "trust", dumpFailed)
 	if !got.StillForwarding {
 		t.Fatalf("a netdev ENUMERATION failure does not prove the interface is absent — it may "+
 			"be live, UP and in a zone; got %+v", got)
@@ -962,6 +964,196 @@ func TestArmProofUnarmedSurfacesAreDeduplicated(t *testing.T) {
 	rep = classifyArmCoverage(r, lookupFrom(nil, nil))
 	if rep.Uncovered != 1 || rep.Skipped != 0 || !rep.WouldGate {
 		t.Fatalf("a repeat sighting must never downgrade a surface to benign; got %+v", rep)
+	}
+}
+
+// armProofZoneDP is a netlink-free DataPlane stub for driving programZoneMaps
+// over interfaces that do not resolve. It embeds the interface (nil) and
+// overrides only SetZoneConfig; mapZoneInterface returns at the missing-netdev
+// skip long before any other method, so a call to one is an intended nil-panic
+// tripwire saying the fixture stopped exercising the path it claims to.
+type armProofZoneDP struct{ DataPlane }
+
+func (armProofZoneDP) SetZoneConfig(uint16, ZoneConfig) error { return nil }
+
+// requireAbsentInterface asserts the fixture's premise: the netdev must NOT
+// exist on this host, because the whole path under test starts at
+// cachedInterfaceByName FAILING. A t.Skip here would turn a mutation cell into
+// an unknown, so this is a hard failure.
+func requireAbsentInterface(t *testing.T, name string) {
+	t.Helper()
+	if _, err := net.InterfaceByName(name); err == nil {
+		t.Fatalf("%s exists on this host — this fixture requires the interface lookup to FAIL", name)
+	}
+}
+
+// zoneCfgForAbsentPhys builds the smallest config that reaches the
+// missing-interface skip: one physical interface (which will not resolve)
+// carrying the given VLAN units, named by the given zones through the given
+// refs. Unit 0 always exists so a plain "<phys>.0" reference is legal.
+func zoneCfgForAbsentPhys(phys string, vlans []int, zones map[string][]string) *config.Config {
+	units := map[int]*config.InterfaceUnit{0: {Number: 0}}
+	for _, v := range vlans {
+		units[v] = &config.InterfaceUnit{Number: v, VlanID: v}
+	}
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				phys: {Name: phys, VlanTagging: len(vlans) > 0, Units: units},
+			},
+		},
+	}
+	cfg.Security.Zones = make(map[string]*config.ZoneConfig, len(zones))
+	for name, refs := range zones {
+		cfg.Security.Zones[name] = &config.ZoneConfig{Interfaces: refs}
+	}
+	return cfg
+}
+
+// unarmedFromZoneMaps drives the REAL programZoneMaps -> mapZoneInterface path
+// and returns the surfaces it declined to arm, sorted by name so a count
+// mismatch reads clearly.
+func unarmedFromZoneMaps(t *testing.T, cfg *config.Config) []string {
+	t.Helper()
+	result := &CompileResult{
+		ZoneIDs:             make(map[string]uint16),
+		ScreenIDs:           make(map[string]uint16),
+		ifCache:             make(map[string]*net.Interface),
+		rxVlanOffCache:      make(map[string]bool),
+		ethtoolApplied:      make(map[string]bool),
+		genericXDPIfindexes: make(map[int]bool),
+	}
+	for name := range cfg.Security.Zones {
+		result.ZoneIDs[name] = config.StableZoneID(name)
+	}
+	if _, err := programZoneMaps(armProofZoneDP{}, cfg, result); err != nil {
+		t.Fatalf("programZoneMaps: %v", err)
+	}
+	names := make([]string, 0, len(result.unarmedSurfaces))
+	for _, u := range result.unarmedSurfaces {
+		names = append(names, u.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestArmProofAbsentParentRecordsEachVlanChildSeparately binds the CALL SITE in
+// mapZoneInterface, which is where the surface identity is chosen — the record
+// helper alone cannot be wrong about it.
+//
+// mapZoneInterface resolves "<phys>.<vid>" to its PARENT before the netdev
+// lookup, so a missing parent delivers only the parent's name to the record.
+// recordUnarmedSurface dedups on exactly (Name, Ifindex), and every child of an
+// absent parent has Ifindex 0, so filing them under the parent folds ALL of
+// them — and the parent's own reference — into ONE record. When the parent
+// resolves, the proof counts the parent and each VLAN child separately: the
+// same configured topology would report a different number of surfaces
+// depending on a condition unrelated to how many surfaces exist, always in the
+// UNDER direction. An under-count hides a live forwarding surface, which is
+// what #5275 exists to see.
+func TestArmProofAbsentParentRecordsEachVlanChildSeparately(t *testing.T) {
+	const phys = "ge-9-0-9"
+	requireAbsentInterface(t, phys)
+
+	got := unarmedFromZoneMaps(t, zoneCfgForAbsentPhys(phys, []int{50, 80}, map[string][]string{
+		"wan": {phys + ".50", phys + ".80"},
+	}))
+
+	want := []string{phys + ".50", phys + ".80"}
+	if len(got) != len(want) {
+		t.Fatalf("two configured VLAN children of one absent parent produced %d unarmed record(s) %v, "+
+			"want %d %v — the record was filed under the resolved PARENT name, so the "+
+			"(Name, Ifindex) dedup collapsed both children onto one key; the surface count is "+
+			"this phase's deliverable and it now depends on whether the parent happened to resolve",
+			len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("unarmed surfaces %v must name the CONFIGURED children %v — the parent belongs "+
+				"in the reason, not in the identity", got, want)
+		}
+	}
+}
+
+// TestArmProofOneSurfaceNamedByTwoZonesStaysOneRecord is the over-reach guard
+// for the test above: giving the record the child's identity must not defeat
+// the dedup that is there on purpose.
+//
+// mapZoneInterface runs once per ZONE REFERENCE and the per-phys dedup sits far
+// below the soft skips, so one interface named by two zones legitimately
+// reaches the skip twice and must still count once. Both legs hold before and
+// after the identity fix — the guard's job is to stay green while the test
+// above goes red.
+func TestArmProofOneSurfaceNamedByTwoZonesStaysOneRecord(t *testing.T) {
+	const phys = "ge-9-0-8"
+	requireAbsentInterface(t, phys)
+
+	// The same VLAN child named by two zones.
+	if got := unarmedFromZoneMaps(t, zoneCfgForAbsentPhys(phys, []int{50}, map[string][]string{
+		"wan": {phys + ".50"},
+		"dmz": {phys + ".50"},
+	})); len(got) != 1 {
+		t.Fatalf("one VLAN child named by two zones is ONE unarmed surface; got %d %v", len(got), got)
+	}
+
+	// The same physical unit-0 reference named by two zones. This leg also
+	// pins that a non-VLAN surface keeps the bare interface name.
+	got := unarmedFromZoneMaps(t, zoneCfgForAbsentPhys(phys, nil, map[string][]string{
+		"wan": {phys + ".0"},
+		"dmz": {phys + ".0"},
+	}))
+	if len(got) != 1 || got[0] != phys {
+		t.Fatalf("one physical interface named by two zones is ONE unarmed surface named %q; got %v",
+			phys, got)
+	}
+}
+
+// TestArmProofReportsTheReadbackInstanceWithoutVerifyingIt pins the SCOPE of
+// the program-instance half of the proof. It is a RESIDUAL RECORD, not a
+// guard: it asserts what the proof does NOT check, so the documents and the
+// code cannot drift apart silently in either direction.
+//
+// xdpLinkProgramID accepts any readable program id. It never compares it
+// against m.programs[m.XDPEntryProgram()] — the program AttachXDP installs —
+// and never checks Info.XDP().Ifindex. A `direct` verdict therefore means "an
+// instance exists here and this is its id", not "the shim covers this
+// surface". That is sound today only by an invariant held in OTHER functions
+// (every writer of m.xdpLinks installs the entry program; nothing outside the
+// package can reach a tracked link), which is exactly why a gating build
+// cannot inherit it.
+//
+// The gating PR MUST add the comparison, at which point this test goes red —
+// deliberately. Replace it then, and update the residual paragraphs at
+// xdpLinkProgramID, in pkg/dataplane/README.md and in plan §13/D1 in the same
+// change.
+func TestArmProofReportsTheReadbackInstanceWithoutVerifyingIt(t *testing.T) {
+	const ifidx, readback = 11, 4242
+	swapArmProbes(t,
+		func(int) bool { return false },
+		func(link.Link) (uint32, bool) { return readback, true },
+	)
+
+	m := New()
+	m.loaded = true
+	m.SelectUserspaceXDPShimEntryProgram()
+	// The Manager holds NO shim program to compare against — AttachXDP's own
+	// source of truth is absent — and the surface still classifies covered.
+	delete(m.programs, m.XDPEntryProgram())
+	m.xdpLinks[ifidx] = nil
+
+	rep := m.ProveArmCoverage(newProofResult([]int{ifidx}))
+	if len(rep.Surfaces) != 1 {
+		t.Fatalf("expected exactly the one required surface; got %+v", rep.Surfaces)
+	}
+	s := rep.Surfaces[0]
+	if s.Kind != CoverageDirect || rep.WouldGate {
+		t.Fatalf("this phase classifies from the readback ALONE; if that changed, the residual "+
+			"paragraphs at xdpLinkProgramID / README / plan D1 are now stale: got kind=%s "+
+			"would_gate=%v (%s)", s.Kind, rep.WouldGate, s.Detail)
+	}
+	if s.ProgramID != readback {
+		t.Fatalf("the proof REPORTS the instance the readback returned; got %d, want %d",
+			s.ProgramID, readback)
 	}
 }
 
