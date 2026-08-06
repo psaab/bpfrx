@@ -121,6 +121,32 @@ untouched); Go diff verified comment-only with a non-comment line filter.
      needs its own gate.
 - **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_auth_test.go`,
   `pkg/cluster/README.md`, `_Log.md`
+## 2026-08-05 — #4313: the closed-world comment said no subtree was armed; ten are
+
+- **Timestamp**: 2026-08-05 (fix/4313-closedworld-comment)
+- **Action**: Correct a false claim in the `closedWorld` doc comment. Comment-only.
+- **File(s)**: `pkg/config/schema.go`
+
+`schemaNode.closedWorld` carried "No production subtree sets this yet — the
+per-subtree flips are follow-ups". `git grep -n 'closedWorld: true' pkg/config/`
+returns TEN production subtrees: NAT `then`, `nat64`, `natv6v4`, IKE `proposal`,
+IKE `dead-peer-detection`, IPsec `proposal`, IPsec `dead-peer-detection`,
+`vpn-monitor`, `traffic-selector` (all `schema_security.go`) and
+`master-password` (`schema_system.go`). Six dedicated
+`schema_closedworld_*_4313_test.go` files pin them.
+
+The comment is what a maintainer reads before touching the walker. Believing the
+mechanism inert, they could change `walkSchemaNode`'s keyword-resolution gate
+without realising ten security subtrees already depend on it rejecting.
+
+Fixed by stating that production subtrees DO set it and giving the grep, rather
+than by enumerating them: an enumerated list in a comment drifts the same way
+the count did, and the next reader trusts the list. This matches the reasoning
+already recorded a few lines away in `walkSchemaNode`, which deliberately
+declines to state how many subtrees are armed.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
+`gofmt -l` clean; diff verified comment-only.
 
 ## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
 
