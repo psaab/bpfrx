@@ -3119,21 +3119,19 @@ pub(super) fn poll_binding_process_descriptor(
                             Some(l3_flow),
                             meta,
                             ingress_zone_override,
-                            // #2620 counter ownership: `routing_eval_follows =
-                            // false`. An association HIT returns the cached
-                            // decision directly and NEVER reaches
-                            // `ingress_route_table_override` (that call lives in
-                            // the miss `else` arm below), so this evaluator is
-                            // the SOLE per-packet counter for the fragment —
-                            // exactly like the session-HIT re-eval in
-                            // `evaluate_dscp_sensitive_input_filter_on_session_hit`.
-                            // Passing `true` here would select
-                            // `OnlyTerminalNonAccept` whenever the input filter
-                            // is route-lookup-affecting, deferring this
-                            // fragment's `then count` terms to a routing
-                            // evaluator that never runs — every accepted
-                            // fragment of the datagram would go uncounted.
-                            false,
+                            // #2620 counter ownership. #6927: `true`, because a
+                            // routing evaluator DOES follow on this arm now —
+                            // `ingress_route_table_override` runs below. Before
+                            // #6927 nothing followed, so `false` (`Always`) was
+                            // correct and `true` would have deferred this
+                            // fragment's `then count` terms to an evaluator that
+                            // never ran. Now the reverse is true: `false` would
+                            // count every matched term TWICE (once here under
+                            // `Always`, once in the routing walk, which counts
+                            // every matched term unconditionally). This is the
+                            // same value, for the same reason, as the miss arm
+                            // below.
+                            true,
                         );
                         if let Some(cached_log) = input_eval.cached_log {
                             emit_input_filter_log_match(
@@ -3154,7 +3152,70 @@ pub(super) fn poll_binding_process_descriptor(
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
+                        // #6927: and the PBR half of the same filter. A matching
+                        // term with a non-empty `routing-instance` makes
+                        // `evaluate_non_pbr_input_filter` return
+                        // `FilterResult::default()` — BEFORE recording its
+                        // counter and BEFORE applying its action — and that
+                        // default action is `Accept`. So a configured
+                        // `from { is-fragment; } then { routing-instance scrub;
+                        // discard; count X; }` was silently ACCEPTED on an
+                        // association hit, and `X` stayed at zero: a reachable
+                        // configured drop guard that could not fire, and no
+                        // counter to notice it by. The PBR verdict lives in the
+                        // routing-instance evaluator, which only
+                        // `ingress_route_table_override` runs.
+                        //
+                        // Same call shape as the miss arm below, including the
+                        // sink-less flowless contract: a non-first fragment has
+                        // no L4 header to reflect, so `reject` degrades to the
+                        // same silent drop as `discard`.
+                        match ingress_route_table_override(
+                            worker_ctx.forwarding,
+                            packet_frame,
+                            meta,
+                            l3_flow,
+                            ingress_zone_override,
+                            worker_ctx.event_stream,
+                            now_ns,
+                            None,
+                        ) {
+                            RouteOverride::Drop => {
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
+                            // A non-drop PBR steer is DELIBERATELY not applied
+                            // here. An association hit exists to inherit the
+                            // first fragment's forwarding decision — egress,
+                            // neighbor and NAT translation — for the rest of the
+                            // datagram; re-steering only the non-first fragments
+                            // into an override table would split one datagram
+                            // across two egresses and defeat reassembly. What
+                            // does NOT get inherited is per-packet ENFORCEMENT,
+                            // which is why the drop above applies and why the
+                            // term's counter/log were recorded by the call.
+                            RouteOverride::Table(_) | RouteOverride::None => {}
+                        }
                     }
+                    // #6927: an association hit inherits the STATEFUL decision,
+                    // never the per-packet authorization behind it. Owner-RG
+                    // activity is per-packet: after an RG transition the old
+                    // owner still hits a same-generation association, and
+                    // because every hit re-stamps the entry's deadline the stale
+                    // ownership was indefinitely renewable. The guard that
+                    // demotes an inactive owner to `HAInactive` sat only on the
+                    // miss path's resolution, so it could never fire here. Run
+                    // it on the cached resolution too; the shared HAInactive
+                    // safety net below then fabric-redirects to the peer that
+                    // now owns the egress RG, exactly as it does for a demoted
+                    // session.
+                    let mut hit = hit;
+                    hit.resolution = enforce_ha_resolution_snapshot(
+                        worker_ctx.forwarding,
+                        worker_ctx.ha_state,
+                        now_secs,
+                        hit.resolution,
+                    );
                     hit
                 } else {
                     // #6472: NAT64 (cross-family) ICMP error translation
@@ -3523,6 +3584,52 @@ pub(super) fn poll_binding_process_descriptor(
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
+                    }
+
+                    // #6927: the CROSS-FAMILY sibling of the #6122 gate above,
+                    // and the one #6122's comment assumed already existed ("its
+                    // own consult already drops fail-closed on a miss"). It does
+                    // not. `nat64_consult_forward_fragment_assoc` returns `None`
+                    // on a miss, which only means "no association" — the packet
+                    // then falls through to this arm and is resolved like any
+                    // other IPv6 destination. With a default route present that
+                    // FORWARDS it, still addressed to the synthetic Pref64
+                    // destination and still carrying the client's real IPv6
+                    // source. The fail-closed claim held only inside the test
+                    // fixture, which deleted `::/0` to keep it holding.
+                    //
+                    // A Pref64 is a translation namespace, not a forwardable
+                    // destination: nothing downstream can deliver
+                    // `64:ff9b::8.8.8.8` as native IPv6. So when such a packet
+                    // reaches this arm untranslated, refuse it rather than emit
+                    // it. Observable through the existing #2562 fail-closed
+                    // fragment counter.
+                    //
+                    // The destination comes from the FRAME, not from `l3_ctx`.
+                    // `l3_ctx` is built from `meta.flow_{src,dst}_addr`, which
+                    // the shim stamps but a flowless packet need not carry — it
+                    // is `None` for exactly the meta-less fragments this gate
+                    // exists to stop, so gating on it would have left the leak
+                    // open on the majority of them. Placed after the transit
+                    // policy block (not inside it) for the same reason, and
+                    // scoped to ForwardCandidate: NoRoute/MissingNeighbor/
+                    // HAInactive/LocalDelivery have their own arms and none of
+                    // them emits the packet natively.
+                    if final_resolution.disposition == ForwardingDisposition::ForwardCandidate
+                        && let Some(IpAddr::V6(dst_v6)) =
+                            crate::afxdp::frame::parse_packet_destination_from_frame(
+                                packet_frame,
+                                meta,
+                            )
+                        && worker_ctx
+                            .forwarding
+                            .nat64
+                            .match_ipv6_dest(dst_v6)
+                            .is_some()
+                    {
+                        telemetry.counters.record_nat64_frag_dropped();
+                        binding.scratch.scratch_recycle.push(desc.addr);
+                        continue;
                     }
 
                     // (4) #3292: flowless LocalDelivery (host-bound) enforcement.
