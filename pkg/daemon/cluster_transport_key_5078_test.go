@@ -28,8 +28,9 @@ import (
 // across. If a key change restarted comms, the primary would drop the
 // connection at the moment it became keyed, the secondary would still be
 // unkeyed, and — since #5078 makes a keyed node reject an unkeyed peer, with no
-// migration window — the cluster could never converge. That is a PERMANENT
-// deadlock recoverable only by console access to the secondary.
+// migration window — the cluster could never converge. The cluster cannot get
+// itself out of that state; see the recovery note below, which is reasoned but
+// UNVERIFIED, so do not assume a particular escape route is available.
 //
 // Adding `ControlLinkAuthKey` to clusterTransportKey looks obviously correct
 // ("restart comms when the key changes") and would silently create that
@@ -104,7 +105,15 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 // established connection. Restart comms at the moment the primary becomes keyed
 // and that connection drops while the peer is still unkeyed; the now-keyed
 // primary then rejects its handshake forever, and the secondary cannot be keyed
-// locally. Recovery needs console access to the standby.
+// locally.
+//
+// Recovery from that state is NOT established. pkg/cluster/README.md reasons
+// out a path that runs entirely from the primary — remove the key there, let
+// the peer reconnect unkeyed, config-sync pushes, re-add the key — and marks it
+// UNVERIFIED, derived from the read-only gate and the fail-closed decision
+// rather than executed on a cluster. Console access to the standby is the
+// fallback if that path does not hold. Do not state either as fact here: the
+// README carries the hedge and this comment must not out-claim it.
 //
 // Observable: clusterCommsGen. stopClusterComms bumps it before anything else,
 // and startClusterComms bumps it via beginClusterCommsEpoch, so an unchanged
@@ -180,6 +189,48 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 			t.Fatalf("a peer-address change did NOT restart cluster comms "+
 				"(clusterCommsGen stayed %d); the key-commit assertion above is "+
 				"meaningless if step 20 never fires", before)
+		}
+	})
+
+	// Second positive control, KEYED. The control above builds `moved` from
+	// transport(), which sets no ControlLinkAuthKey, so on its own it cannot
+	// distinguish "restarts on an endpoint change" from "restarts on an
+	// endpoint change ONLY WHILE UNKEYED" — and the latter is the most
+	// plausible over-correction of this very issue, because "don't restart
+	// comms when a key is involved" is the obvious wrong way to satisfy
+	// key_commit_must_not_restart.
+	//
+	// Measured, not assumed (#6865 review): suppressing step 20 whenever a key
+	// is configured --
+	//
+	//	keyed := cfg != nil && cfg.Chassis.Cluster != nil &&
+	//		cfg.Chassis.Cluster.ControlLinkAuthKey != ""
+	//	if !keyed && d.activeClusterTransport != (clusterTransportKey{}) && ...
+	//
+	// -- left the ENTIRE pkg/daemon package green, both subtests above
+	// included, while every keyed cluster silently stopped restarting comms on
+	// a real endpoint move. This subtest is the one that reds it.
+	t.Run("keyed_endpoint_change_must_still_restart", func(t *testing.T) {
+		movedKeyed := transport()
+		movedKeyed.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
+		movedKeyed.Chassis.Cluster.PeerAddress = "10.99.0.9"
+
+		// The active transport must also be keyed, or the key itself is the
+		// change under test rather than the endpoint move.
+		d.clusterCommsMu.Lock()
+		keyedBase := transport()
+		keyedBase.Chassis.Cluster.ControlLinkAuthKey = config.Secret("a-real-cluster-psk-5078")
+		d.activeClusterTransport = clusterTransportFromConfig(keyedBase)
+		d.clusterCommsMu.Unlock()
+
+		before := gen()
+		_ = d.applyTailReconciles(movedKeyed, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		if after := gen(); after == before {
+			t.Fatalf("a peer-address change on a KEYED cluster did NOT restart "+
+				"cluster comms (clusterCommsGen stayed %d); step 20 must key its "+
+				"decision on the transport endpoints alone, never on whether an "+
+				"authentication key is configured -- suppressing the restart while "+
+				"keyed strands session-sync on the old peer address (#5078)", before)
 		}
 	})
 }

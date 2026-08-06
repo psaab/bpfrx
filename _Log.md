@@ -925,6 +925,47 @@
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6865 gate fold: close the keyed positive-control gap, hedge the recovery claim
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: Two review findings, both in the test file; no production change.
+  **MINOR-1 (guard scope).** The `endpoint_change_must_restart` positive
+  control builds `moved` from `transport()`, which sets no
+  `ControlLinkAuthKey`. It therefore could not distinguish "restarts on an
+  endpoint change" from "restarts on an endpoint change ONLY WHILE UNKEYED" —
+  and the latter is the most plausible over-correction of this very issue,
+  since "don't restart comms when a key is involved" is the obvious wrong way
+  to satisfy `key_commit_must_not_restart`. Added a third subtest,
+  `keyed_endpoint_change_must_still_restart`, which seats a KEYED active
+  transport and then moves the peer address, so the key is held constant and
+  the endpoint move is the only variable.
+  **MINOR-2 (claim wording).** The comment stated flatly that the deadlock is
+  "recoverable only by console access to the secondary", while
+  `pkg/cluster/README.md` documents a reasoned recovery path that runs entirely
+  from the primary and explicitly marks it UNVERIFIED. A shipping code comment
+  must not out-claim the doc that carries the hedge; both sites now point at
+  the README and say the escape route is not established.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go
+- **Validation**: Parent mutation proof of MINOR-1, with the negative control
+  taken from git rather than from a snapshot — a snapshot captured after the
+  edit restores the edit, which silently turns the control into a second copy
+  of the treatment cell:
+  - mutation (suppress step 20 whenever a key is configured):
+    `keyedMut := cfg != nil && cfg.Chassis.Cluster != nil &&
+    cfg.Chassis.Cluster.ControlLinkAuthKey != ""`, then
+    `if !keyedMut && d.activeClusterTransport != ...`
+  - `go vet ./pkg/daemon/` -> rc=0 under the mutation, so a red is an
+    assertion and not a build break
+  - CELL A, mutation + new subtest -> rc=1, failing subtest exactly
+    `keyed_endpoint_change_must_still_restart`
+  - CELL B, mutation + the ORIGINAL test file restored from
+    `git show <pr-head>:...` -> rc=0, `ok github.com/psaab/xpf/pkg/daemon`.
+    The gap was real: the whole package was green under a mutation that
+    silently stops every KEYED cluster from restarting comms on a real
+    endpoint move.
+  Unmutated: `go vet` rc=0; `go test` rc=0 for pkg/daemon, pkg/cluster,
+  pkg/configstore and pkg/refactoraudit.
+
 ## 2026-08-05 — #5078 PR1 r3: my rollout correction was ALSO wrong; guard the transport key
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
