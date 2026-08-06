@@ -1,10 +1,19 @@
 # #4408 — Rust hot-path god-functions: `enqueue_pending_forwards` + waterfill
 
-**Status:** PLAN-READY (r3) on a **narrowed scope** — recommending
-**Option B′: the waterfill split ONLY** (Increments 3a + 3b). The dispatch
-de-duplication (Increment 1) is **DEFERRED, not rejected**, with its evidence
-preserved in §5-A for whoever picks it up. The arm-decomposition shape that
-#4404 killed remains explicitly rejected (§5-D).
+**Status:** PLAN-READY (r4) on a **narrowed scope** — recommending
+**Option B′: the waterfill split ONLY** (Increments 3a + 3b), and
+**PLAN-KILL of #4408's dispatch half as scoped**, with the de-duplication
+re-filed as a maintenance-hazard issue on its own merits (§12.4). r3 had
+DEFERRED that half behind a coverage precondition; r4's judgement is that a
+deferral nobody owns is how an issue stays open for a year, and that the
+framing — "decompose a god-function" — is one that **no available option
+satisfies at a risk the hottest TX path should accept**. The arm-decomposition
+shape that #4404 killed remains explicitly rejected (§5-D).
+
+**Read §12 first if you only read one section.** It re-verifies every number at
+a newer master, corrects the responsibility count, and records the measurement
+no prior round made: the project's own modularity gate does not move for either
+increment.
 
 **Convergence so far (2 reviewers, same conclusion on the narrowed scope).**
 Codex returned PLAN-NEEDS-MAJOR on r2: it declined to kill the waterfill split
@@ -23,10 +32,14 @@ as disagreeing.
 | r1 | first draft | — |
 | r2 | folded 7 SMR findings | **2 load-bearing, both in the GATE**: unsatisfiable parent-RED (F1); call-edge command missing the `.llvm` strip (F2) |
 | r3 | narrowed scope; **gate made instance-aware** | **1 load-bearing, again in the GATE**: the inherited Rust-hash strip **over-collapsed** three distinct `VecDeque::grow` monomorphisations into one identity (F8) |
+| r4 | re-verified at a new master; **sharpened the dispatch disposition from DEFER to KILL-as-scoped + re-file** (§12) | none in the design; one **measurement gap**: no round had checked whether the project's own modularity gate actually moves (§12.3 — it does not, for either increment) |
 
 Three consecutive rounds, three gate defects, zero defects found in the refactor
 design itself. §8a treats that as evidence, not coincidence.
 Base: `origin/master` `dd23119aa7a6ea5bd118b2f788faa1cf68ce7a42`.
+**Re-verified at `d77583fe56750dd1ae915a453bd73803574f268b` — see §12.1; both
+target files are byte-identical to the r1–r3 base, so every line number below is
+still exact.**
 Branch: `research/4408-hotpath-split`. No production code touched.
 
 ---
@@ -806,3 +819,179 @@ PLAN-KILL of #4408 in full, not a smaller compromise.
 3. Tier-2 of the §2c-bis classifier is the least-exercised part of this gate —
    it has a synthetic proof and a negative control, but no real failure has ever
    run through it. §8a argues that is where the next defect most likely lives.
+
+---
+
+## 12. r4 — independent re-verification and a sharpened disposition
+
+r4 was commissioned as a fresh read of `enqueue_pending_forwards` against a new
+master, by someone who had not written r1–r3. It confirms the r3 recommendation
+on the waterfill and **hardens the dispatch disposition from "deferred" to
+"killed as scoped, re-filed on its real merits"** (§12.4). It found no defect in
+the r1–r3 design and one gap in what every prior round had measured (§12.3).
+
+### 12.1 Re-verification at `d77583fe5` — every number re-measured, not inherited
+
+r1–r3 were written at `dd23119aa`. Master is now `d77583fe5`. The first thing to
+establish is whether any of this doc is stale.
+
+```
+git diff --stat dd23119aa d77583fe5 -- \
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs \
+  userspace-dp/src/afxdp/cos/queue_service/mod.rs
+# (empty)
+```
+
+**Both target files are byte-identical across those 3,000-odd commits.** So
+every line number, range, and count in §0–§11 is still exact — not merely still
+approximately right. Re-measured independently anyway, because a diff being
+empty and the numbers being correct are two different claims:
+
+| Artifact | r0–r3 claim | r4 measured at `d77583fe5` | |
+|---|---|---|---|
+| `tx/dispatch/mod.rs` | 1608 LOC | **1608** | ✓ |
+| `enqueue_pending_forwards` | 1074 LOC, 19 params, :339–1412 | **:339–1412 = 1074**, **19 params** | ✓ |
+| `cos/queue_service/mod.rs` | 2166 LOC | **2166** | ✓ |
+| waterfill | 432 LOC, :968–1399 | **:968–1399 = 432** | ✓ |
+
+The two load-bearing structural claims were re-run rather than trusted:
+
+```
+# §1b escape-free interior — 11 hits, ALL inside comments
+awk 'NR>=589 && NR<=1295' src/afxdp/tx/dispatch/mod.rs \
+  | grep -c 'continue\|return\|recycle_ingress_frame'          # 11
+# ... of which non-comment:                                     # 0
+
+# §1d duplication — 102 lines each, agreeing on 100
+diff armD.txt armE.txt
+# 1c1   < None => match if is_nat64 {  ---  > match if is_nat64 {
+# 101c101  < },                        ---  > }
+```
+
+Both reproduce exactly. §1b and §1d stand.
+
+### 12.2 Responsibility count — r4 reads FOUR, not r1's "one", not the issue's "8+"
+
+§1c argues the residual is *one* responsibility ("choose a frame-materialisation
+strategy and enqueue it") expressed as a 4-way cascade. That is the right
+correction to the issue's inflated "8+", and it is the reason Option D is
+rejected. But it under-counts, and the under-count matters for anyone who reads
+§1c as licence to treat the body as indivisible.
+
+Reading the per-request loop top-down, there are **four** responsibilities, of
+which three form one pipeline and one does not:
+
+| # | Region | Responsibility | In the pipeline? |
+|---|---|---|---|
+| 1 | :395–474 | **Prebuilt fast path** — a `PendingForwardFrame::Prebuilt` resolves its target, builds a `TxRequest`, enqueues, recycles and `continue`s. It never reaches the cascade. | **No — wholly self-contained** |
+| 2 | :479–574 | **Admission** — source-frame acquisition, egress-binding resolution, the `FabricRedirect` special case. Carries **5 of the 8** recycle-and-`continue` sites. | yes (phase a) |
+| 3 | :589–1295 | **Materialisation** — the 4-way cascade, with TCP segmentation dispatch nested at :596–701. Escape-free (§1b). | yes (phase b) |
+| 4 | :1296–1401 | **Disposition** — shared recycles, the PTB/ICMP reply enqueue with its own output-filter verdict, and the epilogue that owns the single remaining recycle. | yes (phase c) |
+
+Plus a post-loop drain of `pending_fill_frames` (:1403–1409) that belongs to
+neither.
+
+Why the distinction is worth recording: **responsibility 1 is a genuine,
+separable responsibility that §1c folds into "one".** It shares no local state
+with the cascade, it exits before any of it, and it is ~80 lines. It is the one
+region of this function a decomposition could take that is neither the
+#4404-killed arm-split (§1c) nor the deferred de-dup (§5-A). r4 does **not**
+propose extracting it — see §12.4 — but a future pass that re-reads §1c should
+know it exists rather than concluding the body is atomic.
+
+### 12.3 The measurement no prior round made: the project's own gate does not move
+
+Every round scored value as "LOC removed from the god-function". None checked
+what the repo's committed modularity metric would say. That metric exists:
+`docs/refactoring-audit-current.txt`, enforced by `pkg/refactoraudit`'s
+`TestHeatmapNotStale`, which gates on **file set and tier** at `auditFloor =
+1500` (enter the heatmap) and `refactorFloor = 2000` (promote to `[REFACTOR]`).
+
+Both targets are already tracked:
+
+```
+[REFACTOR]   2166  userspace-dp/src/afxdp/cos/queue_service/mod.rs
+[WATCH]      1608  userspace-dp/src/afxdp/tx/dispatch/mod.rs
+```
+
+Applying each increment to those thresholds:
+
+| Increment | File | Before | After | Tier change? |
+|---|---|---|---|---|
+| B′ (waterfill 3a+3b) | `queue_service/mod.rs` | 2166 `[REFACTOR]` | ~2166 (a split does not shrink a file) | **no** |
+| 1 (dispatch de-dup) | `tx/dispatch/mod.rs` | 1608 `[WATCH]` | ~1524 `[WATCH]` | **no** |
+
+**Neither increment moves the gate the issue is nominally filed against.**
+Neither requires regenerating the heatmap, so neither trips `TestHeatmapNotStale`
+— convenient operationally, and damning for the value case: by the project's own
+committed measure of the defect, the proposed work changes nothing.
+
+Two consequences worth carrying forward:
+
+- The value of B′ has to be argued as **reviewability of a state machine**
+  (three named phases a reviewer can hold in their head), never as "addresses
+  the modularity audit". §9 is already honest that the file does not shrink;
+  this is the sharper form of the same point.
+- Increment 1's ~1524 lands **24 lines above the 1500 audit floor**. A later
+  change shaving another ~25 lines would drop `tx/dispatch/mod.rs` out of the
+  heatmap entirely — a file-set change that **does** trip the canary unless the
+  artifact is regenerated in the same commit. Whoever eventually ships a
+  dispatch-side reduction should expect that and regenerate.
+
+### 12.4 Disposition: KILL the dispatch half *as scoped*, re-file the de-dup
+
+r3 deferred Increment 1 behind a coverage precondition. r4's judgement is that
+"deferred behind a precondition nobody owns" is the disposition that leaves
+issues open for a year, and that the honest call is a **scoped kill plus a
+re-file**:
+
+1. **#4408's dispatch half is PLAN-KILLED as a decomposition.** The issue asks
+   to decompose a god-function. Increment 1 does not decompose anything — it
+   removes a duplicate. 1074 → ~840 is still a god-function by every threshold
+   the issue cites, the audit tier does not move (§12.3), and the only true
+   decomposition shapes available are the #4404-killed arm-split (§1c/Option D)
+   or Option C's "move the god-function into a 700-line helper" (Value 4 / Risk
+   6). There is no version of this that satisfies the issue as written at a risk
+   the hottest TX path should accept. Killing it as scoped is not a judgement
+   that the code is fine; it is a judgement that **this issue's framing cannot
+   be satisfied**, which is exactly what PLAN-KILL is for.
+
+2. **Re-file the de-duplication on its own merits, as a maintenance-hazard
+   issue, not a modularity one.** The finding that survives is §1d: the NAT64
+   drop attribution (`nat64_exthdr_ineligible` / `nat64_frag_dropped`, #5625 /
+   #2562) and the #2208 oversized/enqueue-fail handling are implemented **twice,
+   100 of 102 lines identical**, and must be edited in lockstep forever. That is
+   a real defect class with a real cost, and it stands whether or not anyone
+   ever calls the function "too long". Filed that way it gets judged on the
+   right axis, it carries §5-A's evidence and §5-A's caveat (the 11-param helper
+   — bundle by reference or accept it explicitly), and its release condition
+   (§7.2's cp1/cp2 + NAT64-attribution cells demonstrated to bind) belongs to
+   that issue instead of blocking this one.
+
+3. **The waterfill half is unchanged: proceed with B′.** r4 re-read §1a and
+   agrees. The phase boundaries are real state-machine boundaries, the export
+   set is `Option`-shaped with no invented protocol, the refill's #1743-r3
+   ordering hazard is correctly called out as un-splittable, and §1a names the
+   borrowck floor inside Phase 1 so a future pass does not walk into it. Value
+   is reviewability, not audit tier (§12.3).
+
+**If the leader prefers a single verdict rather than a split one:** kill #4408
+entirely and re-file both halves. §9 already contemplates that ("if even it is
+judged not worth the churn, the correct outcome is PLAN-KILL of #4408 in full").
+r4 does not recommend it — the waterfill work is genuinely ready and twice
+reviewed — but it is a defensible read and is cheaper to administer than a
+half-open issue.
+
+### 12.5 What r4 did NOT do
+
+- **No cargo, no test run.** r4 is a reading exercise; every number above comes
+  from `git diff`, `wc`, `awk`/`grep`, and a brace-balance scan. The §2 codegen
+  gate was **not** re-run at `d77583fe5` — its artifacts are from `dd23119aa`.
+  Because both files are byte-identical (§12.1) the *inputs* are unchanged, but
+  the toolchain and the rest of the crate are not, so **§7.3's call-edge baseline
+  must be regenerated at the implementation head, not inherited from this doc.**
+  That is a real caveat, not a formality: §8a's record is three gate defects in
+  three rounds, and a stale baseline is exactly the shape that record predicts.
+- **No independent re-derivation of §2's monomorphisation classifier.** r4 read
+  §2c-bis and has no finding on it. §11 q3's warning stands unaddressed: Tier-2
+  is the least-exercised part of the gate.
