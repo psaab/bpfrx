@@ -111,12 +111,29 @@ func stubHostname(t *testing.T, name string) {
 func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 	t.Run("boot_rename_is_diagnosed_once_mgmt_is_up", func(t *testing.T) {
 		d := &Daemon{}
-		stubHostname(t, "new-fw-6827")
 		restoreSet, restorePath := sethostname, hostnamePath
 		t.Cleanup(func() { sethostname, hostnamePath = restoreSet, restorePath })
-		var applied []string
-		sethostname = func(b []byte) error { applied = append(applied, string(b)); return nil }
 		hostnamePath = filepath.Join(t.TempDir(), "hostname")
+
+		// STATEFUL stub (#6827 r3). The earlier fixture had the kernel already
+		// reporting "new-fw-6827" while asking applyHostname to rename TO it —
+		// a state production cannot reach, because the early return at
+		// daemon_system.go fires first and sethostname is never called. It only
+		// ran because that guard read os.Hostname directly while the rest of
+		// the function read the seam; completing the seam reds it.
+		//
+		// So model the real sequence: the kernel reports the PRE-rename name,
+		// and the fake sethostname advances it.
+		current := "old-fw-6827"
+		restoreHost := osHostname
+		t.Cleanup(func() { osHostname = restoreHost })
+		osHostname = func() (string, error) { return current, nil }
+		var applied []string
+		sethostname = func(b []byte) error {
+			applied = append(applied, string(b))
+			current = string(b)
+			return nil
+		}
 
 		bootOut := captureDaemonWarn(t, func() {
 			cfg := &config.Config{}
@@ -144,6 +161,49 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 		// The debt is settled: a second delivery says nothing.
 		if again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); again != "" {
 			t.Fatalf("a delivered diagnosis must not repeat; got %q", again)
+		}
+	})
+
+	// #6827 r3: bind applyHostname's already-applied early return.
+	//
+	// It was innocuous before this PR and is LOAD-BEARING after it, because
+	// noteStaleMgmtCertHostName is reachable only past it. Deleting the guard
+	// left the whole pkg/daemon + pkg/api suite GREEN, so nothing noticed —
+	// while in production every commit carrying an unchanged `system host-name`
+	// would re-fire the debt and its delivery, and a box with a genuinely stale
+	// durable cert would emit the "does not cover the current host-name" WARN on
+	// EVERY commit. Muting a real diagnostic by repeating it is exactly what
+	// hostNameLikelyAccessIdentity's design avoids on the load path.
+	t.Run("an_unchanged_host_name_is_a_no_op", func(t *testing.T) {
+		d := &Daemon{}
+		restoreSet, restorePath := sethostname, hostnamePath
+		t.Cleanup(func() { sethostname, hostnamePath = restoreSet, restorePath })
+		hostnamePath = filepath.Join(t.TempDir(), "hostname")
+
+		restoreHost := osHostname
+		t.Cleanup(func() { osHostname = restoreHost })
+		osHostname = func() (string, error) { return "steady-fw-6827", nil }
+		var applied []string
+		sethostname = func(b []byte) error { applied = append(applied, string(b)); return nil }
+
+		// A cert that does NOT cover the name, so a delivery would be loud if
+		// the debt were ever armed — the assertion below is not true for free.
+		serveStaleCert(t, d, "other-fw-6827")
+
+		out := captureDaemonWarn(t, func() {
+			cfg := &config.Config{}
+			cfg.System.HostName = "steady-fw-6827"
+			d.applyHostname(cfg)
+			d.deliverStaleMgmtCertDiagnosis()
+		})
+		if len(applied) != 0 {
+			t.Fatalf("a commit whose host-name already matches the kernel must not call "+
+				"sethostname; got %v", applied)
+		}
+		if strings.Contains(out, "does not cover the current host-name") {
+			t.Fatalf("an unchanged host-name must not arm the stale-cert debt — otherwise a box "+
+				"with a stale durable cert warns on EVERY commit and operators learn to ignore "+
+				"it; got %q", out)
 		}
 	})
 

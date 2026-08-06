@@ -403,7 +403,19 @@ func (d *Daemon) applyHostname(cfg *config.Config) {
 		return
 	}
 
-	current, _ := os.Hostname()
+	// Read through the seam, not os.Hostname directly. This early return is
+	// LOAD-BEARING since #6827: noteStaleMgmtCertHostName below is reachable
+	// only past it, so without it every commit carrying an unchanged
+	// `system host-name` re-fires the debt and its delivery — and a box with a
+	// genuinely stale durable cert would emit the "does not cover the current
+	// host-name" WARN on EVERY commit. That is the diagnostic-muting failure
+	// mode hostNameLikelyAccessIdentity's own doc block exists to avoid.
+	//
+	// It also has to use osHostname so a test can present a kernel name that
+	// differs from the configured one. Reading os.Hostname here while the rest
+	// of the function reads the seam made the guard untestable and let a
+	// fixture describe a kernel state production cannot reach (#6827 r3).
+	current, _ := osHostname()
 	if current == cfg.System.HostName {
 		return
 	}

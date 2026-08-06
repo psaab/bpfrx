@@ -68514,3 +68514,19 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/management_recovery_6827_test.go, pkg/daemon/README.md,
   pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go,
   pkg/api/README.md, _Log.md
+
+## 2026-08-06 — #6827 fold r3 (re-gate MINOR-1 / MINOR-2)
+
+- **Timestamp**: 2026-08-06 03:55 PDT
+- **Action**: Complete the osHostname seam at the already-applied early return,
+  bind that guard (it had ZERO coverage and is load-bearing since #6827), and
+  rewrite the boot_rename fixture off an impossible kernel state onto the
+  stateful-stub pattern the file already uses.
+- **File(s)**: pkg/daemon/daemon_system.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/api
+  ./pkg/config -count=1 rc=0; gofmt clean. M1 (neutralise the early return)
+  reds an_unchanged_host_name_is_a_no_op as an ASSERTION at :200. M2 (revert
+  the seam to os.Hostname) reds the SAME subtest — which is the point: the
+  half-applied seam is exactly what made the guard untestable and let the old
+  fixture describe a kernel state production cannot reach.
