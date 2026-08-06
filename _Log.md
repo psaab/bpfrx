@@ -1,3 +1,35 @@
+## 2026-08-05 — #6894 round 2: the coverage count went stale again, in the fix for it
+
+- **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
+- **Action**: The round-1 fold closed four of five gate items — the table-contents
+  assertion exists (`TestValidationPhaseTableMatchesDocumentedCoverage_4960` pins
+  length AND name order), `validateFilterProtocols` is hoisted in and is
+  idempotent (reads `cfg` only), the pre-pass log duplication is suppressed via
+  `isValidationPass(dp)`, and the test fixture now uses synthetic names
+  (`xpft4960a`/`xpft4960b`) behind a `skipIfCouldMutateAHost` root guard.
+  The fifth item came back: `compiler_validate_4960.go` still said **"Eleven of
+  the thirteen fallible post-zones phases"** while the table it introduces now
+  holds **twelve** — the filter-protocols hoist added a row and the header was
+  not updated. That is the third time this campaign a fold has grown a list and
+  left its count behind, and the second time on this exact class of comment.
+  Fixed by removing the count rather than correcting it. Prose now defers to the
+  table as the authority and says so explicitly, pointing at the test that makes
+  a silent row deletion impossible. A number in a comment is a coverage claim; a
+  pointer to an asserted table is not.
+  Also restated the exclusion accurately: it is `compilePortMirroring` entirely
+  plus all of `compileFirewallFilters` EXCEPT its cfg-pure prefix, not "two
+  phases" — the hoist made that sentence wrong in a second way that a numeral
+  swap would not have caught.
+  And separated the two kinds of binding, because the gate measured them and the
+  file did not distinguish them: the table test binds the SET (no row can vanish),
+  while behavioural fixtures bind that a row actually rejects pre-mutation, and
+  there are exactly two of those (`applications`, `nat`). The remaining rows are
+  set-bound only. That is the intended trade and is now written down instead of
+  being inferred.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md
+- **Validation**: comment-only — production diff filtered to non-comment lines is
+  empty. `go build ./...` rc=0; `go test ./pkg/dataplane/ -count=1` rc=0;
+  `gofmt -l` clean.
 ## 2026-08-05 — #6851 round 5: bind the sanitizer's ARGUMENT, not just that the call is present
 
 - **Timestamp**: 2026-08-05 (fix/4626-policy-id-zero, PR #6851)

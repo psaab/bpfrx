@@ -130,17 +130,25 @@ func (discardingDataPlane) GetPersistentNAT() *PersistentNATTable {
 // Phase 2 mutates the host. It writes nothing: the CompileResult it builds is
 // local and discarded, and every dataplane call lands on discardingDataPlane.
 //
-// COVERAGE, stated precisely because the gap is deliberate. Eleven of the
-// thirteen fallible post-zones phases are validated here. The two excluded are
-// `compileFirewallFilters` and `compilePortMirroring`: both resolve VLAN
-// sub-interface names through `result.cachedInterfaceByName`, and those devices
-// do not exist until Phase 2 creates them. Running them here would evaluate a
-// different world than the real pass -- every lookup would miss and take the
-// `slog.Warn(...); continue` soft skip -- so the pre-pass would emit misleading
-// warnings on every successful commit and would still not faithfully predict
-// the real run. A hard failure inside those two therefore still occurs
-// post-mutation; that residual is named rather than papered over, and closing
-// it needs the interface-resolution soft skips addressed first (#6893).
+// COVERAGE, stated precisely because the gap is deliberate. The table below is
+// the authority on what is covered; do not restate its size in prose -- the
+// count is the part that rots, and it has already gone stale once here.
+// `TestValidationPhaseTableMatchesDocumentedCoverage_4960` pins the table's
+// length AND its name order, so a row added or removed without updating this
+// comment reds.
+//
+// What is EXCLUDED, which is the part worth stating: `compilePortMirroring`
+// entirely, and all of `compileFirewallFilters` EXCEPT its cfg-pure prefix
+// `validateFilterProtocols` (hoisted in as its own row -- see below). Both
+// resolve VLAN sub-interface names through `result.cachedInterfaceByName`, and
+// those devices do not exist until Phase 2 creates them. Running them here would
+// evaluate a different world than the real pass -- every lookup would miss and
+// take the `slog.Warn(...); continue` soft skip -- so the pre-pass would emit
+// misleading warnings on every successful commit and would still not faithfully
+// predict the real run. A hard failure inside that excluded remainder therefore
+// still occurs post-mutation; that residual is named rather than papered over,
+// and closing it needs the interface-resolution soft skips addressed first
+// (#6893).
 //
 // The double compile is safe with respect to ID assignment:
 // TestPrePassDoesNotPerturbIDAssignment_4960 measures that two passes with a
@@ -179,9 +187,19 @@ func validateBeforeMutate(cfg *config.Config) error {
 // validationPhase is one entry in the pre-pass table. The table is a named
 // function rather than a literal inside validateBeforeMutate so a test can
 // assert over its CONTENTS: the call site being bound proves the pre-pass
-// RUNS, not that it still covers what the doc comment claims it covers. Ten of
-// the eleven original rows could be deleted with the whole package suite still
-// green, because a single binding fixture pins exactly one row (#6894 r1 F1).
+// RUNS, not that it still covers what the doc comment claims it covers. At
+// round 1, ten of the eleven rows then present could be deleted with the whole
+// package suite still green, because a single behavioural fixture pins exactly
+// one row (#6894 r1 F1).
+//
+// So the two kinds of binding are DIFFERENT and neither substitutes for the
+// other. `TestValidationPhaseTableMatchesDocumentedCoverage_4960` binds the SET
+// -- no row can vanish silently. Behavioural fixtures bind that a given row
+// actually rejects pre-mutation, and there are two of those (`applications` via
+// an unresolvable application name, `nat` via an unresolvable pool). The
+// remaining rows are set-bound only, which is the intended trade: a per-row
+// failure fixture for all twelve would triple this file for little added signal
+// once deletion is impossible.
 type validationPhase struct {
 	name string
 	run  func() error
