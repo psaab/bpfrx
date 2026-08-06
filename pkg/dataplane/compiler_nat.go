@@ -332,12 +332,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri6}] = true
 						v6RuleIdx[zp] = ri6 + 1
 
-						slog.Info("source NAT off rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
+						if !isValidationPass(dp) {
+							slog.Info("source NAT off rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"from", rs.FromZone, "to", rs.ToZone,
+								"counter_id", counterID,
+								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+								"src_addr", srcAddr, "dst_addr", dstAddr)
+						}
 					}
 				}
 				continue
@@ -616,10 +618,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 									pnat.RegisterNATIP(addr, pool.Name)
 								}
 							}
-							slog.Info("persistent NAT pool registered",
-								"pool", pool.Name,
-								"timeout", timeout,
-								"permit", string(pool.PersistentNAT.Permit))
+							if !isValidationPass(dp) {
+								slog.Info("persistent NAT pool registered",
+									"pool", pool.Name,
+									"timeout", timeout,
+									"permit", string(pool.PersistentNAT.Permit))
+							}
 						}
 					}
 
@@ -707,13 +711,15 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						}
 						writtenSNATv6[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
 						v6RuleIdx[zp] = ri + 1
-						slog.Info("source NAT v6 rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"pool_id", curPoolID, "rule_idx", ri,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
+						if !isValidationPass(dp) {
+							slog.Info("source NAT v6 rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"from", rs.FromZone, "to", rs.ToZone,
+								"pool_id", curPoolID, "rule_idx", ri,
+								"counter_id", counterID,
+								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+								"src_addr", srcAddr, "dst_addr", dstAddr)
+						}
 					}
 				} // end dstAddr loop
 			} // end srcAddr loop
@@ -1040,13 +1046,15 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			}
 
 			count++
-			slog.Info("static NAT rule compiled",
-				"rule-set", rs.Name, "rule", rule.Name,
-				"external", rule.Match, "internal", rule.Then)
+			if !isValidationPass(dp) {
+				slog.Info("static NAT rule compiled",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"external", rule.Match, "internal", rule.Then)
+			}
 		}
 	}
 
-	if count > 0 {
+	if count > 0 && !isValidationPass(dp) {
 		slog.Info("static NAT compilation complete", "entries", count)
 	}
 
@@ -1172,14 +1180,16 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			written[outKey] = true
 
 			count++
-			slog.Info("nptv6 rule compiled",
-				"rule-set", rs.Name, "rule", rule.Name,
-				"external", rule.Match, "internal", rule.Then,
-				"prefix_len", extOnes)
+			if !isValidationPass(dp) {
+				slog.Info("nptv6 rule compiled",
+					"rule-set", rs.Name, "rule", rule.Name,
+					"external", rule.Match, "internal", rule.Then,
+					"prefix_len", extOnes)
+			}
 		}
 	}
 
-	if count > 0 {
+	if count > 0 && !isValidationPass(dp) {
 		slog.Info("nptv6 compilation complete", "rules", count)
 	}
 
@@ -1294,8 +1304,10 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				return fmt.Errorf("NAT64 rule-set %q: set pool config %d: %w",
 					rs.Name, newID, err)
 			}
-			slog.Info("auto-assigned NAT64 source pool",
-				"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
+			if !isValidationPass(dp) {
+				slog.Info("auto-assigned NAT64 source pool",
+					"pool", pool.Name, "pool_id", newID, "v4_ips", numV4, "v6_ips", numV6)
+			}
 		}
 
 		nat64Cfg := NAT64Config{
@@ -1307,9 +1319,11 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 		writtenPrefixes[NAT64PrefixKey{Prefix: nat64Cfg.Prefix}] = true
 
-		slog.Info("compiled NAT64 prefix",
-			"rule-set", rs.Name, "prefix", rs.Prefix,
-			"pool", rs.SourcePool, "pool_id", poolID)
+		if !isValidationPass(dp) {
+			slog.Info("compiled NAT64 prefix",
+				"rule-set", rs.Name, "prefix", rs.Prefix,
+				"pool", rs.SourcePool, "pool_id", poolID)
+		}
 		count++
 	}
 
@@ -1320,6 +1334,8 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	// Delete stale NAT64 entries.
 	dp.DeleteStaleNAT64(count, writtenPrefixes)
 
-	slog.Info("NAT64 compilation complete", "prefixes", count)
+	if !isValidationPass(dp) {
+		slog.Info("NAT64 compilation complete", "prefixes", count)
+	}
 	return nil
 }

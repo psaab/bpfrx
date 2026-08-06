@@ -1186,16 +1186,22 @@ func compileFlowTimeouts(dp DataPlane, cfg *config.Config) error {
 		}
 	}
 
-	// Log only if any non-default value was set.
+	// Log only if any non-default value was set, and only on the REAL pass:
+	// the pre-pass's SetFlowTimeout is a no-op, so logging here records
+	// "compiled" for a write that never happened and an operator reading the
+	// journal of a FAILED apply sees success followed by failure, for a
+	// compile whose result was thrown away (#6894 r8 F6).
 	for _, v := range timeouts {
 		if v > 0 {
-			slog.Info("flow timeouts compiled",
-				"tcp_established", timeouts[FlowTimeoutTCPEstablished],
-				"tcp_initial", timeouts[FlowTimeoutTCPInitial],
-				"tcp_closing", timeouts[FlowTimeoutTCPClosing],
-				"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
-				"udp", timeouts[FlowTimeoutUDP],
-				"icmp", timeouts[FlowTimeoutICMP])
+			if !isValidationPass(dp) {
+				slog.Info("flow timeouts compiled",
+					"tcp_established", timeouts[FlowTimeoutTCPEstablished],
+					"tcp_initial", timeouts[FlowTimeoutTCPInitial],
+					"tcp_closing", timeouts[FlowTimeoutTCPClosing],
+					"tcp_time_wait", timeouts[FlowTimeoutTCPTimeWait],
+					"udp", timeouts[FlowTimeoutUDP],
+					"icmp", timeouts[FlowTimeoutICMP])
+			}
 			break
 		}
 	}

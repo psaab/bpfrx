@@ -35,6 +35,21 @@ import (
 //
 //	slip = 12632/200000 = 0.0632 per trial      (uniform 1/9 would be 0.1111)
 //
+// And it is not a function of the ELEMENT COUNT either, which is the framing
+// everyone here reached for including me (#6894 r8 F3). It is a function of how
+// this fixture is BUILT. Independently measured over 200,000 constructions:
+//
+//	8 valid inserted first, offender last (what the builder below does) -> 0.0622
+//	offender inserted FIRST, then the 8 valid                           -> 0.31
+//
+// Same nine keys, same value type, same N: a factor of five from insertion
+// order alone. (In the real fixture zone-ok-0 comes first 0.31 of the time and
+// zone-ok-7 0.063 — nothing here is near 1/9.) So hoisting the offender's
+// assignment above the loop below is a refactor that changes no test, no N and
+// no constant, and silently takes the bound from ~1e-29 to ~1e-12. The rate is
+// measured for this builder AS WRITTEN; reorder it and re-measure rather than
+// rescaling.
+//
 // so k=24 trials leaves a reverted build passing with probability ~0.0632^24,
 // about 1e-29. The old text said "N^-k; at N=8 ... ~10^-21", which had the
 // wrong denominator (8, counting only the valid zones) AND the wrong model.

@@ -70810,3 +70810,74 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/compiler_prepass_fidelity_4960_test.go,
   pkg/dataplane/compiler_prepass_order_4960_test.go,
   pkg/dataplane/compiler_screenids_solewriter_4960_test.go, _Log.md
+
+## 2026-08-06 — #6894 r8: comparison-loop defect + validation-pass success logs
+
+- **Timestamp**: 2026-08-06
+- **Action**: Cherry-pick candidate on top of `e42fa044c`. Carries only what r7
+  does not already have or does better: the F4 comparison-loop defect a re-gate
+  found blocking, the F6 log gating, one F3 measurement, and two stale row-index
+  comments. Deliberately does NOT carry F1, F2, or the F5 ordering treatment.
+- **File(s)**: `pkg/dataplane/compiler.go`, `pkg/dataplane/compiler_nat.go`,
+  `pkg/dataplane/compiler_idprobe_4960_test.go`,
+  `pkg/dataplane/compiler_prepass_logging_4960_test.go` (new),
+  `pkg/dataplane/compiler_validate_4960.go`,
+  `pkg/dataplane/compiler_validate_4960_test.go`,
+  `pkg/dataplane/compiler_zone_screen_prepass_4960_test.go`, `_Log.md`
+
+- **F4 — the blocking half was ALREADY FIXED at `fdc19cab2` while this was
+  being written, so what remains is one level up.** That commit appended the
+  three names to the comparison list, which closes the immediate defect. The
+  failure mode, though, was a SECOND list falling out of sync with the returned
+  map — and a list that must be edited whenever a column is added can fall out
+  of sync again. This derives the key set from the map instead, so a new column
+  is compared the moment it exists. Measured on this tree with the same
+  mutation (seed `policySetID` from a package-level sequence): the eight-key
+  list was GREEN, the eleven-key list and the derived set are both RED on
+  `PolicyNames differs between pass 1 and pass 2`. So this is a
+  RECURRENCE-PREVENTION change, not a defect fix, and it should be graded as
+  one.
+- **F4, second half — `PolicyScheduleRuleSlots`, and the r8 refusal of it was
+  CORRECT on its own terms.** The r8 entry above records refusing this column
+  because `compiler.go` appends only under `if pol.SchedulerName != ""` and
+  neither probe policy set it, so it would have been nil-vs-nil. That reasoning
+  is right and the refusal was the correct call **for that fixture**. This
+  change removes the premise rather than overriding the conclusion: `p-single`
+  now carries `SchedulerName: "sched-6894"`, which reaches the sole writer, and
+  only then is the column added. Adding it without widening the fixture would
+  have been exactly the vacuous comparison r8 declined.
+  It is also the column that DISCRIMINATES: under the seeded-id mutation
+  `PolicyNames` and the slots both move while `PolicySets` (a count) does not,
+  and that asymmetry is only observable if the columns are genuinely consumed. Floors name the specific rule ids (0,1,2 -> p-multi/p-multi/p-single)
+  and the slot's `PolicySetID`/`RuleIndex`/`RuleID`, because a count-only floor is
+  satisfied by a shifted numbering.
+- **F6 — eleven INFO success records gated on `!isValidationPass(dp)`.** The
+  pre-pass's writes are no-ops, so "static NAT compilation complete" and
+  friends recorded success for work that never happened; on a failed apply the
+  journal read success-then-failure for a compile whose result was discarded.
+  Two-way grid, both verified at this head: removing one gate REDs
+  `TestPrePassLogsNoSuccessForWorkItDidNotDo_4960` ("the pre-pass logged 1
+  success record(s)..."), and over-widening it to suppress BOTH passes REDs
+  `TestRealPassStillLogsItsSuccesses_4960` ("the REAL pass no longer logs ...").
+  WARN duplication is left alone and stays on #6903 — noise, not a false claim.
+- **F3 — one measurement, not a rewrite.** r7 already corrected the "coin flip"
+  and uniformity errors and measured 0.0632. What it does not say is that the
+  rate is a property of the fixture's INSERTION ORDER rather than of N: measured
+  over 200,000 constructions, 8-valid-then-offender gives 0.0622 while
+  offender-first gives **0.31** — same nine keys, same value type, factor of
+  five. So hoisting the offender's assignment above the builder loop is a
+  refactor that changes no test, no N and no constant, and silently moves the
+  24-trial bound from ~1e-29 to ~1e-12. Recorded next to the constant.
+- **F5 — two stale comments only.** The r7 reorder moved every row index but no
+  row name, and three comments still said "row 2 / row 3 / row 5 / row 7".
+  Replaced with row NAMES so they cannot rot on the next insertion.
+- **NOT CARRIED, deliberately.** F1: the premise was refuted — the production
+  compile dataplane is `userspaceShimCompileDataplane`, whose
+  `SetAddressBookEntry` is itself a no-op, and `NewDataPlane` refuses the eBPF
+  `Manager`, so there is no divergence on a reachable path and the delegation
+  machinery is unnecessary on an apply path. F2: r7's sole-writer +
+  key-set-mirror pair proves the two screen maps cannot disagree, which is
+  stronger than binding each lookup behind a fixture — and a fixture that seeds
+  them divergently now describes a state production cannot reach. F5 ordering:
+  r7 moved the row to first and derives the order from `CompileConfig`, which
+  makes the claim true and bound rather than merely dropped.

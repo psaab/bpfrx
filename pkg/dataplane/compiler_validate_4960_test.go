@@ -572,8 +572,11 @@ func TestEachValidationPhaseRowRunsItsOwnCompiler_4960(t *testing.T) {
 			phase: "policies",
 			dp:    discardingDataPlane{},
 			cfg: emptyCfgWith(func(c *config.Config) {
-				// Applications resolvable, so row 2 passes and row 3 is what
-				// rejects: the from-zone has no ZoneID.
+				// Applications resolvable, so the `applications` row passes and
+				// `policies` is what rejects: the from-zone has no ZoneID.
+				// Named, not numbered — the r7 reorder moved every index but no
+				// name, and these three comments did not move with them
+				// (#6894 r8 F5).
 				c.Security.Policies = []*config.ZonePairPolicies{{
 					FromZone: "no-such-zone-6894", ToZone: "untrust",
 					Policies: []*config.Policy{{
@@ -629,7 +632,8 @@ func TestEachValidationPhaseRowRunsItsOwnCompiler_4960(t *testing.T) {
 			dp:    failOneDP{fail: "SetNPTv6Rule"},
 			cfg: emptyCfgWith(func(c *config.Config) {
 				// A VALID NPTv6 rule: compileStaticNAT skips IsNPTv6 rules, so
-				// row 5 passes and row 7 reaches its dataplane write.
+				// the `static nat` row passes and `nptv6` reaches its dataplane
+				// write. Named, not numbered (#6894 r8 F5).
 				c.Security.NAT.Static = []*config.StaticNATRuleSet{{
 					Name: "rs-npt",
 					Rules: []*config.StaticNATRule{{

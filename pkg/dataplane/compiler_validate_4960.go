@@ -57,7 +57,7 @@ package dataplane
 //   - `buildSnapshotWithSchedulerStateAndNATCounters`
 //     (userspace/manager_compile.go), whose builders return errors (#2514,
 //     #3438, #3772). The #3438 address-book case specifically IS caught
-//     earlier, by `compileApplications` (row 2 below), which is why the
+//     earlier, by `compileApplications` (the `applications` row below), which is why the
 //     headline example above holds; the builder family as a whole is not.
 //
 // So the guarantee this file provides is bounded to the phases in

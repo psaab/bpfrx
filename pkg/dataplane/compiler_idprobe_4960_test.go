@@ -193,6 +193,14 @@ func idProbeConfig() *config.Config {
 						Applications:         []string{"app-dns"},
 					},
 					Action: config.PolicyPermit,
+					// #6894 r8 F4: the ONLY writer of
+					// result.PolicyScheduleRuleSlots is compilePolicies'
+					// `if pol.SchedulerName != ""` branch (compiler.go).
+					// Without a scheduled policy that column is an
+					// empty-vs-empty DeepEqual forever. compilePolicies does
+					// not resolve the name against cfg.Schedulers — it records
+					// the slot verbatim — so a name alone reaches the writer.
+					SchedulerName: "sched-6894",
 				},
 			},
 		},
@@ -400,6 +408,13 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 		"PolicyNames": result.PolicyNames,
 		"PolicySets":  result.PolicySets,
 		"AppNames":    result.AppNames,
+		// #6894 r8 F4: the scheduler's view of the SAME rule numbering.
+		// PolicyNames is keyed by RuleID, so a shifted policySetID moves its
+		// keys; this slice carries PolicySetID, RuleIndex and RuleID as
+		// FIELDS, which is what UpdatePolicyScheduleState later indexes by
+		// (maps_policy.go). A drift the PolicyNames key set happened to absorb
+		// still shows here, and the two disagreeing is itself the finding.
+		"PolicyScheduleRuleSlots": result.PolicyScheduleRuleSlots,
 		// Scalar, not a map: an off-by-one in the NAT64 auto-assign branch
 		// would leave every map above identical while the next pool allocated
 		// collides with an existing one.
@@ -428,17 +443,37 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	first := compileIDsOnce(t, cfg)  // the discarded validate pass
 	second := compileIDsOnce(t, cfg) // the real pass that programs the dataplane
 
-	// #6894 r8 F1: PolicyNames / PolicySets / AppNames were ADDED to the driver's
-	// return map a round earlier and never added HERE, so nothing read them. A
-	// package-level counter perturbing result.PolicyNames across passes left this
-	// test PASSING while the identical mutation shape on implicitSets — a
-	// compared column — reds. Three columns were requested, three columns
-	// appeared, and the property stayed unmeasured. When adding a column to a
-	// comparison-driven test the acceptance check is a MUTATION IN THAT COLUMN,
-	// never the column's presence.
-	for _, k := range []string{"ZoneIDs", "ScreenIDs", "AddrIDs", "AppIDs",
-		"PoolIDs", "NATCounterIDs", "implicitSets", "NextPoolID",
-		"PolicyNames", "PolicySets", "AppNames"} {
+	// EVERY key compileIDsOnce returns, derived from the map rather than
+	// re-listed (#6894 r8).
+	//
+	// The history is the argument. PolicyNames / PolicySets / AppNames were
+	// added to the driver's return map with non-vacuity floors and NOT to this
+	// loop, so nothing read them: a package-level counter perturbing
+	// result.PolicyNames across passes left this test PASSING while the
+	// identical mutation on implicitSets — a compared column — RED'd. That was
+	// fixed by extending the list to eleven names. Deriving the key set instead
+	// closes the same hole one level up: the failure mode was a SECOND list
+	// falling out of sync with the first, and a list that must be edited when a
+	// column is added can fall out of sync again. A derived set compares a new
+	// column the moment it exists.
+	//
+	// The floors below stay, and are not redundant with this: a column that is
+	// present but empty compares clean forever ({} DeepEquals {}), which this
+	// loop cannot see. Adding a column needs BOTH — membership here, and a
+	// floor that fails if the fixture stops producing it.
+	//
+	// Acceptance for a new column is a MUTATION IN THAT COLUMN, never the
+	// column's presence.
+	keys := make([]string, 0, len(first))
+	for k := range first {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if len(keys) == 0 {
+		t.Fatal("compileIDsOnce returned no columns at all")
+	}
+
+	for _, k := range keys {
 		if !reflect.DeepEqual(first[k], second[k]) {
 			t.Errorf("%s differs between pass 1 and pass 2 — a discarded "+
 				"validate pre-pass would PERTURB the IDs the live dataplane is "+
@@ -484,6 +519,39 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 			"zero means no set was compiled and a double-increment regression could " +
 			"not show here")
 	}
+	// #6894 r8 F4: name the SPECIFIC rule ids, not merely "non-empty". p-multi
+	// expands to 2 app ids and p-single to 1, so the trust->untrust set
+	// (policySetID 0) occupies rule ids 0,1,2 — and a seeded set id moves all
+	// three. A count-only floor is satisfied by a shifted numbering; this is
+	// not.
+	for id, wantName := range map[uint32]string{0: "p-multi", 1: "p-multi", 2: "p-single"} {
+		got, ok := policyNames[id]
+		if !ok || got != wantName {
+			t.Errorf("PolicyNames[%d] is %q (present=%v), want %q — the policy id "+
+				"space is not being measured as written: either the fixture's "+
+				"policies changed shape or the rule-id numbering shifted "+
+				"(#6894 r8 F4)\n  have: %v", id, got, ok, wantName, policyNames)
+		}
+	}
+
+	// The scheduler slot's id FIELDS. This column is what DISCRIMINATES: under
+	// a seeded policySetID, PolicyNames and this both move while PolicySets (a
+	// count) does not — so a fix that wired only some of the columns into the
+	// comparison loop shows up as exactly that asymmetry.
+	slots := first["PolicyScheduleRuleSlots"].([]PolicyScheduleRuleSlot)
+	if len(slots) != 1 {
+		t.Fatalf("want exactly 1 scheduled policy slot from the fixture, got %d — "+
+			"an empty slice DeepEquals an empty slice, so this column would be "+
+			"vacuous (#6894 r8 F4)\n  have: %v", len(slots), slots)
+	}
+	if sl := slots[0]; sl.PolicyName != "p-single" || sl.SchedulerName != "sched-6894" ||
+		sl.PolicySetID != 0 || sl.RuleIndex != 2 || sl.RuleID != 2 {
+		t.Errorf("scheduled slot is %+v, want {PolicySetID:0 RuleIndex:2 RuleID:2 "+
+			"PolicyName:p-single SchedulerName:sched-6894} — the scheduler's view "+
+			"of the rule numbering has drifted from the policy compiler's, and "+
+			"UpdatePolicyScheduleState indexes by these fields (#6894 r8 F4)", sl)
+	}
+
 	if n := len(first["AppNames"].(map[uint16]string)); n == 0 {
 		t.Error("AppNames is empty — compileApplications populates it for every " +
 			"catalogued app, so this column would compare empty against empty")
