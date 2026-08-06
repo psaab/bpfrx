@@ -68309,3 +68309,47 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #4960 r2: stop the negative control from stripping a root host's interfaces (#6894 F1/F2/F3)
+- **Timestamp**: 2026-08-06
+- **Action**: F1 (MAJOR, test safety) —
+  `TestValidConfigStillReachesZoneCompile_4960` drove `CompileConfig` all the
+  way through `compileZones`, whose tail `stripUnmanagedInterfaces` enumerates
+  the REAL host and runs `netlink.AddrDel` + `netlink.LinkSetDown` (and
+  `LinkDel` for a bond) on every unmanaged link. Confirmed firsthand with an
+  instrumented panic at `compiler_iface.go:1255`: it fired on `eno2` via
+  `compiler_validate_4960_test.go:117`. Unprivileged that is EPERM; as root it
+  black-holes host networking. Fixed with a #5268-style tripwire —
+  `recordingDP.SetZoneConfig` counts the call and then returns
+  `errStopBeforeHostReconcile`, which halts `programZoneMaps` before
+  `mapZoneInterface` and therefore before `ensureVLANSubInterface`,
+  `reconcileInterfaceAddresses`, the ethtool/procfs writes and the strip.
+  The control stays live: `errors.Is` on that sentinel is reachable only after
+  the pre-pass has PASSED the config. Removed `skipIfCouldMutateAHost` — it
+  guarded only the two fixture names while the exposure was the host's other
+  50+ links, and the tripwire subsumes it unconditionally at any euid.
+  F2 — named the three fallible steps that run AFTER the mutation and BEFORE
+  the snapshot publishes (`preflightCheckIfindexCaps`, structurally
+  unhoistable; `attachUserspaceShimXDP`, the reachable one;
+  `buildSnapshotWithSchedulerStateAndNATCounters`), so "bounded" has a stated
+  boundary. F3 — `TestValidationPhaseTableMatchesDocumentedCoverage_4960`
+  asserts only `got[i].name`, so it binds INDEX -> NAME and nothing else;
+  added `TestEachValidationPhaseRowRunsItsOwnCompiler_4960` to bind
+  NAME -> BODY for all twelve rows.
+- **Validation**: `go build ./...` exit 0. `go test ./pkg/dataplane/...
+  ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. All runs at uid 1000.
+  F1 proof: with the panic probe armed in `stripUnmanagedInterfaces` the WHOLE
+  `pkg/dataplane` package passes; neutralising the tripwire (`return nil`) with
+  the probe still armed re-fires it on `eno2`. Pre-pass revert (move
+  `validateBeforeMutate` after `compileZones`) reds both no-mutation tests as
+  ASSERTIONS — "compileZones RAN before the failing phase was caught (1
+  SetZoneConfig calls)" — and the revert path is itself now host-safe.
+  F3 proof: gutting the ten unbound row bodies to `func() error { return nil }`
+  reds exactly those ten subtests ("row %q accepted an input its own compiler
+  rejects"); `applications` and `nat` stay green, and
+  `TestValidationPhaseTableMatchesDocumentedCoverage_4960` stays GREEN through
+  it, which is the gap. Swapping the `static nat` / `nat64` bodies with names
+  intact reds both on the `validate <name>: ` prefix.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go, _Log.md

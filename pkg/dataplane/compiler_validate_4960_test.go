@@ -4,13 +4,38 @@ package dataplane
 // dataplane phase must leave the host UNMUTATED.
 
 import (
-	"net"
-	"os"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
 )
+
+// errStopBeforeHostReconcile is a #5268-style tripwire (the idiom is
+// documented at compiler_rxvlan_failclosed_5268_test.go): a sentinel returned
+// by recordingDP.SetZoneConfig AFTER the probe has counted the call. It is
+// what makes the control test below safe to run.
+//
+// compileZones cannot be driven to completion in a unit test. Its tail calls
+// stripUnmanagedInterfaces (compiler_iface.go), which enumerates the REAL host
+// via net.Interfaces() and, for every link that is not `lo`, not in this config
+// and not daemon-owned, runs netlink.AddrDel then netlink.LinkSetDown -- and
+// netlink.LinkDel outright for a bond. Measured, not inferred: an instrumented
+// panic at compiler_iface.go:1255 fired on `eno2` through
+// TestValidConfigStillReachesZoneCompile_4960 -> CompileConfig -> compileZones,
+// with 50+ further links behind it. Unprivileged those netlink calls fail with
+// EPERM; as ROOT the test black-holes the host's networking (#6894 r2 F1).
+//
+// programZoneMaps calls SetZoneConfig once per zone BEFORE iterating that
+// zone's interfaces, so failing the FIRST call halts the compile after the
+// probe has recorded "compileZones was entered" and before mapZoneInterface --
+// therefore before ensureVLANSubInterface, reconcileInterfaceAddresses, the
+// ethtool/procfs writes, and the stripUnmanagedInterfaces tail. That is
+// strictly stronger than the euid+name skip it replaces, which guarded only
+// the two fixture interface names while the hazard was every OTHER link on the
+// host.
+var errStopBeforeHostReconcile = errors.New(
+	"recordingDP tripwire: compileZones was entered (SetZoneConfig reached)")
 
 // recordingDP counts the dataplane calls that mark how far CompileConfig got.
 // SetZoneConfig is the probe for host mutation: programZoneMaps calls it once
@@ -18,18 +43,25 @@ import (
 // the only caller of ensureVLANSubInterface / reconcileInterfaceAddresses, the
 // only destructive netlink in the whole compile -- runs inside that iteration.
 // So zero SetZoneConfig calls proves compileZones never started, which proves
-// no host mutation occurred. SetVlanIfaceInfo is the tighter inner probe: it is
-// invoked immediately after a successful ensureVLANSubInterface, so a nonzero
-// count means a VLAN device was actually created.
+// no host mutation occurred; one call proves it started and then stopped on the
+// tripwire.
+//
+// vlanIfaceInfoCall and ifaceSetupCalls are the inner probes, and they exist to
+// make the tripwire's guarantee an ASSERTED fact rather than a structural
+// argument. Every one of them is reached only from inside mapZoneInterface --
+// SetVlanIfaceInfo immediately after a successful ensureVLANSubInterface,
+// SetZone/AddTxPort during the one-time per-phys host setup -- so a nonzero
+// count means execution got past the tripwire into the host-touching half.
 type recordingDP struct {
 	discardingDataPlane
 	zoneConfigCalls   int
 	vlanIfaceInfoCall int
+	ifaceSetupCalls   int
 }
 
 func (r *recordingDP) SetZoneConfig(zoneID uint16, zc ZoneConfig) error {
 	r.zoneConfigCalls++
-	return nil
+	return errStopBeforeHostReconcile
 }
 
 func (r *recordingDP) SetVlanIfaceInfo(subIfindex, parentIfindex int, vlanID uint16) error {
@@ -89,11 +121,22 @@ func TestNoHostMutationWhenALaterPhaseFails_4960(t *testing.T) {
 		t.Fatal("expected the unresolvable application reference to fail the " +
 			"compile — the fixture no longer exercises a later-phase failure")
 	}
+	// Checked BEFORE the error identity: on a revert the tripwire changes the
+	// error text, so the identity assertion would fire first and bury the
+	// finding that actually matters.
+	assertNoHostMutation(t, dp)
 	if !strings.Contains(err.Error(), "no-such-application-4960") {
 		t.Fatalf("failed for the wrong reason, so this test would not bind the "+
 			"property: %v", err)
 	}
+}
 
+// assertNoHostMutation asserts that CompileConfig never entered compileZones.
+// Zero SetZoneConfig calls is the outer proof (compileZones never started);
+// the two inner counters are asserted alongside so a future change that makes
+// the tripwire fire later still reports which half was reached.
+func assertNoHostMutation(t *testing.T, dp *recordingDP) {
+	t.Helper()
 	if dp.zoneConfigCalls != 0 {
 		t.Errorf("compileZones RAN before the failing phase was caught "+
 			"(%d SetZoneConfig calls) — the host was mutated before a later "+
@@ -104,33 +147,62 @@ func TestNoHostMutationWhenALaterPhaseFails_4960(t *testing.T) {
 			"caught (%d SetVlanIfaceInfo calls) — destructive netlink ran and "+
 			"has no undo path (#4960)", dp.vlanIfaceInfoCall)
 	}
+	if dp.ifaceSetupCalls != 0 {
+		t.Errorf("per-interface host setup RAN before the failing phase was "+
+			"caught (%d SetZone/AddTxPort calls) — mapZoneInterface reconciles "+
+			"addresses and writes ethtool/procfs from there (#4960)",
+			dp.ifaceSetupCalls)
+	}
 }
 
 // Control: a VALID config must still reach compileZones. Without this the test
 // above is satisfied by a pre-pass that rejects everything, or by CompileConfig
 // failing before it does any work at all.
+//
+// It reaches compileZones and stops there, on the SetZoneConfig tripwire; see
+// errStopBeforeHostReconcile for why running the phase to completion is not an
+// option. The control is still live: the tripwire is reachable only after
+// validateBeforeMutate has passed the config, so a pre-pass that rejected good
+// configs would surface a `validate ...` error here instead, and a phase
+// reorder that moved compileZones ahead of the pre-pass would too.
 func TestValidConfigStillReachesZoneCompile_4960(t *testing.T) {
 	dp := &recordingDP{}
 	cfg := failLaterPhaseConfig()
 	cfg.Security.Policies[0].Policies[0].Match.Applications = []string{"any"} // now resolvable
 
 	_, err := CompileConfig(dp, cfg, false)
-	if err != nil {
-		t.Fatalf("valid config must compile: %v", err)
+	if !errors.Is(err, errStopBeforeHostReconcile) {
+		t.Fatalf("a VALID config did not reach compileZones — the pre-pass is "+
+			"rejecting good configs, or the phase order changed. want the "+
+			"SetZoneConfig tripwire, got: %v", err)
 	}
-	if dp.zoneConfigCalls == 0 {
-		t.Fatal("a VALID config did not reach compileZones — the pre-pass is " +
-			"rejecting good configs, or the phase order changed")
+	if dp.zoneConfigCalls != 1 {
+		t.Errorf("want exactly 1 SetZoneConfig call (the tripwire fires on the "+
+			"first zone), got %d", dp.zoneConfigCalls)
+	}
+	// The safety property, asserted rather than argued: nothing past the
+	// tripwire ran, so ensureVLANSubInterface / reconcileInterfaceAddresses /
+	// stripUnmanagedInterfaces were unreachable from this test.
+	if dp.vlanIfaceInfoCall != 0 || dp.ifaceSetupCalls != 0 {
+		t.Errorf("the tripwire did NOT halt before per-interface host work "+
+			"(%d SetVlanIfaceInfo, %d SetZone/AddTxPort) — mapZoneInterface ran, "+
+			"so compileZones' host-mutating tail is reachable from this unit "+
+			"test and it would take a root host's interfaces DOWN (#6894 r2 F1)",
+			dp.vlanIfaceInfoCall, dp.ifaceSetupCalls)
 	}
 }
 
 // The pre-pass shim deliberately nil-panics on any method it does not
-// override, so it cannot carry a FULL CompileConfig run. The control test needs
-// one, because proving a valid config still reaches compileZones means letting
-// the whole function execute. These stubs cover the rest of the compiler's
-// dataplane surface for that purpose only.
-func (*recordingDP) AddTxPort(ifindex int) error { return nil }
-func (*recordingDP) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8, screenFlags uint32) error {
+// override, so it cannot carry a CompileConfig run that enters compileZones.
+// These stubs cover the rest of the compiler's dataplane surface for that
+// purpose only.
+//
+// AddTxPort and SetZone are NOT inert here: both are reached only from inside
+// mapZoneInterface, so they double as the "execution passed the tripwire"
+// counter the control test asserts is zero.
+func (r *recordingDP) AddTxPort(ifindex int) error { r.ifaceSetupCalls++; return nil }
+func (r *recordingDP) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8, screenFlags uint32) error {
+	r.ifaceSetupCalls++
 	return nil
 }
 func (*recordingDP) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) error { return nil }
@@ -145,26 +217,20 @@ func (*recordingDP) DeleteStaleVlanIface(written map[uint32]bool)               
 func (*recordingDP) DeleteStaleIfaceFilter(written map[IfaceFilterKey]bool)            {}
 func (*recordingDP) ZeroStaleFilterConfigs(startID uint32)                             {}
 
-// #6894 r1 F4: this file is the first test in pkg/dataplane to drive
-// compileZones to completion. Once cachedInterfaceByName(physName) SUCCEEDS the
-// path runs LinkAdd/LinkSetUp, AddrDel/AddrAdd, `ethtool -K/-G` and
-// os.WriteFile("/proc/sys/net/core/rps_sock_flow_entries", ...). The fixture
-// therefore uses names outside the vSRX scheme (config.LinuxIfName only maps
-// "/"->"-", so "ge-0-0-0.50" is byte-identical to a real interface on the
-// standalone VM and on loss cluster node 0). This belt refuses to run as root
-// if the name ever does collide with a live link.
-func skipIfCouldMutateAHost(t *testing.T, names ...string) {
-	t.Helper()
-	if os.Geteuid() != 0 {
-		return
-	}
-	for _, n := range names {
-		if _, err := net.InterfaceByName(n); err == nil {
-			t.Skipf("refusing to run as root with a live %q: compileZones would "+
-				"reconfigure a real interface", n)
-		}
-	}
-}
+// #6894 r1 F4 introduced a euid+name belt here (skipIfCouldMutateAHost): as
+// root, skip if either FIXTURE interface name resolved to a live link, on the
+// theory that mapZoneInterface would then reconfigure a real interface. It was
+// removed in r2 because it was aimed at the wrong hazard and covered a
+// vanishing slice of it. Once compileZones runs at all, its tail strips EVERY
+// unmanaged link on the box, so the two fixture names were never the exposure
+// -- the host's other 50 were. errStopBeforeHostReconcile replaces it: the
+// tripwire halts before mapZoneInterface unconditionally, at any euid, for any
+// host interface inventory, and the control test ASSERTS that it did.
+//
+// The fixture still deliberately uses names outside the vSRX scheme
+// (config.LinuxIfName only maps "/"->"-", so "ge-0-0-0.50" would be
+// byte-identical to a real interface on the standalone VM and on loss cluster
+// node 0). That is now defence in depth rather than the only belt.
 
 // #6894 r1 F1: a SECOND binding fixture, from a DIFFERENT phase. The
 // application fixture pins exactly one row of the phase table; with only that
@@ -187,19 +253,15 @@ func failLaterNATPhaseConfig() *config.Config {
 }
 
 func TestNoHostMutationWhenNATPhaseFails_4960(t *testing.T) {
-	skipIfCouldMutateAHost(t, "xpft4960a", "xpft4960b")
 	dp := &recordingDP{}
 
 	_, err := CompileConfig(dp, failLaterNATPhaseConfig(), false)
 	if err == nil {
 		t.Fatal("expected the unresolvable NAT pool to fail the compile")
 	}
+	assertNoHostMutation(t, dp)
 	if !strings.Contains(err.Error(), "no-such-pool-4960") {
 		t.Fatalf("failed for the wrong reason: %v", err)
-	}
-	if dp.zoneConfigCalls != 0 || dp.vlanIfaceInfoCall != 0 {
-		t.Errorf("host was mutated before the NAT phase failed: %d SetZoneConfig, "+
-			"%d SetVlanIfaceInfo (#4960)", dp.zoneConfigCalls, dp.vlanIfaceInfoCall)
 	}
 }
 
@@ -208,6 +270,13 @@ func TestNoHostMutationWhenNATPhaseFails_4960(t *testing.T) {
 // the doc comment claims. Deleting rows is invisible to every behavioural test
 // that does not happen to exercise the deleted phase, so the coverage sentence
 // is pinned here directly.
+//
+// SCOPE, because this test's claim was overstated at r1 (#6894 r2 F3): it
+// asserts on got[i].name and NOTHING else, so it binds INDEX -> NAME. Replacing
+// the BODY of a row with `func() error { return nil }`, leaving names and order
+// intact, was measured to keep the whole package GREEN for ten of the twelve
+// rows. TestEachValidationPhaseRowRunsItsOwnCompiler_4960 below is what binds
+// NAME -> BODY; neither test substitutes for the other.
 func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 	want := []string{
 		"address book", "applications", "policies", "nat", "static nat",
@@ -238,5 +307,255 @@ func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 func TestPrePassShimCoversTheCalledSurface_4960(t *testing.T) {
 	if err := validateBeforeMutate(idProbeConfig()); err != nil {
 		t.Fatalf("rich config must validate clean: %v", err)
+	}
+}
+
+// errPhaseBodyProbe is the sentinel failOneDP hands back from whichever single
+// dataplane method a case names.
+var errPhaseBodyProbe = errors.New("phase-body probe: this dp method was called")
+
+// failOneDP fails EXACTLY ONE dataplane method and succeeds at everything else.
+//
+// It exists for the five rows that have no config-shaped hard error at all --
+// nptv6, screen profiles, default policy, flow timeouts, flow config. Read
+// their compilers: every bad input inside them is `slog.Warn(...); continue`
+// (compileNPTv6 soft-skips an unparseable prefix, a length mismatch and a
+// non-/48-or-/64 length alike), and the ONLY `return err` in each is the
+// dataplane call. Handing that call a failure is therefore the sole way to make
+// those rows produce an error, and without it they cannot be bound to their
+// bodies by any config whatsoever.
+//
+// Each of the five methods below has exactly one caller in the compiler
+// (verified by grep over pkg/dataplane), so the row a failure surfaces at is
+// unambiguous.
+type failOneDP struct {
+	discardingDataPlane
+	fail string
+}
+
+func (d failOneDP) errIf(method string) error {
+	if d.fail == method {
+		return errPhaseBodyProbe
+	}
+	return nil
+}
+
+func (d failOneDP) SetNPTv6Rule(NPTv6Key, NPTv6Value) error    { return d.errIf("SetNPTv6Rule") }
+func (d failOneDP) SetScreenConfig(uint32, ScreenConfig) error { return d.errIf("SetScreenConfig") }
+func (d failOneDP) SetDefaultPolicy(uint8) error               { return d.errIf("SetDefaultPolicy") }
+func (d failOneDP) SetFlowTimeout(idx, seconds uint32) error   { return d.errIf("SetFlowTimeout") }
+func (d failOneDP) SetFlowConfig(FlowConfigValue) error        { return d.errIf("SetFlowConfig") }
+
+// emptyCfgWith returns a config that is empty except for what fn sets. Every
+// phase is a no-op over an empty config, so a per-row fixture reaches its own
+// row without tripping an earlier one.
+func emptyCfgWith(fn func(*config.Config)) *config.Config {
+	cfg := &config.Config{}
+	fn(cfg)
+	return cfg
+}
+
+// #6894 r2 F3: bind NAME -> BODY for every row.
+//
+// TestValidationPhaseTableMatchesDocumentedCoverage_4960 asserts only
+// got[i].name, so it protects the LABEL. Measured at r2: replacing the BODY of
+// the ten rows with no behavioural fixture with `func() error { return nil }`,
+// names and order untouched, left the entire package GREEN — address book,
+// policies, static nat, nat64, nptv6, screen profiles, default policy, flow
+// timeouts, firewall filter protocols and flow config could all silently stop
+// validating.
+//
+// Each case here drives the REAL pre-pass over an input the row's own compiler
+// rejects and requires the error back prefixed `validate <that row's name>: `.
+// A gutted body returns nil and reds; a body swapped with a sibling's surfaces
+// under the sibling's name and reds on the prefix. The prefix comes from
+// production (validateBeforeMutateWith), not from a reimplementation here, so
+// the wrapping is bound too.
+func TestEachValidationPhaseRowRunsItsOwnCompiler_4960(t *testing.T) {
+	cases := []struct {
+		phase string    // must equal the row's name in validationPhases
+		dp    DataPlane // discardingDataPlane{} unless the row needs a dp failure
+		cfg   *config.Config
+		want  string // substring identifying the phase's OWN rejection
+	}{
+		{
+			phase: "address book",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				c.Security.AddressBook = &config.AddressBook{
+					Addresses: map[string]*config.Address{},
+					AddressSets: map[string]*config.AddressSet{
+						"srv": {Name: "srv", Addresses: []string{"no-such-address-6894"}},
+					},
+				}
+			}),
+			want: "no-such-address-6894",
+		},
+		{
+			phase: "applications",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				c.Security.Policies = []*config.ZonePairPolicies{{
+					FromZone: "trust", ToZone: "untrust",
+					Policies: []*config.Policy{{
+						Name:   "p",
+						Match:  config.PolicyMatch{Applications: []string{"no-such-application-6894"}},
+						Action: config.PolicyPermit,
+					}},
+				}}
+			}),
+			want: "no-such-application-6894",
+		},
+		{
+			phase: "policies",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				// Applications resolvable, so row 2 passes and row 3 is what
+				// rejects: the from-zone has no ZoneID.
+				c.Security.Policies = []*config.ZonePairPolicies{{
+					FromZone: "no-such-zone-6894", ToZone: "untrust",
+					Policies: []*config.Policy{{
+						Name:   "p",
+						Match:  config.PolicyMatch{Applications: []string{"any"}},
+						Action: config.PolicyPermit,
+					}},
+				}}
+			}),
+			want: "no-such-zone-6894",
+		},
+		{
+			phase: "nat",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				c.Security.NAT.Source = []*config.NATRuleSet{{
+					Name: "rs", FromZone: "no-such-nat-zone-6894", ToZone: "untrust",
+					Rules: []*config.NATRule{{
+						Name:  "r1",
+						Match: config.NATMatch{SourceAddress: "10.0.0.0/8"},
+						Then:  config.NATThen{Type: config.NATSource, Interface: true},
+					}},
+				}}
+			}),
+			want: "no-such-nat-zone-6894",
+		},
+		{
+			phase: "static nat",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				c.Security.NAT.Static = []*config.StaticNATRuleSet{{
+					Name: "rs-static",
+					Rules: []*config.StaticNATRule{{
+						Name: "r-mixed-6894", Match: "192.0.2.50", Then: "2001:db8::1",
+					}},
+				}}
+			}),
+			want: "r-mixed-6894",
+		},
+		{
+			phase: "nat64",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				// /64 rather than the required /96.
+				c.Security.NAT.NAT64 = []*config.NAT64RuleSet{
+					{Name: "rs64-6894", Prefix: "64:ff9b::/64"},
+				}
+			}),
+			want: "rs64-6894",
+		},
+		{
+			phase: "nptv6",
+			dp:    failOneDP{fail: "SetNPTv6Rule"},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				// A VALID NPTv6 rule: compileStaticNAT skips IsNPTv6 rules, so
+				// row 5 passes and row 7 reaches its dataplane write.
+				c.Security.NAT.Static = []*config.StaticNATRuleSet{{
+					Name: "rs-npt",
+					Rules: []*config.StaticNATRule{{
+						Name: "npt", IsNPTv6: true,
+						Match: "2001:db8:1::/48", Then: "fd00:1::/48",
+					}},
+				}}
+			}),
+			want: "set nptv6 inbound",
+		},
+		{
+			phase: "screen profiles",
+			dp:    failOneDP{fail: "SetScreenConfig"},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				// The pre-pass prelude assigns ScreenIDs, so the profile is
+				// resolvable and compileScreenProfiles reaches SetScreenConfig.
+				c.Security.Screen = map[string]*config.ScreenProfile{
+					"sp-6894": {Name: "sp-6894"},
+				}
+			}),
+			want: "set screen config sp-6894",
+		},
+		{
+			phase: "default policy",
+			dp:    failOneDP{fail: "SetDefaultPolicy"},
+			cfg:   emptyCfgWith(func(*config.Config) {}), // called unconditionally
+			want:  "set default policy",
+		},
+		{
+			phase: "flow timeouts",
+			dp:    failOneDP{fail: "SetFlowTimeout"},
+			cfg:   emptyCfgWith(func(*config.Config) {}), // called unconditionally
+			want:  "set flow timeout",
+		},
+		{
+			phase: "firewall filter protocols",
+			dp:    discardingDataPlane{},
+			cfg: emptyCfgWith(func(c *config.Config) {
+				c.Firewall.FiltersInet = map[string]*config.FirewallFilter{
+					"f": {Name: "f", Terms: []*config.FirewallFilterTerm{
+						{Name: "t", Protocols: []string{"bogus-proto-6894"}},
+					}},
+				}
+			}),
+			want: "bogus-proto-6894",
+		},
+		{
+			phase: "flow config",
+			dp:    failOneDP{fail: "SetFlowConfig"},
+			cfg:   emptyCfgWith(func(*config.Config) {}), // called unconditionally
+			want:  errPhaseBodyProbe.Error(),             // compileFlowConfig returns the dp error unwrapped
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.phase, func(t *testing.T) {
+			err := validateBeforeMutateWith(tc.dp, tc.cfg)
+			if err == nil {
+				t.Fatalf("row %q accepted an input its own compiler rejects — "+
+					"the row's BODY no longer validates anything (#6894 r2 F3)",
+					tc.phase)
+			}
+			if prefix := "validate " + tc.phase + ": "; !strings.HasPrefix(err.Error(), prefix) {
+				t.Fatalf("row %q rejected under the wrong name: want prefix %q, "+
+					"got %q — a row's name and body have come apart, or the row "+
+					"moved behind a phase that now rejects first",
+					tc.phase, prefix, err.Error())
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("row %q rejected for the wrong reason: want a message "+
+					"containing %q, got %q — the fixture may no longer reach the "+
+					"rejection it was written for", tc.phase, tc.want, err.Error())
+			}
+		})
+	}
+
+	// Completeness: a row added to validationPhases without a rejection case
+	// here would otherwise be name-bound only, which is the gap this test
+	// exists to close.
+	covered := make(map[string]bool, len(cases))
+	for _, tc := range cases {
+		covered[tc.phase] = true
+	}
+	for _, p := range validationPhases(discardingDataPlane{}, &config.Config{}, newValidationResult()) {
+		if !covered[p.name] {
+			t.Errorf("phase %q has no rejection case in this test, so its BODY "+
+				"is unbound: it could be replaced with `func() error { return nil }` "+
+				"and the suite would stay green (#6894 r2 F3)", p.name)
+		}
 	}
 }

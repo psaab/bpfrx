@@ -36,6 +36,33 @@ package dataplane
 // what happens AFTER the dataplane is asked; this is about not wrecking the
 // host BEFORE it is asked. The host-netlink purity this relies on is
 // independently derived in that plan's section 4.4.
+//
+// That scope line has a STATED boundary, because "before the dataplane is
+// asked" is not the same as "before the apply can still fail". Three fallible
+// steps run AFTER compileZones has mutated the host and BEFORE the new
+// snapshot is published, so by the line above they belong to THIS half, and
+// none of them is covered here (#6894 r2 F2):
+//
+//   - `preflightCheckIfindexCaps` (loader.go, #5836). It CANNOT be hoisted:
+//     it consumes `result.pendingXDP`, which only compileZones populates. Its
+//     input does not exist until the mutation has already happened, so closing
+//     it needs the ifindex set derived without the host pass -- a different
+//     change, not an extra row in the table below.
+//   - `attachUserspaceShimXDP` (loader.go), whose tail returns
+//     `attach userspace XDP shim generic to ifindex %d`. This is the REACHABLE
+//     one: an ordinary XDP attach failure on a driver that rejects a generic
+//     attach leaves VLANs created and addresses reconciled while the apply
+//     reports failure -- exactly the #4960 shape, on a path this pre-pass does
+//     not defend.
+//   - `buildSnapshotWithSchedulerStateAndNATCounters`
+//     (userspace/manager_compile.go), whose builders return errors (#2514,
+//     #3438, #3772). The #3438 address-book case specifically IS caught
+//     earlier, by `compileApplications` (row 2 below), which is why the
+//     headline example above holds; the builder family as a whole is not.
+//
+// So the guarantee this file provides is bounded to the phases in
+// validationPhases. A failure in any of the three above still lands
+// post-mutation.
 
 import (
 	"fmt"
@@ -165,10 +192,30 @@ func (discardingDataPlane) GetPersistentNAT() *PersistentNATTable {
 // NAT-counter family whose streaming assignment was once compile-order
 // dependent on a hash collision.
 func validateBeforeMutate(cfg *config.Config) error {
+	return validateBeforeMutateWith(discardingDataPlane{}, cfg)
+}
+
+// validateBeforeMutateWith is validateBeforeMutate with the discarding shim
+// injectable. Production has exactly one caller and it passes
+// discardingDataPlane{}; the seam exists so a test can fail exactly ONE
+// dataplane method and prove which ROW of the table surfaces it.
+//
+// That is not a convenience. Five of the twelve rows -- nptv6, screen
+// profiles, default policy, flow timeouts, flow config -- have NO
+// config-shaped hard error at all: every bad input inside them is a
+// `slog.Warn(...); continue`, so their only `return err` is a dataplane
+// failure. Without this seam those five could not be bound to their bodies by
+// any config fixture, and `func() error { return nil }` in place of the body
+// would stay green (#6894 r2 F3). `validationPhases` was already
+// dp-parameterised for the same reason; this completes it.
+//
+// Any dp passed here MUST embed discardingDataPlane so it keeps the
+// xpfValidationPass marker (isValidationPass) and the never-write override
+// set.
+func validateBeforeMutateWith(dp DataPlane, cfg *config.Config) error {
 	if cfg == nil {
 		return nil
 	}
-	dp := discardingDataPlane{}
 	result := newValidationResult()
 
 	// Phases 1 / 1.5 are pure and produce the IDs the later phases read.
@@ -201,13 +248,27 @@ func validateBeforeMutate(cfg *config.Config) error {
 // one row (#6894 r1 F1).
 //
 // So the two kinds of binding are DIFFERENT and neither substitutes for the
-// other. `TestValidationPhaseTableMatchesDocumentedCoverage_4960` binds the SET
-// -- no row can vanish silently. Behavioural fixtures bind that a given row
-// actually rejects pre-mutation, and there are two of those (`applications` via
-// an unresolvable application name, `nat` via an unresolvable pool). The
-// remaining rows are set-bound only, which is the intended trade: a per-row
-// failure fixture for all twelve would triple this file for little added signal
-// once deletion is impossible.
+// other, and BOTH are now present -- stated precisely, because the earlier
+// wording here ("no row can vanish silently") claimed more than its guard
+// delivered (#6894 r2 F3):
+//
+//   - `TestValidationPhaseTableMatchesDocumentedCoverage_4960` binds INDEX ->
+//     NAME: the row count and the name at each position. It asserts on
+//     `got[i].name` ONLY, so it protects the LABEL. Replacing the BODY of a
+//     row with `func() error { return nil }` -- names and order untouched --
+//     left the whole package green.
+//   - `TestEachValidationPhaseRowRunsItsOwnCompiler_4960` binds NAME -> BODY:
+//     every row is driven against an input its own compiler rejects, and the
+//     error must arrive prefixed `validate <that row's name>: `. A gutted or
+//     swapped body reds there.
+//
+// Together those pin the table: a row cannot be deleted (count/name), cannot
+// be renamed (name), cannot be reordered relative to its siblings (index ->
+// name), and cannot stop validating (name -> body). The two behavioural
+// fixtures (`applications` via an unresolvable application name, `nat` via an
+// unresolvable pool) additionally bind that the pre-pass rejects BEFORE
+// compileZones, which is the property of the whole change rather than of any
+// one row.
 type validationPhase struct {
 	name string
 	run  func() error
