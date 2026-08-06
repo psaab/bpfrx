@@ -68145,3 +68145,21 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #6413 userspace-dp synced-import-cap doc corrections
+
+- **Timestamp**: 2026-08-06 02:20 PDT
+- **Action**: Correct the #5674 reverse-ride SOURCE framing (local mirror, not
+  peer), document the +1 orphan corner, and align two HELP strings to the
+  2N-ENTRIES bound. Comment-only, no behaviour change.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs
+- **Validation**: the .rs diff contains ZERO executable lines (every changed
+  line is `//` or `///`); `cargo check` exit 0. Each claim verified against
+  origin/master before editing: SetClusterSyncedSessionV4 at manager_ha.go:1136
+  early-returns for a reverse and writes only the BPF mirror; mirrorSessionPairV4
+  at :1115 dispatches the reverse as a SEPARATE upsert with IsReverse=1;
+  session_import.rs:103 already states the cap as 2 * worker_count *
+  DEFAULT_MAX_SESSIONS while status.rs/control.rs stated the logical bound.

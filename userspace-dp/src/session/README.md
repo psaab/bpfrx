@@ -814,8 +814,31 @@ drops the non-SYN first packet).
 The gate keys only on FORWARD new keys (`!entry.metadata.is_reverse`): a
 synthesized reverse always rides with its forward (a rejected forward
 returns BEFORE publishing its reverse, so no half-sync), and a lone
-reverse import off the wire (`is_reverse` set by a peer) is never
-independently rejected at a boundary slot. A REPLACE of an existing
+reverse import is never independently rejected at a boundary slot.
+
+**Where that lone reverse actually comes from (#6413).** Not "off the wire
+from a peer" — an earlier framing had it that way and it is wrong. A
+peer-received reverse never reaches the coordinator at all: Go's
+`SetClusterSyncedSessionV4`/`V6` early-return on
+`!shouldMirrorUserspaceSession(val.IsReverse)` and write ONLY the BPF
+mirror, so only FORWARD peer imports transit the helper, which then
+synthesizes their reverse companion locally
+(`synthesized_synced_reverse_entry`). The only `is_reverse=1` entry that
+reaches the gate is the **local mirror** companion that
+`mirrorSessionPairV4` (#310) pre-installs as a SEPARATE `upsert`,
+dispatched via `server/handlers/sync_session.rs`, which calls
+`upsert_synced_session` unconditionally for any `is_reverse`.
+
+**The +1 orphan corner (#6413).** Pairing at this boundary is not perfect,
+and the text should not imply it is. If the shared `synced` map is AT the
+2N entry cap and the local mirror's FORWARD is cap-rejected, its separate
+`is_reverse=1` companion still skips the forward-only gate and publishes
+as a bounded **+1 orphan** with no matching forward. That is
+self-inflicted, bounded by the local session rate, low-harm, and NOT the
+peer-DoS vector this cap targets — the Go reverse filter already excludes
+the peer path entirely.
+
+A REPLACE of an existing
 synced key is always allowed (it does not grow the map) so an in-flight
 synced session keeps refreshing; an existing entry is never evicted to
 make room. One documented residual: on an ASYMMETRIC pair (peer has MORE
