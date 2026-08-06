@@ -66849,6 +66849,172 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-05 09:41
+- **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
+  process-global `AtomicU64` statics as their before/after baseline, so cargo's
+  in-process parallelism made each test's assertion depend on what every other
+  test happened to do. Measured at pristine `origin/master` ad9591177 with a
+  bounded harness: `FAIL FAIL HUNG FAIL FAIL`, with a #6819 participant failing
+  in 5 of 5 runs. Moved `SESSION_INSTALL_STALE_IGNORED`,
+  `SESSION_DELETE_STALE_IGNORED` (#2170) and `SYNCED_IMPORT_CAP_DROPS` (#5674)
+  out of `bpf_map/metrics.rs` and onto `SessionManager` as per-Coordinator
+  fields (`install_stale_ignored`, `delete_stale_ignored`, `import_cap_drops`),
+  beside the existing per-instance `export_seq`. Every bump site
+  (`ha/session_import.rs`) and every read site (`coordinator/status.rs`)
+  already held a `&self` Coordinator, and production constructs exactly one
+  Coordinator (`server/lifecycle.rs`), so the exported values are unchanged —
+  this is a test-isolation fix with no production behaviour change.
+  [CORRECTED 2026-08-05 16:10, gate fold: this entry originally said "the
+  gRPC/Prometheus values are unchanged", which was wrong twice. This crate has
+  NO gRPC dependency and none of the three counters is in `proto/`; and only
+  `import_cap_drops` reaches Prometheus (`server/helpers/status.rs` ->
+  `protocol::control` -> the Go status struct ->
+  `xpf_userspace_synced_import_cap_drops_total`). The two stale counters have
+  no wire or metric surface at all — their accessors are reachable only from
+  `ha_tests.rs`.]
+  `ha_tests.rs` is untouched: no assertion weakened, no `--test-threads=1`, no
+  `#[serial]`. The issue's own suggested fix — "make the assertions
+  DELTA-based" — was already in place and is not sufficient: the tests capture
+  `let before = ...` and assert `before + 1`, but a concurrent test's increment
+  lands INSIDE that capture window. Only a per-instance home removes the
+  dependency. After: 10 runs, a #6819 participant failed in 0 of 10. The suite
+  itself is 5 PASS / 2 FAIL / 3 HUNG — every residual failure is #6657
+  (CoS-lease seqlock `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, and an
+  unbounded blocking recv wedging at 7 threads in
+  `__skb_wait_for_more_packets`), a separate defect that this PR does not
+  touch. Red-on-revert: 7 of 7 tests go RED on an assertion when the guard each
+  one covers is reverted.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/metrics.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 14:52
+- **Action**: #6819 gate fold (§7 test-acceptance findings). Three findings,
+  each verified against the code before acting. (F1) Both #5674 admission
+  tests set `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+  branch of `synced_import_cap` BEFORE the production expression is evaluated —
+  a test-only seam shadowing the production path, so deleting its trailing
+  `.saturating_mul(2)` left both tests green. Made `synced_import_cap`
+  `pub(super)` (ha_tests is `crate::afxdp::ha::tests`, a SIBLING of
+  `session_import`, so a private fn was unreachable) and added
+  `synced_import_cap_production_formula_is_twice_the_logical_ceiling`, which
+  runs with the override at its default 0 and pins entry-cap == 2x logical
+  ceiling, plus `assert_ne!` against the bare ceiling (what dropping the 2x
+  yields) and a `DEFAULT_MAX_SESSIONS > 0` precondition so `0 == 2*0` cannot
+  make the claim vacuous. (F2) The two non-poison rejection tests accepted a
+  guard that refuses the WHOLE category while counting once, so each now
+  carries its own positive control (newer install applies and does not count;
+  applied equal-generation delete does not count). The two poison rejection
+  tests get scope comments naming the control test that supplies their
+  selectivity. (F3, priority) The poison negative control exercised only
+  NEWER/EQUAL operations with both stale expectations at the per-instance zero
+  baseline, so it accepted DELETING the generation guard outright — a negative
+  control that accepts removal of the thing it controls for. It now also probes
+  the stale direction after recovery (stale install and stale delete each
+  refused and counted exactly once), and the recoveries assertion tightened
+  from `> before` to `>= before + 4` (the poisoning count); kept a LOWER bound,
+  with the reason in the comment, because `SHARED_SESSION_POISON_RECOVERIES`
+  is the one counter still process-global (bumped inside `lock_shared_recover`,
+  which takes only the mutex and has no per-Coordinator home) so a concurrent
+  test can only push it up — `>=` cannot false-FAIL where `==` could.
+  Validation: four-cell mutation matrix, each mutation run against BOTH test
+  generations so a mutation the old tests already caught could not be credited
+  to the new one. Drop-the-2x PASSES both old cap tests and FAILS the new one;
+  delete-the-generation-guard PASSES the old negative control and FAILS the new
+  one. Full `cargo test --release` rc=0 (4234 passed, 0 failed), `go test
+  ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, _Log.md
+- **Timestamp**: 2026-08-05 16:24
+- **Action**: #6819 gate fold round 2 (R3 + doc accuracy). (R3) The gated suite
+  could not detect a regression of the fix. Every assertion on the three
+  counters is a DELTA capture (`before + 1` / `== before`), and `make test-rust`
+  pins `-- --test-threads=1` (Makefile:114-116, adopted to dodge the #6657
+  `__skb_wait_for_more_packets` socket wedge) — under serial execution a
+  process-global satisfies every one of those identically, so reverting any
+  counter to a static shipped GREEN. Added
+  `refusal_counters_are_per_coordinator_not_process_global`: drives one refusal
+  of each kind on a BUSY Coordinator and asserts an IDLE one, live in the same
+  process, saw none of them. It does not depend on interleaving, so it reds at
+  any thread count. Proof under the gate flag: reverting
+  `install_stale_ignored` to its original `metrics.rs` static REDS the new test
+  while the other 29 `ha::` tests run and pass — the pre-existing suite
+  genuinely cannot see the revert. WHICH assertion reds depends on the run
+  mode, and the original claim of `ha_tests.rs:738` was only true of the
+  ISOLATED run: libtest orders alphabetically under `--test-threads=1`, so
+  `current_generation_…`/`delete_synced_session_gen_…`/`over_ceiling_import_…`
+  all bump the restored global BEFORE `refusal_counters_…` runs, and the
+  PRECONDITION at the top of the test trips first. Fixed in the 2026-08-05
+  18:05 entry by giving the preconditions the same diagnostic as the payload
+  assertions, so the message is reachable in the mode the gate actually uses. (DOC) Corrected the
+  export-surface claim at three sites: this crate has NO gRPC dependency and
+  none of the three counters is in `proto/`; only `import_cap_drops` reaches
+  Prometheus (`server/helpers/status.rs:102` -> `protocol/control.rs:334` ->
+  `protocol_status.go:279` -> `metrics_userspace.go:672`), and the two stale
+  counters have no wire or metric surface — their accessors are reachable only
+  from `ha_tests.rs`. The earlier 2026-08-05 09:41 entry carries an inline
+  correction. (README) Recorded that the concurrency mechanism is MEASURED
+  (revert reds 24/60 parallel vs 0/12 serial for the cap counter; 43/60 vs 0/5
+  for the stale pair) AND that the sanctioned gate structurally cannot observe
+  it. (NOTE) Documented that per-instance scoping makes every `..._before`
+  capture 0, degenerating three `== before` assertions to `0 == 0` — recorded
+  where those assertions live, with why the family is still bound.
+  Gates: `cargo test --release --bins --tests -- --test-threads=1` rc=0
+  (4235 passed, 0 failed, 2 ignored), `go test ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 17:38
+- **Action**: #6819 README — cited the independent cross-PR measurement of the
+  counter flake. While gating #6843, a lane measured parallel `cargo test --
+  afxdp::ha` over 40 iterations: 34/40 FAILED at that PR's HEAD and 34/40 at an
+  `origin/master` CONTROL with the PR's files reverted and its tests confirmed
+  absent. The identical rate with and without the change under review is what
+  identifies the flake as pre-existing and specific to these counters rather
+  than caused by any one PR, and it root-caused the failures to
+  `SESSION_INSTALL_STALE_IGNORED`/`SESSION_DELETE_STALE_IGNORED` being
+  process-global under `assert_eq!(total, before)` — as a family, not one test.
+  That is unmutated evidence from a lane with no stake in #6862, stronger than
+  the mutation numbers already cited. Also recorded the coupling explicitly:
+  the `--test-threads=1` that hides this defect exists to dodge a DIFFERENT one
+  (#6657).
+  NOTE ON THE GATE RUN: `cargo test --release --bins --tests --
+  --test-threads=1` returned rc=101 on this README-only change, failing
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`.
+  That is NOT this change — the diff since the previous green gate is one .md
+  file and no test reads it. Characterized it instead of re-running for green:
+  the test fails 2 of 10 runs ALONE in the process under `--test-threads=1`, so
+  its race is INTERNAL to the test (it spawns its own threads, which
+  `--test-threads=1` does not serialize). That distinguishes it from #6819
+  (cross-test, masked by serial execution) and from the #6657 wg-engine hang.
+  Reported to the #6657 owner.
+- **File(s)**: userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 18:05
+- **Action**: #6819 gate fold round 3 (two MINORs). (M1) The `#6819`
+  diagnostics in `refusal_counters_are_per_coordinator_not_process_global` were
+  UNREACHABLE in the mode the gate actually runs. libtest executes
+  alphabetically under `--test-threads=1`, so `current_generation_…` (c),
+  `delete_synced_session_gen_…` (d) and `over_ceiling_import_…` (o) all bump a
+  restored global BEFORE `refusal_counters_…` (r) runs — the bare
+  `assert_eq!(x, 0)` PRECONDITIONS tripped first and reported `left: 1,
+  right: 0` with no explanation, while the carefully-worded payload assertions
+  forty lines below fired only when the test was run in ISOLATION. Gave the
+  three preconditions the same named diagnostic, so a future engineer who
+  reintroduces the regression reads why in either run mode. Generalisable: a
+  diagnostic is only as good as the run mode that REACHES it — when a test has
+  a precondition and a payload assertion, check which fires under the
+  SANCTIONED invocation, not the filtered one used while developing. (M2)
+  Corrected the `ha_tests.rs:738` line cite: under the conditions stated
+  alongside it (the other 29 `ha::` tests running) the revert reds at the
+  precondition, not 738; 738 is the isolated-run line. Corrected in the
+  2026-08-05 16:24 entry and in the PR body.
+  NOT FOLDED: #6891 — a live cross-test counter flake of exactly the shape this
+  PR's README rule warns about (`GRE_DECAP_CHECKSUM_INVALID_DROPS`, equality
+  assert, 18/60 RED at this branch's HEAD and 16/40 at the merge base — equal
+  rate, so pre-existing). Filed separately; it raises #6891's priority, not
+  this PR's scope.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs, _Log.md
 
 - **Timestamp**: 2026-08-05 15:10
 - **Action**: #6851 fold — two MAJORs on the #4626 policy-id-zero guard, both
