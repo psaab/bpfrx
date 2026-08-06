@@ -524,7 +524,8 @@ func validateApplicationSyntaxStrict(cfg *Config) error {
 //     parent name on cfg.Applications.MixedDirectTermApps.
 //
 //   - #3366 duplicate scalar term leaf: a single-valued leaf (destination-port /
-//     source-port / inactivity-timeout / timeout / alg) repeated with a
+//     source-port / inactivity-timeout / timeout / alg, and — since #6766 —
+//     icmp-type / icmp-code) repeated with a
 //     CONFLICTING value inside one inline term. The term is opaque to the
 //     SchemaValidate walk, so the repeat was last-writer-wins — the earlier value
 //     silently overwritten by parse order, narrowing/widening the term with no
@@ -589,7 +590,7 @@ func validateApplicationStructureStrict(cfg *Config) error {
 				return fmt.Errorf(
 					"application %q: conflicting duplicate %q inside `term`; a single-valued "+
 						"term leaf (destination-port / source-port / inactivity-timeout / "+
-						"timeout / alg) may carry only one value — a repeat with a different "+
+						"timeout / alg / icmp-type / icmp-code) may carry only one value — a repeat with a different "+
 						"value is last-writer-wins and silently overrides the earlier one by "+
 						"token order (use repeated `protocol` only for an intentional "+
 						"multi-protocol term)",

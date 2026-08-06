@@ -13,14 +13,32 @@ import (
 // (policy, filter, NAT, flood) live in their own domain files; ClearAllCounters
 // calls those domain clears via same-package method dispatch.
 
-// ErrCounterNotPopulated reports that a counter family is safely readable but
-// is not sourced by the userspace dataplane (#3643). It is DISTINCT from a
+// ErrCounterNotPopulated reports that a READ returned no value for this key --
+// the family is safely readable, but nothing published a row here (#3643). It
+// deliberately does NOT say the family is unsourced: per-zone traffic IS
+// sourced since #3651, and only flood remains unsourced. It is DISTINCT from a
 // genuine read failure (a missing map or a degraded IPC bridge, which must
 // still bump the #3345 xpf_counter_read_errors_total signal) and DISTINCT from
 // a real zero. Read surfaces treat it as "not available" -- never a 500, never
-// a false read-error alert, never a bare misleading 0. Per-zone traffic and
-// flood counters currently report this because the eBPF writers were deleted
-// in #1476 and the userspace POPULATE path is deferred (#3643 plan §5A).
+// a false read-error alert, never a bare misleading 0.
+//
+// The two per-zone families that return this reach it for DIFFERENT reasons,
+// and conflating them is what made the pre-#6843 wording wrong:
+//
+//   - Per-zone TRAFFIC counters ARE populated (#3651 shipped the userspace
+//     POPULATE path). This sentinel means the helper published no row for THIS
+//     zone -- a pre-#3651 helper, a zone past the helper's hot-path slot
+//     capacity, or an idle zone whose all-zero row the sparse snapshot drops.
+//     Those are the ONLY three. "No loaded dataplane" and "no apply result
+//     yet" are NOT meanings of this sentinel: on both, the collector
+//     increments before it ever calls ReadZoneCounters, so no read happens and
+//     no sentinel is produced. They are causes of the UNPOPULATED GAUGE, which
+//     is a wider set -- see the xpf_zone_counters_unpopulated_zones HELP, and
+//     do not read that list as a list of sentinel meanings.
+//   - Per-zone FLOOD counters are still deferred: no PRODUCTION writer exists,
+//     so in a running firewall they report this on every read (#3643 plan §5A,
+//     leaning on the #3343 aggregate). Not an API-wide absolute --
+//     SetFloodCounterOffset is exported and tests do populate it.
 var ErrCounterNotPopulated = errors.New("counter not populated in userspace dataplane")
 
 // ReadGlobalCounter reads a per-CPU global counter and returns the sum across all CPUs.
@@ -109,11 +127,17 @@ func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, err
 // which the read surfaces mis-reported as a hard failure (REST 500, false
 // Prometheus read-error alert, CLI/gRPC error rows). This now keys a Go-side
 // sparse offset map -- the exact treatment #2255 gave nat_rule_counters -- and
-// NEVER indexes the dense array, so an id >= MaxZones can no longer OOB. The
-// userspace helper does not yet populate per-zone traffic counters (POPULATE
-// deferred, #3643 plan §5A), so the map is empty and this reports
-// ErrCounterNotPopulated; surfaces render "not available" rather than a
-// misleading 0.
+// NEVER indexes the dense array, so an id >= MaxZones can no longer OOB.
+//
+// #3651: the helper DOES now populate per-zone traffic counters (Rust forward-
+// path accounting -> ProcessStatus.ZoneTrafficCounters -> syncBPFCountersLocked
+// -> ReplaceZoneCounterOffsets), so this returns live volume for a zone the helper
+// has published. ErrCounterNotPopulated remains reachable and is NOT an error
+// condition: the helper's status snapshot is sparse and omits all-zero rows, so
+// the sentinel covers a pre-#3651 helper, a zone past the helper's hot-path
+// slot capacity, and a merely idle zone alike. Surfaces must render "not
+// available" (or omit the sample) rather than a misleading 0, and must not
+// treat it as a read failure -- see pkg/api/README.md.
 func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, error) {
 	if direction != 0 && direction != 1 {
 		return CounterValue{}, fmt.Errorf("invalid zone counter direction %d", direction)
@@ -132,12 +156,63 @@ func (m *Manager) ReadZoneCounters(zoneID uint16, direction int) (CounterValue, 
 // POPULATE hook, mirroring SetNATRuleCounterOffset). Values are absolute
 // (overwrite), matching the helper's cumulative-since-launch totals. Once set,
 // ReadZoneCounters returns them (nil error) instead of ErrCounterNotPopulated.
+//
+// #6843: this has NO production callers. syncBPFCountersLocked now replaces the
+// whole offset map per status poll (ReplaceZoneCounterOffsets) rather than
+// setting row by row, because a per-row setter can only add or overwrite and so
+// strands the last value of any zone the helper stops publishing. This single-
+// row setter is retained for tests that seed one zone directly; production code
+// MUST use ReplaceZoneCounterOffsets, or a zone that disappears from the helper
+// snapshot keeps serving a frozen total.
 func (m *Manager) SetZoneCounterOffset(zoneID uint16, ingress, egress CounterValue) {
 	m.mu.Lock()
 	if m.zoneCounterOffsets == nil {
 		m.zoneCounterOffsets = make(map[uint16][2]CounterValue)
 	}
 	m.zoneCounterOffsets[zoneID] = [2]CounterValue{ingress, egress}
+	m.mu.Unlock()
+}
+
+// ReplaceZoneCounterOffsets atomically replaces the ENTIRE per-zone offset map
+// with the rows the helper published in this status poll (#3651).
+//
+// Replace, not merge, and the distinction is load-bearing. The helper's
+// `zone_traffic_counters` block is a COMPLETE sparse set rebuilt from its store
+// on every poll, not a delta — so a zone absent from it is a zone the helper is
+// no longer reporting, and the correct Go-side state is "not populated".
+// SetZoneCounterOffset alone can only ever ADD or overwrite, so a row that
+// stops being published leaves its last value stranded in the map and every
+// read surface keeps serving a FROZEN total indefinitely.
+//
+// Three ways a row legitimately disappears, all of which this handles:
+//
+//   - The zone lost its hot-path slot. Config apply carries the store forward
+//     and retains still-configured zones, but a zone pushed past the helper's
+//     assignable slot capacity gets slot 0 and stops being counted; the helper
+//     drops it from the published set (coordinator zone_traffic_counters). Its
+//     retained totals are stale from that moment on.
+//   - The zone was deleted from the config (helper-side reconcile drops it).
+//   - The helper restarted, or was downgraded to a build with no per-zone
+//     block. Its store is empty, so it publishes nothing, and nothing is what
+//     the Go side should report.
+//
+// An empty rows map therefore clears the offset map, which is correct in every case
+// above: "the helper published no per-zone volume" is exactly
+// ErrCounterNotPopulated. The sole call site (syncBPFCountersLocked) runs only
+// on a successfully decoded ProcessStatus, so an empty set here is a real
+// observation and never a failed fetch.
+func (m *Manager) ReplaceZoneCounterOffsets(rows map[uint16][2]CounterValue) {
+	m.mu.Lock()
+	if len(rows) == 0 {
+		m.zoneCounterOffsets = nil
+		m.mu.Unlock()
+		return
+	}
+	next := make(map[uint16][2]CounterValue, len(rows))
+	for id, vals := range rows {
+		next[id] = vals
+	}
+	m.zoneCounterOffsets = next
 	m.mu.Unlock()
 }
 

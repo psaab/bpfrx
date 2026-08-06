@@ -456,11 +456,19 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 // ENGAGED (frames are verified and an unauthenticated peer is rejected) or had
 // silently degraded to DUAL-ACCEPT (an unauthenticated peer is still
 // accepted) — the rolling-upgrade grace #4107 deliberately keeps open. The
-// posture is derived from the SAME two facts syncAuthDecision /
-// heartbeatAuthDecision gate on — the local key (ControlLinkAuthKey) and the
-// sticky peer-authenticated flag (HeartbeatPeerAuthSeen) — so this string
-// tracks the real enforcement decision rather than a separate estimate. It
-// only inspects len(key) and never renders the secret.
+// posture is derived from the SAME two facts heartbeatAuthDecision gates on —
+// the local key (ControlLinkAuthKey) and the sticky peer-authenticated flag
+// (HeartbeatPeerAuthSeen) — so for the HEARTBEAT this string tracks the real
+// enforcement decision rather than a separate estimate.
+//
+// It does NOT track the session-sync channel. #5078 removed peerAuthSeen from
+// syncAuthDecision, so sync admission no longer consults the sticky flag this
+// string is built from; naming syncAuthDecision here would assert a coupling
+// that no longer exists. pkg/cluster/README.md, "Rolling it onto a live
+// unkeyed cluster", scopes the operator-facing line accordingly — it does not
+// tell you whether an existing session-sync connection predates the key.
+//
+// It only inspects len(key) and never renders the secret.
 func (m *Manager) controlLinkAuthStatus() string {
 	keyConfigured := len(m.ControlLinkAuthKey()) > 0
 	switch {

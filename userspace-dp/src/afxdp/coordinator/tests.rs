@@ -4589,6 +4589,7 @@ fn validate_snapshot_buildable_matches_reconcile_5171() {
 /// Fail-on-revert: reverting `validate_forwarding_buildable` to `previous =
 /// Some(&coord.forwarding)` prunes zone B (absent from the candidate) from
 /// the live store → the `after.contains(B)` assertion FAILS.
+
 #[test]
 fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
     use crate::afxdp::zone_counters::{
@@ -4655,6 +4656,106 @@ fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
     assert!(
         after.contains(&ZONE_A) && after.contains(&ZONE_B),
         "validate_snapshot_buildable must NOT prune the live zone-counter store; got {after:?} (zone B dropped = the rev-5605 leak)"
+    );
+}
+
+#[test]
+fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
+    // #6843 (Codex gate): drive the PRODUCTION publication accessor,
+    // `Coordinator::zone_traffic_counters`, not the extracted
+    // `publishable_zone_rows` primitive. The primitive tests in
+    // zone_counters.rs prove the filter; they do NOT prove the coordinator
+    // calls it, so reverting this accessor to its old inline
+    // "configured-only" body left them all green. This test binds the wiring.
+    use crate::afxdp::zone_counters::{
+        flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,
+        ZONE_COUNTER_ASSIGNABLE_SLOTS,
+    };
+    const Z: u16 = 50675; // config::StableZoneID("trust")
+
+    let mut coord = Coordinator::new();
+
+    // Apply 1: Z alone, holding a slot, moving traffic.
+    let map1 = ZoneCounterSlotMap::build(&[Z], &coord.forwarding.zone_counter_store);
+    record_zone_traffic(&map1, Z, 0, 1500);
+    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &map1);
+    coord.forwarding.zone_counter_slot_map = std::sync::Arc::new(map1);
+    coord.forwarding.zone_id_to_name.insert(Z, "trust".to_string());
+
+    let published = coord.zone_traffic_counters();
+    assert!(
+        published.iter().any(|r| r.zone_id == Z),
+        "apply 1: the coordinator must publish a slotted zone with traffic: {published:?}"
+    );
+
+    // Apply 2: enough lower ids to exhaust capacity. Z stays CONFIGURED and
+    // keeps its retained totals, but loses its slot.
+    let mut ids: Vec<u16> = (1..=(ZONE_COUNTER_ASSIGNABLE_SLOTS as u16)).collect();
+    ids.push(Z);
+    for id in &ids {
+        coord
+            .forwarding
+            .zone_id_to_name
+            .insert(*id, format!("z{id}"));
+    }
+    let map2 = ZoneCounterSlotMap::build(&ids, &coord.forwarding.zone_counter_store);
+    assert_eq!(map2.slot_of(Z), 0, "Z must lose its slot in apply 2");
+    coord.forwarding.zone_counter_slot_map = std::sync::Arc::new(map2);
+
+    // The store still retains Z's totals -- assert it, so this test cannot
+    // pass because the data vanished for an unrelated reason.
+    assert!(
+        coord
+            .forwarding
+            .zone_counter_store
+            .snapshot()
+            .iter()
+            .any(|r| r.zone_id == Z),
+        "precondition: the store must still retain Z's totals"
+    );
+
+    // Move traffic on a zone that KEPT its slot in apply 2, so the assertions
+    // below constrain both directions.
+    const SURVIVOR: u16 = 1;
+    let survivor_map = ZoneCounterSlotMap::build(&ids, &coord.forwarding.zone_counter_store);
+    record_zone_traffic(&survivor_map, SURVIVOR, 0, 64);
+    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &survivor_map);
+
+    let published = coord.zone_traffic_counters();
+    assert!(
+        !published.iter().any(|r| r.zone_id == Z),
+        "the coordinator kept publishing a zone that lost its slot: its total can \
+         never advance again, so Prometheus would emit a FROZEN counter: {published:?}"
+    );
+    // #6843 gate F1: without this, a coordinator-level blanket
+    // `if overflow_active { return Vec::new() }` satisfies the assertion above
+    // and escapes the WHOLE suite -- the primitive sibling test that exists to
+    // stop exactly that over-reach drives `publishable_zone_rows` directly, so
+    // it cannot see an over-reach introduced HERE. Runtime consequence of the
+    // escape: at >=64 configured zones the entire per-zone Prometheus family
+    // vanishes for every zone and the unpopulated gauge jumps to the full zone
+    // count.
+    assert!(
+        published.iter().any(|r| r.zone_id == SURVIVOR),
+        "a zone that KEPT its slot stopped publishing once overflow became \
+         active: the filter must drop only the zones that lost their slot, not \
+         everything: {published:?}"
+    );
+
+    // #6843 gate R3: bind the coordinator's CONFIGURED predicate too. Dropping
+    // it (`|_| true`) passed the entire cargo suite — the mirror of F1, left
+    // open for this predicate after being closed for the slot one. The gate
+    // could not construct a REACHABLE runtime divergence (apply-time
+    // `reconcile` prunes unconfigured zones, and the reserved-id path is
+    // filtered identically in policy.rs), so this predicate is defence in
+    // depth rather than a live guard — but it is documented as load-bearing at
+    // the call site, so it gets a test rather than an unbound claim.
+    coord.forwarding.zone_id_to_name.remove(&SURVIVOR);
+    let published = coord.zone_traffic_counters();
+    assert!(
+        !published.iter().any(|r| r.zone_id == SURVIVOR),
+        "a zone dropped from the configured set kept publishing: the configured \
+         predicate must hold independently of the slot predicate: {published:?}"
     );
 }
 

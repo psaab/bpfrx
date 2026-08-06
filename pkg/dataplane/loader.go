@@ -66,11 +66,19 @@ type Manager struct {
 	// mis-reported that structural OOB as a hard failure (REST 500, false
 	// Prometheus xpf_counter_read_errors_total alerts, CLI/gRPC error rows).
 	// Read{Zone,Flood}Counters now key these sparse maps and NEVER index the
-	// dense arrays -- the same treatment #2255 gave nat_rule_counters. The
-	// userspace helper does not yet populate per-zone / flood counters (POPULATE
-	// deferred, see docs/research/3643-dead-counters/plan.md §5A), so these maps
-	// stay empty and the reads report ErrCounterNotPopulated; surfaces render
-	// "not available", never a misleading 0. The setters are the POPULATE hook.
+	// dense arrays -- the same treatment #2255 gave nat_rule_counters.
+	//
+	// #6843: the two maps are no longer symmetric and must not be described as
+	// one. zoneCounterOffsets IS populated -- #3651 shipped the traffic POPULATE
+	// path, and syncBPFCountersLocked REPLACES this map from every helper status
+	// poll (ReplaceZoneCounterOffsets), so a zone the helper stops publishing is
+	// dropped rather than left serving a frozen total. floodCounterOffsets stays
+	// empty IN A RUNNING FIREWALL: the flood POPULATE path is still deferred
+	// (docs/research/3643-dead-counters/plan.md §5A, leaning on the #3343
+	// aggregate), so those reads report ErrCounterNotPopulated. That is a claim
+	// about production, not an API-wide absolute -- SetFloodCounterOffset is
+	// exported and tests do write it. Surfaces render "not available", never a
+	// misleading 0.
 	zoneCounterOffsets  map[uint16][2]CounterValue // [zoneID] -> {ingress, egress}
 	floodCounterOffsets map[uint16]FloodState      // [zoneID]
 
@@ -197,6 +205,13 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	if err := m.attachUserspaceShimXDP(result); err != nil {
 		return nil, err
 	}
+	// #5275 PR1: OBSERVE-ONLY arm-coverage proof. Runs after the attach so it
+	// sees real link state, reports what a gating build would have decided,
+	// and gates NOTHING — the return value is deliberately discarded. It reads
+	// `result` directly and publishes nothing: hoisting the m.lastCompile
+	// assignment to feed it would expose a half-observed CompileResult through
+	// the exported LastCompileResult() for a diagnostic's benefit.
+	m.ProveArmCoverage(result).LogArmCoverage("post-attach", m.nextApplyGeneration())
 
 	for ifidx := range result.genericXDPIfindexes {
 		if !result.tunnelIfindexes[ifidx] {
@@ -478,7 +493,7 @@ func xdpAttachModeMatches(ifindex int, wantGeneric bool) bool {
 	if xdp == nil || !xdp.Attached {
 		return true
 	}
-	isGeneric := xdp.AttachMode == 2 /* XDP_ATTACHED_SKB */
+	isGeneric := xdp.AttachMode == xdpAttachedSKB
 	return isGeneric == wantGeneric
 }
 

@@ -265,6 +265,19 @@ func (m *Manager) recordApplyResult(result *ApplyResult) *ApplyResult {
 	return next.Clone()
 }
 
+// nextApplyGeneration reports the generation recordApplyResult will stamp on
+// the compile now in flight.
+//
+// Used to give the #5275 arm-coverage line a DISTINCT stage label per compile:
+// a single daemon apply can compile TWICE on the RETH deferred-MAC path
+// (daemon_apply_dataplane.go's reapplyAfterDeferredMAC), and two proof lines
+// carrying an identical stage label are indistinguishable in a log archive.
+func (m *Manager) nextApplyGeneration() uint64 {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+	return m.applyGeneration + 1
+}
+
 func NewDataPlaneLinkController(dp DataPlane) LinkController {
 	return dataPlaneLinkController{dp: dp}
 }

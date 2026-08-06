@@ -204,14 +204,14 @@ impl super::Coordinator {
     /// variant). The authoritative guard is in the Go cluster apply layer;
     /// this is the helper-side back-stop counter.
     pub fn session_install_stale_ignored_total(&self) -> u64 {
-        SESSION_INSTALL_STALE_IGNORED.load(Ordering::Relaxed)
+        self.sessions.install_stale_ignored.load(Ordering::Relaxed)
     }
 
     /// #2170: total stale-generation deletes refused by the helper's
     /// in-memory SyncedSessionEntry guard (belt-and-suspenders for any
     /// helper-side generation-aware delete).
     pub fn session_delete_stale_ignored_total(&self) -> u64 {
-        SESSION_DELETE_STALE_IGNORED.load(Ordering::Relaxed)
+        self.sessions.delete_stale_ignored.load(Ordering::Relaxed)
     }
 
     /// #5674: total peer-synced session imports rejected by the coordinator's
@@ -220,11 +220,19 @@ impl super::Coordinator {
     /// imports were previously uncapped and fanned out to every worker, so a
     /// peer under session-table pressure (or a compromised peer) could drive
     /// this node past its own aggregate session ceiling. A rising value means a
-    /// peer exceeded this appliance's ceiling (`worker_count *
-    /// DEFAULT_MAX_SESSIONS`); a legitimate symmetric-pair failover never trips
-    /// it. Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
+    /// peer exceeded this appliance's ceiling.
+    ///
+    /// #6413: state that ceiling in ENTRIES, matching `synced_import_cap` and
+    /// `coordinator/session_manager.rs` — it is
+    /// `2 * worker_count * DEFAULT_MAX_SESSIONS`,
+    /// not the LOGICAL `worker_count * DEFAULT_MAX_SESSIONS`. Each admitted
+    /// forward publishes TWO keys into `sessions.synced` (the forward and its
+    /// synthesized reverse companion), so N logical sessions arrive as 2N
+    /// entries and EXACTLY fit the 2N cap. A legitimate symmetric-pair failover
+    /// therefore never trips it; firing semantics are unchanged by this wording.
+    /// Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
     pub fn synced_import_cap_drops_total(&self) -> u64 {
-        SYNCED_IMPORT_CAP_DROPS.load(Ordering::Relaxed)
+        self.sessions.import_cap_drops.load(Ordering::Relaxed)
     }
 
     /// #1760 W3': shared-map NAT reverse-key displacement events — a

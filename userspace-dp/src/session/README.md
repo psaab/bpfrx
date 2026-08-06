@@ -637,7 +637,7 @@ context is built in `afxdp/worker/loop_body/mod.rs` right before the
 expire call.
 
 The self-heal edge is made airtight by the **epoch-before-publish
-ordering** in `afxdp/ha.rs::update_ha_state`: `rg_epochs` for every
+ordering** in `afxdp/ha/state.rs::update_ha_state`: `rg_epochs` for every
 activated/demoted RG (and the node-level `rg_epochs[0]` on any activation)
 is bumped BEFORE `rg_runtime.store`, so a worker that observes the active
 `rg_runtime` always observes the bumped epoch (never new-rg + old-epoch).
@@ -776,19 +776,19 @@ record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
 `upsert_synced_with_origin` stays uncapped (the infallibility contract
 above), but the sync family is no longer *unbounded*: the row-I11 cap
-arbitration is now enforced ONE level up, at the coordinator's
-peer-sync entry point (`Coordinator::upsert_synced_session`,
-`afxdp/ha.rs`). Before #5674 a peer-synced session was published to the
-shared `synced` map and fanned out to EVERY worker command queue+table
-with no cap, so a peer under session-table pressure — or a
-malicious/compromised peer — could drive this node past its own
-aggregate session ceiling and multiply that state across all workers
-(an availability/DoS the per-worker `install_with_protocol_with_origin`
-cap is meant to prevent). `upsert_synced_session` now bounds the shared
+arbitration is now enforced ONE level up, at the coordinator's peer-sync
+entry point (`Coordinator::upsert_synced_session`,
+`afxdp/ha/session_import.rs`). Before #5674 a peer-synced session was
+published to the shared `synced` map and fanned out to EVERY worker
+command queue+table with no cap, so a peer under session-table pressure
+— or a malicious/compromised peer — could drive this node past its own
+aggregate session ceiling and multiply that state across all workers (an
+availability/DoS the per-worker `install_with_protocol_with_origin` cap
+is meant to prevent). `upsert_synced_session` now bounds the shared
 `synced` map (the single fan-out choke point) at this appliance's OWN
 aggregate **ENTRY** ceiling — `2 * worker_count * DEFAULT_MAX_SESSIONS`
 (`synced_import_cap()`) — and **drop-newest**-rejects a NEW over-ceiling
-FORWARD key: it bumps `SYNCED_IMPORT_CAP_DROPS`
+FORWARD key: it bumps `SessionManager::import_cap_drops`
 (`Coordinator::synced_import_cap_drops_total()`, Prometheus
 `xpf_userspace_synced_import_cap_drops_total`) and returns BEFORE the
 publish + fan-out, so a rejected import is never enqueued to any worker
@@ -814,8 +814,31 @@ drops the non-SYN first packet).
 The gate keys only on FORWARD new keys (`!entry.metadata.is_reverse`): a
 synthesized reverse always rides with its forward (a rejected forward
 returns BEFORE publishing its reverse, so no half-sync), and a lone
-reverse import off the wire (`is_reverse` set by a peer) is never
-independently rejected at a boundary slot. A REPLACE of an existing
+reverse import is never independently rejected at a boundary slot.
+
+**Where that lone reverse actually comes from (#6413).** Not "off the wire
+from a peer" — an earlier framing had it that way and it is wrong. A
+peer-received reverse never reaches the coordinator at all: Go's
+`SetClusterSyncedSessionV4`/`V6` early-return on
+`!shouldMirrorUserspaceSession(val.IsReverse)` and write ONLY the BPF
+mirror, so only FORWARD peer imports transit the helper, which then
+synthesizes their reverse companion locally
+(`synthesized_synced_reverse_entry`). The only `is_reverse=1` entry that
+reaches the gate is the **local mirror** companion that
+`mirrorSessionPairV4`/`V6` (#310) pre-install as a SEPARATE `upsert`,
+dispatched via `server/handlers/sync_session.rs`, which calls
+`upsert_synced_session` unconditionally for any `is_reverse`.
+
+**The +1 orphan corner (#6413).** Pairing at this boundary is not perfect,
+and the text should not imply it is. If the shared `synced` map is AT the
+2N entry cap and the local mirror's FORWARD is cap-rejected, its separate
+`is_reverse=1` companion still skips the forward-only gate and publishes
+as a bounded **+1 orphan** with no matching forward. That is
+self-inflicted, bounded by the local session rate, low-harm, and NOT the
+peer-DoS vector this cap targets — the Go reverse filter already excludes
+the peer path entirely.
+
+A REPLACE of an existing
 synced key is always allowed (it does not grow the map) so an in-flight
 synced session keeps refreshing; an existing entry is never evicted to
 make room. One documented residual: on an ASYMMETRIC pair (peer has MORE
@@ -840,11 +863,12 @@ missing-neighbor seed) leave it 0. The synthesized reverse companion inherits
 the forward entry's generation so a delete refusal is consistent across both
 halves.
 
-`upsert_synced_session` (`afxdp/ha.rs`) refuses a strictly-older-generation
+`upsert_synced_session` (`afxdp/ha/session_import.rs`) refuses a strictly-older-generation
 install (both generations non-zero) so the helper's stored generation never
-regresses (`SESSION_INSTALL_STALE_IGNORED`), mirroring the Go install guard.
-`delete_synced_session_gen(key, delete_gen)` refuses a strictly-older-generation
-delete (`SESSION_DELETE_STALE_IGNORED`); the plain `delete_synced_session(key)`
+regresses (`SessionManager::install_stale_ignored`), mirroring the Go install
+guard. `delete_synced_session_gen(key, delete_gen)` refuses a
+strictly-older-generation delete (`SessionManager::delete_stale_ignored`); the
+plain `delete_synced_session(key)`
 wrapper passes `delete_gen = 0` so helper-local purges (tunnel-remap, GC) stay
 unconditional. These helper-side guards are **belt-and-suspenders** — the
 authoritative guard lives in the Go cluster apply layer (`deleteClusterSynced*`),
@@ -852,6 +876,57 @@ which short-circuits both the BPF map delete and the helper. The counters are
 surfaced via `Coordinator::session_install_stale_ignored_total()` /
 `session_delete_stale_ignored_total()`. See `docs/sync-protocol.md` and
 `docs/research/2170-ha-deferred-delete/plan.md`.
+
+All three sync-import refusal counters (`install_stale_ignored`,
+`delete_stale_ignored`, `import_cap_drops`) are **per-`Coordinator` fields on
+`SessionManager`**, not process-global statics. Production builds exactly one
+`Coordinator`, so the **exported Prometheus value (`import_cap_drops`) is
+unchanged; the other two have no surface outside this binary** — their
+accessors are reachable only from `ha_tests.rs`. Only `import_cap_drops`
+travels the wire, via `server/helpers/status.rs` →
+`protocol::control::…synced_import_cap_drops_total` → the Go status struct →
+`xpf_userspace_synced_import_cap_drops_total`. None of the three appears in
+`proto/`; this crate has no gRPC dependency.
+
+The distinction that matters is therefore purely a test one: the suite builds
+one `Coordinator` per `#[test]` and runs them concurrently in a single
+process. As globals, a test asserting on these counters was measuring every
+*other* test's stale-install/stale-delete/over-ceiling refusals as well as its
+own (#6819). Keep new refusal counters on `SessionManager` for the same reason
+— a delta capture (`let before = ...; assert_eq!(..., before + 1)`) does
+**not** make a process-global safe, because a concurrent test's increment lands
+inside the capture window.
+
+**That mechanism is measured, and the sanctioned gate cannot see it.** Reverting
+`import_cap_drops` to a static reds 24 of 60 parallel runs and 0 of 12 runs
+under `--test-threads=1`; reverting both stale counters reds 43 of 60 parallel
+and 0 of 5 single-threaded.
+
+The strongest evidence is independent of this change and predates it. While
+gating an unrelated PR (#6843), a lane measured parallel
+`cargo test -- afxdp::ha` over 40 iterations and found **34 of 40 runs failing
+at that PR's HEAD — and 34 of 40 at a `origin/master` CONTROL** with the PR's
+own files reverted and its tests confirmed absent. Identical rate with and
+without the change under review, which is what identifies the flake as
+pre-existing and environmental to these counters rather than caused by any one
+PR. It root-caused the failures to exactly `SESSION_INSTALL_STALE_IGNORED` /
+`SESSION_DELETE_STALE_IGNORED` being process-global and asserted with
+`assert_eq!(total, before)`, so *any* concurrently-running test that refuses a
+stale op reds them — and observed it as a whole family
+(`stale_generation_install_refused_…`, `stale_generation_delete_refused_…`,
+`over_ceiling_import_rejected_…`), not a single test. Those are the counters
+this section is about.
+
+`make test-rust` pins `-- --test-threads=1` (to dodge
+an unrelated socket-test wedge in `__skb_wait_for_more_packets`, #6657), so a
+regression of this property would ship **green** through the gate. Note the
+coupling: the flag that hides this defect exists because of a *different* one.
+Delta-capture assertions cannot close that hole — under serial execution a
+process-global satisfies `before + 1` identically. The binding test is
+`refusal_counters_are_per_coordinator_not_process_global`, which asserts one
+`Coordinator`'s refusals are invisible to a second live instance and so reds at
+any thread count. Any new refusal counter needs an equivalent, or it is
+unguarded no matter how many delta assertions surround it.
 
 ### Per-policy log flags on the session-sync wire (#2785)
 
