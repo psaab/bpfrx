@@ -649,6 +649,28 @@ is fail-closed: the shim's unresolved chain leaves the extension-header type
 in `ParsedPacket::protocol` with `parse_l4`'s catch-all ports 0/0, so the
 session key misses and the packet is redirected to userspace for full
 policy — it costs that flow the XDP fast path permanently, nothing more.
+
+That miss is **not** something the shim enforces. The shim probes a session
+map userspace writes, so "the key cannot be present" is a claim about the
+WRITERS, and #6923 found it false: `metadata_tuple_complete`
+(`userspace-dp/src/afxdp/frame/inspect.rs`) accepted every non-TCP/UDP
+metadata tuple, so the residual extension-header protocol with ports 0/0
+became a `SessionFlow`. That made `flow.is_none()` false, which SKIPPED the
+#4743 over-limit drop; an `application any` permit then matched a flow with
+no ports to fail on, and the session was installed and published under
+exactly the key the shim probes with. The unconditional over-limit refusal
+was in fact conditional on policy, and after one packet the chain had a fast
+path. Both writers now refuse an IPv6 key whose protocol is one the walk
+traverses — the packet path in `metadata_tuple_complete`, and the HA import
+in `build_synced_session_key`
+(`userspace-dp/src/server/helpers/session_sync.rs`), because the session map
+is global and the shim probes whatever row is present regardless of who
+wrote it. The refused set is `ipv6_ext_header_is_traversable`, held equal to
+the shim's own `eh_class` non-terminal set over all 256 values by
+`refused_protocol_set_equals_the_shim_traversable_set`. **A third writer
+into `USERSPACE_SESSIONS` must extend that refusal, or this paragraph goes
+back to being false.**
+
 Shim-ABOVE-userspace is the direction never to take: the shim would stamp a
 full 5-tuple and `l4_offset` for a chain `walk_ipv6_ext_chain` refuses with
 `OverLimit`, and hand that meta to consumers that trust it. Independently of

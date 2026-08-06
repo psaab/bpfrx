@@ -143,8 +143,20 @@ pub fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -
 ///
 /// Exhausting the loop is NOT an error here: it returns the last declared
 /// next-header value, which will be an extension-header type. `parse_l4`'s
-/// catch-all then yields ports 0/0, the session key misses, and the packet is
-/// redirected to userspace — the fail-closed path for an over-limit chain.
+/// catch-all then yields ports 0/0 and the packet is redirected to userspace —
+/// the fail-closed path for an over-limit chain.
+///
+/// #6923: that refusal rests on the session-key lookup MISSING, and the miss is
+/// a property of the session MAP, which userspace writes — not of anything this
+/// file can see. It holds only because BOTH writers refuse to mint
+/// `(AF_INET6, <a next-header this walk traverses>, src, dst, 0, 0)`:
+/// `metadata_tuple_complete` declines the tuple on the packet path, and
+/// `build_synced_session_key` rejects it on the HA import path (both in
+/// userspace-dp). Before #6923 the first of those accepted it, an
+/// `application any` permit matched a flow with no ports to fail on, and the
+/// installed key was published — so the next packet of the same chain HIT and
+/// took the fast path. Do not restate this refusal as unconditional without
+/// checking those two, and do not add a third writer without extending them.
 ///
 /// Each arm's shape matters. The host-side parity corpus exercises them with
 /// MINIMAL-length buffers as well as padded ones — a padded buffer cannot

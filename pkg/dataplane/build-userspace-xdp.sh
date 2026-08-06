@@ -136,9 +136,17 @@ set +e
 run_verifier
 VERIFY_RC=$?
 set -e
+# #4555/#6923: how the install line below describes the gate. Only rc=0 is a
+# measured PASS; rc=6 installed because the operator suppressed the floor, and
+# saying "PASS" for it prints the one word an operator greps for to confirm the
+# gate was satisfied. The warning on stderr is not enough: stdout and stderr are
+# routinely read apart (CI log panes, `2>/dev/null`), so the verdict has to be
+# correct in the line that carries it.
+VERIFY_VERDICT="verifier PASS"
 case "${VERIFY_RC}" in
 0) ;;
 6)
+	VERIFY_VERDICT="verifier headroom gate OVERRIDDEN (XPF_SHIM_ALLOW_LOW_HEADROOM=1), NOT a measured pass"
 	# #4555: the headroom gate was OVERRIDDEN. Install (the operator asked
 	# for it) but never silently: a distinct code exists so this is
 	# distinguishable from a measured PASS without reading stderr.
@@ -186,7 +194,7 @@ if [[ "${UNPINNED}" -eq 1 && "${XPF_SHIM_ALLOW_UNPINNED_INSTALL:-0}" != "1" ]]; 
 fi
 
 install -m 0644 "${CANDIDATE}" "${OUT_FILE}"
-echo "build-userspace-xdp.sh: verifier PASS — installed ${OUT_FILE} (toolchain ${TOOLCHAIN}, bpf-linker ${BPF_LINKER_VERSION})"
+echo "build-userspace-xdp.sh: ${VERIFY_VERDICT} — installed ${OUT_FILE} (toolchain ${TOOLCHAIN}, bpf-linker ${BPF_LINKER_VERSION})"
 
 # --- Refresh the source→object freshness manifest (#4977). ---
 # `make build` never runs `make generate`, and `make test` never
