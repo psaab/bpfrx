@@ -68670,3 +68670,41 @@ than after, so this does not repeat the defect it corrects. The enclosing
 paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
+- **Timestamp**: 2026-08-06
+  **Action**: #5275 PR2 fold r2 — BLOCKER: the facade introduced a
+  nil-dereference daemon PANIC on its own revocation path. The backend's
+  GetPersistentNAT is `return m.PersistentNAT` (pkg/dataplane/loader.go), a
+  plain field read that never transitions non-nil -> nil. The facade's gate
+  does. Four consumers were written against the old guarantee and called the
+  getter once PER USE — nil-check, then Len(), then Clear() — so a revocation
+  landing between the guard and the dereference returns nil to the second call,
+  and PersistentNATTable.Len/Clear/All all take the table's mutex with NO
+  nil-receiver guard. Reachable in production: runBootstrapExitStartup calls
+  setDataplane(nil) while handler goroutines serve, and pkg/grpcapi chains no
+  panic-recovery interceptor (server.go: fabric auth + allowlist only), so a
+  handler panic takes down xpfd.
+  Fixed at all four sites by fetching ONCE and checking the fetched value —
+  pkg/cli/cli_clear.go clearPersistentNAT, pkg/grpcapi
+  server_diag_system_action.go clear-persistent-nat, and both pkg/natshow
+  persistent.go renderers (shared by the CLI and gRPC show surfaces). That
+  removes the window rather than masking it. Deliberately NOT fixed with
+  nil-receiver guards on PersistentNATTable: a nil-receiver Clear() that
+  silently succeeds would report "Cleared 0 persistent NAT bindings" for a
+  revoked dataplane — a false success, worse than the panic in the one respect
+  that matters. The gRPC site uses two early returns instead of a typed local
+  so the fix does not add a root pkg/dataplane import and widen the #1451
+  retirement-boundary surface for a nil check.
+  Swept every other delegator for the same shape and found none:
+  GetMapStats returns a nil SLICE (len/range only, value elements),
+  PolicySchedulerActiveState a nil MAP (read-only at both consumers), Compile's
+  sole consumer discards the result and checks the error, AppliedNATView's three
+  consumers all test Available and Config != nil, and every ProcessStatus
+  consumer checks the error first (ProcessStatus has no pointer fields).
+  Verified by reading each call site.
+  Also corrected a self-contradicting claim in dataplane_facade_probes.go: the
+  transitive signature proof covers drift on the BACKEND side only. Consumer-side
+  drift is caught by nothing, because a consumer's fakes track its own
+  declaration — which is exactly why losing cliUserspaceControlProvider left the
+  whole Go suite green. The old text asserted the opposite two paragraphs after
+  recording the counter-example.
+  **File(s)**: pkg/daemon/dataplane_facade.go, pkg/daemon/dataplane_facade_probes.go, pkg/daemon/dataplane_facade_consumer_binding_5275_test.go, pkg/daemon/dataplane_facade_probe_coverage_5275_test.go, pkg/cli/cli_clear.go, pkg/grpcapi/server_diag_system_action.go, pkg/natshow/persistent.go

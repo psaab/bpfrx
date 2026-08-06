@@ -52,16 +52,33 @@ import (
 //     the one alternative form it knows of (an inline `interface{...}` literal is
 //     resolved, not skipped).
 //
-//   - SIGNATURE agreement with the consumer's own declaration is not proved HERE,
-//     because these are copies: pkg/api, pkg/cli and pkg/grpcapi keep their probe
-//     interfaces package-private and pkg/daemon imports all three, so the daemon
-//     cannot name them. It is proved TRANSITIVELY instead. A consumer probe is
-//     only useful if the real backend satisfies it, so a signature change to a
-//     probe comes with the same change to *dpuserspace.LegacyDataPlaneAdapter —
-//     and that breaks `var _ facadeBackend = (*dpuserspace.LegacyDataPlaneAdapter)(nil)`
-//     (dataplane_facade.go) plus the facade's own delegating call. A probe whose
-//     signature drifts AWAY from the backend is a bug in that consumer, caught by
-//     that consumer's tests, not a facade-coverage gap.
+//   - SIGNATURE agreement with the consumer's own declaration is proved only in
+//     ONE DIRECTION, and the other direction is guarded by nothing. These mirrors
+//     are copies: pkg/api, pkg/cli and pkg/grpcapi keep their probe interfaces
+//     package-private and pkg/daemon imports all three, so the daemon cannot name
+//     them.
+//
+//     What IS covered is drift on the BACKEND side. A signature change to
+//     *dpuserspace.LegacyDataPlaneAdapter breaks
+//     `var _ facadeBackend = (*dpuserspace.LegacyDataPlaneAdapter)(nil)`
+//     (dataplane_facade.go) and the facade's own delegating call, so it cannot
+//     land quietly.
+//
+//     What is NOT covered is drift on the CONSUMER side. If a consumer edits its
+//     probe to a signature the backend does not have — say `Status() error` — the
+//     facade stops satisfying it, the build stays green, and the probe fails at
+//     runtime. Do not reach for "its own tests would catch that": they would not,
+//     and this PR is the proof. pkg/cli's tests construct a CLI from their own
+//     fakes, and a fake is written to satisfy the consumer's OWN declaration, so
+//     it tracks the drift instead of exposing it — which is exactly why losing
+//     cliUserspaceControlProvider left the whole Go suite green (see the note on
+//     facadeUserspaceControlProbe below).
+//
+//     This is a future hazard rather than a live defect: no consumer probe today
+//     declares a signature the backend lacks, and the compile assertions below
+//     would not build if one did. Closing it properly means one shared
+//     declaration both sides import, which is a refactor of three packages'
+//     visibility, not a comment.
 
 // facadeStatusProbe mirrors the userspace-helper status probe. Four call sites
 // assert this shape against the handle they hold: pkg/api/nat.go

@@ -49,6 +49,13 @@ import (
 // with the construction sites asserted by TestEveryExternalConsumerHoldsTheFacade.
 var consumerProbePackages = []string{"../api", "../cli", "../grpcapi"}
 
+// persistentNATConsumerPackages are the packages that reach the persistent-NAT
+// table through a handle that may be the facade. pkg/natshow is included and the
+// probe list above is not the right set: natshow renders through its own Reader
+// interface, which the facade satisfies, and it is the shared implementation
+// behind BOTH the CLI and gRPC show surfaces.
+var persistentNATConsumerPackages = []string{"../api", "../cli", "../grpcapi", "../natshow"}
+
 // dataplaneHandleField is the field name every consumer stores its handle in.
 const dataplaneHandleField = "dp"
 
@@ -241,4 +248,109 @@ func interfaceMethodNames(t *testing.T, pkg, file string, line int, it *ast.Inte
 		names = append(names, interfaceMethodNames(t, pkg, file, line, embedded, ifaces, seen)...)
 	}
 	return names
+}
+
+// TestPersistentNATIsFetchedOncePerFunction pins the fetch-once discipline that
+// keeps the facade's GetPersistentNAT from crashing the daemon (#5275).
+//
+// The hazard is specific and does not generalise from the other delegators. The
+// backend's GetPersistentNAT is a plain field read that never transitions
+// non-nil -> nil; the facade's gate does, the instant the dataplane is dropped.
+// A consumer that calls the getter once to nil-check and again to dereference
+// therefore has a window in which the second call returns nil — and
+// PersistentNATTable.Len/Clear/All all take the table's mutex with no
+// nil-receiver guard, so that dereference PANICS a handler goroutine, in a gRPC
+// server that chains no panic-recovery interceptor.
+//
+// Fetching once and checking the fetched value removes the window rather than
+// masking it. This scan enforces that shape mechanically, because the safe and
+// unsafe versions look nearly identical in review and only the unsafe one is a
+// crash. A function is allowed AT MOST ONE call: the count is per top-level
+// function (nested closures included), so a closure that re-fetches inside a
+// function that already fetched is a failure too — that is the same window.
+//
+// Deliberately NOT solved by nil-receiver guards on PersistentNATTable: a
+// nil-receiver Clear() that silently succeeds would report "Cleared 0
+// persistent NAT bindings" for a revoked dataplane, replacing a loud crash with
+// a quiet lie to the operator.
+func TestPersistentNATIsFetchedOncePerFunction(t *testing.T) {
+	const getter = "GetPersistentNAT"
+
+	type callSite struct {
+		fn    string
+		file  string
+		count int
+	}
+	var offenders []callSite
+	callers := 0
+
+	for _, dir := range persistentNATConsumerPackages {
+		fset := token.NewFileSet()
+		pkgs, err := parser.ParseDir(fset, dir, func(fi fs.FileInfo) bool {
+			return !strings.HasSuffix(fi.Name(), "_test.go")
+		}, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", dir, err)
+		}
+		if len(pkgs) == 0 {
+			t.Fatalf("parsed no packages in %s — the scan is reading nothing", dir)
+		}
+
+		for _, pkg := range pkgs {
+			for path, f := range pkg.Files {
+				for _, decl := range f.Decls {
+					fn, ok := decl.(*ast.FuncDecl)
+					if !ok || fn.Body == nil {
+						continue
+					}
+					n := 0
+					ast.Inspect(fn.Body, func(node ast.Node) bool {
+						call, ok := node.(*ast.CallExpr)
+						if !ok {
+							return true
+						}
+						if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == getter {
+							n++
+						}
+						return true
+					})
+					if n == 0 {
+						continue
+					}
+					callers++
+					if n > 1 {
+						offenders = append(offenders, callSite{
+							fn:    fn.Name.Name,
+							file:  filepath.Join(dir, filepath.Base(path)),
+							count: n,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	if len(offenders) > 0 {
+		var detail []string
+		for _, o := range offenders {
+			detail = append(detail, fmt.Sprintf("%s: %s calls %s() %d times",
+				o.file, o.fn, getter, o.count))
+		}
+		sort.Strings(detail)
+		t.Fatalf("a consumer fetches the persistent-NAT table more than once in one function. "+
+			"Through the revocable facade the later fetch can return nil when the earlier one "+
+			"did not, and the table's mutex-taking methods have no nil-receiver guard — so this "+
+			"is a daemon PANIC, not a redundancy. Fetch once into a local and check that "+
+			"(#5275):\n  %s", strings.Join(detail, "\n  "))
+	}
+
+	// Floor: a scan that stops recognising the call shape would otherwise pass
+	// over nothing and read as compliance. Bump deliberately when a consumer is
+	// genuinely added or removed.
+	const wantCallers = 4
+	if callers != wantCallers {
+		t.Fatalf("found %d functions calling %s(), expected %d — if a consumer was genuinely "+
+			"added or removed, update wantCallers (and make sure the new one fetches ONCE); if "+
+			"not, the scan has narrowed and is no longer proving anything", callers, getter, wantCallers)
+	}
 }

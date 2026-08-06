@@ -1,10 +1,15 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/netip"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
@@ -12,6 +17,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/grpcapi"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/natshow"
 )
 
 // #5275 PR2 — the facade must not NARROW the dynamic type below what consumers
@@ -41,6 +47,7 @@ type probeBindingBackend struct {
 
 	schedulerState map[string]bool
 	natView        dpuserspace.AppliedNATView
+	persistentNAT  *dataplane.PersistentNATTable
 
 	v4 []sessionRow
 	v6 []sessionRowV6
@@ -123,8 +130,131 @@ func (d *probeBindingBackend) IterateSessionsV6From(cursor *dataplane.SessionKey
 	return nil
 }
 
+func (d *probeBindingBackend) GetPersistentNAT() *dataplane.PersistentNATTable {
+	return d.persistentNAT
+}
+
 func newProbeBindingBackend() *probeBindingBackend {
 	return &probeBindingBackend{fakeFacadeBackend: &fakeFacadeBackend{}}
+}
+
+// revokeOnFirstPersistentNATFetch arms the facade's test-only seam so the very
+// first GetPersistentNAT call revokes the facade AFTER returning its result.
+// That reproduces, deterministically, the window a consumer opens when it calls
+// the getter once to nil-check and again to dereference: the guard sees a live
+// table, revocation lands, and the second fetch returns nil.
+//
+// The alternative — revoking from another goroutine and hoping it lands in the
+// window — passes on broken code whenever it loses the race, which is most of
+// the time. Set before the facade is handed to any consumer, so nothing reads
+// the field concurrently with the write.
+func revokeOnFirstPersistentNATFetch(f *dataplaneFacade) {
+	var once sync.Once
+	f.afterGetPersistentNAT = func() { once.Do(f.Revoke) }
+}
+
+// persistentNATFixture is a table with one binding, so a successful clear
+// reports a count that an "unavailable" answer cannot fake.
+func persistentNATFixture() *dataplane.PersistentNATTable {
+	t := dataplane.NewPersistentNATTable()
+	t.Save(&dataplane.PersistentNATBinding{
+		SrcIP:    netip.MustParseAddr("10.0.1.5"),
+		SrcPort:  1234,
+		NatIP:    netip.MustParseAddr("203.0.113.7"),
+		NatPort:  5678,
+		PoolName: "p1",
+		LastSeen: time.Now(),
+		Timeout:  time.Minute,
+	})
+	return t
+}
+
+// TestFacadeRevocationMidCallDoesNotPanicTheClearPath is the regression test for
+// the daemon crash this facade introduced.
+//
+// The backend the facade replaced returns m.PersistentNAT — a plain field read
+// that never transitions non-nil -> nil. The facade's gate CAN, and four
+// consumers called the getter once to nil-check and again to dereference.
+// PersistentNATTable.Len/Clear/All all take the table's mutex with no
+// nil-receiver guard, so the second fetch returning nil panics the handler —
+// and pkg/grpcapi chains no panic-recovery interceptor, so that kills xpfd.
+//
+// The window is reachable in production: runBootstrapExitStartup calls
+// setDataplane(nil) on an arm failure while handler goroutines are serving.
+//
+// The panic is recovered here and reported as an assertion so the failure is a
+// readable test result rather than a dead test binary.
+func TestFacadeRevocationMidCallDoesNotPanicTheClearPath(t *testing.T) {
+	be := newProbeBindingBackend()
+	be.persistentNAT = persistentNATFixture()
+
+	f := facadeOver(t, be)
+	revokeOnFirstPersistentNATFetch(f)
+
+	srv := grpcapi.NewServer("", grpcapi.Config{Store: emptyConfigStore(t), DP: f})
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("clear-persistent-nat PANICKED when the facade was revoked between the "+
+				"consumer's nil guard and its dereference — this is a daemon crash on the exact "+
+				"path #5275 exists to make safe, and gRPC has no panic-recovery interceptor to "+
+				"contain it. Fetch the table ONCE and check the fetched value. panic: %v", r)
+		}
+	}()
+
+	resp, err := srv.SystemAction(context.Background(), &pb.SystemActionRequest{
+		Action: "clear-persistent-nat",
+	})
+	if err != nil {
+		t.Fatalf("SystemAction(clear-persistent-nat): %v", err)
+	}
+
+	// Non-vacuity: the handler must have reached the real table it fetched
+	// before revocation, not bailed out on the "unavailable" branch — otherwise
+	// this test would pass without ever entering the dangerous window.
+	if got := resp.GetMessage(); got != "Cleared 1 persistent NAT bindings" {
+		t.Fatalf("clear reported %q — the handler never reached the table it fetched, so this "+
+			"test did not exercise the revocation window at all", got)
+	}
+}
+
+// TestFacadeRevocationMidCallDoesNotPanicTheRenderPath is the same window on the
+// .All() shape, through a different consumer. pkg/natshow's renderers are shared
+// by BOTH the CLI and gRPC persistent-NAT show surfaces, so binding them here
+// covers the two sites pkg/cli's package-private dispatcher puts out of reach.
+func TestFacadeRevocationMidCallDoesNotPanicTheRenderPath(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		render func(io.Writer, natshow.Reader)
+	}{
+		{"RenderPersistent", natshow.RenderPersistent},
+		{"RenderPersistentDetail", natshow.RenderPersistentDetail},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			be := newProbeBindingBackend()
+			be.persistentNAT = persistentNATFixture()
+
+			f := facadeOver(t, be)
+			revokeOnFirstPersistentNATFetch(f)
+
+			var buf bytes.Buffer
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("%s PANICKED when the facade was revoked between the nil guard and "+
+						"the All() dereference — a daemon crash on a read-only show path. Fetch "+
+						"the table ONCE and check the fetched value. panic: %v", tc.name, r)
+				}
+			}()
+
+			tc.render(&buf, f)
+
+			if out := buf.String(); !strings.Contains(out, "203.0.113.7") {
+				t.Fatalf("%s did not render the binding it fetched (%q) — it took the "+
+					"'not available' branch, so the revocation window was never entered",
+					tc.name, out)
+			}
+		})
+	}
 }
 
 // facadeOver wraps be and fails the test if the union rejects it — a nil facade
