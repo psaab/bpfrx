@@ -148,6 +148,14 @@ func (discardingDataPlane) GetPersistentNAT() *PersistentNATTable {
 // predict the real run. A hard failure inside that excluded remainder therefore
 // still occurs post-mutation; that residual is named rather than papered over,
 // and closing it needs the interface-resolution soft skips addressed first
+//
+// One more site sits outside BOTH the table and the exclusion prose above:
+// `dp.BumpFIBGeneration()` (compiler.go), which returns an error the caller
+// deliberately discards under the fire-and-forget contract documented at
+// dataplane.go. It is listed here only so a reader auditing coverage does not
+// have to rediscover that it is neither covered nor an omission -- it cannot
+// produce a returned CompileConfig error, so it is out of scope by construction
+// rather than by choice
 // (#6893).
 //
 // The double compile is safe with respect to ID assignment:
@@ -225,13 +233,25 @@ func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) [
 		{"default policy", func() error { return compileDefaultPolicy(dp, cfg) }},
 		{"flow timeouts", func() error { return compileFlowTimeouts(dp, cfg) }},
 		// #6894 r1 F2: the ONE config-shape hard error still reachable after the
-		// mutation point. validateFilterProtocols is the FIRST statement of
-		// Phase 10 (compiler_filter.go:26) and is purely a function of cfg --
-		// no result, no dp, no logging -- so validating it here cannot read
-		// anything a later phase set up, and the existing in-place call is left
-		// untouched. Reachable via the TOLERANT load paths (Store.Load boot,
-		// Store.SyncApply HA peer-sync), which downgrade the strict rejection to
-		// a warning and then reach CompileConfig.
+		// mutation point. validateFilterProtocols is the first FALLIBLE
+		// statement of Phase 10 -- one local map init precedes it
+		// (compiler_filter.go:19), so it is not literally the first statement --
+		// and is purely a function of cfg: no result, no dp, no logging. So
+		// validating it here cannot read anything a later phase set up, and the
+		// existing in-place call is left untouched. Reachable via the TOLERANT
+		// load paths (Store.Load boot, Store.SyncApply HA peer-sync), which
+		// downgrade the strict rejection to a warning and then reach
+		// CompileConfig.
+		//
+		// PRECEDENCE, deliberate: hoisting this changes which error an operator
+		// SEES when a config carries both a Phase-2 fault and a bad filter
+		// protocol. The whole pre-pass runs before compileZones, so a config
+		// with an unknown screen-profile ref AND `from protocol bogus-proto`
+		// now reports the filter error, where it previously reported
+		// `compile zones: screen profile ... not found`. Both are hard errors
+		// and both abort the same apply, so nothing reaches the dataplane
+		// either way -- only the message changes. Do not "fix" this by moving
+		// the row later; the ordering is what keeps the mutation point clean.
 		{"firewall filter protocols", func() error { return validateFilterProtocols(cfg) }},
 		{"flow config", func() error { return compileFlowConfig(dp, cfg, result) }},
 	}
@@ -267,13 +287,24 @@ func newValidationResult() *CompileResult {
 // isValidationPass reports whether dp is the pre-pass's discarding shim.
 //
 // #6894 r1 F3: the covered phases log unconditionally, so running them twice
-// doubled every compile's INFO output (measured 15 -> 22 lines) and one line
-// printed a value that was FALSE for the run the operator cares about:
+// repeats their INFO output, and one line printed a value that was FALSE for
+// the run the operator cares about:
 // compileFlowConfig logs lo0_filter_v4 from a pass where compileFirewallFilters
 // has not run, so the sentinel 65535 is emitted immediately before the real
 // pass logs the armed id. An operator asking "did my lo0 filter arm?" read NO
 // then YES for one apply. CLAUDE.md restricts slog.Info to state transitions and
 // one-time events; a discarded validation pass is neither.
+//
+// SCOPE — this gate is PARTIAL, and reading it as "the pre-pass no longer
+// double-logs" is wrong. It suppresses the sites it is wired into; a
+// substantial inventory of INFO/WARN sites inside the covered phases still
+// logs unconditionally and therefore still emits twice. Measured on a
+// composite config: 25 INFO/WARN records, of which eleven distinct
+// covered-phase records appeared twice. The known-ungated sites are the
+// application compiler (compiler.go), the NAT/DNAT/static-NAT/NPTv6/NAT64
+// families (compiler_nat.go), and the flow-timeouts record (compiler.go).
+// Tracked as #6903 — do NOT infer from this comment that a duplicate you are
+// looking at is impossible.
 //
 // The marker rides on the DATAPLANE rather than on CompileResult because two of
 // the validated phases (compileDefaultPolicy, compileFlowTimeouts) do not take a

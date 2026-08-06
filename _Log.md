@@ -1,3 +1,51 @@
+## 2026-08-05 — #6894 round 3: the log-gating item was PARTIAL, and the count that proved it was unreproducible
+
+- **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
+- **Action**: Correct four claims the Codex gate refuted; file the real residue
+  as #6903. Comment-only in Go — `git diff -U0 -- '*.go'` shows zero non-comment
+  changed lines.
+- **File(s)**: `pkg/dataplane/compiler_validate_4960.go`, `_Log.md`
+
+Codex returned MERGE-NEEDS-MINOR with no runtime findings. What it refuted:
+
+1. **"the pre-pass log duplication is suppressed via `isValidationPass(dp)`"**
+   is PARTIAL, not closed. The gate suppresses the sites it is wired into; a
+   large inventory inside the covered phases still logs unconditionally and
+   still emits twice — applications, the NAT/DNAT/static-NAT/NPTv6/NAT64
+   families, and flow timeouts. Measured on a composite config: 25 INFO/WARN
+   records, eleven distinct covered-phase records appearing twice. Reproduction:
+   make `failLaterPhaseConfig()` valid, set `UDPSessionTimeout = 30`, and one
+   `udp=30` record prints twice. Filed as **#6903**; the round-2 log entry now
+   says PARTIAL and the doc comment carries the scope limit plus the issue
+   pointer, so nobody reads it as "duplicates are impossible".
+
+2. **"measured 15 -> 22 lines"** was unbound. The fixture that produced those
+   numbers was never recorded, so the claim is unreproducible — the likely
+   `idProbeConfig()` candidate now emits 12. Deleted rather than re-measured: a
+   count assertion has to ship with the fixture that produces it, which is what
+   #6903 says to do if a count is wanted.
+
+3. **"validateFilterProtocols is the FIRST statement of Phase 10"** is
+   literally false — a local map init precedes it. Corrected to "first FALLIBLE
+   statement", which is the property the hoist actually depends on.
+
+4. **`dp.BumpFIBGeneration()`** sat outside both the phase table and the
+   exclusion prose while being able to return an error. Named in the exclusion
+   prose as out-of-scope-by-construction (the caller discards it under the
+   fire-and-forget contract, so it cannot produce a returned CompileConfig
+   error) so the next coverage audit does not have to rediscover it.
+
+Also documented, not changed: hoisting the filter row changes operator-visible
+diagnostic PRECEDENCE. A config carrying both an unknown screen-profile ref and
+`from protocol bogus-proto` now reports the filter error where it previously
+reported `compile zones: screen profile ... not found`. Both are hard errors
+aborting the same apply — nothing reaches the dataplane either way — so only the
+message changes. The comment says not to "fix" it by moving the row later,
+because the ordering is what keeps the mutation point clean.
+
+Validation: `go build ./...` rc 0; `go test ./pkg/dataplane/ -count=1` ok;
+`gofmt -l` clean; Go diff verified comment-only.
+
 ## 2026-08-05 — #6894 round 2: the coverage count went stale again, in the fix for it
 
 - **Timestamp**: 2026-08-05 (fix/4960-validate-before-mutate, PR #6894)
@@ -5,7 +53,9 @@
   assertion exists (`TestValidationPhaseTableMatchesDocumentedCoverage_4960` pins
   length AND name order), `validateFilterProtocols` is hoisted in and is
   idempotent (reads `cfg` only), the pre-pass log duplication is suppressed via
-  `isValidationPass(dp)`, and the test fixture now uses synthetic names
+  `isValidationPass(dp)` **at the sites it is wired into — see the round-3 entry
+  above: that item is PARTIAL, not closed**, and the test fixture now uses
+  synthetic names
   (`xpft4960a`/`xpft4960b`) behind a `skipIfCouldMutateAHost` root guard.
   The fifth item came back: `compiler_validate_4960.go` still said **"Eleven of
   the thirteen fallible post-zones phases"** while the table it introduces now
