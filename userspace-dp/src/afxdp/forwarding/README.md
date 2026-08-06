@@ -341,15 +341,19 @@ limitation, tracked by #2387.
   used to alias too; it is keyed on the LOGICAL (VLAN unit) ingress ifindex
   since `42bc6bc88`, so two units of one parent no longer share a cache
   entry. Only the ifindex-less conntrack table remains.
-- **Interim mitigation + deferred real fix.** The Go compiler emits a
-  commit WARNING (`validateVRFOverlap`, `pkg/config`) when two distinct
-  routing-instances carry overlapping L3 address space, so the operator is
-  told the topology is not session-isolated (the config still commits — an
-  overlapping-subnet PBR VRF is a legitimate working design). The real fix
-  (Track B) adds a **symmetric routing-domain id** to `SessionKey` +
-  `FlowCacheLookup` + the reverse-key transforms — the discriminator MUST
-  be the routing-domain id (symmetric across forward/reply), NOT zone or
-  ingress-ifindex (asymmetric → breaks conntrack reverse matching).
+- **Interim mitigation + candidate real fix (UNDECIDED).** The Go compiler
+  emits a commit WARNING (`validateVRFOverlap`, `pkg/config`) when two
+  distinct routing-instances carry overlapping L3 address space, so the
+  operator is told the topology is not session-isolated (the config still
+  commits — an overlapping-subnet PBR VRF is a legitimate working design).
+  That warning states the limitation and points at #2387; it deliberately
+  does NOT promise a fix, because none is committed to. The candidate fix
+  (Track B) *would* add a **symmetric routing-domain id** to `SessionKey` +
+  `FlowCacheLookup` + the reverse-key transforms — if taken, the
+  discriminator MUST be the routing-domain id (symmetric across
+  forward/reply), NOT zone or ingress-ifindex (asymmetric → breaks conntrack
+  reverse matching). Whether to take it is an open maintainer decision on
+  #2387, not a scheduled change.
 - **The HA session-sync wire does NOT need a version bump** (corrected in
   plan v5 §0a; the plan's own §4d said otherwise). The domain does not have
   to live in the fixed-width wire KEY block — it rides as a length-gated

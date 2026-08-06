@@ -101,9 +101,10 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// PBR table override, so a second colliding flow inherits the first's cached
 	// egress / NAT / policy). A WARNING, never a reject: overlapping-subnet
 	// multi-tenant VRF via PBR is a legitimate working design; the config still
-	// commits, the operator is told it is not session-isolated. The VRF-aware
-	// session key is the deferred real fix (Track B — SessionKey widening + HA
-	// wire bump).
+	// commits, the operator is told it is not session-isolated. Whether to widen
+	// the session identity (Track B — a routing-domain id in SessionKey) is an
+	// OPEN #2387 decision, so the warning states the limitation and points at
+	// the issue rather than promising a fix.
 	cfg.Warnings = append(cfg.Warnings, validateVRFOverlap(cfg)...)
 
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust

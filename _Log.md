@@ -1,3 +1,49 @@
+## 2026-08-05 — #2387 A.1: the warning promised an outcome #2387 has not decided
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording)
+- **Action**: Reword the `validateVRFOverlap` commit warning so it states the
+  CURRENT limitation and points at #2387, instead of promising that the session
+  identity becomes VRF-aware. Add two tests that keep forward-looking wording
+  out of both format strings without letting the diagnostic be gutted.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `pkg/config/compiler_tailgates.go`,
+  `docs/research/2387-vrf-flow-identity/plan.md`,
+  `userspace-dp/src/afxdp/forwarding/README.md`
+
+The shipped text said colliding 5-tuples may cross-forward "until the session
+identity is VRF-aware". #2387 is held on a maintainer risk-appetite call and
+neither candidate end-state — the hard-reject posture, or the VRF-aware session
+key (Track B) — is decided, so that clause asserted an outcome that may never
+arrive. It was also circular: the #2387 plan cited the warning text back as
+evidence that the widening was already settled, while the warning had been
+written from the plan's assumption. Both sides are now decoupled; the plan
+bullet that leaned on the warning records that the argument is retired and is
+evidence for neither branch.
+
+Mutation proof (a guard is worthless until watched to fail), 2x2, orthogonal:
+
+| Mutation | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| restore "until…VRF-aware" in both format strings | RED (both arms) | GREEN |
+| strip diagnostic substance, keep no-promise wording | GREEN | RED |
+
+The second row is the negative control: without it, the no-promise test is
+satisfied just as well by deleting the warning text wholesale. The fixture
+helper asserts each arm was actually reached (`both carry` vs `carry
+overlapping L3`) before asserting on it — a single fixture binds one match arm,
+so a "both format strings" claim made from one fixture would be vacuous.
+
+A first mutation attempt was a no-op: the substitution anchored on the wrong
+tab depth, matched nothing, and the suite stayed green — which is
+indistinguishable from a passing guard. Counting the applied substitutions
+before reading the result is what caught it.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.9s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean on all three Go files; post-mutation restore verified
+byte-identical with `cmp`.
+
 ## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

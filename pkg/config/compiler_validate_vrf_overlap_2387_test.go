@@ -15,10 +15,17 @@ import (
 // These tests pin: (1) two RIs with overlapping addresses on their member
 // interface units WARN, naming both RIs + the prefix; (2) non-overlapping RIs
 // do NOT warn (no false positive); (3) a single RI / no RI does NOT warn;
-// (4) the PBR-term source (`then routing-instance`) also feeds the overlap set.
+// (4) the PBR-term source (`then routing-instance`) also feeds the overlap set;
+// (5) the warning states the CURRENT limitation and points at the tracking
+// issue instead of promising a fix, and (6) losing the promise did not cost the
+// diagnostic any of its substance.
 //
 // fail-on-revert: removing the validateVRFOverlap call (or its detection body)
-// drops the warning, so TestVRFOverlapWarnsOnOverlappingRIs goes RED.
+// drops the warning, so TestVRFOverlapWarnsOnOverlappingRIs goes RED. Restoring
+// the old "…may cross-forward until the session identity is VRF-aware" wording
+// reds TestVRFOverlapWarningStatesStatusNotPromise on the "until" token, while
+// TestVRFOverlapWarningKeepsDiagnosticSubstance stays GREEN — that pair is what
+// distinguishes "the promise is gone" from "the diagnostic is gone".
 
 // vrf2387Warnings returns the compile warnings that mention #2387.
 func vrf2387Warnings(t *testing.T, cmds []string) []string {
@@ -132,5 +139,123 @@ func TestVRFOverlapV6NoCrossFamilyFalsePositive(t *testing.T) {
 	})
 	if len(warns) != 0 {
 		t.Fatalf("cross-family (v4 vs v6) must not warn, got: %v", warns)
+	}
+}
+
+// vrfOverlapForwardLookingTokens are the wordings that turn the advisory from a
+// statement of the CURRENT limitation into a promise about a future one. #2387
+// is held on a maintainer risk-appetite call: neither candidate end-state (the
+// hard-reject posture, or the VRF-aware session key) is decided, so the warning
+// must not assert that either one arrives. The original text said colliding
+// 5-tuples may cross-forward "until the session identity is VRF-aware", and the
+// #2387 plan then cited that sentence back as evidence the widening was already
+// settled — a promise the open decision may never keep.
+var vrfOverlapForwardLookingTokens = []string{
+	"until",
+	"will be",
+	"planned",
+	"future",
+	"deferred",
+	"upcoming",
+	"roadmap",
+	"once the session",
+	"when the session",
+}
+
+// vrfOverlapBothFormStrings returns one warning from EACH of the two format
+// strings in validateVRFOverlap: the equal-prefix form (both RIs carry the
+// identical prefix) and the unequal-overlap form (the prefixes overlap without
+// being equal). A fixture that hits only one arm leaves the other's wording
+// unbound, so every wording assertion below runs against both.
+func vrfOverlapBothFormStrings(t *testing.T) (equal, unequal string) {
+	t.Helper()
+
+	eq := vrf2387Warnings(t, []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.2/24",
+		"set routing-instances RI-A instance-type virtual-router",
+		"set routing-instances RI-A interface ge-0/0/1.0",
+		"set routing-instances RI-B instance-type virtual-router",
+		"set routing-instances RI-B interface ge-0/0/2.0",
+	})
+	if len(eq) != 1 {
+		t.Fatalf("equal-prefix fixture: want 1 warning, got %d: %v", len(eq), eq)
+	}
+	// 10.0.0.0/24 vs 10.0.0.0/25 overlap but are not equal, so this reaches the
+	// second format string. Assert the arm separation actually held rather than
+	// trusting the fixture: if both fixtures produced the same form, every
+	// "both format strings" claim below would be vacuous.
+	un := vrf2387Warnings(t, []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.0.1/24",
+		"set interfaces ge-0/0/2 unit 0 family inet address 10.0.0.2/25",
+		"set routing-instances RI-A instance-type virtual-router",
+		"set routing-instances RI-A interface ge-0/0/1.0",
+		"set routing-instances RI-B instance-type virtual-router",
+		"set routing-instances RI-B interface ge-0/0/2.0",
+	})
+	if len(un) != 1 {
+		t.Fatalf("unequal-overlap fixture: want 1 warning, got %d: %v", len(un), un)
+	}
+	if !strings.Contains(eq[0], "both carry") {
+		t.Fatalf("equal-prefix fixture did not reach the equal-prefix format string: %s", eq[0])
+	}
+	if !strings.Contains(un[0], "carry overlapping L3") {
+		t.Fatalf("unequal fixture did not reach the unequal-overlap format string: %s", un[0])
+	}
+	return eq[0], un[0]
+}
+
+// TestVRFOverlapWarningStatesStatusNotPromise pins that BOTH format strings
+// describe the current limitation and point at the tracking issue, without
+// asserting that any particular fix arrives. Restoring the old "…may
+// cross-forward until the session identity is VRF-aware" wording reds this on
+// the "until" token.
+func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
+	equal, unequal := vrfOverlapBothFormStrings(t)
+	for _, tc := range []struct {
+		form string
+		warn string
+	}{
+		{"equal-prefix", equal},
+		{"unequal-overlap", unequal},
+	} {
+		lower := strings.ToLower(tc.warn)
+		for _, tok := range vrfOverlapForwardLookingTokens {
+			if strings.Contains(lower, tok) {
+				t.Errorf("%s form promises a fix via %q; #2387 is an open decision, so the warning must state the limitation and point at the issue: %s",
+					tc.form, tok, tc.warn)
+			}
+		}
+		if !strings.Contains(tc.warn, "#2387") {
+			t.Errorf("%s form does not point at the tracking issue: %s", tc.form, tc.warn)
+		}
+	}
+}
+
+// TestVRFOverlapWarningKeepsDiagnosticSubstance is the negative control for
+// TestVRFOverlapWarningStatesStatusNotPromise. Dropping the promise must not
+// cost the operator the diagnosis: the warning still has to say WHAT is wrong
+// (no routing-instance discriminator in the session identity) and WHAT the
+// consequence is (colliding 5-tuples may cross-forward). Without this pair, the
+// forward-looking-token test above is satisfied just as well by deleting the
+// warning text wholesale.
+func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
+	equal, unequal := vrfOverlapBothFormStrings(t)
+	for _, tc := range []struct {
+		form string
+		warn string
+	}{
+		{"equal-prefix", equal},
+		{"unequal-overlap", unequal},
+	} {
+		for _, want := range []string{
+			"NOT session-isolated",
+			"no routing-instance discriminator",
+			"cross-forward",
+		} {
+			if !strings.Contains(tc.warn, want) {
+				t.Errorf("%s form lost diagnostic substance %q: %s", tc.form, want, tc.warn)
+			}
+		}
 	}
 }
