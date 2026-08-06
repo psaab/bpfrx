@@ -152,8 +152,35 @@ Standard library only.
   dropping locally-originated traffic via the slow-path TUN, and `nil`
   returned. `Manager.activationPending` is set when Apply enters the
   pass and cleared only after the tail completes, so no other owner can
-  discharge it. The write-error path is unaffected: it always returns a
-  non-nil error, so it can never report a false success.
+  discharge it.
+- **The write/remove-error path owes the tail too, and did not ARM it
+  (#5718 fold r7).** This paragraph used to end "the write-error path is
+  unaffected: it always returns a non-nil error, so it can never report a
+  false success", and that reasoning is what produced the bug. The error
+  return is truthful for THAT Apply. What it does not do is record the
+  obligation for the NEXT one: `activationPending = true` had a single
+  assignment, in the success path, which the error branch returns before
+  reaching — the tail was never armed, not merely skipped. The branch does
+  arm the GLOBAL debt, and any reload owner discharges that. So a
+  device-map teardown that removes the offending stale marker and reloads
+  successfully clears the global debt while performing neither tail
+  operation, and the byte-identical Apply that follows sees no change, no
+  global debt, no reconfigure debt and no activation debt — and returns
+  `nil` having run neither the per-interface `reconfigure` nor
+  `restoreSlowPathRPFilter`. The error branch now arms `activationPending`
+  before its own reload attempt, and deliberately does NOT clear it when
+  that reload succeeds: the reload is half the tail, and the reconfigure
+  half still has not run.
+- **The debt does not survive the PROCESS (#5718 fold r7, disclosed not
+  fixed).** `reloadDebt` is a package variable, so a daemon restart
+  between a failed reload and its retry drops the obligation with the
+  generated files sitting on disk unactivated — the LOST direction. This
+  is not a regression: the pre-PR `Manager.reloadPending` field had exactly
+  the same process lifetime, and making it durable means persisting it
+  outside the process, a larger change than this one. It is recorded here
+  because a reader just told the debt has "ONE holder" and is
+  "process-scoped" can reasonably read that as a durability claim, and it
+  is not one.
 - **`Manager.Clear()` has no production caller (#5718 fold).** It has
   been exported and uncalled since this package was introduced (`git
   log -S` finds no caller in history); the daemon uses only

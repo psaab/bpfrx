@@ -236,3 +236,122 @@ func TestApplyTailNotRepeatedOnceComplete_5718(t *testing.T) {
 			reloadCalls, reconfigureCalls)
 	}
 }
+
+// #5718 fold r7 BLOCKER 1 FAIL-ON-REVERT: the write/remove-error branch owes
+// this Manager's activation tail, and before the fix it NEVER ARMED it — the
+// sole `activationPending = true` assignment lived in the success path, which
+// that branch returns before reaching. Not "skipped": never armed.
+//
+// The distinction is what makes it reachable. The branch DOES arm the GLOBAL
+// reload debt, and the global debt can be discharged by any reload owner — a
+// device-map teardown that removes the offending stale marker and reloads
+// successfully (pkg/daemon/linksetup.go) clears it while performing neither
+// tail operation. The byte-identical Apply that follows then sees no change, no
+// global debt, no reconfigure debt and no activation debt, and returns SUCCESS
+// having run neither `networkctl reconfigure` nor `restoreSlowPathRPFilter` —
+// bond/VLAN addresses unapplied, and the slow-path TUN's rp_filter left at the
+// reload default of 2, which silently drops locally-originated traffic.
+//
+// The sequence below is that production sequence, with the external reload
+// modelled by the same NoteReloadResult(BeginReload(), nil) the daemon helper
+// calls.
+//
+// RED on revert: remove the `m.activationPending = true` arm from the
+// write/remove-error branch in Apply and this fails with
+// `Manager-only activation tail was lost: reconfigure=0 rp_filter="2"`.
+func TestApplyErrorBranchArmsActivationTail_5718(t *testing.T) {
+	resetReloadDebtForTest(t)
+	readRPFilter := rpFilterFixture(t)
+	dir := t.TempDir()
+	m := NewInDir(dir)
+
+	// A non-empty directory at a stale path makes os.Remove fail while every
+	// desired file still writes, which is what forces Apply's partial-write /
+	// remove-error branch rather than an outright abort.
+	stale := filepath.Join(dir, filePrefix+"retired.link")
+	if err := os.Mkdir(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(stale, "busy")
+	if err := os.WriteFile(child, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reloadFails := true
+	var reconfigureCalls int
+	orig := runNetworkctl
+	runNetworkctl = func(args ...string) error {
+		if len(args) > 0 && args[0] == "reload" && reloadFails {
+			return errors.New("simulated reload failure")
+		}
+		if len(args) > 0 && args[0] == "reconfigure" {
+			reconfigureCalls++
+		}
+		return nil
+	}
+	t.Cleanup(func() { runNetworkctl = orig })
+
+	ifaces := activationTailIfaces()
+	if err := m.Apply(ifaces); err == nil {
+		t.Fatal("setup: Apply must fail on the unremovable stale path, or this " +
+			"test is not exercising the error branch at all")
+	}
+	if !reloadDebtOutstanding() {
+		t.Fatal("setup: the failed reload must arm the global reload debt")
+	}
+
+	// The daemon's next pre-Apply teardown resolves the stale removal and
+	// reloads the shared networkd instance successfully. That discharges the
+	// GLOBAL debt without doing either Manager tail operation.
+	if err := os.Remove(child); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(stale); err != nil {
+		t.Fatal(err)
+	}
+	NoteReloadResult(BeginReload(), nil)
+	if reloadDebtOutstanding() {
+		t.Fatal("setup: an external successful reload must discharge the global debt — " +
+			"if it does not, the retry below is driven by the global debt and this " +
+			"test passes without the Manager-local arm existing at all")
+	}
+
+	reloadFails = false
+	if err := m.Apply(ifaces); err != nil {
+		t.Fatalf("retry Apply: %v", err)
+	}
+	if reconfigureCalls == 0 || readRPFilter() != "0" {
+		t.Fatalf("Manager-only activation tail was lost: reconfigure=%d rp_filter=%q",
+			reconfigureCalls, readRPFilter())
+	}
+}
+
+// OVER-REACH GUARD for the arm above, GREEN under the revert: an Apply that
+// SUCCEEDS must still leave no activation debt behind. Arming the flag in the
+// error branch must not leak into the ordinary path — a Manager that ends every
+// Apply owing a tail would re-run reload+reconfigure on every subsequent commit
+// forever, which is the #4954 debt machinery inverted into a permanent cost.
+func TestApplySuccessLeavesNoActivationDebt_5718(t *testing.T) {
+	resetReloadDebtForTest(t)
+	_ = rpFilterFixture(t)
+	dir := t.TempDir()
+	m := NewInDir(dir)
+
+	orig := runNetworkctl
+	runNetworkctl = func(args ...string) error { return nil }
+	t.Cleanup(func() { runNetworkctl = orig })
+
+	if err := m.Apply(activationTailIfaces()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	m.mu.Lock()
+	pending := m.activationPending
+	m.mu.Unlock()
+	if pending {
+		t.Fatal("a fully successful Apply must clear activationPending — the error " +
+			"branch's arm must not leak into the success path")
+	}
+	if reloadDebtOutstanding() {
+		t.Fatal("a fully successful Apply must leave no global reload debt")
+	}
+}

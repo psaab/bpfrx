@@ -394,6 +394,31 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		// get written/removed, but surface the error so the operator is not told
 		// a config was committed while a stale unit survives on disk.
 		nWrite, nRemove := len(writeErrs), len(removeErrs)
+		// #5718 fold r7 BLOCKER 1: this branch owes the Manager tail and never
+		// armed it. `activationPending` had exactly one assignment — in the
+		// success path below — so an Apply that failed a write or a stale
+		// removal returned from here with the tail NEVER ARMED, not merely
+		// skipped. The reload attempted just below is not the tail: the
+		// per-interface `networkctl reconfigure` and (on a failed reload)
+		// `restoreSlowPathRPFilter` are Manager-only work that no other reload
+		// owner performs.
+		//
+		// That matters because the GLOBAL debt this branch arms is discharged
+		// by ANY reload owner. A device-map teardown that removes the offending
+		// stale marker and reloads successfully (daemon/linksetup.go) clears the
+		// global debt while doing neither tail operation; the byte-identical
+		// Apply that follows then sees no change, no global debt, no
+		// reconfigure debt and no activation debt, and returns success having
+		// skipped the tail entirely — bond/VLAN addresses unapplied and
+		// `xpf-usp0`'s rp_filter left at 2, silently dropping slow-path traffic.
+		//
+		// Armed BEFORE the reload, like the success path, so an early return
+		// still records the obligation. Deliberately NOT cleared when the reload
+		// below succeeds: that reload is only the first half, and the
+		// reconfigure half has still not run.
+		m.mu.Lock()
+		m.activationPending = true
+		m.mu.Unlock()
 		if changed {
 			epoch := reloadDebtEpoch()
 			if err := runNetworkctl("reload"); err != nil {
