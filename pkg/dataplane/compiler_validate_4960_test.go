@@ -5,6 +5,7 @@ package dataplane
 
 import (
 	"errors"
+	"net"
 	"strings"
 	"testing"
 
@@ -46,12 +47,32 @@ var errStopBeforeHostReconcile = errors.New(
 // no host mutation occurred; one call proves it started and then stopped on the
 // tripwire.
 //
-// vlanIfaceInfoCall and ifaceSetupCalls are the inner probes, and they exist to
-// make the tripwire's guarantee an ASSERTED fact rather than a structural
-// argument. Every one of them is reached only from inside mapZoneInterface --
-// SetVlanIfaceInfo immediately after a successful ensureVLANSubInterface,
-// SetZone/AddTxPort during the one-time per-phys host setup -- so a nonzero
-// count means execution got past the tripwire into the host-touching half.
+// zoneConfigCalls is the counter that BINDS the tripwire, and saying so
+// plainly is a correction: r2 claimed the two inner counters below "turn the
+// safety property into a runtime assertion instead of a structural argument",
+// and they do not (#6894 r3 F2). Measured by driving programZoneMaps directly
+// with the tripwire neutralised -- which is safe, because
+// stripUnmanagedInterfaces is in compileZones (compiler_iface.go:287), not in
+// programZoneMaps:
+//
+//	WITH tripwire:    zoneConfigCalls=1 vlanIfaceInfoCall=0 ifaceSetupCalls=0
+//	WITHOUT tripwire: zoneConfigCalls=2 vlanIfaceInfoCall=0 ifaceSetupCalls=0
+//
+// So zoneConfigCalls distinguishes and the inner two do not. What actually
+// holds the control test together is `errors.Is(err, errStopBeforeHostReconcile)`
+// -- the tripwire arrived at all -- plus `zoneConfigCalls == 1`, which pins
+// that it halted on the FIRST zone rather than walking every zone.
+//
+// vlanIfaceInfoCall and ifaceSetupCalls are DEFENCE IN DEPTH. Each is reached
+// only from inside mapZoneInterface (SetVlanIfaceInfo right after a successful
+// ensureVLANSubInterface, SetZone/AddTxPort during the one-time per-phys host
+// setup), and mapZoneInterface returns early at compiler_iface.go:450-454 when
+// cachedInterfaceByName misses -- which it always does here, because
+// xpft4960a/xpft4960b exist on no host. They would therefore fire only if this
+// fixture's interface names ever started resolving. Keep them, and do NOT
+// "make them live" by switching to real interface names: that is precisely the
+// r2 F1 host hazard, since a resolving name puts reconcileInterfaceAddresses on
+// a real link.
 type recordingDP struct {
 	discardingDataPlane
 	zoneConfigCalls   int
@@ -132,9 +153,10 @@ func TestNoHostMutationWhenALaterPhaseFails_4960(t *testing.T) {
 }
 
 // assertNoHostMutation asserts that CompileConfig never entered compileZones.
-// Zero SetZoneConfig calls is the outer proof (compileZones never started);
-// the two inner counters are asserted alongside so a future change that makes
-// the tripwire fire later still reports which half was reached.
+// Zero SetZoneConfig calls is the proof (compileZones never started); the two
+// inner counters are defence in depth, asserted alongside so a future change
+// that makes the tripwire fire later still reports which half was reached.
+// They do not distinguish the tripwire on today's fixture — see recordingDP.
 func assertNoHostMutation(t *testing.T, dp *recordingDP) {
 	t.Helper()
 	if dp.zoneConfigCalls != 0 {
@@ -176,13 +198,17 @@ func TestValidConfigStillReachesZoneCompile_4960(t *testing.T) {
 			"rejecting good configs, or the phase order changed. want the "+
 			"SetZoneConfig tripwire, got: %v", err)
 	}
+	// This is the counter that binds the tripwire: without it the compile
+	// walks every zone and this reads 2 (measured -- see recordingDP).
 	if dp.zoneConfigCalls != 1 {
 		t.Errorf("want exactly 1 SetZoneConfig call (the tripwire fires on the "+
 			"first zone), got %d", dp.zoneConfigCalls)
 	}
-	// The safety property, asserted rather than argued: nothing past the
-	// tripwire ran, so ensureVLANSubInterface / reconcileInterfaceAddresses /
-	// stripUnmanagedInterfaces were unreachable from this test.
+	// Defence in depth, NOT the proof. Both counters read 0 with and without
+	// the tripwire, because mapZoneInterface soft-skips this fixture's
+	// interface names before reaching either of them (#6894 r3 F2). They fire
+	// only if those names ever start resolving on the host running the test --
+	// which is exactly when the r2 F1 hazard would come back.
 	if dp.vlanIfaceInfoCall != 0 || dp.ifaceSetupCalls != 0 {
 		t.Errorf("the tripwire did NOT halt before per-interface host work "+
 			"(%d SetVlanIfaceInfo, %d SetZone/AddTxPort) — mapZoneInterface ran, "+
@@ -199,7 +225,8 @@ func TestValidConfigStillReachesZoneCompile_4960(t *testing.T) {
 //
 // AddTxPort and SetZone are NOT inert here: both are reached only from inside
 // mapZoneInterface, so they double as the "execution passed the tripwire"
-// counter the control test asserts is zero.
+// counter the control test asserts is zero — a defence-in-depth counter, not
+// the one that binds the tripwire (see recordingDP, #6894 r3 F2).
 func (r *recordingDP) AddTxPort(ifindex int) error { r.ifaceSetupCalls++; return nil }
 func (r *recordingDP) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTable uint32, flags uint8, rgID uint8, screenFlags uint32) error {
 	r.ifaceSetupCalls++
@@ -304,9 +331,135 @@ func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
 // not override panics. Nothing enforces completeness at compile time, so this
 // exercises the pre-pass over a config that reaches every covered phase: a
 // newly-called dp method shows up as a panic here rather than in production.
+//
+// Reaching every PHASE is not the same as reaching every phase's WRITE
+// SURFACE, and at r2 this test reached only 28 of the 40 overrides (#6894 r3
+// F1). idProbeConfig now carries a destination-NAT rule-set, static NAT v4 and
+// v6, an NPTv6 rule, a NAT64 rule-set, an IPv6 source pool with its v6 SNAT
+// rule, an interface-SNAT rule and a security policy, which takes the reached
+// set to 39 of 40. Instrumented count, measured by overriding all 40 with a
+// name recorder: 38 from the first leg below, plus SetSNATEgressIP from the
+// second. The 40th is IsLoaded, which CompileConfig calls itself
+// (compiler.go:182) before the pre-pass runs, so no config can reach it from
+// here.
+//
+// The second leg exists because SetSNATEgressIP is the one covered write that
+// is not a pure function of cfg: compileNAT's interface-SNAT branch resolves
+// the egress zone's member through result.cachedInterfaceByName and soft-skips
+// when it misses, so on a host without that link the branch never writes.
+// Seeding the cache with a synthetic entry reaches it. Naming a REAL link
+// instead would work on this host and is exactly what must not be done -- a
+// fixture that resolves to a live interface is one CompileConfig call away
+// from reconciling that interface's addresses (#6894 r2 F1).
 func TestPrePassShimCoversTheCalledSurface_4960(t *testing.T) {
-	if err := validateBeforeMutate(idProbeConfig()); err != nil {
+	cfg := idProbeConfig()
+
+	if err := validateBeforeMutate(cfg); err != nil {
 		t.Fatalf("rich config must validate clean: %v", err)
+	}
+
+	// The seeded leg is TWO runs, and it has to be: a counting dp would
+	// override SetSNATEgressIP itself and so could not detect the override
+	// missing from the shim — the exact method it exists to cover.
+	//
+	// Run one is the PLAIN shim, so a deleted SetSNATEgressIP nil-panics here.
+	if err := validateBeforeMutateWithResult(
+		discardingDataPlane{}, cfg, seededEgressResult()); err != nil {
+		t.Fatalf("rich config must validate clean with the egress interface "+
+			"resolvable: %v", err)
+	}
+	// Run two counts, which is what makes run one meaningful: without it, a
+	// fixture that stopped declaring the egress member — or a compileNAT that
+	// stopped resolving it through the interface cache — would soft-skip past
+	// the write again and both runs would stay green having proved nothing.
+	egress := &egressCountingDP{}
+	if err := validateBeforeMutateWithResult(egress, cfg, seededEgressResult()); err != nil {
+		t.Fatalf("counting leg must validate clean: %v", err)
+	}
+	if egress.writes == 0 {
+		t.Fatal("the seeded ifCache entry did not reach SetSNATEgressIP, so " +
+			"that override is NOT covered by this test and could be deleted " +
+			"with the suite still green (#6894 r3 F1)")
+	}
+}
+
+// seededEgressResult is a fresh pre-pass CompileResult whose interface cache
+// already answers for idProbeConfig's egress-zone member, so compileNAT's
+// interface-SNAT branch resolves it instead of soft-skipping. A fresh result
+// per run: each pass writes into the one it is given.
+func seededEgressResult() *CompileResult {
+	result := newValidationResult()
+	result.ifCache[idProbeEgressIface] = &net.Interface{
+		Index: 4960, Name: idProbeEgressIface,
+	}
+	return result
+}
+
+// egressCountingDP is the pre-pass shim plus a counter on the one covered
+// write that a config alone cannot reach. It overrides SetSNATEgressIP only —
+// everything else, including the xpfValidationPass marker, comes from the
+// embedded discardingDataPlane.
+type egressCountingDP struct {
+	discardingDataPlane
+	writes int
+}
+
+func (d *egressCountingDP) SetSNATEgressIP(SNATEgressKey, SNATEgressValue) error {
+	d.writes++
+	return nil
+}
+
+// notAValidationDP is a DataPlane that reports FALSE for the pre-pass marker.
+//
+// It shadows the embedded shim's xpfValidationPass rather than being written
+// from scratch, which is deliberate: inheriting all 40 no-op overrides means a
+// pre-pass that wrongly accepted it would run to completion instead of
+// nil-panicking part way, so removing the guard fails the assertions below
+// rather than crashing the test. What it models is a caller handing
+// validateBeforeMutateWith a REAL dataplane — the one input the marker exists
+// to refuse, and the one a unit test cannot construct.
+type notAValidationDP struct {
+	discardingDataPlane
+	writes int
+}
+
+func (*notAValidationDP) xpfValidationPass() bool { return false }
+
+func (d *notAValidationDP) SetAddressBookEntry(cidr string, addressID uint32) error {
+	d.writes++
+	return nil
+}
+
+// #6894 r3 F4: "any dp passed here MUST embed discardingDataPlane" was a note
+// in the doc comment with nothing enforcing it. The pre-pass compiles the
+// config and throws the result away, so running it against a dataplane that
+// actually writes would program the live tables from a discarded compile —
+// the inverse of the property this whole file exists to establish.
+func TestPrePassRejectsADataPlaneWithoutTheMarker_4960(t *testing.T) {
+	dp := &notAValidationDP{}
+
+	err := validateBeforeMutateWith(dp, idProbeConfig())
+	if err == nil {
+		t.Fatal("the pre-pass accepted a dataplane that does not carry the " +
+			"discardingDataPlane marker — a real dataplane would have been " +
+			"programmed from a compile whose result is discarded (#6894 r3 F4)")
+	}
+	if !strings.Contains(err.Error(), "does not carry the discardingDataPlane marker") {
+		t.Fatalf("rejected for the wrong reason: %v", err)
+	}
+	// The guard has to fire BEFORE the first phase, not merely somewhere: a
+	// check placed after the phase loop would return this same error having
+	// already written the whole address book.
+	if dp.writes != 0 {
+		t.Errorf("the pre-pass wrote %d address-book entries to a non-marker "+
+			"dataplane before rejecting it — the guard must precede the phase "+
+			"loop", dp.writes)
+	}
+
+	// Positive control: the real shim is still accepted, so the guard rejects
+	// the marker's absence rather than everything.
+	if err := validateBeforeMutate(idProbeConfig()); err != nil {
+		t.Fatalf("the guard rejected the production shim: %v", err)
 	}
 }
 

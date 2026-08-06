@@ -256,10 +256,21 @@ then stays green.
 - `New() *Manager` — `loader.go`.
 - `Compile(cfg *config.Config) (*CompileResult, error)` — multi-phase
   lowering to BPF map entries. Phases live in `compiler.go`: zone IDs,
-  screen profile IDs, zones, address book, applications, policies,
-  NAT, static NAT, NAT64 prefixes, NPTv6, screen profiles, default
-  policy, flow timeouts, firewall filters, flow config, port
-  mirroring.
+  screen profile IDs, **validate-before-mutate pre-pass**, zones, address
+  book, applications, policies, NAT, static NAT, NAT64 prefixes, NPTv6,
+  screen profiles, default policy, flow timeouts, firewall filters, flow
+  config, port mirroring.
+  - The pre-pass (`compiler_validate_4960.go`, #4960) re-runs the fallible
+    HOST-PURE phases against a discarding dataplane BEFORE the zones phase
+    performs the first destructive host netlink mutation, so a config that
+    passes `commit check` but trips a later phase is REJECTED with nothing
+    mutated instead of half-applied with no undo path. It can therefore fail
+    the whole compile on its own. It is additive — every real phase keeps its
+    position — but it does change WHICH error an operator sees when a config
+    carries more than one fault: a bad `firewall filter` protocol is hoisted
+    into the pre-pass, so it is now reported ahead of a zones-phase fault such
+    as an unknown screen-profile reference. That file states what the pre-pass
+    does and does not cover; the coverage table is not the whole compile.
 - `CompileResult` — `compiler.go`. Zone/policy/NAT/app IDs, compiled
   policy-scheduler rule slots, and the per-interface networkd configs.
 - Session iteration: `IterateSessions`, `BatchIterateSessions`,

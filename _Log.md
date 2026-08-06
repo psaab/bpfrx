@@ -68353,3 +68353,74 @@ break — `go vet` confirmed passing under every revert.
   intact reds both on the `validate <name>: ` prefix.
 - **File(s)**: pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/compiler_validate_4960_test.go, _Log.md
+
+## 2026-08-06 — #4960 pre-pass: cover the shim's whole write surface (#6894 r3)
+- **Timestamp**: 2026-08-06
+- **Action**: Fold the r3 gate findings on PR #6894.
+  F1 (MAJOR) — the completeness guard was blind to nine of the surfaces its
+  doc comment claimed it enforced. `discardingDataPlane` embeds a NIL
+  `DataPlane`, so an un-overridden method nil-panics, and
+  `TestPrePassShimCoversTheCalledSurface_4960` is the only thing enforcing the
+  override set. Measured by instrumenting all 40 overrides with a name
+  recorder: that test reached 28/40, and `SetDNATEntry`, `SetDNATEntryV6`,
+  `SetNAT64Config`, `SetNATPoolIPV6`, `SetNPTv6Rule`, `SetSNATEgressIP`,
+  `SetSNATRuleV6`, `SetStaticNATEntryV4`, `SetStaticNATEntryV6` were reached by
+  NO test in the package — `idProbeConfig` reached every PHASE but not every
+  phase's WRITE SURFACE. Widened the fixture: destination NAT (v4+v6), static
+  NAT (v4+v6), an NPTv6 rule, a NAT64 rule-set, an IPv6 source pool with its v6
+  SNAT rule, an interface-SNAT rule and a security policy. Reached set is now
+  39/40; the 40th, `IsLoaded`, is called by `CompileConfig` itself
+  (compiler.go:182) above the pre-pass, and is bound by the CompileConfig-
+  driving tests. Renamed the fixture's zone interfaces off the vSRX scheme —
+  the interface list became load-bearing here for the first time, and
+  `ge-0-0-1` is a real link on the standalone VM and on loss node 0.
+  `SetSNATEgressIP` is the one covered write that is not a pure function of
+  cfg (compileNAT resolves the egress member through
+  `result.cachedInterfaceByName` and soft-skips on a miss), so added
+  `validateBeforeMutateWithResult` and seeded a SYNTHETIC ifCache entry rather
+  than naming a live link — a resolving name is one `CompileConfig` call away
+  from reconciling a real interface's addresses, the r2 F1 hazard.
+  F2 (MINOR) — corrected a claim this file has now made twice. r2 said
+  `vlanIfaceInfoCall == 0` / `ifaceSetupCalls == 0` "turn the safety property
+  into a runtime assertion instead of a structural argument". They do not: both
+  read 0 with AND without the tripwire, because `mapZoneInterface` soft-skips
+  at compiler_iface.go:450-454 (xpft4960a/xpft4960b exist on no host).
+  `zoneConfigCalls` is what distinguishes. Reworded `recordingDP`,
+  `assertNoHostMutation` and the control test's inner assertion to say so; the
+  counters stay as defence in depth and must NOT be made live with real
+  interface names.
+  F3 (MINOR) — `pkg/dataplane/README.md` listed the compile phases without the
+  pre-pass, which can reject a config on its own and changes which error an
+  operator sees when a config carries both a Phase-2 fault and a bad filter
+  protocol. Named it, and pointed at compiler_validate_4960.go.
+  F4 (NIT) — "any dp passed here MUST embed discardingDataPlane" was a note
+  with nothing enforcing it; it is now an `isValidationPass` guard at the top
+  of the shared body, ahead of the phase loop.
+- **Validation**: uid 1000 throughout. `go build ./...` exit 0.
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0.
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. `gofmt -l` on the three Go
+  files touched: clean (the seven files it does list are unformatted at the PR
+  head too).
+  F1 proof, 9x2 matrix, each mutation grepped back out of the file and the file
+  restored byte-identical after every cell: deleting any ONE of the nine
+  overrides at PR head 5fcb494d9 leaves the WHOLE `pkg/dataplane` package GREEN
+  (9/9, rc=0); at this head all nine RED with a nil-pointer panic at their own
+  call site — `SetDNATEntry` compiler_nat.go:900, `SetDNATEntryV6` :918,
+  `SetNAT64Config` :1305, `SetNATPoolIPV6` :579, `SetNPTv6Rule` :1161,
+  `SetSNATEgressIP` :424, `SetSNATRuleV6` :704, `SetStaticNATEntryV4` :1020,
+  `SetStaticNATEntryV6` :1032. Deleting `IsLoaded` reds
+  `TestNoHostMutationWhenALaterPhaseFails_4960`, so all 40 are bound.
+  F2 proof: driving `programZoneMaps` directly (it does NOT contain the
+  `stripUnmanagedInterfaces` tail, which lives in `compileZones` at
+  compiler_iface.go:287, so the probe cannot reach the host-stripping path) —
+  WITH tripwire `zoneConfigCalls=1 vlanIfaceInfoCall=0 ifaceSetupCalls=0`,
+  WITHOUT `zoneConfigCalls=2 vlanIfaceInfoCall=0 ifaceSetupCalls=0`.
+  F4 proof, both ASSERTIONS not panics: deleting the guard reds
+  `TestPrePassRejectsADataPlaneWithoutTheMarker_4960` on "the pre-pass accepted
+  a dataplane that does not carry the discardingDataPlane marker"; MOVING the
+  guard to after the phase loop reds it on "the pre-pass wrote 6 address-book
+  entries to a non-marker dataplane before rejecting it".
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/README.md,
+  _Log.md

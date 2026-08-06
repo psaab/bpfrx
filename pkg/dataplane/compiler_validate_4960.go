@@ -91,8 +91,20 @@ import (
 // panic in production (the only recover() on the apply path is scoped to
 // host-auth closeout). TestPrePassShimCoversTheCalledSurface_4960 is what
 // enforces it -- it drives the pre-pass over a config reaching every covered
-// phase, so a new call surfaces as a test panic. Widen that fixture when
-// adding a phase.
+// phase, so a new call surfaces as a test panic. Widen its fixture,
+// idProbeConfig, when adding a phase.
+//
+// "Reaching every covered phase" was not enough, and that is worth stating
+// because it took two rounds to notice (#6894 r3 F1). A phase can be entered
+// and still leave its WRITE SURFACE untouched: at r2 the fixture reached every
+// phase but only 28 of the 40 overrides, and nine -- the destination-NAT,
+// static-NAT, NPTv6, NAT64, v6-pool/v6-SNAT and SNAT-egress writes -- were
+// called by no test in the package. Any one of them could be deleted with the
+// whole suite green, while an ordinary `security nat destination` stanza
+// nil-panicked the daemon on apply. The fixture now reaches 39; the 40th,
+// IsLoaded, is called by CompileConfig itself (compiler.go:182) above the
+// pre-pass and is bound by the CompileConfig-driving tests instead. Adding an
+// override without a config shape that REACHES it re-opens the same hole.
 type discardingDataPlane struct{ DataPlane }
 
 func (discardingDataPlane) IsLoaded() bool                                                { return true }
@@ -211,12 +223,31 @@ func validateBeforeMutate(cfg *config.Config) error {
 //
 // Any dp passed here MUST embed discardingDataPlane so it keeps the
 // xpfValidationPass marker (isValidationPass) and the never-write override
-// set.
+// set. That is enforced rather than asked for (#6894 r3 F4): a dp without the
+// marker is rejected below, because a pre-pass running against a REAL
+// dataplane would program the live tables from a discarded compile.
 func validateBeforeMutateWith(dp DataPlane, cfg *config.Config) error {
+	return validateBeforeMutateWithResult(dp, cfg, newValidationResult())
+}
+
+// validateBeforeMutateWithResult is validateBeforeMutateWith with the
+// CompileResult injectable as well. Production never calls it directly; the
+// extra seam exists because one covered write surface is not reachable from
+// cfg alone. compileNAT's interface-SNAT branch resolves the egress zone's
+// member through result.cachedInterfaceByName, so SetSNATEgressIP is called
+// only when that name exists on the host running the test. Seeding a synthetic
+// result.ifCache entry reaches it without naming a live link in a fixture --
+// which is what TestPrePassShimCoversTheCalledSurface_4960 does, and is why
+// that test can cover 39 of the 40 overrides (#6894 r3 F1).
+func validateBeforeMutateWithResult(dp DataPlane, cfg *config.Config, result *CompileResult) error {
+	if !isValidationPass(dp) {
+		return fmt.Errorf("validate pre-pass: dataplane %T does not carry the "+
+			"discardingDataPlane marker — the pre-pass would program the live "+
+			"tables from a compile whose result is thrown away (#4960)", dp)
+	}
 	if cfg == nil {
 		return nil
 	}
-	result := newValidationResult()
 
 	// Phases 1 / 1.5 are pure and produce the IDs the later phases read.
 	assignZoneIDs(result, cfg)
