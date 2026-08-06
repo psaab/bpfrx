@@ -662,18 +662,36 @@ under the daemon's errgroup. Nothing else imports this package.
     over an unknown. The gauge is always emitted (0 when healthy) and counts
     exactly the zones REST reports `per_zone_counters_available:false` for.
 
-    **Emitted ABOVE the dataplane-loaded gate (#6843 R1), which adds a fourth
-    membership cause.** The gauge is contractually always emitted so `> 0` is
-    alertable and its absence is not confusable with a scrape that failed to
-    run — which means it must also be emitted on a degraded / config-only boot,
-    where per-zone volume is least available. So `collectZoneCounters` runs
-    before the `dp == nil || !dp.IsLoaded()` early return, alongside
-    `collectPBRStatus` and the host-inbound families. Consequence: a zone is
-    counted unpopulated for a **fourth** reason — no loaded dataplane at all —
-    on top of the three `ErrCounterNotPopulated` causes. That is named in the
-    metric HELP, because there is no `xpf_dataplane_loaded` series to
-    disambiguate against and an operator paging on `> 0` would otherwise triage
-    toward three causes none of which applies.
+    **Emitted ABOVE the dataplane-loaded gate (#6843 R1), which widens the
+    membership set beyond the sentinel's.** The gauge is contractually always
+    emitted so `> 0` is alertable and its absence is not confusable with a
+    scrape that failed to run — which means it must also be emitted on a
+    degraded / config-only boot, where per-zone volume is least available. So
+    `collectZoneCounters` runs before the `dp == nil || !dp.IsLoaded()` early
+    return, alongside `collectPBRStatus` and the host-inbound families.
+
+    Consequence: **the gauge's cause set is strictly wider than
+    `ErrCounterNotPopulated`'s.** The sentinel has exactly three meanings; the
+    gauge has those plus every pre-read membership branch. The authoritative
+    enumeration is the metric's own HELP in
+    `pkg/api/metrics_descriptors_zone.go`, and **this document deliberately
+    states no count** — the count is the part that rots, and it rotted right
+    here: this paragraph claimed "a fourth reason" and "three causes none of
+    which applies" while the Go comment it mirrors had already grown past four.
+
+    Two causes are worth naming here because an operator is least likely to
+    guess them, and both follow from the config store being promoted BEFORE the
+    dataplane apply: the dataplane is **loaded but has no apply result yet**
+    (shim loaded, first apply pending or failed), and a zone is **in the active
+    config but absent from the last apply result** (a commit whose apply failed
+    leaves the store ahead of the dataplane). Neither produces the sentinel —
+    the collector increments and `continue`s before it ever calls
+    `ReadZoneCounters` — so do not read the HELP list as a list of sentinel
+    meanings.
+
+    All of this is named in the HELP because there is no `xpf_dataplane_loaded`
+    series to disambiguate against, so an operator paging on `> 0` would
+    otherwise triage toward causes none of which applies.
 
     **Retention (#6843).** "Not populated" must also be reachable *backwards* —
     a zone that WAS reporting and stops. The helper's store outlives its slot

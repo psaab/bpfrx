@@ -424,16 +424,27 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 			prometheus.GaugeValue, float64(unpopulated))
 	}()
 
-	// #6843 R1: running ABOVE the dataplane-loaded gate means this can now be
-	// reached with a nil server/store, which the below-gate position implicitly
-	// ruled out. Counted, not pattern-matched: of the pre-gate collectors, the
-	// ones that actually touch c.srv/c.srv.store and therefore guard the same
-	// way are collectPBRStatus, collectHostInboundAddresslessZones,
-	// collectHostInboundAddresslessInterfaces and
-	// collectHostInboundAmbiguousAddresses. collectLo0Counters and the
-	// collectHostInbound{KernelDenies,JunosHostDenies,ICMPNDAccepts} readers
-	// touch NEITHER field and need no guard -- naming "the collectHostInbound*
-	// family" would have been a smaller pattern-match, not a check.
+	// #6843 R1: this runs ABOVE the dataplane-loaded gate. The guard below is
+	// belt-and-braces, NOT a nil-safety requirement: Collect() already
+	// dereferences c.srv unconditionally (metrics.go, c.srv.configPersistDegradedFn)
+	// long before either position, so a nil c.srv panics regardless and the
+	// below-gate position never actually ruled anything out. What the guard does
+	// buy is the direct-call test path, where a collector method is invoked
+	// without going through Collect().
+	//
+	// Counted, not pattern-matched -- and the count is NINE pre-gate collectors,
+	// which partition into three sets, not two:
+	//   - touch c.srv/c.srv.store AND guard: collectPBRStatus,
+	//     collectHostInboundAddresslessZones, collectHostInboundAddresslessInterfaces,
+	//     collectHostInboundAmbiguousAddresses.
+	//   - touch NEITHER field, so need no guard: collectLo0Counters and the
+	//     collectHostInbound{KernelDenies,JunosHostDenies,ICMPNDAccepts} readers.
+	//   - touches c.srv and does NOT guard: collectFlowExportMetrics
+	//     (metrics_system.go, c.srv.flowCollectorHealthFn). It is safe for the
+	//     reason above, not because it was overlooked.
+	// That third set is why "the collectHostInbound* family" would have been a
+	// pattern-match rather than a check: an earlier revision of this comment
+	// enumerated eight of the nine and its two-way split read as exhaustive.
 	var cfg *config.Config
 	if c.srv != nil && c.srv.store != nil {
 		cfg = c.srv.store.ActiveConfig()

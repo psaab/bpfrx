@@ -79,9 +79,11 @@ func (c *xpfCollector) initZoneDescriptors() {
 	// (e) and (f) matter because they are the causes an operator is LEAST
 	// likely to guess: the helper is current, the zone count is nowhere near
 	// the slot capacity, the zone carries traffic, and the dataplane IS loaded
-	// — so every one of (a)-(d) reads as inapplicable while the gauge sits at
-	// 1. Under-enumerating here reproduces exactly the mis-triage (d) was
-	// added to prevent.
+	// — so every one of (a)-(d) reads as inapplicable. They differ in the
+	// MAGNITUDE they produce, which is itself a triage hint: (f) fires per
+	// missing zone, so one newly-added zone whose apply failed reads 1, while
+	// (e) fires for EVERY configured zone, so it reads N. Under-enumerating
+	// either reproduces exactly the mis-triage (d) was added to prevent.
 	//
 	// There is no xpf_dataplane_loaded series to disambiguate against, so (d)
 	// must be named in the HELP or an operator paging on `> 0` triages toward

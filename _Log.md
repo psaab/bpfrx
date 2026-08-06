@@ -1,3 +1,48 @@
+## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Third gate at `290035ded` returned **no runtime finding**. It
+  verified all three counts independently from the code (3 increment branches,
+  6 HELP causes, 3 sentinel meanings), confirmed the ordering claim directly
+  (both pre-read increments `continue` before the first `ReadZoneCounters`), ran
+  four discrimination mutations each producing exactly its own assertion, and
+  proved the delta comment-only with an **AST-based comment stripper** — a
+  stronger check than the line-filter grep used here, since it cannot be fooled
+  by `//` inside a string and, because the phrase list is a composite literal,
+  its identity also proves no assertion moved. It also verified phrase
+  uniqueness empirically across all 298 described descriptors.
+  Two findings, both documentation, both this PR's own thesis defect standing in
+  surfaces the delta did not reach. Fixed inline.
+  1. **`pkg/api/README.md` was frozen at FOUR causes** and still carried the
+     literal "triages toward three causes" sentence that round 6 deleted from the
+     Go comment. Byte-identical to `e08a3c74f`. It is the doc
+     `docs/userspace-dataplane-gaps.md` explicitly redirects operators to, and it
+     was maintained by four of this PR's eight commits — it stopped being updated
+     exactly when the list grew past four. An operator following the redirect
+     would check four causes, find none applies, and never reach (f), which this
+     PR's own comment calls the cause an operator is LEAST likely to guess.
+     Rewritten to state NO count, defer to the HELP as the authority, name (e)
+     and (f) explicitly, and record that the paragraph itself rotted.
+  2. **The "Counted, not pattern-matched" partition counted eight of NINE
+     pre-gate collectors.** The missing one, `collectFlowExportMetrics`, touches
+     `c.srv` and does NOT guard — so it belongs to neither claimed set and
+     falsifies the two-way split. A comment that advertises having counted is
+     the last place an enumeration should be short. Now a three-way partition,
+     with the third member named and its safety explained.
+     The gate also refuted the paragraph's premise: `Collect()` dereferences
+     `c.srv` unconditionally before either position, so the below-gate position
+     never "implicitly ruled out" a nil server. The guard is real but it buys the
+     direct-call test path, not nil-safety. Said so.
+  3. NIT: "(a)-(d) read as inapplicable while the gauge sits at 1" is true only
+     of (f). (e)'s branch fires for EVERY configured zone, so it reads N. The
+     magnitude difference is itself a triage hint and is now stated.
+  4. NIT: a 22-column orphan line left by the round-6 re-wrap.
+- **File(s)**: pkg/api/README.md, pkg/api/metrics_counters.go,
+  pkg/api/metrics_descriptors_zone.go, pkg/api/zone_counters_metrics_test.go,
+  _Log.md
+- **Validation**: comment-only in BOTH production and test — each diff filtered
+  to non-comment lines is empty. `go build ./...` rc=0; `go vet ./pkg/api/` rc=0;
+  `go test ./pkg/api/ ./pkg/dataplane/ -count=1` rc=0; `gofmt -l` clean.
 ## 2026-08-05 — #6843 round 6: the enumeration grew, the header did not
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

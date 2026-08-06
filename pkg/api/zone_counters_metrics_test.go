@@ -612,8 +612,8 @@ func (d *notLoadedDP) IsLoaded() bool { return false }
 // share a branch, and (a)-(c) all arrive via the ErrCounterNotPopulated
 // sentinel. The HELP is keyed to CAUSES, because that is what an operator
 // triages; do not read the phrase list below as a branch count. A HELP that
-// lists fewer causes
-// sends the operator after causes that do not apply — which is the whole
+// lists fewer causes sends the operator after causes that do not apply —
+// which is the whole
 // failure the cause list exists to prevent. Reverting the HELP to any shorter
 // enumeration was green before this test: nothing asserted on the string.
 //
