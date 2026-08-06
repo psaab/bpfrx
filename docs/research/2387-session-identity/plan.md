@@ -1,8 +1,24 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r1 (DRAFT — awaiting r1 hostile review)
+**Revision:** v6-r2 — incorporates r1 reviews (Claude SMR + AGY; Codex pending)
 **Verified against:** origin/master @ `e80db2eae`
 **Branch:** `research/2387-session-identity` (docs only — no production source)
+
+**v6-r2 changelog:**
+- **AGY REFUTED Path D** (ISOLATE-narrow) on a live-session stability hazard.
+  Path D is **withdrawn**; §5 now mandates static deterministic interning.
+- **Claude SMR** found the plan blind to the maintainer-prescribed chain
+  **#4983 → #2387 → #5804**. New §2.5. C-P3 is rewritten as an *extensible*
+  mechanism — a bespoke single-field append would force #5804 into a second
+  wire break.
+- §4.3 split into **narrowing-safe vs widening-unsafe**; the two issues have
+  opposite mixed-version polarity through the same mechanism.
+- **§4.3a is new and corrects my own SMR-2:** a connection-setup capability
+  handshake **does** exist (F23 `performSyncHandshake`) — but it is **gated on a
+  PSK being configured**, which is the constraint that matters.
+- §5 Path B now cites the **1:1 `key_to_handle` map** as the structural reason
+  it is forced, not merely inferior.
+- Literal counts reconciled with explicit grep scope; chain-wide byte budget added.
 
 > **Relationship to the existing decision record.** `docs/research/2387-vrf-flow-identity/plan.md`
 > is on master and is the converged **v4 PLAN-DEFER (3-of-3)** decision record, plus a
@@ -50,13 +66,56 @@ verdict without its own policy ever being evaluated.
 | Metric | Prior figure | **Measured on `e80db2eae`** |
 |---|---|---|
 | `SessionKey` refs, Rust | 725 | **743** (413 outside test files) |
-| `SessionKey {` struct literals, Rust | — | **301** (191 under `src/`, 110 in test files) |
+| `SessionKey {` struct literals, Rust | — | **297** — see scope note below |
+
+**Grep scope, stated because three independent sweeps got three answers** (301 /
+297 / 291). The canonical figure is `grep -rn 'SessionKey\s*{' --include='*.rs'
+userspace-dp/src` = **297**. Adding `userspace-xdp/src` gives 301; a stricter
+regex gives 291. Of the 297, **175 are in files named `tests*.rs`**, leaving
+**122 construction sites in non-test-named files** — and some of those are
+`#[cfg(test)]` blocks inside production files, so 122 is an upper bound on real
+production churn.
 | `SessionKey` refs, Go | — | **1154** — but this is the *separate* `dataplane.SessionKey` C-mirror type, a fixed-layout byte struct, not the Rust type. Counting it in one blast-radius number conflates two types. |
 
 The honest framing: **301 struct-literal sites** is the mechanical churn (a field
 added to a struct literal), and roughly a third of those are test fixtures. The
 "743" and "1154" reference counts overstate the edit surface — most references are
 `&SessionKey` parameter passing that needs no change at all.
+
+## 2.5 Chain position — #2387 is the middle link, and it owns the wire decision
+
+**This is the finding that most changes the design, and v6-r1 missed it entirely.**
+
+Issue **#5804** carries a maintainer-directed scoping decision stating that
+**#4983, #2387 and #5804 are one decision** — all three widen the *same*
+`SessionKey` — and prescribing a **chain, not parallel lanes**:
+
+> **#4983 → #2387 → #5804**
+
+on the rationale that parallel lanes would *"manufacture conflicts in one struct
+and produce three partial answers to one question"*, with **#2387 as the
+designated owner of the HA-wire decision, paid for once**.
+
+| Issue | What it adds to the identity | State | Branch/PR |
+|---|---|---|---|
+| #4983 | true ingress-interface identity (session **filter** today approximates via zone→interfaces) | OPEN, `plan-deferred` | none |
+| **#2387** | `routing_domain` | OPEN, `plan-deferred-operator` | research only |
+| #5804 | GRE key / PPTP call-ID discriminator | OPEN, `plan-deferred-research` | none pushed; uncommitted work touching neither `SessionKey` nor the wire |
+
+**Three consequences this plan must absorb:**
+
+1. **C-P3 cannot be a bespoke single-field append.** If #2387 ships "+1 trailing
+   `u32`", #5804 must invent a *second* wire mechanism — the duplicated hard break
+   the chain ordering exists to prevent. C-P3 must be specified as a mechanism
+   #5804 can **extend**.
+2. **Is #4983 a hard blocker?** **No.** #2387 imports no symbol and no wire field
+   from #4983, so calling this BLOCKED would be false precision. The chain order is
+   a *risk-sequencing preference* with a real rationale — #4983 is VALUE-only and
+   old-peer-safe, so it proves the meta→logical-ingress plumbing somewhere a bug is
+   **cosmetic** (a wrong `show session` filter) rather than a forwarding fault. That
+   rationale is worth honouring, and this plan recommends honouring it, but it is
+   not a dependency.
+3. **The byte budget belongs to the chain, not to #2387** (§4.4).
 
 ## 3. Honest scope / value framing
 
@@ -160,9 +219,48 @@ re-established flow, not a blackhole.
 **if the domain is carried in the VALUE.** The `ReverseKey` embedded in the value
 (line 440) is a *fixed 16-byte block*; widening the Rust key does **not** automatically
 widen it, so the design must carry ingress and egress domain as two separate trailing
-`u32`s and reconstruct the reverse key's domain from them. If an implementer instead
-grows the reverse-key block in place, §4d's hard-break conclusion becomes true again.
-**This is the single most likely way to get the implementation wrong.**
+`u32`s (`IngressRoutingDomain`, `EgressRoutingDomain`) and reconstruct the reverse
+key's domain from them. If an implementer instead grows the reverse-key block in
+place, every field after it shifts and §4d's hard-break conclusion becomes true again.
+**This is the single most likely way to get the implementation wrong.** AGY
+independently confirmed this caveat.
+
+### 4.3a Narrowing-safe, widening-unsafe — the polarity that governs the chain
+
+The safety property above is **specific to this discriminator** and must not be
+generalized to the chain, because the same mechanism has opposite polarity for #5804:
+
+| | Old peer omits the field → decodes 0 | Effect on identity | Posture |
+|---|---|---|---|
+| **#2387 `routing_domain`** | 0 is interned as the **default** routing-instance | a domain-N packet **fails to match**; flow re-establishes | **narrows — fail-CLOSED** |
+| **#5804 GRE discriminator** | 0 reads as "no key" | two distinct keyed tunnels **alias onto one session** | **widens — fail-OPEN, a security fault** |
+
+#5804's own acceptance criteria demand "mixed-version **reject**, not widen". A bare
+length-gated trailing field cannot deliver that. So the chain needs a capability
+signal, and #2387 is the issue positioned to introduce it.
+
+**Is there a negotiated-capability path already in the tree to reuse?** **Yes,
+partially — and the caveat is the important part.** `performSyncHandshake`
+(`pkg/cluster/sync_auth.go:314`, feature F23) is a **connection-setup capability
+handshake** that exchanges a HELLO before any session frame flows, negotiates a
+posture, implements **dual-accept** for rolling upgrades, and already carries a
+**downgrade-guard** — "once a peer has authenticated, a later UNAUTHENTICATED
+connection from it is rejected". That downgrade-guard is structurally the same shape
+as #5804's reject-not-widen requirement, and the HELLO is the natural place to hang a
+feature bit.
+
+**The constraint that matters:** the handshake *"runs ONLY when a local key is
+configured. An unkeyed node ... sends nothing special and is indistinguishable from —
+and fully compatible with — a legacy peer"* (`sync_auth.go:322-326`). So on a cluster
+with no `authentication-key`, **no handshake happens at all** and there is no place to
+carry a capability bit. Any chain-wide negotiation design must either accept that it
+only protects keyed clusters, or introduce an unconditional capability exchange.
+
+**Cost consequence for this plan:** #2387 alone does **not** need negotiation — its
+polarity is fail-closed. But the chain does, and #2387 owns the wire decision. C-P3
+must therefore either (i) introduce the capability bit, or (ii) explicitly hand that
+scope to #5804 with a written rationale. **v6-r1 priced this at zero. It is not
+zero, and reviewers should decide which of (i)/(ii) this plan adopts** — see §11 Q2.
 
 ### 4.4 Hot-path cost — measured where measurable, unmeasured where not (Q4)
 
@@ -183,6 +281,27 @@ this is a size fact, not a throughput claim.
 (`afxdp/session_delta.rs:156-158`). `#[derive(Hash)]` hashes field-by-field, so the
 added `u32` costs **exactly one additional `write_u32` into FxHasher per key hash** —
 one multiply-xor-rotate — plus 4 bytes per map entry.
+
+**Two costs v6-r1 under-counted** (Claude SMR): the key is also compared on **every
+flow-cache hit** (`flow_cache.rs:204`), and it feeds `set_index` bucket derivation
+(`flow_cache.rs:870`) — so the **bucket distribution shifts for all protocols**, not
+only those carrying a non-zero domain. A distribution shift is not a hash-cost
+argument; it must appear in the measurement plan as a flow-cache hit-rate check.
+
+**The byte budget belongs to the chain, not to #2387.** Measured in isolation this
+looks like +10%. Across the prescribed chain:
+
+| Stage | `size_of::<SessionKey>()` |
+|---|---|
+| today | 40 |
+| + #2387 `routing_domain: u32` | **44** |
+| + #5804 discriminator as a plain `u32` | **48** (+20% on today) |
+| + #5804 as a *typed* `TunnelDiscriminator` **enum** | **past 48** — an enum costs 8 B on its own (discriminant + padding) |
+
+**Rule this imposes on the chain, and #2387 is the issue that must state it:** every
+discriminator must be a **plain fixed-width integer**, with anything variable (a VRF
+name, a tunnel identity) **interned to a dense id at config-compile time**. Never a
+`String`, never a typed enum in the key, never a name hashed on the hot path.
 
 > **I am striking a number from the existing converged plan.** Its §8 risk table
 > states the performance cost as **"~1-3%"**. That figure is **not backed by any
@@ -256,6 +375,17 @@ HA delta storm. **This is worse than the bug.**
 The same reasoning collapses "make install not evict a different-domain incumbent"
 into Path C: holding two entries for one 5-tuple *requires* the key to disambiguate.
 
+**The structural reason, which is stronger than the eviction argument** (Claude SMR):
+`SessionTable.key_to_handle` is `SeededKeyMap<u32>`
+(`userspace-dp/src/session/mod.rs:548`) — strictly **1:1, at most one live session per
+key**. So a discriminator held *outside* the key has exactly two possible behaviours
+under that map — evict the other context's session, or refuse to create yours — and
+**both are cross-tenant faults**. Any non-key approach first requires converting
+`key_to_handle` to 1:N and re-auditing every reader that assumes one-session-per-key
+(the assumption is documented at `userspace-dp/src/session/README.md:409-415`). That
+conversion is not cheaper than widening the key; it is the same work plus a
+correctness re-audit.
+
 ### Path A — do nothing further; A.1 warning is the permanent contract
 
 Close #2387 as PLAN-KILL. The operator is warned at commit; the limitation is
@@ -305,34 +435,49 @@ mismatch, **drop + increment a dedicated counter** — do not fall through to in
 `write_u32` per hash, an additive wire append, and a mandatory `make test-failover`.
 **Delivers:** the issue's literal ask and vendor parity.
 
-### Path D — ISOLATE-narrow: Path C, but the discriminator is only non-zero where overlap exists
+### ~~Path D — ISOLATE-narrow~~ — WITHDRAWN in v6-r2
 
-Identical mechanism to C, but the control plane assigns a non-zero domain **only to
-routing-instances that the A.1 overlap check actually flags**. Every other deployment
-runs with `routing_domain == 0` on every session.
+v6-r1 proposed assigning a non-zero domain **only** to routing-instances the A.1
+overlap check flags, so non-overlapping deployments stayed behaviourally identical.
+v6-r1 flagged its own stability hazard and invited attack. **AGY refuted it, and the
+refutation is correct:**
 
-- **Value:** the *behavioural* delta is confined to exactly the configs that can
-  collide. Non-overlapping and non-VRF deployments — the overwhelming majority — are
-  bit-identical in behaviour, which makes the smoke/perf risk far easier to argue and
-  the mixed-version window trivially safe.
-- **Cost:** the *mechanical* cost is the same as C (the field still exists in the
-  struct and on the wire), so this is not a cheaper implementation — it is a **lower-risk
-  rollout** of the same implementation.
-- **Objection to raise in review:** it makes the domain assignment depend on a
-  config-analysis result, so a config edit can change a *live* session's domain
-  meaning. Domain identity must be stable for the life of a session, or re-keyed on
-  a config generation change. **This is the option's main correctness hazard and
-  reviewers should attack it.**
+> Committing a configuration change mid-flight (e.g. adding or removing a PBR term or
+> interface) alters the compiler's overlap detection, causing routing-domain IDs for
+> active VRFs to change or reset to 0. Active in-memory sessions keyed under old
+> domain IDs will mismatch new packets, **dropping established production traffic.**
+
+This is worse than the bug it fixes: #2387 mis-forwards traffic only in a niche
+overlapping config, whereas Path D would drop **established sessions in any VRF
+deployment** on an unrelated commit. A domain id must be stable for the life of a
+session, and deriving it from a config-analysis result cannot guarantee that.
+
+**Path D is withdrawn.** Domain interning must be **static and deterministic across
+all routing-instances** — every routing-instance gets a dense id regardless of whether
+it overlaps anything, so ids do not move when unrelated config changes. Non-VRF
+deployments still see `routing_domain == 0` everywhere, which preserves most of the
+rollout-safety value Path D was reaching for, without the hazard.
 
 ### Recommendation (to be tested by review, not asserted)
 
-**Path C, staged, with Path D's rollout discipline** — i.e. implement the full
-discriminator, but validate that non-overlapping deployments are behaviourally
-identical. Rationale: the cost objection that drove the v4 deferral is retired (§4.3);
-Path B's semantic objections are not retired by anything; Path A contradicts the
-shipped A.1 text. Path C is a **PR series**, not one PR: C-P0 (domain plumbing, no
-behaviour change) → C-P2 (identity) → C-P3 (wire) is the natural split, each with its
-own RED-on-revert test.
+**Path C, staged, with static deterministic interning** (Path D's rollout discipline
+is withdrawn; its *goal* — non-VRF deployments behaviourally identical — is preserved
+by domain 0). Rationale: the cost objection that drove the v4 deferral is retired
+(§4.3); Path B is structurally forced into a cross-tenant fault by the 1:1
+`key_to_handle` map, not merely semantically inferior; Path A contradicts the shipped
+A.1 warning text.
+
+Path C is a **PR series**, not one PR:
+
+| PR | Content | Wire? | Gate |
+|---|---|---|---|
+| **C-P0** | dense static interning of RI names → `routing_domain: u32`; populate the dead `meta.routing_table` slot at **every** ingress producer (native ingress, local delivery, GRE decap, fabric ingress). **No behaviour change** — nothing reads it yet. | no | unit |
+| **C-P2** | add `routing_domain` to `SessionKey` + the four transforms in `session/key.rs`; store ingress **and** egress domain in `SessionMetadata`; fabric exemption. | no | RED-on-revert + negative control |
+| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **plus the §4.3a capability decision**. | yes | `make test-failover` + short-payload decode test |
+
+Splitting C-P0 out is what makes this reviewable: it is a pure plumbing PR whose
+correctness can be checked without touching identity, and it is also the PR that most
+resembles #4983 — which is the chain's argument for doing #4983 first.
 
 ## 6. Public API preservation
 
@@ -361,9 +506,26 @@ actually matters for a rolling upgrade.
   a flow in the same scope it was admitted under. This is the invariant #2387 violates.
 - **The embedded reverse-key block is fixed-width** (§4.3 caveat).
 
+### 7a. Where `routing_domain` must be populated (AGY r1 required this be explicit)
+
+C-P0 is only correct if **every** producer of a session-bearing ingress stamps the
+slot. A missed producer leaves domain 0 on a real VRF flow, which under Path C means a
+**silent failure to match** — a self-DoS, not a security hole, but a production outage
+all the same. The inventory:
+
+| Ingress producer | Domain source | Note |
+|---|---|---|
+| native interface ingress | `ifindex_to_routing_instance[ingress_ifindex]` → interned id | the common case |
+| PBR-steered | the PBR-resolved routing-instance (`ingress_route_table_override`) | must agree with the FIB table actually used |
+| GRE decap | the **tunnel logical** interface's RI | `gre.rs:760` already rebinds `ingress_ifindex` to `endpoint.logical_ifindex`, so this falls out of the native rule — **verified** |
+| fabric cross-chassis | **exempt** — do not compare | `packet_fabric_ingress` is already a parameter at `poll_descriptor/mod.rs:448` |
+| local delivery / host-inbound | default domain | |
+| neighbor-seed, NAT64 companion, other transient installs | default domain | must not be fail-closed against |
+| peer-synced sessions | the wire field; absent → 0 = default | §4.3 |
+
 ## 8. Risk assessment
 
-| Class | Path A | Path B (DENY) | Path C/D (ISOLATE) |
+| Class | Path A | Path B (DENY) | Path C (ISOLATE) |
 |---|---|---|---|
 | Behavioural regression | NONE | MED — a mis-derived domain drops a legitimate flow (self-DoS) | MED-HIGH — a mis-derived domain either fails to match (self-DoS) or cross-matches |
 | HA mixed-version | NONE | NONE (value-only, no sync semantics) | **LOW** — additive, no version bump, non-VRF clusters bit-identical (§4.3) — *was rated HIGH in v4; that rating is withdrawn* |
@@ -406,22 +568,32 @@ actually matters for a rolling upgrade.
 
 ## 11. Open questions for adversarial review
 
-1. **The binary: DENY (Path B) or ISOLATE (Path C/D)?** Attack the claim that Path B's
-   co-tenant-DoS and Junos-parity objections outweigh its much smaller footprint.
-2. **Is §4.3 right that this is additive?** Specifically attack the caveat: is there a
-   path where the domain *must* enter the embedded reverse-key block, re-creating the
-   hard break? This is the highest-consequence claim in the document.
-3. **Path D's stability hazard:** if domain ids are assigned from a config-analysis
-   result, what happens to a live session when the config changes? Is a
-   config-generation re-key required, and does that make D strictly worse than C?
+**Resolved in r1** — Path D's stability hazard (AGY refuted it; Path D withdrawn);
+the additivity caveat (AGY independently confirmed the fixed-width reverse-key block);
+the ifindex/zone symmetry disqualification (AGY confirmed airtight); the literal-count
+scope (reconciled to 297 with the grep stated).
+
+**Open for r2:**
+
+1. **The binary: DENY (Path B) or ISOLATE (Path C)?** With the 1:1 `key_to_handle`
+   finding, Path B's two possible behaviours are both cross-tenant faults. Is that
+   dispositive, or is a bounded co-tenant DoS still preferable to the churn of C?
+2. **§4.3a — which of (i)/(ii) does this plan adopt?** Either #2387 introduces the
+   capability bit in the F23 HELLO (real added scope, and it only protects clusters
+   with a PSK configured), or it explicitly defers that to #5804 with a written
+   rationale. **This is the largest remaining cost question and v6-r1 priced it at
+   zero.**
+3. **Does the chain ordering bind?** #4983 is a sequencing preference, not a
+   dependency (§2.5). Should #2387 nonetheless wait for it, given #4983 is OPEN with
+   no branch and would otherwise be the safer place to prove the plumbing?
 4. **Is the route-leaked corner really cheap?** v4 deferred dual-domain handling as
-   expensive; §4.5 claims it is cheap because `SessionMetadata` already swaps a
-   zone pair. Refute or confirm.
-5. **Is there a symmetric discriminator cheaper than a routing-domain id** already
-   present on both forward and reply packets? §7 disqualifies zone and ifindex on
-   symmetry — is that disqualification airtight?
-6. **Does the ~301-literal churn estimate hold**, or does adding a field to
-   `SessionKey` cascade into the C mirror (`bpf/headers/xpf_conntrack.h`) and the Go
-   mirror (`pkg/dataplane/types.go`) in ways that make the edit surface much larger?
+   expensive; §4.5 claims it is cheap because `SessionMetadata` already swaps a zone
+   pair. Refute or confirm.
+5. **Is the §7a producer inventory complete?** A missed ingress producer is a silent
+   self-DoS. Name any producer the table omits.
+6. **Does the churn estimate hold**, or does adding a field to `SessionKey` cascade
+   into the C mirror (`bpf/headers/xpf_conntrack.h`) and the Go mirror
+   (`pkg/dataplane/types.go`)? AGY says the Go mirror stays 16 B if the domain rides
+   in `SessionValue` — confirm or refute.
 7. **Is PLAN-KILL the right answer anyway?** The trigger config is niche and now
    warned-about. Argue the cost/benefit case for closing #2387 with Path A.
