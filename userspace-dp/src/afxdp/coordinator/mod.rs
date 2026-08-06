@@ -1081,7 +1081,9 @@ impl Coordinator {
     ///
     /// Dropping the row makes such a zone read as `ErrCounterNotPopulated`
     /// end-to-end, which is the honest answer: its traffic genuinely is not
-    /// being counted. `zone_counter_overflow_active` tells the operator why.
+    /// being counted. `zone_counter_overflow_active` carries the reason on the
+    /// wire — though #6845 tracks that it has no consumer on any surface yet,
+    /// so today an operator sees "not available" without the why.
     ///
     /// NOTE: this is only half the fix. The Go status loop must REPLACE its
     /// offset map from each snapshot rather than merge into it, or a row that

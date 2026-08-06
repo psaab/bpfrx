@@ -4589,6 +4589,76 @@ fn validate_snapshot_buildable_matches_reconcile_5171() {
 /// Fail-on-revert: reverting `validate_forwarding_buildable` to `previous =
 /// Some(&coord.forwarding)` prunes zone B (absent from the candidate) from
 /// the live store → the `after.contains(B)` assertion FAILS.
+
+#[test]
+fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
+    use crate::afxdp::zone_counters::{
+        flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,
+    };
+    const ZONE_A: u16 = 100;
+    const ZONE_B: u16 = 200;
+
+    let coord = Coordinator::new();
+    // Seed the LIVE forwarding zone-counter store with cumulative totals for
+    // zones A and B, as steady-state forwarded traffic would.
+    // #5163: build the seed map FROM the live store so its cached per-zone
+    // atomics are the coordinator's — the lock-free fold then lands directly in
+    // `coord.forwarding.zone_counter_store`.
+    let seed_map =
+        ZoneCounterSlotMap::build(&[ZONE_A, ZONE_B], &coord.forwarding.zone_counter_store);
+    record_zone_traffic(&seed_map, ZONE_A, ZONE_B, 1000);
+    record_zone_traffic(&seed_map, ZONE_B, ZONE_A, 500);
+    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &seed_map);
+    let before: std::collections::HashSet<u16> = coord
+        .forwarding
+        .zone_counter_store
+        .snapshot()
+        .into_iter()
+        .map(|r| r.zone_id)
+        .collect();
+    assert!(
+        before.contains(&ZONE_A) && before.contains(&ZONE_B),
+        "precondition: live store must carry both zones, got {before:?}"
+    );
+
+    // A buildable candidate that configures ONLY zone A (drops B). Mandatory
+    // pins open so validation reaches Leg 3's forwarding build and its
+    // zone-counter reconcile.
+    let candidate = ConfigSnapshot {
+        generation: 2,
+        map_pins: crate::protocol::snapshot::MapPins {
+            xsk: format!("{TEST_MAP_PIN_OK}xsk"),
+            heartbeat: format!("{TEST_MAP_PIN_OK}heartbeat"),
+            sessions: format!("{TEST_MAP_PIN_OK}sessions"),
+            ..Default::default()
+        },
+        zones: vec![crate::protocol::snapshot::ZoneSnapshot {
+            name: "A".to_string(),
+            id: ZONE_A,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(
+        coord.validate_snapshot_buildable(Some(&candidate)).is_ok(),
+        "the single-zone candidate must be buildable"
+    );
+
+    // The live store must be UNTOUCHED — zone B's totals survive even though
+    // the candidate does not configure zone B.
+    let after: std::collections::HashSet<u16> = coord
+        .forwarding
+        .zone_counter_store
+        .snapshot()
+        .into_iter()
+        .map(|r| r.zone_id)
+        .collect();
+    assert!(
+        after.contains(&ZONE_A) && after.contains(&ZONE_B),
+        "validate_snapshot_buildable must NOT prune the live zone-counter store; got {after:?} (zone B dropped = the rev-5605 leak)"
+    );
+}
+
 #[test]
 fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
     // #6843 (Codex gate): drive the PRODUCTION publication accessor,
@@ -4671,74 +4741,21 @@ fn zone_traffic_counters_drops_a_zone_that_lost_its_slot_6843() {
          active: the filter must drop only the zones that lost their slot, not \
          everything: {published:?}"
     );
-}
 
-#[test]
-fn validate_snapshot_buildable_does_not_prune_live_zone_counters_5171() {
-    use crate::afxdp::zone_counters::{
-        flush_recorded_zone_counters, record_zone_traffic, ZoneCounterSlotMap,
-    };
-    const ZONE_A: u16 = 100;
-    const ZONE_B: u16 = 200;
-
-    let coord = Coordinator::new();
-    // Seed the LIVE forwarding zone-counter store with cumulative totals for
-    // zones A and B, as steady-state forwarded traffic would.
-    // #5163: build the seed map FROM the live store so its cached per-zone
-    // atomics are the coordinator's — the lock-free fold then lands directly in
-    // `coord.forwarding.zone_counter_store`.
-    let seed_map =
-        ZoneCounterSlotMap::build(&[ZONE_A, ZONE_B], &coord.forwarding.zone_counter_store);
-    record_zone_traffic(&seed_map, ZONE_A, ZONE_B, 1000);
-    record_zone_traffic(&seed_map, ZONE_B, ZONE_A, 500);
-    flush_recorded_zone_counters(&coord.forwarding.zone_counter_store, &seed_map);
-    let before: std::collections::HashSet<u16> = coord
-        .forwarding
-        .zone_counter_store
-        .snapshot()
-        .into_iter()
-        .map(|r| r.zone_id)
-        .collect();
+    // #6843 gate R3: bind the coordinator's CONFIGURED predicate too. Dropping
+    // it (`|_| true`) passed the entire cargo suite — the mirror of F1, left
+    // open for this predicate after being closed for the slot one. The gate
+    // could not construct a REACHABLE runtime divergence (apply-time
+    // `reconcile` prunes unconfigured zones, and the reserved-id path is
+    // filtered identically in policy.rs), so this predicate is defence in
+    // depth rather than a live guard — but it is documented as load-bearing at
+    // the call site, so it gets a test rather than an unbound claim.
+    coord.forwarding.zone_id_to_name.remove(&SURVIVOR);
+    let published = coord.zone_traffic_counters();
     assert!(
-        before.contains(&ZONE_A) && before.contains(&ZONE_B),
-        "precondition: live store must carry both zones, got {before:?}"
-    );
-
-    // A buildable candidate that configures ONLY zone A (drops B). Mandatory
-    // pins open so validation reaches Leg 3's forwarding build and its
-    // zone-counter reconcile.
-    let candidate = ConfigSnapshot {
-        generation: 2,
-        map_pins: crate::protocol::snapshot::MapPins {
-            xsk: format!("{TEST_MAP_PIN_OK}xsk"),
-            heartbeat: format!("{TEST_MAP_PIN_OK}heartbeat"),
-            sessions: format!("{TEST_MAP_PIN_OK}sessions"),
-            ..Default::default()
-        },
-        zones: vec![crate::protocol::snapshot::ZoneSnapshot {
-            name: "A".to_string(),
-            id: ZONE_A,
-            ..Default::default()
-        }],
-        ..Default::default()
-    };
-    assert!(
-        coord.validate_snapshot_buildable(Some(&candidate)).is_ok(),
-        "the single-zone candidate must be buildable"
-    );
-
-    // The live store must be UNTOUCHED — zone B's totals survive even though
-    // the candidate does not configure zone B.
-    let after: std::collections::HashSet<u16> = coord
-        .forwarding
-        .zone_counter_store
-        .snapshot()
-        .into_iter()
-        .map(|r| r.zone_id)
-        .collect();
-    assert!(
-        after.contains(&ZONE_A) && after.contains(&ZONE_B),
-        "validate_snapshot_buildable must NOT prune the live zone-counter store; got {after:?} (zone B dropped = the rev-5605 leak)"
+        !published.iter().any(|r| r.zone_id == SURVIVOR),
+        "a zone dropped from the configured set kept publishing: the configured \
+         predicate must hold independently of the slot predicate: {published:?}"
     );
 }
 

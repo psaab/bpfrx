@@ -313,9 +313,12 @@ impl ZoneCounterStore {
     }
 
     /// Operator clear (`clear_zone_counters` IPC): zero every zone's cumulative
-    /// totals so the helper reports 0 on the next status poll (otherwise the Go
-    /// side's absolute `SetZoneCounterOffset` overwrite would snap the cleared
-    /// value back within <= 1 s). Load-bearing half of the operator clear.
+    /// totals so the pre-clear value is not snapped back on the next status
+    /// poll. Load-bearing half of the operator clear.
+    ///
+    /// #6843: a cleared zone then reads as NOT POPULATED, not as zero -- the
+    /// snapshot below omits all-zero rows and the Go side replaces its offset
+    /// map from that snapshot, so the row is dropped rather than set to 0.
     ///
     /// #5163: resets each block IN PLACE rather than clearing the map, because a
     /// live slot map caches each zone's `Arc`; dropping the map entry would

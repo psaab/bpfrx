@@ -424,11 +424,28 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 			prometheus.GaugeValue, float64(unpopulated))
 	}()
 
-	cfg := c.srv.store.ActiveConfig()
+	// #6843 R1: running ABOVE the dataplane-loaded gate means this can now be
+	// reached with a nil server/store, which the below-gate position implicitly
+	// ruled out. Every other pre-gate collector guards the same way
+	// (collectPBRStatus, collectLo0Counters).
+	var cfg *config.Config
+	if c.srv != nil && c.srv.store != nil {
+		cfg = c.srv.store.ActiveConfig()
+	}
 	if cfg == nil {
 		return
 	}
-	cr := dataplane.LastApplyResultOf(dp)
+	// #6843 R1: this collector runs ABOVE the dataplane-loaded gate, so dp may
+	// be nil or unloaded on a degraded / config-only boot. That is not an error
+	// and not an empty result: every configured zone is genuinely "not known",
+	// which is exactly what the gauge reports. Volume samples are omitted (there
+	// is nothing to read) and no read error is recorded — an unloaded dataplane
+	// is a state, not a failed read.
+	loaded := dp != nil && dp.IsLoaded()
+	var cr *dataplane.ApplyResult
+	if loaded {
+		cr = dataplane.LastApplyResultOf(dp)
+	}
 
 	// Iterate the CONFIGURED zone set (not cr.ZoneIDs) with the same nil-zone
 	// skip the REST handler uses (#3493 tolerant/HA-sync configs can carry a nil
@@ -440,11 +457,11 @@ func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp apiRu
 		if zone == nil {
 			continue
 		}
-		// No apply result, or a configured zone the last apply did not assign an
-		// id to: nothing has been published for it, which is the unpopulated
-		// state, not an error. REST leaves PerZoneCountersAvailable false here
-		// for the same reason.
-		if cr == nil {
+		// No loaded dataplane, no apply result, or a configured zone the last
+		// apply did not assign an id to: nothing has been published for it,
+		// which is the unpopulated state, not an error. REST leaves
+		// PerZoneCountersAvailable false here for the same reason.
+		if !loaded || cr == nil {
 			unpopulated++
 			continue
 		}

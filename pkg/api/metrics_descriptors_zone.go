@@ -48,8 +48,15 @@ func (c *xpfCollector) initZoneDescriptors() {
 	// userspace-dp/src/afxdp/zone_counters.rs): (a) a pre-#3651 helper that
 	// publishes no per-zone block at all, (b) a zone past the helper's 63
 	// assignable hot-path slots, whose traffic genuinely goes uncounted
-	// (ZoneCounterSlotMap::build sets overflow_active and never registers the
-	// zone with the store), and (c) a zone that is simply idle.
+	// (the helper stops publishing its row -- see below), and (c) a zone that
+	// is simply idle.
+	//
+	// #6843: the earlier wording here said build "never registers the zone with
+	// the store". That holds only for a zone that was ALWAYS overflowed. The
+	// store is carried forward across applies and retains still-configured
+	// zones, so a zone that accumulated traffic and LATER lost its slot keeps
+	// its totals -- which is why the helper filters published rows by live slot
+	// assignment and the Go side replaces (not merges) the offset map.
 	//
 	// Publishing 0 would be correct only for (c) and would silently understate
 	// (a) and (b) as "no traffic" — an authoritative zero over an unknown,

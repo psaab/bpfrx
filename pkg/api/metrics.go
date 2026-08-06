@@ -1124,6 +1124,18 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// a degraded FBF mirror must stay visible in a config-only / degraded boot.
 	c.collectPBRStatus(ch)
 
+	// #6843 R1: per-zone traffic, emitted BEFORE the dataplane gate. The
+	// xpf_zone_counters_unpopulated_zones gauge is documented as ALWAYS emitted
+	// so `> 0` is alertable and its absence cannot be confused with a scrape
+	// that failed to run — but below the gate that promise breaks exactly when
+	// it matters most: on a degraded or config-only boot no sample is emitted at
+	// all, so the alert silently stops evaluating precisely when per-zone volume
+	// is most unavailable. The collector is config-derived (it counts every
+	// configured zone as unpopulated when there is no apply result or no loaded
+	// dataplane), so it degrades correctly above the gate, like collectPBRStatus
+	// and the lo0/host-inbound families hoisted above for the same reason.
+	c.collectZoneCounters(ch, c.srv.dp)
+
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
 		return
@@ -1142,15 +1154,6 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 
 	c.collectGlobalCounters(ch, dp)
 	c.collectInterfaceCounters(ch, dp)
-	// #3651: per-zone traffic volume, restored after the #3643 HIDE now that the
-	// populate path ships. It reads the SPARSE zone-counter offset map, so it
-	// cannot reintroduce the per-zone dense-array OOB that made the old
-	// collector bump counterReadErrors once per zone per scrape; an unpopulated
-	// zone is counted into xpf_zone_counters_unpopulated_zones instead of being
-	// treated as a read error. Ordered before the deferred emitCounterReadErrors
-	// (top of Collect) so a GENUINE per-zone read failure is reflected in THIS
-	// scrape's xpf_counter_read_errors_total (#3462 ordering).
-	c.collectZoneCounters(ch, dp)
 	c.collectPolicyCounters(ch, dp)
 	c.collectFilterCounters(ch, dp, userspaceStatus)
 	// #3464: emit the per-interface scrape-error counter AFTER

@@ -1,3 +1,38 @@
+## 2026-08-05 — #6843 gate round 3: hoist the gauge, correct a correction, finish the sweep
+
+- **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
+- **Action**: Seven items. **R1 (only operational one):** the unpopulated gauge
+  is documented as ALWAYS emitted so `> 0` is alertable and its absence cannot be
+  mistaken for a scrape that failed — but `collectZoneCounters` sat BELOW the
+  `dp == nil || !dp.IsLoaded()` gate, so on a degraded/config-only boot no sample
+  was emitted and the alert silently stopped evaluating exactly when per-zone
+  volume was most unavailable: the literal failure the comment said cannot
+  happen. Hoisted above the gate (it is config-derived and degrades correctly),
+  added the not-loaded branch, and added a nil-store guard the below-gate
+  position had implicitly provided — a real nil-pointer panic the full suite
+  caught after the hoist. No existing fixture could see any of this:
+  `descriptorCoverageDP.IsLoaded()` is hardcoded true, so a `notLoadedDP` was
+  needed. **T1:** my own F3 correction shipped an unmeasured claim. **D4:**
+  inserting my test directly below a doc block silently reassigned that block to
+  it, leaving the #5171 test undocumented — moved my test below. **R2:** two
+  operator-facing surfaces still printed "per-zone accounting not implemented"
+  while this PR's own code says the helper populates them; with 64+ zones one
+  `show security zones` printed real bytes for slotted zones and "not
+  implemented" for overflowed ones, naming the wrong cause. **D1/D2/D3/D5, T2:**
+  finished the sweep, including a refuted premise and three Rust mirrors of a
+  sentence I had already fixed twice on the Go side.
+- **Validation**: full Go suite REAL exit 0; full cargo `--test-threads=1` REAL
+  exit 0; `pkg/refactoraudit` ok.
+- **File(s)**: `pkg/api/metrics.go`, `pkg/api/metrics_counters.go`,
+  `pkg/api/metrics_descriptors_zone.go`, `pkg/api/zone_counters_metrics_test.go`,
+  `pkg/cli/cli_show_security_zones.go`, `pkg/grpcapi/server_show_zones_text.go`,
+  `pkg/dataplane/zone_counter_retention_6843_test.go`,
+  `userspace-dp/src/afxdp/coordinator/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/mod.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/handlers/mod.rs`, `_Log.md`
+
 ## 2026-08-05 — #6843 Codex fold: bind the two PRODUCTION call sites
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)
@@ -30,9 +65,24 @@
   - My mutation table row *"S1 always-clear -> EmptyClearsAll RED (passed before
     the repopulate leg)"* is FACTUALLY WRONG. The gate ran the counterfactual: at
     `f7b9e820d`, EmptyClearsAll was ALREADY RED under always-clear, failing at
-    its own setup precondition. The repopulate leg did not close a gap; it made
-    the test fail for the RIGHT reason (its stated property) instead of at setup.
-    S2 (merge-only vs CopiesInput) was accurate as reported.
+    its own setup precondition. S2 (merge-only vs CopiesInput) was accurate as
+    reported.
+
+    **CORRECTION TO THE CORRECTION (gate round 3, T1).** The sentence above
+    originally continued "...it made the test fail for the RIGHT reason instead
+    of at setup". That was ALSO unmeasured, and also false: measured at BOTH
+    trees, the always-clear mutation fails at the identical line for the
+    identical reason (`:73 setup read failed`) — `t.Fatalf` Goexits before the
+    repopulate leg runs, so the fold changed nothing about that mutation. The
+    leg is still load-bearing, but for a NARROWER property the gate identified:
+    a STICKY clear (clear correctly, never repopulate) reds it. Comment
+    rewritten to name that instead.
+
+    The generalizable lesson, and the reason this is recorded twice: **a
+    correction is itself a claim and needs the same measurement discipline as
+    the thing it corrects.** I fixed an inferred table row by measuring at both
+    trees, and in the same breath wrote an inferred sentence about what the fix
+    accomplished.
 
   I ran those mutations only against the post-fold tree and inferred the "passed
   before" half instead of running the counterfactual at the parent. A mutation

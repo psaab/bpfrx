@@ -82,9 +82,13 @@ func TestReplaceZoneCounterOffsetsEmptyClearsAll(t *testing.T) {
 		t.Errorf("empty (non-nil) snapshot must clear the map; got err = %v", err)
 	}
 
-	// An implementation that ALWAYS clears would satisfy every assertion above,
-	// so the clearing assertions alone are not a test: "emitted nothing" is the
-	// failure default of this path. Re-populate and require the value back.
+	// This leg guards a STICKY clear: an implementation that clears correctly
+	// but never repopulates (e.g. clearing to an empty non-nil map and then
+	// dropping later writes). Measured at both trees: an ALWAYS-clear
+	// implementation is already caught upstream by the setup precondition at
+	// the top of this test, which t.Fatalf's before reaching here — so this leg
+	// does NOT bind always-clear, and an earlier version of this comment which
+	// claimed it did was wrong.
 	m.ReplaceZoneCounterOffsets(map[uint16][2]CounterValue{
 		id: {{Packets: 7, Bytes: 700}, {Packets: 8, Bytes: 800}},
 	})

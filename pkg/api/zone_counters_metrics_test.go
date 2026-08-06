@@ -161,10 +161,12 @@ func zoneSamples(t *testing.T, c *xpfCollector, dp apiRuntimeDataPlane) (map[str
 // the populate path has written the offset map, a scrape publishes live
 // per-zone volume.
 //
-// It seeds the map through Manager.SetZoneCounterOffset — the exact call
-// syncBPFCountersLocked makes with each ProcessStatus.ZoneTrafficCounters row
-// (pkg/dataplane/userspace/manager_ha.go) — and reads back through the real
-// Manager, so both ends of the production hook are exercised. The zone ids are
+// It seeds the map through Manager.SetZoneCounterOffset, the single-row
+// TEST-ONLY setter, and reads back through the real Manager. #6843: production
+// no longer uses that setter — syncBPFCountersLocked replaces the whole map via
+// ReplaceZoneCounterOffsets — so this exercises the READ end against a
+// realistic map, not the production write path. The write path is bound
+// separately by TestSyncBPFCountersReplacesZoneOffsetsAcrossPolls6843. The zone ids are
 // the real stable hashes, i.e. >= MaxZones, so this simultaneously demonstrates
 // that a large id now reads back fine instead of OOB'ing.
 //
@@ -525,9 +527,11 @@ func TestCollectDoesNotFalseAlertOnZoneReads(t *testing.T) {
 // a frozen counter that under-reports every subsequent packet while looking
 // alive. That is strictly worse than the omission this PR exists to produce.
 //
-// FAIL-ON-REVERT: make the status mirror merge instead of replace and the
-// post-transition assertions go RED — the sample is still emitted and the
-// unpopulated gauge stays 0.
+// FAIL-ON-REVERT: make `ReplaceZoneCounterOffsets` merge instead of replace and
+// the post-transition assertions go RED. Note this test injects offset maps
+// directly, so it does NOT bind the status-loop CALL SITE — that is bound by
+// TestSyncBPFCountersReplacesZoneOffsetsAcrossPolls6843 in
+// pkg/dataplane/userspace.
 func TestZoneMetricsFollowTheHelperAcrossSlotLoss(t *testing.T) {
 	ids := fixtureZoneIDs(t)
 	mgr := dataplane.New()
@@ -588,5 +592,74 @@ func TestZoneMetricsFollowTheHelperAcrossSlotLoss(t *testing.T) {
 	}
 	if err := c.counterReadErrors.Load(); err != 0 {
 		t.Errorf("counterReadErrors = %d; losing a slot is not a read error", err)
+	}
+}
+
+// notLoadedDP reports the dataplane as NOT loaded — the degraded / config-only
+// boot state. descriptorCoverageDP hardcodes IsLoaded() true, so no existing
+// fixture can reach this path.
+type notLoadedDP struct{ *descriptorCoverageDP }
+
+func (d *notLoadedDP) IsLoaded() bool { return false }
+
+// TestZoneUnpopulatedGaugeEmittedOnDegradedBoot is the #6843 R1 pin.
+//
+// The gauge is documented as ALWAYS emitted, so `> 0` is alertable and its
+// ABSENCE cannot be confused with a scrape that failed to run. Below the
+// dataplane-loaded gate that promise broke exactly where it mattered most: on a
+// degraded or config-only boot Collect() returned before reaching the collector,
+// so no sample was emitted and the alert silently stopped evaluating precisely
+// when per-zone volume was most unavailable — the literal failure the comment
+// says cannot happen.
+//
+// FAIL-ON-REVERT: move the collectZoneCounters call back below the
+// `dp == nil || !dp.IsLoaded()` early return and this goes RED with no gauge
+// emitted.
+func TestZoneUnpopulatedGaugeEmittedOnDegradedBoot(t *testing.T) {
+	neutralizeKernelCounterReads(t)
+
+	ids := fixtureZoneIDs(t)
+	srv := &Server{store: newDescriptorCoverageStore(t), gc: conntrack.NewGC(nil, time.Minute), startTime: time.Now()}
+	srv.dp = &notLoadedDP{&descriptorCoverageDP{
+		Manager: dataplane.New(),
+		apply:   &dataplane.ApplyResult{ZoneIDs: ids},
+	}}
+	c := newCollector(srv)
+
+	ch := make(chan prometheus.Metric, 256)
+	c.Collect(ch)
+	close(ch)
+
+	gauge := -1.0
+	sawVolume := false
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric write: %v", err)
+		}
+		switch descFQName(m.Desc().String()) {
+		case "xpf_zone_counters_unpopulated_zones":
+			gauge = pb.GetGauge().GetValue()
+		case "xpf_zone_packets_total", "xpf_zone_bytes_total":
+			sawVolume = true
+		}
+	}
+
+	if gauge < 0 {
+		t.Fatal("no xpf_zone_counters_unpopulated_zones sample on a NOT-LOADED " +
+			"dataplane; the gauge is contractually always emitted, and its absence " +
+			"here silences the alert exactly when per-zone volume is unavailable")
+	}
+	if gauge != 2 {
+		t.Errorf("unpopulated gauge = %v on a degraded boot, want 2 (both configured "+
+			"zones unknown)", gauge)
+	}
+	if sawVolume {
+		t.Error("emitted a per-zone volume sample with no loaded dataplane; there is " +
+			"nothing to read, so publishing a number would be fabricated")
+	}
+	if got := c.counterReadErrors.Load(); got != 0 {
+		t.Errorf("counterReadErrors = %d on an unloaded dataplane; want 0 — not "+
+			"being loaded is a state, not a failed read", got)
 	}
 }
