@@ -26,14 +26,21 @@ package cluster
 //     when BOTH peers are keyed each proves possession of the PSK with an
 //     HMAC over the OTHER side's nonce (mutual challenge-response). Fresh
 //     per-connection nonces make the proof replay-safe at setup.
-//   - Dual-accept (rolling upgrade): a node with no key never handshakes and
-//     is byte-for-byte a legacy peer; a keyed node that sees a legacy/unkeyed
-//     peer negotiates UNAUTHENTICATED and the stream stays legacy-compatible.
-//     Enforcement engages only once BOTH nodes are keyed and signing.
-//   - Downgrade-guard: once a peer has authenticated (on the sync channel OR
-//     the heartbeat channel, HeartbeatPeerAuthSeen), a later UNAUTHENTICATED
-//     connection from it is rejected — mirrors heartbeatAuthDecision / the
-//     #4357 fabric guard.
+//   - Dual-accept, UNKEYED SIDE ONLY: a node with no key never handshakes and
+//     is byte-for-byte a legacy peer, so an unkeyed node still accepts anything.
+//     A KEYED node does NOT dual-accept — #5078 removed that. It requires an
+//     authenticated peer and rejects a legacy/unkeyed one outright, with no
+//     first-contact grace and no migration window; see syncAuthDecision.
+//   - No sync-side downgrade-guard: there is nothing left for one to protect.
+//     A guard of that shape only matters where an unkeyed peer would otherwise
+//     be admitted, and on a keyed node none ever is. The former
+//     syncPeerAuthSeen / syncAuthedEver pair was removed once #5078 made the
+//     rejection unconditional — it had become unreachable, and a dead guard
+//     whose doc still asserts a live property is exactly the hazard #5078
+//     removed the pre-admission frame path for. The #4107 HEARTBEAT downgrade
+//     guard is SEPARATE state (heartbeatAuthState.peerAuthenticated, reached
+//     via Manager.HeartbeatPeerAuthSeen) and is unaffected, as is the #4357
+//     fabric guard that consumes it.
 //   - Per-frame seal (authConn.sealFrame / verifyFrame): on an authenticated
 //     connection every frame gets an 8-byte per-connection sequence + a
 //     32-byte HMAC (keyed by a per-connection key derived from the PSK and
@@ -108,14 +115,19 @@ const (
 	syncAuthAuthenticated                       // PSK handshake succeeded; frames sealed
 )
 
-// SyncAuthProvider supplies the shared control-link PSK and the cross-channel
-// downgrade-guard signal to the session-sync stream authenticator (#4107 F23).
-// *Manager satisfies it (ControlLinkAuthKey + HeartbeatPeerAuthSeen). It is
-// OPTIONAL: when no provider is wired, or the key is empty, the sync stream
-// runs in legacy unauthenticated mode (dual-accept), byte-identical to before.
+// SyncAuthProvider supplies the shared control-link PSK to the session-sync
+// stream authenticator (#4107 F23). *Manager satisfies it. It is OPTIONAL:
+// when no provider is wired, or the key is empty, the sync stream runs in
+// legacy unauthenticated mode, byte-identical to before.
+//
+// #5078: this used to also require HeartbeatPeerAuthSeen(), the cross-channel
+// downgrade-guard signal. Its only consumer was syncPeerAuthSeen, which the
+// unconditional keyed-node rejection made unreachable, so the requirement went
+// with it. Manager still EXPORTS HeartbeatPeerAuthSeen — the gRPC fabric
+// listener (pkg/grpcapi) and the control-link auth status string both consume
+// it — it is simply no longer part of this interface's contract.
 type SyncAuthProvider interface {
 	ControlLinkAuthKey() []byte
-	HeartbeatPeerAuthSeen() bool
 }
 
 type syncAuthProviderBox struct{ p SyncAuthProvider }
@@ -134,22 +146,6 @@ func (s *SessionSync) authKey() []byte {
 		return box.p.ControlLinkAuthKey()
 	}
 	return nil
-}
-
-// syncPeerAuthSeen reports whether the peer has ever authenticated on EITHER
-// the sync channel (this stream, sticky s.syncAuthedEver) or the heartbeat
-// channel (HeartbeatPeerAuthSeen). Either proves both nodes are keyed, so a
-// subsequent unauthenticated connection is a downgrade attack and must be
-// rejected. Consulting the heartbeat closes the window after a keyed node
-// restarts (heartbeats flow every ~200ms) before the first sync auth.
-func (s *SessionSync) syncPeerAuthSeen() bool {
-	if s.syncAuthedEver.Load() {
-		return true
-	}
-	if box := s.authProvider.Load(); box != nil && box.p != nil {
-		return box.p.HeartbeatPeerAuthSeen()
-	}
-	return false
 }
 
 // authConn wraps a session-sync connection after the setup handshake. When
@@ -251,18 +247,66 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 //	peerKeyed      — the peer's HELLO advertised that it holds a key.
 //	proofOK        — the peer's challenge-response proof verified (meaningful
 //	                 only when both sides are keyed).
-//	peerAuthSeen   — sticky: the peer has previously authenticated on the sync
-//	                 OR heartbeat channel (so both nodes are keyed and an
-//	                 unauthenticated connection is now a downgrade attack).
 //
 // Policy:
 //   - No local key: dual-accept — this node cannot verify and may be the
 //     not-yet-keyed side of a rolling upgrade.
 //   - Local key + peer keyed (proof exchanged): enforce — reject a bad proof.
-//   - Local key + peer legacy/unkeyed + peer never authenticated: dual-accept.
-//   - Local key + peer legacy/unkeyed + peer HAS authenticated: reject
-//     (downgrade attack once both nodes are known-keyed).
-func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK, peerAuthSeen bool) (mode syncAuthMode, accept bool, reason string) {
+//   - Local key + peer legacy/unkeyed: REJECT, unconditionally.
+//
+// #5078: that last line used to grant a first-contact grace — a keyed node
+// dual-accepted an unkeyed peer whenever `peerAuthSeen` was still false. That
+// grace was an unauthenticated ACTIVE bypass, not a compatibility affordance,
+// and it did not need the reflection weakness to exploit: a PSK-less attacker
+// reaching the fabric on first contact was admitted, could fence the node
+// (disabling every RG), and displaced the legitimate peer connection — after
+// which arming the sticky guard did not evict it. `peerAuthSeen` is therefore
+// no longer consulted for this branch; it cannot be, because the whole window
+// is "before the guard arms".
+//
+// There is deliberately NO relaxation knob — but the rollout constraint is
+// sharper than an earlier revision of this comment claimed. An RG0 secondary
+// whose read-only gate is ARMED cannot be keyed locally:
+// applyRG0OwnershipTransition sets the store read-only on
+// StateSecondary/StateSecondaryHold and EnterConfigureSession then returns
+// ErrClusterReadOnly, so config-sync is that node's only writer. Arming is
+// driven by an RG0 TRANSITION event and nothing else, so a node that
+// cold-starts into secondary and never transitions is still writable, and REST
+// has no RG0 check of its own — see #6890 (and #6889 for the dropped-event
+// variant). Both are OPEN and unscheduled; do not design a rollout around
+// either, and do not assume they are fixed.
+// Keying a LIVE cluster therefore means committing on the PRIMARY while sync is
+// connected and letting the established connection carry the key across — which
+// works only because the auth key is absent from clusterTransportKey, so a key
+// commit does not restart cluster comms (pinned by
+// TestAuthKeyChangeDoesNotRestartClusterComms_5078). Keying at provisioning,
+// before either node seats as secondary, avoids the question entirely.
+//
+// A bounded dual-accept window was shipped and then removed. It had to bound a
+// connection's LIFETIME rather than just its admission (an admitted
+// pass-through stream outlived the deadline), it had to stop an admitted peer
+// re-arming it through config-sync, and it could not survive a crash loop
+// without persisting its deadline. A relaxation that needs three guards of its
+// own does not belong in the fix that closes the hole.
+//
+// The property this leaves is the right one for a security appliance: for a
+// connection established AFTER keying, a node must POSSESS the key to join a
+// keyed cluster. A fresh or RMA node is keyed locally as part of the same
+// bootstrap that gives it its node-id.
+//
+// That qualifier is load-bearing, and it is exactly what makes the live-keying
+// procedure above work. Verification is gated PER CONNECTION on ac.authed(),
+// which is fixed at handshake time, so a connection established BEFORE the key
+// was committed stays unauthenticated for its whole lifetime and keeps having
+// its frames accepted with no HMAC — the key never applies retroactively to an
+// established stream. That residual is PRE-EXISTING (master behaves
+// identically) and is tracked by #6628 — the broader "never re-handshakes on
+// an auth-key CHANGE", which also covers a key ROTATION and subsumes the
+// narrower unkeyed→keyed case. It is OPEN. Do not read the sentence above as
+// claiming it is closed. pkg/cluster/README.md, "Rolling it onto
+// a live unkeyed cluster", spells out the operator consequence: the restart in
+// step 3 is not optional.
+func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK bool) (mode syncAuthMode, accept bool, reason string) {
 	if !keyConfigured {
 		return syncAuthUnauthenticated, true, ""
 	}
@@ -272,18 +316,7 @@ func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK, peerAut
 		}
 		return syncAuthUnauthenticated, false, "hmac verification failed"
 	}
-	if peerAuthSeen {
-		return syncAuthUnauthenticated, false, "missing auth handshake (enforced: peer previously authenticated)"
-	}
-	return syncAuthUnauthenticated, true, ""
-}
-
-// pendingFrame carries a legacy/unkeyed peer's first real frame that was
-// consumed by the handshake read. receiveLoop must process it before reading
-// further so no message is lost and stream order is preserved.
-type pendingFrame struct {
-	typ     uint8
-	payload []byte
+	return syncAuthUnauthenticated, false, "missing auth handshake (enforced: this node is keyed)"
 }
 
 // readSyncFrameRaw reads one length-framed sync frame (header+payload) directly
@@ -326,21 +359,21 @@ func readSyncFrameRaw(conn net.Conn) (typ uint8, payload []byte, err error) {
 // HELLO and PROOF are written concurrently with reading the peer's frame so the
 // handshake works over a fully-synchronous transport (net.Pipe in tests): a
 // strict write-then-read on both symmetric peers would deadlock.
-func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte, *pendingFrame, error) {
+func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte, error) {
 	key := s.authKey()
 	if len(key) == 0 {
 		// No local key ⇒ no handshake; legacy behavior (dual-accept).
-		return syncAuthUnauthenticated, nil, nil, nil
+		return syncAuthUnauthenticated, nil, nil
 	}
 
 	if err := conn.SetDeadline(time.Now().Add(syncHandshakeTimeout)); err != nil {
-		return syncAuthUnauthenticated, nil, nil, err
+		return syncAuthUnauthenticated, nil, err
 	}
 	defer conn.SetDeadline(time.Time{})
 
 	localNonce := make([]byte, syncAuthNonceSize)
 	if _, err := rand.Read(localNonce); err != nil {
-		return syncAuthUnauthenticated, nil, nil, fmt.Errorf("cluster sync: handshake nonce: %w", err)
+		return syncAuthUnauthenticated, nil, fmt.Errorf("cluster sync: handshake nonce: %w", err)
 	}
 	hello := make([]byte, 0, 2+syncAuthNonceSize)
 	hello = append(hello, syncAuthVersion, 1) // version, keyed=1
@@ -352,36 +385,57 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 	typ, payload, err := readSyncFrameRaw(conn)
 	if err != nil {
 		<-writeErr
-		return syncAuthUnauthenticated, nil, nil, err
+		return syncAuthUnauthenticated, nil, err
 	}
 	if werr := <-writeErr; werr != nil {
-		return syncAuthUnauthenticated, nil, nil, werr
+		return syncAuthUnauthenticated, nil, werr
 	}
 
-	peerAuthSeen := s.syncPeerAuthSeen()
-
 	if typ != syncMsgAuthHello {
-		// Peer sent a real frame, not a HELLO ⇒ legacy or unkeyed peer.
-		_, accept, reason := syncAuthDecision(true, false, false, false, peerAuthSeen)
-		if !accept {
-			return syncAuthUnauthenticated, nil, nil, errors.New(reason)
-		}
-		return syncAuthUnauthenticated, nil, &pendingFrame{typ: typ, payload: payload}, nil
+		// Peer sent a real frame, not a HELLO ⇒ legacy or unkeyed peer. This
+		// node is keyed (the len(key)==0 early return is above), so the frame
+		// is discarded unread and the connection dropped. This arm rejects
+		// UNCONDITIONALLY — it does not branch on syncAuthDecision's accept
+		// bit, which is consulted only for the operator-facing reason string.
+		// That is deliberate: with the pending mechanism gone there is no
+		// "accept" outcome available here, so re-introducing a grace in the
+		// decision must not silently re-open this path.
+		//
+		// #5078: this arm used to hand that first frame back to the caller as a
+		// `pendingFrame`, which executed it BEFORE the connection was admitted
+		// — `syncMsgFence` on that path disabled every routing group for a peer
+		// that had proven nothing. With the dual-accept grace gone the arm can
+		// no longer accept, so the mechanism is deleted rather than reordered:
+		// unreachable code that mutates cluster state pre-admission is one edit
+		// away from being live again.
+		_, _, reason := syncAuthDecision(true, false, false, false)
+		return syncAuthUnauthenticated, nil, errors.New(reason)
 	}
 
 	if len(payload) < 2+syncAuthNonceSize {
-		return syncAuthUnauthenticated, nil, nil, errors.New("cluster sync: short auth HELLO")
+		return syncAuthUnauthenticated, nil, errors.New("cluster sync: short auth HELLO")
 	}
 	peerKeyed := payload[1] != 0
 	peerNonce := payload[2 : 2+syncAuthNonceSize]
 
 	if !peerKeyed {
-		// Peer is a new build but holds no key ⇒ it is not signing. Dual-accept.
-		_, accept, reason := syncAuthDecision(true, true, false, false, peerAuthSeen)
-		if !accept {
-			return syncAuthUnauthenticated, nil, nil, errors.New(reason)
-		}
-		return syncAuthUnauthenticated, nil, nil, nil
+		// Peer is a new build that speaks the handshake but holds no key ⇒ it
+		// is not signing and can prove nothing. This node is keyed, so the
+		// connection is dropped.
+		//
+		// Like the legacy/no-HELLO arm above, this arm rejects
+		// UNCONDITIONALLY — it does not branch on syncAuthDecision's accept
+		// bit, which is consulted only for the operator-facing reason string.
+		// The two arms are the SAME admission decision reached by different
+		// evidence (no HELLO at all vs. a HELLO advertising keyed=0), so they
+		// get the same shape deliberately: this is the arm that literally IS
+		// the rolling-upgrade case, so it is the one an operator restoring
+		// rolling-upgrade compatibility would edit first. Leaving an "accept"
+		// outcome reachable here — even one that today's decision never
+		// returns — is a single deleted `if` away from admitting a PSK-less
+		// peer that then fences every routing group.
+		_, _, reason := syncAuthDecision(true, true, false, false)
+		return syncAuthUnauthenticated, nil, errors.New(reason)
 	}
 
 	// Both keyed ⇒ mutual challenge-response: prove we hold the key over the
@@ -392,19 +446,19 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 	ptyp, ppayload, err := readSyncFrameRaw(conn)
 	if err != nil {
 		<-writeErr
-		return syncAuthUnauthenticated, nil, nil, err
+		return syncAuthUnauthenticated, nil, err
 	}
 	if werr := <-writeErr; werr != nil {
-		return syncAuthUnauthenticated, nil, nil, werr
+		return syncAuthUnauthenticated, nil, werr
 	}
 
 	proofOK := ptyp == syncMsgAuthProof && hmac.Equal(ppayload, syncAuthProof(key, localNonce))
-	mode, accept, reason := syncAuthDecision(true, true, true, proofOK, peerAuthSeen)
+	mode, accept, reason := syncAuthDecision(true, true, true, proofOK)
 	if !accept {
-		return syncAuthUnauthenticated, nil, nil, errors.New(reason)
+		return syncAuthUnauthenticated, nil, errors.New(reason)
 	}
 	frameKey := syncDeriveFrameKey(key, localNonce, peerNonce)
-	return mode, frameKey, nil, nil
+	return mode, frameKey, nil
 }
 
 // wrapSyncConn applies the negotiated handshake result to a connection: it
@@ -416,7 +470,6 @@ func (s *SessionSync) wrapSyncConn(fabricIdx int, conn net.Conn, mode syncAuthMo
 	ac := &authConn{Conn: conn}
 	if mode == syncAuthAuthenticated {
 		ac.key = frameKey
-		s.syncAuthedEver.Store(true)
 		slog.Info("cluster sync: connection authenticated with control-link PSK",
 			"fabric", fabricIdx, "remote", connRemoteAddrString(conn))
 	}

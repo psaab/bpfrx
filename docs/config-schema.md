@@ -2155,7 +2155,12 @@ path (`lenientClusterAuthKey`, #1960 no-brick) — that downgrade **is** the
 IN-PLACE upgrade path: a cluster that was unkeyed before this gate existed
 keeps its config DB, loads it through `CompileConfigLenient` at daemon start,
 boots, keeps forwarding, and is keyed on the operator's next commit;
-dual-accept then lets the key roll out one node at a time. Because the
+the heartbeat and fabric gRPC dual-accept then lets the key roll out one node
+at a time without dropping the cluster — but **not** session sync, whose
+dual-accept #5078 removed: a keyed node rejects an unkeyed peer, so session sync
+stays down until both nodes are keyed and both have restarted (see
+`pkg/cluster/README.md` -> "Rolling it onto a live unkeyed cluster", which marks
+the old sequence STALE, #6881). Because the
 unattended paths above fail closed, the migration has a REQUIRED ORDER: **key
 the running cluster first, then re-provision / reimage / rebuild a day-0
 drive.** `pkg/cluster/README.md` -> "Operating the control-link PSK (#6611)"

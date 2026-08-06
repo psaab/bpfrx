@@ -1293,9 +1293,15 @@ type compileOpts struct {
 	// entire control channel unauthenticated. The tolerant load / peer-sync
 	// paths downgrade to a warning so a cluster that was already unkeyed
 	// before this gate existed still BOOTS after the upgrade (#1960 no-brick)
-	// — that is the migration path; the dual-accept grace in all three
-	// mechanisms then lets the key be rolled out one node at a time without
-	// dropping the cluster. Same doctrine as lenientChassisRG.
+	// — that is the migration path. NOTE the grace is no longer uniform: #5078
+	// removed dual-accept from SESSION SYNC, so a keyed node now rejects an
+	// unkeyed peer's connection outright. The heartbeat and fabric gRPC
+	// channels still dual-accept, so the cluster does not drop, but keying one
+	// node at a time takes SESSION SYNC DOWN until both nodes are keyed and
+	// both have restarted (a connection only picks the key up on a new
+	// handshake). See pkg/cluster/README.md -> "Rolling it onto a live unkeyed
+	// cluster", which marks the old one-node-at-a-time sequence STALE (#6881).
+	// Same doctrine as lenientChassisRG.
 	lenientClusterAuthKey bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
