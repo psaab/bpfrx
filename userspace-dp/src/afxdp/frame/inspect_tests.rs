@@ -515,3 +515,131 @@ fn meta_fallback_icmpv4_truncated_echo_installs_no_session() {
         "a query packet truncated before its identifier must not install a metadata-keyed session"
     );
 }
+
+// ---- #4555/#6923: the traversable-type predicate, bound to the walker ----
+
+/// `ipv6_ext_header_is_traversable` must agree with what `walk_ipv6_ext_chain`
+/// MEASURABLY does, for all 256 next-header values — not with a second copy of
+/// the walker's match arms.
+///
+/// The probe is one minimal 8-byte header declaring TCP, laid out
+/// `[TCP, 0, 0, 0, 0, 0, 0, 0]`. That form is the minimum of all three
+/// traversable arms at once: GENERIC reads `HdrExtLen = 0` and advances
+/// `(0 + 1) * 8`, AUTH reads `len = 0` and advances `(0 + 2) * 4`, Fragment
+/// advances its fixed 8 — all three land on the TCP at offset 48. A value the
+/// walker does NOT traverse resolves in place at 40 (terminal) or returns
+/// `NoNextHeader` (59). So "landed at 48 carrying TCP" is a measurement of
+/// traversal, and the predicate must reproduce it exactly.
+///
+/// This is what keeps the predicate honest when someone teaches the walker a new
+/// extension-header type: adding an arm without adding the value here reds, and
+/// so does the reverse. `tests_shim_ext_parity.rs` runs the same equivalence
+/// against the SHIM's `eh_class`, so the three descriptions cannot drift apart.
+#[test]
+fn traversable_predicate_matches_walker_behaviour_over_all_256_values() {
+    for proto in 0u8..=255 {
+        let mut buf = vec![0u8; 40];
+        buf[0] = 0x60;
+        buf[4..6].copy_from_slice(&28u16.to_be_bytes());
+        buf[6] = proto;
+        buf.extend_from_slice(&[PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&[0u8; 20]);
+        let walked_past = matches!(
+            walk_ipv6_ext_chain(&buf, 0).outcome,
+            ExtChainOutcome::L4(48, PROTO_TCP)
+        );
+        assert_eq!(
+            ipv6_ext_header_is_traversable(proto),
+            walked_past,
+            "#6923: proto={proto}: ipv6_ext_header_is_traversable disagrees with what \
+             walk_ipv6_ext_chain does with a one-header chain of that type (outcome {:?}). The \
+             predicate is what stops an over-limit chain of this type from minting an installable \
+             session key, so a walker arm it does not know about is a hole.",
+            walk_ipv6_ext_chain(&buf, 0).outcome
+        );
+    }
+    // Anti-vacuity: the sweep must actually observe both outcomes, and the
+    // no-extension-header baseline must resolve at 40 so "landed at 48" is a
+    // statement about traversal rather than about every chain.
+    assert!(ipv6_ext_header_is_traversable(60));
+    assert!(!ipv6_ext_header_is_traversable(PROTO_TCP));
+    assert!(
+        !ipv6_ext_header_is_traversable(59),
+        "#6923: No-Next-Header is a terminal verdict on both sides, not a traversed header"
+    );
+    assert!(
+        !ipv6_ext_header_is_traversable(50),
+        "#6923: ESP is a resolved terminal — its payload is encrypted, so neither walker steps \
+         past it and an ESP flow must keep its metadata tuple"
+    );
+}
+
+/// The over-limit refusal lives in `metadata_tuple_complete`, and this pins the
+/// decision itself: the SAME addresses and the SAME 0/0 ports are COMPLETE for a
+/// resolved terminal and INCOMPLETE for a next-header value the walk traverses.
+///
+/// The pair is the point. "Refuses the ext-header tuple" alone is satisfied by a
+/// predicate that refuses every portless tuple, which would strand ESP, GRE and
+/// ICMPv6; the ESP row is what excludes that.
+#[test]
+fn metadata_tuple_complete_refuses_only_unresolved_ipv6_ext_protocols() {
+    let src = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x11));
+    let dst = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x22));
+    let judge_ports = |family: u8, protocol: u8, src_port: u16, dst_port: u16| {
+        let flow = SessionFlow {
+            src_ip: src,
+            dst_ip: dst,
+            forward_key: SessionKey {
+                addr_family: family,
+                protocol,
+                src_ip: src,
+                dst_ip: dst,
+                src_port,
+                dst_port,
+            },
+        };
+        let meta = UserspaceDpMeta {
+            addr_family: family,
+            protocol,
+            ..UserspaceDpMeta::default()
+        };
+        metadata_tuple_complete(meta, &flow)
+    };
+    let judge = |family: u8, protocol: u8| judge_ports(family, protocol, 0, 0);
+    let v6 = libc::AF_INET6 as u8;
+    let v4 = libc::AF_INET as u8;
+
+    for proto in 0u8..=255 {
+        if ipv6_ext_header_is_traversable(proto) {
+            assert!(
+                !judge(v6, proto),
+                "#6923: IPv6 protocol {proto} is a next-header the walk traverses — the shim only \
+                 emits it by EXHAUSTING its loop, so the tuple names where it gave up, not a \
+                 resolved L4 flow"
+            );
+            assert!(
+                judge(v4, proto),
+                "#6923: IPv4 protocol {proto} has no extension-header meaning and must stay \
+                 complete"
+            );
+            // #6923 does not disturb the pre-existing port rule either: the
+            // same value on IPv6 stays refused WITH ports, so the refusal is
+            // about the protocol, not about the tuple being portless.
+            assert!(!judge_ports(v6, proto, 1234, 5678));
+            continue;
+        }
+        if matches!(proto, PROTO_TCP | PROTO_UDP) {
+            // Pre-#6923 rule, untouched: TCP/UDP need BOTH ports. Asserting it
+            // here is what keeps the sweep from mistaking "0/0 is incomplete"
+            // for the new ext-header refusal.
+            assert!(!judge(v6, proto));
+            assert!(judge_ports(v6, proto, 1234, 5678));
+            continue;
+        }
+        assert!(
+            judge(v6, proto),
+            "#6923: IPv6 protocol {proto} is a RESOLVED terminal and its portless tuple must \
+             stay complete — refusing it would strand ESP/GRE/ICMPv6 transit flows"
+        );
+    }
+}
