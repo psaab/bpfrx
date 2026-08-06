@@ -17,9 +17,15 @@ import (
 // do NOT warn (no false positive); (3) a single RI / no RI does NOT warn;
 // (4) the PBR-term source (`then routing-instance`) also feeds the overlap set;
 // (5) the warning ENDS with the exact status sentence — stating the current
-// limitation and pointing at the tracking issue, with no promise before it and
-// nothing appended after it — and (6) losing the promise did not cost the
-// diagnostic any of its substance, polarity included.
+// limitation and pointing at the tracking issue, with no forecast in EITHER
+// direction before it and nothing appended after it — and (6) losing the promise
+// did not cost the diagnostic any of its substance, polarity included.
+//
+// "Either direction" is load-bearing in (5). The contract on validateVRFOverlap
+// is that the text must not promise a fix "nor rule one out", and until now only
+// the promise half was guarded: appending ". #2387 is closed wontfix; this is by
+// design and permanent" passed the whole suite while foreclosing an outcome that
+// is still the maintainer's to decide. See vrfOverlapForeclosingTokens.
 //
 // fail-on-revert: removing the validateVRFOverlap call (or its detection body)
 // drops the warning, so TestVRFOverlapWarnsOnOverlappingRIs goes RED.
@@ -211,6 +217,10 @@ const vrfOverlapStatusTail = "colliding 5-tuples may cross-forward. " +
 // documents. The entries below the first group were each added after a review
 // demonstrated it passing the test while reintroducing a promise, so treat any
 // addition the same way: prove it green first, then add it.
+//
+// Adding a whole DIRECTION is a different act from growing this list, and
+// vrfOverlapForeclosingTokens below is that: not one more spelling of a covered
+// axis, but the first coverage of an axis that had none.
 var vrfOverlapForwardLookingTokens = []string{
 	"until",
 	"will be",
@@ -255,6 +265,38 @@ var vrfOverlapForwardLookingTokens = []string{
 	"next release",
 	"targeted for",
 	"tracked for",
+}
+
+// vrfOverlapForeclosingTokens are the mirror image: wordings that rule a fix
+// OUT. The contract on validateVRFOverlap is symmetric — the text "must not
+// promise a fix, nor rule one out" — because #2387 is held on a maintainer
+// risk-appetite call whose two candidate end-states are BOTH still open. A
+// warning saying the collision is permanent and by design is exactly as wrong as
+// one saying a fix is coming, and it is the more dangerous error of the two: an
+// operator who reads "by design" stops treating an overlapping-VRF topology as a
+// hazard to revisit.
+//
+// This axis had NO guard until now. Every one of the 31 entries above is
+// forward-looking, so appending ". #2387 is closed wontfix; this is by design
+// and permanent" passed the whole suite while foreclosing the outcome the
+// comment forbids foreclosing. vrfOverlapStatusTail now reds any APPEND in
+// either direction; these tokens cover the same span the forward list does — the
+// message BEFORE the tail — and inherit the same disclosed incompleteness.
+//
+// The entries are checked against the shipped text: none is a substring of the
+// current warning, so this list starts from a real green.
+var vrfOverlapForeclosingTokens = []string{
+	"wontfix",
+	"won't fix",
+	"will not",
+	"never",
+	"by design",
+	"as designed",
+	"working as intended",
+	"permanent",
+	"closed as",
+	"not going to",
+	"no fix",
 }
 
 // vrfOverlapBothFormStrings returns one warning from EACH of the two format
@@ -302,11 +344,17 @@ func vrfOverlapBothFormStrings(t *testing.T) (equal, unequal string) {
 
 // TestVRFOverlapWarningStatesStatusNotPromise pins that BOTH format strings
 // describe the current limitation and point at the tracking issue, without
-// asserting that any particular fix arrives. Two layers, in order of strength:
-// the message must END with vrfOverlapStatusTail verbatim, and the message must
-// carry none of the known promise spellings anywhere. Restoring the old "…may
-// cross-forward until the session identity is VRF-aware" wording reds both — the
-// suffix no longer matches, and "until" is on the list.
+// forecasting EITHER outcome. Despite the name, "NotPromise" is shorthand for
+// "neither promises nor forecloses": the contract on validateVRFOverlap is
+// symmetric, so the test is too. Two layers, in order of strength: the message
+// must END with vrfOverlapStatusTail verbatim, and the message must carry none
+// of the known forecasting spellings — forward or backward — anywhere.
+//
+// Restoring the old "…may cross-forward until the session identity is VRF-aware"
+// wording reds this twice over: the suffix no longer matches, and "until" is on
+// the forward list. Appending ". #2387 is closed wontfix; this is by design and
+// permanent" reds it on the suffix; splicing the same text BEFORE the tail reds
+// it on the foreclosing list, which is the span the suffix cannot reach.
 func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 	equal, unequal := vrfOverlapBothFormStrings(t)
 	for _, tc := range []struct {
@@ -317,10 +365,19 @@ func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 		{"unequal-overlap", unequal},
 	} {
 		lower := strings.ToLower(tc.warn)
-		for _, tok := range vrfOverlapForwardLookingTokens {
-			if strings.Contains(lower, tok) {
-				t.Errorf("%s form promises a fix via %q; #2387 is an open decision, so the warning must state the limitation and point at the issue: %s",
-					tc.form, tok, tc.warn)
+		for _, grp := range []struct {
+			verb   string
+			tokens []string
+		}{
+			{"promises a fix", vrfOverlapForwardLookingTokens},
+			{"rules a fix OUT", vrfOverlapForeclosingTokens},
+		} {
+			for _, tok := range grp.tokens {
+				if strings.Contains(lower, tok) {
+					t.Errorf("%s form %s via %q; #2387 is an open decision, so the warning must state the "+
+						"limitation and point at the issue without forecasting EITHER outcome: %s",
+						tc.form, grp.verb, tok, tc.warn)
+				}
 			}
 		}
 		if !strings.HasSuffix(tc.warn, vrfOverlapStatusTail) {
@@ -338,14 +395,25 @@ func TestVRFOverlapWarningStatesStatusNotPromise(t *testing.T) {
 // (no routing-instance discriminator in the session identity) and WHAT follows
 // from it (colliding 5-tuples MAY cross-forward).
 //
-// What this control actually defends against is PARTIAL diagnostic stripping —
-// text that still passes the helper's selector and still ends with the exact
-// status tail, but has lost the cause, the consequence, or the pairing that says
-// which instance sits on which source and prefix. It is NOT what stops wholesale
-// deletion of the warning text: that reds StatesStatusNotPromise first, because
-// vrfOverlapBothFormStrings requires the diagnosis selector to match, exactly one
-// warning per fixture, and both arm markers before any assertion here is reached.
-// An earlier revision of this comment claimed the opposite; it was wrong.
+// What this control actually defends against is GUTTING the warning down to a
+// bare issue reference — text that still passes the helper's selector, still
+// carries both arm markers, and still ends with the exact status tail, but has
+// lost the cause, the consequence, or the pairing that says which instance sits
+// on which source and prefix. Measured on such a gut:
+// TestVRFOverlapWarningStatesStatusNotPromise stays GREEN and this test reds. Be
+// precise about how much that proves — TestVRFOverlapWarnsOnOverlappingRIs also
+// reds there, because that particular gut drops "NOT session-isolated", which it
+// asserts too. The cell where this control is the ONLY red in the file is
+// stripping the "…carries no routing-instance discriminator, so " clause while
+// leaving the tail intact: promise GREEN, six pre-existing GREEN, this one RED.
+// That is the measurement that makes it load-bearing rather than duplicative.
+//
+// An earlier revision of this comment said the promise test "is satisfied just as
+// well by deleting the warning text wholesale". The word doing the damage is
+// "wholesale": a WHOLESALE delete does red the promise test, at
+// vrfOverlapBothFormStrings' one-warning-per-fixture Fatalf, because the
+// diagnosis selector no longer matches anything. It is the skeleton-preserving
+// gut, not the wholesale delete, that this control alone catches.
 func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 	equal, unequal := vrfOverlapBothFormStrings(t)
 	for _, tc := range []struct {

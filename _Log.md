@@ -1,3 +1,64 @@
+## 2026-08-06 — #6902 round 5: the neutrality contract was guarded in one direction
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold two findings from the hostile review leg, plus a precision
+  correction to the round-4 comment. Test-file-only; production warning strings
+  still byte-identical to round 1, `cmp`-verified after every cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**ADD-1 — the reverse direction had NO guard.** The contract at
+`compiler_validate_vrf_overlap.go:58-59` is symmetric: the text "must not promise
+a fix, nor rule one out". All 31 blocklist entries were forward-looking, so
+appending `". #2387 is closed wontfix; this is by design and permanent"` passed
+the whole suite while foreclosing an outcome that is still the maintainer's to
+decide. That is the more dangerous half: an operator who reads "by design" stops
+treating an overlapping-VRF topology as a hazard to revisit.
+
+Added `vrfOverlapForeclosingTokens` and widened the test to scan both groups.
+Adding a DIRECTION is not the same act as growing a list — one covers an axis
+with zero coverage, the other chases an infinite tail — and the comment now says
+so, so the two do not get confused later.
+
+**ADD-2 — helper doc.** Already folded in round 4: `vrf2387Warnings` now
+documents that it selects on the diagnosis phrase, deliberately not on `#2387`.
+
+**Correction to round 4's own comment.** It said the control defends against
+"wholesale" deletion being caught elsewhere; the reviewer's framing is sharper
+and the round-4 text was imprecise in the other direction — it asserted the gut
+"reds only this test", which is false. Measured below: the gut also reds
+`TestVRFOverlapWarnsOnOverlappingRIs`, because that gut drops "NOT
+session-isolated". The cell where the control is the ONLY red in the file is the
+discriminator-clause strip. The comment now states exactly that.
+
+| Mutation | subs | Promise | Substance | 6 pre-existing |
+|---|---|---|---|---|
+| baseline | 0 | GREEN | GREEN | ALL GREEN |
+| APPEND foreclosing (wontfix/by design/permanent) | 2 | RED `wontfix` | GREEN | ALL GREEN |
+| SPLICE foreclosing BEFORE the tail | 2 | RED `by design` | GREEN | ALL GREEN |
+| SPLICE forward-looking BEFORE the tail | 2 | RED `planned` | GREEN | ALL GREEN |
+| APPEND the disclosed-escape wording | 2 | RED (suffix) | GREEN | ALL GREEN |
+| SPLICE the disclosed-escape wording before the tail | 2 | GREEN | GREEN | ALL GREEN |
+| GUT to a bare issue reference | 2 | GREEN | RED | 1 RED |
+| WHOLESALE delete the advisory | 2 | RED (helper) | RED (helper) | 2 RED |
+| literal FULL revert of both arms to master | 2 | RED `until` | RED | ALL GREEN |
+| strip every `#2387`, diagnosis intact | 4 | RED (suffix) | GREEN | ALL GREEN |
+| round-4 cells R4a-R4e, re-run | 2 ea | unchanged | unchanged | ALL GREEN |
+
+The two mid-message SPLICE cells are what prove each blocklist load-bearing in
+the span the suffix pin cannot reach; both fire naming a token from the intended
+group. Negative control for the prescribed addition: with
+`vrfOverlapForeclosingTokens` emptied, the foreclosing splice goes GREEN — so the
+new group, not something incidental, is what catches it.
+
+Two rows are honest limits rather than wins. Splicing the disclosed-escape
+wording (`the VRF-aware session key fixes this`) BEFORE the tail leaves both
+tests GREEN — that is the blocklist incompleteness the test file already
+discloses, and the suffix pin only reaches the append form of it. And the
+`#2387`-strip cell now fires at the suffix assertion rather than at the old
+issue-reference check; the defect did not move and the round-3 filter change
+stays.
+
 ## 2026-08-06 — #6902 round 4: the assertions bound VOCABULARY, not the CLAIM
 
 - **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
