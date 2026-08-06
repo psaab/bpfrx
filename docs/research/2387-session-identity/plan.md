@@ -1,6 +1,22 @@
 # #2387 — session/flow identity is the bare 5-tuple: the DENY-vs-ISOLATE decision
 
-**Revision:** v6-r2 — incorporates r1 reviews (Claude SMR + AGY; Codex pending)
+**Revision:** v6-r3 — incorporates r2 reviews (Claude SMR + AGY; Codex pending)
+
+**v6-r3 changelog — two defects found in v6-r2, both in the fix rather than the bug:**
+- **AGY r2 REFUTED §4.3a's fail-closed claim.** It is fail-closed for domain-N
+  packets but **fail-OPEN for domain-0 packets** during a mixed-version window.
+  Resolved in §4.3b by **version-gating enforcement** — and that flips §11 Q2
+  from "defer the capability signal to #5804" to "#2387 needs it for its own
+  correctness".
+- **Claude SMR r2 (SMR-7)** found "static deterministic interning" — v6-r2's own
+  replacement for the withdrawn Path D — re-creates the cross-forwarding bug
+  through routine config churn. Replaced with an explicit allocate-once /
+  never-reissue invariant in §5 C-P0.
+- §7a extended with the ICMP-error and NAT64 producers. **AGY's suggested VXLAN
+  and IP-in-IP producers were verified NOT to exist in this codebase and are
+  rejected.**
+- §4.3a's `performSyncHandshake` PSK-gating, the 1:1 map, the chain claim and the
+  byte budget were all independently VERIFIED by AGY r2.
 **Verified against:** origin/master @ `e80db2eae`
 **Branch:** `research/2387-session-identity` (docs only — no production source)
 
@@ -256,11 +272,72 @@ with no `authentication-key`, **no handshake happens at all** and there is no pl
 carry a capability bit. Any chain-wide negotiation design must either accept that it
 only protects keyed clusters, or introduce an unconditional capability exchange.
 
-**Cost consequence for this plan:** #2387 alone does **not** need negotiation — its
-polarity is fail-closed. But the chain does, and #2387 owns the wire decision. C-P3
-must therefore either (i) introduce the capability bit, or (ii) explicitly hand that
-scope to #5804 with a written rationale. **v6-r1 priced this at zero. It is not
-zero, and reviewers should decide which of (i)/(ii) this plan adopts** — see §11 Q2.
+### 4.3b The fail-closed claim was WRONG at domain 0 — and fixing it decides the capability question
+
+**AGY r2 refuted §4.3a's "it never cross-forwards", and the refutation is correct.**
+The trace:
+
+1. An un-upgraded peer syncs a session for `tenant-a` (domain N). It omits the field.
+2. The upgraded node decodes `routing_domain = 0` and installs the session **under
+   domain 0** — because we chose "0 = the default routing-instance".
+3. A **new flow in the default VRF** (genuinely domain 0) arrives with the same 5-tuple.
+4. It looks up `(5-tuple, domain 0)` and **matches tenant-a's session** — inheriting
+   its egress, NAT binding and policy verdict.
+
+So the interning choice that makes non-VRF clusters bit-identical is exactly what
+makes a VRF cluster **fail-OPEN for default-VRF traffic** during the upgrade window.
+The polarity table in §4.3a holds for domain-N packets only.
+
+**Note this is not a small residue:** it re-creates #2387's original cross-forwarding
+bug, in the one window where an operator is least able to observe it, and in exactly
+the overlapping-subnet config the feature exists to protect.
+
+**Why the obvious fixes fail.** Using a distinct `UNKNOWN` sentinel instead of 0 is
+fail-closed, but then *every* legacy-peer-synced session fails to match — including in
+**non-VRF clusters**, which destroys the "bit-identical" property and turns a
+mixed-version failover into mass session loss. That is a worse trade.
+
+**The resolution: gate enforcement on the peer's protocol version, not on the field.**
+During the window, the upgraded node must behave **exactly as today** — 5-tuple only,
+no domain comparison — and engage domain enforcement only once the peer is known to
+speak it. The signal already exists and, crucially, is **not PSK-gated**:
+
+- The heartbeat carries `HAProtocolVersion` in **every packet**, encoded at
+  `pkg/cluster/heartbeat.go:286` and decoded at `:374`. Unlike the F23 handshake this
+  is unconditional — an unkeyed cluster still exchanges it.
+
+**The catch, and the scope it implies.** The ISSU driver requires the two versions to
+be **exactly equal**: `parseHAProtocolCompatible` (`pkg/upgrade/cluster_cli.go:253`)
+is documented *"Compatible iff N == M … a bump means the wire semantics changed and
+the release is NOT rolling-upgradable"*. So a naive bump would make the release
+non-rolling — reviving the very objection §4.3 retired.
+
+But `MinCompatHAProtocolVersion` (`heartbeat.go:46`) **exists for precisely this case**
+— *"the OLDEST HA protocol version `CurrentHAProtocolVersion` can still interoperate
+with"* — and it is currently **vestigial: it has no non-test consumer in the tree**
+(verified). The design is therefore:
+
+1. bump `CurrentHAProtocolVersion` → 2, set `MinCompatHAProtocolVersion` = 1;
+2. change `parseHAProtocolCompatible` to honour the declared floor (`peer >=
+   MinCompat`) instead of exact equality;
+3. enforce domain matching only when the peer advertises >= 2.
+
+Result: no fail-open, no session loss, and the upgrade **stays rolling** — but via a
+declared-compatibility contract rather than by avoiding the version bump.
+
+**This is real, high-consequence scope: it modifies the upgrade safety gate.** It is
+well-founded (the constant exists for this and is unused), but it must be priced, and
+it must not be smuggled in as a one-liner.
+
+**Consequently §11 Q2 lands on (i), not (ii):** #2387 must carry the capability signal
+**for its own correctness**, not as a favour to #5804. That also disposes of the
+PSK-gating problem — the heartbeat version is unconditional, so the F23 handshake is
+*not* the mechanism to use here. #5804 may still need a finer-grained feature bit for
+its reject-not-widen requirement; that remains its own scope.
+
+**Cost consequence for this plan:** v6-r1 priced the capability question at zero and
+v6-r2 left it open. It is neither. C-P3 carries a protocol-version bump plus a change
+to the ISSU compatibility predicate.
 
 ### 4.4 Hot-path cost — measured where measurable, unmeasured where not (Q4)
 
@@ -452,10 +529,50 @@ overlapping config, whereas Path D would drop **established sessions in any VRF
 deployment** on an unrelated commit. A domain id must be stable for the life of a
 session, and deriving it from a config-analysis result cannot guarantee that.
 
-**Path D is withdrawn.** Domain interning must be **static and deterministic across
-all routing-instances** — every routing-instance gets a dense id regardless of whether
-it overlaps anything, so ids do not move when unrelated config changes. Non-VRF
-deployments still see `routing_domain == 0` everywhere, which preserves most of the
+**Path D is withdrawn.**
+
+#### The replacement, stated as an invariant — because v6-r2's version of it was also defective
+
+v6-r2 said only "static and deterministic interning across all routing-instances".
+**Claude SMR r2 and AGY r2 independently found that this is not sufficient**, and the
+most natural reading of it is actively dangerous:
+
+- If ids are **derived from the current RI set** (e.g. sorted names → 1, 2, 3…), then
+  deleting one routing-instance **renumbers its successors**. Every live session in
+  every higher-numbered RI is then keyed on an id denoting a **different VRF** — not a
+  failure to match, but a **match against the wrong tenant**. That is #2387's original
+  bug, re-created by its own fix, and triggered by an unrelated commit.
+- **Id reuse** after a delete/re-add has the same shape: a stale session matches a new
+  tenant.
+- **AGY additionally found the HA half:** two nodes that build their tables at
+  different times (one has been running through several commits, the other just
+  rebooted from a fresh snapshot) would assign **different ids to the same RI name**.
+  A session synced from node A then matches a *different* VRF on node B. This is a
+  live-cluster fault, not just an upgrade-window one.
+
+**The invariant, which C-P0 must implement and test:**
+
+> A `routing_domain` id is **allocated once per routing-instance identity and never
+> re-derived from the current RI set**. Allocation is monotonic; the name→id table is
+> **carried in the configuration** and therefore (a) identical on both cluster nodes
+> via the existing config sync, (b) persisted across daemon restart, and (c) restored
+> correctly by `rollback`. Deleting an RI **retires** its id; a retired id is **never
+> reissued**. On RI deletion, sessions in that domain are explicitly **flushed** rather
+> than left to age out under an id that no longer denotes anything.
+
+**Why the table is carried in the config rather than hashed — a deliberate rejection
+of AGY's recommendation.** AGY r2 proposed a deterministic string hash (FNV-1a of the
+RI name, 0 reserved for `default`) to guarantee both nodes agree. That does solve
+agreement and persistence with no new state — but **a hash has collisions**, and a
+collision between two RI names maps two distinct tenants onto one domain id, which is
+**precisely the cross-tenant match this entire issue exists to prevent**. Trading a
+guaranteed-correct table for a 2^-32 silent security fault is the wrong trade in a
+security boundary. Config-carried allocation gets agreement from the config sync that
+already exists, and gets persistence and rollback for free, with **no collision
+possible**. Reviewers should push back if they disagree, but the collision argument
+should be answered rather than waved past.
+
+Non-VRF deployments still see `routing_domain == 0` everywhere, which preserves the
 rollout-safety value Path D was reaching for, without the hazard.
 
 ### Recommendation (to be tested by review, not asserted)
@@ -473,7 +590,26 @@ Path C is a **PR series**, not one PR:
 |---|---|---|---|
 | **C-P0** | dense static interning of RI names → `routing_domain: u32`; populate the dead `meta.routing_table` slot at **every** ingress producer (native ingress, local delivery, GRE decap, fabric ingress). **No behaviour change** — nothing reads it yet. | no | unit |
 | **C-P2** | add `routing_domain` to `SessionKey` + the four transforms in `session/key.rs`; store ingress **and** egress domain in `SessionMetadata`; fabric exemption. | no | RED-on-revert + negative control |
-| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **plus the §4.3a capability decision**. | yes | `make test-failover` + short-payload decode test |
+| **C-P3** | `IngressRoutingDomain` / `EgressRoutingDomain` as length-gated trailing VALUE fields, V4 **and** V6; reverse-key domain reconstruction; **`CurrentHAProtocolVersion` → 2 + `MinCompat` = 1 + the `parseHAProtocolCompatible` change + version-gated enforcement (§4.3b)**. | yes | `make test-failover` + short-payload decode + **mixed-version enforcement-off** test |
+
+**C-P0 additionally owns** the allocate-once/never-reissue interner, its
+config-carried name→id table, and the flush-on-RI-delete path (§5). That is more than
+"plumbing" and should not be under-scoped.
+
+**C-P2's signature changes, made explicit** (AGY r2 required this). `SessionKey`
+carries the *ingress* domain, so the reverse/translated transforms cannot derive the
+reply's domain from the key alone — the reply's domain is the **egress** domain, which
+lives in `SessionMetadata`. All four transforms in `userspace-dp/src/session/key.rs`
+must therefore take it as a parameter:
+
+- `reverse_wire_key(forward_key, nat, egress_domain)` (`:94`)
+- `reverse_canonical_key(forward_key, nat, egress_domain)` (`:145`)
+- `translated_session_key(key, nat, egress_domain)` (`:73`)
+- `forward_wire_key(forward_key, nat)` (`:28`) — keeps the ingress domain, unchanged
+
+`reply_matches_forward_session` must thread it through to both. **For intra-VRF flows
+ingress == egress and this is a no-op**, which is exactly why the change is safe in
+the common case and why a route-leaked test is mandatory to prove it is not vacuous.
 
 Splitting C-P0 out is what makes this reviewable: it is a pure plumbing PR whose
 correctness can be checked without touching identity, and it is also the PR that most
@@ -519,9 +655,18 @@ all the same. The inventory:
 | PBR-steered | the PBR-resolved routing-instance (`ingress_route_table_override`) | must agree with the FIB table actually used |
 | GRE decap | the **tunnel logical** interface's RI | `gre.rs:760` already rebinds `ingress_ifindex` to `endpoint.logical_ifindex`, so this falls out of the native rule — **verified** |
 | fabric cross-chassis | **exempt** — do not compare | `packet_fabric_ingress` is already a parameter at `poll_descriptor/mod.rs:448` |
-| local delivery / host-inbound | default domain | |
-| neighbor-seed, NAT64 companion, other transient installs | default domain | must not be fail-closed against |
-| peer-synced sessions | the wire field; absent → 0 = default | §4.3 |
+| local delivery / host-inbound | default domain | `forwarding/host_inbound.rs` |
+| neighbor-seed, other transient installs | default domain | must not be fail-closed against |
+| **host-generated ICMP error state** (ICMP unreachable / time-exceeded / PTB) | inherit the **triggering packet's** domain — do **not** fall back to 0 | `afxdp/icmp_embed/`, `afxdp/icmp_ptb.rs` — AGY r2 |
+| **NAT64 / NPTv6 synthetic translation flows** | the domain of the admitting side | `nat64.rs` — AGY r2; interacts with the cross-family key transform |
+| peer-synced sessions | the wire field; absent → **do not enforce** (§4.3b), not "0 = default" | corrected in v6-r3 |
+
+**Two producers AGY r2 asked for were verified NOT to exist and are deliberately
+omitted:** **VXLAN decap** (no VXLAN implementation in `userspace-dp/src` — the sole
+grep hit is a GRE local-delivery test filename) and **IP-in-IP decap** (`PROTO_IPIP`
+appears only as a *policy match* protocol in `policy.rs`, with no decapsulation path).
+Adding inventory rows for non-existent code would make the plan look more complete
+while making it less true.
 
 ## 8. Risk assessment
 
@@ -536,6 +681,26 @@ all the same. The inventory:
 
 ## 9. Test plan
 
+**Per-path matching obligations (Claude SMR r2).** The domain argument must be made
+for each lookup path, not just the primary one — v6-r2 asserted it globally. The paths
+are: the direct-primary `key_to_handle` probe (**1:1**); the **reverse companion**
+built by `build_reverse_session_from_forward_match`; and the **NAT-translated alias**
+via `reverse_translated_index`, which is a **1:N multimap with validate-on-lookup**
+(`#4438`) — a different structure, so the "1:1 forces the fault" reasoning in §5 does
+**not** transfer to it and it needs its own test. Each path needs a case proving a
+cross-domain packet does not match, and an intra-domain reply still does.
+
+- **Interner stability (new in v6-r3, and the highest-value test in the plan):** add
+  RI `b`, commit; establish a session in RI `c`; delete RI `a`; commit; assert `c`'s
+  session **still matches** and its domain id is **unchanged**. This is RED against any
+  positional/derived interning scheme, which is exactly the defect v6-r2 shipped.
+  A second case: delete an RI and assert its id is **not reissued** to a new RI, and
+  that its sessions were flushed.
+- **Mixed-version enforcement-off (new in v6-r3):** with the peer advertising
+  `HAProtocolVersion` 1, assert the upgraded node performs **no** domain comparison —
+  i.e. behaviour is byte-identical to today, and specifically that a domain-0 packet
+  does **not** match a legacy-synced session that would have collided under §4.3b's
+  refuted trace.
 - **RED-on-revert, the issue's stated regression:** two VLAN sub-units on one parent,
   two routing-instances, each with PBR `then routing-instance`, identical 5-tuples,
   differing policy/NAT ⇒ assert **no** session reuse across the boundary **and**
@@ -578,11 +743,16 @@ scope (reconciled to 297 with the grep stated).
 1. **The binary: DENY (Path B) or ISOLATE (Path C)?** With the 1:1 `key_to_handle`
    finding, Path B's two possible behaviours are both cross-tenant faults. Is that
    dispositive, or is a bounded co-tenant DoS still preferable to the churn of C?
-2. **§4.3a — which of (i)/(ii) does this plan adopt?** Either #2387 introduces the
-   capability bit in the F23 HELLO (real added scope, and it only protects clusters
-   with a PSK configured), or it explicitly defers that to #5804 with a written
-   rationale. **This is the largest remaining cost question and v6-r1 priced it at
-   zero.**
+2. **[LANDED in v6-r3 on (i) — attack the landing, not the question.]** §4.3b resolves
+   the mixed-version fail-open by version-gating enforcement on the heartbeat's
+   `HAProtocolVersion`, which requires bumping `CurrentHAProtocolVersion` to 2, setting
+   `MinCompatHAProtocolVersion` = 1, and changing `parseHAProtocolCompatible` from
+   exact equality to a declared-floor comparison. **Is changing the ISSU compatibility
+   predicate acceptable?** It is the safety gate that decides whether a release is
+   rolling-upgradable; loosening it to honour a declared floor is what the unused
+   constant was written for, but it is a real widening of what the gate permits. If
+   reviewers reject this, the fail-open at domain 0 has no cheap fix and the plan
+   should probably go back to PLAN-DEFER.
 3. **Does the chain ordering bind?** #4983 is a sequencing preference, not a
    dependency (§2.5). Should #2387 nonetheless wait for it, given #4983 is OPEN with
    no branch and would otherwise be the safer place to prove the plumbing?
