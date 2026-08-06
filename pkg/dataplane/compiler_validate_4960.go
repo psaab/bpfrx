@@ -48,11 +48,24 @@ import (
 )
 
 // discardingDataPlane satisfies DataPlane for the validation pre-pass. It
-// embeds the interface (the LegacyDataPlaneAdapter idiom) so it satisfies all
-// 130 methods while overriding only the ones the validated phases actually
-// call. An un-overridden method nil-panics rather than silently succeeding,
-// which is the behaviour we want: if a phase starts calling something new, the
-// pre-pass must be revisited rather than quietly diverging from the real run.
+// embeds the interface and overrides only the methods the validated phases
+// actually call.
+//
+// This is a deliberate INVERSION of the LegacyDataPlaneAdapter pattern, not the
+// same thing (#6894 r1 F5): that adapter embeds a NON-nil DataPlane
+// (legacy_dataplane.go sets adapter.DataPlane = the shim manager) and delegates
+// everything it does not override. This one leaves the embedded interface NIL,
+// so an un-overridden method panics rather than silently succeeding against a
+// real dataplane -- the pre-pass must never write.
+//
+// The panic is the desired failure mode but is NOT compile-time enforced: the
+// override set is complete for today's call graph, and a newly added,
+// CONDITIONALLY reached dp.X() inside a validated phase would ship green and
+// panic in production (the only recover() on the apply path is scoped to
+// host-auth closeout). TestPrePassShimCoversTheCalledSurface_4960 is what
+// enforces it -- it drives the pre-pass over a config reaching every covered
+// phase, so a new call surfaces as a test panic. Widen that fixture when
+// adding a phase.
 type discardingDataPlane struct{ DataPlane }
 
 func (discardingDataPlane) IsLoaded() bool                                                { return true }
@@ -155,12 +168,34 @@ func validateBeforeMutate(cfg *config.Config) error {
 		screenID++
 	}
 
-	// Same order as CompileConfig, so a config that fails several phases
-	// reports the same phase it would have reported post-mutation.
-	for _, phase := range []struct {
-		name string
-		run  func() error
-	}{
+	for _, phase := range validationPhases(dp, cfg, result) {
+		if err := phase.run(); err != nil {
+			return fmt.Errorf("validate %s: %w", phase.name, err)
+		}
+	}
+	return nil
+}
+
+// validationPhase is one entry in the pre-pass table. The table is a named
+// function rather than a literal inside validateBeforeMutate so a test can
+// assert over its CONTENTS: the call site being bound proves the pre-pass
+// RUNS, not that it still covers what the doc comment claims it covers. Ten of
+// the eleven original rows could be deleted with the whole package suite still
+// green, because a single binding fixture pins exactly one row (#6894 r1 F1).
+type validationPhase struct {
+	name string
+	run  func() error
+}
+
+// validationPhases lists the phases the pre-pass validates, in the same order
+// CompileConfig runs them, so a config that fails several reports the same
+// phase it would have reported post-mutation.
+//
+// The name set is asserted by TestValidationPhaseTableMatchesDocumentedCoverage_4960.
+// Adding or removing a row without updating that test -- and the coverage
+// paragraph above -- is a test failure by construction.
+func validationPhases(dp DataPlane, cfg *config.Config, result *CompileResult) []validationPhase {
+	return []validationPhase{
 		{"address book", func() error { return compileAddressBook(dp, cfg, result) }},
 		{"applications", func() error { return compileApplications(dp, cfg, result) }},
 		{"policies", func() error { return compilePolicies(dp, cfg, result) }},
@@ -171,13 +206,17 @@ func validateBeforeMutate(cfg *config.Config) error {
 		{"screen profiles", func() error { return compileScreenProfiles(dp, cfg, result) }},
 		{"default policy", func() error { return compileDefaultPolicy(dp, cfg) }},
 		{"flow timeouts", func() error { return compileFlowTimeouts(dp, cfg) }},
+		// #6894 r1 F2: the ONE config-shape hard error still reachable after the
+		// mutation point. validateFilterProtocols is the FIRST statement of
+		// Phase 10 (compiler_filter.go:26) and is purely a function of cfg --
+		// no result, no dp, no logging -- so validating it here cannot read
+		// anything a later phase set up, and the existing in-place call is left
+		// untouched. Reachable via the TOLERANT load paths (Store.Load boot,
+		// Store.SyncApply HA peer-sync), which downgrade the strict rejection to
+		// a warning and then reach CompileConfig.
+		{"firewall filter protocols", func() error { return validateFilterProtocols(cfg) }},
 		{"flow config", func() error { return compileFlowConfig(dp, cfg, result) }},
-	} {
-		if err := phase.run(); err != nil {
-			return fmt.Errorf("validate %s: %w", phase.name, err)
-		}
 	}
-	return nil
 }
 
 // newValidationResult builds a zero-valued CompileResult with every map
@@ -206,3 +245,24 @@ func newValidationResult() *CompileResult {
 		genericXDPIfindexes: make(map[int]bool),
 	}
 }
+
+// isValidationPass reports whether dp is the pre-pass's discarding shim.
+//
+// #6894 r1 F3: the covered phases log unconditionally, so running them twice
+// doubled every compile's INFO output (measured 15 -> 22 lines) and one line
+// printed a value that was FALSE for the run the operator cares about:
+// compileFlowConfig logs lo0_filter_v4 from a pass where compileFirewallFilters
+// has not run, so the sentinel 65535 is emitted immediately before the real
+// pass logs the armed id. An operator asking "did my lo0 filter arm?" read NO
+// then YES for one apply. CLAUDE.md restricts slog.Info to state transitions and
+// one-time events; a discarded validation pass is neither.
+//
+// The marker rides on the DATAPLANE rather than on CompileResult because two of
+// the validated phases (compileDefaultPolicy, compileFlowTimeouts) do not take a
+// result, so a result field could not gate them without a signature change.
+func isValidationPass(dp DataPlane) bool {
+	v, ok := dp.(interface{ xpfValidationPass() bool })
+	return ok && v.xpfValidationPass()
+}
+
+func (discardingDataPlane) xpfValidationPass() bool { return true }

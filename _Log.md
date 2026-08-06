@@ -66938,3 +66938,45 @@ break — `go vet` confirmed passing under every revert.
   pkg/dataplane/compiler_validate_4960.go,
   pkg/dataplane/compiler_validate_4960_test.go,
   pkg/dataplane/compiler_idprobe_4960_test.go, _Log.md
+- **Timestamp**: 2026-08-05 21:58
+- **Action**: #4960 / PR #6894 gate fold r1 — five items. (F1, the one that
+  mattered) The coverage claim was asserted by NOTHING: dropping 10 of 11 phase
+  rows left the whole package suite green, because the single binding fixture
+  used an unresolvable APPLICATION name and pinned exactly one row. The call
+  site was bound; the table's CONTENTS were not. Hoisted the literal into
+  `validationPhases()` so it can be asserted over, added
+  `TestValidationPhaseTableMatchesDocumentedCoverage_4960` (length + ordered
+  name set vs the doc comment) and a SECOND binding fixture from a different
+  phase (`TestNoHostMutationWhenNATPhaseFails_4960`, unresolvable SNAT pool).
+  (F2) `validateFilterProtocols` — the first statement of Phase 10 and 100%
+  cfg-pure (no result, no dp, no logging) — is now a pre-pass row, taking
+  coverage to TWELVE of thirteen. It is ADDED, not moved: the in-place call
+  stays, so a config where compileFirewallFilters succeeds is bit-identical.
+  It was the sole config-shape hard error still reachable post-mutation, via the
+  TOLERANT load paths. (F3) The covered phases logged twice per compile (15 ->
+  22 INFO lines) and `flow config compiled` printed lo0_filter_v4=65535 from the
+  pre-pass then =0 from the real pass — an operator reading NO then YES for one
+  apply. Added `isValidationPass(dp)` (marker on the DATAPLANE, because
+  compileDefaultPolicy/compileFlowTimeouts take no result) and gated 8 log
+  sites. (F4) The test fixture used `ge-0-0-0.50`/`ge-0-0-1.0`, byte-identical
+  to real interfaces on the standalone VM and loss node 0, and this is the first
+  pkg/dataplane test to drive compileZones to completion — as root it would have
+  run LinkAdd/AddrDel/ethtool//proc/sys writes. Renamed to `xpft4960a/b` and
+  added a root+live-link skip belt. (F5) Three citations corrected: the
+  parenthetical understated the mutation set (LinkDel/LinkSetDown via
+  stripUnmanagedInterfaces); the shim was cited as "the LegacyDataPlaneAdapter
+  idiom" when it is the INVERSION (that one embeds a NON-nil dataplane and
+  delegates; this one leaves it nil so un-overridden methods panic) — now says
+  so and names `TestPrePassShimCoversTheCalledSurface_4960` as what enforces
+  completeness, since nothing does at compile time; and the ID probe's "same
+  order as CompileConfig" was not literally true.
+  Cells: dropping 10 of 12 rows REDs BOTH the table assertion ("covers 2 phases
+  but the documented coverage is 12") and the new NAT fixture ("host was mutated
+  before the NAT phase failed: 2 SetZoneConfig"). Gates: go build rc=0, go vet
+  rc=0, go test ./... rc=0, go test ./pkg/refactoraudit/ rc=0 (6 top-level, 0
+  SKIP).
+- **File(s)**: pkg/dataplane/compiler.go,
+  pkg/dataplane/compiler_validate_4960.go,
+  pkg/dataplane/compiler_validate_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/compiler_iface.go, _Log.md

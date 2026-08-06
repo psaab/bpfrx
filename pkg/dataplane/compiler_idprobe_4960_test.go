@@ -133,8 +133,11 @@ func idProbeConfig() *config.Config {
 	return cfg
 }
 
-// compileIDsOnce runs the ID-assigning phases against a fresh CompileResult,
-// exactly as the validate-pre-pass would, and returns the assigned IDs.
+// compileIDsOnce runs the ID-ASSIGNING phases against a fresh CompileResult
+// and returns the assigned IDs. Deliberately NOT the pre-pass's phase set: it
+// is the ID-assigning subset PLUS finalizeNATCounterIDs, which the pre-pass
+// does not call. The question here is ID stability across two compiles, not
+// pre-pass coverage (#6894 r1 F5).
 func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 	t.Helper()
 	dp := idProbeDP{}

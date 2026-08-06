@@ -1415,12 +1415,14 @@ func compileScreenProfiles(dp DataPlane, cfg *config.Config, result *CompileResu
 			maxScreenID = uint32(sid)
 		}
 
-		slog.Info("screen profile compiled",
-			"name", name, "id", sid,
-			"flags", fmt.Sprintf("0x%x", sc.Flags),
-			"syn_thresh", sc.SynFloodThresh,
-			"icmp_thresh", sc.ICMPFloodThresh,
-			"udp_thresh", sc.UDPFloodThresh)
+		if !isValidationPass(dp) {
+			slog.Info("screen profile compiled",
+				"name", name, "id", sid,
+				"flags", fmt.Sprintf("0x%x", sc.Flags),
+				"syn_thresh", sc.SynFloodThresh,
+				"icmp_thresh", sc.ICMPFloodThresh,
+				"udp_thresh", sc.UDPFloodThresh)
+		}
 	}
 
 	// Zero screen config entries above the highest used ID.

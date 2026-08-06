@@ -203,9 +203,12 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 
 	// #4960: validate every fallible HOST-PURE phase against a discarding
 	// dataplane BEFORE Phase 2 touches the host. compileZones below is the
-	// first and only destructive netlink mutation in this function (VLAN
-	// create/link-up, address delete/add) and nothing after it has an undo
-	// path, so a config that trips a later phase must be rejected here rather
+	// first and only destructive netlink mutation in this function -- VLAN
+	// create/link-up and address delete/add, AND netlink.LinkDel /
+	// LinkSetDown on unmanaged interfaces via stripUnmanagedInterfaces
+	// (compiler_iface.go:1256/1284), plus ethtool and /proc/sys writes
+	// (#6894 r1 F5: the earlier parenthetical understated this) -- and
+	// nothing after it has an undo path, so a config that trips a later phase must be rejected here rather
 	// than half-applied. See compiler_validate_4960.go for what is and is not
 	// covered, and why this is additive rather than a reordering.
 	if err := validateBeforeMutate(cfg); err != nil {
@@ -1075,9 +1078,13 @@ func compileDefaultPolicy(dp DataPlane, cfg *config.Config) error {
 		return fmt.Errorf("set default policy: %w", err)
 	}
 	if action == ActionPermit {
-		slog.Info("default policy compiled", "action", "permit-all")
+		if !isValidationPass(dp) {
+			slog.Info("default policy compiled", "action", "permit-all")
+		}
 	} else {
-		slog.Info("default policy compiled", "action", "deny-all")
+		if !isValidationPass(dp) {
+			slog.Info("default policy compiled", "action", "deny-all")
+		}
 	}
 	return nil
 }
@@ -1192,15 +1199,17 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		return err
 	}
 
-	slog.Info("flow config compiled",
-		"tcp_mss_ipsec", fc.TCPMSSIPsec,
-		"tcp_mss_gre_in", fc.TCPMSSGreIn,
-		"tcp_mss_gre_out", fc.TCPMSSGreOut,
-		"allow_dns_reply", fc.AllowDNSReply,
-		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
-		"app_flags", fc.AppFlags,
-		"lo0_filter_v4", fc.Lo0FilterV4,
-		"lo0_filter_v6", fc.Lo0FilterV6)
+	if !isValidationPass(dp) {
+		slog.Info("flow config compiled",
+			"tcp_mss_ipsec", fc.TCPMSSIPsec,
+			"tcp_mss_gre_in", fc.TCPMSSGreIn,
+			"tcp_mss_gre_out", fc.TCPMSSGreOut,
+			"allow_dns_reply", fc.AllowDNSReply,
+			"allow_embedded_icmp", fc.AllowEmbeddedICMP,
+			"app_flags", fc.AppFlags,
+			"lo0_filter_v4", fc.Lo0FilterV4,
+			"lo0_filter_v6", fc.Lo0FilterV6)
+	}
 
 	return nil
 }

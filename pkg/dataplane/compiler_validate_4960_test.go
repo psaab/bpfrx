@@ -4,6 +4,8 @@ package dataplane
 // dataplane phase must leave the host UNMUTATED.
 
 import (
+	"net"
+	"os"
 	"strings"
 	"testing"
 
@@ -47,14 +49,14 @@ func (r *recordingDP) SetVlanIfaceInfo(subIfindex, parentIfindex int, vlanID uin
 func failLaterPhaseConfig() *config.Config {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
-		"trust":   {Name: "trust", Interfaces: []string{"ge-0-0-0.50"}},
-		"untrust": {Name: "untrust", Interfaces: []string{"ge-0-0-1.0"}},
+		"trust":   {Name: "trust", Interfaces: []string{"xpft4960a.50"}},
+		"untrust": {Name: "untrust", Interfaces: []string{"xpft4960b.0"}},
 	}
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
-		"ge-0-0-0": {Name: "ge-0-0-0", Units: map[int]*config.InterfaceUnit{
+		"xpft4960a": {Name: "xpft4960a", Units: map[int]*config.InterfaceUnit{
 			50: {Number: 50, VlanID: 50, Addresses: []string{"192.0.2.1/24"}},
 		}},
-		"ge-0-0-1": {Name: "ge-0-0-1", Units: map[int]*config.InterfaceUnit{
+		"xpft4960b": {Name: "xpft4960b", Units: map[int]*config.InterfaceUnit{
 			0: {Number: 0, Addresses: []string{"198.51.100.1/24"}},
 		}},
 	}
@@ -142,3 +144,99 @@ func (*recordingDP) DeleteStaleIfaceZone(written map[IfaceZoneKey]bool)         
 func (*recordingDP) DeleteStaleVlanIface(written map[uint32]bool)                      {}
 func (*recordingDP) DeleteStaleIfaceFilter(written map[IfaceFilterKey]bool)            {}
 func (*recordingDP) ZeroStaleFilterConfigs(startID uint32)                             {}
+
+// #6894 r1 F4: this file is the first test in pkg/dataplane to drive
+// compileZones to completion. Once cachedInterfaceByName(physName) SUCCEEDS the
+// path runs LinkAdd/LinkSetUp, AddrDel/AddrAdd, `ethtool -K/-G` and
+// os.WriteFile("/proc/sys/net/core/rps_sock_flow_entries", ...). The fixture
+// therefore uses names outside the vSRX scheme (config.LinuxIfName only maps
+// "/"->"-", so "ge-0-0-0.50" is byte-identical to a real interface on the
+// standalone VM and on loss cluster node 0). This belt refuses to run as root
+// if the name ever does collide with a live link.
+func skipIfCouldMutateAHost(t *testing.T, names ...string) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		return
+	}
+	for _, n := range names {
+		if _, err := net.InterfaceByName(n); err == nil {
+			t.Skipf("refusing to run as root with a live %q: compileZones would "+
+				"reconfigure a real interface", n)
+		}
+	}
+}
+
+// #6894 r1 F1: a SECOND binding fixture, from a DIFFERENT phase. The
+// application fixture pins exactly one row of the phase table; with only that
+// test, ten of the eleven original rows could be deleted and the whole package
+// suite stayed green. This one fails in compileNAT instead, so the two together
+// bind opposite ends of the table.
+func failLaterNATPhaseConfig() *config.Config {
+	cfg := failLaterPhaseConfig()
+	cfg.Security.Policies[0].Policies[0].Match.Applications = []string{"any"} // app phase now clean
+	cfg.Security.NAT.Source = []*config.NATRuleSet{
+		{
+			Name: "rs", FromZone: "trust", ToZone: "untrust",
+			Rules: []*config.NATRule{
+				{Name: "r1", Match: config.NATMatch{SourceAddress: "10.0.0.0/8"},
+					Then: config.NATThen{Type: config.NATSource, PoolName: "no-such-pool-4960"}},
+			},
+		},
+	}
+	return cfg
+}
+
+func TestNoHostMutationWhenNATPhaseFails_4960(t *testing.T) {
+	skipIfCouldMutateAHost(t, "xpft4960a", "xpft4960b")
+	dp := &recordingDP{}
+
+	_, err := CompileConfig(dp, failLaterNATPhaseConfig(), false)
+	if err == nil {
+		t.Fatal("expected the unresolvable NAT pool to fail the compile")
+	}
+	if !strings.Contains(err.Error(), "no-such-pool-4960") {
+		t.Fatalf("failed for the wrong reason: %v", err)
+	}
+	if dp.zoneConfigCalls != 0 || dp.vlanIfaceInfoCall != 0 {
+		t.Errorf("host was mutated before the NAT phase failed: %d SetZoneConfig, "+
+			"%d SetVlanIfaceInfo (#4960)", dp.zoneConfigCalls, dp.vlanIfaceInfoCall)
+	}
+}
+
+// #6894 r1 F1: assert over the TABLE ITSELF. The call site being bound proves
+// the pre-pass RUNS; it says nothing about whether the table still covers what
+// the doc comment claims. Deleting rows is invisible to every behavioural test
+// that does not happen to exercise the deleted phase, so the coverage sentence
+// is pinned here directly.
+func TestValidationPhaseTableMatchesDocumentedCoverage_4960(t *testing.T) {
+	want := []string{
+		"address book", "applications", "policies", "nat", "static nat",
+		"nat64", "nptv6", "screen profiles", "default policy", "flow timeouts",
+		"firewall filter protocols", "flow config",
+	}
+	got := validationPhases(discardingDataPlane{}, &config.Config{}, newValidationResult())
+
+	if len(got) != len(want) {
+		t.Fatalf("the pre-pass covers %d phases but the documented coverage is "+
+			"%d — a row was added or removed without updating the doc comment "+
+			"in compiler_validate_4960.go and this test (#6894 r1 F1)",
+			len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].name != w {
+			t.Errorf("phase %d is %q, documented as %q — the table order must "+
+				"match CompileConfig so a multi-phase failure reports the same "+
+				"phase it would post-mutation", i, got[i].name, w)
+		}
+	}
+}
+
+// The pre-pass shim leaves the embedded DataPlane nil, so any method it does
+// not override panics. Nothing enforces completeness at compile time, so this
+// exercises the pre-pass over a config that reaches every covered phase: a
+// newly-called dp method shows up as a panic here rather than in production.
+func TestPrePassShimCoversTheCalledSurface_4960(t *testing.T) {
+	if err := validateBeforeMutate(idProbeConfig()); err != nil {
+		t.Fatalf("rich config must validate clean: %v", err)
+	}
+}

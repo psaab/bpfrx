@@ -425,15 +425,19 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						slog.Warn("failed to set SNAT egress IP",
 							"interface", ifaceRef, "err", err)
 					} else {
-						slog.Info("SNAT egress IP set",
-							"interface", ifaceRef, "ifindex", physIface.Index,
-							"vlan", vlanID, "v4", unitV4, "v6", unitV6)
+						if !isValidationPass(dp) {
+							slog.Info("SNAT egress IP set",
+								"interface", ifaceRef, "ifindex", physIface.Index,
+								"vlan", vlanID, "v4", unitV4, "v6", unitV6)
+						}
 					}
 				}
 
 				if len(v4IPs) == 0 && len(v6IPs) == 0 {
-					slog.Warn("no IP addresses for interface SNAT",
-						"zone", rs.ToZone)
+					if !isValidationPass(dp) {
+						slog.Warn("no IP addresses for interface SNAT",
+							"zone", rs.ToZone)
+					}
 					continue
 				}
 
@@ -673,13 +677,15 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 						}
 						writtenSNAT[SNATKey{FromZone: fromZone, ToZone: toZone, RuleIdx: ri}] = true
 						v4RuleIdx[zp] = ri + 1
-						slog.Info("source NAT rule compiled",
-							"rule-set", rs.Name, "rule", rule.Name,
-							"from", rs.FromZone, "to", rs.ToZone,
-							"pool_id", curPoolID, "rule_idx", ri,
-							"counter_id", counterID,
-							"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
-							"src_addr", srcAddr, "dst_addr", dstAddr)
+						if !isValidationPass(dp) {
+							slog.Info("source NAT rule compiled",
+								"rule-set", rs.Name, "rule", rule.Name,
+								"from", rs.FromZone, "to", rs.ToZone,
+								"pool_id", curPoolID, "rule_idx", ri,
+								"counter_id", counterID,
+								"src_addr_id", srcAddrID, "dst_addr_id", dstAddrID,
+								"src_addr", srcAddr, "dst_addr", dstAddr)
+						}
 					}
 
 					// Write SNAT rule (v6)
@@ -916,12 +922,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 								writtenDNATv6[dk] = true
 							}
 
-							slog.Info("destination NAT rule compiled",
-								"rule-set", rs.Name, "rule", rule.Name,
-								"match_ip", matchIP, "match_port", dstPort,
-								"proto", proto,
-								"pool", pool.Name, "pool_ip", poolIP,
-								"pool_port", poolPort)
+							if !isValidationPass(dp) {
+								slog.Info("destination NAT rule compiled",
+									"rule-set", rs.Name, "rule", rule.Name,
+									"match_ip", matchIP, "match_port", dstPort,
+									"proto", proto,
+									"pool", pool.Name, "pool_ip", poolIP,
+									"pool_port", poolPort)
+							}
 						}
 					}
 				}
