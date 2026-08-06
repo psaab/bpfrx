@@ -1,3 +1,77 @@
+## 2026-08-05 — #5078 round 9: the hardening was applied to one of two symmetric arms
+
+- **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
+- **Action**: A ninth gate at `4d097df7d` again returned **no runtime defect**
+  — it re-verified the three #5078 removals (`syncAuthedEver`,
+  `HeartbeatPeerAuthSeen` consumers, the deleted `pendingFrame` path) and found
+  all three sound. It did find that the round-8 hardening landed on only ONE of
+  `performSyncHandshake`'s two unauthenticated-admission arms.
+  1. **F1 (fixed).** The no-HELLO arm was hardened to reject UNCONDITIONALLY,
+     with a comment explaining that "unreachable code that mutates cluster state
+     pre-admission is one edit away from being live again". Its sibling — the
+     `!peerKeyed` arm, reached when a peer sends a well-formed HELLO advertising
+     `keyed=0` — still read "Dual-accept.", still branched on
+     `syncAuthDecision`'s accept bit, and had **no handshake-level test at all**.
+     That is the worse of the two to leave soft: it is literally the
+     rolling-upgrade shape (a new build not yet keyed), so it is the arm an
+     operator restoring rolling-upgrade compatibility edits first. Proven unbound
+     by mutation BEFORE the fix: replacing the whole arm body with
+     `return syncAuthUnauthenticated, nil, nil` left the **entire `pkg/cluster`
+     suite GREEN**. A PSK-less peer admitted there reaches `syncMsgFence`, which
+     disables every routing group. The arm now has the sibling's shape —
+     hardcoded rejection, `syncAuthDecision` consulted only for the reason
+     string.
+  2. **The missing test.** `TestSyncAuthHandshakeKeyedNodeRejectsUnkeyedHelloPeer`
+     hand-builds a `HELLO{version:1, keyed:0, nonce}` — a fixture the real
+     handshake cannot produce on either end, since `performSyncHandshake` returns
+     early when unkeyed and otherwise always advertises `keyed=1` — and asserts
+     both the rejection and its operator-facing reason string. Neither existing
+     test reaches this arm: `TestSyncAuthDecisionMatrix` drives
+     `syncAuthDecision` directly and never runs a handshake, and
+     `...RejectsLegacyPeer` sends a real frame, so it exits at the
+     `typ != syncMsgAuthHello` arm and never evaluates `peerKeyed`.
+  3. **Over-reach guard.** `TestSyncAuthHandshakeKeyedHelloPeerStillAuthenticates`
+     drives the same hand-built HELLO writer down the same pipe with exactly one
+     byte changed (keyed 0 -> 1), completes the challenge-response, and asserts
+     the derived frame key equals `syncDeriveFrameKey(key, serverNonce,
+     peerNonce)`. It pins that the rejection is attributable to the keyed=0
+     ADVERTISEMENT rather than to a malformed fixture that never reached the
+     handshake, and that the fail-closed change did not over-reach into the keyed
+     path. It stays GREEN under the accepting mutation.
+  4. **Mutation matrix (all run firsthand).** (A) arm accepts → new rejection
+     test RED at `sync_auth_test.go:255`, "a keyed node must REJECT a peer
+     advertising keyed=0"; guard GREEN; `TestSyncAuthDecisionMatrix` GREEN,
+     confirming the new test is the SOLE catcher. (B) restore the grace inside
+     `syncAuthDecision` → both matrix rows RED plus both handshake reason
+     assertions RED (the relaxed decision returns an empty reason). (C) the
+     LITERAL revert of the hardening — restoring the old
+     `if !accept { reject }` shape — is **GREEN, by construction**: the
+     hardening is behavior-preserving, exactly like its sibling. What it buys is
+     that the accepting edit in (A) is no longer one deleted `if` away; what the
+     new test buys is that the edit is no longer silent. Recorded here rather
+     than dressed up as a red.
+  5. **F2 (comment only).** The `syncAuthDecision` doc asserted without
+     qualification that "a node must POSSESS the key to join a keyed cluster".
+     That is false for a connection established BEFORE keying: verification is
+     gated per-connection on `ac.authed()`, fixed at handshake time, so such a
+     connection stays unauthenticated for its whole lifetime and its frames keep
+     being accepted with no HMAC. The claim is now scoped to connections
+     established AFTER keying, and the residual is named. Note the residual has
+     TWO open issue numbers: **#6628** ("never re-handshakes on an auth-key
+     CHANGE", older, also covers a key ROTATION) and **#6906** (the narrower
+     unkeyed->keyed re-filing). `pkg/cluster/README.md` on this branch already
+     cited #6628 for exactly this; the brief named #6906. Rather than pick one
+     blind, both surfaces now cite BOTH and say which is broader — flagged to
+     the parent as a probable duplicate to close. The same unqualified claim was
+     standing in `pkg/cluster/README.md` line 233 and is qualified there too;
+     leaving it in the sibling surface is the defect pattern this PR already
+     corrected once (`5f85960b6`, "sweep the refuted premise, not just one
+     row"). Both are PRE-EXISTING (master behaves identically). The behaviour
+     fix belongs to that issue alone: it is a change on a security path and
+     needs its own gate.
+- **File(s)**: `pkg/cluster/sync_auth.go`, `pkg/cluster/sync_auth_test.go`,
+  `pkg/cluster/README.md`, `_Log.md`
+
 ## 2026-08-05 — #6843 round 7: the thesis defect was standing in the module README
 
 - **Timestamp**: 2026-08-05 (fix/3651-zone-prom-surface, PR #6843)

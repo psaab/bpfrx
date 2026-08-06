@@ -230,8 +230,17 @@ in-memory arming meant a crash loop granted a fresh interval on every restart.
 A relaxation needing three guards of its own does not belong inside the fix that
 closes the hole, so it was removed.
 
-What remains is the property a security appliance should have: **a node must
-possess the key to join a keyed cluster.**
+What remains is the property a security appliance should have: **for a
+connection established AFTER keying, a node must possess the key to join a
+keyed cluster.**
+
+That qualifier is not pedantry. Verification is gated per-connection on
+`ac.authed()`, fixed at handshake time, so a connection established BEFORE the
+key was committed stays unauthenticated for its whole lifetime and keeps having
+its frames accepted with no HMAC. See "Rolling it onto a live unkeyed cluster"
+below for the operator consequence — the restart there is not optional — and
+**#6628** / **#6906** for the open residual. Both are PRE-EXISTING, not
+introduced by #5078.
 
 ### Rollout: a secondary whose gate is ARMED cannot be keyed locally
 

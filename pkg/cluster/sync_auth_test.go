@@ -187,6 +187,161 @@ func TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer(t *testing.T) {
 	}
 }
 
+// writeSyncAuthHello writes a well-formed HELLO from the PEER side of a pipe,
+// with the keyed byte under the caller's control. performSyncHandshake only
+// ever emits keyed=1 (it returns early when it holds no key), so a keyed=0
+// HELLO cannot be produced by running the real handshake on both ends — it has
+// to be hand-built here. The version byte and the 32-byte nonce match what a
+// real new-build peer sends, so the ONLY thing distinguishing the two callers
+// below is the keyed advertisement.
+func writeSyncAuthHello(t *testing.T, conn net.Conn, keyed byte, nonce []byte) {
+	t.Helper()
+	if len(nonce) != syncAuthNonceSize {
+		t.Fatalf("test bug: nonce must be %d bytes, got %d", syncAuthNonceSize, len(nonce))
+	}
+	hello := make([]byte, 0, 2+syncAuthNonceSize)
+	hello = append(hello, syncAuthVersion, keyed)
+	hello = append(hello, nonce...)
+	if err := writeMsg(conn, syncMsgAuthHello, hello); err != nil {
+		t.Fatalf("peer failed to send HELLO(keyed=%d): %v", keyed, err)
+	}
+}
+
+// TestSyncAuthHandshakeKeyedNodeRejectsUnkeyedHelloPeer covers the OTHER
+// unauthenticated-admission arm of performSyncHandshake: a peer that speaks the
+// handshake correctly but advertises keyed=0.
+//
+// This is the arm that literally IS the rolling-upgrade shape — a new build
+// that has not been keyed yet — so it is the one an operator restoring
+// rolling-upgrade compatibility edits first, and until this test existed
+// nothing in pkg/cluster stopped them. Verified by mutation before the fix:
+// replacing the whole arm body with `return syncAuthUnauthenticated, nil, nil`
+// left the ENTIRE pkg/cluster suite GREEN. A PSK-less peer admitted there
+// reaches syncMsgFence, which disables every routing group.
+//
+// TestSyncAuthDecisionMatrix does NOT reach this: it drives syncAuthDecision
+// directly and never runs a handshake. TestSyncAuthHandshakeKeyedNodeRejects-
+// LegacyPeer does not reach it either — it sends a real frame instead of a
+// HELLO, so it exits at the `typ != syncMsgAuthHello` arm above and never
+// evaluates peerKeyed.
+//
+// RED on revert: make this arm accept (return a nil error, the rolling-upgrade
+// edit) and this test fails on "a keyed node must REJECT a peer advertising
+// keyed=0". Note the arm's hardening is behavior-PRESERVING — restoring the
+// old `if !accept { reject }` shape rejects identically, so that literal revert
+// is green here by construction. What the hardening buys is that the accepting
+// edit above is no longer one deleted `if` away; what this test buys is that
+// the edit is no longer silent.
+func TestSyncAuthHandshakeKeyedNodeRejectsUnkeyedHelloPeer(t *testing.T) {
+	a := newAuthSync(t, []byte("psk"))
+
+	ca, cb := net.Pipe()
+	defer ca.Close()
+	defer cb.Close()
+
+	ach := runHandshake(a, ca)
+
+	// Read the keyed node's HELLO first — net.Pipe is unbuffered, and the
+	// handshake blocks in <-writeErr until its HELLO is consumed.
+	if typ, _, err := readSyncFrameRaw(cb); err != nil {
+		t.Fatalf("peer failed to read HELLO: %v", err)
+	} else if typ != syncMsgAuthHello {
+		t.Fatalf("expected server HELLO type %d, got %d", syncMsgAuthHello, typ)
+	}
+	writeSyncAuthHello(t, cb, 0, bytes.Repeat([]byte{0xA5}, syncAuthNonceSize))
+
+	ar := <-ach
+	if ar.err == nil {
+		t.Fatalf("a keyed node must REJECT a peer advertising keyed=0, got mode=%d key=%x", ar.mode, ar.key)
+	}
+	// Assert the REASON, not merely that some error occurred. Every error path
+	// in performSyncHandshake returns (unauthenticated, nil, err) — a read
+	// timeout, a short HELLO, a write failure all look identical here — so
+	// `err != nil` alone would still pass if the connection died before ever
+	// reaching the keyed=0 arm.
+	if !strings.Contains(ar.err.Error(), "missing auth handshake") {
+		t.Fatalf("rejection must come from the unkeyed-peer arm and name the cause; "+
+			"got %q, want it to contain %q", ar.err.Error(), "missing auth handshake")
+	}
+	if ar.mode != syncAuthUnauthenticated {
+		t.Fatalf("a rejected keyed=0 peer must not negotiate an authenticated mode, got %d", ar.mode)
+	}
+	if ar.key != nil {
+		t.Fatalf("a rejected handshake must yield no frame key")
+	}
+}
+
+// TestSyncAuthHandshakeKeyedHelloPeerStillAuthenticates is the OVER-REACH guard
+// for the test above. It drives the same hand-built HELLO writer down the same
+// pipe, changing exactly ONE byte — keyed 0 -> 1 — and then completes the
+// challenge-response. The keyed peer must still authenticate and must still
+// derive the shared frame key.
+//
+// Two things this pins that the rejection test cannot:
+//   - the rejection is attributable to the keyed=0 ADVERTISEMENT, not to a
+//     malformed frame or a fixture that never reached the handshake at all —
+//     the identical construction with keyed=1 gets all the way to an
+//     authenticated result;
+//   - the fail-closed hardening did not over-reach into the keyed path.
+//
+// It stays GREEN under the keyed=0 arm's accepting mutation (that edit is
+// unreachable from here), which is what makes it a guard rather than a
+// restatement of the fix.
+func TestSyncAuthHandshakeKeyedHelloPeerStillAuthenticates(t *testing.T) {
+	key := []byte("psk")
+	a := newAuthSync(t, key)
+
+	ca, cb := net.Pipe()
+	defer ca.Close()
+	defer cb.Close()
+
+	ach := runHandshake(a, ca)
+
+	typ, payload, err := readSyncFrameRaw(cb)
+	if err != nil {
+		t.Fatalf("peer failed to read HELLO: %v", err)
+	}
+	if typ != syncMsgAuthHello {
+		t.Fatalf("expected server HELLO type %d, got %d", syncMsgAuthHello, typ)
+	}
+	if len(payload) < 2+syncAuthNonceSize {
+		t.Fatalf("server HELLO too short: %d bytes", len(payload))
+	}
+	if payload[1] == 0 {
+		t.Fatalf("a keyed node must advertise keyed=1, got keyed=%d", payload[1])
+	}
+	serverNonce := append([]byte(nil), payload[2:2+syncAuthNonceSize]...)
+
+	peerNonce := bytes.Repeat([]byte{0xA5}, syncAuthNonceSize)
+	writeSyncAuthHello(t, cb, 1, peerNonce)
+
+	// The node proves over OUR nonce; we prove over ITS nonce.
+	ptyp, ppayload, err := readSyncFrameRaw(cb)
+	if err != nil {
+		t.Fatalf("peer failed to read PROOF: %v", err)
+	}
+	if ptyp != syncMsgAuthProof {
+		t.Fatalf("expected PROOF type %d, got %d", syncMsgAuthProof, ptyp)
+	}
+	if !hmac.Equal(ppayload, syncAuthProof(key, peerNonce)) {
+		t.Fatalf("node's proof does not verify over our nonce")
+	}
+	if err := writeMsg(cb, syncMsgAuthProof, syncAuthProof(key, serverNonce)); err != nil {
+		t.Fatalf("peer failed to send PROOF: %v", err)
+	}
+
+	ar := <-ach
+	if ar.err != nil {
+		t.Fatalf("a keyed peer with a good proof must be ACCEPTED, got %v", ar.err)
+	}
+	if ar.mode != syncAuthAuthenticated {
+		t.Fatalf("expected authenticated mode, got %d", ar.mode)
+	}
+	if want := syncDeriveFrameKey(key, serverNonce, peerNonce); !bytes.Equal(ar.key, want) {
+		t.Fatalf("frame key mismatch: got %x, want %x", ar.key, want)
+	}
+}
+
 // TestSyncAuthHandshakeDowngradeGuardRejects was DELETED here.
 //
 // It claimed to verify the downgrade-guard — "once the peer has authenticated

@@ -289,9 +289,23 @@ func syncDeriveFrameKey(key, nonceA, nonceB []byte) []byte {
 // without persisting its deadline. A relaxation that needs three guards of its
 // own does not belong in the fix that closes the hole.
 //
-// The property this leaves is the right one for a security appliance: a node
-// must POSSESS the key to join a keyed cluster. A fresh or RMA node is keyed
-// locally as part of the same bootstrap that gives it its node-id.
+// The property this leaves is the right one for a security appliance: for a
+// connection established AFTER keying, a node must POSSESS the key to join a
+// keyed cluster. A fresh or RMA node is keyed locally as part of the same
+// bootstrap that gives it its node-id.
+//
+// That qualifier is load-bearing, and it is exactly what makes the live-keying
+// procedure above work. Verification is gated PER CONNECTION on ac.authed(),
+// which is fixed at handshake time, so a connection established BEFORE the key
+// was committed stays unauthenticated for its whole lifetime and keeps having
+// its frames accepted with no HMAC — the key never applies retroactively to an
+// established stream. That residual is PRE-EXISTING (master behaves
+// identically) and is tracked by #6628 (the broader "never re-handshakes on an
+// auth-key CHANGE", which also covers a key ROTATION) and by #6906 (the
+// narrower unkeyed→keyed re-filing); both are OPEN. Do not read the sentence
+// above as claiming either is closed. pkg/cluster/README.md, "Rolling it onto
+// a live unkeyed cluster", spells out the operator consequence: the restart in
+// step 3 is not optional.
 func syncAuthDecision(keyConfigured, peerAdvertised, peerKeyed, proofOK bool) (mode syncAuthMode, accept bool, reason string) {
 	if !keyConfigured {
 		return syncAuthUnauthenticated, true, ""
@@ -405,12 +419,23 @@ func (s *SessionSync) performSyncHandshake(conn net.Conn) (syncAuthMode, []byte,
 	peerNonce := payload[2 : 2+syncAuthNonceSize]
 
 	if !peerKeyed {
-		// Peer is a new build but holds no key ⇒ it is not signing. Dual-accept.
-		_, accept, reason := syncAuthDecision(true, true, false, false)
-		if !accept {
-			return syncAuthUnauthenticated, nil, errors.New(reason)
-		}
-		return syncAuthUnauthenticated, nil, nil
+		// Peer is a new build that speaks the handshake but holds no key ⇒ it
+		// is not signing and can prove nothing. This node is keyed, so the
+		// connection is dropped.
+		//
+		// Like the legacy/no-HELLO arm above, this arm rejects
+		// UNCONDITIONALLY — it does not branch on syncAuthDecision's accept
+		// bit, which is consulted only for the operator-facing reason string.
+		// The two arms are the SAME admission decision reached by different
+		// evidence (no HELLO at all vs. a HELLO advertising keyed=0), so they
+		// get the same shape deliberately: this is the arm that literally IS
+		// the rolling-upgrade case, so it is the one an operator restoring
+		// rolling-upgrade compatibility would edit first. Leaving an "accept"
+		// outcome reachable here — even one that today's decision never
+		// returns — is a single deleted `if` away from admitting a PSK-less
+		// peer that then fences every routing group.
+		_, _, reason := syncAuthDecision(true, true, false, false)
+		return syncAuthUnauthenticated, nil, errors.New(reason)
 	}
 
 	// Both keyed ⇒ mutual challenge-response: prove we hold the key over the
