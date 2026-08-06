@@ -21,7 +21,14 @@ impl crate::afxdp::Coordinator {
     /// ceiling via the uncapped sync-import fan-out. Zero when no workers are
     /// registered (early boot / teardown) — the caller treats a zero ceiling as
     /// "bound disabled" so a transient window never rejects legitimate imports.
-    fn synced_import_cap(&self) -> usize {
+    /// Visible to `ha::tests` (#6819 §7) so the PRODUCTION arithmetic below can
+    /// be asserted directly. Both admission tests set
+    /// `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+    /// branch BEFORE this function's production expression is ever evaluated —
+    /// a test-only seam shadowing the real formula. With only those tests,
+    /// deleting the trailing `.saturating_mul(2)` here leaves every cap
+    /// assertion green.
+    pub(super) fn synced_import_cap(&self) -> usize {
         #[cfg(test)]
         if self.synced_import_cap_override != 0 {
             // The override expresses a LOGICAL session ceiling; double it to the
@@ -79,7 +86,9 @@ impl crate::afxdp::Coordinator {
             && entry.generation != 0
             && entry.generation < previous.generation
         {
-            SESSION_INSTALL_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            self.sessions
+                .install_stale_ignored
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         // #5674: aggregate synced-import admission bound. Locally-created
@@ -101,10 +110,33 @@ impl crate::afxdp::Coordinator {
         // only a peer EXCEEDING its own logical ceiling is rejected. Gate ONLY
         // FORWARD new keys (`!entry.metadata.is_reverse`): a synthesized reverse
         // always rides with its forward (a rejected forward `return`s BEFORE
-        // publishing its reverse, so no half-sync), and a lone reverse import
-        // off the wire (`is_reverse` set by a peer) is never independently
-        // rejected at a boundary slot — it inserts one entry that its forward
-        // already accounted for. Drop-NEWEST: reject a NEW forward key at/above
+        // publishing its reverse, so no half-sync), and a lone reverse import is
+        // never independently rejected at a boundary slot — it inserts one entry
+        // that its forward already accounted for.
+        //
+        // #6413: that lone reverse does NOT arrive "off the wire from a peer" —
+        // a peer-received reverse never reaches this function at all. Go's
+        // `SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/
+        // manager_ha.go`) early-returns on `!shouldMirrorUserspaceSession(
+        // val.IsReverse)` and writes ONLY the BPF mirror, so only FORWARD peer
+        // imports transit the helper — which then synthesizes their reverse
+        // companion locally (`synthesized_synced_reverse_entry`). The only
+        // `is_reverse=1` entry that reaches this gate is the LOCAL mirror
+        // companion `mirrorSessionPairV4`/`V6` (#310) pre-install as a
+        // SEPARATE upsert, dispatched through
+        // `server/handlers/sync_session.rs`, which calls
+        // `upsert_synced_session` unconditionally for any `is_reverse`.
+        //
+        // #6413 corner, documented rather than implied away: if the shared
+        // `synced` map is AT the 2N entry cap and that local mirror's FORWARD is
+        // cap-rejected, its separate `is_reverse=1` companion still skips this
+        // forward-only gate and publishes as a bounded **+1 orphan** entry with
+        // no matching forward. Self-inflicted and bounded by the local session
+        // rate, low-harm, and explicitly NOT the peer-DoS vector this cap
+        // targets — the Go reverse filter above already excludes the peer path.
+        // So fwd/rev pairing at this boundary is not perfect, by construction.
+        //
+        // Drop-NEWEST: reject a NEW forward key at/above
         // the ceiling (never enqueue it to any worker), but ALWAYS allow a
         // REPLACE of an existing synced key (`previous_entry.is_some()` — it
         // does not grow the map) so an in-flight synced session keeps
@@ -115,7 +147,9 @@ impl crate::afxdp::Coordinator {
         if previous_entry.is_none() && !entry.metadata.is_reverse {
             let synced_cap = self.synced_import_cap();
             if synced_cap != 0 && synced_len >= synced_cap {
-                SYNCED_IMPORT_CAP_DROPS.fetch_add(1, Ordering::Relaxed);
+                self.sessions
+                    .import_cap_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 return;
             }
         }
@@ -275,7 +309,9 @@ impl crate::afxdp::Coordinator {
             && delete_gen != 0
             && delete_gen < entry.generation
         {
-            SESSION_DELETE_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            self.sessions
+                .delete_stale_ignored
+                .fetch_add(1, Ordering::Relaxed);
             return;
         }
         let reverse_key = removed_entry.as_ref().and_then(|entry| {

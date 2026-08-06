@@ -681,8 +681,77 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 	if err != nil {
 		slog.Warn("failed to fetch peer sessions", "err", err)
 	} else {
-		resp.Peer = peerResp
+		// #6851/#4626: the peer resolved these policy NAMES itself, so a peer
+		// running a pre-#4626 build sent the name of ITS first configured
+		// policy for every session carrying the reserved id 0 — host-inbound,
+		// fabric, tunnel, and its entire table if IT is in turn syncing from an
+		// older node. The #4626 guard covers rows THIS node renders from a raw
+		// id; it does not cover a name arriving as DATA. Without this, the
+		// misattribution is republished unchanged on every local surface: gRPC
+		// clients, the REST `peer` block (sessionListFromPB), and the CLI.
+		//
+		// Only RESERVED ids are overridden — see PeerSessionPolicyName for why
+		// re-resolving an unreserved peer id against the LOCAL map would be a
+		// fresh misattribution rather than a fix.
+		//
+		// This is the choke point for the gRPC and REST surfaces: REST reaches
+		// the peer through this same in-process response (writeSessionList
+		// reads `pr.GetPeer()`), so guarding here covers both at once.
+		//
+		// It does NOT cover the on-box interactive CLI (#6851). `pkg/cli`
+		// dials the peer daemon itself (session_filter.go dialPeer) and sets no
+		// IncludePeer, so it neither passes through here nor triggers the
+		// peer's own fan-out. That surface sanitizes at its own ingress —
+		// sanitizePeerSessionPolicyNames — for the same reason and via the same
+		// dataplane.PeerSessionPolicyName decision. Two call sites, one
+		// decision function: a third normalization rule is what would rot.
+		// The REMOTE cli binary is not a third case; it sets IncludePeer and
+		// arrives here.
+		attachPeerSessions(resp, peerResp)
 	}
+}
+
+// attachPeerSessions sanitizes a fan-out response's policy names and attaches
+// it (#6851).
+//
+// The ATTACH lives inside the sanitizing function deliberately. Keeping them as
+// two statements at the call site would let a future edit drop the guard while
+// leaving the attach — the failure mode this whole PR is about, silent and
+// green. Fused, the two cannot be separated by deleting a line.
+//
+// SCOPED (#6851 review): "fused" is a shape argument, not an enforced one.
+// `attachPeerSessions(resp, nil)` on its own does NOT compile — peerResp goes
+// unused — but with `_ = peerResp` beside it the whole suite passes while every
+// peer session is dropped from all three surfaces. So this reads as loud to an
+// OPERATOR (peer rows vanish), not to CI. Do not cite it as test-enforced.
+//
+// Residual, stated rather than implied: the tests below drive this function, so
+// they bind the sanitize-and-attach pair. They do NOT bind `fetchPeerSessions`'
+// call TO it — that needs a live cluster.Manager with PeerAlive() plus a real
+// authenticated peer dial, neither of which is reachable from a unit test.
+// Replacing this call with a bare `resp.Peer = peerResp` would not be caught
+// here.
+func attachPeerSessions(resp, peerResp *pb.GetSessionsResponse) {
+	sanitizePeerPolicyNames(peerResp)
+	resp.Peer = peerResp
+}
+
+// sanitizePeerPolicyNames rewrites the policy name of every peer session whose
+// id is reserved, in place.
+func sanitizePeerPolicyNames(peerResp *pb.GetSessionsResponse) {
+	if peerResp == nil {
+		return
+	}
+	for _, e := range peerResp.GetSessions() {
+		if e == nil {
+			continue
+		}
+		e.PolicyName = dataplane.PeerSessionPolicyName(e.GetPolicyName(), e.GetPolicyId())
+	}
+	// A peer that itself fanned out (it should not — include_peer is not
+	// forwarded, precisely to prevent recursion) would nest another response
+	// here. Guard it rather than assume the invariant holds across versions.
+	sanitizePeerPolicyNames(peerResp.GetPeer())
 }
 
 // getSessionsLegacy is the original limit/offset iteration path.
@@ -1693,14 +1762,15 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		outIf = zoneNames[val.EgressZone]
 	}
 	se := &pb.SessionEntry{
-		SrcAddr:          net.IP(key.SrcIP[:]).String(),
-		DstAddr:          net.IP(key.DstIP[:]).String(),
-		SrcPort:          uint32(ntohs(key.SrcPort)),
-		DstPort:          uint32(ntohs(key.DstPort)),
-		Protocol:         protoName(key.Protocol),
-		State:            sessionStateName(val.State),
-		PolicyId:         val.PolicyID,
-		PolicyName:       policyNames[val.PolicyID],
+		SrcAddr:  net.IP(key.SrcIP[:]).String(),
+		DstAddr:  net.IP(key.DstIP[:]).String(),
+		SrcPort:  uint32(ntohs(key.SrcPort)),
+		DstPort:  uint32(ntohs(key.DstPort)),
+		Protocol: protoName(key.Protocol),
+		State:    sessionStateName(val.State),
+		PolicyId: val.PolicyID,
+		// #4626: reserved ids must not be resolved through the compiled map.
+		PolicyName:       dataplane.SessionPolicyName(policyNames, val.PolicyID),
 		IngressZone:      uint32(val.IngressZone),
 		EgressZone:       uint32(val.EgressZone),
 		IngressZoneName:  zoneNames[val.IngressZone],
@@ -1746,14 +1816,15 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		outIf = zoneNames[val.EgressZone]
 	}
 	se := &pb.SessionEntry{
-		SrcAddr:          net.IP(key.SrcIP[:]).String(),
-		DstAddr:          net.IP(key.DstIP[:]).String(),
-		SrcPort:          uint32(ntohs(key.SrcPort)),
-		DstPort:          uint32(ntohs(key.DstPort)),
-		Protocol:         protoName(key.Protocol),
-		State:            sessionStateName(val.State),
-		PolicyId:         val.PolicyID,
-		PolicyName:       policyNames[val.PolicyID],
+		SrcAddr:  net.IP(key.SrcIP[:]).String(),
+		DstAddr:  net.IP(key.DstIP[:]).String(),
+		SrcPort:  uint32(ntohs(key.SrcPort)),
+		DstPort:  uint32(ntohs(key.DstPort)),
+		Protocol: protoName(key.Protocol),
+		State:    sessionStateName(val.State),
+		PolicyId: val.PolicyID,
+		// #4626: reserved ids must not be resolved through the compiled map.
+		PolicyName:       dataplane.SessionPolicyName(policyNames, val.PolicyID),
 		IngressZone:      uint32(val.IngressZone),
 		EgressZone:       uint32(val.EgressZone),
 		IngressZoneName:  zoneNames[val.IngressZone],

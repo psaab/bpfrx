@@ -100,11 +100,14 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 					switch {
 					case errors.Is(errIn, dataplane.ErrCounterNotPopulated) ||
 						errors.Is(errOut, dataplane.ErrCounterNotPopulated):
-						// #3643 HIDE: per-zone traffic counters are not sourced
-						// by the userspace dataplane. Flag them unavailable and
-						// leave the counts unset rather than reporting a
-						// misleading 0 or 500'ing the whole endpoint on the
-						// structural stable-hash-id OOB.
+						// #6843: per-zone counters ARE sourced (#3651). This
+						// branch means the dataplane published nothing for THIS
+						// zone -- pre-#3651 helper, a zone past the helper's
+						// hot-path slot capacity (traffic genuinely uncounted),
+						// or an idle zone.
+						// Flag unavailable and leave the counts unset rather
+						// than reporting a misleading 0 or 500'ing the whole
+						// endpoint on the structural stable-hash-id OOB.
 						zi.PerZoneCountersAvailable = false
 					case errIn != nil:
 						if readErr == nil {

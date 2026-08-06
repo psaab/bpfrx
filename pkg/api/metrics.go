@@ -101,6 +101,16 @@ type xpfCollector struct {
 	interfaceCounterReadErrorsTotal *prometheus.Desc
 	interfaceCounterReadErrors      atomic.Uint64
 
+	// Zone counters (#3651, restored after the #3643 HIDE). Sourced from the
+	// Go-side SPARSE zone-counter offset map, never a dense array indexed by
+	// zone id — see initZoneDescriptors for why that distinction is the whole
+	// point. zoneCountersUnpopulatedZones is the explicit "not yet known"
+	// signal that lets the per-zone samples be OMITTED rather than published
+	// as an authoritative 0.
+	zonePacketsTotal             *prometheus.Desc
+	zoneBytesTotal               *prometheus.Desc
+	zoneCountersUnpopulatedZones *prometheus.Desc
+
 	// Policy counters
 	policyHitsTotal *prometheus.Desc
 
@@ -646,6 +656,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.interfaceCounterReadErrorsTotal
+	ch <- c.zonePacketsTotal
+	ch <- c.zoneBytesTotal
+	ch <- c.zoneCountersUnpopulatedZones
 	ch <- c.policyHitsTotal
 	ch <- c.filterHitsTotal
 	ch <- c.threeColorPolicerPacketsTotal
@@ -1110,6 +1123,24 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	// netlink), so it is a control-plane signal emitted BEFORE the dataplane gate:
 	// a degraded FBF mirror must stay visible in a config-only / degraded boot.
 	c.collectPBRStatus(ch)
+
+	// #6843 R1: per-zone traffic, emitted BEFORE the dataplane gate. The
+	// xpf_zone_counters_unpopulated_zones gauge is documented as ALWAYS emitted
+	// so `> 0` is alertable and its absence cannot be confused with a scrape
+	// that failed to run — but below the gate that promise breaks exactly when
+	// it matters most: on a degraded or config-only boot no sample is emitted at
+	// all, so the alert silently stops evaluating precisely when per-zone volume
+	// is most unavailable. The collector is config-derived (it counts every
+	// configured zone as unpopulated when there is no apply result or no loaded
+	// dataplane), so it degrades correctly above the gate, like collectPBRStatus
+	// and the lo0/host-inbound families hoisted above for the same reason.
+	// #3462 ordering, restated at the new position: a GENUINE per-zone read
+	// failure bumps counterReadErrors, and the deferred emitCounterReadErrors at
+	// the top of Collect runs at function exit — after this — so a failure this
+	// scrape is reflected in THIS scrape's xpf_counter_read_errors_total rather
+	// than lagging one behind. Moving the collector earlier preserves that: it
+	// is still upstream of the deferred emit.
+	c.collectZoneCounters(ch, c.srv.dp)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {

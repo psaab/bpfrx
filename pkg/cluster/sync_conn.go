@@ -97,7 +97,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// closes the connection; the accept/connect loops retry, so this never
 	// bricks a keyed↔keyed reconnect during failover (both nodes are up and
 	// keyed → the handshake completes in milliseconds).
-	mode, frameKey, pending, err := s.performSyncHandshake(conn)
+	mode, frameKey, err := s.performSyncHandshake(conn)
 	// #5303: release the pre-auth admission slot (and the setup-tracking entry)
 	// the moment the handshake resolves — an admitted slot must cover only the
 	// brief pre-auth window, never the subsequent bulk sync. Post-auth the
@@ -116,12 +116,6 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// Wrap so writeFull seals and receiveLoop verifies per-frame auth when the
 	// connection authenticated; an unauthenticated wrapper is a pass-through.
 	conn = s.wrapSyncConn(fabricIdx, conn, mode, frameKey)
-	// A legacy/unkeyed peer's first real frame was consumed by the handshake
-	// read — process it before the receive loop starts so no message is lost.
-	if pending != nil {
-		s.handleMessage(conn, pending.typ, pending.payload)
-	}
-
 	// #4962: install the connection and DECIDE cold-prime atomically under
 	// s.mu. Computing the decision after unlock (the pre-#4962 shape) let a
 	// racing same-fabric accept supersede this connection between the unlock and

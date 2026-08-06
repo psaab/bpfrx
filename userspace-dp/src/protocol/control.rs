@@ -327,7 +327,11 @@ pub(crate) struct ProcessStatus {
     /// session-table pressure (or a compromised peer) could drive this node
     /// past its own aggregate session ceiling and multiply that state across
     /// all workers. A rising value means a peer exceeded this appliance's own
-    /// ceiling (`worker_count * max_sessions`); it never trips on a legitimate
+    /// ceiling — stated in ENTRIES as `2 * worker_count * max_sessions` (#6413),
+    /// matching `synced_import_cap`, not the LOGICAL `worker_count *
+    /// max_sessions`. Each admitted forward publishes TWO keys (the forward and
+    /// its synthesized reverse companion), so N logical sessions arrive as 2N
+    /// entries and EXACTLY fit the cap; it never trips on a legitimate
     /// symmetric-pair failover. Surfaced as the Prometheus counter
     /// `xpf_userspace_synced_import_cap_drops_total`. Additive / defaulted for
     /// backward compatibility.
@@ -571,7 +575,10 @@ pub(crate) struct ProcessStatus {
     /// pre-summed sparse block — one row per zone with nonzero traffic, keyed
     /// by the stable zone id). The Go control plane mirrors each row into the
     /// legacy `dataplane.Manager` zone-counter offset map via
-    /// `SetZoneCounterOffset`, so `show security zones` (Traffic statistics),
+    /// `ReplaceZoneCounterOffsets` (#6843: the whole map is replaced per poll,
+    /// so a zone the helper stops publishing stops being reported rather than
+    /// freezing at its last value), so `show security zones` (Traffic
+    /// statistics),
     /// the REST `/security/zones` endpoint, and the Prometheus collector report
     /// live per-zone volume instead of `ErrCounterNotPopulated` ("not
     /// available"). `zone_counter_layout_version` selects the decode path

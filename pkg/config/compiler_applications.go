@@ -338,7 +338,8 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		hasDirectBody := false
 		// #5574: value-aware conflict tracking for the DIRECT (scalar) match body,
 		// mirroring the inline-term duplicate detection in parseApplicationTerms
-		// (dstPortSet / srcPortSet / algSet / timeoutSet -> DuplicateTermLeaves). A
+		// (dstPortSet / srcPortSet / algSet / timeoutSet / icmpTypeSet /
+		// icmpCodeSet -> DuplicateTermLeaves). A
 		// direct application stores each scalar leaf into a SINGLE typed field, so
 		// two conflicting sibling leaves (protocol tcp; protocol udp;
 		// destination-port 22; destination-port 53) were last-writer-wins — only
@@ -599,14 +600,31 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 	// DIFFERENT value — via apply-groups, flat-set ordering, or hand authoring —
 	// was last-writer-wins: the loop below overwrote the earlier value with no
 	// validation, silently narrowing (or widening) the term to the final token by
-	// parse order. Track each scalar leaf's first assigned value so a CONFLICTING
-	// repeat (a new value that silently discards the earlier one) is recorded for
-	// the strict structure gate. An idempotent repeat (the same value again, e.g.
+	// parse order. Each scalar leaf carries a companion `<leaf>Set` flag and a
+	// `<leaf>Val` holding the MOST RECENTLY assigned value — not the first: every
+	// arm refreshes its comparison value after recording, so the check is
+	// "differs from its immediate predecessor", i.e. one record per TRANSITION.
+	// `8, 3, 8` therefore records TWO conflicts, where comparing every later value
+	// against the first would record one. Nothing observable depends on that
+	// difference: acceptance is identical (any sequence carrying more than one
+	// distinct value contains at least one transition, so the strict gate rejects
+	// it, and an idempotent run records nothing either way), and the gate reports
+	// only `DuplicateTermLeaves[0]` (compiler_validate_strict_application.go), so
+	// the extra records never reach the error text. Treat the slice as a
+	// non-empty/empty signal carrying one representative leaf name, NOT as a
+	// conflict tally. An idempotent repeat (the same value again, e.g.
 	// the `timeout` / `inactivity-timeout` aliases both set to 1800) is harmless
 	// and accepted. `protocol` is deliberately EXCLUDED — a repeated `protocol` is
 	// the documented multi-protocol-term syntax (one Application per unique
-	// protocol), not a duplicate.
+	// protocol), not a duplicate. #6766: the #3366 framework omitted the ICMP
+	// leaves — a conflicting `icmp-type` / `icmp-code` repeat overwrote the
+	// pointer with no record, so a referenced deny enforced only the LAST
+	// type/code; they are now tracked like the ports (malformed tokens keep the
+	// badICMP / UnknownICMP path — duplicate tracking applies only to values
+	// that parse).
 	dstPortSet, srcPortSet, algSet, timeoutSet := false, false, false, false
+	icmpTypeSet, icmpCodeSet := false, false
+	var icmpTypeVal, icmpCodeVal uint8
 	var dupTermLeaves []string
 	// #3352: tokens inside the inline term that are not a recognized leaf.
 	// The term subtree is opaque to SchemaValidate (children:nil), so without
@@ -650,6 +668,14 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			if i+1 < len(keys) {
 				i++
 				if t, ok := parseICMPTypeCode(keys[i]); ok {
+					// #6766: value-aware duplicate tracking, mirroring the
+					// ports above — a conflicting repeat is recorded for the
+					// strict structure gate; an idempotent same-value repeat
+					// is accepted.
+					if icmpTypeSet && *t != icmpTypeVal {
+						dupTermLeaves = append(dupTermLeaves, "icmp-type")
+					}
+					icmpTypeSet, icmpTypeVal = true, *t
 					icmpType = t
 				} else {
 					// #3348: a malformed inline-term icmp-type. The schema does
@@ -663,6 +689,10 @@ func parseApplicationTerms(parentName string, keys []string) []*Application {
 			if i+1 < len(keys) {
 				i++
 				if c, ok := parseICMPTypeCode(keys[i]); ok {
+					if icmpCodeSet && *c != icmpCodeVal {
+						dupTermLeaves = append(dupTermLeaves, "icmp-code")
+					}
+					icmpCodeSet, icmpCodeVal = true, *c
 					icmpCode = c
 				} else {
 					badICMP = append(badICMP, keys[i])

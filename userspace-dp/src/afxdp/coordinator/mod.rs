@@ -336,8 +336,9 @@ pub struct Coordinator {
     #[cfg(test)]
     pub(crate) force_worker_healthy_stub: bool,
     /// #5674 test seam (per-instance, NOT a process-global): when nonzero,
-    /// `synced_import_cap()` returns this value INSTEAD of the real
-    /// `worker_count * DEFAULT_MAX_SESSIONS` aggregate ceiling. Lets a test
+    /// `synced_import_cap()` returns TWICE this value (the override expresses a
+    /// LOGICAL ceiling; `synced_import_cap()` doubles it) instead of the real
+    /// `2 * worker_count * DEFAULT_MAX_SESSIONS` ENTRY ceiling. Lets a test
     /// exercise the synced-import admission boundary without inserting
     /// `DEFAULT_MAX_SESSIONS` (131072) entries. Always 0 in release builds
     /// (the field does not exist); per-instance so parallel tests never race.
@@ -1058,17 +1059,48 @@ impl Coordinator {
     }
 
     /// #3651: per-zone ingress/egress traffic-volume snapshot for
-    /// `ProcessStatus.zone_traffic_counters`, filtered to currently-configured
-    /// zones so a zone removed between the worker fold and this status build
-    /// never surfaces. Empty when no configured zone has moved traffic yet.
+    /// `ProcessStatus.zone_traffic_counters`.
+    ///
+    /// TWO filters. A row is published only when its zone is BOTH (a) currently
+    /// configured and (b) holding a live hot-path slot.
+    ///
+    /// (b) is load-bearing — see the carried-forward-store case below. (a) is
+    /// DEFENCE IN DEPTH: no reachable runtime divergence has been demonstrated
+    /// for it (apply-time `reconcile` prunes unconfigured zones and the
+    /// reserved-id path is filtered identically in policy.rs), so it is kept and
+    /// tested as a belt, not claimed as a live guard.
+    ///
+    /// Filter (b) exists because the store OUTLIVES the slot map. Config apply
+    /// carries the store forward and `reconcile` retains every still-configured
+    /// zone (`forwarding_build/mod.rs`), while `ZoneCounterSlotMap::build`
+    /// assigns only `ZONE_COUNTER_ASSIGNABLE_SLOTS` slots in sorted zone-id
+    /// order. So a zone that accumulated traffic and is then pushed past
+    /// capacity by a later config — 63 lower-id zones added alongside it —
+    /// stays configured, keeps its retained nonzero totals, and gets slot 0.
+    /// Without this filter its stale row keeps publishing: the Go side mirrors
+    /// it, and Prometheus emits a FROZEN total forever while every subsequent
+    /// packet on that zone goes uncounted. That is strictly worse than omitting
+    /// the zone, because a frozen counter looks alive — an authoritative number
+    /// that is wrong, which is the exact failure the per-zone surface work
+    /// exists to prevent.
+    ///
+    /// Dropping the row makes such a zone read as `ErrCounterNotPopulated`
+    /// end-to-end, which is the honest answer: its traffic genuinely is not
+    /// being counted. `zone_counter_overflow_active` carries the reason on the
+    /// wire — though #6845 tracks that it has no consumer on any surface yet,
+    /// so today an operator sees "not available" without the why.
+    ///
+    /// NOTE: this is only half the fix. The Go status loop must REPLACE its
+    /// offset map from each snapshot rather than merge into it, or a row that
+    /// stops being published leaves a stale offset behind
+    /// (`Manager.ReplaceZoneCounterOffsets`).
     pub fn zone_traffic_counters(&self) -> Vec<crate::protocol::ZoneTrafficCounterStatus> {
         let configured = &self.forwarding.zone_id_to_name;
-        self.forwarding
-            .zone_counter_store
-            .snapshot()
-            .into_iter()
-            .filter(|s| configured.contains_key(&s.zone_id))
-            .collect()
+        crate::afxdp::zone_counters::publishable_zone_rows(
+            &self.forwarding.zone_counter_store,
+            &self.forwarding.zone_counter_slot_map,
+            |zone_id| configured.contains_key(&zone_id),
+        )
     }
 
     /// #3651: true when the configured zone count exceeded the hot-path slot
@@ -1084,9 +1116,15 @@ impl Coordinator {
     }
 
     /// #3651: operator clear of per-zone traffic counters. Resets the helper's
-    /// cumulative store so the Go side's absolute `SetZoneCounterOffset`
-    /// overwrite reports 0 instead of snapping the pre-clear total back on the
-    /// next 1 s status poll (the load-bearing half of the operator clear).
+    /// cumulative store so the pre-clear total is not snapped back on the next
+    /// 1 s status poll (the load-bearing half of the operator clear).
+    ///
+    /// #6843: a cleared zone then reads as NOT POPULATED rather than as zero.
+    /// `ZoneCounterStore::snapshot` omits all-zero rows, so a just-cleared zone
+    /// produces no row, and the Go side replaces its offset map from that
+    /// snapshot (`ReplaceZoneCounterOffsets`) rather than overwriting row by
+    /// row — so the offset is dropped, not set to 0. Surfaces render
+    /// "not available" until traffic repopulates the row.
     pub fn clear_zone_counters(&self) {
         self.forwarding.zone_counter_store.clear();
     }

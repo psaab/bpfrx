@@ -302,13 +302,15 @@ type SessionSync struct {
 	conn0     net.Conn
 	conn1     net.Conn
 	writeMu   sync.Mutex
-	// authProvider supplies the shared control-link PSK + the cross-channel
-	// downgrade-guard signal for #4107 F23 session-sync stream auth. Optional:
-	// nil (or an empty key) ⇒ legacy unauthenticated stream (dual-accept).
+	// authProvider supplies the shared control-link PSK for #4107 F23
+	// session-sync stream auth. Optional: nil (or an empty key) ⇒ legacy
+	// unauthenticated stream.
+	//
+	// #5078: a sticky syncAuthedEver downgrade-guard used to sit beside this.
+	// It was removed with syncPeerAuthSeen — once a keyed node rejects every
+	// unkeyed peer unconditionally, there is no admission for such a guard to
+	// withdraw, and it had become write-only in effect.
 	authProvider atomic.Pointer[syncAuthProviderBox]
-	// syncAuthedEver is the sticky sync-channel downgrade-guard: once any sync
-	// connection authenticates, a later unauthenticated connection is rejected.
-	syncAuthedEver atomic.Bool
 
 	// #5303 pre-auth admission gate. Bounds the inbound sync connections that
 	// are in setup (pre-handshake) at once so a flood of connections that stall
