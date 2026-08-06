@@ -1,3 +1,69 @@
+## 2026-08-05 — #6902 round 3: the identity assertions bound PRESENCE, not ASSOCIATION
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold four re-gate findings. Test-file-only — production warning
+  strings byte-identical to rounds 1 and 2.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F3 — the finding worth the round.** Round 2 added per-form identity
+assertions, but as a LIST OF TOKENS. Presence and association are different
+properties and only the second is useful: every identifier stays in the string
+while attached to the WRONG object. Both format strings are 6-argument Sprintf
+calls carrying three (name, origin, prefix) triples — precisely where a
+transposition happens — and `go vet` cannot see it, because every argument is a
+string or Stringer feeding %q/%s.
+
+Measured on the round-2 form: swapping the two origins, the two RI names, or the
+two prefixes each left `go test ./pkg/config/ -count=1` fully GREEN and
+`go vet ./pkg/config/` silent, while the operator was sent to the wrong
+interface or told the wrong prefix sits on the wrong instance — the same
+"told the hazard but not where" failure round 2 was written to prevent, one
+level down. Replaced with ORDERED PAIRINGS held as one contiguous substring. A
+strict replacement, not an addition: a strip breaks the pairing too.
+
+| Mutation (arg transposition in the Sprintf) | substance test |
+|---|---|
+| baseline | GREEN |
+| equal arm, origins swapped | RED |
+| equal arm, RI names swapped | RED |
+| unequal arm, origins swapped | RED |
+| unequal arm, prefixes swapped | RED |
+
+**F4 — an assertion that could not fail.** The `#2387` check was unreachable:
+the helper pre-filtered on the same substring, so every warning reaching it had
+already been selected for containing it. Dropping #2387 failed the fixture's
+COUNT assertion instead, with a message about the wrong thing. The helper now
+filters on the diagnosis phrase ("overlapping L3 across routing-instances"),
+which both arms carry and no other warning does. Verified: removing BOTH #2387
+occurrences from the unequal arm now fires the intended assertion with the
+intended message. (One occurrence is not enough — the tail carries a second.)
+
+**F2 — one of my unmeasured guesses was off-target.** Round 2 added six sibling
+tokens on top of four measured escapes. "work is under way" fires only on that
+exact four-word spelling and misses "underway" and "in progress" — the phrasing
+actually measured. "temporarily" was a good add ("temporary" is not a substring
+of it). Added the eleven still-escaping spellings the review measured, and kept
+"work is under way" with a comment recording it as the worked example of
+reaching for an imagined phrase instead of an observed one.
+
+**F5 — not folded, recorded here instead.** The round-1 COMMIT MESSAGE says "No
+runtime behaviour changes". The operator-facing warning TEXT changed, which is
+runtime output — it is the entire PR. The clause after the dash is right; only
+the headline overstates. The commit is pushed and rewriting it would move the
+PR head for a prose fix, so the correction lives here and in the PR body: the
+accurate statement is "no behaviour change beyond the warning text".
+
+**F6 — validation record was incomplete, not wrong.** Rounds 1-2 claimed only Go
+legs. `userspace-dp/tests/vrf_session_identity_doc_guard.rs` asserts on BOTH
+docs round 1 edited, including plan anchors on the very bullets it rewrote, and
+`make test` runs both legs (#4006). Ran it: `cargo test --test
+vrf_session_identity_doc_guard` -> ok, 2 passed, 0 failed. No defect; the record
+just never named the leg the diff put at risk.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; `cargo test --test vrf_session_identity_doc_guard` ok
+(2 passed); every restore verified byte-identical with `cmp`.
+
 ## 2026-08-05 — #6902 round 2: the mutation recipe in the shipping comment was false
 
 - **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)

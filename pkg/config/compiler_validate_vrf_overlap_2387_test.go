@@ -49,7 +49,15 @@ func vrf2387Warnings(t *testing.T, cmds []string) []string {
 	}
 	var out []string
 	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "#2387") {
+		// Filter on the DIAGNOSIS, not on "#2387". Filtering on the issue
+		// reference made the "points at the tracking issue" assertion below
+		// unreachable: every warning reaching it had already been selected for
+		// containing the very substring it then checked for. Dropping #2387
+		// from a format string failed the fixture's count assertion instead,
+		// with a message about the wrong thing. This phrase is carried by both
+		// overlap format strings and by neither the truncation notice nor any
+		// other warning, so the selection stays arm-neutral.
+		if strings.Contains(w, "overlapping L3 across routing-instances") {
 			out = append(out, w)
 		}
 	}
@@ -179,8 +187,18 @@ var vrfOverlapForwardLookingTokens = []string{
 	"roadmap",
 	"once the session",
 	"when the session",
-	// Measured escapes — each of these was inserted into the warning and
-	// observed to leave the test GREEN before it was listed here.
+	// Measured escapes — each was inserted into the warning and observed to
+	// leave the test GREEN before it was listed here.
+	//
+	// "temporarily" earns its own entry: it does NOT contain "temporary" as a
+	// substring, so the shorter token does not cover it.
+	//
+	// A cautionary one, kept as a worked example rather than removed: an
+	// earlier round added "work is under way", which fires only on that exact
+	// four-word spelling and does NOT match "work is underway" or "work is in
+	// progress" — the phrasing actually measured. Reaching for a phrase you
+	// imagined instead of the one you observed buys nothing. "in progress"
+	// below is the token that does the work.
 	"not yet",
 	"pending",
 	"temporary",
@@ -190,7 +208,19 @@ var vrfOverlapForwardLookingTokens = []string{
 	"interim",
 	"to be addressed",
 	"work is under way",
+	"underway",
+	"in progress",
 	"soon",
+	"shortly",
+	"eventually",
+	"plan to",
+	"will gain",
+	"is expected to",
+	"shall",
+	"going to",
+	"next release",
+	"targeted for",
+	"tracked for",
 }
 
 // vrfOverlapBothFormStrings returns one warning from EACH of the two format
@@ -276,30 +306,46 @@ func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 		form string
 		warn string
 		// ident is the WHICH of the diagnosis: which routing-instances, reached
-		// through which config source, over which prefix. Asserting only the
-		// explanatory prose leaves every one of these strippable with the whole
-		// package still green — an operator would be told a cross-forwarding
-		// hazard exists but not where, which is not a usable diagnostic.
+		// through which config source, over which prefix.
+		//
+		// These are ORDERED PAIRINGS held as one contiguous substring, not a
+		// list of tokens to find somewhere in the message. Presence and
+		// association are different properties, and only the second is useful:
+		// a token list is satisfied while every identifier is attached to the
+		// WRONG object. Both format strings are 6-argument Sprintf calls
+		// carrying three (name, origin, prefix) triples, which is exactly where
+		// an argument transposition happens — and `go vet` cannot see it,
+		// because every argument is a string or Stringer feeding %q/%s, so the
+		// printf checker reports nothing.
+		//
+		// Measured on the token-list version: swapping the two origins, or the
+		// two RI names, or the two prefixes, left `go test ./pkg/config/
+		// -count=1` fully green and `go vet ./pkg/config/` silent, while the
+		// operator was sent to the wrong interface or told the wrong prefix
+		// sits on the wrong instance. Fixture truth is
+		// RI-A <- ge-0/0/1.0 @ 10.0.0.0/24 and RI-B <- ge-0/0/2.0 @ 10.0.0.0/25.
+		//
+		// The pairing form is a strict replacement, not an addition: a strip
+		// breaks the contiguous substring too, so it still catches everything
+		// the token list caught.
 		ident []string
 	}{
 		{
 			form: "equal-prefix",
 			warn: equal,
 			ident: []string{
-				`"RI-A"`, `"RI-B"`,
-				`interface "ge-0/0/1.0"`, `interface "ge-0/0/2.0"`,
-				"10.0.0.0/24",
+				`"RI-A" (interface "ge-0/0/1.0") and "RI-B" (interface "ge-0/0/2.0") both carry 10.0.0.0/24`,
 			},
 		},
 		{
 			form: "unequal-overlap",
 			warn: unequal,
+			// One pairing per instance: this arm's whole reason to exist is
+			// that the two prefixes DIFFER, so each must stay bound to its own
+			// instance and origin.
 			ident: []string{
-				`"RI-A"`, `"RI-B"`,
-				`interface "ge-0/0/1.0"`, `interface "ge-0/0/2.0"`,
-				// BOTH prefixes: the unequal form's whole reason to exist is
-				// that the two differ, so printing only one loses the overlap.
-				"10.0.0.0/24", "10.0.0.0/25",
+				`"RI-A" (interface "ge-0/0/1.0", 10.0.0.0/24)`,
+				`"RI-B" (interface "ge-0/0/2.0", 10.0.0.0/25)`,
 			},
 		},
 	} {
@@ -316,8 +362,8 @@ func TestVRFOverlapWarningKeepsDiagnosticSubstance(t *testing.T) {
 		// The identification: which objects the explanation is about.
 		for _, want := range tc.ident {
 			if !strings.Contains(tc.warn, want) {
-				t.Errorf("%s form no longer identifies %q — the warning explains the hazard "+
-					"but not which routing-instances, source or prefix it concerns: %s",
+				t.Errorf("%s form no longer states the pairing %q — the warning explains the hazard "+
+					"but not which routing-instance sits on which source and prefix: %s",
 					tc.form, want, tc.warn)
 			}
 		}
