@@ -310,11 +310,14 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 		// subtree that opted in (schemaNode.closedWorld, inherited via closed)
 		// reaches this branch.
 		//
-		// Deliberately NO count of armed subtrees here. The previous wording
-		// ("no production subtree does so today") was written when that was
-		// true and was never updated as the rollout proceeded; a month later it
-		// was still asserting a dormant mechanism while ten subtrees were
-		// closed, and it mis-scoped a lane that trusted it. A comment stating
+		// Deliberately NO count of armed subtrees here — including in this
+		// paragraph, which is why it names no number. The previous wording
+		// ("no production subtree does so today") was written in the mechanism
+		// commit 49fef7174 when it was true, and the first production flip
+		// landed the SAME DAY; it was never updated as the rollout proceeded,
+		// so a month later it still described a mechanism that had not been
+		// dormant since the day the sentence was written, and it mis-scoped a
+		// lane that trusted it. A comment stating
 		// how much of a mechanism is in use is a coverage claim, and it rots
 		// silently. The armed set is exactly whatever carries
 		// `closedWorld: true` — grep for it, or read the
