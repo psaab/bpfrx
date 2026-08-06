@@ -1491,8 +1491,11 @@ outside the monitor loop:
   signal"); closing it is a wire change, not a local one.
 
   `installConn` does NOT clear on the full-disconnect edge, because reaching an
-  empty registry implies `handleDisconnect`'s clear already ran —
-  `conn0`/`conn1` are nilled nowhere else. Adding the condition back is inert
+  empty registry implies `handleDisconnect`'s clear already ran. Note the
+  reason is NOT that `conn0`/`conn1` are nilled nowhere else — since fold r4b
+  `evictStaleIncarnationConnsLocked` nils them too. It is that eviction cannot
+  leave the registry EMPTY (below), so an empty one still implicates
+  `handleDisconnect` alone. Adding the condition back is inert
   rather than wrong, so no behavioural test can reject it; what the tests pin
   instead is the PREMISE. That has two halves, because the behavioural half
   alone would be decorative (removing `handleDisconnect`'s clear already reds
@@ -1504,12 +1507,23 @@ outside the monitor loop:
   would still pass, and at that point this narrowing must be revisited.
 
   `evictStaleIncarnationConnsLocked` is the one exemption in that allowlist. It
-  nils a slot, but it provably cannot EMPTY the registry: `installConn` calls it
-  only after the incoming connection has been written into its slot, and it
-  skips that slot. The exemption is not a rubber stamp —
-  `TestInstallConnNeverLeavesTheRegistryEmpty_5718` asserts the behaviour that
-  makes it sound, so losing the `keepIdx` skip reds there instead of passing the
-  allowlist unnoticed.
+  nils a slot, but it provably cannot EMPTY the registry, and since fold r6 for
+  reasons intrinsic to the function rather than to its caller: it skips the keep
+  slot, **and** it refuses to evict anything at all unless that slot is
+  occupied. The second half matters because the allowlist exempts by function
+  NAME. Before it, soundness rested on what the single caller happened to do —
+  `installConn` installs before it evicts — so a future second call site would
+  have inherited the exemption without inheriting the property it was granted
+  for, and could have emptied the registry with every guard green:
+  `TestInstallConnNeverLeavesTheRegistryEmpty_5718` drives the existing call
+  site and cannot see a new one.
+
+  Both are pinned. `TestEvictionRefusesToEmptyTheRegistry_5718` calls the helper
+  directly with an unoccupied keep slot (and with an out-of-range index) and
+  asserts it declines; `TestInstallConnNeverLeavesTheRegistryEmpty_5718` still
+  covers the live path, so losing the `keepIdx` skip reds there. Removing the
+  refusal reds only the former — which is the point: the pre-r6 tests all stay
+  green under that mutation, so they were not covering it.
 
   **The SEND path is incarnation-aware too (#5718 fold r4).** The stamp
   originally taught only the ACK path that an installed connection can belong

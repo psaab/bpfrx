@@ -233,6 +233,36 @@ func (s *SessionSync) connIsCurrentIncarnationLocked(conn net.Conn) bool {
 // here: it needs the peer-supplied boot epoch #6669 signs into the heartbeat.
 // See pkg/cluster/README.md for the full sequence and which half self-heals.
 func (s *SessionSync) evictStaleIncarnationConnsLocked(keepIdx int) bool {
+	// #5718 fold r6: "this can never empty the registry" is the ENTIRE
+	// justification for exempting this function from
+	// TestOnlyHandleDisconnectEmptiesTheRegistry_5718, so it has to be a
+	// property of this function and not of the one caller that happens to
+	// satisfy it today. installConn installs before it evicts, so keepIdx
+	// currently always names an occupied slot — but that is a call-site
+	// accident. A future caller passing an out-of-range keepIdx, or naming a
+	// slot it has not filled yet, would evict every OTHER slot and leave the
+	// registry empty. Neither guard would fire: the AST guard allowlists this
+	// function by NAME, and TestInstallConnNeverLeavesTheRegistryEmpty_5718
+	// drives the existing call site, so a new one is invisible to both.
+	//
+	// Make the precondition intrinsic instead. Refuse to evict unless the keep
+	// slot actually holds a connection; then whatever else is evicted, that
+	// connection is still installed on return, and the registry is non-empty by
+	// construction for EVERY caller.
+	var keep net.Conn
+	switch keepIdx {
+	case 0:
+		keep = s.conn0
+	case 1:
+		keep = s.conn1
+	}
+	if keep == nil {
+		slog.Error("cluster sync: refusing to evict retired-incarnation connections — "+
+			"the keep slot is empty, so evicting would leave the fabric registry with no "+
+			"connection at all (this is a caller bug: install before evicting)",
+			"keep_idx", keepIdx, "peer_incarnation", s.peerIncarnation)
+		return false
+	}
 	evicted := false
 	if keepIdx != 0 && s.conn0 != nil && s.conn0Gen != s.peerIncarnation {
 		slog.Warn("cluster sync: evicting fabric 0 connection from a retired peer incarnation",
@@ -513,9 +543,16 @@ func (s *SessionSync) installConn(fabricIdx int, conn net.Conn) connColdPrimeDec
 	//   - a full-disconnect -> connect edge (d.wasDisconnected) needs nothing
 	//     here; going to zero connections ran handleDisconnect's clear already,
 	//     and re-clearing would discard a capability nothing could have set.
-	//     conn0/conn1 are nilled ONLY by handleDisconnect, so observing an
-	//     empty registry PROVES that clear already ran (or that no connection
-	//     ever existed) — the redundancy is structural, not incidental.
+	//     Observing an EMPTY registry proves that clear already ran (or that no
+	//     connection ever existed), so the redundancy is structural, not
+	//     incidental. Note the proof is NOT "only handleDisconnect nils a slot"
+	//     — since fold r4b, evictStaleIncarnationConnsLocked nils slots too.
+	//     It is that eviction cannot leave the registry EMPTY: it never touches
+	//     the keep slot, and it refuses to run at all unless that slot is
+	//     occupied. So an empty registry still implicates handleDisconnect
+	//     alone. TestOnlyHandleDisconnectEmptiesTheRegistry_5718 pins that any
+	//     THIRD slot-nilling site re-opens this, and the refusal above keeps
+	//     the eviction exemption true for callers that do not exist yet.
 	//   - a fabric link coming up into an EMPTY slot beside a surviving one is
 	//     not a supersession and must NOT clear: same peer process, the mirror
 	//     of the partial-disconnect scope control in handleDisconnect.

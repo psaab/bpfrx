@@ -325,12 +325,19 @@ type SessionSync struct {
 	// change and must not advance it, or the connection that legitimately
 	// proved the capability would be stranded stale and could never re-arm.
 	//
-	// Residual, deliberately not closed here: a THIRD incarnation whose first
-	// dial lands on the slot still holding a stale connection is stamped into
-	// the current incarnation, because nothing on the wire distinguishes it.
-	// That is the same missing peer boot-incarnation field #5480 already tracks
-	// and defers ("the sync handshake carries no peer-cold / boot-incarnation /
-	// table-count signal"); closing it is a wire change, not a local one.
+	// Residual, deliberately not closed here. This used to be described as a
+	// THIRD incarnation dialling into the slot that still held a stale
+	// connection — fold r4b's eviction made that shape unreachable, because no
+	// stale connection is left installed for a later incarnation to land on.
+	//
+	// The residual that survives is narrower to state and wider in effect: a
+	// peer whose replacement enters through an EMPTY alternate slot is never
+	// classified as a supersession at all, so the incarnation never advances
+	// and none of this machinery runs. See evictStaleIncarnationConnsLocked's
+	// KNOWN-INCOMPLETE note and pkg/cluster/README.md for the sequence. Both
+	// the old shape and this one need the same thing — a peer-supplied boot
+	// incarnation on the wire, which #5480 tracks and #6669 implements. It is a
+	// wire change, not a local one, which is why it is not closed here.
 	peerIncarnation uint64
 	conn0Gen        uint64
 	conn1Gen        uint64

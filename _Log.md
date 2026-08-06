@@ -68503,3 +68503,21 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_conn.go,
   pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
   pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
+
+## 2026-08-06 — #6825 fold r6 (Codex r6 residual findings)
+
+- **Timestamp**: 2026-08-06 01:05 PDT
+- **Action**: Make the eviction helper's registry-non-emptiness intrinsic
+  rather than a call-site accident; assert the activation tail's reconfigure
+  ARGUMENTS, not just its call count; correct three comments whose premise
+  fold r4b's eviction had falsified.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/README.md, pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go,
+  pkg/networkd/activation_tail_5718_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/cluster ./pkg/networkd
+  ./pkg/daemon -count=1 -race rc=0. Both new guards proven to fire, with the
+  pre-existing guards staying GREEN under the same mutations (negative
+  control): M1 (neutralise the keep-slot refusal) reds only
+  TestEvictionRefusesToEmptyTheRegistry_5718; M2 (reconfigure a wrong but
+  nonempty interface) reds only the two activation-tail argv assertions.

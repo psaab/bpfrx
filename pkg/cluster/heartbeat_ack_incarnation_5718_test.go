@@ -559,12 +559,22 @@ func TestPeerHeartbeatAckClearedWheneverRegistryEmpties_5718(t *testing.T) {
 //
 // #5718 fold r4b widens the allowlist by exactly one name.
 // evictStaleIncarnationConnsLocked also nils a slot — that is its job — but it
-// provably cannot EMPTY the registry: installConn calls it only after the
-// incoming connection has been written into its slot, and it skips that slot
-// (keepIdx). The premise this guard protects therefore still holds. The
-// exemption is not a rubber stamp: TestInstallConnNeverLeavesTheRegistryEmpty_5718
-// asserts the behaviour that makes it sound, so losing the keepIdx skip reds
-// there instead of passing this allowlist unnoticed.
+// provably cannot EMPTY the registry, for two reasons that are both properties
+// of the function itself:
+//
+//   - it never touches the keep slot (keepIdx), and
+//   - it refuses to evict anything at all unless that keep slot is occupied.
+//
+// #5718 fold r6 added the second one. Before it, the exemption rested on what
+// the single caller happened to do — installConn installs before it evicts —
+// which is not something this allowlist can enforce. A future caller naming a
+// slot it had not filled yet would have emptied the registry while BOTH guards
+// stayed green: this one allowlists the function by NAME, and
+// TestInstallConnNeverLeavesTheRegistryEmpty_5718 drives the existing call
+// site, so a second call site is invisible to it. The refusal closes that by
+// making the exemption true for callers that do not exist yet;
+// TestEvictionRefusesToEmptyTheRegistry_5718 binds it directly, and
+// TestInstallConnNeverLeavesTheRegistryEmpty_5718 still covers the live path.
 func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
 	allowed := map[string]bool{
 		"handleDisconnect":                 true,
@@ -627,9 +637,11 @@ func TestOnlyHandleDisconnectEmptiesTheRegistry_5718(t *testing.T) {
 				"the registry can then go empty with the capability still latched, and the "+
 				"previous incarnation is enforced against the next peer. Either clear the "+
 				"capability there too, or restore the clear in installConn (#5718 fold r3). "+
-				"evictStaleIncarnationConnsLocked is exempt ONLY because it always leaves "+
-				"the just-installed connection in place; a new site has no such argument "+
-				"until one is written down and tested",
+				"evictStaleIncarnationConnsLocked is exempt ONLY because it cannot empty "+
+				"the registry on its own terms — it skips the keep slot AND refuses to "+
+				"evict unless that slot is occupied, so the guarantee does not depend on "+
+				"which caller invoked it. A new site has no such argument until one is "+
+				"written INTO the function and tested",
 				s.fn, s.pos)
 		}
 	}

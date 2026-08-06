@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -73,6 +74,14 @@ func TestApplyTailSurvivesExternalDebtDischarge_5718(t *testing.T) {
 	m := NewInDir(t.TempDir())
 
 	var reloadCalls, reconfigureCalls int
+	// #5718 fold r6: record the whole argv, not just a count keyed on args[0].
+	// `networkctl reconfigure` NAMES the interfaces it acts on, so counting
+	// calls asserts only that the tail ran — a regression that reconfigured the
+	// WRONG interfaces (an inverted bond-member exclusion, a stale list, the
+	// wrong field read for the name) makes exactly the same number of calls and
+	// the guard cannot fire. The argument list is the part that carries the
+	// behaviour.
+	var reconfigureArgs [][]string
 	reloadFails := true
 	orig := runNetworkctl
 	runNetworkctl = func(args ...string) error {
@@ -84,6 +93,7 @@ func TestApplyTailSurvivesExternalDebtDischarge_5718(t *testing.T) {
 			}
 		case len(args) > 0 && args[0] == "reconfigure":
 			reconfigureCalls++
+			reconfigureArgs = append(reconfigureArgs, append([]string(nil), args...))
 		}
 		return nil
 	}
@@ -114,9 +124,23 @@ func TestApplyTailSurvivesExternalDebtDischarge_5718(t *testing.T) {
 	// 3) The next Apply sees unchanged files and no global debt. It must still
 	//    run ITS tail, because nobody else can.
 	reloadFails = false
-	reloadCalls, reconfigureCalls = 0, 0
+	reloadCalls, reconfigureCalls, reconfigureArgs = 0, 0, nil
 	if err := m.Apply(ifaces); err != nil {
 		t.Fatalf("Apply should succeed: %v", err)
+	}
+
+	// The tail must reconfigure the interface this Apply actually wrote a file
+	// for. debtTestIfaces() declares exactly one managed, non-bond-member
+	// interface, so the production argv is fully determined: ["reconfigure",
+	// "trust0"]. Spelled out rather than derived from the fixture — deriving
+	// the expectation from the same source the production code reads would
+	// make this assertion true by construction.
+	wantArgs := []string{"reconfigure", "trust0"}
+	if len(reconfigureArgs) != 1 || !slices.Equal(reconfigureArgs[0], wantArgs) {
+		t.Fatalf("the activation tail must run %v exactly once; got %v. An address "+
+			"application that names the wrong interfaces leaves the real ones unapplied "+
+			"while still making the call the count-only assertion was watching for",
+			wantArgs, reconfigureArgs)
 	}
 
 	if reconfigureCalls == 0 {
@@ -143,6 +167,7 @@ func TestApplyTailNotRepeatedOnceComplete_5718(t *testing.T) {
 	m := NewInDir(t.TempDir())
 
 	var reloadCalls, reconfigureCalls int
+	var reconfigureArgs [][]string
 	orig := runNetworkctl
 	runNetworkctl = func(args ...string) error {
 		switch {
@@ -150,6 +175,7 @@ func TestApplyTailNotRepeatedOnceComplete_5718(t *testing.T) {
 			reloadCalls++
 		case len(args) > 0 && args[0] == "reconfigure":
 			reconfigureCalls++
+			reconfigureArgs = append(reconfigureArgs, append([]string(nil), args...))
 		}
 		return nil
 	}
@@ -164,6 +190,13 @@ func TestApplyTailNotRepeatedOnceComplete_5718(t *testing.T) {
 	if reloadCalls != 1 || reconfigureCalls != 1 {
 		t.Fatalf("first Apply should reload once and reconfigure once, got %d/%d",
 			reloadCalls, reconfigureCalls)
+	}
+	// Same reasoning as TestApplyTailSurvivesExternalDebtDischarge_5718: this
+	// test's subject is repetition, so the call COUNT is load-bearing here —
+	// but a count alone still cannot see a tail that runs the right number of
+	// times against the wrong interfaces.
+	if want := []string{"reconfigure", "trust0"}; !slices.Equal(reconfigureArgs[0], want) {
+		t.Fatalf("first Apply ran %v, want %v", reconfigureArgs[0], want)
 	}
 
 	// An identical Apply has nothing to do: files unchanged, no global debt,

@@ -139,6 +139,74 @@ func TestInstallConnNeverLeavesTheRegistryEmpty_5718(t *testing.T) {
 	}
 }
 
+// TestEvictionRefusesToEmptyTheRegistry_5718 binds the #5718 fold r6 intrinsic
+// precondition, and it is deliberately NOT routed through installConn.
+//
+// TestInstallConnNeverLeavesTheRegistryEmpty_5718 above proves the LIVE call
+// site is safe. It cannot prove the FUNCTION is, because installConn installs
+// before it evicts and therefore never presents an empty keep slot. That gap
+// is what makes the allowlist exemption in
+// TestOnlyHandleDisconnectEmptiesTheRegistry_5718 weaker than it reads: the
+// exemption is by function NAME, so a second call site inherits it without
+// inheriting the property it was granted for. A caller naming a slot it had not
+// filled would evict every other slot and return with the registry empty —
+// exactly the state the structural guard exists to forbid — and all three
+// existing tests would stay green.
+//
+// So drive the helper directly, in the two shapes a caller can get wrong, and
+// assert it declines. Reverting the keep-slot refusal reds both subtests.
+func TestEvictionRefusesToEmptyTheRegistry_5718(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		keepIdx int
+	}{
+		// The keep slot names a real fabric, but the caller has not installed
+		// into it yet. Only the OTHER slot is occupied, and it is stale.
+		{"keep slot empty", 0},
+		// The keep slot names no fabric at all, so neither skip applies and
+		// both occupied slots are eviction candidates.
+		{"keep index out of range", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ss := newAckTestSync(t)
+			stale := pipeConn(t)
+
+			ss.mu.Lock()
+			// Stand up the state a wrong caller would hand the helper: a
+			// connection stamped with a retired incarnation, and no connection
+			// in the slot the caller claims to be keeping.
+			ss.conn1 = stale
+			ss.conn1Gen = 1
+			ss.peerIncarnation = 2
+			ss.mu.Unlock()
+
+			ss.mu.Lock()
+			evicted := ss.evictStaleIncarnationConnsLocked(tc.keepIdx)
+			ss.mu.Unlock()
+
+			if evicted {
+				t.Errorf("evictStaleIncarnationConnsLocked reported an eviction with keepIdx=%d, "+
+					"whose keep slot holds nothing. The only justification for exempting this "+
+					"function from TestOnlyHandleDisconnectEmptiesTheRegistry_5718 is that it "+
+					"cannot empty the registry; evicting here does exactly that", tc.keepIdx)
+			}
+			c0, c1 := ss.installedFabrics()
+			if c0 == nil && c1 == nil {
+				t.Fatalf("the fabric registry is EMPTY after evictStaleIncarnationConnsLocked(%d). "+
+					"installConn omits its capability clear on the full-disconnect edge because "+
+					"an empty registry is supposed to PROVE handleDisconnect already ran. A "+
+					"second path that empties it makes that proof false, and the retired "+
+					"incarnation's capability latch is then enforced against the next peer",
+					tc.keepIdx)
+			}
+			if c1 != stale {
+				t.Errorf("the stale connection must be left installed when the helper declines; " +
+					"declining has to be a no-op, not a partial eviction")
+			}
+		})
+	}
+}
+
 // TestSecondFabricComingUpIsNotEvicted_5718 is the over-reach guard for the
 // eviction and must stay GREEN when it is reverted.
 //
