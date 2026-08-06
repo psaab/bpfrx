@@ -72,6 +72,8 @@ fn make_metadata(owner_rg_id: i32) -> SessionMetadata {
     SessionMetadata {
         ingress_zone: TEST_TRUST_ZONE_ID,
         egress_zone: TEST_UNTRUST_ZONE_ID,
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         owner_rg_id,
         fabric_ingress: false,
         is_reverse: false,

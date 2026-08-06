@@ -9,13 +9,14 @@ import (
 // Sizes of the on-map C `struct session_value` / `struct session_value_v6`
 // conntrack ABI (bpf/headers/xpf_conntrack.h), mirrored by the Rust helper's
 // BpfSessionValueV4 / BpfSessionValueV6 and asserted on the Rust side at
-// userspace-dp/src/afxdp/bpf_map_tests.rs (size_of == 136 / 184; 128 / 176
-// before the #5460 __u16 flags widen). These are the authoritative on-map
+// userspace-dp/src/afxdp/bpf_map_tests.rs (size_of == 144 / 192; 136 / 184
+// before the #4983 ingress_ifindex append, 128 / 176 before the #5460 __u16
+// flags widen). These are the authoritative on-map
 // value sizes — the Go map registration MUST match them, not sizeOf[SessionValue]
 // (which is larger due to sync-only trailing fields, #2360).
 const (
-	conntrackValueSizeV4 = 136
-	conntrackValueSizeV6 = 184
+	conntrackValueSizeV4 = 144
+	conntrackValueSizeV6 = 192
 )
 
 // TestBPFSessionValueMatchesConntrackABI pins the dedicated on-map ABI types to
@@ -47,7 +48,7 @@ func TestBPFSessionValueMatchesConntrackABI(t *testing.T) {
 // unsafe.Sizeof(T). encoding/binary does NOT count implicit alignment padding,
 // so when the three head-padding gaps (after State, after IsReverse, before
 // SessionID) are left implicit, binary.Size is 129/177 while unsafe.Sizeof is
-// 136/184. sysenc then falls back to binary.Decode, which consumes only
+// 144/192. sysenc then falls back to binary.Decode, which consumes only
 // binary.Size bytes of every value_size-byte kernel record and fails the batch
 // with "unmarshaling []dataplane.bpfSessionValue doesn't consume all data" —
 // the live HA session-sync sweep breakage.
@@ -56,7 +57,7 @@ func TestBPFSessionValueMatchesConntrackABI(t *testing.T) {
 // == unsafe.Sizeof == value_size, keeping the fast path engaged. This test goes
 // RED if the explicit pads are removed (reverting to implicit padding), because
 // binary.Size drops back to 129/177. It asserts all three sizes are equal AND
-// equal to the on-map conntrack ABI value_size (136/184) — the exact invariant
+// equal to the on-map conntrack ABI value_size (144/192) — the exact invariant
 // cilium/ebpf relies on.
 func TestBPFSessionValueMarshalsAtConntrackABISize(t *testing.T) {
 	cases := []struct {
@@ -194,7 +195,7 @@ func TestSessionValueCarriesSyncOnlyGeneration(t *testing.T) {
 
 // TestSessionMapRegisteredAtConntrackABISize is the regression guard for
 // #2360: the `sessions` / `sessions_v6` BPF maps MUST be registered with the
-// on-map conntrack ABI value_size (136 / 184 post-#5460; 128 / 176 before),
+// on-map conntrack ABI value_size (144 / 192 post-#4983; 136 / 184 post-#5460),
 // NOT sizeOf[SessionValue] / sizeOf[SessionValueV6], which are larger by the
 // sync-only trailing fields (Generation, PolicyCounterIdx, ...). Registering at
 // the larger SessionValue size makes the kernel value_size exceed the Rust

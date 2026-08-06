@@ -66,6 +66,25 @@ struct session_value {
 	__u8  fib_dmac[6];
 	__u8  fib_smac[6];
 	__u16 fib_gen;      /* FIB cache generation (matches fib_gen_map[0]) */
+
+	/* #4983: the ifindex of the binding the session's FIRST packet arrived
+	 * on -- the session's TRUE ingress-interface identity, stamped once at
+	 * install and never re-derived. Distinct from fib_ifindex above, which
+	 * is the resolved EGRESS. 0 means "no ingress identity carried" and is
+	 * NOT a valid ifindex: the reverse companion (whose real ingress is the
+	 * forward flow's egress, unknown at install), an HA peer-synced session
+	 * (an ifindex is node-local -- the peer's number names a different NIC
+	 * here), and any pre-#4983 helper all leave it 0. Consumers MUST treat
+	 * 0 as "fall back to the zone approximation", never as "matches
+	 * nothing" or "matches everything". */
+	__u32 ingress_ifindex;
+	/* #4983: the 802.1Q VLAN id the session's first packet arrived with, 0
+	 * for untagged. Paired with ingress_ifindex it names the LOGICAL ingress
+	 * unit -- the same {parent ifindex, vlan} identity the egress side is
+	 * already resolved by (fib_ifindex/fib_vlan_id), so two units of one
+	 * trunk NIC are distinguishable. The struct tail-pads 2 bytes to its
+	 * 8-byte alignment: sizeof grows 136 -> 144, not 136 -> 152. */
+	__u16 ingress_vlan_id;
 };
 
 /* IPv6 session key -- 5-tuple with 128-bit addresses. */
@@ -128,6 +147,14 @@ struct session_value_v6 {
 	__u8  fib_dmac[6];
 	__u8  fib_smac[6];
 	__u16 fib_gen;      /* FIB cache generation (matches fib_gen_map[0]) */
+
+	/* #4983: ingress-binding ifindex -- see session_value.ingress_ifindex
+	 * for the full contract (0 = no identity carried, fall back to the
+	 * zone approximation). */
+	__u32 ingress_ifindex;
+	/* #4983: ingress 802.1Q VLAN id, 0 = untagged -- see
+	 * session_value.ingress_vlan_id. sizeof grows 184 -> 192. */
+	__u16 ingress_vlan_id;
 };
 
 /* TCP state machine transition. Returns new state. */

@@ -178,6 +178,23 @@ struct BpfSessionValueV4 {
     fib_dmac: [u8; 6],
     fib_smac: [u8; 6],
     fib_gen: u16,
+    /// #4983: the ifindex of the binding the session's FIRST packet arrived
+    /// on -- the session's TRUE ingress identity, stamped once at install from
+    /// `SessionMetadata::ingress_ifindex` and never re-derived from the zone.
+    /// Distinct from `fib_ifindex` above, which is the resolved EGRESS. `0`
+    /// means "no ingress identity carried" (reverse companion / peer-synced /
+    /// pre-#4983 entry) and is never a valid ifindex; the Go consumer falls
+    /// back to the zone approximation for it. Appending this u32 on the
+    /// existing 8-byte boundary + the compiler's 4-byte tail pad grows the
+    /// struct 136 -> 144 (v4) / 184 -> 192 (v6) -- `ingress_vlan_id` below
+    /// lands inside that same tail pad, so it costs nothing further.
+    ingress_ifindex: u32,
+    /// #4983: the 802.1Q VLAN id the session's first packet arrived with (0 =
+    /// untagged). Paired with `ingress_ifindex` it names the LOGICAL ingress
+    /// unit using the very same `{parent ifindex, vlan}` identity the Go side
+    /// already resolves the EGRESS interface name by, so two VLAN units of one
+    /// trunk NIC are distinguishable rather than aliased onto the NIC.
+    ingress_vlan_id: u16,
 }
 
 /// Mirrors C `struct session_key_v6` — 40 bytes, packed.
@@ -227,6 +244,23 @@ struct BpfSessionValueV6 {
     fib_dmac: [u8; 6],
     fib_smac: [u8; 6],
     fib_gen: u16,
+    /// #4983: the ifindex of the binding the session's FIRST packet arrived
+    /// on -- the session's TRUE ingress identity, stamped once at install from
+    /// `SessionMetadata::ingress_ifindex` and never re-derived from the zone.
+    /// Distinct from `fib_ifindex` above, which is the resolved EGRESS. `0`
+    /// means "no ingress identity carried" (reverse companion / peer-synced /
+    /// pre-#4983 entry) and is never a valid ifindex; the Go consumer falls
+    /// back to the zone approximation for it. Appending this u32 on the
+    /// existing 8-byte boundary + the compiler's 4-byte tail pad grows the
+    /// struct 136 -> 144 (v4) / 184 -> 192 (v6) -- `ingress_vlan_id` below
+    /// lands inside that same tail pad, so it costs nothing further.
+    ingress_ifindex: u32,
+    /// #4983: the 802.1Q VLAN id the session's first packet arrived with (0 =
+    /// untagged). Paired with `ingress_ifindex` it names the LOGICAL ingress
+    /// unit using the very same `{parent ifindex, vlan}` identity the Go side
+    /// already resolves the EGRESS interface name by, so two VLAN units of one
+    /// trunk NIC are distinguishable rather than aliased onto the NIC.
+    ingress_vlan_id: u16,
 }
 
 /// Session flag constants matching C SESS_FLAG_* defines. `u16` because the

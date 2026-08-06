@@ -24,6 +24,42 @@ pub(crate) struct SessionDecision {
 pub(crate) struct SessionMetadata {
     pub(crate) ingress_zone: u16,
     pub(crate) egress_zone: u16,
+    /// #4983: the ifindex of the binding this session's FIRST packet arrived
+    /// on — the session's TRUE ingress-interface identity. Stamped ONCE at
+    /// install from `UserspaceDpMeta::ingress_ifindex` (the binding the frame
+    /// was actually received on) and never re-derived from `ingress_zone`
+    /// afterwards; re-deriving is precisely the approximation this field
+    /// exists to remove. Mirrored into the conntrack map as
+    /// `session_value.ingress_ifindex` by `publish_conntrack`, which is how
+    /// `show security flow session interface <name>` and the matching `clear`
+    /// stop matching a session on interface X against a filter for a SIBLING
+    /// interface Y of the same multi-interface zone (#4792 widened the CLI to
+    /// consider every interface bound to the zone, which is as good as the
+    /// approximation gets without this datum).
+    ///
+    /// `0` means "no ingress identity carried" and is NEVER a valid ifindex.
+    /// Three populations legitimately carry `0`:
+    ///   - the REVERSE companion — its true ingress is the forward flow's
+    ///     egress interface, which is not resolved at install time;
+    ///   - a PEER-SYNCED session — an ifindex is NODE-LOCAL, so the peer's
+    ///     number names a different NIC here. Carrying it across the cluster
+    ///     wire would produce a confidently WRONG interface name, strictly
+    ///     worse than approximating, so it is deliberately not synced;
+    ///   - a session installed by a pre-#4983 helper.
+    /// The Go consumer falls back to the zone approximation for all three
+    /// (never "matches nothing", never "matches everything").
+    pub(crate) ingress_ifindex: u32,
+    /// #4983: the 802.1Q VLAN id this session's FIRST packet arrived with
+    /// (`UserspaceDpMeta::ingress_vlan_id`; 0 = untagged). Stamped at install
+    /// alongside `ingress_ifindex` and meaningful only with it: the PAIR is
+    /// the logical ingress unit, and it is deliberately the same
+    /// `{parent ifindex, vlan}` identity the Go side already resolves the
+    /// EGRESS interface name by (`fib_ifindex`/`fib_vlan_id` →
+    /// `buildSessionEgressIfaces`). Without the VLAN half, two units of one
+    /// trunk NIC — e.g. `reth0.50` and `reth0.80` in the same zone — would
+    /// alias onto the parent and reproduce the very cross-interface match
+    /// this issue removes.
+    pub(crate) ingress_vlan_id: u16,
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
@@ -135,6 +171,8 @@ impl PartialEq for SessionMetadata {
     fn eq(&self, other: &Self) -> bool {
         self.ingress_zone == other.ingress_zone
             && self.egress_zone == other.egress_zone
+            && self.ingress_ifindex == other.ingress_ifindex
+            && self.ingress_vlan_id == other.ingress_vlan_id
             && self.owner_rg_id == other.owner_rg_id
             && self.fabric_ingress == other.fabric_ingress
             && self.is_reverse == other.is_reverse
@@ -172,6 +210,8 @@ impl SessionMetadata {
         Self {
             ingress_zone: self.ingress_zone,
             egress_zone: self.egress_zone,
+            ingress_ifindex: self.ingress_ifindex,
+            ingress_vlan_id: self.ingress_vlan_id,
             owner_rg_id: self.owner_rg_id,
             fabric_ingress: self.fabric_ingress,
             is_reverse: self.is_reverse,

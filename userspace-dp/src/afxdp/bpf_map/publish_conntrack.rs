@@ -244,6 +244,14 @@ pub(super) fn build_conntrack_value_v4(
         fib_dmac: [0; 6],
         fib_smac: [0; 6],
         fib_gen: 0,
+        // #4983: the session's TRUE ingress-interface identity, taken from the
+        // metadata stamped at install (the binding the FIRST packet arrived
+        // on) — deliberately NOT re-derived from `ingress_zone_id` here, which
+        // is the very zone approximation the field replaces. `0` when the
+        // session carries no ingress identity (reverse companion / peer-synced
+        // import); the Go filter falls back to the zone approximation for it.
+        ingress_ifindex: metadata.ingress_ifindex,
+        ingress_vlan_id: metadata.ingress_vlan_id,
     })
 }
 
@@ -386,6 +394,14 @@ pub(super) fn build_conntrack_value_v6(
         fib_dmac: [0; 6],
         fib_smac: [0; 6],
         fib_gen: 0,
+        // #4983: the session's TRUE ingress-interface identity, taken from the
+        // metadata stamped at install (the binding the FIRST packet arrived
+        // on) — deliberately NOT re-derived from `ingress_zone_id` here, which
+        // is the very zone approximation the field replaces. `0` when the
+        // session carries no ingress identity (reverse companion / peer-synced
+        // import); the Go filter falls back to the zone approximation for it.
+        ingress_ifindex: metadata.ingress_ifindex,
+        ingress_vlan_id: metadata.ingress_vlan_id,
     })
 }
 

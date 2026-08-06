@@ -611,6 +611,8 @@ pub(super) fn build_missing_neighbor_session_metadata(
     decision: SessionDecision,
 ) -> SessionMetadata {
     SessionMetadata {
+        ingress_ifindex: 0,
+        ingress_vlan_id: 0,
         ingress_zone,
         egress_zone,
         owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),

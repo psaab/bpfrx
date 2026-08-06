@@ -63,6 +63,39 @@ type SessionValue struct {
 	FibSmac    [6]byte
 	FibGen     uint16
 
+	// IngressIfindex is the #4983 TRUE ingress-interface identity: the ifindex
+	// of the binding the session's FIRST packet arrived on. The helper stamps
+	// it ONCE at session install from the packet's ingress binding
+	// (SessionMetadata.ingress_ifindex -> publish_conntrack) and never
+	// re-derives it from the zone — re-deriving is exactly the approximation
+	// this field exists to remove. It rides the on-map C conntrack ABI
+	// (session_value.ingress_ifindex), NOT the sync-only trailing fields below,
+	// so it is present on bpfSessionValue and round-trips through the BPF
+	// mirror.
+	//
+	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. Three
+	// populations legitimately carry 0 and MUST keep working:
+	//   - the reverse companion (its real ingress is the forward flow's egress,
+	//     which is unknown at install time);
+	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
+	//     number names a different NIC on this node, so carrying it across the
+	//     cluster wire would be confidently wrong, worse than approximating);
+	//   - any session installed by a pre-#4983 helper (rolling upgrade).
+	// Consumers MUST fall back to the zone approximation for those (see
+	// sessionFilter.ingressIfaces / resolveIngressIfaces in pkg/cli), never
+	// treat 0 as "matches nothing" or "matches everything".
+	IngressIfindex uint32
+
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
+	// packet carried (0 = untagged). It is meaningful ONLY alongside a
+	// non-zero IngressIfindex: the pair {IngressIfindex, IngressVlanID} is
+	// exactly the sessionIfaceKey the CLI already resolves the EGRESS
+	// interface name by (buildSessionEgressIfaces keys on the PARENT netdev
+	// ifindex + the unit's VLAN), so the ingress side reuses that one map and
+	// two VLAN units of a single trunk NIC do not alias onto each other.
+	// Also part of the on-map C conntrack ABI.
+	IngressVlanID uint16
+
 	// Generation is a per-(sender,key) monotonic install generation used
 	// by the HA session-sync deferred-delete guard (#2170). It is
 	// userspace-sync-only metadata — like the LogFlagUserspace* bits — and
@@ -193,6 +226,39 @@ type SessionValueV6 struct {
 	FibDmac    [6]byte
 	FibSmac    [6]byte
 	FibGen     uint16
+
+	// IngressIfindex is the #4983 TRUE ingress-interface identity: the ifindex
+	// of the binding the session's FIRST packet arrived on. The helper stamps
+	// it ONCE at session install from the packet's ingress binding
+	// (SessionMetadata.ingress_ifindex -> publish_conntrack) and never
+	// re-derives it from the zone — re-deriving is exactly the approximation
+	// this field exists to remove. It rides the on-map C conntrack ABI
+	// (session_value.ingress_ifindex), NOT the sync-only trailing fields below,
+	// so it is present on bpfSessionValue and round-trips through the BPF
+	// mirror.
+	//
+	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. Three
+	// populations legitimately carry 0 and MUST keep working:
+	//   - the reverse companion (its real ingress is the forward flow's egress,
+	//     which is unknown at install time);
+	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
+	//     number names a different NIC on this node, so carrying it across the
+	//     cluster wire would be confidently wrong, worse than approximating);
+	//   - any session installed by a pre-#4983 helper (rolling upgrade).
+	// Consumers MUST fall back to the zone approximation for those (see
+	// sessionFilter.ingressIfaces / resolveIngressIfaces in pkg/cli), never
+	// treat 0 as "matches nothing" or "matches everything".
+	IngressIfindex uint32
+
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
+	// packet carried (0 = untagged). It is meaningful ONLY alongside a
+	// non-zero IngressIfindex: the pair {IngressIfindex, IngressVlanID} is
+	// exactly the sessionIfaceKey the CLI already resolves the EGRESS
+	// interface name by (buildSessionEgressIfaces keys on the PARENT netdev
+	// ifindex + the unit's VLAN), so the ingress side reuses that one map and
+	// two VLAN units of a single trunk NIC do not alias onto each other.
+	// Also part of the on-map C conntrack ABI.
+	IngressVlanID uint16
 
 	// Generation: see SessionValue.Generation. Userspace-sync-only HA
 	// deferred-delete guard metadata (#2170), not in the BPF C struct.

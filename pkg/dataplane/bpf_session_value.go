@@ -114,6 +114,20 @@ type bpfSessionValue struct {
 	FibDmac    [6]byte
 	FibSmac    [6]byte
 	FibGen     uint16
+
+	// IngressIfindex is the #4983 ingress-binding ifindex: the interface the
+	// session's FIRST packet arrived on, stamped ONCE by the helper at install
+	// (SessionMetadata.ingress_ifindex -> publish_conntrack) and never
+	// re-derived from the zone. It is part of the C conntrack ABI
+	// (session_value.ingress_ifindex), unlike the sync-only trailing fields on
+	// SessionValue. 0 = no ingress identity carried; see
+	// SessionValue.IngressIfindex for the full contract.
+	IngressIfindex uint32
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id (0 = untagged). It
+	// lands inside the tail padding IngressIfindex already forced, so the
+	// pair costs 8 bytes total, not 16.
+	IngressVlanID uint16
+	_             [2]byte // pad: C tail-pads the struct to its 8-byte alignment (#6082)
 }
 
 // bpfSessionValueV6 mirrors C `struct session_value_v6` exactly (184 bytes; 176
@@ -163,6 +177,20 @@ type bpfSessionValueV6 struct {
 	FibDmac    [6]byte
 	FibSmac    [6]byte
 	FibGen     uint16
+
+	// IngressIfindex is the #4983 ingress-binding ifindex: the interface the
+	// session's FIRST packet arrived on, stamped ONCE by the helper at install
+	// (SessionMetadata.ingress_ifindex -> publish_conntrack) and never
+	// re-derived from the zone. It is part of the C conntrack ABI
+	// (session_value.ingress_ifindex), unlike the sync-only trailing fields on
+	// SessionValue. 0 = no ingress identity carried; see
+	// SessionValue.IngressIfindex for the full contract.
+	IngressIfindex uint32
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id (0 = untagged). It
+	// lands inside the tail padding IngressIfindex already forced, so the
+	// pair costs 8 bytes total, not 16.
+	IngressVlanID uint16
+	_             [2]byte // pad: C tail-pads the struct to its 8-byte alignment (#6082)
 }
 
 // toBPF projects a SessionValue onto the on-map ABI layout, dropping the
@@ -198,6 +226,10 @@ func (v SessionValue) toBPF() bpfSessionValue {
 		FibDmac:     v.FibDmac,
 		FibSmac:     v.FibSmac,
 		FibGen:      v.FibGen,
+		// #4983: the ingress-binding ifindex is part of the on-map C ABI, so it
+		// round-trips in BOTH directions (unlike the sync-only trailing fields).
+		IngressIfindex: v.IngressIfindex,
+		IngressVlanID:  v.IngressVlanID,
 	}
 }
 
@@ -235,6 +267,10 @@ func (v bpfSessionValue) sessionValue() SessionValue {
 		FibDmac:     v.FibDmac,
 		FibSmac:     v.FibSmac,
 		FibGen:      v.FibGen,
+		// #4983: the ingress-binding ifindex is part of the on-map C ABI, so it
+		// round-trips in BOTH directions (unlike the sync-only trailing fields).
+		IngressIfindex: v.IngressIfindex,
+		IngressVlanID:  v.IngressVlanID,
 	}
 }
 
@@ -271,6 +307,10 @@ func (v SessionValueV6) toBPF() bpfSessionValueV6 {
 		FibDmac:     v.FibDmac,
 		FibSmac:     v.FibSmac,
 		FibGen:      v.FibGen,
+		// #4983: the ingress-binding ifindex is part of the on-map C ABI, so it
+		// round-trips in BOTH directions (unlike the sync-only trailing fields).
+		IngressIfindex: v.IngressIfindex,
+		IngressVlanID:  v.IngressVlanID,
 	}
 }
 
@@ -307,5 +347,9 @@ func (v bpfSessionValueV6) sessionValue() SessionValueV6 {
 		FibDmac:     v.FibDmac,
 		FibSmac:     v.FibSmac,
 		FibGen:      v.FibGen,
+		// #4983: the ingress-binding ifindex is part of the on-map C ABI, so it
+		// round-trips in BOTH directions (unlike the sync-only trailing fields).
+		IngressIfindex: v.IngressIfindex,
+		IngressVlanID:  v.IngressVlanID,
 	}
 }
