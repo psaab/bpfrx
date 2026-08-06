@@ -28,9 +28,13 @@ import (
 // blocklist is incomplete by construction. Nine distinct foreclosing sentences
 // and nine distinct promising sentences, none using a listed spelling, were
 // each spliced before the tail and left the whole package suite GREEN. So what
-// is enforced is "no forecast in any spelling we listed, anywhere, plus no
-// tampering with the tail at all" — not "no forecast". Do not grow the lists
-// toward completeness; see the doctrine note at the blocklist itself.
+// is enforced is purely LEXICAL: "none of the listed spellings appears anywhere,
+// plus no tampering with the tail at all" — not "no forecast", and not even "no
+// forecast in a listed spelling". The check cannot see meaning in either
+// direction. It misses a forecast phrased in a spelling nobody listed, and it
+// rejects accurate neutral prose that happens to contain one — eight such
+// sentences were measured tripping the lists. Do not grow the lists toward
+// completeness; see the doctrine note at the blocklist itself.
 //
 // "Either direction" is load-bearing in (5). The contract on validateVRFOverlap
 // is that the text must not promise a fix "nor rule one out", and until now only
@@ -378,12 +382,16 @@ func vrfOverlapBothFormStrings(t *testing.T) (equal, unequal string) {
 	return eq[0], un[0]
 }
 
-// TestVRFOverlapWarningStatesStatusNotPromise pins two properties of BOTH format
-// strings: the message ENDS with vrfOverlapStatusTail verbatim, and the message
-// carries none of the KNOWN forecasting spellings — forward or backward —
-// anywhere. Despite the name, "NotPromise" is shorthand for "neither promises nor
-// forecloses": the contract on validateVRFOverlap is symmetric, so the test is
-// too.
+// TestVRFOverlapWarningStatesStatusNotPromise pins two LEXICAL properties of
+// BOTH format strings: the message ENDS with vrfOverlapStatusTail verbatim, and
+// the message contains none of the listed spellings — from either list —
+// anywhere. It compares text. It does not and cannot evaluate meaning.
+//
+// The NAME is aspirational, not a description of what runs. "NotPromise" is
+// shorthand for the CONTRACT on validateVRFOverlap, which is symmetric —
+// "neither promises nor forecloses". The test approximates that contract with
+// two substring checks, and the gap between the contract and the approximation
+// is the subject of the next paragraph. Do not read the name as the guarantee.
 //
 // What that does NOT amount to is "the text cannot forecast either outcome". The
 // suffix compare is absolute but reaches only the tail; everything before it is
