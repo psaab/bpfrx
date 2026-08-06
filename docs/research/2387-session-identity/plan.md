@@ -508,9 +508,11 @@ mismatch, **drop + increment a dedicated counter** — do not fall through to in
   surfaces, length-gated, **no version bump** (§4.3, and heed its caveat: do **not**
   grow the embedded reverse-key block).
 
-**Cost:** ~301 struct-literal edits (a third in tests), +4 B/key, one extra
-`write_u32` per hash, an additive wire append, and a mandatory `make test-failover`.
-**Delivers:** the issue's literal ask and vendor parity.
+**Cost:** ~297 struct-literal edits (most in test files), +4 B/key, one extra
+`write_u32` per hash, an additive wire append, **a rolling-compatible
+`CurrentHAProtocolVersion` bump plus the `parseHAProtocolCompatible` change (§4.3b)**,
+the allocate-once interner and its config-carried table (§5), and a mandatory
+`make test-failover`. **Delivers:** the issue's literal ask and vendor parity.
 
 ### ~~Path D — ISOLATE-narrow~~ — WITHDRAWN in v6-r2
 
@@ -673,8 +675,9 @@ while making it less true.
 | Class | Path A | Path B (DENY) | Path C (ISOLATE) |
 |---|---|---|---|
 | Behavioural regression | NONE | MED — a mis-derived domain drops a legitimate flow (self-DoS) | MED-HIGH — a mis-derived domain either fails to match (self-DoS) or cross-matches |
-| HA mixed-version | NONE | NONE (value-only, no sync semantics) | **LOW** — additive, no version bump, non-VRF clusters bit-identical (§4.3) — *was rated HIGH in v4; that rating is withdrawn* |
+| HA mixed-version | NONE | NONE (value-only, no sync semantics) | **MED** — the *payload* is additive, but §4.3b's fail-open at domain 0 forces version-gated enforcement, so C-P3 carries a `CurrentHAProtocolVersion` bump **and** a change to the ISSU compatibility predicate. Still **rolling** (via the declared `MinCompat` floor), so v4's "HIGH / non-rolling flag day" rating remains withdrawn — but v6-r1's "LOW / no version bump" was too optimistic. |
 | Wire / struct | NONE | NONE | LOW-MED — +4 B key, two additive trailing wire fields, golden fixture regen |
+| Upgrade-gate blast radius | NONE | NONE | **MED (new in v6-r3)** — `parseHAProtocolCompatible` decides whether *any* release is rolling-upgradable. Loosening it to a declared floor is what the unused `MinCompatHAProtocolVersion` was written for, but it widens what the gate permits for every future release, not just this one. |
 | Performance | NONE | NONE | **UNMEASURED** — one extra `write_u32`/hash, +4 B/entry; must be benchmarked (§4.4) |
 | Security posture | leaves a hijack surface | closes hijack, opens a co-tenant DoS | closes hijack without opening a DoS |
 | Semantics | contradicts shipped A.1 text | contradicts shipped A.1 text + Junos parity | matches both |
