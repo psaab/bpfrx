@@ -345,12 +345,26 @@ pub(crate) struct Nat64ReverseInfo {
 //     shared across all workers behind `Arc<ForwardingState>` (ArcSwap) and
 //     threaded across config reloads by `from_snapshots_with_previous` — the
 //     same Arc-sharing pattern the `PortAllocator` uses. No new sharded mutex,
-//     no session-sync/control-socket traffic (HA does NOT sync it: transient,
-//     sub-second; on failover an in-flight fragmented datagram is dropped ->
-//     retransmitted, documented + bounded).
+//     no session-sync/control-socket traffic. HA does NOT sync it, and #6927
+//     corrected what that costs: the TTL is an IDLE timeout, RE-STAMPED on
+//     every hit (`lookup`), so a continuously hit entry does NOT expire in two
+//     seconds — it lives as long as fragments keep arriving. Calling the state
+//     "transient, sub-second" and "bounded" was true of an idle entry and false
+//     of a busy one, and the difference mattered: an association that outlives
+//     an RG transition kept serving the OLD owner. What bounds it now is
+//     enforcement, not time — the hit arm re-runs `enforce_ha_resolution_snapshot`
+//     on the cached resolution every packet, so an inactive owner is demoted to
+//     `HAInactive` on the very next fragment however often the entry is
+//     refreshed. Memory is separately bounded (16 shards x 64 entries).
 //
-// Miss (reorder / orphan / eviction / cross-node failover) falls to the #4617
+// Miss (reorder / orphan / eviction / cross-node failover) falls to a
 // fail-closed drop (`nat64_frag_dropped`), never a wrong-source forward.
+// #6927: that was an ASPIRATION until the Pref64-destination gate on the
+// flowless arm (`poll_descriptor/mod.rs`) existed. `nat64_consult_forward_fragment_assoc`
+// returning `None` only means "no association"; the packet then resolved like
+// any other IPv6 destination and, with a default route, FORWARDED — untranslated,
+// to a synthetic Pref64 address, with the client's real IPv6 source on the wire.
+// Every test agreed with this comment because the fixture deleted `::/0`.
 // ===========================================================================
 
 /// Number of independent shards. Power of two so the shard index is a mask.
