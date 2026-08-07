@@ -91,6 +91,17 @@ func TestUserspaceXDPShimObjectMatchesSourceManifest(t *testing.T) {
 		}
 	}
 
+	// #4555: the emitted shim facts are recomputed from the OBJECT, so they
+	// can drift from the committed manifest even when the object and every
+	// input hash still match — a hand-edited or tool-corrupted `shim_facts`
+	// block is exactly that case. Report it explicitly: without this branch
+	// the operator gets the generic "the object may be STALE, run `make
+	// generate`" preamble followed by an EMPTY diff, which misdiagnoses the
+	// cause and shows nothing. The parity guard in userspace-dp trusts these
+	// numbers, so a falsified block is the one way to make it compare
+	// stale-fact against stale-fact.
+	reportFactDrift(&b, got.ShimFacts, want.ShimFacts)
+
 	t.Fatal(b.String())
 }
 
@@ -154,4 +165,60 @@ func TestUserspaceXDPManifestCoversTrackedShimInputs(t *testing.T) {
 			t.Errorf("manifest must cover critical build input %q", must)
 		}
 	}
+}
+
+// reportFactDrift appends a description of any #4555 emitted-fact drift.
+//
+// It reports only the fields that actually moved. An earlier version dumped
+// both 512-character `eh_classes` hex strings unconditionally, which buried
+// a one-field difference (`max_ext_hdrs=6` vs `7`) between two walls of
+// identical hex — the reader could not see what changed.
+func reportFactDrift(b *strings.Builder, got, want *ShimFacts) {
+	switch {
+	case got == nil && want == nil:
+		return
+	case got == nil:
+		fmt.Fprintf(b, "manifest has no shim_facts block (#4555), but the object emits one.\n"+
+			"  Run `make generate`; the userspace-dp parity guard needs it.\n")
+		return
+	case want == nil:
+		fmt.Fprintf(b, "manifest carries a shim_facts block (#4555) but the object emits none.\n")
+		return
+	}
+
+	var diffs []string
+	if got.MaxExtHdrs != want.MaxExtHdrs {
+		diffs = append(diffs, fmt.Sprintf("  max_ext_hdrs:  manifest %d, object %d", got.MaxExtHdrs, want.MaxExtHdrs))
+	}
+	if got.FragHdrSize != want.FragHdrSize {
+		diffs = append(diffs, fmt.Sprintf("  frag_hdr_size: manifest %d, object %d", got.FragHdrSize, want.FragHdrSize))
+	}
+	if got.EHClassesHex != want.EHClassesHex {
+		gc, gerr := got.EHClasses()
+		wc, werr := want.EHClasses()
+		if gerr != nil || werr != nil {
+			diffs = append(diffs, fmt.Sprintf("  eh_classes:    undecodable (manifest err=%v, object err=%v)", gerr, werr))
+		} else {
+			var changed []string
+			for i := range wc {
+				if gc[i] != wc[i] {
+					changed = append(changed, fmt.Sprintf("next-header %d: manifest class %d, object class %d", i, gc[i], wc[i]))
+				}
+			}
+			diffs = append(diffs, "  eh_classes:    "+strings.Join(changed, "; "))
+		}
+	}
+	if len(diffs) == 0 {
+		return
+	}
+
+	fmt.Fprintf(b, "emitted shim facts (#4555) differ from the object's own XPF_SHIM_FACTS:\n")
+	for _, d := range diffs {
+		fmt.Fprintf(b, "%s\n", d)
+	}
+	fmt.Fprintf(b, "  The manifest's shim_facts block does not match what the tracked object\n")
+	fmt.Fprintf(b, "  actually emits. If the object and inputs above are unchanged, the block was\n")
+	fmt.Fprintf(b, "  edited by hand or corrupted — the userspace-dp parity guard trusts these\n")
+	fmt.Fprintf(b, "  numbers, so a falsified block is how it would compare stale against stale.\n")
+	fmt.Fprintf(b, "  Run `make generate` to restore them from the object.\n")
 }
