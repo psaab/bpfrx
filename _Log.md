@@ -402,6 +402,1012 @@
   `pkg/api/authz_bodybudget_5561_test.go`, `pkg/api/README.md`,
   `pkg/daemon/management.go`, `pkg/daemon/management_authstale_5561_test.go`,
   `pkg/daemon/README.md`, `_Log.md`
+## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
+
+- **Timestamp**: 2026-08-06 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate at `42b2c8733` returned DO-NOT-MERGE on ONE
+  blocking finding, and it is not in either walk — it is in the sentence the
+  walk's own doc comment uses to justify exhaustion. Traced end to end and
+  confirmed real before changing anything; the two walks themselves are
+  untouched and the regenerated object is byte-identical.
+  - **(1) BLOCKING: an over-limit chain could INSTALL the exact key the shim
+    probes.** `walk_ipv6_ext_headers` exits by EXHAUSTING `MAX_EXT_HDRS` and
+    returns the residual extension-header type; `parse_l4`'s catch-all
+    (`lib.rs:1518`) stamps ports 0/0. The doc comment then asserted "the session
+    key misses, and the packet is redirected to userspace — the fail-closed path
+    for an over-limit chain", and `pkg/dataplane/README.md` repeated it as "it
+    costs that flow the XDP fast path permanently, nothing more". Both were
+    FALSE. The miss is a property of the session MAP, which userspace writes,
+    and `metadata_tuple_complete` (`frame/inspect.rs`) accepted EVERY non-TCP/UDP
+    metadata tuple — so `(AF_INET6, <residual ext type>, src, dst, 0, 0)` became
+    a `SessionFlow`. Three consequences, in order: `flow.is_none()` went false,
+    so the #4743 over-limit drop in the poll loop was SKIPPED; an
+    `application any` permit matched a flow with no ports to fail on; and the
+    key was installed and published to `USERSPACE_SESSIONS`. The next packet of
+    the same chain then HIT and took the fast path. The unconditional over-limit
+    refusal was in fact conditional on policy.
+    - FIX, at the chokepoint that mints the false tuple:
+      `metadata_tuple_complete` now declines an IPv6 tuple whose protocol is one
+      the walk TRAVERSES. The frame arm already declined (`parse_flow_ports` has
+      no case for an extension-header protocol) and so does the meta-offset
+      fallback, so `parse_session_flow_from_bytes` returns `None` — which is
+      exactly the input the existing #4743 gate needs to fire and DROP. No new
+      gate, no reordering of the poll loop: the old gate stops being
+      accidentally-correct.
+    - The refused set is `ipv6_ext_header_is_traversable` (GENERIC ∪ AUTH ∪
+      FRAGMENT). No-Next-Header 59 is deliberately NOT a member — it is a
+      terminal verdict both walkers resolve to, not a header either steps past —
+      and ESP 50 is not either, so IPsec transit keeps its portless tuple.
+  - **(2) The map has a SECOND writer, and it took arbitrary protocols.**
+    `build_synced_session_key` (`server/helpers/session_sync.rs`) rebuilds a peer
+    key straight off the wire. The session map is global and the shim probes
+    whatever row is present regardless of who wrote it, so closing only the
+    packet path would have left the invariant false. It now rejects the same
+    set, and the caller surfaces the error on the control response instead of
+    importing the row. This also closes the reviewer's finding 5 exploitation
+    path: `USERSPACE_SESSION_ACTION_PASS_TO_KERNEL` is published ONLY via
+    `uses_kernel_local_session_map_entry`, which requires `origin.is_peer_synced()`
+    — so a synced LocalDelivery row was the one way
+    `classify_native_gre_inner_ipv6` could return the kernel-delivery verdict for
+    an extension-header protocol. It can no longer be imported.
+  - **(3) Finding 6: "verifier PASS" was printed for an OVERRIDE.**
+    `build-userspace-xdp.sh` accepts shimverify rc=6 (headroom gate suppressed
+    via `XPF_SHIM_ALLOW_LOW_HEADROOM=1`) and then printed the unconditional
+    `verifier PASS — installed ...`. `PASS` is the one word an operator greps
+    for to confirm the gate was satisfied, and the warning is on stderr, which
+    is routinely read apart from stdout. The verdict is now carried in
+    `VERIFY_VERDICT` and rc=6 says
+    "verifier headroom gate OVERRIDDEN ..., NOT a measured pass".
+  - **(4) NOT folded — finding 5's classifier restructuring, SPLIT.**
+    `classify_native_gre_inner_ipv6` (`lib.rs:931`) still rejects only the
+    pre-#4555 five (HOP/ROUTING/DEST/AUTH/FRAGMENT), so for inner
+    135/139/140/253/254 it builds a fixed `inner IPv6 + 40` key using the
+    extension value as the protocol instead of walking. After (1)+(2) its worst
+    outcome is a session-map MISS falling through to XSK — the safe direction —
+    because no writer can produce a key with those protocols. Making it agree
+    with the canonical class set, or fold the shared walker, is a shim CODEGEN
+    change: a new `.o`, which owes a loss-userspace cluster smoke this lane is
+    not permitted to run. Verifier headroom measured at this head for whoever
+    picks it up: **947,188 / 1,000,000 insns, 5.28% free** (floor is 3%).
+  - **Tests.** `over_limit_chain_never_becomes_a_session_flow` sweeps all ten
+    traversable types, sizing each chain from `shim_walk::MAX_EXT_HDRS + 1` and
+    taking the residual protocol from the REAL shim walk, so the fixture exceeds
+    the shim's own limit by construction and the key asserted about is the key
+    the shim will really probe. Its companion
+    `at_limit_chain_still_publishes_the_key_the_shim_probes` is the negative
+    control: one header shorter, the SAME pipeline produces a flow whose
+    `forward_key` IS the shim's probe key — so the machinery under test really
+    is the one that publishes session identities, and the over-limit case is a
+    refusal rather than a dead path. `refused_protocol_set_equals_the_shim_traversable_set`
+    holds the refused set equal to the shim's `eh_class` non-terminal set over
+    all 256 values, and `traversable_predicate_matches_walker_behaviour_over_all_256_values`
+    holds it equal to what `walk_ipv6_ext_chain` measurably does — so a new
+    extension-header type taught to either walker reds unless the refusal learns
+    it too. Over-reach guards (ESP, No-Next-Header, all-IPv4, at-limit chains,
+    the pre-existing TCP/UDP port rule) stay GREEN under both reverts.
+  - **Revert probes**, run firsthand, restored after each: dropping the
+    `metadata_tuple_complete` clause → `cargo test` exit **101**, RED on
+    `#6923: proto=0: an over-limit IPv6 extension-header chain must NOT become a
+    session flow ... left: Some(SessionFlow { ... protocol: 0, src_port: 0,
+    dst_port: 0 })`; neutering `reject_unresolved_ipv6_ext_protocol` → exit
+    **101**, RED on `#6923: a synced IPv6 session keyed on extension-header
+    protocol 0 must be REFUSED`. Both are ASSERTION failures, not build breaks,
+    and each left the other's tests green.
+  - **`make generate` ran** and is disclosed rather than hidden: the two
+    corrected texts live in `userspace-xdp/src/ipv6_ext_walk.rs` (a doc comment)
+    and `pkg/dataplane/build-userspace-xdp.sh` (an echo), and BOTH are hashed
+    inputs of the #4977 freshness manifest, so the gate went RED. Neither edit
+    can change codegen, and the rebuild confirmed it: the object came back
+    **byte-identical** (`29fc6d783f74b3b9a27275aec67492dcc1f071a841c71cd51e505fdc35daf268`
+    before and after), verifier PASS at 5.28% headroom, manifest refreshed.
+    Hand-running `cmd/shim-manifest` would have been the cheaper route and was
+    deliberately NOT taken — it is precisely the laundering path that gate
+    exists to catch.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/server/helpers/session_sync.rs,
+  userspace-dp/src/afxdp/frame/inspect_tests.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-dp/src/main_tests.rs, userspace-xdp/src/ipv6_ext_walk.rs,
+  pkg/dataplane/build-userspace-xdp.sh, pkg/dataplane/README.md,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
+
+## 2026-08-01 — #4555 round 6: unfake the parity comparison, unfake the harness
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate returned MERGE-NEEDS-MAJOR with six MAJORs, every
+  one in the GUARD or its acceptance harness rather than in the shipped walk.
+  The reviewer's 120,000-buffer randomized differential over all 14 relevant
+  next-header types (random HdrExtLen, random padding, random truncation,
+  l3 in {0,14}) found ZERO divergences between the two walkers, and confirmed
+  `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1` is correct — both sides resolve
+  exactly 0..=7 and refuse 8 or more. The walk is untouched, the tracked object
+  is unchanged, no `make generate`. Two of the six (arm boundary cases, L3
+  sweep) were closed by `c87851b3f` while this round was in flight; its three
+  boundary-exact cases and their comment are carried forward VERBATIM, and my
+  exact (target, target-1) pairs sit alongside them at a different magnitude.
+  - **(1) THE COMPARISON WAS A TAUTOLOGY.** `walk_ipv6_ext_headers` returns
+    `(offset, protocol)` and records no fragment state. The previous revision
+    compared a `WalkRecord` carrying `saw_fragment`/`non_first_fragment` too,
+    and supplied the shim's two columns by hand-writing a SECOND walk loop
+    inside the test that re-derived them with literally the same expression
+    `walk_ipv6_ext_chain` uses (`tests:550` vs `inspect.rs:236`). Every
+    comparison of those columns was `X == X`: no shim-side edit could move
+    them, and the widened corpus stayed GREEN on the exact non-first-fragment
+    input it was widened to catch. Second loop deleted; the corpus now compares
+    only what the shim actually returns.
+  - **(2) WROTE THE ASSERTION THE FILE HAD BEEN CITING.**
+    `shim_is_not_more_permissive` was named at `:493-496` as the mitigation for
+    exactly this gap and existed nowhere in the tree — the third dangling
+    citation on this branch. It exists now and both halves are MEASURED by
+    running the real walkers: two chains differing only in the Fragment
+    header's offset/M/identification bytes give the SAME real shim result and
+    DIFFERENT `ExtChainWalk`s. Every sub-field the old `.is_some()` collapsed is
+    pinned — readable/unreadable discriminant, 13-bit offset, M flag, 32-bit
+    identification — plus `ipv6_is_any_fragment` / `ipv6_is_non_first_fragment`
+    on the declared-but-truncated header. It records the divergence as KNOWN and
+    UNCLOSED (#6704, pre-existing) and declines to claim it is safe.
+  - **(3) THE HARNESS COULD REPORT SUCCESS WITHOUT OBSERVING ANYTHING** — three
+    instances of one defect. (a) The build gate ran `cargo build`, which never
+    compiles `ipv6_ext_walk.rs` (`#[cfg(test)]`-only), so a mutation that did
+    not parse scored as "the guard fired"; now `cargo test --no-run`, and
+    preflight P1 DEMONSTRATES the coverage by requiring a deliberate syntax
+    error to break the gate. (b) Nothing asserted a test RAN: `cargo test
+    <filter matching nothing>` exits 0 with `0 passed` and no Go-style `[no
+    tests to run]` marker, so with both negative controls deleted every row
+    printed an empty column and the script still exited PASS. Per-test results
+    now come from an anchored full-module-path match, an absent test is a
+    HARNESS ERROR, and preflight P2 demonstrates it. (c) The `first divergence`
+    extractor's character class excluded `{` and `:`, so it matched nothing once
+    the assertion text changed and every RED row printed no reason; fixed, and a
+    RED row with no extractable reason is now a HARNESS ERROR.
+  - **(4) EVERY ROW CARRIES AN EXPECTATION.** Row 11 is a semantically null
+    rename that must SURVIVE, so a harness that reds unconditionally fails as
+    loudly as one that never reds. Mutators assert their target COUNT (two were
+    `sed -i` with no match check), restore is verified with `cmp`, the lock
+    moved off `${TMPDIR}` (which this repo routinely varies) to a fixed path,
+    the baseline compares the mutated file against git HEAD instead of inferring
+    cleanliness from passing tests, and the lock fd is closed in cargo's
+    children (`9>&-`) — an inherited fd 9 left the lock held by orphaned rustc
+    after a killed run, found by doing exactly that.
+  - **Validation** — `test/mutation/shim-ext-parity-acceptance.sh` from this
+    tree, ALL 13 rows, build exit 0 in every row, `=== acceptance PASS ===`:
+
+    ```
+    P1  build gate observes ipv6_ext_walk.rs .. yes (build failed on a deliberate syntax error)
+    P2  a vacuous run is reported MISSING ..... yes (cargo exit 0, all 5 columns MISSING)
+     0. GREEN [baseline self-check]              rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+     1. GENERIC advance *8 -> *16                rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     2. GENERIC post-advance revalidation DELETED rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     3. GENERIC revalidation length - 1          rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     4. AUTH advance *4 -> *8                    rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     5. AUTH post-advance revalidation DELETED   rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     6. AUTH revalidation length - 1             rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     7. FRAGMENT read 8 -> 2                     rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     8. FRAGMENT read 8 -> 7                     rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     9. revalidation base l3_offset -> 0         rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+    10. statement in the loop, outside the match rc=101 | corpus=FAILED permissive=ok     facts=ok CONTROL=ok/ok
+    11. NEG-CTL semantically null rename         rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+    12. RESTORED                                 rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+    ```
+
+    First divergence per row (the extractor MINOR-0 had blinded):
+    row 6 `[l3=0] AH(len=0) buffer one byte short: shim=L4(48, 6) userspace=FailClosed`;
+    row 8 `[l3=0] Fragment buffer one byte short: shim=L4(48, 6) userspace=FailClosed`;
+    row 9 `[l3=14] HbH(len=5) -> TCP, trimmed 21: shim=L4(102, 6) userspace=FailClosed`
+    — row 9 fires ONLY at a non-zero l3, which is what makes the sweep
+    load-bearing rather than decorative. Row 10's `permissive=ok` is the
+    `shim_is_not_more_permissive` column correctly declining to fire on a
+    mutation that makes the shim MORE restrictive (`OverLimit` where this crate
+    resolves `L4(424, 6)`) — the column discriminates rather than co-signing.
+  - **Validation, the harness's own controls** — the M-6 property proved
+    end-to-end on a throwaway copy with BOTH negative-control tests deleted:
+    cargo exits 0, all three guard columns report `ok`, and the OLD harness
+    scored that as PASS. This one prints `ok ok ok MISSING MISSING`, names both
+    absent tests, and exits 3.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, _Log.md
+
+## 2026-08-01 — #4555 round 4: execute the shim's walk instead of emitting three scalars
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Both reviewers returned MERGE-NEEDS-MAJOR on the same finding,
+  and it is a regression I introduced in round 3. Deleting the source
+  model removed coverage the three emitted facts do not replace. Four
+  edits to the shim's walk left every parity test green: the generic
+  advance changed to `* 16`, the AH advance to `* 8`, a statement added
+  inside the loop but outside the `match` (leak #3 verbatim, which round
+  3 had deliberately closed), and — worst — DELETING the generic arm's
+  post-advance bounds revalidation. None of them touches `MAX_EXT_HDRS`,
+  `FragHdr` or `eh_class`, so the emitted facts are byte-identical and
+  only the #4977 freshness hashes move. Worse, that red's message says
+  the object may be stale and to run `make generate`; following it
+  regenerates the same facts and ships the divergence — a gate silent
+  BEHIND a red whose stated remedy ships the defect, the same shape I had
+  just found in my own empty-diff message one level up.
+
+  Fixed by making the walk OBSERVABLE rather than described. Extracted it
+  into `userspace-xdp/src/ipv6_ext_walk.rs`, a module depending only on
+  `core` (no aya, no map, no std), which the shim calls and which
+  userspace-dp's parity test `#[path]`-includes and compiles for the
+  HOST. The test then runs the shim's actual code alongside
+  `walk_ipv6_ext_chain` over a corpus of real chains — lengths across the
+  7/8 boundary, declared lengths 0/1/2/5/15, AH and Fragment arms,
+  truncated buffers where a declared length overruns the packet, chains
+  whose offset passes 200 mid-walk, and all 256 next-header values as the
+  first header. Advance arithmetic, bounds revalidation and resolvable
+  chain length stop being claims about source text and become compared
+  outcomes.
+
+  The extraction is codegen-neutral: 947,188 processed insns and 5.28%
+  headroom, identical before and after, so `#[inline(always)]` folds it
+  exactly as the inline loop did.
+
+  Also deleted `shim_walk_exits_by_exhaustion`, the last source-text
+  check. Its justification was that exhaustion semantics are "a shape,
+  not a value" and therefore unemittable — true, but executing the walk
+  dissolves the problem: the corpus measures resolvable chain length on
+  both sides. And corrected the overclaims in `pkg/dataplane/README.md`
+  and the test header that said there was "nothing left to defeat",
+  which the four mutations falsify.
+
+  The emitted facts are KEPT, for the one thing they are uniquely good
+  at: travelling with the artifact, so a consumer of a prebuilt object
+  (the Debian packaging path never compiles the shim crate) can check the
+  walk's constants without a Rust toolchain.
+
+  Two harness failures of my own along the way, both worth recording. The
+  negative control asserted the shim resolves one DestOpt at offset 48,
+  which the `* 8` → `* 16` mutation changes to 56 — so it went red
+  alongside the corpus and co-signed instead of controlling. Its
+  shim-side expectations are now restricted to cases that execute NO arm
+  body at all (a chain with no extension headers, a buffer too short for
+  the fixed header). And an acceptance run killed mid-mutation left the
+  tree mutated; the next run captured that as its "pristine" baseline and
+  reported the clean tree as failing. The harness now takes an exclusive
+  lock, restores on EXIT/INT/TERM via trap, and aborts unless a GREEN
+  baseline self-check passes before it mutates anything.
+
+  Validation: `make generate` verifier PASS at 947,188 insns / 5.28%.
+  Acceptance matrix — `cargo build --release` exit 0 in every row, so
+  every red is an assertion: all four mutations red the corpus with
+  concrete divergences (`shim=L4(56,6) userspace=L4(48,6)`;
+  `shim=L4(88,6) userspace=FailClosed`; `shim=OverLimit
+  userspace=L4(424,6)`; `shim=L4(56,6) userspace=L4(48,6)`), both
+  negative controls green in all six rows. Mutation 2 run IN ISOLATION
+  with `MAX_EXT_HDRS`/`FragHdr`/`eh_class`/both advances grep-verified
+  untouched: build exit 0, only the corpus fails, and the shim resolves
+  an L4 offset OUTSIDE the buffer where userspace fails closed.
+- **File(s)**: userspace-xdp/src/ipv6_ext_walk.rs (new),
+  userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/README.md, pkg/dataplane/userspace_xdp_manifest.json,
+  pkg/dataplane/userspace_xdp_bpfel.o, _Log.md
+
+## 2026-08-01 — #4555: teach the freshness diff about emitted-fact drift
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Self-check on the tautology risk in the new facts pipeline —
+  can the manifest's `shim_facts` drift from the object without any test
+  failing? Probed it rather than reasoning about it.
+
+  It IS caught: `TestUserspaceXDPShimObjectMatchesSourceManifest` compares
+  the committed manifest byte-for-byte against one recomputed from the
+  working tree, and `ComputeUserspaceXDPManifest` now reads the facts
+  from the OBJECT. So a hand-edited or corrupted `shim_facts` block fails
+  even when the object hash and every input hash still match. That closes
+  the case the parity guard's own B4 row does not cover — B4 tests a
+  MISSING block, not a FALSIFIED one.
+
+  But the failure MESSAGE was wrong, and that is a gap I introduced by
+  adding a manifest field without teaching the diff builder about it: the
+  operator got the generic "the object may be STALE, run `make generate`"
+  preamble followed by an EMPTY diff, because the builder only knew how to
+  report object-hash and input-hash drift. Neither had moved. A gate that
+  fires but misdiagnoses the cause and shows nothing is barely better than
+  one that does not fire.
+
+  Added `reportFactDrift`, which names only the fields that actually
+  moved — and for the class table names the changed next-header numbers
+  rather than dumping both 512-character hex strings, which in the first
+  attempt buried a one-field difference between two walls of identical
+  hex. A falsified block now reports e.g. `max_ext_hdrs: manifest 6,
+  object 7` and `eh_classes: next-header 44: manifest class 1, object
+  class 3; next-header 135: manifest class 0, object class 1`.
+
+  Test-only change; no production behaviour touched. Verified by
+  falsifying `max_ext_hdrs` and two class bytes in the committed manifest
+  (object and inputs untouched) and reading the resulting message, then
+  restoring and confirming green. Go build, vet and full `go test ./...`
+  clean.
+- **File(s)**: pkg/dataplane/userspace_xdp_manifest_test.go, _Log.md
+
+## 2026-08-01 — #4555 round 3: stop modelling the shim, have it EMIT its facts
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Round-3 review returned three MAJORs. All three converge on
+  one answer, and the answer is to invert the dependency rather than
+  refine the model a sixth time.
+
+  **MAJOR 1 — the FIFTH leak, to the most innocuous edit yet.** The
+  round-2 struct-layout resolver split fields on commas and skipped any
+  fragment starting with `//`, so a COMMENT above a field hid the field
+  with it: `identification: u32,` / `// Reserved...` / `pad: u8,` makes
+  the packed FragHdr nine bytes and the resolver returned 8. Reproduced
+  firsthand: both guard and control reported ok.
+
+  **MAJOR 2 — the override collapsed into ordinary success.** An
+  overridden run returned exit 0, identical to a measured PASS, and the
+  recipe's `0) ;;` arm installed it silently. The stale-variable note was
+  stderr-only, so exit 5 worked right up until someone had the variable
+  exported.
+
+  **MAJOR 3 — the const assert never runs on the packaging path.**
+  `debian/rules` runs `make build`, and the daemon embeds the tracked
+  object via `//go:embed`; the shim crate is never compiled, so a
+  compile-time assertion is a generation-time check, not a guard on the
+  shipped artifact.
+
+  The guard had now leaked five times — substring on arithmetic, a
+  statement outside the match, a symbolic `size_of`, and a comment —
+  each to a more ordinary edit. Every fix was a better model, and a
+  better model is still a model. So `userspace-xdp` now EMITS its
+  resolved facts: `XPF_SHIM_FACTS`, a `#[used]` static whose fields
+  rustc const-evaluates from the real types and the real classifier
+  (`MAX_EXT_HDRS`, `size_of::<FragHdr>()`, and a 256-entry class table
+  produced by the same `eh_class` const fn the walk now dispatches on).
+  `make generate` reads it back out of the object with `debug/elf`
+  (`ReadShimFactsFromObject`) into the manifest's `shim_facts` block, and
+  the parity test compares userspace's MEASURED behaviour against those
+  numbers. Deleted with the model: the arm-body literals, the token
+  normaliser, the match-arm splitter, the loop-body pin and
+  `resolve_packed_struct_size`.
+
+  Two things were measured before committing to the design, not assumed.
+  The emitted static survives bpf-linker into its own
+  `.rodata.XPF_SHIM_FACTS` section and is readable from Go; and driving
+  the walk from `eh_class` costs ZERO verifier budget — 947,188 insns
+  before and after, headroom 5.28% unchanged. That is what made this a
+  small change rather than one worth splitting into its own PR.
+
+  MAJOR 3 dissolves: the facts travel with the artifact, so a consumer of
+  a prebuilt object checks the numbers the generator measured. MAJOR 2:
+  an overridden run now exits 6, never 0, with its own recipe arm — the
+  distinction is machine-readable without parsing stderr.
+
+  **Residual, stated rather than papered over:** the walk's exit
+  semantics (exhaustion straight into `parse_l4`, no post-loop over-limit
+  check) is a shape, not a value. Any number the shim exported for it
+  would be an assertion about its own semantics rather than a
+  measurement, which is the modelling being removed.
+  `shim_walk_exits_by_exhaustion` keeps a narrow source check for that
+  one property and says so.
+
+  Validation: `make generate` PASS, headroom 5.28%. Nine-row matrix in
+  three parts — end-to-end (mutate shim, regenerate, guard reds on real
+  emitted facts), fact-comparison (perturb one emitted value in the
+  manifest; each of max_ext_hdrs / frag_hdr_size / one class byte /
+  a missing shim_facts block reds), and a FragHdr layout row which is
+  refused by the VERIFIER gate before it can be installed (its changed
+  arithmetic blows the 1M cap). Control green in all rows.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/userspace_xdp_facts.go,
+  pkg/dataplane/userspace_xdp_manifest.go, cmd/shimverify/main.go,
+  pkg/dataplane/build-userspace-xdp.sh, pkg/dataplane/README.md,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  pkg/dataplane/userspace_xdp_bpfel.o, _Log.md
+
+## 2026-08-01 — #4555 round 2: two Codex MAJORs (symbolic-size hole, fail-open headroom gate)
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Round-2 hostile review returned MERGE-NEEDS-MAJOR with two
+  findings, both proven by execution. Both are real; I reproduced each
+  firsthand before fixing.
+
+  **MAJOR 1 — a THIRD hole in the parity guard, surviving the round-1
+  equality pinning.** The shim's Fragment arm advances by
+  `mem::size_of::<FragHdr>()`. Round 1 pinned arm bodies by token
+  equality, which pins that expression's TEXT but not its VALUE. Adding
+  one byte to `FragHdr` makes the shim advance 9 where userspace
+  advances a literal 8, corrupting every L4 offset in a fragmented IPv6
+  chain — and every pinned literal stays byte-identical. Reproduced:
+  with `pad: u8` added, both the guard and the negative control passed
+  `ok`. This is the same class already closed twice (pin the value, not
+  the text), one level further down.
+
+  Fixed at two layers. In the shim, `const _: () = assert!(size_of::
+  <FragHdr>() == 8)` — the invariant belongs in the crate that owns the
+  type, and it fails the BUILD with an assertion message, not a generic
+  compile error. In the guard, `resolve_packed_struct_size` models the
+  struct's layout (requires `#[repr(C, packed)]`, sums field widths,
+  panics on any unmodelled field type rather than guessing) and the test
+  compares the RESOLVED advance against userspace's advance measured by
+  probe. Both layers fire independently on the mutation.
+
+  Search scope for the same shape: the three pinned arm bodies are the
+  only place a symbolic value can hide, and `FragHdr` is the only
+  `size_of::<..>()` among them. The generic and AH arms use literal
+  arithmetic, which token equality does pin. The resolver is written
+  generically (`size_of_type_in`) so a symbolic size introduced
+  elsewhere resolves too.
+
+  **MAJOR 2 — the headroom gate false-passed exactly when headroom was
+  unknown.** Round 1 made an unparseable stats line WARN and pass, on
+  the reasoning that "cannot measure" is not "at the wall" and blocking
+  over a kernel log-format difference guards nothing. That reasoning
+  does not survive the tripwire's purpose: the thing it exists to
+  prevent is the shim sitting at 0.92% because nothing was watching, and
+  a gate that switches itself off when the format changes reproduces
+  that failure mode — silently, and a WARN is invisible in an automated
+  build. Unmeasurable is now a refusal, `shimverify` exit 5, with its
+  own recipe arm and remediation text. Took a DISTINCT exit code from
+  the below-floor case (4) because the two need different remediation,
+  under the SAME `XPF_SHIM_ALLOW_LOW_HEADROOM=1` override so a genuine
+  kernel difference is one documented env var from unblocking.
+
+  Also hardened the override itself, which is read from the ambient
+  environment: consuming it now prints a loud banner naming the object
+  and which condition it suppressed, and a run that did NOT need it but
+  has it set prints a staleness note telling the operator to unset it.
+  Requiring it per-invocation is not implementable at the script level —
+  bash cannot distinguish an ambient export from a command-local prefix
+  — so surfacing staleness on the healthy path is the practical
+  equivalent, and it is the only place a stale export is visible.
+
+  Validation: `make generate` PASS, `processed 947188 insns (limit
+  1000000), headroom 5.28%`; the object is BIT-IDENTICAL again (a const
+  assertion emits no code), so the previously banked cluster smoke still
+  covers the shipped bytes. Full 9-row mutation matrix re-run against
+  the round-2 guard — every one of the 7 mutations reds it, the negative
+  control stays green in all 9 rows, no regression in the rows round 2
+  did not touch. Exit-5 path proven by making the stats regex
+  unmatchable (the exact "log format changed" condition): exit 5 without
+  the override, exit 0 with it plus the OVERRIDDEN banner, exit 0 after
+  restore.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  cmd/shimverify/main.go, pkg/dataplane/build-userspace-xdp.sh,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/README.md, pkg/dataplane/userspace_xdp_manifest.json,
+  _Log.md
+
+## 2026-08-01 — #4555 review fold: guard scope, headroom tripwire, two doc corrections
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no MAJOR; the
+  parity reasoning was independently reproduced. Four folds.
+
+  **M-1 (the real one) — the parity guard was scoped narrower than its
+  claim.** The shim side is a source MODEL, never executed, and each arm
+  was classified by a SUBSTRING of its body (`contains("+ 1) * 8")`), so
+  anything else in the body was invisible. The reviewer demonstrated two
+  mutations that passed GREEN: adding `+ 8` to the generic advance, and
+  prepending `if opt[1] == 0 { break; }` to the generic arm. The second
+  is the sharp one — `HdrExtLen == 0` IS the ordinary 8-byte
+  HbH/DestOpt, so that edit destroys parity for essentially every real
+  chain while the guard reports ok. Replaced the substring classifier
+  with whitespace-normalised token EQUALITY against pinned arm-body
+  literals. The normaliser tokenises (identifier runs vs single
+  punctuation chars) so rustfmt reflow is invisible, and drops a
+  trailing comma before a closing delimiter, which rustfmt emits only in
+  the multi-line form — without that the pins would be hostage to
+  reflow.
+
+  Closed the SIBLING hole the same mutations imply: pinning arm bodies
+  still left a statement placed inside the loop but OUTSIDE the `match`
+  entirely invisible (`if offset > 200 { break; }` would cut the
+  resolvable chain length with every arm still matching). The loop body
+  must now contain the match block and nothing else.
+
+  Also made the negative control a REAL control. It previously called
+  `shim_walk_model` too, so it went red alongside the guard on any
+  mutation that made an arm unparseable — co-signing, not controlling.
+  It is now shim-source-free: it exercises only this crate's walker and
+  the probe harness. Its shim-side assertions were redundant anyway, the
+  guard's 256-value comparison subsumes them. With that change the
+  control stays green under all six mutations.
+
+  **M-4 — no durability gate on verifier headroom.** Every gate added
+  after #1864 is BINARY, which is exactly how master reached 0.92%
+  headroom with everything green. Added `ShimVerifierStats` +
+  `VerifyUserspaceShimObjectStats` (loads with `LogLevelStats`, parses
+  `processed N insns (limit M)`), a committed floor
+  `UserspaceShimMinVerifierHeadroomPct = 3.0`, and a `shimverify` exit
+  code 4 for "loads but below the floor". Chose a HARD FAIL with an
+  `XPF_SHIM_ALLOW_LOW_HEADROOM=1` override, mirroring the existing
+  `XPF_SHIM_ALLOW_UNPINNED_INSTALL` precedent in the same recipe — the
+  failure mode being guarded is a dead dataplane, so default-closed is
+  right. An unparseable stats line WARNS and passes: that means "cannot
+  measure", and blocking builds over a kernel log-format difference
+  guards nothing. Existing signatures kept, so the runtime deploy
+  pre-flight (`VerifyEmbeddedUserspaceShim`) and the root-gated tests
+  are untouched. Threading the override through `sudo` explicitly was
+  necessary — sudo scrubs the environment, so the documented escape
+  hatch would otherwise have been a silent no-op.
+
+  **M-2 — the doc understated the blast radius.** `parsed.protocol` is
+  not only a session-key ingredient: it drives PRE-SESSION dispatch that
+  terminates in the shim (ESP and non-native GRE to `cpumap_or_pass`, WG
+  steering, ICMPv6 NDP 133-137 to `pass_local_control`). Verified all
+  four sites firsthand, plus the userspace `meta.protocol` consumers
+  (NAT64 translation and L4 checksum recomputation in `frame/mod.rs`).
+  So widening the type set re-routes packets between the XSK and kernel
+  paths: `IPv6 → Mobility → ESP` reached userspace over XSK before and
+  now goes to the kernel — the correct direction (userspace-dp
+  classifies it as ESP too, and `DestOpt → ESP` already behaved that
+  way), but a wider change than "session key parity" and the reason this
+  wants a cluster smoke.
+
+  **M-3 — an incorrect safety claim.** "Getting it wrong in either
+  direction is fail-closed" was wrong: only shim-BELOW-userspace is. At
+  bound 8 the shim would stamp a full 5-tuple and `l4_offset` for a
+  chain userspace refuses with `OverLimit` and hand that meta to
+  consumers that trust it. Corrected in the constant's doc comment and
+  in the README, stating the two directions separately.
+
+  Validation: `make generate` PASS, now reporting `processed 947188
+  insns (limit 1000000), headroom 5.28%`; the object is BIT-IDENTICAL to
+  the pre-fold one (the shim change was doc-comment-only). The headroom
+  gate was proven to FIRE — with the floor temporarily raised to 6.0 the
+  same object exits 4, and `XPF_SHIM_ALLOW_LOW_HEADROOM=1` returns it to
+  exit 0 with a warning. Six-mutation matrix: all six red the guard
+  (previously two passed green), all six leave the control green.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-xdp/src/lib.rs, pkg/dataplane/verify_userspace_shim.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/build-userspace-xdp.sh, cmd/shimverify/main.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-01 — #4555 IPv6 extension-header walk parity: shim vs userspace
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity)
+- **Action**: Closed the #4555 divergence between the AF_XDP shim's
+  `parse_ipv6` extension-header walk and userspace-dp's
+  `walk_ipv6_ext_chain`. The issue proposed bumping the shim's
+  `MAX_EXT_HDRS` 6 -> 8 to numerically match `MAX_IPV6_EXT_HEADERS`.
+  Both halves of that turned out to be wrong, and the kernel verifier
+  settled it.
+
+  (1) 8 does not load. `make generate` REJECTED the candidate at
+  `BPF program is too large. Processed 1000001 insn (limit 1000000)` —
+  the #1864 failure mode. The gate fail-closed correctly and left the
+  tracked `.o` untouched. A bisect over (bound x type-set) with a
+  throwaway `LogLevelStats` probe measured every cell: bound 6 narrow
+  990,796 PASS (master — under 1% headroom); bound 6 wide 874,873 PASS;
+  bound 7 narrow REJECT; bound 7 wide 947,188 PASS; bound 8 either
+  REJECT. Two findings: 8 is unreachable, and the bound is COUPLED to
+  the type set — widening the generic arm to the full #4517 set prunes
+  more verifier state than its five extra compares cost, which is the
+  only reason bound 7 is affordable.
+
+  (2) Numeric equality was the wrong parity condition anyway. The two
+  bounds are ITERATION counts over loops that exit differently: the shim
+  spends one iteration per extension header and exits by EXHAUSTION
+  carrying the last declared next-header straight into `parse_l4` (there
+  is no post-loop over-limit check), so it resolves up to `MAX_EXT_HDRS`
+  headers; `walk_ipv6_ext_chain` needs one FURTHER iteration to return
+  the terminal and folds exhaustion into the fail-closed `OverLimit`
+  verdict, so it resolves up to `MAX_IPV6_EXT_HEADERS - 1`. The real
+  parity point is therefore `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
+  = 7, and the real gap was a chain of EXACTLY 7 headers (not "7+" — at
+  8+ both sides already refused). Setting 8 would have made the shim
+  resolve chains userspace fails closed on.
+
+  Shipped: `MAX_EXT_HDRS` 6 -> 7 and the #4517 generic types
+  (135 Mobility / 139 HIP / 140 Shim6 / 253-254 experimental) added to
+  the shim's generic length-prefixed arm, matching the set #4517 gave
+  the userspace walkers. Net verifier effect is an IMPROVEMENT: headroom
+  goes from 0.92% to 5.3% while the parity gap closes. Regenerated
+  `userspace_xdp_bpfel.o` + `userspace_xdp_manifest.json` through the
+  verifier-gated `make generate` (PASS). The pre-change baseline
+  regenerate reproduced the tracked object bit-identically, so the
+  object diff is attributable to this change alone.
+
+  Guard: `tests_shim_ext_parity.rs` parses the shim's walk out of its
+  source text (bound, arm patterns resolved through the `NEXTHDR_*`
+  consts, arm bodies classified by their advance arithmetic) and compares
+  it against the userspace walker derived BEHAVIOURALLY — resolvable
+  chain length measured by walking real chains, and all 256 next-header
+  values classified by probe packet — rather than a second text parse. It
+  asserts resolvable-chain-length equality, the `- 1` relation, and
+  full type-set agreement, plus the structural property the derivation
+  rests on (no post-loop over-limit check between the walk and
+  `parse_l4`). It fails LOUDLY, never skips, on an unreadable or
+  unrecognised shim source.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json, pkg/dataplane/README.md,
+  _Log.md
+## 2026-08-06 — #6902 round 5: the neutrality contract was guarded in one direction
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold two findings from the hostile review leg, plus a precision
+  correction to the round-4 comment. Test-file-only; production warning strings
+  still byte-identical to round 1, `cmp`-verified after every cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**ADD-1 — the reverse direction had NO guard.** The contract at
+`compiler_validate_vrf_overlap.go:58-59` is symmetric: the text "must not promise
+a fix, nor rule one out". All 31 blocklist entries were forward-looking, so
+appending `". #2387 is closed wontfix; this is by design and permanent"` passed
+the whole suite while foreclosing an outcome that is still the maintainer's to
+decide. That is the more dangerous half: an operator who reads "by design" stops
+treating an overlapping-VRF topology as a hazard to revisit.
+
+Added `vrfOverlapForeclosingTokens` and widened the test to scan both groups.
+Adding a DIRECTION is not the same act as growing a list — one covers an axis
+with zero coverage, the other chases an infinite tail — and the comment now says
+so, so the two do not get confused later.
+
+**ADD-2 — helper doc.** Already folded in round 4: `vrf2387Warnings` now
+documents that it selects on the diagnosis phrase, deliberately not on `#2387`.
+
+**Correction to round 4's own comment.** It said the control defends against
+"wholesale" deletion being caught elsewhere; the reviewer's framing is sharper
+and the round-4 text was imprecise in the other direction — it asserted the gut
+"reds only this test", which is false. Measured below: the gut also reds
+`TestVRFOverlapWarnsOnOverlappingRIs`, because that gut drops "NOT
+session-isolated". The cell where the control is the ONLY red in the file is the
+discriminator-clause strip. The comment now states exactly that.
+
+| Mutation | subs | Promise | Substance | 6 pre-existing |
+|---|---|---|---|---|
+| baseline | 0 | GREEN | GREEN | ALL GREEN |
+| APPEND foreclosing (wontfix/by design/permanent) | 2 | RED `wontfix` | GREEN | ALL GREEN |
+| SPLICE foreclosing BEFORE the tail | 2 | RED `by design` | GREEN | ALL GREEN |
+| SPLICE forward-looking BEFORE the tail | 2 | RED `planned` | GREEN | ALL GREEN |
+| APPEND the disclosed-escape wording | 2 | RED (suffix) | GREEN | ALL GREEN |
+| SPLICE the disclosed-escape wording before the tail | 2 | GREEN | GREEN | ALL GREEN |
+| GUT to a bare issue reference | 2 | GREEN | RED | 1 RED |
+| WHOLESALE delete the advisory | 2 | RED (helper) | RED (helper) | 2 RED |
+| literal FULL revert of both arms to master | 2 | RED `until` | RED | ALL GREEN |
+| strip every `#2387`, diagnosis intact | 4 | RED (suffix) | GREEN | ALL GREEN |
+| round-4 cells R4a-R4e, re-run | 2 ea | unchanged | unchanged | ALL GREEN |
+
+The two mid-message SPLICE cells are what prove each blocklist load-bearing in
+the span the suffix pin cannot reach; both fire naming a token from the intended
+group. Negative control for the prescribed addition: with
+`vrfOverlapForeclosingTokens` emptied, the foreclosing splice goes GREEN — so the
+new group, not something incidental, is what catches it.
+
+Two rows are honest limits rather than wins. Splicing the disclosed-escape
+wording (`the VRF-aware session key fixes this`) BEFORE the tail leaves both
+tests GREEN — that is the blocklist incompleteness the test file already
+discloses, and the suffix pin only reaches the append form of it. And the
+`#2387`-strip cell now fires at the suffix assertion rather than at the old
+issue-reference check; the defect did not move and the round-3 filter change
+stays.
+
+## 2026-08-06 — #6902 round 4: the assertions bound VOCABULARY, not the CLAIM
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three test-contract findings plus two comment corrections.
+  Test-file-only — the production warning strings are byte-identical to rounds
+  1 through 3, verified with `cmp` against a pristine copy after every
+  mutation cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**F1a — the substance test was polarity-insensitive.** It asserted the bare
+noun `"cross-forward"`. Rewriting `may cross-forward` to `cannot cross-forward`
+inverts the diagnosis — the operator is told the topology IS session-isolated,
+so the hazard reads as a reassurance — and both tests stayed GREEN. Verified
+firsthand at HEAD 690dba2c8 before the fix. A bare noun cannot carry polarity;
+the assertions now hold the claim as contiguous spans: `"the session identity
+carries no routing-instance discriminator"` and `"colliding 5-tuples may
+cross-forward"` (subject + modality + verb).
+
+**F1b — the promise test was a token blocklist, and only a blocklist.**
+Appending `"A fix is guaranteed."` to both arms reintroduces an explicit promise
+that no listed spelling matches; both tests stayed GREEN. Growing the list is
+the trap the list itself documents, so the fix is structural: a new
+`vrfOverlapStatusTail` constant that both arms must END with, verbatim. One
+suffix comparison forbids appending, truncating, and rewording the tail at once.
+The blocklist is retained as the secondary layer and its doc now says what it
+still uniquely covers — a promise spliced into the span BEFORE the tail — and
+that it must not be grown.
+
+**F2 — the PR's own new sentence was unpinned.** The assertion checked only for
+the presence of any `#2387`, and the message carried a `(#2387)` before this PR.
+Deleting the entire new tail — `"See #2387 for the status of this limitation"` —
+left the earlier reference in place and both tests GREEN. The deliverable, going
+unbound. `vrfOverlapStatusTail` pins the sentence, not the reference.
+
+| Mutation (production warning strings) | subs | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|---|
+| baseline | 0 | GREEN | GREEN |
+| `may cross-forward` -> `cannot cross-forward` | 2 | RED | RED |
+| append `A fix is guaranteed.` | 2 | RED | GREEN |
+| delete the `See #2387 …limitation` tail, keep earlier `(#2387)` | 2 | RED | GREEN |
+| restore `until the session identity is VRF-aware` (tail only) | 2 | RED | GREEN |
+| strip the `no routing-instance discriminator` clause, keep tail | 2 | GREEN | RED |
+| wholesale-delete the advisory text (F3 probe) | 2 | RED (helper) | RED (helper) |
+
+Every cell reports the substitutions APPLIED before its result was read: a
+pattern that silently matches nothing is a no-op wearing a passing guard, and it
+bit this exact matrix once — the clause-strip regex matched only the unequal arm
+(1 of 2) because the word "session" falls on a different concatenation line in
+each arm. Both isolating cells fire on BOTH arms. Every RED is an assertion
+message, never a build break; production restored from a pristine copy and
+`cmp`-verified after each cell. The first three rows were re-run against the
+pre-fix test file and measured GREEN/GREEN, which is what makes them findings
+rather than hypotheses.
+
+**F3 — a false claim in the test's own comment, endorsed in my brief.** The
+comment said that without the substance control, the promise test "is satisfied
+just as well by deleting the warning text wholesale". It is not:
+`vrfOverlapBothFormStrings` requires the diagnosis selector to match, exactly one
+warning per fixture, and both arm markers, so wholesale deletion reds the promise
+test at the helper first. Measured — the F3 probe row above fails at
+`compiler_validate_vrf_overlap_2387_test.go:311`, the fixture-count assertion, in
+BOTH tests. The control's real value is against PARTIAL stripping: text that
+still passes the selector and still ends with the exact tail but has lost the
+cause, the consequence, or the pairing. The comment now says that.
+
+**F4 — two stale comments.** The `vrf2387Warnings` doc still said it "returns
+the compile warnings that mention #2387"; it has filtered on the diagnosis
+phrase since round 3 (deliberately — filtering on `#2387` made the tracking-issue
+assertion unreachable). And the arg-count claim corrected in the round-3 entry
+above.
+
+No production behaviour change: the warning fires on the same configurations,
+with the same severity, and still commits. No module doc needs updating — this
+round changes test assertions and comments only, and the operator-visible
+warning text is unchanged from round 1, whose doc updates already landed.
+
+## 2026-08-05 — #6902 round 3: the identity assertions bound PRESENCE, not ASSOCIATION
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold four re-gate findings. Test-file-only — production warning
+  strings byte-identical to rounds 1 and 2.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F3 — the finding worth the round.** Round 2 added per-form identity
+assertions, but as a LIST OF TOKENS. Presence and association are different
+properties and only the second is useful: every identifier stays in the string
+while attached to the WRONG object. Both format strings interleave the two
+instances' identifiers — the equal-prefix arm substitutes FIVE arguments (two
+name/origin pairs plus the single prefix they share), the unequal arm SIX (a
+full (name, origin, prefix) triple each) — precisely where a transposition
+happens, and `go vet` cannot see it, because every argument is a string or
+Stringer feeding %q/%s. (Round 4 correction: this paragraph originally called
+both arms "6-argument Sprintf calls carrying three (name, origin, prefix)
+triples", which is wrong on both counts for the equal-prefix arm.)
+
+Measured on the round-2 form: swapping the two origins, the two RI names, or the
+two prefixes each left `go test ./pkg/config/ -count=1` fully GREEN and
+`go vet ./pkg/config/` silent, while the operator was sent to the wrong
+interface or told the wrong prefix sits on the wrong instance — the same
+"told the hazard but not where" failure round 2 was written to prevent, one
+level down. Replaced with ORDERED PAIRINGS held as one contiguous substring. A
+strict replacement, not an addition: a strip breaks the pairing too.
+
+| Mutation (arg transposition in the Sprintf) | substance test |
+|---|---|
+| baseline | GREEN |
+| equal arm, origins swapped | RED |
+| equal arm, RI names swapped | RED |
+| unequal arm, origins swapped | RED |
+| unequal arm, prefixes swapped | RED |
+
+**F4 — an assertion that could not fail.** The `#2387` check was unreachable:
+the helper pre-filtered on the same substring, so every warning reaching it had
+already been selected for containing it. Dropping #2387 failed the fixture's
+COUNT assertion instead, with a message about the wrong thing. The helper now
+filters on the diagnosis phrase ("overlapping L3 across routing-instances"),
+which both arms carry and no other warning does. Verified: removing BOTH #2387
+occurrences from the unequal arm now fires the intended assertion with the
+intended message. (One occurrence is not enough — the tail carries a second.)
+
+**F2 — one of my unmeasured guesses was off-target.** Round 2 added six sibling
+tokens on top of four measured escapes. "work is under way" fires only on that
+exact four-word spelling and misses "underway" and "in progress" — the phrasing
+actually measured. "temporarily" was a good add ("temporary" is not a substring
+of it). Added the eleven still-escaping spellings the review measured, and kept
+"work is under way" with a comment recording it as the worked example of
+reaching for an imagined phrase instead of an observed one.
+
+**F5 — not folded, recorded here instead.** The round-1 COMMIT MESSAGE says "No
+runtime behaviour changes". The operator-facing warning TEXT changed, which is
+runtime output — it is the entire PR. The clause after the dash is right; only
+the headline overstates. The commit is pushed and rewriting it would move the
+PR head for a prose fix, so the correction lives here and in the PR body: the
+accurate statement is "no behaviour change beyond the warning text".
+
+**F6 — validation record was incomplete, not wrong.** Rounds 1-2 claimed only Go
+legs. `userspace-dp/tests/vrf_session_identity_doc_guard.rs` asserts on BOTH
+docs round 1 edited, including plan anchors on the very bullets it rewrote, and
+`make test` runs both legs (#4006). Ran it: `cargo test --test
+vrf_session_identity_doc_guard` -> ok, 2 passed, 0 failed. No defect; the record
+just never named the leg the diff put at risk.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; `cargo test --test vrf_session_identity_doc_guard` ok
+(2 passed); every restore verified byte-identical with `cmp`.
+
+## 2026-08-05 — #6902 round 2: the mutation recipe in the shipping comment was false
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three hostile-review findings. Test-only — the production
+  warning strings are byte-identical to round 1.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F1 — the recipe did not do what it said.** The header comment claimed that
+"restoring the old …until the session identity is VRF-aware wording" reds the
+promise test while the substance test stays GREEN. Reproduced firsthand: a
+LITERAL revert to the pre-PR string reds BOTH. The old string also lacked the
+"no routing-instance discriminator" clause, so reverting changes two things at
+once — re-adds the promise AND removes the diagnosis. The isolating mutation is
+a TAIL-ONLY substitution that keeps the discriminator clause; the comment now
+prescribes exactly that and warns not to read a both-red result as "the tests do
+not separate". Worth keeping: that the old text trips the substance test proves
+the replacement is strictly more informative than what it replaced.
+
+**F2 — the blocklist was a guess, and the review measured the escapes.** Four
+spellings reintroduced a promise while the test stayed GREEN: "not yet",
+"pending", "temporary", "in a later release". Added those plus siblings
+("temporarily", "for now", "interim", "to be addressed", "work is under way",
+"soon"), each re-verified RED after injection. The list comment now states
+plainly that a blocklist is incomplete by construction — green means "contains
+none of these", NOT "contains no promise" — and that any addition must be shown
+green before being listed.
+
+**F3 — the diagnosis was identified by nobody.** The substance test asserted
+only the explanatory prose, so the RI names, the config origins and the prefixes
+were all strippable with `pkg/config` fully green: an operator would be told a
+cross-forwarding hazard exists but not where. Added per-form identity
+assertions, including BOTH prefixes on the unequal-overlap arm — printing only
+one loses the overlap that arm exists to report.
+
+Mutation matrix, each dimension binding independently:
+
+| Mutation | promise test | substance test |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| tail-only promise restore (the isolating one) | RED | GREEN |
+| blank the RI name, equal-prefix arm | GREEN | RED |
+| duplicate the prefix, unequal-overlap arm | GREEN | RED |
+| literal full revert | RED | RED (expected — two changes) |
+
+Each of the four F2 escapes verified RED after being listed. All arg-count-
+preserving mutations, so every red is an assertion and not a build break.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; restores verified byte-identical with `cmp`.
+
+## 2026-08-05 — #2387 A.1: the warning promised an outcome #2387 has not decided
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording)
+- **Action**: Reword the `validateVRFOverlap` commit warning so it states the
+  CURRENT limitation and points at #2387, instead of promising that the session
+  identity becomes VRF-aware. Add two tests that keep forward-looking wording
+  out of both format strings without letting the diagnostic be gutted.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `pkg/config/compiler_tailgates.go`,
+  `docs/research/2387-vrf-flow-identity/plan.md`,
+  `userspace-dp/src/afxdp/forwarding/README.md`
+
+The shipped text said colliding 5-tuples may cross-forward "until the session
+identity is VRF-aware". #2387 is held on a maintainer risk-appetite call and
+neither candidate end-state — the hard-reject posture, or the VRF-aware session
+key (Track B) — is decided, so that clause asserted an outcome that may never
+arrive. It was also circular: the #2387 plan cited the warning text back as
+evidence that the widening was already settled, while the warning had been
+written from the plan's assumption. Both sides are now decoupled; the plan
+bullet that leaned on the warning records that the argument is retired and is
+evidence for neither branch.
+
+Mutation proof (a guard is worthless until watched to fail), 2x2, orthogonal:
+
+| Mutation | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| restore "until…VRF-aware" in both format strings | RED (both arms) | GREEN |
+| strip diagnostic substance, keep no-promise wording | GREEN | RED |
+
+The second row is the negative control: without it, the no-promise test is
+satisfied just as well by deleting the warning text wholesale. The fixture
+helper asserts each arm was actually reached (`both carry` vs `carry
+overlapping L3`) before asserting on it — a single fixture binds one match arm,
+so a "both format strings" claim made from one fixture would be vacuous.
+
+A first mutation attempt was a no-op: the substitution anchored on the wrong
+tab depth, matched nothing, and the suite stayed green — which is
+indistinguishable from a passing guard. Counting the applied substitutions
+before reading the result is what caught it.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.9s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean on all three Go files; post-mutation restore verified
+byte-identical with `cmp`.
+## 2026-08-06 — #6864 round 2: ParentIndex is not a VLAN parent for every link kind
+
+- **Timestamp**: 2026-08-06 (fix/5275-arm-failclosed, PR #6864)
+- **Action**: Close a reproducible false-`SKIPPED`/false-`DELEGATED` path in
+  `coverDelegated` — the observe-only proof read `LinkAttrs.ParentIndex` as a
+  VLAN delegation without proving the child was an 802.1Q device.
+- **File(s)**: `pkg/dataplane/armproof.go`,
+  `pkg/dataplane/armproof_5275_test.go`, `pkg/dataplane/README.md`
+
+**The defect inverted the fix's value.** Round 1 turned an OVER-count into a
+correct count. This path turned it into an UNDER-count, which silently hides a
+real uncovered surface — strictly worse than what it replaced. An over-count
+inflates a baseline an operator can see; an under-count reports a live
+forwarding interface with no shim on it as covered.
+
+**Mechanism, in three links.** `ensureVLANSubInterface` (`compiler_iface.go`)
+blindly adopts ANY existing device named `<phys>.<vid>` — no check of link
+kind, VLAN ID, configured parent, or namespace. That ifindex is then recorded
+as a delegated VLAN child, and the userspace attach loop SKIPS it
+(`compiler.go`, `genericXDPIfindexes && !tunnelIfindexes`), so it never gets a
+shim. `coverDelegated` then read `lnk.Attrs().ParentIndex` and treated it as a
+VLAN-parent relationship — but vishvananda/netlink folds `IFLA_LINK` into
+`ParentIndex` in the COMMON attribute loop, for every link kind, and what
+`IFLA_LINK` means is per-kind. For a cross-namespace veth it is the FOREIGN
+peer's ifindex, which can numerically alias any local interface. The unmanaged
+sweep does not clean the squatter up either: it skips any name whose prefix
+before `.` is a managed interface.
+
+**Both covered-reading branches were affected**, so closing one would have left
+the other live: a parent that aliases a proven-down record promoted the child
+to `skipped`, and one that aliases a covered required surface promoted it to
+`delegated`. Neither is a hole in one arm — they are two arms of the same hole.
+
+**Fix.** `coverDelegated` now requires `lnk.Type() == vlanLinkKind` ("vlan")
+before reading `ParentIndex` at all; anything else reports `uncovered` with
+`Via` left ZERO, because naming a bogus parent in the record would repeat the
+same confusion in the operator's log. Scoped to the PROOF: the blind adoption
+in `ensureVLANSubInterface` is a real, pre-existing production defect but is
+outside #5275 PR1's observe-only scope and is filed separately.
+
+**Domain parity, verified firsthand in a network namespace** against this
+netlink version rather than inferred:
+
+| device | `Type()` | `ParentIndex` |
+|---|---|---|
+| genuine vlan `p0.100@p0` | `vlan` | real_dev |
+| cross-ns veth `p0.100@if6` | `veth` | PEER, in the FOREIGN namespace |
+| macvlan `r0.300@r0` | `macvlan` | lower device |
+| bond slave | `dummy` | 0 — bond membership is `IFLA_MASTER`/`MasterIndex` |
+
+Two limits are written into the code rather than assumed. A genuine vlan whose
+real_dev is moved to another namespace KEEPS its kind and its now-foreign
+`ParentIndex` — but the kernel forces it admin-DOWN, `LinkSetUp` fails
+`ENETDOWN`, and it cannot transmit, so it is not a live forwarding surface and
+the type check is sufficient. And the belt binds the KIND, not the CONFIGURED
+parent: an adopted vlan stacked on a different device delegates to that device,
+which stays honest (that parent's XDP really does see its tagged frames, and a
+down parent really does stop it). Binding the configured parent needs the
+compiler to record it per child — a `CompileResult` data-model change, not part
+of an observe-only phase.
+
+**Tests.** `TestArmProofNonVLANChildNeverInheritsItsParentIndex` is the
+fail-on-revert binding: 2 arms (proven-down parent, covered required parent) x
+2 real kinds (cross-namespace veth, macvlan) = 4 cells, each asserting
+`uncovered`, `Via == 0` and `WouldGate`. Deleting the production hunk reds all
+four with the assertion message, `go vet` exit 0 — an assertion failure, not a
+build break (`vlanLinkKind` simply becomes an unused const, which Go permits).
+`TestArmProofVLANKindIsTheDiscriminator` is the over-reach guard and negative
+control: the SAME fixture, same ifindexes, same aliasing, same unarmed record,
+varying ONLY the child's kind to a genuine vlan — both arms must still reach
+`skipped` and `delegated`. It stays GREEN under the revert, which is what
+separates it from a restatement of the fix; without it, "make every delegated
+child uncovered" would pass the red test while re-breaking every VLAN
+deployment round 1 fixed.
+
+**Validation.** `go build ./...` rc=0; `go vet ./pkg/dataplane/` rc=0;
+`go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` rc=0;
+`go test ./pkg/refactoraudit/ -count=1` rc=0. Under the revert exactly ONE test
+moves — the new one — while all five named guards
+(`TestArmProofVLANChildOfProvenDownParentIsSkipped`,
+`TestArmProofVLANChildOfUnprovenParentStaysUncovered`,
+`TestArmProofDelegateMustBeARequiredSurface`,
+`TestArmProofProvenDownRecordCoversOnlyItsOwnChild`) and the widened AST canary
+(`TestArmProofEverySurfaceDroppingBranchRecords`) stay green.
+
 ## 2026-08-05 — #6865 round 5: the sweep stopped at the package boundary
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
@@ -68442,6 +69448,47 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-01 16:55
+- **Action**: #6655 review fold round 6 — two guards I added in earlier rounds
+  assert a PROXY rather than the property their own message claims. (F1) The
+  corpus floor `assert!(cases.len() >= 200, "...every assertion in this file
+  passes vacuously on a short corpus...")` was a VACUITY floor wearing a
+  COVERAGE message: 256 of the 310 cases come from one `for p in 0..=255` loop,
+  which clears 200 by itself with 56 to spare, so the floor could not see all 54
+  hand-crafted boundary cases deleted. Measured firsthand on the untouched
+  round-5 file: corpus cut to that sweep AND the generic arm's post-advance
+  bounds revalidation deleted from `ipv6_ext_walk.rs` — the security property —
+  left all five tests `ok`, `cargo test` rc 0. Replaced with five floors, each
+  binding ONE named shape and each stating what it does NOT cover: the
+  hand-crafted block counted BEFORE the sweep (>= 40 of 54); per-arm
+  boundary-tight coverage (>= 2 each for GENERIC/AUTH/FRAGMENT, MEASURED as this
+  crate's walker failing closed rather than by re-deriving each arm's advance
+  target, which would re-model the walk this file exists to stop modelling);
+  the resolvable chain-length boundary straddled (>= 1 case resolving at offset
+  40 + 8*(MAX_IPV6_EXT_HEADERS-1) and >= 1 OverLimit); all 256 next-header
+  values present as a first header; and the L3 offsets. (F2)
+  `assert!(L3_OFFSETS.len() >= 3, ...)` asserted a proxy — `[0, 0, 0]` has
+  length 3 and restores exactly the l3-blindness the message described — split
+  into `any(|&o| o != 0)` (what makes the `l3_offset -> 0` revalidation-base
+  mutation observable) plus `contains(&0)` (the offset
+  `walk_ipv6_ext_chain`'s other callers pass). All five floors read only the
+  corpus bytes and this crate's walker, so no acceptance-matrix shim mutation
+  can move one; neither negative control calls `parity_corpus()`, so a floor red
+  leaves both CONTROL columns `ok` and the harness's attributability rule holds.
+  Proved by a 12-row mutation matrix: for each floor, a corpus edit that the OLD
+  floor scored GREEN and the NEW floor reds on, with `cargo build` + `cargo test
+  --no-run` rc 0 in every row (a build break would be a false red), the specific
+  assertion named with its message, `shim_ipv6_ext_walk_matches_userspace_walker`
+  and both controls staying `ok` (the guard is scoped, not blanket), and a
+  byte-exact sha256 restore after each. Docs: corrected the stale `run()`
+  contract comment in `test/mutation/shim-ext-parity-acceptance.sh` (it still
+  said "0 green, 1 red, 2 build failure" after `return 3` for a moved control was
+  added), and scoped `pkg/dataplane/README.md`'s "the corpus proves the walk
+  behaves identically" to the dimension the shim actually represents — the shim's
+  walk returns `(offset, protocol)` and no fragment state, which is #6704, open
+  and pinned rather than fixed.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, pkg/dataplane/README.md, _Log.md
 - **Timestamp**: 2026-08-01 09:15
 - **Action**: #6526 — a security-policy `match` leaf written with NO OPERAND
   satisfied the #3044 required-dimension gate and compiled to the
@@ -69210,6 +70257,317 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/management_authpublish_5561_test.go,
   pkg/daemon/management_5866_test.go, pkg/daemon/README.md, pkg/api/README.md,
   _Log.md
+
+## 2026-08-01 — #4555 round 7: the replacement corpus floors were themselves proxies
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Third layer of one defect. Round 5 had a single
+  `cases.len() >= 200` floor that 256 sweep cases cleared alone. Round 6
+  replaced it with five floors "each binding one shape". Three of the five
+  bound CORRELATES of their shape, and ONE corpus edit defeated all three
+  with all five still passing.
+
+  **Reproduced before fixing.** Applied the degenerate corpus (40 pre-sweep
+  filler entries, two 40-byte unreadable-header stubs per arm, one padded
+  `DestOpt(len=6)`, one eight-header chain, the sweep replaced by 256
+  seven-byte stubs, `L3_OFFSETS` untouched) TOGETHER with the shim's GENERIC
+  post-advance revalidation deleted: all five parity tests reported `ok`.
+  Each defeat also confirmed individually in the same run — a 40-byte packet
+  satisfies `b[6] == arm && fails_closed` while `raw_shim_walk` returns
+  `None` at the arm's INITIAL two-byte read; the two FRAGMENT cases the
+  "more than one magnitude" claim rested on are BYTE-IDENTICAL (both 47
+  bytes, `b[40] = TCP`, rest zero); `chain(&[(DEST, 6)], TCP, 0)` — ONE
+  header — resolves `L4(96, TCP)`, the same offset a seven-header chain
+  lands on; and 256 seven-byte buffers give `distinct == 256` with both
+  walkers rejecting before the fixed IPv6 header.
+
+  **M-1..3 — floors now bind by CONSTRUCTION and MEASUREMENT, not by a
+  count of predicate-satisfying cases.** A count has degenerate satisfiers;
+  a named buffer that must be present byte-for-byte, and must behave as
+  claimed, does not.
+
+  Floor 1 is a WITNESS PAIR per `ARM_BOUNDARIES` entry: the padded twin
+  (exactly `target` bytes) must resolve the terminal at exactly `target`,
+  which can only happen if the arm ran its advance and landed there — that
+  is what proves the boundary was REACHED — and the tight twin, one byte
+  shorter and otherwise identical, must fail closed, which attributes the
+  refusal to the length check rather than an earlier read. `FailClosed`
+  alone was the round-6 proxy: it loses WHICH read failed. The entry's
+  named arm is checked against `userspace_class(proto)`, so a witness
+  cannot report coverage of an arm it does not exercise. Per-arm counts
+  are over DISTINCT declared lengths and are DERIVED: an advance error
+  `f(l) + a*l + b` is invisible wherever `a*l + b == 0`, and an affine
+  expression vanishing at two distinct `l` is identically zero, so
+  GENERIC/AUTH need 2 distinct lengths; FRAGMENT's read and advance take no
+  declared length, so its error family is the constant `f + b` and one
+  witness excludes it. Counting distinct LENGTHS rather than cases is what
+  kills the byte-identical duplicate.
+
+  Floor 2 rebuilds the chains of exactly `MAX_IPV6_EXT_HEADERS - 1` and
+  `MAX_IPV6_EXT_HEADERS` minimum-size DestOpt headers and requires both by
+  byte identity, plus their measured verdicts — terminal offset is no
+  longer a stand-in for header COUNT. Floor 3 rebuilds the canonical
+  68-byte single-header case for each of the 256 next-header values,
+  requires each by byte identity, and requires each NOT to fail closed,
+  which is the direct statement that the walk got far enough to classify
+  the value. Floor 4 (new) requires the two `DestOpt(len=15)` chains the
+  statement-outside-the-match mutation needs. Floor 5 MEASURES the L3
+  offsets with `frame_l3_offset` on the prefixes `at_l3` builds, so
+  `[0, 14, 14]` — which satisfied round 6's `any(!= 0)` + `contains(0)` —
+  now reds.
+
+  Round 6's floor 1 (`handcrafted >= 40`) was DELETED rather than kept: 40
+  is not derivable from any property, and the identity floors subsume
+  "the block was not removed wholesale".
+
+  Every floor reads only the corpus bytes and this crate's walker, so a
+  floor red is always a corpus defect and never a shim finding — confirmed
+  by both CONTROL columns and the manifest-facts guard staying `ok` in
+  every RED row.
+
+  **M-4 — acceptance row 9 mutated GENERIC and AUTH together** but scored
+  RED on either arm reding, so it could not support the "both arms" claim
+  its label made: GENERIC alone could red while AUTH coverage had
+  degenerated. Split into per-arm rows 9 and 10 (12 mutation rows now).
+  Added property 5 to the harness header ("one mutation per row, and one
+  ARM per row"), and per-row accounting at the tail so quoted evidence is
+  checkable against the matrix rather than against a bare `PASS`.
+
+  **M-5 — the precondition compared the worktree against the INDEX.**
+  `git diff --quiet -- "$WALK"` while printing "differs from git HEAD": a
+  STAGED mutation passes, and the script's own abort text spells out the
+  consequence — it would be captured as GOLD and restored as pristine, so
+  the whole matrix runs against a poisoned baseline. Verified by staging a
+  mutation: the old check returned rc 0, `git diff --quiet HEAD --` returns
+  1. Fixed; it is the only git comparison in the file.
+
+  **MINORs.** `cmd/shimverify`'s decision is now a testable `decide(stats,
+  overridden) -> shimverifyDecision`, with every (stats, override)
+  combination pinned in `cmd/shimverify/main_test.go` including the exit-6
+  override-success arm; the pkg/dataplane test that CLAIMED to pin that
+  decision only re-asserted `Measured()` and `HeadroomPct()` and is now
+  scoped to the invariant it does carry (the floor must stay strictly
+  positive, or unmeasured stats read as acceptable in a caller that skips
+  `Measured()`). The recipe exit-code list gained `6)` and — found by a
+  scope-edge mutation while RED-proving it — is now matched as a case
+  PATTERN AT LINE START: `strings.Contains(recipe, "6)")` was satisfied by
+  `66)`, so renaming the arm left it green. The FragHdr compile-time
+  assertion is matched as a `const _: () = assert!(` item at line start
+  rather than a raw substring a comment satisfies. `main.go`'s claim that
+  an override is visible "in the manifest" was false — the manifest carries
+  the object hash, the shim facts and hashed inputs, and no override status
+  — and now says so. The negative control's claim that a plain packet
+  "never enters a `match` arm" was wrong: it enters the loop, classifies,
+  and takes the terminal catch-all; the added `if offset > 200` statement
+  runs there and is false, which is what makes it a control. README scoped
+  the "vacuous on an empty corpus" claim to the corpus-CONSUMING assertions.
+
+- **Validation**: per-floor RED matrix (6 corpus-only mutations, each
+  `cargo build` rc 0 + `cargo test --no-run` rc 0 in the red state, both
+  CONTROLs `ok`, manifest-facts guard `ok`): F1a distinct-length collapse,
+  F1b wrong-arm entry, F2 seven-header chain replaced by the same-offset
+  one-header proxy, F3 sweep replaced by unwalked stubs, F4 long chains
+  deleted, F5 `[0,14,18] -> [0,14,14]` — all RED, restore byte-exact.
+  Go RED proofs: `decide` returning 0 on unmeasured RED; floor 0.0 RED;
+  recipe arms `0)`, `5)`, `6)` renamed RED. `ipv6_ext_walk.rs` is
+  byte-identical to HEAD, so no `make generate` and the object hash is
+  unchanged. `cargo fmt --check` delta measured against a throwaway
+  detached worktree at the parent: 2501 -> 2498 hunks over the same 328
+  files, all three removed from `tests_shim_ext_parity.rs`, zero added
+  anywhere.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, cmd/shimverify/main.go,
+  cmd/shimverify/main_test.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-01 — #4555 round 8: the tested function was not the binary's decision
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate at e2a85e311 returned MERGE-NEEDS-MAJOR with two
+  HIGHs, four MEDIUMs and a LOW — every one in the verification apparatus, none
+  in the shipped walk. `userspace-xdp/src/ipv6_ext_walk.rs` is byte-identical to
+  e2a85e311, the tracked object and manifest are unchanged, no `make generate`.
+  All seven reproduced BEFORE being fixed; none failed to reproduce.
+  - **(H1) THE GATE'S GUARD COULD NOT FIRE ON THE GATE.** Round 7 extracted
+    `decide(stats, overridden)` and unit-tested every combination — and left
+    `main` calling it and then INDEPENDENTLY repeating both predicates
+    (`!stats.Measured()` at main.go:83, `headroom < floor` at :111) to choose its
+    branch AND its `os.Exit`. Reproduced end to end: with `if false {` at :111,
+    `go build` rc 0, `go vet` rc 0, `go test ./cmd/shimverify/` **ok**, and a
+    scratch build with a 990796/1000000 stub printed
+    `LOW-HEADROOM ... headroom 0.92%` and **exited 0** — which the recipe's
+    `0) ;;` arm installs. That is origin/master's pre-#4555 fail-open restored
+    underneath a green suite, with the status word on stdout even saying
+    LOW-HEADROOM. Fixed by making `decide` the sole decision: it now carries a
+    `refusal` discriminant, `run(argv, stdout, stderr, getenv, verify)` presents
+    the verdict and returns `decision.exit` on every path, and `main` is
+    `os.Exit(run(...))` and nothing else. `TestShimverifyRun` drives the real
+    control flow with all four process boundaries injected and asserts the exit
+    status plus the stdout status word for eleven arms;
+    `TestShimverifyRunNeverExitsZeroWithoutMeasuredHeadroom` states the property
+    the codes exist for.
+  - **(H2) THE SUBSTRING BUG WAS FIXED AT THE POINT FOUND, NOT ACROSS ITS
+    CLASS.** Round 7 anchored the recipe's `case` arms so `6)` no longer matches
+    `66)`, and left the two assertions beside it substring-matching the same
+    file. Reproduced: replacing build-userspace-xdp.sh:129 with
+    `true # sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=..." "${SHIMVERIFY}" ...`
+    left `TestBuildRecipeHandlesShimverifyExitCodes` PASSING while non-root
+    `make generate` skipped verification entirely and installed through `0)` —
+    the unverified-install path the script's header says does not exist. Search
+    scope, enumerated rather than eyeballed: every `strings.`/`regexp.`/`bytes.`
+    call in the file (11 sites, 4 of them matching source text: the arm parser,
+    the override mention, the sudo hop, the FragHdr assertion), plus every Go
+    file in the repo that reads `build-userspace-xdp.sh` (11 — the other 10 use
+    it as a path, not as text) and every `_test.go` that names a `.sh` (11 — the
+    other 8 are unrelated scripts). Fixed by routing every recipe match through
+    `shellCodeLines`, a comment-stripping filter with its own two-direction test,
+    and requiring the invocation at the START of a code line in BOTH branches of
+    `run_verifier` — the root branch had no assertion at all, so commenting IT
+    out was invisible to the fix the finding asked for.
+  - **(H3) THE DELETED COUNT FLOOR WAS NOT SUBSUMED.** Round 7 deleted
+    `handcrafted >= 40` arguing the identity floors subsume it. Reproduced:
+    floors 1-4 require ten boundary buffers, two chain-length twins and two long
+    chains — 14 cases — so deleting the ten varied-HbH cases and the ten
+    truncation cases takes the hand-written count 55 -> 35 with every floor
+    green. Not restored as a count (the threshold was arbitrary and a count has
+    degenerate satisfiers): floor 6 binds the BLOCKS, rebuilding each of the
+    eight named categories locally and requiring every member by byte identity,
+    so deleting a category names that category in the failure. Blocks floored:
+    chain lengths 0..=10, declared lengths 0/1/2/5/15 (alone and followed by
+    DestOpt), long chains, truncation, minimal per-arm, non-first fragments,
+    Fragment composition, AH sweep + Mobility. Deliberately NOT floored there:
+    the 256-value sweep (floor 3) and the boundary witness pairs (floor 1),
+    bound where they are constructed.
+  - **(M1) the "every reachable combination" claim omitted the exact-floor
+    case.** `<` vs `<=` was indistinguishable to every fixture. Added
+    970000/1000000, which is exactly 3.00% in IEEE-754, to both decision tests.
+  - **(M2) THE 256-VALUE FLOOR WAS CIRCULAR.** Both the corpus entries and the
+    floor's expectations came from `chain`. Reproduced by reasoning through the
+    named edit: making `chain` write TCP at byte 6 for every one-header input
+    collapses the corpus to one distinct next-header value, moves no verdict on
+    either walker, and leaves the floor reporting 256 present because it rebuilt
+    the same degenerate bytes. Broken by `expect_chain`, an independent
+    reconstruction used by floors 2, 3, 4 and 6 — which is also what makes the
+    256 values distinct, since 256 buffers differing at byte 6 are 256 different
+    buffers and each must be present byte for byte. A separate
+    `distinct(b[6]) == 256` assertion was written and then deleted: the bytes it
+    counts are the ones the floor's own loop just wrote, so it was `X == X`.
+  - **(M3) asserted-not-executed integrations beyond `parse_l2`.** Confirmed
+    empirically that the shim's entry points cannot be run here:
+    `cargo build --target x86_64-unknown-linux-gnu` on userspace-xdp fails with
+    "unwinding panics are not supported without std". So the comment now
+    enumerates all four — `parse_l2`'s offsets, `parse_ipv6`'s arguments to the
+    walk, `parse_l4`'s catch-all behind the OverLimit fold, and the
+    manifest-to-object relationship — instead of naming one, which read as a
+    claim the rest were covered.
+  - **(M4) the acceptance harness's baseline was still fail-open.** Reproduced
+    twice against the real precondition block: an archive with no `.git` printed
+    `UNVERIFIED` and ran every row against a `*8 -> *16` mutation captured as
+    GOLD; and `git update-index --assume-unchanged` flipped
+    `git diff --quiet HEAD` from rc 1 to rc 0 with the mutation on disk, so the
+    check printed "matches git HEAD (index included)" — a positive claim that
+    was false. Fixed by moving the verification BEFORE the capture (it was 138
+    lines after it), aborting instead of warning when git cannot answer, and
+    requiring an `ls-files -v` tag of `H`. The tree-cleanliness prose no longer
+    overclaims: exactly one path is compared against git, and the guard/control
+    files are covered behaviourally by rows 0 and 12.
+  - **(L1) the FragHdr checker accepted a comment.**
+    `const _: () = assert!(true); // mem::size_of::<FragHdr>() == 8` satisfied
+    it; line comments are now stripped by `rustCodeLine` first.
+  - **Also**: the tight boundary witnesses' `FailClosed` is now attributed —
+    the tight twin must be the padded twin minus exactly its last byte, asserted
+    before the verdict is read. The truncated-Fragment `None` and the short-stub
+    `FailClosed` controls gained positive companions (a complete 8-byte Fragment
+    header must resolve at 48; a buffer of exactly 40 bytes must resolve at 40)
+    so neither rests on a failure default. `compared == cases * offsets` was
+    tautological — the counter incremented inside the loops it claimed to
+    measure — and is replaced by a visited-set of `(l3, name)` pairs recorded
+    after each comparison, checked against the cross product built independently,
+    plus a distinct-names assertion so the set comparison cannot collapse two
+    cases into one.
+- **File(s)**: cmd/shimverify/main.go, cmd/shimverify/main_test.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  test/mutation/shim-ext-parity-acceptance.sh,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/README.md, _Log.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 — OBSERVE-ONLY dataplane arm-coverage proof. Computes
+  whether the dataplane is armed for the surfaces the config requires and
+  reports what a gating build would have decided; gates nothing. Records
+  native->generic fallback on the compile result so the skb-mode population is
+  measurable. Corrects the plan's §5/D1 native/generic binary to three-valued
+  coverage (direct / delegated / uncovered) — implemented as written it would
+  fail-close every VLAN deployment — and refreshes the appendix coordinates
+  re-verified at origin/master ad9591177.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go, pkg/dataplane/compiler.go, pkg/dataplane/loader.go, pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 reporting — report the coverage branch PER SURFACE
+  (SurfaceSummary, one compact token per interface in the single apply-time log
+  line) and report DidGate separately from WouldGate, so the divergence rate is
+  readable directly instead of inferred from the ABSENCE of an enforcement line
+  (an absence is indistinguishable from a proof that never ran).
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go
+
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 fold round 1 — seven findings from an independent
+  hostile gate at 65f5a588b. (F1) The attach mode is now read from the KERNEL
+  (`xdpLinkModeGeneric`, RTM_GETLINK, XDP_ATTACHED_SKB) instead of a per-compile
+  fallback record: the record was empty from compile #2 onward — every later
+  compile short-circuits on "already attached" while the link stays on skb-mode
+  — so the proof reported "went native" on exactly the iavf population it exists
+  to count. `CompileResult.fallbackGenericIfindexes` and its loader recording
+  are deleted. (F2) The three compiler soft skips (interface not found, VLAN
+  child create failed, administratively disabled) now record an
+  `UnarmedSurface`, reported as a distinct `skipped` branch — or as `uncovered`
+  when the disable's `LinkSetDown` failed and the netdev may still be UP,
+  zoned and forwarding with no XDP. `LogArmCoverage` now emits unconditionally
+  with a `ran` field, so "nothing to arm" and "the proof never ran" are
+  distinguishable. (F3) Tests now bind the Manager path — a second compile still
+  reports skb-mode — plus AST canaries on the `CompileUserspaceShim` call site
+  and the three recording sites. (F4) The `m.lastCompile` hoist is gone and link
+  resolution uses the non-memoising `peekLinkByIndex`, so "observe-only" is
+  literally true. (F5) Delegation now requires the parent to be a REQUIRED
+  surface that itself classified `direct`. (F6) The apply generation is folded
+  into the stage label, so the RETH deferred-MAC path's two compiles per apply
+  are distinguishable. (F7) Plan §10 gains a PR0 measurement phase and §5 states
+  this is the PRELIMINARY stage. (F8) The delegated token carries the delegate's
+  attach mode. Eleven mutations, each restored byte-for-byte with sha256
+  verification, all ASSERTION-RED with `go vet` exit 0.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/loader.go, pkg/dataplane/apply.go, pkg/dataplane/README.md,
+  docs/research/5275-arm-failclosed/plan.md
+- **Timestamp**: 2026-08-05
+  **Action**: #5275 PR1 fold round 2 — eight GREEN cells authored by the re-gate
+  at ed28086c8. (1, MAJOR) The compiler half of `StillForwarding` was bound by
+  nothing: setting it to `false`, or deleting the never-resolved-link leg, was
+  whole-suite GREEN. The judgement moved into a pure `disabledSurfaceRecord`
+  (linkErr, downErr -> proven-down or not), unit-tested across all four
+  combinations, and the WIRE is bound by an AST canary asserting both errors are
+  threaded as identifiers rather than `nil`. `linkDownFailed` is gone — the
+  netdev is proven down only when both errors are nil. (2) The call-site canary
+  was satisfied by four inert edits; it now asserts the statement is a
+  TOP-LEVEL element of the body, that the receiver is `m`, that the argument is
+  `result`, and that its index EXCEEDS the `attachUserspaceShimXDP` call's.
+  (3) A FOURTH surface-dropping soft skip existed — `if zone == nil { continue }`
+  in `programZoneMaps`, which drops every interface in a zone and is reachable on
+  the HA config-sync path — now recorded at zone level. The message allowlist is
+  replaced by a STRUCTURAL enumeration: every early `return nil` in
+  `mapZoneInterface` and every `continue` in `programZoneMaps` must record, so a
+  new soft skip with an unguessed message no longer passes. (4) README no longer
+  claims `skipped` means nothing forwards — it is the third unknown, and
+  `WouldGate` excludes it. `missingInterfaceRecord` distinguishes a genuine
+  absence from a netlink DUMP failure (wrapped `syscall.Errno`) instead of
+  inferring absence from an error it never inspected. `XDP_ATTACHED_MULTI` now
+  counts as generic (reachable via the discarded `DetachXDP` error), via a pure
+  `xdpModeIsGeneric` covered by a five-mode table. `nextApplyGeneration` and both
+  probe bodies gained tests. `recordUnarmedSurface` dedupes by (name, ifindex)
+  and never downgrades a classification — the count is the deliverable.
+  `swapArmProbes` documents its no-parallel constraint.
+  **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/README.md, docs/research/5275-arm-failclosed/plan.md
 - **Timestamp**: 2026-08-05 09:41
 - **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
   process-global `AtomicU64` statics as their before/after baseline, so cargo's
@@ -69538,3 +70896,399 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-06 — #2387: state what the VRF-overlap tests actually enforce
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct two high-level comments that overclaimed the guard (comment-only)
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+A Codex gate and a hostile Claude gate reached the same finding by different
+routes: the DETAILED blocklist comments are honest about being incomplete, but
+the two HIGH-LEVEL summaries above them claim a semantic guarantee the tests do
+not provide.
+
+Codex measured the escape set rather than arguing it. Nine distinct foreclosing
+sentences and nine distinct promising sentences, none using a listed spelling,
+were each spliced before the status tail in both warning arms; all eighteen left
+`go test ./pkg/config` GREEN. Mechanism by shape, measured:
+
+| shape | suffix pin | token lists |
+|---|---|---|
+| APPEND after the tail | always catches | also, if listed |
+| REWORD inside the tail | always catches | also, if listed |
+| SPLICE before the tail | BLIND | listed spellings only |
+| PREPEND at the front | BLIND | listed spellings only |
+
+So the test-file header's "(5) ... with no forecast in EITHER direction before
+it" and the production comment's "keeps forward-looking wording out of BOTH
+format strings" both overstate. Corrected to state the split: the tail is pinned
+verbatim so nothing can be appended, reworded or dropped there; mid-message
+wording is caught only in spellings someone listed. The shipped text is neutral
+because it was written to be, not because the test would stop an author.
+
+Neither list is grown — that is the completeness trap the file's own doctrine
+note refuses, and growing it would trade a disclosed limit for a hidden one.
+
+Comment-only: every changed line is `//` or blank, verified by stripping the
+diff markers and filtering. `gofmt -l` clean, `go vet ./pkg/config/` 0,
+`go test ./pkg/config -run TestVRFOverlap -count=1` 0.
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold — F1 (MATERIAL): a VLAN child whose parent
+  was cleanly `disable`d landed `CoverageUncovered` and drove `WouldGate`.
+  `compiler_iface.go` appends the child to `pendingXDP` ~130 lines ABOVE the
+  `isDisabled` check and never appends a disabled parent, so `coverDelegated`'s
+  "delegate is not a required surface" branch caught it — on precisely the
+  shape both reference deployments run (loss cluster `reth0.50`/`reth0.80`,
+  standalone VLAN 50), inflating the very baseline this phase exists to
+  measure and contradicting the README's own rule that a clean `disable` stays
+  out of would-gate. `coverDelegated` now consults `unarmedByIfindex`: a
+  parent the compiler declined AND proved down (`StillForwarding == false`)
+  makes the child `CoverageSkipped` naming that parent; a parent whose
+  `LinkSetDown` FAILED still leaves the child `CoverageUncovered`, because the
+  child rides that same possibly-UP, zoned, XDP-less netdev. F2 (MATERIAL):
+  the structural canary's `ast.Inspect` matched only `*ast.BlockStmt`, but
+  `ast.CaseClause.Body`/`ast.CommClause.Body` are bare `[]ast.Stmt` — a real
+  early `return nil` inside a `switch { case ...: }` in `mapZoneInterface`
+  escaped it entirely while the byte-identical `if` form was caught. Added
+  `stmtBody` + `stmtListRecords` and repointed both halves (the
+  `mapZoneInterface` `return nil` walk and the `programZoneMaps` `continue`
+  walk). F3: README named PR1 as the phase that decides what a declined
+  surface means to a gate; `armproof.go` had it right (the gating PR does).
+  NITs: a proven-down declined surface now logs at INFO, not WARN alongside
+  the would-gate set; the "one RTM_GETLINK + one bpf_link info per required
+  surface" cost claim was wrong for DELEGATED surfaces (RTM_GETLINK via
+  `peekLinkByIndex`, no bpf_link call) and is now stated per surface kind.
+  DECLINED the ifindex→name NIT: `xdpLinkModeGeneric` is a `func(int) bool`
+  package var swapped by `swapArmProbes`, so threading a name changes that
+  seam plus `instanceLookup`/`coverDirect` and moves seven pinned summary
+  tokens (`10:direct/native`, `20:delegated/via-10/native`, …) — not the
+  "costs nothing" the review conditioned it on.
+- **Validation**: `go build ./...` exit 0; `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race`
+  exit 0; `go test ./pkg/refactoraudit/ -count=1` exit 0. Six mutations, all
+  RED via ASSERTION with `go vet` exit 0 first: M1 drop the proven-down
+  branch → `...VLANChildOfProvenDownParentIsSkipped` fails, and all three
+  over-reach guards stay GREEN; M2 drop the `!u.StillForwarding` condition →
+  `...VLANChildOfUnprovenParentStaysUncovered` fails; M3 `return nil` inside a
+  switch case in `mapZoneInterface` → canary fails (GREEN before this fold);
+  M4 `continue` inside a switch case in `programZoneMaps` → canary fails, and
+  the PR-head canary was re-run against M4 and confirmed GREEN; M5 revert the
+  skip log to WARN → `...DeclinedSurfaceLogsAtInfo` fails; M6 drop the parent
+  NAME from the child's detail → the naming assertion fails.
+- **File(s)**: pkg/dataplane/armproof.go,
+  pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md, _Log.md
+
+## 2026-08-06 — #6864 fold r4: name the identity residual, stop the missing-parent count collapse
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold, two findings.
+
+  **F1 (docs) — the artifact claimed a proof it does not perform.** The README
+  and plan §13/D1 both said the preliminary proof establishes "program-instance
+  identity". It does not: `xdpLinkProgramID` accepts ANY readable program id,
+  never compares it against `m.programs[m.XDPEntryProgram()]`, and never checks
+  `Info.XDP().Ifindex` — the two symbols do not appear in `armproof.go` at all.
+  CHOSE to correct the documents rather than implement the comparison, on the
+  evidence that in this tree the comparison can only ever answer "match":
+  every writer of `m.xdpLinks` installs `m.programs[m.XDPEntryProgram()]`
+  (`AttachXDP`'s fresh attach and its pinned-link `Update` reuse, which drops
+  the pin and re-attaches when `Update` fails; `swapXDPEntryProg`, which updates
+  the links and only then renames the entry program), post-#1476 `m.programs`
+  has one shim writer (`loader_userspace_shim.go`) with the legacy entry program
+  never loaded, and nothing outside the package can reach a tracked link
+  (`Program(name)` is a read-only getter; `m.xdpLinks` has no accessor). So the
+  brief's premise that update-capable handles are exported does not hold. Adding
+  the check to a DIAGNOSTIC would measure nothing while adding a reachable way
+  to report a false `uncovered` (an unreadable expected program — a nil entry is
+  literally exercised by `...GenericModeSurvivesASecondCompile`), and binding it
+  would need a fabricated fixture. It also forces the fail-closed direction for
+  an unreadable expected program to be picked in a phase with no evidence for
+  it. The residual is now written down in three places — at `xdpLinkProgramID`,
+  in `pkg/dataplane/README.md`, and as a "delivered so far" note under plan
+  §13/D1 — each naming the specific unchecked thing so the GATING PR closes it.
+
+  **F2 (runtime) — the unarmed-surface count changed with an unrelated
+  condition.** `mapZoneInterface` resolves `reth0.50` to its PARENT before the
+  netdev lookup, and passed that parent as `missingInterfaceRecord`'s `Name`.
+  `recordUnarmedSurface` dedups on exactly `(Name, Ifindex)` and every child of
+  an absent parent has Ifindex 0, so `p0.50`, `p0.80` and the parent's own
+  reference collapsed into ONE record — while a parent that RESOLVES yields one
+  record per surface. The same configured topology reported a different surface
+  count depending on whether the parent happened to resolve, always in the UNDER
+  direction, and the count is this phase's whole deliverable. Fixed at the
+  RECORD, not by weakening the dedup (which is correct and deliberate — an
+  interface named by two zones legitimately reaches the skip twice):
+  `missingInterfaceRecord` now takes the VLAN id and names `<parent>.<vid>`,
+  keeping the parent in the Reason where an operator needs it.
+
+  Also corrected two overstatements the same review flagged: the README said all
+  FOUR soft skips sit behind a `slog` line (the nil-zone branch at
+  `compiler_iface.go:415` records and continues with no log — only the proof's
+  own per-surface line makes it visible), and "one line per compile" is true of
+  the SUMMARY line only (uncovered surfaces add a WARN each, skipped an INFO).
+- **Validation**: `id -u` 1000 (non-root). `go build ./...` exit 0;
+  `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0;
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. Three mutations, each RED via
+  ASSERTION with the build still clean, each grepped back out afterwards and the
+  file `cmp`'d against its pre-mutation copy: M1 drop the `vlanID > 0` branch
+  from `missingInterfaceRecord` while KEEPING the signature (so the failure
+  cannot be a build break) → `...AbsentParentRecordsEachVlanChildSeparately`
+  fails with "two configured VLAN children of one absent parent produced 1
+  unarmed record(s) [ge-9-0-9], want 2", and the over-reach guard
+  `...OneSurfaceNamedByTwoZonesStaysOneRecord` stays GREEN; M2 disable the
+  `recordUnarmedSurface` dedup → that over-reach guard FIRES ("got 2
+  [ge-9-0-8.50 ge-9-0-8.50]"), proving it is a guard and not a restatement, and
+  the F2 binding test stays GREEN; M3 add a gate-style expected-program check to
+  `attachedInstance` → the F1 residual pin
+  `...ReportsTheReadbackInstanceWithoutVerifyingIt` fires, so the docs cannot
+  silently outlive the code in either direction. The F2 tests drive the REAL
+  `programZoneMaps` → `mapZoneInterface` path (the caller is where the identity
+  is chosen, so a test on the record helper alone would leave the defect
+  unbound) and assert the fixture's premise — the netdev must not exist —
+  rather than skipping.
+- **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/compiler_iface.go,
+  pkg/dataplane/armproof_5275_test.go, pkg/dataplane/README.md,
+  docs/research/5275-arm-failclosed/plan.md, _Log.md
+
+## 2026-08-06 — #6864 fold r5: the foreign-netns orphan VLAN is a LIVE surface; close it
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5275 PR1 review fold, one MAJOR — a claim in my own r3 comment
+  was refuted by reproduction, and the residual it dismissed is real.
+
+  **The refuted claim.** The `vlanLinkKind` "WHAT IT DOES NOT PROVE" block (and
+  the matching README sentence) disposed of the foreign-namespace orphan by
+  asserting that a genuine vlan whose `real_dev` moved to another netns "is
+  forced admin-DOWN, LinkSetUp fails ENETDOWN, and it cannot transmit — so it
+  is not a live forwarding surface". Reproduced firsthand on this kernel with
+  `unshare -rn` (dummy `p0` + vlan child `p0.100`, child moved to a peer netns,
+  probed through `netlink.LinkByIndex`):
+
+      real_dev DOWN : LinkSetUp rc=2 ENETDOWN, flags=broadcast, oper=down
+      real_dev UP   : LinkSetUp rc=0, flags=up|broadcast|running, oper=up
+      both legs     : Type()="vlan"  ParentIndex=5 (FOREIGN ns)  NetNsID=0
+      local control : loc0.100 Type()="vlan" ParentIndex=7 NetNsID=-1, up
+
+  The original experiment only reproduced because it left the foreign `real_dev`
+  DOWN. `vlan_dev_open` refuses only while the real device is down; nothing pins
+  the orphan down. So it IS live, its kind IS "vlan" so it passes the r3 kind
+  belt, and its `ParentIndex` is a foreign ifindex used as a bare numeric key
+  into `isRequired` / `unarmed[parent]` / `direct[parent]` — aliasing a local
+  record yields SKIPPED or DELEGATED, both UNDER-counts that hide a live
+  XDP-less forwarding surface. Reachable by the same route as the wrong-kind
+  squatter: `ensureVLANSubInterface` adopts any `<phys>.<vid>` without checking
+  its kind OR where its real_dev lives.
+
+  **Closed in code, not just in prose.** The r4 reasoning for declining a code
+  fix was that the bad state is unproducible; this one is PROVEN producible, so
+  the same reasoning points the other way. `coverDelegated` now also requires
+  `LinkAttrs.NetNsID == netnsIDLocal` after the kind check. The kernel emits
+  `IFLA_LINK_NETNSID` exactly when `link_net != dev_net` and netlink seeds -1,
+  overwriting only from that attribute, so -1 means "local parent" — one extra
+  condition on an `Attrs()` call already being made, no new syscall.
+
+  **The comparison is `!= -1`, never `> 0`**, and both reasons were measured
+  rather than reasoned: (i) a foreign parent's nsid is commonly ZERO — the
+  orphan above read 0 — so `> 0` lets exactly the target case through; (ii)
+  netlink parses the wire s32 UNSIGNED (`int(native.Uint32(...))`,
+  link_linux.go:2304), so a wire `NETNSA_NSID_NOT_ASSIGNED` (-1) arrives as
+  4294967295 on this 64-bit build — verified by running the same expression —
+  which `!= -1` still rejects, conservatively.
+
+  Test fixtures now set `NetNsID` EXPLICITLY on every hand-built link. The zero
+  value of a `netlink.LinkAttrs` is 0, which is a real FOREIGN nsid; only
+  `LinkDeserialize` seeds -1. Leaving it unset modelled a link production never
+  returns and would have routed every existing VLAN fixture through the new
+  belt.
+- **Validation**: `id -u` 1000 (non-root). `go build ./...` exit 0;
+  `go vet ./pkg/dataplane/` exit 0;
+  `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1 -race` exit 0;
+  `go test ./pkg/refactoraudit/ -count=1` exit 0. A 3-mutation matrix, each cell
+  `go vet`-clean first so every RED is an ASSERTION, each mutation grepped back
+  out and the file `cmp`'d identical after restore:
+
+      cell                          foreign_ns_vlan rows | veth+macvlan | local-VLAN control
+      M0 baseline                   PASS                 | PASS         | PASS
+      M1 belt removed               FAIL (both arms)     | PASS         | PASS
+      M2 belt always fires          PASS                 | PASS         | FAIL (both arms)
+      M3 `> 0` instead of `!= -1`   FAIL (both arms)     | PASS         | PASS
+
+  M1 reds with the two concrete under-counts (`Kind:skipped Via:10` and
+  `Kind:delegated Via:10 ProgramID:55`). M2 is the over-reach control the parent
+  asked for — "make every delegated child uncovered" reds BOTH negative-control
+  arms while the new rows stay green, so the belt cannot be widened into
+  re-breaking `reth0.50`/`reth0.80`. M3 is the decisive sign cell: the nsid-0
+  orphan slips a `> 0` test while the control stays green, so `!= -1` is
+  load-bearing and not interchangeable.
+
+  OUT OF SCOPE, deliberately untouched: `pkg/dataplane/compiler.go:474` reads
+  `link.Attrs().ParentIndex` for the VLAN-child generic-attach decision with the
+  identical aliasing exposure. Unchanged by this PR; a separate follow-up issue.
+- **File(s)**: pkg/dataplane/armproof.go, pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-06 — #5275 PR1: correct three false claims in the arm-proof comments
+
+- **Timestamp**: 2026-08-06
+- **Action**: make the decline's justification true (comment-only)
+- **File(s)**: `pkg/dataplane/armproof.go`
+
+Two independent gates reached the same three findings by different routes — a
+hostile Claude review that ran an unprescribed mutation cell, and a Codex leg
+that reasoned from the value domain and the shipped architecture. All three are
+false statements in the shipping artifact, none changes behaviour:
+
+1. "nothing outside the package can reach a tracked link at all — `Program(name)`
+   is a read-only getter and `m.xdpLinks` has no accessor." FALSE.
+   `Manager.XDPLinks()` returns the LIVE map by reference and `Manager.Program()`
+   returns a live `*ebpf.Program` handle. The two current out-of-package callers
+   (`userspace/manager_compile.go`, `userspace/maps_sync.go`) read only `len` and
+   keys, so the CONCLUSION holds — but it is upheld by the call sites, not by
+   encapsulation, and a future caller in `pkg/dataplane/userspace` could falsify
+   it without an API change. The comment now says that, and frames the missing
+   comparison as DEFERRED to the gating PR rather than impossible. Also records
+   the two `swapXDPEntryProg` states the old text omitted: it skips VLAN
+   sub-interfaces, and it returns on the first per-link `Update` error without
+   advancing `m.xdpEntryProg`.
+2. "The comparison MUST be `!= -1`, never `> 0` or `>= 0`." Half false. `> 0` is
+   genuinely wrong (it misses a foreign nsid of 0). `>= 0` is indistinguishable
+   from `!= -1` for every producible value — the seed is the only negative one
+   and the wire parse is unsigned. `!= -1` stays, as the spelling that says what
+   it means, but the claim that `>= 0` would be a defect is withdrawn.
+3. "only `LinkDeserialize` seeds -1." `NewLinkAttrs()` does too. The
+   load-bearing point is unchanged — a bare composite literal, which is what
+   fixtures use, still zero-values it to 0, and 0 is a real FOREIGN nsid.
+
+Comment-only: every changed line in `armproof.go` is `//` or blank, verified by
+stripping the diff markers and filtering. `gofmt -l` clean, `go build ./...` 0,
+`go vet ./pkg/dataplane/` 0, `go test ./pkg/dataplane/ -count=1` 0, non-root.
+## 2026-08-06 — #6413 userspace-dp synced-import-cap doc corrections
+
+- **Timestamp**: 2026-08-06 02:20 PDT
+- **Action**: Correct the #5674 reverse-ride SOURCE framing (local mirror, not
+  peer), document the +1 orphan corner, and align two HELP strings to the
+  2N-ENTRIES bound. Comment-only, no behaviour change.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs
+- **Validation**: the .rs diff contains ZERO executable lines (every changed
+  line is `//` or `///`); `cargo check` exit 0. Each claim verified against
+  origin/master before editing: SetClusterSyncedSessionV4 at manager_ha.go:1136
+  early-returns for a reverse and writes only the BPF mirror; mirrorSessionPairV4
+  at :1115 dispatches the reverse as a SEPARATE upsert with IsReverse=1;
+  session_import.rs:103 already states the cap as 2 * worker_count *
+  DEFAULT_MAX_SESSIONS while status.rs/control.rs stated the logical bound.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #6413 amend — three doc corrections found by review, two of
+  which are this PR's own subject matter (a cross-reference PR must not ship
+  a bad cross-reference). (1) The `#6413:` block this PR ADDED to
+  `coordinator/status.rs` cited `bpf_map/metrics.rs` as documenting the ENTRY
+  ceiling. It documents no ceiling — `grep -nE
+  'ceiling|2 \*|worker_count|max_sessions'` over
+  `userspace-dp/src/afxdp/bpf_map/metrics.rs` exits 1, and all that survives
+  there is a redirect at :275-284 saying the counters moved to
+  `coordinator/session_manager.rs`. metrics.rs did hold the formula at
+  `c8d7559cc`, with the OLD un-doubled wording, until `83df45377` (#6819)
+  moved it out. Repointed at `coordinator/session_manager.rs`, whose :45-56
+  does state `2 * worker_count * DEFAULT_MAX_SESSIONS` — verified before
+  writing the pointer, so the fix does not repeat the defect in the other
+  direction. (2) `coordinator/mod.rs:338-343`, the fourth site this PR's
+  sweep missed, still carried both errors it fixes elsewhere: the un-doubled
+  `worker_count * DEFAULT_MAX_SESSIONS`, and "returns this value", which is
+  false — `ha/session_import.rs:33-37` returns `override.saturating_mul(2)`
+  and says so. (3) `ha/session_import.rs:124-126` and
+  `session/README.md:826-829` named only `mirrorSessionPairV4` as the
+  producer of the lone reverse; the IPv6 twin `mirrorSessionPairV6`
+  (`pkg/dataplane/userspace/manager_ha.go:1246`, `revVal.IsReverse = 1` at
+  :1258) reaches the SAME gate — the control handler
+  (`server/handlers/sync_session.rs:22`) is family-agnostic and calls
+  `upsert_synced_session` once for any `upsert`. Both sites now read
+  `mirrorSessionPairV4`/`V6`. Comment-only, no behaviour change.
+- **Validation**: `cargo check --manifest-path userspace-dp/Cargo.toml` exit
+  0 (161 warnings, all pre-existing). Comment-only re-proved after the edit
+  the same way the review proved it: strip the +/- marker from every changed
+  `.rs` line in `origin/master...HEAD` and confirm nothing remains that is
+  not `//`, `///`, or blank — the residual grep exits 1.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+
+## 2026-08-06 — #6304/#6413: retire the `afxdp/ha.rs` path in session/README.md
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct three stale module pointers surfaced by the #6913 gate
+- **File(s)**: `userspace-dp/src/session/README.md`
+
+The gate's cross-reference sweep covered pre-existing references inside the
+blocks this PR edits, and found `session/README.md` still citing
+`afxdp/ha.rs` — a file that no longer exists. Commit `18c4ba7fd` split it
+into the `afxdp/ha/` module. Three citations, all pre-existing on
+`origin/master`, all in or adjacent to the "Sync-family aggregate ceiling"
+section this PR rewrites:
+
+- `:640` `afxdp/ha.rs::update_ha_state` -> `afxdp/ha/state.rs::update_ha_state`
+  (verified: `fn update_ha_state` is at `afxdp/ha/state.rs:4`)
+- `:781` and `:866` `upsert_synced_session` (`afxdp/ha.rs`) ->
+  (`afxdp/ha/session_import.rs`) (verified: `pub fn upsert_synced_session`
+  is at `afxdp/ha/session_import.rs:46`)
+
+Both replacement targets were resolved before writing the pointer rather
+than after, so this does not repeat the defect it corrects. The enclosing
+paragraph was rewrapped to 72 columns because the longer path overflowed;
+no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
+`.rs` file is touched — this PR stays comment/doc-only.
+
+- **Timestamp**: 2026-08-06
+- **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
+  and blocked on #5480. Seven review rounds established that the fence keys on
+  `syncConnID`, a total ORDER over connections, when the predicate it needs is
+  an EQUIVALENCE ("same peer boot?"), because config generations are comparable
+  only within one sender incarnation. A ranking cannot express an equivalence,
+  so the floor has no correct setting: never descending locks out a live
+  same-incarnation sibling that merely connected earlier, and descending
+  re-admits departed older-incarnation connections and makes the floor a mutable
+  target an in-flight `resetRecvGen` can reclaim. The decisive finding is that
+  the fence's drop is a `continue` that skips the generation gate, so a dropped
+  payload's generation never enters the high-water and HEAD ended up applying a
+  stale payload `origin/master` REFUSES; closing that means recording the
+  dropped generation, which is a pre-reboot (higher) value and wedges the
+  standby permanently. One scalar high-water cannot serve two incarnations.
+  What ships instead is the one defect that is real on master with or without
+  the fence: the reconnect RESET of the config-generation marks was not atomic
+  against their ADVANCE. Both marks are advanced by a load/compare/store and
+  cleared to 0 by `resetRecvGen` from a DIFFERENT goroutine — the clear runs on
+  a receive loop, the applied mark advances on `configApplyLoop`, and the
+  received mark advances on a receive loop of which there are TWO. A clear
+  landing inside an advance was LOST and the store re-raised the mark it had
+  just zeroed, leaving a pre-reboot generation that refuses every generation the
+  reconnected peer can produce — silently, permanently, since the marks are
+  monotone-max. New `configGenMu` covers the reset and all four advance sites;
+  readers stay lock-free. Two false contracts corrected at their sites
+  ("called ONLY from the single-consumer configApplyLoop" ignored the clear;
+  "the receiveLoop is single-threaded per connection" is true per connection but
+  there are two of them).
+- **Validation**: 2x2 mutation grid, disjoint cells. M1 (remove `configGenMu`
+  from the advances and the reset) REDs both binders as ASSERTIONS —
+  "the reconnect reset was LOST: the applied config high-water is 1800000000123
+  (the peer's PRE-REBOOT generation) instead of 0.
+  reset_completed_inside_the_advance_window=true" and the received-mark twin —
+  and leaves `TestConfigGenAdvanceStaysMonotone` GREEN. M2 (drop the
+  `gen > current` comparison for a bare Store) REDs only the monotone guard,
+  both subtests ("the applied high-water must never regress: publishing
+  12000000456 after 1800000000123 pulled it down to 12000000456"), and leaves
+  both binders GREEN. Each monotone subtest carries a negative control (a
+  strictly higher generation must still advance), so the assertion pins
+  regression rather than "never moves". `go build ./...` 0,
+  `go vet ./pkg/cluster ./pkg/daemon` 0,
+  `go test ./pkg/cluster ./pkg/daemon -count=1 -race` 0,
+  `go test ./pkg/cluster -run <5084 cohort> -count=5 -race` 0.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn_config.go,
+  pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/sync_config_gen_reset_race_5084_test.go,
+  pkg/cluster/README.md, docs/sync-protocol.md, _Log.md

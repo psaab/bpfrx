@@ -160,9 +160,13 @@ practice. The remaining decision is only §0b's table:
 - **DENY** is small and Rust-only, but it is *not* Junos semantics (a Junos
   session table is per-routing-instance; identical 5-tuples in two instances
   coexist), and it hands a tenant a denial primitive against a co-tenant that
-  guesses/observes its 5-tuple. It also contradicts the already-shipped A.1
-  warning text, which promises the operator cross-forwarding "until the session
-  identity is VRF-aware" — i.e. it points at ISOLATE.
+  guesses/observes its 5-tuple. (This bullet used to add a third argument: that
+  the already-shipped A.1 warning text promised the operator cross-forwarding
+  "until the session identity is VRF-aware", and so pointed at ISOLATE. That
+  argument is retired — the warning was reworded to state the limitation and
+  point at #2387 without promising or excluding either end-state, precisely so
+  the shipped operator text does not pre-commit this decision. It is now
+  evidence for neither branch.)
 - **ISOLATE** is the issue's literal ask, is vendor-parity, and — with §0a —
   no longer carries the wire flag-day that drove the v4 deferral. Its residual
   cost is mechanical: `SessionKey` grows one `u32` (≈300 struct-literal sites in
@@ -407,8 +411,12 @@ Two tracks. The decision between them is a **product-scope call** (see §11 Q1).
   static routes) to two different routing-instances reachable via PBR `then
   routing-instance`, emit a **commit warning** naming both interfaces/instances:
   "overlapping L3 across routing-instances is forwarded via PBR but is NOT
-  session-isolated (#2387) — colliding 5-tuples may cross-forward until the
-  session identity is VRF-aware." **A warning, not a reject** — AGY r1 Attack 4
+  session-isolated (#2387) — the session identity carries no routing-instance
+  discriminator, so colliding 5-tuples may cross-forward. See #2387 for the
+  status of this limitation." (As originally prescribed here the sentence ended
+  "…may cross-forward until the session identity is VRF-aware"; that promised an
+  outcome this plan has not settled, so the shipped text states the limitation
+  and points at the issue instead.) **A warning, not a reject** — AGY r1 Attack 4
   correctly notes that overlapping-subnet PBR VRF is a *legitimate, working*
   multi-tenant design, so hard-rejecting it breaks a valid deployment to work
   around a fast-path bug. A hard reject is only appropriate if the maintainer's
