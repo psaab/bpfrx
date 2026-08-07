@@ -113,9 +113,36 @@ system {
 // millisecond it adds is a millisecond of revoked authority it keeps.
 //
 // Each case runs TWICE against the same fixture: once with no commit (the
-// CONTROL, which must be admitted) and once with the revoking commit landing
-// while the lookup is blocked (which must be denied). Without the control a
-// reverted ordering could be "caught" by any unrelated 403.
+// CONTROL) and once with the revoking commit landing while the lookup is
+// blocked (which must be denied). Without the control a reverted ordering could
+// be "caught" by any unrelated 403.
+//
+// # Why the route carries a WITHHELD body (#5561 round 18, finding 2)
+//
+// The first shape of this case drove POST /api/v1/config/enter and asserted
+// only "403". That does not bind the ordering it is named for, and the proof is
+// mechanical: hoist `cfg := s.activeConfig()` back to before `pending.wait` in
+// authorizeInputs — the exact pre-round-9 shape the paragraphs above describe —
+// and the case still PASSED. Pass 2 (reauthorizeInputs) is unconditional and
+// re-reads the snapshot, and the commit has landed by the time it runs, so a
+// stale pass 1 is simply overruled and the caller sees the same 403 either way.
+// The round-9 property was entirely subsumed by the round-10/11 two-pass gate.
+//
+// What distinguishes the two orderings is not WHETHER the request is denied but
+// WHEN — before the caller-controlled block or after it. So the request here is
+// a body-carrying route (POST /api/v1/config/set, mutationBodyEdit) whose body
+// is declared and never sent:
+//
+//	fixed ordering   pass 1 reads the post-commit snapshot -> 403 arrives while
+//	                 the body is still withheld
+//	hoisted ordering pass 1 reads the pre-commit snapshot -> ADMITS, and the
+//	                 gate parks in bufferMutationBody waiting for a body that
+//	                 never comes; nothing answers until apiReadTimeout (30s)
+//
+// The control arm is what makes the timing assertion mean something: with no
+// commit, the same request must PARK rather than answer, which proves the
+// withheld body genuinely holds a request that passes pass 1. A prompt 403 in
+// the revoked arm can therefore only have come from pass 1.
 func TestConfigSnapshotIsReadAfterThePeerWait_5561(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -160,15 +187,18 @@ func TestConfigSnapshotIsReadAfterThePeerWait_5561(t *testing.T) {
 						},
 					})
 
-					type result struct {
-						status int
-						msg    string
-					}
-					done := make(chan result, 1)
-					go func() {
-						status, msg := postRoute(t, base, "POST /api/v1/config/enter", nil)
-						done <- result{status, msg}
-					}()
+					// No request from an earlier subtest may still be parked in
+					// the drain, or this one's waiter edge would be another
+					// case's.
+					waitForAdmittedToSettle(t, 0)
+
+					// Headers only: the body is DECLARED and withheld, so a
+					// request that gets past pass 1 parks in the gate's drain
+					// instead of being answered. openDeclaredBody writes the
+					// headers synchronously, so the request reaches the gate
+					// immediately.
+					const body = `{"input":"set system host-name r18"}`
+					conn := openDeclaredBody(t, base, "POST /api/v1/config/set", len(body), "", nil)
 
 					// Wait for the accept-time lookup to start...
 					select {
@@ -192,26 +222,37 @@ func TestConfigSnapshotIsReadAfterThePeerWait_5561(t *testing.T) {
 					}
 					close(release)
 
-					var got result
-					select {
-					case got = <-done:
-					case <-time.After(20 * time.Second):
-						t.Fatal("the request never completed")
-					}
-
 					if !commitDuringWait {
-						if got.status == http.StatusForbidden {
-							t.Fatalf("the CONTROL was denied (%d, %q) — a super-user with no "+
-								"intervening commit must be admitted, so the denial below would "+
-								"prove nothing", got.status, got.msg)
+						// The control's assertion is positive and then negative:
+						// the request got PAST pass 1 into the gate's body
+						// drain, and stays there rather than being answered. If
+						// it did not park, the revoked arm's prompt 403 would
+						// prove nothing about WHERE the denial came from.
+						waitForMutationBodyWaiter(t)
+						if status, answered := readStatus(t, conn, time.Second); answered {
+							t.Fatalf("the CONTROL answered %d with its body still withheld — a "+
+								"super-user with no intervening commit must be admitted by pass "+
+								"1 and then park on its caller", status)
 						}
 						return
 					}
-					if got.status != http.StatusForbidden {
-						t.Fatalf("got %d, want 403: %s, and the request was still authorized. "+
-							"The active config was read BEFORE the blocking peer wait, so the "+
-							"decision was evaluated against the snapshot the commit superseded "+
-							"(error=%q)", got.status, tc.why, got.msg)
+
+					// The window this assertion lives in: the body has not been
+					// sent and will not be. Whatever answers here answered
+					// WITHOUT it, and the only adjudication that runs before the
+					// body is pass 1.
+					status, answered := readStatus(t, conn, 5*time.Second)
+					if !answered {
+						t.Fatalf("nothing answered within 5s while the body was withheld: %s. "+
+							"Pass 1 therefore ADMITTED the request and the gate is parked in "+
+							"its body drain — the active config was read BEFORE the blocking "+
+							"peer wait, so pass 1 was evaluated against the snapshot the commit "+
+							"superseded. Pass 2 will overrule it once the caller finishes, but "+
+							"that is the round-10 gate doing the work, not this ordering",
+							tc.why)
+					}
+					if status != http.StatusForbidden {
+						t.Fatalf("got %d, want 403: %s", status, tc.why)
 					}
 				})
 			}

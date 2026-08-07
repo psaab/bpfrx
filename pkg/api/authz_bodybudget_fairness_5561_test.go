@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -270,6 +271,104 @@ func TestViewTierSaturationLeavesHeadroomForTheConfigureTier_5561(t *testing.T) 
 	}
 }
 
+// saturateViewTier drives the aggregate budget to the VIEW tier's ceiling and
+// returns the peak it settled at.
+//
+// "To its ceiling" is established by observation rather than by arithmetic: the
+// bulk phase gets close with route-ceiling declarations, and then the top-up
+// phase adds requests in single-initial-buffer granules until a round of them
+// is REFUSED. A refusal is the only externally visible proof that the tier is
+// genuinely FULL — that the next charge of mutationBodyInitialBuf will not fit
+// — as opposed to merely busy, and a case that asserts what a full view tier
+// can and cannot deny has to start from full or it asserts nothing.
+func saturateViewTier(t *testing.T, base string) int64 {
+	t.Helper()
+
+	// Bulk: 400 sockets each declaring the route's whole ceiling and sending
+	// all but the last byte, so each admitted one really holds what it is
+	// charged for. 25 MiB of declared body is past any share the view tier can
+	// be given and short of the whole budget.
+	floodDeclaredBodies(t, base, "POST /api/v1/diagnostics/ping",
+		400, int(mutationBodySmall), strings.Repeat("a", int(mutationBodySmall)-1))
+
+	// Top-up. A socket that sends ONE byte parks holding exactly
+	// mutationBodyInitialBuf: the read loop takes the byte, the buffer is not
+	// full, and the next read blocks on a caller that will never continue. So
+	// each round below closes the remaining gap in 512-byte steps, and the
+	// round that reports a refusal is the one that hit the wall.
+	for round := 0; round < 8; round++ {
+		_, refused := floodDeclaredBodies(t, base, "POST /api/v1/diagnostics/ping",
+			256, int(mutationBodySmall), "{")
+		if refused > 0 {
+			return MutationBodyBytesAdmittedForTest()
+		}
+	}
+	t.Fatalf("the view tier never refused a request after %d bulk and 2048 top-up sockets "+
+		"(admitted=%d of a %d budget) — the case never reached the saturated state it "+
+		"asserts from", 400, MutationBodyBytesAdmittedForTest(), MutationBodyBudgetForTest())
+	return 0
+}
+
+// TestViewTierFloodCannotDenyTheClearTier_5561 binds the step of the ladder
+// that separates a `read-only` account from an `operator`'s clear verbs
+// (#5561 round 18, finding 1).
+//
+// Round 11 gave view, clear and control the SAME share and tested each ceiling
+// against the AGGREGATE. Equal shares plus an aggregate test is not a ladder
+// between those three: whatever the view tier takes is subtracted from what the
+// clear tier can reach, so a view tier driven to its own ceiling leaves the
+// clear tier exactly nothing. `read-only` holds PermView; `operator` holds
+// PermView, PermClear and PermControl (config.LoginClassPermissions), so clear
+// is strictly the higher privilege — and 383 sockets from a read-only shell
+// account on POST /api/v1/diagnostics/ping made a super-user's 24-byte
+// POST /api/v1/dhcp/identifiers/clear answer 429.
+//
+// That is the exact denial primitive the ladder exists to remove, and it was
+// CREATED by the round-11 tier split rather than inherited: before the split
+// there was no budget to exhaust. TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561
+// did not catch it because it tested view and clear EACH against the configure
+// tier's work and never against each other.
+//
+// The flood is driven from the read-only account and the clear request from a
+// super-user, so the case is a genuine cross-privilege one rather than an
+// account denying itself.
+func TestViewTierFloodCannotDenyTheClearTier_5561(t *testing.T) {
+	usePasswdFixture(t)
+	store := authzStore(t, authzTestConfig)
+	_, viewBase := authzServer(t, Config{
+		Addr:         "127.0.0.1:8080",
+		Store:        store,
+		PeerLookupFn: fixedPeerUID(authzUIDReadOnly),
+	})
+	_, superBase := authzServer(t, Config{
+		Addr:         "127.0.0.1:8080",
+		Store:        store,
+		PeerLookupFn: fixedPeerUID(authzUIDSuperuser),
+	})
+
+	waitForAdmittedToSettle(t, 0)
+	peak := saturateViewTier(t, viewBase)
+
+	// The one clear-tier route that carries a body. The other two clear verbs
+	// are mutationBodyNone and are never charged at all, so this route is the
+	// whole blast radius — and it is enough, because a route that cannot be
+	// reached is a denied route.
+	body := `{"interface":"ge-0-0-0"}`
+	conn := openDeclaredBody(t, superBase, "POST /api/v1/dhcp/identifiers/clear", len(body), body, nil)
+	status, got := readStatus(t, conn, 10*time.Second)
+	if !got {
+		t.Fatal("the clear-tier request never answered")
+	}
+	if status == http.StatusTooManyRequests {
+		t.Fatalf("a super-user's POST /api/v1/dhcp/identifiers/clear was refused %d with the "+
+			"VIEW tier at its ceiling (%d of %d bytes reserved, view ceiling %d, clear ceiling "+
+			"%d). A `read-only` account holding only PermView can therefore deny the clear "+
+			"verbs an `operator` holds — the ladder gives clear no share the view tier cannot "+
+			"reach into", status, peak, MutationBodyBudgetForTest(),
+			mutationBodyTierCeiling(config.PermView), mutationBodyTierCeiling(config.PermClear))
+	}
+}
+
 // TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561 binds the RELEASE.
 //
 // The gate defers the release for the whole request, so every exit path — the
@@ -353,8 +452,105 @@ func TestEveryGuardedRouteDeclaresABodyTier_5561(t *testing.T) {
 //
 // A ladder that is merely monotonic can still be useless — three tiers at 63,
 // 63.5 and 64 MiB order correctly and protect nothing.
+//
+// Round 18 added the general form below. The two explicit blocks that follow it
+// state the two steps by hand and are why finding 1 survived: they check view
+// and clear EACH against the CONFIGURE tier's work and never against each
+// other, so the view==clear step — a real privilege step, `read-only` versus
+// `operator` — was outside every loop.
 func TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561(t *testing.T) {
 	budget := MutationBodyBudgetForTest()
+
+	// EVERY privilege step, derived — not a restatement of the constants.
+	//
+	// Both inputs come out of production tables. The ORDER comes from
+	// config.LoginClassPermissions through the production evaluator: p is
+	// strictly less privileged than q when every class holding q also holds p
+	// and some class holds p without q (`read-only` holds view without clear,
+	// so view < clear; nothing distinguishes clear from control, so they are
+	// incomparable and neither has to reserve for the other). The SIZE comes
+	// from restMutationPermissions x restMutationBodyLimits: the largest body
+	// any route in the higher tier can legitimately carry.
+	//
+	// The requirement joins them: because each ceiling is tested against the
+	// AGGREGATE, tier q is protected from tier p only if q's ceiling stands
+	// above p's by at least one whole q-sized request. A gap of zero is no
+	// protection at all, which is precisely what equal shares gave.
+	ladder := make([]config.LoginClassPermission, 0, len(mutationBodyTierCeilings))
+	for perm := range mutationBodyTierCeilings {
+		ladder = append(ladder, perm)
+	}
+	sort.Slice(ladder, func(i, j int) bool { return ladder[i] < ladder[j] })
+
+	largestBody := map[config.LoginClassPermission]int64{}
+	for route, required := range restMutationPermissions {
+		if n := mutationBodyLimit(route); n > largestBody[required] {
+			largestBody[required] = n
+		}
+	}
+	strictlyBelow := func(p, q config.LoginClassPermission) bool {
+		var someClassSeparates bool
+		for class := range config.LoginClassPermissions {
+			hasP := config.ClassHasPermission(nil, class, p)
+			hasQ := config.ClassHasPermission(nil, class, q)
+			if hasQ && !hasP {
+				return false // a class holds q without p: q is not the higher one
+			}
+			if hasP && !hasQ {
+				someClassSeparates = true
+			}
+		}
+		return someClassSeparates
+	}
+	for _, low := range ladder {
+		for _, high := range ladder {
+			if low == high || !strictlyBelow(low, high) {
+				continue
+			}
+			// A tier with no body-carrying route has nothing to reserve for:
+			// PermControl is on the ladder today but owns no route, so its rows
+			// are vacuous until one is added — at which point they bite.
+			need := largestBody[high]
+			if gap := mutationBodyTierCeiling(high) - mutationBodyTierCeiling(low); gap < need {
+				t.Errorf("the %s tier stands only %d bytes above the %s tier (%d vs %d), less "+
+					"than the %d a single %s-tier request can carry. Every ceiling is tested "+
+					"against the AGGREGATE, so a %s-tier flood drives the total to its own "+
+					"ceiling and leaves the %s tier that gap and no more — a caller holding "+
+					"only %s can then 429 a caller holding %s off its own routes, which is the "+
+					"cross-privilege denial the ladder exists to remove",
+					authz.PermissionName(high), gap, authz.PermissionName(low),
+					mutationBodyTierCeiling(high), mutationBodyTierCeiling(low), need,
+					authz.PermissionName(high), authz.PermissionName(low),
+					authz.PermissionName(high), authz.PermissionName(low),
+					authz.PermissionName(high))
+			}
+		}
+	}
+
+	// The other direction: a share small enough to be safe can be too small to
+	// SERVE, and shrinking a tier to buy separation would trade a
+	// cross-privilege denial for a self-denial.
+	//
+	// Only the OPERATIONAL tiers are held to this. Their routes carry a few
+	// hundred bytes and their callers are the numerous ones. The configure tier
+	// deliberately is not: its largest route carries a whole 16 MiB candidate
+	// configuration, and 48 MiB holding two or three of those at once is the
+	// documented pathological extreme (mutationBodyBudgetBytes), not a
+	// regression.
+	const minConcurrentOperationalRequests = 64
+	for _, perm := range []config.LoginClassPermission{config.PermView, config.PermClear, config.PermControl} {
+		largest := largestBody[perm]
+		if largest == 0 {
+			continue // no body-carrying route in this tier
+		}
+		if fits := mutationBodyTierCeiling(perm) / largest; fits < minConcurrentOperationalRequests {
+			t.Errorf("the %s tier's %d-byte share holds only %d concurrent %d-byte requests, "+
+				"below the %d its own routes need. Separating the tiers by starving one of "+
+				"them replaces a cross-privilege denial with a self-denial",
+				authz.PermissionName(perm), mutationBodyTierCeiling(perm), fits, largest,
+				minConcurrentOperationalRequests)
+		}
+	}
 
 	view := mutationBodyTierCeiling(config.PermView)
 	clear := mutationBodyTierCeiling(config.PermClear)

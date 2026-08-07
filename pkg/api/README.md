@@ -367,7 +367,15 @@ they superseded had already been captured:
   outright — did not reach that principal's own in-flight request. The wait now
   comes first and the snapshot is read after it (`authorizeInputs`), so exactly
   one snapshot feeds both the principal's class and `Authorize`, and nothing
-  blocks between the read and the verdict.
+  blocks between the read and the verdict. Since round 10 this ordering no
+  longer decides the *outcome* — pass 2 re-reads the snapshot unconditionally
+  and would overrule a stale pass 1 — but it still decides **when** the denial
+  lands: with the fresh read, a revoked caller is refused before the gate
+  buffers a byte on its behalf; with the stale one it is admitted into the
+  caller-controlled body drain first. `TestConfigSnapshotIsReadAfterThePeerWait_5561`
+  asserts that timing (a body-carrying route whose body is declared and never
+  sent must still answer 403), because an assertion on the status alone passes
+  under either ordering.
 - The credential principal was minted *before* the enumeration. It is a value
   and `ReplaceAuth` swaps a pointer, so a rotated or revoked secret did not
   invalidate a principal already speaking. The credential is now re-validated
@@ -404,7 +412,7 @@ So the body is drained **inside the gate**, between two adjudications:
 | step | why it is where it is |
 |---|---|
 | **pass 1** | Fail-fast, and it comes first for *availability*, not authorization. Buffering before deciding would let any caller that can open a socket park daemon memory behind a 30s read timeout. With the check first, only a principal already authorized for **this** route can make the daemon hold a buffer. That is a necessary bound and not a sufficient one — the cheapest permission on the surface is `PermView`, held by a `read-only` shell account — so the drain is bounded again below. |
-| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation, and bounded in **three** dimensions. **Per route** (`restMutationBodyLimits`): `POST /api/v1/config/load` keeps the 16 MiB whole-configuration ceiling, config edits get 1 MiB, diagnostics and `system/action` get 64 KiB, and the routes whose handlers never read a body are **not buffered at all** — their own immediate answer is restored rather than moved behind a read the caller controls. That no-body class is `security/sessions/clear`, `security/counters/clear`, and the candidate-lifecycle and commit verbs addressed by the `X-Config-Session` header alone: `config/enter`, `config/exit`, `config/commit`, `config/commit-check` and `config/confirm`. `dhcp/identifiers/clear` is deliberately *not* in it — #4794 made it decode an optional body, so it keeps the ordering — but note its 413 threshold **moved from 16 MiB to 64 KiB**: the gate's ceiling now trips before the handler's own `MaxBytesReader`. **In aggregate** (`mutationBodyBudgetBytes`, 64 MiB): a request is charged for the buffer it has actually ALLOCATED, grown as the caller's bytes arrive, and is refused **429** when a growth step would breach its share — so the memory a caller can pin is capped no matter how many sockets it opens, and a declared `Content-Length` buys nothing on its own. **Per privilege tier** (`mutationBodyTierCeilings`): that aggregate is partitioned by the permission the route requires — view/clear/control 16 MiB, config 48 MiB, maint 64 MiB — so a caller flooding the cheapest routes cannot deny a privileged one. On the one route still at the 16 MiB cap the read is `limit+1`, so an oversized body still reaches `MaxBytesReader` and still answers 413; on a tighter route the gate answers 413 itself, with the same status and message. |
+| **drain** | The caller-controlled block, moved in front of the verdict that admits the mutation, and bounded in **three** dimensions. **Per route** (`restMutationBodyLimits`): `POST /api/v1/config/load` keeps the 16 MiB whole-configuration ceiling, config edits get 1 MiB, diagnostics and `system/action` get 64 KiB, and the routes whose handlers never read a body are **not buffered at all** — their own immediate answer is restored rather than moved behind a read the caller controls. That no-body class is `security/sessions/clear`, `security/counters/clear`, and the candidate-lifecycle and commit verbs addressed by the `X-Config-Session` header alone: `config/enter`, `config/exit`, `config/commit`, `config/commit-check` and `config/confirm`. `dhcp/identifiers/clear` is deliberately *not* in it — #4794 made it decode an optional body, so it keeps the ordering — but note its 413 threshold **moved from 16 MiB to 64 KiB**: the gate's ceiling now trips before the handler's own `MaxBytesReader`. **In aggregate** (`mutationBodyBudgetBytes`, 64 MiB): a request is charged for the buffer it has actually ALLOCATED, grown as the caller's bytes arrive, and is refused **429** when a growth step would breach its share — so the memory a caller can pin is capped no matter how many sockets it opens, and a declared `Content-Length` buys nothing on its own. **Per privilege tier** (`mutationBodyTierCeilings`): that aggregate is partitioned by the permission the route requires — view 8 MiB, clear/control 16 MiB, config 48 MiB, maint 64 MiB — so a caller flooding the cheapest routes cannot deny a privileged one. The guarantee is **one-directional**: each ceiling is tested against the *aggregate*, so a tier is protected only from the tiers strictly below it, and a privileged flood can still refuse a cheap one (scheduling, not a denial primitive). That is also why view is **half** what clear and control get rather than the same 16 MiB round 11 first gave all three: equal shares put no tier below any other, so a view tier driven to its own ceiling left the clear tier nothing, and 383 sockets on `diagnostics/ping` from a `read-only` account made a super-user's 24-byte `dhcp/identifiers/clear` answer **429**. Each step now reserves the largest body the tier above it can carry (16−8 = 8 MiB ≥ the 64 KiB clear body; 48−16 = 32 MiB ≥ a 16 MiB `config/load`; 64−48 = 16 MiB ≥ the 64 KiB `system/action`), and 8 MiB still holds 128 concurrent *maximum-size* view bodies. On the one route still at the 16 MiB cap the read is `limit+1`, so an oversized body still reaches `MaxBytesReader` and still answers 413; on a tighter route the gate answers 413 itself, with the same status and message. |
 | **pass 2** | The verdict the handler actually runs under. It re-reads the **live** half — the config snapshot and the api-auth credential, the two things a commit can change under an in-flight request — **on every row**, not only on the credential row. The credential re-check used to sit inside `principalFrom`'s off-box branch, which an attributed *local* caller never reaches, so a configured administrator on this host could present secret A, withhold its body, let another session rotate A to B, and still have the mutation run; the same hole in its worst spelling let a request admitted while the listener had *no* api-auth stay credentialless after a commit added one. The **connection-fixed** half (the accept-time peer UID, and the credential row's locality re-derivation) is reused: a connection's addresses do not change mid-request, and re-enumerating interfaces per pass would make every credentialed mutation pay twice for an unchanged answer. The `/etc/passwd` resolution *is* repeated, deliberately — it is a page-cached read of a small local file, and repeating it means an account deleted mid-request is noticed. |
 
 Two residuals, both named. Locality is answered from an enumeration started on
@@ -442,9 +450,17 @@ requests to have emptied the undivided budget, after which a super-user's
 `config/set` must still be served;
 `TestViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` does the same
 with real bytes and asserts the view tier is capped with a whole-configuration
-load still free behind it; `TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561`
+load still free behind it;
+`TestViewTierFloodCannotDenyTheClearTier_5561` drives the *view-versus-clear*
+step — a `read-only` flood saturating the view tier, after which a super-user's
+`dhcp/identifiers/clear` must still be served — which is the step the equal
+16 MiB shares left unprotected;
+`TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561`
 states the ladder in the units of the work it protects (a merely monotonic
-ladder can still protect nothing);
+ladder can still protect nothing), walking **every** privilege step derived from
+`config.LoginClassPermissions` against the largest body derived from the route
+tables, and holding the operational tiers to a concurrency floor so separating
+them by starving one is caught too;
 `TestEveryGuardedRouteDeclaresABodyTier_5561` keeps the ladder covering the
 routes it arbitrates between; and
 `TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` binds the release on

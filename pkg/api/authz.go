@@ -935,9 +935,10 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // The ladder fixes that the way a filesystem reserves blocks for root: a
 // request may be admitted only while the running total is within ITS tier's
 // share, and the shares increase with privilege. Whatever the view tier takes,
-// it stops at 16 MiB — so 48 MiB is permanently out of its reach and belongs to
-// the configure tier; and the configure tier in turn cannot take the last
-// 16 MiB the maintenance verbs need. The total across every tier is still
+// it stops at 8 MiB — so 56 MiB is permanently out of its reach; the clear and
+// control tiers stop at 16 MiB, leaving 48 MiB that belongs to the configure
+// tier; and the configure tier in turn cannot take the last 16 MiB the
+// maintenance verbs need. The total across every tier is still
 // mutationBodyBudgetBytes, so the memory bound is unchanged.
 //
 // The guarantee is one-directional, and deliberately so. Each ceiling is tested
@@ -948,13 +949,44 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // crowding out a privileged one is a denial primitive — and it is the whole
 // reason the shares are ordered rather than equal.
 //
+// Which is exactly why VIEW gets half of what clear and control get, rather
+// than the same 16 MiB round 11 first gave all three (#5561 round 18, finding
+// 1). An aggregate-tested ceiling means a tier is only protected from the tiers
+// STRICTLY BELOW it, and equal shares put no tier below any other: driven to
+// its own 16 MiB, the view tier left the clear tier nothing, so 383 sockets on
+// POST /api/v1/diagnostics/ping from a `read-only` account (PermView) made a
+// super-user's 24-byte POST /api/v1/dhcp/identifiers/clear (PermClear) answer
+// 429. `read-only` holds PermView and `operator` holds PermView + PermClear +
+// PermControl (config.LoginClassPermissions), so that is a cheap permission
+// denying a privileged one — the primitive this table exists to remove — and
+// the round-11 split CREATED it, because before the split there was no budget
+// to exhaust.
+//
+// The step sizes are chosen so every privilege step reserves the LARGEST BODY
+// the tier above it can legitimately carry:
+//
+//	clear/control - view    16 - 8 = 8 MiB  >= 64 KiB (mutationBodySmall, the
+//	                                        dhcp clear; the other clear verbs
+//	                                        are mutationBodyNone and are never
+//	                                        charged, and PermControl has no
+//	                                        routes at all today)
+//	configure - clear       48 - 16 = 32 MiB >= 16 MiB (mutationBodyLoad)
+//	maint - configure       64 - 48 = 16 MiB >= 64 KiB (mutationBodySmall)
+//
+// and 8 MiB still holds 128 concurrent max-size view-route bodies (64 KiB
+// each), or ~16k of the few-hundred-byte ping and traceroute payloads the
+// routes really carry, on a surface that answers a handful of operator actions
+// per second — so the smaller share is not itself an availability regression.
+// TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561 derives both of
+// those checks from the route tables rather than restating the numbers.
+//
 // Keying on the ROUTE's required permission rather than on the CALLER's class
 // is deliberate: it is the action that is being protected, and pass 1 has
 // already established that only a principal holding that permission can reach
 // this point. A super-user's pings draw on the view tier, exactly like anyone
 // else's, and cannot crowd out that same super-user's commit.
 var mutationBodyTierCeilings = map[config.LoginClassPermission]int64{
-	config.PermView:    mutationBodyBudgetBytes / 4,     // 16 MiB
+	config.PermView:    mutationBodyBudgetBytes / 8,     // 8 MiB
 	config.PermClear:   mutationBodyBudgetBytes / 4,     // 16 MiB
 	config.PermControl: mutationBodyBudgetBytes / 4,     // 16 MiB
 	config.PermConfig:  mutationBodyBudgetBytes * 3 / 4, // 48 MiB
