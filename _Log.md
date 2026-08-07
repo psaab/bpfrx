@@ -71034,3 +71034,43 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/compiler_prepass_logging_4960_test.go,
   pkg/dataplane/compiler_idprobe_4960_test.go,
   pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6894 r9b — COMMENT-ONLY. Restate the #4960 pre-pass's no-brick
+  argument as an IMPORT CLOSURE instead of a call trace, and carry a positive
+  control with it. No production behaviour, no test, no fixture changed; the
+  only non-comment edit in the commit is this log entry.
+
+  The r9 comment said configstore's `Load` / `SyncApply` "compile through
+  `pkg/config.compileTreeLenient` and never reach `CompileConfig`". True, but
+  it is a statement about today's call sites: one new call site makes it
+  silently false, and false in the direction that matters, because the next
+  reader trusts it and skips the check. The durable form is that
+  `pkg/dataplane` is not in `pkg/configstore`'s dependency CLOSURE — not merely
+  un-imported, but unreachable through any intermediate package — so the path
+  cannot be created without a visible new dependency edge.
+
+  Measured firsthand at `ba3aa2c40`, including the `-test` variant (a
+  `_test.go` import is a real edge for this purpose):
+
+      go list -deps       ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane -> 0
+      go list -deps -test ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane -> 0
+      go list -deps       ./pkg/daemon      | grep -c psaab/xpf/pkg/dataplane -> non-zero (CONTROL)
+
+  **The control is the load-bearing part and it is why this edit was worth
+  making at all.** A bare `grep -c ... = 0` is indistinguishable from a broken
+  query — wrong module path, wrong flag, a swallowed build failure all print 0.
+  The `pkg/daemon` leg proves the query can find a real edge, which is what
+  converts "0" from an absence of OUTPUT into an absence of DEPENDENCY. Its
+  four edges were listed to confirm the control is not itself a coincidence:
+  `pkg/dataplane`, `.../runtime`, `.../userspace`, `.../userspace/format`. The
+  comment records the control COMMAND and the required NON-ZERO property but
+  deliberately does NOT pin the count — this file already carries one lesson
+  about a stated number going stale (the "ONE such error" note in
+  `validationPhases`), and the value is not what makes the query trustworthy.
+
+  Scope held deliberately tight: nothing else in the file was touched, so the
+  diff is trivially verifiable as comment-only at re-gate time.
+  GATES: `gofmt -l` clean; `go vet ./pkg/dataplane/...` rc=0;
+  `go test ./pkg/dataplane/... ./pkg/config/... -count=1` rc=0.
+- **File(s)**: pkg/dataplane/compiler_validate_4960.go, _Log.md

@@ -82,10 +82,36 @@ package dataplane
 //     today's apply succeeds without it, so those keep warn-and-skip.
 //     `config.NPTv6ScopeUnsupported` is the shared predicate; the builder and
 //     this compiler read the same answer.
-//   - It cannot brick a boot or a peer sync. configstore's Load and SyncApply
-//     compile through pkg/config.compileTreeLenient and never reach
-//     CompileConfig, so the config still loads with the lenient warning; only
-//     the dataplane apply fails, and it already failed at publish.
+//   - It cannot brick a boot or a peer sync, and the reason is STRUCTURAL
+//     rather than a property of today's call sites. pkg/dataplane is not in
+//     pkg/configstore's dependency closure at all -- not merely un-imported
+//     directly, but unreachable through any intermediate package -- so no
+//     tolerant load (Store.Load) or HA peer sync (Store.SyncApply) can enter
+//     this pre-pass. They compile through pkg/config.compileTreeLenient, the
+//     config still loads with the lenient warning validateNPTv6Strict emits,
+//     and only the dataplane apply fails -- which already failed at publish
+//     before this change.
+//
+//     Stated as an import closure deliberately: a call trace answers "is this
+//     reached today", which one new call site invalidates silently, while the
+//     closure answers "is this expressible at all", which cannot change without
+//     a visible new dependency edge. Re-verify with
+//
+//     go list -deps       ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane
+//     go list -deps -test ./pkg/configstore | grep -c psaab/xpf/pkg/dataplane
+//
+//     Both must be 0 (the -test variant matters: a _test.go import is a real
+//     edge for this purpose). Run the POSITIVE CONTROL alongside them or the
+//     zeros prove nothing -- a broken query, a wrong module path or a swallowed
+//     build failure also prints 0:
+//
+//     go list -deps ./pkg/daemon | grep -c psaab/xpf/pkg/dataplane
+//
+//     which must be NON-ZERO, because pkg/daemon genuinely does depend on the
+//     dataplane. The exact count is deliberately not written here; this file
+//     already carries one lesson about a number stated in a comment going stale
+//     (see the "ONE such error" note in validationPhases below). Non-zero is
+//     the property that makes the query trustworthy; the value is not.
 //
 // RESIDUAL, named rather than papered over: the helper ALSO rejects overlapping
 // NPTv6 prefixes (#2241), partitioned by zone scope (#5176). That partitioning
