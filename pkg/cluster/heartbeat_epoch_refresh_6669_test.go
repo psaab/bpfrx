@@ -149,10 +149,7 @@ func keyedEpochManager(t *testing.T, path string) *Manager {
 	bootEpochPath = path
 	t.Cleanup(func() { bootEpochPath = orig })
 
-	m := NewManager(0, 42)
-	m.mu.Lock()
-	m.controlAuthKey = []byte("cluster-shared-secret")
-	m.mu.Unlock()
+	m := epochGateManager()
 	// Backstop the worker's lifetime against this test's teardown. The refine
 	// worker writes under `path`, which is a t.TempDir the harness removes, and
 	// reads package vars a test may have overridden. Registered here so it runs
@@ -952,4 +949,72 @@ func TestSecondStopIsANoOp_6669(t *testing.T) {
 		t.Fatalf("Stop left a sender/receiver installed (sender=%v receiver=%v); a THIRD "+
 			"call would then reach stop() on a closed stopCh", sender != nil, receiver != nil)
 	}
+}
+
+// TestUnkeyedNodeNeverTouchesTheEpochStore_6669 binds the unkeyed early-return
+// in initHeartbeatEpochState.
+//
+// The boot epoch is meaningful only on a KEYED cluster — the section marker is
+// key-derived, so an unkeyed node cannot carry one on the wire — and an unkeyed
+// node must therefore not create state under /var/lib/xpf for a mechanism it
+// cannot use. That guard could be deleted with the whole package green: every
+// other epoch fixture is keyed, so no test ever drove the unkeyed path.
+//
+// The cost of losing it is not security, it is footprint and diagnosis: a
+// standalone or not-yet-keyed node silently grows an ha-boot-epoch file plus its
+// .lock sidecar, and spawns a refine worker that can block on a wedged store, on
+// a node where none of it can ever be read.
+//
+// RED-on-revert: delete the `if len(m.controlLinkAuthKey()) == 0 { return }`
+// arm from initHeartbeatEpochState.
+func TestUnkeyedNodeNeverTouchesTheEpochStore_6669(t *testing.T) {
+	t.Run("unkeyed_writes_nothing_and_publishes_nothing", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+		orig := bootEpochPath
+		bootEpochPath = path
+		t.Cleanup(func() { bootEpochPath = orig })
+
+		m := NewManager(0, 42) // no control-link PSK
+		t.Cleanup(func() { m.joinBootEpochRefine(5 * time.Second) })
+		if len(m.controlLinkAuthKey()) != 0 {
+			t.Fatal("fixture broken: this Manager must be UNKEYED")
+		}
+
+		m.initHeartbeatEpochState()
+
+		// Join before touching the filesystem, so a worker that was wrongly
+		// started cannot land its write after the assertion and read as a pass.
+		if !m.joinBootEpochRefine(5 * time.Second) {
+			t.Fatal("an unkeyed node started a refine worker that did not finish in 5s")
+		}
+		if got := m.bootEpoch.Load(); got != 0 {
+			t.Fatalf("an unkeyed node published boot epoch %d; the wire cannot carry one, so "+
+				"resolving it is pure cost", got)
+		}
+		for _, p := range []string{path, path + ".lock"} {
+			if _, err := os.Stat(p); !os.IsNotExist(err) {
+				t.Fatalf("an unkeyed node created %s (stat err = %v). It must not touch "+
+					"/var/lib/xpf for a mechanism it cannot use — that is state to back up, "+
+					"clean up and explain on every standalone node in the fleet", p, err)
+			}
+		}
+	})
+
+	// NEGATIVE CONTROL. Without it the subtest above is satisfied by a store
+	// path that is simply broken for everyone, which would look identical.
+	t.Run("keyed_does_resolve_and_persist", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ha-boot-epoch")
+		m := keyedEpochManager(t, path)
+
+		m.initHeartbeatEpochState()
+		awaitFirstRefine(t, m, "a keyed node's first refinement")
+
+		if got := m.bootEpoch.Load(); got == 0 {
+			t.Fatal("a KEYED node published no epoch; the guard above is being satisfied by a " +
+				"store path that never writes for anyone")
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("a KEYED node did not persist its epoch to %s: %v", path, err)
+		}
+	})
 }

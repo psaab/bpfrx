@@ -145,7 +145,7 @@ func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
 		// ROTATE FIRST. The archive dies with the old key — but rotation alone
 		// is not the recovery: the latch is in memory and rotation does not
 		// touch it, so the rolled-back peer is still refused under the new key.
-		e.key = rotated
+		e.rotateKey(rotated)
 		if !e.r.auth.peerEpochLatched() {
 			t.Fatal("a PSK rotation must not, by itself, clear the downgrade latch — if it did, " +
 				"the restart in the documented recovery would be pointless")
@@ -217,7 +217,7 @@ func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
 		// NOW rotate. It retires the archive, but the latch it already re-armed
 		// is in memory and rotation does not clear it — a floor and a latch are
 		// per-peer state, not key material. The rolled-back peer stays refused.
-		e.key = rotated
+		e.rotateKey(rotated)
 		if !e.r.auth.peerEpochLatched() {
 			t.Fatal("rotating the PSK must not clear a latch that is already armed; if it did, " +
 				"the ordering advice would be unnecessary")

@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,9 +18,10 @@ import (
 // value + 1 without re-checking it, and the README claimed a bad persisted
 // epoch "heals" without stating the clock precondition that makes that true.
 
-// withPinnedEpochClock pins the instant refineBootEpoch validates against.
-// Both boundaries below exist only for one specific `now`, so the real clock
-// cannot hit them reliably.
+// withPinnedEpochClock pins the instant every clock-dependent epoch check
+// validates against — refineBootEpoch on load, and admitAuthedLocked's forward
+// bound on the accept path. Those boundaries exist only for one specific `now`,
+// so the real clock cannot hit them reliably.
 func withPinnedEpochClock(t *testing.T, now int64) {
 	t.Helper()
 	orig := epochNowNanos
@@ -241,7 +243,15 @@ func TestPersistedEpochHealsOnlyWhenClockCredible_6169(t *testing.T) {
 		// correctly clocked peer refuses the epoch this node now advertises, on
 		// its raise path. That is ASYMMETRIC — this node keeps accepting the
 		// peer, so it does not know it is invisible.
+		//
+		// The peer is a DIFFERENT NODE with a CORRECT clock, and that has to be
+		// modelled explicitly: admitAuthed's forward bound samples epochNowNanos
+		// (#6669 fold round 15), so leaving this subtest's dead-RTC pin in place
+		// would hand the peer the SENDER's broken clock — under which the bound
+		// abstains and the refusal below would be measuring the absolute band
+		// instead.
 		var peer heartbeatAuthState
+		withPinnedEpochClock(t, time.Now().UnixNano())
 		if peer.admitAuthed(true, got, 0x6669, 1) {
 			t.Fatalf("a correctly clocked peer admitted epoch %d; it is far beyond that peer's "+
 				"forward bound and must be refused", got)
@@ -263,5 +273,101 @@ func TestEpochClockPinIsTestOnly_6169(t *testing.T) {
 	if delta := now - got; delta < 0 || delta > int64(time.Minute) {
 		t.Fatalf("epochNowNanos() = %d but time.Now() = %d — the default clock hook is not the "+
 			"real clock (a test leaked its pin?)", got, now)
+	}
+}
+
+// TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669 is the fail-on-revert gate
+// for epochUsableAsFloor on the ACCEPT path.
+//
+// The two bounds in admitAuthedLocked are ORDERED belts, and with a real clock
+// the outer one absorbs every fixture the inner one has:
+// TestHeartbeatEpochImplausibleValueCannotLockOut_6169 feeds MaxUint64,
+// epochPlausibleMax and now+2h, and all three are also beyond
+// bootEpochMaxSkew ahead of a present-day `now`, so the forward bound rejects
+// them whether or not the absolute band exists. epochUsableAsFloor was
+// therefore deletable with the whole package green.
+//
+// Its unique regime is the one epochWithinForwardBound abstains from: a
+// RECEIVER whose own clock reads below epochClockSaneFloor — a dead RTC, or a
+// boot that beat NTP, the same appliance fault
+// TestRefinementSamplesTheClockAfterLoadingPersistedState_6669 models. There the
+// forward bound cannot judge anything and the absolute band is the only filter
+// left standing. That regime was untestable until the accept-path sample was
+// routed through epochNowNanos; the fix was the seam, not a wider fixture.
+//
+// SCOPE, stated so this is not read as more than it is: a CONFORMING #6169
+// sender cannot emit such a value. refineBootEpoch refuses to chain from a
+// persisted epoch whose successor fails epochOrderable, and that refusal is
+// clock-independent. This is a backstop against a peer running a foreign or
+// non-conforming build under a legitimate PSK, not a live hole in xpf-to-xpf
+// traffic — which is why it is a bound worth keeping and not a bug worth
+// escalating.
+//
+// RED-on-revert: delete the `if !epochUsableAsFloor(epoch) { return false }`
+// arm from admitAuthedLocked.
+func TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669(t *testing.T) {
+	// A dead RTC boots the appliance near the Unix epoch, below
+	// epochClockSaneFloor.
+	const deadRTCNow = int64(5_000_000_000)
+
+	// FIXTURE PRECONDITIONS. Both halves, because this test proves nothing
+	// unless the forward bound is genuinely abstaining and the absolute band is
+	// genuinely the one rejecting.
+	if uint64(deadRTCNow) >= epochClockSaneFloor {
+		t.Fatalf("fixture broken: %d must be below epochClockSaneFloor (%d) or the clock is "+
+			"credible and the forward bound still engages", deadRTCNow, epochClockSaneFloor)
+	}
+	for _, bad := range []uint64{math.MaxUint64, epochPlausibleMax} {
+		if !epochWithinForwardBound(bad, deadRTCNow) {
+			t.Fatalf("fixture broken: the forward bound must ABSTAIN on %d at an uncredible "+
+				"clock; if it rejects, it is still the outer belt and this test is a "+
+				"restatement of it", bad)
+		}
+		if epochUsableAsFloor(bad) {
+			t.Fatalf("fixture broken: %d must be outside the absolute plausibility band", bad)
+		}
+	}
+
+	withPinnedEpochClock(t, deadRTCNow)
+	e := newLatchEnv(t)
+
+	for _, bad := range []uint64{math.MaxUint64, epochPlausibleMax} {
+		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x6690, 1, bad)) {
+			t.Fatalf("#6669: an epoch of %d was ADMITTED on a receiver whose own clock is not "+
+				"credible. The forward bound abstains there, so the absolute year-2200 band is "+
+				"the only filter left — without it a single frame parks the floor at an "+
+				"unreachable value and every genuine peer frame is then below it, which is a "+
+				"self-inflicted lockout an attacker gets for one packet", bad)
+		}
+	}
+	if got := e.r.auth.peerEpochFloor(); got != 0 {
+		t.Fatalf("floor = %d, want 0 — a refused frame must not move the floor", got)
+	}
+	if e.r.auth.peerEpochLatched() {
+		t.Fatal("a refused frame must not arm the latch")
+	}
+
+	// OVER-REACH GUARD, and it is what separates this from a restatement of the
+	// outer belt. Both of these stay GREEN when epochUsableAsFloor is deleted:
+	//
+	//   - an epoch INSIDE the absolute band but beyond bootEpochMaxSkew is still
+	//     refused, by the forward bound, once the clock is credible;
+	//   - an ordinary in-range epoch is still admitted, so nothing here has been
+	//     turned into a lockout.
+	withPinnedEpochClock(t, int64(epochClockSaneFloor)+int64(time.Hour))
+	credible := epochNowNanos()
+	ahead := uint64(credible) + bootEpochMaxSkew*2
+	if !epochUsableAsFloor(ahead) {
+		t.Fatalf("fixture broken: %d must be INSIDE the absolute band, or the guard below is "+
+			"measuring the band rather than the forward bound", ahead)
+	}
+	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x6691, 1, ahead)) {
+		t.Fatal("an epoch beyond the forward bound was admitted at a credible clock")
+	}
+	ok := uint64(credible) - uint64(time.Hour)
+	e.liveRun(e.captureIncarnation(0x6692, ok, epochFramesPerIncarnation),
+		"a genuine peer with an ordinary in-range epoch")
+	if got := e.r.auth.peerEpochFloor(); got != ok {
+		t.Fatalf("floor = %d after a genuine peer, want %d", got, ok)
 	}
 }

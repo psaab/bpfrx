@@ -43,10 +43,38 @@ type epochEnv struct {
 	key []byte
 }
 
+// epochTestPSK is the control-link PSK every epoch fixture is keyed with. One
+// constant, installed on the MANAGER, because feed now delegates to admitFrame
+// and admitFrame reads the key from the Manager exactly as production does. A
+// helper holding its own private copy of the key would put the duplication back
+// one level down.
+var epochTestPSK = []byte("cluster-shared-secret")
+
+// epochGateManager is a Manager on a KEYED cluster — the only configuration in
+// which the boot epoch exists at all, since the section marker is key-derived.
+//
+// It deliberately does NOT redirect bootEpochPath: nothing on the gate path
+// (admitFrame, handlePeerHeartbeat) touches the epoch store. Only StartHeartbeat
+// and heartbeatSender.send resolve an epoch, and a fixture that drives either of
+// those must use keyedEpochManager, which points the path at a per-test file and
+// joins the refine worker.
+func epochGateManager() *Manager { return epochGateManagerWithKey(epochTestPSK) }
+
+// epochGateManagerWithKey is epochGateManager under a NAMED key, for the
+// rotation fixtures: a daemon restart re-reads the committed PSK, so a restart
+// after a rotation must come up on the ROTATED key, not the original one.
+func epochGateManagerWithKey(key []byte) *Manager {
+	m := NewManager(0, 42)
+	m.mu.Lock()
+	m.controlAuthKey = key
+	m.mu.Unlock()
+	return m
+}
+
 func newEpochEnv(t *testing.T) *epochEnv {
 	t.Helper()
-	m := NewManager(0, 42)
-	e := &epochEnv{t: t, m: m, key: []byte("cluster-shared-secret")}
+	m := epochGateManager()
+	e := &epochEnv{t: t, m: m, key: m.controlLinkAuthKey()}
 	e.restartHeartbeat()
 	return e
 }
@@ -64,35 +92,40 @@ func (e *epochEnv) restartHeartbeat() {
 	e.m.mu.Unlock()
 }
 
-// feed pushes one raw frame through the EXACT gate readLoop applies (see
-// heartbeatReceiver.readLoop) and applies the exact consequences readLoop
-// applies on accept. It reports whether the frame was accepted.
+// feed pushes one raw frame through the gate readLoop applies, by CALLING it —
+// heartbeatReceiver.admitFrame is the single implementation both use. It
+// reports whether the frame was accepted.
+//
+// It used to re-implement that gate line-for-line and assert equivalence in a
+// prose comment. That is why severing the receiver's epoch read left every
+// epoch test green: the tests were exercising the copy. Delegation makes the
+// equivalence structural instead of asserted — see admitFrame.
 func (e *epochEnv) feed(frame []byte) bool {
 	e.t.Helper()
 	pkt, err := UnmarshalHeartbeat(frame)
 	if err != nil {
 		e.t.Fatalf("unmarshal: %v", err)
 	}
-	session, counter, present := heartbeatAuthTrailer(frame)
-	macOK := present && len(e.key) > 0 && verifyHeartbeatMAC(frame, e.key)
-	var (
-		epoch    uint64
-		hasEpoch bool
-	)
-	if macOK {
-		epoch, hasEpoch = heartbeatFrameEpoch(frame, e.key)
-	}
-	nonceFresh := macOK && e.r.auth.admitAuthed(hasEpoch, epoch, session, counter)
-	accept, _ := heartbeatAuthDecision(len(e.key) > 0, present, macOK, nonceFresh, e.r.auth.peerAuthenticated())
-	if !accept {
-		return false
-	}
-	if macOK {
-		e.r.auth.notePeerAuthenticated()
-	}
-	e.r.lastSeen.Store(MonotonicNanos())
-	e.m.handlePeerHeartbeat(pkt)
-	return true
+	return e.r.admitFrame(frame, pkt)
+}
+
+// rotateKey models the operator rotating the control-link PSK on this node: the
+// committed key changes, so the RECEIVER verifies with the new one from the next
+// frame on, and the peer signs with it too.
+//
+// BOTH halves, because admitFrame reads the key from the Manager exactly as
+// production does. A fixture that changed only its own signing key would leave
+// production verifying with the OLD one, so an archived frame signed under that
+// old key still verified — and every "rotation retires the attacker's capture"
+// assertion was measuring nothing. That is what this fixture did before the
+// gate was deduplicated, and it is why restating a production gate in a test
+// helper is not a neutral convenience.
+func (e *epochEnv) rotateKey(key []byte) {
+	e.t.Helper()
+	e.key = key
+	e.m.mu.Lock()
+	e.m.controlAuthKey = key
+	e.m.mu.Unlock()
 }
 
 // captureIncarnation builds the authenticated frames an on-link attacker

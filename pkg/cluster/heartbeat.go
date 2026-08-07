@@ -635,10 +635,15 @@ const heartbeatReplaySessions = 64
 //     that publishes its predecessor's epoch, and that is REACHABLE on a
 //     healthy, advancing clock: refineBootEpoch chains to exactly prev+1, which
 //     is a pure function of the file, so a store that reads but cannot WRITE
-//     hands every successive incarnation the identical value. Measured through
-//     initHeartbeatEpochState over a write-failing directory: 0/40 heartbeats
-//     from the second incarnation admitted, which declares a healthy node dead
-//     in 1s at the shipped 200ms interval and threshold 5.
+//     hands every successive incarnation the identical value — PROVIDED the file
+//     sits at or above the wall-clock seed, since the chain engages only on
+//     `prev+1 > epoch`. An unwritable store holding a value BEHIND `now` gives
+//     each incarnation its own higher seed and no collision at all; the reachable
+//     shape is the unwritable store plus an RTC that ran fast and was corrected
+//     back, which is what epochUnwritableStore builds. Measured through
+//     initHeartbeatEpochState over such a directory: 0/40 heartbeats from the
+//     second incarnation admitted, which declares a healthy node dead in 1s at
+//     the shipped 200ms interval and threshold 5.
 //   - unbounded (pre-round-10) is the #6169 replay hole itself: 65 captured
 //     incarnations sharing one epoch churned the ring 1625/1625.
 //
@@ -1358,7 +1363,15 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// wall-clock step beyond bootEpochMaxSkew reject a HEALTHY peer before the
 	// monotonic lastSeen update, declaring it dead in ~500ms and going
 	// dual-master. See epochWithinForwardBound.
-	if epoch > s.highEpoch && !epochWithinForwardBound(epoch, time.Now().UnixNano()) {
+	//
+	// Sampled through epochNowNanos rather than time.Now directly, so the
+	// regime this bound does NOT cover is drivable: below epochClockSaneFloor
+	// (a dead RTC, or a boot before NTP) epochWithinForwardBound abstains
+	// entirely and epochUsableAsFloor above is the only surviving filter. With
+	// a real clock that regime is unreachable from a test, which left the
+	// absolute band looking redundant with this one. See
+	// TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669.
+	if epoch > s.highEpoch && !epochWithinForwardBound(epoch, epochNowNanos()) {
 		return false
 	}
 	if !s.replay.admit(session, counter) {
@@ -1795,58 +1808,81 @@ func (r *heartbeatReceiver) readLoop() {
 			continue
 		}
 
-		// #4107 control-channel authentication. When a PSK is configured the
-		// heartbeat/election channel is HMAC-authenticated; a forged or
-		// replayed heartbeat is rejected HERE, before it can refresh peer
-		// liveness (lastSeen) or drive election (handlePeerHeartbeat).
-		// Dual-accept keeps a mixed-version / not-yet-keyed cluster from
-		// splitting — see heartbeatAuthDecision. The key is never logged.
-		key := r.mgr.controlLinkAuthKey()
-		session, counter, present := heartbeatAuthTrailer(buf[:n])
-		macOK := present && len(key) > 0 && verifyHeartbeatMAC(buf[:n], key)
-		// #6169: the boot epoch is read ONLY from a MAC-verified frame — only a
-		// verified frame authorises treating len-52 as the end of the signed
-		// body — and the epoch floor is applied BEFORE the session ring, so a
-		// frame the floor REJECTS never churns it. That is an ordering property
-		// of admitAuthedLocked, not a claim that every replayed retired frame is
-		// rejected: after a sender regression (#6711) an archived frame can sit
-		// at or above the floor and reach the ring like any other.
-		var (
-			epoch    uint64
-			hasEpoch bool
-		)
-		if macOK {
-			epoch, hasEpoch = heartbeatFrameEpoch(buf[:n], key)
-		}
-		nonceFresh := macOK && r.auth.admitAuthed(hasEpoch, epoch, session, counter)
-		accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
-		if !accept {
-			r.recvErrors.Add(1)
-			// #6169: an authenticated frame that lost its epoch after the peer
-			// had proved it signs one is operator-actionable (a deliberate
-			// rollback stays refused until the floor is cleared), so surface it
-			// distinctly instead of burying it in the generic replay reason.
-			if macOK && !hasEpoch && r.auth.peerEpochLatched() {
-				r.mgr.NoteEpochDowngradeHeartbeat()
-			}
-			slog.Warn("cluster: heartbeat auth rejected",
-				"reason", reason, "peer_node", pkt.NodeID)
+		if !r.admitFrame(buf[:n], pkt) {
 			continue
 		}
-		if macOK {
-			// The peer proved it holds the key — from now on an
-			// unauthenticated frame from it is a downgrade attack. This also
-			// arms the gRPC fabric listener's downgrade-guard (via
-			// Manager.HeartbeatPeerAuthSeen).
-			r.auth.notePeerAuthenticated()
-		}
-
-		r.received.Add(1)
-		// Store CLOCK_MONOTONIC, not wall clock: the timeout comparison
-		// must be immune to wall-clock steps (#1792).
-		r.lastSeen.Store(MonotonicNanos())
-		r.mgr.handlePeerHeartbeat(pkt)
 	}
+}
+
+// admitFrame runs the #4107/#6169 authentication gate over one raw heartbeat
+// datagram and, on accept, applies the consequences an accepted frame has:
+// refresh peer liveness (lastSeen) and drive election (handlePeerHeartbeat).
+// It reports whether the frame was accepted.
+//
+// IT IS THE ONLY IMPLEMENTATION OF THAT GATE — the point of it being a method
+// rather than inline in readLoop. Two epoch fixtures used to RESTATE the gate
+// line-for-line and assert equivalence in a prose comment, so severing
+// `if macOK { epoch, hasEpoch = ... }` here — every frame read as epochless, the
+// floor never consulted, the latch never armed — left the whole package green.
+// Two human-written artifacts restating each other catch typos, not wrong
+// beliefs. Those helpers now DELEGATE here, so divergence is impossible rather
+// than asserted. Do not reintroduce a second copy for a test's convenience.
+//
+// pkt must be the already-unmarshalled view of frame; readLoop needs it for the
+// cluster-id and duplicate-node-id checks that run first.
+func (r *heartbeatReceiver) admitFrame(frame []byte, pkt *HeartbeatPacket) bool {
+	// #4107 control-channel authentication. When a PSK is configured the
+	// heartbeat/election channel is HMAC-authenticated; a forged or
+	// replayed heartbeat is rejected HERE, before it can refresh peer
+	// liveness (lastSeen) or drive election (handlePeerHeartbeat).
+	// Dual-accept keeps a mixed-version / not-yet-keyed cluster from
+	// splitting — see heartbeatAuthDecision. The key is never logged.
+	key := r.mgr.controlLinkAuthKey()
+	session, counter, present := heartbeatAuthTrailer(frame)
+	macOK := present && len(key) > 0 && verifyHeartbeatMAC(frame, key)
+	// #6169: the boot epoch is read ONLY from a MAC-verified frame — only a
+	// verified frame authorises treating len-52 as the end of the signed
+	// body — and the epoch floor is applied BEFORE the session ring, so a
+	// frame the floor REJECTS never churns it. That is an ordering property
+	// of admitAuthedLocked, not a claim that every replayed retired frame is
+	// rejected: after a sender regression (#6711) an archived frame can sit
+	// at or above the floor and reach the ring like any other.
+	var (
+		epoch    uint64
+		hasEpoch bool
+	)
+	if macOK {
+		epoch, hasEpoch = heartbeatFrameEpoch(frame, key)
+	}
+	nonceFresh := macOK && r.auth.admitAuthed(hasEpoch, epoch, session, counter)
+	accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
+	if !accept {
+		r.recvErrors.Add(1)
+		// #6169: an authenticated frame that lost its epoch after the peer
+		// had proved it signs one is operator-actionable (a deliberate
+		// rollback stays refused until the floor is cleared), so surface it
+		// distinctly instead of burying it in the generic replay reason.
+		if macOK && !hasEpoch && r.auth.peerEpochLatched() {
+			r.mgr.NoteEpochDowngradeHeartbeat()
+		}
+		slog.Warn("cluster: heartbeat auth rejected",
+			"reason", reason, "peer_node", pkt.NodeID)
+		return false
+	}
+	if macOK {
+		// The peer proved it holds the key — from now on an
+		// unauthenticated frame from it is a downgrade attack. This also
+		// arms the gRPC fabric listener's downgrade-guard (via
+		// Manager.HeartbeatPeerAuthSeen).
+		r.auth.notePeerAuthenticated()
+	}
+
+	r.received.Add(1)
+	// Store CLOCK_MONOTONIC, not wall clock: the timeout comparison
+	// must be immune to wall-clock steps (#1792).
+	r.lastSeen.Store(MonotonicNanos())
+	r.mgr.handlePeerHeartbeat(pkt)
+	return true
 }
 
 func (r *heartbeatReceiver) timeoutLoop() {

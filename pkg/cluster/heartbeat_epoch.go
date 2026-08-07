@@ -203,12 +203,23 @@ const bootEpochStopJoinBudget = 2 * time.Second
 // paths it claims. Production never replaces it.
 var epochFlock = unix.Flock
 
-// epochNowNanos is the wall clock refineBootEpoch validates persisted state
-// against. A var so a test can PIN an instant: the load-time checks are
-// clock-DEPENDENT (epochWithinForwardBound is skipped below
-// epochClockSaneFloor, and the forward bound is relative to this sample), so
-// the boundaries only exist for one specific `now` and cannot be hit reliably
-// with the real clock. Production never replaces it.
+// epochNowNanos is the wall clock every CLOCK-DEPENDENT epoch check samples:
+// refineBootEpoch validating persisted state at load, and admitAuthedLocked
+// applying the forward bound on the raise path. A var so a test can PIN an
+// instant — epochWithinForwardBound is relative to this sample and abstains
+// entirely below epochClockSaneFloor, so its boundaries only exist for one
+// specific `now` and cannot be hit reliably with the real clock.
+//
+// The ACCEPT-PATH sample was added late, and its absence had a cost worth
+// recording: with the real clock, `now` is always well above
+// epochClockSaneFloor, so the forward bound always engages and absorbs every
+// fixture the absolute band (epochUsableAsFloor) also catches. That made the
+// absolute band deletable with the suite green — ordered belts, the outer one
+// swallowing the inner one's whole tested range — even though the band is the
+// only filter that survives an uncredible clock. See
+// TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669.
+//
+// Production never replaces it.
 var epochNowNanos = func() int64 { return time.Now().UnixNano() }
 
 // epochRefineBeforeRelease is a test seam on the refine worker's exit path, for

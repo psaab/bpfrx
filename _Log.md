@@ -71679,3 +71679,79 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-07 — #6669 fold round 15: bind the boot-epoch production wiring at both ends
+
+- **Timestamp**: 2026-08-07
+- **Action**: PR #6669 (advances #6169). An independent hostile review ran 34
+  mutations and found the ALGORITHM well bound — every off-by-one on the
+  security bound REDs — but the mechanism's PRODUCTION WIRING unbound at BOTH
+  ends, and it is one defect twice.
+
+  The SEND site, `heartbeatSender.send`, was the only line putting an epoch on
+  the wire. Passing `0` there makes `marshalHeartbeatAuthEpoch` emit a
+  byte-identical LEGACY frame (measured on-wire len 81 -> 65), and
+  `go test ./pkg/cluster` stayed fully green. Both nodes could run "#6169",
+  neither receiver would ever latch, and the >=65-recording sustained replay
+  the change exists to close would be wide open under passing CI.
+
+  The RECEIVE site was unbound for a structural reason: `epochEnv.feed` and
+  `replay5086Env.feed` each RE-IMPLEMENTED readLoop's auth gate line-for-line
+  and asserted equivalence in a prose comment ("the EXACT gate readLoop
+  applies"). Every epoch test routed through those copies, so readLoop's own
+  epoch path had zero coverage and severing its `heartbeatFrameEpoch` read left
+  the package green.
+
+  The receive half is DEDUPLICATED rather than merely tested: the gate is
+  extracted to `heartbeatReceiver.admitFrame`, readLoop calls it, and both
+  fixtures now DELEGATE to it. Deriving one side from the other beats asserting
+  equivalence in prose — and it immediately exposed a fixture that was measuring
+  nothing: the rollback tests "rotated the PSK" by reassigning the test's own
+  signing key while production kept verifying with the Manager's unchanged one,
+  so "rotation retires the archive" was never exercised. Rotation now goes
+  through `epochEnv.rotateKey`, which moves BOTH, and `restartDaemon` comes up
+  on the rotated key as a real daemon re-reading committed config would.
+
+  Also folded: the accept-path forward bound now samples the existing
+  `epochNowNanos` seam instead of `time.Now()` directly, which makes the
+  dead-RTC regime drivable and stops `epochUsableAsFloor` from being absorbed by
+  the outer belt; the `NoteEpochDowngradeHeartbeat` call site and the
+  unkeyed-node `/var/lib/xpf` guard are bound; and two code comments that told
+  an operator an unwritable `/var` produces equal epochs "with the clock
+  irrelevant" are corrected — the chain engages only on `prev+1 > epoch`, so it
+  also needs the file at or above the wall-clock seed (measured at both
+  polarities: file 30m behind gives distinct epochs, 30m ahead gives equal).
+
+- **Validation**: five disjoint mutation cells, `go vet` rc=0 before each so no
+  RED is a build break.
+  M1 (send site -> `0`): ONLY `TestBootEpochTraversesTheRealSendAndReceivePath_6169`
+  REDs in the whole package, on both halves — "the frame heartbeatSender.send
+  put on the wire carries NO epoch section (len=65)" and the end-to-end latch
+  assertion. The over-reach guard asserted first (`readLoop accepted 1 frame`)
+  stays GREEN, so the mutation is shown to cost the epoch and not liveness.
+  M2 (`if macOK` -> `if macOK && false` on the receiver's epoch read): 28 test
+  functions RED, up from 0 before the deduplication; the send-side observation
+  subtest correctly stays GREEN, so the two halves are separately diagnosable.
+  M3 (delete `epochUsableAsFloor` from `admitAuthedLocked`): only
+  `TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669` REDs — "an epoch of
+  18446744073709551615 was ADMITTED on a receiver whose own clock is not
+  credible"; its credible-clock over-reach guard stays GREEN.
+  M4 (delete the `NoteEpochDowngradeHeartbeat` block): only the downgrade test's
+  positive subtest REDs; its unverifiable-frame negative control stays GREEN.
+  M5 (delete the unkeyed early return in `initHeartbeatEpochState`): only the
+  unkeyed subtest REDs — "an unkeyed node published boot epoch ..."; its keyed
+  negative control stays GREEN.
+  `go build ./...` 0, `gofmt -l pkg/cluster` empty,
+  `go test ./pkg/cluster -count=1` ok 15.4s,
+  `go test -race -count=2 ./pkg/cluster` ok 35.8s.
+  `heartbeat.go` is 1992 lines, still [WATCH]; audit regenerated.
+
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_epoch_wire_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_replay_restart_5086_test.go,
+  pkg/cluster/README.md, docs/refactoring-audit-current.txt, _Log.md

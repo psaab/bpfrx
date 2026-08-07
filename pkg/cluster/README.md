@@ -929,10 +929,23 @@ peer liveness (`lastSeen`) or drive election.
     pre-upgrade capture is genuinely signed (it came off a keyed cluster), so it
     passes the first gate and is stopped only by the second — which is precisely
     why the epoch latch was needed. An unsigned frame never reaches the epoch
-    gate: `readLoop` calls `admitAuthed` only when the MAC verified. The one
-    path skipping BOTH is a cluster with no key configured at all, where there
-    is no MAC to verify and the key-derived marker cannot exist; that is #6624's
-    domain (an unkeyed chassis cluster is refused at commit), not the epoch's.
+    gate: `heartbeatReceiver.admitFrame` — the single implementation of the
+    receive-side gate, called by `readLoop` for every datagram and by the epoch
+    fixtures instead of a restated copy — reads the epoch and calls
+    `admitAuthed` only when the MAC verified. The one path skipping BOTH is a
+    cluster with no key configured at all, where there is no MAC to verify and
+    the key-derived marker cannot exist; that is #6624's domain (an unkeyed
+    chassis cluster is refused at commit), not the epoch's.
+
+    **The wiring at both ends is bound by an end-to-end test, not by
+    inspection.** `TestBootEpochTraversesTheRealSendAndReceivePath_6169` drives
+    the real `heartbeatSender` through a real UDP socket into the real
+    `readLoop` goroutine and asserts the receiver latched the exact epoch the
+    sender published. Before it existed, passing `0` at the send site
+    (`marshalHeartbeatAuthEpoch`'s last argument, which produces a byte-identical
+    legacy frame) and severing the receiver's epoch read BOTH left `go test
+    ./pkg/cluster` fully green — two nodes could run this code, neither latch,
+    and the sustained replay stay open under passing CI.
   - **Observability.** `HeartbeatStats.EpochlessAdmitted` counts authenticated
     heartbeats admitted WITHOUT an epoch — the exposure meter — and
     `EpochDowngradeRejected` counts those the latch refused. Without a counter

@@ -73,7 +73,9 @@ func newLatchEnv(t *testing.T) *latchEnv {
 // restart or a VRF rebind — which preserve Manager.hbAuth (#5086/#6642) — this
 // discards every in-memory tracker, including the downgrade latch.
 func (e *latchEnv) restartDaemon() {
-	e.m = NewManager(0, 42)
+	// The restarted daemon re-reads the COMMITTED PSK, so it comes up on
+	// whatever rotateKey last installed — not on the original key.
+	e.m = epochGateManagerWithKey(e.key)
 	e.r = newHeartbeatReceiver(e.m, nil, DefaultHeartbeatThreshold, DefaultHeartbeatInterval)
 	e.m.mu.Lock()
 	e.m.hbReceiver = e.r

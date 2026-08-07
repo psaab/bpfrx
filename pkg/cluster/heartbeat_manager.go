@@ -571,13 +571,25 @@ type HeartbeatStats struct {
 	// thing to check is a NON-WRITABLE /var on that node — a full filesystem, a
 	// quota, or a read-only remount. refineBootEpoch chains to persisted+1,
 	// which is a pure function of the file, so a store that READS but cannot
-	// WRITE hands every restart the identical value; the node's clock is
-	// irrelevant to this and is usually perfectly correct. `df` and a test write
-	// under /var/lib/xpf find it. The degenerate second cause — a clock at or
-	// before the Unix epoch, which makes bootEpochSeed return the literal 1 for
-	// every incarnation — is worth checking only after the store is ruled out.
-	// Either way the sender recovers once its epoch can move again; see
-	// pkg/cluster/README.md.
+	// WRITE hands every restart the identical value. `df` and a test write under
+	// /var/lib/xpf find it.
+	//
+	// IT TAKES THE FILE AS WELL AS THE STORE FAULT, and an earlier revision of
+	// this note said the clock was "irrelevant to this and usually perfectly
+	// correct". The chain only engages when `prev+1 > epoch`, and `epoch` is
+	// this incarnation's WALL-CLOCK seed, so an unwritable /var holding a value
+	// BEHIND the current clock changes nothing — each restart simply publishes
+	// its own, higher, seed. Measured on the fixture in
+	// TestEqualEpochSuccessorIsAdmitted_6669 at both polarities: a file 30
+	// minutes behind `now` gives two incarnations 1786141172292358650 and
+	// 1786141172295059255 (different), the same file 30 minutes AHEAD gives both
+	// 1786142972295695676 (equal). So the regime is an unwritable store holding a
+	// value at or above the wall-clock seed — an RTC that ran fast and was
+	// corrected back, or a clock that stepped backwards. Look at both, not just
+	// `df`. The degenerate third cause — a clock at or before the Unix epoch,
+	// which makes bootEpochSeed return the literal 1 for every incarnation — is
+	// worth checking only after the store is ruled out. Either way the sender
+	// recovers once its epoch can move again; see pkg/cluster/README.md.
 	//
 	// CLIMBING WHILE PEER LIVENESS IS STILL HEALTHY is an attacker replaying a
 	// captured set that shares an epoch. Read that as "not yet affected" rather
