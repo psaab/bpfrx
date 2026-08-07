@@ -205,6 +205,13 @@ func (m *Manager) CompileUserspaceShim(cfg *config.Config) (*CompileResult, erro
 	if err := m.attachUserspaceShimXDP(result); err != nil {
 		return nil, err
 	}
+	// #5275 PR1: OBSERVE-ONLY arm-coverage proof. Runs after the attach so it
+	// sees real link state, reports what a gating build would have decided,
+	// and gates NOTHING — the return value is deliberately discarded. It reads
+	// `result` directly and publishes nothing: hoisting the m.lastCompile
+	// assignment to feed it would expose a half-observed CompileResult through
+	// the exported LastCompileResult() for a diagnostic's benefit.
+	m.ProveArmCoverage(result).LogArmCoverage("post-attach", m.nextApplyGeneration())
 
 	for ifidx := range result.genericXDPIfindexes {
 		if !result.tunnelIfindexes[ifidx] {
@@ -486,7 +493,7 @@ func xdpAttachModeMatches(ifindex int, wantGeneric bool) bool {
 	if xdp == nil || !xdp.Attached {
 		return true
 	}
-	isGeneric := xdp.AttachMode == 2 /* XDP_ATTACHED_SKB */
+	isGeneric := xdp.AttachMode == xdpAttachedSKB
 	return isGeneric == wantGeneric
 }
 
