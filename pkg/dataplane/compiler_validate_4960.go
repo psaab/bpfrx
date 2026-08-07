@@ -63,6 +63,36 @@ package dataplane
 // So the guarantee this file provides is bounded to the phases in
 // validationPhases. A failure in any of the three above still lands
 // post-mutation.
+//
+// A FOURTH class is worth stating separately, because it is not "a phase we do
+// not run" but "a phase we DO run that was not strict enough" (#6894 r9 F1).
+// A covered row that ACCEPTS what the Rust helper later REJECTS reproduces the
+// exact #4960 shape from inside the guard: the helper's rejection lands in
+// publishSnapshotFailClosedLocked, after compileZones has mutated the host.
+// NPTv6 was such a row. `Match = "2001:db8:9::/48"` with `Then =
+// "not-a-prefix"` is retained by lenient validation with a warning, warned-and-
+// skipped by compileNPTv6, copied verbatim into the snapshot, and then rejected
+// WHOLE by Nptv6State::try_from_snapshots (userspace-dp/src/nptv6.rs,
+// #2240/#4519). compileNPTv6 now returns an error for the parse class instead,
+// so the same certain failure happens before the mutation rather than after it.
+// Two properties keep that from over-rejecting, and both matter:
+//
+//   - It fires only for rules that actually REACH the helper. The snapshot
+//     builder drops a rule carrying an unsupported match scope (#5818), and
+//     today's apply succeeds without it, so those keep warn-and-skip.
+//     `config.NPTv6ScopeUnsupported` is the shared predicate; the builder and
+//     this compiler read the same answer.
+//   - It cannot brick a boot or a peer sync. configstore's Load and SyncApply
+//     compile through pkg/config.compileTreeLenient and never reach
+//     CompileConfig, so the config still loads with the lenient warning; only
+//     the dataplane apply fails, and it already failed at publish.
+//
+// RESIDUAL, named rather than papered over: the helper ALSO rejects overlapping
+// NPTv6 prefixes (#2241), partitioned by zone scope (#5176). That partitioning
+// is not replicated here. Replicating it coarsely — as validateNPTv6Strict's
+// commit-time overlap check does, which does not partition — would reject
+// configs the helper ACCEPTS, turning a post-mutation failure into a failed
+// apply for a working config. An overlap therefore still lands post-mutation.
 
 import (
 	"fmt"

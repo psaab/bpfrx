@@ -549,6 +549,29 @@ then stays green.
     sentence — the previous wording had the two the wrong way round. That file
     states what the pre-pass
     does and does not cover; the coverage table is not the whole compile.
+  - **The pre-pass is only as good as the phases' own strictness** (#6894 r9,
+    #4960). A row that ACCEPTS what the Rust helper later REJECTS puts the
+    half-applied state back: the helper's rejection lands at
+    `publishSnapshotFailClosedLocked`, after the zones phase has already
+    created VLANs and reconciled addresses. NPTv6 was such a row —
+    `compileNPTv6` warned and skipped an unparseable / length-mismatched /
+    host-bits-set prefix while `Nptv6State::try_from_snapshots` rejects the
+    WHOLE snapshot over it (`userspace-dp/src/nptv6.rs`, #2240/#4519). It now
+    returns an error for those, so the same certain failure happens BEFORE the
+    mutation. The error is scoped to rules that actually reach the helper:
+    `config.NPTv6ScopeUnsupported` is the shared predicate the snapshot builder
+    uses to DROP a rule (#5818), and a dropped rule keeps the warn-and-skip
+    disposition because today's apply succeeds without it. **Residual:** the
+    helper also rejects OVERLAPPING NPTv6 prefixes (#2241) partitioned by zone
+    scope (#5176); the pre-pass does not replicate that partitioning, so an
+    overlap still fails post-mutation. Replicating it coarsely would REJECT
+    configs the helper accepts, which is worse than the residual.
+  - **No-brick note.** A pre-pass rejection cannot strand a boot or an HA
+    peer-sync: `configstore.Store.Load` and `Store.SyncApply` compile through
+    `pkg/config.compileTreeLenient` and never reach `pkg/dataplane.CompileConfig`
+    at all. The config still loads with the warning `validateNPTv6Strict` emits
+    on the tolerant path; what fails is the dataplane apply, which already
+    failed at publish before this change.
 - `CompileResult` — `compiler.go`. Zone/policy/NAT/app IDs, compiled
   policy-scheduler rule slots, and the per-interface networkd configs.
 - Session iteration: `IterateSessions`, `BatchIterateSessions`,

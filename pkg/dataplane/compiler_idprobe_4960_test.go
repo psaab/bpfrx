@@ -26,6 +26,7 @@ package dataplane
 // rather than silently succeeding.
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -440,7 +441,22 @@ func compileIDsOnce(t *testing.T, cfg *config.Config) map[string]any {
 func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	cfg := idProbeConfig()
 
-	first := compileIDsOnce(t, cfg)  // the discarded validate pass
+	first := compileIDsOnce(t, cfg) // the discarded validate pass
+
+	// SNAPSHOT BEFORE THE SECOND COMPILE (#6894 r9 F3). `first` holds LIVE map
+	// and slice references. Comparing them to `second` only after the second
+	// compile has run is exactly blind to the failure class this test names: a
+	// regression storing IDs in process-global or interned state would mutate
+	// BOTH observations at once, so the comparison — and every floor below,
+	// which also reads `first` — would stay green while the live dataplane got
+	// perturbed IDs.
+	//
+	// Rendering to a string materialises the values at this instant. fmt sorts
+	// map keys, so the rendering is deterministic for every column here (maps
+	// of scalars, a struct slice, a scalar), and a differing VALUE differs as a
+	// string.
+	firstSnapshot := renderColumns(first)
+
 	second := compileIDsOnce(t, cfg) // the real pass that programs the dataplane
 
 	// EVERY key compileIDsOnce returns, derived from the map rather than
@@ -473,12 +489,42 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 		t.Fatal("compileIDsOnce returned no columns at all")
 	}
 
+	secondSnapshot := renderColumns(second)
 	for _, k := range keys {
-		if !reflect.DeepEqual(first[k], second[k]) {
+		// The ALIASING-PROOF comparison: firstSnapshot was materialised before
+		// the second compile ran, so shared backing storage cannot make the two
+		// sides agree.
+		if firstSnapshot[k] != secondSnapshot[k] {
 			t.Errorf("%s differs between pass 1 and pass 2 — a discarded "+
 				"validate pre-pass would PERTURB the IDs the live dataplane is "+
-				"programmed with (#4960)\n  pass1: %v\n  pass2: %v",
-				k, first[k], second[k])
+				"programmed with (#4960)\n  pass1: %s\n  pass2: %s",
+				k, firstSnapshot[k], secondSnapshot[k])
+		}
+		// Kept alongside: DeepEqual compares the TYPED values, so a difference
+		// two renderings happened to collapse still shows. It cannot see the
+		// aliasing class, which is why it is the second check and not the only
+		// one.
+		if !reflect.DeepEqual(first[k], second[k]) {
+			t.Errorf("%s differs between pass 1 and pass 2 (typed comparison) "+
+				"— #4960\n  pass1: %v\n  pass2: %v", k, first[k], second[k])
+		}
+	}
+
+	// UNIVERSAL NON-VACUITY. Every comparison above is an equality, and an
+	// always-empty column compares clean forever — `{}` renders identically to
+	// `{}` in both directions. The per-dimension floors below name the SPECIFIC
+	// entries each column should carry, but they are hand-maintained and a
+	// column added without one is exactly the gap #6894 r9 F3 reports. This is
+	// the mechanical backstop: a column that is present but carries nothing is
+	// a comparison that cannot fail, whatever its name.
+	for _, k := range keys {
+		if columnIsEmpty(first[k]) {
+			t.Errorf("column %q is EMPTY, so comparing it proves nothing — an "+
+				"empty map/slice/zero scalar equals itself across both passes "+
+				"forever. Either the fixture stopped producing this dimension, "+
+				"or the column was added to compileIDsOnce without a config "+
+				"shape that reaches its writer (#6894 r9 F3)\n  value: %v",
+				k, first[k])
 		}
 	}
 
@@ -488,11 +534,26 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 	// keys, no pool-nat64), so each dimension below asserts the SPECIFIC entry
 	// the fixture is supposed to produce — not merely that the map is
 	// non-empty, which a partial regression would still satisfy.
-	if len(first["ZoneIDs"].(map[string]uint16)) == 0 {
-		t.Fatal("fixture assigned no zone IDs — the comparison would be vacuous")
+	// #6894 r9 F3: these two said "non-empty", which the paragraph above
+	// promises is NOT what a floor here does. A partial regression that dropped
+	// three of the four zones, or every user application, satisfied both.
+	zones := first["ZoneIDs"].(map[string]uint16)
+	for _, want := range []string{"trust", "untrust", "dmz", "egress"} {
+		if _, ok := zones[want]; !ok {
+			t.Errorf("zone %q is absent from ZoneIDs, so that zone contributes "+
+				"nothing to the comparison — the fixture stopped declaring it, or "+
+				"assignZoneIDs stopped seeing it (#6894 r9 F3)\n  have: %v",
+				want, sortedKeys(zones))
+		}
 	}
-	if len(first["AppIDs"].(map[string]uint32)) == 0 {
-		t.Fatal("fixture assigned no application IDs — comparison vacuous")
+	apps := first["AppIDs"].(map[string]uint32)
+	for _, want := range []string{"app-ssh", "app-http", "app-dns"} {
+		if _, ok := apps[want]; !ok {
+			t.Errorf("application %q is absent from AppIDs. The fixture's own "+
+				"three apps are the part it controls; the junos-* catalogue would "+
+				"keep this map large even if all three vanished, so a size check "+
+				"cannot see them going (#6894 r9 F3)\n  have %d entries", want, len(apps))
+		}
 	}
 
 	// #6894 r6 F3 floors. These three dimensions were omitted from the driver
@@ -514,10 +575,15 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 			"rule-id -> name pairs on top of the sentinel, or the column measures only "+
 			"a constant", n)
 	}
-	if ps := first["PolicySets"].(int); ps == 0 {
-		t.Error("PolicySets is 0 — compilePolicies increments it per compiled set, so " +
-			"zero means no set was compiled and a double-increment regression could " +
-			"not show here")
+	// EXACT, not non-zero (#6894 r9 F3). compilePolicies increments this once
+	// per compiled zone-pair set and the fixture declares exactly one
+	// (trust->untrust), so a double-increment reads 2 — which a `!= 0` check
+	// accepts. That is the regression the column exists for.
+	if ps := first["PolicySets"].(int); ps != 1 {
+		t.Errorf("PolicySets is %d, want exactly 1: the fixture declares one "+
+			"zone-pair policy set and compilePolicies increments once per set, so "+
+			"any other value is a miscount (a `!= 0` floor accepted a "+
+			"double-increment) (#6894 r9 F3)", ps)
 	}
 	// #6894 r8 F4: name the SPECIFIC rule ids, not merely "non-empty". p-multi
 	// expands to 2 app ids and p-single to 1, so the trust->untrust set
@@ -552,9 +618,23 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 			"UpdatePolicyScheduleState indexes by these fields (#6894 r8 F4)", sl)
 	}
 
-	if n := len(first["AppNames"].(map[uint16]string)); n == 0 {
-		t.Error("AppNames is empty — compileApplications populates it for every " +
-			"catalogued app, so this column would compare empty against empty")
+	// AppNames is the REVERSE index of AppIDs, so the floor is DERIVED from the
+	// other column rather than hand-written: for each of the fixture's own apps,
+	// AppNames must map that app's assigned id back to its name. A size check
+	// (the previous floor) could not see the two indexes disagreeing, which is
+	// the failure that matters — a lookup by id is how the operator surfaces
+	// resolve an app (#6894 r9 F3).
+	appNames := first["AppNames"].(map[uint16]string)
+	for _, want := range []string{"app-ssh", "app-http", "app-dns"} {
+		id, ok := apps[want]
+		if !ok {
+			continue // already reported by the AppIDs floor above
+		}
+		if got := appNames[uint16(id)]; got != want {
+			t.Errorf("AppNames[%d] is %q but AppIDs[%q] is %d — the forward and "+
+				"reverse application indexes disagree (#6894 r9 F3)",
+				uint16(id), got, want, id)
+		}
 	}
 
 	// ScreenIDs had no floor at all until the assignScreenIDs extraction: the
@@ -598,8 +678,20 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 				"\n  have: %v", want, sortedKeys(addrs))
 		}
 	}
-	if len(first["PoolIDs"].(map[string]uint8)) == 0 {
-		t.Fatal("fixture assigned no NAT pool IDs — comparison vacuous there")
+	// Every pool the fixture declares, not merely "some" (#6894 r9 F3). Each is
+	// a distinct writer: three are reached by SNAT rules (v4 pool, second v4
+	// pool, v6-only pool) and pool-nat64 only by compileNAT64's auto-assign
+	// branch, so naming one leaves the others unpinned.
+	if pools := first["PoolIDs"].(map[string]uint8); len(pools) != 4 {
+		t.Errorf("PoolIDs holds %d entries, want the fixture's 4 — %v",
+			len(pools), sortedKeys(pools))
+	} else {
+		for _, want := range []string{"pool-a", "pool-b", "pool-v6", "pool-nat64"} {
+			if _, ok := pools[want]; !ok {
+				t.Errorf("NAT pool %q is absent from PoolIDs, so its writer is not "+
+					"measured (#6894 r9 F3)\n  have: %v", want, sortedKeys(pools))
+			}
+		}
 	}
 
 	// The NAT counter IDs are THE dimension this probe exists for: #5099 made
@@ -652,10 +744,49 @@ func TestPrePassDoesNotPerturbIDAssignment_4960(t *testing.T) {
 			"auto-assign branch is not running in this driver (#6894 r4)"+
 			"\n  have: %v", sortedKeys(pools))
 	}
-	if next := first["NextPoolID"].(uint8); next <= nat64ID {
-		t.Errorf("NextPoolID is %d but pool-nat64 took id %d — the auto-assign "+
-			"branch did not advance the allocator, so the next pool would "+
-			"collide with it (#6894 r4)", next, nat64ID)
+	// EXACT, and DERIVED from the pool map rather than pinned to a literal
+	// (#6894 r9 F3). "greater than the NAT64 id" is satisfied by any
+	// over-advance: an allocator that skipped two ids per pool would leave a
+	// permanent hole and still pass. The invariant the allocator actually owes
+	// is that the next id is one past the HIGHEST it handed out.
+	var maxPoolID uint8
+	for _, id := range pools {
+		if id > maxPoolID {
+			maxPoolID = id
+		}
+	}
+	if next := first["NextPoolID"].(uint8); next != maxPoolID+1 {
+		t.Errorf("NextPoolID is %d but the highest assigned pool id is %d "+
+			"(pool-nat64 took %d) — the allocator is not sitting exactly one "+
+			"past its high-water mark, so the next pool either collides with an "+
+			"existing one or leaves an unreachable hole (#6894 r9 F3)"+
+			"\n  pools: %v", next, maxPoolID, nat64ID, pools)
+	}
+}
+
+// renderColumns materialises a compileIDsOnce result as strings, so a later
+// compile sharing backing storage with it cannot retroactively change what was
+// observed (#6894 r9 F3). fmt sorts map keys, so the rendering is stable.
+func renderColumns(cols map[string]any) map[string]string {
+	out := make(map[string]string, len(cols))
+	for k, v := range cols {
+		out[k] = fmt.Sprintf("%v", v)
+	}
+	return out
+}
+
+// columnIsEmpty reports whether a compileIDsOnce column carries nothing — an
+// empty map or slice, or a zero scalar. Such a column compares clean across
+// both passes forever, whatever regression is present.
+func columnIsEmpty(v any) bool {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array, reflect.String:
+		return rv.Len() == 0
+	case reflect.Invalid:
+		return true
+	default:
+		return rv.IsZero()
 	}
 }
 

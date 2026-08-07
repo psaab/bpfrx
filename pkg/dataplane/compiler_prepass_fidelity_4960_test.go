@@ -66,6 +66,19 @@ var prePassShimDivergence = map[string]string{
 // deliberate WARNING, not a reject (compiler_validate_warn.go, #2229), and this
 // gate has already swung through over-rejection twice.
 //
+// SCOPE, and this is the part that was over-read (#6894 r9 F1). "The pre-pass
+// is no more permissive than production" is asserted here ONLY about the Go
+// DataPlane interface: this test compares discardingDataPlane's method bodies
+// against userspaceShimCompileDataplane's. It says nothing about the RUST
+// helper, which is the actual enforcement plane and which rejects snapshots the
+// Go shim accepted — and does so at publish, after compileZones has mutated the
+// host. NPTv6 was a live instance: an unparseable `then` prefix cleared this
+// test, cleared the pre-pass, and then failed the apply post-mutation. That
+// half is fixed in compileNPTv6 and bound by
+// compiler_nptv6_prepass_4960_test.go, NOT here; the residual (overlapping
+// prefixes, #2241/#5176) is named in compiler_validate_4960.go. Do not read a
+// green result here as "the pre-pass predicts the apply".
+//
 // WHAT IT DOES CHECK, and why the shape matters. The equivalence is a PROPERTY
 // OF THE SHIM, not a law, so:
 //

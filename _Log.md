@@ -70931,3 +70931,106 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `go test ./pkg/dataplane/... ./pkg/config ./pkg/daemon -count=1` rc=0 (6
   packages); `gofmt -l` clean.
 - **File(s)**: _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6894 r9 — fold the Codex MERGE-BLOCK at `cf79adff3`. F1 (BLOCKING):
+  the pre-pass ACCEPTS an NPTv6 config the Rust helper REJECTS post-mutation.
+  F2/F3 (MINOR): the log gate's over-reach arm and the ID probe's aliasing hole.
+
+  **F1 — chose (i) make the pre-pass reject what Rust rejects, NOT (ii) make the
+  Go snapshot builder drop the malformed rule, NOT (iii) narrow the claim.**
+  The reasoning is the load-bearing part:
+  - **(ii) is a security regression.** The Go side dropping the rule is exactly
+    the fail-open #2240 closed. `compileNPTv6` calls `DeleteStaleNPTv6(written)`
+    over only the VALID subset, so editing one previously-good rule into an
+    invalid one TEARS DOWN its working translation with no replacement. The
+    Rust whole-snapshot rejection is what makes the apply preflight keep the
+    previous live state — and `validateNPTv6Strict`'s own lenient warning text
+    PROMISES exactly that ("the helper rejects the whole NPTv6 snapshot and the
+    previous state is kept"). Dropping in Go falsifies that promise.
+  - **(iii) is unnecessary**, because (i) does not brick. Verified firsthand:
+    `configstore.Store.Load` (store_persist.go) and `Store.SyncApply` (store.go)
+    both compile through `s.compileTreeLenient` — `pkg/config`, not
+    `pkg/dataplane`. Neither reaches `CompileConfig`, so a pre-pass rejection
+    cannot fail a boot or an HA peer sync. What it fails is the dataplane apply,
+    which ALREADY fails today at `publishSnapshotFailClosedLocked` — just after
+    `compileZones` created VLANs and reconciled addresses. (i) moves an
+    already-certain failure ahead of the mutation; it creates no new one.
+  - **Over-rejection was the real hazard and is gated.** A rule the snapshot
+    builder DROPS (#5818 unsupported match scope) never reaches the helper, so
+    today's apply SUCCEEDS without it; hard-erroring on it would break a working
+    tolerant-load config. `config.NPTv6ScopeUnsupported` (new,
+    `pkg/config/nptv6_scope.go`) is now the SSOT both `buildNptv6Snapshots` and
+    `compileNPTv6` read, so the two cannot drift.
+  - Added the **#4519 host-bits check** the Go compiler lacked: it truncates to
+    the prefix BYTES (silently masking), the helper's `parse_prefix` fails
+    CLOSED. Without it the fix would close the class Codex demonstrated and
+    leave an identical one one string away.
+  - **RESIDUAL, named in the code**: the helper also rejects overlapping
+    prefixes (#2241) partitioned by zone scope (#5176). Not replicated —
+    `validateNPTv6Strict`'s overlap check does NOT partition, so reusing it
+    would reject configs the helper ACCEPTS. An overlap still lands
+    post-mutation.
+
+  **Mutation cells, `go vet` rc=0 before each, verbatim assertion captured:**
+  - F1 revert (restore the four `slog.Warn; continue` arms, drop the host-bits
+    block): `TestNPTv6UnparseablePrefixRejectedBeforeHostMutation_4960` RED with
+    *"compileZones RAN before the failing phase was caught (1 SetZoneConfig
+    calls) — the host was mutated before a later phase failed, which is #4960"*.
+    Host-bits and length-mismatch tests RED the same way. **Over-reach guards
+    stayed GREEN** under that revert: the five scope-excluded sub-cases and the
+    valid-NPTv6 control.
+  - Builder inline-copy divergence (drop `MatchDestinationPort` from a
+    re-inlined predicate): `TestNptv6BuilderDropSetMatchesScopePredicate_4960`
+    RED naming the disagreeing rule.
+  - Rust half verified firsthand, non-zero match: `cargo test --release --bin
+    xpf-userspace-dp -- invalid_snapshot_rejected_fail_closed
+    host_bits_snapshot_rejected_fail_closed parse_prefix_rejects_host_bits` →
+    3 passed, 4250 filtered. The `"not-a-prefix"` / `"2001:db8:9::/48"` pair is
+    literally the `bad-parse` fixture over there.
+
+  **F2 — the gate is complete; its two-way grid was not.** MEASURED the
+  pre-pass's reachable set rather than reasoning: of 19 `!isValidationPass(dp)`
+  sites, 17 are reachable and 2 are NOT (`SNAT egress IP set` — the pre-pass's
+  `newValidationResult` has an empty ifCache so the branch soft-skips;
+  `persistent NAT pool registered` — the shim's typed-nil `GetPersistentNAT`
+  skips the block). Both are stated in the test, not papered over. The
+  over-reach arm went from 13 named records to 17 + 2 separately bound:
+  `logProbeConfig` now reaches the source-NAT-off, persistent-NAT and
+  no-address-SNAT paths, the real-pass driver seeds the egress ifCache and a
+  live persistent-NAT table, `successLogLines` returns FULL records so the two
+  `default policy compiled` arms are distinguishable, and
+  `TestOverReachArmCoversEveryReachableGate_4960` derives the gate COUNT by AST
+  so a newly gated site cannot be added unaccounted.
+  Cells: screen gate suppress-both → RED (the exact case Codex measured GREEN);
+  SNAT-egress suppress-both → RED; gated WARN removed → negative arm RED;
+  deny-all gate removed → ONLY the `default-deny` subtest RED (`default-permit`
+  stayed green — the arms are separately bound); a new gated record added → the
+  completeness test RED at 20 vs 19.
+
+  **F3 — aliasing hole closed with an A/B, not an assertion.** `first` is now
+  rendered to strings BEFORE the second compile. Proof: simulated the exact
+  regression class (a column served from process-global storage, drifting on the
+  second call) — WITH the pre-second snapshot the test REDs *"ZoneIDs differs
+  between pass 1 and pass 2"*; with the snapshot moved AFTER the second compile
+  (the r8 shape) the SAME regression is GREEN. Added a mechanical universal
+  floor (`columnIsEmpty` over every column — an always-empty column REDs), and
+  tightened the four loose floors to match the file's own "specific entry, not
+  merely non-empty" claim: ZoneIDs and AppIDs name entries, AppNames is DERIVED
+  from AppIDs (reverse-index agreement), PolicySets is exact, PoolIDs names all
+  four pools, NextPoolID is derived as max+1. Production cells: a
+  `result.PolicySets++` double-increment → RED at "PolicySets is 2, want exactly
+  1" (the old `!= 0` accepted it); a `result.NextPoolID++` over-advance → RED at
+  "NextPoolID is 5 but the highest assigned pool id is 3" (the old `> nat64ID`
+  accepted it).
+
+  Every mutated file restored from a byte-level backup and verified by sha256 /
+  `git diff HEAD` being empty. No `git checkout` used to undo a probe.
+- **File(s)**: pkg/config/nptv6_scope.go (new),
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/userspace/nat_nptv6.go,
+  pkg/dataplane/compiler_validate_4960.go, pkg/dataplane/README.md,
+  pkg/dataplane/compiler_nptv6_prepass_4960_test.go (new),
+  pkg/dataplane/userspace/nat_nptv6_scope_parity_4960_test.go (new),
+  pkg/dataplane/compiler_prepass_logging_4960_test.go,
+  pkg/dataplane/compiler_idprobe_4960_test.go,
+  pkg/dataplane/compiler_prepass_fidelity_4960_test.go, _Log.md
