@@ -284,6 +284,33 @@ pub(crate) fn walk_ipv6_ext_chain(buf: &[u8], l3: usize) -> ExtChainWalk {
     }
 }
 
+/// #4555/#6923: `true` iff `protocol` is an IPv6 next-header value the walk
+/// above TRAVERSES rather than terminates on — the GENERIC length-prefixed set
+/// (`0 | 43 | 60 | 135 | 139 | 140 | 253 | 254`), AH (51) and Fragment (44).
+/// No-Next-Header (59) is deliberately NOT a member: it is a TERMINAL verdict
+/// (`NoNextHeader`) both walkers resolve to, not a header either one steps past.
+///
+/// This is the set a resolved walk can NEVER hand out as an upper-layer
+/// protocol, on either side of the shim boundary — the shim's
+/// `walk_ipv6_ext_headers` yields one of these only by EXHAUSTING
+/// `MAX_EXT_HDRS`, and `walk_ipv6_ext_chain` folds that same exhaustion into
+/// `OverLimit`. So a `meta.protocol` in this set means "the shim gave up
+/// mid-chain", never "the shim resolved this upper-layer protocol", which is
+/// what [`metadata_tuple_complete`] keys off. ESP (50) is deliberately absent
+/// on both sides (encrypted payload, unreadable inner next-header): it IS a
+/// resolved terminal and must keep flowing.
+///
+/// Kept next to `walk_ipv6_ext_chain` and pinned to it BEHAVIOURALLY rather
+/// than by a second copy of the arm list — `inspect_tests.rs` sweeps all 256
+/// values and asserts this predicate agrees with what the walker measurably
+/// does with a one-header chain of that type, and `tests_shim_ext_parity.rs`
+/// asserts it also agrees with the SHIM's `eh_class`. Adding a type to either
+/// walker without adding it here reds both.
+#[inline]
+pub(crate) fn ipv6_ext_header_is_traversable(protocol: u8) -> bool {
+    matches!(protocol, 0 | 43 | 44 | 51 | 60 | 135 | 139 | 140 | 253 | 254)
+}
+
 pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
         return None;
@@ -1055,8 +1082,40 @@ pub(in crate::afxdp) fn neighbor_ip_is_learnable(ip: IpAddr) -> bool {
     }
 }
 
+/// Is the shim-stamped metadata tuple a RESOLVED flow identity, or only the
+/// state the shim was in when it stopped parsing?
+///
+/// #4555/#6923 — the second question is why the `_ => true` arm is not the
+/// whole answer. For IPv6 the shim's walk exits by EXHAUSTING `MAX_EXT_HDRS`
+/// on an over-limit chain, and exhaustion is not an error there: it returns the
+/// last declared next-header value, so `ParsedPacket::protocol` holds an
+/// EXTENSION-HEADER type and `parse_l4`'s catch-all stamps ports 0/0. That
+/// tuple has real addresses and a plausible-looking protocol, so the blanket
+/// `_ => true` accepted it, `parse_session_flow_from_bytes` returned the
+/// metadata flow, and every downstream consumer treated an uninspectable
+/// packet as a resolved L4 flow. Concretely: `flow.is_none()` went false, so
+/// the #4743 over-limit drop in the poll loop was SKIPPED; an
+/// `application any` permit matched (no ports to fail on); and the session was
+/// installed AND published to `USERSPACE_SESSIONS` under
+/// `(AF_INET6, <ext-header type>, src, dst, 0, 0)` — which is EXACTLY the key
+/// the shim probes for the next packet of that chain. The over-limit refusal
+/// the shim documents as unconditional was in fact conditional on policy, and
+/// after the first packet the chain had a fast path.
+///
+/// So an IPv6 metadata tuple whose protocol is one the walk TRAVERSES
+/// ([`ipv6_ext_header_is_traversable`]) is NOT complete: it names where the
+/// shim gave up, not an upper-layer protocol. Refusing it here makes the
+/// metadata arm decline, the frame arm already declines (`parse_flow_ports`
+/// has no case for an extension-header protocol), the meta-offset fallback
+/// declines for the same reason, and `parse_session_flow_from_bytes` returns
+/// `None` — which is the input the #4743 gate needs to fire and drop the
+/// packet. IPv4 is untouched: 0/43/44/51/60/... are ordinary IPv4 protocol
+/// numbers there, with no extension-header meaning.
 pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow) -> bool {
     if flow.src_ip.is_unspecified() || flow.dst_ip.is_unspecified() {
+        return false;
+    }
+    if meta.addr_family as i32 == libc::AF_INET6 && ipv6_ext_header_is_traversable(meta.protocol) {
         return false;
     }
     match meta.protocol {

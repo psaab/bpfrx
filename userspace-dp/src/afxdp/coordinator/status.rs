@@ -220,9 +220,17 @@ impl super::Coordinator {
     /// imports were previously uncapped and fanned out to every worker, so a
     /// peer under session-table pressure (or a compromised peer) could drive
     /// this node past its own aggregate session ceiling. A rising value means a
-    /// peer exceeded this appliance's ceiling (`worker_count *
-    /// DEFAULT_MAX_SESSIONS`); a legitimate symmetric-pair failover never trips
-    /// it. Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
+    /// peer exceeded this appliance's ceiling.
+    ///
+    /// #6413: state that ceiling in ENTRIES, matching `synced_import_cap` and
+    /// `coordinator/session_manager.rs` — it is
+    /// `2 * worker_count * DEFAULT_MAX_SESSIONS`,
+    /// not the LOGICAL `worker_count * DEFAULT_MAX_SESSIONS`. Each admitted
+    /// forward publishes TWO keys into `sessions.synced` (the forward and its
+    /// synthesized reverse companion), so N logical sessions arrive as 2N
+    /// entries and EXACTLY fit the 2N cap. A legitimate symmetric-pair failover
+    /// therefore never trips it; firing semantics are unchanged by this wording.
+    /// Surfaced as `xpf_userspace_synced_import_cap_drops_total`.
     pub fn synced_import_cap_drops_total(&self) -> u64 {
         self.sessions.import_cap_drops.load(Ordering::Relaxed)
     }
