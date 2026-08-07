@@ -50,49 +50,67 @@ Include any extra context from $ARGUMENTS in final header as Extra context: <arg
 ## Phase 0 — Coordinator Setup (top-level context)
 
 ### Scratch work location rule (mandatory, repo-agnostic) — to avoid /tmp pollution:
-- Determine `<whoami>` DYNAMICALLY at runtime from environment — do NOT hardcode a model name, do NOT use Unix username `ps`. Must work across model changes (fable -> claude-spark -> opus -> sonnet etc.):
+- Determine `<whoami>` DYNAMICALLY at runtime from environment — do NOT hardcode a model name, do NOT use Unix username `ps`. Must work across model changes (fable -> claude-spark -> muse-spark -> opus -> sonnet etc.) and across host families (Claude vs Muse):
   ```bash
-  # Dynamic model detection — handles changing models across runs, and display rewriting
-  # ANTHROPIC_MODEL may show as claude-spark-1.1 or be rewritten to muse-spark-1.1 in some shells — normalize both
-  MODEL_RAW="${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-}}}}"
+  # Dynamic model detection — handles changing models across runs AND across host families (Muse vs Claude)
+  # Sources checked in priority order: explicit host envs (ANTHROPIC_MODEL, MUSE_MODEL, CLAUDE_CODE_SUBAGENT_MODEL), then settings.json
+  # Do NOT blindly normalize muse- -> claude- — keep Muse family distinct (muse-spark) while still accepting legacy claude- alias
+  MODEL_RAW="${MUSE_MODEL:-${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-}}}}}"
   [ -z "$MODEL_RAW" ] && MODEL_RAW=$(jq -r '.model // empty' ~/.claude/settings.json 2>/dev/null || echo "")
+  # Muse Spark identity: when running under Muse (check for muse marker), prefer muse-spark family even if settings.json says opus[1m]
+  # Detect Muse host via env or by checking if original MODEL_RAW was empty and settings.json is generic opus
+  if [ -z "${ANTHROPIC_MODEL:-}" ] && [ -z "${MUSE_MODEL:-}" ] && [ -z "${CLAUDE_CODE_SUBAGENT_MODEL:-}" ]; then
+    # No explicit env — check if we are on Muse host via available marker (Muse CLI leaves MUSE_* or the binary reports muse)
+    if command -v muse >/dev/null 2>&1 || [ -n "${MUSE_CLI:-}" ] || grep -qi muse ~/.claude/settings.json 2>/dev/null; then
+      # Heuristic: generic opus[1m] in settings.json on a Muse host likely means Muse Spark, not Claude Opus
+      if echo "$MODEL_RAW" | grep -qiE '^opus(\[.*\])?$'; then
+        MODEL_RAW="muse-spark-1.1"
+      fi
+    fi
+  fi
   MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]')
-  # Normalize display rewrite: claude -> claude, but some envs expose muse-* instead of claude-* — treat muse-* as claude-*
-  MODEL_LC=$(echo "$MODEL_LC" | sed -E 's/^muse-/claude-/')
-  # Extract family: claude-spark, claude-opus, claude-sonnet, claude-fable, claude-haiku, codex, gemini, fable, opus, etc.
-  # For claude-* keep first two dash-parts (claude-spark, claude-opus); strip trailing version like -1.1, -4-8, -20251001, -20250820
-  if [[ "$MODEL_LC" == claude-* ]]; then
+  # Extract family: muse-spark, claude-spark, claude-opus, claude-sonnet, claude-fable, claude-haiku, codex, gemini, fable, opus, etc.
+  # Keep muse- and claude- distinct — do NOT rewrite muse- -> claude-
+  # Handle bracket version like opus[1m] -> opus
+  MODEL_LC=$(echo "$MODEL_LC" | sed -E 's/\[.*\]$//')
+  if [[ "$MODEL_LC" == muse-* ]]; then
+    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
+  elif [[ "$MODEL_LC" == claude-* ]]; then
     WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
   else
-    # For non-claude (fable, codex, gemini, opus, agy), first part is family
+    # For non-prefixed (fable, codex, gemini, opus, agy), first part is family
     WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1)
   fi
   # Strip any remaining version suffix that survived cut (e.g. claude-spark-1.1 -> cut gives claude-spark, good; but claude-3.5 -> claude)
-  WHOAMI=$(echo "$WHOAMI" | sed -E 's/-[0-9]+(\.[0-9]+)*$//; s/-[0-9]{8,}$//; s/-[0-9]+$//')
+  WHOAMI=$(echo "$WHOAMI" | sed -E 's/-[0-9]+(\.[0-9]+)*$//; s/-[0-9]{8,}$//; s/-[0-9]+$//' | sed -E 's/\[.*\]$//')
   [ -z "$WHOAMI" ] && WHOAMI="claude"
-  # Final normalization: ensure claude-spark is kept, not just spark
-  # If WHOAMI is just "spark", "opus", "sonnet", "haiku", "fable" without claude- prefix but MODEL contained claude-, restore prefix
-  if [[ "$MODEL_LC" == *"spark"* && "$WHOAMI" == "spark" ]]; then WHOAMI="claude-spark"; fi
-  if [[ "$MODEL_LC" == *"opus"* && "$WHOAMI" == "opus" ]]; then WHOAMI="claude-opus"; fi
+  # Final normalization: ensure spark/opus/sonnet keep family prefix (handle bare spark/opus)
+  if [[ "$MODEL_LC" == *"muse"* && "$MODEL_LC" == *"spark"* && "$WHOAMI" == "spark" ]]; then WHOAMI="muse-spark"; fi
+  if [[ "$MODEL_LC" == *"spark"* && "$WHOAMI" == "spark" ]]; then WHOAMI="muse-spark"; fi
+  if [[ "$MODEL_LC" == *"opus"* && "$WHOAMI" == "opus" ]]; then
+    # Distinguish muse-spark host vs real opus
+    if [[ "$MODEL_LC" == muse-* ]]; then WHOAMI="muse-spark"; else WHOAMI="claude-opus"; fi
+  fi
   if [[ "$MODEL_LC" == *"sonnet"* && "$WHOAMI" == "sonnet" ]]; then WHOAMI="claude-sonnet"; fi
   echo "Detected model: $MODEL_RAW -> family $WHOAMI (normalized from $MODEL_LC)"
   ```
-  This handles dynamic changing models across runs (you may be `claude-spark` now per ANTHROPIC_MODEL=claude-spark-1.1 which sometimes displays as `muse-spark-1.1`, previously `fable` per fable-173.md, etc.). Prior `fable-173.md` etc were from older model run — new runs will be `claude-spark-review-NNN.md` if you are on spark, `claude-opus-review-NNN.md` if on opus, etc. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/claude-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`).
+  This handles dynamic changing models across runs (you may be `muse-spark` now per MUSE_MODEL=muse-spark-1.1 which sometimes displays as `claude-spark-1.1` on Claude hosts, previously `fable` per fable-173.md, etc.). Prior `fable-173.md` etc were from older model run — new runs will be `muse-spark-review-NNN.md` if you are on Muse Spark, `claude-spark-review-NNN.md` if on Claude Spark, `claude-opus-review-NNN.md` if on opus, etc. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`). The `muse-` and `claude-` families are now distinct — do NOT normalize `muse-`→`claude-`.
   ```bash
-  # Prefer ANTHROPIC_MODEL (e.g. claude-spark-1.1, claude-opus-4-8, claude-sonnet-5, fable), fallback to CLAUDE_CODE_SUBAGENT_MODEL
-  MODEL_RAW="${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-}}}"
-  MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]')
-  # Extract family: claude-spark, claude-opus, claude-sonnet, claude-fable, fable, etc.
-  # For claude-* keep first two dash-parts (claude-spark, claude-opus); strip trailing version like -1.1, -4-8, -20251001
-  if [[ "$MODEL_LC" == claude-* ]]; then
+  # Prefer MUSE_MODEL / ANTHROPIC_MODEL (e.g. muse-spark-1.1, claude-spark-1.1, claude-opus-4-8, fable), fallback to CLAUDE_CODE_SUBAGENT_MODEL
+  # Keep muse- and claude- distinct — muse-spark stays muse-spark
+  MODEL_RAW="${MUSE_MODEL:-${ANTHROPIC_MODEL:-${CLAUDE_CODE_SUBAGENT_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-}}}}"
+  MODEL_LC=$(echo "$MODEL_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/\[.*\]$//')
+  if [[ "$MODEL_LC" == muse-* ]]; then
+    WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
+  elif [[ "$MODEL_LC" == claude-* ]]; then
     WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1-2)
   else
     WHOAMI=$(echo "$MODEL_LC" | cut -d'-' -f1)
   fi
-  WHOAMI=$(echo "$WHOAMI" | sed -E 's/-[0-9]+(\.[0-9]+)*$//; s/-[0-9]{8,}$//')
-  [ -z "$WHOAMI" ] && WHOAMI="claude"
+  WHOAMI=$(echo "$WHOAMI" | sed -E 's/-[0-9]+(\.[0-9]+)*$//; s/-[0-9]{8,}$//; s/\[.*\]$//')
+  [ -z "$WHOAMI" ] && WHOAMI="muse-spark"
   ```
-  This handles dynamic changing models across runs (you are currently `claude-spark` per ANTHROPIC_MODEL=claude-spark-1.1 -> family `claude-spark`, not `fable`). Prior `fable-173.md` etc were from an older model run — new runs will be `claude-spark-review-NNN.md`. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/claude-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`).
+  This handles dynamic changing models across runs (you are currently `muse-spark` per MUSE_MODEL=muse-spark-1.1 -> family `muse-spark`, not `fable`). Prior `fable-173.md`/`claude-spark` etc were from older model runs — new runs will be `muse-spark-review-NNN.md` on Muse Spark. Final file MUST use this detected family name: `/tmp/<whoami>-review-NNN.md` (e.g. `/tmp/muse-spark-review-042.md`, `/tmp/claude-spark-review-001.md`, `/tmp/fable-review-173.md`).
 - NEVER write any .md file directly under /tmp/ during campaign. Not /tmp/<whoami>-review-NNN.md, not /tmp/<whoami>-review-NNN-<area>-b<batch>.md, not any other *.md directly under /tmp/. ALL scratch work MUST go under a subdirectory of /tmp/.
 - Create dedicated work directory (repo-agnostic, no repo name in path):
     /tmp/review-work-<whoami>-<NNN>/
@@ -225,14 +243,15 @@ Verify against origin/master tip and FRESH GH issues (hard):
    e. If low-materiality, mark COHORT.
 4. After steps 2-3, produce triage sections:
    - Verified-against-origin/master highlights: 2-5 bullets explaining most interesting FIXED/STALE/DUP decisions, with origin/master file:line evidence.
-   - Per-finding table with columns: | Finding | Area | Gate verdict (MATERIAL/FIXED/STALE/DUP/COHORT/NEG) | Reasoning |
+   - Per-finding table with columns: | Finding | Area | Gate verdict (MATERIAL/FIXED/STALE/DUP/COHORT/NEG) | Reasoning | — this table is an INDEX ONLY, not a substitute for evidence.
+   - Full findings section (MANDATORY, self-contained): inline the COMPLETE 13-label evidence bar for EVERY individually-fileable MATERIAL (and the grouped COHORT issue, if any) directly in the published final — Title, Severity, Confidence, Gate verdict, Evidence (file:line + 5-10 line quote read from worktree at base SHA), Trace (required for High/Medium MATERIAL), Refutation attempt (required for High/Critical MATERIAL), HPC/invariant check, Why it matters (concrete production impact — why it is load-bearing major and needs deeper investigation), Fix direction (concrete remediation), Labels, Dedup note, Verified against origin/master (exact origin/master file:line and result). The published final MUST NOT require the reader to open per-batch intermediates under /tmp/review-work-*/ or /tmp/review-wt-*/ to get the rationale — those are retained only for audit. If the per-finding table and the full findings section disagree, the full findings section is authoritative.
    - Count summary: total parsed, dropped-dup count, dropped-stale-or-fixed count, pure NEG count, cohort'd low-materiality count, filed individually count.
 
 Produce DRAFT final report at: /tmp/review-work-<whoami>-<NNN>/<whoami>-review-NNN.md (still inside work dir, NOT directly under /tmp/). Verify completeness, then as VERY LAST STEP, copy it to: /tmp/<whoami>-review-NNN.md This copy is ONLY file that may ever exist directly under /tmp/ matching /tmp/<whoami>-review-NNN*.md for this NNN. During work, no file matching /tmp/*-review-*.md for this NNN exists directly under /tmp/ — only prior campaign finals. After copy, verify `ls /tmp/<whoami>-review-NNN*.md` shows exactly ONE file (final) and `ls /tmp/<whoami>-review-NNN-*.md` shows none.
 
 Cleanup (mandatory) AFTER final copy verified: remove ALL worktrees created for this NNN: git worktree list | grep "review-wt-<whoami>-<NNN>-" -> git worktree remove --force; rm -rf /tmp/review-wt-<whoami>-<NNN>-* (Optionally keep /tmp/review-work-<whoami>-<NNN>/ for post-verification inspection, but per strictest interpretation: rm -rf /tmp/review-work-<whoami>-<NNN>/ after final exists in /tmp/. Draft final inside work dir is NOT published final — published final is copy in /tmp/.)
 
-Produce ONE final report at /tmp/<whoami>-review-NNN.md (via copy from work-dir draft) with: Base commit reviewed + origin/master SHA (both, with fetch timestamp). Output path. Duplicate suppression summary (including fresh GH open count at triage time). Triage result — MANDATORY top section (Review base SHA + verified-against origin/master SHA, Open GH issues at triage fresh count, Outcome: X individually-filed material issues, Y cohort issue (Z survivors), Why zero if zero). Verified-against-origin/master highlights. Per-finding table with Gate verdict. Explicit expertise-area + module checklist with per-area file counts and batch counts (proving full-tree coverage). Module-by-module inspection log (aggregated, incl. negatives — NEG belongs ONLY here). Findings separated by confidence (High/Medium/Low), each with exact field labels above — BUT findings section MUST contain ONLY Gate verdict MATERIAL or COHORT candidates (no pure NEG). If you include COHORT, group them under single cohort issue heading, not 41 separate issues. Coverage & verification summary: files reviewed/total, findings per area, how many Critical/High coordinator-verified vs dropped as FIXED/STALE/DUP/COHORT/NEG. Suggested issue split (with mapping to Gate verdicts). TARGET: aggregate across all areas, report material findings that survive freshness + retired-path + dedup + materiality gates. At least 20 is aspirational, NOT mandatory. If provably-complete sweep after origin/master verification yields 0 individually-fileable material issues and 1 cohort issue of 41 low-materiality survivors (as in claude-003), that IS correct outcome — report 0+cohort and let coverage log stand. Do NOT pad with NEG.
+Produce ONE final report at /tmp/<whoami>-review-NNN.md (via copy from work-dir draft) with: Base commit reviewed + origin/master SHA (both, with fetch timestamp). Output path. Duplicate suppression summary (including fresh GH open count at triage time). Triage result — MANDATORY top section (Review base SHA + verified-against origin/master SHA, Open GH issues at triage fresh count, Outcome: X individually-filed material issues, Y cohort issue (Z survivors), Why zero if zero). Verified-against-origin/master highlights. Per-finding table with Gate verdict (INDEX ONLY — see Full findings section for authoritative evidence). Explicit expertise-area + module checklist with per-area file counts and batch counts (proving full-tree coverage). Module-by-module inspection log (aggregated, incl. negatives — NEG belongs ONLY here). Full findings section (MANDATORY, self-contained) — inline COMPLETE 13-label evidence bar for every MATERIAL (and grouped COHORT) directly in the published final: Title, Severity, Confidence, Gate verdict, Evidence (file:line + 5-10 line quote), Trace (High/Medium MATERIAL), Refutation attempt (High/Critical MATERIAL), HPC/invariant check, Why it matters (concrete production impact — why load-bearing major needs deeper investigation), Fix direction, Labels, Dedup note, Verified against origin/master — with exact origin/master file:line. This section is authoritative and MUST NOT require opening /tmp/review-work-*/ intermediates. Then Coverage & verification summary: files reviewed/total, findings per area, how many Critical/High coordinator-verified vs dropped as FIXED/STALE/DUP/COHORT/NEG. Suggested issue split (with mapping to Gate verdicts). TARGET: aggregate across all areas, report material findings that survive freshness + retired-path + dedup + materiality gates. At least 20 is aspirational, NOT mandatory. If provably-complete sweep after origin/master verification yields 0 individually-fileable material issues and 1 cohort issue of 41 low-materiality survivors (as in claude-003), that IS correct outcome — report 0+cohort and let coverage log stand. Do NOT pad with NEG.
 
 Focus line to append per run (biases persona emphasis, does NOT reduce coverage — all areas still reviewed):
 Focus this round on core firewall behavior: zone policies, global policies, host-inbound, application matching, default deny/permit — ensure packets that should be denied are denied and allowed packets are allowed — AND on areas prior campaigns under-covered: VRRP/HA failover & cold-boot, dataplane integer-truncation on config casts, and DDNS/observability resource safety.
