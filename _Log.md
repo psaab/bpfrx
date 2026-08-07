@@ -1,3 +1,96 @@
+## 2026-08-07 — #5173 round 8: three completeness claims were FALSE; `ctx` was the escape
+
+- **Timestamp**: 2026-08-07 (fix/5173-shim-queue-mis-steer, PR #6676)
+- **Action**: Round-7 hostile re-gate reached all six probes and found NOTHING
+  wrong with the shipped runtime code — the queue coordinate is carried
+  verbatim on every path, `binding_slot`'s arithmetic is sound including the
+  above-planner-range case, the Go/Rust wire constants did not move, and the
+  committed object reproduces from source and passes the live kernel verifier.
+  What it found was that three sentences in the guard apparatus claimed the
+  guard closed something it does not, and it demonstrated the escape end to
+  end. This round is a TEXT correction plus two bounds; the runtime shim is
+  untouched, and the object regenerates bit-identically across every comment
+  edit here.
+
+  THE FALSE CLAIMS. All three said, in different words, that spending the
+  per-file mention budget for the two COUNTED names leaves nothing to spend:
+  `main_tests.rs` "For `rx_queue` that closes it", `binding_index.rs` "so
+  there is nothing free to spend there", and the construction-statement
+  assertion's "makes the argument spelling the load-bearing part". A fourth
+  site restated the same thing in the `MENTIONS_PER_FILE` comment ("has
+  nothing left to spend") and is corrected with them. The defect in all four
+  is the same: a token/AST canary can bound how something is SPELLED and how
+  often a name is WRITTEN. It cannot bound what a name is BOUND TO, and #5173
+  is a property of the value that arrives, not of the text that names it.
+
+  THE ESCAPE, reproduced firsthand before the corrections were written rather
+  than taken on report. Five statement-scope lines above the pinned
+  construction, shadow `ctx` with a zeroed `xdp_md` carrying a masked queue
+  index, then restore it before `bpf_xdp_adjust_meta` needs the real one. The
+  pinned construction statement is byte-identical and reads the doctored
+  struct. Measured: builds for `bpfel-unknown-none`; `make generate` verifier
+  PASS (725961 insns, 27.40% headroom); the emitted object gains `r &= 0x3`
+  AND LOSES the `> 0xf` stride guard entirely — `llvm-objdump -d --section=xdp
+  | grep -c "0xf goto"` is 1 pristine and 0 mutated, which LLVM only does once
+  it can prove the value is under 16 — and all 14 `shim_*` tests stay GREEN
+  with `rx_queue` still at 3 in `lib.rs` and `ingress_ifindex` still at 22.
+  That is #5173 back in the shipped program with every merge-path guard green,
+  the kernel verifier included.
+
+  THE TWO BOUNDS, and what they are NOT. `ctx` joins `MENTIONS_PER_FILE` as a
+  third column (`binding_index.rs` 3, `lib.rs` 17) and `let ctx` is refused
+  outright (0 today). Four-cell mutation grid, run firsthand: (A) the `let`
+  shadow REDs on the refusal with its assertion message, 13/14; (B) the same
+  shadow written through tuple patterns dodges the refusal (`let ctx` stays 0)
+  and REDs on the tally column instead, `ctx` 17 -> 23 while both coordinate
+  columns are unmoved, 13/14; (C) cell B with ONLY the `ctx` column severed
+  from the comparison goes back to 14/14 GREEN, which is what makes the RED in
+  B attributable to that column rather than to some other belt; (D) pristine is
+  14/14. Both REDs are assertion failures, not build breaks.
+
+  These close the DEMONSTRATED forms. They do NOT close the class and the
+  comments now say so at every site: the class is semantic (what a name
+  resolves to) and every instrument in that file is syntactic (which names the
+  source writes). The round-7 pattern — treat each new escape as blocking,
+  produce another — is not repeated here; an AST canary cannot enumerate them,
+  so the terminal state is an honest residual rather than an exhaustive one.
+
+  ALSO. The `RawRxQueue` trait-impl assertion said the type "must implement NO
+  traits", which is literally false and self-contradicted two sentences later:
+  the struct carries `#[derive(Clone, Copy, PartialEq, Eq, Debug)]`. Message
+  text only, no runtime effect. Reworded to what it checks — no hand-written
+  `impl … for` block — with the reason the five derives are allowed (none
+  yields the inner `u32` or an operator).
+
+  MERGE. Resolved against master: `lib.rs` kept both module declarations and
+  dropped master's local `BINDING_QUEUES_PER_IFACE` (now supplied by
+  `binding_index`); `main_tests.rs` and `_Log.md` union-resolved and verified
+  STRUCTURALLY — each pre-merge side diffs into the result with zero removed
+  and zero changed lines, not by prefix containment, since `_Log.md` is no
+  longer append-ordered. The object and manifest were regenerated rather than
+  resolved by hand. One interaction needed a source change: master's new prose
+  spells the module-path attribute literally, which this branch's confinement
+  bound refuses anywhere under `userspace-xdp/src`; that is the spurious RED
+  the check documents, so the prose is worded around it and the reason
+  recorded at both sites.
+
+  OBJECT. `62eb90b6b9b9ff62144c39cd083f0a79aa41b993707fe835da23e7e39c8be517`
+  before and after this round's comment edits — a new hash versus the branch's
+  previous `114354c9…` only because master's shared IPv6 extension-header walk
+  genuinely changed shim codegen. `make generate` twice leaves
+  `git status --porcelain` unchanged; only `binding_index.rs`'s input sha moved
+  in the manifest.
+- **Validation**: `cargo test --release` full crate green (4230 parallel + the
+  24 `afxdp::wg::engine::engine_internal_tests` run serially, both legs to dodge
+  the two opposite-trigger deadlocks in #6952); `go build ./...`,
+  `go vet ./pkg/dataplane/`, `go test ./pkg/dataplane/...` and
+  `go test ./pkg/refactoraudit/` all clean; heatmap regenerated.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs, userspace-xdp/src/lib.rs,
+  userspace-xdp/src/ipv6_ext_walk.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/refactoring-audit-current.txt, _Log.md
+
 ## 2026-08-01 — #5173 round 7: a seventh escape class — the function BODIES were never pinned
 
 - **Timestamp**: 2026-08-01 (fix/6676-shim-rx-queue-r7)

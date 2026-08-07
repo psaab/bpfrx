@@ -2806,17 +2806,55 @@ fn shim_raw_rx_queue_exposes_no_arithmetic() {
 ///    site.
 ///
 ///    The tally is PER FILE, which stops a mention freed in one file from paying
-///    for a shadow in another. For `rx_queue` that closes it. Its three `lib.rs`
-///    mentions are all inside pinned statements — the construction, the
-///    `for_trace()` readback and the lookup — and `lib.rs` is the only file a
-///    shadow can sit in, because that is where the pinned definition and the
-///    pinned use are. In `binding_index.rs` the parameter is pinned by the
-///    signature and the two body uses are load-bearing for the build and the
-///    executed stride test, so the one free mention in the whole crate is a
-///    single doc line there — and per-file pinning means it cannot be spent on
-///    `lib.rs`. (Before round 5 this was NOT true and the paragraph claimed it
-///    anyway: `for_trace()`'s caller was unpinned, and renaming `binding_slot`'s
-///    parameter freed three more. Five of the seven were free, not one.)
+///    for a shadow in another. For `rx_queue` the mention budget in `lib.rs` is
+///    fully spent: its three mentions are all inside pinned statements — the
+///    construction, the `for_trace()` readback and the lookup — and `lib.rs` is
+///    the only file a shadow of THAT NAME can sit in, because that is where the
+///    pinned definition and the pinned use are. In `binding_index.rs` the
+///    parameter is pinned by the signature and the two body uses are
+///    load-bearing for the build and the executed stride test, so the one free
+///    mention of that name in the whole crate is a single doc line there — and
+///    per-file pinning means it cannot be spent on `lib.rs`. (Before round 5
+///    this was NOT true and the paragraph claimed it anyway: `for_trace()`'s
+///    caller was unpinned, and renaming `binding_slot`'s parameter freed three
+///    more. Five of the seven were free, not one.)
+///
+///    **The shipped version of the paragraph above said "for `rx_queue` that
+///    closes it", and that was FALSE.** Spending the budget for the two COUNTED
+///    names closes nothing on its own, because a statement pin bounds how the
+///    construction is SPELLED and the tally bounds how often two names are
+///    WRITTEN — neither bounds what a THIRD name in that statement is BOUND TO.
+///    The demonstrated form, measured on this tree and reproduced by hand
+///    before this paragraph was written, attacks `ctx`. Five statement-scope
+///    lines above the pinned construction, shadow `ctx` with a doctored
+///    `xdp_md`, then restore it before `bpf_xdp_adjust_meta` needs the real
+///    one:
+///
+///    ```ignore
+///    let real_ctx = ctx;
+///    let q_masked = unsafe { (*ctx.ctx).rx_queue_index } & 0x3;
+///    let mut shadow_md: xdp_md = unsafe { core::mem::zeroed() };
+///    shadow_md.rx_queue_index = q_masked;
+///    let ctx = &XdpContext { ctx: &mut shadow_md };
+///    // …the PINNED construction statement, byte-identical, reads the
+///    //   doctored struct…
+///    let ctx = real_ctx;
+///    ```
+///
+///    Measured: builds for `bpfel-unknown-none`; the live kernel verifier
+///    PASSes; the emitted object gains `r &= 0x3` AND LOSES the `> 0xf` stride
+///    guard entirely (1 → 0 occurrences of `0xf goto`, which LLVM only removes
+///    once it can prove the value is under 16); every `shim_*` test stays
+///    GREEN. That is #5173 back in the shipped program with the whole merge
+///    path green. The counted names are untouched: `rx_queue` still appears
+///    three times in `lib.rs`, `ingress_ifindex` twenty-two, and the
+///    construction statement still matches its pin token-for-token.
+///
+///    Two bounds below now close the DEMONSTRATED forms of this — `ctx` joins
+///    the per-file tally, and `let ctx` is refused outright. They do not close
+///    the CLASS, and cannot: the class is semantic (what a name resolves to)
+///    and the instrument is syntactic (which names appear, and how often).
+///    Read that as a raised bar, not a proof.
 ///
 ///    For `ingress_ifindex` it does NOT close, and the previous claim that
 ///    buying a shadow there "costs a visibly deleted telemetry call" was false:
@@ -3188,8 +3226,15 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         "#5173: the coordinate must be wrapped by exactly this statement, once:\n  {}\nfound {} \
          occurrence(s) {ctor_site:?}. The constructor takes a bare u32, so a reduction applied \
          BEFORE the wrap is one of the two escapes the newtype cannot prevent (`transmute` is \
-         the other, and nothing here catches it) — which makes the argument spelling the \
-         load-bearing part, not just the call's existence.",
+         the other, and nothing here catches it) — which is why the argument SPELLING is pinned \
+         and not just the call's existence.\nWhat that pin does NOT do, stated because an \
+         earlier revision claimed it did: pinning the spelling does not make the spelling \
+         load-bearing. This sequence is byte-identical whatever `ctx` is bound to, and a \
+         statement-scope rebinding of `ctx` above this line — a zeroed `xdp_md` carrying a \
+         masked queue index, restored immediately after — reintroduces #5173 in the emitted \
+         object with this assertion, the tallies and the kernel verifier all green. That form \
+         is now caught by the `ctx` column of the per-file tally and by the `let ctx` refusal \
+         below, neither of which is this check.",
         CONSTRUCTION_STATEMENT.join(" "),
         ctor_site.len(),
     );
@@ -3620,35 +3665,95 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // PER FILE, not crate-wide. A crate total is FUNGIBLE across files: a doc
     // line deleted in `binding_index.rs` would pay for a shadow added to
     // `lib.rs`, which is a conservation escape the total cannot see. Pinning the
-    // tally per file makes the conservation residual per-file too, and that is
-    // what closes it for the queue coordinate: `lib.rs` names it three times and
+    // tally per file makes the conservation residual per-file too, and for the
+    // queue coordinate that spends the budget: `lib.rs` names it three times and
     // all three are inside pinned statements — the construction, the `for_trace`
-    // readback and the lookup — so the ONE file a shadow could sit in, between
-    // the pinned definition and the pinned use, has nothing left to spend. It is
-    // NOT closed for the interface coordinate; see CONSERVATION on the doc
-    // comment for the free slots that remain there.
+    // readback and the lookup. It does NOT spend it for the interface
+    // coordinate; see CONSERVATION on the doc comment for the free slots that
+    // remain there.
+    //
+    // A spent budget is NOT a closed hole, and the shipped version of the
+    // paragraph above said it was ("has nothing left to spend"). Both counted
+    // names can be fully accounted for while #5173 is reintroduced through a
+    // THIRD name that neither of them tracks — `ctx`. Shadow it a few
+    // statement-scope lines above the pinned construction with a zeroed
+    // `xdp_md` whose `rx_queue_index` is masked, restore it before
+    // `bpf_xdp_adjust_meta` needs the real one, and the pinned statement is
+    // byte-identical while reading a different struct. Measured on this tree:
+    // builds for `bpfel-unknown-none`, live kernel verifier PASS, the emitted
+    // object gains `&= 0x3` and LOSES the `> 0xf` stride guard, and every
+    // `shim_*` test green — with `rx_queue` still at 3 in `lib.rs` and
+    // `ingress_ifindex` still at 22.
+    //
+    // So `ctx` gets a column. That closes the DEMONSTRATED forms — a `let`
+    // shadow, a pattern binding, a parameter — and it does not close the class:
+    // the class is what a name RESOLVES TO, and every instrument in this file
+    // is about which names the source WRITES. Do not read a green tally as
+    // proof that the coordinate arrives intact.
+    //
+    // The `ctx` column is only counted on files that already name a coordinate,
+    // and that is sound rather than a gap: the construction statement is pinned
+    // and it names `rx_queue`, so whatever file holds it necessarily has a row.
+    // A shadow has to be in lexical scope AT that statement — same function,
+    // therefore same file — and the two ways to inject a binding across a file
+    // boundary are already refused above (`include!`/`#[path]` by the
+    // confinement bound) or carried as the declared proc-macro residual.
     //
     // Paths are relative to the walked root, so this is pinnable and a NEW file
-    // that mentions either name is a red rather than an invisible addition.
+    // that mentions either coordinate is a red rather than an invisible
+    // addition.
     #[rustfmt::skip]
-    const MENTIONS_PER_FILE: &[(&str, usize, usize)] = &[
-        //  file                 ingress_ifindex  rx_queue
-        //                       ---------------  --------
-        //  binding_index.rs:    1 doc + param    1 doc + param
-        //                       + 1 body use     + 2 body uses
-        //  lib.rs:              2 struct fields, 3, ALL inside pinned
-        //                       the pinned read  statements: the
-        //                       (x2), the iface  construction, the
-        //                       gate, the pinned `for_trace` readback
-        //                       lookup, 12 trace and the lookup
-        //                       args, the meta
-        //                       write, the trace
-        //                       fn's param, its
-        //                       struct init and
+    const MENTIONS_PER_FILE: &[(&str, usize, usize, usize)] = &[
+        //  file                 ingress_ifindex  rx_queue         ctx
+        //                       ---------------  --------         ---
+        //  binding_index.rs:    1 doc + param    1 doc + param    PROSE ONLY —
+        //                       + 1 body use     + 2 body uses    this module is
+        //                                                         `core`-only
+        //                                                         and cannot see
+        //                                                         an
+        //                                                         `XdpContext`:
+        //                                                         2 quoting the
+        //                                                         pinned read,
+        //                                                         1 naming the
+        //                                                         escape
+        //  lib.rs:              2 struct fields, 3, ALL inside    the `#[xdp]`
+        //                       the pinned read  pinned           entry param,
+        //                       (x2), the iface  statements: the  the inner
+        //                       gate, the pinned construction,    fn's param,
+        //                       lookup, 12 trace `for_trace`      and every
+        //                       args, the meta   readback and     `ctx.`/
+        //                       write, the trace the lookup       `(*ctx.ctx)`
+        //                       fn's param, its                   read on the
+        //                       struct init and                   packet path
         //                       its key mix
-        ("binding_index.rs",     3,               4),
-        ("lib.rs",               22,              3),
+        ("binding_index.rs",     3,               4,               3),
+        ("lib.rs",               22,              3,               17),
     ];
+
+    // ---- …and `ctx` may not be rebound AT ALL. ---------------------------
+    //
+    // The column above sees a rebinding because it moves the count. This sees
+    // the single most direct form regardless of the count, so that trading a
+    // prose mention for a shadow — the conservation move the tally is honest
+    // about not classifying — still reds on the shape. Zero today: the context
+    // is a parameter on both functions that take one and is never re-`let` in
+    // this crate.
+    let ctx_rebinds = seq(&["let", "ctx"]);
+    assert!(
+        ctx_rebinds.is_empty(),
+        "#5173: `ctx` must never be rebound with a `let` in the shim crate, but {} do \
+         {ctx_rebinds:?}. The construction statement below is pinned token-for-token, which \
+         bounds how it is SPELLED and not what `ctx` resolves to when it runs: shadowing `ctx` \
+         above it with a doctored `xdp_md` and restoring it afterwards puts a masked queue index \
+         into `RawRxQueue` with the pin, the tallies and the kernel verifier all green. That was \
+         demonstrated end to end, so this refusal exists. It closes the `let` form only — a \
+         pattern binding or a parameter is caught by the `ctx` column of the tally above, and \
+         neither bound closes the CLASS, which is semantic while both of these are syntactic. \
+         Prose spelling `let` immediately before the identifier trips this; that is a spurious \
+         RED, never a silent pass, and the shim's own comments are worded around it.",
+        ctx_rebinds.len(),
+    );
+
     for name in ["ingress_ifindex", "rx_queue"] {
         let rebinds = seq(&["let", name]);
         assert_eq!(
@@ -3671,36 +3776,44 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // One row per file that names either coordinate, in walk order. Compared as
     // a whole list so a file appearing, disappearing or trading a mention with
     // another file is a red — which a pair of crate totals is not.
-    let tally: Vec<(String, usize, usize)> = tokens
+    let tally: Vec<(String, usize, usize, usize)> = tokens
         .iter()
         .filter_map(|(file, toks)| {
             let ifx = shim_token_seq_count(toks, &["ingress_ifindex"]);
             let queue = shim_token_seq_count(toks, &["rx_queue"]);
-            (ifx + queue > 0).then(|| (file.clone(), ifx, queue))
+            let ctx = shim_token_seq_count(toks, &["ctx"]);
+            (ifx + queue > 0).then(|| (file.clone(), ifx, queue, ctx))
         })
         .collect();
-    let expected: Vec<(String, usize, usize)> = MENTIONS_PER_FILE
+    let expected: Vec<(String, usize, usize, usize)> = MENTIONS_PER_FILE
         .iter()
-        .map(|(f, ifx, queue)| ((*f).to_string(), *ifx, *queue))
+        .map(|(f, ifx, queue, ctx)| ((*f).to_string(), *ifx, *queue, *ctx))
         .collect();
     assert_eq!(
         tally, expected,
-        "#5173: the shim crate must name `ingress_ifindex` and `rx_queue` exactly this many times \
-         in exactly these files — (file, ingress_ifindex, rx_queue) — but the walk found \
-         {tally:#?} against {expected:#?}.\nThis is the bound that is complete over binding FORMS \
-         written here, and the reason it is a tally rather than a pattern match: a rebinding in \
-         ANY form — a tuple, struct, slice or `Some(..)` pattern, a `let … else`, `if let`, \
-         `while let`, `for`, a match arm, a `macro_rules!` expansion, or a closure/`fn` parameter \
-         — has to WRITE the name to exist, so all of them land here even though only the \
-         bare-identifier `let` lands on the bound above. Four such forms were demonstrated \
-         compiling with every other check green, one of them a `transmute` forgery bound through \
-         a tuple pattern that reintroduced #5173 in the emitted object.\nIt is PER FILE because a \
-         crate total is fungible: a freed mention in one file would pay for a shadow in another. \
-         What it does NOT see is a binding written outside the walk — a proc-macro expansion; the \
-         manifest pin above bounds the route to that, and this test's doc comment carries it as a \
-         residual.\nA comment or doc line that spells either identifier lands here too; that is a \
-         spurious RED, never a silent pass. If you are adding a legitimate mention, move the row \
-         deliberately and say why.",
+        "#5173: the shim crate must name `ingress_ifindex`, `rx_queue` and `ctx` exactly this \
+         many times in exactly these files — (file, ingress_ifindex, rx_queue, ctx) — but the \
+         walk found {tally:#?} against {expected:#?}.\nThis is the bound that is complete over \
+         binding FORMS written here, and the reason it is a tally rather than a pattern match: a \
+         rebinding in ANY form — a tuple, struct, slice or `Some(..)` pattern, a `let … else`, \
+         `if let`, `while let`, `for`, a match arm, a `macro_rules!` expansion, or a closure/`fn` \
+         parameter — has to WRITE the name to exist, so all of them land here even though only \
+         the bare-identifier `let` lands on the bounds above. Five such forms were demonstrated \
+         compiling with every other check green: a `transmute` forgery bound through a tuple \
+         pattern, and a `ctx` shadow carrying a doctored `xdp_md` past the byte-identical pinned \
+         construction — both reintroduced #5173 in the emitted object.\nComplete over FORMS is \
+         not complete over the CLASS. The `ctx` column exists because two fully-accounted \
+         coordinate columns did not stop the shadow that hijacked the third name, and adding it \
+         closes the forms demonstrated so far, not the possibility of another name. What this \
+         file measures is which identifiers the source writes; what #5173 is about is what they \
+         resolve to at run time. Those are different questions and a green tally answers only \
+         the first.\nIt is PER FILE because a crate total is fungible: a freed mention in one \
+         file would pay for a shadow in another. What it does NOT see is a binding written \
+         outside the walk — a proc-macro expansion; the manifest pin above bounds the route to \
+         that, and this test's doc comment carries it as a residual.\nA comment or doc line that \
+         spells any of the three identifiers lands here too; that is a spurious RED, never a \
+         silent pass. If you are adding a legitimate mention, move the row deliberately and say \
+         why.",
     );
 
     // ---- The newtype's compile-time half, tested rather than assumed. -----
@@ -3718,6 +3831,15 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     // `impl core::ops::Rem<u32> for &RawRxQueue` tokenizes `… for & RawRxQueue`,
     // the adjacency fails, and `&rx_queue % 4` then compiles. So step over the
     // reference sugar (`&`, `mut`, a lifetime) between `for` and the type.
+    //
+    // "NO traits" was also literally false about the type as it stands, in a way
+    // the same message went on to contradict two sentences later: the `struct`
+    // carries `#[derive(Clone, Copy, PartialEq, Eq, Debug)]`, so it implements
+    // five. What this refuses is a WRITTEN `impl … for` block, and the five
+    // derives are exactly why that is the right line to draw — none of them
+    // yields the inner `u32` or an arithmetic operator, so none of them can
+    // reduce the coordinate, whereas a hand-written impl is how `Rem`,
+    // `BitAnd`, `Shr`, `Deref` or `Into` would arrive.
     let mut trait_impls: Vec<String> = Vec::new();
     for (name, toks) in &tokens {
         for i in 0..toks.len() {
@@ -3740,12 +3862,15 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
     }
     assert!(
         trait_impls.is_empty(),
-        "#5173: `RawRxQueue` must implement NO traits, on the type OR on a reference to it — \
-         found {trait_impls:?}. An arithmetic impl (`Rem`, `BitAnd`, `Shr`) makes reducing the \
-         coordinate compile, and `Deref`/`Into` hand out the raw integer to be reduced elsewhere; \
-         either way the module's compile-time half is gone while every other check here stays \
-         green. `#[derive]`d traits are written before the type, not after it, so they do not \
-         trip this."
+        "#5173: `RawRxQueue` must carry NO hand-written `impl … for` block, on the type OR on a \
+         reference to it — found {trait_impls:?}. An arithmetic impl (`Rem`, `BitAnd`, `Shr`) \
+         makes reducing the coordinate compile, and `Deref`/`Into` hand out the raw integer to \
+         be reduced elsewhere; either way the module's compile-time half is gone while every \
+         other check here stays green. This is deliberately narrower than \"implements no \
+         traits\", which the type does not satisfy and never has: it derives `Clone`, `Copy`, \
+         `PartialEq`, `Eq` and `Debug`. Those are allowed because none of them exposes the inner \
+         `u32` or an operator — and mechanically they do not trip this needle either, since a \
+         `#[derive]` names its traits BEFORE the type rather than after `for`."
     );
 
     // …and the type's mention count, which is the bound that is complete over

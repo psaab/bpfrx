@@ -120,15 +120,37 @@
 //! DELETES an existing use or line of prose can pay for a shadow and leave the
 //! tally where it was. The two coordinates are in different positions and the
 //! parity tests say so precisely rather than in the aggregate: for the queue
-//! half every mention in the packet-path file is inside a pinned statement, so
-//! there is nothing free to spend there; for the interface half free mentions
-//! still exist outside the index path, and that is stated there as an open
-//! residual rather than defended. What the bounds can do, and now do, is make
-//! every reintroduction of #5173 DEMONSTRATED in five hostile rounds either fail
+//! half every mention in the packet-path file is already inside a pinned
+//! statement, so that name's budget there is spent; for the interface half free
+//! mentions still exist outside the index path, and that is stated there as an
+//! open residual rather than defended.
+//!
+//! **An earlier revision of the sentence above went on to say "so there is
+//! nothing free to spend there", and that was FALSE — it treated a spent budget
+//! for the two COUNTED names as a closed hole.** It is not one, because what a
+//! tally bounds is which names are WRITTEN and how often, and what a statement
+//! pin bounds is how the construction is SPELLED. Neither bounds what a THIRD
+//! name inside that statement is BOUND TO. The demonstrated form attacks `ctx`:
+//! shadow it a few statement-scope lines above the pinned construction with a
+//! zeroed `xdp_md` carrying a masked queue index, restore it before
+//! `bpf_xdp_adjust_meta` needs the real one, and the byte-identical pinned
+//! statement reads the doctored struct. Measured on this tree: it builds, the
+//! live kernel verifier PASSes, the emitted object gains a mask and LOSES the
+//! stride guard, and every parity test stays green. The context binding is now
+//! counted per file, and a `let`-rebinding of it is refused outright, which
+//! closes the demonstrated forms — it does not close the class, because the
+//! class is about what a name RESOLVES TO and every instrument here is about
+//! what the source SAYS. (The refusal is why this paragraph writes "the context
+//! binding" where it means the identifier: spelling `let` immediately before it
+//! would trip the parity test on prose.)
+//!
+//! What the bounds can do, and now do, is make
+//! every reintroduction of #5173 DEMONSTRATED in six hostile rounds either fail
 //! to compile, fail a pinned token sequence — a statement, a signature, or this
 //! crate's manifest — trip a refused build capability, or move a pinned tally.
-//! Undemonstrated variants of the interface-half conservation escape are not
-//! covered, and the parity tests name the mentions that are still free.
+//! Undemonstrated variants of the conservation escape are not covered, on
+//! EITHER coordinate and on the context binding as well, and the parity tests
+//! name the mentions that are still free.
 //!
 //! Nothing here may depend on `aya`, on a BPF map, or on `std` — that is what
 //! keeps it host-compilable, and it is the whole point.
