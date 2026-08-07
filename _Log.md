@@ -74004,4 +74004,74 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/logging/flow_trace_flag_installed_6673_test.go,
   pkg/dataplane/userspace/nptv6_multivalue_match_6673_test.go,
   pkg/dataplane/userspace/static_nat_repeated_match_6673_test.go,
+## 2026-08-07 — #6673 fold r10: the flat-set bracket FUSES; the prescribed schema fix is wrong
+
+- **Timestamp**: 2026-08-07
+- **Action**: Fixed a RUNTIME REGRESSION vs master in the two `event-options`
+  multi-word leaves, corrected two false claims in the shipped prose, and
+  classified three deferred sites as GATE ESCAPES rather than value-drops.
+- **F1 (blocking, regression vs master)**: `eventChangeConfigCommands` split the
+  node's own TAIL per token but joined each CHILD's Keys unconditionally. Which
+  of the two a bracketed list lands in is decided by WHICH PARSER RAN —
+  `NewParser` collapses `commands [ "a" "b" ]` onto `Keys[1:]`, while
+  `ParseSetCommand` + `SetPath` puts the identical list on ONE CHILD's Keys — so
+  the hierarchical spelling compiled correctly and the flat-set spelling fused
+  into `"set system host-name foo delete system host-name"`. Measured on
+  origin/master (`["set system host-name foo"]`, drops the rest) vs the branch
+  (one fused string). Fused, the string still carries the `set ` prefix, so
+  `eventengine.classifyPlan` ACCEPTS it and the remediation applies a 6-token
+  path nobody wrote — strictly worse than master, which applied command #1.
+  `attributes-match` fuses the same way (master fuses identically, so a
+  completeness defect, not a regression) and fails CLOSED at runtime. A third
+  shape was found by enumeration: hierarchical `commands set system host-name
+  foo;` compiled to FOUR bare words at the branch head.
+- **The prescribed fix (`args: 1, multi: true` on both leaves) is wrong, and
+  measured wrong.** It fixes the two bracket cases and introduces two
+  regressions: `SetPath` then routes an UNQUOTED command onto the tail where the
+  per-token read shatters it into four bare words, and it turns repeated
+  flat-set statements into SIBLING nodes that `ccNode.FindChild` (singular)
+  drops after the first — worse than master. It also cannot repair an
+  already-persisted config, because the configstore deserializes Nodes from JSON
+  and `SetPath` never runs. Fixed in the READER instead, where both parser
+  shapes and both storage paths meet: one `eventMultiWordLeafValues` helper
+  applied to the tail AND to each child's Keys. All 16 enumerated authoring
+  shapes now compile correctly; three were wrong at the branch head.
+- **Discriminator**: the FIRST token, not any token. A first token that is
+  quoted (contains a space, or is empty — the lexer produces neither in a bare
+  word) means every token is a whole value. "Any token" breaks the legitimate
+  `commands set system host-name "foo bar"`, and taking the first token puts the
+  opposite ambiguity (`[ "set a b" bogus ]`) on the fail-CLOSED side.
+- **F2**: corrected `docs/config-schema.md`'s "Both regressions landed there,
+  and only there" — true of PROMOTION, false of the token boundary, and the
+  claim that would stop the next reader looking.
+- **F3**: corrected the PR body's "CoS `code-points` is not a fail-open — its
+  validator reads `Keys` and correctly rejects a bogus code point in either
+  slot". `collectCoSDSCPCodePoints` reads `child.Keys[1:]` plus the inline tail
+  and NEVER `child.Children`, so "either slot" holds only within the packed
+  tail. Three deferred sites classified through `configstore.CheckText`, each
+  paired with a single-value control: CoS `code-points` (BLOCK escapes,
+  bracket rejects, #6697), `archive-sites` (bracket escapes, block and single
+  reject, #6692, CWE-88), `vlan-id-list` (BOTH shapes escape, single rejects,
+  #6687). Left deferred — all three are already tracked, in three unrelated
+  subsystems, with no read this PR widens — but the escape is now stated at each
+  READ SITE in code, with an explicit warning that widening the archive-sites
+  read without widening the leading-dash check in the same change ships a live
+  argument injection.
+- **Validation**: four mutation cells, `go vet ./pkg/config ./pkg/eventengine`
+  rc=0 under every one so no red is a build break. M-A (children branch →
+  unconditional join, i.e. the branch head) REDs 5 cells with named assertions
+  including "ThenCommands = [\"set system host-name foo delete interfaces
+  ge-0/0/0\"]" and "policy does not fire for the event it was written for". M-B
+  (tail branch → head rules) REDs the two hierarchical shapes. M-C
+  (discriminator → ANY token) REDs only the four over-reach cells and leaves
+  every bracket cell GREEN — the negative control separating "splits correctly"
+  from "splits at all". M-D (drop the empty-token clause) REDs only the
+  empty-in-first-slot parity cell. Over-reach guards GREEN under every
+  mutation: the flat-set single-unquoted, repeated-statement and block
+  spellings. `go build ./...` 0, `go vet ./...` 0, `go test ./...` 0 across 60
+  packages, `golden_4406.json` regenerates byte-identical.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/compiler_system.go, pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
+  pkg/eventengine/multivalue_leaf_runtime_6673_test.go,
   docs/config-schema.md, _Log.md

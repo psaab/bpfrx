@@ -283,3 +283,189 @@ func TestEventAttributesMatch6673UnquotedPackedStaysOneExpression(t *testing.T) 
 			pol.AttributesMatch)
 	}
 }
+
+// --- #6673 fold: the FLAT-SET parser shape, which this file had never driven --
+
+// compileFlatSetPolicy6673 builds the candidate the way an operator using
+// `set` / `load set` does — ParseSetCommand + SetPath, never NewParser (which
+// merges every set line into one node, per CLAUDE.md).
+//
+// Every test above this line drives config text through NewParser. That is why
+// none of them saw the regression below: a bracketed list lands on the node's
+// own Keys under the hierarchical parser but on ONE CHILD's Keys under SetPath,
+// and the two shapes were read by different branches of the same helper.
+func compileFlatSetPolicy6673(t *testing.T, cmds ...string) *config.EventPolicy {
+	t.Helper()
+	tree := &config.ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("strict compile rejected a configuration origin/master accepts: %v", err)
+	}
+	if len(cfg.EventOptions) != 1 {
+		t.Fatalf("compiled %d event policies, want 1", len(cfg.EventOptions))
+	}
+	return cfg.EventOptions[0]
+}
+
+// TestEventChangeConfigCommands6673FlatSetBracketStaysExecutable is the F1
+// differential, and it is a REGRESSION guard rather than a fail-open guard —
+// the branch was strictly worse than origin/master at this shape.
+//
+// `set … commands [ "set system host-name foo" "delete system host-name" ]`
+// puts both members on ONE CHILD's Keys. The children branch joined them, so
+// the policy compiled to the single string
+// "set system host-name foo delete system host-name".
+//
+// That string is not merely a lost command. It carries the `set ` prefix, so
+// classifyPlan ACCEPTS it: ParseSetCommand parses the six remaining tokens into
+// a path and the batch classifies ok with one op. The remediation therefore
+// stops applying command #1 (what master did, dropping the rest) and starts
+// applying a path the operator never wrote, which the candidate commit then
+// rejects — the automation stops working entirely where it previously worked
+// partially.
+//
+// The assertion is classifyPlan's verdict plus the op's own setInput, because
+// "ok=true with one op" is exactly what the FUSED value also produces; only the
+// path inside the op separates them.
+func TestEventChangeConfigCommands6673FlatSetBracketStaysExecutable(t *testing.T) {
+	pol := compileFlatSetPolicy6673(t,
+		"set event-options policy p events e",
+		`set event-options policy p then change-configuration commands [ "set system host-name foo" "delete system host-name" ]`,
+	)
+
+	e := &Engine{}
+	ops, ok := e.classifyPlan(pol)
+	if !ok {
+		t.Fatalf("flat-set bracket `commands` classified as UNEXECUTABLE from "+
+			"ThenCommands=%q", pol.ThenCommands)
+	}
+	if len(ops) != 2 {
+		t.Fatalf("flat-set bracket `commands` classified into %d ops from "+
+			"ThenCommands=%q, want 2 — the two bracket members fused into one "+
+			"string, and because it still starts with `set ` classifyPlan "+
+			"accepts it and the remediation applies a path the operator never "+
+			"wrote", len(ops), pol.ThenCommands)
+	}
+	if ops[0].setInput != "system host-name foo" {
+		t.Fatalf("first op setInput = %q, want %q — anything longer means the "+
+			"second bracket member was fused onto the first command's path",
+			ops[0].setInput, "system host-name foo")
+	}
+	if !ops[1].isDelete {
+		t.Fatalf("second op is not a delete (raw = %q); the `delete …` member "+
+			"of the bracket must survive as its own operation", ops[1].raw)
+	}
+}
+
+// TestEventAttributesMatch6673FlatSetBracketYieldsSeparateConstraints is the F2
+// differential — the same AST shape, on the other leaf.
+//
+// This one is NOT a regression against master: master fused it identically. It
+// is the failure the branch's own docs declared fixed and located "there, and
+// only there" — the branch widened the tail read but left the flat-set child
+// shape fusing, so a two-member list committed clean and then matched nothing,
+// because ParseEventAttributesMatch splits at the FIRST separator and treats
+// everything after it as one regex.
+//
+// It fails CLOSED at runtime (attributesMatch rejects a non-matching pattern),
+// so the cost is a policy that never fires rather than one that always does.
+func TestEventAttributesMatch6673FlatSetBracketYieldsSeparateConstraints(t *testing.T) {
+	pol := compileFlatSetPolicy6673(t,
+		"set event-options policy p events e",
+		`set event-options policy p attributes-match [ "e.test-owner matches ^alice$" "e.test-name matches ^wan$" ]`,
+	)
+
+	e := &Engine{}
+	authored := rpm.Event{Name: "e", TestOwner: "alice", TestName: "wan"}
+	if !e.attributesMatch(pol, authored) {
+		t.Fatalf("policy does not fire for the event it was written for "+
+			"(TestOwner=%q TestName=%q); compiled constraints = %q. A "+
+			"flat-set bracketed attributes-match list must compile to ONE "+
+			"CONSTRAINT PER MEMBER; fused, the regex is everything after the "+
+			"first \" matches \" and is compared against ev.TestOwner alone, "+
+			"so the policy commits clean and never matches anything.",
+			authored.TestOwner, authored.TestName, pol.AttributesMatch)
+	}
+	if got := len(pol.AttributesMatch); got != 2 {
+		t.Fatalf("compiled %d attributes-match constraints from a 2-member "+
+			"flat-set bracket list, want 2: %q", got, pol.AttributesMatch)
+	}
+	// Both must BIND, or "it fires" is satisfied by compiling nothing.
+	for _, tc := range []struct {
+		name string
+		ev   rpm.Event
+	}{
+		{"first member must bind", rpm.Event{Name: "e", TestOwner: "bob", TestName: "wan"}},
+		{"second member must bind", rpm.Event{Name: "e", TestOwner: "alice", TestName: "lan"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if e.attributesMatch(pol, tc.ev) {
+				t.Fatalf("policy fires for TestOwner=%q TestName=%q; the "+
+					"constraint list %q must NARROW the policy, not just exist",
+					tc.ev.TestOwner, tc.ev.TestName, pol.AttributesMatch)
+			}
+		})
+	}
+}
+
+// TestEventChangeConfigCommands6673FlatSetUnquotedStaysOneCommand is the
+// OVER-REACH guard for the pair above, and it is what rules out the schema fix.
+//
+// Declaring these two leaves `multi: true` in setSchema makes SetPath absorb a
+// bracket onto the node's own tail — which does fix the two tests above — but
+// it absorbs an UNQUOTED command's bare words the same way, and the tail is
+// read per token. `set … commands set system host-name foo` then compiles to
+// four bare words, none of which carries a `set `/`delete ` prefix, so
+// classifyPlan rejects the whole batch and the remediation never runs. Measured
+// firsthand before choosing the reader fix instead.
+func TestEventChangeConfigCommands6673FlatSetUnquotedStaysOneCommand(t *testing.T) {
+	pol := compileFlatSetPolicy6673(t,
+		"set event-options policy p events e",
+		`set event-options policy p then change-configuration commands set system host-name foo`,
+	)
+	e := &Engine{}
+	ops, ok := e.classifyPlan(pol)
+	if !ok || len(ops) != 1 {
+		t.Fatalf("unquoted flat-set `commands` classified into %d ops ok=%v "+
+			"from ThenCommands=%q, want 1 executable op — its bare words are "+
+			"ONE command, not a list", len(ops), ok, pol.ThenCommands)
+	}
+	if ops[0].setInput != "system host-name foo" {
+		t.Fatalf("op setInput = %q, want %q", ops[0].setInput, "system host-name foo")
+	}
+}
+
+// TestEventChangeConfigCommands6673FlatSetRepeatedStatementsAllSurvive is the
+// second over-reach guard, and it pins the OTHER thing `multi: true` breaks.
+//
+// Under `multi`, repeated flat-set statements become distinct SIBLING
+// `commands` nodes instead of merging into one node's children — and
+// compileEventOptions reaches the leaf through ccNode.FindChild (SINGULAR), so
+// every sibling after the first is silently dropped. That is worse than both
+// master and the branch. Measured firsthand; this guard makes the loss visible
+// if anyone declares the leaf `multi` without also making the reader
+// sibling-aware.
+func TestEventChangeConfigCommands6673FlatSetRepeatedStatementsAllSurvive(t *testing.T) {
+	pol := compileFlatSetPolicy6673(t,
+		"set event-options policy p events e",
+		`set event-options policy p then change-configuration commands "set system host-name foo"`,
+		`set event-options policy p then change-configuration commands "delete system host-name"`,
+	)
+	e := &Engine{}
+	ops, ok := e.classifyPlan(pol)
+	if !ok || len(ops) != 2 {
+		t.Fatalf("two repeated flat-set `commands` statements classified into "+
+			"%d ops ok=%v from ThenCommands=%q, want 2 — a dropped sibling is "+
+			"a remediation step that silently never runs",
+			len(ops), ok, pol.ThenCommands)
+	}
+}

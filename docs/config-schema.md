@@ -964,6 +964,34 @@ complaint about the pair that actually installs. For the same reason the
 match-side widening buys DIAGNOSTIC completeness, not a dataplane backstop: the
 tail values never reach the Rust parser at all.
 
+**A one-sided read is a GATE ESCAPE, not a value-drop, wherever the leaf's only
+validator lives in the compiler loop (#6673).** The discriminator is mechanical,
+not a judgement call: a leaf declaring a schema `validator` gets dual-shape
+checking for free, because `validateMultiValueLeaf` (`schema_walk.go`) walks
+`Keys[1:]` AND every child's `Keys[0]`. A leaf whose only check is an inline
+`if` inside the compiler's own read loop is checked exactly where that loop
+looks — so the shape the loop does not read commits CLEAN, while the identical
+token authored in the shape it does read is REJECTED. Three deferred sites were
+classified through `configstore.CheckText`, each paired with a single-value
+control so an ACCEPT only counts beside a REJECT of the same token:
+
+| Leaf | Shape that ESCAPES | Same token REJECTED as | Tracked |
+|---|---|---|---|
+| CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 |
+| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
+| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
+
+Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
+reads `child.Keys[1:]` plus the inline tail and never `child.Children`, while
+the archive-sites loop reads children and only slot 1 of the tail. "Which shape
+escapes" is a property of the individual reader; do not generalise from one.
+
+**And an escape can become live when someone else fixes the value-drop.** The
+archive-sites escape is inert TODAY only because the value is also dropped. A
+follow-up that widens that read without widening the leading-dash check in the
+same change ships a live CWE-88 argument injection; the warning is stated at the
+read site itself in `compiler_system.go`, not only here.
+
 **An EMPTY authored value is a value, and whether to keep it depends on whether
 the leaf SELECTS or SETS (#6673).** `firewallMatchValues` skips blank tokens,
 which is right where every value it returns is installed — but a leaf that reads
@@ -1014,8 +1042,15 @@ no gate reports anything.
 that used it ALREADY preferred the node's own tail; widening such a leaf can
 only add values from slots the old reader never reached. The two `event-options`
 arms are the exception in the #6659 set: they read `Children` and NOTHING else,
-so for them the tail is exactly the discarded side. Both regressions landed
-there, and only there.
+so for them the tail is exactly the discarded side. Both PROMOTION regressions
+landed there.
+
+That is a statement about promotion only, and an earlier revision of this
+section over-read it into "both regressions landed there, and only there" —
+which was wrong, and wrong in the direction that stops the next reader looking.
+Promotion is one of the two ways a widened reader misreads a node. The other is
+the TOKEN BOUNDARY below, and it bites in a place this section originally did
+not consider: not the tail, but a CHILD's Keys.
 
 The concrete shape is a node carrying BOTH a tail and children —
 `<leaf> <identifier> { <value>; }`, which the parser renders as
@@ -1036,23 +1071,60 @@ whole value list and the node's own tail is ignored, verbatim master behaviour;
 the tail is read only when there are no children, which is the shape master
 compiled nothing from.**
 
-The tail itself then needs one more distinction, because two different spellings
-land there:
+#### The token boundary is a property of the GROUP, not of the tail (#6673)
 
-| Spelling | `Keys[1:]` | Meaning |
+When a leaf's value is itself a MULTI-WORD string, "how many values does this
+token group hold" cannot be answered by counting tokens. Both `event-options`
+arms are like this — a command carries its `set `/`delete ` prefix, an
+expression carries `" matches "` — and both spellings are legal:
+
+| Spelling | tokens | Meaning |
 |---|---|---|
 | `attributes-match e.owner matches X;` | `["e.owner","matches","X"]` | ONE expression the lexer split |
 | `attributes-match [ "e.a matches X" "e.b matches Y" ];` | `["e.a matches X","e.b matches Y"]` | TWO whole expressions |
 
-The lexer never leaves a space inside an unquoted token, so a tail token
-CONTAINING `" matches "` can only have come from a quoted bracket member. If any
-tail token carries the separator the tail is a list of expressions; otherwise it
-joins into one. Joining unconditionally produced
+**Apply the rule to every group — the tail AND each child's Keys.** Which of the
+two a bracketed list lands in is decided by WHICH PARSER RAN, not by what the
+operator wrote:
+
+| | `commands [ "set a b" "delete c" ]` becomes |
+|---|---|
+| `NewParser` (hierarchical / `load merge`) | `Keys=["commands","set a b","delete c"]`, no children |
+| `ParseSetCommand` + `SetPath` (flat set / `load set` / CLI) | `Keys=["commands"]` with ONE child `Keys=["set a b","delete c"]` |
+
+A rule applied to the tail alone therefore fixes one operator's spelling and
+leaves the other's fusing. That was the #6673 defect: the branch split the tail
+and joined the children, so the hierarchical bracket compiled correctly while
+the identical flat-set bracket compiled to one fused string. For `commands` that
+string still begins with `set `, so `classifyPlan` ACCEPTS it and the
+remediation applies a path nobody wrote — strictly worse than the pre-#6659
+reader, which applied the first command and dropped the rest. For
+`attributes-match` it produced
 `e.test-owner matches ^alice$ e.test-name matches ^wan$`, which
 `ParseEventAttributesMatch` splits at the FIRST separator and accepts — the
 remainder compiles as a valid regex — so the policy committed and then never
-matched anything. The `commands` tail needs no such rule: each trailing token is
-already one complete (quoted) command.
+matched anything.
+
+Note that neither leaf declares `multi: true`, and that is what makes the two
+shapes diverge (a `multi` leaf absorbs a bracket onto its own tail under
+`SetPath`). **Declaring them `multi` is not the fix**, for three reasons
+measured firsthand and pinned by
+`TestEventMultiValueLeaf6673TokenBoundaryBothParsers`: it routes an UNQUOTED
+value onto the tail where a per-token read shatters it; it turns repeated
+flat-set statements into sibling nodes that `ccNode.FindChild` (singular) drops
+after the first; and it cannot repair an ALREADY-PERSISTED config, because the
+configstore deserializes Nodes from JSON and `SetPath` never runs. Fix the
+boundary in the reader, where both parser shapes and both storage paths meet.
+
+**The discriminator is the FIRST token, not any token.** The lexer never leaves
+a space inside an unquoted token — nor produces an empty one — so a first token
+that is quoted (contains a space, or is empty) means every token is a whole
+value. Testing "any token" instead breaks the legitimate mixture
+`commands set system host-name "foo bar"`, a quoted VALUE inside an otherwise
+bare statement, shattering one command into four. Testing the first token also
+takes the fail-CLOSED side of the opposite mixture: `[ "set a b" bogus ]` splits,
+so `bogus` reaches `classifyPlan`'s prefix check alone and rejects the whole
+batch, rather than being fused onto a valid command and applied.
 
 **Test this at the CONSUMER.** Every one of these is invisible to an assertion
 about the compiler's intermediate string: the constraint list exists, the

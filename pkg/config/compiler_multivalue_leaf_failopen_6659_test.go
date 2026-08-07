@@ -171,51 +171,224 @@ event-options {
 
 // --- FAIL-OPEN 2: event-options then change-configuration commands ----------
 
-// TestEventChangeConfigCommands6659 covers both broken command spellings.
+// TestEventChangeConfigCommands6659 covers every broken command spelling.
 // The packed form compiled ZERO remediation commands. The unquoted BLOCK form
 // truncated a command to its first word (`set`) because the arm read
 // child.Name() — Keys[0] — instead of joining the child's Keys; that shape is
 // not in the issue's table and was found by dumping the parsed AST.
+//
+// #6673 fold: the table was HIERARCHICAL-ONLY, which is why it did not catch
+// that the flat-set bracket list fused its members into one string. Which of
+// the node's own tail / a child's Keys a bracket lands on is decided by WHICH
+// PARSER RAN, so a table that drives only one parser cannot see the other's
+// shape. Every spelling is now driven through both where both exist.
 func TestEventChangeConfigCommands6659(t *testing.T) {
+	const cmd1 = "set system host-name foo"
+	const cmd2 = "delete interfaces ge-0/0/0"
 	for _, tc := range []struct {
 		name string
-		cfg  string
+		tree *ConfigTree
 		want []string
 	}{
 		{
-			"packed single quoted",
-			`event-options { policy p1 { events e; then { change-configuration {
+			"hier packed single quoted",
+			hierTree6659(t, `event-options { policy p1 { events e; then { change-configuration {
                 commands "set system host-name foo";
-            } } } }`,
-			[]string{"set system host-name foo"},
+            } } } }`),
+			[]string{cmd1},
 		},
 		{
-			"packed bracket list",
-			`event-options { policy p1 { events e; then { change-configuration {
+			"hier packed bracket list",
+			hierTree6659(t, `event-options { policy p1 { events e; then { change-configuration {
                 commands [ "set system host-name foo" "delete interfaces ge-0/0/0" ];
-            } } } }`,
-			[]string{"set system host-name foo", "delete interfaces ge-0/0/0"},
+            } } } }`),
+			[]string{cmd1, cmd2},
 		},
 		{
-			"block unquoted (truncated to `set` pre-fix)",
-			`event-options { policy p1 { events e; then { change-configuration { commands {
+			// Landed on the node's own tail with no children, and the tail was
+			// read PER TOKEN unconditionally — so one command became four
+			// bare words, none of which carries a `set `/`delete ` prefix.
+			"hier packed unquoted (four bare words pre-fold)",
+			hierTree6659(t, `event-options { policy p1 { events e; then { change-configuration {
+                commands set system host-name foo;
+            } } } }`),
+			[]string{cmd1},
+		},
+		{
+			"hier block unquoted (truncated to `set` pre-#6659)",
+			hierTree6659(t, `event-options { policy p1 { events e; then { change-configuration { commands {
                 set system host-name foo;
-            } } } } }`,
-			[]string{"set system host-name foo"},
+            } } } } }`),
+			[]string{cmd1},
 		},
 		{
-			"block quoted (GREEN CONTROL — worked pre-fix)",
-			`event-options { policy p1 { events e; then { change-configuration { commands {
+			"hier block quoted (GREEN CONTROL — worked pre-#6659)",
+			hierTree6659(t, `event-options { policy p1 { events e; then { change-configuration { commands {
                 "set system host-name foo";
                 "delete interfaces ge-0/0/0";
-            } } } } }`,
-			[]string{"set system host-name foo", "delete interfaces ge-0/0/0"},
+            } } } } }`),
+			[]string{cmd1, cmd2},
+		},
+		{
+			// THE #6673 FOLD CASE. ParseSetCommand + SetPath put the whole
+			// bracket on ONE CHILD's Keys, and the children branch joined it:
+			// ["set system host-name foo delete interfaces ge-0/0/0"], a single
+			// string that classifyPlan turns into a garbage set path.
+			"flat-set bracket list",
+			setTree6659(t,
+				"set event-options policy p1 events e",
+				`set event-options policy p1 then change-configuration commands [ "set system host-name foo" "delete interfaces ge-0/0/0" ]`),
+			[]string{cmd1, cmd2},
+		},
+		{
+			"flat-set single quoted (GREEN CONTROL)",
+			setTree6659(t,
+				"set event-options policy p1 events e",
+				`set event-options policy p1 then change-configuration commands "set system host-name foo"`),
+			[]string{cmd1},
+		},
+		{
+			"flat-set single unquoted (GREEN CONTROL)",
+			setTree6659(t,
+				"set event-options policy p1 events e",
+				`set event-options policy p1 then change-configuration commands set system host-name foo`),
+			[]string{cmd1},
+		},
+		{
+			"flat-set repeated statements (GREEN CONTROL)",
+			setTree6659(t,
+				"set event-options policy p1 events e",
+				`set event-options policy p1 then change-configuration commands "set system host-name foo"`,
+				`set event-options policy p1 then change-configuration commands "delete interfaces ge-0/0/0"`),
+			[]string{cmd1, cmd2},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := mustCompile6659(t, hierTree6659(t, tc.cfg))
+			cfg := mustCompile6659(t, tc.tree)
 			if got := cfg.EventOptions[0].ThenCommands; !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("ThenCommands = %q, want %q", got, tc.want)
+				t.Fatalf("ThenCommands = %q, want %q — a fused entry is not a "+
+					"lost command, it is a DIFFERENT command: classifyPlan "+
+					"accepts it as a set path and the remediation applies "+
+					"garbage where it previously applied the first command",
+					got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEventMultiValueLeaf6673TokenBoundaryBothParsers is the #6673 fold's
+// discriminator guard, and the reason the fold did not take the obvious fix.
+//
+// The obvious fix for the fused flat-set bracket is to declare `commands` and
+// `attributes-match` `multi: true` in setSchema, so SetPath absorbs the bracket
+// onto the node's own tail the way the hierarchical parser already does. That
+// is measurably wrong on three counts and none of them is visible from the
+// bracket case alone:
+//
+//  1. `multi` makes SetPath append a bracket's members to the node's Keys, so
+//     `commands set system host-name foo` — an unquoted command — also lands on
+//     the tail, where the per-token read shatters it into four bare words.
+//  2. `multi` makes REPEATED flat-set statements distinct SIBLING nodes rather
+//     than merging into one node's children, and compileEventOptions reaches
+//     `commands` through ccNode.FindChild (singular), so every sibling after
+//     the first is silently dropped — worse than master.
+//  3. It cannot repair a config ALREADY PERSISTED in the child shape: the
+//     configstore deserializes Nodes straight from JSON and SetPath never runs,
+//     so the fused read would survive a reload of the very configs the fold
+//     exists to fix.
+//
+// So the boundary is decided in the READER, once, for both the tail and the
+// children — and this table is what pins it. The last group is the over-reach
+// guard: a quoted VALUE inside an otherwise unquoted statement must stay part
+// of ONE value. That is what rules out the simpler "any token containing a
+// space means the group is a list" discriminator.
+func TestEventMultiValueLeaf6673TokenBoundaryBothParsers(t *testing.T) {
+	cmdsOf := func(cfg *Config) []string { return cfg.EventOptions[0].ThenCommands }
+	amOf := func(cfg *Config) []string { return cfg.EventOptions[0].AttributesMatch }
+
+	for _, tc := range []struct {
+		name string
+		tree *ConfigTree
+		get  func(*Config) []string
+		want []string
+	}{
+		// --- attributes-match: the fused flat-set bracket (F2) -------------
+		{
+			"am/flat-set bracket splits per member",
+			setTree6659(t,
+				"set event-options policy p1 events e1",
+				`set event-options policy p1 attributes-match [ "e1.test-owner matches Comcast" "e1.test-name matches wan" ]`),
+			amOf,
+			[]string{"e1.test-owner matches Comcast", "e1.test-name matches wan"},
+		},
+		{
+			"am/hier bracket splits per member (GREEN CONTROL)",
+			hierTree6659(t, `event-options { policy p1 { events e1;
+                attributes-match [ "e1.test-owner matches Comcast" "e1.test-name matches wan" ]; } }`),
+			amOf,
+			[]string{"e1.test-owner matches Comcast", "e1.test-name matches wan"},
+		},
+		{
+			"am/hier block (GREEN CONTROL)",
+			hierTree6659(t, `event-options { policy p1 { events e1; attributes-match {
+                e1.test-owner matches Comcast; e1.test-name matches wan; } } }`),
+			amOf,
+			[]string{"e1.test-owner matches Comcast", "e1.test-name matches wan"},
+		},
+
+		// --- OVER-REACH GUARD: a quoted value inside a bare statement ------
+		// Tokens are [e1.test-owner, matches, "Comcast Business"]. This is ONE
+		// constraint. A discriminator keyed on "any token has a space" would
+		// emit three, two of which are malformed and one of which silently
+		// narrows the policy to the literal owner "Comcast Business" only.
+		{
+			"am/hier quoted VALUE stays one expression",
+			hierTree6659(t, `event-options { policy p1 { events e1;
+                attributes-match e1.test-owner matches "Comcast Business"; } }`),
+			amOf,
+			[]string{"e1.test-owner matches Comcast Business"},
+		},
+		{
+			"am/flat-set quoted VALUE stays one expression",
+			setTree6659(t,
+				"set event-options policy p1 events e1",
+				`set event-options policy p1 attributes-match e1.test-owner matches "Comcast Business"`),
+			amOf,
+			[]string{"e1.test-owner matches Comcast Business"},
+		},
+		{
+			"cmd/hier quoted VALUE stays one command",
+			hierTree6659(t, `event-options { policy p1 { events e1; then { change-configuration {
+                commands set system host-name "foo bar"; } } } }`),
+			cmdsOf,
+			[]string{"set system host-name foo bar"},
+		},
+		{
+			"cmd/flat-set quoted VALUE stays one command",
+			setTree6659(t,
+				"set event-options policy p1 events e1",
+				`set event-options policy p1 then change-configuration commands set system host-name "foo bar"`),
+			cmdsOf,
+			[]string{"set system host-name foo bar"},
+		},
+
+		// --- a mixed bracket must SPLIT, so the bare member fails alone ----
+		// Joining would fuse `bogus` onto a valid command and hand
+		// classifyPlan a plausible set path to apply. Split, `bogus` reaches
+		// the prefix check on its own and rejects the whole batch.
+		{
+			"cmd/flat-set mixed bracket splits so the bare member fails alone",
+			setTree6659(t,
+				"set event-options policy p1 events e1",
+				`set event-options policy p1 then change-configuration commands [ "set system host-name foo" bogus ]`),
+			cmdsOf,
+			[]string{"set system host-name foo", "bogus"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := mustCompile6659(t, tc.tree)
+			if got := tc.get(cfg); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("compiled values = %q, want %q", got, tc.want)
 			}
 		})
 	}

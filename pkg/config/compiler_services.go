@@ -1792,12 +1792,9 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 //     constraint here would REJECT (as a malformed match expression) a
 //     configuration that committed before #6659. Widening a read must not
 //     invent a rejection out of a token the previous reader discarded.
-//   - Only when there are NO children does the tail carry the expression(s),
-//     and then a token containing " matches " is a self-contained expression
-//     (it can only have come from a quoted member) while a run of bare tokens
-//     is ONE unquoted expression split by the lexer. So: if ANY tail token
-//     contains the separator, every tail token is its own expression;
-//     otherwise the whole tail joins into one. A bracketed list mixing a
+//   - Every token GROUP — the node's own tail, and each child's Keys — is
+//     split by eventMultiWordLeafValues, because a bracketed list can land in
+//     EITHER place depending on which parser ran. A bracketed list mixing a
 //     well-formed member with a bare garbage token therefore yields the
 //     garbage token as its own (malformed) expression and strict commit
 //     rejects it — that is the #6659 fail-closed conversion, not a new
@@ -1834,7 +1831,7 @@ func eventAttributesMatchExprs(child *Node) []string {
 	if len(child.Children) > 0 {
 		exprs := make([]string, 0, len(child.Children))
 		for _, amChild := range child.Children {
-			exprs = append(exprs, strings.Join(amChild.Keys, " "))
+			exprs = append(exprs, eventMultiWordLeafValues(amChild.Keys)...)
 		}
 		return exprs
 	}
@@ -1842,27 +1839,85 @@ func eventAttributesMatchExprs(child *Node) []string {
 		// No value slot at all (`attributes-match;`): no constraint authored.
 		return nil
 	}
-	tail := child.Keys[1:]
-	// A tail token that carries the " matches " separator can only have come
-	// from a QUOTED member of a bracket list — the lexer never leaves a space
-	// inside an unquoted token. One such token means the tail is a LIST of
-	// whole expressions, not the tokens of a single one.
-	for _, tok := range tail {
-		if strings.Contains(tok, eventAttributesMatchSep) {
-			return append([]string(nil), tail...)
-		}
+	// Packed leaf or bracket list. A one-token tail is the same either way, so
+	// an authored-but-EMPTY expression still reaches the strict gate.
+	return eventMultiWordLeafValues(child.Keys[1:])
+}
+
+// eventMultiWordLeafValues splits ONE token group — a node's own Keys tail, or
+// a single child's Keys — into the whole values it carries (#6673 fold).
+//
+// Both event-options leaves in this file (`attributes-match` and `then
+// change-configuration commands`) hold values that are themselves MULTI-WORD
+// strings, so "how many values are in this group" cannot be answered by
+// counting tokens: `[ "set a b" "delete c" ]` is two values in two tokens,
+// while `set system host-name foo` is ONE value in four. The lexer settles it —
+// it never leaves a space INSIDE an unquoted token, so a token carrying a space
+// came from a quoted string, and a quoted string is exactly one authored value.
+//
+// This must be applied to the CHILDREN as well as the tail, and that is the
+// whole point of hoisting it out of the tail branch. Which of the two places a
+// bracketed list lands in depends on WHICH PARSER RAN, not on what the operator
+// wrote. The hierarchical parser collapses `commands [ "a" "b" ];` onto the
+// node's own Keys; ParseSetCommand + SetPath puts the identical list on ONE
+// CHILD's Keys, because neither leaf declares `multi: true` in setSchema (the
+// flag that would make SetPath absorb a bracket onto the node's own tail).
+// Splitting only the tail therefore fixed the hierarchical spelling and left
+// the flat-set spelling fusing every member into one string — see
+// TestEventChangeConfigCommands6659/flat-set_bracket_list.
+//
+// The decision is taken on the FIRST token, not on "any token has a space",
+// because the two ambiguous mixtures pull in OPPOSITE directions and only the
+// first token separates them:
+//
+//   - `commands set system host-name "foo bar"` — a quoted VALUE inside an
+//     otherwise bare statement, tokens [set system host-name "foo bar"]. That
+//     is ONE command; an "any token" rule would shatter it into four. The
+//     first token is bare, so: join.
+//   - `commands [ "set a b" bogus ]` — a quoted member beside a bare one. That
+//     is a LIST whose second member is garbage; joining would fuse the garbage
+//     onto a valid command and hand eventengine.classifyPlan a plausible-
+//     looking set path to apply. The first token is quoted, so: split, and the
+//     bare member reaches classifyPlan alone, fails its set/delete prefix check
+//     and rejects the WHOLE batch. Fail-closed, which is the direction a
+//     genuinely ambiguous authoring must take.
+//
+// A single-token group is identical under both rules, so the choice only ever
+// decides a group of two or more.
+//
+// "The first token was quoted" is evidenced by a space OR by EMPTINESS: the
+// lexer cannot produce an empty bare word either, so `commands [ "" "set a b" ]`
+// is a two-member list whose first member is the authored empty command that
+// TestEventChangeConfigCommands6673EmptyCommandStaysInTheBatch pins. Testing
+// only for a space would join that list into " set a b" — one command with a
+// leading space, which is neither of the two things the operator could have
+// meant.
+//
+// Residual, deliberately not chased: a bracket list whose members are ALL
+// single bare-looking words (`[ seta setb ]`) is indistinguishable from one
+// unquoted value and joins. Every well-formed value of both leaves contains a
+// space — a command carries its `set `/`delete ` prefix and an expression
+// carries " matches " — so a group that reaches this case is malformed either
+// way, and joining sends it to the same gate (classifyPlan's prefix check /
+// ValidateEventAttributesMatchStrict) that the split would.
+func eventMultiWordLeafValues(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
 	}
-	// Packed leaf: the tail tokens form exactly ONE expression. Emitted
-	// whenever a value slot exists, even if the expression is empty.
-	return []string{strings.Join(tail, " ")}
+	if tokens[0] == "" || strings.Contains(tokens[0], " ") {
+		return append([]string(nil), tokens...)
+	}
+	return []string{strings.Join(tokens, " ")}
 }
 
 // eventChangeConfigCommands extracts every `then change-configuration commands`
 // entry, across BOTH parser AST shapes (#6659).
 //
-// The token boundary differs from eventAttributesMatchExprs above, which is why
-// they are separate readers rather than one shared helper — verified against the
-// actual parsed ASTs:
+// It stays a separate reader from eventAttributesMatchExprs above because the
+// two arms differ in what they do with an authored EMPTY value and in which
+// gate catches a malformed one — but the TOKEN BOUNDARY is now one shared rule
+// (eventMultiWordLeafValues), applied identically to the tail and to each
+// child. Verified against the actual parsed ASTs:
 //
 //   - CHILD form   `commands { "set system host-name foo"; "delete ..."; }`
 //     → one child per command. A QUOTED command lexes to a single Key; an
@@ -1872,12 +1927,12 @@ func eventAttributesMatchExprs(child *Node) []string {
 //     its first word — `set` — which is not a command at all.
 //   - PACKED form  `commands "set system host-name foo";` → Keys=["commands",
 //     "<cmd>"], and `commands [ "cmd1" "cmd2" ]` → Keys=["commands","cmd1",
-//     "cmd2"]. Here each TAIL TOKEN is one complete command (a quoted string is
-//     one token), so the tail is read per-token, NOT joined. Reading only
-//     Children compiled zero remediation commands.
-//
-// A child boundary and a tail-token boundary are different things, so the two
-// rules do not conflict.
+//     "cmd2"]. Reading only Children compiled zero remediation commands.
+//   - FLAT-SET bracket. `set … commands [ "cmd1" "cmd2" ]` is the SAME list as
+//     the packed form, but SetPath puts it on ONE CHILD's Keys instead of the
+//     node's own. #6673 fold: that is why the boundary rule cannot live in the
+//     tail branch — splitting the tail and joining the children fixed one
+//     operator's spelling and left the other's fusing into a single string.
 //
 // #6673 fold: CHILDREN WIN, exactly as in eventAttributesMatchExprs and for
 // exactly the same reason. `commands bogus { "set system host-name foo"; }`
@@ -1910,21 +1965,24 @@ func eventAttributesMatchExprs(child *Node) []string {
 // classifyPlan trims them itself. A `commands;` with no value slot still
 // contributes nothing.
 func eventChangeConfigCommands(cmdsNode *Node) []string {
-	// Block: each child is one command; join its Keys so an unquoted command
-	// survives whole instead of truncating to its first word. The node's own
-	// tail is the identifier slot master discarded — do not promote it.
+	// Block: each child carries one command — or, on the flat-set path, a
+	// whole bracketed LIST of them. eventMultiWordLeafValues decides which,
+	// so an unquoted command survives whole instead of truncating to its first
+	// word AND a bracket list stops fusing into one string. The node's own tail
+	// is the identifier slot master discarded — do not promote it.
 	if len(cmdsNode.Children) > 0 {
 		cmds := make([]string, 0, len(cmdsNode.Children))
 		for _, cmdChild := range cmdsNode.Children {
-			cmds = append(cmds, strings.Join(cmdChild.Keys, " "))
+			cmds = append(cmds, eventMultiWordLeafValues(cmdChild.Keys)...)
 		}
 		return cmds
 	}
-	// Packed: each trailing token is one complete (quoted) command.
+	// Packed: the tail is a bracketed list of quoted commands, or the bare
+	// words of exactly one unquoted command. Same discriminator.
 	if len(cmdsNode.Keys) < 2 {
 		return nil
 	}
-	return append([]string(nil), cmdsNode.Keys[1:]...)
+	return eventMultiWordLeafValues(cmdsNode.Keys[1:])
 }
 
 func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
@@ -2025,6 +2083,13 @@ func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig) error {
 		}
 
 		// Collect VLAN IDs — multi-value leaf: each "vlan-id-list" child is a separate leaf
+		// #6687 / #6659: nodeVal takes slot 0 only, and the range/parse checks
+		// below are the leaf's ONLY validator (it declares none in setSchema),
+		// so every value past the first is a GATE ESCAPE and not merely a
+		// value-drop: `[ 100 99999 ]` and `{ 100; 99999; }` both commit CLEAN
+		// where a bare `vlan-id-list 99999` is REJECTED "out of range
+		// (1-4094)". Verified through configstore.CheckText. A widened read
+		// MUST run these two checks over every authored value.
 		for _, vlanNode := range child.FindChildren("vlan-id-list") {
 			valStr := nodeVal(vlanNode)
 			if valStr == "" {
