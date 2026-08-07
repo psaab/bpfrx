@@ -70263,3 +70263,57 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-07 — #5798 fold: bind the fragment-authority ZONE OVERRIDE at its production wiring
+
+- **Timestamp**: 2026-08-07
+- **Action**: Add `frag_assoc_authority_binds_the_fabric_zone_stamp_5798` and
+  correct an overclaiming coverage comment. The `ingress_zone` dimension of
+  `FragAuthority` was bound only at the STRUCT level; its production wiring —
+  the `frag_authority_zone_override` argument the install site passes and the
+  `ingress_zone_override` the consult site passes to `frag_ingress_authority`
+  (poll_descriptor/mod.rs) — had no test. Production was CORRECT; what was
+  missing was any test that would notice a later edit severing it.
+- **Why the existing coverage could not see it**:
+  `frag_assoc_every_authority_dimension_is_load_bearing` (nat64_tests.rs) hands
+  `FragAuthority` STRUCT LITERALS to the key builders, so it binds the key's
+  equality being zone-sensitive and never calls `frag_ingress_authority`.
+  `nat64_frag_authority_dimensions_are_threaded_end_to_end_5798`
+  (tests_nat64_tunnel.rs) drives the production resolver but passes `None` for
+  the override — its fixture has no fabric ingress, so the zone can only move
+  by moving the interface. PR #6835's own M3 mutation neutralized the HELPER,
+  which perturbs all four dimensions at once and is caught by the ifindex/VLAN
+  cases; severing only the two zone-override ARGUMENTS is invisible to it.
+- **What the new test does**: drives `poll_binding_process_descriptor` (via
+  `txn_run_descriptor`) with fragments of ONE IPv4/UDP datagram arriving on the
+  fabric link — identical ingress ifindex (21), VLAN (0) and routing table (0)
+  — differing ONLY in the zone-encoded src-MAC stamp. A `lan`-stamped first
+  fragment is admitted under the split-RG placement, interface-SNAT'd, and
+  publishes one association; `dmz`- and `mgmt`-stamped non-first fragments must
+  not inherit it, with a home-domain positive control between them so a refusal
+  can never be explained by "the entry was gone". Preconditions assert all three
+  stamps are HONORED at stage 9 (else the refusals would prove only that an
+  INVALID stamp is ignored) and that the two ingresses differ in exactly the
+  zone dimension, resolved through the production authority builder.
+- **Validation**: three mutation cells, each `cargo build --bins --release` with
+  0 errors first (a valid cell, not a build break), each RED on an ASSERTION.
+  (a) BOTH argument sites -> `None`: RED at tests_fabric_zone_stamp.rs:685,
+  "a non-first fragment stamped dmz — same ifindex, same VLAN, same routing
+  table, DIFFERENT security domain — must not inherit the lan flow's permit +
+  egress, left: 1, right: 0" (the foreign fragment inherited). (b) install site
+  ONLY -> `None` and (c) consult site ONLY -> `None`: both RED at :710,
+  "control after dmz: the SAME-domain non-first fragment must still inherit and
+  forward, left: 0, right: 1" — install and consult stop agreeing, so the
+  LEGITIMATE fragment misses. The one-site cells red only through the positive
+  control, which is why it is not optional. Full suite 4265 passed / 0 failed
+  (base was 4264); severed, 4264 passed / 1 failed.
+- **Pre-existing flake, proven at the base SHA**: the full parallel suite
+  intermittently wedges on three `afxdp::wg::engine::engine_internal_tests`
+  (`install_session_serializes_with_reconcile_removal`,
+  `reconcile_peers_snapshot_is_atomic_under_concurrent_load`,
+  `wg_engine_test_serial_grants_exclusive_access`). Measured at 40344ab05 with
+  this change absent: 1 wedge in 6 full runs, the other 5 giving 4264 passed;
+  the module alone is green 6/6 in 0.4s. Not caused by this change, which
+  touches no `wg` code.
+- **File(s)**: userspace-dp/src/afxdp/tests_fabric_zone_stamp.rs,
+  userspace-dp/src/afxdp/tests_nat64_tunnel.rs, _Log.md

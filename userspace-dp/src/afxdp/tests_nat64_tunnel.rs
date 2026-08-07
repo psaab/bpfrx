@@ -1665,9 +1665,24 @@ fn nat64_frag_snapshot_with_second_lan_iface() -> ConfigSnapshot {
 // `ingress_zone` alone cannot be varied through the production path here: a
 // forwarding state maps a logical ifindex to exactly one zone, so the only way
 // to move the zone without moving the interface is a fabric/tunnel zone stamp,
-// which this fixture has no ingress for. That dimension is pinned in isolation
+// which this fixture has no ingress for.
+//
+// Be exact about what covers that dimension instead, because an earlier
+// revision of this paragraph was not. It said the zone is "pinned in isolation
 // by `frag_assoc_every_authority_dimension_is_load_bearing` (nat64_tests.rs),
-// which drives the key builder directly.
+// which drives the key builder directly" — and that overstated what the cited
+// test can see. It hands `FragAuthority` STRUCT LITERALS to the key builders,
+// so what it binds is the KEY'S EQUALITY being zone-sensitive; it never calls
+// `frag_ingress_authority`, so it cannot tell whether production POPULATES the
+// field at all. Measured: replacing the override argument at BOTH production
+// sites with `None` compiled with zero errors and left the entire suite green.
+//
+// The PRODUCTION WIRING — `frag_authority_zone_override` at the install site
+// and `ingress_zone_override` at the consult site (poll_descriptor/mod.rs) — is
+// bound by `frag_assoc_authority_binds_the_fabric_zone_stamp_5798`
+// (tests_fabric_zone_stamp.rs), which drives a real stamped fabric ingress
+// through `poll_binding_process_descriptor`. Both kinds of coverage are needed,
+// and neither substitutes for the other.
 //
 // RED on revert: drop any one of the three fields from `FragAuthority` (or stop
 // threading it in `frag_ingress_authority`) and that case's fragment inherits →
