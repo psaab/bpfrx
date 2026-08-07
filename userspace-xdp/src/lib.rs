@@ -30,13 +30,6 @@ const GRE_PROTO_IPV4: u16 = 0x0800;
 const GRE_PROTO_IPV6: u16 = 0x86dd;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
-const MAX_EXT_HDRS: usize = 6;
-const NEXTHDR_HOP: u8 = 0;
-const NEXTHDR_ROUTING: u8 = 43;
-const NEXTHDR_FRAGMENT: u8 = 44;
-const NEXTHDR_AUTH: u8 = 51;
-const NEXTHDR_DEST: u8 = 60;
-const NEXTHDR_NONE: u8 = 59;
 // The BPF-side symbol names retain FALLBACK for index/map compatibility. The
 // Go/operator surface exposes these retained-shim actions as degraded-path
 // counters.
@@ -73,7 +66,12 @@ const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 /// property.
 const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
 mod binding_index;
+mod ipv6_ext_walk;
 use binding_index::{BINDING_QUEUES_PER_IFACE, RawRxQueue, binding_slot};
+use ipv6_ext_walk::{
+    FragHdr, MAX_EXT_HDRS, NEXTHDR_AUTH, NEXTHDR_DEST, NEXTHDR_FRAGMENT, NEXTHDR_HOP,
+    NEXTHDR_ROUTING, eh_class_table, read_bytes,
+};
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
 // `export MAX_INTERFACES=$(awk ... xpf_common.h)` before `cargo build`.
@@ -306,14 +304,34 @@ struct Ipv6OptHdr {
     hdrlen: u8,
 }
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-struct FragHdr {
-    nexthdr: u8,
-    reserved: u8,
-    frag_off: u16,
-    identification: u32,
+
+
+#[repr(C)]
+struct ShimFacts {
+    magic: u32,
+    version: u32,
+    max_ext_hdrs: u32,
+    frag_hdr_size: u32,
+    eh_classes: [u8; 256],
 }
+
+// Deliberately NOT in `.rodata`: cilium/ebpf surfaces `.rodata*` sections
+// as internal MAPS, so the facts would be created in the kernel on every
+// load and would have to be added to the retained-collection allowlist.
+// These are BUILD-TIME metadata read out of the ELF by `make generate`;
+// the BPF programs never touch them. A section the loader does not
+// recognise keeps them out of the collection entirely — zero runtime
+// cost, no map, no allowlist entry.
+#[unsafe(link_section = ".xpf_shim_facts")]
+#[unsafe(no_mangle)]
+#[used]
+static XPF_SHIM_FACTS: ShimFacts = ShimFacts {
+    magic: 0x5850_4646,
+    version: 1,
+    max_ext_hdrs: MAX_EXT_HDRS as u32,
+    frag_hdr_size: mem::size_of::<FragHdr>() as u32,
+    eh_classes: eh_class_table(),
+};
 
 #[map(name = "userspace_ctrl")]
 static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
@@ -1261,42 +1279,16 @@ fn parse_ipv6(
     if (version_priority >> 4) != 6 {
         return None;
     }
-    let mut protocol = ip6[6];
-    let mut offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
+    let protocol = ip6[6];
+    let offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
 
-    for _ in 0..MAX_EXT_HDRS {
-        match protocol {
-            NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add(((opt[1] as u16) + 1) * 8)?;
-                read_bytes(
-                    data,
-                    data_end,
-                    l3_offset as usize,
-                    (offset - l3_offset) as usize,
-                )?;
-            }
-            NEXTHDR_AUTH => {
-                let opt = read_bytes(data, data_end, offset as usize, 2)?;
-                protocol = opt[0];
-                offset = offset.checked_add(((opt[1] as u16) + 2) * 4)?;
-                read_bytes(
-                    data,
-                    data_end,
-                    l3_offset as usize,
-                    (offset - l3_offset) as usize,
-                )?;
-            }
-            NEXTHDR_FRAGMENT => {
-                let frag = read_bytes(data, data_end, offset as usize, 8)?;
-                protocol = frag[0];
-                offset = offset.checked_add(mem::size_of::<FragHdr>() as u16)?;
-            }
-            NEXTHDR_NONE => break,
-            _ => break,
-        }
-    }
+    // #4555: the shared walk, executed verbatim by userspace-dp's parity
+    // corpus (`ipv6_ext_walk.rs` is pulled in there through a module-path
+    // attribute — described, not spelled; see that file's module comment for
+    // why — and driven on real buffers), so its advance arithmetic and bounds
+    // revalidation are observed rather than asserted about the source text.
+    let (offset, protocol) =
+        ipv6_ext_walk::walk_ipv6_ext_headers(data, data_end, l3_offset, protocol, offset)?;
 
     let flow_lbl0 = ip6[1];
     let dscp = ((version_priority & 0x0f) << 2) | (flow_lbl0 >> 6);
@@ -1513,13 +1505,6 @@ fn parse_l4(
     }
 }
 
-fn read_bytes<'a>(data: usize, data_end: usize, offset: usize, len: usize) -> Option<&'a [u8]> {
-    if data.checked_add(offset)?.checked_add(len)? > data_end {
-        return None;
-    }
-    let ptr = (data + offset) as *const u8;
-    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
-}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {

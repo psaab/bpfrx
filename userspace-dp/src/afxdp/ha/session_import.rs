@@ -110,10 +110,33 @@ impl crate::afxdp::Coordinator {
         // only a peer EXCEEDING its own logical ceiling is rejected. Gate ONLY
         // FORWARD new keys (`!entry.metadata.is_reverse`): a synthesized reverse
         // always rides with its forward (a rejected forward `return`s BEFORE
-        // publishing its reverse, so no half-sync), and a lone reverse import
-        // off the wire (`is_reverse` set by a peer) is never independently
-        // rejected at a boundary slot — it inserts one entry that its forward
-        // already accounted for. Drop-NEWEST: reject a NEW forward key at/above
+        // publishing its reverse, so no half-sync), and a lone reverse import is
+        // never independently rejected at a boundary slot — it inserts one entry
+        // that its forward already accounted for.
+        //
+        // #6413: that lone reverse does NOT arrive "off the wire from a peer" —
+        // a peer-received reverse never reaches this function at all. Go's
+        // `SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/
+        // manager_ha.go`) early-returns on `!shouldMirrorUserspaceSession(
+        // val.IsReverse)` and writes ONLY the BPF mirror, so only FORWARD peer
+        // imports transit the helper — which then synthesizes their reverse
+        // companion locally (`synthesized_synced_reverse_entry`). The only
+        // `is_reverse=1` entry that reaches this gate is the LOCAL mirror
+        // companion `mirrorSessionPairV4`/`V6` (#310) pre-install as a
+        // SEPARATE upsert, dispatched through
+        // `server/handlers/sync_session.rs`, which calls
+        // `upsert_synced_session` unconditionally for any `is_reverse`.
+        //
+        // #6413 corner, documented rather than implied away: if the shared
+        // `synced` map is AT the 2N entry cap and that local mirror's FORWARD is
+        // cap-rejected, its separate `is_reverse=1` companion still skips this
+        // forward-only gate and publishes as a bounded **+1 orphan** entry with
+        // no matching forward. Self-inflicted and bounded by the local session
+        // rate, low-harm, and explicitly NOT the peer-DoS vector this cap
+        // targets — the Go reverse filter above already excludes the peer path.
+        // So fwd/rev pairing at this boundary is not perfect, by construction.
+        //
+        // Drop-NEWEST: reject a NEW forward key at/above
         // the ceiling (never enqueue it to any worker), but ALWAYS allow a
         // REPLACE of an existing synced key (`previous_entry.is_some()` — it
         // does not grow the map) so an in-flight synced session keeps

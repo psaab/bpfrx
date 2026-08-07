@@ -3783,3 +3783,89 @@ fn shim_index_path_has_one_construction_and_one_lookup() {
         decl.len(),
     );
 }
+
+// #4555/#6923: the session map has two writers, and the shim's over-limit
+// refusal is an invariant about the MAP, not about the packet in front of it.
+// An IPv6 chain longer than the shim's `MAX_EXT_HDRS` leaves the shim probing
+// `(AF_INET6, <a next-header its walk traverses>, src, dst, 0, 0)`; the packet
+// path can no longer mint that key (`metadata_tuple_complete`), and neither may
+// an HA import, because the session map is global and the shim probes whatever
+// row is present regardless of who wrote it. A peer-synced `LocalDelivery` row
+// in particular publishes `PASS_TO_KERNEL`, returning the frame to the kernel
+// stack unfiltered.
+//
+// Reverting `reject_unresolved_ipv6_ext_protocol` makes the first assertion
+// fail with "must be REFUSED".
+#[test]
+fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
+    let sync_req = |family: u8, protocol: u8, src: &str, dst: &str| SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: family,
+        protocol,
+        src_ip: src.to_string(),
+        dst_ip: dst.to_string(),
+        src_port: 0,
+        dst_port: 0,
+        ingress_zone: "lan".to_string(),
+        egress_zone: "wan".to_string(),
+        ..SessionSyncRequest::default()
+    };
+    let v6 = libc::AF_INET6 as u8;
+
+    // Every next-header value the walk traverses is refused on IPv6.
+    let traversable: Vec<u8> = (0u8..=255)
+        .filter(|p| crate::afxdp::ipv6_ext_header_is_traversable(*p))
+        .collect();
+    assert_eq!(traversable.len(), 10, "#6923: the traversable set changed size");
+    for protocol in &traversable {
+        let err = build_synced_session_key(&sync_req(v6, *protocol, "2001:db8::11", "2001:db8::22"))
+            .expect_err(&format!(
+                "#6923: a synced IPv6 session keyed on extension-header protocol {protocol} must \
+                 be REFUSED — importing it hands the shim a hit for the exact over-limit chain it \
+                 refused to parse"
+            ));
+        assert!(
+            err.contains("unresolved IPv6 extension-header protocol"),
+            "#6923: protocol {protocol}: unexpected rejection reason {err}"
+        );
+    }
+
+    // OVER-REACH GUARDS, all GREEN under the revert.
+    //
+    // (a) A resolved IPv6 terminal still imports, INCLUDING ones that carry
+    //     ports 0/0 the same way an unresolved chain does — ESP (50, never
+    //     traversable: encrypted payload) and No-Next-Header (59, a terminal
+    //     verdict on both sides). Refusing on "ports are 0/0" would take these
+    //     with it.
+    for protocol in [6u8, 17, 50, 58, 59, 47] {
+        let key =
+            build_synced_session_key(&sync_req(v6, protocol, "2001:db8::11", "2001:db8::22"))
+                .unwrap_or_else(|e| {
+                    panic!("#6923: a resolved IPv6 protocol {protocol} must still import: {e}")
+                });
+        assert_eq!(key.protocol, protocol);
+    }
+
+    // (b) IPv4 is untouched — the same numbers are ordinary IPv4 protocols.
+    for protocol in &traversable {
+        let key = build_synced_session_key(&sync_req(
+            libc::AF_INET as u8,
+            *protocol,
+            "192.0.2.1",
+            "192.0.2.2",
+        ))
+        .unwrap_or_else(|e| panic!("#6923: IPv4 protocol {protocol} must still import: {e}"));
+        assert_eq!(key.protocol, *protocol);
+    }
+
+    // (c) The whole entry builder refuses too, not just the key helper — the
+    //     `upsert` verb goes through `build_synced_session_entry`.
+    assert!(
+        build_synced_session_entry(
+            &sync_req(v6, 60, "2001:db8::11", "2001:db8::22"),
+            &test_zone_name_to_id(),
+        )
+        .is_err(),
+        "#6923: the upsert path must refuse the same key the delete path refuses"
+    );
+}

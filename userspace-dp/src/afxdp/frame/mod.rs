@@ -82,7 +82,7 @@ pub(crate) use inspect::MAX_IPV6_EXT_HEADERS;
 // `crate::afxdp` re-export + `use super::*` chain. The `ExtChainWalk` /
 // `ExtChainFragment` container types stay inspect-local — callers read
 // their fields, never name them.
-pub(crate) use inspect::{ExtChainOutcome, walk_ipv6_ext_chain};
+pub(crate) use inspect::{ExtChainOutcome, ipv6_ext_header_is_traversable, walk_ipv6_ext_chain};
 pub(super) use inspect::{
     frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
     live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,
@@ -2019,6 +2019,11 @@ mod tests_ipv6_ext_walk;
 #[cfg(test)]
 #[path = "tests_mss_inject_inspect.rs"]
 mod tests_mss_inject_inspect;
+// #4555: parity guard between the AF_XDP shim's parse_ipv6 extension-header
+// walk (userspace-xdp/src/lib.rs) and walk_ipv6_ext_chain above.
+#[cfg(test)]
+#[path = "tests_shim_ext_parity.rs"]
+mod tests_shim_ext_parity;
 
 // #1824: proptest property harness (parse no-panic/bounds, NAT
 // round-trip + descriptor-vs-generic differential, TSO reassembly).
