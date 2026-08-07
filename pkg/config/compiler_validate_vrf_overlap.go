@@ -48,11 +48,30 @@ const (
 // A WARNING, not a reject: overlapping-subnet multi-tenant VRF via PBR is a
 // legitimate, working forwarding design, so hard-rejecting it would break a
 // valid deployment to work around a fast-path bug. The operator is told the
-// topology is not session-isolated; the config still commits. The hard-reject
-// variant (for a "no overlapping subnets at all" product posture) is a future
-// maintainer-gated follow-up, not this pass. The VRF-aware session key itself
-// (a symmetric routing-domain id in SessionKey + the HA wire bump) is the
-// deferred real fix (Track B).
+// topology is not session-isolated; the config still commits. Neither of the
+// two candidate end-states is decided: the hard-reject variant (a "no
+// overlapping subnets at all" product posture) and the VRF-aware session key
+// (a symmetric routing-domain id in SessionKey, Track B) both remain open on
+// #2387, which is held on a maintainer risk-appetite call rather than on
+// further engineering.
+//
+// The warning text below therefore states the CURRENT limitation and points at
+// the tracking issue; it must not promise a fix, nor rule one out. It used to
+// say colliding 5-tuples may cross-forward "until the session identity is
+// VRF-aware", which asserted an outcome the open decision may never produce —
+// and which the #2387 plan then cited back as evidence for that same outcome.
+// TestVRFOverlapWarningStatesStatusNotPromise enforces that in BOTH format
+// strings below — but enforces it PARTIALLY, and the difference matters if you
+// are editing this text. It pins the closing status sentence verbatim, so the
+// tail cannot be reworded or dropped, and nothing can be appended after it
+// EXCEPT text that itself re-terminates with the tail verbatim — a contrived
+// escape, recorded so nobody reasons from "appends are impossible". Wording
+// spliced into the
+// MIDDLE of the message is caught only if it uses a spelling on that test's
+// token lists, which are blocklists and incomplete by construction. A forecast
+// in either direction, phrased in a way nobody listed, will commit green. The
+// text is neutral today because it was written to be, not because the test
+// would stop you.
 //
 // Detection builds routing-instance -> set-of-prefixes from two sources:
 //  1. native RI membership — each member interface unit's configured addresses
@@ -211,17 +230,19 @@ Scan:
 						warnings = append(warnings, fmt.Sprintf(
 							"routing-instance %q (%s) and %q (%s) both carry %s: "+
 								"overlapping L3 across routing-instances is forwarded via "+
-								"PBR but is NOT session-isolated (#2387) — colliding "+
-								"5-tuples may cross-forward until the session identity is "+
-								"VRF-aware",
+								"PBR but is NOT session-isolated (#2387) — the session "+
+								"identity carries no routing-instance discriminator, so "+
+								"colliding 5-tuples may cross-forward. See #2387 for the "+
+								"status of this limitation",
 							riA, a.origin, riB, b.origin, a.prefix))
 					} else {
 						warnings = append(warnings, fmt.Sprintf(
 							"routing-instance %q (%s, %s) and %q (%s, %s) carry "+
 								"overlapping L3: overlapping L3 across routing-instances is "+
-								"forwarded via PBR but is NOT session-isolated (#2387) — "+
-								"colliding 5-tuples may cross-forward until the session "+
-								"identity is VRF-aware",
+								"forwarded via PBR but is NOT session-isolated (#2387) — the "+
+								"session identity carries no routing-instance discriminator, "+
+								"so colliding 5-tuples may cross-forward. See #2387 for the "+
+								"status of this limitation",
 							riA, a.origin, a.prefix, riB, b.origin, b.prefix))
 					}
 				}
