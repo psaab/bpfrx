@@ -71292,3 +71292,54 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-07 — #5561 round 18: the view tier could 429 the clear tier
+
+- **Timestamp**: 2026-08-07
+- **Action**: F1 — the round-11 tier ladder gave `PermView`, `PermClear`
+  and `PermControl` the same 16 MiB share and tested each ceiling against
+  the AGGREGATE, which is not a ladder between three equal shares: a view
+  tier at its own ceiling left the clear tier nothing. Measured on the
+  unmutated tree, 383 read-only sockets on `POST /api/v1/diagnostics/ping`
+  pinned the aggregate at 16777216 and a super-user's 24-byte
+  `POST /api/v1/dhcp/identifiers/clear` answered 429 — a cheap permission
+  denying a privileged one, CREATED by round 11 (master has no budget at
+  all). `PermView` is now `mutationBodyBudgetBytes/8` (8 MiB); clear and
+  control stay at 16 MiB, so every privilege step reserves the largest
+  body the tier above it carries (16-8 >= 64 KiB, 48-16 >= 16 MiB,
+  64-48 >= 64 KiB) and 8 MiB still holds 128 concurrent maximum-size view
+  bodies. New behavioural guard `TestViewTierFloodCannotDenyTheClearTier_5561`
+  saturates the view tier by OBSERVATION (bulk flood, then top-up rounds
+  until one is refused) and requires the clear route to be served. The
+  ladder test gained the structural row that was missing: it checked view
+  and clear each against the CONFIGURE tier and never against each other,
+  so the new block walks every privilege step with both sides derived —
+  the order from `config.LoginClassPermissions` through
+  `config.ClassHasPermission`, the size from `restMutationPermissions` x
+  `restMutationBodyLimits` — plus a concurrency floor catching the
+  opposite error of starving a tier to buy separation.
+  F2 — `TestConfigSnapshotIsReadAfterThePeerWait_5561` did not bind its
+  own name: hoisting `cfg := s.activeConfig()` back to before
+  `pending.wait` left it GREEN, because pass 2 re-reads the snapshot
+  unconditionally and 403s either way. The orderings differ on WHEN the
+  denial lands, so the case now drives a body-carrying route
+  (`config/set`) with the body declared and never sent and requires the
+  403 while the body is withheld; its control arm requires the same
+  request to PARK with no commit. Not a fail-open — a stale pass-1
+  snapshot can only be more permissive and pass 2 governs the handler.
+  F3 — merged `origin/master`; `_Log.md` was the only conflict.
+- **Validation**: `go build ./...` 0; `go test ./pkg/api/... ./pkg/authz/...
+  ./pkg/config/...` 0; `gofmt -l pkg/api/` empty; `go vet` rc=0 before every
+  mutation cell. M1 (`PermView` back to `budget/4`): both new guards RED with
+  assertions, `...LowPrivilegeCallerCannotDenyAPrivilegedOne_5561` and
+  `...ViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` stay GREEN.
+  M2 (`PermView` to `budget/512`): concurrency floor REDs, step check green.
+  M3 (snapshot hoisted): freshness guard RED on both revocation shapes,
+  controls green. M4 (`config/set` -> `mutationBodyNone`): control arm REDs.
+  M5 (pass 2 deleted): freshness guard PASSES (binds pass 1 alone), the
+  round-10 guard REDs. `_Log.md` union verified structurally — diffing each
+  pre-merge file against the result yields only `a` hunks adding exactly the
+  other side's 1393 / 1754 lines.
+- **File(s)**: pkg/api/authz.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go,
+  pkg/api/authz_freshness_5561_test.go, pkg/api/README.md, _Log.md
