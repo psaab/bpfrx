@@ -227,6 +227,12 @@ pub(crate) use self::frame::MAX_IPV6_EXT_HEADERS;
 // items NAT64/icmp_embed NAME are re-exported here — the `ExtChainWalk`
 // / `ExtChainFragment` field access needs no import.
 pub(crate) use self::frame::{ExtChainOutcome, walk_ipv6_ext_chain};
+// #4555/#6923: the walk's own type classification, re-exported on the same
+// channel so the HA session-sync IMPORT path (`crate::server::helpers`, outside
+// `crate::afxdp`) rejects a peer-supplied key whose protocol is one the walk
+// traverses. The shim's over-limit refusal is an invariant about the session
+// map, and the map has two writers — the packet path and this import.
+pub(crate) use self::frame::ipv6_ext_header_is_traversable;
 use self::umem::*;
 
 // #4435 (test-only): a thin `pub(crate)` wrapper over the canonical
