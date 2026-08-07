@@ -351,20 +351,32 @@ func (s *SessionSync) resetRecvGen() {
 	// 0 makes the next config apply unconditionally; it is always the peer's
 	// CURRENT config (pushConfigToPeer sends ShowActive), so the newest
 	// content still wins.
+	//
+	// #5084: the three clears below are ONE transaction under configGenMu, and
+	// every advance of these marks takes the same lock. Without it a clear could
+	// land between a concurrent advance's load and its store and be LOST, so a
+	// pre-reboot generation survived the reset and refused every one of the
+	// reconnected peer's lower current generations — permanently, since the
+	// marks are monotone-max. The clears run on a receive-loop goroutine and the
+	// applied-mark advance runs on configApplyLoop, so they genuinely race.
+	s.configGenMu.Lock()
 	s.lastAppliedConfigGen.Store(0)
 	// #6284: drop the apply-in-progress fence alongside the high-water so a
 	// concurrent bulk re-prime restores the accept-everything posture the reset
 	// intends. A re-prime admits the rebooted peer's lower-generation set; a
 	// stale fence from an apply that raced the reset would otherwise keep
-	// refusing it. configApplyLoop may re-raise the fence on its next apply —
-	// the same benign race the high-water reset already has with a concurrent
-	// advance — and the re-primed installs are re-sent by the next sweep.
+	// refusing it. configApplyLoop may re-raise the fence on its NEXT apply,
+	// which is benign — the re-primed installs are re-sent by the next sweep.
+	// (The pre-#5084 wording called that "the same benign race the high-water
+	// reset already has with a concurrent advance". The fence half is benign;
+	// the high-water half is not, which is what configGenMu now closes.)
 	s.applyingConfigGen.Store(0)
 	// #5563: reset the received-config high-water alongside the applied mark so
 	// the manual-failover readiness gate's applied<=received invariant holds
 	// across the reset window. The reconnect re-push then re-establishes both
 	// (received on receive, applied on successful apply).
 	s.lastRecvConfigGen.Store(0)
+	s.configGenMu.Unlock()
 	// #5706: reset the full-set (IPsec/DHCP) ordering high-water marks for the
 	// same reason. A reconnecting peer that OS-rebooted restarts its monotonic
 	// incarnation LOWER; without this reset the guard would refuse its fresh
