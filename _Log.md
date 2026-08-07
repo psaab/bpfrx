@@ -71733,9 +71733,14 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   functions RED, up from 0 before the deduplication; the send-side observation
   subtest correctly stays GREEN, so the two halves are separately diagnosable.
   M3 (delete `epochUsableAsFloor` from `admitAuthedLocked`): only
-  `TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669` REDs — "an epoch of
+  `TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669` REDs, on its
+  `the_band_is_the_only_filter_under_a_dead_rtc` subtest — "an epoch of
   18446744073709551615 was ADMITTED on a receiver whose own clock is not
-  credible"; its credible-clock over-reach guard stays GREEN.
+  credible". Its credible-clock over-reach guard is a SEPARATE subtest,
+  `a_credible_clock_still_has_its_own_forward_bound`, and was OBSERVED staying
+  GREEN under the same cell. That split is load-bearing rather than cosmetic: a
+  guard sharing a body with its binder sits behind the binder's `t.Fatalf`, so
+  under the mutation it never runs and can only be ASSUMED to hold.
   M4 (delete the `NoteEpochDowngradeHeartbeat` block): only the downgrade test's
   positive subtest REDs; its unverifiable-frame negative control stays GREEN.
   M5 (delete the unkeyed early return in `initHeartbeatEpochState`): only the

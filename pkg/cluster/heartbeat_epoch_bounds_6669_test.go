@@ -309,65 +309,76 @@ func TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669(t *testing.T) {
 	// A dead RTC boots the appliance near the Unix epoch, below
 	// epochClockSaneFloor.
 	const deadRTCNow = int64(5_000_000_000)
+	outOfBand := []uint64{math.MaxUint64, epochPlausibleMax}
 
-	// FIXTURE PRECONDITIONS. Both halves, because this test proves nothing
-	// unless the forward bound is genuinely abstaining and the absolute band is
-	// genuinely the one rejecting.
-	if uint64(deadRTCNow) >= epochClockSaneFloor {
-		t.Fatalf("fixture broken: %d must be below epochClockSaneFloor (%d) or the clock is "+
-			"credible and the forward bound still engages", deadRTCNow, epochClockSaneFloor)
-	}
-	for _, bad := range []uint64{math.MaxUint64, epochPlausibleMax} {
-		if !epochWithinForwardBound(bad, deadRTCNow) {
-			t.Fatalf("fixture broken: the forward bound must ABSTAIN on %d at an uncredible "+
-				"clock; if it rejects, it is still the outer belt and this test is a "+
-				"restatement of it", bad)
+	t.Run("the_band_is_the_only_filter_under_a_dead_rtc", func(t *testing.T) {
+		// FIXTURE PRECONDITIONS. Both halves, because this subtest proves
+		// nothing unless the forward bound is genuinely abstaining and the
+		// absolute band is genuinely the one rejecting.
+		if uint64(deadRTCNow) >= epochClockSaneFloor {
+			t.Fatalf("fixture broken: %d must be below epochClockSaneFloor (%d) or the clock is "+
+				"credible and the forward bound still engages", deadRTCNow, epochClockSaneFloor)
 		}
-		if epochUsableAsFloor(bad) {
-			t.Fatalf("fixture broken: %d must be outside the absolute plausibility band", bad)
+		for _, bad := range outOfBand {
+			if !epochWithinForwardBound(bad, deadRTCNow) {
+				t.Fatalf("fixture broken: the forward bound must ABSTAIN on %d at an uncredible "+
+					"clock; if it rejects, it is still the outer belt and this subtest is a "+
+					"restatement of it", bad)
+			}
+			if epochUsableAsFloor(bad) {
+				t.Fatalf("fixture broken: %d must be outside the absolute plausibility band", bad)
+			}
 		}
-	}
 
-	withPinnedEpochClock(t, deadRTCNow)
-	e := newLatchEnv(t)
+		withPinnedEpochClock(t, deadRTCNow)
+		e := newLatchEnv(t)
 
-	for _, bad := range []uint64{math.MaxUint64, epochPlausibleMax} {
-		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x6690, 1, bad)) {
-			t.Fatalf("#6669: an epoch of %d was ADMITTED on a receiver whose own clock is not "+
-				"credible. The forward bound abstains there, so the absolute year-2200 band is "+
-				"the only filter left — without it a single frame parks the floor at an "+
-				"unreachable value and every genuine peer frame is then below it, which is a "+
-				"self-inflicted lockout an attacker gets for one packet", bad)
+		for _, bad := range outOfBand {
+			if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x6690, 1, bad)) {
+				t.Fatalf("#6669: an epoch of %d was ADMITTED on a receiver whose own clock is not "+
+					"credible. The forward bound abstains there, so the absolute year-2200 band is "+
+					"the only filter left — without it a single frame parks the floor at an "+
+					"unreachable value and every genuine peer frame is then below it, which is a "+
+					"self-inflicted lockout an attacker gets for one packet", bad)
+			}
 		}
-	}
-	if got := e.r.auth.peerEpochFloor(); got != 0 {
-		t.Fatalf("floor = %d, want 0 — a refused frame must not move the floor", got)
-	}
-	if e.r.auth.peerEpochLatched() {
-		t.Fatal("a refused frame must not arm the latch")
-	}
+		if got := e.r.auth.peerEpochFloor(); got != 0 {
+			t.Fatalf("floor = %d, want 0 — a refused frame must not move the floor", got)
+		}
+		if e.r.auth.peerEpochLatched() {
+			t.Fatal("a refused frame must not arm the latch")
+		}
+	})
 
-	// OVER-REACH GUARD, and it is what separates this from a restatement of the
-	// outer belt. Both of these stay GREEN when epochUsableAsFloor is deleted:
+	// OVER-REACH GUARD, and it is what separates the subtest above from a
+	// restatement of the outer belt. It is a SEPARATE subtest rather than a tail
+	// on that one deliberately: a t.Fatalf there would skip the rest of the
+	// body, so a guard living inside it could never be OBSERVED staying green
+	// under the mutation it exists to bound. Both halves below stay GREEN when
+	// epochUsableAsFloor is deleted:
 	//
 	//   - an epoch INSIDE the absolute band but beyond bootEpochMaxSkew is still
 	//     refused, by the forward bound, once the clock is credible;
 	//   - an ordinary in-range epoch is still admitted, so nothing here has been
 	//     turned into a lockout.
-	withPinnedEpochClock(t, int64(epochClockSaneFloor)+int64(time.Hour))
-	credible := epochNowNanos()
-	ahead := uint64(credible) + bootEpochMaxSkew*2
-	if !epochUsableAsFloor(ahead) {
-		t.Fatalf("fixture broken: %d must be INSIDE the absolute band, or the guard below is "+
-			"measuring the band rather than the forward bound", ahead)
-	}
-	if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x6691, 1, ahead)) {
-		t.Fatal("an epoch beyond the forward bound was admitted at a credible clock")
-	}
-	ok := uint64(credible) - uint64(time.Hour)
-	e.liveRun(e.captureIncarnation(0x6692, ok, epochFramesPerIncarnation),
-		"a genuine peer with an ordinary in-range epoch")
-	if got := e.r.auth.peerEpochFloor(); got != ok {
-		t.Fatalf("floor = %d after a genuine peer, want %d", got, ok)
-	}
+	t.Run("a_credible_clock_still_has_its_own_forward_bound", func(t *testing.T) {
+		withPinnedEpochClock(t, int64(epochClockSaneFloor)+int64(time.Hour))
+		e := newLatchEnv(t)
+		credible := epochNowNanos()
+
+		ahead := uint64(credible) + bootEpochMaxSkew*2
+		if !epochUsableAsFloor(ahead) {
+			t.Fatalf("fixture broken: %d must be INSIDE the absolute band, or this guard is "+
+				"measuring the band rather than the forward bound", ahead)
+		}
+		if e.feed(marshalHeartbeatAuthEpoch(samplePkt(), e.key, 0x6691, 1, ahead)) {
+			t.Fatal("an epoch beyond the forward bound was admitted at a credible clock")
+		}
+		ok := uint64(credible) - uint64(time.Hour)
+		e.liveRun(e.captureIncarnation(0x6692, ok, epochFramesPerIncarnation),
+			"a genuine peer with an ordinary in-range epoch")
+		if got := e.r.auth.peerEpochFloor(); got != ok {
+			t.Fatalf("floor = %d after a genuine peer, want %d", got, ok)
+		}
+	})
 }
