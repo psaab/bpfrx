@@ -84,8 +84,21 @@ func XFRMIfNameAndID(bindIface string) (string, uint32) {
 // of this comment said: `bind-interface st0.0` creates a netdev named `st0.0`
 // but `bind-interface st0` creates one named `st0`, and the unit ref is
 // `st0.0` in both cases. The name therefore cannot be derived from the ref at
-// all — see SecureTunnelUnitNetdev, which reads it back from the config, and
-// which every resolver of this rule now calls.
+// all — see SecureTunnelUnitNetdev, which reads it back from the config.
+//
+// It is NOT true that every resolver calls it. Two live sites in
+// pkg/dataplane/compiler_iface.go still derive the netdev from the ref, and
+// both are reached on the userspace path (loader.go CompileConfig →
+// compiler.go compileZones):
+//
+//	:72   resolveInterfaceRef          physName = config.LinuxIfName(ref)
+//	:757  buildInterfaceNetworkdModels XFRMIfNameAndID("<ifName>.<unit>")
+//
+// That file calls SecureTunnelUnitNetdev zero times. The migration is 3 of 5
+// resolvers, tracked as #6728-#6731, and userspace-dp/src/server/README.md
+// scopes it correctly — this comment is the one that overstated it. Do not
+// restore the absolute here without re-counting the call sites; an unqualified
+// "every" in a doc is what a later reader will rely on instead of grepping.
 //
 // Callers of the PREDICATE: SecureTunnelUnitNetdev (below) and
 // userspaceSkipsIngressInterface (pkg/dataplane/userspace/maps_sync.go), whose

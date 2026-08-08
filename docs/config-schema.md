@@ -187,11 +187,18 @@ class):
 - `lo0` — the always-present loopback, a reserved Junos interface a zone may
   reference (host-inbound self-traffic) with no explicit `set interfaces lo0`;
 - every secure-tunnel base derived from an IPsec `bind-interface`
-  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — `bind-interface st0.0`
-  materializes the st0 xfrmi device at apply time (`daemon_apply` →
+  (`cfg.Security.IPsec.VPNs[*].BindInterface`) — a `bind-interface`
+  materializes an xfrmi device at apply time (`daemon_apply` →
   `routing.ApplyXfrmi`) even with no explicit `set interfaces st0 unit 0`. The
   base is the bind string with any `.unit` stripped, so every unit of a bound
   secure tunnel is admitted.
+
+  The device is named after the AUTHORED bind string, not after the unit ref:
+  `bind-interface st0.0` creates a netdev literally named `st0.0`, while
+  `bind-interface st0` creates one named `st0` — and the unit ref is `st0.0` in
+  both cases, so the name cannot be derived from the ref. This line previously
+  read "`bind-interface st0.0` materializes the st0 xfrmi device", which is the
+  exact conflation #5619 exists to correct.
 
 The tolerant load / peer-sync path downgrades to a warning
 (`opts.lenientZoneInterfaceDefined`) so an already-persisted or peer-synced
