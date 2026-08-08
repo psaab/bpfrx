@@ -255,6 +255,8 @@ func (m *Manager) FormatInformation() string {
 		epochlessExposureNote(hbStats))
 	fmt.Fprintf(&b, "  Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "  Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
+	fmt.Fprintf(&b, "  Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
+	fmt.Fprintf(&b, "  Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintln(&b)
 
 	// Sync link statistics.
@@ -407,6 +409,8 @@ func (m *Manager) FormatStatistics() string {
 		epochlessExposureNote(hbStats))
 	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
+	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
+	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintln(&b)
 
 	// Services synchronized table.
@@ -458,6 +462,8 @@ func (m *Manager) FormatControlPlaneStatistics() string {
 		epochlessExposureNote(hbStats))
 	fmt.Fprintf(&b, "    Epoch downgrades rejected:  %d\n", hbStats.EpochDowngradeRejected)
 	fmt.Fprintf(&b, "    Epoch session collisions:   %d\n", hbStats.EpochSessionCollision)
+	fmt.Fprintf(&b, "    Epoch out-of-band rejected: %d\n", hbStats.EpochOutOfBandRejected)
+	fmt.Fprintf(&b, "    Epoch ahead of our clock:   %d\n", hbStats.EpochAheadOfClockRejected)
 	fmt.Fprintf(&b, "    Authentication:             %s\n", m.controlLinkAuthStatus())
 	return b.String()
 }

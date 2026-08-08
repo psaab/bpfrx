@@ -305,7 +305,7 @@ type Manager struct {
 	// and xpfd is then restarted on this one; a bare restart is not reliable
 	// recovery, because an archived epoch-bearing frame replayed into the empty
 	// post-restart state re-arms the latch (see the arming site in
-	// admitAuthedLocked) — so it must be visible. But the peer sends at 5-10/s,
+	// admitAuthed) — so it must be visible. But the peer sends at 5-10/s,
 	// so an unguarded log would flood journald. Read/written under m.mu.
 	lastEpochDowngradeWarn time.Time
 
@@ -536,7 +536,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 // THE RECOVERY THIS NAMES IS THE COMPLETE ONE, in order. Restarting xpfd clears
 // the process-scoped latch, but an attacker holding one archived epoch-bearing
 // frame re-arms it against the empty post-restart state — see the arming site
-// in admitAuthedLocked. Rotating the control-link PSK first makes every
+// in admitAuthed. Rotating the control-link PSK first makes every
 // archived frame fail MAC verification, so it can never reach the latch. An
 // operator told only "restart" would loop.
 func (m *Manager) NoteEpochDowngradeHeartbeat() {

@@ -255,7 +255,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 		t.Fatal("receiver auth state must never be nil")
 	}
 	// Record a peer session on the first receiver.
-	if !first.auth.admitAuthed(false, 0, 0x1234, 7) {
+	if ok, _ := first.auth.admitAuthed(false, 0, 0x1234, 7); !ok {
 		t.Fatal("first sighting of a session must be admitted")
 	}
 	first.auth.notePeerAuthenticated()
@@ -270,7 +270,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 	}
 
 	// The retired-session watermark survived every restart.
-	if last.auth.admitAuthed(false, 0, 0x1234, 7) {
+	if ok, _ := last.auth.admitAuthed(false, 0, 0x1234, 7); ok {
 		t.Error("#5086: a replayed (session, counter) must stay rejected across heartbeat restarts")
 	}
 	if !last.auth.peerAuthenticated() {

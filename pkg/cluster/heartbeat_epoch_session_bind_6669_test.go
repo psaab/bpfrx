@@ -39,7 +39,7 @@ import (
 // equal-epoch replay hole.
 //
 // RED-on-revert: delete the `epoch == s.highEpoch &&
-// !s.epochSessionAdmissible(session)` rejection in admitAuthedLocked (or move
+// !s.epochSessionAdmissible(session)` rejection in admitAuthed (or move
 // it AFTER the s.replay.admit call, which is the same ordering bug the floor
 // itself has to avoid) and both subtests go back to sustained admits.
 func TestEqualEpochsCannotChurnTheRing_6669(t *testing.T) {
@@ -1183,10 +1183,10 @@ func TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669(t *testing.T) {
 
 		// The peer latches A's value and refuses B.
 		var peer heartbeatAuthState
-		if !peer.admitAuthed(true, epochA, 0xA669, 1) {
+		if ok, _ := peer.admitAuthed(true, epochA, 0xA669, 1); !ok {
 			t.Fatal("the peer refused A")
 		}
-		if peer.admitAuthed(true, b, 0xB669, 1) {
+		if ok, _ := peer.admitAuthed(true, b, 0xB669, 1); ok {
 			t.Fatal("the peer admitted B; the mis-ordering premise is not reachable")
 		}
 
@@ -1202,7 +1202,7 @@ func TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669(t *testing.T) {
 				"recovery claim can be stated unconditionally and this characterization "+
 				"should be replaced by a fix-gate.", got, epochA)
 		}
-		if peer.admitAuthed(true, mB.heartbeatBootEpoch(), 0xB66A, 2) {
+		if ok, _ := peer.admitAuthed(true, mB.heartbeatBootEpoch(), 0xB66A, 2); ok {
 			t.Fatal("the peer admitted B after all; see above")
 		}
 	})

@@ -96,7 +96,7 @@ func (e *latchEnv) epochlessCaptures(n int) [][][]byte {
 // gate for the finding that the epoch floor alone closes almost nothing.
 //
 // RED-on-revert: the fix is the `if s.epochSeen { return false }` branch in
-// heartbeatAuthState.admitAuthedLocked. Delete it and the epochless replays are
+// heartbeatAuthState.admitAuthed. Delete it and the epochless replays are
 // admitted again (975/975 on the pre-fix code), because they never reach the
 // floor comparison at all.
 func TestHeartbeatEpochlessReplayRefusedOnceLatched_6169(t *testing.T) {
@@ -822,7 +822,7 @@ func TestStartHeartbeatReturnsWithAUsableEpoch_6169(t *testing.T) {
 // The forward bound now gates only RAISING the floor.
 //
 // RED-on-revert: restore the unconditional `if !epochOrderable(epoch, now)`
-// ahead of the floor comparison in admitAuthedLocked.
+// ahead of the floor comparison in admitAuthed.
 func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	e := newLatchEnv(t)
 
@@ -837,7 +837,7 @@ func TestBackwardClockStepDoesNotKillALatchedPeer_6169(t *testing.T) {
 	// It was latched earlier, when the clocks still agreed. Model that directly:
 	// the floor holds this incarnation's epoch AND is bound to the session that
 	// raised it. Both halves, because the real raise path sets both — a floor
-	// with an unbound session is a state admitAuthedLocked cannot reach, and
+	// with an unbound session is a state admitAuthed cannot reach, and
 	// modelling only the epoch would test the peer against a DIFFERENT
 	// incarnation than the one this test says is already latched.
 	const liveSession = uint64(0x7701)

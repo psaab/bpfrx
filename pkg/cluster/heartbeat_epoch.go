@@ -204,7 +204,7 @@ const bootEpochStopJoinBudget = 2 * time.Second
 var epochFlock = unix.Flock
 
 // epochNowNanos is the wall clock every CLOCK-DEPENDENT epoch check samples:
-// refineBootEpoch validating persisted state at load, and admitAuthedLocked
+// refineBootEpoch validating persisted state at load, and admitAuthed
 // applying the forward bound on the raise path. A var so a test can PIN an
 // instant — epochWithinForwardBound is relative to this sample and abstains
 // entirely below epochClockSaneFloor, so its boundaries only exist for one
@@ -313,7 +313,7 @@ func epochUsableAsFloor(epoch uint64) bool {
 // comes back into range.
 //
 // THE RECEIVER DOES NOT CALL THIS; it applies the two halves separately, and
-// the split is the point. admitAuthedLocked runs epochUsableAsFloor on EVERY
+// the split is the point. admitAuthed runs epochUsableAsFloor on EVERY
 // frame (clock-independent, so a 0 or beyond-year-2200 value is refused
 // outright) but epochWithinForwardBound only on the RAISE path, epoch >
 // highEpoch. So a frame at epoch == highEpoch that is beyond the forward bound
@@ -344,7 +344,7 @@ func epochOrderable(epoch uint64, nowNanos int64) bool {
 // monotonic lastSeen update, so a healthy peer was declared dead in ~500ms and
 // the cluster went dual-master. That is wall-clock sensitivity on the accept
 // path, which is exactly what #1792's CLOCK_MONOTONIC lastSeen exists to keep
-// out. admitAuthedLocked therefore applies this ONLY when epoch > highEpoch.
+// out. admitAuthed therefore applies this ONLY when epoch > highEpoch.
 //
 // It is skipped entirely when our own clock is not credible
 // (epochClockSaneFloor): an appliance with a dead RTC boots near the Unix epoch
@@ -519,7 +519,7 @@ func epochWithinForwardBound(epoch uint64, nowNanos int64) bool {
 // overlapping incarnation already emitted. That value is read back as `prev` on
 // the next boot, and it is exactly the term that matters after a backward clock
 // step — the one case persistence exists for. The epoch then produced can sit
-// BELOW the peer's latched floor, where admitAuthedLocked refuses it: the same
+// BELOW the peer's latched floor, where admitAuthed refuses it: the same
 // false-peer-death the fail-open was supposed to avoid, moved one restart later
 // and made durable rather than transient. Corrupting the state whose only job is
 // surviving a clock step is not a safe way to fail.

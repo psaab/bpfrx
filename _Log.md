@@ -71760,3 +71760,97 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
   pkg/cluster/heartbeat_replay_restart_5086_test.go,
   pkg/cluster/README.md, docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-08-07 — #6669 fold round 15b: name the two epoch refusals that are not replays
+
+- **Timestamp**: 2026-08-07
+- **Action**: PR #6669 (advances #6169), five review findings at `45e80b59c`.
+  Each was verified against the code before implementing; one had to be
+  reconciled with the brief (see F2).
+
+  **F2, the substantive one.** `admitAuthed` had THREE silent refusal arms, and
+  `heartbeatAuthDecision` — which sees only `nonceFresh == false` — reported all
+  of them as `"stale nonce (replay)"`. The brief said "two silent arms"; the code
+  shows three. Reading them resolves it: `epoch < s.highEpoch` really IS a replay
+  of a retired incarnation, so the generic wording is already true there. The
+  other two are not replays at all and were being mislabelled:
+
+    - `!epochUsableAsFloor(epoch)` — a 0 or post-2200 epoch. A conforming #6169
+      sender cannot emit one (refineBootEpoch declines to chain to such a value,
+      clock-independently), so it means a corrupt state file on the PEER or a
+      peer running a non-conforming build.
+    - `!epochWithinForwardBound(...)` — the epoch is more than bootEpochMaxSkew
+      ahead of OUR clock. This is routinely a perfectly HEALTHY peer whose clock
+      runs fast, and the action is NTP.
+
+  Both now carry a counter (`EpochOutOfBandRejected`,
+  `EpochAheadOfClockRejected`) and a distinct reason that names the action; the
+  receive path prefers the epoch gate's reason over the generic one. The
+  below-floor arm is deliberately left with neither, and a negative control pins
+  that so a later change cannot relabel a genuine replay.
+
+  **F1.** `Epoch session collisions` was rendered on all three surfaces and
+  asserted by NOTHING — all three copies were deletable with the package green —
+  and the file header's RED-on-revert claim said "drop *either* fmt.Fprintf",
+  naming two lines when there were three. The new
+  `TestEveryEpochCounterIsRendered_6669` is table-driven over all FIVE counters
+  on all THREE surfaces and drives each to a DISTINCT value, so a transposed pair
+  of render lines fails instead of passing a label match. The stale "either" text
+  is corrected and the header now says what makes it stale-proof.
+
+  **F3.** `TestHeartbeatReplayGatesLivenessRefresh` was a THIRD hand-copy of the
+  readLoop gate — missed in r15, which deduplicated only the two `feed` helpers —
+  and it counted a local integer "standing in for r.lastSeen.Store(...)". It now
+  drives `admitFrame` and asserts on `r.lastSeen` itself.
+
+  **F4.** `admitAuthed` was a bare pass-through to `admitAuthedLocked`, which TOOK
+  the lock despite a suffix that by Go convention means the caller already holds
+  it. Collapsed to one function, `admitAuthed`; 32 stale references renamed
+  across code, tests and README. The six in `_Log.md` are historical entries and
+  are deliberately left alone.
+
+  **F5.** `heartbeatAuthReplay`'s "touched only from the single readLoop
+  goroutine, so it needs no locking" stopped being true at #5086: the state lives
+  on the Manager, outlives any one receiver, and a heartbeat restart overlaps two
+  readLoops. What makes it safe is that `admitAuthed` holds `mu` across both
+  `admit()` call sites. Corrected, and moved with the type into a new file.
+
+  **The 2000-line watch.** F2 adds production code to a file that was at
+  1992/2000. Rather than trim comments, `replaySessionMark` +
+  `heartbeatAuthReplay` + `admit` (a self-contained unit, and where F5's comment
+  lives) moved to `heartbeat_auth_replay.go` as pure code motion. heartbeat.go is
+  1988 lines AFTER adding the counters and reasons; audit regenerated.
+
+- **Validation**: seven disjoint mutation cells, `go vet` rc=0 before each.
+  A (drop the collisions render from FormatInformation ONLY): REDs only that
+  subtest — "FormatInformation does not render \"Epoch session collisions:\" at
+  all" — while the other two surfaces stay GREEN, so the guard is per-surface.
+  B (keep the label, wire the WRONG field behind it): "FormatInformation renders
+  \"Epoch out-of-band rejected:\" as 4, want 2" — the transposition a
+  label-presence check would have missed.
+  C1/C2 (out-of-band arm: drop the counter / collapse the reason): each REDs its
+  own assertion independently.
+  D1/D2 (forward-bound arm: same two): likewise, with
+  "epochAheadOfClockRejected = 0, want 1" and the NTP-vs-incident message.
+  The `below_floor_stays_a_replay` negative control stayed GREEN in all four.
+  E1 (revert #5477 `admit`): "a replayed retired heartbeat refreshed peer
+  liveness — r.lastSeen moved 3372462449949032 -> 3372462449961596".
+  E2 (delete `r.lastSeen.Store(MonotonicNanos())` from admitFrame): "setup: an
+  accepted frame must have stamped lastSeen" — the cell that proves F3, because
+  the previous simulated-counter version could not have detected it at all.
+  `go build ./...` 0, `gofmt -l pkg/cluster` empty,
+  `go test ./pkg/cluster -count=1` ok 15.4s.
+
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_replay.go
+  (new), pkg/cluster/heartbeat_manager.go, pkg/cluster/status.go,
+  pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch_wire_6669_test.go, plus the call-site and
+  reference renames in heartbeat_epoch.go, manager.go,
+  heartbeat_epoch_bounds_6669_test.go, heartbeat_epoch_latch_test.go,
+  heartbeat_epoch_refresh_6669_test.go,
+  heartbeat_epoch_rollback_recovery_6669_test.go,
+  heartbeat_epoch_session_bind_6669_test.go,
+  heartbeat_epoch_session_budget_6669_test.go,
+  heartbeat_replay_restart_5086_test.go, pkg/cluster/README.md,
+  docs/refactoring-audit-current.txt, _Log.md

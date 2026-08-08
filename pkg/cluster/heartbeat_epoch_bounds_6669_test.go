@@ -19,7 +19,7 @@ import (
 // epoch "heals" without stating the clock precondition that makes that true.
 
 // withPinnedEpochClock pins the instant every clock-dependent epoch check
-// validates against — refineBootEpoch on load, and admitAuthedLocked's forward
+// validates against — refineBootEpoch on load, and admitAuthed's forward
 // bound on the accept path. Those boundaries exist only for one specific `now`,
 // so the real clock cannot hit them reliably.
 func withPinnedEpochClock(t *testing.T, now int64) {
@@ -252,13 +252,13 @@ func TestPersistedEpochHealsOnlyWhenClockCredible_6169(t *testing.T) {
 		// instead.
 		var peer heartbeatAuthState
 		withPinnedEpochClock(t, time.Now().UnixNano())
-		if peer.admitAuthed(true, got, 0x6669, 1) {
+		if ok, _ := peer.admitAuthed(true, got, 0x6669, 1); ok {
 			t.Fatalf("a correctly clocked peer admitted epoch %d; it is far beyond that peer's "+
 				"forward bound and must be refused", got)
 		}
 		// The same peer accepts an ordinary epoch, so the refusal is about this
 		// value and not a wedged receiver.
-		if !peer.admitAuthed(true, uint64(time.Now().UnixNano()), 0x666A, 1) {
+		if ok, _ := peer.admitAuthed(true, uint64(time.Now().UnixNano()), 0x666A, 1); !ok {
 			t.Fatal("control: a peer that refuses the stranded epoch must still accept a normal one")
 		}
 	})
@@ -279,7 +279,7 @@ func TestEpochClockPinIsTestOnly_6169(t *testing.T) {
 // TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669 is the fail-on-revert gate
 // for epochUsableAsFloor on the ACCEPT path.
 //
-// The two bounds in admitAuthedLocked are ORDERED belts, and with a real clock
+// The two bounds in admitAuthed are ORDERED belts, and with a real clock
 // the outer one absorbs every fixture the inner one has:
 // TestHeartbeatEpochImplausibleValueCannotLockOut_6169 feeds MaxUint64,
 // epochPlausibleMax and now+2h, and all three are also beyond
@@ -304,7 +304,7 @@ func TestEpochClockPinIsTestOnly_6169(t *testing.T) {
 // escalating.
 //
 // RED-on-revert: delete the `if !epochUsableAsFloor(epoch) { return false }`
-// arm from admitAuthedLocked.
+// arm from admitAuthed.
 func TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669(t *testing.T) {
 	// A dead RTC boots the appliance near the Unix epoch, below
 	// epochClockSaneFloor.

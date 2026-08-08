@@ -946,17 +946,38 @@ peer liveness (`lastSeen`) or drive election.
     legacy frame) and severing the receiver's epoch read BOTH left `go test
     ./pkg/cluster` fully green — two nodes could run this code, neither latch,
     and the sustained replay stay open under passing CI.
-  - **Observability.** `HeartbeatStats.EpochlessAdmitted` counts authenticated
-    heartbeats admitted WITHOUT an epoch — the exposure meter — and
-    `EpochDowngradeRejected` counts those the latch refused. Without a counter
-    the residual is invisible: an operator who has upgraded both nodes has no
-    way to tell whether the cluster is still accepting pre-upgrade-shaped
-    frames, and the documentation would be the only defence.
+  - **Observability — FIVE counters, and the operator action differs per
+    counter.** Without them the residual is invisible: an operator who has
+    upgraded both nodes has no way to tell whether the cluster is still
+    accepting pre-upgrade-shaped frames, and the documentation would be the
+    only defence.
 
-    Both are RENDERED in the `Control link statistics:` block on all three
+    | `HeartbeatStats` field | rendered as | what a non-zero value means |
+    |---|---|---|
+    | `EpochlessAdmitted` | `Heartbeats without epoch:` | the exposure meter — frames admitted with no epoch at all |
+    | `EpochDowngradeRejected` | `Epoch downgrades rejected:` | the latch refused a peer that had previously signed epochs |
+    | `EpochSessionCollision` | `Epoch session collisions:` | too many sessions at one epoch value — usually a peer whose epoch store cannot advance |
+    | `EpochOutOfBandRejected` | `Epoch out-of-band rejected:` | the PEER emitted 0 or a post-2200 epoch. A conforming build cannot; check the peer's state file or its build |
+    | `EpochAheadOfClockRejected` | `Epoch ahead of our clock:` | a CLOCK fault, usually on a healthy peer — check NTP on both nodes, not for an attacker |
+
+    The last two exist because `heartbeatAuthDecision` cannot tell those arms
+    apart: it sees only `nonceFresh == false` and reports every epoch refusal as
+    `stale nonce (replay)`. Both arms used to be silent as well as mislabelled,
+    so a clock-skew lockout and a corrupt-epoch peer both read as an on-link
+    replay attack. `admitAuthed` now returns a reason for each and the receive
+    path prefers it over the generic wording. The third silent arm — an epoch
+    BELOW the floor — keeps the generic wording deliberately: that one really is
+    a replay of a retired incarnation.
+
+    All five are rendered on all three surfaces
+    (`FormatInformation`, `FormatStatistics`, `FormatControlPlaneStatistics`)
+    and bound there by `TestEveryEpochCounterIsRendered_6669`, which drives each
+    counter to a DISTINCT value so a transposed pair of render lines fails
+    rather than passing on a label match.
+
+    Every one is RENDERED in the `Control link statistics:` block on all three
     surfaces that print it — `FormatInformation`, `FormatStatistics` and
-    `FormatControlPlaneStatistics` — as `Heartbeats without epoch:` and
-    `Epoch downgrades rejected:`. While the peer is not yet signing epochs the
+    `FormatControlPlaneStatistics` — under the labels in the table above. While the peer is not yet signing epochs the
     count carries an inline note naming the action that closes it (rotate the
     control-link PSK); once the latch has armed the note switches to marking the
     count historical, since it is then a record of the migration rather than
@@ -1021,7 +1042,7 @@ peer liveness (`lastSeen`) or drive election.
         the latch; the key is re-read per frame on both the send and receive
         paths, so rotation itself needs no restart. This is pinned by
         `TestArchivedEpochReplayReArmsLatchAfterRestart_6169` and stated at the
-        arming site in `admitAuthedLocked`, which also records why a durable
+        arming site in `admitAuthed`, which also records why a durable
         latch and a freshness test were both rejected.
   - **Honest residuals**, each measured rather than asserted.
     1. **Receiver restart window — bounded by the peer's next genuine frame, not

@@ -213,10 +213,10 @@ func TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669(t *testing.T) {
 	// --- The peer orders them by epoch alone, so the OLDER one wins and the
 	// survivor is refused.
 	var peer heartbeatAuthState
-	if !peer.admitAuthed(true, epochA, 0xA669, 1) {
+	if ok, _ := peer.admitAuthed(true, epochA, 0xA669, 1); !ok {
 		t.Fatal("the peer refused A's frame")
 	}
-	if peer.admitAuthed(true, b, 0xB669, 1) {
+	if ok, _ := peer.admitAuthed(true, b, 0xB669, 1); ok {
 		t.Fatalf("the peer admitted B at %d under a floor of %d; the mis-ordering this test "+
 			"characterizes is not reachable and withEpochFileLock's ordering note is stale",
 			b, peer.peerEpochFloor())
@@ -233,7 +233,7 @@ func TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669(t *testing.T) {
 			"incarnation left in the file. Refinement behind sync.Once alone never re-reads, "+
 			"so the peer refuses this node until a full daemon restart.", recovered, epochA)
 	}
-	if !peer.admitAuthed(true, recovered, 0xB66A, 1) {
+	if ok, _ := peer.admitAuthed(true, recovered, 0xB66A, 1); !ok {
 		t.Fatalf("B at %d is still refused under floor %d after re-refinement",
 			recovered, peer.peerEpochFloor())
 	}

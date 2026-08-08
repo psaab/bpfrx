@@ -78,7 +78,7 @@ func startedIncarnation(t *testing.T, what string) *Manager {
 // 10's regression.
 //
 // RED-on-revert: restore the singleton form of the equality check in
-// admitAuthedLocked —
+// admitAuthed —
 //
 //	if epoch == s.highEpoch && session != s.highEpochSession { ... }
 //
@@ -332,7 +332,7 @@ func TestEqualEpochSuccessorIsAdmitted_6669(t *testing.T) {
 //
 // What blocks using it is that the EPOCH is an ordering value, not an identity:
 // the receiver compares it with < and >, so folding random bits in produces a
-// successor that can land BELOW its predecessor, which admitAuthedLocked refuses
+// successor that can land BELOW its predecessor, which admitAuthed refuses
 // outright — trading a bounded stranding for an unbounded one. Distinctness
 // would have to come from something MONOTONE the sender can produce without the
 // file, and that is what the degenerate case does not have. A receiver-side

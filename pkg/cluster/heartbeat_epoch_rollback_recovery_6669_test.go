@@ -24,7 +24,7 @@ import (
 // the latch and the legitimately rolled-back peer is refused again.
 //
 // This is a CHARACTERIZATION test: it pins behaviour the code deliberately does
-// not change (see the arming site in admitAuthedLocked for why a durable latch
+// not change (see the arming site in admitAuthed for why a durable latch
 // and a freshness test were both rejected), so that the documentation and the
 // operator warning cannot drift back to claiming a bare restart is enough.
 func TestArchivedEpochReplayReArmsLatchAfterRestart_6169(t *testing.T) {
@@ -61,11 +61,11 @@ func TestArchivedEpochReplayReArmsLatchAfterRestart_6169(t *testing.T) {
 	if !e.feed(archived[0]) {
 		t.Fatal("an archived epoch frame was refused by a freshly restarted receiver; if this " +
 			"now fails, the re-arm is closed and README residual 5 plus the arming-site comment " +
-			"in admitAuthedLocked are stale")
+			"in admitAuthed are stale")
 	}
 	if !e.r.auth.peerEpochLatched() {
 		t.Fatal("the replayed archived frame did not re-arm the latch; README residual 5 and the " +
-			"arming-site comment in admitAuthedLocked are stale and must be updated")
+			"arming-site comment in admitAuthed are stale and must be updated")
 	}
 
 	// 5. So the restart did NOT recover: the genuine rolled-back peer is refused
@@ -208,7 +208,7 @@ func TestRollbackRecoveryOrderingIsRotateThenRestart_6169(t *testing.T) {
 		if !e.feed(archived) {
 			t.Fatal("the archived frame was refused by a freshly restarted receiver under the " +
 				"UNROTATED key; if this now fails, the re-arm is closed and README residual 5 " +
-				"plus the arming-site comment in admitAuthedLocked are stale")
+				"plus the arming-site comment in admitAuthed are stale")
 		}
 		if !e.r.auth.peerEpochLatched() {
 			t.Fatal("the replayed archived frame did not re-arm the latch")

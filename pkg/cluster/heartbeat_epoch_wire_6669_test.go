@@ -1,8 +1,10 @@
 package cluster
 
 import (
+	"math"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -179,7 +181,7 @@ func TestBootEpochTraversesTheRealSendAndReceivePath_6169(t *testing.T) {
 // epochDowngradeWarned reports whether the rate-limited epoch-downgrade warning
 // has fired on this Manager. It is the only observable effect of the
 // NoteEpochDowngradeHeartbeat CALL SITE — the refusal itself is counted on the
-// auth state (EpochDowngradeRejected), by admitAuthedLocked, and therefore stays
+// auth state (EpochDowngradeRejected), by admitAuthed, and therefore stays
 // green when the call site is deleted.
 func epochDowngradeWarned(m *Manager) bool {
 	m.mu.RLock()
@@ -250,6 +252,102 @@ func TestEpochDowngradeIsRaisedOnTheRealReceivePath_6169(t *testing.T) {
 			t.Fatal("an unverifiable frame raised the epoch-downgrade warning — the warning " +
 				"must name epoch downgrades, not rejections in general, or its recovery " +
 				"instructions are handed to operators whose peer never rolled back")
+		}
+	})
+}
+
+// TestNonReplayEpochRefusalsAreNamedAndCounted_6669 binds the two epoch
+// refusals that are NOT replays.
+//
+// Both arms used to `return false` with no counter, and heartbeatAuthDecision —
+// which sees only `nonceFresh == false` — logged them as "stale nonce
+// (replay)". That is not a cosmetic imprecision. Each has a DIFFERENT operator
+// action, and neither is the one "replay" implies:
+//
+//   - out-of-band epoch: the PEER is emitting 0 or a post-2200 value. A
+//     conforming #6169 build cannot; check the peer's state file or its build.
+//   - beyond the forward bound: a CLOCK fault, and usually a perfectly healthy
+//     peer. Check NTP on both nodes. Reading this one as a replay sends an
+//     operator hunting an on-link attacker during what is an NTP problem.
+//
+// RED-on-revert: drop either `s.epochOutOfBandRejected.Add(1)` /
+// `s.epochAheadOfClockRejected.Add(1)`, or collapse either arm's reason back to
+// a bare `return false, ""`.
+func TestNonReplayEpochRefusalsAreNamedAndCounted_6669(t *testing.T) {
+	t.Run("out_of_band_epoch", func(t *testing.T) {
+		var s heartbeatAuthState
+		ok, reason := s.admitAuthed(true, math.MaxUint64, 0x7001, 1)
+		if ok {
+			t.Fatal("an out-of-band epoch must be refused")
+		}
+		if got := s.epochOutOfBandRejected.Load(); got != 1 {
+			t.Fatalf("epochOutOfBandRejected = %d, want 1 — the refusal is invisible to an "+
+				"operator, so a peer emitting corrupt epochs looks like an attack", got)
+		}
+		if reason == "" {
+			t.Fatal("#6669: an out-of-band epoch was refused with NO reason, so the log says " +
+				"\"stale nonce (replay)\". It is not a replay — it is a corrupt state file or " +
+				"a peer that is not a conforming #6169 build, and the operator is sent to " +
+				"the wrong place.")
+		}
+		if !strings.Contains(reason, "outside the plausible range") {
+			t.Fatalf("the out-of-band reason does not name the range: %q", reason)
+		}
+		// The OTHER counter must not move — the two arms are distinguishable.
+		if got := s.epochAheadOfClockRejected.Load(); got != 0 {
+			t.Fatalf("the clock-skew counter moved (%d) on an out-of-band refusal; the two "+
+				"arms must be separable or the split buys nothing", got)
+		}
+	})
+
+	t.Run("epoch_beyond_the_forward_bound", func(t *testing.T) {
+		var s heartbeatAuthState
+		ahead := uint64(time.Now().UnixNano()) + bootEpochMaxSkew*3
+		if !epochUsableAsFloor(ahead) {
+			t.Fatalf("fixture broken: %d must be INSIDE the absolute band, or this measures "+
+				"the out-of-band arm instead", ahead)
+		}
+		ok, reason := s.admitAuthed(true, ahead, 0x7002, 1)
+		if ok {
+			t.Fatal("an epoch beyond the forward bound must be refused")
+		}
+		if got := s.epochAheadOfClockRejected.Load(); got != 1 {
+			t.Fatalf("epochAheadOfClockRejected = %d, want 1", got)
+		}
+		if reason == "" {
+			t.Fatal("#6669: an epoch past the forward bound was refused with NO reason, so " +
+				"the log says \"stale nonce (replay)\" for what is a CLOCK fault on a healthy " +
+				"peer. The operator opens a security incident instead of checking NTP.")
+		}
+		if !strings.Contains(reason, "NTP") {
+			t.Fatalf("the forward-bound reason does not name the action (NTP): %q", reason)
+		}
+		if got := s.epochOutOfBandRejected.Load(); got != 0 {
+			t.Fatalf("the out-of-band counter moved (%d) on a clock-skew refusal", got)
+		}
+	})
+
+	// NEGATIVE CONTROL. A frame BELOW the floor is a genuine replay of a retired
+	// incarnation, so it must carry NO epoch-specific reason — the generic
+	// "stale nonce (replay)" wording is already correct there. Without this, the
+	// assertions above are satisfied by a change that hands every refusal a
+	// reason, which would relabel a real replay as something else.
+	t.Run("below_floor_stays_a_replay", func(t *testing.T) {
+		var s heartbeatAuthState
+		const floor = uint64(9_600_000_000_000_000)
+		if ok, _ := s.admitAuthed(true, floor, 0x7003, 1); !ok {
+			t.Fatal("setup: the first in-range epoch must be admitted and set the floor")
+		}
+		ok, reason := s.admitAuthed(true, floor-1, 0x7004, 1)
+		if ok {
+			t.Fatal("an epoch below the floor must be refused")
+		}
+		if reason != "" {
+			t.Fatalf("a below-floor frame IS a replay of a retired incarnation, so it must "+
+				"keep the generic replay wording; got a distinct reason %q", reason)
+		}
+		if s.epochOutOfBandRejected.Load() != 0 || s.epochAheadOfClockRejected.Load() != 0 {
+			t.Fatal("a below-floor replay moved one of the two non-replay counters")
 		}
 	})
 }

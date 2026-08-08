@@ -556,7 +556,7 @@ func verifyHeartbeatMAC(data, authKey []byte) bool {
 // This receiver-only map cannot close that residual by itself — it needs an
 // order over peer incarnations, which random session ids cannot provide. That
 // order SHIPPED in #6169 as the signed boot epoch (heartbeat_epoch.go):
-// admitAuthedLocked consults the epoch floor BEFORE this ring, so a frame the
+// admitAuthed consults the epoch floor BEFORE this ring, so a frame the
 // floor REJECTS never reaches admit() and therefore cannot churn it. That is an
 // ORDERING property, not a claim that every retired incarnation is rejected —
 // see the #6711 paragraph below, where the opposite happens.
@@ -682,7 +682,7 @@ const heartbeatReplaySessions = 64
 // of this comment wrote it as exactly "k-1-j restarts, where j is the number of
 // distinct captured sessions an attacker can present", and that arithmetic
 // over-counts what a capture set consumes: presenting a session is not the same
-// as spending a slot. admitAuthedLocked binds only AFTER s.replay.admit
+// as spending a slot. admitAuthed binds only AFTER s.replay.admit
 // succeeds, so a replay the ring refuses — a session already at or above its
 // remembered watermark, which is every re-presentation of one already used —
 // costs the attacker a frame and the budget nothing
@@ -709,76 +709,6 @@ const heartbeatReplaySessions = 64
 // restores exactly the sustained churn this constant closes.
 // See heartbeatAuthState.highEpochSessions for the rest of the cost.
 const heartbeatEpochSessionsPerEpoch = 2
-
-// replaySessionMark is one remembered (session, high-water counter) pair.
-type replaySessionMark struct {
-	session uint64
-	counter uint64
-}
-
-// heartbeatAuthReplay tracks per-peer anti-replay state for authenticated
-// heartbeats. A sender advertises a random per-process session id and a
-// monotonic per-session counter (MarshalHeartbeatAuth). The receiver keeps a
-// bounded set of per-session high-water counters and:
-//
-//   - accepts a strictly increasing counter within a KNOWN session (the live
-//     session advancing), and
-//   - accepts a genuinely NEW, never-seen session with any counter — a sender
-//     restart/reboot picks a fresh random session, so a real reboot (a routine
-//     HA event) is never mistaken for a replay and failover is never wedged.
-//
-// #5477: it REJECTS a return to a session already at or below its remembered
-// watermark. Before this, the tracker held exactly ONE (session, counter): any
-// session switch reset the watermark, so an on-link attacker who recorded
-// authenticated frames from two incarnations A and B could alternate
-// A->B->A->B forever — each switch re-anchored and re-admitted the SAME
-// recorded A frames, refreshing peer liveness and applying their STALE
-// role/priority (a forged liveness/election drive). Session ids are RANDOM
-// (unordered), so a strictly-newer test like fullSetSeqGuard cannot be used:
-// remembering a bounded per-session watermark is what distinguishes a real
-// reboot (new id) from a replay of a retired incarnation (known id, no counter
-// advance).
-//
-// Touched only from the single readLoop goroutine, so it needs no locking.
-type heartbeatAuthReplay struct {
-	marks [heartbeatReplaySessions]replaySessionMark
-	// count is the number of occupied slots, saturating at len(marks). next is
-	// the FIFO write cursor for eviction once the ring is full. While filling,
-	// next == count and the valid entries are marks[:count]; once full, count
-	// stays at len(marks) and next cycles, so marks[:count] still spans every
-	// live entry for the lookup scan.
-	count int
-	next  int
-}
-
-// admit reports whether (session, counter) is fresh (not a replay) and, when
-// fresh, advances the per-session watermark (or records a new session). Callers
-// must invoke admit only after the MAC has verified — an unauthenticated caller
-// must never mutate replay state.
-func (a *heartbeatAuthReplay) admit(session, counter uint64) bool {
-	// Known session: admit only a strictly-advancing counter. A frame at or
-	// below the watermark is a replay — including a return to a RETIRED session
-	// whose watermark we still remember (#5477: the attacker cannot exceed the
-	// highest counter the genuine peer ever signed for that session).
-	for i := 0; i < a.count; i++ {
-		if a.marks[i].session == session {
-			if counter > a.marks[i].counter {
-				a.marks[i].counter = counter
-				return true
-			}
-			return false
-		}
-	}
-	// Never-seen session: a genuine reboot draws a fresh random session, so
-	// accept and record a new watermark. Bounded FIFO — evict the oldest once
-	// the ring is full (see the heartbeatReplaySessions security bound above).
-	a.marks[a.next] = replaySessionMark{session: session, counter: counter}
-	a.next = (a.next + 1) % len(a.marks)
-	if a.count < len(a.marks) {
-		a.count++
-	}
-	return true
-}
 
 // heartbeatAuthState is the per-PEER control-channel authentication state:
 // the anti-replay watermarks and the sticky "peer has authenticated" flag.
@@ -952,11 +882,11 @@ type heartbeatAuthState struct {
 	highEpochSessionCount int
 
 	// epochSeen is the DOWNGRADE LATCH: an epoch-bearing frame has been accepted
-	// from this peer, and admitAuthedLocked refuses an epochless one from now
+	// from this peer, and admitAuthed refuses an epochless one from now
 	// on. Two qualifications, both stated in full elsewhere: an accepted frame
 	// is normally proof the peer runs a build that emits epochs, but a REPLAYED
 	// archived one arms the latch identically (see the arming site in
-	// admitAuthedLocked); and admitAuthedLocked is not the outermost gate, so
+	// admitAuthed); and admitAuthed is not the outermost gate, so
 	// "armed" is not the same as "epochless frames are being refused right now"
 	// (see peerEpochLatched).
 	//
@@ -1084,7 +1014,7 @@ type heartbeatAuthState struct {
 	// What process scope does NOT buy is a restart that recovers
 	// UNCONDITIONALLY. A replayed archived epoch frame re-arms this latch
 	// against the empty post-restart state, so PSK rotation has to come FIRST.
-	// Stated in full at the arming site in admitAuthedLocked, where the
+	// Stated in full at the arming site in admitAuthed, where the
 	// property lives.
 	epochSeen bool
 
@@ -1114,6 +1044,34 @@ type heartbeatAuthState struct {
 	// is not epochlessAdmitted, and it is not a downgrade, so it is not
 	// epochDowngradeRejected.
 	epochSessionCollision atomic.Uint64
+
+	// epochOutOfBandRejected and epochAheadOfClockRejected count the two epoch
+	// refusals that are NOT replays, and that is the whole reason they are
+	// separate counters rather than folded into a general "epoch rejected"
+	// total. Both arms used to be silent AND mislabelled: they returned a bare
+	// false, so heartbeatAuthDecision reported them as "stale nonce (replay)",
+	// and an operator reading that goes looking for an on-link attacker.
+	//
+	//   - epochOutOfBandRejected: the epoch is 0 or past the year-2200 horizon
+	//     (epochUsableAsFloor). A conforming #6169 sender cannot emit one —
+	//     refineBootEpoch refuses to chain to such a value, clock-independently
+	//     — so a non-zero count means a corrupt state file on the peer or a peer
+	//     running something that is not this build. Check the PEER.
+	//   - epochAheadOfClockRejected: the epoch is more than bootEpochMaxSkew
+	//     ahead of OUR clock (epochWithinForwardBound). This is the one that is
+	//     routinely a healthy peer: either its clock runs fast or ours runs
+	//     slow. It is a CLOCK fault and the action is NTP on both nodes, not an
+	//     incident response. It gates only the raise path, so a peer already at
+	//     the floor keeps being accepted while this climbs — which is why it can
+	//     climb with liveness perfectly healthy.
+	//
+	// The third silent arm, `epoch < s.highEpoch`, deliberately has neither a
+	// counter nor a distinct reason: a frame below the floor IS a replay of a
+	// retired incarnation, so "stale nonce (replay)" is already the true
+	// statement, and the lockout case it can also mean (#6711) is metered by the
+	// floor itself rather than by a rejection count.
+	epochOutOfBandRejected    atomic.Uint64
+	epochAheadOfClockRejected atomic.Uint64
 
 	// peerAuthSeen is sticky and READ cross-goroutine
 	// (Manager.HeartbeatPeerAuthSeen, consumed by the gRPC fabric listener to
@@ -1226,7 +1184,7 @@ type heartbeatAuthState struct {
 // `systemctl restart xpfd` on THIS node clears the latch, but it is NOT
 // sufficient on its own: an attacker holding one archived epoch-bearing frame
 // re-arms it against the empty post-restart state. Rotate the control-link PSK
-// on both nodes FIRST, then restart. See the arming site in admitAuthedLocked
+// on both nodes FIRST, then restart. See the arming site in admitAuthed
 // for why, and why it is not closed in code.
 //
 // The three epoch cases, once the peer is known to emit them:
@@ -1299,19 +1257,28 @@ type heartbeatAuthState struct {
 // the latch never armed on it, its EPOCHLESS frames would still be accepted if
 // it were later rolled back. Refusing to latch an out-of-bound epoch never
 // strands a peer that comes back into range.
-func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter uint64) bool {
-	return s.admitAuthedLocked(hasEpoch, epoch, session, counter)
-}
-
-// admitAuthedLocked is the locked half of admitAuthed.
-func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, counter uint64) (ok bool) {
+// It returns the admission decision and, on refusal, a REASON naming the arm
+// that refused. The reason exists because heartbeatAuthDecision cannot tell
+// them apart: it sees only `nonceFresh == false` and reports every one of them
+// as "stale nonce (replay)". Two of the epoch arms are not replays at all — an
+// out-of-band epoch is a corrupt or non-conforming peer, and an epoch past the
+// forward bound is a healthy peer with a fast clock — and labelling either as a
+// replay sends the operator hunting an attacker instead of checking the peer's
+// build or its NTP. An empty reason means "no epoch-specific arm refused this",
+// and the caller keeps heartbeatAuthDecision's generic wording.
+//
+// It takes s.mu itself. It was previously a bare pass-through to a second
+// method named admitAuthed, which by the usual Go convention would mean
+// "caller already holds the lock" — the opposite of what it did. One function,
+// no suffix.
+func (s *heartbeatAuthState) admitAuthed(hasEpoch bool, epoch, session, counter uint64) (ok bool, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !hasEpoch {
 		if s.epochSeen {
 			// Downgrade: this peer has proved it emits epochs.
 			s.epochDowngradeRejected.Add(1)
-			return false
+			return false, "boot epoch withdrawn by a peer that had signed one (rollback or pre-upgrade replay)"
 		}
 		// The migration window — and the ONLY residual an operator can still be
 		// exposed to on merge day, since a capture taken before the upgrade is
@@ -1324,7 +1291,9 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 		if ok {
 			s.epochlessAdmitted.Add(1)
 		}
-		return ok
+		// No epoch-specific reason: an epochless refusal here IS an ordinary ring
+		// replay, which is exactly what heartbeatAuthDecision already says.
+		return ok, ""
 	}
 	// An epoch the floor cannot ORDER is refused, not admitted-and-ignored.
 	// Admitting it would recreate the epochless bypass in miniature: a frame
@@ -1334,10 +1303,17 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// The ABSOLUTE sanity check is clock-independent, so it is safe on every
 	// frame: a 0 or beyond-year-2200 value is never a real incarnation.
 	if !epochUsableAsFloor(epoch) {
-		return false
+		s.epochOutOfBandRejected.Add(1)
+		return false, "boot epoch outside the plausible range (corrupt state file, or a peer " +
+			"that is not a conforming #6169 build)"
 	}
+	// A frame BELOW the floor is a replay of a retired incarnation, so the
+	// generic "stale nonce (replay)" wording is already accurate here and no
+	// distinct reason is added. It is the one epoch arm where the collapsed
+	// label was never wrong; the counter for it is EpochDowngradeRejected's
+	// sibling case and is deliberately not introduced (see the fold notes).
 	if epoch < s.highEpoch {
-		return false
+		return false, ""
 	}
 	// A BOUNDED NUMBER OF INCARNATIONS PER EPOCH VALUE. Equality falls through
 	// to the ring — it must, because the live peer signs every one of its frames
@@ -1355,7 +1331,8 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// its residual cost, and the two alternatives that were declined.
 	if epoch == s.highEpoch && !s.epochSessionAdmissible(session) {
 		s.epochSessionCollision.Add(1)
-		return false
+		return false, "too many peer sessions at one boot epoch (peer cannot advance its " +
+			"epoch store, or a replayed capture set sharing one epoch)"
 	}
 	// The FORWARD bound is clock-dependent, so it gates ONLY the irreversible
 	// operation — raising the floor. Applying it to a frame from the
@@ -1372,10 +1349,12 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 	// absolute band looking redundant with this one. See
 	// TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669.
 	if epoch > s.highEpoch && !epochWithinForwardBound(epoch, epochNowNanos()) {
-		return false
+		s.epochAheadOfClockRejected.Add(1)
+		return false, "boot epoch more than bootEpochMaxSkew ahead of our clock " +
+			"(check NTP on BOTH nodes — this is a clock fault, not a replay)"
 	}
 	if !s.replay.admit(session, counter) {
-		return false
+		return false, ""
 	}
 	// ARMING THE LATCH. A REPLAY CAN DO THIS, and the consequence is a real
 	// residual an operator has to be told about, not a theoretical one.
@@ -1438,7 +1417,7 @@ func (s *heartbeatAuthState) admitAuthedLocked(hasEpoch bool, epoch, session, co
 		// re-affirms a session already bound or consumes a free slot.
 		s.bindEpochSession(session, false)
 	}
-	return true
+	return true, ""
 }
 
 // epochSessionAdmissible reports whether a frame claiming exactly highEpoch may
@@ -1464,7 +1443,7 @@ func (s *heartbeatAuthState) epochSessionAdmissible(session uint64) bool {
 // credited the wrong one.
 //
 //   - The CAPACITY REFUSAL — the (k+1)-th distinct session at one epoch value is
-//     rejected — is enforced by epochSessionAdmissible, at admitAuthedLocked and
+//     rejected — is enforced by epochSessionAdmissible, at admitAuthed and
 //     BEFORE the ring. Not by the full-set branch below, which the pre-check
 //     makes unreachable from that caller: under the same s.mu hold
 //     epochSessionAdmissible already returns false for any session not in the
@@ -1516,7 +1495,7 @@ func (s *heartbeatAuthState) peerEpochFloor() uint64 {
 // Diagnostics and tests only.
 //
 // IT IS A FACT ABOUT THIS STATE, NOT ABOUT CURRENT ENFORCEMENT, and callers
-// that render it must not promote it into one. admitAuthedLocked does refuse an
+// that render it must not promote it into one. admitAuthed does refuse an
 // epochless frame while this is true — but it is not the outermost gate:
 // heartbeatAuthDecision short-circuits to dual-accept whenever no local key is
 // configured, and UpdateConfig clears the live key WITHOUT resetting hbAuth. So
@@ -1844,7 +1823,7 @@ func (r *heartbeatReceiver) admitFrame(frame []byte, pkt *HeartbeatPacket) bool 
 	// verified frame authorises treating len-52 as the end of the signed
 	// body — and the epoch floor is applied BEFORE the session ring, so a
 	// frame the floor REJECTS never churns it. That is an ordering property
-	// of admitAuthedLocked, not a claim that every replayed retired frame is
+	// of admitAuthed, not a claim that every replayed retired frame is
 	// rejected: after a sender regression (#6711) an archived frame can sit
 	// at or above the floor and reach the ring like any other.
 	var (
@@ -1854,10 +1833,27 @@ func (r *heartbeatReceiver) admitFrame(frame []byte, pkt *HeartbeatPacket) bool 
 	if macOK {
 		epoch, hasEpoch = heartbeatFrameEpoch(frame, key)
 	}
-	nonceFresh := macOK && r.auth.admitAuthed(hasEpoch, epoch, session, counter)
+	var (
+		nonceFresh  bool
+		epochReason string
+	)
+	if macOK {
+		nonceFresh, epochReason = r.auth.admitAuthed(hasEpoch, epoch, session, counter)
+	}
 	accept, reason := heartbeatAuthDecision(len(key) > 0, present, macOK, nonceFresh, r.peerAuthenticated())
 	if !accept {
 		r.recvErrors.Add(1)
+		// #6669: prefer the epoch gate's own reason when it has one.
+		// heartbeatAuthDecision sees only `nonceFresh == false` and calls every
+		// epoch refusal "stale nonce (replay)" — true for the ring and for a
+		// below-floor frame, and WRONG for an out-of-band epoch (a corrupt or
+		// non-conforming peer) and for one past the forward bound (a clock
+		// fault). Those two send an operator hunting an attacker instead of
+		// checking the peer's build or NTP, which is the whole cost of the
+		// collapsed label.
+		if epochReason != "" {
+			reason = epochReason
+		}
 		// #6169: an authenticated frame that lost its epoch after the peer
 		// had proved it signs one is operator-actionable (a deliberate
 		// rollback stays refused until the floor is cleared), so surface it
