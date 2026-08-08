@@ -107,6 +107,32 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 	scanned := map[string]bool{}
 	var filesScanned int
 
+	// PRE-PASS: collect every struct field declared *CLI across the whole
+	// production tree before looking for writes. A field is declared in one
+	// file and may be dereferenced in another, so a per-file collection would
+	// leave `*a.cli = CLI{}` invisible whenever the struct lives elsewhere
+	// (#6706 review r10 F2).
+	holderFields := map[string]bool{}
+	for _, root := range productionRoots(t) {
+		err := walkCanaryFiles(root, func(path string) {
+			fset := token.NewFileSet()
+			f, perr := parser.ParseFile(fset, path, nil, 0)
+			if perr != nil {
+				return
+			}
+			holderPointerFieldNames(f, holderFields)
+		})
+		if err != nil {
+			t.Fatalf("walk %s (holder-field pre-pass): %v", root, err)
+		}
+	}
+	if len(holderFields) == 0 {
+		t.Fatalf("the *CLI field pre-pass found nothing — three such fields exist " +
+			"(cli_show_chassis.go, monitor_interface.go, completion.go), so an empty set " +
+			"means the collector or the walk stopped seeing them and the `*a.cli = CLI{}` " +
+			"arm is silently disabled")
+	}
+
 	for _, root := range productionRoots(t) {
 		err := walkCanaryFiles(root, func(path string) {
 			fset := token.NewFileSet()
@@ -123,7 +149,7 @@ func TestSetUserClassHasOneProductionCaller_6701(t *testing.T) {
 					unexpected = append(unexpected, call{key: ref.key, pos: ref.pos})
 				}
 			}
-			for _, ref := range classFieldWrites(fset, f, pkgRelKeyFor(path)) {
+			for _, ref := range classFieldWrites(fset, f, pkgRelKeyFor(path), holderFields) {
 				seenField[ref.key] = true
 				if _, allowed := allowedClassFieldWriters[ref.key]; !allowed {
 					unexpectedField = append(unexpectedField, call{key: ref.key, pos: ref.pos})
@@ -294,19 +320,26 @@ func setUserClassRefs(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 // found one more form and the honest statement is where the enumeration stops:
 //
 //   - The whole-object arms learn which identifiers point AT a CLI from
-//     DECLARED types (holderPointerNames), not from a type-checker. A pointer
-//     from an untyped source (`p := somethingReturningStar()`) and a double
-//     indirection (`**pp`) are not recognised.
+//     DECLARED types — holderPointerNames for locals/params/receivers,
+//     holderPointerFieldNames for struct FIELDS (#6706 r10 F2) — not from a
+//     type-checker. A pointer from an untyped source
+//     (`p := somethingReturningStar()`) and a double indirection (`**pp`) are
+//     not recognised. The field arm keys on the field NAME with the qualifier
+//     ignored, so it over-approximates toward flagging.
 //   - A whole-value write into a COLLECTION element — `shells[0] = CLI{}`,
 //     `byName[k] = other` — is not recognised: the LHS is an IndexExpr and
 //     deciding it needs the element type. There is no `[]CLI`, `[]*CLI` or
-//     map-of-CLI anywhere in the tree today (grepped), so no such write exists
-//     to catch; a narrower rule keyed on the RHS literal was rejected because
-//     partial coverage of a form invites the belief that the form is covered.
+//     map-of-CLI anywhere in the tree today (re-grepped at this revision), so
+//     no such write exists to catch; a narrower rule keyed on the RHS literal
+//     was rejected because partial coverage of a form invites the belief that
+//     the form is covered. Note this excuse is about COLLECTIONS specifically —
+//     it never covered the *CLI FIELD form, which does exist three times
+//     (cli_show_chassis.go, monitor_interface.go, completion.go) and is why
+//     that form was reachable and unflagged until r10.
 //   - reflect and unsafe are outside any AST predicate.
 //
 // The arms that exist are the ones a reviewer could plausibly write by hand.
-func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRef {
+func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string, holderFields map[string]bool) []classRef {
 	var out []classRef
 	for _, decl := range f.Decls {
 		key := pkgRel + "::" + packageLevelKey
@@ -318,7 +351,7 @@ func classFieldWrites(fset *token.FileSet, f *ast.File, pkgRel string) []classRe
 			out = append(out, classRef{key: key, pos: fset.Position(n.Pos()).String()})
 		}
 		recordLHS := func(lhs ast.Expr) {
-			if isClassFieldSelector(lhs) || isWholeHolderWrite(lhs, holders) {
+			if isClassFieldSelector(lhs) || isWholeHolderWrite(lhs, holders, holderFields) {
 				record(lhs)
 			}
 		}
@@ -379,17 +412,67 @@ func isClassFieldSelector(expr ast.Expr) bool {
 // replaces an ENTIRE CLI value — which writes userClass along with every other
 // field while naming none of them.
 //
-// Two shapes: through a pointer this declaration declares as *CLI (`*c = ...`),
-// and through an embedded CLI field (`x.CLI = ...`).
-func isWholeHolderWrite(expr ast.Expr, holderPtrs map[string]bool) bool {
+// Three shapes: through a local pointer this declaration declares as *CLI
+// (`*c = ...`), through a STRUCT FIELD declared *CLI (`*a.cli = ...`), and
+// through an embedded CLI field (`x.CLI = ...`).
+//
+// The field shape (#6706 review r10 F2) was the twelfth escape. The StarExpr
+// arm required an *ast.Ident operand, so `*a.cli = CLI{}` — a StarExpr over a
+// SelectorExpr — was recorded nowhere, while `a.cli.userClass = ""` at the same
+// site through the same field reds. Both leave userClass == "", the most
+// privileged state. Demonstrated at a production site (cli_show_chassis.go)
+// with that negative control: vet rc 0 and ALL canaries green for the first,
+// RED for the second.
+//
+// holderFields is keyed on the FIELD NAME with the qualifier ignored, the same
+// over-approximation every other predicate here makes: `*anything.cli = ...`
+// is flagged once any production struct declares a `cli *CLI`. Flagging is the
+// safe direction for a canary.
+func isWholeHolderWrite(expr ast.Expr, holderPtrs, holderFields map[string]bool) bool {
 	switch e := unparenExpr(expr).(type) {
 	case *ast.StarExpr:
-		id, ok := unparenExpr(e.X).(*ast.Ident)
-		return ok && holderPtrs[id.Name]
+		switch operand := unparenExpr(e.X).(type) {
+		case *ast.Ident:
+			return holderPtrs[operand.Name]
+		case *ast.SelectorExpr:
+			return holderFields[operand.Sel.Name]
+		}
+		return false
 	case *ast.SelectorExpr:
 		return e.Sel.Name == classHolderType
 	}
 	return false
+}
+
+// holderPointerFieldNames adds to `into` every STRUCT FIELD name in f whose
+// declared type is `*CLI` (or `*<pkg>.CLI`).
+//
+// Separate from holderPointerNames because the two have different scopes: a
+// local pointer is declared inside the decl that writes through it, so that
+// collector is per-decl, while a field is declared in a type that any file in
+// the tree may write through. The repository walk therefore collects fields in
+// a PRE-PASS over every production file before the write pass, rather than
+// per-file, so a struct declared in one file and dereferenced in another is
+// still recognised.
+//
+// Three such fields exist today, all named `cli`: pkg/cli/cli_show_chassis.go,
+// pkg/cli/monitor_interface.go, pkg/cli/completion.go.
+func holderPointerFieldNames(f *ast.File, into map[string]bool) {
+	ast.Inspect(f, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok || st.Fields == nil {
+			return true
+		}
+		for _, field := range st.Fields.List {
+			if !isHolderPointerType(field.Type) {
+				continue
+			}
+			for _, name := range field.Names {
+				into[name.Name] = true
+			}
+		}
+		return true
+	})
 }
 
 // holderPointerNames collects the identifiers within decl whose DECLARED type
@@ -520,6 +603,19 @@ func (c *CLI) positionalComposite() *CLI { return &CLI{"prompt", "super-user"} }
 
 func (s *superShell) embeddedWhole(other CLI) { s.CLI = other }
 
+type zzHolder struct {
+	cli     *CLI
+	counter *int
+}
+
+func (a *zzHolder) wholeObjectViaField() { *a.cli = CLI{} }
+
+func (a *zzHolder) wholeObjectViaFieldParen() { (*a.cli) = CLI{} }
+
+func wholeObjectViaNestedField(w struct{ inner *zzHolder }) { *w.inner.cli = CLI{} }
+
+func (a *zzHolder) unrelatedFieldDeref(n int) { *a.counter = n }
+
 func (c *CLI) readsOnly() bool { return c.userClass == "" || c.userClass == "super-user" }
 
 func (c *CLI) unrelatedWrite() { c.version = "x" }
@@ -535,8 +631,21 @@ var packageLevelSetter = func(c *CLI) { c.userClass = "super-user" }
 	if err != nil {
 		t.Fatalf("parse synthetic: %v", err)
 	}
+	// The field set is collected from THIS file by the same collector the
+	// repository walk uses, so the control exercises the real pairing rather
+	// than a hand-written set that could disagree with production.
+	holderFields := map[string]bool{}
+	holderPointerFieldNames(f, holderFields)
+	if !holderFields["cli"] {
+		t.Fatalf("holderPointerFieldNames did not see `cli *CLI` in the synthetic source; "+
+			"got %v — the field arm cannot fire and every expectation below is vacuous",
+			holderFields)
+	}
+	if holderFields["counter"] {
+		t.Fatalf("holderPointerFieldNames collected `counter *int` as a CLI holder; got %v", holderFields)
+	}
 	got := map[string]int{}
-	for _, ref := range classFieldWrites(fset, f, "cli") {
+	for _, ref := range classFieldWrites(fset, f, "cli", holderFields) {
 		got[ref.key]++
 	}
 	want := map[string]struct {
@@ -557,7 +666,12 @@ var packageLevelSetter = func(c *CLI) { c.userClass = "super-user" }
 		"cli::wholeObjectViaVar":        {1, "nor a parameter"},
 		"cli::CLI.positionalComposite":  {1, "a POSITIONAL literal sets every field with no KeyValueExpr to see"},
 		"cli::superShell.embeddedWhole": {1, "replacing an embedded CLI replaces its class"},
-		"cli::" + packageLevelKey:       {1, "a package-level func literal is not inside any FuncDecl"},
+		"cli::zzHolder.wholeObjectViaField": {1, "r10 F2: a StarExpr over a SELECTOR — `*a.cli = CLI{}` " +
+			"through a real production *CLI field, which the Ident-only arm recorded nowhere " +
+			"while `a.cli.userClass = \"\"` at the same site reds"},
+		"cli::zzHolder.wholeObjectViaFieldParen": {1, "EDGE: the parenthesised spelling of the same write"},
+		"cli::wholeObjectViaNestedField":         {1, "EDGE: the arm keys on the field NAME, so receiver depth is irrelevant"},
+		"cli::" + packageLevelKey:                {1, "a package-level func literal is not inside any FuncDecl"},
 	}
 	for key, w := range want {
 		if got[key] != w.n {
@@ -571,6 +685,9 @@ var packageLevelSetter = func(c *CLI) { c.userClass = "super-user" }
 		"cli::CLI.unrelatedWrite":            "a different field of the same object",
 		"cli::CLI.emptyLiteralOfAnotherType": "an empty literal of an unrelated type sets nothing",
 		"cli::notAHolder":                    "a deref of a *string is not a whole-object CLI write",
+		"cli::zzHolder.unrelatedFieldDeref": "the NEGATIVE CONTROL for the field arm: `*a.counter = n` " +
+			"derefs a *int field on the very struct that also holds the *CLI, so an arm that " +
+			"flagged every `*x.y =` LHS rather than only *CLI-typed fields would red here",
 	}
 	for key, why := range mustNotWrite {
 		if got[key] != 0 {

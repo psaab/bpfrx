@@ -74556,3 +74556,406 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cli/userclass_entrypoint_canary_test.go,
   pkg/cli/canary_helper_parity_6706_test.go,
   pkg/daemon/cli_rbac_wiring_6706_test.go, _Log.md
+- **Timestamp**: 2026-08-05 09:41
+- **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
+  process-global `AtomicU64` statics as their before/after baseline, so cargo's
+  in-process parallelism made each test's assertion depend on what every other
+  test happened to do. Measured at pristine `origin/master` ad9591177 with a
+  bounded harness: `FAIL FAIL HUNG FAIL FAIL`, with a #6819 participant failing
+  in 5 of 5 runs. Moved `SESSION_INSTALL_STALE_IGNORED`,
+  `SESSION_DELETE_STALE_IGNORED` (#2170) and `SYNCED_IMPORT_CAP_DROPS` (#5674)
+  out of `bpf_map/metrics.rs` and onto `SessionManager` as per-Coordinator
+  fields (`install_stale_ignored`, `delete_stale_ignored`, `import_cap_drops`),
+  beside the existing per-instance `export_seq`. Every bump site
+  (`ha/session_import.rs`) and every read site (`coordinator/status.rs`)
+  already held a `&self` Coordinator, and production constructs exactly one
+  Coordinator (`server/lifecycle.rs`), so the exported values are unchanged —
+  this is a test-isolation fix with no production behaviour change.
+  [CORRECTED 2026-08-05 16:10, gate fold: this entry originally said "the
+  gRPC/Prometheus values are unchanged", which was wrong twice. This crate has
+  NO gRPC dependency and none of the three counters is in `proto/`; and only
+  `import_cap_drops` reaches Prometheus (`server/helpers/status.rs` ->
+  `protocol::control` -> the Go status struct ->
+  `xpf_userspace_synced_import_cap_drops_total`). The two stale counters have
+  no wire or metric surface at all — their accessors are reachable only from
+  `ha_tests.rs`.]
+  `ha_tests.rs` is untouched: no assertion weakened, no `--test-threads=1`, no
+  `#[serial]`. The issue's own suggested fix — "make the assertions
+  DELTA-based" — was already in place and is not sufficient: the tests capture
+  `let before = ...` and assert `before + 1`, but a concurrent test's increment
+  lands INSIDE that capture window. Only a per-instance home removes the
+  dependency. After: 10 runs, a #6819 participant failed in 0 of 10. The suite
+  itself is 5 PASS / 2 FAIL / 3 HUNG — every residual failure is #6657
+  (CoS-lease seqlock `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, and an
+  unbounded blocking recv wedging at 7 threads in
+  `__skb_wait_for_more_packets`), a separate defect that this PR does not
+  touch. Red-on-revert: 7 of 7 tests go RED on an assertion when the guard each
+  one covers is reverted.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/metrics.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 14:52
+- **Action**: #6819 gate fold (§7 test-acceptance findings). Three findings,
+  each verified against the code before acting. (F1) Both #5674 admission
+  tests set `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+  branch of `synced_import_cap` BEFORE the production expression is evaluated —
+  a test-only seam shadowing the production path, so deleting its trailing
+  `.saturating_mul(2)` left both tests green. Made `synced_import_cap`
+  `pub(super)` (ha_tests is `crate::afxdp::ha::tests`, a SIBLING of
+  `session_import`, so a private fn was unreachable) and added
+  `synced_import_cap_production_formula_is_twice_the_logical_ceiling`, which
+  runs with the override at its default 0 and pins entry-cap == 2x logical
+  ceiling, plus `assert_ne!` against the bare ceiling (what dropping the 2x
+  yields) and a `DEFAULT_MAX_SESSIONS > 0` precondition so `0 == 2*0` cannot
+  make the claim vacuous. (F2) The two non-poison rejection tests accepted a
+  guard that refuses the WHOLE category while counting once, so each now
+  carries its own positive control (newer install applies and does not count;
+  applied equal-generation delete does not count). The two poison rejection
+  tests get scope comments naming the control test that supplies their
+  selectivity. (F3, priority) The poison negative control exercised only
+  NEWER/EQUAL operations with both stale expectations at the per-instance zero
+  baseline, so it accepted DELETING the generation guard outright — a negative
+  control that accepts removal of the thing it controls for. It now also probes
+  the stale direction after recovery (stale install and stale delete each
+  refused and counted exactly once), and the recoveries assertion tightened
+  from `> before` to `>= before + 4` (the poisoning count); kept a LOWER bound,
+  with the reason in the comment, because `SHARED_SESSION_POISON_RECOVERIES`
+  is the one counter still process-global (bumped inside `lock_shared_recover`,
+  which takes only the mutex and has no per-Coordinator home) so a concurrent
+  test can only push it up — `>=` cannot false-FAIL where `==` could.
+  Validation: four-cell mutation matrix, each mutation run against BOTH test
+  generations so a mutation the old tests already caught could not be credited
+  to the new one. Drop-the-2x PASSES both old cap tests and FAILS the new one;
+  delete-the-generation-guard PASSES the old negative control and FAILS the new
+  one. Full `cargo test --release` rc=0 (4234 passed, 0 failed), `go test
+  ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, _Log.md
+- **Timestamp**: 2026-08-05 16:24
+- **Action**: #6819 gate fold round 2 (R3 + doc accuracy). (R3) The gated suite
+  could not detect a regression of the fix. Every assertion on the three
+  counters is a DELTA capture (`before + 1` / `== before`), and `make test-rust`
+  pins `-- --test-threads=1` (Makefile:114-116, adopted to dodge the #6657
+  `__skb_wait_for_more_packets` socket wedge) — under serial execution a
+  process-global satisfies every one of those identically, so reverting any
+  counter to a static shipped GREEN. Added
+  `refusal_counters_are_per_coordinator_not_process_global`: drives one refusal
+  of each kind on a BUSY Coordinator and asserts an IDLE one, live in the same
+  process, saw none of them. It does not depend on interleaving, so it reds at
+  any thread count. Proof under the gate flag: reverting
+  `install_stale_ignored` to its original `metrics.rs` static REDS the new test
+  while the other 29 `ha::` tests run and pass — the pre-existing suite
+  genuinely cannot see the revert. WHICH assertion reds depends on the run
+  mode, and the original claim of `ha_tests.rs:738` was only true of the
+  ISOLATED run: libtest orders alphabetically under `--test-threads=1`, so
+  `current_generation_…`/`delete_synced_session_gen_…`/`over_ceiling_import_…`
+  all bump the restored global BEFORE `refusal_counters_…` runs, and the
+  PRECONDITION at the top of the test trips first. Fixed in the 2026-08-05
+  18:05 entry by giving the preconditions the same diagnostic as the payload
+  assertions, so the message is reachable in the mode the gate actually uses. (DOC) Corrected the
+  export-surface claim at three sites: this crate has NO gRPC dependency and
+  none of the three counters is in `proto/`; only `import_cap_drops` reaches
+  Prometheus (`server/helpers/status.rs:102` -> `protocol/control.rs:334` ->
+  `protocol_status.go:279` -> `metrics_userspace.go:672`), and the two stale
+  counters have no wire or metric surface — their accessors are reachable only
+  from `ha_tests.rs`. The earlier 2026-08-05 09:41 entry carries an inline
+  correction. (README) Recorded that the concurrency mechanism is MEASURED
+  (revert reds 24/60 parallel vs 0/12 serial for the cap counter; 43/60 vs 0/5
+  for the stale pair) AND that the sanctioned gate structurally cannot observe
+  it. (NOTE) Documented that per-instance scoping makes every `..._before`
+  capture 0, degenerating three `== before` assertions to `0 == 0` — recorded
+  where those assertions live, with why the family is still bound.
+  Gates: `cargo test --release --bins --tests -- --test-threads=1` rc=0
+  (4235 passed, 0 failed, 2 ignored), `go test ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 17:38
+- **Action**: #6819 README — cited the independent cross-PR measurement of the
+  counter flake. While gating #6843, a lane measured parallel `cargo test --
+  afxdp::ha` over 40 iterations: 34/40 FAILED at that PR's HEAD and 34/40 at an
+  `origin/master` CONTROL with the PR's files reverted and its tests confirmed
+  absent. The identical rate with and without the change under review is what
+  identifies the flake as pre-existing and specific to these counters rather
+  than caused by any one PR, and it root-caused the failures to
+  `SESSION_INSTALL_STALE_IGNORED`/`SESSION_DELETE_STALE_IGNORED` being
+  process-global under `assert_eq!(total, before)` — as a family, not one test.
+  That is unmutated evidence from a lane with no stake in #6862, stronger than
+  the mutation numbers already cited. Also recorded the coupling explicitly:
+  the `--test-threads=1` that hides this defect exists to dodge a DIFFERENT one
+  (#6657).
+  NOTE ON THE GATE RUN: `cargo test --release --bins --tests --
+  --test-threads=1` returned rc=101 on this README-only change, failing
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`.
+  That is NOT this change — the diff since the previous green gate is one .md
+  file and no test reads it. Characterized it instead of re-running for green:
+  the test fails 2 of 10 runs ALONE in the process under `--test-threads=1`, so
+  its race is INTERNAL to the test (it spawns its own threads, which
+  `--test-threads=1` does not serialize). That distinguishes it from #6819
+  (cross-test, masked by serial execution) and from the #6657 wg-engine hang.
+  Reported to the #6657 owner.
+- **File(s)**: userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 18:05
+- **Action**: #6819 gate fold round 3 (two MINORs). (M1) The `#6819`
+  diagnostics in `refusal_counters_are_per_coordinator_not_process_global` were
+  UNREACHABLE in the mode the gate actually runs. libtest executes
+  alphabetically under `--test-threads=1`, so `current_generation_…` (c),
+  `delete_synced_session_gen_…` (d) and `over_ceiling_import_…` (o) all bump a
+  restored global BEFORE `refusal_counters_…` (r) runs — the bare
+  `assert_eq!(x, 0)` PRECONDITIONS tripped first and reported `left: 1,
+  right: 0` with no explanation, while the carefully-worded payload assertions
+  forty lines below fired only when the test was run in ISOLATION. Gave the
+  three preconditions the same named diagnostic, so a future engineer who
+  reintroduces the regression reads why in either run mode. Generalisable: a
+  diagnostic is only as good as the run mode that REACHES it — when a test has
+  a precondition and a payload assertion, check which fires under the
+  SANCTIONED invocation, not the filtered one used while developing. (M2)
+  Corrected the `ha_tests.rs:738` line cite: under the conditions stated
+  alongside it (the other 29 `ha::` tests running) the revert reds at the
+  precondition, not 738; 738 is the isolated-run line. Corrected in the
+  2026-08-05 16:24 entry and in the PR body.
+  NOT FOLDED: #6891 — a live cross-test counter flake of exactly the shape this
+  PR's README rule warns about (`GRE_DECAP_CHECKSUM_INVALID_DROPS`, equality
+  assert, 18/60 RED at this branch's HEAD and 16/40 at the merge base — equal
+  rate, so pre-existing). Filed separately; it raises #6891's priority, not
+  this PR's scope.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs, _Log.md
+
+- **Timestamp**: 2026-08-05 15:10
+- **Action**: #6851 fold — two MAJORs on the #4626 policy-id-zero guard, both
+  verified firsthand before folding.
+
+  MAJOR 1, the SEVENTH resolver. `EventReader.resolvePolicyName`
+  (`pkg/logging/ringbuf.go`) resolves RT_FLOW record names independently of the
+  six session-row builders and indexed `er.policyNames` directly. It already
+  special-cased `DefaultPolicySentinelID` (#3057) but not
+  `UnattributedPolicyID`, so every host-inbound / fabric / tunnel / pre-#3056 /
+  older-peer record named the FIRST configured policy. This is the surface that
+  matters most: RT_FLOW records go to syslog and ship off-box, so the wrong
+  attribution is durable and lands in what an auditor reads later.
+
+  MAJOR 2, peer fan-out. `fetchPeerSessions` did `resp.Peer = peerResp` — the
+  peer's response attached UNCHANGED, names included. The #4626 guard resolves a
+  name from a raw id for rows THIS node renders; it does not cover a name
+  arriving as DATA from an old peer that resolved it wrongly itself. REST
+  (`writeSessionList` → `pr.GetPeer()`), gRPC clients and the CLI all republish
+  that string, so `fetchPeerSessions` is the single choke point for all three.
+
+  DECISION on MAJOR 2, and why. Override the name for RESERVED ids only; keep
+  the peer's name for everything else. Policy ids are NODE-LOCAL
+  (`compilePolicies` assigns from the local config's rule ordering), so the peer
+  is authoritative for the names of its own sessions and re-resolving an
+  unreserved peer id against the LOCAL map would name whichever local policy
+  occupies that slot — a fresh misattribution firing on every mixed-config
+  cluster, not a fix. The two choices are identical against a same-version peer
+  (it already sends `unattributed`); they differ only for an older peer, which
+  is the population that needs correcting. Pinned by mutation M4.
+
+  STRUCTURE. Added `dataplane.ReservedPolicyName(id) (string, bool)` as the SSOT
+  for "which ids must never reach a name map", and expressed `SessionPolicyName`,
+  the new `PeerSessionPolicyName`, and the logging resolver through it. The
+  logging site keeps its own numeric fallback so it cannot call
+  `SessionPolicyName` directly; an earlier draft probed
+  `SessionPolicyName(nil, id)` for a non-empty result, which works only because
+  a nil map yields "" for unreserved ids — a property nobody is obliged to
+  preserve and whose loss would silently route unreserved ids away from the
+  caller's map. Replaced with the explicit predicate.
+
+  Also FUSED the peer guard with the attach it protects
+  (`attachPeerSessions` sanitizes AND assigns). Two statements at the call site
+  would let a future edit drop the guard and keep the attach — silent and green,
+  the exact failure mode of this PR. Fused, dropping the guard drops the
+  fan-out, which fails loudly.
+
+  ENUMERATION, re-run rather than inherited (the count has grown at every
+  count: briefed 2, previous lane 6, gate 7). Every `policyNames[...]` index in
+  the tree is now: the helper itself, `compilePolicies` building the map, and
+  the logging resolver (fixed). Six routed session builders + logging = SEVEN
+  resolvers; the peer pass-through is the only place a name arrives as data.
+  Checked and CLEARED as carrying no policy name: the other two peer fan-outs
+  (`GetSessionSummaryResponse` is counts only; `GetZonePairSummaryResponse` holds
+  `ZonePairSessionSummary`, which is zone pairs + protocol counts) — verified by
+  enumerating their generated struct fields, not by assuming. Downstream
+  consumers (`pkg/api/sse.go`, `server_show_events.go`,
+  `cli_show_security_log.go`, `monitor.go`, `cmd/cli/show_flow.go`) read an
+  already-resolved string and are fixed transitively.
+
+  MUTATIONS (each restored + re-verified green):
+  - M1 map-first, the shape that looks like a guard: reserved check moved AFTER
+    the map lookup in the logging resolver → RED on
+    `TestResolvePolicyNameZeroIsNotTheFirstPolicy_6851`. Note the
+    no-published-map test stays GREEN under it, which is why the OCCUPIED-map
+    fixture is the load-bearing one.
+  - M2 peer-name-first (trust a non-empty peer string before the reserved
+    check) → 3 RED.
+  - M3 guard dropped, attach kept → 3 RED; the fusion holds.
+  - M4 the REJECTED alternative (discard the peer's name for unreserved ids too,
+    as "re-resolve everything locally" would) → RED on the unreserved control.
+    The decision is pinned, not accidental.
+
+  SUPERSEDED #3057 ASSERTION, called out because the brief did not anticipate
+  it. Routing the logging resolver through the guard broke a PRE-EXISTING test:
+  `TestResolvePolicyNameSentinelRendersDefaultPolicy` asserted "a genuine policy
+  ID 0 still resolves to the first configured policy". That is precisely the
+  claim #4626 retires — the same claim the six session surfaces already stopped
+  making — so the assertion was updated, not the fix weakened. The test's actual
+  #3057 purpose (the sentinel must not alias the first policy) is untouched, and
+  I STRENGTHENED it in the other direction: id 0 must now also not render as
+  `default-policy`, so a "fix" collapsing both reserved ids onto one name would
+  fail rather than pass. The supersession is documented in the test comment.
+  Under mutation M1 that test now reds ALONGSIDE the new one.
+
+  SCOPE LIMIT, stated rather than implied: the tests drive `attachPeerSessions`,
+  so they bind the sanitize-and-attach pair. They do NOT bind
+  `fetchPeerSessions`' call to it — that needs a live `cluster.Manager` with
+  `PeerAlive()` plus an authenticated peer dial, neither reachable from a unit
+  test. Replacing the call with a bare `resp.Peer = peerResp` would not be
+  caught. Recorded in the source next to the function.
+- **File(s)**: pkg/dataplane/policy_display.go, pkg/logging/ringbuf.go,
+  pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
+  pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
+  _Log.md
+
+## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
+
+- **Timestamp**: 2026-08-05
+- **Action**: Two findings from reviewing the #5078 branch, plus the doc
+  half. (1) F-B: `TestSyncAuthHandshakeDowngradeGuardRejects` documented a
+  RED-on-revert that could not fire — flipping its only precondition
+  (`newAuthSync(t, key, true)` -> `false`) left it PASSING, because after
+  #5078 `syncAuthDecision` rejects every unkeyed peer on a keyed node
+  regardless of `peerAuthSeen`. It was a duplicate of
+  `TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer` wearing a
+  downgrade-guard name; deleted with a comment recording why. (2) F-A: the
+  sync-side downgrade guard it was named for was itself dead —
+  `syncPeerAuthSeen` had ZERO callers and `syncAuthedEver` was write-only
+  in effect (stored in `wrapSyncConn`, read only by the orphan). Go does
+  not flag unused methods, so it compiled green. Deleted, along with
+  `SyncAuthProvider.HeartbeatPeerAuthSeen()` (its only consumer through
+  the interface), the fake's implementation, and the now-meaningless
+  `authSeen` parameter of `newAuthSync`. (3) Docs: the `sync_auth.go`
+  package doc and the `pkg/cluster/README.md` PR-C section still described
+  keyed-node dual-accept, the deleted `pendingFrame` path, the removed
+  sync downgrade guard, and a two-method provider wiring.
+- **Scope verified, not assumed**: `Manager.HeartbeatPeerAuthSeen` is NOT
+  removed — still exported, still consumed by the gRPC fabric listener
+  (`pkg/grpcapi/fabric_auth.go`) and the control-link status string
+  (`status.go`). The #4107 HEARTBEAT downgrade guard is separate state
+  (`heartbeatAuthDecision` over `heartbeatAuthState.peerAuthenticated`),
+  so deleting the sync pair cannot disarm it;
+  `TestHeartbeatAuthDecision/key/legacy-after-peer-authed` and
+  `TestControlLinkAuthStatus` still pass.
+- **Not landed, deliberately**: my own `clusterCommsNeedRestart` guard +
+  `cluster_authkey_no_comms_restart_5078_test.go`. The branch already
+  carries `TestAuthKeyChangeDoesNotRestartClusterComms_5078`, which binds
+  the same property and additionally covers key ROTATION. A second test
+  for one property is noise.
+- **Validation**: `go build ./...` 0; `go vet ./pkg/cluster/ ./pkg/grpcapi/
+  ./pkg/daemon/` 0; `go test -count=1 ./pkg/cluster/ ./pkg/grpcapi/` 0;
+  full `go test ./pkg/... ./cmd/...` exit 0 (59 packages, zero failures).
+- **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
+  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-05 — #6865 gate fold: bind the call site, retarget two RED labels
+
+- **Timestamp**: 2026-08-05
+- **Action**: F1 — added `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078`.
+  The step-20 decision in `daemon_apply_tail.go` is INLINE, so the existing
+  struct test could not see it: adding `|| keyChanged` there, with
+  `clusterTransportKey`/`clusterTransportFromConfig` byte-identical, produced
+  the permanent deadlock with a green suite. New test observes
+  `clusterCommsGen` across a real `applyTailReconciles`. F2 — retargeted the
+  RED-on-revert on `...KeyedNodeRejectsLegacyPeer`: it claimed "restore the
+  grace in syncAuthDecision", which does NOT fail it (the arm discards the
+  accept bit); it actually binds the arm returning nil. F3 — matrix comment
+  still described the deleted migration window as current and named the
+  removed `peerAuthSeen` param. F4 — de-duplicated a doubled paragraph in
+  `sync_auth.go`. F6 — assert the `reason` substring, since nil key is the
+  failure default of every error path. README — procedure 2 can itself
+  produce the keyed-primary/unkeyed-secondary deadlock if the connection
+  drops mid-rollout.
+- **Validation**: `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0.
+  M2 (call-site `|| keyChanged`, struct untouched): struct test PASSES, new
+  call-site test FAILS, positive control passes. M4 (legacy arm returns nil):
+  `...KeyedNodeRejectsLegacyPeer` FAILS at the err==nil assertion.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
+  pkg/cluster/README.md, _Log.md
+
+## 2026-08-07 — #6706 r11 fold: the `system login` packed gate saw one of three levels
+
+- **Timestamp**: 2026-08-07
+- **Action**: F1 (MAJOR) — `validateLoginPackedStatementsAST` walked
+  `system` → `login` → `<instance>` with `forEachChild`/`FindChildren`, both
+  of which match on `Keys[0]`. With the path packed onto an ANCESTOR line
+  neither gate recorded anything: the `login` node then carries
+  `Keys=["login","user","alice",…]` with zero children so `FindChildren`
+  returns nothing, and the `system` node has empty `Children` so the inner
+  walk never runs. Measured firsthand through `configstore.CheckText` (the
+  real commit / `commit check` / `xpfd check-config` pipeline) at the parent
+  commit: `system { login user alice class read-only; }` → ACCEPT, 0 users;
+  `system login user alice class read-only;` → ACCEPT, `System.Login == nil`;
+  a whole file written that way → ACCEPT, zero warnings. The level the gate
+  DID cover is the fail-CLOSED one (empty class → `unauthorized`); both it
+  missed are fail-OPEN, and `System.Login == nil` is precisely
+  `applyCLILoginClass`'s early return → `SetUserClass` never called →
+  `c.userClass == ""` → `checkPermission` nil for every command and
+  `showConfigRedacted` false. Fixed by generalising the walk to the two
+  ancestor levels with per-level consequence text, riding the same
+  `lenientLoginPackedStatements` flag (#1960 warn on the tolerant ingress)
+  and the same `forEachClusterNodeView` both-node union.
+  Scoped wider than the review described, with evidence: `system login {
+  user alice { class ops; } }` and `system { login user alice { class ops;
+  } }` also drop everything, so the rule is "the path must descend into a
+  nested block at every step", not "the body must not be on the instance
+  line". `system login;` / `system login user;` declare nothing in either
+  spelling and stay accepted; `inactive:` config is pruned by
+  `cloneForExpansion` before any gate and stays accepted.
+  Also fixed a mirror-image over-reach in the sibling shadow gate: under a
+  prefix-packed `login` node its children are an INSTANCE body, so a `class
+  <n>` child there is a user's class ASSIGNMENT, and the gate reported
+  `system login class read-only: this definition is INERT` for a definition
+  never written. The stanza is still rejected — by the new ancestor arm.
+  F2 — `isWholeHolderWrite`'s `*ast.StarExpr` arm required an `*ast.Ident`
+  operand, so `*a.cli = CLI{}` through a real production `*CLI` field
+  (three exist) was recorded nowhere. Added a `holderPointerFieldNames`
+  pre-pass over the whole production tree and a SelectorExpr operand arm;
+  updated the KNOWN LIMITS block, whose collection-element excuse never
+  covered the field form. F3 — split `classifyLookup` out of `Current` as a
+  PURE function so the `name != ""` term is reachable by argument rather
+  than through a repointable package-level hook; the term was unbindable and
+  that is the exact shape `lookupPasswd`'s own comment forbids 15 lines
+  earlier. F4 — `osident.go` claimed an unknown uid "resolves to
+  `unidentified`"; no such value exists (`Name` is `""`, `String()` renders
+  `uid-<n>`, and `pkg/cli`'s `ClassUnidentified` is `"unauthorized"`).
+- **Validation**: `go build ./...`, `go vet ./...`, and
+  `go test ./pkg/config/ ./pkg/configstore/... ./pkg/cli/ ./pkg/daemon/
+  ./pkg/osident/ ./cmd/cli/` exit 0.
+  Mutation matrix, pristine control first, restored by `cp` each time:
+  M1 (drop the `system`-level arm) — the `system`-line sub-tests RED on
+  "compiled with NO error — the gate did not fire"; every `login`-line
+  sub-test and every over-reach guard stayed GREEN.
+  M2 (drop the `login`-level arm) — mirror image: `login`-line RED,
+  `system`-line GREEN.
+  M3 (drop the shadow-gate skip) — RED on "the shadow gate misread a user's
+  class ASSIGNMENT as a class DEFINITION"; bound on the LENIENT path, since
+  strict returns the packed error first and a strict-only assertion would
+  stay green.
+  M4 (drop the SelectorExpr operand arm) with `*a.cli = CLI{}` inserted at
+  `cli_show_chassis.go`: vet rc 0, `TestSetUserClassHasOneProductionCaller`
+  **ok** — the escape reproduced. With the fix, the same insertion REDs
+  naming file:line. Negative control `a.cli.userClass = ""` at the same site
+  through the same field REDs in both states, isolating the escape to the
+  write FORM.
+  M5 (`case err == nil && name != "":` → `case err == nil:`) — `./pkg/cli`,
+  `./pkg/daemon`, `./cmd/cli` all ok as the review reported, `./pkg/osident`
+  now RED on "Reason = 0, want ReasonLookupFailed".
+- **File(s)**: pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go,
+  pkg/configstore/login_path_packed_6706_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/osident/osident.go,
+  pkg/osident/passwd_6706_test.go, docs/system-login.md,
+  docs/config-schema.md, _Log.md

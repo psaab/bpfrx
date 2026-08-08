@@ -537,3 +537,102 @@ func who() string {
 	// edit that switches this file to a full parse does not have to re-add it.
 	var _ ast.Node = f
 }
+
+// TestClassifyLookupUnnamedSuccessIsNotIdentified_6706 binds the `name != ""`
+// term in classifyLookup's first case.
+//
+// It exists because the term was UNBINDABLE at the previous head. No
+// lookupPasswd path returns ("", nil) — every empty-name return carries
+// errNoPasswdEntry, errAmbiguousUID or an I/O error — so with the whole switch
+// inlined in Current() there was no way to reach the combination, and mutating
+// the case to a bare `err == nil` left `./pkg/osident ./pkg/cli ./pkg/daemon
+// ./cmd/cli` all ok. That is precisely the shape lookupPasswd's own comment
+// forbids one screen earlier ("A redundant emptiness filter here would MASK the
+// empty-name term ... and leave it unbindable by any test"), so the file was
+// asserting one rule and violating it (#6706 review r10 F3).
+//
+// Splitting the classification into a pure function makes the combination
+// reachable by argument rather than by a repointable package-level hook, which
+// on an identity path is a hook worth not having.
+//
+// FAIL-ON-REVERT: change the first case to `case err == nil:` and the unnamed
+// -success sub-test reds on Reason (ReasonNone, not ReasonLookupFailed). The
+// other sub-tests are the negative controls: they pin that the term did not
+// swallow a NAMED success or re-route the two classified failures, so a
+// mutation that deleted the whole first case cannot pass by making this one
+// assertion true.
+func TestClassifyLookupUnnamedSuccessIsNotIdentified_6706(t *testing.T) {
+	t.Run("unnamed success is a lookup failure, not an identity", func(t *testing.T) {
+		id := classifyLookup(1000, "", nil)
+		if id.Resolved() {
+			t.Fatalf("classifyLookup(1000, \"\", nil) reports Resolved() — an empty Name is "+
+				"not an identification, and a caller that fails closed on Resolved() would "+
+				"admit it: %+v", id)
+		}
+		if id.Reason != ReasonLookupFailed {
+			t.Fatalf("classifyLookup(1000, \"\", nil).Reason = %v, want ReasonLookupFailed; "+
+				"ReasonNone would read as `resolved, no failure recorded`, the one combination "+
+				"pkg/cli has no fail-closed arm for", id.Reason)
+		}
+		if id.Name != "" {
+			t.Fatalf("classifyLookup fabricated a name %q", id.Name)
+		}
+	})
+
+	t.Run("a NAMED success is still an identity", func(t *testing.T) {
+		// Negative control: the term must not have been widened into rejecting
+		// every success.
+		id := classifyLookup(1000, "alice", nil)
+		if !id.Resolved() || id.Name != "alice" || id.Reason != ReasonNone {
+			t.Fatalf("classifyLookup(1000, \"alice\", nil) = %+v, want a resolved alice with "+
+				"ReasonNone", id)
+		}
+	})
+
+	t.Run("the classified failures keep their own categories", func(t *testing.T) {
+		// Negative control: the three failure arms are operator-facing (create
+		// the account / fix the duplicate uid / repair the database), so
+		// collapsing them into one would deny identically but misdirect.
+		cases := []struct {
+			err  error
+			want Reason
+		}{
+			{fmt.Errorf("%w %d", errNoPasswdEntry, 1000), ReasonNoPasswdEntry},
+			{fmt.Errorf("%w %d", errAmbiguousUID, 1000), ReasonAmbiguousUID},
+			{errors.New("permission denied"), ReasonLookupFailed},
+		}
+		for _, tc := range cases {
+			id := classifyLookup(1000, "", tc.err)
+			if id.Reason != tc.want {
+				t.Errorf("classifyLookup(1000, \"\", %v).Reason = %v, want %v",
+					tc.err, id.Reason, tc.want)
+			}
+			if id.Resolved() {
+				t.Errorf("classifyLookup(1000, \"\", %v) reports Resolved()", tc.err)
+			}
+		}
+	})
+
+	t.Run("a name arriving WITH an error is not trusted", func(t *testing.T) {
+		// The first case requires err == nil as well; a name returned beside a
+		// failure must not become an identity.
+		id := classifyLookup(1000, "alice", fmt.Errorf("%w %d", errAmbiguousUID, 1000))
+		if id.Resolved() || id.Reason != ReasonAmbiguousUID {
+			t.Fatalf("classifyLookup(1000, \"alice\", errAmbiguousUID) = %+v, want unresolved "+
+				"with ReasonAmbiguousUID", id)
+		}
+	})
+}
+
+// TestCurrentUsesClassifyLookup_6706 keeps the seam from drifting away from the
+// path it stands in for: a classifyLookup that Current() no longer calls would
+// leave the test above proving something about dead code.
+func TestCurrentUsesClassifyLookup_6706(t *testing.T) {
+	uid := os.Getuid()
+	name, err := lookupID(uid)
+	want := classifyLookup(uid, name, err)
+	if got := Current(); got != want {
+		t.Fatalf("Current() = %+v but classifyLookup(%d, %q, %v) gives %+v — Current no longer "+
+			"routes through the classifier the unnamed-success test binds", got, uid, name, err, want)
+	}
+}

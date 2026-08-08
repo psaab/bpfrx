@@ -49,8 +49,17 @@
 //
 //	a uid mapped to SEVERAL names resolves to "" here, where os/user returns
 //	whichever row came first — see lookupPasswd for why that fails closed.
-//	a uid with NO row resolves to "unidentified" here, instead of to whatever
-//	the caller put in $USER.
+//	a uid with NO row also resolves to "" here (Reason ReasonNoPasswdEntry),
+//	instead of to whatever the caller put in $USER.
+//
+// Both divergences produce an empty Name — Resolved() == false — and nothing
+// else; this package mints no placeholder account name. String() renders such
+// an identity as `uid-<n>` for a log line or prompt. The word "unidentified" is
+// a CATEGORY here, never a value: earlier revisions of this comment spelled it
+// as though `Name` held the literal "unidentified", which is greppable text a
+// reader would look for and not find. The class an unresolved caller lands in
+// is pkg/cli's ClassUnidentified, whose value is "unauthorized" — a different
+// thing again, one layer up (#6706 review r10 F4).
 //
 // pkg/cli fails closed on both. The sentence above is scoped to "exactly one
 // name" and "readable" on purpose: an earlier revision claimed parity for every
@@ -59,10 +68,11 @@
 //
 // A cgo-enabled dev build loses NSS name resolution — and that affects the RBAC
 // CLASS DECISION, not merely the displayed prompt. An NSS-only account (LDAP,
-// SSSD) resolves to "unidentified" and is therefore denied, where a cgo build
-// would previously have named it. That is a narrowing and never a promotion, so
-// it is safe in the direction that matters, but it is a functional narrowing
-// rather than a cosmetic one and is worth stating as such. The shipped build is
+// SSSD) resolves to an empty Name — unidentified, the category — and is
+// therefore denied, where a cgo build would previously have named it. That is a
+// narrowing and never a promotion, so it is safe in the direction that matters,
+// but it is a functional narrowing rather than a cosmetic one and is worth
+// stating as such. The shipped build is
 // CGO_ENABLED=0 (see the Makefile), so production is unaffected either way.
 // TestNoOsUserInIdentityResolution_6701 keeps os/user out.
 package osident
@@ -401,6 +411,30 @@ func containsString(list []string, want string) bool {
 func Current() Identity {
 	uid := os.Getuid()
 	name, err := lookupID(uid)
+	return classifyLookup(uid, name, err)
+}
+
+// classifyLookup maps one passwd-lookup outcome to an Identity.
+//
+// Split out of Current so the outcome classification is a PURE function of
+// (uid, name, err) and can be driven directly. That is not a stylistic split:
+// the `name != ""` term in the first case is unreachable through Current
+// itself, because no lookupPasswd path returns ("", nil) — every zero-name
+// return carries errNoPasswdEntry, errAmbiguousUID or an I/O error. Left inside
+// Current the term was therefore unbindable, which is exactly the shape
+// lookupPasswd's own comment (see matchPasswdRow's second result) refuses one
+// screen earlier: mutating it to a bare `err == nil` left `./pkg/osident
+// ./pkg/cli ./pkg/daemon ./cmd/cli` all ok. A seam that is a plain function
+// argument, rather than a package-level function variable, keeps the term
+// testable without putting a repointable hook on the identity path of a package
+// whose whole purpose is failing closed (#6706 review r10 F3).
+//
+// The term is retained rather than deleted because an unnamed success is not an
+// identification: should any future lookup path return ("", nil), the caller
+// must get Resolved() == false and a stated Reason, not an Identity with an
+// empty Name and ReasonNone — which reads as "resolved, no failure recorded"
+// and is the one combination pkg/cli has no fail-closed arm for.
+func classifyLookup(uid int, name string, err error) Identity {
 	switch {
 	case err == nil && name != "":
 		return Identity{UID: uid, Name: name}
@@ -409,9 +443,7 @@ func Current() Identity {
 	case errors.Is(err, errAmbiguousUID):
 		return Identity{UID: uid, Reason: ReasonAmbiguousUID}
 	default:
-		// Includes err == nil with an empty name, which no lookupPasswd path
-		// produces but a future/test seam could: an unnamed success is not an
-		// identification.
+		// Includes err == nil with an empty name.
 		return Identity{UID: uid, Reason: ReasonLookupFailed}
 	}
 }

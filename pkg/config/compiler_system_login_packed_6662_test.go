@@ -872,3 +872,434 @@ system { host-name fw; }
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// #6706: the same drop at the two ANCESTOR levels of the path.
+// ---------------------------------------------------------------------------
+
+// gate6706SystemLineMarker / gate6706LoginLineMarker attribute the two
+// ancestor-level arms SEPARATELY. One fixture cannot cover both — the walk
+// reaches them through different branches (a `system` node that never descends,
+// vs a `login` node that does) — so a single marker would let one arm regress
+// while the other kept the assertion green.
+const (
+	gate6706SystemLineMarker = "is written on the `system` statement line"
+	gate6706LoginLineMarker  = "is written on the `login` statement line"
+)
+
+// TestLoginPathPackedRejectedAtCommit_6706 is the fail-on-revert binder for the
+// ancestor-level arms.
+//
+// The original gate walked `system` -> `login` -> `<keyword>` with forEachChild
+// and FindChildren, both of which match on Keys[0]. With the path packed onto
+// the `login` line that node carries Keys=["login","user","alice",...] and ZERO
+// children, so FindChildren("user") returns nothing; with it packed onto the
+// `system` line, sys.Children is empty and the inner walk never runs. Measured
+// through configstore.CheckText (the real operator commit / commit-check
+// pipeline) at the parent commit, all of these committed GREEN:
+//
+//	system login user alice class read-only;         -> ACCEPT, System.Login == nil
+//	system { login user alice class read-only; }     -> ACCEPT, 0 users, 0 classes
+//
+// and the `system`-line arm is the fail-OPEN one: System.Login == nil makes
+// pkg/daemon applyCLILoginClass early-return, SetUserClass is never called, and
+// pkg/cli runs with an empty class — allow every command, render secrets in
+// cleartext. The one level the gate DID cover (the instance line) is the
+// fail-CLOSED one.
+//
+// FAIL-ON-REVERT: drop either `if len(...Keys) > 1` arm from
+// collectLoginPackedFindings and that arm's sub-tests go RED on the assertion
+// in mustReject ("compiled with NO error — the gate did not fire"); the other
+// arm stays green, which is the point of splitting the markers.
+func TestLoginPathPackedRejectedAtCommit_6706(t *testing.T) {
+	tests := []struct {
+		name   string
+		text   string
+		marker string
+	}{
+		{
+			name:   "user instance on the system line",
+			text:   `system login user alice class read-only;`,
+			marker: gate6706SystemLineMarker,
+		},
+		{
+			name:   "class instance on the system line",
+			text:   `system login class noc permissions view;`,
+			marker: gate6706SystemLineMarker,
+		},
+		{
+			name:   "login BLOCK hung off the system line",
+			text:   `system login { user alice { class read-only; } }`,
+			marker: gate6706SystemLineMarker,
+		},
+		{
+			name:   "user BLOCK hung off the system line",
+			text:   `system login user alice { class read-only; }`,
+			marker: gate6706SystemLineMarker,
+		},
+		{
+			name:   "user instance on the login line",
+			text:   `system { login user alice class read-only; }`,
+			marker: gate6706LoginLineMarker,
+		},
+		{
+			name:   "class instance on the login line",
+			text:   `system { login class noc permissions view; }`,
+			marker: gate6706LoginLineMarker,
+		},
+		{
+			name:   "user BLOCK hung off the login line",
+			text:   `system { login user alice { class read-only; } }`,
+			marker: gate6706LoginLineMarker,
+		},
+		{
+			name: "a second, packed login block beside a well-formed one",
+			// The nested `user a` is lost too: two sibling `login` nodes under
+			// one `system` reduce to the LAST, so the packed line does not
+			// merely fail to add bob, it wipes the stanza that worked.
+			text:   `system { login { user a { class read-only; } } login user bob class ops; }`,
+			marker: gate6706LoginLineMarker,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := compileLogin6662(t, tt.text)
+			mustReject(t, err, tt.marker, "ancestor-level packed `system login` path")
+			if !strings.Contains(err.Error(), "#6662") {
+				t.Errorf("rejection does not cite the issue: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoginPathPackedRejectionIsPasteable_6706 pins the rewrite. The operator
+// is mid-migration from a vSRX config; a rejection that does not hand back a
+// working spelling just moves the guesswork.
+func TestLoginPathPackedRejectionIsPasteable_6706(t *testing.T) {
+	tests := []struct {
+		name    string
+		text    string
+		wantSet string
+	}{
+		{
+			name:    "system line reconstructs the full set path",
+			text:    `system login user alice class read-only;`,
+			wantSet: "set system login user alice class read-only",
+		},
+		{
+			name:    "login line reconstructs the full set path",
+			text:    `system { login class noc permissions view; }`,
+			wantSet: "set system login class noc permissions view",
+		},
+		{
+			name: "a multi-word instance name stays ONE token",
+			// A bare strings.Join would render `set system login class noc ops
+			// idle-timeout 5`, which is a different (invalid) configuration.
+			text:    `system { login class "noc ops" idle-timeout 5; }`,
+			wantSet: `set system login class "noc ops" idle-timeout 5`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := compileLogin6662(t, tt.text)
+			if err == nil {
+				t.Fatalf("gate did not fire")
+			}
+			if !strings.Contains(err.Error(), tt.wantSet) {
+				t.Fatalf("rejection does not offer the pasteable rewrite %q:\n  %v",
+					tt.wantSet, err)
+			}
+		})
+	}
+}
+
+// TestLoginPathPackedNamesTheRBACCost_6706 pins the CONSEQUENCE clause per arm.
+// The two ancestor levels do NOT fail the same way and the message must not
+// claim they do: `system`-line packing yields System.Login == nil, which is
+// pkg/cli's legacy no-RBAC allow-everything shortcut, while `login`-line
+// packing yields a non-nil but EMPTY stanza, where ResolveLoginClass falls to
+// the fail-closed `unauthorized` class. Stating the permissive outcome on the
+// fail-closed arm (or the reverse) would send the operator to the wrong
+// urgency.
+func TestLoginPathPackedNamesTheRBACCost_6706(t *testing.T) {
+	t.Run("system line names the allow-everything outcome", func(t *testing.T) {
+		_, err := compileLogin6662(t, `system login user alice class read-only;`)
+		if err == nil {
+			t.Fatalf("gate did not fire")
+		}
+		for _, want := range []string{"System.Login == nil", "CLEARTEXT", "DEPROVISIONED"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("system-line rejection omits %q:\n  %v", want, err)
+			}
+		}
+	})
+
+	t.Run("login line names the fail-closed lockout, not a promotion", func(t *testing.T) {
+		_, err := compileLogin6662(t, `system { login user alice class read-only; }`)
+		if err == nil {
+			t.Fatalf("gate did not fire")
+		}
+		for _, want := range []string{"`unauthorized`", "DEPROVISIONED"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("login-line rejection omits %q:\n  %v", want, err)
+			}
+		}
+		if strings.Contains(err.Error(), "CLEARTEXT") {
+			t.Errorf("login-line rejection claims the allow-everything outcome, which belongs "+
+				"to the `system`-line arm (this arm compiles a PRESENT but empty stanza, so "+
+				"ResolveLoginClass fails closed):\n  %v", err)
+		}
+	})
+}
+
+// TestLoginPathPackedLenientWarns_6706 covers the tolerant load / peer-sync
+// ingress. A strict-only fix re-creates the #1960 brick: a node that persisted
+// such a config under an older binary must still BOOT, with the drop stated.
+//
+// FAIL-ON-REVERT: wire either arm to report unconditionally rather than through
+// loginFindings (or gate it on !lenient) and these go RED on the missing
+// warning, while the strict tests above stay green.
+func TestLoginPathPackedLenientWarns_6706(t *testing.T) {
+	tests := []struct {
+		name   string
+		text   string
+		marker string
+	}{
+		{"system line", `system login user alice class read-only;`, gate6706SystemLineMarker},
+		{"login line", `system { login user alice class read-only; }`, gate6706LoginLineMarker},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := compileLogin6662Lenient(t, tt.text)
+			if err != nil {
+				t.Fatalf("tolerant path must NOT reject (#1960 no-brick): %v", err)
+			}
+			var found string
+			for _, w := range cfg.Warnings {
+				if strings.Contains(w, tt.marker) {
+					found = w
+				}
+			}
+			if found == "" {
+				t.Fatalf("tolerant path emitted no warning containing %q; warnings: %v",
+					tt.marker, cfg.Warnings)
+			}
+			if !strings.Contains(found, "#6662") {
+				t.Errorf("warning does not cite the issue: %q", found)
+			}
+		})
+	}
+}
+
+// TestLoginPathPackedRejectedFromBothNodeViews_6706 extends the #6706 both-node
+// contract to the ancestor arms: a peer-only `${node}` group carrying a packed
+// path must be rejected whichever node the operator commits from, or the origin
+// commits green and the peer ingests it through the tolerant sync path.
+//
+// peerOnlyLoginGroup nests the body inside `system { login { ... } }`, which is
+// the wrong wrapper for an ancestor-level fixture (it would produce an INSTANCE
+// -level packing), so this builds the group body directly.
+func TestLoginPathPackedRejectedFromBothNodeViews_6706(t *testing.T) {
+	tests := []struct {
+		name   string
+		body   string
+		marker string
+	}{
+		{
+			name:   "system line in a peer-only ${node} group",
+			body:   `system login user bob class read-only;`,
+			marker: gate6706SystemLineMarker,
+		},
+		{
+			name:   "login line in a peer-only ${node} group",
+			body:   `system { login user bob class read-only; }`,
+			marker: gate6706LoginLineMarker,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			text := `groups {
+	node0 { system { host-name fw0; } }
+	node1 { ` + tt.body + ` }
+}
+apply-groups "${node}";
+`
+			p := NewParser(text)
+			tree, perrs := p.Parse()
+			if len(perrs) != 0 {
+				t.Fatalf("parse: %v", perrs)
+			}
+			for _, nodeID := range []int{0, 1} {
+				_, err := CompileConfigForNode(tree, nodeID)
+				mustReject(t, err, tt.marker,
+					"peer-only ${node} packed path committed on a node")
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #6706 over-reach guards: what the ancestor arms must NOT reject.
+// These stay GREEN under the revert of either arm — they assert the behaviour
+// the fix did not intend to change, so they separate a guard from a restatement
+// of the fix.
+// ---------------------------------------------------------------------------
+
+// TestLoginPathPackedDoesNotOverReach_6706 pins the accept side.
+func TestLoginPathPackedDoesNotOverReach_6706(t *testing.T) {
+	t.Run("the nested spelling still compiles", func(t *testing.T) {
+		cfg, err := compileLogin6662(t, `system {
+		login {
+			class noc { permissions [ view configure ]; }
+			user alice { class noc; }
+		}
+	}`)
+		if err != nil {
+			t.Fatalf("the correct spelling was rejected: %v", err)
+		}
+		if len(cfg.System.Login.Users) != 1 || cfg.System.Login.Users[0].Class != "noc" {
+			t.Fatalf("nested spelling did not compile: %+v", cfg.System.Login)
+		}
+	})
+
+	t.Run("a user CONTAINER block still compiles", func(t *testing.T) {
+		// `user { alice { ... } }` — the identity-1 shape the instance arm
+		// branches on. The `user` node has one key, so no ancestor arm applies.
+		cfg, err := compileLogin6662(t, `system { login { user { alice { class read-only; } } } }`)
+		if err != nil {
+			t.Fatalf("container spelling was rejected: %v", err)
+		}
+		if len(cfg.System.Login.Users) != 1 || cfg.System.Login.Users[0].Name != "alice" {
+			t.Fatalf("container spelling did not compile: %+v", cfg.System.Login)
+		}
+	})
+
+	t.Run("a user literally NAMED login still compiles", func(t *testing.T) {
+		// The `system` arm branches on Keys[1] == "login" and the `login` arm
+		// on the node's own key count, so neither can be tripped by an
+		// instance whose NAME collides with a path keyword.
+		cfg, err := compileLogin6662(t, `system { login { user login { class read-only; } } }`)
+		if err != nil {
+			t.Fatalf("a user named `login` was rejected: %v", err)
+		}
+		if len(cfg.System.Login.Users) != 1 || cfg.System.Login.Users[0].Name != "login" {
+			t.Fatalf("user named `login` did not compile: %+v", cfg.System.Login)
+		}
+	})
+
+	t.Run("a non-login system statement line is not this gate's business", func(t *testing.T) {
+		// `system host-name fw1;` is dropped by the compiler too (an adjacent
+		// defect, filed separately), but it is NOT an RBAC fail-open and this
+		// gate must not claim it. Rejecting every packed `system` key would
+		// turn one gate into an unbounded one.
+		if _, err := compileLogin6662(t, `system host-name fw1;`); err != nil {
+			t.Fatalf("gate reached beyond `system login`: %v", err)
+		}
+	})
+
+	t.Run("an empty path prefix declares nothing and is not reported", func(t *testing.T) {
+		// `system login;` and `system login user;` compile to nothing in BOTH
+		// spellings, so no statement was dropped. A gate that rejected them
+		// would be rejecting config it has no complaint about.
+		for _, text := range []string{`system login;`, `system login user;`, `system { login user; }`} {
+			if _, err := compileLogin6662(t, text); err != nil {
+				t.Fatalf("%q declares nothing yet was rejected: %v", text, err)
+			}
+		}
+	})
+
+	t.Run("flat set still compiles every leaf", func(t *testing.T) {
+		// The flat-set ingress hangs the body off as CHILDREN at every level,
+		// so no packed shape arises. If an arm ever matched here the whole
+		// `set` grammar would become uncommittable.
+		cfg, err := compileLogin6662FlatSet(t,
+			"set system login class noc permissions view",
+			"set system login user alice class noc",
+			`set system login user alice authentication ssh-rsa "ssh-rsa AAAA k"`)
+		if err != nil {
+			t.Fatalf("flat set was rejected: %v", err)
+		}
+		if len(cfg.System.Login.Users) != 1 || cfg.System.Login.Users[0].Class != "noc" {
+			t.Fatalf("flat-set user did not compile: %+v", cfg.System.Login)
+		}
+		if len(cfg.System.Login.Users[0].SSHKeys) != 1 {
+			t.Fatalf("flat-set ssh key did not compile: %+v", cfg.System.Login.Users[0])
+		}
+	})
+
+	t.Run("deactivated config stays accepted", func(t *testing.T) {
+		// `inactive:` subtrees are pruned by cloneForExpansion before any gate
+		// runs, so an operator can park a stanza the gate would otherwise
+		// reject. A gate that rejected deactivated config is its own outage.
+		for _, text := range []string{
+			`inactive: system login user alice class read-only;`,
+			`system { inactive: login user alice class read-only; }`,
+			`system { inactive: login { user alice class read-only; } }`,
+			`system { login { inactive: user alice class ops; } }`,
+		} {
+			if _, err := compileLogin6662(t, text); err != nil {
+				t.Fatalf("deactivated config was rejected: %q\n  %v", text, err)
+			}
+		}
+	})
+}
+
+// TestLoginClassShadowSkipsInstanceLineChildren_6706 pins the shadow gate's
+// half of the fix, in BOTH directions.
+//
+// `system { login user alice { class super-user; } }` puts the USER on the
+// login line, so login.Children hold that user's body. The shadow walk read the
+// `class super-user;` ASSIGNMENT there as a class DEFINITION and rejected with
+// "system login class super-user: this definition is INERT" — naming a
+// definition the operator never wrote, and sending them to rename a class that
+// does not exist. It now skips a login node carrying extra keys.
+//
+// The stanza must STILL be rejected — by the ancestor arm, which diagnoses the
+// real defect — so this is not a rejection removed, it is a rejection
+// re-attributed. Asserting only "no longer says INERT" would pass if the whole
+// stanza had started committing green.
+//
+// The STRICT path cannot bind the skip on its own: compileConfigWithOpts runs
+// the packed gate before the shadow gate and returns on its first error, so
+// with the skip reverted strict still surfaces the packed message and a
+// strict-only assertion stays green. The observable difference is on the
+// TOLERANT path, where both gates run and accumulate — which is also where it
+// matters operationally, since that is the boot log of a node that persisted
+// such a config. Hence the lenient leg below.
+func TestLoginClassShadowSkipsInstanceLineChildren_6706(t *testing.T) {
+	const instanceLine = `system { login user alice { class super-user; } }`
+
+	_, err := compileLogin6662(t, instanceLine)
+	mustReject(t, err, gate6706LoginLineMarker, "user instance on the login line")
+
+	// FAIL-ON-REVERT for the shadow-gate skip: drop the `len(login.Keys) > 1`
+	// early return from collectLoginClassShadowFindings and this goes RED.
+	cfg, lerr := compileLogin6662Lenient(t, instanceLine)
+	if lerr != nil {
+		t.Fatalf("tolerant path must NOT reject (#1960 no-brick): %v", lerr)
+	}
+	var sawPacked bool
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, gate6701ShadowMarker) {
+			t.Errorf("the shadow gate misread a user's class ASSIGNMENT as a class "+
+				"DEFINITION — it names `class super-user` as INERT config the operator "+
+				"never wrote:\n  %s", w)
+		}
+		if strings.Contains(w, gate6706LoginLineMarker) {
+			sawPacked = true
+		}
+	}
+	if !sawPacked {
+		t.Fatalf("the tolerant path lost the real finding while suppressing the bogus one; "+
+			"warnings: %v", cfg.Warnings)
+	}
+
+	// The genuine shadowing definition, one level in, still rejects — the skip
+	// must not have disabled the shadow gate wholesale.
+	_, err = compileLogin6662(t, `system { login { class super-user { permissions view; } } }`)
+	mustReject(t, err, gate6701ShadowMarker, "a real shadowing class definition")
+}

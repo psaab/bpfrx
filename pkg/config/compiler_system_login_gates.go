@@ -204,11 +204,67 @@ func validateLoginPackedStatementsAST(tree *ConfigTree, lenient bool) ([]string,
 	return f.verdict(lenient)
 }
 
-// collectLoginPackedFindings records every packed-body offender under one
+// loginPathLevelSystem / loginPathLevelLogin name the two ANCESTOR levels at
+// which the `system login` path itself can be packed onto a statement line.
+// They are the `%s statement line` token in the rejection message, so they are
+// also the per-arm attribution marker the tests assert on.
+const (
+	loginPathLevelSystem = "system"
+	loginPathLevelLogin  = "login"
+)
+
+// collectLoginPackedFindings records every packed offender under one
 // already-expanded node view.
+//
+// The packing has THREE levels, not one, and the compiler drops the body at
+// every one of them. `system login` is compiled only when the path descends
+// through `.Children` at each step — compileSystem reaches `login` only as a
+// CHILD of a bare `system` node, and namedInstances reads the instance name off
+// Keys[1] of a `login` CHILD:
+//
+//	system { login { user alice { class ops; } } }   compiles
+//	system { login { user alice class ops; } }       INSTANCE line packed
+//	                                                 -> the user's body drops
+//	system { login user alice class ops; }           `login` line packed
+//	                                                 -> the whole stanza drops
+//	system login user alice class ops;               `system` line packed
+//	                                                 -> the whole stanza drops
+//
+// The two ancestor levels are the DANGEROUS ones, and the original gate saw
+// neither: both `forEachChild` and `FindChildren` match on Keys[0], so with the
+// path packed onto the `login` line that node has zero children and
+// FindChildren returns nothing, and with it packed onto the `system` line
+// sys.Children is empty and the inner walk never runs. The one level the gate
+// DID cover is the one whose runtime outcome is fail-CLOSED (an instance with
+// an empty class resolves to `unauthorized`), while the two it missed are the
+// fail-OPEN ones — see loginPathPackedConsequence (#6706 review blocker).
+//
+// A prefix finding SUBSUMES everything below it: the stanza the operator wrote
+// does not exist at all, so descending to report which of its instances are
+// also packed would name statements inside a block that never compiled. The
+// rewrite in the prefix message fixes the whole stanza in one edit; if the
+// rewritten form still packs an instance line, the existing instance-level arm
+// rejects it on the next commit.
+//
+// Both arms ride the SAME lenientLoginPackedStatements flag as the instance
+// arm: identical #6662 defect (a valid Junos spelling xpf silently discards),
+// identical #1960 doctrine (strict at commit, warn on the tolerant load /
+// peer-sync ingress), so a separate opts field would be a second thing to wire
+// and a second thing to wire wrong.
 func collectLoginPackedFindings(nodes []*Node, f *loginFindings) {
 	_ = forEachChild(nodes, "system", func(sys *Node) error {
+		if len(sys.Keys) > 1 && sys.Keys[1] == "login" {
+			// rest = [login, <keyword>, <name>, body...] — the instance name
+			// would sit at index 2.
+			reportLoginPathPacked(loginPathLevelSystem, sys.Keys[1:], 2, sys.Children, f)
+			return nil
+		}
 		return forEachChild(sys.Children, "login", func(login *Node) error {
+			if len(login.Keys) > 1 {
+				// rest = [<keyword>, <name>, body...] — name at index 1.
+				reportLoginPathPacked(loginPathLevelLogin, login.Keys[1:], 1, login.Children, f)
+				return nil
+			}
 			for _, keyword := range loginInstanceKeywords {
 				for _, container := range login.FindChildren(keyword) {
 					if len(container.Keys) >= 2 {
@@ -223,6 +279,78 @@ func collectLoginPackedFindings(nodes []*Node, f *loginFindings) {
 			return nil
 		})
 	})
+}
+
+// loginPathPackedConsequence renders what the WHOLE-STANZA drop costs at each
+// ancestor level. The two differ, and the difference is the reason this gate
+// exists: only one of them is fail-closed.
+//
+//   - `system` line: System.Login compiles as nil. pkg/daemon
+//     applyCLILoginClass (cli_rbac.go) takes its `cfg.System.Login == nil` early
+//     return, so SetUserClass is never called and the CLI runs with an EMPTY
+//     login class. That is pkg/cli's DELIBERATE legacy "no RBAC configured"
+//     shortcut — checkPermission returns nil for every command and
+//     showConfigRedacted returns false (permissions.go). The shortcut is
+//     correct for a deployment that configured no RBAC; the defect is that a
+//     config which DOES configure it lands there.
+//   - `login` line: System.Login is non-nil but carries no users and no
+//     classes, so ResolveLoginClass matches nothing and every non-root caller
+//     falls to the fail-closed `unauthorized` class instead of the one written
+//     (uid 0 keeps the root default). Not an escalation — a silent lockout from
+//     the class the operator authored.
+//
+// Both levels leave zero configured users, so daemon reconcileAbsentLoginUsers
+// (login_password.go) builds an EMPTY desired set and deprovisions every
+// xpf-managed operator account.
+func loginPathPackedConsequence(level string) string {
+	switch level {
+	case loginPathLevelSystem:
+		return "`system login` compiles ABSENT (System.Login == nil), which is exactly " +
+			"pkg/cli's legacy no-RBAC shortcut — every caller runs with an empty login " +
+			"class, so every command is permitted and IKE PSKs, SNMP communities and " +
+			"authentication-keys render in CLEARTEXT — and, with no configured users, " +
+			"every xpf-managed operator account is DEPROVISIONED on the next apply"
+	case loginPathLevelLogin:
+		return "`system login` compiles EMPTY (no users, no classes), so every non-root " +
+			"caller resolves to the fail-closed `unauthorized` class instead of the one " +
+			"written — a silent lockout — and every xpf-managed operator account is " +
+			"DEPROVISIONED on the next apply"
+	}
+	return "the stanza compiles EMPTY"
+}
+
+// reportLoginPathPacked records one ancestor-level packing. `rest` is the run
+// of keys the statement line carries beyond the level's own keyword — starting
+// at `login` for the `system` level, at the instance keyword for the `login`
+// level — so `set system %s` / `set system login %s` reconstructs the operator's
+// intended path verbatim. Rendered through quoteKeys for the same round-trip
+// reason the instance arm quotes: the rewrite is meant to be PASTED, and an
+// unquoted multi-word token would paste back as several tokens.
+//
+// nameIndex is where an instance NAME would sit in rest. A prefix that stops
+// before it AND has no children below declares nothing that the nested spelling
+// would have compiled either — `system login;` and `system login user;` are
+// inert in both spellings — so there is nothing dropped to report, and
+// rejecting them would be rejecting config the gate has no complaint about.
+// A prefix WITH children is always reportable however short it is:
+// `system login { user alice { class ops; } }` packs only the two-token prefix
+// yet drops a fully-formed stanza.
+func reportLoginPathPacked(level string, rest []string, nameIndex int, children []*Node, f *loginFindings) {
+	if len(rest) <= nameIndex && len(children) == 0 {
+		return
+	}
+	packed := quoteKeys(rest)
+	setPath := "set system " + packed
+	if level == loginPathLevelLogin {
+		setPath = "set system login " + packed
+	}
+	f.add(fmt.Sprintf(
+		"system login: `%s` is written on the `%s` statement line, but xpf compiles the "+
+			"`system login` stanza only when every level of the path descends into a NESTED "+
+			"BLOCK — or is written as a `set` statement — so every user and class written "+
+			"here is SILENTLY DROPPED and %s (#6662). Rewrite as `system { login { ... } }` "+
+			"with each `user`/`class` instance in its own block, or as `%s`.",
+		packed, level, loginPathPackedConsequence(level), setPath))
 }
 
 // checkLoginInstancePacked reports the packed body of ONE login instance:
@@ -425,6 +553,18 @@ func collectLoginClassShadowFindings(nodes []*Node, f *loginFindings) {
 
 	_ = forEachChild(nodes, "system", func(sys *Node) error {
 		return forEachChild(sys.Children, "login", func(login *Node) error {
+			// A `login` node carrying extra keys is an INSTANCE line
+			// (`login user alice { ... }`), so its children are that
+			// instance's body, not login-level containers. Reading a `class`
+			// child there misreads a user's class ASSIGNMENT as a class
+			// DEFINITION and reports `system login class read-only: this
+			// definition is INERT` for a definition the operator never wrote
+			// (#6706). The stanza is still rejected — by the ancestor-level
+			// arm of the packed gate, which runs first and diagnoses the real
+			// defect (the whole stanza is dropped).
+			if len(login.Keys) > 1 {
+				return nil
+			}
 			for _, container := range login.FindChildren("class") {
 				if len(container.Keys) >= 2 {
 					report(container.Keys[1])

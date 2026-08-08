@@ -1298,6 +1298,40 @@ Consequences worth knowing when adding a reader:
   shape — rather than sniffing `Keys[0]` against the keyword — stays correct
   for an instance literally named `user` or `class`.
 
+  **The packing has THREE levels, and the gate's first revision saw only one
+  (#6706).** The walk descends with `forEachChild` and `FindChildren`, which
+  both match on `Keys[0]`, so a path packed onto an ANCESTOR line was invisible
+  to it: with the instance on the `login` line that node carries
+  `Keys=["login","user","alice",…]` and zero children, so `FindChildren("user")`
+  returns nothing; with `login` on the `system` line, `sys.Children` is empty
+  and the inner walk never runs. Measured through `configstore.CheckText` — the
+  real commit / `commit check` / `xpfd check-config` pipeline — both
+  `system { login user alice class ops; }` and `system login user alice class
+  ops;` committed GREEN and compiled nothing.
+
+  The sharp form of why that mattered: the one level the gate covered is the
+  one whose runtime outcome is fail-CLOSED (an instance with an empty class
+  resolves to `unauthorized`), while the two it missed are the fail-OPEN ones —
+  `System.Login == nil` is exactly `pkg/daemon` `applyCLILoginClass`'s early
+  return, so `SetUserClass` is never called and `pkg/cli` runs with an empty
+  class: allow every command, render secrets in cleartext.
+
+  The generalisation is one predicate at two node levels — a `system` node with
+  `Keys[1] == "login"`, or a `login` node with any key beyond its own — and a
+  finding at an ancestor SUBSUMES everything below it, since the stanza the
+  operator wrote does not exist at all. A prefix that stops before an instance
+  NAME and has no children below (`system login;`, `system login user;`)
+  declares nothing in either spelling and is not reported. Both arms ride the
+  same `lenientLoginPackedStatements` flag as the instance arm and the same
+  `forEachClusterNodeView` both-node union.
+
+  The sibling shadow gate (`validateLoginClassShadowsBuiltinAST`) skips a
+  `login` node carrying extra keys for the mirror-image reason: its children are
+  then an INSTANCE body, so reading a `class <n>` child there misreads a user's
+  class ASSIGNMENT as a class DEFINITION — it reported `system login class
+  read-only: this definition is INERT` for a definition never written. The
+  stanza is still rejected, by the ancestor arm, which names the real defect.
+
 **The two collapses COMPOSE, and a monitor statement hits both.** The packed
 collapse above is orthogonal to the `#2419` bracket collapse at the top of this
 section, and `interface-monitor` is subject to each independently:

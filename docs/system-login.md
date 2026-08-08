@@ -360,13 +360,45 @@ safety nets are all guarded on non-emptiness, including the `deny-commands`
 "MORE PERMISSIVE" advisory above (`if lc.DenyCommands != ""`): the field the bug
 dropped is the field the guard reads.
 
-This applies to the whole stanza, at both levels:
+This applies to the whole stanza, at every level:
 
 | Statement | Packed spelling | Result |
 |---|---|---|
 | `login class <n>` — `permissions`, `idle-timeout`, `allow-commands`, `deny-commands`, `allow-configuration`, `deny-configuration`, `login-alarms`, `login-tip` | `class ops permissions view;` | **rejected** |
 | `login user <n>` — `uid`, `class`, `authentication` | `user alice class ops;` | **rejected** |
 | `login user <n> authentication` (a block) written inline inside a nested user body | `user alice { authentication ssh-rsa "…"; }` | **rejected** |
+| the instance on the **`login`** statement line | `system { login user alice class ops; }` | **rejected** |
+| `login` itself on the **`system`** statement line | `system login user alice class ops;` | **rejected** |
+
+#### The `system` and `login` lines too (#6706)
+
+The two ANCESTOR levels of the path drop the same way, and they were the
+dangerous ones. `system login` compiles only when the path descends into a
+nested block at **every** step:
+
+```
+system { login { user alice { class ops; } } }   # OK
+system { login user alice { class ops; } }       # REJECTED — instance on the `login` line
+system login { user alice { class ops; } }       # REJECTED — `login` on the `system` line
+system login user alice class ops;               # REJECTED — the whole path on one line
+```
+
+Before #6706 all three of the rejected forms **committed green** and compiled
+nothing. The cost differs by level, and the message says which:
+
+| Packed at | Compiles to | Runtime |
+|---|---|---|
+| the instance line | a user with an **empty class** | fail-**closed**: `ResolveLoginClass` maps it to `unauthorized` |
+| the `login` line | `System.Login` present but **empty** | fail-**closed** for non-root (`unauthorized`), root keeps its default |
+| the `system` line | `System.Login == nil` | fail-**OPEN**: `applyCLILoginClass` early-returns, the CLI runs with an empty class — the legacy no-RBAC mode, every command allowed and secrets in cleartext |
+
+At every level, zero configured users also means `reconcileAbsentLoginUsers`
+sees an empty desired set and **deprovisions every xpf-managed operator
+account** on the next apply.
+
+Rejecting `system login;` or `system login user;` would be rejecting config that
+declares nothing in either spelling, so those are accepted. Deactivated config
+(`inactive:`) is pruned before any gate runs and is likewise unaffected.
 
 The tolerant load / peer-sync path **warns** instead of rejecting (#1960
 no-brick), so a node that persisted such a config under an older binary still
