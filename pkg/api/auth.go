@@ -147,8 +147,13 @@ func CredentialCount(a *AuthConfig) int {
 		return 0
 	}
 	n := len(a.Users)
-	for _, ok := range a.APIKeys {
-		if ok {
+	for key, ok := range a.APIKeys {
+		// constantTimeAPIKeyMatch skips `!valid || key == ""`, so both a
+		// disabled key and an empty-string key authenticate nobody and neither
+		// is a credential. Mirror BOTH of its conditions rather than only the
+		// valid flag: a count that includes an unusable key is one an operator
+		// has to go and disprove.
+		if ok && key != "" {
 			n++
 		}
 	}

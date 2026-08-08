@@ -751,6 +751,17 @@ func TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561(t *testing.T) {
 
 	// What the operational tiers cannot reach must still hold a configuration —
 	// again in charged bytes, not in body bytes.
+	//
+	// This check is live and byte-exact, but it is IMPLIED rather than
+	// independent, and saying so keeps it from being mistaken for a dimension it
+	// does not add: whenever the step-gap loop above and the aggregate check
+	// below both pass, budget - clear >= configure - clear >= needFor(load), and
+	// the same follows for view through the derived view -> configure step. No
+	// ceiling table makes this red alone while both of those are green. It
+	// becomes independent only if largestBody[PermConfig] reaches 0, which
+	// `continue`s the step loop and is itself guarded by
+	// requireConfigureStepDerived. Keep it as a belt; do not count it as a third
+	// binding site.
 	for _, tc := range []struct {
 		name    string
 		ceiling int64

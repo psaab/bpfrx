@@ -981,7 +981,23 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 //	                                       charged)
 //	configure - view      48 - 8 = 40 MiB  >= 24 MiB (peak of mutationBodyLoad)
 //	configure - clear     48 - 16 = 32 MiB >= 24 MiB (peak of mutationBodyLoad)
-//	maint - configure     64 - 48 = 16 MiB >= 96 KiB (peak of mutationBodySmall)
+//	maint - view          64 - 8 = 56 MiB  >= 96 KiB (peak of mutationBodySmall)
+//	maint - clear         64 - 16 = 48 MiB >= 96 KiB (peak of mutationBodySmall)
+//
+// Those five are exactly the steps tierLadderSteps() DERIVES, and the step loop
+// checks each. The list above used to read "maint - configure 64 - 48" instead
+// of the two maint rows, which inverted the truth in both directions: configure
+// -> maint is NOT derived, because no built-in class holds PermConfig without
+// PermMaint (super-user reaches both through PermAll; operator, read-only and
+// config-viewer hold neither), so someClassSeparates is false and the loop never
+// sees that pair — while maint - view and maint - clear ARE derived and were
+// missing from the list.
+//
+// The configure -> maint reservation is still checked, just not here: a
+// standalone assertion in authz_bodybudget_fairness_5561_test.go requires the
+// budget's free space above the configure ceiling to cover a max-size load.
+// Keep this list in step with what the derivation produces — a table that names
+// a step the loop cannot see reads as coverage that does not exist.
 //
 // and 8 MiB still holds 127 concurrent max-size view-route bodies (64 KiB
 // each — the 128th cannot reach 64 KiB, its own last doubling would peak at
@@ -1121,14 +1137,29 @@ func refuseMutationBody(w http.ResponseWriter, r *http.Request, want int64) {
 //
 // Otherwise it reads at most limit+1 bytes — the route's whole limit into the
 // buffer, and one more into a scratch byte that only has to answer "is there
-// more?". On the one route whose limit is still maxRequestBodyBytes that extra
-// byte preserves the previous outcome byte for byte — the body reached the
-// handler long enough for its own MaxBytesReader to trip and answer 413. On a
-// route with a TIGHTER limit the handler's reader would not trip, so the 413 is
-// written here instead, with the same status and the same message
-// decodeJSONBody produces. A body under the limit is handed over whole, so
-// decode behaviour — including which malformed inputs produce 400 — is
-// unchanged.
+// more?". An oversized body is answered 413 HERE, on every route, with the
+// same status and the same body decodeJSONBody writes (measured byte-identical
+// on the wire). A body under the limit is handed over whole, so decode
+// behaviour — including which malformed inputs produce 400 — is unchanged; the
+// 400/413 split lands exactly on limit.
+//
+// What is NOT preserved, and an earlier revision of this comment wrongly said
+// was: the HTTP-message disposition. http.MaxBytesReader marks the
+// ResponseWriter requestTooLarge, so the pre-gate 413 carried `Connection:
+// close`; this one does not, because the gate consumed the whole body (limit
+// into the buffer, one into scratch) and answers it itself. A pipelining client
+// that used to see the connection closed now gets a reusable one. Operationally
+// benign, and it is NOT a consequence of moving the probe byte into scratch —
+// the divergence dates from the gate's first commit, where an explicit
+// over-limit check already took the write away from MaxBytesReader. Verified by
+// substituting the pre-scratch bufferMutationBody and driving the same request:
+// same result.
+//
+// The clause "the body reached the handler long enough for its own
+// MaxBytesReader to trip" described a mechanism that does not execute at all —
+// on this path the handler never runs. Do not restore either claim without
+// driving a real request through both shapes and comparing the response
+// headers, not just the status and payload.
 //
 // The over-limit byte lands in SCRATCH rather than in the buffer because the
 // buffer's growth is what the budget charges (#5561 round 19, finding 1). Making

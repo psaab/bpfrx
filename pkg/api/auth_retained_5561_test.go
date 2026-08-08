@@ -156,6 +156,19 @@ func TestCredentialCountIgnoresDisabledAPIKeys_5561(t *testing.T) {
 			"constantTimeAPIKeyMatch skips !valid, so that key authenticates nobody", n)
 	}
 
+	// A SEPARATE arm, deliberately not folded into the case above: constantTimeAPIKeyMatch
+	// skips `!valid || key == ""`, so it has two independent reasons to reject a key and
+	// CredentialCount must mirror both. One fixture carrying a disabled key AND an empty
+	// key would stay red if either arm regressed, so it could not tell them apart —
+	// each needs its own distinguishing mutation. (#5561 round 19 fixed the valid flag
+	// and left this one; the empty-key shape is real, see auth_empty_secret_5636_test.go.)
+	if n := CredentialCount(&AuthConfig{APIKeys: map[string]bool{"": true}}); n != 0 {
+		t.Fatalf("a snapshot whose only api-key is the EMPTY STRING counts %d credentials, want 0. "+
+			"constantTimeAPIKeyMatch skips key == \"\" as well as !valid, so an empty key "+
+			"authenticates nobody however it is flagged — counting it makes the reconciler "+
+			"report a credential that cannot be used", n)
+	}
+
 	// The consumer shape: the retained-listener set and the committed set differ
 	// by nothing a listener could use, so nothing was withheld.
 	live := &AuthConfig{Users: map[string]string{"admin": "pw"}, APIKeys: map[string]bool{"k": true}}
