@@ -707,7 +707,7 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 			// every flag after the first was silently dropped and the operator
 			// debugging a live problem got less tracing than they asked for
 			// with no diagnostic. Worse, the strict validator below
-			// (validateFlowTraceFlagsStrict) read the same one side, so an
+			// (validateFlowTraceFlagsAndFiltersAST) read the same one side, so an
 			// UNKNOWN flag in any slot but the first committed CLEAN — a
 			// validation fail-open. firewallMatchValues accumulates both sides.
 			to.Flags = append(to.Flags, firewallMatchValues(flagNode)...)

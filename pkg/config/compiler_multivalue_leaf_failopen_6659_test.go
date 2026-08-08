@@ -422,7 +422,7 @@ security { flow { traceoptions { flag basic-datapath; flag session; } } }`)},
 }
 
 // TestFlowTraceFlags6659UnknownFlagInAnySlotRejected is the GATE-ESCAPE half.
-// validateFlowTraceFlagsStrict read the same nodeVal the compiler did, so an
+// validateFlowTraceFlagsAndFiltersAST read the same nodeVal the compiler did, so an
 // unknown flag anywhere but the FIRST slot committed clean. Both orderings must
 // now be rejected; the first-slot case is the control that already worked.
 func TestFlowTraceFlags6659UnknownFlagInAnySlotRejected(t *testing.T) {

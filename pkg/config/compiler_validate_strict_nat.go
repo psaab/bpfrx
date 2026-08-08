@@ -2592,6 +2592,22 @@ func validateStaticNATMatchAddressesStrict(cfg *Config) error {
 // committed clean before #6659 too (verified), because proxy-ARP addresses
 // carried no commit-time validator at all. Every slot is checked.
 //
+// That first-slot arm is a DELIBERATE NEW COMMIT GATE, not a consequence of the
+// widening, and the paragraph above does not justify it — say so plainly rather
+// than let the causal framing carry it. Measured on both trees with an identical
+// corpus: `address bogus` (one value, first slot) is STRICT=OK on master and
+// STRICT=REJECT here, while the COMPILED result is byte-identical on both
+// ("bogus/32"). The widening never touched slot 1; this arm closes a hole that
+// predates it.
+//
+// Operator-visible consequence, and the reason this is stated here instead of
+// only in a commit message: an appliance whose ACTIVE config already carries a
+// malformed proxy-ARP address keeps booting (the tolerant path warns), but its
+// operator can no longer `commit` ANY change -- including a fix for an unrelated
+// outage -- until that line is corrected. The gate is still the right call, since
+// the entry was silently inert rather than working, but it is a behaviour change
+// against an existing config and belongs in the release notes.
+//
 // The parse is netip.ParsePrefix — deliberately the SAME call the installer
 // makes (pkg/dataplane/proxyarp.go), so "accepted at commit" and "installed at
 // runtime" cannot diverge. The reported value is the COMPILED form: an address
