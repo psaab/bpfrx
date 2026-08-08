@@ -71343,3 +71343,79 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/authz.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go,
   pkg/api/authz_freshness_5561_test.go, pkg/api/README.md, _Log.md
+
+## 2026-08-07 — #5561 round 19: the tier ladder was denominated in body bytes, not charge
+
+- **Timestamp**: 2026-08-07
+- **Action**: F1 — `mutationBodyTierCeilings` reserves each privilege step
+  against the tiers below it, and round 18 sized those steps in BODY
+  bytes while `bodyBudget` charges the buffer's PEAK. `bufferMutationBody`
+  read `limit+1` bytes to detect an oversized body, so a body of exactly
+  `limit` filled `cap == limit` and then grew once more — and a grow
+  charges the old allocation and the new one across the copy. Measured
+  against production by binary-searching the smallest ceiling that admits
+  a max-size body: `2*limit+1`, i.e. 33554433 for a 16 MiB
+  `POST /api/v1/config/load`, against a configure−clear step of exactly
+  33554432. One byte short: with the clear tier pinned at its 16777216
+  ceiling (reachable exactly — 255 sockets parked at 65536, one at 32768,
+  64 at the 512-byte initial buffer), a super-user's 16 MiB `config/load`
+  answered 429 for the whole `apiReadTimeout`, renewably, driven by an
+  `operator` or by any custom class holding nothing but `permissions
+  clear`. Fixed at the allocation, not at the ladder: the over-limit
+  probe byte now lands in a one-byte scratch array and the buffer never
+  grows past `limit`, so the measured peak drops to `1.5*limit`
+  (25165824) — the doubling floor, since a growing buffer necessarily
+  holds the old and new allocations at once. The existing 48/16 MiB step
+  satisfies that with 8 MiB to spare, so no ceiling moved. Two comments
+  that were false about the code are corrected: 48 MiB holds ONE 16 MiB
+  candidate and refuses the second (it holds two after the fix), and the
+  sufficiency criterion is now stated in peak bytes at every step, not
+  just the broken one. The concurrency note also said 128 concurrent
+  max-size view bodies; measured 127.
+  F2 — the `PermControl` tier row was VACUOUS, not a live denial
+  primitive: no route in `restMutationPermissions` requires that
+  permission and `mutationBodyTierCeiling` is only ever called with a
+  route's requirement, so the row was never consulted. Removed; the
+  unlisted-permission fallback already assigns the smallest share, so a
+  later `PermControl` route is bounded from the moment it exists. The
+  test comment claiming clear and control are "incomparable because
+  nothing distinguishes them" was false — `mapJunosPermissions` has
+  distinct arms for `clear` and `control`/`reset`, so a custom class
+  separates them — and so was the note that the row would "bite once a
+  route is added". Widening `strictlyBelow` to custom classes was
+  REJECTED after checking the consequence: once any single Junos token
+  can stand alone, no two coarse permissions are ordered by subset and
+  the derivation returns an EMPTY step set, which would silently make
+  every requirement in the file vacuous. The scope is documented instead.
+  F3 — `CredentialCount` counted `len(a.APIKeys)` including entries
+  mapped to false, which `constantTimeAPIKeyMatch` rejects and
+  `AuthForRetainedListener` does not copy, so the reconciler's `withheld`
+  warning over-reported by one per disabled key. Log-only.
+- **Validation**: `go build ./...` 0; `go vet ./...` 0; `gofmt -l pkg/api/`
+  empty; `go test ./pkg/api/ ./pkg/authz/ ./pkg/cli/ ./pkg/config/
+  ./pkg/daemon/` all ok. `make audit-check` up to date. Pristine control
+  GREEN first. M1 (buffer grows to `limit+1` again, pre-round-19 oversize
+  check restored so the 413 boundary is unchanged):
+  `TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561` RED —
+  "the configure tier stands only 33554432 bytes above the clear tier
+  (50331648 vs 16777216), less than the 33554433 the gate is CHARGED for
+  a single configure-tier request" — and
+  `TestATierAtItsCeilingCannotRefuseTheTierAboveIt_5561/clear_at_ceiling_vs_configure`
+  RED with an observed 429; the concurrency floor also RED at 63 of 64.
+  Over-reach guards GREEN under M1:
+  `TestBufferedBodyLimitBoundaryIsUnchanged_5561` (all three rows),
+  `TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` (all three
+  exit paths incl. the 413),
+  `TestHalfOpenBodyIsChargedForWhatItHoldsNotWhatItDeclared_5561`,
+  `TestEveryGuardedRouteDeclaresABodyTier_5561`. M2 (`PermControl` row
+  re-added at `budget/4`): `TestEveryGuardedRouteDeclaresABodyTier_5561`
+  RED on the new no-vacuous-row arm; both ladder cases stay GREEN, which
+  is the evidence that the row really was vacuous. M3
+  (`CredentialCount` back to `len`): the new
+  `TestCredentialCountIgnoresDisabledAPIKeys_5561` RED. Every mutation
+  restored by `cp` from a saved pristine copy, `git status --porcelain`
+  clean of markers before committing. PR still MERGEABLE/CLEAN against
+  `origin/master`, which has not touched `pkg/api/` since the merge base.
+- **File(s)**: pkg/api/authz.go, pkg/api/auth.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go,
+  pkg/api/auth_retained_5561_test.go, pkg/api/README.md, _Log.md

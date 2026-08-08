@@ -136,3 +136,39 @@ func TestAuthForRetainedListenerNilNext_5561(t *testing.T) {
 		t.Fatalf("got %+v, want nil", got)
 	}
 }
+
+// TestCredentialCountIgnoresDisabledAPIKeys_5561 pins the two operands of the
+// reconciler's `withheld` figure against each other (#5561 round 19, finding 3).
+//
+// pkg/daemon's management reconciler logs
+// CredentialCount(next.Auth) - CredentialCount(AuthForRetainedListener(...)).
+// That subtraction is only meaningful if both sides count the same things, and
+// AuthForRetainedListener copies an api-key only when it is mapped to TRUE —
+// which is also the only case constantTimeAPIKeyMatch will ever match. A count
+// that included the false entries therefore reported a credential as withheld
+// that no listener could have honoured in either snapshot.
+//
+// Log-only, so the assertion is the identity itself rather than any behaviour:
+// a disabled key must contribute nothing to either operand.
+func TestCredentialCountIgnoresDisabledAPIKeys_5561(t *testing.T) {
+	if n := CredentialCount(&AuthConfig{APIKeys: map[string]bool{"revoked": false}}); n != 0 {
+		t.Fatalf("a snapshot whose only api-key is mapped to false counts %d credentials, want 0. "+
+			"constantTimeAPIKeyMatch skips !valid, so that key authenticates nobody", n)
+	}
+
+	// The consumer shape: the retained-listener set and the committed set differ
+	// by nothing a listener could use, so nothing was withheld.
+	live := &AuthConfig{Users: map[string]string{"admin": "pw"}, APIKeys: map[string]bool{"k": true}}
+	next := &AuthConfig{
+		Users:   map[string]string{"admin": "pw"},
+		APIKeys: map[string]bool{"k": true, "revoked": false},
+	}
+	publish := AuthForRetainedListener(live, next)
+	if withheld := CredentialCount(next) - CredentialCount(publish); withheld != 0 {
+		t.Fatalf("the reconciler would warn that it withheld %d credentials from the retained "+
+			"listener, but the only difference between the committed set and the published one "+
+			"is an api-key mapped to false — a credential neither snapshot would ever accept. "+
+			"An over-reported withholding is a warning an operator has to go and disprove "+
+			"(committed %+v, published %+v)", withheld, next, publish)
+	}
+}

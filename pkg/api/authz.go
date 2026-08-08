@@ -917,7 +917,10 @@ func MutationBodyWaitersForTest() int { return int(mutationBodyWaitersInFlight.L
 // operator concurrency on a surface answering a handful of actions per second.
 // At the pathological extreme, where a caller really does send a 16 MiB
 // candidate, that same 48 MiB holds two at once and refuses the third with a
-// 429 rather than growing the heap.
+// 429 rather than growing the heap. Two rather than three because the PEAK a
+// 16 MiB body drives is 24 MiB, not 16: the buffer's last doubling holds 8 MiB
+// and 16 MiB at once across the copy. That 1.5x is why the ladder's steps below
+// are sized in peak bytes rather than in body bytes (#5561 round 19, finding 1).
 const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 
 // mutationBodyTierCeilings partitions that budget by the permission the ROUTE
@@ -935,11 +938,11 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // The ladder fixes that the way a filesystem reserves blocks for root: a
 // request may be admitted only while the running total is within ITS tier's
 // share, and the shares increase with privilege. Whatever the view tier takes,
-// it stops at 8 MiB — so 56 MiB is permanently out of its reach; the clear and
-// control tiers stop at 16 MiB, leaving 48 MiB that belongs to the configure
-// tier; and the configure tier in turn cannot take the last 16 MiB the
-// maintenance verbs need. The total across every tier is still
-// mutationBodyBudgetBytes, so the memory bound is unchanged.
+// it stops at 8 MiB — so 56 MiB is permanently out of its reach; the clear tier
+// stops at 16 MiB, leaving 48 MiB that belongs to the configure tier; and the
+// configure tier in turn cannot take the last 16 MiB the maintenance verbs
+// need. The total across every tier is still mutationBodyBudgetBytes, so the
+// memory bound is unchanged.
 //
 // The guarantee is one-directional, and deliberately so. Each ceiling is tested
 // against the AGGREGATE, so a tier is protected from every tier below it and
@@ -949,9 +952,9 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // crowding out a privileged one is a denial primitive — and it is the whole
 // reason the shares are ordered rather than equal.
 //
-// Which is exactly why VIEW gets half of what clear and control get, rather
-// than the same 16 MiB round 11 first gave all three (#5561 round 18, finding
-// 1). An aggregate-tested ceiling means a tier is only protected from the tiers
+// Which is exactly why VIEW gets half of what clear gets, rather than the same
+// 16 MiB round 11 first gave view, clear and control alike (#5561 round 18,
+// finding 1). An aggregate-tested ceiling means a tier is only protected from the tiers
 // STRICTLY BELOW it, and equal shares put no tier below any other: driven to
 // its own 16 MiB, the view tier left the clear tier nothing, so 383 sockets on
 // POST /api/v1/diagnostics/ping from a `read-only` account (PermView) made a
@@ -962,35 +965,54 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 // the round-11 split CREATED it, because before the split there was no budget
 // to exhaust.
 //
-// The step sizes are chosen so every privilege step reserves the LARGEST BODY
-// the tier above it can legitimately carry:
+// The step sizes are chosen so every privilege step reserves the PEAK CHARGE of
+// the largest body the tier above it can legitimately carry. Peak, not body
+// size, and the distinction is load-bearing: bufferMutationBody charges what the
+// buffer holds, a doubling holds the old allocation and the new one across the
+// copy, so a body that steps to a route's limit L peaks at 1.5L. Round 18 stated
+// these steps in BODY bytes, which left configure - clear one byte short of what
+// a 16 MiB config/load really drove — the clear tier at its own ceiling made a
+// super-user's config/load answer 429, which is precisely the primitive this
+// table removes (#5561 round 19, finding 1).
 //
-//	clear/control - view    16 - 8 = 8 MiB  >= 64 KiB (mutationBodySmall, the
-//	                                        dhcp clear; the other clear verbs
-//	                                        are mutationBodyNone and are never
-//	                                        charged, and PermControl has no
-//	                                        routes at all today)
-//	configure - clear       48 - 16 = 32 MiB >= 16 MiB (mutationBodyLoad)
-//	maint - configure       64 - 48 = 16 MiB >= 64 KiB (mutationBodySmall)
+//	clear - view          16 - 8 = 8 MiB   >= 96 KiB (peak of mutationBodySmall,
+//	                                       the dhcp clear; the other clear verbs
+//	                                       are mutationBodyNone and are never
+//	                                       charged)
+//	configure - view      48 - 8 = 40 MiB  >= 24 MiB (peak of mutationBodyLoad)
+//	configure - clear     48 - 16 = 32 MiB >= 24 MiB (peak of mutationBodyLoad)
+//	maint - configure     64 - 48 = 16 MiB >= 96 KiB (peak of mutationBodySmall)
 //
-// and 8 MiB still holds 128 concurrent max-size view-route bodies (64 KiB
-// each), or ~16k of the few-hundred-byte ping and traceroute payloads the
+// and 8 MiB still holds 127 concurrent max-size view-route bodies (64 KiB
+// each — the 128th cannot reach 64 KiB, its own last doubling would peak at
+// 96 KiB), or ~16k of the few-hundred-byte ping and traceroute payloads the
 // routes really carry, on a surface that answers a handful of operator actions
 // per second — so the smaller share is not itself an availability regression.
 // TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561 derives both of
-// those checks from the route tables rather than restating the numbers.
+// those checks from the route tables rather than restating the numbers, and
+// MEASURES the peak by driving bufferMutationBody rather than restating 1.5x.
 //
 // Keying on the ROUTE's required permission rather than on the CALLER's class
 // is deliberate: it is the action that is being protected, and pass 1 has
 // already established that only a principal holding that permission can reach
 // this point. A super-user's pings draw on the view tier, exactly like anyone
 // else's, and cannot crowd out that same super-user's commit.
+//
+// PermControl is deliberately ABSENT (#5561 round 19, finding 2). Round 11 gave
+// it a share equal to the clear tier's, but no route in restMutationPermissions
+// requires it and mutationBodyTierCeiling is only ever called with a route's
+// required permission — so the row was never consulted, and there was nothing on
+// the tier for it to protect or to protect against. Listing a share for a tier
+// that owns no work does not fail closed, it just states a number nobody
+// derived. The unlisted-permission fallback below assigns the SMALLEST share, so
+// a PermControl route added later is bounded from the moment it exists; and
+// TestEveryGuardedRouteDeclaresABodyTier_5561 fails the moment one is added, so
+// its real share gets chosen deliberately rather than inherited.
 var mutationBodyTierCeilings = map[config.LoginClassPermission]int64{
-	config.PermView:    mutationBodyBudgetBytes / 8,     // 8 MiB
-	config.PermClear:   mutationBodyBudgetBytes / 4,     // 16 MiB
-	config.PermControl: mutationBodyBudgetBytes / 4,     // 16 MiB
-	config.PermConfig:  mutationBodyBudgetBytes * 3 / 4, // 48 MiB
-	config.PermMaint:   mutationBodyBudgetBytes,         // 64 MiB
+	config.PermView:   mutationBodyBudgetBytes / 8,     // 8 MiB
+	config.PermClear:  mutationBodyBudgetBytes / 4,     // 16 MiB
+	config.PermConfig: mutationBodyBudgetBytes * 3 / 4, // 48 MiB
+	config.PermMaint:  mutationBodyBudgetBytes,         // 64 MiB
 }
 
 // mutationBodyTierCeiling returns how far the running total may be driven by a
@@ -1097,14 +1119,29 @@ func refuseMutationBody(w http.ResponseWriter, r *http.Request, want int64) {
 // contract's own 400), which is what it did before the gate started reading
 // bodies at all.
 //
-// Otherwise it reads at most limit+1 bytes. On the one route whose limit is
-// still maxRequestBodyBytes the extra byte preserves the previous outcome byte
-// for byte — the body reaches the handler long enough for its own
-// MaxBytesReader to trip and answer 413. On a route with a TIGHTER limit the
-// handler's reader would not trip, so the 413 is written here instead, with the
-// same status and the same message decodeJSONBody produces. A body under the
-// limit is handed over whole, so decode behaviour — including which malformed
-// inputs produce 400 — is unchanged.
+// Otherwise it reads at most limit+1 bytes — the route's whole limit into the
+// buffer, and one more into a scratch byte that only has to answer "is there
+// more?". On the one route whose limit is still maxRequestBodyBytes that extra
+// byte preserves the previous outcome byte for byte — the body reached the
+// handler long enough for its own MaxBytesReader to trip and answer 413. On a
+// route with a TIGHTER limit the handler's reader would not trip, so the 413 is
+// written here instead, with the same status and the same message
+// decodeJSONBody produces. A body under the limit is handed over whole, so
+// decode behaviour — including which malformed inputs produce 400 — is
+// unchanged.
+//
+// The over-limit byte lands in SCRATCH rather than in the buffer because the
+// buffer's growth is what the budget charges (#5561 round 19, finding 1). Making
+// room for it meant one more doubling, and a doubling charges the old allocation
+// and the new one at once, so a body that exactly filled the route's limit
+// peaked at 2*limit+1 — twice the buffer it ever actually needed. The tier
+// ladder above reserves its steps against the LARGEST BODY the tier above can
+// carry, so that doubling was spending a reserve that was never sized for it:
+// configure - clear is 32 MiB, one byte short of the 33554433 a 16 MiB
+// config/load then drove, and a PermClear flood at its own ceiling made a
+// super-user's config/load answer 429. Reading the probe into scratch keeps the
+// peak at the buffer's own high-water mark (one doubling below the limit, plus
+// the limit, across the copy).
 //
 // The read is io.ReadAll with its growth steps charged against b, which is what
 // makes the aggregate budget a statement about memory rather than about
@@ -1117,13 +1154,9 @@ func bufferMutationBody(w http.ResponseWriter, r *http.Request, limit int64, b *
 	if r.Body == nil || r.Body == http.NoBody || limit == mutationBodyNone {
 		return true
 	}
-	// One past the ceiling, so an oversized body is DETECTED rather than
-	// silently truncated into a body the handler would accept.
-	max := limit + 1
-
 	first := mutationBodyInitialBuf
-	if first > max {
-		first = max
+	if first > limit {
+		first = limit
 	}
 	if !b.resize(first) {
 		refuseMutationBody(w, r, first)
@@ -1138,18 +1171,16 @@ func bufferMutationBody(w http.ResponseWriter, r *http.Request, limit int64, b *
 	mutationBodyWaitersInFlight.Add(1)
 	defer mutationBodyWaitersInFlight.Add(-1)
 
-	for int64(len(buf)) < max {
+	atEOF := false
+	for !atEOF && int64(len(buf)) < limit {
 		if len(buf) == cap(buf) {
 			next := int64(cap(buf)) * 2
-			// Step to the ceiling before stepping past it, so a body that
-			// legitimately fills the route's whole limit is not charged for a
-			// doubling it needs one byte of. Only a body that then keeps going
-			// — one this function is about to 413 — pays for the last step.
-			if next > limit && int64(cap(buf)) < limit {
+			// Never past the route's limit. The buffer is sized for the body
+			// this route ADMITS; the byte that detects one over it is read into
+			// scratch below, so a body that legitimately fills the whole limit
+			// is not charged for a doubling it needs one byte of.
+			if next > limit {
 				next = limit
-			}
-			if next > max {
-				next = max
 			}
 			// Both allocations are live across the copy, so both are charged;
 			// the budget bounds peak resident bytes, not settled ones.
@@ -1165,21 +1196,43 @@ func bufferMutationBody(w http.ResponseWriter, r *http.Request, limit int64, b *
 		n, err := r.Body.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]
 		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			// The caller hung up, timed out, or sent a malformed chunked body.
-			// Not an authorization outcome: 400, and the handler never runs.
-			slog.Debug("api: could not read mutating request body",
-				"method", r.Method, "path", r.URL.Path, "err", err)
-			writeError(w, http.StatusBadRequest, "could not read request body")
-			return false
+			atEOF = true
+		} else if err != nil {
+			return refuseUnreadableBody(w, r, err)
 		}
 	}
-	if int64(len(buf)) > limit {
-		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
-		return false
+
+	// The buffer holds the route's whole limit and the caller has not finished:
+	// the body is oversized iff one more byte arrives. One stack byte answers
+	// that, and is not charged — see the note above on why it must not be the
+	// buffer that grows to hold it.
+	if !atEOF && int64(len(buf)) == limit {
+		var probe [1]byte
+		for {
+			n, err := r.Body.Read(probe[:])
+			if n > 0 {
+				writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return false
+			}
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return refuseUnreadableBody(w, r, err)
+			}
+		}
 	}
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	return true
+}
+
+// refuseUnreadableBody writes the 400 a body the gate could not finish reading
+// answers: the caller hung up, timed out, or sent a malformed chunked body. Not
+// an authorization outcome, and the handler never runs. Always returns false, so
+// bufferMutationBody's read paths can `return refuseUnreadableBody(...)`.
+func refuseUnreadableBody(w http.ResponseWriter, r *http.Request, err error) bool {
+	slog.Debug("api: could not read mutating request body",
+		"method", r.Method, "path", r.URL.Path, "err", err)
+	writeError(w, http.StatusBadRequest, "could not read request body")
+	return false
 }

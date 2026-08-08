@@ -129,15 +129,30 @@ func AuthForRetainedListener(live, next *AuthConfig) *AuthConfig {
 	return out
 }
 
-// CredentialCount reports how many usable credentials a snapshot carries. A nil
+// CredentialCount reports how many credentials a snapshot carries. A nil
 // snapshot means no authentication at all, which is not a count of credentials;
 // the management reconciler uses this only to log how much of a committed set it
 // had to withhold from a retained listener.
+//
+// API keys are counted BY VALUE rather than by len, because an APIKeys entry
+// mapped to false is a key the auth check rejects outright
+// (constantTimeAPIKeyMatch skips `!valid`) and AuthForRetainedListener does not
+// copy it. Counting it would inflate the reconciler's `withheld` subtraction on
+// one side only, reporting a credential as withheld when neither snapshot could
+// ever have honoured it. Log-only, no authorization effect — but a warning that
+// over-reports is one an operator has to go and disprove (#5561 round 19,
+// finding 3).
 func CredentialCount(a *AuthConfig) int {
 	if a == nil {
 		return 0
 	}
-	return len(a.Users) + len(a.APIKeys)
+	n := len(a.Users)
+	for _, ok := range a.APIKeys {
+		if ok {
+			n++
+		}
+	}
+	return n
 }
 
 // authMiddleware wraps an http.Handler with Basic Auth / Bearer / X-API-Key
