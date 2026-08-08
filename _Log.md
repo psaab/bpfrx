@@ -71854,3 +71854,25 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   heartbeat_epoch_session_budget_6669_test.go,
   heartbeat_replay_restart_5086_test.go, pkg/cluster/README.md,
   docs/refactoring-audit-current.txt, _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6169 — correct the M2 RED count recorded in `ae56bebe4`.
+
+  That commit's mutation table records, for
+  `M2 \`if macOK\` -> \`if macOK && false\` on the receiver's epoch read`:
+  "28 test functions RED, up from 0 before the deduplication". Re-measured
+  firsthand at 45e80b59c, in a `git archive` scratch with `go build ./...` and
+  `go vet ./pkg/cluster` rc=0 first so no RED is a build break: the cell REDs
+  **29** distinct top-level test functions, not 28. The direction is favourable
+  — the deduplication binds MORE than the commit claimed, not less — but the
+  number was published as exact and is not, so it is corrected here rather than
+  by rewriting a pushed commit.
+
+  The SEAM has also moved since, and a reviewer re-running the documented cell
+  at the current head would be measuring something else. Folding `admitAuthed`
+  and `admitAuthedLocked` into one function merged `admitFrame`'s two `if macOK`
+  blocks, so `if macOK && false` there now suppresses the whole authenticated
+  gate rather than the epoch read alone. The faithful equivalent at the current
+  head is severing the `heartbeatFrameEpoch(frame, key)` assignment itself.
+
+- **File(s)**: _Log.md
