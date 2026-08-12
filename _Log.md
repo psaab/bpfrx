@@ -70077,3 +70077,89 @@ Every RED above is an assertion failure, not a build break.
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-12 — #4983: bind the HOST-INBOUND (LocalMiss) ingress stamp
+
+- **Timestamp**: 2026-08-12
+- **Action**: Close the last unbound production stamp site on PR #6928. A
+  per-site mutation matrix at 0e5d35f11 found that reverting the LocalMiss
+  install's `ingress_ifindex` / `ingress_vlan_id` to `0`
+  (`poll_descriptor/mod.rs`, the `local_metadata` literal) left the whole Rust
+  suite GREEN at 4257/4257, while the same loop applied to the ForwardFlow
+  install and to the `build_missing_neighbor_seed` call site both went RED —
+  so the green was a real "nothing binds it", not a stale-binary artifact.
+  `tests_session_ingress_identity.rs` had zero occurrences of `localmiss` /
+  `local_miss` / `install_helper`: no test drove the host-inbound install path
+  at all, in a PR whose claim is that every forward session carries a true
+  ingress identity. Host-bound flows (management SSH, BGP, syslog-TCP) are
+  exactly the population an operator filters by interface when the firewall
+  itself is the endpoint.
+- **Fix**: new `poll_descriptor_local_miss_install_stamps_ingress_binding_4983`
+  drives ONE host-bound TCP SYN through the real
+  `poll_binding_process_descriptor` body — dst is the ingress unit's OWN
+  address, so the session-miss resolution is `LocalDelivery` and the poll takes
+  `install_helper_local_session_on_miss` -> `publish_bpf_conntrack_entry` — and
+  asserts the installed `SessionOrigin::LocalMiss` metadata. The fixture adds a
+  THIRD LAN unit `reth2.70` on its own trunk: {parent ifindex 7, VLAN 80},
+  logical ifindex 17. Every number is disjoint from every other value the stamp
+  could have been copied from: 7 != 0/1 (no default satisfies it), 7 != 80 (a
+  transposition is RED), 7 != 17 (stamping the resolved LOGICAL unit is RED),
+  7 is neither zone id, and {7,80} is neither the transit fixture's {11,50} nor
+  its egress sibling's {11,80} — so no single constant satisfies this test and
+  the transit test at once. VLAN 80 is deliberately REUSED from reth0.80 on a
+  different parent: the ingress map is keyed by the {parent, VLAN} PAIR, so
+  this separates "recorded the pair it arrived on" from "found whichever unit
+  carries VLAN 80". Fixture liveness is asserted before the metadata
+  (`dbg.local == 1`, exactly one installed session, the binding resolves to the
+  lan logical unit), so a fixture that stopped admitting the flow or started
+  taking a transit arm is RED, not vacuously green.
+- **Validation**: per-site mutation, one cell each, full `cargo test --release`.
+  Cell A (`ingress_ifindex: 0` + `ingress_vlan_id: 0` at the LocalMiss literal)
+  rc=101, and the ONLY failure is the new test —
+  "assertion `left == right` failed: the host-local session must record the
+  ifindex of the binding its first packet arrived on ... left: 0 right: 7";
+  the transit, reverse-companion and neighbor-seed tests stay GREEN, so the
+  fixture is distinguishing rather than a restatement. Cell B (restore the
+  ifindex, zero ONLY `ingress_vlan_id`) rc=101 with "... must record the
+  ingress 802.1Q VID ... left: 0 right: 80", proving the VLAN half binds
+  independently of the ifindex half rather than hiding behind the first
+  assertion. Restored: `cargo test --release` rc=0, 4382 passed / 0 failed
+  (4258 in the main binary, +1 vs the 4257 baseline);
+  `go test ./pkg/cli/... ./pkg/dataplane/...` rc=0.
+- **Site-enumeration completeness**: re-derived the population list rather than
+  trusting it. `SessionMetadata {` across `userspace-dp/src` yields 11 literal
+  sites; two (`ha/session_import.rs`, `worker/loop_body/mod.rs`) are inside
+  `#[cfg(test)]` blocks. The nine live ones are the four stamped/deliberate-zero
+  poll populations plus `shared_ops` (synthesized reverse companion),
+  `server/helpers/session_sync.rs` (peer-synced), `tunnel.rs` (host-outbound
+  GRE), `flow_cache.rs` (descriptor seed), and `session_glue/promote.rs` (which
+  MUTATES an existing metadata and preserves the pair). Cross-checked against
+  every session install site (`install_with_protocol_with_origin` /
+  `upsert_synced_session` / `promote_synced_with_origin`) and every
+  `publish_bpf_conntrack_entry` call site, plus a grep for any direct write to
+  `.ingress_ifindex` / `.ingress_vlan_id` (there are none outside the
+  literals). NAT64 and fabric-redirect ride the ordinary ForwardFlow install;
+  there are no ALG child/pinhole session installs. No FIFTH site exists. The
+  `tunnel.rs` zero is confirmed correct at its source: `local_origin_packet_meta`
+  builds its `UserspaceDpMeta` with `..UserspaceDpMeta::default()`, so there is
+  no ingress binding to record.
+- **Reverse-companion rationale verified**: the documented claim that the
+  reverse row's `0` never reaches an interface filter holds. All eight
+  production `matchesV4`/`matchesV6` call sites in `pkg/cli` skip
+  `val.IsReverse != 0` immediately before the matcher (`cli_show_flow.go`
+  417/544/798/837 behind guards at 414/541/795/834; `cli_clear.go`
+  356/404/494/532 behind guards at 353/401/491/529), and the `In: ... If:`
+  display closures `printV4`/`printV6` are invoked only from inside those same
+  guarded callbacks. In `pkg/grpcapi`, `sessionFilter.matchV4`/`matchV6`
+  (`server_sessions.go` 549/594) reject `IsReverse != 0` as their FIRST
+  statement, ahead of the `ifaceFilter` arm, covering all twelve call sites;
+  that surface reads `f.zoneIfaces[val.IngressZone]` and never touches
+  `IngressIfindex` at all.
+- **Docs**: the zero-population list is UNCHANGED — this fold adds coverage of
+  an already-stamped site, it does not move a site between populations, so
+  `pkg/dataplane/types.go` and `session/entry.rs` need no edit.
+  `session/README.md` gains one paragraph recording that all three stamping
+  sites now carry a per-site fail-on-revert test in
+  `tests_session_ingress_identity.rs`.
+- **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/README.md, _Log.md

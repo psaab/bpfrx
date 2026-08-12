@@ -22,6 +22,16 @@
 // have to separate: the ifindex alone names the parent — shared by both units
 // — so only the {ifindex, VLAN} PAIR names the unit the flow arrived on.
 //
+// THREE production stamp sites reach this file, one test each, plus the
+// deliberate zero on the fourth:
+//   - the TRANSIT forward install (`poll_descriptor` ForwardFlow arm);
+//   - the HOST-INBOUND install (`poll_descriptor` LocalMiss arm) — the flows
+//     addressed to the firewall itself (management, BGP, syslog), driven at
+//     the bottom of this file on a THIRD binding whose numbers are disjoint
+//     from the transit fixture's, so no single constant satisfies both;
+//   - the MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`);
+//   - and the REVERSE companion, whose 0 is asserted as an over-reach guard.
+//
 // Sibling `#[path]` test module loaded from afxdp/mod.rs, mirroring the #4840
 // split; helpers come from afxdp/tests_support.rs.
 #![allow(unused_imports)]
@@ -331,5 +341,208 @@ fn poll_descriptor_missing_neighbor_seed_stamps_ingress_binding_4983() {
     assert_eq!(
         metadata.ingress_vlan_id, INGRESS_VLAN_ID,
         "the missing-neighbor seed must record the ingress 802.1Q VID too"
+    );
+}
+
+/// The HOST-INBOUND ingress unit under test: `reth2.70`, VLAN 80 on the
+/// physical trunk `ge-0-0-3` (parent ifindex 7), in zone `lan`, owning
+/// 10.0.70.1. A TCP SYN addressed to that address resolves `LocalDelivery`
+/// through `ingress_interface_local_resolution_on_session_miss` and installs a
+/// `SessionOrigin::LocalMiss` session.
+///
+/// Every one of these three numbers is DISTINCT from every other number the
+/// stamp could plausibly have been copied from, so the assertions below can
+/// tell "stamped from the frame's binding" apart from "stamped from something
+/// else that happened to be in scope":
+///   - 7 is not 0 and not 1 (no zero/one default can satisfy it);
+///   - 7 != 80, so a transposition of the ifindex and VLAN halves is RED;
+///   - 7 != 17, so stamping the RESOLVED LOGICAL unit instead of the binding
+///     the frame arrived on is RED;
+///   - {7, 80} is neither of the transit fixture's {11, 50} (ingress) or
+///     {11, 80} (egress sibling), so no single constant satisfies this test
+///     and `poll_descriptor_transit_install_stamps_ingress_binding_4983`
+///     at once;
+///   - 7 is not `TEST_LAN_ZONE_ID` (1) or `TEST_WAN_ZONE_ID` (2), so a zone
+///     re-derivation is RED.
+const LOCAL_PARENT_IFINDEX: i32 = 7;
+const LOCAL_VLAN_ID: u16 = 80;
+const LOCAL_LOGICAL_IFINDEX: i32 = 17;
+
+/// `ingress_identity_snapshot()` plus a THIRD LAN interface — `reth2.70`, a
+/// VLAN unit on its own physical trunk (parent ifindex 7) — that owns a host
+/// address of its own. Adding it to the same zone keeps the #4983 premise
+/// intact (zone `lan` now holds THREE interfaces, so the ingress zone
+/// identifies no single interface) while giving the host-inbound flow a
+/// binding that is distinct from both transit units.
+///
+/// Note the VLAN id 80 is deliberately the SAME as the fixture's WAN egress
+/// unit reth0.80 while the parent differs: the ingress map is keyed by the
+/// `{parent ifindex, VLAN}` PAIR, so this proves the stamp records the pair
+/// this frame arrived on and not "whichever unit carries VLAN 80".
+fn local_miss_identity_snapshot() -> crate::ConfigSnapshot {
+    let mut snapshot = ingress_identity_snapshot();
+    snapshot.interfaces.push(crate::InterfaceSnapshot {
+        name: "reth2.70".to_string(),
+        zone: "lan".to_string(),
+        linux_name: "ge-0-0-3.80".to_string(),
+        ifindex: LOCAL_LOGICAL_IFINDEX,
+        parent_ifindex: LOCAL_PARENT_IFINDEX,
+        vlan_id: LOCAL_VLAN_ID as i32,
+        // Same RG as the fixture's other LAN units so the shared
+        // `txn_ha_state()` placement owns this ingress too.
+        redundancy_group: 2,
+        hardware_addr: "02:bf:72:00:70:07".to_string(),
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "10.0.70.1/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    });
+    snapshot
+}
+
+/// Push ONE TCP SYN addressed to the firewall's OWN 10.0.70.1 through the real
+/// poll body, ingressing on `reth2.70` ({parent 7, VLAN 80}). The dst is that
+/// unit's own primary address, so the session-miss resolution is
+/// `LocalDelivery` and the poll takes the host-inbound install arm
+/// (`install_helper_local_session_on_miss` -> `publish_bpf_conntrack_entry`).
+/// Returns the session table the poll installed into.
+///
+/// Asserts the fixture is live before returning — the binding must resolve to
+/// the LAN logical unit, the packet must actually take the LocalDelivery arm
+/// (`dbg.local`), and exactly one session must be installed. Without those a
+/// fixture that quietly stopped admitting the flow, or that started taking the
+/// transit arm, would make the metadata assertion vacuous instead of RED.
+fn run_local_miss_identity_flow() -> SessionTable {
+    let forwarding = build_forwarding_state(&local_miss_identity_snapshot());
+    assert_eq!(
+        crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
+            &forwarding,
+            LOCAL_PARENT_IFINDEX,
+            LOCAL_VLAN_ID
+        ),
+        Some(LOCAL_LOGICAL_IFINDEX),
+        "fixture must map parent 7 / VLAN 80 -> the reth2.70 logical unit"
+    );
+    assert_eq!(
+        forwarding
+            .ifindex_to_zone_id
+            .get(&LOCAL_LOGICAL_IFINDEX)
+            .copied(),
+        Some(TEST_LAN_ZONE_ID),
+        "reth2.70 is in zone lan"
+    );
+    assert_ne!(
+        LOCAL_PARENT_IFINDEX, LOCAL_LOGICAL_IFINDEX,
+        "the binding the frame arrives on must differ from the resolved \
+         logical unit, or 'stamped the binding' and 'stamped the logical \
+         unit' produce the same number and the assertion cannot separate them"
+    );
+
+    // Host-bound: dst is reth2.70's OWN address, so the miss-path resolution is
+    // LocalDelivery. Port 179 matches the other host-inbound pins; the fixture
+    // zone carries `host-inbound-traffic system-services any-service`, so
+    // admission is not the thing under test here.
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 70, 102),
+        Ipv4Addr::new(10, 0, 70, 1),
+        12345,
+        179,
+        TCP_FLAG_SYN,
+    );
+    // As in the transit flow: the shim strips the 802.1Q tag and conveys the
+    // VID out of band in `meta.ingress_vlan_id`, so the frame stays untagged.
+    let mut meta = txn_meta_v4(
+        LOCAL_PARENT_IFINDEX as u32,
+        TCP_FLAG_SYN,
+        (frame.len() - 14) as u16,
+    );
+    meta.ingress_vlan_id = LOCAL_VLAN_ID;
+
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LOCAL_PARENT_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("ge-0-0-3");
+    let ha_state = txn_ha_state();
+    let mut sessions = SessionTable::new();
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert_eq!(
+        dbg.local, 1,
+        "the host-bound SYN must take the LocalDelivery arm; if it took a \
+         transit arm instead this test would be re-pinning the already-bound \
+         forward install"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the admitted host-bound SYN must install exactly one host-local \
+         session (no reverse companion on this path); without it the metadata \
+         assertions below are vacuous"
+    );
+    sessions
+}
+
+/// #4983 PRODUCER fail-on-revert (HOST-INBOUND LocalMiss install). The
+/// host-local session the poll installs must carry the {ifindex, VLAN} of the
+/// binding the SYN actually arrived on — parent 7, VLAN 80.
+///
+/// This is the fourth and last session-metadata construction site that reaches
+/// the conntrack map, and it was the only one no test drove: reverting its
+/// stamp to 0 left the whole Rust suite green while the transit and
+/// neighbor-seed reverts both went RED. A host-local session is exactly the
+/// population an operator reaches for when a management/BGP/syslog flow to the
+/// firewall itself misbehaves, and on a multi-interface zone the zone fallback
+/// answers with every sibling.
+///
+/// RED on reverting `poll_descriptor/mod.rs`'s `local_metadata` to
+/// `ingress_ifindex: 0` / `ingress_vlan_id: 0`.
+#[test]
+fn poll_descriptor_local_miss_install_stamps_ingress_binding_4983() {
+    let sessions = run_local_miss_identity_flow();
+    let mut host_local = Vec::new();
+    sessions.iter_with_origin(|_key, _decision, metadata, origin| {
+        if origin == SessionOrigin::LocalMiss {
+            host_local.push(metadata.clone());
+        }
+    });
+    assert_eq!(
+        host_local.len(),
+        1,
+        "the host-bound SYN must install exactly one LocalMiss session (if it \
+         installs none, this test proves nothing)"
+    );
+    let metadata = &host_local[0];
+    assert!(
+        !metadata.is_reverse,
+        "the host-local install is a FORWARD session"
+    );
+    assert_eq!(
+        metadata.ingress_ifindex, LOCAL_PARENT_IFINDEX as u32,
+        "the host-local session must record the ifindex of the binding its \
+         first packet arrived on (RED on revert: every firewall-bound session \
+         stamps 0 and `show/clear security flow session interface <name>` \
+         falls back to the zone, matching every sibling interface of a \
+         multi-interface zone)"
+    );
+    assert_eq!(
+        metadata.ingress_vlan_id, LOCAL_VLAN_ID,
+        "the host-local session must record the ingress 802.1Q VID (RED on \
+         revert: stamping 0 loses the unit half of the identity, so two units \
+         of one trunk NIC alias onto the parent)"
+    );
+    // The ingress ZONE is unchanged by this PR. Pinned here so a future change
+    // that "fixed" the ifindex by rewriting the zone stamp is not mistaken for
+    // this one.
+    assert_eq!(
+        metadata.ingress_zone, TEST_LAN_ZONE_ID,
+        "the host-local session's ingress zone still resolves from the LOGICAL \
+         unit (#3021)"
     );
 }

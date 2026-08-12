@@ -1027,6 +1027,15 @@ an unresolved ARP/NDP, it is published to the conntrack map, and the
 pending-neighbor retry sweep never re-installs it — so it is stamped from the
 frame's `meta` exactly like the two policy-admitted install sites.
 
+That leaves exactly THREE production sites that stamp the pair — the TRANSIT
+forward install and the HOST-INBOUND (`LocalMiss`) install, both in
+`afxdp/poll_descriptor`, plus the missing-neighbor seed. Each has its own
+fail-on-revert test in `afxdp/tests_session_ingress_identity.rs`, driven
+through the real `poll_binding_process_descriptor` body on a binding whose
+{ifindex, VLAN} is distinct from the other two fixtures', so reverting any ONE
+site to `0` reddens exactly its own test. The reverse companion's deliberate
+`0` is pinned by an over-reach test in the same module.
+
 A NON-ZERO ifindex the running config cannot name (an interface deleted since
 install, a tunnel/fabric ingress with no config unit) falls back the same way.
 
