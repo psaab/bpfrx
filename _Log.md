@@ -1,3 +1,47 @@
+## 2026-08-05 — #6829 round 9: the assign-half guard was a clean miss at BOTH sites
+
+- **Timestamp**: 2026-08-05 (fix/5797-syslog-selector-failclosed, PR #6829)
+- **Action**: Bind the `haveFacility` assign-half guard with per-site tests in
+  pkg/cli and pkg/daemon. No production change.
+- **File(s)**: `pkg/cli/syslog_facility_checked_6829_test.go` (new subtests),
+  `pkg/daemon/syslog_facility_default_6829_test.go` (new)
+
+`haveFacility` keeps a stream naming NO facility on the constructor default
+`FacilityLocal0` (16) instead of overwriting it with the zero value of the
+`facility` local (0 = `FacilityKern`). Forcing `if haveFacility` to
+`if true || haveFacility` at both sites left pkg/cli, pkg/daemon AND
+pkg/logging entirely green. Dropping the guard outright does not compile
+(`declared and not used`) — a build break is not an assertion, so the
+always-true form is the one that proves anything.
+
+The existing unmapped-facility subtest looks like it covers this and does not:
+`ParseFacilityChecked` returns `FacilityLocal0` for an unknown name, so its
+`Facility == FacilityLocal0` assertion holds whether the guard runs or not. The
+value coincides; the check cannot fail for this failure mode. Every other
+subtest in the file passes a NON-empty facility, so `haveFacility` is true in
+all of them.
+
+Per-site mutation matrix — the guard is duplicated across two packages, so one
+test binding both would leave either free to drift:
+
+| Mutation | pkg/cli test | pkg/daemon test |
+|---|---|---|
+| baseline | ok | ok |
+| guard always-true in pkg/cli ONLY | FAIL | ok |
+| guard always-true in pkg/daemon ONLY | ok | FAIL |
+
+Under the pkg/cli mutation the failing subtest is the unset case reading
+`Facility = 0 (FacilityKern)`; the `named facility still overrides` positive
+control PASSES, so the failure is the guard and not a hardcode.
+
+Impact: receivers filter on facility and kern is conventionally reserved for
+kernel messages, so a silent local0 -> kern shift sends every record from a
+facility-less stream to the wrong bucket while `show system syslog` still
+reports the stream as configured. The daemon site is the path the running
+daemon takes; pkg/cli is the local-console commit mirror.
+
+Validation: `go test ./pkg/cli/ ./pkg/daemon/ ./pkg/logging/ -count=1` all ok;
+`gofmt -l` clean on both test files.
 ## 2026-08-06 — #5718 round 7: two obligations that could never be paid
 
 - **Timestamp**: 2026-08-06 (fix/5718-ha-hardening, PR #6825)
@@ -2757,6 +2801,459 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   `pkg/config/types_security.go`,
   `pkg/config/compiler_application_term_icmp_dup_6766_test.go`,
   `pkg/config/README.md`, `docs/pr/6766-inline-icmp-dup/plan.md`, `_Log.md`
+## 2026-08-05 — #6829 round 8: apply the ordering doctrine at the two sites that did not have it
+
+- **Timestamp**: 2026-08-05 (fold/6829-r3, PR #6829)
+- **Action**: Four items.
+  **1. Ordering at the audit + CLI sites.** The rationale I wrote at the
+  HOST site — classify the facility BEFORE constructing the client, because
+  construction dials and an unmappable facility is the one diagnosis that
+  does not depend on the network being up — was applied at 1 of 3 sites.
+  The other two classified BELOW the `client == nil` continue, so a stream
+  whose host does not resolve was skipped and the operator was never told
+  the facility was ALSO unmappable.
+  Measured before changing anything: `host 192.0.2.10` constructs fine (1
+  client); an unresolvable name returns `nil, err` from the UDP arm and
+  installs ZERO. That is the fixture the property needs.
+  SPLIT, not moved, and this is the load-bearing part — the question the
+  brief asked to answer before committing. **What the old position supplied
+  besides ordering:** `client` is guaranteed non-nil there precisely
+  BECAUSE the nil case already `continue`d. Hoisting the whole block would
+  put `client.Facility` on a pointer that does not exist yet — the same
+  trap that panicked a prescribed hoist on another PR this week. **What
+  supplies it now:** nothing changed for the assign half. Only the COMPUTE
+  half moved (it needs nothing from `client`); the ASSIGN half stays below
+  the same `continue`, taking the same guarantee from the same source. A
+  `haveFacility` bool preserves the original conditional assignment so a
+  stream with no facility keeps the constructor default rather than being
+  overwritten with a zero value.
+  **2. Two vacuous unmapped cells.** `len(cs) == 1 && cs[0].Facility != ...`
+  evaporates when nothing is installed. Replaced with a `t.Fatalf` on the
+  count — which binds a real dimension, "forwarding is deliberately NOT
+  withheld" — and left the value check in place but documented as NOT
+  discriminating: `FacilityLocal0` is the constructor default, so on an
+  unmapped facility "the substitution ran" and "nothing ran" are the same
+  number. Rather than assert a non-default value that cannot exist on that
+  path, added a two-stream subtest (one unmappable → local0, one mapped →
+  auth) asserting the two DIFFER. Dropping the assign half puts both on the
+  default, which is what the single-stream cell cannot see.
+  **3. A comment this round's own delta contradicted.** The CLI test header
+  said the test "captures the log rather than inspecting the client"; the
+  previous round added exactly that inspection. Rewritten to say what is
+  true now — the log capture binds the CONVERSION, the client inspection
+  binds the ASSIGNMENT — and to record that the old sentence stopped being
+  true when the inspection was added.
+  **4. Two numbers that no longer described the code.** The corpus is 553
+  at HEAD, not ~539 (539 is the count EXCLUDING the widening, which cannot
+  be quoted beside "the widening added 14"); verified empirically at 553.
+  And the moved-table tripwire's message claimed the corpus "no longer
+  self-samples" — measured false: moving the table to a package-level var
+  in the same file also reds, and there the GenDecl walk still samples every
+  name. Reworded to what it actually detects; it fails closed either way and
+  the remediation instruction was already right.
+- **Validation**: two mutations, snapshot-and-write-back with byte-for-byte
+  verify, each required to compile.
+  R1 (ordering reverted at BOTH sites) → RED on exactly the two new
+  `warns_even_when_client_construction_fails` subtests and nothing else, so
+  the new emission is not unconditional.
+  R2 (assign half dropped at BOTH sites) → RED on the mapped cells AND the
+  new two-stream cells, so the two-stream construction discriminates.
+  `go vet ./...` rc=0. `go test ./... -count=1` rc=0, 59 ok, zero FAIL,
+  real exit codes captured to files (no pipes).
+  `daemon_system.go` grew 2076 → 2103, so `go test ./pkg/refactoraudit/
+  -count=1` was run explicitly and uncached: rc=0.
+- **File(s)**: `pkg/daemon/daemon_system.go`, `pkg/cli/apply.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`,
+  `pkg/cli/syslog_facility_checked_6829_test.go`,
+  `pkg/logging/parse_facility_source_6829_test.go`, `_Log.md`
+
+## 2026-08-05 — #6829 fold round 7: the widening I adopted killed a tripwire
+
+- **Timestamp**: 2026-08-05 (fold/6829-r3, gate at f4da2fc1b — MINOR, no blockers)
+- **Action**: Six items. The first is the important one, and it is a defect in
+  a patch I verified and adopted.
+    - **F1 — the A1 widening made the zero-literal tripwire unreachable.**
+      `import ( ... )` IS an `*ast.GenDecl` and every `ImportSpec.Path` is a
+      STRING `BasicLit`, so once the package-level walk runs, `out` always holds
+      this file's ~11 import paths plus its package-level `errors.New` strings.
+      `len(out) == 0` could never be true again. Reproduced at HEAD before
+      fixing: moving the mapping to a `var` in a NEW file and reducing
+      `ParseFacility` to a lookup passed SILENTLY (rc=0), where the same
+      mutation RED at the parent with "extracted zero string literals". So the
+      widening closed one escape and converted a loud `t.Fatalf` into silence
+      for another, while the helper's doc still claimed "a refactor cannot
+      quietly shrink the corpus". Fixed by counting the BODY contribution
+      separately (`bodyLits := len(out)` before the package-level walk).
+      Filtering `gd.Tok != token.IMPORT` is NOT sufficient — the package-level
+      `errors.New` strings alone keep `out` non-empty and the moved-table
+      mutation still escapes; the gate measured that and I did not re-derive it.
+    - **The lesson, which is mine to carry**: I verified the prescribed patch
+      against the escape it targeted and it worked. Neither I nor the lead asked
+      what it BROKE. **A prescribed fix needs a regression check against the
+      guards it touches, not only a check against the escape it closes.** This
+      round runs both directions.
+    - **F2** — the compute/assign-across-the-dial value was bound at 1 of the 3
+      sites the round-6 delta put into that shape. Added
+      `EventReader.SyslogClients()` (sibling of the existing
+      `SyslogClientCount`, which cannot observe WHICH facility was installed)
+      and bound the value on the audit stream and in the CLI test, where the
+      clients were already returned and every caller discarded them.
+    - **F3** — inserting `FacilityIsWildcard` immediately below
+      `ParseFacilityChecked`'s doc block reassigned that doc to it. Third
+      instance of this class today. Fixed — and I reproduced it once while
+      fixing it, by re-anchoring below `ParseFacility`'s doc instead of above
+      it, which moved the same defect one function over. Verified with
+      `go doc` on all THREE functions rather than the two I had changed.
+    - **F4** — the scale paragraph still said the AST contributes "zero" names
+      the table does not hold; it is 14 after the widening, and sitting next to
+      the widening it read as "this change was inert", the opposite of what
+      round 6 established.
+    - **F5** — regenerated `docs/refactoring-audit-current.txt` (2060 -> 2076).
+    - **F6** — the round-6 `File(s)` list named a round-FIVE file; corrected in
+      place with a note rather than silently.
+- **Validation**, each `go vet ./<pkg>/` then `go test -count=1 -run '6829'`:
+  moved-table mutation now **rc=1** (tripwire restored) where it was rc=0 at
+  `f4da2fc1b`; and the REGRESSION check the F1 lesson demands — both escapes A1
+  closed are still caught, A1-const rc=1 and E1-map rc=1. vet=0 throughout.
+- **File(s)**: `pkg/logging/parse_facility_source_6829_test.go`,
+  `pkg/logging/syslog.go`, `pkg/logging/ringbuf.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`,
+  `pkg/cli/syslog_facility_checked_6829_test.go`,
+  `docs/refactoring-audit-current.txt`, `_Log.md`
+
+## 2026-08-05 — #6829 fold round 6: the residual was a scope choice, and two call sites did not satisfy the shipped contract
+
+- **Timestamp**: 2026-08-05 (fold/6829-r3, gate at 8e994753b — MINOR, no blockers)
+- **Action**: Five items. Two substantive.
+    - **A1 — the corpus walk was scoped to `fn.Body` while already holding the
+      whole `*ast.File`.** A `const auditLogFacility = "audit-log"` consulted
+      before the switch SLIPPED; the identical mutation with a bare literal
+      RED. So the escape was the IDENTIFIER, not the mutation — verified both
+      ways before adopting the prescribed patch, per the standing rule that a
+      prescribed fix is a hypothesis. Widened to also walk the file's
+      package-level `GenDecl`s. **That also closed the residual this file
+      shipped as "the realistic one"** — a package-level map consulted before a
+      RETAINED switch. It was never a property of the approach, only of the
+      scope, so the residual list was re-derived and the closed entries deleted
+      rather than left reading as considered-and-kept.
+    - **A2 — the PR shipped a contract two of its three call sites did not
+      satisfy.** `syslog.go` says callers "MUST use this form"; the security/
+      audit stream wiring (`daemon_system.go`) and the CLI commit mirror
+      (`cli/apply.go`) were still on the unchecked `ParseFacility`. My own
+      dismissal — enum-gated — holds on the STRICT path only:
+      `configstore.Store` downgrades the gate to a warning on `Load` (boot) and
+      `SyncApply` (HA peer sync), the same reachability class the severity belt
+      exists for. Identical class, opposite treatment. Both converted, and BOTH
+      now bound by tests — the first mutation run showed the daemon conversion
+      RED but the CLI one rc=0, i.e. converted-but-unbound, so a `pkg/cli` test
+      was added rather than shipping an unbound production change.
+    - **A3 — this PR made the canonical Junos form warn, with text false for
+      it.** `set system syslog host <ip> any <sev>` is the repo's own fixture,
+      and `any` names no facility on purpose, so "records will carry a facility
+      the configuration does not name" is literally false. Added
+      `logging.FacilityIsWildcard` as the single shared definition and applied
+      it at all three warn sites; `any` was already in the unmapped corpus, so
+      the not-known half stays pinned and a new daemon test pins the no-warn
+      half.
+    - **A4** — added the mapped-facility + failing-dial cell, so the dial-fail
+      test no longer has its only `SourceAddress` case coincide with its only
+      unmapped facility.
+    - **A5** — the facility VALUE reaching the wire was bound by nothing.
+      Added `SyslogSlogHandler.Clients()` and asserted the installed
+      `Facility` for a mapped and an unmapped case.
+    - **NITs** — the `"severity newline"` fixture is relabelled: a literal
+      newline is reachable on NEITHER path, and the old label re-taught the
+      misconception the belt's own comment exists to correct.
+- **Validation** — 9 cells, each `go vet ./<pkg>/` then
+  `go test -count=1 -run '6829' ./<pkg>/`; rc=1 means RED, vet=0 means the RED
+  is an assertion and not a build break. All nine: vet=0 rc=1.
+  A1 const-identifier · E1 partial map · M3 escaped literal · M2 pre-switch
+  accept · A5a drop `facility = f` · A5b drop `c.Facility = facility` ·
+  A3 remove wildcard suppression · A2a security stream unchecked ·
+  A2b cli mirror unchecked.
+  Two process notes: the first A5b attempt reported vet=1 — an unused-variable
+  BUILD BREAK, so that red was invalid and was redone as `_ = facility`; and my
+  first `pkg/cli` test failed on unmutated code because
+  `return buf.String(), build(cfg)` evaluates the buffer BEFORE the call, so it
+  always captured "". Both were my errors, caught by reading the vet code and
+  the failure rather than adjusting the assertion.
+- **File(s)**: `pkg/logging/syslog.go`,
+  `pkg/logging/parse_facility_source_6829_test.go`,
+  `pkg/logging/slog_handler.go`, `pkg/logging/README.md`,
+  `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`, `pkg/cli/apply.go`,
+  `pkg/cli/syslog_facility_checked_6829_test.go`, `_Log.md`
+  (#6829 F6: this list previously also named
+  `parse_facility_checked_5797_test.go`, which was round FIVE's file and not in
+  the round-6 delta — checked against `git show --stat`.)
+
+## 2026-08-05 — #6829 fold round 5: dangling refs, an uncorrected artifact, an unrunnable repro
+
+- **Timestamp**: 2026-08-05 (fold/6829-r3, gate at 44af059d5 — MINOR, no blockers)
+- **Action**: Four fixes, all of them the PR's own failure species pointed inward.
+    - **F1 — five references to three tests round 4 DELETED.**
+      `parse_facility_checked_5797_test.go` still named
+      `TestParseFacilityMappingTableMatchesSource_6829` and
+      `TestParseFacilityCheckedCoversEveryParseFacilityCase_6829` at `:16`,
+      `:161`, `:164`, `:195-196`, and described a mechanism that no longer
+      exists ("reads ParseFacility's case labels from the source"). Confirmed
+      undefined at HEAD. Retargeted to the behavioural tests that DO exist, with
+      a parenthetical recording that the source-walking pair was replaced in
+      round 4 and why — so the next reader is not left wondering whether the
+      rename lost something.
+    - **F2 — the errno retraction reached `_Log.md` and not the artifact.**
+      `syslog_selector_render_5797_test.go` was byte-identical to `767ee3696`
+      and still claimed "no sandbox dependency", the exact sub-claim retracted
+      in round 4. The caveat now lives in the shipping comment: the errno is
+      environment-dependent, and the test survives it because its premise
+      asserts only that construction FAILED. Second time this session a
+      correction landed in the log while the comment kept the wrong version.
+    - **F3 — a cited invocation that cannot be run.** `_Log.md` cited
+      `go test -run TestProbeErrno6829`; that probe was ad-hoc and never
+      committed, so `git grep` finds it at no head. This is the failure mode of
+      the "name the invocation" habit adopted in round 4: an invocation naming a
+      nonexistent thing is worse than none, because it reads as reproducible.
+      The probe source is now inlined in the entry so the measurement is
+      genuinely re-runnable.
+    - **F4 — an escape OUTSIDE the stated residual.** The corpus builder did
+      `lit.Value[1:len-1]`, stripping delimiters WITHOUT unquoting, so
+      `"audit\x2dlog"` — a bare literal that does appear in the body, which the
+      residual therefore promised was sampled — entered the corpus as 12 source
+      characters and never as the 9-character runtime value. Switched to
+      `strconv.Unquote`.
+    - **E1 named in the file with its asymmetry**, per the gate: a package-level
+      map consulted before a RETAINED switch is the realistic future refactor
+      and slips; a WHOLESALE move trips the zero-literal `t.Fatalf` loudly. Both
+      halves verified rather than asserted (below). Also recorded the corpus
+      scale — ~539 names, 14 discriminating, AST contributes zero new ones at
+      HEAD — so the framing cannot be read as broader than it is.
+- **Validation**, each with the command that produced it, all
+  `go test -count=1 -run '6829' -v ./pkg/logging/` unless noted:
+  M3 pre-switch return keyed on `"audit\x2dlog"` — REDs BOTH assertions now
+  that the corpus unquotes (16 vs 21); this is the case F4 closed.
+  E1 partial (map before a retained switch) — rc=0, SLIPS, exactly as the file
+  now says.
+  E5 wholesale (switch replaced, zero literals) — REDs both via
+  `t.Fatalf` "extracted zero string literals", the loud half of the asymmetry.
+  `go vet ./pkg/logging/ ./pkg/daemon/` -> 0 under every mutation. Restored by
+  pristine-snapshot write-back plus `touch`.
+- **File(s)**: `pkg/logging/parse_facility_source_6829_test.go`,
+  `pkg/logging/parse_facility_checked_5797_test.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`, `_Log.md`
+
+## 2026-08-05 — #6829 fold round 4: the AST guards bound the switch, not the function
+
+- **Timestamp**: 2026-08-05 (fold/6829-r3, gate at 767ee3696)
+- **Action**: MAJOR. All three round-3 guards asserted over an AST walk of
+  `ParseFacility`'s SWITCH, so a short-circuit placed BEFORE the switch was
+  invisible to every one of them. Reproduced first: inserting
+  `if name == "audit-log" { return FacilityLocal5 }` ahead of the switch leaves
+  `ParseFacilityChecked("audit-log") == (FacilityLocal0, false)` while
+  `ParseFacility` returns `FacilityLocal5` (21 vs 16 — measured), and the whole
+  `pkg/logging` package stayed green. That is a live over-rejection: a config
+  naming the facility draws a spurious "unmapped" warning for a name the
+  runtime does map.
+    - **Assertions are now behavioural** — they CALL both functions and compare.
+      A structural check binds only the construct it walks, so widening the walk
+      to "every return" would buy one more mutation shape and stay fragile to
+      the next.
+    - **The enumeration clause the obvious fix misses.** Behavioural assertions
+      still need something to enumerate names, and the natural enumerator is the
+      mapping table. "For every table name assert agreement, and for a name
+      absent from the table assert Checked reports not-known" PASSES the
+      mutation — `Checked("audit-log")` genuinely IS not-known; the defect is
+      that `ParseFacility` maps it. That form was written and run against the
+      mutation before being rejected, not reasoned about: rc=0. The missing
+      clause is that a name absent from the table must ALSO fall through
+      `ParseFacility` to the default, which converts "the table is complete"
+      from an assumption every table-driven test rests on into an assertion one
+      of them makes.
+    - **The AST walk survives only as a corpus contributor** — it supplies names
+      to call with and nothing is asserted about its output. It now collects
+      every string literal in the whole function BODY rather than case labels,
+      so a name special-cased by any construct that mentions it literally is
+      sampled. What is NOT bound is stated in the file: a name special-cased
+      without its literal appearing in the body is not in the corpus.
+- **Validation**, each with the command that produced it:
+  M1 pre-switch return in `ParseFacility` — `go test -count=1 -run '6829' -v
+  ./pkg/logging/` REDs BOTH new assertions (agreement: 16 vs 21;
+  table-completeness: non-default code for an absent name).
+  M2 pre-switch `return FacilityLocal0, true` in `ParseFacilityChecked` — same
+  command REDs the table-completeness assertion (reports KNOWN for a name with
+  no table entry). `go vet ./pkg/logging/` -> 0 under both, so neither RED is a
+  build break. Restored by pristine-snapshot write-back plus `touch`.
+- **File(s)**: `pkg/logging/parse_facility_source_6829_test.go`, `_Log.md`
+
+## 2026-08-05 — #6829 fold round 3: make the drift claim true, un-hide the dial
+
+- **Timestamp**: 2026-08-05 (fold/6829-r3, gate at 453844ca3)
+- **Action**: Gate returned MERGE-NEEDS-MAJOR on four items, all of the same
+  species this PR exists to fight: a comment asserting a mechanism the code does
+  not have. Fixed the claims to match the measurements — and where the claim was
+  worth keeping, built the mechanism so it became true.
+    - **The drift guard did not guard (items 1 and 3, same root cause).** There
+      were THREE hand-maintained copies of one name set: `ParseFacility`'s
+      switch, `ParseFacilityChecked`'s case list, and the test's
+      `parseFacilityMappingTable`. The agreement test iterated the TABLE, so a
+      name added to `ParseFacility` alone was visited by no assertion at all.
+      Reproduced the gate's experiment first: adding `audit-log` to
+      `ParseFacility` left the whole package green. A test cannot reflect over a
+      switch, so `parse_facility_source_6829_test.go` reads the case labels from
+      SOURCE via go/ast (an established convention here — 8 packages already do
+      it) and pins three things against that authority: every `ParseFacility`
+      case is known to `ParseFacilityChecked` with the same code (this is the
+      OVER-REJECTION direction, and reading it from source is what finally
+      completes it — a table-driven test structurally could not), nothing extra
+      is claimed as known, and the hand-written table matches the real case set.
+      The helper fails closed on a missing function, a missing switch, a
+      non-literal case, or an empty extraction, so a refactor cannot quietly
+      turn these into no-ops.
+    - **The host-warning test was non-hermetic AND its comment was false.** It
+      claimed UDP "resolves without a connect"; `NewSyslogClientWithSource`
+      dials, and on UDP a failure returns a NIL client, so
+      `applySystemSyslog`'s `continue` skipped everything after it. Under a
+      restricted runner the test died at construction having asserted nothing.
+      Fixed in production rather than with a test-only seam, because the
+      ordering is a real defect: an operator whose collector is unreachable was
+      never told their facility name is ALSO unmappable — the one diagnosis
+      that does not depend on the network. Classification now runs BEFORE the
+      dial; it reads only config, so it belongs on that side.
+    - **Two `_Log.md` claims overstated.** "500 generated tokens no fixture list
+      can contain" — the corpus is a FIXED seed (5797) with lengths 1-24, so it
+      is reproducible and finite and a list could enumerate it; corrected to
+      what it does rule out. "changed flips so rsyslog restarts" — the test
+      asserts the `changed` return and never calls `applySyslogFiles` or
+      observes `systemctl restart`; corrected to say it asserts the flag that
+      GATES the restart.
+- **Validation**: Preflight build+vet clean; every mutation vet-clean; restores
+  by pristine-snapshot write-back plus `touch`, never `git checkout --`.
+  (1) The gate's own experiment — `audit-log` added to `ParseFacility` only —
+  now REDs three assertions naming the missing coverage, where before the fold
+  it was green.
+  (2) Classification moved back below the dial REDs the new
+  `TestApplySystemSyslogWarnsWhenClientDialFails_6829` (rc=1); the PRE-EXISTING
+  5797 warning test PASSES under that same mutation (rc=0), so the new test is
+  what binds the hoist, not the old one. Both re-measured in #6829 round 4 on
+  this workstation via
+  `go test -count=1 -run '<TestName>$' ./pkg/daemon/`.
+  The dial failure is forced by binding the source to an RFC 5737 address on no
+  local interface. On a host that may create sockets that is EADDRNOTAVAIL —
+  measured, `errors.Is(err, syscall.EADDRNOTAVAIL) == true`, EPERM false. That
+  was an AD-HOC probe, not a committed test, so the earlier citation of
+  `go test -run TestProbeErrno6829` named something that does not exist at any
+  head — an invocation that cannot be run is worse than none, because it reads
+  as reproducible. The probe is reproduced here so the measurement can be
+  re-run: write to `pkg/logging/probe_errno_test.go`
+  ```go
+  package logging
+  import ("errors";"syscall";"testing")
+  func TestProbeErrno(t *testing.T) {
+      _, err := NewSyslogClientWithSource("192.0.2.10", 514, "192.0.2.1")
+      t.Logf("%v EADDRNOTAVAIL=%v EPERM=%v", err,
+          errors.Is(err, syscall.EADDRNOTAVAIL), errors.Is(err, syscall.EPERM))
+  }
+  ```
+  then `go test -count=1 -run TestProbeErrno -v ./pkg/logging/` and delete it.
+  In a sandbox
+  that denies socket CREATION the call fails earlier with EPERM instead, so the
+  errno is environment-dependent and the earlier "EADDRNOTAVAIL immediately"
+  wording was true only of an unsandboxed host. The test does not depend on
+  which: its premise asserts only that client construction FAILED (the
+  "failed to create system syslog client" warning), which holds under either
+  errno, so the hermeticity argument survives the correction.
+  Gates, each with the invocation that produced it:
+  `go test ./pkg/logging/... ./pkg/daemon/...` -> 0;
+  `go test ./...` -> 1 on `pkg/refactoraudit` `TestHeatmapNotStale` first,
+  then 0 after regenerating the heatmap.
+- **Pre-existing red found while gating (not introduced by this fold).**
+  `daemon_system.go` crossed the 2000-LOC tier boundary in THIS PR's own
+  commit — 1889 on master to 2047 at `453844ca3` — without regenerating
+  `docs/refactoring-audit-current.txt`, so the branch has been failing the
+  full Go suite since that commit. Verified by attribution rather than
+  assumed: the gate FAILS at the untouched PR head in a throwaway detached
+  worktree, and PASSES at `origin/master` `ad9591177`. My hoist took the file
+  to 2060 but did not cause the crossing. Regenerated the heatmap as the
+  failure message prescribes; the file now records
+  `[REFACTOR] 2060 pkg/daemon/daemon_system.go`. The regenerated artifact
+  also refreshes LOC numbers for unrelated files (e.g. `compiler_system.go`
+  2157 -> 2583) — those are WITHIN-tier drift that the gate deliberately
+  tolerates, which is why master is green despite them; they are refreshed
+  because the script rewrites the whole file, not because they were failing.
+  Full suite re-run clean afterwards.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `docs/refactoring-audit-current.txt`,
+  `pkg/daemon/syslog_selector_render_5797_test.go`,
+  `pkg/logging/parse_facility_source_6829_test.go`,
+  `pkg/logging/parse_facility_checked_5797_test.go`, `_Log.md`
+
+## 2026-08-05 — #5797 round 2: bind the selector belts at the render site, and correct a threat model that was wrong in the understating direction
+
+- **Timestamp**: 2026-08-05 (fix/5797-syslog-selector-failclosed, PR #6829)
+- **Action**: The round-1 tests proved the PREDICATE
+  (`syslogSelectorTokenSafe`) and the checked parser in isolation; nothing
+  proved the RENDER SITES consult them. Measured, not assumed: with both
+  `if !syslogSelectorTokenSafe(...)` guards deleted the whole suite stayed
+  GREEN, and so did deleting the unmapped-facility warning. Split the
+  desired-drop-in builder out of `applySyslogFiles` as
+  `syslogDropinContents` so the belts are testable at the site that calls
+  them, and added `syslog_selector_render_5797_test.go`: a safe token
+  renders byte-for-byte, an unsafe file/user token is omitted, a drop-in a
+  previous apply wrote for a now-unsafe destination is REMOVED from disk
+  (production pair `syslogDropinContents` -> `reconcileSyslogDropins`
+  against a temp dir) and the `changed` return flips — the flag that GATES
+  the restart; the test asserts the flag, it does not call
+  `applySyslogFiles` or observe `systemctl restart` — and both
+  skips warn while a clean config stays quiet. Same for the daemon side of
+  `ParseFacilityChecked` — `applySystemSyslog` is driven directly and the
+  warning asserted, with mapped names as the negative control.
+  While tracing reachability for those tests, a runnable probe falsified
+  the PR's own threat model. Both `daemon_system.go` and
+  `pkg/logging/syslog.go` claimed the facility name was gated at commit by
+  `config.SystemSyslogFacilities` "via the schema's wildcardNameValidator",
+  making the belt tolerant-load-only defence in depth. That symbol does not
+  exist and neither does that gate: `<facility> <severity>` is a schema
+  WILDCARD whose validator sits on the severity VALUE, so
+  `set system syslog file audit "daemon;*.* /tmp/pwn" info` passes
+  SchemaValidate, compiles, and arrives at the render site verbatim. The
+  facility half of the injection surface is reachable from an ORDINARY
+  operator commit; only the severity half is tolerant-path-only. Corrected
+  every comment carrying the old framing (both belts, the predicate doc,
+  `ParseFacilityChecked`, both test headers, `pkg/logging/README.md`) and
+  pinned the chain end to end in
+  `TestSyslogRenderUnsafeFacilityIsCommitReachable_5797`, whose
+  SchemaValidate assertion is deliberately `must pass` so a future key
+  validator fails the test instead of silently licensing the belt's removal.
+  Three review items folded: the vocabulary test could be satisfied by a
+  hardcoded set of exactly its own fixtures, so
+  `TestSyslogSelectorTokenIsAShapeNotAList_5797` characterizes the
+  predicate exhaustively over all 256 bytes plus 500 generated safe-shaped
+  tokens (fixed seed 5797, lengths 1-24, so the corpus is reproducible and
+  finite — a fixture list COULD enumerate it; what it rules out is the
+  specific hardcoded-set-of-its-own-fixtures shape the review found, not
+  every conceivable list); the unmapped-facility test's
+  hand-written list permitted an unlisted special case, so the corpus is
+  now DERIVED from the mapping table's edit neighbourhood plus the Junos
+  and BSD vocabularies and a generated tail, with its scope limit stated
+  rather than implied; and the "cannot drift" test sampled eight names
+  while discarding the `known` return, so it is replaced by
+  `TestParseFacilityCheckedKnownSetIsExactlyParseFacility_5797`, which runs
+  the full mapping table plus that corpus and asserts BOTH returns.
+- **Validation**: seven-mutation matrix, snapshot-and-write-back restore
+  with a byte-for-byte verify, each mutant required to COMPILE so no RED is
+  a build break. At this head all seven are RED. Negative control at the
+  PR head d4018236 in a throwaway detached worktree: M1 drop file belt,
+  M2 drop user belt, M3 drop both, M5 drop the unmapped warning, and
+  M7 predicate replaced by a hardcoded fixture set were all GREEN there —
+  four escapes the old guard could not see, now closed. M4 checked
+  always-true and M6 predicate relaxed to control-bytes-only were already
+  RED at the old head, confirming those two existing guards were live
+  rather than dead. Full `pkg/daemon`, `pkg/logging`, `pkg/config` suites
+  pass.
+- **File(s)**: `pkg/daemon/daemon_system.go`,
+  `pkg/daemon/syslog_selector_render_5797_test.go` (new),
+  `pkg/daemon/syslog_selector_token_5797_test.go`,
+  `pkg/logging/syslog.go`, `pkg/logging/parse_facility_checked_5797_test.go`,
+  `pkg/logging/README.md`, `_Log.md`
 ## 2026-08-05 — #6865 round 8: stop restating the premise; point at it
 
 - **Timestamp**: 2026-08-05 (fix/5078-syncauth, PR #6865)
@@ -72025,6 +72522,39 @@ break — `go vet` confirmed passing under every revert.
   pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
   _Log.md
 
+- **Timestamp**: 2026-08-05
+- **Action**: #5797 invariant 7 — make an unmappable syslog facility VISIBLE and
+  stop it reaching rsyslog's config grammar; do NOT close the facility name set.
+  STEP-0 found two facts that redirected the work. First, the obvious fix was
+  wrong: `security log stream facility` is already enum-validated against
+  `syslogFacilities`, and reusing that enum for `system syslog` would hard-reject
+  `any` (absent from the list but special-cased by the daemon into the rsyslog
+  wildcard `*`) — i.e. `set system syslog host <h> any info`, ordinary Junos.
+  Second, and decisive: the facility vocabulary itself diverges. Junos writes
+  `authorization` / `kernel` / `interactive-commands`; `ParseFacility` knows only
+  the BSD spellings `auth` / `kern`. A prototype commit gate keyed on the mapped
+  set was built, and its own over-rejection test rejected #5797's OWN worked
+  example (`daemon info; authorization critical;`). That gate was therefore
+  REVERTED rather than shipped: closing the name set first requires deciding the
+  Junos-to-BSD mapping, which changes which facility records go out under —
+  operator-visible, and the deferred half of this issue. Also found: the `file`
+  and `user` destinations never touch `SyslogClient` — the daemon interpolates
+  facility+severity into an rsyslog selector and writes a managed drop-in, and
+  #4902's belts on that exact line cover the file NAME and user TOKEN but not the
+  two selector tokens, so a newline or metacharacter injects rsyslog config on
+  the tolerant path. Shipped: `ParseFacilityChecked` (returns the recognized bit;
+  the substituted code is deliberately unchanged, so no behaviour change) wired
+  into the host client with a warning, and `syslogSelectorTokenSafe`, a SHAPE
+  belt (`[A-Za-z0-9-]`) on the file/user render path that admits the whole
+  legitimate Junos vocabulary — including names the mapper cannot resolve — so it
+  does not pre-empt the mapping decision. Validation: both guards proven RED
+  under isolating mutations with `go vet` clean each time (shape check forced to
+  always-safe → 12 injection sub-tests RED; checked parse forced to always-known
+  → 22 unmapped names RED). Full `go test ./...` exit 0. No Rust files touched,
+  so the cargo leg is unaffected (#6819's flake is not implicated).
+- **File(s)**: pkg/logging/syslog.go, pkg/daemon/daemon_system.go,
+  pkg/logging/parse_facility_checked_5797_test.go,
+  pkg/daemon/syslog_selector_token_5797_test.go, pkg/logging/README.md, _Log.md
 ## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
 
 - **Timestamp**: 2026-08-05
@@ -72371,6 +72901,123 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
   pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
 
+## 2026-08-06 — #6829 fold r3 (hostile-gate F1/F2)
+
+- **Timestamp**: 2026-08-06 01:35 PDT
+- **Action**: Bind the third syslog facility site's DEFAULT INITIALIZER
+  (`applySystemSyslog`), which no test reached; document the bare-`*`
+  facility behaviour change instead of widening the selector belt.
+- **File(s)**: pkg/daemon/syslog_selector_render_5797_test.go,
+  pkg/logging/README.md
+- **Validation**: go build ./... rc=0; go test ./pkg/daemon ./pkg/logging
+  ./pkg/cli ./pkg/config -count=1 rc=0. Mutation `facility :=
+  logging.FacilityDaemon` -> `var facility int` now REDs as an assertion at
+  syslog_selector_render_5797_test.go:547 (Facility = 0 (FacilityKern), want
+  FacilityDaemon (3)); the same mutation left all four packages GREEN before
+  this subtest.
+
+## 2026-08-06 — #6829 fold r4 (position-aware selector grammar)
+
+- **Timestamp**: 2026-08-06 09:20 PDT
+- **Action**: Replace the single `syslogSelectorTokenSafe` byte-allowlist with
+  a POSITION-AWARE grammar (`syslogSelectorAtomSafe` +
+  `syslogSelectorFacilitySafe` + `syslogSelectorSeveritySafe`). The r3 belt
+  was the INTERSECTION of rsyslog's two selector grammars, so it dropped
+  native syntax from each: `auth,authpriv` (rsyslog's multiple-facility comma
+  operator) and a bare `*` in the facility position, plus severity `*` and the
+  `=`/`!`/`!=` priority modifiers. `auth,authpriv` was measured to pass
+  SchemaValidate, compile verbatim, and render nothing at r3 — a
+  strict-commit-clean, rsyslog-valid destination reconciled AWAY on upgrade,
+  not the "loud failure" the r3 README claimed. Facility now accepts empty /
+  `*` / a comma list of nonempty `[A-Za-z0-9-]` atoms; severity accepts empty
+  / `*` / an atom behind an optional `=`, `!` or `!=`. No comma in the
+  severity position: rsyslog defines the comma for facilities "with the same
+  priority pattern" and spells multiple priorities as `;`-joined selectors, so
+  `daemon.info,err` was never valid. Also reworded the three pre-dial
+  unmapped-facility warnings — construction DIALS and can `continue`, so
+  "forwarding under local0" claimed forwarding that may never happen; they now
+  say local0 was SELECTED.
+- **File(s)**: pkg/daemon/daemon_system.go, pkg/cli/apply.go,
+  pkg/daemon/syslog_selector_token_5797_test.go,
+  pkg/daemon/syslog_selector_render_5797_test.go, pkg/logging/README.md,
+  _Log.md
+- **Validation**: `go build ./...` rc=0; `go test ./pkg/daemon ./pkg/logging
+  ./pkg/cli ./pkg/config -count=1` rc=0; `go vet ./pkg/daemon ./pkg/cli` rc=0.
+  Five mutations, each RED as an ASSERTION (never a build break), marker
+  grepped back out of the file before each run:
+  M1a (facility predicate -> old single allowlist): 4 tests RED, e.g.
+  `facility="auth,authpriv" ... rendered NO file drop-in`; every injection
+  guard stayed GREEN (over-reach control).
+  M1b (severity predicate -> old single allowlist): 4 tests RED on `daemon.*`,
+  `daemon.=info`, `daemon.!info`, `daemon.!=info`.
+  M2 (`case c == ';'` admitted to the atom): `TestSyslogSelectorTokenRejects\
+  Injection_5797/statement_separator_alone` and the two render rows RED.
+  NOTE: M2 initially reddened ONLY the byte-exhaustive test and one render
+  row, because every named `;` fixture also carried a `*`, `.` or space and so
+  was rejected four times over. Added ISOLATED one-unsafe-byte rows (`daemon;x`,
+  `auth;authpriv`, `var/log/pwn`, `daemon local7`, `info;y`, `info warning`) so
+  each metacharacter binds on its own rather than being masked by a neighbour.
+  M3 (empty atom accepted): the four malformed-list rows RED at both the
+  predicate and render levels, plus the bare-modifier rows (`!`, `=`, `!=`).
+  M4 (severity delegates to facility — the "reuse one predicate" shape):
+  `TestSyslogSelectorPositionsAreNotInterchangeable_6829` RED in BOTH
+  directions.
+  M5 (`!=` case dropped so `!` strips first): `!=info` / `!=debug` RED.
+
+## 2026-08-06 — #6829 round 3: exhaustive scans for the MULTI-CHARACTER selector contexts
+
+- **Timestamp**: 2026-08-06
+- **Action**: The 0..255 scan added in round 2 constructs
+  `string([]byte{byte(b)})` — ONE byte, no positional syntax — so it is
+  complete by construction only for the unmodified priority and the
+  single-atom facility. Every MULTI-CHARACTER context repeated the masking
+  defect round 2 fixed at the single-byte level: no scan existed behind the
+  `=`/`!`/`!=` priority modifiers, there was no invalid `!=<suffix>` fixture at
+  all, `!=*` (which the grammar accepts) had no positive, and every comma-list
+  negative carried four or five forbidden bytes at once. Added three exhaustive
+  scans plus a one-byte-at-a-time fixture test, and a `!=*` positive.
+- **File(s)**: pkg/daemon/syslog_selector_token_5797_test.go, _Log.md
+- **Validation**: `GOCACHE=/var/tmp/gc-6829h GOTMPDIR=/tmp go build ./...`
+  rc=0; `go test ./pkg/daemon ./pkg/logging ./pkg/cli ./pkg/config -count=1`
+  rc=0; `go test ./pkg/daemon -run 5797 -v` rc=0 with 67 `=== RUN` lines (11
+  top-level); `-run '5797|6829' -v` rc=0 with 124 `=== RUN` (24 top-level);
+  `go vet ./pkg/daemon` rc=0; `go test ./pkg/refactoraudit/...` rc=0.
+  TWO mutations, each confirmed to pass the PRE-round-3 suite and then to go
+  RED as an ASSERTION (never a build break); the production file was restored
+  from a pristine copy and `cmp`-verified plus grepped for the marker before
+  every run.
+  MUT-A (`!=` arm -> `return len(rest) > 2`, i.e. accept ANY nonempty suffix —
+  the escape the reviewer constructed): passed `go test ./pkg/daemon
+  ./pkg/logging ./pkg/cli ./pkg/config -count=1` rc=0 on the round-2 suite.
+  Now RED in `TestSyslogSelectorSeverityModifierSuffixExhaustive_6829`
+  (`severity "!=;" = true, want false: byte 0x3b rode in behind the "!="
+  modifier`) and `TestSyslogSelectorPayloadsOneByteAtATime_6829`
+  (`severity "!=info;" accepted`). The facility scans stayed GREEN — the
+  mutation is severity-side and the guards are scoped, not blanket.
+  MUT-B (facility list members strip `;` before the atom check, but only when
+  the token has >1 member — a list-specific relaxation): also passed the
+  round-2 suite rc=0, because `daemon;x` / `auth;authpriv` have no comma and
+  every existing list negative is rejected for its `*`, `.`, space or `/`
+  regardless of the `;`. Now RED at ALL THREE member positions in
+  `TestSyslogSelectorFacilityListMemberExhaustive_6829` (`facility
+  "priv;log,auth,daemon"` / `"auth,priv;log,daemon"` / `"auth,daemon,priv;log"`
+  `= true, want false`) and on three
+  `TestSyslogSelectorPayloadsOneByteAtATime_6829` rows. The severity scans and
+  every injection guard stayed GREEN.
+  NOTE on scope: a scan over the FIRST member alone would not have caught
+  MUT-B's middle/last cells, and the BARE-member scan does not catch MUT-B at
+  all (stripping `;` from a lone `;` member leaves an empty member, which is
+  rejected anyway) — the byte has to be embedded INSIDE an otherwise-safe
+  member. Both contexts are therefore scanned at all three positions.
+  Each scan asserts the FULL accept/reject partition, and the partitions differ
+  by context on purpose: `*` is legal as a whole suffix (`!=*`) but not infix
+  (`!=in*fo`); `,` is legal infix in a facility (it splits the token into two
+  safe members) but never in a priority; `*` is never a list member (`auth,*`).
+- **Docs**: no documentation change. The predicates are byte-identical to the
+  round-2 head — `sha256(pkg/daemon/daemon_system.go)` is unchanged at
+  `167c976ca10fddfb…` — so the operator-visible accept set, the belt's own
+  doc comments and pkg/logging/README.md all still describe the shipped
+  behaviour exactly. This round adds regression coverage only.
 ## 2026-08-06 — #6825 fold r6 (Codex r6 residual findings)
 
 - **Timestamp**: 2026-08-06 01:05 PDT
