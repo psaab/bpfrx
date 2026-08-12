@@ -32,8 +32,8 @@ type replay5086Env struct {
 
 func newReplay5086Env(t *testing.T) *replay5086Env {
 	t.Helper()
-	m := NewManager(0, 42)
-	e := &replay5086Env{t: t, m: m, key: []byte("cluster-shared-secret")}
+	m := epochGateManager()
+	e := &replay5086Env{t: t, m: m, key: m.controlLinkAuthKey()}
 	e.restartHeartbeat()
 	return e
 }
@@ -54,29 +54,20 @@ func (e *replay5086Env) restartHeartbeat() {
 	e.m.mu.Unlock()
 }
 
-// feed pushes one raw frame through the exact gate readLoop applies, and
-// applies the exact consequences readLoop applies on accept: refresh peer
-// liveness (lastSeen) and drive election (handlePeerHeartbeat). It reports
-// whether the frame was accepted.
+// feed pushes one raw frame through the gate readLoop applies, by CALLING it —
+// heartbeatReceiver.admitFrame is the single implementation both use, so the
+// accept-side consequences (lastSeen, handlePeerHeartbeat) are production's,
+// not a copy of them. It reports whether the frame was accepted.
+//
+// This helper too used to restate the gate; see admitFrame for why a restated
+// gate let the receiver's epoch read be severed with the suite green.
 func (e *replay5086Env) feed(frame []byte) bool {
 	e.t.Helper()
 	pkt, err := UnmarshalHeartbeat(frame)
 	if err != nil {
 		e.t.Fatalf("unmarshal: %v", err)
 	}
-	session, counter, present := heartbeatAuthTrailer(frame)
-	macOK := present && len(e.key) > 0 && verifyHeartbeatMAC(frame, e.key)
-	nonceFresh := macOK && e.r.auth.admit(session, counter)
-	accept, _ := heartbeatAuthDecision(len(e.key) > 0, present, macOK, nonceFresh, e.r.auth.peerAuthenticated())
-	if !accept {
-		return false
-	}
-	if macOK {
-		e.r.auth.notePeerAuthenticated()
-	}
-	e.r.lastSeen.Store(MonotonicNanos())
-	e.m.handlePeerHeartbeat(pkt)
-	return true
+	return e.r.admitFrame(frame, pkt)
 }
 
 // capture builds the authenticated frames an on-link attacker records off the
@@ -264,7 +255,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 		t.Fatal("receiver auth state must never be nil")
 	}
 	// Record a peer session on the first receiver.
-	if !first.auth.admit(0x1234, 7) {
+	if ok, _ := first.auth.admitAuthed(false, 0, 0x1234, 7); !ok {
 		t.Fatal("first sighting of a session must be admitted")
 	}
 	first.auth.notePeerAuthenticated()
@@ -279,7 +270,7 @@ func TestHeartbeatAuthStateOutlivesReceiver_5086(t *testing.T) {
 	}
 
 	// The retired-session watermark survived every restart.
-	if last.auth.admit(0x1234, 7) {
+	if ok, _ := last.auth.admitAuthed(false, 0, 0x1234, 7); ok {
 		t.Error("#5086: a replayed (session, counter) must stay rejected across heartbeat restarts")
 	}
 	if !last.auth.peerAuthenticated() {
