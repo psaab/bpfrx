@@ -72571,6 +72571,58 @@ paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
+## 2026-08-06 — #4800 new-flow-ceiling instrumentation + harness
+
+- **Timestamp**: 2026-08-06
+- **Action**: Add per-site contention accounting for the three cross-worker
+  synchronization points on the new-flow install path — the SNAT pool
+  allocator's residual `live` map mutex, `publish_shared_session`, and the
+  N-way `replicate_session_upsert` fan-out — plus a per-worker transit
+  new-flow install counter, a tested attribution layer, a connection-rate
+  generator, and the loss-cluster harness that drives them. This is the
+  measurement #2852 Phase-2 SNAT-allocator sharding is gated on: a
+  new-flows/sec plateau alone cannot say WHICH site saturated, and #4800's
+  own conclusion is that allocator sharding is insufficient because publish
+  and replication serialize every new flow regardless.
+- **File(s)**: userspace-dp/src/nat/allocator.rs,
+  userspace-dp/src/nat/status.rs, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/tests_newflow_lock.rs (new),
+  userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/worker_queue.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs (new),
+  userspace-dp/src/afxdp/binding_state/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/afxdp/worker_runtime.rs,
+  userspace-dp/src/afxdp/worker_runtime_tests.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/{nat,control,binding}.rs,
+  userspace-dp/src/server/{lifecycle.rs,helpers/status.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/{protocol_counters,protocol_status}.go,
+  pkg/api/{metrics,metrics_userspace,metrics_descriptors_nat,
+  metrics_descriptors_worker,metrics_descriptors_userspace_session,
+  metrics_test}.go, test/incus/newflow_ceiling_analyze.py (new),
+  test/incus/newflow_ceiling_analyze_test.py (new),
+  test/incus/newflow-gen/ (new crate),
+  test/incus/newflow-ceiling-harness.sh (new),
+  docs/userspace-newflow-ceiling.md (new), docs/README.md, Makefile
+- **Validation**: Fail-on-revert proven per leg by reverting only the
+  production hunk (via Edit, never `git checkout`) and re-running: each
+  reverted counter leaves its assertion RED with the assertion's own
+  message, never a compile error. The over-reach guards — status polling
+  must not inflate the acquisition denominator; `remove_shared_session` is
+  not a publish; `replicate_session_delete` is not an upsert — stay GREEN
+  under every revert, since each asserts an UNCHANGED counter and the
+  reverted code pins all counters at zero. `cargo test` (userspace-dp,
+  newflow-gen), `go build ./...`, `go test ./pkg/api ./pkg/dataplane/...`,
+  `python3 -m unittest newflow_ceiling_analyze_test`, `shellcheck -S
+  warning`. The wire golden `protocol_wire_v1.json` was regenerated; its
+  diff is 10 additive zero-valued keys with no existing key changed.
+  **The loss-cluster measurement itself has NOT been performed** — this
+  change ships the instrumentation and the harness; the number is owed.
 ## 2026-08-06 — #6861 fold r2 (gate F1 / F2 NIT)
 
 - **Timestamp**: 2026-08-06 06:40 PDT
@@ -72760,6 +72812,137 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+## 2026-08-06 — #4800 fold r1: the analyzer could report a confident wrong answer
+
+- **Timestamp**: 2026-08-06
+- **Action**: Close five instances of one bug shape — a missing or stale
+  input degrading into a value that SKIPS a refusal rather than tripping it.
+  Two were blocking review findings; a sweep for the same shape found three
+  more. All five biased the instrument toward a confident wrong answer, which
+  is the exact failure the harness exists to prevent.
+  (1) The sibling queue-depth verdict read `..._queue_depth_max`, a
+  process-lifetime `fetch_max`. It never falls, so one spike in an earlier
+  cell left every later cell naming `replicate_session_upsert_queue_backlog`
+  with a VALID verdict — a systematic bias toward the site the #2852 Phase-2
+  decision turns on. A lifetime max cannot be differenced (a zero delta spans
+  "no backlog" through "a backlog up to the previous all-time high"), so the
+  COUNTER shape was changed rather than patched in the analyzer: a new
+  `session_replication_queue_depth_sum` accumulates the per-call WORST
+  sibling depth, and `Δsum / Δupserts` is the window mean the verdict now
+  rests on. The lifetime max is retained as operator context and can no
+  longer vote. (2) An unparseable `generator.json` reached the analyzer as
+  `--offered-rate 0`; zero is falsy, so `accept_ratio` stayed None and the
+  generator-bound check — the one that catches a broken generator — was
+  disabled BY the broken generator. Now INVALID at the analyzer and a
+  refused cell in the shell. (3) A missing `t` defaulted to 0.0, inflating
+  the window to ~1.7e9s and yielding a near-zero rate that still read VALID.
+  (4) A missing `helper_pid` skipped the restart comparison outright, and the
+  shell manufactured that absence whenever `pidof` failed. (5) An absent
+  per-worker series left `installs` empty, and the `if installs` guards
+  skipped BOTH cross-worker gates — the two that stop a single-RX-queue run
+  reading as a cross-worker lock bound. (3)(4)(5) are now refused up front by
+  `REQUIRED_SNAPSHOT_KEYS`.
+- **File(s)**: userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/server/{lifecycle.rs,helpers/status.rs},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol_status.go,
+  pkg/api/{metrics,metrics_userspace,metrics_descriptors_userspace_session,
+  metrics_test}.go, test/incus/newflow_ceiling_analyze.py,
+  test/incus/newflow_ceiling_analyze_test.py,
+  test/incus/newflow-ceiling-harness.sh, docs/userspace-newflow-ceiling.md
+- **Validation**: Six new tests, each revert-probed at assertion level. The
+  B1 regression case (lifetime max already 50_000 at window START, depth sum
+  flat through the window) asserts NO backlog culprit — the cell that was
+  previously wrong. The exact depth-sum assertions required a new
+  `replication_counter_test_guard` in `session_glue/mod.rs`: the counters are
+  process-global and two sibling tests in `tests.rs` also replicate, so an
+  exact delta without serialization would have been a #6819-class flake
+  generator rather than a test. Two pre-existing tests deliberately passed
+  absent inputs (`helper_pid=None`, an unpopulated `workers`) and were
+  updated to supply real ones so they still exercise their own targets rather
+  than the new gate. The measurement remains OWED.
+
+## 2026-08-12 — #4800 fold r2: the counter tests were a master-red flake generator
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fold three blocking review findings on PR #6927. All three are
+  test-integrity, not runtime — this PR remains instrumentation-only and no
+  production control flow changes.
+
+  **F1/F2 — the exact-equality assertions on process-global counters were a
+  ~1-in-12-runs master red.** `remove_shared_session_is_not_counted_as_a_publish`
+  asserts equality on `SHARED_SESSION_PUBLISHES` /
+  `SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS` with no serialization, while
+  roughly 40 sibling tests in the same test binary publish. The r1 answer was a
+  hand-taken `replication_counter_test_guard` plus a doc comment listing the
+  movers — and that inventory was already WRONG: it missed
+  `coordinator::sync_worker_session_tables` and
+  `promote::maybe_promote_synced_session`, both of which reach
+  `replicate_session_upsert` from tests that have no idea they are movers.
+
+  Replaced with a DERIVED guard (`afxdp::counter_test_lock`, `#[cfg(test)]`
+  only). Readers take the exclusive side; the shared side is taken INSIDE
+  `publish_shared_session` and `replicate_session_upsert` themselves, so the
+  mover set is closed by construction — moving a counter requires calling one
+  of those two functions, and calling one takes the guard. There is no list to
+  keep current. A thread-local depth handles the two re-entrancy cases
+  (`RwLock` is not reentrant): a reader that drives a mover on its own thread,
+  and a mover that calls another mover. The two deterministic contention probes
+  drive their mover from a spawned thread and hand it an explicit
+  `CounterExempt`.
+
+  **F3 — the per-worker `new_flow_installs` path was unbound at BOTH ends.**
+  Deleting the poll-path `fetch_add` and replacing the body of
+  `refresh_worker_new_flow_install_counters` with `= 0` JOINTLY left the suite
+  green; on the Go side, changing the emit to carry
+  `w.SessionInstallPartial` also passed, because the only binding was a metric
+  COUNT (`len(got) != 3*33`) and the fixture never set the field. This series
+  is the sole input to both cross-worker analyzer gates
+  (`active_workers < 3`, `max_worker_share > 0.60`), and it was the one new
+  series in this PR without a distinct-value assertion.
+
+  Also folded (non-blocking): corrected the "the fast path is unchanged"
+  claim in three artifacts — the acquisition counters are bumped
+  unconditionally, so an uncontended forward `publish_shared_session` goes
+  from 3 atomic RMWs to 7 and `lock_live` from 1 to 2; and corrected
+  `depth_sum_accumulates_while_depth_max_stays_a_high_water`'s docstring,
+  which claimed it stayed green under either revert when it REDs under the
+  SUM revert (verified both directions by mutation).
+- **File(s)**: userspace-dp/src/afxdp/counter_test_lock.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  userspace-dp/src/nat/allocator.rs, pkg/api/metrics_test.go,
+  docs/userspace-newflow-ceiling.md
+- **Validation**: Flake proven GONE against a like-for-like BASELINE build of
+  the pre-fold head, not merely unobserved. Baseline: 5 failures in 300
+  filtered 16-thread iterations (`remove_shared_session_is_not_counted_as_a_publish`,
+  `left: 9 / right: 8` and `left: 3 / right: 2`). Fixed: 0 failures in the
+  same 300 iterations and 0 #4800 failures across 12 consecutive full-suite
+  runs at default parallelism. Two unrelated timing tests
+  (`wg::engine::...install_session_serializes_with_reconcile_removal`,
+  `shared_cos_lease::...v8_epoch_seqlock_snapshot_never_tears_tag_grace`)
+  flake on BOTH arms and were confirmed pre-existing at the baseline SHA by
+  interleaved full-suite runs under identical load.
+
+  Mutation matrix, each a fresh build and each RED on an ASSERTION:
+  `refresh_worker_new_flow_install_counters` fold -> `.next()` gives
+  `left: 7 / right: 119`; deleting the poll-path
+  `binding.live.new_flow_installs.fetch_add(1, ..)` gives `left: 0 / right: 1`
+  while `batch.session_creates` still reports 2; the Go emit rewired to
+  `float64(w.SessionInstallPartial)` gives `= 0, want 149/151/157` on all
+  three workers. Both over-reach guards
+  (`..._touches_no_other_slot`, `txn_admission_refusal_at_cap_...`) stayed
+  GREEN under their siblings' reverts. Full Rust suite 4255 passed / 0 failed;
+  `go build ./...` + `go test ./pkg/api/... ./pkg/dataplane/userspace/...`
+  green. The measurement itself remains OWED.
 ## 2026-08-06 — #4785 fold r3: the IPIP anchor advisory keys on the RUNTIME DEVICE NAME (#6861 F1b/F2b/F2c/F3)
 
 - **Timestamp**: 2026-08-06
@@ -73108,6 +73291,123 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
   docs/cos-validation-notes.md, _Log.md
 
+## 2026-08-12 — #4800 fold r3: Codex DO-NOT-MERGE, five blocking findings closed
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fold the Codex DO-NOT-MERGE round at `8c45cea3e`. Five of six
+  blocking findings closed; the sixth is partly refuted and partly outstanding
+  (below). Still instrumentation-only for packet handling.
+
+  **Correction first — the r2 "closed by construction" claim was wrong** and is
+  withdrawn in the code, not just here. The guarded atomics are `pub(crate)`
+  and any module can `fetch_add` one directly; `lock_recover_counting` accepts
+  an arbitrary counter; and per-binding `new_flow_installs` moves at
+  `poll_descriptor` outside both guarded functions and is not in the isolation
+  set at all. The real property is "every mover reachable through TODAY'S call
+  graph", a convention the compiler does not enforce. Corrected in
+  `counter_test_lock.rs` and in both mover-site comments that repeated it.
+
+  **B1** — `CounterExempt` auto-derived `Send`/`Sync` while owning thread-local
+  state. Now `!Send`/`!Sync` via `PhantomData<Rc<()>>`, with a compile-time
+  ambiguity assertion so losing the bound stops the build.
+
+  **B2** — the mover guards could not fire on their own removal: every
+  same-thread test holds the reader guard and every helper is exempt, so both
+  return `None`. The r2 evidence for that side was a 1-in-1500 flake rate,
+  which is not a binding. Added the missing shape — hold the reader, start a
+  NON-exempt mover, prove it stays blocked, release, prove it completes — made
+  deterministic by a new `movers_waiting()` counter of threads parked inside
+  the guard. A nap-and-check-a-flag version would pass under its own mutation.
+
+  **B3** — the harness fed the generator's ACHIEVED rate to `--offered-rate`,
+  so `accept_ratio = achieved/achieved ≈ 1` and the underdrive gate could not
+  fire arithmetically. Now passes the REQUESTED `$rate`; the generator report
+  is still parsed as a liveness check.
+
+  **B4** — the reported flow rate came from `pool.allocations_total`, taken
+  BEFORE pair admission and not decremented on rollback, so 100k SYNs with 90k
+  refused reported 100k flows/s. Now the summed per-worker `new_flow_installs`.
+
+  **B5** — `SESSION_REPLICATION_ENQUEUED` booked the whole fan-out before the
+  first acquisition, so a scrape during a blocked call reported 1/16 = 6.25%
+  contention (under the 10% threshold) when 100% of ATTEMPTED acquisitions had
+  blocked. Now incremented per sibling immediately before its acquisition;
+  at-rest totals and the fan-out ratio are unchanged.
+- **File(s)**: userspace-dp/src/afxdp/counter_test_lock.rs,
+  userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  test/incus/newflow-ceiling-harness.sh,
+  test/incus/newflow_ceiling_analyze.py,
+  test/incus/newflow_ceiling_analyze_test.py, _Log.md
+- **Validation**: Four mutations run firsthand, each RED on an assertion.
+  Deleting the publish mover guard (statement form — the same text appears in a
+  doc comment, and substituting there mutates nothing) gives "no non-exempt
+  mover ever blocked on the counter guard within 10s ... publishes went 0 -> 1",
+  deadline-bounded so the revert fails rather than wedges. Restoring the
+  pre-booked fan-out gives "the denominator counted siblings that had not been
+  attempted yet: 3 enqueued against 1 attempted". Restoring
+  `allocations / elapsed` gives "10000.0 != 1000.0". The `!Send` bound REDs as
+  a compile error, which is the only possible red for a compile-time property.
+  `six_even_workers` was silently dropping the division remainder (199_998 for
+  a stated 200_000); fixed so the fixture sums to its own total rather than
+  loosening the two accept-ratio assertions it broke.
+  cargo `--release` all targets green (4271 unit); `go build ./...` 0;
+  `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0; 31 analyzer tests 0;
+  `bash -n` on the harness 0.
+
+## 2026-08-12 — #4800 fold r4: the remaining B6 seams + four false comments
+
+- **Timestamp**: 2026-08-12
+- **Action**: Close the highest-value part of Codex's B6 (telemetry seams
+  removable or misspellable with every test green) and the four leftover
+  inaccurate comments. One B6 sub-item was REFUTED in r3 and is not revisited.
+
+  **Cross-language wire seam (JSON tags).** The Go tags must match the Rust
+  serde names, and nothing enforced it: the Rust fixture test is Rust->Rust and
+  the Go tests hand-BUILD their status structs. A rename on either side left
+  both suites green while the field decoded as zero. New Go test decodes a
+  payload that is JSON TEXT written by hand as the helper emits it — NOT a
+  marshalled Go struct, because marshal-then-unmarshal is symmetric under a
+  rename by construction and proves only that Go agrees with itself (the
+  failure mode PR #6938 shipped). Every value distinct, so a cross-wiring
+  cannot hide behind a shared number.
+
+  **Metric-name seam.** The emit tests match on DESCRIPTOR POINTER, which is
+  the right choice there and exactly why they cannot see a rename. New test
+  pins all 11 `#4800` names, matching on `fqName: "..."` rather than a bare
+  substring because `Desc.String()` also embeds HELP text.
+
+  **Four false comments.** `nat/allocator.rs` carried a second copy of the
+  "adds nothing to the hot path" overstatement (the acquisition counter is
+  unconditional: 2 RMWs, not 1). `newflow-gen/src/main.rs` claimed "the
+  harness asserts that identity" for
+  `attempted == established + refused + timed_out + other_errors` — the
+  harness never reads `attempted` at all, it reads only
+  `established_per_sec`. Two in `docs/userspace-newflow-ceiling.md` described
+  the accept ratio as being against the generator's ACHIEVED rate, which is
+  the B3 defect stated as if it were the design.
+- **File(s)**: pkg/dataplane/userspace/protocol_wire_newflow_4800_test.go
+  (new), pkg/api/metrics_newflow_names_4800_test.go (new),
+  userspace-dp/src/nat/allocator.rs, test/incus/newflow-gen/src/main.rs,
+  docs/userspace-newflow-ceiling.md, _Log.md
+- **Validation**: Two mutations run firsthand. Renaming three Go JSON tags
+  away from the Rust names (`session_replication_enqueued_total`,
+  `new_flow_installs`, `live_lock_contended_total`) REDs the decode test on
+  all three, each naming itself — e.g. "session_replication_enqueued_total
+  decoded as 0, want 1031". Misspelling two metric names REDs the name test on
+  both, and — the negative control that shows the seam was real — the
+  pointer-matched emit tests stayed GREEN (`ok`) under the SAME mutation.
+  `go build ./...` 0; `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0;
+  `cargo build --release` 0; newflow-gen cargo tests 13 passed.
+
+  STILL OPEN, not claimed: the sole live refresh call at
+  `worker/loop_body/mod.rs:481`. Nothing drives `loop_body` in any test today
+  (it is referenced only from `worker/mod.rs` and two READMEs), so binding it
+  needs a worker-loop harness rather than an assertion — a piece of work in
+  its own right, and a source-level canary would assert presence, not
+  reachability.
 ## 2026-08-12 — #4785 fold r7: the pointer-keying claim, measured properly
 
 - **Timestamp**: 2026-08-12
@@ -73179,6 +73479,45 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
   and 226 after the union — the resolve introduced none.
 
+## 2026-08-12 — #4800 fold r5: exact fqName extraction + the open seam named
+
+- **Timestamp**: 2026-08-12
+- **Action**: Replace the metric-name guard's `strings.Contains` on
+  `Desc.String()` with EXACT fqName extraction, and record the both-sides wire
+  parity check plus the precise identity of the one seam still open.
+
+  The `Contains` shape was anchored on `fqName: "..."` and so could not match
+  help text, but `Desc.String()` renders `Desc{fqName: "...", help: "...", ...}`
+  and these metrics' help strings cross-reference sibling metric NAMES — so any
+  substring shape is one careless edit away from being satisfiable by a
+  neighbour's prose. `fqNameOf` now parses the value out and compares with
+  `!=`; there is no substring semantics left to abuse.
+
+  Wire parity, both sides, all 11 `#4800` fields: every Go `json:` tag has a
+  matching Rust `serde(rename = ...)` — 8 in `protocol/control.rs`,
+  `new_flow_installs` in `protocol/binding.rs`, and the two `live_lock_*` in
+  `protocol/nat.rs` — and every one appears as a key in the hand-written
+  decode fixture. This closes the risk flagged in r4 (the fixture keys had
+  been derived from the Go tags alone, never diffed against the Rust side).
+- **File(s)**: pkg/api/metrics_newflow_names_4800_test.go, _Log.md
+- **Validation**: Single-line production edit
+  `metrics_descriptors_worker.go`: `"xpf_userspace_worker_new_flow_installs_total"`
+  -> `"xpf_userspace_worker_new_flow_install_total"` REDs at
+  `metric is exposed as "xpf_userspace_worker_new_flow_install_total", want
+  "xpf_userspace_worker_new_flow_installs_total"`. Full cargo `--release` green
+  (4271 unit + 6 integration binaries) after merging the rebased branch;
+  `go build ./...` 0; `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0.
+
+  STILL OPEN — `worker/loop_body/mod.rs:481`, the sole live call to
+  `refresh_worker_new_flow_install_counters`. RUNTIME (counting), and it is
+  the CALL SITE that is unbound, not the callee: the callee is bound by
+  `refresh_worker_new_flow_install_counters_sums_across_bindings`. Deleting the
+  call leaves the per-worker wire field pinned at 0, which silently disables
+  BOTH cross-worker analyzer gates. NOT introduced by #4800: its immediate
+  sibling one line above, `refresh_worker_cos_queue_lease_runtime_counters`
+  (#1782), is unbound in exactly the same way, and `worker_loop` is called only
+  from `coordinator/reconcile/bringup.rs` — no test drives it. Binding it means
+  a worker-loop harness that would cover both refreshers.
 ## 2026-08-07 — #6669 fold round 15: bind the boot-epoch production wiring at both ends
 
 - **Timestamp**: 2026-08-07
@@ -73639,3 +73978,43 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   result was read.
 - **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go,
   pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-12 — #4800 fold r6: per-call vs per-connection in the cost table
+
+- **Timestamp**: 2026-08-12
+- **Action**: Docs-only. The serialization cost table read as per-CONNECTION
+  and was really per-CALL, which matters because the whole #4800 argument
+  rests on that table.
+
+  Both rows rescoped: `publish_shared_session` is "up to three shared-map
+  mutexes **per publish call**", `replicate_session_upsert` is "one sibling
+  command-queue mutex per worker, **per replication call**". Added a note that
+  a connection performs more than one publish (the forward flow and its
+  reverse companion are separate entries), so the per-connection acquisition
+  and fan-out counts are MULTIPLES of the per-call figures — and that the
+  multiplier is not uniform, because `shared_sessions` is taken
+  unconditionally while the `nat_sessions` and `forward_wire_sessions` arms are
+  both gated on `!entry.metadata.is_reverse` (verified at
+  `afxdp/shared_ops.rs:985/996/1021`), so a forward publish takes up to three
+  maps and a reverse takes exactly one.
+
+  NO per-connection total is asserted. Deriving one means counting the publish
+  and replication calls a connection makes across the install path, its reverse
+  companion, and any promote / HA-import / tunnel install that also publishes —
+  which has not been measured. The doc now says so and points at the two
+  Prometheus counters to measure it against.
+
+  Sweep of the document's other numeric claims: the three verdict thresholds
+  (95% accept ratio, 3 active workers, 60% max worker share) all match the
+  analyzer defaults exactly (`DEFAULT_MIN_ACCEPT_RATIO = 0.95`,
+  `DEFAULT_MIN_ACTIVE_WORKERS = 3`, `DEFAULT_MAX_WORKER_SHARE = 0.60`); the
+  saturation ratio and queue-depth backlog thresholds are described by
+  mechanism and never quoted as numbers, so nothing to drift. Two further
+  scope defects found and fixed in the same pass: the queue-depth row said
+  "mean depth per replicated flow" (same per-call ambiguity) and the enqueued
+  row still described pre-r3 accounting.
+- **File(s)**: docs/userspace-newflow-ceiling.md, _Log.md
+- **Validation**: Docs only; no code changed. `go build ./...` 0 as a sanity
+  check that the tree is intact. The `is_reverse` gating claim was re-verified
+  by reading `shared_ops.rs` at this SHA rather than carried from an earlier
+  round.
