@@ -71876,3 +71876,96 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   head is severing the `heartbeatFrameEpoch(frame, key)` assignment itself.
 
 - **File(s)**: _Log.md
+
+## 2026-08-12 — #6169/#6669 r18: Codex DO-NOT-MERGE fold, part 1 (finding 1 enumeration + finding 8)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Codex returned DO-NOT-MERGE with eight blocking findings. This
+  entry covers the guard enumeration that gates the rest, and the one finding
+  closed in full.
+
+  **Finding 1 — guards that cannot fire. VERIFIED BY MUTATION, not by
+  reading.** Baseline first (`go test -count=1 ./pkg/cluster/...` = 0,
+  `ok 15.199s`), because "stays GREEN" means nothing without one. Four of the
+  five concrete claims are real, and the whole `pkg/cluster` suite stays GREEN
+  under each:
+    - revert `heartbeatSender.send()` to a per-sender nonce → GREEN
+      (`ok 16.138s`); `TestHeartbeatNonceIsIncarnationScoped_6169` itself still
+      PASSES. It calls `m.heartbeatNonce()` directly and builds two senders it
+      never uses, so it pins the ACCESSOR and leaves the send site unbound.
+    - move `EpochOutOfBandRejected` / `EpochAheadOfClockRejected` /
+      `EpochSessionCollision` back under `receiver != nil` → GREEN
+      (`ok 15.621s`). Only three of the six counters are guarded.
+    - delete the `m.initHeartbeatEpochState()` call outright → GREEN
+      (`ok 15.599s`).
+    - `TestInBoundFarFutureEpochLockoutIsBounded_6169`'s "BOUND 1 ... no
+      operator action at all" feeds a NEW session at a NEW epoch
+      (`0xEE03`/`inBound+1`). The rejected sender is `0xEE02` and is never
+      re-fed, so the test proves a fresh incarnation above the floor is
+      admitted — which nobody disputed — and says nothing about the running
+      sender. This is finding 6 seen from the test side.
+  The fifth (swapping the worker `CompareAndSwap`/`close(done)` order) does
+  stay GREEN (`ok 15.414s`), but the PR's own comment at
+  `heartbeat_epoch.go:1038-1047` already states that verbatim and argues the
+  seam is not worth buying. That is a disclosed residual carrying its caveat in
+  the shipping artifact, not a silently unbound guard.
+
+  **The ledger's positive half was sampled too**, because a review that
+  over-credits misleads as badly as one that misses: disabling the
+  epochless-downgrade latch (`if s.epochSeen` → `if false`) turns 12 tests RED,
+  including every one Codex marks `R` against that target. The epoch ADMISSION
+  core is genuinely bound; the decorative set is narrow and specific.
+
+  **Finding 8 — log flood under a documented rate limit. FIXED.**
+  `NoteEpochDowngradeHeartbeat` is limited to one line per 30s, but `admitFrame`
+  then emitted an UNCONDITIONAL `slog.Warn("cluster: heartbeat auth rejected")`
+  for every rejected frame immediately afterwards — so 10 valid-MAC epochless
+  heartbeats a second produced ~10 warnings a second, and the line that WAS
+  bounded is the one an operator most needs. New
+  `heartbeatRejectWarnLimiter` bounds the generic line on the same 30s interval
+  and reports `suppressed_since_last`, so bounding the volume does not conceal
+  it. It lives on `heartbeatAuthState` (Manager lifetime), not the receiver, for
+  the same reason the epoch counters do: a receiver-scoped limiter is reset by
+  every `StartHeartbeat`, including a routine DHCP-triggered VRF rebind, which
+  would restore the flood one burst per restart. `README.md`'s
+  "the rejection logs a rate-limited, actionable warning" is corrected to say
+  which lines are bounded and on what interval.
+
+  **No sleeps.** `heartbeatRejectWarnNowNanos` is an injectable seam (same idiom
+  as `epochNowNanos`), so the tests step across the interval explicitly. A
+  wall-clock rate-limit test would be the flakiest possible addition to a PR
+  whose subject is ordering.
+
+  **Mutations, run and observed.** (F8) remove the `rejectWarn.admit()` gate →
+  `TestRejectionWarningIsRateLimitedOnTheRealPath_6669` RED with
+  "40 rejected frames inside one 30s window produced 40 rejection warnings,
+  want 1"; the suppressed-count test RED too. (F8b) keep the gate but drop the
+  `suppressed_since_last` attribute → the rate test stays GREEN and only
+  `TestRejectionWarningReportsWhatItSuppressed_6669` goes RED, so the two belts
+  are separately distinguished rather than riding one another.
+
+  **Finding 4 is NOT locally patchable — attempted, reverted, and why.** The
+  fix looks like a one-line predicate: stop `refineBootEpoch` overwriting an
+  intact higher persisted epoch with a lower wall-clock seed. Applying it broke
+  `TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169` and
+  `TestPersistedEpochHealsOnlyWhenClockCredible_6169` and hung
+  `TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`, and the reason
+  is structural, not a bad predicate: two DIFFERENT situations reach the
+  `!epochOrderable` branch and `refineBootEpoch` cannot tell them apart from
+  inside. A year-2191 file with a correct clock is corrupt state that SHOULD be
+  healed by writing over it; an intact file written by a correctly-clocked
+  predecessor, read by a node whose clock stepped back two hours, MUST NOT be
+  written over. Both present identically as "file value far beyond my forward
+  bound". Healing necessarily writes DOWN; protecting necessarily refuses to.
+  The PR already contains a test asserting the heal ("Declining to chain also
+  HEALS the file"), so closing finding 4 is a design decision about persistence
+  semantics — which the PR's own comment says is "tracked there rather than
+  papered over here" — and not a fold-round patch. Reverted; tree clean;
+  baseline re-confirmed GREEN (`ok 15.492s`).
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.418s`); `go test -race -count=1 ./pkg/cluster/` 0 (`ok 17.744s`);
+  `gofmt -l` clean on both touched files. No cluster/incus tooling.
+- **File(s)**: pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_reject_warn_rate_6669_test.go (new),
+  pkg/cluster/README.md, _Log.md

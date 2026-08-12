@@ -1013,8 +1013,15 @@ peer liveness (`lastSeen`) or drive election.
       - a cluster that has never run an epoch-capable build is never latched,
         so a plain rolling upgrade in either direction is unaffected;
       - the rejection logs a rate-limited, actionable warning naming the
-        recovery below (`Manager.NoteEpochDowngradeHeartbeat`) — there is no
-        state file, so nothing to clear by hand;
+        recovery below (`Manager.NoteEpochDowngradeHeartbeat`, once per 30s) —
+        there is no state file, so nothing to clear by hand. The generic
+        per-frame `heartbeat auth rejected` line is rate-limited on the same
+        30s interval (`heartbeatRejectWarnLimiter`) and reports
+        `suppressed_since_last`, so the bound does not hide the rate. Before
+        #6669 r18 only the actionable line was bounded and the generic one
+        fired per frame, so a 10/s epochless stream produced ~10 warnings a
+        second — the sentence promised a rate limit the noisy line did not
+        have;
       - **recovery, in this order:** rotate the control-link PSK on BOTH nodes,
         *then* `systemctl restart xpfd` on the node that is refusing. The latch
         is process-scoped, so the restart brings it back unlatched and it
