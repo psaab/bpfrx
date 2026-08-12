@@ -66,6 +66,92 @@ fn txn_admission_refusal_at_cap_drops_and_leaks_nothing() {
         "a refused flow's (rolled-back) NAT decision must never be cached"
     );
     assert_eq!(batch.session_creates, 0);
+    // #4800: a REFUSED flow is not an install. This is the over-reach half of
+    // the per-binding new-flow counter — see
+    // `txn_new_flow_install_counts_on_the_binding_4800` below for the positive
+    // cell. It stays GREEN under that cell's revert (deleting the poll-path
+    // `fetch_add` pins the counter at 0, and 0 is what this asserts).
+    assert_eq!(
+        binding.live.new_flow_installs.load(Ordering::Relaxed),
+        0,
+        "an admission-refused flow must not be counted as a new-flow install \
+         — folding refusals in would inflate the very rate the ceiling \
+         analysis divides by"
+    );
+}
+
+
+/// #4800 RED-on-revert: the per-binding `new_flow_installs` counter must be
+/// bumped by the REAL transit-install path, not merely carried by the
+/// worker-level plumbing above it.
+///
+/// The counter is the only input to both cross-worker gates the ceiling
+/// analyzer runs (`active_workers < 3` and `max_worker_share > 0.60`), so an
+/// increment that never fires reads as "one worker does all the work" — the
+/// exact verdict those gates exist to raise — with no way to tell that from a
+/// real skew.
+///
+/// Drives a genuine LAN->WAN TCP SYN through `poll_binding_process_descriptor`
+/// (not a synthetic leaf call), so the assertion sits downstream of every
+/// rollback door: ICMP-TE bounce, admission refusal, and install-partial all
+/// `continue` before reaching the increment.
+///
+/// RED on revert: deleting the `binding.live.new_flow_installs.fetch_add(1, ..)`
+/// in `poll_descriptor/mod.rs` leaves the counter at 0 and this fails on its
+/// message while `batch.session_creates` still reports 1 — an assertion
+/// failure, not a build or behaviour break.
+#[test]
+fn txn_new_flow_install_counts_on_the_binding_4800() {
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    assert_eq!(
+        binding.live.new_flow_installs.load(Ordering::Relaxed),
+        0,
+        "fixture must start from zero for the delta below to mean anything"
+    );
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    // Control: the flow really did install and forward. Without this, a
+    // fixture that silently stopped installing would make the counter
+    // assertion below vacuous rather than red. Two session CREATES for one
+    // flow is the dual forward+reverse entry the session table always
+    // installs as a pair.
+    assert_eq!(dbg.tx, 1, "the SYN must forward");
+    assert_eq!(
+        batch.session_creates, 2,
+        "the SYN must install the forward session and its reverse companion"
+    );
+    // ...and exactly ONE new-flow install. The counter is a FLOW rate, not a
+    // session-entry rate: it sits on the forward-install site alone, so the
+    // reverse companion must not double it. A per-entry count would report
+    // twice the connection rate the ceiling analysis is trying to bound.
+    assert_eq!(
+        binding.live.new_flow_installs.load(Ordering::Relaxed),
+        1,
+        "a committed transit forward install must count exactly once on the \
+         OWNING binding — this is the per-worker skew signal, and a zero here \
+         is indistinguishable from a worker that never took any work"
+    );
 }
 
 

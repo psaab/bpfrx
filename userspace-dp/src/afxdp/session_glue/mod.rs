@@ -921,6 +921,14 @@ pub(super) fn replicate_session_upsert(
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     entry: &SyncedSessionEntry,
 ) {
+    // #4800: in test builds only, hold the shared side of the counter lock for
+    // the whole fan-out. This is where the replication-side mover set is
+    // DERIVED: moving any `SESSION_REPLICATION_*` counter requires calling this
+    // function. The previous hand-written inventory had already missed two real
+    // movers (`coordinator::sync_worker_session_tables` and
+    // `promote::maybe_promote_synced_session`). See `afxdp::counter_test_lock`.
+    #[cfg(test)]
+    let _counter_guard = crate::afxdp::counter_test_lock::counter_mover_guard();
     let replica = synced_replica_entry(entry);
     // #4800: two O(1) counter updates per call rather than per sibling.
     SESSION_REPLICATION_UPSERTS.fetch_add(1, Ordering::Relaxed);

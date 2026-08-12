@@ -827,10 +827,13 @@ impl PortAllocator {
     /// and the subset that had to block.
     ///
     /// `try_lock()` first: on an uncontended mutex that is a single CAS —
-    /// exactly what `lock()` was already doing — so the fast path is
-    /// unchanged. Only when the CAS fails (another worker holds the map
-    /// mutex) do we bump `live_lock_contended` and fall through to the
-    /// blocking `lock()`, which was going to happen regardless.
+    /// exactly what `lock()` was already doing — so the LOCK ITSELF costs what
+    /// it always did. The acquisition counter is bumped UNCONDITIONALLY, so an
+    /// uncontended acquisition is 2 relaxed atomic read-modify-writes where it
+    /// used to be 1; "unchanged" would be false, though both are relaxed,
+    /// untimed and allocation-free. Only when the CAS fails (another worker
+    /// holds the map mutex) do we bump `live_lock_contended` and fall through
+    /// to the blocking `lock()`, which was going to happen regardless.
     ///
     /// Poison policy is preserved verbatim from the call sites this
     /// replaces (`unwrap_or_else(|e| e.into_inner())`): a worker that

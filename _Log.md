@@ -68772,3 +68772,81 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   absent inputs (`helper_pid=None`, an unpopulated `workers`) and were
   updated to supply real ones so they still exercise their own targets rather
   than the new gate. The measurement remains OWED.
+
+## 2026-08-12 — #4800 fold r2: the counter tests were a master-red flake generator
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fold three blocking review findings on PR #6927. All three are
+  test-integrity, not runtime — this PR remains instrumentation-only and no
+  production control flow changes.
+
+  **F1/F2 — the exact-equality assertions on process-global counters were a
+  ~1-in-12-runs master red.** `remove_shared_session_is_not_counted_as_a_publish`
+  asserts equality on `SHARED_SESSION_PUBLISHES` /
+  `SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS` with no serialization, while
+  roughly 40 sibling tests in the same test binary publish. The r1 answer was a
+  hand-taken `replication_counter_test_guard` plus a doc comment listing the
+  movers — and that inventory was already WRONG: it missed
+  `coordinator::sync_worker_session_tables` and
+  `promote::maybe_promote_synced_session`, both of which reach
+  `replicate_session_upsert` from tests that have no idea they are movers.
+
+  Replaced with a DERIVED guard (`afxdp::counter_test_lock`, `#[cfg(test)]`
+  only). Readers take the exclusive side; the shared side is taken INSIDE
+  `publish_shared_session` and `replicate_session_upsert` themselves, so the
+  mover set is closed by construction — moving a counter requires calling one
+  of those two functions, and calling one takes the guard. There is no list to
+  keep current. A thread-local depth handles the two re-entrancy cases
+  (`RwLock` is not reentrant): a reader that drives a mover on its own thread,
+  and a mover that calls another mover. The two deterministic contention probes
+  drive their mover from a spawned thread and hand it an explicit
+  `CounterExempt`.
+
+  **F3 — the per-worker `new_flow_installs` path was unbound at BOTH ends.**
+  Deleting the poll-path `fetch_add` and replacing the body of
+  `refresh_worker_new_flow_install_counters` with `= 0` JOINTLY left the suite
+  green; on the Go side, changing the emit to carry
+  `w.SessionInstallPartial` also passed, because the only binding was a metric
+  COUNT (`len(got) != 3*33`) and the fixture never set the field. This series
+  is the sole input to both cross-worker analyzer gates
+  (`active_workers < 3`, `max_worker_share > 0.60`), and it was the one new
+  series in this PR without a distinct-value assertion.
+
+  Also folded (non-blocking): corrected the "the fast path is unchanged"
+  claim in three artifacts — the acquisition counters are bumped
+  unconditionally, so an uncontended forward `publish_shared_session` goes
+  from 3 atomic RMWs to 7 and `lock_live` from 1 to 2; and corrected
+  `depth_sum_accumulates_while_depth_max_stays_a_high_water`'s docstring,
+  which claimed it stayed green under either revert when it REDs under the
+  SUM revert (verified both directions by mutation).
+- **File(s)**: userspace-dp/src/afxdp/counter_test_lock.rs (new),
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  userspace-dp/src/nat/allocator.rs, pkg/api/metrics_test.go,
+  docs/userspace-newflow-ceiling.md
+- **Validation**: Flake proven GONE against a like-for-like BASELINE build of
+  the pre-fold head, not merely unobserved. Baseline: 5 failures in 300
+  filtered 16-thread iterations (`remove_shared_session_is_not_counted_as_a_publish`,
+  `left: 9 / right: 8` and `left: 3 / right: 2`). Fixed: 0 failures in the
+  same 300 iterations and 0 #4800 failures across 12 consecutive full-suite
+  runs at default parallelism. Two unrelated timing tests
+  (`wg::engine::...install_session_serializes_with_reconcile_removal`,
+  `shared_cos_lease::...v8_epoch_seqlock_snapshot_never_tears_tag_grace`)
+  flake on BOTH arms and were confirmed pre-existing at the baseline SHA by
+  interleaved full-suite runs under identical load.
+
+  Mutation matrix, each a fresh build and each RED on an ASSERTION:
+  `refresh_worker_new_flow_install_counters` fold -> `.next()` gives
+  `left: 7 / right: 119`; deleting the poll-path
+  `binding.live.new_flow_installs.fetch_add(1, ..)` gives `left: 0 / right: 1`
+  while `batch.session_creates` still reports 2; the Go emit rewired to
+  `float64(w.SessionInstallPartial)` gives `= 0, want 149/151/157` on all
+  three workers. Both over-reach guards
+  (`..._touches_no_other_slot`, `txn_admission_refusal_at_cap_...`) stayed
+  GREEN under their siblings' reverts. Full Rust suite 4255 passed / 0 failed;
+  `go build ./...` + `go test ./pkg/api/... ./pkg/dataplane/userspace/...`
+  green. The measurement itself remains OWED.

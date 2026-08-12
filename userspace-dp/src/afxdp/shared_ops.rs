@@ -20,9 +20,16 @@ pub(crate) static SHARED_SESSION_PUBLISHES: AtomicU64 = AtomicU64::new(0);
 /// Scoped to the publish path deliberately: `remove_shared_session`, the HA
 /// promote/demote prewarm, and the read-side lookups take the same mutexes
 /// through the uncounted [`lock_shared_recover`], so folding them in would
-/// blur exactly the attribution this pair exists to provide. The
-/// try-lock-first pattern means an uncontended acquisition costs the same
-/// single CAS `lock()` already cost.
+/// blur exactly the attribution this pair exists to provide.
+///
+/// COST, stated honestly: the LOCK is unchanged — `try_lock()` on an
+/// uncontended mutex is the same single CAS `lock()` already performed — but
+/// the acquisition counter is bumped UNCONDITIONALLY, so the uncontended path
+/// is not free. One forward `publish_shared_session` goes from 3 atomic
+/// read-modify-writes (three `lock()` CASes) to 7: the call counter, plus one
+/// relaxed increment and one CAS for each of the three maps. All relaxed, no
+/// timing, no allocation, on the cold new-flow-install path — but "unchanged"
+/// would be false.
 pub(crate) static SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SHARED_SESSION_PUBLISH_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
 
@@ -70,9 +77,13 @@ pub(super) fn lock_shared_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// [`publish_shared_session`].
 ///
 /// `try_lock()` first — a single CAS on an uncontended mutex, exactly what
-/// `lock()` already did, so the fast path is unchanged. A failed CAS means
-/// another worker holds the map and this new-flow install is about to
-/// serialize behind it: bump the counter, then block as before. Poison
+/// `lock()` already did, so the LOCK ITSELF costs what it always did. The
+/// acquisition counter above it is unconditional, so an uncontended
+/// acquisition is 2 relaxed atomic RMWs where it used to be 1 (see
+/// [`SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS`] for the per-publish total).
+/// A failed CAS means another worker holds the map and this new-flow install
+/// is about to serialize behind it: bump the contended counter, then block as
+/// before — the block was going to happen anyway. Poison
 /// policy is inherited unchanged by delegating to [`lock_shared_recover`]
 /// for the blocking arm, and reproduced for the try-lock Poisoned arm
 /// (which `try_lock` reports only when the mutex is FREE).
@@ -954,6 +965,13 @@ pub(super) fn publish_shared_session(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     entry: &SyncedSessionEntry,
 ) {
+    // #4800: in test builds only, hold the shared side of the counter lock for
+    // the whole publish. This is where the publish-side mover set is DERIVED:
+    // moving `SHARED_SESSION_PUBLISHES` or either lock counter requires
+    // calling this function, so no caller can be forgotten the way a
+    // hand-maintained inventory was. See `afxdp::counter_test_lock`.
+    #[cfg(test)]
+    let _counter_guard = super::counter_test_lock::counter_mover_guard();
     // #4800: every new transit flow passes through here, so this counter is
     // the publish-leg new-flow rate AND the denominator for the lock
     // contention counted by `lock_shared_publish` below.

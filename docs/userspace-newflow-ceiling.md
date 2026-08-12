@@ -37,8 +37,17 @@ saying *more than one did*.
 
 Cheap monotonic counters, no timing on the hot path. Every lock site
 try-locks first: on an uncontended mutex that is the same single CAS `lock()`
-already cost, so the fast path is unchanged; only a failed CAS pays an extra
-relaxed increment, on top of a block that was going to happen anyway.
+already cost, so the **lock itself** is unchanged, and only a failed CAS pays
+the extra contended increment on top of a block that was going to happen
+anyway.
+
+The acquisition counters, however, are bumped **unconditionally**, so the
+uncontended path is not free. Measured in atomic read-modify-writes: an
+uncontended `lock_live()` goes from 1 to 2, and one forward
+`publish_shared_session` goes from 3 (three `lock()` CASes) to 7 — the call
+counter plus one relaxed increment and one CAS per shared map. All relaxed, no
+timing, no allocation, and confined to the cold new-flow-install path, but
+"the fast path is unchanged" would be an overstatement and is not the claim.
 
 Per pool, on `SourceNatPoolStatus` (Prometheus labels `pool`, `rule`):
 

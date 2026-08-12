@@ -1741,4 +1741,91 @@ mod tests {
         assert_eq!(telemetry.dbg_tx_completion_ring_available, 0);
         assert_eq!(telemetry.dbg_tx_completion_ring_available_max, 0);
     }
+
+    /// #4800: the worker-level `new_flow_installs` is the SUM over the
+    /// worker's bindings, and the sum is what the whole series means — a
+    /// worker owns several bindings (per NIC/queue), so a first-element or
+    /// max read under-reports the worker's share and skews the very
+    /// distribution the analyzer keys its cross-worker gates on
+    /// (`active_workers < 3`, `max_worker_share > 0.60`).
+    ///
+    /// Three bindings with distinct primes, because two cannot separate the
+    /// readings that matter: 7 / 11 / 101 sum to 119, while a first-element
+    /// read gives 7, a last-element read 101, a max 101, and a count 3. Every
+    /// degenerate reading lands on a different number.
+    ///
+    /// RED on revert: replacing the fold in
+    /// `refresh_worker_new_flow_install_counters` with a first-element read
+    /// (`.next()`/`[0]`), a `max`, or a constant fails the sum assertion on
+    /// its message.
+    #[test]
+    fn refresh_worker_new_flow_install_counters_sums_across_bindings() {
+        let bindings: Vec<BindingWorker> = [7u64, 11, 101]
+            .iter()
+            .enumerate()
+            .map(|(slot, installs)| {
+                let binding = BindingWorker::new_for_mirror_test(slot as u32, 0, 24, slot as u32);
+                binding
+                    .live
+                    .new_flow_installs
+                    .store(*installs, Ordering::Relaxed);
+                binding
+            })
+            .collect();
+
+        let mut counters = crate::afxdp::worker_runtime::WorkerRuntimeCounters::default();
+        refresh_worker_new_flow_install_counters(&mut counters, &bindings);
+
+        assert_eq!(
+            counters.new_flow_installs, 119,
+            "the worker counter must be the SUM over its bindings (7+11+101); \
+             7 would be a first-element read, 101 a max or last-element read, \
+             3 a count of bindings"
+        );
+    }
+
+    /// OVER-REACH GUARD for the same refresh: it owns exactly ONE slot on
+    /// `WorkerRuntimeCounters` and must leave every neighbouring slot alone.
+    /// The neighbours are filled by sibling refreshers on the same ~1s
+    /// cadence, so a refresh that reset or overwrote one of them would blank a
+    /// counter that had just been published — the failure mode is silent, and
+    /// the value it destroys (the #1861 install-refusal trio) is what tells an
+    /// operator whether the new-flow rate is a ceiling or a refusal.
+    ///
+    /// Stays GREEN under the SUM->FIRST / SUM->MAX / constant mutations above:
+    /// those change only which number lands in `new_flow_installs`, which this
+    /// test does not read.
+    #[test]
+    fn refresh_worker_new_flow_install_counters_touches_no_other_slot() {
+        let binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+        binding.live.new_flow_installs.store(5, Ordering::Relaxed);
+        let bindings = vec![binding];
+
+        let mut counters = crate::afxdp::worker_runtime::WorkerRuntimeCounters {
+            session_install_partial: 3,
+            session_create_drops: 13,
+            session_install_admission_refused: 17,
+            cos_queue_lease_acquire_v8_calls: 23,
+            ..Default::default()
+        };
+        refresh_worker_new_flow_install_counters(&mut counters, &bindings);
+
+        assert_eq!(
+            counters.session_install_partial, 3,
+            "the new-flow refresh must not disturb session_install_partial"
+        );
+        assert_eq!(
+            counters.session_create_drops, 13,
+            "the new-flow refresh must not disturb session_create_drops"
+        );
+        assert_eq!(
+            counters.session_install_admission_refused, 17,
+            "the new-flow refresh must not disturb session_install_admission_refused"
+        );
+        assert_eq!(
+            counters.cos_queue_lease_acquire_v8_calls, 23,
+            "the new-flow refresh must not disturb the CoS lease counters its \
+             sibling refresher owns"
+        );
+    }
 }

@@ -45,13 +45,18 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 				CoSQueueLeaseUndergrantOutstandingCap: 6,
 				SessionTableEntries:                   17,
 				MaxSessions:                           100,
-				Dead:                                  false,
+				// #4800: distinct per worker, and distinct from every other
+				// field on the same worker, so a collector wired to the wrong
+				// quantity cannot pass by coincidence.
+				NewFlowInstalls: 149,
+				Dead:            false,
 			},
 			{
 				WorkerID: 1, CoSQueueLeaseAcquireV8Calls: 11,
 				CoSQueueLeaseAcquireV8GrantedBytes: 0,
 				SessionTableEntries:                19,
 				MaxSessions:                        100,
+				NewFlowInstalls:                    151,
 				Dead:                               true,
 			},
 			{
@@ -59,6 +64,7 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 				CoSQueueLeaseAcquireV8GrantedBytes: 8192,
 				SessionTableEntries:                23,
 				MaxSessions:                        100,
+				NewFlowInstalls:                    157,
 				Dead:                               false,
 			},
 		},
@@ -210,6 +216,27 @@ func TestEmitWorkerRuntime_DeadGaugeReflectsDeadFlag(t *testing.T) {
 	for wid, want := range map[string]float64{"0": 100, "1": 100, "2": 100} {
 		if got := capacityByWorker[wid]; got != want {
 			t.Errorf("xpf_userspace_worker_session_table_capacity{worker_id=%q} = %v, want %v", wid, got, want)
+		}
+	}
+	// #4800: per-worker transit new-flow installs. Asserted per worker_id with
+	// a distinct value each, exactly like the sibling per-worker series above,
+	// because this is the ONLY input to both cross-worker gates the ceiling
+	// analyzer runs (`active_workers < 3`, `max_worker_share > 0.60`) — a
+	// collector emitting the right descriptor, label and type while carrying a
+	// different worker's number, or a different field's number, would leave
+	// both gates quietly reading the wrong distribution.
+	//
+	// RED on revert: changing the emit to `float64(w.SessionInstallPartial)`
+	// (or any other WorkerRuntimeStatus field) in metrics_userspace.go fails
+	// these on their messages; a per-worker count assertion alone would not
+	// have noticed, which is what the pre-#6927 `len(got) != 3*33` check was.
+	newFlowsByWorker := metricValuesByWorker(t, got, c.workerNewFlowInstalls, true)
+	if len(newFlowsByWorker) != 3 {
+		t.Fatalf("expected one new-flow-installs emission per worker (3), got %d", len(newFlowsByWorker))
+	}
+	for wid, want := range map[string]float64{"0": 149, "1": 151, "2": 157} {
+		if got := newFlowsByWorker[wid]; got != want {
+			t.Errorf("xpf_userspace_worker_new_flow_installs_total{worker_id=%q} = %v, want %v", wid, got, want)
 		}
 	}
 }
