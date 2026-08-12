@@ -149,7 +149,8 @@ struct BpfSessionValueV4 {
     // __u16 to fit SESS_FLAG_NPTV6 (bit 8, 0x100), which overflows a u8 (#5460).
     // The compiler inserts one pad byte after `state` and two before
     // `app_timeout`; the layout matches C `struct session_value` and the Go
-    // `bpfSessionValue` mirror (size-asserted at 136 in bpf_map_tests.rs).
+    // `bpfSessionValue` mirror (size-asserted at 144 in bpf_map_tests.rs --
+    // 136 before #4983 added the ingress-identity pair below).
     flags: u16,
     tcp_state: u8,
     is_reverse: u8,
@@ -215,7 +216,8 @@ struct BpfSessionKeyV6 {
 struct BpfSessionValueV6 {
     state: u8,
     // __u16 to fit SESS_FLAG_NPTV6 (bit 8), see BpfSessionValueV4::flags (#5460).
-    // Layout matches C `struct session_value_v6` (size-asserted at 184).
+    // Layout matches C `struct session_value_v6` (size-asserted at 192 -- 184
+    // before #4983 added the ingress-identity pair below).
     flags: u16,
     tcp_state: u8,
     is_reverse: u8,

@@ -18,7 +18,7 @@ type SessionValue struct {
 	// Flags is uint16 (not uint8): SessFlagNPTV6 is bit 8 (0x100), which
 	// overflows a byte (#5460). The C `struct session_value.flags` and the Rust
 	// `BpfSessionValueV4::flags` mirror this width; the on-map ABI is size-
-	// asserted at 136 (bpf_session_value_test.go / bpf_map_tests.rs).
+	// asserted at 144 (bpf_session_value_test.go / bpf_map_tests.rs).
 	Flags      uint16
 	TCPState   uint8
 	IsReverse  uint8
@@ -73,17 +73,29 @@ type SessionValue struct {
 	// so it is present on bpfSessionValue and round-trips through the BPF
 	// mirror.
 	//
-	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. Three
+	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
 	// populations legitimately carry 0 and MUST keep working:
 	//   - the reverse companion (its real ingress is the forward flow's egress,
-	//     which is unknown at install time);
+	//     which is unknown at install time). Note every pkg/cli show/clear call
+	//     site skips IsReverse != 0 before filtering, so a reverse row is never
+	//     interface-matched in the first place;
 	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
 	//     number names a different NIC on this node, so carrying it across the
 	//     cluster wire would be confidently wrong, worse than approximating);
+	//   - the helper's host-outbound GRE encapsulation path, where the traffic
+	//     is firewall-self-originated off the TUN device and has no ingress
+	//     binding to record;
 	//   - any session installed by a pre-#4983 helper (rolling upgrade).
 	// Consumers MUST fall back to the zone approximation for those (see
-	// sessionFilter.ingressIfaces / resolveIngressIfaces in pkg/cli), never
-	// treat 0 as "matches nothing" or "matches everything".
+	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
+	// nothing" or "matches everything".
+	//
+	// Only pkg/cli — the IN-DAEMON console CLI — consumes this today. The gRPC
+	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
+	// AND clear) and the REST query in pkg/api still resolve an interface
+	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
+	// Porting them is tracked separately; until then an interface-filtered
+	// show/clear is exact on the console and approximate over gRPC/REST.
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
@@ -237,17 +249,29 @@ type SessionValueV6 struct {
 	// so it is present on bpfSessionValue and round-trips through the BPF
 	// mirror.
 	//
-	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. Three
+	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
 	// populations legitimately carry 0 and MUST keep working:
 	//   - the reverse companion (its real ingress is the forward flow's egress,
-	//     which is unknown at install time);
+	//     which is unknown at install time). Note every pkg/cli show/clear call
+	//     site skips IsReverse != 0 before filtering, so a reverse row is never
+	//     interface-matched in the first place;
 	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
 	//     number names a different NIC on this node, so carrying it across the
 	//     cluster wire would be confidently wrong, worse than approximating);
+	//   - the helper's host-outbound GRE encapsulation path, where the traffic
+	//     is firewall-self-originated off the TUN device and has no ingress
+	//     binding to record;
 	//   - any session installed by a pre-#4983 helper (rolling upgrade).
 	// Consumers MUST fall back to the zone approximation for those (see
-	// sessionFilter.ingressIfaces / resolveIngressIfaces in pkg/cli), never
-	// treat 0 as "matches nothing" or "matches everything".
+	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
+	// nothing" or "matches everything".
+	//
+	// Only pkg/cli — the IN-DAEMON console CLI — consumes this today. The gRPC
+	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
+	// AND clear) and the REST query in pkg/api still resolve an interface
+	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
+	// Porting them is tracked separately; until then an interface-filtered
+	// show/clear is exact on the console and approximate over gRPC/REST.
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first

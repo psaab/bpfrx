@@ -31,22 +31,35 @@ pub(crate) struct SessionMetadata {
     /// afterwards; re-deriving is precisely the approximation this field
     /// exists to remove. Mirrored into the conntrack map as
     /// `session_value.ingress_ifindex` by `publish_conntrack`, which is how
-    /// `show security flow session interface <name>` and the matching `clear`
-    /// stop matching a session on interface X against a filter for a SIBLING
-    /// interface Y of the same multi-interface zone (#4792 widened the CLI to
-    /// consider every interface bound to the zone, which is as good as the
-    /// approximation gets without this datum).
+    /// the IN-DAEMON CLI's `show security flow session interface <name>` and
+    /// the matching `clear` stop matching a session on interface X against a
+    /// filter for a SIBLING interface Y of the same multi-interface zone
+    /// (#4792 widened that CLI to consider every interface bound to the zone,
+    /// which is as good as the approximation gets without this datum). The
+    /// gRPC surface the REMOTE `cli` binary uses (`pkg/grpcapi`) and the REST
+    /// surface (`pkg/api`) still answer an interface filter from the zone —
+    /// see `session/README.md` "Which surfaces this applies to".
     ///
     /// `0` means "no ingress identity carried" and is NEVER a valid ifindex.
-    /// Three populations legitimately carry `0`:
+    /// These populations legitimately carry `0`:
     ///   - the REVERSE companion — its true ingress is the forward flow's
-    ///     egress interface, which is not resolved at install time;
+    ///     egress interface, which is not resolved at install time (the CLI
+    ///     never interface-matches a reverse row anyway: every show/clear call
+    ///     site skips `IsReverse != 0` first);
     ///   - a PEER-SYNCED session — an ifindex is NODE-LOCAL, so the peer's
     ///     number names a different NIC here. Carrying it across the cluster
     ///     wire would produce a confidently WRONG interface name, strictly
     ///     worse than approximating, so it is deliberately not synced;
+    ///   - the HOST-OUTBOUND GRE encapsulation path (`afxdp/tunnel.rs`) —
+    ///     firewall-self-originated traffic read off the TUN device has no
+    ///     ingress binding to record, so `0` is the correct answer there;
+    ///   - the flow-cache descriptor seed, which is replay state for an
+    ///     already-installed session and is never published as one;
     ///   - a session installed by a pre-#4983 helper.
-    /// The Go consumer falls back to the zone approximation for all three
+    /// The MISSING-NEIGHBOR seed is NOT among them — it is a published forward
+    /// session that outlives the neighbor resolution, so it is stamped from the
+    /// frame's `meta` like the two policy-admitted install sites.
+    /// The Go consumer falls back to the zone approximation for every zero
     /// (never "matches nothing", never "matches everything").
     pub(crate) ingress_ifindex: u32,
     /// #4983: the 802.1Q VLAN id this session's FIRST packet arrived with

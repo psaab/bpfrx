@@ -21,7 +21,8 @@ struct session_value {
 				* (0x100), which does not fit a __u8 (#5460). The
 				* compiler inserts one pad byte after `state` and
 				* two after `is_reverse`; the C/Rust/Go layouts
-				* stay byte-identical (size-asserted 136/184). */
+				* stay byte-identical (size-asserted 144/192 -- 136/184
+				* before #4983 appended the ingress-identity pair). */
 	__u8  tcp_state;       /* TCP-specific sub-state */
 	__u8  is_reverse;      /* 1 if this is the reverse direction entry */
 	__u32 app_timeout;     /* per-application inactivity timeout (seconds), 0=use default */

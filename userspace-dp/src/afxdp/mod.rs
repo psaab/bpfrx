@@ -509,6 +509,9 @@ mod tests_embedded_poll_filter;
 #[path = "tests_fabric_zone_stamp.rs"]
 mod tests_fabric_zone_stamp;
 #[cfg(test)]
+#[path = "tests_session_ingress_identity.rs"]
+mod tests_session_ingress_identity;
+#[cfg(test)]
 #[path = "tests_slow_path_disposition.rs"]
 mod tests_slow_path_disposition;
 #[cfg(test)]

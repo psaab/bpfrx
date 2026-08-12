@@ -1272,6 +1272,8 @@ fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
         &state,
         TEST_LAN_ZONE_ID,
         TEST_WAN_ZONE_ID,
+        11,
+        50,
         true,
         decision,
     );
@@ -1280,6 +1282,9 @@ fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
     assert_eq!(metadata.egress_zone, 2);
     assert!(metadata.fabric_ingress);
     assert!(!metadata.is_reverse);
+    // #4983: the seed carries the frame's ingress binding through, not 0.
+    assert_eq!(metadata.ingress_ifindex, 11);
+    assert_eq!(metadata.ingress_vlan_id, 50);
 }
 
 #[test]

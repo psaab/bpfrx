@@ -4803,6 +4803,14 @@ pub(super) fn poll_binding_process_descriptor(
                                         worker_ctx.forwarding,
                                         from_zone_id,
                                         to_zone_id,
+                                        // #4983: stamp the seed's TRUE ingress identity from the
+                                        // frame that created it, exactly as the two policy-admitted
+                                        // install sites above do. This seed is published to the BPF
+                                        // conntrack map below and is never re-installed once the
+                                        // neighbor resolves, so it is the session's only chance to
+                                        // record where the flow actually arrived.
+                                        meta.ingress_ifindex,
+                                        meta.ingress_vlan_id,
                                         packet_fabric_ingress,
                                         pending_decision,
                                     );

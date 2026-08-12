@@ -974,24 +974,58 @@ exact.) `pkg/cli/session_filter.go`'s `resolveIngressIfaces` now resolves the
 recorded pair through the very same `{parent ifindex, VLAN}` map the EGRESS
 side already uses (`buildSessionEgressIfaces`), so one map defines one
 interface identity for both directions and two units of a single trunk NIC —
-`reth0.50` vs `reth0.80` — do not alias onto the parent.
+`reth0.50` vs `reth0.80` — do not alias onto the parent. The `In: ... If:`
+column of the detailed `show` output is resolved from the same identity
+(`sessionIngressIf` in `pkg/cli/cli_show_flow.go`), so the filter and the
+displayed interface name cannot disagree.
+
+**Which surfaces this applies to.** The consumer side landed in the IN-DAEMON
+CLI only (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
+the same session table and still answer an `interface` filter from the ingress
+ZONE, in the pre-#4792 FIRST-interface-only form:
+
+- `pkg/grpcapi/server_sessions.go` (`f.zoneIfaces[zid] = zone.Interfaces[0]`),
+  which is what the REMOTE `cli` binary uses for both `show security flow
+  session interface <name>` and the matching `clear`;
+- `pkg/api/sessions.go`, the HTTP/REST session query.
+
+Neither is changed here (this PR's diff against `pkg/grpcapi` and `pkg/api` is
+empty), so on those surfaces an interface filter still selects every session of
+the named interface's zone whose zone happens to resolve to that first
+interface. Porting `resolveIngressIfaces` to them is tracked separately.
 
 The identity is stamped ONCE and never re-derived from the zone; re-deriving
 is the approximation it exists to remove.
 
-**`0` means "no ingress identity carried" and is never a valid ifindex.** Three
+**`0` means "no ingress identity carried" and is never a valid ifindex.** These
 populations legitimately carry `0`, and the CLI falls back to the zone
 approximation for all of them — never "matches nothing" (which would hide them
 from `show`/`clear`), never "matches everything":
 
-1. the REVERSE companion — its true ingress is the forward flow's egress
-   interface, unresolved at install;
-2. a PEER-SYNCED session — an ifindex is NODE-LOCAL, so node 0's `ge-0-0-1`
-   and node 1's `ge-7-0-1` are different numbers for the same logical RETH
-   member. The identity is deliberately NOT carried across the cluster wire:
-   shipping the peer's number would render a confidently WRONG interface name
-   locally, strictly worse than approximating;
-3. a session installed by a pre-#4983 helper, mid rolling upgrade.
+1. the REVERSE companion (`poll_descriptor` reverse install, `shared_ops`
+   synthesized companion) — its true ingress is the forward flow's egress
+   interface, unresolved at install. Note the CLI fallback is INERT for this
+   one: every `show`/`clear` call site skips `IsReverse != 0` rows before
+   reaching the filter, so a reverse entry is never interface-matched at all;
+2. a PEER-SYNCED session (`server/helpers/session_sync.rs`) — an ifindex is
+   NODE-LOCAL, so node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different
+   numbers for the same logical RETH member. The identity is deliberately NOT
+   carried across the cluster wire: shipping the peer's number would render a
+   confidently WRONG interface name locally, strictly worse than approximating;
+3. the HOST-OUTBOUND GRE encapsulation path (`afxdp/tunnel.rs`,
+   `build_local_origin_tunnel_tx_request`) — firewall-self-originated traffic
+   read off the TUN device. There is no ingress binding to record: its
+   `UserspaceDpMeta` is synthesized from the raw packet, so `0` here is the
+   correct answer, not a gap;
+4. the flow-cache descriptor seed (`afxdp/flow_cache.rs`) — replay state for an
+   already-installed session, never published as a session itself;
+5. a session installed by a pre-#4983 helper, mid rolling upgrade.
+
+The MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`) is NOT in
+that list: it is a forward session installed when a flow's first packet races
+an unresolved ARP/NDP, it is published to the conntrack map, and the
+pending-neighbor retry sweep never re-installs it — so it is stamped from the
+frame's `meta` exactly like the two policy-admitted install sites.
 
 A NON-ZERO ifindex the running config cannot name (an interface deleted since
 install, a tunnel/fabric ingress with no config unit) falls back the same way.

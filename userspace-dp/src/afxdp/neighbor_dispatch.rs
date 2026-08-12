@@ -607,12 +607,22 @@ pub(super) fn build_missing_neighbor_session_metadata(
     forwarding: &ForwardingState,
     ingress_zone: u16,
     egress_zone: u16,
+    // #4983: the ingress binding of the frame that created this seed
+    // (`meta.ingress_ifindex` / `meta.ingress_vlan_id`). A missing-neighbor
+    // seed is a FORWARD session that survives for the life of the flow — the
+    // pending-neighbor retry sweep replays the buffered frame but never
+    // re-installs the session, so whatever is stamped here is the identity
+    // the session carries until it expires. Leaving it 0 (as before) meant
+    // every flow whose first packet raced an unresolved ARP/NDP kept the zone
+    // approximation forever — a routine cold-start case on a busy LAN.
+    ingress_ifindex: u32,
+    ingress_vlan_id: u16,
     fabric_ingress: bool,
     decision: SessionDecision,
 ) -> SessionMetadata {
     SessionMetadata {
-        ingress_ifindex: 0,
-        ingress_vlan_id: 0,
+        ingress_ifindex,
+        ingress_vlan_id,
         ingress_zone,
         egress_zone,
         owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),

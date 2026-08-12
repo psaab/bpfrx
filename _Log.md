@@ -69888,14 +69888,27 @@ aliasing onto the parent. `cli_clear.go` needed no edit — it shares
 
 `0` = no identity carried, and the CLI falls back to the zone approximation for
 it — never "matches nothing" (which would hide sessions from `show`/`clear`),
-never "matches everything". Three populations legitimately carry 0: the reverse
-companion (its ingress is the forward flow's egress, unresolved at install), a
-peer-synced session, and a pre-#4983 helper's session. The peer case is a
-DESIGN choice, not an omission: an ifindex is node-local, so node 0's
-`ge-0-0-1` and node 1's `ge-7-0-1` are different numbers for the same logical
-RETH member and shipping the peer's value would name the wrong interface
-locally. The identity is therefore deliberately not carried on the cluster
-wire.
+never "matches everything". The populations that legitimately carry 0 are: the
+reverse companion (its ingress is the forward flow's egress, unresolved at
+install — and the CLI never interface-matches a reverse row anyway, every
+show/clear call site skips `IsReverse != 0` first), a peer-synced session, the
+host-outbound GRE encapsulation path in `afxdp/tunnel.rs` (firewall-originated
+traffic off the TUN device has no ingress binding to record), the flow-cache
+descriptor seed (replay state, never published as a session), and a pre-#4983
+helper's session. The peer case is a DESIGN choice, not an omission: an ifindex
+is node-local, so node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different
+numbers for the same logical RETH member and shipping the peer's value would
+name the wrong interface locally. The identity is therefore deliberately not
+carried on the cluster wire.
+
+SURFACE SCOPE: the consumer change is in the IN-DAEMON CLI (`pkg/cli`) only.
+`pkg/grpcapi/server_sessions.go` — which the REMOTE `cli` binary uses for both
+`show security flow session interface <name>` and the matching `clear` — and
+`pkg/api/sessions.go` still resolve an interface filter from the ingress ZONE,
+in the pre-#4792 FIRST-interface-only form (`zone.Interfaces[0]`). This PR's
+diff against both packages is empty. So an interface-filtered show/clear is
+exact on the console and still approximate over gRPC/REST; the port is tracked
+separately.
 
 ABI: the fields join the shared C conntrack struct (not the sync-only trailing
 fields), growing it 136 -> 144 / 184 -> 192 — the u32 on the existing 8-byte
@@ -69913,6 +69926,109 @@ assertion (`left: 0, right: 24`) with the publish hunk reverted. The
 over-reach guards — `TestIngressIdentityDoesNotDisturbEgressMatching4983` and
 `ingress_identity_does_not_occupy_the_fib_egress_slots_4983` — stayed GREEN
 under both reverts.
+
+Those two reverts covered the CLI FILTER and the conntrack PUBLISH — the
+mirror and the consumer. Neither claimed the PRODUCER (the poll-body stamp)
+was bound, and it was not: replacing both
+`ingress_ifindex: meta.ingress_ifindex` / `ingress_vlan_id:
+meta.ingress_vlan_id` lines with `0` left the whole Rust suite green, because
+the Rust tests hand-set a `SessionMetadata` and the Go tests hand-build a
+`dataplane.SessionValue`. See the follow-up entry below for the producer
+binding and the missing-neighbor seed stamp.
+
+## 2026-08-12 — #4983 review fold: bind the producer, stamp the seed
+
+- **Timestamp**: 2026-08-12
+- **Action**: Bind the poll-body ingress stamp with a fail-on-revert test,
+  stamp the missing-neighbor seed, resolve the display column from the same
+  identity, and scope the shipped claims to the surface they are true of
+- **File(s)**: `userspace-dp/src/afxdp/neighbor_dispatch.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+  `userspace-dp/src/afxdp/tests_session_ingress_identity.rs` (new),
+  `userspace-dp/src/afxdp/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`,
+  `userspace-dp/src/afxdp/bpf_map/mod.rs`,
+  `userspace-dp/src/session/entry.rs`, `userspace-dp/src/session/README.md`,
+  `bpf/headers/xpf_conntrack.h`, `pkg/dataplane/types.go`,
+  `pkg/cli/cli_show_flow.go`, `pkg/cli/cli_show_flow_ingress_if_4983_test.go`
+  (new), `_Log.md`
+
+F1 (producer unbound). The only two places a real packet's binding reached
+`SessionMetadata` were the host-inbound LocalDelivery and transit-forward
+install literals in `poll_binding_process_descriptor`. Replacing both with `0`
+left the Rust suite fully green (4255 passed; 0 failed) — the three Rust
+#4983 tests hand-set a `SessionMetadata` and so bind the conntrack MIRROR, and
+the four Go tests hand-build a `dataplane.SessionValue` and so bind the
+CONSUMER. Nothing observed the producer. A future refactor of the 5000-line
+poll body could drop those four lines and every session would silently carry
+`ingress_ifindex 0`, returning `show/clear ... interface X` to exact pre-#4983
+behaviour with CI green.
+
+`tests_session_ingress_identity.rs` drives the real
+`poll_binding_process_descriptor` (via `txn_run_descriptor`) with a permitted
+LAN -> WAN SYN ingressing on a VLAN unit of a TRUNK NIC — parent ifindex 11,
+VID 50 — whose SIBLING unit on the same parent (reth0.80, VID 80) is the
+egress, and whose parent resolves to a DIFFERENT zone. The forward install must
+carry 11/50; a separate `#[test]` asserts the reverse companion installed by
+the same call carries 0/0, so the two arms are distinguished rather than both
+satisfied by one constant.
+
+F3 (missing-neighbor seed unstamped). `build_missing_neighbor_session_metadata`
+hardcoded 0/0 for a FORWARD session, while the caller had `meta` in scope 32
+lines above. That seed is installed for any flow whose first packet races an
+unresolved ARP/NDP — an ordinary cold start on a busy LAN — is published to the
+conntrack map at install, and is never re-installed: `retry_pending_neigh`
+replays the buffered frame and does not take a `&mut SessionTable`. So the flow
+kept the zone approximation for its whole life. The builder now takes the
+ingress binding and the call site passes `meta.ingress_ifindex` /
+`meta.ingress_vlan_id`.
+
+F5 (filter and column disagreed). `cli_show_flow.go` derived the displayed
+`In: ... If:` name from the ingress zone's FIRST interface, so after this PR an
+interface-filtered show selected exactly the right sessions and then printed
+the wrong interface for every one. A `sessionIngressIf` closure — same shape as
+the existing `sessionEgressIf` — resolves it from the recorded identity.
+
+F2/F4 (claims). The shipped contract stated the CLI behaviour unconditionally;
+it is true of the in-daemon console CLI only. `pkg/grpcapi` (the remote `cli`
+binary, show AND clear) and `pkg/api` keep the zone approximation in its
+pre-#4792 first-interface-only form, and this PR's diff against both is empty.
+`session/entry.rs`, `session/README.md`, `pkg/dataplane/types.go` and the
+entry above are now scoped, and the population list is corrected: it had listed
+the reverse companion (whose fallback is inert — every CLI show/clear call site
+skips `IsReverse != 0` before filtering) and omitted the seed path and the
+host-outbound GRE path in `tunnel.rs`. Two ABI notes still said "size-asserted
+at 136"; the assertions are 144/192.
+
+Validation. `cargo test --release` 4257 passed / 0 failed / 2 ignored in the
+main binary (three new tests), all other targets ok. `go build ./...` exit 0,
+`go test ./pkg/cli/... ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/...`
+all ok. Mutation matrix, each applied via edit and restored with a clean
+`git diff` on the production file:
+
+- both poll-body stamps -> `0`, measured against the FULL Rust suite: 4256
+  passed / 1 FAILED — the single failure is
+  `poll_descriptor_transit_install_stamps_ingress_binding_4983`, "the forward
+  session must record the ifindex of the binding its first packet arrived on
+  ... left: 0, right: 11". Nothing else among 4257 tests observes the revert,
+  which is the finding this entry exists to close. Reverse guard and seed test
+  GREEN.
+- transit `ingress_vlan_id` -> `0` only (ifindex left stamped): same test RED
+  on the VID assertion, "left: 0, right: 50" — the two halves bind
+  independently.
+- seed stamp -> `0` with both poll-body stamps intact:
+  `poll_descriptor_missing_neighbor_seed_stamps_ingress_binding_4983` RED,
+  "left: 0, right: 11"; transit test GREEN.
+- reverse companion -> `meta.ingress_*`:
+  `poll_descriptor_reverse_companion_carries_no_ingress_identity_4983` RED,
+  "left: 11, right: 0" — the over-reach guard is proven to FIRE, not merely to
+  stay green.
+- `sessionIngressIf` display call sites -> `zoneIfaces[val.IngressZone]`:
+  `TestShowFlowSessionIngressIfColumnUsesRecordedIdentity4983` RED on both the
+  v4 and v6 arms.
+
+Every RED above is an assertion failure, not a build break.
+
 - **Timestamp**: 2026-08-06
 - **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
   and blocked on #5480. Seven review rounds established that the fence keys on
