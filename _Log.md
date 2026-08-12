@@ -70030,6 +70030,28 @@ all ok. Mutation matrix, each applied via edit and restored with a clean
 Every RED above is an assertion failure, not a build break.
 
 - **Timestamp**: 2026-08-06
+- **Action**: #5480 research plan — `docs/peer-boot-incarnation-plan.md`. Plan
+  only, no implementation, no wire change. Establishes that the incarnation
+  granularity is not a free choice: `initGenState` seeds `configGenCounter` from
+  a monotonic base precisely so generations survive "restarts within a boot", so
+  the incarnation must change exactly when CLOCK_MONOTONIC restarts — exactly on
+  OS boot — which makes `/proc/sys/kernel/random/boot_id` the one correct source
+  and rules out a process seed, a persisted counter, and the existing
+  `bulkSendNext` transfer epoch. Places the field in the `syncMsgBulkStart`
+  payload (8 -> 24 bytes) rather than the auth HELLO, because
+  `performSyncHandshake` returns immediately when unkeyed, so a HELLO-carried
+  field would make the guard silently absent on unkeyed clusters. The extension
+  uses this protocol's established length-gated pattern (`>= 8` on BulkStart,
+  `>= 24`/`>= 48` on the delete frames, the session payload's "all length-gated"
+  note). Recommends FAIL-OPEN on an absent incarnation, with the argument that
+  the fallback IS origin/master's behaviour, that it matches the existing
+  gen==0 / epoch==0 / (0,0) legacy sentinels, and that failing closed would
+  strand the standby for the whole rolling-upgrade window. Concludes NO flag day
+  is needed, but records the contingency explicitly: a fail-CLOSED requirement
+  would force one, because an upgraded receiver cannot distinguish an old peer
+  from a suppressing peer without a negotiated capability, and that capability
+  has nowhere to live unkeyed.
+- **File(s)**: docs/peer-boot-incarnation-plan.md, _Log.md
 - **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
   and blocked on #5480. Seven review rounds established that the fence keys on
   `syncConnID`, a total ORDER over connections, when the predicate it needs is
@@ -70163,3 +70185,90 @@ Every RED above is an assertion failure, not a build break.
   `tests_session_ingress_identity.rs`.
 - **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
   userspace-dp/src/session/README.md, _Log.md
+## 2026-08-06 — #4408 increment 3a: lift the waterfill epoch refill (Option B')
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 epoch refill out of
+  `select_exact_cos_guarantee_queue_waterfill` into
+  `refill_waterfill_epoch(root, now_ns)`, `#[inline(always)]`, same
+  module. Pure motion: the 74 moved lines diff clean against master's
+  `:1000-1073` once leading whitespace is stripped, and the only
+  non-motion edit is the doc comment de-indenting from `    //` to `//`
+  as it becomes the helper's header. The block stays ATOMIC — the order
+  of the `waterfill_epochs` bump, the `epoch_boundary`-gated
+  honored-bitset clear, and `waterfill_epoch_wrap_pending = false` is
+  the #1743 r3 livelock fix, and the helper's header says so.
+- **Scope honesty**: this does NOT move the committed modularity metric.
+  `docs/refactoring-audit-current.txt` gates on file set and tier;
+  `queue_service/mod.rs` was 2166 `[REFACTOR]` and stays above the 2000
+  floor, so the tier is unchanged and `TestHeatmapNotStale` neither
+  fires nor needs a regenerated artifact (`go test
+  ./pkg/refactoraudit/...` ok). The value is reviewability of a state
+  machine, and nothing else.
+- **Validation**: call-edge baseline REGENERATED at this head, not
+  inherited from the plan (`docs/research/4408-hotpath-split/plan.md`
+  §2's artifacts are from `dd23119aa`). Raw, zero-normalisation Tier 1
+  on `service_exact_guarantee_queue_direct_with_info` (the symbol the
+  waterfill inlines into) — 32 edges, diff exit 0; on the untouched
+  `enqueue_pending_forwards` control — 51 edges, diff exit 0. `nm`:
+  neither the waterfill nor `refill_waterfill_epoch` is present, and
+  `service_exact_guarantee_queue_direct_with_info` holds at 0x619b.
+  Negative control: flipping the helper to `#[inline(never)]` puts it in
+  `nm` at 0x1eb and the Tier-1 diff reports the new edge — the gate is
+  watched failing, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs, _Log.md
+
+## 2026-08-06 — #4408 increment 3b: split the waterfill's two selection walks
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 ascending walk and the Phase-2
+  descending residual walk into `waterfill_phase1_select` /
+  `waterfill_phase2_select`, both `#[inline(always)]` and same-module,
+  leaving `select_exact_cos_guarantee_queue_waterfill` a 59-line
+  orchestrator (from 432) over refill -> Phase 1 -> Phase 2 -> wrap
+  tail. Pure motion: 175 + 108 moved lines diff clean against master's
+  `:1094-1268` and `:1280-1387` after stripping leading whitespace.
+  `Option` is a faithful encoding, not an invented protocol — every
+  non-selecting exit of each walk already converged on the same
+  successor in the original body.
+- **Finding (the reason this took a second pass)**: the plan's §7.2
+  mutation grid caught that `waterfill_phase2_select` was **completely
+  unbound**. Both prescribed cells — M5 "Phase 2 ignores the honored
+  bitset" and M6 "Phase 2 resets the cursor on each entry" — left the
+  full waterfill + refund suite GREEN. Every pre-existing fixture enters
+  Phase 2 with the largest class UN-honored (Phase 1 walks ascending and
+  runs out of budget before reaching it), so the descending walk lands
+  on an eligible queue at cursor 0 and neither the honored-skip nor the
+  cursor arithmetic is ever exercised. Two tests now bind it, built on a
+  fixture that honors the LARGEST class first by emptying the two small
+  queues so Phase 1 skips them, then refilling them so the next call
+  breaks into Phase 2 with ordinal bit 2 set.
+- **Validation**: 6-of-6 mutation grid, each cell a NAMED failing test
+  with an ASSERTION (never a build break), plus a negative control.
+  M1 (drop the `epoch_boundary` gate) REDs
+  `waterfill_exact_fit_honor_does_not_livelock_phase1`; M2 (reset the
+  cursor in the refill) REDs
+  `waterfill_exhausted_refill_does_not_reset_phase2_cursor` — "the
+  exhausted refill path must PRESERVE the Phase-2 cursor"; M3 (drop the
+  honored-bit set) REDs 8 tests incl. the #1732 distribution test; M4
+  (charge `send_budget` not `phase1_cost`) REDs 5 incl.
+  `waterfill_phase1_honor_charge_is_configured_quantum_not_tokens`;
+  M5 REDs both new Phase-2 tests; M6 REDs ONLY
+  `waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest`
+  — "Phase 2 must RESUME the descending walk from the stored cursor",
+  left 1 right 0 — so the two new tests discriminate rather than
+  restate each other. The negative control (hoisting the
+  `waterfill_epochs` bump earlier inside the same block, semantically
+  null) stays GREEN, so the grid measures the code rather than
+  reporting "everything fails".
+- **Codegen**: raw zero-normalisation Tier-1 call-edge sets unchanged on
+  `service_exact_guarantee_queue_direct_with_info` (32 edges) and on the
+  untouched `enqueue_pending_forwards` control (51 edges).
+  `service_exact_guarantee_queue_direct_with_info` grows 0x619b ->
+  0x61cf (+52 B, +0.21%) with an identical call-edge set — scheduling
+  drift, not a new or lost callee. Negative control fires for all three
+  helpers. Three whole-binary residuals in modules this PR does not
+  open are classified in the PR body.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
+  docs/cos-validation-notes.md, _Log.md
