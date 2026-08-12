@@ -73,6 +73,22 @@ type SessionValue struct {
 	// so it is present on bpfSessionValue and round-trips through the BPF
 	// mirror.
 	//
+	// SCOPE (#6965): the stamp is on every forward session the helper installs,
+	// but only some of those sessions reach THIS map, which is what
+	// IterateSessions — and therefore `show`/`clear security flow session` —
+	// enumerates. The helper's publish_bpf_conntrack_entry is called from only
+	// three sites in afxdp/poll_descriptor: the host-inbound (LocalMiss)
+	// install, the missing-neighbor-seed install, and the reverse-companion
+	// repair (whose row is IsReverse != 0 and is skipped before filtering).
+	// The ordinary TRANSIT forward install does NOT publish here — it writes
+	// the shim's separate steering table via publish_live_session_entry — so a
+	// transit session has NO row in this map at all, and an interface filter
+	// cannot select it either way. That gap predates #4983 (it dates to the
+	// commit that first added the conntrack mirror) and is tracked as #6965;
+	// until it is closed, this field is operator-visible for the host-inbound
+	// and missing-neighbor-seed populations plus peer-synced sessions the Go
+	// side installs directly.
+	//
 	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
 	// populations legitimately carry 0 and MUST keep working:
 	//   - the reverse companion (its real ingress is the forward flow's egress,
@@ -255,6 +271,22 @@ type SessionValueV6 struct {
 	// (session_value.ingress_ifindex), NOT the sync-only trailing fields below,
 	// so it is present on bpfSessionValue and round-trips through the BPF
 	// mirror.
+	//
+	// SCOPE (#6965): the stamp is on every forward session the helper installs,
+	// but only some of those sessions reach THIS map, which is what
+	// IterateSessions — and therefore `show`/`clear security flow session` —
+	// enumerates. The helper's publish_bpf_conntrack_entry is called from only
+	// three sites in afxdp/poll_descriptor: the host-inbound (LocalMiss)
+	// install, the missing-neighbor-seed install, and the reverse-companion
+	// repair (whose row is IsReverse != 0 and is skipped before filtering).
+	// The ordinary TRANSIT forward install does NOT publish here — it writes
+	// the shim's separate steering table via publish_live_session_entry — so a
+	// transit session has NO row in this map at all, and an interface filter
+	// cannot select it either way. That gap predates #4983 (it dates to the
+	// commit that first added the conntrack mirror) and is tracked as #6965;
+	// until it is closed, this field is operator-visible for the host-inbound
+	// and missing-neighbor-seed populations plus peer-synced sessions the Go
+	// side installs directly.
 	//
 	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
 	// populations legitimately carry 0 and MUST keep working:

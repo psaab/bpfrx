@@ -958,11 +958,37 @@ pre-#2785 behavior. The JSON RPC-fallback delta (`SessionDeltaInfo` in
 A session records the interface its FIRST packet arrived on. At install
 `afxdp/poll_descriptor` stamps `SessionMetadata::ingress_ifindex` and
 `ingress_vlan_id` from the frame's `UserspaceDpMeta` — the binding the packet
-was actually received on plus its 802.1Q tag — and
-`afxdp/bpf_map/publish_conntrack` mirrors both into the conntrack value
+was actually received on plus its 802.1Q tag. For the sessions that ARE
+mirrored to the kernel-visible conntrack map (see the next paragraph),
+`afxdp/bpf_map/publish_conntrack` copies both into the conntrack value
 (`session_value.ingress_ifindex` / `ingress_vlan_id`), where the Go control
 plane reads them as `dataplane.SessionValue.IngressIfindex` /
 `IngressVlanID`.
+
+**Which sessions this is OPERATOR-VISIBLE for (#6965).** The stamp above is on
+the helper's in-memory `SessionEntry`, and that is a different question from
+what `show security flow session` can see. That command enumerates the BPF
+conntrack map (`pkg/dataplane/maps_session.go`'s `Manager.IterateSessions`
+over `m.maps["sessions"]`), and only three install sites ever write it:
+`publish_bpf_conntrack_entry`'s callers in `afxdp/poll_descriptor` — the
+host-inbound `LocalMiss` install, the `MissingNeighborSeed` install, and the
+reverse-companion repair on the session-hit path (that third row is
+`is_reverse != 0`, which every `show`/`clear` call site skips before filtering,
+so it never surfaces a flow on its own). The ordinary TRANSIT forward
+install does NOT publish there: it calls `publish_live_session_entry`, which
+writes the shim's steering table (`session_map_fd`, a 36-byte key with a
+one-byte action value — a different map from the 144-byte conntrack value),
+plus `publish_shared_session` for the shared/HA maps.
+
+So the identity is stamped on every forward session, but reaches the operator
+surface only for the host-inbound and missing-neighbor-seed populations, and
+for peer-synced sessions the Go side installs directly. Transit sessions are
+absent from that map entirely — not carrying a zeroed identity, but having no
+row at all — so `show`/`clear ... interface <name>` cannot select them either
+way. That gap is PRE-EXISTING (it dates to `fab9230c5`, the commit that first
+added the conntrack mirror and wired only these three sites) and is tracked as
+**#6965**; #4983 neither introduced nor widened it. Closing #6965 is what makes
+this datum operator-visible for the dominant population.
 
 Before this the session carried only its ingress ZONE, so
 `show security flow session interface <name>` and the matching `clear` had to

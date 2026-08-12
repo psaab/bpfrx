@@ -29,16 +29,26 @@ pub(crate) struct SessionMetadata {
     /// install from `UserspaceDpMeta::ingress_ifindex` (the binding the frame
     /// was actually received on) and never re-derived from `ingress_zone`
     /// afterwards; re-deriving is precisely the approximation this field
-    /// exists to remove. Mirrored into the conntrack map as
-    /// `session_value.ingress_ifindex` by `publish_conntrack`, which is how
-    /// the IN-DAEMON CLI's `show security flow session interface <name>` and
-    /// the matching `clear` stop matching a session on interface X against a
-    /// filter for a SIBLING interface Y of the same multi-interface zone
-    /// (#4792 widened that CLI to consider every interface bound to the zone,
-    /// which is as good as the approximation gets without this datum). The
-    /// gRPC surface the REMOTE `cli` binary uses (`pkg/grpcapi`) and the REST
-    /// surface (`pkg/api`) still answer an interface filter from the zone —
-    /// see `session/README.md` "Which surfaces this applies to".
+    /// exists to remove. For the sessions that are mirrored, `publish_conntrack`
+    /// copies it into the conntrack map as `session_value.ingress_ifindex`,
+    /// which is how the IN-DAEMON CLI's `show security flow session interface
+    /// <name>` and the matching `clear` stop matching a session on interface X
+    /// against a filter for a SIBLING interface Y of the same multi-interface
+    /// zone (#4792 widened that CLI to consider every interface bound to the
+    /// zone, which is as good as the approximation gets without this datum).
+    /// The gRPC surface the REMOTE `cli` binary uses (`pkg/grpcapi`) and the
+    /// REST surface (`pkg/api`) still answer an interface filter from the zone
+    /// — see `session/README.md` "Which surfaces this applies to".
+    ///
+    /// SCOPE (#6965): "for the sessions that are mirrored" is load-bearing.
+    /// `publish_bpf_conntrack_entry` is called from only three sites in
+    /// `afxdp/poll_descriptor` — the host-inbound (LocalMiss) install, the
+    /// missing-neighbor-seed install, and the reverse-companion repair. The
+    /// ordinary TRANSIT forward install does NOT publish there (it writes the
+    /// shim's separate steering table via `publish_live_session_entry`), so a
+    /// transit session has no conntrack row at all and this stamp, though
+    /// correct on the in-memory entry, is not operator-visible for it. The gap
+    /// predates #4983 and is tracked as #6965.
     ///
     /// `0` means "no ingress identity carried" and is NEVER a valid ifindex.
     /// These populations legitimately carry `0`:

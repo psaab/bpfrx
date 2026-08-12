@@ -39,11 +39,15 @@
 //
 // SCOPE, stated plainly because it is easy to over-read: these tests bind what
 // the poll body STAMPS onto the installed session. They do not, and cannot,
-// assert that a transit session's identity reaches the operator-visible BPF
+// assert that a TRANSIT session's identity reaches the operator-visible BPF
 // conntrack map — the transit install does not publish there at all (it calls
-// `publish_live_session_entry`, which writes shim steering KEYS, plus
-// `publish_shared_session`). Only the LocalMiss and missing-neighbor-seed
-// installs call `publish_bpf_conntrack_entry`. That gap predates #4983.
+// `publish_live_session_entry`, which writes shim steering KEYS into a
+// different map, plus `publish_shared_session`). Only the LocalMiss and
+// missing-neighbor-seed installs call `publish_bpf_conntrack_entry`, and their
+// tests below DO drive that call. The transit gap predates #4983 — it dates to
+// `fab9230c5`, the commit that first added the conntrack mirror and wired only
+// those sites — and is tracked as #6965. Read these tests as "the stamp is
+// correct", not "the operator can see it for every session".
 //
 // Sibling `#[path]` test module loaded from afxdp/mod.rs, mirroring the #4840
 // split; helpers come from afxdp/tests_support.rs.
@@ -222,6 +226,17 @@ fn split_forward_reverse(sessions: &SessionTable) -> (Vec<SessionMetadata>, Vec<
 ///
 /// RED on reverting `poll_descriptor/mod.rs` transit install to
 /// `ingress_ifindex: 0` / `ingress_vlan_id: 0`.
+///
+/// WHAT THIS DOES NOT ASSERT, and why there is no assertion to add: it stays
+/// GREEN if you "omit the full conntrack publication" for this install,
+/// because the transit install HAS no conntrack publication to omit (#6965).
+/// It writes the shim steering table (`publish_live_session_entry`) and the
+/// shared maps, never `publish_bpf_conntrack_entry`. An assertion that this
+/// stamp reaches the operator-visible map would be asserting a call that does
+/// not exist on this path — it would fail today and would be testing #6965's
+/// fix, not #4983's. This test binds the STAMP; the mirror is #6965's to bind.
+/// The sibling `..._without_an_rg_4983` covers the other scope hole (a stamp
+/// conditioned on `owner_rg_id`), which IS real and IS closed here.
 #[test]
 fn poll_descriptor_transit_install_stamps_ingress_binding_4983() {
     let sessions = run_ingress_identity_flow();

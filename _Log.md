@@ -70335,3 +70335,59 @@ Every RED above is an assertion failure, not a build break.
 - **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
   userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
   pkg/dataplane/bpf_session_value.go, pkg/dataplane/types.go, _Log.md
+
+## 2026-08-12 — #4983 round 3: narrow the operator-visibility claim to #6965
+
+- **Timestamp**: 2026-08-12
+- **Action**: The #4983 docs claimed the stamped ingress identity is mirrored
+  into the conntrack value "where the Go control plane reads them". That is
+  true of the METADATA and false of what reaches `show security flow session`.
+  A trace (recorded on #6965) established that the command enumerates the BPF
+  conntrack map — `Manager.IterateSessions` over `m.maps["sessions"]`,
+  pkg/dataplane/maps_session.go — and that `publish_bpf_conntrack_entry` has
+  exactly three production callers in `afxdp/poll_descriptor`: the host-inbound
+  LocalMiss install, the missing-neighbor-seed install, and the
+  reverse-companion repair (whose row is `IsReverse != 0` and is skipped before
+  filtering). The ordinary TRANSIT forward install is NOT among them: it calls
+  `publish_live_session_entry`, which writes the shim's steering table — a
+  36-byte key with a ONE-BYTE action value, a different map from the 144-byte
+  conntrack value — plus `publish_shared_session`. Instrumenting the publisher
+  and running the whole 4260-test bin suite produced 23 fires, every one a
+  LocalDelivery or MissingNeighborSeed install plus one reverse repair, and
+  ZERO transit-forward publishes even from tests that drive complete permitted
+  transit flows with replies. The remaining escape routes are closed:
+  `refresh_bpf_conntrack_last_seen` updates with `BPF_EXIST` so it can never
+  create a missing row, `session_delta.rs` only deletes, `ConntrackCtx` has no
+  caller in any commit, and the Go side's only conntrack writers are the
+  cluster-sync install and snapshot rollback. So a transit session has no row
+  at all — not a zeroed identity — and an interface filter cannot select it
+  either way.
+- **Decision**: the gap is PRE-EXISTING (origin `fab9230c5`, the commit that
+  first added the conntrack mirror and wired only these three sites) and is
+  strictly larger than #4983, so it is NOT fixed here. Publishing the full
+  entry at the transit install would add a BPF syscall to the new-session cold
+  path — the path #5287 exists because a full-table conntrack pass stalled the
+  low-latency core — and forces three decisions this PR has no basis to make
+  (reverse-companion row, conntrack-map capacity once the mirror is
+  near-complete, `SessionCount`/Prometheus/GC semantics). Filed as **#6965**,
+  marked as needing research before implementation.
+- **Fix**: narrow the claim rather than overstate it. `session/README.md` gains
+  a "Which sessions this is OPERATOR-VISIBLE for (#6965)" paragraph naming the
+  three publishing sites, the two-map distinction, and the transit exclusion;
+  `pkg/dataplane/types.go` gains the same SCOPE note on both `IngressIfindex`
+  field docs; `session/entry.rs` likewise. The transit test's own doc comment
+  now records WHY no assertion is added for the mirror: it stays green if you
+  "omit the full conntrack publication" because there IS no transit publication
+  to omit, so such an assertion would fail today and would be testing #6965's
+  fix rather than #4983's. The module header says the same in one place and
+  points at #6965.
+- **Validation**: docs/comments only — no production or test logic changed this
+  round. `cargo test --release` rc=0, 4261 passed / 0 failed;
+  `go build ./pkg/dataplane/...` rc=0, `go vet ./pkg/dataplane/...` rc=0,
+  `go test -count=1 ./pkg/cli/... ./pkg/dataplane/...` rc=0.
+  `rustfmt --check` rc=0 on the two touched .rs files; `gofmt -l` clean on the
+  touched .go file.
+- **File(s)**: userspace-dp/src/session/README.md,
+  userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  pkg/dataplane/types.go, _Log.md
