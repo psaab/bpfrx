@@ -17,6 +17,7 @@
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
 [REFACTOR]   2034  userspace-dp/src/afxdp/frame/mod.rs
 [WATCH]      1990  pkg/grpcapi/server_sessions.go
+[WATCH]      1988  pkg/cluster/heartbeat.go
 [WATCH]      1950  pkg/dataplane/compiler.go
 [WATCH]      1932  pkg/ddns/manager.go
 [WATCH]      1889  pkg/daemon/daemon_system.go
