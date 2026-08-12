@@ -1,11 +1,9 @@
 package config
 
-import "fmt"
-
-// ValidatePeerEffectiveSourceNATStrict re-runs the strict SOURCE-NAT
-// representability validators against the PEER node's effective compiled view so
-// a chassis-cluster commit proves BOTH node-effective source-NAT outputs are
-// installable before promotion (#5876).
+// The SOURCE-NAT subject of the peer-effective strict gate (#5876). The
+// mechanism that compiles the peer view and dispatches every registered subject
+// lives in compiler_peer_effective.go; this file owns only which validators the
+// source-NAT subject runs.
 //
 // The strict SNAT gates (validateSourceNATPoolStrict,
 // validateSourceNATPoolAddressGrammarStrict, validateSourceNATPoolAddressScopeStrict,
@@ -25,60 +23,12 @@ import "fmt"
 // silently degrades on the node that just took over. This gate pulls the peer's
 // strict SNAT check forward to the origin's commit.
 //
-// The peer-effective view is produced with CompileConfigForNodeLenient(peerID) —
-// the EXACT transform the standby applies on Store.SyncApply — so the pools and
-// rules we validate are precisely what the peer will instantiate (same ${node}
-// apply-group substitution and per-node rewrites). The lenient compile downgrades
-// every gate to a warning, so it always yields the peer-effective *Config even
-// when a NON-source-NAT gate would strict-reject; those non-SNAT concerns are
-// OUT OF SCOPE for #5876 (a peer view that will not compile at all is a broader
-// structural problem left to the peer's own load path — we do not false-reject
-// the origin commit for it). Only the strict SOURCE-NAT validators are re-run.
+// The peer-effective view the subject runs against is produced with
+// CompileConfigForNodeLenient(peerID) by the shared mechanism — the EXACT
+// transform the standby applies on Store.SyncApply — so the pools and rules
+// validated here are precisely what the peer will instantiate (same ${node}
+// apply-group substitution and per-node rewrites).
 //
-// Standalone (localNodeID < 0) has no peer and is a no-op — zero behavior change
-// off a cluster. The verdict is deterministic: CompileConfigForNodeLenient(peerID)
-// is a pure function of the candidate tree, and the reused validators already walk
-// pools / rule-sets in sorted order for a stable first-reported offender.
-func ValidatePeerEffectiveSourceNATStrict(tree *ConfigTree, localNodeID int) error {
-	if tree == nil || localNodeID < 0 {
-		return nil
-	}
-	peerID, ok := peerNodeID(localNodeID)
-	if !ok {
-		return nil
-	}
-	// Compile the peer view the SAME way the standby ingests a config-synced
-	// snapshot (Store.SyncApply -> compileTreeLenient -> CompileConfigForNodeLenient):
-	// the lenient path downgrades every strict gate to a warning, so it produces
-	// the peer-effective *Config even where a non-SNAT gate would hard-reject.
-	peerCfg, err := CompileConfigForNodeLenient(tree, peerID)
-	if err != nil || peerCfg == nil {
-		// A peer view that will not compile AT ALL is a structural concern
-		// broader than source-NAT representability (#5876 scope). Leave it to the
-		// peer's own strict/load path rather than false-rejecting the origin
-		// commit here.
-		return nil
-	}
-	if err := validateSourceNATStrictView(peerCfg); err != nil {
-		return fmt.Errorf("chassis cluster peer node%d effective source-NAT is not "+
-			"representable (a shared commit would strand the standby): %w", peerID, err)
-	}
-	return nil
-}
-
-// peerNodeID returns the OTHER node id in a 2-node chassis cluster (0<->1). ok is
-// false for any id that has no defined 2-node peer (nodes are always 0 or 1).
-func peerNodeID(nodeID int) (int, bool) {
-	switch nodeID {
-	case 0:
-		return 1, true
-	case 1:
-		return 0, true
-	default:
-		return 0, false
-	}
-}
-
 // validateSourceNATStrictView runs the strict NAT representability validators
 // that touch source-NAT rules (the source-NAT-relevant validators the NAT gates
 // in runUniformGates dispatch on the local compiled view) against an
