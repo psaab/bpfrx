@@ -73069,3 +73069,55 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   **1595**, audit `[WATCH]`. Every mutation restored from backup BEFORE its
   result was read.
 - **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go (new), _Log.md
+
+## 2026-08-12 — #6669 r18: the last two wiring binders + a FALSE shipping claim retired
+
+- **Timestamp**: 2026-08-12
+- **Action**: Completed the finding-1 wiring binders (4 of 4) and corrected the
+  one claim in this fold that was false rather than merely narrow.
+
+  **A FALSE claim, in two places.** `README.md` said the in-bound lockout is
+  bounded because "the peer's own wall-clock seed climbs past it unattended",
+  and `heartbeat_epoch.go` called it "a self-limiting window instead of one
+  that needs intervention". **Both are false.** The rejected sender resolved
+  its epoch ONCE at boot and caches it for the life of the process
+  (`bootEpochOnce`), so waiting does not change the value it emits: a peer
+  latched out at T+30m stays out however long anyone waits. The failure mode
+  is not academic — it tells a maintainer debugging a wedged peer to wait for a
+  recovery that cannot arrive. Both now say what the hour actually bounds (how
+  far a NEW incarnation must climb) and that recovery is a SENDER RESTART, or a
+  receiver restart, never elapsed time.
+
+  **Binder 3 — `TestRunningSenderDoesNotRecoverByWaiting_6669`.** Re-feeds the
+  SAME rejected incarnation (`0xEE02`) with the clock advanced past the floor
+  and asserts it is STILL refused — the assertion that makes the corrected
+  sentence true and the old one false. The existing
+  `TestInBoundFarFutureEpochLockoutIsBounded_6169` never returns to that
+  incarnation; it fabricates a fresh one at `inBound+1`. A second half asserts a
+  RESTARTED sender IS admitted, so the test cannot be read as "permanently
+  stuck", which would be the opposite overstatement. Its fail-on-revert is
+  TEXTUAL and the comment says so plainly: it pins a residual, not a guard, and
+  calling it a behavioural guard would be the same overstatement it retires.
+
+  **Binder 4 — `TestStartHeartbeatResolvesTheBootEpoch_6669.`** Drives the real
+  `StartHeartbeat` and reads the published cell WITHOUT calling the resolver —
+  touching `heartbeatBootEpoch()` would publish the value under observation and
+  mask the deletion. Production edit: delete `m.initHeartbeatEpochState()`.
+  Observed RED: *"bootEpoch = 0 after StartHeartbeat returned"*. **Attribution
+  checked** per the review condition: `TestStartHeartbeatReturnsWithAUsableEpoch_6169`
+  and the other pre-existing `StartHeartbeat` callers stay GREEN under the same
+  deletion, so the RED is attributable to the new binder alone.
+
+  **Claims sweep** over the whole fold diff for "unattended", "self-limiting",
+  "unconditionally", "every", "all", "always", "cannot", "no longer" and
+  numeric figures. The two above were the only FALSE ones; the README already
+  self-corrects several claims in place ("an earlier revision of this document
+  said ... That is false"), and the 219→584 count was fixed earlier this round.
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.174s`); `go test -race -count=1 ./pkg/cluster/` 0 (`ok 17.849s`);
+  `gofmt -l pkg/cluster/` clean; `heartbeat.go` 1595, audit reports no
+  `[REFACTOR]` for pkg/cluster. Every mutation restored from backup BEFORE its
+  result was read.
+- **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go,
+  pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md

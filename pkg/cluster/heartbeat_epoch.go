@@ -151,15 +151,27 @@ const (
 	//
 	// THE SLACK IS ITSELF THE WORST-CASE LOCKOUT, which is why it is an hour
 	// and not a year. A bad epoch INSIDE the bound is latched, and a repaired
-	// peer returning to real time then sits below the floor until its own
-	// wall-clock seed climbs past it — so the bound and the lockout duration
-	// are the same number. A year of slack bought nothing over an hour (it only
-	// has to exceed real inter-node clock skew, which is milliseconds under NTP
-	// and minutes without it) and cost a year-long lockout.
+	// peer returning to real time then sits below the floor. A year of slack
+	// bought nothing over an hour (it only has to exceed real inter-node clock
+	// skew, which is milliseconds under NTP and minutes without it) and cost a
+	// year-long lockout.
 	//
-	// An hour still closes the MaxUint64 class by four orders of magnitude, and
-	// bounds the in-range case to a self-limiting window instead of one that
-	// needs intervention.
+	// THE LOCKOUT IS BOUNDED IN WALL-CLOCK TIME, NOT SELF-HEALING FOR THE
+	// RUNNING SENDER (#6669 r18, Codex finding 6). An earlier revision of this
+	// comment called it "a self-limiting window instead of one that needs
+	// intervention", and README.md said the peer's seed "climbs past it
+	// unattended". BOTH WERE FALSE, and falsely reassuring: the rejected
+	// sender resolved its epoch ONCE, at boot, and caches it for the life of
+	// the process (bootEpochOnce). Waiting does not change the value it emits,
+	// so a peer latched out at T+30m stays out however long anyone waits — an
+	// operator watching a wedged peer for a recovery that cannot arrive.
+	//
+	// What the hour actually bounds is how far a NEW incarnation has to climb:
+	// the next sender restart on that peer seeds from a wall clock that has
+	// moved on, and the receiver admits it on the raise path. So the recovery
+	// is A SENDER RESTART (or a receiver restart, which clears the in-memory
+	// floor outright) — never the passage of time alone.
+	// Pinned by TestRunningSenderDoesNotRecoverByWaiting_6669.
 	bootEpochMaxSkew uint64 = 60 * 60 * 1_000_000_000
 
 	// epochClockSaneFloor is 2020-01-01T00:00:00Z in nanoseconds: the point

@@ -1079,9 +1079,16 @@ peer liveness (`lastSeen`) or drive election.
     2. **In-bound clock skew latches a bounded lockout.** A peer epoch ahead of
        us but INSIDE the skew allowance is latched, so a peer later repaired to
        real time sits below that floor. Bounded twice: the slack IS the lockout
-       (one hour), so the peer's own wall-clock seed climbs past it unattended;
-       and the floor is in memory, so `systemctl restart xpfd` on the refusing
-       node clears it immediately — subject to residual 5, since a replayed
+       (one hour), which bounds how far a NEW incarnation of the peer has to
+       climb — **not** a window the RUNNING sender waits out. An earlier
+       revision of this list said the peer's seed "climbs past it unattended";
+       that was false. The rejected sender resolved its epoch once at boot and
+       caches it for the life of the process (`bootEpochOnce`), so waiting
+       changes nothing it emits: recovery is a **sender restart** on the peer,
+       or a receiver restart, never elapsed time alone
+       (`TestRunningSenderDoesNotRecoverByWaiting_6669`). The floor is in
+       memory, so `systemctl restart xpfd` on the refusing node clears it
+       immediately — subject to residual 5, since a replayed
        archived frame can re-raise a cleared floor just as it can re-arm a
        cleared latch. With a durable floor this needed deleting a state file,
        which is what made it a MAJOR.
