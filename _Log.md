@@ -73014,3 +73014,58 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/cluster/heartbeat.go,
   pkg/cluster/heartbeat_epoch_admit.go (new),
   pkg/cluster/heartbeat_reject_warn.go (new), pkg/cluster/README.md, _Log.md
+
+## 2026-08-12 — #6669 r18: wiring binders for two of the four decorative guards
+
+- **Timestamp**: 2026-08-12
+- **Action**: Bound the PRODUCTION CALL SITES for two of the four guards the
+  finding-1 enumeration proved decorative, and rebased onto master
+  `6c4289902`.
+
+  **The defect class, stated once.** All four decorative guards are one shape:
+  THE INNER GUARD IS BOUND AND THE WIRING TO IT IS NOT. Each existing test
+  calls the helper directly and asserts the helper behaves; none asserts that
+  production reaches it. So each binder here drives the production path and
+  never re-invokes the helper the site is supposed to call.
+
+  **B1 — the send site (`heartbeatSender.send`).**
+  `TestSendSiteUsesTheIncarnationNonce_6669` runs a REAL sender over a real UDP
+  socket into the REAL readLoop, restarts the sender on the same Manager (the
+  VRF-rebind / comms-restart shape), and asserts the receiver has bound exactly
+  ONE session at the floor. Production edit that fails it: replace
+  `session, counter := s.mgr.heartbeatNonce()` in `send()` with a per-sender
+  draw. Observed RED: *"after a heartbeat restart: 2 sessions bound at ONE boot
+  epoch, want 1"* — while `TestHeartbeatNonceIsIncarnationScoped_6169`, the
+  test that was supposed to cover this, still **PASSES**. That contrast is the
+  proof the new test binds what the old one could not.
+
+  **B2 — the stats exposure path (`Manager.HeartbeatStats`).**
+  `TestEpochCountersAreExposedWithoutAReceiver_6669` drives
+  `EpochOutOfBandRejected` and `EpochAheadOfClockRejected` through the REAL
+  admission path (an out-of-band epoch and an ahead-of-clock epoch, both
+  refused), removes the receiver — what a VRF rebind does — and asserts the
+  accessor still reports them. Production edit that fails it: move the three
+  assignments back under `if receiver != nil {`. Observed RED: *"HeartbeatStats
+  reports EpochOutOfBandRejected=0 with no receiver installed, but the counter
+  was incremented on the admission path"* — while
+  `TestEpochLatchSurvivesReceiverGapInStats_6669` still **PASSES**, again the
+  contrast that shows the gap was real.
+  `TestEpochCountersStillExposedWithAReceiver_6669` is its negative control in
+  its own body: it asserts the UNDRIVEN counter reads 0, so the fix cannot be
+  satisfied by hard-wiring a non-zero value.
+
+  **Rebase onto `6c4289902`.** `_Log.md` was the only conflict, as expected.
+  Union-resolved keeping both blocks; structural check `ours + theirs − base`
+  = (1527, 2889, 1736) matched actual exactly; whole-tree marker sweep found
+  zero surviving `<<<<<<<` / `=======` / `>>>>>>>`.
+
+  **Still owed:** the other two wiring binders — the `StartHeartbeat` →
+  `initHeartbeatEpochState()` call, and the running-sender lockout recovery
+  (finding 1d/6, which also needs its README/comment claim corrected from
+  "unattended" recovery). Designs recorded in the round report.
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.319s`); `gofmt -l pkg/cluster/` clean; `heartbeat.go` re-measured at
+  **1595**, audit `[WATCH]`. Every mutation restored from backup BEFORE its
+  result was read.
+- **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go (new), _Log.md
