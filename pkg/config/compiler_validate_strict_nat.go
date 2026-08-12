@@ -2809,14 +2809,23 @@ func natThenTerminalActionCount(then NATThen) int {
 //     NAT the builder EMITS the actionless rule and the Rust matcher's `else`
 //     arm (nat/source.rs) then `continue`s to the next rule; for destination
 //     NAT the builder skips the rule. Either way the matched traffic FALLS
-//     THROUGH to a later, broader rule and is translated by it — exactly the
-//     fail-open this gate's own zero-action rejection text describes. Making
-//     an actionless rule terminal instead would newly exempt traffic that
+//     THROUGH — and what it falls through TO depends on what follows it (#6820
+//     re-gate). If a later, broader rule matches, that rule translates it,
+//     which is exactly the fail-open this gate's own zero-action rejection text
+//     describes. If NOTHING later matches, the loop simply ends and the packet
+//     leaves UNTRANSLATED. Both are fail-open against an INTENDED exemption —
+//     in the second case the operator gets no translation only by accident, not
+//     because the rule asked for it — but they are different outcomes, and an
+//     earlier revision of this comment asserted only the first ("...and is
+//     translated by it"), which presumes a later rule exists.
+//     Making an actionless rule terminal instead would newly exempt traffic that
 //     already-deployed configs translate, so it is a migration-contract
 //     decision tracked on #5717, not a mechanical fix.
-//     TestTolerantActionlessRuleIsNotInert_5717 and
-//     actionless_rule_falls_through_to_later_broader_rule_5717 pin today's
-//     disposition so the "inert" framing cannot silently return.
+//     TestTolerantActionlessRuleIsNotInert_5717,
+//     actionless_rule_falls_through_to_later_broader_rule_5717 and
+//     actionless_rule_with_no_later_rule_passes_untranslated_5717 pin BOTH
+//     dispositions so neither the "inert" framing nor the "always translated by
+//     a later rule" framing can silently return.
 //
 // Rule-sets are walked in sorted name order for a deterministic first-reported
 // offender.

@@ -1,7 +1,7 @@
 [REFACTOR]   5193  userspace-dp/src/afxdp/poll_descriptor/mod.rs
 [REFACTOR]   3770  userspace-dp/src/policy.rs
 [REFACTOR]   3565  userspace-dp/src/nat64.rs
-[REFACTOR]   3433  pkg/config/compiler_validate_strict_nat.go
+[REFACTOR]   3497  pkg/config/compiler_validate_strict_nat.go
 [REFACTOR]   2605  pkg/config/compiler_system.go
 [REFACTOR]   2462  pkg/policymatch/policymatch.go
 [REFACTOR]   2459  userspace-dp/src/afxdp/worker/loop_body/mod.rs

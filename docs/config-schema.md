@@ -3132,16 +3132,25 @@ there very differently, and the difference is load-bearing:
   a predicate that mishandles only the three-action case.
 
 - **Zero actions is NOT inert.** It installs no translation, but the matched
-  traffic FALLS THROUGH to a later, broader rule and is translated by that —
-  the fail-open the gate's own zero-action rejection text describes. Source NAT
-  reaches it by emitting the actionless rule and letting the Rust matcher's
-  `else` arm `continue`; destination NAT reaches it by skipping the rule in the
-  builder. Making an actionless rule terminal would newly exempt traffic that
-  already-deployed configs translate, so that is a migration-contract decision
-  tracked on #5717 rather than a mechanical fix.
-  `TestTolerantActionlessRuleIsNotInert_5717` and
-  `actionless_rule_falls_through_to_later_broader_rule_5717` pin today's
-  disposition so the "inert" framing cannot silently return.
+  traffic FALLS THROUGH — and what it falls through TO depends on what follows
+  it. If a later, broader rule matches, that rule translates it: the fail-open
+  the gate's own zero-action rejection text describes. If NOTHING later matches,
+  the matcher's loop simply ends and the packet leaves **untranslated**. Both
+  are fail-open against an INTENDED exemption — in the second case the operator
+  gets no translation only by accident rather than because the rule asked for it
+  — but they are different outcomes, and an earlier revision of this bullet
+  asserted only the first ("and is translated by that"), which presumes a later
+  rule exists (#6820 re-gate). Source NAT reaches the fall-through by emitting
+  the actionless rule and letting the Rust matcher's `else` arm `continue`;
+  destination NAT reaches it by skipping the rule in the builder. Making an
+  actionless rule terminal would newly exempt traffic that already-deployed
+  configs translate, so that is a migration-contract decision tracked on #5717
+  rather than a mechanical fix.
+  `TestTolerantActionlessRuleIsNotInert_5717`,
+  `actionless_rule_falls_through_to_later_broader_rule_5717` and
+  `actionless_rule_with_no_later_rule_passes_untranslated_5717` pin BOTH
+  dispositions, so neither the "inert" framing nor the "always translated by a
+  later rule" framing can silently return.
 
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`

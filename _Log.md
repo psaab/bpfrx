@@ -1340,6 +1340,92 @@ pkg/config and pkg/daemon). Plus the production-reassignment mutation, GREEN
 before the analyzer fix and RED after. go build rc=0, go vet rc=0, and the FULL
 `go test ./...` rc=0 with ZERO failures. No cluster tooling: control-plane only,
 no dataplane artifact.
+## 2026-08-12 — #6820 re-gate: the brief's three items were already done; what was missing was the EVIDENCE, plus a fourth over-claim from the unread AGY leg
+
+- **Timestamp**: 2026-08-12 (fix/5717-config-parity, PR #6820)
+- **Action**: verified the three briefed items against the branch instead of
+  re-implementing them, produced the mutation evidence the bar required and
+  nobody had run, and folded the one live finding from the AGY leg.
+- **File(s)**: userspace-dp/src/nat/tests_source.rs,
+  pkg/config/compiler_validate_strict_nat.go, docs/config-schema.md, _Log.md
+
+WHAT THE BRIEF ASKED FOR WAS ALREADY ON THE BRANCH. The three items — narrow
+three wording sites, add the `interface + pool` case, add the three-action
+`interface + off + pool` case — landed in 27bf2221b / 6c1b6f4b6 / f5f7acfd6,
+AFTER the review that generated the brief. Checked rather than assumed: all
+three wording sites carry the narrowed "CONTAINING `off`" phrasing plus the
+interface-mode-precedence half, and both tests exist
+(`interface_wins_over_pool_without_off_5717`,
+`off_wins_over_all_three_actions_5717`). Writing them again would have produced
+duplicates and told nobody anything.
+
+The AGY leg described those same tests as existing. Given AGY's false-positive
+rate that was not evidence either way, so it was settled against the file: the
+tests are real, at tests_source.rs:964 and :1117, with `git log -S` dating both
+to 27bf2221b.
+
+WHAT WAS ACTUALLY MISSING was the bar: "for item 3 the mutation must be one the
+two EXISTING pairwise tests survive". The three-action test's own doc comment
+NAMES that predicate — `off && !(interface_mode && pool_mode)` — but naming a
+mutation result is not measuring it, which is the whole doctrine here. Measured:
+
+    if rule.off  ->  if rule.off && !(rule.interface_mode && rule.pool_mode)
+
+    off_wins_over_contradictory_interface_action_5717 ... ok      <- pairwise
+    off_wins_over_contradictory_pool_action_5717      ... ok      <- pairwise
+    off_wins_over_all_three_actions_5717              ... FAILED
+    test result: FAILED. 5 passed; 1 failed
+
+Exactly the old-green / new-RED contrast the bar demands. The comment's claim is
+now a measurement.
+
+Item 2 measured the same way, with the OLD FALSE WORDING made real —
+`if rule.off || (rule.interface_mode && rule.pool_mode)`, i.e. "any contradiction
+exempts", which is what the pre-#6820 prose said:
+
+    interface_wins_over_pool_without_off_5717     ... FAILED
+    interface_with_pool_no_egress_fails_closed_5717 ... FAILED
+    test result: FAILED. 4 passed; 2 failed
+
+A FOURTH ITEM, FROM THE UNREAD AGY LEG, AND IT IS LIVE. AGY quoted the gate
+comment's "the matched traffic FALLS THROUGH to a later, broader rule and is
+translated by it" and gave the counter-example: with NO later rule the matcher
+runs out of rules and returns `SourceNatLookup::NoMatch`, so the packet leaves
+UNTRANSLATED. Verified — `match_source_nat`'s loop ends at source.rs:1690 with
+`NoMatch` — and the sentence survives at compiler_validate_strict_nat.go:2307
+and in docs/config-schema.md, because the existing
+`actionless_rule_falls_through_to_later_broader_rule_5717` pins only the
+two-rule shape and nothing bound the one-rule shape.
+
+Both are fail-open against an INTENDED exemption, but they are different
+outcomes: in the no-later-rule case the operator gets no translation only by
+accident. New `actionless_rule_with_no_later_rule_passes_untranslated_5717`
+binds it, and both prose sites now state both dispositions.
+
+Its mutation isolates the path the sibling cannot reach — the loop's terminal
+`NoMatch` becomes an exemption:
+
+    actionless_rule_falls_through_to_later_broader_rule_5717 ... ok    <- sibling GREEN
+    actionless_rule_with_no_later_rule_passes_untranslated_5717 ... FAILED
+    off_wins_over_all_three_actions_5717 ... FAILED
+    test result: FAILED. 5 passed; 2 failed
+
+The sibling survives because it never reaches the loop end. The three-action
+test also reds — its two NON-MATCHING controls expect `None` — which is those
+controls doing exactly the job their comment claims, confirmed rather than
+asserted.
+
+AGY's other quoted over-claim is NOT folded and the reason is recorded: it says
+"contradictory CONTAINING `off` resolves to the EXEMPTION" is falsified by a
+packet outside the rule's match criteria returning no decision. That conflates
+WHICH ACTION a matched rule resolves to with WHETHER the rule matches at all.
+The sentence is about action resolution; every neighbouring sentence is too. No
+change.
+
+Validation: full Rust suite 4259 + 60 + 8 + 22 + 31 + 1 + 2 passed, 0 failed.
+go build rc=0, go vet rc=0, `go test ./pkg/config/... ./pkg/dataplane/userspace/...`
+rc=0. No production code changed — this PR remains tests-and-comments only. No
+cluster tooling.
 
 ## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
 

@@ -947,6 +947,46 @@ fn actionless_rule_falls_through_to_later_broader_rule_5717() {
     );
 }
 
+/// #5717 (#6820 re-gate): the actionless rule with NO later rule to fall into.
+///
+/// The gate comment said the matched traffic "FALLS THROUGH to a later, broader
+/// rule and is translated by it". The first half is right; the second half
+/// presumes a later rule EXISTS. `match_source_nat` reaches the actionless
+/// `else` arm, `continue`s, runs out of rules, and returns no decision — the
+/// packet leaves UNTRANSLATED. That is still a fail-open against an intended
+/// exemption (the operator wanted no translation and got no translation only by
+/// accident), but it is a DIFFERENT outcome from being translated by a later
+/// rule, and the sibling test above pins only the two-rule shape.
+///
+/// One rule in the slice, deliberately: adding a later rule is exactly what the
+/// sibling does, and it is the presence of that rule that the old wording
+/// silently assumed.
+#[test]
+fn actionless_rule_with_no_later_rule_passes_untranslated_5717() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "actionless-only".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string()],
+        // No off, no interface_mode, no pool — the actionless shape.
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    assert_eq!(
+        match_source_nat(
+            &rules,
+            &NatScopeCtx::default(),
+            "lan",
+            "wan",
+            "10.0.61.102".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        ),
+        None,
+        "an actionless rule with NO later rule must yield NO decision — the packet          passes untranslated. If this reports an exemption the actionless          disposition became terminal (a migration-contract change tracked on          #5717); if it reports a rewrite, the actionless arm started translating          on a rule that names no terminal action at all"
+    );
+}
+
 /// #5717 (#6820 gate): a contradictory rule WITHOUT `off` — source NAT
 /// `interface` + `pool` — resolves to INTERFACE TRANSLATION, not to an
 /// exemption.
