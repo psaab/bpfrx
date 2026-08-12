@@ -182,7 +182,7 @@ func (m *Manager) clearFilterCountersRaw() error {
 // 512 (bpf/headers/xpf_common.h:710), which is filter_counters'
 // max_entries (bpf/headers/xpf_maps.h), so no index below can be out of
 // range on an armed map.
-func clearFilterCountersIn(zm *ebpf.Map) error {
+func clearFilterCountersIn(zm counterMapUpdater) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
 	for i := uint32(0); i < MaxFilterRules; i++ {

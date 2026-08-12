@@ -377,6 +377,15 @@ func (m *Manager) clearPolicyCountersRaw() error {
 	return clearPolicyCountersIn(zm)
 }
 
+// counterMapUpdater is the *ebpf.Map subset the blind-write counter-clear
+// loops use. It exists as a seam (#2114, Codex PR #6743 r4-F2): creating
+// a real BPF map needs privileges the unit lane does not have, so the
+// error-propagation contract below is otherwise untestable and would ship
+// on a comment alone. *ebpf.Map satisfies it as declared.
+type counterMapUpdater interface {
+	Update(key, value any, flags ebpf.MapUpdateFlags) error
+}
+
 // clearPolicyCountersIn zeroes every policy_counters slot.
 //
 // #2114 (Codex PR #6743 r4-F2): the Update error is PROPAGATED. It used
@@ -388,7 +397,7 @@ func (m *Manager) clearPolicyCountersRaw() error {
 // bpf/headers/xpf_common.h:151), so every index below is in range on an
 // armed map and this cannot turn a working clear into an error. Matches
 // clearInterfaceCountersIn, which already returned its Update error.
-func clearPolicyCountersIn(zm *ebpf.Map) error {
+func clearPolicyCountersIn(zm counterMapUpdater) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
 	for i := uint32(0); i < 4096; i++ {

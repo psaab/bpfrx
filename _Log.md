@@ -70266,7 +70266,11 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   statistics` / `clear firewall counters` could not fail. Both now propagate,
   matching `clearInterfaceCountersIn`, which already did; the index bounds
   are exact (MAX_POLICIES 4096 / MAX_FILTER_RULES 512 are the maps'
-  max_entries) so no working clear becomes an error. This does NOT close the
+  max_entries) so no working clear becomes an error. Both helpers now take
+  a two-line `counterMapUpdater` seam (`*ebpf.Map` satisfies it as
+  declared, asserted in the test) because real BPF map creation returns
+  EPERM in the unprivileged unit lane — verified — and a SKIPPED test
+  would have left the mutation cell unknown rather than green. This does NOT close the
   review's worked interleaving: after `Teardown()` the map fds stay open and
   the backend stays published on purpose (the rollback re-arms that same
   object), so an update still succeeds against detached state. That window is
@@ -70314,7 +70318,13 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   setDataplane(nil)" and `TestRESTServer_LateDataplanePublicationIsObserved`
   RED; `TestRESTServer_PublishedDataplaneStillReachable` stays GREEN (it is
   the positive control proving `dataplane_loaded=true` is reachable at all,
-  so the binder is not vacuous). (3) Revert the CLI hunk →
+  so the binder is not vacuous). (3) Revert either counter-clear error
+  wrapper to the bare `zm.Update(i, zero, ebpf.UpdateAny)` →
+  `TestClearPolicyCountersIn_PropagatesUpdateError` and its filter twin RED
+  with "clearPolicyCountersIn reported SUCCESS after the map rejected the
+  write at index 7; the operator's clear silently did nothing";
+  `TestClearCountersIn_HealthyMapStillClearsEveryEntry` (4096 / 512 writes,
+  no error) stays GREEN. (4) Revert the CLI hunk →
   `TestManagementProbesComeFromLiveDataplane` RED naming
   "daemon_run.go:Run declares cliDataPlane without liveDataplane()"; its
   both-direction self-test stays GREEN. Every RED is an ASSERTION, never a
@@ -70333,6 +70343,7 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/daemon/daemon_dp_canary_test.go,
   pkg/daemon/daemon_forwarding_status_test.go, pkg/daemon/README.md,
   pkg/dataplane/maps_policy.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/counter_clear_error_2114_test.go (new),
   pkg/dataplane/armed_gate_matrix_test.go,
   pkg/dataplane/armproof_5275_test.go,
   pkg/dataplane/retirement_boundary_canary_test.go,
