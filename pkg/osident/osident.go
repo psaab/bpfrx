@@ -45,12 +45,37 @@
 // So for a READABLE database, every uid the file maps to exactly one account
 // name resolves to that same name here.
 //
-// Two divergences are deliberate, and both NARROW:
+// Two divergences are deliberate, and both narrow the IDENTITY:
 //
 //	a uid mapped to SEVERAL names resolves to "" here, where os/user returns
 //	whichever row came first — see lookupPasswd for why that fails closed.
 //	a uid with NO row also resolves to "" here (Reason ReasonNoPasswdEntry),
 //	instead of to whatever the caller put in $USER.
+//
+// A NARROWER IDENTITY IS NOT A NARROWER CLASS, and at uid 0 it inverts
+// (#6706 review r11). An earlier revision of this comment said the two
+// divergences are "both NARROW" without that qualification, which reads as a
+// statement about the authorization outcome. It is not one. This package
+// decides only WHO the caller is; pkg/cli ResolveLoginClass decides what they
+// may do, and for uid 0 an unresolved identity is MORE permissive than a
+// resolved one. Measured, with `system login user toor class read-only;` and
+// a uid-0 passwd alias `toor`:
+//
+//	resolved   uid 0 "toor"          -> class "read-only"
+//	unresolved uid 0 (LookupFailed)  -> class "super-user"
+//	unresolved uid 0 (NoPasswdEntry) -> class "super-user"
+//	unresolved uid 0 (AmbiguousUID)  -> class "super-user"
+//
+// All three unresolved Reasons promote, because candidateNames offers only the
+// literal "root" for an unnamed uid 0 and no `root` stanza matches, so
+// ResolveLoginClass falls to ClassRootDefault. That promotion is DELIBERATE and
+// is argued at pkg/cli/identity.go: uid 0 already owns the config database, the
+// daemon process and the on-disk secrets, so it is not a boundary xpf can
+// enforce, and denying would risk locking the console out over an unreadable
+// passwd. It is stated here because the word "narrow" alone would let a reader
+// conclude the opposite. For NON-root callers the divergences do narrow the
+// class as well — an unresolved non-root identity matches no stanza and gets
+// ClassUnidentified.
 //
 // Both divergences produce an empty Name — Resolved() == false — and nothing
 // else; this package mints no placeholder account name. String() renders such

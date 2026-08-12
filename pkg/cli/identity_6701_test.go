@@ -580,6 +580,25 @@ func TestAmbiguousUIDFailsClosed_6706(t *testing.T) {
 // TestRootAliasClassMatrix_6706 pins the uid-0 decision matrix that decision 1
 // of ResolveLoginClass's doc comment describes.
 //
+// READ THIS AS A DELIBERATE DECISION, NOT AN ACCIDENT AWAITING A FIX (#6706
+// review r11). The alias rows below assert that a restrictively configured
+// uid-0 alias — `system login user toor class read-only;` with a passwd row
+// `toor:x:0:0:` — resolves to `read-only` on a SUCCESSFUL lookup and to
+// `super-user` on every FAILED one. That is a promotion on failure, and it is
+// the one place in this package where a lookup failure is not narrowing. A
+// reviewer meeting it cold reasonably reads it as a fail-open to close; it was
+// reviewed as exactly that and deliberately kept, because uid 0 already owns
+// the config database, the daemon process and the on-disk secrets, so it is not
+// a boundary xpf can enforce — and denying instead would risk locking the
+// console out over an unreadable /etc/passwd, buying no real security for a
+// real lockout mode. The reasoning lives at identity.go decision 1; this note
+// exists so the test is not "corrected" into a denial by someone who finds the
+// matrix before the argument.
+//
+// Changing it is a product decision, not a bug fix. If it is ever revisited,
+// the non-root half must stay as it is: an unresolved NON-root identity matches
+// no stanza and gets ClassUnidentified, which IS fail-closed.
+//
 // That paragraph has now been wrong twice, in opposite directions: first
 // claiming an explicit class wins "for any uid including 0" (#6706 MINOR-5),
 // then that it "cannot win when the caller has no name" and that this is "false

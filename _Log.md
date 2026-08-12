@@ -522,8 +522,35 @@ posture are separate decisions and only the second one changed.
 
 The golden behaviour-preservation baseline (golden_4406.json) moved by exactly
 18 lines, every one of them `"LoginDroppedByPacking": false`, with zero
-deletions and zero changed values — i.e. the golden itself is the proof that the
-flag defaults false and changes nothing for existing configuration.
+deletions and zero changed values.
+
+CORRECTION (#6706 review r11). An earlier revision of this paragraph read "the
+golden itself is the proof that the flag defaults false and changes nothing for
+existing configuration". The second half of that was FALSE, and it is the kind
+of sentence a maintainer would read as "no operator can be affected". Eighteen
+false-valued fixtures prove exactly eighteen fixtures default false; they say
+nothing about configurations outside the golden. Behaviour DOES change for
+existing accepted configuration:
+
+    system login;        (packed, names no user and no class)
+
+commits clean today with no warning — the reporting gate deliberately stays
+silent for prefixes that name nobody — and now sets the flag, so
+`applyCLILoginClass` refuses the legacy unset-class mode and every non-root
+caller is stamped `unauthorized`. Measured through the real daemon path:
+`SetUserClass called=true class="unauthorized"`; the same config with no
+`login` token at all gives `called=false`, so the flag is the whole difference.
+
+That change is DELIBERATE and is the direction this PR aligns on: the nested
+spelling `system { login; }` already denied (it compiles a non-nil but empty
+LoginConfig, so `ResolveLoginClass` returns ClassUnidentified — the flag plays
+no part), so marking the packed spelling makes the two spellings of identical
+text agree. Whether a content-free `system login` should deny at ALL, in either
+spelling, is a separate open question filed as #6972; it is deliberately not
+decided here, because the two candidate answers both reach outside this diff
+(permitting requires changing the nested empty-stanza path, pre-existing #6662;
+rejecting at commit would refuse configs that commit clean today, against the
+#1960 no-brick rule).
 
 TEST-ANALYZER GAP (Codex was right, and I proved it by mutating production).
 `TestSetUserClassCallersResolveThroughTheSharedResolver_6701` claims the class
@@ -75088,3 +75115,70 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cli/userclass_entrypoint_canary_test.go, pkg/osident/osident.go,
   pkg/osident/passwd_6706_test.go, docs/system-login.md,
   docs/config-schema.md, _Log.md
+## 2026-08-12 — #6706 review r11: fold the Codex DO-NOT-MERGE findings
+
+- **Timestamp**: 2026-08-12
+- **Method note**: `cx6706b.log:151` states in Codex's own words that it
+  executed no tests and that its 45-RED/7-MIXED/20-GREEN ledger is static
+  analysis. All five blocking findings were therefore re-verified by RUNNING
+  them; the ledger's counts are not repeated as fact anywhere.
+- **F1 (remote CLI unauthorized) — SCOPE, not a regression.** Measured:
+  `applyCLILoginClass` has exactly one production call site
+  (`daemon_run.go:729`, the in-process console); `grpcapi/server.go:436` is a
+  bare `net.Listen("tcp")` with no interceptor and no SO_PEERCRED anywhere;
+  `cmd/cli/main.go:66` uses `osident.Current()` for the prompt only. The remote
+  path was unauthorized before this PR too, so the PR owes the description, not
+  the boundary. Filed as **#6973** with the three measurements.
+- **F2 (`system login;` denies an innocent config) — REAL, kept as-is after a
+  fix was written and REVERTED.** The obvious narrowing (apply the reporting
+  gate's content test to the detector) was implemented with a two-arm fixture
+  and proven RED. It was then thrown away, because measuring a comment it would
+  have overridden showed the narrowing makes the two spellings DISAGREE:
+  `system { login; }` compiles a non-nil empty LoginConfig and denies via
+  ResolveLoginClass without consulting the flag, while the narrowed packed
+  spelling would permit. Trading a lockout for a spelling-dependent
+  authorization outcome is worse than either consistent answer. Option 1
+  (both spellings deny) is kept; the open question is filed as **#6972** with
+  the four-row measurement, and the reasoning is recorded AT the detector so
+  the next reader does not re-narrow it.
+- **F3 (uid-0 alias promotes on lookup failure) — kept, claim amended.**
+  Measured: resolved alias -> `read-only`; all three unresolved Reasons ->
+  `super-user`. Deliberate per identity.go decision 1 (uid 0 already owns the
+  config DB, daemon process and on-disk secrets; denying risks a console
+  lockout over an unreadable passwd). `osident.go`'s "both NARROW" now says the
+  divergences narrow the IDENTITY and that a narrower identity is NOT a
+  narrower class — at uid 0 it inverts — with the matrix inline.
+  `TestRootAliasClassMatrix_6706` now says it pins a deliberate decision so it
+  is not "corrected" into a denial by someone who meets the matrix first.
+- **F4 (node-aware flag unbound) — FIXED with a two-arm fixture.** Measured
+  first: reverting ONLY `compiler.go:550` left every package `ok`.
+  `TestLoginDroppedFlagIsPerNodeView_6706` drives node 0 and node 1 of one
+  config whose packed stanza exists only in node1's group;
+  `TestLoginDroppedFlagNodeViewsDisagree_6706` asserts the two views DIFFER, so
+  collapsing the two assignment sites into one whole-tree computation is RED
+  even though each single-node arm could survive it. RED on the revert:
+  "node 1: LoginDroppedByPacking = false, want true" with node 0 still passing.
+- **F5 (classifyLookup guard cannot fire) — FIXED.** Measured: inlining an
+  equivalent switch into `Current` and leaving `classifyLookup` dead left
+  osident/cli/daemon/cmd-cli all `ok`, because the existing test compares a
+  VALUE. New `TestCurrentBodyCallsClassifyLookup_6706` binds the CALL via go/ast
+  scoped to Current's own body, with a synthetic negative control proving the
+  walk rejects an inlined body. Under the mutation the OLD test still PASSES
+  while the new one FAILS — the exact discrimination.
+- **Claim correction (blocking)**: `_Log.md`'s "the golden itself is the proof
+  that the flag defaults false and changes nothing for existing configuration"
+  was FALSE. Eighteen false-valued fixtures prove eighteen fixtures; `system
+  login;` is existing accepted configuration whose behaviour changes, silently.
+  Rewritten to state what changed, why it is deliberate, and where the open
+  question lives.
+- **#6966 checked, no collision**: it is a POSITION miss (`login` at `Keys[3]`
+  behind another packed system key, seen by neither arm); F2 was an over-fire
+  on a shape the detector does see. Different axes; #6966 stays open and must
+  not be closed against this PR.
+- **Validation**: `go test ./pkg/config/... ./pkg/configstore/... ./pkg/daemon/...
+  ./pkg/cli/... ./pkg/osident/... ./cmd/cli/...` rc=0, every package ok.
+  `go vet` rc=0 on the touched packages; `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/config/compiler_system_login_gates.go,
+  pkg/config/login_dropped_node_aware_6706_test.go,
+  pkg/osident/osident.go, pkg/osident/current_calls_classifier_6706_test.go,
+  pkg/cli/identity_6701_test.go, _Log.md

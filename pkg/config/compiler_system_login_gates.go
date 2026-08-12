@@ -234,6 +234,33 @@ func validateLoginPackedStatementsAST(tree *ConfigTree, lenient bool) ([]string,
 // It walks the same two ancestor branches collectLoginPackedFindings walks, so
 // the two cannot drift on WHICH shapes count as packed — only on which of them
 // are reportable.
+//
+// CONTENT-FREE PREFIXES ARE MARKED TOO, AND THAT IS DELIBERATE (#6706 review
+// r11, #6972). `system login;` and `system login user;` name no user and no
+// class, so it is tempting to read the mark as an over-fire and narrow this to
+// "only prefixes that carried RBAC away" — the same `len(rest) > nameIndex ||
+// len(children) > 0` test reportLoginPathPacked applies. That narrowing was
+// written, measured, and REVERTED, because it makes the two spellings of
+// identical text disagree:
+//
+//	"system { login; }"   -> non-nil EMPTY LoginConfig, flag irrelevant -> DENIES
+//	"system login;"       -> nil Login, flag -> DENIES        (with this mark)
+//	"system login;"       -> nil Login, no flag -> PERMITS     (if narrowed)
+//
+// The nested spelling denies through a completely different mechanism —
+// ResolveLoginClass returns ClassUnidentified for a caller not listed in an
+// empty stanza — and never consults this flag. So narrowing here would leave
+// `system { login; }` denying while `system login;` permits: a
+// spelling-dependent authorization outcome, which is worse than either
+// consistent answer. Marking content-free prefixes keeps them aligned.
+//
+// What this does NOT settle is whether a content-free `system login` should
+// deny at all. It arguably should not — the operator configured nothing — but
+// both alternatives reach outside this gate (permitting means changing the
+// nested empty-stanza path in pkg/cli, pre-existing #6662; rejecting at commit
+// would refuse configs that commit clean today, against the #1960 no-brick
+// rule). That question is #6972. Until it is answered, do not "fix" the mark
+// here in isolation: the divergence above is what you would reintroduce.
 func loginPathPackedAnywhere(tree *ConfigTree) bool {
 	packed := false
 	forEachClusterNodeView(tree, func(view *ConfigTree) {
