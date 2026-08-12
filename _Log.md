@@ -101,6 +101,215 @@
   pkg/networkd/README.md, pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
   _Log.md
 ## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
+## 2026-08-12 — #6673 round 11: the r10 serializer re-opened the fail-open through display-set, and two provenance carriers were unbound
+
+- **Timestamp**: 2026-08-12 (fold/6673-r11, PR #6673)
+- **Action**: fixed a fail-open the r10 fold itself introduced (B1), refreshed
+  provenance on the duplicate short-circuit (B2), bound the inactive-strip copy
+  (F1), and corrected the r10 sufficiency claim that B1 proved false.
+- **File(s)**: pkg/config/ast_format.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/event_quote_provenance_6673_test.go,
+  pkg/configstore/quote_provenance_ingress_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+B1 — A NEW FAIL-OPEN, INTRODUCED BY R10. The r10 serializer preserved an
+authored quote only on a key that was NON-TERMINAL IN ITS OWN NODE. That is
+sound for the hierarchical renderer, where a node's last key is followed by `{`
+and stays a container key on re-parse. It is wrong for display-set, which
+FLATTENS: a container's keys are concatenated with its children's, so the
+container's last key lands at the FRONT of the child's group — exactly the token
+eventMultiWordLeafValues reads to decide the boundary.
+
+Measured at the r10 head on `commands "set" { "system host-name pwned"; }`:
+
+    LoadOverride (hierarchical) -> ThenCommands ["system host-name pwned"]
+                                  -> no `set `/`delete ` prefix -> DECLINED
+    display-set dump             -> `... commands set "system host-name pwned"`
+    LoadSet (that dump)          -> ThenCommands ["set system host-name pwned"]
+                                  -> APPLIED
+
+A batch the operator's own config declines became one that runs an arbitrary
+`set`, on the same authored bytes, after a round trip through the product's own
+display format.
+
+VERIFIED NOT PRE-EXISTING, rather than assumed. origin/master (6c4289902) was
+driven on the identical fixture: hierarchical compiles ["system host-name
+pwned"] and the replay compiles ["set"] — both declined. Master's two ingresses
+disagree on the STRING and agree on the VERDICT. The r10 suppression is what
+made the disagreement run toward execution.
+
+The fix moves the terminal test to where the flattening happens:
+joinQuotedKeysProv now tests against the finished LINE, and appendNodeKeys
+records the RAW authored bit instead of pre-applying the per-node rule.
+
+WHAT THE TEST ASSERTS, and what it deliberately does not. Display-set cannot
+express the difference between a container's identifier slot
+(`commands "x" { "y"; }`) and a two-member list (`commands [ "x" "y" ]`) — both
+flatten to one line. That ambiguity is PRE-EXISTING and master has it too, so
+demanding identical command lists from both ingresses would pin a property no
+version of this code has ever had. What must hold, and what master does provide,
+is that the disagreement never runs toward EXECUTION. The new
+pkg/configstore test drives the real LoadOverride and LoadSet and asserts
+exactly that, with two controls: a well-formed single command must execute on
+BOTH (so a fix that declined everything cannot pass), and the r10 bracket-list
+property must still decline (so a regression of the original #6673 fix would
+show up here rather than silently making the B1 rows vacuous).
+
+B2 — THE DUPLICATE SHORT-CIRCUIT KEPT A STALE MASK. SetPath's three dedup arms
+compare keys with keysEqual, which reads key TEXT and nothing else, then return
+early. Two set commands with identical text but different quoting are not the
+same statement — they group opposite ways — so the early return left the FIRST
+command's mask describing the SECOND command's tokens. Lengths still agree, so
+the invariant holds and nothing downstream can notice. Measured: issuing
+[false,true] then [true,false] left [false,true] in place and the group JOINED
+where the second command says SPLIT — the fail-open direction, since joining is
+what turns two members into one applicable command. All three arms now re-stamp;
+the later command wins, which is what `set` means in the single-value arm a few
+lines up.
+
+F1 — THE INACTIVE-STRIP COPY WAS UNBOUND, and the reason is worth recording:
+WithoutInactive returns the receiver UNCHANGED when nothing is inactive, so
+every existing fixture skipped stripInactiveNodes entirely. Deleting the
+KeysQuoted copy left pkg/config, pkg/configstore and pkg/eventengine ALL GREEN.
+The new fixture carries one unrelated `inactive: host-name parked;`, which is
+what routes the tree through the clone. With the copy deleted that config
+compiles ThenCommands ["set system host-name pwned"] instead of
+["set", "system host-name pwned"] — a declined batch becomes an applied one,
+reached by parking an unrelated line.
+
+CLAIM CORRECTED. The r10 comment and docs/config-schema.md said preserving
+non-terminal authored quotes was "exactly sufficient". B1 is the proof it is
+not. Both now state the rule PER RENDERER, in a table, with the measurement.
+
+Validation: three mutations, each a single-line production edit, each RED as an
+ASSERTION (not a build break):
+  - joinQuotedKeysProv/appendNodeKeys reverted to the per-node rule ->
+    TestIngressesDoNotDisagreeTowardExecution_6673 fails with "FAIL-OPEN: the
+    hierarchical ingress DECLINES this batch but the display-set replay
+    EXECUTES it".
+  - refreshDupKeysQuoted made a no-op -> the duplicate test fails naming the
+    retained [false true].
+  - the strip's KeysQuoted copy set to nil -> the inactive test fails naming the
+    emptied mask.
+go build rc=0, go vet rc=0, go test ./pkg/config/... ./pkg/configstore/... rc=0,
+full go test ./... rc=0 with zero failures. No cluster tooling: control-plane
+only, no dataplane artifact.
+
+## 2026-08-12 — #6673 round 10: quote provenance was inferred from token TEXT, fusing two authored members into one applicable command
+
+- **Timestamp**: 2026-08-12 (fold/6673-quote-provenance, PR #6673)
+- **Action**: F1 — carry quote provenance STRUCTURALLY through the AST instead
+  of re-deriving it from token text; F2 — bind it at the compiler, the runtime
+  consumer and the production wiring, with three scoped mutation proofs; F3 —
+  publish the six-family / seven-read-site inventory the four-row category
+  table was being mistaken for.
+- **File(s)**: pkg/config/ast.go, pkg/config/ast_edit.go,
+  pkg/config/ast_format.go, pkg/config/ast_groups.go, pkg/config/inactive.go,
+  pkg/config/parser.go, pkg/config/compiler_services.go,
+  pkg/configstore/store_command.go, docs/config-schema.md,
+  pkg/config/event_quote_provenance_6673_test.go,
+  pkg/eventengine/quote_provenance_runtime_6673_test.go,
+  pkg/configstore/quote_provenance_wiring_6673_test.go, _Log.md
+
+F1 — the defect. `eventMultiWordLeafValues` decided "was the first list member
+QUOTED?" by inspecting the member's TEXT: a space, or emptiness. That is an
+implication in ONE direction only — every space-bearing token was quoted, but a
+quoted token need not bear a space. A quoted one-word first member carries
+neither marker, so measured at the PR head:
+
+    ["set", "system host-name pwned"] -> ["set system host-name pwned"]  n=1
+
+The two authored members FUSED into a syntactically perfect command.
+`eventengine.classifyPlan` requires each member to start `set ` or `delete `; the
+bare `set` the operator actually wrote fails that check and rejects the WHOLE
+batch, which is the fail-closed behaviour the function's own 45-line rationale
+promises. The fused string passes it, parses, and is APPLIED — a config change
+nobody authored. The rationale's "Residual, deliberately not chased" paragraph
+covered only the ALL-bare-words case, not a quoted one-word FIRST member.
+
+The fix carries the bit structurally rather than refining the guess, because no
+text test can separate the two authorings — their tokens are byte-identical.
+`Node.KeysQuoted []bool` records per-key provenance; `parseKeys` already computed
+the token KINDS for the #4348 `inactive:` marker, so the hierarchical spelling
+only had to stop discarding them. The flat-set spelling gained
+`ParseSetVerbQuoted`/`ParseSetCommandQuoted` -> `ConfigTree.SetPathQuoted`, wired
+into `Store.SetFromInputAs` (every operator `set` from CLI, gRPC and REST) and
+`applyEditLine` (LoadSet / display-set replay). `SetPath`/`SetAs` keep their
+signatures and delegate with nil, so all 512 existing SetPath call sites are
+untouched.
+
+Serialization is the other half. HA config sync ships TEXT (`Store.SyncApply`
+takes a string), and `quoteKey` normalizes `"set"` back to a bare `set` because
+it is bare-safe — so without a render-side change the peer would re-parse the
+list as one fused command and the fail-open would simply move across the wire.
+`keyNeedsAuthoredQuote` re-emits the authored quote for NON-TERMINAL keys only.
+That is not a heuristic: the grouping decision reads the first token of a group
+of two or more, and that token is always non-terminal, so preserving non-terminal
+quotes is exactly sufficient — a trailing bare-safe key still normalizes to bare
+and `show configuration` output is unchanged everywhere else (full Go suite, zero
+failures). Provenance is also preserved across `stripInactiveNodes` (which
+produces the tree the compiler actually reads), `cloneNodes`, the multi-leaf
+member drop, and the apply-groups leaf-list union; `CopyPath`/`RenamePath` clear
+it, because the node takes a new identity there.
+
+Two residuals are stated in the code comment and the doc, not left implied. An
+ALL-BARE group (`[ seta setb ]`) still joins — provenance cannot help, since
+both authorings have zero quoted tokens and the AST does not record brackets. A
+tree that arrives with NO provenance (compiler synthesis, or a config DB written
+before this change) falls back to the old text rule; assuming all-bare would be a
+false claim in the fail-open direction, and assuming all-quoted would split
+`commands set system host-name "foo bar"` and break a working remediation across
+an upgrade. The fallback is not a second guess: for a group with no quoted token
+the two rules agree, since a bare word can be neither empty nor space-bearing —
+which is also why an all-false mask collapses to nil and the persisted JSON stays
+byte-identical for the majority of nodes.
+
+An unrelated latent bug surfaced while wiring this: `parseStatement`'s INLINE
+`inactive:` branch truncated `keys` but not `kinds`, leaving the two slices at
+different lengths for every statement carrying an inline marker. Invisible while
+`kinds` was only indexed against `keys`, but it panicked the moment a per-key
+slice was derived from it. Both slices are now re-sliced together.
+
+F2 — three mutations, three distinct RED signatures, each scoped to the belt it
+severs, all run with `-run 6673` after confirming the pattern actually selects
+the new tests (a `-run Provenance6673` typo first produced a vacuous 0.005s
+"ok"):
+
+  - revert `eventMultiWordLeafValues` to the text rule -> 8 named failures across
+    pkg/config (hierarchical AND flat-set arms, plus attributes-match),
+    pkg/eventengine (`ok = true, want false`) and pkg/configstore.
+  - `keyNeedsAuthoredQuote` -> false -> ONLY the round-trip test reds, on
+    exactly the three ambiguous authorings; the five controls and the direct-read
+    tests stay green. eventengine and configstore stay green.
+  - `SetFromInputAs`/`applyEditLine` drop provenance -> ONLY the two configstore
+    wiring tests red; pkg/config and pkg/eventengine stay green.
+
+The wiring test exists because a fix applied to `SetPathQuoted` alone still
+passes every pkg/config test — plain `SetPath` records nothing, so a test written
+against it is evaluated under the legacy rule and passes with the defect present.
+The tests therefore drive the same entry points production uses.
+
+F3 — the inventory. The empty-value category table has FOUR rows and was being
+read as the coverage list; it classifies empty-value SEMANTICS and its `Reader`
+column names four mechanisms because two of them serve two leaves each. The real
+inventory is SIX leaf families over SEVEN read sites: `security flow traceoptions
+flag` is read twice, once by `compileFlow` and once by the #3422 commit gate
+`validateFlowTraceFlagsAndFiltersAST`, and widening one without the other would
+leave the gate and the compiler disagreeing about which values exist. All seven
+were verified to accumulate both AST sides at this head. The leaves still read
+one-sided are unchanged and already filed: #6697 (CoS code-points), #6692
+(system archival + four siblings), #6687 (vlan-id-list), #6714 (nested-bracket
+tails, proxy-ARP after a range, repeated `commands`). Both tables are now in
+docs/config-schema.md so the next audit counts read sites rather than rows.
+
+Validation: `go build ./...` rc=0, `go vet` on the three packages rc=0, the
+specified gate `go test ./pkg/config/... ./pkg/eventengine/...` rc=0, and the
+FULL `go test ./...` rc=0 with zero failures — the render change touches every
+`show configuration` path, so the whole suite is the honest scope for it. No
+cluster tooling run; this change is control-plane only and ships no dataplane
+artifact.
+
+## 2026-08-01 — #6673 round 8: an invented rejection for a repeated identical prefix, and two rule-dropping checks that never marked the rule
 
 - **Timestamp**: 2026-08-12 (fold/6861-ipip-r6, PR #6861)
 - **Action**: fixed the one runtime blocker (the ID-collision arm of the live
@@ -3100,6 +3309,59 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   `pkg/routing/test_seams.go`,
   `pkg/routing/close_partial_manager_5718_test.go`,
   `pkg/routing/README.md`, `_Log.md`
+## 2026-08-01 — #6673 round 8: an invented rejection for a repeated identical prefix, and two rule-dropping checks that never marked the rule
+
+- **Timestamp**: 2026-08-01 (fix/6659-multivalue-leaf-arms, PR #6673)
+- **Action**: MAJOR — the #6659 cardinality gates counted RAW value slots, so a
+  REPEATED identical value became a hard commit rejection for a config
+  `origin/master` accepted and compiled byte-identically. Reproduced on both
+  trees through `CompileConfig` in strict mode before touching anything: three
+  authoring spellings (duplicate sibling statements, a duplicate inside one
+  bracket, two `match {}` stanzas) all ACCEPT on `ad9591177` and REJECT on
+  `b5da4d4d2`, with `rule.Match` identical on both. The same trap sat on the
+  SIBLING gate — `export [ p1 p1 ]` and `export p1; export p1;` measured the
+  same way — which the review had not looked at; both gates were written from
+  one template and both spared empties while rejecting duplicates. Both now run
+  `dedupeValuesBy` after `nonEmptyValues`. Identity is chosen per leaf: exact
+  text for the export gate (opaque policy names), and `staticNATMatchAddrKey`
+  for `match destination-address`, which mirrors Rust `parse_nat_prefix` (bare
+  address = host route, base masked to the prefix length) so `192.0.2.1` and
+  `192.0.2.1/32` collapse too — exact-text dedupe alone would have left the same
+  invented rejection one spelling over. Equal keys mean the rule lowers to a
+  byte-identical row, which is what makes collapsing sound rather than lenient;
+  genuinely distinct prefixes/policies still fail commit.
+- **Action (MINOR-1)**: the round-7 claim "every rule-dropping check
+  participates automatically" was true of `emit` and false of the ROUTING: two
+  whole-rule-dropping checks reported through the port-scoped `emitSuffix` and
+  so left `ruleDropped` false, emitting "stays active" for a rule the dataplane
+  discards. The review named one (out-of-range `match destination-port`, #5101 —
+  measured, 0 snapshots); enumerating the drop causes from BOTH lowering stages
+  found a second it had not: the block-pair-plus-port gate (#3202), where the Go
+  leg passes the rule through and the Rust block branch `continue`s (pinned by
+  `static_nat_block_with_port_is_dropped`). Both routed through `emit`. The
+  three remaining port checks are genuinely narrower and stay on `emitSuffix`,
+  each with the Rust `(0,_)/(m,0)` fold that installs an entry stated at its call
+  site — including why the malformed-`mapped-port` sibling differs from the
+  `destination-port` one (`combineMappedPortOperands` folds any malformed
+  operand to 0; the `destination-port` arm stores whatever `Atoi` returned).
+- **Action (MINOR-2/3)**: the residual is now an INVENTORY, not one example —
+  the empty `then static-nat` target (reported, but by a sibling validator whose
+  emissions the flag cannot see) beside the cross-family host pair (not checked
+  by any validator). The oracle field comment no longer claims all 23
+  `wantInstalled` rows are master's installed set: the two CONTROL rows are
+  head's intended #6659 widening, which master does not install.
+- **Validation**: RED-then-GREEN on four mutations, build rc 0 AND vet rc 0 in
+  both states each time — drop the static-NAT dedupe (8 subtests of
+  `…RepeatedIdenticalPrefixCommits` red, nothing else), drop the export dedupe
+  (its 4 subtests), revert `destination-port` to `emitSuffix` (1 subtest),
+  revert block-pair+port to `emitSuffix` (1 subtest). `go build`/`go vet` rc 0,
+  `go test ./pkg/config/... ./pkg/dataplane/...` ok, full `go test ./...` rc 0,
+  59 packages ok, 0 FAIL. gofmt clean on every touched file.
+- **File(s)**: `pkg/config/ast.go`, `pkg/config/compiler_nat_static.go`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_validate_strict_routing.go`,
+  `pkg/config/compiler_multivalue_leaf_empty_6673_test.go`,
+  `docs/config-schema.md`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
@@ -73978,6 +74240,389 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   result was read.
 - **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go,
   pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
+- **Timestamp**: 2026-08-02 07:05
+- **Action**: #6673 F1 MAJOR — restore last-sibling-wins for static-NAT `match
+  destination-address`. #6659's widening changed the scalar `rule.Match` from
+  `nodeVal(m)` (assigned per sibling child, LAST wins) to `MatchAddresses[0]`
+  (FIRST wins). Invisible for the BRACKET form — one node, values on
+  Keys[1:]/Children, both selections agree — which is why every test the widening
+  shipped with stayed green. The REPEATED-`set` form makes two sibling nodes and
+  is the shape that flipped; it had zero coverage. Measured myself end-to-end
+  through buildStaticNATSnapshots on the tolerant path: ExternalIP
+  "198.51.100.1/32" (correct) vs "192.0.2.1/32" (regressed) — matching the
+  reviewer's figures. Restored `rule.Match = nodeVal(m)` alongside the
+  accumulation, so the #6659 widening (both prefixes read, neither escaping
+  validation) is kept. New test drives the repeated-set shape through
+  CompileConfigLenient AND a Format()/FormatSet() round trip, since the tolerant
+  path is reached by re-loading a persisted config. RED-on-revert: build rc=0,
+  vet rc=0 under the mutation, both new tests red with real `--- FAIL:` lines,
+  and ZERO non-6673 static-NAT failures.
+- **File(s)**: pkg/config/compiler_nat_static.go,
+  pkg/dataplane/userspace/static_nat_repeated_match_6673_test.go, _Log.md
+
+
+- **Timestamp**: 2026-08-02 13:40
+- **Action**: #6673 F2 MAJOR — make the empty-value semantics of the six widened
+  multi-value arms match master, and make the scalar and plural mechanisms agree.
+  Built a master-vs-head differential over 35 empty-value shapes (`[ "" x ]`,
+  `[ ]`, a bare `""`, and an empty value in a non-first slot, strict AND
+  tolerant, all six arms) — the shape matrix #6659 shipped with never
+  constructed an empty value, so four behaviour changes were invisible to it by
+  construction. (1) SELECTION MOVED: deriving `ForwardingTableExport` from
+  `Exports[0]` over an empty-filtered list made `export [ "" p1 ];` select p1
+  where master selected nothing, silently enabling an ECMP policy the operator
+  had blanked; four authoring shapes affected, plus LAST-ROOT-WINS lost across
+  two `routing-options` roots. Restored the verbatim pre-#6659 `FindChild` +
+  `nodeVal` statement. (2) DRIFT: `firewallMatchValues` skips empty values while
+  `nodeVal` selects them, so `rule.Match` could hold a value absent from
+  `MatchAddresses` — every consumer of that list is a validator or diagnostic
+  describing what installs. New `multiLeafAuthoredValues` (ast.go) keeps empty
+  values and guarantees `values[0] == nodeVal(n)` for every node shape;
+  cardinality gates count `nonEmptyValues` so no accept/reject outcome changes.
+  (3) NEW REGRESSION FOUND AND FIXED: dropping an empty `attributes-match`
+  expression turned master's fail-CLOSED malformed-expression rejection into a
+  fail-open (the policy then fires on every occurrence of its event). (4) The
+  sibling `commands` leaf is an OUTPUT-PARITY divergence, NOT a fail-open —
+  `eventengine.classifyPlan` has trimmed and SKIPPED empty commands since the
+  engine's first commit, so the remediation batch is identical either way; the
+  compiled list is kept because it is hashed into `policySemanticRevision` and
+  printed verbatim by `show event-options`. Both readers keep empty entries again;
+  the packed spellings now behave like the block ones, which is the dual-shape
+  parity the arms were widened for. Flow-trace flags and proxy-ARP addresses are
+  SET leaves and keep skipping empties, as master did — pinned as a control.
+  Also corrected the tolerant-path suffix: `emitMatchAddr` no longer claims "rule
+  dropped by dataplane" for a value the compiler did not select, since only
+  `rule.Match` is lowered and the rule keeps translating. RED-on-revert: 13
+  mutations, build rc=0 + vet rc=0 asserted under each, all 13 red the named test
+  with a real `--- FAIL:` line. Two mutations initially produced NO red and
+  exposed a non-binding assertion — the warning lookup matched the cardinality
+  warning, which quotes the same value and legitimately carries no suffix — fixed
+  by keying on the message body and asserting a unique match.
+- **File(s)**: pkg/config/ast.go, pkg/config/compiler_routing.go,
+  pkg/config/compiler_nat_static.go, pkg/config/compiler_services.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-02 18:20
+- **Action**: #6673 F3 MINOR fold — correct a rationale that was factually false
+  in five shipping places, and close the two behaviour gaps the R5 re-gate
+  found. (1) The F2 entry above, `compiler_services.go`, `docs/config-schema.md`
+  and the guard test all justified keeping an empty `then change-configuration
+  commands` entry by claiming master's event engine "declined the WHOLE
+  remediation batch" for it. It never did: `eventengine.classifyPlan` opens with
+  `cmd = strings.TrimSpace(cmd); if cmd == "" { continue }` and has since the
+  engine's first commit — driven directly, `["", "set …"]` gives ok=true with
+  one op. The CODE is right and unchanged; only the reason was wrong. Restated
+  as what it actually preserves: OUTPUT PARITY. The compiled list is hashed into
+  `policySemanticRevision` and printed verbatim by `show event-options`, so
+  filtering would silently diverge the persisted policy from master's while
+  changing nothing about what the batch executes. The classification table gains
+  a fourth row (REPORTED LIST) because `commands` and `attributes-match` are not
+  one category — only the latter has a checker that rejects. (2) #6715, which
+  this PR NEWLY INTRODUCED rather than inherited: widening the dangling-reference
+  gate from the rendering scalar to every authored value let a NON-rendering
+  token reach "load-balancing would be silently disabled", which is false while
+  the selected policy renders. Fixed the same way the NAT side was — decide per
+  value, with a third branch for an EMPTY selection (`export [ "" nosuch ]`), so
+  no message names a policy that is not there. (3) The tolerant list-form warning
+  claimed "only the FIRST policy is honoured" while the error it wraps correctly
+  says only `"p2"` takes effect across two `routing-options` roots; the wrapper
+  no longer names a slot. (4) `emitMatchAddr` rendered `— "" is, and it stays
+  active` when the SELECTED value was an authored blank; `parse_nat_prefix("")`
+  returns None, so the rule is dropped, and the suffix now says so. (5) Dropped
+  the undocumented `strings.TrimSpace` both event readers had gained. The lexer
+  DOES preserve whitespace inside a quoted token (probed both ways), so trimming
+  diverged the persisted string, the semantic revision and the diagnostic from
+  master while being invisible to every consumer — the opposite of the parity
+  argument in (1). (6) The proxy-ARP `to`-skip comment claimed it "preserves the
+  pre-#6659 behaviour"; a master-vs-head differential shows master compiled
+  `address [ to 192.0.2.1 ]`, `address { to; }` and `address { to; 192.0.2.5; }`
+  to exactly `["to/32"]` while head gives `["192.0.2.1/32"]`, `[]` and
+  `["192.0.2.5/32"]`. It is a deliberate CHANGE, and its real purpose is that
+  without it `to/32` materialises and `validateProxyARPAddressesStrict`
+  hard-REJECTS a config master accepted — an invented rejection. Comment
+  corrected and the skip is now bound. (7) Recorded the #6714 sibling blind spot:
+  a SECOND `forwarding-table` block inside ONE `routing-options` root is
+  invisible to both the scalar and the list (`FindChild`), same as master.
+  RED-on-revert: 7 mutations, `go build -buildvcs=false ./...` rc=0 and
+  `go vet ./pkg/config/... ./pkg/eventengine/...` rc=0 asserted BEFORE every red,
+  predicate-disable/substitution style only (no deletion mutation that could
+  break the build into a false red); each reds its named test with a real
+  `--- FAIL:` line and a confirmed `=== RUN` count.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/compiler_nat_source.go, pkg/config/compiler_routing.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/eventengine/classify_plan_empty_command_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-02 21:05
+- **Action**: #6673 F4 fold — the proxy-ARP MAJOR the previous round could not
+  see, plus five diagnostic/rationale MINORs. (1) MAJOR: the F3 round verified
+  the malformed-range `to` skip on ACCEPTANCE parity — master accepts, head
+  accepts — and that is not the property that matters. Measured INSTALLATION
+  parity instead, running master and head through the installer's own gate
+  (`netip.ParsePrefix`, pkg/dataplane/proxyarp.go) over 34 authoring shapes
+  (23 hierarchical + 11 flat-set): the skip promoted a malformed range's
+  surviving endpoint to a standalone proxy address on SIX shapes. Master
+  compiled `address [ to 192.0.2.1 ]` to `["to/32"]` and installed NOTHING;
+  head installed an NTF_PROXY neighbour and enabled the interface proxy
+  responder for `192.0.2.1`. Codex reported one shape; the differential found
+  five more, worst of them `address [ .1 .2 to .9 ]`, where head installed .2
+  AND the orphan high endpoint .9 on top of master's .1. Fix: a malformed range
+  keeps master's single-value read (`nodeVal`) minus the bare keyword, so
+  installed(head) == installed(master) EXACTLY for every malformed shape in both
+  directions, with no invented rejection. The #6659 widening is untouched on
+  well-formed lists. Post-fix drift vs master is now only the four well-formed
+  list shapes (the intended widening) and three shapes carrying a genuinely
+  malformed ADDRESS literal (the intended `validateProxyARPAddressesStrict`
+  tightening, install set unchanged). (2) The routing per-value diagnostic said
+  the selected policy "still resolves" without checking it; with two undefined
+  policies the loop reports the first and mis-states the consequence for the
+  second. (3) `emitMatchAddr` said the selected value "stays active" without
+  checking it, so two malformed `destination-address` siblings produced two
+  warnings on one rule that contradicted each other. (4) Both cardinality gates
+  printed `only "" would take effect` when the selected slot was an authored
+  blank — none takes effect; the tolerant wrappers said "exactly/only ONE" for
+  the same reason. (5) Two comments still said the static-NAT "first" prefix is
+  selected; `rule.Match = nodeVal(m)` runs per sibling, so the LAST statement
+  wins and "first" holds only within one bracket list. (6) The trimming note
+  claimed trimming "rewrites the persisted config" — it does not: configstore
+  persists the AST candidate tree (store_commit.go writeActive -> db.go
+  writeTreeMarked) and the reader returns new strings; what it changes is the
+  compiled policy and its consumers. RED-on-revert: 8 mutations, `go build
+  -buildvcs=false ./...` rc=0 and `go vet ./pkg/config/... ./pkg/dataplane/...`
+  rc=0 asserted BEFORE every red, predicate-disable/substitution style only;
+  each reds its named test with a real `--- FAIL:` line. Two scope probes found
+  the `selectedInstalls` host-mask and block-pair legs UNBOUND by the first
+  draft of the guard and the test was widened until mutating each one reds.
+  `compiler_services.go` held at 1999 lines (TestHeatmapNotStale headroom).
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go,
+  pkg/config/compiler_uniformgates_log_feed_routing.go,
+  pkg/config/compiler_services.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #6673 round 7 — detect the proxy-ARP range keyword by CLASS, and
+  OBSERVE the static-NAT rule verdict instead of mirroring it. Round 6 found the
+  round-5 fix at a position its enumeration missed, which is the third time a
+  position list has shipped a live divergence, so both fixes here replace an
+  enumeration with a total rule. (F1, MAJOR) `proxyARPMalformedRange` inspected
+  `prop.Keys[1:]` and `Children[i].Keys[0]`. In the hierarchical BLOCK form a
+  range rides on a CHILD's own Keys (`address { .1; .2 to .9; }` →
+  `Children[1].Keys=[".2","to",".9"]`), so `Keys[0]` is the address and the `to`
+  at `Keys[1]` is invisible; the veto never engaged and every child's `Keys[0]`,
+  including each broken range's low endpoint, became a live proxy address.
+  Reproduced firsthand before fixing, differentially against origin/master
+  through the installer's own `netip.ParsePrefix` gate: SEVEN malformed shapes
+  diverged, e.g. `address { 192.0.2.1; 192.0.2.2 to; }` master installs
+  `[192.0.2.1/32]` and head installed `[192.0.2.1/32 192.0.2.2/32]`;
+  `{ .2 to .9; 198.51.100.2 to .9; }` master `[192.0.2.2/32]`, head added
+  `198.51.100.2/32`; same for the no-high-endpoint, three-child, IPv6, and two
+  NEWLY-found shapes the review had not seen — `to` at a child's THIRD key, and
+  `to` under a NESTED child (`address { .1 { to .9; } .3; }`), which the parser
+  nests arbitrarily deep. That is four distinct positions for one statement, so
+  the fix does not add a fifth: `nodeSubtreeHasKey` walks the whole subtree the
+  parser built for the statement and asks whether the keyword is among its
+  tokens. Position-independent by construction — every token the parser keeps
+  lands in some node's Keys there. Runtime impact of the bug:
+  `pkg/dataplane/proxyarp.go` parses the promoted address, installs an
+  `NTF_PROXY` neighbour, and `recordFamily` enables the per-interface kernel
+  proxy responder, so the appliance answered ARP/ND on an interface master left
+  silent for that address. The false universal at compiler_nat_source.go:218
+  ("installed(head)==installed(master) for EVERY malformed shape") is replaced
+  by what is actually measured — a corpus claim plus a detector that provably
+  sees every `to` — and the residual is stated: the veto is per STATEMENT, so a
+  broken range suppresses the #6659 widening for its own statement's operands
+  (matching master, and matching the already-shipped bracket form); per-CHILD
+  vetoing would install an address master never claimed. Block-form ranges still
+  do not EXPAND on either tree; that is pre-existing and out of scope, raised
+  rather than taken. (F2/F3, MINOR) `selectedInstalls` hand-mirrored the two
+  match-side loops and was wrong by THREE causes, not the one reported: the
+  then-side parse, the then-side host-mask, and the `/0` block-pair loop each
+  drop the rule without touching a match address. Replaced the mirror with
+  observation — `emit`, the closure whose suffix is "rule dropped by dataplane
+  until corrected", sets a per-rule `ruleDropped` flag itself, so every present
+  and future rule-dropping check counts while the port-scoped `emitSuffix`
+  callers correctly do not. Per-value complaints are appended with a blank
+  suffix and patched in place at end-of-rule (preserving warning order), and
+  `selectedMatchInvalid` keeps the sharper "that value is invalid too" wording
+  where the selected match value IS the cause. The `/0` loop now routes through
+  `emitMatchAddr` like its two siblings (F2). Measured while fixing: the review's
+  F2 repro does drop the rule — its `then 0.0.0.0/0` fails the host-route check —
+  so "it installs and translates" would have been a NEW falsehood; the wording
+  defers to the co-reported cause instead. Residual documented in code: the flag
+  observes THIS validator, so a cross-family `then` prefix (no such check exists)
+  still leaves "stays active" standing. (N1) The routing comment's repro was
+  measured unreachable and corrected: a single `forwarding-table` block selects
+  the FIRST export leaf (`FindChild`), so the branch needs two top-level
+  `routing-options` roots. RED-then-GREEN, `go build ./...` and `go vet ./...`
+  rc=0 asserted in BOTH states for all four mutations, each a scoped assertion
+  red: reverting the detector to the round-6 spelling reds the 8 new block-child
+  subtests and no others; reverting it to the REVIEWER's own prescribed fix
+  (scan `vn.Keys[1:]` too) still reds the 2 nested-depth subtests — direct
+  evidence the prescribed positional fix would have shipped a fourth round;
+  removing the `ruleDropped` observation reds the then-parse and non-selected /0
+  subtests; restoring the scalar `emit` in the /0 loop reds both /0 subtests;
+  and making `emitSuffix` set the flag reds the port-scoped negative-half test.
+  Every new `wantInstalled` oracle was re-measured on origin/master with the
+  EXACT test configs, not transcribed. `go test ./...` rc=0, 0 FAIL (known flake
+  #6726 `pkg/ddns` did not fire this run — pkg/ddns ok 3.629s).
+- **File(s)**: pkg/config/compiler_nat_source.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_validate_strict_routing.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01
+- **Action**: #6673 round 9 — a widened read must not PROMOTE a token the old
+  reader DISCARDED. Codex at 705bd0fa1 returned MERGE-NEEDS-MAJOR with four
+  items, all the same mistake in a different arm. (R1, MAJOR, runtime) A
+  bracketed `attributes-match [ "e.a matches X" "e.b matches Y" ]` has no
+  children — each quoted member is one token on Keys[1:] — and the reader joined
+  the tail into ONE impossible expression. `ParseEventAttributesMatch` splits at
+  the FIRST " matches " and the remainder compiles as a valid regex, so strict
+  commit ACCEPTED it and `attributesMatch` then compared that composite against
+  `ev.TestOwner` alone: an active policy became permanently inert with no
+  diagnostic. Master compiled nothing from a packed tail, so master FIRED. (R2,
+  MAJOR, runtime) `commands bogus { "set …"; }` parses as Keys=["commands",
+  "bogus"] with one child; master read Children only and the remediation ran.
+  Emitting both hands `classifyPlan` a token matching neither the `set ` nor the
+  `delete ` prefix, which rejects the WHOLE batch. (R4, MAJOR, invented
+  rejection) The same mixed shape on `attributes-match` turned a config that
+  committed before #6659 into a hard commit rejection. Fix for all three:
+  CHILDREN WIN — when the node has children they are the whole value list and
+  the node's own tail is ignored, verbatim master behaviour; the tail is read
+  only when there are no children, the shape master compiled NOTHING from. On
+  the tail, a token containing " matches " can only come from a quoted bracket
+  member (the lexer never leaves a space in an unquoted token), so any such
+  token makes the tail a LIST; otherwise it joins into one expression. Scope,
+  stated because four turned up in one review: this regression is only possible
+  where the old reader read Children EXCLUSIVELY. `nodeVal` prefers Keys[1] and
+  falls back to Children[0], so the other three widened arms (proxy-ARP address,
+  static-NAT match destination-address, forwarding-table export) already
+  preferred the tail and cannot promote a discarded token; the two event-options
+  arms are the only Children-only readers in the #6659 set, and both were hit.
+  (R3, decision, no code change) `flag [ "" session ]` installs {session} where
+  master installed both writer defaults. Reviewed and KEPT: master's rule was
+  slot-0 selection, so it installed different sets for `[ "" session ]` and
+  `[ session "" ]` — the same config with the tokens swapped — and installed one
+  flag when the operator asked for two. The rule is now position-independent
+  (every non-empty authored flag installs; an empty token is not a flag). An
+  empty token is NOT rejected, because master accepted it; the defaults stay
+  reachable by authoring no `flag` stanza. Written down in docs/config-schema.md
+  with the before/after table and pinned at `NewTraceWriter`'s own flag map.
+  (G1, validation escape) `staticNATMatchAddrKey` masks a prefix because plain
+  static NAT's `parse_nat_prefix` masks too — but NPTv6's `parse_prefix` FAILS
+  CLOSED on host bits (#4519, "do NOT mask"). So `[ 2001:db8:1::/48
+  2001:db8:1:2::/48 ]` collapsed to one key, the cardinality gate counted one,
+  the per-address validator skips NPTv6, and the NPTv6 validator reads only the
+  scalar: the invalid tail reached no gate at all, falsifying the PR's "every
+  widened value is validated". `staticNATMatchAddrKeyFor(rule.IsNPTv6)` withholds
+  masking from a value carrying host bits, so the pair counts as two and the
+  gate fires; the claim is now the narrow true one (a DISTINCT widened value is
+  rejected by cardinality, an IDENTICAL one IS the selected value the NPTv6
+  validator already checks). Also fixed the four test-claim defects that let the
+  four regressions ship: `installedProxyARP6673` now models
+  `proxyKey{ifindex, prefix.Addr()}` (it claimed two installs where proxyarp.go
+  creates one neighbour); the empty-selection test gained a swapped-slot control
+  so `Match == ""` is no longer satisfied by the field's zero value; the
+  Format round-trip test now reparses `Format()` — what store_persist.go writes
+  — instead of `FormatSet()`; and `ruleDropped` is DERIVED from the case's own
+  dropping cause instead of hand-set, with the snapshot-level observation and
+  the missing NPTv6 end-to-end coverage added in pkg/dataplane/userspace.
+  Differential proof for each: RED at 705bd0fa1 with a real assertion failure
+  (build+vet clean there), GREEN after, RED again under Edit-mutation of the
+  fix. Controls (packed forms, repeated identical prefixes, plain static-NAT
+  masking) PASS in every state, so the reds are scoped.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/compiler_nat_static.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_multivalue_leaf_empty_6673_test.go,
+  pkg/config/multivalue_mixed_shape_6673_test.go,
+  pkg/eventengine/multivalue_leaf_runtime_6673_test.go,
+  pkg/logging/flow_trace_flag_installed_6673_test.go,
+  pkg/dataplane/userspace/nptv6_multivalue_match_6673_test.go,
+  pkg/dataplane/userspace/static_nat_repeated_match_6673_test.go,
+## 2026-08-07 — #6673 fold r10: the flat-set bracket FUSES; the prescribed schema fix is wrong
+
+- **Timestamp**: 2026-08-07
+- **Action**: Fixed a RUNTIME REGRESSION vs master in the two `event-options`
+  multi-word leaves, corrected two false claims in the shipped prose, and
+  classified three deferred sites as GATE ESCAPES rather than value-drops.
+- **F1 (blocking, regression vs master)**: `eventChangeConfigCommands` split the
+  node's own TAIL per token but joined each CHILD's Keys unconditionally. Which
+  of the two a bracketed list lands in is decided by WHICH PARSER RAN —
+  `NewParser` collapses `commands [ "a" "b" ]` onto `Keys[1:]`, while
+  `ParseSetCommand` + `SetPath` puts the identical list on ONE CHILD's Keys — so
+  the hierarchical spelling compiled correctly and the flat-set spelling fused
+  into `"set system host-name foo delete system host-name"`. Measured on
+  origin/master (`["set system host-name foo"]`, drops the rest) vs the branch
+  (one fused string). Fused, the string still carries the `set ` prefix, so
+  `eventengine.classifyPlan` ACCEPTS it and the remediation applies a 6-token
+  path nobody wrote — strictly worse than master, which applied command #1.
+  `attributes-match` fuses the same way (master fuses identically, so a
+  completeness defect, not a regression) and fails CLOSED at runtime. A third
+  shape was found by enumeration: hierarchical `commands set system host-name
+  foo;` compiled to FOUR bare words at the branch head.
+- **The prescribed fix (`args: 1, multi: true` on both leaves) is wrong, and
+  measured wrong.** It fixes the two bracket cases and introduces two
+  regressions: `SetPath` then routes an UNQUOTED command onto the tail where the
+  per-token read shatters it into four bare words, and it turns repeated
+  flat-set statements into SIBLING nodes that `ccNode.FindChild` (singular)
+  drops after the first — worse than master. It also cannot repair an
+  already-persisted config, because the configstore deserializes Nodes from JSON
+  and `SetPath` never runs. Fixed in the READER instead, where both parser
+  shapes and both storage paths meet: one `eventMultiWordLeafValues` helper
+  applied to the tail AND to each child's Keys. All 16 enumerated authoring
+  shapes now compile correctly; three were wrong at the branch head.
+- **Discriminator**: the FIRST token, not any token. A first token that is
+  quoted (contains a space, or is empty — the lexer produces neither in a bare
+  word) means every token is a whole value. "Any token" breaks the legitimate
+  `commands set system host-name "foo bar"`, and taking the first token puts the
+  opposite ambiguity (`[ "set a b" bogus ]`) on the fail-CLOSED side.
+- **F2**: corrected `docs/config-schema.md`'s "Both regressions landed there,
+  and only there" — true of PROMOTION, false of the token boundary, and the
+  claim that would stop the next reader looking.
+- **F3**: corrected the PR body's "CoS `code-points` is not a fail-open — its
+  validator reads `Keys` and correctly rejects a bogus code point in either
+  slot". `collectCoSDSCPCodePoints` reads `child.Keys[1:]` plus the inline tail
+  and NEVER `child.Children`, so "either slot" holds only within the packed
+  tail. Three deferred sites classified through `configstore.CheckText`, each
+  paired with a single-value control: CoS `code-points` (BLOCK escapes,
+  bracket rejects, #6697), `archive-sites` (bracket escapes, block and single
+  reject, #6692, CWE-88), `vlan-id-list` (BOTH shapes escape, single rejects,
+  #6687). Left deferred — all three are already tracked, in three unrelated
+  subsystems, with no read this PR widens — but the escape is now stated at each
+  READ SITE in code, with an explicit warning that widening the archive-sites
+  read without widening the leading-dash check in the same change ships a live
+  argument injection.
+- **Validation**: four mutation cells, `go vet ./pkg/config ./pkg/eventengine`
+  rc=0 under every one so no red is a build break. M-A (children branch →
+  unconditional join, i.e. the branch head) REDs 5 cells with named assertions
+  including "ThenCommands = [\"set system host-name foo delete interfaces
+  ge-0/0/0\"]" and "policy does not fire for the event it was written for". M-B
+  (tail branch → head rules) REDs the two hierarchical shapes. M-C
+  (discriminator → ANY token) REDs only the four over-reach cells and leaves
+  every bracket cell GREEN — the negative control separating "splits correctly"
+  from "splits at all". M-D (drop the empty-token clause) REDs only the
+  empty-in-first-slot parity cell. Over-reach guards GREEN under every
+  mutation: the flat-set single-unquoted, repeated-statement and block
+  spellings. `go build ./...` 0, `go vet ./...` 0, `go test ./...` 0 across 60
+  packages, `golden_4406.json` regenerates byte-identical.
+- **File(s)**: pkg/config/compiler_services.go,
+  pkg/config/compiler_system.go, pkg/config/compiler_class_of_service.go,
+  pkg/config/compiler_multivalue_leaf_failopen_6659_test.go,
+  pkg/eventengine/multivalue_leaf_runtime_6673_test.go,
+  docs/config-schema.md, _Log.md
 
 ## 2026-08-12 — #4800 fold r6: per-call vs per-connection in the cost table
 
