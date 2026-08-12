@@ -1191,11 +1191,32 @@ space-bearing.
 
 Serialization is deliberately NOT "preserve every authored quote", which would
 render `description foo` as `description "foo"` in every `show configuration`.
-The grouping decision reads the first token of a group of two or more, and that
-token is always a NON-TERMINAL key of its node — so preserving non-terminal
-authored quotes is exactly sufficient, and a trailing bare-safe key still
-normalizes to bare. `TestEventCommands6673QuoteProvenanceSurvivesTextRoundTrip`
-binds both renderings.
+It is as wide as the ambiguity — but **the terminal test differs between the two
+renderers, and conflating them was a fail-open** (#6673 r11).
+
+| Renderer | What "terminal" means | Why |
+|---|---|---|
+| hierarchical (`QuotedKeyPath`) | last key OF THE NODE | a node's last key is followed by `{`, so it stays a container key on re-parse and its quoting decides nothing |
+| display-set (`joinQuotedKeysProv`) | last key OF THE EMITTED LINE | flattening concatenates a container's keys with its children's, so a container's last key lands at the FRONT of the child's group — the grouping-deciding token |
+
+Applying the per-node rule to the flat path dropped exactly that quote.
+Measured: `commands "set" { "system host-name pwned"; }` compiles, through
+`load override`, to a batch `classifyPlan` DECLINES; its display-set dump emitted
+the terminal `"set"` bare, and replaying that dump through `load set` compiled an
+applicable `set system host-name pwned`. Same authored bytes, reject became
+apply. `origin/master` does not have this — its reader compiles `["set"]` on the
+replay side, which is declined too.
+
+What is assertable, and what is not: display-set cannot express the difference
+between a container's identifier slot (`commands "x" { "y"; }`) and a two-member
+list (`commands [ "x" "y" ]`) — both flatten to one line, and that ambiguity is
+pre-existing. So the two ingresses are NOT required to compile identical command
+lists. They are required never to disagree toward EXECUTION: a batch one ingress
+declines must not be applied by the other.
+`TestIngressesDoNotDisagreeTowardExecution_6673` (pkg/configstore) binds that
+through the real `LoadOverride` and `LoadSet`;
+`TestEventCommands6673QuoteProvenanceSurvivesTextRoundTrip` binds the
+round-trip fidelity of the leaf shapes.
 
 Residual, unchanged: an ALL-BARE group (`[ seta setb ]`) still joins. Provenance
 cannot help — both authorings have zero quoted tokens and the AST does not record

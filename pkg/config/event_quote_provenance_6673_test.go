@@ -317,3 +317,161 @@ func equalStrings6673(a, b []string) bool {
 	}
 	return true
 }
+
+// TestSetPathQuotedRefreshesADuplicateLeafsProvenance_6673 binds the duplicate
+// short-circuit (#6673 r11 B2).
+//
+// THE DEFECT. SetPath's dedup arms compare keys with keysEqual, which reads the
+// key TEXT and nothing else, then return early. Two set commands with identical
+// text but DIFFERENT quoting are not the same statement — they group opposite
+// ways — so the early return left the FIRST command's mask describing the
+// SECOND command's tokens. Both slices keep the same length, so the
+// len(KeysQuoted)==len(Keys) invariant still holds and nothing downstream can
+// detect it; the node simply carries a mask that was never authored for it.
+//
+// Measured before the fix: issuing the path with mask [false,true] and then
+// re-issuing it with [true,false] left [false,true] in place, so the group
+// JOINED where the operator's second command says it must SPLIT — the
+// fail-open direction, since joining is what turns two members into one
+// applicable command.
+func TestSetPathQuotedRefreshesADuplicateLeafsProvenance_6673(t *testing.T) {
+	base := []string{"event-options", "policy", "p", "then", "change-configuration", "commands"}
+	withTail := func(a, b string) []string {
+		return append(append([]string(nil), base...), a, b)
+	}
+	// mask helper: which of the two TAIL tokens were authored quoted.
+	mask := func(firstQuoted, secondQuoted bool) []bool {
+		m := make([]bool, len(base)+2)
+		m[len(base)] = firstQuoted
+		m[len(base)+1] = secondQuoted
+		return m
+	}
+
+	tree := &ConfigTree{}
+	// First command: `set` BARE, `system` quoted -> the group JOINS.
+	if err := tree.SetPathQuoted(withTail("set", "system"), mask(false, true)); err != nil {
+		t.Fatalf("first SetPathQuoted: %v", err)
+	}
+	if got := childMask6673(t, tree); !equalBools6673(got, []bool{false, true}) {
+		t.Fatalf("after the first command the child mask is %v, want [false true] — the "+
+			"fixture is not set up as this test describes", got)
+	}
+
+	// Second command: identical TEXT, opposite quoting -> the group must SPLIT.
+	if err := tree.SetPathQuoted(withTail("set", "system"), mask(true, false)); err != nil {
+		t.Fatalf("second SetPathQuoted: %v", err)
+	}
+	if got := childMask6673(t, tree); !equalBools6673(got, []bool{true, false}) {
+		t.Fatalf("the duplicate short-circuit kept the FIRST command's mask %v, want "+
+			"[true false]. keysEqual compares key TEXT only, so two commands that differ "+
+			"solely in quoting look identical to it — and the retained mask then describes "+
+			"tokens it was never authored for (#6673 r11 B2)", got)
+	}
+
+	got := eventChangeConfigCommands(commandsNode6673(t, tree))
+	want := []string{"set", "system"}
+	if !equalStrings6673(got, want) {
+		t.Fatalf("compiled commands = %q, want %q — the second command authored a QUOTED "+
+			"leading `set`, which splits the group; joining is the fail-open direction "+
+			"because it is what turns two members into one applicable command", got, want)
+	}
+}
+
+// TestInactiveStripPreservesQuoteProvenance_6673 binds the copy at
+// inactive.go's stripInactiveNodes (#6673 r11 F1).
+//
+// The inner accessors were already bound, but the CALL SITE was not: deleting
+// `KeysQuoted` from the clone left the ENTIRE suite green, because
+// WithoutInactive returns the receiver unchanged when nothing is inactive — so
+// every existing fixture skipped the clone entirely.
+//
+// This fixture carries an UNRELATED `inactive:` statement, which is what makes
+// the strip actually run. That is the whole point: an operator parking one
+// unrelated line with `inactive:` is enough to route the tree through the clone,
+// and without the copy the remediation list silently changes meaning. Measured
+// with the copy deleted:
+//
+//	ThenCommands ["set" "system host-name pwned"]  ->  ["set system host-name pwned"]
+//
+// i.e. a batch classifyPlan declines becomes one it applies. Fail-open, reached
+// by a config change that has nothing to do with event-options.
+func TestInactiveStripPreservesQuoteProvenance_6673(t *testing.T) {
+	src := `system {
+  inactive: host-name parked;
+}
+event-options {
+  policy p {
+    then {
+      change-configuration {
+        commands [ "set" "system host-name pwned" ];
+      }
+    }
+  }
+}`
+	tree, perrs := NewParser(src).Parse()
+	if len(perrs) != 0 {
+		t.Fatalf("parse: %v", perrs)
+	}
+	// PRECONDITION: without an inactive node WithoutInactive short-circuits and
+	// stripInactiveNodes never runs, so the fixture would bind nothing.
+	if !tree.HasInactiveNodes() {
+		t.Fatal("fixture precondition: the tree must carry an inactive node, or the " +
+			"strip returns the receiver unchanged and this test exercises no copy")
+	}
+
+	stripped := tree.WithoutInactive()
+	if stripped == tree {
+		t.Fatal("fixture precondition: WithoutInactive returned the receiver, so no clone " +
+			"happened and the copy under test never ran")
+	}
+	n := stripped.FindChild("event-options").FindChild("policy").FindChild("then").
+		FindChild("change-configuration").FindChild("commands")
+	if n == nil {
+		t.Fatal("the stripped tree lost the commands node")
+	}
+	if !n.KeysHaveQuoteProvenance() {
+		t.Fatalf("the inactive strip DROPPED quote provenance (Keys=%q KeysQuoted=%v). "+
+			"WithoutInactive produces the tree the compiler reads, so a lost mask here "+
+			"silently re-keys every multi-value leaf below it (#6673 r11 F1)",
+			n.Keys, n.KeysQuoted)
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	if len(cfg.EventOptions) != 1 {
+		t.Fatalf("compiled %d event policies, want 1", len(cfg.EventOptions))
+	}
+	got := cfg.EventOptions[0].ThenCommands
+	want := []string{"set", "system host-name pwned"}
+	if !equalStrings6673(got, want) {
+		t.Fatalf("ThenCommands = %q (n=%d), want %q (n=%d). An unrelated `inactive:` "+
+			"statement routes the tree through stripInactiveNodes; if that clone drops "+
+			"KeysQuoted the two authored members FUSE into one applicable command",
+			got, len(got), want, len(want))
+	}
+}
+
+// childMask6673 returns the mask of the commands node's sole child, which is
+// where the flat-set path puts the value list.
+func childMask6673(t *testing.T, tree *ConfigTree) []bool {
+	t.Helper()
+	n := commandsNode6673(t, tree)
+	if len(n.Children) != 1 {
+		t.Fatalf("commands node has %d children, want 1", len(n.Children))
+	}
+	return n.Children[0].KeysQuoted
+}
+
+func equalBools6673(a, b []bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

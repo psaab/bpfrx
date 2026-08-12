@@ -242,15 +242,37 @@ func joinQuotedKeys(keys []string) string {
 }
 
 // joinQuotedKeysProv is joinQuotedKeys with per-key AUTHORED-quote provenance
-// (#6673): where forceQuote[i] is true the key is emitted quoted even though
-// its bare text would read back as the same key, because dropping the quotes
-// would lose the value GROUPING (see keyNeedsAuthoredQuote). forceQuote may be
-// nil or short — a missing entry means "quote only if quoteKey says so", which
-// is exactly the pre-#6673 rendering.
+// (#6673): where forceQuote[i] reports an AUTHORED quote, the key is emitted
+// quoted even though its bare text would read back as the same key, because
+// dropping the quotes would lose the value GROUPING. forceQuote may be nil or
+// short — a missing entry means "quote only if quoteKey says so", which is
+// exactly the pre-#6673 rendering.
+//
+// THE TERMINAL TEST IS AGAINST THIS LINE, not against the node a key came from,
+// and that distinction is the #6673 r11 fail-open (B1). The hierarchical
+// renderer may drop an authored quote on a node's LAST key, because there the
+// key is followed by `{` and stays a container key on re-parse
+// (keyNeedsAuthoredQuote). Flattening destroys that: a container's last key is
+// concatenated with its child's keys, so it lands at the FRONT of the child's
+// group, where it is exactly the token the grouping rule reads.
+//
+// Measured at the previous head on `commands "set" { "system host-name pwned"; }`
+// — the hierarchical ingress compiles ["system host-name pwned"], which
+// classifyPlan REJECTS for having no `set `/`delete ` prefix. FormatSet emitted
+// the terminal `"set"` BARE, and replaying that line compiled
+// ["set system host-name pwned"]: a valid command, APPLIED. Reject became
+// apply, on the same authored bytes. origin/master does not have this — its
+// reader compiles ["set"] on replay, which is rejected too, so both of its
+// ingresses decline. The suppression added the hole.
+//
+// Quoting every authored-quoted key except the line's LAST restores that: the
+// last token's quoting decides nothing (a one-token group is identical under
+// both grouping rules), and every earlier token keeps the bit the next parse
+// needs.
 func joinQuotedKeysProv(keys []string, forceQuote []bool) string {
 	parts := make([]string, len(keys))
 	for i, k := range keys {
-		if i < len(forceQuote) && forceQuote[i] {
+		if i < len(keys)-1 && i < len(forceQuote) && forceQuote[i] {
 			parts[i] = `"` + keyEscaper.Replace(k) + `"`
 			continue
 		}
@@ -260,10 +282,16 @@ func joinQuotedKeysProv(keys []string, forceQuote []bool) string {
 }
 
 // appendNodeKeys extends a flat display-set path (and its parallel
-// authored-quote mask) with one node's keys. The mask is computed with the
-// SAME per-node rule the hierarchical renderer uses (keyNeedsAuthoredQuote), so
-// `show configuration` and `show | display set` re-emit an authored quote in
-// exactly the same positions and the two renderings stay mutually replayable.
+// authored-quote mask) with one node's keys.
+//
+// It records the RAW authored bit — Node.KeyQuoted — and deliberately does NOT
+// apply keyNeedsAuthoredQuote's per-node terminal rule (#6673 r11 B1). At this
+// point it is not yet known whether a key is terminal: a container's last key
+// is followed by its CHILDREN's keys in the flattened line. Pre-suppressing
+// here dropped exactly the quote that decides the child group's boundary on
+// re-parse, which is how a rejected remediation batch became an applied one.
+// joinQuotedKeysProv owns the terminal test, against the finished line.
+//
 // forceQuote is normalized to len(path) first so a caller may pass nil (or a
 // stale short mask) without silently shifting every subsequent key's flag.
 func appendNodeKeys(path []string, forceQuote []bool, n *Node) ([]string, []bool) {
@@ -271,7 +299,7 @@ func appendNodeKeys(path []string, forceQuote []bool, n *Node) ([]string, []bool
 	outQuote := make([]bool, len(path), len(outPath))
 	copy(outQuote, forceQuote)
 	for i := range n.Keys {
-		outQuote = append(outQuote, keyNeedsAuthoredQuote(n, i))
+		outQuote = append(outQuote, n.KeyQuoted(i))
 	}
 	return outPath, outQuote
 }

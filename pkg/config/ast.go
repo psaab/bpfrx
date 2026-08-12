@@ -159,13 +159,24 @@ func (n *Node) QuotedKeyPath() string {
 //
 // The rule is NOT "preserve every authored quote", which would rewrite
 // `description "foo"` as `description "foo"` instead of the Junos-normalized
-// `description foo` across every `show configuration` in the product. It is
-// exactly as wide as the ambiguity: the grouping decision
-// (eventMultiWordLeafValues) reads the quoting of the FIRST token of a group,
-// and a group of two or more always begins at a NON-TERMINAL key of its node.
-// A trailing key's quoting decides nothing — a one-token group is identical
-// under both rules — so a terminal bare-safe key still normalizes to bare and
-// no existing rendering changes.
+// `description foo` across every `show configuration` in the product. It is as
+// wide as the ambiguity: the grouping decision (eventMultiWordLeafValues) reads
+// the quoting of the FIRST token of a group, and within THIS renderer's output a
+// group of two or more begins at a non-terminal key of its node — a node's last
+// key is followed by `{`, so it stays a container key on re-parse and its
+// quoting decides nothing.
+//
+// SCOPE: THIS FUNCTION IS FOR THE HIERARCHICAL RENDERER ONLY. An earlier
+// revision called the non-terminal rule "exactly sufficient" without that
+// qualifier, and the display-set renderer used it too — where it is WRONG and
+// was a fail-open (#6673 r11 B1). Flattening concatenates a container's keys
+// with its children's, so a container's LAST key lands at the FRONT of the
+// child's group, which is precisely the grouping-deciding token. Measured:
+// `commands "set" { "system host-name pwned"; }` compiles to a batch
+// classifyPlan declines, but its display-set dump emitted the terminal `"set"`
+// bare and replaying that dump compiled an applicable `set system host-name
+// pwned`. The flat path now owns its own terminal test against the finished
+// LINE (joinQuotedKeysProv in ast_format.go); do not re-point it here.
 func keyNeedsAuthoredQuote(n *Node, i int) bool {
 	return i < len(n.Keys)-1 && n.KeyQuoted(i)
 }

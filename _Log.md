@@ -101,6 +101,100 @@
   pkg/networkd/README.md, pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
   _Log.md
 ## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
+## 2026-08-12 — #6673 round 11: the r10 serializer re-opened the fail-open through display-set, and two provenance carriers were unbound
+
+- **Timestamp**: 2026-08-12 (fold/6673-r11, PR #6673)
+- **Action**: fixed a fail-open the r10 fold itself introduced (B1), refreshed
+  provenance on the duplicate short-circuit (B2), bound the inactive-strip copy
+  (F1), and corrected the r10 sufficiency claim that B1 proved false.
+- **File(s)**: pkg/config/ast_format.go, pkg/config/ast.go,
+  pkg/config/ast_edit.go, pkg/config/event_quote_provenance_6673_test.go,
+  pkg/configstore/quote_provenance_ingress_6673_test.go,
+  docs/config-schema.md, _Log.md
+
+B1 — A NEW FAIL-OPEN, INTRODUCED BY R10. The r10 serializer preserved an
+authored quote only on a key that was NON-TERMINAL IN ITS OWN NODE. That is
+sound for the hierarchical renderer, where a node's last key is followed by `{`
+and stays a container key on re-parse. It is wrong for display-set, which
+FLATTENS: a container's keys are concatenated with its children's, so the
+container's last key lands at the FRONT of the child's group — exactly the token
+eventMultiWordLeafValues reads to decide the boundary.
+
+Measured at the r10 head on `commands "set" { "system host-name pwned"; }`:
+
+    LoadOverride (hierarchical) -> ThenCommands ["system host-name pwned"]
+                                  -> no `set `/`delete ` prefix -> DECLINED
+    display-set dump             -> `... commands set "system host-name pwned"`
+    LoadSet (that dump)          -> ThenCommands ["set system host-name pwned"]
+                                  -> APPLIED
+
+A batch the operator's own config declines became one that runs an arbitrary
+`set`, on the same authored bytes, after a round trip through the product's own
+display format.
+
+VERIFIED NOT PRE-EXISTING, rather than assumed. origin/master (6c4289902) was
+driven on the identical fixture: hierarchical compiles ["system host-name
+pwned"] and the replay compiles ["set"] — both declined. Master's two ingresses
+disagree on the STRING and agree on the VERDICT. The r10 suppression is what
+made the disagreement run toward execution.
+
+The fix moves the terminal test to where the flattening happens:
+joinQuotedKeysProv now tests against the finished LINE, and appendNodeKeys
+records the RAW authored bit instead of pre-applying the per-node rule.
+
+WHAT THE TEST ASSERTS, and what it deliberately does not. Display-set cannot
+express the difference between a container's identifier slot
+(`commands "x" { "y"; }`) and a two-member list (`commands [ "x" "y" ]`) — both
+flatten to one line. That ambiguity is PRE-EXISTING and master has it too, so
+demanding identical command lists from both ingresses would pin a property no
+version of this code has ever had. What must hold, and what master does provide,
+is that the disagreement never runs toward EXECUTION. The new
+pkg/configstore test drives the real LoadOverride and LoadSet and asserts
+exactly that, with two controls: a well-formed single command must execute on
+BOTH (so a fix that declined everything cannot pass), and the r10 bracket-list
+property must still decline (so a regression of the original #6673 fix would
+show up here rather than silently making the B1 rows vacuous).
+
+B2 — THE DUPLICATE SHORT-CIRCUIT KEPT A STALE MASK. SetPath's three dedup arms
+compare keys with keysEqual, which reads key TEXT and nothing else, then return
+early. Two set commands with identical text but different quoting are not the
+same statement — they group opposite ways — so the early return left the FIRST
+command's mask describing the SECOND command's tokens. Lengths still agree, so
+the invariant holds and nothing downstream can notice. Measured: issuing
+[false,true] then [true,false] left [false,true] in place and the group JOINED
+where the second command says SPLIT — the fail-open direction, since joining is
+what turns two members into one applicable command. All three arms now re-stamp;
+the later command wins, which is what `set` means in the single-value arm a few
+lines up.
+
+F1 — THE INACTIVE-STRIP COPY WAS UNBOUND, and the reason is worth recording:
+WithoutInactive returns the receiver UNCHANGED when nothing is inactive, so
+every existing fixture skipped stripInactiveNodes entirely. Deleting the
+KeysQuoted copy left pkg/config, pkg/configstore and pkg/eventengine ALL GREEN.
+The new fixture carries one unrelated `inactive: host-name parked;`, which is
+what routes the tree through the clone. With the copy deleted that config
+compiles ThenCommands ["set system host-name pwned"] instead of
+["set", "system host-name pwned"] — a declined batch becomes an applied one,
+reached by parking an unrelated line.
+
+CLAIM CORRECTED. The r10 comment and docs/config-schema.md said preserving
+non-terminal authored quotes was "exactly sufficient". B1 is the proof it is
+not. Both now state the rule PER RENDERER, in a table, with the measurement.
+
+Validation: three mutations, each a single-line production edit, each RED as an
+ASSERTION (not a build break):
+  - joinQuotedKeysProv/appendNodeKeys reverted to the per-node rule ->
+    TestIngressesDoNotDisagreeTowardExecution_6673 fails with "FAIL-OPEN: the
+    hierarchical ingress DECLINES this batch but the display-set replay
+    EXECUTES it".
+  - refreshDupKeysQuoted made a no-op -> the duplicate test fails naming the
+    retained [false true].
+  - the strip's KeysQuoted copy set to nil -> the inactive test fails naming the
+    emptied mask.
+go build rc=0, go vet rc=0, go test ./pkg/config/... ./pkg/configstore/... rc=0,
+full go test ./... rc=0 with zero failures. No cluster tooling: control-plane
+only, no dataplane artifact.
+
 ## 2026-08-12 — #6673 round 10: quote provenance was inferred from token TEXT, fusing two authored members into one applicable command
 
 - **Timestamp**: 2026-08-12 (fold/6673-quote-provenance, PR #6673)

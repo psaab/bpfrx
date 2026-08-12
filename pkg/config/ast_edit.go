@@ -248,6 +248,29 @@ func (t *ConfigTree) insertRelative(elementPath, refPath []string, after bool) e
 	return nil
 }
 
+// refreshDupKeysQuoted re-stamps an already-present duplicate leaf's authored
+// quote provenance from the CURRENT set command (#6673 r11 B2).
+//
+// SetPath's dedup arms short-circuit on keysEqual, which compares the key TEXT
+// and nothing else. Two set commands with identical text but different quoting
+// are not the same statement — `commands "set" system` and `commands set
+// "system"` produce the same Keys and opposite groupings — so returning early
+// left the FIRST command's mask describing the SECOND command's tokens. The
+// lengths still agree, so nothing downstream can notice; the node simply
+// carries a mask that was never authored for it. Measured before this fix:
+// re-issuing the path with mask [true,false] left [false,true] in place and the
+// group joined where it should have split.
+//
+// The LATER command wins, which is what `set` means everywhere else here — the
+// single-value arm a few lines up replaces the node outright for the same
+// reason.
+func refreshDupKeysQuoted(n *Node, quoted []bool) {
+	if n == nil {
+		return
+	}
+	n.setKeysQuoted(quoted)
+}
+
 // SetPath inserts a leaf node at the given path in the tree.
 // Intermediate block nodes are created as needed. The schema determines
 // which keywords are containers (and how many extra args they consume)
@@ -310,6 +333,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 			remaining := path[i:]
 			for _, n := range *current {
 				if n.IsLeaf && keysEqual(n.Keys, remaining) {
+					refreshDupKeysQuoted(n, quotedRange(i, len(path)))
 					return nil
 				}
 			}
@@ -382,6 +406,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 				// Flag leaf (args == 0) or multi-value leaf: skip if exact duplicate.
 				for _, n := range *current {
 					if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+						refreshDupKeysQuoted(n, quotedRange(keyStart, i))
 						return nil
 					}
 				}
@@ -461,6 +486,7 @@ func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 				dup := false
 				for _, n := range *current {
 					if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+						refreshDupKeysQuoted(n, quotedRange(keyStart, i))
 						dup = true
 						break
 					}
