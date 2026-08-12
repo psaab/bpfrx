@@ -204,6 +204,55 @@ func validateLoginPackedStatementsAST(tree *ConfigTree, lenient bool) ([]string,
 	return f.verdict(lenient)
 }
 
+// loginPathPackedAnywhere reports whether ANY `system login` ancestor path in
+// the tree is written packed onto a statement line, across both cluster node
+// views.
+//
+// It is deliberately BROADER than the reporting gate above and answers a
+// different question. validateLoginPackedStatementsAST answers "is there
+// something to REJECT?", and reportLoginPathPacked stays silent for a prefix
+// that names no instance and carries no children (`system login;`,
+// `system login user;`) because rejecting those would reject configuration
+// master accepts. This answers "did the operator write a `system login` path
+// that the compiler did not descend?" — and the answer is yes for those
+// prefixes too.
+//
+// That distinction is the #6706 review finding: the two spellings are not
+// equivalent, so calling the short prefixes inert was wrong. Measured directly:
+//
+//	system { login; }   -> System.Login NON-NIL (0 users) -> every non-root
+//	                       caller resolves to `unauthorized`
+//	system login;       -> System.Login NIL                -> pkg/cli's legacy
+//	                       unset-class mode: every command permitted, secrets
+//	                       rendered in CLEARTEXT
+//
+// The packed spelling is the fail-OPEN one, which is the direction that cannot
+// be left to a comment. Reporting them would be a new rejection; making the
+// RUNTIME agree costs nothing an operator can see, so that is what this drives
+// (Config.System.LoginDroppedByPacking -> pkg/daemon applyCLILoginClass).
+//
+// It walks the same two ancestor branches collectLoginPackedFindings walks, so
+// the two cannot drift on WHICH shapes count as packed — only on which of them
+// are reportable.
+func loginPathPackedAnywhere(tree *ConfigTree) bool {
+	packed := false
+	forEachClusterNodeView(tree, func(view *ConfigTree) {
+		_ = forEachChild(view.Children, "system", func(sys *Node) error {
+			if len(sys.Keys) > 1 && sys.Keys[1] == "login" {
+				packed = true
+				return nil
+			}
+			return forEachChild(sys.Children, "login", func(login *Node) error {
+				if len(login.Keys) > 1 {
+					packed = true
+				}
+				return nil
+			})
+		})
+	})
+	return packed
+}
+
 // loginPathLevelSystem / loginPathLevelLogin name the two ANCESTOR levels at
 // which the `system login` path itself can be packed onto a statement line.
 // They are the `%s statement line` token in the rejection message, so they are
@@ -328,10 +377,26 @@ func loginPathPackedConsequence(level string) string {
 // unquoted multi-word token would paste back as several tokens.
 //
 // nameIndex is where an instance NAME would sit in rest. A prefix that stops
-// before it AND has no children below declares nothing that the nested spelling
-// would have compiled either — `system login;` and `system login user;` are
-// inert in both spellings — so there is nothing dropped to report, and
-// rejecting them would be rejecting config the gate has no complaint about.
+// before it AND has no children below names no user and no class, so there is
+// no authored instance to report as dropped, and rejecting it would reject
+// config master accepts.
+//
+// An earlier revision justified that silence by calling `system login;` and
+// `system login user;` "inert in both spellings". They are not, and the
+// difference runs in the fail-OPEN direction (#6706 review r11). Measured:
+//
+//	system { login; }   -> System.Login NON-NIL (0 users) -> every non-root
+//	                       caller resolves to `unauthorized`
+//	system login;       -> System.Login NIL -> pkg/cli's legacy unset-class
+//	                       mode: every command permitted, secrets in CLEARTEXT
+//
+// The silence is still right — a new commit rejection here would be an outage
+// of its own, and neither spelling declares anything an operator asked for —
+// but the RUNTIME divergence is not acceptable, so it is closed elsewhere:
+// loginPathPackedAnywhere records every packed path INCLUDING these prefixes
+// into Config.System.LoginDroppedByPacking, and pkg/daemon applyCLILoginClass
+// refuses the legacy unset-class mode when it is set. Reporting and posture are
+// two decisions, and only one of them needed changing.
 // A prefix WITH children is always reportable however short it is:
 // `system login { user alice { class ops; } }` packs only the two-token prefix
 // yet drops a fully-formed stanza.

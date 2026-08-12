@@ -465,6 +465,135 @@ control-plane only, no dataplane artifact.
   `pkg/config/compiler_validate_warn_routing.go`,
   `pkg/config/parser_routing_test.go`, `docs/feature-gaps.md`,
   `docs/feature-coverage.md`, `_Log.md`
+## 2026-08-12 — #6706 round 11: the tolerant packed-login path was an RBAC hole, and five shipped claims were false
+
+- **Timestamp**: 2026-08-12 (fold/6706-rbac-identity, PR #6706)
+- **Action**: verified every Codex DO-NOT-MERGE finding BY RUNNING IT (Codex
+  could not run tests at all — its `go test` died on a read-only `/tmp`, so its
+  whole RED/GREEN ledger was analysis); fixed the one real runtime hole plus a
+  real test-analyzer gap; corrected seven false claims across code and docs.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler.go,
+  pkg/config/compiler_system_login_gates.go, pkg/config/testdata/golden_4406.json,
+  pkg/daemon/cli_rbac.go, pkg/daemon/daemon_run.go, pkg/osident/osident.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/config/compiler_system_login_packed_6662_test.go,
+  pkg/daemon/cli_rbac_dropped_login_6706_test.go, docs/system-login.md,
+  docs/config-schema.md, _Log.md
+
+BASELINE FIRST. The suite is GREEN at the PR head (9c2115096) across osident,
+cli, daemon, config, configstore and cmd/cli. Codex never established that, so
+nothing in its report distinguished "this assertion fails" from "no assertion
+ran".
+
+RUNTIME HOLE (the only one, and it is real). A `system login` path packed onto
+an ancestor statement line compiles the whole stanza away. Measured at the head:
+
+    system login user alice class ops;   -> strict REJECTED | lenient System.Login = NIL
+    system { login user alice class ops; } -> strict REJECTED | lenient Login = non-nil, EMPTY
+    system { login; }                    -> ACCEPTED | Login = NON-NIL (0 users)
+    system login;                        -> ACCEPTED | Login = NIL
+
+Strict commit rejects the first two, so an operator typing them never gets
+there. The TOLERANT ingress does not: Store.Load at boot and Store.SyncApply
+from a peer downgrade the finding to a warning and KEEP the config (#1960
+no-brick). `applyCLILoginClass` then took its `cfg.System.Login == nil` early
+return, so SetUserClass was never called and the shell ran with an EMPTY class
+— pkg/cli's legacy allow-everything mode: every command permitted and
+showConfigRedacted false, so IKE PSKs, SNMP communities and authentication-keys
+render in CLEARTEXT. On a config that reads as restrictive. Driven end to end
+and confirmed: `SetUserClass called=false class=""`.
+
+The last two rows are the second half. `system { login; }` and `system login;`
+are the SAME text in two spellings and they disagree — nested denies every
+non-root caller, packed permits everyone. The gate stays silent on that prefix
+on purpose (rejecting it would reject config master accepts), but its stated
+justification, "inert in both spellings", was false.
+
+FIX. `Config.System.LoginDroppedByPacking` carries the one bit the daemon was
+missing: "a `system login` path was AUTHORED but did not compile", which is what
+separates a deployment that never configured RBAC from one whose RBAC was
+dropped — both of which arrive as `Login == nil`. It is set by
+`loginPathPackedAnywhere`, deliberately BROADER than the reporting gate so it
+covers the short prefixes too, and `applyCLILoginClass` resolves through
+`ResolveLoginClass` instead of returning when it is set. Non-root callers get
+`unauthorized`; uid 0 keeps the console lifeline; a config with no `system
+login` at all is untouched. No new commit rejection: reporting and runtime
+posture are separate decisions and only the second one changed.
+
+The golden behaviour-preservation baseline (golden_4406.json) moved by exactly
+18 lines, every one of them `"LoginDroppedByPacking": false`, with zero
+deletions and zero changed values — i.e. the golden itself is the proof that the
+flag defaults false and changes nothing for existing configuration.
+
+TEST-ANALYZER GAP (Codex was right, and I proved it by mutating production).
+`TestSetUserClassCallersResolveThroughTheSharedResolver_6701` claims the class
+written is "the VALUE cli.ResolveLoginClass returned". Inserting
+`class = "super-user"` between the resolver call and the SetUserClass call in
+applyCLILoginClass — the #6701 defect verbatim — left BOTH repository-facing
+canaries GREEN, because the argument identifier had still been assigned from the
+resolver at some point. The analyzer now un-binds an identifier that is
+reassigned from a non-resolver expression at a position after the assignment
+that bound it; the same production mutation is now caught by name. Position
+rather than "any assignment" so the legitimate `class := "unauthorized"`
+pre-initialisation is not falsely rejected — three synthetic discriminator rows
+pin both directions, including that control.
+
+TEST ROLE LABELS, measured rather than assumed. Disabling
+`validateLoginPackedStatementsAST` entirely partitions the packed-test file in
+one run: thirteen tests go RED (they bind the gate) and six stay GREEN. The six
+are positive controls and are now labelled as such IN THE FILE, with the
+measurement that establishes it, rather than counted as gate coverage. Same for
+the canary file: exactly two of its six tests are repository-facing; the other
+four run the analyzer over a synthetic `const src` and cannot observe a change
+to pkg/daemon or cmd/cli at all. Nothing was deleted.
+
+The subtest at compiler_system_login_packed_6662_test.go:1204 was the worst of
+them — a positive control whose comment asserted the FALSE permissive invariant
+above ("compile to nothing in BOTH spellings"). Its accept assertion is correct
+and stands; the rationale is replaced by assertions of the actual divergence in
+both directions, plus the flag and a negative control for it.
+
+CLAIM CORRECTIONS, all verified false by measurement first:
+
+  - osident.go "pkg/cli fails closed on both" — false at uid 0. All three
+    unresolved Reasons (ambiguous, no row, unreadable) resolve uid 0 to
+    `super-user` while `user toor class read-only` is configured.
+  - osident.go "a narrowing and never a promotion" — false at uid 0, same
+    mechanism.
+  - osident.go IsRoot "never to OVERRIDE an explicit configured class" — the
+    default does not override a class that MATCHED, but when the lookup fails
+    there is no name to match with, so an explicit class written for an alias is
+    not applied and the caller lands on super-user. Indistinguishable from an
+    override from the operator's side. The BEHAVIOUR is deliberate and already
+    documented honestly in identity.go decision 1; only osident.go contradicted
+    it.
+  - daemon_run.go "the default is the restrictive class, not super-user" — two
+    of three outcomes. The third, an unset class, is more permissive than
+    super-user.
+  - docs/system-login.md "not an escalation path: changing `system login`
+    requires `configure`, which none of the restricted classes hold" — the
+    premise is false for CUSTOM classes. Measured: a session bound to a custom
+    class holding `[view configure]` is denied `request system reboot` with
+    showConfigRedacted true; after that same session commits
+    `permissions all` on its own class, both flip — allowed, and secrets in
+    cleartext — with no re-login. Only the class NAME is session-bound;
+    `resolveClassPerms` reads the ACTIVE config on every check. Replaced with
+    the four-row asymmetry table.
+  - docs/system-login.md "The CLI's class comes from the OS credential" — scoped
+    to the in-process console shell. The remote `cli` has no class at all; its
+    credential only renders the prompt and the gRPC listener has no
+    per-principal auth (#5278). The doc contradicted its own Scope paragraph.
+  - docs/system-login.md + docs/config-schema.md "declares nothing in either
+    spelling" — the measured divergence above.
+
+Validation: three mutations, three scoped RED signatures — the daemon branch
+reverted (4 rows red, controls green), the detector narrowed to the reportable
+shapes (ONLY the two short-prefix rows red), and the flag never set (red in both
+pkg/config and pkg/daemon). Plus the production-reassignment mutation, GREEN
+before the analyzer fix and RED after. go build rc=0, go vet rc=0, and the FULL
+`go test ./...` rc=0 with ZERO failures. No cluster tooling: control-plane only,
+no dataplane artifact.
+
 ## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
 
 - **Timestamp**: 2026-08-06 (fix/4555-ext-hdr-parity, PR #6655)

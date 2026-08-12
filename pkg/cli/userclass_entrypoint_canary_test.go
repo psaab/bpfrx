@@ -566,6 +566,12 @@ func hasPositionalElts(lit *ast.CompositeLit) bool {
 // the order they were found and each names what it defeats. The EDGE cases —
 // double parentheses, a parenthesised deref — exist because a fix aimed at one
 // spelling of a form is not a fix for the form.
+// ROLE: CHECKER CONTROL, not production coverage — it runs the analyzer over a SYNTHETIC file, never over this repository
+// (#6706 review r11). It proves the PREDICATE discriminates; it cannot
+// observe a change to pkg/daemon or cmd/cli. Exactly two tests in this file
+// are repository-facing: TestSetUserClassHasOneProductionCaller_6701 and
+// TestSetUserClassCallersResolveThroughTheSharedResolver_6701. Counting the
+// controls as production coverage overstates this file by a factor of three.
 func TestClassFieldWriteCanaryDetectsEveryWriteForm_6706(t *testing.T) {
 	const src = `package cli
 
@@ -765,8 +771,10 @@ func analyzeClassWrites(fset *token.FileSet, f *ast.File, pkgRel string) map[str
 // so the proof is of the SAME predicate the walk applies.
 func analyzeFuncClassWrite(fn *ast.FuncDecl) classWrite {
 	var cw classWrite
-	// Identifiers that hold the resolver's first result.
+	// Identifiers that hold the resolver's first result, and the position of
+	// the assignment that bound each one.
 	classVars := map[string]bool{}
+	boundAt := map[string]token.Pos{}
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		assign, ok := n.(*ast.AssignStmt)
 		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
@@ -778,6 +786,53 @@ func analyzeFuncClassWrite(fn *ast.FuncDecl) classWrite {
 		}
 		if id, ok := assign.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
 			classVars[id.Name] = true
+			if prev, seen := boundAt[id.Name]; !seen || assign.Pos() < prev {
+				boundAt[id.Name] = assign.Pos()
+			}
+		}
+		return true
+	})
+
+	// REBINDING. Holding the resolver's result at some point is not the same
+	// as WRITING it, and the difference is the whole claim this canary makes.
+	// Measured at the previous head by mutating production directly: inserting
+	// `class = "super-user"` between the ResolveLoginClass call and the
+	// SetUserClass call in applyCLILoginClass — the #6701 defect restored
+	// verbatim — left BOTH repository-facing canaries GREEN, because the
+	// argument identifier was still the one the resolver had assigned to
+	// (#6706 review r11). Only the behavioural tests caught it, which is
+	// exactly the coverage this test exists to be independent of.
+	//
+	// A non-resolver assignment to a bound identifier, at a position AFTER the
+	// assignment that bound it, therefore un-binds it. Position rather than
+	// "anywhere" so the legitimate `class := "unauthorized"` pre-initialisation
+	// followed by `class, _ = ResolveLoginClass(...)` is not falsely rejected;
+	// the discriminator test below pins both directions.
+	//
+	// LIMIT, named rather than implied: this is textual order, not control
+	// flow. A rebinding written textually BEFORE its resolver assignment but
+	// executing after it — a loop body that reassigns and then re-resolves —
+	// is not caught. Every shape reachable by an ordinary edit to
+	// applyCLILoginClass is.
+	rebound := map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		if len(assign.Rhs) == 1 {
+			if call, isCall := assign.Rhs[0].(*ast.CallExpr); isCall && isResolveLoginClassCall(call) {
+				return true
+			}
+		}
+		for _, lhs := range assign.Lhs {
+			id, isIdent := lhs.(*ast.Ident)
+			if !isIdent || !classVars[id.Name] {
+				continue
+			}
+			if at, seen := boundAt[id.Name]; seen && assign.Pos() > at {
+				rebound[id.Name] = true
+			}
 		}
 		return true
 	})
@@ -811,7 +866,7 @@ func analyzeFuncClassWrite(fn *ast.FuncDecl) classWrite {
 				return true
 			}
 			arg, ok := node.Args[0].(*ast.Ident)
-			if !ok || !classVars[arg.Name] {
+			if !ok || !classVars[arg.Name] || rebound[arg.Name] {
 				allBound = false
 			}
 		case *ast.SelectorExpr:
@@ -932,6 +987,12 @@ func TestSetUserClassCallersResolveThroughTheSharedResolver_6701(t *testing.T) {
 // to tell apart by name-mention alone, and requires exactly the correct one to
 // be accepted. The two evasion cases are the ones the #6706 review demonstrated
 // against the previous co-occurrence predicate.
+// ROLE: CHECKER CONTROL, not production coverage — it runs the analyzer over a SYNTHETIC file, never over this repository
+// (#6706 review r11). It proves the PREDICATE discriminates; it cannot
+// observe a change to pkg/daemon or cmd/cli. Exactly two tests in this file
+// are repository-facing: TestSetUserClassHasOneProductionCaller_6701 and
+// TestSetUserClassCallersResolveThroughTheSharedResolver_6701. Counting the
+// controls as production coverage overstates this file by a factor of three.
 func TestSharedResolverCanaryBindsDataflowNotCoOccurrence_6701(t *testing.T) {
 	const src = `package p
 
@@ -973,6 +1034,26 @@ func reDerived(shell userClassSetter, login *L, id I) {
 	}
 	shell.SetUserClass(promoted)
 }
+
+func rebindsAfterResolving(shell userClassSetter, login *L, id I) {
+	class, _ := cli.ResolveLoginClass(login, id)
+	class = "super-user"
+	shell.SetUserClass(class)
+}
+
+func rebindsConditionally(shell userClassSetter, login *L, id I) {
+	class, _ := cli.ResolveLoginClass(login, id)
+	if id.UID != 0 {
+		class = "super-user"
+	}
+	shell.SetUserClass(class)
+}
+
+func preInitialisedThenResolved(shell userClassSetter, login *L, id I) {
+	class := "unauthorized"
+	class, _ = cli.ResolveLoginClass(login, id)
+	shell.SetUserClass(class)
+}
 `
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
@@ -991,6 +1072,20 @@ func reDerived(shell userClassSetter, login *L, id I) {
 		"p::decoyCall":   {false, "calls the resolver, DISCARDS it, and writes a literal"},
 		"p::methodValue": {false, "writes through a method value the analysis cannot follow"},
 		"p::reDerived":   {false, "re-derives the class after the resolver returned"},
+		// #6706 review r11. The previous predicate accepted all three of the
+		// rows below, because it asked only whether the ARGUMENT IDENTIFIER had
+		// ever held the resolver's result. Inserting `class = "super-user"`
+		// into applyCLILoginClass — the #6701 defect verbatim — was therefore
+		// invisible to this canary, and the LAST row is why the fix is
+		// position-aware rather than "any assignment to the name": rejecting a
+		// pre-initialisation would have made the predicate reject a perfectly
+		// sound shape.
+		"p::rebindsAfterResolving": {false,
+			"reassigns the bound identifier after the resolver returned"},
+		"p::rebindsConditionally": {false,
+			"reassigns the bound identifier on one branch after the resolver returned"},
+		"p::preInitialisedThenResolved": {true,
+			"assigns a placeholder BEFORE resolving, then writes the resolver's result"},
 	}
 	if len(got) != len(cases) {
 		t.Fatalf("analyzer saw %d class writers, want %d: %v", len(got), len(cases), got)
@@ -1043,6 +1138,12 @@ func recvTypeNameFor(expr ast.Expr) string {
 // above is not vacuous: it runs setUserClassRefs — the very function the walk
 // calls, not a copy of it — over a synthetic file that reintroduces the #6701
 // default, and requires a hit outside the allowlist.
+// ROLE: CHECKER CONTROL, not production coverage — it runs the walker over a SYNTHETIC file, never over this repository
+// (#6706 review r11). It proves the PREDICATE discriminates; it cannot
+// observe a change to pkg/daemon or cmd/cli. Exactly two tests in this file
+// are repository-facing: TestSetUserClassHasOneProductionCaller_6701 and
+// TestSetUserClassCallersResolveThroughTheSharedResolver_6701. Counting the
+// controls as production coverage overstates this file by a factor of three.
 func TestSetUserClassCanaryDetectsAnUnallowlistedCaller_6701(t *testing.T) {
 	const src = `package rogue
 
@@ -1092,6 +1193,12 @@ func viaMethodValue(shell interface{ SetUserClass(string) }) {
 // FAIL-ON-REVERT: key setUserClassRefs on a running `enclosing` variable again
 // and this reds — the second reference is attributed to the allowlisted function
 // instead of to the package level.
+// ROLE: CHECKER CONTROL, not production coverage — it runs the walker over a SYNTHETIC file, never over this repository
+// (#6706 review r11). It proves the PREDICATE discriminates; it cannot
+// observe a change to pkg/daemon or cmd/cli. Exactly two tests in this file
+// are repository-facing: TestSetUserClassHasOneProductionCaller_6701 and
+// TestSetUserClassCallersResolveThroughTheSharedResolver_6701. Counting the
+// controls as production coverage overstates this file by a factor of three.
 func TestPackageLevelClassWriteIsNotAllowlistedByANeighbour_6701(t *testing.T) {
 	const src = `package daemon
 

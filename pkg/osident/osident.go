@@ -61,19 +61,38 @@
 // is pkg/cli's ClassUnidentified, whose value is "unauthorized" — a different
 // thing again, one layer up (#6706 review r10 F4).
 //
-// pkg/cli fails closed on both. The sentence above is scoped to "exactly one
-// name" and "readable" on purpose: an earlier revision claimed parity for every
-// uid that HAS a row, which the ambiguity refusal falsifies outright (#6706
-// review r4/r5 F5).
+// pkg/cli fails closed on both FOR EVERY NON-ROOT CALLER. It does NOT for uid
+// 0, and the difference is deliberate rather than an oversight — but an earlier
+// revision of this sentence said "fails closed on both" flat, which is false
+// for the one uid where the direction is a promotion (#6706 review r11).
+// Measured by driving cli.ResolveLoginClass: uid 0 with ReasonAmbiguousUID,
+// ReasonNoPasswdEntry or ReasonLookupFailed, against a config carrying
+// `system login user toor class read-only`, resolves to `super-user` in all
+// three cases — because candidateNames offers only the literal "root" for an
+// unnamed uid 0, no `root` stanza matches, and ResolveLoginClass decision 2
+// hands back the Junos root default. cli.ResolveLoginClass documents WHY that
+// is left as-is (uid 0 owns the config database, the daemon process and the
+// on-disk secrets, so a CLI-level denial is advisory and the alternative is
+// locking the console out over a passwd alias) and its reason string says so to
+// the operator. What must not happen is this package claiming otherwise.
+//
+// The sentence above is scoped to "exactly one name" and "readable" on purpose:
+// an earlier revision claimed parity for every uid that HAS a row, which the
+// ambiguity refusal falsifies outright (#6706 review r4/r5 F5).
 //
 // A cgo-enabled dev build loses NSS name resolution — and that affects the RBAC
 // CLASS DECISION, not merely the displayed prompt. An NSS-only account (LDAP,
 // SSSD) resolves to an empty Name — unidentified, the category — and is
 // therefore denied, where a cgo build would previously have named it. That is a
-// narrowing and never a promotion, so it is safe in the direction that matters,
-// but it is a functional narrowing rather than a cosmetic one and is worth
-// stating as such. The shipped build is
-// CGO_ENABLED=0 (see the Makefile), so production is unaffected either way.
+// narrowing for every non-root uid. It is NOT a narrowing at uid 0, for the
+// same reason as above: an unnamed uid 0 takes the root default, so a uid 0
+// that a cgo build would have named through NSS as an aliased account carrying
+// an explicit restrictive class is PROMOTED to super-user by losing the name.
+// An earlier revision said "a narrowing and never a promotion", which is the
+// claim this paragraph now scopes (#6706 review r11). uid 0 is essentially
+// always a local passwd row, so this is a statement about the claim rather than
+// a reachable production regression; the shipped build is CGO_ENABLED=0 (see
+// the Makefile) and is unaffected either way.
 // TestNoOsUserInIdentityResolution_6701 keeps os/user out.
 package osident
 
@@ -140,9 +159,21 @@ func (id Identity) Resolved() bool { return id.Name != "" }
 //
 // uid 0 already owns the config database file, the daemon process, and the
 // on-disk secrets, so it is not a boundary xpf can meaningfully enforce; it is
-// the console lifeline instead. Callers use this for a Junos-parity default
-// (root with no `system login user root` stanza is super-user), never to
-// OVERRIDE an explicit configured class.
+// the console lifeline instead. Callers use this for a Junos-parity default:
+// root with no MATCHING `system login user` stanza is super-user.
+//
+// "No matching stanza" is the honest phrasing, and an earlier revision's
+// "never to OVERRIDE an explicit configured class" was not (#6706 review r11).
+// The default does not override a class that MATCHED — an explicit
+// `system login user root class read-only` still wins, and so does a stanza
+// written for a resolved alias. But when the passwd lookup FAILS, uid 0 has no
+// name to match with, so an explicit class the operator wrote for that account
+// under its alias (`user toor class read-only`) is not applied and the caller
+// lands on super-user. From the operator's side that is indistinguishable from
+// an override, and it is reachable through all three unresolved Reasons.
+// cli.ResolveLoginClass decision 1 documents the case, TestRootAliasClassMatrix_6706
+// pins the matrix, and the reason string tells the operator that an explicit
+// class was NOT applied rather than claiming root is unconfigured.
 func (id Identity) IsRoot() bool { return id.UID == 0 }
 
 // String renders the identity for a log line or a shell prompt: the account

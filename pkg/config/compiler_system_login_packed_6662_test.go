@@ -84,6 +84,11 @@ func mustReject(t *testing.T, err error, marker, what string) {
 // point — that advisory (`if lc.DenyCommands != ""`, loginClassAdvisoryWarnings)
 // is one of the safety nets the packed drop silently disabled, so a test that
 // only checked struct fields would miss half of what the bug cost.
+// ROLE: POSITIVE CONTROL — the shape that must keep working. Measured, not assumed: disabling
+// validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
+// review r11), so it binds no gate behaviour and must not be counted as gate
+// coverage. It is kept because a gate with no over-reach control is one
+// widening away from rejecting valid configuration.
 func TestLoginNestedCompilesCorrectly_6662(t *testing.T) {
 	cfg, err := compileLogin6662(t, `system {
 		login {
@@ -327,6 +332,11 @@ func TestLoginPackedUserRejectionExplainsTheRBACCost_6662(t *testing.T) {
 // this, a gate keyed on "the instance node carries extra tokens" that got the
 // identity-key count wrong would reject every `set system login ...` line and
 // brick config authoring, while the reject-table above stayed green.
+// ROLE: POSITIVE CONTROL — the ingress the gate must never touch. Measured, not assumed: disabling
+// validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
+// review r11), so it binds no gate behaviour and must not be counted as gate
+// coverage. It is kept because a gate with no over-reach control is one
+// widening away from rejecting valid configuration.
 func TestLoginFlatSetStillCompiles_6662(t *testing.T) {
 	cfg, err := compileLogin6662FlatSet(t,
 		"set system login class ops permissions [ view configure ]",
@@ -378,6 +388,11 @@ func TestLoginFlatSetStillCompiles_6662(t *testing.T) {
 // TestLoginBareInstanceStillCompiles_6662 guards the other false-positive edge:
 // an instance with NO body at all (`user alice;` / `class ops;`) carries exactly
 // the identity keys and must pass the gate untouched.
+// ROLE: POSITIVE CONTROL — an unpacked instance the gate must not claim. Measured, not assumed: disabling
+// validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
+// review r11), so it binds no gate behaviour and must not be counted as gate
+// coverage. It is kept because a gate with no over-reach control is one
+// widening away from rejecting valid configuration.
 func TestLoginBareInstanceStillCompiles_6662(t *testing.T) {
 	for _, text := range []string{
 		`system { login { user alice; } }`,
@@ -494,13 +509,27 @@ func TestLoginPackedLenientWarns_6662(t *testing.T) {
 	}
 }
 
-// TestLoginPackedLenientStillCompilesEmpty_6662 states the residual honestly and
-// pins the belt that covers it: on the tolerant path the packed stanza STILL
-// compiles to an empty class (that is what "warn, don't reject" means), so the
-// commit gate alone does not close the RBAC hole there. What closes it is
-// pkg/cli ResolveLoginClass mapping a matched user with an EMPTY class to the
-// fail-closed class — asserted independently in
+// TestLoginPackedLenientStillCompilesEmpty_6662 pins the residual for the
+// INSTANCE-line packing specifically: on the tolerant path that stanza still
+// compiles a user with an EMPTY class (that is what "warn, don't reject"
+// means), so the commit gate alone does not close the RBAC hole there. What
+// closes it is pkg/cli ResolveLoginClass mapping a MATCHED user with an empty
+// class to the fail-closed class — asserted independently in
 // pkg/daemon TestApplyCLILoginClassLenientEmptyClassFailsClosed_6701.
+//
+// ROLE, measured rather than asserted: this test does NOT guard the packed
+// gate. Disabling validateLoginPackedStatementsAST entirely leaves it GREEN
+// (#6706 review r11) — correctly, because its subject is the LENIENT path,
+// where the gate only warns. It is a residual pin, and it should be read as
+// one.
+//
+// SCOPE, because the belt it names does not cover every packing. "A matched
+// user with an empty class" only exists at the INSTANCE level. At either
+// ANCESTOR level there is no matched user: the `login` line drops to a non-nil
+// but empty LoginConfig, and the `system` line drops to System.Login == nil,
+// which used to reach pkg/cli's legacy allow-everything mode. Those two are
+// covered by Config.System.LoginDroppedByPacking and pkg/daemon
+// TestApplyCLILoginClass6706DroppedLoginFailsClosed, not by this belt.
 func TestLoginPackedLenientStillCompilesEmpty_6662(t *testing.T) {
 	cfg, err := compileLogin6662Lenient(t, `system { login { user alice class ops; } }`)
 	if err != nil {
@@ -558,6 +587,11 @@ func TestLoginClassShadowingBuiltinLenientWarns_6701(t *testing.T) {
 // TestLoginCustomClassStillCompiles_6701 is the false-positive guard for the
 // shadow gate: a custom class whose name is NOT a built-in must keep compiling
 // exactly as #4304 S-2 intends.
+// ROLE: POSITIVE CONTROL — a custom class the gate must not claim. Measured, not assumed: disabling
+// validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
+// review r11), so it binds no gate behaviour and must not be counted as gate
+// coverage. It is kept because a gate with no over-reach control is one
+// widening away from rejecting valid configuration.
 func TestLoginCustomClassStillCompiles_6701(t *testing.T) {
 	cfg, err := compileLogin6662(t, `system {
 		login {
@@ -1150,6 +1184,11 @@ apply-groups "${node}";
 // ---------------------------------------------------------------------------
 
 // TestLoginPathPackedDoesNotOverReach_6706 pins the accept side.
+// ROLE: POSITIVE CONTROL — the boundary of what the gate may reject. Measured, not assumed: disabling
+// validateLoginPackedStatementsAST entirely leaves this test GREEN (#6706
+// review r11), so it binds no gate behaviour and must not be counted as gate
+// coverage. It is kept because a gate with no over-reach control is one
+// widening away from rejecting valid configuration.
 func TestLoginPathPackedDoesNotOverReach_6706(t *testing.T) {
 	t.Run("the nested spelling still compiles", func(t *testing.T) {
 		cfg, err := compileLogin6662(t, `system {
@@ -1201,14 +1240,68 @@ func TestLoginPathPackedDoesNotOverReach_6706(t *testing.T) {
 		}
 	})
 
-	t.Run("an empty path prefix declares nothing and is not reported", func(t *testing.T) {
-		// `system login;` and `system login user;` compile to nothing in BOTH
-		// spellings, so no statement was dropped. A gate that rejected them
-		// would be rejecting config it has no complaint about.
+	t.Run("an empty path prefix names no instance and is not rejected", func(t *testing.T) {
+		// A prefix that stops before an instance name declares no user and no
+		// class, so there is nothing dropped to report and a gate that rejected
+		// it would be rejecting config master accepts. That accept assertion is
+		// the over-reach control and it stands.
+		//
+		// The RATIONALE this subtest used to carry did not: it said the two
+		// spellings "compile to nothing in BOTH spellings, so no statement was
+		// dropped", which made it a positive control PROTECTING A FALSE AND
+		// PERMISSIVE INVARIANT (#6706 review r11). Measured, they diverge, and
+		// in the fail-OPEN direction — so the divergence is asserted here
+		// rather than denied.
 		for _, text := range []string{`system login;`, `system login user;`, `system { login user; }`} {
 			if _, err := compileLogin6662(t, text); err != nil {
-				t.Fatalf("%q declares nothing yet was rejected: %v", text, err)
+				t.Fatalf("%q names no instance yet was rejected: %v", text, err)
 			}
+		}
+
+		// The divergence itself, in both directions, so neither half can drift.
+		nested, err := compileLogin6662(t, `system { login; }`)
+		if err != nil {
+			t.Fatalf("`system { login; }` rejected: %v", err)
+		}
+		if nested.System.Login == nil {
+			t.Fatal("`system { login; }` compiled System.Login == nil; the whole point of " +
+				"this assertion is that the NESTED spelling compiles a present-but-empty " +
+				"LoginConfig, which is what makes every non-root caller resolve to " +
+				"`unauthorized`")
+		}
+		packed, err := compileLogin6662(t, `system login;`)
+		if err != nil {
+			t.Fatalf("`system login;` rejected: %v", err)
+		}
+		if packed.System.Login != nil {
+			t.Fatal("`system login;` compiled a non-nil System.Login; if the compiler " +
+				"was taught to descend a packed path, this subtest's premise — and the " +
+				"LoginDroppedByPacking posture that compensates for it — need revisiting")
+		}
+
+		// And the flag that makes the two agree at RUNTIME, which is where the
+		// divergence is actually closed (pkg/daemon applyCLILoginClass). Without
+		// it, `system login;` reaches pkg/cli's legacy unset-class mode: every
+		// command permitted, secrets in cleartext.
+		for _, text := range []string{`system login;`, `system login user;`} {
+			cfg, err := compileLogin6662(t, text)
+			if err != nil {
+				t.Fatalf("%q rejected: %v", text, err)
+			}
+			if !cfg.System.LoginDroppedByPacking {
+				t.Fatalf("%q left LoginDroppedByPacking false — the daemon would then take "+
+					"its legacy unset-class early return, which is the fail-open the "+
+					"nested spelling of the same text does not have", text)
+			}
+		}
+		// NEGATIVE CONTROL for the flag: a correctly nested stanza must not set
+		// it, or every deployment would be forced into the resolver.
+		ok, err := compileLogin6662(t, `system { login { user alice { class ops; } } }`)
+		if err != nil {
+			t.Fatalf("nested stanza rejected: %v", err)
+		}
+		if ok.System.LoginDroppedByPacking {
+			t.Fatal("a correctly nested `system login` set LoginDroppedByPacking")
 		}
 	})
 

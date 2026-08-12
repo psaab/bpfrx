@@ -67,8 +67,12 @@ see the next section for the narrow, and only, way that state is reached.
 
 ### Which class you get: identity and the default (#6701)
 
-The CLI's class comes from the **OS credential of the invoking process**,
-never from the environment. `pkg/osident.Current()` reads the **real uid**
+The **in-process console shell's** class comes from the **OS credential of the
+invoking process**, never from the environment. "The CLI" unqualified was wrong
+here (#6706 review r11): the remote `cli` client has no class at all — its OS
+credential only renders the prompt (`cmd/cli/main.go` `resolveUsername`), and
+the gRPC listener it speaks to has no per-principal authentication yet (#5278),
+so nothing on that path makes an authorization decision. See **Scope** below. `pkg/osident.Current()` reads the **real uid**
 (`os.Getuid`) and resolves it through the passwd database; the resolved name
 is matched against `system login user <name>`. `pkg/daemon`
 `applyCLILoginClass` performs the lookup once, at shell start, and logs the
@@ -93,9 +97,10 @@ The decision, in order:
 | uid 0 listed with **no** class | `super-user` — an omission is not an instruction; see below |
 | uid 0, no matching `system login user` | `super-user` (Junos root default) |
 | OS account absent from `system login` | `unauthorized` |
-| uid with no passwd entry (unidentifiable) | `unauthorized` |
-| uid shared by **several** passwd accounts (ambiguous) | `unauthorized` — see below |
-| passwd database unreadable | `unauthorized` |
+| **non-root** uid with no passwd entry (unidentifiable) | `unauthorized` |
+| **non-root** uid shared by several passwd accounts (ambiguous) | `unauthorized` — see below |
+| **non-root** uid, passwd database unreadable | `unauthorized` |
+| **uid 0** unidentifiable by any of those three | `super-user` — the root default; a class configured for an ALIAS is not applied |
 | no `system login` stanza at all | **unset** — legacy allow-everything |
 
 All three unidentifiable cases deny identically, but the journal line names
@@ -175,9 +180,12 @@ are unchanged; what changes is that a uid **without** one is now unidentified
 rather than whatever the caller put in `$USER`. A cgo-enabled developer build
 loses NSS name resolution — which affects the RBAC **class decision**, not just
 the displayed prompt: an NSS-only account (LDAP, SSSD) resolves to unidentified
-and is denied. That is a narrowing and never a promotion, so it is safe in the
-direction that matters, but it is functional rather than cosmetic. The shipped
-build is `CGO_ENABLED=0`, so production is unaffected.
+and is denied. That is a narrowing for every **non-root** uid. At uid 0 it is a
+**promotion**, for the same reason as the table row above: an unnamed uid 0
+takes the root default, so losing the name of an aliased root that carried an
+explicit restrictive class hands it `super-user`. uid 0 is essentially always a
+local passwd row, so this corrects the claim rather than describing a reachable
+production regression, and the shipped build is `CGO_ENABLED=0` either way.
 `TestNoOsUserInIdentityResolution_6701` keeps `os/user` out of the package.
 
 The same narrowing reaches a second route worth naming explicitly. Host-account
@@ -221,10 +229,36 @@ client's prompt identity was moved to the same OS credential so that when
 #5278 wires per-principal auth it finds the identity already coming from the
 kernel, but the client is not itself an authorization boundary today.
 
-The class is resolved **once, at shell start**, and is not re-evaluated
-mid-session. That matches Junos (your class is bound at login) and is not an
-escalation path: changing `system login` requires `configure`, which none of
-the restricted classes hold.
+The class **name** is resolved once, at shell start, and is not re-evaluated
+mid-session. That matches Junos (your class is bound at login). The class's
+**permissions** are not bound: `resolveClassPerms` (`pkg/cli/permissions.go`)
+reads `store.ActiveConfig()` on every check, so a custom class's permission set
+is whatever the **currently active** config says.
+
+An earlier revision called that "not an escalation path" on the grounds that
+"changing `system login` requires `configure`, which none of the restricted
+classes hold". The premise is false for **custom** classes, which may carry
+`configure` (see below), and the conclusion does not follow. Measured by driving
+the real store and checker: a session bound to a custom class holding
+`[view configure]` is denied `request system reboot` and gets
+`showConfigRedacted == true`; after that same session commits
+`set system login class <its-own-class> permissions all`, the identical checks
+return **allowed** and **false** — secrets in cleartext — with no re-login.
+
+The accurate statement of the boundary is the asymmetry:
+
+| Change | Takes effect mid-session? |
+|---|---|
+| widening the bound class's permissions | **yes**, immediately |
+| narrowing the bound class's permissions | **yes**, immediately |
+| moving the user to a different class | no — the class NAME is bound |
+| deleting the user from `system login` | no — same reason |
+
+The widening row is not a boundary being crossed that could not be crossed
+otherwise: a class holding `configure` can already author a `super-user` account
+and use it. What is worth stating plainly is that it happens **immediately and
+in the same session**, and that the narrowing row is what makes a mid-session
+revocation of a class's permissions actually effective.
 
 ### Custom login classes (accept-with-advisory, #4304 S-2)
 
@@ -396,15 +430,35 @@ At every level, zero configured users also means `reconcileAbsentLoginUsers`
 sees an empty desired set and **deprovisions every xpf-managed operator
 account** on the next apply.
 
-Rejecting `system login;` or `system login user;` would be rejecting config that
-declares nothing in either spelling, so those are accepted. Deactivated config
-(`inactive:`) is pruned before any gate runs and is likewise unaffected.
+`system login;` and `system login user;` name no user and no class, so there is
+no authored instance to report as dropped and they are **accepted** — rejecting
+them would be an outage of its own. They are **not** equivalent between the two
+spellings, though, and an earlier revision said they "declare nothing in either
+spelling", which is false (#6706 review r11): `system { login; }` compiles a
+non-nil empty `LoginConfig` and denies every non-root caller, while the packed
+`system login;` compiles `System.Login == nil` and reaches the legacy
+allow-everything mode. Deactivated config (`inactive:`) is pruned before any
+gate runs and is unaffected.
 
 The tolerant load / peer-sync path **warns** instead of rejecting (#1960
 no-brick), so a node that persisted such a config under an older binary still
-boots. On that path the stanza still compiles empty — what keeps it from being
-an RBAC hole is the resolver: a matched user with an empty class resolves to
-`unauthorized`, not to the legacy allow-everything mode.
+boots. An earlier revision claimed the resolver kept that from being an RBAC
+hole because "a matched user with an empty class resolves to `unauthorized`".
+That is true only of the `login`-line packing, where `System.Login` is non-nil
+but empty. At the `system` line the stanza compiles to **nil**, there is no
+matched user, and `applyCLILoginClass` used to take its
+`cfg.System.Login == nil` early return — leaving the shell with **no class at
+all**: every command permitted and secrets in cleartext, on a config that reads
+as restrictive.
+
+What closes it is `Config.System.LoginDroppedByPacking` (#6706 review r11): the
+compiler records that a `system login` path was authored packed — for every
+packed shape, including the two short prefixes above that the gate deliberately
+does not report — and `applyCLILoginClass` refuses the legacy unset-class mode
+when it is set, resolving through `ResolveLoginClass` instead. Non-root callers
+get `unauthorized`; uid 0 keeps the console lifeline. A config that never
+configured RBAC is untouched: the flag is false, the early return still fires,
+and the legacy contract is unchanged.
 
 `login-alarms` and `login-tip` are accepted by the grammar but have no compiler
 arm in **either** spelling — a pre-existing accept-but-ignore gap, not a packed

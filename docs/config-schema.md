@@ -1320,9 +1320,18 @@ Consequences worth knowing when adding a reader:
   `Keys[1] == "login"`, or a `login` node with any key beyond its own — and a
   finding at an ancestor SUBSUMES everything below it, since the stanza the
   operator wrote does not exist at all. A prefix that stops before an instance
-  NAME and has no children below (`system login;`, `system login user;`)
-  declares nothing in either spelling and is not reported. Both arms ride the
-  same `lenientLoginPackedStatements` flag as the instance arm and the same
+  NAME and has no children below (`system login;`, `system login user;`) names
+  no user and no class, so there is nothing dropped to report and it is not
+  rejected. It does NOT "declare nothing in either spelling" — an earlier
+  revision said that and it is false (#6706 review r11): the nested
+  `system { login; }` compiles a non-nil empty `LoginConfig` and denies every
+  non-root caller, while the packed `system login;` compiles nil and reaches the
+  legacy allow-everything mode. Reporting and runtime posture are separate
+  decisions; the divergence is closed by `Config.System.LoginDroppedByPacking`
+  (set by `loginPathPackedAnywhere` for EVERY packed shape, reported or not) and
+  `pkg/daemon` `applyCLILoginClass`, which refuses the legacy unset-class mode
+  when it is set. Both REPORTING arms ride the same
+  `lenientLoginPackedStatements` flag as the instance arm and the same
   `forEachClusterNodeView` both-node union.
 
   The sibling shadow gate (`validateLoginClassShadowsBuiltinAST`) skips a

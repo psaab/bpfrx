@@ -719,7 +719,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		// Set the RBAC login class for the in-process console shell (#6701).
 		// See applyCLILoginClass (cli_rbac.go) for why identity comes from the
-		// kernel and why the default is the restrictive class, not super-user.
+		// kernel, and for the THREE outcomes — an earlier revision of this
+		// comment said "the default is the restrictive class, not super-user",
+		// which is only two of them (#6706 review r11): a caller RBAC cannot
+		// place gets the restrictive class, uid 0 keeps the Junos super-user
+		// default, and a config with no `system login` at all leaves the class
+		// UNSET, which is pkg/cli's legacy allow-everything mode and the one
+		// outcome more permissive than super-user.
 		applyCLILoginClass(shell, d.store.ActiveConfig(), osident.Current())
 
 		// Run CLI in a goroutine so we can still handle signals

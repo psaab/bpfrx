@@ -48,17 +48,51 @@ type userClassSetter interface {
 //     configured restriction silently ignored is the very defect being removed.
 //
 // The `cfg.System.Login == nil` early return is deliberate and is NOT a
-// fail-open: with no `system login` stanza the class is left UNSET, which is
-// pkg/cli's documented legacy allow-everything mode for a deployment that never
-// configured RBAC (permissions.go checkPermission / showConfigRedacted both
-// short-circuit on the empty class). That contract is unchanged here; #6662 is
-// what stops a config that DOES configure RBAC from compiling into it.
+// fail-open FOR A CONFIG THAT NEVER CONFIGURED RBAC: the class is left UNSET,
+// which is pkg/cli's documented legacy allow-everything mode (permissions.go
+// checkPermission / showConfigRedacted both short-circuit on the empty class).
+// That contract is unchanged here.
+//
+// It IS a fail-open for the OTHER config that arrives as `Login == nil`, and
+// that is what LoginDroppedByPacking separates (#6706 review). A `system login`
+// path packed onto an ancestor line compiles the stanza away entirely:
+//
+//	system login user alice class ops;      -> System.Login == nil
+//
+// Strict commit REJECTS that (#6662), so an operator typing it never gets here.
+// The tolerant ingress does not: Store.Load at boot and Store.SyncApply from a
+// peer downgrade the finding to a warning and KEEP the config (#1960 no-brick),
+// so a node can boot — or a standby can inherit — a config that reads as
+// restrictive and lands in legacy allow-everything, with IKE PSKs, SNMP
+// communities and authentication-keys rendered in CLEARTEXT. Taking the early
+// return on that config is the RBAC hole, not the legacy contract.
+//
+// The same flag closes a second, quieter divergence. `system login;` written
+// packed compiles nil (permit everyone) while the NESTED `system { login; }`
+// compiles a non-nil empty LoginConfig (deny every non-root caller). The packed
+// gate stays silent on that prefix on purpose — rejecting it would reject
+// config master accepts — so the flag is what makes the two spellings agree
+// where it matters, at runtime, without inventing a commit rejection.
+//
+// Resolving a DROPPED login through ResolveLoginClass with the nil config is
+// exactly right rather than a special case: identity.go documents nil as
+// "nothing is configured about root", so every non-root caller takes
+// ClassUnidentified and uid 0 keeps the console lifeline — which is precisely
+// what the nested spelling of the same text produces.
 //
 // Every resolution is logged once, at shell startup — not in a loop — so an
 // operator locked out by their own config can see exactly why in the journal.
 func applyCLILoginClass(shell userClassSetter, cfg *config.Config, id osident.Identity) {
-	if shell == nil || cfg == nil || cfg.System.Login == nil {
+	if shell == nil || cfg == nil {
 		return
+	}
+	if cfg.System.Login == nil && !cfg.System.LoginDroppedByPacking {
+		return
+	}
+	if cfg.System.Login == nil {
+		slog.Warn("CLI RBAC: `system login` was authored packed onto an ancestor "+
+			"statement line and compiled away; refusing the legacy unset-class mode",
+			"identity", id.String(), "uid", id.UID)
 	}
 	class, reason := cli.ResolveLoginClass(cfg.System.Login, id)
 	if class == cli.ClassUnidentified {

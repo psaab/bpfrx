@@ -361,6 +361,13 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
 	cfg.Warnings = append(cfg.Warnings, loginPackedWarnings...)
 	cfg.Warnings = append(cfg.Warnings, loginShadowWarnings...)
+	// #6706: record that a `system login` path was authored packed, so the
+	// daemon can tell "RBAC never configured" from "RBAC configured and dropped"
+	// — both of which arrive here as System.Login == nil. Set from the BROADER
+	// detector, not from len(loginPackedWarnings): the reporting gate is silent
+	// for the short prefixes, and those are precisely the ones whose packed and
+	// nested spellings disagree about whether the CLI denies or permits.
+	cfg.System.LoginDroppedByPacking = loginPathPackedAnywhere(tree)
 	return cfg, nil
 }
 
@@ -546,6 +553,13 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
 	cfg.Warnings = append(cfg.Warnings, loginPackedWarnings...)
 	cfg.Warnings = append(cfg.Warnings, loginShadowWarnings...)
+	// #6706: record that a `system login` path was authored packed, so the
+	// daemon can tell "RBAC never configured" from "RBAC configured and dropped"
+	// — both of which arrive here as System.Login == nil. Set from the BROADER
+	// detector, not from len(loginPackedWarnings): the reporting gate is silent
+	// for the short prefixes, and those are precisely the ones whose packed and
+	// nested spellings disagree about whether the CLI denies or permits.
+	cfg.System.LoginDroppedByPacking = loginPathPackedAnywhere(tree)
 	return cfg, nil
 }
 
