@@ -7,8 +7,9 @@ import "unsafe"
 // BPF HASH maps. They EXCLUDE the sync-only Generation field — they mirror the
 // C `struct session_value` / `session_value_v6` (bpf/headers/xpf_conntrack.h)
 // and the Rust `BpfSessionValueV4` / `BpfSessionValueV6` (size-asserted at
-// 136 / 184 in userspace-dp/src/afxdp/bpf_map_tests.rs; 128 / 176 before the
-// #5460 flags widen from __u8 to __u16).
+// 144 / 192 in userspace-dp/src/afxdp/bpf_map_tests.rs; 136 / 184 before the
+// #4983 ingress-identity growth, 128 / 176 before the #5460 flags widen from
+// __u8 to __u16).
 //
 // This is the SINGLE source of truth for the map value_size: the production
 // registration (loader_userspace_shim.go) and every test fixture that creates a
@@ -24,8 +25,8 @@ var (
 //
 // The shared kernel-visible `sessions` / `sessions_v6` BPF HASH maps store the
 // C `struct session_value` / `struct session_value_v6` layout (bpf/headers/
-// xpf_conntrack.h), which the Rust helper mirrors as BpfSessionValueV4 (136
-// bytes) / BpfSessionValueV6 (184 bytes) — test-asserted at
+// xpf_conntrack.h), which the Rust helper mirrors as BpfSessionValueV4 (144
+// bytes) / BpfSessionValueV6 (192 bytes) — test-asserted at
 // userspace-dp/src/afxdp/bpf_map_tests.rs.
 //
 // SessionValue / SessionValueV6 (types.go) carry EXTRA sync-only trailing
@@ -38,7 +39,7 @@ var (
 //
 // Registering the map at sizeof(SessionValue) (the previous behaviour) made the
 // kernel value_size larger than every reader/writer's on-map struct. A
-// bpf_map_lookup_elem from the Rust side into its 136/184-byte buffer then has
+// bpf_map_lookup_elem from the Rust side into its 144/192-byte buffer then has
 // the kernel copy the larger value_size bytes into the smaller buffer — a
 // stack out-of-bounds write (latent because the trailing bytes are usually
 // zero). See issue #2360.
@@ -50,11 +51,12 @@ var (
 // Go-facing accessors convert at the boundary; Generation never touches the
 // BPF map (it is sourced from the Go session table / sync path).
 
-// bpfSessionValue mirrors C `struct session_value` exactly (136 bytes; 128
-// before the #5460 __u16 flags widen). It is SessionValue without the sync-only
-// trailing fields. Keep field-for-field in sync with both SessionValue
-// (types.go) and the C struct (xpf_conntrack.h); the parity test in
-// bpf_session_value_test.go fails if the size drifts from 136.
+// bpfSessionValue mirrors C `struct session_value` exactly (144 bytes; 136
+// before the #4983 ingress-identity growth, 128 before the #5460 __u16 flags
+// widen). It is SessionValue without the sync-only trailing fields. Keep
+// field-for-field in sync with both SessionValue (types.go) and the C struct
+// (xpf_conntrack.h); the parity test in bpf_session_value_test.go fails if the
+// size drifts from 144.
 //
 // EXPLICIT PADDING (#6082): every byte the C/Go compiler inserts as implicit
 // alignment padding is declared as a named `_ [N]byte` gap. This is NOT
@@ -63,11 +65,12 @@ var (
 // binary.Size(T) == unsafe.Sizeof(T) (it compares encoding/binary's field-sum
 // size against the native slice-element size). encoding/binary does not count
 // implicit padding, so with the three head gaps left implicit binary.Size was
-// 129 while unsafe.Sizeof is 136; sysenc then fell back to binary.Decode, which
-// consumes only 129 of every 136 kernel value bytes and fails the whole batch
+// 129 while unsafe.Sizeof was 136 (the struct's size at the time of #6082);
+// sysenc then fell back to binary.Decode, which consumed only 129 of every 136
+// kernel value bytes and failed the whole batch
 // with "unmarshaling []dataplane.bpfSessionValue doesn't consume all data",
 // breaking the 60s HA session-sync sweep. Making the padding explicit keeps
-// binary.Size == unsafe.Sizeof == 136 (blank `_` fields ARE counted by
+// binary.Size == unsafe.Sizeof (144 today, post-#4983) (blank `_` fields ARE counted by
 // encoding/binary yet do NOT count as "unexported" for the fast path), so the
 // zero-copy path stays engaged. The on-map ABI bytes are unchanged: these pads
 // occupy the exact offsets the compiler already padded, so unsafe.Sizeof and
@@ -130,8 +133,9 @@ type bpfSessionValue struct {
 	_             [2]byte // pad: C tail-pads the struct to its 8-byte alignment (#6082)
 }
 
-// bpfSessionValueV6 mirrors C `struct session_value_v6` exactly (184 bytes; 176
-// before the #5460 __u16 flags widen). It is SessionValueV6 without the
+// bpfSessionValueV6 mirrors C `struct session_value_v6` exactly (192 bytes; 184
+// before the #4983 ingress-identity growth, 176 before the #5460 __u16 flags
+// widen). It is SessionValueV6 without the
 // sync-only trailing fields. The head padding is declared explicitly for the
 // same cilium/ebpf marshal-size reason as bpfSessionValue (#6082) — see that
 // type's doc comment.

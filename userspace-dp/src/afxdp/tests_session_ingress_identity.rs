@@ -22,15 +22,28 @@
 // have to separate: the ifindex alone names the parent — shared by both units
 // — so only the {ifindex, VLAN} PAIR names the unit the flow arrived on.
 //
-// THREE production stamp sites reach this file, one test each, plus the
-// deliberate zero on the fourth:
-//   - the TRANSIT forward install (`poll_descriptor` ForwardFlow arm);
+// THREE production stamp sites reach this file, plus the deliberate zero on
+// the fourth:
+//   - the TRANSIT forward install (`poll_descriptor` ForwardFlow arm), covered
+//     TWICE — once on the chassis-cluster fixture and once on a STANDALONE
+//     (redundancy-group 0) one. The second arm is not redundancy: with only
+//     the cluster fixture, gating the stamp on `owner_rg_id > 0` leaves every
+//     test here green while silently dropping the identity on every
+//     non-clustered firewall;
 //   - the HOST-INBOUND install (`poll_descriptor` LocalMiss arm) — the flows
-//     addressed to the firewall itself (management, BGP, syslog), driven at
-//     the bottom of this file on a THIRD binding whose numbers are disjoint
-//     from the transit fixture's, so no single constant satisfies both;
+//     addressed to the firewall itself (management, BGP, syslog), driven on a
+//     THIRD binding whose numbers are disjoint from the transit fixture's, so
+//     no single constant satisfies both;
 //   - the MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`);
 //   - and the REVERSE companion, whose 0 is asserted as an over-reach guard.
+//
+// SCOPE, stated plainly because it is easy to over-read: these tests bind what
+// the poll body STAMPS onto the installed session. They do not, and cannot,
+// assert that a transit session's identity reaches the operator-visible BPF
+// conntrack map — the transit install does not publish there at all (it calls
+// `publish_live_session_entry`, which writes shim steering KEYS, plus
+// `publish_shared_session`). Only the LocalMiss and missing-neighbor-seed
+// installs call `publish_bpf_conntrack_entry`. That gap predates #4983.
 //
 // Sibling `#[path]` test module loaded from afxdp/mod.rs, mirroring the #4840
 // split; helpers come from afxdp/tests_support.rs.
@@ -99,7 +112,27 @@ fn ingress_identity_snapshot() -> crate::ConfigSnapshot {
 /// stopped admitting the flow would make every metadata assertion below
 /// vacuous instead of RED.
 fn run_ingress_identity_flow() -> SessionTable {
-    let forwarding = build_forwarding_state(&ingress_identity_snapshot());
+    run_ingress_identity_flow_on(&ingress_identity_snapshot(), &txn_ha_state())
+}
+
+/// `run_ingress_identity_flow` against a CALLER-SUPPLIED snapshot and HA
+/// runtime state, so the same driven flow can be replayed on a topology that
+/// differs in exactly one dimension (see the standalone arm at the bottom of
+/// this file). The fixture-liveness assertions travel with the driver, so every
+/// caller gets them.
+///
+/// The two travel TOGETHER on purpose: `enforce_ha_resolution_snapshot`
+/// (forwarding/ha.rs) turns a resolution whose `owner_rg_id <= 0` into
+/// `HAInactive` when `ha_state` is NON-empty — that combination means "a
+/// cluster node whose snapshot predates the RETH RG propagation fix", and it
+/// installs nothing. A genuine standalone box has neither, so a caller wanting
+/// the RG-0 case must clear both or it gets an empty session table and a
+/// vacuous test.
+fn run_ingress_identity_flow_on(
+    snapshot: &crate::ConfigSnapshot,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+) -> SessionTable {
+    let forwarding = build_forwarding_state(snapshot);
     assert_eq!(
         crate::afxdp::forwarding::resolve_ingress_logical_ifindex(
             &forwarding,
@@ -146,13 +179,12 @@ fn run_ingress_identity_flow() -> SessionTable {
 
     let mut binding = BindingWorker::new_for_mirror_test(0, 0, INGRESS_PARENT_IFINDEX, 0);
     binding.interface = Arc::<str>::from("ge-0-0-0");
-    let ha_state = txn_ha_state();
     let mut sessions = SessionTable::new();
     txn_run_descriptor(
         &mut binding,
         &mut sessions,
         &forwarding,
-        &ha_state,
+        ha_state,
         &frame,
         meta,
     );
@@ -544,5 +576,66 @@ fn poll_descriptor_local_miss_install_stamps_ingress_binding_4983() {
         metadata.ingress_zone, TEST_LAN_ZONE_ID,
         "the host-local session's ingress zone still resolves from the LOGICAL \
          unit (#3021)"
+    );
+}
+
+/// `ingress_identity_snapshot()` with every interface moved OUT of a redundancy
+/// group — the STANDALONE (non-chassis-cluster) topology, which is the majority
+/// deployment and the one where `owner_rg_for_resolution` returns 0. Driven
+/// with an EMPTY `ha_state`, the other half of "this box is not clustered";
+/// see `run_ingress_identity_flow_on` for why both are required.
+fn standalone_ingress_identity_snapshot() -> crate::ConfigSnapshot {
+    let mut snapshot = ingress_identity_snapshot();
+    for iface in snapshot.interfaces.iter_mut() {
+        iface.redundancy_group = 0;
+    }
+    snapshot
+}
+
+/// #4983 SCOPE guard for the transit stamp: the identity must be recorded
+/// UNCONDITIONALLY, not only for sessions that happen to be owned by a
+/// redundancy group.
+///
+/// `poll_descriptor_transit_install_stamps_ingress_binding_4983` cannot see
+/// this on its own. Its fixture is a chassis-cluster topology, so the installed
+/// session's `owner_rg_id` is non-zero, and a stamp rewritten as
+/// `if owner_rg_id > 0 { meta.ingress_ifindex } else { 0 }` leaves it — and
+/// every other test in this module — GREEN. That mutation is not hypothetical
+/// book-keeping: it is exactly the shape a future HA-scoping change would take,
+/// and it would silently drop the identity on every STANDALONE firewall while
+/// CI stayed green.
+///
+/// This arm differs from the sibling in exactly one property (redundancy group
+/// 0 instead of 1/2), and asserts that property as a precondition — without the
+/// `owner_rg_id == 0` assertion the fixture could quietly acquire an RG and
+/// become a duplicate of the sibling rather than a second data point.
+///
+/// RED on gating either half of the transit stamp on `owner_rg_id`.
+#[test]
+fn poll_descriptor_transit_install_stamps_ingress_binding_without_an_rg_4983() {
+    let sessions =
+        run_ingress_identity_flow_on(&standalone_ingress_identity_snapshot(), &BTreeMap::new());
+    let (forward, _reverse) = split_forward_reverse(&sessions);
+    assert_eq!(
+        forward.len(),
+        1,
+        "exactly one forward session for the driven standalone flow"
+    );
+    let metadata = &forward[0];
+    assert_eq!(
+        metadata.owner_rg_id, 0,
+        "PRECONDITION: this arm exists to cover the RG-less case, so the \
+         installed session must actually carry owner_rg_id 0; if the fixture \
+         acquires an RG this test silently becomes a copy of the sibling"
+    );
+    assert_eq!(
+        metadata.ingress_ifindex, INGRESS_PARENT_IFINDEX as u32,
+        "a standalone firewall's transit session must record its ingress \
+         binding too (RED on gating the stamp behind owner_rg_id > 0, which \
+         the chassis-cluster sibling cannot detect)"
+    );
+    assert_eq!(
+        metadata.ingress_vlan_id, INGRESS_VLAN_ID,
+        "the ingress 802.1Q VID is likewise unconditional"
     );
 }

@@ -54,8 +54,13 @@ pub(crate) struct SessionMetadata {
     ///     firewall-self-originated traffic read off the TUN device has no
     ///     ingress binding to record, so `0` is the correct answer there;
     ///   - the flow-cache descriptor seed, which is replay state for an
-    ///     already-installed session and is never published as one;
-    ///   - a session installed by a pre-#4983 helper.
+    ///     already-installed session and is never published as one.
+    /// There is deliberately NO "pre-#4983 helper" population: `sessions` /
+    /// `sessions_v6` are in the shim ABI pre-flight's checked set and a
+    /// `ValueSize` mismatch against the live pin is a hard refusal
+    /// (`validateUserspaceShimLivePins`), so a new daemon never reads an old
+    /// helper's 136/184-byte rows — the remediation is a full dataplane reload,
+    /// which starts from an empty map.
     /// The MISSING-NEIGHBOR seed is NOT among them — it is a published forward
     /// session that outlives the neighbor resolution, so it is stamped from the
     /// frame's `meta` like the two policy-admitted install sites.

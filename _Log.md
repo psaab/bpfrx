@@ -70272,3 +70272,66 @@ Every RED above is an assertion failure, not a build break.
 - **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
   docs/cos-validation-notes.md, _Log.md
+
+## 2026-08-12 — #4983 round 2: standalone stamp arm, ABI sizes, population list
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fold three review items onto the #4983 head. (1) A hostile
+  reviewer claimed the transit stamp could be gated on `owner_rg_id > 0` with
+  every test still green. Verified firsthand: mutating the transit literal to
+  `if owner_rg_id > 0 { meta.ingress_ifindex } else { 0 }` left all four
+  ingress-identity tests GREEN. The claim is correct and the escape is not
+  academic — it is the shape a future HA-scoping change would take, and it
+  would drop the identity on every STANDALONE (non-clustered) firewall, the
+  majority deployment, with CI green. (2) Ten ABI size figures in
+  `pkg/dataplane/bpf_session_value.go` still read 136/184; the PR had updated
+  `types.go` and the parity test but not the file that documents the ABI.
+  (3) `session/README.md` listed "a session installed by a pre-#4983 helper"
+  as a legitimate zero population while the ABI note directly below said a
+  rolling deploy cannot cross this.
+- **Fix**: new `poll_descriptor_transit_install_stamps_ingress_binding_without_an_rg_4983`
+  replays the SAME driven flow on a standalone topology — every interface in
+  redundancy group 0 AND an empty `ha_state`. Both are required and the driver
+  now says why: `enforce_ha_resolution_snapshot` (forwarding/ha.rs:84-96) turns
+  `owner_rg_id <= 0` into `HAInactive` when `ha_state` is NON-empty, because
+  that combination means a cluster node with a pre-RG-propagation snapshot. My
+  first attempt cleared only the redundancy groups and the arm went RED on the
+  LIVENESS assertion (0 sessions installed, not 2) — a fixture that never drove
+  the path, which would have "passed" a careless mutation check for the wrong
+  reason. The arm asserts `owner_rg_id == 0` as an explicit precondition so it
+  cannot silently reacquire an RG and degrade into a copy of its sibling.
+  `run_ingress_identity_flow_on(snapshot, ha_state)` carries the liveness
+  assertions so both arms inherit them.
+  Sizes corrected to 144/192 at all ten sites, with the prior values retained
+  as explicit history (136/184 pre-#4983, 128/176 pre-#5460) and the #6082
+  binary.Size measurement re-scoped to "the struct's size at the time".
+  Population 5 replaced in `session/README.md`, `pkg/dataplane/types.go` (both
+  copies) and `session/entry.rs` with the reason it cannot occur: `sessions` /
+  `sessions_v6` are in `userspaceABICheckedPinnedMaps` (which unions
+  `userspaceShimSharedMapSpecs`, loader_userspace_shim.go:655-665) and
+  `validateUserspaceShimLivePins` (:461-489) hard-refuses a `ValueSize`
+  mismatch against the live pin — verified at both sites, not taken on trust.
+- **Validation**: the standalone arm goes RED on the `owner_rg_id` gate with
+  the failure on the IDENTITY assertion, not the liveness one —
+  "a standalone firewall's transit session must record its ingress binding too
+  ... left: 0 right: 11" — while the chassis-cluster sibling, the LocalMiss
+  test, the seed test and the reverse over-reach guard all stay GREEN, which is
+  precisely the discrimination the arm exists to provide. Restored:
+  `cargo test --release` rc=0, 4259 passed in the main binary (+2 over the 4257
+  baseline). `go test ./pkg/cli/... ./pkg/dataplane/...` rc=0; `go build` and
+  `go vet ./pkg/dataplane/...` rc=0. `rustfmt --check` rc=0 on the two touched
+  Rust files only (no crate-wide fmt); `gofmt -l` does not list either touched
+  Go file.
+  One unrelated failure appeared mid-work and is recorded rather than dropped:
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  FAILED in one heavily-loaded run in which the wg-engine concurrency tests also
+  reported "running for over 60 seconds". It passes 5/5 in isolation and again
+  in the clean full-suite run above; `shared_cos_lease.rs` is untouched by this
+  branch. Attributed to machine contention, not the diff.
+- **Scope note recorded in the test module**: these tests bind what the poll
+  body STAMPS. They cannot assert the identity reaches the operator-visible
+  conntrack map for TRANSIT sessions, because the transit install never calls
+  `publish_bpf_conntrack_entry` — a pre-existing gap traced separately.
+- **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  pkg/dataplane/bpf_session_value.go, pkg/dataplane/types.go, _Log.md

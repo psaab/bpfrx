@@ -1018,8 +1018,17 @@ from `show`/`clear`), never "matches everything":
    `UserspaceDpMeta` is synthesized from the raw packet, so `0` here is the
    correct answer, not a gap;
 4. the flow-cache descriptor seed (`afxdp/flow_cache.rs`) — replay state for an
-   already-installed session, never published as a session itself;
-5. a session installed by a pre-#4983 helper, mid rolling upgrade.
+   already-installed session, never published as a session itself.
+
+There is deliberately no "installed by a pre-#4983 helper" population. It looks
+like one, but the ABI note below rules it out: `sessions` / `sessions_v6` are in
+the pre-flight's ABI-checked set (`userspaceABICheckedPinnedMaps`, which unions
+`userspaceShimSharedMapSpecs`), and `validateUserspaceShimLivePins` hard-refuses
+a `ValueSize` mismatch against the live pin — so a new daemon never comes up
+against an old helper's 136/184-byte map, and the remediation (full dataplane
+reload) starts from a freshly created, EMPTY map. A row written in the old
+format can therefore never be read by a new reader; the mixed state the
+population would describe is unreachable rather than merely rare.
 
 The MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`) is NOT in
 that list: it is a forward session installed when a flow's first packet races

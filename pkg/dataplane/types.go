@@ -85,7 +85,14 @@ type SessionValue struct {
 	//   - the helper's host-outbound GRE encapsulation path, where the traffic
 	//     is firewall-self-originated off the TUN device and has no ingress
 	//     binding to record;
-	//   - any session installed by a pre-#4983 helper (rolling upgrade).
+	//   - the helper's flow-cache descriptor seed, which is replay state for an
+	//     already-installed session and is never published as one.
+	// There is deliberately NO "pre-#4983 helper, rolling upgrade" population:
+	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
+	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
+	// ValueSize mismatch against the live pin, so a new daemon never reads an
+	// old helper's 136/184-byte rows — the remediation is a full dataplane
+	// reload, which starts from an empty map.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
@@ -261,7 +268,14 @@ type SessionValueV6 struct {
 	//   - the helper's host-outbound GRE encapsulation path, where the traffic
 	//     is firewall-self-originated off the TUN device and has no ingress
 	//     binding to record;
-	//   - any session installed by a pre-#4983 helper (rolling upgrade).
+	//   - the helper's flow-cache descriptor seed, which is replay state for an
+	//     already-installed session and is never published as one.
+	// There is deliberately NO "pre-#4983 helper, rolling upgrade" population:
+	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
+	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
+	// ValueSize mismatch against the live pin, so a new daemon never reads an
+	// old helper's 136/184-byte rows — the remediation is a full dataplane
+	// reload, which starts from an empty map.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
