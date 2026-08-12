@@ -367,17 +367,32 @@ strict SNAT gate to a warning and fails the translation CLOSED). SNAT silently
 degraded on the node that just took over. Unlike the #5631/#5878 unit-alias gate
 — a pure-AST union that can be computed pre-expansion — source-NAT
 representability needs the fully COMPILED per-node view (pools resolved), so the
-fix RE-COMPILES rather than unions: `ValidatePeerEffectiveSourceNATStrict(tree,
-localNodeID)` (`compiler_peer_effective_snat.go`), wired into
+fix RE-COMPILES rather than unions: `ValidatePeerEffectiveStrict(tree,
+localNodeID)` (`compiler_peer_effective.go`), wired into
 `configstore.compileTreeStrict` after the local compile + cross-checks, compiles
 the PEER node with `CompileConfigForNodeLenient(peerID)` — the exact transform
-the standby applies — and re-runs the strict SOURCE-NAT validators against that
+the standby applies — and re-runs the registered strict SUBJECTS against that
 peer-effective `*Config`. A peer-only source-NAT error is now rejected at the
 origin commit, naming the peer node and the offending pool, so BOTH
 node-effective source-NAT outputs are proven representable before promotion.
-Non-source-NAT gate errors on the peer view are out of scope (downgraded to
-warnings by the lenient compile); a peer view that will not compile at all is
-left to the peer's own load path (no false-reject of the origin commit).
+A peer view that will not compile at all is left to the peer's own load path (no
+false-reject of the origin commit).
+
+**Subjects, not one gate (#4785).** The peer view is a FULL compile, so it is
+built ONCE and every registered subject runs against it; a second standalone
+entry point would compile it again on every cluster commit. The registry
+(`peerEffectiveStrictSubjects`) currently holds the source-NAT subject
+(`validateSourceNATStrictView`, #5876) and the IPIP tunnel subject
+(`validateIpipTunnelStrictView`, #4785) — the latter because the strict IPIP
+rejection has the identical bypass: a peer-only `ip-*` interface commits green
+on the origin, the RAW group tree is what synchronises, and the standby
+lenient-loads a tunnel the dataplane drops in both directions. Each subject
+reuses the LOCAL strict validators verbatim, so the peer gate and the local
+commit path cannot drift, and each carries its own operator-facing framing
+naming the peer node. A strict gate whose verdict is node-INDEPENDENT gains
+nothing from registration. Gate errors on the peer view for concerns NOT
+registered here remain out of scope (downgraded to warnings by the lenient
+compile).
 Standalone (`nodeID < 0`) has no peer and is a no-op — zero behavior change off a
 cluster. Covered by `pkg/config/compiler_peer_effective_snat_5876_test.go`
 (peer-only reversed-range / per-node address / dangling-pool-reference vectors,

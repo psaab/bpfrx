@@ -1,3 +1,368 @@
+## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
+
+- **Timestamp**: 2026-08-12 (fold/6861-ipip-r6, PR #6861)
+- **Action**: fixed the one runtime blocker (the ID-collision arm of the live
+  set) and swept the PR's claim-accuracy cluster as a class, re-running every
+  mutation whose result a comment asserts.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/compiler_peer_effective.go,
+  pkg/config/compiler_peer_effective_snat_5876_test.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/configstore/store.go, pkg/configstore/ipip_no_brick_4785_test.go, _Log.md
+
+B1 — THE RUNTIME BLOCKER. `emittedTunnelDeviceNames` treated every EMITTED
+endpoint reference as live. Emission is necessary but not sufficient:
+`buildTunnelEndpointSnapshots` hashes each ref to a `StableTunnelEndpointID` and
+RETURNS — appending nothing — when the id is already taken, so the later-sorting
+collider never becomes an endpoint. Counting it live SUPPRESSED the anchor
+advisory for a device that genuinely carries nothing: the inverse of what this
+advisory exists to do, and the operator gets silence.
+
+Reproduced before the fix on the collision pair already frozen by
+tunnelid_test.go (`StableTunnelEndpointID("wg0") == ("wg34524.0") == 17799`) —
+complete GRE `wg0` plus interface-level IPIP `wg34524` overridden by a complete
+unit-0 GRE:
+
+    emitted ref "wg0"       id=17799
+    emitted ref "wg34524.0" id=17799     <- runtime DROPS this one
+    live = {wg0:true, wg34524:true}      <- wg34524 live only via the dropped ref
+    ipipAnchorOnlyWarnings n=0           <- SUPPRESSED
+    ValidateConfig ipip warnings n=0     <- nothing on `show system alarms`
+
+After: `live = {wg0}`, one anchor advisory, and it reaches ValidateConfig. The
+fix mirrors the builder exactly — same SSOT emitter, same sorted order, same
+first-wins rule. Strict commit rejects this config (the collision gate), so the
+shape is reachable only through the tolerant ingress, which is precisely where
+the advisory is claimed to matter.
+
+What the fix still does NOT model is stated in the code rather than implied:
+`addEndpoint` also skips a ref whose interface is absent from the runtime
+InterfaceSnapshot, and this function has no ifindex knowledge — it never did. A
+collision whose WINNER has no kernel device would leave the loser installed at
+runtime while this loop drops it. That conjunction is the one shape where the
+drop can produce a false "dead"; within the model the function has always used,
+the drop is the builder's rule.
+
+C3 — TWO MUTATION COMMENTS RE-RUN, and both were wrong.
+`TestSyncApplyIpipDoesNotRelaxTheStrictCommit_4785` claimed to stay GREEN under
+the tolerance revert. It does not: `lenientIpipTunnelMode -> false` turns it RED
+at its SyncApply PRECONDITION ("the ingress must tolerate the stanza"), not at
+its CommitCheck assertion. `TestPeerGateRewriteDoesNotMutateTheCandidate_4785`
+claimed to stay GREEN under the raw-tree revert. It does not: it turns RED at its
+own precondition ("this tree must be rejected for the peer's IPIP endpoint"),
+because the raw tree makes the peer view fail to compile, the gate takes its
+out-of-scope arm, and the commit is ACCEPTED — so the over-reach property it
+exists for is never reached. Its sibling
+`TestPeerGateSeesTheTreeThePeerCompiles_4785` is what actually binds that revert
+and fails on its real assertion. Both comments now record which LINE fails and
+why, because a RED at a precondition is not the same evidence as a RED at an
+assertion.
+
+C1 — A FALSE CITATION IN A REACHABILITY ARGUMENT, in two places. The swallow
+arm's reachability was justified by "validateTunnelEndpointIDCollisionAST is
+returned unconditionally, with no lenient flag". False: it takes a
+`lenient bool`, both call sites pass `opts.sanitizeFreeTextControlChars`, and
+`lenientCompileOpts()` sets that true — so on the lenient path it WARNS. The
+CONCLUSION is right (the arm is reachable) but via `validateDataplaneTypeStrict`,
+called with no lenient downgrade, which configstore store.go already cited
+correctly. Left as-is the failure mode was concrete: a maintainer follows the
+citation, finds the gate lenient, concludes the arm unreachable, and deletes the
+clone+rewrite that exists because it is not. Corrected in the code comment AND in
+the r5 `_Log.md` entry that repeated it.
+
+C2 — "ADJUDICATES" OVERSTATED A TWO-ITEM REGISTRY, at three sites
+(compiler_peer_effective.go, configstore store.go, and the residual
+"proving BOTH node-effective views are representable" in the SNAT test header).
+Now "the registered peer-effective concerns", which is what the registry holds.
+
+C4 — AN ENUMERATION CLAIMED EXHAUSTIVE THAT IS NOT. Two TunnelConfig records
+were said to share a Name only two ways; an interface authored `gr-0/0/0u1`
+shares a Name with `gr-0/0/0 unit 1`, a third and COMMITTABLE shape. It cannot
+become a discriminator here (the unit ref puts that name in live[], so the device
+clause decides first), so the conclusion is unchanged — the statement is narrowed
+to "the shapes that can put an interface-site candidate on a shared, non-live
+Name", which IS exhaustive, and the underlying gap is referenced as #6964.
+
+Also corrected: "on anything committable the two keyings are equivalent" was
+categorical and false — a node1-only `${node}` group commits on node0 and
+activates the shape on node1 through SyncApply — so the bound is now the LOCAL
+strict effective view; the rendering command is `show system alarms`, not plain
+`show system`; and the strictly-rejecting gate is named
+(compiler_validate_strict_ifname_collision.go).
+
+B2 — WHAT THE POINTER FIXTURE ESTABLISHES. It proves IDENTITY SEMANTICS versus
+NAME KEYING, not that a literal Go pointer is the only implementation — deleting
+the emitted clause outright still produces the warning, which its sibling catches
+deliberately. Recorded, along with the fact that the rendered remediation
+("removing the interface-level stanza would drop this anchor") is NOT accurate
+for this fixture, whose base device is SHARED with the WireGuard record. The
+production wording is written for the committable single-owner case; narrowing it
+for a tolerant-only shape is a separate change and is not made here.
+
+T1 — A SAFEGUARD THAT COULD GO VACUOUS. The final matcher accepted any anchor
+warning containing `interfaces "gr-0/0-0"`, with nothing requiring the candidate
+to have zero units — so fixture drift adding an incomplete IPIP unit would let
+name keying suppress the intended INTERFACE warning while the unit's warning
+matched the same substring and the count stayed green. Now a zero-unit
+precondition plus the exact `interfaces "gr-0/0-0" tunnel mode ipip:` prefix.
+
+T2 — THE TOLERANT-SURFACE CLAIM BOUND AT THE STORE, not the compiler. The
+existing binding is `CompileConfigLenient`; a future pre-compile admission gate
+at Store.Load/SyncApply would leave it green while the cited surface disappeared.
+New `TestSyncApplyRendersThePointerKeyedAnchor_4785` drives a real Store and
+asserts the whole chain: the strict commit REFUSES the fixture (the premise of
+the tolerant-only scope), SyncApply ACCEPTS it, and the anchor advisory is in
+what ValidateConfig re-renders. It is not decoration — it reds on the same
+pointer->name re-key that reds the compiler test.
+
+T3 — a precondition that cannot fail given its predecessor is kept and LABELLED
+as a forward assert, with why.
+
+Validation: five mutations, run firsthand, each with a scoped signature.
+(1) Collision drop removed -> only the new B1 test reds, on the live-set
+assertion. (2) Collision drop made over-broad (winner dropped too) -> the
+PRE-EXISTING false-alarm guards red, which is the over-reach control. (3)
+Tolerance revert and (4) raw-tree revert -> the two C3 results above. (5)
+pointer->name re-key -> BOTH the compiler test and the new store companion red.
+go build rc=0, go vet rc=0, `go test ./pkg/config/... ./pkg/configstore/...`
+rc=0, and the FULL `go test ./...` rc=0 with zero failures. No cluster tooling:
+control-plane only, no dataplane artifact.
+
+## 2026-08-05 — #4785: the new ACCEPTANCE was argued from the same incomplete fact as the old rejection
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: Round 3 accepted `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel
+  mode gre` on the stated ground that "nothing dead reaches the
+  dataplane". Verified firsthand that the ground is incomplete:
+  `collectAppliedTunnels` appends the interface-level record whenever
+  `Source != ""` (or mode is wireguard), independent of mode and of whether
+  any endpoint is emitted for it, and the routing manager creates a
+  mode-INDEPENDENT Tuntap anchor. So emission publishes only
+  `ip-0/0/0.1` gre while the box still gets an `ip-0-0-0` device with
+  nothing routed through it.
+  That is the same defect class as the round-2 rejection, one round later
+  and with the opposite verdict: a verdict argued from a fact that does not
+  cover the anchor. The sentence would have read as settled to the next
+  auditor.
+  Resolved by ADVISORY, not by widening the strict gate. The strict gate
+  keeps its single-SSOT property — "reject exactly the endpoints emission
+  would emit as IPIP" — because keying it on `collectAppliedTunnels` would
+  reintroduce the second hand-rolled model that B2 was about. The new
+  `ipipAnchorOnlyWarnings` reports an interface-level ipip record that
+  creates an anchor but has no emitted endpoint. It detects that by POINTER
+  identity against the emitter's own output rather than re-deriving which
+  records emit, so it adds no competing model; it screens on
+  `Source != ""` to match the anchor-creation condition exactly, so a
+  record that creates nothing is not reported.
+  Non-blocking on purpose: the anchor carries no traffic but breaks
+  nothing, the per-unit tunnel is the likely intent, and rejecting would
+  re-import the over-rejection this gate has already swung through twice.
+  The acceptance test now asserts BOTH halves — the commit succeeds AND
+  the alarm names the orphan device — and its comment records why the
+  original justification was incomplete rather than quietly replacing it.
+- **Validation**: three targeted mutations, snapshot-and-write-back with
+  byte-for-byte verify, each required to compile. All RED: dropping the
+  advisory reds the acceptance test; dropping the `Source` screen reds the
+  no-anchor negative control; dropping the emitted-pointer check reds the
+  already-reported control plus two others. Full
+  `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`,
+  `pkg/config/ipip_tunnel_reject_4785_test.go`, `_Log.md`
+
+## 2026-08-05 — #4785 half 1 round 3: gate on EMITTED endpoints; the round-2 shadowing fix was an under-rejection
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: The round-2 fix turned an over-rejection into an
+  UNDER-rejection — the sharp edge I had named and still walked into.
+  Reproduced against the round-2 head e3754bc4c BEFORE writing the fixture,
+  so it is not green on both sides: `ip-0/0/0 tunnel src/dst` +
+  `unit 0 tunnel mode gre` + a bare `unit 2` returned nil from
+  `CompileConfig`, produced ZERO `#4785` advisories (alarm surface silent),
+  and the emitter published BOTH `ip-0/0/0.0` gre and `ip-0/0/0.2` **ipip**.
+  The same input was correctly REJECTED one commit earlier.
+  Mechanism: my walk skipped units without their own tunnel stanza
+  (`unit.Tunnel == nil { continue }`), while the emitter hands those exact
+  units the interface-level tunnel — and says so in a comment directly
+  above the code, in the file I had cited in my own report. Unit 0's GRE
+  record shadowed the interface record on the shared device key, and the
+  inheriting sibling was never visited.
+  Root cause was deeper than the skip: the gate hand-rolled a model of
+  "which tunnels are real", naming `routing.tunnelManager` as the
+  authority. Under the userspace dataplane that is wrong — the anchor is
+  mode-INDEPENDENT; what decides `gre_decap_index` membership versus the
+  `TunnelKind::Unknown` drop arm is the EMITTED endpoint's mode. Deleted
+  the model and routed the gate through `EmitTunnelEndpointNames`, the
+  existing SSOT that `buildTunnelEndpointSnapshots` consumes and that the
+  sibling gate `validateTunnelEndpointIDCollisionAST` is already built on.
+  That single change closes B1 (inheritance handled by the emitter), B2
+  (right authority, same drift guarantee) and N4 (the emitter's
+  source/destination screen means a reported endpoint really is emitted, so
+  the indicative wording is now accurate and `tunnel destination` with no
+  source is no longer reported).
+  It also CORRECTS a rejection: `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel
+  mode gre` emits only `ip-0/0/0.1` gre, so nothing dead reaches the
+  dataplane and it now commits. Recorded as its own test — the previous
+  round rejected it, defensibly on a kernel-anchor argument but not for the
+  reason its error text gave.
+  Also corrected: my round-2 log entry claimed a WireGuard positive control
+  was added. It was added but could NOT fire — wrong syntax
+  (`tunnel listen-port` rather than `tunnel wireguard listen-port`), so
+  both fixtures were rejected earlier by the WireGuard validator, and the
+  assertion was only "the error is not mine", which that satisfies.
+  Mutating the gate to also flag `wireguard` left it PASSING. Rewritten to
+  assert `err == nil` on a fixture complete enough to compile. The entry
+  has been amended in place rather than left standing.
+  N1 (tolerant path emitted the ~500-char paragraph twice — `runTailGates`
+  folds `ValidateConfig` into `cfg.Warnings` before the gate runs, and the
+  lenient arm appended again), N3 (the 44-line doc block ran into the type
+  with no blank line, so godoc attached it to `ipipTunnelSite` and the
+  function had none — file rewritten with the doc on the function), N5
+  (advisory lists every dead endpoint, with an ordered-identity test rather
+  than a count), and N6 (the rejection test asserted only `#4785` and
+  `mode gre`; it now asserts the cause, the both-directions claim and WHICH
+  emitted endpoint is dead).
+- **Validation**: ten-mutation matrix retargeted to the emitter-based gate,
+  snapshot-and-write-back restore with byte-for-byte verify, every mutant
+  required to compile. The skip-inherited-unit mutant was first written
+  with `strings.HasSuffix` in a file that does not import `strings` — a
+  BUILD-BREAK is a false red, so it was re-expressed with slicing before
+  being scored. Full `go test ./pkg/... ./cmd/...` passes.
+  NOT run: cluster/smoke — config-layer change; scheduled centrally.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`
+  (rewritten), `pkg/config/ipip_tunnel_reject_4785_test.go`, `_Log.md`
+
+## 2026-08-05 — #4785 half 1 round 2: resolve the EFFECTIVE tunnel mode, and put the advisory back on the alarm path
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: Two MAJORs from the gate, both real.
+  **The gate over-rejected an effective-GRE device.** Round 1 keyed on the
+  compiled mode rather than the interface name so an `ip-*` interface set
+  to GRE still commits (proved as M7), but it walked the compiled records
+  individually. An interface-level `tunnel` stanza and a `unit 0 tunnel`
+  stanza compile to TWO records carrying the SAME Linux device name — only
+  unit N>0 gets the "uN" suffix — and `routing.tunnelManager.Apply` keys
+  its desired set by `tc.Name` while `tunnelConfigsFor` appends the
+  interface record BEFORE the units, so for a shared name the UNIT record
+  is the one realized. Verified by probe, not inference:
+  `ip-0/0/0 tunnel source/destination` + `unit 0 tunnel mode gre`
+  compiles to iface=ipip, unit0=gre, both on device `ip-0-0-0` — a working
+  GRE tunnel that round 1 rejected. Replaced the per-record walk with
+  `effectiveIpipTunnelSites`, which resolves winner-per-device the way the
+  applier does and reports only winners. Unit N>0 is a different device and
+  shadows nothing, so an interface-level ipip stanza beside it is still
+  reported — pinned as its own counter-test so the over-rejection fix
+  cannot silently become an under-rejection.
+  Hardening found while fixing that: keying the winner map on the device
+  name collapses every record whose Name is empty onto one entry, which
+  UNDER-reports (the fail-open direction). Unnamed records now get unique
+  keys. The determinism test's fixture had exactly that shape — hand-built
+  `TunnelConfig`s with no Name — so it was made realistic rather than
+  worked around.
+  **The alarm surface regressed.** Round 1 removed the #4788 advisory from
+  `ValidateConfig`, reasoning the gate's lenient-path warning replaced it.
+  It does not: `cli_show_system.go`, `server_show_system.go`,
+  `server_show_security_text.go` and `cli_show_security_log.go` all
+  RECOMPUTE `ValidateConfig(cfg)` from the ACTIVE config rather than
+  reading `cfg.Warnings`. So a box already carrying a dead tunnel got a
+  one-time apply log and a standing "No alarms currently active" — the
+  strict gate never reaches that box, because its config was committed by
+  an older build and loads leniently. Advisory restored and re-registered,
+  now sharing `effectiveIpipTunnelSites` + `ipipUnimplementedText` with the
+  strict gate so the two cannot drift.
+  Also: added a WireGuard positive control (later found NOT to fire — it
+  used the wrong `tunnel listen-port` syntax and asserted only that the
+  error was somebody else's; corrected in the next round to assert the
+  config COMMITS); split the malformed
+  `docs/feature-coverage.md` row — the IPIP text had been appended AFTER
+  the row's closing pipe, making a third cell against a two-column header —
+  into its own two-cell row; and narrowed the rollback wording in this log
+  and in the PR body to what was actually verified (that path applies the
+  stashed compiled config directly, so no compile runs on it) rather than
+  the wider "no recompile at rollback".
+- **Validation**: ten-mutation matrix, snapshot-and-write-back restore with
+  byte-for-byte verify, every mutant required to compile. All ten RED,
+  including the two new ones: dropping the device-name shadowing (which
+  restores the over-rejection) and dropping the ValidateConfig advisory
+  registration (which restores the silent alarm surface). Full
+  `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/ipip_tunnel_reject_4785_test.go`,
+  `docs/feature-coverage.md`, `_Log.md`
+
+## 2026-08-05 — #4785 half 1: reject `tunnel mode ipip` at commit instead of accepting into a blackhole
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject)
+- **Action**: IPIP (ip-in-ip, proto-4/41) parses, compiles, creates a Tuntap
+  anchor and reaches the dataplane snapshot, but the userspace helper — the
+  only supported runtime — has no IPIP primitive in EITHER direction.
+  Verified firsthand rather than from the issue text:
+  `forwarding_build/tunnels.rs` enters an endpoint into `gre_decap_index`
+  only when `tunnel_mode_kind(&endpoint.mode) == TunnelKind::Gre`, and
+  `tunnel_mode_kind` maps only `gre`/`ip6gre`/`wireguard` — `ipip` falls to
+  `TunnelKind::Unknown`, which that enum's own doc names as the egress
+  dispatcher's fail-closed drop arm. So inbound has nothing to decap
+  against and outbound drops: the tunnel is created, comes UP, and passes
+  no traffic at all.
+  Until now that committed green with only the #4788 advisory. Replaced the
+  advisory with a hard gate, `validateIpipTunnelUnimplementedStrict`, wired
+  in `compiler_tailgates.go` beside `validateTunnelOuterFamilyStrict` whose
+  shape it mirrors: strict on the operator commit / commit-check path,
+  downgraded to a warning on the tolerant load / peer-sync paths via the
+  new `lenientIpipTunnelMode` opt. Removed `validateIpipTunnelDeadWarning`
+  and its `ValidateConfig` registration — the advisory text now survives as
+  the gate's lenient-path warning, which is the only path that still has to
+  tolerate it.
+  Two things worth recording. First, `mode ipip` is not only written
+  explicitly: `compileInterfaces` INFERS it from an `ip-*` interface name
+  (and `gre` from `gr-*`), so an operator who never typed "ipip" can hit
+  this — the error message names the inference. Second, the gate keys on
+  the compiled MODE, not the interface name, so `ip-0/0/0 tunnel mode gre`
+  still commits; a name-keyed gate would take working GRE tunnels down and
+  is one of the mutations below.
+  Checked the no-brick surface rather than assuming it: `Store.Load` and
+  `Store.SyncApply` go through `compileTreeLenient` ->
+  `CompileConfigLenient` -> `lenientCompileOpts()`, so the new opt makes
+  both warn. For commit-confirmed, what was VERIFIED is narrower than the
+  first wording claimed: `PromoteRollback` returns `s.confirmPrevCfg`,
+  which `CommitConfirmed` sets to `s.compiled` — the already-compiled
+  active config, stashed by reference — and the daemon applies that value
+  directly (`applyConfigLocked(prevCfg)`), so no compile runs on THAT
+  path and the new gate is not reached by it. That is a statement about
+  this rollback path only; it is not a claim that nothing anywhere
+  recompiles a rollback target.
+  Three pre-existing tests (TestIPIPTunnelSetSyntax,
+  TestIPIPTunnelExplicitMode, TestIPIPTunnelWithRoutingInstance) compiled
+  IPIP through `CompileConfig` and expected success. Their subject is field
+  parsing and mode inference, not commit acceptance, so they now compile
+  through `CompileConfigLenient` — the path that still accepts this config
+  — each with a note saying why. Not a dismissal: they are now also the
+  tolerant-path canary, and two mutations below are caught by them. A first
+  pass over-applied that switch to three passing GRE tests
+  (TestGRETunnelRoutingInstanceDestination, TestPointToPointFlag,
+  TestInterfaceLevelTunnelLinuxName); those were reverted to strict
+  `CompileConfig`, which is the stronger assertion and the one they want.
+- **Validation**: eight-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile so no RED is
+  a build break. All eight RED: unwire the gate; wire it but swallow the
+  error; hardcode lenient (the pre-#4785 behaviour dressed as a gate);
+  hardcode strict (loses the #1960 downgrade — caught by the three
+  retargeted tests plus the new tolerant-path test); never set the tolerant
+  opt (the same brick by another route); drop the unit-level walk; key on
+  the `ip-` name prefix instead of the mode (over-rejects working GRE); and
+  walk the map unsorted (non-deterministic first error, so two HA nodes
+  disagree on one config). The name-keyed mutant first came back
+  BUILD-BREAK because the gate file has no `strings` import — that is a
+  false red by the project's own rule, so it was rewritten with slicing and
+  re-run to a real RED. Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go` (new),
+  `pkg/config/ipip_tunnel_reject_4785_test.go` (new),
+  `pkg/config/ipip_tunnel_dead_warn_4788_test.go` (deleted),
+  `pkg/config/compiler_tailgates.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/compiler_validate_warn_routing.go`,
+  `pkg/config/parser_routing_test.go`, `docs/feature-gaps.md`,
+  `docs/feature-coverage.md`, `_Log.md`
 ## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
 
 - **Timestamp**: 2026-08-06 (fix/4555-ext-hdr-parity, PR #6655)
@@ -71284,6 +71649,63 @@ break — `go vet` confirmed passing under every revert.
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
 
+## 2026-08-06 — #6861 fold r1 (gate F1 BLOCKING / F2 REGRESSION / F3)
+
+- **Timestamp**: 2026-08-06 05:10 PDT
+- **Action**: F1 — the hard IPIP gate was bypassable on the peer. The strict
+  commit gate compiles only the submitting node (CompileConfigForNode), the RAW
+  group tree is what config-sync sends, and the standby ingests it leniently, so
+  a `${node}` config whose IPIP endpoint resolves only in `groups node1`
+  committed GREEN on node0 and installed the dead tunnel on node1. Generalised
+  the #5876 peer-effective mechanism into a SUBJECT REGISTRY that compiles the
+  peer view ONCE and runs every registered strict concern against it, and
+  registered the IPIP gate as the second subject. F2 — restored unit-level
+  coverage in ipipAnchorOnlyWarnings: collectAppliedTunnels applies every
+  non-nil unit tunnel with NO completeness screen, so a unit-level stanza still
+  builds a kernel anchor; the deleted #4788 validator warned on it and the
+  replacement did not, leaving that shape with neither rejection nor alarm.
+  F3 — the advisory's cause is now derived, so an incomplete endpoint is not
+  diagnosed as "every unit overrides it" when there are no units.
+- **File(s)**: pkg/config/compiler_peer_effective.go (new),
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_peer_effective_4785_test.go (new),
+  pkg/config/ipip_anchor_only_4785_test.go (new),
+  pkg/configstore/store.go,
+  pkg/configstore/peer_effective_ipip_4785_test.go (new),
+  pkg/config/compiler_peer_effective_snat_5876_test.go,
+  pkg/config/compiler_nat_pool_overlap_5144_test.go,
+  pkg/config/compiler_zone_scoped_snat_pool_5875_test.go,
+  pkg/configstore/peer_effective_snat_5876_test.go, docs/config-schema.md,
+  docs/feature-gaps.md, docs/feature-coverage.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./... rc=0; go test ./pkg/config
+  ./pkg/configstore ./pkg/daemon -count=1 rc=0; `-run 4785` across pkg/config +
+  pkg/configstore = 40 `=== RUN` / 40 PASS, up from 25 at the PR head (measured
+  by moving the three new test files aside and re-counting); gofmt clean on
+  every touched file.
+- **NOTE — generalised rather than bolted on, deliberately.** A second
+  standalone peer entry point would run CompileConfigForNodeLenient — a FULL
+  compile — twice on every cluster commit, and the next concern three times.
+  ValidatePeerEffectiveSourceNATStrict is therefore renamed to
+  ValidatePeerEffectiveStrict; the 11 test call sites are a pure rename with no
+  assertion or fixture changes, and the source-NAT wrapper wording is
+  byte-identical so #5876's message assertions are untouched.
+- **NOTE — mutation matrix, 9 cells, every one an ASSERTION failure with
+  `go vet ./pkg/config ./pkg/configstore` rc=0.** Tunnel subject dropped from
+  the registry; store call dropped from compileTreeStrict; unit walk dropped;
+  cause split reverted to the single hard-coded string; unit walk stops keying
+  on mode; unit walk stops skipping EMITTED endpoints; peer id hard-coded to 1;
+  peer-node framing dropped from the wrapper; peerNodeID accepting ids with no
+  2-node peer. The over-reach guards — peer-only GRE still commits (both at the
+  validator and at compileTreeStrict), standalone is a no-op, the genuine
+  every-unit-overrides shape keeps its original diagnosis and remediation, a GRE
+  unit record raises nothing, an EMITTED unit endpoint is not double-reported —
+  stayed GREEN under the F1/F2/F3 reverts. The PR's own pre-existing negative
+  control (TestIpipAnchorAlarmDoesNotOverreach_4785) also fired under the
+  ignore-mode mutation. Each cell was grepped back out before its result was
+  believed and restored with a filecmp check against a pristine copy. An early
+  attempt at the framing mutation was a BUILD break (unused "fmt"); it was
+  rewritten to keep the import live so the cell is a real assertion.
 ## 2026-08-06 — #2387: state what the VRF-overlap tests actually enforce
 
 - **Timestamp**: 2026-08-06
@@ -71631,7 +72053,147 @@ paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
+## 2026-08-06 — #6861 fold r2 (gate F1 / F2 NIT)
+
+- **Timestamp**: 2026-08-06 06:40 PDT
+- **Action**: F1 — bind the #1960 no-brick claim at the INGRESS. The tolerant
+  test drove CompileConfigLenient directly, but no-brick is a property of
+  Store.SyncApply / Store.Load, and nothing in the suite drove an IPIP config
+  through either; route SyncApply through the strict compile, or register the
+  gate outside lenientCompileOpts(), and every compiler-level test stays green
+  while a booting node is bricked and HA config sync alarm-loops. New
+  store-level test asserts SyncApply ACCEPTS the config, PRESERVES the stanza,
+  and warns EXACTLY once — standalone plus both cluster ingress views of the
+  peer-only `${node}` tree. F2 — documented the operator cost of a
+  whole-candidate strict gate in docs/feature-gaps.md.
+- **File(s)**: pkg/configstore/ipip_no_brick_4785_test.go (new),
+  docs/feature-gaps.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./pkg/config ./pkg/configstore
+  rc=0; go test ./pkg/config ./pkg/configstore ./pkg/daemon -count=1 rc=0;
+  `-run 'Ipip|PeerEffective'` across config+configstore = 47 `=== RUN` / 47
+  PASS / 0 FAIL, up from 42 at fe3ce8708; gofmt clean.
+- **NOTE — both prescribed mutations RED as ASSERTIONS, `go vet ./pkg/config
+  ./pkg/configstore` rc=0 on each.** (a) SyncApply routed through
+  `s.compileTree` (strict): all three subtests fail at "SyncApply REJECTED a
+  config carrying a dead IPIP tunnel". (b) `lenientIpipTunnelMode` dropped from
+  `lenientCompileOpts()`: standalone and the node1 view fail the same way while
+  the node0 view correctly stays PASS — node0's effective view carries no
+  endpoint, so there is nothing for a strict gate to reject there, and the
+  per-view subtest structure is what makes that discrimination visible.
+- **NOTE — (b) also reddened the r1 peer-gate test, which is a real coupling.**
+  `ValidatePeerEffectiveStrict` builds the peer view with
+  `CompileConfigForNodeLenient`; with the lenient switch gone that compile
+  hard-fails, so the gate takes its "peer view will not compile at all →
+  out of scope" arm and returns nil, and
+  TestCompileTreeStrict_RejectsPeerOnlyIpip_4785 goes RED. The lenient switch is
+  therefore load-bearing for the STRICT peer gate as well as for boot safety —
+  worth knowing before anyone tightens it.
+- **NOT CHANGED**: registry order (first-failure-wins) and its comment, per the
+  reviewer's judgement that it matches compileTreeStrict's existing
+  return-on-first-error contract.
+
 - **Timestamp**: 2026-08-06
+- **Action**: Fold the F1 gate finding on PR #6861. `ipipAnchorOnlyText`
+  (compiler_validate_strict_tunnel_ipip.go) has two call sites — an
+  interface-level one and a unit-level one — that SHARED the
+  complete-but-unemitted fallback text. For a unit that text is wrong three
+  ways: it names a unit and then explains the interface-level stanza, it
+  inverts the direction of the suppression (the interface-level stanza
+  suppressed the unit, not the units overriding the interface), and its
+  remediation points at the wrong stanza.
+  REACHABILITY, verified against the emitter rather than taken from the
+  finding: `EmitTunnelEndpointNames` short-circuits an interface-level
+  `tunnel mode wireguard` stanza to ONE endpoint keyed by the lowest unit
+  (#1910, tunnelemit.go) and never visits the per-unit records, while
+  `collectAppliedTunnels` (pkg/daemon/daemon_run_routehelpers.go) applies
+  EVERY non-nil `unit.Tunnel` with no completeness or mode screen. So a unit
+  overriding to `mode ipip` with BOTH endpoints set is complete, unemitted,
+  and still gets a real kernel anchor. Enumerated the other two shapes to
+  confirm this is the whole branch: with `iface.Tunnel == nil` every non-nil
+  unit tunnel goes through `add` and a complete one IS emitted; with a
+  non-WireGuard interface-level stanza the emitter walks the units and emits
+  each unit's own TunnelConfig (#5635). Neither reaches the fallback. That is
+  why the new text names WireGuard specifically instead of "a different mode".
+  Added an explicit `isUnit bool` parameter rather than sniffing the `where`
+  string — the prefix is a display detail and must not become a control
+  input. Kept the incomplete-endpoint check FIRST: that cause is shared, and
+  an endpoint missing a half stays unemitted even once the slot cause is gone.
+  Corrected two comments that were themselves the reason this went unnoticed:
+  `ipipAnchorOnlyText`'s claim that an incomplete endpoint is "the ONLY way a
+  unit record reaches here" (false — it is the finding), and
+  `ipipMissingEndpointHalves`'s description of the `""` fallback as "a neutral
+  cause" (it is not neutral; it is the interface-branch cause, and reading it
+  as neutral is what let a unit be reported with it).
+  RENDERED TEXT, unit branch. BEFORE: `interfaces "wg0" unit 3 tunnel mode
+  ipip: no tunnel endpoint is emitted for the interface-level stanza (every
+  unit overrides it), ... Remove the interface-level `tunnel` stanza if the
+  per-unit tunnels are the intent.` AFTER: `... the interface-level `tunnel
+  mode wireguard` stanza takes the interface's single tunnel endpoint, so this
+  unit's own endpoint is never emitted even though it is fully configured, ...
+  Remove this unit's `tunnel` stanza to drop the dead anchor, or remove the
+  interface-level `tunnel` stanza if the per-unit tunnels are the intent.`
+  The interface branch renders BYTE-IDENTICAL before and after.
+  TEST. `TestIpipUnitUnderWireguardNamesTheSlotCause_6861` builds the shape the
+  finding describes and drives `ValidateConfig`, the real alarm entry point, so
+  the wiring is bound and not just the renderer. It asserts a precondition
+  first — exactly one endpoint emitted, it is the interface-level WireGuard
+  object keyed by the lowest unit, and unit 3 still carries a COMPLETE ipip
+  override — so a fixture that drifts into the missing-halves arm fails loudly
+  instead of measuring the wrong branch. Fixture producibility was checked the
+  hard way: a WireGuard stanza needs `tunnel wireguard listen-port` (a bare
+  `tunnel listen-port` is not the syntax and parses into a leaf nothing reads —
+  the trap an earlier round already hit), a decodable 64-hex private key, and
+  at least one peer.
+  REVERT PROBE. Deleted ONLY the `isUnit` branch body, leaving the signature
+  and both call sites intact, inside a throwaway `git archive` extract; the
+  worktree tree hash was verified identical before and after. `go vet` under
+  the revert exits 0, so an unused PARAMETER (legal in Go) cannot masquerade as
+  a build break. The new test then fails on THREE assertions, not a compile
+  error: "a UNIT record was given the INTERFACE record's cause ... the
+  direction is inverted", "the advisory does not name the interface-level
+  WireGuard stanza that took the interface's single endpoint slot", and "the
+  advisory does not offer the remediation that actually drops this dead
+  anchor". Exit 1.
+  OVER-REACH CONTROLS, run under the SAME revert, whole `4785|6861` set: 1
+  FAIL / 7 PASS. `TestIpipOverriddenAnchorKeepsTheOverrideCause_4785` — the
+  interface branch, where the shared default text is CORRECT, and the reason
+  this defect survived — stays GREEN, so the interface wording did not move.
+  The new `TestIpipIncompleteUnitStillNamesTheMissingHalf_6861` also stays
+  GREEN under the revert: it pins the PRECEDENCE, asserting that a unit that is
+  both incomplete and slot-suppressed still reports the missing half.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/config` rc=0;
+  `go test ./pkg/config ./pkg/configstore ./pkg/daemon -count=1` rc=0;
+  `gofmt -l` clean on both touched files.
+  No doc change: the advisory text appears in no operator or module doc
+  (grep over docs/ outside the review/issue archives finds nothing), the alarm
+  is discovered through `show system alarms` rather than documented verbatim,
+  and no behaviour outside the rendered string changed — the set of records
+  that raise the advisory is identical.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+- **Timestamp**: 2026-08-06
+- **Action**: #5480 research plan — `docs/peer-boot-incarnation-plan.md`. Plan
+  only, no implementation, no wire change. Establishes that the incarnation
+  granularity is not a free choice: `initGenState` seeds `configGenCounter` from
+  a monotonic base precisely so generations survive "restarts within a boot", so
+  the incarnation must change exactly when CLOCK_MONOTONIC restarts — exactly on
+  OS boot — which makes `/proc/sys/kernel/random/boot_id` the one correct source
+  and rules out a process seed, a persisted counter, and the existing
+  `bulkSendNext` transfer epoch. Places the field in the `syncMsgBulkStart`
+  payload (8 -> 24 bytes) rather than the auth HELLO, because
+  `performSyncHandshake` returns immediately when unkeyed, so a HELLO-carried
+  field would make the guard silently absent on unkeyed clusters. The extension
+  uses this protocol's established length-gated pattern (`>= 8` on BulkStart,
+  `>= 24`/`>= 48` on the delete frames, the session payload's "all length-gated"
+  note). Recommends FAIL-OPEN on an absent incarnation, with the argument that
+  the fallback IS origin/master's behaviour, that it matches the existing
+  gen==0 / epoch==0 / (0,0) legacy sentinels, and that failing closed would
+  strand the standby for the whole rolling-upgrade window. Concludes NO flag day
+  is needed, but records the contingency explicitly: a fail-CLOSED requirement
+  would force one, because an upgraded receiver cannot distinguish an old peer
+  from a suppressing peer without a negotiated capability, and that capability
+  has nowhere to live unkeyed.
+- **File(s)**: docs/peer-boot-incarnation-plan.md, _Log.md
 - **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
   and blocked on #5480. Seven review rounds established that the fence keys on
   `syncConnID`, a total ORDER over connections, when the predicate it needs is
@@ -71679,6 +72241,425 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-06 — #4785 fold r3: the IPIP anchor advisory keys on the RUNTIME DEVICE NAME (#6861 F1b/F2b/F2c/F3)
+
+- **Timestamp**: 2026-08-06
+- **Action**: `ipipAnchorOnlyWarnings` decided "unused anchor" by `*TunnelConfig`
+  POINTER identity against the emitter's output. Runtime identity for a tunnel is
+  the Linux DEVICE name, and several records share a device with an emitted
+  endpoint, so the advisory declared live traffic-carrying devices dead and told
+  the operator to delete them. Two shapes, both reproduced on this branch before
+  the fix:
+    - `ip-0/0/0 tunnel source/destination` + `unit 0 tunnel mode gre`. Unit 0's
+      per-unit tunnel takes the BASE Linux name (`compiler_interfaces.go`), the
+      same name the interface record carries, and `pkg/routing/tunnel.go` keys
+      its desired set by name — one device. The emitter publishes the unit's GRE
+      pointer (#5635), so the interface pointer is unemitted and `ip-0-0-0` was
+      reported as "nothing routed through it" while carrying the working GRE
+      tunnel.
+    - Interface-level `tunnel mode wireguard` with a sole `unit 3`. The emitter
+      keys ONE endpoint to the lowest unit carrying the INTERFACE-level pointer
+      (#1910), but `TunnelNameMap` resolves `wg0.3` to the UNIT's `wg0u3` — which
+      is what `snapshotLinuxName` writes into `InterfaceSnapshot.LinuxName` and
+      therefore what the tunnel endpoint (and the Rust WireGuard TUN behind it)
+      binds to. `wg0u3` is live WireGuard infrastructure; it was reported as a
+      dead IPIP anchor.
+  Detection now goes through `emittedTunnelDeviceNames`, built from
+  `cfg.TunnelNameMap()` — the same map `snapshotLinuxName` consults — so the
+  advisory cannot drift from the device the dataplane opens.
+- **Action**: both remediations corrected. They reach the boot/apply log and the
+  standing `show system alarms` surfaces, so an operator acts on them, and both
+  instructed a deletion that costs traffic. The interface branch's unconditional
+  "Remove the interface-level `tunnel` stanza" is replaced by
+  `ipipInterfaceStanzaRemovalAdvice`, which states the inheritance hazard
+  (`cloneForUnit` runs before a unit's own overrides, so a unit carrying only
+  `mode gre` holds INHERITED endpoints and stops emitting entirely) and the safe
+  ordering. The WireGuard-unit branch no longer offers removing the parent
+  stanza at all and says why: it deletes the working WireGuard tunnel AND exposes
+  the complete ipip endpoint underneath, which the strict gate then rejects. The
+  incomplete-endpoint branch is shared by both sites and carried the same
+  ambiguity, so it now scopes its deletion per site.
+- **Action**: three review follow-ups. `TestIpipUnitAnchorStillAlarms_4785`
+  asserted only the bare word `unit`, so it passed with the WRONG unit number —
+  now asserts `interfaces "ip-0/0/0" unit 5` exactly. `pkg/configstore`'s
+  no-brick test claimed to bind `Load` AND `SyncApply` but drove only SyncApply;
+  `TestLoadToleratesIpip_4785` adds the disk-boot half, persisting via
+  `db.WriteActiveMarker` (not SyncApply) so a strict-compile mutation lands on
+  its OWN `Store.Load REFUSED` assertion rather than a borrowed precondition.
+  The `lenientIpipTunnelMode` doc, `CompileConfigForNodeLenient`'s doc, and
+  `ValidatePeerEffectiveStrict`'s doc now record that the peer gate compiles
+  leniently from a STRICT commit path on purpose — tightening the flag turns the
+  peer compile into an error that the `err != nil -> return nil` arm swallows,
+  silently disarming the gate.
+- **Validation**: four disjoint mutations, each compiled (`go vet` 0) before
+  scoring, each restored to a byte-identical file (sha256 verified).
+  M1 (restore pointer identity) REDs only
+  `TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861`, both subtests,
+  as ASSERTIONS — `device "ip-0-0-0" was declared DEAD ("carries no traffic")
+  but that device carries the emitted endpoint "ip-0/0/0.0"` and the `wg0u3` /
+  `wg0.3` twin — and leaves all 40 other cells in the IPIP cohort GREEN,
+  including `TestIpipOverriddenAnchorKeepsTheOverrideCause_4785` (a genuinely
+  dead distinct-name anchor must still warn — the over-reach guard).
+  M2 (restore the interface remediation) REDs the inheritance arm and the
+  incomplete arm, leaving the WireGuard arm GREEN. M3 (restore the WireGuard
+  alternative) REDs only the WireGuard arm. M4 (production reports `u+1`) REDs
+  the new exact-unit assertion, which the old bare-word form survived. M5 (set
+  `lenientIpipTunnelMode: false`) REDs `TestLoadToleratesIpip_4785` at its own
+  assertion. Both remediation arms carry a behavioural PROOF of the hazard
+  rather than a wording assertion alone: removing the interface stanza is shown
+  to emit ZERO endpoints, and removing the WireGuard stanza is shown to make
+  `CompileConfig` reject `tunnel endpoint "wg0.3" has mode ipip`.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (59 packages).
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/compiler_opts.go, pkg/config/compiler.go,
+  pkg/config/compiler_peer_effective.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #4785 fold r4: Codex MERGE-NEEDS-MAJOR — five findings (#6861 F1-F5)
+
+- **Timestamp**: 2026-08-06
+- **Action** (F1, blocking): the BARE-interface arm of the device derivation was
+  `LinuxIfName(ep.Name)`, which is NOT what `snapshotLinuxName` does — its
+  no-unit arm resolves a `reth*` name through `ResolveReth` first. So an emitted
+  `reth0` endpoint was recorded live under device `reth0` when the snapshot
+  binds it to the physical member `ge-0-0-0`. The harm is a FALSE POSITIVE on a
+  DIFFERENT record: `ge-0/0/0` carrying its own unemitted ipip stanza has anchor
+  device `ge-0-0-0`, so with the wrong derivation that device is missing from
+  the live set and the advisory calls a live, traffic-carrying device dead —
+  this gate's own defect class surviving in its fallback arm. Fixed by splitting
+  `resolveBareKernelIfName` out of `ResolveKernelIfName` (the sanctioned
+  config-side twin of `snapshotLinuxName`, drift-guarded in the userspace
+  package) and routing the bare arm through it.
+- **Action** (F1b): the predicate is now `!emitted[t] && !live[t.Name]` — the
+  emitted-POINTER test restored ALONGSIDE the device-name test, not instead of
+  it. A record that is itself emitted belongs to the strict gate and the
+  dead-endpoint advisory, which is this advisory's stated contract and what
+  `TestIpipEmittedUnitIsNotDoubleReported_4785` already asserted. Device-name
+  alone reported the emitted `reth0` record with a structurally false cause
+  ("every unit overrides it" on an interface with no units).
+- **Action** (F2, major): the peer-effective gate is now handed the tree AFTER
+  `rewriteRetiredDataplaneType`, on a CLONE. Peer ingestion (Store.SyncApply)
+  strips a retired `system dataplane-type` leaf BEFORE compiling, so a
+  `groups node1` block carrying BOTH a retired leaf and a complete `ip-*` tunnel
+  failed the unconditional retirement validator on the raw tree —
+  `ValidatePeerEffectiveStrict` treats a peer view that will not compile as out
+  of scope and returns nil, so the gate returned SUCCESS WITHOUT EVER RUNNING
+  its IPIP subject. Reproduced end to end before the fix: node0 committed green,
+  node1's SyncApply installed `ip-0/0/0` mode ipip. The clone matters — mutating
+  the candidate would strip the operator's own leaf out of the tree being
+  committed and out of what syncs.
+- **Action** (F3): the device lookup is now STRUCTURAL, keyed on the
+  (interface, unit) pair each emitted ref came from, rather than parsing the ref
+  string. `ip-0/0/0.0` is a legal authored interface name and collides with the
+  synthesized unit ref for unit 0 of `ip-0/0/0`. See the mutation note below —
+  this fix has no end-to-end consequence today and the test says so.
+- **Action** (F4): the incomplete-endpoint remediation for a unit under an
+  interface-level `tunnel mode wireguard` stanza recommended "configure both
+  endpoints (and use `mode gre`…)", which is INEFFECTIVE — the emitter publishes
+  only the LOWEST unit and continues past every other per-unit record, so a
+  completed or GRE-converted unit still emits nothing (verified by compiling
+  exactly that). Both WireGuard-slot arms now share
+  `ipipWireguardSlotRemovalAdvice`, which names the one action that works and
+  marks both tempting alternatives as ineffective / destructive. A fourth
+  instance of the same family, so the set is not assumed closed: the
+  complete-but-not-under-WireGuard arm now renders an explicit "cause not
+  recognised — inspect, do not delete" rather than inheriting WireGuard's.
+- **Action** (F5): four assertions overstated what they bind. `unit 5` is a
+  strict PREFIX of `unit 50`, so the "EXACT" unit assertion stayed green under a
+  wrong-unit formatter; both it and the WireGuard twin now anchor on
+  `interfaces %q unit %d tunnel mode ipip`. The shared-device test never asserted
+  the UNEMITTED candidate was ipip (flipping it to gre left the subtest green for
+  the wrong reason). `TestIpipTunnelUnitOverrideCommitsButRaisesAnchorAlarm_4785`
+  looped over "whatever exists", so zero endpoints satisfied it; it now asserts
+  the count and the identity.
+- **Validation**: five disjoint mutations, each compiled (`go vet` 0) before
+  scoring, each restored byte-identical (sha256). R4-M1 (bare arm back to
+  `LinuxIfName`) REDs the reth guard at `device "ge-0-0-0" was declared DEAD but
+  that device carries the emitted reth0 endpoint`. R4-M2 (ref-first lookup) REDs
+  the F3 derivation test at `device "ip-0-0-0.0" is missing from the live set`.
+  R4-M3 (restore the shared incomplete text) REDs at `the advisory still
+  recommends completing the endpoints as though that would help`. R4-M4 (raw
+  tree to the peer gate) REDs at `node0 COMMITTED a config that gives node1 a
+  dead IPIP tunnel`. R4-M5 (`u*10`) REDs the exact-unit assertions, which the
+  pre-F5 `unit 5` form survived.
+  **F3 scope, recorded rather than dressed up**: reverting the structural walk
+  changes NO advisory, because the record whose device was being stolen is
+  itself emitted and the F1b pointer test skips it first. The string-keying
+  defect is unreachable end to end; the test binds the derivation's own output
+  and states that limit in its doc comment.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/types.go, pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/config/ipip_tunnel_reject_4785_test.go, pkg/configstore/store.go,
+  pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #6861 r4a: the two-clause anchor predicate carries its own rationale
+
+- **Timestamp**: 2026-08-06
+- **Action**: doc-only. After r4 restored the emitted-POINTER test alongside the
+  device-name test, `ipipAnchorOnlyWarnings`' doc comment still read "Detection
+  is by RUNTIME DEVICE NAME, **not** by *TunnelConfig pointer identity" — which
+  contradicted the code it sits above and reads as licence to delete the
+  `!emitted[t]` conjunct as a leftover. Rewritten to state that
+  `!emitted[t] && !live[t.Name]` is a deliberate two-clause design, that neither
+  clause subsumes the other, and that EACH was once the whole predicate and
+  wrong alone: pointer-only declared live shared devices dead (the original
+  #6861 defect); device-only reports an emitted `reth0` as a dead anchor with a
+  structurally false cause, duplicating a record the dead-endpoint advisory
+  already covers correctly. Also records the scope test that puts the orphan
+  `reth0` device in #6941 rather than #4785 — the same orphan appears under
+  `mode gre`, where #4785 is deliberately silent, so #4785 is not its cause.
+- **Rationale**: the shipping artifact has to carry the caveat. This reasoning
+  existed only in review correspondence; the next reviewer reading the code
+  would have found a comment arguing against one of its own clauses.
+- **Validation**: comment-only, no behaviour change. `go build ./...` 0;
+  `go test ./pkg/config ./pkg/configstore` 0.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go, _Log.md
+
+## 2026-08-06 — #6861 r5: every clause of the anchor predicate is now measured
+
+- **Timestamp**: 2026-08-06
+- **Context**: a parent mutation grid found the emitted-POINTER clause UNBOUND at
+  both sites — deletable from either predicate with the whole suite green — while
+  the r4 comment asserted it was load-bearing and told the next reader not to
+  simplify it. A comment was the only thing preventing the simplification. Both
+  resolutions were left open: the clause is real and untested, or it is redundant
+  and the comment is wrong.
+- **Action** (interface site — the clause is REAL, answer (a)): reproduced the
+  shape the comment claimed. A bare `reth0` with an interface-level ipip stanza
+  emits, and `snapshotLinuxName` binds that endpoint to the physical member
+  `ge-0-0-0` while the record's own anchor name stays `reth0`, so on the device
+  clause alone `reth0` is absent from the live set and is reported as a dead
+  anchor — a SECOND diagnosis of a record the dead-endpoint advisory already
+  covers, carrying the cause "every unit overrides it" on an interface with no
+  units. `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` now binds it.
+- **Action** (unit site — the clause is REDUNDANT, answer (b)): removed. Not
+  "could not find a case": TunnelNameMap keys a unit's device BY
+  `unit.Tunnel.Name`, and compiler_interfaces.go always assigns a non-empty Name
+  at construction, so an emitted unit record's device IS its own name and the
+  device clause necessarily holds it. The predicate is now deliberately
+  ASYMMETRIC and the comment says which site carries what, and why.
+- **Action** (a defect found while measuring): the unit arm deferred to
+  `ResolveKernelIfName` unconditionally, but that answers XFRM (`st<N>`) and IRB
+  refs BEFORE consulting the tunnel map, while `snapshotLinuxName` — which fills
+  the LinuxName the dataplane binds — consults the map first and has neither arm.
+  So `st0.1` resolved to `st0.1` instead of the unit's `st0u1`, and `irb.0` under
+  a bridge domain to `br-bd0` instead of `irb`: a device the dataplane never
+  opens entered the live set and the real one was left out. Fixed by consulting
+  TunnelNameMap first, mirroring snapshotLinuxName's ordering. This is what made
+  the unit-site pointer clause redundant — before the fix it was masking these
+  two mis-derivations.
+- **Validation**: four cells, each compiled (`go vet` 0), each restored
+  byte-identical. C1 drop iface device clause → RED (shared-device + reth-member
+  guards). C2 drop iface pointer clause → RED
+  (`TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861`). C3 drop unit device clause →
+  RED (three guards). C4 drop the TunnelNameMap-first ordering → RED
+  (`TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861`, both st and irb subtests).
+  No clause remains unmeasured: every one either reds a cell or was deleted.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+
+## 2026-08-06 — #6861 r6: two guards whose evidence did not reach the property they name
+
+- **Timestamp**: 2026-08-06
+- **Context**: a Codex leg at `7f8681369` (one commit behind head) returned four
+  findings. Its F1 (IRB/XFRM ordering) and F2 (missing emitted-record test) were
+  already closed by r5 at `25c6cb705` — VERIFIED against Codex's own verbatim
+  reproducer rather than assumed: its IRB config now yields `live={irb}` and
+  ZERO anchor advisories, and the r5 C2 cell already reds the pointer clause.
+  Its F2 also independently corroborates the (a)/(b) split r5 landed on. The two
+  remaining findings are both the same shape — a guard whose evidence does not
+  reach the property it names — and neither was a production defect.
+- **Action** (F3): `TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName` exists
+  to catch drift between `ResolveKernelIfName` and `snapshotLinuxName`, but the
+  whole `TunnelNameMap()` block could be DELETED from `ResolveKernelIfName` with
+  the guard still green. Every case in its fixture used a config where the map
+  answer and the fallback COINCIDE — `gr-0/0/0` carried only unit 0, whose map
+  answer (`gr-0-0-0`) equals the fallback's `unit.Number == 0 -> kernelBase`. The
+  fallback silently supplied the right answer, so the lookup was unobservable.
+  Added unit 1: a NONZERO unit under an interface-level tunnel is the shape where
+  they split (map/runtime `gr-0-0-0`, fallback `gr-0-0-0.1`).
+- **Action** (F4): the deleted `TestIpipTunnelDeadWarning` covered a unit-level
+  ipip tunnel with NEITHER source nor destination; its stated replacement
+  `TestIpipUnitAnchorStillAlarms_4785` covered only source-only and
+  destination-only. A unit loop that skipped records with both halves empty
+  therefore stayed green across the whole suite. Production warns correctly —
+  only the guard was lost in the relocation. Added the
+  `neither_source_nor_destination` subtest.
+- **Validation**: three cells, each compiled (`go vet` 0), each restored
+  byte-identical. F2 cell (drop `!emitted[t] &&`) REDs
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` at `the record was reported as
+  a DEAD ANCHOR even though its endpoint is emitted`. F3 cell (delete the
+  `TunnelNameMap()` block) REDs the drift guard at `drift: ref "gr-0/0/0.1" ...
+  got "gr-0-0-0.1", want "gr-0-0-0"` — it did NOT red before this round. F4 cell
+  (skip units with both halves empty) REDs the new subtest at `a unit-level ipip
+  stanza creates a kernel anchor device the operator can see, but raised NO
+  alarm`. `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
+- **Docs**: none. Both changes are test-only; no behaviour, config surface or
+  operator-visible output changed this round.
+- **File(s)**: pkg/dataplane/userspace/interfaces_test.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+## 2026-08-06 — #4408 increment 3a: lift the waterfill epoch refill (Option B')
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 epoch refill out of
+  `select_exact_cos_guarantee_queue_waterfill` into
+  `refill_waterfill_epoch(root, now_ns)`, `#[inline(always)]`, same
+  module. Pure motion: the 74 moved lines diff clean against master's
+  `:1000-1073` once leading whitespace is stripped, and the only
+  non-motion edit is the doc comment de-indenting from `    //` to `//`
+  as it becomes the helper's header. The block stays ATOMIC — the order
+  of the `waterfill_epochs` bump, the `epoch_boundary`-gated
+  honored-bitset clear, and `waterfill_epoch_wrap_pending = false` is
+  the #1743 r3 livelock fix, and the helper's header says so.
+- **Scope honesty**: this does NOT move the committed modularity metric.
+  `docs/refactoring-audit-current.txt` gates on file set and tier;
+  `queue_service/mod.rs` was 2166 `[REFACTOR]` and stays above the 2000
+  floor, so the tier is unchanged and `TestHeatmapNotStale` neither
+  fires nor needs a regenerated artifact (`go test
+  ./pkg/refactoraudit/...` ok). The value is reviewability of a state
+  machine, and nothing else.
+- **Validation**: call-edge baseline REGENERATED at this head, not
+  inherited from the plan (`docs/research/4408-hotpath-split/plan.md`
+  §2's artifacts are from `dd23119aa`). Raw, zero-normalisation Tier 1
+  on `service_exact_guarantee_queue_direct_with_info` (the symbol the
+  waterfill inlines into) — 32 edges, diff exit 0; on the untouched
+  `enqueue_pending_forwards` control — 51 edges, diff exit 0. `nm`:
+  neither the waterfill nor `refill_waterfill_epoch` is present, and
+  `service_exact_guarantee_queue_direct_with_info` holds at 0x619b.
+  Negative control: flipping the helper to `#[inline(never)]` puts it in
+  `nm` at 0x1eb and the Tier-1 diff reports the new edge — the gate is
+  watched failing, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs, _Log.md
+
+## 2026-08-06 — #4408 increment 3b: split the waterfill's two selection walks
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 ascending walk and the Phase-2
+  descending residual walk into `waterfill_phase1_select` /
+  `waterfill_phase2_select`, both `#[inline(always)]` and same-module,
+  leaving `select_exact_cos_guarantee_queue_waterfill` a 59-line
+  orchestrator (from 432) over refill -> Phase 1 -> Phase 2 -> wrap
+  tail. Pure motion: 175 + 108 moved lines diff clean against master's
+  `:1094-1268` and `:1280-1387` after stripping leading whitespace.
+  `Option` is a faithful encoding, not an invented protocol — every
+  non-selecting exit of each walk already converged on the same
+  successor in the original body.
+- **Finding (the reason this took a second pass)**: the plan's §7.2
+  mutation grid caught that `waterfill_phase2_select` was **completely
+  unbound**. Both prescribed cells — M5 "Phase 2 ignores the honored
+  bitset" and M6 "Phase 2 resets the cursor on each entry" — left the
+  full waterfill + refund suite GREEN. Every pre-existing fixture enters
+  Phase 2 with the largest class UN-honored (Phase 1 walks ascending and
+  runs out of budget before reaching it), so the descending walk lands
+  on an eligible queue at cursor 0 and neither the honored-skip nor the
+  cursor arithmetic is ever exercised. Two tests now bind it, built on a
+  fixture that honors the LARGEST class first by emptying the two small
+  queues so Phase 1 skips them, then refilling them so the next call
+  breaks into Phase 2 with ordinal bit 2 set.
+- **Validation**: 6-of-6 mutation grid, each cell a NAMED failing test
+  with an ASSERTION (never a build break), plus a negative control.
+  M1 (drop the `epoch_boundary` gate) REDs
+  `waterfill_exact_fit_honor_does_not_livelock_phase1`; M2 (reset the
+  cursor in the refill) REDs
+  `waterfill_exhausted_refill_does_not_reset_phase2_cursor` — "the
+  exhausted refill path must PRESERVE the Phase-2 cursor"; M3 (drop the
+  honored-bit set) REDs 8 tests incl. the #1732 distribution test; M4
+  (charge `send_budget` not `phase1_cost`) REDs 5 incl.
+  `waterfill_phase1_honor_charge_is_configured_quantum_not_tokens`;
+  M5 REDs both new Phase-2 tests; M6 REDs ONLY
+  `waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest`
+  — "Phase 2 must RESUME the descending walk from the stored cursor",
+  left 1 right 0 — so the two new tests discriminate rather than
+  restate each other. The negative control (hoisting the
+  `waterfill_epochs` bump earlier inside the same block, semantically
+  null) stays GREEN, so the grid measures the code rather than
+  reporting "everything fails".
+- **Codegen**: raw zero-normalisation Tier-1 call-edge sets unchanged on
+  `service_exact_guarantee_queue_direct_with_info` (32 edges) and on the
+  untouched `enqueue_pending_forwards` control (51 edges).
+  `service_exact_guarantee_queue_direct_with_info` grows 0x619b ->
+  0x61cf (+52 B, +0.21%) with an identical call-edge set — scheduling
+  drift, not a new or lost callee. Negative control fires for all three
+  helpers. Three whole-binary residuals in modules this PR does not
+  open are classified in the PR body.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
+  docs/cos-validation-notes.md, _Log.md
+
+## 2026-08-12 — #4785 fold r7: the pointer-keying claim, measured properly
+
+- **Timestamp**: 2026-08-12
+- **Action**: Three review findings on #6861, all about claims outrunning their
+  evidence. No production behaviour changes.
+
+  **F1 — the interface site's emitted clause: pointer keying IS load-bearing,
+  but not for the reason the comment gave.** The r5 comment defended
+  `emitted[t]` (pointer-keyed) with the reth divergence and cited
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` as the measurement. That
+  measurement cannot support the claim: the cited test reds when the clause is
+  DELETED, which any check-exists test catches, and it stays GREEN when the
+  clause is re-keyed to `!emittedName[t.Name]` — because in its fixture the
+  emitted record IS the record under test, so both keyings agree.
+
+  Built the discriminating fixture instead. Two records share a `Name` only as
+  an interface-level record and its own unit 0 — where TunnelNameMap puts that
+  same name in `live[]`, so the device clause decides first — or as two
+  DIFFERENT interface keys canonicalizing to one Linux name, since LinuxIfName
+  only replaces '/' with '-' (`gr-0/0-0` is one character from `gr-0/0/0`; both
+  give `gr-0-0-0`). Combined with the one shape whose emitted device diverges
+  from its record's Name — interface-level WireGuard whose lowest unit is > 0,
+  where the emitter publishes the INTERFACE pointer at ref `X.u` (#1910) while
+  TunnelNameMap resolves `X.u` to the UNIT device — the name is emitted while
+  the device is not live, and the two keyings disagree.
+
+  SCOPE, now stated in the code: a strict commit REJECTS that config (the
+  duplicate Linux-device-name gate fires), so on anything committable the two
+  keyings are equivalent. What pointer keying protects is the TOLERANT surface
+  (#1960) — configstore Load/SyncApply lenient-compiles a config a strict commit
+  would refuse, and `show system` renders ValidateConfig's warnings for whatever
+  is active. Kept because it is correct on its own terms rather than by
+  borrowing the dup-name gate's guarantee.
+
+  **F2 — "Measured, not assumed" rewritten** to say what was actually measured
+  (a presence measurement, which says nothing about keying) and to point at the
+  separate fixture and mutation that do settle the keying.
+
+  **F3 — the code is deliberate; the CLAIM was false.** `ValidatePeerEffectiveStrict`
+  returns nil when the peer view fails to compile, skipping every peer strict
+  subject. That arm is documented and intentional (#1960 no-brick: a peer-side
+  compile failure must not false-reject the origin commit), and it is REACHABLE
+  — though NOT for the reason this entry originally gave. It cited
+  `validateTunnelEndpointIDCollisionAST` as "returned unconditionally with no
+  lenient flag", which is false and is corrected in the r6 entry above: that gate
+  takes a `lenient bool`, both call sites pass `opts.sanitizeFreeTextControlChars`,
+  and `lenientCompileOpts()` sets it true, so on the lenient path it WARNS. The
+  reachable hard error is `validateDataplaneTypeStrict`, called from
+  `compiler_earlystrict.go` with no lenient downgrade. The CONCLUSION (the arm is
+  reachable) stands; the citation did not. So the defect was the doc sentence "a
+  chassis-cluster commit proves BOTH node-effective outputs are installable
+  before promotion", which is unconditional and false in exactly that case.
+  Corrected at both sites to state the conditional guarantee.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/config/compiler_peer_effective.go, pkg/configstore/store.go, _Log.md
+- **Validation**: New `TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861`
+  with five preconditions, each a `t.Fatalf` guarding a way the fixture could
+  silently stop discriminating. Mutation, run firsthand: re-keying
+  `!emitted[t]` to `!emittedName[t.Name]` (built from the same
+  EmitTunnelEndpointNames walk) reds it at "the anchor advisory did not fire
+  exactly once ... (got 0)", while
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` stays GREEN under the same
+  mutation — the two now bind existence and keying separately. Before the fix
+  the ENTIRE `pkg/config` suite was green under that mutation.
+  Rebased onto origin/master; only `_Log.md` conflicted, union-resolved
+  (260 ours + 87 theirs), zero residual markers, and the seam checked
+  STRUCTURALLY: header count 1512 + 2 new = 1514, and the one-header-one-
+  Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
+  and 226 after the union — the resolve introduced none.
 
 ## 2026-08-07 — #6669 fold round 15: bind the boot-epoch production wiring at both ends
 
