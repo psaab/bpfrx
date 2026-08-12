@@ -98,7 +98,7 @@ fn txn_admission_refusal_at_cap_drops_and_leaks_nothing() {
 ///
 /// RED on revert: deleting the `binding.live.new_flow_installs.fetch_add(1, ..)`
 /// in `poll_descriptor/mod.rs` leaves the counter at 0 and this fails on its
-/// message while `batch.session_creates` still reports 1 — an assertion
+/// message while `batch.session_creates` still reports 2 — an assertion
 /// failure, not a build or behaviour break.
 #[test]
 fn txn_new_flow_install_counts_on_the_binding_4800() {

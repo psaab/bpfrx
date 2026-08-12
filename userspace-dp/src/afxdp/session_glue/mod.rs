@@ -874,9 +874,14 @@ pub(crate) static SESSION_REPLICATION_UPSERTS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SESSION_REPLICATION_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 
 /// #4800: sibling worker-queue mutex acquisitions in
-/// [`replicate_session_upsert`] that found the queue already held. The
-/// denominator is `SESSION_REPLICATION_ENQUEUED` (one acquisition per
-/// enqueue).
+/// [`replicate_session_upsert`] that found the queue already held.
+///
+/// The denominator is `SESSION_REPLICATION_ENQUEUED`, which is incremented
+/// once per sibling IMMEDIATELY BEFORE that sibling's acquisition — so the
+/// pair is a ratio over acquisitions actually ATTEMPTED, at every instant and
+/// not merely once a call has returned. Booking the whole fan-out up front
+/// (the pre-fix order) understated contention by the sibling count for any
+/// scrape landing mid-call.
 pub(crate) static SESSION_REPLICATION_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
 
 /// #4800: sum of the per-call deepest sibling-queue depth observed at
@@ -922,19 +927,38 @@ pub(super) fn replicate_session_upsert(
     entry: &SyncedSessionEntry,
 ) {
     // #4800: in test builds only, hold the shared side of the counter lock for
-    // the whole fan-out. This is where the replication-side mover set is
-    // DERIVED: moving any `SESSION_REPLICATION_*` counter requires calling this
-    // function. The previous hand-written inventory had already missed two real
-    // movers (`coordinator::sync_worker_session_tables` and
-    // `promote::maybe_promote_synced_session`). See `afxdp::counter_test_lock`.
+    // the whole fan-out, so a reading test excludes this mover without the
+    // caller having to opt in. The previous hand-written inventory had already
+    // missed two real movers (`coordinator::sync_worker_session_tables` and
+    // `promote::maybe_promote_synced_session`).
+    //
+    // This does NOT make the mover set closed: the `SESSION_REPLICATION_*`
+    // statics are `pub(crate)` and any module can bump one directly, and
+    // `worker_queue::lock_recover_counting` takes an arbitrary counter. It
+    // covers the movers reachable through today's call graph, which is a
+    // convention, not an invariant. See `afxdp::counter_test_lock`.
     #[cfg(test)]
     let _counter_guard = crate::afxdp::counter_test_lock::counter_mover_guard();
     let replica = synced_replica_entry(entry);
     // #4800: two O(1) counter updates per call rather than per sibling.
     SESSION_REPLICATION_UPSERTS.fetch_add(1, Ordering::Relaxed);
-    SESSION_REPLICATION_ENQUEUED.fetch_add(worker_commands.len() as u64, Ordering::Relaxed);
     let mut deepest = 0u64;
     for commands in worker_commands {
+        // #4800: count this sibling's acquisition ATTEMPT immediately before
+        // making it, NOT the whole fan-out up front.
+        //
+        // Pre-booking `worker_commands.len()` here made the contention ratio
+        // structurally wrong for any scrape taken mid-call, which is every
+        // scrape under load. With 16 sibling queues and queue 0 held, the old
+        // order recorded 16 enqueues and 1 contended acquisition and then
+        // BLOCKED — a scrape in that window reports 6.25% contention, under the
+        // analyzer's 10% threshold, while 100% of the acquisitions actually
+        // attempted had blocked. The denominator counted work that had not been
+        // tried yet. Incrementing per iteration keeps `contended <= enqueued` a
+        // ratio over ATTEMPTED acquisitions at every instant, and leaves the
+        // at-rest value identical (every attempt completes), so the fan-out
+        // ratio `enqueued / upserts` is unchanged.
+        SESSION_REPLICATION_ENQUEUED.fetch_add(1, Ordering::Relaxed);
         // #1807: recover-and-push — `if let Ok` silently DROPPED the
         // UpsertSynced replica for a poisoned worker queue.
         // #4800: ...and count the acquisitions that had to block.

@@ -240,14 +240,25 @@ for name, ts, pid in (("before", t0, pid0), ("after", t1, pid1)):
         json.dump(snap, f, indent=2)
 PY
 
-    # Offered rate = the generator's own achieved handshake rate, not the
-    # requested one. Comparing accepted flows against a rate the generator
-    # never actually produced would blame the firewall for client shortfall.
+    # Offered rate = the rate we REQUESTED of the generator, i.e. `$rate`.
     #
-    # An unparseable report FAILS THE CELL. It must never degrade to 0: the
-    # analyzer's generator-bound check is keyed on this value, so a silent 0
-    # would disable the very check that catches a broken generator, and the
-    # cell would come back VALID with a firewall number behind it.
+    # It used to be the generator's own ACHIEVED rate, which disabled the
+    # generator-underdrive gate mathematically rather than merely weakening it:
+    # the analyzer computes accept_ratio = accepted / offered, so feeding it the
+    # achieved rate makes the ratio ~1 by construction. Request 100k/s, have the
+    # client manage 20k/s, have the firewall install all 20k, and the cell came
+    # back VALID at 20k — a GENERATOR ceiling reported as a firewall
+    # measurement, which is the single most expensive way this harness can be
+    # wrong. With the requested rate the same cell yields accept_ratio 0.2 and
+    # is refused INCONCLUSIVE, which is what the gate exists to do (and what
+    # newflow_ceiling_analyze_test.py has always asserted — the harness and its
+    # own unit test disagreed about what was being fed in).
+    #
+    # The generator report is still parsed and still FAILS THE CELL when it is
+    # unreadable or reports zero established connections. That check answers a
+    # different question — "did the generator run at all" — and must never
+    # degrade to 0, because a silent 0 would disable the underdrive gate from
+    # the other side.
     if ! offered="$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -262,11 +273,12 @@ print(v)
         continue
     fi
 
+    # `$rate` is what we asked for; "$offered" above is only the liveness check.
     python3 "$ANALYZER" "$cell/before.json" "$cell/after.json" \
-        --offered-rate "$offered" --json > "$cell/analysis.json"
+        --offered-rate "$rate" --json > "$cell/analysis.json"
     cell_rc=$?
     python3 "$ANALYZER" "$cell/before.json" "$cell/after.json" \
-        --offered-rate "$offered" | tee "$cell/analysis.txt"
+        --offered-rate "$rate" | tee "$cell/analysis.txt"
     [[ $cell_rc -eq 0 ]] || overall_rc=$cell_rc
 done
 

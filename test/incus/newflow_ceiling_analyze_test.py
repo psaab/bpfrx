@@ -80,9 +80,17 @@ def snap(
 
 def six_even_workers(total):
     """Six workers sharing `total` installs evenly — the loss cluster's 6 RX
-    queues, distributed as a healthy multi-worker run would be."""
-    per = total // 6
-    return {str(i): per for i in range(6)}
+    queues, distributed as a healthy multi-worker run would be.
+
+    The remainder is spread over the first `total % 6` workers so the six
+    counters sum to EXACTLY `total`. Truncating it (`total // 6` for all six)
+    lost up to 5 installs, which was invisible while the reported rate came
+    from `pool.allocations_total` and became a real 0.199998-vs-0.2 discrepancy
+    once the rate started deriving from these counters. A per-worker fixture
+    that does not add up to its own stated total cannot express an exact
+    accept-ratio, and real per-worker counters do add up."""
+    per, extra = divmod(total, 6)
+    return {str(i): per + (1 if i < extra else 0) for i in range(6)}
 
 
 class AttributionNamesEverySaturatedSite(unittest.TestCase):
@@ -523,6 +531,45 @@ class ValidityGates(unittest.TestCase):
         self.assertEqual(a.verdict, INCONCLUSIVE)
         self.assertAlmostEqual(a.accept_ratio, 0.2)
         self.assertTrue(any("bound first" in r for r in a.reasons))
+
+    def test_rate_is_installed_flows_not_pool_allocations(self):
+        """The reported rate must be INSTALLED flows, not pool allocations.
+
+        A pool allocation is taken before pair admission and a refusal rolls it
+        back without decrementing the cumulative counter, so under overload the
+        allocation delta counts attempts. This fixture is that overload: 100k
+        allocations over 10s but only 10k installs, i.e. 90% refused.
+
+        The two numbers must not be confusable, so they are an order of
+        magnitude apart. Reading allocations would report 10000/s — ten times
+        the flows the firewall actually installed, and a "ceiling" ten times
+        too high in exactly the regime this harness is pointed at.
+
+        RED on revert: restore `result.new_flows_per_sec = allocations /
+        elapsed` and this fails at 10000.0 != 1000.0.
+        """
+        a = analyze(
+            snap(0.0, workers=six_even_workers(0)),
+            snap(
+                10.0,
+                allocations=100_000,
+                nat_acq=200_000,
+                pub_acq=30_000,
+                rep_upserts=10_000,
+                rep_enqueued=60_000,
+                workers=six_even_workers(10_000),
+            ),
+            offered_flows_per_sec=10_000.0,
+        )
+        self.assertAlmostEqual(
+            a.new_flows_per_sec,
+            1_000.0,
+            msg="the rate must come from the summed per-worker new_flow_installs "
+            "(10k installs / 10s), not from pool.allocations_total (100k/10s)",
+        )
+        # ...and the accept ratio inherits the corrected numerator, so a run
+        # that refuses 90% of what it was offered is not scored as accepting it.
+        self.assertAlmostEqual(a.accept_ratio, 0.1)
 
     def test_generator_at_rate_is_valid(self):
         a = analyze(

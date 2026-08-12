@@ -41,7 +41,7 @@
 // `promote::maybe_promote_synced_session`.
 
 use super::*;
-use crate::afxdp::counter_test_lock::{CounterExempt, counter_reader_guard};
+use crate::afxdp::counter_test_lock::{CounterExempt, counter_reader_guard, movers_waiting};
 use crate::afxdp::shared_ops::{
     SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS, SHARED_SESSION_PUBLISH_LOCK_CONTENDED,
     SHARED_SESSION_PUBLISHES, publish_shared_session, remove_shared_session,
@@ -223,9 +223,14 @@ fn publish_shared_session_counts_calls_and_lock_acquisitions() {
 }
 
 /// The contention counter must fire when a sibling worker already holds a
-/// shared map. Forced deterministically: the test thread parks on
-/// `shared_sessions`, so the publishing thread's `try_lock` is guaranteed to
-/// fail before the guard is released.
+/// shared map. Forced by parking: the test thread holds `shared_sessions` while the
+/// publishing thread runs, so its `try_lock` misses.
+///
+/// NOT deterministic, and the comment used to say it was. The helper sets a
+/// flag and the parent sleeps 50ms before releasing; a deschedule longer than
+/// that lets the `try_lock` succeed and the test fails spuriously. The window
+/// is generous rather than guaranteed. Widen the sleep if it ever flakes — do
+/// not weaken the assertion, which is the part that binds.
 ///
 /// RED on revert: the plain `lock()` has no try-lock probe, the counter never
 /// moves, and the `>= 1` assertion fails on its message. The publish itself
@@ -376,8 +381,8 @@ fn replicate_session_upsert_counts_fanout_and_queue_depth() {
 }
 
 /// The replication contention counter must fire when a sibling's command
-/// queue is already held. Forced deterministically, same shape as the publish
-/// case.
+/// queue is already held. Same parked-mutex shape as the publish case, and
+/// the same caveat: the 50ms window is generous, not deterministic.
 ///
 /// RED on revert: reverting `lock_recover_counting` back to `lock_recover`
 /// removes the try-lock probe, the counter never moves, and the `>= 1`
@@ -622,4 +627,181 @@ fn replicate_session_delete_is_not_counted_as_an_upsert() {
             "worker {worker} must still have received the delete"
         );
     }
+}
+
+/// The MOVER side of the guard, bound on its own — the one property every
+/// other test in this file is structurally unable to check.
+///
+/// Every same-thread test here holds the reader guard, so `counter_mover_guard`
+/// returns `None` on their thread via the depth marker; every contention probe
+/// hands its helper a `CounterExempt`, which also returns `None`. Deleting
+/// either `#[cfg(test)] let _counter_guard = ...` binding therefore changes
+/// NOTHING observable in any of them. The only prior evidence that the mover
+/// side did anything was a 1-in-1500 flake rate under a probabilistic loop,
+/// which is not a binding.
+///
+/// This is the missing shape: hold the reader, start a NON-exempt mover, prove
+/// it stays blocked, release the reader, prove it then completes.
+///
+/// "Stays blocked" is a POSITIVE observation, not a nap. `movers_waiting()`
+/// counts threads parked inside `counter_mover_guard` between entering and
+/// acquiring the shared lock, so the wait loop below asserts that a mover
+/// actually reached the guard and stopped there. A sleep-and-check-a-flag
+/// version would pass identically for a merely descheduled thread — including
+/// under its own mutation, which is the failure mode that makes such a test
+/// worthless.
+///
+/// RED on revert: delete `let _counter_guard = super::counter_test_lock::
+/// counter_mover_guard();` from `publish_shared_session` and the publisher
+/// never registers as waiting; the deadline expires and this fails at "no
+/// non-exempt mover ever blocked on the counter guard", reporting that the
+/// publish counter moved while the reader guard was held. An assertion, not a
+/// hang — the wait is deadline-bounded precisely so the mutation cannot present
+/// as a wedged test.
+#[test]
+fn a_non_exempt_mover_blocks_until_the_reader_guard_is_released() {
+    let guard = counter_reader_guard();
+    let before = publish_counters();
+
+    let maps = Arc::new(SharedMaps::new());
+    let publisher = {
+        let maps = Arc::clone(&maps);
+        // NO CounterExempt here, deliberately: this thread must take the real
+        // mover side and park on it.
+        std::thread::spawn(move || maps.publish(&entry(40010)))
+    };
+
+    // Wait for the publisher to REGISTER as blocked on the guard.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while movers_waiting() == 0 {
+        if std::time::Instant::now() > deadline {
+            let now = publish_counters();
+            panic!(
+                "no non-exempt mover ever blocked on the counter guard within \
+                 10s. The mover side is not in force: publishes went {} -> {} \
+                 while the exclusive reader guard was held, which is exactly \
+                 what the guard exists to prevent.",
+                before.publishes, now.publishes
+            );
+        }
+        std::hint::spin_loop();
+    }
+
+    // It is parked, so it cannot have published. This is the exclusion property
+    // itself, not a proxy for it.
+    let during = publish_counters();
+    assert_eq!(
+        during.publishes, before.publishes,
+        "a mover blocked on the guard must not have published yet"
+    );
+    assert!(
+        !maps
+            .sessions
+            .lock()
+            .expect("map readable")
+            .contains_key(&key(40010)),
+        "the blocked publish must not have reached the shared map"
+    );
+
+    drop(guard);
+    publisher.join().expect("publishing thread must not panic");
+
+    // Released, so it completed.
+    let after = publish_counters();
+    assert!(
+        after.publishes >= before.publishes + 1,
+        "once the reader guard is released the blocked mover must complete: {} -> {}",
+        before.publishes,
+        after.publishes
+    );
+    assert!(
+        maps.sessions
+            .lock()
+            .expect("map readable")
+            .contains_key(&key(40010)),
+        "the released publish must have landed in the shared map"
+    );
+}
+
+/// The contention ratio must be over acquisitions ATTEMPTED, observed
+/// MID-CALL — which is the only moment it can be wrong, and the moment every
+/// scrape under load lands in.
+///
+/// Pre-booking the whole fan-out into the denominator before the first
+/// acquisition made `contended / enqueued` structurally understate contention
+/// by the sibling count for the entire duration of a blocked call. With 16
+/// queues and one held that is 1/16 = 6.25%, under the analyzer's 10%
+/// threshold, while every acquisition actually attempted had blocked. The
+/// at-rest totals are identical either way, so no end-of-call assertion can
+/// see this: the fixture has to read the counters WHILE a replicator is parked.
+///
+/// RED on revert: restore
+/// `SESSION_REPLICATION_ENQUEUED.fetch_add(worker_commands.len() as u64, ..)`
+/// above the loop and this fails at "the denominator counted siblings that
+/// had not been attempted yet", reporting 3 enqueued against 1 attempted.
+#[test]
+fn replication_contention_denominator_counts_only_attempted_acquisitions() {
+    let _g = counter_reader_guard();
+    let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..3)
+        .map(|_| Arc::new(Mutex::new(VecDeque::new())))
+        .collect();
+    let before = replication_counters();
+
+    // Hold the FIRST sibling, so the replicator blocks on its very first
+    // acquisition with two siblings still untouched.
+    let held = queues[0].lock().expect("held by the test thread");
+    let replicator = {
+        let queues: Vec<_> = queues.iter().map(Arc::clone).collect();
+        std::thread::spawn(move || {
+            let _exempt = CounterExempt::new();
+            replicate_session_upsert(&queues, &entry(40011));
+        })
+    };
+
+    // Wait for it to register as BLOCKED (the contended bump happens before
+    // the blocking lock, worker_queue.rs), deadline-bounded so a revert that
+    // never blocks fails on an assertion instead of wedging.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if replication_counters().contended >= before.contended + 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "the replicator never registered a blocked acquisition within 10s"
+        );
+        std::hint::spin_loop();
+    }
+
+    // THE ASSERTION. One acquisition has been attempted; two siblings have not
+    // been touched. The denominator must reflect that.
+    let during = replication_counters();
+    assert_eq!(
+        during.enqueued - before.enqueued,
+        1,
+        "the denominator counted siblings that had not been attempted yet: \
+         {} enqueued against 1 attempted acquisition, so the contention ratio \
+         reads {}% instead of 100% for a call that is blocked on its first \
+         queue",
+        during.enqueued - before.enqueued,
+        100 * (during.contended - before.contended) / (during.enqueued - before.enqueued).max(1),
+    );
+
+    drop(held);
+    replicator.join().expect("replicating thread must not panic");
+
+    // At rest the total is unchanged by this reordering — the fan-out ratio
+    // the analyzer divides by must still be exactly the sibling count.
+    let after = replication_counters();
+    assert_eq!(
+        after.enqueued - before.enqueued,
+        3,
+        "once the call completes every sibling must be counted, so \
+         enqueued/upserts is still the fan-out multiplier"
+    );
+    assert_eq!(
+        after.upserts - before.upserts,
+        1,
+        "exactly one replication call"
+    );
 }

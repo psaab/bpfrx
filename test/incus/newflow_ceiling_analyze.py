@@ -396,7 +396,43 @@ def analyze(
 
     # --- rate + attribution -------------------------------------------------
     result = Analysis(verdict=VALID, elapsed_s=elapsed)
-    result.new_flows_per_sec = allocations / elapsed
+
+    # --- worker distribution (needed for the rate below) -------------------------------------------------
+    before_workers = before.get("workers", {}) or {}
+    after_workers = after.get("workers", {}) or {}
+    installs: Dict[str, int] = {}
+    for worker in sorted(set(before_workers) | set(after_workers), key=str):
+        delta = int(after_workers.get(worker, 0)) - int(before_workers.get(worker, 0))
+        if delta < 0:
+            result.verdict = INVALID
+            result.reasons.append(
+                f"worker {worker} new-flow install counter went backwards; "
+                "the helper restarted mid-window"
+            )
+            return result
+        installs[str(worker)] = delta
+    result.worker_installs = installs
+    total_installs = sum(installs.values())
+    result.active_workers = sum(1 for v in installs.values() if v > 0)
+    if total_installs > 0:
+        result.max_worker_share = max(installs.values()) / total_installs
+
+    # The reported flow rate is INSTALLED flows, summed from the per-worker
+    # `new_flow_installs` counters — NOT `pool.allocations_total`.
+    #
+    # A pool allocation is taken BEFORE pair admission (nat/allocator.rs) and a
+    # refusal rolls it back without decrementing the cumulative counter, so the
+    # allocation delta counts attempts, not installs. 100k SYNs with 90k refused
+    # and 10k committed reported 100k new flows/s — a ceiling measurement that
+    # is 10x the flows the firewall actually installed, in exactly the overload
+    # regime this harness is pointed at. The Rust side already proves the two
+    # diverge: the admission-refusal test asserts a rolled-back NAT decision
+    # with `new_flow_installs == 0`.
+    #
+    # The allocation delta is still required to be > 0 above — that gate answers
+    # "was the pool-mode SNAT rule in effect at all", which is a different
+    # question and still worth refusing on.
+    result.new_flows_per_sec = total_installs / elapsed
     result.offered_flows_per_sec = offered_flows_per_sec
     if offered_flows_per_sec:
         result.accept_ratio = result.new_flows_per_sec / offered_flows_per_sec
@@ -456,26 +492,6 @@ def analyze(
         # different remedy (drain rate vs. lock sharding). Keyed on the
         # WINDOW MEAN, never on the lifetime high-water.
         result.culprits.append("replicate_session_upsert_queue_backlog")
-
-    # --- worker distribution -------------------------------------------------
-    before_workers = before.get("workers", {}) or {}
-    after_workers = after.get("workers", {}) or {}
-    installs: Dict[str, int] = {}
-    for worker in sorted(set(before_workers) | set(after_workers), key=str):
-        delta = int(after_workers.get(worker, 0)) - int(before_workers.get(worker, 0))
-        if delta < 0:
-            result.verdict = INVALID
-            result.reasons.append(
-                f"worker {worker} new-flow install counter went backwards; "
-                "the helper restarted mid-window"
-            )
-            return result
-        installs[str(worker)] = delta
-    result.worker_installs = installs
-    total_installs = sum(installs.values())
-    result.active_workers = sum(1 for v in installs.values() if v > 0)
-    if total_installs > 0:
-        result.max_worker_share = max(installs.values()) / total_installs
 
     # --- things that bound BEFORE the install path did -----------------------
     # These downgrade to INCONCLUSIVE rather than INVALID: the run happened
@@ -658,7 +674,7 @@ def render(a: Analysis) -> str:
     for r in a.reasons:
         lines.append(f"  ! {r}")
     lines.append(f"window: {a.elapsed_s:.2f}s")
-    lines.append(f"new flows/sec (accepted pool allocations): {a.new_flows_per_sec:.0f}")
+    lines.append(f"new flows/sec (installed transit flows): {a.new_flows_per_sec:.0f}")
     if a.offered_flows_per_sec:
         lines.append(
             f"offered flows/sec: {a.offered_flows_per_sec:.0f} "

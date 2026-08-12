@@ -966,10 +966,13 @@ pub(super) fn publish_shared_session(
     entry: &SyncedSessionEntry,
 ) {
     // #4800: in test builds only, hold the shared side of the counter lock for
-    // the whole publish. This is where the publish-side mover set is DERIVED:
-    // moving `SHARED_SESSION_PUBLISHES` or either lock counter requires
-    // calling this function, so no caller can be forgotten the way a
-    // hand-maintained inventory was. See `afxdp::counter_test_lock`.
+    // the whole publish, so a reading test excludes this mover without the
+    // caller having to opt in — no caller can be forgotten the way a
+    // hand-maintained inventory was.
+    //
+    // NOT a closure proof: `SHARED_SESSION_PUBLISHES` and both lock counters
+    // are `pub(crate)` and a direct `fetch_add` from anywhere in the crate
+    // bypasses this entirely. See `afxdp::counter_test_lock`.
     #[cfg(test)]
     let _counter_guard = super::counter_test_lock::counter_mover_guard();
     // #4800: every new transit flow passes through here, so this counter is

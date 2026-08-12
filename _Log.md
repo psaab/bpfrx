@@ -70170,3 +70170,69 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
   docs/cos-validation-notes.md, _Log.md
+
+## 2026-08-12 — #4800 fold r3: Codex DO-NOT-MERGE, five blocking findings closed
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fold the Codex DO-NOT-MERGE round at `8c45cea3e`. Five of six
+  blocking findings closed; the sixth is partly refuted and partly outstanding
+  (below). Still instrumentation-only for packet handling.
+
+  **Correction first — the r2 "closed by construction" claim was wrong** and is
+  withdrawn in the code, not just here. The guarded atomics are `pub(crate)`
+  and any module can `fetch_add` one directly; `lock_recover_counting` accepts
+  an arbitrary counter; and per-binding `new_flow_installs` moves at
+  `poll_descriptor` outside both guarded functions and is not in the isolation
+  set at all. The real property is "every mover reachable through TODAY'S call
+  graph", a convention the compiler does not enforce. Corrected in
+  `counter_test_lock.rs` and in both mover-site comments that repeated it.
+
+  **B1** — `CounterExempt` auto-derived `Send`/`Sync` while owning thread-local
+  state. Now `!Send`/`!Sync` via `PhantomData<Rc<()>>`, with a compile-time
+  ambiguity assertion so losing the bound stops the build.
+
+  **B2** — the mover guards could not fire on their own removal: every
+  same-thread test holds the reader guard and every helper is exempt, so both
+  return `None`. The r2 evidence for that side was a 1-in-1500 flake rate,
+  which is not a binding. Added the missing shape — hold the reader, start a
+  NON-exempt mover, prove it stays blocked, release, prove it completes — made
+  deterministic by a new `movers_waiting()` counter of threads parked inside
+  the guard. A nap-and-check-a-flag version would pass under its own mutation.
+
+  **B3** — the harness fed the generator's ACHIEVED rate to `--offered-rate`,
+  so `accept_ratio = achieved/achieved ≈ 1` and the underdrive gate could not
+  fire arithmetically. Now passes the REQUESTED `$rate`; the generator report
+  is still parsed as a liveness check.
+
+  **B4** — the reported flow rate came from `pool.allocations_total`, taken
+  BEFORE pair admission and not decremented on rollback, so 100k SYNs with 90k
+  refused reported 100k flows/s. Now the summed per-worker `new_flow_installs`.
+
+  **B5** — `SESSION_REPLICATION_ENQUEUED` booked the whole fan-out before the
+  first acquisition, so a scrape during a blocked call reported 1/16 = 6.25%
+  contention (under the 10% threshold) when 100% of ATTEMPTED acquisitions had
+  blocked. Now incremented per sibling immediately before its acquisition;
+  at-rest totals and the fan-out ratio are unchanged.
+- **File(s)**: userspace-dp/src/afxdp/counter_test_lock.rs,
+  userspace-dp/src/afxdp/shared_ops.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/newflow_contention_tests.rs,
+  userspace-dp/src/afxdp/tests_txn_flow_cache.rs,
+  test/incus/newflow-ceiling-harness.sh,
+  test/incus/newflow_ceiling_analyze.py,
+  test/incus/newflow_ceiling_analyze_test.py, _Log.md
+- **Validation**: Four mutations run firsthand, each RED on an assertion.
+  Deleting the publish mover guard (statement form — the same text appears in a
+  doc comment, and substituting there mutates nothing) gives "no non-exempt
+  mover ever blocked on the counter guard within 10s ... publishes went 0 -> 1",
+  deadline-bounded so the revert fails rather than wedges. Restoring the
+  pre-booked fan-out gives "the denominator counted siblings that had not been
+  attempted yet: 3 enqueued against 1 attempted". Restoring
+  `allocations / elapsed` gives "10000.0 != 1000.0". The `!Send` bound REDs as
+  a compile error, which is the only possible red for a compile-time property.
+  `six_even_workers` was silently dropping the division remainder (199_998 for
+  a stated 200_000); fixed so the fixture sums to its own total rather than
+  loosening the two accept-ratio assertions it broke.
+  cargo `--release` all targets green (4271 unit); `go build ./...` 0;
+  `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0; 31 analyzer tests 0;
+  `bash -n` on the harness 0.
