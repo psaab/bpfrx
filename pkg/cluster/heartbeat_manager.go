@@ -58,6 +58,16 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	threshold := m.hbThreshold
 	m.mu.Unlock()
 
+	// #6169: kick this node's boot-epoch resolution. This MUST NOT BLOCK —
+	// StopHeartbeat() above has already torn the heartbeat down, so any wait
+	// here is a window with no frames going out at all, which a peer cannot
+	// tell apart from a dead node. An earlier revision waited up to 2s for the
+	// persisted value and measured 2.005s/2.012s/2.011s against a 500ms
+	// dead-peer threshold under a wedged store. It buys nothing now: the
+	// wall-clock epoch is published synchronously before any I/O, so the frame
+	// already carries one and persistence catches up off-path.
+	m.initHeartbeatEpochState()
+
 	// Select the UDP network from the control-link address family so a v6
 	// control link binds; v4 stays "udp4". net.JoinHostPort brackets a v6
 	// literal (fd00::1 -> [fd00::1]:port) — plain "%s:%d" would produce an
@@ -486,6 +496,20 @@ func (m *Manager) handlePeerNeverSeen() {
 }
 
 // HeartbeatStats returns current heartbeat counters.
+//
+// The SCOPES here differ, and reporting them off the same nil check was a
+// defect. Sent/Received/error counts belong to the goroutine currently
+// installed, so they are correctly gated on a live sender/receiver. The #6169
+// epoch state does NOT: the downgrade latch and its counters live on
+// Manager.hbAuth precisely so a heartbeat restart or a VRF rebind cannot reset
+// them (#5086/#6642), and the receiver merely holds a pointer to it.
+//
+// Gating them on `receiver != nil` therefore reported the latch as CLEAR during
+// every window in which no receiver is installed — StopHeartbeat, and the whole
+// bind-retry span of a failed RestartHeartbeat, which is up to ~5s of retries
+// and is exactly when an operator is looking at the status output. The
+// underlying state was armed the entire time. Read it from the Manager, which
+// owns it, so the report tracks the process state rather than the goroutine's.
 func (m *Manager) HeartbeatStats() HeartbeatStats {
 	m.mu.RLock()
 	sender := m.hbSender
@@ -501,6 +525,13 @@ func (m *Manager) HeartbeatStats() HeartbeatStats {
 		s.Received = receiver.received.Load()
 		s.RecvErrors = receiver.recvErrors.Load()
 	}
+	// Process-scoped, not receiver-scoped: valid with no receiver installed.
+	s.EpochlessAdmitted = m.hbAuth.epochlessAdmitted.Load()
+	s.EpochDowngradeRejected = m.hbAuth.epochDowngradeRejected.Load()
+	s.EpochOutOfBandRejected = m.hbAuth.epochOutOfBandRejected.Load()
+	s.EpochAheadOfClockRejected = m.hbAuth.epochAheadOfClockRejected.Load()
+	s.EpochSessionCollision = m.hbAuth.epochSessionCollision.Load()
+	s.PeerEpochLatched = m.hbAuth.peerEpochLatched()
 	return s
 }
 
@@ -510,4 +541,111 @@ type HeartbeatStats struct {
 	Received   uint64
 	SendErrors uint64
 	RecvErrors uint64
+
+	// EpochlessAdmitted counts authenticated heartbeats admitted WITHOUT a
+	// #6169 boot epoch, and EpochDowngradeRejected counts those refused because
+	// the peer had already proved it emits them.
+	//
+	// EpochlessAdmitted is the exposure meter. A frame with no epoch is
+	// governed by the bounded session ring alone, which is the mechanism that
+	// stops working past heartbeatReplaySessions captures — so a non-zero and
+	// still-climbing value after BOTH nodes are upgraded means either a node is
+	// still on a pre-#6169 build or someone is replaying pre-upgrade captures.
+	// Rotating the control-link PSK is what retires an attacker's archive; see
+	// "Operating the control-link PSK" in pkg/cluster/README.md. Without this
+	// counter that residual is invisible to an operator.
+	EpochlessAdmitted      uint64
+	EpochDowngradeRejected uint64
+
+	// EpochSessionCollision counts frames refused because they claimed the
+	// FLOOR epoch beyond the bound on how many sessions may be admitted at one
+	// epoch value (heartbeatAuthState.highEpochSessions,
+	// heartbeatEpochSessionsPerEpoch slots).
+	//
+	// It is the meter for the one case the floor's own value cannot order: two
+	// peer incarnations advertising the SAME epoch. Distinct sessions at one
+	// epoch are what let a replay churn the bounded ring, so past the bound they
+	// are refused — and a non-zero value says which of the two causes is in
+	// play.
+	//
+	// CLIMBING ALONGSIDE A PEER THAT KEEPS BEING DECLARED DEAD is a SENDER
+	// emitting one constant epoch across its own incarnations, and the first
+	// thing to check is a NON-WRITABLE /var on that node — a full filesystem, a
+	// quota, or a read-only remount. refineBootEpoch chains to persisted+1,
+	// which is a pure function of the file, so a store that READS but cannot
+	// WRITE hands every restart the identical value. `df` and a test write under
+	// /var/lib/xpf find it.
+	//
+	// IT TAKES THE FILE AS WELL AS THE STORE FAULT, and an earlier revision of
+	// this note said the clock was "irrelevant to this and usually perfectly
+	// correct". The chain only engages when `prev+1 > epoch`, and `epoch` is
+	// this incarnation's WALL-CLOCK seed, so an unwritable /var holding a value
+	// BEHIND the current clock changes nothing — each restart simply publishes
+	// its own, higher, seed. Measured on the fixture in
+	// TestEqualEpochSuccessorIsAdmitted_6669 at both polarities: a file 30
+	// minutes behind `now` gives two incarnations 1786141172292358650 and
+	// 1786141172295059255 (different), the same file 30 minutes AHEAD gives both
+	// 1786142972295695676 (equal). So the regime is an unwritable store holding a
+	// value at or above the wall-clock seed — an RTC that ran fast and was
+	// corrected back, or a clock that stepped backwards. Look at both, not just
+	// `df`. The degenerate third cause — a clock at or before the Unix epoch,
+	// which makes bootEpochSeed return the literal 1 for every incarnation — is
+	// worth checking only after the store is ruled out. Either way the sender
+	// recovers once its epoch can move again; see pkg/cluster/README.md.
+	//
+	// CLIMBING WHILE PEER LIVENESS IS STILL HEALTHY is an attacker replaying a
+	// captured set that shares an epoch. Read that as "not yet affected" rather
+	// than "harmless": an earlier revision of this note said liveness is
+	// UNAFFECTED, and it is not. Each replayed session spends one of the epoch
+	// value's slots, so the peer's NEXT restart at that same value finds the slot
+	// it needs already taken and is refused — the same lockout the first cause
+	// produces, deferred until the peer happens to restart. Investigate a
+	// climbing count even while the peer is up.
+	//
+	// Neither cause is visible in the other two counters: such a frame carries an
+	// epoch (so it is not EpochlessAdmitted) and is not a downgrade (so it is not
+	// EpochDowngradeRejected).
+	EpochSessionCollision uint64
+
+	// EpochOutOfBandRejected and EpochAheadOfClockRejected are the two epoch
+	// refusals that are NOT replays, split out so the operator action differs
+	// from the one "stale nonce (replay)" implies.
+	//
+	// A non-zero EpochOutOfBandRejected means the PEER is emitting an epoch of 0
+	// or past the year-2200 horizon. A conforming #6169 build cannot do that
+	// (refineBootEpoch declines to chain to such a value, clock-independently),
+	// so this points at the peer's state file or at the peer running something
+	// that is not this build — never at this node's clock.
+	//
+	// A non-zero EpochAheadOfClockRejected is a CLOCK fault and usually a
+	// perfectly healthy peer: its epoch is more than bootEpochMaxSkew (one hour)
+	// ahead of THIS node's clock, so either the peer runs fast or this node runs
+	// slow. Check NTP on both nodes. It gates only the RAISE path, so a peer
+	// already at the floor keeps being admitted — which is why this can climb
+	// while peer liveness stays healthy, and why reading it as an attack wastes
+	// an incident. It self-clears once the clocks agree; no restart is needed.
+	EpochOutOfBandRejected    uint64
+	EpochAheadOfClockRejected uint64
+
+	// PeerEpochLatched is the DOWNGRADE LATCH itself (heartbeatAuthState.
+	// epochSeen): an epoch-bearing frame has been accepted from this peer.
+	//
+	// THAT IS A FACT ABOUT THIS NODE'S STATE, NOT ABOUT WHAT IS ENFORCED, and an
+	// earlier revision of this comment said "so an epoch-less frame from it is
+	// refused from now on". admitAuthed does refuse one while this is
+	// true, but it is not the outermost gate: heartbeatAuthDecision
+	// short-circuits to dual-accept whenever no local control-link key is
+	// configured, and UpdateConfig clears controlAuthKey WITHOUT resetting
+	// hbAuth. So a latched node admits epoch-less frames unverified for as long
+	// as the key is absent. Renderers must report the fact — see
+	// epochlessExposureNote and peerEpochLatched.
+	//
+	// This is the state, not a proxy for it. EpochDowngradeRejected was used as
+	// one and is not equivalent: it only moves when a LATER epoch-less frame
+	// arrives and is refused, so between the frame that arms the latch and the
+	// next epoch-less frame — which may never come — the counter is still 0
+	// while the latch is armed. Reporting live exposure off the counter told
+	// the operator "replay protection is ring-only" at a moment when it was
+	// not. epochlessExposureNote reads this instead.
+	PeerEpochLatched bool
 }

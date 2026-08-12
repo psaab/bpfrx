@@ -16,6 +16,7 @@ import (
 // re-runs reload and surfaces the still-failing state; the third (now
 // succeeding) Apply activates and clears the debt.
 func TestApply_ReloadDebtRetriedAfterFailure(t *testing.T) {
+	resetReloadDebtForTest(t)
 	dir := t.TempDir()
 	m := NewInDir(dir)
 
@@ -78,6 +79,7 @@ func TestApply_ReloadDebtRetriedAfterFailure(t *testing.T) {
 // still returns nil) but must be retried on the next Apply even with unchanged
 // files, then cleared on success.
 func TestApply_ReconfigureDebtRetriedAfterFailure(t *testing.T) {
+	resetReloadDebtForTest(t)
 	dir := t.TempDir()
 	m := NewInDir(dir)
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -35,6 +36,99 @@ func natStaticPrefixInfo(addr string) (fam string, bits int, isHost, parsedIP bo
 		return fam, -1, false, true
 	}
 	return fam, n, n == max, true
+}
+
+// staticNATMatchAddrKey returns the INSTALL IDENTITY of a `match
+// destination-address` value: two values with the same key lower to a
+// byte-identical dataplane row, so a cardinality gate may count them once.
+//
+// #6673 fold. The gate over this leaf must count how many DISTINCT external
+// prefixes were authored; counting raw value slots invented a commit rejection
+// for a repeated identical prefix that origin/master accepted (dedupeValuesBy).
+// Exact-text dedupe alone would still reject `192.0.2.1` beside `192.0.2.1/32`,
+// which is the SAME host route written two ways — the same invented rejection,
+// one spelling over. So the key is the canonical form the dataplane itself
+// reduces the value to.
+//
+// The canonical form mirrors Rust parse_nat_prefix (static_nat.rs): a bare
+// address is a host route of the family's full width, and the base is MASKED to
+// the prefix length (`base = addr & !host_mask(len)`), which is why
+// `192.0.2.5/24` keys the same as `192.0.2.0/24`. That masking is what makes
+// collapsing SOUND rather than lenient: equal keys mean the rule translates
+// identically whichever spelling the compiler selects, so counting them once
+// cannot suppress a rejection that would have changed what installs. The #6659
+// rejection for GENUINELY distinct prefixes — where one of them really would
+// carry no translation — is untouched.
+//
+// A value that does not parse as an IP, or whose mask is malformed, has no
+// canonical form and keys on its raw text under a distinct prefix, so two
+// different malformed tokens never collapse into one and a malformed token can
+// never collide with a well-formed address. netip is used rather than net.IP
+// because net.IP folds IPv4-mapped IPv6 into IPv4 (#6327); natStaticPrefixInfo
+// supplies the family and width from the colon-strict natAddrFamily, so the two
+// agree on which width a 4-in-6 literal has.
+// staticNATMatchAddrKeyFor picks the install-identity key for a rule's `match
+// destination-address` values. The identity depends on the CONSUMER, and static
+// NAT and NPTv6 have different ones.
+//
+// #6673 fold. staticNATMatchAddrKey masks the value to its prefix length
+// because plain static NAT's consumer masks too (parse_nat_prefix in
+// userspace-dp/src/nat/static_nat.rs: `base = addr & !host_mask(len)`), so two
+// spellings that mask alike really do lower to a byte-identical row. NPTv6's
+// consumer does the OPPOSITE: parse_prefix in userspace-dp/src/nptv6.rs
+// documents "OR host bits are set beyond the prefix length (#4519 — fail
+// closed, do NOT mask)" and returns None. So for an NPTv6 rule
+// `2001:db8:1:2::/48` and `2001:db8:1::/48` mask alike but do NOT install
+// alike — one translates and one is rejected — and collapsing them let a value
+// with host bits ride along invisibly: the cardinality gate saw one prefix, the
+// per-address validator skips NPTv6 rules, and the NPTv6 validator reads only
+// the scalar rule.Match. Nothing rejected it and nothing installed it.
+//
+// Keying a host-bits value on its raw text restores the distinction, so the
+// #6659 cardinality gate fires on the pair. Every widened NPTv6 value is then
+// covered by SOME strict gate, which is the honest form of the claim: a value
+// DISTINCT from the selected one is rejected by the cardinality gate; a value
+// IDENTICAL to it is the selected value, which
+// validateNPTv6PrefixesStrict already checks (length, family, /48-or-/64,
+// host bits). No per-value NPTv6 validator is added or needed.
+func staticNATMatchAddrKeyFor(isNPTv6 bool) func(string) string {
+	if !isNPTv6 {
+		return staticNATMatchAddrKey
+	}
+	return nptv6MatchAddrKey
+}
+
+// nptv6MatchAddrKey is staticNATMatchAddrKey with masking withheld from any
+// value that actually carries host bits — the values NPTv6 refuses to install.
+// Two identical spellings still collapse (that is the invented-rejection fix
+// dedupeValuesBy exists for), and so do two masked-equal spellings that are both
+// already canonical; only a value the NPTv6 consumer would reject is kept
+// distinct from the one it accepts.
+func nptv6MatchAddrKey(v string) string {
+	if p, err := netip.ParsePrefix(v); err == nil && p.Masked() != p {
+		return "hostbits\x00" + v
+	}
+	return staticNATMatchAddrKey(v)
+}
+
+func staticNATMatchAddrKey(v string) string {
+	_, bits, _, parsedIP := natStaticPrefixInfo(v)
+	if !parsedIP || bits < 0 {
+		return "raw\x00" + v
+	}
+	ipPart := v
+	if slash := strings.IndexByte(v, '/'); slash >= 0 {
+		ipPart = v[:slash]
+	}
+	addr, err := netip.ParseAddr(ipPart)
+	if err != nil {
+		return "raw\x00" + v
+	}
+	p := netip.PrefixFrom(addr, bits)
+	if !p.IsValid() {
+		return "raw\x00" + v
+	}
+	return "ip\x00" + p.Masked().String()
 }
 
 // isStaticBlockPair reports whether (match, then) is a valid block-to-block
@@ -732,6 +826,64 @@ func compileNATStatic(node *Node, sec *SecurityConfig) error {
 				for _, m := range matchNode.Children {
 					switch m.Name() {
 					case "destination-address":
+						// #6659: read EVERY value, not just the first. The
+						// schema declares this leaf `multi: true`, so a bracket
+						// list collapses onto m.Keys[1:] (flat-set) or
+						// m.Children (hierarchical) exactly like the
+						// source-address sibling below. nodeVal kept only the
+						// first prefix, and the dropped ones ALSO escaped
+						// ValidateIPPrefix — a malformed prefix in any slot but
+						// the first committed clean.
+						//
+						// Match keeps LAST-SIBLING-WINS, which is what this
+						// compiler did before #6659 and what the tolerant load
+						// path still depends on. Do not "simplify" it to
+						// MatchAddresses[0].
+						//
+						// The two differ only for the REPEATED-set shape, which
+						// is precisely the shape that had no coverage. Two
+						// sibling `destination-address` nodes give
+						// MatchAddresses = [first, second]; nodeVal per child
+						// leaves Match = second, while MatchAddresses[0] leaves
+						// it = first. Measured end-to-end through
+						// buildStaticNATSnapshots via Store.Load +
+						// CompileConfigLenient, taking [0] flipped ExternalIP
+						// from 198.51.100.1/32 to 192.0.2.1/32 — the published
+						// service silently stops being translated and an
+						// address that was never a NAT target starts DNAT'ing.
+						// tree.Format() renders both lines verbatim, so the
+						// divergence round-trips through persistence.
+						//
+						// For the BRACKET shape the two agree (one node, values
+						// on Keys[1:]/Children), which is why every existing
+						// test stayed green.
+						//
+						// A genuinely multi-valued list is REJECTED at strict
+						// commit by validateStaticNATMatchAddressesStrict rather
+						// than silently collapsing — see MatchAddresses. The
+						// tolerant path has no such gate, so it must keep the
+						// historical selection.
+						//
+						// #6673: read the list with multiLeafAuthoredValues, NOT
+						// firewallMatchValues. The latter drops empty values while
+						// nodeVal selects them, so the scalar could hold a value
+						// the list did not contain: `destination-address
+						// 192.0.2.1/32` followed by `destination-address [ ]`
+						// left Match = "" (an inert rule, exactly as before
+						// #6659) with MatchAddresses = ["192.0.2.1/32"]. Every
+						// consumer of the list is a validator or a diagnostic
+						// that describes what installs, so a list that omits the
+						// installed value makes all of them wrong at once — the
+						// cardinality gate names a prefix that is not in effect,
+						// and the prefix loops "cover" a value that was never
+						// selected. multiLeafAuthoredValues guarantees
+						// MatchAddresses[0] == nodeVal(m) per statement, so the
+						// installed value is always present.
+						//
+						// Empty entries are not a second prefix: the gates count
+						// only non-empty values and the value loops skip them, so
+						// this changes no accept/reject outcome.
+						rule.MatchAddresses = append(rule.MatchAddresses, multiLeafAuthoredValues(m)...)
 						rule.Match = nodeVal(m)
 					case "source-address":
 						// #3435 (M02): support bracket / repeated lists
