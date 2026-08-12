@@ -729,11 +729,12 @@ struct PortAllocatorShared {
     /// form in which "is the NAT allocator the new-flow bottleneck?" has an
     /// answer: a raw acquisition rate says nothing without the denominator.
     ///
-    /// Counted by `lock_live()`, which try-locks first — the uncontended
-    /// path costs exactly one CAS, the same as `lock()` did, so this adds
-    /// nothing to the hot path when there is no contention. The contended
-    /// path pays one extra relaxed increment on top of a block that was
-    /// already going to happen.
+    /// Counted by `lock_live()`, which try-locks first — the LOCK on the
+    /// uncontended path costs exactly one CAS, the same as `lock()` did. It is
+    /// not free, though: the acquisition counter is bumped unconditionally, so
+    /// an uncontended acquisition is 2 relaxed atomic RMWs where it used to be
+    /// 1. The contended path pays one further relaxed increment on top of a
+    /// block that was already going to happen.
     ///
     /// Deliberately NOT counted: `snapshot()` (the ~1s status poll that
     /// READS these counters — the observer must not appear in its own

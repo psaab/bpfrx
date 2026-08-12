@@ -70236,3 +70236,55 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   cargo `--release` all targets green (4271 unit); `go build ./...` 0;
   `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0; 31 analyzer tests 0;
   `bash -n` on the harness 0.
+
+## 2026-08-12 — #4800 fold r4: the remaining B6 seams + four false comments
+
+- **Timestamp**: 2026-08-12
+- **Action**: Close the highest-value part of Codex's B6 (telemetry seams
+  removable or misspellable with every test green) and the four leftover
+  inaccurate comments. One B6 sub-item was REFUTED in r3 and is not revisited.
+
+  **Cross-language wire seam (JSON tags).** The Go tags must match the Rust
+  serde names, and nothing enforced it: the Rust fixture test is Rust->Rust and
+  the Go tests hand-BUILD their status structs. A rename on either side left
+  both suites green while the field decoded as zero. New Go test decodes a
+  payload that is JSON TEXT written by hand as the helper emits it — NOT a
+  marshalled Go struct, because marshal-then-unmarshal is symmetric under a
+  rename by construction and proves only that Go agrees with itself (the
+  failure mode PR #6938 shipped). Every value distinct, so a cross-wiring
+  cannot hide behind a shared number.
+
+  **Metric-name seam.** The emit tests match on DESCRIPTOR POINTER, which is
+  the right choice there and exactly why they cannot see a rename. New test
+  pins all 11 `#4800` names, matching on `fqName: "..."` rather than a bare
+  substring because `Desc.String()` also embeds HELP text.
+
+  **Four false comments.** `nat/allocator.rs` carried a second copy of the
+  "adds nothing to the hot path" overstatement (the acquisition counter is
+  unconditional: 2 RMWs, not 1). `newflow-gen/src/main.rs` claimed "the
+  harness asserts that identity" for
+  `attempted == established + refused + timed_out + other_errors` — the
+  harness never reads `attempted` at all, it reads only
+  `established_per_sec`. Two in `docs/userspace-newflow-ceiling.md` described
+  the accept ratio as being against the generator's ACHIEVED rate, which is
+  the B3 defect stated as if it were the design.
+- **File(s)**: pkg/dataplane/userspace/protocol_wire_newflow_4800_test.go
+  (new), pkg/api/metrics_newflow_names_4800_test.go (new),
+  userspace-dp/src/nat/allocator.rs, test/incus/newflow-gen/src/main.rs,
+  docs/userspace-newflow-ceiling.md, _Log.md
+- **Validation**: Two mutations run firsthand. Renaming three Go JSON tags
+  away from the Rust names (`session_replication_enqueued_total`,
+  `new_flow_installs`, `live_lock_contended_total`) REDs the decode test on
+  all three, each naming itself — e.g. "session_replication_enqueued_total
+  decoded as 0, want 1031". Misspelling two metric names REDs the name test on
+  both, and — the negative control that shows the seam was real — the
+  pointer-matched emit tests stayed GREEN (`ok`) under the SAME mutation.
+  `go build ./...` 0; `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0;
+  `cargo build --release` 0; newflow-gen cargo tests 13 passed.
+
+  STILL OPEN, not claimed: the sole live refresh call at
+  `worker/loop_body/mod.rs:481`. Nothing drives `loop_body` in any test today
+  (it is referenced only from `worker/mod.rs` and two READMEs), so binding it
+  needs a worker-loop harness rather than an assertion — a piece of work in
+  its own right, and a source-level canary would assert presence, not
+  reachability.

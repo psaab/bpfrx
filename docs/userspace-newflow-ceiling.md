@@ -153,7 +153,7 @@ gates were skipped. When adding a gate, add its input to
 "the gate does not run", the gate fails open.
 
 `INCONCLUSIVE`: pool port exhaustion (a capacity ceiling, not a lock one);
-accepted flows below 95% of the generator's own achieved rate (the generator,
+accepted flows below 95% of the REQUESTED rate (the generator,
 client NIC or target bound first); fewer than 3 of the 6 RX queues carrying
 installs (RSS-distribution-limited); or one worker taking >60% of installs
 (single-core-bound, not cross-worker-lock-bound).
@@ -181,8 +181,12 @@ dataplane builds).
   the rate sweep so peak occupancy stays well under `max_sessions`.
 * **It is a blocking-connect thread pool**, therefore bounded by thread count
   and RTT rather than by the firewall. This is declared, not hidden: the
-  generator reports its own achieved rate and the analyzer marks a cell
-  INCONCLUSIVE when accepted flows fall short. A generator ceiling shows up
+  analyzer compares installed flows against the REQUESTED rate and marks a
+  cell INCONCLUSIVE when they fall short — so a generator that cannot reach
+  the requested rate refuses the cell instead of passing its own ceiling off
+  as the firewall's. (Comparing against the generator's ACHIEVED rate, which
+  the harness did until #6927 r3, makes that ratio ~1 by construction and
+  disables the check entirely.) A generator ceiling shows up
   as a refusal to conclude. Raise `--threads`, or drive from more than one
   client host.
 
@@ -238,9 +242,12 @@ Per cell, under `artifacts/newflow-ceiling/<UTC>/rate-<N>/`:
 4. `active_workers >= 3` and `max_worker_share <= 0.60` (proving the
    cross-worker path was genuinely exercised).
 5. `replication_fanout` reads back as the real sibling worker count.
-6. `accept_ratio >= 0.95` against the generator's own achieved rate.
+6. `accept_ratio >= 0.95` against the REQUESTED rate (not the achieved one —
+   achieved/achieved is ~1 by construction and gates nothing).
 7. `generator.json` accounts for every attempt:
-   `attempted == established + refused + timed_out + other_errors`.
+   `attempted == established + refused + timed_out + other_errors`. Check this
+   BY HAND — the harness does not assert it, it reads only
+   `established_per_sec`.
 
 **The ceiling** is the highest cell that came back `VALID` and unsaturated,
 followed by a higher cell that came back `VALID` and saturated. A sweep with

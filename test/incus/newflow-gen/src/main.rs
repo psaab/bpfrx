@@ -83,8 +83,14 @@ struct SinkConfig {
 }
 
 /// Cumulative outcome counters. Every attempt lands in exactly one bucket, so
-/// `attempted == established + refused + timed_out + other_errors`; the
-/// harness asserts that identity rather than trusting a single number.
+/// `attempted == established + refused + timed_out + other_errors` holds by
+/// construction here.
+///
+/// NOTHING CHECKS IT. An earlier version of this comment said "the harness
+/// asserts that identity"; the harness never reads `attempted` at all — it
+/// reads only `established_per_sec`, as a liveness check. The identity is a
+/// property of this file, not a verified cross-check, and saying otherwise
+/// invited a reader to trust a gate that does not exist.
 #[derive(Default)]
 struct Counters {
     attempted: AtomicU64,
