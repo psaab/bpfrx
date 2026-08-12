@@ -319,11 +319,16 @@ func TestSyslogSelectorTokenAcceptsJunosVocabulary_5797(t *testing.T) {
 // everything outside it can alter the line's structure.
 func TestSyslogSelectorTokenIsAShapeNotAList_5797(t *testing.T) {
 	const accepted = syslogSelectorAcceptedAtomBytes
+	const lead = syslogSelectorAcceptedLeadBytes
 
 	// The ATOM: one facility name, or one priority name. No positional syntax.
 	for b := 0; b < 256; b++ {
 		tok := string([]byte{byte(b)})
-		want := strings.ContainsRune(accepted, rune(b))
+		// A ONE-BYTE atom is entirely its own first byte, so the LEAD class
+		// applies, not the interior class. #6829 B1: the hyphen is the one byte
+		// where the two differ, and using the interior class here is what let
+		// the bare `-` through.
+		want := syslogSelectorAtomLeadByte(b)
 		if got := syslogSelectorAtomSafe(tok); got != want {
 			if want {
 				t.Errorf("atom byte %#x (%q) rejected: the belt is a membership test, not a shape "+
@@ -342,7 +347,8 @@ func TestSyslogSelectorTokenIsAShapeNotAList_5797(t *testing.T) {
 	// admitted.
 	for b := 0; b < 256; b++ {
 		tok := string([]byte{byte(b)})
-		want := strings.ContainsRune(accepted, rune(b)) || b == '*'
+		// Offset 0 again: a single-byte token is a single-byte atom.
+		want := syslogSelectorAtomLeadByte(b) || b == '*'
 		if got := syslogSelectorFacilitySafe(tok); got != want {
 			t.Errorf("facility byte %#x (%q) = %v, want %v — the facility position accepts the "+
 				"atom class plus the whole-token `*` wildcard, and nothing else", b, tok, got, want)
@@ -360,7 +366,13 @@ func TestSyslogSelectorTokenIsAShapeNotAList_5797(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		n := 1 + rng.Intn(24)
 		var sb strings.Builder
-		for j := 0; j < n; j++ {
+		// The FIRST byte is drawn from the lead class and the rest from the
+		// interior class, so the corpus is safe-shaped under the real belt
+		// rather than under a position-blind approximation of it. Drawing the
+		// head from the interior class would generate `-foo`, which the belt
+		// correctly rejects — the generator would be manufacturing failures.
+		sb.WriteByte(lead[rng.Intn(len(lead))])
+		for j := 1; j < n; j++ {
 			sb.WriteByte(accepted[rng.Intn(len(accepted))])
 		}
 		tok := sb.String()
@@ -419,17 +431,38 @@ func TestSyslogSelectorTokenSpaceIsUnsafe_5797(t *testing.T) {
 	}
 }
 
-// syslogSelectorAcceptedAtomBytes is the ATOM accept class the belt implements:
-// [A-Za-z0-9-]. It is stated once because two independently written copies of a
-// security decision disagree silently until somebody widens one of them.
+// syslogSelectorAcceptedAtomBytes is the accept class for a byte INSIDE an
+// atom: [A-Za-z0-9-]. It is stated once because two independently written
+// copies of a security decision disagree silently until somebody widens one of
+// them.
 const syslogSelectorAcceptedAtomBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
 
-// syslogSelectorAtomByte reports whether byte b is in the atom accept class.
+// syslogSelectorAcceptedLeadBytes is the accept class for the FIRST byte of an
+// atom: [A-Za-z0-9], i.e. the interior class MINUS the hyphen.
+//
+// #6829 B1: the two classes are not the same, and treating them as one is what
+// let `-host` through. A leading hyphen makes the rendered line a legacy
+// sysklogd/rsyslog HOSTNAME-FILTER directive rather than a facility selector,
+// which re-scopes every selector after it — a construct substitution, not a
+// cosmetic byte. Interior hyphens stay legal (`interactive-commands`).
+const syslogSelectorAcceptedLeadBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+// syslogSelectorAtomByte reports whether byte b is accepted at a NON-LEADING
+// offset of an atom. syslogSelectorAtomLeadByte is its offset-0 counterpart.
+//
 // The exhaustive scans below express their expected partition as a function of
-// it plus the positional syntax legal at that exact offset, so each scan pins
-// the FULL accept/reject split rather than "some bytes are rejected".
+// whichever of the two applies at that exact offset, plus the positional syntax
+// legal there, so each scan pins the FULL accept/reject split rather than "some
+// bytes are rejected". Picking the wrong one of the pair is the mistake that
+// makes a scan assert the belt is MORE permissive than it is.
 func syslogSelectorAtomByte(b int) bool {
 	return strings.ContainsRune(syslogSelectorAcceptedAtomBytes, rune(b))
+}
+
+// syslogSelectorAtomLeadByte reports whether byte b is accepted as the FIRST
+// byte of an atom.
+func syslogSelectorAtomLeadByte(b int) bool {
+	return strings.ContainsRune(syslogSelectorAcceptedLeadBytes, rune(b))
 }
 
 // TestSyslogSelectorSeverityModifierSuffixExhaustive_6829 closes the half of
@@ -475,7 +508,9 @@ func TestSyslogSelectorSeverityModifierSuffixExhaustive_6829(t *testing.T) {
 				// coincidence: at prefix `!` and b == '=' the token is the bare
 				// `!=`, whose suffix is empty — and `=` is outside the atom
 				// class, so the same expression already predicts the rejection.
-				want := syslogSelectorAtomByte(b) || b == '*'
+				// The suffix is the whole priority, so its first byte is an
+				// atom's offset 0 — the LEAD class, not the interior one.
+				want := syslogSelectorAtomLeadByte(b) || b == '*'
 				if got := syslogSelectorSeveritySafe(tok); got != want {
 					if want {
 						t.Errorf("severity %q = false, want true: byte %#x is a legal priority "+
@@ -567,8 +602,10 @@ func TestSyslogSelectorFacilityListMemberExhaustive_6829(t *testing.T) {
 			for b := 0; b < 256; b++ {
 				tok := p.render(string([]byte{byte(b)}))
 				// A member is an atom and nothing else. `*` does not get in
-				// here, and `,` produces an empty member on both sides.
-				want := syslogSelectorAtomByte(b)
+				// here, and `,` produces an empty member on both sides. The byte
+				// is the WHOLE member, so it sits at offset 0 and the LEAD class
+				// applies.
+				want := syslogSelectorAtomLeadByte(b)
 				if got := syslogSelectorFacilitySafe(tok); got != want {
 					if want {
 						t.Errorf("facility %q = false, want true: byte %#x is a one-character "+

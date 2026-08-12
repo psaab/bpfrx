@@ -874,9 +874,116 @@ func TestApplySyslogConfigSecurityStreamWarnsOnUnmappedFacility_6829(t *testing.
 		}
 	})
 
-	t.Run("wildcard any stays quiet", func(t *testing.T) {
-		if got, _ := apply(t, "any"); strings.Contains(got, "unmapped facility name") {
-			t.Errorf("`any` names no facility on purpose; warning about it is false. captured:\n%s", got)
+	// #6829 B2: `any` must WARN on a security stream, and this subtest asserted
+	// the opposite. The suppression it pinned was borrowed from the system-syslog
+	// host/file/user surface, whose facility key is an open-ended schema wildcard
+	// and where `host <ip> any <sev>` really is the canonical Junos form. A
+	// security stream is a different surface: its facility is
+	// ValidateEnum(syslogFacilities) — auth/change-log/daemon/kern/local0-7/
+	// syslog/user — with no `any`, and the stream carries a NUMERIC facility, so
+	// there is no wildcard for `any` to denote.
+	//
+	// Because the enum forbids it, `any` cannot arrive by strict commit at all;
+	// it arrives only through the tolerant paths (configstore.Store downgrades
+	// the gate on Load and SyncApply). Those are precisely the paths this
+	// diagnostic exists for, so suppressing there silenced it on its whole
+	// population. TestApplySystemSyslogWildcardFacilityDoesNotWarn_6829 keeps the
+	// HOST surface quiet and is the control for this inversion.
+	t.Run("wildcard any warns on a security stream", func(t *testing.T) {
+		got, _ := apply(t, "any")
+		if !strings.Contains(got, "unmapped facility name") {
+			t.Errorf("`any` on a SECURITY STREAM did not warn. The enum has no `any`, so this "+
+				"reached the stream through a tolerant load or a peer sync and was mapped to "+
+				"local0 in silence — the exact substitution this diagnostic exists to "+
+				"report. captured:\n%s", got)
 		}
 	})
+}
+
+// TestSyslogRenderRejectsLeadingHyphenSelector_6829 is the fail-on-revert guard
+// for #6829 B1, driven through the real render site rather than the predicate.
+//
+// THE VECTOR. `syslogSelectorAtomSafe` admitted `-` at every offset, so a
+// facility of `-host` rendered a drop-in whose first line is
+// `-host.info<TAB>/var/log/d`. In legacy sysklogd / rsyslog syntax a token
+// beginning `-` at the start of a line is not a facility selector at all — it
+// is a HOSTNAME-FILTER directive, and it re-scopes every selector that follows
+// it until the next such directive. So the byte does not merely appear in the
+// output; it changes what the surrounding configuration MEANS. That is the
+// construct substitution this belt exists to prevent, and it is reachable
+// through the schema's unvalidated wildcard facility KEY (same chain as
+// TestSyslogRenderUnsafeFacilityIsCommitReachable_5797).
+//
+// The bare `-` is the same defect with nothing after it.
+//
+// RED-on-revert: delete the leading-byte guard at the top of
+// syslogSelectorAtomSafe (`if c := atom[0]; !(c >= 'a' ...)`), or move it to
+// only one of the two call sites.
+func TestSyslogRenderRejectsLeadingHyphenSelector_6829(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		facility, severity string
+	}{
+		{"hostname-filter facility", "-host", "info"},
+		{"bare hyphen facility", "-", "info"},
+		{"hostname-filter as a list member", "auth,-host", "info"},
+		{"hostname-filter severity", "daemon", "-crit"},
+		{"bare hyphen severity", "daemon", "-"},
+		{"hyphen behind a severity modifier", "daemon", "=-crit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := syslogCfg([]*config.SyslogFileConfig{
+				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+			}, nil)
+			body, ok := renderedFor(cfg, renderPrefix+"d.conf")
+			if ok {
+				t.Fatalf("facility=%q severity=%q RENDERED a managed drop-in:\n%s\n"+
+					"A selector atom beginning with `-` is a sysklogd/rsyslog hostname-filter "+
+					"directive, not a facility — it re-scopes every selector after it. The "+
+					"belt must refuse it before it reaches the file (#6829 B1).",
+					tc.facility, tc.severity, body)
+			}
+		})
+	}
+}
+
+// TestSyslogRenderKeepsInteriorHyphens_6829 is the over-reach control for the
+// guard above, and it is a SEPARATE test on purpose: sharing a body with the
+// binder would put it behind that body's t.Fatalf, where it could never be
+// observed running under the mutation it exists to bound.
+//
+// The leading-byte guard must not become "reject any hyphen". Every row here is
+// a real Junos facility spelling or a real rsyslog priority, all of which
+// rendered working drop-ins before the guard and must still render. These stay
+// GREEN when the guard is deleted — that contrast is what makes them a control
+// rather than a restatement of the fix.
+func TestSyslogRenderKeepsInteriorHyphens_6829(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		facility, severity string
+		want               string
+	}{
+		{"interior hyphen facility", "interactive-commands", "notice",
+			"interactive-commands.notice\t/var/log/d\n"},
+		{"trailing hyphen facility", "daemon-", "info", "daemon-.info\t/var/log/d\n"},
+		{"interior hyphen in a list member", "auth,interactive-commands", "info",
+			"auth,interactive-commands.info\t/var/log/d\n"},
+		{"change-log remap still fires", "change-log", "warning", "local6.warning\t/var/log/d\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := syslogCfg([]*config.SyslogFileConfig{
+				{Name: "d", Facility: tc.facility, Severity: tc.severity},
+			}, nil)
+			body, ok := renderedFor(cfg, renderPrefix+"d.conf")
+			if !ok {
+				t.Fatalf("facility=%q severity=%q did NOT render. The #6829 B1 guard constrains "+
+					"the FIRST byte of an atom only; an interior or trailing hyphen is ordinary "+
+					"configuration and rejecting it deletes a working destination on upgrade.",
+					tc.facility, tc.severity)
+			}
+			if want := "# Managed by xpf — do not edit\n" + tc.want; body != want {
+				t.Errorf("rendered drop-in = %q, want %q", body, want)
+			}
+		})
+	}
 }

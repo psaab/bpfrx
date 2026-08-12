@@ -170,10 +170,27 @@ func TestBuildSyslogClientsWarnsOnUnmappedFacility_6829(t *testing.T) {
 		}
 	})
 
-	t.Run("wildcard any stays quiet", func(t *testing.T) {
-		if got, _ := build(t, "any"); strings.Contains(got, "unmapped facility name") {
-			t.Errorf("`any` names no facility on purpose, so warning about it is false — and "+
-				"`host <ip> any <sev>` is the canonical Junos form. captured:\n%s", got)
+	// #6829 B2: `any` must WARN on a security stream, and this subtest asserted
+	// the opposite. The suppression it pinned was borrowed from the system-syslog
+	// host/file/user surface, whose facility key is an open-ended schema wildcard
+	// and where `host <ip> any <sev>` really is the canonical Junos form. A
+	// security stream is a different surface: its facility is
+	// ValidateEnum(syslogFacilities) — auth/change-log/daemon/kern/local0-7/
+	// syslog/user — with no `any`, and the stream carries a NUMERIC facility, so
+	// there is no wildcard for `any` to denote.
+	//
+	// Because the enum forbids it, `any` cannot arrive by strict commit at all;
+	// it arrives only through the tolerant paths (configstore.Store downgrades
+	// the gate on Load and SyncApply). Those are precisely the paths this
+	// diagnostic exists for, so suppressing there silenced it on its whole
+	// population. TestApplySystemSyslogWildcardFacilityDoesNotWarn_6829 keeps the
+	// HOST surface quiet and is the control for this inversion.
+	t.Run("wildcard any warns on a security stream", func(t *testing.T) {
+		got, _ := build(t, "any")
+		if !strings.Contains(got, "unmapped facility name") {
+			t.Errorf("`any` on a SECURITY STREAM did not warn. `host <ip> any <sev>` is the "+
+				"canonical Junos form on the SYSTEM-SYSLOG surface, not this one; here the "+
+				"name is not in the enum and is silently mapped to local0. captured:\n%s", got)
 		}
 	})
 }

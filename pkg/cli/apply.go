@@ -160,7 +160,23 @@ func buildSyslogClients(cfg *config.Config) []*logging.SyslogClient {
 			// Untold, every record on this stream leaves under local0 while
 			// `show system syslog` still reports the authored name.
 			f, known := logging.ParseFacilityChecked(stream.Facility)
-			if !known && !logging.FacilityIsWildcard(stream.Facility) {
+			// #6829 B2: NO wildcard suppression on this surface. `any` is the
+			// Junos "all facilities" spelling on the system-syslog
+			// host/file/user surface, whose facility key is an OPEN-ENDED
+			// schema wildcard — and this is not that surface. A security
+			// stream's facility is ValidateEnum(syslogFacilities), which lists
+			// auth/change-log/daemon/kern/local0-7/syslog/user and does NOT
+			// include `any`; the stream carries a numeric facility, so there is
+			// no wildcard for `any` to mean here.
+			//
+			// Suppressing on it therefore silenced the diagnostic on exactly
+			// the population it was built for: `any` cannot arrive by strict
+			// commit, so it arrives only via the TOLERANT paths
+			// (configstore.Store's Load/SyncApply downgrade), and there it is
+			// mapped to local0 with no warning at all — the silence this PR
+			// exists to remove, reinstated by a helper borrowed from the other
+			// surface.
+			if !known {
 				slog.Warn("security log: unmapped facility name; local0 selected — if this "+
 					"stream's client is installed, its records will carry a facility the "+
 					"configuration does not name (#5797)",

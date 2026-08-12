@@ -151,7 +151,23 @@ func (d *Daemon) applySyslogConfig(er *logging.EventReader, cfg *config.Config) 
 			// Untold, every record on this stream leaves under local0 while
 			// `show system syslog` still reports the authored name.
 			f, known := logging.ParseFacilityChecked(stream.Facility)
-			if !known && !logging.FacilityIsWildcard(stream.Facility) {
+			// #6829 B2: NO wildcard suppression on this surface. `any` is the
+			// Junos "all facilities" spelling on the system-syslog
+			// host/file/user surface, whose facility key is an OPEN-ENDED
+			// schema wildcard — and this is not that surface. A security
+			// stream's facility is ValidateEnum(syslogFacilities), which lists
+			// auth/change-log/daemon/kern/local0-7/syslog/user and does NOT
+			// include `any`; the stream carries a numeric facility, so there is
+			// no wildcard for `any` to mean here.
+			//
+			// Suppressing on it therefore silenced the diagnostic on exactly
+			// the population it was built for: `any` cannot arrive by strict
+			// commit, so it arrives only via the TOLERANT paths
+			// (configstore.Store's Load/SyncApply downgrade), and there it is
+			// mapped to local0 with no warning at all — the silence this PR
+			// exists to remove, reinstated by a helper borrowed from the other
+			// surface.
+			if !known {
 				slog.Warn("security log: unmapped facility name; local0 selected — if this "+
 					"stream's client is installed, its records will carry a facility the "+
 					"configuration does not name (#5797)",
@@ -2101,6 +2117,29 @@ func syslogSelectorAtomSafe(atom string) bool {
 	// and start admitting the space — the guard would look intact and stop
 	// guarding anything. TestSyslogSelectorTokenSpaceIsUnsafe_5797 fails on
 	// exactly that edit. #5797.
+	// #6829 B1: the hyphen is legal INSIDE an atom and never at its head.
+	//
+	// `case c == '-'` with no position guard accepted `-host` and the bare `-`.
+	// A facility of `-host` renders as a line beginning `-host.info<TAB>/path`,
+	// and in legacy sysklogd/rsyslog syntax a leading `-hostname` is a
+	// HOSTNAME-FILTER directive, not a facility selector: it scopes every
+	// selector that follows it until the next such directive. So the byte does
+	// not merely appear in the line, it changes what the following lines MEAN —
+	// which is exactly the construct substitution this belt exists to prevent,
+	// reached through the schema's unvalidated wildcard facility key.
+	//
+	// Guarding here rather than at the two callers is deliberate: both
+	// syslogSelectorFacilitySafe (per comma-separated atom) and
+	// syslogSelectorSeveritySafe (on the remainder after modifier stripping)
+	// hand this function one atom, so the precondition is a property of an
+	// ATOM and belongs with the atom. A caller-side guard is one a future
+	// third caller has to remember.
+	//
+	// Internal hyphens stay legal — `interactive-commands` is a real Junos
+	// facility and a real rendered selector.
+	if c := atom[0]; !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') {
+		return false
+	}
 	for i := 0; i < len(atom); i++ {
 		c := atom[i]
 		switch {
