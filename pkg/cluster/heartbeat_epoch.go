@@ -1035,13 +1035,23 @@ func (m *Manager) startBootEpochRefine(ready chan struct{}) {
 		// bootEpochWorker is nil straight after it returns (see the retirement
 		// assertion in TestThirdRequestCoalescesOntoTheLateReclaim_6669).
 		//
-		// Swapping them does not fail any test — measured, 219 passes, 0
-		// failures — because the window it opens is a couple of instructions and
-		// an observer has to land inside it. Closing it mechanically would need
-		// a seam BETWEEN these two lines, which is production surface bought for
-		// a hazard that this comment and the one at the assertion already
-		// address. So it is bound by comment on both ends rather than by a test,
-		// deliberately, and that is the reason not to reorder them.
+		// Swapping them does not fail any test, because the window it opens is
+		// a couple of instructions and an observer has to land inside it.
+		// Closing it mechanically would need a seam BETWEEN these two lines,
+		// which is production surface bought for a hazard that this comment and
+		// the one at the assertion already address. So it is bound by comment on
+		// both ends rather than by a test, deliberately, and that is the reason
+		// not to reorder them.
+		//
+		// RE-MEASURED at 50698ade7 (#6669 r18): `go test -count=1 -v
+		// ./pkg/cluster/` with the two statements swapped reports 584 top-level
+		// PASS / 732 including subtests, 0 failures. An earlier revision of this
+		// comment recorded "219 passes, 0 failures"; that number was taken when
+		// the package was a third of its current size, so it had stopped
+		// describing any run a reader could reproduce while still reading as a
+		// live measurement. A COUNT in a comment goes stale as the guarded
+		// surface grows — the reproducible part is the command and the SHA, so
+		// re-measure rather than trusting the digits.
 		defer func() {
 			m.bootEpochWorker.CompareAndSwap(worker, nil)
 			close(worker.done)

@@ -71969,3 +71969,27 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/cluster/heartbeat.go,
   pkg/cluster/heartbeat_reject_warn_rate_6669_test.go (new),
   pkg/cluster/README.md, _Log.md
+
+## 2026-08-12 — #6669 r18: refresh the stale measurement in the worker-ordering disclosure
+
+- **Timestamp**: 2026-08-12
+- **Action**: The accepted-residual disclosure at `heartbeat_epoch.go`'s worker
+  retirement recorded "measured, 219 passes, 0 failures" for the
+  `CompareAndSwap`/`close(done)` swap. Re-measuring at 50698ade7 gives **584
+  top-level PASS / 732 including subtests, 0 failures** — the package has grown
+  roughly threefold since that number was taken, so the digits had stopped
+  describing any run a reader could reproduce while still reading as a live
+  measurement. That is the same defect class as the stale M2 cell in
+  `ae56bebe4` which 0d8d7e3a8 corrected: a measurement note goes stale as the
+  surface it measures grows.
+
+  The residual itself is unchanged and remains accepted — the swap fails no
+  test, the seam that would close it is production surface not worth buying,
+  and the comment says so. What changed is that the note now carries the
+  COMMAND and the SHA (the reproducible parts) and states explicitly that a
+  count in a comment is a snapshot to re-measure rather than digits to trust.
+
+  Measured with the swap applied, then restored from backup BEFORE the result
+  was inspected, so an early exit on a failing leg could not skip the restore.
+  `git status` clean afterwards.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, _Log.md
