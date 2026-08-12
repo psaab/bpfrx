@@ -478,6 +478,15 @@ pub(crate) fn worker_loop(
                 }
                 refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);
                 // #4800: per-worker transit new-flow install count.
+                //
+                // NOT REACHABILITY-BOUND (#6971). The callee is covered by
+                // `refresh_worker_new_flow_install_counters_sums_across_bindings`,
+                // but nothing drives `worker_loop` in any test, so deleting
+                // THIS LINE leaves the whole suite green while the wire field
+                // pins at 0 and both #4800 cross-worker analyzer gates
+                // (`active_workers < 3`, `max_worker_share > 0.60`) silently
+                // stop discriminating. The `refresh_worker_cos_queue_lease_*`
+                // call above it has the same gap; one harness binds both.
                 refresh_worker_new_flow_install_counters(&mut wr_counters, &bindings);
                 wr_counters.session_table_entries = sessions.len() as u64;
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
