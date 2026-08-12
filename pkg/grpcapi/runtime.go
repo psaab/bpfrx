@@ -90,3 +90,33 @@ func (s *Server) dpProbe() any {
 	}
 	return dataplane.Unwrap(s.dp)
 }
+
+// backendSessionCount and backendMapStats read the mandatory management
+// surface off an ALREADY-RESOLVED backend (Codex PR #6743 r7-F3).
+//
+// The buffer renders in server_show_system.go take exactly one
+// dataplane.Unwrap and must not take another: calling s.dp.SessionCount()
+// or s.dp.GetMapStats() there would each be a fresh cell load, and a
+// setDataplane(nil) landing between the publication check and the map read
+// made the render print "No BPF maps available" — a claim about a LOADED
+// backend's maps — for a daemon that had just lost its backend. Asserting
+// off the single resolution keeps the whole render describing one instant.
+//
+// Both narrow interfaces are part of grpcDataPlane, so every value that can
+// be stored in Server.dp satisfies them; the ok=false arms are the
+// forward-compatibility answer for a future backend that does not.
+func backendSessionCount(backend any) (v4, v6 int) {
+	c, ok := backend.(interface{ SessionCount() (int, int) })
+	if !ok {
+		return 0, 0
+	}
+	return c.SessionCount()
+}
+
+func backendMapStats(backend any) []dataplane.MapStats {
+	m, ok := backend.(interface{ GetMapStats() []dataplane.MapStats })
+	if !ok {
+		return nil
+	}
+	return m.GetMapStats()
+}

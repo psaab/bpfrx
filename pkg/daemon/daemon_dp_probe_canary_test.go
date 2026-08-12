@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,48 +29,122 @@ import (
 // indirection, whose method set is exactly the mandatory surface, so the
 // assertion answers "absent" for a healthy backend that has T.
 //
-// SCOPE — the EXACT spellings covered (Codex PR #6743 r7-F3; do not read
-// this as a completeness fence, it is not one):
+// SCOPE — the EXACT spellings covered (Codex PR #6743 r7-F3). This is a
+// fence against a handful of SPELLINGS of one mistake. It is not a
+// completeness fence, and calling it one is what made the r6 comment
+// misleading. Covered:
 //
-//  1. a type assertion on a `.dp` selector — `x.dp.(T)`;
+//  1. a type assertion on a `.dp` selector — `x.dp.(T)`, including any
+//     number of parenthesization / dereference layers: `(x.dp).(T)`,
+//     `((x.dp)).(T)`, `(*p).dp.(T)`;
 //  2. a type SWITCH on the same — `switch x.dp.(type)`;
 //  3. either of those on a local bound DIRECTLY from the field in the same
-//     function — `d := s.dp; ...; d.(T)`.
+//     function — `d := s.dp; ...; d.(T)`, `var d = s.dp`, `d := &s.dp;
+//     (*d).(T)`.
 //
-// Everything else passes clean, by construction. In particular:
+// Everything else passes clean, by construction:
 //
 //   - a helper that returns `s.dp` as `any`, and an assertion on ITS
 //     result;
+//   - a closure — `get := func() any { return s.dp }; get().(T)`;
 //   - a FREE FUNCTION that takes the field as a parameter and asserts on
 //     the parameter. This is not hypothetical: it is the exact shape of
 //     pkg/api's fetchUserspaceStatus(dp apiRuntimeDataPlane), the site of
 //     the original metric loss, whose correctness rests entirely on the
 //     dataplane.Unwrap call in its body — the scanner cannot see across
-//     that call boundary and its live call site
+//     that call boundary, and its live call site
 //     `fetchUserspaceStatus(s.dp)` is CORRECT, so flagging `.dp` as a call
-//     argument would be a false positive, not coverage;
+//     ARGUMENT would be a false positive, not coverage;
 //   - a field with a different name (the scanner keys on the identifier
 //     `dp`, not on the field's type — it has no type information).
 //
-// The scan is also per-package-directory, NOT recursive: the `dp` field is
-// a field of each consumer package's own server/CLI type, so a
-// subdirectory is a different package that the daemon never fills.
+// Those need dataflow, not syntax. Case 3 above is nonetheless worth the
+// extra pass, because `rt := <handle>; rt.(T)` is the HOUSE IDIOM: an AST
+// sweep found 19 instances of it in pkg/daemon, every one of them sound
+// (they bind from the raw cell, where asserting on the alias is correct).
+// A contributor copying that style into pkg/grpcapi writes `rt := s.dp;
+// rt.(T)` — which is why the alias spelling is the likeliest of these to
+// walk in, and why it is caught rather than merely disclaimed.
 //
 // The behavioural half — that the pattern actually preserves capabilities
 // — is daemon_dp_capability_2114_test.go, plus pkg/cli's
-// cli_capability_probe_2114_test.go. This canary only stops the three
-// spellings above from reappearing.
+// cli_capability_probe_2114_test.go. This canary only stops the spellings
+// above from reappearing.
 
 // probeConsumerDirs are the packages whose `dp` field the daemon fills
 // with liveDataPlane (daemon_run_servers.go, daemon_run.go).
 var probeConsumerDirs = []string{"../grpcapi", "../api", "../cli"}
 
+// probeScanFiles returns the production .go files under root, RECURSIVELY.
+//
+// r7-F3c: both scanners in this file used os.ReadDir and skipped every
+// subdirectory, so a consumer moved into a future pkg/api/<sub> would be
+// unfenced without anything failing. testdata and dot-directories are
+// excluded (fixtures and tooling, never production probes); _test.go stays
+// exempt because tests wire concrete backends into dp directly, where the
+// raw assertion is correct.
+func probeScanFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		name := entry.Name()
+		if entry.IsDir() {
+			if path != root && (name == "testdata" || strings.HasPrefix(name, ".")) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// unwrapProbeExpr strips parenthesization, pointer-dereference and
+// address-of layers to reach the expression a probe is really made against.
+//
+// It deliberately mirrors the house helper unwrapOwnerIdent
+// (pkg/dataplane/armed_gate_matrix_test.go), which this PR added for the
+// same evasion class on the registry canary and which
+// pkg/dataplane/README.md advertises as covering multi-layer parenthesized
+// access: s.dp, (s.dp) and ((s.dp)) must all resolve to the same selector,
+// or `(s.dp).(T)` walks straight past the fence (Codex PR #6743 r7-F3a).
+// Anything that is not one of those layers is returned unchanged, so a call
+// or an index expression cannot be mistaken for the field.
+func unwrapProbeExpr(expr ast.Expr) ast.Expr {
+	for {
+		switch x := expr.(type) {
+		case *ast.ParenExpr:
+			expr = x.X
+		case *ast.StarExpr:
+			expr = x.X
+		case *ast.UnaryExpr:
+			if x.Op != token.AND {
+				return expr
+			}
+			expr = x.X
+		default:
+			return expr
+		}
+	}
+}
+
 // dpFieldAliases returns the identifiers a function body binds DIRECTLY to
-// a `.dp` selector (`d := s.dp`, `var d = s.dp`). An assertion on such an
-// alias reaches the same live indirection the field itself does, so r7-F3
-// treats it as the same violation. Assignments through a call, an
-// interface conversion or a struct field are NOT aliases and are not
-// tracked — see the scope note at the top of this file.
+// a `.dp` selector (`d := s.dp`, `var d = s.dp`, and the parenthesized /
+// address-of spellings of those). An assertion on such an alias reaches the
+// same live indirection the field itself does, so r7-F3 treats it as the
+// same violation. Assignments through a call, an interface conversion or a
+// struct field are NOT aliases and are not tracked — see the scope note at
+// the top of this file.
 func dpFieldAliases(body *ast.BlockStmt) map[string]bool {
 	aliases := map[string]bool{}
 	record := func(lhs, rhs []ast.Expr) {
@@ -77,11 +152,11 @@ func dpFieldAliases(body *ast.BlockStmt) map[string]bool {
 			return
 		}
 		for i, r := range rhs {
-			sel, ok := r.(*ast.SelectorExpr)
+			sel, ok := unwrapProbeExpr(r).(*ast.SelectorExpr)
 			if !ok || sel.Sel.Name != "dp" {
 				continue
 			}
-			if id, ok := lhs[i].(*ast.Ident); ok && id.Name != "_" {
+			if id, ok := unwrapProbeExpr(lhs[i]).(*ast.Ident); ok && id.Name != "_" {
 				aliases[id.Name] = true
 			}
 		}
@@ -102,32 +177,33 @@ func dpFieldAliases(body *ast.BlockStmt) map[string]bool {
 	return aliases
 }
 
-// rawDPAssertionViolations reports the three covered spellings (see the
-// scope note at the top of this file) in the production sources directly
-// under root. A type SWITCH head is an *ast.TypeAssertExpr with a nil Type,
-// so both passes below accept it: `switch x.dp.(type)` erases capabilities
-// exactly as `x.dp.(T)` does.
+// rawDPAssertionViolations reports the covered spellings (see the scope
+// note at the top of this file) in the production sources under root,
+// recursively. A type SWITCH head is an *ast.TypeAssertExpr with a nil
+// Type, so both passes below accept it: `switch x.dp.(type)` erases
+// capabilities exactly as `x.dp.(T)` does.
 func rawDPAssertionViolations(t *testing.T, root string) []string {
 	t.Helper()
 
-	entries, err := os.ReadDir(root)
+	files, err := probeScanFiles(root)
 	if err != nil {
-		t.Fatalf("read %s: %v", root, err)
+		t.Fatalf("walk %s: %v", root, err)
 	}
+
 	var violations []string
 	seen := map[string]bool{}
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
+	for _, path := range files {
 		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, filepath.Join(root, name), nil, 0)
+		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
-			t.Fatalf("parse %s/%s: %v", root, name, err)
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			rel = filepath.Base(path)
 		}
 		add := func(pos token.Position, why string) {
-			v := filepath.Base(root) + "/" + name + ":" + probeLineNo(pos.Line) + " (" + why + ")"
+			v := filepath.Base(root) + "/" + rel + ":" + probeLineNo(pos.Line) + " (" + why + ")"
 			if seen[v] {
 				return
 			}
@@ -136,13 +212,13 @@ func rawDPAssertionViolations(t *testing.T, root string) []string {
 		}
 
 		// Pass A (file-wide): assertions and type switches directly on the
-		// `.dp` selector.
+		// `.dp` selector, through any number of parenthesization layers.
 		ast.Inspect(file, func(n ast.Node) bool {
 			assert, ok := n.(*ast.TypeAssertExpr)
 			if !ok {
 				return true
 			}
-			sel, ok := assert.X.(*ast.SelectorExpr)
+			sel, ok := unwrapProbeExpr(assert.X).(*ast.SelectorExpr)
 			if !ok || sel.Sel.Name != "dp" {
 				return true
 			}
@@ -166,7 +242,7 @@ func rawDPAssertionViolations(t *testing.T, root string) []string {
 				if !ok {
 					return true
 				}
-				id, ok := assert.X.(*ast.Ident)
+				id, ok := unwrapProbeExpr(assert.X).(*ast.Ident)
 				if !ok || !aliases[id.Name] {
 					return true
 				}
@@ -289,6 +365,33 @@ func (s *Server2) cursor() int {
 		t.Fatalf("_test.go must be exempt; violations = %v", v)
 	}
 
+	// r7-F3c: a violation in a SUBDIRECTORY must be reported. The r6
+	// scanner skipped every directory entry, so this shape was invisible.
+	sub := filepath.Join(dir, "inner")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "deep.go"),
+		[]byte(strings.Replace(bad, "Server2", "ServerDeep", -1)), 0o644); err != nil {
+		t.Fatalf("write subdir fixture: %v", err)
+	}
+	if v := rawDPAssertionViolations(t, dir); len(v) != 2 {
+		t.Fatalf("a violation in a SUBDIRECTORY must be reported; violations = %v", v)
+	}
+
+	// ... but testdata is excluded: it holds fixtures, never production probes.
+	td := filepath.Join(dir, "testdata")
+	if err := os.Mkdir(td, 0o755); err != nil {
+		t.Fatalf("mkdir testdata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(td, "fixture.go"),
+		[]byte(strings.Replace(bad, "Server2", "ServerTD", -1)), 0o644); err != nil {
+		t.Fatalf("write testdata fixture: %v", err)
+	}
+	if v := rawDPAssertionViolations(t, dir); len(v) != 2 {
+		t.Fatalf("testdata must be excluded; violations = %v", v)
+	}
+
 	// r7-F3: the two spellings the r6 scanner let through. Each gets its
 	// own directory so the count is unambiguous.
 	typeSwitch := `package consumer
@@ -321,6 +424,68 @@ func (s *Server5) cursor() int {
 	return p.Cursor()
 }
 `
+	// r7-F3a: the parenthesization / dereference layers. `(s.dp).(T)` walked
+	// straight past the r6 scanner because assert.X was an *ast.ParenExpr.
+	// The house helper unwrapOwnerIdent already covered this class for the
+	// registry canary, so the fence has to match it — one layer is not
+	// enough, which is why ((...)) is here too.
+	parens := `package consumer
+
+type Server6 struct{ dp any }
+
+type cursorProvider6 interface{ Cursor() int }
+
+func (s *Server6) cursor() int {
+	p, ok := (s.dp).(cursorProvider6)
+	if !ok {
+		return 0
+	}
+	return p.Cursor()
+}
+`
+	doubleParens := `package consumer
+
+type Server7 struct{ dp any }
+
+type cursorProvider7 interface{ Cursor() int }
+
+func (s *Server7) cursor() int {
+	p, ok := ((s.dp)).(cursorProvider7)
+	if !ok {
+		return 0
+	}
+	return p.Cursor()
+}
+`
+	starField := `package consumer
+
+type Server8 struct{ dp any }
+
+type cursorProvider8 interface{ Cursor() int }
+
+func cursor8(p *Server8) int {
+	c, ok := (*p).dp.(cursorProvider8)
+	if !ok {
+		return 0
+	}
+	return c.Cursor()
+}
+`
+	addrOfAlias := `package consumer
+
+type Server9 struct{ dp any }
+
+type cursorProvider9 interface{ Cursor() int }
+
+func (s *Server9) cursor() int {
+	d := &s.dp
+	p, ok := (*d).(cursorProvider9)
+	if !ok {
+		return 0
+	}
+	return p.Cursor()
+}
+`
 	for _, tc := range []struct {
 		name string
 		src  string
@@ -328,6 +493,10 @@ func (s *Server5) cursor() int {
 	}{
 		{"type switch on the field", typeSwitch, "type switch"},
 		{"assertion on a local alias", alias, "local alias"},
+		{"parenthesized field", parens, "on the dp field"},
+		{"doubly parenthesized field", doubleParens, "on the dp field"},
+		{"field through a dereferenced receiver", starField, "on the dp field"},
+		{"dereferenced address-of alias", addrOfAlias, "local alias"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := t.TempDir()
@@ -371,22 +540,22 @@ func fetch(dp any) int {
 	return p.Status()
 }
 
-type Server6 struct{ dp any }
+type Gap1 struct{ dp any }
 
-func (s *Server6) status() int { return fetch(s.dp) }
+func (s *Gap1) status() int { return fetch(s.dp) }
 `
 	// A helper that RETURNS the field as any, with the assertion on the
 	// helper's result.
 	helper := `package consumer
 
-type Server7 struct{ dp any }
+type Gap2 struct{ dp any }
 
-type statusProvider7 interface{ Status() int }
+type statusProviderG2 interface{ Status() int }
 
-func (s *Server7) raw() any { return s.dp }
+func (s *Gap2) raw() any { return s.dp }
 
-func (s *Server7) status() int {
-	p, ok := s.raw().(statusProvider7)
+func (s *Gap2) status() int {
+	p, ok := s.raw().(statusProviderG2)
 	if !ok {
 		return 0
 	}
@@ -397,12 +566,28 @@ func (s *Server7) status() int {
 	// on the type (it has no type information).
 	renamed := `package consumer
 
-type Server8 struct{ backend any }
+type Gap3 struct{ backend any }
 
-type statusProvider8 interface{ Status() int }
+type statusProviderG3 interface{ Status() int }
 
-func (s *Server8) status() int {
-	p, ok := s.backend.(statusProvider8)
+func (s *Gap3) status() int {
+	p, ok := s.backend.(statusProviderG3)
+	if !ok {
+		return 0
+	}
+	return p.Status()
+}
+`
+	// A closure that returns the field; the assertion is on the CALL.
+	closure := `package consumer
+
+type Gap4 struct{ dp any }
+
+type statusProviderG4 interface{ Status() int }
+
+func (s *Gap4) status() int {
+	get := func() any { return s.dp }
+	p, ok := get().(statusProviderG4)
 	if !ok {
 		return 0
 	}
@@ -413,6 +598,7 @@ func (s *Server8) status() int {
 		{"free function taking the field as a parameter", freeFunc},
 		{"helper returning the field as any", helper},
 		{"differently named field", renamed},
+		{"closure returning the field", closure},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := t.TempDir()
@@ -445,20 +631,20 @@ var persistentNATConsumerDirs = []string{"../grpcapi", "../api", "../cli", "../n
 func repeatedPersistentNATResolutions(t *testing.T, root string) []string {
 	t.Helper()
 
-	entries, err := os.ReadDir(root)
+	files, err := probeScanFiles(root)
 	if err != nil {
-		t.Fatalf("read %s: %v", root, err)
+		t.Fatalf("walk %s: %v", root, err)
 	}
 	var violations []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
+	for _, path := range files {
+		name, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			name = filepath.Base(path)
 		}
 		fset := token.NewFileSet()
-		file, err := parser.ParseFile(fset, filepath.Join(root, name), nil, 0)
+		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
-			t.Fatalf("parse %s/%s: %v", root, name, err)
+			t.Fatalf("parse %s: %v", path, err)
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
@@ -487,11 +673,17 @@ func repeatedPersistentNATResolutions(t *testing.T, root string) []string {
 	return violations
 }
 
-// TestPersistentNATResolvedOncePerOperation fences every consumer,
-// including pkg/cli's clearPersistentNAT — which runs only under
-// isInteractive() and has no unit-reachable path, so the behavioural
-// binders (pkg/daemon's SystemAction test, pkg/natshow's render tests)
-// cannot reach it.
+// TestPersistentNATResolvedOncePerOperation fences every consumer PACKAGE
+// (recursively since r7-F3c), including pkg/cli's clearPersistentNAT —
+// which runs only under isInteractive() and has no unit-reachable path, so
+// the behavioural binders (pkg/daemon's SystemAction test, pkg/natshow's
+// render tests) cannot reach it.
+//
+// Codex PR #6743 r7: the rule it enforces is per-FUNCTION — more than one
+// GetPersistentNAT call inside one function body. A check-then-use split
+// ACROSS two functions still resolves twice and is not reported; that needs
+// dataflow, not syntax, and is the same documented boundary as the
+// optional-probe scanner above.
 func TestPersistentNATResolvedOncePerOperation(t *testing.T) {
 	t.Parallel()
 

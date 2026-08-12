@@ -155,18 +155,43 @@ type liveDataPlane struct{ daemon *Daemon }
 // path. Enumerating the union into liveDataPlaneSurface would only move
 // the failure to the next capability a backend gains.
 //
-// Unwrap is deliberately NOT a way to keep a backend: it resolves through
-// the same cell load as every forwarder and returns nil once the daemon
-// has disowned the backend, so a probe made after a setDataplane(nil)
-// fails its assertion and the consumer takes its "capability unavailable"
-// branch. What a caller gets is a handle valid for the call it is about to
-// make — exactly the window an explicit forwarder has between its resolve
-// and its call, and bounded by the same #6741 lifetime gap.
-// It reads the cell DIRECTLY rather than going through resolve(): resolve
-// narrows to liveDataPlaneSurface and rejects a backend that does not
-// implement the mandatory management surface, but such a backend could
-// still carry optional capabilities, and erasing those is the very bug
-// this method exists to fix.
+// Unwrap is deliberately NOT a way to keep a backend across the daemon's
+// lifecycle: it resolves through the same cell load as every forwarder and
+// returns nil once the daemon has disowned the backend, so a probe made
+// after a setDataplane(nil) fails its assertion and the consumer takes its
+// "capability unavailable" branch.
+//
+// WHAT THE CALLER ACTUALLY HOLDS (Codex PR #6743 r7-N1). Not "a handle for
+// the one call it is about to make" — several consumers legitimately keep
+// the resolved handle for a whole OPERATION spanning multiple backend
+// calls, and re-resolving mid-operation would be wrong, not safer:
+//
+//   - pkg/cli's request-chassis inject path and pkg/grpcapi's
+//     userspace-inject action both resolve once, call Status() to build the
+//     request, then InjectPacket() against the SAME provider — the second
+//     call must land on the backend the first one described;
+//   - the gRPC session-cursor loops iterate the cursor they resolved,
+//     which is what makes them a cursor.
+//
+// So the guarantee is per-OPERATION, not per-call: the handle a consumer
+// gets is the backend published when the operation began, and a
+// setDataplane(nil) landing mid-operation is still serviced by that
+// backend. No consumer caches it in a FIELD, so the window is bounded by
+// the request, and the residual — a torn-down but not yet replaced backend
+// still answering — is the same #6741 lifetime gap documented above, not a
+// publication escape.
+//
+// It reads the cell DIRECTLY rather than going through resolve() for ONE
+// reason: resolve narrows to liveDataPlaneSurface and returns an ERROR for
+// a backend that does not implement the mandatory management surface, so
+// Unwrap would hand back nil for a backend that is published and may well
+// carry the optional capability being probed for. It is NOT because a
+// conversion would drop methods — a successful Go interface conversion
+// preserves the dynamic concrete type, so asserting an optional interface
+// on a liveDataPlaneSurface value still sees the backend's full method set
+// (Codex PR #6743 r7-N3 corrected the earlier claim here). Reading the cell
+// directly is still the right implementation; only the stated reason was
+// wrong.
 func (a liveDataPlane) Unwrap() any {
 	if a.daemon == nil {
 		return nil

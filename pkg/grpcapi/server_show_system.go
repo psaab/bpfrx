@@ -444,9 +444,17 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 	// daemon whose startup arm FAILED and cleared the cell would fall into
 	// the backend arm and answer "No BPF maps available" (a statement
 	// about a loaded backend's maps) for a firewall that has no backend at
-	// all. Published() asks the honest question and is the identity for a
-	// plain backend.
-	if dataplane.Published(s.dp) {
+	// all.
+	//
+	// r7: ONE resolution feeds every decision in this render. Published(),
+	// dpProbe() and s.dp.GetMapStats() were three INDEPENDENT cell loads,
+	// so a setDataplane(nil) landing between them re-created the exact
+	// confusion Published() was added to prevent: the publication check
+	// passed against backend A, the status probe then resolved nil, and the
+	// map arm printed "No BPF maps available" for a daemon that no longer
+	// had a backend at all. Resolving once and asserting every capability
+	// off that single value makes the whole render describe one instant.
+	if backend := dataplane.Unwrap(s.dp); backend != nil {
 		// #5782: this render ends with a full v4+v6 SessionCount() table walk
 		// (same per-bucket BPF-map lock contention as the session read-scans).
 		// Gate the whole render through the shared diagcmd.SessionWalkLimiter and
@@ -460,19 +468,19 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 				"session scan concurrency limit reached; retry shortly")
 		}
 		defer release()
-		if provider, ok := s.dpProbe().(userspaceStatusProvider); ok {
+		if provider, ok := backend.(userspaceStatusProvider); ok {
 			status, err := provider.Status()
 			if err != nil {
 				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
 			} else {
 				buf.WriteString(dpformat.FormatSystemBuffers(status, false))
-				v4, v6 := s.dp.SessionCount()
+				v4, v6 := backendSessionCount(backend)
 				if v4 > 0 || v6 > 0 {
 					fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 				}
 			}
 		} else {
-			stats := s.dp.GetMapStats()
+			stats := backendMapStats(backend)
 			if len(stats) == 0 {
 				buf.WriteString("No BPF maps available\n")
 			} else {
@@ -515,14 +523,11 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 }
 
 func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) error {
-	// #2114/#6743-F3: `dp != nil` no longer means "a dataplane exists" —
-	// the daemon publishes a permanently non-nil live indirection, so a
-	// daemon whose startup arm FAILED and cleared the cell would fall into
-	// the backend arm and answer "No BPF maps available" (a statement
-	// about a loaded backend's maps) for a firewall that has no backend at
-	// all. Published() asks the honest question and is the identity for a
-	// plain backend.
-	if dataplane.Published(s.dp) {
+	// #2114/#6743-F3 + r7: same single-resolution contract as showBuffers —
+	// one Unwrap feeds the publication check, the optional status probe and
+	// the map-stats fallback, so the whole render describes one instant
+	// instead of three separate cell loads.
+	if backend := dataplane.Unwrap(s.dp); backend != nil {
 		// #5782: same full-table SessionCount() walk gate as showBuffers.
 		release, err := sessionWalkLimiter.Acquire()
 		if err != nil {
@@ -530,19 +535,19 @@ func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) err
 				"session scan concurrency limit reached; retry shortly")
 		}
 		defer release()
-		if provider, ok := s.dpProbe().(userspaceStatusProvider); ok {
+		if provider, ok := backend.(userspaceStatusProvider); ok {
 			status, err := provider.Status()
 			if err != nil {
 				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
 			} else {
 				buf.WriteString(dpformat.FormatSystemBuffers(status, true))
-				v4, v6 := s.dp.SessionCount()
+				v4, v6 := backendSessionCount(backend)
 				if v4 > 0 || v6 > 0 {
 					fmt.Fprintf(buf, "\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 				}
 			}
 		} else {
-			stats := s.dp.GetMapStats()
+			stats := backendMapStats(backend)
 			if len(stats) == 0 {
 				buf.WriteString("No BPF maps available\n")
 			} else {

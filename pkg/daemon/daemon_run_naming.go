@@ -244,10 +244,13 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 // re-reads the cell — which, since #6743 r4, includes gRPC, REST and the
 // console CLI (they hold liveDataPlane, so the clear makes their
 // dataplane surface report unavailable immediately). It is NOT a claim
-// that every consumer is severed: the conntrack GC, cluster SessionSync
-// and the userspace event-stream loop were wired from a handle taken
-// before this point and keep it (daemon_dp_live.go documents why), so
-// their loops run until their own contexts end.
+// that every consumer is severed: the conntrack GC and cluster
+// SessionSync were wired from DECOMPOSED domain handles taken before this
+// point and keep them (daemon_dp_live.go documents why), so their loops
+// run until their own contexts end. Codex PR #6743 r7: the userspace
+// event-stream loop is NO LONGER in that list — it re-resolves the
+// provider, the stream and the session-delta drainer from the cell on
+// every tick, so this clear stops it draining within one tick.
 func (d *Daemon) armBootstrapExitDataplane(nodeID int) {
 	// #2114: ONE snapshot feeds the nil-check, Start, and the seeder
 	// (plan §5.3 rule 3); the cell is cleared only on the failure branch.

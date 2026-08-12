@@ -142,20 +142,15 @@ func TestEventStreamFallbackLoop_DrainerReresolvedPerTick(t *testing.T) {
 	})
 }
 
-// TestSyncUserspaceSessionDeltas_DrainerReresolvedPerTick is the SECOND
-// instance of the same F1 defect. syncUserspaceSessionDeltas is the polling
-// path taken when the published backend exposes no event stream
-// (runUserspaceEventStream), and it carried the identical capture-at-entry
-// shape — worse, its miss arm RETURNED rather than continued, so an empty
-// cell at entry killed the goroutine outright.
-//
-// Fail-on-revert: restore `drainer, ok := d.dataplane().(...)` plus the
-// `!ok ||` entry gate and drop the per-tick resolution, and this fails the
-// same way its eventStreamFallbackLoop sibling does. Fixing only one of the
-// two functions leaves this test RED.
-func TestSyncUserspaceSessionDeltas_DrainerReresolvedPerTick(t *testing.T) {
+// TestRunUserspaceEventStream_DrainerReresolvedPerTick drives the SAME
+// property through the production ENTRY POINT (the function
+// daemon_ha_sync.go and daemon_run.go actually launch) rather than through
+// eventStreamFallbackLoop directly, so a future entry point that stops
+// routing into the shared loop cannot silently lose the per-tick
+// resolution.
+func TestRunUserspaceEventStream_DrainerReresolvedPerTick(t *testing.T) {
 	runDrainerReresolutionBinder(t, func(d *Daemon, ctx context.Context) {
-		d.syncUserspaceSessionDeltas(ctx)
+		d.runUserspaceEventStream(ctx)
 	})
 }
 
@@ -370,6 +365,86 @@ func TestEventStreamFallbackLoop_ProviderResolvedPerTick(t *testing.T) {
 
 	cancel()
 	<-loopDone
+}
+
+// TestRunUserspaceEventStream_WiresAfterEmptyCellAtEntry binds INITIAL
+// RECOVERY, the fourth independent regression in this chain (Codex r7-F1b).
+//
+// The entry point used to open with a one-shot
+// `d.dataplane().(userspaceEventStreamProvider)` probe and, on a miss, hand
+// off permanently to a wiring-free polling loop. An empty cell at that
+// instant latched the daemon out of the event stream for the life of the
+// process: a healthy provider published a moment later — the corrected
+// commit after a bootstrap-arm failure — never had its callbacks installed,
+// so every helper event accumulated in the callback-not-ready queue.
+//
+// Fail-on-revert: restore that pre-check (or route the HA branch anywhere
+// that resolves the provider once) and no ACK ever comes back. Note this is
+// NOT covered by the per-tick drainer or provider binders: with the
+// pre-check in place the loop those tests exercise is never entered.
+func TestRunUserspaceEventStream_WiresAfterEmptyCellAtEntry(t *testing.T) {
+	runEmptyCellWiringBinder(t, true)
+}
+
+// TestRunUserspaceEventStream_StandaloneWiresAfterEmptyCellAtEntry is the
+// same property on the STANDALONE path (d.cluster == nil, daemon_run.go).
+// There is no session sync to poll there, but the helper's dataplane events
+// still reach the event buffer through these callbacks — so collapsing the
+// entry point into the HA fallback loop (which returns immediately without
+// a cluster) would silently kill standalone event delivery. This is the
+// guard against that.
+func TestRunUserspaceEventStream_StandaloneWiresAfterEmptyCellAtEntry(t *testing.T) {
+	runEmptyCellWiringBinder(t, false)
+}
+
+func runEmptyCellWiringBinder(t *testing.T, withCluster bool) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	es, path := startEventStreamForRewireTest(t, ctx, "late-entry.sock")
+
+	d := &Daemon{store: storeWithActiveConfigForDrainTest(t)}
+	if withCluster {
+		// Primary for NOTHING, so handleEventStreamDelta takes its
+		// "ignored (not primary for any RG)" arm and ACKs — the ACK then
+		// proves only that the CALLBACK ran, which is the property here.
+		d.cluster = cluster.NewManager(0, 1)
+		d.sessionSync = cluster.NewSessionSync(":0", "127.0.0.1:1", nil)
+	}
+
+	// The cell is EMPTY when the entry point starts. This is the production
+	// shape after a bootstrap-arm failure cleared it, and also simply
+	// before the helper is armed.
+	if d.dataplane() != nil {
+		t.Fatal("test setup: the cell must be empty at entry")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.runUserspaceEventStream(ctx)
+	}()
+
+	conn, err := dialEventStreamForRewireTest(t, path)
+	if err != nil {
+		t.Fatalf("dial event stream: %v", err)
+	}
+	defer conn.Close()
+
+	// Only NOW does a healthy provider appear.
+	time.Sleep(200 * time.Millisecond)
+	backend := &replaceableStreamDP{}
+	backend.es.Store(es)
+	d.setDataplane(backend)
+
+	writeEventFrameForWiringTest(t, conn, dpuserspace.EventTypeSessionOpen, 1,
+		buildSessionOpenFrameV4PayloadForWiringTest())
+	waitForAckSeqForWiringTest(t, conn, 1)
+
+	cancel()
+	<-done
 }
 
 // dialEventStreamForRewireTest dials the stream's socket, retrying until the

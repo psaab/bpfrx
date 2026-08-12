@@ -586,6 +586,15 @@ func (s *Server) executeClusterFailover(ctx context.Context, req *pb.SystemActio
 // this mapping the identical operator-visible condition is reported as
 // codes.Internal — a server fault — purely because of when the cell
 // cleared. Anything else is a genuine backend failure and stays Internal.
+//
+// Codex PR #6743 r7: that last sentence is about the MAPPING, not about
+// backend coverage — it holds for every failure that actually reaches here.
+// Some do not: pkg/dataplane/maps_nat.go's ClearNATRuleCounters discards
+// every per-entry Update error and returns nil, so a partial clear is
+// reported as success and never gets a code at all. That is pre-existing on
+// master, is not part of #2114's publication contract, and is deliberately
+// out of scope for this PR — recorded here so the sentence above is not
+// read as a claim that every backend failure is surfaced.
 func dataplaneActionError(err error) error {
 	if errors.Is(err, dataplane.ErrNotPublished) {
 		return status.Error(codes.Unavailable, "dataplane not loaded")

@@ -25,25 +25,30 @@ func (c *CLI) showSystemBuffers() error {
 	// whose startup arm failed and cleared the cell would fall through to
 	// the map branch and print "No BPF maps available" (a claim about a
 	// loaded backend's maps) instead of "Dataplane not loaded".
-	// Published() is the identity for a plain backend.
-	if !dataplane.Published(c.dp) {
+	//
+	// r7: ONE resolution feeds every decision here. Published(), dpProbe()
+	// and c.dp.GetMapStats() were three independent cell loads, so a
+	// setDataplane(nil) between them re-created the very confusion
+	// Published() was added to prevent.
+	backend := dataplane.Unwrap(c.dp)
+	if backend == nil {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	if provider, ok := c.dpProbe().(cliUserspaceStatusProvider); ok {
+	if provider, ok := backend.(cliUserspaceStatusProvider); ok {
 		status, err := provider.Status()
 		if err != nil {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)
 			return nil
 		}
 		fmt.Print(dpformat.FormatSystemBuffers(status, false))
-		v4, v6 := c.dp.SessionCount()
+		v4, v6 := backendSessionCount(backend)
 		if v4 > 0 || v6 > 0 {
 			fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 		}
 		return nil
 	}
-	stats := c.dp.GetMapStats()
+	stats := backendMapStats(backend)
 	if len(stats) == 0 {
 		fmt.Println("No BPF maps available")
 		return nil
@@ -86,25 +91,27 @@ func (c *CLI) showSystemBuffers() error {
 }
 
 func (c *CLI) showSystemBuffersDetail() error {
-	// #2114/#6743-F3: same publication check as showSystemBuffers.
-	if !dataplane.Published(c.dp) {
+	// #2114/#6743-F3 + r7: same SINGLE-resolution contract as
+	// showSystemBuffers.
+	backend := dataplane.Unwrap(c.dp)
+	if backend == nil {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	if provider, ok := c.dpProbe().(cliUserspaceStatusProvider); ok {
+	if provider, ok := backend.(cliUserspaceStatusProvider); ok {
 		status, err := provider.Status()
 		if err != nil {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)
 			return nil
 		}
 		fmt.Print(dpformat.FormatSystemBuffers(status, true))
-		v4, v6 := c.dp.SessionCount()
+		v4, v6 := backendSessionCount(backend)
 		if v4 > 0 || v6 > 0 {
 			fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
 		}
 		return nil
 	}
-	stats := c.dp.GetMapStats()
+	stats := backendMapStats(backend)
 	if len(stats) == 0 {
 		fmt.Println("No BPF maps available")
 		return nil

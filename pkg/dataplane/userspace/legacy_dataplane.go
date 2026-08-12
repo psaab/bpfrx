@@ -83,6 +83,26 @@ func (a *LegacyDataPlaneAdapter) AppliedNATView() AppliedNATView {
 	return m.AppliedNATView()
 }
 
+// ReadAllPolicyCounters forwards the #3965 bulk policy-counter snapshot.
+//
+// Codex PR #6743 r7-N2: the bulk reader existed on *Manager only, and the
+// daemon publishes the ADAPTER, so NewPolicyCounterReader's probe missed on
+// every one of its seven observability call sites and each of them silently
+// took the O(P*(P+C)) per-policy fallback the bulk path was written to
+// replace. Same capability-erasure class as the #2114 optional-probe bug,
+// with a performance cliff rather than a missing metric as the symptom.
+// This is a pure in-memory read of the manager's last published status (no
+// control-socket round trip), so forwarding it costs nothing on the path it
+// restores. Returns the manager's error when there is no manager, matching
+// every other forwarder here.
+func (a *LegacyDataPlaneAdapter) ReadAllPolicyCounters(cfg *config.Config) (map[uint32]dataplane.CounterValue, error) {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return nil, err
+	}
+	return m.ReadAllPolicyCounters(cfg)
+}
+
 func (a *LegacyDataPlaneAdapter) IsLoaded() bool {
 	m, err := a.managerOrErr()
 	if err != nil || m.bpfShim == nil {

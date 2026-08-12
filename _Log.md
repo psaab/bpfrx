@@ -70824,3 +70824,158 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/daemon/daemon_dp_race_test.go,
   pkg/daemon/daemon_dp_probe_canary_test.go, pkg/daemon/daemon_dp_live.go,
   pkg/daemon/README.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: PR #6743 round 8 — a second review round on the r7 head. Codex
+  re-gated DO-NOT-MERGE and found a SECOND schedule in the loop r7 fixed; a
+  parallel reviewer ran the optional-probe scanner against nine evasion
+  shapes and got one hit (the control). Plus three new findings and a
+  correction to a claim the parent had endorsed.
+
+  **F1b (BLOCKING, runtime) — the second schedule.** r7 made the drainer
+  per-tick, which fixes the loop once it is RUNNING. It does not reach the
+  entry point: `runUserspaceEventStream` opened with a ONE-SHOT
+  `d.dataplane().(userspaceEventStreamProvider)` probe and, on a miss,
+  handed off permanently to `syncUserspaceSessionDeltas`, a sibling loop
+  with no wiring logic at all. An empty cell at that instant — the daemon
+  has not armed the helper yet, or a bootstrap-arm failure cleared it —
+  therefore LATCHED the daemon out of the event stream for the life of the
+  process: the corrected commit could publish a perfectly healthy provider
+  a moment later and its callbacks were never installed, so every helper
+  event accumulated in the callback-not-ready queue. A per-tick drainer
+  cannot help; the decision was already made and, on the standalone path,
+  the goroutine had already returned.
+
+  Fix: `eventStreamFallbackLoop` is now the single loop for both roles.
+  It already re-resolves provider + stream + drainer every tick, installs
+  callbacks the first time it sees a stream (`wired == nil` means "nothing
+  wired yet") and polls at 100 ms while disconnected — which is exactly
+  what `syncUserspaceSessionDeltas` did, so that function is DELETED rather
+  than fixed twice. The standalone branch (`d.cluster == nil`) keeps
+  calling `wireUserspaceEventStreamCallbacks`, which re-reads the cell every
+  500 ms: there is no session sync to poll there, but the helper's
+  RT_FLOW dataplane events still reach the event buffer through those
+  callbacks, and routing standalone into the HA loop would silently kill
+  them (bound below).
+
+  **N1 (claim) — "used immediately" is false.** `Unwrap`'s doc said the
+  caller gets "a handle valid for the call it is about to make". Consumers
+  legitimately hold it across a whole OPERATION: pkg/cli's
+  request-chassis inject and pkg/grpcapi's userspace-inject action both
+  `Status()` then `InjectPacket()` on the same provider, and the gRPC
+  session-cursor loops iterate the cursor they resolved. Re-resolving
+  mid-operation would be wrong, not safer. The guarantee is now stated as
+  per-OPERATION, with the observation that no consumer caches it in a
+  FIELD, so the window is bounded by the request and the residual is the
+  same #6741 lifetime gap.
+
+  **N2 (real, predates the PR) — one optional probe never went through
+  `dpProbe()`, for TWO reasons.** `NewPolicyCounterReader` asserted the
+  #3965 bulk interface on the RAW handle, and the bulk reader existed on
+  `*Manager` only while the daemon publishes the ADAPTER. Both had to be
+  fixed: the probe now resolves through `dataplane.Unwrap`, and
+  `LegacyDataPlaneAdapter` gained a `ReadAllPolicyCounters` forwarder.
+  Until now all seven observability callers (pkg/api metrics + security
+  inventory, pkg/cli show-security, pkg/grpcapi policies-text + zones)
+  silently took the `O(P*(P+C))` per-policy fallback the bulk snapshot
+  exists to replace. NOTE this is a deliberate behaviour change on a live
+  path: the bulk path was production-dead and is now live. It is a pure
+  in-memory read of the manager's last published status (no control-socket
+  round trip), and on a bulk read error the reader surfaces that error
+  through the per-policy channel rather than silently falling back — the
+  documented #3965 design.
+
+  **N3 (claim) — the parent's endorsed rationale was technically false.**
+  `daemon_dp_live.go` implied that routing `Unwrap` through `resolve()`
+  would ERASE optional methods. A successful Go interface conversion
+  preserves the dynamic concrete type, so it would not. The real reason is
+  narrower and is now stated: `resolve()` REJECTS a backend that does not
+  satisfy the mandatory management surface, so `Unwrap` would return nil
+  for a published backend that may well carry the capability being probed.
+
+  **F3 (Codex) — the fix was present but the race survived it.**
+  `Published()`, `dpProbe()` and `dp.GetMapStats()` were three INDEPENDENT
+  cell loads in each of the four buffer renders, so a `setDataplane(nil)`
+  between them re-created the exact confusion `Published()` was added to
+  prevent: publication check passes, later loads resolve nil, render prints
+  "No BPF maps available" — a statement about a LOADED backend's maps — for
+  a daemon with no backend at all. All four now take ONE
+  `dataplane.Unwrap` and assert every capability off that single value
+  (`backendSessionCount` / `backendMapStats` helpers in each consumer).
+
+  **F3 (parallel reviewer) — the fence catches one SPELLING.** Three
+  concrete fixes, in the order asked: (a) strip parenthesization before the
+  selector check — `(s.dp).(T)` evaded because `assert.X` was an
+  `*ast.ParenExpr`, and this PR had ALREADY added the paren-stripping
+  helper for the same class in a sibling canary
+  (`unwrapOwnerIdent`, pkg/dataplane/armed_gate_matrix_test.go), so the
+  thinner pkg/daemon fence simply had not inherited the house standard;
+  (b) the type-switch head (already done in r7); (c) recursion into
+  subdirectories, applied to BOTH scanners in the file via a shared
+  `probeScanFiles`. The five dataflow shapes are NOT chased — the scope
+  note now names the covered spellings, names the uncovered ones with the
+  concrete production example (`fetchUserspaceStatus`), and records WHY the
+  alias spelling is the likeliest to walk in: `rt := <handle>; rt.(T)` is
+  the house idiom, with 19 sound instances in pkg/daemon, so a contributor
+  copying that style into pkg/grpcapi writes the erasing version. That one
+  IS caught rather than merely disclaimed. NOTE: the referenced model
+  `pkg/cli/userclass_entrypoint_canary_test.go` is on an unmerged sibling
+  PR — absent from this branch and from origin/master — so `unwrapOwnerIdent`
+  was used as the in-tree model.
+
+  **Completeness-claim sweep (as a class, not case by case).** Four
+  instances were named; the sweep over every absolute claim the PR adds
+  found and corrected: (1) `daemon_run_naming.go`'s "the conntrack GC,
+  cluster SessionSync AND the userspace event-stream loop keep a handle
+  taken before this point" — false since r6-F4/r7-F1, the loop is severed
+  within one tick; (2) `pkg/cli/runtime.go`'s "Replaces the inline probes"
+  — TRUE as scoped (both named files really were converted) but misreadable
+  as a general claim, now explicitly scoped, recording that the surviving
+  anonymous-interface probes in pkg/api and cli_show_nat.go are correct
+  because they resolve through `dpProbe()`; (3)
+  `TestPersistentNATResolvedOncePerOperation`'s "fences every consumer" —
+  now says every consumer PACKAGE, recursively, with the per-FUNCTION limit
+  stated; (4) `dataplaneActionError`'s "anything else is a genuine backend
+  failure and stays Internal" — true of the MAPPING, but
+  `pkg/dataplane/maps_nat.go`'s ClearNATRuleCounters discards every
+  per-entry Update error and returns nil, so a partial clear never gets a
+  code at all. Pre-existing on master, not part of #2114's publication
+  contract, recorded as explicitly out of scope.
+
+  **Mutation matrix (all six RED, every RED an assertion).**
+  (N1a) restore the one-shot provider pre-check in `runUserspaceEventStream`
+  → `TestRunUserspaceEventStream_DrainerReresolvedPerTick` RED ("no
+  DrainSessionDeltas call against the published backend: the loop never
+  reached its drain") AND
+  `TestRunUserspaceEventStream_WiresAfterEmptyCellAtEntry` RED (ack
+  timeout). (N1b) route the STANDALONE branch into the HA fallback loop →
+  `TestRunUserspaceEventStream_StandaloneWiresAfterEmptyCellAtEntry` RED
+  (ack timeout) — the guard against the collapse killing standalone event
+  delivery. (N2a) drop `dataplane.Unwrap` from `NewPolicyCounterReader` →
+  "the reader took the per-policy FALLBACK 1 times for a handle that
+  resolves to a bulk-capable backend". (N2b) delete the adapter forwarder →
+  "the PUBLISHED backend (*LegacyDataPlaneAdapter) does not expose
+  ReadAllPolicyCounters" + the reader test. (F3a) revert both gRPC renders
+  to `Published()` + `dpProbe()` + `s.dp.GetMapStats()` → both subtests RED
+  with `reported "No BPF maps available" after resolving the backend more
+  than once (resolves=2)`. (F3b) reduce `unwrapProbeExpr` to the identity →
+  three self-test cells RED (`violations = [], want exactly one`). (F3c)
+  make the scanner non-recursive again → "a violation in a SUBDIRECTORY
+  must be reported". The r7 4x4 diagonal still holds.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0; `-race` leg on the pkg/daemon cell/bootstrap/
+  event-stream tests 0. Control-plane Go only, no dataplane artifact — no
+  cluster smoke owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_stream_live_test.go,
+  pkg/daemon/daemon_dp_probe_canary_test.go, pkg/daemon/daemon_dp_live.go,
+  pkg/daemon/daemon_run_naming.go,
+  pkg/dataplane/userspace/policycounters.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/policy_counter_unwrap_6743_test.go (new),
+  pkg/grpcapi/server_show_system.go, pkg/grpcapi/runtime.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_show_system_single_resolve_6743_test.go (new),
+  pkg/cli/cli_show_system.go, pkg/cli/runtime.go, _Log.md
