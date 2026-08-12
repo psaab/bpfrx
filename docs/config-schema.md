@@ -1311,10 +1311,19 @@ Consequences worth knowing when adding a reader:
 
   The sharp form of why that mattered: the one level the gate covered is the
   one whose runtime outcome is fail-CLOSED (an instance with an empty class
-  resolves to `unauthorized`), while the two it missed are the fail-OPEN ones —
-  `System.Login == nil` is exactly `pkg/daemon` `applyCLILoginClass`'s early
-  return, so `SetUserClass` is never called and `pkg/cli` runs with an empty
+  resolves to `unauthorized`), while the two it missed were the fail-OPEN ones —
+  `System.Login == nil` used to hit `pkg/daemon` `applyCLILoginClass`'s early
+  return, so `SetUserClass` was never called and `pkg/cli` ran with an empty
   class: allow every command, render secrets in cleartext.
+
+  That description is now HISTORICAL for the system level, and the tense is
+  load-bearing (corrected #6706 review r11). `LoginDroppedByPacking` suppresses
+  that early return, so a system-line packed path no longer fails open: a
+  non-root caller gets `unauthorized` and root keeps its default. The
+  login-line level was never nil-Login in the first place — it compiles a
+  NON-nil but empty `LoginConfig`, which denies through `ResolveLoginClass`
+  without consulting the flag at all. Both spellings therefore deny today, by
+  two different mechanisms; #6972 asks whether a content-free prefix should.
 
   The generalisation is one predicate at two node levels — a `system` node with
   `Keys[1] == "login"`, or a `login` node with any key beyond its own — and a

@@ -57,11 +57,18 @@ type SystemConfig struct {
 	//
 	// It matters most on the TOLERANT ingress (Store.Load at boot,
 	// Store.SyncApply from a peer), where the #1960 no-brick doctrine downgrades
-	// the packed finding to a warning and KEEPS the config. Strict commit
-	// rejects, so on that path the flag is never read.
+	// the packed finding to a warning and KEEPS the config.
+	//
+	// It is NOT only the tolerant path (corrected, #6706 review r11). An
+	// earlier revision said "strict commit rejects, so on that path the flag
+	// is never read". Strict rejects the prefixes that NAME something, but it
+	// ACCEPTS the content-free ones — `system login;`, `system login user;` —
+	// because the reporting gate deliberately does not report a prefix naming
+	// nobody. Those commit strictly AND set this flag, so a strict commit is a
+	// live path for it, not one where it is dead.
 	LoginDroppedByPacking bool
-	RootAuthentication *RootAuthConfig
-	Archival           *ArchivalConfig
+	RootAuthentication    *RootAuthConfig
+	Archival              *ArchivalConfig
 	// MasterPassword is a misnomer kept for the Junos token: it holds the
 	// `system master-password pseudorandom-function <fn>` value, i.e. the PRF
 	// ALGORITHM-SELECTOR NAME (e.g. hmac-sha256), NOT key material. The actual

@@ -424,7 +424,7 @@ nothing. The cost differs by level, and the message says which:
 |---|---|---|
 | the instance line | a user with an **empty class** | fail-**closed**: `ResolveLoginClass` maps it to `unauthorized` |
 | the `login` line | `System.Login` present but **empty** | fail-**closed** for non-root (`unauthorized`), root keeps its default |
-| the `system` line | `System.Login == nil` | fail-**OPEN**: `applyCLILoginClass` early-returns, the CLI runs with an empty class — the legacy no-RBAC mode, every command allowed and secrets in cleartext |
+| the `system` line | `System.Login == nil` | fail-**closed** since #6706: `LoginDroppedByPacking` suppresses the legacy early return, so a non-root caller gets `unauthorized` and root keeps its default. (Before #6706 this row WAS fail-OPEN — empty class, every command allowed, secrets in cleartext.) It applies to content-free prefixes too, e.g. `system login;`; whether it should is #6972 |
 
 At every level, zero configured users also means `reconcileAbsentLoginUsers`
 sees an empty desired set and **deprovisions every xpf-managed operator

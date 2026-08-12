@@ -75182,3 +75182,45 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/login_dropped_node_aware_6706_test.go,
   pkg/osident/osident.go, pkg/osident/current_calls_classifier_6706_test.go,
   pkg/cli/identity_6701_test.go, _Log.md
+
+## 2026-08-12 — #6706 review r11b: finish the completeness-claim sweep
+
+- **Timestamp**: 2026-08-12
+- **Action**: Close the remaining five claims from the Codex log's section 10.
+  The sweep rule exists because these cluster: two had already been confirmed
+  and fixed (`_Log.md` "changes nothing for existing configuration",
+  `osident.go:48` "both NARROW"), so the rest were worked as a class rather
+  than left for the next reviewer to re-find.
+- **Measured, not asserted**: `daemon_run.go:728` called the UNSET class "the
+  one outcome more permissive than super-user". Driven through the real
+  `checkPermission` / `showConfigRedacted` for five representative commands:
+  unset denies 0/5 and renders cleartext; super-user denies 0/5 and renders
+  cleartext. They are BEHAVIOURALLY EQUIVALENT, not ordered — corrected to say
+  so and to name the two mechanisms (`userClass == ""` short-circuits;
+  super-user holds PermAll).
+- **The other four**:
+  - `compiler_system_login_gates.go:229-232` — "making the RUNTIME agree costs
+    nothing an operator can see" is counterexampled by the very lockout this
+    review measured (every non-root command flips to denied, silently). Removed
+    and replaced with what it actually costs. This is the same sentence class
+    as the `_Log.md` claim, and more load-bearing because it sits AT the
+    detector.
+  - `types_system.go:58-61` — "Strict commit rejects, so on that path the flag
+    is never read" is false: strict rejects prefixes that NAME something but
+    ACCEPTS the content-free ones, which commit strictly and set the flag. A
+    strict commit is a live path for it.
+  - `docs/system-login.md:423-427` — the system-line row still described the
+    runtime as fail-OPEN. It is fail-CLOSED since #6706; the old text is kept
+    as explicit history and the open question points at #6972.
+  - `docs/config-schema.md:1297-1302` — described BOTH ancestor levels as
+    fail-open with `System.Login == nil`. Only the system level was ever nil;
+    the login level compiles a NON-nil empty LoginConfig and denies through
+    ResolveLoginClass without consulting the flag. Tense corrected and the
+    two mechanisms distinguished.
+- **Validation**: `go test ./pkg/config/... ./pkg/configstore/... ./pkg/daemon/...
+  ./pkg/cli/... ./pkg/osident/... ./cmd/cli/...` rc=0, all 8 packages ok.
+  `gofmt -l` clean on every touched file. Claims-only round: no production
+  logic changed, which is why the test count is unmoved.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
+  pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
+  _Log.md

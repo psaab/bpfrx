@@ -227,9 +227,19 @@ func validateLoginPackedStatementsAST(tree *ConfigTree, lenient bool) ([]string,
 //	                       rendered in CLEARTEXT
 //
 // The packed spelling is the fail-OPEN one, which is the direction that cannot
-// be left to a comment. Reporting them would be a new rejection; making the
-// RUNTIME agree costs nothing an operator can see, so that is what this drives
+// be left to a comment. Reporting them would be a new rejection, so this drives
+// the RUNTIME instead
 // (Config.System.LoginDroppedByPacking -> pkg/daemon applyCLILoginClass).
+//
+// An earlier revision ended that sentence "costs nothing an operator can see".
+// That is FALSE and is removed (#6706 review r11). For a content-free prefix
+// the runtime change is precisely what an operator sees: every non-root command
+// flips from permitted to denied — measured as SetUserClass("unauthorized") for
+// a plain `system login;` — and it happens with no diagnostic at all, because
+// the reporting gate deliberately stays silent for prefixes naming nobody. The
+// change is still the right one (it aligns the packed spelling with the nested
+// one, which already denied), but calling it invisible is how a reviewer
+// concludes no deployment can be affected.
 //
 // It walks the same two ancestor branches collectLoginPackedFindings walks, so
 // the two cannot drift on WHICH shapes count as packed — only on which of them

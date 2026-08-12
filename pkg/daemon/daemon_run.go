@@ -724,8 +724,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// which is only two of them (#6706 review r11): a caller RBAC cannot
 		// place gets the restrictive class, uid 0 keeps the Junos super-user
 		// default, and a config with no `system login` at all leaves the class
-		// UNSET, which is pkg/cli's legacy allow-everything mode and the one
-		// outcome more permissive than super-user.
+		// UNSET, which is pkg/cli's legacy allow-everything mode. An earlier
+		// revision called that "more permissive than super-user"; measured, the
+		// two are BEHAVIOURALLY EQUIVALENT — checkPermission returns nil for
+		// every command under both (`userClass == ""` short-circuits;
+		// super-user holds PermAll) and showConfigRedacted is false for both,
+		// so secrets render in cleartext either way (permissions.go).
 		applyCLILoginClass(shell, d.store.ActiveConfig(), osident.Current())
 
 		// Run CLI in a goroutine so we can still handle signals
