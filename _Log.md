@@ -1,3 +1,105 @@
+## 2026-08-06 — #5718 round 7: two obligations that could never be paid
+
+- **Timestamp**: 2026-08-06 (fix/5718-ha-hardening, PR #6825)
+- **Action**: An independent Claude review and an independent AGY review had
+  BOTH cleared this commit with zero runtime findings; a Codex leg then found
+  two runtime holes underneath them. Both are the same shape at different
+  scales — an obligation is recorded, and the thing that was supposed to
+  discharge it cannot reach it.
+  - **(1) BLOCKING: the write/remove-error branch NEVER ARMED the activation
+    tail.** Not "skipped" — `activationPending = true` had exactly ONE
+    assignment, in Apply's success path, which that branch returns before
+    reaching. The distinction is the whole finding: the branch DOES arm the
+    GLOBAL reload debt, and the global debt is discharged by ANY reload owner.
+    So a transient stale-marker removal failure plus a failed reload arms the
+    global debt; the next commit's device-map teardown removes that marker and
+    reloads successfully (`pkg/daemon/linksetup.go`), clearing the global debt
+    while performing neither tail operation; and the byte-identical Apply that
+    follows sees no change, no global debt, no reconfigure debt and no
+    activation debt — returning `nil` having run neither the per-interface
+    `networkctl reconfigure` nor `restoreSlowPathRPFilter`. Bond/VLAN addresses
+    unapplied, `xpf-usp0`'s rp_filter left at 2, slow-path traffic silently
+    dropped. Armed now BEFORE the branch's own reload (like the success path),
+    and deliberately NOT cleared when that reload succeeds: the reload is half
+    the tail and the reconfigure half still has not run.
+  - **(2) BLOCKING: an owed cold-prime with no firing edge.** `needColdPrime`
+    had exactly one consumer — `shouldColdPrime` in `installConn` — so its only
+    edge was a connection INSTALL that becomes active. The survivor re-drive in
+    `handleDisconnect`, the one other path that could pay it, was gated solely
+    on `!outboundBulkAcked`, and that flag is sticky for the life of the
+    PROCESS: written true once in `sync_conn_read.go` and cleared NOWHERE — not
+    on a full disconnect, not on a supersession. So an ack earned by a PRIOR
+    peer incarnation suppresses the re-drive for the CURRENT one. Reachable
+    sequence: a new incarnation supersedes fabric 0, arming needColdPrime and
+    starting a bulk; the same peer's fabric 1 joins passively while that bulk
+    runs; fabric 0's write fails and BulkSync disconnects it. The obligation is
+    armed, every connection that could fire it is already installed, and the old
+    incarnation's ack suppresses the alternative. It stays armed forever. The
+    incremental sweep only ships sessions newer than its watermark, so
+    established flows are never repaired and a failover to that peer blackholes
+    them.
+    - THE PRINCIPLE, stated in the code: an obligation whose firing edge is an
+      event that has ALREADY PASSED is not deferred, it is lost. The gate keys
+      on the OBLIGATION (`|| needColdPrime`) rather than on the staleness.
+      Clearing `outboundBulkAcked` on supersession would close this path but
+      only this path — an owed cold-prime armed by the FULL-DISCONNECT edge and
+      then failed, with a survivor installed, is the same lost-edge shape with
+      no supersession in it anywhere.
+    - Three parts, each independently load-bearing (each proved by its own
+      revert): the gate, the goroutine's mirrored re-check (bailing on
+      `outboundBulkAcked` alone would make the gate inert — the prior
+      incarnation's ack is true in both places), and a DISCHARGE on success
+      (without it the latch that now triggers the re-drive stays armed after
+      satisfying it, so every later survivor disconnect re-bulks an
+      already-primed peer — a lost obligation traded for one that can never be
+      paid off).
+  - **STICKY-FLAG SURVEY** (asked for explicitly; the shape is a latch that
+    describes a PRIOR incarnation and gates a recovery whose only other edge may
+    have passed). `outboundBulkAcked` was the only one:
+    - `bulkEverCompleted` — equally sticky and never cleared, but #5480 already
+      removed its suppressor role in this package; its remaining cluster-side
+      read only selects log wording. Its `pkg/daemon` readers are outside this
+      diff.
+    - `syncBackfillNeeded`, `forceResync` — both also consumed by the PERIODIC
+      SWEEP (`sync_conn_sweep.go`), a recurring timer edge, so neither can be
+      stranded by a connection edge that already passed. That recurring edge is
+      exactly what `needColdPrime` lacked.
+    - `clockSynced`, `peerHeartbeatAckEver` — cleared on the incarnation-ending
+      edges (full disconnect / supersession).
+    - `bulkRedriveInFlight` — a CAS in-flight guard reset by `defer`.
+  - **Docs.** `pkg/networkd/README.md` carried the exact reasoning error that
+    produced (1): "the write-error path is unaffected: it always returns a
+    non-nil error, so it can never report a false success". The error return is
+    truthful for THAT Apply; what it never did was record the obligation for the
+    NEXT one. Corrected, and the paragraph now says which half of the tail the
+    branch's reload does and does not cover. Also DISCLOSED (not fixed): the
+    reload debt is a package variable, so a daemon restart between a failed
+    reload and its retry drops it with files on disk unactivated — the LOST
+    direction. Not a regression (the pre-PR `Manager.reloadPending` field had the
+    same process lifetime), but a reader just told the debt has "ONE holder" and
+    is "process-scoped" can read that as a durability claim, and it is not one.
+  - **NOT fixed here, deliberately**: #6930 (the `heartbeatZeroSlots`
+    multiply-before-cap) is filed and unreachable with the production 4096-entry
+    shim Array. It is its own issue.
+  - **Revert probes**, each in a throwaway `git archive` extract restored by
+    re-extraction, each an ASSERTION failure at `go test` exit **1**: remove the
+    error-branch arm -> `Manager-only activation tail was lost: reconfigure=0
+    rp_filter="2"`; restore the gate to `!outboundBulkAcked` -> `an owed
+    cold-prime had no firing edge`; restore the goroutine re-check to bail on
+    that flag alone -> the same message (so the mirror is load-bearing, not
+    decorative); remove the discharge -> `a successful re-drive must DISCHARGE
+    needColdPrime`. Over-reach guards stayed GREEN in all four: a successful
+    Apply leaves no activation debt, and a survivor disconnect with NO
+    cold-prime owed still does not re-bulk (#466 flap suppression).
+  - **Test attribution** (the end state alone would not have bound it): the
+    cold-prime test samples `pendingBulkAckEpoch` INSIDE the bulk override,
+    which `doBulkSync` runs before stamping its own epoch. The re-drive
+    goroutine zeroes that field immediately before driving and is the only
+    reachable path here that does. A first draft sampled it AFTER the bulk and
+    read the bulk's own fresh epoch — green for the wrong reason.
+- **File(s)**: pkg/networkd/networkd.go, pkg/networkd/activation_tail_5718_test.go,
+  pkg/networkd/README.md, pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
+  _Log.md
 ## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
 
 - **Timestamp**: 2026-08-12 (fold/6861-ipip-r6, PR #6861)
@@ -2919,6 +3021,85 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   `pkg/cluster/README.md`, `pkg/config/schema_chassis.go`,
   `pkg/config/types_chassis.go`, `pkg/config/compiler_system.go`,
   `pkg/config/testdata/golden_4406.json`, `_Log.md`
+## 2026-08-05 — #5718 C-HA cohort: five surviving hardening items
+
+- **Timestamp**: 2026-08-05 (fix/5718-ha-hardening)
+- **Action**: Implemented the five items the #5718 audit comment confirmed
+  still unimplemented on master (C01b/C01c shipped earlier in PR #6376).
+  Verified each against origin/master ad9591177 before writing code, per the
+  issue's own method note that a naive item-ID grep hits `docs/reviews/**` and
+  `_Log.md` for 100% of items and falsely reads as "all fixed".
+    - **C01a — heartbeat-ACK capability was process-sticky.**
+      `SessionSync.peerHeartbeatAckEver` latches when the peer proves it
+      understands `syncMsgHeartbeat`, and that latch arms two enforcement
+      paths: the `receiveLoop` missed-heartbeat teardown and `PeerHealthy()`'s
+      silence window (which gates manual-failover readiness). It was never
+      cleared, so it outlived the peer incarnation that earned it: on a peer
+      DOWNGRADE (new build acks, then rolls back to a build that never acks)
+      the stale latch turned a healthy old peer into connection churn every
+      two read deadlines plus a permanent "session sync disconnected"
+      failover block. Now cleared in `handleDisconnect`'s FULL-disconnect
+      block, directly beside `clockSynced` — the sibling peer-incarnation
+      capability that was already reset correctly. Deliberately NOT cleared on
+      a partial disconnect: one fabric link dropping while the other holds is
+      the same peer process, and resetting there would disarm both enforcement
+      paths on every link blip.
+    - **A6-b01-C1 — worker clamp cast before clamp.** `heartbeatZeroSlots`
+      did `uint32(maxInt(workers, 1))` BEFORE comparing against
+      `mapCap/heartbeatSlotsPerWorker`, so the narrowing happened before
+      either clamp could see the value. `workers = 1<<32` narrowed to 0, sailed
+      under the high clamp, and returned 0 — zero-initialising NOTHING and
+      leaving every worker on stale heartbeat data; `1<<32+5` narrowed to 5.
+      `workers` is a min-only schema leaf with no upper bound, so both are
+      reachable from config. Both clamps now run in int space and the cast
+      happens on an already-bounded value. The existing #4572 test stopped at
+      999999999, below the narrowing boundary, so it could not see either case.
+    - **A7-b01-C001 — networkd `Clear` forgot activation debt.** Removing the
+      managed files deactivates nothing until `networkctl reload` lands.
+      `Clear` recorded no `reloadPending` on reload failure and returned early
+      on an empty glob, so the second `Clear` found the files already gone and
+      reported a success it had not achieved while the removed addresses /
+      VRFs / bonds / renames stayed live. `Clear` now mirrors `Apply`'s #4954
+      debt contract on both halves: record on failure, and on an empty glob
+      re-run the idempotent reload when debt is outstanding instead of
+      short-circuiting.
+    - **A7-b02-C01 — partial test-manager `Close` panic.** `Manager.Close()`
+      called `m.tunnel.stopAll()` unguarded while `NewManagerWithRuleOpsForTest`
+      / `NewManagerWithRouteListerForTest` leave `m.tunnel` nil and their doc
+      comments promised "Close nil-guards it" (true only of `nlHandle`).
+      `stopAll` takes `t.mu` immediately, so the documented `defer m.Close()`
+      nil-dereferenced. Guarded, and the two stale comments corrected.
+    - **D-A6-b00-C1 — user app-set NAT guard false-passed.** The membership-only
+      `if !want[pp]` check with a length check is satisfied by any multiset
+      whose members are all in `want`, so two duplicate `tcp/4444` terms passed
+      while a missing `udp/5555` went undetected. Rewritten to consume with
+      `delete()` and assert the want set drains, matching the correct sibling
+      test in the same file, plus the per-term shape assertions that keep
+      `Ports[0]` from being an unchecked index.
+- **Validation**: Each guard mutation-proved — reverted individually, watched
+  the specific test go RED from an assertion (or, for the Close guard, the real
+  nil dereference at `routing.go:91`), restored with `touch`, watched it go
+  GREEN. `go vet` was clean under every mutation, so no RED was a build break;
+  build+vet were confirmed clean and disk free BEFORE any mutation so no RED
+  could be a stale-cache or full-disk artifact. C01a was mutated in BOTH
+  directions — dropping the reset fails the incarnation test, hoisting it to
+  every disconnect fails the partial-disconnect scope control — so the guard is
+  pinned to the peer incarnation, neither narrower nor broader than its claim.
+  The D-A6-b00-C1 proof is two-sided: with the duplicate+missing regression
+  injected, the strengthened guard FAILS and the pre-fix guard PASSES.
+  `go test -race ./pkg/cluster/... ./pkg/vrrp/...` and the full `go test ./...`
+  both clean. No cluster/incus/smoke tooling run — the issue notes promoting any
+  of these to material needs `test-failover`, which the campaign lead schedules.
+- **File(s)**: `pkg/cluster/sync.go`, `pkg/cluster/sync_conn.go`,
+  `pkg/cluster/heartbeat_ack_incarnation_5718_test.go`,
+  `pkg/cluster/README.md`, `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/heartbeat_slots_narrowing_5718_test.go`,
+  `pkg/dataplane/userspace/nat_predefined_set_5629_test.go`,
+  `pkg/networkd/networkd.go`, `pkg/networkd/clear_reload_debt_5718_test.go`,
+  `pkg/networkd/README.md`, `pkg/routing/routing.go`,
+  `pkg/routing/test_seams.go`,
+  `pkg/routing/close_partial_manager_5718_test.go`,
+  `pkg/routing/README.md`, `_Log.md`
 
 ## 2026-08-01 — #6588 round 6c: put the two-of-three characterization in the comment
 
@@ -71648,6 +71829,343 @@ break — `go vet` confirmed passing under every revert.
 - **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
   pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
   pkg/cluster/README.md, _Log.md
+- **Timestamp**: 2026-08-05 10:45
+- **Action**: #6825 review fold r1 (#5718 C-HA) — four runtime findings plus two
+  test findings on `fix/5718-ha-hardening`. **F1**: the C01a heartbeat-ack
+  capability was scoped to the peer but not to which INCARNATION of it.
+  `handleDisconnect`'s full-disconnect clear structurally cannot see a
+  SUPERSESSION, which is the peer-reboot shape: a hard reboot sends no
+  FIN/RST, so our conn stays ESTABLISHED, `fabricConnectLoop` will not redial
+  a slot it thinks is connected, the peer's NEW process dials in, and
+  `installConn` swaps the slot — the old `receiveLoop`'s `handleDisconnect`
+  then finds the new conn in place and returns down the stale-disconnect
+  branch, clearing nothing. `installConn` now clears on supersession only (not
+  on the full-disconnect edge, which `handleDisconnect` already covers, and
+  not on a link filling an EMPTY slot beside a live one), and the ack latch
+  moved behind `noteHeartbeatAck`, which tests fabric-slot membership and
+  stores under `s.mu` — atomic with that clear, so an ack already read off the
+  superseded conn cannot re-arm the latch for the incoming incarnation.
+  **F2**: the #4954 reload debt had one Manager-scoped holder while
+  `pkg/daemon` runs `networkctl reload` directly from four sites (linksetup —
+  warn-only, device-map rename + teardown, bootstrap teardown + lifeline) over
+  the same `10-xpf-*` files; their failure was invisible, so the next Apply
+  with unchanged content skipped the reload and returned the #4954 false
+  success. The debt is now process-scoped in `pkg/networkd` and `pkg/daemon`
+  brackets its shell-out with the exported `BeginReload`/`NoteReloadResult`.
+  **F3**: `programBootstrapMapsLocked` read `cfg.Workers` TWICE under
+  different rules, so after the A6-b01-C1 narrowing fix the ctrl fields and the
+  heartbeat bound DISAGREED (`workers 4294967296` -> ctrl says 0 workers/0
+  queues, loop zeroes 128 workers' slots). `planUserspaceWorkers` returns both
+  from one clamp; an AST guard pins the single read. **F4**: the debt clear was
+  a blind store, so a reload that succeeded BEFORE another owner's files
+  existed could erase that owner's debt — a debt cleared whose work never ran.
+  The clear is now epoch-guarded. **Tests**: rebuilt
+  `close_partial_manager_5718_test.go`, which previously passed with
+  `Close` replaced by `return nil` (every expectation was the failure default
+  and the drain fixture had an empty map) — it now installs a live keepalive
+  goroutine and a real netlink handle and observes both released.
+  `networkd.Manager.Clear` has NO production caller and never has (`git log
+  -S`); surfaced at the declaration and in the README rather than papered over.
+  All twelve fixes mutation-proved: `go vet` clean under every mutation, each
+  RED an assertion (M11 a nil-deref panic, the correct mode for a nil guard).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync_conn_read.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/networkd/networkd.go, pkg/networkd/reload_debt_process_5718_test.go,
+  pkg/networkd/reload_debt_4954_test.go,
+  pkg/networkd/clear_reload_debt_5718_test.go, pkg/networkd/networkd_test.go,
+  pkg/networkd/README.md, pkg/daemon/linksetup.go,
+  pkg/daemon/networkctl_reload_debt_5718_test.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
+  pkg/routing/routing.go, pkg/routing/close_partial_manager_5718_test.go,
+  pkg/routing/README.md, _Log.md
+- **Timestamp**: 2026-08-05 17:40
+- **Action**: #6825 review fold r2 (#5718 C-HA) — one MAJOR and two
+  test-acceptance findings against `b11e417f5`. **MAJOR (F1b)**: r1 closed the
+  same-slot supersession edge but not the TWO-FABRIC one. `noteHeartbeatAck`
+  accepted an ack from EITHER slot (`s.conn0 == conn || s.conn1 == conn`) while
+  the supersession clear was scoped to the slot being superseded, so after a
+  peer reboot — no FIN/RST, both sockets still ESTABLISHED, the new process
+  supersedes only the slot it dialled — an in-flight ack off the survivor in
+  the OTHER slot re-armed the capability microseconds after the clear. Same
+  defect one level up. Fixed with a per-slot incarnation stamp: `SessionSync`
+  gains `peerIncarnation` + `conn0Gen`/`conn1Gen` under `mu`, `installConn`
+  stamps each slot at install, and acceptance compares the stamp instead of
+  testing membership. The counter advances only when the SUPERSEDED connection
+  belonged to the current incarnation — evicting an already-stale one is the
+  new incarnation reclaiming its second slot, and advancing there would strand
+  the connection that proved the capability at a stale stamp, permanently
+  disarming both enforcement paths. Residual (a third incarnation whose first
+  dial lands on the stale slot) is the missing peer boot-incarnation wire field
+  #5480 already defers. **Test findings**: the F3 AST guard counted
+  `cfg.Workers` occurrences, which `w := cfg.Workers` defeats with a single
+  read — replaced with a data-flow guard binding the raw value as the
+  `planUserspaceWorkers` argument, one call bound to a name, both ctrl fields
+  and the zero-init bound read from that plan, and no direct clamp-helper call.
+  The rebuilt close test accepted two reversals: closing the handle BEFORE
+  draining keepalives (final state is identical either way) and swapping in a
+  fresh handle while leaking the original. The keepalive goroutine now records
+  whether the handle was still open at the moment it was cancelled — race-free
+  and deterministic in both orderings because `stopAll` blocks on
+  `<-runner.done` — and the original handle pointer is captured up front so
+  identity and closure are both asserted on it. Ten mutations, all `go vet`
+  clean; one (R3) came back GREEN and exposed that the reclaim test only
+  exercised the fabric-1 arm of a per-fabric switch, so both incarnation tests
+  now run in both fabric orderings. A negative control confirms adding
+  `d.wasDisconnected` back to the install clear is INERT — nothing observable
+  rejects it — so a premise test pins the reason instead: every way the
+  registry empties leaves the capability cleared.
+- **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_conn.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
+  pkg/routing/close_partial_manager_5718_test.go, _Log.md
+- **Timestamp**: 2026-08-05 19:20
+- **Action**: #6825 review fold r3 (#5718 C-HA) — Codex gate at `7b29c99b9`
+  found no defect in the incarnation-stamping runtime implementation; both
+  MAJORs were guards that check a proxy instead of the property.
+  **MAJOR 1**: `noteHeartbeatAck`'s doc claimed the incarnation check and the
+  capability store are atomic under `s.mu`, but every test called `installConn`
+  and `handleMessage` in sequence, so none ever opened the window — an
+  implementation that checks under the lock, releases it and only then stores
+  passed 20/20 while allowing a supersession to land in between and resurrect a
+  just-cleared capability. Added `noteHeartbeatAckMidpointHook` (nil in
+  production, `atomic.Pointer`) so a test can start a competing `installConn`
+  from inside that window: the competitor BLOCKS on `s.mu` under the real
+  implementation and completes under the released-early one, and the assertion
+  is on final state so it is deterministic in both. **MAJOR 2**: the F3 AST
+  guard asserted on the `slots := plan.HeartbeatSlots` assignment, which a
+  decoy satisfies — keeping the assignment and writing `slot < plan.Workers`
+  zeroes 6 Array entries instead of 192, leaving 186 heartbeat slots stale. The
+  intermediate variable is gone (the bound is read inline) and the guard now
+  locates the loop by the fact that it writes `heartbeatMap.Update` and asserts
+  on its CONDITION. **Green-by-skip**: r1's R8/R9 cells were scored against a
+  netlink-gated test that SKIPS where netlink is unavailable, and a skipped
+  test reports PASS — the cell is UNKNOWN, not GREEN. Added
+  `Manager.closeHandleFn`, bound in `New()` to the handle it created, so the
+  #848 ordering is now bound by a netlink-free test with an injected release
+  recorder; the real-handle test is relabelled supplementary and
+  environment-gated. Also added a structural guard asserting `conn0`/`conn1`
+  are nilled in exactly one function, which is the premise test's unique job
+  (removing `handleDisconnect`'s clear was already caught by an older
+  assertion). Six mutations C1-C6, all `go vet` clean, all RED with assertions,
+  none skipped.
+- **File(s)**: pkg/cluster/sync_conn.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go,
+  pkg/routing/routing.go, pkg/routing/close_partial_manager_5718_test.go,
+  pkg/routing/README.md, _Log.md
+- **Timestamp**: 2026-08-06 07:10
+- **Action**: #6825 review fold r4 (#5718 C-HA) — two RUNTIME blockers, both
+  regressions my own earlier rounds introduced. **BLOCKER 1**: the r2
+  incarnation stamp taught the ACK path that an installed connection can belong
+  to a dead peer, but left the SEND path on raw slot occupancy.
+  `activeConnLocked` returned `conn0` whenever non-nil, so after a peer reboot
+  whose replacement dialled FABRIC 1 the dead incarnation's still-ESTABLISHED
+  socket was handed to all 18 senders reached through `getActiveConn` — bulk
+  sync pins it once and streams the whole session table into it.
+  `preferredFabricLocked` now prefers a CURRENT-incarnation connection, then the
+  historical fab0-before-fab1 order, falling back to the old preference when
+  nothing is current so the self-correcting write-fail path is unchanged.
+  `installConn` computes `activeAfter` from the same helper AFTER the advance
+  and stamp, and `needColdPrime` re-arms on a supersession of a CURRENT
+  connection: that edge is the new-peer signal #5480 records as unavailable on
+  the wire, and without it a rebooted peer's empty table leaves the standby with
+  no synced sessions and blackholes every established flow on the next failover.
+  **BLOCKER 2**: process-scoping the reload debt (fold F2) collapsed two
+  obligations into one flag. "The kernel re-read the directory" is global, but
+  Apply's TAIL — the per-interface `networkctl reconfigure` and
+  `restoreSlowPathRPFilter` — only Apply can run, and both sit behind
+  `needReload`. When Apply's own reload FAILED (returning early, before the
+  tail, recording no reconfigure debt) and `pkg/daemon` then ran a successful
+  reload, the global debt cleared and the next unchanged Apply skipped the block
+  entirely: addresses never reconfigured, rp_filter left at networkd's default
+  silently dropping locally-originated traffic via the slow-path TUN, and nil
+  returned. `Manager.activationPending` is set on entry and cleared only after
+  the tail, so no external owner can discharge it. Also corrected a miscount in
+  two comments: "6 of 192 at the default worker count" cited the six-worker loss
+  cluster, while `capabilities.go` seeds `Workers: 1` (so 1 of 32 at the
+  default). Seven mutations B1a-B1d/B2a-B2c, all `go vet` clean, all RED with
+  assertions, none skipped.
+- **File(s)**: pkg/cluster/sync_conn.go,
+  pkg/cluster/active_conn_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/networkd/networkd.go, pkg/networkd/activation_tail_5718_test.go,
+  pkg/networkd/README.md, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/worker_count_single_source_5718_test.go, _Log.md
+- **Timestamp**: 2026-08-06 01:10
+- **Action**: #6825 review fold r4b (#5718 C-HA) — a second lane had folded the
+  same two r4 blockers concurrently and pushed first (`13d72300c`). Its
+  networkd fix is substantively identical to the one this lane built
+  independently (a Manager-scoped `activationPending` armed before the first
+  shell-out, cleared only after the tail), so that work was DISCARDED rather
+  than duplicated. For BLOCKER 1 the two lanes took different designs, so this
+  entry records the reconciliation. `13d72300c` made SELECTION
+  incarnation-aware (`preferredFabricLocked`) and re-armed `needColdPrime` on
+  the supersession edge, which fixes where outbound traffic goes. It leaves the
+  retired incarnation's connection INSTALLED, and three other paths read raw
+  slot occupancy rather than the stamp — verified by a regression written
+  against `13d72300c` unmodified, which reds three assertions in both fabric
+  directions: (1) `handleDisconnect` computes `connected := s.conn0 != nil ||
+  s.conn1 != nil`, so when the one LIVE connection later drops it takes the
+  "still connected" branch — `stats.Connected` stays true and `PeerHealthy()`
+  reports a healthy peer with ZERO live connections (the incarnation advance
+  already cleared the latch that gates its silence check), barrier and failover
+  waiters are never released with `failoverAckDisconnected`,
+  `OnPeerDisconnected` never fires, the in-progress bulk receive is never
+  reset; (2) `fabricConnectLoop` skips a fabric whose slot is non-nil, so the
+  link to the new peer process is never redialled and the cluster silently runs
+  on one fabric; (3) `d.wasDisconnected` needs BOTH slots nil, so the
+  full-disconnect cold-prime edge is unreachable while the corpse occupies a
+  slot. Nothing removes it either — `receiveLoop`'s missed-heartbeat teardown
+  is gated on `peerHeartbeatAckEver`, which the advance clears, so identifying
+  the connection as retired is what disarmed its only eviction path. Layered
+  `evictStaleIncarnationConnsLocked` on top: `installConn` closes and clears
+  every slot other than the one just filled whose stamp is stale, restoring the
+  invariant all three readers assume. Both generation checks
+  (`preferredFabricLocked`, `connIsCurrentIncarnationLocked`) are KEPT and
+  re-documented as fail-closed belts against an install path added later that
+  forgets to evict — neither can substitute for the eviction, since each
+  governs one reader and the three above come through neither. Because the
+  eviction makes "installed but stale-stamped" unreachable, the two tests that
+  drove that state through `installConn` were converted to hand-built BELT
+  tests and labelled as such rather than left asserting an impossible fixture.
+  **Also folded**: the AST guard forbidding a second `conn0`/`conn1` nil site
+  gains one exemption, backed by `TestInstallConnNeverLeavesTheRegistryEmpty_5718`
+  (the eviction runs after the incoming conn is installed and skips its slot, so
+  it cannot empty the registry) rather than left as a bare allowlist entry; the
+  "four call sites" comments were a miscount, there are FIVE production
+  `networkctlReload` invocations (linksetup 1, device-map 2, bootstrap 2); the
+  partial-disconnect and empty-slot scope controls were one-sided (fabric-0
+  loss, fabric-1 addition) and now run both orderings; and the daemon success
+  test asserted only that the debt epoch did not move — a proxy unchanged
+  whether a success is reported correctly or not reported at all — so it now
+  asserts the debt STATE via the new exported `networkd.ReloadDebtOutstanding`
+  and drives a concurrent owner's failure from inside the shell-out to bind
+  that `BeginReload` is snapshotted before it. **Validation**: three revert
+  probes, each an ASSERTION not a build break — eviction removed reds "the
+  retired incarnation's fabric-N connection is still INSTALLED" plus the
+  Connected and PeerHealthy assertions; `BeginReload` moved after the shell-out
+  reds the concurrent-owner debt-loss assertion; the success report dropped
+  reds the discharge assertion. Over-reach guards stayed GREEN under the
+  eviction revert: a second fabric into an EMPTY slot is not evicted, and
+  `13d72300c`'s own selection, fallback and cold-prime tests are unaffected.
+  `go test -race -count=1` green on pkg/cluster, pkg/networkd, pkg/daemon,
+  pkg/routing, pkg/dataplane/userspace; pkg/refactoraudit and `go vet` clean.
+  Advances #5718.
+- **File(s)**: pkg/cluster/sync_conn.go,
+  pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/active_conn_incarnation_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md,
+  pkg/networkd/networkd.go, pkg/networkd/reload_debt_process_5718_test.go,
+  pkg/networkd/README.md, pkg/daemon/linksetup.go,
+  pkg/daemon/networkctl_reload_debt_5718_test.go, _Log.md
+- **Timestamp**: 2026-08-06 03:40
+- **Action**: #6825 review fold r5 (#5718 C-HA) — DOCUMENTATION ONLY, no
+  behaviour change. The gate returned a THIRD hole in the same area: a rebooted
+  peer whose replacement enters through an EMPTY alternate slot. Sequence: A
+  holds conn0 with conn1 already down; A hard-reboots leaving conn0 half-open;
+  A' connects on fabric 1; `installConn` sees a non-empty registry but an EMPTY
+  target slot, so BOTH `wasDisconnected` and `supersededCurrent` are false — no
+  incarnation advance, no eviction, no capability clear, no cold-prime arm; A'
+  is stamped with the SAME incarnation as dead conn0, so
+  `preferredFabricLocked` picks the corpse; and when conn0 drops, conn1 keeps
+  `connected` true so the full-disconnect path never runs and A' is never
+  primed. Reproduced firsthand with a throwaway test before writing anything
+  (`activeConn_is_dead_conn0=true`, `shouldColdPrime=false`, and after the conn0
+  drop `Connected=true PeerHealthy=true`); the scratch file was deleted, not
+  committed. **Not fixed locally, deliberately**: step 4 is observationally
+  identical to the routine case (same peer bringing up its second fabric after a
+  link flap) and nothing on the wire distinguishes them — the missing
+  peer-cold/boot-incarnation signal #5480 already records and defers. Any local
+  heuristic that reads it as a reboot also reads every routine second-fabric
+  recovery as one, re-priming the whole session table on each link blip and
+  destroying the #466 flap suppression. Filed as #6910, blocked on #6669 (boot
+  epoch signed into the heartbeat). **One correction to the finding, verified
+  before documenting**: its two halves do NOT decay alike. Step 5 (dead conn0
+  preferred) is TIME-BOUNDED for an ack-capable peer at ~2 read deadlines (~20s
+  at the 10s default) — because this path performs no incarnation advance,
+  `peerHeartbeatAckEver` is NOT cleared, so `receiveLoop`'s missed-heartbeat
+  teardown stays ARMED. That is the exact inverse of the two-fabric supersession
+  case, where the advance clears the latch and disarms the teardown, which is
+  why THAT case needed eviction and this one partly self-heals. Step 6 (A' never
+  primed) is NOT bounded: when conn0 drops, `handleDisconnect` takes the `else
+  if !s.outboundBulkAcked` branch, so A' is re-primed only if our outbound bulk
+  to the OLD A had never been acked — in steady state it had, so nothing fires.
+  Step 6 is the half that genuinely needs #6669. Documented in
+  `pkg/cluster/README.md` (full six-step sequence, why it is locally
+  undecidable, the bounded/unbounded split, #6910 + #6669), at the
+  `supersededCurrent` classification site and in
+  `evictStaleIncarnationConnsLocked` (so a maintainer reading either does not
+  rediscover the limit), and on `TestSecondFabricComingUpIsNotEvicted_5718` and
+  `TestRoutineInstallDoesNotReArmColdPrime_5718`, which now say they pin the
+  ROUTINE reading deliberately and must not be "fixed" into failing. Rebased
+  onto master 5d20e13de: `_Log.md` union-resolved (0 deletions against master
+  AND against the pre-rebase branch; all five PR rounds present) plus one real
+  code conflict in `pkg/cluster/sync.go`, where #5078/#6865 had rewritten the
+  `authProvider` doc — resolved keeping BOTH master's updated comment and this
+  branch's `peerIncarnation`/`conn0Gen`/`conn1Gen` fields. No assertion, no
+  classification and no heuristic changed. Advances #5718.
+- **File(s)**: pkg/cluster/README.md, pkg/cluster/sync_conn.go,
+  pkg/cluster/sync.go, pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/active_conn_incarnation_5718_test.go, _Log.md
+
+## 2026-08-06 — #6825 fold r6 (Codex r6 residual findings)
+
+- **Timestamp**: 2026-08-06 01:05 PDT
+- **Action**: Make the eviction helper's registry-non-emptiness intrinsic
+  rather than a call-site accident; assert the activation tail's reconfigure
+  ARGUMENTS, not just its call count; correct three comments whose premise
+  fold r4b's eviction had falsified.
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/README.md, pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go,
+  pkg/networkd/activation_tail_5718_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/cluster ./pkg/networkd
+  ./pkg/daemon -count=1 -race rc=0. Both new guards proven to fire, with the
+  pre-existing guards staying GREEN under the same mutations (negative
+  control): M1 (neutralise the keep-slot refusal) reds only
+  TestEvictionRefusesToEmptyTheRegistry_5718; M2 (reconfigure a wrong but
+  nonempty interface) reds only the two activation-tail argv assertions.
+
+## 2026-08-06 — #6825 fold r8 (Codex r7 findings, all against my own r6 fold)
+
+- **Timestamp**: 2026-08-06 01:55 PDT
+- **Action**: Both r6 guards were narrower than their claims. The eviction
+  refusal test populated only conn1, so the `case 1` keep-slot arm was
+  unbound; the argv fixture had one eligible interface, so the bond-member
+  exclusion the comment advertised was untested. Fixed both, and corrected
+  five overstated invariants (four of them mine).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/README.md, pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go,
+  pkg/networkd/activation_tail_5718_test.go
+- **Validation**: go build ./... rc=0; go test ./pkg/cluster ./pkg/networkd
+  ./pkg/daemon -count=1 -race rc=0. M4 (neutralise the keep-slot refusal)
+  now reds ALL THREE subtests including keep_slot_1_empty, with
+  TestInstallConnNeverLeavesTheRegistryEmpty_5718 and
+  TestOnlyHandleDisconnectEmptiesTheRegistry_5718 GREEN as the negative
+  control. M3 (drop the bond-member exclusion) now reds both activation-tail
+  tests with `[reconfigure trust0 lag0m]` vs `[reconfigure trust0]`; before
+  the fixture change that mutation passed.
+
+## 2026-08-06 — #6825 fold r10 (Codex r9 prose findings)
+
+- **Timestamp**: 2026-08-06 02:50 PDT
+- **Action**: Correct three remaining categorical claims, all mine from r8.
+  Comment/string-literal only — zero executable Go lines changed.
+- **File(s)**: pkg/cluster/supersession_eviction_5718_test.go,
+  pkg/cluster/heartbeat_ack_incarnation_5718_test.go, pkg/cluster/README.md
+- **Validation**: go build ./... rc=0; go test ./pkg/cluster ./pkg/networkd
+  -count=1 rc=0; gofmt clean. Codex r9 stated plainly that its gate failed on
+  invariant prose, not runtime behaviour, and separately re-verified the two r8
+  guards: a mutation confined to the switch's `case 1` arm reds ONLY
+  keep_slot_1_empty, and deleting `&& ifc.BondMaster == ""` reds both
+  activation-tail tests with [reconfigure trust0 lag0m].
+- **Known-unbound, recorded not fixed**: three other wrong-interface
+  regressions on the activation tail remain unbound and were mutation-proven
+  to exit 0 — a hardcoded "trust0", removal of the unmanaged/disabled
+  filtering, and reversed multi-interface accumulation/order. The fixture
+  closes the bond-member arm only; the comment claims only that arm.
 
 ## 2026-08-06 — #6861 fold r1 (gate F1 BLOCKING / F2 REGRESSION / F3)
 
