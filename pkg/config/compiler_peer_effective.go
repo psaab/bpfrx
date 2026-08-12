@@ -76,18 +76,36 @@ var peerEffectiveStrictSubjects = []peerEffectiveStrictSubject{
 
 // ValidatePeerEffectiveStrict re-runs every registered strict subject against
 // the PEER node's effective compiled view, so a chassis-cluster commit
-// adjudicates the peer-effective output as well as the submitting node's.
+// adjudicates the REGISTERED peer-effective concerns as well as the submitting
+// node's. "The registered concerns", not "the peer-effective output": the
+// registry below holds exactly two subjects (source NAT and the emitted-IPIP
+// endpoint), and calling this an adjudication of the output overstates a
+// two-item list (#6861 re-gate C2).
 //
 // The guarantee is CONDITIONAL and the condition is not a formality: it holds
 // only when the peer view COMPILES. If CompileConfigForNodeLenient returns an
 // error the arm below returns nil and EVERY peer subject is skipped, so the
-// commit passes having adjudicated nothing about the peer. That arm is
-// reachable — the lenient compile still hard-errors on the pre-expansion
-// collision gates (validateTunnelEndpointIDCollisionAST in compiler.go is
-// returned unconditionally, with no lenient flag) — and it is deliberate, for
-// the reason spelled out two paragraphs down. Do not read this as "both node-
-// effective outputs are proven installable": a peer view that will not compile
-// is NOT adjudicated here, by design.
+// commit passes having adjudicated nothing about the peer.
+//
+// That arm IS reachable, but not for the reason an earlier revision of this
+// comment gave (#6861 re-gate C1). It cited validateTunnelEndpointIDCollisionAST
+// as "returned unconditionally, with no lenient flag" — false: its signature is
+// (tree *ConfigTree, lenient bool) (tunnelid.go), both call sites pass
+// opts.sanitizeFreeTextControlChars (compiler.go), and lenientCompileOpts sets
+// that true (compiler_opts.go), so on the lenient path it WARNS. A maintainer
+// following that citation would find the gate already lenient, conclude this
+// arm unreachable, and delete the clone+rewrite in configstore store.go that
+// exists precisely because it is not.
+//
+// The reachable hard error on the lenient path is validateDataplaneTypeStrict
+// (compiler_validate_strict.go), called from compiler_earlystrict.go with no
+// lenient downgrade — which is the citation configstore store.go already gives
+// correctly, and the exact case the #6861 F2 clone+rewrite handles. An
+// undefined `apply-groups` reference (compiler.go) is a second one.
+//
+// Do not read any of this as "both node-effective outputs are proven
+// installable": a peer view that will not compile is NOT adjudicated here, by
+// design.
 //
 // The peer view is produced with CompileConfigForNodeLenient(peerID) — the EXACT
 // transform the standby applies on Store.SyncApply — so what is validated is

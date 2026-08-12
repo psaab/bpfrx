@@ -1091,6 +1091,27 @@ func TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861(t *testing.T) {
 // device name. Pointer keying is correct without depending on another gate
 // staying in place, which is why it is kept.
 //
+// WHAT THIS FIXTURE ESTABLISHES, exactly (#6861 re-gate B2). It proves IDENTITY
+// SEMANTICS versus NAME KEYING: there is one emitted reference, its record is a
+// DIFFERENT object from the candidate, the two Names are equal, and that Name is
+// absent from the live device set — so a name-keyed set suppresses a warning
+// that an identity-keyed one raises. It does NOT prove that a literal Go pointer
+// is the only implementation; any keying on record identity would do, and
+// deleting the emitted clause outright still produces the warning (its sibling
+// TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861 is what catches that deletion,
+// deliberately — existence and keying are separate properties).
+//
+// AND ITS RENDERED REMEDIATION IS NOT ACCURATE FOR THIS SHAPE. The advisory
+// tells the operator that removing the interface-level `tunnel` stanza would
+// drop the anchor. Here it would not: collectAppliedTunnels submits both the
+// unrelated interface WireGuard record and this IPIP record under the same base
+// device, routing reconciles every record, so the WireGuard record retains or
+// recreates that TUN. The device is SHARED, not uniquely created by the IPIP
+// site. The wording is written for the committable single-owner case and this
+// fixture is reachable only on the tolerant surface; it is recorded here rather
+// than rewritten because the assertion under test is the KEYING, and narrowing
+// the shared production text for a tolerant-only shape is a separate change.
+//
 // RED-on-revert: re-key the clause to a name-keyed set
 // (`!emittedName[t.Name]`, built from the same EmitTunnelEndpointNames walk)
 // and this fails at "the anchor advisory did not fire".
@@ -1125,6 +1146,12 @@ func TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861(t *testing.T) {
 		t.Fatalf("fixture precondition: expected exactly the emitted \"gr-0/0/0.1\" "+
 			"endpoint, got %d: %+v", len(eps), eps)
 	}
+	// FORWARD ASSERT, not a reachable branch (#6861 re-gate T3). Once the check
+	// above has pinned the sole emitted ref to "gr-0/0/0.1", its record is by
+	// construction the tunnel of a DIFFERENT interface than `gr-0/0-0`, so this
+	// can no longer fail. It is kept deliberately: it states the property the
+	// discriminator depends on at the point a future fixture edit would break
+	// it, and such an edit would land here before it landed on the assertion.
 	if eps[0].Tunnel == rec {
 		t.Fatalf("fixture precondition: the emitted record must be a DIFFERENT object " +
 			"from the candidate, else pointer and name keying cannot disagree")
@@ -1140,13 +1167,27 @@ func TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861(t *testing.T) {
 			rec.Name)
 	}
 
+	// The candidate must carry NO units. Without this the matcher below can go
+	// vacuous (#6861 re-gate T1): a unit added by fixture or compiler drift
+	// would emit its OWN anchor warning under the same `interfaces "gr-0/0-0"`
+	// substring, so name keying could suppress the INTERFACE warning this test
+	// is about while len(anchor)==1 stayed green on the unit's.
+	if len(cand.Units) != 0 {
+		t.Fatalf("fixture precondition: the candidate must have NO units (has %d) — a "+
+			"unit contributes its own anchor warning matching the same substring, which "+
+			"would let this test pass on the wrong warning", len(cand.Units))
+	}
+
 	// The candidate is a genuine dead ipip anchor and the operator must hear
 	// about it. Under name keying the unrelated WireGuard record's Name
 	// suppresses this warning entirely.
 	var anchor []string
 	for _, w := range ValidateConfig(cfg) {
+		// The EXACT interface-site prefix, not merely the interface name: a unit
+		// warning renders `interfaces "gr-0/0-0" unit N tunnel mode ipip:` and
+		// would satisfy a substring match on the name alone.
 		if strings.Contains(w, "kernel anchor device") &&
-			strings.Contains(w, `interfaces "gr-0/0-0"`) {
+			strings.HasPrefix(w, `interfaces "gr-0/0-0" tunnel mode ipip:`) {
 			anchor = append(anchor, w)
 		}
 	}
@@ -1156,5 +1197,145 @@ func TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861(t *testing.T) {
 			"it creates a kernel anchor carrying nothing; a name-keyed emitted set "+
 			"suppresses it because a DIFFERENT interface (\"gr-0/0/0\") canonicalizes "+
 			"to the same device name %q: %v", len(anchor), rec.Name, anchor)
+	}
+}
+
+// TestIpipAnchorIgnoresAnEndpointTheRuntimeDrops_6861 binds the ID-COLLISION
+// arm of the live set (#6861 re-gate B1).
+//
+// THE DEFECT. `emittedTunnelDeviceNames` recorded every EMITTED endpoint
+// reference as live. Being emitted is necessary but not sufficient: the builder
+// (buildTunnelEndpointSnapshots) hashes each ref to a StableTunnelEndpointID
+// and appends NOTHING when the id is already taken, so the later-sorting
+// collider never becomes an endpoint. Counting it live suppressed the anchor
+// advisory for a device that genuinely carries no traffic — the exact inverse
+// of what this advisory exists to report, and the operator gets SILENCE.
+//
+// WHY THE TOLERANT PATH IS THE WHOLE POINT. `validateTunnelEndpointIDCollisionAST`
+// rejects this config at strict commit, so an operator typing it is stopped.
+// The tolerant ingress is not: Store.Load at boot and Store.SyncApply from a
+// peer keep it (#1960 no-brick), and `show system alarms` recomputes
+// ValidateConfig — which is the surface asserted here.
+//
+// THE FIXTURE IS NOT HAND-PICKED. `wg0` and `wg34524.0` are the collision pair
+// already frozen by TestTunnelEndpointIDOverflowOnlyUnitHashesBareRef
+// (tunnelid_test.go), so this test cannot silently stop colliding: the
+// precondition below re-asserts the fold, and if StableTunnelEndpointID ever
+// changes, that test fails too rather than this one going vacuously green.
+func TestIpipAnchorIgnoresAnEndpointTheRuntimeDrops_6861(t *testing.T) {
+	if a, b := StableTunnelEndpointID("wg0"), StableTunnelEndpointID("wg34524.0"); a != b || a != 17799 {
+		t.Fatalf("precondition: wg0=%d wg34524.0=%d, want both 17799 — this fixture is "+
+			"only a collision because those two refs fold together (tunnelid_test.go)", a, b)
+	}
+	cmds := []string{
+		// Complete GRE on wg0 with NO units: emits the bare ref "wg0", which
+		// sorts first and therefore CLAIMS id 17799 at the builder.
+		"set interfaces wg0 tunnel mode gre",
+		"set interfaces wg0 tunnel source 10.0.0.1",
+		"set interfaces wg0 tunnel destination 10.0.0.2",
+		// The subject: an interface-level IPIP anchor whose unit 0 overrides it
+		// with a complete GRE. The emitter publishes the UNIT's pointer as
+		// "wg34524.0" — which collides and is dropped — while the interface's
+		// own IPIP record still creates the "wg34524" kernel device.
+		"set interfaces wg34524 tunnel mode ipip",
+		"set interfaces wg34524 tunnel source 10.0.1.1",
+		"set interfaces wg34524 unit 0 tunnel mode gre",
+		"set interfaces wg34524 unit 0 tunnel source 10.0.1.1",
+		"set interfaces wg34524 unit 0 tunnel destination 10.0.1.2",
+	}
+	tree := ipipTree(t, cmds...)
+
+	// Strict commit must still REJECT — the collision gate owns that, and if it
+	// ever stopped firing this fixture would be reachable by an ordinary commit
+	// and the test would be about a different thing.
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("strict commit ACCEPTED a tunnel-endpoint id collision; this fixture is " +
+			"supposed to be reachable only through the tolerant ingress")
+	} else if !strings.Contains(err.Error(), "collision") {
+		t.Fatalf("strict rejection is not the collision gate: %v", err)
+	}
+
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("tolerant compile must keep this config (#1960 no-brick): %v", err)
+	}
+
+	// PRECONDITION, so the assertion below cannot pass for the wrong reason:
+	// BOTH refs are emitted and they DO collide. Without this, a fixture that
+	// stopped emitting the unit ref would make the advisory fire trivially.
+	var refs []string
+	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		refs = append(refs, ep.Name)
+	}
+	if len(refs) != 2 || refs[0] != "wg0" || refs[1] != "wg34524.0" {
+		t.Fatalf("emitted refs = %q, want exactly [wg0 wg34524.0] in that order — the "+
+			"builder keeps the FIRST and drops the second, so the order is load-bearing", refs)
+	}
+
+	// The live set must NOT contain the dropped endpoint's device.
+	live := emittedTunnelDeviceNames(cfg)
+	if !live["wg0"] {
+		t.Fatal(`live set lost "wg0" — the collision WINNER must stay live`)
+	}
+	if live["wg34524"] {
+		t.Fatal(`live set contains "wg34524", whose only emitted endpoint ("wg34524.0") ` +
+			`the builder DROPS on the id collision — an endpoint the runtime never ` +
+			`creates must not count as live, or the anchor advisory is suppressed for a ` +
+			`device that carries nothing (#6861 B1)`)
+	}
+
+	// And the advisory must reach the real alarm surface, naming the anchor.
+	var ipipWarns []string
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "ipip") {
+			ipipWarns = append(ipipWarns, w)
+		}
+	}
+	if len(ipipWarns) != 1 {
+		t.Fatalf("ValidateConfig produced %d ipip warning(s), want exactly 1:\n%s",
+			len(ipipWarns), strings.Join(ipipWarns, "\n"))
+	}
+	if !strings.HasPrefix(ipipWarns[0], `interfaces "wg34524" tunnel mode ipip:`) {
+		t.Fatalf("the ipip warning is not the wg34524 interface anchor: %s", ipipWarns[0])
+	}
+}
+
+// TestIpipAnchorCollisionDropDoesNotOverreach_6861 is the negative control for
+// the drop above: the SAME two interfaces, renamed so their ids no longer
+// collide, must produce NO anchor advisory at all.
+//
+// Without this, a mutation that dropped every emitted ref from the live set —
+// or simply broke the id computation so nothing ever matched — would leave the
+// test above green while manufacturing a false "this device is dead" against a
+// perfectly live GRE endpoint, which is the failure direction this advisory
+// must never take.
+func TestIpipAnchorCollisionDropDoesNotOverreach_6861(t *testing.T) {
+	cmds := []string{
+		"set interfaces wg0 tunnel mode gre",
+		"set interfaces wg0 tunnel source 10.0.0.1",
+		"set interfaces wg0 tunnel destination 10.0.0.2",
+		// wg1 instead of wg34524: same shape, no id collision.
+		"set interfaces wg1 tunnel mode ipip",
+		"set interfaces wg1 tunnel source 10.0.1.1",
+		"set interfaces wg1 unit 0 tunnel mode gre",
+		"set interfaces wg1 unit 0 tunnel source 10.0.1.1",
+		"set interfaces wg1 unit 0 tunnel destination 10.0.1.2",
+	}
+	cfg, err := CompileConfig(ipipTree(t, cmds...))
+	if err != nil {
+		t.Fatalf("the non-colliding twin must COMMIT: %v", err)
+	}
+	if a, b := StableTunnelEndpointID("wg0"), StableTunnelEndpointID("wg1.0"); a == b {
+		t.Fatalf("control fixture collides after all (both %d); pick another name", a)
+	}
+	live := emittedTunnelDeviceNames(cfg)
+	if !live["wg0"] || !live["wg1"] {
+		t.Fatalf("both devices must be live with no collision, got %v", live)
+	}
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "ipip") {
+			t.Fatalf("no-collision twin raised an ipip advisory against a live GRE "+
+				"endpoint: %s", w)
+		}
 	}
 }

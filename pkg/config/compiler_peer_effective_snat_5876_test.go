@@ -20,8 +20,14 @@ import (
 // configstore.compileTreeStrict) re-runs the strict SOURCE-NAT validators
 // against the PEER node's effective compile — the same
 // CompileConfigForNodeLenient transform the standby applies — so a peer-only
-// source-NAT error is rejected at the origin commit, proving BOTH node-effective
-// views are representable before promotion.
+// source-NAT error is rejected at the origin commit.
+//
+// NOT "proving BOTH node-effective views are representable" (#6861 re-gate C2).
+// The gate runs a REGISTERED subject list, currently two items, and it is
+// conditional on the peer view compiling at all: ValidatePeerEffectiveStrict
+// returns nil for a peer view that does not compile, adjudicating nothing. What
+// is proven is that the registered source-NAT subject was evaluated against the
+// peer view, which is what these cases assert.
 //
 // These tests use ParseSetCommand + tree.SetPath (buildTreeFromSet) per
 // CLAUDE.md — NewParser must not be used for multi-line set input. A faithful HA

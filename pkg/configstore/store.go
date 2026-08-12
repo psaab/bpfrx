@@ -412,12 +412,17 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := crossCheckRAIntervals(compiled); err != nil {
 		return nil, err
 	}
-	// #5876 + #4785: a chassis-cluster commit must adjudicate BOTH node-effective
-	// views before promotion, not only the submitting node's. "Adjudicate", not
-	// "prove installable": the peer gate below is conditional on the peer view
-	// COMPILING, and a peer view that does not compile is deliberately left
-	// unadjudicated here (see ValidatePeerEffectiveStrict, and the #6861 F2
-	// paragraph further down for the case where that swallow bit).
+	// #5876 + #4785: a chassis-cluster commit must adjudicate the REGISTERED
+	// peer-effective concerns on BOTH node-effective views before promotion, not
+	// only the submitting node's. Two qualifiers, both load-bearing. "The
+	// registered concerns", because the registry holds exactly two subjects
+	// (source NAT and the emitted-IPIP endpoint) — "adjudicates the
+	// peer-effective view" would claim a completeness it does not have (#6861
+	// re-gate C2). And "adjudicate", not "prove installable": the peer gate
+	// below is conditional on the peer view COMPILING, and a peer view that does
+	// not compile is deliberately left unadjudicated (see
+	// ValidatePeerEffectiveStrict, and the #6861 F2 paragraph further down for
+	// the case where that swallow bit).
 	// This gate compiles for the local node alone (CompileConfigForNode above),
 	// so a ${node} apply-group substitution / per-node rewrite that selects a
 	// source-NAT pool valid on the origin but invalid on the peer — or a

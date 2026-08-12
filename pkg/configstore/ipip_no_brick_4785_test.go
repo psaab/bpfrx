@@ -246,7 +246,15 @@ func TestLoadToleratesIpip_4785(t *testing.T) {
 // halves of #1960, and a fix that satisfied the first by weakening the second
 // would delete this PR's whole point.
 //
-// Stays GREEN under both reverts.
+// MUTATION RESULT, re-measured (#6861 re-gate C3). An earlier comment said this
+// test "stays GREEN under both reverts". It does not. Reverting the tolerance
+// (lenientIpipTunnelMode -> false) turns it RED at its SyncApply PRECONDITION
+// on line ~253 — "precondition: the ingress must tolerate the stanza: sync
+// config compile error: tunnel endpoint \"ip-0/0/0\" has mode ipip ..." — not
+// at its own CommitCheck assertion. That distinction is the point of recording
+// it: a RED here does not mean this test caught a relaxed commit gate, it means
+// the fixture could no longer be set up. Read a failure of this test by which
+// line failed, never by the fact that it failed.
 func TestSyncApplyIpipDoesNotRelaxTheStrictCommit_4785(t *testing.T) {
 	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	if _, err := s.SyncApply(ipipSyncConfig, nil); err != nil {
@@ -371,7 +379,18 @@ func TestPeerGateSeesTheTreeThePeerCompiles_4785(t *testing.T) {
 // removing the leaf that must still SYNC so the standby's own tolerance handles
 // it.
 //
-// Stays GREEN under the revert (the raw-tree version never rewrote anything).
+// MUTATION RESULT, re-measured (#6861 re-gate C3). An earlier comment said this
+// test "stays GREEN under the revert (the raw-tree version never rewrote
+// anything)". It does not. Under the raw-tree revert it turns RED at its own
+// PRECONDITION on line ~385 — "precondition: this tree must be rejected for the
+// peer's IPIP endpoint" — because the raw tree makes the peer view fail to
+// compile, ValidatePeerEffectiveStrict takes its out-of-scope arm, and the
+// commit is ACCEPTED. The over-reach property this test exists for (the
+// candidate is not mutated) is never reached.
+//
+// Its sibling TestPeerGateSeesTheTreeThePeerCompiles_4785 is the test that
+// actually binds that revert, and it fails on its real assertion: "node0
+// COMMITTED a config that gives node1 a dead IPIP tunnel." Both were run.
 func TestPeerGateRewriteDoesNotMutateTheCandidate_4785(t *testing.T) {
 	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
 	s.SetNodeID(0)
@@ -391,5 +410,101 @@ func TestPeerGateRewriteDoesNotMutateTheCandidate_4785(t *testing.T) {
 			"The rewrite models the standby's ingest and must run on a CLONE — the "+
 			"leaf has to survive to sync so the standby's own tolerance handles it "+
 			"(#6861 F2). candidate:\n%s", shown)
+	}
+}
+
+// ipipPointerKeyingSyncConfig is the pointer-keying discriminator fixture in
+// CONFIG TEXT, so it can be driven through the real store ingress rather than
+// through the compiler directly.
+//
+// Two interface keys canonicalizing to one Linux name (`gr-0/0-0` and
+// `gr-0/0/0` both give `gr-0-0-0`), plus an interface-level WireGuard stanza
+// whose lowest unit is > 0 — so the emitter publishes the INTERFACE pointer at
+// ref `gr-0/0/0.1` while TunnelNameMap resolves that ref to the UNIT device
+// `gr-0-0-0u1`. `gr-0-0-0` is therefore emitted-by-NAME but absent from the
+// live device set, which is what makes name keying and identity keying
+// disagree.
+const ipipPointerKeyingSyncConfig = `interfaces {
+    gr-0/0/0 {
+        tunnel {
+            mode wireguard;
+        }
+        unit 1 {
+            tunnel {
+                mode wireguard;
+            }
+        }
+    }
+    gr-0/0-0 {
+        tunnel {
+            mode ipip;
+            source 10.0.0.1;
+        }
+    }
+}`
+
+// TestSyncApplyRendersThePointerKeyedAnchor_4785 binds the TOLERANT-SURFACE
+// claim at the STORE INGRESS, which is where it is actually made (#6861 re-gate
+// T2).
+//
+// The compiler-side test (pkg/config
+// TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861) drives
+// CompileConfigLenient. That proves the advisory keying, but it does NOT prove
+// the fixture is reachable: its whole justification is "a strict commit refuses
+// this config, so it only exists on the tolerant surface". If a future
+// pre-compile admission gate at Store.Load / Store.SyncApply rejected this shape
+// before the compiler ever ran, the compiler test would stay green while the
+// surface it cites disappeared — the exact shortfall this PR's own header raises
+// for the sibling property.
+//
+// So this asserts the chain the claim depends on, at the store:
+//
+//  1. a strict COMMIT of the same config is REFUSED (else the fixture is not
+//     tolerant-only and the pointer clause's justification changes), and
+//  2. SyncApply ACCEPTS it, and
+//  3. the anchor advisory is present in the accepted config's warnings — which
+//     is what `show system alarms` re-renders via ValidateConfig.
+func TestSyncApplyRendersThePointerKeyedAnchor_4785(t *testing.T) {
+	// (1) The strict commit must refuse it. This is the premise, not decoration:
+	// if it ever commits, the "tolerant surface only" scope in
+	// compiler_validate_strict_tunnel_ipip.go is wrong and must be revisited.
+	strict := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	if err := strict.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := strict.LoadOverride(ipipPointerKeyingSyncConfig); err != nil {
+		t.Fatalf("LoadOverride: %v", err)
+	}
+	if _, err := strict.CommitCheck(); err == nil {
+		t.Fatal("a strict commit ACCEPTED the duplicate-Linux-name fixture. The pointer " +
+			"clause is justified as protecting the TOLERANT surface precisely because " +
+			"this shape cannot be committed; if it can, that scope statement is wrong")
+	}
+
+	// (2) The tolerant ingress must accept it.
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	cfg, err := s.SyncApply(ipipPointerKeyingSyncConfig, nil)
+	if err != nil {
+		t.Fatalf("SyncApply REJECTED the fixture; the tolerant ingress is where this "+
+			"advisory is claimed to matter, so a rejection here makes the claim "+
+			"unreachable rather than merely untested: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("SyncApply returned a nil config with no error")
+	}
+
+	// (3) The anchor advisory must be in what the alarm surface re-renders.
+	var anchor []string
+	for _, w := range config.ValidateConfig(cfg) {
+		if strings.HasPrefix(w, `interfaces "gr-0/0-0" tunnel mode ipip:`) &&
+			strings.Contains(w, "kernel anchor device") {
+			anchor = append(anchor, w)
+		}
+	}
+	if len(anchor) != 1 {
+		t.Fatalf("the ingested config renders %d anchor advisories for the dead ipip "+
+			"record on \"gr-0/0-0\", want exactly 1. `show system alarms` recomputes "+
+			"ValidateConfig over the ACTIVE config, so this is what the operator sees: %v",
+			len(anchor), config.ValidateConfig(cfg))
 	}
 }

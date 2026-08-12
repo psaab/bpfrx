@@ -101,8 +101,45 @@ func emittedTunnelDeviceNames(cfg *Config) map[string]bool {
 	if cfg == nil {
 		return nil
 	}
+	// The ID-COLLISION DROP, mirrored from the builder. Being emitted is
+	// necessary but NOT sufficient for an endpoint to reach the snapshot:
+	// buildTunnelEndpointSnapshots (pkg/dataplane/userspace/tunnels.go) hashes
+	// each ref to a StableTunnelEndpointID and RETURNS — appending nothing —
+	// when that id is already taken, so the later-sorting collider is dropped.
+	// Counting it as live suppressed the advisory for an anchor whose endpoint
+	// the runtime will never create, which is the exact inverse of this
+	// advisory's job: the operator gets silence about a dead device (#6861
+	// re-gate B1).
+	//
+	// Measured on the frozen pair pinned by tunnelid_test.go (StableTunnelEndpointID
+	// "wg0" == "wg34524.0" == 17799): complete GRE `wg0` plus interface-level
+	// IPIP `wg34524` overridden by a complete unit-0 GRE emits both refs, the
+	// runtime keeps `wg0` and drops `wg34524.0`, and before this loop
+	// live["wg34524"] was true — so the `wg34524` device the IPIP anchor
+	// creates had no endpoint and no alarm.
+	//
+	// The iteration order is the builder's: EmitTunnelEndpointNames is the SSOT
+	// both walk (sorted interface names, sorted unit numbers), and the builder
+	// feeds addEndpoint straight from it, so "first wins" means the same ref
+	// here as there.
+	//
+	// WHAT THIS STILL DOES NOT MODEL, stated rather than implied: addEndpoint
+	// also skips a ref whose interface is absent from the runtime
+	// InterfaceSnapshot rows (its `ifaceByName` lookup), and this function has
+	// no ifindex knowledge — it never did. So a collision whose WINNER has no
+	// kernel device would, at runtime, leave the loser installed, and this loop
+	// drops the loser anyway. That conjunction (a missing kernel device AND an
+	// id collision) is the one shape where the drop can produce a false "this
+	// device is dead"; within the model this function has always used — every
+	// emitted ref is present — the drop is exactly the builder's rule.
 	emittedRefs := make(map[string]bool)
+	usedIDs := make(map[uint16]string)
 	for _, ep := range EmitTunnelEndpointNames(cfg) {
+		id := StableTunnelEndpointID(ep.Name)
+		if _, taken := usedIDs[id]; taken {
+			continue
+		}
+		usedIDs[id] = ep.Name
 		emittedRefs[ep.Name] = true
 	}
 	refToDevice := cfg.TunnelNameMap()
@@ -263,10 +300,19 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // re-keying and therefore proves only that SOME emitted-check is present.
 //
 // The keying is decided by the one shape where an emitted record is NOT `t` yet
-// shares `t.Name`, with that name absent from live[]. Two records share a Name
-// only as an interface-level record and its own unit 0 — where TunnelNameMap
+// shares `t.Name`, with that name absent from live[]. The shapes that can put an
+// interface-site candidate on a SHARED, NON-LIVE Name are two — and that
+// qualified statement is the exhaustive one (#6861 re-gate C4). An earlier
+// revision claimed Name sharing itself had only two sources, which is false: an
+// interface authored `gr-0/0/0u1` shares a Name with `gr-0/0/0 unit 1`, a third
+// and COMMITTABLE shape. It cannot be turned into a discriminator here (the unit
+// ref puts that very name in live[], so the device clause decides first), so the
+// conclusion is unchanged; the underlying authored-vs-derived name collision is
+// filed separately as #6964. The two that do decide the keying:
+//
+// An interface-level record and its own unit 0 — where TunnelNameMap
 // puts that very name in live[], so the device clause decides first and the
-// keying never matters — or as two DIFFERENT interface keys canonicalizing to
+// keying never matters — or two DIFFERENT interface keys canonicalizing to
 // one Linux name, since LinuxIfName only replaces '/' with '-' (`gr-0/0-0` and
 // `gr-0/0/0` both give `gr-0-0-0`). Pair that with interface-level WireGuard
 // whose lowest unit is > 0, where the emitter publishes the INTERFACE pointer at
@@ -277,14 +323,27 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861, which reds on
 // exactly that re-keying.
 //
-// SCOPE of that difference, because it bounds the claim: a strict commit
-// REJECTS such a config — the duplicate Linux-device-name gate fires on the two
-// interface keys. On anything committable the two keyings are equivalent. What
-// pointer keying protects is the TOLERANT surface (#1960): configstore
-// Load/SyncApply lenient-compiles a config a strict commit would refuse, and
-// `show system` renders ValidateConfig's warnings for whatever is active. Kept
-// because it is correct on its own terms rather than by borrowing another
-// gate's guarantee — not because the committable case needs it.
+// SCOPE of that difference, because it bounds the claim: the LITERAL fixture is
+// rejected by a strict LOCAL commit — the duplicate Linux-device-name gate
+// (compiler_validate_strict_ifname_collision.go) fires on the two interface
+// keys.
+//
+// That bound is the LOCAL STRICT EFFECTIVE VIEW and no wider. An earlier
+// revision said "on anything committable the two keyings are equivalent", which
+// is categorical and false (#6861 re-gate, Codex 4): put the collision fixture
+// only in node1's `${node}` group and keep node0 clean. compileTreeStrict
+// strictly compiles node0 ONLY, the peer compile downgrades the duplicate-name
+// gate, and the peer registry carries just the SNAT and emitted-IPIP subjects —
+// and this candidate is source-only, so the emitter drops it before the IPIP
+// subject ever sees it. Node0 commits; node1 then activates the exact shape
+// through SyncApply.
+//
+// What pointer keying protects is therefore the TOLERANT surface (#1960):
+// configstore Load/SyncApply lenient-compiles a config the local strict commit
+// would refuse, and `show system alarms` — the actual rendering command, not
+// plain `show system` — renders ValidateConfig's warnings for whatever is
+// active. Kept because it is correct on its own terms rather than by borrowing
+// another gate's guarantee.
 //
 // The orphan `reth0` device in that second case is real, but it is not this
 // gate's subject: the same orphan appears with `mode gre`, where #4785 is

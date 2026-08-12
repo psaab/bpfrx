@@ -1,3 +1,133 @@
+## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
+
+- **Timestamp**: 2026-08-12 (fold/6861-ipip-r6, PR #6861)
+- **Action**: fixed the one runtime blocker (the ID-collision arm of the live
+  set) and swept the PR's claim-accuracy cluster as a class, re-running every
+  mutation whose result a comment asserts.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/compiler_peer_effective.go,
+  pkg/config/compiler_peer_effective_snat_5876_test.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/configstore/store.go, pkg/configstore/ipip_no_brick_4785_test.go, _Log.md
+
+B1 — THE RUNTIME BLOCKER. `emittedTunnelDeviceNames` treated every EMITTED
+endpoint reference as live. Emission is necessary but not sufficient:
+`buildTunnelEndpointSnapshots` hashes each ref to a `StableTunnelEndpointID` and
+RETURNS — appending nothing — when the id is already taken, so the later-sorting
+collider never becomes an endpoint. Counting it live SUPPRESSED the anchor
+advisory for a device that genuinely carries nothing: the inverse of what this
+advisory exists to do, and the operator gets silence.
+
+Reproduced before the fix on the collision pair already frozen by
+tunnelid_test.go (`StableTunnelEndpointID("wg0") == ("wg34524.0") == 17799`) —
+complete GRE `wg0` plus interface-level IPIP `wg34524` overridden by a complete
+unit-0 GRE:
+
+    emitted ref "wg0"       id=17799
+    emitted ref "wg34524.0" id=17799     <- runtime DROPS this one
+    live = {wg0:true, wg34524:true}      <- wg34524 live only via the dropped ref
+    ipipAnchorOnlyWarnings n=0           <- SUPPRESSED
+    ValidateConfig ipip warnings n=0     <- nothing on `show system alarms`
+
+After: `live = {wg0}`, one anchor advisory, and it reaches ValidateConfig. The
+fix mirrors the builder exactly — same SSOT emitter, same sorted order, same
+first-wins rule. Strict commit rejects this config (the collision gate), so the
+shape is reachable only through the tolerant ingress, which is precisely where
+the advisory is claimed to matter.
+
+What the fix still does NOT model is stated in the code rather than implied:
+`addEndpoint` also skips a ref whose interface is absent from the runtime
+InterfaceSnapshot, and this function has no ifindex knowledge — it never did. A
+collision whose WINNER has no kernel device would leave the loser installed at
+runtime while this loop drops it. That conjunction is the one shape where the
+drop can produce a false "dead"; within the model the function has always used,
+the drop is the builder's rule.
+
+C3 — TWO MUTATION COMMENTS RE-RUN, and both were wrong.
+`TestSyncApplyIpipDoesNotRelaxTheStrictCommit_4785` claimed to stay GREEN under
+the tolerance revert. It does not: `lenientIpipTunnelMode -> false` turns it RED
+at its SyncApply PRECONDITION ("the ingress must tolerate the stanza"), not at
+its CommitCheck assertion. `TestPeerGateRewriteDoesNotMutateTheCandidate_4785`
+claimed to stay GREEN under the raw-tree revert. It does not: it turns RED at its
+own precondition ("this tree must be rejected for the peer's IPIP endpoint"),
+because the raw tree makes the peer view fail to compile, the gate takes its
+out-of-scope arm, and the commit is ACCEPTED — so the over-reach property it
+exists for is never reached. Its sibling
+`TestPeerGateSeesTheTreeThePeerCompiles_4785` is what actually binds that revert
+and fails on its real assertion. Both comments now record which LINE fails and
+why, because a RED at a precondition is not the same evidence as a RED at an
+assertion.
+
+C1 — A FALSE CITATION IN A REACHABILITY ARGUMENT, in two places. The swallow
+arm's reachability was justified by "validateTunnelEndpointIDCollisionAST is
+returned unconditionally, with no lenient flag". False: it takes a
+`lenient bool`, both call sites pass `opts.sanitizeFreeTextControlChars`, and
+`lenientCompileOpts()` sets that true — so on the lenient path it WARNS. The
+CONCLUSION is right (the arm is reachable) but via `validateDataplaneTypeStrict`,
+called with no lenient downgrade, which configstore store.go already cited
+correctly. Left as-is the failure mode was concrete: a maintainer follows the
+citation, finds the gate lenient, concludes the arm unreachable, and deletes the
+clone+rewrite that exists because it is not. Corrected in the code comment AND in
+the r5 `_Log.md` entry that repeated it.
+
+C2 — "ADJUDICATES" OVERSTATED A TWO-ITEM REGISTRY, at three sites
+(compiler_peer_effective.go, configstore store.go, and the residual
+"proving BOTH node-effective views are representable" in the SNAT test header).
+Now "the registered peer-effective concerns", which is what the registry holds.
+
+C4 — AN ENUMERATION CLAIMED EXHAUSTIVE THAT IS NOT. Two TunnelConfig records
+were said to share a Name only two ways; an interface authored `gr-0/0/0u1`
+shares a Name with `gr-0/0/0 unit 1`, a third and COMMITTABLE shape. It cannot
+become a discriminator here (the unit ref puts that name in live[], so the device
+clause decides first), so the conclusion is unchanged — the statement is narrowed
+to "the shapes that can put an interface-site candidate on a shared, non-live
+Name", which IS exhaustive, and the underlying gap is referenced as #6964.
+
+Also corrected: "on anything committable the two keyings are equivalent" was
+categorical and false — a node1-only `${node}` group commits on node0 and
+activates the shape on node1 through SyncApply — so the bound is now the LOCAL
+strict effective view; the rendering command is `show system alarms`, not plain
+`show system`; and the strictly-rejecting gate is named
+(compiler_validate_strict_ifname_collision.go).
+
+B2 — WHAT THE POINTER FIXTURE ESTABLISHES. It proves IDENTITY SEMANTICS versus
+NAME KEYING, not that a literal Go pointer is the only implementation — deleting
+the emitted clause outright still produces the warning, which its sibling catches
+deliberately. Recorded, along with the fact that the rendered remediation
+("removing the interface-level stanza would drop this anchor") is NOT accurate
+for this fixture, whose base device is SHARED with the WireGuard record. The
+production wording is written for the committable single-owner case; narrowing it
+for a tolerant-only shape is a separate change and is not made here.
+
+T1 — A SAFEGUARD THAT COULD GO VACUOUS. The final matcher accepted any anchor
+warning containing `interfaces "gr-0/0-0"`, with nothing requiring the candidate
+to have zero units — so fixture drift adding an incomplete IPIP unit would let
+name keying suppress the intended INTERFACE warning while the unit's warning
+matched the same substring and the count stayed green. Now a zero-unit
+precondition plus the exact `interfaces "gr-0/0-0" tunnel mode ipip:` prefix.
+
+T2 — THE TOLERANT-SURFACE CLAIM BOUND AT THE STORE, not the compiler. The
+existing binding is `CompileConfigLenient`; a future pre-compile admission gate
+at Store.Load/SyncApply would leave it green while the cited surface disappeared.
+New `TestSyncApplyRendersThePointerKeyedAnchor_4785` drives a real Store and
+asserts the whole chain: the strict commit REFUSES the fixture (the premise of
+the tolerant-only scope), SyncApply ACCEPTS it, and the anchor advisory is in
+what ValidateConfig re-renders. It is not decoration — it reds on the same
+pointer->name re-key that reds the compiler test.
+
+T3 — a precondition that cannot fail given its predecessor is kept and LABELLED
+as a forward assert, with why.
+
+Validation: five mutations, run firsthand, each with a scoped signature.
+(1) Collision drop removed -> only the new B1 test reds, on the live-set
+assertion. (2) Collision drop made over-broad (winner dropped too) -> the
+PRE-EXISTING false-alarm guards red, which is the over-reach control. (3)
+Tolerance revert and (4) raw-tree revert -> the two C3 results above. (5)
+pointer->name re-key -> BOTH the compiler test and the new store companion red.
+go build rc=0, go vet rc=0, `go test ./pkg/config/... ./pkg/configstore/...`
+rc=0, and the FULL `go test ./...` rc=0 with zero failures. No cluster tooling:
+control-plane only, no dataplane artifact.
+
 ## 2026-08-05 — #4785: the new ACCEPTANCE was argued from the same incomplete fact as the old rejection
 
 - **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
@@ -70722,8 +70852,14 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   returns nil when the peer view fails to compile, skipping every peer strict
   subject. That arm is documented and intentional (#1960 no-brick: a peer-side
   compile failure must not false-reject the origin commit), and it is REACHABLE
-  — `validateTunnelEndpointIDCollisionAST` in compiler.go is returned
-  unconditionally with no lenient flag. So the defect was the doc sentence "a
+  — though NOT for the reason this entry originally gave. It cited
+  `validateTunnelEndpointIDCollisionAST` as "returned unconditionally with no
+  lenient flag", which is false and is corrected in the r6 entry above: that gate
+  takes a `lenient bool`, both call sites pass `opts.sanitizeFreeTextControlChars`,
+  and `lenientCompileOpts()` sets it true, so on the lenient path it WARNS. The
+  reachable hard error is `validateDataplaneTypeStrict`, called from
+  `compiler_earlystrict.go` with no lenient downgrade. The CONCLUSION (the arm is
+  reachable) stands; the citation did not. So the defect was the doc sentence "a
   chassis-cluster commit proves BOTH node-effective outputs are installable
   before promotion", which is unconditional and false in exactly that case.
   Corrected at both sites to state the conditional guarantee.
