@@ -75,8 +75,19 @@ var peerEffectiveStrictSubjects = []peerEffectiveStrictSubject{
 }
 
 // ValidatePeerEffectiveStrict re-runs every registered strict subject against
-// the PEER node's effective compiled view, so a chassis-cluster commit proves
-// BOTH node-effective outputs are installable before promotion.
+// the PEER node's effective compiled view, so a chassis-cluster commit
+// adjudicates the peer-effective output as well as the submitting node's.
+//
+// The guarantee is CONDITIONAL and the condition is not a formality: it holds
+// only when the peer view COMPILES. If CompileConfigForNodeLenient returns an
+// error the arm below returns nil and EVERY peer subject is skipped, so the
+// commit passes having adjudicated nothing about the peer. That arm is
+// reachable — the lenient compile still hard-errors on the pre-expansion
+// collision gates (validateTunnelEndpointIDCollisionAST in compiler.go is
+// returned unconditionally, with no lenient flag) — and it is deliberate, for
+// the reason spelled out two paragraphs down. Do not read this as "both node-
+// effective outputs are proven installable": a peer view that will not compile
+// is NOT adjudicated here, by design.
 //
 // The peer view is produced with CompileConfigForNodeLenient(peerID) — the EXACT
 // transform the standby applies on Store.SyncApply — so what is validated is

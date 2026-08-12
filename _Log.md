@@ -70679,3 +70679,68 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
   userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
   docs/cos-validation-notes.md, _Log.md
+
+## 2026-08-12 — #4785 fold r7: the pointer-keying claim, measured properly
+
+- **Timestamp**: 2026-08-12
+- **Action**: Three review findings on #6861, all about claims outrunning their
+  evidence. No production behaviour changes.
+
+  **F1 — the interface site's emitted clause: pointer keying IS load-bearing,
+  but not for the reason the comment gave.** The r5 comment defended
+  `emitted[t]` (pointer-keyed) with the reth divergence and cited
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` as the measurement. That
+  measurement cannot support the claim: the cited test reds when the clause is
+  DELETED, which any check-exists test catches, and it stays GREEN when the
+  clause is re-keyed to `!emittedName[t.Name]` — because in its fixture the
+  emitted record IS the record under test, so both keyings agree.
+
+  Built the discriminating fixture instead. Two records share a `Name` only as
+  an interface-level record and its own unit 0 — where TunnelNameMap puts that
+  same name in `live[]`, so the device clause decides first — or as two
+  DIFFERENT interface keys canonicalizing to one Linux name, since LinuxIfName
+  only replaces '/' with '-' (`gr-0/0-0` is one character from `gr-0/0/0`; both
+  give `gr-0-0-0`). Combined with the one shape whose emitted device diverges
+  from its record's Name — interface-level WireGuard whose lowest unit is > 0,
+  where the emitter publishes the INTERFACE pointer at ref `X.u` (#1910) while
+  TunnelNameMap resolves `X.u` to the UNIT device — the name is emitted while
+  the device is not live, and the two keyings disagree.
+
+  SCOPE, now stated in the code: a strict commit REJECTS that config (the
+  duplicate Linux-device-name gate fires), so on anything committable the two
+  keyings are equivalent. What pointer keying protects is the TOLERANT surface
+  (#1960) — configstore Load/SyncApply lenient-compiles a config a strict commit
+  would refuse, and `show system` renders ValidateConfig's warnings for whatever
+  is active. Kept because it is correct on its own terms rather than by
+  borrowing the dup-name gate's guarantee.
+
+  **F2 — "Measured, not assumed" rewritten** to say what was actually measured
+  (a presence measurement, which says nothing about keying) and to point at the
+  separate fixture and mutation that do settle the keying.
+
+  **F3 — the code is deliberate; the CLAIM was false.** `ValidatePeerEffectiveStrict`
+  returns nil when the peer view fails to compile, skipping every peer strict
+  subject. That arm is documented and intentional (#1960 no-brick: a peer-side
+  compile failure must not false-reject the origin commit), and it is REACHABLE
+  — `validateTunnelEndpointIDCollisionAST` in compiler.go is returned
+  unconditionally with no lenient flag. So the defect was the doc sentence "a
+  chassis-cluster commit proves BOTH node-effective outputs are installable
+  before promotion", which is unconditional and false in exactly that case.
+  Corrected at both sites to state the conditional guarantee.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/config/compiler_peer_effective.go, pkg/configstore/store.go, _Log.md
+- **Validation**: New `TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861`
+  with five preconditions, each a `t.Fatalf` guarding a way the fixture could
+  silently stop discriminating. Mutation, run firsthand: re-keying
+  `!emitted[t]` to `!emittedName[t.Name]` (built from the same
+  EmitTunnelEndpointNames walk) reds it at "the anchor advisory did not fire
+  exactly once ... (got 0)", while
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` stays GREEN under the same
+  mutation — the two now bind existence and keying separately. Before the fix
+  the ENTIRE `pkg/config` suite was green under that mutation.
+  Rebased onto origin/master; only `_Log.md` conflicted, union-resolved
+  (260 ours + 87 theirs), zero residual markers, and the seam checked
+  STRUCTURALLY: header count 1512 + 2 new = 1514, and the one-header-one-
+  Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
+  and 226 after the union — the resolve introduced none.

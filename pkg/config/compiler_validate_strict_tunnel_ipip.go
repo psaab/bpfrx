@@ -256,6 +256,36 @@ func validateIpipTunnelDeadWarning(cfg *Config) []string {
 // name and live[] necessarily holds it. Dropping it reds nothing; dropping the
 // interface one reds TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861.
 //
+// WHY POINTER KEYING AND NOT `emittedName[t.Name]` — a separate question from
+// whether the clause exists at all, and one the reth case above does NOT answer.
+// In that case the emitted record IS `t`, so a name-keyed set suppresses it just
+// as well; TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861 stays green under the
+// re-keying and therefore proves only that SOME emitted-check is present.
+//
+// The keying is decided by the one shape where an emitted record is NOT `t` yet
+// shares `t.Name`, with that name absent from live[]. Two records share a Name
+// only as an interface-level record and its own unit 0 — where TunnelNameMap
+// puts that very name in live[], so the device clause decides first and the
+// keying never matters — or as two DIFFERENT interface keys canonicalizing to
+// one Linux name, since LinuxIfName only replaces '/' with '-' (`gr-0/0-0` and
+// `gr-0/0/0` both give `gr-0-0-0`). Pair that with interface-level WireGuard
+// whose lowest unit is > 0, where the emitter publishes the INTERFACE pointer at
+// ref `X.u` (#1910) while TunnelNameMap resolves `X.u` to the UNIT device
+// `X u<n>`, and the name is emitted while the device is not live. Name keying
+// then drops a real dead ipip anchor on the strength of an unrelated
+// interface's name. Bound by
+// TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861, which reds on
+// exactly that re-keying.
+//
+// SCOPE of that difference, because it bounds the claim: a strict commit
+// REJECTS such a config — the duplicate Linux-device-name gate fires on the two
+// interface keys. On anything committable the two keyings are equivalent. What
+// pointer keying protects is the TOLERANT surface (#1960): configstore
+// Load/SyncApply lenient-compiles a config a strict commit would refuse, and
+// `show system` renders ValidateConfig's warnings for whatever is active. Kept
+// because it is correct on its own terms rather than by borrowing another
+// gate's guarantee — not because the committable case needs it.
+//
 // The orphan `reth0` device in that second case is real, but it is not this
 // gate's subject: the same orphan appears with `mode gre`, where #4785 is
 // deliberately silent, so #4785 is not its cause. It is the routing-vs-dataplane
@@ -335,9 +365,18 @@ func ipipAnchorOnlyWarnings(cfg *Config) []string {
 			// device IS its own name and live[] already holds it. The interface
 			// site has no such identity — snapshotLinuxName resolves a bare
 			// `reth*` through ResolveReth, so an emitted reth0 record's device
-			// is the physical member and NOT t.Name. Measured, not assumed:
-			// dropping the clause here reds nothing, dropping it there reds
-			// TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861.
+			// is the physical member and NOT t.Name.
+			//
+			// What was measured, stated exactly: DELETING the clause reds
+			// nothing here and reds
+			// TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861 at the interface
+			// site. That is a presence measurement and nothing more — it does
+			// not speak to how the interface site's set is KEYED, because
+			// deleting a check is caught by any test that the check exists.
+			// The pointer-vs-name keying is a separate claim with its own
+			// fixture and its own mutation; see the block above
+			// `ipipAnchorOnlyWarnings` and
+			// TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861.
 			if unit.Tunnel.Mode != "ipip" || live[unit.Tunnel.Name] {
 				continue
 			}

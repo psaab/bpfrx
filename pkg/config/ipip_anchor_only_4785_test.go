@@ -1052,3 +1052,109 @@ func TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861(t *testing.T) {
 		})
 	}
 }
+
+// TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861 binds the KEYING
+// of the interface site's emitted clause, which its sibling above does not.
+//
+// The distinction matters because the two tests fail to different mutations.
+// TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861 reds when `!emitted[t]` is
+// DELETED — it proves an emitted-check exists. It stays GREEN when the check is
+// re-keyed from the pointer to `t.Name`, because in its fixture the emitted
+// record IS the record under test, so both keyings agree. Existence and keying
+// are separate properties and need separate fixtures.
+//
+// The discriminator needs an emitted record that is NOT `t` yet shares `t.Name`,
+// with `t.Name` absent from the live device set so the device clause cannot be
+// what decides. Two TunnelConfig records share a Name only via:
+//
+//   - an interface-level record and its own unit 0 (both `LinuxIfName(ifName)`)
+//     — but TunnelNameMap resolves that unit ref to exactly that name, so the
+//     device clause suppresses it first and the keying never decides; or
+//   - two DIFFERENT interface keys collapsing to one Linux name, since
+//     LinuxIfName only replaces '/' with '-'. `gr-0/0-0` is a one-character slip
+//     from `gr-0/0/0` and both canonicalize to `gr-0-0-0`.
+//
+// The second is this fixture, combined with the one shape whose emitted device
+// diverges from its record's Name: interface-level WireGuard whose lowest unit
+// is > 0. The emitter publishes the INTERFACE pointer at ref `gr-0/0/0.1`
+// (#1910) while TunnelNameMap resolves that ref to the UNIT device
+// `gr-0-0-0u1`, so `gr-0-0-0` is emitted-by-name but absent from `live`.
+//
+// SCOPE, stated plainly: a strict commit REJECTS this config — the duplicate
+// Linux-device-name gate fires on `gr-0/0-0` vs `gr-0/0/0`. So on any config
+// that can be committed the two keyings are equivalent, and the pointer clause
+// buys nothing there. It is load-bearing on the TOLERANT surface instead
+// (#1960): configstore's Load/SyncApply lenient-compiles a config a strict
+// commit would refuse, and `show system` renders ValidateConfig's warnings for
+// whatever is active. On that path name-keying silently drops a real dead ipip
+// anchor because an unrelated interface happens to canonicalize to the same
+// device name. Pointer keying is correct without depending on another gate
+// staying in place, which is why it is kept.
+//
+// RED-on-revert: re-key the clause to a name-keyed set
+// (`!emittedName[t.Name]`, built from the same EmitTunnelEndpointNames walk)
+// and this fails at "the anchor advisory did not fire".
+func TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861(t *testing.T) {
+	cfg, err := CompileConfigLenient(ipipTree(t,
+		// Emitted, and its device DIVERGES from its record's Name.
+		"set interfaces gr-0/0/0 tunnel mode wireguard",
+		"set interfaces gr-0/0/0 unit 1 tunnel mode wireguard",
+		// The anchor candidate: same canonical Linux name, ipip, source but no
+		// destination so the emitter skips it entirely.
+		"set interfaces gr-0/0-0 tunnel mode ipip",
+		"set interfaces gr-0/0-0 tunnel source 10.0.0.1",
+	))
+	if err != nil {
+		t.Fatalf("tolerant compile: %v", err)
+	}
+
+	// PRECONDITIONS. Each one is a way this fixture could silently stop
+	// discriminating, which would leave the test green while proving nothing.
+	cand := cfg.Interfaces.Interfaces["gr-0/0-0"]
+	if cand == nil || cand.Tunnel == nil {
+		t.Fatalf("fixture precondition: the candidate interface must survive the " +
+			"tolerant compile with its tunnel record")
+	}
+	rec := cand.Tunnel
+	if rec.Mode != "ipip" || rec.Source == "" || rec.Destination != "" {
+		t.Fatalf("fixture precondition: candidate must be ipip with a source and no "+
+			"destination (mode=%q src=%q dst=%q)", rec.Mode, rec.Source, rec.Destination)
+	}
+	eps := EmitTunnelEndpointNames(cfg)
+	if len(eps) != 1 || eps[0].Name != "gr-0/0/0.1" {
+		t.Fatalf("fixture precondition: expected exactly the emitted \"gr-0/0/0.1\" "+
+			"endpoint, got %d: %+v", len(eps), eps)
+	}
+	if eps[0].Tunnel == rec {
+		t.Fatalf("fixture precondition: the emitted record must be a DIFFERENT object " +
+			"from the candidate, else pointer and name keying cannot disagree")
+	}
+	if eps[0].Tunnel.Name != rec.Name {
+		t.Fatalf("fixture precondition: the emitted record's Name (%q) must EQUAL the "+
+			"candidate's (%q) — that collision is the whole discriminator",
+			eps[0].Tunnel.Name, rec.Name)
+	}
+	if emittedTunnelDeviceNames(cfg)[rec.Name] {
+		t.Fatalf("fixture precondition: %q must be ABSENT from the live device set, "+
+			"otherwise the device clause decides and the keying is never consulted",
+			rec.Name)
+	}
+
+	// The candidate is a genuine dead ipip anchor and the operator must hear
+	// about it. Under name keying the unrelated WireGuard record's Name
+	// suppresses this warning entirely.
+	var anchor []string
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "kernel anchor device") &&
+			strings.Contains(w, `interfaces "gr-0/0-0"`) {
+			anchor = append(anchor, w)
+		}
+	}
+	if len(anchor) != 1 {
+		t.Fatalf("the anchor advisory did not fire exactly once for the unemitted "+
+			"ipip record on \"gr-0/0-0\" (got %d). Its own endpoint is NOT emitted, so "+
+			"it creates a kernel anchor carrying nothing; a name-keyed emitted set "+
+			"suppresses it because a DIFFERENT interface (\"gr-0/0/0\") canonicalizes "+
+			"to the same device name %q: %v", len(anchor), rec.Name, anchor)
+	}
+}
