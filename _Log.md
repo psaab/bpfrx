@@ -70528,3 +70528,77 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/natshow/persistent.go,
   pkg/natshow/persistent_single_resolution_2114_test.go (new),
   docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md
+
+## 2026-08-12 — #2114 r6b: the optional-capability surface is TWO families, and family 2 was unbound
+
+- **Timestamp**: 2026-08-12
+- **Action**: Parent scope correction on r6-F1. The optional-capability
+  erasure has TWO independent code paths, not one, and the r6 guard set
+  only bound the first behaviourally.
+
+  **Family 1** — the `...Of(provider any)` helpers in
+  `pkg/dataplane/apply.go`. Verified a CLOSED set of exactly three at head:
+  `LastApplyResultOf`, `SessionStoreOf`, `TelemetryOf`. Being closed is
+  what makes the `Unwrap` approach tractable there.
+
+  **Family 2** — NAMED interfaces asserted against the consumer's stored
+  `dp` field, which never touch `apply.go` at all: in `pkg/cli` that is
+  `cliUserspaceStatusProvider` (`Status()`, consumed by
+  `cli_show_system.go`, `cli_show_chassis.go`,
+  `cli_show_security_wireguard.go`) and `cliUserspaceControlProvider`
+  (Status + `SetForwardingArmed`/`SetQueueState`/`SetBindingState`/
+  `InjectPacket`, consumed by
+  `cli_request.go:handleRequestChassisClusterDataPlane`). The r6 fix
+  already routed every one of these through `dpProbe()`, but the only
+  behavioural binder for the family went through pkg/grpcapi's
+  `userspaceStatusProvider` — so a regression confined to `pkg/cli`'s
+  `dpProbe()` would have read GREEN.
+
+  **Sweep, run rather than trusted.** `pkg/cli/runtime.go`'s comment claims
+  the named types "replace the inline `c.dp.(interface{ Status() ... })`
+  probes"; verified with `git grep -nE '\.\(interface\{' -- pkg/cli/
+  pkg/api/ pkg/grpcapi/ pkg/natshow/`: ZERO remaining inline anonymous
+  probes in consumer production code at head. The only two hits are the
+  comment itself and generated protobuf (`xpf_grpc.pb.go:957` asserting on
+  `srv`, unrelated to the dataplane). Note the comment was accurate about
+  pkg/cli but NOT about pkg/api — `system.go`, `nat.go` (x2) and
+  `metrics_userspace.go` still carried inline anonymous probes before r6,
+  and `cli_show_nat.go`'s inline `AppliedNATView` probe was outside that
+  comment's scope; all five are converted. Also swept for a local-alias
+  shape (`rt := s.dp; rt.(T)`) that the AST canary would not catch: zero
+  occurrences. All 23 provider-shaped assertions in the consumer packages
+  now go through `dpProbe()`.
+
+  **New binder** (`pkg/cli/cli_capability_probe_2114_test.go`). pkg/daemon
+  cannot host it — pkg/daemon imports pkg/cli, so the real `liveDataPlane`
+  is unreachable from here. The fixture reproduces its ESSENTIAL property
+  instead: `cliLiveIndirection` embeds a `*dataplane.Manager` (the mandatory
+  `cliRuntime` surface and nothing more — no `Status()`, none of the four
+  mutators) and resolves the backend per call through
+  `dataplane.LiveUnwrapper`. Three bodies: `Status()` preserved,
+  the CONTROL provider preserved (asserting `SetForwardingArmed` actually
+  reached the backend, not merely that the assertion succeeded), and
+  disowned-unreachable. Each preservation test carries a positive control
+  proving the backend really implements the interface.
+
+  **Fixture-fidelity guard.** `newCLIWithLiveIndirection` asserts the
+  adapter itself FAILS both probes. Without it the fixture could drift into
+  carrying `Status()` and the guards would pass with no unwrap at all.
+
+  **Mutation matrix.** (9) Delete the unwrap hunk from `pkg/cli`'s
+  `dpProbe()` (`return c.dp`) → both family-2 preservation tests RED
+  ("userspaceDataplaneStatus() = userspace status unavailable for a HEALTHY
+  published backend that implements Status()" / "userspaceDataplaneControl()
+  = userspace dataplane control unavailable") while
+  `TestCLIProbe_DisownedBackendIsUnreachable` stays GREEN — the targeted
+  negative control. (10) Give `cliLiveIndirection` its own `Status()` → all
+  three RED at the fidelity guard ("fixture drift: cliLiveIndirection
+  implements cliUserspaceStatusProvider directly"), so that guard is live
+  rather than decorative. Family 1's distinguishing mutations were recorded
+  in the preceding entry (delete the unwrap from `LastApplyResultOf` +
+  `SessionStoreOf`, and from `SessionStoreOf` alone).
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0. `gofmt -l` clean on the new file.
+- **File(s)**: pkg/cli/cli_capability_probe_2114_test.go (new), _Log.md
