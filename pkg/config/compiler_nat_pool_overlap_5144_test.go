@@ -335,7 +335,7 @@ func TestNAT5144NAT64EmptyPrefixPairNotOverlap(t *testing.T) {
 // whose node0 resolution has DISJOINT pools but whose node1 resolution has
 // OVERLAPPING pools. node0's local compile is clean (green commit today), yet the
 // peer-effective gate run at a node0 commit
-// (ValidatePeerEffectiveSourceNATStrict(tree, 0)) must REJECT the node1-only
+// (ValidatePeerEffectiveStrict(tree, 0)) must REJECT the node1-only
 // overlap — else the standby lenient-loads the vulnerable independent allocators
 // (the #5876 divergent-commit fail-open, for the #5144 collision).
 //
@@ -369,7 +369,7 @@ func TestNAT5144PeerOnlyOverlapRejectedAtOriginCommit(t *testing.T) {
 	}
 
 	// The peer-effective gate at a node0 commit must reject the node1-only overlap.
-	err := ValidatePeerEffectiveSourceNATStrict(tree, 0)
+	err := ValidatePeerEffectiveStrict(tree, 0)
 	if err == nil {
 		t.Fatal("node0 commit ACCEPTED a peer-only source-NAT pool overlap (node1 view) — #5144 divergent-commit fail-open")
 	}
@@ -396,7 +396,7 @@ func TestNAT5144PeerOnlyOverlapRejectedAtOriginCommit(t *testing.T) {
 		"set groups node1 security nat source pool B address 203.0.113.6/32",
 		`set apply-groups "${node}"`,
 	}
-	if err := ValidatePeerEffectiveSourceNATStrict(buildTreeFromSet(t, swapped), 1); err == nil {
+	if err := ValidatePeerEffectiveStrict(buildTreeFromSet(t, swapped), 1); err == nil {
 		t.Fatal("node1 commit ACCEPTED a peer-only (node0) source-NAT pool overlap — #5144 divergent-commit fail-open")
 	}
 }
