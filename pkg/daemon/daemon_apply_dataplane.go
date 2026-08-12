@@ -567,6 +567,16 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 		// stays down until a restart while step 2.6b2 rebinds AF_XDP sockets
 		// onto it.
 		//
+		// AND THE ADDRESS GAP IS DELIBERATE (#6871 F4). Step 2.6b's VIP
+		// reconcile is gated on linkCycled too, so a MAC write that failed
+		// AFTER the cycle skips it and the member comes back without its VRRP
+		// VIPs until the next apply that does cycle it. That is not an
+		// oversight and not new here — it predates #5103 and is unchanged by
+		// it. It was documented only in docs/reth-mac.md, which is the wrong
+		// place for a caveat a maintainer needs while reading THIS branch: the
+		// shipping artifact has to carry it. The full table lives in that doc;
+		// the operative fact is here.
+		//
 		// Leave the rebind to step 2.6b2, which owns it for every cycled
 		// member. Note that suppression is per-MEMBER while 2.6b2's gate
 		// (needLinkCycleRecovery) is a per-APPLY accumulator, so an apply that
@@ -577,10 +587,22 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 		// order the members are visited in, and that order is a Go map range
 		// (rethToPhys, step 2.6) — so state both. tear_down samples
 		// had_live_workers = !coord.workers.records.is_empty()
-		// (coordinator/reconcile/teardown.rs), and every stop_workers empties
-		// records (handlers/stop_workers.rs -> afxdp.stop() -> stop_inner ->
-		// WorkerManager::stop_and_clear, which joins each worker thread and
-		// then records.clear()s). So:
+		// (coordinator/reconcile/teardown.rs), and a stop_workers that REACHES
+		// ITS HANDLER empties records (handlers/stop_workers.rs -> afxdp.stop()
+		// -> stop_inner -> WorkerManager::stop_and_clear, which joins each
+		// worker thread and then records.clear()s).
+		//
+		// "REACHES ITS HANDLER" is load-bearing and an earlier revision of this
+		// comment said "every stop_workers" without it (#6871 F3). The prepare
+		// can fail on the DIAL or the WRITE, before the helper ever runs the
+		// handler — which is precisely the failure class this whole block
+		// exists for. In that case records are NOT cleared and stay live, so
+		// the had_live_workers sample below is true rather than false and the
+		// quiesce is PAID rather than skipped. The two orders below therefore
+		// describe the handler-ran case; a pre-handler failure costs an extra
+		// 500ms and nothing else. Behaviour is unaffected either way — the
+		// rebind is correct with live records or without them — but the
+		// sentence was not universally true as written. So:
 		//
 		//   - aborted member FIRST: its rollback rebind sees an empty records
 		//     (its own stop_workers just cleared it) and skips the quiesce, then

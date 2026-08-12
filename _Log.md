@@ -70106,3 +70106,46 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-12 — #6871 F3/F4/F5: three claim/test corrections (F2 harness separate)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Landed the three findings that are independent of the F2 harness,
+  so the round banks value whether or not the harness lands.
+
+  **F3 — a comment claim that was not universally true.** The teardown
+  reasoning said "every stop_workers empties records". The prepare can fail on
+  the DIAL or the WRITE, before the helper ever runs the handler — which is
+  precisely the failure class the surrounding block exists for — and records
+  then stay live. Corrected to "a stop_workers that REACHES ITS HANDLER", with
+  the consequence stated: `had_live_workers` samples true rather than false, so
+  the 500ms quiesce is PAID rather than skipped. Behaviour is unaffected (the
+  rebind is correct either way); the sentence was wrong, and the two visit
+  orders it goes on to describe are the handler-ran case.
+
+  **F4 — a deliberate gap documented only outside the shipping artifact.**
+  Step 2.6b's VIP reconcile is gated on `linkCycled`, so a MAC write that fails
+  AFTER the cycle skips it and the member returns without its VRRP VIPs until
+  the next apply that cycles it. That is deliberate and predates #5103, but it
+  lived only in `docs/reth-mac.md:159` — the wrong place for a caveat a
+  maintainer needs while reading the `if linkCycled` branch. Stated inline now;
+  the full table stays in the doc.
+
+  **F5 — a fatal that suppressed the guard.** Both abort-recovery fixtures
+  checked the link sequence with `t.Fatalf`, so a fixture-sequence mismatch left
+  the `linkCycled` / `commitErr` assertions — the ones actually carrying the
+  guard — UNEXECUTED. A run reporting only "link sequence" said nothing about
+  linkCycled either way. Both are `t.Errorf` now, so the fixture problem reports
+  itself without suppressing the guard.
+
+  **F2 is NOT in this commit.** It needs a harness that reaches
+  `applyDataplaneAndHACore`'s RETH loop (the function spans 45-447 and no test
+  in pkg/daemon calls it — all six mentions are comments). Deliberately NOT
+  closed by extracting the loop: extraction is what produced this finding in the
+  first place, and doing it again would relocate the unbound edge a second time
+  while wearing the evidence of a fix.
+
+  **Validation.** `go vet ./pkg/daemon/` 0; `go test -count=1 ./pkg/daemon/` 0
+  (`ok 16.945s`); `gofmt -l` clean on both touched files.
+- **File(s)**: pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go, _Log.md

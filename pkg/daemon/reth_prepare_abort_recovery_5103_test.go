@@ -211,8 +211,13 @@ func TestRethMACAbortRebindsWhenCycleFailsAfterJoin_5103(t *testing.T) {
 					"hook and have it SUCCEED, otherwise this test is just the failed-join "+
 					"case again", lc.prepareCalls)
 			}
+			// #6871 F5: Errorf, not Fatalf. A wrong sequence means the FIXTURE
+			// is off, but it must not stop the linkCycled assertion below from
+			// running — that assertion is the one carrying the guard, and a
+			// fatal here left it unexecuted, so a run reporting only "link
+			// sequence" told us nothing about linkCycled either way.
 			if got := strings.Join(events, ","); got != tc.wantSeq {
-				t.Fatalf("link sequence = %q, want %q — the fixture must fail the step it "+
+				t.Errorf("link sequence = %q, want %q — the fixture must fail the step it "+
 					"claims to", got, tc.wantSeq)
 			}
 			if linkCycled {
@@ -257,8 +262,11 @@ func TestRethMACLinkUpFailureFailsCommitWithoutDoubleRebind_5103(t *testing.T) {
 
 	linkCycled, commitErr := d.programRethMACWithWorkerJoin("ge-0-0-1", virtMAC5103)
 
+	// #6871 F5: Errorf, not Fatalf — see the sibling above. The linkCycled and
+	// commitErr assertions below are the guard; a fixture-sequence mismatch
+	// must report itself without suppressing them.
 	if got := strings.Join(events, ","); got != "set-mac-live,link-down,set-mac-cycled,link-up-FAILED" {
-		t.Fatalf("link sequence = %q — the fixture must complete the cycle and fail only "+
+		t.Errorf("link sequence = %q — the fixture must complete the cycle and fail only "+
 			"the UP", got)
 	}
 	if !linkCycled {
