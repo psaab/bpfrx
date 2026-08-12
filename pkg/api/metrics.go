@@ -144,6 +144,11 @@ type xpfCollector struct {
 	userspaceSNATPoolAllocationsTotal *prometheus.Desc
 	userspaceSNATPoolReusesTotal      *prometheus.Desc
 	userspaceSNATPoolExhaustionsTotal *prometheus.Desc
+	// #4800: the per-pool NAT-allocator leg of the new-flow-install
+	// contention surface. Always emitted as a pair — a contention count
+	// without its denominator is not interpretable.
+	userspaceSNATPoolLiveLockAcquisitionsTotal *prometheus.Desc
+	userspaceSNATPoolLiveLockContendedTotal    *prometheus.Desc
 
 	// DHCP lease gauge
 	dhcpLeasesActive *prometheus.Desc
@@ -366,15 +371,26 @@ type xpfCollector struct {
 	workerSessionTableCapacity       *prometheus.Desc
 	workerNatReverseKeyCollisions    *prometheus.Desc
 	// #1861: install-refusal trio (per-worker + aggregate).
-	workerSessionCreateDrops                *prometheus.Desc
-	workerSessionInstallAdmissionRefused    *prometheus.Desc
-	workerSessionInstallPartial             *prometheus.Desc
-	userspaceSessionCreateDrops             *prometheus.Desc
-	userspaceSessionInstallAdmissionRefused *prometheus.Desc
-	userspaceSessionInstallPartial          *prometheus.Desc
-	userspaceSessionTableEntries            *prometheus.Desc
-	userspaceSessionTableCapacity           *prometheus.Desc
-	userspaceNatReverseKeyCollisions        *prometheus.Desc
+	workerSessionCreateDrops             *prometheus.Desc
+	workerSessionInstallAdmissionRefused *prometheus.Desc
+	workerSessionInstallPartial          *prometheus.Desc
+	// #4800: per-worker transit new-flow installs, plus the six
+	// process-global publish/replication contention counters.
+	workerNewFlowInstalls                     *prometheus.Desc
+	userspaceSharedSessionPublishes           *prometheus.Desc
+	userspaceSharedSessionPublishLockAcquired *prometheus.Desc
+	userspaceSharedSessionPublishLockBlocked  *prometheus.Desc
+	userspaceSessionReplicationUpserts        *prometheus.Desc
+	userspaceSessionReplicationEnqueued       *prometheus.Desc
+	userspaceSessionReplicationLockBlocked    *prometheus.Desc
+	userspaceSessionReplicationQueueDepthSum  *prometheus.Desc
+	userspaceSessionReplicationQueueDepthMax  *prometheus.Desc
+	userspaceSessionCreateDrops               *prometheus.Desc
+	userspaceSessionInstallAdmissionRefused   *prometheus.Desc
+	userspaceSessionInstallPartial            *prometheus.Desc
+	userspaceSessionTableEntries              *prometheus.Desc
+	userspaceSessionTableCapacity             *prometheus.Desc
+	userspaceNatReverseKeyCollisions          *prometheus.Desc
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes — the
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
 	userspaceSessionPublishErrors *prometheus.Desc
@@ -684,6 +700,8 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSNATPoolAllocationsTotal
 	ch <- c.userspaceSNATPoolReusesTotal
 	ch <- c.userspaceSNATPoolExhaustionsTotal
+	ch <- c.userspaceSNATPoolLiveLockAcquisitionsTotal
+	ch <- c.userspaceSNATPoolLiveLockContendedTotal
 	ch <- c.dhcpLeasesActive
 	ch <- c.dhcpDDNSUpsertsTotal
 	ch <- c.dhcpDDNSDeletesTotal
@@ -792,6 +810,15 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.workerSessionCreateDrops
 	ch <- c.workerSessionInstallAdmissionRefused
 	ch <- c.workerSessionInstallPartial
+	ch <- c.workerNewFlowInstalls
+	ch <- c.userspaceSharedSessionPublishes
+	ch <- c.userspaceSharedSessionPublishLockAcquired
+	ch <- c.userspaceSharedSessionPublishLockBlocked
+	ch <- c.userspaceSessionReplicationUpserts
+	ch <- c.userspaceSessionReplicationEnqueued
+	ch <- c.userspaceSessionReplicationLockBlocked
+	ch <- c.userspaceSessionReplicationQueueDepthSum
+	ch <- c.userspaceSessionReplicationQueueDepthMax
 	ch <- c.userspaceSessionCreateDrops
 	ch <- c.userspaceSessionInstallAdmissionRefused
 	ch <- c.userspaceSessionInstallPartial
