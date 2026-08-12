@@ -69160,6 +69160,340 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-01 12:40
+- **Action**: #6169 — close the >=65-recording sustained heartbeat replay with a
+  signed boot epoch. Two parts. (1) Scope the #4107 anti-replay nonce to the
+  daemon incarnation (`Manager.heartbeatNonce`) instead of the heartbeatSender,
+  so routine heartbeat restarts (VRF rebind, comms restart) stop minting fresh
+  sessions — otherwise one daemon incarnation could emit more than a ringful of
+  sessions under ONE epoch and the ring stayed churnable inside an incarnation.
+  (2) Carry a per-incarnation boot epoch in the SIGNED heartbeat: a 16-byte
+  `marker(8)+epoch(8)` section inserted BETWEEN the body and the `XPFA` trailer,
+  so a pre-#6169 receiver still finds the trailer at len-52, still verifies the
+  MAC over exactly the bytes the new sender signed, and simply ignores the
+  epoch (bidirectional compat, no HAProtocolVersion bump — the #6370 attempt
+  appended AFTER the trailer and split a keyed cluster). Marker is key-derived
+  `HMAC(PSK,"xpf-ha-boot-epoch-v1")[:8]`, not a fixed magic, so an ordinary body
+  cannot deterministically collide and latch a bogus far-future floor. Receiver
+  keeps an O(1) `highEpoch` floor on the Manager (restart-proof via #6642) and
+  rejects `epoch < highEpoch` BEFORE the session ring is touched — the ordering
+  is load-bearing because `ring.admit` records a never-seen session as a side
+  effect. Sender epoch is `max(persisted+1, wall_nanos)` at NANOSECOND
+  resolution, persisted atomically under /var/lib/xpf; persist-before-emit means
+  a node that cannot write advertises no epoch and its peer falls back to the
+  ring, so no healthy node's heartbeats can ever become unacceptable to a
+  healthy peer — that is what keeps this change free of election/ownership
+  coupling and of any HA availability cost. Resolution is async (fsync must not
+  block the 100ms send loop). Deliberately NO sticky epoch-strip gate: it would
+  reject a live peer during a supported A/B rollback, which is dual-primary —
+  worse than the replay it closes; that residual is closed by PSK rotation.
+  Removed `heartbeatAuthState.admit` so `admitAuthed` is the single gate.
+  Baseline reproduced first (64 recordings -> 0/640 admitted; 65 -> 650/650).
+  Five mutations each red an ASSERTION with build+vet rc=0.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_nonce_scope_test.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_replay_restart_5086_test.go,
+  pkg/cluster/heartbeat_auth_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 15:05
+- **Action**: #6169 review fold — close the epochless bypass (review MAJOR) plus
+  two uint64-boundary hardening findings. The MAJOR: the floor only ever sees
+  frames that CARRY an epoch, and an attacker's captures are by construction
+  mostly PRE-upgrade and therefore epochless, so they bypassed the floor
+  entirely. Measured on the first cut with the floor latched at a live peer's
+  epoch: 975/975 epochless replays admitted — the fix defended only against an
+  attacker who started capturing AFTER the upgrade. Added a DOWNGRADE LATCH
+  (`epochSeen`): once the peer is seen to emit an epoch, epochless frames from
+  it are refused. Latch is armed by OBSERVATION (never by local build version)
+  so a rolling upgrade still works, and is DURABLE via a persisted peer floor
+  at /var/lib/xpf/ha-peer-epoch-floor, loaded before the receiver admits its
+  first frame — an in-memory latch is cleared by exactly the receiver restart
+  an attacker waits for. To keep the latch safe, the sender switched from
+  persist-before-emit to ALWAYS-EMIT: a persist failure now degrades
+  monotonicity (wall-clock fallback), never emission, which buys the invariant
+  "a keyed heartbeat carries no epoch iff the peer runs a pre-#6169 build". So
+  no runtime fault can make a healthy node unacceptable to a healthy peer; the
+  one legitimate latch trigger is a deliberate ROLLBACK to a pre-#6169 build,
+  which is refused with a rate-limited actionable log and recovered by clearing
+  the floor file + restart (documented). Every storage fault on both sides fails
+  OPEN. Hardening: `nextBootEpoch` refuses to chain from an implausible
+  persisted value (MaxUint64-1 previously saturated then REGRESSED on the next
+  boot, permanently locking out a peer that had latched it) and the receiver
+  will only latch an epoch below year 2200 (`epochUsableAsFloor`) — one-sided
+  and absolute, so a dead RTC or a wrong local clock never refuses a peer.
+  StartHeartbeat now primes the floor and bounded-waits the boot-epoch resolve
+  so opening frames already carry an epoch. Mutations 7/8/9 red the new guards
+  as assertions with build+vet rc=0; mutations 1/2 re-verified on the new shape;
+  negative controls green in every world.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 17:20
+- **Action**: #6169 round-2 review fold. The three-way-confirmed MAJOR (epochless
+  bypass) was already closed by the previous fold f7536ce32 — the reviews ran at
+  9fc8b79f7, where `grep epochSeen` is genuinely empty; verified the fold
+  satisfies the property as stated rather than re-doing it. New in this round:
+  (1) FORWARD BOUND on an accepted epoch (`epochOrderable`): at most
+  `bootEpochMaxSkew` (1y) ahead of the receiver's wall clock, applied ONLY when
+  our own clock is credible (`epochClockSaneFloor`, y2020) so a dead-RTC cold
+  boot does not refuse a healthy peer — the naive relative form would, at exactly
+  the moment cold-boot split-brain is most likely. Same bound applied in
+  `nextBootEpoch` (won't chain from an out-of-range prev) and on floor LOAD, so a
+  node or floor written under a bad clock HEALS. An unorderable epoch is now
+  REFUSED, not admitted-and-ignored — admitting it was the epochless bypass in
+  miniature. (2) Cross-process `flock` on both state files (`withEpochFileLock`):
+  nothing enforces a single xpfd (no pidfile, and gRPC sets SO_REUSEPORT so a 2nd
+  instance does NOT fail on the port), so the read-modify-write, not just the
+  write, needed to be atomic. Fails open. (3) OBSERVABILITY:
+  `HeartbeatStats.EpochlessAdmitted` / `EpochDowngradeRejected` — without a
+  counter the residual is invisible to an operator. (4) Docs: PSK rotation
+  elevated to a REQUIRED post-upgrade step with the counter as the exposure
+  meter; the #4107 `peerAuthSeen` layering stated (two gates, neither redundant;
+  the unkeyed path is #6624's domain). Tidiness: "scan back" -> single fixed
+  offset (there is no search loop); whole-struct DeepEqual in the legacy-receiver
+  test. Mutations 10/11/12 red as assertions with build+vet rc=0; 7 re-verified;
+  negative controls green in every world.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 19:10
+- **Action**: #6169 round-3 review fold — two MINORs. (1) The doc comment above
+  `admitAuthed` still described the SUPERSEDED behaviour: it claimed an
+  unorderable epoch "still satisfies the latch ... neither compared against the
+  floor nor latched", but the round-2 fold changed that path to REFUSE, so
+  `s.epochSeen = true` is never reached. Both clauses were wrong, at the exact
+  spot a reader checks whether a far-future peer can bypass the latch. Corrected,
+  and made executable — `TestHeartbeatUnorderableEpochNeverArmsLatch_6169` pins
+  both the refusal + no-latch AND the second-order consequence worth keeping (a
+  peer later rolled back is still accepted, because the latch never armed: the
+  safe direction). Second time this PR a comment outlived a behaviour change.
+  (2) The exposure meter had NO operator surface — `EpochlessAdmitted` /
+  `EpochDowngradeRejected` were populated on the Go struct and rendered nowhere,
+  while README told operators to read them. Added both to the `Control link
+  statistics:` block at all three render sites (`FormatInformation`,
+  `FormatStatistics`, `FormatControlPlaneStatistics`) with an inline actionable
+  note (`rotate the control-link PSK`) while the peer is not signing epochs,
+  switching to "count is historical" once the latch arms. Guard asserts the
+  RENDERED string per surface; mutating each site individually reds only that
+  site's subtests. Prometheus deliberately NOT done: `xpfCollector` is
+  dataplane-scoped with no cluster surface, so it needs a new dependency edge —
+  recorded as a follow-up rather than bolted on.
+- **File(s)**: pkg/cluster/status.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 21:40
+- **Action**: #6169 round-4 — RESHAPED rather than patched. Codex xhigh returned
+  five MAJORs, four of them the same theme: the failure paths did not hold the
+  invariant the happy path established. Priced the durable peer-epoch floor and
+  REMOVED it: its marginal benefit was one narrow window (receiver daemon restart
+  AND genuinely absent peer AND attacker holding pre-upgrade captures, itself
+  retired by the already-REQUIRED PSK rotation), while its marginal cost was four
+  of the five MAJORs — rollback needing a documented `rm` under incident pressure
+  (M1), a crash window between accept and commit whose test could not even
+  observe it because it installed a SYNCHRONOUS hook against production's
+  goroutine (M3), a receive-path cross-process lock (M5), and a persisted
+  in-range-but-wrong epoch locking a peer out across reboots (M4). The latch is
+  now process-scoped on Manager.hbAuth, which already survives the routine
+  restarts (heartbeat restart, VRF rebind, comms restart, #5086/#6642); only a
+  full daemon restart clears it and a live peer re-arms it in ~100ms. Rollback
+  recovery becomes `systemctl restart xpfd` — no state file, no new CLI.
+  M2 fixed independently: the boot epoch is now published SYNCHRONOUSLY from the
+  wall clock with NO file access, and persistence is a refinement worker that
+  only RAISES it (its one job is the backward clock step). So a hung disk cannot
+  make a latched peer see a healthy node as epoch-less and therefore dead. With
+  emission decoupled from I/O, the lock could be made to fail CLOSED at zero
+  availability cost (M5). M4: skew tightened one year -> ONE HOUR, because the
+  slack IS the worst-case lockout for a repaired peer. Guards added per finding;
+  mutations 13-16 each red an assertion with build+vet rc=0.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 22:30
+- **Action**: #6169 tie-break response. Q2 (storage hang -> false peer-death) was
+  ALREADY fixed by the reshape in 2cba87111 — the epoch is published
+  synchronously from the wall clock before any file is touched — but that was
+  proven with an unwritable-path proxy, not the tie-break's actual experiment.
+  Added `TestHeldFlockCannotCauseFalsePeerDeath_6169`, which holds the REAL
+  advisory flock and walks all four measured links: bootEpoch non-zero and
+  non-blocking under a held lock; the emitted frame carries an epoch; a LATCHED
+  receiver accepts those frames; checkTimeout does NOT declare the peer dead. It
+  also drains the worker after releasing, demonstrating the self-heal. Mutation 17
+  (publish only after the worker — the tie-break's measured shape) reds LINK 1
+  with build+vet rc=0. Q1: the persist hook, `peerFloor` and the whole
+  peerEpochFloorStore are GONE with the durable floor, so the untracked-goroutine
+  window and the synchronous-hook test that could not see it were deleted with the
+  mechanism, not patched. Also fixed a FOURTH stale comment: the `epochSeen` doc
+  still said "restored from the DURABLE floor at start (primeEpochFloor)" after
+  the reshape removed both — a `grep primeEpochFloor` caught it.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  _Log.md
+
+- **Timestamp**: 2026-08-01 23:15
+- **Action**: #6169 — post-reshape comment sweep + the two open findings measured.
+  Grepping the DELETED symbols found SEVEN stale references to the removed
+  durable floor across four files, not the one block spotted: two in
+  heartbeat.go (including the rollback recovery instruction pointing at a state
+  file that no longer exists), two in manager.go (the operator-facing
+  rate-limited warning), one in heartbeat_epoch.go, one in the latch test header,
+  two in README. All corrected to the restart-only recovery. Also re-stated the
+  storage claim explicitly naming the HANGING case, which is the one that was
+  actually broken: a FAILING store always fell through to the wall-clock seed; a
+  HANGING one did not, because the epoch was computed before I/O and then thrown
+  away by not publishing until after a blocking LOCK_EX. Findings re-checked
+  against the reshape: MAJOR 1 and MAJOR 3 are MOOT (no state to hand-edit, no
+  durable window); MAJOR 5 is free (emission no longer depends on the lock);
+  MAJOR 2 is fixed and pinned by the tie-break's own held-flock experiment
+  (3ba876e7c); MAJOR 4 is NOT moot but reduced — an in-bound skewed epoch still
+  latches, now bounded BOTH by the one-hour slack (self-clearing) and by a
+  restart clearing the in-memory floor. Measured the receiver-restart cost rather
+  than asserting it: ONE heartbeat interval with a live peer; a replay inside the
+  window IS admitted, the live peer's higher epoch repairs the floor, so sustained
+  exposure additionally needs the peer ABSENT. Both now have tests and are
+  documented as deliberate.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 23:55
+- **Action**: #6169 — lock-skip rationale + last stale doc reference. The five
+  stale-doc sites cited by review were already corrected in e84af04a0 (review read
+  3ba876e7c, one commit behind); verified at HEAD rather than assumed — all five
+  clean, and a grep of the deleted symbols found ONE survivor: the README
+  entry-points list still named `peerEpochFloorStore`. Fixed; the deleted
+  mechanism now has zero occurrences under pkg/. Strengthened `withEpochFileLock`'s
+  comment with the argument that makes the skip obviously right rather than
+  arguably right: proceeding unlocked did NOT trade correctness for liveness, it
+  traded a TRANSIENT liveness risk for a DURABLE one — a raced read-modify-write
+  can leave a lower epoch in the file, that value is read back as `prev` on the
+  next boot, and it is exactly the term that matters after a backward clock step,
+  so the epoch produced can sit below the peer's latched floor and be refused:
+  the same false-peer-death, moved one restart later and made durable. Also noted
+  the old justification ("a node that cannot lock must not be a node that cannot
+  heartbeat") was a SENDER-liveness argument applied to a call site that is not on
+  the heartbeat path at all, and that 2 of 3 branches in the same function already
+  declined. Elevated the one-heartbeat-interval restart window from a rollout-step
+  side note to the design decision that REPLACED durability, with what was bought
+  in exchange stated alongside it.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 00:40
+- **Action**: #6169 — NEW-1 (blocking) + NEW-2 folded; NEW-3 verified already
+  clean. NEW-1: `initHeartbeatEpochState` still waited up to 2s on
+  `bootEpochReady`, which closes in a defer inside the refine goroutine — under a
+  wedged store that goroutine never returns. StartHeartbeat calls StopHeartbeat()
+  FIRST, so every routine restart (VRF rebind, HA comms restart) stalled a node
+  with its heartbeat already STOPPED, against a 500ms/1s dead-peer threshold.
+  That is the same false-peer-death this work removed, relocated from "emits
+  epochless frames" to "emits no frames at all" — indistinguishable to the peer.
+  The wait was a leftover from the pre-decoupling design and bought nothing once
+  emission moved ahead of all I/O; deleted, along with now-unused
+  `bootEpochResolveWait`. Guard + mutation 18 (reinstate the wait) reds at
+  2.008s. NEW-2: `nextBootEpoch` had ZERO production callers and 9 test call
+  sites — a green suite exercising read-modify-write logic that shipped nothing
+  and could silently diverge. Deleted; tests repointed at the live
+  `refineBootEpoch`, with the wall-clock seed factored into a shared
+  `bootEpochSeed()` so the helper cannot restate (and drift from) production.
+  NEW-3: the ten cited sites were already corrected in e84af04a0/8802c4f97;
+  verified at HEAD. Restated the durability trade honestly per review: the window
+  is bounded by the peer's NEXT GENUINE FRAME, not wall clock — ~100ms live,
+  OPEN UNTIL RETURN if the peer is silent, which is the case durability existed
+  for. Recorded the measured figures (1080/1080 admitted in-window, 0/120 after;
+  one ascending pass ~60 frames across 12 incarnations) so nobody re-derives it
+  and concludes it was oversold.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 01:30
+- **Action**: #6169 — the doc sweep's own blind spot, plus a test my fix made
+  vacuous. NEW-1/NEW-2 were already fixed in 7f14a7cd0 (both reviews read stale
+  heads). But my NEW-1 commit did NOT touch heartbeat_manager.go, so the comment
+  sitting DIRECTLY on the defect survived — it still said "restore the durable
+  peer epoch floor" (deleted) and "Both are once per process, so a routine
+  VRF-rebind restart pays neither" (measurably false under the exact failure the
+  wait existed for). Missed because the handed-down grep alternation
+  (`durable floor|persisted floor|primeEpochFloor|made durable|peer-epoch-floor`)
+  does not match "durable peer epoch floor" — a COUNT derived from a grep carries
+  that grep's blind spot downstream, twice in this PR. Re-swept from SIX
+  independent angles (`durable.*floor`, `fails? open`, `state files`,
+  `epoch.*floor`, `once per process`, `restore the`) and found two MORE:
+  README's lock bullet said "both state files" (there is one) and "It fails OPEN"
+  (the code SKIPS — the exact rationale I replaced, still standing as the live
+  description three lines below the correct one), and the #5086 section still
+  claimed the floor and latch are DURABLE. All four fixed. Codex finding 4:
+  publishing the epoch synchronously silently removed the condition
+  `TestHeartbeatBootEpochResolvesAsync_6169` polled on, so it exited on iteration
+  0 and guarded nothing — and its "stable across calls" assertion had become a
+  FALSE claim, since refinement legitimately raises the epoch after a backward
+  clock step. Rewritten to join the worker and assert both halves of the real
+  contract; mutation 19 (refinement no-op) reds both subtests.
+- **File(s)**: pkg/cluster/heartbeat_manager.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 01:55
+- **Action**: #6169 — swept by DELETED SYMBOL NAME, an angle none of the previous
+  sweeps used, and found six more. The prior passes were all keyed on the removed
+  design's PROSE (durable floor, fails open, both state files); they cannot catch
+  a comment that correctly describes current behaviour while attributing it to a
+  function that no longer exists. `nextBootEpoch` was named as live in five
+  places (2 code comments describing the plausibility bound, 3 README bullets
+  describing the sender) and `bootEpochResolveWait` in one — all deleted symbols.
+  Retargeted at `bootEpochSeed` / `refineBootEpoch`. Sweep is now three
+  independent axes: removed-design prose, behaviour keywords (fails open / state
+  files / once per process), and removed-symbol identifiers. The last is
+  mechanical and complete by construction — enumerate what the diff deleted,
+  grep each — so it is the one to run first next time rather than last.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-02 02:25
+- **Action**: #6169 — pre-empted the three questions the re-measure was dispatched
+  to answer, since two are things I can settle myself. (1) STALL-TRADED-FOR-RACE:
+  removing a bound is exactly the shape that swaps a stall for a race, so added
+  `TestStartHeartbeatReturnsWithAUsableEpoch_6169` — drives the REAL StartHeartbeat
+  under a held flock and asserts it returns fast AND with a usable, orderable
+  epoch, AND that a frame built immediately after carries it. Safe because
+  sync.Once.Do does not return until its body has stored the seed, and that body
+  touches no filesystem. Mutation 20 (move the publish into the worker) reds it:
+  "StartHeartbeat returned with no usable epoch". (2) COVERAGE AFTER THE REPOINT:
+  diffed the subtest list at 8802c4f97 vs HEAD — ZERO removed, two added, 15->17,
+  so repointing the 9 nextBootEpoch call sites took no coverage with it. (3) The
+  async test binds — mutation 19 already showed both subtests red under a
+  refinement no-op. Re-ran the three wedged-store tests with -count=3: 9/9 pass.
+  Confirmed the durability restatement landed in both README sites and the commit
+  body, with the ascending-pass figure.
+- **File(s)**: pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+- **Timestamp**: 2026-08-02 03:20
+- **Action**: #6169 — the two SHIP-blocking fixes. (1) CLOCK-STEP FALSE PEER-DEATH:
+  `epochOrderable` ran on EVERY epoched frame including `epoch == highEpoch` from
+  the already-latched incarnation, so a backward wall-clock step beyond
+  bootEpochMaxSkew rejected a HEALTHY peer before the monotonic lastSeen update —
+  wall-clock sensitivity on the accept path, which is exactly what #1792's
+  CLOCK_MONOTONIC lastSeen exists to prevent. Split the check: `epochUsableAsFloor`
+  (absolute, clock-independent) applies to every frame; the new
+  `epochWithinForwardBound` (clock-dependent) gates ONLY `epoch > highEpoch`, i.e.
+  the irreversible raise. Mutation 21 reds. (2) READ ERROR DURABLY REGRESSED THE
+  EPOCH: a non-ENOENT ReadFile error left prev=0 and fell through to the write,
+  clobbering a possibly-higher persisted value — the regression withEpochFileLock's
+  own comment argues against, and both sibling branches already abort. Now returns.
+  Mutation 22 reds — but only after I REWROTE the test: the first version injected
+  the fault with a directory, where the rename ALSO fails, so it passed for a
+  reason unrelated to the fix and stayed green under mutation. Switched to a
+  self-referential symlink (read fails ELOOP, write would succeed), which is the
+  shape that actually exercises the branch. (3) PSK rotation doc already existed at
+  README:1013 (review searched an older head); strengthened it to name the
+  `verifyHeartbeatMAC` live-key mechanism and to state explicitly that rotation is
+  what makes the accepted restart residual acceptable. Also retired the last stale
+  comment describing the removed startup wait (manager.go).
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/README.md, _Log.md
 - **Timestamp**: 2026-08-01 16:55
 - **Action**: #6655 review fold round 6 — two guards I added in earlier rounds
   assert a PROXY rather than the property their own message claims. (F1) The
@@ -69229,6 +69563,1452 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01 19:35
+- **Action**: #6169 fold round (PR #6669) — two MAJORs and three MINORs from an
+  independent Codex correctness review. (MAJOR-2) The documented rollback
+  recovery does not work under the attacker the feature defends against: a
+  restart clears the floor, the latch and the ring TOGETHER, and arming needs
+  only an authenticated, orderable, ring-fresh epoch frame, so ONE archived
+  frame re-arms the latch against the empty post-restart state and the
+  legitimately rolled-back peer is refused again — one replay per restart,
+  indefinitely. Not closed in code: a durable latch re-creates the peer-floor
+  file this design deliberately removed (and makes an in-range-but-wrong epoch
+  a lockout outliving reboots), and a freshness test needs a challenge-response
+  or timestamp the heartbeat wire format does not carry — a legitimately
+  long-lived peer's epoch is arbitrarily old, so no recency test separates it
+  from an archived one. Corrected the recovery instead, everywhere it is
+  stated: the operator WARNING now names the PSK rotation FIRST (rotation makes
+  archived frames fail `verifyHeartbeatMAC`, so they never reach the latch; the
+  key is re-read per frame on both paths, so rotation needs no restart), the
+  arming site in `admitAuthedLocked` carries the caveat and the rejected
+  alternatives, and README residual 5 states it with scope — a peer that never
+  emitted an epoch cannot be falsely armed, so this bites on rollback,
+  same-identity replacement, or a partial upgrade. (MAJOR-1) Verified by
+  execution that the "bad-clock state heals" claim holds only when the LOCAL
+  clock is credible when refinement LOADS the file: below `epochClockSaneFloor`
+  the forward bound is skipped, so a wrong-but-below-2200 value is chained
+  from, and refinement runs once per Manager so a later NTP correction never
+  re-validates it. Inherent, not an oversight — under a dead RTC a legitimate
+  previous epoch and a corrupt future one are indistinguishable, and healing
+  after the fact means LOWERING a published epoch mid-incarnation, the one
+  direction the design refuses. Claim narrowed to exactly what holds, at both
+  sites (`epochWithinForwardBound`, README), plus residual 6. (MINOR-3)
+  `refineBootEpoch` validated `prev` and published `prev+1`; a persisted
+  `epochPlausibleMax-1` published exactly `epochPlausibleMax` (refused on a
+  strict `<`) and a persisted `now+bootEpochMaxSkew` published one nanosecond
+  past the bound — the node then signs frames no receiver accepts. Now
+  validates the successor against ONE clock sample. (MINOR-4) Status inferred
+  the latch from `EpochDowngradeRejected > 0`, which only moves on a LATER
+  refusal, so between arming and that frame it reported "replay protection is
+  ring-only" while the latch was refusing; added `HeartbeatStats.
+  PeerEpochLatched` and read the state instead of the proxy. The existing test
+  masked this by injecting a downgrade before rendering — split into a phase
+  that renders with nothing else injected. (MINOR-5) Fixed all nine
+  contradicting comments, including the two the review flagged as most
+  important (non-orderable frames are NOT uniformly rejected — `epoch ==
+  highEpoch` past the forward bound is admitted by design; a failed absolute
+  band DOES reject and does NOT arm), the non-existent peer-floor store, the
+  "persistence failure suppresses emission" implications, the obsolete
+  per-`heartbeatSender` session model (`heartbeatNonce` is Manager-scoped since
+  Stage 0), and the latch test whose comment contradicted its own assertion.
+  Validation: build + vet clean; `go test -race ./pkg/cluster/` green; four
+  mutations each RED with build+vet CLEAN first and scoped to their own
+  assertions — dropping the successor check reds both bound subtests while the
+  in-range negative control stays green; restoring the counter proxy reds
+  exactly the three new render subtests; reverting the warning text reds only
+  the warning test; and refusing to arm against an empty floor reds the
+  characterization test, proving it binds the residual the docs now describe.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/manager.go,
+  pkg/cluster/status.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 21:40
+- **Action**: #6169 fold round 2 (PR #6669) — Codex verification of the previous
+  fold returned MERGE-NEEDS-MAJOR. (MAJOR-1, a regression the previous fold
+  introduced) Collapsing two clock samples into one was right, but the single
+  sample was taken BEFORE `os.ReadFile` rather than after it, so a stalled read
+  straddling an NTP correction judged the persisted value against a clock that
+  no longer existed: a dead-RTC boot captured 1970, the read completed after the
+  clock reached the present, `epochClockSaneFloor` then skipped the forward
+  bound on the stale sample, and a corrupt-but-below-2200 successor was
+  published by a node whose clock was by then good. Sample moved after the
+  successful read; only that branch consults the clock. (MAJOR-2, claims only —
+  the behavioural fix is #6711) A single backward clock step larger than
+  `bootEpochMaxSkew`, with storage intact and the EARLIER clock correct,
+  regresses the sender epoch below a floor its peer already latched. Corrected
+  the sender bullet, the forward-bound trade paragraph and residual 3 in
+  pkg/cluster/README.md, the chain-refusal comment in `refineBootEpoch`, and the
+  `value_beyond_the_forward_bound_is_not_chained_from` rationale, which pinned
+  the behaviour on the false assertion that such a value is reachable only when
+  this node's own clock was wrong at persist time. (MINOR-3)
+  `Manager.HeartbeatStats` read the downgrade latch and its counters through the
+  installed receiver and gated them on `receiver != nil`, so it reported the
+  latch CLEAR through `StopHeartbeat` and the whole ~5s bind-retry span of a
+  failed `RestartHeartbeat` — and status therefore re-ran the "replay protection
+  is ring-only; rotate the PSK" advice while the latch was refusing. Read from
+  `m.hbAuth`, which owns them. (MINOR-4) The recovery test asserted rotate-first
+  over a body that restarted first, with no replay between, so it proved neither
+  ordering; replaced with `TestRollbackRecoveryOrderingIsRotateThenRestart_6169`
+  executing both — rotate/restart recovers, restart/rotate re-arms via one
+  replayed archived frame and costs a second restart. (MINOR-5) Corrected the
+  remaining contradictory text: the ~56-vs-222-year magnitude in the bounds
+  test, the README claim that the downgrade counter starts when the latch arms
+  (it stays 0 until a later epochless frame is refused), the status note
+  asserting the peer "now signs boot epochs" when an archive can arm the latch
+  against a rolled-back epochless peer, and four sites still calling a bare
+  restart the rollback recovery. Also addressed two Codex design critiques in
+  the rationale rather than the code: the "not closable" claim is now qualified
+  with the partial narrowing that exists (lowering the arbitrary year-2200
+  horizon) and why it is declined — the horizon is a hard cliff, and a value
+  past it is rejected on EVERY frame, so lowering it trades a fault whose worst
+  case is asymmetric visibility for one whose worst case is mutual refusal; and
+  the durable-latch rejection no longer charges a durable LATCH for the costs of
+  a durable FLOOR — a PSK-scoped `{key fingerprint, epochSeen}` boolean avoids
+  both floor costs and is declined on its own (a durable write on the accept
+  path with no good failure policy, cross-process locking there, a strictly
+  heavier no-attacker rollback, closing a window the mandatory PSK rotation
+  already closes).
+  Validation: `go build -buildvcs=false ./...` and `go vet ./pkg/cluster/...`
+  rc 0 before every red; `go test -race ./pkg/cluster/` green; consumer packages
+  (cmd/cli, cmd/xpfd, pkg/cli, pkg/clusterfailover, pkg/daemon, pkg/grpcapi,
+  pkg/upgrade, pkg/vrrp) green. Four mutations, each with build+vet CLEAN first
+  and each scoped to its own assertions: hoisting the clock sample back above
+  the read reds only the new sample-placement test at exactly 7000000000000000001
+  while `absolute_band`, `forward_bound` and the `in_range_predecessor_still_
+  chains` control stay green; re-gating the epoch fields on `receiver != nil`
+  reds only the new stats-scope test; and swapping the two operations inside
+  each ordering subtest reds that subtest alone.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/manager.go,
+  pkg/cluster/status.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_clock_sample_6669_test.go,
+  pkg/cluster/heartbeat_epoch_stats_scope_6669_test.go,
+  pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+## 2026-08-01 — #6669 fold r7: pin the status string, finish the two missed sweep sites
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold the three MINORs the r6 hostile re-gate raised on PR #6669
+  at `846e832c0`. All three are claim/coverage defects; the executable delta
+  here is one test helper.
+- **MINOR-3 was the material one — a guard that could not fire.** The fold at
+  `846e832c0` changed the armed-latch note from
+  `"(epoch-less frames now refused; count is historical)"` to
+  `"(downgrade latch armed; count is historical)"`. Every existing assertion
+  keyed on `"count is historical"` — a substring **both** spellings contain —
+  so all six latched subtests passed identically before and after the PR's one
+  runtime-visible change. Asserting the surviving substring is not asserting
+  the fix. Added `assertLatchNoteReportsFactNotEnforcement`, called from both
+  the `_latched_before_any_downgrade` and `_after_latch` loops: positively
+  requires `"downgrade latch armed"`, negatively forbids `"now refused"` /
+  `"frames refused"` / `"are refused"`.
+- **Both arms proven to fire, independently.** Mutation A (restore the old
+  string verbatim) reds the positive arm on all 6 latched subtests; mutation B
+  (`"downgrade latch armed; epoch-less frames now refused; count is historical"`
+  — deliberately satisfies the positive arm) reds the negative arm alone,
+  naming the overclaim. Mutation A alone would NOT have proven the negative arm,
+  because the positive arm `t.Fatalf`s first. `go build` + `go vet` stayed rc=0
+  under both mutations, so neither red is a build break; the three unrelated
+  `_exposure` subtests stayed PASS under both, so the guard is scoped.
+- **MINOR-1 — two sites still carried the claim this PR disproved.**
+  `heartbeat_epoch.go:566` ("this one ends at the next restart") is a production
+  comment at the `!epochOrderable` decision site, and `README.md:578-579` said
+  "ends at the next restart on either node" while `README.md:739` in the same
+  file already spelled out the narrower truth. Restarting the SENDER with the
+  wrong clock re-publishes from the same bad clock (the file now holds the lower
+  value) and stays below the floor. Both now say RECOVERABLE and point at the
+  "Recovery is narrower" paragraph rather than restating it.
+- **MINOR-2 — "total order" was unqualified** at `heartbeat.go:557` and
+  `heartbeat_epoch_test.go:18`. The boot epoch totally orders incarnations only
+  while the sender's clock advances monotonically across boots; a backward step
+  larger than `bootEpochMaxSkew` sorts a later incarnation below an earlier one
+  (#6711). Both sites now state the qualification.
+  **CORRECTION (round 8): the replacement wording was itself false.** It said
+  the failure direction "is CLOSED — a genuine peer refused, never a retired one
+  admitted". Both halves fail together: once a sender regresses, the highest
+  epoch on the wire belongs to a RETIRED incarnation, so an archived frame from
+  it is ADMITTED and raises the floor while the genuine current incarnation is
+  refused. `TestArchivedEpochPoisonsAFreshFloor_6711`, on this same branch,
+  already asserted exactly that. Withdrawn and replaced in round 8 below.
+- **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
+  `go test -race ./pkg/cluster/` ok 12.4s, the 6 latched subtests confirmed to
+  RUN by name under `-v` (not skipped), `status.go` byte-identical to the PR
+  head after restoring the mutation.
+- **File(s)**: pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-01 — #6669 fold r8: withdraw the fail-closed claim, reprice the durable latch, make a lost epoch race recoverable
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold of three MAJOR and two MINOR review findings on
+  `fix/6169-heartbeat-boot-epoch-v2`. Every finding was reproduced firsthand
+  before it was fixed; none was refuted.
+- **MAJOR-1 — the fail-closed claim was FALSE and is withdrawn, not softened.**
+  `heartbeat.go` said a #6711 sender regression "fails CLOSED (a genuine peer is
+  refused, never a retired one admitted)". Measured counterexample: a fresh
+  receiver accepts the genuine current incarnation B at `T-2h`, then an archived
+  frame from RETIRED incarnation A at `T` arrives — above the floor, inside the
+  forward bound, ring-fresh — is ADMITTED, raises the floor to `T`, and B is
+  refused from then on. Both halves go the wrong way at once.
+  `TestArchivedEpochPoisonsAFreshFloor_6711` on this same branch already
+  asserted it. The replacement states the weaker true property instead: sustained
+  churn still needs `heartbeatReplaySessions+1` sessions at or above the floor
+  and one incarnation emits exactly ONE session (#6169 Stage 0), so
+  epoch-BEARING captures buy a FINITE ascending pass — measured 325/325 admitted
+  on the pass, then 0/1625 over five further rounds. Swept the current-tense
+  contradictions at `heartbeat_epoch.go` (header, `heartbeatBootEpoch`),
+  `heartbeat.go` (both `admitAuthed` three-case lists, the `readLoop` note),
+  `README.md` (the `heartbeat_epoch.go` index entry, the receiver case list) and
+  `heartbeat_epoch_test.go:18`.
+- **MAJOR-1b — the recovery wording was over-broad in the other direction.**
+  "Restarting the sender while its clock is still wrong does not help" is false
+  once the slow clock's READING reaches the floor: `epoch == highEpoch` falls
+  through to the ring and is admitted. The operative condition is "while the
+  published reading remains below the floor", now used at
+  `heartbeat_epoch.go` and `README.md`'s "Recovery is narrower" paragraph.
+- **MAJOR-2 — the durable latch was declined on a false premise; repriced.**
+  The old argument was that an epoch-bearing archived frame opens the same door,
+  so a durable latch buys nothing outside a capture window strictly inside a
+  rollback. Measured against a restarted receiver, the doors are NOT equivalent:
+  65 epoch-BEARING incarnations admit 325/325 then 0/1625 (the set is spent),
+  while 65 epoch-LESS incarnations captured under the CURRENT key admit 1625/1625
+  and keep going — indefinitely sustained forged liveness against a silent peer,
+  which a durable PSK-scoped latch would refuse entirely. The decline STANDS, on
+  its own costs (a durable write on the accept path with no good failure policy,
+  cross-process locking there, a heavier no-attacker rollback), with the benefit
+  stated honestly. Corrected the four sites carrying the old premise:
+  `heartbeat.go` (the `epochSeen` field comment and the arming site),
+  `heartbeat_epoch_latch_test.go`, `README.md` (durable-latch pricing, residual
+  5, and the rotation section's "every archived capture ... none of it
+  verifies").
+- **MAJOR-2b — the test was weaker than its comment.**
+  `TestRollbackRecoveryOrderingIsRotateThenRestart_6169/rotate_then_restart_recovers`
+  generated valid NEW-key epoch-less frames, used them only to show rotation
+  alone does not recover, then discarded them before the restart — the step that
+  makes them usable. It now keeps them and replays them after the restart: 5/5
+  admitted, asserted as the residual the process-scoped latch accepts. Proven to
+  bind by mutating `admitAuthedLocked` to refuse every epoch-less frame (0/5
+  admitted, assertion RED).
+- **MAJOR-3 — a real defect: the state lock does not order incarnations.**
+  `withEpochFileLock` claimed to stop two overlapping incarnations "publishing
+  epochs that are not strictly ordered". It serializes by lock ACQUISITION, and
+  `heartbeatBootEpoch` publishes and starts emitting BEFORE its worker reaches
+  the lock, so there is no happens-before edge from daemon start or survivorship
+  to acquisition. Reproduced: older A publishes `a`, newer B locks first and
+  persists `b > a`, A locks second, reads `b` and raises ITSELF to `b+1`; the
+  peer latches the OLDER incarnation and refuses the surviving newer one.
+  It cannot be ordered with this file alone — a predecessor's value after a
+  backward clock step and a concurrent newer incarnation's value leave the
+  identical file — so the UNRECOVERABLE half is what is fixed:
+  `Manager.refreshBootEpoch` re-runs refinement at every later heartbeat start
+  (`initHeartbeatEpochState` branches on an already-published epoch), so the
+  stranded incarnation climbs back above the file at the next `StartHeartbeat`
+  instead of being pinned below the peer's floor for the life of the process by
+  `sync.Once`. `refineBootEpoch` gained a `lastWrote` watermark
+  (`Manager.bootEpochWrote`) so a re-run over our own persisted value is a no-op
+  rather than a +1 ratchet, and `Manager.bootEpochRefining` admits one worker at
+  a time. What remains — the mis-ordering itself, and no periodic re-check
+  between it and the next heartbeat start — is stated at the lock, in README
+  residual 7, and filed as **#6724**.
+- **MINOR-4 — a status assertion narrower than its own message.**
+  `assertLatchNoteReportsFactNotEnforcement` required `"downgrade latch armed"`
+  and blacklisted three phrasings, so `"downgrade latch armed; epoch-less frames
+  currently rejected; count is historical"` — the same false enforcement claim in
+  unlisted words — PASSED (verified: build/vet rc=0, tests PASS). It now isolates
+  the note from the rendered `Heartbeats without epoch:` line and compares it by
+  EXACT EQUALITY against a literal spelled out in the test (not read back from
+  `epochlessExposureNote`, which would be `X == X`). The RED-on-revert comment
+  was also wrong — a plain revert reds the POSITIVE arm and `t.Fatalf`s before
+  the negative loop runs — and now describes the two mutations that actually
+  exercise the single assertion. Fixed the matching overclaim on the public
+  `HeartbeatStats.PeerEpochLatched` field and on `heartbeatAuthState.epochSeen`.
+- **MINOR-5 — three comments promising more than they assert.**
+  (a) `TestEpochFileLockFailsClosed_6169` claimed both lock-failure paths red;
+  only `OpenFile` failure was forced, and `flock(2)` on an opened regular file
+  does not fail on Linux, so running the critical section unlocked on the flock
+  branch stayed green (verified). Added `epochFlock`, a package var indirecting
+  `unix.Flock` for the same reason `epochNowNanos` exists, and split the test
+  into `open_failure` / `flock_failure` / `lock_available`.
+  (b) `restarts_strictly_increase` claimed to pin nanosecond seed uniqueness but
+  cannot: every iteration persists, so `persisted+1` supplies strictness
+  whenever the seed does not — rounding `bootEpochSeed` UP to whole seconds left
+  the ENTIRE package green. Comment corrected and
+  `TestBootEpochSeedResolutionIsFinerThanARestart_6669` added, asserting the
+  smallest positive gap across 2000 samples is under a millisecond.
+  (c) `heartbeat_epoch_stats_scope_6669_test.go` described the latch as
+  "refusing" during a receiver gap; with no receiver installed nothing is read,
+  so the latch is RETAINED, not enforcing. Reworded to match what it asserts.
+- **Also found, not asked about**: the MAJOR-3 fix makes residual 6 ("a bad
+  persisted epoch heals only if the local clock is credible") narrower — the
+  file now heals at the first heartbeat start after NTP corrects the clock,
+  rather than never within the process. Updated at `epochWithinForwardBound`,
+  README residual 6, and `TestPersistedEpochHealsOnlyWhenClockCredible_6169`'s
+  header, including the part that does NOT improve (the epoch this incarnation
+  already published is never lowered).
+- **RED-then-GREEN** (each mutation verified `go build ./...` rc=0 and
+  `go vet ./pkg/cluster/...` rc=0 in BOTH states, so no red is a build break):
+  drop the `refreshBootEpoch` branch in `initHeartbeatEpochState` →
+  `TestConcurrentIncarnationsAreOrderedByLockAcquisition_6669` reds on the
+  recovery assertion, the other four epoch tests stay PASS. Delete the
+  `prev == lastWrote` early return → the idempotence and watermark assertions
+  red, `TestBootEpochMonotonic_6169` stays PASS. Run `fn()` on the flock error →
+  only the `flock_failure` subtest reds. Round `bootEpochSeed` to seconds (and to
+  milliseconds) → only the new seed-resolution guard reds. Both status-note
+  mutations ("now refused" and the "currently rejected" hybrid the old blacklist
+  admitted) → the exact-equality assertion reds on all six latched subtests.
+  Refuse every epoch-less frame → the new post-rotation replay assertion reds
+  0/5 (this mutation is broad and also reds the migration tests, as expected).
+- **Also found: the PR head was shipping a RED canary.** `go test ./pkg/...`
+  failed `TestHeatmapNotStale` — this branch pushed `pkg/cluster/heartbeat.go`
+  past the 1500-LOC audit threshold without regenerating the heatmap. Verified
+  PRE-EXISTING at the PR head 37d0729b9 in a throwaway detached worktree (RED
+  there, GREEN at origin/master), so it is this PR's regression, not mine.
+  Regenerated `docs/refactoring-audit-current.txt` with
+  `scripts/refactoring-audit.sh`; the only file-set/tier change is
+  `pkg/cluster/heartbeat.go` entering [WATCH] at 1609 LOC (the rest is LOC-count
+  refresh). Well under the 2000-LOC refactor threshold, so it is a watch entry,
+  not a split obligation.
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `gofmt -l
+  pkg/cluster/` empty, `go test -race ./pkg/cluster/` ok, `go test ./pkg/...`
+  and `go test ./cmd/...` green.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/heartbeat.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_clock_sample_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_epoch_stats_scope_6669_test.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go, pkg/cluster/README.md,
+  _Log.md
+
+## 2026-08-02 — #6669 fold r9: withdraw the "a re-run heals the file" claim
+
+- **Timestamp**: 2026-08-02
+- **Action**: Fold the r7 hostile re-gate's F1 (MAJOR) and F2 (MINOR) on PR
+  #6669 at `706c06748`. Both are claim defects; zero executable lines change.
+- **F1 — the previous fold replaced a TRUE statement with a FALSE one.** It
+  claimed `Manager.refreshBootEpoch` means "the NEXT StartHeartbeat does
+  re-validate the file AND HEAL IT", so "the file is healed for the next boot".
+  The re-validate half is true and new. The heal half is false and unreachable
+  by construction, which I verified in the code rather than accepting the
+  review: `refineBootEpoch` computes `epoch := published.Load()`, raises only
+  under `if next := prev + 1; next > epoch`, and then persists that `epoch`
+  (`heartbeat_epoch.go:755/764-769/771`). Residual 6's premise is that the FIRST
+  pass already chained from the corrupt value, so `published` is by then
+  `bad+1`; every later pass therefore writes `bad+1` back or returns without
+  writing (`prev == lastWrote`, read error, MkdirAll failure). No path LOWERS
+  the file, and lowering is exactly what healing means here — contrast the
+  first-pass decline, which heals precisely because `published` is still the
+  sane wall-clock seed. On the dead-RTC box this residual describes, a restart
+  does not clear it either: the first pass of every boot chains again and the
+  value ratchets +1 per boot. Corrected at `heartbeat_epoch.go:272-279` (code
+  comment), `README.md:832-834` (operator-facing residual 6) and the
+  `TestPersistedEpochHealsOnlyWhenClockCredible_6169` header.
+- **The test header also promised more than the body asserts**, the shape this
+  PR exists to remove: nothing below it exercised a second pass. The header now
+  states its scope — first pass only — and says what a multi-pass test would
+  need (a second `refineBootEpoch` with the `lastWrote` watermark carried).
+- **What re-running refinement DOES bound** is stated instead: an incarnation
+  stranded BELOW its peer's floor climbs back rather than being pinned by
+  `sync.Once` for the life of the process. That is a different failure from
+  residual 6, and conflating them is what produced the false claim.
+- **F2 — the withdrawn claim survived verbatim six lines above its own
+  withdrawal** at `heartbeat.go:558-560`: "a frame from a retired incarnation
+  never reaches admit()". The next paragraph says the opposite. Rewritten to
+  "a frame the floor REJECTS never reaches admit()… an ORDERING property, not a
+  claim that every retired incarnation is rejected". Not pre-existing —
+  `origin/master` has no `heartbeat_epoch.go` and no such sentence. Also
+  restored the `//` paragraph separator the previous rewrite dropped.
+- **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
+  `go test -race ./pkg/cluster/` ok 13.0s, and
+  `TestPersistedEpochHealsOnlyWhenClockCredible_6169` confirmed by name under
+  `-v` to have RUN both subtests rather than been skipped. No executable line
+  changed, so no mutation proof applies — the defect was the prose.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go, pkg/cluster/heartbeat.go,
+  _Log.md
+
+## 2026-08-02 — #6669 fold r10: bind the epoch floor to a session; coalesce refines
+
+- **Timestamp**: 2026-08-02
+- **Action**: Fold four Codex MAJORs and a MINOR on PR #6669 at `c76ddec38`.
+  Every finding was REPRODUCED before it was fixed.
+- **MAJOR 1 (CONFIRMED, code fix) — the replacement claim was FALSE for EQUAL
+  EPOCHS, and it was a live replay hole.** "Epoch-bearing captures buy only a
+  finite ascending pass" was stated unconditionally, but `epoch == highEpoch`
+  fell through to the ring, so 65 captured incarnations sharing ONE valid epoch
+  churned it exactly as epochless frames do. Measured before the fix: 325/325 on
+  the first pass, **1625/1625** across five further rounds. The step that fails
+  is "distinct sessions => distinct epochs" — one session per process does NOT
+  imply one epoch per process. Reachable: the wall-clock seed is published
+  before refinement and a failing store never raises it, and `bootEpochSeed`
+  returns the literal `1` for every incarnation of a node whose clock reads at
+  or before the Unix epoch. The existing corpus could not see it because
+  `heartbeat_epoch_test.go:190` hard-codes strictly increasing epochs `1000+i` —
+  a corpus holding constant the very variable the defect lives in.
+  **Fix**: `heartbeatAuthState.highEpochSession` binds the floor to the session
+  that raised it. Equality still falls through to the ring for THAT session (it
+  must — a live peer signs every frame of its incarnation with one epoch, so
+  refusing equality outright declares a healthy peer dead) and is refused for
+  any other, BEFORE `ring.admit`, which is the same ordering the floor itself
+  needs. Raising rebinds. Cost: a peer incarnation whose epoch exactly equals a
+  predecessor's is refused until its epoch moves AT ALL — one nanosecond of wall
+  clock, or one refinement pass (`prev+1`) — so it is durable only under a
+  frozen clock AND a dead store, the regime in which the sender publishes no
+  order at all. Counted as `EpochSessionCollision` and rendered by
+  `show chassis cluster status`.
+- **MAJOR 2 (CONFIRMED, NOT fixable here — claim corrected + characterized).**
+  Recovery via `Manager.refreshBootEpoch` fails when the floor-raising epoch
+  never reached the file. Measured: B persists `b`; delayed A reads `b`,
+  publishes `b+1`, its write FAILS; the peer latches `b+1` and refuses B; five
+  restarts later B is still at `b`. B has NO signal — it wrote `b`, the file
+  says `b`, so every pass returns at the `prev == lastWrote` shortcut. I
+  considered persisting BEFORE publishing and REJECTED it: on a write failure
+  that would stop A raising above a predecessor it has already READ, which is
+  exactly the backward-clock-step case persistence exists for — trading a later
+  lockout of B for an immediate one of A. The second unstated condition is also
+  real and measured: while both incarnations live they leapfrog, each pass
+  raising above the other and ratcheting the file. Both conditions are now
+  stated at `withEpochFileLock`, `refreshBootEpoch` and README residual 7, and
+  characterized in `TestRefineRecoveryNeedsTheRaisingEpochInTheFile_6669`.
+- **MAJOR 3 (CONFIRMED, code fix) — a lost CAS dropped the exact recovery
+  request that was needed.** Measured: with a worker held at the lock, a
+  concurrent `refreshBootEpoch` produced only ONE refine pass. **Fix**:
+  `Manager.bootEpochRefinePending` coalesces — the in-flight worker serves one
+  follow-up pass before exiting, with a re-claim step for the request that lands
+  between the pending check and the flag release. A BIT, not a queue, so the
+  backlog stays bounded at one.
+- **MAJOR 4 (already fixed at `c76ddec38`, VERIFIED not assumed).** Codex's
+  extra detail — a refresh rejects `H+1` as too far forward leaving `prev=0`,
+  then reloads the still-published `H+1` and writes it straight back — is
+  exactly the mechanism the existing wording covers ("every later pass therefore
+  writes bad+1 back"). Traced in code: `epoch := published.Load()`, `next :=
+  prev+1` is 1 which does not exceed `epoch`, so the write re-persists `H+1`. No
+  change needed.
+- **MINOR 5 (CONFIRMED, code fix) — a post-rename durability error ratcheted the
+  file on every pass.** `fsatomic.WriteFileDurable` returns a typed
+  `*PostRenameSyncError` where the content IS visible (#5185). Treating it as a
+  failed write left the watermark stale; measured a +1 ratchet on each of four
+  passes under an injected dir-fsync failure. **Fix**: `errors.As` classifies it
+  and records the watermark from what the file now holds.
+- **Remaining inaccurate claims, all corrected**: the two duplicated three-case
+  descriptions (`heartbeat.go`) said epochs "at or below" the floor never reach
+  the ring immediately before admitting equality; `heartbeat_auth_test.go`
+  claimed a post-eviction replay "cannot be sustained" when its body only
+  retries the SAME session; `heartbeat_epoch_latch_test.go` said the live peer
+  can "never" climb back over the archived floor while asserting only a restart
+  one second later. Also corrected everywhere the #6711 recovery was described
+  as happening "at equality" — with a session-bound floor it happens on the
+  RAISE path, which is the wider door anyway and is now measured
+  (`TestPoisonedFloorStillRecoversByRaise_6669`).
+- **Mutation proof — six gates, build rc=0 and vet rc=0 asserted in EVERY
+  mutated state so no red is a build artifact**: (M1) delete the equality
+  session check → 1625/1625 admitted; (M1b, edge of scope) keep the check but
+  run it AFTER `ring.admit` → 25/1625, still red, proving the ORDERING and not
+  merely the predicate; (M1c, edge of scope) raise the floor without REBINDING →
+  "the live peer was refused at the floor it had just raised", 9 failures across
+  the epoch surface, orthogonal control (bare ring + config sync, 12 tests)
+  green; (M3) restore the drop → "only 1 refine pass(es) ran"; (M5) drop the
+  `errors.As` branch → the file ratchets; (M2) drop the idempotence shortcut so
+  B DOES recover → the characterization reds, proving it binds rather than
+  asserting a tautology.
+- **Validation**: `go build ./...` rc=0, `go vet ./pkg/cluster/...` rc=0,
+  `go test -race ./pkg/cluster/` ok 12.6s, `gofmt -l pkg/cluster/` empty, and
+  pkg/daemon + pkg/conntrack + pkg/grpcapi + pkg/dataplane/... green (the
+  canary-bearing packages). No consumer of `HeartbeatStats` exists outside
+  pkg/cluster, so the new counter crosses no proto or CLI boundary.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/status.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+## 2026-08-01 18:59 — #6669 fold round 11: the equal-epoch bound was a singleton, and that refused a HEALTHY node
+- **Action**: Fold the round-8 review's MAJOR and two MINORs on PR #6669
+  (`fix/6169-heartbeat-boot-epoch-v2`, head `3aced9e80`).
+- **MAJOR — round 10's fix cost more than the hole it closed, and it is this
+  PR's regression.** Round 10 bound the epoch floor to EXACTLY ONE session
+  (`highEpochSession`) and claimed the resulting lockout was "durable only under
+  the dead-clock AND dead-store pair, the regime in which the sender publishes
+  no order at all" (`heartbeat.go`, `heartbeat_manager.go`, `README.md`, three
+  verbatim copies). That is false. `refineBootEpoch` chains with
+  `if next := prev + 1; next > epoch`, which is a pure function of the FILE, so
+  a store that READS but cannot WRITE hands every successive incarnation the
+  identical epoch — on a healthy, advancing clock. Refinement, which the prose
+  offered as the escape, is the equal-epoch GENERATOR whenever persist fails.
+  REPRODUCED FIRSTHAND through the production entry point
+  (`m.initHeartbeatEpochState()`, what `StartHeartbeat` calls): two Managers
+  over a write-failing directory, `.lock` pre-created so the read-modify-write
+  runs, file 30 min ahead (an RTC corrected back by NTP, inside
+  `bootEpochMaxSkew`); real signed frames through the real `readLoop` gate ->
+  `file=1785636088974200628`, both incarnations publish `...629` with different
+  sessions, and the successor is admitted **0/40**. With only the round-10 check
+  removed: **40/40, collisions=0**, `go build ./pkg/cluster/` rc 0 in both
+  states. The refusal returns false before `r.lastSeen.Store`, so at the shipped
+  200 ms interval and threshold 5 the peer declares a healthy node dead in 1 s.
+- **Direction chosen**: the reviewer's shape — a small constant `k`
+  (`heartbeatEpochSessionsPerEpoch = 2`) of distinct sessions per epoch VALUE,
+  reset by a raise (`highEpochSessions` + `highEpochSessionCount`,
+  `epochSessionAdmissible` / `bindEpochSession`). Any finite `k` keeps the
+  security property (the floor is monotone, so a capture set buys a finite
+  ascending pass and 0 sustained), and 2 is far below the ring's 64 slots so the
+  bound sessions cannot evict each other. Staleness-based rebind DECLINED:
+  waiting out the dead-peer interval is free, so it restores unbounded
+  admissions. Generator-side fix DECLINED and the reason stated in the code: the
+  only local source of distinctness is the incarnation's own entropy, so it is
+  probabilistic and has nothing to draw on in the degenerate case (clock at or
+  before the Unix epoch, no chainable file) — a receiver bound is needed in
+  every regime, a sender jitter in none of them alone.
+- **Residual, stated rather than hidden**: a successor past the last slot at one
+  unchanged epoch is refused for its whole process lifetime (`bootEpochOnce` +
+  re-refinement lands on the same `prev+1`; measured: 10 re-refinements move
+  nothing). Recovery needs the clock past `prev+1` AND another restart — up to
+  `bootEpochMaxSkew`. Made executable as
+  `TestEqualEpochBoundStillStrandsTheNextSuccessor_6669`.
+- **MINOR 1**: MAJOR 3's re-claim step was deletable with the suite green.
+  Added the `epochRefineBeforeRelease` seam (same rationale as `epochFlock`) and
+  `TestLateRefineRequestIsReclaimed_6669`; hammering does NOT reach the window
+  (measured firsthand: 3000 rounds x 4 concurrent `refreshBootEpoch` -> 0
+  strands). Its prose claim ("the request costs one extra pass") is now
+  qualified with the one interleaving that is still lost.
+- **MINOR 2**: corrected "both need the same missing state" — condition 1 needs
+  only a TRIGGER to retry the failed persist (#6724), not a writer identity.
+- **PRE-EXISTING FLAKE IN THIS PR, fixed**: `go test -race ./pkg/cluster/`
+  failed intermittently at `3aced9e80` (1/6 runs) and 20/20 when
+  `TestInitHeartbeatEpochStateNeverBlocks_6169` and
+  `TestArchivedEpochPoisonsAFreshFloor_6711` ran together — the former drained
+  only `bootEpochReady` (the FIRST attempt), so a coalesced worker escaped and
+  read `epochNowNanos` while the latter overrode it. Verified absent at the
+  merge-base only because the file does not exist there, so it is this PR's.
+  `waitBootEpochIdle` is the real drain: 20/20 -> 0/20, full race suite 0/6.
+- **Mutation proof** (build+vet rc 0 in EVERY mutated state): (M1)
+  `heartbeatEpochSessionsPerEpoch = 1` -> successor gate RED at 0/40, churn +
+  slots-once + floor-rebind + reclaim controls GREEN; (M2) delete the equality
+  check -> churn 1625/1625 RED, slots-once RED (65 sessions at one value),
+  poisoned-floor RED, successor GREEN; (M3) move the check AFTER `ring.admit` ->
+  churn RED at 50/1625, proving the ORDERING; (M4) record the binding BEFORE
+  `ring.admit` -> slot-ordering gate RED; (M5) raise ADDS instead of resetting
+  -> raise-resets gate RED on both halves; (M6) delete the re-claim step ->
+  reclaim gate RED ("only 1 refine pass(es) ran"), coalesce + no-ratchet +
+  successor controls GREEN. One prediction was WRONG and is reported as such:
+  `TestFloorRebindsToTheRaisingIncarnation_6669` stays GREEN under M5 because it
+  uses a single session and cannot fill the set — so the claim it was meant to
+  cover ("a floor whose bound sessions are stale refuses the peer that just
+  raised it") was added to `a_raise_resets_the_slots`, which then REDs.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race -count=1 ./pkg/cluster/` ok 6/6 runs, `gofmt -l pkg/cluster/`
+  empty, plus pkg/daemon + pkg/conntrack + pkg/grpcapi + pkg/upgrade + pkg/cli
+  green.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go, pkg/cluster/manager.go,
+  pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_session_budget_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, _Log.md
+
+## 2026-08-02 — #6669 fold r12: correct the k=2 availability claim and three misattributions
+
+- **Timestamp**: 2026-08-02
+- **Action**: Fold the r9 hostile re-gate's six findings on PR #6669 at
+  `bdbfc0f33`. All six are claim/attribution defects — the reviewer states
+  explicitly that none changes runtime behaviour and that every load-bearing
+  property remains bound — so this is prose plus two small test/comment touches,
+  folded inline rather than via an agent round.
+- **F1 — the k=2 availability claim was false against the threat model the file
+  is written for.** `heartbeat.go` said 2 is "the smallest value that admits a
+  legitimate successor at an unchanged epoch". An attacker spends a slot as
+  cheaply as the peer does: in the equal-epoch regime EVERY prior incarnation's
+  frames carry the current floor value under a distinct session, so one replayed
+  archived frame fills the second slot and the first genuine successor is
+  refused. Measured by the reviewer through the real `newEpochEnv`/`feed` gate —
+  A1 admitted, one archived frame admitted (set FULL), A1 exits, successor A2
+  REFUSED with `EpochSessionCollision=1`. The headroom is therefore `k-1-j`
+  restarts where `j` is the number of distinct captured sessions presentable at
+  the live epoch, and `j >= 1` is free for an on-link recorder. Raising k does
+  not fix it (k-1 slots are as cheap to spend as one), which is why the comment
+  now states the bound rather than tuning it. The SECURITY property is
+  unaffected — the floor stays monotone, the budget finite and non-refilling.
+- **F2 — the no-refill property was credited to a line that cannot execute.**
+  `bindEpochSession`'s full-set branch is unreachable from `admitAuthedLocked`:
+  under the same `s.mu` hold, `epochSessionAdmissible` already returns false for
+  any session not in the set once the count reaches capacity, and nothing
+  between the check and the bind mutates the set. Mutating the branch to evict
+  slot 0 leaves the whole suite green. The comment now names
+  `epochSessionAdmissible` as the enforcer and marks the branch defence-in-depth
+  for a state the caller cannot present.
+- **F3 — the stated recovery omitted the receiver restart.** `highEpoch` and
+  `highEpochSessions` are Manager-scoped, so restarting the RECEIVER zeroes the
+  floor and admits the stranded successor at once, on the raise-from-0 path. The
+  README told the operator the only exit was up to an hour of waiting for the
+  sender's clock. Both are now stated, with the receiver restart preferred when
+  both nodes are reachable.
+- **F5 — `bootEpochReady` is not a drain, reintroduced in the new helper.** The
+  worker closes it and then still reads the `epochRefineBeforeRelease` package
+  var before clearing `bootEpochRefining`, so a test joining only `ready` can
+  return and let a later test assign that var mid-read. `startedIncarnation` now
+  calls `waitBootEpochIdle`. This is the identical shape round 11's commit
+  message says it removed elsewhere.
+- **F6 — the reason for declining the generator fix was wrong, the conclusion
+  right.** The comment claimed there is "nothing to jitter" with a pre-epoch
+  clock and no chainable file; `randomSessionID()` draws from crypto/rand in the
+  same process, so entropy IS available. The sound reason is that a randomised
+  epoch stops being an ORDER — the only thing the epoch provides — and that the
+  ATTACKER controls the frames it replays and will not jitter them, so a
+  sender-side change cannot bind admissions at all. Decline kept, reason
+  restated.
+- **F4 left as the reviewer characterised it**: `waitBootEpochIdle` has a window
+  on the re-claim path where both flags read idle while the worker is still
+  alive. Measured 0/12000 in the production shape and not exposed by any current
+  test; closing it needs the two flags to move as one word, which the code
+  already names as a larger change.
+- **Validation, stated with its gap.** `go build ./...` rc 0, `go vet
+  ./pkg/cluster/...` rc 0, `gofmt` clean. `go test -race ./pkg/cluster/`: the
+  FIRST run after these edits FAILED, and I could not reproduce it — 6 warm runs
+  and 3 cold-cache runs all passed, and I did not capture the failing run's
+  detail before it was overwritten. So the honest record is 9/10 clean with one
+  unreproduced failure of unknown cause, NOT a clean sweep. It is consistent
+  with F4's latent window; the re-gate should treat `-race` on this package as
+  unsettled rather than green.
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_session_budget_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 21:05 PDT
+- **Action**: #6669 round 13 — close the boot-epoch refine LOST WAKEUP by packing
+  the in-flight flag and the pending bit into one CAS'd word; join the refine
+  worker in `Manager.Stop`; correct four claims round 12 got wrong.
+- **Item 1 — the lost wakeup is CLOSED, not documented.** `bootEpochRefining`
+  and `bootEpochRefinePending` were two separate `atomic.Bool`s, so the pair
+  could be observed torn: a requester that lost the in-flight CAS, was descheduled
+  while the worker ran all the way out, and only then stored the pending bit
+  published it against a worker that no longer existed. They are now ONE
+  `atomic.Uint32` (`Manager.bootEpochRefine`, bits `bootEpochRefiningBit` /
+  `bootEpochPendingBit`) with `claimBootEpochRefine` / `releaseBootEpochRefine`
+  moving the pair by CompareAndSwap. A requester whose observation went stale
+  fails its CAS and takes the idle slot itself; the worker's release only
+  succeeds while the pending bit is still clear. Coalescing is unchanged (a BIT,
+  not a queue) and `ready` keeps its "closed when the FIRST attempt finishes"
+  meaning with no double-close.
+- **Item 1 proof — DETERMINISTIC, not a stress loop.**
+  `TestLateRefineRequestCannotBeStranded_6669` imposes the schedule through two
+  seams (`epochRefineBeforeRelease` parks the worker at its exit,
+  the new `epochRefineAfterLostClaim` parks the requester between observing that
+  worker and publishing its request) and JOINS the worker goroutine before
+  letting the requester go, so "the worker has gone" is a fact rather than a
+  poll on a flag that clears a few instructions early. MUTATION: publish
+  unconditionally (`Or(bootEpochPendingBit)`, exactly a separate
+  `bootEpochRefinePending.Store(true)`) — build rc 0, vet rc 0, the new test the
+  ONLY failure across the whole package, asserting `only 1 refine pass(es) ran:
+  the request was published AFTER the worker had gone and was STRANDED with
+  nothing to serve it (refine word = 0x2)`. 0x2 is `{pending}` with no worker,
+  the stranded state itself. Restored by Edit; all green.
+- **Item 2 — the false justification is GONE.** The shipped comment said the
+  stranded state "is self-announcing rather than silent, since waitBootEpochIdle
+  hangs on exactly the bit that was left set". `waitBootEpochIdle` is a
+  TEST-ONLY helper taking a `*testing.T`; nothing in production observes that
+  bit. The window is closed rather than excused, and what it cost is now stated
+  in operator terms: a node silently below its peer's floor until some later
+  heartbeat start that nothing bounds (#6724).
+- **Item 3 — REACHABLE, and `Manager.Stop` now joins.** No race is needed: the
+  worker parks indefinitely inside a flock or an fsync by design, so one
+  sequential shutdown over a wedged store leaves it storing to `m.bootEpoch` /
+  `m.bootEpochWrote` and writing the state file on a torn-down manager (and in
+  tests outliving the `t.Cleanup` that restores `bootEpochPath`, `epochFlock`,
+  `epochNowNanos`, `epochRefineBeforeRelease`). Stop refuses new workers under
+  `bootEpochRefineMu` and then waits `bootEpochStopJoinBudget` (2s). The join is
+  BOUNDED deliberately — an unbounded one would park the shutdown path behind a
+  dead disk, which is the exact failure the 2s wait in `initHeartbeatEpochState`
+  was removed for. Both halves proven: dropping the join reds
+  `TestStopJoinsTheBootEpochRefineWorker_6669`; making it unbounded reds
+  `TestStopDoesNotBlockOnAWedgedRefineWorker_6669` and leaves the other green.
+- **Item 4 — four round-12 claims corrected.** (1) The `k-1-j` headroom
+  arithmetic over-counts: a replay the ring refuses spends no slot at all, since
+  `admitAuthedLocked` binds only after `s.replay.admit` succeeds. Restated as "at
+  most k-1 and can be none", with `k <= heartbeatReplaySessions` named as the
+  invariant the constant is chosen against. (2) The README said restarting the
+  receiver clears the floor *because* the state is Manager-scoped — backwards.
+  Manager-scoping is why `RestartHeartbeat` PRESERVES it; only a full `xpfd`
+  restart builds a new Manager, and even that is not unconditionally preferable
+  (a cleared floor is re-raised by one archived frame, residual 5). (3) The
+  generator-decline reason "the attacker will not jitter them" is false: the
+  epoch is inside the HMAC-signed span, so a replay carries the ORIGINAL
+  sender's value verbatim. The real reason is that the receiver cannot depend on
+  the sender's generator at all. (4) `bindEpochSession` credited
+  `epochSessionAdmissible` with the NO-REFILL property; that gate enforces the
+  CAPACITY REFUSAL. No-refill is enforced here — this is the only mutator, it
+  never evicts or decrements, and resets only on a raise.
+- **Validation.** `go build ./...` rc 0, `go vet ./...` rc 0, `gofmt -l
+  pkg/cluster/` empty. Full Go suite 59/59 ok. `go test -race ./pkg/cluster/`:
+  clean on 5 fresh-process runs at the PARENT before any edit, and after the
+  change on `-count=5` twice plus 13 fresh-process runs — 0 races, 0 failures.
+  The round-12 unreproduced `-race` failure did not recur; Item 3 is the most
+  likely explanation for it (a worker outliving a test's seam restore) and is
+  now closed, but that is an inference and not a reproduction.
+- **File(s)**: pkg/cluster/manager.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 22:35 PDT
+- **Action**: #6669 round 14 — REPRODUCE and fix the cross-test data race the
+  round-13 entry only inferred; stop `joinBootEpochRefine` leaking a waiter per
+  timed-out call; make three tests assert something only working code produces;
+  correct four claims that were still internally inconsistent.
+- **Item 1 — the race is REPRODUCED, and round 13's explanation was incomplete.**
+  Round 13 closed one "ready is not a drain" site and recorded, honestly, that
+  the round-12 `-race` failure "did not recur" and that the fix was "an
+  inference and not a reproduction". It reproduces deterministically:
+
+      go test -race ./pkg/cluster \
+        -run 'Test(HeldFlockCannotCauseFalsePeerDeath_6169|LateRefineRequestIsReclaimed_6669)$' \
+        -count=100
+
+  fails on the first iteration with a WRITE of `epochRefineBeforeRelease` at
+  `heartbeat_epoch_session_bind_6669_test.go:336` (the SECOND test installing
+  its seam) against a READ at `heartbeat_epoch.go:791` by the FIRST test's
+  refine worker, inside `releaseBootEpochRefine`. The worker closes
+  `bootEpochReady` from inside its loop and only then reaches the release seam,
+  so receipt from that channel is not a join and the worker escapes the test.
+  Round 13 fixed the one site it had caught; five sites were still doing it
+  (`TestHeldFlockCannotCauseFalsePeerDeath_6169`,
+  `TestStartHeartbeatReturnsWithAUsableEpoch_6169`, both subtests of
+  `TestHeartbeatBootEpochRefinementCompletes_6169`, and
+  `TestBootEpochNeverBlocksOnStorage_6169`), and eleven hand-rolled the bare
+  receive in total. The drain now lives once, in `awaitFirstRefine`, which waits
+  for ready AND `waitBootEpochIdle`; the six remaining sites survived only on
+  `keyedEpochManager`'s `t.Cleanup` join, which is a backstop, not a drain.
+  `heartbeatBootEpoch`'s own comment had ADVERTISED the channel as a join
+  ("tests use it to join the worker") — that claim is what produced the bug and
+  it is corrected at the source.
+- **Item 2 — every timed-out join leaked a goroutine.**
+  `joinBootEpochRefine` spawned `go func() { m.bootEpochWG.Wait(); close(done) }()`
+  per call and its timeout returned only the CALLER. Nothing cancels a
+  `WaitGroup.Wait`, so over a wedged store each call left one goroutine parked
+  for the life of the process. "Small and bounded" holds for ONE terminal
+  `Stop`; it is not called once (`Stop` is public, and `waitBootEpochIdle` /
+  `keyedEpochManager` join on every epoch test). Measured on a parked worker:
+  8 timed-out joins, 8 permanent waiters. The `WaitGroup` is replaced by
+  `Manager.bootEpochWorkerDone` — the worker's own exit channel, published under
+  `bootEpochRefineMu` at spawn and closed as the worker's last act — so a join
+  is a select on a channel somebody else closes and a timeout costs nothing.
+  Same measurement after: 0. The comment claiming the worker "holds no locks a
+  caller can wait on" is also false and corrected: `withEpochFileLock` holds the
+  state file's advisory lock across the whole read-modify-write, so another
+  INCARNATION's refine blocks behind a wedged worker.
+- **Item 3 — three tests asserted their own failure default.**
+  (a) `TestStopDoesNotBlockOnAWedgedRefineWorker_6669` checked a zero refine word
+  and an unchanged watermark after a refresh on a stopped manager — both of which
+  an ILLEGAL worker that spawned and finished quickly also produces, since the
+  extra pass is idempotent. It now counts LOCKED PASSES through the `epochFlock`
+  seam and asserts the count does not move, after joining. (b)
+  `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` claimed twenty requests
+  overlapped and coalesced but imposed no seam and asserted no pass count —
+  twenty strictly sequential workers satisfied it. The worker is now parked
+  inside its first locked pass while all twenty land, the word is asserted to be
+  exactly `{refining|pending}`, and the pass count exactly 2. (c) the no-refill
+  subtest claimed to model waiting out a staleness interval while neither
+  advancing an injected clock nor sleeping. There is no clock to advance —
+  `epochSessionAdmissible` is a pure predicate and `bindEpochSession` its only
+  mutator — so the comment now says what the rounds ARE (silent but
+  instantaneous, and unable to detect a future time-based refill), and the
+  assertion is strengthened to split the 1625 refusals by GATE: 1575 by the
+  epoch budget and 50 (the two BOUND sessions' own stale counters) by the ring.
+  0-admitted was the failure default; the split is not.
+- **Item 4 — four corrected claims that were still inconsistent.** (1)
+  `heartbeatEpochSessionsPerEpoch` said the security property "holds for ANY
+  finite k", twice, while the invariant three paragraphs down is
+  `k <= heartbeatReplaySessions`. At k=65 against a 64-slot ring the admissible
+  sessions overflow the ring themselves — the 65th mark evicts the 1st, whose
+  session is still BOUND, so replaying it clears the epoch gate, reads as
+  never-seen, and is admitted, evicting the 2nd. Sustained churn from a finite
+  bound. (2) README.md and the recovery test said both refinement-recovery
+  conditions need the same missing state; `withEpochFileLock`'s comment is the
+  accurate one — condition 1 needs only a retry TRIGGER (A retries its failed
+  persist, B reads `b+1` and raises to `b+2`), which is the smaller half of
+  #6724. (3) README said a join timeout leaves "one `fsatomic` write"; it can
+  leave TWO, because a request that set the pending bit while the pass was
+  wedged is served as a follow-up once it unblocks. (4) the budget test said the
+  degenerate case has no source of distinctness; every Manager already draws 64
+  crypto-random bits (`randomSessionID`, via `heartbeatNonce`) with no
+  dependence on clock or file. What blocks using them is that the epoch is an
+  ORDER — random low bits produce a successor BELOW its predecessor, which
+  `admitAuthedLocked` refuses outright.
+- **Validation.** `go build ./...` rc 0, `go vet ./...` rc 0. Full Go suite
+  green. `go test -race ./pkg/cluster -count=5` clean. The Item-1 repro at
+  `-count=100`: 1 DATA RACE before, 0 after. Every fix mutated out by Edit and
+  confirmed RED with a real assertion (or, for Item 1, a real race report), with
+  `go build` and `go vet` clean in both states.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/manager.go,
+  pkg/cluster/heartbeat.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_budget_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 23:20 PDT
+- **Action**: #6669 round 14 addendum — the Item-2 join rework INTRODUCED a
+  three-goroutine deadlock in `pkg/cluster`. Found by the full-package run,
+  established at the parent by measurement, fixed, and now guarded by an
+  assertion instead of a hang.
+- **What happened.** The first form of the Item-2 fix stored the worker's exit
+  channel in a plain `Manager` field and read it under `bootEpochRefineMu`. That
+  mutex is held across `claimBootEpochRefine` — and therefore across its
+  `epochRefineAfterLostClaim` seam, where a requester can be parked
+  indefinitely. `TestLateRefineRequestCannotBeStranded_6669` drives exactly that
+  schedule: it parks a requester at the seam and THEN calls
+  `joinBootEpochRefine`. Three goroutines deadlocked on the one mutex
+  (`0xc0002c1dcc` in the dump): the requester holding it at
+  `heartbeat_epoch.go:767`, the worker's exit defer blocked at `:937`, and the
+  join blocked at `:854`. `go test ./...` and `go test -race ./pkg/cluster
+  -count=5` both wedged 600 s and died on the 10-minute test timeout.
+- **It is MINE, and that is measured rather than argued.** The same test at the
+  parent `bb9ae0d75`, in a throwaway detached worktree
+  (`/var/tmp/probe6669parent`), passes 3/3 in 0.00 s. The parent's
+  `joinBootEpochRefine` used a `WaitGroup` and took no lock, and the parent's
+  worker exit was a bare `defer m.bootEpochWG.Done()` — neither touched
+  `bootEpochRefineMu`. Both acquisitions were introduced by round 14.
+- **Fix.** The handle is now an `atomic.Pointer[bootEpochRefineWorker]`. It is
+  still PUBLISHED under `bootEpochRefineMu`, which is what keeps `Stop`'s
+  refuse-then-join ordering airtight, but the join LOADS it and the worker's
+  exit CLEARS it (CAS) without the lock. The two operations that must always
+  make progress no longer wait on a mutex that a parked requester can hold.
+- **Process lesson, recorded because it is the actual defect.** F1 was validated
+  with a NARROW `-run` filter that did not include the one test driving this
+  schedule, and every new test was run individually. A lifecycle change must be
+  validated against the WHOLE package before anything else. It also failed as a
+  ten-minute timeout rather than an assertion, which is why
+  `TestJoinDoesNotBlockBehindAParkedRequester_6669` now exists: it drives the
+  same schedule and asserts in 200 ms that a bounded join returned.
+- **Validation.** `go build ./...` rc 0, `go vet ./...` rc 0. Whole
+  `pkg/cluster` package green in 12.7 s (was: wedged at 600 s).
+  Mutating the handle back under `bootEpochRefineMu` reds the new guard with
+  "joinBootEpochRefine had not returned 5.02325974s after its 200ms budget".
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/manager.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 07:52 PDT
+- **Action**: #6669 round 14 (continued) — salvage the killed 2026-08-01 lane's
+  uncommitted work, AUDIT it rather than trust it, and close three defects the
+  audit found in the round-14 changes themselves: a new guard that could not
+  report, the same hazard in two sibling tests, and a real cross-test flake in
+  the new deadlock guard.
+- **Provenance.** The worktree was found dirty with four-day-old uncommitted
+  work (+718/-134 across 10 files, mtimes 2026-08-01 22:20-22:28, no live
+  process) from the run that was killed mid-round. Every hunk was re-derived
+  against the Codex verdict at `bb9ae0d75` and every guard re-proved from
+  scratch; nothing was taken on the strength of the previous entry.
+- **Defect 1 — the deadlock guard could not report, and the 08-01 entry's
+  RED-on-revert claim was FALSE AS WRITTEN.** That entry states the mutation
+  "reds the new guard with `joinBootEpochRefine had not returned 5.02325974s
+  after its 200ms budget`". Measured at the same head, it does not. Reverting
+  the handle read back under `bootEpochRefineMu` produced
+  `panic: test timed out` with NO assertion at both `-timeout 60s` and
+  `-timeout 120s`. The goroutine dump gives the mechanism: the 5 s assertion DOES
+  fire, but `t.Fatalf` -> `FailNow` -> `runtime.Goexit` runs the cleanups, and
+  `keyedEpochManager`'s cleanup join (`heartbeat_epoch_refresh_6669_test.go:126`)
+  then blocks forever on the mutex the parked requester still holds — because
+  Goexit skipped the `close(resumeRequester)` at the end of the body. The
+  message is buffered and never flushed, so the guard reported the exact failure
+  mode its own comment says it exists to replace. Unparking now happens from a
+  `t.Cleanup`, and the same mutation fails cleanly:
+  `--- FAIL: TestJoinDoesNotBlockBehindAParkedRequester_6669 (5.03s)` carrying
+  the intended message.
+- **Defect 2 — the same hazard in two siblings.**
+  `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` asserts the refine word
+  while pass 1 is parked in the `epochFlock` seam; on failure that worker stayed
+  parked for the life of the binary and would later read
+  `epochRefineBeforeRelease` while another test assigned it — the very
+  cross-test race `awaitFirstRefine` exists to stop, reintroduced on the failure
+  path. `TestLateRefineRequestCannotBeStranded_6669` is worse: its assertions
+  fire while the REQUESTER is parked inside `claimBootEpochRefine` holding
+  `bootEpochRefineMu`, so one failure there would wedge every later test in the
+  package and surface as a timeout naming an unrelated test. This is the likely
+  mechanism behind the ten-minute `panic: test timed out` in that test recorded
+  on 08-01. Both now unpark from a `t.Cleanup`, via `sync.Once` so the
+  happy-path closes stay single.
+- **Defect 3 — a REAL FLAKE in the new guard, found by the 5x repeat.**
+  `TestJoinDoesNotBlockBehindAParkedRequester_6669` spawned
+  `go m.refreshBootEpoch()` and never joined that goroutine; `waitBootEpochIdle`
+  polls `bootEpochRefine`, and that word reads 0 in the window after the worker
+  releases the slot and before the unparked requester re-claims it. The test
+  could therefore return and let its cleanups restore `bootEpochPath` and
+  `epochRefineBeforeRelease` while the requester was still reading them.
+  Measured: 1 failure in 8 runs at `-count=5`, two data races per failure
+  (`heartbeat_epoch.go:952` vs `refresh_6669_test.go:115`, and
+  `heartbeat_epoch.go:811` vs `refresh_6669_test.go:532`).
+  `keyedEpochManager`'s join is no backstop — it joins a REGISTERED worker, and
+  a requester that has not claimed yet is not one. The test now joins the
+  goroutine itself, and the unpark-then-join pair is ONE cleanup because
+  `t.Cleanup` is LIFO and a separately registered join would run before the
+  unpark. After the fix: 15 iterations x `-count=5` (75 runs of each test), 0
+  failures.
+- **Guards re-proved from scratch, each watched RED then GREEN.**
+  1. `awaitFirstRefine` (the F1 race): reverting the drain in
+     `TestHeldFlockCannotCauseFalsePeerDeath_6169` reproduces Codex's race
+     exactly — WRITE at `session_bind_6669_test.go:336` vs READ at
+     `heartbeat_epoch.go:811` by the escaped worker; rc 1 -> restored rc 0.
+  2. `TestTimedOutJoinLeavesNoWaiterBehind_6669`: re-adding a per-call
+     forwarding helper fails with "8 goroutine(s) parked in the join after 8
+     timed-out calls" — the claimed count exactly.
+  3. `TestJoinDoesNotBlockBehindAParkedRequester_6669`: as above, 5.03 s clean
+     FAIL, re-proved against the FINAL test after the flake fix.
+  4. `TestStopDoesNotBlockOnAWedgedRefineWorker_6669`: Codex's own scenario —
+     removing the stopped guard AND letting the illegal worker COMPLETE leaves
+     the refine word 0 and the watermark unmoved, so both failure-default
+     assertions PASS and only the new locked-pass count catches it ("a stopped
+     manager ran 1 further locked refine pass(es) (1 -> 2)"). That is the
+     finding refuted directly.
+  5. `TestCoalescingDoesNotRatchetOnAHealthyNode_6669`, word assertion:
+     dropping a busy request instead of setting pending gives "refine word =
+     0x1 ... want 0x3".
+  6. Same test, pass-count assertion IN ISOLATION: an over-serving worker (the
+     locked pass run twice per iteration) is idempotent, so the word, the epoch
+     and the file are all unchanged and only the count moves — "4 locked refine
+     passes ... want exactly 2".
+  7. `TestEqualEpochSuccessorIsAdmitted_6669` per-gate split: dropping the
+     already-bound recognition in `epochSessionAdmissible` keeps `sustained ==
+     0` (the failure default Codex flagged) and is caught ONLY by the new
+     collision count — "the epoch budget refused 1625 of the 1625 replayed
+     frames, want 1575".
+- **Validation.** `go build ./...` rc 0; `go vet ./pkg/cluster/` rc 0; `gofmt
+  -l pkg/cluster/` empty. `go test -race ./pkg/cluster/...` rc 0 in 17.5 s with
+  `TMPDIR=/tmp` — the socket/netlink failures Codex hit under a restricted
+  environment did not occur. Codex's `-count=100` race repro: rc 0 on five
+  consecutive runs. Focused suite: 15 iterations x `-count=5`, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-08-05 08:34 PDT
+- **Action**: #6669 round 15 — resolve F1a as a comment correction (the leak is
+  ONE goroutine in production, not N), give F1b a reachability trace and an
+  exposure bound, and assert the double-`Stop` invariant that until now held
+  only by call topology.
+- **F1a is not material, and the comment now says WHY rather than asserting
+  boundedness.** `Stop` is once-per-process-per-Manager, each link verified:
+  `cluster.NewManager` has one production site
+  (`pkg/daemon/daemon_run_bringup.go`) and the manager is never rebuilt live —
+  a day-2 node-id / cluster-id or topology change is REFUSED at commit and
+  requires a process restart (`pkg/daemon/cluster_topology_preflight.go`); the
+  only production `Stop` is in `runShutdownSequence`
+  (`pkg/daemon/daemon_run_shutdown.go:204-205`, nil-guarded), reached from two
+  mutually exclusive returns in a `Run` that itself runs once
+  (`cmd/xpfd/main.go`). Codex's "repeated Stop leaves another permanent waiter"
+  therefore cannot occur in production. The previous revision of the join
+  comment overstated this as "this is not called once"; it now states the
+  topology and records that the repeated-join pressure is from the TESTS
+  (`waitBootEpochIdle`, `keyedEpochManager`), where 8 timed-out joins left 8
+  parked waiters.
+- **F1b — reachable, deliberately NOT released, and bounded.** Trace: the worker
+  enters `withEpochFileLock`, opens `<path>.lock`, takes `LOCK_EX`, and wedges
+  inside `fn()` — the read-modify-write, whose `WriteFileDurable` fsyncs — so it
+  holds the lock; `Stop` sets `bootEpochStopped`, joins for
+  `bootEpochStopJoinBudget` (2 s), times out, logs and returns. The claim at the
+  old `heartbeat_epoch.go:811` that the worker "holds no locks a caller can wait
+  on" was therefore FALSE, and is corrected. Releasing on the timeout path would
+  be WRONG, not merely awkward: the descriptor is a local on the wedged worker's
+  stack, and dropping the lock mid-write would let another incarnation interleave
+  with a write in progress — trading a delay for the torn update the lock exists
+  to prevent. It does not need releasing, because an flock dies with the open
+  file description: the kernel drops it at process exit, SIGKILL included. Under
+  the documented restart recovery (systemd `Type=simple`, `TimeoutStopSec=20`,
+  `test/incus/xpfd.service`) the old unit is reaped BEFORE the new one starts, so
+  a restart never contends for this lock. The case that can contend is two
+  concurrently running incarnations — the SO_REUSEPORT overlap the lock was
+  written for — and there the blocked party is the other incarnation's refine
+  WORKER, whose failure this file already treats as survivable: it declines the
+  persist and keeps the wall-clock epoch already on the wire.
+- **`Stop` is idempotent by CALL TOPOLOGY, not by construction — now asserted.**
+  It has no `sync.Once` and no early return, so a repeat call re-executes the
+  body; it survives only because it captures `hbSender`/`hbReceiver` under `mu`
+  and nils them in the same critical section, while `Monitor.Stop` is
+  independently idempotent through the same idiom. Both
+  `heartbeatSender.stop` (`heartbeat.go:1710`) and `heartbeatReceiver.stop`
+  (`heartbeat.go:1953`) open with a bare `close(stopCh)`, and closing a closed
+  channel panics. `pkg/lldp` and `pkg/natpoolalarm` both assert this for their
+  managers; `cluster.Manager` did not.
+  `TestSecondStopIsANoOp_6669` now does, and recovers the panic rather than
+  letting it take the binary down with no assertion.
+- **RED-on-revert (watched).** Replacing the capture-and-nil with direct field
+  reads (`if m.hbSender != nil { m.hbSender.stop() }`) fails with
+  "the second Manager.Stop panicked: close of closed channel"; restored, rc 0
+  over `-count=3`.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 17.0 s.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 09:41 PDT
+- **Action**: #6669 round 16 — make the leak guard about LEAKING rather than
+  about which function is on the stack, correct two false comments (one of them
+  created by this fold), and give the real-flock tests a failure-path release.
+- **B1 — the finding is REAL, but its stated reproduction is NOT, and the
+  difference is recorded in the guard.** The old `joinWaiterGoroutines` matched
+  two literal frames. The proposed mutation — hoist the goroutine's BODY into a
+  package-level `forwardBootEpochDone` — does **not** defeat it, because
+  `runtime.Stack` emits a creator line and that line still named the spawner:
+  `created by …cluster.(*Manager).joinBootEpochRefine in goroutine 20`. Measured
+  directly with a throwaway probe that dumped the leaked goroutine's stack; the
+  old matcher went RED on that mutation (rc 1), so "matching neither string" was
+  wrong as written. What DOES defeat it is moving the `go` STATEMENT into a
+  differently-named function (`spawnDoneForwarder`), after which neither line
+  mentions `joinBootEpochRefine`:
+  `…cluster.spawnDoneForwarder.func1()` / `created by …cluster.spawnDoneForwarder`.
+  Against that variant the OLD matcher was GREEN while eight goroutines leaked,
+  and the NEW one is RED. So the fragility is genuine and the fix is
+  load-bearing; only the proposed repro needed correcting.
+- **Fix.** `clusterGoroutines` matches the package PATH
+  (`github.com/psaab/xpf/pkg/cluster`) anywhere in a goroutine's stack, naming
+  no function at all. That covers a helper anywhere in this package under any
+  name, anything this package spawns directly (via the creator line), AND a
+  rename of `joinBootEpochRefine` itself — which the old form would also have
+  missed. Scope is stated rather than implied: a helper moved into a DIFFERENT
+  package that runs its own `go` would carry no cluster frame on either line and
+  would escape, which is the limit of what stack matching can see. The count
+  remains a BEFORE/AFTER DELTA, because this package always has some goroutines
+  parked (the wedged worker the test installs, for one).
+- **B2 — the fold made a concurrency comment false.**
+  `releaseBootEpochRefine` said the worker "must return without touching Manager
+  state again". True before round 14; false after, because the worker's
+  outermost defer still runs `m.bootEpochWorker.CompareAndSwap(worker, nil)`.
+  Corrected to say what is actually forbidden — further refinement, and any
+  touch of `m.bootEpoch`, `m.bootEpochWrote` or the state file — and to explain
+  that the trailing CAS is the worker publishing its own death, with the
+  compare-and-swap being exactly what stops an outgoing worker clearing a
+  SUCCESSOR's handle in the window this function opens.
+- **B3 — two comments contradicted each other.** `manager.go` still said
+  "Tests use it to join the worker" about `bootEpochReady` while
+  `heartbeat_epoch.go` said "IT IS NOT A JOIN". The latter is correct; the
+  field comment now says so and points at `awaitFirstRefine` /
+  `waitBootEpochIdle`.
+- **B4 — folded in, it was cheap.** The three tests that hold the REAL advisory
+  lock released it only at the end of their bodies, so a `Fatalf` before that
+  point left a refine worker parked on the lock for the rest of the package run,
+  reading seams a later test assigns. `heldEpochLock` now returns a
+  once-guarded release, and each caller registers release-AND-drain as ONE
+  `t.Cleanup` — one cleanup and in that order, because `t.Cleanup` is LIFO and a
+  separately registered drain would run before the release and just wait out its
+  budget.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 16.7 s. B1 mutation
+  against the FINAL tree: RED with "8 goroutine(s) parked in the join after 8
+  timed-out calls"; restored GREEN over `-count=5`. Because B4 touched the latch
+  tests the race repro was re-run: Codex's `-count=100` pair rc 0 on three
+  consecutive runs, and the three real-flock tests rc 0 over three runs at
+  `-count=20`.
+- **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_latch_test.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/manager.go, _Log.md
+
+- **Timestamp**: 2026-08-05 10:12 PDT
+- **Action**: #6669 round 16b — finish the failure-path unpark class B4 opened,
+  at the three remaining sites the named ones did not cover.
+- **Why the class needed finishing rather than stopping at B4.** B4 named the
+  three REAL-FLOCK tests. Auditing every `= func(` seam in the package for a
+  blocking receive found three more that park a refine worker and release it
+  only at the end of the body, so a `Fatalf` in between escapes the worker for
+  the rest of the package run: `parkedRefineWorker` (the shared helper, used by
+  three Stop/join tests), `TestOverlappingRefineRequestIsCoalesced_6669` (a
+  two-stage park on `releasePass1`/`releasePass2`) and
+  `TestLateRefineRequestIsReclaimed_6669`. Half-fixing a hygiene class is worse
+  than either end of it.
+- **Severity, stated honestly: these are NOISE-AFTER-A-FAILURE, not the
+  package-wedging shape.** None of them parks in `epochRefineAfterLostClaim`,
+  so none holds `bootEpochRefineMu`; the two sites that could wedge every later
+  test in the package were `TestLateRefineRequestCannotBeStranded_6669` and the
+  new `TestJoinDoesNotBlockBehindAParkedRequester_6669`, both already closed in
+  round 14. What these three leak is a worker parked in `epochFlock` or the
+  release seam, which then reads package vars a later test assigns — a
+  cross-test race reported after an already-failing test.
+- **Fix.** `parkedRefineWorker` registers its own once-guarded release as a
+  `t.Cleanup` before returning it, so every caller is covered and the next one
+  cannot forget; the two inline sites get the same once-guard plus a single
+  cleanup. Callers that already `defer release()` are unaffected — the guard
+  makes the second call a no-op.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 15.4 s. B1's mutation
+  re-proved against THIS tree: RED with "8 goroutine(s) parked in the join after
+  8 timed-out calls" (an assertion, not a build break), restored GREEN over
+  `-count=5`, and `heartbeat_epoch.go` confirmed byte-identical to HEAD after
+  the restore. Because `TestLateRefineRequestIsReclaimed_6669` is one of the two
+  tests in Codex's race repro, that repro was re-run: rc 0 on three consecutive
+  `-count=100` runs, and the eight touched tests rc 0 on three runs at
+  `-count=10`.
+- **File(s)**: pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 11:28 PDT
+- **Action**: #6669 round 17 — gate items 2 and 3 folded (exact pass count; a
+  positive control plus the production `Stop` path). Item 1 NOT folded: its
+  negative control refutes the framing, and the instruction was to report that
+  rather than build on it.
+- **ITEM 1 NEGATIVE CONTROL — THE FRAMING IS WRONG. The prescribed mutation does
+  NOT leave `TestOverlappingRefineRequestIsCoalesced_6669` green; it REDs, three
+  different ways.** Measured before touching the test, as instructed:
+  1. Suppress the pending-bit coalesce AND spawn a concurrent second worker
+     (ad-hoc): RED at the epoch-chaining assertion, `session_bind:299`.
+  2. Same, but the second worker runs the FULL normal loop so every watermark
+     and handle path is identical: RED, same assertion.
+  3. Coalescing left fully intact, plus a REDUNDANT concurrent worker: RED via
+     `WARNING: DATA RACE`.
+  Control on the isolate: suppressing the pending bit alone (the classic dropped
+  request, no second worker) REDs at `session_bind:284` — "only 1 refine
+  pass(es) ran" — so the test's own fail-on-revert gate still works and the
+  above are not an artifact of a broken harness.
+- **WHY IT REDS, AND WHY THE GATE'S CONCERN IS STILL PARTLY RIGHT.** Variants 1
+  and 2 fail on the epoch assertion, which sits on a KNIFE EDGE:
+  `bootEpochMaxSkew` is exactly `60 * 60 * 1e9`, and the test raises the file by
+  exactly `time.Hour`, so `epochOrderable(n+1, now)` turns on whether the wall
+  clock advanced past the published epoch between the raise and the worker's
+  read. That is a downstream CONSEQUENCE assertion, not an ownership one.
+  Variant 3 is caught by the race detector, not by an assertion. So the gate's
+  conclusion — nothing in this test binds "exactly one worker owns the
+  follow-up" — is STRUCTURALLY TRUE (it never counts workers or goroutines), but
+  its stated consequence, "an implementation spawning a concurrent second worker
+  can pass", is FALSE as measured. Left for the lead to rule on rather than
+  built on, per the explicit instruction.
+- **Item 2 — exact pass count.** `TestLateRefineRequestIsReclaimed_6669` waited
+  for ANY pass numbered at least two, so queueing the request correctly AND
+  running a surplus pass satisfied it. It now asserts exactly 2.
+  RED-on-revert: a surplus `refineBootEpoch` on the losing-claim path gives
+  "3 locked refine passes ran ... want exactly 2".
+- **Item 3 — zero was the not-bound default, and the seam was test-only.** Two
+  fixes. A POSITIVE CONTROL now parks 8 goroutines of the same shape as a
+  per-call forwarding helper and requires `clusterGoroutines` to see exactly 8
+  before the real zero is trusted; RED-on-revert (one letter of `clusterPkgPath`
+  transposed) gives "the positive control parked 8 goroutines and
+  clusterGoroutines saw 0". And the test now also drives `Manager.Stop` — the
+  production caller, which refuses spawns under `bootEpochRefineMu` first, tears
+  down sender/receiver, and joins on `bootEpochStopJoinBudget` rather than a
+  budget the test picked — asserting the same zero delta over the real path.
+- **Left alone deliberately.** `TestSecondStopIsANoOp_6669`, which the gate
+  credited; its nil expectations are defaults but the non-nil handle and
+  stopped-channel checks are what bind.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 18.7 s with `TMPDIR=/tmp`
+  — the socket/netlink denials the gate hit are its sandbox, not this tree.
+  Both new assertions watched RED then GREEN, each from an assertion rather than
+  a build break, restored with `touch` and `heartbeat_epoch.go` confirmed
+  identical to HEAD. Flake: three runs at `-count=5` over the three affected
+  tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 12:04 PDT
+- **Action**: #6669 round 17b — item 1 folded after the lead ruled on the
+  negative control: keep the consequence assertions, ADD an ownership one, so
+  the concurrency detection no longer rests on a timing boundary.
+- **Why it was added even though the test already reds.** The three variants DO
+  fail today, but on things that can quietly stop working. Variants 1 and 2 are
+  caught by the epoch assertion, which turns on `epochOrderable(n+1, now)` —
+  `bootEpochMaxSkew` is exactly `60*60*1e9` and the test raises the file by
+  exactly `time.Hour`, so whether it fires depends on the wall clock advancing
+  past the published epoch between the raise and the read. Widen the skew
+  constant or loosen that assertion and the concurrency detection disappears
+  from a test still named `IsCoalesced`. Variant 3 is caught only by the race
+  detector, which is not in every leg. The new assertion states the invariant
+  the running/pending design exists for — the request coalesces ONTO the
+  running worker, so exactly one worker means exactly one goroutine — and its
+  comment says explicitly that it is NOT redundant with the assertions below,
+  so a later cleanup cannot read it as duplication and delete it.
+- **THE THREE VARIANTS NOW FAIL ON THE OWNERSHIP ASSERTION ITSELF, not on the
+  old detection.** All three fail at `session_bind_6669_test.go:305` in 0.02 s
+  with "2 package goroutines in flight after the overlapping request, want
+  exactly 1", ahead of the pass-exists assertion (:320) and the epoch assertion
+  (:335), and without needing the race detector:
+  1. no-coalesce + ad-hoc concurrent second worker -> :305
+  2. no-coalesce + concurrent second worker through the FULL normal loop -> :305
+  3. coalescing intact + REDUNDANT concurrent worker -> :305
+  Previously variants 1 and 2 landed at the epoch assertion and 3 only as a
+  `DATA RACE`, so the ownership assertion is doing the work on its own rather
+  than riding what was already there. A baseline check (exactly 1 goroutine with
+  pass 1 parked, :276) keeps the delta meaningful, since a count is only
+  evidence against a known starting point.
+- **Existing assertions kept**, per the ruling — the consequence assertions are
+  still worth having, they simply are not the load-bearing ones for ownership.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty. `go test -race ./pkg/cluster/...` rc 0 in 18.4 s. The new assertion
+  held over 20 consecutive runs before mutation, and `heartbeat_epoch.go` was
+  confirmed identical to HEAD after each of the three restores. Flake: three
+  runs at `-count=5` across the four affected tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 13:02 PDT
+- **Action**: #6669 round 18 — add the THIRD-request element (a request arriving
+  on an already-pending word in the LATE order), and scope one overbroad
+  sentence. Includes a correction to the finding's own framing.
+- **THE NEGATIVE CONTROL PARTLY REFUTES THE FRAMING, and the test comment now
+  carries the measurement rather than the claim.** Mutating the already-pending
+  branch to re-arm a full-loop worker (`return true` for `return false`) was run
+  against each candidate at `-count=20`:
+  - `TestOverlappingRefineRequestIsCoalesced_6669` GREEN
+  - `TestLateRefineRequestIsReclaimed_6669` GREEN
+  - `TestLateRefineRequestCannotBeStranded_6669` GREEN
+  - `TestInitHeartbeatEpochStateNeverBlocks_6169` GREEN
+  - `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` **RED** at
+    `session_bind:794`, "21 locked refine passes ran ... want exactly 2"
+  The four named in the finding are blind exactly as reported. But the mutation
+  does NOT escape the package: the twenty-request test reaches the same branch
+  through the EARLY order and its exact pass count catches the re-arm. So
+  "the already-pending branch is unguarded" is too strong.
+- **What the new test actually adds, and why it is still worth having.** The
+  twenty requests all arrive while the worker is still inside its pass and has
+  not yet run its own pending check, so the follow-up is served BY that check.
+  `TestThirdRequestCoalescesOntoTheLateReclaim_6669` parks the worker PAST the
+  check, at the epochRefineBeforeRelease seam, so request 2 establishes the late
+  reclaim and request 3 lands on an already-pending word whose follow-up can only
+  be served by the release CAS failing and the loop re-reading. Same branch,
+  different path to the coalesce, and the only test that drives a request into
+  it. This is the third instance on this PR of a state whose ENTRY two elements
+  can show but whose RE-ARM needs a third.
+- **RED-on-revert (final tree).** `2 package goroutines after the third request,
+  want exactly 1: it re-armed a worker instead of coalescing onto the follow-up
+  already owed` (`session_bind:565`). Assertion, not a build break; restored with
+  `touch` and `heartbeat_epoch.go` confirmed identical to HEAD.
+- **One sentence scoped.** "Exactly one worker, so exactly one goroutine" was
+  written as a flat production invariant. It is not: `releaseBootEpochRefine`
+  drops the in-flight bit BEFORE the outgoing goroutine's deferred handle-clear,
+  so a legitimate successor may overlap a retiring predecessor and two goroutines
+  is correct. The count is exact only AT THIS CHECKPOINT, where pass 1 is
+  deterministically parked in `epochFlock` across both reads. The assertion is
+  unchanged — only its justification was overreaching.
+- **Confirmed NOT owed, per the gate.** The external-package escape cannot be
+  closed by a cluster-path matcher and the existing comment already states that
+  scope honestly; and `joinBootEpochRefine` must stay in `Manager.Stop` —
+  deleting it fails `TestStopJoinsTheBootEpochRefineWorker_6669` at
+  `heartbeat_epoch_refresh_6669_test.go:401`.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 19.5 s. New test green
+  over 10 consecutive runs before mutation; flake three runs at `-count=5`
+  across the four coalescing tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 14:11 PDT
+- **Action**: #6669 round 19 — close what the round-18 test would still ACCEPT
+  (a hand-off of the owed follow-up) and adopt the gate's framing of the
+  novelty verbatim.
+- **What the test still accepted.** Every count in it was taken BEFORE the
+  unpark, so the window from `unparkWorker()` to `waitBootEpochIdle` was
+  unobserved. A HAND-OFF satisfied it exactly: worker 1 consumes the pending
+  bit, exits, and a SUCCESSOR runs the follow-up — two locked passes, a settled
+  word, and both goroutine counts untouched, because the successor is spawned
+  after the last one is read. `releaseBootEpochRefine`'s contract is stronger
+  than that: it serves the follow-up with the in-flight bit STILL HELD, which is
+  exactly what keeps a second worker from spawning at all. Arithmetic could not
+  express that; identity can.
+- **Fix.** The `epochFlock` seam now parks PASS 2 as well, so who runs the
+  follow-up is observable. While it is parked the test asserts the published
+  worker handle is the SAME pointer captured with pass 1 in flight, and that the
+  package goroutine count is still exactly 1.
+- **RED-on-revert, with the escape measured both ways.** Handing the owed
+  follow-up to a successor worker — word protocol and pass count preserved
+  exactly, only the identity changed — fails at `session_bind:613`: "the
+  follow-up is running on a DIFFERENT worker: the owed pass was handed to a
+  successor instead of being served by the worker that still holds the in-flight
+  bit". Against the SAME mutation,
+  `TestOverlappingRefineRequestIsCoalesced_6669`,
+  `TestLateRefineRequestIsReclaimed_6669` and
+  `TestCoalescingDoesNotRatchetOnAHealthyNode_6669` are all GREEN at
+  `-count=10`, so the hand-off escapes every other test in the file and only
+  this assertion catches it. Restored with `touch`; `heartbeat_epoch.go`
+  confirmed identical to HEAD.
+- **The gate's description of the novelty adopted verbatim**, because it is more
+  precise than the one this file carried: what is new is THE COMPOSITION OF THE
+  ALREADY-COVERED PENDING COALESCE WITH THE ALREADY-COVERED LATE RELEASE-CAS
+  RETRY — not unique protection against the reported mutation. The comment now
+  spells out both wrong readings it forecloses: delete the twenty-request test
+  because "this one covers the branch" and the EARLY order goes unguarded;
+  delete this one as "redundant" and the COMPOSITION does.
+- **Noted, not chased.** Under `-count=20` in ONE process against an
+  intentionally broken tree, a predecessor from the malformed two-worker state
+  can retire across the next iteration's baseline and add a late failure at the
+  baseline line. Every iteration is still RED and a healthy tree does not show
+  it, so it is an artifact of repeating a broken tree in a single process rather
+  than a flake in the test.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 19.4 s. New assertion
+  green over 20 consecutive runs before mutation; flake three runs at
+  `-count=10` across the five coalescing/reclaim tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 15:26 PDT
+- **Action**: #6669 round 20 — bind GOROUTINE identity instead of asserting a
+  handle pointer and calling it worker identity; assert the handle is retired.
+- **The round-19 assertion proved the wrong thing, and it was the same shape as
+  the defect round 18 closed, one level down.** Round 19 closed
+  hand-off-with-a-DIFFERENT-handle. The escape left open is
+  hand-off-with-the-SAME-handle: a successor that inherits the predecessor's
+  handle keeps the published pointer equal, holds the in-flight bit
+  continuously, and takes over the final cleanup, while a different goroutine
+  serves pass 2. Measured on that mutation with only the new goroutine-id check
+  disabled: the pointer comparison AND the goroutine COUNT are both satisfied,
+  20/20 green. So "prove the SAME worker serves the follow-up" was a claim about
+  a proxy. It was also wrong in the other direction — a healthy worker that
+  rotated its handle per pass would have failed it.
+- **Goroutine identity IS cheaply observable, so the claim is now true rather
+  than narrowed.** `runtime.Stack(buf, false)` dumps only the calling goroutine
+  and its header carries the id ("goroutine 20 [running]:"), so
+  `currentGoroutineID` can be called from inside a seam. The epochFlock seam
+  records the id on pass 1 and again on pass 2 (before parking, so the test can
+  read it while pass 2 is held), and the test asserts they are equal. Go exposes
+  no public API for this and it stays confined to tests; the alternative was to
+  keep asserting a proxy and describe it as something it is not.
+- **Both checks kept, each described as what it actually says.** The ids bind
+  the WORKER; the handle pointer binds the HANDLE against rotation or
+  republication (a handle is published per claimed worker, not per pass, and
+  rotating it would release a joiner holding the old one early).
+- **RED-on-revert, both directions measured.**
+  - Gate's mutation (same handle inherited, in-flight bit held, fresh goroutine,
+    cleanup transferred): RED at `session_bind:635` — "the follow-up is running
+    on goroutine 22 but pass 1 ran on 21". With ONLY the id assertion disabled
+    the same mutation is GREEN 20/20, so the id check is the load-bearing one.
+  - Deleting the handle-clear `CompareAndSwap` from the worker's exit defer: RED
+    at `session_bind:664` — nothing else required the handle to be nil, since
+    the word is 0 and `done` is closed. `joinBootEpochRefine` short-circuits on
+    a nil handle, so a stale one makes a later join select on a channel whose
+    worker has already gone.
+  Both are assertions rather than build breaks; restored with `touch` and
+  `heartbeat_epoch.go` confirmed identical to HEAD.
+- **Cleared by the gate, recorded so it is not re-litigated.** Round 19 did not
+  merely relocate the unobserved window: `waitBootEpochIdle` joins
+  `worker.done`, which the worker closes as its very last act, so the original
+  live-worker window is genuinely closed. The two parks neither deadlock nor
+  flake.
+- **Validation.** `go build ./...` rc 0, `go vet ./pkg/cluster/` rc 0, `gofmt
+  -l` empty, `go test -race ./pkg/cluster/...` rc 0 in 20.8 s. New assertions
+  green over 20 consecutive runs before mutation; flake three runs at
+  `-count=10` across the six coalescing/reclaim/join tests, rc 0 throughout.
+- **File(s)**: pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 16:44 PDT
+- **Action**: #6669 round 21 — two MAJORs. The drain's "joins the goroutine"
+  claim was false and is narrowed to what it observes; the handle retire's
+  CAS-vs-Store distinction is now bound by a fixture that opens the window.
+  Plus the goroutine-count flake and its root cause.
+- **MAJOR 1 — the signal is published before the event it names.** The worker's
+  exit defer runs `CompareAndSwap(worker, nil)` BEFORE `close(worker.done)`, and
+  `joinBootEpochRefine` returns immediately on a nil handle, so a joiner arriving
+  between those two statements reports "joined" with the goroutine still
+  running. Even a joiner released by `done` is woken by a close that is itself
+  still inside the deferred function: inserting `select {}` immediately after
+  `close(worker.done)` leaves the worker permanently parked and the helper and
+  its callers stay green 20/20. `waitBootEpochIdle`'s claim is now what it
+  actually observes — the handle retired and `done` closed — with the residual
+  stated: after that close the worker executes only the return from the defer
+  and the goroutine exit, reads no package var and touches no Manager state, so
+  a `t.Cleanup` restoring a seam behind the call cannot race it. A test needing
+  the GOROUTINE gone must observe that itself.
+- **MAJOR 2 — the retirement assertion caught deleting the clear, not degrading
+  it.** Replacing the CAS with `Store(nil)` passed
+  `TestThirdRequestCoalescesOntoTheLateReclaim_6669` 50/50 (measured), because
+  that fixture never has a successor published while the outgoing worker
+  retires. The hazard is real: outgoing worker drops the in-flight bit ->
+  successor claims and publishes its own handle -> outgoing worker's
+  `Store(nil)` ERASES the live successor -> `Stop` loads nil, joins nothing, and
+  returns while that worker is still writing the state file.
+- **The window is now openable.** `epochRefineWorkerBeforeExit` is a new seam
+  between `releaseBootEpochRefine` dropping the bit and the deferred clear — the
+  only place a successor can be published mid-retire. It is a few instructions
+  wide and closes on its own, so hammering cannot land in it; production cost is
+  one call to an empty func on a path that runs once per worker.
+  `TestRetiringWorkerDoesNotEraseASuccessor_6669` parks the outgoing worker
+  there, publishes a successor (parked in its own pass so it stays live), lets
+  the outgoing worker retire, and asserts the published handle is still the
+  SUCCESSOR. RED-on-revert: "published handle = 0x0 after the outgoing worker
+  retired, want the LIVE successor 0xc000102020".
+- **The flake, with its root cause rather than a retry.** `goBase` was sampled
+  BEFORE `initHeartbeatEpochState`, so it counted whatever this package still
+  had in flight from earlier tests; if one of those exited before the check the
+  delta read one lower — exactly the reported "0 package goroutines ... want
+  exactly 1". Both tests now compare two samples taken while pass 1 is
+  deterministically parked (`goParked`), so drift before the park cannot reach
+  them, and the assertion measures the property actually claimed: these requests
+  add no goroutine. Verified under the flake's own conditions — three CONCURRENT
+  processes x `-count=30` over the three affected tests, rc 0 on all three.
+- **Both earlier guards re-proved against the re-anchored counts**, since
+  changing a comparison can silently unbind it: the concurrent-second-worker
+  mutation still reds ("package goroutines went 2 -> 3 across the overlapping
+  request"), and the same-handle hand-off still reds on the goroutine id.
+- **Heatmap.** `pkg/cluster/heartbeat.go` is untouched at 1956 LOC (44 under the
+  REFACTOR tier); the seam added 14 lines to `heartbeat_epoch.go`, which sits at
+  1226, well under WATCH. `go test ./pkg/refactoraudit/` rc 0, so no regenerate
+  is owed.
+- **Validation, real exit codes.** `go build ./...` 0; `go vet ./pkg/cluster/`
+  0; `gofmt -l pkg/cluster/` 0; `git diff --check` 0; `go test -race
+  ./pkg/cluster/...` **0** in 21.3 s.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
+
+- **Timestamp**: 2026-08-05 18:03 PDT
+- **Action**: #6669 round 22 — F1, the blocking flake this PR would have put INTO
+  master; F2, binding the load-bearing CAS/close order by comment at both ends;
+  F3/F4 comment accuracy.
+- **F1 — a 3-5% flake in a test that does not exist on origin/master.**
+  `TestHeartbeatBootEpochRefinementCompletes_6169/refinement_raises_after_a_backward_clock_step`.
+  `heartbeatBootEpoch` spawns the refine worker inside `bootEpochOnce.Do` and
+  only THEN returns `m.bootEpoch.Load()`, so a worker that wins the race has
+  already raised the value: `published` captures the RAISED epoch, `final ==
+  published`, and `final <= published` reds on a healthy tree.
+  REPRODUCED FIRST, at HEAD, in the gate's own shape — six concurrent processes
+  at `-count=200`: **41/1200, all six rc=1**. (Gate measured 65/1200.)
+- **Attribution vs consequence, stated because they differ.** It is not this
+  round's regression — the file is byte-identical at `4c5f4d9b3` and the parent
+  rate is indistinguishable. But `heartbeat_epoch_test.go` is +1030 lines that
+  do NOT exist on origin/master, so MERGING is what puts the flake into a
+  package every lane touches, where a 5% failure gets dismissed as environmental
+  for weeks. Pre-existing on the branch is not pre-existing on master.
+- **Fix and proof.** The worker is parked on `epochFlock` — which sits inside
+  `withEpochFileLock`, strictly before `refineBootEpoch`'s read-modify-write, so
+  no raise can have happened while it is held — until `published` has been read.
+  A second assertion checks the epoch did NOT move while parked, so a park that
+  drifts to the wrong place fails loudly rather than silently restoring the
+  race. Re-measured in the identical shape: **0/1200, all six rc=0**.
+- **F2 — the CAS-before-close order is load-bearing and now documented at BOTH
+  ends.** It is what makes "done closed => handle already retired" true, which
+  the retirement assertion depends on. Swapping the two lines fails nothing
+  (measured 219/0), and closing that mechanically needs a seam BETWEEN the two
+  statements — production surface for a hazard two comments already address. So
+  it is bound by comment, deliberately, and both the exit defer and the
+  assertion now say so and name each other. Recorded plainly as a comment-level
+  guard rather than dressed up as a test.
+- **F3 — the residual covered only one of two join paths.** The same comment
+  establishes a joiner can be released EARLY, at the nil handle, and for that
+  path `close(worker.done)` still remains to run. Both residuals are now stated;
+  neither reads a package var or touches Manager state, because every seam read
+  happens inside the loop before the release that clears the word, so the safety
+  conclusion holds for both.
+- **F4 — the package-var list was missing `epochRefineWorkerBeforeExit`**, added
+  with the round-21 seam. That list is what a reader consults to decide whether
+  a `t.Cleanup` is safe, so it has to stay complete.
+- **Corrections.** The `:783` line cited for the MAJOR-2 RED was wrong (it is a
+  blank line); the assertion is at `:802` after this round's edits, and the
+  quoted message text was always correct. It appeared only in the round-21
+  report, not in this log. Separately, the heatmap concern from round 21 is
+  withdrawn: `scripts/refactoring-audit.sh` documents the LOC column as an
+  advisory snapshot the tree is expected to outrun, and the gate compares file
+  set and tier, so the 1609-vs-1956 gap is expected and nothing was owed.
+- **Validation, real exit codes.** `gofmt -l pkg/cluster/` 0; `go build ./...`
+  0; `go vet ./pkg/cluster/` 0; `git diff --check` 0; `go test -race
+  ./pkg/cluster/...` **0** in 17.6 s. MAJOR-2 guard re-proved at its new line:
+  CAS -> Store(nil) reds at `:802`, restored with `heartbeat_epoch.go` back to
+  +14 lines over HEAD (the round-21 seam only).
+- **File(s)**: pkg/cluster/heartbeat_epoch_test.go,
+  pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_epoch_session_bind_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go, _Log.md
 
 ## 2026-08-01 — #4555 round 7: the replacement corpus floors were themselves proxies
 
@@ -70880,3 +72660,464 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   STRUCTURALLY: header count 1512 + 2 new = 1514, and the one-header-one-
   Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
   and 226 after the union — the resolve introduced none.
+
+## 2026-08-07 — #6669 fold round 15: bind the boot-epoch production wiring at both ends
+
+- **Timestamp**: 2026-08-07
+- **Action**: PR #6669 (advances #6169). An independent hostile review ran 34
+  mutations and found the ALGORITHM well bound — every off-by-one on the
+  security bound REDs — but the mechanism's PRODUCTION WIRING unbound at BOTH
+  ends, and it is one defect twice.
+
+  The SEND site, `heartbeatSender.send`, was the only line putting an epoch on
+  the wire. Passing `0` there makes `marshalHeartbeatAuthEpoch` emit a
+  byte-identical LEGACY frame (measured on-wire len 81 -> 65), and
+  `go test ./pkg/cluster` stayed fully green. Both nodes could run "#6169",
+  neither receiver would ever latch, and the >=65-recording sustained replay
+  the change exists to close would be wide open under passing CI.
+
+  The RECEIVE site was unbound for a structural reason: `epochEnv.feed` and
+  `replay5086Env.feed` each RE-IMPLEMENTED readLoop's auth gate line-for-line
+  and asserted equivalence in a prose comment ("the EXACT gate readLoop
+  applies"). Every epoch test routed through those copies, so readLoop's own
+  epoch path had zero coverage and severing its `heartbeatFrameEpoch` read left
+  the package green.
+
+  The receive half is DEDUPLICATED rather than merely tested: the gate is
+  extracted to `heartbeatReceiver.admitFrame`, readLoop calls it, and both
+  fixtures now DELEGATE to it. Deriving one side from the other beats asserting
+  equivalence in prose — and it immediately exposed a fixture that was measuring
+  nothing: the rollback tests "rotated the PSK" by reassigning the test's own
+  signing key while production kept verifying with the Manager's unchanged one,
+  so "rotation retires the archive" was never exercised. Rotation now goes
+  through `epochEnv.rotateKey`, which moves BOTH, and `restartDaemon` comes up
+  on the rotated key as a real daemon re-reading committed config would.
+
+  Also folded: the accept-path forward bound now samples the existing
+  `epochNowNanos` seam instead of `time.Now()` directly, which makes the
+  dead-RTC regime drivable and stops `epochUsableAsFloor` from being absorbed by
+  the outer belt; the `NoteEpochDowngradeHeartbeat` call site and the
+  unkeyed-node `/var/lib/xpf` guard are bound; and two code comments that told
+  an operator an unwritable `/var` produces equal epochs "with the clock
+  irrelevant" are corrected — the chain engages only on `prev+1 > epoch`, so it
+  also needs the file at or above the wall-clock seed (measured at both
+  polarities: file 30m behind gives distinct epochs, 30m ahead gives equal).
+
+- **Validation**: five disjoint mutation cells, `go vet` rc=0 before each so no
+  RED is a build break.
+  M1 (send site -> `0`): ONLY `TestBootEpochTraversesTheRealSendAndReceivePath_6169`
+  REDs in the whole package, on both halves — "the frame heartbeatSender.send
+  put on the wire carries NO epoch section (len=65)" and the end-to-end latch
+  assertion. The over-reach guard asserted first (`readLoop accepted 1 frame`)
+  stays GREEN, so the mutation is shown to cost the epoch and not liveness.
+  M2 (`if macOK` -> `if macOK && false` on the receiver's epoch read): 28 test
+  functions RED, up from 0 before the deduplication; the send-side observation
+  subtest correctly stays GREEN, so the two halves are separately diagnosable.
+  M3 (delete `epochUsableAsFloor` from `admitAuthedLocked`): only
+  `TestUncredibleClockLeavesOnlyTheAbsoluteBand_6669` REDs, on its
+  `the_band_is_the_only_filter_under_a_dead_rtc` subtest — "an epoch of
+  18446744073709551615 was ADMITTED on a receiver whose own clock is not
+  credible". Its credible-clock over-reach guard is a SEPARATE subtest,
+  `a_credible_clock_still_has_its_own_forward_bound`, and was OBSERVED staying
+  GREEN under the same cell. That split is load-bearing rather than cosmetic: a
+  guard sharing a body with its binder sits behind the binder's `t.Fatalf`, so
+  under the mutation it never runs and can only be ASSUMED to hold.
+  M4 (delete the `NoteEpochDowngradeHeartbeat` block): only the downgrade test's
+  positive subtest REDs; its unverifiable-frame negative control stays GREEN.
+  M5 (delete the unkeyed early return in `initHeartbeatEpochState`): only the
+  unkeyed subtest REDs — "an unkeyed node published boot epoch ..."; its keyed
+  negative control stays GREEN.
+  `go build ./...` 0, `gofmt -l pkg/cluster` empty,
+  `go test ./pkg/cluster -count=1` ok 15.4s,
+  `go test -race -count=2 ./pkg/cluster` ok 35.8s.
+  `heartbeat.go` is 1992 lines, still [WATCH]; audit regenerated.
+
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_epoch.go,
+  pkg/cluster/heartbeat_manager.go,
+  pkg/cluster/heartbeat_epoch_wire_6669_test.go (new),
+  pkg/cluster/heartbeat_epoch_test.go, pkg/cluster/heartbeat_epoch_latch_test.go,
+  pkg/cluster/heartbeat_epoch_bounds_6669_test.go,
+  pkg/cluster/heartbeat_epoch_refresh_6669_test.go,
+  pkg/cluster/heartbeat_epoch_rollback_recovery_6669_test.go,
+  pkg/cluster/heartbeat_replay_restart_5086_test.go,
+  pkg/cluster/README.md, docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-08-07 — #6669 fold round 15b: name the two epoch refusals that are not replays
+
+- **Timestamp**: 2026-08-07
+- **Action**: PR #6669 (advances #6169), five review findings at `45e80b59c`.
+  Each was verified against the code before implementing; one had to be
+  reconciled with the brief (see F2).
+
+  **F2, the substantive one.** `admitAuthed` had THREE silent refusal arms, and
+  `heartbeatAuthDecision` — which sees only `nonceFresh == false` — reported all
+  of them as `"stale nonce (replay)"`. The brief said "two silent arms"; the code
+  shows three. Reading them resolves it: `epoch < s.highEpoch` really IS a replay
+  of a retired incarnation, so the generic wording is already true there. The
+  other two are not replays at all and were being mislabelled:
+
+    - `!epochUsableAsFloor(epoch)` — a 0 or post-2200 epoch. A conforming #6169
+      sender cannot emit one (refineBootEpoch declines to chain to such a value,
+      clock-independently), so it means a corrupt state file on the PEER or a
+      peer running a non-conforming build.
+    - `!epochWithinForwardBound(...)` — the epoch is more than bootEpochMaxSkew
+      ahead of OUR clock. This is routinely a perfectly HEALTHY peer whose clock
+      runs fast, and the action is NTP.
+
+  Both now carry a counter (`EpochOutOfBandRejected`,
+  `EpochAheadOfClockRejected`) and a distinct reason that names the action; the
+  receive path prefers the epoch gate's reason over the generic one. The
+  below-floor arm is deliberately left with neither, and a negative control pins
+  that so a later change cannot relabel a genuine replay.
+
+  **F1.** `Epoch session collisions` was rendered on all three surfaces and
+  asserted by NOTHING — all three copies were deletable with the package green —
+  and the file header's RED-on-revert claim said "drop *either* fmt.Fprintf",
+  naming two lines when there were three. The new
+  `TestEveryEpochCounterIsRendered_6669` is table-driven over all FIVE counters
+  on all THREE surfaces and drives each to a DISTINCT value, so a transposed pair
+  of render lines fails instead of passing a label match. The stale "either" text
+  is corrected and the header now says what makes it stale-proof.
+
+  **F3.** `TestHeartbeatReplayGatesLivenessRefresh` was a THIRD hand-copy of the
+  readLoop gate — missed in r15, which deduplicated only the two `feed` helpers —
+  and it counted a local integer "standing in for r.lastSeen.Store(...)". It now
+  drives `admitFrame` and asserts on `r.lastSeen` itself.
+
+  **F4.** `admitAuthed` was a bare pass-through to `admitAuthedLocked`, which TOOK
+  the lock despite a suffix that by Go convention means the caller already holds
+  it. Collapsed to one function, `admitAuthed`; 32 stale references renamed
+  across code, tests and README. The six in `_Log.md` are historical entries and
+  are deliberately left alone.
+
+  **F5.** `heartbeatAuthReplay`'s "touched only from the single readLoop
+  goroutine, so it needs no locking" stopped being true at #5086: the state lives
+  on the Manager, outlives any one receiver, and a heartbeat restart overlaps two
+  readLoops. What makes it safe is that `admitAuthed` holds `mu` across both
+  `admit()` call sites. Corrected, and moved with the type into a new file.
+
+  **The 2000-line watch.** F2 adds production code to a file that was at
+  1992/2000. Rather than trim comments, `replaySessionMark` +
+  `heartbeatAuthReplay` + `admit` (a self-contained unit, and where F5's comment
+  lives) moved to `heartbeat_auth_replay.go` as pure code motion. heartbeat.go is
+  1988 lines AFTER adding the counters and reasons; audit regenerated.
+
+- **Validation**: seven disjoint mutation cells, `go vet` rc=0 before each.
+  A (drop the collisions render from FormatInformation ONLY): REDs only that
+  subtest — "FormatInformation does not render \"Epoch session collisions:\" at
+  all" — while the other two surfaces stay GREEN, so the guard is per-surface.
+  B (keep the label, wire the WRONG field behind it): "FormatInformation renders
+  \"Epoch out-of-band rejected:\" as 4, want 2" — the transposition a
+  label-presence check would have missed.
+  C1/C2 (out-of-band arm: drop the counter / collapse the reason): each REDs its
+  own assertion independently.
+  D1/D2 (forward-bound arm: same two): likewise, with
+  "epochAheadOfClockRejected = 0, want 1" and the NTP-vs-incident message.
+  The `below_floor_stays_a_replay` negative control stayed GREEN in all four.
+  E1 (revert #5477 `admit`): "a replayed retired heartbeat refreshed peer
+  liveness — r.lastSeen moved 3372462449949032 -> 3372462449961596".
+  E2 (delete `r.lastSeen.Store(MonotonicNanos())` from admitFrame): "setup: an
+  accepted frame must have stamped lastSeen" — the cell that proves F3, because
+  the previous simulated-counter version could not have detected it at all.
+  `go build ./...` 0, `gofmt -l pkg/cluster` empty,
+  `go test ./pkg/cluster -count=1` ok 15.4s.
+
+- **File(s)**: pkg/cluster/heartbeat.go, pkg/cluster/heartbeat_auth_replay.go
+  (new), pkg/cluster/heartbeat_manager.go, pkg/cluster/status.go,
+  pkg/cluster/heartbeat_auth_test.go,
+  pkg/cluster/heartbeat_epoch_status_6169_test.go,
+  pkg/cluster/heartbeat_epoch_wire_6669_test.go, plus the call-site and
+  reference renames in heartbeat_epoch.go, manager.go,
+  heartbeat_epoch_bounds_6669_test.go, heartbeat_epoch_latch_test.go,
+  heartbeat_epoch_refresh_6669_test.go,
+  heartbeat_epoch_rollback_recovery_6669_test.go,
+  heartbeat_epoch_session_bind_6669_test.go,
+  heartbeat_epoch_session_budget_6669_test.go,
+  heartbeat_replay_restart_5086_test.go, pkg/cluster/README.md,
+  docs/refactoring-audit-current.txt, _Log.md
+
+- **Timestamp**: 2026-08-07
+- **Action**: #6169 — correct the M2 RED count recorded in `ae56bebe4`.
+
+  That commit's mutation table records, for
+  `M2 \`if macOK\` -> \`if macOK && false\` on the receiver's epoch read`:
+  "28 test functions RED, up from 0 before the deduplication". Re-measured
+  firsthand at 45e80b59c, in a `git archive` scratch with `go build ./...` and
+  `go vet ./pkg/cluster` rc=0 first so no RED is a build break: the cell REDs
+  **29** distinct top-level test functions, not 28. The direction is favourable
+  — the deduplication binds MORE than the commit claimed, not less — but the
+  number was published as exact and is not, so it is corrected here rather than
+  by rewriting a pushed commit.
+
+  The SEAM has also moved since, and a reviewer re-running the documented cell
+  at the current head would be measuring something else. Folding `admitAuthed`
+  and `admitAuthedLocked` into one function merged `admitFrame`'s two `if macOK`
+  blocks, so `if macOK && false` there now suppresses the whole authenticated
+  gate rather than the epoch read alone. The faithful equivalent at the current
+  head is severing the `heartbeatFrameEpoch(frame, key)` assignment itself.
+
+- **File(s)**: _Log.md
+
+## 2026-08-12 — #6169/#6669 r18: Codex DO-NOT-MERGE fold, part 1 (finding 1 enumeration + finding 8)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Codex returned DO-NOT-MERGE with eight blocking findings. This
+  entry covers the guard enumeration that gates the rest, and the one finding
+  closed in full.
+
+  **Finding 1 — guards that cannot fire. VERIFIED BY MUTATION, not by
+  reading.** Baseline first (`go test -count=1 ./pkg/cluster/...` = 0,
+  `ok 15.199s`), because "stays GREEN" means nothing without one. Four of the
+  five concrete claims are real, and the whole `pkg/cluster` suite stays GREEN
+  under each:
+    - revert `heartbeatSender.send()` to a per-sender nonce → GREEN
+      (`ok 16.138s`); `TestHeartbeatNonceIsIncarnationScoped_6169` itself still
+      PASSES. It calls `m.heartbeatNonce()` directly and builds two senders it
+      never uses, so it pins the ACCESSOR and leaves the send site unbound.
+    - move `EpochOutOfBandRejected` / `EpochAheadOfClockRejected` /
+      `EpochSessionCollision` back under `receiver != nil` → GREEN
+      (`ok 15.621s`). Only three of the six counters are guarded.
+    - delete the `m.initHeartbeatEpochState()` call outright → GREEN
+      (`ok 15.599s`).
+    - `TestInBoundFarFutureEpochLockoutIsBounded_6169`'s "BOUND 1 ... no
+      operator action at all" feeds a NEW session at a NEW epoch
+      (`0xEE03`/`inBound+1`). The rejected sender is `0xEE02` and is never
+      re-fed, so the test proves a fresh incarnation above the floor is
+      admitted — which nobody disputed — and says nothing about the running
+      sender. This is finding 6 seen from the test side.
+  The fifth (swapping the worker `CompareAndSwap`/`close(done)` order) does
+  stay GREEN (`ok 15.414s`), but the PR's own comment at
+  `heartbeat_epoch.go:1038-1047` already states that verbatim and argues the
+  seam is not worth buying. That is a disclosed residual carrying its caveat in
+  the shipping artifact, not a silently unbound guard.
+
+  **The ledger's positive half was sampled too**, because a review that
+  over-credits misleads as badly as one that misses: disabling the
+  epochless-downgrade latch (`if s.epochSeen` → `if false`) turns 12 tests RED,
+  including every one Codex marks `R` against that target. The epoch ADMISSION
+  core is genuinely bound; the decorative set is narrow and specific.
+
+  **Finding 8 — log flood under a documented rate limit. FIXED.**
+  `NoteEpochDowngradeHeartbeat` is limited to one line per 30s, but `admitFrame`
+  then emitted an UNCONDITIONAL `slog.Warn("cluster: heartbeat auth rejected")`
+  for every rejected frame immediately afterwards — so 10 valid-MAC epochless
+  heartbeats a second produced ~10 warnings a second, and the line that WAS
+  bounded is the one an operator most needs. New
+  `heartbeatRejectWarnLimiter` bounds the generic line on the same 30s interval
+  and reports `suppressed_since_last`, so bounding the volume does not conceal
+  it. It lives on `heartbeatAuthState` (Manager lifetime), not the receiver, for
+  the same reason the epoch counters do: a receiver-scoped limiter is reset by
+  every `StartHeartbeat`, including a routine DHCP-triggered VRF rebind, which
+  would restore the flood one burst per restart. `README.md`'s
+  "the rejection logs a rate-limited, actionable warning" is corrected to say
+  which lines are bounded and on what interval.
+
+  **No sleeps.** `heartbeatRejectWarnNowNanos` is an injectable seam (same idiom
+  as `epochNowNanos`), so the tests step across the interval explicitly. A
+  wall-clock rate-limit test would be the flakiest possible addition to a PR
+  whose subject is ordering.
+
+  **Mutations, run and observed.** (F8) remove the `rejectWarn.admit()` gate →
+  `TestRejectionWarningIsRateLimitedOnTheRealPath_6669` RED with
+  "40 rejected frames inside one 30s window produced 40 rejection warnings,
+  want 1"; the suppressed-count test RED too. (F8b) keep the gate but drop the
+  `suppressed_since_last` attribute → the rate test stays GREEN and only
+  `TestRejectionWarningReportsWhatItSuppressed_6669` goes RED, so the two belts
+  are separately distinguished rather than riding one another.
+
+  **Finding 4 is NOT locally patchable — attempted, reverted, and why.** The
+  fix looks like a one-line predicate: stop `refineBootEpoch` overwriting an
+  intact higher persisted epoch with a lower wall-clock seed. Applying it broke
+  `TestRefinementValidatesThePublishedEpochNotJustThePersistedOne_6169` and
+  `TestPersistedEpochHealsOnlyWhenClockCredible_6169` and hung
+  `TestRefinementSamplesTheClockAfterLoadingPersistedState_6669`, and the reason
+  is structural, not a bad predicate: two DIFFERENT situations reach the
+  `!epochOrderable` branch and `refineBootEpoch` cannot tell them apart from
+  inside. A year-2191 file with a correct clock is corrupt state that SHOULD be
+  healed by writing over it; an intact file written by a correctly-clocked
+  predecessor, read by a node whose clock stepped back two hours, MUST NOT be
+  written over. Both present identically as "file value far beyond my forward
+  bound". Healing necessarily writes DOWN; protecting necessarily refuses to.
+  The PR already contains a test asserting the heal ("Declining to chain also
+  HEALS the file"), so closing finding 4 is a design decision about persistence
+  semantics — which the PR's own comment says is "tracked there rather than
+  papered over here" — and not a fold-round patch. Reverted; tree clean;
+  baseline re-confirmed GREEN (`ok 15.492s`).
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.418s`); `go test -race -count=1 ./pkg/cluster/` 0 (`ok 17.744s`);
+  `gofmt -l` clean on both touched files. No cluster/incus tooling.
+- **File(s)**: pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_reject_warn_rate_6669_test.go (new),
+  pkg/cluster/README.md, _Log.md
+
+## 2026-08-12 — #6669 r18: refresh the stale measurement in the worker-ordering disclosure
+
+- **Timestamp**: 2026-08-12
+- **Action**: The accepted-residual disclosure at `heartbeat_epoch.go`'s worker
+  retirement recorded "measured, 219 passes, 0 failures" for the
+  `CompareAndSwap`/`close(done)` swap. Re-measuring at 50698ade7 gives **584
+  top-level PASS / 732 including subtests, 0 failures** — the package has grown
+  roughly threefold since that number was taken, so the digits had stopped
+  describing any run a reader could reproduce while still reading as a live
+  measurement. That is the same defect class as the stale M2 cell in
+  `ae56bebe4` which 0d8d7e3a8 corrected: a measurement note goes stale as the
+  surface it measures grows.
+
+  The residual itself is unchanged and remains accepted — the swap fails no
+  test, the seam that would close it is production surface not worth buying,
+  and the comment says so. What changed is that the note now carries the
+  COMMAND and the SHA (the reproducible parts) and states explicitly that a
+  count in a comment is a snapshot to re-measure rather than digits to trust.
+
+  Measured with the swap applied, then restored from backup BEFORE the result
+  was inspected, so an early exit on a failing leg could not skip the restore.
+  `git status` clean afterwards.
+- **File(s)**: pkg/cluster/heartbeat_epoch.go, _Log.md
+
+## 2026-08-12 — #6669 r18: finding 2 disclosure + the modularity gate I tripped
+
+- **Timestamp**: 2026-08-12
+- **Action**: Two items, and the second is a correction to my own previous
+  commit.
+
+  **Finding 2 — disclosure widened (comment + README, no behavioural change).**
+  Determined by measurement, not assertion: master has no `admitAuthed` at all,
+  so an archived current-key frame with an unseen session is admitted by the
+  bare replay ring there too, and
+  `TestHeartbeatRestartStillAcceptsGenuinePeer_5086` REQUIRES that (a genuine
+  peer reboot must be accepted). The mechanic is therefore PRE-EXISTING, not
+  introduced by #6169, and the epoch floor strictly improves on master once
+  armed. What the existing comment disclosed was only the LATCH half. Codex's
+  finding names the other half: the same archived frame is ADMITTED, so
+  `admitFrame` refreshes `lastSeen` and calls `handlePeerHeartbeat` — a DEAD
+  peer looks alive for as long as the replay continues, and that liveness feeds
+  election. Both the arming-site comment and README's residual list now say so,
+  and say plainly that the paragraph above them covers the latch only.
+
+  **The modularity gate: I tripped it and did not notice.** `heartbeat.go` was
+  at 1988/2000 before this round; the finding-8 limiter took it to **2050**,
+  over the hard gate, and I committed that without re-measuring — the sibling
+  lane had flagged the headroom and I did not act on it before landing. Two
+  extractions restore compliance, both single-concern cuts that are right
+  independently of the line count:
+    - `heartbeat_reject_warn.go` (59 lines) — the rate limiter added this round;
+    - `heartbeat_epoch_admit.go` (426 lines) — `admitAuthed` +
+      `epochSessionAdmissible` + `bindEpochSession` and their rationale. This is
+      the epoch DECISION; heartbeat.go keeps the wire format and the
+      sender/receiver lifecycle. Nothing in the extracted file touches sockets.
+  `heartbeat.go` is now **1595** and `scripts/refactoring-audit.sh` reports
+  `[WATCH] 1595` rather than `[REFACTOR]`.
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.492s`); `gofmt -l pkg/cluster/` clean; refactoring audit clean.
+- **File(s)**: pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_epoch_admit.go (new),
+  pkg/cluster/heartbeat_reject_warn.go (new), pkg/cluster/README.md, _Log.md
+
+## 2026-08-12 — #6669 r18: wiring binders for two of the four decorative guards
+
+- **Timestamp**: 2026-08-12
+- **Action**: Bound the PRODUCTION CALL SITES for two of the four guards the
+  finding-1 enumeration proved decorative, and rebased onto master
+  `6c4289902`.
+
+  **The defect class, stated once.** All four decorative guards are one shape:
+  THE INNER GUARD IS BOUND AND THE WIRING TO IT IS NOT. Each existing test
+  calls the helper directly and asserts the helper behaves; none asserts that
+  production reaches it. So each binder here drives the production path and
+  never re-invokes the helper the site is supposed to call.
+
+  **B1 — the send site (`heartbeatSender.send`).**
+  `TestSendSiteUsesTheIncarnationNonce_6669` runs a REAL sender over a real UDP
+  socket into the REAL readLoop, restarts the sender on the same Manager (the
+  VRF-rebind / comms-restart shape), and asserts the receiver has bound exactly
+  ONE session at the floor. Production edit that fails it: replace
+  `session, counter := s.mgr.heartbeatNonce()` in `send()` with a per-sender
+  draw. Observed RED: *"after a heartbeat restart: 2 sessions bound at ONE boot
+  epoch, want 1"* — while `TestHeartbeatNonceIsIncarnationScoped_6169`, the
+  test that was supposed to cover this, still **PASSES**. That contrast is the
+  proof the new test binds what the old one could not.
+
+  **B2 — the stats exposure path (`Manager.HeartbeatStats`).**
+  `TestEpochCountersAreExposedWithoutAReceiver_6669` drives
+  `EpochOutOfBandRejected` and `EpochAheadOfClockRejected` through the REAL
+  admission path (an out-of-band epoch and an ahead-of-clock epoch, both
+  refused), removes the receiver — what a VRF rebind does — and asserts the
+  accessor still reports them. Production edit that fails it: move the three
+  assignments back under `if receiver != nil {`. Observed RED: *"HeartbeatStats
+  reports EpochOutOfBandRejected=0 with no receiver installed, but the counter
+  was incremented on the admission path"* — while
+  `TestEpochLatchSurvivesReceiverGapInStats_6669` still **PASSES**, again the
+  contrast that shows the gap was real.
+  `TestEpochCountersStillExposedWithAReceiver_6669` is its negative control in
+  its own body: it asserts the UNDRIVEN counter reads 0, so the fix cannot be
+  satisfied by hard-wiring a non-zero value.
+
+  **Rebase onto `6c4289902`.** `_Log.md` was the only conflict, as expected.
+  Union-resolved keeping both blocks; structural check `ours + theirs − base`
+  = (1527, 2889, 1736) matched actual exactly; whole-tree marker sweep found
+  zero surviving `<<<<<<<` / `=======` / `>>>>>>>`.
+
+  **Still owed:** the other two wiring binders — the `StartHeartbeat` →
+  `initHeartbeatEpochState()` call, and the running-sender lockout recovery
+  (finding 1d/6, which also needs its README/comment claim corrected from
+  "unattended" recovery). Designs recorded in the round report.
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.319s`); `gofmt -l pkg/cluster/` clean; `heartbeat.go` re-measured at
+  **1595**, audit `[WATCH]`. Every mutation restored from backup BEFORE its
+  result was read.
+- **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go (new), _Log.md
+
+## 2026-08-12 — #6669 r18: the last two wiring binders + a FALSE shipping claim retired
+
+- **Timestamp**: 2026-08-12
+- **Action**: Completed the finding-1 wiring binders (4 of 4) and corrected the
+  one claim in this fold that was false rather than merely narrow.
+
+  **A FALSE claim, in two places.** `README.md` said the in-bound lockout is
+  bounded because "the peer's own wall-clock seed climbs past it unattended",
+  and `heartbeat_epoch.go` called it "a self-limiting window instead of one
+  that needs intervention". **Both are false.** The rejected sender resolved
+  its epoch ONCE at boot and caches it for the life of the process
+  (`bootEpochOnce`), so waiting does not change the value it emits: a peer
+  latched out at T+30m stays out however long anyone waits. The failure mode
+  is not academic — it tells a maintainer debugging a wedged peer to wait for a
+  recovery that cannot arrive. Both now say what the hour actually bounds (how
+  far a NEW incarnation must climb) and that recovery is a SENDER RESTART, or a
+  receiver restart, never elapsed time.
+
+  **Binder 3 — `TestRunningSenderDoesNotRecoverByWaiting_6669`.** Re-feeds the
+  SAME rejected incarnation (`0xEE02`) with the clock advanced past the floor
+  and asserts it is STILL refused — the assertion that makes the corrected
+  sentence true and the old one false. The existing
+  `TestInBoundFarFutureEpochLockoutIsBounded_6169` never returns to that
+  incarnation; it fabricates a fresh one at `inBound+1`. A second half asserts a
+  RESTARTED sender IS admitted, so the test cannot be read as "permanently
+  stuck", which would be the opposite overstatement. Its fail-on-revert is
+  TEXTUAL and the comment says so plainly: it pins a residual, not a guard, and
+  calling it a behavioural guard would be the same overstatement it retires.
+
+  **Binder 4 — `TestStartHeartbeatResolvesTheBootEpoch_6669.`** Drives the real
+  `StartHeartbeat` and reads the published cell WITHOUT calling the resolver —
+  touching `heartbeatBootEpoch()` would publish the value under observation and
+  mask the deletion. Production edit: delete `m.initHeartbeatEpochState()`.
+  Observed RED: *"bootEpoch = 0 after StartHeartbeat returned"*. **Attribution
+  checked** per the review condition: `TestStartHeartbeatReturnsWithAUsableEpoch_6169`
+  and the other pre-existing `StartHeartbeat` callers stay GREEN under the same
+  deletion, so the RED is attributable to the new binder alone.
+
+  **Claims sweep** over the whole fold diff for "unattended", "self-limiting",
+  "unconditionally", "every", "all", "always", "cannot", "no longer" and
+  numeric figures. The two above were the only FALSE ones; the README already
+  self-corrects several claims in place ("an earlier revision of this document
+  said ... That is false"), and the 219→584 count was fixed earlier this round.
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.174s`); `go test -race -count=1 ./pkg/cluster/` 0 (`ok 17.849s`);
+  `gofmt -l pkg/cluster/` clean; `heartbeat.go` 1595, audit reports no
+  `[REFACTOR]` for pkg/cluster. Every mutation restored from backup BEFORE its
+  result was read.
+- **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go,
+  pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
