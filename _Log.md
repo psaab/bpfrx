@@ -69852,6 +69852,28 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
 - **Timestamp**: 2026-08-06
+- **Action**: #5480 research plan — `docs/peer-boot-incarnation-plan.md`. Plan
+  only, no implementation, no wire change. Establishes that the incarnation
+  granularity is not a free choice: `initGenState` seeds `configGenCounter` from
+  a monotonic base precisely so generations survive "restarts within a boot", so
+  the incarnation must change exactly when CLOCK_MONOTONIC restarts — exactly on
+  OS boot — which makes `/proc/sys/kernel/random/boot_id` the one correct source
+  and rules out a process seed, a persisted counter, and the existing
+  `bulkSendNext` transfer epoch. Places the field in the `syncMsgBulkStart`
+  payload (8 -> 24 bytes) rather than the auth HELLO, because
+  `performSyncHandshake` returns immediately when unkeyed, so a HELLO-carried
+  field would make the guard silently absent on unkeyed clusters. The extension
+  uses this protocol's established length-gated pattern (`>= 8` on BulkStart,
+  `>= 24`/`>= 48` on the delete frames, the session payload's "all length-gated"
+  note). Recommends FAIL-OPEN on an absent incarnation, with the argument that
+  the fallback IS origin/master's behaviour, that it matches the existing
+  gen==0 / epoch==0 / (0,0) legacy sentinels, and that failing closed would
+  strand the standby for the whole rolling-upgrade window. Concludes NO flag day
+  is needed, but records the contingency explicitly: a fail-CLOSED requirement
+  would force one, because an upgraded receiver cannot distinguish an old peer
+  from a suppressing peer without a negotiated capability, and that capability
+  has nowhere to live unkeyed.
+- **File(s)**: docs/peer-boot-incarnation-plan.md, _Log.md
 - **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
   and blocked on #5480. Seven review rounds established that the fence keys on
   `syncConnID`, a total ORDER over connections, when the predicate it needs is
