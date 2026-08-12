@@ -71419,3 +71419,94 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/authz.go, pkg/api/auth.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go,
   pkg/api/auth_retained_5561_test.go, pkg/api/README.md, _Log.md
+
+## 2026-08-12 — #5561 round 20: verify the stale round-3 verdict firsthand, then disclose the cap
+
+- **Timestamp**: 2026-08-12
+- **Action**: The newest posted verdict (Codex round 3, DO-NOT-MERGE, 7 MAJORs)
+  was against `7f77f7364` — posted 2026-08-01, seven days and roughly twelve
+  rounds before this head, and **not an ancestor of it** (the branch was
+  rebased since). A verdict in that state cannot be folded as written: several
+  of its findings were closed by later rounds, and one of them attacks a
+  mechanism a later round deliberately kept. So each finding was verified
+  FIRSTHAND at the head, with a distinguishing mutation, and only the survivor
+  was acted on.
+
+  **Method.** For every finding: locate the production line that closes it,
+  then make the single-line edit that should reopen it and require the guard to
+  go RED. A commit message claiming a fix is not evidence, and neither is a
+  code comment describing one — comments outlive the code they describe. Every
+  RED below was run at `-count=2` so a single stray failure could not be
+  mistaken for a mutation kill.
+
+  **F1 — closed and bound.** `authorizeInputs` (`pkg/api/authz.go:485`) reads
+  the config snapshot AFTER the blocking peer wait, and `mutationAuthzGuard`
+  re-adjudicates at the mutation boundary via `reauthorizeInputs` (`:520`,
+  called `:857`). Mutation: hoist `s.activeConfig()` above the wait →
+  `TestConfigSnapshotIsReadAfterThePeerWait_5561` RED on both the demoted and
+  deleted arms, with a message that distinguishes the pass-1 ordering from the
+  pass-2 gate.
+
+  **F2 — closed and bound.** Mutation: delete `cfg, p = s.reauthorizeInputs(r,
+  ri)` → `TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` RED on
+  BOTH arms (`class-demoted-while-body-withheld` and
+  `credential-revoked-while-body-withheld`), controls green. Noted for the
+  record: `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` survives
+  that mutation. It is not vacuous — it guards a DIFFERENT window (the gap
+  between minting the CredentialPrincipal and the decision, held open through
+  `Config.PeerLocalityFn`), so its own distinguishing mutation lives in the
+  credential re-validation, not in the second pass.
+
+  **F3 — closed and bound, seven ways.** Mutation: delete the PRE-rebind
+  `m.srv.ReplaceAuth(publish)` (`pkg/daemon/management.go:426`) → seven tests
+  RED, including `TestMgmtNewListenerNeverServesUnderTheOldAuth_5561` (the
+  verdict's exact complaint) and `TestMgmtFailedRebindStillRevokesACommittedRotation_5561`,
+  with ten sibling tests staying PASS.
+
+  **F4 — closed in CODE, not only in prose.** `pkg/authz/peer.go:504` now
+  consults `findPeerSocket` inside the `ct.Zone != ""` branch BEFORE any
+  address classification, failing closed on a read error and on a found or
+  malformed row. Mutation: drop `Local: true` from the unreadable-table arm →
+  `TestScopedPeerWithNoObservationDenies_5561/no_table_could_be_read` RED,
+  sibling subtest PASS.
+
+  **F5 — LIVE, and the only survivor.** The cap is real and still there;
+  an earlier screen of this round reported it "gone" because the grep was
+  scoped to `pkg/authz` while the cap lives in `pkg/api/authz.go:236/241/356/358`.
+  Decision: ACCEPT the cap, because the alternative under a wedged
+  `localAddrsFn` — where cancellation is unavailable because the wedge is under
+  a mutex — is unbounded goroutine accumulation on the management plane driven
+  by an unauthenticated caller. Bounded denial beats unbounded growth. But the
+  comment ARGUED the case without stating its costs, and an argument is not a
+  refutation, so the constant's doc now states the tradeoff plainly: the slot is
+  taken at accept before authentication, past the cap requests are DENIED rather
+  than queued, and the pool is process-global so saturation on one listener
+  denies on all. A maintainer can now disagree with it. The refinements that
+  would remove the cost rather than bound it (per-listener budget, post-auth
+  acquisition) are filed as #6974.
+
+  **F6 — closed and bound.** Mutation: delete `defer func() { <-peerLookupSlots }()`
+  (`pkg/api/authz.go:358`) → `TestPeerLookupSlotsAreReturned_5561` RED: "a
+  FINISHED lookup did not return its token, so the pool is a lifetime budget
+  rather than a concurrency ceiling". The test acquires through production
+  `connContext`, which is what the older `TestWedgedLookupsDoNotAccumulate_5561`
+  could not do.
+
+  **F7 — closed, and closed with the structural binding the verdict asked for.**
+  Mutation: swap the shared call for a FAITHFUL copy — the exact mutant the
+  verdict named. `TestCLIResolvesThroughTheSharedEvaluator_5561` stayed **PASS**,
+  confirming the verdict's reasoning that behaviour comparison cannot
+  distinguish sharing from an equivalent copy; `TestCLIResolveClassPermsCallsSharedEvaluator_5561`
+  (an AST check requiring exactly one `config.ResolveClassPermissions` call in
+  `CLI.resolveClassPerms`) went RED. That pair is the finding's resolution.
+
+  **Flake, disclosed as UNKNOWN.** One run of `./pkg/authz/... ./pkg/api/...`
+  failed once at this head and never again: `-count=5` (4365 test runs),
+  `-race -count=2`, and three `-shuffle=on` legs were all clean. The failing
+  test name is unrecoverable — the output was truncated before it was read. It
+  is NOT labelled benign, and no "pre-existing on master" claim is made, because
+  an unreproduced failure attributes to neither branch nor master.
+
+  **Validation.** `go build ./...` 0. Every mutation restored and the tree
+  verified clean before committing.
+- **File(s)**: pkg/api/authz.go, _Log.md
