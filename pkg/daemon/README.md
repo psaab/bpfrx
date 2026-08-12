@@ -15,15 +15,43 @@ uses the split config, HA/fabric, sessions, telemetry, and link-cycle domains.
 The runtime dataplane is published through ONE synchronized point (#2114):
 `Daemon.dpCell` (`atomic.Pointer[dpSlot]`) with the `dataplane()` /
 `setDataplane()` accessor pair — the `natPoolAlarm` (#2116) idiom. Every
-reader and writer goes through the accessors; a `pkg/daemon` AST canary
-(`daemon_dp_canary_test.go`) fails the build on a direct `.dpCell`
-reference outside them. Readers that nil-check AND use the value load ONCE
-into a local (the plan's §5.3 snapshot boundaries: one load per
-sampler/watchdog tick, per event/request callback, or per straight-line
-block — never per-element, never a lifetime capture beyond the deliberate
-GC/event-stream capture-once). `setDataplane`'s kind-gated guard keeps a
-non-nil interface wrapping a nil value (any nillable kind) out of the
-cell.
+in-package ACQUISITION of the handle goes through the accessors; a
+`pkg/daemon` AST canary (`daemon_dp_canary_test.go`) fails the build on a
+direct `.dpCell` reference outside them. Readers that nil-check AND use
+the value load ONCE into a local (the plan's §5.3 snapshot boundaries: one
+load per sampler/watchdog tick, per event/request callback, or per
+straight-line block — never per-element). `setDataplane`'s kind-gated
+guard keeps a non-nil interface wrapping a nil value (any nillable kind)
+out of the cell.
+
+**Publication is not lifetime.** The cell answers "what is published
+now?"; it does not bound how long a handle someone already took stays
+usable. Two consequences the code makes explicit:
+
+- **Escaping consumers.** Six things outlive a single call. The three
+  OPERATOR-FACING management servers — gRPC, REST, and the console CLI —
+  do NOT receive the backend handle: they receive `liveDataPlane`
+  (`daemon_dp_live.go`), a daemon-owned indirection that re-reads the cell
+  on every method, so a later `setDataplane(nil)` is immediately visible
+  to them. The three DATA-PATH consumers are deliberate capture-once
+  wiring, and are documented as such rather than claimed converted:
+  conntrack GC and cluster `SessionSync` take the DECOMPOSED
+  `dataplane.SessionStore` / `dataplane.Telemetry` domains (a live
+  indirection would put an atomic load + interface assertion +
+  `SessionStoreOf` allocation on every per-session step), and the
+  userspace event-stream loop owns an already-open socket subscription
+  that re-resolving cannot redirect. Behavioural guards live in
+  `daemon_dp_escape_test.go` (gRPC) and `daemon_dp_escape_rest_test.go`
+  (REST); `daemon_dp_escape_canary_test.go` is the syntactic fence that
+  covers the console-CLI site and any future management consumer.
+- **A torn-down backend can still be published.** The commit-confirmed
+  rollback calls `Teardown()` and deliberately LEAVES the object in the
+  cell so a corrected commit re-arms that same object
+  (`TestDataplaneCell_RollbackRearmRecurrence` pins this). Between the
+  teardown and the re-arm, a management call resolves to a detached
+  backend and the `pkg/dataplane` retained-unarmed registry state proceeds
+  exactly as it did pre-#2114. Closing that window needs a
+  generation/lease on the backend itself and is tracked as **#6741**.
 Legacy `dataplane.DataPlane` access is isolated behind `legacyDP()` for
 callers that still need legacy eBPF compatibility while their domain adapters
 are completed (DPDK retired #1525). Userspace currently reaches those old callers through
@@ -588,10 +616,13 @@ never lock an operator out of a remote box it manages.
   always-down / address-stripped, even on an empty/absent/rolled-back config.
   An explicit non-fxp0 leaf narrows fxp0 off the auto-protection.
 - **First-commit rollback** (`enterBootstrapMode`): a timed-out first
-  `commit confirmed` stops+discards the NAT pool-alarm monitor (#2114 — so
-  no sampler survives to race a later re-arm's dataplane-cell clear; the
-  monitor is rebuilt fresh on a corrected re-arm because it is not
-  restartable after `Stop`), removes the takeover `.network` files (keeping
+  `commit confirmed` stops+discards the NAT pool-alarm monitor (#2114 — the
+  reason is NOT a data race: `dpCell` is an `atomic.Pointer`, so a
+  concurrent load against a later re-arm's clear is well-defined. The
+  reason is that a surviving sampler would keep issuing control-socket
+  calls into a backend the rollback has just torn down. The monitor is
+  rebuilt fresh on a corrected re-arm because it is not restartable after
+  `Stop`), removes the takeover `.network` files (keeping
   the lifeline + `.link` files), clears the FRR managed section, and
   detaches the dataplane — instead of applying an empty config — and the
   store persists the never-committed marker so a restart re-enters

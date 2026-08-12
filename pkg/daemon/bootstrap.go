@@ -324,8 +324,13 @@ func (d *Daemon) enterBootstrapMode() error {
 	// #2114: stop and DISCARD the NAT pool-alarm monitor. It may have been
 	// started on a prior successful bootstrap-exit arm; rolling back to
 	// bootstrap means a later corrected commit can re-enter
-	// runBootstrapExitStartup and, on an arm failure, clear the dataplane cell —
-	// which would race the still-running monitor's sampler. Discard (not
+	// runBootstrapExitStartup and, on an arm failure, clear the dataplane
+	// cell. Codex PR #6743 r4-F5: that is NOT a data race — the cell is an
+	// atomic.Pointer, so a concurrent sampler load against the clear is
+	// well-defined and the sampler would simply observe nil. The reason to
+	// stop the monitor is that a survivor keeps SAMPLING a backend this
+	// rollback has just torn down, issuing control-socket work against
+	// detached state. Discard (not
 	// just Stop) because natpoolalarm.Monitor is not restartable after
 	// Stop(); the next successful re-arm builds a fresh one via
 	// maybeStartNATPoolAlarm. Placed BEFORE the applyBodyForTest seam return

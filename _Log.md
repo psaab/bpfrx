@@ -68876,9 +68876,13 @@ break — `go vet` confirmed passing under every revert.
   guard over Chan/Func/Map/Pointer/Slice/UnsafePointer). All 5 writer sites
   converted (4 boot writers in daemon_run_bringup.go, bootstrap-exit arm in
   daemon_run_naming.go — the latter extracted as armBootstrapExitDataplane so
-  the race tests drive the real writer). All readers converted per the plan's
-  §5.3 snapshot-boundary rules (one load per tick/callback/straight-line
-  block). The fwdstatus adapter is structurally narrowed to the sampler-only
+  the race tests drive the real writer). All reader ACQUISITION sites
+  converted per the plan's §5.3 snapshot-boundary rules (one load per
+  tick/callback/straight-line block). **CORRECTION (r4, see the r4 entry
+  below): this entry originally read "All readers converted", which was
+  false — six consumers took the handle from an accessor and then kept it
+  for the daemon's lifetime, so the conversion covered acquisition only.**
+  The fwdstatus adapter is structurally narrowed to the sampler-only
   CachedStatusProvider (fwdstatus.NewSampler retyped; the daemon adapter
   collapses to one per-call-probing CachedStatus method; IsLoaded/GetMapStats/
   Status leave the daemon adapter). ~80 `Daemon{dp: ...}` test literals
@@ -70224,3 +70228,113 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-12 — #2114 r4 fold: the atomic cell fixed ACQUISITION, not ESCAPE (PR #6743)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Folded a DO-NOT-MERGE hostile review of PR #6743 at 36e2d9cff.
+  Its central finding: the PR's claim "every reader and writer goes through
+  dataplane()/setDataplane()" is true only of ACQUISITION. Direct daemon-field
+  access really was migrated (no surviving `d.dp`; `.dpCell` appears only in
+  the accessors), but the handle escaped immediately to six long-lived
+  consumers that snapshotted it once and held it for the daemon's lifetime, so
+  a later `setDataplane(nil)` was invisible to all six.
+
+  **F1 (escape) — FIXED for the three operator-facing management surfaces,
+  NARROWED for the three data-path consumers.** New `pkg/daemon/
+  daemon_dp_live.go` adds `liveDataPlane`, a daemon-owned value type that
+  holds ONLY the `*Daemon` pointer and re-reads the cell on every method
+  (one atomic load + one assertion in `resolve()`), forwarding the UNION of
+  the three `runtime_probes.go` management probes. gRPC (`startGRPCServer`),
+  REST (`startHTTPServer`) and the console CLI (`Run`'s `isInteractive()`
+  block) now receive that indirection instead of the backend handle; it is
+  the same idiom the fwdstatus sampler already used, widened from one method
+  to 27. `--no-dataplane` still hands a genuine nil interface so the
+  consumers' `dp == nil` branches stay reachable. `IsLoaded()` returns false
+  on an empty cell, which is what the dominant downstream guard
+  (`dp == nil || !dp.IsLoaded()`) already keys on, so no new error surfaces
+  where a "not loaded" branch previously ran. Compile-time assertions make
+  the three probes and both in-tree backends drift-fatal. The conntrack GC,
+  cluster SessionSync and the userspace event-stream loop stay capture-once
+  and are now DOCUMENTED as such (they take decomposed
+  SessionStore/Telemetry domains on per-session paths, or own an already-open
+  socket subscription) instead of being claimed converted.
+
+  **F2 (false success on a detached backend) — partly FIXED, partly
+  NARROWED.** `clearPolicyCountersIn` and `clearFilterCountersIn` discarded
+  every `zm.Update` error and returned nil, so `clear security policies
+  statistics` / `clear firewall counters` could not fail. Both now propagate,
+  matching `clearInterfaceCountersIn`, which already did; the index bounds
+  are exact (MAX_POLICIES 4096 / MAX_FILTER_RULES 512 are the maps'
+  max_entries) so no working clear becomes an error. This does NOT close the
+  review's worked interleaving: after `Teardown()` the map fds stay open and
+  the backend stays published on purpose (the rollback re-arms that same
+  object), so an update still succeeds against detached state. That window is
+  a lifetime/generation problem, not a publication one, and is narrowed in
+  the shipped comments at `daemon.go` (the cell doc), `daemon_dp_live.go`
+  (the SCOPE block) and `pkg/daemon/README.md`, pointing at **#6741**.
+
+  **F3 (tests that cannot fire) — repaired.** `churnDataplaneCellReaders`
+  now returns a rendezvous: every reader shape completes one pass before
+  `ready` closes, so the three writer-vs-reader tests provably overlap
+  instead of relying on the scheduler. `TestDataplaneCell_
+  ClusterStartPublication`'s two 2 ms sleeps are replaced by `sawNil` /
+  `sawPublished` channel edges — no timing constant participates.
+  `TestForwardingStatusAdapterIsNotDataPlaneAccessor` now checks the POINTER
+  method set too (a pointer-receiver `Status`/`IsLoaded` pair evaded the
+  value-only assertion). The registry gate-evidence collector required only
+  a bare `st == registryFresh` comparison anywhere in the body, so an inert
+  `_ = st == registryFresh` or an empty `if` read as a gate; it now requires
+  the comparison to be an `if` CONDITION whose body returns, with two new
+  negative fixtures. The `.dpCell` canary's comment no longer calls an atomic
+  Store "unsynchronized" (it is synchronized; it bypasses normalization and
+  the snapshot discipline) and now cross-references
+  `checkDaemonDPFieldShape`, which covers the raw-field case it cannot see.
+
+  **F4 (nothing guarded a real escaping consumer) — closed.** Three new test
+  files construct GENUINE consumers through the PRODUCTION startup paths.
+
+  **Also fixed: the package's test build was RED at 36e2d9cff.** The merge
+  from master brought `armproof_5275_test.go` (#5275), which assigns
+  `m.loaded = true` — but this PR retyped `Manager.loaded` to `atomic.Bool`,
+  so `pkg/dataplane`'s test binary did not compile, and master's two new
+  exported `*Manager` methods (`ProveArmCoverage`,
+  `ReplaceZoneCounterOffsets`) left the class census at 159 against a
+  manifest of 157. A clean `mergeable` flag hid both. Fixed and classified.
+
+- **Validation**: mutation table, each cell run firsthand.
+  (1) Revert the gRPC hunk to the capture-once shape →
+  `TestGRPCServer_DisownedDataplaneIsNotReachable` RED with "gRPC cleared
+  counters on the DISOWNED dataplane 1 time(s) after setDataplane(nil)" and
+  `TestGRPCServer_RepublishedDataplaneIsReachable` RED with "the SUPERSEDED
+  backend took 1 clear call(s)"; `TestGRPCServer_PublishedDataplaneStill
+  Reachable` and `TestGRPCServer_NoDataplaneModeLeavesConfigNil` stay GREEN.
+  (2) Revert the REST hunk → `TestRESTServer_DisownedDataplaneIsNot
+  Reachable` RED with "REST still reports dataplane_loaded=true after
+  setDataplane(nil)" and `TestRESTServer_LateDataplanePublicationIsObserved`
+  RED; `TestRESTServer_PublishedDataplaneStillReachable` stays GREEN (it is
+  the positive control proving `dataplane_loaded=true` is reachable at all,
+  so the binder is not vacuous). (3) Revert the CLI hunk →
+  `TestManagementProbesComeFromLiveDataplane` RED naming
+  "daemon_run.go:Run declares cliDataPlane without liveDataplane()"; its
+  both-direction self-test stays GREEN. Every RED is an ASSERTION, never a
+  build break. `go build ./...` 0, `gofmt -l` clean on every touched file,
+  `go test ./pkg/daemon/... ./pkg/dataplane/... ./pkg/grpcapi/...
+  ./pkg/api/... ./pkg/cluster/... ./pkg/conntrack/... ./pkg/cli/...
+  ./pkg/fwdstatus/... -count=1` 0, `go test -race ./pkg/daemon/
+  ./pkg/dataplane/ -count=1` 0, `go test ./... -count=1` 0.
+- **File(s)**: pkg/daemon/daemon_dp_live.go (new),
+  pkg/daemon/daemon_dp_escape_test.go (new),
+  pkg/daemon/daemon_dp_escape_rest_test.go (new),
+  pkg/daemon/daemon_dp_escape_canary_test.go (new),
+  pkg/daemon/daemon_run_servers.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/daemon.go, pkg/daemon/daemon_run_naming.go,
+  pkg/daemon/bootstrap.go, pkg/daemon/daemon_dp_race_test.go,
+  pkg/daemon/daemon_dp_canary_test.go,
+  pkg/daemon/daemon_forwarding_status_test.go, pkg/daemon/README.md,
+  pkg/dataplane/maps_policy.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/armed_gate_matrix_test.go,
+  pkg/dataplane/armproof_5275_test.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/dataplane/README.md, docs/pr/1373-retire-ebpf-dataplane/README.md,
+  _Log.md

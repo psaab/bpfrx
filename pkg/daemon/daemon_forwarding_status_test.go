@@ -150,11 +150,21 @@ func TestForwardingStatusAdapterUsesCurrentDataplaneAfterSwap(t *testing.T) {
 // fwdstatus.DataPlaneAccessor, because Build keys backend identity on
 // Status() presence and this type can never be routed there. The `var _`
 // idiom cannot express the negative, so this is a plain type assertion.
+//
+// Codex PR #6743 r4-F3: BOTH method sets are checked. Testing only the
+// value left an escape — a pointer-receiver Status()/IsLoaded() pair puts
+// DataPlaneAccessor on *forwardingStatusDaemonDataPlane and NOT on the
+// value, so the value-only assertion stayed green while the pointer form
+// became routable the moment the constructor returned an address.
 func TestForwardingStatusAdapterIsNotDataPlaneAccessor(t *testing.T) {
 	var _ fwdstatus.CachedStatusProvider = forwardingStatusDaemonDataPlane{}
 
 	if _, ok := any(forwardingStatusDaemonDataPlane{}).(fwdstatus.DataPlaneAccessor); ok {
 		t.Fatal("forwardingStatusDaemonDataPlane must not satisfy fwdstatus.DataPlaneAccessor")
+	}
+	if _, ok := any(&forwardingStatusDaemonDataPlane{}).(fwdstatus.DataPlaneAccessor); ok {
+		t.Fatal("*forwardingStatusDaemonDataPlane must not satisfy fwdstatus.DataPlaneAccessor " +
+			"(a pointer-receiver Status/IsLoaded pair evades the value-only assertion)")
 	}
 }
 

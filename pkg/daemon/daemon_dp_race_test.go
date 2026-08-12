@@ -160,12 +160,34 @@ func (f *failingStartUserspaceDP) CachedStatus() (dpuserspace.ProcessStatus, boo
 	return dpuserspace.ProcessStatus{}, false
 }
 
+// dataplaneCellReaderChurn is a running set of reader goroutines plus the
+// two rendezvous channels the callers need.
+//
+// Codex PR #6743 r4-F3: `ready` is the READER-READY BARRIER. Before it,
+// the writer in each test could in principle run to completion before a
+// single reader goroutine had touched the cell, so the overlap the test
+// claims to exercise was a scheduling accident rather than a property of
+// the test. Every shape now completes one full pass before ready closes,
+// so the writer provably runs against live readers. It is a rendezvous,
+// not a sleep: no timing constant participates.
+type dataplaneCellReaderChurn struct {
+	ready chan struct{}
+	done  chan struct{}
+}
+
 // churnDataplaneCellReaders launches the §5.4 reader shapes against the
 // cell until stop closes: the narrowed forwarding-status adapter
 // CachedStatus probe, applyResult(), a PolicySchedulerActiveStateFn-shape
 // probe, the NAT pool sampler closure, and a watchdog-shape per-tick load
 // (one load per tick, shared across a small RG loop).
-func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) {
+//
+// The returned churn's ready channel closes once EVERY shape has made a
+// pass; done closes once every shape has returned after stop.
+func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) *dataplaneCellReaderChurn {
+	churn := &dataplaneCellReaderChurn{
+		ready: make(chan struct{}),
+		done:  make(chan struct{}),
+	}
 	var wg sync.WaitGroup
 	adapter := d.forwardingStatusDataplane()
 	sampler := d.natPoolAlarmSampler()
@@ -199,10 +221,16 @@ func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) {
 			}
 		},
 	}
+	var firstPass sync.WaitGroup
+	firstPass.Add(len(shapes))
 	for _, shape := range shapes {
 		wg.Add(1)
 		go func(fn func()) {
 			defer wg.Done()
+			// One pass BEFORE signalling ready, so the caller's writer
+			// cannot start against a set of not-yet-scheduled readers.
+			fn()
+			firstPass.Done()
 			for {
 				select {
 				case <-stop:
@@ -213,7 +241,9 @@ func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) {
 			}
 		}(shape)
 	}
-	wg.Wait()
+	go func() { firstPass.Wait(); close(churn.ready) }()
+	go func() { wg.Wait(); close(churn.done) }()
+	return churn
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +257,8 @@ func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) {
 func TestDataplaneCell_ConcurrentReadersVsWriter(t *testing.T) {
 	d := &Daemon{}
 	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() { churnDataplaneCellReaders(d, stop); close(done) }()
+	churn := churnDataplaneCellReaders(d, stop)
+	<-churn.ready // reader-ready barrier (r4-F3): every shape has run
 
 	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -236,7 +266,7 @@ func TestDataplaneCell_ConcurrentReadersVsWriter(t *testing.T) {
 		d.setDataplane(&runtimeOnlyApplyTestDP{})
 	}
 	close(stop)
-	<-done
+	<-churn.done
 }
 
 // TestDataplaneCell_TypedNilAndValueShapes is the kind-gated guard matrix:
@@ -322,13 +352,13 @@ func TestBootstrapExit_ArmFailureWithConcurrentReaders(t *testing.T) {
 	d.setDataplane(&failingStartUserspaceDP{})
 
 	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() { churnDataplaneCellReaders(d, stop); close(done) }()
+	churn := churnDataplaneCellReaders(d, stop)
+	<-churn.ready // reader-ready barrier (r4-F3)
 
 	d.armBootstrapExitDataplane(0)
 
 	close(stop)
-	<-done
+	<-churn.done
 	if d.dataplane() != nil {
 		t.Fatal("cell must be cleared after the arm failure")
 	}
@@ -344,8 +374,8 @@ func TestBootstrapExit_ArmFailureWithConcurrentReaders(t *testing.T) {
 // with NO happens-before edge between them.
 type blockingProcReader struct {
 	fwdstatus.ProcReader
-	mu           sync.Mutex
-	entries      int
+	mu            sync.Mutex
+	entries       int
 	readerEntered chan struct{}
 	release       chan struct{}
 	once          sync.Once
@@ -490,8 +520,8 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 	d.setDataplane(backend)
 
 	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() { churnDataplaneCellReaders(d, stop); close(done) }()
+	churn := churnDataplaneCellReaders(d, stop)
+	<-churn.ready // reader-ready barrier (r4-F3)
 
 	// Successful arm: monitor starts.
 	d.armBootstrapExitDataplane(0)
@@ -532,7 +562,7 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 	d.armBootstrapExitDataplane(0)
 
 	close(stop)
-	<-done
+	<-churn.done
 	if backend.startCalls != 2 {
 		t.Fatalf("re-arm Start calls = %d, want 2 (the retained object is re-Started, not replaced)", backend.startCalls)
 	}
@@ -549,12 +579,23 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 // per event, SetRGActive through the HA domain) racing the boot
 // setDataplane(dp) publication. Every load observes nil or the full slot;
 // never a torn interface (the detector fires on a plain-field revert).
+//
+// Codex PR #6743 r4-F3: the two 2 ms sleeps that used to bracket the
+// publication are gone. They were the ONLY thing making the reader
+// overlap the writer, and a loaded CI box could schedule the whole
+// writer between them. Both edges are now rendezvous channels: sawNil
+// proves the reader ran against the EMPTY cell before publication, and
+// sawPublished proves it ran against the FULL slot after — so the
+// overlap is a property of the test, not of the scheduler.
 func TestDataplaneCell_ClusterStartPublication(t *testing.T) {
 	d := &Daemon{}
 	stop := make(chan struct{})
 	readerDone := make(chan struct{})
+	sawNil := make(chan struct{})
+	sawPublished := make(chan struct{})
 	go func() {
 		defer close(readerDone)
+		var nilOnce, publishedOnce sync.Once
 		for {
 			select {
 			case <-stop:
@@ -562,17 +603,19 @@ func TestDataplaneCell_ClusterStartPublication(t *testing.T) {
 			default:
 				rt := d.dataplane()
 				if rt == nil {
+					nilOnce.Do(func() { close(sawNil) })
 					continue
 				}
 				// The watcher handler chain shape: HA() + SetRGActive.
 				_ = rt.HA().SetRGActive(context.Background(), 0, true)
+				publishedOnce.Do(func() { close(sawPublished) })
 			}
 		}
 	}()
 
-	time.Sleep(2 * time.Millisecond) // let the reader spin on the nil cell first
+	<-sawNil // the reader is live and spinning on the empty cell
 	d.setDataplane(&runtimeOnlyApplyTestDP{})
-	time.Sleep(2 * time.Millisecond)
+	<-sawPublished // the reader dispatched through the published slot
 	close(stop)
 	<-readerDone
 	if d.dataplane() == nil {

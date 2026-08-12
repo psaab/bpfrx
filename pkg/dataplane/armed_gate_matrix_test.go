@@ -48,7 +48,7 @@ var managerMethodClasses = map[string]string{
 	"SetZone": "class1", "SetVlanIfaceInfo": "class1",
 	"ClearIfaceZoneMap": "class1", "ClearVlanIfaceMap": "class1",
 	"SwapToUserspaceXDPShimEntryProgram": "class1",
-	"ReadGlobalCounter": "class1", "ReadInterfaceCounters": "class1", "ClearInterfaceCounters": "class1",
+	"ReadGlobalCounter":                  "class1", "ReadInterfaceCounters": "class1", "ClearInterfaceCounters": "class1",
 	"UpdateFabricFwd": "class1", "UpdateFabricFwd1": "class1",
 	"UpdateRGActive": "class1", "UpdateHAWatchdog": "class1", "BumpFIBGeneration": "class1",
 	"SetIfaceFilter": "class1", "ClearIfaceFilterMap": "class1",
@@ -88,29 +88,29 @@ var managerMethodClasses = map[string]string{
 	// --- class 2: neutral-outcome, any signature, WITH the uniform
 	// synchronization rule (fresh outcome == master's missing-map outcome,
 	// byte-for-byte) ---
-	"Compile":                 "class2", // redirect_capable optional skip-and-continue
-	"SessionCount":            "class2",
-	"GetMapStats":             "class2",
-	"ClearSessionCounts":      "class2",
-	"ClearStaticNATEntries":   "class2",
-	"UpdatePolicyScheduleState": "class2", // the #3780 deliberate nil
-	"SeedNATPortCounters":       "class2",
-	"SeedSessionIDCounter":      "class2",
-	"DeleteStaleIfaceZone":         "class2",
-	"DeleteStaleVlanIface":         "class2",
-	"DeleteStaleZonePairPolicies":  "class2",
-	"DeleteStaleApplications":      "class2",
-	"DeleteStaleSNATRules":         "class2",
-	"DeleteStaleSNATRulesV6":       "class2",
-	"DeleteStaleDNATStatic":        "class2",
-	"DeleteStaleDNATStaticV6":      "class2",
-	"DeleteStaleStaticNAT":         "class2",
-	"DeleteStaleNPTv6":             "class2",
-	"DeleteStaleNAT64":             "class2",
-	"ZeroStaleScreenConfigs":       "class2",
-	"ZeroStaleNATPoolConfigs":      "class2",
-	"DeleteStaleIfaceFilter":       "class2",
-	"ZeroStaleFilterConfigs":       "class2",
+	"Compile":                     "class2", // redirect_capable optional skip-and-continue
+	"SessionCount":                "class2",
+	"GetMapStats":                 "class2",
+	"ClearSessionCounts":          "class2",
+	"ClearStaticNATEntries":       "class2",
+	"UpdatePolicyScheduleState":   "class2", // the #3780 deliberate nil
+	"SeedNATPortCounters":         "class2",
+	"SeedSessionIDCounter":        "class2",
+	"DeleteStaleIfaceZone":        "class2",
+	"DeleteStaleVlanIface":        "class2",
+	"DeleteStaleZonePairPolicies": "class2",
+	"DeleteStaleApplications":     "class2",
+	"DeleteStaleSNATRules":        "class2",
+	"DeleteStaleSNATRulesV6":      "class2",
+	"DeleteStaleDNATStatic":       "class2",
+	"DeleteStaleDNATStaticV6":     "class2",
+	"DeleteStaleStaticNAT":        "class2",
+	"DeleteStaleNPTv6":            "class2",
+	"DeleteStaleNAT64":            "class2",
+	"ZeroStaleScreenConfigs":      "class2",
+	"ZeroStaleNATPoolConfigs":     "class2",
+	"DeleteStaleIfaceFilter":      "class2",
+	"ZeroStaleFilterConfigs":      "class2",
 
 	// --- class 3: required-side-effect hybrids, UNGATED (pinned legacy
 	// behavior in every state; scoped lookups; ClearAllCounters composes
@@ -127,15 +127,15 @@ var managerMethodClasses = map[string]string{
 
 	// --- category L: lifecycle (arming/teardown path itself; ungated by
 	// construction) + the retired-path no-op stubs ---
-	"Load":               "catL",
-	"LoadUserspaceShim":  "catL",
-	"Start":              "catL",
+	"Load":                 "catL",
+	"LoadUserspaceShim":    "catL",
+	"Start":                "catL",
 	"CompileUserspaceShim": "catL",
-	"Close":              "catL",
-	"Teardown":           "catL",
-	"StartFIBSync":       "catL",
-	"NotifyLinkCycle":    "catL",
-	"SyncFabricState":    "catL",
+	"Close":                "catL",
+	"Teardown":             "catL",
+	"StartFIBSync":         "catL",
+	"NotifyLinkCycle":      "catL",
+	"SyncFabricState":      "catL",
 
 	// --- category F: facade/domain accessors ---
 	"Link":              "catF",
@@ -149,31 +149,40 @@ var managerMethodClasses = map[string]string{
 
 	// --- category G: ungated Go-state helpers (m.mu-protected offset state,
 	// construction-time handles, the loaded bit read itself) ---
-	"IncrementGlobalCounter":       "catG",
-	"ReadUserspaceCounterOffset":   "catG",
-	"ReadZoneCounters":             "catG",
-	"SetZoneCounterOffset":         "catG",
-	"ClearZoneCounterOffsets":      "catG",
-	"ReadFloodCounters":            "catG",
-	"SetFloodCounterOffset":        "catG",
-	"ClearFloodCounterOffsets":     "catG",
-	"ReadNATRuleCounter":           "catG",
-	"SetNATRuleCounterOffset":      "catG",
-	"ClearNATRuleCounterOffsets":   "catG",
-	"IsLoaded":                     "catG", // the gate read itself
-	"GetPersistentNAT":             "catG",
-	"XDPLinks":                     "catG",
-	"TCLinks":                      "catG",
-	"DetachTC":                     "catG", // reads only the construction link map
+	"IncrementGlobalCounter":     "catG",
+	"ReadUserspaceCounterOffset": "catG",
+	"ReadZoneCounters":           "catG",
+	"SetZoneCounterOffset":       "catG",
+	// #6743 r4: master's #3643/#5275 work landed two exported *Manager
+	// methods after this census was written, and neither touches the map
+	// registry — the merge left the package's TEST BUILD red (159 vs 157)
+	// until they were classified. ReplaceZoneCounterOffsets swaps the
+	// m.mu-protected zoneCounterOffsets map wholesale (the plural sibling
+	// of SetZoneCounterOffset); ProveArmCoverage (armproof.go) reads only
+	// m.attachedInstance.
+	"ReplaceZoneCounterOffsets":  "catG",
+	"ProveArmCoverage":           "catG",
+	"ClearZoneCounterOffsets":    "catG",
+	"ReadFloodCounters":          "catG",
+	"SetFloodCounterOffset":      "catG",
+	"ClearFloodCounterOffsets":   "catG",
+	"ReadNATRuleCounter":         "catG",
+	"SetNATRuleCounterOffset":    "catG",
+	"ClearNATRuleCounterOffsets": "catG",
+	"IsLoaded":                   "catG", // the gate read itself
+	"GetPersistentNAT":           "catG",
+	"XDPLinks":                   "catG",
+	"TCLinks":                    "catG",
+	"DetachTC":                   "catG", // reads only the construction link map
 	// DetachXDP's single label is category G (its direct access is the
 	// construction link map) with the class-3-LIKE delegation target
 	// setXDPAttachedFlag: scoped lookups, cleanup always runs, NO gate.
 	"DetachXDP": "catG",
 	// The xdpEntryProg trio: the field is m.mu-protected (locked-helper
 	// scheme), so the accessors touch only m.mu-protected Go state.
-	"XDPEntryProgram":                     "catG",
-	"SelectUserspaceXDPShimEntryProgram":  "catG",
-	"UsingUserspaceXDPShimEntryProgram":   "catG",
+	"XDPEntryProgram":                    "catG",
+	"SelectUserspaceXDPShimEntryProgram": "catG",
+	"UsingUserspaceXDPShimEntryProgram":  "catG",
 }
 
 // TestManager_PreArmMethodMatrix assigns every exported *Manager method to
@@ -220,8 +229,8 @@ func TestManager_PreArmMethodMatrix(t *testing.T) {
 		}
 	}
 
-	if len(inventory) != 157 {
-		t.Fatalf("exported *Manager method inventory = %d, want 157 (the plan's census); reconcile the count or the plan", len(inventory))
+	if len(inventory) != 159 {
+		t.Fatalf("exported *Manager method inventory = %d, want 159 (the plan census 157 + the two #6743 r4 additions); reconcile the count or the plan", len(inventory))
 	}
 	for name := range inventory {
 		if _, ok := managerMethodClasses[name]; !ok {
@@ -321,9 +330,9 @@ var armedGateInvokeExemptions = map[string]string{
 // helpers. The stale-allowlist self-check below fails if an allowlisted
 // function is renamed or removed without updating the canary.
 var registryAccessAllowlist = map[string]bool{
-	"lookupMapLocked":            true,
-	"lookupProgramLocked":        true,
-	"publishShimRegistryLocked":  true,
+	"lookupMapLocked":           true,
+	"lookupProgramLocked":       true,
+	"publishShimRegistryLocked": true,
 }
 
 // unwrapOwnerIdent strips any parenthesization and pointer-dereference
@@ -1097,13 +1106,13 @@ type registryCallsiteManifestEntry struct {
 var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"compiler.go", "Compile", "map", `"redirect_capable"`, "optional"}, // leg: Compile continuation (absent redirect_capable skips AND CONTINUES into attachment work)
 	{"loader.go", "AddTxPort", "map", `"tx_ports"`, "required"},
-	{"loader.go", "AttachTC", "prog", `"tc_main_prog"`, "carveout"},       // carve-out: the pre-registry loaded rejection fires first on both unarmed states; the lookup keeps master's not-found text
-	{"loader.go", "AttachXDP", "prog", "<ident:entryProg>", "carveout"},   // carve-out
+	{"loader.go", "AttachTC", "prog", `"tc_main_prog"`, "carveout"},     // carve-out: the pre-registry loaded rejection fires first on both unarmed states; the lookup keeps master's not-found text
+	{"loader.go", "AttachXDP", "prog", "<ident:entryProg>", "carveout"}, // carve-out
 	{"loader.go", "ClearIfaceZoneMap", "map", `"iface_zone_map"`, "required"},
 	{"loader.go", "ClearVlanIfaceMap", "map", `"vlan_iface_map"`, "required"},
-	{"loader.go", "Map", "map", "<ident:name>", "optional"},               // class 4: nil outcome
-	{"loader.go", "NewEventSource", "map", `"events"`, "required"},        // class 4 with error signature: fresh -> typed error
-	{"loader.go", "Program", "prog", "<ident:name>", "optional"},          // class 4: nil outcome
+	{"loader.go", "Map", "map", "<ident:name>", "optional"},        // class 4: nil outcome
+	{"loader.go", "NewEventSource", "map", `"events"`, "required"}, // class 4 with error signature: fresh -> typed error
+	{"loader.go", "Program", "prog", "<ident:name>", "optional"},   // class 4: nil outcome
 	{"loader.go", "SetVlanIfaceInfo", "map", `"vlan_iface_map"`, "required"},
 	{"loader.go", "SetZone", "map", `"iface_zone_map"`, "required"},
 	{"loader.go", "clearNativeXDPFlags", "map", `"iface_zone_map"`, "optional"},
@@ -1112,9 +1121,9 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"loader.go", "setXDPAttachedFlag", "map", `"iface_zone_map"`, "optional"},       // leg (iii): absent -> master's early-boot no-op NIL, claims untouched
 	{"loader.go", "setXDPAttachedFlag", "map", `"vlan_iface_map"`, "optional"},       // leg: absent vlan_iface_map CONTINUES into the physical-interface processing
 	{"loader.go", "swapXDPEntryProg", "prog", "<ident:name>", "required"},
-	{"maps_counters.go", "ClearGlobalCounters", "map", `"global_counters"`, "optional"},   // class 3: pinned legacy behavior
+	{"maps_counters.go", "ClearGlobalCounters", "map", `"global_counters"`, "optional"}, // class 3: pinned legacy behavior
 	{"maps_counters.go", "ClearInterfaceCounters", "map", `"interface_counters"`, "required"},
-	{"maps_counters.go", "ClearZoneCounters", "map", `"zone_counters"`, "optional"},       // class 3
+	{"maps_counters.go", "ClearZoneCounters", "map", `"zone_counters"`, "optional"}, // class 3
 	{"maps_counters.go", "ReadGlobalCounter", "map", `"global_counters"`, "required"},
 	{"maps_counters.go", "ReadInterfaceCounters", "map", `"interface_counters"`, "required"},
 	{"maps_counters.go", "clearInterfaceCountersRaw", "map", `"interface_counters"`, "raw"}, // class-3 nested-call composition leg (legacy text preserved)
@@ -1140,8 +1149,8 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_mirror.go", "SetMirrorConfig", "map", `"mirror_config"`, "required"},
 	{"maps_nat.go", "ClearDNATStatic", "map", `"dnat_table"`, "required"},
 	{"maps_nat.go", "ClearDNATStaticV6", "map", `"dnat_table_v6"`, "required"},
-	{"maps_nat.go", "ClearNAT64Configs", "map", `"nat64_configs"`, "required"},       // leg: partial-registry continuation — present + nonzero count, prefix_map ABSENT: succeeds AND the count is zeroed
-	{"maps_nat.go", "ClearNAT64Configs", "map", `"nat64_prefix_map"`, "optional"},    //   (same leg: the optional miss must NOT abort before the trailing required SetNAT64Count write)
+	{"maps_nat.go", "ClearNAT64Configs", "map", `"nat64_configs"`, "required"},    // leg: partial-registry continuation — present + nonzero count, prefix_map ABSENT: succeeds AND the count is zeroed
+	{"maps_nat.go", "ClearNAT64Configs", "map", `"nat64_prefix_map"`, "optional"}, //   (same leg: the optional miss must NOT abort before the trailing required SetNAT64Count write)
 	{"maps_nat.go", "ClearNATPoolConfigs", "map", `"nat_pool_configs"`, "required"},
 	{"maps_nat.go", "ClearNATPoolIPs", "map", `"nat_pool_ips_v4"`, "required"},
 	{"maps_nat.go", "ClearNATPoolIPs", "map", `"nat_pool_ips_v6"`, "required"},
@@ -1149,7 +1158,7 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_nat.go", "ClearSNATEgressIPs", "map", `"snat_egress_ips"`, "required"},
 	{"maps_nat.go", "ClearSNATRules", "map", `"snat_rules"`, "required"},
 	{"maps_nat.go", "ClearSNATRulesV6", "map", `"snat_rules_v6"`, "required"},
-	{"maps_nat.go", "ClearStaticNATEntries", "map", `"static_nat_v4"`, "optional"},   // leg: absent v4 CONTINUES to the v6 clear
+	{"maps_nat.go", "ClearStaticNATEntries", "map", `"static_nat_v4"`, "optional"}, // leg: absent v4 CONTINUES to the v6 clear
 	{"maps_nat.go", "ClearStaticNATEntries", "map", `"static_nat_v6"`, "optional"},
 	{"maps_nat.go", "DeleteDNATEntry", "map", `"dnat_table"`, "required"},
 	{"maps_nat.go", "DeleteDNATEntryV6", "map", `"dnat_table_v6"`, "required"},
@@ -1157,8 +1166,8 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_nat.go", "SeedNATPortCounters", "map", `"nat_port_counters"`, "optional"},
 	{"maps_nat.go", "SetDNATEntry", "map", `"dnat_table"`, "required"},
 	{"maps_nat.go", "SetDNATEntryV6", "map", `"dnat_table_v6"`, "required"},
-	{"maps_nat.go", "SetNAT64Config", "map", `"nat64_configs"`, "required"},          // leg (i): required present + optional absent -> succeeds AND the required write landed
-	{"maps_nat.go", "SetNAT64Config", "map", `"nat64_prefix_map"`, "optional"},       //   (same leg)
+	{"maps_nat.go", "SetNAT64Config", "map", `"nat64_configs"`, "required"},    // leg (i): required present + optional absent -> succeeds AND the required write landed
+	{"maps_nat.go", "SetNAT64Config", "map", `"nat64_prefix_map"`, "optional"}, //   (same leg)
 	{"maps_nat.go", "SetNAT64Count", "map", `"nat64_count"`, "required"},
 	{"maps_nat.go", "SetNATPoolConfig", "map", `"nat_pool_configs"`, "required"},
 	{"maps_nat.go", "SetNATPoolIPV4", "map", `"nat_pool_ips_v4"`, "required"},
@@ -1206,7 +1215,7 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_session.go", "IterateSessionsV6", "map", `"sessions_v6"`, "required"},
 	{"maps_session.go", "IterateSessionsV6From", "map", `"sessions_v6"`, "required"},
 	{"maps_session.go", "SeedSessionIDCounter", "map", `"session_id_gen"`, "optional"},
-	{"maps_session.go", "SessionCount", "map", `"sessions"`, "optional"},   // leg: v4 AND v6 both reported (continuation)
+	{"maps_session.go", "SessionCount", "map", `"sessions"`, "optional"}, // leg: v4 AND v6 both reported (continuation)
 	{"maps_session.go", "SessionCount", "map", `"sessions_v6"`, "optional"},
 	{"maps_session.go", "SetSessionV4", "map", `"sessions"`, "required"},
 	{"maps_session.go", "SetSessionV6", "map", `"sessions_v6"`, "required"},
@@ -1215,17 +1224,17 @@ var registryCallsiteManifest = []registryCallsiteManifestEntry{
 	{"maps_stale.go", "DeleteStaleDNATStaticV6", "map", `"dnat_table_v6"`, "optional"},
 	{"maps_stale.go", "DeleteStaleIfaceFilter", "map", `"iface_filter_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleIfaceZone", "map", `"iface_zone_map"`, "optional"},
-	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_configs"`, "optional"},      // leg: multi-map stale cleanups process ALL maps (continuation)
+	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_configs"`, "optional"}, // leg: multi-map stale cleanups process ALL maps (continuation)
 	{"maps_stale.go", "DeleteStaleNAT64", "map", `"nat64_prefix_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleNPTv6", "map", `"nptv6_rules"`, "optional"},
 	{"maps_stale.go", "DeleteStaleSNATRules", "map", `"snat_rules"`, "optional"},
 	{"maps_stale.go", "DeleteStaleSNATRulesV6", "map", `"snat_rules_v6"`, "optional"},
-	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v4"`, "optional"},  // (same continuation pattern)
+	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v4"`, "optional"}, // (same continuation pattern)
 	{"maps_stale.go", "DeleteStaleStaticNAT", "map", `"static_nat_v6"`, "optional"},
 	{"maps_stale.go", "DeleteStaleVlanIface", "map", `"vlan_iface_map"`, "optional"},
 	{"maps_stale.go", "DeleteStaleZonePairPolicies", "map", `"zone_pair_policies"`, "optional"},
 	{"maps_stale.go", "ZeroStaleFilterConfigs", "map", `"filter_configs"`, "optional"},
-	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_configs"`, "optional"},   // (same)
+	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_configs"`, "optional"}, // (same)
 	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_ips_v4"`, "optional"},
 	{"maps_stale.go", "ZeroStaleNATPoolConfigs", "map", `"nat_pool_ips_v6"`, "optional"},
 	{"maps_stale.go", "ZeroStaleScreenConfigs", "map", `"screen_configs"`, "optional"},
@@ -1323,8 +1332,32 @@ func collectRegistryGatedCallsites(t *testing.T, root string) map[string]bool {
 }
 
 type gatedEvidence struct {
-	bound    bool   // third result bound non-blank
-	compared bool   // that identifier compared against registryFresh in-body
+	bound bool // third result bound non-blank
+	// compared: that identifier is the EQL operand of an `if` condition
+	// against registryFresh whose body returns (r4-F3 — a bare comparison
+	// expression or an empty if body is not a gate).
+	compared bool
+}
+
+// blockReturns reports whether blk contains a return statement at any
+// depth outside a nested function literal. It is the "this if actually
+// rejects the call" half of the gate-shape check (r4-F3).
+func blockReturns(blk *ast.BlockStmt) bool {
+	if blk == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(blk, func(n ast.Node) bool {
+		switch n.(type) {
+		case *ast.FuncLit:
+			return false // a return inside a closure returns from the closure
+		case *ast.ReturnStmt:
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func gatedCallsiteEvidence(t *testing.T, root string) map[string]gatedEvidence {
@@ -1447,31 +1480,46 @@ func gatedCallsiteEvidence(t *testing.T, root string) map[string]gatedEvidence {
 								// nested closure — a comparison anywhere
 								// else in the function must not satisfy the
 								// gate evidence for this callsite.
+								// Codex PR #6743 r4-F3: the comparison must be
+								// the CONDITION of an if whose body RETURNS.
+								// Matching a bare *ast.BinaryExpr accepted an
+								// inert `_ = st == registryFresh` and an
+								// `if st == registryFresh {}` with an empty
+								// body — both of which read as a gate to this
+								// collector while admitting the call.
 								ast.Inspect(g.body, func(n3 ast.Node) bool {
 									switch node := n3.(type) {
 									case *ast.FuncLit:
 										return false // comparisons inside closures do not count
-									case *ast.BinaryExpr:
-										if node.Pos() <= as.Pos() {
+									case *ast.IfStmt:
+										cond, ok := node.Cond.(*ast.BinaryExpr)
+										if !ok {
+											return true
+										}
+										if cond.Pos() <= as.Pos() {
 											return true // must come after the binding
 										}
-										if reassignPos != token.NoPos && node.Pos() >= reassignPos {
+										if reassignPos != token.NoPos && cond.Pos() >= reassignPos {
 											return true // past the reassignment: evaluates a later value (r3-4)
 										}
-										if node.Op != token.EQL {
+										if cond.Op != token.EQL {
 											return true
 										}
 										var leftName, rightName string
-										if id, ok := node.X.(*ast.Ident); ok {
+										if id, ok := cond.X.(*ast.Ident); ok {
 											leftName = id.Name
 										}
-										if id, ok := node.Y.(*ast.Ident); ok {
+										if id, ok := cond.Y.(*ast.Ident); ok {
 											rightName = id.Name
 										}
-										if (leftName == boundName && rightName == "registryFresh") ||
-											(leftName == "registryFresh" && rightName == boundName) {
-											ev.compared = true
+										if (leftName != boundName || rightName != "registryFresh") &&
+											(leftName != "registryFresh" || rightName != boundName) {
+											return true
 										}
+										if !blockReturns(node.Body) {
+											return true // an empty / fall-through body is not a gate
+										}
+										ev.compared = true
 									}
 									return true
 								})
@@ -1555,6 +1603,33 @@ func (m *Manager) blank(name string) error {
 	return nil
 }
 `
+	// Codex PR #6743 r4-F3 negatives: the two shapes that read as a gate
+	// to a bare-comparison matcher but admit the call anyway.
+	inertCompare := `package dataplane
+
+func (m *Manager) inertBad(name string) error {
+	zm, present, st := m.lookupMapLocked(name)
+	_ = st == registryFresh // evaluated and thrown away — not a gate
+	if !present {
+		return nil
+	}
+	_ = zm
+	return nil
+}
+`
+	emptyIfCompare := `package dataplane
+
+func (m *Manager) emptyIfBad(name string) error {
+	zm, present, st := m.lookupMapLocked(name)
+	if st == registryFresh {
+	}
+	if !present {
+		return nil
+	}
+	_ = zm
+	return nil
+}
+`
 	crossCredit := `package dataplane
 
 func (m *Manager) reused(name string) error {
@@ -1587,6 +1662,8 @@ func (m *Manager) reused(name string) error {
 	write("d.go", closureCompare)
 	write("e.go", earlyCompare)
 	write("f.go", crossCredit)
+	write("g.go", inertCompare)
+	write("h.go", emptyIfCompare)
 
 	ev := gatedCallsiteEvidence(t, dir)
 	if got := ev["a.go|good|map|<ident:name>"].bound && ev["a.go|good|map|<ident:name>"].compared; !got {
@@ -1618,6 +1695,17 @@ func (m *Manager) reused(name string) error {
 	}
 	if got := ev[`f.go|reused|map|"nat_pool_ips_v6"`]; !got.compared {
 		t.Error("the second callsite's own comparison must still count")
+	}
+	// Codex PR #6743 r4-F3 negatives: a comparison that is not an if
+	// condition, and an if whose body does not reject, are NOT gates.
+	if got := ev["g.go|inertBad|map|<ident:name>"]; got.compared {
+		t.Error("an inert `_ = st == registryFresh` must not count as gate evidence")
+	}
+	if got := ev["g.go|inertBad|map|<ident:name>"]; !got.bound {
+		t.Error("the inert fixture should still register the non-blank binding")
+	}
+	if got := ev["h.go|emptyIfBad|map|<ident:name>"]; got.compared {
+		t.Error("an `if st == registryFresh {}` with an empty body must not count as gate evidence")
 	}
 }
 

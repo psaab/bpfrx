@@ -377,11 +377,24 @@ func (m *Manager) clearPolicyCountersRaw() error {
 	return clearPolicyCountersIn(zm)
 }
 
+// clearPolicyCountersIn zeroes every policy_counters slot.
+//
+// #2114 (Codex PR #6743 r4-F2): the Update error is PROPAGATED. It used
+// to be discarded, so `clear security policies statistics` reported
+// success even when not one slot was actually zeroed — the operator's
+// only feedback that the clear landed was a message that could not
+// fail. The bound is exact: policy_counters is a PERCPU_ARRAY of
+// MAX_POLICIES == 4096 entries (bpf/headers/xpf_maps.h,
+// bpf/headers/xpf_common.h:151), so every index below is in range on an
+// armed map and this cannot turn a working clear into an error. Matches
+// clearInterfaceCountersIn, which already returned its Update error.
 func clearPolicyCountersIn(zm *ebpf.Map) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
 	for i := uint32(0); i < 4096; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
+		if err := zm.Update(i, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear policy_counters %d: %w", i, err)
+		}
 	}
 	return nil
 }

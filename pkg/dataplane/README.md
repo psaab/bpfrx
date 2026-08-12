@@ -560,7 +560,7 @@ The gate predicate is TWO-STATE on the unarmed side:
   `TestManagerTeardownClearsLinkMembership` pins both polarities.
 
 Enforcement (all in `armed_gate_matrix_test.go` /
-`armed_gate_legs_test.go`): the 157-method class manifest is
+`armed_gate_legs_test.go`): the 159-method class manifest is
 AST-verified for totality; the registry canary fails the build on any
 raw `m.maps`/`m.programs` access outside the two helpers + the
 publisher, with negatives covering package-wide/chained/pointer type

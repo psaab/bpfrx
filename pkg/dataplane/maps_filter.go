@@ -173,11 +173,22 @@ func (m *Manager) clearFilterCountersRaw() error {
 	return clearFilterCountersIn(zm)
 }
 
+// clearFilterCountersIn zeroes every filter_counters slot.
+//
+// #2114 (Codex PR #6743 r4-F2): the Update error is PROPAGATED, for the
+// same reason as clearPolicyCountersIn — a discarded error made
+// `clear firewall counters` unconditionally report success. The bound is
+// exact: MaxFilterRules (pkg/dataplane/types.go) == MAX_FILTER_RULES ==
+// 512 (bpf/headers/xpf_common.h:710), which is filter_counters'
+// max_entries (bpf/headers/xpf_maps.h), so no index below can be out of
+// range on an armed map.
 func clearFilterCountersIn(zm *ebpf.Map) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)
 	for i := uint32(0); i < MaxFilterRules; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
+		if err := zm.Update(i, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear filter_counters %d: %w", i, err)
+		}
 	}
 	return nil
 }

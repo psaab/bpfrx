@@ -80,12 +80,24 @@ type Daemon struct {
 	// dpCell is the #2114 single synchronized publication point for the
 	// runtime dataplane. A nil cell means no dataplane (NoDataplane mode,
 	// a retired-backend construction failure, or an arm-failure
-	// teardown). Every reader and writer goes through dataplane() /
+	// teardown). Every ACQUISITION goes through dataplane() /
 	// setDataplane(); the same atomic.Pointer publication idiom as
 	// natPoolAlarm (#2116) below. The plain interface field this replaces
 	// raced the bootstrap-exit `d.dp = nil` writer against the
 	// forwarding-status sampler, the HA watcher chain, and the recovered
 	// commit-confirmed rollback timer (#2114).
+	//
+	// The cell is a PUBLICATION protocol, not a LIFETIME one. It does not
+	// stop an acquired handle from outliving its publication, and it does
+	// not un-publish a backend that Teardown() has detached (the
+	// commit-confirmed rollback deliberately keeps the torn-down object
+	// here so a corrected commit re-arms it — #6741 owns that window).
+	// The three operator-facing management servers therefore receive
+	// liveDataPlane (daemon_dp_live.go), which re-reads this cell per
+	// call, instead of a startup snapshot of the handle; the conntrack
+	// GC, cluster SessionSync, and the userspace event-stream loop stay
+	// deliberate capture-once consumers (rationale in daemon_dp_live.go
+	// and pkg/daemon/README.md).
 	dpCell   atomic.Pointer[dpSlot]
 	networkd *networkd.Manager
 	routing  *routing.Manager

@@ -235,9 +235,19 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 // the backend object was constructed at boot (C1) but never started in
 // bootstrap mode. Split from runBootstrapExitStartup (#2114) so the
 // dataplane-cell race tests can drive the REAL arm/nil-on-failure writer
-// without the netlink/sysctl takeover steps. On a Start failure the cell
-// is cleared and the daemon runs config-only; on success the NAT
+// without the netlink/sysctl takeover steps. On success the NAT
 // port/session seeds run and the #2079 pool-alarm monitor starts.
+//
+// On a Start failure the cell is cleared, so nothing can ACQUIRE the
+// unarmed backend afterwards and the daemon forwards nothing. That is
+// "config-only" for the forwarding path and for every consumer that
+// re-reads the cell — which, since #6743 r4, includes gRPC, REST and the
+// console CLI (they hold liveDataPlane, so the clear makes their
+// dataplane surface report unavailable immediately). It is NOT a claim
+// that every consumer is severed: the conntrack GC, cluster SessionSync
+// and the userspace event-stream loop were wired from a handle taken
+// before this point and keep it (daemon_dp_live.go documents why), so
+// their loops run until their own contexts end.
 func (d *Daemon) armBootstrapExitDataplane(nodeID int) {
 	// #2114: ONE snapshot feeds the nil-check, Start, and the seeder
 	// (plan §5.3 rule 3); the cell is cleared only on the failure branch.

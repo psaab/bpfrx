@@ -609,16 +609,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start interactive CLI or block in daemon mode
 	var runErr error
 	if isInteractive() {
-		// The published dataplane is asserted against the local cliDataPlane probe
+		// #2114 (r4): the LIVE indirection — cli.New stores dp on the CLI for
+		// the console session's lifetime, so a startup snapshot outlived every
+		// setDataplane(nil) and the console kept clearing counters on a
+		// disowned backend. liveDataPlane (daemon_dp_live.go) re-reads the cell
+		// per call and satisfies the local cliDataPlane probe
 		// (runtime_probes.go) — structurally identical to pkg/cli's
-		// package-private cliRuntime (pkg/cli/runtime.go, #1517).
-		// Go duck-types the assignment to cli.New's dp parameter at
-		// this site; signature drift surfaces as a compile error.
+		// package-private cliRuntime (pkg/cli/runtime.go, #1517). Go duck-types
+		// the assignment to cli.New's dp parameter at this site; signature
+		// drift surfaces as a compile error.
 		var cliDP cliDataPlane
-		if rt := d.dataplane(); rt != nil {
-			if probe, ok := rt.(cliDataPlane); ok {
-				cliDP = probe
-			}
+		if live, ok := d.liveDataplane(); ok {
+			cliDP = live
 		}
 		shell := cli.New(d.store, cliDP, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)

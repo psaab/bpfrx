@@ -13,11 +13,30 @@ import (
 // #2114: the runtime dataplane is published ONLY through the dpCell
 // atomic.Pointer, and the cell is touched ONLY by the dataplane() /
 // setDataplane() accessor pair (plus the Daemon struct field declaration).
-// A package-local bypass — a new direct d.dpCell.Load()/Store() outside
-// the accessors — would reintroduce an unsynchronized publication path
-// with none of the §5.3 snapshot-boundary discipline, so it fails the
-// build here the same way the retirement-boundary canary fails a legacy
-// eBPF reference (pkg/dataplane/retirement_boundary_canary_test.go).
+//
+// Codex PR #6743 r4-F5: a direct d.dpCell.Load()/Store() outside the
+// accessors is NOT "unsynchronized" — atomic operations are synchronized
+// by definition, and that was the wrong reason to forbid them. The real
+// reasons are that a raw Store bypasses setDataplane's kind-gated
+// typed-nil normalization (publishing a non-nil interface wrapping a nil
+// value), and a raw Load bypasses the §5.3 snapshot-boundary discipline
+// that keeps one publication view per tick/callback/block. Either failure
+// is silent at runtime, so it fails the build here the same way the
+// retirement-boundary canary fails a legacy eBPF reference
+// (pkg/dataplane/retirement_boundary_canary_test.go).
+//
+// This canary is a SYNTACTIC fence over the accessor boundary, and it
+// matches on the `.dpCell` SELECTOR — so it is deliberately blind to a
+// re-added plain `dp dataplane.RuntimeDataPlane` field, which has no such
+// selector at all. That case is covered by checkDaemonDPFieldShape
+// (pkg/dataplane/retirement_boundary_canary_test.go), which parses the
+// real pkg/daemon/daemon.go and rejects both a missing
+// `dpCell atomic.Pointer[dpSlot]` and any raw RuntimeDataPlane field.
+//
+// It also says nothing about what happens to a handle once dataplane()
+// has returned it — that is the escape question, guarded behaviourally in
+// daemon_dp_escape_test.go / daemon_dp_escape_rest_test.go and
+// syntactically in daemon_dp_escape_canary_test.go.
 
 // dpCellAccessorFuncs names the ONLY functions permitted to reference the
 // dpCell field selector.
