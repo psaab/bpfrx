@@ -17,10 +17,12 @@ import (
 // see a rename. Misspell a name and every one of them stays green while the
 // series silently disappears from the scrape.
 //
-// Matching is on `fqName: "..."` rather than a bare substring, because
-// `Desc.String()` also embeds the HELP text — a bare `strings.Contains` would
-// match a name that merely appears in another metric's help string and report
-// a rename as present.
+// The fqName is EXTRACTED and compared with `!=`, not matched as a substring.
+// `Desc.String()` renders as `Desc{fqName: "...", help: "...", ...}` and the
+// help text of these metrics cross-references sibling metric names, so ANY
+// `strings.Contains` shape can be satisfied by a name appearing in a
+// neighbour's prose rather than by the metric under test actually carrying it.
+// Extraction has no substring semantics to abuse.
 //
 // RED on revert: change any name literal in metrics_descriptors_worker.go,
 // metrics_descriptors_nat.go or metrics_descriptors_userspace_session.go and
@@ -53,12 +55,35 @@ func TestNewFlowContentionMetricNamesAreStable_4800(t *testing.T) {
 			t.Errorf("%s: descriptor is nil — it is not initialised by newCollector", tc.want)
 			continue
 		}
-		marker := fmt.Sprintf("fqName: %q", tc.want)
-		if !strings.Contains(tc.desc.String(), marker) {
-			t.Errorf("metric %q is not exposed under that name; the descriptor "+
-				"reads %s. Renaming a series breaks the analyzer scrape and every "+
-				"dashboard built on it, with no error at runtime — the series just "+
-				"stops existing", tc.want, tc.desc.String())
+		got, ok := fqNameOf(tc.desc.String())
+		if !ok {
+			t.Errorf("%s: could not extract fqName from %s — the Desc rendering "+
+				"changed and this guard is no longer reading what it thinks",
+				tc.want, tc.desc.String())
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("metric is exposed as %q, want %q. Renaming a series breaks "+
+				"the analyzer scrape and every dashboard built on it, with no "+
+				"error at runtime — the series just stops existing", got, tc.want)
 		}
 	}
+}
+
+// fqNameOf extracts the fqName from a `Desc.String()` rendering
+// (`Desc{fqName: "...", help: "...", ...}`), returning ok=false if the
+// rendering does not have that shape. Extraction rather than substring
+// matching is the whole point: it cannot be satisfied by help-text prose.
+func fqNameOf(desc string) (string, bool) {
+	const open = `fqName: "`
+	i := strings.Index(desc, open)
+	if i < 0 {
+		return "", false
+	}
+	rest := desc[i+len(open):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return "", false
+	}
+	return rest[:j], true
 }

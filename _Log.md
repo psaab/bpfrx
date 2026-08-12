@@ -71180,3 +71180,43 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   STRUCTURALLY: header count 1512 + 2 new = 1514, and the one-header-one-
   Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
   and 226 after the union — the resolve introduced none.
+
+## 2026-08-12 — #4800 fold r5: exact fqName extraction + the open seam named
+
+- **Timestamp**: 2026-08-12
+- **Action**: Replace the metric-name guard's `strings.Contains` on
+  `Desc.String()` with EXACT fqName extraction, and record the both-sides wire
+  parity check plus the precise identity of the one seam still open.
+
+  The `Contains` shape was anchored on `fqName: "..."` and so could not match
+  help text, but `Desc.String()` renders `Desc{fqName: "...", help: "...", ...}`
+  and these metrics' help strings cross-reference sibling metric NAMES — so any
+  substring shape is one careless edit away from being satisfiable by a
+  neighbour's prose. `fqNameOf` now parses the value out and compares with
+  `!=`; there is no substring semantics left to abuse.
+
+  Wire parity, both sides, all 11 `#4800` fields: every Go `json:` tag has a
+  matching Rust `serde(rename = ...)` — 8 in `protocol/control.rs`,
+  `new_flow_installs` in `protocol/binding.rs`, and the two `live_lock_*` in
+  `protocol/nat.rs` — and every one appears as a key in the hand-written
+  decode fixture. This closes the risk flagged in r4 (the fixture keys had
+  been derived from the Go tags alone, never diffed against the Rust side).
+- **File(s)**: pkg/api/metrics_newflow_names_4800_test.go, _Log.md
+- **Validation**: Single-line production edit
+  `metrics_descriptors_worker.go`: `"xpf_userspace_worker_new_flow_installs_total"`
+  -> `"xpf_userspace_worker_new_flow_install_total"` REDs at
+  `metric is exposed as "xpf_userspace_worker_new_flow_install_total", want
+  "xpf_userspace_worker_new_flow_installs_total"`. Full cargo `--release` green
+  (4271 unit + 6 integration binaries) after merging the rebased branch;
+  `go build ./...` 0; `go test ./pkg/api/... ./pkg/dataplane/userspace/...` 0.
+
+  STILL OPEN — `worker/loop_body/mod.rs:481`, the sole live call to
+  `refresh_worker_new_flow_install_counters`. RUNTIME (counting), and it is
+  the CALL SITE that is unbound, not the callee: the callee is bound by
+  `refresh_worker_new_flow_install_counters_sums_across_bindings`. Deleting the
+  call leaves the per-worker wire field pinned at 0, which silently disables
+  BOTH cross-worker analyzer gates. NOT introduced by #4800: its immediate
+  sibling one line above, `refresh_worker_cos_queue_lease_runtime_counters`
+  (#1782), is unbound in exactly the same way, and `worker_loop` is called only
+  from `coordinator/reconcile/bringup.rs` — no test drives it. Binding it means
+  a worker-loop harness that would cover both refreshers.
