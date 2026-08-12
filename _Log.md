@@ -71993,3 +71993,43 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   was inspected, so an early exit on a failing leg could not skip the restore.
   `git status` clean afterwards.
 - **File(s)**: pkg/cluster/heartbeat_epoch.go, _Log.md
+
+## 2026-08-12 — #6669 r18: finding 2 disclosure + the modularity gate I tripped
+
+- **Timestamp**: 2026-08-12
+- **Action**: Two items, and the second is a correction to my own previous
+  commit.
+
+  **Finding 2 — disclosure widened (comment + README, no behavioural change).**
+  Determined by measurement, not assertion: master has no `admitAuthed` at all,
+  so an archived current-key frame with an unseen session is admitted by the
+  bare replay ring there too, and
+  `TestHeartbeatRestartStillAcceptsGenuinePeer_5086` REQUIRES that (a genuine
+  peer reboot must be accepted). The mechanic is therefore PRE-EXISTING, not
+  introduced by #6169, and the epoch floor strictly improves on master once
+  armed. What the existing comment disclosed was only the LATCH half. Codex's
+  finding names the other half: the same archived frame is ADMITTED, so
+  `admitFrame` refreshes `lastSeen` and calls `handlePeerHeartbeat` — a DEAD
+  peer looks alive for as long as the replay continues, and that liveness feeds
+  election. Both the arming-site comment and README's residual list now say so,
+  and say plainly that the paragraph above them covers the latch only.
+
+  **The modularity gate: I tripped it and did not notice.** `heartbeat.go` was
+  at 1988/2000 before this round; the finding-8 limiter took it to **2050**,
+  over the hard gate, and I committed that without re-measuring — the sibling
+  lane had flagged the headroom and I did not act on it before landing. Two
+  extractions restore compliance, both single-concern cuts that are right
+  independently of the line count:
+    - `heartbeat_reject_warn.go` (59 lines) — the rate limiter added this round;
+    - `heartbeat_epoch_admit.go` (426 lines) — `admitAuthed` +
+      `epochSessionAdmissible` + `bindEpochSession` and their rationale. This is
+      the epoch DECISION; heartbeat.go keeps the wire format and the
+      sender/receiver lifecycle. Nothing in the extracted file touches sockets.
+  `heartbeat.go` is now **1595** and `scripts/refactoring-audit.sh` reports
+  `[WATCH] 1595` rather than `[REFACTOR]`.
+
+  **Validation.** `go build ./...` 0; `go test -count=1 ./pkg/cluster/...` 0
+  (`ok 15.492s`); `gofmt -l pkg/cluster/` clean; refactoring audit clean.
+- **File(s)**: pkg/cluster/heartbeat.go,
+  pkg/cluster/heartbeat_epoch_admit.go (new),
+  pkg/cluster/heartbeat_reject_warn.go (new), pkg/cluster/README.md, _Log.md

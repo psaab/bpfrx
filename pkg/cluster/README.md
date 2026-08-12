@@ -1022,6 +1022,17 @@ peer liveness (`lastSeen`) or drive election.
         fired per frame, so a 10/s epochless stream produced ~10 warnings a
         second — the sentence promised a rate limit the noisy line did not
         have;
+      - the archived-frame replay that re-arms the latch is ALSO admitted, so
+        it refreshes `lastSeen` and feeds `handlePeerHeartbeat`: a peer that is
+        DEAD looks alive for as long as the replay continues, and that liveness
+        feeds election. One frame per dead-peer interval sustains it. This is
+        NOT introduced by #6169 — master has no epoch gate at all, so the bare
+        replay ring admits the same frame after the same receiver restart, and
+        `TestHeartbeatRestartStillAcceptsGenuinePeer_5086` REQUIRES that (a
+        genuine peer reboot must be accepted). The epoch floor strictly
+        improves on master once armed and does not close the post-restart
+        window. The recovery below retires it by the same mechanism as the
+        latch half, because it is the same replay;
       - **recovery, in this order:** rotate the control-link PSK on BOTH nodes,
         *then* `systemctl restart xpfd` on the node that is refusing. The latch
         is process-scoped, so the restart brings it back unlatched and it
