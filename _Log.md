@@ -101,6 +101,121 @@
   pkg/networkd/README.md, pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
   _Log.md
 ## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
+## 2026-08-12 — #6673 round 10: quote provenance was inferred from token TEXT, fusing two authored members into one applicable command
+
+- **Timestamp**: 2026-08-12 (fold/6673-quote-provenance, PR #6673)
+- **Action**: F1 — carry quote provenance STRUCTURALLY through the AST instead
+  of re-deriving it from token text; F2 — bind it at the compiler, the runtime
+  consumer and the production wiring, with three scoped mutation proofs; F3 —
+  publish the six-family / seven-read-site inventory the four-row category
+  table was being mistaken for.
+- **File(s)**: pkg/config/ast.go, pkg/config/ast_edit.go,
+  pkg/config/ast_format.go, pkg/config/ast_groups.go, pkg/config/inactive.go,
+  pkg/config/parser.go, pkg/config/compiler_services.go,
+  pkg/configstore/store_command.go, docs/config-schema.md,
+  pkg/config/event_quote_provenance_6673_test.go,
+  pkg/eventengine/quote_provenance_runtime_6673_test.go,
+  pkg/configstore/quote_provenance_wiring_6673_test.go, _Log.md
+
+F1 — the defect. `eventMultiWordLeafValues` decided "was the first list member
+QUOTED?" by inspecting the member's TEXT: a space, or emptiness. That is an
+implication in ONE direction only — every space-bearing token was quoted, but a
+quoted token need not bear a space. A quoted one-word first member carries
+neither marker, so measured at the PR head:
+
+    ["set", "system host-name pwned"] -> ["set system host-name pwned"]  n=1
+
+The two authored members FUSED into a syntactically perfect command.
+`eventengine.classifyPlan` requires each member to start `set ` or `delete `; the
+bare `set` the operator actually wrote fails that check and rejects the WHOLE
+batch, which is the fail-closed behaviour the function's own 45-line rationale
+promises. The fused string passes it, parses, and is APPLIED — a config change
+nobody authored. The rationale's "Residual, deliberately not chased" paragraph
+covered only the ALL-bare-words case, not a quoted one-word FIRST member.
+
+The fix carries the bit structurally rather than refining the guess, because no
+text test can separate the two authorings — their tokens are byte-identical.
+`Node.KeysQuoted []bool` records per-key provenance; `parseKeys` already computed
+the token KINDS for the #4348 `inactive:` marker, so the hierarchical spelling
+only had to stop discarding them. The flat-set spelling gained
+`ParseSetVerbQuoted`/`ParseSetCommandQuoted` -> `ConfigTree.SetPathQuoted`, wired
+into `Store.SetFromInputAs` (every operator `set` from CLI, gRPC and REST) and
+`applyEditLine` (LoadSet / display-set replay). `SetPath`/`SetAs` keep their
+signatures and delegate with nil, so all 512 existing SetPath call sites are
+untouched.
+
+Serialization is the other half. HA config sync ships TEXT (`Store.SyncApply`
+takes a string), and `quoteKey` normalizes `"set"` back to a bare `set` because
+it is bare-safe — so without a render-side change the peer would re-parse the
+list as one fused command and the fail-open would simply move across the wire.
+`keyNeedsAuthoredQuote` re-emits the authored quote for NON-TERMINAL keys only.
+That is not a heuristic: the grouping decision reads the first token of a group
+of two or more, and that token is always non-terminal, so preserving non-terminal
+quotes is exactly sufficient — a trailing bare-safe key still normalizes to bare
+and `show configuration` output is unchanged everywhere else (full Go suite, zero
+failures). Provenance is also preserved across `stripInactiveNodes` (which
+produces the tree the compiler actually reads), `cloneNodes`, the multi-leaf
+member drop, and the apply-groups leaf-list union; `CopyPath`/`RenamePath` clear
+it, because the node takes a new identity there.
+
+Two residuals are stated in the code comment and the doc, not left implied. An
+ALL-BARE group (`[ seta setb ]`) still joins — provenance cannot help, since
+both authorings have zero quoted tokens and the AST does not record brackets. A
+tree that arrives with NO provenance (compiler synthesis, or a config DB written
+before this change) falls back to the old text rule; assuming all-bare would be a
+false claim in the fail-open direction, and assuming all-quoted would split
+`commands set system host-name "foo bar"` and break a working remediation across
+an upgrade. The fallback is not a second guess: for a group with no quoted token
+the two rules agree, since a bare word can be neither empty nor space-bearing —
+which is also why an all-false mask collapses to nil and the persisted JSON stays
+byte-identical for the majority of nodes.
+
+An unrelated latent bug surfaced while wiring this: `parseStatement`'s INLINE
+`inactive:` branch truncated `keys` but not `kinds`, leaving the two slices at
+different lengths for every statement carrying an inline marker. Invisible while
+`kinds` was only indexed against `keys`, but it panicked the moment a per-key
+slice was derived from it. Both slices are now re-sliced together.
+
+F2 — three mutations, three distinct RED signatures, each scoped to the belt it
+severs, all run with `-run 6673` after confirming the pattern actually selects
+the new tests (a `-run Provenance6673` typo first produced a vacuous 0.005s
+"ok"):
+
+  - revert `eventMultiWordLeafValues` to the text rule -> 8 named failures across
+    pkg/config (hierarchical AND flat-set arms, plus attributes-match),
+    pkg/eventengine (`ok = true, want false`) and pkg/configstore.
+  - `keyNeedsAuthoredQuote` -> false -> ONLY the round-trip test reds, on
+    exactly the three ambiguous authorings; the five controls and the direct-read
+    tests stay green. eventengine and configstore stay green.
+  - `SetFromInputAs`/`applyEditLine` drop provenance -> ONLY the two configstore
+    wiring tests red; pkg/config and pkg/eventengine stay green.
+
+The wiring test exists because a fix applied to `SetPathQuoted` alone still
+passes every pkg/config test — plain `SetPath` records nothing, so a test written
+against it is evaluated under the legacy rule and passes with the defect present.
+The tests therefore drive the same entry points production uses.
+
+F3 — the inventory. The empty-value category table has FOUR rows and was being
+read as the coverage list; it classifies empty-value SEMANTICS and its `Reader`
+column names four mechanisms because two of them serve two leaves each. The real
+inventory is SIX leaf families over SEVEN read sites: `security flow traceoptions
+flag` is read twice, once by `compileFlow` and once by the #3422 commit gate
+`validateFlowTraceFlagsAndFiltersAST`, and widening one without the other would
+leave the gate and the compiler disagreeing about which values exist. All seven
+were verified to accumulate both AST sides at this head. The leaves still read
+one-sided are unchanged and already filed: #6697 (CoS code-points), #6692
+(system archival + four siblings), #6687 (vlan-id-list), #6714 (nested-bracket
+tails, proxy-ARP after a range, repeated `commands`). Both tables are now in
+docs/config-schema.md so the next audit counts read sites rather than rows.
+
+Validation: `go build ./...` rc=0, `go vet` on the three packages rc=0, the
+specified gate `go test ./pkg/config/... ./pkg/eventengine/...` rc=0, and the
+FULL `go test ./...` rc=0 with zero failures — the render change touches every
+`show configuration` path, so the whole suite is the honest scope for it. No
+cluster tooling run; this change is control-plane only and ships no dataplane
+artifact.
+
+## 2026-08-01 — #6673 round 8: an invented rejection for a repeated identical prefix, and two rule-dropping checks that never marked the rule
 
 - **Timestamp**: 2026-08-12 (fold/6861-ipip-r6, PR #6861)
 - **Action**: fixed the one runtime blocker (the ID-collision arm of the live

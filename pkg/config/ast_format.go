@@ -172,7 +172,7 @@ func (t *ConfigTree) FormatPath(path []string) string {
 // FormatSet renders the tree as flat "set" commands.
 func (t *ConfigTree) FormatSet() string {
 	var b strings.Builder
-	formatSetNodes(&b, t.Children, nil)
+	formatSetNodes(&b, t.Children, nil, nil)
 	return b.String()
 }
 
@@ -200,14 +200,17 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 	parentPrefix := append([]string(nil), path[:len(path)-width]...)
 	var b strings.Builder
 	for _, n := range matches {
-		prefix := append(append([]string{}, parentPrefix...), n.Keys...)
+		// The ancestor prefix is reconstructed from the REQUESTED path, not
+		// walked, so no node is available to source its quote provenance from;
+		// only the matched node's own keys carry a mask (#6673).
+		prefix, prefixQuote := appendNodeKeys(parentPrefix, nil, n)
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "set %s\n", joinQuotedKeys(prefix))
+			fmt.Fprintf(&b, "set %s\n", joinQuotedKeysProv(prefix, prefixQuote))
 		} else {
-			formatSetNodes(&b, n.Children, prefix)
+			formatSetNodes(&b, n.Children, prefix, prefixQuote)
 		}
 		if n.Inactive {
-			fmt.Fprintf(&b, "deactivate %s\n", joinQuotedKeys(prefix))
+			fmt.Fprintf(&b, "deactivate %s\n", joinQuotedKeysProv(prefix, prefixQuote))
 		}
 	}
 	return b.String()
@@ -219,27 +222,58 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 // models deactivation as the separate `deactivate` verb rather than an
 // inline token. Loading such output replays the `set` then the
 // `deactivate`, restoring the Inactive flag.
-func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
+func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string, prefixQuote []bool) {
 	for _, n := range canonicalOrder(nodes) {
-		path := append(append([]string(nil), prefix...), n.Keys...)
+		path, pathQuote := appendNodeKeys(prefix, prefixQuote, n)
 		if n.IsLeaf {
-			fmt.Fprintf(b, "set %s\n", joinQuotedKeys(path))
+			fmt.Fprintf(b, "set %s\n", joinQuotedKeysProv(path, pathQuote))
 		} else {
-			formatSetNodes(b, n.Children, path)
+			formatSetNodes(b, n.Children, path, pathQuote)
 		}
 		if n.Inactive {
-			fmt.Fprintf(b, "deactivate %s\n", joinQuotedKeys(path))
+			fmt.Fprintf(b, "deactivate %s\n", joinQuotedKeysProv(path, pathQuote))
 		}
 	}
 }
 
 // joinQuotedKeys joins keys with spaces, quoting any that contain special characters.
 func joinQuotedKeys(keys []string) string {
+	return joinQuotedKeysProv(keys, nil)
+}
+
+// joinQuotedKeysProv is joinQuotedKeys with per-key AUTHORED-quote provenance
+// (#6673): where forceQuote[i] is true the key is emitted quoted even though
+// its bare text would read back as the same key, because dropping the quotes
+// would lose the value GROUPING (see keyNeedsAuthoredQuote). forceQuote may be
+// nil or short — a missing entry means "quote only if quoteKey says so", which
+// is exactly the pre-#6673 rendering.
+func joinQuotedKeysProv(keys []string, forceQuote []bool) string {
 	parts := make([]string, len(keys))
 	for i, k := range keys {
+		if i < len(forceQuote) && forceQuote[i] {
+			parts[i] = `"` + keyEscaper.Replace(k) + `"`
+			continue
+		}
 		parts[i] = quoteKey(k)
 	}
 	return strings.Join(parts, " ")
+}
+
+// appendNodeKeys extends a flat display-set path (and its parallel
+// authored-quote mask) with one node's keys. The mask is computed with the
+// SAME per-node rule the hierarchical renderer uses (keyNeedsAuthoredQuote), so
+// `show configuration` and `show | display set` re-emit an authored quote in
+// exactly the same positions and the two renderings stay mutually replayable.
+// forceQuote is normalized to len(path) first so a caller may pass nil (or a
+// stale short mask) without silently shifting every subsequent key's flag.
+func appendNodeKeys(path []string, forceQuote []bool, n *Node) ([]string, []bool) {
+	outPath := append(append([]string(nil), path...), n.Keys...)
+	outQuote := make([]bool, len(path), len(outPath))
+	copy(outQuote, forceQuote)
+	for i := range n.Keys {
+		outQuote = append(outQuote, keyNeedsAuthoredQuote(n, i))
+	}
+	return outPath, outQuote
 }
 
 // FormatCompare produces a Junos-style hierarchical diff between two trees.

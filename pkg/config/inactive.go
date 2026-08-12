@@ -105,7 +105,11 @@ func stripInactiveNodes(nodes []*Node) []*Node {
 			continue
 		}
 		clone := &Node{
-			Keys:          append([]string(nil), n.Keys...),
+			Keys: append([]string(nil), n.Keys...),
+			// #6673: WithoutInactive runs on the cloned tree BEFORE compile, so
+			// this is the copy the compiler reads. Dropping the per-key quote
+			// provenance here would blind every reader downstream of it.
+			KeysQuoted:    append([]bool(nil), n.KeysQuoted...),
 			Children:      stripInactiveNodes(n.Children),
 			IsLeaf:        n.IsLeaf,
 			Annotation:    n.Annotation,

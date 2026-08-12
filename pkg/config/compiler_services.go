@@ -1831,7 +1831,7 @@ func eventAttributesMatchExprs(child *Node) []string {
 	if len(child.Children) > 0 {
 		exprs := make([]string, 0, len(child.Children))
 		for _, amChild := range child.Children {
-			exprs = append(exprs, eventMultiWordLeafValues(amChild.Keys)...)
+			exprs = append(exprs, eventMultiWordLeafValues(amChild, 0)...)
 		}
 		return exprs
 	}
@@ -1841,22 +1841,26 @@ func eventAttributesMatchExprs(child *Node) []string {
 	}
 	// Packed leaf or bracket list. A one-token tail is the same either way, so
 	// an authored-but-EMPTY expression still reaches the strict gate.
-	return eventMultiWordLeafValues(child.Keys[1:])
+	return eventMultiWordLeafValues(child, 1)
 }
 
-// eventMultiWordLeafValues splits ONE token group — a node's own Keys tail, or
-// a single child's Keys — into the whole values it carries (#6673 fold).
+// eventMultiWordLeafValues splits ONE token group — a node's own Keys tail
+// (from > 0) or a single child's whole Keys (from == 0) — into the values it
+// carries (#6673 fold).
 //
 // Both event-options leaves in this file (`attributes-match` and `then
 // change-configuration commands`) hold values that are themselves MULTI-WORD
 // strings, so "how many values are in this group" cannot be answered by
 // counting tokens: `[ "set a b" "delete c" ]` is two values in two tokens,
-// while `set system host-name foo` is ONE value in four. The lexer settles it —
-// it never leaves a space INSIDE an unquoted token, so a token carrying a space
-// came from a quoted string, and a quoted string is exactly one authored value.
+// while `set system host-name foo` is ONE value in four. What separates them is
+// which tokens the operator QUOTED, and that is a property of the source
+// TOKEN KIND, not of the token's text — so this reader takes the *Node and
+// consults its recorded provenance (Node.KeysQuoted, populated by parseKeys for
+// the hierarchical spelling and by SetPathQuoted for the flat-set one) rather
+// than re-deriving it from the strings.
 //
-// This must be applied to the CHILDREN as well as the tail, and that is the
-// whole point of hoisting it out of the tail branch. Which of the two places a
+// It is applied to the CHILDREN as well as the tail, and that is the whole
+// point of hoisting it out of the tail branch. Which of the two places a
 // bracketed list lands in depends on WHICH PARSER RAN, not on what the operator
 // wrote. The hierarchical parser collapses `commands [ "a" "b" ];` onto the
 // node's own Keys; ParseSetCommand + SetPath puts the identical list on ONE
@@ -1866,14 +1870,14 @@ func eventAttributesMatchExprs(child *Node) []string {
 // the flat-set spelling fusing every member into one string — see
 // TestEventChangeConfigCommands6659/flat-set_bracket_list.
 //
-// The decision is taken on the FIRST token, not on "any token has a space",
-// because the two ambiguous mixtures pull in OPPOSITE directions and only the
-// first token separates them:
+// The decision is taken on the FIRST token of the group, because the two
+// ambiguous mixtures pull in OPPOSITE directions and only the first token
+// separates them:
 //
 //   - `commands set system host-name "foo bar"` — a quoted VALUE inside an
 //     otherwise bare statement, tokens [set system host-name "foo bar"]. That
-//     is ONE command; an "any token" rule would shatter it into four. The
-//     first token is bare, so: join.
+//     is ONE command; an "any token is quoted" rule would shatter it into four.
+//     The first token is bare, so: join.
 //   - `commands [ "set a b" bogus ]` — a quoted member beside a bare one. That
 //     is a LIST whose second member is garbage; joining would fuse the garbage
 //     onto a valid command and hand eventengine.classifyPlan a plausible-
@@ -1885,25 +1889,65 @@ func eventAttributesMatchExprs(child *Node) []string {
 // A single-token group is identical under both rules, so the choice only ever
 // decides a group of two or more.
 //
-// "The first token was quoted" is evidenced by a space OR by EMPTINESS: the
-// lexer cannot produce an empty bare word either, so `commands [ "" "set a b" ]`
-// is a two-member list whose first member is the authored empty command that
-// TestEventChangeConfigCommands6673EmptyCommandStaysInTheBatch pins. Testing
-// only for a space would join that list into " set a b" — one command with a
-// leading space, which is neither of the two things the operator could have
-// meant.
+// WHY PROVENANCE AND NOT TEXT. The rule this replaced asked whether the first
+// token CONTAINED A SPACE or was EMPTY, on the reasoning that the lexer never
+// leaves a space inside a bare word. That is sound as far as it goes, but it is
+// an implication in one direction only: every space-bearing token was quoted,
+// while a quoted token need not bear a space. A quoted ONE-WORD first member —
+// `commands [ "set" "system host-name pwned" ]` — has neither a space nor
+// emptiness, so it read as bare and the list JOINED into
+// `set system host-name pwned`: a syntactically perfect command that passes
+// classifyPlan's `set ` prefix check, parses, and is APPLIED. The authoring the
+// operator wrote (a bare `set` member) is exactly the one the fail-closed path
+// above exists to reject. No refinement of the text test can fix this, because
+// the two authorings produce byte-identical tokens; only the token kind
+// distinguishes them.
 //
-// Residual, deliberately not chased: a bracket list whose members are ALL
-// single bare-looking words (`[ seta setb ]`) is indistinguishable from one
-// unquoted value and joins. Every well-formed value of both leaves contains a
-// space — a command carries its `set `/`delete ` prefix and an expression
-// carries " matches " — so a group that reaches this case is malformed either
-// way, and joining sends it to the same gate (classifyPlan's prefix check /
-// ValidateEventAttributesMatchStrict) that the split would.
-func eventMultiWordLeafValues(tokens []string) []string {
-	if len(tokens) == 0 {
+// WHEN PROVENANCE IS ABSENT the old text rule is used unchanged, which is a
+// deliberate non-regression rather than a second guess. A node carries no
+// KeysQuoted when it was synthesized by the compiler, or when it was
+// deserialized from a config DB written before this change. Treating "no
+// provenance" as "all bare" would be a false claim in the fail-OPEN direction;
+// treating it as "all quoted" would SPLIT `commands set system host-name
+// "foo bar"` and silently break a working remediation across an upgrade. The
+// text rule is what those trees were already evaluated under, so it is the only
+// answer that changes nothing for them. Note this is not a widening: for a
+// group that genuinely has no quoted token the two rules AGREE by construction,
+// since a bare word can be neither empty nor space-bearing — which is also why
+// setKeysQuoted may collapse an all-false mask to nil without losing anything.
+//
+// Residual, unchanged and deliberately not chased: a bracket list whose members
+// are ALL single bare-looking words (`[ seta setb ]`) is indistinguishable from
+// one unquoted value and joins. Provenance does not help here — both authorings
+// have zero quoted tokens and the AST does not record the brackets themselves.
+// Every well-formed value of both leaves contains a space (a command carries its
+// `set `/`delete ` prefix, an expression carries " matches "), so a group that
+// reaches this case is malformed either way, and joining sends it to the same
+// gate (classifyPlan's prefix check / ValidateEventAttributesMatchStrict) that
+// the split would.
+//
+// Residual, KNOWN AND NARROWER THAN THE ABOVE: a tree that reaches this reader
+// with no provenance is still decided by the text rule, so the fused-member
+// read survives for (a) an event policy authored BEFORE this change and still
+// sitting in the persisted config DB — until the operator re-authors the
+// `commands` line, at which point SetPathQuoted stamps provenance — and (b) any
+// future caller that builds these nodes by hand. The serialize/re-parse paths
+// (HA config sync, `show | display set` replay, load merge, archive) are NOT in
+// this set: keyNeedsAuthoredQuote re-emits the authored quotes that decide the
+// grouping, so a round-tripped tree re-parses with the same provenance it had.
+func eventMultiWordLeafValues(n *Node, from int) []string {
+	if n == nil || from < 0 || from >= len(n.Keys) {
 		return nil
 	}
+	tokens := n.Keys[from:]
+	if n.KeysHaveQuoteProvenance() {
+		if n.KeyQuoted(from) {
+			return append([]string(nil), tokens...)
+		}
+		return []string{strings.Join(tokens, " ")}
+	}
+	// No provenance recorded for this node — fall back to the text rule these
+	// trees were already evaluated under. See "WHEN PROVENANCE IS ABSENT".
 	if tokens[0] == "" || strings.Contains(tokens[0], " ") {
 		return append([]string(nil), tokens...)
 	}
@@ -1973,7 +2017,7 @@ func eventChangeConfigCommands(cmdsNode *Node) []string {
 	if len(cmdsNode.Children) > 0 {
 		cmds := make([]string, 0, len(cmdsNode.Children))
 		for _, cmdChild := range cmdsNode.Children {
-			cmds = append(cmds, eventMultiWordLeafValues(cmdChild.Keys)...)
+			cmds = append(cmds, eventMultiWordLeafValues(cmdChild, 0)...)
 		}
 		return cmds
 	}
@@ -1982,7 +2026,7 @@ func eventChangeConfigCommands(cmdsNode *Node) []string {
 	if len(cmdsNode.Keys) < 2 {
 		return nil
 	}
-	return eventMultiWordLeafValues(cmdsNode.Keys[1:])
+	return eventMultiWordLeafValues(cmdsNode, 1)
 }
 
 func compileEventOptions(node *Node, policies *[]*EventPolicy) error {

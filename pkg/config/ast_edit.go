@@ -72,6 +72,10 @@ func (t *ConfigTree) CopyPath(src, dst []string) error {
 	// stamp the destination keys, and append under the resolved parent.
 	cloned := cloneNodes([]*Node{srcNode})[0]
 	cloned.Keys = newKeys
+	// The copy takes a NEW identity from the destination path, so the source's
+	// per-key quote provenance no longer describes it (#6673). Dropping it is
+	// the honest state — "unknown", never a false "these were bare".
+	cloned.KeysQuoted = nil
 	*dstParent = append(*dstParent, cloned)
 	return nil
 }
@@ -123,6 +127,7 @@ func (t *ConfigTree) RenamePath(src, dst []string) error {
 	if dstParent == srcParent {
 		// Same parent: rename in place, preserving sibling order and children.
 		srcNode.Keys = newKeys
+		srcNode.KeysQuoted = nil // new identity — see CopyPath (#6673)
 		return nil
 	}
 	// Different parent: detach from the source parent and append to the
@@ -134,6 +139,7 @@ func (t *ConfigTree) RenamePath(src, dst []string) error {
 		}
 	}
 	srcNode.Keys = newKeys
+	srcNode.KeysQuoted = nil // new identity — see CopyPath (#6673)
 	*dstParent = append(*dstParent, srcNode)
 	return nil
 }
@@ -247,8 +253,37 @@ func (t *ConfigTree) insertRelative(elementPath, refPath []string, after bool) e
 // which keywords are containers (and how many extra args they consume)
 // versus leaves (all remaining tokens form the leaf's Keys).
 func (t *ConfigTree) SetPath(path []string) error {
+	return t.SetPathQuoted(path, nil)
+}
+
+// SetPathQuoted is SetPath carrying per-token QUOTE PROVENANCE (#6673):
+// quoted[i] reports whether path[i] was authored as a quoted string. Every
+// node this call creates records the provenance of the path tokens that became
+// its keys, so a reader that must tell a bracketed LIST from one multi-word
+// unquoted statement (eventMultiWordLeafValues) is not left guessing from the
+// token text. Pass nil — as plain SetPath does — when the path was synthesized
+// rather than authored; the created nodes then carry no provenance, which is
+// exactly the pre-#6673 state and never a false "this was bare" claim.
+//
+// quoted must be nil or the same length as path; a mismatched length is
+// treated as nil rather than silently misattributing quotes to the wrong
+// tokens.
+func (t *ConfigTree) SetPathQuoted(path []string, quoted []bool) error {
 	if len(path) == 0 {
 		return fmt.Errorf("empty path")
+	}
+	if len(quoted) != len(path) {
+		quoted = nil
+	}
+	// quotedRange returns the provenance for path[from:to] — every node built
+	// below takes its keys from exactly one CONTIGUOUS range of path (the
+	// schema slice, plus any compound-key or trailing-value tokens, which are
+	// consumed in order), so the mask is always this simple sub-slice.
+	quotedRange := func(from, to int) []bool {
+		if quoted == nil || from < 0 || to > len(quoted) || from > to {
+			return nil
+		}
+		return quoted[from:to]
 	}
 
 	current := &t.Children
@@ -257,6 +292,7 @@ func (t *ConfigTree) SetPath(path []string) error {
 
 	for i < len(path) {
 		keyword := path[i]
+		keyStart := i
 
 		// Look up keyword in current schema level.
 		var childSchema *schemaNode
@@ -281,6 +317,7 @@ func (t *ConfigTree) SetPath(path []string) error {
 				Keys:   append([]string(nil), remaining...),
 				IsLeaf: true,
 			}
+			leaf.setKeysQuoted(quotedRange(i, len(path)))
 			*current = append(*current, leaf)
 			return nil
 		}
@@ -293,6 +330,7 @@ func (t *ConfigTree) SetPath(path []string) error {
 				Keys:   append([]string(nil), path[i:]...),
 				IsLeaf: true,
 			}
+			leaf.setKeysQuoted(quotedRange(i, len(path)))
 			*current = append(*current, leaf)
 			return nil
 		}
@@ -323,10 +361,12 @@ func (t *ConfigTree) SetPath(path []string) error {
 				for _, n := range *current {
 					if n.IsLeaf && len(n.Keys) > 0 && n.Keys[0] == nodeKeys[0] {
 						if !replaced {
-							filtered = append(filtered, &Node{
+							repl := &Node{
 								Keys:   append([]string(nil), nodeKeys...),
 								IsLeaf: true,
-							})
+							}
+							repl.setKeysQuoted(quotedRange(keyStart, i))
+							filtered = append(filtered, repl)
 							replaced = true
 						}
 						// skip all duplicate entries
@@ -350,6 +390,7 @@ func (t *ConfigTree) SetPath(path []string) error {
 				Keys:   append([]string(nil), nodeKeys...),
 				IsLeaf: true,
 			}
+			leaf.setKeysQuoted(quotedRange(keyStart, i))
 			*current = append(*current, leaf)
 			return nil
 		}
@@ -425,10 +466,12 @@ func (t *ConfigTree) SetPath(path []string) error {
 					}
 				}
 				if !dup {
-					*current = append(*current, &Node{
+					listLeaf := &Node{
 						Keys:   append([]string(nil), nodeKeys...),
 						IsLeaf: true,
-					})
+					}
+					listLeaf.setKeysQuoted(quotedRange(keyStart, i))
+					*current = append(*current, listLeaf)
 				}
 				if i >= len(path) {
 					return nil
@@ -454,6 +497,7 @@ func (t *ConfigTree) SetPath(path []string) error {
 			newNode := &Node{
 				Keys: append([]string(nil), nodeKeys...),
 			}
+			newNode.setKeysQuoted(quotedRange(keyStart, i))
 			*current = append(*current, newNode)
 			current = &newNode.Children
 		}
@@ -737,13 +781,19 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, mo
 			continue
 		}
 		// Flat / bracket shape: members ride on Keys[1:].
+		// #6673: the surviving keys keep their AUTHORED-quote provenance, which
+		// means rebuilding the mask in lockstep — a stale-length KeysQuoted
+		// would silently demote the node to "provenance unknown" and re-expose
+		// the fused-member read that provenance exists to close.
 		newKeys := append([]string(nil), n.Keys[:1]...)
-		for _, v := range n.Keys[1:] {
+		newQuoted := []bool{n.KeyQuoted(0)}
+		for i, v := range n.Keys[1:] {
 			if drop[v] {
 				removedAny = true
 				continue
 			}
 			newKeys = append(newKeys, v)
+			newQuoted = append(newQuoted, n.KeyQuoted(i+1))
 		}
 		if modifierChildren {
 			// valueList node: children are MODIFIERS of the value, not members.
@@ -754,6 +804,7 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, mo
 				continue
 			}
 			n.Keys = newKeys
+			n.setKeysQuoted(newQuoted)
 			out = append(out, n)
 			continue
 		}
@@ -771,6 +822,7 @@ func removeMultiLeafMembers(nodes *[]*Node, keyword string, members []string, mo
 			continue
 		}
 		n.Keys = newKeys
+		n.setKeysQuoted(newQuoted)
 		n.Children = newChildren
 		out = append(out, n)
 	}

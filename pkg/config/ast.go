@@ -44,9 +44,76 @@ type Node struct {
 	// active nodes (an old DB has no Inactive key → false → active).
 	Inactive bool `json:",omitempty"`
 
+	// KeysQuoted records, per key, whether the operator AUTHORED that key as a
+	// quoted string (lexer TokenString) rather than as a bare word
+	// (TokenIdentifier) — the one bit about a key that its TEXT cannot carry
+	// (#6673).
+	//
+	// It exists because a `[ ... ]` bracketed list and a multi-word unquoted
+	// statement flatten to the SAME []string. `commands [ "set" "system
+	// host-name x" ]` and `commands set system host-name x` differ only in
+	// which tokens were quoted; without this slice a reader has to guess from
+	// the text, and the guess is wrong for a quoted ONE-WORD member (`"set"`
+	// has no space, so it reads as bare and FUSES onto its neighbour into a
+	// command the operator never wrote). eventMultiWordLeafValues
+	// (compiler_services.go) is the reader that consumes it.
+	//
+	// INVARIANT: nil, or len(KeysQuoted) == len(Keys). Use Node.KeyQuoted(i),
+	// never index it directly — a Node built by hand (compiler synthesis, an
+	// old persisted config) legitimately carries no provenance at all.
+	//
+	// It is nil whenever NO key is quoted, which is the overwhelming majority
+	// of nodes: JSON-tagged omitempty so those configs stay byte-identical on
+	// disk, exactly as for Inactive above. Collapsing all-false to nil is
+	// lossless for the consumer because the lexer cannot produce a bare word
+	// that is empty or contains a space — so an all-bare group is exactly the
+	// group the pre-provenance text rule already joined.
+	KeysQuoted []bool `json:",omitempty"`
+
 	// Line/Column where this node starts (for error reporting).
 	Line   int
 	Column int
+}
+
+// KeyQuoted reports whether key i was AUTHORED as a quoted string. It answers
+// false for every index when the node carries no provenance (nil KeysQuoted:
+// a synthesized node, or one deserialized from a config DB written before
+// #6673) and for an out-of-range index, so a caller never has to length-check.
+//
+// A false here therefore means "not known to be quoted", not "known to be
+// bare". Callers whose behaviour must not change for a provenance-less tree
+// use KeysHaveQuoteProvenance to tell the two apart.
+func (n *Node) KeyQuoted(i int) bool {
+	if n == nil || i < 0 || i >= len(n.KeysQuoted) {
+		return false
+	}
+	return n.KeysQuoted[i]
+}
+
+// KeysHaveQuoteProvenance reports whether this node records which of its keys
+// were authored quoted. False means the question is unanswerable for this node
+// — not that every key was bare.
+func (n *Node) KeysHaveQuoteProvenance() bool {
+	return n != nil && len(n.KeysQuoted) == len(n.Keys) && len(n.Keys) > 0
+}
+
+// setKeysQuoted stores quote provenance alongside keys, normalizing to the
+// invariant: nil unless the lengths agree AND at least one key is quoted.
+// Every Node construction path that has provenance available funnels through
+// here so the "nil means all-false or unknown" collapse is made in exactly one
+// place.
+func (n *Node) setKeysQuoted(quoted []bool) {
+	if len(quoted) != len(n.Keys) {
+		n.KeysQuoted = nil
+		return
+	}
+	for _, q := range quoted {
+		if q {
+			n.KeysQuoted = append([]bool(nil), quoted...)
+			return
+		}
+	}
+	n.KeysQuoted = nil
 }
 
 // Name returns the first key of the node.
@@ -64,13 +131,43 @@ func (n *Node) KeyPath() string {
 }
 
 // QuotedKeyPath returns the key path with keys quoted if they contain
-// characters that aren't valid bare identifiers (e.g. ${node}).
+// characters that aren't valid bare identifiers (e.g. ${node}), plus the
+// NON-TERMINAL keys whose quoting the operator authored (keyNeedsAuthoredQuote).
 func (n *Node) QuotedKeyPath() string {
 	parts := make([]string, len(n.Keys))
 	for i, k := range n.Keys {
+		if keyNeedsAuthoredQuote(n, i) {
+			parts[i] = `"` + keyEscaper.Replace(k) + `"`
+			continue
+		}
 		parts[i] = quoteKey(k)
 	}
 	return strings.Join(parts, " ")
+}
+
+// keyNeedsAuthoredQuote reports whether key i must be re-emitted QUOTED to
+// preserve information that quoteKey alone would drop.
+//
+// quoteKey quotes a key only when the bare text would not read back as the same
+// key. That is sufficient for a key's VALUE but not for its GROUPING: `set` is
+// bare-safe, so `commands [ "set" "system host-name x" ]` serializes as
+// `set "system host-name x"` and the next parse cannot tell it from the single
+// unquoted command `set system host-name x`. Every path that serializes then
+// re-parses — HA config sync (Store.SyncApply takes TEXT), `show | display set`
+// replay, load merge, archive — would launder the two authorings into one and
+// re-open the #6673 fail-open on the far side of the wire.
+//
+// The rule is NOT "preserve every authored quote", which would rewrite
+// `description "foo"` as `description "foo"` instead of the Junos-normalized
+// `description foo` across every `show configuration` in the product. It is
+// exactly as wide as the ambiguity: the grouping decision
+// (eventMultiWordLeafValues) reads the quoting of the FIRST token of a group,
+// and a group of two or more always begins at a NON-TERMINAL key of its node.
+// A trailing key's quoting decides nothing — a one-token group is identical
+// under both rules — so a terminal bare-safe key still normalizes to bare and
+// no existing rendering changes.
+func keyNeedsAuthoredQuote(n *Node, i int) bool {
+	return i < len(n.Keys)-1 && n.KeyQuoted(i)
 }
 
 // keyEscaper escapes exactly the characters that the lexer's readString
@@ -364,6 +461,7 @@ func cloneNodes(nodes []*Node) []*Node {
 	for i, n := range nodes {
 		result[i] = &Node{
 			Keys:          append([]string(nil), n.Keys...),
+			KeysQuoted:    append([]bool(nil), n.KeysQuoted...),
 			Children:      cloneNodes(n.Children),
 			IsLeaf:        n.IsLeaf,
 			Annotation:    n.Annotation,

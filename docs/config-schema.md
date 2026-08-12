@@ -1015,6 +1015,40 @@ empty command, so an empty entry never reaches a checker and the remediation
 batch is unaffected by it. Its entry is kept because the compiled list is
 observable in its own right (below), not because anything gates on it.
 
+**SIX leaf families, SEVEN read sites — the category table above has FOUR rows
+and is not the inventory.** The four rows classify EMPTY-VALUE semantics, and
+its `Reader` column names four reader mechanisms because two of them serve two
+leaves each. Counting rows (or readers) undercounts what this change had to
+widen. The inventory is:
+
+| # | Leaf family | Read site (pkg/config) | Reader | Both sides? |
+|---|---|---|---|---|
+| 1 | `routing-options forwarding-table export` | `compiler_routing.go` `compileRoutingOptions` | `multiLeafAuthoredValues` | yes |
+| 2 | `security nat static … rule … match destination-address` | `compiler_nat_static.go` static-rule loop | `multiLeafAuthoredValues` | yes |
+| 3 | `security flow traceoptions flag` — COMPILE | `compiler_security_flow.go` `compileFlow` | `firewallMatchValues` | yes |
+| 4 | `security flow traceoptions flag` — COMMIT GATE | `compiler_security_flow.go` `validateFlowTraceFlagsAndFiltersAST` | `firewallMatchValues` | yes |
+| 5 | `security nat proxy-arp … address` | `compiler_nat_source.go` `compileNAT` | `proxyARPAddressValues` | yes |
+| 6 | `event-options … attributes-match` | `compiler_services.go` `eventAttributesMatchExprs` | `eventMultiWordLeafValues` (tail + each child) | yes |
+| 7 | `event-options … then change-configuration commands` | `compiler_services.go` `eventChangeConfigCommands` | `eventMultiWordLeafValues` (tail + each child) | yes |
+
+Family 3 has TWO read sites, and that is the whole reason the count differs from
+the family count: the `flag` leaf is read once by the compiler and once by the
+#3422 commit gate, and widening only one of them would leave a validation
+fail-open where the gate and the compiler disagree about which values exist.
+When auditing a widening, count READ SITES, not leaves — and not table rows.
+
+**What this change does NOT cover, and where it is tracked.** These are
+multi-value leaves whose readers are still one-sided; each is filed rather than
+bundled, because each needs its own value-domain gate widened in the same change
+(see the GATE ESCAPE table above):
+
+| Leaf | Still one-sided | Tracked |
+|---|---|---|
+| CoS DSCP / IEEE classifier `code-points` | reads tail, never `Children` | #6697 |
+| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
+| `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
+| nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
+
 `multiLeafAuthoredValues` exists to make one invariant TOTAL:
 `multiLeafAuthoredValues(n)[0] == nodeVal(n)` for every node shape — including a
 node carrying no value slot at all (`export [ ];`, whose brackets the lexer
@@ -1116,15 +1150,61 @@ after the first; and it cannot repair an ALREADY-PERSISTED config, because the
 configstore deserializes Nodes from JSON and `SetPath` never runs. Fix the
 boundary in the reader, where both parser shapes and both storage paths meet.
 
-**The discriminator is the FIRST token, not any token.** The lexer never leaves
-a space inside an unquoted token — nor produces an empty one — so a first token
-that is quoted (contains a space, or is empty) means every token is a whole
-value. Testing "any token" instead breaks the legitimate mixture
-`commands set system host-name "foo bar"`, a quoted VALUE inside an otherwise
-bare statement, shattering one command into four. Testing the first token also
-takes the fail-CLOSED side of the opposite mixture: `[ "set a b" bogus ]` splits,
-so `bogus` reaches `classifyPlan`'s prefix check alone and rejects the whole
-batch, rather than being fused onto a valid command and applied.
+**The discriminator is the FIRST token, not any token.** A first token that was
+QUOTED means every token in the group is a whole value. Testing "any token"
+instead breaks the legitimate mixture `commands set system host-name "foo bar"`,
+a quoted VALUE inside an otherwise bare statement, shattering one command into
+four. Testing the first token also takes the fail-CLOSED side of the opposite
+mixture: `[ "set a b" bogus ]` splits, so `bogus` reaches `classifyPlan`'s prefix
+check alone and rejects the whole batch, rather than being fused onto a valid
+command and applied.
+
+**"Was it quoted" is read from the AST, never inferred from the token text.**
+The first cut of this rule asked whether the first token CONTAINED A SPACE or
+was EMPTY, reasoning that the lexer never leaves a space inside a bare word.
+That reasoning is sound but one-directional: every space-bearing token was
+quoted, while a quoted token need NOT bear a space. A quoted one-word first
+member — `commands [ "set" "system host-name pwned" ]` — carries neither marker,
+so it read as bare and the list JOINED into `set system host-name pwned`: a
+syntactically perfect command that passes `classifyPlan`'s `set ` prefix check
+and is APPLIED. The authoring the operator wrote is a bare `set` member, which
+is precisely what the fail-closed path exists to reject. No refinement of a text
+test can separate the two — the tokens are byte-identical — so the bit is
+carried STRUCTURALLY instead:
+
+| Layer | Carries the bit |
+|---|---|
+| `Node.KeysQuoted []bool` (`ast.go`) | per-key provenance; `nil` when nothing is quoted, so the persisted JSON is byte-identical for the majority of nodes |
+| `Parser.parseKeys` → `parseStatement` (`parser.go`) | hierarchical spelling; `parseKeys` already returned the token KINDS for the `inactive:` marker (#4348) |
+| `ParseSetVerbQuoted` → `ConfigTree.SetPathQuoted` (`parser.go`, `ast_edit.go`) | flat-set spelling; `Store.SetFromInputAs` / `applyEditLine` call these, so CLI, gRPC and REST all carry it |
+| `keyNeedsAuthoredQuote` (`ast.go`) | re-emits the authored quote on a NON-TERMINAL key so a serialize/re-parse cycle (HA config sync, `display set` replay, load merge, archive) does not launder it away |
+
+Read it with `Node.KeyQuoted(i)`; ask `Node.KeysHaveQuoteProvenance()` before
+treating a `false` as "this key was bare". A node with NO provenance — compiler
+synthesis, or a config DB written before #6673 — falls back to the old text rule
+rather than being assumed all-bare, because assuming all-bare is a false claim in
+the fail-OPEN direction and assuming all-quoted would split
+`commands set system host-name "foo bar"` and break a working remediation across
+an upgrade. The fallback is not a second guess: for a group that genuinely has no
+quoted token the two rules AGREE, since a bare word can be neither empty nor
+space-bearing.
+
+Serialization is deliberately NOT "preserve every authored quote", which would
+render `description foo` as `description "foo"` in every `show configuration`.
+The grouping decision reads the first token of a group of two or more, and that
+token is always a NON-TERMINAL key of its node — so preserving non-terminal
+authored quotes is exactly sufficient, and a trailing bare-safe key still
+normalizes to bare. `TestEventCommands6673QuoteProvenanceSurvivesTextRoundTrip`
+binds both renderings.
+
+Residual, unchanged: an ALL-BARE group (`[ seta setb ]`) still joins. Provenance
+cannot help — both authorings have zero quoted tokens and the AST does not record
+the brackets — and every well-formed value of both leaves contains a space, so
+such a group is malformed either way and reaches the same gate under both rules.
+Second residual: a tree that arrives with no provenance is still decided by the
+text rule, so a policy authored before #6673 and still sitting in the persisted
+config DB keeps the fused read until the operator re-authors the line (any `set`
+through the CLI/gRPC/REST re-stamps it).
 
 **Test this at the CONSUMER.** Every one of these is invisible to an assertion
 about the compiler's intermediate string: the constraint list exists, the
