@@ -101,9 +101,10 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 	// PBR table override, so a second colliding flow inherits the first's cached
 	// egress / NAT / policy). A WARNING, never a reject: overlapping-subnet
 	// multi-tenant VRF via PBR is a legitimate working design; the config still
-	// commits, the operator is told it is not session-isolated. The VRF-aware
-	// session key is the deferred real fix (Track B — SessionKey widening + HA
-	// wire bump).
+	// commits, the operator is told it is not session-isolated. Whether to widen
+	// the session identity (Track B — a routing-domain id in SessionKey) is an
+	// OPEN #2387 decision, so the warning states the limitation and points at
+	// the issue rather than promising a fix.
 	cfg.Warnings = append(cfg.Warnings, validateVRFOverlap(cfg)...)
 
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
@@ -267,6 +268,23 @@ func runTailGates(cfg *Config, opts compileOpts) error {
 		return err
 	}
 	cfg.Warnings = append(cfg.Warnings, tunnelFamilyWarnings...)
+
+	// #4785 half 1: IPIP (ip-in-ip, proto-4/41) has NO userspace dataplane
+	// primitive in either direction — the endpoint is never entered into
+	// gre_decap_index (only TunnelKind::Gre is) and the egress encap
+	// dispatcher's TunnelKind::Unknown arm fails closed — so a `mode ipip`
+	// tunnel is created, comes UP, and passes no traffic at all. Until #4785
+	// half 2 implements the decap stage, reject at commit / commit-check rather
+	// than accept into a blackhole (this replaces the #4788 warn-only
+	// advisory). Lenient on load / peer-sync (warn) so a config committed
+	// before this gate still boots — #1960; the runtime keeps it inert anyway.
+	// Runs after the outer-family gate so a family error still wins the
+	// first-error slot.
+	ipipWarnings, err := validateIpipTunnelUnimplementedStrict(cfg, opts.lenientIpipTunnelMode)
+	if err != nil {
+		return err
+	}
+	cfg.Warnings = append(cfg.Warnings, ipipWarnings...)
 
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility

@@ -358,8 +358,20 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // node-aware TOLERANT paths that compile an already-active / peer-synced
 // config the local operator did not just author: Store.SyncApply (HA
 // peer-sync ingress) and the read-only peer-interface display re-compiles
-// (cli_show_interfaces.go, server_show_interfaces.go). MUST NOT be used on
-// the candidate-commit path — see CompileConfigLenient.
+// (cli_show_interfaces.go, server_show_interfaces.go). MUST NOT be used to
+// decide whether a CANDIDATE commit is accepted — see CompileConfigLenient.
+//
+// ONE deliberate exception, and it does not weaken that rule (#6861 F3):
+// ValidatePeerEffectiveStrict (compiler_peer_effective.go) calls this from a
+// strict commit helper. It is not using the lenient compile as the acceptance
+// decision — it is using it to MODEL what the standby's tolerant SyncApply will
+// instantiate, and then re-imposes strictness by running
+// peerEffectiveStrictSubjects over the result. The candidate's own acceptance
+// still comes from the strict CompileConfig on the local view. Reading that
+// call as a violation and "fixing" it to the strict compiler would break the
+// peer gate: a peer view that will not strict-compile is exactly the case it
+// must inspect, and a compile error there is swallowed by its
+// `err != nil -> return nil` arm.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, lenientCompileOpts())
 }

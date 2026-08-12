@@ -787,3 +787,128 @@ fn waterfill_exact_fit_honor_does_not_livelock_phase1() {
     );
 }
 
+
+/// Drives Phase 2 to a state the pre-#4408 suite never reached: a
+/// descending walk whose FIRST candidate is a queue Phase 1 already
+/// honored this epoch.
+///
+/// Every prior waterfill fixture enters Phase 2 with the largest class
+/// un-honored (Phase 1 walks ascending and runs out of budget before it),
+/// so the cursor starts at 0, lands on the largest, and selects it —
+/// Phase 2's honored-skip and its cursor arithmetic are never exercised.
+/// The #4408 mutation grid caught that: removing Phase 2's honored check
+/// and forcing its cursor to 0 both left the whole suite GREEN.
+///
+/// The trick is to honor the LARGEST class first by making the two small
+/// ones momentarily empty, then refill them:
+///   - fraction 0.7 over quantum_sum 37500 -> Phase-1 budget 26250
+///   - q0/q1 empty, so Phase 1 skips both and honors q2 (cost 25000),
+///     leaving 1250 and ordinal bit 2 set
+///   - refill q0/q1; the next call cannot honor q0 (2500 > 1250), so
+///     Phase 1 breaks and Phase 2 runs with the largest class HONORED
+///
+/// Same tick throughout (`now_ns = 1`), so no time refresh clears the
+/// bitset and no bare-exhausted refill fires (1250 != 0).
+fn waterfill_phase2_root_with_largest_honored() -> (CoSInterfaceRuntime, CoSQueueLeaseAcquireTelemetry)
+{
+    let mut root = waterfill_three_unequal_exact_root(0.7);
+    let mut tel = CoSQueueLeaseAcquireTelemetry::default();
+
+    for idx in [0usize, 1usize] {
+        root.queues[idx].hot.items.clear();
+        root.queues[idx].hot.queued_bytes = 0;
+    }
+
+    let first = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("Phase 1 honors the only backlogged class");
+    assert_eq!(
+        first.queue_idx, 2,
+        "precondition: with q0/q1 empty, Phase 1 must honor the LARGEST class"
+    );
+    assert_eq!(
+        root.waterfill_honored_epoch_bits & 0b100,
+        0b100,
+        "precondition: ordinal 2 is marked Phase-1-honored"
+    );
+    assert_eq!(
+        root.waterfill_pass1_remaining_bytes, 1250,
+        "precondition: 26250 - 25000 leaves less than q0's 2500 quantum, so \
+         the next call breaks Phase 1 into Phase 2"
+    );
+
+    for idx in [0usize, 1usize] {
+        for _ in 0..8 {
+            root.queues[idx].hot.items.push_back(test_cos_item(1500));
+        }
+        root.queues[idx].hot.queued_bytes = 8 * 1500;
+    }
+    (root, tel)
+}
+
+#[test]
+fn waterfill_phase2_skips_a_queue_honored_in_phase1() {
+    // #1732 via #4408: Phase 2 reads the SAME persistent honored bitset
+    // Phase 1 sets, so a class that already took its Phase-1 guarantee this
+    // epoch must NOT also collect the descending residual. The walk starts
+    // at the largest (cursor 0 -> pos_from_end 2 -> q2), which IS honored,
+    // so the correct selection is the next un-honored class down, q1.
+    let (mut root, mut tel) = waterfill_phase2_root_with_largest_honored();
+
+    let second = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("Phase 2 residual selection");
+
+    assert_eq!(
+        second.queue_idx, 1,
+        "Phase 2 must SKIP the Phase-1-honored largest class and serve the \
+         next un-honored class down; selecting q2 again would hand it both \
+         its guarantee and the residual in one epoch"
+    );
+    assert_eq!(
+        root.queues[2].telemetry.waterfill_counters.phase2_admissions, 0,
+        "the honored class must take NO Phase-2 admission this epoch"
+    );
+    assert_eq!(
+        root.queues[1].telemetry.waterfill_counters.phase2_admissions, 1,
+        "the residual goes to the largest UN-honored class"
+    );
+}
+
+#[test]
+fn waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest() {
+    // #1630 r4 via #4408: `waterfill_phase2_cursor` is seeded from `root`
+    // and written back on selection precisely so the descending walk
+    // advances through ALL large classes across calls instead of
+    // restarting at the largest every time. Re-entering Phase 2 must
+    // resume where it stopped.
+    //
+    // This is a DISTINCT assertion from the refill-side cursor test
+    // (`waterfill_exhausted_refill_does_not_reset_phase2_cursor`), which
+    // pins that the refill leaves the cursor alone; this one pins that
+    // Phase 2 itself consumes the cursor rather than ignoring it.
+    let (mut root, mut tel) = waterfill_phase2_root_with_largest_honored();
+
+    let second = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("Phase 2 residual selection 1");
+    assert_eq!(second.queue_idx, 1, "precondition: first residual is q1");
+    assert_eq!(
+        root.waterfill_phase2_cursor, 2,
+        "precondition: the cursor advanced past the honored q2 and the \
+         selected q1"
+    );
+
+    let third = select_exact_cos_guarantee_queue_with_lease_telemetry(&mut root, &[], 1, &mut tel)
+        .expect("Phase 2 residual selection 2");
+
+    assert_eq!(
+        third.queue_idx, 0,
+        "Phase 2 must RESUME the descending walk from the stored cursor and \
+         reach the smallest un-honored class; restarting at the largest \
+         would re-serve q1 forever and starve q0 (the #1630 r4 residual \
+         starvation)"
+    );
+    assert_eq!(
+        root.queues[1].telemetry.waterfill_counters.phase2_admissions, 1,
+        "q1 took exactly one residual — the walk moved on rather than \
+         re-serving it"
+    );
+}

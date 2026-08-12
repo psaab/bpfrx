@@ -100,6 +100,1292 @@
 - **File(s)**: pkg/networkd/networkd.go, pkg/networkd/activation_tail_5718_test.go,
   pkg/networkd/README.md, pkg/cluster/sync_conn.go, pkg/cluster/sync_test.go,
   _Log.md
+## 2026-08-12 — #6861 round 6: the advisory counted an endpoint the runtime drops, and four more claims did not survive measurement
+
+- **Timestamp**: 2026-08-12 (fold/6861-ipip-r6, PR #6861)
+- **Action**: fixed the one runtime blocker (the ID-collision arm of the live
+  set) and swept the PR's claim-accuracy cluster as a class, re-running every
+  mutation whose result a comment asserts.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/compiler_peer_effective.go,
+  pkg/config/compiler_peer_effective_snat_5876_test.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/configstore/store.go, pkg/configstore/ipip_no_brick_4785_test.go, _Log.md
+
+B1 — THE RUNTIME BLOCKER. `emittedTunnelDeviceNames` treated every EMITTED
+endpoint reference as live. Emission is necessary but not sufficient:
+`buildTunnelEndpointSnapshots` hashes each ref to a `StableTunnelEndpointID` and
+RETURNS — appending nothing — when the id is already taken, so the later-sorting
+collider never becomes an endpoint. Counting it live SUPPRESSED the anchor
+advisory for a device that genuinely carries nothing: the inverse of what this
+advisory exists to do, and the operator gets silence.
+
+Reproduced before the fix on the collision pair already frozen by
+tunnelid_test.go (`StableTunnelEndpointID("wg0") == ("wg34524.0") == 17799`) —
+complete GRE `wg0` plus interface-level IPIP `wg34524` overridden by a complete
+unit-0 GRE:
+
+    emitted ref "wg0"       id=17799
+    emitted ref "wg34524.0" id=17799     <- runtime DROPS this one
+    live = {wg0:true, wg34524:true}      <- wg34524 live only via the dropped ref
+    ipipAnchorOnlyWarnings n=0           <- SUPPRESSED
+    ValidateConfig ipip warnings n=0     <- nothing on `show system alarms`
+
+After: `live = {wg0}`, one anchor advisory, and it reaches ValidateConfig. The
+fix mirrors the builder exactly — same SSOT emitter, same sorted order, same
+first-wins rule. Strict commit rejects this config (the collision gate), so the
+shape is reachable only through the tolerant ingress, which is precisely where
+the advisory is claimed to matter.
+
+What the fix still does NOT model is stated in the code rather than implied:
+`addEndpoint` also skips a ref whose interface is absent from the runtime
+InterfaceSnapshot, and this function has no ifindex knowledge — it never did. A
+collision whose WINNER has no kernel device would leave the loser installed at
+runtime while this loop drops it. That conjunction is the one shape where the
+drop can produce a false "dead"; within the model the function has always used,
+the drop is the builder's rule.
+
+C3 — TWO MUTATION COMMENTS RE-RUN, and both were wrong.
+`TestSyncApplyIpipDoesNotRelaxTheStrictCommit_4785` claimed to stay GREEN under
+the tolerance revert. It does not: `lenientIpipTunnelMode -> false` turns it RED
+at its SyncApply PRECONDITION ("the ingress must tolerate the stanza"), not at
+its CommitCheck assertion. `TestPeerGateRewriteDoesNotMutateTheCandidate_4785`
+claimed to stay GREEN under the raw-tree revert. It does not: it turns RED at its
+own precondition ("this tree must be rejected for the peer's IPIP endpoint"),
+because the raw tree makes the peer view fail to compile, the gate takes its
+out-of-scope arm, and the commit is ACCEPTED — so the over-reach property it
+exists for is never reached. Its sibling
+`TestPeerGateSeesTheTreeThePeerCompiles_4785` is what actually binds that revert
+and fails on its real assertion. Both comments now record which LINE fails and
+why, because a RED at a precondition is not the same evidence as a RED at an
+assertion.
+
+C1 — A FALSE CITATION IN A REACHABILITY ARGUMENT, in two places. The swallow
+arm's reachability was justified by "validateTunnelEndpointIDCollisionAST is
+returned unconditionally, with no lenient flag". False: it takes a
+`lenient bool`, both call sites pass `opts.sanitizeFreeTextControlChars`, and
+`lenientCompileOpts()` sets that true — so on the lenient path it WARNS. The
+CONCLUSION is right (the arm is reachable) but via `validateDataplaneTypeStrict`,
+called with no lenient downgrade, which configstore store.go already cited
+correctly. Left as-is the failure mode was concrete: a maintainer follows the
+citation, finds the gate lenient, concludes the arm unreachable, and deletes the
+clone+rewrite that exists because it is not. Corrected in the code comment AND in
+the r5 `_Log.md` entry that repeated it.
+
+C2 — "ADJUDICATES" OVERSTATED A TWO-ITEM REGISTRY, at three sites
+(compiler_peer_effective.go, configstore store.go, and the residual
+"proving BOTH node-effective views are representable" in the SNAT test header).
+Now "the registered peer-effective concerns", which is what the registry holds.
+
+C4 — AN ENUMERATION CLAIMED EXHAUSTIVE THAT IS NOT. Two TunnelConfig records
+were said to share a Name only two ways; an interface authored `gr-0/0/0u1`
+shares a Name with `gr-0/0/0 unit 1`, a third and COMMITTABLE shape. It cannot
+become a discriminator here (the unit ref puts that name in live[], so the device
+clause decides first), so the conclusion is unchanged — the statement is narrowed
+to "the shapes that can put an interface-site candidate on a shared, non-live
+Name", which IS exhaustive, and the underlying gap is referenced as #6964.
+
+Also corrected: "on anything committable the two keyings are equivalent" was
+categorical and false — a node1-only `${node}` group commits on node0 and
+activates the shape on node1 through SyncApply — so the bound is now the LOCAL
+strict effective view; the rendering command is `show system alarms`, not plain
+`show system`; and the strictly-rejecting gate is named
+(compiler_validate_strict_ifname_collision.go).
+
+B2 — WHAT THE POINTER FIXTURE ESTABLISHES. It proves IDENTITY SEMANTICS versus
+NAME KEYING, not that a literal Go pointer is the only implementation — deleting
+the emitted clause outright still produces the warning, which its sibling catches
+deliberately. Recorded, along with the fact that the rendered remediation
+("removing the interface-level stanza would drop this anchor") is NOT accurate
+for this fixture, whose base device is SHARED with the WireGuard record. The
+production wording is written for the committable single-owner case; narrowing it
+for a tolerant-only shape is a separate change and is not made here.
+
+T1 — A SAFEGUARD THAT COULD GO VACUOUS. The final matcher accepted any anchor
+warning containing `interfaces "gr-0/0-0"`, with nothing requiring the candidate
+to have zero units — so fixture drift adding an incomplete IPIP unit would let
+name keying suppress the intended INTERFACE warning while the unit's warning
+matched the same substring and the count stayed green. Now a zero-unit
+precondition plus the exact `interfaces "gr-0/0-0" tunnel mode ipip:` prefix.
+
+T2 — THE TOLERANT-SURFACE CLAIM BOUND AT THE STORE, not the compiler. The
+existing binding is `CompileConfigLenient`; a future pre-compile admission gate
+at Store.Load/SyncApply would leave it green while the cited surface disappeared.
+New `TestSyncApplyRendersThePointerKeyedAnchor_4785` drives a real Store and
+asserts the whole chain: the strict commit REFUSES the fixture (the premise of
+the tolerant-only scope), SyncApply ACCEPTS it, and the anchor advisory is in
+what ValidateConfig re-renders. It is not decoration — it reds on the same
+pointer->name re-key that reds the compiler test.
+
+T3 — a precondition that cannot fail given its predecessor is kept and LABELLED
+as a forward assert, with why.
+
+Validation: five mutations, run firsthand, each with a scoped signature.
+(1) Collision drop removed -> only the new B1 test reds, on the live-set
+assertion. (2) Collision drop made over-broad (winner dropped too) -> the
+PRE-EXISTING false-alarm guards red, which is the over-reach control. (3)
+Tolerance revert and (4) raw-tree revert -> the two C3 results above. (5)
+pointer->name re-key -> BOTH the compiler test and the new store companion red.
+go build rc=0, go vet rc=0, `go test ./pkg/config/... ./pkg/configstore/...`
+rc=0, and the FULL `go test ./...` rc=0 with zero failures. No cluster tooling:
+control-plane only, no dataplane artifact.
+
+## 2026-08-05 — #4785: the new ACCEPTANCE was argued from the same incomplete fact as the old rejection
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: Round 3 accepted `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel
+  mode gre` on the stated ground that "nothing dead reaches the
+  dataplane". Verified firsthand that the ground is incomplete:
+  `collectAppliedTunnels` appends the interface-level record whenever
+  `Source != ""` (or mode is wireguard), independent of mode and of whether
+  any endpoint is emitted for it, and the routing manager creates a
+  mode-INDEPENDENT Tuntap anchor. So emission publishes only
+  `ip-0/0/0.1` gre while the box still gets an `ip-0-0-0` device with
+  nothing routed through it.
+  That is the same defect class as the round-2 rejection, one round later
+  and with the opposite verdict: a verdict argued from a fact that does not
+  cover the anchor. The sentence would have read as settled to the next
+  auditor.
+  Resolved by ADVISORY, not by widening the strict gate. The strict gate
+  keeps its single-SSOT property — "reject exactly the endpoints emission
+  would emit as IPIP" — because keying it on `collectAppliedTunnels` would
+  reintroduce the second hand-rolled model that B2 was about. The new
+  `ipipAnchorOnlyWarnings` reports an interface-level ipip record that
+  creates an anchor but has no emitted endpoint. It detects that by POINTER
+  identity against the emitter's own output rather than re-deriving which
+  records emit, so it adds no competing model; it screens on
+  `Source != ""` to match the anchor-creation condition exactly, so a
+  record that creates nothing is not reported.
+  Non-blocking on purpose: the anchor carries no traffic but breaks
+  nothing, the per-unit tunnel is the likely intent, and rejecting would
+  re-import the over-rejection this gate has already swung through twice.
+  The acceptance test now asserts BOTH halves — the commit succeeds AND
+  the alarm names the orphan device — and its comment records why the
+  original justification was incomplete rather than quietly replacing it.
+- **Validation**: three targeted mutations, snapshot-and-write-back with
+  byte-for-byte verify, each required to compile. All RED: dropping the
+  advisory reds the acceptance test; dropping the `Source` screen reds the
+  no-anchor negative control; dropping the emitted-pointer check reds the
+  already-reported control plus two others. Full
+  `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`,
+  `pkg/config/ipip_tunnel_reject_4785_test.go`, `_Log.md`
+
+## 2026-08-05 — #4785 half 1 round 3: gate on EMITTED endpoints; the round-2 shadowing fix was an under-rejection
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: The round-2 fix turned an over-rejection into an
+  UNDER-rejection — the sharp edge I had named and still walked into.
+  Reproduced against the round-2 head e3754bc4c BEFORE writing the fixture,
+  so it is not green on both sides: `ip-0/0/0 tunnel src/dst` +
+  `unit 0 tunnel mode gre` + a bare `unit 2` returned nil from
+  `CompileConfig`, produced ZERO `#4785` advisories (alarm surface silent),
+  and the emitter published BOTH `ip-0/0/0.0` gre and `ip-0/0/0.2` **ipip**.
+  The same input was correctly REJECTED one commit earlier.
+  Mechanism: my walk skipped units without their own tunnel stanza
+  (`unit.Tunnel == nil { continue }`), while the emitter hands those exact
+  units the interface-level tunnel — and says so in a comment directly
+  above the code, in the file I had cited in my own report. Unit 0's GRE
+  record shadowed the interface record on the shared device key, and the
+  inheriting sibling was never visited.
+  Root cause was deeper than the skip: the gate hand-rolled a model of
+  "which tunnels are real", naming `routing.tunnelManager` as the
+  authority. Under the userspace dataplane that is wrong — the anchor is
+  mode-INDEPENDENT; what decides `gre_decap_index` membership versus the
+  `TunnelKind::Unknown` drop arm is the EMITTED endpoint's mode. Deleted
+  the model and routed the gate through `EmitTunnelEndpointNames`, the
+  existing SSOT that `buildTunnelEndpointSnapshots` consumes and that the
+  sibling gate `validateTunnelEndpointIDCollisionAST` is already built on.
+  That single change closes B1 (inheritance handled by the emitter), B2
+  (right authority, same drift guarantee) and N4 (the emitter's
+  source/destination screen means a reported endpoint really is emitted, so
+  the indicative wording is now accurate and `tunnel destination` with no
+  source is no longer reported).
+  It also CORRECTS a rejection: `ip-0/0/0 tunnel src/dst` + `unit 1 tunnel
+  mode gre` emits only `ip-0/0/0.1` gre, so nothing dead reaches the
+  dataplane and it now commits. Recorded as its own test — the previous
+  round rejected it, defensibly on a kernel-anchor argument but not for the
+  reason its error text gave.
+  Also corrected: my round-2 log entry claimed a WireGuard positive control
+  was added. It was added but could NOT fire — wrong syntax
+  (`tunnel listen-port` rather than `tunnel wireguard listen-port`), so
+  both fixtures were rejected earlier by the WireGuard validator, and the
+  assertion was only "the error is not mine", which that satisfies.
+  Mutating the gate to also flag `wireguard` left it PASSING. Rewritten to
+  assert `err == nil` on a fixture complete enough to compile. The entry
+  has been amended in place rather than left standing.
+  N1 (tolerant path emitted the ~500-char paragraph twice — `runTailGates`
+  folds `ValidateConfig` into `cfg.Warnings` before the gate runs, and the
+  lenient arm appended again), N3 (the 44-line doc block ran into the type
+  with no blank line, so godoc attached it to `ipipTunnelSite` and the
+  function had none — file rewritten with the doc on the function), N5
+  (advisory lists every dead endpoint, with an ordered-identity test rather
+  than a count), and N6 (the rejection test asserted only `#4785` and
+  `mode gre`; it now asserts the cause, the both-directions claim and WHICH
+  emitted endpoint is dead).
+- **Validation**: ten-mutation matrix retargeted to the emitter-based gate,
+  snapshot-and-write-back restore with byte-for-byte verify, every mutant
+  required to compile. The skip-inherited-unit mutant was first written
+  with `strings.HasSuffix` in a file that does not import `strings` — a
+  BUILD-BREAK is a false red, so it was re-expressed with slicing before
+  being scored. Full `go test ./pkg/... ./cmd/...` passes.
+  NOT run: cluster/smoke — config-layer change; scheduled centrally.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`
+  (rewritten), `pkg/config/ipip_tunnel_reject_4785_test.go`, `_Log.md`
+
+## 2026-08-05 — #4785 half 1 round 2: resolve the EFFECTIVE tunnel mode, and put the advisory back on the alarm path
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject, PR #6861)
+- **Action**: Two MAJORs from the gate, both real.
+  **The gate over-rejected an effective-GRE device.** Round 1 keyed on the
+  compiled mode rather than the interface name so an `ip-*` interface set
+  to GRE still commits (proved as M7), but it walked the compiled records
+  individually. An interface-level `tunnel` stanza and a `unit 0 tunnel`
+  stanza compile to TWO records carrying the SAME Linux device name — only
+  unit N>0 gets the "uN" suffix — and `routing.tunnelManager.Apply` keys
+  its desired set by `tc.Name` while `tunnelConfigsFor` appends the
+  interface record BEFORE the units, so for a shared name the UNIT record
+  is the one realized. Verified by probe, not inference:
+  `ip-0/0/0 tunnel source/destination` + `unit 0 tunnel mode gre`
+  compiles to iface=ipip, unit0=gre, both on device `ip-0-0-0` — a working
+  GRE tunnel that round 1 rejected. Replaced the per-record walk with
+  `effectiveIpipTunnelSites`, which resolves winner-per-device the way the
+  applier does and reports only winners. Unit N>0 is a different device and
+  shadows nothing, so an interface-level ipip stanza beside it is still
+  reported — pinned as its own counter-test so the over-rejection fix
+  cannot silently become an under-rejection.
+  Hardening found while fixing that: keying the winner map on the device
+  name collapses every record whose Name is empty onto one entry, which
+  UNDER-reports (the fail-open direction). Unnamed records now get unique
+  keys. The determinism test's fixture had exactly that shape — hand-built
+  `TunnelConfig`s with no Name — so it was made realistic rather than
+  worked around.
+  **The alarm surface regressed.** Round 1 removed the #4788 advisory from
+  `ValidateConfig`, reasoning the gate's lenient-path warning replaced it.
+  It does not: `cli_show_system.go`, `server_show_system.go`,
+  `server_show_security_text.go` and `cli_show_security_log.go` all
+  RECOMPUTE `ValidateConfig(cfg)` from the ACTIVE config rather than
+  reading `cfg.Warnings`. So a box already carrying a dead tunnel got a
+  one-time apply log and a standing "No alarms currently active" — the
+  strict gate never reaches that box, because its config was committed by
+  an older build and loads leniently. Advisory restored and re-registered,
+  now sharing `effectiveIpipTunnelSites` + `ipipUnimplementedText` with the
+  strict gate so the two cannot drift.
+  Also: added a WireGuard positive control (later found NOT to fire — it
+  used the wrong `tunnel listen-port` syntax and asserted only that the
+  error was somebody else's; corrected in the next round to assert the
+  config COMMITS); split the malformed
+  `docs/feature-coverage.md` row — the IPIP text had been appended AFTER
+  the row's closing pipe, making a third cell against a two-column header —
+  into its own two-cell row; and narrowed the rollback wording in this log
+  and in the PR body to what was actually verified (that path applies the
+  stashed compiled config directly, so no compile runs on it) rather than
+  the wider "no recompile at rollback".
+- **Validation**: ten-mutation matrix, snapshot-and-write-back restore with
+  byte-for-byte verify, every mutant required to compile. All ten RED,
+  including the two new ones: dropping the device-name shadowing (which
+  restores the over-rejection) and dropping the ValidateConfig advisory
+  registration (which restores the silent alarm surface). Full
+  `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/ipip_tunnel_reject_4785_test.go`,
+  `docs/feature-coverage.md`, `_Log.md`
+
+## 2026-08-05 — #4785 half 1: reject `tunnel mode ipip` at commit instead of accepting into a blackhole
+
+- **Timestamp**: 2026-08-05 (fix/4785-ipip-reject)
+- **Action**: IPIP (ip-in-ip, proto-4/41) parses, compiles, creates a Tuntap
+  anchor and reaches the dataplane snapshot, but the userspace helper — the
+  only supported runtime — has no IPIP primitive in EITHER direction.
+  Verified firsthand rather than from the issue text:
+  `forwarding_build/tunnels.rs` enters an endpoint into `gre_decap_index`
+  only when `tunnel_mode_kind(&endpoint.mode) == TunnelKind::Gre`, and
+  `tunnel_mode_kind` maps only `gre`/`ip6gre`/`wireguard` — `ipip` falls to
+  `TunnelKind::Unknown`, which that enum's own doc names as the egress
+  dispatcher's fail-closed drop arm. So inbound has nothing to decap
+  against and outbound drops: the tunnel is created, comes UP, and passes
+  no traffic at all.
+  Until now that committed green with only the #4788 advisory. Replaced the
+  advisory with a hard gate, `validateIpipTunnelUnimplementedStrict`, wired
+  in `compiler_tailgates.go` beside `validateTunnelOuterFamilyStrict` whose
+  shape it mirrors: strict on the operator commit / commit-check path,
+  downgraded to a warning on the tolerant load / peer-sync paths via the
+  new `lenientIpipTunnelMode` opt. Removed `validateIpipTunnelDeadWarning`
+  and its `ValidateConfig` registration — the advisory text now survives as
+  the gate's lenient-path warning, which is the only path that still has to
+  tolerate it.
+  Two things worth recording. First, `mode ipip` is not only written
+  explicitly: `compileInterfaces` INFERS it from an `ip-*` interface name
+  (and `gre` from `gr-*`), so an operator who never typed "ipip" can hit
+  this — the error message names the inference. Second, the gate keys on
+  the compiled MODE, not the interface name, so `ip-0/0/0 tunnel mode gre`
+  still commits; a name-keyed gate would take working GRE tunnels down and
+  is one of the mutations below.
+  Checked the no-brick surface rather than assuming it: `Store.Load` and
+  `Store.SyncApply` go through `compileTreeLenient` ->
+  `CompileConfigLenient` -> `lenientCompileOpts()`, so the new opt makes
+  both warn. For commit-confirmed, what was VERIFIED is narrower than the
+  first wording claimed: `PromoteRollback` returns `s.confirmPrevCfg`,
+  which `CommitConfirmed` sets to `s.compiled` — the already-compiled
+  active config, stashed by reference — and the daemon applies that value
+  directly (`applyConfigLocked(prevCfg)`), so no compile runs on THAT
+  path and the new gate is not reached by it. That is a statement about
+  this rollback path only; it is not a claim that nothing anywhere
+  recompiles a rollback target.
+  Three pre-existing tests (TestIPIPTunnelSetSyntax,
+  TestIPIPTunnelExplicitMode, TestIPIPTunnelWithRoutingInstance) compiled
+  IPIP through `CompileConfig` and expected success. Their subject is field
+  parsing and mode inference, not commit acceptance, so they now compile
+  through `CompileConfigLenient` — the path that still accepts this config
+  — each with a note saying why. Not a dismissal: they are now also the
+  tolerant-path canary, and two mutations below are caught by them. A first
+  pass over-applied that switch to three passing GRE tests
+  (TestGRETunnelRoutingInstanceDestination, TestPointToPointFlag,
+  TestInterfaceLevelTunnelLinuxName); those were reverted to strict
+  `CompileConfig`, which is the stronger assertion and the one they want.
+- **Validation**: eight-mutation matrix, snapshot-and-write-back restore
+  with byte-for-byte verify, every mutant required to compile so no RED is
+  a build break. All eight RED: unwire the gate; wire it but swallow the
+  error; hardcode lenient (the pre-#4785 behaviour dressed as a gate);
+  hardcode strict (loses the #1960 downgrade — caught by the three
+  retargeted tests plus the new tolerant-path test); never set the tolerant
+  opt (the same brick by another route); drop the unit-level walk; key on
+  the `ip-` name prefix instead of the mode (over-rejects working GRE); and
+  walk the map unsorted (non-deterministic first error, so two HA nodes
+  disagree on one config). The name-keyed mutant first came back
+  BUILD-BREAK because the gate file has no `strings` import — that is a
+  false red by the project's own rule, so it was rewritten with slicing and
+  re-run to a real RED. Full `go test ./pkg/... ./cmd/...` passes.
+- **File(s)**: `pkg/config/compiler_validate_strict_tunnel_ipip.go` (new),
+  `pkg/config/ipip_tunnel_reject_4785_test.go` (new),
+  `pkg/config/ipip_tunnel_dead_warn_4788_test.go` (deleted),
+  `pkg/config/compiler_tailgates.go`, `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_validate_warn.go`,
+  `pkg/config/compiler_validate_warn_routing.go`,
+  `pkg/config/parser_routing_test.go`, `docs/feature-gaps.md`,
+  `docs/feature-coverage.md`, `_Log.md`
+## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
+
+- **Timestamp**: 2026-08-06 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate at `42b2c8733` returned DO-NOT-MERGE on ONE
+  blocking finding, and it is not in either walk — it is in the sentence the
+  walk's own doc comment uses to justify exhaustion. Traced end to end and
+  confirmed real before changing anything; the two walks themselves are
+  untouched and the regenerated object is byte-identical.
+  - **(1) BLOCKING: an over-limit chain could INSTALL the exact key the shim
+    probes.** `walk_ipv6_ext_headers` exits by EXHAUSTING `MAX_EXT_HDRS` and
+    returns the residual extension-header type; `parse_l4`'s catch-all
+    (`lib.rs:1518`) stamps ports 0/0. The doc comment then asserted "the session
+    key misses, and the packet is redirected to userspace — the fail-closed path
+    for an over-limit chain", and `pkg/dataplane/README.md` repeated it as "it
+    costs that flow the XDP fast path permanently, nothing more". Both were
+    FALSE. The miss is a property of the session MAP, which userspace writes,
+    and `metadata_tuple_complete` (`frame/inspect.rs`) accepted EVERY non-TCP/UDP
+    metadata tuple — so `(AF_INET6, <residual ext type>, src, dst, 0, 0)` became
+    a `SessionFlow`. Three consequences, in order: `flow.is_none()` went false,
+    so the #4743 over-limit drop in the poll loop was SKIPPED; an
+    `application any` permit matched a flow with no ports to fail on; and the
+    key was installed and published to `USERSPACE_SESSIONS`. The next packet of
+    the same chain then HIT and took the fast path. The unconditional over-limit
+    refusal was in fact conditional on policy.
+    - FIX, at the chokepoint that mints the false tuple:
+      `metadata_tuple_complete` now declines an IPv6 tuple whose protocol is one
+      the walk TRAVERSES. The frame arm already declined (`parse_flow_ports` has
+      no case for an extension-header protocol) and so does the meta-offset
+      fallback, so `parse_session_flow_from_bytes` returns `None` — which is
+      exactly the input the existing #4743 gate needs to fire and DROP. No new
+      gate, no reordering of the poll loop: the old gate stops being
+      accidentally-correct.
+    - The refused set is `ipv6_ext_header_is_traversable` (GENERIC ∪ AUTH ∪
+      FRAGMENT). No-Next-Header 59 is deliberately NOT a member — it is a
+      terminal verdict both walkers resolve to, not a header either steps past —
+      and ESP 50 is not either, so IPsec transit keeps its portless tuple.
+  - **(2) The map has a SECOND writer, and it took arbitrary protocols.**
+    `build_synced_session_key` (`server/helpers/session_sync.rs`) rebuilds a peer
+    key straight off the wire. The session map is global and the shim probes
+    whatever row is present regardless of who wrote it, so closing only the
+    packet path would have left the invariant false. It now rejects the same
+    set, and the caller surfaces the error on the control response instead of
+    importing the row. This also closes the reviewer's finding 5 exploitation
+    path: `USERSPACE_SESSION_ACTION_PASS_TO_KERNEL` is published ONLY via
+    `uses_kernel_local_session_map_entry`, which requires `origin.is_peer_synced()`
+    — so a synced LocalDelivery row was the one way
+    `classify_native_gre_inner_ipv6` could return the kernel-delivery verdict for
+    an extension-header protocol. It can no longer be imported.
+  - **(3) Finding 6: "verifier PASS" was printed for an OVERRIDE.**
+    `build-userspace-xdp.sh` accepts shimverify rc=6 (headroom gate suppressed
+    via `XPF_SHIM_ALLOW_LOW_HEADROOM=1`) and then printed the unconditional
+    `verifier PASS — installed ...`. `PASS` is the one word an operator greps
+    for to confirm the gate was satisfied, and the warning is on stderr, which
+    is routinely read apart from stdout. The verdict is now carried in
+    `VERIFY_VERDICT` and rc=6 says
+    "verifier headroom gate OVERRIDDEN ..., NOT a measured pass".
+  - **(4) NOT folded — finding 5's classifier restructuring, SPLIT.**
+    `classify_native_gre_inner_ipv6` (`lib.rs:931`) still rejects only the
+    pre-#4555 five (HOP/ROUTING/DEST/AUTH/FRAGMENT), so for inner
+    135/139/140/253/254 it builds a fixed `inner IPv6 + 40` key using the
+    extension value as the protocol instead of walking. After (1)+(2) its worst
+    outcome is a session-map MISS falling through to XSK — the safe direction —
+    because no writer can produce a key with those protocols. Making it agree
+    with the canonical class set, or fold the shared walker, is a shim CODEGEN
+    change: a new `.o`, which owes a loss-userspace cluster smoke this lane is
+    not permitted to run. Verifier headroom measured at this head for whoever
+    picks it up: **947,188 / 1,000,000 insns, 5.28% free** (floor is 3%).
+  - **Tests.** `over_limit_chain_never_becomes_a_session_flow` sweeps all ten
+    traversable types, sizing each chain from `shim_walk::MAX_EXT_HDRS + 1` and
+    taking the residual protocol from the REAL shim walk, so the fixture exceeds
+    the shim's own limit by construction and the key asserted about is the key
+    the shim will really probe. Its companion
+    `at_limit_chain_still_publishes_the_key_the_shim_probes` is the negative
+    control: one header shorter, the SAME pipeline produces a flow whose
+    `forward_key` IS the shim's probe key — so the machinery under test really
+    is the one that publishes session identities, and the over-limit case is a
+    refusal rather than a dead path. `refused_protocol_set_equals_the_shim_traversable_set`
+    holds the refused set equal to the shim's `eh_class` non-terminal set over
+    all 256 values, and `traversable_predicate_matches_walker_behaviour_over_all_256_values`
+    holds it equal to what `walk_ipv6_ext_chain` measurably does — so a new
+    extension-header type taught to either walker reds unless the refusal learns
+    it too. Over-reach guards (ESP, No-Next-Header, all-IPv4, at-limit chains,
+    the pre-existing TCP/UDP port rule) stay GREEN under both reverts.
+  - **Revert probes**, run firsthand, restored after each: dropping the
+    `metadata_tuple_complete` clause → `cargo test` exit **101**, RED on
+    `#6923: proto=0: an over-limit IPv6 extension-header chain must NOT become a
+    session flow ... left: Some(SessionFlow { ... protocol: 0, src_port: 0,
+    dst_port: 0 })`; neutering `reject_unresolved_ipv6_ext_protocol` → exit
+    **101**, RED on `#6923: a synced IPv6 session keyed on extension-header
+    protocol 0 must be REFUSED`. Both are ASSERTION failures, not build breaks,
+    and each left the other's tests green.
+  - **`make generate` ran** and is disclosed rather than hidden: the two
+    corrected texts live in `userspace-xdp/src/ipv6_ext_walk.rs` (a doc comment)
+    and `pkg/dataplane/build-userspace-xdp.sh` (an echo), and BOTH are hashed
+    inputs of the #4977 freshness manifest, so the gate went RED. Neither edit
+    can change codegen, and the rebuild confirmed it: the object came back
+    **byte-identical** (`29fc6d783f74b3b9a27275aec67492dcc1f071a841c71cd51e505fdc35daf268`
+    before and after), verifier PASS at 5.28% headroom, manifest refreshed.
+    Hand-running `cmd/shim-manifest` would have been the cheaper route and was
+    deliberately NOT taken — it is precisely the laundering path that gate
+    exists to catch.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/server/helpers/session_sync.rs,
+  userspace-dp/src/afxdp/frame/inspect_tests.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-dp/src/main_tests.rs, userspace-xdp/src/ipv6_ext_walk.rs,
+  pkg/dataplane/build-userspace-xdp.sh, pkg/dataplane/README.md,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
+
+## 2026-08-01 — #4555 round 6: unfake the parity comparison, unfake the harness
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate returned MERGE-NEEDS-MAJOR with six MAJORs, every
+  one in the GUARD or its acceptance harness rather than in the shipped walk.
+  The reviewer's 120,000-buffer randomized differential over all 14 relevant
+  next-header types (random HdrExtLen, random padding, random truncation,
+  l3 in {0,14}) found ZERO divergences between the two walkers, and confirmed
+  `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1` is correct — both sides resolve
+  exactly 0..=7 and refuse 8 or more. The walk is untouched, the tracked object
+  is unchanged, no `make generate`. Two of the six (arm boundary cases, L3
+  sweep) were closed by `c87851b3f` while this round was in flight; its three
+  boundary-exact cases and their comment are carried forward VERBATIM, and my
+  exact (target, target-1) pairs sit alongside them at a different magnitude.
+  - **(1) THE COMPARISON WAS A TAUTOLOGY.** `walk_ipv6_ext_headers` returns
+    `(offset, protocol)` and records no fragment state. The previous revision
+    compared a `WalkRecord` carrying `saw_fragment`/`non_first_fragment` too,
+    and supplied the shim's two columns by hand-writing a SECOND walk loop
+    inside the test that re-derived them with literally the same expression
+    `walk_ipv6_ext_chain` uses (`tests:550` vs `inspect.rs:236`). Every
+    comparison of those columns was `X == X`: no shim-side edit could move
+    them, and the widened corpus stayed GREEN on the exact non-first-fragment
+    input it was widened to catch. Second loop deleted; the corpus now compares
+    only what the shim actually returns.
+  - **(2) WROTE THE ASSERTION THE FILE HAD BEEN CITING.**
+    `shim_is_not_more_permissive` was named at `:493-496` as the mitigation for
+    exactly this gap and existed nowhere in the tree — the third dangling
+    citation on this branch. It exists now and both halves are MEASURED by
+    running the real walkers: two chains differing only in the Fragment
+    header's offset/M/identification bytes give the SAME real shim result and
+    DIFFERENT `ExtChainWalk`s. Every sub-field the old `.is_some()` collapsed is
+    pinned — readable/unreadable discriminant, 13-bit offset, M flag, 32-bit
+    identification — plus `ipv6_is_any_fragment` / `ipv6_is_non_first_fragment`
+    on the declared-but-truncated header. It records the divergence as KNOWN and
+    UNCLOSED (#6704, pre-existing) and declines to claim it is safe.
+  - **(3) THE HARNESS COULD REPORT SUCCESS WITHOUT OBSERVING ANYTHING** — three
+    instances of one defect. (a) The build gate ran `cargo build`, which never
+    compiles `ipv6_ext_walk.rs` (`#[cfg(test)]`-only), so a mutation that did
+    not parse scored as "the guard fired"; now `cargo test --no-run`, and
+    preflight P1 DEMONSTRATES the coverage by requiring a deliberate syntax
+    error to break the gate. (b) Nothing asserted a test RAN: `cargo test
+    <filter matching nothing>` exits 0 with `0 passed` and no Go-style `[no
+    tests to run]` marker, so with both negative controls deleted every row
+    printed an empty column and the script still exited PASS. Per-test results
+    now come from an anchored full-module-path match, an absent test is a
+    HARNESS ERROR, and preflight P2 demonstrates it. (c) The `first divergence`
+    extractor's character class excluded `{` and `:`, so it matched nothing once
+    the assertion text changed and every RED row printed no reason; fixed, and a
+    RED row with no extractable reason is now a HARNESS ERROR.
+  - **(4) EVERY ROW CARRIES AN EXPECTATION.** Row 11 is a semantically null
+    rename that must SURVIVE, so a harness that reds unconditionally fails as
+    loudly as one that never reds. Mutators assert their target COUNT (two were
+    `sed -i` with no match check), restore is verified with `cmp`, the lock
+    moved off `${TMPDIR}` (which this repo routinely varies) to a fixed path,
+    the baseline compares the mutated file against git HEAD instead of inferring
+    cleanliness from passing tests, and the lock fd is closed in cargo's
+    children (`9>&-`) — an inherited fd 9 left the lock held by orphaned rustc
+    after a killed run, found by doing exactly that.
+  - **Validation** — `test/mutation/shim-ext-parity-acceptance.sh` from this
+    tree, ALL 13 rows, build exit 0 in every row, `=== acceptance PASS ===`:
+
+    ```
+    P1  build gate observes ipv6_ext_walk.rs .. yes (build failed on a deliberate syntax error)
+    P2  a vacuous run is reported MISSING ..... yes (cargo exit 0, all 5 columns MISSING)
+     0. GREEN [baseline self-check]              rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+     1. GENERIC advance *8 -> *16                rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     2. GENERIC post-advance revalidation DELETED rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     3. GENERIC revalidation length - 1          rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     4. AUTH advance *4 -> *8                    rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     5. AUTH post-advance revalidation DELETED   rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     6. AUTH revalidation length - 1             rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     7. FRAGMENT read 8 -> 2                     rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     8. FRAGMENT read 8 -> 7                     rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+     9. revalidation base l3_offset -> 0         rc=101 | corpus=FAILED permissive=FAILED facts=ok CONTROL=ok/ok
+    10. statement in the loop, outside the match rc=101 | corpus=FAILED permissive=ok     facts=ok CONTROL=ok/ok
+    11. NEG-CTL semantically null rename         rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+    12. RESTORED                                 rc=0   | corpus=ok     permissive=ok     facts=ok CONTROL=ok/ok
+    ```
+
+    First divergence per row (the extractor MINOR-0 had blinded):
+    row 6 `[l3=0] AH(len=0) buffer one byte short: shim=L4(48, 6) userspace=FailClosed`;
+    row 8 `[l3=0] Fragment buffer one byte short: shim=L4(48, 6) userspace=FailClosed`;
+    row 9 `[l3=14] HbH(len=5) -> TCP, trimmed 21: shim=L4(102, 6) userspace=FailClosed`
+    — row 9 fires ONLY at a non-zero l3, which is what makes the sweep
+    load-bearing rather than decorative. Row 10's `permissive=ok` is the
+    `shim_is_not_more_permissive` column correctly declining to fire on a
+    mutation that makes the shim MORE restrictive (`OverLimit` where this crate
+    resolves `L4(424, 6)`) — the column discriminates rather than co-signing.
+  - **Validation, the harness's own controls** — the M-6 property proved
+    end-to-end on a throwaway copy with BOTH negative-control tests deleted:
+    cargo exits 0, all three guard columns report `ok`, and the OLD harness
+    scored that as PASS. This one prints `ok ok ok MISSING MISSING`, names both
+    absent tests, and exits 3.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, _Log.md
+
+## 2026-08-01 — #4555 round 4: execute the shim's walk instead of emitting three scalars
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Both reviewers returned MERGE-NEEDS-MAJOR on the same finding,
+  and it is a regression I introduced in round 3. Deleting the source
+  model removed coverage the three emitted facts do not replace. Four
+  edits to the shim's walk left every parity test green: the generic
+  advance changed to `* 16`, the AH advance to `* 8`, a statement added
+  inside the loop but outside the `match` (leak #3 verbatim, which round
+  3 had deliberately closed), and — worst — DELETING the generic arm's
+  post-advance bounds revalidation. None of them touches `MAX_EXT_HDRS`,
+  `FragHdr` or `eh_class`, so the emitted facts are byte-identical and
+  only the #4977 freshness hashes move. Worse, that red's message says
+  the object may be stale and to run `make generate`; following it
+  regenerates the same facts and ships the divergence — a gate silent
+  BEHIND a red whose stated remedy ships the defect, the same shape I had
+  just found in my own empty-diff message one level up.
+
+  Fixed by making the walk OBSERVABLE rather than described. Extracted it
+  into `userspace-xdp/src/ipv6_ext_walk.rs`, a module depending only on
+  `core` (no aya, no map, no std), which the shim calls and which
+  userspace-dp's parity test `#[path]`-includes and compiles for the
+  HOST. The test then runs the shim's actual code alongside
+  `walk_ipv6_ext_chain` over a corpus of real chains — lengths across the
+  7/8 boundary, declared lengths 0/1/2/5/15, AH and Fragment arms,
+  truncated buffers where a declared length overruns the packet, chains
+  whose offset passes 200 mid-walk, and all 256 next-header values as the
+  first header. Advance arithmetic, bounds revalidation and resolvable
+  chain length stop being claims about source text and become compared
+  outcomes.
+
+  The extraction is codegen-neutral: 947,188 processed insns and 5.28%
+  headroom, identical before and after, so `#[inline(always)]` folds it
+  exactly as the inline loop did.
+
+  Also deleted `shim_walk_exits_by_exhaustion`, the last source-text
+  check. Its justification was that exhaustion semantics are "a shape,
+  not a value" and therefore unemittable — true, but executing the walk
+  dissolves the problem: the corpus measures resolvable chain length on
+  both sides. And corrected the overclaims in `pkg/dataplane/README.md`
+  and the test header that said there was "nothing left to defeat",
+  which the four mutations falsify.
+
+  The emitted facts are KEPT, for the one thing they are uniquely good
+  at: travelling with the artifact, so a consumer of a prebuilt object
+  (the Debian packaging path never compiles the shim crate) can check the
+  walk's constants without a Rust toolchain.
+
+  Two harness failures of my own along the way, both worth recording. The
+  negative control asserted the shim resolves one DestOpt at offset 48,
+  which the `* 8` → `* 16` mutation changes to 56 — so it went red
+  alongside the corpus and co-signed instead of controlling. Its
+  shim-side expectations are now restricted to cases that execute NO arm
+  body at all (a chain with no extension headers, a buffer too short for
+  the fixed header). And an acceptance run killed mid-mutation left the
+  tree mutated; the next run captured that as its "pristine" baseline and
+  reported the clean tree as failing. The harness now takes an exclusive
+  lock, restores on EXIT/INT/TERM via trap, and aborts unless a GREEN
+  baseline self-check passes before it mutates anything.
+
+  Validation: `make generate` verifier PASS at 947,188 insns / 5.28%.
+  Acceptance matrix — `cargo build --release` exit 0 in every row, so
+  every red is an assertion: all four mutations red the corpus with
+  concrete divergences (`shim=L4(56,6) userspace=L4(48,6)`;
+  `shim=L4(88,6) userspace=FailClosed`; `shim=OverLimit
+  userspace=L4(424,6)`; `shim=L4(56,6) userspace=L4(48,6)`), both
+  negative controls green in all six rows. Mutation 2 run IN ISOLATION
+  with `MAX_EXT_HDRS`/`FragHdr`/`eh_class`/both advances grep-verified
+  untouched: build exit 0, only the corpus fails, and the shim resolves
+  an L4 offset OUTSIDE the buffer where userspace fails closed.
+- **File(s)**: userspace-xdp/src/ipv6_ext_walk.rs (new),
+  userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/README.md, pkg/dataplane/userspace_xdp_manifest.json,
+  pkg/dataplane/userspace_xdp_bpfel.o, _Log.md
+
+## 2026-08-01 — #4555: teach the freshness diff about emitted-fact drift
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Self-check on the tautology risk in the new facts pipeline —
+  can the manifest's `shim_facts` drift from the object without any test
+  failing? Probed it rather than reasoning about it.
+
+  It IS caught: `TestUserspaceXDPShimObjectMatchesSourceManifest` compares
+  the committed manifest byte-for-byte against one recomputed from the
+  working tree, and `ComputeUserspaceXDPManifest` now reads the facts
+  from the OBJECT. So a hand-edited or corrupted `shim_facts` block fails
+  even when the object hash and every input hash still match. That closes
+  the case the parity guard's own B4 row does not cover — B4 tests a
+  MISSING block, not a FALSIFIED one.
+
+  But the failure MESSAGE was wrong, and that is a gap I introduced by
+  adding a manifest field without teaching the diff builder about it: the
+  operator got the generic "the object may be STALE, run `make generate`"
+  preamble followed by an EMPTY diff, because the builder only knew how to
+  report object-hash and input-hash drift. Neither had moved. A gate that
+  fires but misdiagnoses the cause and shows nothing is barely better than
+  one that does not fire.
+
+  Added `reportFactDrift`, which names only the fields that actually
+  moved — and for the class table names the changed next-header numbers
+  rather than dumping both 512-character hex strings, which in the first
+  attempt buried a one-field difference between two walls of identical
+  hex. A falsified block now reports e.g. `max_ext_hdrs: manifest 6,
+  object 7` and `eh_classes: next-header 44: manifest class 1, object
+  class 3; next-header 135: manifest class 0, object class 1`.
+
+  Test-only change; no production behaviour touched. Verified by
+  falsifying `max_ext_hdrs` and two class bytes in the committed manifest
+  (object and inputs untouched) and reading the resulting message, then
+  restoring and confirming green. Go build, vet and full `go test ./...`
+  clean.
+- **File(s)**: pkg/dataplane/userspace_xdp_manifest_test.go, _Log.md
+
+## 2026-08-01 — #4555 round 3: stop modelling the shim, have it EMIT its facts
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Round-3 review returned three MAJORs. All three converge on
+  one answer, and the answer is to invert the dependency rather than
+  refine the model a sixth time.
+
+  **MAJOR 1 — the FIFTH leak, to the most innocuous edit yet.** The
+  round-2 struct-layout resolver split fields on commas and skipped any
+  fragment starting with `//`, so a COMMENT above a field hid the field
+  with it: `identification: u32,` / `// Reserved...` / `pad: u8,` makes
+  the packed FragHdr nine bytes and the resolver returned 8. Reproduced
+  firsthand: both guard and control reported ok.
+
+  **MAJOR 2 — the override collapsed into ordinary success.** An
+  overridden run returned exit 0, identical to a measured PASS, and the
+  recipe's `0) ;;` arm installed it silently. The stale-variable note was
+  stderr-only, so exit 5 worked right up until someone had the variable
+  exported.
+
+  **MAJOR 3 — the const assert never runs on the packaging path.**
+  `debian/rules` runs `make build`, and the daemon embeds the tracked
+  object via `//go:embed`; the shim crate is never compiled, so a
+  compile-time assertion is a generation-time check, not a guard on the
+  shipped artifact.
+
+  The guard had now leaked five times — substring on arithmetic, a
+  statement outside the match, a symbolic `size_of`, and a comment —
+  each to a more ordinary edit. Every fix was a better model, and a
+  better model is still a model. So `userspace-xdp` now EMITS its
+  resolved facts: `XPF_SHIM_FACTS`, a `#[used]` static whose fields
+  rustc const-evaluates from the real types and the real classifier
+  (`MAX_EXT_HDRS`, `size_of::<FragHdr>()`, and a 256-entry class table
+  produced by the same `eh_class` const fn the walk now dispatches on).
+  `make generate` reads it back out of the object with `debug/elf`
+  (`ReadShimFactsFromObject`) into the manifest's `shim_facts` block, and
+  the parity test compares userspace's MEASURED behaviour against those
+  numbers. Deleted with the model: the arm-body literals, the token
+  normaliser, the match-arm splitter, the loop-body pin and
+  `resolve_packed_struct_size`.
+
+  Two things were measured before committing to the design, not assumed.
+  The emitted static survives bpf-linker into its own
+  `.rodata.XPF_SHIM_FACTS` section and is readable from Go; and driving
+  the walk from `eh_class` costs ZERO verifier budget — 947,188 insns
+  before and after, headroom 5.28% unchanged. That is what made this a
+  small change rather than one worth splitting into its own PR.
+
+  MAJOR 3 dissolves: the facts travel with the artifact, so a consumer of
+  a prebuilt object checks the numbers the generator measured. MAJOR 2:
+  an overridden run now exits 6, never 0, with its own recipe arm — the
+  distinction is machine-readable without parsing stderr.
+
+  **Residual, stated rather than papered over:** the walk's exit
+  semantics (exhaustion straight into `parse_l4`, no post-loop over-limit
+  check) is a shape, not a value. Any number the shim exported for it
+  would be an assertion about its own semantics rather than a
+  measurement, which is the modelling being removed.
+  `shim_walk_exits_by_exhaustion` keeps a narrow source check for that
+  one property and says so.
+
+  Validation: `make generate` PASS, headroom 5.28%. Nine-row matrix in
+  three parts — end-to-end (mutate shim, regenerate, guard reds on real
+  emitted facts), fact-comparison (perturb one emitted value in the
+  manifest; each of max_ext_hdrs / frag_hdr_size / one class byte /
+  a missing shim_facts block reds), and a FragHdr layout row which is
+  refused by the VERIFIER gate before it can be installed (its changed
+  arithmetic blows the 1M cap). Control green in all rows.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/userspace_xdp_facts.go,
+  pkg/dataplane/userspace_xdp_manifest.go, cmd/shimverify/main.go,
+  pkg/dataplane/build-userspace-xdp.sh, pkg/dataplane/README.md,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  pkg/dataplane/userspace_xdp_bpfel.o, _Log.md
+
+## 2026-08-01 — #4555 round 2: two Codex MAJORs (symbolic-size hole, fail-open headroom gate)
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Round-2 hostile review returned MERGE-NEEDS-MAJOR with two
+  findings, both proven by execution. Both are real; I reproduced each
+  firsthand before fixing.
+
+  **MAJOR 1 — a THIRD hole in the parity guard, surviving the round-1
+  equality pinning.** The shim's Fragment arm advances by
+  `mem::size_of::<FragHdr>()`. Round 1 pinned arm bodies by token
+  equality, which pins that expression's TEXT but not its VALUE. Adding
+  one byte to `FragHdr` makes the shim advance 9 where userspace
+  advances a literal 8, corrupting every L4 offset in a fragmented IPv6
+  chain — and every pinned literal stays byte-identical. Reproduced:
+  with `pad: u8` added, both the guard and the negative control passed
+  `ok`. This is the same class already closed twice (pin the value, not
+  the text), one level further down.
+
+  Fixed at two layers. In the shim, `const _: () = assert!(size_of::
+  <FragHdr>() == 8)` — the invariant belongs in the crate that owns the
+  type, and it fails the BUILD with an assertion message, not a generic
+  compile error. In the guard, `resolve_packed_struct_size` models the
+  struct's layout (requires `#[repr(C, packed)]`, sums field widths,
+  panics on any unmodelled field type rather than guessing) and the test
+  compares the RESOLVED advance against userspace's advance measured by
+  probe. Both layers fire independently on the mutation.
+
+  Search scope for the same shape: the three pinned arm bodies are the
+  only place a symbolic value can hide, and `FragHdr` is the only
+  `size_of::<..>()` among them. The generic and AH arms use literal
+  arithmetic, which token equality does pin. The resolver is written
+  generically (`size_of_type_in`) so a symbolic size introduced
+  elsewhere resolves too.
+
+  **MAJOR 2 — the headroom gate false-passed exactly when headroom was
+  unknown.** Round 1 made an unparseable stats line WARN and pass, on
+  the reasoning that "cannot measure" is not "at the wall" and blocking
+  over a kernel log-format difference guards nothing. That reasoning
+  does not survive the tripwire's purpose: the thing it exists to
+  prevent is the shim sitting at 0.92% because nothing was watching, and
+  a gate that switches itself off when the format changes reproduces
+  that failure mode — silently, and a WARN is invisible in an automated
+  build. Unmeasurable is now a refusal, `shimverify` exit 5, with its
+  own recipe arm and remediation text. Took a DISTINCT exit code from
+  the below-floor case (4) because the two need different remediation,
+  under the SAME `XPF_SHIM_ALLOW_LOW_HEADROOM=1` override so a genuine
+  kernel difference is one documented env var from unblocking.
+
+  Also hardened the override itself, which is read from the ambient
+  environment: consuming it now prints a loud banner naming the object
+  and which condition it suppressed, and a run that did NOT need it but
+  has it set prints a staleness note telling the operator to unset it.
+  Requiring it per-invocation is not implementable at the script level —
+  bash cannot distinguish an ambient export from a command-local prefix
+  — so surfacing staleness on the healthy path is the practical
+  equivalent, and it is the only place a stale export is visible.
+
+  Validation: `make generate` PASS, `processed 947188 insns (limit
+  1000000), headroom 5.28%`; the object is BIT-IDENTICAL again (a const
+  assertion emits no code), so the previously banked cluster smoke still
+  covers the shipped bytes. Full 9-row mutation matrix re-run against
+  the round-2 guard — every one of the 7 mutations reds it, the negative
+  control stays green in all 9 rows, no regression in the rows round 2
+  did not touch. Exit-5 path proven by making the stats regex
+  unmatchable (the exact "log format changed" condition): exit 5 without
+  the override, exit 0 with it plus the OVERRIDDEN banner, exit 0 after
+  restore.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  cmd/shimverify/main.go, pkg/dataplane/build-userspace-xdp.sh,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/README.md, pkg/dataplane/userspace_xdp_manifest.json,
+  _Log.md
+
+## 2026-08-01 — #4555 review fold: guard scope, headroom tripwire, two doc corrections
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile review returned MERGE-NEEDS-MINOR with no MAJOR; the
+  parity reasoning was independently reproduced. Four folds.
+
+  **M-1 (the real one) — the parity guard was scoped narrower than its
+  claim.** The shim side is a source MODEL, never executed, and each arm
+  was classified by a SUBSTRING of its body (`contains("+ 1) * 8")`), so
+  anything else in the body was invisible. The reviewer demonstrated two
+  mutations that passed GREEN: adding `+ 8` to the generic advance, and
+  prepending `if opt[1] == 0 { break; }` to the generic arm. The second
+  is the sharp one — `HdrExtLen == 0` IS the ordinary 8-byte
+  HbH/DestOpt, so that edit destroys parity for essentially every real
+  chain while the guard reports ok. Replaced the substring classifier
+  with whitespace-normalised token EQUALITY against pinned arm-body
+  literals. The normaliser tokenises (identifier runs vs single
+  punctuation chars) so rustfmt reflow is invisible, and drops a
+  trailing comma before a closing delimiter, which rustfmt emits only in
+  the multi-line form — without that the pins would be hostage to
+  reflow.
+
+  Closed the SIBLING hole the same mutations imply: pinning arm bodies
+  still left a statement placed inside the loop but OUTSIDE the `match`
+  entirely invisible (`if offset > 200 { break; }` would cut the
+  resolvable chain length with every arm still matching). The loop body
+  must now contain the match block and nothing else.
+
+  Also made the negative control a REAL control. It previously called
+  `shim_walk_model` too, so it went red alongside the guard on any
+  mutation that made an arm unparseable — co-signing, not controlling.
+  It is now shim-source-free: it exercises only this crate's walker and
+  the probe harness. Its shim-side assertions were redundant anyway, the
+  guard's 256-value comparison subsumes them. With that change the
+  control stays green under all six mutations.
+
+  **M-4 — no durability gate on verifier headroom.** Every gate added
+  after #1864 is BINARY, which is exactly how master reached 0.92%
+  headroom with everything green. Added `ShimVerifierStats` +
+  `VerifyUserspaceShimObjectStats` (loads with `LogLevelStats`, parses
+  `processed N insns (limit M)`), a committed floor
+  `UserspaceShimMinVerifierHeadroomPct = 3.0`, and a `shimverify` exit
+  code 4 for "loads but below the floor". Chose a HARD FAIL with an
+  `XPF_SHIM_ALLOW_LOW_HEADROOM=1` override, mirroring the existing
+  `XPF_SHIM_ALLOW_UNPINNED_INSTALL` precedent in the same recipe — the
+  failure mode being guarded is a dead dataplane, so default-closed is
+  right. An unparseable stats line WARNS and passes: that means "cannot
+  measure", and blocking builds over a kernel log-format difference
+  guards nothing. Existing signatures kept, so the runtime deploy
+  pre-flight (`VerifyEmbeddedUserspaceShim`) and the root-gated tests
+  are untouched. Threading the override through `sudo` explicitly was
+  necessary — sudo scrubs the environment, so the documented escape
+  hatch would otherwise have been a silent no-op.
+
+  **M-2 — the doc understated the blast radius.** `parsed.protocol` is
+  not only a session-key ingredient: it drives PRE-SESSION dispatch that
+  terminates in the shim (ESP and non-native GRE to `cpumap_or_pass`, WG
+  steering, ICMPv6 NDP 133-137 to `pass_local_control`). Verified all
+  four sites firsthand, plus the userspace `meta.protocol` consumers
+  (NAT64 translation and L4 checksum recomputation in `frame/mod.rs`).
+  So widening the type set re-routes packets between the XSK and kernel
+  paths: `IPv6 → Mobility → ESP` reached userspace over XSK before and
+  now goes to the kernel — the correct direction (userspace-dp
+  classifies it as ESP too, and `DestOpt → ESP` already behaved that
+  way), but a wider change than "session key parity" and the reason this
+  wants a cluster smoke.
+
+  **M-3 — an incorrect safety claim.** "Getting it wrong in either
+  direction is fail-closed" was wrong: only shim-BELOW-userspace is. At
+  bound 8 the shim would stamp a full 5-tuple and `l4_offset` for a
+  chain userspace refuses with `OverLimit` and hand that meta to
+  consumers that trust it. Corrected in the constant's doc comment and
+  in the README, stating the two directions separately.
+
+  Validation: `make generate` PASS, now reporting `processed 947188
+  insns (limit 1000000), headroom 5.28%`; the object is BIT-IDENTICAL to
+  the pre-fold one (the shim change was doc-comment-only). The headroom
+  gate was proven to FIRE — with the floor temporarily raised to 6.0 the
+  same object exits 4, and `XPF_SHIM_ALLOW_LOW_HEADROOM=1` returns it to
+  exit 0 with a warning. Six-mutation matrix: all six red the guard
+  (previously two passed green), all six leave the control green.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-xdp/src/lib.rs, pkg/dataplane/verify_userspace_shim.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/build-userspace-xdp.sh, cmd/shimverify/main.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-01 — #4555 IPv6 extension-header walk parity: shim vs userspace
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity)
+- **Action**: Closed the #4555 divergence between the AF_XDP shim's
+  `parse_ipv6` extension-header walk and userspace-dp's
+  `walk_ipv6_ext_chain`. The issue proposed bumping the shim's
+  `MAX_EXT_HDRS` 6 -> 8 to numerically match `MAX_IPV6_EXT_HEADERS`.
+  Both halves of that turned out to be wrong, and the kernel verifier
+  settled it.
+
+  (1) 8 does not load. `make generate` REJECTED the candidate at
+  `BPF program is too large. Processed 1000001 insn (limit 1000000)` —
+  the #1864 failure mode. The gate fail-closed correctly and left the
+  tracked `.o` untouched. A bisect over (bound x type-set) with a
+  throwaway `LogLevelStats` probe measured every cell: bound 6 narrow
+  990,796 PASS (master — under 1% headroom); bound 6 wide 874,873 PASS;
+  bound 7 narrow REJECT; bound 7 wide 947,188 PASS; bound 8 either
+  REJECT. Two findings: 8 is unreachable, and the bound is COUPLED to
+  the type set — widening the generic arm to the full #4517 set prunes
+  more verifier state than its five extra compares cost, which is the
+  only reason bound 7 is affordable.
+
+  (2) Numeric equality was the wrong parity condition anyway. The two
+  bounds are ITERATION counts over loops that exit differently: the shim
+  spends one iteration per extension header and exits by EXHAUSTION
+  carrying the last declared next-header straight into `parse_l4` (there
+  is no post-loop over-limit check), so it resolves up to `MAX_EXT_HDRS`
+  headers; `walk_ipv6_ext_chain` needs one FURTHER iteration to return
+  the terminal and folds exhaustion into the fail-closed `OverLimit`
+  verdict, so it resolves up to `MAX_IPV6_EXT_HEADERS - 1`. The real
+  parity point is therefore `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
+  = 7, and the real gap was a chain of EXACTLY 7 headers (not "7+" — at
+  8+ both sides already refused). Setting 8 would have made the shim
+  resolve chains userspace fails closed on.
+
+  Shipped: `MAX_EXT_HDRS` 6 -> 7 and the #4517 generic types
+  (135 Mobility / 139 HIP / 140 Shim6 / 253-254 experimental) added to
+  the shim's generic length-prefixed arm, matching the set #4517 gave
+  the userspace walkers. Net verifier effect is an IMPROVEMENT: headroom
+  goes from 0.92% to 5.3% while the parity gap closes. Regenerated
+  `userspace_xdp_bpfel.o` + `userspace_xdp_manifest.json` through the
+  verifier-gated `make generate` (PASS). The pre-change baseline
+  regenerate reproduced the tracked object bit-identically, so the
+  object diff is attributable to this change alone.
+
+  Guard: `tests_shim_ext_parity.rs` parses the shim's walk out of its
+  source text (bound, arm patterns resolved through the `NEXTHDR_*`
+  consts, arm bodies classified by their advance arithmetic) and compares
+  it against the userspace walker derived BEHAVIOURALLY — resolvable
+  chain length measured by walking real chains, and all 256 next-header
+  values classified by probe packet — rather than a second text parse. It
+  asserts resolvable-chain-length equality, the `- 1` relation, and
+  full type-set agreement, plus the structural property the derivation
+  rests on (no post-loop over-limit check between the walk and
+  `parse_l4`). It fails LOUDLY, never skips, on an unreadable or
+  unrecognised shim source.
+- **File(s)**: userspace-xdp/src/lib.rs,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json, pkg/dataplane/README.md,
+  _Log.md
+## 2026-08-06 — #6902 round 5: the neutrality contract was guarded in one direction
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold two findings from the hostile review leg, plus a precision
+  correction to the round-4 comment. Test-file-only; production warning strings
+  still byte-identical to round 1, `cmp`-verified after every cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**ADD-1 — the reverse direction had NO guard.** The contract at
+`compiler_validate_vrf_overlap.go:58-59` is symmetric: the text "must not promise
+a fix, nor rule one out". All 31 blocklist entries were forward-looking, so
+appending `". #2387 is closed wontfix; this is by design and permanent"` passed
+the whole suite while foreclosing an outcome that is still the maintainer's to
+decide. That is the more dangerous half: an operator who reads "by design" stops
+treating an overlapping-VRF topology as a hazard to revisit.
+
+Added `vrfOverlapForeclosingTokens` and widened the test to scan both groups.
+Adding a DIRECTION is not the same act as growing a list — one covers an axis
+with zero coverage, the other chases an infinite tail — and the comment now says
+so, so the two do not get confused later.
+
+**ADD-2 — helper doc.** Already folded in round 4: `vrf2387Warnings` now
+documents that it selects on the diagnosis phrase, deliberately not on `#2387`.
+
+**Correction to round 4's own comment.** It said the control defends against
+"wholesale" deletion being caught elsewhere; the reviewer's framing is sharper
+and the round-4 text was imprecise in the other direction — it asserted the gut
+"reds only this test", which is false. Measured below: the gut also reds
+`TestVRFOverlapWarnsOnOverlappingRIs`, because that gut drops "NOT
+session-isolated". The cell where the control is the ONLY red in the file is the
+discriminator-clause strip. The comment now states exactly that.
+
+| Mutation | subs | Promise | Substance | 6 pre-existing |
+|---|---|---|---|---|
+| baseline | 0 | GREEN | GREEN | ALL GREEN |
+| APPEND foreclosing (wontfix/by design/permanent) | 2 | RED `wontfix` | GREEN | ALL GREEN |
+| SPLICE foreclosing BEFORE the tail | 2 | RED `by design` | GREEN | ALL GREEN |
+| SPLICE forward-looking BEFORE the tail | 2 | RED `planned` | GREEN | ALL GREEN |
+| APPEND the disclosed-escape wording | 2 | RED (suffix) | GREEN | ALL GREEN |
+| SPLICE the disclosed-escape wording before the tail | 2 | GREEN | GREEN | ALL GREEN |
+| GUT to a bare issue reference | 2 | GREEN | RED | 1 RED |
+| WHOLESALE delete the advisory | 2 | RED (helper) | RED (helper) | 2 RED |
+| literal FULL revert of both arms to master | 2 | RED `until` | RED | ALL GREEN |
+| strip every `#2387`, diagnosis intact | 4 | RED (suffix) | GREEN | ALL GREEN |
+| round-4 cells R4a-R4e, re-run | 2 ea | unchanged | unchanged | ALL GREEN |
+
+The two mid-message SPLICE cells are what prove each blocklist load-bearing in
+the span the suffix pin cannot reach; both fire naming a token from the intended
+group. Negative control for the prescribed addition: with
+`vrfOverlapForeclosingTokens` emptied, the foreclosing splice goes GREEN — so the
+new group, not something incidental, is what catches it.
+
+Two rows are honest limits rather than wins. Splicing the disclosed-escape
+wording (`the VRF-aware session key fixes this`) BEFORE the tail leaves both
+tests GREEN — that is the blocklist incompleteness the test file already
+discloses, and the suffix pin only reaches the append form of it. And the
+`#2387`-strip cell now fires at the suffix assertion rather than at the old
+issue-reference check; the defect did not move and the round-3 filter change
+stays.
+
+## 2026-08-06 — #6902 round 4: the assertions bound VOCABULARY, not the CLAIM
+
+- **Timestamp**: 2026-08-06 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three test-contract findings plus two comment corrections.
+  Test-file-only — the production warning strings are byte-identical to rounds
+  1 through 3, verified with `cmp` against a pristine copy after every
+  mutation cell below.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `_Log.md`
+
+**F1a — the substance test was polarity-insensitive.** It asserted the bare
+noun `"cross-forward"`. Rewriting `may cross-forward` to `cannot cross-forward`
+inverts the diagnosis — the operator is told the topology IS session-isolated,
+so the hazard reads as a reassurance — and both tests stayed GREEN. Verified
+firsthand at HEAD 690dba2c8 before the fix. A bare noun cannot carry polarity;
+the assertions now hold the claim as contiguous spans: `"the session identity
+carries no routing-instance discriminator"` and `"colliding 5-tuples may
+cross-forward"` (subject + modality + verb).
+
+**F1b — the promise test was a token blocklist, and only a blocklist.**
+Appending `"A fix is guaranteed."` to both arms reintroduces an explicit promise
+that no listed spelling matches; both tests stayed GREEN. Growing the list is
+the trap the list itself documents, so the fix is structural: a new
+`vrfOverlapStatusTail` constant that both arms must END with, verbatim. One
+suffix comparison forbids appending, truncating, and rewording the tail at once.
+The blocklist is retained as the secondary layer and its doc now says what it
+still uniquely covers — a promise spliced into the span BEFORE the tail — and
+that it must not be grown.
+
+**F2 — the PR's own new sentence was unpinned.** The assertion checked only for
+the presence of any `#2387`, and the message carried a `(#2387)` before this PR.
+Deleting the entire new tail — `"See #2387 for the status of this limitation"` —
+left the earlier reference in place and both tests GREEN. The deliverable, going
+unbound. `vrfOverlapStatusTail` pins the sentence, not the reference.
+
+| Mutation (production warning strings) | subs | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|---|
+| baseline | 0 | GREEN | GREEN |
+| `may cross-forward` -> `cannot cross-forward` | 2 | RED | RED |
+| append `A fix is guaranteed.` | 2 | RED | GREEN |
+| delete the `See #2387 …limitation` tail, keep earlier `(#2387)` | 2 | RED | GREEN |
+| restore `until the session identity is VRF-aware` (tail only) | 2 | RED | GREEN |
+| strip the `no routing-instance discriminator` clause, keep tail | 2 | GREEN | RED |
+| wholesale-delete the advisory text (F3 probe) | 2 | RED (helper) | RED (helper) |
+
+Every cell reports the substitutions APPLIED before its result was read: a
+pattern that silently matches nothing is a no-op wearing a passing guard, and it
+bit this exact matrix once — the clause-strip regex matched only the unequal arm
+(1 of 2) because the word "session" falls on a different concatenation line in
+each arm. Both isolating cells fire on BOTH arms. Every RED is an assertion
+message, never a build break; production restored from a pristine copy and
+`cmp`-verified after each cell. The first three rows were re-run against the
+pre-fix test file and measured GREEN/GREEN, which is what makes them findings
+rather than hypotheses.
+
+**F3 — a false claim in the test's own comment, endorsed in my brief.** The
+comment said that without the substance control, the promise test "is satisfied
+just as well by deleting the warning text wholesale". It is not:
+`vrfOverlapBothFormStrings` requires the diagnosis selector to match, exactly one
+warning per fixture, and both arm markers, so wholesale deletion reds the promise
+test at the helper first. Measured — the F3 probe row above fails at
+`compiler_validate_vrf_overlap_2387_test.go:311`, the fixture-count assertion, in
+BOTH tests. The control's real value is against PARTIAL stripping: text that
+still passes the selector and still ends with the exact tail but has lost the
+cause, the consequence, or the pairing. The comment now says that.
+
+**F4 — two stale comments.** The `vrf2387Warnings` doc still said it "returns
+the compile warnings that mention #2387"; it has filtered on the diagnosis
+phrase since round 3 (deliberately — filtering on `#2387` made the tracking-issue
+assertion unreachable). And the arg-count claim corrected in the round-3 entry
+above.
+
+No production behaviour change: the warning fires on the same configurations,
+with the same severity, and still commits. No module doc needs updating — this
+round changes test assertions and comments only, and the operator-visible
+warning text is unchanged from round 1, whose doc updates already landed.
+
+## 2026-08-05 — #6902 round 3: the identity assertions bound PRESENCE, not ASSOCIATION
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold four re-gate findings. Test-file-only — production warning
+  strings byte-identical to rounds 1 and 2.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F3 — the finding worth the round.** Round 2 added per-form identity
+assertions, but as a LIST OF TOKENS. Presence and association are different
+properties and only the second is useful: every identifier stays in the string
+while attached to the WRONG object. Both format strings interleave the two
+instances' identifiers — the equal-prefix arm substitutes FIVE arguments (two
+name/origin pairs plus the single prefix they share), the unequal arm SIX (a
+full (name, origin, prefix) triple each) — precisely where a transposition
+happens, and `go vet` cannot see it, because every argument is a string or
+Stringer feeding %q/%s. (Round 4 correction: this paragraph originally called
+both arms "6-argument Sprintf calls carrying three (name, origin, prefix)
+triples", which is wrong on both counts for the equal-prefix arm.)
+
+Measured on the round-2 form: swapping the two origins, the two RI names, or the
+two prefixes each left `go test ./pkg/config/ -count=1` fully GREEN and
+`go vet ./pkg/config/` silent, while the operator was sent to the wrong
+interface or told the wrong prefix sits on the wrong instance — the same
+"told the hazard but not where" failure round 2 was written to prevent, one
+level down. Replaced with ORDERED PAIRINGS held as one contiguous substring. A
+strict replacement, not an addition: a strip breaks the pairing too.
+
+| Mutation (arg transposition in the Sprintf) | substance test |
+|---|---|
+| baseline | GREEN |
+| equal arm, origins swapped | RED |
+| equal arm, RI names swapped | RED |
+| unequal arm, origins swapped | RED |
+| unequal arm, prefixes swapped | RED |
+
+**F4 — an assertion that could not fail.** The `#2387` check was unreachable:
+the helper pre-filtered on the same substring, so every warning reaching it had
+already been selected for containing it. Dropping #2387 failed the fixture's
+COUNT assertion instead, with a message about the wrong thing. The helper now
+filters on the diagnosis phrase ("overlapping L3 across routing-instances"),
+which both arms carry and no other warning does. Verified: removing BOTH #2387
+occurrences from the unequal arm now fires the intended assertion with the
+intended message. (One occurrence is not enough — the tail carries a second.)
+
+**F2 — one of my unmeasured guesses was off-target.** Round 2 added six sibling
+tokens on top of four measured escapes. "work is under way" fires only on that
+exact four-word spelling and misses "underway" and "in progress" — the phrasing
+actually measured. "temporarily" was a good add ("temporary" is not a substring
+of it). Added the eleven still-escaping spellings the review measured, and kept
+"work is under way" with a comment recording it as the worked example of
+reaching for an imagined phrase instead of an observed one.
+
+**F5 — not folded, recorded here instead.** The round-1 COMMIT MESSAGE says "No
+runtime behaviour changes". The operator-facing warning TEXT changed, which is
+runtime output — it is the entire PR. The clause after the dash is right; only
+the headline overstates. The commit is pushed and rewriting it would move the
+PR head for a prose fix, so the correction lives here and in the PR body: the
+accurate statement is "no behaviour change beyond the warning text".
+
+**F6 — validation record was incomplete, not wrong.** Rounds 1-2 claimed only Go
+legs. `userspace-dp/tests/vrf_session_identity_doc_guard.rs` asserts on BOTH
+docs round 1 edited, including plan anchors on the very bullets it rewrote, and
+`make test` runs both legs (#4006). Ran it: `cargo test --test
+vrf_session_identity_doc_guard` -> ok, 2 passed, 0 failed. No defect; the record
+just never named the leg the diff put at risk.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; `cargo test --test vrf_session_identity_doc_guard` ok
+(2 passed); every restore verified byte-identical with `cmp`.
+
+## 2026-08-05 — #6902 round 2: the mutation recipe in the shipping comment was false
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording, PR #6902)
+- **Action**: Fold three hostile-review findings. Test-only — the production
+  warning strings are byte-identical to round 1.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+**F1 — the recipe did not do what it said.** The header comment claimed that
+"restoring the old …until the session identity is VRF-aware wording" reds the
+promise test while the substance test stays GREEN. Reproduced firsthand: a
+LITERAL revert to the pre-PR string reds BOTH. The old string also lacked the
+"no routing-instance discriminator" clause, so reverting changes two things at
+once — re-adds the promise AND removes the diagnosis. The isolating mutation is
+a TAIL-ONLY substitution that keeps the discriminator clause; the comment now
+prescribes exactly that and warns not to read a both-red result as "the tests do
+not separate". Worth keeping: that the old text trips the substance test proves
+the replacement is strictly more informative than what it replaced.
+
+**F2 — the blocklist was a guess, and the review measured the escapes.** Four
+spellings reintroduced a promise while the test stayed GREEN: "not yet",
+"pending", "temporary", "in a later release". Added those plus siblings
+("temporarily", "for now", "interim", "to be addressed", "work is under way",
+"soon"), each re-verified RED after injection. The list comment now states
+plainly that a blocklist is incomplete by construction — green means "contains
+none of these", NOT "contains no promise" — and that any addition must be shown
+green before being listed.
+
+**F3 — the diagnosis was identified by nobody.** The substance test asserted
+only the explanatory prose, so the RI names, the config origins and the prefixes
+were all strippable with `pkg/config` fully green: an operator would be told a
+cross-forwarding hazard exists but not where. Added per-form identity
+assertions, including BOTH prefixes on the unequal-overlap arm — printing only
+one loses the overlap that arm exists to report.
+
+Mutation matrix, each dimension binding independently:
+
+| Mutation | promise test | substance test |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| tail-only promise restore (the isolating one) | RED | GREEN |
+| blank the RI name, equal-prefix arm | GREEN | RED |
+| duplicate the prefix, unequal-overlap arm | GREEN | RED |
+| literal full revert | RED | RED (expected — two changes) |
+
+Each of the four F2 escapes verified RED after being listed. All arg-count-
+preserving mutations, so every red is an assertion and not a build break.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.6s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean; restores verified byte-identical with `cmp`.
+
+## 2026-08-05 — #2387 A.1: the warning promised an outcome #2387 has not decided
+
+- **Timestamp**: 2026-08-05 (fix/2387-a1-warning-wording)
+- **Action**: Reword the `validateVRFOverlap` commit warning so it states the
+  CURRENT limitation and points at #2387, instead of promising that the session
+  identity becomes VRF-aware. Add two tests that keep forward-looking wording
+  out of both format strings without letting the diagnostic be gutted.
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`,
+  `pkg/config/compiler_tailgates.go`,
+  `docs/research/2387-vrf-flow-identity/plan.md`,
+  `userspace-dp/src/afxdp/forwarding/README.md`
+
+The shipped text said colliding 5-tuples may cross-forward "until the session
+identity is VRF-aware". #2387 is held on a maintainer risk-appetite call and
+neither candidate end-state — the hard-reject posture, or the VRF-aware session
+key (Track B) — is decided, so that clause asserted an outcome that may never
+arrive. It was also circular: the #2387 plan cited the warning text back as
+evidence that the widening was already settled, while the warning had been
+written from the plan's assumption. Both sides are now decoupled; the plan
+bullet that leaned on the warning records that the argument is retired and is
+evidence for neither branch.
+
+Mutation proof (a guard is worthless until watched to fail), 2x2, orthogonal:
+
+| Mutation | StatesStatusNotPromise | KeepsDiagnosticSubstance |
+|---|---|---|
+| baseline | GREEN | GREEN |
+| restore "until…VRF-aware" in both format strings | RED (both arms) | GREEN |
+| strip diagnostic substance, keep no-promise wording | GREEN | RED |
+
+The second row is the negative control: without it, the no-promise test is
+satisfied just as well by deleting the warning text wholesale. The fixture
+helper asserts each arm was actually reached (`both carry` vs `carry
+overlapping L3`) before asserting on it — a single fixture binds one match arm,
+so a "both format strings" claim made from one fixture would be vacuous.
+
+A first mutation attempt was a no-op: the substitution anchored on the wrong
+tab depth, matched nothing, and the suite stayed green — which is
+indistinguishable from a passing guard. Counting the applied substitutions
+before reading the result is what caught it.
+
+Validation: `go test ./pkg/config/ -count=1` ok (15.9s); `go vet ./pkg/config/`
+clean; `gofmt -l` clean on all three Go files; post-mutation restore verified
+byte-identical with `cmp`.
 ## 2026-08-06 — #6864 round 2: ParentIndex is not a VLAN parent for every link kind
 
 - **Timestamp**: 2026-08-06 (fix/5275-arm-failclosed, PR #6864)
@@ -68055,6 +69341,47 @@ break — `go vet` confirmed passing under every revert.
   pkg/daemon/userspace_sync_session_id_6198_test.go,
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
+- **Timestamp**: 2026-08-01 16:55
+- **Action**: #6655 review fold round 6 — two guards I added in earlier rounds
+  assert a PROXY rather than the property their own message claims. (F1) The
+  corpus floor `assert!(cases.len() >= 200, "...every assertion in this file
+  passes vacuously on a short corpus...")` was a VACUITY floor wearing a
+  COVERAGE message: 256 of the 310 cases come from one `for p in 0..=255` loop,
+  which clears 200 by itself with 56 to spare, so the floor could not see all 54
+  hand-crafted boundary cases deleted. Measured firsthand on the untouched
+  round-5 file: corpus cut to that sweep AND the generic arm's post-advance
+  bounds revalidation deleted from `ipv6_ext_walk.rs` — the security property —
+  left all five tests `ok`, `cargo test` rc 0. Replaced with five floors, each
+  binding ONE named shape and each stating what it does NOT cover: the
+  hand-crafted block counted BEFORE the sweep (>= 40 of 54); per-arm
+  boundary-tight coverage (>= 2 each for GENERIC/AUTH/FRAGMENT, MEASURED as this
+  crate's walker failing closed rather than by re-deriving each arm's advance
+  target, which would re-model the walk this file exists to stop modelling);
+  the resolvable chain-length boundary straddled (>= 1 case resolving at offset
+  40 + 8*(MAX_IPV6_EXT_HEADERS-1) and >= 1 OverLimit); all 256 next-header
+  values present as a first header; and the L3 offsets. (F2)
+  `assert!(L3_OFFSETS.len() >= 3, ...)` asserted a proxy — `[0, 0, 0]` has
+  length 3 and restores exactly the l3-blindness the message described — split
+  into `any(|&o| o != 0)` (what makes the `l3_offset -> 0` revalidation-base
+  mutation observable) plus `contains(&0)` (the offset
+  `walk_ipv6_ext_chain`'s other callers pass). All five floors read only the
+  corpus bytes and this crate's walker, so no acceptance-matrix shim mutation
+  can move one; neither negative control calls `parity_corpus()`, so a floor red
+  leaves both CONTROL columns `ok` and the harness's attributability rule holds.
+  Proved by a 12-row mutation matrix: for each floor, a corpus edit that the OLD
+  floor scored GREEN and the NEW floor reds on, with `cargo build` + `cargo test
+  --no-run` rc 0 in every row (a build break would be a false red), the specific
+  assertion named with its message, `shim_ipv6_ext_walk_matches_userspace_walker`
+  and both controls staying `ok` (the guard is scoped, not blanket), and a
+  byte-exact sha256 restore after each. Docs: corrected the stale `run()`
+  contract comment in `test/mutation/shim-ext-parity-acceptance.sh` (it still
+  said "0 green, 1 red, 2 build failure" after `return 3` for a moved control was
+  added), and scoped `pkg/dataplane/README.md`'s "the corpus proves the walk
+  behaves identically" to the dimension the shim actually represents — the shim's
+  walk returns `(offset, protocol)` and no fragment state, which is #6704, open
+  and pinned rather than fixed.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, pkg/dataplane/README.md, _Log.md
 - **Timestamp**: 2026-08-01 09:15
 - **Action**: #6526 — a security-policy `match` leaf written with NO OPERAND
   satisfied the #3044 required-dimension gate and compiled to the
@@ -68083,6 +69410,240 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+
+## 2026-08-01 — #4555 round 7: the replacement corpus floors were themselves proxies
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Third layer of one defect. Round 5 had a single
+  `cases.len() >= 200` floor that 256 sweep cases cleared alone. Round 6
+  replaced it with five floors "each binding one shape". Three of the five
+  bound CORRELATES of their shape, and ONE corpus edit defeated all three
+  with all five still passing.
+
+  **Reproduced before fixing.** Applied the degenerate corpus (40 pre-sweep
+  filler entries, two 40-byte unreadable-header stubs per arm, one padded
+  `DestOpt(len=6)`, one eight-header chain, the sweep replaced by 256
+  seven-byte stubs, `L3_OFFSETS` untouched) TOGETHER with the shim's GENERIC
+  post-advance revalidation deleted: all five parity tests reported `ok`.
+  Each defeat also confirmed individually in the same run — a 40-byte packet
+  satisfies `b[6] == arm && fails_closed` while `raw_shim_walk` returns
+  `None` at the arm's INITIAL two-byte read; the two FRAGMENT cases the
+  "more than one magnitude" claim rested on are BYTE-IDENTICAL (both 47
+  bytes, `b[40] = TCP`, rest zero); `chain(&[(DEST, 6)], TCP, 0)` — ONE
+  header — resolves `L4(96, TCP)`, the same offset a seven-header chain
+  lands on; and 256 seven-byte buffers give `distinct == 256` with both
+  walkers rejecting before the fixed IPv6 header.
+
+  **M-1..3 — floors now bind by CONSTRUCTION and MEASUREMENT, not by a
+  count of predicate-satisfying cases.** A count has degenerate satisfiers;
+  a named buffer that must be present byte-for-byte, and must behave as
+  claimed, does not.
+
+  Floor 1 is a WITNESS PAIR per `ARM_BOUNDARIES` entry: the padded twin
+  (exactly `target` bytes) must resolve the terminal at exactly `target`,
+  which can only happen if the arm ran its advance and landed there — that
+  is what proves the boundary was REACHED — and the tight twin, one byte
+  shorter and otherwise identical, must fail closed, which attributes the
+  refusal to the length check rather than an earlier read. `FailClosed`
+  alone was the round-6 proxy: it loses WHICH read failed. The entry's
+  named arm is checked against `userspace_class(proto)`, so a witness
+  cannot report coverage of an arm it does not exercise. Per-arm counts
+  are over DISTINCT declared lengths and are DERIVED: an advance error
+  `f(l) + a*l + b` is invisible wherever `a*l + b == 0`, and an affine
+  expression vanishing at two distinct `l` is identically zero, so
+  GENERIC/AUTH need 2 distinct lengths; FRAGMENT's read and advance take no
+  declared length, so its error family is the constant `f + b` and one
+  witness excludes it. Counting distinct LENGTHS rather than cases is what
+  kills the byte-identical duplicate.
+
+  Floor 2 rebuilds the chains of exactly `MAX_IPV6_EXT_HEADERS - 1` and
+  `MAX_IPV6_EXT_HEADERS` minimum-size DestOpt headers and requires both by
+  byte identity, plus their measured verdicts — terminal offset is no
+  longer a stand-in for header COUNT. Floor 3 rebuilds the canonical
+  68-byte single-header case for each of the 256 next-header values,
+  requires each by byte identity, and requires each NOT to fail closed,
+  which is the direct statement that the walk got far enough to classify
+  the value. Floor 4 (new) requires the two `DestOpt(len=15)` chains the
+  statement-outside-the-match mutation needs. Floor 5 MEASURES the L3
+  offsets with `frame_l3_offset` on the prefixes `at_l3` builds, so
+  `[0, 14, 14]` — which satisfied round 6's `any(!= 0)` + `contains(0)` —
+  now reds.
+
+  Round 6's floor 1 (`handcrafted >= 40`) was DELETED rather than kept: 40
+  is not derivable from any property, and the identity floors subsume
+  "the block was not removed wholesale".
+
+  Every floor reads only the corpus bytes and this crate's walker, so a
+  floor red is always a corpus defect and never a shim finding — confirmed
+  by both CONTROL columns and the manifest-facts guard staying `ok` in
+  every RED row.
+
+  **M-4 — acceptance row 9 mutated GENERIC and AUTH together** but scored
+  RED on either arm reding, so it could not support the "both arms" claim
+  its label made: GENERIC alone could red while AUTH coverage had
+  degenerated. Split into per-arm rows 9 and 10 (12 mutation rows now).
+  Added property 5 to the harness header ("one mutation per row, and one
+  ARM per row"), and per-row accounting at the tail so quoted evidence is
+  checkable against the matrix rather than against a bare `PASS`.
+
+  **M-5 — the precondition compared the worktree against the INDEX.**
+  `git diff --quiet -- "$WALK"` while printing "differs from git HEAD": a
+  STAGED mutation passes, and the script's own abort text spells out the
+  consequence — it would be captured as GOLD and restored as pristine, so
+  the whole matrix runs against a poisoned baseline. Verified by staging a
+  mutation: the old check returned rc 0, `git diff --quiet HEAD --` returns
+  1. Fixed; it is the only git comparison in the file.
+
+  **MINORs.** `cmd/shimverify`'s decision is now a testable `decide(stats,
+  overridden) -> shimverifyDecision`, with every (stats, override)
+  combination pinned in `cmd/shimverify/main_test.go` including the exit-6
+  override-success arm; the pkg/dataplane test that CLAIMED to pin that
+  decision only re-asserted `Measured()` and `HeadroomPct()` and is now
+  scoped to the invariant it does carry (the floor must stay strictly
+  positive, or unmeasured stats read as acceptable in a caller that skips
+  `Measured()`). The recipe exit-code list gained `6)` and — found by a
+  scope-edge mutation while RED-proving it — is now matched as a case
+  PATTERN AT LINE START: `strings.Contains(recipe, "6)")` was satisfied by
+  `66)`, so renaming the arm left it green. The FragHdr compile-time
+  assertion is matched as a `const _: () = assert!(` item at line start
+  rather than a raw substring a comment satisfies. `main.go`'s claim that
+  an override is visible "in the manifest" was false — the manifest carries
+  the object hash, the shim facts and hashed inputs, and no override status
+  — and now says so. The negative control's claim that a plain packet
+  "never enters a `match` arm" was wrong: it enters the loop, classifies,
+  and takes the terminal catch-all; the added `if offset > 200` statement
+  runs there and is false, which is what makes it a control. README scoped
+  the "vacuous on an empty corpus" claim to the corpus-CONSUMING assertions.
+
+- **Validation**: per-floor RED matrix (6 corpus-only mutations, each
+  `cargo build` rc 0 + `cargo test --no-run` rc 0 in the red state, both
+  CONTROLs `ok`, manifest-facts guard `ok`): F1a distinct-length collapse,
+  F1b wrong-arm entry, F2 seven-header chain replaced by the same-offset
+  one-header proxy, F3 sweep replaced by unwalked stubs, F4 long chains
+  deleted, F5 `[0,14,18] -> [0,14,14]` — all RED, restore byte-exact.
+  Go RED proofs: `decide` returning 0 on unmeasured RED; floor 0.0 RED;
+  recipe arms `0)`, `5)`, `6)` renamed RED. `ipv6_ext_walk.rs` is
+  byte-identical to HEAD, so no `make generate` and the object hash is
+  unchanged. `cargo fmt --check` delta measured against a throwaway
+  detached worktree at the parent: 2501 -> 2498 hunks over the same 328
+  files, all three removed from `tests_shim_ext_parity.rs`, zero added
+  anywhere.
+- **File(s)**: userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  test/mutation/shim-ext-parity-acceptance.sh, cmd/shimverify/main.go,
+  cmd/shimverify/main_test.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  pkg/dataplane/README.md, _Log.md
+
+## 2026-08-01 — #4555 round 8: the tested function was not the binary's decision
+
+- **Timestamp**: 2026-08-01 (fix/4555-ext-hdr-parity, PR #6655)
+- **Action**: Hostile re-gate at e2a85e311 returned MERGE-NEEDS-MAJOR with two
+  HIGHs, four MEDIUMs and a LOW — every one in the verification apparatus, none
+  in the shipped walk. `userspace-xdp/src/ipv6_ext_walk.rs` is byte-identical to
+  e2a85e311, the tracked object and manifest are unchanged, no `make generate`.
+  All seven reproduced BEFORE being fixed; none failed to reproduce.
+  - **(H1) THE GATE'S GUARD COULD NOT FIRE ON THE GATE.** Round 7 extracted
+    `decide(stats, overridden)` and unit-tested every combination — and left
+    `main` calling it and then INDEPENDENTLY repeating both predicates
+    (`!stats.Measured()` at main.go:83, `headroom < floor` at :111) to choose its
+    branch AND its `os.Exit`. Reproduced end to end: with `if false {` at :111,
+    `go build` rc 0, `go vet` rc 0, `go test ./cmd/shimverify/` **ok**, and a
+    scratch build with a 990796/1000000 stub printed
+    `LOW-HEADROOM ... headroom 0.92%` and **exited 0** — which the recipe's
+    `0) ;;` arm installs. That is origin/master's pre-#4555 fail-open restored
+    underneath a green suite, with the status word on stdout even saying
+    LOW-HEADROOM. Fixed by making `decide` the sole decision: it now carries a
+    `refusal` discriminant, `run(argv, stdout, stderr, getenv, verify)` presents
+    the verdict and returns `decision.exit` on every path, and `main` is
+    `os.Exit(run(...))` and nothing else. `TestShimverifyRun` drives the real
+    control flow with all four process boundaries injected and asserts the exit
+    status plus the stdout status word for eleven arms;
+    `TestShimverifyRunNeverExitsZeroWithoutMeasuredHeadroom` states the property
+    the codes exist for.
+  - **(H2) THE SUBSTRING BUG WAS FIXED AT THE POINT FOUND, NOT ACROSS ITS
+    CLASS.** Round 7 anchored the recipe's `case` arms so `6)` no longer matches
+    `66)`, and left the two assertions beside it substring-matching the same
+    file. Reproduced: replacing build-userspace-xdp.sh:129 with
+    `true # sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=..." "${SHIMVERIFY}" ...`
+    left `TestBuildRecipeHandlesShimverifyExitCodes` PASSING while non-root
+    `make generate` skipped verification entirely and installed through `0)` —
+    the unverified-install path the script's header says does not exist. Search
+    scope, enumerated rather than eyeballed: every `strings.`/`regexp.`/`bytes.`
+    call in the file (11 sites, 4 of them matching source text: the arm parser,
+    the override mention, the sudo hop, the FragHdr assertion), plus every Go
+    file in the repo that reads `build-userspace-xdp.sh` (11 — the other 10 use
+    it as a path, not as text) and every `_test.go` that names a `.sh` (11 — the
+    other 8 are unrelated scripts). Fixed by routing every recipe match through
+    `shellCodeLines`, a comment-stripping filter with its own two-direction test,
+    and requiring the invocation at the START of a code line in BOTH branches of
+    `run_verifier` — the root branch had no assertion at all, so commenting IT
+    out was invisible to the fix the finding asked for.
+  - **(H3) THE DELETED COUNT FLOOR WAS NOT SUBSUMED.** Round 7 deleted
+    `handcrafted >= 40` arguing the identity floors subsume it. Reproduced:
+    floors 1-4 require ten boundary buffers, two chain-length twins and two long
+    chains — 14 cases — so deleting the ten varied-HbH cases and the ten
+    truncation cases takes the hand-written count 55 -> 35 with every floor
+    green. Not restored as a count (the threshold was arbitrary and a count has
+    degenerate satisfiers): floor 6 binds the BLOCKS, rebuilding each of the
+    eight named categories locally and requiring every member by byte identity,
+    so deleting a category names that category in the failure. Blocks floored:
+    chain lengths 0..=10, declared lengths 0/1/2/5/15 (alone and followed by
+    DestOpt), long chains, truncation, minimal per-arm, non-first fragments,
+    Fragment composition, AH sweep + Mobility. Deliberately NOT floored there:
+    the 256-value sweep (floor 3) and the boundary witness pairs (floor 1),
+    bound where they are constructed.
+  - **(M1) the "every reachable combination" claim omitted the exact-floor
+    case.** `<` vs `<=` was indistinguishable to every fixture. Added
+    970000/1000000, which is exactly 3.00% in IEEE-754, to both decision tests.
+  - **(M2) THE 256-VALUE FLOOR WAS CIRCULAR.** Both the corpus entries and the
+    floor's expectations came from `chain`. Reproduced by reasoning through the
+    named edit: making `chain` write TCP at byte 6 for every one-header input
+    collapses the corpus to one distinct next-header value, moves no verdict on
+    either walker, and leaves the floor reporting 256 present because it rebuilt
+    the same degenerate bytes. Broken by `expect_chain`, an independent
+    reconstruction used by floors 2, 3, 4 and 6 — which is also what makes the
+    256 values distinct, since 256 buffers differing at byte 6 are 256 different
+    buffers and each must be present byte for byte. A separate
+    `distinct(b[6]) == 256` assertion was written and then deleted: the bytes it
+    counts are the ones the floor's own loop just wrote, so it was `X == X`.
+  - **(M3) asserted-not-executed integrations beyond `parse_l2`.** Confirmed
+    empirically that the shim's entry points cannot be run here:
+    `cargo build --target x86_64-unknown-linux-gnu` on userspace-xdp fails with
+    "unwinding panics are not supported without std". So the comment now
+    enumerates all four — `parse_l2`'s offsets, `parse_ipv6`'s arguments to the
+    walk, `parse_l4`'s catch-all behind the OverLimit fold, and the
+    manifest-to-object relationship — instead of naming one, which read as a
+    claim the rest were covered.
+  - **(M4) the acceptance harness's baseline was still fail-open.** Reproduced
+    twice against the real precondition block: an archive with no `.git` printed
+    `UNVERIFIED` and ran every row against a `*8 -> *16` mutation captured as
+    GOLD; and `git update-index --assume-unchanged` flipped
+    `git diff --quiet HEAD` from rc 1 to rc 0 with the mutation on disk, so the
+    check printed "matches git HEAD (index included)" — a positive claim that
+    was false. Fixed by moving the verification BEFORE the capture (it was 138
+    lines after it), aborting instead of warning when git cannot answer, and
+    requiring an `ls-files -v` tag of `H`. The tree-cleanliness prose no longer
+    overclaims: exactly one path is compared against git, and the guard/control
+    files are covered behaviourally by rows 0 and 12.
+  - **(L1) the FragHdr checker accepted a comment.**
+    `const _: () = assert!(true); // mem::size_of::<FragHdr>() == 8` satisfied
+    it; line comments are now stripped by `rustCodeLine` first.
+  - **Also**: the tight boundary witnesses' `FailClosed` is now attributed —
+    the tight twin must be the padded twin minus exactly its last byte, asserted
+    before the verdict is read. The truncated-Fragment `None` and the short-stub
+    `FailClosed` controls gained positive companions (a complete 8-byte Fragment
+    header must resolve at 48; a buffer of exactly 40 bytes must resolve at 40)
+    so neither rests on a failure default. `compared == cases * offsets` was
+    tautological — the counter incremented inside the loops it claimed to
+    measure — and is replaced by a visited-set of `(l3, name)` pairs recorded
+    after each comparison, checked against the cross product built independently,
+    plus a distinct-names assertion so the set comparison cannot collapse two
+    cases into one.
+- **File(s)**: cmd/shimverify/main.go, cmd/shimverify/main_test.go,
+  pkg/dataplane/verify_userspace_shim_headroom_test.go,
+  test/mutation/shim-ext-parity-acceptance.sh,
+  userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs,
+  pkg/dataplane/README.md, _Log.md
 - **Timestamp**: 2026-08-05
   **Action**: #5275 PR1 — OBSERVE-ONLY dataplane arm-coverage proof. Computes
   whether the dataplane is armed for the surfaces the config requires and
@@ -68826,6 +70387,100 @@ break — `go vet` confirmed passing under every revert.
   filtering, and reversed multi-interface accumulation/order. The fixture
   closes the bond-member arm only; the comment claims only that arm.
 
+## 2026-08-06 — #6861 fold r1 (gate F1 BLOCKING / F2 REGRESSION / F3)
+
+- **Timestamp**: 2026-08-06 05:10 PDT
+- **Action**: F1 — the hard IPIP gate was bypassable on the peer. The strict
+  commit gate compiles only the submitting node (CompileConfigForNode), the RAW
+  group tree is what config-sync sends, and the standby ingests it leniently, so
+  a `${node}` config whose IPIP endpoint resolves only in `groups node1`
+  committed GREEN on node0 and installed the dead tunnel on node1. Generalised
+  the #5876 peer-effective mechanism into a SUBJECT REGISTRY that compiles the
+  peer view ONCE and runs every registered strict concern against it, and
+  registered the IPIP gate as the second subject. F2 — restored unit-level
+  coverage in ipipAnchorOnlyWarnings: collectAppliedTunnels applies every
+  non-nil unit tunnel with NO completeness screen, so a unit-level stanza still
+  builds a kernel anchor; the deleted #4788 validator warned on it and the
+  replacement did not, leaving that shape with neither rejection nor alarm.
+  F3 — the advisory's cause is now derived, so an incomplete endpoint is not
+  diagnosed as "every unit overrides it" when there are no units.
+- **File(s)**: pkg/config/compiler_peer_effective.go (new),
+  pkg/config/compiler_peer_effective_snat.go,
+  pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_peer_effective_4785_test.go (new),
+  pkg/config/ipip_anchor_only_4785_test.go (new),
+  pkg/configstore/store.go,
+  pkg/configstore/peer_effective_ipip_4785_test.go (new),
+  pkg/config/compiler_peer_effective_snat_5876_test.go,
+  pkg/config/compiler_nat_pool_overlap_5144_test.go,
+  pkg/config/compiler_zone_scoped_snat_pool_5875_test.go,
+  pkg/configstore/peer_effective_snat_5876_test.go, docs/config-schema.md,
+  docs/feature-gaps.md, docs/feature-coverage.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./... rc=0; go test ./pkg/config
+  ./pkg/configstore ./pkg/daemon -count=1 rc=0; `-run 4785` across pkg/config +
+  pkg/configstore = 40 `=== RUN` / 40 PASS, up from 25 at the PR head (measured
+  by moving the three new test files aside and re-counting); gofmt clean on
+  every touched file.
+- **NOTE — generalised rather than bolted on, deliberately.** A second
+  standalone peer entry point would run CompileConfigForNodeLenient — a FULL
+  compile — twice on every cluster commit, and the next concern three times.
+  ValidatePeerEffectiveSourceNATStrict is therefore renamed to
+  ValidatePeerEffectiveStrict; the 11 test call sites are a pure rename with no
+  assertion or fixture changes, and the source-NAT wrapper wording is
+  byte-identical so #5876's message assertions are untouched.
+- **NOTE — mutation matrix, 9 cells, every one an ASSERTION failure with
+  `go vet ./pkg/config ./pkg/configstore` rc=0.** Tunnel subject dropped from
+  the registry; store call dropped from compileTreeStrict; unit walk dropped;
+  cause split reverted to the single hard-coded string; unit walk stops keying
+  on mode; unit walk stops skipping EMITTED endpoints; peer id hard-coded to 1;
+  peer-node framing dropped from the wrapper; peerNodeID accepting ids with no
+  2-node peer. The over-reach guards — peer-only GRE still commits (both at the
+  validator and at compileTreeStrict), standalone is a no-op, the genuine
+  every-unit-overrides shape keeps its original diagnosis and remediation, a GRE
+  unit record raises nothing, an EMITTED unit endpoint is not double-reported —
+  stayed GREEN under the F1/F2/F3 reverts. The PR's own pre-existing negative
+  control (TestIpipAnchorAlarmDoesNotOverreach_4785) also fired under the
+  ignore-mode mutation. Each cell was grepped back out before its result was
+  believed and restored with a filecmp check against a pristine copy. An early
+  attempt at the framing mutation was a BUILD break (unused "fmt"); it was
+  rewritten to keep the import live so the cell is a real assertion.
+## 2026-08-06 — #2387: state what the VRF-overlap tests actually enforce
+
+- **Timestamp**: 2026-08-06
+- **Action**: correct two high-level comments that overclaimed the guard (comment-only)
+- **File(s)**: `pkg/config/compiler_validate_vrf_overlap.go`,
+  `pkg/config/compiler_validate_vrf_overlap_2387_test.go`
+
+A Codex gate and a hostile Claude gate reached the same finding by different
+routes: the DETAILED blocklist comments are honest about being incomplete, but
+the two HIGH-LEVEL summaries above them claim a semantic guarantee the tests do
+not provide.
+
+Codex measured the escape set rather than arguing it. Nine distinct foreclosing
+sentences and nine distinct promising sentences, none using a listed spelling,
+were each spliced before the status tail in both warning arms; all eighteen left
+`go test ./pkg/config` GREEN. Mechanism by shape, measured:
+
+| shape | suffix pin | token lists |
+|---|---|---|
+| APPEND after the tail | always catches | also, if listed |
+| REWORD inside the tail | always catches | also, if listed |
+| SPLICE before the tail | BLIND | listed spellings only |
+| PREPEND at the front | BLIND | listed spellings only |
+
+So the test-file header's "(5) ... with no forecast in EITHER direction before
+it" and the production comment's "keeps forward-looking wording out of BOTH
+format strings" both overstate. Corrected to state the split: the tail is pinned
+verbatim so nothing can be appended, reworded or dropped there; mid-message
+wording is caught only in spellings someone listed. The shipped text is neutral
+because it was written to be, not because the test would stop an author.
+
+Neither list is grown — that is the completeness trap the file's own doctrine
+note refuses, and growing it would trade a disclosed limit for a hidden one.
+
+Comment-only: every changed line is `//` or blank, verified by stripping the
+diff markers and filtering. `gofmt -l` clean, `go vet ./pkg/config/` 0,
+`go test ./pkg/config -run TestVRFOverlap -count=1` 0.
 - **Timestamp**: 2026-08-06
 - **Action**: #5275 PR1 review fold — F1 (MATERIAL): a VLAN child whose parent
   was cleanly `disable`d landed `CoverageUncovered` and drove `WouldGate`.
@@ -69136,7 +70791,147 @@ paragraph was rewrapped to 72 columns because the longer path overflowed;
 no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 `.rs` file is touched — this PR stays comment/doc-only.
 
+## 2026-08-06 — #6861 fold r2 (gate F1 / F2 NIT)
+
+- **Timestamp**: 2026-08-06 06:40 PDT
+- **Action**: F1 — bind the #1960 no-brick claim at the INGRESS. The tolerant
+  test drove CompileConfigLenient directly, but no-brick is a property of
+  Store.SyncApply / Store.Load, and nothing in the suite drove an IPIP config
+  through either; route SyncApply through the strict compile, or register the
+  gate outside lenientCompileOpts(), and every compiler-level test stays green
+  while a booting node is bricked and HA config sync alarm-loops. New
+  store-level test asserts SyncApply ACCEPTS the config, PRESERVES the stanza,
+  and warns EXACTLY once — standalone plus both cluster ingress views of the
+  peer-only `${node}` tree. F2 — documented the operator cost of a
+  whole-candidate strict gate in docs/feature-gaps.md.
+- **File(s)**: pkg/configstore/ipip_no_brick_4785_test.go (new),
+  docs/feature-gaps.md, _Log.md
+- **Validation**: go build ./... rc=0; go vet ./pkg/config ./pkg/configstore
+  rc=0; go test ./pkg/config ./pkg/configstore ./pkg/daemon -count=1 rc=0;
+  `-run 'Ipip|PeerEffective'` across config+configstore = 47 `=== RUN` / 47
+  PASS / 0 FAIL, up from 42 at fe3ce8708; gofmt clean.
+- **NOTE — both prescribed mutations RED as ASSERTIONS, `go vet ./pkg/config
+  ./pkg/configstore` rc=0 on each.** (a) SyncApply routed through
+  `s.compileTree` (strict): all three subtests fail at "SyncApply REJECTED a
+  config carrying a dead IPIP tunnel". (b) `lenientIpipTunnelMode` dropped from
+  `lenientCompileOpts()`: standalone and the node1 view fail the same way while
+  the node0 view correctly stays PASS — node0's effective view carries no
+  endpoint, so there is nothing for a strict gate to reject there, and the
+  per-view subtest structure is what makes that discrimination visible.
+- **NOTE — (b) also reddened the r1 peer-gate test, which is a real coupling.**
+  `ValidatePeerEffectiveStrict` builds the peer view with
+  `CompileConfigForNodeLenient`; with the lenient switch gone that compile
+  hard-fails, so the gate takes its "peer view will not compile at all →
+  out of scope" arm and returns nil, and
+  TestCompileTreeStrict_RejectsPeerOnlyIpip_4785 goes RED. The lenient switch is
+  therefore load-bearing for the STRICT peer gate as well as for boot safety —
+  worth knowing before anyone tightens it.
+- **NOT CHANGED**: registry order (first-failure-wins) and its comment, per the
+  reviewer's judgement that it matches compileTreeStrict's existing
+  return-on-first-error contract.
+
 - **Timestamp**: 2026-08-06
+- **Action**: Fold the F1 gate finding on PR #6861. `ipipAnchorOnlyText`
+  (compiler_validate_strict_tunnel_ipip.go) has two call sites — an
+  interface-level one and a unit-level one — that SHARED the
+  complete-but-unemitted fallback text. For a unit that text is wrong three
+  ways: it names a unit and then explains the interface-level stanza, it
+  inverts the direction of the suppression (the interface-level stanza
+  suppressed the unit, not the units overriding the interface), and its
+  remediation points at the wrong stanza.
+  REACHABILITY, verified against the emitter rather than taken from the
+  finding: `EmitTunnelEndpointNames` short-circuits an interface-level
+  `tunnel mode wireguard` stanza to ONE endpoint keyed by the lowest unit
+  (#1910, tunnelemit.go) and never visits the per-unit records, while
+  `collectAppliedTunnels` (pkg/daemon/daemon_run_routehelpers.go) applies
+  EVERY non-nil `unit.Tunnel` with no completeness or mode screen. So a unit
+  overriding to `mode ipip` with BOTH endpoints set is complete, unemitted,
+  and still gets a real kernel anchor. Enumerated the other two shapes to
+  confirm this is the whole branch: with `iface.Tunnel == nil` every non-nil
+  unit tunnel goes through `add` and a complete one IS emitted; with a
+  non-WireGuard interface-level stanza the emitter walks the units and emits
+  each unit's own TunnelConfig (#5635). Neither reaches the fallback. That is
+  why the new text names WireGuard specifically instead of "a different mode".
+  Added an explicit `isUnit bool` parameter rather than sniffing the `where`
+  string — the prefix is a display detail and must not become a control
+  input. Kept the incomplete-endpoint check FIRST: that cause is shared, and
+  an endpoint missing a half stays unemitted even once the slot cause is gone.
+  Corrected two comments that were themselves the reason this went unnoticed:
+  `ipipAnchorOnlyText`'s claim that an incomplete endpoint is "the ONLY way a
+  unit record reaches here" (false — it is the finding), and
+  `ipipMissingEndpointHalves`'s description of the `""` fallback as "a neutral
+  cause" (it is not neutral; it is the interface-branch cause, and reading it
+  as neutral is what let a unit be reported with it).
+  RENDERED TEXT, unit branch. BEFORE: `interfaces "wg0" unit 3 tunnel mode
+  ipip: no tunnel endpoint is emitted for the interface-level stanza (every
+  unit overrides it), ... Remove the interface-level `tunnel` stanza if the
+  per-unit tunnels are the intent.` AFTER: `... the interface-level `tunnel
+  mode wireguard` stanza takes the interface's single tunnel endpoint, so this
+  unit's own endpoint is never emitted even though it is fully configured, ...
+  Remove this unit's `tunnel` stanza to drop the dead anchor, or remove the
+  interface-level `tunnel` stanza if the per-unit tunnels are the intent.`
+  The interface branch renders BYTE-IDENTICAL before and after.
+  TEST. `TestIpipUnitUnderWireguardNamesTheSlotCause_6861` builds the shape the
+  finding describes and drives `ValidateConfig`, the real alarm entry point, so
+  the wiring is bound and not just the renderer. It asserts a precondition
+  first — exactly one endpoint emitted, it is the interface-level WireGuard
+  object keyed by the lowest unit, and unit 3 still carries a COMPLETE ipip
+  override — so a fixture that drifts into the missing-halves arm fails loudly
+  instead of measuring the wrong branch. Fixture producibility was checked the
+  hard way: a WireGuard stanza needs `tunnel wireguard listen-port` (a bare
+  `tunnel listen-port` is not the syntax and parses into a leaf nothing reads —
+  the trap an earlier round already hit), a decodable 64-hex private key, and
+  at least one peer.
+  REVERT PROBE. Deleted ONLY the `isUnit` branch body, leaving the signature
+  and both call sites intact, inside a throwaway `git archive` extract; the
+  worktree tree hash was verified identical before and after. `go vet` under
+  the revert exits 0, so an unused PARAMETER (legal in Go) cannot masquerade as
+  a build break. The new test then fails on THREE assertions, not a compile
+  error: "a UNIT record was given the INTERFACE record's cause ... the
+  direction is inverted", "the advisory does not name the interface-level
+  WireGuard stanza that took the interface's single endpoint slot", and "the
+  advisory does not offer the remediation that actually drops this dead
+  anchor". Exit 1.
+  OVER-REACH CONTROLS, run under the SAME revert, whole `4785|6861` set: 1
+  FAIL / 7 PASS. `TestIpipOverriddenAnchorKeepsTheOverrideCause_4785` — the
+  interface branch, where the shared default text is CORRECT, and the reason
+  this defect survived — stays GREEN, so the interface wording did not move.
+  The new `TestIpipIncompleteUnitStillNamesTheMissingHalf_6861` also stays
+  GREEN under the revert: it pins the PRECEDENCE, asserting that a unit that is
+  both incomplete and slot-suppressed still reports the missing half.
+  GATES, each unpiped: `go build ./...` rc=0; `go vet ./pkg/config` rc=0;
+  `go test ./pkg/config ./pkg/configstore ./pkg/daemon -count=1` rc=0;
+  `gofmt -l` clean on both touched files.
+  No doc change: the advisory text appears in no operator or module doc
+  (grep over docs/ outside the review/issue archives finds nothing), the alarm
+  is discovered through `show system alarms` rather than documented verbatim,
+  and no behaviour outside the rendered string changed — the set of records
+  that raise the advisory is identical.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+- **Timestamp**: 2026-08-06
+- **Action**: #5480 research plan — `docs/peer-boot-incarnation-plan.md`. Plan
+  only, no implementation, no wire change. Establishes that the incarnation
+  granularity is not a free choice: `initGenState` seeds `configGenCounter` from
+  a monotonic base precisely so generations survive "restarts within a boot", so
+  the incarnation must change exactly when CLOCK_MONOTONIC restarts — exactly on
+  OS boot — which makes `/proc/sys/kernel/random/boot_id` the one correct source
+  and rules out a process seed, a persisted counter, and the existing
+  `bulkSendNext` transfer epoch. Places the field in the `syncMsgBulkStart`
+  payload (8 -> 24 bytes) rather than the auth HELLO, because
+  `performSyncHandshake` returns immediately when unkeyed, so a HELLO-carried
+  field would make the guard silently absent on unkeyed clusters. The extension
+  uses this protocol's established length-gated pattern (`>= 8` on BulkStart,
+  `>= 24`/`>= 48` on the delete frames, the session payload's "all length-gated"
+  note). Recommends FAIL-OPEN on an absent incarnation, with the argument that
+  the fallback IS origin/master's behaviour, that it matches the existing
+  gen==0 / epoch==0 / (0,0) legacy sentinels, and that failing closed would
+  strand the standby for the whole rolling-upgrade window. Concludes NO flag day
+  is needed, but records the contingency explicitly: a fail-CLOSED requirement
+  would force one, because an upgraded receiver cannot distinguish an old peer
+  from a suppressing peer without a negotiated capability, and that capability
+  has nowhere to live unkeyed.
+- **File(s)**: docs/peer-boot-incarnation-plan.md, _Log.md
 - **Action**: #5084 SPLIT — the connection-epoch fence is removed from this PR
   and blocked on #5480. Seven review rounds established that the fence keys on
   `syncConnID`, a total ORDER over connections, when the predicate it needs is
@@ -69184,3 +70979,422 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-06 — #4785 fold r3: the IPIP anchor advisory keys on the RUNTIME DEVICE NAME (#6861 F1b/F2b/F2c/F3)
+
+- **Timestamp**: 2026-08-06
+- **Action**: `ipipAnchorOnlyWarnings` decided "unused anchor" by `*TunnelConfig`
+  POINTER identity against the emitter's output. Runtime identity for a tunnel is
+  the Linux DEVICE name, and several records share a device with an emitted
+  endpoint, so the advisory declared live traffic-carrying devices dead and told
+  the operator to delete them. Two shapes, both reproduced on this branch before
+  the fix:
+    - `ip-0/0/0 tunnel source/destination` + `unit 0 tunnel mode gre`. Unit 0's
+      per-unit tunnel takes the BASE Linux name (`compiler_interfaces.go`), the
+      same name the interface record carries, and `pkg/routing/tunnel.go` keys
+      its desired set by name — one device. The emitter publishes the unit's GRE
+      pointer (#5635), so the interface pointer is unemitted and `ip-0-0-0` was
+      reported as "nothing routed through it" while carrying the working GRE
+      tunnel.
+    - Interface-level `tunnel mode wireguard` with a sole `unit 3`. The emitter
+      keys ONE endpoint to the lowest unit carrying the INTERFACE-level pointer
+      (#1910), but `TunnelNameMap` resolves `wg0.3` to the UNIT's `wg0u3` — which
+      is what `snapshotLinuxName` writes into `InterfaceSnapshot.LinuxName` and
+      therefore what the tunnel endpoint (and the Rust WireGuard TUN behind it)
+      binds to. `wg0u3` is live WireGuard infrastructure; it was reported as a
+      dead IPIP anchor.
+  Detection now goes through `emittedTunnelDeviceNames`, built from
+  `cfg.TunnelNameMap()` — the same map `snapshotLinuxName` consults — so the
+  advisory cannot drift from the device the dataplane opens.
+- **Action**: both remediations corrected. They reach the boot/apply log and the
+  standing `show system alarms` surfaces, so an operator acts on them, and both
+  instructed a deletion that costs traffic. The interface branch's unconditional
+  "Remove the interface-level `tunnel` stanza" is replaced by
+  `ipipInterfaceStanzaRemovalAdvice`, which states the inheritance hazard
+  (`cloneForUnit` runs before a unit's own overrides, so a unit carrying only
+  `mode gre` holds INHERITED endpoints and stops emitting entirely) and the safe
+  ordering. The WireGuard-unit branch no longer offers removing the parent
+  stanza at all and says why: it deletes the working WireGuard tunnel AND exposes
+  the complete ipip endpoint underneath, which the strict gate then rejects. The
+  incomplete-endpoint branch is shared by both sites and carried the same
+  ambiguity, so it now scopes its deletion per site.
+- **Action**: three review follow-ups. `TestIpipUnitAnchorStillAlarms_4785`
+  asserted only the bare word `unit`, so it passed with the WRONG unit number —
+  now asserts `interfaces "ip-0/0/0" unit 5` exactly. `pkg/configstore`'s
+  no-brick test claimed to bind `Load` AND `SyncApply` but drove only SyncApply;
+  `TestLoadToleratesIpip_4785` adds the disk-boot half, persisting via
+  `db.WriteActiveMarker` (not SyncApply) so a strict-compile mutation lands on
+  its OWN `Store.Load REFUSED` assertion rather than a borrowed precondition.
+  The `lenientIpipTunnelMode` doc, `CompileConfigForNodeLenient`'s doc, and
+  `ValidatePeerEffectiveStrict`'s doc now record that the peer gate compiles
+  leniently from a STRICT commit path on purpose — tightening the flag turns the
+  peer compile into an error that the `err != nil -> return nil` arm swallows,
+  silently disarming the gate.
+- **Validation**: four disjoint mutations, each compiled (`go vet` 0) before
+  scoring, each restored to a byte-identical file (sha256 verified).
+  M1 (restore pointer identity) REDs only
+  `TestIpipSharedDeviceWithEmittedEndpointIsNotAnchorOnly_6861`, both subtests,
+  as ASSERTIONS — `device "ip-0-0-0" was declared DEAD ("carries no traffic")
+  but that device carries the emitted endpoint "ip-0/0/0.0"` and the `wg0u3` /
+  `wg0.3` twin — and leaves all 40 other cells in the IPIP cohort GREEN,
+  including `TestIpipOverriddenAnchorKeepsTheOverrideCause_4785` (a genuinely
+  dead distinct-name anchor must still warn — the over-reach guard).
+  M2 (restore the interface remediation) REDs the inheritance arm and the
+  incomplete arm, leaving the WireGuard arm GREEN. M3 (restore the WireGuard
+  alternative) REDs only the WireGuard arm. M4 (production reports `u+1`) REDs
+  the new exact-unit assertion, which the old bare-word form survived. M5 (set
+  `lenientIpipTunnelMode: false`) REDs `TestLoadToleratesIpip_4785` at its own
+  assertion. Both remediation arms carry a behavioural PROOF of the hazard
+  rather than a wording assertion alone: removing the interface stanza is shown
+  to emit ZERO endpoints, and removing the WireGuard stanza is shown to make
+  `CompileConfig` reject `tunnel endpoint "wg0.3" has mode ipip`.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (59 packages).
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/compiler_opts.go, pkg/config/compiler.go,
+  pkg/config/compiler_peer_effective.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #4785 fold r4: Codex MERGE-NEEDS-MAJOR — five findings (#6861 F1-F5)
+
+- **Timestamp**: 2026-08-06
+- **Action** (F1, blocking): the BARE-interface arm of the device derivation was
+  `LinuxIfName(ep.Name)`, which is NOT what `snapshotLinuxName` does — its
+  no-unit arm resolves a `reth*` name through `ResolveReth` first. So an emitted
+  `reth0` endpoint was recorded live under device `reth0` when the snapshot
+  binds it to the physical member `ge-0-0-0`. The harm is a FALSE POSITIVE on a
+  DIFFERENT record: `ge-0/0/0` carrying its own unemitted ipip stanza has anchor
+  device `ge-0-0-0`, so with the wrong derivation that device is missing from
+  the live set and the advisory calls a live, traffic-carrying device dead —
+  this gate's own defect class surviving in its fallback arm. Fixed by splitting
+  `resolveBareKernelIfName` out of `ResolveKernelIfName` (the sanctioned
+  config-side twin of `snapshotLinuxName`, drift-guarded in the userspace
+  package) and routing the bare arm through it.
+- **Action** (F1b): the predicate is now `!emitted[t] && !live[t.Name]` — the
+  emitted-POINTER test restored ALONGSIDE the device-name test, not instead of
+  it. A record that is itself emitted belongs to the strict gate and the
+  dead-endpoint advisory, which is this advisory's stated contract and what
+  `TestIpipEmittedUnitIsNotDoubleReported_4785` already asserted. Device-name
+  alone reported the emitted `reth0` record with a structurally false cause
+  ("every unit overrides it" on an interface with no units).
+- **Action** (F2, major): the peer-effective gate is now handed the tree AFTER
+  `rewriteRetiredDataplaneType`, on a CLONE. Peer ingestion (Store.SyncApply)
+  strips a retired `system dataplane-type` leaf BEFORE compiling, so a
+  `groups node1` block carrying BOTH a retired leaf and a complete `ip-*` tunnel
+  failed the unconditional retirement validator on the raw tree —
+  `ValidatePeerEffectiveStrict` treats a peer view that will not compile as out
+  of scope and returns nil, so the gate returned SUCCESS WITHOUT EVER RUNNING
+  its IPIP subject. Reproduced end to end before the fix: node0 committed green,
+  node1's SyncApply installed `ip-0/0/0` mode ipip. The clone matters — mutating
+  the candidate would strip the operator's own leaf out of the tree being
+  committed and out of what syncs.
+- **Action** (F3): the device lookup is now STRUCTURAL, keyed on the
+  (interface, unit) pair each emitted ref came from, rather than parsing the ref
+  string. `ip-0/0/0.0` is a legal authored interface name and collides with the
+  synthesized unit ref for unit 0 of `ip-0/0/0`. See the mutation note below —
+  this fix has no end-to-end consequence today and the test says so.
+- **Action** (F4): the incomplete-endpoint remediation for a unit under an
+  interface-level `tunnel mode wireguard` stanza recommended "configure both
+  endpoints (and use `mode gre`…)", which is INEFFECTIVE — the emitter publishes
+  only the LOWEST unit and continues past every other per-unit record, so a
+  completed or GRE-converted unit still emits nothing (verified by compiling
+  exactly that). Both WireGuard-slot arms now share
+  `ipipWireguardSlotRemovalAdvice`, which names the one action that works and
+  marks both tempting alternatives as ineffective / destructive. A fourth
+  instance of the same family, so the set is not assumed closed: the
+  complete-but-not-under-WireGuard arm now renders an explicit "cause not
+  recognised — inspect, do not delete" rather than inheriting WireGuard's.
+- **Action** (F5): four assertions overstated what they bind. `unit 5` is a
+  strict PREFIX of `unit 50`, so the "EXACT" unit assertion stayed green under a
+  wrong-unit formatter; both it and the WireGuard twin now anchor on
+  `interfaces %q unit %d tunnel mode ipip`. The shared-device test never asserted
+  the UNEMITTED candidate was ipip (flipping it to gre left the subtest green for
+  the wrong reason). `TestIpipTunnelUnitOverrideCommitsButRaisesAnchorAlarm_4785`
+  looped over "whatever exists", so zero endpoints satisfied it; it now asserts
+  the count and the identity.
+- **Validation**: five disjoint mutations, each compiled (`go vet` 0) before
+  scoring, each restored byte-identical (sha256). R4-M1 (bare arm back to
+  `LinuxIfName`) REDs the reth guard at `device "ge-0-0-0" was declared DEAD but
+  that device carries the emitted reth0 endpoint`. R4-M2 (ref-first lookup) REDs
+  the F3 derivation test at `device "ip-0-0-0.0" is missing from the live set`.
+  R4-M3 (restore the shared incomplete text) REDs at `the advisory still
+  recommends completing the endpoints as though that would help`. R4-M4 (raw
+  tree to the peer gate) REDs at `node0 COMMITTED a config that gives node1 a
+  dead IPIP tunnel`. R4-M5 (`u*10`) REDs the exact-unit assertions, which the
+  pre-F5 `unit 5` form survived.
+  **F3 scope, recorded rather than dressed up**: reverting the structural walk
+  changes NO advisory, because the record whose device was being stolen is
+  itself emitted and the F1b pointer test skips it first. The string-keying
+  defect is unreachable end to end; the test binds the derivation's own output
+  and states that limit in its doc comment.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/types.go, pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/config/ipip_tunnel_reject_4785_test.go, pkg/configstore/store.go,
+  pkg/configstore/ipip_no_brick_4785_test.go, docs/feature-coverage.md, _Log.md
+
+## 2026-08-06 — #6861 r4a: the two-clause anchor predicate carries its own rationale
+
+- **Timestamp**: 2026-08-06
+- **Action**: doc-only. After r4 restored the emitted-POINTER test alongside the
+  device-name test, `ipipAnchorOnlyWarnings`' doc comment still read "Detection
+  is by RUNTIME DEVICE NAME, **not** by *TunnelConfig pointer identity" — which
+  contradicted the code it sits above and reads as licence to delete the
+  `!emitted[t]` conjunct as a leftover. Rewritten to state that
+  `!emitted[t] && !live[t.Name]` is a deliberate two-clause design, that neither
+  clause subsumes the other, and that EACH was once the whole predicate and
+  wrong alone: pointer-only declared live shared devices dead (the original
+  #6861 defect); device-only reports an emitted `reth0` as a dead anchor with a
+  structurally false cause, duplicating a record the dead-endpoint advisory
+  already covers correctly. Also records the scope test that puts the orphan
+  `reth0` device in #6941 rather than #4785 — the same orphan appears under
+  `mode gre`, where #4785 is deliberately silent, so #4785 is not its cause.
+- **Rationale**: the shipping artifact has to carry the caveat. This reasoning
+  existed only in review correspondence; the next reviewer reading the code
+  would have found a comment arguing against one of its own clauses.
+- **Validation**: comment-only, no behaviour change. `go build ./...` 0;
+  `go test ./pkg/config ./pkg/configstore` 0.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go, _Log.md
+
+## 2026-08-06 — #6861 r5: every clause of the anchor predicate is now measured
+
+- **Timestamp**: 2026-08-06
+- **Context**: a parent mutation grid found the emitted-POINTER clause UNBOUND at
+  both sites — deletable from either predicate with the whole suite green — while
+  the r4 comment asserted it was load-bearing and told the next reader not to
+  simplify it. A comment was the only thing preventing the simplification. Both
+  resolutions were left open: the clause is real and untested, or it is redundant
+  and the comment is wrong.
+- **Action** (interface site — the clause is REAL, answer (a)): reproduced the
+  shape the comment claimed. A bare `reth0` with an interface-level ipip stanza
+  emits, and `snapshotLinuxName` binds that endpoint to the physical member
+  `ge-0-0-0` while the record's own anchor name stays `reth0`, so on the device
+  clause alone `reth0` is absent from the live set and is reported as a dead
+  anchor — a SECOND diagnosis of a record the dead-endpoint advisory already
+  covers, carrying the cause "every unit overrides it" on an interface with no
+  units. `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` now binds it.
+- **Action** (unit site — the clause is REDUNDANT, answer (b)): removed. Not
+  "could not find a case": TunnelNameMap keys a unit's device BY
+  `unit.Tunnel.Name`, and compiler_interfaces.go always assigns a non-empty Name
+  at construction, so an emitted unit record's device IS its own name and the
+  device clause necessarily holds it. The predicate is now deliberately
+  ASYMMETRIC and the comment says which site carries what, and why.
+- **Action** (a defect found while measuring): the unit arm deferred to
+  `ResolveKernelIfName` unconditionally, but that answers XFRM (`st<N>`) and IRB
+  refs BEFORE consulting the tunnel map, while `snapshotLinuxName` — which fills
+  the LinuxName the dataplane binds — consults the map first and has neither arm.
+  So `st0.1` resolved to `st0.1` instead of the unit's `st0u1`, and `irb.0` under
+  a bridge domain to `br-bd0` instead of `irb`: a device the dataplane never
+  opens entered the live set and the real one was left out. Fixed by consulting
+  TunnelNameMap first, mirroring snapshotLinuxName's ordering. This is what made
+  the unit-site pointer clause redundant — before the fix it was masking these
+  two mis-derivations.
+- **Validation**: four cells, each compiled (`go vet` 0), each restored
+  byte-identical. C1 drop iface device clause → RED (shared-device + reth-member
+  guards). C2 drop iface pointer clause → RED
+  (`TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861`). C3 drop unit device clause →
+  RED (three guards). C4 drop the TunnelNameMap-first ordering → RED
+  (`TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861`, both st and irb subtests).
+  No clause remains unmeasured: every one either reds a cell or was deleted.
+  `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+
+## 2026-08-06 — #6861 r6: two guards whose evidence did not reach the property they name
+
+- **Timestamp**: 2026-08-06
+- **Context**: a Codex leg at `7f8681369` (one commit behind head) returned four
+  findings. Its F1 (IRB/XFRM ordering) and F2 (missing emitted-record test) were
+  already closed by r5 at `25c6cb705` — VERIFIED against Codex's own verbatim
+  reproducer rather than assumed: its IRB config now yields `live={irb}` and
+  ZERO anchor advisories, and the r5 C2 cell already reds the pointer clause.
+  Its F2 also independently corroborates the (a)/(b) split r5 landed on. The two
+  remaining findings are both the same shape — a guard whose evidence does not
+  reach the property it names — and neither was a production defect.
+- **Action** (F3): `TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName` exists
+  to catch drift between `ResolveKernelIfName` and `snapshotLinuxName`, but the
+  whole `TunnelNameMap()` block could be DELETED from `ResolveKernelIfName` with
+  the guard still green. Every case in its fixture used a config where the map
+  answer and the fallback COINCIDE — `gr-0/0/0` carried only unit 0, whose map
+  answer (`gr-0-0-0`) equals the fallback's `unit.Number == 0 -> kernelBase`. The
+  fallback silently supplied the right answer, so the lookup was unobservable.
+  Added unit 1: a NONZERO unit under an interface-level tunnel is the shape where
+  they split (map/runtime `gr-0-0-0`, fallback `gr-0-0-0.1`).
+- **Action** (F4): the deleted `TestIpipTunnelDeadWarning` covered a unit-level
+  ipip tunnel with NEITHER source nor destination; its stated replacement
+  `TestIpipUnitAnchorStillAlarms_4785` covered only source-only and
+  destination-only. A unit loop that skipped records with both halves empty
+  therefore stayed green across the whole suite. Production warns correctly —
+  only the guard was lost in the relocation. Added the
+  `neither_source_nor_destination` subtest.
+- **Validation**: three cells, each compiled (`go vet` 0), each restored
+  byte-identical. F2 cell (drop `!emitted[t] &&`) REDs
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` at `the record was reported as
+  a DEAD ANCHOR even though its endpoint is emitted`. F3 cell (delete the
+  `TunnelNameMap()` block) REDs the drift guard at `drift: ref "gr-0/0/0.1" ...
+  got "gr-0-0-0.1", want "gr-0-0-0"` — it did NOT red before this round. F4 cell
+  (skip units with both halves empty) REDs the new subtest at `a unit-level ipip
+  stanza creates a kernel anchor device the operator can see, but raised NO
+  alarm`. `go build ./...` 0; `go test ./pkg/... ./cmd/...` 0 (60 packages).
+- **Docs**: none. Both changes are test-only; no behaviour, config surface or
+  operator-visible output changed this round.
+- **File(s)**: pkg/dataplane/userspace/interfaces_test.go,
+  pkg/config/ipip_anchor_only_4785_test.go, _Log.md
+## 2026-08-06 — #4408 increment 3a: lift the waterfill epoch refill (Option B')
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 epoch refill out of
+  `select_exact_cos_guarantee_queue_waterfill` into
+  `refill_waterfill_epoch(root, now_ns)`, `#[inline(always)]`, same
+  module. Pure motion: the 74 moved lines diff clean against master's
+  `:1000-1073` once leading whitespace is stripped, and the only
+  non-motion edit is the doc comment de-indenting from `    //` to `//`
+  as it becomes the helper's header. The block stays ATOMIC — the order
+  of the `waterfill_epochs` bump, the `epoch_boundary`-gated
+  honored-bitset clear, and `waterfill_epoch_wrap_pending = false` is
+  the #1743 r3 livelock fix, and the helper's header says so.
+- **Scope honesty**: this does NOT move the committed modularity metric.
+  `docs/refactoring-audit-current.txt` gates on file set and tier;
+  `queue_service/mod.rs` was 2166 `[REFACTOR]` and stays above the 2000
+  floor, so the tier is unchanged and `TestHeatmapNotStale` neither
+  fires nor needs a regenerated artifact (`go test
+  ./pkg/refactoraudit/...` ok). The value is reviewability of a state
+  machine, and nothing else.
+- **Validation**: call-edge baseline REGENERATED at this head, not
+  inherited from the plan (`docs/research/4408-hotpath-split/plan.md`
+  §2's artifacts are from `dd23119aa`). Raw, zero-normalisation Tier 1
+  on `service_exact_guarantee_queue_direct_with_info` (the symbol the
+  waterfill inlines into) — 32 edges, diff exit 0; on the untouched
+  `enqueue_pending_forwards` control — 51 edges, diff exit 0. `nm`:
+  neither the waterfill nor `refill_waterfill_epoch` is present, and
+  `service_exact_guarantee_queue_direct_with_info` holds at 0x619b.
+  Negative control: flipping the helper to `#[inline(never)]` puts it in
+  `nm` at 0x1eb and the Tier-1 diff reports the new edge — the gate is
+  watched failing, not assumed.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs, _Log.md
+
+## 2026-08-06 — #4408 increment 3b: split the waterfill's two selection walks
+
+- **Timestamp**: 2026-08-06
+- **Action**: Extract the Phase-1 ascending walk and the Phase-2
+  descending residual walk into `waterfill_phase1_select` /
+  `waterfill_phase2_select`, both `#[inline(always)]` and same-module,
+  leaving `select_exact_cos_guarantee_queue_waterfill` a 59-line
+  orchestrator (from 432) over refill -> Phase 1 -> Phase 2 -> wrap
+  tail. Pure motion: 175 + 108 moved lines diff clean against master's
+  `:1094-1268` and `:1280-1387` after stripping leading whitespace.
+  `Option` is a faithful encoding, not an invented protocol — every
+  non-selecting exit of each walk already converged on the same
+  successor in the original body.
+- **Finding (the reason this took a second pass)**: the plan's §7.2
+  mutation grid caught that `waterfill_phase2_select` was **completely
+  unbound**. Both prescribed cells — M5 "Phase 2 ignores the honored
+  bitset" and M6 "Phase 2 resets the cursor on each entry" — left the
+  full waterfill + refund suite GREEN. Every pre-existing fixture enters
+  Phase 2 with the largest class UN-honored (Phase 1 walks ascending and
+  runs out of budget before reaching it), so the descending walk lands
+  on an eligible queue at cursor 0 and neither the honored-skip nor the
+  cursor arithmetic is ever exercised. Two tests now bind it, built on a
+  fixture that honors the LARGEST class first by emptying the two small
+  queues so Phase 1 skips them, then refilling them so the next call
+  breaks into Phase 2 with ordinal bit 2 set.
+- **Validation**: 6-of-6 mutation grid, each cell a NAMED failing test
+  with an ASSERTION (never a build break), plus a negative control.
+  M1 (drop the `epoch_boundary` gate) REDs
+  `waterfill_exact_fit_honor_does_not_livelock_phase1`; M2 (reset the
+  cursor in the refill) REDs
+  `waterfill_exhausted_refill_does_not_reset_phase2_cursor` — "the
+  exhausted refill path must PRESERVE the Phase-2 cursor"; M3 (drop the
+  honored-bit set) REDs 8 tests incl. the #1732 distribution test; M4
+  (charge `send_budget` not `phase1_cost`) REDs 5 incl.
+  `waterfill_phase1_honor_charge_is_configured_quantum_not_tokens`;
+  M5 REDs both new Phase-2 tests; M6 REDs ONLY
+  `waterfill_phase2_cursor_resumes_instead_of_restarting_at_the_largest`
+  — "Phase 2 must RESUME the descending walk from the stored cursor",
+  left 1 right 0 — so the two new tests discriminate rather than
+  restate each other. The negative control (hoisting the
+  `waterfill_epochs` bump earlier inside the same block, semantically
+  null) stays GREEN, so the grid measures the code rather than
+  reporting "everything fails".
+- **Codegen**: raw zero-normalisation Tier-1 call-edge sets unchanged on
+  `service_exact_guarantee_queue_direct_with_info` (32 edges) and on the
+  untouched `enqueue_pending_forwards` control (51 edges).
+  `service_exact_guarantee_queue_direct_with_info` grows 0x619b ->
+  0x61cf (+52 B, +0.21%) with an identical call-edge set — scheduling
+  drift, not a new or lost callee. Negative control fires for all three
+  helpers. Three whole-binary residuals in modules this PR does not
+  open are classified in the PR body.
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/mod.rs,
+  userspace-dp/src/afxdp/cos/queue_service/tests/waterfill.rs,
+  docs/cos-validation-notes.md, _Log.md
+
+## 2026-08-12 — #4785 fold r7: the pointer-keying claim, measured properly
+
+- **Timestamp**: 2026-08-12
+- **Action**: Three review findings on #6861, all about claims outrunning their
+  evidence. No production behaviour changes.
+
+  **F1 — the interface site's emitted clause: pointer keying IS load-bearing,
+  but not for the reason the comment gave.** The r5 comment defended
+  `emitted[t]` (pointer-keyed) with the reth divergence and cited
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` as the measurement. That
+  measurement cannot support the claim: the cited test reds when the clause is
+  DELETED, which any check-exists test catches, and it stays GREEN when the
+  clause is re-keyed to `!emittedName[t.Name]` — because in its fixture the
+  emitted record IS the record under test, so both keyings agree.
+
+  Built the discriminating fixture instead. Two records share a `Name` only as
+  an interface-level record and its own unit 0 — where TunnelNameMap puts that
+  same name in `live[]`, so the device clause decides first — or as two
+  DIFFERENT interface keys canonicalizing to one Linux name, since LinuxIfName
+  only replaces '/' with '-' (`gr-0/0-0` is one character from `gr-0/0/0`; both
+  give `gr-0-0-0`). Combined with the one shape whose emitted device diverges
+  from its record's Name — interface-level WireGuard whose lowest unit is > 0,
+  where the emitter publishes the INTERFACE pointer at ref `X.u` (#1910) while
+  TunnelNameMap resolves `X.u` to the UNIT device — the name is emitted while
+  the device is not live, and the two keyings disagree.
+
+  SCOPE, now stated in the code: a strict commit REJECTS that config (the
+  duplicate Linux-device-name gate fires), so on anything committable the two
+  keyings are equivalent. What pointer keying protects is the TOLERANT surface
+  (#1960) — configstore Load/SyncApply lenient-compiles a config a strict commit
+  would refuse, and `show system` renders ValidateConfig's warnings for whatever
+  is active. Kept because it is correct on its own terms rather than by
+  borrowing the dup-name gate's guarantee.
+
+  **F2 — "Measured, not assumed" rewritten** to say what was actually measured
+  (a presence measurement, which says nothing about keying) and to point at the
+  separate fixture and mutation that do settle the keying.
+
+  **F3 — the code is deliberate; the CLAIM was false.** `ValidatePeerEffectiveStrict`
+  returns nil when the peer view fails to compile, skipping every peer strict
+  subject. That arm is documented and intentional (#1960 no-brick: a peer-side
+  compile failure must not false-reject the origin commit), and it is REACHABLE
+  — though NOT for the reason this entry originally gave. It cited
+  `validateTunnelEndpointIDCollisionAST` as "returned unconditionally with no
+  lenient flag", which is false and is corrected in the r6 entry above: that gate
+  takes a `lenient bool`, both call sites pass `opts.sanitizeFreeTextControlChars`,
+  and `lenientCompileOpts()` sets it true, so on the lenient path it WARNS. The
+  reachable hard error is `validateDataplaneTypeStrict`, called from
+  `compiler_earlystrict.go` with no lenient downgrade. The CONCLUSION (the arm is
+  reachable) stands; the citation did not. So the defect was the doc sentence "a
+  chassis-cluster commit proves BOTH node-effective outputs are installable
+  before promotion", which is unconditional and false in exactly that case.
+  Corrected at both sites to state the conditional guarantee.
+- **File(s)**: pkg/config/compiler_validate_strict_tunnel_ipip.go,
+  pkg/config/ipip_anchor_only_4785_test.go,
+  pkg/config/compiler_peer_effective.go, pkg/configstore/store.go, _Log.md
+- **Validation**: New `TestIpipAnchorEmittedClauseIsPointerKeyedNotNameKeyed_6861`
+  with five preconditions, each a `t.Fatalf` guarding a way the fixture could
+  silently stop discriminating. Mutation, run firsthand: re-keying
+  `!emitted[t]` to `!emittedName[t.Name]` (built from the same
+  EmitTunnelEndpointNames walk) reds it at "the anchor advisory did not fire
+  exactly once ... (got 0)", while
+  `TestIpipEmittedRecordIsNeverAlsoAnAnchor_6861` stays GREEN under the same
+  mutation — the two now bind existence and keying separately. Before the fix
+  the ENTIRE `pkg/config` suite was green under that mutation.
+  Rebased onto origin/master; only `_Log.md` conflicted, union-resolved
+  (260 ours + 87 theirs), zero residual markers, and the seam checked
+  STRUCTURALLY: header count 1512 + 2 new = 1514, and the one-header-one-
+  Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
+  and 226 after the union — the resolve introduced none.
