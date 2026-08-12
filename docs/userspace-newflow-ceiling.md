@@ -20,8 +20,26 @@ Three cross-worker synchronization points sit on that path:
 | Site | What serializes | Scope |
 |---|---|---|
 | SNAT pool allocator `live` mutex | flow-map insert + persistent-lease lifecycle (the residual after the #2852 Phase-1 lock-free port claim) | per pool |
-| `publish_shared_session` | up to three shared-map mutexes per flow (`sessions`, `nat_sessions`, `forward_wire_sessions`) | process |
-| `replicate_session_upsert` | one sibling command-queue mutex **per worker, per flow** | process |
+| `publish_shared_session` | up to three shared-map mutexes **per publish call** (`sessions`, `nat_sessions`, `forward_wire_sessions`) | process |
+| `replicate_session_upsert` | one sibling command-queue mutex **per worker, per replication call** | process |
+
+**Read those two rows as per CALL, not per connection.** A normal connection
+does not perform one publish and one replication: the forward flow and its
+reverse companion are separate entries, so the per-connection acquisition count
+and replication fan-out are MULTIPLES of the per-call figures above. The
+multiplier is not uniform either — `shared_sessions` is taken unconditionally
+but the `nat_sessions` and `forward_wire_sessions` arms are both gated on
+`!entry.metadata.is_reverse` (`afxdp/shared_ops.rs`), so a forward publish takes
+up to three maps where a reverse publish takes exactly one.
+
+No per-connection total is asserted here on purpose. Deriving one means
+counting the publish and replication calls a real connection makes across the
+install path, its reverse companion, and any promote / HA-import / tunnel
+install that also publishes — and that count has not been measured. Anyone
+quoting a per-connection cost should measure it against
+`xpf_userspace_shared_session_publishes_total` and
+`xpf_userspace_session_replication_upserts_total` over a known number of
+connections, and say that it is measured.
 
 #2852 Phase-2 (SNAT-allocator sharding) targets only the first. The
 conclusion #4800 reached before any code was written is that this is
@@ -68,9 +86,9 @@ Process-global, on `ProcessStatus`:
 | `xpf_userspace_shared_session_publish_lock_acquisitions_total` | shared-map acquisitions **scoped to publish only** |
 | `xpf_userspace_shared_session_publish_lock_contended_total` | the blocked subset |
 | `xpf_userspace_session_replication_upserts_total` | replication calls |
-| `xpf_userspace_session_replication_enqueued_total` | individual sibling enqueues; `enqueued/upserts` **is** the N-way fan-out multiplier |
+| `xpf_userspace_session_replication_enqueued_total` | individual sibling enqueues, counted immediately BEFORE each acquisition so `contended/enqueued` is a ratio over acquisitions actually ATTEMPTED at any instant, not over a fan-out booked up front; at rest `enqueued/upserts` **is** the N-way fan-out multiplier |
 | `xpf_userspace_session_replication_lock_contended_total` | sibling-queue acquisitions that blocked |
-| `xpf_userspace_session_replication_queue_depth_sum` | sum of the per-call **worst** sibling-queue depth; `Δsum / Δupserts` is the mean depth per replicated flow — **the backlog statistic** |
+| `xpf_userspace_session_replication_queue_depth_sum` | sum of the per-call **worst** sibling-queue depth; `Δsum / Δupserts` is the mean worst-sibling depth per replication CALL (not per connection — see the per-call note above) — **the backlog statistic** |
 | `xpf_userspace_session_replication_queue_depth_max` | process-lifetime high-water. **Operator context only** — see below |
 
 Per worker:

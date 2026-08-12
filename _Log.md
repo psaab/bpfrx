@@ -73460,3 +73460,43 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   result was read.
 - **File(s)**: pkg/cluster/heartbeat_wiring_binders_6669_test.go,
   pkg/cluster/heartbeat_epoch.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-12 — #4800 fold r6: per-call vs per-connection in the cost table
+
+- **Timestamp**: 2026-08-12
+- **Action**: Docs-only. The serialization cost table read as per-CONNECTION
+  and was really per-CALL, which matters because the whole #4800 argument
+  rests on that table.
+
+  Both rows rescoped: `publish_shared_session` is "up to three shared-map
+  mutexes **per publish call**", `replicate_session_upsert` is "one sibling
+  command-queue mutex per worker, **per replication call**". Added a note that
+  a connection performs more than one publish (the forward flow and its
+  reverse companion are separate entries), so the per-connection acquisition
+  and fan-out counts are MULTIPLES of the per-call figures — and that the
+  multiplier is not uniform, because `shared_sessions` is taken
+  unconditionally while the `nat_sessions` and `forward_wire_sessions` arms are
+  both gated on `!entry.metadata.is_reverse` (verified at
+  `afxdp/shared_ops.rs:985/996/1021`), so a forward publish takes up to three
+  maps and a reverse takes exactly one.
+
+  NO per-connection total is asserted. Deriving one means counting the publish
+  and replication calls a connection makes across the install path, its reverse
+  companion, and any promote / HA-import / tunnel install that also publishes —
+  which has not been measured. The doc now says so and points at the two
+  Prometheus counters to measure it against.
+
+  Sweep of the document's other numeric claims: the three verdict thresholds
+  (95% accept ratio, 3 active workers, 60% max worker share) all match the
+  analyzer defaults exactly (`DEFAULT_MIN_ACCEPT_RATIO = 0.95`,
+  `DEFAULT_MIN_ACTIVE_WORKERS = 3`, `DEFAULT_MAX_WORKER_SHARE = 0.60`); the
+  saturation ratio and queue-depth backlog thresholds are described by
+  mechanism and never quoted as numbers, so nothing to drift. Two further
+  scope defects found and fixed in the same pass: the queue-depth row said
+  "mean depth per replicated flow" (same per-call ambiguity) and the enqueued
+  row still described pre-r3 accounting.
+- **File(s)**: docs/userspace-newflow-ceiling.md, _Log.md
+- **Validation**: Docs only; no code changed. `go build ./...` 0 as a sanity
+  check that the tree is intact. The `is_reverse` gating claim was re-verified
+  by reading `shared_ops.rs` at this SHA rather than carried from an earlier
+  round.
