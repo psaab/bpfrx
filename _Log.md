@@ -70713,3 +70713,114 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
   ./pkg/natshow/...` 0. `gofmt -l` clean on the new file.
 - **File(s)**: pkg/cli/cli_capability_probe_2114_test.go (new), _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: PR #6743 round 7 — fold five hostile-review findings. One
+  BLOCKING runtime escape (F1), one BLOCKING guard defect (F2), a canary
+  over-claim (F3), stale docs (F4), and the coverage gap that let the whole
+  r6-F4 hunk pair be deletable (F5).
+
+  **F1 (MAJOR, runtime).** r6-F4 made the event-stream loop re-resolve the
+  PROVIDER and the STREAM per tick but left the third resolution — the
+  session-delta DRAINER — captured at loop entry, in BOTH
+  `eventStreamFallbackLoop` (used at the reconciliation and fast-fallback
+  drains) and `syncUserspaceSessionDeltas`. Both loops run under `commsCtx`,
+  which only `stopClusterComms` cancels; a dataplane disown does not. So
+  after `commit confirmed` timeout → `enterBootstrapMode` (Teardown, object
+  retained) → corrected commit → `armBootstrapExitDataplane`'s `rt.Start()`
+  failure → `setDataplane(nil)`, the provider correctly resolved to nothing
+  and `connected` went false, dropping the loop onto its FAST 100 ms branch
+  — where `hasDrainer` was still true and it kept calling
+  `DrainSessionDeltas` on the torn-down, disowned backend, taking
+  `userspaceDeltaSyncMu` each time, for the daemon's lifetime. Verbatim the
+  escape the r6-F4 comment claims to have closed, at 10 Hz instead of 2 Hz.
+  The reverse arm is as bad: an empty cell at entry latched `hasDrainer =
+  false` (and in `syncUserspaceSessionDeltas`, RETURNED outright), so the
+  reconciliation drain stayed dead even after a healthy backend was
+  republished. Fix: `currentSessionDeltaDrainer()` resolves from the cell
+  immediately before each of the three drains; the `!ok` arm was dropped
+  from `syncUserspaceSessionDeltas`'s entry gate so a later publication is
+  picked up.
+
+  **F2 (MAJOR, guard).** `dataplaneCellReaderChurn`'s doc asserted
+  unconditionally that "the plain-field revert below still fires". Measured
+  here against a plain-field shadow of `dpCell` under `-race`:
+  `TestBootstrapExit_ArmFailureWithConcurrentReaders` 0/5 and
+  `TestDataplaneCell_RollbackRearmRecurrence` 0/5 at GOMAXPROCS=1, while the
+  controls `TestBootstrapExit_RealSamplerOverlap` (3/3) and
+  `TestDataplaneCell_ConcurrentReadersVsWriter` (2/3) DID fire — so P=1 does
+  not blind the detector; the bracketing simply is not a revert-fires gate.
+  Mechanism: the round is a happens-before edge in both directions (reader
+  `wg.Done()` → `Wait()` → `close(ch)` → the caller's `<-ch` orders every
+  credited pass before the store; the caller's next `cur.Store` → a reader's
+  `cur.Load` orders every subsequently credited pass after it), so for a
+  SINGLE-SHOT writer only uncredited passes are unordered and nothing forces
+  one to exist. Fix, both halves: the doc now states what the bracketing
+  proves (liveness) with the measured table, and a new
+  `TestDataplaneCell_RollbackRearmOverlap` supplies the missing
+  deterministic gate for the rollback + re-arm store on the
+  `RealSamplerOverlap` two-sided pattern — reader parked immediately before
+  its `dataplane()` load, the retained backend's re-arm `Start` parked
+  immediately before `setDataplane(nil)`, one `close(release)` for both.
+
+  **F3 (MINOR, canary).** `rawDPAssertionViolations` caught ONE spelling
+  (`x.dp.(T)`) and the comment called it "the 'no new capability-erasing
+  probe' fence". Extended to type-switch heads (`switch x.dp.(type)`) and to
+  a local bound directly from the field (`d := s.dp; d.(T)`), and the scope
+  note now names the covered spellings AND the shapes that pass clean —
+  notably a free function taking the field as a parameter, which is the
+  exact shape of `pkg/api`'s `fetchUserspaceStatus`, the site of the
+  original metric loss. Flagging `.dp` as a call ARGUMENT was rejected: the
+  live call site `fetchUserspaceStatus(s.dp)` is correct, so that would be a
+  false positive rather than coverage. New
+  `TestOptionalCapabilityProbeScannerDocumentedGaps` pins the disclaimed
+  boundary executably, so a later widening (or a wrong disclaimer) fails.
+
+  **F4 (MINOR, docs).** `daemon_dp_live.go` still said the event-stream loop
+  "resolves a helper-specific EventStream provider once", and
+  `pkg/daemon/README.md` still called all three data-path consumers
+  capture-once while describing the third as per-poll. Both corrected: TWO
+  capture-once consumers, one per-tick resolver.
+
+  **F5 (MINOR, coverage).** Both r6-F4 production hunks were entirely
+  unbound — deleting the `es != wired` re-install block, or reverting the
+  per-tick provider resolution, left the whole `pkg/daemon` suite green. New
+  `daemon_ha_userspace_stream_live_test.go` drives
+  `eventStreamFallbackLoop`/`syncUserspaceSessionDeltas` themselves (the
+  production goroutines from `daemon_ha_sync.go`) over a real connected
+  `SessionSync` pair.
+
+  **Mutation matrix (4x4 diagonal, every RED an assertion).**
+  (M1) capture the drainer once at `eventStreamFallbackLoop` entry →
+  `TestEventStreamFallbackLoop_DrainerReresolvedPerTick` RED
+  ("DrainSessionDeltas ran 15 more times on the DISOWNED backend after
+  setDataplane(nil) (1 -> 16)"), other three GREEN. (M4) same revert in
+  `syncUserspaceSessionDeltas` only → `TestSyncUserspaceSessionDeltas_...`
+  RED with the same message, other three GREEN — the two instances are
+  independently bound. (M2) delete the `es != wired` re-install block →
+  `TestEventStreamFallbackLoop_RewiresReplacementStream` RED ("read ack
+  frame: ... i/o timeout"), other three GREEN. (M3) capture the provider
+  once at loop entry → `TestEventStreamFallbackLoop_ProviderResolvedPerTick`
+  RED ("the loop never observed the stream of a backend published AFTER loop
+  entry"), other three GREEN — that test is handed the stream it will later
+  see, so the re-install block is a no-op in it and the two arms do not
+  overlap. (M5) plain-field revert of the cell → the new
+  `TestDataplaneCell_RollbackRearmOverlap` reports DATA RACE 5/5 at
+  GOMAXPROCS=1 and 5/5 at default, pairing `dataplane()` in the parked
+  reader against `setDataplane()` in `armBootstrapExitDataplane`. (P1/P2)
+  rewrite the LIVE `pkg/grpcapi/server.go:235` probe as `switch s.dp.(type)`
+  and as `d := s.dp; d.(T)` → `TestOptionalCapabilityProbesUseDPProbe` RED
+  naming `grpcapi/server.go:235 (type switch on the dp field)` and
+  `grpcapi/server.go:236 (type assertion on d, a local alias of the dp
+  field)` — the extension is proven against production, not only fixtures.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0; `go test -race ./pkg/daemon/ -run 'TestDataplaneCell|
+  TestBootstrapExit|TestForwardingStatusAdapter'` 0. No dataplane artifact
+  changes, so no cluster smoke is owed.
+- **File(s)**: pkg/daemon/daemon_ha_userspace_stream.go,
+  pkg/daemon/daemon_ha_userspace_stream_live_test.go (new),
+  pkg/daemon/daemon_dp_race_test.go,
+  pkg/daemon/daemon_dp_probe_canary_test.go, pkg/daemon/daemon_dp_live.go,
+  pkg/daemon/README.md, _Log.md

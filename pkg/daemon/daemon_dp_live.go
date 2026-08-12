@@ -42,8 +42,8 @@ import (
 //
 // SCOPE — which consumers are converted. The three OPERATOR-FACING
 // management surfaces (gRPC, REST, console CLI) route through
-// liveDataPlane. The three DATA-PATH consumers deliberately keep their
-// capture-once wiring:
+// liveDataPlane. Of the three DATA-PATH consumers, TWO deliberately keep
+// their capture-once wiring and the third resolves from the cell itself:
 //
 //   - conntrack GC (daemon_run.go) and cluster SessionSync
 //     (daemon_ha_sync.go) do not take a RuntimeDataPlane at all — they
@@ -52,14 +52,22 @@ import (
 //     those live would put an atomic load, an interface assertion and a
 //     SessionStoreOf allocation on every per-session GC sweep and sync
 //     step; both loops are also lifecycle-scoped to the commsCtx/daemon
-//     ctx that the same code path cancels.
-//   - the userspace event-stream loop (daemon_ha_userspace_stream.go)
-//     resolves a helper-specific EventStream provider once and then owns
-//     a live socket subscription; re-resolving per event would not make
-//     an already-open stream point somewhere else.
+//     ctx that the same code path cancels. These two are the remaining
+//     capture-once wiring.
+//   - the userspace event-stream loop (daemon_ha_userspace_stream.go) is
+//     NOT capture-once: it re-resolves the EventStream provider, the
+//     stream instance and the session-delta drainer from the cell on
+//     EVERY poll tick (#6743 r6-F4 for the first two, r7-F1 for the
+//     drainer). It does not go through liveDataPlane — those are
+//     helper-specific optional capabilities, not the mandatory
+//     management surface — but it obeys the same rule: no handle
+//     survives a tick, so a disowned backend stops being polled. Its
+//     commsCtx is cancelled only by stopClusterComms, never by a
+//     dataplane disown, which is precisely why capture-once was wrong
+//     there.
 //
-// Those three are stated as capture-once in pkg/daemon/README.md rather
-// than claimed converted.
+// The two capture-once consumers are stated as such in
+// pkg/daemon/README.md rather than claimed converted.
 
 // errDataplaneUnpublished is returned by every liveDataPlane forwarder
 // when the daemon's cell is empty at call time. Callers that pre-check

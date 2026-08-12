@@ -180,11 +180,41 @@ func (f *failingStartUserspaceDP) CachedStatus() (dpuserspace.ProcessStatus, boo
 // write instead of assuming it — the same bracketing
 // TestDataplaneCell_ClusterStartPublication uses around its publication.
 //
-// The rounds do not sanitize the race the tests exist to detect. The
-// bracketing orders only the specific passes used to prove liveness; the
-// reader loops and the writer's stores keep running with no edge between
-// them, so the conflicting pairs the detector needs remain unordered (the
-// plain-field revert below still fires).
+// WHAT THE BRACKETING PROVES, AND WHAT IT DOES NOT (Codex PR #6743
+// r7-F2). It proves LIVENESS, and for a SINGLE-SHOT writer that is all it
+// proves: the round is itself a happens-before edge in BOTH directions.
+// A reader's wg.Done() -> the helper's Wait() -> close(ch) -> the caller's
+// <-ch orders every credited pass BEFORE the store; the caller's next
+// cur.Store(round) -> a reader's cur.Load() orders every subsequently
+// credited pass AFTER it. The only unordered pairs left are UNCREDITED
+// passes between a reader's wg.Done() and its next Load(), and nothing
+// forces one to exist.
+//
+// That is not a theoretical worry — it was MEASURED, against a plain-field
+// shadow of the cell (dpCell replaced by a plain interface field, the
+// revert these tests exist to catch), under -race:
+//
+//	                                       GOMAXPROCS=1   default
+//	BootstrapExit_ArmFailureWithConcurrentReaders   0/5      2/2
+//	DataplaneCell_RollbackRearmRecurrence           0/5      fires
+//	BootstrapExit_RealSamplerOverlap  (control)     3/3      fires
+//	DataplaneCell_ConcurrentReadersVsWriter (ctrl)  2/3      fires
+//
+// The controls prove GOMAXPROCS=1 does not blind the detector; the zero
+// cells are PASSes, not skips. ConcurrentReadersVsWriter is not a
+// single-shot writer — it stores CONTINUOUSLY while the round is open —
+// which is why it still fires.
+//
+// So the REVERT-FIRES property for the two single-shot bootstrap-exit
+// writers is carried by the deterministic two-sided gates, NOT by the
+// bracketing: TestBootstrapExit_RealSamplerOverlap for the arm-failure
+// store and TestDataplaneCell_RollbackRearmOverlap for the rollback +
+// re-arm store. Both park reader and writer immediately before their
+// conflicting accesses and release them with one close, so neither side
+// is ordered with respect to the other. The bracketed tests remain
+// valuable for what they do assert — the real writer paths, the cell/
+// monitor postconditions, and the retention identity contract — and for
+// proving those assertions were made with readers provably live.
 type dataplaneCellReaderChurn struct {
 	ready chan struct{}
 	done  chan struct{}
@@ -434,6 +464,13 @@ func TestForwardingStatusAdapter_BackendTypeTransitions(t *testing.T) {
 // bootstrap-exit writer (armBootstrapExitDataplane) with a failing-Start
 // fake while the reader shapes churn: -race clean, the cell cleared, and
 // the NAT pool monitor NOT started.
+//
+// r7-F2: the rounds below prove the readers were LIVE on both sides of the
+// clear; for this single-shot writer they do not make the store race a
+// load, and on a plain-field shadow this test fired 0/5 at GOMAXPROCS=1
+// (table in dataplaneCellReaderChurn). The deterministic revert-fires gate
+// for THIS store is TestBootstrapExit_RealSamplerOverlap, which parks the
+// real forwarding-status sampler and this same writer on one release.
 func TestBootstrapExit_ArmFailureWithConcurrentReaders(t *testing.T) {
 	d := &Daemon{}
 	d.applyBodyForTest = func(_ *config.Config) {}
@@ -614,6 +651,12 @@ func (f *armedRecorderDP) Teardown() error {
 // published object in the cell (a clear-on-teardown would strand the
 // corrected-commit re-arm), and the re-arm Starts THAT object — a fresh
 // replacement would re-arm into a dataplane whose teardown never ran.
+//
+// r7-F2: those identity/lifecycle assertions are what this test binds. Its
+// reader rounds prove LIVENESS, not a race: on a plain-field shadow it
+// fired 0/5 at GOMAXPROCS=1 (table in dataplaneCellReaderChurn). The
+// deterministic revert-fires gate for the re-arm store is
+// TestDataplaneCell_RollbackRearmOverlap.
 func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 	// Codex PR #6743 r2-8: run the PRODUCTION teardown path (the default
 	// enterBootstrapMode branch → runBootstrapTeardownSteps → the real
@@ -691,6 +734,92 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 	}
 	if d.natPoolAlarm.Load() != nil {
 		t.Fatal("no monitor may survive the failed re-arm")
+	}
+}
+
+// TestDataplaneCell_RollbackRearmOverlap is the DETERMINISTIC revert-fires
+// gate for the rollback + re-arm store (Codex PR #6743 r7-F2), the
+// counterpart of TestBootstrapExit_RealSamplerOverlap for the plain
+// arm-failure store.
+//
+// TestDataplaneCell_RollbackRearmRecurrence brackets that store with reader
+// ROUNDS, which prove the readers were live on both sides but leave no
+// conflicting pair unordered for a single-shot writer — measured 0/5 on a
+// plain-field shadow at GOMAXPROCS=1 (see dataplaneCellReaderChurn). This
+// test supplies the missing half and asserts nothing about identity or
+// monitor lifecycle, which the recurrence test already covers.
+//
+// The gate sits BEFORE the dataplane access on BOTH sides with NO channel
+// between the conflicting accesses: the reader parks immediately before its
+// dataplane() load, the retained backend's re-arm Start parks immediately
+// before armBootstrapExitDataplane's setDataplane(nil), and ONE close
+// releases both. Only the absence of a happens-before edge is required, so
+// on the plain-field revert the detector fires at any GOMAXPROCS; on the
+// cell it is clean.
+func TestDataplaneCell_RollbackRearmOverlap(t *testing.T) {
+	// Same production teardown path as the recurrence test: linkDir points
+	// at an empty temp dir so the networkd step removes nothing, and d.frr
+	// is nil so the FRR step is skipped. No churn and no NAT pool monitor
+	// here — the gated pair IS the test, and extra readers only add shadow
+	// traffic on the field under observation.
+	d := &Daemon{}
+	prevLinkDir := linkDir
+	linkDir = t.TempDir()
+	t.Cleanup(func() { linkDir = prevLinkDir })
+	d.bootstrapMode.Store(false)
+
+	backend := &armedRecorderDP{}
+	d.setDataplane(backend)
+
+	// Roll back to bootstrap: the object is torn down but RETAINED in the
+	// cell, which is the state a corrected commit re-arms.
+	if err := d.enterBootstrapMode(); err != nil {
+		t.Fatalf("enterBootstrapMode: %v", err)
+	}
+	if backend.teardownCalls != 1 {
+		t.Fatalf("rollback teardown calls = %d, want 1", backend.teardownCalls)
+	}
+	if got := d.dataplane(); got != dataplane.RuntimeDataPlane(backend) {
+		t.Fatalf("the cell must retain the backend across the rollback (got %T)", got)
+	}
+
+	readerParked := make(chan struct{})
+	writerParked := make(chan struct{})
+	release := make(chan struct{})
+
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		// The watchdog reader shape (one load per tick, then the HA domain),
+		// parked immediately before the load.
+		close(readerParked)
+		<-release
+		if rt := d.dataplane(); rt != nil {
+			_ = rt.HA().SetRGActive(context.Background(), 0, true)
+		}
+	}()
+
+	backend.failStart = true
+	backend.onStart = func() {
+		close(writerParked)
+		<-release
+	}
+	d.bootstrapMode.Store(false)
+
+	go func() {
+		<-readerParked
+		<-writerParked
+		close(release)
+	}()
+
+	d.armBootstrapExitDataplane(0)
+	<-readerDone
+
+	if backend.startCalls != 1 {
+		t.Fatalf("re-arm Start calls = %d, want 1 (the RETAINED object is re-Started)", backend.startCalls)
+	}
+	if d.dataplane() != nil {
+		t.Fatal("cell must be cleared after the re-arm failure")
 	}
 }
 
