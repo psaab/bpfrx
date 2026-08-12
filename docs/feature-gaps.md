@@ -452,7 +452,45 @@ xpf uses strongSwan for IPsec. Basic certificate-auth IKE generation exists, but
 
 ## 14. Routing Enhancements
 
-xpf has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPIP tunnels (IPv4+IPv6), rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet6.0` IPv6 static routes, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
+xpf has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet6.0` IPv6 static routes, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
+
+**IPIP tunnels are NOT supported (#4785).** This section previously claimed
+"IPIP tunnels (IPv4+IPv6)"; that was never true of the forwarding path. The
+userspace dataplane — the only supported runtime — has no IPIP primitive in
+either direction: a tunnel endpoint is entered into the decap index only when
+its mode classifies as `TunnelKind::Gre`, and `TunnelKind::Unknown` is the
+egress encap dispatcher's fail-closed drop arm. A `mode ipip` tunnel was
+therefore created, came UP, and passed no traffic at all. Since #4785 half 1 the
+configuration is HARD-REJECTED at strict commit / commit-check
+(`validateIpipTunnelUnimplementedStrict`) and downgraded to a warning on the
+tolerant load / peer-sync path (#1960 no-brick), so the dead tunnel is now an
+operator-visible error instead of a silent blackhole. Note an `ip-*` interface
+defaults to `mode ipip` even without an explicit `mode` statement. Half 2 of
+#4785 implements the decap stage; use `mode gre` or `mode wireguard` until then.
+
+On a chassis cluster the rejection also covers the PEER's effective view. The
+strict commit gate compiles only the submitting node, the RAW group tree is what
+config-sync sends, and the standby ingests it leniently — so a `mode ipip`
+endpoint that only `groups node1` resolves would commit green on node0 and
+install on node1 with no strict check anywhere. `ValidatePeerEffectiveStrict`
+(`pkg/config/compiler_peer_effective.go`) re-runs the gate against the peer's
+effective compile at the ORIGIN's commit. `SyncApply` stays lenient, so a config
+already on disk still boots.
+
+**Operator cost.** `compileTreeStrict` evaluates the WHOLE candidate, so a box
+whose active config already carries an emitted IPIP endpoint boots fine (the
+ingress is lenient) but is then refused on EVERY subsequent commit — including
+entirely unrelated ones — until the stanza is deleted. That is inherent to any
+whole-candidate strict gate rather than specific to this one, but it is the
+visible cost of the change: the first commit after an upgrade is where an
+operator meets it.
+
+A stanza that emits NO endpoint is not rejected — there is nothing dead in the
+dataplane snapshot — but it can still create a kernel ANCHOR device, because
+`collectAppliedTunnels` screens the interface level only on `tunnel source` and
+screens units on nothing at all. Those get a standing advisory
+(`ipipAnchorOnlyWarnings`) naming the device and the actual reason no endpoint
+was emitted, covering interface-level AND unit-level records.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
