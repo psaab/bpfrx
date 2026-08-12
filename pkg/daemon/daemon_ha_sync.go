@@ -14,6 +14,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 func (d *Daemon) stopSyncReadyTimer() {
@@ -1123,23 +1124,24 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 
 			ss.SetVRFDevice(vrfDevice)
-			var streamProvider userspaceEventStreamProvider
-			streamCallbacksWired := false
-			if rt := d.dataplane(); rt != nil {
+			// r6-F4: the wiring resolves the provider from the #2114
+			// cell per poll, so it never installs callbacks on a backend
+			// the daemon has since disowned. wiredStream is the instance
+			// the callbacks landed on; the fallback loop re-installs if a
+			// rollback + corrected re-arm replaces it.
+			var wiredStream *dpuserspace.EventStream
+			if _, ok := d.dataplane().(userspaceEventStreamProvider); ok {
 				// userspaceEventStreamProvider is a local probe;
 				// userspace LegacyDataPlaneAdapter satisfies it via
 				// EventStream (legacy_dataplane.go:414). Type-
 				// assertion target is the published dataplane directly —
 				// the legacyDP() round-trip retired in #1519 added no
 				// method-set coverage.
-				if provider, ok := rt.(userspaceEventStreamProvider); ok {
-					streamProvider = provider
-					wireCtx, cancel := context.WithTimeout(commsCtx, 5*time.Second)
-					streamCallbacksWired = d.wireUserspaceEventStreamCallbacks(wireCtx, provider)
-					cancel()
-					if !streamCallbacksWired {
-						slog.Warn("userspace: event stream callbacks not ready before session sync start; falling back to polling until stream wires")
-					}
+				wireCtx, cancel := context.WithTimeout(commsCtx, 5*time.Second)
+				wiredStream = d.wireUserspaceEventStreamCallbacks(wireCtx)
+				cancel()
+				if wiredStream == nil {
+					slog.Warn("userspace: event stream callbacks not ready before session sync start; falling back to polling until stream wires")
 				}
 			}
 
@@ -1182,8 +1184,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
 					}
 					ss.StartSyncSweep(commsCtx)
-					if streamCallbacksWired {
-						go d.eventStreamFallbackLoop(commsCtx, streamProvider)
+					if wiredStream != nil {
+						go d.eventStreamFallbackLoop(commsCtx, wiredStream)
 					} else {
 						go d.runUserspaceEventStream(commsCtx)
 					}

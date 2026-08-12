@@ -182,6 +182,18 @@ func (m *Manager) clearFilterCountersRaw() error {
 // 512 (bpf/headers/xpf_common.h:710), which is filter_counters'
 // max_entries (bpf/headers/xpf_maps.h), so no index below can be out of
 // range on an armed map.
+//
+// RESIDUAL — error propagation does NOT close the detached-backend false
+// success (Codex PR #6743 r5/r6-F5). Teardown() does not close the map
+// FDs: loader.go's teardown closes only the link handles and Cleanup
+// merely unpins, so a RETAINED, torn-down Manager still holds a live
+// FD-backed map object. cilium's Map.Update through that FD SUCCEEDS, and
+// a successful write is indistinguishable from a correct one at this
+// layer — so a `clear` issued against a disowned generation still reports
+// success while the live generation keeps its counters. Detecting it
+// needs a generation tag or lease on the handle itself, which is #6741's
+// scope, NOT this wrapper's; do not read the paragraph above as closing
+// that case.
 func clearFilterCountersIn(zm counterMapUpdater) error {
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)

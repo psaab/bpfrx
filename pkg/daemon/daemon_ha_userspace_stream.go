@@ -119,13 +119,13 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 // binary event stream. Falls back to the existing polling loop when the stream
 // is unavailable or disconnected.
 func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
-	provider, ok := d.dataplane().(userspaceEventStreamProvider)
-	if !ok {
+	if _, ok := d.dataplane().(userspaceEventStreamProvider); !ok {
 		// Manager doesn't support event stream — fall back to polling.
 		d.syncUserspaceSessionDeltas(ctx)
 		return
 	}
-	if !d.wireUserspaceEventStreamCallbacks(ctx, provider) {
+	wired := d.wireUserspaceEventStreamCallbacks(ctx)
+	if wired == nil {
 		return
 	}
 	if d.cluster == nil || d.getSessionSync() == nil {
@@ -137,25 +137,55 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 	// Monitor connection. When the stream is connected, events arrive via
 	// callback and polling drops to 5s reconciliation. When disconnected,
 	// polling resumes at 100ms.
-	d.eventStreamFallbackLoop(ctx, provider)
+	d.eventStreamFallbackLoop(ctx, wired)
 }
 
-func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context, provider userspaceEventStreamProvider) bool {
+// currentEventStreamProvider re-resolves the event-stream provider from the
+// #2114 cell.
+//
+// Codex PR #6743 r6-F4: this loop used to CAPTURE the provider once, at
+// Phase 5 (daemon_run.go), from the constructed-but-unarmed bootstrap
+// backend — before any helper socket existed. If the bootstrap arm then
+// failed and cleared the cell (daemon_run_naming.go), nothing cancelled
+// this goroutine: it kept polling the STALE, disowned backend every 500ms
+// for the daemon's lifetime, which is exactly the escape #2114 exists to
+// close. Re-resolving per tick means an emptied cell yields no provider
+// and a REPLACED backend yields the new one.
+func (d *Daemon) currentEventStreamProvider() (userspaceEventStreamProvider, bool) {
+	p, ok := d.dataplane().(userspaceEventStreamProvider)
+	return p, ok
+}
+
+// wireUserspaceEventStreamCallbacks waits for a stream to exist on the
+// CURRENTLY published backend and installs the callbacks on it. It returns
+// the stream it wired, or nil if ctx ended first.
+func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context) *dpuserspace.EventStream {
 	// Wait for the event stream to become available (helper may not have started yet).
-	var es *dpuserspace.EventStream
 	for {
-		es = provider.EventStream()
-		if es != nil {
-			break
+		if provider, ok := d.currentEventStreamProvider(); ok {
+			if es := provider.EventStream(); es != nil {
+				d.installEventStreamCallbacks(es)
+				return es
+			}
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return nil
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
 
-	// Wire callbacks.
+// installEventStreamCallbacks binds the daemon's handlers onto es.
+//
+// Split out for r6-F4's rewire: the commit-confirmed rollback CLOSES the
+// armed backend's stream (pkg/dataplane/userspace/process.go) and a
+// corrected re-arm constructs a NEW one. Before r6 the wiring ran once, at
+// startup, on a goroutine that had already returned — so the replacement
+// stream had no callbacks and its events accumulated in the
+// callback-not-ready queue instead of reaching session sync. The fallback
+// loop now re-installs whenever it observes a different stream instance.
+func (d *Daemon) installEventStreamCallbacks(es *dpuserspace.EventStream) {
 	es.SetOnEvent(func(eventType uint8, seq uint64, delta dpuserspace.SessionDeltaInfo) bool {
 		return d.handleEventStreamDelta(eventType, delta)
 	})
@@ -175,7 +205,6 @@ func (d *Daemon) wireUserspaceEventStreamCallbacks(ctx context.Context, provider
 			}
 		})
 	}
-	return true
 }
 
 // handleEventStreamDelta processes a single session event from the event
@@ -255,7 +284,9 @@ func (d *Daemon) handleEventStreamFullResync() bool {
 // to polling via DrainSessionDeltas when the stream is disconnected.
 // When the event stream is live, polling slows to 5s reconciliation;
 // when disconnected, it runs at 100ms to compensate for the lost stream.
-func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspaceEventStreamProvider) {
+// wired is the stream whose callbacks are already installed; a different
+// instance observed on a later tick is re-wired in place (r6-F4).
+func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, wired *dpuserspace.EventStream) {
 	drainer, hasDrainer := d.dataplane().(userspaceSessionDeltaDrainer)
 	if d.cluster == nil || d.getSessionSync() == nil {
 		return
@@ -278,7 +309,20 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		case <-ticker.C:
 		}
 
-		es := provider.EventStream()
+		// r6-F4: re-resolve BOTH the provider and the stream each tick.
+		// The provider must come from the cell (a captured one can be a
+		// backend the daemon disowned), and a stream instance that is not
+		// the one we wired is a post-rollback replacement whose callbacks
+		// were never installed.
+		var es *dpuserspace.EventStream
+		if provider, ok := d.currentEventStreamProvider(); ok {
+			es = provider.EventStream()
+		}
+		if es != nil && es != wired {
+			d.installEventStreamCallbacks(es)
+			wired = es
+			slog.Info("userspace: event stream replaced (rollback/re-arm), callbacks re-installed")
+		}
 		connected := es != nil && es.IsConnected()
 
 		// Track transitions and adjust cadence.

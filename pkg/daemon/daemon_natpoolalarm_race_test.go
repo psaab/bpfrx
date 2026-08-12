@@ -161,34 +161,83 @@ func TestNATPoolAlarm_RollbackDiscard(t *testing.T) {
 // the monitor pointer. With d.natPoolAlarm as atomic.Pointer the reads/writes
 // of the pointer are race-free; as a plain field they are not. This is the
 // deterministic guard for Edit 0.
+//
+// Codex PR #6743 r6-F6: the overlap used to rest on the comment
+// "inline so the readers are guaranteed to overlap" — which the code did
+// not establish. Nothing ordered a reader against the writer, so a
+// schedule in which no reader ran until after the 2000 write cycles
+// completed was legal and the test would pass having exercised nothing.
+// Two rendezvous now make it a property of the test: `ready` proves every
+// reader made a pass BEFORE the first write, and `overlap` proves every
+// reader completed a pass that BEGAN after the write loop started, with
+// the writer looping until that holds.
 func TestNATPoolAlarm_PointerPublication(t *testing.T) {
 	d := newNATPoolAlarmTestDaemon()
 	d.bootstrapMode.Store(false)
 
+	const numReaders = 4
 	var readers sync.WaitGroup
+	var firstPass, overlapPass sync.WaitGroup
+	firstPass.Add(numReaders)
+	overlapPass.Add(numReaders)
 	stop := make(chan struct{})
+	writing := make(chan struct{})
+	ready := make(chan struct{})
+	overlap := make(chan struct{})
 
 	// Readers: the gRPC/CLI render path, looping until the writer is done.
-	for r := 0; r < 4; r++ {
+	for r := 0; r < numReaders; r++ {
 		readers.Add(1)
 		go func() {
 			defer readers.Done()
+			_ = d.natPoolAlarms()
+			firstPass.Done()
+			credited := false
 			for {
 				select {
 				case <-stop:
 					return
 				default:
-					_ = d.natPoolAlarms()
+				}
+				// Sample the writer's announcement BEFORE the pass, so a
+				// credited pass provably began after the writes started.
+				started := false
+				select {
+				case <-writing:
+					started = true
+				default:
+				}
+				_ = d.natPoolAlarms()
+				if started && !credited {
+					credited = true
+					overlapPass.Done()
 				}
 			}
 		}()
 	}
+	go func() { firstPass.Wait(); close(ready) }()
+	go func() { overlapPass.Wait(); close(overlap) }()
 
-	// Writer: runtime start/discard cycles (bootstrap exit / rollback),
-	// inline so the readers are guaranteed to overlap a full run before stop.
-	for i := 0; i < 2000; i++ {
+	<-ready // every reader has touched the pointer before any write
+
+	// Writer: runtime start/discard cycles (bootstrap exit / rollback).
+	close(writing)
+	overlapped := false
+	hard := time.Now().Add(30 * time.Second)
+	for i := 0; i < 2000 || !overlapped; i++ {
 		d.maybeStartNATPoolAlarm()
 		d.stopAndDiscardNATPoolAlarm()
+		if !overlapped {
+			select {
+			case <-overlap:
+				overlapped = true
+			default:
+			}
+			if !overlapped && time.Now().After(hard) {
+				t.Fatal("no reader completed a pass inside the write loop: the reader/writer " +
+					"overlap this test claims to exercise did not happen")
+			}
+		}
 	}
 
 	close(stop)

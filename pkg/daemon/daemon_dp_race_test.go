@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -161,19 +162,72 @@ func (f *failingStartUserspaceDP) CachedStatus() (dpuserspace.ProcessStatus, boo
 }
 
 // dataplaneCellReaderChurn is a running set of reader goroutines plus the
-// two rendezvous channels the callers need.
+// rendezvous channels the callers need.
 //
-// Codex PR #6743 r4-F3: `ready` is the READER-READY BARRIER. Before it,
-// the writer in each test could in principle run to completion before a
-// single reader goroutine had touched the cell, so the overlap the test
-// claims to exercise was a scheduling accident rather than a property of
-// the test. Every shape now completes one full pass before ready closes,
-// so the writer provably runs against live readers. It is a rendezvous,
-// not a sleep: no timing constant participates.
+// `ready` closes once every shape has completed one pass. Codex PR #6743
+// r6-F6 corrected the claim r4 made for it: a completed first pass proves
+// the readers are RUNNING before the writer starts — it does NOT prove any
+// read happens once the writer is under way. A legal schedule parks every
+// reader immediately after its first pass, runs the writer to completion,
+// closes stop, and lets the readers exit: `ready` is satisfied and not one
+// unordered read overlapped a write.
+//
+// `round()` supplies the missing half. It opens a fresh per-shape
+// rendezvous: the returned channel closes only after EVERY shape has
+// completed a pass that BEGAN after the round was opened. A caller that
+// opens a round while the writer is parked mid-write, and another after
+// the write has landed, has PROVEN reader activity on both sides of the
+// write instead of assuming it — the same bracketing
+// TestDataplaneCell_ClusterStartPublication uses around its publication.
+//
+// The rounds do not sanitize the race the tests exist to detect. The
+// bracketing orders only the specific passes used to prove liveness; the
+// reader loops and the writer's stores keep running with no edge between
+// them, so the conflicting pairs the detector needs remain unordered (the
+// plain-field revert below still fires).
 type dataplaneCellReaderChurn struct {
 	ready chan struct{}
 	done  chan struct{}
+
+	// cur is the open round, or nil. Readers snapshot it BEFORE each pass
+	// so a pass credited to a round provably started after the round was
+	// opened.
+	cur atomic.Pointer[readerRound]
 }
+
+// readerRound is one "every shape has made a fresh pass" rendezvous.
+type readerRound struct {
+	wg sync.WaitGroup
+	ch chan struct{}
+}
+
+// round opens a new rendezvous and returns its completion channel.
+func (c *dataplaneCellReaderChurn) round(shapes int) <-chan struct{} {
+	r := &readerRound{ch: make(chan struct{})}
+	r.wg.Add(shapes)
+	c.cur.Store(r)
+	go func() { r.wg.Wait(); close(r.ch) }()
+	return r.ch
+}
+
+// awaitReaderRound opens a round and blocks until every shape has made a
+// pass inside it. A timeout is an ASSERTION failure, not a hang: it means
+// the overlap the caller is about to claim did not happen.
+func awaitReaderRound(t *testing.T, churn *dataplaneCellReaderChurn, what string) {
+	t.Helper()
+	select {
+	case <-churn.round(dataplaneCellReaderShapes):
+	case <-time.After(30 * time.Second):
+		t.Errorf("no reader pass completed %s: the overlap this test claims to "+
+			"exercise did not happen, so a green run says nothing about the cell", what)
+	}
+}
+
+// dataplaneCellReaderShapes is the number of reader shapes
+// churnDataplaneCellReaders runs. It is a constant so a round can be sized
+// without reaching into the closure; churnDataplaneCellReaders panics if
+// the two ever diverge.
+const dataplaneCellReaderShapes = 5
 
 // churnDataplaneCellReaders launches the §5.4 reader shapes against the
 // cell until stop closes: the narrowed forwarding-status adapter
@@ -221,6 +275,9 @@ func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) *dataplaneCellRe
 			}
 		},
 	}
+	if len(shapes) != dataplaneCellReaderShapes {
+		panic("dataplaneCellReaderShapes out of sync with the shape list")
+	}
 	var firstPass sync.WaitGroup
 	firstPass.Add(len(shapes))
 	for _, shape := range shapes {
@@ -231,12 +288,20 @@ func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) *dataplaneCellRe
 			// cannot start against a set of not-yet-scheduled readers.
 			fn()
 			firstPass.Done()
+			var credited *readerRound
 			for {
 				select {
 				case <-stop:
 					return
 				default:
-					fn()
+				}
+				// Snapshot the open round BEFORE the pass: a pass credited
+				// below therefore provably began after that round opened.
+				r := churn.cur.Load()
+				fn()
+				if r != nil && r != credited {
+					credited = r
+					r.wg.Done()
 				}
 			}
 		}(shape)
@@ -254,16 +319,41 @@ func churnDataplaneCellReaders(d *Daemon, stop <-chan struct{}) *dataplaneCellRe
 // readers while a writer alternates setDataplane(nil)/setDataplane(fake).
 // Revert-guard: on the plain interface field this is the RACE-2 schedule
 // and the detector fires.
+//
+// r6-F6: the overlap is now PROVEN rather than assumed. The writer keeps
+// storing until a full round of reader passes has completed INSIDE the
+// write loop, so at least one pass per shape provably began after the
+// writer started and finished before it stopped.
 func TestDataplaneCell_ConcurrentReadersVsWriter(t *testing.T) {
 	d := &Daemon{}
 	stop := make(chan struct{})
 	churn := churnDataplaneCellReaders(d, stop)
-	<-churn.ready // reader-ready barrier (r4-F3): every shape has run
+	<-churn.ready // every shape has run at least once
 
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
+	// Open the overlap round FIRST, then write until it closes: every
+	// credited pass began after this point, i.e. inside the write loop.
+	overlap := churn.round(dataplaneCellReaderShapes)
+	soft := time.Now().Add(300 * time.Millisecond)
+	hard := time.Now().Add(30 * time.Second)
+	overlapped := false
+	for {
 		d.setDataplane(nil)
 		d.setDataplane(&runtimeOnlyApplyTestDP{})
+		if !overlapped {
+			select {
+			case <-overlap:
+				overlapped = true
+			default:
+			}
+			if !overlapped && time.Now().After(hard) {
+				t.Fatal("no reader shape completed a pass inside the write loop: the " +
+					"reader/writer overlap this test claims to exercise did not happen")
+			}
+			continue
+		}
+		if time.Now().After(soft) {
+			break
+		}
 	}
 	close(stop)
 	<-churn.done
@@ -349,13 +439,27 @@ func TestBootstrapExit_ArmFailureWithConcurrentReaders(t *testing.T) {
 	d.applyBodyForTest = func(_ *config.Config) {}
 	d.natPoolAlarmTestTick = time.Millisecond
 	d.bootstrapMode.Store(false) // exitBootstrapMode already flipped it in production
-	d.setDataplane(&failingStartUserspaceDP{})
 
 	stop := make(chan struct{})
-	churn := churnDataplaneCellReaders(d, stop)
-	<-churn.ready // reader-ready barrier (r4-F3)
+	var churn *dataplaneCellReaderChurn
+
+	// r6-F6: park the writer INSIDE the arm (the fake's Start hook runs
+	// immediately before armBootstrapExitDataplane's setDataplane(nil))
+	// and hold it there until every reader shape has completed a fresh
+	// pass. The write therefore lands with the readers provably live,
+	// instead of merely having been live at some earlier point.
+	d.setDataplane(&failingStartUserspaceDP{onStart: func() {
+		awaitReaderRound(t, churn, "while the arm-failure writer was parked mid-write")
+	}})
+
+	churn = churnDataplaneCellReaders(d, stop)
+	<-churn.ready // every shape has run at least once
 
 	d.armBootstrapExitDataplane(0)
+
+	// And a round AFTER the store: the readers are proven live on both
+	// sides of the cell clear.
+	awaitReaderRound(t, churn, "after the arm-failure writer cleared the cell")
 
 	close(stop)
 	<-churn.done
@@ -479,10 +583,17 @@ type armedRecorderDP struct {
 	startCalls    int
 	teardownCalls int
 	failStart     bool
+	onStart       func()
 }
 
 func (f *armedRecorderDP) Start(context.Context) error {
 	f.startCalls++
+	// r6-F6: the optional hook parks the writer INSIDE the arm, immediately
+	// before armBootstrapExitDataplane's store, so a caller can prove
+	// reader passes overlap the write instead of assuming it.
+	if f.onStart != nil {
+		f.onStart()
+	}
 	if f.failStart {
 		return errors.New("synthetic re-arm failure (#2114 test)")
 	}
@@ -521,7 +632,7 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 
 	stop := make(chan struct{})
 	churn := churnDataplaneCellReaders(d, stop)
-	<-churn.ready // reader-ready barrier (r4-F3)
+	<-churn.ready // every shape has run at least once
 
 	// Successful arm: monitor starts.
 	d.armBootstrapExitDataplane(0)
@@ -557,9 +668,18 @@ func TestDataplaneCell_RollbackRearmRecurrence(t *testing.T) {
 
 	// Re-exit with a failing Start on the SAME retained object: the cell
 	// clears, no monitor.
+	//
+	// r6-F6: the re-arm parks inside Start until every reader shape has
+	// made a fresh pass, so the clear that follows lands against provably
+	// live readers; a second round after it brackets the store on both
+	// sides.
 	backend.failStart = true
+	backend.onStart = func() {
+		awaitReaderRound(t, churn, "while the failing re-arm was parked mid-write")
+	}
 	d.bootstrapMode.Store(false)
 	d.armBootstrapExitDataplane(0)
+	awaitReaderRound(t, churn, "after the failing re-arm cleared the cell")
 
 	close(stop)
 	<-churn.done

@@ -66,7 +66,14 @@ import (
 // with IsLoaded() (the dominant shape across pkg/grpcapi and pkg/api:
 // `dp == nil || !dp.IsLoaded()`) take their existing "dataplane not
 // loaded" branch instead and never reach a forwarder.
-var errDataplaneUnpublished = errors.New("dataplane not published")
+//
+// It is the EXPORTED dataplane.ErrNotPublished so a management server can
+// tell "the daemon currently has no dataplane" apart from a backend
+// failure: pkg/grpcapi matches it with errors.Is and answers
+// codes.Unavailable, the same code its `dp == nil || !IsLoaded()`
+// pre-checks return, instead of reporting daemon lifecycle state as
+// codes.Internal (Codex PR #6743 r6-F3).
+var errDataplaneUnpublished = dataplane.ErrNotPublished
 
 // errDataplaneSurfaceUnsupported is returned when a dataplane IS
 // published but does not implement the management surface. Both in-tree
@@ -124,6 +131,44 @@ type liveDataPlaneSurface interface {
 // no backend reference at all — there is nothing for a consumer to keep
 // alive past a setDataplane(nil).
 type liveDataPlane struct{ daemon *Daemon }
+
+// Unwrap implements dataplane.LiveUnwrapper: it returns the backend the
+// daemon publishes AT THE MOMENT OF THE CALL, or nil.
+//
+// Codex PR #6743 r6-F1. liveDataPlane has no embedded field, so its method
+// set is exactly the 27 forwarders below — every OPTIONAL capability the
+// management servers reach by asserting on `any` (LastApplyResult,
+// Sessions, Telemetry, Status, AppliedNATView, the session cursor, the
+// userspace controls) was ERASED the moment the servers started holding
+// the adapter instead of the backend. That is not a lifecycle narrowing,
+// it is a silent capability loss on a HEALTHY deployment: NAT-pool and
+// userspace Prometheus families stop being emitted, NAT statistics report
+// healthy zeros, and session paging falls back to the explicitly O(N^2)
+// path. Enumerating the union into liveDataPlaneSurface would only move
+// the failure to the next capability a backend gains.
+//
+// Unwrap is deliberately NOT a way to keep a backend: it resolves through
+// the same cell load as every forwarder and returns nil once the daemon
+// has disowned the backend, so a probe made after a setDataplane(nil)
+// fails its assertion and the consumer takes its "capability unavailable"
+// branch. What a caller gets is a handle valid for the call it is about to
+// make — exactly the window an explicit forwarder has between its resolve
+// and its call, and bounded by the same #6741 lifetime gap.
+// It reads the cell DIRECTLY rather than going through resolve(): resolve
+// narrows to liveDataPlaneSurface and rejects a backend that does not
+// implement the mandatory management surface, but such a backend could
+// still carry optional capabilities, and erasing those is the very bug
+// this method exists to fix.
+func (a liveDataPlane) Unwrap() any {
+	if a.daemon == nil {
+		return nil
+	}
+	rt := a.daemon.dataplane()
+	if rt == nil {
+		return nil
+	}
+	return rt
+}
 
 // resolve performs the single per-call cell load. Every forwarder below
 // starts here; no forwarder may cache the result across calls.
@@ -368,10 +413,17 @@ func (a liveDataPlane) DeleteDNATEntryV6(key dataplane.DNATKeyV6) error {
 // NAT table, or nil. Consumers treat nil as "not available"
 // (server_diag_system_action.go's clear-persistent-nat arm), so an empty
 // cell degrades to that branch rather than handing back the disowned
-// backend's table. The returned pointer is a genuine escape for the
-// duration of the caller's expression — that is the callers' existing
-// contract (they immediately Len()/Clear() it) and is bounded by the
-// same #6741 lifetime gap documented above.
+// backend's table.
+//
+// Codex PR #6743 r6-F2: every caller must bind the result to a LOCAL and
+// operate on that. Before r6 the three call sites read
+// `dp.GetPersistentNAT()` two or three times in a row — nil-check, then
+// .Len(), then .Clear() — which under the live indirection are SEPARATE
+// cell loads, not one bounded expression. A setDataplane(nil) landing
+// between the check and the use returned nil to a caller that had already
+// proven non-nil, and the process nil-dereferenced. The local also makes
+// the escape explicit: the pointer is live for the caller's operation and
+// is bounded by the same #6741 lifetime gap documented above.
 func (a liveDataPlane) GetPersistentNAT() *dataplane.PersistentNATTable {
 	s, err := a.resolve()
 	if err != nil {

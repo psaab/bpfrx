@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/clusterfailover"
 	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -236,7 +238,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 		}
 		if err := s.dp.ClearPolicyCounters(); err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, dataplaneActionError(err)
 		}
 		return &pb.SystemActionResponse{Message: "policy hit counters cleared"}, nil
 
@@ -245,7 +247,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 		}
 		if err := s.dp.ClearFilterCounters(); err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, dataplaneActionError(err)
 		}
 		return &pb.SystemActionResponse{Message: "Firewall filter counters cleared"}, nil
 
@@ -254,16 +256,24 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 		}
 		if err := s.dp.ClearNATRuleCounters(); err != nil {
-			return nil, status.Errorf(codes.Internal, "%v", err)
+			return nil, dataplaneActionError(err)
 		}
 		return &pb.SystemActionResponse{Message: "NAT translation statistics cleared"}, nil
 
 	case "clear-persistent-nat":
-		if s.dp == nil || s.dp.GetPersistentNAT() == nil {
+		// #2114/#6743-F2: resolve the table ONCE. Under the daemon's live
+		// indirection each GetPersistentNAT() is its own cell load, so a
+		// check-then-use pair nil-dereferences if the daemon disowns the
+		// backend in between.
+		var table *dataplane.PersistentNATTable
+		if s.dp != nil {
+			table = s.dp.GetPersistentNAT()
+		}
+		if table == nil {
 			return &pb.SystemActionResponse{Message: "Persistent NAT table not available"}, nil
 		}
-		count := s.dp.GetPersistentNAT().Len()
-		s.dp.GetPersistentNAT().Clear()
+		count := table.Len()
+		table.Clear()
 		return &pb.SystemActionResponse{
 			Message: fmt.Sprintf("Cleared %d persistent NAT bindings", count),
 		}, nil
@@ -563,4 +573,22 @@ func (s *Server) executeClusterFailover(ctx context.Context, req *pb.SystemActio
 	}
 	// ParseAction only yields the four kinds above; defensive fallthrough.
 	return nil, status.Errorf(codes.InvalidArgument, "unknown action: %s", req.Action)
+}
+
+// dataplaneActionError maps a dataplane clear/mutate failure to a gRPC
+// status.
+//
+// #2114/#6743-F3: the daemon's live indirection answers
+// dataplane.ErrNotPublished when its cell is empty AT CALL TIME, which is
+// exactly the condition the `dp == nil || !dp.IsLoaded()` pre-check above
+// reports as codes.Unavailable. A clear that races a setDataplane(nil)
+// passes the pre-check and then fails inside the forwarder, so without
+// this mapping the identical operator-visible condition is reported as
+// codes.Internal — a server fault — purely because of when the cell
+// cleared. Anything else is a genuine backend failure and stays Internal.
+func dataplaneActionError(err error) error {
+	if errors.Is(err, dataplane.ErrNotPublished) {
+		return status.Error(codes.Unavailable, "dataplane not loaded")
+	}
+	return status.Errorf(codes.Internal, "%v", err)
 }

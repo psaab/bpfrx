@@ -87,3 +87,17 @@ type cliUserspaceControlProvider interface {
 	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 }
+
+// dpProbe returns the value that OPTIONAL-capability assertions must be
+// made against. See pkg/grpcapi/runtime.go's dpProbe for the full #2114 /
+// #6743-F1 rationale: the daemon publishes a live indirection whose method
+// set is exactly cliRuntime, so probing it directly erases
+// cliUserspaceStatusProvider, cliUserspaceControlProvider, the session
+// cursor and the applied-NAT view for a healthy backend. Unwrap is the
+// identity for a plain backend and nil once the daemon has disowned one.
+func (c *CLI) dpProbe() any {
+	if c == nil {
+		return nil
+	}
+	return dataplane.Unwrap(c.dp)
+}

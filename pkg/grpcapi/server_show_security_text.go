@@ -1038,7 +1038,7 @@ func (s *Server) showWireguard(buf *strings.Builder, detail bool) {
 		buf.WriteString("Dataplane not loaded\n")
 		return
 	}
-	provider, ok := s.dp.(userspaceStatusProvider)
+	provider, ok := s.dpProbe().(userspaceStatusProvider)
 	if !ok {
 		buf.WriteString("WireGuard telemetry requires the userspace dataplane\n")
 		return
@@ -1060,7 +1060,7 @@ func (s *Server) showWireguardPublicKey(buf *strings.Builder) {
 		buf.WriteString("Dataplane not loaded\n")
 		return
 	}
-	provider, ok := s.dp.(userspaceStatusProvider)
+	provider, ok := s.dpProbe().(userspaceStatusProvider)
 	if !ok {
 		buf.WriteString("WireGuard telemetry requires the userspace dataplane\n")
 		return

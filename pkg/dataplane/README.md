@@ -580,6 +580,41 @@ arrival from the `muAcquireProbeHook` pre-lock seam (a signal before
 the contended call can pass the silence window without the goroutine
 ever reaching the mutex).
 
+## Live-indirection primitives (#2114 / #6743 r6)
+
+`live.go` carries the three things the daemon's `liveDataPlane` adapter
+(`pkg/daemon/daemon_dp_live.go`) needs the consumers to share:
+
+- `ErrNotPublished` — returned by every forwarder when the daemon's cell
+  is empty AT CALL TIME. It is EXPORTED so `pkg/grpcapi` can map it to
+  `codes.Unavailable` (the code its own `dp == nil || !IsLoaded()`
+  pre-check already returns) rather than reporting daemon lifecycle state
+  as `codes.Internal`.
+- `LiveUnwrapper` / `Unwrap` — an adapter's method set is exactly its
+  declared forwarders, so every OPTIONAL capability consumers reach by
+  asserting on `any` is ERASED by it. `Unwrap` resolves to the backend
+  published at the instant of the call, and returns nil once the daemon
+  has disowned one — capability transparency WITHOUT resurrecting a
+  disowned backend. It is the identity for a plain backend, so every
+  non-daemon caller and every test is unaffected. The
+  `LastApplyResultOf` / `SessionStoreOf` / `TelemetryOf` helpers resolve
+  through it, as does each consumer package's `dpProbe()`.
+- `Published` — the honest replacement for `dp != nil` at render sites:
+  the adapter is permanently non-nil, so the field cannot answer "does a
+  dataplane exist?".
+
+### Counter-clear error propagation: what it does NOT cover
+
+`clearPolicyCountersIn` / `clearFilterCountersIn` propagate their
+`Map.Update` error (#6743 r4-F2), which fixes the discarded-error false
+success. It does NOT fix the DETACHED-backend false success: `Teardown()`
+closes only the link handles and `Cleanup` merely unpins, so a retained,
+torn-down `Manager` still holds live FD-backed map objects and an
+`Update` through them SUCCEEDS. A `clear` issued against a disowned
+generation therefore still reports success while the live generation
+keeps its counters. Detecting that needs a generation tag or lease on the
+handle itself — **#6741**, not this wrapper.
+
 ## Entry points
 
 - `DataPlane` — `dataplane.go`. Legacy BPF-shaped interface kept for the

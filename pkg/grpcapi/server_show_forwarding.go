@@ -67,7 +67,7 @@ func (s *Server) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
 		return nil
 	}
 	base := forwardingStatusServerDataPlane{server: s}
-	if _, ok := s.dp.(userspaceStatusProvider); ok {
+	if _, ok := s.dpProbe().(userspaceStatusProvider); ok {
 		return forwardingStatusServerUserspaceDataPlane{forwardingStatusServerDataPlane: base}
 	}
 	return base

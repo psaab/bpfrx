@@ -17,7 +17,7 @@ func (c *CLI) showSecurityWireguard(detail bool) error {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	provider, ok := c.dp.(cliUserspaceStatusProvider)
+	provider, ok := c.dpProbe().(cliUserspaceStatusProvider)
 	if !ok {
 		fmt.Println("WireGuard telemetry requires the userspace dataplane")
 		return nil
@@ -41,7 +41,7 @@ func (c *CLI) showSecurityWireguardPublicKey() error {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	provider, ok := c.dp.(cliUserspaceStatusProvider)
+	provider, ok := c.dpProbe().(cliUserspaceStatusProvider)
 	if !ok {
 		fmt.Println("WireGuard telemetry requires the userspace dataplane")
 		return nil

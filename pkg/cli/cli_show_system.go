@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/sysservices"
 	"golang.org/x/sys/unix"
@@ -19,11 +20,17 @@ import (
 // readLinkSpeed reads the link speed in Mbps from sysfs. Returns 0 on error.
 
 func (c *CLI) showSystemBuffers() error {
-	if c.dp == nil {
+	// #2114/#6743-F3: `dp == nil` no longer detects "no dataplane" — the
+	// daemon publishes a permanently non-nil live indirection, so a daemon
+	// whose startup arm failed and cleared the cell would fall through to
+	// the map branch and print "No BPF maps available" (a claim about a
+	// loaded backend's maps) instead of "Dataplane not loaded".
+	// Published() is the identity for a plain backend.
+	if !dataplane.Published(c.dp) {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	if provider, ok := c.dp.(cliUserspaceStatusProvider); ok {
+	if provider, ok := c.dpProbe().(cliUserspaceStatusProvider); ok {
 		status, err := provider.Status()
 		if err != nil {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)
@@ -79,11 +86,12 @@ func (c *CLI) showSystemBuffers() error {
 }
 
 func (c *CLI) showSystemBuffersDetail() error {
-	if c.dp == nil {
+	// #2114/#6743-F3: same publication check as showSystemBuffers.
+	if !dataplane.Published(c.dp) {
 		fmt.Println("Dataplane not loaded")
 		return nil
 	}
-	if provider, ok := c.dp.(cliUserspaceStatusProvider); ok {
+	if provider, ok := c.dpProbe().(cliUserspaceStatusProvider); ok {
 		status, err := provider.Status()
 		if err != nil {
 			fmt.Printf("Userspace buffer metrics unavailable: %v\n", err)

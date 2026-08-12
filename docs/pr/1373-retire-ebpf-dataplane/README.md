@@ -257,6 +257,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/api/metrics.go` | Prometheus telemetry still reads legacy counters and metadata. |
 | `pkg/api/metrics_counters.go` | Prometheus map-counter collectors still call legacy dataplane reads (#1540 metrics split). |
 | `pkg/api/metrics_nat.go` | Prometheus NAT pool collector still reads legacy dataplane (#1540 metrics split). |
+| `pkg/api/metrics_userspace.go` | #2114 r6-F1 — the userspace `Status()` probe resolves through `dataplane.Unwrap` so the daemon's live indirection (whose method set is only the mandatory surface) does not erase the capability and blank every userspace metric family. Probe-routing only, no legacy enforcement path. |
 | `pkg/api/metrics_sessions.go` | Prometheus session gauge collector still iterates legacy session tables (#1540 metrics split). |
 | `pkg/api/nat.go` | REST NAT handlers still read legacy NAT counters and metadata (#1540 handlers split). |
 | `pkg/api/security.go` | REST security handlers still reference legacy policy/screen counter types (#1540 handlers split). |
@@ -265,6 +266,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cli/cli.go` | Embedded CLI construction still stores the legacy bridge. |
 | `pkg/cli/cli_clear.go` | Clear commands still delete legacy session entries. |
 | `pkg/cli/cli_show_cluster.go` | #1444 — `fabricRedirectCounters` type and `readFabricRedirectCounters` relocated from `cli.go`; still reads legacy `GlobalCtrFabric*` counter indices via `dataplane.Telemetry`. |
+| `pkg/cli/cli_show_system.go` | #2114 r6-F3 — `show system buffers` asks `dataplane.Published(dp)` instead of `dp != nil`: the live indirection is permanently non-nil, so the old check printed "No BPF maps available" (a claim about a loaded backend) for a daemon with no dataplane at all. Render-only, no legacy enforcement path. |
 | `pkg/cli/cli_show_flow.go` | Flow display still uses legacy session keys and values. |
 | `pkg/cli/cli_show_nat.go` | NAT display still uses legacy NAT/session metadata. |
 | `pkg/cli/cli_show_security.go` | Security display still uses legacy counters and filter types. |
@@ -301,6 +303,8 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_run_naming.go` | #5661 pure-motion split of `daemon_run.go` — interface naming reads `dataplane.EffectiveType`/`TypeUserspace`. |
 | `pkg/daemon/daemon_run_routehelpers.go` | #5661 pure-motion split of `daemon_run.go` — applied-tunnel/route helpers read `dataplane.EffectiveType`/`TypeUserspace`. |
 | `pkg/daemon/runtime_probes.go` | #1519 daemon-local typed probes (`apiDataPlane`/`grpcDataPlane`/`cliDataPlane`/`dataplaneReadyProbe`/`natSeeder`/`fibSyncStarter`) mirror downstream package-private interfaces; still name root `pkg/dataplane` types (`SessionKey`, `CounterValue`, etc.) until those move to a domain package. |
+| `pkg/grpcapi/server_diag_system_action.go` | #2114 r6-F2/F3 — `clear-persistent-nat` binds `dataplane.PersistentNATTable` to a LOCAL so the table is resolved once per operation (a check-then-use across two cell loads nil-dereferenced), and `dataplaneActionError` maps `dataplane.ErrNotPublished` to `codes.Unavailable`. Control-plane only, no legacy enforcement path. |
+| `pkg/grpcapi/server_show_system.go` | #2114 r6-F3 — `show system buffers` asks `dataplane.Published(dp)` instead of `dp != nil` (peer of `pkg/cli/cli_show_system.go`). Render-only, no legacy enforcement path. |
 | `pkg/daemon/daemon_dp_live.go` | #2114 r4 — the live management-surface indirection handed to gRPC/REST/CLI in place of a startup snapshot of the published backend. It forwards the UNION of the `runtime_probes.go` probes, so it names exactly the same root `pkg/dataplane` types those probes do and moves with them. No legacy enforcement path. |
 | `pkg/logging/ringbuf.go` | #3057 — RT_FLOW policy-name resolution references the shared wire-contract constants `dataplane.DefaultPolicySentinelID` + `dataplane.DefaultPolicyName` (the implicit default-policy sentinel ID, kept in lockstep with `userspace-dp/src/policy.rs`). Display-only; no legacy enforcement path. |
 | `pkg/nftables/netlink_lo0.go` | #6387 PR-2 — the additive netlink lo0-filter builder resolves DSCP names through the `dataplane.DSCPValues` SSOT to emit numeric nft-equivalent matches (mirrors `daemon_nft.go`'s #3436 resolution). Ruleset-generation-only; no legacy enforcement path. |

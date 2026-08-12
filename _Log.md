@@ -70349,3 +70349,182 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/retirement_boundary_canary_test.go,
   pkg/dataplane/README.md, docs/pr/1373-retire-ebpf-dataplane/README.md,
   _Log.md
+
+## 2026-08-12 — #2114 r6: the live indirection ERASED every optional capability (Codex PR #6743 round 6)
+
+- **Timestamp**: 2026-08-12
+- **Action**: Folded a hostile Codex re-gate (six blocking findings) into the
+  #2114 publication work.
+
+  **F1 (FIXED, confirmed firsthand by the parent).** `liveDataPlane` has no
+  embedded field, so Go gave it exactly its 27 declared forwarders as its
+  method set. The management servers reach OPTIONAL capabilities by asserting
+  on `any` — `LastApplyResult`, `Sessions`, `Telemetry`, `Status`,
+  `AppliedNATView`, the session cursor, the userspace controls — and every one
+  of those assertions now failed against the adapter, silently, on a HEALTHY
+  deployment: `pkg/api/metrics_nat.go` stopped emitting every NAT-pool sample,
+  `pkg/grpcapi/server_helpers.go` built null session/telemetry domains so NAT
+  statistics reported healthy zeros, `pkg/api/metrics_userspace.go` suppressed
+  every userspace metric family, `show system buffers` answered "No BPF maps
+  available" about a running helper, session paging fell back to the
+  explicitly O(N^2) HA-watchdog-starving path, and deterministic NAT became
+  unavailable. The r4 compile-time assertions structurally cannot see this:
+  they pin the MANDATORY union, and erasure is the absence of everything
+  outside it. Fixed with a per-call unwrap escape hatch rather than by
+  enumerating the union (which silently re-breaks on the next capability a
+  backend gains): new `pkg/dataplane/live.go` carries `LiveUnwrapper` /
+  `Unwrap` / `Published` / the exported `ErrNotPublished`;
+  `liveDataPlane.Unwrap()` reads the cell DIRECTLY (not through `resolve()`,
+  whose mandatory-surface narrowing would itself erase capabilities on a
+  backend outside that union) and returns nil once the daemon has disowned
+  the backend. The `LastApplyResultOf` / `SessionStoreOf` / `TelemetryOf`
+  family resolves through it, and all ~28 probe sites in `pkg/grpcapi`,
+  `pkg/api` and `pkg/cli` now assert on a new per-package `dpProbe()`
+  accessor instead of the raw `dp` field.
+
+  **F2 (FIXED).** `GetPersistentNAT()` is a fresh cell load per call, and the
+  three callers read it two or three times in a row — nil-check, `.Len()`,
+  `.Clear()`. A `setDataplane(nil)` between the check and the use handed nil
+  to a caller that had already proven non-nil, and `.Len()` dereferenced it
+  (`PersistentNATTable.Len` takes `t.mu.RLock()` — a nil receiver panics).
+  Every caller now resolves ONCE into a local:
+  `pkg/grpcapi/server_diag_system_action.go`, `pkg/cli/cli_clear.go`, and
+  both `pkg/natshow/persistent.go` renderers (via `persistentNATTable`).
+
+  **F3 (FIXED).** (a) `dp != nil` stopped meaning "a dataplane exists" the
+  moment the servers held a permanently non-nil adapter, so a daemon whose
+  startup arm failed and cleared the cell rendered "No BPF maps available" —
+  a claim about a loaded backend's maps — instead of "Dataplane not loaded".
+  The four buffer-render sites ask `dataplane.Published(dp)` now. (b) A clear
+  that RACES the disown passes the `IsLoaded()` pre-check and then fails
+  inside the forwarder with `ErrNotPublished`, which was reported as
+  `codes.Internal` — the daemon's own lifecycle state presented to the
+  operator as a server fault. `dataplaneActionError` maps it to
+  `codes.Unavailable`, the same code the `dp == nil` pre-check returns for
+  the identical operator-visible condition; a genuine backend failure stays
+  Internal (negative control test).
+
+  **F4 (FIXED, both halves).** The event-stream loop CAPTURED its provider at
+  Phase 5, from the constructed-but-unarmed bootstrap backend, before any
+  helper socket existed; if the bootstrap arm then failed and cleared the
+  cell, nothing cancelled the goroutine and it kept polling the STALE,
+  disowned backend every 500ms for the daemon's lifetime.
+  `currentEventStreamProvider()` re-resolves from the cell each tick.
+  Separately, a commit-confirmed rollback closes the armed backend's stream
+  and a corrected re-arm builds a NEW one, but the wiring goroutine had
+  already returned and never installed callbacks on it — events accumulated
+  in the callback-not-ready queue instead of reaching session sync. The
+  callback installation is split into `installEventStreamCallbacks` and the
+  fallback loop re-installs whenever it observes a different stream
+  instance.
+
+  **F5 (NARROWED in the code comment; #6741 is the follow-up, no new issue
+  filed).** The r4 counter-clear error propagation cannot detect the
+  DETACHED-backend false success: `Teardown()` closes only link handles and
+  `Cleanup` merely unpins, so a retained torn-down `Manager` still holds live
+  FD-backed map objects and `Map.Update` through them SUCCEEDS. A successful
+  write is indistinguishable from a correct one at that layer. Both wrapper
+  comments now carry an explicit RESIDUAL paragraph saying so and pointing at
+  #6741 — whose body already names exactly this ("Teardown does not close the
+  `m.maps`/`m.programs` FDs ... a mutation that SUCCEEDS yet never reaches
+  the live generation"), so filing a second issue would have duplicated it.
+  `pkg/dataplane/README.md` gained a matching "what it does NOT cover"
+  subsection.
+
+  **F6 (FIXED for the three probabilistic guards; the BPF-privileged leg
+  stated UNPROVEN).** The r4 reader-ready barrier proved only that readers
+  had run BEFORE the writer: a legal schedule let every reader complete its
+  first pass, park, and never read again while the writer ran to completion.
+  `dataplaneCellReaderChurn` gained `round()`, a fresh per-shape rendezvous
+  that closes only after every shape completes a pass which BEGAN after the
+  round opened. `TestDataplaneCell_ConcurrentReadersVsWriter` opens a round
+  and keeps writing until it closes; the two arm-failure tests park the
+  writer INSIDE the arm (via the fakes' `onStart` hook, immediately before
+  `setDataplane(nil)`) until a round completes, then require a second round
+  after the store — so the write is bracketed by proven reader activity. A
+  30s timeout on the wait is an ASSERTION failure, not a hang.
+  `TestNATPoolAlarm_PointerPublication` got the same two rendezvous (its
+  overlap previously rested on a comment that the code did not establish).
+  `TestManager_ArmedGate_DetachRetainedClaims` still SKIPs without BPF
+  privilege — `Manager.maps` is `map[string]*ebpf.Map` with no substitution
+  seam, so making it privilege-free is its own change; its doc comment now
+  says plainly that a skipped cell is UNKNOWN and must not be counted as
+  covered.
+
+  **False claims corrected in text.** The churn helper's doc no longer says a
+  first-pass barrier proves overlap (it proves liveness before the writer,
+  nothing more), and `GetPersistentNAT`'s doc no longer describes the
+  repeated calls as one bounded expression — they were always separate cell
+  loads.
+
+  **Guards.** `daemon_dp_capability_2114_test.go` binds F1 preservation and
+  F1 disowned-unreachability in SEPARATE function bodies (a guard sharing a
+  body with its binder never runs once the binder fails), each with a control
+  proving the fixture really carries the capability; plus the probe-site
+  end-to-end binder through `startGRPCServer`, the F3(a) unpublished render,
+  the F3(b) status-code mapping with its Internal negative control, and the
+  F2 single-resolution binder. Every fixture embeds a real `*dataplane.Manager`
+  — with a stub-shaped fake, `resolve()` rejects the backend, `IsLoaded()`
+  answers false and the handler takes its "dataplane not loaded" pre-check
+  branch, so the test would pass without the forwarder/probe/mapping under
+  test ever running (two of these tests initially did exactly that and were
+  rebuilt). `daemon_dp_probe_canary_test.go` adds two syntactic fences with
+  both-direction self-tests: no optional-capability assertion on the raw `dp`
+  field, and no function resolving `GetPersistentNAT` more than once — the
+  latter covers `pkg/cli`'s `clearPersistentNAT`, which runs only under
+  `isInteractive()` and has no unit-reachable path.
+  `pkg/natshow/persistent_single_resolution_2114_test.go` binds both
+  renderers plus a no-table negative control.
+
+  **Mutation matrix — every RED observed, not predicted.** (1) Delete the
+  `Unwrap` hunk from `LastApplyResultOf` + `SessionStoreOf` → both F1 tests
+  RED ("LastApplyResultOf(liveDataPlane) = nil for a HEALTHY published
+  backend..."). (1b) Delete it from `SessionStoreOf` ALONE → RED on the
+  session-store assertion specifically ("Count() = (0,0), want (7,11)"), so
+  neither belt is masked by the other. (2) Make `Unwrap` memoise the first
+  resolved backend → F1(b) RED ("Unwrap handed back a DISOWNED backend")
+  while F1(a) stays GREEN — the targeted negative control. (3) Restore the
+  three-call `GetPersistentNAT` shape → the gRPC F2 test RED with an actual
+  nil-pointer panic after 1 resolution; (8) the same revert in `pkg/natshow`
+  → both render tests RED after 2 resolutions, with the no-table control
+  still GREEN. (4) Drop `dataplaneActionError` → F3(b) RED ("code = Internal,
+  want Unavailable") while the Internal control stays GREEN. (5) Restore
+  `if s.dp != nil` → F3(a) RED (`got "No BPF maps available\n"`) while the
+  probe test stays GREEN. (6) Restore `s.dp.(userspaceStatusProvider)` → the
+  probe test RED ("took the BPF-map branch for a backend that implements
+  Status()") while F3(a) stays GREEN. (7) Revert the #2114 cell to a plain
+  interface field → all three rewritten race guards RED under `-race` ("race
+  detected during execution of test"), confirming the new rendezvous did NOT
+  sanitize the race they exist to detect.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/daemon/...
+  ./pkg/dataplane/... ./pkg/grpcapi/... ./pkg/api/... ./pkg/cli/...
+  ./pkg/natshow/...` 0; `go test ./...` 0; `go test -race ./pkg/daemon/ -run
+  'TestDataplaneCell_|TestBootstrapExit_|TestNATPoolAlarm_'` 0. No cluster
+  tooling run (control-plane Go only; no shim `.o` change).
+- **File(s)**: pkg/dataplane/live.go (new), pkg/dataplane/apply.go,
+  pkg/dataplane/maps_policy.go, pkg/dataplane/maps_filter.go,
+  pkg/dataplane/armed_gate_legs_test.go,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  pkg/dataplane/README.md, pkg/daemon/daemon_dp_live.go,
+  pkg/daemon/daemon_ha_userspace_stream.go, pkg/daemon/daemon_ha_sync.go,
+  pkg/daemon/daemon_dp_capability_2114_test.go (new),
+  pkg/daemon/daemon_dp_probe_canary_test.go (new),
+  pkg/daemon/daemon_dp_race_test.go,
+  pkg/daemon/daemon_natpoolalarm_race_test.go,
+  pkg/daemon/userspace_sync_test.go, pkg/daemon/README.md,
+  pkg/grpcapi/runtime.go, pkg/grpcapi/server.go,
+  pkg/grpcapi/server_diag_system_action.go,
+  pkg/grpcapi/server_nat_deterministic.go,
+  pkg/grpcapi/server_sessions.go, pkg/grpcapi/server_show_forwarding.go,
+  pkg/grpcapi/server_show_policies_text.go,
+  pkg/grpcapi/server_show_security_text.go,
+  pkg/grpcapi/server_show_system.go, pkg/api/api.go,
+  pkg/api/metrics_userspace.go, pkg/api/nat.go, pkg/api/sessions.go,
+  pkg/api/system.go, pkg/cli/runtime.go, pkg/cli/cli_clear.go,
+  pkg/cli/cli_helpers.go, pkg/cli/cli_show_chassis.go,
+  pkg/cli/cli_show_nat.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/cli/cli_show_security_wireguard.go, pkg/cli/cli_show_system.go,
+  pkg/natshow/persistent.go,
+  pkg/natshow/persistent_single_resolution_2114_test.go (new),
+  docs/pr/1373-retire-ebpf-dataplane/README.md, _Log.md

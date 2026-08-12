@@ -69,3 +69,24 @@ type userspaceControlProvider interface {
 	SetBindingState(uint32, bool, bool) (dpuserspace.ProcessStatus, error)
 	InjectPacket(dpuserspace.InjectPacketRequest) (dpuserspace.ProcessStatus, error)
 }
+
+// dpProbe returns the value that OPTIONAL-capability assertions must be
+// made against.
+//
+// #2114/#6743-F1: the daemon hands Server.dp a live indirection
+// (pkg/daemon's liveDataPlane) whose method set is exactly the MANDATORY
+// grpcRuntime surface above. Asserting an optional capability directly on
+// that value — the session cursor, Status(), AppliedNATView, the
+// userspace controls, the policy-scheduler state — fails for a perfectly
+// HEALTHY backend that implements it, silently degrading session paging to
+// the O(N^2) fallback and blanking whole answer families. dataplane.Unwrap
+// resolves to the backend published AT THIS INSTANT; it returns nil once
+// the daemon has disowned the backend, so the probe still fails closed
+// after a setDataplane(nil). For a plain backend — every test, every
+// non-daemon embedder — it is the identity.
+func (s *Server) dpProbe() any {
+	if s == nil {
+		return nil
+	}
+	return dataplane.Unwrap(s.dp)
+}

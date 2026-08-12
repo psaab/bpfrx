@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/sysservices"
 	"golang.org/x/sys/unix"
@@ -438,7 +439,14 @@ func (s *Server) showTask(cfg *config.Config, buf *strings.Builder) {
 }
 
 func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
-	if s.dp != nil {
+	// #2114/#6743-F3: `dp != nil` no longer means "a dataplane exists" —
+	// the daemon publishes a permanently non-nil live indirection, so a
+	// daemon whose startup arm FAILED and cleared the cell would fall into
+	// the backend arm and answer "No BPF maps available" (a statement
+	// about a loaded backend's maps) for a firewall that has no backend at
+	// all. Published() asks the honest question and is the identity for a
+	// plain backend.
+	if dataplane.Published(s.dp) {
 		// #5782: this render ends with a full v4+v6 SessionCount() table walk
 		// (same per-bucket BPF-map lock contention as the session read-scans).
 		// Gate the whole render through the shared diagcmd.SessionWalkLimiter and
@@ -452,7 +460,7 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 				"session scan concurrency limit reached; retry shortly")
 		}
 		defer release()
-		if provider, ok := s.dp.(userspaceStatusProvider); ok {
+		if provider, ok := s.dpProbe().(userspaceStatusProvider); ok {
 			status, err := provider.Status()
 			if err != nil {
 				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)
@@ -507,7 +515,14 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 }
 
 func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) error {
-	if s.dp != nil {
+	// #2114/#6743-F3: `dp != nil` no longer means "a dataplane exists" —
+	// the daemon publishes a permanently non-nil live indirection, so a
+	// daemon whose startup arm FAILED and cleared the cell would fall into
+	// the backend arm and answer "No BPF maps available" (a statement
+	// about a loaded backend's maps) for a firewall that has no backend at
+	// all. Published() asks the honest question and is the identity for a
+	// plain backend.
+	if dataplane.Published(s.dp) {
 		// #5782: same full-table SessionCount() walk gate as showBuffers.
 		release, err := sessionWalkLimiter.Acquire()
 		if err != nil {
@@ -515,7 +530,7 @@ func (s *Server) showBuffersDetail(cfg *config.Config, buf *strings.Builder) err
 				"session scan concurrency limit reached; retry shortly")
 		}
 		defer release()
-		if provider, ok := s.dp.(userspaceStatusProvider); ok {
+		if provider, ok := s.dpProbe().(userspaceStatusProvider); ok {
 			status, err := provider.Status()
 			if err != nil {
 				fmt.Fprintf(buf, "Userspace buffer metrics unavailable: %v\n", err)

@@ -39,11 +39,51 @@ usable. Two consequences the code makes explicit:
   `dataplane.SessionStore` / `dataplane.Telemetry` domains (a live
   indirection would put an atomic load + interface assertion +
   `SessionStoreOf` allocation on every per-session step), and the
-  userspace event-stream loop owns an already-open socket subscription
-  that re-resolving cannot redirect. Behavioural guards live in
-  `daemon_dp_escape_test.go` (gRPC) and `daemon_dp_escape_rest_test.go`
-  (REST); `daemon_dp_escape_canary_test.go` is the syntactic fence that
-  covers the console-CLI site and any future management consumer.
+  userspace event-stream loop resolves its provider from the cell on every
+  poll (#6743 r6-F4 — it used to capture one at Phase 5 from the
+  constructed-but-unarmed bootstrap backend and keep polling it after an
+  arm failure cleared the cell) and re-installs its callbacks when a
+  rollback + corrected re-arm replaces the stream instance. Behavioural
+  guards live in `daemon_dp_escape_test.go` (gRPC) and
+  `daemon_dp_escape_rest_test.go` (REST);
+  `daemon_dp_escape_canary_test.go` is the syntactic fence that covers the
+  console-CLI site and any future management consumer.
+- **The indirection must not ERASE capabilities.** Go computes a method
+  set statically, so `liveDataPlane`'s is exactly its declared forwarders:
+  the MANDATORY management surface and nothing else. Consumers reach
+  OPTIONAL capabilities by asserting on `any` — `LastApplyResult`,
+  `Sessions`, `Telemetry`, `Status`, `AppliedNATView`, the session cursor,
+  the userspace controls — and every one of those assertions fails against
+  the adapter, silently, on a HEALTHY deployment (#6743 r6-F1: NAT-pool
+  and userspace Prometheus families stop being emitted, NAT statistics
+  report healthy zeros, session paging falls back to the O(N^2) path).
+  Every such probe therefore resolves through `dataplane.Unwrap` first —
+  `dpProbe()` in `pkg/grpcapi`, `pkg/api` and `pkg/cli`, and the
+  `dataplane.LastApplyResultOf` / `SessionStoreOf` / `TelemetryOf` helper
+  family. `Unwrap` is NOT a way to keep a backend: it performs the same
+  per-call cell load and returns nil once the daemon has disowned one, so
+  a probe after `setDataplane(nil)` still fails closed.
+  `daemon_dp_capability_2114_test.go` binds preservation and
+  unreachability in separate bodies; `daemon_dp_probe_canary_test.go` is
+  the fence against a new probe asserting on the raw `dp` field.
+- **Resolve ONCE per operation.** `GetPersistentNAT()` returns a pointer,
+  and each call is its own cell load; a `check == nil` followed by a
+  second call to `.Len()`/`.Clear()`/`.All()` nil-dereferences if the
+  daemon disowns the backend in between (#6743 r6-F2). Every caller binds
+  the result to a local; `TestPersistentNATResolvedOncePerOperation`
+  fences the shape across `pkg/grpcapi`, `pkg/api`, `pkg/cli` and
+  `pkg/natshow`.
+- **`dp != nil` no longer means "a dataplane exists".** The servers hold a
+  permanently non-nil adapter, so a render keyed on the field describes a
+  backend that may not be there — `show system buffers` answered "No BPF
+  maps available" (a claim about a loaded backend's maps) for a daemon
+  whose startup arm failed. Those sites ask `dataplane.Published(dp)`
+  instead (#6743 r6-F3). For the same reason a clear that RACES the
+  disown fails inside the forwarder with `dataplane.ErrNotPublished`;
+  `pkg/grpcapi` maps it to `codes.Unavailable`, matching what its
+  `dp == nil || !IsLoaded()` pre-check returns for the identical
+  operator-visible condition, instead of reporting daemon lifecycle state
+  as `codes.Internal`.
 - **A torn-down backend can still be published.** The commit-confirmed
   rollback calls `Teardown()` and deliberately LEAVES the object in the
   cell so a corrected commit re-arms that same object

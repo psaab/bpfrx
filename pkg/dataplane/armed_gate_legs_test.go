@@ -848,6 +848,18 @@ func TestManager_ArmedGate_XDPSelectorTwoSided(t *testing.T) {
 // is unpinned+closed, race-free against the concurrent population actor.
 // "Cleanup always runs" excludes master's absent-iface_zone_map early-boot
 // no-op and any discovery-failure path (those preserve claims for retry).
+//
+// UNPROVEN WITHOUT BPF PRIVILEGE (Codex PR #6743 r6-F6). This leg needs a
+// REAL ebpf.Hash map: the claim it makes is about setXDPAttachedFlag's
+// registry lookup blocking on a concurrent publisher, and Manager.maps is
+// typed map[string]*ebpf.Map, so there is no seam to substitute a fake
+// through. Without CAP_BPF (or a sufficient MEMLOCK rlimit) the map
+// creation fails and this test SKIPS — and a skipped cell is UNKNOWN, not
+// a pass: on such a host NOTHING here is verified, and a regression in the
+// detach claim-cleanup path would go unnoticed. Do not count this leg as
+// covered unless the run log shows it EXECUTING. Making it privilege-free
+// requires introducing a map interface in Manager (its own change), which
+// #6743 deliberately does not attempt.
 func TestManager_ArmedGate_DetachRetainedClaims(t *testing.T) {
 	zoneMap, err := ebpf.NewMap(&ebpf.MapSpec{
 		Name:       "iface_zone_map",

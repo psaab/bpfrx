@@ -234,7 +234,7 @@ func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	if provider, ok := s.dp.(interface {
+	if provider, ok := s.dpProbe().(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	}); ok {
 		status, err := provider.Status()
