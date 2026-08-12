@@ -70004,3 +70004,22 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6211 review fold — correct two false claims in the source-NAT
+  release/rollback sweep comment. MINOR 1: the comment called the swept body
+  "a cold teardown path"; it is not. `rollback_source_nat_allocation` has five
+  non-test call sites, all on the packet path in
+  `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472, :2634, :4902), and
+  :2374 is the admission-refusal arm — the flood regime. The comment now
+  states the per-refused-flow cost (K allocator locks instead of
+  owning-index + 1) as a mechanism, explicitly noting no throughput
+  measurement was taken, and gives the correctness argument that justifies
+  paying it. MINOR 2: "at most one allocator could ever hold a given flow"
+  was stated unconditionally; it held only against an UNCHANGED `rules`,
+  because `parse_source_nat_rules_with_previous` carries allocators over
+  keyed on `allocator_key()` alone. The comment now scopes the invariant and
+  says #6211 does not create the hazard, it makes it reachable with no config
+  edit at all. Comments only — no behaviour change; `cargo build --release`
+  rc 0.
+- **File(s)**: userspace-dp/src/nat/source.rs, _Log.md

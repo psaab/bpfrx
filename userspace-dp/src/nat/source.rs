@@ -858,8 +858,15 @@ fn release_source_nat_allocation_with_mode(
     //
     // Before #6211 the reserve was a pure function of `rules`, so a re-upsert
     // of the same session always re-entered the SAME allocator and
-    // short-circuited on `reserve_flow`'s idempotence: at most one allocator
-    // could ever hold a given flow, and a first-hit `break` was sufficient.
+    // short-circuited on `reserve_flow`'s idempotence. Scope that precisely:
+    // the "at most one allocator holds a given flow" invariant held against an
+    // UNCHANGED `rules`, not unconditionally. `parse_source_nat_rules_with_previous`
+    // carries allocators over keyed on `allocator_key()` alone, so an edit that
+    // reshuffled which rule a session matched could already strand a flow in a
+    // carried-over allocator. #6211 does not create that hazard; it makes it
+    // reachable without any config edit at all, because pass 1 and pass 2 can
+    // disagree on an unchanged rule set. A first-hit `break` was sufficient only
+    // under the narrower invariant.
     // The #6211 two-pass selection breaks that invariant — pass 1 and pass 2
     // can choose DIFFERENT rules for the same session at different times (a
     // zone delete/renumber, or a rule-set `from zone` / `match` edit, flips
@@ -883,7 +890,19 @@ fn release_source_nat_allocation_with_mode(
     // flow — or the same flow under a different translation — is untouched.
     // For the single-reservation case (every pre-#6211 config, and every
     // config where selection never moved) the outcome is bit-identical; only
-    // the early exit is gone, on a cold teardown path.
+    // the early exit is gone.
+    //
+    // That early exit was NOT on a cold path, so state the cost honestly rather
+    // than waving it off. This body backs `rollback_source_nat_allocation` as
+    // well as the release, and that has five non-test call sites, all of them on
+    // the packet path in `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472,
+    // :2634, :4902) — :2374 is the admission-refusal arm, i.e. the flood regime.
+    // Per refused SNAT'ed flow the sweep takes K allocator locks instead of
+    // (owning index + 1), where K is the pool-mode rule count. This is a
+    // mechanism statement: no throughput measurement was taken and none is
+    // claimed. The correctness argument above is what justifies it — a leaked
+    // `(pool_addr, port)` is permanent and counts against `max_tracked_flows`
+    // until exhaustion, while the extra locks are bounded and per-teardown.
     for rule in rules {
         if !rule.pool_mode {
             continue;
