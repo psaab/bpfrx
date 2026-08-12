@@ -514,6 +514,23 @@ queue-ownership fragmentation + the Phase-1/Phase-2 split — empirically
 visible. They are **diagnostic only**: the scheduler reads none of them,
 and they are zero on the default Proportional (legacy RR) path.
 
+Since #4408 that selector is an orchestrator over three named phases in
+`userspace-dp/src/afxdp/cos/queue_service/mod.rs`, which is where each
+counter below is actually bumped:
+
+| Phase fn | Counters it bumps |
+|---|---|
+| `refill_waterfill_epoch` | `epochs` |
+| `waterfill_phase1_select` | `phase1_admit`, `phase1_budget_breaks`, and the Phase-1 half of `eligible_visits` |
+| `waterfill_phase2_select` | `phase2_admit` and the Phase-2 half of `eligible_visits` |
+
+`phase1_no_progress` belongs to none of the three: it is bumped — and
+`phase1_admit` correspondingly decremented — by
+`apply_phase1_waterfill_honor_refund`, which
+`service_exact_guarantee_queue_direct_with_info` invokes after a Phase-1
+honor that transmitted zero bytes. The #4408 split was pure motion; no
+counter semantics changed.
+
 ```
 show class-of-service interface reth0.80
   ...
