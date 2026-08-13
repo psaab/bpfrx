@@ -65,13 +65,13 @@ const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 /// already-loaded flags word restores the true zero-cost-when-absent
 /// property.
 const USERSPACE_CTRL_FLAG_WG_RX: u32 = 16;
+mod binding_index;
 mod ipv6_ext_walk;
+use binding_index::{BINDING_QUEUES_PER_IFACE, RawRxQueue, binding_slot};
 use ipv6_ext_walk::{
     FragHdr, MAX_EXT_HDRS, NEXTHDR_AUTH, NEXTHDR_DEST, NEXTHDR_FRAGMENT, NEXTHDR_HOP,
     NEXTHDR_ROUTING, eh_class_table, read_bytes,
 };
-
-const BINDING_QUEUES_PER_IFACE: u32 = 16;
 // MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
 // pkg/dataplane/build-userspace-xdp.sh wrapper, which does
 // `export MAX_INTERFACES=$(awk ... xpf_common.h)` before `cargo build`.
@@ -442,6 +442,15 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return drop_degraded_transit(ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
     };
 
+    // #5173: this statement is pinned token-for-token by the parity tests, and
+    // the name it binds is bounded twice over there — to exactly one `let`
+    // binding, and to a fixed total number of mentions anywhere in the crate.
+    // The second bound is what catches a rebinding spelled as a tuple pattern,
+    // a `let … else`, a macro expansion or a parameter, none of which write the
+    // token pair the first one matches. The interface coordinate stays a bare
+    // u32 all the way into `binding_slot`, so unlike the queue coordinate
+    // NOTHING rejects a reduction of it by type — pinning where it comes from,
+    // bounding the name, and pinning how it is passed is the whole defence.
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
     if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }.map_or(true, |v| *v == 0) {
         return Ok(cpumap_or_pass(ctrl));
@@ -449,8 +458,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let native_gre =
         parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0;
 
-    let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
-    let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
+    // #5173: wrap the coordinate at the ONE point it leaves the context, so
+    // nothing downstream can reduce it — `RawRxQueue` has a private field and no
+    // arithmetic impls. The repo-scoped checks in the parity tests pin that this
+    // is the only construction site and that its argument is the context field.
+    let rx_queue = RawRxQueue::from_ctx_field(unsafe { (*ctx.ctx).rx_queue_index });
+    let rx_queue_index = rx_queue.for_trace();
+    let selected_queue = rx_queue_index;
     record_trace(
         ctrl.flags,
         ingress_ifindex,
@@ -461,13 +475,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         0,
         &parsed,
     );
-    let binding_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue;
-    let mut binding = USERSPACE_BINDINGS.get(binding_idx);
-    // Treat zero-flags (unpopulated Array entry) as missing.
-    if binding.map_or(true, |b| b.flags == 0) && selected_queue != rx_queue_index {
-        let fallback_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + rx_queue_index;
-        binding = USERSPACE_BINDINGS.get(fallback_idx);
-    }
+    let binding =
+        binding_slot(ingress_ifindex, rx_queue).and_then(|idx| USERSPACE_BINDINGS.get(idx));
     let binding = match binding {
         Some(b) if b.flags != 0 => b,
         _ => {
@@ -1274,9 +1283,10 @@ fn parse_ipv6(
     let offset = l3_offset.checked_add(mem::size_of::<Ipv6Hdr>() as u16)?;
 
     // #4555: the shared walk, executed verbatim by userspace-dp's parity
-    // corpus (`ipv6_ext_walk.rs` is `#[path]`-included there and driven on real
-    // buffers), so its advance arithmetic and bounds revalidation are observed
-    // rather than asserted about the source text.
+    // corpus (`ipv6_ext_walk.rs` is pulled in there through a module-path
+    // attribute — described, not spelled; see that file's module comment for
+    // why — and driven on real buffers), so its advance arithmetic and bounds
+    // revalidation are observed rather than asserted about the source text.
     let (offset, protocol) =
         ipv6_ext_walk::walk_ipv6_ext_headers(data, data_end, l3_offset, protocol, offset)?;
 
@@ -1447,30 +1457,6 @@ fn is_ipv4_link_local(ip: u32) -> bool {
 
 fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
-}
-
-fn select_userspace_queue(
-    ctrl: &UserspaceCtrl,
-    rx_queue_index: u32,
-    _parsed: &ParsedPacket,
-) -> u32 {
-    let queue_count = if ctrl.queue_count == 0 {
-        ctrl.workers
-    } else {
-        ctrl.queue_count
-    };
-    if queue_count <= 1 {
-        return 0;
-    }
-    /*
-     * AF_XDP delivery is queue-bound. XDP may only redirect to a socket bound
-     * to the packet's actual RX queue. Hashing to a different userspace queue
-     * here silently strands packets between redirect intent and ring delivery.
-     *
-     * Keep the XDP handoff on the ingress queue and let userspace do any
-     * higher-level work redistribution after the packet is received.
-     */
-    rx_queue_index % queue_count
 }
 
 fn parse_l4(

@@ -1,3 +1,470 @@
+## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
+
+- **Timestamp**: 2026-08-12 (fix/5173-shim-queue-mis-steer, PR #6676)
+- **Action**: re-verified the only findable verdict against the head instead of
+  folding it blind; recorded why the guards resist the substitution class.
+- **File(s)**: _Log.md
+
+NO CODE CHANGED. Every finding this round was re-run against `3f6faf297` and
+every one of them is already answered. Writing a guard for a hole that probes
+say is closed is how a test becomes decoration, and this PR has eight rounds of
+that behind it.
+
+THE r9 BRIEF COULD NOT BE RECOVERED. Task #136 carried one line — "F1
+binding_slot callee substitution unbound" — with no artefact path, and there is
+no verdict at the head: the newest PR comment is the Codex leg at `1275efbf5`
+dated 2026-08-01, six days older. Rather than guess, the finding was derived
+from the code and probed.
+
+F1 AS DERIVED DOES NOT REPRODUCE — three substitution shapes, three guards:
+
+  - a local `fn binding_slot` shadowing the import, call statement byte-identical
+    -> caught, `shim_index_path_has_one_construction_and_one_lookup`
+  - a cross-file module exporting the identical `pub fn binding_slot` signature
+    -> caught, same guard, crate-wide signature count (left: 2, right: 1)
+  - rename-on-import (`use queue_index2::slot as binding_slot`) — ONE signature
+    crate-wide, call statement byte-identical -> caught, `RawRxQueue` tally
+    ("must be named exactly 8 times ... was named 10")
+
+WHY THE THIRD MATTERS, and it is the part worth keeping. It was expected to
+pass: it defeats the call-statement pin AND the one-signature rule. It fails
+because any substitute must ACCEPT a `RawRxQueue`, and that name is tallied
+EXACTLY, crate-wide — so the newtype functions as a CAPABILITY TOKEN and an
+imported substitute cannot pay the mention cost. That is a stronger property
+than "formatting-insensitive source-spelling test" suggests, and it is the same
+tally called fungible in round 8. Recorded here because the next reviewer will
+reach for that same objection; the counter-evidence should be findable rather
+than re-derived.
+
+Through all three, `shim_binding_slot_never_leaves_its_interfaces_row` stayed
+GREEN — consistent with the shape of the finding, since it binds the
+`#[path]`-included file rather than production's resolution. The GUARDS close
+this class, not the executable test.
+
+BOTH AUG-1 CODEX ESCAPES ARE CLOSED AT THIS HEAD, re-run rather than assumed:
+
+  - escape 1, `let rx_queue_index = rx_queue_index % 2` transforming the RAW ctx
+    field before the identity -> RED at main_tests.rs:3223, the construction
+    statement pin ("the coordinate must be wrapped by exactly this statement,
+    once ... found 0 occurrence(s)"). This is the head commit's own "bind the ctx
+    escape" work firing.
+  - escape 2, a CROSS-FILE raw fallback computing the aliased adjacent row from
+    `ingress_ifindex` and the raw queue, with BOTH pinned statements left
+    byte-identical -> RED at main_tests.rs:3183, the one-binding-map-read rule
+    ("the shim crate must contain exactly ONE binding-map read; found
+    ["lib.rs", "lib.rs"]").
+
+The Aug-1 leg's prescribed fix — extract the index computation into a
+`core`-only function and drive it from a host test over out-of-stride
+coordinates — is ALREADY IMPLEMENTED: `binding_slot` lives in
+userspace-xdp/src/binding_index.rs and
+`shim_binding_slot_never_leaves_its_interfaces_row` drives it over a queue axis
+that straddles the stride, asserting `None` above it. So the MERGE-NEEDS-MAJOR
+is answered by the head, and re-doing the extraction would have been the #6871
+mistake — moving an unbound edge to a new call site rather than closing one.
+
+Baseline after every probe was restored: `git status` clean, 14 shim tests pass,
+0 failed. No production code, no shim `.o`, and no manifest input changed by this
+round, so this commit adds no new cluster-smoke obligation; the PR's existing one
+(the `.o` changed earlier in its history) stands and is the parent's to schedule.
+
+## 2026-08-07 — #5173 round 8: three completeness claims were FALSE; `ctx` was the escape
+
+- **Timestamp**: 2026-08-07 (fix/5173-shim-queue-mis-steer, PR #6676)
+- **Action**: Round-7 hostile re-gate reached all six probes and found NOTHING
+  wrong with the shipped runtime code — the queue coordinate is carried
+  verbatim on every path, `binding_slot`'s arithmetic is sound including the
+  above-planner-range case, the Go/Rust wire constants did not move, and the
+  committed object reproduces from source and passes the live kernel verifier.
+  What it found was that three sentences in the guard apparatus claimed the
+  guard closed something it does not, and it demonstrated the escape end to
+  end. This round is a TEXT correction plus two bounds; the runtime shim is
+  untouched, and the object regenerates bit-identically across every comment
+  edit here.
+
+  THE FALSE CLAIMS. All three said, in different words, that spending the
+  per-file mention budget for the two COUNTED names leaves nothing to spend:
+  `main_tests.rs` "For `rx_queue` that closes it", `binding_index.rs` "so
+  there is nothing free to spend there", and the construction-statement
+  assertion's "makes the argument spelling the load-bearing part". A fourth
+  site restated the same thing in the `MENTIONS_PER_FILE` comment ("has
+  nothing left to spend") and is corrected with them. The defect in all four
+  is the same: a token/AST canary can bound how something is SPELLED and how
+  often a name is WRITTEN. It cannot bound what a name is BOUND TO, and #5173
+  is a property of the value that arrives, not of the text that names it.
+
+  THE ESCAPE, reproduced firsthand before the corrections were written rather
+  than taken on report. Five statement-scope lines above the pinned
+  construction, shadow `ctx` with a zeroed `xdp_md` carrying a masked queue
+  index, then restore it before `bpf_xdp_adjust_meta` needs the real one. The
+  pinned construction statement is byte-identical and reads the doctored
+  struct. Measured: builds for `bpfel-unknown-none`; `make generate` verifier
+  PASS (725961 insns, 27.40% headroom); the emitted object gains `r &= 0x3`
+  AND LOSES the `> 0xf` stride guard entirely — `llvm-objdump -d --section=xdp
+  | grep -c "0xf goto"` is 1 pristine and 0 mutated, which LLVM only does once
+  it can prove the value is under 16 — and all 14 `shim_*` tests stay GREEN
+  with `rx_queue` still at 3 in `lib.rs` and `ingress_ifindex` still at 22.
+  That is #5173 back in the shipped program with every merge-path guard green,
+  the kernel verifier included.
+
+  THE TWO BOUNDS, and what they are NOT. `ctx` joins `MENTIONS_PER_FILE` as a
+  third column (`binding_index.rs` 3, `lib.rs` 17) and `let ctx` is refused
+  outright (0 today). Four-cell mutation grid, run firsthand: (A) the `let`
+  shadow REDs on the refusal with its assertion message, 13/14; (B) the same
+  shadow written through tuple patterns dodges the refusal (`let ctx` stays 0)
+  and REDs on the tally column instead, `ctx` 17 -> 23 while both coordinate
+  columns are unmoved, 13/14; (C) cell B with ONLY the `ctx` column severed
+  from the comparison goes back to 14/14 GREEN, which is what makes the RED in
+  B attributable to that column rather than to some other belt; (D) pristine is
+  14/14. Both REDs are assertion failures, not build breaks.
+
+  These close the DEMONSTRATED forms. They do NOT close the class and the
+  comments now say so at every site: the class is semantic (what a name
+  resolves to) and every instrument in that file is syntactic (which names the
+  source writes). The round-7 pattern — treat each new escape as blocking,
+  produce another — is not repeated here; an AST canary cannot enumerate them,
+  so the terminal state is an honest residual rather than an exhaustive one.
+
+  ALSO. The `RawRxQueue` trait-impl assertion said the type "must implement NO
+  traits", which is literally false and self-contradicted two sentences later:
+  the struct carries `#[derive(Clone, Copy, PartialEq, Eq, Debug)]`. Message
+  text only, no runtime effect. Reworded to what it checks — no hand-written
+  `impl … for` block — with the reason the five derives are allowed (none
+  yields the inner `u32` or an operator).
+
+  MERGE. Resolved against master: `lib.rs` kept both module declarations and
+  dropped master's local `BINDING_QUEUES_PER_IFACE` (now supplied by
+  `binding_index`); `main_tests.rs` and `_Log.md` union-resolved and verified
+  STRUCTURALLY — each pre-merge side diffs into the result with zero removed
+  and zero changed lines, not by prefix containment, since `_Log.md` is no
+  longer append-ordered. The object and manifest were regenerated rather than
+  resolved by hand. One interaction needed a source change: master's new prose
+  spells the module-path attribute literally, which this branch's confinement
+  bound refuses anywhere under `userspace-xdp/src`; that is the spurious RED
+  the check documents, so the prose is worded around it and the reason
+  recorded at both sites.
+
+  OBJECT. `62eb90b6b9b9ff62144c39cd083f0a79aa41b993707fe835da23e7e39c8be517`
+  before and after this round's comment edits — a new hash versus the branch's
+  previous `114354c9…` only because master's shared IPv6 extension-header walk
+  genuinely changed shim codegen. `make generate` twice leaves
+  `git status --porcelain` unchanged; only `binding_index.rs`'s input sha moved
+  in the manifest.
+- **Validation**: `cargo test --release` full crate green (4230 parallel + the
+  24 `afxdp::wg::engine::engine_internal_tests` run serially, both legs to dodge
+  the two opposite-trigger deadlocks in #6952); `go build ./...`,
+  `go vet ./pkg/dataplane/`, `go test ./pkg/dataplane/...` and
+  `go test ./pkg/refactoraudit/` all clean; heatmap regenerated.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs, userspace-xdp/src/lib.rs,
+  userspace-xdp/src/ipv6_ext_walk.rs, pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/refactoring-audit-current.txt, _Log.md
+
+## 2026-08-01 — #5173 round 7: a seventh escape class — the function BODIES were never pinned
+
+- **Timestamp**: 2026-08-01 (fix/6676-shim-rx-queue-r7)
+- **Action**: Round-6 hostile re-gate returned `MERGE-NEEDS-MAJOR` on the
+  GUARD apparatus, not the runtime fix. Runtime behaviour is untouched:
+  the shim source change in this round is COMMENT-ONLY, and the installed
+  object reproduces bit-identically at
+  `114354c9a2238bfa1229027b66da3f815a1c5deeaebd2c48f141ef8b84a35e96`
+  after `make generate` (verifier PASS).
+
+  **F1 (MAJOR) — a seventh escape class, and cheaper than the six before
+  it.** Six escapes had been closed on this branch; every one of them
+  needed a binding, a proc macro, a `--extern`, a `[patch]`, a manifest
+  edit or a deletion. This one needs a single in-place arithmetic edit
+  inside a shim function BODY. It creates no binding, spends nothing from
+  the per-file mention tally (`rx_queue_index` is a different token to
+  the counted `rx_queue`) and moves no other pinned sequence.
+  `binding_slot`'s SIGNATURE was pinned but its body was not, and
+  `CONSTRUCTION_STATEMENT` pinned the constructor's CALL SITE in `lib.rs`
+  while its body went unpinned.
+
+  Reproduced firsthand before fixing, both instances GREEN on the shipped
+  guards: `RawRxQueue(rx_queue_index & 0x3f)` at `binding_index.rs:134`,
+  and `Some((ingress_ifindex & 0xffff) * BINDING_QUEUES_PER_IFACE + …)`
+  at `:171`.
+
+  The ROOT REASON is worth recording, because it generalises past this
+  file: the only value-level check was an enumerated grid
+  (`ifindex ∈ {0,1,2,7,63,1000,65535}` × `q ∈ [0,64)`) whose LARGEST
+  TESTED VALUE ON EACH AXIS WAS EXACTLY THE MASK'S BOUNDARY.
+  `65535 & 0xffff == 65535`; every `q < 64` satisfies `q & 0x3f == q`. So
+  both masks were the identity on every point the grid tested. The guard
+  was not weak — it was precisely coextensive with the defect it existed
+  to catch.
+
+  The `& 0x3f` instance is RUNTIME-REACHABLE, not theoretical. On a NIC
+  left above 64 combined channels with the helper's queue count capped at
+  ≤16 (one of the two remediations `docs/afxdp-packet-processing.md`
+  names), a packet on hardware queue 70 resolves to `None` today and
+  takes the designed binding-missing path; masked, `70 & 0x3f = 6`
+  resolves to a LIVE binding and the shim redirects to an XSK bound to a
+  queue the packet did not arrive on — `xsk_rcv_check()` returns
+  `-EINVAL`, the driver discards, and the trace stage stays REDIRECT.
+  #5173 verbatim. The Go publish-side `queue_id >= 16` refusal bounds
+  what Go WRITES, not what arrives from hardware. The `& 0xffff`
+  instance is bounded by the Go cap (fails closed at ifindex ≥ 65536), so
+  it is a guard defect rather than a shipping one — recorded as such
+  rather than inflated, and fixed because it proves the hole is a CLASS.
+
+  Fixed by pinning all THREE bodies in `binding_index.rs`
+  token-for-token, the way the call sites in `lib.rs` already were —
+  the constructor, the telemetry readback and `binding_slot` — which
+  closes the class exactly. The executed grid was ALSO replaced with a
+  property over power-of-two ladders (`2^k`, `2^k ± 1`) on both axes:
+  ifindex to `2^28 - 1` (where `ifindex * 16 + 15` is exactly `u32::MAX`
+  and host/target genuinely disagree above it), queue to `u32::MAX`, with
+  a per-axis floor asserting the OR of the tested values is all-ones so
+  ANY mask that clears a bit alters a tested result. Widening ALONE was
+  refused: it relocates the boundary and buys one round.
+
+  Mutation-proved, four ways. Both reviewer instances now RED with real
+  assertions. Two edge mutations show why the pin and not the axis is the
+  primary bound: `& 0x1ffff` is the identity on the shipped grid AND at
+  `2^16 ± 1` (a grid widened one step would still miss it) and reds at
+  `2^17`; and a `#[cfg(target_arch = "bpf")]`-split body that masks in the
+  BPF object while evaluating `& !0` on the host left the executed axis
+  green at all ~7700 points AND left the per-file tally green — ONLY the
+  body pin caught it. A host test cannot see a target-conditional body by
+  construction, however wide its axes.
+
+  Also corrected the module comment at `binding_index.rs:32-44`, which
+  named its only gap as "ifindexes … (2^28 and up)". That was wrong by
+  four orders of magnitude on the ifindex axis (everything above 65535
+  was uncovered) and silent on the queue axis, whose coverage stopped at
+  63.
+
+  **F2 (MINOR) — `rustc-wrapper` was not on the banned-capability list.**
+  It tokenizes to `rustc`, `-`, `wrapper`, so none of
+  `extern`/`patch`/`replace` appears in it. A wrapper is exec'd as
+  `<wrapper> <rustc> <args…>` and can append `--extern <procmacro>=<path>`
+  to every invocation — the exact acquisition capability the manifest pin
+  exists to close. The reviewer verified empirically that a wrapper in the
+  repo-root config IS invoked for the `bpfel-unknown-none` shim build with
+  all three tests green. Added the token `rustc` to both ban lists
+  (neither config contains a bare `rustc` token, verified before relying
+  on it). A second, narrower claim in the same paragraph was false and is
+  now CLOSED rather than reworded: `rustflags` is legal in the repo-root
+  config, and `-L dependency=…` there spells the injection in the SOURCE
+  as `extern crate evil;` — so the source walk now refuses the token pair
+  `extern crate` alongside `[path]`/`include`, bounding that route at both
+  ends.
+
+  **F3 (MINOR) — the trait-impl refusal missed an impl on a reference.**
+  `impl core::ops::Rem<u32> for &RawRxQueue` tokenizes `… for & RawRxQueue`,
+  so the adjacent needle `["for","RawRxQueue"]` missed it while the
+  message claimed "must implement NO traits". The scan now steps over
+  reference sugar (`&`, `mut`, a lifetime), and a `RawRxQueue` mention
+  count (8) was added as the bound that is complete over impl FORMS the
+  way a needle is not — coherence means any impl must NAME the type.
+
+  **F4 (MINOR) — dangling citations this PR introduced.** Moving
+  `BINDING_QUEUES_PER_IFACE` out of `lib.rs` left four citations behind;
+  a repo-wide sweep found a FIFTH the review did not list. Fixed:
+  `pkg/dataplane/constants.go:7` and `:25`, the two operator-facing
+  #4894 fail-closed error strings at
+  `pkg/dataplane/userspace/maps_sync.go` (which sent an operator to a file
+  that no longer contains the constant), and
+  `pkg/dataplane/userspace/maps_sync_cap_test.go:672`. Deliberately NOT
+  changed: `constants.go:31` cites `BINDING_ARRAY_MAX_ENTRIES`, which
+  genuinely stayed at `lib.rs:86` — verified.
+
+  **F5 (MINOR) — rustfmt.** The repo-wide failure is real and
+  pre-existing. Measured per file at the parent `ad9591177`: userspace-dp
+  2495 hunks, `main_tests.rs` 4, userspace-xdp 0. This PR had widened
+  `main_tests.rs` to 8. All four extra hunks were in its own new code and
+  are fixed; the per-file count is back to the parent's exact 4 and the
+  total to 2495, so the delta is zero per file, not merely in aggregate.
+
+  **F6 (MINOR) — two comments claiming more than their assertions.** The
+  `for_trace()` claim ("corrupting it … reds here") was false: the test
+  evaluated it at one input, 3, and `3 & 0x3f == 3`. It now runs the
+  readback over the same `u32`-wide ladder, and the sentence says what is
+  true. The interface-half residual was presented "as inventory" naming
+  three free `ingress_ifindex` mentions in `lib.rs`; there are SIX
+  (`:127`, `:246`, `:437`, `:696`, `:1124`, `:1140`) — verified
+  firsthand, and 16 + 6 == the pinned tally of 22. The inventory is now
+  complete and each site is named.
+- **File(s)**: `userspace-xdp/src/binding_index.rs` (comment only),
+  `userspace-dp/src/main_tests.rs`, `pkg/dataplane/constants.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/maps_sync_cap_test.go`,
+  `pkg/dataplane/userspace_xdp_manifest.json` (source-hash refresh only),
+  `_Log.md`
+- **Validation**: `make generate` rc=0, kernel verifier PASS, installed
+  object sha UNCHANGED; `go build ./...` and `go vet ./...` rc=0;
+  `go test ./pkg/dataplane/...` all 4 packages ok; the full userspace-dp
+  cargo suite green; `cargo fmt --check` per-file delta vs the parent
+  exactly zero. No docs change was needed in
+  `docs/afxdp-packet-processing.md`: it documents runtime behaviour, and
+  this round changes only the guard apparatus and comments — the
+  citations it carries were already correct, and the four that were not
+  are fixed above.
+
+## 2026-08-01 — #5173 fold: bound VALUE, not just spelling; close the off-path fail-open
+
+- **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)
+- **Action**: Round-3 hostile re-gate returned `MERGE-NEEDS-MINOR` with
+  five findings. Runtime behaviour is untouched — the object is
+  bit-identical after `make generate` — and every finding was a guard
+  scoped narrower than the claim it protected.
+
+  **F1 — the statement pin fixed argument SPELLING, not argument VALUE.**
+  Both coordinates reach the pinned lookup by NAME, so pinning the
+  statement said nothing about what the names were worth. A one-line
+  shadow immediately above the pin (`% 4` on the interface coordinate)
+  compiled for `bpfel-unknown-none` and left all three guards green —
+  literally M2's defect moved one line up, which falsified the commit
+  message's claim that "neither of its arguments is transformed". Fixed
+  by pinning the interface coordinate's DEFINITION statement as well, and
+  by bounding each coordinate to exactly ONE binding of its name in the
+  crate. Matching `let <name>` rather than `<name> =` is deliberate: a
+  type annotation slips the latter, and the unsafe-forgery shadow is
+  spelled exactly that way.
+
+  **F2 — the off-tree-source refusal was defeated by a 12-character
+  respelling.** `#[cfg_attr(all(), path = "…")]` never emits the `[ path`
+  token pair the check looked for, and `use core::include as inc` never
+  emits `include !`. The reviewer put a second, reduced binding-map read
+  on the packet path in a file outside the walk with every bound green,
+  and proved rustc really compiles it. That is the exact fail-open the
+  check's own comment says it exists to close. Now matched by CAPABILITY
+  rather than spelling: any module-redirect attribute must write `path =`
+  at any nesting depth, and any route to the macro must NAME `include` to
+  import it.
+
+  **F3 — the residual named a symbol where it meant a class.**
+  `core::mem::zeroed()` escaped everything and pinned every packet to
+  queue 0; same class as `transmute`, different symbol. Chasing the
+  symbols would always be one behind (`MaybeUninit::assume_init`, a
+  pointer read, …), so the class is bounded structurally instead: the
+  pinned lookup only accepts the coordinate under one fixed NAME, and
+  that name is bounded to one binding — a forged value that cannot be
+  bound cannot be used. `binding_index.rs` now names the class, not the
+  symbol.
+
+  **F4 — the compile-time half had no regression guard.** Adding
+  `impl Rem<u32> for RawRxQueue` plus a `pub` field reddened NOTHING, and
+  with one shadow line that is a complete #5173 reintroduction with no
+  `unsafe` anywhere for a reader to catch. Bounded: no trait impls on the
+  newtype, and the field declaration pinned so `pub` reds.
+
+  **F5 — two dangling doc citations.** `docs/fairness-regimes.md` cited
+  the deleted `select_userspace_queue()`; `docs/afxdp-packet-processing.md`
+  still located `BINDING_QUEUES_PER_IFACE` in `lib.rs` and described
+  out-of-stride handling as Go-side-only, omitting the shim read-side
+  stride bound this PR adds — the user-visible behaviour change.
+
+  Also fixed: this PR had regressed `userspace-xdp/src/lib.rs` from
+  rustfmt-clean (master is clean) — a stray double blank line left by the
+  `select_userspace_queue` deletion, and a lookup statement over the width
+  limit. Reformatting SPLIT the pinned statement across two lines, which
+  is the round-2 bypass verbatim; the pin matched anyway, so the shipped
+  source now demonstrates the tokenizer's whitespace-insensitivity instead
+  of only asserting it.
+
+  Not closed, stated plainly: a closure or helper-`fn` PARAMETER can
+  shadow either coordinate without writing a binding. Probed (row R1) and
+  confirmed green. It requires the pinned statement verbatim inside the
+  new body and a visible reduced argument at the call site. Typing the
+  interface half would move that residual rather than close it — its
+  constructor would take a bare `u32` for the same aya-shaped reason the
+  queue newtype's does — and would change the runtime object, so it was
+  evaluated and rejected for this fold.
+
+  Validation: 23-row matrix, `shimcheck` (pinned nightly-2026-05-23,
+  `bpfel-unknown-none`) and `cargo build --tests` rc=0 in EVERY row that
+  reports a test result, so every red is an ASSERTION not a build break;
+  byte-exact restore asserted per row; results read only from the
+  anchored `^test tests::<NAME> ... (ok|FAILED)$` line, because
+  `cargo test --exact` prints `test result: ok. 0 passed` and exits 0 when
+  nothing matches. All 12 prior rows reproduce. NINE escapes go
+  green-on-parent -> red-on-fold with the shim compiling: N1, N1b (F1),
+  N3, M7b (F3 — transmute now reds too), N5 cfg_attr, N6 aliased-include
+  (F2), N7, N7b, N8 (F4). Each reds on the INTENDED new assertion, not a
+  collateral break — verified by reading the panic text per row; N5 hits
+  one needle where the literal `#[path]` control hits two, discriminating
+  the new bound from the old. `make generate`: verifier PASS, object
+  sha256 `114354c9…` UNCHANGED across both regenerations, so the whole
+  fold is codegen-neutral; only the two source input hashes moved.
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` ok, `go vet` and
+  `go test ./pkg/dataplane/...` ok. Rust suite: 4236 passed, 1 failed —
+  `afxdp::ha::…poisoned_shared_mutex`, the pre-existing flake filed as
+  #6712 (passes 3/3 in isolation; this diff touches zero `afxdp/` files).
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs, userspace-xdp/src/lib.rs,
+  pkg/dataplane/userspace_xdp_manifest.json,
+  docs/afxdp-packet-processing.md, docs/fairness-regimes.md, _Log.md
+
+## 2026-08-01 — #5173 SPLIT: ship the coordinate fix, defer the planner half
+
+- **Timestamp**: 2026-08-01 (fix/5173-shim-queue-mis-steer)
+- **Action**: Split the change after a capacity audit and two hostile
+  reviews. The shim half ships; the planner half does not.
+
+  **Why split.** Moving the planner from `min(queues) x interfaces` to
+  `sum(per-interface queues)` takes the binding count from 4 to 34 on the
+  real asymmetric topology, and each binding pins its own UMEM with
+  MAP_POPULATE — ~176 MiB to ~1.34 GiB resident, 4x that again at the
+  permitted `--ring-entries 16384`. Shared UMEM does not help; it sizes a
+  group as the SUM of members. Codex separately found the XSK and
+  heartbeat maps are hard-capped at 4096 entries while the per-interface
+  sum is uncapped, and that the resulting failure can abort an apply
+  AFTER the previous dataplane is torn down — a config that planned fine
+  under the old scheme ends with no dataplane. Six further downstream
+  assumptions depend on the old count (partial heartbeat-slot zeroing,
+  1 -> 8 busy-polling worker threads, all-or-nothing readiness barriers,
+  a wedge-recovery gate that only fires at `bound == 0`, slot-keyed state
+  carry-over that reshuffles on any queue-count change, RSS pinning RX to
+  `[0, workers)`).
+
+  The shim half stands alone: it removes the mis-steer and the verifier
+  cost goes DOWN. What it does not do without the planner half is make
+  queues above the old minimum WORK — they get no binding and are dropped
+  explicitly instead of being silently mis-steered to a socket the kernel
+  then rejects. Same outcome, legible instead of silent. That is a
+  shippable increment; "make them work" needs the capacity work.
+
+  **Two corrections, both mine, both propagated into review before being
+  caught.** The comment claimed an out-of-stride read would deliver into
+  another interface's XSK. It cannot: `xsk_rcv_check()` compares BOTH
+  `xs->dev != xdp->rxq->dev` and `xs->queue_id != xdp->rxq->queue_index`,
+  so a row belonging to a different netdev AND queue is rejected on both
+  counts and dropped. Same class of silent drop, not a cross-interface
+  leak. The bound is still worth having — it makes the refusal explicit
+  and traced where the index is formed — but it guards a hazard this
+  change itself creates by removing the modulo, not a pre-existing hole.
+  Separately, calling the raw-queue fallback "dead code" understated the
+  old behaviour in the other direction: `flags == 0` means "not
+  FORWARDING-live", not "unplanned", so during every bringup, unarmed or
+  dead worker, and RG transition a planned binding read back as absent,
+  the fallback fired, and it indexed with the raw unbounded
+  `rx_queue_index`. That read was REACHABLE, not latent.
+
+  **The guards were keyholes.** A hostile review proved three mutations
+  that reintroduce #5173 verbatim while leaving every guard green:
+  reducing at the call site, masking inside the lookup, and shadowing
+  `selected_queue` one line ABOVE the anchor — the old check used a
+  forward-only 400-character window, so anything behind it was invisible.
+  Replaced with four FILE-SCOPED property guards: exactly one binding-map
+  read in the file with a token-exact index; `selected_queue` bound
+  exactly once with token-exact provenance; the identity function body;
+  and the whole stride-bound statement pinned by tokens rather than a
+  directional window.
+
+  Validation: `make generate` verifier PASS, 797,849 insns / 20.2%
+  headroom (unchanged — the corrections are comment-only). Seven-row
+  acceptance with `cargo build --release` exit 0 in every row: all six
+  mutations red, including the three that previously passed everything,
+  and the negative control (master's own
+  `queue_planner_uses_smallest_queue_count`, restored with the planner
+  revert) green in all eight rows.
+- **File(s)**: userspace-xdp/src/lib.rs, userspace-dp/src/main_tests.rs,
+  pkg/dataplane/userspace_xdp_bpfel.o,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
 ## 2026-08-05 — #6829 round 9: the assign-half guard was a clean miss at BOTH sites
 
 - **Timestamp**: 2026-08-05 (fix/5797-syslog-selector-failclosed, PR #6829)
@@ -70257,6 +70724,120 @@ break — `go vet` confirmed passing under every revert.
   userspace-dp/src/session/mod.rs, userspace-dp/src/session/tests.rs,
   userspace-dp/src/session/README.md, docs/session-sync-architecture.md, _Log.md
 
+- **Timestamp**: 2026-08-01 12:20
+- **Action**: #5173 / PR #6676 fix round — close the six guard escapes a
+  hostile re-gate found at `1b9d91464`. The RUNTIME fix was verified
+  correct and is untouched; the defect was entirely in the guards, and
+  it had a single shape: the previous head replaced a token-exact index
+  pin with a bare `str::matches` COUNT of `USERSPACE_BINDINGS.get(`.
+  A count cannot see an index that has been transformed, so coverage
+  REGRESSED while the claim strengthened — `.get(idx % 4)` (#5173
+  verbatim), `binding_slot(ingress_ifindex % 4, ..)`, dropping
+  `binding_slot` off the packet path entirely, an alias
+  (`use crate::USERSPACE_BINDINGS as BINDS`), and the deleted unbounded
+  raw-queue fallback reinstated with ONE NEWLINE before `.get(` all
+  passed green. The newline is the formatting rustfmt itself emits for a
+  chain that long, so it is not an adversarial spelling.
+
+  **Remedy — the source half is now TOKEN-based, not substring-based,
+  and pins whole STATEMENTS.** `shim_tokens` split into `shim_token_vec`
+  (+ `shim_token_seq_count`) so a token SEQUENCE can be counted:
+  (1) the binding-lookup statement pinned token-for-token, exactly once
+  — one assertion closing M1/M2/M8 at a stroke because it pins that
+  `binding_slot` is on the packet path AND that neither argument nor the
+  lookup's index is transformed; (2) the map read counted as a TOKEN
+  sequence, so a newline no longer bypasses it; (3) the identifier
+  `USERSPACE_BINDINGS` bounded to exactly 2 mentions, which is what an
+  alias/re-export/local-rebinding cannot dodge — all of them must NAME
+  the static; (4) the wrap statement pinned the same way, with
+  `from_ctx_field` bounded to 2 mentions for the symmetric ctor-alias
+  hole; (5) `#[path]`/`include!` refused so the directory walk really is
+  the crate.
+
+  **Claims corrected rather than quietly fixed.** The residual is NOT
+  "one expression" and cannot be driven to zero: `transmute::<u32,
+  RawRxQueue>` compiles and passes everything (no newtype can stop it),
+  and `binding_slot` types the queue half of the index but not the
+  ifindex half. Both are now stated in `binding_index.rs` and on the
+  tests. Dead `shim_source()` deleted; `shim_tokens` repurposed into the
+  pin's failure diagnostic rather than left unused.
+
+  Validation: 12-row mutation matrix, `shimcheck` (pinned
+  nightly-2026-05-23, `bpfel-unknown-none`) and `cargo build` rc=0 in
+  every row that reports a test result, so every red is an ASSERTION not
+  a build break; byte-exact restore asserted per row. M1/M2/M3/M8/M11
+  now FAIL (previously all green); M4/M5/M9/M10 still fail; M6/M7a still
+  rejected by the compiler (E0369 / E0423). M7b (transmute) still passes
+  — documented, not claimed closed. `make generate`: verifier PASS and
+  the object is BIT-IDENTICAL (sha256 `114354c9…` unchanged), so the
+  comment edits are codegen-neutral; only the `binding_index.rs` input
+  hash moved in the manifest. Verifier counts measured firsthand under a
+  privileged load (previously INCONCLUSIVE): master `74d66ecc` = 990,796
+  insns (99.08% of the 1,000,000 cap), this head `bdade89d` = 797,849
+  (79.78%) — a 192,947-insn reduction from the runtime fix, not from
+  this commit.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
+- **Timestamp**: 2026-08-01 22:40
+- **Action**: #5173 / PR #6676 round-4 fold — the binding bound bounded one
+  SPELLING of a binding, not bindings. `shim_token_seq_count(toks,
+  &["let", name])` matches only a bare-identifier `let` pattern, and a
+  hostile re-gate walked through it four ways, every one compiling for
+  `bpfel-unknown-none` with all three tests green: a tuple pattern, a
+  `let … else`, a `macro_rules!` body taking an `$n:ident`, and a
+  closure/`fn` parameter. The tuple-pattern one is a COMPILED #5173 —
+  reproduced firsthand at the object level: the emitted program gains
+  `r1 &= 0x3` before the binding-map lookup and LOSES the `> 0xf` stride
+  guard, because LLVM can then prove the index in range.
+
+  Fixed by adding the CLASS-COMPLETE bound the file's own idiom already
+  uses for `USERSPACE_BINDINGS` and `from_ctx_field`: the total mention
+  count of each coordinate name in the shim crate is pinned
+  (`INGRESS_IFINDEX_MENTIONS = 25`, `RX_QUEUE_MENTIONS = 7`). A binding
+  cannot exist without WRITING the name it binds, whatever pattern,
+  macro or parameter form it takes, so every binding form raises the
+  count — where enumerating the forms would always be one form behind,
+  exactly as enumerating fabrication symbols would. The `let <name>`
+  bound is kept ahead of it for its precise message on the common shadow.
+  This also closes the residual the previous head DECLARED open (the
+  closure/`fn` parameter): probed and now RED.
+
+  Three false or stale statements corrected in the same pass. The
+  assertion message claimed the name "must be bound exactly ONCE in the
+  shim crate", broader than what was enforced. The comment claimed a
+  `macro_rules!` body "must still write these tokens to define itself,
+  and macro hygiene stops an out-of-crate one from shadowing here" —
+  false on the first half, since the body writes `let $n` and an `ident`
+  metavariable is call-site-hygienic. And the residual, stated in the
+  test doc, the `binding_index.rs` module doc, the commit message and
+  the PR body as "a parameter, rather than a `let`", is now stated as
+  what genuinely remains: CONSERVATION, since a count bounds occurrences
+  without classifying them, so an author who also DELETES an existing
+  mention pays for a shadow and leaves the total where it was.
+
+  Validation: 28-row mutation matrix, serialized libtest output
+  (`--test-threads=1` — parallel writers interleaved partial lines and
+  DESTROYED anchored result lines, a false NOTRUN; polarity is safe but
+  a result can be silently dropped). Shim `bpfel-unknown-none` build rc 0
+  asserted in every row reporting a test result; the only nonzero shim
+  rows stay M6/M7a where the compile rejection IS the result. Byte-exact
+  restore asserted per row over the whole `userspace-xdp/` tree. P1-P4
+  and the closure-parameter residual R1 are green on parent `db6b22576`
+  and RED at this head, all five on the new mention bound. Every prior
+  row still reds on its own intended assertion. `make generate`: verifier
+  PASS, object sha256 `114354c9…` UNCHANGED, so the change is
+  codegen-neutral; BOTH source input hashes moved (`lib.rs` and
+  `binding_index.rs`), correcting a PR-body line that named only one.
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` ok, `go build` and
+  `go vet` 0. Rust suite 4236 passed / 1 failed —
+  `afxdp::ha::…current_generation_install_and_delete_still_apply_on_poisoned_shared_mutex`,
+  which fails with IDENTICAL counts on parent `db6b22576` and passes 3 of
+  3 in isolation: the #6712 poisoned-shared-mutex flake family, and this
+  change touches zero `afxdp/` files.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs, userspace-xdp/src/lib.rs,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
 - **Timestamp**: 2026-08-01 12:40
 - **Action**: #6169 — close the >=65-recording sustained heartbeat replay with a
   signed boot epoch. Two parts. (1) Scope the #4107 anti-replay nonce to the
@@ -70659,6 +71240,36 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01 17:41
+- **Action**: #5173 round-5 fold — the #6676 guard claimed CLASS-COMPLETENESS
+  over binding forms that a proc macro breaks, and understated its own
+  CONSERVATION residual for both counted names. Both reproduced firsthand
+  against the tracked object (pristine sha256 `114354c9a2238b…`, zero `&= 0x3`
+  instructions anywhere). (1) A `proc-macro = true` crate outside
+  `userspace-xdp/src`, emitting a shadow from a parsed string so every span is
+  `call_site`, invoked by one line naming neither coordinate: build rc 0, test
+  rc 0, all three guards green, object `eb71ef9e…` gaining `r2 &= 0x3` right
+  after the `xdp_md.rx_queue_index` load. (2a) Re-sourcing `rx_queue_index`
+  from the context field freed the mention that paid for a tuple-pattern
+  `transmute` shadow — object `5122c347…`, count still exactly 7. (2b) A
+  cosmetic rename of `binding_slot`'s parameter freed THREE more (7 -> 4),
+  topped back up with prose. (2c) An alias plus two rerouted `record_trace`
+  arguments bought an ifindex shadow with NOTHING deleted — object
+  `e0707678…` — so the shipped "costs a visibly deleted telemetry call" was
+  false. Fix: five new token pins (the shim `Cargo.toml` dependency manifest;
+  a capability refusal of `extern`/`patch`/`replace`/`rustflags` in both cargo
+  configs; the `for_trace()` readback statement; `binding_slot`'s signature;
+  `record_trace`'s signature plus every call site's canonical argument prefix)
+  and the mention tally split PER FILE so a mention freed in one file can no
+  longer pay for a shadow in another. Every claim rewritten to what the checks
+  deliver: the tally is complete over binding forms WRITTEN IN THE WALKED
+  SOURCE, a proc-macro expansion is bounded by in-tree acquisition cost only,
+  and the interface half's remaining free mentions are named rather than
+  defended. Seven mutations proved RED-then-GREEN with build+`--no-run` rc 0
+  in both states; `make generate` left the object bit-identical.
+- **File(s)**: userspace-dp/src/main_tests.rs,
+  userspace-xdp/src/binding_index.rs,
+  pkg/dataplane/userspace_xdp_manifest.json, _Log.md
 - **Timestamp**: 2026-08-01 19:35
 - **Action**: #6169 fold round (PR #6669) — two MAJORs and three MINORs from an
   independent Codex correctness review. (MAJOR-2) The documented rollback
