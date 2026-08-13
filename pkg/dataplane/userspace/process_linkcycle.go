@@ -3,6 +3,7 @@ package userspace
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -134,20 +135,11 @@ func (m *Manager) DisableAndStopHelper() {
 }
 
 // linkCycleLeaseTTL bounds the gap between two consecutive TOUCHES of a
-// link-cycle lease — the acquire in PrepareLinkCycle, and each RenewLinkCycle
-// the daemon's per-member loop issues after it. It is deliberately NOT a bound
-// on the whole cycle, and that distinction is the point.
+// link-cycle lease. Since #6871 round 8 that gap is a CONSTANT — the heartbeat
+// period below — so this is an actual bound rather than an estimate.
 //
-// A TTL that had to cover the whole cycle would be a function of the RETH count,
-// and there is no constant that bounds that: the config permits 1..128 RETHs
-// (pkg/config/schema_chassis.go, reth-count), step 2.6 walks them serially
-// (pkg/daemon/daemon_apply_dataplane.go), and only a member that actually cycles
-// re-arms the lease on its own — so the exposure is the tail of members visited
-// AFTER the last cycling one, and that traversal is a Go map range, i.e. the
-// same input passes or fails between runs. Picking a bigger constant would be
-// the same defect with a bigger number.
-//
-// So the daemon renews instead, at three points in step 2.6 (all of them via
+// WHY IT USED TO BE AN ESTIMATE, AND WHY THAT WAS NOT SURVIVABLE. Rounds 6 and 7
+// made the daemon renew at three points in step 2.6 (all via
 // Daemon.renewLinkCycleLease, pkg/daemon/daemon_apply_dataplane.go):
 //
 //	programRethMemberMAC        after this member's MAC set
@@ -155,49 +147,143 @@ func (m *Manager) DisableAndStopHelper() {
 //	reconcileAfterRethLinkCycle after the VIP/link-local reconcile, i.e. just
 //	                            before NotifyLinkCycle releases the lease
 //
-// which leaves these intervals for the TTL to cover:
+// leaving the TTL to cover the gaps between them. Exactly one of those gaps has
+// a hard ceiling — the `ethtool -K <if> rxvlan off`, 20s (externalCommandTimeout
+// 15s + runCommandStdinTimeout's 5s WaitDelay, pkg/daemon/exec_timeout.go) — and
+// round 7 narrowed the claim honestly to "60s is 3x the only bounded term".
 //
-//	acquire -> MAC-set renewal        3 netlink calls (down/set/up)
-//	MAC-set -> tail renewal           ONE `ethtool -K <if> rxvlan off` +
-//	                                  netlink, one round trip per child netdev
-//	tail -> next member's MAC-set     netlink + one control-socket round trip
-//	last tail -> reconcile renewal    netlink, one pass per redundancy group
-//	reconcile renewal -> release      NotifyLinkCycle's 1s settle + one round trip
+// That narrowing was honest and still insufficient, because the OTHER terms in
+// the same gap scale with operator-controlled cardinality:
 //
-// WHAT 60s ACTUALLY BUYS, stated as what it is. The one term here with a HARD
-// ceiling is the ethtool: 20s, not 15 — externalCommandTimeout is 15s and
-// runCommandStdinTimeout adds a 5s WaitDelay on top of it
-// (pkg/daemon/exec_timeout.go). Exactly one interval contains one of those, so
-// 60s is 3x the only bounded term, for ANY member count rather than for the
-// deployed N=2 only. That is the whole of the guarantee.
+//   - finishRethMemberLinkTail walks every child netdev of the member
+//     (netlink.LinkList filtered by ParentIndex) and per child does a
+//     addr_gen_mode sysctl write, a conditional LinkSetHardwareAddr, and
+//     rethSubIfaceLinkLocalRepair's address list/add. A member can carry one
+//     VLAN sub-interface per VLAN id, so that loop is reachable at ~4094
+//     iterations on ONE member — inside the same interval as the 20s ethtool.
+//     At 10ms per child it alone is 40s; the interval is over 60s before the
+//     second member is reached.
+//   - reconcileAfterRethLinkCycle loops over every redundancy group, netlink
+//     per group.
+//   - the whole loop is over cfg.RethToPhysical(), i.e. up to the schema's
+//     reth-count ceiling of 128 (pkg/config/schema_chassis.go).
+//   - and netlink has no elapsed-time bound at all: ONE syscall can block
+//     indefinitely, which no amount of call-site renewal covers.
 //
-// It is NOT an invariant, and #6871 round 6 overstated it as one ("still inside
-// the TTL"). Every interval above also contains netlink operations, and netlink
-// has no elapsed-time bound: a syscall can block, and both the child-netdev loop
-// and the per-RG reconcile scale with operator-controlled cardinality. A
-// sufficiently pathological box can exceed 60s in an interval that contains no
-// ethtool at all. 60s is an engineering estimate with a 3x margin over the only
-// measurable term — not a proof.
+// A bigger constant is the same defect with a bigger number, so round 8 stopped
+// picking one. A live lease now renews ITSELF every linkCycleLeaseHeartbeat from
+// a goroutine the lease owns (startLinkCycleHeartbeat), which makes the interval
+// the TTL must cover independent of member count, child-netdev count, redundancy
+// group count and netlink latency — including the single-blocking-syscall case,
+// which the daemon's call-site renewals structurally cannot reach. The TTL is
+// now 4x that period.
 //
-// That is acceptable because of what an overrun COSTS, which is bounded even
-// though the interval is not: see the paragraph below on degrading to master's
-// behaviour. An expiry loses the added protection for the remainder of that
-// cycle; it cannot produce a state master did not already have.
+// The three daemon call sites stay. They are no longer load-bearing, and they
+// are cheap (RenewLinkCycle refuses to create a lease, so an apply that cycled
+// nothing is a no-op); keeping them means a heartbeat that failed to start still
+// degrades to round 7's behaviour rather than to no renewal at all.
 //
-// The TTL remains what it always was: a backstop, not the mechanism. The lease
-// is normally ended by NotifyLinkCycle, which every path that takes one reaches
-// (the cycle completes and step 2.6b2 rebinds; or the cycle aborts and
-// programRethMACWithWorkerJoin rolls back with the same call). The backstop
-// covers the one case that does not — a caller that dies between the two — and a
-// lease that never ended would suppress the 1 Hz reconcile FOREVER, which is a
-// worse failure than the race it exists to close.
+// THE OTHER HALF: A HEARTBEAT KEEPS A LEASE ALIVE, so on its own it would turn a
+// leaked lease from a 60s suppression into a permanent one — worse than the race
+// it closes. That is why the daemon wraps the whole cycle in a guaranteed
+// release: applyDataplaneAndHACore defers AbandonLinkCycle, which runs on every
+// exit from the apply including a panic and any early return added later. The
+// two are a package and neither is correct alone. What remains is a caller
+// BLOCKED forever inside the cycle — and there, holding is the right answer: the
+// workers really are joined and reconciling really would be wrong.
 //
-// Overrunning is bounded and loud rather than silent: linkCycleInFlight logs a
-// Warn under the CAS when it clears an expired lease, and the state it degrades
-// to is master's — the pre-#6871 behaviour where the tick was never suppressed
-// at all. An overrun loses the added protection for the tail of that cycle; it
-// does not introduce a new failure mode.
+// The TTL therefore covers exactly one residual: a lease acquired outside that
+// deferred extent by some future call site. There is none today
+// (PrepareLinkCycle has a single caller, daemon_apply_dataplane.go), and
+// TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871 fails if one appears.
+//
+// Overrunning stays bounded and loud rather than silent: linkCycleInFlight logs
+// a Warn under the CAS when it retires an expired lease, and the state it
+// degrades to is master's — the pre-#6871 behaviour where the tick was never
+// suppressed at all. An overrun loses the added protection for the tail of that
+// cycle; it does not introduce a new failure mode.
 const linkCycleLeaseTTL = 60 * time.Second
+
+// linkCycleLeaseHeartbeat is the period at which a live lease renews itself, and
+// it is the quantity linkCycleLeaseTTL is 4x of. It is a constant BECAUSE that
+// is the whole point: every candidate for "how long can one step of step 2.6
+// take" is operator-controlled (see the cardinality list above), so the lease
+// stops asking and re-arms on a timer instead.
+//
+// 4x leaves room for three consecutive missed beats — a fully saturated box, a
+// GC pause, a descheduled goroutine — before the backstop fires.
+const linkCycleLeaseHeartbeat = linkCycleLeaseTTL / 4
+
+// linkCycleHeartbeatTicker produces the beat channel and its stop. Indirected so
+// a test can drive beats synchronously instead of waiting out 15s of wall clock.
+// Production never reassigns it. Mirrors linkCycleLeaseElapsed above.
+var linkCycleHeartbeatTicker = func() (<-chan time.Time, func()) {
+	t := time.NewTicker(linkCycleLeaseHeartbeat)
+	return t.C, t.Stop
+}
+
+// linkCycleHeartbeat is the per-Manager state of the lease's self-renewal
+// goroutine. Zero value = not beating.
+type linkCycleHeartbeat struct {
+	mu   sync.Mutex
+	stop chan struct{}
+	done chan struct{}
+}
+
+// startLinkCycleHeartbeat begins renewing a lease that has just been taken.
+//
+// Idempotent: a second acquire with a beat already running re-arms the DEADLINE
+// (the caller stored it) without stacking a second goroutine.
+func (m *Manager) startLinkCycleHeartbeat() {
+	m.linkCycleHB.mu.Lock()
+	defer m.linkCycleHB.mu.Unlock()
+	if m.linkCycleHB.stop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	m.linkCycleHB.stop, m.linkCycleHB.done = stop, done
+	beats, cancel := linkCycleHeartbeatTicker()
+	go func() {
+		defer close(done)
+		defer cancel()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-beats:
+				m.RenewLinkCycle()
+				// Self-reap. The release path stops this goroutine
+				// explicitly, so reaching here with no lease means the word
+				// was retired some other way (the TTL backstop, or a test
+				// writing it directly). Beating on nothing is harmless —
+				// RenewLinkCycle never creates a lease — but pointless.
+				if m.linkCycleLeaseUntil.Load() == 0 {
+					return
+				}
+			}
+		}
+	}()
+}
+
+// stopLinkCycleHeartbeat ends the renewal goroutine and WAITS for it, so a
+// released lease can never be extended by a beat still in flight.
+//
+// The wait cannot deadlock against m.mu: the goroutine's only call is
+// RenewLinkCycle, which touches nothing but the atomic lease word. That is why
+// the heartbeat has its own mutex rather than reusing m.mu — the release site
+// (NotifyLinkCycle) holds m.mu across this call.
+func (m *Manager) stopLinkCycleHeartbeat() {
+	m.linkCycleHB.mu.Lock()
+	stop, done := m.linkCycleHB.stop, m.linkCycleHB.done
+	m.linkCycleHB.stop, m.linkCycleHB.done = nil, nil
+	m.linkCycleHB.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	<-done
+}
 
 // linkCycleLeaseEpoch is the process-lifetime reference the lease deadline is
 // measured from. It is captured once and never reassigned, so
@@ -232,8 +318,14 @@ func linkCycleLeaseDeadline() int64 {
 // acquireLinkCycleLease opens the #6871 lease. Callers hold m.mu, but the lease
 // deliberately does not depend on it — it is read by the status loop from
 // outside m.mu's protection of the window it covers.
+//
+// It also starts the round-8 heartbeat, so the deadline is re-armed on a fixed
+// period for as long as the cycle runs. Store FIRST, then start: the heartbeat
+// refuses to renew from the 0 sentinel, so a beat that somehow ran before the
+// store would be a no-op and the lease would never open.
 func (m *Manager) acquireLinkCycleLease() {
 	m.linkCycleLeaseUntil.Store(linkCycleLeaseDeadline())
+	m.startLinkCycleHeartbeat()
 }
 
 // RenewLinkCycle pushes a lease that is ALREADY held out by another full TTL. It
@@ -282,27 +374,96 @@ func (m *Manager) RenewLinkCycle() {
 // releaseLinkCycleLease ends the lease. Idempotent — the release site runs
 // unconditionally at the top of NotifyLinkCycle's critical section, so a second
 // call (or a call with no lease held) is a no-op.
+//
+// Heartbeat FIRST, then the word. Ordering is not load-bearing either way —
+// RenewLinkCycle refuses to renew from the 0 sentinel, so a beat racing the
+// clear cannot resurrect anything — but stopping first means the goroutine is
+// already joined when the word goes to 0, which keeps "released" and "nothing is
+// still touching this lease" the same instant.
 func (m *Manager) releaseLinkCycleLease() {
+	m.stopLinkCycleHeartbeat()
 	m.linkCycleLeaseUntil.Store(0)
+}
+
+// AbandonLinkCycle drops a lease that is still held when the apply that took it
+// is leaving, and reports whether there was one. It is the OTHER half of the
+// round-8 heartbeat, and neither half is correct alone.
+//
+// The heartbeat renews a live lease forever, which is exactly right while the
+// cycle runs and exactly wrong once its owner is gone: without a guaranteed
+// release, a leaked lease would suppress the 1 Hz reconcile permanently rather
+// than for one TTL — strictly worse than what the lease exists to prevent. The
+// daemon therefore defers this over the whole extent that can take a lease
+// (applyDataplaneAndHACore), so it runs on every exit including a panic and any
+// early return a later change introduces.
+//
+// It does NOT rebind. The rebind has two owners already — step 2.6b2 for a
+// completed cycle and programRethMACWithWorkerJoin for an aborted one — and
+// firing a third would be the double rebind that gets EBUSY on mlx5 zero-copy
+// queues. Dropping the lease alone is the recovery: it hands the helper back to
+// the 1 Hz reconcile, which re-arms bindings and workers on its own. That is
+// master's behaviour, i.e. the state this whole PR improves on, so the leak
+// degrades to the status quo ante instead of to a frozen dataplane.
+//
+// A true return means a code path took a lease and did not release it, which is
+// a bug in that path rather than an expected outcome — the caller logs it.
+func (m *Manager) AbandonLinkCycle() bool {
+	held := m.linkCycleLeaseUntil.Load() != 0
+	m.releaseLinkCycleLease()
+	return held
 }
 
 // linkCycleInFlight reports whether a RETH MAC link cycle currently owns the
 // dataplane. It self-heals a stranded lease past linkCycleLeaseTTL: the CAS
 // clears the deadline so the wedge cannot recur every tick, and the tick that
 // observes the expiry resumes reconciling immediately.
+//
+// #6871 (round 8): the expiry branch RE-READS on a lost CAS instead of reporting
+// the expiry it failed to commit, and that is a correctness fix, not tidying.
+//
+// Three writers touch this word: this expiry CAS, RenewLinkCycle's CAS, and
+// acquireLinkCycleLease's Store. Either of the other two can land between the
+// Load above and the CAS below, and when one does, the CAS FAILS — the word no
+// longer holds the value that was read. The previous form returned false anyway:
+//
+//	if m.linkCycleLeaseUntil.CompareAndSwap(until, 0) { warn }
+//	return false                     // CAS result discarded
+//
+// A failed CAS means the word MOVED, and the value it moved to is the one that
+// decides the answer:
+//
+//	moved to 0            a concurrent release retired it   -> no cycle (false)
+//	moved further out     a renewal extended a live cycle   -> IN FLIGHT (true)
+//	moved to a new lease  a fresh PrepareLinkCycle          -> IN FLIGHT (true)
+//
+// Two of those three read the opposite way from the discarded expiry, so the old
+// form unlatched the guard for the remainder of a cycle that was live — the 1 Hz
+// tick then respawns AF_XDP workers, re-enables ctrl, or republishes bindings
+// into a NIC whose queues that cycle is about to destroy. The renewal case is
+// the sharp one: a renewal landing on the expiry instant is precisely what
+// renewal is FOR, so the mechanism added to strengthen the lease was the one
+// most likely to defeat it.
+//
+// The loop terminates for the standard lock-free reason: an iteration either
+// returns or its CAS lost, and a lost CAS means another writer committed a
+// change. Same shape as RenewLinkCycle's loop directly above.
 func (m *Manager) linkCycleInFlight() bool {
-	until := m.linkCycleLeaseUntil.Load()
-	if until == 0 {
-		return false
-	}
-	if int64(linkCycleLeaseElapsed()) >= until {
+	for {
+		until := m.linkCycleLeaseUntil.Load()
+		if until == 0 {
+			return false
+		}
+		if int64(linkCycleLeaseElapsed()) < until {
+			return true
+		}
+		// Expired as read. Report "no cycle" only if THIS goroutine is the one
+		// that retired it; otherwise re-read and judge the new value.
 		if m.linkCycleLeaseUntil.CompareAndSwap(until, 0) {
 			slog.Warn("userspace: link-cycle lease expired without a rebind; resuming reconcile",
 				"ttl", linkCycleLeaseTTL)
+			return false
 		}
-		return false
 	}
-	return true
 }
 
 // PrepareLinkCycle must be called BEFORE any link DOWN/UP cycle (e.g. RETH

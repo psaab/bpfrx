@@ -351,8 +351,9 @@ of the way of `NotifyLinkCycle`'s own post-rebind status apply, so a completed
 cycle re-enables `ctrl` on that call instead of costing an extra reconcile tick.
 
 **Renewal, and what the TTL actually bounds.** `linkCycleLeaseTTL` (60s) bounds
-the gap between two consecutive **touches** of a lease — the acquire, and each
-`RenewLinkCycle` — not the whole cycle.
+the gap between two consecutive **touches** of a lease — the acquire, each
+`RenewLinkCycle`, and (since round 8) each beat of the lease's own heartbeat —
+not the whole cycle.
 
 That distinction was a defect before #6871's round 6. Only a member that actually
 cycles re-arms the lease, so the exposure was the tail of members visited *after*
@@ -388,34 +389,92 @@ are now three renewal points, all through `Daemon.renewLinkCycleLease`:
 | `reconcileAfterRethLinkCycle` | netlink, one pass per redundancy group |
 | *(release: `NotifyLinkCycle`)* | its 1s NIC settle + one control round trip |
 
-**What 60s actually buys.** Exactly one interval contains the only term with a
-hard ceiling — the 20s `ethtool` — so 60s is 3x that, for any member count rather
-than for the deployed N=2. That is the whole of the guarantee. It is **not an
-invariant**: every interval also contains netlink operations, netlink has no
-elapsed-time bound, and both the VLAN-child loop and the per-RG reconcile scale
-with operator-controlled cardinality. A pathological box can exceed 60s in an
-interval holding no `ethtool` at all. 60s is an engineering estimate with a 3x
-margin over the only measurable term, not a proof — and that is acceptable
-because of what an overrun costs, which *is* bounded (see the next paragraph).
-
 The last two renewals are *unconditional* on whether the member cycled. Gating
 them on `needLinkCycleRecovery` would look harmless and would skip exactly the
 abort path, where `programRethMACWithWorkerJoin` took a lease and then returned
 `linkCycled=false`. Renewing unconditionally is safe because the renewal cannot
 create a lease.
 
-The TTL remains a backstop, not the mechanism: every path that takes a lease
-reaches a `NotifyLinkCycle`, so it is only for a caller that dies in between — but
-a stranded lease would suppress the reconcile loop permanently, which is worse
-than the race. Overrunning is bounded and loud rather than silent —
-`linkCycleInFlight` logs a `Warn` under the CAS when it clears an expired lease,
-and the behaviour it degrades to is master's, where the tick was never suppressed
-at all. An overrun therefore loses the *added* protection for the remainder of
-that cycle; it cannot produce a state master did not already have. That is why a
-60s estimate is an acceptable backstop even though it is not an invariant.
+**Round 7's answer was still an estimate, and round 8 stopped estimating.** The
+round-7 claim — "exactly one interval contains the only term with a hard ceiling,
+the 20s `ethtool`, so 60s is 3x the only bounded term" — was honest and
+insufficient, because the *other* terms in that same interval scale with things
+an operator sets:
 
-One further precision on the renewal, since round 6 overstated this too: it never
-renews an expired lease is stronger than the code. A renewal can pass the
+| term | what bounds it |
+|---|---|
+| the VLAN-child loop in `finishRethMemberLinkTail` | one pass per child netdev — a member can carry one VLAN sub-interface per VLAN id, each pass a sysctl write plus up to three netlink round trips |
+| the per-RG loop in `reconcileAfterRethLinkCycle` | the redundancy-group count |
+| the enclosing member loop | `reth-count`, schema ceiling 128 |
+| any single netlink syscall | **nothing** — it can block indefinitely |
+
+The last row is the one no amount of call-site renewal can reach: a blocking
+syscall sits *between* two renewals by construction. A single member with a few
+thousand VLAN children exceeds 60s in one interval before the second member is
+visited, and no constant fixes that — a bigger one is the same defect with a
+bigger number.
+
+So the lease now **renews itself**. `acquireLinkCycleLease` starts a goroutine
+that calls `RenewLinkCycle` every `linkCycleLeaseHeartbeat`
+(`linkCycleLeaseTTL / 4`, i.e. 15s); `releaseLinkCycleLease` stops it and
+**joins** it, so a released lease can never be extended by a beat still in
+flight. The interval the TTL must cover is therefore a constant, independent of
+member count, VLAN-child count, redundancy-group count and netlink latency, and
+the TTL is 4x it — three missed beats of headroom for a saturated box, a GC
+pause or a descheduled goroutine. The three daemon call sites stay: they are no
+longer load-bearing, but they are free (a renewal cannot create a lease) and they
+keep a heartbeat that failed to start degrading to round 7 rather than to no
+renewal at all.
+
+**A self-renewing lease needs a guaranteed release, and that is the other half.**
+A heartbeat keeps a live lease alive indefinitely — correct while the cycle runs,
+and catastrophic once its owner is gone, because a leaked lease would suppress
+the 1 Hz reconcile *permanently* instead of for one TTL. So
+`applyDataplaneAndHACore` defers `Daemon.abandonLinkCycleLease`, which calls
+`LinkController.AbandonLinkCycle()`: it drops a still-held lease, reports whether
+there was one (a `true` is a bug report, logged at `Error`), and does **not**
+rebind — the rebind already has two owners (step 2.6b2 and the abort rollback)
+and a third would be the double rebind that gets `EBUSY` on mlx5 zero-copy
+queues. Dropping the lease alone *is* the recovery: it hands the helper back to
+the 1 Hz reconcile, which re-arms bindings and workers on its own.
+
+The defer is on the extent that contains both ends of the cycle, so it runs on
+every exit including a panic and any early return a later change introduces.
+Neither half is correct alone: without the heartbeat the TTL is a guess, and
+without the guaranteed release the heartbeat turns a leak into a permanent
+outage. What remains is a caller **blocked forever** inside the cycle — and there
+holding is the right answer, because the workers really are joined.
+
+The TTL is now a backstop for exactly one residual: a lease acquired outside that
+deferred extent by some future call site. There is none today —
+`PrepareLinkCycle` has a single caller. Overrunning stays bounded and loud rather
+than silent: `linkCycleInFlight` logs a `Warn` under the CAS when it retires an
+expired lease, and the behaviour it degrades to is master's, where the tick was
+never suppressed at all.
+
+**`linkCycleInFlight` re-reads on a lost CAS (#6871 round 8).** Three writers
+touch the lease word: the expiry CAS in `linkCycleInFlight`, `RenewLinkCycle`'s
+CAS, and `acquireLinkCycleLease`'s `Store`. Either of the latter two can land
+between the reader's `Load` and its CAS, and the reader's CAS then **fails**. The
+previous code returned `false` regardless, discarding the CAS result — but the
+value the word moved *to* is what decides the answer:
+
+| the word moved to | what happened | correct answer |
+|---|---|---|
+| `0` | a concurrent release retired it | no cycle |
+| a later deadline | a renewal extended a **live** cycle | **in flight** |
+| a fresh deadline | a new `PrepareLinkCycle` | **in flight** |
+
+Two of the three read the opposite way from the discarded expiry, so the old form
+unlatched the guard for the remainder of a cycle that was still running — and the
+renewal case is the sharp one, because a renewal landing on the expiry instant is
+precisely what renewal is *for*. The mechanism added to strengthen the lease was
+the one most likely to defeat it. The fix loops: report "expired" only if this
+goroutine's CAS is the one that retired it, otherwise re-read and judge the new
+value.
+
+One further precision on the renewal, since round 6 overstated this too: "it
+never renews an expired lease" is stronger than the code. A renewal can pass the
 `linkCycleInFlight()` check while the lease is live, be descheduled past the
 deadline, and then CAS a still-nonzero — by then expired — deadline forward,
 because no reader happened to observe the expiry and retire it to `0` in the
@@ -438,14 +497,14 @@ on that would be an over-rejection.
 
 | file | role |
 |------|------|
-| `pkg/dataplane/userspace/manager.go` | `linkCycleLeaseUntil` — the atomic deadline |
-| `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `RenewLinkCycle` / `linkCycleInFlight` + the monotonic epoch and the TTL |
+| `pkg/dataplane/userspace/manager.go` | `linkCycleLeaseUntil` — the atomic deadline; `linkCycleHB` — the heartbeat's own state |
+| `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `RenewLinkCycle` / `AbandonLinkCycle` / `linkCycleInFlight` + the monotonic epoch, the TTL, and `linkCycleLeaseHeartbeat` with `start`/`stopLinkCycleHeartbeat` |
 | `pkg/dataplane/userspace/manager_ha.go` | the `set_forwarding_state` deferral (covers the HA watchdog heartbeat) |
-| `pkg/daemon/daemon_apply_dataplane.go` | `renewLinkCycleLease` + its three call sites — `programRethMemberMAC`, `finishRethMemberLinkTail`, `reconcileAfterRethLinkCycle` |
+| `pkg/daemon/daemon_apply_dataplane.go` | `renewLinkCycleLease` + its three call sites — `programRethMemberMAC`, `finishRethMemberLinkTail`, `reconcileAfterRethLinkCycle` — and `abandonLinkCycleLease`, deferred over the whole of `applyDataplaneAndHACore` |
 | `pkg/dataplane/userspace/process_status.go` | the tick-wide skip |
 | `pkg/dataplane/userspace/maps_sync.go` | the ctrl-write gate (covers `UpdateRGActive`) |
 | `pkg/dataplane/userspace/manager_status.go` | `errLinkCycleInFlight` + the three operator-verb gates |
-| `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` + `LinkController.RenewLinkCycle()` |
+| `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` + `LinkController.RenewLinkCycle()` + `LinkController.AbandonLinkCycle() bool` |
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.NotifyLinkCycle()` — the live adapter carrying the rebind error to the daemon |
 
 ### The production adapters are load-bearing, and are tested as such
@@ -475,8 +534,49 @@ link-cycle lease while leaving all of its tests green.
 method of both adapters through `m.Link()` / `m.HA()` — the same constructors the
 daemon uses, so severing a constructor is caught too — against an observable only
 the real inner `Manager` can produce (a control-socket request, a manager field,
-the lease deadline, or the specific error a missing BPF map raises). When adding
-a method to `LinkController` or `HAController`, add its cell there.
+the lease deadline, or the specific error a missing BPF map raises).
+
+**Round 8 made that structural, because counting by hand kept under-counting.**
+Codex found two unbound forwarders; the round-7 sweep answering it found six;
+Codex then found a **seventh**, `userspaceLinkController.RecordDeferredWorkerArmDebt`.
+Every one of those numbers was a lower bound, because every one was somebody
+enumerating by hand and stopping at what they could see — so an eighth
+hand-written cell would have had the same property.
+
+`controllers_binding_table_6871_test.go` therefore **derives** the surface
+instead of listing it. It parses this package's non-test sources for every method
+declared on `userspaceLinkController`, `managerHAOps`, `userspaceHAController` or
+`userspaceSessionStore`, and fails if any of them lacks a row in
+`adapterBindingTable` — so adding an adapter method without answering for it is a
+named test failure rather than a silent gap. Each row then drives the method
+through the production constructor. A row may instead carry a `cannotDrive`
+reason, which makes a gap **visible in the table** rather than absent from it.
+
+Two things that enumeration alone got wrong, both now covered:
+
+- `userspaceHAController.SetFabricForwarding` calls `managerHAOps.SyncFabricState`
+  **directly**, bypassing `userspaceHAController.SyncFabricState`'s body. The
+  map-free fixture never reaches that tail (the fabric update fails first), so a
+  fake `userspaceHAOps` whose updates succeed drives it — `userspaceHAOps` being
+  an interface is what makes that possible. Without it, deleting the
+  "always push helper fabric state after a successful update" line was invisible.
+- `RecordDeferredWorkerArmDebt` is reached by an optional type assertion, not
+  through `LinkController`, so its cell asserts the same way
+  `Daemon.recordDataplaneWorkerArmDebt` does — a failed assertion *is* the
+  severance. Its live reachability is narrower than first reported: production
+  `d.dp` is `*LegacyDataPlaneAdapter`, which satisfies that assertion itself, so
+  the `d.dp.Link()` fallback is a latent path rather than the live one today.
+
+The two files overlap on purpose. The older one's cells were each measured
+against a real severance, and a table that subsumed them would be a table that
+could retire one by accident.
+
+Known boundaries of the derivation, stated rather than left to be found: it does
+not cover methods **promoted** from `userspaceSessionStore`'s embedded
+`dataplane.SessionStore` (those are the implementation, not a forwarder), and the
+one hand-maintained list left is the set of controller *types* — a new type is a
+new production seam that gets reviewed, unlike a two-line method added to an
+existing one.
 
 ## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
 

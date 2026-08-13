@@ -49,6 +49,15 @@ func (c userspaceLinkController) RenewLinkCycle() {
 	}
 }
 
+// AbandonLinkCycle drops a lease the departing apply still holds (#6871 round
+// 8). No manager wired: no lease was ever taken, so nothing was held.
+func (c userspaceLinkController) AbandonLinkCycle() bool {
+	if c.manager != nil {
+		return c.manager.AbandonLinkCycle()
+	}
+	return false
+}
+
 type userspaceHAOps interface {
 	UpdateRGActive(int, bool) error
 	UpdateHAWatchdog(int, uint64) error

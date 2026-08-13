@@ -279,6 +279,17 @@ type Manager struct {
 	// before the link comes back up.
 	linkCycleLeaseUntil atomic.Int64
 
+	// linkCycleHB owns the #6871 round-8 lease heartbeat: the goroutine that
+	// renews a live lease on a FIXED period, so the interval the TTL has to
+	// cover is a constant instead of a function of operator-controlled
+	// cardinality. See linkCycleLeaseHeartbeat in process_linkcycle.go.
+	//
+	// Its own mutex, not m.mu: acquire/release run under m.mu in production but
+	// not in tests, and the heartbeat goroutine must never need m.mu (it calls
+	// RenewLinkCycle, which is pure atomics) or stopping it from under m.mu
+	// would deadlock.
+	linkCycleHB linkCycleHeartbeat
+
 	// neighborPrewarmInFlight is the #5104 singleflight guard for the async
 	// neighbor-resolve prewarm scan spawned by the status loop. The loop kicks
 	// a full scan every 1s for the first 60s (then every 10s on HA standby); a

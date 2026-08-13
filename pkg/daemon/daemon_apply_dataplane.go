@@ -43,6 +43,25 @@ import (
 // (nil) before the networkd / apply phases assign them. Runs in the same slot,
 // after the fabric-IPVLAN reconcile and before the routing rules.
 func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config) (commitOverlay []config.RouteOverlayEntry, networkdErr error, applyErr error, err error) {
+	// #6871 (round 8): a link-cycle lease cannot outlive this function.
+	//
+	// This is the extent that contains BOTH ends of the cycle — step 2.6's
+	// rethToPhys loop takes the lease (via programRethMACWithWorkerJoin ->
+	// PrepareLinkCycle) and step 2.6b2 releases it (NotifyLinkCycle) — so a
+	// defer here is a guarantee no arrangement of the code between them can
+	// break: it runs on a panic and on any early return a later change adds.
+	//
+	// It is what makes the self-renewing lease safe. The lease now re-arms its
+	// own deadline on a fixed period (linkCycleLeaseHeartbeat), which is what
+	// lets its TTL bound a CONSTANT instead of an interval that scales with
+	// reth-count, child-netdev count and netlink latency — but a lease that
+	// renews itself is a lease that a leak would suppress the 1 Hz reconcile
+	// with FOREVER. The wall-clock backstop cannot fix that without also being
+	// able to expire a cycle that is still running; a guaranteed release can.
+	//
+	// On the normal path this is a no-op: NotifyLinkCycle already released.
+	defer d.abandonLinkCycleLease()
+
 	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
 	// If yes, tell the userspace DP to skip initial worker startup during
 	// ApplyConfig(). Workers will be started by NotifyLinkCycle() after MAC
@@ -485,6 +504,30 @@ func (d *Daemon) renewLinkCycleLease() {
 		return
 	}
 	d.dp.Link().RenewLinkCycle()
+}
+
+// abandonLinkCycleLease drops a link-cycle lease the apply is leaving behind. It
+// is deferred over the whole of applyDataplaneAndHACore, so it is the one
+// release that no control-flow arrangement can skip (#6871 round 8).
+//
+// A true return is a BUG REPORT, not a routine outcome: every path that takes a
+// lease reaches NotifyLinkCycle (the cycle completes and step 2.6b2 rebinds, or
+// it aborts and programRethMACWithWorkerJoin rolls back with the same call), so
+// reaching here with one still held means a path was added that does neither.
+// Log it at Error with what it implies about the dataplane, because dropping the
+// lease resumes the 1 Hz reconcile but does NOT rebind — the reconcile has to
+// re-arm the workers itself, which is exactly master's pre-#6871 behaviour.
+func (d *Daemon) abandonLinkCycleLease() {
+	if d.dp == nil {
+		return
+	}
+	if d.dp.Link().AbandonLinkCycle() {
+		slog.Error("userspace: the config apply is leaving with a RETH link-cycle lease " +
+			"still held; dropping it so the reconcile loop resumes. The AF_XDP workers " +
+			"may still be joined and ctrl disabled — the 1 Hz reconcile is now what has " +
+			"to re-arm them. Some path between PrepareLinkCycle and NotifyLinkCycle " +
+			"returned or panicked without completing the cycle")
+	}
 }
 
 // finishRethMemberLinkTail runs the per-member work that follows the MAC set:

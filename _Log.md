@@ -77891,3 +77891,101 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/daemon/reth_rollback_failure_6871_test.go,
   pkg/daemon/policy_scheduler_apply_test.go,
   docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 8 — close a live CAS race in the link-cycle guard,
+  replace the TTL estimate with a self-renewing lease plus a guaranteed release,
+  and make the controller-adapter layer impossible to sever silently.
+  B1 (BLOCKING, live race, reproduced before fixing): `linkCycleInFlight` could
+  return FALSE after LOSING its expiry CAS. Three writers touch
+  `linkCycleLeaseUntil` — the expiry CAS, `RenewLinkCycle`'s CAS and
+  `acquireLinkCycleLease`'s Store — so either of the latter two can land between
+  the reader's Load and its CAS; the old code discarded the CAS result and
+  returned false regardless. Two of the three possible new values read the
+  OPPOSITE way (a renewal extended a live cycle; a fresh PrepareLinkCycle took a
+  new one), so the guard unlatched for the rest of a cycle that was still
+  running — and the renewal case is the sharp one, because a renewal landing on
+  the expiry instant is precisely what renewal is FOR. The mechanism round 6
+  added to strengthen the lease was the one most likely to defeat it. Fix:
+  `linkCycleInFlight` loops, reporting "expired" only when THIS goroutine's CAS
+  retired the lease, otherwise re-reading and judging the new value.
+  B2 (BLOCKING): round 7's "60s is 3x the only bounded term" was honest and
+  insufficient. Measured firsthand, the other terms in that same interval scale
+  with operator-controlled cardinality — `finishRethMemberLinkTail` runs one pass
+  per CHILD NETDEV (a member can carry one VLAN sub-interface per VLAN id, each
+  pass a sysctl write plus up to three netlink round trips),
+  `reconcileAfterRethLinkCycle` runs one pass per redundancy group, the enclosing
+  loop runs up to the schema's reth-count ceiling of 128
+  (`pkg/config/schema_chassis.go`), and a single netlink syscall has no
+  elapsed-time bound at all. The last of those is unreachable by call-site
+  renewal by construction: a blocking syscall sits BETWEEN two renewals. A bigger
+  constant is the same defect with a bigger number, so the lease stopped
+  estimating: `acquireLinkCycleLease` now starts a heartbeat that renews every
+  `linkCycleLeaseHeartbeat` (TTL/4 = 15s) and `releaseLinkCycleLease` stops AND
+  JOINS it. The interval the TTL covers is now a constant. Because a
+  self-renewing lease would make a LEAK permanent rather than 60s long, the
+  daemon owes a release nothing can skip: `applyDataplaneAndHACore` defers
+  `abandonLinkCycleLease` -> new `LinkController.AbandonLinkCycle() bool`, which
+  drops a still-held lease, reports it (a true is a bug report, logged at Error)
+  and deliberately does NOT rebind — that has two owners already and a third is
+  the double rebind that EBUSYs on mlx5. Neither half is correct alone.
+  B3: a SEVENTH unbound adapter (`RecordDeferredWorkerArmDebt`) after Codex found
+  two and the round-7 sweep found six, so the answer is structural rather than an
+  eighth cell. `controllers_binding_table_6871_test.go` DERIVES the surface: it
+  parses this package's non-test sources for every method declared on any of the
+  four controller types and fails BY NAME if one has no row in
+  `adapterBindingTable`; each row then drives the method through the production
+  constructor, and a row may instead carry a `cannotDrive` reason so a gap is
+  VISIBLE in the table rather than absent from it. 16 methods derived, 16 rows,
+  zero cannotDrive, zero skips. Two enumeration-only misses are now covered:
+  `SetFabricForwarding` calls `managerHAOps.SyncFabricState` DIRECTLY (bypassing
+  `userspaceHAController.SyncFabricState`'s body) and the map-free fixture never
+  reaches that tail because the fabric update fails first — a fake
+  `userspaceHAOps` whose updates succeed drives both entry points; and
+  `RecordDeferredWorkerArmDebt` is reached by an optional type assertion, so its
+  cell asserts the same way `Daemon.recordDataplaneWorkerArmDebt` does.
+  CLAIM CORRECTED by measurement: Codex placed `RecordDeferredWorkerArmDebt` on
+  the LIVE path via the link fallback at daemon_apply_dataplane.go. It is not
+  reached there today — production `d.dp` is `*LegacyDataPlaneAdapter`
+  (`Boot()` -> `NewLegacyDataPlaneAdapter`), which satisfies the `debtRecorder`
+  assertion itself, so the `d.dp.Link()` fallback is dead for that caller. The
+  finding stands (a production method, reachable through `Manager.Link()`, that
+  was unbound) but the harm is a latent fallback rather than a live one.
+  `runtime_adapter_binding_6871_test.go` is deliberately NOT replaced — its cells
+  were each measured against a real severance and a subsuming table could retire
+  one by accident. The two overlap on purpose.
+  Mutation matrix — 18 severances, 18 RED, zero build breaks. The 13 from round 7
+  ALL still red (P1 managerHAOps.UpdateHAWatchdog, P2
+  userspaceHAController.SetHAWatchdog, P3 userspaceLinkController.RenewLinkCycle,
+  P4 SetDeferWorkers, P5 managerHAOps.UpdateRGActive, P6
+  userspaceHAController.SetRGActive, P7 LegacyAdapter.PrepareLinkCycle, P8
+  userspaceLinkController.PrepareLinkCycle, P9 NotifyLinkCycle, P10
+  managerHAOps.UpdateFabricFwd, P11 UpdateFabricFwd1, P12
+  managerHAOps.SyncFabricState, P13 userspaceHAController.SyncFabricState), plus
+  five new: N14 RecordDeferredWorkerArmDebt -> {}, N15 AbandonLinkCycle ->
+  return false, N16 SessionDeltas -> return nil, N17 the SyncFabricState tail
+  deleted from SetFabricForwarding (RED at "SyncFabricState calls after a
+  SUCCESSFUL fabric update = 0, want 1"), N18 a NEW adapter method with no table
+  row (RED at "controller adapter methods with NO entry in adapterBindingTable:
+  [userspaceLinkController.ProbeUnboundAdapter6871]" — the structural property,
+  demonstrated rather than asserted). Separately: B1's straight-line
+  `linkCycleInFlight` -> both discriminator cells RED, both controls
+  (release-wins, stranded-lease-still-expires) GREEN; `startLinkCycleHeartbeat`
+  removed from acquire -> `TestLinkCycleLeaseRenewsItself_6871` +
+  `TestLinkCycleHeartbeatStopsOnRelease_6871` RED; `defer
+  d.abandonLinkCycleLease()` deleted -> both
+  `TestApplyDataplaneCoreAlwaysAbandonsAHeldLease_6871` cells RED (normal return
+  AND panic unwind) while the helper-level control stays GREEN.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/controllers.go,
+  pkg/dataplane/apply.go,
+  pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go (new),
+  pkg/dataplane/userspace/link_cycle_heartbeat_6871_test.go (new),
+  pkg/dataplane/userspace/controllers_binding_table_6871_test.go (new),
+  pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/reth_lease_abandon_6871_test.go (new),
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go,
+  docs/reth-mac.md, _Log.md

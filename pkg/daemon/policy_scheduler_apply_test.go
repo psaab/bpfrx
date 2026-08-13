@@ -122,6 +122,7 @@ func (noopLinkController) SetDeferWorkers(bool)    {}
 func (noopLinkController) PrepareLinkCycle() error { return nil }
 func (noopLinkController) NotifyLinkCycle() error  { return nil }
 func (noopLinkController) RenewLinkCycle()         {}
+func (noopLinkController) AbandonLinkCycle() bool  { return false }
 
 type runtimeOnlyPolicyUpdaterTestDP struct {
 	runtimeOnlyApplyTestDP

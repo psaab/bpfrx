@@ -55,6 +55,8 @@ type abortRecoveryLinkController struct {
 	prepareCalls int
 	notifyCalls  int
 	renewCalls   int
+	abandonCalls int
+	leaseHeld    bool
 }
 
 func (c *abortRecoveryLinkController) SetDeferWorkers(bool) {}
@@ -70,6 +72,15 @@ func (c *abortRecoveryLinkController) NotifyLinkCycle() error {
 }
 
 func (c *abortRecoveryLinkController) RenewLinkCycle() { c.renewCalls++ }
+
+// AbandonLinkCycle records the #6871 round-8 deferred release and reports
+// whether a lease was outstanding, which this fake models with leaseHeld.
+func (c *abortRecoveryLinkController) AbandonLinkCycle() bool {
+	c.abandonCalls++
+	held := c.leaseHeld
+	c.leaseHeld = false
+	return held
+}
 
 // abortRecoveryTestDP is a RuntimeDataPlane whose only interesting surface is
 // the link controller. It reuses deferredMACReapplyTestDP for the rest of the

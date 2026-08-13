@@ -151,6 +151,18 @@ type LinkController interface {
 	// not an optional type assertion, so a new implementation has to answer for
 	// it at compile time instead of silently no-opping the renewal.
 	RenewLinkCycle()
+	// AbandonLinkCycle drops a link-cycle lease that is still held, WITHOUT
+	// rebinding, and reports whether one was. The daemon defers it over the
+	// whole apply so a lease can never outlive the apply that took it — which
+	// is what makes the #6871 round-8 self-renewing lease safe: a heartbeat
+	// keeps a live lease alive indefinitely, so the leak case needs a
+	// guaranteed release rather than a wall-clock backstop that is also
+	// capable of expiring a cycle that is still running.
+	//
+	// Interface member, not an optional assertion, for the same reason
+	// RenewLinkCycle is: a backend that silently no-ops it would turn a leaked
+	// lease into a permanently suppressed reconcile loop.
+	AbandonLinkCycle() bool
 }
 
 type FabricID uint8
@@ -314,6 +326,11 @@ func (c dataPlaneLinkController) PrepareLinkCycle() error { return nil }
 // PrepareLinkCycle is: this controller never takes a link-cycle lease, so there
 // is never one to extend.
 func (c dataPlaneLinkController) RenewLinkCycle() {}
+
+// AbandonLinkCycle on the eBPF-backed controller reports "nothing was held" for
+// the same reason: no lease is ever taken here, so there is never one to
+// abandon. The daemon's deferred call is a no-op on this backend.
+func (c dataPlaneLinkController) AbandonLinkCycle() bool { return false }
 
 // NotifyLinkCycle on the eBPF-backed controller is always a success: the
 // DataPlane-level NotifyLinkCycle it forwards to is a no-op for the eBPF
