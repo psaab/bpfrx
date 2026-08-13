@@ -199,6 +199,28 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					// URL]. Password lands either in subsequent keys
 					// (leaf form) or as a child leaf (Keys=["password",
 					// "$9$..."]).
+					//
+					// #6692 / #6659 — READ THIS BEFORE WIDENING THE READ
+					// BELOW. This branch takes slot 1 and then `continue`s, so
+					// a BRACKETED LIST (`archive-sites [ "scp://a/b"
+					// "-oProxyCommand=id" ]`, which the lexer collapses onto
+					// Keys[1:]) drops every member past the first — and because
+					// the leading-dash check runs on `url` alone, that dropped
+					// member also ESCAPES the #4589 A7 F-02 gate and commits
+					// CLEAN. Measured: the bracket form ACCEPTS where the same
+					// token authored alone, or in the hierarchical block form
+					// below, REJECTS.
+					//
+					// Today the escape is inert — the value is dropped, so
+					// nothing reaches scp. It STOPS being inert the moment
+					// anyone widens this to accumulate Keys[2:]. Widen the
+					// leading-dash check in the SAME change, over EVERY authored
+					// value. Widening the read alone ships a live CWE-88
+					// argument injection: the second member would land in
+					// ArchiveSites and be handed to `scp <src> <dest>` as an
+					// option. Note also that Keys[2:] is where `password` rides,
+					// so a widening reader must separate values from that
+					// modifier rather than treating the whole tail as URLs.
 					if len(asNode.Keys) >= 2 {
 						url := asNode.Keys[1]
 						// #4589 A7 F-02: reject a leading-dash archive-site at

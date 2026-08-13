@@ -178,16 +178,32 @@ func (c *Config) ResolveFab(ref string) string {
 // pkg/dataplane/userspace/interfaces.go and resolveJunosIfName in
 // pkg/daemon/daemon_dhcp.go. Migration to centralize all callers is
 // tracked as a follow-up to #1565.
+// resolveBareKernelIfName is the BARE-ref arm of ResolveKernelIfName, split out
+// so callers that already know structurally that they hold an interface name —
+// not a unit ref — can reach it without round-tripping through the dotted
+// parse (#6861 F1/F3).
+//
+// The distinction is load-bearing, not cosmetic. ResolveKernelIfName decides
+// which arm to take by splitting the string on ".", so an interface whose
+// AUTHORED name contains a dot (`ip-0/0/0.0` is a legal interface name in the
+// config tree even though Junos would read it as a unit ref) takes the dotted
+// arm and can consume an unrelated unit's TunnelNameMap entry. The dataplane's
+// snapshotLinuxName has no such ambiguity because it branches on `unit != nil`
+// — a structural fact. A caller holding the structure must be able to say so.
+func (c *Config) resolveBareKernelIfName(name string) string {
+	if strings.HasPrefix(name, "reth") {
+		return LinuxIfName(c.ResolveReth(name))
+	}
+	return LinuxIfName(name)
+}
+
 func (c *Config) ResolveKernelIfName(ref string) string {
 	parts := strings.SplitN(ref, ".", 2)
 	base := parts[0]
 
 	// Bare refs.
 	if len(parts) == 1 {
-		if strings.HasPrefix(base, "reth") {
-			return LinuxIfName(c.ResolveReth(base))
-		}
-		return LinuxIfName(base)
+		return c.resolveBareKernelIfName(base)
 	}
 
 	// XFRM (st<N>): the kernel device is the AUTHORED bind-interface, which

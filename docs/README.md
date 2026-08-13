@@ -66,7 +66,10 @@ docs.
 ## Performance & CoS
 
 - [`userspace-perf-compare.md`](userspace-perf-compare.md) — throughput
-  benchmarking methodology.
+  benchmarking methodology (bulk / elephant-flow regime).
+- [`userspace-newflow-ceiling.md`](userspace-newflow-ceiling.md) —
+  connection-rate (new flows/sec) harness and the per-site contention
+  attribution that decides #2852 Phase-2. Measurement OWED.
 - [`fairness-regimes.md`](fairness-regimes.md) — per-flow fairness
   regimes and CoV floors.
 - [`cos-traffic-shaping.md`](cos-traffic-shaping.md) — class-of-service
