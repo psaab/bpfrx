@@ -79066,3 +79066,27 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go,
   pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-13T12:45Z
+- **Action**: #6645 pre-merge fold — corrected a FALSE claim in production source and
+  unasserted two client-side socket-close errors. `pkg/api/authz.go` claimed the
+  standalone configure->maint assertion "requires the budget's free space above the
+  configure ceiling to cover a max-size load". It does not: the real assertion at
+  `authz_bodybudget_fairness_5561_test.go:783` uses `needFor(mutationBodySmall)`, and
+  the load form is arithmetically false (budget-configure = 64-48 = 16 MiB, while
+  needFor(mutationBodyLoad) peaks at 24 MiB). The `mutationBodyLoad` assertions in
+  that file are quantified over view and clear only. Anyone implementing the sentence
+  as written would produce a RED test against a correct ladder. Also unasserted the
+  `conn.Close()` errors at `authz_bodywindow_5561_test.go:309` and
+  `authz_bodybudget_fairness_5561_test.go:410` — both closes are load-bearing (one
+  releases the gate for the next case, one IS the abort under test) but their errors
+  bind nothing in production; the binding assertions are the quiescence/settle waits
+  that follow. Validation: go build + go vet clean, `go test ./pkg/api/...` ok 37.7s,
+  gofmt clean on all three files. Parent mutation proof at this head: deleting the
+  entire second adjudication (`reauthorizeInputs` + its `Authorize` guard,
+  authz.go:892-896) compiles cleanly and reds exactly
+  `TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561` and
+  `TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` — the TOCTOU fix is
+  independently bound.
+- **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go

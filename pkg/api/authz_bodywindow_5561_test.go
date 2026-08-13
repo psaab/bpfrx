@@ -306,9 +306,12 @@ func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 		// 2): openDeclaredBody's own cleanup closes the connection but nothing
 		// joins the handler, so without this the waiter outlives the case and
 		// the next one's waitForMutationBodyWaiter can take it for its own.
-		if err := conn.Close(); err != nil {
-			t.Fatalf("close: %v", err)
-		}
+		//
+		// The close is load-bearing; its ERROR is not. A failure to close a
+		// client-side test socket says nothing about production, so it is
+		// deliberately unasserted — the binding assertion is the quiescence
+		// wait that follows.
+		_ = conn.Close()
 		waitForGateQuiescent(t)
 	})
 }

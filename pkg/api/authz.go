@@ -1030,7 +1030,12 @@ const mutationBodyBudgetBytes int64 = 64 << 20 // 64 MiB
 //
 // The configure -> maint reservation is still checked, just not here: a
 // standalone assertion in authz_bodybudget_fairness_5561_test.go requires the
-// budget's free space above the configure ceiling to cover a max-size load.
+// budget's free space above the configure ceiling to cover the peak charge of a
+// max-size `POST /api/v1/system/action` body (mutationBodySmall). It is NOT a
+// max-size load: budget-configure is 64-48 = 16 MiB, while needFor(
+// mutationBodyLoad) peaks at 24 MiB, so the load form would be false. The
+// mutationBodyLoad assertions in that file are quantified over view and clear
+// only.
 // Keep this list in step with what the derivation produces — a table that names
 // a step the loop cannot see reads as coverage that does not exist.
 //

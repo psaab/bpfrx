@@ -406,10 +406,11 @@ func TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561(t *testing.T) {
 		waitForGateQuiescent(t)
 		conn := openDeclaredBody(t, base, "POST /api/v1/diagnostics/ping", int(mutationBodySmall), "{", nil)
 		waitForMutationBodyWaiter(t)
-		// Abort: the gate's read fails and the handler never runs.
-		if err := conn.Close(); err != nil {
-			t.Fatalf("close: %v", err)
-		}
+		// Abort: the gate's read fails and the handler never runs. The close IS
+		// the abort under test; its error is not asserted, because a failed
+		// close on a client-side test socket binds nothing in production — the
+		// settle assertion below is what binds.
+		_ = conn.Close()
 		waitForAdmittedToSettle(t, 0)
 	})
 
