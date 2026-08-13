@@ -6,12 +6,14 @@
 // (`snapshot_binding_plan_key` and its JSON-canonicalizing helpers), and
 // the RX-queue / binding replanner (`replan_queues`,
 // `replan_bindings_from_candidates`, `effective_rx_queues`,
-// `plan_key_rx_queues`, `include_userspace_binding_interface`). Hash
-// ownership and layout ownership stay together so the same-plan skip and
-// the produced layout can never disagree — the invariant fixed by
-// #2915/#2916/#3007/#3175. Cold path only (control responses), no
-// per-packet work. Bodies byte-for-byte identical to the pre-split
-// source.
+// `plan_key_rx_queues`, `include_userspace_binding_interface`,
+// `userspace_unbindable_netdev`, `snapshot_refuses_parent_netdev`,
+// `binding_target_is_refused`). Hash ownership and layout ownership stay
+// together so the same-plan skip and the produced layout can never
+// disagree — the invariant fixed by #2915/#2916/#3007/#3175, and the
+// reason #6691 round 8's refusal predicate is read by BOTH the hash
+// filter and the candidate loop rather than restated in each. Cold path
+// only (control responses), no per-packet work.
 
 use super::{refresh_status, should_run_afxdp};
 use crate::protocol::{BindingStatus, ConfigSnapshot, InterfaceSnapshot, QueueStatus};
@@ -110,6 +112,20 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         .interfaces
         .iter()
         .filter(|iface| include_userspace_binding_interface(iface))
+        // #6691 round 8: a row whose bind target the snapshot REFUSES produces
+        // no candidate in `replan_queues`, so it must not be hashed here
+        // either. Both sides read the SAME predicate
+        // (`binding_target_is_refused`), which is what keeps the #2915
+        // hash/layout invariant a property of the code rather than of two
+        // filters that happen to agree today.
+        .filter(|iface| {
+            let resolved = if iface.linux_name.is_empty() {
+                linux_ifname(&iface.name)
+            } else {
+                iface.linux_name.clone()
+            };
+            !binding_target_is_refused(snapshot, iface, &resolved)
+        })
     {
         // #3091: `vlan_id` and `parent_linux_name` are now binding-plan inputs
         // — `replan_queues` dedups a VLAN-child netdev onto its physical parent
@@ -265,28 +281,42 @@ fn write_canonical_json(value: &serde_json::Value, out: &mut String) {
     }
 }
 
-pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> bool {
-    if iface.zone.is_empty() {
-        return false;
-    }
+/// The NETDEV-INTRINSIC half of the binding refusal: "whatever row asks, an
+/// AF_XDP socket may not be bound to this netdev".
+///
+/// #6691 round 8 split `include_userspace_binding_interface` in two because the
+/// two halves behave differently under a REDIRECT. `replan_queues` re-keys an
+/// orphan VLAN child onto its physical parent, so the child hands the planner a
+/// netdev that is not its own — and the classes below travel with the netdev,
+/// while the ones left in the caller (a mgmt/control ZONE, an empty zone, a
+/// local-fabric ROLE) describe the ROW and must not be inherited by a sibling.
+///
+/// The Go control plane mirrors this split exactly in
+/// `userspaceUnbindableNetdev` (pkg/dataplane/userspace/ingress_exclusions.go).
+/// Only the `secure_tunnel` arm carries a decision this plane cannot re-derive,
+/// which is why it is shipped rather than computed here (round 5).
+pub(crate) fn userspace_unbindable_netdev(iface: &InterfaceSnapshot) -> bool {
     if iface.tunnel {
-        return false;
-    }
-    if !iface.local_fabric_member.is_empty() {
-        return false;
+        return true;
     }
     let base = iface.name.split('.').next().unwrap_or(iface.name.as_str());
     if base.starts_with("fxp") || base.starts_with("em") || base.starts_with("fab") || base == "lo0"
     {
-        return false;
+        return true;
     }
     // #5619: an IPsec secure tunnel gets no AF_XDP binding.
     //
-    // KEYED ON OWNERSHIP, NOT ON NAME SHAPE (#6691 round 5). `secure_tunnel`
-    // is set by the Go control plane from `Config.SecureTunnelNetdevForRef` —
-    // some `security ipsec vpn <name> bind-interface` derives this interface's
-    // if_id — so this excludes exactly the interfaces an IPsec configuration
-    // actually binds.
+    // KEYED ON OWNERSHIP OR DEVICE KIND, NEVER ON NAME SHAPE (#6691 rounds 5
+    // and 8). `secure_tunnel` is set by the Go control plane from
+    // `snapshotSecureTunnel`, the union of two facts: some `security ipsec vpn
+    // <name> bind-interface` NAMES this row's device
+    // (`Config.SecureTunnelNetdevForRef`), OR the netdev the row resolves to
+    // has kernel link kind `xfrm` (`liveXfrmNetdevs`). The first covers what an
+    // IPsec configuration binds; the second covers a live xfrmi the config no
+    // longer describes — a failed `LinkDel` retains one while the apply
+    // proceeds on a deferred error, and a daemon restart leaves an untracked
+    // one — which no config-keyed predicate can see. This plane reads the one
+    // flag and does not care which half set it.
     //
     // This used to call a local `is_secure_tunnel_ifname(base)` mirroring
     // `config.IsSecureTunnelIfName`: `st` followed by an index in
@@ -338,7 +368,17 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     // copy-mode binding is REACHABLE in this code and earlier rounds of this
     // comment were wrong to say the bind could not happen. Settling it needs a
     // live NIC. Reason 1 does not depend on the answer.
-    if iface.secure_tunnel {
+    iface.secure_tunnel
+}
+
+pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> bool {
+    if iface.zone.is_empty() {
+        return false;
+    }
+    if !iface.local_fabric_member.is_empty() {
+        return false;
+    }
+    if userspace_unbindable_netdev(iface) {
         return false;
     }
     !matches!(iface.zone.as_str(), "mgmt" | "control")
@@ -398,6 +438,70 @@ fn snapshot_has_parent_candidate(snapshot: &ConfigSnapshot, parent: &str) -> boo
         // child that happens to share the name string.
         p_linux == parent && vlan_child_parent_netdev(p, &p_linux).is_none()
     })
+}
+
+/// #6691 round 8: the snapshot REFUSES this parent netdev on device grounds —
+/// as opposed to simply not carrying it.
+///
+/// `snapshot_has_parent_candidate` returning false conflates two states that
+/// need OPPOSITE handling, and the orphan branch of `replan_queues` was written
+/// for only one of them:
+///
+///   - ABSENT. The physical parent is not in the snapshot at all (unzoned, not
+///     configured). The child's tagged frames still arrive on the parent's
+///     hardware queues, so re-keying the child onto the parent is the #3175 fix
+///     and is correct.
+///   - REFUSED. The parent IS in the snapshot and `userspace_unbindable_netdev`
+///     rejected it. Re-keying onto it re-admits precisely the netdev the
+///     binding contract just excluded — through a sibling row that never had to
+///     pass the test itself.
+///
+/// The reachable case is a route-based IPsec tunnel with a zoned sibling unit:
+/// `bind-interface st10` makes the base row `st10` a secure tunnel, while
+/// `st10 unit 5 vlan-id 100` derives a DIFFERENT if_id and is correctly NOT one.
+/// Measured at head on that snapshot, with the LAN at 4 hardware queues and the
+/// xfrmi at its single queue: the planner produced a binding for `st10` and the
+/// LAN's planned queue count fell from 4 to 1 — the #3091 single-worker
+/// regression that `userspace_unbindable_netdev`'s secure-tunnel arm exists to
+/// prevent, arriving through the child.
+///
+/// Deliberately mirrors `snapshot_has_parent_candidate`'s structure, including
+/// the "must be the netdev itself, not another VLAN child sharing the name
+/// string" guard, so the two answers are about the same row.
+fn snapshot_refuses_parent_netdev(snapshot: &ConfigSnapshot, parent: &str) -> bool {
+    snapshot.interfaces.iter().any(|p| {
+        if !userspace_unbindable_netdev(p) {
+            return false;
+        }
+        let p_linux = if p.linux_name.is_empty() {
+            linux_ifname(&p.name)
+        } else {
+            p.linux_name.clone()
+        };
+        p_linux == parent && vlan_child_parent_netdev(p, &p_linux).is_none()
+    })
+}
+
+/// #6691 round 8: this row's AF_XDP binding would land on a netdev the snapshot
+/// REFUSES, so the row contributes no candidate at all.
+///
+/// Shared by `replan_queues` (the LAYOUT) and `update_snapshot_binding_plan_key`
+/// (the HASH) so the two cannot disagree about which rows produce candidates —
+/// the #2915 invariant. A row dropped from the layout but still hashed would
+/// over-key (extra replans, never a stale plan); a row hashed but not dropped
+/// would under-key, which is the unsafe direction. Sharing the predicate makes
+/// both impossible rather than merely unlikely.
+pub(crate) fn binding_target_is_refused(
+    snapshot: &ConfigSnapshot,
+    iface: &InterfaceSnapshot,
+    resolved_linux_name: &str,
+) -> bool {
+    match vlan_child_parent_netdev(iface, resolved_linux_name) {
+        Some(parent) => snapshot_refuses_parent_netdev(snapshot, parent),
+        // A non-VLAN row binds its OWN netdev, which its own row already
+        // passed `include_userspace_binding_interface` for.
+        None => false,
+    }
 }
 
 /// #3175: resolve the rx_queue count the PLAN KEY must hash for `iface`,
@@ -469,6 +573,17 @@ pub(crate) fn replan_queues(
             // candidate collapses the `queue_count` min to 1 (single worker,
             // the #3091 ~6 Gbps regression). The #1921 `seen_linux` guard below
             // cannot catch this — the child netdev name differs from the parent.
+            // #6691 round 8: this row's bind target is a netdev the snapshot
+            // REFUSES — not one it merely lacks. Without this the orphan
+            // re-key below hands the planner exactly the netdev the binding
+            // contract just excluded, through a sibling row that never had to
+            // pass the test itself. Asked BEFORE the orphan arm and through
+            // the same helper the plan-key filter uses, so the layout and the
+            // hash drop identical rows. Drop the child: its bind target is the
+            // parent, so there is no netdev left for it to bind.
+            if binding_target_is_refused(snapshot, iface, &linux_name) {
+                continue;
+            }
             if let Some(parent) = vlan_child_parent_netdev(iface, &linux_name) {
                 if snapshot_has_parent_candidate(snapshot, parent) {
                     // The parent's per-queue XSKs already capture this VLAN's

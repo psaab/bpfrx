@@ -242,9 +242,15 @@ construction, because the config language admits it. Keying the exclusion on the
 name dropped that interface out of the ingress map, the binding plan and the RSS
 allowlist: a traffic outage on a working NIC.
 
-The exclusion is therefore keyed on OWNERSHIP. An `st` name is a secure tunnel
-when an IPsec configuration BINDS it — `Config.SecureTunnelNetdevForRef` — and
-an unowned `st5` keeps adjudication, binding and RSS. `pkg/routing/xfrm.go`,
+The exclusion is therefore keyed on OWNERSHIP — or, since #6691 round 8, on the
+kernel's DEVICE KIND. An `st` name is a secure tunnel when an IPsec
+configuration BINDS it (`Config.SecureTunnelNetdevForRef`) or when the netdev it
+resolves to actually has link kind `xfrm` (`liveXfrmNetdevs`); an unowned `st5`
+that is neither keeps adjudication, binding and RSS. The kernel half exists
+because every config-keyed predicate is blind to a live xfrmi the config no
+longer describes: a failed `LinkDel` retains one (`pkg/routing`, #4901) while
+the apply proceeds on a deferred error, and a daemon restart leaves an untracked
+one that no sweep enumerates. `pkg/routing/xfrm.go`,
 which actually creates the xfrmi devices, does not call that resolver; the two
 agree because both derive names and if_ids through `config.XFRMIfNameAndID` and
 both treat one if_id claimed by two distinct names as unresolvable. A shared

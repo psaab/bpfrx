@@ -36,6 +36,11 @@ var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-gl
 // (include_userspace_binding_interface) is AUTHORITATIVE on it: a route-based
 // IPsec xfrmi must not become an AF_XDP binding candidate.
 //
+// #6691 round 8: the flag is now set by CONFIG ownership or by the KERNEL link
+// kind, and configHasSecureTunnel asks both — so this gate fires for a stale
+// live xfrmi too, which is the case the operator cannot fix by editing the
+// config.
+//
 // A helper that predates the field ignores it and plans the candidate. That is
 // not a lost optimisation — the helper's queue count is the GLOBAL MINIMUM
 // across candidates (replan_bindings_from_candidates) and an xfrm interface has
@@ -782,15 +787,28 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 	)
 }
 
-// configHasSecureTunnel reports whether any `security ipsec vpn <name>
-// bind-interface` in cfg derives an xfrmi — i.e. whether the snapshot this
-// config produces will carry an InterfaceSnapshot with SecureTunnel set.
+// configHasSecureTunnel reports whether the snapshot this config produces will
+// carry an InterfaceSnapshot with SecureTunnel set.
 //
-// It asks the SAME question the snapshot builder asks (secureTunnelOwned →
-// Config.SecureTunnelNetdevForRef), over the same refs the builder walks, so
-// the gate cannot arm for a config whose snapshot carries no flagged row or
-// stay silent for one that does. Keying on the VPN stanza directly would
-// diverge the moment a bind-interface stops resolving to a netdev.
+// It asks the SAME question the snapshot builder asks — snapshotSecureTunnel,
+// over the same refs the builder walks — so the gate cannot arm for a config
+// whose snapshot carries no flagged row or stay silent for one that does.
+// Keying on the VPN stanza directly would diverge the moment a bind-interface
+// stops resolving to a netdev.
+//
+// #6691 round 8: that invariant is why the KERNEL half is here too. The
+// builder's flag became the union of config ownership and "the resolved netdev
+// is an xfrm interface" (snapshotSecureTunnel), so a gate that asked only the
+// config half would stay silent for a snapshot that DOES carry a flagged row —
+// exactly the divergence the paragraph above forbids. The stale-xfrmi state is
+// the one this covers: a pre-v5 helper refuses such a snapshot outright and
+// stays armed on its previous image, which is the window this gate exists to
+// close, and the operator cannot close it by editing the config.
+//
+// The kernel half costs ONE RTM_GETLINK dump, taken only after the config half
+// has found nothing, and it is skipped entirely on a box with no xfrm devices
+// (the dump comes back empty). This runs on apply/publish/arm paths, never on
+// a poll tick.
 func configHasSecureTunnel(cfg *config.Config) bool {
 	if cfg == nil {
 		return false
@@ -804,6 +822,26 @@ func configHasSecureTunnel(cfg *config.Config) bool {
 		}
 		for unitNum := range iface.Units {
 			if _, ok := cfg.SecureTunnelNetdevForRef(fmt.Sprintf("%s.%d", name, unitNum)); ok {
+				return true
+			}
+		}
+	}
+	liveXfrm := liveXfrmNetdevs()
+	if len(liveXfrm) == 0 {
+		return false
+	}
+	for name, iface := range cfg.Interfaces.Interfaces {
+		if iface == nil {
+			continue
+		}
+		if liveXfrm[snapshotLinuxName(cfg, name, iface, nil)] {
+			return true
+		}
+		for _, unit := range iface.Units {
+			if unit == nil {
+				continue
+			}
+			if liveXfrm[snapshotLinuxName(cfg, name, iface, unit)] {
 				return true
 			}
 		}

@@ -4249,3 +4249,244 @@ fn synced_session_rejects_unresolved_ipv6_ext_protocol_6923() {
         "#6923: the upsert path must refuse the same key the delete path refuses"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// #6691 round 8: an orphan VLAN child must not re-key onto a REFUSED parent.
+// ---------------------------------------------------------------------------
+//
+// `replan_queues` has two reasons to find no parent candidate, and only one of
+// them means "the parent is absent". The other means "the parent is present and
+// the binding contract refused it" — and the orphan branch's remedy (promote
+// the parent into the candidate list) is exactly wrong there: it hands the
+// planner the netdev the contract just excluded, sourced from a sibling row
+// that never had to pass the test itself.
+//
+// The snapshot below is the real Go wire snapshot for a strict-valid config:
+//
+//	set security ipsec vpn V bind-interface st10
+//	set interfaces st10 vlan-tagging
+//	set interfaces st10 unit 5 vlan-id 100
+//	set interfaces st10 unit 5 family inet address 192.0.2.1/24
+//	set security zones security-zone trust interfaces st10.5
+//
+// The base row `st10` carries `secure_tunnel: true` (the VPN binds it); the
+// unit derives `10<<16 | 6` against the bound `10<<16 | 1`, so it is correctly
+// NOT a secure tunnel — and its `parent_linux_name` is the xfrmi.
+//
+// The assertion is the QUEUE COUNT, not plan identity, because the queue count
+// IS the harm: `replan_bindings_from_candidates` takes the global minimum and
+// an xfrm interface has exactly one RX queue, so admitting it drags every
+// physical interface on the box to one queue and one worker (#3091).
+//
+// FAIL-ON-REVERT: measured at head before the fix, this snapshot planned a
+// binding for `st10` and the LAN's planned queue count fell from 4 to 1.
+
+#[test]
+fn orphan_vlan_child_cannot_readmit_its_refused_parent() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+        snapshot_binding_plan_key,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-0", 4);
+    // The measured xfrmi property: `ip -d link` reports `numrxqueues 1` and
+    // /sys/class/net/<if>/queues holds a single `rx-0`.
+    set_rx_queue_count_override("st10", 1);
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 10,
+        rx_queues: 4,
+        ..Default::default()
+    };
+    let xfrmi = InterfaceSnapshot {
+        name: "st10".to_string(),
+        linux_name: "st10".to_string(),
+        zone: "trust".to_string(),
+        secure_tunnel: true,
+        ifindex: 11,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    let sibling = InterfaceSnapshot {
+        name: "st10.5".to_string(),
+        // The VLAN device the Go builder names for `vlan-id 100`; it exists on
+        // no box (a VLAN cannot be created on an ARPHRD_NONE xfrmi), which is
+        // why its own ifindex is 0 and the PARENT redirect is the only way it
+        // contributes anything.
+        linux_name: "st10.100".to_string(),
+        parent_linux_name: "st10".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 0,
+        parent_ifindex: 11,
+        vlan_id: 100,
+        rx_queues: 1,
+        ..Default::default()
+    };
+
+    // Premises. Without all three the assertions below cannot discriminate.
+    assert!(
+        !crate::server::helpers::include_userspace_binding_interface(&xfrmi),
+        "premise: the xfrmi's own row must already be refused a binding"
+    );
+    assert!(
+        crate::server::helpers::include_userspace_binding_interface(&sibling),
+        "premise: the sibling must NOT be refused on its own merits — otherwise \
+         no laundering is being tested"
+    );
+    assert!(
+        lan.rx_queues > xfrmi.rx_queues,
+        "premise: the LAN must have MORE queues than the tunnel, or the global \
+         minimum cannot move and this test is vacuous"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![lan.clone(), xfrmi, sibling],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 4, &[]);
+
+    assert!(
+        bindings.iter().all(|b| b.interface != "st10"),
+        "the planner produced an AF_XDP binding for the xfrmi. Its own row was \
+         refused; a zoned sibling unit re-keyed onto it through the orphan-VLAN \
+         parent redirect. Planned: {:?}",
+        bindings
+            .iter()
+            .map(|b| &b.interface)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-0")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {}. The xfrmi entered \
+         the candidate list through its sibling and its single RX queue became \
+         the global minimum — every interface on the box is now one queue and \
+         one worker (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    // #2915: the plan-key HASH must drop exactly the rows the LAYOUT drops. The
+    // refused sibling contributes no candidate, so a snapshot without it at all
+    // must hash identically — otherwise the key would churn (or, in the unsafe
+    // direction, a change to the dropped row would not bump the key while the
+    // layout stayed the same).
+    let without_sibling = ConfigSnapshot {
+        interfaces: snapshot.interfaces[..2].to_vec(),
+        ..Default::default()
+    };
+    assert_eq!(
+        snapshot_binding_plan_key(&snapshot),
+        snapshot_binding_plan_key(&without_sibling),
+        "the plan key still hashes a row that produces no candidate: the hash and \
+         the layout disagree about the binding plan (#2915)"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// The NON-REFUSED orphan case must keep working. This is #3175's own scenario
+/// and it is the negative control for the refusal above.
+///
+/// THE PARENT ROW IS PRESENT AND UNZONED, which is the only shape that can
+/// discriminate the two predicates. An earlier revision of this test omitted
+/// the parent row entirely, and it did not bind: with no row resolving to
+/// `ge-0-0-2`, BOTH `snapshot_refuses_parent_netdev` and the wrong-but-tempting
+/// `!include_userspace_binding_interface(p)` return false for want of anything
+/// to examine, so the mutation survived. Measured, not reasoned — it survived
+/// the grid before the fixture was corrected.
+///
+/// With the parent row present and unzoned, the parent is NOT a candidate (an
+/// empty zone fails `include_userspace_binding_interface`) yet it is NOT
+/// refused either (an unzoned physical NIC is not an unbindable NETDEV). Its
+/// hardware queues really do carry the child's tagged frames, so the #3175
+/// re-key must still happen.
+///
+/// FAIL-ON-REVERT: widen `snapshot_refuses_parent_netdev` to fire on any
+/// non-candidate parent — the obvious wrong simplification — and this test goes
+/// RED with an empty binding list.
+#[test]
+fn orphan_vlan_child_still_rekeys_onto_an_unzoned_parent() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, include_userspace_binding_interface, replan_queues,
+        set_rx_queue_count_override, userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-2", 6);
+
+    // Present, unzoned: not a candidate, but not refused either.
+    let parent = InterfaceSnapshot {
+        name: "ge-0/0/2".to_string(),
+        linux_name: "ge-0-0-2".to_string(),
+        zone: String::new(),
+        ifindex: 30,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    let child = InterfaceSnapshot {
+        name: "reth0.80".to_string(),
+        linux_name: "ge-0-0-2.80".to_string(),
+        parent_linux_name: "ge-0-0-2".to_string(),
+        zone: "untrust".to_string(),
+        ifindex: 31,
+        parent_ifindex: 30,
+        vlan_id: 80,
+        rx_queues: 1,
+        ..Default::default()
+    };
+
+    assert!(
+        !include_userspace_binding_interface(&parent),
+        "premise: the parent must NOT be a candidate, or this is the ordinary \
+         VLAN-dedup path and the orphan branch never runs"
+    );
+    assert!(
+        !userspace_unbindable_netdev(&parent),
+        "premise: the parent must NOT be refused — the whole point is that \
+         'not a candidate' and 'refused' are different facts"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![parent, child],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        planned.contains("ge-0-0-2"),
+        "an orphan VLAN child whose parent is present-but-not-a-candidate must \
+         still re-key onto the parent netdev (#3175) — refusing it here would \
+         take the child's traffic off the dataplane. Planned: {planned:?}"
+    );
+    let queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-2")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        queues.len(),
+        6,
+        "the orphan re-key must use the PARENT's hardware queue count, not the \
+         child's lone software queue"
+    );
+
+    clear_rx_queue_count_override();
+}

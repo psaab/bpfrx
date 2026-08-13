@@ -1667,11 +1667,17 @@ The v5 bump carries the matching gate,
 `ErrSecureTunnelProtocolIncompatible` (also registered in
 `requiredProtocolGateSentinels`). It arms off `configHasSecureTunnel`,
 which asks the SAME question the snapshot builder asks
-(`Config.SecureTunnelNetdevForRef`) over the same interface and unit
-refs — so it cannot arm for a config whose snapshot carries no flagged
-row, nor stay silent for one that does. Scoped that way, an operator
-with no route-based IPsec is never blocked by a helper-version mismatch
-that cannot affect them.
+(`snapshotSecureTunnel`) over the same interface and unit refs — so it
+cannot arm for a config whose snapshot carries no flagged row, nor stay
+silent for one that does. Since #6691 round 8 that question has TWO
+halves — config ownership (`Config.SecureTunnelNetdevForRef`) and the
+kernel's link kind (`liveXfrmNetdevs`) — and the gate asks both, because
+a stale live xfrmi is exactly the case an operator cannot fix by editing
+the config. Scoped that way, an operator with neither route-based IPsec
+nor a leftover xfrm device is never blocked by a helper-version mismatch
+that cannot affect them; the kernel half costs one `RTM_GETLINK` dump on
+the apply/publish/arm paths, taken only after the config half finds
+nothing, and never on a poll tick.
 
 If the disarm ITSELF fails, the helper is still armed on its
 previous-good snapshot — and on a publish path whose classifier BPF maps

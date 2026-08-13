@@ -122,7 +122,9 @@ func userspaceBindTargetNetdev(iface InterfaceSnapshot) string {
 // Scope mirrors buildUserspaceIngressIfindexes() and
 // userspaceSkipsIngressInterface(): include zoned non-tunnel interfaces
 // excluding fxp*, em*, fab*, lo0, mgmt/control zones, and RETH member
-// children; plus every fabric's parent member (fab0/fab1 themselves are
+// children — and, since #6691 round 8, excluding a row whose AF_XDP bind
+// TARGET is a netdev some other row was already refused for (a VLAN child
+// redirecting onto an excluded parent); plus every fabric's parent member (fab0/fab1 themselves are
 // IPVLAN overlays and are excluded above, but their physical parent is
 // where AF_XDP binds). For zoned VLAN units whose parent is the physical
 // interface, we emit the parent Linux name — that is the netdev the
@@ -160,6 +162,7 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		seen[name] = struct{}{}
 		out = append(out, name)
 	}
+	refused := buildUserspaceRefusedNetdevs(snap.Interfaces)
 	for _, iface := range snap.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
@@ -169,7 +172,20 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		// mirrors the Rust planner's vlan_child_parent_netdev rule
 		// exactly. A VLAN sub-interface binds its physical PARENT netdev;
 		// everything else binds its own netdev.
-		add(userspaceBindTargetNetdev(iface))
+		//
+		// #6691 round 8: that redirect is the second way an excluded netdev
+		// re-enters an adjudicated set. This allowlist is NAME-keyed, so it is
+		// asked by name — under `bind-interface st10` plus a zoned
+		// `st10 unit 5 vlan-id 100`, the child's bind target is the string
+		// "st10" and the allowlist measured at head contained it. The refusal
+		// is only reachable through the redirect: for a non-VLAN row the bind
+		// target is the row's OWN netdev, which its own row already passed the
+		// predicate for.
+		bindTarget := userspaceBindTargetNetdev(iface)
+		if refused.refusesName(bindTarget) {
+			continue
+		}
+		add(bindTarget)
 	}
 	for _, fab := range snap.Fabrics {
 		add(fab.ParentLinuxName)
@@ -182,6 +198,10 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
 		return nil
 	}
+	// #6691 round 8: resolved ONCE per snapshot, not per row — it is a single
+	// RTM_GETLINK dump, against the two netlink lookups buildLinkSnapshot
+	// already issues for every row.
+	liveXfrm := liveXfrmNetdevs()
 	zoneByInterface := buildInterfaceZoneMap(cfg)
 	ifaceRoutingInstance := buildInterfaceRoutingInstances(cfg)
 	usedSyntheticIfindexes := make(map[int]struct{})
@@ -230,7 +250,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			RedundancyGroup: rg,
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
-			SecureTunnel:    secureTunnelOwned(cfg, name),
+			SecureTunnel:    snapshotSecureTunnel(cfg, name, linuxName, liveXfrm),
 			MTU:             mtu,
 			HardwareAddr:    hardwareAddr,
 			Addresses:       addresses,
@@ -303,7 +323,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				RedundancyGroup:           rg, // inherit resolved RG (RETH parent or own)
 				UnitCount:                 0,
 				Tunnel:                    iface.Tunnel != nil || unit.Tunnel != nil,
-				SecureTunnel:              secureTunnelOwned(cfg, unitName),
+				SecureTunnel:              snapshotSecureTunnel(cfg, unitName, linuxUnit, liveXfrm),
 				MTU:                       mtu,
 				HardwareAddr:              hardwareAddr,
 				Addresses:                 addresses,
@@ -431,6 +451,11 @@ func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {
 // stripped it of ingress adjudication, of its AF_XDP binding and of its RSS
 // entry — the traffic outage the excluding arm's own comment named.
 //
+// This is the CONFIG half of the row flag only; snapshotSecureTunnel unions it
+// with the kernel half (liveXfrmNetdevs) and is what buildInterfaceSnapshots
+// actually stamps on a row. Read that first if you are asking what
+// InterfaceSnapshot.SecureTunnel means.
+//
 // The oracle is Config.SecureTunnelNetdevForRef. pkg/routing/xfrm.go — which
 // actually creates the devices — does NOT call it; the two agree because both
 // derive names and if_ids through config.XFRMIfNameAndID and both treat an
@@ -477,6 +502,83 @@ func secureTunnelOwned(cfg *config.Config, ifName string) bool {
 	}
 	_, ok := cfg.SecureTunnelNetdevForRef(ifName)
 	return ok
+}
+
+// liveXfrmNetdevs returns the LIVE kernel netdevs whose link KIND is `xfrm`.
+//
+// #6691 round 8. Every other predicate in this change is keyed on the CONFIG,
+// and a live xfrmi the config no longer describes is invisible to all of them.
+// Two routes reach that state, and neither needs an operator mistake:
+//
+//   - LinkDel FAILS. pkg/routing/xfrm.go deleteLocked deliberately RETAINS
+//     tracking on a failed LinkDel (#4901) and returns the error; ApplyXfrmi
+//     joins it, and applyInterfaceReconcile's result is a DEFERRED error
+//     (daemon_apply.go — "All steps still run (no early return)"), so the apply
+//     proceeds through applyDataplaneAndHACore with the xfrmi still in the
+//     kernel. The new config has no bind-interface, so secureTunnelOwned says
+//     false, and buildLinkSnapshot finds the retained device: the row ships
+//     Ifindex > 0 with SecureTunnel false.
+//   - DAEMON RESTART. xfrmManager.xfrmis starts EMPTY and both Apply's delete
+//     pass and clearLocked iterate only TRACKED names, so an xfrmi left in the
+//     kernel across a restart is never enumerated and never swept. Same end
+//     state, and it persists.
+//
+// Measured at head on the second shape (`set interfaces st10 unit 0` + a zone,
+// no VPN, `st10` live at ifindex 11): ingress [10 11], RSS [ge-0-0-0 st10] —
+// the stale xfrmi in both adjudicated sets, and a candidate whose single RX
+// queue becomes the planner's global minimum.
+//
+// The kernel is the only thing that knows, so the kernel is asked. This is a
+// BELT, not a replacement for the ownership test: the xfrmi reconciler runs at
+// apply time, so on the commit that CREATES a tunnel the device may not exist
+// yet and only the config knows — the two halves cover different instants and
+// snapshotSecureTunnel takes the union. It fails OPEN (an unreadable link list
+// yields nil, i.e. today's behaviour) because the config half is the primary.
+//
+// It cannot over-match: `xfrm` is the kernel link kind (netlink IFLA_INFO_KIND,
+// vishvananda/netlink *Xfrmi.Type()), so a wildcard-authored NIC named `st5` —
+// the interface four earlier rounds of this PR fought to keep adjudicated — is
+// not in this set, and no ordinary NIC ever can be.
+//
+// A package var so a test can present a kernel state without one; production
+// never assigns it.
+var liveXfrmNetdevs = func() map[string]bool {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return nil
+	}
+	var out map[string]bool
+	for _, link := range links {
+		if link == nil || link.Type() != "xfrm" {
+			continue
+		}
+		name := link.Attrs().Name
+		if name == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[name] = true
+	}
+	return out
+}
+
+// snapshotSecureTunnel is the value a row's SecureTunnel flag carries: the
+// CONFIG-ownership fact (an IPsec bind-interface derives this ref's if_id) OR
+// the KERNEL fact (the netdev this row resolves to is an xfrm interface).
+//
+// The flag's WIRE meaning is unchanged and no protocol bump is owed: it has
+// always meant "the dataplane must not adjudicate or bind this row's netdev,
+// because it is a route-based IPsec tunnel device", and both halves are that
+// same claim reached by different evidence. Rust reads the same `secure_tunnel`
+// field at the same v5 protocol version, and its only consumer is
+// include_userspace_binding_interface.
+func snapshotSecureTunnel(cfg *config.Config, ref, netdev string, liveXfrm map[string]bool) bool {
+	if secureTunnelOwned(cfg, ref) {
+		return true
+	}
+	return netdev != "" && liveXfrm[netdev]
 }
 
 // NOTE: Keep in sync with (*Config).ResolveKernelIfName in

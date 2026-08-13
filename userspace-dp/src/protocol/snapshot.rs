@@ -68,14 +68,24 @@ pub(crate) struct InterfaceSnapshot {
     pub unit_count: usize,
     #[serde(default)]
     pub tunnel: bool,
-    /// #6691: the Go control plane resolved that an IPsec configuration BINDS
-    /// this interface — some `security ipsec vpn <name> bind-interface`
-    /// derives its if_id (`Config.SecureTunnelNetdevForRef`).
+    /// #6691: the Go control plane resolved that this row's netdev IS a
+    /// route-based IPsec tunnel device, so this plane must not bind it.
     ///
-    /// OWNERSHIP, not name shape. Nothing reserves the `st` prefix, so a
-    /// wildcard-authored `st5` with no VPN is an ordinary data interface and
-    /// this stays false. Classifying by shape here used to strip such an
-    /// interface of its AF_XDP binding — a traffic outage on a working NIC.
+    /// Two oracles, one claim (`snapshotSecureTunnel`, round 8): some
+    /// `security ipsec vpn <name> bind-interface` NAMES the row's device
+    /// (`Config.SecureTunnelNetdevForRef`), OR the netdev the row resolves to
+    /// has kernel link kind `xfrm`. The second half sees a live xfrmi the
+    /// config no longer describes — a failed `LinkDel` retains one while the
+    /// apply proceeds on a deferred error, and a daemon restart leaves an
+    /// untracked one — which every config-keyed predicate is blind to. The
+    /// wire meaning, type and tag are unchanged, so no protocol bump is owed
+    /// for the second half; only the evidence the control plane accepts.
+    ///
+    /// OWNERSHIP or DEVICE KIND, never name shape. Nothing reserves the `st`
+    /// prefix, so a wildcard-authored `st5` with no VPN is an ordinary data
+    /// interface, is not an xfrm device, and this stays false. Classifying by
+    /// shape here used to strip such an interface of its AF_XDP binding — a
+    /// traffic outage on a working NIC.
     ///
     /// Absent from an older Go control plane's snapshot, in which case serde
     /// defaults it to false and an xfrmi would receive a binding it cannot

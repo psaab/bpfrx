@@ -19,10 +19,10 @@
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
 [REFACTOR]   2034  userspace-dp/src/afxdp/frame/mod.rs
 [WATCH]      1990  pkg/grpcapi/server_sessions.go
+[WATCH]      1958  pkg/dataplane/userspace/maps_sync.go
 [WATCH]      1950  pkg/dataplane/compiler.go
 [WATCH]      1947  pkg/api/metrics_userspace.go
 [WATCH]      1932  pkg/ddns/manager.go
-[WATCH]      1925  pkg/dataplane/userspace/maps_sync.go
 [WATCH]      1892  pkg/config/compiler_validate_warn.go
 [WATCH]      1831  userspace-dp/src/afxdp/worker/mod.rs
 [WATCH]      1829  pkg/config/compiler_validate_strict_filter.go

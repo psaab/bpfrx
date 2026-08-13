@@ -1588,11 +1588,33 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	seen := make(map[uint32]bool)
 	out := make([]uint32, 0)
+	refused := buildUserspaceRefusedNetdevs(snapshot.Interfaces)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
+			// #6691 round 8: the parent netdev is one a DIFFERENT row has
+			// already been refused a binding for on device grounds — an xfrmi
+			// under `bind-interface st10` with a zoned sibling unit is the
+			// reachable case. Appending its ifindex here re-admits exactly the
+			// netdev the predicate just excluded, and measured at head it did:
+			// the set came back [10 11] with 11 the live xfrmi.
+			//
+			// The WHOLE ROW is dropped, not just the parent key, because for a
+			// VLAN child the parent IS the bind target (userspaceBindTargetNetdev)
+			// — so keeping the child's own ifindex here while its binding is
+			// refused would put an ifindex in the ingress map with no READY
+			// binding, which the shim answers with drop_degraded_transit
+			// (BINDING_MISSING). "The ingress map and the binding plan move
+			// together or transit dies" is the invariant this arm is holding up;
+			// on every config reachable today the child's own netdev does not
+			// exist anyway (a VLAN device cannot be created on an ARPHRD_NONE
+			// xfrmi), so the two readings coincide and this is the one that
+			// stays right if that changes.
+			if refused.refusesIfindex(iface.ParentIfindex) {
+				continue
+			}
 			if iface.Ifindex > 0 && !iface.LogicalOnly {
 				key := uint32(iface.Ifindex)
 				if !seen[key] {
@@ -1673,11 +1695,22 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		return nil
 	}
 	out := make(map[uint32]uint32)
+	refused := buildUserspaceRefusedNetdevs(snapshot.Interfaces)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
 		}
 		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 || iface.Ifindex == iface.ParentIfindex || iface.LogicalOnly {
+			continue
+		}
+		// #6691 round 8: same redirect, same refusal. This site is INERT on
+		// every config reachable today — the sibling unit of an xfrmi resolves
+		// to a netdev that does not exist, so it is dropped by the `Ifindex <= 0`
+		// guard above before this line runs — and it is guarded anyway so the
+		// alias table cannot become the one place the refusal is not asked.
+		// An alias here would tell the shim to treat frames on the child as
+		// arriving on a netdev the dataplane refused to bind.
+		if refused.refusesIfindex(iface.ParentIfindex) {
 			continue
 		}
 		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
