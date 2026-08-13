@@ -195,14 +195,26 @@ counters (see below).
   Guards, in `userspace-dp/src/afxdp/forwarding_build/tests.rs`:
   `rejected_build_does_not_prune_live_zone_counters` and
   `rejected_build_does_not_create_zone_blocks_in_the_live_store` each drive
-  EVERY fallible integrity belt reachable in the builder — #3719 duplicate zone
-  id (the first) through #2410 CoS queue id (the last), via #2240 NPTv6 and
-  #3367 filter — so hoisting the binding above the `?` reds them. A single-belt
-  fixture does not bind the ordering: it stays green when a *different* belt
+  FOUR of the inner builder's ten fallible integrity belts, chosen by POSITION
+  rather than exhaustively — #3719 duplicate zone id (the first `?`) and #2410
+  CoS queue id (the last, with nothing fallible after it), via #2240 NPTv6 and
+  #3367 filter — so hoisting the binding back into the fallible region reds
+  them. Span, not count: every position the binding could be relocated to and
+  still be a defect has a `?` below it, hence lies above the LAST belt, so the
+  CoS row sees all of them. (A hoist below the last `?` stays green, correctly
+  — nothing after it can reject.) The dup-zone row REJECTS before any relocated
+  block could run, so it stays green under a relocation; its job is to pin
+  where the fallible region begins, which is what makes "the last belt" a
+  checkable bracket rather than one arbitrary belt.
+  A single-belt fixture binds neither: it stays green when a *different* belt
   moves. `accepted_build_still_prunes_zone_counters_for_removed_zones` is the
   anti-over-fix control. The create half is only observable through
   `ZoneCounterStore::tracked_zone_ids_for_test`, since the operator-facing
   `snapshot()` omits all-zero rows by design.
+
+  Scope note: this is the ZONE-counter store only. The same rejected build
+  still leaves get-or-create residue in the shared `PolicyCounterStore` and
+  `NatCounterStore` — pre-existing, untouched by #6832, tracked as **#6995**.
 
 - **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting (the screen module holds per-zone

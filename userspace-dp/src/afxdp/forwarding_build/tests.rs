@@ -5653,17 +5653,28 @@ fn zone_counter_snapshot_with_zones(zone_ids: &[u16]) -> ConfigSnapshot {
 /// of 200, and the `ZoneCounterSlotMap::build` get-or-create of 300.
 const ZONE_COUNTER_CANDIDATE_ZONES: [u16; 2] = [100, 300];
 
-/// One row per fallible integrity belt reachable in the builder: a snapshot
-/// carrying the candidate zone set plus that belt's defect, and the error it
-/// must raise.
+/// FOUR of the inner builder's ten fallible integrity belts, chosen by
+/// POSITION: a snapshot carrying the candidate zone set plus that belt's
+/// defect, and the error it must raise. Deliberately not one row per belt —
+/// the reason the four are the four is below.
 ///
-/// The SPAN is what matters. #3719 duplicate-zone-id is the builder's FIRST
-/// fallible step and #2410 CoS queue-id its LAST, with #2240 NPTv6 and
-/// #3367/#2505 filter in between — so driving the two live-store assertions
-/// over the whole table binds the ORDERING invariant rather than one belt.
-/// A single-belt fixture does not: a fallible step relocated below the
+/// The SPAN is what matters, not the count. #3719 duplicate-zone-id is the
+/// builder's FIRST fallible step and #2410 CoS queue-id its LAST (nothing
+/// fallible follows it), with #2240 NPTv6 and #3367/#2505 filter in between.
+/// Every position the zone-counter work could be relocated to and still be a
+/// DEFECT is a position with a `?` below it — and every one of those is above
+/// the LAST belt, so the CoS row observes the relocation wherever it lands.
+/// That is the row that binds the ordering invariant. The dup-zone row is what
+/// makes "the last belt" a checkable bracket instead of an arbitrary pick: it
+/// pins where the fallible region begins.
+///
+/// A single-belt fixture binds neither: a fallible step relocated below the
 /// zone-counter work leaves it green (measured — moving the NPTv6 step below
-/// the prune left 4280 of 4281 tests passing).
+/// the prune left 4280 of 4281 tests passing). That second, weaker defect
+/// class — one BELT moved below the binding rather than the binding moved up —
+/// is caught only by that belt's OWN row, so the table covers it for these
+/// four belts and not for the other six. Adding the six would buy only more of
+/// that class; it would not strengthen the ordering bind above.
 fn zone_counter_rejection_rows() -> Vec<(
     &'static str,
     ConfigSnapshot,
@@ -5671,8 +5682,11 @@ fn zone_counter_rejection_rows() -> Vec<(
 )> {
     let mut dup_zone = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
     // #3719: a second zone re-using id 300. The FIRST fallible step in the
-    // builder, so this row is the one that would still be above a relocated
-    // zone-counter block.
+    // builder. Note the polarity: because it rejects before any relocated
+    // zone-counter block could run, this row is the one that STAYS GREEN under
+    // a relocation — the CoS row is what reds. Its job is to pin where the
+    // fallible region begins, so "the last belt" names a bracketed region
+    // rather than one arbitrary belt.
     dup_zone.zones.push(ZoneSnapshot {
         name: "clash".into(),
         id: 300,

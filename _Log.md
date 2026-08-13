@@ -1,3 +1,132 @@
+## 2026-08-13 — #5716 (5/5): three false claims, and the sibling guards the r2 Drop fix skipped
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r3)
+- **Action**: No production behaviour changes this round. Three claim
+  corrections and one coverage sweep, all raised by the hostile review at
+  256416f7f (verdict MERGE-NEEDS-MINOR, zero blocking).
+
+  **(1) "having touched NO live shared state" is false.**
+  `build_fallible_forwarding_state`'s doc comment claimed a rejected build
+  touches no live shared state. It touches two other `Arc`-shared stores
+  before the last three belts can reject: `PolicyCounterStore::rule_hit_counter`
+  GET-OR-CREATES a block per policy rule plus one for the reserved
+  default-policy id (store at `policy.rs:730`, callers at `policy.rs:1858`
+  and `:2158`, reached from `mod.rs`'s `parse_policy_state_with_counters`),
+  and `NatCounterStore::rule_counter` GET-OR-INSERTS one per NAT rule
+  (`nat/mod.rs:261`, callers in `static_nat.rs` and its siblings). Both run
+  ahead of the NPTv6 / filter / CoS `?`s, so a rejected build leaves
+  candidate-only rows in each. The comment is now scoped to the ZONE-counter
+  store, which is what #6832 actually fixed, and names the residue explicitly.
+  Pre-existing, not introduced or fixed here; filed as **#6995** and
+  cross-referenced from the comment and from `docs/userspace-dataplane-gaps.md`.
+
+  **(2) "EVERY fallible belt" is false in four places, and the guard is still
+  sound.** `build_fallible_forwarding_state` has TEN `?` sites (`mod.rs` 288,
+  293, 305, 306, 317, 321, 330, 423, 473, 478). The rejection table drives
+  FOUR (288, 423, 473, 478). The POSITIONAL claims around it are true — 288 is
+  the first `?`, 478 is the last, and the function body runs to 683 with no `?`
+  after — so this is a false claim that does NOT imply a coverage hole, and no
+  belt rows were added. What the four rows actually buy, stated exactly in each
+  of the corrected sites: every position `attach_zone_counters` could be
+  relocated to and still be a DEFECT is a position with a `?` below it, and
+  every such position lies above the LAST belt — so the CoS row observes the
+  relocation wherever it lands. That is the row that binds the ordering. The
+  dup-zone row makes "the last belt" a checkable bracket rather than an
+  arbitrary pick. Six more rows would only widen the second, weaker class (one
+  BELT moved below the binding, caught by that belt's own row and no other).
+  Corrected at `forwarding_build/mod.rs`, `forwarding_build/tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, and in the r2 `_Log.md` entry below,
+  which carried the same sentence.
+
+  **(3) The r2 Drop fix closed one guard and left three siblings standing.**
+  r2 found `ReadRx`'s `read -> release -> read -> drop` shape unbound and bound
+  it, without asking whether `WriteTx`, `WriteFill` or `ReadComplete` had the
+  same hole. They did. Sweep predicate: "a guard shape that exists for one ring
+  guard but not its siblings", over all four guards. One row came back
+  asymmetric, and it is that one — see the grid below. Three new fixtures close
+  it, one per remaining guard, each the same shape as the r2 `ReadRx` one: run
+  the first two batches to the terminal op explicitly, leave the third PARTLY
+  done, let `Drop` finish. That gives `Drop` both halves of its job at once, so
+  a wrong submit/release AND a wrong cancel are each observable.
+
+  Stated precisely, because "the Drop body never ran" would itself be a false
+  absolute: the submit/release half (`if self.written > 0` /
+  `if self.read_count > 0`) never executed at all for those three guards, since
+  every pre-existing fixture commits or releases everything before the guard
+  leaves scope. The cancel half DOES run in
+  `write_tx_two_inserts_append_not_overwrite`,
+  `write_tx_single_insert_writes_base` and their `write_fill` twins — but none
+  of them asserts anything after the guard drops, so it ran unobserved. In the
+  reuse fixtures the reservation is fully consumed, which makes their post-drop
+  `cached_prod == *producer` pair a check on a `Drop` that did nothing.
+
+- **Sweep**: four guards x eight shapes. BOUND cells included deliberately — a
+  sweep reported as failures only cannot be told apart from one that ran out of
+  patience.
+
+  | # | shape | WriteTx | WriteFill | ReadRx | ReadComplete |
+  |---|---|---|---|---|---|
+  | S1 | second op within one reservation appends / reads in order | BOUND | BOUND | BOUND | BOUND |
+  | S2 | op cannot exceed the remaining window | BOUND | BOUND | BOUND | BOUND |
+  | S3 | terminal op advances the base cursor by its own count, per op | BOUND | BOUND | BOUND | BOUND |
+  | S4 | terminal op reaches the shared kernel pointer, per op | BOUND | BOUND | BOUND | BOUND |
+  | S5 | terminal op shrinks the window (`reserved`/`peeked`) | BOUND | BOUND | BOUND | BOUND |
+  | S6 | **Drop finishes work left after an explicit terminal op** | **was UNBOUND** | **was UNBOUND** | BOUND (r2) | **was UNBOUND** |
+  | S7 | **Drop's cancel covers exactly the unused/unread remainder** | **ran, UNOBSERVED** | **ran, UNOBSERVED** | BOUND (r2) | **never ran** |
+  | S8 | `u32` wrap cursor origin | BOUND | BOUND | BOUND | BOUND |
+
+  S6 and S7 are now BOUND in every column. Nothing is left recorded as
+  known-unbound: the sweep found exactly one asymmetric row (S6) plus one row
+  (S7) that was weak in all four columns, and both are closed by the three new
+  fixtures. S5 for the two consumers is bound INDIRECTLY — through the terminal
+  exhaustion check plus the post-drop `cached_cons` equality, not a named
+  assertion on `peeked` — which cells M7/M8 below confirm is sufficient.
+
+- **Mutation matrix.** Eight production lines in `xsk_ffi.rs`, each reverted on
+  its own, in an ISOLATED worktree copy so no mutation could reach the tree
+  under review (checked: the copy did hold a live mutation when an earlier pass
+  was killed mid-cell, and it was restored). Edits are made IN PLACE, never by
+  an mtime-preserving copy, and each cell additionally asserts a
+  `Compiling xpf-userspace-dp` line naming the copy's path — so a stale artifact
+  fails loudly instead of scoring silently. The control is a separate full
+  `cargo test --release` on the final tree, not a cell of this matrix.
+
+  M1-M3 are the comparative proof for the three new fixtures: each reverts the
+  one production line its fixture should hold, and in every case ONLY that
+  fixture reds while every pre-existing `xsk_ffi` test stays green.
+
+  | cell | reverted line | result | assertion |
+  |---|---|---|---|
+  | M1 | `ReadComplete::drop` release half | ONLY `read_complete_drop_releases_a_batch_read_after_an_explicit_release` RED | `left: 4, right: 5` — consumer not at 4+1 |
+  | M2 | `WriteTx::drop` submit half | ONLY `write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit` RED | `left: 4, right: 5` — producer not at 4+1 |
+  | M3 | `WriteFill::drop` submit half | ONLY `write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit` RED | `left: 4, right: 5` — producer not at 4+1 |
+  | M4 | `ReadComplete::drop` cancel half | ONLY `read_complete_drop_releases_a_batch_read_after_an_explicit_release` RED | `cached_cons` off the kernel consumer |
+
+  Every RED above is an ASSERTION failure, not a build break — zero `error[`
+  in any cell log; the only `error:` line is cargo's trailing "test failed".
+
+  M4 is the S7 confirmation for `ReadComplete`, and it lands exactly where the
+  grid predicts: severing the drop-time cancel reds the NEW fixture while
+  `read_complete_read_after_release_does_not_re_reap_released_entries` stays
+  green, because that one reaches drop with nothing left to cancel. Four more
+  confirmatory cells were queued and are NOT part of this entry — `WriteTx` /
+  `WriteFill` cancel halves (S7) and the two `release`-side `peeked` shrinks
+  (S5) — all of them against rows this table already records as BOUND. They
+  would add confirmation, not coverage, and no claim above depends on them.
+
+  One measured flake worth recording, because it would otherwise read as a
+  regression: the first M1 run was full-suite and additionally showed
+  `afxdp::wg::engine::engine_internal_tests::install_session_serializes_with_reconcile_removal`
+  RED at `engine_tests.rs:872` — "reconcile loop must have completed at least
+  one full add/remove cycle". That is a VACUITY guard on a concurrency loop in
+  an untouched subsystem, not the property its name suggests, and it fires under
+  machine load. It passes in the full control run and in the scoped M1 re-run.
+
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `docs/userspace-dataplane-gaps.md`,
+  `_Log.md`
+
 ## 2026-08-13 — #5716 (4/4): a REJECTED build still mutated the live zone-counter store
 
 - **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r2)
@@ -60,7 +189,9 @@
 
 - **Tests**: `rejected_build_does_not_prune_live_zone_counters` and the new
   `rejected_build_does_not_create_zone_blocks_in_the_live_store` are now
-  table-driven over EVERY fallible integrity belt reachable in the builder —
+  table-driven over FOUR of the inner builder's ten fallible integrity belts,
+  chosen by position (this sentence said "EVERY fallible integrity belt
+  reachable in the builder" when written; corrected in the r3 entry above) —
   #3719 duplicate zone id (the first fallible step), #2240 NPTv6, #3367 filter
   tcp-flags, #2410 CoS queue id (the last) — and each row asserts it rejected
   through the belt it names, so a row that starts failing early stops silently

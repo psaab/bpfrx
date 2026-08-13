@@ -221,8 +221,18 @@ pub(super) fn build_forwarding_state_with_counters(
 ///
 /// `rejected_build_does_not_prune_live_zone_counters` /
 /// `rejected_build_does_not_create_zone_blocks_in_the_live_store` in
-/// `forwarding_build/tests.rs` exercise this over EVERY fallible belt reachable
-/// in the builder, so hoisting [`attach_zone_counters`] above the `?` reds them.
+/// `forwarding_build/tests.rs` drive this over FOUR belts, chosen by POSITION,
+/// not over all ten of the inner builder's `?` sites: the first `?` (#3719
+/// duplicate zone id), the last (#2410 CoS queue id — no fallible step follows
+/// it), and #2240 NPTv6 / #3367 filter in between. Span, not count. Every
+/// position a relocated [`attach_zone_counters`] could occupy and still be a
+/// DEFECT is one with a `?` below it, and every such position is above the
+/// last belt — so the last row observes all of them. (A hoist BELOW the last
+/// `?` would stay green, and correctly: nothing after it can reject.) The
+/// first row is what
+/// makes "the last" a checkable bracket rather than an arbitrary pick. Six
+/// more rows would only widen the second, weaker class — a single BELT moved
+/// below the binding, which is caught by that belt's own row and by no other.
 pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,
@@ -268,8 +278,19 @@ fn attach_zone_counters(
 }
 
 /// Every fallible step of the forwarding build. Returns `Err` on any snapshot
-/// integrity violation, having touched NO live shared state — see the caller
-/// for why the per-zone counter binding is deliberately not done here.
+/// integrity violation, having touched no live ZONE-COUNTER state — see the
+/// caller for why the per-zone counter binding is deliberately not done here.
+///
+/// That scope is exact, and it is narrower than "no live shared state". Two
+/// OTHER `Arc`-shared stores are mutated inside this function, above the last
+/// three belts: `PolicyCounterStore::rule_hit_counter` GET-OR-CREATES a block
+/// per policy rule plus one for the reserved default-policy id (store at
+/// `policy.rs`, callers in `parse_policy_state_with_counters` below), and
+/// `NatCounterStore::rule_counter` GET-OR-INSERTS one per NAT rule (the
+/// source / static / destination NAT calls below). Both run ahead of the
+/// NPTv6, filter and CoS `?`s, so a build those belts reject leaves
+/// candidate-only rows behind in each. That residue is pre-existing — neither
+/// introduced nor fixed by #5716/#6832 — and is tracked as #6995.
 fn build_fallible_forwarding_state(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,

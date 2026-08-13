@@ -736,6 +736,257 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
     }
 }
 
+// ── Terminal-op-then-Drop, for the other three guards ────────────
+//
+// #6832 fold r3. The fixture above closed the `read -> release -> read ->
+// drop` shape for `ReadRx` because r2 had found it unbound there. It did not
+// ask whether the three SIBLING guards had the same hole. They did.
+//
+// Precisely, measured on this branch — the two halves of a guard's `Drop` are
+// not equally uncovered, so stating it as "the body never ran" would be false:
+//
+//   * The submit/release half — `if self.written > 0 { submit }` and
+//     `if self.read_count > 0 { release }` — never executed AT ALL for these
+//     three guards. Every pre-existing fixture commits or releases everything
+//     it wrote or read before the guard leaves scope, so each reaches drop
+//     with `written`/`read_count` at 0.
+//   * The cancel half DOES run in `write_tx_two_inserts_append_not_overwrite`
+//     and `write_tx_single_insert_writes_base` (and their `write_fill`
+//     twins), which leave part of the reservation unused. But neither asserts
+//     anything after the guard drops, so it ran unobserved. In the reuse
+//     fixtures the reservation is fully consumed, which makes their post-drop
+//     `cached_prod == *producer` pair a check on a `Drop` that did nothing.
+//
+// The three fixtures below are the same shape as the `ReadRx` one, one per
+// remaining guard: run the first two batches to the terminal op explicitly,
+// leave the third PARTLY done, and let `Drop` finish. That gives the drop both
+// halves of its job at once — a submit/release AND a non-zero cancel — so a
+// drop that does either wrongly is observable.
+//
+// Each is comparative: reverting its production line reds it while the
+// pre-existing tests in this file stay green (see `_Log.md` for the matrix).
+
+#[test]
+fn read_complete_drop_releases_a_batch_read_after_an_explicit_release() {
+    // Twin of `read_rx_drop_releases_a_batch_read_after_an_explicit_release`.
+    // `ReadComplete::Drop` releases `read_count` and cancels the peeked-but-
+    // unread remainder; the sibling reuse fixture releases everything it reads,
+    // so it reaches drop with `read_count == 0` AND `peeked == 0` and the whole
+    // body is skipped. A drop that skipped the release here would leave those
+    // completion entries unreleasable — the kernel never learns the TX frames
+    // were reaped, so the completion ring loses those slots for the life of the
+    // socket.
+    for origin in CURSOR_ORIGINS {
+        let mut dq = DeviceQueue::new_for_test(-1, REUSE_RING_CAPACITY);
+        seed_cons_at(dq.rings.comp_mut(), origin);
+        for j in 0..REUSE_TOTAL {
+            dq.push_comp_for_test(reuse_payload(j));
+        }
+        let consumer = dq.rings.comp().consumer;
+
+        let released_explicitly = REUSE_BATCHES[0] + REUSE_BATCHES[1];
+        let dropped_read = REUSE_BATCHES[2] - 1;
+        assert!(
+            dropped_read > 0 && dropped_read < REUSE_BATCHES[2],
+            "fixture: the final batch must be partly read so drop does both a \
+             release and a cancel"
+        );
+        {
+            let mut r = dq.complete(REUSE_TOTAL);
+            let mut read_so_far = 0u32;
+            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+                for _ in 0..n {
+                    r.read().expect("entry inside the peek window");
+                }
+                r.release();
+                read_so_far += n;
+            }
+            assert_eq!(
+                unsafe { *consumer },
+                origin.wrapping_add(released_explicitly),
+                "origin {origin}: fixture precondition — the two explicit \
+                 releases must already have reached the kernel"
+            );
+            for k in 0..dropped_read {
+                assert_eq!(
+                    r.read(),
+                    Some(reuse_payload(read_so_far + k)),
+                    "origin {origin}: entry {} was not reaped in order after a \
+                     release",
+                    read_so_far + k
+                );
+            }
+            // No second `release()` — `Drop` owns this batch.
+        }
+        assert_eq!(
+            unsafe { *consumer },
+            origin.wrapping_add(released_explicitly + dropped_read),
+            "origin {origin}: the consumer is not at \
+             {released_explicitly}+{dropped_read}. The shape this guards: a \
+             drop that skips the completion entries read after an explicit \
+             release, leaving them unreleasable and leaking their slots"
+        );
+        assert_eq!(
+            dq.rings.comp().cached_cons,
+            unsafe { *consumer },
+            "origin {origin}: cached_cons is not on the kernel consumer. The \
+             shape this guards: a drop-time cancel that does not cover exactly \
+             the peeked-but-unread remainder"
+        );
+    }
+}
+
+#[test]
+fn write_tx_drop_submits_a_batch_inserted_after_an_explicit_commit() {
+    // The producer counterpart. `WriteTx::Drop` submits `written` and cancels
+    // `reserved - written`; every pre-existing fixture commits its whole
+    // reservation, so it drops with `written == 0` and `reserved == 0` and the
+    // body does nothing. A drop that skipped the submit would silently DISCARD
+    // descriptors the caller had already inserted — frames the caller believes
+    // it queued for TX are never handed to the kernel.
+    for origin in CURSOR_ORIGINS {
+        let mut tx = RingTx::new_for_test(-1, REUSE_RING_CAPACITY);
+        seed_prod_at(&mut tx.ring, origin);
+        let producer = tx.ring.producer;
+
+        let committed = REUSE_BATCHES[0] + REUSE_BATCHES[1];
+        let dropped_written = REUSE_BATCHES[2] - 1;
+        assert!(
+            dropped_written > 0 && dropped_written < REUSE_BATCHES[2],
+            "fixture: the final batch must be partly inserted so drop does both \
+             a submit and a cancel"
+        );
+        let base;
+        {
+            let mut w = tx.transmit(REUSE_TOTAL);
+            base = w.base_idx;
+            assert_eq!(base, origin, "reservation must start at the seeded cursor");
+            let mut submitted = 0u32;
+            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+                let first = submitted;
+                assert_eq!(
+                    w.insert((0..n).map(|k| desc(reuse_payload(first + k)))),
+                    n,
+                    "origin {origin}: a {n}-descriptor batch did not fit the \
+                     remaining reservation"
+                );
+                w.commit();
+                submitted += n;
+            }
+            assert_eq!(
+                unsafe { *producer },
+                base.wrapping_add(committed),
+                "origin {origin}: fixture precondition — the two explicit \
+                 commits must already have reached the kernel"
+            );
+            let first = submitted;
+            assert_eq!(
+                w.insert((0..dropped_written).map(|k| desc(reuse_payload(first + k)))),
+                dropped_written,
+                "origin {origin}: the post-commit batch did not fit the \
+                 remaining reservation"
+            );
+            // No second `commit()` — `Drop` owns this batch.
+        }
+        assert_eq!(
+            unsafe { *producer },
+            base.wrapping_add(committed + dropped_written),
+            "origin {origin}: the producer is not at {committed}+\
+             {dropped_written}. The shape this guards: a drop that discards \
+             descriptors inserted after an explicit commit, so frames the \
+             caller queued are never handed to the kernel"
+        );
+        assert_eq!(
+            tx.ring.cached_prod,
+            unsafe { *producer },
+            "origin {origin}: cached_prod is not on the kernel producer. The \
+             shape this guards: a drop-time cancel that does not cover exactly \
+             the unused remainder of the reservation"
+        );
+        // The drop-submitted descriptor landed in its OWN slot, past the ones
+        // the kernel already owns — the same append property the commit path
+        // has, on the path where `Drop` rather than `commit` publishes it.
+        for j in 0..committed + dropped_written {
+            assert_eq!(
+                tx_slot(&tx.ring, base.wrapping_add(j)).addr,
+                reuse_payload(j),
+                "origin {origin}: slot {j} does not hold its own descriptor"
+            );
+        }
+    }
+}
+
+#[test]
+fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
+    // Twin of the `WriteTx` fixture above. A fill-ring drop that skipped the
+    // submit would strand UMEM frames: the caller has handed them to the fill
+    // writer and will not re-post them, but the kernel never sees them, so
+    // those RX buffers are lost for the life of the socket.
+    for origin in CURSOR_ORIGINS {
+        let mut dq = DeviceQueue::new_for_test(-1, REUSE_RING_CAPACITY);
+        seed_prod_at(dq.rings.fill_mut(), origin);
+        let producer = dq.rings.fill().producer;
+
+        let committed = REUSE_BATCHES[0] + REUSE_BATCHES[1];
+        let dropped_written = REUSE_BATCHES[2] - 1;
+        let base;
+        {
+            let mut w = dq.fill(REUSE_TOTAL);
+            base = w.base_idx;
+            assert_eq!(base, origin, "reservation must start at the seeded cursor");
+            let mut submitted = 0u32;
+            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+                let first = submitted;
+                assert_eq!(
+                    w.insert((0..n).map(|k| reuse_payload(first + k))),
+                    n,
+                    "origin {origin}: a {n}-offset batch did not fit the \
+                     remaining reservation"
+                );
+                w.commit();
+                submitted += n;
+            }
+            assert_eq!(
+                unsafe { *producer },
+                base.wrapping_add(committed),
+                "origin {origin}: fixture precondition — the two explicit \
+                 commits must already have reached the kernel"
+            );
+            let first = submitted;
+            assert_eq!(
+                w.insert((0..dropped_written).map(|k| reuse_payload(first + k))),
+                dropped_written,
+                "origin {origin}: the post-commit batch did not fit the \
+                 remaining reservation"
+            );
+            // No second `commit()` — `Drop` owns this batch.
+        }
+        let ring = dq.rings.fill();
+        assert_eq!(
+            unsafe { *producer },
+            base.wrapping_add(committed + dropped_written),
+            "origin {origin}: the producer is not at {committed}+\
+             {dropped_written}. The shape this guards: a drop that discards \
+             fill offsets inserted after an explicit commit, stranding those \
+             UMEM frames for the life of the socket"
+        );
+        assert_eq!(
+            ring.cached_prod,
+            unsafe { *producer },
+            "origin {origin}: cached_prod is not on the kernel producer. The \
+             shape this guards: a drop-time cancel that does not cover exactly \
+             the unused remainder of the reservation"
+        );
+        for j in 0..committed + dropped_written {
+            assert_eq!(
+                fill_slot(ring, base.wrapping_add(j)),
+                reuse_payload(j),
+                "origin {origin}: slot {j} does not hold its own fill offset"
+            );
+        }
+    }
+}
+
 // ── libxdp ring ABI contract (#4976) ─────────────────────────────
 //
 // The authoritative guard is the `const _` block in `xsk_ffi.rs` (fails
