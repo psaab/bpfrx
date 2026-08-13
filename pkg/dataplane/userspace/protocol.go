@@ -271,19 +271,24 @@ type InterfaceSnapshot struct {
 	//
 	// ResolveReth (pkg/config/types.go) collapses a RETH onto its physical
 	// member's netdev, and snapshotLinuxName applies it to the reth base row AND
-	// its units, so `ge-0/0/1`, `reth1` and `reth1.0` are one ifindex — and a
-	// member's own units alias the matching reth unit the same way
-	// (`ge-0/0/1.100` onto `reth1.100`). Junos zones the RETH, never the member,
-	// so the member's rows arrive UNZONED and their "no zone" would otherwise be
-	// counted as a dissenting vote that makes the RETH's own zone ambiguous.
+	// its units, so `ge-0/0/1`, `reth1` and `reth1.0` are one ifindex. Junos
+	// zones the RETH, never the member, so the member's row arrives UNZONED and
+	// its "no zone" would otherwise be counted as a dissenting vote that makes
+	// the RETH's own zone ambiguous.
 	//
-	// Set PER ROW, by rethProjectionNetdevs (interfaces.go), from the netdevs
-	// the RETH's own rows land on. A member unit that resolves somewhere the
-	// RETH has no row is not marked, because it is observing a netdev of its
-	// own. This replaced a carried `redundant_parent` string that the helper had
-	// to interpret: unvalidated operator input, from which no re-derivation of
-	// "is a projection" survives contact with a config that names a parent the
-	// resolver never resolves through.
+	// Set by rethProjectionMembers (interfaces.go), which asks snapshotLinuxName
+	// — the function that CREATES the aliasing — whether the named parent's base
+	// row resolves to this interface's netdev. Set on a member's BASE row only:
+	// validateRethMemberStrict rejects a member that configures its own logical
+	// units, and one that arrives anyway via the tolerant load / peer-sync path
+	// is an independently ADDRESSED L3 interface whose vote must stand.
+	//
+	// This replaced four successive RE-DERIVATIONS of the resolver's answer —
+	// from the raw `redundant_parent` string, from co-resident row names, then
+	// from the set of netdevs the RETH's rows occupy. Each was holed by a config
+	// strict CompileConfig then accepted; the last by a member unit carrying its
+	// own address, which lands exactly where the RETH's unit lands and so passed
+	// the netdev-set test while being a real independent observer.
 	//
 	// Additive: an old Rust helper ignores the field (no deny_unknown_fields)
 	// and keeps the pre-#6722 fail-CLOSED behavior; an old Go binary omits it

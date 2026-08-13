@@ -78171,3 +78171,128 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   Advances #6713 / #6722.
 - **File(s)**: pkg/dataplane/userspace/zone_propagation_6722_test.go,
   userspace-dp/src/afxdp/test_fixtures.rs, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6722 spelling FIVE — stop RE-DERIVING the resolver's answer;
+  reject the incoherent reth memberships instead. Codex returned
+  MERGE-NEEDS-MAJOR on `ad79cd972` with two blocking findings, both reproduced
+  FIRSTHAND here through strict `CompileConfig` + the real
+  `buildInterfaceSnapshots` before any code was written:
+  F1 — an independently addressed member unit is marked a projection.
+  `ge-0/0/1 unit 0 family inet address 10.9.9.1/30` beside `reth1 unit 0 family
+  inet address 10.0.61.1/24` measured `ge-0/0/1.0` on ifindex 24 with
+  `zone=""`, `proj=true`, `addrs=1` — its empty-zone vote suppressed while its
+  connected route `10.9.9.0/30 -> 24` is still installed, so a flow to
+  `10.9.9.2` resolves the RETH's `lan` and is PERMITTED. Fail-OPEN.
+  F1b — the "names can no longer satisfy the predicate" claim is FALSE.
+  `ge-0/0/1.100` (authored VLAN unit, own address) measured
+  `linux=ge-0-0-1.100 ifx=30 proj=true` alongside `reth1.100` on the same
+  ifindex, because `ResolveReth("reth1")` selects `ge-0/0/1` and the authored
+  name therefore resolves onto the RETH's own VLAN netdev.
+  F2 — the redundancy-group clause disagreed with the resolver that creates the
+  alias. Measured: a no-RG `reth1` gave `ResolveReth(reth1)="ge-0/0/1"` while
+  the member came back `proj=false`, so its empty vote held ifindex 24
+  ambiguous and the egress zone stayed at the 0 sentinel.
+  PREMISE CHECKED AND REFUTED before building. The proposal was to emit the
+  projection fact from `ResolveReth` at alias-creation time. `ResolveReth` /
+  `RethToPhysical` know only the alias RELATION (`reth1` -> `ge-0/0/1`) — a
+  fact about the RETH's rows. The ledger needs a fact about the MEMBER's rows,
+  and F1b is the disproof: `ge-0/0/1.100` is entirely INSIDE the alias relation
+  (it lands exactly where `reth1.100` lands, by the resolver's own answer) and
+  must still vote, because it carries its own address. Emitting from the
+  resolver reproduces the current WRONG answer. Took Codex's stated fallback
+  instead: reject the configuration strictly.
+  ROUTE. New `validateRethMemberStrict`
+  (pkg/config/compiler_validate_strict_reth_member.go), wired in
+  runUniformGatesRoutingRibRPM, rejects three incoherent memberships at commit:
+  a member naming ITSELF, a member naming a parent that is not CONFIGURED, and
+  a member carrying its OWN logical units. Junos models a reth as one interface
+  — the rethN node owns units/addresses/zone, the member contributes a port —
+  and all three break that. Downgraded to a warning on the tolerant load /
+  peer-sync paths (`lenientRethMember`, #1960 no-brick).
+  `rethProjectionNetdevs` -> `rethProjectionMembers`, and the netdev-SET
+  reconstruction is gone. What is left is the alias itself, asked of
+  `snapshotLinuxName` — the function that CREATES it: does the named parent's
+  base row resolve to the same netdev as this interface's base row? After the
+  gate a member has exactly ONE row, so the only question remaining is which of
+  a RETH's declared members `RethToPhysical`'s node-affinity scoring picked,
+  which IS the resolver's answer. Stamped on the BASE row only; a member unit
+  arriving via the lenient path keeps voting (fail-CLOSED). The RG clause is
+  DELETED, which is how F2 closes: the predicate now follows the resolver
+  rather than contradicting it.
+  FAIL-ON-REVERT MATRIX, measured, 10 production hunks x 10 cells. Every hunk
+  reverted individually (via Edit, never `git checkout`), each confirmed to
+  still BUILD before the run so no red is a compile break, each restored
+  byte-identical afterwards:
+  M1 drop `out[name]=true`            -> A D E F I
+  M2 drop the netdev comparison       -> C D
+  M3 stamp the unit row from the map  -> F
+  M4 drop the base-row stamp          -> A D E F I
+  M5 drop `parent != name`            -> J
+  M6 drop the gate self clause        -> H
+  M7 drop the parent-exists clause    -> I
+  M8 drop the unit clause             -> F G
+  M9 unwire the gate                  -> F G H I J
+  M10 drop the lenient downgrade      -> F G H I J
+  Baseline all green; no hunk unbound. Cell B (a config declaring no
+  `redundant-parent` at all) is the OVER-REACH GUARD and stayed green under all
+  ten. Cell C reads like a guard but is a BINDING cell — it reds with D under
+  M2 — and the header now says so rather than claiming otherwise.
+  TWO WEAKNESSES THE MATRIX EXPOSED IN MY OWN TESTS, both fixed. (1) Every
+  self-parent sub-case carried units, so the unit clause caught them even with
+  the self clause gone — each proved only that SOME clause fires. Added H1, a
+  self-parent with NO units, which is the only sub-case that genuinely COMPILES
+  when the self clause is dropped. (2) `parent != name` in
+  `rethProjectionMembers` red NOTHING, because the strict gate stops that shape
+  before any snapshot is built; added cell J on the LENIENT path, where the
+  clause actually earns its keep.
+  RED AT THE PR HEAD, verified by reverting production to `ad79cd972` while
+  keeping the new tests — `go build ./...` OK first, so neither red is a
+  compile break. `TestRethMemberWithOwnUnitsIsRejected_6722` reds on BOTH
+  sub-cases with "CompileConfig accepted an incoherent reth membership".
+  `TestGrandfatheredMemberUnitStillVotes_6722` reds at head on its
+  PRECONDITION (no gate exists to warn); its fail-open assertion —
+  "ge-0/0/1.0 RethProjection = true, want false: the unit carries its own
+  address 10.9.9.1/30..." — is the observed red under M3, which reproduces
+  head's stamping behaviour exactly. Stated this way rather than claiming the
+  stronger form.
+  RE-CUT EVERY CELL. The four inherited fixtures could not go vacuous the way
+  earlier ones did (`redundant_parent` is not a Rust field any more, so a stale
+  fixture would not compile), but four cells became UNREPRESENTABLE and were
+  converted from mark assertions into commit REJECTIONS: old B (member units),
+  old E (self-parent), old F (undeclared/dangling parent), old G (member unit
+  off the RETH's netdevs). Each rejection cell also asserts the TOLERANT path
+  still ADMITS with a warning, so the gate cannot brick a grandfathered config.
+  Cells that now bind for a DIFFERENT reason than before: A and D — previously
+  the netdev-SET membership test, now the base-row netdev comparison; the
+  bare-prefix `reth10`/`reth1` case, previously an exact-map-key argument, now
+  simply "reth1 is not configured", with its positive control preserved.
+  Validation: `go build ./...` OK; `go test ./...` rc=0 (whole repo, no
+  failures); `cargo test --release` 4295 passed / 0 failed on three consecutive
+  full runs. One nondeterministic red seen earlier in
+  `shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  ("readers must have validated at least one snapshot (test not vacuous)"): a
+  spawned-thread liveness precondition that starves under CPU contention. Not
+  dismissed as a flake — characterised: it passed 5/5 in isolation and 3/3 in
+  full runs on an IDENTICAL tree, and `git diff origin/master...HEAD --
+  userspace-dp/src/afxdp/types/shared_cos_lease/` is EMPTY, so this PR does not
+  touch that module at all. gofmt clean on every touched Go file. rustfmt NOT
+  run crate-wide: `--check` drift in `forwarding_build/interfaces.rs` and
+  `protocol/snapshot.rs` is PRE-EXISTING (verified against the origin/master
+  copies of both files) and lies outside the hunks touched here.
+  Docs: `docs/userspace-dataplane-architecture.md` rewritten for the
+  five-spelling history, the two replacements, and the now-false "names can no
+  longer satisfy the predicate" claim — which is corrected in place rather than
+  deleted, because a name CAN satisfy it and that is exactly why the answer is
+  taken from the resolution.
+  Advances #6713 / #6722.
+- **File(s)**: pkg/config/compiler_validate_strict_reth_member.go (new),
+  pkg/config/compiler_opts.go,
+  pkg/config/compiler_uniformgates_routing_rib_rpm.go,
+  pkg/config/parser_ast_test.go, pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/protocol/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md

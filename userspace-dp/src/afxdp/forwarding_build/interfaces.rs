@@ -134,11 +134,21 @@ pub(super) fn populate_interfaces(
         // `ResolveReth` (`pkg/config/types.go`) resolves a RETH to its member,
         // and `snapshotLinuxName` (`pkg/dataplane/userspace/interfaces.go`)
         // applies it to the reth base row AND its units, so `ge-0/0/1`,
-        // `reth1` and `reth1.0` are ONE kernel netdev. A member's own units
-        // alias the matching reth unit the same way — a VLAN unit resolves to
-        // `LinuxIfName(ResolveReth(base)).<vlan>`, putting `ge-0/0/1.100` on
-        // `reth1.100`'s netdev — which is why the Go builder marks the member's
-        // unit rows too, not just its base.
+        // `reth1` and `reth1.0` are ONE kernel netdev.
+        //
+        // Only the member's BASE row is ever marked. A reth member is an L2
+        // port: `validateRethMemberStrict`
+        // (`pkg/config/compiler_validate_strict_reth_member.go`) rejects a
+        // member that configures its own logical units, so on the commit path a
+        // member has exactly one row. One that arrives anyway — through the
+        // tolerant load / peer-sync path, where that gate is downgraded to a
+        // warning (#1960) — is an independently ADDRESSED L3 interface: it
+        // installs its own connected route and local address on the shared
+        // ifindex, so its missing zone is a real operator statement and it must
+        // keep voting. Marking it was the measured #6722 fail-open (a flow to
+        // the member unit's own subnet resolved the RETH's zone and was
+        // permitted); leaving it to vote holds the ifindex ambiguous, which
+        // fails CLOSED.
         //
         // Junos configs conventionally zone the RETH rather than the member, so
         // `buildInterfaceZoneMap` usually leaves the member's rows unzoned and
@@ -178,28 +188,36 @@ pub(super) fn populate_interfaces(
         // (`snapshotLinuxName` never calls `ResolveFab`), so it never shares
         // one with its physical parent.
         // `reth_projection` is the DECIDED FACT, not evidence to weigh. The Go
-        // builder (`rethProjectionNetdevs`,
+        // builder (`rethProjectionMembers`,
         // `pkg/dataplane/userspace/interfaces.go`) answers it where the answer
         // is knowable — it holds `ResolveReth` and the whole interface table —
-        // and marks a row only when the parent is a DECLARED
-        // redundant-ethernet interface, is a DIFFERENT interface, and its own
-        // rows land on this row's netdev.
+        // by asking `snapshotLinuxName`, the function that CREATES the
+        // aliasing, whether the named parent's base row resolves to the same
+        // netdev as this interface's.
         //
         // Deciding it there rather than here is what closes the class, and the
-        // class is worth naming. #6722 B1 carried the raw `redundant-parent`
-        // string on the wire and re-derived "is a projection" from row names.
-        // That string is unvalidated operator input: `schema_interfaces.go`
-        // accepts `gigether-options` under ANY interface name, and no compiler
-        // pass requires the named parent to exist, to be a `reth*`, or to
-        // resolve back to the interface naming it (grepping
-        // `compiler_validate_strict*.go` / `*_warn*.go` returns nothing). Three
-        // successive re-derivations were each holed by a config strict
-        // `CompileConfig` accepts — the last by `set interfaces st0
-        // gigether-options redundant-parent st0`, where `st0.0` matched its own
-        // co-resident BASE row (`st0`), exempted itself and flipped
-        // `egress_zone_id` from the fail-closed 0 to `vpnb`. A predicate over
-        // names is a predicate the operator can satisfy by choosing names; the
-        // resolver's own answer is not.
+        // class is worth naming, because FIVE spellings were needed. #6722 B1
+        // carried the raw `redundant-parent` string on the wire and re-derived
+        // "is a projection" from row names; the next three re-derived it from
+        // co-resident rows, then from the SET of netdevs the parent's rows
+        // occupied. Every one was a RECONSTRUCTION of the resolver's answer,
+        // and every one was holed by a config strict `CompileConfig` then
+        // accepted — `set interfaces st0 gigether-options redundant-parent
+        // st0`, where `st0.0` matched its own co-resident BASE row and flipped
+        // `egress_zone_id` from the fail-closed 0 to `vpnb`; then a member unit
+        // carrying its OWN address, which lands exactly where the RETH's unit
+        // lands and so satisfied the netdev-set test while being a genuinely
+        // independent L3 interface.
+        //
+        // Two things replaced the reconstruction. `validateRethMemberStrict`
+        // makes the incoherent memberships unrepresentable at commit — a member
+        // naming ITSELF, a member naming an unconfigured parent, and a member
+        // carrying its own units. What is left is the alias itself, asked of
+        // the aliasing function, so there is no second opinion that can
+        // disagree with `ResolveReth`. Note that a NAME can still satisfy the
+        // predicate — `ge-0/0/1.100` really does resolve onto `reth1.100`'s
+        // netdev — which is precisely why the answer is taken from the
+        // resolution rather than from the shape of the operator's string.
         //
         // The helper-boundary backstop (#2391/#2409/#2706) is not weakened by
         // trusting the field, and the bound is worth stating exactly rather

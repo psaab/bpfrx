@@ -1599,7 +1599,7 @@ pub(super) const WAN_IFINDEX_6722: i32 = 27;
 ///
 /// `projection` is HAND-STAMPED, and that limit is worth naming. These are
 /// ConfigSnapshot literals; the Rust harness cannot reach the Go builder, so
-/// nothing here exercises `rethProjectionNetdevs` — the function that actually
+/// nothing here exercises `rethProjectionMembers` — the function that actually
 /// DECIDES the flag. What these fixtures cover is the consumer: given a row
 /// marked (or not), does the ledger withhold (or count) its vote. Which rows a
 /// real config marks is covered on the other side of the wire, by

@@ -2299,7 +2299,11 @@ func TestInterfacePointToPointAndMTU(t *testing.T) {
 }
 
 func TestInterfaceDescriptionSetSyntax(t *testing.T) {
-	cmds := []string{"set interfaces ge-0/0/0 description \"Uplink to core\"", "set interfaces ge-0/0/0 gigether-options redundant-parent reth0", "set interfaces gr-0/0/0 unit 0 point-to-point", "set interfaces gr-0/0/0 unit 0 description \"Tunnel unit\"", "set interfaces gr-0/0/0 unit 0 family inet mtu 1420", "set interfaces gr-0/0/0 unit 0 family inet address 10.0.0.1/30"}
+	// #6722: `redundant-parent` must name a configured interface
+	// (validateRethMemberStrict), so the reth this port belongs to is declared
+	// here. The subject under test is unchanged — description parsing beside a
+	// gigether-options stanza.
+	cmds := []string{"set interfaces ge-0/0/0 description \"Uplink to core\"", "set interfaces ge-0/0/0 gigether-options redundant-parent reth0", "set interfaces reth0 redundant-ether-options redundancy-group 1", "set interfaces gr-0/0/0 unit 0 point-to-point", "set interfaces gr-0/0/0 unit 0 description \"Tunnel unit\"", "set interfaces gr-0/0/0 unit 0 family inet mtu 1420", "set interfaces gr-0/0/0 unit 0 family inet address 10.0.0.1/30"}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
 		path, err := ParseSetCommand(cmd)

@@ -198,11 +198,10 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			}
 		}
 	}
-	// #6722: which of this interface's rows are a PROJECTION of a RETH's rows
-	// rather than an independent observer of their own netdev. Keyed by
-	// interface name, then by the row's OWN kernel netdev name, so the stamp
-	// below is a lookup and every row is classified by where it actually lands.
-	rethProjection := rethProjectionNetdevs(cfg)
+	// #6722: which interfaces are a PROJECTION of the RETH they belong to —
+	// the ones a RETH's own rows were resolved onto, so member and RETH
+	// describe one netdev rather than two independent observers of it.
+	rethProjection := rethProjectionMembers(cfg)
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
 		names = append(names, name)
@@ -233,7 +232,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			VLANID:          0,
 			LocalFabric:     iface.LocalFabricMember,
 			RedundancyGroup: rg,
-			RethProjection:  rethProjection[name][linuxName],
+			RethProjection:  rethProjection[name],
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
 			MTU:             mtu,
@@ -305,8 +304,8 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				RXQueues:                  rxQueues,
 				VLANID:                    unit.VlanID,
 				LocalFabric:               iface.LocalFabricMember,
-				RedundancyGroup:           rg, // inherit resolved RG (RETH parent or own)
-				RethProjection:            rethProjection[name][linuxUnit],
+				RedundancyGroup:           rg,    // inherit resolved RG (RETH parent or own)
+				RethProjection:            false, // #6722: never on a unit row — see rethProjectionMembers
 				UnitCount:                 0,
 				Tunnel:                    iface.Tunnel != nil || unit.Tunnel != nil,
 				MTU:                       mtu,
@@ -459,69 +458,59 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 	return config.LinuxIfName(ifName)
 }
 
-// rethProjectionNetdevs reports, for each interface declaring a
-// `gigether-options redundant-parent`, the kernel netdev names on which that
-// interface's rows are a PROJECTION of the RETH's own rows rather than an
-// independent observer of a netdev of their own. Keyed interface name → netdev
-// name so buildInterfaceSnapshots can classify each row by where it lands.
+// rethProjectionMembers reports which interfaces are a PROJECTION of the
+// redundant-ethernet interface they name as their `gigether-options
+// redundant-parent` — that is, which ones the RETH's own rows have been
+// resolved ONTO, so that the member's row and the RETH's row describe one
+// kernel netdev rather than two independent observers of it.
 //
-// #6722. snapshotLinuxName resolves a RETH through ResolveReth onto its local
-// physical member's netdev, so `reth1`, `reth1.0` and `ge-0/0/1` are ONE kernel
-// device described by three rows — and a member's own units alias the matching
-// reth unit the same way, since a VLAN unit resolves to
-// LinuxIfName(ResolveReth(base)).<vlan>. Junos zones the RETH rather than the
-// member, so the member's rows arrive unzoned. Counting that "no zone" as a
-// dissenting vote in the Rust agreement ledger
-// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs) holds the ifindex
-// ambiguous, collapses the egress zone to the 0 sentinel, and blackholes every
-// WAN->LAN transit flow on a bondless-RETH cluster.
+// #6722. `snapshotLinuxName` resolves a RETH through `ResolveReth`
+// (pkg/config/types.go) onto its LOCAL member's netdev, so on a bondless
+// cluster `reth1`, `reth1.0` and `ge-0/0/1` are three rows on ONE device.
+// Junos zones the RETH rather than the member, so the member's row arrives
+// unzoned. Counting that "no zone" as a dissenting vote in the Rust agreement
+// ledger (userspace-dp/src/afxdp/forwarding_build/interfaces.rs) holds the
+// ifindex ambiguous, collapses the egress zone to the 0 sentinel, and
+// blackholes every WAN->LAN transit flow on a bondless-RETH cluster.
 //
-// The set is derived from where the PARENT's rows actually land — snapshotLinuxName
-// evaluated on the parent, the same function that creates the aliasing — and
-// never from the shape of the `redundant-parent` string. That string is
-// unvalidated operator input: schema_interfaces.go accepts `gigether-options`
-// under ANY interface name, and no compiler pass requires the named parent to
-// exist, to be a `reth*`, or to differ from the interface naming it. A
-// predicate read off the string is a predicate the operator can satisfy by
-// writing a name; a predicate read off the resolution is not.
+// The predicate is the ALIAS ITSELF, asked of the function that creates it:
+// does the parent's base row resolve to the same netdev as this interface's?
+// Four earlier spellings re-derived that answer downstream — from the shape of
+// the `redundant-parent` string, then from co-resident row names, then from the
+// set of netdevs the parent's rows occupy — and each re-derivation was holed by
+// a config that made it disagree with `ResolveReth`. There is no second opinion
+// to disagree now: `snapshotLinuxName` is the aliasing, and the only question
+// left is which of a RETH's declared members it picked (`RethToPhysical`'s
+// node-affinity scoring), which is exactly what this comparison asks.
 //
-// Three properties of the RELATION, none of them a name shape, make a row a
-// projection:
+// The remaining `parent != name` test is the definition of a parent relation,
+// not a clause excluding a case: nothing is its own redundant parent, and a
+// self-reference makes `ResolveReth` a no-op so the comparison would otherwise
+// be trivially true and silence the interface's own row.
+// `validateRethMemberStrict` (pkg/config/compiler_validate_strict_reth_member.go)
+// rejects that config at commit; this test is what holds the line on the
+// tolerant load / peer-sync path, where that gate is downgraded to a warning
+// (#1960 no-brick).
 //
-//   - The named parent is a DECLARED redundant-ethernet interface — present in
-//     the config with `redundant-ether-options redundancy-group N`. Only a
-//     declared RETH is an authority whose zone the ledger may defer to.
-//   - It is a DIFFERENT interface. Nothing is a projection of itself, and a
-//     self-naming `redundant-parent` (accepted by strict CompileConfig) names
-//     no RETH: its rows observe their own netdev and their "no zone" is a real
-//     operator statement that must keep the ifindex ambiguous.
-//   - The row LANDS on a netdev the parent's own rows occupy. A member unit
-//     resolving somewhere the RETH has no row — a VLAN the RETH does not carry,
-//     or a TunnelNameMap rewrite — is observing a netdev of its own.
-func rethProjectionNetdevs(cfg *config.Config) map[string]map[string]bool {
-	out := make(map[string]map[string]bool)
+// Keyed by interface name because after `validateRethMemberStrict` a member has
+// exactly ONE row: the gate rejects a member carrying its own logical units, so
+// there are no member unit rows to classify. `buildInterfaceSnapshots` stamps
+// this on the BASE row only — a member unit that reaches the builder anyway,
+// through the lenient path, is an independently addressed L3 interface and must
+// keep voting, which leaves its ifindex ambiguous and fail-CLOSED.
+func rethProjectionMembers(cfg *config.Config) map[string]bool {
+	out := make(map[string]bool)
 	for name, iface := range cfg.Interfaces.Interfaces {
 		if iface == nil || iface.RedundantParent == "" || iface.RedundantParent == name {
 			continue
 		}
-		reth := cfg.Interfaces.Interfaces[iface.RedundantParent]
-		if reth == nil || reth.RedundancyGroup <= 0 {
+		parent := cfg.Interfaces.Interfaces[iface.RedundantParent]
+		if parent == nil {
 			continue
 		}
-		netdevs := make(map[string]bool, len(reth.Units)+1)
-		if base := snapshotLinuxName(cfg, iface.RedundantParent, reth, nil); base != "" {
-			netdevs[base] = true
-		}
-		for _, unit := range reth.Units {
-			if unit == nil {
-				continue
-			}
-			if linuxUnit := snapshotLinuxName(cfg, iface.RedundantParent, reth, unit); linuxUnit != "" {
-				netdevs[linuxUnit] = true
-			}
-		}
-		if len(netdevs) > 0 {
-			out[name] = netdevs
+		parentNetdev := snapshotLinuxName(cfg, iface.RedundantParent, parent, nil)
+		if parentNetdev != "" && parentNetdev == snapshotLinuxName(cfg, name, iface, nil) {
+			out[name] = true
 		}
 	}
 	return out

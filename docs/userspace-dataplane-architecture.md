@@ -946,8 +946,8 @@ Scope of the fallback:
   was unaffected throughout (`ifindex_to_zone_id[24]` still carried `lan`); that
   asymmetry is the diagnostic tell.
 
-  So the Go builder marks every row of a RETH physical member that lands on the
-  RETH's netdev (base AND units) with `reth_projection`, and
+  So the Go builder marks a RETH physical member's **base row** with
+  `reth_projection`, and
   `populate_interfaces` exempts a row that carries it **and has no zone of its
   own** from voting. The `zone.is_empty()` half is
   load-bearing: a member the operator EXPLICITLY zoned into a different zone than
@@ -960,39 +960,70 @@ Scope of the fallback:
   with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`).
 - **`reth_projection` is decided in Go, not re-derived in the helper.** The
   wire carries the ANSWER; `populate_interfaces` reads it and computes nothing.
-  That split is the fix, not an implementation detail. The field's predecessor
-  carried the raw `redundant-parent` string, and `redundant-parent` is
-  unvalidated operator input: nothing requires the interface it names to exist,
-  to be a `reth*`, to declare a redundancy-group, or to differ from the
-  interface naming it, and `schema_interfaces.go` accepts `gigether-options`
-  under any interface name. Every re-derivation from that string was therefore a
-  predicate the operator could satisfy by choosing names, and three successive
-  spellings were holed in turn by configs strict `CompileConfig` accepts — the
-  last by `set interfaces st0 gigether-options redundant-parent st0`, where
-  `st0.0` matched its own co-resident BASE row (base and unit-0 are one netdev
-  by the non-VLAN unit-0 collapse), exempted itself, and flipped
-  `egress_zone_id` from the fail-closed `0` to `vpnb` — measured end to end
-  through the real builders as `ledger[42]=Some(32521)`, `egress_zone_id=32521`,
-  `action=Permit`.
+  That split is the fix, not an implementation detail. But deciding it in Go was
+  not sufficient on its own: **four** successive spellings each RE-DERIVED the
+  resolver's answer downstream, and each was holed by a config strict
+  `CompileConfig` then accepted. B1 carried the raw `redundant-parent` string on
+  the wire and re-derived from row names; the next two re-derived from
+  co-resident rows — the last of those holed by `set interfaces st0
+  gigether-options redundant-parent st0`, where `st0.0` matched its own
+  co-resident BASE row (base and unit-0 are one netdev by the non-VLAN unit-0
+  collapse), exempted itself, and flipped `egress_zone_id` from the fail-closed
+  `0` to `vpnb` (measured as `ledger[42]=Some(32521)`, `egress_zone_id=32521`,
+  `action=Permit`). The fourth re-derived from the SET of netdevs the parent's
+  rows occupy, and was holed by a member unit carrying its OWN address:
+  `ge-0/0/1 unit 0 family inet address 10.9.9.1/30` lands exactly where
+  `reth1.0` lands, so it satisfied the netdev-set test — while installing its
+  own connected route `10.9.9.0/30 -> 24` and being a genuinely independent L3
+  interface. Measured, a flow `203.0.113.7 -> 10.9.9.2` resolved
+  `to_zone=lan` and was `Permit`ted where clearing the mark gives `to_zone=0`,
+  `Deny`. **Reconstruction was the defect, not any particular clause.**
 
-  `rethProjectionNetdevs` (`pkg/dataplane/userspace/interfaces.go`) answers it
-  where `ResolveReth` and the whole interface table are in hand. A row is a
-  projection when its `redundant-parent` names a **declared**
-  redundant-ethernet interface (present, `redundancy-group N`), that interface
-  is a **different** one, and the row **lands on a netdev the parent's own rows
-  occupy** — the last computed by evaluating `snapshotLinuxName` on the parent,
-  the same function that creates the aliasing. The Go-side cells are pinned per
-  clause in `pkg/dataplane/userspace/reth_member_projection_6722_test.go`
-  (`TestSelfNamedRedundantParentIsNotAProjection_6722`,
-  `TestUndeclaredParentIsNotAProjection_6722`,
-  `TestMemberUnitOffTheRethsNetdevsIsNotAProjection_6722`).
+  Two things replaced it.
 
-  A `reth*` with no declared `redundancy-group` is accepted by the compiler and
-  is deliberately NOT treated as a RETH here — the same test the adjacent
-  `rethRG` lookup already applies. Its members keep voting, so such an ifindex
-  stays ambiguous and its egress zone stays at the `0` sentinel; declaring the
-  redundancy group is the fix. Every RETH config in this repository declares
-  one.
+  **`validateRethMemberStrict`** (`pkg/config/compiler_validate_strict_reth_member.go`)
+  makes the incoherent memberships UNREPRESENTABLE at commit. Junos models a
+  reth as one interface — the `rethN` node owns the units, addresses and zone,
+  each member contributes a physical port — and three authored shapes break
+  that: a member naming **itself**, a member naming a parent that is **not
+  configured**, and a member carrying its **own logical units** (the fail-open
+  above; Junos rejects unit configuration on a reth child for the same reason).
+  Strict on commit / commit-check; downgraded to a warning on the tolerant
+  load / peer-sync paths (`lenientRethMember`) so a config committed before the
+  gate still boots (#1960).
+
+  **`rethProjectionMembers`** (`pkg/dataplane/userspace/interfaces.go`) is then
+  the alias itself, asked of `snapshotLinuxName` — the function that CREATES it:
+  does the named parent's base row resolve to the same netdev as this
+  interface's base row? After the gate a member has exactly one row, so the only
+  question left is which of a RETH's declared members `RethToPhysical`'s
+  node-affinity scoring picked — and that comparison IS the resolver's answer,
+  with no second opinion to disagree with it. The mark is stamped on the base
+  row only, so a member unit arriving through the lenient path keeps voting and
+  its ifindex stays ambiguous (fail-closed).
+
+  Note that a NAME can still satisfy the predicate — `ge-0/0/1.100` really does
+  resolve onto `reth1.100`'s netdev. That is not a hole; it is why the answer is
+  taken from the resolution rather than from the shape of the operator's string.
+
+  The cells are pinned in
+  `pkg/dataplane/userspace/reth_member_projection_6722_test.go`: the rejections
+  in `TestRethMemberWithOwnUnitsIsRejected_6722`,
+  `TestSelfNamedRedundantParentIsRejected_6722` and
+  `TestUnconfiguredRedundantParentIsRejected_6722` (each also asserting the
+  tolerant path still ADMITS with a warning), the alias comparison in
+  `TestPeerNodeRethMemberIsNotAProjection_6722` and
+  `TestRedundantParentThatDoesNotAliasMarksNothing_6722`, and the lenient-path
+  fail-closed backstop in `TestGrandfatheredMemberUnitStillVotes_6722`.
+
+  A `reth*` with no declared `redundancy-group` is no longer a special case
+  here. `ResolveReth` resolves it onto its member regardless of the redundancy
+  group, so the predicate does too — the earlier `redundancy-group N` clause
+  made the predicate disagree with the resolver that creates the alias, which
+  left such an ifindex at the `0` sentinel while the RETH's row plainly named a
+  zone. Every RETH config in this repository declares a redundancy group; the
+  `rethRG` lookup in the same file still requires one for its own purpose
+  (inheriting the HA flow-cache redundancy group onto member rows).
 
   The field is additive in both directions — `omitempty` on the Go side,
   `#[serde(default)]` on the Rust side, and no `deny_unknown_fields` anywhere in

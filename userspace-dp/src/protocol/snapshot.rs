@@ -71,22 +71,26 @@ pub(crate) struct InterfaceSnapshot {
     ///
     /// `ResolveReth` (`pkg/config/types.go`) collapses a RETH onto its
     /// physical member's netdev, so `ge-0/0/1`, `reth1` and `reth1.0` are ONE
-    /// ifindex, and a member's own units alias the matching reth unit the same
-    /// way. Junos zones the RETH, never the member, so the member's rows
-    /// arrive unzoned; counting that "no zone" as a dissenting vote makes the
+    /// ifindex. Junos zones the RETH, never the member, so the member's row
+    /// arrives unzoned; counting that "no zone" as a dissenting vote makes the
     /// RETH's own zone ambiguous and collapses the egress zone to the 0
     /// sentinel.
     ///
     /// This is a DECIDED FACT, not an input to a decision. The Go builder
-    /// (`rethProjectionNetdevs`, `pkg/dataplane/userspace/interfaces.go`) owns
+    /// (`rethProjectionMembers`, `pkg/dataplane/userspace/interfaces.go`) owns
     /// it because that is where `ResolveReth` and the full interface table
-    /// live: it marks a row only when the parent is a DECLARED
-    /// redundant-ethernet interface, is a DIFFERENT interface, and its own rows
-    /// actually land on this row's netdev. The predecessor of this field
-    /// carried the raw `redundant-parent` string and left the helper to
-    /// re-derive that from row names — unvalidated operator input, and every
-    /// spelling of the re-derivation admitted a config the resolver never
-    /// resolves through.
+    /// live, and it asks `snapshotLinuxName` — the function that CREATES the
+    /// aliasing — whether the named parent's base row resolves to this
+    /// interface's netdev. Set on a member's BASE row only; a member that
+    /// configures its own logical units is rejected at commit
+    /// (`validateRethMemberStrict`), and one arriving via the tolerant
+    /// load / peer-sync path is an independently ADDRESSED L3 interface whose
+    /// vote must stand.
+    ///
+    /// Four earlier spellings RE-DERIVED that answer downstream — from the raw
+    /// `redundant-parent` string, from co-resident row names, then from the set
+    /// of netdevs the RETH's rows occupy — and each was holed by a config
+    /// strict `CompileConfig` then accepted.
     ///
     /// Additive via serde default: absent on snapshots from an old Go binary,
     /// in which case the member votes and the ifindex stays ambiguous — the
