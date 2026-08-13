@@ -145,9 +145,15 @@ fn tcp_v4_ack_frame() -> Vec<u8> {
 /// (`userspace-xdp/src/lib.rs`) does `read_bytes(data, data_end, l3_offset,
 /// ihl)?` before deriving `l4_offset`, so a shim-delivered IPv4 packet ALWAYS
 /// satisfies `frame.len() - l3 >= ihl`, and `ipv4_declared_l3_end` then clamps
-/// the trimmed payload UP to at least `ihl`. Those two facts together mean no
-/// self-consistent, shim-produced IPv4 frame can make either in-place rewriter
-/// take its `l3_payload.len() < ihl` bail — verified firsthand by
+/// the trimmed payload UP to at least `ihl`. Those two facts COMPOSE rather
+/// than corroborate, and the shim leg is the load-bearing one: on exactly the
+/// input it excludes (`frame.len() < l3 + ihl`) `ipv4_declared_l3_end` returns
+/// `None` rather than clamping, and `trim_l3_payload` falls through to a
+/// `meta.pkt_len`-derived length with no `ihl` relation at all. So the clamp
+/// bites only where the shim leg already holds — do not lean on it alone.
+/// Together they mean no self-consistent, shim-produced IPv4 frame can make
+/// either in-place rewriter take its `l3_payload.len() < ihl` bail — verified
+/// firsthand by
 /// `live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304`,
 /// which feeds the SELF-CONSISTENT IHL-15 packet (40 bytes of options, an
 /// honest 80-byte datagram) and watches the rewrite succeed.
@@ -287,6 +293,30 @@ fn cached_entry() -> FlowCacheEntry {
         neighbor_mac_epoch: 0,
         neighbor_shard: crate::afxdp::flow_cache::NEIGHBOR_SHARD_NONE,
     }
+}
+
+/// `cached_entry` with an UNTAGGED egress: same VLAN-80-tagged ingress frame,
+/// but the cached descriptor asks for no tag on the way out.
+///
+/// This is the only lever in this module that changes which `InPlaceL2Rewrite`
+/// variant the rewrite reports. With `tx_vlan_id == INGRESS_VLAN_ID` the
+/// target Ethernet length equals the ingress `l3_offset` (18 == 18) and
+/// `classify_in_place_l2_rewrite` returns `SameLength`, whose arm in
+/// `WorkerTxCounters::record_in_place_l2_rewrite` is empty — so every other
+/// fixture here accounts NOTHING through that call and cannot tell whether it
+/// runs. With `tx_vlan_id == 0` the target is 14, the 802.1Q tag is dropped by
+/// sliding the descriptor 4 bytes forward inside the same UMEM frame, and the
+/// call is `VlanPopDescriptor`.
+///
+/// `decision.resolution.tx_vlan_id` moves with it: the generic rewriter reads
+/// the resolution where the descriptor path reads the descriptor, and this
+/// module has already been bitten once by a fixture whose two halves
+/// disagreed.
+fn untagged_egress_entry() -> FlowCacheEntry {
+    let mut entry = cached_entry();
+    entry.descriptor.tx_vlan_id = 0;
+    entry.decision.resolution.tx_vlan_id = 0;
+    entry
 }
 
 fn tx_pipeline() -> WorkerTxPipeline {
@@ -554,6 +584,21 @@ fn run_stage_with_meta(
     meta: UserspaceDpMeta,
     initial_sample_counter: u64,
 ) -> StageRun {
+    run_stage_with_entry(fixture, frame, meta, cached_entry(), initial_sample_counter)
+}
+
+/// `run_stage_with_meta` with the cached flow-cache entry supplied explicitly,
+/// so a test can vary the CACHED REWRITE DESCRIPTOR rather than the packet.
+/// `live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304` uses it to
+/// hand the same VLAN-tagged frame an UNTAGGED egress, which is the only way
+/// to reach an `InPlaceL2Rewrite` variant other than `SameLength` from here.
+fn run_stage_with_entry(
+    fixture: &LiveCallSiteFixture,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    entry: FlowCacheEntry,
+    initial_sample_counter: u64,
+) -> StageRun {
     let mut area = MmapArea::new(2 * 1024 * 1024).expect("umem mmap");
     let frame_offset: u64 = 4096;
     area.slice_mut(frame_offset as usize, frame.len())
@@ -571,7 +616,7 @@ fn run_stage_with_meta(
     let mut flow_state = WorkerFlowCacheState {
         flow_cache: FlowCache::new(),
     };
-    flow_state.flow_cache.insert(cached_entry());
+    flow_state.flow_cache.insert(entry);
 
     let mut tx_pipeline_state = tx_pipeline();
     let mut tx_counters_state = tx_counters();
@@ -997,12 +1042,26 @@ fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
 /// construction, and visible to anyone racing it.
 ///
 /// COVERAGE GAP, stated plainly rather than papered over. No test in this
-/// module observes that transient window, and none here can do so
+/// module observes that transient window, and none here can observe THE WINDOW
 /// deterministically: the window is a pair of atomic RMWs entirely inside
 /// `stage_flow_cache_hit`, with no production hook a test could synchronise
-/// against, so a racing-producer test would fail only probabilistically —
-/// a flake, not a binding. What IS bound deterministically is the pair of
-/// properties either side of that window:
+/// against, so a racing-producer test would have to catch it open and would
+/// fail only probabilistically — a flake, not a binding.
+///
+/// DETECTING THE MUTATION is strictly weaker than observing the window, and
+/// that IS deterministically available: a `#[cfg(test)]`-gated cumulative
+/// acquisition counter on `BindingLiveState`, bumped at the top of
+/// `try_acquire_pending_tx_admission` (`afxdp/binding_state/tx_inbox.rs`),
+/// reads ONE attempt under reserve-first and ZERO under sample-first for a
+/// non-sampled packet — single-threaded, no race, because it counts the
+/// ATTEMPT rather than catching the window open. Not taken here as a cost
+/// judgement, not an impossibility: `BindingLiveState` is the struct whose
+/// cross-core cacheline behaviour #6114 exists to fix, so a `#[cfg(test)]`
+/// field means the layout under test is not the layout that ships. Recorded in
+/// `docs/userspace-dataplane-gaps.md` so a later round can take it.
+///
+/// What IS bound deterministically is the pair of properties either side of
+/// that window:
 ///   - the reservation the call site takes is externally visible and must be
 ///     handed back, not stranded —
 ///     `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304`;
@@ -1011,12 +1070,20 @@ fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
 ///     for the #6114 ordering invariant, so going through it inherits the
 ///     ordering rather than restating it.
 ///
-/// Limits of the canary itself: it is source text, not a runtime observation,
-/// and it would need updating if the helper is legitimately renamed. It does
-/// NOT catch every reserve-before-sample defect inside the shared helper —
-/// the #6114 tests catch the historical form, where the helper returned early
-/// with the reservation already taken; a rewrite of the helper that reserved
-/// first and then suppressed on a sampler decline would be caught by neither.
+/// Limits of the canary itself, enumerated so the list is not mistaken for
+/// completeness it does not have. It is source text, not a runtime
+/// observation, and it would need updating if the helper is legitimately
+/// renamed. It does NOT catch every reserve-before-sample defect inside the
+/// shared helper — the #6114 tests catch the historical form, where the helper
+/// returned early with the reservation already taken; a rewrite of the helper
+/// that reserved first and then suppressed on a sampler decline would be
+/// caught by neither. And the negative substring check is defeated by
+/// RENAMING at the import — `use ...::admit_mirror_clone_to_live as admit;`
+/// then `admit(...)` calls the reservation directly while the forbidden
+/// spelling never appears in this file. That escape needs a deliberate alias,
+/// not an accidental edit, so it is a bound on what this canary proves rather
+/// than a regression it is expected to catch; a substring canary cannot close
+/// it, only the runtime instrumentation described above can.
 #[test]
 fn live_flow_cache_callsite_delegates_to_the_shared_sampler_6304() {
     let src = include_str!("flow_cache_hit.rs");
@@ -1241,4 +1308,95 @@ fn live_flow_cache_callsite_accounts_debug_forward_and_tx_6304() {
         "#6304: the fallback staging arm accounts one forwarded packet too"
     );
     assert_eq!(run.dbg_tx, 1, "#6304: ...and one TX");
+}
+
+/// #6304 (staging telemetry, second line). The
+/// `record_in_place_l2_rewrite(rewrite_result.l2_rewrite)` call sits two lines
+/// above the debug counters bound just above, on a rationale that applies to
+/// it verbatim — and it was deletable with the WHOLE CRATE green (4283 passed
+/// / 0 failed / 2 ignored plus every integration target, measured), not merely
+/// with the #6304 guards green.
+///
+/// The reason is a fixture property rather than an oversight in the assertions:
+/// every other frame here egresses on the same VLAN it arrived on, so
+/// `eth_len == current_l3 == 18`, the classification is
+/// `InPlaceL2Rewrite::SameLength`, and THAT arm of
+/// `record_in_place_l2_rewrite` is an empty block. The call ran on every
+/// fixture and could not be observed by any of them. Nothing else in the tree
+/// asserted `pending_in_place_vlan_push_desc_packets` or
+/// `_pop_desc_packets` either, so deleting the call cost nothing anywhere.
+///
+/// Handing the same tagged frame an UNTAGGED egress makes the call
+/// load-bearing: the tag is popped by sliding the TX descriptor 4 bytes forward
+/// inside the same UMEM frame, `classify_in_place_l2_rewrite` returns
+/// `VlanPopDescriptor`, and the operator-visible
+/// `pending_in_place_vlan_pop_desc_packets` — drained to `BindingLiveState` on
+/// the per-second debug tick — must move.
+///
+/// The three sibling counters are asserted ZERO as well, so the cell binds the
+/// CLASSIFICATION and not merely "some counter advanced". Measured: rewiring
+/// the `VlanPopDescriptor` arm of `record_in_place_l2_rewrite` to bump the PUSH
+/// counter instead reds this test alone, with the other nine #6304 guards
+/// green. Hardcoding the ARGUMENT to `SameLength` at the call site collapses
+/// onto the deletion mutation — that arm is an empty block, so the pop counter
+/// stays at 0 either way.
+#[test]
+fn live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    // rate = 2 with counter = 1 -> NOT sampled: this cell is about the L2
+    // rewrite accounting, so the mirror block stays out of the way.
+    let run = run_stage_with_entry(
+        &fixture,
+        &frame,
+        test_meta(&frame),
+        untagged_egress_entry(),
+        1,
+    );
+
+    // --- POSITIVE CONTROLS: the in-place arm ran, and it genuinely popped the
+    // tag rather than taking the same-length path with a different label.
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::Consumed),
+        "control: the cached flow must be consumed by the fast path"
+    );
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED — this is \
+         the branch that records the L2 rewrite classification"
+    );
+    let prepared = run
+        .tx_pipeline
+        .pending_tx_prepared
+        .front()
+        .expect("control: the rewritten frame must be queued for TX");
+    assert_eq!(
+        prepared.len as usize,
+        frame.len() - 4,
+        "control: the TRANSMITTED extent is 4 bytes shorter than the ingress \
+         frame — the 802.1Q tag really was popped, so `VlanPopDescriptor` is \
+         the honest classification rather than a relabelled no-op"
+    );
+
+    // --- THE DISCRIMINATOR: the classification reaches the counters.
+    let tx = &run.tx_counters;
+    assert_eq!(
+        tx.pending_in_place_vlan_pop_desc_packets, 1,
+        "#6304: the in-place staging arm must account the descriptor VLAN pop \
+         — this counter is the operator's only view of how the fast path is \
+         rewriting L2, and without this cell the whole \
+         `record_in_place_l2_rewrite` call deletes with the crate green"
+    );
+    assert_eq!(
+        tx.pending_in_place_vlan_push_desc_packets, 0,
+        "#6304: ...as a POP, not a push"
+    );
+    assert_eq!(
+        tx.pending_in_place_vlan_push_no_headroom_packets, 0,
+        "#6304: ...and not the no-headroom memmove variant"
+    );
+    assert_eq!(
+        tx.pending_in_place_l2_memmove_fallback_packets, 0,
+        "#6304: ...and not the unsupported-memmove fallback"
+    );
 }

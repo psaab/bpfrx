@@ -443,6 +443,109 @@
   60 + 8 + 22 + 31 + 1 + 2 in the integration targets. `CARGO_TARGET_DIR` and
   `TMPDIR` private to this lane; no crate-wide `cargo fmt`.
 
+## 2026-08-13 — #6304 fold r3: an impossibility claim I could have disproved, and an adjacent counter with only a no-op arm
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a hostile MERGE-NEEDS-MINOR. The verdict upheld both r2
+  judgements — the F2 reachability claim survived six attacks and the
+  reserve-first labelling stayed defensible — so the round is two real defects
+  and two clause-level corrections, not a rework.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. Again NO production file
+  changed; `flow_cache_hit.rs` and `worker/tx_counters.rs` are byte-identical to
+  the pre-fold head (restored from a saved copy and re-diffed after every
+  mutation).
+
+  M1. **THE REPLACEMENT CLAIM WAS ALSO OVER-BROAD, ONE LEVEL WEAKER.** r2
+     corrected an over-broad "no test could catch this" and wrote
+     `docs/userspace-dataplane-gaps.md`: "No test observes that transient
+     window, and none deterministically can." That absolute is FALSE, and the
+     counter-example is cheap: a `#[cfg(test)]`-gated cumulative acquisition
+     counter on `BindingLiveState`, bumped at the top of
+     `try_acquire_pending_tx_admission` (`binding_state/tx_inbox.rs`), reads ONE
+     attempt under reserve-first and ZERO under sample-first for a non-sampled
+     packet — single-threaded, no race.
+
+     The error is a conflation, and naming it is the point: OBSERVING THE WINDOW
+     does require catching a pair of atomic RMWs open, and that part is
+     genuinely non-deterministic. DETECTING THE MUTATION is strictly weaker and
+     is deterministically available, because a counter observes the ATTEMPT
+     rather than the window. The doc now states both halves separately and NAMES
+     the instrumentation so a later round takes it instead of rediscovering it.
+     The test-file copy was already correctly scoped ("none *here* can") and
+     gets the same pointer so the two agree.
+
+     NOT IMPLEMENTED this round, as a cost judgement stated as one:
+     `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+     exists to fix, so a `#[cfg(test)]` field means the layout under test is not
+     the layout that ships. That is a reason to defer, not a reason to call it
+     impossible — which is exactly the distinction r2 lost.
+
+  M2. **AN ADJACENT PRODUCTION LINE, DELETABLE WITH THE WHOLE CRATE GREEN.**
+     `flow_cache_hit.rs:499` — `tx_counters.record_in_place_l2_rewrite(
+     rewrite_result.l2_rewrite)` — deletes with 4283 passed / 0 failed / 2
+     ignored and every integration target green. Measured here, not inferred;
+     the reported scope was "the 9 #6304 guards", and the true scope is the
+     whole crate.
+
+     The mechanism is worth recording because it generalises. The call RAN on
+     every fixture in the module and was observable to none of them: every frame
+     egressed on the VLAN it arrived on, so `eth_len == current_l3 == 18`, the
+     classification was `InPlaceL2Rewrite::SameLength`, and THAT arm of
+     `record_in_place_l2_rewrite` is an empty block. Nothing else in the tree
+     asserted `pending_in_place_vlan_push_desc_packets` or `_pop_desc_packets`
+     either. **A counter whose only reachable arm is a no-op looks covered and
+     binds nothing** — coverage of the call site is not coverage of the call.
+
+     Bound by `live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304`:
+     `untagged_egress_entry()` hands the same VLAN-80-tagged frame an untagged
+     egress, so `classify_in_place_l2_rewrite(18 -> 14)` returns
+     `VlanPopDescriptor` — the tag is popped by sliding the TX descriptor 4
+     bytes forward inside the same UMEM frame. The harness gained
+     `run_stage_with_entry`, which varies the CACHED DESCRIPTOR rather than the
+     packet; `run_stage_with_meta` is now a thin wrapper over it, so no existing
+     cell changed shape.
+
+     | mutation | result |
+     |---|---|
+     | delete `record_in_place_l2_rewrite(..)` at `flow_cache_hit.rs:499` | new cell RED (`left: 0, right: 1`), 9 pre-existing #6304 guards GREEN |
+     | `VlanPopDescriptor` arm bumps the PUSH counter (`tx_counters.rs:48`) | new cell RED, same 9 GREEN — the cell binds the CLASSIFICATION, not "some counter moved" |
+
+     Both reds are assertion failures, never compile breaks. The positive
+     control is load-bearing in its own right: the cell asserts the transmitted
+     extent is exactly `frame.len() - 4`, so `VlanPopDescriptor` is the honest
+     label for what happened rather than a relabelled same-length rewrite.
+
+  N1. **The F2 argument COMPOSES; it does not corroborate.** Both copies said
+     the shim's `read_bytes(.., ihl)?` guarantees `frame.len() - l3 >= ihl` AND
+     that `ipv4_declared_l3_end` clamps the payload up to `ihl`, as if two
+     independent facts. They are sequential, and only the first is load-bearing:
+     on exactly the input the shim leg excludes (`frame.len() < l3 + ihl`)
+     `ipv4_declared_l3_end` returns `None` rather than clamping
+     (`frame/inspect.rs`), and `trim_l3_payload` falls through to a
+     `meta.pkt_len`-derived length with no `ihl` relation at all
+     (`frame/mod.rs`). The clamp bites only where the shim leg already holds.
+     Both copies now say so, so a future reader cannot lean on the clamp alone.
+
+  N2. **The delegation canary's limits list claimed enumeration it did not
+     have.** The negative substring check `!src.contains(
+     "admit_mirror_clone_to_live(")` is defeated by renaming at the import —
+     `use ...::admit_mirror_clone_to_live as admit;` then `admit(...)`. That
+     needs a deliberate alias rather than an accidental edit, so it bounds what
+     the canary PROVES rather than naming a regression it should catch; it is
+     added to the enumeration at both sites, with the note that only the runtime
+     instrumentation from M1 can close it.
+
+- **Validation**: full `cargo test --release` rc=0 both parallel and
+  `--test-threads=1`: 4284 passed / 0 failed / 2 ignored in the bin target
+  (4283 + the new cell), plus 60 + 8 + 22 + 31 + 1 + 2 in the integration
+  targets. The pre-existing single-threaded flake in
+  `install_session_serializes_with_reconcile_removal` (issue #6989, unrelated to
+  this PR) did not fire this round. `CARGO_TARGET_DIR` and `TMPDIR` private to
+  this lane; no crate-wide `cargo fmt` — the one touched file was checked with
+  `rustfmt --check` alone and carries the same 9 pre-existing deviations as its
+  parent commit, none added.
+
 ## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
 
 - **Timestamp**: 2026-08-12 (fix/5173-shim-queue-mis-steer, PR #6676)

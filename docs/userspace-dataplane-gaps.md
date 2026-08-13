@@ -138,8 +138,14 @@ models exactly that and the metadata it passes is the PRISTINE frame's.
 l3_offset, ihl)?` before deriving `l4_offset`, so a shim-delivered IPv4 packet
 always satisfies `frame.len() - l3 >= ihl`, and `ipv4_declared_l3_end` then
 clamps the trimmed payload UP to at least `ihl`: no self-consistent, shim-
-produced IPv4 frame can take the `l3_payload.len() < ihl` bail at all. That is
-measured, not argued —
+produced IPv4 frame can take the `l3_payload.len() < ihl` bail at all. Those two
+facts COMPOSE rather than corroborate, and the order matters: the shim leg is
+the load-bearing one. `ipv4_declared_l3_end` returns `None` — not a clamp — on
+exactly `frame.len() < l3 + ihl` (`frame/inspect.rs`), the input the shim leg
+excludes, and `trim_l3_payload` then falls through to a `meta.pkt_len`-derived
+length carrying no `ihl` relation at all (`frame/mod.rs`). So the clamp bites
+only where the shim leg already holds; it is not an independent second guard,
+and a reader must not lean on it alone. That is measured, not argued —
 `live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304` feeds
 the SELF-CONSISTENT IHL-15 packet (40 bytes of NOP options, an honest 80-byte
 datagram, metadata derived from it) and the rewrite succeeds. The rollback
@@ -152,6 +158,23 @@ The same module also binds `telemetry.dbg.forward` / `.tx` on BOTH staging arms.
 `run_stage` built the debug counters and dropped them unread, so either
 increment could be deleted with every guard above green — an undercounted
 forward-debug metric on every established-flow cache hit.
+
+Two lines above those, the `record_in_place_l2_rewrite(rewrite_result
+.l2_rewrite)` call was deletable with the WHOLE CRATE green — at the pre-fold
+head, 4283 passed / 0 failed / 2 ignored plus every integration target,
+measured rather than argued — and for a reason worth recording because it
+recurs: the call RAN on every fixture and was observable to none of them. Every frame in the module egressed on the VLAN it arrived on, so
+`eth_len == current_l3 == 18`, the classification was
+`InPlaceL2Rewrite::SameLength`, and that arm of `record_in_place_l2_rewrite` is
+an empty block — while nothing else in the tree asserted
+`pending_in_place_vlan_push_desc_packets` or `_pop_desc_packets` either. A
+counter whose only reachable arm is a no-op looks covered and binds nothing.
+`live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304` closes it by giving
+the same tagged frame an UNTAGGED egress: the tag is popped by sliding the TX
+descriptor 4 bytes forward inside the same UMEM frame, and the cell asserts the
+transmitted extent shrank by exactly 4 (so the label is honest) with the pop
+counter at 1 and its three siblings at 0 (so the CLASSIFICATION is bound, not
+merely "some counter moved").
 
 The fixtures also keep every ifindex DISTINCT — wire VLAN 80 on physical
 ifindex 6 resolving to logical unit 20080, and mirror output unit 200 resolving
@@ -186,18 +209,40 @@ one call is invisible to that call by construction and visible to anyone racing
 it; "no state differs" was established by walking one invocation to completion,
 which cannot decide the concurrent case.
 
-No test observes that transient window, and none deterministically can: it is a
-pair of atomic RMWs entirely inside `stage_flow_cache_hit`, with no production
-hook to synchronise against, so a racing-producer test would fail only
-probabilistically. That gap is recorded rather than papered over. What IS bound
-either side of it:
+No test observes that transient window, and none can observe THE WINDOW
+deterministically: it is a pair of atomic RMWs entirely inside
+`stage_flow_cache_hit`, with no production hook to synchronise against, so a
+racing-producer test would have to catch the window open and would fail only
+probabilistically.
+
+DETECTING THE MUTATION is a strictly weaker requirement than observing the
+window, and that IS deterministically available — an earlier revision of this
+note said "none deterministically can" without the distinction, which is false
+and is recorded here so the option is taken rather than rediscovered. A
+`#[cfg(test)]`-gated cumulative acquisition counter (or high-water gauge) on
+`BindingLiveState`, bumped at the top of `try_acquire_pending_tx_admission`
+(`afxdp/binding_state/tx_inbox.rs`), makes a NOT-SAMPLED packet read ONE
+acquisition attempt under reserve-first and ZERO under sample-first:
+single-threaded, no race, no flake, no release cost, because it counts the
+ATTEMPT rather than catching the window open. It is deliberately not taken in
+this round — `BindingLiveState` is the very struct whose cross-core cacheline
+behaviour #6114 exists to fix, so a `#[cfg(test)]` field means the layout under
+test is no longer the layout that ships, and the mutation it would catch is
+already pinned structurally by the delegation canary below. That is a cost
+judgement, not an impossibility. What IS bound either side of the window:
 
 - DELEGATION — a source canary asserts the call site reaches the queue through
   `sample_then_admit_mirror_clone` and never calls `admit_mirror_clone_to_live`
   directly, so the ordering is inherited from the helper the #6114 tests already
   bind. (Those tests catch the historical early-return form inside the helper;
   a helper rewritten to reserve first and then suppress on a sampler decline
-  would be caught by neither, which is why the canary pins the wiring.)
+  would be caught by neither, which is why the canary pins the wiring.) Its
+  limits are enumerated at the test, and the enumeration includes the one a
+  substring check can never close: `use ...::admit_mirror_clone_to_live as
+  admit;` calls the reservation directly while the forbidden spelling never
+  appears in the file. That takes a deliberate alias rather than an accidental
+  edit, so it bounds what the canary PROVES rather than naming a regression it
+  is expected to catch.
 - SHARED-CAPACITY ACCOUNTING —
   `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304` drives
   the target at a soft cap of exactly one slot, so an interleaving producer is
