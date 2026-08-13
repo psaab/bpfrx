@@ -24,20 +24,17 @@ import (
 // (config.LoginClass.MappedPermissions); without this resolution a
 // custom-class user would be locked out of every command at runtime even
 // though the config committed cleanly.
+//
+// The evaluation itself lives in config.ResolveClassPermissions (#5561) so the
+// CLI and the REST control surface — which now enforces the same classes
+// server-side — cannot drift into disagreeing about what a class may do. This
+// method remains as the CLI's store-bound adapter.
 func (c *CLI) resolveClassPerms(class string) ([]config.LoginClassPermission, bool) {
-	if perms, ok := config.LoginClassPermissions[class]; ok {
-		return perms, true
-	}
+	var cfg *config.Config
 	if c.store != nil {
-		if cfg := c.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
-			for _, lc := range cfg.System.Login.Classes {
-				if lc != nil && lc.Name == class {
-					return lc.MappedPermissions, true
-				}
-			}
-		}
+		cfg = c.store.ActiveConfig()
 	}
-	return nil, false
+	return config.ResolveClassPermissions(cfg, class)
 }
 
 func (c *CLI) checkPermission(parts []string) error {
