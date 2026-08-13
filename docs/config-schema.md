@@ -367,17 +367,32 @@ strict SNAT gate to a warning and fails the translation CLOSED). SNAT silently
 degraded on the node that just took over. Unlike the #5631/#5878 unit-alias gate
 — a pure-AST union that can be computed pre-expansion — source-NAT
 representability needs the fully COMPILED per-node view (pools resolved), so the
-fix RE-COMPILES rather than unions: `ValidatePeerEffectiveSourceNATStrict(tree,
-localNodeID)` (`compiler_peer_effective_snat.go`), wired into
+fix RE-COMPILES rather than unions: `ValidatePeerEffectiveStrict(tree,
+localNodeID)` (`compiler_peer_effective.go`), wired into
 `configstore.compileTreeStrict` after the local compile + cross-checks, compiles
 the PEER node with `CompileConfigForNodeLenient(peerID)` — the exact transform
-the standby applies — and re-runs the strict SOURCE-NAT validators against that
+the standby applies — and re-runs the registered strict SUBJECTS against that
 peer-effective `*Config`. A peer-only source-NAT error is now rejected at the
 origin commit, naming the peer node and the offending pool, so BOTH
 node-effective source-NAT outputs are proven representable before promotion.
-Non-source-NAT gate errors on the peer view are out of scope (downgraded to
-warnings by the lenient compile); a peer view that will not compile at all is
-left to the peer's own load path (no false-reject of the origin commit).
+A peer view that will not compile at all is left to the peer's own load path (no
+false-reject of the origin commit).
+
+**Subjects, not one gate (#4785).** The peer view is a FULL compile, so it is
+built ONCE and every registered subject runs against it; a second standalone
+entry point would compile it again on every cluster commit. The registry
+(`peerEffectiveStrictSubjects`) currently holds the source-NAT subject
+(`validateSourceNATStrictView`, #5876) and the IPIP tunnel subject
+(`validateIpipTunnelStrictView`, #4785) — the latter because the strict IPIP
+rejection has the identical bypass: a peer-only `ip-*` interface commits green
+on the origin, the RAW group tree is what synchronises, and the standby
+lenient-loads a tunnel the dataplane drops in both directions. Each subject
+reuses the LOCAL strict validators verbatim, so the peer gate and the local
+commit path cannot drift, and each carries its own operator-facing framing
+naming the peer node. A strict gate whose verdict is node-INDEPENDENT gains
+nothing from registration. Gate errors on the peer view for concerns NOT
+registered here remain out of scope (downgraded to warnings by the lenient
+compile).
 Standalone (`nodeID < 0`) has no peer and is a no-op — zero behavior change off a
 cluster. Covered by `pkg/config/compiler_peer_effective_snat_5876_test.go`
 (peer-only reversed-range / per-node address / dangling-pool-reference vectors,
@@ -918,6 +933,558 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+**Widening a multi-value READ requires widening its VALIDATOR in the same
+change (#6659).** Adopting the accumulating reader at a site changes what a
+malformed value DOES. Before, a bad value in slot 2 was discarded at compile and
+could never reach the dataplane; after, it materialises in the typed config and
+the runtime installer is the first thing that sees it. `security nat proxy-arp
+address` is the worked example: `address [ 192.0.2.1 bogus ]` used to compile to
+one entry, and with the widened read it compiles to
+`["192.0.2.1/32", "bogus/32"]`, which `pkg/dataplane/proxyarp.go` parses with
+`netip.ParsePrefix`, logs a bounded warning about, and SKIPS — a silently-inert
+address that answers no ARP/ND. `validateProxyARPAddressesStrict`
+(`compiler_validate_strict_nat.go`, wired in
+`compiler_uniformgates_firewall_nat2.go`) now checks EVERY value with the
+installer's own parse: strict rejects, tolerant warns (#1960 no-brick).
+
+The mirror-image rule applies to a validator that already exists: widen it
+per-value only where the OPERAND is the value being widened. The static-NAT
+`match destination-address` host-route and `/0` checks moved to a per-address
+block-pair classification, but the `then static-nat prefix` checks and the #3202
+port check kept the SCALAR pair, because only ONE value is ever lowered
+(`ExternalIP: rule.Match`, `pkg/dataplane/userspace/nat_static.go`). That value
+is what `nodeVal` selected from the LAST authored `match destination-address`
+statement — within a bracketed list, that statement's first value — so it is
+**not** in general `MatchAddresses[0]`: author a bracket followed by a repeated
+sibling and `MatchAddresses[0]`, `MatchAddresses[len-1]` and `rule.Match` are
+three different prefixes. Reading the scalar is therefore the only way to name
+the prefix that actually installs — an
+"any authored match address pairs with the target" flag would SUPPRESS a true
+complaint about the pair that actually installs. For the same reason the
+match-side widening buys DIAGNOSTIC completeness, not a dataplane backstop: the
+tail values never reach the Rust parser at all.
+
+**A one-sided read is a GATE ESCAPE, not a value-drop, wherever the leaf's only
+validator lives in the compiler loop (#6673).** The discriminator is mechanical,
+not a judgement call: a leaf declaring a schema `validator` gets dual-shape
+checking for free, because `validateMultiValueLeaf` (`schema_walk.go`) walks
+`Keys[1:]` AND every child's `Keys[0]`. A leaf whose only check is an inline
+`if` inside the compiler's own read loop is checked exactly where that loop
+looks — so the shape the loop does not read commits CLEAN, while the identical
+token authored in the shape it does read is REJECTED. Three deferred sites were
+classified through `configstore.CheckText`, each paired with a single-value
+control so an ACCEPT only counts beside a REJECT of the same token:
+
+| Leaf | Shape that ESCAPES | Same token REJECTED as | Tracked |
+|---|---|---|---|
+| CoS `code-points` | hierarchical BLOCK (`{ totally-bogus; }`) | bracket `[ totally-bogus ]` — *"is not a valid DSCP alias or 0..63 value"* | #6697 |
+| `system archival archive-sites` | bracket `[ "scp://a/b" "-oProxyCommand=id" ]` | single value AND block — *"must not begin with '-'"* (#4589 A7 F-02, CWE-88) | #6692 |
+| `bridge-domains vlan-id-list` | BOTH bracket and block | single value — *"out of range (1-4094)"* / *"invalid vlan-id-list value"* | #6687 |
+
+Note the first two escape in OPPOSITE directions — `collectCoSDSCPCodePoints`
+reads `child.Keys[1:]` plus the inline tail and never `child.Children`, while
+the archive-sites loop reads children and only slot 1 of the tail. "Which shape
+escapes" is a property of the individual reader; do not generalise from one.
+
+**And an escape can become live when someone else fixes the value-drop.** The
+archive-sites escape is inert TODAY only because the value is also dropped. A
+follow-up that widens that read without widening the leading-dash check in the
+same change ships a live CWE-88 argument injection; the warning is stated at the
+read site itself in `compiler_system.go`, not only here.
+
+**An EMPTY authored value is a value, and whether to keep it depends on whether
+the leaf SELECTS or SETS (#6673).** `firewallMatchValues` skips blank tokens,
+which is right where every value it returns is installed — but a leaf that reads
+one value into a scalar that installs, plus a list that only validators consume,
+must keep them. `nodeVal` SELECTS a blank token, so filtering it out of the list
+lets the scalar hold a value the list does not contain, and every validator and
+diagnostic reading the list then describes a rule that is not the one in effect.
+Four categories, and the non-uniformity is deliberate:
+
+| Category | Leaves | Reader | Empty value |
+|---|---|---|---|
+| SELECTION (scalar installs, list validates) | `routing-options forwarding-table export`, `security nat static … match destination-address` | `multiLeafAuthoredValues` (`ast.go`) | KEPT |
+| SET (every value installs) | `security flow traceoptions flag`, `security nat proxy-arp … address` | `firewallMatchValues` / `proxyARPAddressValues` | SKIPPED |
+| VALIDATED LIST (a downstream checker rejects a malformed entry) | `event-options … attributes-match` | `eventAttributesMatchExprs` | KEPT |
+| REPORTED LIST (nothing rejects it; the list IS the compiled policy) | `event-options … then change-configuration commands` | `eventChangeConfigCommands` | KEPT |
+
+The last two rows look like one category and are not. `attributes-match` really
+is validated — `ValidateEventAttributesMatchStrict` hard-rejects a `""` expression at
+strict commit. `commands` is not: `eventengine.classifyPlan` trims and SKIPS an
+empty command, so an empty entry never reaches a checker and the remediation
+batch is unaffected by it. Its entry is kept because the compiled list is
+observable in its own right (below), not because anything gates on it.
+
+**SIX leaf families, SEVEN read sites — the category table above has FOUR rows
+and is not the inventory.** The four rows classify EMPTY-VALUE semantics, and
+its `Reader` column names four reader mechanisms because two of them serve two
+leaves each. Counting rows (or readers) undercounts what this change had to
+widen. The inventory is:
+
+| # | Leaf family | Read site (pkg/config) | Reader | Both sides? |
+|---|---|---|---|---|
+| 1 | `routing-options forwarding-table export` | `compiler_routing.go` `compileRoutingOptions` | `multiLeafAuthoredValues` | yes |
+| 2 | `security nat static … rule … match destination-address` | `compiler_nat_static.go` static-rule loop | `multiLeafAuthoredValues` | yes |
+| 3 | `security flow traceoptions flag` — COMPILE | `compiler_security_flow.go` `compileFlow` | `firewallMatchValues` | yes |
+| 4 | `security flow traceoptions flag` — COMMIT GATE | `compiler_security_flow.go` `validateFlowTraceFlagsAndFiltersAST` | `firewallMatchValues` | yes |
+| 5 | `security nat proxy-arp … address` | `compiler_nat_source.go` `compileNAT` | `proxyARPAddressValues` | yes |
+| 6 | `event-options … attributes-match` | `compiler_services.go` `eventAttributesMatchExprs` | `eventMultiWordLeafValues` (tail + each child) | yes |
+| 7 | `event-options … then change-configuration commands` | `compiler_services.go` `eventChangeConfigCommands` | `eventMultiWordLeafValues` (tail + each child) | yes |
+
+Family 3 has TWO read sites, and that is the whole reason the count differs from
+the family count: the `flag` leaf is read once by the compiler and once by the
+#3422 commit gate, and widening only one of them would leave a validation
+fail-open where the gate and the compiler disagree about which values exist.
+When auditing a widening, count READ SITES, not leaves — and not table rows.
+
+**What this change does NOT cover, and where it is tracked.** These are
+multi-value leaves whose readers are still one-sided; each is filed rather than
+bundled, because each needs its own value-domain gate widened in the same change
+(see the GATE ESCAPE table above):
+
+| Leaf | Still one-sided | Tracked |
+|---|---|---|
+| CoS DSCP / IEEE classifier `code-points` | reads tail, never `Children` | #6697 |
+| `system archival archive-sites` (+ four sibling system leaves) | reads `Children` and only slot 1 of the tail | #6692 |
+| `bridge-domains vlan-id-list` | validated at slot 0 only | #6687 |
+| nested-bracket tails, proxy-ARP after a range, repeated `commands` leaves | assorted value drops | #6714 |
+
+`multiLeafAuthoredValues` exists to make one invariant TOTAL:
+`multiLeafAuthoredValues(n)[0] == nodeVal(n)` for every node shape — including a
+node carrying no value slot at all (`export [ ];`, whose brackets the lexer
+strips, leaving `Keys=["export"]`), for which it returns one empty value because
+that is what `nodeVal` selects. Consumers therefore MUST skip empty entries when
+validating a value and MUST count only non-empty entries when enforcing
+cardinality (`nonEmptyValues`) — an empty slot is a selection, not a second
+policy or prefix, so counting it would invent a rejection. For the same reason a
+cardinality gate must also count only DISTINCT entries (`dedupeValuesBy`): a
+repeated value is one value, and rejecting it invents a rejection too. See
+"A cardinality gate counts DISTINCT values" below for how each leaf picks its
+identity.
+
+### A widened read must not PROMOTE a token the old reader discarded (#6673)
+
+Widening a one-sided reader has a failure mode symmetric to the one it fixes.
+The old reader ignored one side of the AST; where the ignored side held garbage,
+ignoring it was LOAD-BEARING. Reading it now materialises that garbage into the
+compiled config, and a downstream consumer that refuses it converts a working
+configuration into an inert one — with commit still succeeding on both trees, so
+no gate reports anything.
+
+**Where this can happen is decidable, not a matter of taste.** `nodeVal` reads
+`Keys[1]` when present and falls back to `Children[0].Name()`, so every leaf
+that used it ALREADY preferred the node's own tail; widening such a leaf can
+only add values from slots the old reader never reached. The two `event-options`
+arms are the exception in the #6659 set: they read `Children` and NOTHING else,
+so for them the tail is exactly the discarded side. Both PROMOTION regressions
+landed there.
+
+That is a statement about promotion only, and an earlier revision of this
+section over-read it into "both regressions landed there, and only there" —
+which was wrong, and wrong in the direction that stops the next reader looking.
+Promotion is one of the two ways a widened reader misreads a node. The other is
+the TOKEN BOUNDARY below, and it bites in a place this section originally did
+not consider: not the tail, but a CHILD's Keys.
+
+The concrete shape is a node carrying BOTH a tail and children —
+`<leaf> <identifier> { <value>; }`, which the parser renders as
+`Keys=["<leaf>","<identifier>"]` with one child:
+
+```
+attributes-match bogus { "e.test-owner matches ^alice$"; }
+then { change-configuration { commands bogus { "set system host-name foo"; } } }
+```
+
+Master discarded `bogus` in both. Promoting it made the first a HARD COMMIT
+REJECTION (`ValidateEventAttributesMatchStrict` sees an expression with no
+`matches` separator) and the second an INERT REMEDIATION
+(`eventengine.classifyPlan` matches neither the `set ` nor the `delete ` prefix
+and rejects the WHOLE batch, so `HandleEvent` discards it). Hence the rule both
+readers now follow: **CHILDREN WIN — when the node has children they are the
+whole value list and the node's own tail is ignored, verbatim master behaviour;
+the tail is read only when there are no children, which is the shape master
+compiled nothing from.**
+
+#### The token boundary is a property of the GROUP, not of the tail (#6673)
+
+When a leaf's value is itself a MULTI-WORD string, "how many values does this
+token group hold" cannot be answered by counting tokens. Both `event-options`
+arms are like this — a command carries its `set `/`delete ` prefix, an
+expression carries `" matches "` — and both spellings are legal:
+
+| Spelling | tokens | Meaning |
+|---|---|---|
+| `attributes-match e.owner matches X;` | `["e.owner","matches","X"]` | ONE expression the lexer split |
+| `attributes-match [ "e.a matches X" "e.b matches Y" ];` | `["e.a matches X","e.b matches Y"]` | TWO whole expressions |
+
+**Apply the rule to every group — the tail AND each child's Keys.** Which of the
+two a bracketed list lands in is decided by WHICH PARSER RAN, not by what the
+operator wrote:
+
+| | `commands [ "set a b" "delete c" ]` becomes |
+|---|---|
+| `NewParser` (hierarchical / `load merge`) | `Keys=["commands","set a b","delete c"]`, no children |
+| `ParseSetCommand` + `SetPath` (flat set / `load set` / CLI) | `Keys=["commands"]` with ONE child `Keys=["set a b","delete c"]` |
+
+A rule applied to the tail alone therefore fixes one operator's spelling and
+leaves the other's fusing. That was the #6673 defect: the branch split the tail
+and joined the children, so the hierarchical bracket compiled correctly while
+the identical flat-set bracket compiled to one fused string. For `commands` that
+string still begins with `set `, so `classifyPlan` ACCEPTS it and the
+remediation applies a path nobody wrote — strictly worse than the pre-#6659
+reader, which applied the first command and dropped the rest. For
+`attributes-match` it produced
+`e.test-owner matches ^alice$ e.test-name matches ^wan$`, which
+`ParseEventAttributesMatch` splits at the FIRST separator and accepts — the
+remainder compiles as a valid regex — so the policy committed and then never
+matched anything.
+
+Note that neither leaf declares `multi: true`, and that is what makes the two
+shapes diverge (a `multi` leaf absorbs a bracket onto its own tail under
+`SetPath`). **Declaring them `multi` is not the fix**, for three reasons
+measured firsthand and pinned by
+`TestEventMultiValueLeaf6673TokenBoundaryBothParsers`: it routes an UNQUOTED
+value onto the tail where a per-token read shatters it; it turns repeated
+flat-set statements into sibling nodes that `ccNode.FindChild` (singular) drops
+after the first; and it cannot repair an ALREADY-PERSISTED config, because the
+configstore deserializes Nodes from JSON and `SetPath` never runs. Fix the
+boundary in the reader, where both parser shapes and both storage paths meet.
+
+**The discriminator is the FIRST token, not any token.** A first token that was
+QUOTED means every token in the group is a whole value. Testing "any token"
+instead breaks the legitimate mixture `commands set system host-name "foo bar"`,
+a quoted VALUE inside an otherwise bare statement, shattering one command into
+four. Testing the first token also takes the fail-CLOSED side of the opposite
+mixture: `[ "set a b" bogus ]` splits, so `bogus` reaches `classifyPlan`'s prefix
+check alone and rejects the whole batch, rather than being fused onto a valid
+command and applied.
+
+**"Was it quoted" is read from the AST, never inferred from the token text.**
+The first cut of this rule asked whether the first token CONTAINED A SPACE or
+was EMPTY, reasoning that the lexer never leaves a space inside a bare word.
+That reasoning is sound but one-directional: every space-bearing token was
+quoted, while a quoted token need NOT bear a space. A quoted one-word first
+member — `commands [ "set" "system host-name pwned" ]` — carries neither marker,
+so it read as bare and the list JOINED into `set system host-name pwned`: a
+syntactically perfect command that passes `classifyPlan`'s `set ` prefix check
+and is APPLIED. The authoring the operator wrote is a bare `set` member, which
+is precisely what the fail-closed path exists to reject. No refinement of a text
+test can separate the two — the tokens are byte-identical — so the bit is
+carried STRUCTURALLY instead:
+
+| Layer | Carries the bit |
+|---|---|
+| `Node.KeysQuoted []bool` (`ast.go`) | per-key provenance; `nil` when nothing is quoted, so the persisted JSON is byte-identical for the majority of nodes |
+| `Parser.parseKeys` → `parseStatement` (`parser.go`) | hierarchical spelling; `parseKeys` already returned the token KINDS for the `inactive:` marker (#4348) |
+| `ParseSetVerbQuoted` → `ConfigTree.SetPathQuoted` (`parser.go`, `ast_edit.go`) | flat-set spelling; `Store.SetFromInputAs` / `applyEditLine` call these, so CLI, gRPC and REST all carry it |
+| `keyNeedsAuthoredQuote` (`ast.go`) | re-emits the authored quote on a NON-TERMINAL key so a serialize/re-parse cycle (HA config sync, `display set` replay, load merge, archive) does not launder it away |
+
+Read it with `Node.KeyQuoted(i)`; ask `Node.KeysHaveQuoteProvenance()` before
+treating a `false` as "this key was bare". A node with NO provenance — compiler
+synthesis, or a config DB written before #6673 — falls back to the old text rule
+rather than being assumed all-bare, because assuming all-bare is a false claim in
+the fail-OPEN direction and assuming all-quoted would split
+`commands set system host-name "foo bar"` and break a working remediation across
+an upgrade. The fallback is not a second guess: for a group that genuinely has no
+quoted token the two rules AGREE, since a bare word can be neither empty nor
+space-bearing.
+
+Serialization is deliberately NOT "preserve every authored quote", which would
+render `description foo` as `description "foo"` in every `show configuration`.
+It is as wide as the ambiguity — but **the terminal test differs between the two
+renderers, and conflating them was a fail-open** (#6673 r11).
+
+| Renderer | What "terminal" means | Why |
+|---|---|---|
+| hierarchical (`QuotedKeyPath`) | last key OF THE NODE | a node's last key is followed by `{`, so it stays a container key on re-parse and its quoting decides nothing |
+| display-set (`joinQuotedKeysProv`) | last key OF THE EMITTED LINE | flattening concatenates a container's keys with its children's, so a container's last key lands at the FRONT of the child's group — the grouping-deciding token |
+
+Applying the per-node rule to the flat path dropped exactly that quote.
+Measured: `commands "set" { "system host-name pwned"; }` compiles, through
+`load override`, to a batch `classifyPlan` DECLINES; its display-set dump emitted
+the terminal `"set"` bare, and replaying that dump through `load set` compiled an
+applicable `set system host-name pwned`. Same authored bytes, reject became
+apply. `origin/master` does not have this — its reader compiles `["set"]` on the
+replay side, which is declined too.
+
+What is assertable, and what is not: display-set cannot express the difference
+between a container's identifier slot (`commands "x" { "y"; }`) and a two-member
+list (`commands [ "x" "y" ]`) — both flatten to one line, and that ambiguity is
+pre-existing. So the two ingresses are NOT required to compile identical command
+lists. They are required never to disagree toward EXECUTION: a batch one ingress
+declines must not be applied by the other.
+`TestIngressesDoNotDisagreeTowardExecution_6673` (pkg/configstore) binds that
+through the real `LoadOverride` and `LoadSet`;
+`TestEventCommands6673QuoteProvenanceSurvivesTextRoundTrip` binds the
+round-trip fidelity of the leaf shapes.
+
+Residual, unchanged: an ALL-BARE group (`[ seta setb ]`) still joins. Provenance
+cannot help — both authorings have zero quoted tokens and the AST does not record
+the brackets — and every well-formed value of both leaves contains a space, so
+such a group is malformed either way and reaches the same gate under both rules.
+Second residual: a tree that arrives with no provenance is still decided by the
+text rule, so a policy authored before #6673 and still sitting in the persisted
+config DB keeps the fused read until the operator re-authors the line (any `set`
+through the CLI/gRPC/REST re-stamps it).
+
+**Test this at the CONSUMER.** Every one of these is invisible to an assertion
+about the compiler's intermediate string: the constraint list exists, the
+command list exists, the config commits. What changed is the engine's verdict.
+`pkg/eventengine/multivalue_leaf_runtime_6673_test.go` asserts whether the
+policy fires and whether the batch classifies into an executable plan, against
+origin/master's own reader run over the same AST.
+
+Two consequences worth stating rather than leaving to be re-derived:
+
+- **The `nodeVal` arms were checked and are NOT instances of this.** Feeding the
+  same mixed shape to them — `destination-address 192.0.2.1/32 { 198.51.100.1/32;
+  }`, `export p1 { p2; }` — does now fail commit where master accepted, but for
+  a different reason and one that is not shape-specific: the tail there IS a
+  value slot (`nodeVal` selects it), so the node carries two genuinely authored
+  values and the cardinality gate rejects it in EVERY spelling, brackets
+  included. That gate is #6659's reviewed core. Nothing is being promoted that
+  the old reader threw away. `proxy-arp … address a { b; }` still commits.
+- **The residual, stated: a value in the identifier slot beside a block is
+  DROPPED.** `attributes-match "e.a matches X" { "e.b matches Y"; }` compiles to
+  the child alone, and so does `commands "set a" { "set b"; }`. That is exactly
+  what master did, so nothing regresses — but authoring a value there has never
+  been supported and silently loses it. Author the block members, or the packed
+  form; not both.
+
+### The `flag` leaf installs every NON-EMPTY value, in every slot (#6673)
+
+`security flow traceoptions flag` is a SET leaf, and #6659 changed what installs
+for any multi-slot list. That change is deliberate and is recorded here because
+it is operator-visible on upgrade.
+
+Before #6659 the compiler read the leaf with `nodeVal` — the FIRST slot only —
+and dropped an empty selection, so the installed set depended on where the
+operator happened to write things:
+
+| Authored | master installed | now installs |
+|---|---|---|
+| `flag [ session basic-datapath ];` | `{session}` | `{basic-datapath, session}` |
+| `flag [ "" session ];` | `{basic-datapath, session}` (writer defaults) | `{session}` |
+| `flag [ session "" ];` | `{session}` | `{session}` |
+
+The middle two rows are the same configuration with the tokens swapped, and
+master installed different flag sets for them; the first row is an operator
+asking for two flags and getting one with no diagnostic. Neither behaviour was
+designed — both fall out of slot-0 selection. The rule now is
+POSITION-INDEPENDENT: every non-empty authored flag installs, and an empty token
+is not a flag — it contributes nothing, it does not suppress the flags beside it,
+and it does not re-enable `NewTraceWriter`'s defaults.
+
+An empty token is NOT rejected at commit, because master accepted it and
+inventing a rejection for an already-committed configuration is the failure mode
+above. The "writer defaults apply" state is not lost either: authoring no `flag`
+stanza remains the documented way to get it, which is what
+`pkg/logging/flow_trace_flag_installed_6673_test.go` pins — at the writer, using
+`NewTraceWriter`'s own flag map rather than the compiled slice.
+
+### Detect a grammar keyword by CLASS, never by position (#6673)
+
+`proxyARPAddressValues` is a SET reader with one exception: a MALFORMED RANGE
+does not widen. `security nat proxy-arp … address` accepts `<low> to <high>`,
+and the compiler consumes the two well-formed range shapes before the value
+reader runs — so a `to` that survives to the reader means the statement is a
+broken range, not a list, and it falls back to `nodeVal` (master's single-value
+read). Widening it instead PROMOTES the range's surviving endpoint to a
+standalone proxy address: `pkg/dataplane/proxyarp.go` installs an `NTF_PROXY`
+neighbour for it and enables the per-interface kernel proxy responder, so the
+appliance answers ARP/ND for an address that was never authored as one.
+
+The detector for that must be over the statement's TOKEN STREAM, not over a
+list of positions. Enumerating positions failed three times, because the parser
+puts a `to` in at least four different places for this one statement:
+
+| Spelling | Where the `to` lands |
+|---|---|
+| `address [ .1 .2 to .9 ];` | `prop.Keys[n]` (the bracket collapses onto one node) |
+| `address { to; .5; }` | `Children[i].Keys[0]` |
+| `address { .1; .2 to .9; }` | `Children[i].Keys[1]` — the BLOCK form, on the child's own Keys |
+| `address { .1 .2 to .9; }` | `Children[i].Keys[2]` |
+| `address { .1 { to .9; } }` | `Children[i].Children[j].Keys[0]`, nesting arbitrarily deep |
+
+Each position-based revision passed its own tests and shipped the next
+unenumerated shape as a live install divergence from master. `nodeSubtreeHasKey`
+walks the whole subtree the parser built for the statement instead: every token
+the parser keeps lands in some node's `Keys` there, so no shape — present or
+future — can hide the keyword from it. **When a reader must recognise a grammar
+keyword inside a multi-value leaf, scan the subtree; do not enumerate slots.**
+
+The veto is per STATEMENT, so a malformed range suppresses the widening for the
+whole statement it appears in (`address { .1; .2 to .9; 198.51.100.1; }` yields
+`.1` alone). That matches what master installs and what the bracket form already
+did; vetoing per CHILD instead would install an address master never claimed.
+Separate `address` statements are independent, so a broken one never suppresses
+a well-formed sibling statement.
+
+Two traps this closed, both invisible to a shape matrix that never builds an
+empty value:
+
+- **A selection can move.** Deriving the scalar from `list[0]` over an
+  empty-filtered list made `export [ "" p1 ];` select `p1` where it had selected
+  nothing — silently ENABLING an ECMP policy the operator had blanked. The
+  scalar is now the verbatim pre-#6659 statement (`FindChild` + `nodeVal`),
+  which also preserves LAST-ROOT-WINS across two top-level `routing-options`
+  blocks: `compiler_dispatch.go` calls `compileRoutingOptions` once per root, so
+  the scalar re-assigns while the list appends, and `list[0]` named the first
+  root's policy instead of the rendered one.
+- **Dropping an empty entry can turn a fail-CLOSED gate fail-OPEN.** The
+  pre-#6659 `attributes-match` reader appended every child expression
+  unconditionally, so a stray `""` was hard-rejected as a malformed match
+  expression; filtering it accepted that config and let the event policy fire on
+  every occurrence of its event.
+- **A leaf that merely LOOKS validated is a trap of its own.** The sibling
+  `commands` leaf keeps its empty entry too, but not for the reason above:
+  `classifyPlan` skips an empty command, so the batch runs identically either
+  way and master never declined it. What filtering would change is the compiled
+  policy — `policySemanticRevision` hashes every `ThenCommands` entry, and
+  `show event-options` prints the list verbatim — so the empty is kept for
+  OUTPUT PARITY. Assuming the fail-closed story generalises from one event-
+  options leaf to the next is exactly the guess that has to be checked against
+  the consumer rather than inferred from the shape of the config.
+
+A diagnostic about a NON-SELECTED value must not describe the selected one's
+fate. `emitMatchAddr` (`compiler_validate_strict_nat.go`) picks the tolerant-path
+suffix per value: the selected value really does drop the whole rule, while a
+malformed value in any other slot never reaches the dataplane at all, so the rule
+installs and keeps translating. Telling an operator their published service is
+down when it is up is the same class of defect as the silence #6659 removed.
+
+**But do not overcorrect into the mirror claim.** "The rule keeps translating"
+holds only when the SELECTED value would itself install, and nothing guarantees
+that: with `destination-address bad-old;` then `destination-address
+bad-selected;` both values are malformed, so the warning about `bad-old`
+announcing that `bad-selected` "stays active" was contradicted by the very next
+warning on the same rule. The same trap sits on the routing side: the
+forwarding-table export diagnostic must re-run `checkPolicyRef` on the selected
+policy before saying it "still resolves", because the loop reports whichever
+undefined value it reaches first and that is usually not the selected one. State
+the consequence you have CHECKED, not the one the happy path suggests.
+
+**And OBSERVE the verdict; do not MIRROR it (#6673).** The first fix here gave
+`emitMatchAddr` a `selectedInstalls` flag recomputed from the two match-side
+checks the loops apply. That mirror was wrong by three causes — the then-side
+parse, the then-side host-mask, and the `/0` block-pair loop each drop the rule
+without touching a match address — so the contradiction simply moved rather than
+closing. A hand-written mirror of a set of checks drifts from that set by
+construction, exactly as a hand-written list of AST positions drifts from the
+parser's shapes.
+
+The reliable form is to make the emission itself carry the verdict.
+`validateNATHostMaskStrict` declares a per-rule `ruleDropped` flag that `emit` —
+the closure whose suffix is *"rule dropped by dataplane until corrected"* — sets
+on every call, while the genuinely narrower `emitSuffix` callers deliberately do
+not. Any check added later participates for free. The per-value complaints are
+then appended with a blank suffix and patched in place at the end of the rule
+(which preserves warning order), once the verdict is final. Also keep the
+empty-selection case, which is not a verdict about validity at all: `[ "" a b ]`
+blanks `ExternalIP` and the Rust parse drops the mapping, so there is no
+surviving rule to describe.
+
+**"Observed, not mirrored" is only as good as the ROUTING of each check.** Two
+whole-rule-dropping checks were reported through `emitSuffix` with port-scoped
+wording and so never set the flag: the block-pair-plus-port gate (#3202 — the
+Rust block branch `continue`s on any port) and the out-of-range `match
+destination-port` gate (#5101 — `buildStaticNATSnapshots` drops the rule so an
+invalid port cannot fail OPEN onto the port-0 wildcard). Both now go through
+`emit`. Decide the routing from the two LOWERING stages, never from how narrow
+the message sounds:
+
+| Check | Effect | Route |
+|---|---|---|
+| match/then address unparseable, non-host, or `/0` block pair | whole rule dropped (Rust `from_snapshots`) | `emit` |
+| block pair + any port (#3202) | whole rule dropped (Rust block branch) | `emit` |
+| `match destination-port` out of range (#5101) | whole rule dropped (Go `buildStaticNATSnapshots`) | `emit` |
+| `match destination-port` with no `mapped-port` | port-scoped 1:1 still installs | `emitSuffix` |
+| `mapped-port` present-but-malformed | folds to 0; plain 1:1 still installs | `emitSuffix` |
+| `mapped-port` with no `match destination-port` | port dropped; plain 1:1 still installs | `emitSuffix` |
+
+The malformed-`mapped-port` row is narrower only because
+`combineMappedPortOperands` folds ANY malformed operand to `0`, while the
+`destination-port` arm stores whatever `Atoi` returned — so the arithmetically
+identical fault reaches the whole-rule drop on one leaf and not the other. If
+that fold ever changes, that row moves to `emit`.
+
+**The bound, as an inventory rather than an example.** The flag reports what
+THAT validator concluded, so a rule-breaking cause it does not itself report
+leaves "stays active" standing. Two cases, both measured: an EMPTY `then
+static-nat` target (a misspelled target keyword — the Go lowering emits
+`InternalIP: ""` and the Rust parse drops the mapping; it IS reported, but by the
+sibling `validateStaticNATThenTargetStrict` (#4290), whose emissions this flag
+cannot see), and a CROSS-FAMILY host pair such as `192.0.2.1/32` ->
+`2001:db8::1/128` (both sides parse and both are host routes, so no validator
+checks it at all). Closing either needs a cross-validator verdict channel or a
+new rejection, not a wording change. Write the inventory, not one example — "one
+exception" invites the next reader to assume the rest are covered.
+
+**Cardinality gates name the SELECTED value, which is not element `[0]`.**
+`compileNATStatic` assigns `rule.Match = nodeVal(m)` once per
+`destination-address` sibling, so the LAST authored statement wins; only within
+one bracket/block list is the selected value that statement's first. The
+forwarding-table export scalar behaves the same way across repeated
+`routing-options` roots. Both gates quote the scalar, and both special-case an
+empty scalar — "only one is honoured" is false when the answer is none.
+
+**A cardinality gate counts DISTINCT values, never raw value slots (#6673).**
+Widening a read makes repetition visible for the first time, and a gate that
+counts slots then hard-rejects a configuration `origin/master` accepted and
+compiled BYTE-IDENTICALLY — an invented rejection, which is the opposite failure
+mode to the silent value-drop the widening was fixing. A repeat is not a second
+prefix or policy: the scalar selects the same value either way, the lowering
+emits the same single row, and *"only `X` would take effect and the rest would be
+silently ignored"* is false when "the rest" IS `X`. Both gates therefore run
+`dedupeValuesBy` after `nonEmptyValues`, for exactly the reason the empty slot is
+already spared.
+
+Choose the IDENTITY per leaf, and justify it:
+
+- `forwarding-table export` values are opaque POLICY NAMES with no canonical
+  form, so only an exact text repeat may be collapsed (`dedupeValues`).
+- `match destination-address` values are ADDRESSES, so the identity is the
+  canonical form the dataplane reduces them to — `staticNATMatchAddrKey` mirrors
+  Rust `parse_nat_prefix` (a bare address is a host route; the base is masked to
+  the prefix length). That collapses `192.0.2.1` with `192.0.2.1/32`, and
+  `192.0.2.5/24` with `192.0.2.0/24`. Exact-text dedupe alone would leave those
+  rejected — the same invented rejection, one spelling over. Equal keys mean the
+  rule translates identically whichever spelling the compiler selects, which is
+  what makes collapsing SOUND rather than merely lenient; a value with no
+  canonical form (unparseable, malformed mask) keys on its raw text so two
+  different typos never merge into one.
+- **…but the identity belongs to the CONSUMER, and `match destination-address`
+  has two.** The masking above mirrors `parse_nat_prefix`, which is the plain
+  static-NAT lowering. The SAME leaf on an `nptv6-prefix` rule is consumed by
+  `parse_prefix` in `userspace-dp/src/nptv6.rs`, which does the opposite: *"OR
+  host bits are set beyond the prefix length (#4519 — fail closed, do NOT
+  mask)"*, returning `None`. So for an NPTv6 rule `2001:db8:1:2::/48` and
+  `2001:db8:1::/48` mask alike and install NOTHING alike — one translates, the
+  other is refused. Keying them together made
+  `destination-address [ 2001:db8:1::/48 2001:db8:1:2::/48 ]` commit clean with
+  the invalid tail visible to no gate at all: the cardinality gate counted one
+  prefix, the per-address validator skips NPTv6 rules, and
+  `validateNPTv6PrefixesStrict` reads only the scalar `rule.Match`.
+  `staticNATMatchAddrKeyFor(rule.IsNPTv6)` therefore withholds masking from a
+  value that actually carries host bits, so the pair counts as two and the
+  cardinality gate fires. The resulting coverage claim is narrow and exact: a
+  widened NPTv6 value DISTINCT from the selected one is rejected by the
+  cardinality gate, and a value IDENTICAL to it *is* the selected value, which
+  `validateNPTv6PrefixesStrict` already checks. There is no per-value NPTv6
+  validator. **Before reusing a dedupe key on a second leaf, check that the
+  second leaf's consumer reduces values the same way the first one does.**
+
+Deduplication must never loosen the rejection itself: genuinely distinct
+prefixes or policies still fail commit, because one of them really would carry
+no translation.
+
+The exposure is not hypothetical even where the CLI cannot author it. Flat set
+is idempotent and `apply-groups` does not duplicate, but a repeat survives
+`tree.Format()` verbatim — a hand-edited config, a `load merge`, a generated
+config or a peer-synced tree keeps it across reboot and HA sync. The tolerant
+load path only warns (#1960) so the box boots, and the operator then cannot
+commit ANY change until they find the duplicated line.
+
 **A multi-value leaf can be PRESENT and still carry NOTHING — presence must be
 decided by VALUES, never by the leaf NAME (#6526).** `firewallMatchValues`
 skips blank tokens, and its doc comment states the contract: *an empty result
@@ -1253,6 +1820,87 @@ Consequences worth knowing when adding a reader:
   compiled routes is a hard commit error ("at least one then preferred-route
   route is required"), so the operator is told rather than left with a silent
   no-op.
+- **`system login` is the fail-closed example with a dedicated gate (#6662).**
+  Where `ip-monitoring` gets its rejection for free (an empty policy is
+  independently invalid), an empty login class is *structurally* fine, so the
+  drop needed its own AST gate:
+  `validateLoginPackedStatementsAST` (`compiler_system_login_gates.go`), wired
+  in `runPreWalkGates`, strict at commit / warn on the tolerant path
+  (`lenientLoginPackedStatements`). It covers `login class <n>` and
+  `login user <n>` at the instance line, plus `authentication` — the one login
+  body statement the compiler reads exclusively through `.Children` — written
+  inline one level down.
+
+  It is worth stating **why** this one had to reject rather than compile
+  something. Every downstream safety net in the stanza is guarded on
+  NON-EMPTINESS, so an empty compile silences the whole belt at once: an empty
+  user class is `pkg/cli`'s deliberate legacy "no RBAC configured" shortcut
+  (allow every command, render secrets in cleartext), and the
+  `deny-commands` "MORE PERMISSIVE" advisory is guarded on
+  `lc.DenyCommands != ""` — the field the bug dropped is the field the guard
+  reads. Unpacking instead would have to be exactly right for every leaf to
+  avoid minting a wrong-but-non-empty class, which is worse than an empty one;
+  both accepted spellings already work, so the operator has a mechanical
+  rewrite. See `docs/system-login.md` for the operator-facing table.
+
+  **The gate reproduces `namedInstances`' two-shape branch rather than calling
+  it**, because it needs the number of leading IDENTITY keys and that helper
+  discards it: `len(Keys) >= 2` is the node itself (identity 2), otherwise it
+  is a child of a bare `user { }` container (identity 1). Branching on the
+  shape — rather than sniffing `Keys[0]` against the keyword — stays correct
+  for an instance literally named `user` or `class`.
+
+  **The packing has THREE levels, and the gate's first revision saw only one
+  (#6706).** The walk descends with `forEachChild` and `FindChildren`, which
+  both match on `Keys[0]`, so a path packed onto an ANCESTOR line was invisible
+  to it: with the instance on the `login` line that node carries
+  `Keys=["login","user","alice",…]` and zero children, so `FindChildren("user")`
+  returns nothing; with `login` on the `system` line, `sys.Children` is empty
+  and the inner walk never runs. Measured through `configstore.CheckText` — the
+  real commit / `commit check` / `xpfd check-config` pipeline — both
+  `system { login user alice class ops; }` and `system login user alice class
+  ops;` committed GREEN and compiled nothing.
+
+  The sharp form of why that mattered: the one level the gate covered is the
+  one whose runtime outcome is fail-CLOSED (an instance with an empty class
+  resolves to `unauthorized`), while the two it missed were the fail-OPEN ones —
+  `System.Login == nil` used to hit `pkg/daemon` `applyCLILoginClass`'s early
+  return, so `SetUserClass` was never called and `pkg/cli` ran with an empty
+  class: allow every command, render secrets in cleartext.
+
+  That description is now HISTORICAL for the system level, and the tense is
+  load-bearing (corrected #6706 review r11). `LoginDroppedByPacking` suppresses
+  that early return, so a system-line packed path no longer fails open: a
+  non-root caller gets `unauthorized` and root keeps its default. The
+  login-line level was never nil-Login in the first place — it compiles a
+  NON-nil but empty `LoginConfig`, which denies through `ResolveLoginClass`
+  without consulting the flag at all. Both spellings therefore deny today, by
+  two different mechanisms; #6972 asks whether a content-free prefix should.
+
+  The generalisation is one predicate at two node levels — a `system` node with
+  `Keys[1] == "login"`, or a `login` node with any key beyond its own — and a
+  finding at an ancestor SUBSUMES everything below it, since the stanza the
+  operator wrote does not exist at all. A prefix that stops before an instance
+  NAME and has no children below (`system login;`, `system login user;`) names
+  no user and no class, so there is nothing dropped to report and it is not
+  rejected. It does NOT "declare nothing in either spelling" — an earlier
+  revision said that and it is false (#6706 review r11): the nested
+  `system { login; }` compiles a non-nil empty `LoginConfig` and denies every
+  non-root caller, while the packed `system login;` compiles nil and reaches the
+  legacy allow-everything mode. Reporting and runtime posture are separate
+  decisions; the divergence is closed by `Config.System.LoginDroppedByPacking`
+  (set by `loginPathPackedAnywhere` for EVERY packed shape, reported or not) and
+  `pkg/daemon` `applyCLILoginClass`, which refuses the legacy unset-class mode
+  when it is set. Both REPORTING arms ride the same
+  `lenientLoginPackedStatements` flag as the instance arm and the same
+  `forEachClusterNodeView` both-node union.
+
+  The sibling shadow gate (`validateLoginClassShadowsBuiltinAST`) skips a
+  `login` node carrying extra keys for the mirror-image reason: its children are
+  then an INSTANCE body, so reading a `class <n>` child there misreads a user's
+  class ASSIGNMENT as a class DEFINITION — it reported `system login class
+  read-only: this definition is INERT` for a definition never written. The
+  stanza is still rejected, by the ancestor arm, which names the real defect.
 
 **The two collapses COMPOSE, and a monitor statement hits both.** The packed
 collapse above is orthogonal to the `#2419` bracket collapse at the top of this

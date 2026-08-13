@@ -177,6 +177,60 @@ impl super::Coordinator {
         per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
+    /// #4800 new-flow-install contention surface. Six process-global
+    /// counters that, read as three (denominator, contended) pairs plus a
+    /// depth high-water, say WHICH of the cross-worker synchronization
+    /// points on the new-flow install path is saturating — the question a
+    /// flat new-flows/sec plateau cannot answer on its own.
+    ///
+    /// `shared_session_publishes_total` is the publish-leg new-flow rate;
+    /// `shared_session_publish_lock_{acquisitions,contended}_total` are the
+    /// map-mutex pair scoped to `publish_shared_session` alone.
+    /// `session_replication_{upserts,enqueued}_total` give the call rate
+    /// and the N-way fan-out multiplier (`enqueued / upserts` = sibling
+    /// worker count), `session_replication_lock_contended_total` is the
+    /// blocked subset of those enqueues, and
+    /// `session_replication_queue_depth_max` is the monotonic high-water
+    /// sibling-queue depth — contention means producers collided, depth
+    /// means the consumer is not keeping up, and the two have different
+    /// remedies.
+    ///
+    /// Surfaced as `xpf_userspace_shared_session_publishes_total` and
+    /// siblings. The NAT-allocator leg of the same question lives on the
+    /// per-pool `SourceNatPoolStatus` (`live_lock_*`), because that mutex
+    /// is per pool, not per process.
+    pub fn shared_session_publishes_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_PUBLISHES.load(Ordering::Relaxed)
+    }
+
+    pub fn shared_session_publish_lock_acquisitions_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS.load(Ordering::Relaxed)
+    }
+
+    pub fn shared_session_publish_lock_contended_total(&self) -> u64 {
+        crate::afxdp::shared_ops::SHARED_SESSION_PUBLISH_LOCK_CONTENDED.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_upserts_total(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_UPSERTS.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_enqueued_total(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_ENQUEUED.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_lock_contended_total(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_LOCK_CONTENDED.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_queue_depth_sum(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_QUEUE_DEPTH_SUM.load(Ordering::Relaxed)
+    }
+
+    pub fn session_replication_queue_depth_max(&self) -> u64 {
+        crate::afxdp::session_glue::SESSION_REPLICATION_QUEUE_DEPTH_MAX.load(Ordering::Relaxed)
+    }
+
     /// #2244: total failed `dnat_table` reverse-SNAT BPF-map publishes.
     /// Sum of the per-binding `dnat_publish_errors` atomics bumped on the
     /// two worker poll-path `publish_dnat_table_entry` call sites whose
@@ -882,6 +936,8 @@ impl super::Coordinator {
                     session_table_entries: s.session_table_entries,
                     max_sessions: s.max_sessions,
                     nat_reverse_key_collisions: s.nat_reverse_key_collisions,
+                    // #4800: per-worker transit new-flow installs.
+                    new_flow_installs: s.new_flow_installs,
                     session_create_drops: s.session_create_drops,
                     session_install_admission_refused: s.session_install_admission_refused,
                     session_install_partial: s.session_install_partial,
