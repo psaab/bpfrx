@@ -196,15 +196,153 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	// forwarding-table export → resolveECMP (config_render.go). Renders
 	// directly as an ECMP policy lookup, so it must be a defined
 	// policy-statement; a missing one silently disables ECMP/consistent-hash.
-	if err := checkPolicyRef(
-		"routing-options forwarding-table export",
-		cfg.RoutingOptions.ForwardingTableExport,
-		hintExport,
-	); err != nil {
-		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
-			"load-balancing would be silently disabled)", err)
+	//
+	// #6659: check EVERY authored policy, not just the first. This gate used to
+	// read the scalar ForwardingTableExport, which the compiler filled with
+	// nodeVal — so `export [ p1 p2 ]` validated only p1 and a DANGLING p2
+	// committed clean, defeating the gate on exactly the silent-ECMP-loss
+	// scenario its own error text describes. Fall back to the scalar when the
+	// list is empty so a typed config produced by an older binary (peer sync /
+	// a restored DB) is still checked.
+	refs := cfg.RoutingOptions.ForwardingTableExports
+	if len(refs) == 0 && cfg.RoutingOptions.ForwardingTableExport != "" {
+		refs = []string{cfg.RoutingOptions.ForwardingTableExport}
+	}
+	// #6715: the consequence is per VALUE, exactly as on the static-NAT side
+	// (emitMatchAddr, compiler_validate_strict_nat.go). Widening this gate to
+	// every authored value let a NON-rendering token reach a message that only
+	// the RENDERING one earns: resolveECMP looks up
+	// cfg.RoutingOptions.ForwardingTableExport, so with `export [ p1 nosuch ]`
+	// the dangling `nosuch` is inert while `p1` renders and ECMP resolves —
+	// "load-balancing would be silently disabled" is simply false there. Master
+	// could not hit this because it only ever passed the scalar. Decide which
+	// value the reference is before naming the consequence.
+	selected := cfg.RoutingOptions.ForwardingTableExport
+	for _, ref := range refs {
+		err := checkPolicyRef(
+			"routing-options forwarding-table export",
+			ref,
+			hintExport,
+		)
+		if err == nil {
+			continue
+		}
+		switch {
+		case ref == selected:
+			return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
+				"load-balancing would be silently disabled)", err)
+		case selected == "":
+			// The selected slot is an authored blank (`export [ "" nosuch ]`),
+			// so nothing renders and there is no surviving policy to name —
+			// the same empty-selection case emitMatchAddr handles.
+			return fmt.Errorf("%s (this value is not the one the forwarding "+
+				"table renders — the selected forwarding-table export is EMPTY, "+
+				"so no ECMP policy is configured at all; correct or remove the "+
+				"undefined policy)", err)
+		case checkPolicyRef("routing-options forwarding-table export",
+			selected, hintExport) != nil:
+			// #6673: "%q is, and it still resolves" ASSUMED the selected policy
+			// resolves without ever checking it. The loop reaches a
+			// non-selected undefined policy FIRST and reassured the operator
+			// that the selected one "still resolves" when it is undefined too
+			// and ECMP is disabled. The verdict was right (strict rejects,
+			// tolerant warns) and the stated consequence was backwards, which
+			// on the tolerant path is the only thing the operator gets.
+			//
+			// Reaching this branch needs the SELECTED value to be a LATER
+			// authored one, which takes two top-level `routing-options` roots:
+			//
+			//   routing-options { forwarding-table { export missing-old; } }
+			//   routing-options { forwarding-table { export missing-selected; } }
+			//
+			// → list [missing-old missing-selected], scalar "missing-selected".
+			// Both single-block spellings — two `export` leaves in one
+			// forwarding-table, and `export [ missing-old missing-selected ]` —
+			// select the FIRST value instead (FindChild takes the first leaf;
+			// measured scalar "missing-old"), so the loop hits `ref == selected`
+			// on iteration 1 and returns there. Do not use them as a repro for
+			// this branch; they exercise the case above it.
+			return fmt.Errorf("%s (this value is not the one the forwarding "+
+				"table renders — %q is, but that policy is UNDEFINED as well, "+
+				"so the expected ECMP / consistent-hash load-balancing is "+
+				"silently disabled; define or correct it)", err, selected)
+		default:
+			return fmt.Errorf("%s (this value is not the one the forwarding "+
+				"table renders — %q is, and it still resolves; correct or "+
+				"remove the undefined policy)", err, selected)
+		}
 	}
 
+	return nil
+}
+
+// validateForwardingTableExportSingleStrict (#6659) hard-rejects a
+// `routing-options forwarding-table export` list carrying MORE THAN ONE policy.
+//
+// Junos accepts an export policy CHAIN here and the schema declares the leaf
+// `multi: true`, but the FRR renderer honours exactly ONE: resolveECMP
+// (frr/config_render.go) looks up a single policy-statement to derive
+// ecmpMaxPaths. Before #6659 the compiler read the leaf with nodeVal, so a
+// multi-policy chain silently collapsed to the first — the operator's remaining
+// policies had no effect on load-balancing and nothing said so.
+//
+// Rejecting makes that collapse loud and fails CLOSED. It is deliberately NOT a
+// renderer change: implementing a real policy chain means deciding how several
+// policies compose into one ecmpMaxPaths, which is a routing-semantics design
+// question rather than a multi-value-read fix. Tracked as #6674.
+//
+// Strict on commit / commit-check (hard reject); the call site downgrades to a
+// warning on the tolerant load / peer-sync path (#1960 no-brick), where
+// ForwardingTableExport still carries the SELECTED policy so rendering is
+// exactly pre-#6659. "Selected", not "first": across two top-level
+// `routing-options` roots the last root wins (#6673), which is why the error
+// below quotes cfg.RoutingOptions.ForwardingTableExport rather than exports[0].
+func validateForwardingTableExportSingleStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	// #6673: count only NON-EMPTY values, and name the policy that actually
+	// renders. ForwardingTableExports records every authored value slot
+	// including empty ones so the list always contains what the scalar selected
+	// (see multiLeafAuthoredValues); an empty slot blanks the export rather than
+	// adding a policy, and `export [ "" p1 ];` must stay acceptable exactly as
+	// it was before #6659. The selected policy is the scalar, NOT element [0]:
+	// with two top-level `routing-options` roots the last root wins, so [0]
+	// named a policy that does not render.
+	//
+	// #6673 fold: count only DISTINCT ones too, for the same reason. `export
+	// [ p1 p1 ];` (or `export p1;` twice) names ONE policy; master accepted it
+	// and rendered the identical ECMP lookup, and the raw count rejected it at
+	// commit while claiming "the rest would be silently ignored" about the very
+	// policy that renders. Exact-text identity is the right one here — an export
+	// value is an opaque POLICY NAME with no canonical form, so two spellings
+	// are two different references and only an exact repeat may be collapsed
+	// (dedupeValues). The #6659 rejection for a genuine multi-policy chain,
+	// where the tail really does not render, is untouched.
+	exports := dedupeValues(nonEmptyValues(cfg.RoutingOptions.ForwardingTableExports))
+	if n := len(exports); n > 1 {
+		// #6673: the selected slot can itself be an authored BLANK —
+		// `export [ "" p1 p2 ];` counts two policies but nodeVal selects the
+		// empty slot, so resolveECMP looks nothing up and NO policy renders.
+		// "only %q would take effect" then printed `only "" would take effect`,
+		// naming a policy that does not exist and implying one of the two is
+		// still honoured.
+		if cfg.RoutingOptions.ForwardingTableExport == "" {
+			return fmt.Errorf(
+				"routing-options forwarding-table export declares %d policies (%v); "+
+					"the forwarding-table export renders as a SINGLE ECMP policy "+
+					"lookup and the selected value is EMPTY, so NONE of them takes "+
+					"effect and no ECMP policy is configured at all — configure one "+
+					"export policy (#6659)",
+				n, exports)
+		}
+		return fmt.Errorf(
+			"routing-options forwarding-table export declares %d policies (%v); "+
+				"the forwarding-table export renders as a SINGLE ECMP policy "+
+				"lookup, so only %q would take effect and the rest would be "+
+				"silently ignored — configure one export policy (#6659)",
+			n, exports, cfg.RoutingOptions.ForwardingTableExport)
+	}
 	return nil
 }
 

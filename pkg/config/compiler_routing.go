@@ -17,7 +17,48 @@ func compileRoutingOptions(node *Node, ro *RoutingOptionsConfig) error {
 	}
 
 	// Parse forwarding-table { export <policy>; }
+	//
+	// #6659: read EVERY value. The leaf is declared `multi: true`, so
+	// `export [ p1 p2 ]` collapses onto Keys[1:] and `export { p1; p2; }` onto
+	// Children; nodeVal kept only the first, which meant the second policy was
+	// neither rendered NOR reference-checked — a dangling reference in slot 2
+	// committed clean. The strict gate now rejects a multi-valued list.
+	//
+	// #6673: the SCALAR keeps the verbatim pre-#6659 statement — FindChild plus
+	// nodeVal, assigned once per compileRoutingOptions invocation. It is NOT
+	// ForwardingTableExports[0]. Two authoring shapes make the two differ, and
+	// both change which policy the FRR renderer installs:
+	//
+	//   - an EMPTY value in the first slot. `export [ "" p1 ];`, `export [ ];
+	//     export p1;`, `export { ""; p1; }` and the flat-set `export ""` +
+	//     `export p1` pair all select "" (no export policy) under nodeVal, but
+	//     [0] over an empty-filtered list selects p1 — silently ENABLING an
+	//     ECMP/consistent-hash policy the operator had blanked out.
+	//   - two top-level `routing-options` roots (a `load override` artifact:
+	//     the parser keeps repeated same-key blocks as separate siblings, and
+	//     compiler_dispatch.go calls this function for each). The scalar
+	//     assignment re-runs per root, so the LAST root wins, exactly as before
+	//     #6659; an append-then-[0] made the FIRST root win instead.
+	//
+	// The plural still accumulates across roots, which is what the reference
+	// gate wants (every named policy must exist) and what makes the cardinality
+	// gate see the ambiguity.
+	//
+	// KNOWN BLIND SPOT (#6714, unchanged from master, deliberately not fixed
+	// here): the FindChild below takes the FIRST `forwarding-table` block only.
+	// Two blocks inside ONE `routing-options` root —
+	// `forwarding-table { export p1; } forwarding-table { export p2; }` — leave
+	// p2 invisible to BOTH the scalar and the list, so the cardinality gate
+	// cannot see the ambiguity it exists to reject and the config commits clean.
+	// Repeated `routing-options` ROOTS are handled (compiler_dispatch.go calls
+	// this per root); repeated sibling BLOCKS within a root are not. Widening it
+	// is a FindChild-vs-FindChildren change of the same class as the `export`
+	// leaf itself and belongs with the other repeated-block sites in #6714,
+	// not bundled into the empty-value fold.
 	if ftNode := node.FindChild("forwarding-table"); ftNode != nil {
+		for _, expNode := range ftNode.FindChildren("export") {
+			ro.ForwardingTableExports = append(ro.ForwardingTableExports, multiLeafAuthoredValues(expNode)...)
+		}
 		if expNode := ftNode.FindChild("export"); expNode != nil {
 			ro.ForwardingTableExport = nodeVal(expNode)
 		}

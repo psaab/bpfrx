@@ -30,6 +30,7 @@ import (
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/natpoolalarm"
+	"github.com/psaab/xpf/pkg/osident"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/sysservices"
@@ -167,10 +168,15 @@ func New(store *configstore.Store, dp cliRuntime, eventBuf *logging.EventBuffer,
 	if hostname == "" {
 		hostname = "xpf"
 	}
-	username := os.Getenv("USER")
-	if username == "" {
-		username = "root"
-	}
+	// #6701: the shell prompt identity comes from the KERNEL (real uid ->
+	// passwd), never from $USER. The prompt is display-only — RBAC is carried
+	// by userClass, set by the daemon through SetUserClass — but a prompt
+	// sourced from a caller-controlled environment variable renders whatever
+	// the caller typed, so `USER=root cli` printed a root prompt to a
+	// read-only operator and to anyone reading over their shoulder. An
+	// unresolvable identity renders as `uid-<n>` rather than a fabricated
+	// plausible account name.
+	username := osident.Current().String()
 
 	return &CLI{
 		store:       store,

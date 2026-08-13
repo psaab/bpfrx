@@ -20,6 +20,9 @@ func TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName(t *testing.T) {
 	//   - bare reth (reth0 only, no unit).
 	//   - bare non-reth (em0, ge-0/0/0).
 	//   - tunnel-map hit (gr-0/0/0.0 with interface-level tunnel).
+	//   - tunnel-map hit where the map DISAGREES with the fallback
+	//     (gr-0/0/0.1 — nonzero unit sharing the interface tunnel device;
+	//     #6861 F3, without which the map lookup is unobservable).
 	//   - VLAN positive (reth0.50 with vlan-id 50; ge-0/0/0.80 with
 	//     vlan-id 180).
 	//   - reth unit 0 (reth0.0 with no vlan).
@@ -42,11 +45,26 @@ func TestResolveKernelIfName_DriftGuardVsSnapshotLinuxName(t *testing.T) {
 					50: {Number: 50, VlanID: 50},
 				}},
 				"ge-0/0/2": {Name: "ge-0/0/2", RedundantParent: "reth0"},
+				// #6861 F3: unit 0 alone does NOT exercise the tunnel-map
+				// lookup. For a unit-0 ref the map answer ("gr-0-0-0") and
+				// ResolveKernelIfName's fallback (unit.Number == 0 ->
+				// kernelBase) are the SAME string, so deleting the
+				// TunnelNameMap() block from ResolveKernelIfName left this
+				// guard green — the fallback silently supplied the right
+				// answer and the lookup was unobservable.
+				//
+				// A NONZERO unit under an interface-level tunnel splits them:
+				// the map (and snapshotLinuxName, and the runtime) say
+				// "gr-0-0-0" because the unit shares the interface's tunnel
+				// device, while the fallback would synthesize "gr-0-0-0.1".
+				// That is the only shape in this config where the lookup is
+				// load-bearing, which is why it has to be here.
 				"gr-0/0/0": {
 					Name:   "gr-0/0/0",
 					Tunnel: &config.TunnelConfig{Source: "10.0.0.1"},
 					Units: map[int]*config.InterfaceUnit{
 						0: {Number: 0},
+						1: {Number: 1},
 					},
 				},
 			},

@@ -1753,6 +1753,282 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 	return nil
 }
 
+// eventAttributesMatchExprs extracts every `attributes-match` expression an
+// event-policy match node carries, across BOTH parser AST shapes (#6659 — the
+// event-options instance of the #2419 dual-shape class).
+//
+// NOTE for anyone auditing this class: the one-sidedness runs in BOTH
+// directions. This arm read Children and never Keys[1:], so its PACKED-LEAF
+// spelling compiled to nothing while the block spelling worked. Other arms have
+// the MIRROR bug — the CoS code-points collector reads Keys[1:] plus the inline
+// tail and never Children, so its hierarchical BLOCK spelling is the broken one.
+// Searching for "looks like a nodeVal call" finds only the first direction.
+// Check every leaf by compiling BOTH spellings and comparing.
+//
+// The UNIT here is a whole EXPRESSION (`<event>.<attribute> matches <value>`),
+// not a token, so firewallMatchValues is the WRONG reader: it would split one
+// constraint into three bogus ones. The two shapes:
+//
+//   - block / flat-set  `attributes-match { e.owner matches Comcast; }`
+//     (and `set ... attributes-match e.owner matches Comcast`)
+//     → one CHILD per expression, its Keys carrying the tokens. Joining each
+//     child's Keys yields the expression. This shape already worked.
+//   - packed leaf       `attributes-match e.owner matches Comcast;`
+//     → NO children; the whole expression rides on the node's own Keys after
+//     the keyword. Reading only Children compiled ZERO constraints.
+//   - bracket list      `attributes-match [ "e.a matches X" "e.b matches Y" ];`
+//     → NO children either; the lexer strips the brackets and each QUOTED
+//     member is ONE token, so the members collapse onto Keys[1:] side by side.
+//     Joining that tail would fuse two constraints into one impossible regex.
+//
+// Hence the two rules below, which are about the two ways a tail can be
+// spelled, not about two different leaves:
+//
+//   - CHILDREN WIN. When the node has children they are the whole expression
+//     list and the node's OWN tail is ignored — verbatim master behaviour,
+//     because master read Children and nothing else. `attributes-match bogus {
+//     "e.owner matches X"; }` parses as Keys=["attributes-match","bogus"] with
+//     one child; master ignored `bogus` and committed, so promoting it into a
+//     constraint here would REJECT (as a malformed match expression) a
+//     configuration that committed before #6659. Widening a read must not
+//     invent a rejection out of a token the previous reader discarded.
+//   - Every token GROUP — the node's own tail, and each child's Keys — is
+//     split by eventMultiWordLeafValues, because a bracketed list can land in
+//     EITHER place depending on which parser ran. A bracketed list mixing a
+//     well-formed member with a bare garbage token therefore yields the
+//     garbage token as its own (malformed) expression and strict commit
+//     rejects it — that is the #6659 fail-closed conversion, not a new
+//     invented rejection, because master compiled NOTHING from any packed
+//     tail and so let the whole list fail open.
+//
+// Dropping the constraints is a FAIL-OPEN: an event policy with no
+// attributes-match fires on every occurrence of the event rather than the
+// narrower set the operator wrote. It also bypassed
+// ValidateEventAttributesMatchStrict — a packed-leaf expression naming an unknown
+// field committed clean because the compiler never produced it.
+// #6673: an authored-but-EMPTY expression is kept, not skipped. Before #6659
+// the block spelling appended strings.Join(amChild.Keys, " ") unconditionally,
+// so `attributes-match { ""; e1.owner matches X; }` produced an "" entry and
+// ValidateEventAttributesMatchStrict HARD-REJECTED it at strict commit as a malformed
+// match expression. Filtering it out silently accepted that config instead —
+// converting a fail-CLOSED commit gate into a fail-OPEN one, which is the exact
+// defect class this arm was widened to fix. The packed spelling now behaves the
+// same way (the parity this helper exists for), so `attributes-match "";` is
+// rejected too; the tolerant load / peer-sync path downgrades both to a warning
+// and still boots. A bare `attributes-match;` carrying no value slot at all
+// remains "no constraint authored" and is untouched.
+//
+// Stored VERBATIM — deliberately no strings.TrimSpace. The lexer preserves
+// whitespace INSIDE a quoted token, so master's BLOCK spelling compiled the
+// padded form and so does this. #6673: trimming would NOT rewrite the persisted
+// config — configstore writes the AST candidate tree (store_commit.go
+// writeActive -> db.go writeTreeMarked) and this reader returns new strings. It
+// changes the COMPILED policy and its consumers: policySemanticRevision (which
+// re-arms the engine), `show event-options`, and the quoted diagnostic.
+func eventAttributesMatchExprs(child *Node) []string {
+	// Block / flat-set: one expression per child, and the node's own tail is
+	// the identifier slot master discarded. Do not promote it (#6673 fold).
+	if len(child.Children) > 0 {
+		exprs := make([]string, 0, len(child.Children))
+		for _, amChild := range child.Children {
+			exprs = append(exprs, eventMultiWordLeafValues(amChild, 0)...)
+		}
+		return exprs
+	}
+	if len(child.Keys) < 2 {
+		// No value slot at all (`attributes-match;`): no constraint authored.
+		return nil
+	}
+	// Packed leaf or bracket list. A one-token tail is the same either way, so
+	// an authored-but-EMPTY expression still reaches the strict gate.
+	return eventMultiWordLeafValues(child, 1)
+}
+
+// eventMultiWordLeafValues splits ONE token group — a node's own Keys tail
+// (from > 0) or a single child's whole Keys (from == 0) — into the values it
+// carries (#6673 fold).
+//
+// Both event-options leaves in this file (`attributes-match` and `then
+// change-configuration commands`) hold values that are themselves MULTI-WORD
+// strings, so "how many values are in this group" cannot be answered by
+// counting tokens: `[ "set a b" "delete c" ]` is two values in two tokens,
+// while `set system host-name foo` is ONE value in four. What separates them is
+// which tokens the operator QUOTED, and that is a property of the source
+// TOKEN KIND, not of the token's text — so this reader takes the *Node and
+// consults its recorded provenance (Node.KeysQuoted, populated by parseKeys for
+// the hierarchical spelling and by SetPathQuoted for the flat-set one) rather
+// than re-deriving it from the strings.
+//
+// It is applied to the CHILDREN as well as the tail, and that is the whole
+// point of hoisting it out of the tail branch. Which of the two places a
+// bracketed list lands in depends on WHICH PARSER RAN, not on what the operator
+// wrote. The hierarchical parser collapses `commands [ "a" "b" ];` onto the
+// node's own Keys; ParseSetCommand + SetPath puts the identical list on ONE
+// CHILD's Keys, because neither leaf declares `multi: true` in setSchema (the
+// flag that would make SetPath absorb a bracket onto the node's own tail).
+// Splitting only the tail therefore fixed the hierarchical spelling and left
+// the flat-set spelling fusing every member into one string — see
+// TestEventChangeConfigCommands6659/flat-set_bracket_list.
+//
+// The decision is taken on the FIRST token of the group, because the two
+// ambiguous mixtures pull in OPPOSITE directions and only the first token
+// separates them:
+//
+//   - `commands set system host-name "foo bar"` — a quoted VALUE inside an
+//     otherwise bare statement, tokens [set system host-name "foo bar"]. That
+//     is ONE command; an "any token is quoted" rule would shatter it into four.
+//     The first token is bare, so: join.
+//   - `commands [ "set a b" bogus ]` — a quoted member beside a bare one. That
+//     is a LIST whose second member is garbage; joining would fuse the garbage
+//     onto a valid command and hand eventengine.classifyPlan a plausible-
+//     looking set path to apply. The first token is quoted, so: split, and the
+//     bare member reaches classifyPlan alone, fails its set/delete prefix check
+//     and rejects the WHOLE batch. Fail-closed, which is the direction a
+//     genuinely ambiguous authoring must take.
+//
+// A single-token group is identical under both rules, so the choice only ever
+// decides a group of two or more.
+//
+// WHY PROVENANCE AND NOT TEXT. The rule this replaced asked whether the first
+// token CONTAINED A SPACE or was EMPTY, on the reasoning that the lexer never
+// leaves a space inside a bare word. That is sound as far as it goes, but it is
+// an implication in one direction only: every space-bearing token was quoted,
+// while a quoted token need not bear a space. A quoted ONE-WORD first member —
+// `commands [ "set" "system host-name pwned" ]` — has neither a space nor
+// emptiness, so it read as bare and the list JOINED into
+// `set system host-name pwned`: a syntactically perfect command that passes
+// classifyPlan's `set ` prefix check, parses, and is APPLIED. The authoring the
+// operator wrote (a bare `set` member) is exactly the one the fail-closed path
+// above exists to reject. No refinement of the text test can fix this, because
+// the two authorings produce byte-identical tokens; only the token kind
+// distinguishes them.
+//
+// WHEN PROVENANCE IS ABSENT the old text rule is used unchanged, which is a
+// deliberate non-regression rather than a second guess. A node carries no
+// KeysQuoted when it was synthesized by the compiler, or when it was
+// deserialized from a config DB written before this change. Treating "no
+// provenance" as "all bare" would be a false claim in the fail-OPEN direction;
+// treating it as "all quoted" would SPLIT `commands set system host-name
+// "foo bar"` and silently break a working remediation across an upgrade. The
+// text rule is what those trees were already evaluated under, so it is the only
+// answer that changes nothing for them. Note this is not a widening: for a
+// group that genuinely has no quoted token the two rules AGREE by construction,
+// since a bare word can be neither empty nor space-bearing — which is also why
+// setKeysQuoted may collapse an all-false mask to nil without losing anything.
+//
+// Residual, unchanged and deliberately not chased: a bracket list whose members
+// are ALL single bare-looking words (`[ seta setb ]`) is indistinguishable from
+// one unquoted value and joins. Provenance does not help here — both authorings
+// have zero quoted tokens and the AST does not record the brackets themselves.
+// Every well-formed value of both leaves contains a space (a command carries its
+// `set `/`delete ` prefix, an expression carries " matches "), so a group that
+// reaches this case is malformed either way, and joining sends it to the same
+// gate (classifyPlan's prefix check / ValidateEventAttributesMatchStrict) that
+// the split would.
+//
+// Residual, KNOWN AND NARROWER THAN THE ABOVE: a tree that reaches this reader
+// with no provenance is still decided by the text rule, so the fused-member
+// read survives for (a) an event policy authored BEFORE this change and still
+// sitting in the persisted config DB — until the operator re-authors the
+// `commands` line, at which point SetPathQuoted stamps provenance — and (b) any
+// future caller that builds these nodes by hand. The serialize/re-parse paths
+// (HA config sync, `show | display set` replay, load merge, archive) are NOT in
+// this set: keyNeedsAuthoredQuote re-emits the authored quotes that decide the
+// grouping, so a round-tripped tree re-parses with the same provenance it had.
+func eventMultiWordLeafValues(n *Node, from int) []string {
+	if n == nil || from < 0 || from >= len(n.Keys) {
+		return nil
+	}
+	tokens := n.Keys[from:]
+	if n.KeysHaveQuoteProvenance() {
+		if n.KeyQuoted(from) {
+			return append([]string(nil), tokens...)
+		}
+		return []string{strings.Join(tokens, " ")}
+	}
+	// No provenance recorded for this node — fall back to the text rule these
+	// trees were already evaluated under. See "WHEN PROVENANCE IS ABSENT".
+	if tokens[0] == "" || strings.Contains(tokens[0], " ") {
+		return append([]string(nil), tokens...)
+	}
+	return []string{strings.Join(tokens, " ")}
+}
+
+// eventChangeConfigCommands extracts every `then change-configuration commands`
+// entry, across BOTH parser AST shapes (#6659).
+//
+// It stays a separate reader from eventAttributesMatchExprs above because the
+// two arms differ in what they do with an authored EMPTY value and in which
+// gate catches a malformed one — but the TOKEN BOUNDARY is now one shared rule
+// (eventMultiWordLeafValues), applied identically to the tail and to each
+// child. Verified against the actual parsed ASTs:
+//
+//   - CHILD form   `commands { "set system host-name foo"; "delete ..."; }`
+//     → one child per command. A QUOTED command lexes to a single Key; an
+//     UNQUOTED one (`set system host-name foo;`) lexes to Keys=["set","system",
+//     "host-name","foo"], so the child's Keys must be JOINED. The pre-#6659
+//     reader took child.Name() (Keys[0]) and truncated an unquoted command to
+//     its first word — `set` — which is not a command at all.
+//   - PACKED form  `commands "set system host-name foo";` → Keys=["commands",
+//     "<cmd>"], and `commands [ "cmd1" "cmd2" ]` → Keys=["commands","cmd1",
+//     "cmd2"]. Reading only Children compiled zero remediation commands.
+//   - FLAT-SET bracket. `set … commands [ "cmd1" "cmd2" ]` is the SAME list as
+//     the packed form, but SetPath puts it on ONE CHILD's Keys instead of the
+//     node's own. #6673 fold: that is why the boundary rule cannot live in the
+//     tail branch — splitting the tail and joining the children fixed one
+//     operator's spelling and left the other's fusing into a single string.
+//
+// #6673 fold: CHILDREN WIN, exactly as in eventAttributesMatchExprs and for
+// exactly the same reason. `commands bogus { "set system host-name foo"; }`
+// parses as Keys=["commands","bogus"] with one child. Master read Children and
+// nothing else, so it ignored `bogus` and the remediation RAN. Emitting both
+// hands eventengine.classifyPlan a token that matches neither the `set ` nor
+// the `delete ` prefix, and classifyPlan rejects the WHOLE batch (`return nil,
+// false`) — HandleEvent then discards it. Both trees accept the configuration;
+// only the widened read makes the remediation inert. A tail is read ONLY when
+// the node has no children, which is the shape where master compiled nothing at
+// all (the #6659 fail-open this helper exists to close).
+// #6673: an authored-but-EMPTY command is kept, not skipped — but for a
+// DIFFERENT reason than eventAttributesMatchExprs above, and the obvious guess
+// is wrong. Before #6659 the block spelling appended cmdChild.Name()
+// unconditionally, so `commands { ""; "set system host-name foo"; }` compiled
+// to ["", "set …"]. Keeping the entry is OUTPUT PARITY with that, NOT a
+// fail-closed gate: unlike attributes-match, nothing downstream rejects an empty
+// command. eventengine.classifyPlan opens with `cmd = strings.TrimSpace(cmd);
+// if cmd == "" { continue }` — present since the engine's first commit — so it
+// is SKIPPED and the batch yields the same typed plan either way (driven
+// directly: ["", "set …"] gives ok=true, one op). It is still not unobservable,
+// which is why this reader must not decide it away: policySemanticRevision
+// hashes EVERY ThenCommands entry (authoring or removing the empty re-arms the
+// policy, exactly as on master) and `show event-options` prints the list
+// verbatim (pkg/cli/cli_show_routing.go, pkg/grpcapi/server_show_events.go).
+// Filtering would diverge the compiled policy from master's on both surfaces
+// while changing nothing about what the batch executes; whether an empty command
+// is meaningless is the consumer's call, and the consumer already makes it.
+// Commands are likewise stored VERBATIM — no TrimSpace, same reasoning,
+// classifyPlan trims them itself. A `commands;` with no value slot still
+// contributes nothing.
+func eventChangeConfigCommands(cmdsNode *Node) []string {
+	// Block: each child carries one command — or, on the flat-set path, a
+	// whole bracketed LIST of them. eventMultiWordLeafValues decides which,
+	// so an unquoted command survives whole instead of truncating to its first
+	// word AND a bracket list stops fusing into one string. The node's own tail
+	// is the identifier slot master discarded — do not promote it.
+	if len(cmdsNode.Children) > 0 {
+		cmds := make([]string, 0, len(cmdsNode.Children))
+		for _, cmdChild := range cmdsNode.Children {
+			cmds = append(cmds, eventMultiWordLeafValues(cmdChild, 0)...)
+		}
+		return cmds
+	}
+	// Packed: the tail is a bracketed list of quoted commands, or the bare
+	// words of exactly one unquoted command. Same discriminator.
+	if len(cmdsNode.Keys) < 2 {
+		return nil
+	}
+	return eventMultiWordLeafValues(cmdsNode, 1)
+}
+
 func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 	// #4423 L1: two same-named policy stanzas must MERGE into one policy, not
 	// coexist as duplicates. Flat-set / display-set config already merges (the
@@ -1826,17 +2102,11 @@ func compileEventOptions(node *Node, policies *[]*EventPolicy) error {
 				}
 				ep.WithinClauses = append(ep.WithinClauses, w)
 			case "attributes-match":
-				// Each child is a match line like "ping_test_failed.test-owner matches Comcast"
-				for _, amChild := range child.Children {
-					// Reconstruct the match expression from keys
-					ep.AttributesMatch = append(ep.AttributesMatch, strings.Join(amChild.Keys, " "))
-				}
+				ep.AttributesMatch = append(ep.AttributesMatch, eventAttributesMatchExprs(child)...)
 			case "then":
 				if ccNode := child.FindChild("change-configuration"); ccNode != nil {
 					if cmdsNode := ccNode.FindChild("commands"); cmdsNode != nil {
-						for _, cmdChild := range cmdsNode.Children {
-							ep.ThenCommands = append(ep.ThenCommands, cmdChild.Name())
-						}
+						ep.ThenCommands = append(ep.ThenCommands, eventChangeConfigCommands(cmdsNode)...)
 					}
 				}
 			}
@@ -1857,6 +2127,13 @@ func compileBridgeDomains(node *Node, bds *[]*BridgeDomainConfig) error {
 		}
 
 		// Collect VLAN IDs — multi-value leaf: each "vlan-id-list" child is a separate leaf
+		// #6687 / #6659: nodeVal takes slot 0 only, and the range/parse checks
+		// below are the leaf's ONLY validator (it declares none in setSchema),
+		// so every value past the first is a GATE ESCAPE and not merely a
+		// value-drop: `[ 100 99999 ]` and `{ 100; 99999; }` both commit CLEAN
+		// where a bare `vlan-id-list 99999` is REJECTED "out of range
+		// (1-4094)". Verified through configstore.CheckText. A widened read
+		// MUST run these two checks over every authored value.
 		for _, vlanNode := range child.FindChildren("vlan-id-list") {
 			valStr := nodeVal(vlanNode)
 			if valStr == "" {

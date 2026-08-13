@@ -33,8 +33,42 @@ type SystemConfig struct {
 	DHCPServer         DHCPServerConfig
 	SNMP               *SNMPConfig
 	Login              *LoginConfig
-	RootAuthentication *RootAuthConfig
-	Archival           *ArchivalConfig
+	// LoginDroppedByPacking records that the candidate DID author a `system
+	// login` path but wrote it packed onto an ancestor statement line, so the
+	// compiler dropped the stanza (#6662/#6706). It is NOT a finding count and
+	// NOT a commit verdict — the packed gate owns those. It is the one bit
+	// pkg/daemon needs to tell two states apart that otherwise both arrive as
+	// `Login == nil`:
+	//
+	//   - nothing configured RBAC at all -> pkg/cli's legacy unset-class mode,
+	//     which permits every command and renders secrets in cleartext. That
+	//     contract is deliberate (permissions.go) and must not change.
+	//   - RBAC WAS configured and compiled away -> the same nil, reached from a
+	//     config that reads as restrictive. Landing there opens the box.
+	//
+	// The flag is set for EVERY packed `system login` ancestor path, including
+	// the short prefixes the gate deliberately does not report (`system login;`,
+	// `system login user;`). Those commit clean by design — rejecting them
+	// would be a new rejection of config that master accepts — but they are not
+	// inert: the NESTED spelling of the same text compiles a non-nil empty
+	// LoginConfig and denies every non-root caller, while the packed spelling
+	// compiles nil and permits everyone. Reporting is the gate's job; making
+	// the two spellings agree at RUNTIME is this flag's.
+	//
+	// It matters most on the TOLERANT ingress (Store.Load at boot,
+	// Store.SyncApply from a peer), where the #1960 no-brick doctrine downgrades
+	// the packed finding to a warning and KEEPS the config.
+	//
+	// It is NOT only the tolerant path (corrected, #6706 review r11). An
+	// earlier revision said "strict commit rejects, so on that path the flag
+	// is never read". Strict rejects the prefixes that NAME something, but it
+	// ACCEPTS the content-free ones — `system login;`, `system login user;` —
+	// because the reporting gate deliberately does not report a prefix naming
+	// nobody. Those commit strictly AND set this flag, so a strict commit is a
+	// live path for it, not one where it is dead.
+	LoginDroppedByPacking bool
+	RootAuthentication    *RootAuthConfig
+	Archival              *ArchivalConfig
 	// MasterPassword is a misnomer kept for the Junos token: it holds the
 	// `system master-password pseudorandom-function <fn>` value, i.e. the PRF
 	// ALGORITHM-SELECTOR NAME (e.g. hmac-sha256), NOT key material. The actual
