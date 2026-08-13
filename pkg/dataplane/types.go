@@ -117,8 +117,20 @@ type SessionValue struct {
 	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
 	// AND clear) and the REST query in pkg/api still resolve an interface
 	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
-	// Porting them is tracked separately; until then an interface-filtered
-	// show/clear is exact on the console and approximate over gRPC/REST.
+	// Porting them is tracked in #6975.
+	//
+	// Until that lands, an interface-filtered SHOW is exact for rows this node
+	// owns and approximate for peer rows. An interface-filtered CLEAR is NOT
+	// exact even when typed on the console: `clearFilteredSessions`
+	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:252`), and
+	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
+	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
+	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
+	// DELETES peer flows actually received on `reth0.80`.
+	//
+	// Do not read the local exactness this field buys as an end-to-end
+	// guarantee: it is exact where this node is the authority, and the clear
+	// path leaves this node. #6975 carries the trace and the fix shape.
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
@@ -316,8 +328,20 @@ type SessionValueV6 struct {
 	// session query in pkg/grpcapi (which the REMOTE cli binary uses for show
 	// AND clear) and the REST query in pkg/api still resolve an interface
 	// filter from the ingress ZONE, in the pre-#4792 first-interface-only form.
-	// Porting them is tracked separately; until then an interface-filtered
-	// show/clear is exact on the console and approximate over gRPC/REST.
+	// Porting them is tracked in #6975.
+	//
+	// Until that lands, an interface-filtered SHOW is exact for rows this node
+	// owns and approximate for peer rows. An interface-filtered CLEAR is NOT
+	// exact even when typed on the console: `clearFilteredSessions`
+	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:252`), and
+	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
+	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
+	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
+	// DELETES peer flows actually received on `reth0.80`.
+	//
+	// Do not read the local exactness this field buys as an end-to-end
+	// guarantee: it is exact where this node is the authority, and the clear
+	// path leaves this node. #6975 carries the trace and the fix shape.
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first

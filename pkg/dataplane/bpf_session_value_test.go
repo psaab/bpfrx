@@ -320,3 +320,57 @@ func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 		t.Fatalf("v6 round trip mismatch:\n got=%+v\nwant=%+v", gotV6, wantV6)
 	}
 }
+
+// Byte OFFSETS of the #4983 ingress-identity pair inside the on-map conntrack
+// ABI (bpf/headers/xpf_conntrack.h `ingress_ifindex` / `ingress_vlan_id`,
+// mirrored by the Rust BpfSessionValueV4 / V6).
+//
+// v4: the pair is appended at the old 136-byte tail, so ifindex occupies
+// [136,140) and the u16 vlan id [140,142), with the struct padded to 144.
+// v6: the same append at the old 184-byte tail — [184,188) and [188,190),
+// padded to 192.
+const (
+	conntrackIngressIfindexOffV4 = 136
+	conntrackIngressVlanIDOffV4  = 140
+	conntrackIngressIfindexOffV6 = 184
+	conntrackIngressVlanIDOffV6  = 188
+)
+
+// TestBPFSessionValueIngressIdentityOffsets pins WHERE the #4983 identity pair
+// sits, not just how big the struct is.
+//
+// The size guards above cannot see a field REORDER. Swapping the Go tail to
+// `IngressVlanID; pad; IngressIfindex` leaves sizeof at 144/192 and
+// binary.Size equal to it, so `TestBPFSessionValueMatchesConntrackABI` and
+// `TestBPFSessionValueMarshalsAtConntrackABISize` both stay green — while C
+// and Rust still write the ifindex at 136/184. A record carrying
+// `{ifindex: 11, vlan: 50}` then decodes in Go as `{ifindex: 50, vlan: 11}`.
+//
+// That failure mode is worse than a decode error: 50 and 11 are both plausible
+// values, so the CLI filters confidently on the wrong interface instead of
+// falling back to the zone approximation the way a zero would make it.
+//
+// RED on revert: swap the two field declarations in `bpfSessionValue` (and/or
+// `bpfSessionValueV6`) in bpf_session_value.go and this fails on the offset
+// that moved, naming the field. Size and binary.Size guards stay GREEN under
+// that same edit, which is why this test has to exist separately.
+func TestBPFSessionValueIngressIdentityOffsets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"bpfSessionValue.IngressIfindex", unsafe.Offsetof(bpfSessionValue{}.IngressIfindex), conntrackIngressIfindexOffV4},
+		{"bpfSessionValue.IngressVlanID", unsafe.Offsetof(bpfSessionValue{}.IngressVlanID), conntrackIngressVlanIDOffV4},
+		{"bpfSessionValueV6.IngressIfindex", unsafe.Offsetof(bpfSessionValueV6{}.IngressIfindex), conntrackIngressIfindexOffV6},
+		{"bpfSessionValueV6.IngressVlanID", unsafe.Offsetof(bpfSessionValueV6{}.IngressVlanID), conntrackIngressVlanIDOffV6},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("offsetof(%s) = %d, want %d — the Go layout no longer "+
+				"matches where C/Rust write this field, so on-map records "+
+				"decode with the ingress identity fields transposed and the "+
+				"CLI filters confidently on the wrong interface",
+				tc.name, tc.got, tc.want)
+		}
+	}
+}

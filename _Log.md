@@ -71261,3 +71261,44 @@ Every RED above is an assertion failure, not a build break.
   STRUCTURALLY: header count 1512 + 2 new = 1514, and the one-header-one-
   Timestamp violation count is 226 on the pre-merge head, 226 on origin/master
   and 226 after the union — the resolve introduced none.
+
+## 2026-08-12 — #4983 fold: Codex #2 (claim) + #6 (ABI offsets)
+
+- **Timestamp**: 2026-08-12
+- **Action**: First two of the five surviving Codex blockers on PR #6928.
+
+  **#2 — the "exact on the console" claim is false, and the runtime hole under
+  it is PRE-EXISTING.** Verified the mechanism firsthand at every link:
+  `clearFilteredSessions` propagates unconditionally
+  (`pkg/cli/cli_clear.go:252`, no interface-filter guard); the filter rides
+  gRPC (`:677`); the peer collapses the zone to one interface
+  (`server_sessions.go:508-515`, `f.zoneIfaces[zid] = zone.Interfaces[0]`) and
+  matches on it at BOTH sites (`:578-583`, `:623-628`), where `inIf` depends
+  only on the ingress zone and not on the session. So on zone
+  `[reth0.50, reth0.80]`, clearing `.50` deletes peer flows received on `.80`.
+
+  Provenance, measured rather than assumed: this PR touches NEITHER path —
+  `git diff origin/master...HEAD -- pkg/grpcapi/ pkg/api/` is empty and its
+  `pkg/cli/cli_clear.go` diff is empty. `resolveIngressIfaces` is new in the PR
+  (0 on master, 4 at head), so the PR makes the LOCAL half exact and NARROWS
+  the defect. What it introduced was the claim, also new (0 on master, 2 at
+  head). Corrected at both sites to state that SHOW is exact only for
+  locally-owned rows and CLEAR is not exact at all because it leaves this node.
+  Runtime gap filed as #6975 with the full trace; the previous "tracked
+  separately" carried no issue number.
+
+  **#6 — the ABI guards pin SIZE, not OFFSETS.** Added
+  `TestBPFSessionValueIngressIdentityOffsets` pinning all four offsets against
+  the C header (v4 136/140, v6 184/188, measured to match
+  `bpf/headers/xpf_conntrack.h`).
+- **File(s)**: pkg/dataplane/types.go, pkg/dataplane/bpf_session_value_test.go,
+  _Log.md
+- **Validation**: #6 mutation is Codex's own — reorder the tail of BOTH structs
+  to `IngressVlanID; pad; IngressIfindex`. The size guards
+  (`TestBPFSessionValueMatchesConntrackABI`,
+  `TestBPFSessionValueMarshalsAtConntrackABISize`) stay **GREEN** (`ok`) under
+  it, which is the negative control proving they cannot see a reorder, while
+  the new guard REDs on all four offsets: `offsetof(bpfSessionValue.IngressIfindex)
+  = 140, want 136` and its three siblings, each naming the transposition.
+  `go build ./...` 0; `go vet ./pkg/dataplane/... ./pkg/cli/...` 0;
+  `go test ./pkg/dataplane/... ./pkg/cli/...` all packages ok.
