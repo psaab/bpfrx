@@ -189,8 +189,11 @@ func TestConfigSnapshotIsReadAfterThePeerWait_5561(t *testing.T) {
 
 					// No request from an earlier subtest may still be parked in
 					// the drain, or this one's waiter edge would be another
-					// case's.
-					waitForAdmittedToSettle(t, 0)
+					// case's. Both counters, not just the byte charge: the
+					// waiter decrements before the budget releases, so a settled
+					// budget implies a settled waiter only for a request that
+					// was charged at all.
+					waitForGateQuiescent(t)
 
 					// Headers only: the body is DECLARED and withheld, so a
 					// request that gets past pass 1 parks in the gate's drain
@@ -387,6 +390,164 @@ func TestRevokedCredentialCannotFinishAnInFlightRequest_5561(t *testing.T) {
 	}
 }
 
+// TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561 isolates the credential
+// re-read the case above cannot distinguish (#6645 r22, finding 1).
+//
+// TestRevokedCredentialCannotFinishAnInFlightRequest_5561 proves a DISJUNCTION:
+// that at least one live credential re-validation happens between
+// Config.PeerLocalityFn and the handler. It cannot say WHICH, because the two
+// sites on that path cover for each other, and the masking is measured, not
+// reasoned:
+//
+//	mutation                                                  that case
+//	principalFrom's credential branch returns the principal
+//	  minted BEFORE the enumeration (drop the re-read)         PASS
+//	mutationAuthzGuard's second pass (reauthorizeInputs)
+//	  deleted                                                  PASS
+//	both                                                       FAIL
+//
+// So a SINGLE-site regression escapes it, and two guards that each cover for
+// the other read as redundancy while actually being a gap.
+//
+// This case answers the question the second pass cannot, by asking it before
+// the second pass exists: a body-carrying route (POST /api/v1/config/set,
+// mutationBodyEdit) whose body is declared and never sent. Pass 1 blocks inside
+// PeerLocalityFn, the credential is revoked while it is parked, locality is
+// released — and the 403 must arrive WITHOUT the body. Only pass 1 runs before
+// the body, and within pass 1 only the branch's own re-read can see a
+// revocation that landed after the check at the top of principalFrom, so the
+// denial has exactly one possible author.
+//
+// The CONTROL is what makes that timing mean something: with no revocation the
+// same request must PARK rather than answer, which proves a withheld body
+// genuinely holds a request that passed pass 1. Without it, "a prompt 403"
+// would be satisfied by any refusal at all.
+//
+// Both credential SHAPES are driven for the same reason the case above drives
+// them: credentialPrincipalUser has a Basic arm and an X-API-Key arm, and a
+// re-validation covering one only leaves the other on the old behaviour.
+func TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561(t *testing.T) {
+	const (
+		user   = "webadmin"
+		secret = "s3cret"
+		apiKey = "k3y-aaaaaaaaaaaaaaaaaaaa"
+	)
+	for _, tc := range []struct {
+		name string
+		hdrs map[string]string
+	}{
+		{
+			name: "basic",
+			hdrs: map[string]string{
+				"Authorization": "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+secret)),
+			},
+		},
+		{
+			name: "api-key",
+			hdrs: map[string]string{"X-API-Key": apiKey},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, revokeDuringWait := range []bool{false, true} {
+				name := "control-no-revocation"
+				if revokeDuringWait {
+					name = "revoked-during-the-first-pass"
+				}
+				t.Run(name, func(t *testing.T) {
+					usePasswdFixture(t)
+
+					entered := make(chan struct{}, 1)
+					release := make(chan struct{})
+					s, base := authzServer(t, Config{
+						Addr:  "127.0.0.1:8080",
+						Store: authzStore(t, authzTestConfig),
+						Auth: &AuthConfig{
+							Users:   map[string]string{user: secret},
+							APIKeys: map[string]bool{apiKey: true},
+						},
+						// Off-box, so principalFrom takes the credential row —
+						// the only row whose re-read this case isolates.
+						PeerLookupFn: remotePeer(),
+						// The production step this stands in for
+						// (authz.PeerCouldBeLocalNow) single-flights an
+						// interface enumeration and so genuinely blocks.
+						PeerLocalityFn: func(net.Addr, net.Addr) bool {
+							select {
+							case entered <- struct{}{}:
+							default:
+							}
+							<-release
+							return false
+						},
+					})
+
+					// The waiter edge below is a process-global count, so no
+					// request from another case may still be parked in the drain.
+					waitForGateQuiescent(t)
+
+					// Headers only: the body is DECLARED and withheld, so a
+					// request that gets past pass 1 parks in the gate's drain
+					// instead of being answered.
+					const body = `{"input":"set system host-name r22"}`
+					conn := openDeclaredBody(t, base, "POST /api/v1/config/set", len(body), "", tc.hdrs)
+
+					// The request has authenticated against the LIVE snapshot,
+					// entered the credential row, and is now parked in the
+					// locality re-derivation — inside PASS 1, before the drain.
+					select {
+					case <-entered:
+					case <-time.After(10 * time.Second):
+						t.Fatal("the locality re-derivation never started; the case never " +
+							"reached the window it tests")
+					}
+					if revokeDuringWait {
+						// Exactly what a `delete system services web-management
+						// ... api-auth` commit does: ReplaceAuth with a policy
+						// that no longer honours the presented credential.
+						s.ReplaceAuth(&AuthConfig{Users: map[string]string{"someone-else": "different"}})
+					}
+					close(release)
+
+					if !revokeDuringWait {
+						// Positive then negative: the request got PAST pass 1
+						// into the gate's body drain, and stays there rather
+						// than being answered.
+						waitForMutationBodyWaiter(t)
+						if status, answered := readStatus(t, conn, time.Second); answered {
+							t.Fatalf("the CONTROL answered %d with its body still withheld — "+
+								"an off-box caller holding a VALID credential must be admitted "+
+								"by pass 1 and then park on its caller, or the prompt 403 below "+
+								"proves nothing about WHERE the denial came from", status)
+						}
+						return
+					}
+
+					// The window this assertion lives in: the body has not been
+					// sent and will not be. Whatever answers here answered
+					// WITHOUT it, so pass 2 has not run.
+					status, answered := readStatus(t, conn, 5*time.Second)
+					if !answered {
+						t.Fatal("nothing answered within 5s while the body was withheld. Pass 1 " +
+							"therefore ADMITTED a request whose api-auth credential had already " +
+							"been revoked, and the gate is parked in its body drain: the " +
+							"credential branch returned the principal it minted BEFORE the " +
+							"locality enumeration, and ReplaceAuth cannot reach a value. Pass 2 " +
+							"will overrule it once the caller finishes — but a caller that never " +
+							"finishes holds an admitted, revoked request for the whole " +
+							"apiReadTimeout, and pass 2 is the site this case exists to hold " +
+							"constant")
+					}
+					if status != http.StatusForbidden {
+						t.Fatalf("got %d, want 403: the credential was revoked while this request "+
+							"was parked in the locality re-derivation, and the re-read inside the "+
+							"credential branch is what must catch it", status)
+					}
+				})
+			}
+		})
+	}
+}
+
 // slotConn is the minimum net.Conn Server.connContext reads: the two addresses.
 type slotConn struct {
 	net.Conn
@@ -407,6 +568,33 @@ func waitSlots(t *testing.T, want int, what string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("%s: the pool holds %d tokens, want %d", what, PeerLookupSlotsInUseForTest(), want)
+}
+
+// waitForPeerLookupsToFinish blocks until at least `want` accept-time lookups
+// have been counted AND none is still running (#6645 r22, finding 3).
+//
+// Both halves are needed, and the second is the one an obvious test omits. The
+// lookup runs in a goroutine connContext starts at ACCEPT, and a SAFE request
+// never enters the mutation gate — so nothing on the request path waits for it,
+// and a case that samples its counter the moment a response lands can read a
+// value the lookup has not reached yet. Zero pool occupancy is the only edge
+// that says every lookup started so far has finished: connContext releases the
+// admission token in the goroutine's LAST defer, after the resolver returns.
+//
+// It is also why <-p.done is not that edge. Defers run LIFO, so close(p.done)
+// runs BEFORE the token is returned — a case that joins on p.done returns while
+// the token is still out, which is what waitSlots exists to absorb.
+func waitForPeerLookupsToFinish(t *testing.T, count func() int, want int, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if count() >= want && PeerLookupSlotsInUseForTest() == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("%s: %d lookups counted with %d still in flight, want at least %d counted and "+
+		"none in flight", what, count(), PeerLookupSlotsInUseForTest(), want)
 }
 
 // TestPeerLookupSlotsAreReturned_5561 is the round-9 finding-5 guard: it
@@ -433,6 +621,17 @@ func waitSlots(t *testing.T, want int, what string) {
 // drain below zero occupancy — i.e. admitting past the cap it exists to enforce.
 func TestPeerLookupSlotsAreReturned_5561(t *testing.T) {
 	usePasswdFixture(t)
+
+	// The pool is PROCESS-GLOBAL and a preceding case can still be holding a
+	// token when this one starts (#6645 r22, finding 3): connContext returns the
+	// token in the goroutine's LAST defer, and close(p.done) is deferred after
+	// it — so it runs FIRST, and a case that joins on <-p.done (or simply drives
+	// HTTP and reads its response) returns while the token is still out. With
+	// one already held, the fill below can only take maxConcurrentPeerLookups-1
+	// more and the pool reads one OVER, so the case fails on its own
+	// precondition — "pool holds 1024 tokens before the case starts, want 1023"
+	// — rather than on anything it tests.
+	waitSlots(t, 0, "the lookup pool never returned to zero occupancy before this case started")
 
 	// Take every token but one, so a single lookup can be observed against a
 	// pool whose occupancy is otherwise pinned.
@@ -605,6 +804,14 @@ func (w *withheldBody) finish(t *testing.T) (int, string) {
 // waitForMutationBodyWaiter blocks until a request is parked reading its
 // caller's body inside the mutation gate — the happens-before edge that says
 // "the first adjudication has finished and the second has not started".
+//
+// PRECONDITION: the gate must be QUIESCENT when the case opens the request this
+// is waiting for. The counter behind it is PROCESS-GLOBAL and this accepts any
+// value above zero, so a request some other case left parked reads as this
+// one's — and under -shuffle the two need not even be adjacent in the source.
+// waitForGateQuiescent establishes that precondition; authzServer's cleanup is
+// what makes it cheap to establish, by refusing to let a case return with a
+// request still parked.
 func waitForMutationBodyWaiter(t *testing.T) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -616,6 +823,30 @@ func waitForMutationBodyWaiter(t *testing.T) {
 	}
 	t.Fatal("no request ever parked reading its body inside the gate, so the case never " +
 		"reached the window it tests")
+}
+
+// waitForGateQuiescent blocks until NO request is parked in the gate's body
+// drain and nothing is charged against its aggregate budget (#6645 r22,
+// finding 2).
+//
+// It is the precondition every case that waits on those process-global counters
+// needs, and the postcondition every case that parks a request owes. Both are
+// package-level gauges shared by every api.Server in the process, so "some
+// request is parked" and "this case's request is parked" are the same
+// observation unless the count is known to have started at zero.
+func waitForGateQuiescent(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if MutationBodyWaitersForTest() == 0 && MutationBodyBytesAdmittedForTest() == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("the gate never went quiescent: %d requests parked reading a body, %d bytes "+
+		"charged against the aggregate budget. A case that returns while a request is still "+
+		"parked poisons the next case's waiter edge",
+		MutationBodyWaitersForTest(), MutationBodyBytesAdmittedForTest())
 }
 
 // TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561 is the round-10
@@ -693,6 +924,10 @@ func TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561(t *testing.T) {
 						cfg.PeerLookupFn = fixedPeerUID(authzUIDSuperuser)
 					}
 					s, base := authzServer(t, cfg)
+
+					// The waiter edge below is a process-global count, so no
+					// request from another case may still be parked in the drain.
+					waitForGateQuiescent(t)
 
 					// config/set is a route whose HANDLER genuinely blocks on the
 					// caller: configSetHandler decodes the body before it looks at

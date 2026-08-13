@@ -107,6 +107,10 @@ func TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561(t *testing.T) {
 						PeerLookupFn: fixedPeerUID(authzUIDSuperuser),
 					})
 
+					// The waiter edge below is a process-global count, so no
+					// request from another case may still be parked in the drain.
+					waitForGateQuiescent(t)
+
 					// A route whose HANDLER blocks on the caller (configSetHandler
 					// decodes before anything else), so the window driven here is
 					// the real one rather than an artefact of the gate buffering on
@@ -296,6 +300,16 @@ func TestNoBodyRouteIsNotBufferedByTheGate_5561(t *testing.T) {
 				"adjudication until the caller supplies it — and the probe above cannot "+
 				"distinguish anything if every route answers early", status)
 		}
+		// This control ENDS with a request deliberately parked on a body it will
+		// never finish, and the counter it is holding is process-global. Hang up
+		// and wait for the gate to let go before returning (#6645 r22, finding
+		// 2): openDeclaredBody's own cleanup closes the connection but nothing
+		// joins the handler, so without this the waiter outlives the case and
+		// the next one's waitForMutationBodyWaiter can take it for its own.
+		if err := conn.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		waitForGateQuiescent(t)
 	})
 }
 

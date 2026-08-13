@@ -84,7 +84,19 @@ func authzServer(t *testing.T, cfg Config) (*Server, string) {
 	// (cross-site guard -> authz guard -> mux) AND the ConnContext hook.
 	srv := s.buildHTTPServer(ln.Addr().String(), s.newAuthSlot())
 	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	t.Cleanup(func() {
+		_ = srv.Close()
+		// Close shuts the listener and every active connection, which unparks a
+		// request still reading its caller's body — but it does NOT join the
+		// handler, so the gate's counters can still be non-zero after this
+		// returns. Wait for them here (#6645 r22, finding 2): the counters are
+		// process-global and waitForMutationBodyWaiter accepts any value above
+		// zero, so a case that leaves a request parked hands the next case a
+		// waiter that is not its own. Waiting at the leaking case's own cleanup
+		// also puts the failure on the case that leaked rather than on whichever
+		// innocent one -shuffle happened to run next.
+		waitForGateQuiescent(t)
+	})
 	return s, "http://" + ln.Addr().String()
 }
 
@@ -697,8 +709,20 @@ func TestHalfCloseCannotBorrowCredential_5561(t *testing.T) {
 // resolving at accept: it runs exactly once no matter how many requests the
 // connection carries, and it runs even on a connection that only ever issues a
 // safe request.
+//
+// Both counts are read through waitForPeerLookupsToFinish rather than sampled
+// when the responses land (#6645 r22, finding 3). The lookup runs in a goroutine
+// connContext starts at accept, and every request below is SAFE — safe methods
+// return from mutationAuthzGuard before authorizeInputs, so nothing on the
+// request path waits for the lookup. A response therefore does not imply the
+// resolver has run, and an immediate sample can read 0 where it wants 1. The
+// wait is for the count AND for zero pool occupancy: with the pool empty, every
+// lookup started so far has returned, so "at least N counted" and "exactly N
+// counted" are the same reading and the equality assertions below still mean
+// what they say.
 func TestPeerIdentityIsResolvedAtAccept_5561(t *testing.T) {
 	usePasswdFixture(t)
+	waitSlots(t, 0, "the lookup pool never returned to zero occupancy before this case started")
 
 	var mu sync.Mutex
 	calls := 0
@@ -735,6 +759,7 @@ func TestPeerIdentityIsResolvedAtAccept_5561(t *testing.T) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
+	waitForPeerLookupsToFinish(t, count, 1, "one connection carrying two safe requests")
 	if got := count(); got != 1 {
 		t.Fatalf("peer identity resolved %d times for ONE connection carrying two SAFE "+
 			"requests, want exactly 1 at accept — a per-request lookup lets the caller "+
@@ -750,6 +775,7 @@ func TestPeerIdentityIsResolvedAtAccept_5561(t *testing.T) {
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	waitForPeerLookupsToFinish(t, count, 2, "a second connection")
 	if got := count(); got != 2 {
 		t.Fatalf("a second connection resolved the peer %d times in total, want 2 — the "+
 			"identity must be per connection, never shared between callers", got)

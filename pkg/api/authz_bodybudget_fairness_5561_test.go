@@ -401,6 +401,9 @@ func TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561(t *testing.T) {
 	})
 
 	t.Run("caller hung up mid-body", func(t *testing.T) {
+		// The waiter edge below is a process-global count, so no request from
+		// another case may still be parked in the drain.
+		waitForGateQuiescent(t)
 		conn := openDeclaredBody(t, base, "POST /api/v1/diagnostics/ping", int(mutationBodySmall), "{", nil)
 		waitForMutationBodyWaiter(t)
 		// Abort: the gate's read fails and the handler never runs.

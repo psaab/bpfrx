@@ -389,9 +389,14 @@ The residual is named rather than papered over: a `/etc/passwd` read still
 separates the snapshot from the verdict on the peer-UID row. Snapshot and
 decision cannot be made simultaneous without holding the config store's lock
 across the whole gate; they can be made adjacent.
-`authz_freshness_5561_test.go` pins the ordering above, each case with a
-control that must be ADMITTED so a reverted ordering cannot be "caught" by an
-unrelated 403.
+`authz_freshness_5561_test.go` pins both orderings, each case with a control
+that must be ADMITTED so a reverted ordering cannot be "caught" by an unrelated
+403. Which case pins which is worth being precise about, because for the
+credential bullet it is *not* the obvious one:
+`TestConfigSnapshotIsReadAfterThePeerWait_5561` pins the first, and
+`TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561` — not
+`TestRevokedCredentialCannotFinishAnInFlightRequest_5561` — pins the second.
+The next section says why.
 
 **What `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` actually
 proves, stated precisely (#6645 r21).** It proves a DISJUNCTION — that *at
@@ -414,12 +419,28 @@ So no single-site deletion distinguishes, and an earlier revision of this
 section — which said the test "pins both" — overstated it.
 
 Isolating the credential-branch re-read specifically needs a case the second
-pass cannot answer: take a body-carrying route, withhold the body, block the
-FIRST pass inside `Config.PeerLocalityFn`, revoke the credential while it is
-parked, release locality, and require a prompt 403 *before* the body is
-supplied — the second pass has not run at that point, so only the branch's own
-re-read can produce the denial. That case is not written; until it is, treat
-the branch re-read as covered only by the disjunction above.
+pass cannot answer, and
+`TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561` (#6645 r22) is it: a
+body-carrying route (`POST /api/v1/config/set`) whose body is declared and never
+sent, with the FIRST pass blocked inside `Config.PeerLocalityFn`, the credential
+revoked while it is parked, locality released, and a **prompt 403 required
+before the body is supplied**. Only pass 1 runs before the body, and within pass
+1 only the branch's own re-read can see a revocation that landed after the check
+at the top of `principalFrom` — so the denial has exactly one possible author.
+Its control arm must PARK rather than answer, which is what makes "prompt"
+mean something. Measured against the same three cells:
+
+| mutation | `…CannotFinishAnInFlightRequest` | `…RereadDeniesBeforeTheBody` |
+|---|---|---|
+| credential branch returns the pre-enumeration principal | PASS | **FAIL** |
+| second-pass `reauthorizeInputs` deleted | PASS | PASS |
+| **both** | **FAIL** | **FAIL** |
+
+The middle row is the point as much as the first: the new case stays green when
+the *second* pass is deleted, so it isolates the branch re-read rather than
+restating the disjunction. Two guards that each cover for the other read as
+redundancy and are actually a gap — worth recognising as a shape, not just as
+this instance.
 
 **And the gate is not the last thing that blocks.** Ordering the gate's own
 blocking steps is necessary and was not sufficient, because the *handler* blocks
@@ -468,6 +489,39 @@ did not run. `authz_bodybudget_5561_test.go` owns what the window may cost:
 holding more than the budget must be REFUSED, not admitted), and
 `TestEveryGuardedRouteDeclaresABodyLimit_5561`, which keeps the permission and
 body-limit tables from diverging.
+
+**The observability hooks these cases wait on are PROCESS-GLOBAL, and that is a
+test-hygiene obligation (#6645 r22).** `MutationBodyWaitersForTest`,
+`MutationBodyBytesAdmittedForTest` and `PeerLookupSlotsInUseForTest` are
+package-level gauges shared by every `api.Server` in the process, so "some
+request is parked" and "*this* case's request is parked" are the same
+observation unless the count is known to have started at zero. Two rules keep
+them meaningful, and both are load-bearing rather than tidiness:
+
+- A case that waits on a waiter edge calls `waitForGateQuiescent` **before** it
+  opens the request, so its `waitForMutationBodyWaiter` — which accepts any
+  count above zero — cannot be answered by somebody else's parked request.
+- A case must not RETURN with a request still parked. `authzServer`'s cleanup
+  closes the server and then waits for the gate to go quiescent, which puts the
+  failure on the case that leaked rather than on whichever innocent case
+  `-shuffle` ran next. `TestNoBodyRouteIsNotBufferedByTheGate_5561` ends by
+  design with a control request parked on a body it never finishes (measured:
+  `waiters=1 admitted=512` at the end of its body), so it hangs up and drains
+  explicitly.
+
+The same shape bites the accept-time pool from the other side. `connContext`
+returns its admission token in the goroutine's **last** defer and `close(p.done)`
+is deferred after it — so `p.done` closes FIRST, and a case that joins on it (or
+simply drives HTTP and reads the response) returns while the token is still out.
+`TestPeerLookupSlotsAreReturned_5561` therefore waits for genuine zero occupancy
+before filling the pool: with one token already held it can take only
+`maxConcurrentPeerLookups-1` more and reads one OVER, failing its own
+precondition — `pool holds 1024 tokens before the case starts, want 1023` — with
+nothing wrong in production. And because a SAFE request never enters the
+mutation gate, nothing on its request path waits for the lookup at all, so
+`TestPeerIdentityIsResolvedAtAccept_5561` reads its resolver counts through
+`waitForPeerLookupsToFinish` (count reached *and* pool empty) rather than
+sampling when the response lands.
 
 `authz_bodybudget_fairness_5561_test.go` owns the other direction of the same
 availability property — that the bound is not itself a denial lever.

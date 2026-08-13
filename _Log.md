@@ -78962,3 +78962,107 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 
   NOT re-derived, per instruction: the route enumeration (one ServeMux, 61
   registrations, 19 mutating, tables equal to that set).
+
+## 2026-08-13 — #5561 round 22: isolate the credential re-read; de-couple three process-global test edges
+
+- **Timestamp**: 2026-08-13
+- **Action**: Three test-quality findings on PR #6645. No production file is
+  touched — `git diff` over `pkg/api/authz.go`, `pkg/api/server.go` and
+  `pkg/authz/` is empty — so the gate's behaviour is unchanged and only what the
+  suite can PROVE about it moves.
+
+  **F1 — the masking round 21 named is now closed by a case, not by a caveat.**
+  Round 21 measured that `TestRevokedCredentialCannotFinishAnInFlightRequest_5561`
+  proves a DISJUNCTION: two live credential re-validations sit between
+  `Config.PeerLocalityFn` and the handler — the re-read inside `principalFrom`'s
+  credential branch, and the gate's second pass (`reauthorizeInputs`, whose
+  `principalFrom` re-validates at the top for every row) — and each masks the
+  other's deletion. Re-measured firsthand at this head before writing anything,
+  because a stale premise is not a licence to write a test:
+
+      mutation                                   old case   NEW case
+      credential branch returns the principal
+        minted BEFORE the enumeration            PASS       FAIL
+      second pass reauthorizeInputs deleted      PASS       PASS
+      both                                       FAIL       FAIL
+
+  New case `TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561`
+  (`authz_freshness_5561_test.go`) asks the question before the second pass
+  exists: a body-carrying route (`POST /api/v1/config/set`, mutationBodyEdit)
+  whose body is DECLARED and never sent, pass 1 blocked inside
+  `Config.PeerLocalityFn`, the credential revoked while it is parked, locality
+  released — and a 403 required WITHOUT the body. Only pass 1 runs before the
+  body, and within pass 1 only the branch's own re-read can see a revocation
+  that landed after the check at the top of `principalFrom`, so the denial has
+  exactly one possible author. Both credential shapes (Basic, X-API-Key) are
+  driven, as in the case above, because `credentialPrincipalUser` has two arms.
+  RED-on-revert observed as an ASSERTION, not a build break:
+
+      authz_freshness_5561_test.go:530: nothing answered within 5s while the
+      body was withheld. Pass 1 therefore ADMITTED a request whose api-auth
+      credential had already been revoked, and the gate is parked in its body
+      drain [...]
+
+  The OVER-REACH GUARD is the middle row: the new case stays GREEN when the
+  second pass is deleted, so it isolates the branch re-read rather than
+  restating the disjunction. Its control arm must PARK rather than answer,
+  which is what makes "prompt" an assertion instead of a hope.
+
+  **F2 — the body-window waiter edge is process-global, and a case was leaving
+  one parked.** `waitForMutationBodyWaiter` accepts ANY count above zero, and
+  `TestNoBodyRouteIsNotBufferedByTheGate_5561` ends by design with a control
+  request parked on a body it never finishes. Measured at the unmodified PR head
+  with a probe: `waiters=1 admitted=512` at the end of that case's body,
+  `waiters=0 admitted=0` once its cleanups had run. So the leak is REAL and the
+  cross-test misattribution it enables is real in principle — but it was NOT
+  reproduced: the subtest's own `t.Cleanup` closes the connection and the
+  handler unparks before the next case's body runs, and a probe test placed
+  immediately after read 0/0 on three consecutive runs. Reported as a race that
+  is now closed by construction rather than one that was caught in the act.
+  New `waitForGateQuiescent` is called BEFORE the request is opened at every
+  case that waits on the edge, and `authzServer`'s cleanup now closes the server
+  and waits for both counters to reach zero — which puts the failure on the case
+  that leaks rather than on whichever innocent case `-shuffle` runs next. The
+  no-body control hangs up and drains explicitly.
+
+  **F3 — two async probes had no quiescence edge, and one of them has a
+  deterministic repro.** `connContext` returns its admission token in the
+  goroutine's LAST defer and `close(p.done)` is deferred after it, so `p.done`
+  closes FIRST: a case that joins on it, or simply drives HTTP and reads the
+  response, returns while the token is still out. With one token already held,
+  `TestPeerLookupSlotsAreReturned_5561` can fill only `maxConcurrentPeerLookups-1`
+  more and reads one OVER. A throwaway preceding case that leaves exactly that
+  state made it fail with an ASSERTION and nothing wrong in production:
+
+      authz_freshness_5561_test.go:455: pool holds 1024 tokens before the case
+      starts, want 1023
+
+  Fixed by an initial `waitSlots(t, 0, ...)`; the same repro then passes, taking
+  2.01s — the held-token window absorbed rather than mistaken for a defect.
+  Separately, `TestPeerIdentityIsResolvedAtAccept_5561` sampled exact resolver
+  counts the moment its responses landed, but every request it makes is SAFE and
+  a safe method returns from `mutationAuthzGuard` before `authorizeInputs` — so
+  nothing on the request path waits for the accept-time lookup and the sample can
+  read 0 where it wants 1. It now reads through new
+  `waitForPeerLookupsToFinish` (count reached AND pool empty; zero occupancy is
+  the only edge that says every lookup started has finished), which keeps the
+  equality assertions meaning what they say.
+
+  **Relation to the flake disclosed as UNKNOWN on 2026-08-12** (`_Log.md`, the
+  round-21 entry): one run of `./pkg/authz/... ./pkg/api/...` failed once at that
+  head and never again, with the test name truncated before it was read. F3's
+  mechanism is a candidate — same package pair, same head, and it was introduced
+  by the very commit that added `TestPeerLookupSlotsAreReturned_5561` — but the
+  name is unrecoverable, so this is NOT claimed as the identification. The
+  mechanism is now closed either way.
+
+  **Validation.** `gofmt -l pkg/api/` clean; `go build ./...` rc 0;
+  `go vet ./pkg/api/...` rc 0; `go test ./pkg/api/` rc 0 (39s); four `-shuffle`
+  legs (seeds 1-4) rc 0; `-race -count=2` rc 0 (90s); the nine touched cases at
+  `-count=5 -shuffle=on` rc 0; `./pkg/authz/... ./pkg/api/...` three times at
+  `-shuffle=on` rc 0. Every mutation restored and the production file verified
+  byte-clean before committing.
+- **File(s)**: pkg/api/authz_freshness_5561_test.go,
+  pkg/api/authz_bodywindow_5561_test.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go,
+  pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
