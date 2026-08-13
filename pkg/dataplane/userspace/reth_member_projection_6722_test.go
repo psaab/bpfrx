@@ -52,8 +52,10 @@ import (
 //     member votes.
 //  4. The four incoherent memberships are commit REJECTIONS.
 //  5. A member unit that reaches the builder anyway — via the tolerant load /
-//     peer-sync path, where the gate is a warning — still VOTES, so its ifindex
-//     stays ambiguous and fails CLOSED.
+//     peer-sync path, where the gate is a warning — still VOTES. For a non-VLAN
+//     unit 0, which collapses onto the base netdev, that holds the SHARED
+//     ifindex ambiguous and fails CLOSED; a VLAN unit lands on its own netdev
+//     and bears on its own ifindex instead (#6722 round 9).
 //
 // FAIL-ON-REVERT, per production hunk:
 //
@@ -837,9 +839,13 @@ func TestRethNamingARedundantParentIsRejected_6722(t *testing.T) {
 //     zone another row on it named, or leave it with no contributing row at all
 //     and answer the 0 sentinel.
 //  2. UNIT rows are never marked. `buildInterfaceSnapshots` stamps
-//     `RethProjection: false` on every unit row unconditionally, so a
-//     grandfathered reth that carries units keeps voting through them and its
-//     unzoned units still hold the shared ifindex ambiguous.
+//     `RethProjection: false` on every unit row unconditionally, so the mark can
+//     never silence an independently addressed L3 interface. It does NOT follow
+//     that those units hold the base row's ifindex ambiguous — round 9 measured
+//     that claim false. It holds for a non-VLAN unit 0, which collapses onto the
+//     base netdev; a VLAN unit goes to `L(R(name)).<vlan>`, its own netdev, and
+//     says nothing about the base's. Sub-case `reth-carrying-a-vlan-unit` pins
+//     the split.
 //
 // It remains a fail-OPEN delta against master, which has no agreement ledger
 // and reaches the 0 sentinel by row-sourced last-write-wins — tolerated on the
@@ -924,6 +930,42 @@ func TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722(t *testing.
 		t.Errorf("reth1.0 ifindex %d, reth1 ifindex %d, want equal: the unit row has "+
 			"to land on the SAME ifindex or its surviving vote does not bear on the "+
 			"one the mark silences", markedUnit.Ifindex, markedBase.Ifindex)
+	}
+
+	// `reth-carrying-a-vlan-unit`: the SAME shape with a VLAN unit instead of
+	// unit 0, and the reason the surviving-unit-vote reading of bound (2) is
+	// wrong. `snapshotLinuxName` sends a VLAN unit to `L(R(name)).<vlan>`, so
+	// the unit is a row on its OWN netdev and bears on its own ifindex only —
+	// the marked base row is then the only unzoned row on the base ifindex.
+	// The unit-row EXEMPTION still holds here (that is bound (2)); what does
+	// not hold is the inference that the exemption keeps the base's ifindex
+	// ambiguous. Round 9 measured that difference; this pins it so the two
+	// cannot be conflated again.
+	vlan := compileWithStubbedLinks6722(t, []string{
+		"set interfaces reth1 gigether-options redundant-parent reth0",
+		"set interfaces reth1 unit 100 vlan-id 100 family inet address 10.0.61.1/24",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 unit 0 family inet address 10.0.62.1/24",
+		"set security zones security-zone lan interfaces reth0",
+	}, map[string]int{"reth1": 31, "reth1.100": 32}, nil, true)
+	vlanSnaps := buildInterfaceSnapshots(vlan)
+	vlanBase := snapByName6722(t, vlanSnaps, "reth1")
+	vlanUnit := snapByName6722(t, vlanSnaps, "reth1.100")
+	if !vlanBase.RethProjection || vlanUnit.RethProjection {
+		t.Errorf("VLAN sub-case marks: reth1 = %v, reth1.100 = %v, want true and "+
+			"false: the base row is marked and the unit row is exempt, exactly as in "+
+			"the unit-0 sub-case", vlanBase.RethProjection, vlanUnit.RethProjection)
+	}
+	if vlanUnit.Ifindex == vlanBase.Ifindex {
+		t.Errorf("reth1.100 ifindex %d == reth1 ifindex %d, want DIFFERENT: a VLAN "+
+			"unit resolves to `L(R(name)).<vlan>`, its own netdev. If these ever "+
+			"coincide, the unit-0 reasoning above would apply to VLAN units too and "+
+			"the bound stated in rethProjectionMembers needs re-deriving rather than "+
+			"this test re-pointing", vlanUnit.Ifindex, vlanBase.Ifindex)
+	}
+	if vlanUnit.LinuxName != "reth1.100" {
+		t.Errorf("reth1.100 LinuxName = %q, want reth1.100: the VLAN suffix is what "+
+			"puts it on a different netdev from the base row", vlanUnit.LinuxName)
 	}
 
 	// Row 4: non-reth parent, reth candidate — the 2-cycle, where BOTH rows on

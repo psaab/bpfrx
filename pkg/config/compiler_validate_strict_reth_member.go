@@ -90,10 +90,14 @@ import (
 // Strict on commit / commit-check (hard reject, so the operator sees the
 // incoherence before it can silently mis-zone traffic); downgraded to a warning
 // on the tolerant load / peer-sync paths (opts.lenientRethMember) so a config
-// committed before this gate still boots (#1960 no-brick). The Go builder stays
-// fail-CLOSED for the shapes that reach it that way: the mark is stamped on a
-// member's BASE row only, so a grandfathered member unit still votes and still
-// holds its ifindex ambiguous.
+// committed before this gate still boots (#1960 no-brick). What bounds the Go
+// builder for a shape that reaches it that way is that the mark is stamped on a
+// member's BASE row only, so a grandfathered member unit is never silenced. Note
+// that this does NOT by itself keep the BASE row's ifindex ambiguous: that
+// follows only for a non-VLAN unit 0, which collapses onto the base netdev — a
+// VLAN unit lands on `L(R(name)).<vlan>`, its own netdev (#6722 round 9). The
+// universal bound is the Rust gate's `zone.is_empty()` conjunct: a withheld vote
+// is always an EMPTY one, so a mark can never discard a zone the operator wrote.
 func validateRethMemberStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -123,27 +127,43 @@ func validateRethMemberStrict(cfg *Config) error {
 				name)
 		}
 		if strings.HasPrefix(name, "reth") {
+			// The consequences below are stated as POSSIBILITIES on purpose.
+			// Which one follows depends on the rest of the config — on whether
+			// this interface wins `RethToPhysical`'s scoring against the
+			// parent's real physical ports, and on whether anything names it as
+			// ITS parent — and every earlier spelling asserted one of them
+			// unconditionally and was measured false for a shape this very gate
+			// rejects (#6722 rounds 8 and 9: a reth parent that already has a
+			// real member marks nothing; a two-name cycle whose reth has a
+			// lower-named third member marks neither cycle row). What IS
+			// unconditional is the entry into the scoring, so that is what the
+			// message asserts.
 			return fmt.Errorf(
 				"interface %q is a redundant-ethernet interface and also names "+
 					"`gigether-options redundant-parent %s`; a reth OWNS the L3 "+
 					"identity of a redundant pair and is never a member port of "+
 					"another interface, so this makes the L3 owner a port of "+
 					"something else. `RethToPhysical` keys its map on the "+
-					"redundant-parent NAME, so %q becomes what %q resolves to. With "+
-					"a reth parent, the parent's rows then land on the netdev name "+
-					"%q, which no NIC is ever named, and the snapshot builder marks "+
-					"%q a PROJECTION of %q and withholds its egress-zone vote — the "+
-					"L3 owner silenced in favour of its own supposed parent. With a "+
-					"non-reth parent it depends on whether that parent also names "+
-					"%q as ITS redundant parent: the two-name cycle marks BOTH rows "+
-					"on the shared device, and without the cycle nothing is marked "+
-					"but the resolvers split — `ResolveKernelIfName` honours the "+
-					"map entry for a dotted reference while the dataplane's "+
-					"`snapshotLinuxName` does not, so %q's units DISPLAY on one "+
-					"device and forward on another. Name the physical ports "+
-					"(ge-/xe-/et-) as the members of %q and remove the "+
-					"redundant-parent line from it",
-				name, parent, name, parent, name, name, parent, name, parent, name)
+					"redundant-parent NAME, so this line enters %q into the "+
+					"scoring for what %q resolves to, competing with %q's real "+
+					"physical ports. Depending on the rest of the config that can "+
+					"put %q's addresses, security zone and ifindex on the netdev "+
+					"name %q — which, a reth not being a kernel device, no NIC "+
+					"carries; it can make the snapshot builder mark %q a "+
+					"PROJECTION of %q and withhold its egress-zone vote, the L3 "+
+					"owner silenced in favour of its own supposed parent; and when "+
+					"%s is not itself a reth it splits the two resolvers, because "+
+					"`ResolveKernelIfName` honours this map entry for a dotted "+
+					"reference where the dataplane's `snapshotLinuxName` does not, "+
+					"so units under %s DISPLAY on one device and forward on "+
+					"another. Name the physical ports (ge-/xe-/et-) as the members "+
+					"of %q and remove the redundant-parent line from it",
+				name, parent,
+				name, parent, parent,
+				parent, name,
+				name, parent,
+				parent, parent,
+				parent)
 		}
 		if _, ok := LookupInterface(cfg, parent); !ok {
 			return fmt.Errorf(

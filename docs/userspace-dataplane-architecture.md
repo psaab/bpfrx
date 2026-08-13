@@ -1000,8 +1000,12 @@ Scope of the fallback:
   question left is which of a RETH's declared members `RethToPhysical`'s
   node-affinity scoring picked — and that comparison IS the resolver's answer,
   with no second opinion to disagree with it. The mark is stamped on the base
-  row only, so a member unit arriving through the lenient path keeps voting and
-  its ifindex stays ambiguous (fail-closed).
+  row only, so a member unit arriving through the lenient path is never silenced.
+  For a non-VLAN unit 0 — which collapses onto the base netdev — that keeps the
+  shared ifindex ambiguous (fail-closed); a VLAN unit lands on its own netdev and
+  bears on its own ifindex instead (#6722 round 9). The bound that holds in BOTH
+  cases is the Rust gate's `zone.is_empty()` conjunct: a withheld vote is always
+  an empty one.
 
   Note that a NAME can still satisfy the predicate — `ge-0/0/1.100` really does
   resolve onto `reth1.100`'s netdev. That is not a hole; it is why the answer is

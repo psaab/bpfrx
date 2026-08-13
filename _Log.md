@@ -80435,3 +80435,48 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/reth_member_projection_6722_test.go,
   pkg/config/compiler_validate_strict_reth_member.go,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-13T20:05Z
+- **Action**: #6722 round 9 — two claim defects from the hostile review at 2baa6095b,
+  both non-blocking, no runtime change; plus three sibling sites the review did not
+  name, found by sweeping the predicate rather than the instance. **Item 1 CORRECTS
+  the round-8 entry above.** That entry's bound (2) said a grandfathered reth
+  carrying units "keeps voting through them, so its unzoned units still hold the
+  shared ifindex ambiguous". That holds only for a non-VLAN unit 0, which collapses
+  onto the base netdev. `snapshotLinuxName` sends a VLAN unit to
+  `L(R(name)).<vlan>` — a different netdev. Measured with the real lenient compiler
+  + builder: `reth1 unit 100 vlan-id 100` beside a zoned `reth0` leaves ifindex 31
+  carrying only [reth0 `lan`, reth1 unzoned+MARKED] and it resolves `lan`, where the
+  same config with `unit 0` puts `reth1.0` on 31 and it resolves 0. Bound (1) — a
+  withheld vote is always an EMPTY one — is sound and unchanged. Replaced the false
+  sentence with a STRONGER bound that does hold: a row-3 mark is RUNTIME-INERT.
+  `S(parent) == S(name)` with both reth forces `S(name)` to the marked reth's own
+  name (any member of `name` would have to canonicalize to a member of `parent`,
+  which is #5832's shape), and a reth is not a kernel device — measured, the row
+  gets ifindex 0 from `buildLinkSnapshot`, and both `populate_interfaces` (:55) and
+  `populate_egress` (:492) skip `ifindex <= 0`. Row 4 is NOT inert (its netdev is a
+  real member's) and is bounded by (1). **Item 2**: the reth-parent branch of the
+  new commit-check message asserted unconditionally that the parent's rows land on
+  the netdev name `rethN` and that the builder marks the reth. Measured false when
+  the parent already has a real member: `ge-0/0/2 redundant-parent reth0` beside
+  `reth1 redundant-parent reth0` gives `RethToPhysical[reth0] = ge-0/0/2` and marks
+  {ge-0/0/2} — reth1 is not marked at all. **SWEEP (not reported, found by grepping
+  the predicate "an unconditional sentence inside a multi-branch message")**: the
+  CYCLE branch is conditional too — a two-name cycle whose reth has a lower-named
+  third member (`ge-0/0/0 redundant-parent reth1`) gives `RethToPhysical[reth1] =
+  ge-0/0/0` and marks NEITHER cycle row. All three branches restructured to assert
+  only what is unconditional (the line enters the reth into `RethToPhysical`'s
+  scoring against the parent's real ports) and to state the consequences as
+  possibilities. **Sweep 2** on item 1's predicate found the same false inference at
+  three more sites: cell M's doc block, the validator's own doc comment tail, and
+  the architecture doc + this file's fact-5 header — all now carry the unit-0
+  qualifier. New cell-M sub-case `reth-carrying-a-vlan-unit` pins the split.
+  Validation: go build/vet/test ./... clean (62 pkgs, rc 0); cargo test --release
+  4419 passed 0 failed; mutations — stamping the unit row from the map reds BOTH
+  cell-M sub-cases, collapsing the VLAN unit onto the base netdev reds the new
+  ifindex/LinuxName assertions, and neutering the reth clause still reds exactly
+  L1/L2/L3 with H/I/K green (the message rewrite kept the matched fragment).
+- **File(s)**: pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  pkg/config/compiler_validate_strict_reth_member.go,
+  docs/userspace-dataplane-architecture.md, _Log.md

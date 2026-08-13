@@ -535,9 +535,31 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 //     operator wrote; it can only let the ifindex resolve a zone another row on
 //     it named, or leave it with no contributing row and answer the 0 sentinel.
 //  2. UNIT rows are never marked — `buildInterfaceSnapshots` stamps
-//     `RethProjection: false` on every unit row unconditionally. A grandfathered
-//     reth that carries units keeps voting through them, so its unzoned units
-//     still hold the shared ifindex ambiguous.
+//     `RethProjection: false` on every unit row unconditionally, so the mark can
+//     never silence an independently addressed L3 interface.
+//
+// It does NOT follow that a marked base row's units hold its ifindex ambiguous.
+// An earlier version of this comment said so; that is true only for a non-VLAN
+// unit 0, which collapses onto the base netdev. `snapshotLinuxName` sends a VLAN
+// unit to `L(R(name)).<vlan>` — a DIFFERENT netdev — so it votes on its own
+// ifindex and says nothing about the base's. Measured on `reth1 unit 100 vlan-id
+// 100` beside a zoned `reth0`: ifindex 31 carries only the zoned reth0 rows and
+// the unzoned MARKED reth1 row, so it resolves `lan` — where the same config
+// with `unit 0` puts `reth1.0` on ifindex 31 as well and resolves the 0
+// sentinel.
+//
+// A STRONGER bound holds for row 3 specifically: the mark is RUNTIME-INERT.
+// A row-3 mark requires `S(parent) == S(name)` with both `reth*`. `S(name)` is
+// `L(R(name))`, which is the marked reth's OWN name unless some interface
+// declares it as a redundant parent; if one does, `R(parent)` is a member of
+// `parent` and `R(name)` a member of `name`, two different interfaces, so the
+// equality needs a canonicalization collision — which is #5832's shape, not this
+// one. So absent a #5832 collision a row-3 mark always lands on the netdev name
+// `rethN`, and on the bondless-RETH model this whole mechanism exists for, a
+// reth is not a kernel device: `buildLinkSnapshot` resolves by name and answers
+// ifindex 0, and both `populate_interfaces` and `populate_egress` skip
+// `ifindex <= 0`. The row never reaches the ledger. Row 4 is NOT inert — its
+// netdev is a real physical member's — and is bounded by (1) instead.
 //
 // Pinned by TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722.
 //
