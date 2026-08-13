@@ -216,33 +216,44 @@ racing-producer test would have to catch the window open and would fail only
 probabilistically.
 
 DETECTING THE MUTATION is a strictly weaker requirement than observing the
-window, and that IS deterministically available — an earlier revision of this
-note said "none deterministically can" without the distinction, which is false
-and is recorded here so the option is taken rather than rediscovered. A
-`#[cfg(test)]`-gated cumulative acquisition counter (or high-water gauge) on
-`BindingLiveState`, bumped at the top of `try_acquire_pending_tx_admission`
-(`afxdp/binding_state/tx_inbox.rs`), makes a NOT-SAMPLED packet read ONE
-acquisition attempt under reserve-first and ZERO under sample-first:
-single-threaded, no race, no flake, no release cost, because it counts the
-ATTEMPT rather than catching the window open. It is deliberately not taken in
-this round — `BindingLiveState` is the very struct whose cross-core cacheline
-behaviour #6114 exists to fix, so a `#[cfg(test)]` field means the layout under
-test is no longer the layout that ships, and the mutation it would catch is
-already pinned structurally by the delegation canary below. That is a cost
-judgement, not an impossibility. What IS bound either side of the window:
+window, and that IS deterministically available. It is now TAKEN:
+`live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+counts calls into `try_acquire_pending_tx_admission`
+(`afxdp/binding_state/tx_inbox.rs`) and asserts a NOT-SAMPLED packet reads ZERO
+— reserve-first reads ONE. Single-threaded, no race, no flake, no release cost,
+because it counts the ATTEMPT rather than catching the window open.
+
+The counter is a `#[cfg(test)]` THREAD-LOCAL, not a `#[cfg(test)]` field on
+`BindingLiveState`. That distinction is the whole reason the instrument is
+takeable, and an earlier revision of this note missed it: it evaluated only the
+field form, correctly rejected it — `BindingLiveState` is the very struct whose
+cross-core cacheline behaviour #6114 exists to fix, so a test-only field puts a
+different layout under test than the one that ships — and then generalised that
+rejection to the instrument as a whole. A thread-local lives in its own storage,
+so `BindingLiveState` is byte-identical with and without it, and `#[cfg(test)]`
+is false for any non-test build so the bump does not exist in the shipped hot
+path. Thread-local rather than a process-global atomic for the #6294 reason: the
+default `cargo test` runs in parallel and every sibling test that enqueues a
+redirect bumps the same counter, so a global would be a load-sensitive flake.
+The pattern already exists in the tree — `OUTER_ROUTE_RESOLVE_COUNT` in
+`afxdp/frame/wg.rs`.
+
+Measured, at the head that added it: reverting `sample_then_admit_mirror_clone`
+itself to reserve-first (reserve, then drop the reservation when the sampler
+declines) reds that ONE test and leaves the other 4284 green — including the
+delegation canary, since the call site still delegates. That form was previously
+caught by nothing at all. Also bound either side of the window:
 
 - DELEGATION — a source canary asserts the call site reaches the queue through
   `sample_then_admit_mirror_clone` and never calls `admit_mirror_clone_to_live`
-  directly, so the ordering is inherited from the helper the #6114 tests already
-  bind. (Those tests catch the historical early-return form inside the helper;
-  a helper rewritten to reserve first and then suppress on a sampler decline
-  would be caught by neither, which is why the canary pins the wiring.) Its
-  limits are enumerated at the test, and the enumeration includes the one a
-  substring check can never close: `use ...::admit_mirror_clone_to_live as
-  admit;` calls the reservation directly while the forbidden spelling never
-  appears in the file. That takes a deliberate alias rather than an accidental
-  edit, so it bounds what the canary PROVES rather than naming a regression it
-  is expected to catch.
+  directly. It is retained for diagnosis — it localises a regression to "the
+  call site stopped delegating" rather than leaving only a counter mismatch —
+  but it is no longer what the ordering rests on. Its two enumerated escapes are
+  now covered by the attempt-count test, both measured: a reserve-first rewrite
+  INSIDE the helper (canary green, attempt count red), and the rename escape
+  `use ...::admit_mirror_clone_to_live as admit;` with a stale comment retaining
+  the required spelling (canary green, attempt count red). A call-site
+  open-coding that keeps the plain spelling reds both.
 - SHARED-CAPACITY ACCOUNTING —
   `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304` drives
   the target at a soft cap of exactly one slot, so an interleaving producer is
@@ -251,6 +262,37 @@ judgement, not an impossibility. What IS bound either side of the window:
   any reservation the call site takes and fails to hand back (measured: leaking
   it on the rollback path reds only that test, with the whole rest of the suite
   green).
+
+**Telemetry call sites in this function, swept individually.** Two rounds found
+an unbound `record_*` call by deleting one line, so the whole set was deleted one
+at a time against the full crate rather than continuing one report at a time.
+`filter::record_filter_counter` (both the #2573 TX-side and the #3777 input-side
+replay), `record_mirror_clone_result`, and
+`tx_counters.record_in_place_l2_rewrite` all RED. Two did not, and both are the
+"looks covered, binds nothing" shape in its two forms:
+
+- `policy::record_policy_hit_counter` (#3073) was UNREACHABLE — every fixture
+  left `policy_counter: None` with `policy_counter_idx: 0` against a
+  `ForwardingState::default()` policy snapshot, so `resolve_session_hit_counter`
+  returned `None` and the guarded block never ran. Bound by
+  `live_flow_cache_callsite_recounts_the_established_policy_hit_6304`, which
+  binds a real counter handle onto the cached entry and asserts packets AND
+  bytes — the byte cell distinguishes `meta.pkt_len` from a stripped L3 length,
+  which the packet count alone cannot.
+- `zone_counters::record_zone_traffic` (#3651) RAN on every fixture and did
+  nothing — an empty `ZoneCounterSlotMap` and an `EGRESS_IFINDEX` absent from
+  `forwarding.egress` make both slot lookups 0, and the function returns at
+  `if ingress_slot == 0 && egress_slot == 0`. Bound by
+  `live_flow_cache_callsite_accounts_per_zone_traffic_6304` through a
+  `with_zone_accounting` fixture builder. Both directions are asserted, because
+  the ingress zone comes from the shim metadata and the egress zone from
+  `egress_zone_id(..)` — two independent resolutions, and asserting one leaves
+  the other free.
+
+The generalisation worth keeping: a telemetry call reached by every test is not
+thereby covered. It binds nothing if its arguments select a no-op arm, and
+nothing if a guard above it is false in every fixture. Neither is visible in a
+coverage report; both are visible to a one-line deletion.
 
 A second canary, living in `mirror/mod_tests.rs` because one inside the module
 could not fire, asserts the test module is still registered at all — deleting

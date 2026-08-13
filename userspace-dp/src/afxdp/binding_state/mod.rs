@@ -55,6 +55,15 @@ pub(in crate::afxdp) use latency::{
 pub(in crate::afxdp) use latency::REDIRECT_SAMPLE_MASK;
 pub(in crate::afxdp) use profile::{OwnerProfileOwnerWrites, OwnerProfilePeerWrites};
 pub(in crate::afxdp) use tx_inbox::{PENDING_TX_INBOX_HARD_CAP, PendingTxAdmission};
+// #6304: the admission-attempt test instrument. Same `cfg(test)` treatment as
+// `REDIRECT_SAMPLE_MASK` above — it has no production consumer, so gating the
+// re-export keeps production builds warning-free. Consumed by
+// `poll_descriptor/flow_cache_hit_tests.rs` through the absolute path
+// `crate::afxdp::binding_state::pending_tx_admission_attempts`.
+#[cfg(test)]
+pub(in crate::afxdp) use tx_inbox::{
+    pending_tx_admission_attempts, pending_tx_admission_attempts_reset,
+};
 
 /// Atomically published flow-worker diagnostic payload.
 #[derive(Default)]

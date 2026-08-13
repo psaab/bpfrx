@@ -319,6 +319,24 @@ fn untagged_egress_entry() -> FlowCacheEntry {
     entry
 }
 
+/// #6304: `cached_entry` carrying a BOUND policy hit counter.
+///
+/// The stock fixture leaves `policy_counter: None` and `policy_counter_idx: 0`,
+/// and the `ForwardingState::default()` policy snapshot has no rule at index 0,
+/// so `resolve_session_hit_counter(None, 0)` is `None` and the whole
+/// `if let Some(counter)` block at the call site never executes. Binding the
+/// handle is what makes the block reachable — see
+/// `live_flow_cache_callsite_recounts_the_established_policy_hit_6304`.
+///
+/// The handle is bound rather than the index because #3322 made the BOUND
+/// handle the preferred resolution: it survives a live policy reorder, where
+/// the positional index re-attributes the flow's packets to a different rule.
+fn policy_counted_entry(counter: &Arc<crate::policy::PolicyRuleCounter>) -> FlowCacheEntry {
+    let mut entry = cached_entry();
+    entry.metadata.policy_counter = Some(counter.clone());
+    entry
+}
+
 fn tx_pipeline() -> WorkerTxPipeline {
     WorkerTxPipeline {
         free_tx_frames: (0..8u64).collect(),
@@ -513,6 +531,43 @@ impl LiveCallSiteFixture {
         }
     }
 
+    /// #6304: add the per-zone traffic-counter wiring `record_zone_traffic`
+    /// needs to do anything at all.
+    ///
+    /// A BUILDER rather than a change to `new`, because it touches state every
+    /// other cell in this module reads: registering `EGRESS_IFINDEX` in
+    /// `forwarding.egress` gives the forward egress a zone and an MTU it did not
+    /// have, and the ten existing cells are calibrated against the fixture
+    /// without it. Only the zone-counter cell opts in.
+    ///
+    /// Without this, `record_zone_traffic` early-returns before touching
+    /// anything: the default `ZoneCounterSlotMap` is empty so `slot_of` is 0 for
+    /// the ingress zone, and `EGRESS_IFINDEX` is absent from `forwarding.egress`
+    /// so `egress_zone_id` is 0 too — `if ingress_slot == 0 && egress_slot == 0
+    /// { return; }`. That is why deleting the call was green across the whole
+    /// crate.
+    fn with_zone_accounting(mut self) -> Self {
+        self.forwarding.egress.insert(
+            EGRESS_IFINDEX,
+            EgressInterface {
+                bind_ifindex: PHYS_INGRESS_IFINDEX,
+                vlan_id: INGRESS_VLAN_ID,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+                zone_id: TEST_UNTRUST_ZONE_ID,
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        self.forwarding.zone_counter_slot_map =
+            Arc::new(crate::afxdp::zone_counters::ZoneCounterSlotMap::build(
+                &[TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID],
+                &self.forwarding.zone_counter_store,
+            ));
+        self
+    }
+
     fn worker_ctx(&self) -> WorkerContext<'_> {
         WorkerContext {
             ident: &self.ident,
@@ -554,6 +609,12 @@ struct StageRun {
     /// forward/tx debug counter on every successful in-place cache hit.
     dbg_forward: u64,
     dbg_tx: u64,
+    /// #6304: how many times THIS call reached
+    /// `try_acquire_pending_tx_admission` — the shared cross-worker CAS whose
+    /// per-packet cost #6114 removed by sampling first. Zero for a packet the
+    /// worker-local sampler declined; see
+    /// `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`.
+    admission_attempts: u64,
 }
 
 /// Drive the LIVE call site once.
@@ -637,6 +698,11 @@ fn run_stage_with_entry(
     let mut owned_packet_frame: Option<Vec<u8>> = None;
     let mut mirror_sample_counter = initial_sample_counter;
 
+    // #6304: measure only THIS call. The fixture's own setup pushes (the AtCap
+    // precondition, the interleaving-producer probes) go through the same
+    // admission primitive, so the reset has to sit immediately before the call
+    // and the read immediately after it.
+    crate::afxdp::binding_state::pending_tx_admission_attempts_reset();
     let outcome = stage_flow_cache_hit(
         &mut flow_state,
         &mut tx_pipeline_state,
@@ -660,6 +726,7 @@ fn run_stage_with_entry(
         &fixture.worker_ctx(),
         &mut telemetry,
     );
+    let admission_attempts = crate::afxdp::binding_state::pending_tx_admission_attempts();
 
     StageRun {
         outcome,
@@ -669,6 +736,7 @@ fn run_stage_with_entry(
         mirror_sample_counter,
         dbg_forward: dbg.forward,
         dbg_tx: dbg.tx,
+        admission_attempts,
     }
 }
 
@@ -1041,27 +1109,24 @@ fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
 /// state created and destroyed inside one call is invisible to that call by
 /// construction, and visible to anyone racing it.
 ///
-/// COVERAGE GAP, stated plainly rather than papered over. No test in this
-/// module observes that transient window, and none here can observe THE WINDOW
-/// deterministically: the window is a pair of atomic RMWs entirely inside
+/// THE WINDOW itself is still not observed here, and cannot be observed
+/// deterministically: it is a pair of atomic RMWs entirely inside
 /// `stage_flow_cache_hit`, with no production hook a test could synchronise
 /// against, so a racing-producer test would have to catch it open and would
 /// fail only probabilistically — a flake, not a binding.
 ///
-/// DETECTING THE MUTATION is strictly weaker than observing the window, and
-/// that IS deterministically available: a `#[cfg(test)]`-gated cumulative
-/// acquisition counter on `BindingLiveState`, bumped at the top of
-/// `try_acquire_pending_tx_admission` (`afxdp/binding_state/tx_inbox.rs`),
-/// reads ONE attempt under reserve-first and ZERO under sample-first for a
-/// non-sampled packet — single-threaded, no race, because it counts the
-/// ATTEMPT rather than catching the window open. Not taken here as a cost
-/// judgement, not an impossibility: `BindingLiveState` is the struct whose
-/// cross-core cacheline behaviour #6114 exists to fix, so a `#[cfg(test)]`
-/// field means the layout under test is not the layout that ships. Recorded in
-/// `docs/userspace-dataplane-gaps.md` so a later round can take it.
+/// DETECTING THE MUTATION is strictly weaker than observing the window, and it
+/// IS deterministic — `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+/// now does it, so the ordering no longer rests on this source-text canary. It
+/// counts calls into `try_acquire_pending_tx_admission`
+/// (`afxdp/binding_state/tx_inbox.rs`) via a `#[cfg(test)]` THREAD-LOCAL —
+/// deliberately not a `#[cfg(test)]` field on `BindingLiveState`, which would
+/// change the layout of the very struct whose cross-core cacheline behaviour
+/// #6114 exists to fix. A thread-local is layout-neutral (that struct is
+/// byte-identical with and without it) and, unlike a process-global atomic,
+/// stays deterministic under the default parallel `cargo test`.
 ///
-/// What IS bound deterministically is the pair of properties either side of
-/// that window:
+/// Bound alongside it are the two properties either side of the window:
 ///   - the reservation the call site takes is externally visible and must be
 ///     handed back, not stranded —
 ///     `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304`;
@@ -1073,17 +1138,16 @@ fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
 /// Limits of the canary itself, enumerated so the list is not mistaken for
 /// completeness it does not have. It is source text, not a runtime
 /// observation, and it would need updating if the helper is legitimately
-/// renamed. It does NOT catch every reserve-before-sample defect inside the
-/// shared helper — the #6114 tests catch the historical form, where the helper
-/// returned early with the reservation already taken; a rewrite of the helper
-/// that reserved first and then suppressed on a sampler decline would be
-/// caught by neither. And the negative substring check is defeated by
-/// RENAMING at the import — `use ...::admit_mirror_clone_to_live as admit;`
-/// then `admit(...)` calls the reservation directly while the forbidden
-/// spelling never appears in this file. That escape needs a deliberate alias,
-/// not an accidental edit, so it is a bound on what this canary proves rather
-/// than a regression it is expected to catch; a substring canary cannot close
-/// it, only the runtime instrumentation described above can.
+/// renamed. It does NOT catch a reserve-before-sample rewrite INSIDE the shared
+/// helper — one that reserved first and suppressed on a sampler decline keeps
+/// the required spelling and avoids the forbidden one. Nor does it catch the
+/// RENAME escape at the import — `use ...::admit_mirror_clone_to_live as
+/// admit;` then `admit(...)` calls the reservation directly while the forbidden
+/// spelling never appears in this file. Both of those are caught by the
+/// attempt-count test named above, which observes the runtime call rather than
+/// the source text; this canary is retained because it localises the failure to
+/// "the call site stopped delegating" instead of leaving only a counter
+/// mismatch to diagnose.
 #[test]
 fn live_flow_cache_callsite_delegates_to_the_shared_sampler_6304() {
     let src = include_str!("flow_cache_hit.rs");
@@ -1099,6 +1163,97 @@ fn live_flow_cache_callsite_delegates_to_the_shared_sampler_6304() {
          directly — open-coding the reservation at this call site reintroduces \
          the O(PPS) cross-core true-sharing #6114 removed, and — for a single \
          completed invocation — without changing any observable counter"
+    );
+}
+
+/// #6304 FAIL-ON-REVERT for the #6114 ORDERING itself, at the live call site.
+///
+/// This is the cell the delegation canary above could not be: a runtime
+/// observation rather than a source-text one, so it catches reserve-first in
+/// EVERY spelling — open-coded at the call site, reached through a renamed
+/// import, or rewritten inside `sample_then_admit_mirror_clone`, which is the
+/// form nothing in the tree caught before.
+///
+/// What makes the mutation hard to see, restated so the instrument's shape is
+/// justified rather than assumed. Reserve-first and sample-first leave a
+/// COMPLETED call indistinguishable: the reservation is taken with an AcqRel
+/// CAS and given straight back by `PendingTxAdmission::drop` before the call
+/// returns, and the refusal path passes `record_overflow = false`
+/// (`try_reserve_mirror_tx_owned`) so even a reservation that FAILS bumps no
+/// counter. Net zero on `pending_tx_admitted`, no telemetry, same queue, same
+/// sampler. The real difference is the transient — the O(PPS) cross-core
+/// true-sharing #6114 removed — and that is visible only to a racing producer,
+/// i.e. only probabilistically.
+///
+/// Counting the ATTEMPT is the deterministic weakening: the mutant must call
+/// the admission primitive for a declined packet whatever it then does with the
+/// result. See `pending_tx_admission_attempts` in
+/// `afxdp/binding_state/tx_inbox.rs` for why the counter is a thread-local and
+/// not a `#[cfg(test)]` field on `BindingLiveState` (layout neutrality on the
+/// exact struct #6114 is about) and not a process-global atomic (determinism
+/// under the default parallel `cargo test`).
+///
+/// The target has ROOM in the declined arm, and that is load-bearing: at cap
+/// the mutant's reservation would be refused, so a test asserting on the
+/// OUTCOME could not tell a refused reservation from one never attempted. The
+/// instrument bumps BEFORE the cap load for the same reason — it must measure
+/// call ordering, not queue depth, which the third cell pins.
+#[test]
+fn live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304() {
+    // --- THE DISCRIMINATOR: rate = 2 with counter = 1 -> the sampler declines,
+    // and nothing may reach the mirror target's shared admission counter.
+    let declined = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let run = run_stage(&declined, &tcp_v4_ack_frame(), 1);
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED — the mirror \
+         arm this measures runs only inside that branch"
+    );
+    assert_eq!(
+        run.admission_attempts, 0,
+        "#6304/#6114: a packet the worker-local sampler DECLINED must not touch \
+         the mirror target's shared `pending_tx_admitted` at all. Reserving \
+         first and handing the reservation back on decline restores exactly the \
+         O(PPS) cross-core true-sharing #6114 removed, while leaving every \
+         counter, queue and admission count this module can read unchanged"
+    );
+
+    // --- POSITIVE CONTROL: a SELECTED packet makes exactly ONE attempt. Without
+    // it a zero above would also be satisfied by an unwired instrument, or by a
+    // fixture that never resolves a mirror target at all; and the exact count
+    // pins that the call site reserves ONCE, not once per resolution step.
+    let selected = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let run = run_stage(&selected, &tcp_v4_ack_frame(), 0);
+    assert_eq!(
+        selected
+            .ingress_live
+            .mirrored_packets
+            .load(Ordering::Relaxed),
+        1,
+        "control: the selected packet's clone is admitted and enqueued"
+    );
+    assert_eq!(
+        run.admission_attempts, 1,
+        "#6304: a SELECTED packet reserves on the mirror target exactly once"
+    );
+
+    // --- AT CAP: still exactly one attempt. This is what makes the declined
+    // arm's zero mean "never asked" rather than "asked and was refused" — the
+    // instrument counts the call, not its outcome.
+    let full = LiveCallSiteFixture::new(MirrorTargetQueue::AtCap);
+    let run = run_stage(&full, &tcp_v4_ack_frame(), 0);
+    assert_eq!(
+        full.ingress_live
+            .mirror_drops_queue_full_cross_worker
+            .load(Ordering::Relaxed),
+        1,
+        "control: the reservation was genuinely attempted and refused by a full \
+         cross-worker target"
+    );
+    assert_eq!(
+        run.admission_attempts, 1,
+        "#6304: a refused reservation is still an ATTEMPT — the instrument \
+         measures call ordering, not queue depth"
     );
 }
 
@@ -1398,5 +1553,159 @@ fn live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304() {
     assert_eq!(
         tx.pending_in_place_l2_memmove_fallback_packets, 0,
         "#6304: ...and not the unsupported-memmove fallback"
+    );
+}
+
+/// #6304 (#3073 policy hit-count replay). `record_policy_hit_counter` at
+/// `flow_cache_hit.rs` DELETES with the whole crate green — measured, 4285
+/// passed / 0 failed — because no fixture ever reaches it. This closes that.
+///
+/// The mechanism is the same one that hid `record_in_place_l2_rewrite` in the
+/// previous round, in its second shape. There the call ran on every fixture and
+/// landed in an arm that is an empty block; here the call never runs at all: the
+/// stock entry leaves `policy_counter: None` with `policy_counter_idx: 0`, and
+/// `ForwardingState::default()` has no rule at index 0, so
+/// `resolve_session_hit_counter` returns `None` and the guarded block is skipped
+/// on every packet this module has ever staged. Both look like covered call
+/// sites in a coverage report; neither binds anything.
+///
+/// What this costs when it regresses: the flow cache serves MOST packets of a
+/// long-lived permitted flow, so `show security policies hit-count` would report
+/// only each flow's seed packet — the exact under-count #3073 exists to fix.
+///
+/// The BYTE assertion is load-bearing separately from the packet one: the call
+/// site passes `meta.pkt_len`, and a call site that passed a stripped L3 length
+/// (or zero) would still advance the packet count. `test_meta` sets `pkt_len` to
+/// the FULL wire length, as the shim reports it.
+#[test]
+fn live_flow_cache_callsite_recounts_the_established_policy_hit_6304() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    let counter = Arc::new(crate::policy::PolicyRuleCounter::default());
+    let run = run_stage_with_entry(
+        &fixture,
+        &frame,
+        test_meta(&frame),
+        policy_counted_entry(&counter),
+        0,
+    );
+
+    // --- POSITIVE CONTROL: the staged packet really was forwarded, so a zero
+    // below would mean the counter was not charged rather than that the fixture
+    // fell out of the fast path early.
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED"
+    );
+
+    // --- THE DISCRIMINATOR.
+    assert_eq!(
+        counter.test_packet_count(),
+        1,
+        "#6304/#3073: an established-session packet served from the flow cache \
+         must be re-counted against the admitting policy's hit counter; without \
+         it `show security policies hit-count` reports only each flow's first \
+         frame"
+    );
+    assert_eq!(
+        counter.test_byte_count(),
+        frame.len() as u64,
+        "#6304/#3073: ...charged the FULL wire length the shim reported, not a \
+         stripped or zero byte count"
+    );
+}
+
+/// #6304 (#3651 per-zone traffic volume). `record_zone_traffic` at
+/// `flow_cache_hit.rs` also DELETES with the whole crate green — measured, same
+/// run. Third instance of the same class in this module, and the reason the
+/// sweep was run over every `record_*` call rather than the one that was
+/// reported.
+///
+/// Here the call RAN on every fixture and did nothing: with an empty
+/// `ZoneCounterSlotMap` and `EGRESS_IFINDEX` absent from `forwarding.egress`,
+/// both slot lookups are 0 and the function returns at its first branch.
+/// `with_zone_accounting` supplies exactly the wiring production always has —
+/// a slot map built over the configured zones, and an egress interface carrying
+/// a zone id — so the call has somewhere to land.
+///
+/// BOTH directions are asserted because the call passes two independently
+/// resolved zone ids: the ingress one comes from the shim metadata, the egress
+/// one from `egress_zone_id(cached_decision.resolution.egress_ifindex)`.
+/// Asserting only one leaves the other resolvable to anything.
+///
+/// `ZONE_PENDING` is a per-thread coalescer, so the flush is what makes the
+/// packet observable in the store at all. It is also thread state this test does
+/// not exclusively own: whether libtest runs each test on its own thread is a
+/// harness detail, not a contract, and `--test-threads=1` is part of this
+/// project's standard validation. The preamble below drains whatever is pending
+/// into a THROWAWAY store first, so a sibling's deltas can never fold into the
+/// assertions here — the isolation is by construction rather than by assumption
+/// about the runner.
+#[test]
+fn live_flow_cache_callsite_accounts_per_zone_traffic_6304() {
+    let discard = crate::afxdp::zone_counters::ZoneCounterStore::default();
+    crate::afxdp::zone_counters::flush_recorded_zone_counters(
+        &discard,
+        &crate::afxdp::zone_counters::ZoneCounterSlotMap::build(
+            &[TEST_TRUST_ZONE_ID, TEST_UNTRUST_ZONE_ID],
+            &discard,
+        ),
+    );
+
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom).with_zone_accounting();
+    let frame = tcp_v4_ack_frame();
+    let mut meta = test_meta(&frame);
+    meta.ingress_zone = TEST_TRUST_ZONE_ID;
+    let run = run_stage_with_meta(&fixture, &frame, meta, 0);
+
+    // --- POSITIVE CONTROL.
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED"
+    );
+
+    crate::afxdp::zone_counters::flush_recorded_zone_counters(
+        &fixture.forwarding.zone_counter_store,
+        &fixture.forwarding.zone_counter_slot_map,
+    );
+    let rows = fixture.forwarding.zone_counter_store.snapshot();
+
+    // --- THE DISCRIMINATOR: the forwarded packet is charged to BOTH zones.
+    let ingress = rows
+        .iter()
+        .find(|r| r.zone_id == TEST_TRUST_ZONE_ID)
+        .expect(
+            "#6304/#3651: the forwarded packet must be charged to its INGRESS \
+             zone; no row at all means `record_zone_traffic` never reached the \
+             coalescer",
+        );
+    assert_eq!(
+        (ingress.ingress_packets, ingress.ingress_bytes),
+        (1, frame.len() as u64),
+        "#6304/#3651: one packet at the full wire length on the ingress zone"
+    );
+    assert_eq!(
+        (ingress.egress_packets, ingress.egress_bytes),
+        (0, 0),
+        "#6304/#3651: ...and nothing on that zone's EGRESS side — the two \
+         directions must not be conflated"
+    );
+
+    let egress = rows
+        .iter()
+        .find(|r| r.zone_id == TEST_UNTRUST_ZONE_ID)
+        .expect(
+            "#6304/#3651: ...and to its EGRESS zone, resolved from the cached \
+             decision's egress ifindex",
+        );
+    assert_eq!(
+        (egress.egress_packets, egress.egress_bytes),
+        (1, frame.len() as u64),
+        "#6304/#3651: one packet at the full wire length on the egress zone"
+    );
+    assert_eq!(
+        (egress.ingress_packets, egress.ingress_bytes),
+        (0, 0),
+        "#6304/#3651: ...and nothing on that zone's INGRESS side"
     );
 }

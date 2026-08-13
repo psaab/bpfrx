@@ -546,6 +546,116 @@
   `rustfmt --check` alone and carries the same 9 pre-existing deviations as its
   parent commit, none added.
 
+## 2026-08-13 — #6304 fold r4: the layout objection was true of a FIELD, not of an instrument; and a sweep found the pattern one line to the left
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a Codex MERGE-NEEDS-MAJOR whose blocking finding
+  contradicted a judgement r3 made and the parent ratified. Codex was RIGHT, and
+  the way it was right matters: r3's rejection of the instrument was sound about
+  the specific form it evaluated and unsound as a generalisation.
+- **File(s)**: `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`, `userspace-dp/src/policy.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. `flow_cache_hit.rs` and
+  `mirror/resolver.rs` are byte-identical to the pre-fold head — restored from
+  saved copies and re-diffed after every mutation.
+
+  F1. **THE LAYOUT OBJECTION WAS ABOUT A FIELD, AND I APPLIED IT TO THE
+     INSTRUMENT.** r3 declined a `#[cfg(test)]` acquisition counter because
+     `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
+     exists to fix, so a test-only FIELD puts a different layout under test than
+     the one that ships. That reasoning is correct — and it is a reason to reject
+     the field, not the measurement. A `#[cfg(test)]` THREAD-LOCAL lives in its
+     own storage: `BindingLiveState` is byte-identical with and without it, and
+     `#[cfg(test)]` is false for every non-test build so nothing reaches the
+     shipped hot path. The pattern was already in the tree — #6294's
+     `OUTER_ROUTE_RESOLVE_COUNT` in `afxdp/frame/wg.rs`, thread-local for exactly
+     the parallel-`cargo test` determinism reason that rules out a global atomic.
+     Candidates checked before implementing, so the enumeration is a record and
+     not a search order: an existing PRODUCTION counter cannot work, because the
+     only shared state a declined packet touches under reserve-first is
+     `pending_tx_admitted` (incremented, then returned by
+     `PendingTxAdmission::drop` — net zero) and the refusal arm passes
+     `record_overflow = false`, so a refused reservation bumps nothing either;
+     observing at the CALL SITE cannot work, because `MirrorTargetMap` is a
+     concrete struct with no injection point and a lookup mutates nothing; a
+     racing-producer test observes the real window but only probabilistically;
+     a global `static AtomicU64` is layout-neutral but not deterministic under
+     the default parallel run.
+
+     `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
+     asserts a declined packet makes ZERO calls into
+     `try_acquire_pending_tx_admission`, with a SELECTED packet at one and a
+     SELECTED packet against a FULL target also at one — the third cell is what
+     makes the zero mean "never asked" rather than "asked and was refused".
+
+     | mutation | result |
+     |---|---|
+     | reserve-first INSIDE `sample_then_admit_mirror_clone` (reserve, drop on decline) | new cell RED (`left: 1, right: 0`), other 4284 GREEN — **including the delegation canary** |
+     | reserve-first OPEN-CODED at the call site | new cell RED **and** delegation canary RED, other 4283 GREEN |
+     | as above but through `use ...::admit_mirror_clone_to_live as reserve_clone_slot;` with a comment retaining the required spelling | new cell RED, delegation canary GREEN, other 4284 GREEN |
+
+     The first row is the finding: that mutation was caught by NOTHING before
+     this round. The third verifies a claim r3 asserted about the canary's rename
+     escape without testing it.
+
+  F2. **CODEX'S NAMED LINE WAS ALREADY BOUND — REFUTED, THREE WAYS.**
+     `record_mirror_clone_result` at `flow_cache_hit.rs:478` is not unbound. The
+     leg volunteered that test files were outside its read scope and asked for
+     empirical confirmation; the empirical answer is that deleting the call reds
+     the suite, and so do both properties the fold was asked to add: forcing the
+     byte argument to 0 reds (`mirrored_bytes` is asserted at the exact frame
+     length), and forcing the result to `Enqueued` reds (the failure counters are
+     asserted on the full-queue path). Recorded as an explicit NON-defect so the
+     next round does not re-derive it.
+
+  F3. **THE SWEEP FOUND THE PATTERN, ONE LINE AND TWO LINES TO THE LEFT.** The
+     hypothesis behind the sweep was right even though the reported instance was
+     not. Every `record_*` call in the file, deleted one at a time against the
+     FULL crate:
+
+     | site | verdict |
+     |---|---|
+     | `filter::record_filter_counter` TX-side (#2573) | RED — bound |
+     | `filter::record_filter_counter` INPUT-side (#3777) | RED — bound |
+     | `policy::record_policy_hit_counter` (#3073) | **GREEN — unbound** |
+     | `zone_counters::record_zone_traffic` (#3651) | **GREEN — unbound** |
+     | `record_mirror_clone_result` (#6304) | RED — bound (F2) |
+     | `tx_counters.record_in_place_l2_rewrite` | RED — bound by r3 |
+
+     Both survivors are the mechanism r3 named, in its two shapes. The policy
+     counter is UNREACHABLE: every fixture leaves `policy_counter: None` with
+     `policy_counter_idx: 0` and `ForwardingState::default()` has no rule at
+     index 0, so `resolve_session_hit_counter` returns `None` and the guarded
+     block never executes. The zone counter RUNS on every fixture and does
+     nothing: the default slot map is empty and `EGRESS_IFINDEX` is absent from
+     `forwarding.egress`, so both slot lookups are 0 and `record_zone_traffic`
+     returns at its first branch — the same "only reachable arm is a no-op" shape
+     as r3's `record_in_place_l2_rewrite`. Bound by
+     `live_flow_cache_callsite_recounts_the_established_policy_hit_6304` (a bound
+     handle on the entry; asserts packets AND bytes, the byte cell separating
+     `meta.pkt_len` from a stripped length) and
+     `live_flow_cache_callsite_accounts_per_zone_traffic_6304` (a
+     `with_zone_accounting` fixture builder, kept a builder so the ten existing
+     cells keep their calibration; asserts both directions, since the two zone
+     ids resolve independently). `PolicyRuleCounter` gained a `#[cfg(test)]`
+     `test_byte_count` beside the existing `test_packet_count`.
+
+  F4. **`enqueue_tx_owned` RETURNS `Ok(())` ON A DROP.** Documented at the
+     definition rather than changed: `push_redirect_inbox` implements the
+     drop-newest contract, so an overflowed request is discarded and the caller
+     is told nothing. The doc names `try_enqueue_tx_owned` and
+     `try_reserve_mirror_tx_owned` as the acceptance-reporting alternatives, and
+     `enqueue_tx` — which has the identical property two lines above — carries a
+     one-line pointer so a reader arriving at either draws the right conclusion.
+
+  Validation: `cargo test --release` GREEN both parallel and at
+  `--test-threads=1`. `CARGO_TARGET_DIR` private to this lane; no crate-wide
+  `cargo fmt` — each touched file checked with `rustfmt --edition 2024 --check`
+  against its parent content IN PLACE (measuring a copy in `$TMPDIR` is wrong:
+  rustfmt follows `mod` declarations, so a detached copy silently reports 0), and
+  every file carries the same deviation count as its parent, none added.
+
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
