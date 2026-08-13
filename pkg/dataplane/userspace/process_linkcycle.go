@@ -339,10 +339,21 @@ func (m *Manager) stopLinkCycleHeartbeat() {
 // clock catches up.
 var linkCycleLeaseEpoch = time.Now()
 
-// linkCycleLeaseElapsed reports monotonic time since linkCycleLeaseEpoch. It is
-// indirected so a test can prove the TTL backstop actually expires a stranded
-// lease without sleeping one out. Production never reassigns it. Mirrors
-// linkCycleRebindSleep below.
+// linkCycleLeaseElapsedOverride is the test seam behind linkCycleLeaseElapsed
+// below: a test installs a fake clock here so it can prove the TTL backstop
+// really does expire a stranded lease, without sleeping one out. Production
+// never installs one. Mirrors linkCycleRebindSleep below.
+//
+// #6871 round 11: this comment opened "linkCycleLeaseElapsed reports monotonic
+// time since linkCycleLeaseEpoch" — the doc of the func VAR of that name, which
+// round 10 split into this variable plus the function below. The prose stayed
+// attached to the variable and kept the old subject, so `go doc -u` printed the
+// function's description under the seam and showed the function itself
+// undocumented. Third instance of the same insertion-and-refactor-steals-the-doc
+// class as round 10's F3 (prose) and this round's N3 (a comment paragraph in the
+// wrong branch), and the first of the three found by looking rather than by
+// review.
+//
 // #6871 round 10 (F1): ATOMIC, because a plain func var is data-raced by a
 // leaked heartbeat.
 //
@@ -389,6 +400,9 @@ var linkCycleLeaseEpoch = time.Now()
 // returning nil plus the same time.Since it always did.
 var linkCycleLeaseElapsedOverride atomic.Pointer[func() time.Duration]
 
+// linkCycleLeaseElapsed reports monotonic time since linkCycleLeaseEpoch — or
+// whatever a test has installed in linkCycleLeaseElapsedOverride above, which
+// is where the seam's contract is stated.
 func linkCycleLeaseElapsed() time.Duration {
 	if fn := linkCycleLeaseElapsedOverride.Load(); fn != nil {
 		return (*fn)()

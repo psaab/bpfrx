@@ -80210,6 +80210,16 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   holds. `docs/reth-mac.md`'s outcome table already had it on the right row, so
   the doc needed no change. Same insertion-lands-against-the-wrong-antecedent
   class as round 10's F3, this time in code rather than prose.
+  N3b, a THIRD instance of that class, found by looking for one rather than by
+  review. Round 10 split
+  `var linkCycleLeaseElapsed = func() time.Duration {...}` into
+  `var linkCycleLeaseElapsedOverride` plus a `linkCycleLeaseElapsed()` function.
+  The doc comment stayed attached to the renamed VARIABLE and kept its old
+  subject, so `go doc -u` printed "linkCycleLeaseElapsed reports monotonic time
+  since linkCycleLeaseEpoch..." under the seam variable and showed the function
+  itself with no doc at all — verified through `go doc` rather than by reading.
+  The variable's comment now describes the variable; the function has its own
+  one-liner pointing at it.
   N2: both acquisition guards keyed sites as `<path>:<enclosing decl name>`, and
   Go allows two declarations of one name in one file when the receivers differ.
   Measured, both plants compiling production Go that takes a real lease: (a) a
