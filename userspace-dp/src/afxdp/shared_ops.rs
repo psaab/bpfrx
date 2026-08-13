@@ -1,6 +1,37 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
-use std::sync::MutexGuard;
+use std::sync::{MutexGuard, TryLockError};
+
+/// #4800: calls to [`publish_shared_session`] — one per session published
+/// into the cross-worker shared maps, i.e. one per new transit flow (plus
+/// its reverse companion) and one per promote / HA import / tunnel install.
+///
+/// This is the DENOMINATOR for the publish leg of the new-flow-install
+/// serialization question. On its own a publish rate says nothing; paired
+/// with `SHARED_SESSION_PUBLISH_LOCK_CONTENDED` it says whether the publish
+/// mutexes are where new flows queue up.
+pub(crate) static SHARED_SESSION_PUBLISHES: AtomicU64 = AtomicU64::new(0);
+
+/// #4800: shared-map mutex acquisitions taken by [`publish_shared_session`]
+/// (1 for `shared_sessions`, plus `shared_nat_sessions` and
+/// `shared_forward_wire_sessions` on a forward entry), and the subset that
+/// found the mutex already held by another worker.
+///
+/// Scoped to the publish path deliberately: `remove_shared_session`, the HA
+/// promote/demote prewarm, and the read-side lookups take the same mutexes
+/// through the uncounted [`lock_shared_recover`], so folding them in would
+/// blur exactly the attribution this pair exists to provide.
+///
+/// COST, stated honestly: the LOCK is unchanged — `try_lock()` on an
+/// uncontended mutex is the same single CAS `lock()` already performed — but
+/// the acquisition counter is bumped UNCONDITIONALLY, so the uncontended path
+/// is not free. One forward `publish_shared_session` goes from 3 atomic
+/// read-modify-writes (three `lock()` CASes) to 7: the call counter, plus one
+/// relaxed increment and one CAS for each of the three maps. All relaxed, no
+/// timing, no allocation, on the cold new-flow-install path — but "unchanged"
+/// would be false.
+pub(crate) static SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SHARED_SESSION_PUBLISH_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
 
 /// #2402: total shared-session / owner-RG-index mutex poison recoveries
 /// across every site in this module (HA promotion prewarm, demotion,
@@ -40,6 +71,39 @@ pub(super) fn lock_shared_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
             poisoned.into_inner()
         }
     }
+}
+
+/// #4800: [`lock_shared_recover`] with contention accounting, used ONLY by
+/// [`publish_shared_session`].
+///
+/// `try_lock()` first — a single CAS on an uncontended mutex, exactly what
+/// `lock()` already did, so the LOCK ITSELF costs what it always did. The
+/// acquisition counter above it is unconditional, so an uncontended
+/// acquisition is 2 relaxed atomic RMWs where it used to be 1 (see
+/// [`SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS`] for the per-publish total).
+/// A failed CAS means another worker holds the map and this new-flow install
+/// is about to serialize behind it: bump the contended counter, then block as
+/// before — the block was going to happen anyway. Poison
+/// policy is inherited unchanged by delegating to [`lock_shared_recover`]
+/// for the blocking arm, and reproduced for the try-lock Poisoned arm
+/// (which `try_lock` reports only when the mutex is FREE).
+#[inline]
+fn lock_shared_publish<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    SHARED_SESSION_PUBLISH_LOCK_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+    match m.try_lock() {
+        Ok(guard) => return guard,
+        Err(TryLockError::Poisoned(poisoned)) => {
+            m.clear_poison();
+            SHARED_SESSION_POISON_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "xpf-ha: shared session mutex poisoned by a prior worker panic; recovering existing sessions and clearing poison"
+            );
+            return poisoned.into_inner();
+        }
+        Err(TryLockError::WouldBlock) => {}
+    }
+    SHARED_SESSION_PUBLISH_LOCK_CONTENDED.fetch_add(1, Ordering::Relaxed);
+    lock_shared_recover(m)
 }
 
 /// #1760 W3': cumulative count of shared-map NAT reverse-key displacement
@@ -901,10 +965,24 @@ pub(super) fn publish_shared_session(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     entry: &SyncedSessionEntry,
 ) {
+    // #4800: in test builds only, hold the shared side of the counter lock for
+    // the whole publish, so a reading test excludes this mover without the
+    // caller having to opt in — no caller can be forgotten the way a
+    // hand-maintained inventory was.
+    //
+    // NOT a closure proof: `SHARED_SESSION_PUBLISHES` and both lock counters
+    // are `pub(crate)` and a direct `fetch_add` from anywhere in the crate
+    // bypasses this entirely. See `afxdp::counter_test_lock`.
+    #[cfg(test)]
+    let _counter_guard = super::counter_test_lock::counter_mover_guard();
+    // #4800: every new transit flow passes through here, so this counter is
+    // the publish-leg new-flow rate AND the denominator for the lock
+    // contention counted by `lock_shared_publish` below.
+    SHARED_SESSION_PUBLISHES.fetch_add(1, Ordering::Relaxed);
     {
         // #2402: recover poison so a peer-sync / promote publish is never
         // silently dropped because a worker panicked under this lock.
-        let mut sessions = lock_shared_recover(shared_sessions);
+        let mut sessions = lock_shared_publish(shared_sessions);
         let previous_owner_rg = sessions
             .insert(entry.key.clone(), entry.clone())
             .map(|existing| existing.metadata.owner_rg_id);
@@ -916,7 +994,7 @@ pub(super) fn publish_shared_session(
         );
     }
     if !entry.metadata.is_reverse {
-        let mut sessions = lock_shared_recover(shared_nat_sessions);
+        let mut sessions = lock_shared_publish(shared_nat_sessions);
         let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
         let displaced = sessions.insert(reverse_wire.clone(), entry.clone());
         record_shared_nat_displacement(displaced.as_ref(), entry);
@@ -941,7 +1019,7 @@ pub(super) fn publish_shared_session(
         }
     }
     if !entry.metadata.is_reverse {
-        let mut sessions = lock_shared_recover(shared_forward_wire_sessions);
+        let mut sessions = lock_shared_publish(shared_forward_wire_sessions);
         let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
         if wire_key != entry.key {
             let previous_owner_rg = sessions

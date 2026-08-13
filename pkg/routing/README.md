@@ -792,7 +792,44 @@ which paths a prefix load-balances over.
   `ReconcileVRFs` isn't re-entrant.
 - `Manager.Close()` is not safe to call concurrently with the public
   apply/read methods (single-threaded-shutdown contract; no daemon
-  caller of `Close` today).
+  caller of `Close` today). It IS safe to call on a PARTIAL Manager
+  (#5718 A7-b02-C01): the `*ForTest` constructors in `test_seams.go`
+  wire only the domains their callers exercise, so `Close` nil-guards
+  the tunnel domain exactly as it does `nlHandle` — an unguarded
+  `m.tunnel.stopAll()` takes `t.mu` on a nil `*tunnelManager` and
+  panics the caller that followed the documented `defer m.Close()`.
+  Any new domain teardown added to `Close` needs the same guard.
+  The guard must not degrade `Close` into a no-op on a wired Manager, so
+  `close_partial_manager_5718_test.go` also drives a Manager with a live
+  keepalive goroutine installed and observes both obligations discharged
+  on real state (#5718 fold): the runner's `done` channel closes (proof
+  the goroutine returned, not merely that `cancel` was called) and the
+  handle release runs exactly once, AFTER the drain.
+- **The handle release is indirected through `Manager.closeHandleFn`
+  (#5718 fold r3).** `New()` binds it to the handle it just created — so
+  a later reassignment of `m.nlHandle` cannot redirect `Close` away from
+  the handle this Manager owns — and the partial `*ForTest`
+  constructors leave it nil alongside `nlHandle`. The indirection exists
+  so the #848 ORDERING contract is testable **without** a live netlink
+  handle: a test that needs one SKIPS where netlink is unavailable, and
+  a skipped test reports PASS, so it accepts every implementation there
+  and a mutation cell scored against it is UNKNOWN, not GREEN. A guard
+  that only fires on a box with netlink is not a guard for the merge
+  gate. `TestCloseDrainsBeforeReleasingHandle_5718` is therefore the
+  binding guard (injected release recorder, no netlink);
+  `TestCloseReleasesLiveHandleAndKeepalives_5718` is supplementary and
+  environment-gated, adding only that a real handle's sockets actually
+  go away — `GetSocketReceiveBufferSize()` drops from one entry per live
+  socket to none. A post-close `LinkList` is NOT an observable:
+  `vishvananda/netlink` silently falls back to a package-level socket
+  once `Handle.sockets` is nil.
+- **Ordering is observed from inside the keepalive goroutine.** Final
+  state is identical whether the drain or the release runs first, so the
+  runner records whether the release had already fired at the moment it
+  was cancelled. `stopAll` blocks on `<-runner.done`, which makes that
+  read deterministic and race-free in both orders: drain-then-release
+  gives `cancel -> read -> close(done) -> release`, release-then-drain
+  gives `release -> cancel -> read`.
 - Keepalive runner goroutines drain on the `done` channel before the
   netlink handle is closed. Closing the handle while a goroutine still
   holds it would be a use-after-close.

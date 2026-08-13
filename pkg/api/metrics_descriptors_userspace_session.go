@@ -57,6 +57,90 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 			"forever — nonzero means a preflight/install pairing bug).",
 		nil, nil,
 	)
+	// #4800: the process-global publish + replication legs of the
+	// new-flow-install contention surface. Each contended counter ships
+	// with the acquisition counter that is its denominator, because a
+	// contention rate alone cannot distinguish a saturated lock from a
+	// merely busy one. The NAT-allocator leg is per pool and lives on the
+	// xpf_userspace_source_nat_pool_live_lock_* family instead.
+	c.userspaceSharedSessionPublishes = prometheus.NewDesc(
+		"xpf_userspace_shared_session_publishes_total",
+		"Sessions published into the helper's cross-worker shared session "+
+			"maps — one per locally-learned transit flow (forward and "+
+			"reverse), promote, HA import and tunnel install. The "+
+			"publish-leg new-flow rate, and the call-count denominator for "+
+			"the publish lock counters below (#4800).",
+		nil, nil,
+	)
+	c.userspaceSharedSessionPublishLockAcquired = prometheus.NewDesc(
+		"xpf_userspace_shared_session_publish_lock_acquisitions_total",
+		"Shared-session map mutex acquisitions taken by the helper's "+
+			"session-publish path (up to three per publish: sessions, "+
+			"nat_sessions, forward_wire_sessions). Scoped to publish only — "+
+			"removals, HA promote/demote prewarm and read-side lookups take "+
+			"the same mutexes but are deliberately excluded so this stays "+
+			"the clean denominator for publish contention (#4800).",
+		nil, nil,
+	)
+	c.userspaceSharedSessionPublishLockBlocked = prometheus.NewDesc(
+		"xpf_userspace_shared_session_publish_lock_contended_total",
+		"Subset of session-publish shared-map mutex acquisitions that found "+
+			"the mutex already held and had to block. Divided by "+
+			"..._publish_lock_acquisitions_total this is the publish leg's "+
+			"share of new-flow-install serialization (#4800).",
+		nil, nil,
+	)
+	c.userspaceSessionReplicationUpserts = prometheus.NewDesc(
+		"xpf_userspace_session_replication_upserts_total",
+		"Calls to the helper's sibling session-replication fan-out — one "+
+			"per session replicated to every sibling worker's command "+
+			"queue (#4800).",
+		nil, nil,
+	)
+	c.userspaceSessionReplicationEnqueued = prometheus.NewDesc(
+		"xpf_userspace_session_replication_enqueued_total",
+		"Individual UpsertSynced commands enqueued by the sibling "+
+			"session-replication fan-out. Divided by "+
+			"..._replication_upserts_total this recovers the N-way fan-out "+
+			"multiplier (the sibling worker count) without the consumer "+
+			"having to know it out of band; it is also the denominator for "+
+			"the replication contention counter (#4800).",
+		nil, nil,
+	)
+	c.userspaceSessionReplicationLockBlocked = prometheus.NewDesc(
+		"xpf_userspace_session_replication_lock_contended_total",
+		"Subset of sibling command-queue mutex acquisitions in the session-"+
+			"replication fan-out that found the queue already held and had "+
+			"to block. Scoped to replication; the tunnel, TX-drain, HA and "+
+			"cross-binding CoS enqueues take the same mutexes and are "+
+			"excluded (#4800).",
+		nil, nil,
+	)
+	c.userspaceSessionReplicationQueueDepthSum = prometheus.NewDesc(
+		"xpf_userspace_session_replication_queue_depth_sum",
+		"Sum of the per-call deepest sibling command-queue depth observed at "+
+			"session-replication push time. Divided by "+
+			"..._replication_upserts_total over the same window this is the "+
+			"MEAN worst-sibling depth per replicated flow — the "+
+			"differenceable backlog statistic, and the only depth reading a "+
+			"verdict may rest on. DEPTH says the consuming worker is not "+
+			"draining as fast as producers enqueue, which is a different "+
+			"failure from producers colliding on the queue mutex and has a "+
+			"different remedy (#4800).",
+		nil, nil,
+	)
+	c.userspaceSessionReplicationQueueDepthMax = prometheus.NewDesc(
+		"xpf_userspace_session_replication_queue_depth_max",
+		"Monotonic PROCESS-LIFETIME high-water sibling command-queue depth "+
+			"observed at session-replication push time. OPERATOR CONTEXT "+
+			"ONLY. Do not rate() it, and do not difference it either: it "+
+			"cannot fall, so a zero delta means \"no backlog\" OR \"a "+
+			"backlog up to the previous all-time high\", and one spike "+
+			"leaves the absolute value elevated for the life of the helper. "+
+			"Use ..._queue_depth_sum / ..._upserts_total for any per-window "+
+			"backlog question (#4800).",
+		nil, nil,
+	)
 	c.userspaceSessionPublishErrors = prometheus.NewDesc(
 		"xpf_userspace_session_publish_errors_total",
 		"Failed USERSPACE_SESSIONS BPF-map publishes across all helper "+
