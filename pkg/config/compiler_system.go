@@ -94,6 +94,20 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 			for _, classInst := range namedInstances(child.FindChildren("class")) {
 				lc := &LoginClass{Name: classInst.name}
 				for _, prop := range classInst.node.Children {
+					// #5831: record RESTRICTIVE leaf PRESENCE from the
+					// classification table (compiler_login_deny.go), NOT from
+					// the case arms below. Presence, not value: a
+					// quoted-empty or valueless deny-commands flattens to ""
+					// and would be invisible to a value test, yet an empty
+					// regex denies EVERY command in Junos. Driving it from the
+					// table means a newly-classified restrictive leaf is gated
+					// without also needing a `case` arm here — the missing-arm
+					// fail-open the table exists to prevent. Both AST shapes
+					// carry the leaf name in Keys[0], so prop.Name() is
+					// dual-shape safe, exactly as the switch below relies on.
+					if loginClassLeafRestrictive[prop.Name()] {
+						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, prop.Name())
+					}
 					switch prop.Name() {
 					case "permissions":
 						lc.Permissions = append(lc.Permissions, firewallMatchValues(prop)...)
@@ -106,21 +120,15 @@ func compileSystem(node *Node, sys *SystemConfig, cfg *Config, opts compileOpts)
 					case "allow-commands":
 						lc.AllowCommands = nodeVal(prop)
 					case "deny-commands":
-						// Record PRESENCE, not just the value (#5831): a
-						// quoted-empty or valueless deny-commands flattens to
-						// "" and would be invisible to a value test, yet an
-						// empty regex denies EVERY command in Junos. This
-						// switch already sees both AST shapes (the leaf node
-						// carries the name in Keys[0] either way), so keying
-						// the gate off the case arm is dual-shape safe by
-						// construction.
+						// Value only. PRESENCE is recorded above, off
+						// loginClassLeafRestrictive, because the value cannot
+						// carry it: a quoted-empty or valueless deny-commands
+						// flattens to "" yet denies EVERY command in Junos.
 						lc.DenyCommands = nodeVal(prop)
-						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, "deny-commands")
 					case "allow-configuration":
 						lc.AllowConfiguration = nodeVal(prop)
 					case "deny-configuration":
 						lc.DenyConfiguration = nodeVal(prop)
-						lc.DenyLeavesPresent = append(lc.DenyLeavesPresent, "deny-configuration")
 					}
 				}
 				lc.MappedPermissions, _ = mapJunosPermissions(lc.Permissions)

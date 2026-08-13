@@ -792,6 +792,10 @@ type LoginClass struct {
 	// write, and therefore the most dangerous one to silently drop. Gating on
 	// `DenyCommands != ""` would wave exactly that config through, so the gate
 	// reads this presence list instead.
+	//
+	// Populated by compiler_system.go from loginClassLeafRestrictive
+	// (compiler_login_deny.go) rather than from a per-leaf `case` arm, so
+	// classifying a new restrictive leaf is the only edit needed to gate it.
 	DenyLeavesPresent []string
 }
 

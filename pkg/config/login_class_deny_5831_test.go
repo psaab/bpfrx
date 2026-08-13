@@ -575,3 +575,131 @@ func TestLoginClassDenyPresenceSurvivesEmptyValue(t *testing.T) {
 			"would accept the most restrictive regex an operator can write; got %v", lc.DenyLeavesPresent)
 	}
 }
+
+// TestLoginClassAdvisoryReportsPostFoldPermissions binds the one production
+// line #5831 changed in loginClassAdvisoryWarnings (#6838 review M2).
+//
+// That advisory used to render a fresh `mapJunosPermissions(lc.Permissions)`
+// call; it now renders lc.MappedPermissions, the EFFECTIVE set. The two are
+// identical for every class the fold did not touch, which is exactly why the
+// switch was invisible to the suite: reverting it left the failure set
+// byte-identical to baseline. On a FOLDED class they diverge, and the fresh
+// call tells the operator the class still holds buckets the fold removed —
+// `{super-user}` for a class that can no longer do anything but read and
+// configure.
+//
+// REVERT THAT REDS THIS: restore `mapped, _ := mapJunosPermissions(lc.Permissions)`
+// and range over `mapped` instead of `lc.MappedPermissions`.
+func TestLoginClassAdvisoryReportsPostFoldPermissions(t *testing.T) {
+	tree := buildLoginTree5831(t, []string{
+		"set system login class limited permissions all",
+		`set system login class limited deny-commands "request system zeroize"`,
+	})
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	lc := cfg.System.Login.Classes[0]
+	// Precondition: the fold must actually have bitten, or the two renderings
+	// agree and this test proves nothing.
+	if len(lc.MappedPermissions) != 2 {
+		t.Fatalf("precondition: expected the class folded to {view,configure}; got %v",
+			lc.MappedPermissions)
+	}
+
+	var advisory string
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "recognized (custom RBAC)") {
+			advisory = w
+		}
+	}
+	if advisory == "" {
+		t.Fatalf("the #4304 per-class advisory did not fire; warnings=%v", cfg.Warnings)
+	}
+	if strings.Contains(advisory, "super-user") {
+		t.Errorf("the advisory still reports the PRE-fold bucket set — it tells the operator "+
+			"the class holds super-user after the fold took it away:\n  %s", advisory)
+	}
+	if !strings.Contains(advisory, "{configure,view}") {
+		t.Errorf("the advisory does not report the post-fold set {configure,view}:\n  %s", advisory)
+	}
+}
+
+// TestLoginClassSchemaLeavesAreClassified_5831 is the schema-drift canary for
+// the deny gate (#6838 review M3), the sibling of
+// TestLoginInstanceKeywordsMatchSchema_6662 for the packed gate.
+//
+// loginClassLeafRestrictive is what decides whether a `login class`
+// sub-statement is gated as restrictive. A leaf added to the schema without a
+// row there parses, compiles, and configures NOTHING — silently reinstating the
+// exact fail-open #5831 exists to close, one statement over. Junos has several
+// candidates this project does not model yet: deny-hidden-commands,
+// access-start / access-end, allowed-days.
+//
+// Pinning the key set in BOTH directions is the point. Schema-not-classified is
+// the fail-open. Classified-not-schema is a row that gates nothing and would
+// make the table look more complete than it is.
+func TestLoginClassSchemaLeavesAreClassified_5831(t *testing.T) {
+	class := setSchema.children["system"].children["login"].children["class"]
+	if class == nil || len(class.children) == 0 {
+		t.Fatal("setSchema has no `system login class` node with children")
+	}
+
+	for name := range class.children {
+		if _, ok := loginClassLeafRestrictive[name]; !ok {
+			t.Errorf("`login class %s` is in the schema but NOT classified in "+
+				"loginClassLeafRestrictive — if it is restrictive it is now accepted and "+
+				"enforced at no granularity, which is the #5831 fail-open; if it is not, "+
+				"say so with an explicit `false` row", name)
+		}
+	}
+	for name := range loginClassLeafRestrictive {
+		if _, ok := class.children[name]; !ok {
+			t.Errorf("loginClassLeafRestrictive classifies %q, which is not a `login class` "+
+				"schema child — the row gates nothing and overstates the table's coverage", name)
+		}
+	}
+}
+
+// TestLoginClassRestrictiveClassificationIsEnforced_5831 closes the canary's
+// other half: the classification must DRIVE the gate, not merely describe it.
+//
+// Every leaf marked restrictive must reach DenyLeavesPresent and be refused at
+// commit; every leaf marked non-restrictive must not. Without this, a correct
+// table paired with a compiler that ignored it would still fail open, and the
+// key-set canary above would stay green.
+func TestLoginClassRestrictiveClassificationIsEnforced_5831(t *testing.T) {
+	for leaf, restrictive := range loginClassLeafRestrictive {
+		if leaf == "permissions" {
+			continue // the identity leaf, not a sub-statement with a regex value
+		}
+		t.Run(leaf, func(t *testing.T) {
+			// A value every leaf accepts, including the integer idle-timeout.
+			value := "1"
+			tree := buildLoginTree5831(t, []string{
+				"set system login class limited permissions view",
+				"set system login class limited " + leaf + " " + value,
+			})
+			_, strictErr := CompileConfig(tree)
+
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("lenient compile: %v", err)
+			}
+			got := len(cfg.System.Login.Classes[0].DenyLeavesPresent) > 0
+
+			if got != restrictive {
+				t.Fatalf("loginClassLeafRestrictive[%q]=%v but DenyLeavesPresent recorded=%v — "+
+					"the table and the compiler disagree about this leaf", leaf, restrictive, got)
+			}
+			if restrictive && strictErr == nil {
+				t.Errorf("%q is classified restrictive but the strict commit path ACCEPTED it — "+
+					"an unenforceable restriction is committable", leaf)
+			}
+			if !restrictive && strictErr != nil {
+				t.Errorf("%q is classified non-restrictive but the strict path rejected it: %v",
+					leaf, strictErr)
+			}
+		})
+	}
+}

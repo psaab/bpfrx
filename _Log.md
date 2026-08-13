@@ -71242,6 +71242,11 @@ break — `go vet` confirmed passing under every revert.
   docs/config-schema.md, _Log.md
 - **Timestamp**: 2026-08-05
   **Action**: #5831 fail-closed half — hard-reject custom login classes carrying unenforced restrictive regexes (deny-commands/deny-configuration); fold to view-only on the tolerant path
+  **[SUPERSEDED by the two entries below]**: the "fold to view-only" clause
+  never shipped. The #6838 review found it strands `configure` on a
+  configured-root class, so the tolerant path folds to a REPAIR FLOOR
+  ({view,configure} ∩ what the class already held) instead. Annotated in place
+  rather than rewritten — this log is append-only history, not current state.
   **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/types_system.go, pkg/config/compiler_system.go, pkg/config/compiler_opts.go, pkg/config/compiler_tailgates.go, pkg/config/login_class_deny_5831_test.go, pkg/config/login_custom_class_4304_test.go, docs/system-login.md
 - **Timestamp**: 2026-08-05
   **Action**: #6838 review fold — the tolerant view-only collapse stranded
@@ -71264,6 +71269,32 @@ break — `go vet` confirmed passing under every revert.
   strings — `PermView` is the iota ZERO value, so slice expectations could be
   satisfied by an uninitialised element.
   **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, docs/config-schema.md
+- **Timestamp**: 2026-08-13
+  **Action**: #6838 review fold r3 — the tolerant fold resolved the class to
+  mutate by NAME through a last-wins map, but pkg/cli's `resolveClassPerms`
+  returns the FIRST match, so a config spelling `class limited` twice folded an
+  object the runtime never reads. Measured through the real peer-sync ingress
+  (SyncApply -> ActiveConfig -> checkPermission): PermAll live, `request system
+  zeroize` allowed, secrets in cleartext, and a warning claiming a reduction
+  that had not happened. BOTH orderings failed open, and the pointer fix alone
+  closes only one — with the deny on the SECOND block, folding exactly the
+  offender is correct by identity and useless in effect, because the runtime
+  reads the first block. So the fold now carries the *LoginClass pointers AND
+  narrows the whole same-named cohort, making the outcome independent of the
+  reader's tie-break rule rather than matching it (matching would be a proxy
+  that rots the day resolveClassPerms changes its pick). Each half is bound by
+  its own subtest and reds on its own revert. Also: repaired the two #6662
+  packed-gate tests the master merge left RED — their fixtures carried deny
+  leaves the new strict gate refuses, and one asserted the MORE PERMISSIVE
+  advisory this PR deleted; the deny carry-through they were buying moved to a
+  new both-AST-shapes test rather than being dropped. Bound the previously
+  unguarded `range lc.MappedPermissions` advisory line. Replaced the per-leaf
+  `case` arm that recorded DenyLeavesPresent with a loginClassLeafRestrictive
+  classification table the compiler consults, plus a two-direction
+  schema-drift canary, so a restrictive leaf added to the schema cannot
+  silently default to unrestricted. Corrected two further stale references to
+  the deleted MORE PERMISSIVE advisory.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_system.go, pkg/config/compiler_system_login_gates.go, pkg/config/types_system.go, pkg/config/login_class_deny_5831_test.go, pkg/config/compiler_system_login_packed_6662_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-08-01 17:41
 - **Action**: #5173 round-5 fold — the #6676 guard claimed CLASS-COMPLETENESS
   over binding forms that a proc macro breaks, and understated its own

@@ -41,41 +41,126 @@ import (
 // deny-with-exceptions, and rejecting on deny-presence alone still catches it
 // — there is no shape where an allow leaf makes a deny leaf safe to drop.
 
-// loginClassDenyRejection describes one class whose restrictive regexes xpf
-// cannot honor. Split out from the gate so the strict error and the tolerant
-// warning render from the identical data and cannot drift apart.
+// loginClassLeafRestrictive classifies every `system login class`
+// sub-statement the schema accepts (schema_system.go, the `class` node) by
+// DIRECTION, and is the single source of truth for which of them the #5831
+// gate treats as restrictive.
+//
+// It is LOAD-BEARING, not documentation: compiler_system.go records
+// LoginClass.DenyLeavesPresent by consulting this table, not from a per-leaf
+// `case` arm. A leaf classified restrictive is therefore gated the moment it
+// is listed here, with no second edit to forget — which is the whole failure
+// mode this table exists to remove. Junos carries several restrictive leaves
+// this project does not model yet (deny-hidden-commands, access-start /
+// access-end, allowed-days); each becomes a fail-open the instant the schema
+// parses it and nothing classifies it.
+//
+// TestLoginClassSchemaLeavesAreClassified_5831 pins the KEY SET against the
+// schema in both directions, so a leaf added to the `class` node without a row
+// here reds the suite rather than silently defaulting to unrestricted.
+//
+// false means the leaf cannot make the class MORE restrictive than its
+// permission bits, so dropping it is fail-CLOSED — see the DIRECTIONALITY note
+// at the top of this file.
+var loginClassLeafRestrictive = map[string]bool{
+	"permissions":         false,
+	"idle-timeout":        false,
+	"allow-commands":      false,
+	"allow-configuration": false,
+	"deny-commands":       true,
+	"deny-configuration":  true,
+	"login-alarms":        false,
+	"login-tip":           false,
+}
+
+// loginClassDenyRejection describes one class NAME whose restrictive regexes
+// xpf cannot honor. Split out from the gate so the strict error and the
+// tolerant warning render from the identical data and cannot drift apart.
 type loginClassDenyRejection struct {
 	class  string
 	leaves []string
+	// entries is EVERY *LoginClass block carrying this name, offending or not,
+	// in config order — the fold's targets.
+	//
+	// It is a POINTER set rather than a name, and it is the WHOLE cohort rather
+	// than the offending block alone, for two independent reasons. Both were
+	// live fail-opens (#6838 review B1), measured through the real peer-sync
+	// ingress with two `class limited` blocks and `user root class limited`:
+	//
+	//  1. IDENTITY. A `map[string]*LoginClass` built by last-wins resolves a
+	//     duplicated name to the LAST block, while the runtime reader
+	//     (pkg/cli/permissions.go resolveClassPerms) returns the FIRST match. A
+	//     deny on the first block folded the second and left the first — the
+	//     one the runtime actually reads — holding PermAll, with the operator
+	//     warning asserting a reduction that had not happened. Anchoring on the
+	//     pointer we collected removes the lookup, and with it the divergence.
+	//     This is the #6861 r3 precedent: anchor on identity, never on a name.
+	//
+	//  2. COHORT. Pointer identity alone still fails open the other way round.
+	//     With the deny on the SECOND block, folding exactly the offender is
+	//     correct by identity and useless in effect: the runtime resolves the
+	//     FIRST block, which never carried a deny leaf and so keeps PermAll.
+	//     Folding the whole same-named cohort makes the outcome independent of
+	//     the reader's tie-break rule, which is the property that actually
+	//     needs to hold — matching first-match would only be a proxy for it,
+	//     and would silently rot if resolveClassPerms ever changed its pick.
+	//     Folding a non-offending sibling is safe in the one direction that
+	//     matters: repairableFloorFold is an intersection, so it can only
+	//     narrow that block, never widen it.
+	entries []*LoginClass
 }
 
 // collectLoginClassDenyRejections returns, in deterministic config order, every
-// custom login class carrying a restrictive regex the coarse gate will not
-// enforce. Reads LoginClass.DenyLeavesPresent (presence, recorded at parse) —
-// NOT DenyCommands/DenyConfiguration, whose empty string cannot distinguish
+// custom login class NAME carrying a restrictive regex the coarse gate will not
+// enforce, together with every block sharing that name. Reads
+// LoginClass.DenyLeavesPresent (presence, recorded at parse) — NOT
+// DenyCommands/DenyConfiguration, whose empty string cannot distinguish
 // "absent" from the maximally-restrictive `deny-commands ""`.
+//
+// Grouping is by NAME because a name is what the runtime resolves: a config may
+// spell `class limited` twice, and pkg/cli/permissions.go answers for the name,
+// not for a block. Order is first appearance of the name, so the strict gate's
+// "report one, deterministically" still reports them in the order an operator
+// reads the config.
 func collectLoginClassDenyRejections(cfg *Config) []loginClassDenyRejection {
 	if cfg == nil || cfg.System.Login == nil {
 		return nil
 	}
-	var out []loginClassDenyRejection
+	var grouped []loginClassDenyRejection
+	idx := map[string]int{}
 	for _, lc := range cfg.System.Login.Classes {
-		if lc == nil || len(lc.DenyLeavesPresent) == 0 {
+		if lc == nil {
 			continue
 		}
-		// Deduplicate: the same leaf can be written twice (two set lines, or a
-		// hierarchical block repeating it). Sorted so the message is stable
-		// regardless of the order the operator wrote them in.
+		i, ok := idx[lc.Name]
+		if !ok {
+			i = len(grouped)
+			idx[lc.Name] = i
+			grouped = append(grouped, loginClassDenyRejection{class: lc.Name})
+		}
+		grouped[i].entries = append(grouped[i].entries, lc)
+		grouped[i].leaves = append(grouped[i].leaves, lc.DenyLeavesPresent...)
+	}
+	var out []loginClassDenyRejection
+	for _, r := range grouped {
+		if len(r.leaves) == 0 {
+			continue
+		}
+		// Deduplicate: the same leaf can be written twice (two set lines, a
+		// hierarchical block repeating it, or two blocks sharing the name).
+		// Sorted so the message is stable regardless of the order the operator
+		// wrote them in.
 		seen := map[string]bool{}
-		leaves := make([]string, 0, len(lc.DenyLeavesPresent))
-		for _, l := range lc.DenyLeavesPresent {
+		leaves := make([]string, 0, len(r.leaves))
+		for _, l := range r.leaves {
 			if !seen[l] {
 				seen[l] = true
 				leaves = append(leaves, l)
 			}
 		}
 		sort.Strings(leaves)
-		out = append(out, loginClassDenyRejection{class: lc.Name, leaves: leaves})
+		r.leaves = leaves
+		out = append(out, r)
 	}
 	return out
 }
@@ -107,7 +192,8 @@ func validateLoginClassDenyStrict(cfg *Config) error {
 
 // foldLoginClassDenyToRepairableFloor is the tolerant load / peer-sync
 // counterpart of validateLoginClassDenyStrict (#5831). It returns one warning
-// per affected class and mutates cfg.
+// per affected class NAME — folding every block that carries the name, see
+// loginClassDenyRejection.entries — and mutates cfg.
 //
 // Why this path does MORE than warn. The #1960 no-brick rule says an
 // already-persisted or peer-synced config must still boot, so the strict
@@ -163,24 +249,41 @@ func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 	if len(rejections) == 0 {
 		return nil
 	}
-	byName := map[string]*LoginClass{}
-	for _, lc := range cfg.System.Login.Classes {
-		if lc != nil {
-			byName[lc.Name] = lc
-		}
-	}
 	warnings := make([]string, 0, len(rejections))
 	for _, r := range rejections {
-		lc := byName[r.class]
-		if lc == nil {
-			continue
+		// Fold every block carrying the name, and report the UNION on each
+		// side. The runtime resolves ONE of these blocks and the config does
+		// not say which, so the union is the honest claim: at most this much
+		// before, at most this much after. For the ordinary single-block class
+		// the union is that block's own set and the message is unchanged.
+		var before, after []LoginClassPermission
+		for _, lc := range r.entries {
+			before = unionPerms(before, lc.MappedPermissions)
+			lc.MappedPermissions = repairableFloorFold(lc.MappedPermissions)
+			after = unionPerms(after, lc.MappedPermissions)
 		}
-		before := lc.MappedPermissions
-		after := repairableFloorFold(before)
-		lc.MappedPermissions = after
 		warnings = append(warnings, loginClassDenyFoldWarning(r, before, after))
 	}
 	return warnings
+}
+
+// unionPerms accumulates src into dst without duplicating. Coarse permission
+// sets hold at most a handful of entries, so the linear scan is cheaper than a
+// map and keeps the result in first-seen order (describePerms sorts anyway).
+func unionPerms(dst, src []LoginClassPermission) []LoginClassPermission {
+	for _, p := range src {
+		found := false
+		for _, q := range dst {
+			if q == p {
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst = append(dst, p)
+		}
+	}
+	return dst
 }
 
 // loginClassDenyFoldWarning renders the operator-facing warning for one folded

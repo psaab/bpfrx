@@ -258,6 +258,152 @@ system {
 	}
 }
 
+// TestFoldedLoginClassDuplicateNameIsNotFailOpen pins the fold against a config
+// that spells the SAME class name twice (#6838 review B1).
+//
+// A duplicate name splits the class into two *LoginClass blocks, and the two
+// sides of the system disagree about which one is "the" class: the fold used to
+// pick the LAST via a name-keyed map, while pkg/cli's resolveClassPerms returns
+// the FIRST match. Every combination of that disagreement was a measured
+// runtime fail-open on the peer-sync path — PermAll live at the console,
+// `request system zeroize` allowed, secrets rendered in cleartext, and an
+// operator warning asserting a reduction that had not happened to the block the
+// runtime reads.
+//
+// The property is deliberately stated WITHOUT reference to the tie-break rule:
+// whichever block resolveClassPerms picks, it must be folded. That is why the
+// production fix folds the whole same-named cohort instead of matching
+// first-match — matching the reader's pick would be a proxy for the property
+// and would rot silently the day the reader's pick changed.
+//
+// TWO INDEPENDENT REVERTS RED THIS TEST, one per subtest:
+//
+//   - restoring the name-keyed last-wins map reds `deny-on-first` (the fold
+//     lands on the innocent second block);
+//   - keeping pointer identity but folding ONLY the offending block reds
+//     `deny-on-second` (correct by identity, useless in effect — the runtime
+//     reads the first block, which never carried a deny leaf).
+func TestFoldedLoginClassDuplicateNameIsNotFailOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  string
+	}{
+		{
+			// The offender is FIRST, so it is also the block the runtime
+			// resolves. A last-wins map folds the other one.
+			name: "deny-on-first",
+			cfg: `
+system {
+    login {
+        class limited {
+            permissions all;
+            deny-commands "request system zeroize";
+        }
+        class limited {
+            permissions [ view configure ];
+        }
+        user root {
+            class limited;
+        }
+    }
+}
+`,
+		},
+		{
+			// The offender is SECOND. A last-wins map folds exactly the right
+			// object — and the box still fails open, because the block the
+			// runtime reads is the first one and it carries `permissions all`.
+			name: "deny-on-second",
+			cfg: `
+system {
+    login {
+        class limited {
+            permissions all;
+        }
+        class limited {
+            permissions [ view configure ];
+            deny-commands "request system zeroize";
+        }
+        user root {
+            class limited;
+        }
+    }
+}
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+			if _, err := store.SyncApply(tc.cfg, nil); err != nil {
+				t.Fatalf("tolerant peer-sync must not reject a previously-accepted config (#1960): %v", err)
+			}
+
+			// Guard the guard: two blocks under ONE name is the whole premise.
+			// If the compiler ever merges them this test silently stops
+			// testing anything, so assert the shape rather than assume it.
+			cfg := store.ActiveConfig()
+			if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) != 2 {
+				t.Fatalf("precondition: want 2 `limited` blocks (the duplicate-name shape); cfg=%+v", cfg)
+			}
+			var denyBlocks int
+			for _, lc := range cfg.System.Login.Classes {
+				if lc.Name != "limited" {
+					t.Fatalf("precondition: block named %q, want both named `limited`", lc.Name)
+				}
+				if len(lc.DenyLeavesPresent) > 0 {
+					denyBlocks++
+				}
+			}
+			if denyBlocks != 1 {
+				t.Fatalf("precondition: want exactly 1 block carrying the deny leaf, got %d — "+
+					"the arm under test is not the arm configured", denyBlocks)
+			}
+
+			c := &CLI{store: store, userClass: "limited"}
+
+			// THE fail-open. `request system zeroize` is the exact verb
+			// deny-commands names, and PermAll answers every requirement in
+			// checkPermission.
+			if err := c.checkPermission([]string{"request", "system", "zeroize"}); err == nil {
+				perms, _ := c.resolveClassPerms("limited")
+				t.Errorf("FAIL-OPEN: `request system zeroize` ALLOWED — the block the runtime "+
+					"resolves was never folded. resolveClassPerms=%v", perms)
+			}
+			// PermAll is also what turns off secret redaction, so a class that
+			// kept it leaks IKE PSKs / SNMP communities / auth-keys to a login
+			// the operator wrote a deny statement for.
+			if !c.showConfigRedacted() {
+				t.Error("FAIL-OPEN: secrets render in cleartext — the resolved block retained PermAll")
+			}
+
+			// The fold is a fold, not a lockout: the repair path survives on
+			// whichever block answers.
+			if err := c.checkPermission([]string{"configure"}); err != nil {
+				t.Errorf("STRANDED: the folded class lost `configure` (%v) — every commit is "+
+					"rejected while the deny statement is present and this is the only way "+
+					"to remove it", err)
+			}
+
+			// And the warning must describe what actually happened. Before the
+			// fix it named a reduction the resolved block never underwent.
+			var foldWarn string
+			for _, w := range cfg.Warnings {
+				if strings.Contains(w, "deny-commands is NOT enforced") {
+					foldWarn = w
+				}
+			}
+			if foldWarn == "" {
+				t.Fatalf("no fold warning at all; warnings=%v", cfg.Warnings)
+			}
+			if !strings.Contains(foldWarn, "super-user") {
+				t.Errorf("the fold warning does not mention losing super-user, but one of the "+
+					"blocks under this name held `permissions all` — the operator is told less "+
+					"than the fold did:\n  %s", foldWarn)
+			}
+		})
+	}
+}
+
 // TestFoldedClassResolvesThroughCustomTableNotBuiltins guards the assumption
 // the pre-fold code leaned on. resolveClassPerms consults the BUILT-IN table
 // first, which was cited as proof the fold "cannot brick the box". It does not

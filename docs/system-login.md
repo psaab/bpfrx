@@ -343,6 +343,17 @@ value test would wave them through — yet an empty POSIX regex matches every
 command, i.e. denies *everything*, the most restrictive thing an operator can
 write.
 
+Which leaves count as restrictive is decided by one table,
+`loginClassLeafRestrictive` (`pkg/config/compiler_login_deny.go`), and that
+table is what the compiler consults when recording presence — not a per-leaf
+`case` arm. Adding a row is therefore the only edit needed to gate a new
+restrictive leaf. This matters because Junos has several xpf does not model
+yet (`deny-hidden-commands`, `access-start` / `access-end`, `allowed-days`):
+each would be a fresh instance of the same fail-open the moment the schema
+learned to parse it. A test pins the table's key set against the schema in both
+directions, so a `class` leaf added without a classification reds the suite
+instead of silently defaulting to unrestricted.
+
 #### Tolerant path: fold to the repair floor
 
 On the **tolerant** load / peer-sync path the rejection is downgraded so an
@@ -368,10 +379,45 @@ Two properties:
   runtime gate requires to enter configuration mode, and there is no
   per-statement gate inside it, so `configure` *is* the self-repair channel.
   Taking it away is the one reduction that cannot be undone from the box.
+- **Folds every block that carries the class name**, not only the block the
+  deny leaf is written on — see below.
 
 Everything else — `clear`, `control`, `maintenance`, and `all` itself — is
 dropped. So the motivating example above (`permissions all` + `deny-commands
 "request system zeroize"`) really does lose the ability to zeroize.
+
+##### Duplicate class names
+
+A config may spell `class limited` twice. That splits the class into two
+blocks, and the fold deliberately narrows **both**:
+
+```
+system {
+    login {
+        class limited { permissions all; }                        # <- also folded
+        class limited { permissions [ view configure ];
+                        deny-commands "request system zeroize"; }
+        user root { class limited; }
+    }
+}
+```
+
+The reason is that the runtime resolves a **name**, not a block:
+`pkg/cli/permissions.go` `resolveClassPerms` walks the class list and returns
+the **first** entry whose name matches. Folding only the offending block leaves
+whichever *other* block the reader happens to pick holding its full permission
+set — `permissions all` above — so the deny statement is again attached to a
+class the box does not enforce. Both orderings failed open before this was
+fixed (#6838 review B1): with the deny on the first block a name-keyed
+last-wins lookup folded the wrong object, and with it on the second block
+folding exactly the right object still left `all` live on the first.
+
+Folding the cohort makes the outcome independent of the reader's tie-break
+rule, which is the property that has to hold. It cannot over-restrict a
+bystander either: the floor is an intersection, so a sibling block is only ever
+narrowed to what it already held. The per-class warning reports the union on
+each side — *at most* this much before, *at most* this much after — because the
+config does not say which block answers.
 
 > [!WARNING]
 > **The fold reduces blast radius; it does not enforce the statement.** A
@@ -505,9 +551,12 @@ An empty class is precisely the legacy allow-everything mode, so a
 `class read-only` operator hand-migrating a vSRX config got a CLI that allowed
 every command and rendered secrets in cleartext — with `show configuration`
 echoing their intent back. Rejecting is load-bearing because the downstream
-safety nets are all guarded on non-emptiness, including the `deny-commands`
-"MORE PERMISSIVE" advisory above (`if lc.DenyCommands != ""`): the field the bug
-dropped is the field the guard reads.
+safety nets all read fields the packed drop leaves empty. The `deny-commands` /
+`deny-configuration` gate above is the sharpest case: it keys off
+`LoginClass.DenyLeavesPresent`, so a packed body means the commit it would have
+**refused** is accepted instead, and the restriction the operator wrote is
+discarded without a word. The field the bug empties is the field the check
+reads.
 
 This applies to the whole stanza, at every level:
 
