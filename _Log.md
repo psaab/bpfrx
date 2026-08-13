@@ -79953,3 +79953,121 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 9 — close a BLOCKING heartbeat-lifecycle defect the
+  round-8 self-reap introduced, build the guard round 8's own comment claimed
+  existed, and fix a data race round 8 added.
+  F1 (BLOCKING, runtime): the round-8 heartbeat loop self-reaped on
+  `linkCycleLeaseUntil == 0` and returned WITHOUT clearing
+  `linkCycleHB.stop/done`, while `startLinkCycleHeartbeat`'s idempotence guard
+  tests that FIELD rather than goroutine liveness. One reap therefore left the
+  field non-nil with nothing running, and every later `acquireLinkCycleLease` IN
+  THE SAME APPLY silently started no heartbeat — leaving every RETH member
+  cycled after that point on round-7 protection, which the TTL block itself
+  argues is not survivable at operator-controlled cardinality. The trigger is
+  the case this design is built around: the word reaches 0 either via
+  `releaseLinkCycleLease` (which stops the heartbeat first, so no reap follows)
+  or via `linkCycleInFlight`'s backstop CAS after four missed beats — exactly
+  the starvation the 4x TTL margin exists to absorb. Blast radius is bounded to
+  the apply by the deferred `AbandonLinkCycle`, which resets the fields.
+  FIX: delete the self-reap so the loop has EXACTLY ONE exit. Clearing the
+  fields inside the reap was the other candidate and is rejected — a release
+  plus a fresh acquire can install a new stop/done between the reap's decision
+  and its lock, so the dying goroutine would clear its SUCCESSOR's state,
+  orphaning a live heartbeat and letting a third acquire stack a second one.
+  Making that safe needs an identity check; one exit needs nothing. The cost of
+  no reap is one atomic load per beat on a retired lease until the guaranteed
+  release.
+  F2: `process_linkcycle.go` claimed "TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871
+  fails if one appears". `grep -rn AcquisitionSite --include=*.go` returned
+  exactly one hit: that comment. The factual half was true — enumerated
+  independently — but a shipped comment asserting absent enforcement is worse
+  than no comment, because it is why the next reader does not add the check.
+  Two guards now exist in `link_cycle_acquisition_site_6871_test.go`: a
+  TREE-WIDE AST scan of every production CALL of `PrepareLinkCycle` against an
+  allowlist (keyed on *ast.CallExpr, so declarations and interface members are
+  correctly ignored — the distinction a grep cannot make), and an IN-PACKAGE
+  scan pinning that the unexported `acquireLinkCycleLease` is reached only from
+  `Manager.PrepareLinkCycle`. The second matters because an in-package caller
+  bypasses the chokepoint entirely and inherits none of the daemon's deferred
+  release. `reth_hook_wired_5103_test.go` does NOT cover this — it parses only
+  daemon_apply_dataplane.go and never looks at PrepareLinkCycle.
+  F3: round 8 introduced a DATA RACE — the heartbeat goroutine reads
+  `linkCycleLeaseElapsed` (beat -> RenewLinkCycle -> linkCycleInFlight -> the
+  seam) while the test writes the plain `elapsed` var `fakeLinkCycleClock`
+  captures. Measured at the round-8 head: 1 DATA RACE, `TestLinkCycleLeaseRenewsItself_6871`
+  (the B2 discriminator itself) FAILING under `-race`. Pre-round-8 nothing read
+  the seam off another goroutine. Fixed with atomic.Int64. ALSO corrected a
+  false claim in `fakeLinkCycleHeartbeat`: it said the beat func "waits for the
+  heartbeat goroutine to have consumed it", but an unbuffered send returns at
+  the RENDEZVOUS, before RenewLinkCycle runs — every assertion after a beat was
+  racing the renewal it was there to observe. It now waits for the OBSERVABLE
+  (the deadline reaching what a renewal at the current clock would set).
+  F4: the `|| m.linkCycleInFlight()` clause in `applyHelperStatusLocked`'s ctrl
+  branch had ZERO unprivileged coverage — deleting it left both packages green,
+  because `applyHelperStatusLocked` opens by resolving userspace_ctrl/bindings
+  off the shim and every unprivileged test stops at line one. Extracted the
+  condition to `ctrlMustStayDisabledLocked` and bound it with an EXHAUSTIVE 2x2x2
+  truth table, map-free. SCOPE STATED: this binds the predicate, not the call
+  site. The full remedy (routing the map handles through an interface as
+  `ctrlMapForDisableLocked` does) threads two handles through
+  `failClosedUserspaceCtrlLocked`, `clearStaleBindingRowsLocked` and ~15 other
+  sites inside a 481-line function ON THE FAIL-CLOSED PATH, so it is
+  deliberately not bundled into this round.
+  F5: a type ALIAS escaped the derived adapter table —
+  `type aliasEscape = userspaceLinkController` plus a method on the alias is in
+  userspaceLinkController's method set but missed a literal receiver-name match.
+  Closed by resolving aliases (`ts.Assign != 0`) to their canonical controller
+  through a fixed-point pass, and keying the method under the CANONICAL name so
+  it lands on the type it really extends. INCLUSION rather than rejection: the
+  alias's methods are bound rather than merely forbidden. Recorded in-file as
+  explicit NON-DEFECTS, so nobody re-derives them: BUILD TAGS over-include
+  (parser.ParseDir ignores //go:build, so a tagged method still fails loudly —
+  the safe direction) and POINTER-vs-VALUE receivers are covered by the StarExpr
+  unwrap.
+  F6: `AbandonLinkCycle`'s doc said dropping the lease hands the helper to "the
+  1 Hz reconcile, which re-arms bindings and workers on its own", implying one
+  tick. Verified firsthand that it is not: `shouldAutoRebindBusyBindingsLocked`
+  requires a wedge observed for >= 5s, rate-limits to one rebind per 15s, and
+  `hasBusyBindingsWedgeLocked` additionally requires `lastStatus.ForwardingArmed`.
+  The RECONCILE resumes within a tick; FORWARDING is seconds. Doc now names the
+  path and the order of magnitude. Also bound the previously untested abandon
+  path (`TestStatusTickResumesAfterAbandon_6871`) for the half a map-free
+  fixture can reach — that the abandon un-suppresses the tick — with a CONTROL
+  asserting the suppression was real first.
+  Mutation matrix — 4 direct reverts RED, plus a comparative pair for F5:
+  restoring the self-reap -> both F1 cells RED ("the second lease has no live
+  heartbeat"); dropping `|| m.linkCycleInFlight()` -> the enabled/no_rg/link_cycle
+  row RED; dropping the rgTransition term -> the enabled/rg/no_cycle row RED
+  (so the truth table discriminates EACH disjunct, not just the new one);
+  `AbandonLinkCycle` reporting without releasing -> 3 cells RED. F5 is a
+  COMPARATIVE pair rather than a revert: with the fix, alias+method REDS naming
+  `userspaceLinkController.EscapedAdapterMethod6871`; with the fix reverted the
+  same alias+method is GREEN — which is the escape, and is why a single
+  mutation cannot express it. Also RED: a new production `PrepareLinkCycle`
+  call site in pkg/daemon, and an in-package `acquireLinkCycleLease` outside
+  PrepareLinkCycle.
+  FIXTURE CORRECTION worth recording: the F1 discriminator PASSED on the
+  unfixed code until a wait on the reap was added. `deliverLinkCycleBeat`
+  returns as soon as the beat is consumed, which is BEFORE the loop re-reads
+  the lease word — so a re-acquire landing first stored a non-zero deadline,
+  the reap arm never fired, and the cell passed with the bug fully present. The
+  fixture raced the defect instead of driving it.
+  `-race` NOTE for the lead: there is no -race leg in the Makefile or the
+  workflows, so this class is invisible to the gate. At the round-8 head the
+  package showed 1 DATA RACE plus an unrelated timing failure
+  (`TestLargeApplySnapshotDoesNotFalseTimeout`); at this head it shows 0 DATA
+  RACES and a different unrelated timing failure
+  (`TestEventStreamSessionCloseRTFlowRoutesToRawCallback`, which passes 3/3 in
+  isolation under -race and which this diff does not touch). So `-race` on this
+  package is load-sensitive independently of #6871; adding it to the gate is a
+  separate decision.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/link_cycle_heartbeat_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/controllers_binding_table_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go (new),
+  docs/reth-mac.md, _Log.md

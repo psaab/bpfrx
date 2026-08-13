@@ -418,7 +418,21 @@ So the lease now **renews itself**. `acquireLinkCycleLease` starts a goroutine
 that calls `RenewLinkCycle` every `linkCycleLeaseHeartbeat`
 (`linkCycleLeaseTTL / 4`, i.e. 15s); `releaseLinkCycleLease` stops it and
 **joins** it, so a released lease can never be extended by a beat still in
-flight. The interval the TTL must cover is therefore a constant, independent of
+flight.
+
+That goroutine has **exactly one exit**, and it is load-bearing (#6871 round 9).
+Round 8 gave it a second — a self-reap when the lease word read `0` — which
+returned *without* clearing `linkCycleHB.stop/done`, while
+`startLinkCycleHeartbeat`'s idempotence guard tests that **field** rather than
+goroutine liveness. One reap therefore left the field non-nil with nothing
+running, and every later `acquireLinkCycleLease` **in the same apply** silently
+started no heartbeat at all: every RETH member cycled after that point ran on
+round-7 protection. The trigger was the case this design is built around — the
+TTL backstop retiring a lease after four missed beats, i.e. exactly the
+starvation the 4x margin exists to absorb. Clearing the fields inside the reap
+was rejected as the fix: a release plus a fresh acquire can install a new
+`stop`/`done` between the reap's decision and its lock, so the dying goroutine
+would clear its successor's state. One exit needs no identity check. The interval the TTL must cover is therefore a constant, independent of
 member count, VLAN-child count, redundancy-group count and netlink latency, and
 the TTL is 4x it — three missed beats of headroom for a saturated box, a GC
 pause or a descheduled goroutine. The three daemon call sites stay: they are no
@@ -440,6 +454,14 @@ the 1 Hz reconcile, which re-arms bindings and workers on its own.
 
 The defer is on the extent that contains both ends of the cycle, so it runs on
 every exit including a panic and any early return a later change introduces.
+
+**How fast the abandon recovers, stated as what it is.** What resumes within a
+tick is the *reconcile* — the status loop stops skipping its body, so the ctrl
+re-enable is available on the next pass, ~1s. Restoring *forwarding* is slower:
+the busy-binding auto-rebind that recreates workers is gated by
+`shouldAutoRebindBusyBindingsLocked` on a wedge observed for >= 5s, a 15s
+rate limit, and `lastStatus.ForwardingArmed`. So the honest figure is **seconds**,
+not one tick. An earlier revision implied the latter (#6871 round 9).
 Neither half is correct alone: without the heartbeat the TTL is a guess, and
 without the guaranteed release the heartbeat turns a leak into a permanent
 outage. What remains is a caller **blocked forever** inside the cycle — and there
@@ -447,7 +469,13 @@ holding is the right answer, because the workers really are joined.
 
 The TTL is now a backstop for exactly one residual: a lease acquired outside that
 deferred extent by some future call site. There is none today —
-`PrepareLinkCycle` has a single caller. Overrunning stays bounded and loud rather
+`PrepareLinkCycle` has a single production caller — and since #6871 round 9 that
+is **enforced** rather than merely stated: `link_cycle_acquisition_site_6871_test.go`
+walks the whole module for `PrepareLinkCycle` calls against an allowlist, and
+separately pins that the unexported `acquireLinkCycleLease` is reached only from
+`Manager.PrepareLinkCycle` (an in-package caller would bypass the chokepoint
+entirely). Round 8's comment named the first of those as existing enforcement
+when no such test existed. Overrunning stays bounded and loud rather
 than silent: `linkCycleInFlight` logs a `Warn` under the CAS when it retires an
 expired lease, and the behaviour it degrades to is master's, where the tick was
 never suppressed at all.

@@ -79,6 +79,69 @@ func adapterMethodsFromSource(t *testing.T) map[string]bool {
 	if err != nil {
 		t.Fatalf("parse package sources: %v", err)
 	}
+	// PASS 1 — expand the governed set through type ALIASES (#6871 round 9, F5).
+	//
+	// `type aliasEscape = userspaceLinkController` plus a method on aliasEscape
+	// puts that method in userspaceLinkController's method set — confirmed by a
+	// compile-time assertion — while a receiver-name match against the literal
+	// list above misses it entirely. Measured: such a method stayed GREEN.
+	//
+	// INCLUDED rather than rejected. Refusing an alias would also be sound, but
+	// resolving it means the alias's methods are BOUND rather than merely
+	// forbidden, and an alias is a legitimate thing to write. `ts.Assign != 0`
+	// is what distinguishes `type A = B` from `type A B`; the latter is a
+	// distinct type with its own method set and is correctly not governed.
+	//
+	// Fixed-point loop because an alias may name another alias.
+	governed := map[string]string{} // type name -> canonical controller name
+	for name := range adapterControllerTypes {
+		governed[name] = name
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, pkg := range pkgs {
+			for _, file := range pkg.Files {
+				for _, decl := range file.Decls {
+					gd, ok := decl.(*ast.GenDecl)
+					if !ok || gd.Tok != token.TYPE {
+						continue
+					}
+					for _, spec := range gd.Specs {
+						ts, ok := spec.(*ast.TypeSpec)
+						if !ok || ts.Assign == 0 {
+							continue // `type A B` defines a NEW type, not an alias
+						}
+						rhs, ok := ts.Type.(*ast.Ident)
+						if !ok {
+							continue
+						}
+						canon, isGoverned := governed[rhs.Name]
+						if !isGoverned {
+							continue
+						}
+						if _, already := governed[ts.Name.Name]; already {
+							continue
+						}
+						governed[ts.Name.Name] = canon
+						changed = true
+					}
+				}
+			}
+		}
+	}
+
+	// TWO ESCAPES THAT DO NOT WORK, recorded so nobody spends time re-deriving
+	// them (#6871 round 9):
+	//
+	//   - BUILD TAGS: parser.ParseDir ignores //go:build, so a method hidden
+	//     behind a tag is still SEEN here. That over-includes rather than
+	//     under-includes — a tagged-out method fails loudly as an unbound row
+	//     instead of escaping — which is the safe direction.
+	//   - POINTER vs VALUE receivers: covered by the StarExpr unwrap below.
+	//     `func (c *userspaceLinkController) M()` keys identically to the value
+	//     form.
+
+	// PASS 2 — collect the methods.
 	out := map[string]bool{}
 	for _, pkg := range pkgs {
 		for path, file := range pkg.Files {
@@ -92,7 +155,11 @@ func adapterMethodsFromSource(t *testing.T) map[string]bool {
 					recv = star.X
 				}
 				id, ok := recv.(*ast.Ident)
-				if !ok || !adapterControllerTypes[id.Name] {
+				if !ok {
+					continue
+				}
+				canon, isGoverned := governed[id.Name]
+				if !isGoverned {
 					continue
 				}
 				if !fn.Name.IsExported() {
@@ -101,7 +168,7 @@ func adapterMethodsFromSource(t *testing.T) map[string]bool {
 					// remove behaviour from a caller outside this package.
 					continue
 				}
-				out[id.Name+"."+fn.Name.Name] = true
+				out[canon+"."+fn.Name.Name] = true
 				_ = path
 			}
 		}

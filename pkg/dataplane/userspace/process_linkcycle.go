@@ -193,9 +193,24 @@ func (m *Manager) DisableAndStopHelper() {
 // workers really are joined and reconciling really would be wrong.
 //
 // The TTL therefore covers exactly one residual: a lease acquired outside that
-// deferred extent by some future call site. There is none today
-// (PrepareLinkCycle has a single caller, daemon_apply_dataplane.go), and
-// TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871 fails if one appears.
+// deferred extent by some future call site. There is none today —
+// PrepareLinkCycle has a single production caller, daemon_apply_dataplane.go —
+// and two guards fail if one appears, in
+// link_cycle_acquisition_site_6871_test.go:
+//
+//	TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871  tree-wide: every
+//	    production CALL of PrepareLinkCycle must be on an allowlist, because
+//	    LinkController lives in pkg/dataplane and any package can hold one
+//	TestLinkCycleLeaseIsAcquiredOnlyByPrepare_6871       in-package:
+//	    acquireLinkCycleLease is unexported, so anything in package userspace
+//	    could take a lease WITHOUT going through PrepareLinkCycle and inherit
+//	    none of the daemon's deferred release
+//
+// #6871 round 9 (F2): this paragraph previously named the first of those as
+// existing enforcement, and it did not exist — the only match for the name in
+// the tree was this comment. The factual claim was true and the guard was
+// absent, which is the worse of the two failures: it is the reason the next
+// reader does not add the check.
 //
 // Overrunning stays bounded and loud rather than silent: linkCycleInFlight logs
 // a Warn under the CAS when it retires an expired lease, and the state it
@@ -233,7 +248,35 @@ type linkCycleHeartbeat struct {
 // startLinkCycleHeartbeat begins renewing a lease that has just been taken.
 //
 // Idempotent: a second acquire with a beat already running re-arms the DEADLINE
-// (the caller stored it) without stacking a second goroutine.
+// (the caller stored it) without stacking a second goroutine. The running
+// heartbeat renews whichever lease is live, so one goroutine serves every
+// acquisition between a start and its release.
+//
+// #6871 (round 9, F1): the loop has EXACTLY ONE exit, and that is load-bearing
+// rather than tidiness. Round 8 added a second — a self-reap when the lease word
+// read 0 — which returned without clearing linkCycleHB.stop/done. The early
+// return above tests that FIELD, not goroutine liveness, so one reap left the
+// field non-nil with nothing running and every later acquireLinkCycleLease in the
+// same apply silently started no heartbeat: every RETH member cycled after that
+// point ran on round-7 protection, which the TTL block above argues is not
+// survivable at operator-controlled cardinality.
+//
+// The trigger was the case this whole round is built around. The word reaches 0
+// two ways: releaseLinkCycleLease, which stops the heartbeat first so no reap can
+// follow it, and linkCycleInFlight's backstop CAS after four missed beats —
+// exactly the starvation the 4x TTL margin exists to absorb.
+//
+// Clearing the fields inside the reap was the other candidate fix and is
+// rejected: the goroutine would be clearing state it no longer owns. A release
+// plus a fresh acquire can install a NEW stop/done between the reap's decision
+// and its lock, and the dying goroutine would then clear its successor's fields,
+// orphaning a live heartbeat and letting a third acquire stack a second one.
+// Making that safe needs an identity check; having one exit needs nothing.
+//
+// The cost of no reap is one atomic load per beat on a retired lease, until the
+// release that is guaranteed by the daemon's deferred AbandonLinkCycle. That is
+// the entire price, and it buys an invariant a reader can check by looking:
+// while linkCycleHB.stop is non-nil, a goroutine is receiving.
 func (m *Manager) startLinkCycleHeartbeat() {
 	m.linkCycleHB.mu.Lock()
 	defer m.linkCycleHB.mu.Unlock()
@@ -252,15 +295,9 @@ func (m *Manager) startLinkCycleHeartbeat() {
 			case <-stop:
 				return
 			case <-beats:
+				// A beat with no lease held is a no-op by construction:
+				// RenewLinkCycle never CASes from the 0 sentinel.
 				m.RenewLinkCycle()
-				// Self-reap. The release path stops this goroutine
-				// explicitly, so reaching here with no lease means the word
-				// was retired some other way (the TTL backstop, or a test
-				// writing it directly). Beating on nothing is harmless —
-				// RenewLinkCycle never creates a lease — but pointless.
-				if m.linkCycleLeaseUntil.Load() == 0 {
-					return
-				}
 			}
 		}
 	}()
@@ -400,10 +437,28 @@ func (m *Manager) releaseLinkCycleLease() {
 // It does NOT rebind. The rebind has two owners already — step 2.6b2 for a
 // completed cycle and programRethMACWithWorkerJoin for an aborted one — and
 // firing a third would be the double rebind that gets EBUSY on mlx5 zero-copy
-// queues. Dropping the lease alone is the recovery: it hands the helper back to
-// the 1 Hz reconcile, which re-arms bindings and workers on its own. That is
-// master's behaviour, i.e. the state this whole PR improves on, so the leak
-// degrades to the status quo ante instead of to a frozen dataplane.
+// queues. Dropping the lease hands the helper back to the 1 Hz reconcile, which
+// is master's behaviour: the leak degrades to the status quo ante rather than to
+// a frozen dataplane.
+//
+// HOW LONG THAT TAKES, stated because an earlier revision implied one tick
+// (#6871 round 9, F6). What resumes within a tick is the RECONCILE — the gate at
+// the top of the status loop stops suppressing it, so ctrl re-enable via
+// applyHelperStatusLocked is available on the next pass, ~1s. Restoring
+// FORWARDING is slower and depends on which producer fires. The busy-binding
+// auto-rebind is the one that recreates workers, and
+// shouldAutoRebindBusyBindingsLocked (maps_sync.go) gates it three ways: the
+// wedge must have been observed for >= 5s, rebinds are rate-limited to one per
+// 15s, and hasBusyBindingsWedgeLocked additionally requires
+// lastStatus.ForwardingArmed. So the honest figure is SECONDS, not one tick, and
+// on an unlucky ordering more than five of them.
+//
+// That is acceptable for what this is — a path taken only when a code path
+// leaked a lease, i.e. a bug — but it is not a fast recovery and must not be
+// described as one. The timing is not bound by a test: it is a multi-producer
+// property of the status loop against a live helper, and the map-free fixtures
+// this suite is built on cannot reach it. What IS bound is the half that
+// matters here, that the abandon un-suppresses the reconcile at all.
 //
 // A true return means a code path took a lease and did not release it, which is
 // a bug in that path rather than an expected outcome — the caller logs it.

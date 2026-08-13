@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -299,13 +300,22 @@ func TestStatusTickResumesAfterLinkCycle_6871(t *testing.T) {
 
 // fakeLinkCycleClock drives the lease's monotonic seam so the TTL can be walked
 // without sleeping out a real minute. It returns a setter for the elapsed value.
+//
+// #6871 round 9 (F3): `elapsed` is ATOMIC, and that is a correctness fix rather
+// than caution. Before round 8 nothing read linkCycleLeaseElapsed off any
+// goroutine but the test's own, so a plain variable was safe. The self-renewing
+// heartbeat reads it from ITS goroutine (beat -> RenewLinkCycle ->
+// linkCycleInFlight -> the seam) while the test writes it, which is a genuine
+// data race — `go test -race ./pkg/dataplane/userspace/` reported it on
+// TestLinkCycleLeaseRenewsItself_6871, the B2 discriminator itself. No -race
+// leg exists in the Makefile or the workflows, so the gate could not see it.
 func fakeLinkCycleClock(t *testing.T) func(time.Duration) {
 	t.Helper()
-	var elapsed time.Duration
+	var elapsed atomic.Int64
 	old := linkCycleLeaseElapsed
-	linkCycleLeaseElapsed = func() time.Duration { return elapsed }
+	linkCycleLeaseElapsed = func() time.Duration { return time.Duration(elapsed.Load()) }
 	t.Cleanup(func() { linkCycleLeaseElapsed = old })
-	return func(d time.Duration) { elapsed += d }
+	return func(d time.Duration) { elapsed.Add(int64(d)) }
 }
 
 // TestLinkCycleLeaseExpiresAfterTTL_6871 pins the backstop. NotifyLinkCycle is
