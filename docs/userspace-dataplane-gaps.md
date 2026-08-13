@@ -120,8 +120,43 @@ BEFORE reporting the pressure (revert that and the hot path pins itself at the
 sampler's first slot, restoring the O(PPS) shared-CAS hit); and a SELECTED
 packet whose target has room must actually land its clone (drop the
 `Sampled(Ok)` arm and port mirroring silently stops delivering on this path —
-green under both other tests). Each of these reds under its own call-site-only
-mutation while both #6114 tests stay green, which is the whole point. The
+green under both other tests). A fourth covers ROLLBACK: sampling and admission
+run before the in-place rewrite, but the sampler commit and the clone delivery
+are deferred until it succeeds, and every other test needs a SUCCESSFUL rewrite
+— so hoisting the commit above that check passed all of them. It drives a cache
+hit where BOTH in-place rewriters decline (an IPv4 IHL overrunning the L3
+payload, the one gate they share and both apply before their first UMEM write)
+and asserts the sampler does not advance, because `tx/dispatch` re-runs mirror
+selection on the fallback path and committing here would silently halve the
+flow's effective mirror rate.
+
+The fixtures also keep every ifindex DISTINCT — wire VLAN 80 on physical
+ifindex 6 resolving to logical unit 20080, and mirror output unit 200 resolving
+through `forwarding.egress[].bind_ifindex` to physical XSK port 22 — because
+`resolve_mirror_config` is keyed by the LOGICAL unit while `MirrorTargetMap` is
+keyed by the PHYSICAL bind port. An earlier revision collapsed both onto one
+constant and configured no VLAN or interface maps, which left two live
+call-site regressions green: ignoring `meta.ingress_vlan_id` (no mirror config
+resolves at all) and passing `config.output_ifindex` to admission unresolved
+(`NoBinding`, and cache-hit mirroring stops).
+
+Each of these reds under its own call-site-only mutation while both #6114 tests
+stay green — with ONE measured exception worth recording, because it bounds
+what this kind of test can prove. Reserve-before-sample INLINED at the call site
+(rather than reverting the shared helper) is FUNCTIONALLY INERT: the reservation
+is taken with an AcqRel CAS and handed straight back by
+`PendingTxAdmission::drop`, so no counter, queue, frame, or sampler value
+differs, and at cap it is not even reachable —
+`try_acquire_pending_tx_admission` bails at its relaxed
+`admitted >= admission_cap` load before the `compare_exchange_weak`. #6114 was a
+shared-cacheline fix, not a correctness fix, so no black-box assertion separates
+the two orderings here. What is pinned instead is DELEGATION: a source canary
+asserts the call site reaches the queue through `sample_then_admit_mirror_clone`
+and never calls `admit_mirror_clone_to_live` directly, so the ordering is
+inherited from the helper the #6114 tests already bind. A second canary, living
+in `mirror/mod_tests.rs` because one inside the module could not fire, asserts
+the test module is still registered at all — deleting its nine-line `mod`
+declaration unregisters every guard above with no build error. The
 mirror clone is captured BEFORE the in-place rewrite and `packet_frame` ALIASES
 the UMEM, so the fixtures slice `raw_frame` out of the UMEM as the poll loop
 does: hand them a detached heap buffer instead and "the clone carries the

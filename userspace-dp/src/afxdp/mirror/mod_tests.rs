@@ -1317,3 +1317,27 @@ fn cross_worker_nonsampled_no_clone_nonfull_5167() {
     target_live.take_pending_tx_into(&mut queued);
     assert!(queued.is_empty(), "a non-sampled packet must not clone");
 }
+
+/// #6304 (test-registration canary). The #6304 guard for the LIVE
+/// established-flow mirror call site lives in
+/// `poll_descriptor/flow_cache_hit_tests.rs`, which reaches the compiler ONLY
+/// through the nine-line `#[cfg(test)] #[path = ...] mod` declaration at the
+/// foot of `poll_descriptor/flow_cache_hit.rs`. Deleting those nine lines does
+/// not fail a build or a test — it silently unregisters the whole module, and
+/// the suite goes green with the live call site unbound again, which is the
+/// exact failure mode #6304 exists to close.
+///
+/// A canary inside that module cannot fire (it disappears with it), so this
+/// one lives here, in the mirror module that owns the #6114 invariant and is
+/// registered independently from `mirror/mod.rs`.
+#[test]
+fn live_flow_cache_callsite_tests_are_registered_6304() {
+    let src = include_str!("../poll_descriptor/flow_cache_hit.rs");
+    assert!(
+        src.contains("#[path = \"flow_cache_hit_tests.rs\"]")
+            && src.contains("mod flow_cache_hit_tests;"),
+        "#6304: poll_descriptor/flow_cache_hit.rs must still declare its test \
+         module — without that declaration the LIVE mirror call-site guards are \
+         not compiled at all and the suite passes vacuously"
+    );
+}

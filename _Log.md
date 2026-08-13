@@ -3,9 +3,14 @@
 - **Timestamp**: 2026-08-05 (fix/6304-mirror-callsite-bound-sv)
 - **Action**: Salvage verification. The implementing lane was killed mid-task by
   a spend limit with its work complete but uncommitted; it was committed as-is
-  at `02ffefd5d` and is rebased here onto `86927d23c`. Nothing was rewritten —
-  the diff is the dead lane's, re-verified firsthand end to end, plus the doc
-  update it missed.
+  at `02ffefd5d` and is rebased here onto `86927d23c`. The SALVAGE COMMIT
+  rewrote nothing — that diff is the dead lane's, re-verified firsthand end to
+  end, plus the doc update it missed. The rounds after it did rewrite:
+  `02ffefd5d..0938e5913` changes `flow_cache_hit_tests.rs` by +468/-1 (the
+  UMEM-aliasing fidelity fix and two added tests), and the fold round at the
+  foot of this entry replaces the file outright. An earlier revision of this
+  paragraph said "Nothing was rewritten" unqualified, which read as a claim
+  about the PR as a whole rather than about the salvage commit.
   The gap: the #6114 sample-before-CAS tests reach the shared
   `sample_then_admit_mirror_clone` (`mirror/resolver.rs`) through
   `enqueue_sampled_mirror_clone_to_live`, a wrapper that is DEAD in non-test
@@ -56,7 +61,11 @@
     "warning: function `enqueue_sampled_mirror_clone_to_live` is never used".
     The issue's premise holds; the wrapper has no production caller.
   - FAIL-ON-REVERT (live call site only — `flow_cache_hit.rs` restored to its
-    exact pre-#6114 form from `1810cb7e7`, `resolver.rs` untouched):
+    exact pre-#6114 form from `1810cb7e7^`, `resolver.rs` untouched; #6114
+    LANDED in `1810cb7e7`, so that commit already carries the sample-first
+    `sample_then_admit_mirror_clone` call and it is its PARENT that holds the
+    old `admit_mirror_clone_to_live` form — an earlier revision of this entry
+    named the commit itself):
     `cargo check --release --tests` -> rc=0 (compiles; not a build break, 0
     `^error[` lines), then `cargo test` -> rc=101 with
     `live_flow_cache_callsite_nonsampled_does_not_reserve_full_queue_6304`
@@ -149,13 +158,131 @@
   make every flow-cache-hit packet re-sample from 0, so `rate=N` would mirror
   EVERY packet on this path — an N-fold clone flood — and nothing in the tree
   would red. The SELECTED-arm residual that stood after round 1 is CLOSED.
-  Fixture note (not changed): `test_meta` sets `pkt_len: (frame.len() - 14)`,
-  the verbatim convention of every sibling fixture in this module tree
-  (`cookie_reply_tests.rs`, `reject_reply_tests.rs`, `frame/tests_*`), whereas
-  the shim stamps `pkt_len = data_end - data` (full frame incl. Ethernet). On
-  this path `pkt_len` only feeds byte counters — it cannot reach the mirror
-  admission decision — so the deviation is immaterial here and is a tree-wide
-  fixture drift to raise separately, not something to fork this diff over.
+  Fixture note (SUPERSEDED — the fold round below sets `pkt_len: frame.len()`):
+  the claim that `(frame.len() - 14)` is "the verbatim convention of every
+  sibling fixture in this module tree" was WRONG; the tree is MIXED.
+  `frame/prop_tests/strategies.rs:337` uses the full `frame.len()` and
+  `frame/tests_parse_forward_pbr.rs:105` uses `raw_payload.len()`, while
+  `cookie_reply_tests.rs:89`, `reject_reply_tests.rs:56` and
+  `tests_native_gre_ecn.rs` do strip 14. The shim is the authority and stamps
+  the FULL wire length (`packet_len = data_end - data`,
+  `userspace-xdp/src/lib.rs:566`; the reinject path agrees at
+  `coordinator/inject.rs:73`), so the stripped form under-reports every byte
+  counter `pkt_len` feeds — filter/policy/zone counters and the session byte
+  accounting. Immaterial to the mirror admission decision either way, but
+  there is no reason for this module's fixture to carry the wrong one.
+
+## 2026-08-12 — #6304 fold r1: three surviving mutations, and one of them is not observable at all
+
+- **Timestamp**: 2026-08-12 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded the Codex MERGE-NEEDS-MAJOR (PR comment 5275830598). The
+  diff is 9 production lines and ~900 test lines, so the GUARD is the
+  deliverable and a surviving mutation is a blocking defect, not a nit. Three
+  survived; all three are closed, but the first is closed differently than the
+  brief assumed and that difference is the important part of this entry.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+  (rewritten), `userspace-dp/src/afxdp/mirror/mod_tests.rs` (+registration
+  canary), `_Log.md`. NO production file changed — `flow_cache_hit.rs` is
+  byte-identical to the pre-fold head.
+
+  1. NON-SAMPLED FIXTURE WAS AT CAP, so its "no shared-CAS side effect"
+     assertion passed for the wrong reason: `try_acquire_pending_tx_admission`
+     (`binding_state/tx_inbox.rs:157-165`) returns `Err` from its RELAXED
+     `admitted >= admission_cap` load BEFORE reaching the
+     `compare_exchange_weak(AcqRel)`, so at cap no CAS is reachable no matter
+     what the call site does. Fixture now has ROOM, and asserts the target's
+     queue is untouched and `mirrored_packets == 0`.
+
+     But giving it room does NOT make the named mutation red, and this was
+     MEASURED rather than argued. Inlining `admit_mirror_clone_to_live` above
+     the sampler and discarding the reservation when the sampler declines is
+     FUNCTIONALLY INERT: the reservation is taken with an AcqRel CAS and handed
+     straight back by `PendingTxAdmission::drop`, so no counter, no queue, no
+     frame, and not even the sampler counter differs. Applied to the tree, that
+     mutation compiles and leaves every behavioural test in the module green —
+     both at cap and with room. #6114 was a shared-cacheline fix, not a
+     correctness fix, so there is no black-box observation that separates the
+     two orderings at this call site.
+
+     Closed with what CAN be pinned: a source canary asserting the call site
+     reaches the queue through `sample_then_admit_mirror_clone` (the single
+     home of the ordering, itself covered by the #6114 fail-on-revert tests)
+     and never calls `admit_mirror_clone_to_live` directly. Stated in the test
+     doc as a source canary with its limits, not dressed up as a runtime proof.
+
+  2. LIVE WIRING WAS ONLY PARTLY BOUND. Every fixture collapsed logical and
+     physical onto 7 and 22 with no VLAN or interface maps, so two live
+     call-site regressions stayed green. The topology is now distinct
+     throughout: wire VLAN 80 on physical ifindex 6 resolves to logical unit
+     20080 (which is where the mirror config hangs, deliberately NOT duplicated
+     under the physical ifindex — `resolve_mirror_config`'s `.or_else` fallback
+     would otherwise rescue the mutation), and mirror output unit 200 resolves
+     through `forwarding.egress[200].bind_ifindex` to physical XSK port 22
+     (which is what `MirrorTargetMap` is keyed by).
+
+     The ingress frame carries a REAL 802.1Q tag with `l3_offset = 18`. The
+     shim only ever reports a non-zero `ingress_vlan_id` together with
+     `ingress_vlan_present` (`parse_l2`, `userspace-xdp/src/lib.rs:1203-1215`),
+     and the whole dataplane then reads L3 at 18 — a tagged VID over an
+     untagged frame is a meta/frame pair the wire format cannot produce, so it
+     would have been a fixture that binds nothing while looking real.
+
+  3. REWRITE-FAILURE ROLLBACK WAS UNOBSERVED. Sampling and admission run before
+     the rewrite; the sampler commit and clone delivery are deferred until it
+     succeeds. Every prior test required a SUCCESSFUL rewrite, so hoisting the
+     commit above the check passed all of them. New test drives a cache hit
+     where BOTH in-place rewriters decline and asserts the counter stays 0 and
+     the packet falls back to the `PendingForwardRequest` path.
+
+     The decline is an IPv4 IHL of 15 (60 bytes) over a 40-byte L3 payload —
+     the one gate BOTH rewriters share and both apply BEFORE their first UMEM
+     write (`validate_rewrite_descriptor_ipv4` / `validate_generic_rewrite_v4`),
+     so the frame is pristine for the fallback per the #4965/#5466
+     preflight-then-commit contract. A DMA-race port mismatch does NOT work
+     here and the first attempt to use one was wrong: the generic path REPAIRS
+     ports (`restore_l4_tuple_from_meta` / `enforce_expected_ports`) instead of
+     declining, so only the descriptor path would have bailed.
+
+  4. TEST REGISTRATION IS NOW GUARDED, from OUTSIDE the module it guards.
+     Deleting the nine-line `#[cfg(test)] #[path = ...] mod` declaration
+     silently unregisters all of these tests with no build error; a canary
+     inside the module cannot fire because it disappears with it. It lives in
+     `mirror/mod_tests.rs`, registered independently from `mirror/mod.rs:87`.
+
+  MUTATION MATRIX (each applied to production, run, reverted, `git diff` then
+  verified clean; exit codes captured unpiped; every RED confirmed to be an
+  ASSERTION failure, with the only `^error` line being the harness's own
+  "test failed", never a compile break):
+
+  | mutation | result |
+  |---|---|
+  | M1 reserve-before-sample, inlined at the call site | delegation canary RED; 4 behavioural tests GREEN (the mutation is inert) |
+  | M2a `resolve_mirror_config(.., 0)` — drop the VLAN id | 3 RED (admitted-clone, full-queue, non-sampled) |
+  | M2b `config.output_ifindex` passed unresolved | 2 RED (admitted-clone, full-queue); non-sampled + rollback GREEN |
+  | M3 sampler commit hoisted above the rewrite check | 1 RED — exactly the new rollback test; 5 GREEN |
+  | M4 delete the `mod` registration | registration canary RED; the other 5 silently vanish from the run |
+
+  OVER-REACH GUARDS: M3 reds ONE test and leaves the three success-path tests
+  and both canaries green, which is what separates the rollback guard from a
+  restatement of the fix. M2b leaves the non-sampled and rollback tests green.
+  M1 leaves all four behavioural tests green — that is the measurement behind
+  item 1's conclusion, not a gap.
+
+  ALSO FIXED WHILE IN HERE (all four were verified at the source first, and all
+  four claims held): the "on another worker" comment was unfounded —
+  `MirrorTargetMap::insert` (`types/runtime.rs:590-601`) DISCARDS
+  `BindingIdentity.worker_id` and keys on (ifindex, queue_id), so the assertion
+  proves a resolved, full, live queue and now says so; the two `_Log.md`
+  provenance errors corrected in place above (the unqualified "Nothing was
+  rewritten", and `1810cb7e7` -> `1810cb7e7^`); and the `pkt_len` fixture drift
+  corrected to the shim's full wire length.
+
+  STRUCTURE: the three tests each carried their own ~200-line copy of the
+  `WorkerContext` wiring, which is how the mirror maps drifted away from the
+  ifindexes the call site actually resolves. They now share one
+  `LiveCallSiteFixture` + `run_stage`, so adding the fourth test cost ~60 lines
+  instead of ~210 and the topology is defined exactly once.
+
 ## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
 
 - **Timestamp**: 2026-08-12 (fix/5173-shim-queue-mis-steer, PR #6676)
