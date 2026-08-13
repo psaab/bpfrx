@@ -691,6 +691,7 @@
     "parent_ifindex": 0,
     "parent_linux_name": "",
     "redundancy_group": 0,
+    "redundant_parent": "",
     "routing_instance": "",
     "rx_queues": 0,
     "tunnel": false,

@@ -198,6 +198,20 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			}
 		}
 	}
+	// #6722: every row of a RETH physical member is stamped with its
+	// RedundantParent below (base row AND unit rows) so the Rust agreement
+	// ledger can tell a PROJECTION of another row's netdev from an independent
+	// observer of it. ResolveReth collapses reth1/reth1.0 onto the member's
+	// netdev, and a member's own units alias the matching reth unit the same
+	// way — a VLAN unit resolves to LinuxIfName(ResolveReth(base)).<vlan>, so
+	// `ge-0/0/1.100` lands on `reth1.100`'s netdev. Measured: a member carrying
+	// `unit 0` + `unit 100 vlan-id 100` puts {ge-0/0/1, ge-0/0/1.0, reth1} on
+	// one ifindex and {ge-0/0/1.100, reth1.100} on another, so stamping only
+	// the base row would leave the second pair ambiguous. Junos zones the RETH
+	// and never the member, so those rows arrive unzoned; counting that "no
+	// zone" as a dissenting vote holds the ifindex ambiguous, collapses the
+	// egress zone to the 0 sentinel, and blackholes every WAN->LAN transit flow
+	// on a bondless-RETH cluster. See InterfaceSnapshot.RedundantParent.
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
 		names = append(names, name)
@@ -228,6 +242,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			VLANID:          0,
 			LocalFabric:     iface.LocalFabricMember,
 			RedundancyGroup: rg,
+			RedundantParent: iface.RedundantParent,
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
 			MTU:             mtu,
@@ -300,6 +315,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				VLANID:                    unit.VlanID,
 				LocalFabric:               iface.LocalFabricMember,
 				RedundancyGroup:           rg, // inherit resolved RG (RETH parent or own)
+				RedundantParent:           iface.RedundantParent,
 				UnitCount:                 0,
 				Tunnel:                    iface.Tunnel != nil || unit.Tunnel != nil,
 				MTU:                       mtu,

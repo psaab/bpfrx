@@ -5844,3 +5844,191 @@ fn zoned_macless_unit_still_reaches_policy_6713() {
     assert_eq!(from_zone, "lan");
     assert_eq!(to_zone, "vpnb");
 }
+
+// ---------------------------------------------------------------------------
+// #6722 B2: the BONDLESS-RETH shape. See
+// `reth_member_unzoned_row_snapshot_6722` for why a RETH member's unzoned row
+// is NOT an operator statement and must cast no zone vote.
+// ---------------------------------------------------------------------------
+
+/// Resolve `dst` through the real FIB, assert it egresses `expect_ifindex`,
+/// then adjudicate WAN -> that ifindex through the real policy evaluator. The
+/// mirror of `adjudicate_lan_transit_6722` with the LAN as the TO-zone, which
+/// is the half #6722 B1 rewrote.
+fn adjudicate_wan_to_lan_transit_6722(
+    state: &ForwardingState,
+    dst: &str,
+    expect_ifindex: i32,
+) -> (u16, u16, crate::policy::PolicyEvaluationResult) {
+    let resolution = lookup_forwarding_resolution_v4(
+        state,
+        None,
+        dst.parse().expect("dst"),
+        "inet.0",
+        0,
+        true,
+        None,
+    );
+    assert_eq!(
+        resolution.egress_ifindex, expect_ifindex,
+        "precondition: the real FIB must hand {dst} to ifindex {expect_ifindex} \
+         (disposition {:?})",
+        resolution.disposition
+    );
+    let (from_id, to_id) =
+        zone_pair_ids_for_flow(state, WAN_IFINDEX_6722, resolution.egress_ifindex);
+    let result = crate::policy::evaluate_policy_result_with_icmp(
+        &state.policy,
+        from_id,
+        to_id,
+        "203.0.113.7".parse().expect("src"),
+        dst.parse().expect("dst"),
+        PROTO_TCP,
+        40000,
+        443,
+        None,
+        64,
+    );
+    (from_id, to_id, result)
+}
+
+/// #6722 B2 BLOCKER, the fail-CLOSED direction that #6722 B1 introduced.
+///
+/// `ResolveReth` collapses `reth1` and `reth1.0` onto their physical member's
+/// netdev, so the deliberately-unzoned `ge-0/0/1` row and the two `lan` RETH
+/// rows all land on ifindex 24. Sourcing the egress row's zone from the
+/// agreement ledger then reads `None` and adjudicates to-zone 0, and
+/// `evaluate_policy_result_l3_aware` refuses to match ANY rule -- exact,
+/// wildcard or `junos-global` -- when either zone id is 0. Under
+/// `default-policy deny-all` every WAN->LAN, sfmix->LAN and tunnel->LAN
+/// transit flow on a bondless-RETH cluster blackholes. LAN->WAN survives,
+/// because its egress ifindex has a single row, which is why an iperf3 smoke
+/// in the usual direction comes back green.
+///
+/// This is not a hypothetical config: `docs/ha-cluster-userspace.conf` is what
+/// `test/incus/loss-userspace-cluster.env` points every HA smoke test at, and
+/// the full `buildSnapshot` measures `ifindex 24: [ge-0/0/1="" reth1="lan"
+/// reth1.0="lan"]` on it.
+#[test]
+fn unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722() {
+    let state = build_forwarding_state(&reth_member_unzoned_row_snapshot_6722());
+
+    // Preconditions. The bondless-RETH netdev is MAC-ful, so this is the
+    // `state.egress` arm rather than the #6713 fallback.
+    assert!(
+        state.egress.contains_key(&LAN_IFINDEX_6722),
+        "precondition: the bondless-RETH member netdev is MAC-ful, so it HAS an \
+         egress row -- this is the `state.egress` arm"
+    );
+    // The asymmetry is the tell: only the EGRESS half regresses.
+    assert_eq!(
+        state
+            .ifindex_to_zone_id
+            .get(&LAN_IFINDEX_6722)
+            .copied()
+            .unwrap_or(0),
+        TEST_LAN_ZONE_ID,
+        "precondition: the INGRESS half is unaffected -- `ifindex_to_zone_id` \
+         still carries `lan`, so a packet ARRIVING on the LAN is attributed \
+         correctly and only the to-zone is in question"
+    );
+
+    let (from_id, to_id, result) =
+        adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+
+    assert_eq!(from_id, TEST_WAN_ZONE_ID, "from-zone");
+    assert_eq!(
+        to_id, TEST_LAN_ZONE_ID,
+        "a RETH and its physical member are ONE kernel netdev -- nothing can \
+         egress ge-0/0/1 that is not reth1.0 traffic -- so the member's unzoned \
+         row must not make the RETH's own zone ambiguous"
+    );
+    assert_eq!(
+        result.action,
+        PolicyAction::Permit,
+        "the operator's `from-zone wan to-zone lan permit` must match; a \
+         to-zone of 0 matches no rule at all and default-policy deny-all \
+         blackholes every WAN->LAN transit flow on the reference HA cluster"
+    );
+    assert_ne!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "the verdict must come from the operator's rule, not the default policy"
+    );
+}
+
+/// #6722 B2 OVER-REACH CONTROL 1, and the reason the exemption is scoped to an
+/// UNZONED member row.
+///
+/// `set security zones security-zone wan interfaces ge-0/0/1` on the MEMBER,
+/// against `lan` on the RETH, is a genuine operator statement about a genuine
+/// conflict rather than an artefact of one netdev described three times. It
+/// must keep failing CLOSED. Exempting every member row regardless of its own
+/// zone would silently discard the operator's word.
+///
+/// Kept in its own `#[test]` body so it cannot be skipped by an earlier
+/// assertion in the binder above.
+#[test]
+fn explicitly_zoned_reth_member_still_makes_the_ifindex_ambiguous_6722() {
+    let state = build_forwarding_state(&reth_member_explicitly_zoned_snapshot_6722());
+
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "a member row carrying its OWN zone is a real operator statement, so \
+         the ifindex must stay ambiguous"
+    );
+    assert_eq!(
+        state.egress_zone_id(LAN_IFINDEX_6722),
+        0,
+        "and the egress half must refuse to guess -- fail CLOSED"
+    );
+
+    let (_, to_id, result) =
+        adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+    assert_eq!(to_id, 0, "to-zone must be the 0 sentinel");
+    assert_eq!(
+        result.action,
+        PolicyAction::Deny,
+        "default-policy deny-all decides an ambiguous egress"
+    );
+}
+
+/// #6722 B2 OVER-REACH CONTROL 2: the RETH exemption must NOT leak to genuine
+/// logical units.
+///
+/// `wg0` / `wg0.0` (unzoned) / `wg0.1` (`vpnb`) is the interface-level
+/// WireGuard shape from #6722 B1. Those ARE three distinct logical units that
+/// Junos zones individually -- `wg0.0`'s "no zone" is a real operator
+/// statement -- so the ifindex must stay ambiguous and the egress half must
+/// still resolve the 0 sentinel. If this goes green the original #6722
+/// fail-open is reopened, which is worse than the bug B2 fixes.
+///
+/// Its own `#[test]` body, for the same reason as control 1.
+#[test]
+fn reth_exemption_does_not_leak_to_iface_tunnel_units_6722() {
+    let state = build_forwarding_state(&wg_iface_tunnel_unzoned_unit_snapshot_6722());
+
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+        "wg0.0 is a genuine unzoned logical unit, NOT a redundant description \
+         of another row's netdev -- the ifindex must stay ambiguous"
+    );
+    assert_eq!(
+        state.egress_zone_id(SHARED_TUNNEL_IFINDEX_6722),
+        0,
+        "the egress half must still refuse to hand wg0.0 its sibling's zone"
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
+    assert_eq!(to_id, 0, "to-zone must be the 0 sentinel");
+    assert_ne!(
+        to_id, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "specifically NOT `vpnb` -- that is the #6722 fail-open"
+    );
+    assert_eq!(result.action, PolicyAction::Deny);
+}

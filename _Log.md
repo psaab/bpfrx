@@ -77694,3 +77694,111 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
   _Log.md
+
+## 2026-08-12 — #6722 B2: RETH member rows must not vote in the egress-zone agreement ledger
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fix a BLOCKING fail-CLOSED regression introduced by #6722 B1
+  (`ad4f0c113`), which made the egress row take its `zone_id` from the
+  agreement ledger. The ledger's model of "how can several rows share one
+  ifindex" covered the non-VLAN unit-0 collapse and interface-level tunnels,
+  but missed a third mechanism — and it is the only one that reaches a shipped
+  topology.
+
+  `ResolveReth` (`pkg/config/types.go`) resolves a RETH to its PHYSICAL MEMBER,
+  and `snapshotLinuxName` applies it to the reth base row AND its units, so
+  `ge-0/0/1`, `reth1` and `reth1.0` are ONE kernel netdev. Junos zones the RETH
+  and never the member, so the member's rows arrive UNZONED and their "no zone"
+  was counted as a dissenting vote. Measured through the full `buildSnapshot`
+  on `docs/ha-cluster-userspace.conf` (node 0 — the topology
+  `test/incus/loss-userspace-cluster.env` points every HA smoke test at):
+
+  ```
+  ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]   <-- DISAGREE
+  ifindex 25: [ge-0/0/2="" reth0="wan"]                 <-- DISAGREE
+  DefaultPolicy="deny"
+  ```
+
+  With the ledger ambiguous, `egress_zone_id(24)` returned 0 instead of 1, the
+  zone pair became `(wan, 0)`, and `policy.rs`'s `from_id != 0 && to_id != 0`
+  gate skipped every tier — exact, from-any, to-any, both-any and
+  `junos-global` — so `default-policy deny-all` dropped the packet. Every
+  WAN->LAN, sfmix->LAN and tunnel->LAN transit flow on a bondless-RETH cluster
+  blackholed. LAN->WAN survived (its egress ifindex has a single row), which is
+  exactly why an iperf3 smoke in the usual direction came back green. The
+  INGRESS half was unaffected throughout (`ifindex_to_zone_id[24]` still `lan`)
+  — that asymmetry was the diagnostic tell.
+
+- **Mechanism**: a ledger is only sound if every row voting on an ifindex is an
+  INDEPENDENT observer of it. A RETH member's row is a PROJECTION of the RETH's
+  netdev, not an observer — nothing can egress `ge-0/0/1` that is not `reth1.0`
+  traffic. New additive wire field `redundant_parent` carries the member
+  relationship, and `populate_interfaces` exempts a row that carries it AND has
+  no zone of its own from voting. Stamped on the member's base row AND its unit
+  rows: a member's units alias the matching reth unit too — a VLAN unit
+  resolves to `LinuxIfName(ResolveReth(base)).<vlan>`, so a member carrying
+  `unit 0` + `unit 100 vlan-id 100` puts `{ge-0/0/1, ge-0/0/1.0, reth1}` on one
+  ifindex and `{ge-0/0/1.100, reth1.100}` on another. Stamping only the base
+  row would have left the second pair ambiguous.
+
+  The `zone.is_empty()` half of the gate is load-bearing, not defensive: a
+  member the operator EXPLICITLY zoned differently from its RETH is a real
+  statement about a real conflict and must keep failing closed.
+
+  ROUTE NOT TAKEN, and why. The obvious Go-side fix — stamp the member with the
+  RETH's zone in `buildInterfaceZoneMap` — was prototyped and MEASURED to
+  reintroduce #5699. The bondless-RETH address lives on the member netdev, so
+  with a zone the member row enters `BuildZoneHostInboundViews` and the single
+  live address 10.0.61.1 lands in TWO views with DIFFERENT admit sets
+  (`[ssh ping]` from `reth1.0`'s per-interface override vs `[ssh]` from the
+  zone default). The kernel host-inbound chain matches destination address
+  only, so the verdict is order-dependent — the deterministic false-deny the
+  #5699 comment exists to prevent. Its existing guard cannot fire because it
+  keys on `ifc.Units[0] != nil` and a RETH member has no units.
+  `go test ./pkg/dataplane/...` passes WITH that defect present.
+
+- **Alias-mechanism audit** (the general lesson: enumerate every projection):
+  (a) non-VLAN unit-0 collapse and (b) interface-level tunnels via
+  `TunnelNameMap` are GENUINE logical units and still vote — unchanged;
+  (c) `ResolveReth` base + units — PROJECTION, exempted here;
+  (d) `fab0` IPVLAN — NOT an alias, measured as its own netdev/ifindex
+  (`snapshotLinuxName` never calls `ResolveFab`), no action;
+  (e) bondless-RETH VLAN synthetic logical ifindexes — unique by construction;
+  (f) a recycled ifindex across two unrelated interfaces — genuinely distinct
+  observers, must vote (pinned by `reused_ifindex_snapshot_6722`).
+
+- **Validation**: new binder
+  `unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722` reds at
+  the unmodified PR head `886ad8662` with an ASSERTION (`left: 0, right: 1`),
+  not a build break. Two over-reach controls stay GREEN there and are each
+  proven to FIRE under their own mutation:
+  `explicitly_zoned_reth_member_still_makes_the_ifindex_ambiguous_6722` reds
+  when the `zone.is_empty()` half is dropped;
+  `reth_exemption_does_not_leak_to_iface_tunnel_units_6722` reds when the
+  exemption is widened. Both pre-existing #6722 mutation cells still red after
+  this change (revert the ledger-sourced egress `zone_id` -> 4 red; break the
+  absorbing `None` -> 4 red), so the B1 ledger guard remains bound. Go row-shape
+  tests bind the producible snapshot (base stamp, unit stamp, over-reach, and
+  the JSON round-trip) and each reds on its own revert.
+
+- **Docs**: corrected three claims this falsified —
+  `forwarding_build/interfaces.rs` "an ordinary single-unit interface is
+  unaffected" (true again, but now stated WITH the reason: the member casts no
+  vote); `types/forwarding.rs` now enumerates all THREE ifindex-sharing
+  mechanisms and names `ResolveReth` as the one that reaches a shipped
+  topology; the architecture doc gains the B2 section and, per review, states
+  BOTH directions of the 0 sentinel — fail-CLOSED under `deny-all` (what the
+  reference cluster runs) and fail-OPEN under `permit-all`, where zone 0 skips
+  the operator's DENY rules too. Consistent with the pre-existing #3110
+  decision to treat zone 0 as unmatchable rather than as a wildcard.
+
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-architecture.md, _Log.md

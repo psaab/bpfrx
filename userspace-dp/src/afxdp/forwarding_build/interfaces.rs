@@ -119,13 +119,61 @@ pub(super) fn populate_interfaces(
         // because the arm is skipped whenever the parent already disagrees and
         // a parent with no snapshot row of its own also has no child pointing
         // at it (an unresolvable link yields `ifindex == 0` on both rows).
-        match zone_agreement.entry(iface.ifindex) {
-            std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(Some(row_zone_id));
-            }
-            std::collections::btree_map::Entry::Occupied(mut slot) => {
-                if *slot.get() != Some(row_zone_id) {
-                    slot.insert(None);
+        // #6722 B2: a ledger is only sound if every row is an INDEPENDENT
+        // observer of its ifindex. An UNZONED physical RETH member's row is
+        // not — it is a PROJECTION of the RETH's own netdev.
+        //
+        // `ResolveReth` (`pkg/config/types.go`) resolves a RETH to its member,
+        // and `snapshotLinuxName` (`pkg/dataplane/userspace/interfaces.go`)
+        // applies it to the reth base row AND its units, so `ge-0/0/1`,
+        // `reth1` and `reth1.0` are ONE kernel netdev. A member's own units
+        // alias the matching reth unit the same way — a VLAN unit resolves to
+        // `LinuxIfName(ResolveReth(base)).<vlan>`, putting `ge-0/0/1.100` on
+        // `reth1.100`'s netdev — which is why the Go builder stamps
+        // `redundant_parent` on the member's unit rows too, not just its base.
+        //
+        // Junos zones the RETH, never the member, so `buildInterfaceZoneMap`
+        // leaves the member's rows unzoned and `buildInterfaceSnapshots` emits
+        // them unfiltered. Counting that "no zone" as a dissenting vote makes
+        // the RETH's own zone ambiguous: measured through the full
+        // `buildSnapshot` on `docs/ha-cluster-userspace.conf` (node 0 — the
+        // topology `test/incus/loss-userspace-cluster.env` points every HA
+        // smoke test at), `ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]`
+        // and `ifindex 25: [ge-0/0/2="" reth0="wan"]` under `default-policy
+        // deny-all`. That collapses the EGRESS zone to the 0 sentinel, against
+        // which `evaluate_policy_result_l3_aware` matches no rule at all
+        // (`policy.rs`, the `from_id != 0 && to_id != 0` gate), so every
+        // WAN->LAN, sfmix->LAN and tunnel->LAN transit flow on a bondless-RETH
+        // cluster blackholes. LAN->WAN survives because its egress ifindex has
+        // a single row, which is exactly why an iperf3 smoke in the usual
+        // direction comes back green.
+        //
+        // The `zone.is_empty()` half of the gate is LOAD-BEARING, not
+        // defensive. A member the operator EXPLICITLY zoned into a different
+        // zone than its RETH is a real statement about a real conflict, not an
+        // artefact of one device described by several rows, and it must keep
+        // failing closed. `explicitly_zoned_reth_member_still_makes_the_
+        // ifindex_ambiguous_6722` reds if this half is dropped.
+        //
+        // SCOPE, deliberately narrow. The other ways two rows share an ifindex
+        // are all genuine independent observers and still vote:
+        // the non-VLAN unit-0 collapse (`st0` / `st0.0`), interface-level
+        // tunnels (`wg0` / `wg0.0` / `wg0.1` via `TunnelNameMap`), and a
+        // recycled ifindex across two unrelated interfaces. `fab0` is NOT one
+        // of them — the fabric IPVLAN is its own netdev with its own ifindex
+        // (`snapshotLinuxName` never calls `ResolveFab`), so it never shares
+        // one with its physical parent.
+        let row_is_reth_member_projection =
+            !iface.redundant_parent.is_empty() && iface.zone.is_empty();
+        if !row_is_reth_member_projection {
+            match zone_agreement.entry(iface.ifindex) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(Some(row_zone_id));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    if *slot.get() != Some(row_zone_id) {
+                        slot.insert(None);
+                    }
                 }
             }
         }
@@ -436,6 +484,19 @@ pub(super) fn populate_egress(
         // `unwrap_or(0)` is exactly right. Where the rows AGREE the value is
         // identical to the row's own zone, so an ordinary single-unit interface
         // is unaffected.
+        //
+        // #6722 B2, stated carefully because the earlier spelling of that last
+        // sentence was FALSE. "Single-unit" is a claim about the CONFIG, not
+        // about how many snapshot rows land on the netdev, and a bondless RETH
+        // is the counterexample: `reth1` with one unit still puts THREE rows on
+        // ifindex 24 (`ge-0/0/1`, `reth1`, `reth1.0`), because `ResolveReth`
+        // collapses the RETH onto its physical member. Before the projection
+        // exemption above, the member's unzoned row dissented and the ledger
+        // held the ifindex ambiguous, so that interface was very much affected
+        // — every WAN->LAN transit flow on the reference HA cluster blackholed.
+        // It is unaffected NOW for a specific reason: the member's rows cast no
+        // vote at all, so the surviving rows are unanimous and the ledger value
+        // is once again identical to the row's own zone.
         //
         // PROVENANCE, so a bisect is not misled: this ambiguity was already
         // latent in the index-keyed `egress` map BEFORE #6713/#6722. On

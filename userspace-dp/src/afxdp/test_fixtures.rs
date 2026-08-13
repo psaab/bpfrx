@@ -1546,3 +1546,189 @@ pub(super) fn wg_iface_tunnel_unanimous_snapshot_6722() -> ConfigSnapshot {
         ..Default::default()
     }
 }
+
+// ---------------------------------------------------------------------------
+// #6722 B2: the BONDLESS-RETH shape — the third way several rows land on one
+// ifindex, and the only one that reaches a SHIPPED topology.
+//
+// `ResolveReth` (`pkg/config/types.go`) collapses a RETH onto its physical
+// member's netdev, and `snapshotLinuxName`
+// (`pkg/dataplane/userspace/interfaces.go`) applies it to BOTH the `reth1`
+// base row and `reth1.0`:
+//
+//     snapshotLinuxName(reth1)   -> LinuxIfName(ResolveReth("reth1")) = ge-0-0-1
+//     snapshotLinuxName(reth1.0) -> LinuxIfName(ResolveReth("reth1")) = ge-0-0-1
+//     snapshotLinuxName(ge-0/0/1)-> LinuxIfName("ge-0/0/1")           = ge-0-0-1
+//
+// Junos zones the RETH, never its member, so `buildInterfaceZoneMap`
+// (`pkg/dataplane/userspace/zones.go`) leaves the member row UNZONED and
+// `buildInterfaceSnapshots` emits it unfiltered. Three rows, one ifindex,
+// and the member's "no zone" DISAGREES with the RETH's.
+//
+// Measured through the full `buildSnapshot` on the reference cluster config
+// (`docs/ha-cluster-userspace.conf`, node 0 — the topology
+// `test/incus/loss-userspace-cluster.env` points every HA smoke test at):
+//
+//     ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]   <-- DISAGREE
+//     ifindex 25: [ge-0/0/2="" reth0="wan"]                 <-- DISAGREE
+//     DefaultPolicy="deny"
+//
+// Unlike `wg0.0` / `st0.0`, the member's unzoned row is NOT an operator
+// statement about a distinct forwarding entity. A RETH and its member are one
+// kernel netdev; nothing can egress `ge-0/0/1` that is not `reth1.0` traffic.
+// The disagreement is an artefact of describing one device with three rows, so
+// the member must cast no zone vote — see `populate_interfaces`.
+//
+// Direction matters here. The regression this fixture pins is on the EGRESS
+// half only: `ifindex_to_zone_id[24]` still carries `lan`, so a packet
+// ARRIVING on the LAN is attributed correctly and only the to-zone collapses
+// to the 0 sentinel. That asymmetry is the tell.
+// ---------------------------------------------------------------------------
+
+/// The WAN-side ingress netdev in the bondless-RETH fixtures (`reth0.80` ->
+/// `ge-0-0-2.80`, its own VLAN child netdev and so its own ifindex).
+pub(super) const WAN_IFINDEX_6722: i32 = 27;
+
+/// A row on the LAN RETH's SHARED netdev (`ge-0-0-1`, `LAN_IFINDEX_6722`).
+/// Every bondless-RETH row resolves to the physical member's netdev, so `name`
+/// is the only thing that distinguishes them.
+fn reth_row_6722(
+    name: &str,
+    zone: &str,
+    redundant_parent: &str,
+    address: Option<&str>,
+) -> InterfaceSnapshot {
+    InterfaceSnapshot {
+        name: name.to_string(),
+        zone: zone.to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        ifindex: LAN_IFINDEX_6722,
+        mtu: 1500,
+        // Only the PHYSICAL MEMBER carries this; the reth rows do not.
+        redundant_parent: redundant_parent.to_string(),
+        // Bondless RETH: the member netdev carries the RETH's virtual MAC, so
+        // every row on it is MAC-ful and `populate_egress` gives all three an
+        // egress row. This is the `state.egress` arm, not the #6713 fallback.
+        hardware_addr: "02:bf:72:01:00:01".to_string(),
+        redundancy_group: 2,
+        addresses: address
+            .map(|a| {
+                vec![InterfaceAddressSnapshot {
+                    family: "inet".to_string(),
+                    address: a.to_string(),
+                    scope: 0,
+                }]
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    }
+}
+
+/// The WAN ingress row: `reth0.80`, a VLAN child with its OWN netdev and
+/// ifindex, so the WAN side is unambiguous and only the LAN egress half is
+/// under test.
+fn wan_row_6722() -> InterfaceSnapshot {
+    InterfaceSnapshot {
+        name: "reth0.80".to_string(),
+        zone: "wan".to_string(),
+        linux_name: "ge-0-0-2.80".to_string(),
+        ifindex: WAN_IFINDEX_6722,
+        vlan_id: 80,
+        mtu: 1500,
+        hardware_addr: "02:bf:72:00:00:02".to_string(),
+        redundancy_group: 1,
+        addresses: vec![InterfaceAddressSnapshot {
+            family: "inet".to_string(),
+            address: "172.16.80.8/24".to_string(),
+            scope: 0,
+        }],
+        ..Default::default()
+    }
+}
+
+fn reth_zones_6722() -> Vec<ZoneSnapshot> {
+    vec![
+        ZoneSnapshot {
+            name: "lan".to_string(),
+            id: TEST_LAN_ZONE_ID,
+            ..Default::default()
+        },
+        ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+            ..Default::default()
+        },
+    ]
+}
+
+/// `from-zone wan to-zone lan permit`, under a `deny-all` default. The LAN is
+/// the TO-zone here, which is the half #6722 B1 changed.
+fn reth_policies_6722() -> Vec<PolicyRuleSnapshot> {
+    vec![PolicyRuleSnapshot {
+        name: "wan-to-lan".to_string(),
+        from_zone: "wan".to_string(),
+        to_zone: "lan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+        ..Default::default()
+    }]
+}
+
+/// The reference bondless-RETH LAN: an UNZONED physical member plus a zoned
+/// `reth1` base plus a zoned `reth1.0`, all on ONE ifindex.
+///
+/// ```text
+/// set interfaces ge-0/0/1 gigether-options redundant-parent reth1
+/// set interfaces reth1 redundant-ether-options redundancy-group 2
+/// set interfaces reth1 unit 0 family inet address 10.0.61.1/24
+/// set security zones security-zone lan interfaces reth1
+/// ```
+///
+/// Row order matches `buildInterfaceSnapshots`, which walks interface names
+/// SORTED — `ge-0/0/1` sorts before `reth1`, so the member votes FIRST and the
+/// two agreeing RETH rows follow. That ordering is why the pre-#6722 code
+/// (`populate_egress` last-write-wins on the row's own zone) happened to land
+/// `lan` and why the ledger, which is order-independent, lands `None` instead.
+pub(super) fn reth_member_unzoned_row_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: reth_zones_6722(),
+        interfaces: vec![
+            wan_row_6722(),
+            reth_row_6722("ge-0/0/1", "", "reth1", None),
+            reth_row_6722("reth1", "lan", "", None),
+            reth_row_6722("reth1.0", "lan", "", Some("10.0.61.1/24")),
+        ],
+        default_policy: "deny".to_string(),
+        policies: reth_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// OVER-REACH CONTROL fixture: the member row carries its own EXPLICIT zone,
+/// different from the RETH's.
+///
+/// ```text
+/// set security zones security-zone wan interfaces ge-0/0/1   # the MEMBER
+/// set security zones security-zone lan interfaces reth1
+/// ```
+///
+/// That is a real operator statement about a real conflict, not an artefact of
+/// one netdev described three times, so it must keep failing CLOSED. The
+/// exemption is scoped to an UNZONED member row for exactly this reason.
+pub(super) fn reth_member_explicitly_zoned_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: reth_zones_6722(),
+        interfaces: vec![
+            wan_row_6722(),
+            reth_row_6722("ge-0/0/1", "wan", "reth1", None),
+            reth_row_6722("reth1", "lan", "", None),
+            reth_row_6722("reth1.0", "lan", "", Some("10.0.61.1/24")),
+        ],
+        default_policy: "deny".to_string(),
+        policies: reth_policies_6722(),
+        ..Default::default()
+    }
+}

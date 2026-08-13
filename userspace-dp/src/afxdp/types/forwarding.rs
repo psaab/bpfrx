@@ -563,10 +563,30 @@ impl ForwardingState {
     /// no operator-authored permit could ever apply to LAN->tunnel transit and
     /// every packet fell to the default policy.
     ///
-    /// #6722, WHY THE FALLBACK IS NOT `ifindex_to_zone_id`. Several logical
-    /// units can share ONE ifindex — `pkg/dataplane/userspace/interfaces.go`'s
-    /// `snapshotLinuxName` collapses a non-VLAN unit 0 onto its base netdev, so
-    /// `st0` and `st0.0` are one ifindex, as are `ge-0/0/1` and `ge-0/0/1.0`.
+    /// #6722, WHY THE FALLBACK IS NOT `ifindex_to_zone_id`. Several rows can
+    /// share ONE ifindex, by THREE distinct mechanisms in
+    /// `pkg/dataplane/userspace/interfaces.go`'s `snapshotLinuxName`:
+    ///
+    /// (a) a non-VLAN unit 0 collapses onto its base netdev, so `st0` and
+    ///     `st0.0` are one ifindex, as are `ge-0/0/1` and `ge-0/0/1.0`;
+    /// (b) an interface-level tunnel maps EVERY unit onto the base device via
+    ///     `TunnelNameMap`, so `wg0`, `wg0.0` and `wg0.1` are one ifindex;
+    /// (c) `ResolveReth` (`pkg/config/types.go`) resolves a RETH to its
+    ///     PHYSICAL MEMBER, so `reth1`, `reth1.0` and the member row
+    ///     `ge-0/0/1` are one ifindex — and a member's own units alias the
+    ///     matching reth unit the same way (`ge-0/0/1.100` onto `reth1.100`).
+    ///
+    /// (c) is the one that reaches a SHIPPED topology: `docs/ha-cluster-
+    /// userspace.conf` is what `test/incus/loss-userspace-cluster.env` points
+    /// every HA smoke test at, and it measures `ifindex 24: [ge-0/0/1=""
+    /// reth1="lan" reth1.0="lan"]`. Its member rows are NOT independent
+    /// observers — a RETH and its member are one kernel netdev — so they are
+    /// exempted from the ledger in `populate_interfaces` rather than counted
+    /// as dissent. (a) and (b) are genuine logical units and still vote.
+    ///
+    /// `fab0` is NOT a fourth mechanism: the fabric IPVLAN is its own netdev
+    /// with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`), so
+    /// it never shares one with its physical parent.
     /// `ifindex_to_zone_id` is therefore a per-NETDEV map, not a per-unit one:
     /// it holds the LAST zoned row's zone plus the zone `populate_interfaces`
     /// propagates from a zoned child unit onto `parent_ifindex`. Reading it

@@ -252,16 +252,37 @@ type InterfaceSnapshot struct {
 	// across VRF boundaries (#2388). Additive: an old Rust helper that does
 	// not know the field treats every interface as the default instance
 	// (the pre-#2388 global behavior); an old Go binary omits it.
-	RoutingInstance           string                     `json:"routing_instance,omitempty"`
-	LinuxName                 string                     `json:"linux_name,omitempty"`
-	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
-	Ifindex                   int                        `json:"ifindex,omitempty"`
-	ParentIfindex             int                        `json:"parent_ifindex,omitempty"`
-	LogicalOnly               bool                       `json:"logical_only,omitempty"`
-	RXQueues                  int                        `json:"rx_queues,omitempty"`
-	VLANID                    int                        `json:"vlan_id,omitempty"`
-	LocalFabric               string                     `json:"local_fabric_member,omitempty"`
-	RedundancyGroup           int                        `json:"redundancy_group,omitempty"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
+	LinuxName       string `json:"linux_name,omitempty"`
+	ParentLinuxName string `json:"parent_linux_name,omitempty"`
+	Ifindex         int    `json:"ifindex,omitempty"`
+	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
+	LogicalOnly     bool   `json:"logical_only,omitempty"`
+	RXQueues        int    `json:"rx_queues,omitempty"`
+	VLANID          int    `json:"vlan_id,omitempty"`
+	LocalFabric     string `json:"local_fabric_member,omitempty"`
+	RedundancyGroup int    `json:"redundancy_group,omitempty"`
+	// RedundantParent is the `gigether-options redundant-parent` RETH this
+	// row's interface is a physical member of ("" = not a RETH member). It is
+	// carried for exactly one purpose: to tell the Rust agreement ledger that
+	// this row is a PROJECTION of another row's netdev rather than an
+	// independent observer of it (#6722).
+	//
+	// ResolveReth (pkg/config/types.go) collapses a RETH onto its physical
+	// member's netdev, and snapshotLinuxName applies it to the reth base row
+	// AND its units, so `ge-0/0/1`, `reth1` and `reth1.0` are one ifindex —
+	// and a member's own units alias the matching reth unit the same way
+	// (`ge-0/0/1.100` onto `reth1.100`). Junos zones the RETH, never the
+	// member, so the member's rows arrive UNZONED and their "no zone" would
+	// otherwise be counted as a dissenting vote that makes the RETH's own zone
+	// ambiguous. Stamped on the member's base row and every one of its unit
+	// rows, since both alias.
+	//
+	// Additive: an old Rust helper ignores the field (no deny_unknown_fields)
+	// and keeps today's fail-CLOSED behavior; an old Go binary omits it and a
+	// new helper defaults to "", likewise fail-closed. The degraded direction
+	// is the safe one.
+	RedundantParent           string                     `json:"redundant_parent,omitempty"`
 	UnitCount                 int                        `json:"unit_count"`
 	Tunnel                    bool                       `json:"tunnel"`
 	MTU                       int                        `json:"mtu,omitempty"`

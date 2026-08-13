@@ -907,6 +907,69 @@ Scope of the fallback:
   source and cannot disagree. Where the rows agree the value is identical to the
   row's own zone, so an ordinary single-unit interface is unaffected.
 
+- **A RETH member's row is a PROJECTION, not an observer (#6722 B2).**
+  A ledger is only sound if every row voting on an ifindex is an INDEPENDENT
+  observer of it. There is a third way several rows land on one ifindex, and it
+  is the only one that reaches a shipped topology: `ResolveReth`
+  (`pkg/config/types.go`) resolves a RETH to its PHYSICAL MEMBER, and
+  `snapshotLinuxName` applies it to the reth base row AND its units. So
+  `ge-0/0/1`, `reth1` and `reth1.0` are one netdev, and a member's own units
+  alias the matching reth unit the same way — a VLAN unit resolves to
+  `LinuxIfName(ResolveReth(base)).<vlan>`, putting `ge-0/0/1.100` on
+  `reth1.100`.
+
+  Junos zones the RETH, never the member, so `buildInterfaceZoneMap` leaves the
+  member's rows unzoned and `buildInterfaceSnapshots` emits them unfiltered.
+  Measured through the full `buildSnapshot` on `docs/ha-cluster-userspace.conf`
+  (node 0 — the topology `test/incus/loss-userspace-cluster.env` points every HA
+  smoke test at):
+
+  ```
+  ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]   <-- DISAGREE
+  ifindex 25: [ge-0/0/2="" reth0="wan"]                 <-- DISAGREE
+  DefaultPolicy="deny"
+  ```
+
+  Counting the member's "no zone" as dissent held those ifindexes ambiguous,
+  collapsed the egress zone to the 0 sentinel and — under `deny-all` — blackholed
+  every WAN→LAN, sfmix→LAN and tunnel→LAN transit flow on a bondless-RETH
+  cluster. LAN→WAN survived because its egress ifindex has a single row, which is
+  why an iperf3 smoke in the usual direction came back green. The INGRESS half
+  was unaffected throughout (`ifindex_to_zone_id[24]` still carried `lan`); that
+  asymmetry is the diagnostic tell.
+
+  So the Go builder stamps `redundant_parent` on every row of a RETH physical
+  member (base AND units), and `populate_interfaces` exempts a row that carries
+  it **and has no zone of its own** from voting. The `zone.is_empty()` half is
+  load-bearing: a member the operator EXPLICITLY zoned into a different zone than
+  its RETH is a real statement about a real conflict, not an artefact of one
+  device described by several rows, and it must keep failing closed
+  (`explicitly_zoned_reth_member_still_makes_the_ifindex_ambiguous_6722`). The
+  exemption reaches nothing else — `st0.0` and `wg0.0` are genuine logical units
+  and still vote (`reth_exemption_does_not_leak_to_iface_tunnel_units_6722`), and
+  `fab0` is not a fourth mechanism at all: the fabric IPVLAN is its own netdev
+  with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`).
+
+  The field is additive in both directions — `omitempty` on the Go side,
+  `#[serde(default)]` on the Rust side, and no `deny_unknown_fields` anywhere in
+  `userspace-dp/src/protocol` — and the DEGRADED direction is the safe one: an
+  old helper ignores the key, an old Go binary omits it, and in both cases the
+  member votes and the ifindex stays ambiguous, i.e. the fail-CLOSED behaviour.
+
+- **Both directions of the 0 sentinel, stated.** The sections above argue the
+  fail-CLOSED consequence because that is what the reference cluster runs
+  (`default-policy deny-all`). Under `default-policy permit-all` the same
+  resolution is fail-OPEN: zone id 0 matches no rule in ANY tier — exact pair,
+  from-any, to-any, both-any or `junos-global` — so a DENY the operator wrote for
+  that zone pair is skipped along with everything else and the permissive default
+  decides. Refusing to guess a zone is therefore not universally "the safe
+  answer"; it is safe exactly to the extent the default policy is. This is
+  consistent with the pre-existing #3110 decision to treat zone 0 as
+  unmatchable rather than as a wildcard, and it is why #6722 B2 is a blocker
+  rather than a cosmetic correctness fix: on a deny-all cluster the ambiguity
+  cost total LAN reachability, and on a permit-all one it would cost the
+  operator's deny rules instead.
+
   **Provenance, stated so a bisect is not misled.** This ambiguity was already
   latent in the index-keyed `egress` map before #6713/#6722: on `origin/master`
   `egress_zone_id` was an `egress`-only read and `populate_egress` already

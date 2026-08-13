@@ -64,6 +64,25 @@ pub(crate) struct InterfaceSnapshot {
     pub local_fabric_member: String,
     #[serde(rename = "redundancy_group", default)]
     pub redundancy_group: i32,
+    /// #6722: the RETH this row's interface is a physical member of ("" = not
+    /// a RETH member). Carried for exactly one purpose — to tell the agreement
+    /// ledger in `forwarding_build::interfaces` that this row is a PROJECTION
+    /// of another row's netdev rather than an independent observer of it.
+    ///
+    /// `ResolveReth` (`pkg/config/types.go`) collapses a RETH onto its
+    /// physical member's netdev, so `ge-0/0/1`, `reth1` and `reth1.0` are ONE
+    /// ifindex, and a member's own units alias the matching reth unit the same
+    /// way. Junos zones the RETH, never the member, so the member's rows
+    /// arrive unzoned; counting that "no zone" as a dissenting vote makes the
+    /// RETH's own zone ambiguous and collapses the egress zone to the 0
+    /// sentinel.
+    ///
+    /// Additive via serde default: absent on snapshots from an old Go binary,
+    /// in which case the member votes and the ifindex stays ambiguous — the
+    /// pre-#6722-B2 fail-CLOSED behavior, which is the safe degraded
+    /// direction.
+    #[serde(rename = "redundant_parent", default)]
+    pub redundant_parent: String,
     #[serde(rename = "unit_count", default)]
     pub unit_count: usize,
     #[serde(default)]
