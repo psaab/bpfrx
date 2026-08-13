@@ -337,6 +337,36 @@ fn policy_counted_entry(counter: &Arc<crate::policy::PolicyRuleCounter>) -> Flow
     entry
 }
 
+/// #6304: `cached_entry` carrying BOUND filter `then count` handles on both
+/// replay paths — the #2573 TX/output side and the #3777 interface-INPUT side.
+///
+/// The stock fixture leaves `tx_selection: CachedTxSelectionDescriptor::default()`
+/// and `input_filter_counters: CachedFilterCounters::default()`, i.e. two EMPTY
+/// counter lists. Both replays are `for_each` walks over those lists, so their
+/// bodies never execute and severing either is invisible to the whole crate —
+/// measured, and the reason
+/// `live_flow_cache_callsite_replays_every_filter_count_term_6304` exists.
+///
+/// `tx` is a SLICE, not one handle, because #2573's guarantee is specifically
+/// that ALL matched `then count` terms are replayed rather than only the last: a
+/// #2544 fall-through flow matches several count terms, and a replay that walked
+/// only the final one would satisfy a single-counter assertion.
+fn filter_counted_entry(
+    tx: &[Arc<crate::filter::FilterTermCounter>],
+    input: &Arc<crate::filter::FilterTermCounter>,
+) -> FlowCacheEntry {
+    let mut entry = cached_entry();
+    for counter in tx {
+        entry
+            .descriptor
+            .tx_selection
+            .filter_counters
+            .push(counter.clone());
+    }
+    entry.descriptor.input_filter_counters.push(input.clone());
+    entry
+}
+
 fn tx_pipeline() -> WorkerTxPipeline {
     WorkerTxPipeline {
         free_tx_frames: (0..8u64).collect(),
@@ -1707,5 +1737,79 @@ fn live_flow_cache_callsite_accounts_per_zone_traffic_6304() {
         (egress.ingress_packets, egress.ingress_bytes),
         (0, 0),
         "#6304/#3651: ...and nothing on that zone's INGRESS side"
+    );
+}
+
+/// #6304 (#2573 + #3777 filter `then count` replay). BOTH `record_filter_counter`
+/// call sites at `flow_cache_hit.rs` sever with the whole crate GREEN — measured,
+/// 4263 passed / 0 failed with the TX-side walk reduced to `.for_each(|_| {})` —
+/// because no fixture in this module has ever put a counter in either list to
+/// walk. This closes both.
+///
+/// Fourth and fifth instances of the class in this function, and a THIRD shape of
+/// it. `record_policy_hit_counter` was unreachable behind a `None` guard;
+/// `record_zone_traffic` ran and landed in a no-op arm; these two run and iterate
+/// an EMPTY collection, so the closure that holds the call never executes at all.
+/// A coverage report marks the `for_each` line as covered in every case.
+///
+/// What it costs when it regresses: `show firewall counter` reports only each
+/// flow's seed packet. The flow cache serves most packets of a long-lived flow,
+/// which is exactly what #2573 (output/TX side) and #3777 (interface input side)
+/// were filed to fix — and #3777 was itself filed because the TX side had been
+/// fixed and the input side had not, so the two sides are demonstrably able to
+/// regress independently. That is why both are asserted here rather than one
+/// standing in for the other.
+///
+/// TWO tx-side counters, not one: #2573's guarantee is that ALL matched count
+/// terms replay, not just the last, so a single-counter assertion would be
+/// satisfied by a walk that stopped after one. The BYTE cell is load-bearing
+/// separately from the packet cell — the call site passes `meta.pkt_len`, and a
+/// stripped or zero length would still advance the packet count.
+#[test]
+fn live_flow_cache_callsite_replays_every_filter_count_term_6304() {
+    let tx_first = Arc::new(crate::filter::FilterTermCounter::default());
+    let tx_second = Arc::new(crate::filter::FilterTermCounter::default());
+    let input = Arc::new(crate::filter::FilterTermCounter::default());
+
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    let run = run_stage_with_entry(
+        &fixture,
+        &frame,
+        test_meta(&frame),
+        filter_counted_entry(&[tx_first.clone(), tx_second.clone()], &input),
+        0,
+    );
+
+    // --- POSITIVE CONTROL: the packet really was forwarded, so a zero below
+    // means the counter was not charged rather than that the fixture fell out of
+    // the fast path before reaching the replay.
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED"
+    );
+
+    // --- THE DISCRIMINATORS.
+    for (label, counter) in [("first", &tx_first), ("second", &tx_second)] {
+        assert_eq!(
+            (
+                counter.packets.load(Ordering::Relaxed),
+                counter.bytes.load(Ordering::Relaxed)
+            ),
+            (1, frame.len() as u64),
+            "#6304/#2573: the {label} matched output-filter `then count` term must \
+             be replayed on a flow-cache hit, at the full wire length. Replaying \
+             only the last term is the #2544 fall-through under-count #2573 fixed"
+        );
+    }
+    assert_eq!(
+        (
+            input.packets.load(Ordering::Relaxed),
+            input.bytes.load(Ordering::Relaxed)
+        ),
+        (1, frame.len() as u64),
+        "#6304/#3777: ...and the interface INPUT filter's `then count` handle too. \
+         The input side regressed independently of the output side once already, \
+         which is why #3777 exists as a separate issue"
     );
 }

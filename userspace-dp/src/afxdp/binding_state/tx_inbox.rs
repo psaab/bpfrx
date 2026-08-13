@@ -45,11 +45,19 @@ thread_local! {
     ///
     /// Why a thread-local and NOT a `#[cfg(test)]` field on `BindingLiveState`.
     /// `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
-    /// exists to fix; a test-only field would move every field after it and put a
-    /// different layout under test than the one that ships. A thread-local lives in
-    /// its own storage, so `BindingLiveState` is byte-identical with and without
-    /// this instrument. And `#[cfg(test)]` is false for any non-test build, so the
-    /// bump below does not exist in the shipped hot path.
+    /// exists to fix, so an instrument that moved anything in it would put a layout
+    /// under test that production never has. A thread-local lives in its own
+    /// storage; `#[cfg(test)]` is false for any non-test build, so the bump below
+    /// does not exist in the shipped hot path either.
+    ///
+    /// Both halves of that are MEASURED, next to the struct in
+    /// `binding_state/mod.rs`, where four `const _: [(); N]` asserts pin size,
+    /// align and two field offsets in BOTH build configurations. With this
+    /// thread-local, all four are identical to the production build. A
+    /// `#[cfg(test)]` FIELD is not — and not in the way the objection originally
+    /// assumed: it leaves the SIZE unchanged (it lands in existing tail slack) and
+    /// moves OFFSETS, `pending_tx_admitted`'s own included. See that comment for
+    /// the numbers.
     ///
     /// Thread-local and not a process-global atomic, for the #6294 reason: the
     /// default `cargo test` runs in parallel and every sibling test that enqueues a

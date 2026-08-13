@@ -227,16 +227,38 @@ The counter is a `#[cfg(test)]` THREAD-LOCAL, not a `#[cfg(test)]` field on
 `BindingLiveState`. That distinction is the whole reason the instrument is
 takeable, and an earlier revision of this note missed it: it evaluated only the
 field form, correctly rejected it — `BindingLiveState` is the very struct whose
-cross-core cacheline behaviour #6114 exists to fix, so a test-only field puts a
-different layout under test than the one that ships — and then generalised that
+cross-core cacheline behaviour #6114 exists to fix — and then generalised that
 rejection to the instrument as a whole. A thread-local lives in its own storage,
-so `BindingLiveState` is byte-identical with and without it, and `#[cfg(test)]`
-is false for any non-test build so the bump does not exist in the shipped hot
-path. Thread-local rather than a process-global atomic for the #6294 reason: the
-default `cargo test` runs in parallel and every sibling test that enqueues a
-redirect bumps the same counter, so a global would be a load-sensitive flake.
-The pattern already exists in the tree — `OUTER_ROUTE_RESOLVE_COUNT` in
-`afxdp/frame/wg.rs`.
+and `#[cfg(test)]` is false for any non-test build, so the bump does not exist in
+the shipped hot path. Thread-local rather than a process-global atomic for the
+#6294 reason: the default `cargo test` runs in parallel and every sibling test
+that enqueues a redirect bumps the same counter, so a global would be a
+load-sensitive flake. The pattern already exists in the tree —
+`OUTER_ROUTE_RESOLVE_COUNT` in `afxdp/frame/wg.rs`.
+
+Layout neutrality is MEASURED, not asserted — "a thread-local lives in its own
+storage" is a claim about the compiler, and the struct it is a claim about is the
+one #6114 is entirely concerned with. `BindingLiveState`, rustc 1.96.0, x86_64:
+
+| instrument | size | align | off(`pending_tx_admitted`) | off(`delta_loss_pending`) |
+|---|---|---|---|---|
+| none — production build | 2304 | 64 | 2152 | 2280 |
+| `cfg(test)` THREAD-LOCAL (the one taken) | 2304 | 64 | 2152 | 2280 |
+| `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | not measured |
+| `cfg(test)` FIELD declared last | 2304 | 64 | 2152 | **2288** |
+
+Two things follow, and the second corrects the earlier note rather than restating
+it. (1) The thread-local moves nothing, and four `const _: [(); N]` asserts
+beside the struct hold it to that: they are deliberately NOT `cfg`-gated, so the
+same literals are evaluated in the production build AND the test build, and an
+instrument that perturbed the struct could satisfy at most one of the two. That
+is the cross-configuration comparison a `#[test]` cannot make on its own, since
+it only ever observes the test configuration. (2) The reason to decline a
+`cfg(test)` FIELD is NOT that it changes the struct's size — measured, it does
+not; it lands in existing tail slack. It moves OFFSETS, the #6114 counter's own
+among them, so a size-only guard would have called both field shapes harmless.
+`repr(Rust)` reorders, so even a field declared LAST moves a neighbour — which is
+why the sentinel offset is pinned as well as the counter's.
 
 Measured, at the head that added it: reverting `sample_then_admit_mirror_clone`
 itself to reserve-first (reserve, then drop the reservation when the sampler
