@@ -78040,3 +78040,43 @@ Every RED above is an assertion failure, not a build break.
   pkg/dataplane/README.md, pkg/dataplane/stalepin_remediation_5363_test.go,
   pkg/dataplane/cleanup_reachability_6928_test.go,
   docs/operations/userspace-shim-pin-recovery.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 claim pass, item 4 of 4 ("VLAN 0 = untagged"). The other
+  three are NOT done — see the stopping note below.
+  Verified before rewriting, and all three cites in the brief were wrong:
+  `types.go:169` is the REST-clear-rejection note, not a VLAN claim;
+  `userspace-dp/src/inspect.rs` does not exist (the file is
+  `userspace-dp/src/afxdp/frame/inspect.rs`); and the claim occurs at SIX
+  sites, not three.
+  The claim IS false. `IngressVlanID` / `ingress_vlan_id` stores a BARE VID, so
+  0 covers both an untagged frame and an 802.1p priority-tagged one (a real
+  802.1Q tag with VID 0 and PCP/DEI set). The in-repo counterexample is
+  `userspace-dp/src/afxdp/README.md:603-607`, which documents that the TX side
+  deliberately emits a tag on PRESENCE via `TxVlanTag` (#2149) precisely so a
+  priority-tagged VLAN-0 frame does not collapse to untagged — so the case is
+  real and handled elsewhere in the same crate, and only the session row
+  cannot distinguish it. A consumer reading "0 = untagged" would conclude such
+  a session arrived untagged, which is wrong.
+  Corrected at all six: `pkg/dataplane/types.go` (x2, v4 + v6),
+  `pkg/dataplane/bpf_session_value.go` (x2), `bpf/headers/xpf_conntrack.h`,
+  and `userspace-dp/src/afxdp/bpf_map/mod.rs` (x2). Each now says 0 means the
+  VID was zero — untagged OR priority-tagged — and that the row does not
+  distinguish them, naming the TX-side contrast. Residual sweep for
+  "0 = untagged" across those trees returns nothing.
+  Doc comments only; no behaviour change. The Rust edit sits directly above
+  the compile-time `offset_of!` ABI assertions, so `cargo check --all-targets`
+  was run rather than assumed: rc=0, zero errors.
+  **Stopping note.** Items 1-3 (session/README.md:1011 vs :1021;
+  `types.go:150` "locally-owned rows are exact"; the three "pre-#4983 helper"
+  sites) are NOT started. Having found every cite in this item wrong, each
+  remaining item needs a full independent derivation rather than a
+  verification of a supplied trace — roughly double the estimated work. Three
+  more at this depth is where the risk of writing a confident wrong sentence
+  becomes real, in a PR whose entire subject is wrong sentences. Left for a
+  fresh pass with the corrected expectation that the cites need re-deriving.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/` rc=0;
+  `cargo check --all-targets` rc=0; `gofmt -l` clean on both touched Go files.
+  Advances #4983.
+- **File(s)**: pkg/dataplane/types.go, pkg/dataplane/bpf_session_value.go,
+  bpf/headers/xpf_conntrack.h, userspace-dp/src/afxdp/bpf_map/mod.rs, _Log.md

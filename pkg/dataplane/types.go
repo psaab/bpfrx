@@ -172,7 +172,9 @@ type SessionValue struct {
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
-	// packet carried (0 = untagged). It is meaningful ONLY alongside a
+	// packet carried. 0 means the first packet's VID was zero, which is BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q tag with VID 0 and PCP/DEI set). The row stores a bare VID, so it does not distinguish them; the TX side does, via TxVlanTag on tag PRESENCE (#2149, userspace-dp/src/afxdp/README.md). Do not read 0 as "arrived untagged" (#6928).
+	//
+	// It is meaningful ONLY alongside a
 	// non-zero IngressIfindex: the pair {IngressIfindex, IngressVlanID} is
 	// exactly the sessionIfaceKey the CLI already resolves the EGRESS
 	// interface name by (buildSessionEgressIfaces keys on the PARENT netdev
@@ -425,7 +427,9 @@ type SessionValueV6 struct {
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
-	// packet carried (0 = untagged). It is meaningful ONLY alongside a
+	// packet carried. 0 means the first packet's VID was zero, which is BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q tag with VID 0 and PCP/DEI set). The row stores a bare VID, so it does not distinguish them; the TX side does, via TxVlanTag on tag PRESENCE (#2149, userspace-dp/src/afxdp/README.md). Do not read 0 as "arrived untagged" (#6928).
+	//
+	// It is meaningful ONLY alongside a
 	// non-zero IngressIfindex: the pair {IngressIfindex, IngressVlanID} is
 	// exactly the sessionIfaceKey the CLI already resolves the EGRESS
 	// interface name by (buildSessionEgressIfaces keys on the PARENT netdev

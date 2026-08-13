@@ -126,8 +126,8 @@ type bpfSessionValue struct {
 	// SessionValue. 0 = no ingress identity carried; see
 	// SessionValue.IngressIfindex for the full contract.
 	IngressIfindex uint32
-	// IngressVlanID is the #4983 ingress 802.1Q VLAN id (0 = untagged). It
-	// lands inside the tail padding IngressIfindex already forced, so the
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id. 0 means the first packet's VID was zero, which is BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q tag with VID 0 and PCP/DEI set). The row stores a bare VID, so it does not distinguish them; the TX side does, via TxVlanTag on tag PRESENCE (#2149, userspace-dp/src/afxdp/README.md). Do not read 0 as "arrived untagged" (#6928).
+	// It lands inside the tail padding IngressIfindex already forced, so the
 	// pair costs 8 bytes total, not 16.
 	IngressVlanID uint16
 	_             [2]byte // pad: C tail-pads the struct to its 8-byte alignment (#6082)
@@ -190,8 +190,8 @@ type bpfSessionValueV6 struct {
 	// SessionValue. 0 = no ingress identity carried; see
 	// SessionValue.IngressIfindex for the full contract.
 	IngressIfindex uint32
-	// IngressVlanID is the #4983 ingress 802.1Q VLAN id (0 = untagged). It
-	// lands inside the tail padding IngressIfindex already forced, so the
+	// IngressVlanID is the #4983 ingress 802.1Q VLAN id. 0 means the first packet's VID was zero, which is BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q tag with VID 0 and PCP/DEI set). The row stores a bare VID, so it does not distinguish them; the TX side does, via TxVlanTag on tag PRESENCE (#2149, userspace-dp/src/afxdp/README.md). Do not read 0 as "arrived untagged" (#6928).
+	// It lands inside the tail padding IngressIfindex already forced, so the
 	// pair costs 8 bytes total, not 16.
 	IngressVlanID uint16
 	_             [2]byte // pad: C tail-pads the struct to its 8-byte alignment (#6082)

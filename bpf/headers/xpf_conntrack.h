@@ -163,8 +163,9 @@ struct session_value_v6 {
 	 * for the full contract (0 = no identity carried, fall back to the
 	 * zone approximation). */
 	__u32 ingress_ifindex;
-	/* #4983: ingress 802.1Q VLAN id, 0 = untagged -- see
-	 * session_value.ingress_vlan_id. sizeof grows 184 -> 192. */
+	/* #4983: ingress 802.1Q VLAN id -- see session_value.ingress_vlan_id.
+	 * 0 is BOTH untagged and 802.1p priority-tagged (real tag, VID 0); this
+	 * bare VID does not distinguish them (#6928). sizeof grows 184 -> 192. */
 	__u16 ingress_vlan_id;
 };
 

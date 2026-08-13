@@ -190,8 +190,11 @@ struct BpfSessionValueV4 {
     /// struct 136 -> 144 (v4) / 184 -> 192 (v6) -- `ingress_vlan_id` below
     /// lands inside that same tail pad, so it costs nothing further.
     ingress_ifindex: u32,
-    /// #4983: the 802.1Q VLAN id the session's first packet arrived with (0 =
-    /// untagged). Paired with `ingress_ifindex` it names the LOGICAL ingress
+    /// #4983: the 802.1Q VLAN id the session's first packet arrived with. 0 is
+    /// BOTH untagged and 802.1p priority-tagged (a real tag with VID 0 and
+    /// PCP/DEI set); this bare VID does not distinguish them, though the TX
+    /// side does via `TxVlanTag` on tag PRESENCE (#2149, afxdp/README.md).
+    /// Paired with `ingress_ifindex` it names the LOGICAL ingress
     /// unit using the very same `{parent ifindex, vlan}` identity the Go side
     /// already resolves the EGRESS interface name by, so two VLAN units of one
     /// trunk NIC are distinguishable rather than aliased onto the NIC.
@@ -257,8 +260,11 @@ struct BpfSessionValueV6 {
     /// struct 136 -> 144 (v4) / 184 -> 192 (v6) -- `ingress_vlan_id` below
     /// lands inside that same tail pad, so it costs nothing further.
     ingress_ifindex: u32,
-    /// #4983: the 802.1Q VLAN id the session's first packet arrived with (0 =
-    /// untagged). Paired with `ingress_ifindex` it names the LOGICAL ingress
+    /// #4983: the 802.1Q VLAN id the session's first packet arrived with. 0 is
+    /// BOTH untagged and 802.1p priority-tagged (a real tag with VID 0 and
+    /// PCP/DEI set); this bare VID does not distinguish them, though the TX
+    /// side does via `TxVlanTag` on tag PRESENCE (#2149, afxdp/README.md).
+    /// Paired with `ingress_ifindex` it names the LOGICAL ingress
     /// unit using the very same `{parent ifindex, vlan}` identity the Go side
     /// already resolves the EGRESS interface name by, so two VLAN units of one
     /// trunk NIC are distinguishable rather than aliased onto the NIC.
