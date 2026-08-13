@@ -498,8 +498,10 @@ config does not say which block answers.
 
 **The fold SKIPS a class name that shadows a built-in.** The same
 built-in-first lookup that makes a shadowing definition inert (see *built-in
-shadowing* below) means `MappedPermissions` is never read for such a name, so
-there is nothing for the floor to narrow. Folding it anyway changed no
+shadowing* below) means `MappedPermissions` is never read for such a name — on
+the CLI or on the REST control surface, both of which go through the shared
+`config.ResolveClassPermissions` evaluator (#5561) — so there is nothing for the
+floor to narrow. Folding it anyway changed no
 behaviour and produced two claims that were **false**: the per-class warning
 said the class had been "folded from `{super-user}` to `{configure,view}`"
 while `request system zeroize` stayed allowed and secrets stayed in cleartext,

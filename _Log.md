@@ -71953,7 +71953,7 @@ break — `go vet` confirmed passing under every revert.
   operator-facing claim that was false for a class NAME shadowing a
   system-defined one. `class super-user { permissions all; deny-commands
   "request system zeroize"; }` warned "The class is folded from {super-user} to
-  {configure,view}" while `resolveClassPerms` consulted the built-in table
+  {configure,view}" while the RBAC evaluator consulted the built-in table
   first, so the runtime returned PermAll: zeroize allowed, secrets in
   cleartext. Reproduced firsthand through the real peer-sync ingress on this
   head AND on origin/master (edefb7570) — the SAME probe allows zeroize and
@@ -71962,7 +71962,8 @@ break — `go vet` confirmed passing under every revert.
   name in `LoginClassPermissions`, per NAME, so the whole cohort is skipped
   together. That also repairs a knock-on the fold had introduced — the #4304
   advisory is the second and only other production reader of
-  `MappedPermissions`, and folding a shadowing class had turned its "mapped to
+  `MappedPermissions` (the other being `config.ResolveClassPermissions`), and
+  folding a shadowing class had turned its "mapped to
   {super-user}" (true, the built-in grants everything) into "mapped to
   {configure,view}", which is the precise sentence the #6701 warning beside it
   calls out as untrue. Both claims are now back to what #6701 found. Nothing is
@@ -71986,7 +71987,15 @@ break — `go vet` confirmed passing under every revert.
   claim, the narrowed advisory); removing `sort.Strings(leaves)`, the `seen`
   dedup, or `unionPerms`' dedup each reds the rendered-message comparison; and
   reporting `rejections[len-1]` instead of `rejections[0]` reds the ordering
-  pin with `beta`.
+  pin with `beta`. After merging origin/master (edefb7570) every citation in
+  this round's new comments was re-checked and corrected: #5561 moved the
+  built-in-first lookup out of `pkg/cli resolveClassPerms` into
+  `config.ResolveClassPermissions`, now shared by the CLI adapter and the REST
+  surface's `pkg/authz` gate. Precedence is unchanged, so the fix's premise
+  holds on both surfaces — and it is asserted rather than assumed: the new test
+  fails with "premise changed" if a built-in ever stops answering for a
+  shadowing name. All five revert proofs were re-run on the merge result and
+  each still reds.
   **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-08-01
 - **Action**: #5561 round-5 fold — close the stale-negative locality window that

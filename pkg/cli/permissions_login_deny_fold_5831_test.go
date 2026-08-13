@@ -435,9 +435,11 @@ func TestFoldedClassResolvesThroughCustomTableNotBuiltins(t *testing.T) {
 // TestFoldNeverClaimsAReductionTheBuiltinOverrides is the claim-truth guard for
 // a class NAME that shadows a system-defined one (#6838 review MINOR-1).
 //
-// `resolveClassPerms` consults `config.LoginClassPermissions` FIRST, so for such
-// a name the built-in answers and `MappedPermissions` — the only state the fold
-// can narrow — is never read at runtime. The fold used to run anyway and warn
+// `config.ResolveClassPermissions` — the shared evaluator behind BOTH this
+// `resolveClassPerms` adapter and the REST surface's `pkg/authz` gate (#5561) —
+// consults `config.LoginClassPermissions` FIRST, so for such a name the built-in
+// answers and `MappedPermissions` — the only state the fold can narrow — is
+// never read at runtime. The fold used to run anyway and warn
 // that the class had been "folded from {super-user} to {configure,view}", while
 // `request system zeroize` stayed ALLOWED and secrets stayed in cleartext. That
 // is the B1 defect one spelling further out: an operator-facing claim of a
@@ -453,8 +455,8 @@ func TestFoldedClassResolvesThroughCustomTableNotBuiltins(t *testing.T) {
 // gate whose entire product is an operator-facing claim.
 //
 // The knock-on is asserted too. `MappedPermissions` has exactly two production
-// readers; the second is the #4304 commit advisory, which reports the EFFECTIVE
-// set. Folding a shadowing class turned its advisory from "{super-user}" (true —
+// readers — that evaluator and the #4304 commit advisory, which reports the
+// EFFECTIVE set — so the advisory is the only one a shadowing name reaches. Folding a shadowing class turned its advisory from "{super-user}" (true —
 // the built-in does grant everything) into "{configure,view}", i.e. made the
 // advisory say precisely what #6701 warns it falsely says.
 //

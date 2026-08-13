@@ -252,9 +252,11 @@ func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 	warnings := make([]string, 0, len(rejections))
 	for _, r := range rejections {
 		// A class NAME shadowing a system-defined one is INERT, so there is
-		// nothing here to fold (#6838 review). pkg/cli resolveClassPerms
-		// consults config.LoginClassPermissions FIRST, so the built-in answers
-		// for such a name and MappedPermissions — the only state
+		// nothing here to fold (#6838 review). ResolveClassPermissions
+		// (login_perms.go — the shared evaluator behind BOTH pkg/cli
+		// resolveClassPerms and the REST surface's pkg/authz gate since #5561)
+		// consults LoginClassPermissions FIRST, so the built-in answers for
+		// such a name and MappedPermissions — the only state
 		// repairableFloorFold can narrow — is never read at runtime. Folding
 		// it anyway changes no behaviour and emits a warning asserting a
 		// reduction that did not happen: measured on the tolerant path,
@@ -266,9 +268,10 @@ func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 		// runtime never applied.
 		//
 		// The knock-on matters as much as the warning. lc.MappedPermissions
-		// has exactly two production readers, and the other one is the #4304
-		// commit advisory (compiler_system.go loginClassAdvisoryWarnings),
-		// which reports the EFFECTIVE set. Folding a shadowing class turned
+		// has exactly two production readers — ResolveClassPermissions above,
+		// and the #4304 commit advisory (compiler_system.go
+		// loginClassAdvisoryWarnings), which reports the EFFECTIVE set — so
+		// the advisory is the only one a shadowing name can reach. Folding
 		// its advisory from "mapped to {super-user}" — true, the built-in does
 		// grant everything — into "mapped to {configure,view}", which is the
 		// precise sentence the #6701 warning beside it calls out as false
