@@ -4629,6 +4629,12 @@ fn apply_worker_commands_recovers_poisoned_queue_and_processes_commands() {
 
 #[test]
 fn replicate_session_upsert_delivers_to_poisoned_queue() {
+    // #4800: this test MOVES the process-global replication counters that
+    // newflow_contention_tests asserts on. It no longer takes a guard by hand
+    // — `replicate_session_upsert` takes the mover side itself under
+    // `#[cfg(test)]`, so the mover set is derived rather than inventoried
+    // (see `afxdp::counter_test_lock`). The hand-written inventory this
+    // replaces had already missed two other real movers.
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();
@@ -4652,6 +4658,10 @@ fn replicate_session_upsert_delivers_to_poisoned_queue() {
 
 #[test]
 fn replicate_session_delete_delivers_to_poisoned_queue() {
+    // #4800: `replicate_session_delete` moves NO counter (it pushes through
+    // the uncounted `lock_recover`), so this test is not a mover at all and
+    // needs no guard. The counted sibling above takes its guard inside
+    // `replicate_session_upsert` itself.
     let queues: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = (0..2)
         .map(|_| Arc::new(Mutex::new(VecDeque::new())))
         .collect();

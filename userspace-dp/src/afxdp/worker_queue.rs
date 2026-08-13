@@ -57,6 +57,27 @@ pub(in crate::afxdp) fn lock_recover(
     }
 }
 
+/// #4800: [`lock_recover`] that reports whether it had to block, for the
+/// N-way session-replication fan-out.
+///
+/// `try_lock` first (one CAS on an uncontended mutex — what `lock()` cost
+/// anyway); on WouldBlock bump `contended` and fall through to the blocking
+/// [`lock_recover`], which carries the poison policy. Kept as an explicit
+/// opt-in rather than folded into `lock_recover` because that helper is
+/// shared by the tunnel, TX-drain, HA and cross-binding CoS enqueues —
+/// counting all of them would blur the very attribution this exists for.
+#[inline]
+pub(in crate::afxdp) fn lock_recover_counting<'a>(
+    m: &'a Mutex<VecDeque<WorkerCommand>>,
+    contended: &AtomicU64,
+) -> MutexGuard<'a, VecDeque<WorkerCommand>> {
+    if let Some(guard) = try_lock_recover(m) {
+        return guard;
+    }
+    contended.fetch_add(1, Ordering::Relaxed);
+    lock_recover(m)
+}
+
 /// `try_lock` variant of [`lock_recover`]: WouldBlock → `None`
 /// (unchanged skip semantics — another thread holds the lock and will
 /// release it shortly); Poisoned → recover + clear + `Some(guard)`,

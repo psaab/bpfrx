@@ -136,6 +136,12 @@ pub(crate) struct WorkerRuntimeCounters {
     /// `SessionTable::install_partial`. Expected 0 forever; nonzero
     /// means the preflight/install pairing has a bug.
     pub session_install_partial: u64,
+    /// #4800: cumulative locally-learned transit forward-flow installs
+    /// summed across this worker's bindings — the per-worker share of the
+    /// SNAT-allocate / publish / replicate new-flow path. Skew across
+    /// workers is how a connection-rate run distinguishes a single-core
+    /// bound from a genuine cross-worker lock bound.
+    pub new_flow_installs: u64,
 }
 
 /// 60 s rolling window. Sized to comfortably cover typical Prometheus
@@ -210,6 +216,9 @@ pub(crate) struct WorkerRuntimeAtomics {
     pub session_create_drops: AtomicU64,
     pub session_install_admission_refused: AtomicU64,
     pub session_install_partial: AtomicU64,
+    /// #4800: per-worker transit new-flow installs (same Relaxed
+    /// cumulative pattern as the trio above).
+    pub new_flow_installs: AtomicU64,
     /// Snapshot of the corresponding cumulative counter at the start of
     /// the current rolling window, plus the monotonic timestamp the
     /// snapshot was taken at. `publish()` rotates these whenever the
@@ -278,6 +287,7 @@ impl WorkerRuntimeAtomics {
             session_create_drops: AtomicU64::new(0),
             session_install_admission_refused: AtomicU64::new(0),
             session_install_partial: AtomicU64::new(0),
+            new_flow_installs: AtomicU64::new(0),
             wall_ns_window_base: AtomicU64::new(0),
             active_ns_window_base: AtomicU64::new(0),
             thread_cpu_ns_window_base: AtomicU64::new(0),
@@ -344,6 +354,9 @@ impl WorkerRuntimeAtomics {
             .store(c.session_install_admission_refused, Ordering::Relaxed);
         self.session_install_partial
             .store(c.session_install_partial, Ordering::Relaxed);
+        // #4800: per-worker transit new-flow installs.
+        self.new_flow_installs
+            .store(c.new_flow_installs, Ordering::Relaxed);
 
         let base_at = self.window_base_at_ns.load(Ordering::Relaxed);
         if base_at == 0 {
@@ -446,6 +459,7 @@ impl WorkerRuntimeAtomics {
                 .session_install_admission_refused
                 .load(Ordering::Relaxed),
             session_install_partial: self.session_install_partial.load(Ordering::Relaxed),
+            new_flow_installs: self.new_flow_installs.load(Ordering::Relaxed),
         }
     }
 

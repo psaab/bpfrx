@@ -44,7 +44,8 @@ func NewManagerWithLinkOpsForTest(ops linkOps) *Manager {
 // in-memory fake (no root, no netlink handle, no host side effects).
 //
 // Only the three rule domains are wired; every other domain is left nil (these
-// tests exercise the rule reconcile only). nlHandle stays nil (Close nil-guards it).
+// tests exercise the rule reconcile only). nlHandle and tunnel stay nil (Close
+// nil-guards both, #5718 A7-b02-C01), so `defer m.Close()` is safe here.
 //
 // Callers pass any value whose method set matches ruleOps (RuleAdd / RuleDel /
 // RuleList — all exported, so a fake defined in another package satisfies it
@@ -66,7 +67,8 @@ func NewManagerWithRuleOpsForTest(ops ruleOps) *Manager {
 // without root, a real netlink handle, or host side effects.
 //
 // Only the routes domain is wired; every other domain is left nil (these
-// tests exercise reads only). nlHandle stays nil (Close nil-guards it).
+// tests exercise reads only). nlHandle and tunnel stay nil (Close nil-guards
+// both, #5718 A7-b02-C01), so `defer m.Close()` is safe here.
 //
 // Callers pass any value whose method set matches routeLister (the interface's
 // methods are all exported, so a fake defined in another package satisfies it

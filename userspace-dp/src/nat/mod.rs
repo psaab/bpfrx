@@ -53,6 +53,10 @@ mod tests_scope;
 #[cfg(test)]
 #[path = "tests_l4_match.rs"]
 mod tests_l4_match;
+// #4800: SNAT pool allocator `live` map-mutex contention accounting.
+#[cfg(test)]
+#[path = "tests_newflow_lock.rs"]
+mod tests_newflow_lock;
 
 /// #3096: per-flow interface / routing-instance identity passed into the NAT
 /// match path so an interface- or routing-instance-scoped rule-set matches
