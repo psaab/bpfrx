@@ -195,7 +195,7 @@ func TestSourceNATPoolUnreferencedScopedNotRejected(t *testing.T) {
 // composes with the #5876 peer-effective SNAT gate: a `%zone`-scoped pool
 // address that appears ONLY on the peer node's `${node}` effective view (node0's
 // own view is clean) must be rejected at the origin (node0) commit via
-// ValidatePeerEffectiveSourceNATStrict — otherwise the standby lenient-loads the
+// ValidatePeerEffectiveStrict — otherwise the standby lenient-loads the
 // config-synced snapshot and its dataplane fails the pool closed while node0
 // committed green. FAIL-ON-REVERT: dropping the scope validator from
 // validateSourceNATStrictView leaves node0 accepting the peer-only scoped
@@ -216,7 +216,7 @@ func TestPeerOnlyZoneScopedSNATPoolRejected_5875(t *testing.T) {
 	}
 	// The peer-effective gate run at a node0 commit must reject the node1-only
 	// scoped address.
-	err := ValidatePeerEffectiveSourceNATStrict(tree, 0)
+	err := ValidatePeerEffectiveStrict(tree, 0)
 	if err == nil {
 		t.Fatal("node0 commit ACCEPTED a peer-only zone-scoped source-NAT pool address (node1 view) — peer-effective fail-open")
 	}

@@ -114,6 +114,19 @@ func (c *xpfCollector) initWorkerDescriptors() {
 			"One increment per refused flow, not per missing slot.",
 		[]string{"worker_id"}, nil,
 	)
+	c.workerNewFlowInstalls = prometheus.NewDesc(
+		"xpf_userspace_worker_new_flow_installs_total",
+		"Cumulative locally-learned transit forward flows installed on "+
+			"this userspace worker — its share of the SNAT-allocate / "+
+			"shared-session-publish / sibling-replication new-flow path. "+
+			"rate() gives the worker's new-flows/sec; the SPREAD across "+
+			"workers separates a genuine cross-worker lock bound from one "+
+			"saturated RX queue, which a single aggregate rate cannot. "+
+			"Excludes reverse companions, peer-synced imports, promotes "+
+			"and local-delivery caches so it stays comparable to the "+
+			"offered connection rate (#4800).",
+		[]string{"worker_id"}, nil,
+	)
 	c.workerSessionInstallPartial = prometheus.NewDesc(
 		"xpf_userspace_worker_session_install_partial_total",
 		"Post-preflight partial session installs on this userspace "+
