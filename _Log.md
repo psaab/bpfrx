@@ -69226,3 +69226,95 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/grpcapi/zone_flood_counters_hide_test.go, pkg/api/README.md,
   docs/userspace-dataplane-gaps.md, docs/research/3643-dead-counters/plan.md,
   _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6938 (#3651) — bind the two flood-counter PRODUCTION call sites.
+  The helpers were never the problem; their callers were.
+
+  **The finding, re-verified at the head before any change.** Head `1bb479ae6`
+  had not moved since the parent proof. Three cells, snapshot-restore between
+  each, tree verified clean after:
+
+      baseline                                       ok 4256 passed / 0 failed
+      DELETE worker-loop fold (loop_body:1095)       ok 4256 passed / 0 failed
+      publication -> Vec::new() (helpers/status:320) ok 4256 passed / 0 failed
+
+  Byte-identical counts. Both production call sites were invisible.
+
+  **Why, and it inverts the usual intuition.**
+  `flush_recorded_flood_counters` has THIRTEEN call sites in tests — eleven in
+  flood_counters.rs, plus tests_slow_path_disposition.rs:988,
+  forwarding_build/tests.rs:5671 and coordinator/tests.rs:4797/:4840 — and every
+  one calls the helper DIRECTLY. One production call site. Thirteen tests reads
+  as thorough coverage, and it is, OF THE HELPER; but a helper with many direct
+  test call sites is MORE likely to have an unbound caller, because each of
+  those tests satisfies itself without ever exercising the production path. The
+  count disguises the gap instead of closing it. Same shape one level up for
+  publication: `Coordinator::zone_flood_counters()` is exercised directly while
+  `refresh_status`'s USE of it was observed by nothing.
+
+  **What binds them now.** Two behavioural tests drive the REAL control-socket
+  dispatcher (`handle_stream` via `run_request`) — the path the daemon's accept
+  loop takes — so the assertion rides `refresh_status`'s own use of the
+  coordinator rather than calling the coordinator itself. `ping` is the driver:
+  the dispatcher's post-match block runs `refresh_status` for every non-export
+  verb and attaches the result, so no status-specific verb is needed. The first
+  asserts on the WIRE payload the reply carries, not only in-memory state.
+
+  NO EXTRACTION. Pulling the loop body into a testable helper would have
+  relocated the unbound edge upward and arrived wearing a new passing test;
+  nothing was extracted, and the seam that was opened
+  (`Coordinator::seed_flood_counter_for_test`, `#[cfg(test)]`) is SEEDING, not
+  the path under test — it puts the coordinator in the state a worker leaves
+  behind so the assertion can ride the real caller.
+
+  **The worker-loop fold is pinned STRUCTURALLY, and that limit is stated
+  rather than papered over.** `worker_loop` takes five heavyweight parameters
+  and is spawned only from `coordinator/reconcile/bringup.rs` against real
+  AF_XDP sockets, so no test can drive it; I found no real seam above it. A
+  source pin is the honest instrument for a claim that is itself syntactic. It
+  additionally asserts adjacency to `flush_recorded_zone_counters`, because the
+  comment's load-bearing claim is that the two share a cadence and one
+  `forwarding` snapshot — separated, the two counter families would fold
+  against different slot maps.
+
+  **Sibling parity, observed and NOT fixed here.** The traffic-counter fold on
+  the line above has the identical shape: all its non-production call sites are
+  direct unit tests in zone_counters.rs, and its production call site is equally
+  unbound. That is pre-existing on master and outside this PR's diff, so it is
+  reported rather than folded in.
+- **File(s)**: userspace-dp/src/server/tests.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs, _Log.md
+- **Validation**: four cells, exclusive partition, every RED an assertion.
+
+    | cell | fold binder | publication | clear | over-reach control |
+    |---|---|---|---|---|
+    | baseline | PASS | PASS | PASS | PASS |
+    | sever the worker-loop fold | **FAIL** | PASS | PASS | PASS |
+    | sever the publication | PASS | **FAIL** | **FAIL** | PASS |
+
+  Each cell reds exactly the guards for its own site and nothing else. The
+  over-reach control holds GREEN in both severing cells, which is what makes it
+  a control rather than a second copy of a binder: it lives in its own test
+  body (a control sharing a body with its binder never runs once the binder
+  fails) and runs the binder's matching logic against a synthetic body
+  containing ONLY the sibling zone-counter fold, requiring no match. That
+  catches the plausible widening — loosening the needle to `flush_recorded_`
+  would match the sibling four lines above and keep the binder green with the
+  flood fold deleted. It also asserts the needle DOES match a body that
+  contains it, so the control cannot pass by matching nothing ever.
+
+  Both behavioural tests carry preconditions: the publication test asserts the
+  wire status starts EMPTY (so a pass cannot be explained by a pre-populated
+  fixture), and the clear test asserts the row IS published before the clear
+  (so its absence afterwards cannot be explained by it never having been there).
+
+  A fixture correction worth recording: the first draft drove `req("get_status")`,
+  which is not a request type — the dispatcher answered
+  `unknown request type get_status` and both tests failed. That failure looked
+  exactly like the finding it was meant to demonstrate. Re-run against `ping`,
+  a real verb that reaches the same post-match `refresh_status`, they pass and
+  red correctly. A test that fails for a reason other than its subject is not
+  evidence.
+
+  Gates: `cargo test --release` 6938 filter — 4 passed / 0 failed.

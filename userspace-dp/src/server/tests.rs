@@ -3344,3 +3344,222 @@ fn drain_session_deltas_survive_write_state_failure_5294() {
          — the pre-#5294 pop-then-fallible-write order dropped the whole batch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #3651 / #6938: the flood-counter PRODUCTION call sites, not the helpers.
+//
+// The helpers were already exhaustively covered — `flush_recorded_flood_counters`
+// has 13 call sites across flood_counters.rs, tests_slow_path_disposition.rs,
+// forwarding_build/tests.rs and coordinator/tests.rs, and every one of them
+// calls it DIRECTLY. What nothing observed was production calling it. Measured
+// on this head: deleting the worker-loop fold at
+// afxdp/worker/loop_body/mod.rs:1095, or replacing the publication at
+// server/helpers/status.rs:320 with an empty vec, each left the whole
+// userspace-dp suite at 4256 passed / 0 failed — byte-identical to baseline.
+//
+// The tests below close the publication and clear links by driving the REAL
+// control-socket dispatcher (`handle_stream` via `run_request`), which is what
+// the daemon's accept loop calls, so the assertion rides `refresh_status`'s own
+// use of the coordinator rather than calling the coordinator itself.
+//
+// The worker-loop fold is not reachable this way — `worker_loop` takes five
+// heavyweight parameters and is spawned only from coordinator bringup with real
+// AF_XDP sockets — so it is pinned structurally in
+// `flood_fold_is_wired_into_the_worker_loop_6938` below, and that limitation is
+// stated rather than papered over.
+
+/// Seed a coordinator so one zone holds a recorded flood event, exactly as a
+/// worker would leave it after `record_zone_flood_drop` + a flush.
+fn seed_flood_counter(coord: &mut afxdp::Coordinator, zone: u16, name: &str) {
+    coord.seed_flood_counter_for_test(zone, name);
+}
+
+/// The status REFRESH must publish the coordinator's flood rows onto the wire
+/// status. Binds server/helpers/status.rs's call, not Coordinator::zone_flood_counters.
+///
+/// RED on revert: replace that line with `Vec::new()` (or delete it) and this
+/// fails — the request still succeeds and every other server test stays green,
+/// which is exactly how the gap survived.
+#[test]
+fn status_refresh_publishes_flood_counters_6938() {
+    const Z: u16 = 50675; // config::StableZoneID("trust")
+
+    let state = new_state(ProcessStatus::default());
+    {
+        let mut guard = state.lock().expect("state");
+        seed_flood_counter(&mut guard.afxdp, Z, "trust");
+        // Precondition: the wire status starts EMPTY, so a pass cannot be
+        // explained by the fixture having pre-populated it.
+        assert!(
+            guard.status.zone_flood_counters.is_empty(),
+            "fixture invalid: status already carried flood rows before any refresh"
+        );
+    }
+
+    // `ping` is the minimal REAL verb: the dispatcher's post-match block runs
+    // refresh_status for every non-export request and attaches the result, so
+    // this rides the production path without needing a status-specific verb.
+    let response = run_request(state.clone(), req("ping"));
+    assert!(response.ok, "ping failed: {}", response.error);
+
+    // Assert on the WIRE payload the daemon actually returns, not only on the
+    // in-memory state: the attach is the half an operator sees.
+    let wire = response.status.expect("dispatcher attached no status to the reply");
+    assert!(
+        wire.zone_flood_counters.iter().any(|r| r.zone_id == Z),
+        "the reply's status carries no flood row for zone {Z}: {:?}",
+        wire.zone_flood_counters
+    );
+
+    let guard = state.lock().expect("state");
+    let rows = &guard.status.zone_flood_counters;
+    assert!(
+        !rows.is_empty(),
+        "refresh_status published NO flood rows although the coordinator holds one \
+         for zone {Z}. The publication line in server/helpers/status.rs is not \
+         reached — deleting it is invisible to every other test because they all \
+         call Coordinator::zone_flood_counters directly (#6938)"
+    );
+    assert!(
+        rows.iter().any(|r| r.zone_id == Z),
+        "flood rows published but zone {Z} is not among them: {rows:?}"
+    );
+}
+
+/// The operator clear must reach the helper's cumulative store, not just the
+/// Go-side offset map. Binds the `clear_flood_counters` handler arm.
+///
+/// RED on revert: delete `guard.afxdp.clear_flood_counters();` from
+/// server/handlers/mod.rs and this fails — the request still returns ok, which
+/// is the whole failure mode (a clear that reports success and snaps back
+/// within one poll).
+#[test]
+fn clear_flood_counters_request_empties_the_store_6938() {
+    const Z: u16 = 50675;
+
+    let state = new_state(ProcessStatus::default());
+    {
+        let mut guard = state.lock().expect("state");
+        seed_flood_counter(&mut guard.afxdp, Z, "trust");
+    }
+
+    // Control: the row is published BEFORE the clear, so a post-clear absence
+    // cannot be explained by it never having been there.
+    let before = run_request(state.clone(), req("ping"));
+    assert!(before.ok, "ping failed: {}", before.error);
+    assert!(
+        state
+            .lock()
+            .expect("state")
+            .status
+            .zone_flood_counters
+            .iter()
+            .any(|r| r.zone_id == Z),
+        "control failed: zone {Z} was not published before the clear, so the \
+         assertion after it would prove nothing"
+    );
+
+    let cleared = run_request(state.clone(), req("clear_flood_counters"));
+    assert!(cleared.ok, "clear_flood_counters failed: {}", cleared.error);
+
+    let guard = state.lock().expect("state");
+    assert!(
+        !guard.status.zone_flood_counters.iter().any(|r| r.zone_id == Z),
+        "zone {Z} still publishes a flood row after `clear_flood_counters`. The \
+         handler's clear_flood_counters() call does not reach the helper's \
+         cumulative store, so the operator's clear is undone by the next 1 s \
+         status poll (#6938)"
+    );
+}
+
+/// The per-RX-batch fold is on the worker loop's own path.
+///
+/// STRUCTURAL, and deliberately so: `worker_loop` takes five heavyweight
+/// parameters (`WorkerLaunchPlan`, `WorkerSharedDataplane`, ...) and is spawned
+/// only from `coordinator/reconcile/bringup.rs` against real AF_XDP sockets, so
+/// no test can drive it. A source pin is the honest instrument for a claim that
+/// is itself syntactic — "the loop body calls this" — and it is what the sibling
+/// traffic-counter fold lacks.
+///
+/// It asserts the fold sits alongside `flush_recorded_zone_counters`, because
+/// the comment's load-bearing claim is that the two share a cadence and a
+/// `forwarding` snapshot: separating them would silently fold the two counter
+/// families against different slot maps.
+#[test]
+fn flood_fold_is_wired_into_the_worker_loop_6938() {
+    let src = include_str!("../afxdp/worker/loop_body/mod.rs");
+    let fold = "crate::afxdp::flood_counters::flush_recorded_flood_counters(";
+    let sibling = "crate::afxdp::zone_counters::flush_recorded_zone_counters(";
+
+    let fold_at = src.find(fold).unwrap_or_else(|| {
+        panic!(
+            "the worker loop does not call flush_recorded_flood_counters. Every \
+             recorded flood event stays in the per-worker cache and the shared \
+             store reads zero forever — and no behavioural test sees it, because \
+             all 13 of the helper's other call sites are tests calling it \
+             directly (#6938)"
+        )
+    });
+    let sibling_at = src.find(sibling).unwrap_or_else(|| {
+        panic!("the worker loop no longer calls flush_recorded_zone_counters — this \
+                guard's adjacency claim names a sibling that is gone")
+    });
+    assert!(
+        fold_at > sibling_at && fold_at - sibling_at < 800,
+        "the flood fold is no longer adjacent to the zone-counter fold \
+         (offsets {sibling_at} vs {fold_at}). They must share one cadence and one \
+         `forwarding` snapshot, or the two counter families fold against \
+         different slot maps (#6938)"
+    );
+}
+
+/// OVER-REACH CONTROL for `flood_fold_is_wired_into_the_worker_loop_6938`.
+///
+/// Its own test body deliberately: a control sharing a body with its binder
+/// never runs once the binder fails, so it would be silent in exactly the
+/// situation it exists to describe.
+///
+/// The risk it guards is the guard being WIDENED. The binder searches for the
+/// flood-specific symbol; loosening it to "some flush happened" — matching
+/// `flush_recorded_` and catching the SIBLING zone-counter fold on the line
+/// above — would keep the binder green with the flood fold deleted, which is
+/// the failure the binder exists to catch. The two folds sit four lines apart,
+/// so that widening is a plausible edit, not a contrived one.
+///
+/// This runs the binder's own matching logic against a synthetic body that
+/// contains ONLY the sibling, and requires it to find nothing. It is
+/// independent of the production file, so it stays GREEN when the production
+/// flood line is deleted — which is what makes it a control rather than a
+/// second copy of the binder.
+#[test]
+fn flood_fold_guard_does_not_accept_the_sibling_fold_6938() {
+    const SIBLING_ONLY: &str = r#"
+        crate::afxdp::zone_counters::flush_recorded_zone_counters(
+            &forwarding.zone_counter_store,
+            &forwarding.zone_counter_slot_map,
+        );
+    "#;
+    let fold = "crate::afxdp::flood_counters::flush_recorded_flood_counters(";
+    assert!(
+        SIBLING_ONLY.find(fold).is_none(),
+        "the flood-fold guard matches a body containing ONLY the zone-counter \
+         fold, so it would report the flood fold as wired after that line was \
+         deleted. The guard must name the flood-counter symbol, not any flush \
+         (#6938)"
+    );
+
+    // And the converse, so this control cannot pass by matching nothing ever:
+    // the binder's needle MUST be found in a body that does contain it.
+    const FLOOD_PRESENT: &str = r#"
+        crate::afxdp::flood_counters::flush_recorded_flood_counters(
+            &forwarding.flood_counter_store,
+            &forwarding.flood_counter_slot_map,
+        );
+    "#;
+    assert!(
+        FLOOD_PRESENT.find(fold).is_some(),
+        "the guard's needle does not match even a body that plainly contains the \
+         call — the binder is searching for something unreachable and would pass \
+         nothing, ever"
+    );
+}

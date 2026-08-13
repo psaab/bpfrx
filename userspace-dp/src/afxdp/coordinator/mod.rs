@@ -1180,6 +1180,28 @@ impl Coordinator {
         self.forwarding.flood_counter_store.clear();
     }
 
+    /// TEST SCAFFOLDING (#6938): seed one zone with a recorded flood event,
+    /// exactly as a worker leaves it after `record_zone_flood_drop` + a flush.
+    ///
+    /// It exists because the binding that matters lives OUTSIDE this package:
+    /// `server::helpers::status::refresh_status` publishing these rows, and the
+    /// `clear_flood_counters` handler arm clearing them. Those call sites were
+    /// unbound precisely because every existing test reached past them into
+    /// `crate::afxdp`, which `pkg`-external tests cannot do — so the seam had to
+    /// be opened deliberately rather than by moving the tests inward, which
+    /// would have measured the coordinator again instead of its callers.
+    #[cfg(test)]
+    pub(crate) fn seed_flood_counter_for_test(&mut self, zone: u16, name: &str) {
+        use crate::afxdp::flood_counters::{
+            flush_recorded_flood_counters, record_zone_flood_drop, FloodCounterSlotMap,
+        };
+        let map = FloodCounterSlotMap::build(&[zone], &self.forwarding.flood_counter_store);
+        record_zone_flood_drop(&map, zone, "syn-flood");
+        flush_recorded_flood_counters(&self.forwarding.flood_counter_store, &map);
+        self.forwarding.flood_counter_slot_map = std::sync::Arc::new(map);
+        self.forwarding.zone_id_to_name.insert(zone, name.to_string());
+    }
+
     /// Current in-memory FIB generation (the value flow-cache lookups
     /// validate against). Read by the `bump_fib_generation` control handler
     /// to build a rollback-rejection error and by tests.
