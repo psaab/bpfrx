@@ -354,9 +354,36 @@ var linkCycleLeaseEpoch = time.Now()
 //
 // The seam is made race-free rather than the leaks chased one by one. There are
 // twenty acquisition sites in this package's tests and the next one added would
-// reopen the hole; an atomic override cannot be raced by any of them. Releasing
-// is still the right hygiene — newLinkCycleProcessOnlyManager does it centrally
-// — but it is no longer what CORRECTNESS depends on.
+// reopen the hole in the VARIABLE, and an atomic override cannot be raced there
+// by any of them. Releasing is still the right hygiene —
+// newLinkCycleProcessOnlyManager does it centrally.
+//
+// #6871 round 11: that is the whole of the guarantee, and both the round-10
+// commit message ("a leaked heartbeat now renews its own dead Manager and races
+// nothing") and an earlier revision of this comment ("cannot be raced by any of
+// them", unqualified) claimed more. THE ATOMIC PROTECTS THE POINTER, NOT WHAT
+// IT POINTS AT. A leaked beat does not merely renew a dead Manager: reaching
+// linkCycleLeaseElapsed at all means it CALLS the override installed at that
+// instant, from its own goroutine. Every closure a test installs is therefore
+// shared state, and anything it captures mutably must be atomic in its own
+// right. fakeLinkCycleClock's counter already was; injectAtLeaseExpiryCheck's
+// one-shot flag was a plain bool, and `go test -race` reported a genuine data
+// race on it — read through this function, previous write through this function
+// from startLinkCycleHeartbeat.func1. Fixed there, in
+// link_cycle_lease_race_6871_test.go, which also records what the fix does and
+// does not buy.
+//
+// So: install-and-read of the override never races, which is what this variable
+// owes. Closure captures are the caller's obligation, which is what the round-10
+// claim silently annexed.
+//
+// A red -race run in this package is not automatically this. It also contains
+// load-sensitive DEADLINE tests — TestLargeApplySnapshotDoesNotFalseTimeout and
+// TestEventStreamRawDataplaneEventsFeedSyslogFanout — which fail under load
+// because a wall-clock budget was missed, and are not races. Round 10 was right
+// to retract the round-9 claim that the observed races WERE that class; it does
+// not follow that the class is empty. Read the report: a race names two
+// goroutines and two accesses, a blown deadline names neither.
 //
 // Production never installs an override, so the hot path is one atomic load
 // returning nil plus the same time.Since it always did.

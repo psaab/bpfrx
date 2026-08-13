@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,7 +40,8 @@ import (
 // PrepareLinkCycle, and it never looks outside that one file.
 
 // linkCycleAcquisitionSites is the allowlist: every production CALL of
-// PrepareLinkCycle, keyed "<path>:<enclosing func>".
+// PrepareLinkCycle, keyed "<path>:<enclosing decl>" — and the enclosing decl of
+// a method is RECEIVER-QUALIFIED (see declSiteKey).
 //
 // Three entries, and only the first is an acquisition site in its own right —
 // the other two are the adapter chain it reaches through
@@ -47,13 +49,13 @@ import (
 // LegacyDataPlaneAdapter). They are listed rather than pattern-excluded so that
 // moving the chain shows up here as a diff rather than as silence.
 var linkCycleAcquisitionSites = map[string]string{
-	"pkg/daemon/daemon_apply_dataplane.go:programRethMACWithWorkerJoin": "" +
+	"pkg/daemon/daemon_apply_dataplane.go:(*Daemon).programRethMACWithWorkerJoin": "" +
 		"the ONLY production acquisition site. It sits inside step 2.6 of " +
 		"applyDataplaneAndHACore, which defers abandonLinkCycleLease over its whole " +
 		"body, so the lease this takes cannot outlive the apply",
-	"pkg/dataplane/userspace/controllers.go:PrepareLinkCycle": "" +
+	"pkg/dataplane/userspace/controllers.go:(userspaceLinkController).PrepareLinkCycle": "" +
 		"adapter hop: userspaceLinkController forwards to Manager",
-	"pkg/dataplane/userspace/legacy_dataplane.go:PrepareLinkCycle": "" +
+	"pkg/dataplane/userspace/legacy_dataplane.go:(*LegacyDataPlaneAdapter).PrepareLinkCycle": "" +
 		"adapter hop: LegacyDataPlaneAdapter forwards to Manager",
 }
 
@@ -80,8 +82,53 @@ func repoRootFromPackage(t *testing.T) string {
 	}
 }
 
+// declSiteKey names the enclosing declaration for a key, QUALIFIED BY RECEIVER
+// TYPE when it is a method: "(*Daemon).programRethMACWithWorkerJoin".
+//
+// #6871 round 11. Go permits two declarations of one name in one file when the
+// receivers differ, so a bare name is not a unique key — and the collision is
+// absorbed SILENTLY by an allowlist entry that already carries that name. The
+// escape was measured, as compiling production Go taking a real lease with both
+// guards green:
+//
+//	type rethMACRetry struct{ d *Daemon }
+//	// same file, same name, different receiver — key collides with the entry below
+//	func (r *rethMACRetry) programRethMACWithWorkerJoin(n string) error {
+//	    return r.d.dp.Link().PrepareLinkCycle()   // a REAL second acquisition
+//	}
+//
+// That is exactly the failure the tree-wide guard exists to prevent: an
+// acquisition outside applyDataplaneAndHACore's deferred abandon, whose leaked
+// lease is permanent since round 8 made the lease renew itself. The in-package
+// guard had the same hole against a shadow method in process_linkcycle.go.
+//
+// types.ExprString rather than a hand-rolled type switch, so a pointer receiver,
+// a generic one (Foo[T]) and any shape added later all render instead of
+// collapsing into a silent default.
+//
+// RED-on-revert without a plant: return d.Name.Name here and BOTH guards fail
+// immediately — every allowlisted key becomes "no longer exists" and every real
+// site becomes "not on the allowlist". The key format and the allowlist are each
+// other's check.
+//
+// KNOWN LIMIT, stated rather than papered over. Neither guard sees
+//
+//	reflect.ValueOf(dp.Link()).MethodByName("PrepareLinkCycle").Call(nil)
+//
+// because there is no SelectorExpr naming the method at all — the name is a
+// string literal. Matching the literal too would fire on every doc comment and
+// error string that spells it, so this guard does not claim to cover reflective
+// calls, and no reviewer should read it as doing so.
+func declSiteKey(d *ast.FuncDecl) string {
+	if d.Recv == nil || len(d.Recv.List) == 0 {
+		return d.Name.Name
+	}
+	return "(" + types.ExprString(d.Recv.List[0].Type) + ")." + d.Name.Name
+}
+
 // callSitesOf returns "<relpath>:<enclosing decl>" for every REFERENCE to the
-// named method in non-test Go source under root.
+// named method in non-test Go source under root, the enclosing decl of a method
+// being receiver-qualified per declSiteKey.
 //
 // It keys on any *ast.SelectorExpr whose selector is the method — not on
 // CallExpr.Fun (#6871 round 10, F2). Two escapes were MEASURED against the
@@ -148,7 +195,7 @@ func callSitesOf(t *testing.T, root, method string) map[string]bool {
 			switch d := decl.(type) {
 			case *ast.FuncDecl:
 				if d.Body != nil {
-					record(d.Name.Name, d.Body)
+					record(declSiteKey(d), d.Body)
 				}
 			case *ast.GenDecl:
 				// var/const initializers run at package init and can take a
@@ -233,7 +280,7 @@ func TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871(t *testing.T) {
 func TestLinkCycleLeaseIsAcquiredOnlyByPrepare_6871(t *testing.T) {
 	got := callSitesOf(t, ".", "acquireLinkCycleLease")
 
-	want := map[string]bool{"process_linkcycle.go:PrepareLinkCycle": true}
+	want := map[string]bool{"process_linkcycle.go:(*Manager).PrepareLinkCycle": true}
 	var unexpected []string
 	for site := range got {
 		if !want[site] {

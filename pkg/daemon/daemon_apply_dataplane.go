@@ -750,16 +750,6 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 		// stays down until a restart while step 2.6b2 rebinds AF_XDP sockets
 		// onto it.
 		//
-		// AND THE ADDRESS GAP IS DELIBERATE (#6871 F4). Step 2.6b's VIP
-		// reconcile is gated on linkCycled too, so a MAC write that failed
-		// AFTER the cycle skips it and the member comes back without its VRRP
-		// VIPs until the next apply that does cycle it. That is not an
-		// oversight and not new here — it predates #5103 and is unchanged by
-		// it. It was documented only in docs/reth-mac.md, which is the wrong
-		// place for a caveat a maintainer needs while reading THIS branch: the
-		// shipping artifact has to carry it. The full table lives in that doc;
-		// the operative fact is here.
-		//
 		// Leave the rebind to step 2.6b2, which owns it for every cycled
 		// member. Note that suppression is per-MEMBER while 2.6b2's gate
 		// (needLinkCycleRecovery) is a per-APPLY accumulator, so an apply that
@@ -810,6 +800,25 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 	slog.Warn("userspace: RETH MAC link cycle did not complete after the worker join; "+
 		"rebinding AF_XDP sockets so the prepare is not left half-applied",
 		"iface", ifName, "err", err)
+	// AND THE ADDRESS GAP IS DELIBERATE (#6871 F4). One member of THIS class —
+	// join OK, setDown OK, the CYCLED MAC write refused — has already taken the
+	// link DOWN and back UP by the time it arrives here (programRethMAC's
+	// set-mac failure path does a best-effort setUp), and the kernel flushes an
+	// interface's addresses on the way down. It nonetheless returns
+	// linkCycled=false, so it contributes nothing to needLinkCycleRecovery, and
+	// step 2.6b's VIP reconcile is gated on exactly that: it is SKIPPED, and the
+	// member comes back without its VRRP VIPs until some later apply cycles it.
+	// Verified against origin/master: the pre-#5103 code returns false on that
+	// same path, so the gap predates this change and is unchanged by it.
+	//
+	// It was attached to the WRONG BRANCH until round 11 — it sat in the
+	// linkCycled==true arm above, where needLinkCycleRecovery is necessarily
+	// true and the reconcile therefore DOES run, so the caveat contradicted the
+	// code it was written against. docs/reth-mac.md's outcome table has always
+	// had it on the right row ("join OK, cycled MAC write failed"), which is why
+	// that doc is the reference for the full table; the shipping artifact still
+	// has to carry the operative fact, which is why it is also here.
+
 	// NotifyLinkCycle opens with a 1s NIC-settle sleep before it takes the
 	// manager lock, and this call site is INSIDE the per-member RETH loop —
 	// step 2.6b2 pays that second at most once, outside it. Worst case here is

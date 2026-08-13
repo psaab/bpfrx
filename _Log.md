@@ -80101,8 +80101,12 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `linkCycleLeaseElapsedOverride` is an `atomic.Pointer[func() time.Duration]`
   behind a plain `linkCycleLeaseElapsed()` function, and every test swaps through
   one helper (`swapLinkCycleLeaseElapsed`) — a direct assignment no longer
-  compiles, which is the point. A leaked heartbeat is now harmless: it renews its
-  own dead Manager and races nothing. The central `t.Cleanup` in
+  compiles, which is the point. A leaked heartbeat can no longer race the
+  override VARIABLE. **Corrected in round 11:** this sentence originally read "A
+  leaked heartbeat is now harmless: it renews its own dead Manager and races
+  nothing", which annexes a guarantee the atomic does not give — it protects the
+  POINTER, not the closure it points at, and a leaked beat CALLS whichever
+  override is installed. See the round-11 entry. The central `t.Cleanup` in
   `newLinkCycleProcessOnlyManager` stays as hygiene (it covers all 12
   constructions through that helper) but is no longer what correctness rests on.
   Production installs no override, so the path is one atomic load plus the same
@@ -80153,3 +80157,90 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
   pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 11 — fix a MEASURED data race in a test seam closure,
+  move a code comment onto the branch it describes, close two guard-key escapes,
+  and correct the round-10 claim that overstated what round 10 bought.
+  N1: `injectAtLeaseExpiryCheck`'s one-shot flag was a plain `bool` read from two
+  goroutines. Round 10 made `linkCycleLeaseElapsedOverride` an `atomic.Pointer`,
+  which makes the SWAP race-free — but the atomic protects the POINTER, not what
+  it points AT. A leaked heartbeat reaching `linkCycleLeaseElapsed` CALLS
+  whichever override is installed, so every closure a test installs is shared
+  state. `fakeLinkCycleClock`'s counter was already an `atomic.Int64` for exactly
+  this reason; this flag had not been given the same treatment. Reproduced from
+  the reviewer's script first (`WARNING: DATA RACE`, read at the flag through
+  `linkCycleInFlight`, previous write through `startLinkCycleHeartbeat.func1`),
+  then measured on the REAL helper rather than on an inlined copy of its shape:
+  with the beat accelerated 15s -> 200us, BEFORE = 1 race under `-race -count=5`
+  and a 200-run functional loop ending in
+  `panic: Fail in goroutine after ... has completed` (the second injector calling
+  `t.Fatal` off-goroutine, taking the whole test binary down); AFTER
+  (`fired atomic.Bool`, `CompareAndSwap`) = 0 races, no panic in 200 runs.
+  WHAT THE FIX DOES NOT BUY, stated because overstating it is the finding: a
+  leaked beat is not thereby harmless. It can still WIN the one-shot and inject
+  on its own goroutine, after which the discriminator's own read finds the lease
+  word unmoved and reds at "reported NO cycle in flight" — ~10 times in the same
+  200 accelerated runs. The direction is what holds: every assertion demands the
+  lease be judged LIVE, and a stolen injection can only make the reader see an
+  expiry, so it reds a cell and never greens one. At the production 15s period
+  the window is microseconds and none of it has been observed.
+  CLAIM CORRECTIONS, two sentences that were false: the round-10 commit message's
+  "A leaked heartbeat now renews its own dead Manager and races nothing", and
+  `process_linkcycle.go`'s "an atomic override cannot be raced by any of them".
+  Both are true of the pointer swap and false of the installed closure. The
+  in-tree copy of the first (round-10 entry above) is corrected in place;
+  the commit message itself is immutable, so it is corrected here and on the PR.
+  The seam comment now scopes the guarantee to install-and-read of the variable
+  and names closure captures as the caller's obligation. It also records that a
+  red `-race` run in this package is NOT automatically a race:
+  `TestLargeApplySnapshotDoesNotFalseTimeout` and
+  `TestEventStreamRawDataplaneEventsFeedSyslogFanout` are load-sensitive DEADLINE
+  tests that fail under load. Round 10 was right to retract the round-9 claim
+  that the observed races WERE that class; it does not follow that the class is
+  empty.
+  N3: the "AND THE ADDRESS GAP IS DELIBERATE" paragraph sat inside
+  `if linkCycled {`, where `needLinkCycleRecovery` is necessarily true and step
+  2.6b's VIP reconcile therefore DOES run — so the caveat contradicted the branch
+  it was attached to. The gap belongs to the `linkCycled==false` cycled-MAC-write
+  row: `setDown` succeeded, the MAC write was refused, the link went down and
+  back up (flushing addresses) and `programRethMAC` still returns false. Moved to
+  the rollback arm. Verified against `origin/master` that the pre-#5103 code
+  returns false on that same path, so "predates #5103 and is unchanged by it"
+  holds. `docs/reth-mac.md`'s outcome table already had it on the right row, so
+  the doc needed no change. Same insertion-lands-against-the-wrong-antecedent
+  class as round 10's F3, this time in code rather than prose.
+  N2: both acquisition guards keyed sites as `<path>:<enclosing decl name>`, and
+  Go allows two declarations of one name in one file when the receivers differ.
+  Measured, both plants compiling production Go that takes a real lease: (a) a
+  second acquisition in `daemon_apply_dataplane.go` under a same-named method on
+  a different receiver, absorbed by the allowlist entry — the exact failure the
+  guard exists to prevent; (b) a shadow `PrepareLinkCycle` in
+  `process_linkcycle.go`, absorbed by the in-package want-set. BEFORE: both
+  plants green. AFTER (receiver-qualified key via `types.ExprString`): both RED,
+  each naming its plant — `(*rethMACRetry).programRethMACWithWorkerJoin` and
+  `(*linkCycleShadow).PrepareLinkCycle`. The key format is self-binding: revert
+  `declSiteKey` to the bare name and both guards fail on every entry, no plant
+  needed. (c) `reflect...MethodByName("PrepareLinkCycle").Call(nil)` has no
+  SelectorExpr at all and is out of reach for an AST guard; recorded as a KNOWN
+  LIMIT rather than papered over, since matching the string literal would fire on
+  every doc comment that spells it.
+  N7 (out of scope here, filed): `renameRethMember` does its own link
+  DOWN/rename/UP in the same step 2.6 loop with no worker join — the #5103 class,
+  unchanged by this PR, reachability explicitly NOT claimed. Filed as #6996 with
+  that provenance rather than fixed here.
+  N5/N6 recorded as explicit NON-DEFECTS so they are not re-raised: severing the
+  ctrl-stay-disabled call site leaves both packages green (the PREDICATE is
+  bound; master's pre-PR condition was equally unbound — round 9's F4 scope note
+  declares and defers exactly this), and a lease surviving forever when
+  `applyDataplaneAndHACore` never RETURNS is the residual `docs/reth-mac.md`
+  already states and argues for, because the workers really are joined.
+  Validation: `go build ./...`, `go vet ./...`, full `go test ./pkg/... ./cmd/...`
+  green; `-race -count=5` on `pkg/dataplane/userspace` x3 and `pkg/daemon` x1,
+  zero races. Cluster smoke `make test-failover` was run centrally at this head
+  before the round: 14/14 PASS, 22.9 Gbps.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/daemon/daemon_apply_dataplane.go, _Log.md

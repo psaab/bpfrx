@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -41,14 +42,54 @@ import (
 //
 // One-shot on purpose: the injected writer computes its own deadline through
 // linkCycleLeaseDeadline(), which reads the same seam, and a re-entrant hook
-// would recurse. A plain bool rather than sync.Once for the same reason — Once
-// deadlocks when Do is re-entered from inside its own function.
+// would recurse. Not sync.Once for the same reason — Once deadlocks when Do is
+// re-entered from inside its own function. CompareAndSwap gives the same
+// one-shot without that: it commits the flag BEFORE inject runs, so a
+// re-entrant read sees it set.
+//
+// ATOMIC, not a plain bool (#6871 round 11), because this closure is read from
+// more than one goroutine. Round 10 made linkCycleLeaseElapsedOverride an
+// atomic.Pointer, which makes the SWAP race-free; it does not make the closure
+// the pointer points AT goroutine-safe. A test that takes a real lease and does
+// not release it leaves a heartbeat beating on a dead Manager, and that
+// goroutine's RenewLinkCycle -> linkCycleInFlight -> linkCycleLeaseElapsed path
+// CALLS whatever override is installed at that instant — including this one,
+// installed by a later test. fakeLinkCycleClock's counter is an atomic.Int64
+// for exactly this reason; this flag was the one capture that had not been
+// given the same treatment, and `go test -race` reported a genuine
+// WARNING: DATA RACE on it (read here, previous write from
+// startLinkCycleHeartbeat.func1) once the heartbeat period is shortened enough
+// to widen the collision window.
+//
+// WHAT THE ATOMIC FIXES AND WHAT IT DOES NOT, measured rather than reasoned,
+// because the sentence this replaces is the one round 10 overstated. With the
+// beat accelerated 15s -> 200us, so that a collision is frequent enough to
+// observe at all:
+//
+//   - the DATA RACE goes away: 1 report before, 0 after, -race -count=5;
+//   - the DOUBLE injection goes away by construction — CompareAndSwap admits
+//     exactly one injector, where two racing plain-bool readers could both see
+//     it unset. Before the fix a 200-run functional loop ended in
+//     `panic: Fail in goroutine after ... has completed`, the second injector
+//     calling t.Fatal from the heartbeat goroutine and taking the whole test
+//     binary down; that was not observed once in 200 runs after;
+//   - a leaked beat is NOT thereby made harmless. It can still WIN the one-shot
+//     and inject on its own goroutine, and then the discriminator's own read
+//     finds the lease word it expected to move unmoved, and reds at "reported
+//     NO cycle in flight". That still happens after the fix, ~10 times in 200
+//     accelerated runs.
+//
+// So the direction is what holds: a stolen injection reds a cell, it never
+// greens one — the assertions all demand the lease be JUDGED LIVE, and the
+// steal can only make the reader see an expiry. A flake, never a false green.
+// At the production 15s period the window is microseconds and none of this has
+// been observed. Releasing the lease is what keeps a fixture stable; the atomic
+// is what keeps it defined.
 func injectAtLeaseExpiryCheck(t *testing.T, elapsed time.Duration, inject func()) {
 	t.Helper()
-	fired := false
+	var fired atomic.Bool
 	swapLinkCycleLeaseElapsed(t, func() time.Duration {
-		if !fired {
-			fired = true
+		if fired.CompareAndSwap(false, true) {
 			inject()
 		}
 		return elapsed
