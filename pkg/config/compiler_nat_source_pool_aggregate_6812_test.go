@@ -118,6 +118,175 @@ func TestAggregateOverBudgetPoolsUnreferenced_6812(t *testing.T) {
 	assertPoison(t, poisonSet(t, cmds...))
 }
 
+// snat6812UnusablePools emits `n` referenced pools that the snapshot builder
+// will independently mark UNUSABLE (poolCmds decides how), followed by ONE
+// small healthy pool "good" referenced LAST. Every unusable pool carries a
+// single distinct /32 so the ONLY aggregate axis these fixtures can cross is
+// the distinct-pool COUNT — the address and port-capacity budgets stay orders
+// of magnitude below their limits, so a poison verdict here cannot be
+// attributed to another axis.
+func snat6812UnusablePools(n int, poolCmds func(i int, name string) []string) []string {
+	cmds := []string{
+		"set security nat source rule-set RS from zone trust",
+		"set security nat source rule-set RS to zone untrust",
+	}
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("bad%d", i)
+		cmds = append(cmds, poolCmds(i, name)...)
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source rule-set RS rule r%d match source-address 10.0.0.0/24", i),
+			fmt.Sprintf("set security nat source rule-set RS rule r%d then source-nat pool %s", i, name),
+		)
+	}
+	// The healthy pool is referenced LAST, so under the first-fit walk it is
+	// the one an over-charge of the unusable pools would refuse.
+	return append(cmds,
+		"set security nat source pool good address 198.51.100.7/32",
+		"set security nat source pool good port range 10000 to 10009",
+		fmt.Sprintf("set security nat source rule-set RS rule r%d match source-address 10.0.0.0/24", n),
+		fmt.Sprintf("set security nat source rule-set RS rule r%d then source-nat pool good", n),
+	)
+}
+
+// TestAggregateBudgetExcludesUnusablePools_6812 is the #6812 F1 regression
+// (Codex gate finding): a pool the snapshot builder ALREADY marks unusable
+// builds NO allocator in the dataplane — the Rust parse loop gates
+// `PendingPoolAllocator` on `pool_failure.is_none()`
+// (userspace-dp/src/nat/source.rs), so a failed pool is never charged and
+// never occupies a slot in `resolve_pool_allocators`' first-fit walk. Charging
+// it Go-side therefore refuses a pool Rust would admit.
+//
+// The concrete damage is fail-closed OVER-rejection on the TOLERANT recovery
+// path — a lenient load / peer-sync (#1960 no-brick) is precisely how an
+// operator gets back to a working state, and this took a healthy pool down
+// with the broken ones. MaxSourceNATPoolCount unusable pools exactly fill the
+// count budget, so the healthy pool referenced after them was poisoned as
+// number 1,025.
+//
+// The dataplane half of the parity claim is
+// `production_entry_admits_a_healthy_pool_after_failed_pools_6812`
+// (userspace-dp/src/nat/tests_aggregate_budget.rs), which drives the SAME
+// scenario — MaxSourceNATPoolCount unusable pools then one healthy pool —
+// through the Rust production entry and asserts the healthy pool installs a
+// real allocator. The snapshot-shape half (that Go actually emits the
+// `pool_unusable` markers that test consumes) is
+// TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812
+// (pkg/dataplane/userspace).
+//
+// RED-on-revert: restore the unconditional charge in
+// sourceNATAggregateReferencedCharges and the poison set comes back
+// {"good"} — the healthy pool disabled by pools that install nothing.
+func TestAggregateBudgetExcludesUnusablePools_6812(t *testing.T) {
+	cases := []struct {
+		name string
+		// wantReason is what SourceNATPoolUnusableReason must say about the
+		// fixture's pools. "" is NOT an omission: it is the unparseable-member
+		// case, where the pool DEFINITION is fine and the pool is skipped by the
+		// zero-expanded-addresses rule instead.
+		wantReason string
+		cmds       func(i int, name string) []string
+		about      string
+	}{
+		{
+			name:       "invalid_port_range",
+			wantReason: "invalid_port_range",
+			about:      "a reversed `port range` leaves PortRangeInvalidSpec set (#5457); the builder marks the pool unusable",
+			cmds: func(i int, name string) []string {
+				return []string{
+					fmt.Sprintf("set security nat source pool %s address 10.%d.%d.1/32", name, i/256, i%256),
+					fmt.Sprintf("set security nat source pool %s port range 20000 to 10000", name),
+				}
+			},
+		},
+		{
+			name:       "zone_scoped_pool_address",
+			wantReason: "zone_scoped_pool_address",
+			about:      "a `%zone` member is not dataplane-representable (#5875); the builder marks the pool unusable",
+			cmds: func(i int, name string) []string {
+				return []string{
+					fmt.Sprintf("set security nat source pool %s address fe80::%d%%eth0", name, i+1),
+				}
+			},
+		},
+		{
+			name:       "empty_pool",
+			wantReason: "empty_pool",
+			about:      "a referenced pool with no address member ships nothing; the builder marks the pool unusable",
+			cmds: func(i int, name string) []string {
+				return []string{
+					fmt.Sprintf("set security nat source pool %s port range 10000 to 10009", name),
+				}
+			},
+		},
+		{
+			// The pool definition itself is fine — members present, no zone
+			// qualifier, valid port range — so SourceNATPoolUnusableReason says
+			// nothing and the snapshot ships the raw strings. It is RUST that
+			// refuses: expand_pool_address fails on every member, total_pool is
+			// 0, the `allocator_key()` gate skips the rule, and it fails as
+			// InvalidPool at the boundary having built nothing. This is the case
+			// the zero-expanded-addresses skip exists for, and the ONLY one that
+			// binds it.
+			name:       "no_member_expands",
+			wantReason: "",
+			about:      "every member is unparseable, so Rust expands zero addresses and builds no allocator",
+			cmds: func(i int, name string) []string {
+				return []string{
+					fmt.Sprintf("set security nat source pool %s address 999.999.999.%d", name, i%256),
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmds := snat6812UnusablePools(MaxSourceNATPoolCount, tc.cmds)
+			cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+			if err != nil {
+				t.Fatalf("CompileConfigLenient: %v", err)
+			}
+			// PRECONDITION: the fixture really did build MaxSourceNATPoolCount
+			// unusable pools plus the healthy one. Without this a fixture that
+			// silently dropped its pools would pass the assertion below while
+			// exercising nothing.
+			if got := len(cfg.Security.NAT.SourcePools); got != MaxSourceNATPoolCount+1 {
+				t.Fatalf("fixture defined %d pools, want %d — the scenario never reached the budget",
+					got, MaxSourceNATPoolCount+1)
+			}
+			if reason := SourceNATPoolUnusableReason(cfg.Security.NAT.SourcePools["bad0"]); reason != tc.wantReason {
+				t.Fatalf("bad0 unusable reason = %q, want %q (%s); the fixture is not building the shape under test",
+					reason, tc.wantReason, tc.about)
+			}
+			// For the unparseable-member case, also pin the premise the skip
+			// rests on: Go expands zero addresses from these members, which is
+			// what makes Rust's `total_pool > 0` gate skip the rule too.
+			if tc.wantReason == "" {
+				for _, m := range SourceNATPoolMembers(cfg.Security.NAT.SourcePools["bad0"]) {
+					if n := sourceNATPoolMemberHostCount(m); n != 0 {
+						t.Fatalf("member %q expands to %d addresses, want 0 — the fixture is not "+
+							"the zero-expansion case and the skip under test is not being exercised", m, n)
+					}
+				}
+			}
+			if reason := SourceNATPoolUnusableReason(cfg.Security.NAT.SourcePools["good"]); reason != "" {
+				t.Fatalf("the healthy pool is itself unusable (%q); the fixture proves nothing", reason)
+			}
+			// THE DISCRIMINATOR: pools that build no allocator must not consume
+			// aggregate budget, so nothing is poisoned.
+			poison := SourceNATAggregateOverBudgetPools(cfg)
+			if poison["good"] {
+				t.Fatalf("the healthy pool was poisoned %q by %d pools that build NO allocator "+
+					"(%s) — fail-closed over-rejection on the tolerant recovery path, and a "+
+					"divergence from the Rust walk, which skips failed pools entirely",
+					"aggregate_over_budget", MaxSourceNATPoolCount, tc.name)
+			}
+			if len(poison) != 0 {
+				t.Fatalf("poison set = %v, want empty — no pool in this fixture crosses a budget "+
+					"once the unusable pools are excluded", poison)
+			}
+		})
+	}
+}
+
 // TestAggregateValidatorMatchesPoisonWalk_6812 pins validator/poison
 // agreement: whenever the strict validator rejects, the poison set is
 // non-empty (the tolerant path degrades the same config per-pool); whenever

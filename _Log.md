@@ -1,3 +1,84 @@
+## 2026-08-13 — #6812 fold: failed pools must not charge the aggregate budget (Codex gate F1-F4)
+
+- **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: Codex returned MERGE-NEEDS-MAJOR on PR #6815. F1 (blocking) is a
+  real fail-closed OVER-rejection introduced by the #6812 poison walk itself,
+  and it falsifies the PR's own comments claiming Go and Rust agree on which
+  pools live.
+  **F1 — failed pools charged the Go budget and disabled a healthy pool.**
+  `sourceNATAggregateReferencedCharges` charged every DEFINED referenced pool.
+  The snapshot builder then, further down the same config, marks a pool
+  UNUSABLE for reasons that are settled by the pool definition alone — empty
+  membership, a `%zone` member (#5875), a port range the parser rejected
+  (#5457). Rust never charges those: the parse loop gates
+  `PendingPoolAllocator` on `pool_failure.is_none()`, so `resolve_pool_allocators`
+  neither charges them nor lets them occupy a slot. Reproduced firsthand on all
+  THREE unusable shapes, not just the reversed port range Codex probed:
+  `MaxSourceNATPoolCount` unusable pools exactly fill the pool-count budget and
+  the next healthy pool is poisoned `aggregate_over_budget` — a pool the
+  dataplane would have installed. It lands on the TOLERANT path (lenient load /
+  peer-sync, #1960 no-brick), which is the path an operator uses to recover.
+  Fixed by making the unusability verdict a SHARED predicate rather than
+  builder-local knowledge: new `config.SourceNATPoolMembers` /
+  `config.SourceNATPoolPortRange` (moved from pkg/dataplane/userspace) /
+  `config.SourceNATPoolUnusableReason`, with the builder and the budget walk
+  both reading it — the builder to poison, the walk to SKIP. The walk also
+  skips a pool whose members all fail to expand (zero addresses), which Rust
+  skips via its `total_pool > 0` gate and fails as InvalidPool instead.
+  Precedence in the extracted predicate preserves the builder's original
+  last-writer-wins order (invalid_port_range over zone_scoped_pool_address over
+  empty_pool) so shipped reasons are unchanged; the three per-condition
+  `slog.Warn` lines collapse to one carrying `reason`.
+  No strict-path change: `validateSourceNATPoolStrict` and
+  `validateSourceNATPoolAddressScopeStrict` run EARLIER in `runUniformGates`
+  than the aggregate gate, so an unusable pool never reaches the aggregate sum
+  on a strict commit — and the resource claim is unaffected either way, since a
+  pool that builds no allocator costs no allocator memory.
+  **F2 — the at-limit control did not prove all pools install.**
+  `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` filtered
+  only for `OverBudget`, so mutating the fixture's `/32` members to a malformed
+  `/33` failed all 1,024 rules as `InvalidPool`, installed ZERO pools, and the
+  test still passed. Now asserts no `pool_failure` of ANY reason plus a positive
+  occupancy-word check (a rule can carry no failure and still hold the empty
+  default allocator).
+  **F3 — repeated references to a reused key were unbound.** Deleting the
+  reuse-path `pool_allocators.insert(key, existing.clone())` left all 279
+  `nat::` tests green; without it a second rule referencing one previous pool
+  charges the key twice and refuses an unrelated new pool. Behaviour was already
+  correct — this adds the missing regression.
+  **F4 — comment drift.** The tests header claimed the wiring tests inject a
+  scaled budget (they use production wiring); "every test above" overlooked the
+  pure-arithmetic parity test; "these two cross" was false for a control sitting
+  exactly AT the limit; and "10,240 occupancy bits" conflated logical slots with
+  word-rounded physical storage (1024 words = 65,536 bits). All corrected here
+  and in the 2026-08-03 entry below.
+- **File(s)**: `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_deterministic_parity_test.go`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`, `_Log.md`
+- **Parity regression (both sides, same scenario, neither hardcoding the
+  other)**: Go — `TestAggregateBudgetExcludesUnusablePools_6812` (pkg/config,
+  all three unusable shapes) and
+  `TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812`
+  (pkg/dataplane/userspace) drive the real builder and assert the healthy pool
+  survives AND pin the exact snapshot markers the Rust fixture is built from.
+  Rust — `production_entry_admits_a_healthy_pool_after_failed_pools_6812` feeds
+  those markers to the PRODUCTION entry at the REAL budget and asserts the
+  healthy pool installs a real allocator. If the builder stops emitting that
+  shape the Go test reds and the Rust fixture stops standing for anything.
+- **Fail-on-revert (observed, not asserted)**: restoring the unconditional
+  charge in `sourceNATAggregateReferencedCharges` reds all three Go subtests
+  with `the healthy pool was poisoned "aggregate_over_budget" by 1024 pools that
+  build NO allocator` — an assertion failure, not a build break. The Rust half
+  reds under the opposite mutation (widening the parse-loop pending gate to
+  `true`). Over-reach controls stay GREEN under the revert:
+  `TestAggregateOverBudgetPoolsCount_6812`,
+  `TestAggregateValidatorMatchesPoisonWalk_6812`,
+  `TestSourceNATSnapshotAggregateStillPoisonsPastBudget_6812`,
+  `production_entry_enforces_the_real_pool_count_budget_6812`.
+
 ## 2026-08-03 — #6812: cap the lenient SNAT aggregate eager bitmap at the apply boundary (opus-review-001 R73)
 
 - **Timestamp**: 2026-08-03 (fix/6812-snat-aggregate-bitmap-cap)
@@ -74555,9 +74636,12 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `max_pools` (1024), NOT `max_port_capacity` (2^33). Crossing port capacity
   honestly would materialise ~8.6e9 occupancy slots — a test that gets deleted
   for being slow, and a guard nobody runs is not a guard. Pool count crosses a
-  REAL budget for ~10,240 occupancy bits total, and `max_addresses` /
-  `max_port_capacity` stay far below their limits so the refusal cannot be
-  attributed to another axis.
+  REAL budget for 10,240 occupancy SLOTS total — stored word-rounded as one u64
+  per address, i.e. 1024 words / 65,536 bits / ~8 KB (corrected 2026-08-13: the
+  original entry wrote "~10,240 occupancy bits", conflating the logical slot
+  count with the physical storage) — and `max_addresses` / `max_port_capacity`
+  stay far below their limits so the refusal cannot be attributed to another
+  axis.
   Two preconditions run BEFORE the discriminator: the production entry returned
   one rule per snapshot (a fixture that never entered the path would otherwise
   pass silently — the same class as the defect being closed), and the first

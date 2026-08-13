@@ -481,24 +481,15 @@ func poolParams(pool *config.NATPool, nat64Referenced bool) (detParams, *LookupE
 	return p, lerrf(ErrCodeNotDeterministic, "unsupported deterministic NAT mode %d", mode)
 }
 
-// poolPortRangeV4 mirrors sourceNATPoolPortRange (pkg/dataplane/userspace):
-// default 1024-65535, but a configured-yet-invalid range fails closed.
+// poolPortRangeV4 DELEGATES to config.SourceNATPoolPortRange: default
+// 1024-65535, but a configured-yet-invalid range fails closed. It used to be a
+// hand-copied third implementation of that rule, alongside the snapshot
+// builder's; #6812 F1 made the config package the SSOT (the aggregate budget
+// walk has to agree with the builder about which pools install), so this reads
+// it rather than mirroring it — the block-boundary parity these derived
+// deterministic params depend on is now true by construction, not by review.
 func poolPortRangeV4(pool *config.NATPool) (uint16, uint16, bool) {
-	if pool == nil || pool.PortRangeInvalidSpec != "" {
-		return 0, 0, false
-	}
-	low := pool.PortLow
-	if low == 0 {
-		low = 1024
-	}
-	high := pool.PortHigh
-	if high == 0 {
-		high = 65535
-	}
-	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
-		return 0, 0, false
-	}
-	return uint16(low), uint16(high), true
+	return config.SourceNATPoolPortRange(pool)
 }
 
 // expandPoolV4 resolves the pool's ordered external IPv4 addresses using the

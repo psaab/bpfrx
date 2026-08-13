@@ -157,3 +157,44 @@ Go:
 - Not bounding the raw address-vector expansion (bounded by the Go grammar
   and the poison for tolerated configs; the bitmap is the 1.48 GiB driver).
 - NAT64 has its own allocator keying; the review scoped R73 to source-NAT.
+
+## Post-review correction — F1: the two admissions were not the same set
+
+The design above says `SourceNATAggregateOverBudgetPools` "runs the SAME
+first-fit admission the Rust boundary uses". The ORDER and the CHARGE matched;
+the SCOPE did not, and the gap was a fail-closed over-rejection.
+
+The Go walk charged every DEFINED referenced pool. The snapshot builder, in a
+separate pass further down the same config, marks a pool UNUSABLE for reasons
+settled by the pool definition alone — empty membership, a `%zone` member
+(#5875), a port range the parser rejected (#5457). Rust never charges those:
+the parse loop only records a `PendingPoolAllocator` when
+`pool_failure.is_none()`, so `resolve_pool_allocators` neither charges such a
+pool nor lets it occupy a slot. `MaxSourceNATPoolCount` unusable pools therefore
+filled the whole pool-count budget Go-side while costing the dataplane nothing,
+and the next HEALTHY pool was poisoned `aggregate_over_budget` — a pool the
+dataplane would have installed. Reproduced on all three unusable shapes, plus a
+fourth where the definition is fine but no member expands.
+
+It lands on the TOLERANT path specifically (lenient load / peer-sync, #1960
+no-brick), which is the path an operator uses to recover — the worst place to
+over-reject.
+
+Fix: the unusability verdict became a SHARED predicate instead of builder-local
+knowledge. `config.SourceNATPoolMembers`, `config.SourceNATPoolPortRange`
+(moved out of pkg/dataplane/userspace) and `config.SourceNATPoolUnusableReason`
+are now read by BOTH the builder (to poison) and the budget walk (to SKIP);
+`pkg/nat`'s third hand-copy of the port-range rule delegates to the same
+function. The walk additionally skips a pool whose members all fail to expand,
+mirroring Rust's `total_pool > 0` gate. No strict-path change:
+`validateSourceNATPoolStrict` / `validateSourceNATPoolAddressScopeStrict` run
+earlier in `runUniformGates`, so an unusable pool never reaches the aggregate
+sum on a strict commit — and a pool that builds no allocator costs no allocator
+memory, so the resource model is unchanged either way.
+
+The equivalence claim is now TESTED on both sides rather than asserted in a
+comment: `TestAggregateBudgetExcludesUnusablePools_6812` (pkg/config) and
+`TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812`
+(pkg/dataplane/userspace) drive the Go half and pin the exact snapshot markers
+that `production_entry_admits_a_healthy_pool_after_failed_pools_6812`
+(userspace-dp) feeds to the Rust production entry at the real budget.

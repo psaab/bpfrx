@@ -2911,6 +2911,113 @@ func sourceNATPoolMemberHostCount(addr string) uint64 {
 	return 1
 }
 
+// SourceNATPoolMembers returns a source-NAT pool's address membership in the
+// order the dataplane receives it: the singular `address` leaf first, then the
+// repeated `address` list. Nil for a pool with no members, so a caller that
+// ships this straight onto the wire keeps the pre-#6812 nil-vs-empty encoding.
+//
+// Shared by the snapshot builder (pkg/dataplane/userspace/nat_source.go, which
+// ships exactly this slice), the aggregate budget walk below, and
+// SourceNATPoolUnusableReason — so "what is in this pool" has ONE answer.
+func SourceNATPoolMembers(pool *NATPool) []string {
+	if pool == nil || (pool.Address == "" && len(pool.Addresses) == 0) {
+		return nil
+	}
+	members := make([]string, 0, len(pool.Addresses)+1)
+	if pool.Address != "" {
+		members = append(members, pool.Address)
+	}
+	return append(members, pool.Addresses...)
+}
+
+// SourceNATPoolPortRange resolves a source-NAT pool's EFFECTIVE port range and
+// reports whether the pool is usable on that axis. An unset endpoint defaults
+// to the 1024-65535 PAT range.
+//
+// #5457: an EXPLICITLY configured but rejected range (a non-canonical token, an
+// endpoint outside 1..65535, or a reversed low>high) is never stamped into
+// PortLow/PortHigh — parseSourcePoolPortRange records the raw spec in
+// PortRangeInvalidSpec instead. Returning ok=false for that marker is what
+// stops the tolerant load / peer-sync path from silently installing the
+// defaulted 1024-65535 range the operator did not configure: the snapshot
+// builder turns ok=false into an "invalid_port_range" pool-unusable marker and
+// the pool installs nothing.
+//
+// Lived in pkg/dataplane/userspace until #6812 F1; it moved here so the
+// aggregate budget walk and the builder read ONE definition of "this pool's
+// port range is usable" (see SourceNATPoolUnusableReason).
+func SourceNATPoolPortRange(pool *NATPool) (uint16, uint16, bool) {
+	if pool == nil {
+		return 0, 0, false
+	}
+	if pool.PortRangeInvalidSpec != "" {
+		return 0, 0, false
+	}
+	low := pool.PortLow
+	if low == 0 {
+		low = 1024
+	}
+	high := pool.PortHigh
+	if high == 0 {
+		high = 65535
+	}
+	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
+		return 0, 0, false
+	}
+	return uint16(low), uint16(high), true
+}
+
+// SourceNATPoolUnusableReason reports the fail-closed snapshot reason a
+// REFERENCED source-NAT pool is unusable from its DEFINITION alone, or "" when
+// the pool installs. The returned strings are the wire reasons the userspace
+// snapshot carries in PoolUnusableReason, decoded on the Rust side by
+// source_nat_failure_reason_from_snapshot (userspace-dp/src/nat/source.rs).
+//
+// Precedence is last-writer-wins — invalid_port_range over
+// zone_scoped_pool_address over empty_pool — preserved verbatim from the
+// snapshot builder's original inline checks, so a pool tripping more than one
+// condition reports the reason it always did.
+//
+// TWO callers share this predicate so they cannot drift (#6812 F1):
+//
+//  1. the snapshot builder marks the pool unusable, and
+//  2. sourceNATAggregateReferencedCharges EXCLUDES it from the aggregate
+//     budget.
+//
+// (2) is the load-bearing one. An unusable pool builds NO allocator in the
+// dataplane — the Rust parse loop gates its PendingPoolAllocator on
+// `pool_failure.is_none()`, so resolve_pool_allocators never charges it — and
+// charging it Go-side therefore refuses a HEALTHY pool the dataplane would
+// admit. That over-rejection lands on the tolerant load / peer-sync path
+// (#1960 no-brick), which is exactly the path an operator uses to recover.
+//
+// Scoped to what the pool DEFINITION already settles. A member string that Go
+// parses but the Rust expander rejects still reaches the dataplane and fails
+// there as InvalidPool; the budget walk covers that case separately by
+// skipping a pool whose expanded address count is zero.
+func SourceNATPoolUnusableReason(pool *NATPool) string {
+	if pool == nil {
+		return "missing_pool"
+	}
+	reason := ""
+	members := SourceNATPoolMembers(pool)
+	if len(members) == 0 {
+		reason = "empty_pool"
+	}
+	// #5875: an IPv6 member carrying a `%<zone>` qualifier is not
+	// dataplane-representable (std::net::IpAddr has no zone model).
+	for _, a := range members {
+		if PoolAddressHasZoneScope(a) {
+			reason = "zone_scoped_pool_address"
+			break
+		}
+	}
+	if _, _, ok := SourceNATPoolPortRange(pool); !ok {
+		reason = "invalid_port_range"
+	}
+	return reason
+}
+
 // sourceNATAggregatePoolCharge is one DISTINCT referenced pool's charge
 // against the #5877 aggregate budgets: its expanded address cardinality and
 // its port capacity (addresses x port range = occupancy bitmap slots).
@@ -2921,25 +3028,40 @@ type sourceNATAggregatePoolCharge struct {
 }
 
 // sourceNATAggregateReferencedCharges walks the DISTINCT pools a pool-mode
-// `then source-nat pool <name>` rule references — the exact set
-// `parse_source_nat_rules` (userspace-dp/src/nat/source.rs) expands into a
-// PortAllocator — and returns each pool's budget charge in deterministic
-// first-reference order (rule-sets sorted by name, rules in config order,
-// pools deduped by name). This is the SINGLE source of truth for the #5877
-// aggregate scoping + charge arithmetic: the strict validator
-// (validateSourceNATAggregateCardinalityStrict) sums it for the whole-config
-// reject, and SourceNATAggregateOverBudgetPools (#6812) first-fits it for
-// the tolerant snapshot poison, so the two can never drift on what is
+// `then source-nat pool <name>` rule references and returns each pool's budget
+// charge in deterministic first-reference order (rule-sets sorted by name,
+// rules in config order, pools deduped by name). This is the SINGLE source of
+// truth for the #5877 aggregate scoping + charge arithmetic: the strict
+// validator (validateSourceNATAggregateCardinalityStrict) sums it for the
+// whole-config reject, and SourceNATAggregateOverBudgetPools (#6812) first-fits
+// it for the tolerant snapshot poison, so the two can never drift on what is
 // counted or how.
 //
-// An unreferenced pool never reaches the allocator path and builds no
-// allocator, so it is out of scope (a NAT64-referenced pool uses the
-// separate parse_pool_v4 path and is bounded by isNAT64PoolHostAddress, not
-// here). Because the strict gate runs AFTER the grammar gate in
-// runUniformGates, every counted member is already validated (parseable,
-// host count <= MaxSourceNATPoolPrefixHosts) on the strict path, so the sums
-// are accurate; the saturating arithmetic only matters on the tolerant path,
-// where a still-over-cap member trips the budget rather than wrapping.
+// SCOPE — the charged set is exactly the set `parse_source_nat_rules`
+// (userspace-dp/src/nat/source.rs) expands into a PortAllocator, which means
+// THREE exclusions, each one a pool that reaches the dataplane and builds
+// nothing:
+//
+//   - UNREFERENCED. No pool-mode rule names it, so it never reaches the
+//     allocator path. (A NAT64-referenced pool uses the separate parse_pool_v4
+//     path and is bounded by isNAT64PoolHostAddress, not here.)
+//   - ALREADY UNUSABLE (#6812 F1). SourceNATPoolUnusableReason is non-empty —
+//     empty membership, a `%zone` member, a rejected port range — so the
+//     snapshot ships it poisoned and the Rust parse loop, which gates its
+//     PendingPoolAllocator on `pool_failure.is_none()`, never charges it.
+//   - ZERO EXPANDED ADDRESSES. Every member fails to parse, so Rust's
+//     `total_pool > 0` gate skips the rule and fails it as InvalidPool instead.
+//
+// Charging any of the three would make this walk refuse a HEALTHY pool that
+// resolve_pool_allocators admits — over-rejection, landing on the tolerant
+// recovery path (#1960 no-brick) where a peer-sync or lenient load is how an
+// operator gets back to a working state.
+//
+// Because the strict gate runs AFTER the grammar gate in runUniformGates, every
+// counted member is already validated (parseable, host count <=
+// MaxSourceNATPoolPrefixHosts) on the strict path, so the sums are accurate;
+// the saturating arithmetic only matters on the tolerant path, where a
+// still-over-cap member trips the budget rather than wrapping.
 func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCharge {
 	if cfg == nil {
 		return nil
@@ -2972,12 +3094,27 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 				// Undefined reference — validateNATPoolReferencesStrict (#5626).
 				continue
 			}
-			var poolAddrs uint64
-			if pool.Address != "" {
-				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(pool.Address))
+			// #6812 F1: a pool the snapshot builder ALREADY marks unusable
+			// (empty / zone-scoped member / invalid port range) never becomes a
+			// PendingPoolAllocator in Rust — the parse loop gates on
+			// `pool_failure.is_none()` — so resolve_pool_allocators neither
+			// charges it nor lets it occupy a slot. Charging it here would
+			// refuse a HEALTHY pool the dataplane admits, which is the wrong
+			// direction on the tolerant recovery path.
+			if SourceNATPoolUnusableReason(pool) != "" {
+				continue
 			}
-			for _, a := range pool.Addresses {
+			var poolAddrs uint64
+			for _, a := range SourceNATPoolMembers(pool) {
 				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(a))
+			}
+			if poolAddrs == 0 {
+				// Every member is unparseable, so the Rust expander yields
+				// total_pool == 0 and the same `allocator_key()` gate skips the
+				// rule (it fails as InvalidPool at the boundary instead). Not
+				// reachable via SourceNATPoolUnusableReason above: the members
+				// exist, they just do not expand.
+				continue
 			}
 			// Port range mirrors the Rust allocator's defaulting (source.rs): an
 			// unset/zero low/high defaults to 1024/65535, and a reversed range yields
@@ -3016,9 +3153,17 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 // pools = 12,683,575,296 bitmap bits, ~1.48 GiB). The Rust apply boundary
 // independently enforces the same budgets (resolve_pool_allocators in
 // userspace-dp/src/nat/source.rs) as the final backstop; the first-fit
-// admission rule here mirrors it exactly, so Go and the dataplane agree on
-// WHICH pools live. Strict-commit configs never reach the builder over
-// budget, so the poison only ever fires on the tolerant path that needs it.
+// admission rule here mirrors it exactly — same order, same charge, and (since
+// #6812 F1) the same EXCLUSIONS, see sourceNATAggregateReferencedCharges — so
+// Go and the dataplane agree on WHICH pools live. That agreement is a tested
+// claim, not an asserted one: TestAggregateBudgetExcludesUnusablePools_6812
+// (this package) and TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812
+// (pkg/dataplane/userspace) drive the Go half, and
+// production_entry_admits_a_healthy_pool_after_failed_pools_6812
+// (userspace-dp/src/nat/tests_aggregate_budget.rs) drives the same scenario
+// through the Rust production entry. Strict-commit configs never reach the
+// builder over budget, so the poison only ever fires on the tolerant path that
+// needs it.
 func SourceNATAggregateOverBudgetPools(cfg *Config) map[string]bool {
 	charges := sourceNATAggregateReferencedCharges(cfg)
 	if len(charges) == 0 {
@@ -3056,7 +3201,13 @@ func SourceNATAggregateOverBudgetPools(cfg *Config) map[string]bool {
 // commit-apply. Fail-closed at COMMIT, before apply constructs any allocator.
 //
 // The walk (scoping + charge arithmetic) is sourceNATAggregateReferencedCharges;
-// this validator sums the charges for the whole-config reject.
+// this validator sums the charges for the whole-config reject. Since #6812 F1
+// that walk skips pools already destined to be unusable, so they no longer
+// inflate this sum either — which is a no-op on the strict path (their own
+// gates, validateSourceNATPoolStrict / validateSourceNATPoolAddressScopeStrict,
+// run EARLIER in runUniformGates and reject the config first) and correct on
+// the resource question regardless: a pool that builds no allocator costs no
+// allocator memory.
 //
 // Strict on commit / commit-check (hard-reject naming the exceeded budget and by
 // how much); the call site (runUniformGates) downgrades it to a warning on the

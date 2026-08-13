@@ -1,11 +1,11 @@
 [REFACTOR]   5193  userspace-dp/src/afxdp/poll_descriptor/mod.rs
 [REFACTOR]   3770  userspace-dp/src/policy.rs
+[REFACTOR]   3666  pkg/config/compiler_validate_strict_nat.go
 [REFACTOR]   3565  userspace-dp/src/nat64.rs
-[REFACTOR]   3433  pkg/config/compiler_validate_strict_nat.go
 [REFACTOR]   2605  pkg/config/compiler_system.go
+[REFACTOR]   2488  userspace-dp/src/nat/allocator.rs
 [REFACTOR]   2462  pkg/policymatch/policymatch.go
 [REFACTOR]   2459  userspace-dp/src/afxdp/worker/loop_body/mod.rs
-[REFACTOR]   2458  userspace-dp/src/nat/allocator.rs
 [REFACTOR]   2358  pkg/daemon/daemon_nft.go
 [REFACTOR]   2310  userspace-dp/src/afxdp/neighbor.rs
 [REFACTOR]   2288  pkg/ddns/surface_a.go
@@ -17,6 +17,7 @@
 [REFACTOR]   2074  pkg/dhcprelay/relay.go
 [REFACTOR]   2073  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
+[REFACTOR]   2035  userspace-dp/src/nat/source.rs
 [REFACTOR]   2034  userspace-dp/src/afxdp/frame/mod.rs
 [WATCH]      1990  pkg/grpcapi/server_sessions.go
 [WATCH]      1953  pkg/dataplane/userspace/maps_sync.go
@@ -30,7 +31,6 @@
 [WATCH]      1819  userspace-dp/src/afxdp/types/cos.rs
 [WATCH]      1795  userspace-dp/src/afxdp/wg/engine.rs
 [WATCH]      1794  pkg/daemon/daemon_ha.go
-[WATCH]      1765  userspace-dp/src/nat/source.rs
 [WATCH]      1764  userspace-dp/src/screen/scan.rs
 [WATCH]      1718  pkg/config/types_system.go
 [WATCH]      1639  pkg/api/sessions.go

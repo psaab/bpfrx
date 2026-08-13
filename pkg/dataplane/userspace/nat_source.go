@@ -95,48 +95,31 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 					poolUnusable = true
 					poolUnusableReason = "missing_pool"
 				} else {
-					if pool.Address != "" {
-						poolAddresses = append(poolAddresses, pool.Address)
-					}
-					poolAddresses = append(poolAddresses, pool.Addresses...)
-					if len(poolAddresses) == 0 {
-						slog.Warn("userspace snapshot: marking source NAT rule with empty pool unusable",
-							"rule", rule.Name, "pool", rule.Then.PoolName)
-						poolUnusable = true
-						poolUnusableReason = "empty_pool"
-					}
-					// #5875: an IPv6 pool address carrying a `%<zone>` scope
-					// qualifier (`fe80::1%eth0`) is not dataplane-representable —
-					// the Rust allocator parses each member as std::net::IpAddr,
-					// which has no zone model, so expand_pool_address returns false
-					// and the whole pool is marked InvalidPool and dropped. The
-					// strict commit gate (validateSourceNATPoolAddressScopeStrict)
-					// hard-rejects this; on the tolerant load / peer-sync path that
-					// gate only warns, so fail CLOSED here — mark the pool unusable
-					// rather than ship the unparseable string to Rust. A global SNAT
-					// pool address never needs an interface scope.
-					for _, a := range poolAddresses {
-						if config.PoolAddressHasZoneScope(a) {
-							slog.Warn("userspace snapshot: marking source NAT rule with zone-scoped pool address unusable",
-								"rule", rule.Name, "pool", rule.Then.PoolName, "address", a)
-							poolUnusable = true
-							poolUnusableReason = "zone_scoped_pool_address"
-							break
-						}
-					}
+					poolAddresses = config.SourceNATPoolMembers(pool)
 					// #3906: `port no-translation` preserves the source port.
 					// The dataplane takes the address-only path and ignores the
 					// port range in this mode, so a defaulted/valid range is
 					// fine even when no-translation is set.
 					poolNoTranslation = pool.PortNoTranslation
-					var valid bool
-					portLow, portHigh, valid = sourceNATPoolPortRange(pool)
-					if !valid {
-						slog.Warn("userspace snapshot: marking source NAT rule with invalid pool port range unusable",
-							"rule", rule.Name, "pool", rule.Then.PoolName,
+					portLow, portHigh, _ = config.SourceNATPoolPortRange(pool)
+					// #6812 F1: ONE predicate decides a pool is unusable from its
+					// DEFINITION — empty membership, a `%zone` member that is not
+					// dataplane-representable (#5875), or a port range the parser
+					// rejected (#5457). config.SourceNATPoolUnusableReason is the
+					// SSOT that the aggregate budget walk
+					// (sourceNATAggregateReferencedCharges) also reads to EXCLUDE
+					// such a pool from the budget, so the set this builder poisons
+					// and the set the budget charges cannot drift apart. Before
+					// they shared it, the 1,024 pools this loop marked unusable
+					// still consumed the whole pool-count budget and the next
+					// healthy pool was poisoned "aggregate_over_budget" — a pool
+					// the dataplane would have installed.
+					if reason := config.SourceNATPoolUnusableReason(pool); reason != "" {
+						slog.Warn("userspace snapshot: marking source NAT rule with unusable pool",
+							"rule", rule.Name, "pool", rule.Then.PoolName, "reason", reason,
 							"port_low", pool.PortLow, "port_high", pool.PortHigh)
 						poolUnusable = true
-						poolUnusableReason = "invalid_port_range"
+						poolUnusableReason = reason
 					}
 					// #6812: a pool that does not fit the #5877 aggregate
 					// cardinality budget on the TOLERANT path is marked
@@ -550,28 +533,7 @@ func deterministicSourceNATFields(pool *config.NATPool, portLow, portHigh uint16
 	return 1, uint16(det.BlockSize), uint16(bpi), binary.BigEndian.Uint32(base), hc
 }
 
-func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
-	if pool == nil {
-		return 0, 0, false
-	}
-	// #5457: an explicitly-configured but invalid port range (rejected by
-	// parseSourcePoolPortRange; PortLow/PortHigh left at the default) must NOT
-	// silently install the defaulted 1024-65535 range on the tolerant load /
-	// peer-sync path. Mark the pool unusable so it installs nothing rather than
-	// translating over a range the operator did not configure.
-	if pool.PortRangeInvalidSpec != "" {
-		return 0, 0, false
-	}
-	low := pool.PortLow
-	if low == 0 {
-		low = 1024
-	}
-	high := pool.PortHigh
-	if high == 0 {
-		high = 65535
-	}
-	if low < 1 || high < 1 || low > 65535 || high > 65535 || low > high {
-		return 0, 0, false
-	}
-	return uint16(low), uint16(high), true
-}
+// sourceNATPoolPortRange moved to config.SourceNATPoolPortRange in #6812 F1 —
+// the aggregate budget walk (pkg/config) has to read the SAME "is this pool's
+// port range usable" verdict this builder does, or it charges budget for pools
+// that install nothing. See config.SourceNATPoolUnusableReason.
