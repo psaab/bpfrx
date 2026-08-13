@@ -1705,39 +1705,10 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		}
 		// #6691 round 8: same redirect, same refusal. An alias here would tell
 		// the shim to treat frames on the child as arriving on a netdev the
-		// dataplane refused to bind.
-		//
-		// INERT ON EVERY CONFIG REACHABLE TODAY — and round 8 said so having
-		// checked only ONE of the six exclusion classes, which a review round
-		// was right to reject. It was in fact LIVE at that revision: on
-		// `set interfaces ge-0/0/5 unit 0 tunnel ...` with a zoned
-		// `unit 100 vlan-id 100`, severing this line alone changed the alias
-		// table from map[] to map[31:30] (measured). That reachability was the
-		// round-9 blocker, not a feature, and it is gone with it — the netdev
-		// there has a bindable owner and is no longer refused at all.
-		//
-		// The claim re-checked per class, since one class is not an
-		// enumeration:
-		//
-		//   - Tunnel, fxp/em/fab/lo0 name. A VLAN child INHERITS the parent's
-		//     exclusion (the name arms read the shared base name; the Tunnel
-		//     flag ORs the parent's), so the child is dropped by
-		//     userspaceSkipsIngressInterface at the top of this loop and never
-		//     reaches here.
-		//   - LocalFabric, mgmt/control. Not device-level at all, so the parent
-		//     is not in the refused index and there is nothing to ask.
-		//   - SecureTunnel. The child does NOT inherit — that is the F1
-		//     mechanism — but its own netdev is `st<N>.<vlan>`, which the xfrmi
-		//     reconciler never creates and which the kernel cannot create as a
-		//     VLAN on an ARPHRD_NONE parent. Ifindex 0, so the guard above drops
-		//     it first.
-		//
-		// The guard is retained because the invariant is about this SITE, not
-		// about today's reachability: if a child netdev ever does resolve here
-		// — which is exactly what #5619 did for three of the four secure-tunnel
-		// spellings — the alias table must not become the one place the refusal
-		// is not asked. TestAliasTableRefusesEvenWhenTheChildNetdevResolves
-		// constructs that state directly and is the fail-on-revert guard.
+		// dataplane refused to bind. This site is inert on every config
+		// reachable today and is guarded anyway — the reachability analysis,
+		// per exclusion class, is in userspaceRefusedNetdevs
+		// (ingress_exclusions.go), which owns the contract.
 		if refused.refusesIfindex(iface.ParentIfindex) {
 			continue
 		}

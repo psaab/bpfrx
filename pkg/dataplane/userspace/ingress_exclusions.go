@@ -414,6 +414,36 @@ func userspaceOwnsItsNetdev(iface InterfaceSnapshot) bool {
 // aliases are ifindex-keyed, while the RSS allowlist is name-keyed and is
 // derived (UserspaceBoundLinuxInterfaces) without resolving ifindexes at all.
 //
+// WHICH CONSUMERS THE INDEX CAN ACTUALLY FIRE FOR. Two of the three
+// set-changing sites are live on reachable configs; the binding-alias table
+// (buildUserspaceIngressBindingAliases, maps_sync.go) is INERT — and round 8
+// said so having checked only ONE of the six exclusion classes, which a review
+// round was right to reject. It was in fact LIVE at that revision: on
+// `set interfaces ge-0/0/5 unit 0 tunnel ...` with a zoned
+// `unit 100 vlan-id 100`, severing that guard alone changed the alias table
+// from map[] to map[31:30] (measured). That reachability was the round-9
+// blocker, not a feature, and it is gone with it — the netdev there has a
+// bindable owner and is no longer refused at all. Re-checked per class, since
+// one class is not an enumeration:
+//
+//   - Tunnel, fxp/em/fab/lo0 name. A VLAN child INHERITS the parent's exclusion
+//     (the name arms read the shared base name; the Tunnel flag ORs the
+//     parent's), so the child is dropped by userspaceSkipsIngressInterface
+//     before that loop consults the index.
+//   - LocalFabric, mgmt/control. Not device-level at all, so the parent never
+//     enters this index and there is nothing to ask.
+//   - SecureTunnel. The child does NOT inherit — that is the F1 mechanism — but
+//     its own netdev is `st<N>.<vlan>`, which the xfrmi reconciler never creates
+//     and which the kernel cannot create as a VLAN on an ARPHRD_NONE parent. It
+//     reports ifindex 0 and the `Ifindex <= 0` guard drops it first.
+//
+// That guard is retained because the invariant is about the SITE, not about
+// today's reachability: if a child netdev ever does resolve there — which is
+// exactly what #5619 did for three of the four secure-tunnel spellings — the
+// alias table must not become the one place the refusal is not asked.
+// TestAliasTableRefusesEvenWhenTheChildNetdevResolves constructs that state
+// directly and is the fail-on-revert guard.
+//
 // Scope: built from rows, so it can only refuse a netdev some row OWNS. That is
 // sufficient here because every unit row's parent netdev is the base row's
 // netdev, and a unit exists only under a base in cfg.Interfaces.Interfaces — so

@@ -180,6 +180,14 @@
   | R1 | `snapshot_refuses_parent_netdev`: EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner_is_not_refused`) |
   | R2 | `snapshot_refuses_parent_netdev`: refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit_its_refused_parent`) |
 
+  **maps_sync.go spends none of the headroom round 8 bought it.** The
+  per-class inertness analysis was first written at the alias call site, which
+  took the file 1958 -> 1986 against the 2000-line refactor threshold — the
+  exact "a comment grows the file" pattern the round-8 split existed to undo.
+  It is a property of the refusal CONTRACT, not of the alias builder, so it
+  lives in `userspaceRefusedNetdevs` with a one-line pointer at the site:
+  maps_sync.go 1957, one line below where round 9 found it.
+
   **R2's first run reported SURVIVED and the HARNESS was the defect**, recorded
   because a mutation harness that silently under-runs inverts its own result:
   the driver's Rust test list omitted
