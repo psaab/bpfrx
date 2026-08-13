@@ -1,3 +1,73 @@
+## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
+
+- **Timestamp**: 2026-08-12 (fix/5173-shim-queue-mis-steer, PR #6676)
+- **Action**: re-verified the only findable verdict against the head instead of
+  folding it blind; recorded why the guards resist the substitution class.
+- **File(s)**: _Log.md
+
+NO CODE CHANGED. Every finding this round was re-run against `3f6faf297` and
+every one of them is already answered. Writing a guard for a hole that probes
+say is closed is how a test becomes decoration, and this PR has eight rounds of
+that behind it.
+
+THE r9 BRIEF COULD NOT BE RECOVERED. Task #136 carried one line — "F1
+binding_slot callee substitution unbound" — with no artefact path, and there is
+no verdict at the head: the newest PR comment is the Codex leg at `1275efbf5`
+dated 2026-08-01, six days older. Rather than guess, the finding was derived
+from the code and probed.
+
+F1 AS DERIVED DOES NOT REPRODUCE — three substitution shapes, three guards:
+
+  - a local `fn binding_slot` shadowing the import, call statement byte-identical
+    -> caught, `shim_index_path_has_one_construction_and_one_lookup`
+  - a cross-file module exporting the identical `pub fn binding_slot` signature
+    -> caught, same guard, crate-wide signature count (left: 2, right: 1)
+  - rename-on-import (`use queue_index2::slot as binding_slot`) — ONE signature
+    crate-wide, call statement byte-identical -> caught, `RawRxQueue` tally
+    ("must be named exactly 8 times ... was named 10")
+
+WHY THE THIRD MATTERS, and it is the part worth keeping. It was expected to
+pass: it defeats the call-statement pin AND the one-signature rule. It fails
+because any substitute must ACCEPT a `RawRxQueue`, and that name is tallied
+EXACTLY, crate-wide — so the newtype functions as a CAPABILITY TOKEN and an
+imported substitute cannot pay the mention cost. That is a stronger property
+than "formatting-insensitive source-spelling test" suggests, and it is the same
+tally called fungible in round 8. Recorded here because the next reviewer will
+reach for that same objection; the counter-evidence should be findable rather
+than re-derived.
+
+Through all three, `shim_binding_slot_never_leaves_its_interfaces_row` stayed
+GREEN — consistent with the shape of the finding, since it binds the
+`#[path]`-included file rather than production's resolution. The GUARDS close
+this class, not the executable test.
+
+BOTH AUG-1 CODEX ESCAPES ARE CLOSED AT THIS HEAD, re-run rather than assumed:
+
+  - escape 1, `let rx_queue_index = rx_queue_index % 2` transforming the RAW ctx
+    field before the identity -> RED at main_tests.rs:3223, the construction
+    statement pin ("the coordinate must be wrapped by exactly this statement,
+    once ... found 0 occurrence(s)"). This is the head commit's own "bind the ctx
+    escape" work firing.
+  - escape 2, a CROSS-FILE raw fallback computing the aliased adjacent row from
+    `ingress_ifindex` and the raw queue, with BOTH pinned statements left
+    byte-identical -> RED at main_tests.rs:3183, the one-binding-map-read rule
+    ("the shim crate must contain exactly ONE binding-map read; found
+    ["lib.rs", "lib.rs"]").
+
+The Aug-1 leg's prescribed fix — extract the index computation into a
+`core`-only function and drive it from a host test over out-of-stride
+coordinates — is ALREADY IMPLEMENTED: `binding_slot` lives in
+userspace-xdp/src/binding_index.rs and
+`shim_binding_slot_never_leaves_its_interfaces_row` drives it over a queue axis
+that straddles the stride, asserting `None` above it. So the MERGE-NEEDS-MAJOR
+is answered by the head, and re-doing the extraction would have been the #6871
+mistake — moving an unbound edge to a new call site rather than closing one.
+
+Baseline after every probe was restored: `git status` clean, 14 shim tests pass,
+0 failed. No production code, no shim `.o`, and no manifest input changed by this
+round, so this commit adds no new cluster-smoke obligation; the PR's existing one
+(the `.o` changed earlier in its history) stands and is the parent's to schedule.
+
 ## 2026-08-07 — #5173 round 8: three completeness claims were FALSE; `ctx` was the escape
 
 - **Timestamp**: 2026-08-07 (fix/5173-shim-queue-mis-steer, PR #6676)
