@@ -301,8 +301,43 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     // The two planes now agree by CONSTRUCTION rather than by convention: the
     // Go side computes the flag once and ships it, so there is no Rust-side
     // rule to keep in sync. An older control plane that omits the field leaves
-    // it false and the xfrmi gets a binding it cannot use — the gap below,
-    // which is the safer direction.
+    // it false — see `ensureSecureTunnelProtocolLocked` (manager_compile.go),
+    // the #6691 round 8 gate that disarms such a helper rather than letting it
+    // plan the binding this arm exists to refuse.
+    //
+    // WHY, in the order the reasons can actually be established (#6691 round 8).
+    //
+    // 1. IT COLLAPSES THE WHOLE BOX TO ONE QUEUE. This is the load-bearing
+    //    reason and it is provable right here. An xfrm interface has exactly
+    //    ONE RX queue — `ip -d link` reports `numrxqueues 1` and
+    //    `/sys/class/net/<if>/queues` holds a single `rx-0`, which is what both
+    //    `rx_queue_count` (below) and the Go `userspaceRXQueueCount` read — and
+    //    `replan_bindings_from_candidates` takes the GLOBAL MINIMUM queue count
+    //    across every candidate. So one zoned xfrmi drags every physical
+    //    interface on the box down to one queue and one worker: the #3091
+    //    ~6 Gbps single-worker regression, arriving through a different door
+    //    than the VLAN child that #3091 named.
+    //    `secure_tunnel_would_collapse_the_global_queue_count` (main_tests.rs)
+    //    is the fail-on-revert guard, and it asserts the QUEUE COUNT rather
+    //    than plan identity so the reason is visible in the failure.
+    //
+    // 2. And it cannot be half-admitted. Keeping the xfrmi in the shim's
+    //    ingress-adjudication map while withholding its binding is precisely
+    //    the configuration the shim drops: an ingress-claimed ifindex with no
+    //    READY binding takes `drop_degraded_transit`
+    //    (userspace-xdp/src/lib.rs, BINDING_MISSING). The two sets move
+    //    together or transit dies.
+    //
+    // NOT ASSERTED, deliberately: whether an XSK can come up on an
+    // ARPHRD_NONE virtual netdev at all. Zero-copy plainly cannot (no
+    // `ndo_bpf`/`ndo_xsk_wakeup`), but zero-copy is not required for every
+    // socket role — `XskSocketRole::Private` returns false from
+    // `requires_zerocopy` (afxdp/bind.rs), a generic-XDP interface is offered
+    // `COPY_ONLY_BIND_FLAGS`, and a failed shared-UMEM group falls back to a
+    // private socket automatically (`fallback_shared_group_to_private`). So a
+    // copy-mode binding is REACHABLE in this code and earlier rounds of this
+    // comment were wrong to say the bind could not happen. Settling it needs a
+    // live NIC. Reason 1 does not depend on the answer.
     if iface.secure_tunnel {
         return false;
     }

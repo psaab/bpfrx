@@ -38,7 +38,23 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// zones dropped from the scope. A compatibility extension that changes
 /// deny/reject COVERAGE must not be silently ignorable under an unchanged
 /// protocol version.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 4;
+///
+/// v5 (#5619 / #6691): `InterfaceSnapshot.secure_tunnel` is AUTHORITATIVE over
+/// AF_XDP binding admission — `include_userspace_binding_interface` refuses a
+/// candidate on it (server/helpers/planning.rs). A helper that predates the
+/// field leaves it `false` and plans the xfrmi anyway, and because
+/// `replan_bindings_from_candidates` takes the GLOBAL MINIMUM queue count and
+/// an xfrm interface has exactly ONE RX queue, that re-plans EVERY physical
+/// interface on the box onto one queue and one worker — the #3091
+/// single-worker regression, on a config the new control plane believes is
+/// safe. Additive-and-ignorable is exactly the shape #5488 was: a new field
+/// that changes how existing bytes behave needs the version, not just the tag.
+///
+/// The bump alone only makes the old helper REFUSE the snapshot and keep
+/// forwarding its previous-good image, so it is paired with
+/// `ensureSecureTunnelProtocolLocked` (pkg/dataplane/userspace/
+/// manager_compile.go), which disarms that helper and aborts the commit.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 5;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level

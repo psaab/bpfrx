@@ -345,3 +345,74 @@ func TestResolveKernelIfNameUsesTheAuthoredBindInterface(t *testing.T) {
 		})
 	}
 }
+
+// TestSecureTunnelOwnershipPrecedesVlanID pins the OTHER arm-order collision
+// (#6691 round 8), which had no doc and no test on either revision.
+//
+// `set interfaces st5 unit 3 vlan-id 80` makes the unit a VLAN child: its
+// kernel device is `st5.80` — parent netdev plus VLAN TAG, not plus unit
+// number. `set security ipsec vpn v bind-interface st5.3` makes the SAME unit
+// an xfrmi whose device is the authored ref, `st5.3`. Both arms claim the ref
+// and they name DIFFERENT devices, so the resolver's arm order decides which
+// one every ifindex-keyed set is programmed against.
+//
+// Strict compile ACCEPTS this config on master and on this branch — nothing
+// rejects the combination — so an operator can author it and the only signal is
+// which device the dataplane picks. The `st` arm is FIRST in both
+// snapshotLinuxName and ResolveKernelIfName, so ownership wins: the row
+// resolves to `st5.3`, the VLAN device `st5.80` is not what gets programmed,
+// and the secure-tunnel exclusion then applies to the row.
+//
+// This test does not argue that order is the right one — it pins it so it
+// cannot move silently, and names the consequence if it does: the two resolvers
+// would program a filter, a zone and a junos-host deny against two different
+// netdevs for one config ref.
+func TestSecureTunnelOwnershipPrecedesVlanID(t *testing.T) {
+	cfg := unownedStConfig(t,
+		"set interfaces st5 unit 3 vlan-id 80",
+		"set interfaces st5 unit 3 family inet address 10.9.9.1/24",
+		"set security ipsec vpn v bind-interface st5.3",
+		"set security zones security-zone trust interfaces st5.3",
+	)
+
+	// PREMISE: both arms really do claim this ref, and they disagree. Without
+	// the disagreement the ordering assertion orders nothing.
+	dev, owned := cfg.SecureTunnelNetdevForRef("st5.3")
+	if !owned || dev != "st5.3" {
+		t.Fatalf("premise broken: SecureTunnelNetdevForRef(st5.3) = (%q, %v), want (\"st5.3\", true)",
+			dev, owned)
+	}
+	iface := cfg.Interfaces.Interfaces["st5"]
+	if iface == nil || iface.Units[3] == nil || iface.Units[3].VlanID != 80 {
+		t.Fatalf("premise broken: st5 unit 3 must carry vlan-id 80, else the VLAN arm " +
+			"never competes for this ref")
+	}
+
+	var row InterfaceSnapshot
+	found := false
+	for _, s := range buildInterfaceSnapshots(cfg) {
+		if s.Name == "st5.3" {
+			row, found = s, true
+		}
+	}
+	if !found {
+		t.Fatal("no snapshot row for st5.3")
+	}
+	if row.LinuxName != dev {
+		t.Errorf("snapshotLinuxName(st5.3) = %q, want %q — `bind-interface` outranks "+
+			"`vlan-id`; a change here silently moves every ifindex-keyed set onto the "+
+			"VLAN device %q instead", row.LinuxName, dev, "st5.80")
+	}
+	if k := cfg.ResolveKernelIfName("st5.3"); k != dev {
+		t.Errorf("ResolveKernelIfName(st5.3) = %q, want %q — the two resolvers must agree "+
+			"on the arm order, or a filter/zone/junos-host deny is scoped to a different "+
+			"device than the snapshot programs", k, dev)
+	}
+	// And the ownership verdict is what the exclusion keys on, so the row must
+	// carry it: an operator who authors both spellings gets the secure-tunnel
+	// treatment, not the VLAN-child treatment.
+	if !row.SecureTunnel {
+		t.Errorf("st5.3 row SecureTunnel = false; the ref a VPN binds must be flagged " +
+			"even when the unit also carries a vlan-id")
+	}
+}

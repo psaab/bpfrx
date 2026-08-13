@@ -184,9 +184,15 @@ func TestSecureTunnelCollisionVetoRequiresAnOwner(t *testing.T) {
 					tc.wantLinux, tc.wantIfindex)
 			}
 
-			// The operator-visible consequence: a name on no box must not
-			// enter the AF_XDP/RSS allowlist, which is keyed by NAME and has
-			// no ifindex guard.
+			// The operator-visible consequence: the AF_XDP/RSS allowlist is
+			// keyed by NAME and has NO ifindex guard, so it follows whichever
+			// netdev the resolver picked — `st5.0` appears in it exactly when
+			// the resolution chose `st5.0`, existing or not. (#6691 round 8:
+			// an earlier version of this comment claimed the opposite, that a
+			// name on no box "must not enter" the allowlist. It does enter, by
+			// construction, and maps_sync.go says so for the sibling `st0`
+			// case. What this assertion pins is that the allowlist tracks the
+			// RESOLUTION, not that it filters on existence.)
 			bound := UserspaceBoundLinuxInterfaces(cfg)
 			if got := slices.Contains(bound, "st5.0"); got != (tc.wantLinux == "st5.0") {
 				t.Errorf("`st5.0` in the RSS/binding allowlist = %v (allowlist %v), want %v",

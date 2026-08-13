@@ -2389,15 +2389,31 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
 // ---------------------------------------------------------------------------
 //
 // Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers the
-// plaintext on the xfrmi netdev. The dataplane has no path to hand a plaintext
-// frame back INTO an xfrmi for the egress direction, and an xfrmi is a virtual
-// netdev with no `ndo_bpf`/`ndo_xsk_wakeup` so no XSK can bind zero-copy there.
+// plaintext on the xfrmi netdev, and the dataplane has no path to hand a
+// plaintext frame back INTO an xfrmi for the egress direction.
+//
+// THE REASON THAT IS PROVABLE HERE (#6691 round 8) is neither of those: an
+// xfrm interface has exactly ONE RX queue (`numrxqueues 1`; a lone `rx-0`
+// under `/sys/class/net/<if>/queues`), and the planner's queue count is the
+// GLOBAL MINIMUM across candidates. Admitting one therefore takes EVERY
+// physical interface on the box down to one queue and one worker — the #3091
+// single-worker regression. `secure_tunnel_would_collapse_the_global_queue_count`
+// asserts exactly that, and it is the guard to keep if the others are ever
+// rewritten.
+//
+// Earlier rounds of this comment asserted instead that "an XSK cannot come up
+// on a virtual netdev, so the shim would DROP the plaintext". Zero-copy indeed
+// cannot (no `ndo_bpf`/`ndo_xsk_wakeup`) — but zero-copy is not required for
+// every socket role (`XskSocketRole::Private` → `requires_zerocopy() == false`,
+// generic-XDP interfaces are offered `COPY_ONLY_BIND_FLAGS`, and a failed
+// shared-UMEM group falls back to a private socket). A copy-mode binding is
+// REACHABLE in this code, so that claim was never established; settling it
+// needs a live NIC. It is not asserted anywhere below.
 //
 // Before #5619 the xfrmi was kept out of the binding plan by ACCIDENT: the Go
 // snapshot resolved `st0.0` to the nonexistent netdev `st0`, so the unit
 // carried ifindex 0. #5619 fixed that name — which means this exclusion now has
-// to be stated deliberately, or a secure tunnel would be planned an XSK that
-// cannot come up and the shim would DROP the decrypted plaintext.
+// to be stated deliberately.
 
 /// The real planner must produce NO binding for a secure tunnel, while still
 /// planning the ordinary data interface beside it.
@@ -2449,10 +2465,9 @@ fn binding_candidate_excludes_secure_tunnel() {
     assert!(
         bindings.iter().all(|b| b.interface != "st0.0"),
         "the planner produced an AF_XDP binding for a secure tunnel (#5619). \
-         An XSK cannot come up on an xfrmi (virtual netdev, no ndo_bpf / \
-         ndo_xsk_wakeup), so the shim would claim the interface and \
-         drop_degraded_transit would DROP the decrypted plaintext — a dead \
-         tunnel, not a policy fix. Planned: {:?}",
+         An xfrmi has ONE RX queue and the planner's queue count is the global \
+         minimum, so admitting it collapses every physical interface to a \
+         single queue and a single worker (#3091). Planned: {:?}",
         bindings.iter().map(|b| &b.interface).collect::<Vec<_>>()
     );
     assert!(
@@ -2530,10 +2545,97 @@ fn secure_tunnel_adds_nothing_to_the_binding_plan() {
         key(&got),
         key(&want),
         "adding a route-based IPsec secure tunnel CHANGED the binding plan. The \
-         xfrmi must add nothing: an XSK cannot come up on a virtual netdev (no \
-         ndo_bpf / ndo_xsk_wakeup, so no zero-copy), so a binding planned for it \
-         would never go READY and the shim would drop the decrypted plaintext \
-         (#5619)"
+         xfrmi must add nothing: its single RX queue would become the global \
+         minimum and re-plan every other interface onto one queue (#5619 / \
+         #3091). See secure_tunnel_would_collapse_the_global_queue_count for \
+         the queue count itself, which is the property this identity check is \
+         standing in for."
+    );
+}
+
+/// #6691 round 8: the exclusion's LOAD-BEARING reason, asserted directly.
+///
+/// The two guards above assert plan IDENTITY. Identity changes for several
+/// reasons at once, so a reader learns from them that the tunnel must add
+/// nothing, but not WHY admitting it is harmful. The why is a number:
+///
+/// `replan_bindings_from_candidates` computes
+/// `queue_count = candidates.iter().map(|(_, rx)| *rx).min()` — the GLOBAL
+/// MINIMUM — and an xfrm interface has exactly ONE RX queue. Measured on a
+/// real device in a network namespace: `ip -d link show xfrm0` reports
+/// `numrxqueues 1`, and `/sys/class/net/xfrm0/queues/` contains exactly
+/// `rx-0` + `tx-0`. That single `rx-*` entry is what BOTH planes count —
+/// `rx_queue_count` here and `userspaceRXQueueCount` in
+/// pkg/dataplane/userspace/interfaces.go.
+///
+/// So admitting one zoned xfrmi does not cost the tunnel a binding; it costs
+/// the WHOLE BOX its queues. This is the #3091 single-worker regression
+/// (~6 Gbps) arriving through a door #3091 did not name, and unlike the
+/// XSK-cannot-bind story it needs no NIC to demonstrate.
+///
+/// FAIL-ON-REVERT: delete `if iface.secure_tunnel { return false; }` from
+/// `include_userspace_binding_interface` and the LAN interface's planned queue
+/// count drops from 4 to 1.
+#[test]
+fn secure_tunnel_would_collapse_the_global_queue_count() {
+    use crate::server::helpers::replan_queues;
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/1".to_string(),
+        linux_name: "ge-0-0-1".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 11,
+        rx_queues: 4,
+        ..Default::default()
+    };
+    let tunnel = InterfaceSnapshot {
+        name: "st0.0".to_string(),
+        secure_tunnel: true,
+        linux_name: "st0.0".to_string(),
+        zone: "vpn".to_string(),
+        ifindex: 42,
+        // The measured xfrmi property. If this ever stops being 1 the premise
+        // is gone and so is the reason for the exclusion.
+        rx_queues: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        tunnel.rx_queues, 1,
+        "premise: an xfrm interface has exactly one RX queue"
+    );
+    assert!(
+        lan.rx_queues > tunnel.rx_queues,
+        "premise: the LAN must have MORE queues than the tunnel, or the \
+         minimum cannot move and this test is vacuous"
+    );
+
+    let bindings = replan_queues(
+        Some(&ConfigSnapshot {
+            interfaces: vec![lan.clone(), tunnel],
+            ..Default::default()
+        }),
+        4,
+        &[],
+    );
+
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-1")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN interface was planned onto {} queue(s), not its own {}. A \
+         secure tunnel entered the candidate list, and its single RX queue \
+         became the global minimum — every physical interface on the box is \
+         now one queue and one worker (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
     );
 }
 

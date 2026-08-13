@@ -34,7 +34,19 @@ const (
 	// ensureScopedGlobalZoneSetProtocolLocked required-protocol gate in
 	// manager_compile.go, which DISARMS the helper and aborts the commit
 	// when the running helper is too old to represent a multi-zone scope.
-	ProtocolVersion                  = 4
+	//
+	// v5 (#5619 / #6691): InterfaceSnapshot.SecureTunnel became AUTHORITATIVE
+	// over AF_XDP binding admission — the helper's
+	// include_userspace_binding_interface refuses a candidate on it. A helper
+	// that predates the field leaves it false and plans the xfrmi anyway, and
+	// since the helper's queue count is the GLOBAL MINIMUM across candidates
+	// and an xfrm interface has exactly ONE RX queue, that re-plans EVERY
+	// physical interface onto one queue and one worker — the #3091
+	// single-worker regression, silently, on a config this control plane
+	// believes is safe. The same-version equality check cannot see it, which
+	// is why the field needed the version and not just a new JSON tag.
+	// Paired with ensureSecureTunnelProtocolLocked (manager_compile.go).
+	ProtocolVersion                  = 5
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 

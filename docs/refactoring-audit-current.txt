@@ -14,7 +14,6 @@
 [REFACTOR]   2258  userspace-dp/src/afxdp/cos/queue_service/mod.rs
 [REFACTOR]   2227  userspace-dp/src/session/mod.rs
 [REFACTOR]   2165  pkg/config/compiler_services.go
-[REFACTOR]   2076  pkg/dataplane/userspace/maps_sync.go
 [REFACTOR]   2074  pkg/dhcprelay/relay.go
 [REFACTOR]   2073  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
@@ -23,6 +22,7 @@
 [WATCH]      1950  pkg/dataplane/compiler.go
 [WATCH]      1947  pkg/api/metrics_userspace.go
 [WATCH]      1932  pkg/ddns/manager.go
+[WATCH]      1925  pkg/dataplane/userspace/maps_sync.go
 [WATCH]      1892  pkg/config/compiler_validate_warn.go
 [WATCH]      1831  userspace-dp/src/afxdp/worker/mod.rs
 [WATCH]      1829  pkg/config/compiler_validate_strict_filter.go

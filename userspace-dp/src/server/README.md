@@ -178,12 +178,37 @@ out of the ingress-adjudication map and the RSS allowlist.
 
 Route-based IPsec decrypts in the **kernel** XFRM stack, which delivers the
 plaintext on the xfrmi netdev (`xfrmi_rcv_cb` sets `skb->dev`, then
-`xfrm_input` → `gro_cells_receive` → `__netif_receive_skb_core`). The
+`xfrm_input` → `gro_cells_receive` → `__netif_receive_skb_core`), and the
 dataplane has no path to hand a plaintext frame back *into* an xfrmi for the
-egress direction, and an xfrmi is a virtual netdev with no
-`ndo_bpf`/`ndo_xsk_wakeup` so an XSK cannot bind zero-copy there. Admitting it
-would make the shim claim the interface, find no usable binding, and
-`drop_degraded_transit` would DROP the decrypted plaintext — a dead tunnel.
+egress direction.
+
+The reason the exclusion is **load-bearing**, and the one that can be
+demonstrated without a NIC, is the queue count. An xfrm interface has exactly
+**one** RX queue (`ip -d link` reports `numrxqueues 1`;
+`/sys/class/net/<if>/queues` holds a single `rx-0`), and
+`replan_bindings_from_candidates` takes the **global minimum** queue count
+across every candidate. One zoned xfrmi therefore re-plans *every physical
+interface on the box* onto a single queue and a single worker — the #3091
+single-worker regression by another route.
+`secure_tunnel_would_collapse_the_global_queue_count` is the fail-on-revert
+guard. It is also why the exclusion cannot be split: an ifindex left in the
+shim's ingress-adjudication map with no READY binding takes
+`drop_degraded_transit` (`userspace-xdp/src/lib.rs`, `BINDING_MISSING`), so
+"adjudicate but do not bind" is the dead-tunnel configuration, not a
+compromise.
+
+Earlier revisions of this section claimed instead that an XSK *cannot come up*
+on a virtual netdev, so admitting the interface would find no usable binding
+and drop the plaintext. Zero-copy indeed cannot bind there, but zero-copy is
+not required for every socket role: `XskSocketRole::Private` returns `false`
+from `requires_zerocopy`, `bind_flag_candidates_for_interface` offers a
+generic-XDP interface `COPY_ONLY_BIND_FLAGS`, and a failed shared-UMEM group
+falls back to a private socket (`fallback_shared_group_to_private`). A
+copy-mode binding is reachable in this code, so that claim was never
+established and is not relied on here.
+
+**The cost is a policy gap, not a drop.** Decrypted plaintext traverses Linux
+routing with no xpf zone policy. That is #5619's open half, tracked in #6700.
 
 Before #5619 the exclusion happened by **accident**: the Go snapshot resolved
 `st0.0` to the nonexistent netdev `st0` (the unit-0 collapse), so the unit
@@ -304,8 +329,18 @@ plaintext egress path into the tunnel. Deleting either exclusion without
 building that path re-opens the drop above rather than fixing the gap.
 
 **Scope of the exclusion — it is narrower than "the dataplane ignores secure
-tunnels".** The predicate gates three sets and only three: the
-ingress-adjudication map, the AF_XDP binding plan and the RSS allowlist. Since
+tunnels".** The Go predicate `userspaceSkipsIngressInterface` has **four** call
+sites, not three (corrected in #6691 round 8 — the earlier text listed only the
+sets whose contents visibly change): `buildUserspaceIngressIfindexes` (the
+ingress-adjudication map), `UserspaceBoundLinuxInterfaces` (the name-keyed
+RSS/AF_XDP allowlist), `snapshotBindingPlanKey` (the plan-key hash — excluding
+the row is what keeps the key from churning when a tunnel appears or moves),
+and `buildUserspaceIngressBindingAliases`, which is measurably **inert** for
+this row because an xfrmi has no parent ifindex and is skipped by the
+`ParentIfindex` guard before the predicate is reached. The AF_XDP binding
+**plan** is gated on this side by the mirrored
+`include_userspace_binding_interface`, off the `secure_tunnel` flag, not by a
+fifth Go call site. Since
 #5619 made the xfrmi's ifindex resolve, the tunnel *does* enter the forwarding
 state built by `populate_interfaces`
 (`afxdp/forwarding_build/interfaces.rs`), which gates on `ifindex > 0` rather

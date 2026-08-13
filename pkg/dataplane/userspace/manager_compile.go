@@ -31,6 +31,24 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 // the multi-zone SHAPE rather than the action so it covers both directions.
 var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-global zone-set snapshot protocol incompatible")
 
+// ErrSecureTunnelProtocolIncompatible is the #5619/#6691 v5 gate. The snapshot
+// carries InterfaceSnapshot.SecureTunnel, and the helper's binding admission
+// (include_userspace_binding_interface) is AUTHORITATIVE on it: a route-based
+// IPsec xfrmi must not become an AF_XDP binding candidate.
+//
+// A helper that predates the field ignores it and plans the candidate. That is
+// not a lost optimisation — the helper's queue count is the GLOBAL MINIMUM
+// across candidates (replan_bindings_from_candidates) and an xfrm interface has
+// exactly ONE RX queue (numrxqueues 1; a single `rx-0` under
+// /sys/class/net/<if>/queues, which is what userspaceRXQueueCount reads and
+// ships). So an ignored flag re-plans EVERY physical interface on the box onto
+// one queue and one worker: the #3091 single-worker regression, on a config
+// this control plane has already decided is safe. Neither the version-equality
+// check (same advertised version on both sides before the v5 bump) nor the
+// snapshot content hash can see it, because nothing about the bytes is wrong —
+// only the reader is.
+var ErrSecureTunnelProtocolIncompatible = errors.New("userspace secure-tunnel snapshot protocol incompatible")
+
 // requiredProtocolGateSentinels enumerates every "this config cannot be
 // committed against the helper's current ConfigSnapshotProtocolVersion"
 // sentinel produced by ensureRequiredSnapshotProtocolLocked. ApplyConfig
@@ -66,6 +84,7 @@ var requiredProtocolGateSentinels = []error{
 	ErrPolicySchedulerProtocolIncompatible,
 	ErrPersistentSourceNATProtocolIncompatible,
 	ErrScopedGlobalZoneSetProtocolIncompatible,
+	ErrSecureTunnelProtocolIncompatible,
 }
 
 // IsRequiredProtocolGateError reports whether err is (or wraps) any
@@ -763,6 +782,70 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 	)
 }
 
+// configHasSecureTunnel reports whether any `security ipsec vpn <name>
+// bind-interface` in cfg derives an xfrmi — i.e. whether the snapshot this
+// config produces will carry an InterfaceSnapshot with SecureTunnel set.
+//
+// It asks the SAME question the snapshot builder asks (secureTunnelOwned →
+// Config.SecureTunnelNetdevForRef), over the same refs the builder walks, so
+// the gate cannot arm for a config whose snapshot carries no flagged row or
+// stay silent for one that does. Keying on the VPN stanza directly would
+// diverge the moment a bind-interface stops resolving to a netdev.
+func configHasSecureTunnel(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	for name, iface := range cfg.Interfaces.Interfaces {
+		if iface == nil {
+			continue
+		}
+		if _, ok := cfg.SecureTunnelNetdevForRef(name); ok {
+			return true
+		}
+		for unitNum := range iface.Units {
+			if _, ok := cfg.SecureTunnelNetdevForRef(fmt.Sprintf("%s.%d", name, unitNum)); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ensureSecureTunnelProtocolLocked is the fail-closed half of the #5619/#6691
+// v5 bump. The bump makes a pre-v5 helper REFUSE the snapshot outright, which
+// stops it from planning a binding for the xfrmi — but a refused snapshot
+// leaves that helper ARMED on its previous-good image while the commit reports
+// success. This gate closes that window the way the sibling gates do: the
+// caller disarms the helper and the commit aborts with an operator-visible
+// reason.
+//
+// Scoped to configs that actually derive an xfrmi, so an operator with no
+// route-based IPsec is never blocked by a helper-version mismatch that cannot
+// affect them.
+func (m *Manager) ensureSecureTunnelProtocolLocked(cfg *config.Config) error {
+	if !configHasSecureTunnel(cfg) {
+		return nil
+	}
+	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
+		m.recordHelperStatusLocked(&status)
+		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf(
+		"%w: helper config snapshot protocol version %d < required %d for route-based IPsec secure tunnels "+
+			"(an older helper ignores the secure_tunnel flag and plans an AF_XDP binding for the xfrmi; its "+
+			"single RX queue then becomes the global minimum and collapses every interface to one queue and one worker)",
+		ErrSecureTunnelProtocolIncompatible,
+		m.lastStatus.ConfigSnapshotProtocolVersion,
+		ProtocolVersion,
+	)
+}
+
 func (m *Manager) ensurePolicySchedulerProtocolLocked(cfg *config.Config) error {
 	if !configHasScheduledPolicy(cfg) {
 		return nil
@@ -814,7 +897,10 @@ func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error
 	if err := m.ensurePersistentSourceNATProtocolLocked(cfg); err != nil {
 		return err
 	}
-	return m.ensureScopedGlobalZoneSetProtocolLocked(cfg)
+	if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); err != nil {
+		return err
+	}
+	return m.ensureSecureTunnelProtocolLocked(cfg)
 }
 
 // disarmSnapshotProtocolFailClosedLocked is the shared fail-closed action for a

@@ -1,3 +1,130 @@
+## 2026-08-13 — #6691 round 8: the exclusion's stated reason could not be established; the real one could
+
+- **Timestamp**: 2026-08-13 10:35 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR at `bcb5335cc` — two blocking
+  findings. B1 required settling a kernel/AF_XDP capability claim this branch
+  had been asserting since round 1; the answer moved the justification, not the
+  code.
+- **File(s)**: `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/ingress_exclusions.go` (new),
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go`,
+  `pkg/dataplane/userspace/secure_tunnel_binding_order_6691_test.go`,
+  `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/refactoring-audit-current.txt`, `_Log.md`
+
+  **B1 — Codex was right about the premise and wrong about the conclusion.**
+
+  The branch justified excluding a route-based IPsec xfrmi from the userspace
+  dataplane with: "an XSK cannot come up on a virtual netdev, so admitting one
+  would make `drop_degraded_transit` DROP the plaintext." Codex called that
+  false. Checked, and it does not hold as written:
+
+  - `XskSocketRole::Private` returns `false` from `requires_zerocopy`
+    (`afxdp/bind.rs`), so zero-copy is role-conditional, not universal;
+  - `bind_flag_candidates_for_interface` hands a generic-XDP interface
+    `COPY_ONLY_BIND_FLAGS`;
+  - and — stronger than the review said — `fallback_shared_group_to_private`
+    converts a failed shared-UMEM group into private bindings automatically,
+    so the copy path is not merely present but REACHED without operator action.
+
+  So a copy-mode binding is reachable in this code. Whether it SUCCEEDS on an
+  `ARPHRD_NONE` netdev is still unsettled: BPF program load needs `CAP_BPF` in
+  the INIT user namespace, so `unshare -rn` cannot answer it (the veth control
+  failed identically). That link needs a live NIC and is NOT asserted anywhere
+  in the tree now.
+
+  **What replaced it is measurable here.** In a network namespace, an xfrm
+  interface reports `numrxqueues 1`, and with sysfs remounted
+  `/sys/class/net/xfrm0/queues/` holds exactly `rx-0` + `tx-0`. That single
+  entry is what BOTH planes count — `userspaceRXQueueCount` (Go) and
+  `rx_queue_count` (Rust) — and `replan_bindings_from_candidates` takes the
+  GLOBAL MINIMUM queue count across candidates. So admitting one zoned xfrmi
+  does not risk the tunnel's binding; it re-plans EVERY physical interface on
+  the box onto one queue and one worker. That is the #3091 single-worker
+  regression arriving through a door #3091 did not name.
+
+  Measured, by deleting `if iface.secure_tunnel { return false; }`:
+
+	the LAN interface was planned onto 1 queue(s), not its own 4
+	Planned: [("ge-0-0-1", 0), ("st0.0", 0)]
+
+  where the unmutated plan is `[(0,0,"ge-0-0-1"), (1,1,"ge-0-0-1")]`.
+
+  **Why the exclusion stays, and why the two narrower options do not work.**
+  Narrowing it per spelling cannot work: the queue count is a property of the
+  DEVICE, not of `st0` vs `st10.5`, so every spelling that resolves to a real
+  xfrmi carries it. Splitting it — adjudicate but do not bind — is worse than
+  either: an ifindex in the shim's ingress map with no READY binding takes
+  `drop_degraded_transit` (`userspace-xdp/src/lib.rs`, BINDING_MISSING), which
+  is the dead-tunnel configuration the old comment described. The two sets move
+  together or transit dies. Building an independent inbound policy path is real
+  work (TC ingress on the xfrmi, or host-inbound adjudication) and is #5619's
+  open half, already filed as #6700 — not a fold.
+
+  **The cost is stated plainly now, and it is a policy gap, not a drop.**
+  Decrypted plaintext traverses Linux routing with no xpf zone policy. Three of
+  four spellings lose an ingress claim they had on master. What master actually
+  did with that claim was not "working policy": it was either a one-worker box
+  (if the copy bind succeeds) or a dead tunnel (if it does not). The trade is
+  defensible; the previous framing, which advertised only the second branch as
+  certain, was not.
+
+  `secure_tunnel_would_collapse_the_global_queue_count` is the new guard. It
+  asserts the QUEUE COUNT rather than plan identity, so the reason is visible in
+  the failure rather than inferred from a diff of two layouts.
+
+  **B2 — a new authoritative wire field shipped at an unchanged version.**
+
+  `InterfaceSnapshot.secure_tunnel` is authoritative over binding admission, and
+  both sides stayed at protocol 4 — the exact shape `server/README.md` forbids
+  and #5488 was filed for. The skew consequence is the same collapse: a v4
+  helper ignores the tag, plans the xfrmi, and its one RX queue becomes the
+  global minimum. Nothing on the wire is malformed, so neither the version
+  equality check nor the content hash can see it.
+
+  Fixed as a lockstep v5 bump (`ProtocolVersion`, `CONFIG_SNAPSHOT_PROTOCOL_VERSION`)
+  plus `ensureSecureTunnelProtocolLocked` + `ErrSecureTunnelProtocolIncompatible`,
+  registered in `requiredProtocolGateSentinels`. The gate arms off
+  `configHasSecureTunnel`, which asks the SAME question the snapshot builder
+  asks (`Config.SecureTunnelNetdevForRef`) over the same refs, so it cannot arm
+  for a config with no flagged row or stay silent for one that has one.
+
+  Three mutations, each red on its intended assertion: unwiring the gate from
+  `ensureRequiredSnapshotProtocolLocked` reds the dispatcher assertion; dropping
+  the sentinel from the abort set reds `IsRequiredProtocolGateError`; reverting
+  `ProtocolVersion` to 4 reds the collision assertion AND all four spellings.
+
+  **Non-blocking, folded.**
+
+  - `secure_tunnel_binding_order_6691_test.go` carried a comment stating the
+    opposite of the assertion under it ("a name on no box must not enter the
+    allowlist" — it does, by construction, and `maps_sync.go` says so for the
+    sibling case). Corrected to describe what the assertion pins: the allowlist
+    tracks the RESOLUTION, not existence.
+  - "gates three sets and only three" was a miscount. Four Go call sites;
+    `snapshotBindingPlanKey` genuinely changes and
+    `buildUserspaceIngressBindingAliases` is inert for this row (no parent
+    ifindex, skipped before the predicate). Both the in-tree comment and the
+    README now enumerate all four and say which is inert and why.
+  - A unit that is BOTH `vlan-id 80` and a `bind-interface st5.3` target had no
+    doc and no test on either revision, though strict compile accepts it and the
+    two arms name DIFFERENT devices (`st5.80` vs `st5.3`).
+    `TestSecureTunnelOwnershipPrecedesVlanID` pins the order without arguing it
+    is the right one, and names the consequence if it moves.
+  - `maps_sync.go` had crossed the 2000-line refactor threshold on comment.
+    `userspaceSkipsIngressInterface` and its ~180 lines of rationale moved
+    verbatim to `ingress_exclusions.go`; the file drops 2130 → 1925, below both
+    the threshold and master's 1953. Pure motion — no signature, behaviour or
+    caller change. Audit regenerated: `[REFACTOR] 2076` → `[WATCH] 1925`.
+
+  Validation: `go build ./...`, `go vet`, full `go test ./...`; full
+  `cargo test --release`. Mutation evidence above observed, not asserted.
+
 ## 2026-08-13 — #6691 round 7: the veto fired before ownership, and ownership was not directional
 
 - **Timestamp**: 2026-08-13 09:40 (fix/5619-ipsec-passthrough-zone-policy)
