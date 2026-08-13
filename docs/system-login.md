@@ -260,6 +260,83 @@ and use it. What is worth stating plainly is that it happens **immediately and
 in the same session**, and that the narrowing row is what makes a mid-session
 revocation of a class's permissions actually effective.
 
+### Where the class is enforced — per control surface (#5561)
+
+The class evaluator is shared (`config.ResolveClassPermissions` /
+`config.ClassHasPermission`), but each control surface must *call* it, and
+until #5561 only the CLI did. That mattered because a login user is a real
+shell account — the daemon creates each one with `useradd -m -s /bin/bash` —
+so the holder can bypass a CLI-side check simply by not using the CLI.
+
+| Surface | Enforcement |
+|---|---|
+| Console / SSH CLI | `checkPermission`, **client-side** — it runs in the CLI process, so it binds only callers who use the CLI. |
+| HTTP REST (`127.0.0.1:8080`) | **Server-side** since #5561: the mutation surface derives the caller's UID from the kernel socket table, maps it to this account, and evaluates the class before the handler runs. See `pkg/api/README.md` "Server-side authorization". |
+| gRPC (`127.0.0.1:50051`) | **Not yet enforced — #5278 is open.** The listener installs no per-principal check, so a login-class holder can still drive privileged RPCs directly. The shared layer (`pkg/authz`) is built for two consumers; the gRPC leg is an interceptor that derives the same principal and calls the same `authz.Authorize`. |
+
+On the REST surface the class is evaluated against a **server-derived**
+identity, so it is a real boundary rather than an advisory one:
+
+- The caller's UID comes from the kernel (`/proc/net/tcp{,6}`), not from
+  anything the request carries, and is fixed at connect rather than at request
+  time so the caller cannot choose when — or whether — it resolves. Concurrent
+  lookups share one table read, so the identity does not cost a kernel hash-table
+  walk per connection.
+- **UID 0 is authorized unconditionally** — root owns the config DB on disk, so
+  a denial would be theater.
+- A local UID that is **not** a configured `system login user` is **denied** the
+  mutation surface. Note the contrast with the CLI, where an unset class means
+  "no restriction": on a network-reachable API the absence of a class means the
+  RBAC model says nothing about that account, which is a reason to deny. Grant
+  it explicitly with `set system login user <account> class <class>` if it needs
+  access.
+- A UID shared by **two passwd accounts** is denied on BOTH surfaces. The kernel
+  reports only the number, so the two callers are indistinguishable and naming
+  one of them would hand that account's class to the other. See "unidentifiable"
+  in the class table above — the REST gate and the CLI resolve this through the
+  same code since #6645, and a divergence here was a privilege escalation
+  between two legitimate accounts.
+- **The class table above governs both surfaces, with one exception**: the row
+  "uid 0 **with** an explicit `system login user root class <c>`" is honoured by
+  the CLI and NOT by the REST gate, which authorizes uid 0 unconditionally (see
+  "UID 0 is authorized unconditionally" above). Root can write the config
+  database directly, so the two are equivalent in effect; the table is the CLI's
+  answer, and this bullet is the REST caveat.
+- A local caller the server cannot identify is **denied**, and an `api-auth`
+  credential does not substitute for it. In fact **no caller this host can PLACE
+  ever reaches the credential check**: the credential speaks only for a caller
+  this host cannot place (the remote administrator #4047 requires it for). Read
+  "can place" rather than "is local" — a process in a container on this same box
+  has its own socket table and interface list, so it is local to the machine yet
+  unplaceable by the daemon, and the credential governs it. That is the design,
+  not a gap in it; `pkg/api/README.md` "Residuals" states the bound. Otherwise a
+  restricted account that also knew the shared secret could escape its class,
+  either by making its own identity unreadable or simply by not being in the
+  login model. That holds even for an address that appeared on this host a
+  moment ago — the "is this caller on our box" question is answered from a
+  cached snapshot for speed, but the answer that would let the credential speak
+  is re-derived from a fresh interface enumeration before it is acted on, so a
+  caller connecting from a just-added VRRP VIP or DHCP lease is still governed
+  by its class rather than by the shared secret.
+- A `system login user` whose **name the daemon would refuse to provision** is
+  denied. A strict commit rejects an invalid name at the schema, but the
+  tolerant load and peer-sync paths (#1960) downgrade that to a warning and keep
+  the stanza active, and account reconciliation then skips it — so the account
+  was never created by xpf. Handing that stanza's class to whatever OS account
+  happens to bear the name would grant authority from a config the runtime
+  declined to realize, so `config.LoginUserClass` applies the same validator and
+  resolves such a user exactly like an absent one. This cannot deny anyone xpf
+  actually provisioned: provisioning runs the identical check. If an operator
+  sees an unexpected denial here, the fix is to rename the user to a valid login
+  name and commit — which is also what makes the shell account appear.
+- Read-only endpoints, `/health` and `/metrics` are unaffected.
+- The authorization is re-made **after** the caller has supplied its request
+  body, not only when its headers arrive. A caller cannot hold a mutation open
+  on a stale verdict by dribbling the body: a `commit` demoting its class, or a
+  `delete system services web-management ... api-auth` revoking its credential,
+  reaches the request before the mutation runs. See `pkg/api/README.md`
+  "Every input to the decision is read after the last thing that can block".
+
 ### Custom login classes (accept-with-advisory, #4304 S-2)
 
 Real vSRX configs define their own RBAC classes:
