@@ -270,7 +270,7 @@ func TestMgmtReconcileAuthSwapNoRebind_5866(t *testing.T) {
 	// The live auth snapshot was swapped IN PLACE to the revoked set (admin gone,
 	// other present). The api-level TestServerReplaceAuthLiveSwap_5866 proves such
 	// a snapshot rejects the revoked credential on the next request.
-	snap := m.srv.AuthSnapshotForTest()
+	snap := m.srv.LiveAuth()
 	if snap == nil {
 		t.Fatal("live auth snapshot is nil after the revoke reconcile")
 	}
@@ -431,9 +431,17 @@ func TestMgmtReconcileHTTPChangeKeepsHTTPS_5866(t *testing.T) {
 
 // #5866 revocation-honoring (the elevated Finding A): a SINGLE commit that BOTH
 // revokes a credential AND changes the HTTPS endpoint to one that FAILS to bind
-// must still reject the revoked credential on the next request — the tightening
-// is published to the persistent HTTP listener UP FRONT, regardless of the HTTPS
-// rebind outcome — while the old HTTPS state is retained with retry debt.
+// must still reject the revoked credential on the next request — the revocation
+// is published UP FRONT, regardless of the HTTPS rebind outcome — while the old
+// HTTPS state is retained with retry debt.
+//
+// The GRANT half of the same commit does not land yet, and #5561 round 12 is why:
+// the failed rebind leaves the old HTTPS listener serving an address this config
+// asked to leave, and the credential set was committed for the address it asked
+// to move to. So `other` is withheld until the HTTPS leg converges, which the
+// control at the end drives. The two halves are deliberately split — a commit
+// that revokes and grants at once must have its revocation honored immediately
+// and its grant honored only where it was committed to apply.
 //
 // FAIL-ON-REVERT: without the up-front ReplaceAuth (publishing auth only after
 // the legs converge), the failed HTTPS rebind leaves the revoked credential in
@@ -461,7 +469,7 @@ func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
 
 	// The revocation was honored despite the HTTPS bind failure: the live auth
 	// snapshot no longer contains admin.
-	snap := m.srv.AuthSnapshotForTest()
+	snap := m.srv.LiveAuth()
 	if snap == nil {
 		t.Fatal("live auth snapshot is nil after the revoke reconcile")
 	}
@@ -469,8 +477,13 @@ func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
 		t.Fatal("revoked credential 'admin' is STILL live after a bundled revoke + failed HTTPS rebind " +
 			"— a revoked credential must be rejected on the next request regardless of the rebind outcome (#5866)")
 	}
-	if _, ok := snap.Users["other"]; !ok {
-		t.Fatal("the tightened credential 'other' is missing from the live auth snapshot")
+	// ...and the grant half is WITHHELD while a leg is retained at an address
+	// this commit asked to leave (#5561 round 12).
+	if _, ok := snap.Users["other"]; ok {
+		t.Fatal("the newly committed credential 'other' was published while the OLD HTTPS listener " +
+			"at 10.0.0.1:8443 is still serving — that address is one this commit asked to move away " +
+			"from, and it never accepted 'other' before, so publishing it there grants a credential " +
+			"on a listener the committed config did not authorize (#5561 round 12)")
 	}
 
 	// The old HTTPS listener is retained (fail-closed) and its fingerprint is not
@@ -485,15 +498,44 @@ func TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866(t *testing.T) {
 	if hln := reg.get("10.0.0.1:8080"); hln == nil || !hln.isOpen() {
 		t.Fatal("the HTTP listener was disturbed by the HTTPS rebind")
 	}
+
+	// Control: the withholding is scoped to the FAILURE, not permanent. Let the
+	// HTTPS rebind succeed and the full committed set lands — otherwise the
+	// assertion above would be satisfied by an implementation that simply never
+	// grants a new credential after any endpoint change.
+	delete(reg.failAddr, "10.0.0.2:8443")
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.1:8080", true, "10.0.0.2:8443", revoked)); err != nil {
+		t.Fatalf("retry reconcile: %v", err)
+	}
+	if snap := m.srv.LiveAuth(); snap == nil || snap.Users["other"] != "pw" {
+		t.Fatalf("post-convergence snapshot = %+v, want the full committed set — every live leg is "+
+			"now at an address this config names, so the grant half must land", snap)
+	}
 }
 
 // #5866 fail-open avoidance (the counterpart to the revocation-honoring case):
 // removing ALL api-auth (next.Auth == nil, which clamps the HTTP bind to
 // loopback) while the HTTP leg's OWN rebind to that loopback address FAILS must
-// NOT drop the retained NON-loopback HTTP listener to no-auth. The nil auth is
-// deferred (httpOK == false), so the retained listener keeps its previous
-// credential set — no fail-open — and converges on retry.
-func TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866(t *testing.T) {
+// NOT drop the retained NON-loopback HTTP listener to no-auth. The nil is not
+// published, because the gate reads the LIVE HTTP address (m.cur.addr, which the
+// failed rebind left at the old non-loopback bind).
+//
+// What IS published there was inverted in #5561 round 14 (MAJOR 4), and this
+// test's original expectation was the defect. It asserted that the retained
+// listener keeps its PREVIOUS credential set — i.e. that `delete system services
+// web-management api-auth` leaves the deleted secret authenticating full-power
+// requests on a routable address, for as long as the loopback bind keeps
+// failing. That is not a deferral; it is the round-7 fail-open in the one
+// direction round 7 did not cover, and it is permanent rather than a window.
+//
+// The safe intermediate for "no credential is authorized here any more" is the
+// DENY-ALL set: non-nil and empty, which dynamicAuthMiddleware rejects every
+// non-exempt request against. It honours the revocation immediately (the
+// operator's instruction) without publishing the nil (the fail-open), and it
+// converges to nil on the retry that binds loopback. The sibling conjunct,
+// covering a retained non-loopback HTTPS leg, is pinned by
+// TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561.
+func TestMgmtReconcileRemoveAuthDeniesAllWhenHTTPRebindFails_5866(t *testing.T) {
 	reg := newFakeReg()
 	m := newTestMgmt(reg)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -514,16 +556,25 @@ func TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866(t *testing.T) {
 		t.Fatal("a failed HTTP rebind must surface an error")
 	}
 
-	// The nil auth was NOT applied: the retained NON-loopback HTTP listener still
-	// enforces the previous credential — dropping it to no-auth would be a
-	// fail-open on a non-loopback bind.
-	snap := m.srv.AuthSnapshotForTest()
+	// The nil auth was NOT applied — that would be the fail-open. What IS applied
+	// is deny-all: the removed credential stops working at once, and the retained
+	// non-loopback listener answers nobody until the bind converges.
+	snap := m.srv.LiveAuth()
 	if snap == nil {
 		t.Fatal("api-auth was removed while the retained listener is still non-loopback — FAIL-OPEN (#5866): " +
 			"a nil-on-loopback auth must not be applied to a retained non-loopback listener")
 	}
-	if _, ok := snap.Users["admin"]; !ok {
-		t.Fatal("the retained listener lost its credential set on a failed HTTP rebind (#5866)")
+	if pw, ok := snap.Users["admin"]; ok {
+		t.Fatalf("the retained non-loopback listener still accepts admin=%q, a credential the "+
+			"commit DELETED (#5561 round 14, MAJOR 4). The loopback bind that would have made "+
+			"the removal safe failed, so this listener keeps serving a routable address — and "+
+			"keeps honouring the deleted secret there until some later bind happens to succeed. "+
+			"An api-auth removal is a revocation and must land immediately, like every other", pw)
+	}
+	if api.CredentialCount(snap) != 0 {
+		t.Fatalf("the retained non-loopback listener enforces %+v, want the EMPTY (deny-all) set — "+
+			"the committed policy authorizes no credential at all, and the only expressions of "+
+			"that are nil (fail-open here) and deny-all", snap)
 	}
 	// Old non-loopback listener retained + open; fingerprint not advanced.
 	if !oldHTTP.isOpen() {
@@ -544,4 +595,84 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// TestMgmtReconcileRotationRevokesDespiteHTTPRebindFailure_5561 is the round-7
+// MAJOR-2 guard.
+//
+// ReplaceAuth used to sit inside `if httpOK`, so when the HTTP leg's OWN rebind
+// failed and the old listener was retained, a credential ROTATION was never
+// published: the retained listener kept honouring the REVOKED secret, and not
+// for a race window — indefinitely, until some later reconcile happened to
+// succeed. The surrounding comment had the right argument for the wrong scope.
+// It says a non-nil Auth only ADDS a requirement and so cannot fail open; that
+// is true of the REVOCATION half against ANY live bind, including one retained
+// by a failure, so gating that half on the rebind outcome bought nothing and
+// cost revocation.
+//
+// Round 12 supplies the scope the round-7 comment was missing. A rotation is a
+// revocation AND a grant, and only the first half is a tightening: `new-secret`
+// was not accepted on this listener before, and the commit that introduced it
+// asked to serve a DIFFERENT address. So the retained listener stops accepting
+// `old-secret` at once and does not start accepting `new-secret` until the
+// rebind converges — asserted here in both directions, since an implementation
+// that published nothing would satisfy the revocation alone.
+//
+// The negative control for the OTHER axis is REMOVING all api-auth. That
+// direction removes a requirement and can fail open, so what it WITHHOLDS on a
+// failed HTTP rebind is the nil itself — not the revocation, which lands at once
+// as the DENY-ALL set (#5561 round 14). It is covered by
+// TestMgmtReconcileRemoveAuthDeniesAllWhenHTTPRebindFails_5866, which must stay
+// green.
+func TestMgmtReconcileRotationRevokesDespiteHTTPRebindFailure_5561(t *testing.T) {
+	reg := newFakeReg()
+	m := newTestMgmt(reg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	old := &api.AuthConfig{Users: map[string]string{"admin": "old-secret"}}
+	if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", old)); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+
+	// The operator rotates the credential AND the new bind fails.
+	rotated := &api.AuthConfig{Users: map[string]string{"admin": "new-secret"}}
+	reg.failAddr["10.0.0.2:8080"] = true
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", rotated)); err == nil {
+		t.Fatal("a failed listener replacement must surface an error")
+	}
+
+	snap := m.srv.LiveAuth()
+	if snap == nil {
+		t.Fatal("the live auth snapshot went nil on a failed rebind — that drops api-auth " +
+			"entirely, which is the fail-open the deferral exists to prevent")
+	}
+	// The revocation half landed despite the failure (round 7).
+	if got := snap.Users["admin"]; got == "old-secret" {
+		t.Fatal("after a credential rotation whose HTTP rebind FAILED, the live snapshot still " +
+			"authorizes old-secret — the revoked secret keeps working on the retained listener " +
+			"until some later reconcile happens to succeed, which is a permanent fail-open " +
+			"rather than a race window (#5561 round 7)")
+	}
+	// The grant half did not (round 12): 10.0.0.1:8080 is the address this commit
+	// asked to leave, and it never accepted new-secret.
+	if got := snap.Users["admin"]; got == "new-secret" {
+		t.Fatal("the rotated secret was published to the listener at 10.0.0.1:8080, which this " +
+			"commit asked to move away from and which never accepted it. A credential set is " +
+			"committed together with the endpoint it is meant for; when that endpoint fails to " +
+			"bind, the retained listener may lose credentials but must not gain them (#5561 " +
+			"round 12)")
+	}
+
+	// Control: the withholding is scoped to the failure. Once the bind converges,
+	// the rotated secret is live — so the assertion above is not satisfied by an
+	// implementation that has simply stopped publishing rotations.
+	delete(reg.failAddr, "10.0.0.2:8080")
+	if err := m.reconcileTo(cfgFor(reg, "10.0.0.2:8080", false, "", rotated)); err != nil {
+		t.Fatalf("retry reconcile: %v", err)
+	}
+	if got := m.srv.LiveAuth(); got == nil || got.Users["admin"] != "new-secret" {
+		t.Fatalf("post-convergence snapshot = %+v, want the rotated secret live on the endpoint "+
+			"the operator committed", got)
+	}
 }
