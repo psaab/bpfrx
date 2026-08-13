@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
+	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/vishvananda/netlink"
 )
 
@@ -527,8 +528,23 @@ func renameInterface(oldName, newName string) error {
 }
 
 // networkctlReload calls networkctl reload to apply .link/.network changes.
+//
+// This is the process's OTHER `networkctl reload` owner: all FIVE daemon-side
+// reload sites go through here (the post-rename reload above, device-map's
+// rename and teardown reloads via networkctlReloadFn, and bootstrap's teardown
+// and lifeline reloads), and all of them write or remove the same 10-xpf-* files
+// pkg/networkd generates. #5718 fold F2: report the outcome into networkd's
+// process-scoped #4954 activation debt so the two owners cannot disagree. A
+// failure here leaves those files on disk unactivated; without the report,
+// networkd.Apply's debt would read false and the next Apply with unchanged
+// content would skip the reload and return a false success — the exact #4954
+// masking the debt exists to prevent, entered through this path instead. Note
+// the linksetup call site above is warn-only, so this record is the ONLY thing
+// that carries the failure forward.
 func networkctlReload() error {
+	epoch := networkd.BeginReload()
 	out, err := execCommand("networkctl", "reload")
+	networkd.NoteReloadResult(epoch, err)
 	if err != nil {
 		return fmt.Errorf("networkctl reload: %w (output: %s)", err, out)
 	}

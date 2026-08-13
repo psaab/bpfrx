@@ -1,0 +1,33 @@
+[package]
+name = "newflow-gen"
+version = "0.1.0"
+edition = "2021"
+
+# #4800 connection-rate generator + sink for the new-flow-ceiling harness
+# (test/incus/newflow-ceiling-harness.sh).
+#
+# Opens many distinct, SHORT-LIVED TCP connections per second through the
+# firewall. Completed handshakes, not SYN floods: a SYN flood exercises the
+# screen path and the half-open window, never reaching SNAT allocation,
+# `publish_shared_session` or `replicate_session_upsert` — the three sites
+# #4800 exists to measure.
+#
+# Lives OUTSIDE the userspace-dp / userspace-xdp workspaces by design, same
+# rationale as test/incus/cold-path-flooder (#1607): a regression in a test
+# binary must not block dataplane builds. Build and test it explicitly:
+#
+#   cargo build --release --manifest-path test/incus/newflow-gen/Cargo.toml
+#   cargo test  --release --manifest-path test/incus/newflow-gen/Cargo.toml
+
+[[bin]]
+name = "newflow-gen"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1

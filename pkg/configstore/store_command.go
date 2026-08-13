@@ -15,7 +15,20 @@ func (s *Store) Set(path []string) error { return s.SetAs("", path) }
 
 // SetAs is Set scoped to a config-lock holder session (#5059). sessionID == ""
 // bypasses ownership (internal/system caller).
+//
+// It carries NO quote provenance, so nodes it creates record none — correct for
+// a synthesized path, and the reason the operator-facing entry point
+// (SetFromInputAs) uses SetAsQuoted instead (#6673).
 func (s *Store) SetAs(sessionID string, path []string) error {
+	return s.SetAsQuoted(sessionID, path, nil)
+}
+
+// SetAsQuoted is SetAs carrying the per-token quote provenance produced by
+// config.ParseSetCommandQuoted (#6673). It is what lets a bracketed list
+// authored through the flat-set path — `set ... commands [ "set" "system
+// host-name x" ]` — keep the one bit that distinguishes its members from the
+// words of a single unquoted command.
+func (s *Store) SetAsQuoted(sessionID string, path []string, quoted []bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -29,7 +42,7 @@ func (s *Store) SetAs(sessionID string, path []string) error {
 		return fmt.Errorf("not in configuration mode")
 	}
 
-	if err := s.candidate.SetPath(path); err != nil {
+	if err := s.candidate.SetPathQuoted(path, quoted); err != nil {
 		return err
 	}
 	s.touchConfigLockLocked()  // #4476: refresh the config-lock idle lease
@@ -43,11 +56,11 @@ func (s *Store) SetFromInput(input string) error { return s.SetFromInputAs("", i
 
 // SetFromInputAs is SetFromInput scoped to a config-lock holder session (#5059).
 func (s *Store) SetFromInputAs(sessionID, input string) error {
-	path, err := config.ParseSetCommand("set " + input)
+	path, quoted, err := config.ParseSetCommandQuoted("set " + input)
 	if err != nil {
 		return err
 	}
-	return s.SetAs(sessionID, path)
+	return s.SetAsQuoted(sessionID, path, quoted)
 }
 
 // Delete removes a node at the given path from the candidate configuration. The
@@ -474,7 +487,7 @@ func hasFlatVerb(line string) bool {
 }
 
 func applyEditLine(tree *config.ConfigTree, line string) error {
-	verb, path, err := config.ParseSetVerb(line)
+	verb, path, quoted, err := config.ParseSetVerbQuoted(line)
 	if err != nil {
 		return err
 	}
@@ -486,7 +499,9 @@ func applyEditLine(tree *config.ConfigTree, line string) error {
 	case "activate":
 		return tree.ActivatePath(path)
 	default: // "set" (or a bare, unprefixed path)
-		return tree.SetPath(path)
+		// Quote provenance rides along so a `show | display set` dump replays
+		// into the same tree it was rendered from (#6673).
+		return tree.SetPathQuoted(path, quoted)
 	}
 }
 
