@@ -464,10 +464,40 @@ func containsString(list []string, want string) bool {
 // A failed or ambiguous passwd lookup yields Name == "" (never a fabricated
 // default), so a caller that fails closed on an unresolved identity does so on
 // the real signal. Reason carries which failure it was, for the log line.
-func Current() Identity {
-	uid := os.Getuid()
+func Current() Identity { return ForUID(os.Getuid()) }
+
+// ForUID resolves an ARBITRARY uid to an Identity, applying exactly the rules
+// Current applies to the calling process — including the ambiguity refusal
+// documented on lookupPasswd.
+//
+// It exists because a uid the process did not itself run as still has to be
+// identified: the REST surface learns its caller's uid from SO_PEERCRED
+// (pkg/authz), not from os.Getuid. Before #6645 that surface carried its OWN
+// passwd scanner, which resolved a duplicate uid to the FIRST matching row —
+// the precise behaviour the comment above calls privilege escalation between
+// two legitimate accounts. The two implementations then disagreed on the same
+// input: REST admitted uid N as the first row's class while the CLI refused to
+// name it. Nothing compared them, so both packages stayed green.
+//
+// One rule, one implementation, one place to change it. A second resolver is
+// how the divergence happened; a shared entry point is what prevents the next.
+func ForUID(uid int) Identity {
 	name, err := lookupID(uid)
 	return classifyLookup(uid, name, err)
+}
+
+// SetPasswdPathForTest points the credential database at path and restores the
+// previous value through the returned function.
+//
+// Exported (unlike the package's other seams) so a CROSS-PACKAGE test can drive
+// the real resolution path against a fixture: pkg/api's REST authorization
+// tests and pkg/authz's resolver tests both need identities that do not depend
+// on whichever accounts exist on the machine running the suite. Dep-free — no
+// test-only import reaches the production binary.
+func SetPasswdPathForTest(path string) (restore func()) {
+	prev := passwdPath
+	passwdPath = path
+	return func() { passwdPath = prev }
 }
 
 // classifyLookup maps one passwd-lookup outcome to an Identity.
