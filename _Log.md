@@ -80281,3 +80281,81 @@ Every RED above is an assertion failure, not a build break.
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13
+- **Action**: #4983 round 7 (PR #6928) — three prose claims this PR asserts were
+  FALSE, and one of them was refuted by the same round's own derivation. Every
+  one was falsified by CONSTRUCTING the case first, never by taking the review
+  at its word.
+- **CLAIM 1, `session/README.md` + `session_filter.go`: "a zone binding NO
+  interface ... no interface filter selects that row at all."** Refuted with no
+  edit required. `matchesV4`/`matchesV6` reject only when BOTH arms miss
+  (`!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)`), so an empty ingress
+  slice removes ONE route in, not the row. New
+  `TestInterfaceFilterReachesRowViaEgressArm6928` builds exactly the described
+  row — ingress zone `quarantine` (binds nothing), ingress identity 0, egress
+  `lo.80` — and `show security flow session interface lo.80` selects it, with a
+  negative control (`ge-0/0/8.0`) selecting nothing. Both README sites and the
+  `resolveIngressIfaces` comment now say "lost route in", and name the real
+  unreachability condition: both arms empty.
+- **CLAIM 2, "the caller test stops the categorical wording coming back
+  green."** Refuted by substitution: rewriting the remediation to "A plain
+  restart ALWAYS releases this pin, on every shutdown path" — categorically
+  false, false in the OPPOSITE direction from the two banned literals — left the
+  whole `./pkg/dataplane/...` suite green. A guard over two strings constrains
+  VOCABULARY, not the claim, and no test can decide whether English describes a
+  code fact. Did NOT add a third literal. The two facts underneath are now bound
+  instead, and the vocabulary check is labelled as one where it lives.
+- **CLAIM 3, "the filter and the displayed interface name cannot disagree" for a
+  non-zero nameable identity.** False with no fallback anywhere: a session
+  arriving on `lo.50` and egressing `lo.80`, both stamped and both nameable, is
+  selected by `interface lo.80` through the egress arm and prints `If: lo.50`.
+  This contradicted the round's own ingress-or-egress derivation, which lives at
+  `cli_show_flow.go:307-315` (NOT elsewhere in the README, as the dispatch had
+  it). The derivation is the correct account; the README now carries it, and the
+  narrower property that DOES hold — an ingress-arm match names the interface
+  typed, because arm and column read one stamped pair through one map — is
+  pinned by the two sub-tests of
+  `TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928`.
+- **BOUND, not narrowed: mode placement.** The prior round admitted its own gap
+  at `cleanup_reachability_6928_test.go:200`. Both escapes were reproduced, not
+  argued: inverting `if hitless` and replacing the call with
+  `// d.dp.Teardown()` (still builds) each left `-run 6928 ./pkg/dataplane/`
+  GREEN. `d.dp` is a `RuntimeDataPlane` interface, so no production seam was
+  needed: new `pkg/daemon/shutdown_dataplane_mode_6928_test.go` drives the real
+  `runShutdownSequence` with a substituted dataplane and asserts both arms
+  (non-hitless -> Teardown not Close; hitless -> Close not Teardown). Both
+  mutations are RED against it. The superseded substring companion was DELETED
+  rather than re-labelled — it proved a strict subset.
+- **BOUND, not narrowed: the caller set.** "Exact direct-caller set" was false in
+  both directions, measured: `import dp ".../pkg/dataplane"` + `dp.Cleanup()`
+  added a real production caller the walk silently missed, and an unrelated bare
+  `Cleanup()` in `pkg/zzprobe` was falsely counted. The walk now resolves each
+  file's IMPORT binding for the dataplane path (alias, dot-import, blank import,
+  plain), counting a bare `Cleanup()` only inside `pkg/dataplane` itself or a
+  dot-importing file. Re-measured: the aliased caller is now REPORTED (test reds
+  naming it), the unrelated one is IGNORED (green), and a newly-tried dot-import
+  case is also caught. Residual stated rather than claimed away: a local
+  identifier shadowing the package name, and indirect calls — both need
+  `go/types`.
+- **Validation**: full `go test ./...` rc 0 (62 ok, 0 FAIL) and full
+  `cargo test --release` rc 0 (4282 passed). One earlier cargo run failed
+  `afxdp::wg::engine::...::install_session_serializes_with_reconcile_removal`, a
+  thread-starvation flake on a loaded box: it passed 5/5 in isolation and 4282/0
+  on a clean full re-run, and this PR touches zero files under `afxdp/wg/`.
+  gofmt clean on all five touched Go files; `go build ./...` and `go vet` on
+  pkg/{dataplane,daemon,cli} rc 0. Merged `origin/master` (edefb7570):
+  `_Log.md` was the only conflict. `git merge-file --union` was REJECTED for the
+  resolve — it fused a shared boundary line, collapsing one blank plus one
+  `- **Timestamp**: 2026-08-12`, which would have stripped master's "#5561 round
+  21b" entry of its timestamp bullet while passing a zero-deletions check. The
+  resolve is a deterministic replay of both diffs onto the merge base instead;
+  predicted BEFORE resolving and matched exactly: 80283 lines (77129 + 1191 +
+  1963), 1594 `##` headings (1573 + 7 + 14), 487 headings preceded by a
+  non-blank line (476 + 4 + 7), and zero deletions in both directions with each
+  parent differing from the result by exactly the other's insertions.
+- **File(s)**: pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  pkg/cli/session_filter.go, pkg/dataplane/cleanup_reachability_6928_test.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go, pkg/dataplane/types.go,
+  pkg/daemon/shutdown_dataplane_mode_6928_test.go,
+  userspace-dp/src/session/README.md, _Log.md

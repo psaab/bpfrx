@@ -1016,16 +1016,37 @@ side already uses (`buildSessionEgressIfaces`), so one map defines one
 interface identity for both directions and two units of a single trunk NIC —
 `reth0.50` vs `reth0.80` — do not alias onto the parent. The `In: ... If:`
 column of the detailed `show` output is resolved from the same identity
-(`sessionIngressIf` in `pkg/cli/cli_show_flow.go`), so the filter and the
-displayed interface name cannot disagree — but ONLY for a non-zero, nameable
-identity. For a zero or unresolvable one the two diverge by construction
-(#6928 review): the FILTER falls back to considering every interface bound to
-the zone (`resolveIngressIfaces`), while the DISPLAY falls back to the zone's
-first/representative interface (`sessionIngressIf`). So a zero-identity row in
-zone `[A, B]` is selected by `interface B` yet prints `If: A`. That is a
-fallback artefact, not a filtering error — the row genuinely has no recorded
-interface — but the sentence above is scoped to the stamped case and does not
-carry to the fallback.
+(`sessionIngressIf` in `pkg/cli/cli_show_flow.go`).
+
+**What that buys, stated at the width it actually holds.** A previous revision
+said the filter and the displayed name therefore "cannot disagree" for a
+non-zero nameable identity. That is false, and no fallback is needed to break
+it. `matchesV4`/`matchesV6` are a DISJUNCTION over two arms —
+`!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)` in
+`pkg/cli/session_filter.go` — while the `If:` column renders the INGRESS side
+alone. A session that arrives on `A` and egresses on `B`, both stamped and both
+nameable, is selected by `interface B` through the EGRESS arm and prints
+`If: A`. Filter term and column differ with no zero identity and no fallback
+anywhere in the derivation. That is the same account
+`pkg/cli/cli_show_flow.go:307-315` derives at the print site, and this sentence
+used to contradict it.
+
+The property that DOES hold is narrower: when a row is selected BY ITS INGRESS
+ARM and carries a non-zero nameable identity, the column names the interface
+that was typed — because the arm and the column read the SAME stamped pair
+through the SAME `{ifindex, VLAN}` map. Both halves are pinned by
+`TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928`
+(`pkg/cli/cli_show_flow_ingress_if_4983_test.go`), whose two sub-tests assert
+the egress-arm disagreement and the ingress-arm agreement against the real
+`showFlowSession`.
+
+For a ZERO or unresolvable identity the ingress arm and the column degrade
+differently as well: the FILTER falls back to every interface bound to the zone
+(`resolveIngressIfaces`), the DISPLAY to the zone's first/representative
+interface (`sessionIngressIf`). So a zero-identity row in zone `[A, B]` is
+selected by `interface B` yet prints `If: A`. That is a second, independent way
+the two can name different interfaces — a fallback artefact, not a filtering
+error.
 
 The DISPLAY side's own fallback chain, for completeness: an absent or an
 unnameable identity falls back to the ingress zone's FIRST interface, and a
@@ -1033,9 +1054,9 @@ zone that binds none falls back to the zone NAME. Never to a blank column, and
 that part matters — WHERE THE INGRESS ZONE BINDS AT LEAST ONE INTERFACE, those
 populations (§ "`0` means no ingress identity carried" below) are still
 selectable by an interface filter through the zone approximation, so a blank
-would hide a row the filter can still reach. That qualifier is not decoration:
-where the zone binds NONE, the filter cannot reach the row at all, which is the
-first of the two consequences spelled out below (#6928 review). The
+would hide a row the filter can still reach. Where the zone binds NONE, that
+particular route in is gone — but the row is NOT thereby unreachable, because
+the filter still has its egress arm; see the consequence spelled out below. The
 never-blank rule is still right there — the column prints the zone name — but
 its justification is the bound-interface case, not every case.
 
@@ -1055,10 +1076,23 @@ on the filter's side — an interface-filtered `show` must see every interface o
 a zone (#4792) — and simply not mirrored into the one-name column.
 
 Two consequences beyond the `[A, B]` example above. A zone binding NO interface
-gives the filter an empty slice, so `ifaceMatchesAny` is false and no interface
-filter selects that row at all, while the column prints the zone name — which
-is not an interface name and cannot be typed back into the filter. And the
-display chain is pinned by
+gives the filter an empty slice, so `ifaceMatchesAny` is false on the INGRESS
+arm, while the column prints the zone name — which is not an interface name and
+cannot be typed back into the filter.
+
+That is a lost route in, not an unreachable row, and an earlier revision said
+otherwise (#6928): "no interface filter selects that row at all" is refuted by
+the code as written, with no edit required. `matchesV4`/`matchesV6` reject only
+when BOTH arms miss, so a session whose ingress zone binds nothing is still
+selected by the name of the interface it EGRESSES on whenever the FIB identity
+is nameable — or, failing that, by any interface bound to its EGRESS zone.
+`TestInterfaceFilterReachesRowViaEgressArm6928` constructs exactly that row
+(ingress zone `quarantine`, which binds nothing, ingress identity 0, egress
+`lo.80`) and shows `show security flow session interface lo.80` selecting it,
+with a negative control that an interface neither arm can name selects nothing.
+A row is invisible to every interface filter only when BOTH arms come up
+empty — no nameable egress identity AND an egress zone that binds no
+interface, on top of the ingress side already being empty. And the
 `TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983`
 (`pkg/cli/cli_show_flow_ingress_if_4983_test.go`), which asserts exactly those
 three arms; there is no corresponding test asserting the two sides agree,
@@ -1193,10 +1227,32 @@ That categorical form was as wrong as the "a reload" it replaced: a HITLESS
 shutdown (`Manager.Close`) preserves the pins on purpose and hits the same
 refusal, but a NON-hitless HA shutdown calls `Manager.Teardown` →
 `dataplane.Cleanup()`, which unpins everything, so on that path a restart
-already suffices. `Cleanup()` therefore has TWO production callers, not one,
-and `pkg/dataplane/cleanup_reachability_6928_test.go` pins that call graph so
-the categorical wording cannot come back green. Sizes are
-asserted in lockstep at `afxdp/bpf_map_tests.rs` and
+already suffices.
+
+Two facts underneath that sentence are pinned, and one thing is NOT (#6928).
+`Cleanup()` has TWO production callers, not one, and
+`pkg/dataplane/cleanup_reachability_6928_test.go` pins that set — resolving
+each call through the file's IMPORT bindings, so an aliased
+`dp.Cleanup()` counts and an unrelated `Cleanup()` in some other package does
+not. Which shutdown arm calls which lifecycle method is pinned behaviourally
+by `TestShutdownModeChoosesCloseOrTeardown6928`
+(`pkg/daemon/shutdown_dataplane_mode_6928_test.go`), which drives the real
+`runShutdownSequence` against a substituted dataplane.
+
+What is NOT pinned is this paragraph's WORDING, and an earlier revision claimed
+otherwise — that the caller test stopped "the categorical wording coming back
+green". It does not, and the check was run rather than reasoned about: replace
+the remediation with a different false sentence ("A plain restart ALWAYS
+releases this pin"), and the caller graph is unchanged, the two banned literals
+in `stalepin_remediation_5363_test.go` are absent, and the whole
+`./pkg/dataplane/...` suite stays green. A guard that forbids two strings
+constrains VOCABULARY, not the claim — no test can decide whether an arbitrary
+English sentence describes the pinned facts correctly. The two literals are
+kept only to stop the two specific disproven phrasings returning verbatim, and
+are labelled as that where they live. Correctness of this paragraph rests on
+reading it against the two tests above.
+
+Sizes are asserted in lockstep at `afxdp/bpf_map_tests.rs` and
 `pkg/dataplane/bpf_session_value_test.go`.
 
 ### Admitting policy ID on the session (#3056)

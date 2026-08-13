@@ -124,11 +124,25 @@ func TestLivePinABIMismatchUsesStalePinRemediation(t *testing.T) {
 			// A phrase-presence assertion is satisfied identically by a correct
 			// and an incorrect instruction — that is how both wrong messages
 			// acquired a passing test. So the only assertion kept here is the
-			// NEGATIVE on the specific claim the code disproves. The positive
-			// property — that the message's account of Cleanup()'s reachability
-			// matches the actual call graph — is bound by
-			// TestCleanupProductionCallersMatchRemediation_6928 below, which
-			// derives the callers from the source instead of trusting prose.
+			// NEGATIVE on the specific claims the code disproves.
+			//
+			// WHAT THIS IS: a VOCABULARY check, not a property check (#6928).
+			// It stops those two disproven phrasings returning VERBATIM. It
+			// cannot tell a correct remediation from an incorrect one that
+			// avoids those words, and this was measured, not assumed: rewriting
+			// the constant to say "A plain restart ALWAYS releases this pin, on
+			// every shutdown path" — categorically false, and false in the
+			// opposite direction from the claims banned below — leaves every
+			// test in ./pkg/dataplane/... green.
+			//
+			// Adding a third banned literal would repeat the mistake a third
+			// time, so the escape is not narrowed, it is stated. What IS bound
+			// is the pair of facts the message describes:
+			// TestCleanupProductionCallersMatchRemediation_6928 pins Cleanup()'s
+			// production caller set, and TestShutdownModeChoosesCloseOrTeardown6928
+			// (pkg/daemon) pins which shutdown arm calls Teardown versus Close.
+			// Whether this English sentence reports those two facts correctly is
+			// not decidable by a test; it is decided by reading it against them.
 			for _, disproven := range []string{
 				"restarting xpfd does NOT release",
 				"reachable only from",

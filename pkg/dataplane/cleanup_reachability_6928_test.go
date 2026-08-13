@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -38,23 +39,30 @@ import (
 // text that describes it. It is not a proxy for the message's correctness: it
 // is the same kind of fact the message asserts.
 //
-// LIMIT, stated rather than left implied (#6928 review). This pins WHO calls
-// `Cleanup()` — the exact direct-caller set. It does NOT pin mode PLACEMENT or
-// REACHABILITY: that a call sits in the non-hitless arm specifically, or that
-// anything reaches it at all. A call-graph instrument cannot express
-// reachability, and this one does not try. The companion below narrows that
-// gap by asserting both shutdown arms still appear in
-// `pkg/daemon/daemon_run_shutdown.go`, but it is a SUBSTRING check on the file
-// text, so it proves the two call expressions are still WRITTEN there — not
-// which branch each sits in, and it would be satisfied by the text appearing
-// inside a comment. The mode-dependence of the remediation ultimately rests on
-// reading that file, not on this pair of tests. What the pair does buy is that
-// neither fact can change SILENTLY.
+// SCOPE, measured rather than asserted (#6928). This pins WHO calls
+// `Cleanup()`. It does NOT pin mode PLACEMENT — that a call sits in the
+// non-hitless arm specifically, or that anything reaches it at all. That half
+// is bound behaviourally, in
+// `pkg/daemon/shutdown_dataplane_mode_6928_test.go`, which drives the real
+// `runShutdownSequence` with a substituted `RuntimeDataPlane` and asserts both
+// arms: non-hitless calls `Teardown` and not `Close`, hitless the reverse.
+//
+// A previous revision paired this with a SUBSTRING check that
+// `daemon_run_shutdown.go` still contained the two call expressions, and
+// described it as making the mode claim un-regressable. It did not, and this
+// round measured both escapes rather than reasoning about them: inverting the
+// condition to `if !hitless`, and replacing the call with
+// `// d.dp.Teardown()`, each left that check GREEN (the second still builds).
+// Both are RED against the behavioural test, so the substring companion was
+// removed rather than re-labelled — it proved a strict subset of what its
+// replacement proves.
 //
 // Deliberately NOT asserted here: the message's wording. Recording that the
 // prose must contain some phrase is what produced two wrong-but-green rounds.
 // stalepin_remediation_5363_test.go keeps only the NEGATIVE — that the
-// disproven categorical claims are absent.
+// disproven categorical claims are absent, which is a check on VOCABULARY and
+// is labelled as such there; it cannot tell a true remediation from a false
+// one that avoids those words.
 
 // cleanupCaller is one production call to dataplane.Cleanup(), identified by
 // the package-relative file and the enclosing function.
@@ -65,9 +73,48 @@ type cleanupCaller struct {
 
 func (c cleanupCaller) String() string { return c.file + ":" + c.fn }
 
-// findCleanupCallers walks the repo for non-test calls to Cleanup(), matching
-// both the in-package bare form (`Cleanup()`) and the qualified form any other
-// package must use (`dataplane.Cleanup()`).
+// dataplaneImportPath is the package whose Cleanup() this test tracks.
+const dataplaneImportPath = "github.com/psaab/xpf/pkg/dataplane"
+
+// dataplaneLocalName reports how `dataplaneImportPath` is bound in f:
+// the empty string if f does not import it, "." for a dot-import (where
+// `Cleanup()` is written bare), otherwise the qualifier — the alias when the
+// import has one, else the package name.
+//
+// Resolving the IMPORT rather than assuming the spelling `dataplane.Cleanup`
+// is what makes an aliased call site visible. The previous revision matched
+// the literal qualifier `dataplane`, so `import dp "…/pkg/dataplane"` followed
+// by `dp.Cleanup()` was a real production caller this walk silently missed —
+// reproduced by adding exactly that file and watching the test stay green.
+func dataplaneLocalName(f *ast.File) string {
+	for _, spec := range f.Imports {
+		path, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || path != dataplaneImportPath {
+			continue
+		}
+		if spec.Name != nil {
+			if spec.Name.Name == "_" {
+				return "" // blank import: no callable binding
+			}
+			return spec.Name.Name // "." for a dot-import, else the alias
+		}
+		return "dataplane" // package name, no alias
+	}
+	return ""
+}
+
+// findCleanupCallers walks the repo for non-test calls to
+// dataplane.Cleanup(), resolving the callee through each file's IMPORT
+// bindings rather than through its spelling.
+//
+// Three forms count: the bare `Cleanup()` inside package dataplane itself;
+// the bare form in a file that dot-imports the package; and `<q>.Cleanup()`
+// where <q> is whatever local name that file bound the package to.
+//
+// Not resolved, because that needs full type information: a local identifier
+// that SHADOWS the package name, and any indirect call (`f := dataplane.Cleanup;
+// f()`). Both would need `go/types`; neither is reachable by accident, and the
+// walk errs toward reporting rather than hiding.
 func findCleanupCallers(t *testing.T, root string) []cleanupCaller {
 	t.Helper()
 	var found []cleanupCaller
@@ -99,6 +146,24 @@ func findCleanupCallers(t *testing.T, root string) []cleanupCaller {
 			rel = path
 		}
 		rel = filepath.ToSlash(rel)
+
+		local := dataplaneLocalName(f)
+		// A bare `Cleanup()` names THIS package's function only inside the
+		// dataplane package itself, or in a file that dot-imported it. Counting
+		// it anywhere else is how an unrelated `Cleanup()` in another package —
+		// a perfectly ordinary name — was falsely reported as a caller, which
+		// this round reproduced by adding one and watching the caller-set
+		// comparison fail on a package that never touches the dataplane.
+		bareIsOurs := local == "." ||
+			(f.Name.Name == "dataplane" && strings.HasPrefix(rel, "pkg/dataplane/"))
+		qualifier := ""
+		if local != "" && local != "." {
+			qualifier = local
+		}
+		if !bareIsOurs && qualifier == "" {
+			return nil // this file cannot name dataplane.Cleanup at all
+		}
+
 		for _, decl := range f.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
 			if !ok || fd.Body == nil {
@@ -110,13 +175,13 @@ func findCleanupCallers(t *testing.T, root string) []cleanupCaller {
 					return true
 				}
 				switch fun := call.Fun.(type) {
-				case *ast.Ident: // in-package: Cleanup()
-					if fun.Name == "Cleanup" {
+				case *ast.Ident: // bare: Cleanup()
+					if bareIsOurs && fun.Name == "Cleanup" {
 						found = append(found, cleanupCaller{rel, fd.Name.Name})
 					}
-				case *ast.SelectorExpr: // cross-package: dataplane.Cleanup()
+				case *ast.SelectorExpr: // qualified: <local>.Cleanup()
 					pkg, ok := fun.X.(*ast.Ident)
-					if ok && pkg.Name == "dataplane" && fun.Sel.Name == "Cleanup" {
+					if ok && qualifier != "" && pkg.Name == qualifier && fun.Sel.Name == "Cleanup" {
 						found = append(found, cleanupCaller{rel, fd.Name.Name})
 					}
 				}
@@ -191,45 +256,18 @@ func TestCleanupProductionCallersMatchRemediation_6928(t *testing.T) {
 	}
 }
 
-// TestNonHitlessShutdownReachesTeardown_6928 is the other half of the claim:
-// that the second caller is on the ordinary shutdown path rather than some
-// decommission-only helper. Without it, `Teardown` could lose its shutdown call
-// site entirely and the caller-set test above would still pass while the
-// mode-dependent wording described a path nothing takes.
+// The other half of the claim — that the second caller sits on the ORDINARY
+// non-hitless shutdown path rather than a decommission-only helper — used to
+// live here as a substring check over `pkg/daemon/daemon_run_shutdown.go`. It
+// is now bound behaviourally by
+// `TestShutdownModeChoosesCloseOrTeardown6928` in `pkg/daemon`, which observes
+// which lifecycle method each arm actually calls. See the SCOPE note above for
+// the two mutations that survived the substring form and are RED against the
+// replacement.
 //
-// It NARROWS that gap; it does not close it (#6928 review). A substring check
-// proves the two call expressions are still written in the file — not that
-// `d.dp.Teardown()` is the arm a NON-hitless shutdown takes, and not that
-// either line is reached rather than sitting in a comment. Read the file for
-// that. Do not describe this test as proving `Teardown` "cannot become dead
-// code".
-//
-// Kept as a source assertion rather than a behavioural one deliberately:
-// exercising it for real means calling Cleanup(), which does
-// os.RemoveAll("/sys/fs/bpf/xpf") — destroying the pinned dataplane state of
-// whatever machine runs the suite. That is not a test, and a test nobody dares
-// run is not a guard.
-func TestNonHitlessShutdownReachesTeardown_6928(t *testing.T) {
-	t.Parallel()
-
-	path, err := filepath.Abs(filepath.Join("..", "daemon", "daemon_run_shutdown.go"))
-	if err != nil {
-		t.Fatalf("resolve shutdown path: %v", err)
-	}
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	body := string(src)
-
-	// Both arms must be present: the hitless arm that PRESERVES the pins and
-	// the non-hitless arm that tears them down. The remediation names both.
-	for _, want := range []string{"d.dp.Close()", "d.dp.Teardown()"} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("%s no longer calls %s. The stale-pin remediation says a hitless "+
-				"shutdown preserves the pins and a non-hitless one releases them; if "+
-				"one arm is gone that sentence is now false (#6928)",
-				filepath.Base(path), want)
-		}
-	}
-}
+// The reason the check could not simply be made behavioural HERE is worth
+// recording: exercising it in `pkg/dataplane` means calling `Cleanup()` for
+// real, which does `os.RemoveAll("/sys/fs/bpf/xpf")` and would destroy the
+// pinned dataplane state of whatever machine runs the suite. Substituting the
+// `RuntimeDataPlane` interface at the daemon's call site avoids that entirely:
+// the fake records the call and touches no bpffs.

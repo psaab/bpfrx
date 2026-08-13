@@ -438,8 +438,20 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 // ingress identity and MUST stay reachable by an interface-filtered show
 // and clear — as far as the zone approximation can carry them, which is
 // nowhere if the ingress zone binds NO interface: the fallback is then an
-// empty slice, ifaceMatchesAny is false, and no interface filter selects
-// the row at all (#6928 review; session/README.md states the same limit):
+// empty slice and ifaceMatchesAny is false on THIS arm.
+//
+// That is not the same as the row being unreachable, and an earlier
+// revision of this comment said it was (#6928). matchesV4/matchesV6
+// reject only when BOTH arms miss — `!f.ifaceMatchesAny(inIfs) &&
+// !f.ifaceMatchesAny(outIfs)` — so an empty ingress slice removes one of
+// two routes in, and the row is still selected by the name of the
+// interface it EGRESSES on (resolveEgressIfaces below, precise from the
+// FIB identity or falling back to the egress zone). Only when both arms
+// come up empty is the row invisible to every interface filter.
+// TestInterfaceFilterReachesRowViaEgressArm6928 in pkg/cli constructs
+// the empty-ingress case and shows it selected.
+//
+// The three populations:
 //   - the reverse companion, whose own ingress has not been OBSERVED yet.
 //     The forward flow's egress IS resolved at install; it is the wrong
 //     datum, predicting where the reply will arrive rather than recording

@@ -141,7 +141,10 @@ type SessionValue struct {
 	// everything, so there a restart is enough. dataplane.Cleanup() therefore
 	// has TWO production callers — the `xpfd cleanup` subcommand
 	// (cmd/xpfd/main.go) and Manager.Teardown (loader.go) — not one.
-	// TestCleanupProductionCallersMatchRemediation_6928 binds that count.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that set, and
+	// TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) binds WHICH
+	// shutdown arm calls Teardown versus Close. Neither binds this comment's
+	// wording — no test can; read it against those two.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
@@ -429,7 +432,10 @@ type SessionValueV6 struct {
 	// everything, so there a restart is enough. dataplane.Cleanup() therefore
 	// has TWO production callers — the `xpfd cleanup` subcommand
 	// (cmd/xpfd/main.go) and Manager.Teardown (loader.go) — not one.
-	// TestCleanupProductionCallersMatchRemediation_6928 binds that count.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that set, and
+	// TestShutdownModeChoosesCloseOrTeardown6928 (pkg/daemon) binds WHICH
+	// shutdown arm calls Teardown versus Close. Neither binds this comment's
+	// wording — no test can; read it against those two.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".

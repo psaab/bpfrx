@@ -24,18 +24,20 @@ import (
 //
 // "the sessions that arrived on lo.50" is the INGRESS ARM only (#6928 review):
 // matchesV4/matchesV6 OR the ingress and egress arms, so an `interface` filter
-// also selects sessions that merely EGRESS there. That OR is deliberate and
-// out of scope here — this test is about the ingress column agreeing with the
-// ingress arm, and its fixtures do not exercise the egress one.
+// also selects sessions that merely EGRESS there. The #4983 tests below are
+// about the ingress column agreeing with the ingress arm and leave FibIfindex
+// zero; the two #6928 tests at the end of this file exercise the egress arm
+// deliberately, because the OR is what makes "the filter and the column cannot
+// disagree" false even for a perfectly stamped identity.
 //
 // Harness note: buildSessionEgressIfaces resolves names through the real
 // net.InterfaceByName, so the fixture's ingress interface has to be a netdev
 // that exists on the test host. `lo` is the one name that is always present
-// (the #5813 display tests use it for the same reason). Two UNITS of it —
-// unit 0 and unit 50 — give the fixture its distinguishing property without
-// needing a second real NIC: both units share one parent ifindex, so only the
-// {ifindex, VLAN} pair separates them, which is precisely the identity under
-// test.
+// (the #5813 display tests use it for the same reason). THREE UNITS of it —
+// unit 0, unit 50 and unit 80 — give the fixture its distinguishing properties
+// without needing a second real NIC: every unit shares one parent ifindex, so
+// only the {ifindex, VLAN} pair separates them, which is precisely the identity
+// under test. Unit 80 is the egress name the #6928 tests filter on.
 
 const (
 	ingressIfColumnTrustZoneID   uint16 = 1
@@ -55,6 +57,12 @@ type ingressIfColumnCLIDP struct {
 	ifindex     uint32
 	vlanID      uint16
 	ingressZone uint16
+	// The FIB egress identity, zero for every caller that only exercises the
+	// ingress column (#6928). A non-zero value gives the session a NAMEABLE
+	// egress interface, which is what the egress arm of the interface filter
+	// resolves — see TestInterfaceFilterReachesRowViaEgressArm6928.
+	fibIfindex uint32
+	fibVlanID  uint16
 }
 
 func (d *ingressIfColumnCLIDP) IsLoaded() bool { return true }
@@ -68,9 +76,12 @@ func (d *ingressIfColumnCLIDP) IterateSessions(fn func(dataplane.SessionKey, dat
 	val := dataplane.SessionValue{
 		IngressZone: d.ingressZone,
 		EgressZone:  ingressIfColumnUntrustZoneID,
-		// FibIfindex stays 0 so the EGRESS column falls back to the untrust
-		// zone's own interface and cannot supply the name the ingress
-		// assertion is looking for.
+		// FibIfindex is 0 for every caller that asserts on the ingress column,
+		// so the EGRESS column falls back to the untrust zone's own interface
+		// and cannot supply the name the ingress assertion is looking for. The
+		// #6928 egress-arm tests set it deliberately.
+		FibIfindex:     d.fibIfindex,
+		FibVlanID:      d.fibVlanID,
 		IngressIfindex: d.ifindex,
 		IngressVlanID:  d.vlanID,
 	}
@@ -85,6 +96,8 @@ func (d *ingressIfColumnCLIDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6,
 	val := dataplane.SessionValueV6{
 		IngressZone:    d.ingressZone,
 		EgressZone:     ingressIfColumnUntrustZoneID,
+		FibIfindex:     d.fibIfindex,
+		FibVlanID:      d.fibVlanID,
 		IngressIfindex: d.ifindex,
 		IngressVlanID:  d.vlanID,
 	}
@@ -151,11 +164,19 @@ security {
 	// Add the ingress unit on a netdev that really resolves. Injected rather
 	// than parsed because `lo` is not a Junos interface name; the shape
 	// (parent + two units, one tagged) is what the code under test reads.
+	//
+	// Unit 80 exists for the #6928 egress-arm tests. It has to be a THIRD unit
+	// rather than reusing unit 0: buildSessionEgressIfaces names unit 0 plainly
+	// `lo` (session_display.go:57-60 only appends `.N` for a non-zero unit or
+	// VLAN), and `ifaceMatches` treats a bare parent name as matching every unit
+	// of it — so a `lo` filter would hit the INGRESS arm too and the tests could
+	// not tell the two arms apart.
 	cfg.Interfaces.Interfaces["lo"] = &config.InterfaceConfig{
 		Name: "lo",
 		Units: map[int]*config.InterfaceUnit{
 			0:  {Number: 0},
 			50: {Number: 50, VlanID: 50},
+			80: {Number: 80, VlanID: 80},
 		},
 	}
 	trust := cfg.Security.Zones["trust"]
@@ -356,4 +377,149 @@ func TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983(t *test
 			}
 		})
 	}
+}
+
+// ingressIfColumnCLIWithEgress is ingressIfColumnCLIWith plus a NAMEABLE FIB
+// egress identity on the session, so the EGRESS arm of the interface filter
+// has something precise to resolve. The two #6928 tests below need `lo` to
+// exist for the same reason the precise ingress test does.
+func ingressIfColumnCLIWithEgress(t *testing.T, ifindex uint32, vlanID, ingressZone uint16,
+	fibIfindex uint32, fibVlanID uint16) *CLI {
+	t.Helper()
+	c := ingressIfColumnCLIWith(t, ifindex, vlanID, ingressZone)
+	dp, ok := c.dp.(*ingressIfColumnCLIDP)
+	if !ok {
+		t.Fatalf("fixture dataplane is %T, want *ingressIfColumnCLIDP", c.dp)
+	}
+	dp.fibIfindex = fibIfindex
+	dp.fibVlanID = fibVlanID
+	return c
+}
+
+// loIfindex is the kernel ifindex of `lo`, the one netdev always present.
+func loIfindex(t *testing.T) uint32 {
+	t.Helper()
+	iface, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Skipf("net.InterfaceByName(%q) unavailable in this environment (%v)", "lo", err)
+	}
+	return uint32(iface.Index)
+}
+
+// TestInterfaceFilterReachesRowViaEgressArm6928 falsifies, by construction, the
+// claim that a session whose ingress zone binds NO interface cannot be selected
+// by any interface filter.
+//
+// `matchesV4`/`matchesV6` reject only when BOTH arms miss —
+// `!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)` (session_filter.go). So
+// the ingress arm going empty removes one of two ways in, not the row. Here the
+// session's ingress zone is `quarantine`, which binds nothing, AND its ingress
+// identity is 0, so `resolveIngressIfaces` returns an empty slice — the exact
+// state the retired sentence described as unreachable. It is selected anyway,
+// through its nameable egress interface.
+//
+// RED-on-revert: change either arm of that condition to a conjunction over the
+// ingress side alone (drop `&& !f.ifaceMatchesAny(outIfs)`) and this test loses
+// both its In lines.
+func TestInterfaceFilterReachesRowViaEgressArm6928(t *testing.T) {
+	lo := loIfindex(t)
+	// Ingress: zone `quarantine` (binds no interface) with NO identity stamped.
+	// Egress: lo unit 80, which the config CAN name, so the egress arm is precise.
+	c := ingressIfColumnCLIWithEgress(t, 0, 0, ingressIfColumnEmptyZoneID, lo, 80)
+
+	out := captureStdout(t, func() {
+		if err := c.showFlowSession([]string{"interface", "lo.80"}); err != nil {
+			t.Fatalf("showFlowSession: %v", err)
+		}
+	})
+
+	got := ingressIfColumnValues(t, out)
+	if len(got) != 2 {
+		t.Fatalf("`interface lo.80` selected %d of the 2 sessions (%q). A row whose ingress "+
+			"zone binds NO interface and carries no ingress identity is still selectable "+
+			"through the EGRESS arm of the filter; it is not unreachable (#6928)\n%s",
+			len(got), got, out)
+	}
+	// And the control: an interface neither arm can name selects nothing, so the
+	// assertion above is not merely observing that the filter is inert.
+	outNone := captureStdout(t, func() {
+		if err := c.showFlowSession([]string{"interface", "ge-0/0/8.0"}); err != nil {
+			t.Fatalf("showFlowSession: %v", err)
+		}
+	})
+	if none := ingressIfColumnValues(t, outNone); len(none) != 0 {
+		t.Fatalf("`interface ge-0/0/8.0` must select neither session (its ingress zone binds "+
+			"nothing and its egress is lo.80), got %d: %q\n%s", len(none), none, outNone)
+	}
+}
+
+// TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928 falsifies the
+// claim that, for a NON-ZERO NAMEABLE ingress identity, the filter and the
+// displayed interface name cannot disagree.
+//
+// The session arrives on `lo.50` and egresses on `lo.80` — two units of one NIC,
+// separated only by the {ifindex, VLAN} pair, both nameable, neither a fallback.
+// `interface lo.80` selects it through the EGRESS arm, and the In line prints
+// `If: lo.50`, the interface it actually arrived on. Filter term and column
+// differ, with no zero identity and no fallback anywhere in the derivation.
+//
+// This is not a defect: an operator naming an interface wants the flows crossing
+// it in EITHER direction (cli_show_flow.go:307-315 derives exactly this), and the
+// ingress column answers a different question from the filter's disjunction. What
+// is bounded is narrower than "cannot disagree": when a row is selected BY ITS
+// INGRESS ARM, the column names the interface that was typed, because both read
+// the same stamped identity through the same {ifindex, VLAN} map. The second
+// sub-test pins that narrower property so the pair distinguishes the two cases.
+//
+// RED-on-revert: restore `inIf := zoneIfaces[val.IngressZone]` at the print site
+// and the ingress-selected sub-test goes red (the column prints ge-0/0/8.0, the
+// zone's first interface, instead of the lo.50 that was filtered on).
+func TestInterfaceFilterEgressArmMakesColumnNameAnotherInterface6928(t *testing.T) {
+	lo := loIfindex(t)
+
+	t.Run("selected via EGRESS: column names the ingress interface, not the filter term", func(t *testing.T) {
+		c := ingressIfColumnCLIWithEgress(t, lo, 50, ingressIfColumnTrustZoneID, lo, 80)
+		out := captureStdout(t, func() {
+			if err := c.showFlowSession([]string{"interface", "lo.80"}); err != nil {
+				t.Fatalf("showFlowSession: %v", err)
+			}
+		})
+		got := ingressIfColumnValues(t, out)
+		if len(got) != 2 {
+			t.Fatalf("`interface lo.80` must select both sessions through the egress arm, "+
+				"got %d: %q\n%s", len(got), got, out)
+		}
+		for i, name := range got {
+			if name != "lo.50" {
+				t.Errorf("In-line If: column %d = %q, want %q — the column reports the "+
+					"interface the session ARRIVED on, which for an egress-arm match is "+
+					"not the interface that was filtered on (#6928)", i, name, "lo.50")
+			}
+			if name == "lo.80" {
+				t.Errorf("In-line If: column %d = %q: the ingress column must not be "+
+					"rewritten to echo the filter term", i, name)
+			}
+		}
+	})
+
+	t.Run("selected via INGRESS: column names the filter term", func(t *testing.T) {
+		c := ingressIfColumnCLIWithEgress(t, lo, 50, ingressIfColumnTrustZoneID, lo, 80)
+		out := captureStdout(t, func() {
+			if err := c.showFlowSession([]string{"interface", "lo.50"}); err != nil {
+				t.Fatalf("showFlowSession: %v", err)
+			}
+		})
+		got := ingressIfColumnValues(t, out)
+		if len(got) != 2 {
+			t.Fatalf("`interface lo.50` must select both sessions through the ingress arm, "+
+				"got %d: %q\n%s", len(got), got, out)
+		}
+		for i, name := range got {
+			if name != "lo.50" {
+				t.Errorf("In-line If: column %d = %q, want %q — a row selected by its "+
+					"INGRESS arm must print the interface that was filtered on: both read "+
+					"the same stamped identity through the same map (#4983)", i, name, "lo.50")
+			}
+		}
+	})
 }
