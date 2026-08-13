@@ -894,8 +894,10 @@ fn off_wins_over_contradictory_pool_action_5717() {
 /// and the `else` arm below the pool_mode check clears the tentative counter
 /// and `continue`s — so matching traffic falls through to the next, BROADER
 /// rule and is translated by it. That is the fail-open the strict gate's own
-/// rejection text names ("matching traffic falls through to a later broader
-/// rule — an intended exemption silently disappears").
+/// rejection text names ("matching traffic falls through — translated by a
+/// later broader rule if one matches"). This fixture supplies that later rule;
+/// the sibling `actionless_rule_with_no_later_rule_passes_untranslated_5717`
+/// covers the other half of that sentence (#6820).
 ///
 /// This test asserts today's behavior, not a desired one. Making an actionless
 /// rule TERMINAL would be a migration-contract change (it would newly exempt

@@ -1986,8 +1986,10 @@ type compileOpts struct {
 	// (validateNATTerminalActionCardinalityStrict) from a hard compile error to
 	// a cfg.Warnings entry. A NAT rule whose complete `then {}` block carries
 	// ZERO terminal actions (actionless — the snapshot builder installs no
-	// translation, so an intended `off` exemption silently disappears and a
-	// later broader rule is revealed) or TWO+ mutually-exclusive actions inside
+	// translation and the rule does not stop evaluation, so an intended `off`
+	// exemption silently disappears and the traffic falls through: translated by
+	// a later broader rule if one matches, otherwise left untranslated) or TWO+
+	// mutually-exclusive actions inside
 	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
 	// picks one by packed-key / child order, so an exemption can publish as a
 	// translation) was previously accepted. The strict commit / commit-check

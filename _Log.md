@@ -77373,3 +77373,63 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: userspace-dp/src/nat/tests_source.rs,
   pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
   pkg/config/compiler_validate_strict_nat.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6820 re-gate fold round 3 (Codex DO-NOT-MERGE §4). Two rationale
+  defects and a wording sweep; no behaviour change.
+  **R2 — "DNAT precedence is decided in Go" is false, measured.** Three sites
+  (`compiler_validate_strict_nat.go` twice, `docs/config-schema.md` once) said
+  the `isOff` short-circuit in `nat_destination.go` DECIDES off-over-pool
+  precedence for DNAT while Rust decides it for SNAT. It does not: it
+  CANONICALIZES. `DnatEntry::to_outcome` branches on `off` alone and never reads
+  the pool, and `DnatTable::from_snapshots` independently substitutes a
+  `0.0.0.0` placeholder for an `off` entry's pool address — two Rust points,
+  both keyed on `off`, neither on anything Go did. Every pre-existing `off:true`
+  fixture in `tests_destination.rs` also leaves `pool_address` empty (exactly
+  the shape Go emits), so the suite could not tell "Rust ignores the pool" from
+  "Go removed the pool". New two-arm test
+  `dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820` builds the
+  snapshot Go never emits — `Off=true` WITH a usable `192.168.1.10:8080` pool —
+  plus a later broader translate rule to `192.168.99.99:9999`, and asserts
+  exemption; its control arm clears `off` on the SAME rule and asserts the
+  translation, so the measurement arm's `None` cannot be a silently dropped
+  entry. RED-on-revert: `to_outcome`'s `if self.off` -> `if false` fails the
+  measurement assertion with `left: Some(rewrite_dst: 0.0.0.0,
+  rewrite_dst_port: 8080), right: None` while the control assertion, which runs
+  first, stays green. Note the narrower edit "exempt only when the pool is also
+  empty" would NOT discriminate — the address is already the placeholder by
+  then; that asymmetry is recorded on the test. A pointer comment now sits at
+  the `if !isOff` site in `nat_destination.go` so the false belief is not
+  re-derived there.
+  **R1 — "both outcomes are fail-open" conflates a live defect with a latent
+  one.** An actionless rule with a later broader rule IS a fail-open (the packet
+  is translated against intent); with no later rule the packet's disposition
+  COINCIDES with the intended exemption, so nothing is observably wrong today.
+  What is wrong there is the RULE — it is non-terminal, so adding any later
+  broader rule silently turns the same config into the first case, which is why
+  the gate rejects both. Corrected in `compiler_validate_strict_nat.go` and
+  `docs/config-schema.md`.
+  **Wording sweep.** Seven surviving sites stated the fall-through outcome
+  unconditionally ("...and a later broader rule is revealed" / "FALLS THROUGH to
+  a later broader rule"): `compiler_uniformgates_firewall_nat2.go` (x2),
+  `compiler_validate_strict_nat.go` (the doc bullet AND the operator-facing
+  rejection string), `docs/config-schema.md`, `compiler_opts.go`,
+  `compiler_nat_terminal_action_5628_test.go` (not in the review's list — found
+  by a tree-wide sweep), and `nat_terminal_action_tolerant_5717_test.go`. All
+  now name both branches. Changing the operator string made
+  `tests_source.rs:897` quote stale text, so that quote was updated too. Two
+  sites already named both branches correctly and were left alone
+  (`compiler_uniformgates_nat.go:124`, `docs/config-schema.md:5391` — "a later
+  rule or the no-NAT default"); the #3844 historical notes in
+  `nat_destination.go:111`, `protocol/nat.rs:303` and `userspace-dnat-plan.md`
+  describe that issue's actual reproducer, which did have a later rule, and were
+  left as history.
+  Validation: `go build ./...` rc=0; `go test ./pkg/config/...
+  ./pkg/dataplane/...` all ok; full `cargo test --release` green.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_uniformgates_firewall_nat2.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/dataplane/userspace/nat_destination.go,
+  pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
+  userspace-dp/src/nat/tests_destination.rs, userspace-dp/src/nat/tests_source.rs,
+  docs/config-schema.md, _Log.md

@@ -346,10 +346,12 @@ security {
 // builder EMITS the rule — it is present in the published snapshot with no
 // terminal action — and the Rust matcher's `else` arm
 // (userspace-dp/src/nat/source.rs) then clears the tentative counter and
-// CONTINUES to the next rule, so matching traffic is translated by the later,
-// broader rule. That is the fail-open the gate's own strict rejection text
-// names. Destination NAT reaches the same outcome by a different mechanism:
-// the builder skips the rule entirely, so the traffic likewise falls through.
+// CONTINUES to the next rule, so matching traffic falls THROUGH. What it falls
+// through TO depends on what follows: a later, broader rule translates it —
+// the fail-open the gate's own strict rejection text names — and with no later
+// rule the loop simply ends and the packet leaves untranslated (#6820).
+// Destination NAT reaches the same fall-through by a different mechanism: the
+// builder skips the rule entirely.
 //
 // This test asserts today's behavior, not a desired one — see the #5717
 // scoping note for why changing it is a migration-contract decision. It exists

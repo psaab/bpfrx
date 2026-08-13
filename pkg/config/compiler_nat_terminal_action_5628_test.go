@@ -10,8 +10,10 @@ import (
 // SNAT: `source-nat interface` | `source-nat pool <p>` | `source-nat off`;
 // DNAT: `destination-nat pool <p>` | `destination-nat off`. Before the fix the
 // schema permitted a block with ZERO actions (actionless: the snapshot builder
-// installs no translation, so an intended `off` exemption silently disappears
-// and a later broader rule is revealed) or TWO+ mutually-exclusive actions (the
+// installs no translation and the rule does not stop evaluation, so an intended
+// `off` exemption silently disappears and the traffic falls through —
+// translated by a later broader rule if one matches, otherwise left
+// untranslated) or TWO+ mutually-exclusive actions (the
 // compiler silently picked one by packed-key / child order, so an exemption
 // could publish as a translation — the inverse of the authored action).
 //

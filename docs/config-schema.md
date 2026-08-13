@@ -3065,8 +3065,10 @@ The closed-world keyword audit above validates WHICH keywords may appear under
 `then`, but not HOW MANY translation actions a rule carries. A malformed or
 mixed-version rule could still present a complete `then {}` block with ZERO
 NAT-terminal actions (actionless — the snapshot builder installs no
-translation, so an intended `off` exemption silently disappears and a later
-broader rule is revealed) or TWO+ mutually-exclusive actions (`off` + `pool`,
+translation and the rule does not stop evaluation, so an intended `off`
+exemption silently disappears and the traffic falls through: translated by a
+later broader rule if one matches, otherwise left untranslated) or TWO+
+mutually-exclusive actions (`off` + `pool`,
 `interface` + `pool` — the compiler silently picked one by packed-key / child
 order, so an exemption could publish as a translation). `security nat
 {source,destination} rule … then` must therefore carry EXACTLY ONE NAT-terminal
@@ -3094,11 +3096,19 @@ there very differently, and the difference is load-bearing:
 - **Contradictory (2+ actions) CONTAINING `off` resolves to the EXEMPTION.**
   Recording every field is what makes this safe: `off` takes precedence over
   `interface` / `pool`, so such a contradiction can never publish the INVERSE of
-  the authored action. The precedence is split across the language boundary —
-  destination NAT decides it in Go (the `isOff` short-circuit in
-  `pkg/dataplane/userspace/nat_destination.go`, which must publish a pool-less
-  exemption entry) and source NAT decides it in Rust (the `rule.off` early
-  return in `userspace-dp/src/nat/source.rs`). Both halves are now pinned:
+  the authored action. The two builders reach that outcome differently —
+  source NAT forwards every field to Rust, destination NAT short-circuits on
+  `isOff` in `pkg/dataplane/userspace/nat_destination.go` and publishes a
+  pool-less exemption entry — but **the precedence itself is decided in Rust on
+  both paths** (#6820): the `rule.off` early return in
+  `userspace-dp/src/nat/source.rs` for SNAT, and the `off`-only branch of
+  `DnatEntry::to_outcome` in `userspace-dp/src/nat/destination.rs` for DNAT.
+  The Go short-circuit is CANONICALIZATION, not the decision: a snapshot
+  carrying both `Off=true` and a usable pool — which Go never emits but a
+  hand-built or mixed-version one can — still resolves to the exemption,
+  measured by `dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820`
+  (`userspace-dp/src/nat/tests_destination.rs`), whose control arm clears `off`
+  on the same rule and gets the translation. Both halves are now pinned:
   `TestTolerantContradictory{SNAT,DNAT}*_5717`
   (`pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go`) and
   `off_wins_over_contradictory_{interface,pool}_action_5717`
@@ -3135,12 +3145,16 @@ there very differently, and the difference is load-bearing:
   traffic FALLS THROUGH — and what it falls through TO depends on what follows
   it. If a later, broader rule matches, that rule translates it: the fail-open
   the gate's own zero-action rejection text describes. If NOTHING later matches,
-  the matcher's loop simply ends and the packet leaves **untranslated**. Both
-  are fail-open against an INTENDED exemption — in the second case the operator
-  gets no translation only by accident rather than because the rule asked for it
-  — but they are different outcomes, and an earlier revision of this bullet
-  asserted only the first ("and is translated by that"), which presumes a later
-  rule exists (#6820 re-gate). Source NAT reaches the fall-through by emitting
+  the matcher's loop simply ends and the packet leaves **untranslated**. Only
+  the first is a fail-open: the packet is translated against the operator's
+  intent. In the second the packet's disposition COINCIDES with the intended
+  exemption, so nothing is observably wrong today — calling that a fail-open
+  too conflates a live wrong disposition with a latent one. What is wrong there
+  is the RULE, not the packet: it is non-terminal, so adding any later broader
+  rule silently turns the same config into the first case. That is why the gate
+  rejects it either way. An earlier revision of this bullet asserted only the
+  first outcome ("and is translated by that"), which presumes a later rule
+  exists (#6820 re-gate). Source NAT reaches the fall-through by emitting
   the actionless rule and letting the Rust matcher's `else` arm `continue`;
   destination NAT reaches it by skipping the rule in the builder. Making an
   actionless rule terminal would newly exempt traffic that already-deployed

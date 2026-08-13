@@ -201,8 +201,10 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 
 	// #5628 (codex-review-181 M16): a source / destination NAT rule's complete
 	// `then` block must carry EXACTLY ONE NAT-terminal translation action. A
-	// rule with ZERO actions installs no translation (an intended `off`
-	// exemption silently disappears, revealing a later broader rule); a rule
+	// rule with ZERO actions installs no translation and is NOT terminal (an
+	// intended `off` exemption silently disappears and the traffic falls
+	// through — translated by a later broader rule if one matches, otherwise
+	// untranslated); a rule
 	// with TWO+ mutually-exclusive actions inside one block let the compiler
 	// silently pick one by packed-key/child order (an exemption can publish as a
 	// translation — the inverse of the authored action). Strict on commit /
@@ -213,8 +215,9 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// `off` (source-NAT `interface` + `pool`) gives INTERFACE MODE precedence,
 	// producing interface translation when a suitable same-family egress
 	// address exists and a fail-closed `Unavailable` otherwise, silently
-	// discarding the pool either way; an actionless rule FALLS
-	// THROUGH to a later broader rule. All three are spelled out and test-cited
+	// discarding the pool either way; an actionless rule FALLS THROUGH — to a
+	// later broader rule if one matches, otherwise off the end of the rule list
+	// untranslated. All three are spelled out and test-cited
 	// on validateNATTerminalActionCardinalityStrict (#5717). Do not restate
 	// them as "inert", and do not compress them to "a contradiction resolves to
 	// the exemption" — that is true only for the `off`-bearing case. Preserves #3850
