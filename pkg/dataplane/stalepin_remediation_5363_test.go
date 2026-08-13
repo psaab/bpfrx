@@ -104,31 +104,35 @@ func TestLivePinABIMismatchUsesStalePinRemediation(t *testing.T) {
 			}
 			// ...and it must be ACTIONABLE, not merely distinctive.
 			//
-			// This block used to require the phrases "FULL dataplane reload",
-			// "stale pin" and "released". Those pinned the message's WORDING and
-			// were satisfied by an instruction that did not work: the text told
-			// the operator to "stop xpfd so the old pin is released", and a bpffs
-			// pin outlives the process, so following it produced the identical
-			// refusal on the next start — mid-upgrade, with the dataplane down
-			// (#6928). A phrase-presence assertion cannot tell a correct
-			// instruction from an incorrect one; it defends the text, not the
-			// behaviour.
+			// This block has now pinned the WORDING of two DIFFERENT wrong
+			// instructions (#6928). It first required "FULL dataplane reload" /
+			// "stale pin" / "released", which was satisfied by text telling the
+			// operator to "stop xpfd so the old pin is released" — a bpffs pin
+			// outlives the process, so following it reproduced the refusal. r5
+			// replaced those with "restarting xpfd does NOT release" and
+			// "OUTLIVES the process", which locked in the OPPOSITE categorical
+			// claim, equally false: Cleanup() also runs from Manager.Teardown,
+			// which non-hitless HA shutdown calls, so on that path a restart IS
+			// enough.
 			//
-			// So assert the two properties that make the message USEFUL: it names
-			// the mechanism that actually releases the pin (`Cleanup()` does
-			// os.RemoveAll(bpfPinPath) and is reachable only from `xpfd cleanup`),
-			// and it says plainly that a restart is not sufficient. Anyone
-			// rewording this must keep both, not restore a matching phrase.
-			if !strings.Contains(msg, "xpfd cleanup") {
-				t.Fatalf("err = %v, remediation must name `xpfd cleanup` — the only "+
-					"path that unpins bpffs state and therefore the only thing that "+
-					"clears this refusal", err)
-			}
-			for _, phrase := range []string{"restarting xpfd does NOT release", "OUTLIVES the process"} {
-				if !strings.Contains(msg, phrase) {
-					t.Fatalf("err = %v, remediation must state that a restart does NOT "+
-						"release the pin (missing %q); without it the operator's first "+
-						"instinct is a restart, which fails identically", err, phrase)
+			// A phrase-presence assertion is satisfied identically by a correct
+			// and an incorrect instruction — that is how both wrong messages
+			// acquired a passing test. So the only assertion kept here is the
+			// NEGATIVE on the specific claim the code disproves. The positive
+			// property — that the message's account of Cleanup()'s reachability
+			// matches the actual call graph — is bound by
+			// TestCleanupProductionCallersMatchRemediation_6928 below, which
+			// derives the callers from the source instead of trusting prose.
+			for _, disproven := range []string{
+				"restarting xpfd does NOT release",
+				"reachable only from",
+			} {
+				if strings.Contains(msg, disproven) {
+					t.Fatalf("err = %v, remediation restored the categorical claim %q. "+
+						"Cleanup() also runs from Manager.Teardown, which "+
+						"daemon_run_shutdown.go calls on every NON-hitless shutdown, so "+
+						"whether a restart clears the pin is mode-dependent (#6928)",
+						err, disproven)
 				}
 			}
 			// ...and NEVER the "rebuild the shim" remediation.

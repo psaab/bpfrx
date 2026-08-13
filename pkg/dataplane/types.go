@@ -131,12 +131,17 @@ type SessionValue struct {
 	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
 	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
 	// ValueSize mismatch against the live pin, so a new daemon never reads an
-	// old helper's 136/184-byte rows — the remediation is `xpfd cleanup` (or a
-	// reboot), which unpins the maps so the next load recreates them at the new
-	// size. NOT a restart: a bpffs pin outlives the process that made it, so
-	// stopping and starting xpfd leaves the old-size pin in place and the
-	// pre-flight refuses again. dataplane.Cleanup() is reachable only from the
-	// `xpfd cleanup` subcommand (cmd/xpfd/main.go).
+	// old helper's 136/184-byte rows — the recovery is to unlink the named pin
+	// (docs/operations/userspace-shim-pin-recovery.md) so the next load
+	// recreates it at the new size. Whether a plain restart suffices is
+	// MODE-DEPENDENT (#6928): a bpffs pin outlives its process, and a HITLESS
+	// shutdown deliberately preserves the pins (Manager.Close), so there a
+	// restart leaves the old-size pin in place and the pre-flight refuses
+	// again; a NON-hitless HA shutdown calls Manager.Teardown, which unpins
+	// everything, so there a restart is enough. dataplane.Cleanup() therefore
+	// has TWO production callers — the `xpfd cleanup` subcommand
+	// (cmd/xpfd/main.go) and Manager.Teardown (loader.go) — not one.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that count.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
@@ -379,12 +384,17 @@ type SessionValueV6 struct {
 	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
 	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
 	// ValueSize mismatch against the live pin, so a new daemon never reads an
-	// old helper's 136/184-byte rows — the remediation is `xpfd cleanup` (or a
-	// reboot), which unpins the maps so the next load recreates them at the new
-	// size. NOT a restart: a bpffs pin outlives the process that made it, so
-	// stopping and starting xpfd leaves the old-size pin in place and the
-	// pre-flight refuses again. dataplane.Cleanup() is reachable only from the
-	// `xpfd cleanup` subcommand (cmd/xpfd/main.go).
+	// old helper's 136/184-byte rows — the recovery is to unlink the named pin
+	// (docs/operations/userspace-shim-pin-recovery.md) so the next load
+	// recreates it at the new size. Whether a plain restart suffices is
+	// MODE-DEPENDENT (#6928): a bpffs pin outlives its process, and a HITLESS
+	// shutdown deliberately preserves the pins (Manager.Close), so there a
+	// restart leaves the old-size pin in place and the pre-flight refuses
+	// again; a NON-hitless HA shutdown calls Manager.Teardown, which unpins
+	// everything, so there a restart is enough. dataplane.Cleanup() therefore
+	// has TWO production callers — the `xpfd cleanup` subcommand
+	// (cmd/xpfd/main.go) and Manager.Teardown (loader.go) — not one.
+	// TestCleanupProductionCallersMatchRemediation_6928 binds that count.
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".

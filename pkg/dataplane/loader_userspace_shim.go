@@ -32,16 +32,30 @@ const (
 	// ABI mismatch (validateUserspaceShimLivePins): the running daemon's pinned
 	// map predates this build's shim-map ABI. That is NOT an embedded-vs-Go SSOT
 	// drift — the embedded shim is the intended deploy target and is not broken
-	// — so `make generate` is the WRONG action. A rolling deploy cannot cross a
-	// shim-map ABI change because the new map can only be pinned after the stale
-	// pin is released, and releasing it requires UNLINKING the pin: `Cleanup()`
-	// (loader.go) does `os.RemoveAll(bpfPinPath)`, and it is reachable only from
-	// the `xpfd cleanup` subcommand (cmd/xpfd/main.go). A bpffs pin outlives the
-	// process that created it, so stopping and restarting xpfd does NOT release
-	// it — the operator hits the identical refusal on the next start. The
-	// message below must therefore name `xpfd cleanup`, not "a reload"; it said
-	// the latter until #6928, which is worse than an inaccurate comment because
-	// it is what an operator follows mid-upgrade with the dataplane down.
+	// — so `make generate` is the WRONG action.
+	//
+	// Whether a restart clears the pin is MODE-DEPENDENT, and this message has
+	// now been wrong in BOTH directions (#6928). It said "a reload" until r5,
+	// which never releases a pin at all. r5 replaced that with the opposite
+	// categorical claim — that restarting NEVER releases it and only `xpfd
+	// cleanup` does — and that is also false: `Cleanup()` (loader.go) does
+	// `os.RemoveAll(bpfPinPath)` and has TWO production callers, the `xpfd
+	// cleanup` subcommand AND `Manager.Teardown`. `daemon_run_shutdown.go`
+	// calls `Teardown` on every NON-hitless shutdown ("HA shutdown: tearing
+	// down BPF state"), so on that path the pins are already gone and a plain
+	// restart is sufficient. Only a HITLESS shutdown takes `Manager.Close`,
+	// which deliberately leaves the pins for the next daemon to reuse — that is
+	// the path where a restart hits this identical refusal.
+	//
+	// The message must therefore state the dependency rather than either
+	// categorical, and must lead with the TARGETED recovery (unlink the one
+	// named pin, docs/operations/userspace-shim-pin-recovery.md) rather than
+	// `xpfd cleanup`, which additionally GCs every other pinned dataplane map
+	// and clears the FRR managed routes (cmd/xpfd/main.go). Getting this wrong
+	// is worse than an inaccurate comment: it is what an operator follows
+	// mid-upgrade with the dataplane down, and the r5 form pointed at a
+	// destructive action, understated what it destroys, and did so in a mode
+	// where a restart would have sufficed.
 	//
 	// #5364: this message is NOT reachable for a userspace_cpumap MaxEntries
 	// gap. That map is a BPF_MAP_TYPE_CPUMAP whose MaxEntries the kernel/loader
@@ -54,12 +68,18 @@ const (
 	// fires only for a real cross-version ABI break of a NON-cpumap map, or a
 	// genuine cpumap Type/KeySize/ValueSize/Flags change.
 	userspaceShimStalePinRemediation = "The RUNNING daemon's pinned map predates " +
-		"this build's shim-map ABI. A rolling deploy CANNOT cross a shim-map ABI " +
-		"change: the new map can only be pinned after the stale pin is released, " +
-		"and a bpffs pin OUTLIVES the process — restarting xpfd does NOT release " +
-		"it. Run `xpfd cleanup` (or reboot) to unpin, then start xpfd to load the " +
-		"new shim; brief downtime is unavoidable. Do NOT `make generate` (the " +
-		"embedded shim is the intended target, not broken). See " +
+		"this build's shim-map ABI. A rolling deploy cannot cross a shim-map ABI " +
+		"change while the old pin is still present: a bpffs pin outlives the " +
+		"process that made it. Whether a restart is enough DEPENDS ON HOW xpfd " +
+		"LAST STOPPED — a hitless shutdown preserves the pins on purpose, so a " +
+		"restart hits this same refusal; a non-hitless HA shutdown tears them " +
+		"down, so a restart already suffices. TARGETED RECOVERY (try this " +
+		"first): stop xpfd, unlink ONLY the pin path named above, start xpfd — " +
+		"see docs/operations/userspace-shim-pin-recovery.md. `xpfd cleanup` also " +
+		"clears it but is far broader: it removes EVERY pinned dataplane map " +
+		"(sessions, DNAT and all compatibility state) and clears the FRR managed " +
+		"routes. Either way brief downtime is unavoidable. Do NOT `make " +
+		"generate` (the embedded shim is the intended target, not broken). See " +
 		"pkg/dataplane/README.md (#1864)."
 	userspaceBindingsMapName           = "userspace_bindings"
 	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"

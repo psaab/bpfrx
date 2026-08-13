@@ -77976,3 +77976,67 @@ Every RED above is an assertion failure, not a build break.
   Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
   `go test ./pkg/dataplane/ ./pkg/cli/` both ok;
   `go test ./pkg/refactoraudit/` ok. No Rust and no shim artefact touched.
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 r6 — the stale-pin remediation was wrong in the OPPOSITE
+  direction from the one r5 fixed, and the test that was supposed to prevent
+  that inherited the same blind spot.
+  r5 replaced "a reload releases the pin" (nothing does) with "restarting xpfd
+  does NOT release it; run `xpfd cleanup`". Also false. Verified firsthand:
+  `Manager.Teardown` (loader.go) is `m.Close()` then `return Cleanup()`, and
+  `daemon_run_shutdown.go` calls `d.dp.Teardown()` on every NON-hitless
+  shutdown ("HA shutdown: tearing down BPF state") while only the HITLESS arm
+  takes `d.dp.Close()` ("preserving BPF state"). So `dataplane.Cleanup()` has
+  TWO production callers, not one, and whether a restart clears the pin is
+  MODE-DEPENDENT. The r5 message pointed the operator at a destructive action
+  (`xpfd cleanup` additionally GCs every pinned dataplane map AND clears the
+  FRR managed routes, cmd/xpfd/main.go), understated what it destroys, and did
+  so in a mode where a plain restart would have sufficed — mid-upgrade, with
+  the dataplane down.
+  Fixed: the message now states the mode dependency and leads with the TARGETED
+  recovery (unlink the one named pin, docs/operations/userspace-shim-pin-
+  recovery.md — which already documented exactly that and was never referenced)
+  before naming `xpfd cleanup` and what else it takes. `types.go:138` and
+  `:386` ("Cleanup() is reachable only from the `xpfd cleanup` subcommand")
+  corrected at both sites. `pkg/dataplane/README.md` carried the same false
+  paragraph and is corrected. The runbook gains the `xpfd cleanup` scope note
+  and the mode dependency.
+  **Why nothing caught it.** `stalepin_remediation_5363_test.go:117` asserted
+  SUBSTRINGS. A phrase-presence assertion is satisfied identically by a correct
+  and an incorrect instruction — it defends the text, not the behaviour. That
+  is how the r4 wrong message passed and how r5's replacement inherited the
+  blind spot: the block was rewritten to require "restarting xpfd does NOT
+  release" / "OUTLIVES the process", locking in the new wrong claim.
+  The false claim is a CALL-GRAPH claim, so the binder is a call-graph check —
+  the same kind of fact, not a proxy. `cleanup_reachability_6928_test.go`
+  parses the repo (go/ast, non-test files) and pins the production caller set
+  of `Cleanup()` to exactly {cmd/xpfd/main.go:main, loader.go:Teardown}, with a
+  precondition that the walk found ANY caller (a broken walk would pass
+  vacuously — the same failure mode one level up) and a second assertion that
+  >= 2 callers exist, so a collapse back to the single CLI caller reds and
+  forces the wording to be revisited. A companion pins that both shutdown arms
+  (`d.dp.Close()` / `d.dp.Teardown()`) still exist, so `Teardown` cannot become
+  dead code while the mode-dependent wording survives.
+  The phrase-presence block is replaced by a NEGATIVE on the two claims the
+  code disproves ("restarting xpfd does NOT release", "reachable only from").
+  RED-first, both verified: severing `Teardown` -> `Cleanup` reds the
+  caller-set test with `got: cmd/xpfd/main.go:main` vs the 2-entry want;
+  restoring the disproven phrase into the message reds
+  TestLivePinABIMismatchUsesStalePinRemediation at
+  "remediation restored the categorical claim". Production restored and
+  verified clean after each.
+  The SSOT-drift negatives (`:173` on the CONSTANT, `:178` on `xpfd cleanup`)
+  were checked for the vacuity trap and both still fire: `:173` keys on the
+  constant so it survives any rewording, and `:178` keys on the action name,
+  which the new message still contains.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/... ./pkg/daemon/...
+  ./pkg/cli/...` rc=0, all 7 packages ok. `gofmt -l` clean on all four touched
+  Go files. NOT reformatted: pkg/dataplane/constants.go and
+  bpf_session_value_test.go are gofmt-dirty at the PR head already and are
+  untouched here.
+  NOT in scope, per the dispatch: the C-mirror ABI offset pinning gap.
+  Advances #4983.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go, pkg/dataplane/types.go,
+  pkg/dataplane/README.md, pkg/dataplane/stalepin_remediation_5363_test.go,
+  pkg/dataplane/cleanup_reachability_6928_test.go,
+  docs/operations/userspace-shim-pin-recovery.md, _Log.md
