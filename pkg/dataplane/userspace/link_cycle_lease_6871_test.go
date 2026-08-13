@@ -334,6 +334,18 @@ func TestLinkCycleLeaseExpiresAfterTTL_6871(t *testing.T) {
 	advance := fakeLinkCycleClock(t)
 
 	m := New()
+	// Release on the way out (#6871 round 12). acquireLinkCycleLease starts a
+	// heartbeat, and a test that never releases leaves that goroutine beating for
+	// the rest of the binary — calling RenewLinkCycle -> linkCycleInFlight ->
+	// linkCycleLeaseElapsed, i.e. reading whatever clock seam a LATER test has
+	// installed, from a goroutine that test does not own. See
+	// injectAtLeaseExpiryCheck in link_cycle_lease_race_6871_test.go for what
+	// that costs. This particular leak is the harmless kind — the assertions
+	// below drive the word to the 0 sentinel, and linkCycleInFlight returns from
+	// `until == 0` before it ever reads the seam, which is why closing it alone
+	// removes no false green (measured: 0 of 100 with only this site closed).
+	// It is closed anyway, with its live siblings below.
+	t.Cleanup(m.releaseLinkCycleLease)
 	m.acquireLinkCycleLease()
 	if !m.linkCycleInFlight() {
 		t.Fatal("the lease must be held immediately after acquire")
@@ -374,6 +386,11 @@ func TestLinkCycleLeaseExpiresAfterTTL_6871(t *testing.T) {
 // and this fails at "deadline ... is in the WALL-CLOCK domain".
 func TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871(t *testing.T) {
 	m := New()
+	// A LIVE leak without this: the word stays non-zero, so the orphaned beat
+	// keeps renewing it and keeps reading the clock seam (#6871 round 12). One of
+	// the two sites that actually produced false greens in the accelerated
+	// measurement.
+	t.Cleanup(m.releaseLinkCycleLease)
 	m.acquireLinkCycleLease()
 
 	got := m.linkCycleLeaseUntil.Load()
@@ -410,6 +427,10 @@ func TestRenewLinkCycleExtendsALiveLease_6871(t *testing.T) {
 	advance := fakeLinkCycleClock(t)
 
 	m := New()
+	// The other LIVE leak (#6871 round 12): this test deliberately leaves the
+	// lease renewed and unexpired, which is exactly the state an orphaned beat
+	// keeps alive forever.
+	t.Cleanup(m.releaseLinkCycleLease)
 	m.acquireLinkCycleLease()
 
 	// Member 1's turn: nearly a whole TTL of ethtool timeouts.
@@ -462,6 +483,7 @@ func TestRenewLinkCycleNeverCreatesALease_6871(t *testing.T) {
 	t.Run("after_ttl_expiry", func(t *testing.T) {
 		advance := fakeLinkCycleClock(t)
 		m := New()
+		t.Cleanup(m.releaseLinkCycleLease) // #6871 round 12: join the beat.
 		m.acquireLinkCycleLease()
 		advance(linkCycleLeaseTTL + time.Second)
 		m.RenewLinkCycle()

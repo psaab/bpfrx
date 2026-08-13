@@ -363,11 +363,18 @@ var linkCycleLeaseEpoch = time.Now()
 // READS this seam from its own goroutine, while a later test WRITES it. `go
 // test -race` reported exactly that, from three different leak sites.
 //
-// The seam is made race-free rather than the leaks chased one by one. There are
-// twenty acquisition sites in this package's tests and the next one added would
-// reopen the hole in the VARIABLE, and an atomic override cannot be raced there
-// by any of them. Releasing is still the right hygiene —
+// The seam is made race-free rather than the leaks chased one by one. This
+// package's tests hold 42 non-comment acquireLinkCycleLease() / PrepareLinkCycle(
+// call lines (`grep -nE 'acquireLinkCycleLease\(\)|PrepareLinkCycle\(' *_test.go`
+// minus the six whose line is a comment), and the next one added would reopen the
+// hole in the VARIABLE, and an atomic override cannot be raced there by any of
+// them. Releasing is still the right hygiene —
 // newLinkCycleProcessOnlyManager does it centrally.
+//
+// #6871 round 12: that count read "twenty", which no rule over these files
+// yields; it is 42 by the grep above. The number is load-bearing here — it is
+// the argument for fixing the seam instead of the sites — so it is stated with
+// the command that reproduces it rather than from memory.
 //
 // #6871 round 11: that is the whole of the guarantee, and both the round-10
 // commit message ("a leaked heartbeat now renews its own dead Manager and races
@@ -387,6 +394,15 @@ var linkCycleLeaseEpoch = time.Now()
 // So: install-and-read of the override never races, which is what this variable
 // owes. Closure captures are the caller's obligation, which is what the round-10
 // claim silently annexed.
+//
+// #6871 round 12: there is a SECOND caller obligation, and it is not about
+// races. A leaked beat calling an installed closure can also perform work the
+// closure meant for its installer — injectAtLeaseExpiryCheck's one-shot was
+// consumable by any goroutine, and a stolen injection made its cells pass
+// VACUOUSLY (measured: ~24% of accelerated iterations with the B1 fix reverted,
+// i.e. with the cell obliged to fail). A closure whose effect depends on WHERE
+// in a reader it runs must gate on the calling goroutine; the atomic makes that
+// gate safe, it does not supply it.
 //
 // A red -race run in this package is not automatically this. It also contains
 // load-sensitive DEADLINE tests — TestLargeApplySnapshotDoesNotFalseTimeout and

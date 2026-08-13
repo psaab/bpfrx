@@ -80179,12 +80179,26 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   (`fired atomic.Bool`, `CompareAndSwap`) = 0 races, no panic in 200 runs.
   WHAT THE FIX DOES NOT BUY, stated because overstating it is the finding: a
   leaked beat is not thereby harmless. It can still WIN the one-shot and inject
-  on its own goroutine, after which the discriminator's own read finds the lease
-  word unmoved and reds at "reported NO cycle in flight" — ~10 times in the same
-  200 accelerated runs. The direction is what holds: every assertion demands the
-  lease be judged LIVE, and a stolen injection can only make the reader see an
-  expiry, so it reds a cell and never greens one. At the production 15s period
-  the window is microseconds and none of it has been observed.
+  on its own goroutine.
+  **CORRECTED IN ROUND 12 — the next two sentences of this entry were INVERTED,
+  and are struck rather than deleted because the wrong version was relayed on the
+  PR.** They read: "the discriminator's own read finds the lease word unmoved and
+  reds at 'reported NO cycle in flight' — ~10 times in the same 200 accelerated
+  runs. The direction is what holds: every assertion demands the lease be judged
+  LIVE, and a stolen injection can only make the reader see an expiry, so it reds
+  a cell and never greens one." Backwards on both halves. The steal is what MOVES
+  the lease word early — `inject()` runs BEFORE the reader's `Load`, so the reader
+  compares 61s against an already-advanced 121s and returns true on its FIRST
+  comparison, never entering the expiry branch. A steal therefore GREENS the cell
+  vacuously; it reds only on the narrow ordering where the reader's own
+  `CAS(stale -> 0)` commits before the thief's store lands. Measured in round 12,
+  B1 reverted so the cell must fail: ~24% of accelerated iterations PASSED, every
+  one a false green. The `~10 in 200` figure was also unreproducible as stated:
+  reds at HEAD under acceleration are 4 of 200 accumulating iterations and 1 of
+  200 separate invocations, all in `fresh_prepare_wins_the_cas`. See the round-12
+  entry at the end of this file. At the production 15s period the window is
+  microseconds and none of it has been observed — that part stands, and it is why
+  round 12 is not a blocker.
   CLAIM CORRECTIONS, two sentences that were false: the round-10 commit message's
   "A leaked heartbeat now renews its own dead Manager and races nothing", and
   `process_linkcycle.go`'s "an atomic override cannot be raced by any of them".
@@ -80254,3 +80268,121 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   pkg/dataplane/userspace/process_linkcycle.go,
   pkg/daemon/daemon_apply_dataplane.go, _Log.md
+
+## 2026-08-13 — #6871 round 12: a stolen injection GREENS the cell; the leak class is wider than the site that was named
+
+- **Timestamp**: 2026-08-13 (fix/5103-reth-worker-join)
+- **Action**: Two items from an independent hostile review that returned
+  MERGE-NEEDS-MINOR with zero blocking findings. The first is a claim of mine
+  that was INVERTED, not merely overstated. The second is the leak it rides,
+  which measurement turned into a class rather than the one site named.
+
+  ITEM 1 — THE DIRECTION WAS BACKWARDS, corrected in all three artefacts that
+  carried it (the fixture comment, the round-11 entry above, the PR body).
+  Round 11 wrote that a stolen injection can only produce a RED, "because every
+  assertion demands the lease be judged LIVE". `injectAtLeaseExpiryCheck`
+  installs its one-shot in a PROCESS-GLOBAL seam, so a heartbeat left beating by
+  an earlier test calls that closure too. When such a beat WINS the one-shot,
+  `inject()` runs BEFORE the discriminator's own `Load` and ADVANCES
+  `linkCycleLeaseUntil` past the fake clock. The reader then loads the
+  already-advanced word and finds 61s < 121s on its FIRST comparison: it returns
+  true without entering the expiry branch, without attempting a CAS, and
+  therefore without exercising the fix under test. The B1-reverted implementation
+  returns true on that same path, so the cell PASSES VACUOUSLY. The steal is
+  precisely what REMOVES the expiry the reader was going to observe — the exact
+  opposite of "finds the lease word it expected to move unmoved".
+
+  MEASURED, with B1 REVERTED so both cells are OBLIGED to fail, the beat
+  accelerated 15s -> 200us, and `-test.count` in one binary so leaked beats
+  accumulate. Every PASS is a false green:
+
+  | configuration | renewal | fresh_prepare |
+  |---|---|---|
+  | whole package, HEAD fixture | 5/20 PASS | 7/20 PASS |
+  | whole package, the four leaks in `link_cycle_lease_6871_test.go` closed | 4/20 PASS | 5/20 PASS |
+  | whole package, goroutine gate + those closures | **0/20** | **0/20** |
+  | this file's tests only, HEAD fixture | 13/54 PASS | 13/54 PASS |
+  | this file's tests only, goroutine gate | **0/100** | **0/100** |
+
+  The 54 is not a typo: that run died at iteration 54 on a stolen inject calling
+  `t.Fatal` off-goroutine.
+
+  ITEM 2 — THE LEAK, AND WHY IT IS NOT ENOUGH.
+  `TestLinkCycleLeaseExpiresAfterTTL_6871` was named as "the leak the steal
+  rides". It does leak a heartbeat, but it is the HARMLESS kind and closing it
+  alone removes ZERO false greens (measured: 0 of 100 with only that site closed;
+  100/100 RED both cells). Its assertions drive the lease word to the 0 sentinel,
+  and `linkCycleInFlight` returns from `until == 0` BEFORE it ever reads the
+  clock seam, so that orphan can never inject. The two sites that actually
+  produced false greens are
+  `TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871` and
+  `TestRenewLinkCycleExtendsALiveLease_6871`, which leave the word NON-ZERO —
+  their orphaned beats then renew the dead Manager forever and read the seam on
+  every beat. In isolation those two produce 22+11 and 29+34 false greens per 100.
+  Found by registering every heartbeat goroutine with its creator stack and
+  dumping the ones whose lease word was still non-zero at the discriminator's
+  entry, rather than by reading the acquisition sites.
+
+  All four unreleased acquires in that file are now closed. That is hygiene, and
+  it is explicitly NOT the fix: at PACKAGE scope, closing them moves the false
+  greens from 12 to 9 out of 40 cell-runs. A separate instrumented build printed
+  the installing and firing goroutine ids whenever they differed and reported one
+  mismatch over six package runs — firing from `startLinkCycleHeartbeat.func1`,
+  on a goroutine created long before the test — against exactly one false green,
+  the same cell in the same run. So the thief survives the closures, and the leak
+  class is wider than any one file.
+
+  THE FIX IS THEREFORE STRUCTURAL, not another site. `injectAtLeaseExpiryCheck`
+  now records the installing goroutine's id and admits an injection only from
+  that goroutine, using the same `runtime.Stack` header parse, for the same
+  reason, as `pkg/logging`'s `goID` (#2287): a flag records THAT someone read,
+  never WHO, and the property under test belongs to one goroutine's Load->CAS
+  window. A stolen injection is now unrepresentable regardless of how many leaks
+  exist — including ones added later. The atomic one-shot stays: the gate narrows
+  who may inject, not who may read.
+
+  WHAT ROUND 11 GOT RIGHT AND KEEPS. The `-race` result stands (1 report before,
+  0 after). The off-goroutine `panic: Fail in goroutine after ... has completed`
+  stands as NOT occurring at HEAD — 0 in 200 accelerated runs here, and the
+  reviewer saw it only with the B1 revert also applied. Its stated MECHANISM is
+  refined: that panic has two producers, and the round-11 atomic retires only
+  one. The double injection is gone by construction; the SINGLE stolen injection
+  panics identically when the thief's emulated renewal loses its CAS and calls
+  `t.Fatal` from the heartbeat goroutine, which is what round 12 reproduced. The
+  gate retires that second producer.
+
+  A SECOND CLAIM OF MINE THAT DID NOT SURVIVE. Round 11 said a steal reds at HEAD
+  "~10 times in 200 accelerated runs". The reviewer measured 200/200 PASS and
+  could not reproduce it. Both are close to right and neither is the number: reds
+  at HEAD are 4 of 200 accumulating iterations and 1 of 200 separate binary
+  invocations, all in `fresh_prepare_wins_the_cas`, none in `renewal_wins_the_cas`.
+  The ordering that reds is narrow — the reader's own `CAS(stale -> 0)` has to
+  commit before the thief's store lands, after which the failure message prints
+  the thief's deadline (121000000000) as though the lease were live. So reds at
+  HEAD are real but ~1/200, not ~10/200, and they are not the dominant outcome of
+  a steal; the vacuous green is.
+
+  NIT — a count that no rule yields. `process_linkcycle.go` said there are
+  "twenty acquisition sites in this package's tests". There are 42 non-comment
+  `acquireLinkCycleLease()` / `PrepareLinkCycle(` call lines
+  (`grep -nE 'acquireLinkCycleLease\(\)|PrepareLinkCycle\(' *_test.go`, minus the
+  six whose line is a comment). The number is load-bearing there — it is the
+  argument for fixing the seam instead of the sites — so it now carries the
+  command that reproduces it.
+
+  SEVERITY. Not a blocker, and that is the reviewer's and the lead's call, not a
+  softening of the finding: at the SHIPPED 15s beat the discriminator is 200/200
+  RED under the B1 revert, and the vacuity needs the 75000x acceleration this
+  work introduced as an instrument, which no shipped configuration uses. It is
+  fixed now because that instrument is a reasonable thing for a later lane to
+  reach for, and because the fixture comment was actively misdirecting whoever
+  does.
+
+  VALIDATION: `go build ./...` clean, `go vet ./pkg/dataplane/userspace/` clean,
+  `go test ./pkg/dataplane/userspace/ ./pkg/daemon/` green (26.4s / 27.0s). At
+  package scope with the accelerated beat and B1 reverted, the delivered fixture
+  is 20/20 RED on both discriminator cells with the two controls green and no
+  other test disturbed.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go, _Log.md

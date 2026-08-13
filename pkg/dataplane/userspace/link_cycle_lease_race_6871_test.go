@@ -1,6 +1,8 @@
 package userspace
 
 import (
+	"runtime"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,7 +40,8 @@ import (
 // sleeps, no goroutines, no scheduler dependence.
 
 // injectAtLeaseExpiryCheck installs a linkCycleLeaseElapsed seam that runs
-// inject EXACTLY ONCE — on the first read — and then reports elapsed forever.
+// inject EXACTLY ONCE — on the first read BY THE GOROUTINE THAT INSTALLED IT —
+// and then reports elapsed forever.
 //
 // One-shot on purpose: the injected writer computes its own deadline through
 // linkCycleLeaseDeadline(), which reads the same seam, and a re-entrant hook
@@ -47,53 +50,126 @@ import (
 // one-shot without that: it commits the flag BEFORE inject runs, so a
 // re-entrant read sees it set.
 //
+// OWNED BY THE INSTALLING GOROUTINE (#6871 round 12), and that gate is what
+// makes these cells mean anything. linkCycleLeaseElapsedOverride is
+// process-global: EVERY goroutine that reaches linkCycleLeaseElapsed calls
+// whatever closure is installed at that instant, including a heartbeat left
+// beating by an earlier test on a Manager that is not this one. Ungated, such a
+// beat can WIN the one-shot, and the injection then runs BEFORE the
+// discriminator's own read instead of inside its Load->CAS window:
+//
+//	inject() advances m.linkCycleLeaseUntil to a LIVE deadline;
+//	the reader Loads the already-advanced word;
+//	61s < 121s on the FIRST comparison -> true. The expiry branch is never
+//	entered, no CAS is attempted, and nothing is tested.
+//
+// Fixed and B1-reverted implementations return true identically there, so the
+// cell PASSES VACUOUSLY. Measured with B1 REVERTED — so both cells are OBLIGED
+// to fail — and the beat accelerated 15s -> 200us, -test.count in one binary so
+// leaked beats accumulate. Every PASS below is therefore a FALSE GREEN:
+//
+//	                                          renewal    fresh_prepare
+//	whole package, HEAD fixture .............   5 / 20       7 / 20
+//	whole package, the four leaks in
+//	  link_cycle_lease_6871_test.go closed ..   4 / 20       5 / 20
+//	whole package, this gate + those closures   0 / 20       0 / 20
+//	this file's tests only, HEAD fixture ....  13 / 54      13 / 54
+//	this file's tests only, this gate .......   0 / 100      0 / 100
+//
+// (The 54 is not a typo: that run died at iteration 54 on a stolen inject
+// calling t.Fatal off-goroutine. See the panic note below.)
+//
+// The SECOND ROW is why the gate is the fix and the releases are only hygiene.
+// Closing every unreleased acquire in the file that owns both LIVE leaks barely
+// moves the number, because the seam is process-global and any other file's next
+// unreleased acquire re-supplies a thief. Enumerating leak sites is a race the
+// next acquisition site wins; owning the injection is not.
+//
+// The steal was also observed DIRECTLY rather than inferred: an instrumented
+// build of that second row printed the installing and the firing goroutine ids
+// whenever they differed, and over six package runs it reported exactly one
+// mismatch — firing from `startLinkCycleHeartbeat.func1` via RenewLinkCycle ->
+// linkCycleInFlight -> linkCycleLeaseElapsed, on a goroutine created long before
+// the test — against exactly one false green, the same cell in the same run.
+//
+// THE DIRECTION IS THE OPPOSITE OF WHAT ROUND 11 WROTE HERE, and it is spelled
+// out because the 75000x acceleration above is exactly the instrument the next
+// lane will reach for. Round 11 said a stolen injection leaves "the lease word
+// it expected to move unmoved" and can therefore only RED a cell, never green
+// one. Backwards: the steal is precisely what MOVES the word early — it REMOVES
+// the expiry the reader was going to observe. A steal greens VACUOUSLY. It reds
+// only on the narrow ordering where the reader's own CAS(stale -> 0) commits
+// before the thief's store lands, measured at HEAD as 4 of 200 accumulating
+// iterations and 1 of 200 separate invocations, all in fresh_prepare_wins_the_cas.
+//
 // ATOMIC, not a plain bool (#6871 round 11), because this closure is read from
-// more than one goroutine. Round 10 made linkCycleLeaseElapsedOverride an
-// atomic.Pointer, which makes the SWAP race-free; it does not make the closure
-// the pointer points AT goroutine-safe. A test that takes a real lease and does
-// not release it leaves a heartbeat beating on a dead Manager, and that
-// goroutine's RenewLinkCycle -> linkCycleInFlight -> linkCycleLeaseElapsed path
-// CALLS whatever override is installed at that instant — including this one,
-// installed by a later test. fakeLinkCycleClock's counter is an atomic.Int64
-// for exactly this reason; this flag was the one capture that had not been
-// given the same treatment, and `go test -race` reported a genuine
-// WARNING: DATA RACE on it (read here, previous write from
-// startLinkCycleHeartbeat.func1) once the heartbeat period is shortened enough
-// to widen the collision window.
+// more than one goroutine — the gate above narrows WHO may inject, not who may
+// read. Round 10 made linkCycleLeaseElapsedOverride an atomic.Pointer, which
+// makes the SWAP race-free; it does not make the closure the pointer points AT
+// goroutine-safe. fakeLinkCycleClock's counter is an atomic.Int64 for exactly
+// this reason; this flag was the one capture that had not been given the same
+// treatment, and `go test -race` reported a genuine WARNING: DATA RACE on it
+// (read here, previous write from startLinkCycleHeartbeat.func1) once the
+// heartbeat period is shortened enough to widen the collision window. Measured:
+// 1 race report before, 0 after, -race -count=5.
 //
-// WHAT THE ATOMIC FIXES AND WHAT IT DOES NOT, measured rather than reasoned,
-// because the sentence this replaces is the one round 10 overstated. With the
-// beat accelerated 15s -> 200us, so that a collision is frequent enough to
-// observe at all:
+// The off-goroutine `panic: Fail in goroutine after ... has completed` has TWO
+// producers and each half retires one. The atomic retires the double injection —
+// CompareAndSwap admits exactly one injector where two racing plain-bool readers
+// could both see the flag unset. The gate retires the single STOLEN injection,
+// which panics the same way when the thief's emulated renewal loses its CAS and
+// calls t.Fatal from the heartbeat goroutine; that is the panic round 12
+// reproduced (1 in a 100-iteration B1-reverted run), and it is not a double
+// injection. Neither producer fired at HEAD: 0 panics in 200 accelerated runs.
 //
-//   - the DATA RACE goes away: 1 report before, 0 after, -race -count=5;
-//   - the DOUBLE injection goes away by construction — CompareAndSwap admits
-//     exactly one injector, where two racing plain-bool readers could both see
-//     it unset. Before the fix a 200-run functional loop ended in
-//     `panic: Fail in goroutine after ... has completed`, the second injector
-//     calling t.Fatal from the heartbeat goroutine and taking the whole test
-//     binary down; that was not observed once in 200 runs after;
-//   - a leaked beat is NOT thereby made harmless. It can still WIN the one-shot
-//     and inject on its own goroutine, and then the discriminator's own read
-//     finds the lease word it expected to move unmoved, and reds at "reported
-//     NO cycle in flight". That still happens after the fix, ~10 times in 200
-//     accelerated runs.
-//
-// So the direction is what holds: a stolen injection reds a cell, it never
-// greens one — the assertions all demand the lease be JUDGED LIVE, and the
-// steal can only make the reader see an expiry. A flake, never a false green.
-// At the production 15s period the window is microseconds and none of this has
-// been observed. Releasing the lease is what keeps a fixture stable; the atomic
-// is what keeps it defined.
+// At the production 15s beat none of this is reachable — the collision window is
+// microseconds against a 15s period, and the discriminator is 200/200 RED under
+// the B1 revert there.
 func injectAtLeaseExpiryCheck(t *testing.T, elapsed time.Duration, inject func()) {
 	t.Helper()
+	owner := leaseSeamGoID()
+	if owner == 0 {
+		t.Fatal("fixture: could not read this goroutine's id, so a stolen injection " +
+			"could not be told from this test's own; refusing to run a cell that would " +
+			"pass vacuously")
+	}
 	var fired atomic.Bool
 	swapLinkCycleLeaseElapsed(t, func() time.Duration {
-		if fired.CompareAndSwap(false, true) {
+		if leaseSeamGoID() == owner && fired.CompareAndSwap(false, true) {
 			inject()
 		}
 		return elapsed
 	})
+}
+
+// leaseSeamGoID returns the calling goroutine's id, parsed out of the header
+// runtime.Stack writes ("goroutine <id> [running]:\n...").
+//
+// Same technique, and for the same reason, as pkg/logging's goID (#2287): the
+// property under test belongs to ONE goroutine's Load->CAS window, so the
+// fixture has to tell its own read of the shared seam from a concurrent one, and
+// no flag can make that distinction — a flag records THAT someone read, never
+// WHO. Test-only, and only while an injecting override is installed, which is
+// microseconds; runtime.Stack for the current goroutine alone does not stop the
+// world.
+func leaseSeamGoID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	const prefix = "goroutine "
+	s := buf[:n]
+	if len(s) < len(prefix) {
+		return 0
+	}
+	s = s[len(prefix):]
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	id, err := strconv.ParseUint(string(s[:i]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
 }
 
 // TestLinkCycleInFlightHonoursALostExpiryCAS_6871 is the B1 discriminator.
