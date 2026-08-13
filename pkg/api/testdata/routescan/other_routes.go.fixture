@@ -1,0 +1,22 @@
+// Package routescan is a FIXTURE, not compiled into pkg/api (it lives under
+// testdata/ and carries a .fixture suffix). It exists so the route-registration
+// scanner can be proven to reach registrations the real package does not
+// currently have: a file that is not server.go, and a ServeMux variable that is
+// not named `mux`.
+//
+// Without it the widened scanner is untestable — every real route today lives in
+// server.go on a variable called `mux`, so narrowing the scanner back would break
+// nothing and the widening would be a claim with no guard behind it.
+package routescan
+
+import "net/http"
+
+func registerElsewhere(apiMux *http.ServeMux, s *server) {
+	apiMux.HandleFunc("POST /api/v1/fixture/elsewhere", s.handler)
+	apiMux.Handle("GET /api/v1/fixture/safe", http.NotFoundHandler())
+	s.router.HandleFunc("DELETE /api/v1/fixture/nested", s.handler)
+}
+
+type server struct{ router *http.ServeMux }
+
+func (s *server) handler(http.ResponseWriter, *http.Request) {}
