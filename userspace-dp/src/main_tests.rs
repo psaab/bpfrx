@@ -4724,3 +4724,72 @@ fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
 
     clear_rx_queue_count_override();
 }
+
+/// #6691 round 9b: the version check refuses in BOTH operand orders.
+///
+/// `apply_snapshot_rejects_unsupported_protocol_version` drives
+/// `CONFIG_SNAPSHOT_PROTOCOL_VERSION - 1`, which is a v5 control plane meeting
+/// this v6 helper. The other half of the mixed-version matrix — a v6 control
+/// plane meeting a v5 helper — cannot be run here, because that needs a v5
+/// helper BINARY. What it depends on is that `snapshot.version != CONST`
+/// refuses whichever side is newer, so this drives `+ 1` to measure that
+/// directly rather than inferring it from the symmetry of one line.
+///
+/// Without this, "an older helper refuses a newer snapshot" is READ. With it,
+/// both operand orders are measured against the real `handle_stream` dispatch.
+#[test]
+fn apply_snapshot_rejects_a_newer_protocol_version_too() {
+    use crate::{ConfigSnapshot, ControlRequest, ControlResponse, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+
+    let (mut client, server) = std::os::unix::net::UnixStream::pair().expect("control socket pair");
+    let state = Arc::new(Mutex::new(ServerState {
+        status: ProcessStatus::default(),
+        snapshot: None,
+        afxdp: afxdp::Coordinator::new(),
+        state_writer: Arc::new(StateWriter::new()),
+    }));
+    let running = Arc::new(AtomicBool::new(true));
+    let state_file = format!(
+        "{}/xpf-newer-version-gate-{}.json",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let handle = {
+        let state = state.clone();
+        let running = running.clone();
+        std::thread::spawn(move || handle_stream(server, &state_file, state, running))
+    };
+
+    let request = ControlRequest {
+        request_type: "apply_snapshot".to_string(),
+        snapshot: Some(ConfigSnapshot {
+            version: CONFIG_SNAPSHOT_PROTOCOL_VERSION + 1,
+            generated_at: Utc::now(),
+            ..ConfigSnapshot::default()
+        }),
+        ..ControlRequest::default()
+    };
+    serde_json::to_writer(&mut client, &request).expect("write request");
+    std::io::Write::write_all(&mut client, b"\n").expect("newline");
+
+    let response: ControlResponse =
+        serde_json::from_reader(std::io::BufReader::new(client)).expect("read response");
+    assert!(
+        !response.ok,
+        "a snapshot at a NEWER protocol version was accepted. The check must refuse \
+         whichever side is ahead — an older helper that accepts a newer snapshot \
+         enforces fields it cannot see, which is the failure the version exists to \
+         prevent"
+    );
+    assert!(
+        response
+            .error
+            .contains("unsupported snapshot protocol version"),
+        "unexpected error: {}",
+        response.error
+    );
+    handle
+        .join()
+        .expect("handler thread")
+        .expect("handler result");
+}

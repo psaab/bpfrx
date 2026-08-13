@@ -1,3 +1,73 @@
+## 2026-08-13 — #6691 round 9c: the v5 → v6 mixed-version matrix, measured on the REFERENCE cluster shapes
+
+- **Timestamp**: 2026-08-13 21:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Measured both directions of the protocol bump before a cluster
+  smoke, on the shapes the clusters actually run rather than the shape the
+  change was designed around.
+- **File(s)**: `pkg/dataplane/userspace/mixed_version_matrix_6691_test.go` (new),
+  `pkg/daemon/mixed_version_commit_6691_test.go` (new),
+  `userspace-dp/src/main_tests.rs`, `_Log.md`
+
+  **WHY THE REFERENCE SHAPE AND NOT THE MOTIVATING ONE.** #6722 bumped 4 → 5
+  earlier the same day, and its first matrix measured ONE ifindex and
+  generalised to the population; the counterexample was an ifindex master
+  forwarded, the buggy head forwarded, and the MIXED pairing dropped — strictly
+  worse than both endpoints. The motivating shape here (a route-based IPsec
+  tunnel) is the LEAST likely to expose a compatibility defect, because it is
+  the one the gate was built for. The question that matters is what a mixed
+  pairing does to a cluster with no secure tunnel at all.
+
+  **MEASURED: the reference cluster arms NOTHING.** The real
+  `docs/ha-cluster-userspace.conf` parses and strict-compiles to **16 interface
+  rows, 0 SecureTunnel rows**. So on the loss userspace cluster the v6 gate is
+  INERT and the only mechanism in a mixed pairing is the helper's
+  version-equality check. That makes the mixed-version behaviour there identical
+  in KIND to every previous bump — it is not specific to this change.
+
+  **MEASURED: both operand orders refuse, against the real dispatcher.**
+  `apply_snapshot_rejects_unsupported_protocol_version` already drove
+  `CONFIG_SNAPSHOT_PROTOCOL_VERSION - 1` (a v5 control plane meeting this v6
+  helper) through `handle_stream` over a socketpair. Round 9c adds
+  `apply_snapshot_rejects_a_newer_protocol_version_too` for `+ 1`, because the
+  other direction — a v6 control plane meeting a v5 HELPER — cannot be run
+  without a v5 binary, and what it depends on is that
+  `snapshot.version != CONST` refuses whichever side is ahead. That was READ
+  from the symmetry of one line; it is now measured. Fail-on-revert confirmed:
+  weakening the check to `<` makes the new cell RED with "a snapshot at a NEWER
+  protocol version was accepted".
+
+  **MEASURED: the commit consequence, both directions, with the REAL error.**
+  The existing #5679 proof injects a GENERIC apply failure ("control-socket sync
+  failed"), which leaves the step from "the helper refused on version" to "the
+  commit fails via the deferred path" as a READ of the classification.
+  `TestMixedVersionHelperRefusalFailsTheCommit_6691` injects the actual string
+  the helper emits, wrapped as `process_control.go` and
+  `publishSnapshotFailClosedLocked` wrap it, in both operand orders. Result:
+  `applyConfigLocked` FAILS the commit, the apply was attempted exactly once,
+  the error is NOT abort-class, and the peer config-sync is NOT skipped.
+
+  **THE ANSWER IS A CLEAN REFUSAL IN BOTH DIRECTIONS — no wrong answers.** But
+  the two halves of "aborts the commit with the helper still forwarding" belong
+  to DIFFERENT paths, and conflating them would misdescribe the design:
+
+  | pairing | gate arms? | commit | helper |
+  |---|---|---|---|
+  | v6 CP → v5 helper, no secure tunnel (every reference cluster) | no | FAILS (#5679 deferred) | refused the snapshot, still ARMED on previous-good, forwarding |
+  | v5 CP → v6 helper, no secure tunnel | no | FAILS (#5679 deferred) | same |
+  | v6 CP → v5 helper, WITH a secure tunnel | YES | ABORTS early | deliberately DISARMED |
+
+  The asymmetry is the designed one and is worth stating out loud: a helper that
+  cannot PARSE the snapshot keeps forwarding what it already enforces, because
+  disarming it would convert a handshake disagreement into a dataplane outage. A
+  helper that would MISENFORCE the snapshot (a pre-v6 reader that ignores
+  `secure_tunnel` and plans an AF_XDP binding for the xfrmi) is disarmed,
+  because forwarding under a rule it reads wrongly is worse than not forwarding.
+  Both classifications are asserted, so neither can drift into the other.
+
+  **Both planes are asserted at 6 in the same test**, since a bump that moved
+  only one side would make EVERY pairing a mismatch, matched deployments
+  included.
+
 ## 2026-08-13 — #6691 round 9b: the kernel evidence was sampled three times, and two of the guards meant to make round 8 safe could not fire
 
 - **Timestamp**: 2026-08-13 19:40 (fix/5619-ipsec-passthrough-zone-policy)
