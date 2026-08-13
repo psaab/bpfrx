@@ -31,8 +31,14 @@ import (
 var errRollbackRebind = errors.New("rebind: helper control socket closed")
 
 // TestRethRollbackRebindFailureReachesTheCommit_6871 is the fail-on-revert guard
-// for the ABORT path: the cycle aborted after the join, the rollback rebind then
-// failed too, and the commit error must name BOTH.
+// for the ABORT path: the cycle aborted after the worker-join HOOK ran, the
+// rollback rebind then failed too, and the commit error must name BOTH.
+//
+// "after the hook ran", not "after the join" (#6871 round 6): this fixture's
+// PrepareLinkCycle returns a stop_workers error, i.e. the request did not
+// complete, so whether the helper joined anything is precisely what the daemon
+// does not know. Escalating anyway is correct — that unknown is the reason — but
+// the sentence must not claim the join happened.
 //
 // RED-on-revert: restore `d.dp.Link().NotifyLinkCycle()` as a bare statement
 // (discarding the error) and this fails at "the rollback's own failure never

@@ -277,8 +277,14 @@ func programRethMAC(ifName string, mac net.HardwareAddr, beforeCycle func() erro
 	slog.Info("setting RETH virtual MAC", "iface", ifName, "mac", mac)
 	// Try setting MAC while link is UP (avoids link DOWN/UP cycle).
 	// mlx5 zero-copy AF_XDP sockets break on link cycle — the driver
-	// doesn't reinitialize XSK WQEs after link UP. If the driver
-	// supports IFF_LIVE_ADDR_CHANGE, this succeeds without any cycle.
+	// doesn't reinitialize XSK WQEs after link UP. When the kernel accepts
+	// the change, no cycle happens.
+	//
+	// #6871: IFF_LIVE_ADDR_CHANGE is a necessary condition for this to succeed
+	// on an UP link, not a sufficient one, and an earlier revision of this line
+	// said "if the driver supports IFF_LIVE_ADDR_CHANGE, this succeeds". A busy
+	// device is refused whether or not it carries the flag — which is why the
+	// fallback below reports the actual error instead of naming a capability.
 	liveSetErr := ops.setHardwareAddr(link, mac)
 	if liveSetErr == nil {
 		slog.Info("RETH MAC set without link cycle", "iface", ifName)

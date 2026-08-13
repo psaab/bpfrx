@@ -133,44 +133,114 @@ func (m *Manager) DisableAndStopHelper() {
 	_ = m.disableCtrlBeforeTeardownLocked()
 }
 
-// linkCycleLeaseTTL bounds a single link-cycle lease. The lease is normally
-// ended by NotifyLinkCycle, which every path that takes one reaches (the cycle
-// completes and step 2.6b2 rebinds; or the cycle aborts and
-// programRethMACWithWorkerJoin rolls back with the same call). The TTL is the
-// backstop for the one case that does not: a caller that dies between the two.
-// A lease that never ends would suppress the 1 Hz reconcile FOREVER, which is a
-// worse failure than the race it exists to close.
+// linkCycleLeaseTTL bounds the gap between two consecutive TOUCHES of a
+// link-cycle lease — the acquire in PrepareLinkCycle, and each RenewLinkCycle
+// the daemon's per-member loop issues after it. It is deliberately NOT a bound
+// on the whole cycle, and that distinction is the point.
 //
-// 60s is derived from the Prepare→Notify gap at the deployed topology, not
-// picked round — but it is the N=2 worst case, not a general bound, and the
-// assumption is worth stating because it is the thing that would go stale. The
-// dominant term is externalCommandTimeout (pkg/daemon/exec_timeout.go, 15s) on
-// the per-member `ethtool -K rxvlan off` that step 2.6 runs after each member's
-// MAC program, and NotifyLinkCycle then pays its own 1s NIC settle. A member
-// that cycles re-arms the lease itself, so exposure is 15s x (1 + the number of
-// members visited AFTER the last cycling one) — on a 2-RETH node that is 30s,
-// half the TTL. It does NOT hold for arbitrary N: four or more wedging members
-// visited after the last cycle would exceed 60s. That traversal is a Go map
-// range, so which members fall after the last cycling one is nondeterministic
-// between runs.
+// A TTL that had to cover the whole cycle would be a function of the RETH count,
+// and there is no constant that bounds that: the config permits 1..128 RETHs
+// (pkg/config/schema_chassis.go, reth-count), step 2.6 walks them serially
+// (pkg/daemon/daemon_apply_dataplane.go), and only a member that actually cycles
+// re-arms the lease on its own — so the exposure is the tail of members visited
+// AFTER the last cycling one, and that traversal is a Go map range, i.e. the
+// same input passes or fails between runs. Picking a bigger constant would be
+// the same defect with a bigger number.
+//
+// So the daemon renews instead — once per member, in programRethMemberMAC — and
+// the TTL now has to cover the interval between two consecutive members. The
+// dominant term there is the per-member `ethtool -K <if> rxvlan off`, whose HARD
+// ceiling is 20s, not 15: externalCommandTimeout is 15s and
+// runCommandStdinTimeout adds a 5s WaitDelay on top of it
+// (pkg/daemon/exec_timeout.go). Everything else in an iteration is netlink or a
+// single control-socket round-trip. 60s is 3x that ceiling and, because it is
+// per-member, it holds for ANY member count rather than for the deployed N=2
+// only. The last renewal is on the final member; between it and NotifyLinkCycle
+// sit that member's ethtool, step 2.6b's VIP/link-local reconcile (netlink) and
+// NotifyLinkCycle's own 1s NIC settle — still inside the TTL.
+//
+// The TTL remains what it always was: a backstop, not the mechanism. The lease
+// is normally ended by NotifyLinkCycle, which every path that takes one reaches
+// (the cycle completes and step 2.6b2 rebinds; or the cycle aborts and
+// programRethMACWithWorkerJoin rolls back with the same call). The backstop
+// covers the one case that does not — a caller that dies between the two — and a
+// lease that never ended would suppress the 1 Hz reconcile FOREVER, which is a
+// worse failure than the race it exists to close.
 //
 // Overrunning is bounded and loud rather than silent: linkCycleInFlight logs a
 // Warn under the CAS when it clears an expired lease, and the state it degrades
 // to is master's — the pre-#6871 behaviour where the tick was never suppressed
-// at all. So an N large enough to blow the TTL loses the added protection for
-// the tail of that cycle; it does not introduce a new failure mode.
+// at all. An overrun loses the added protection for the tail of that cycle; it
+// does not introduce a new failure mode.
 const linkCycleLeaseTTL = 60 * time.Second
 
-// linkCycleLeaseNow is time.Now, indirected so a test can prove the TTL backstop
-// actually expires a stranded lease without sleeping one out. Production never
-// reassigns it. Mirrors linkCycleRebindSleep below.
-var linkCycleLeaseNow = time.Now
+// linkCycleLeaseEpoch is the process-lifetime reference the lease deadline is
+// measured from. It is captured once and never reassigned, so
+// time.Since(linkCycleLeaseEpoch) reads Go's MONOTONIC clock (a time.Time
+// carrying a monotonic reading subtracts monotonically) and is immune to
+// wall-clock steps.
+//
+// #6871 (round 6): the deadline was previously stored as
+// time.Now().Add(TTL).UnixNano() and compared against another UnixNano — both of
+// which STRIP the monotonic reading and leave a pure wall-clock comparison. A
+// step is not hypothetical on this appliance: it runs chrony, and a first sync
+// after boot can move the wall clock by minutes. A forward correction larger
+// than the TTL expires a one-second-old lease and re-opens the worker-restart
+// race the lease exists to close; a backward one strands the lease until the
+// clock catches up.
+var linkCycleLeaseEpoch = time.Now()
+
+// linkCycleLeaseElapsed reports monotonic time since linkCycleLeaseEpoch. It is
+// indirected so a test can prove the TTL backstop actually expires a stranded
+// lease without sleeping one out. Production never reassigns it. Mirrors
+// linkCycleRebindSleep below.
+var linkCycleLeaseElapsed = func() time.Duration { return time.Since(linkCycleLeaseEpoch) }
+
+// linkCycleLeaseDeadline is the value stored in linkCycleLeaseUntil for a lease
+// taken or renewed now. It is monotonic nanoseconds since linkCycleLeaseEpoch,
+// and is never 0 (elapsed is non-negative and the TTL is positive), so the 0
+// sentinel that means "no lease" stays unambiguous.
+func linkCycleLeaseDeadline() int64 {
+	return int64(linkCycleLeaseElapsed() + linkCycleLeaseTTL)
+}
 
 // acquireLinkCycleLease opens the #6871 lease. Callers hold m.mu, but the lease
 // deliberately does not depend on it — it is read by the status loop from
 // outside m.mu's protection of the window it covers.
 func (m *Manager) acquireLinkCycleLease() {
-	m.linkCycleLeaseUntil.Store(linkCycleLeaseNow().Add(linkCycleLeaseTTL).UnixNano())
+	m.linkCycleLeaseUntil.Store(linkCycleLeaseDeadline())
+}
+
+// RenewLinkCycle pushes a lease that is ALREADY held out by another full TTL. It
+// is what makes the TTL a per-member bound instead of a whole-cycle guess: the
+// daemon calls it once per member of step 2.6's rethToPhys loop (from
+// programRethMemberMAC), so the deadline tracks the sequence's actual progress
+// rather than a wall-clock estimate of its total length (#6871 round 6).
+//
+// It NEVER creates a lease. A renewal that could open one would let any caller
+// suppress the 1 Hz reconcile with no cycle in flight and nothing obliged to
+// release it — the daemon's loop runs on every RETH apply, the vast majority of
+// which never cycle a link at all. The load/CAS pair is what keeps that true
+// against a concurrent release: linkCycleInFlight below is checked first (which
+// also self-heals an already-expired deadline), and the CAS then fails rather
+// than resurrecting a lease NotifyLinkCycle released in between.
+//
+// Renewing an unexpired lease that is already further out than the new deadline
+// is a no-op, so the ordering of renew against a fresh acquire does not matter.
+func (m *Manager) RenewLinkCycle() {
+	if !m.linkCycleInFlight() {
+		return
+	}
+	want := linkCycleLeaseDeadline()
+	for {
+		until := m.linkCycleLeaseUntil.Load()
+		if until == 0 || until >= want {
+			return
+		}
+		if m.linkCycleLeaseUntil.CompareAndSwap(until, want) {
+			return
+		}
+	}
 }
 
 // releaseLinkCycleLease ends the lease. Idempotent — the release site runs
@@ -189,7 +259,7 @@ func (m *Manager) linkCycleInFlight() bool {
 	if until == 0 {
 		return false
 	}
-	if linkCycleLeaseNow().UnixNano() >= until {
+	if int64(linkCycleLeaseElapsed()) >= until {
 		if m.linkCycleLeaseUntil.CompareAndSwap(until, 0) {
 			slog.Warn("userspace: link-cycle lease expired without a rebind; resuming reconcile",
 				"ttl", linkCycleLeaseTTL)
@@ -206,7 +276,9 @@ func (m *Manager) linkCycleInFlight() bool {
 //  3. Sends "stop_workers" to the Rust helper, which joins all worker
 //     threads — no thread touches UMEM after this returns
 //  4. Takes the #6871 link-cycle lease, which holds that join across the
-//     window where m.mu is NOT held (see below)
+//     window where m.mu is NOT held (see below). The daemon renews it once per
+//     RETH member (RenewLinkCycle), so the lease tracks the loop's progress
+//     rather than a wall-clock guess at its total length.
 //
 // The caller then performs the link DOWN/UP. Afterwards, NotifyLinkCycle
 // sends "rebind" to recreate workers with fresh AF_XDP sockets.
@@ -236,6 +308,15 @@ func (m *Manager) linkCycleInFlight() bool {
 // The operator worker-affecting verbs are the sixth producer and are gated at
 // their own entry points rather than here — see errLinkCycleInFlight in
 // manager_status.go for why the gate cannot live in requestLocked.
+//
+// The SEVENTH is the daemon's own 500ms HA watchdog heartbeat, and it is the one
+// that shows why enumerating callers is not enough: UpdateHAWatchdog runs on its
+// own goroutine with no applySem, and its first/change/backstop branch ends in
+// syncDesiredForwardingStateLocked, which sends the same worker-respawning
+// set_forwarding_state the operator verbs do. That gate lives at the emitter
+// (manager_ha.go) rather than at UpdateHAWatchdog, so it also covers the tick's
+// and the compile path's calls — see the comment there for why the watchdog's
+// update_ha_state half is deliberately NOT suppressed (#6871 round 6).
 func (m *Manager) PrepareLinkCycle() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

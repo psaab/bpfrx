@@ -263,11 +263,13 @@ type Manager struct {
 
 	rgTransitionInFlight atomic.Bool // set before syncHAStateLocked, cleared on completion
 
-	// linkCycleLeaseUntil is the #6871 link-cycle lease: the deadline
-	// (UnixNano) until which an in-flight RETH MAC link DOWN/UP owns the
-	// dataplane, or 0 when no cycle is in flight. See the lease block in
-	// process_linkcycle.go for what it suppresses and why a deadline rather
-	// than a bare flag.
+	// linkCycleLeaseUntil is the #6871 link-cycle lease: the deadline until
+	// which an in-flight RETH MAC link DOWN/UP owns the dataplane, or 0 when no
+	// cycle is in flight. The unit is MONOTONIC nanoseconds since
+	// linkCycleLeaseEpoch, not UnixNano — a wall-clock deadline would let an NTP
+	// step expire a live lease or strand a dead one (#6871 round 6). See the lease
+	// block in process_linkcycle.go for what it suppresses, why a deadline
+	// rather than a bare flag, and why the daemon renews it per RETH member.
 	//
 	// atomic, and for exactly the reason rgTransitionInFlight above is: the
 	// guard has to survive m.mu being RELEASED. PrepareLinkCycle joins the

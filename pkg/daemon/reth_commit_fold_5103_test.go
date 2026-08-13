@@ -143,7 +143,9 @@ func TestRethMemberMACLeavesPriorErrorAloneOnSuccess_5103(t *testing.T) {
 // the ESCALATION boundary. An ordinary MAC-set failure — here the member is gone
 // by the time programRethMAC looks it up, exactly what a rename/remove between
 // the caller's LinkByName and this call produces — has always been warn-only.
-// Only the class where the worker join already ran fails the commit.
+// Only the class where the worker-join HOOK already ran fails the commit — "the
+// hook ran", not "the workers were joined": the hook can fail at the dial before
+// the helper ever reaches its stop_workers handler (#6871 round 6).
 //
 // Stays GREEN under the revert.
 func TestRethMemberMACKeepsOrdinaryFailureWarnOnly_5103(t *testing.T) {

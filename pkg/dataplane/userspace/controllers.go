@@ -43,6 +43,12 @@ func (c userspaceLinkController) NotifyLinkCycle() error {
 	return nil
 }
 
+func (c userspaceLinkController) RenewLinkCycle() {
+	if c.manager != nil {
+		c.manager.RenewLinkCycle()
+	}
+}
+
 type userspaceHAOps interface {
 	UpdateRGActive(int, bool) error
 	UpdateHAWatchdog(int, uint64) error

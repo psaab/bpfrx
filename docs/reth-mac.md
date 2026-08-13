@@ -63,9 +63,10 @@ There is no flap: whenever a rename happens the MAC already matches so
 `programRethMAC` no-ops, leaving `renameRethMember`'s UP as the final
 state; and even in the defensive case where `programRethMAC` does cycle,
 the member still ends UP. Bringing the member UP before `programRethMAC`
-also restores that function's live-address-change detection, which
-requires an UP link to distinguish `IFF_LIVE_ADDR_CHANGE` drivers from
-those that need a cycle.
+also restores that function's live-address-change attempt, which needs an
+UP link to have any chance of succeeding — a DOWN link takes the fast
+path that sets the MAC without a cycle, so the fallback is never
+exercised and the member never gets its post-cycle recovery.
 
 ## The AF_XDP Worker Join Precedes the Link Cycle (#5103)
 
@@ -77,10 +78,23 @@ worker still reading UMEM while the driver unmaps those pages is a
 use-after-unmap.
 
 It cannot simply be hoisted above `programRethMAC`. Whether a cycle happens at
-all is only knowable by **attempting** the live MAC set — success means the
-driver has `IFF_LIVE_ADDR_CHANGE` and no cycle occurs. Joining unconditionally
-would impose a forwarding outage on every RETH MAC apply on mlx5 and virtio (the
-cluster's own NICs), to protect a path they never take.
+all is only knowable by **attempting** the live MAC set: if the kernel accepts
+it, no cycle occurs. Joining unconditionally would impose a forwarding outage on
+every RETH MAC apply on mlx5 and virtio (the cluster's own NICs), to protect a
+path they take only rarely.
+
+**Neither outcome of that attempt is a statement about `IFF_LIVE_ADDR_CHANGE`,
+and an earlier revision of this document said it was** (#6871). Linux's
+`dev_set_mac_address` does not consult that flag on the failure path at all — it
+refuses a live set for a missing `ndo_set_mac_address`, a wrong `sa_family`, an
+absent device, a *busy* device, or a driver/notifier rejection, all the same way.
+So a transient refusal on the cluster's own mlx5 VFs takes the cycle fallback
+even though those VFs do have the capability, and the journal line
+`RETH MAC live set refused; falling back to a link cycle` carries the actual
+error rather than a guess at its cause. Read the fallback as "the live set was
+refused, for whatever reason, and a cycle is the remaining option" — treating it
+as a driver-capability verdict produces the wrong diagnosis on exactly the
+hardware this cluster runs.
 
 So the join is a hook. `programRethMAC` takes a `beforeCycle func() error` and
 invokes it **at most once, on the fallback path only** — after the live set has
@@ -230,7 +244,13 @@ restarting workers — which is why the first three are not hypothetical.
 **The lease.** `Manager.linkCycleLeaseUntil` is an `atomic.Int64` deadline, taken
 by `PrepareLinkCycle` and released by `NotifyLinkCycle`. It is atomic for the
 same reason `rgTransitionInFlight` is: the guard has to survive `m.mu` being
-released. It is consulted in exactly three places:
+released. Its unit is **monotonic nanoseconds** since a package-level
+`linkCycleLeaseEpoch`, not `UnixNano` (#6871): a wall-clock deadline lets an NTP
+step larger than the TTL expire a live lease — re-opening the very race the lease
+closes — and a backward step strand a dead one. This appliance runs chrony, and a
+first sync after boot can move the wall clock by minutes.
+
+It is consulted in exactly four places:
 
 - **at the top of the status tick's critical section**, which skips its *whole
   body*. Nothing is lost — every action in that body is level-triggered on
@@ -269,6 +289,38 @@ released. It is consulted in exactly three places:
   teardown arm over sockets the cycle has quiesced, and nothing inside the
   daemon calls these three, so the broader scope blocks no internal path.
 
+- **at `syncDesiredForwardingStateLocked`** in `manager_ha.go`, which DEFERS its
+  `set_forwarding_state` publish rather than sending it. This is the **seventh**
+  producer, and it is the one that shows why enumerating callers does not close
+  the class: the daemon's own HA watchdog heartbeat reaches it. `SetHAWatchdog`
+  runs on a 500ms goroutine in `daemon_ha_sync.go` with **no `applySem`**, and on
+  the first tick for an RG, on any Active-state change, or on the 3s backstop it
+  publishes the full HA state (`syncHAStateLocked`) — whose tail is this
+  function. `set_forwarding_state` lands in `handlers/forwarding.rs`, which calls
+  `reconcile_status_bindings` unconditionally and spawns worker threads.
+
+  The gate sits at the **emitter**, not at `UpdateHAWatchdog`. Three callers
+  reach it and only one was covered: the status tick is already inside its own
+  lease skip, and the compile path runs under `applySem` (which the RETH MAC loop
+  also holds). Gating the emitter covers all three and any future fourth.
+
+  It **defers** rather than failing: the decision is level-triggered on
+  `desiredForwardingArmedLocked()` vs `lastStatus.ForwardingArmed`, so the first
+  pass after the lease ends publishes the same delta, and the 1 Hz tick
+  guarantees that within a second of `NotifyLinkCycle`. Returning `nil` is what
+  keeps it a deferral — callers log or propagate an error, and nothing failed.
+
+  **The watchdog's other half is deliberately NOT gated.** `update_ha_state` is
+  the only refresh of the helper's per-RG forwarding lease
+  (`Coordinator::update_ha_state` → `HAGroupRuntime::active_lease_until` →
+  `ActiveUntil(watchdog + HA_WATCHDOG_STALE_AFTER_SECS)`, **10s**, in
+  `userspace-dp/src/afxdp/mod.rs`), and `is_forwarding_active` consults it per
+  packet. Suppressing it for the length of a 60s link-cycle lease would expire
+  that lease and stop forwarding for the RG — an **outage**, strictly worse than
+  the respawn race being closed. Its handler (`server/handlers/ha.rs`) reaches no
+  worker spawn, so there is nothing to gain by suppressing it either. The
+  kernel-visible shim watchdog map write is likewise never gated.
+
 **Acquire point:** before the ctrl disable, not after a successful join. The
 window that needs covering opens at the first mutation of dataplane state, and a
 `stop_workers` can fail *after* the ctrl disable has already cleared binding rows.
@@ -281,20 +333,39 @@ where forwarding is already down). Releasing there also keeps the ctrl gate out
 of the way of `NotifyLinkCycle`'s own post-rebind status apply, so a completed
 cycle re-enables `ctrl` on that call instead of costing an extra reconcile tick.
 
-**TTL backstop:** `linkCycleLeaseTTL` (60s). Every path that takes a lease reaches
-a `NotifyLinkCycle`, so the TTL is only for a caller that dies in between — but a
-stranded lease would suppress the reconcile loop permanently, which is worse than
-the race. 60s is derived from the Prepare→Notify gap **at the deployed N=2
-topology**, and that assumption is the load-bearing part: the dominant term is the
-15s `externalCommandTimeout` on step 2.6's per-member `ethtool -K rxvlan off`,
-plus `NotifyLinkCycle`'s own 1s NIC settle. A cycling member re-arms the lease
-itself, so exposure is 15s × (1 + members visited *after* the last cycling one) —
-30s on a 2-RETH node, half the TTL. It is **not** a general bound: four or more
-wedging members visited after the last cycle exceed it, and since that traversal
-is a Go map range, which members land in the tail is nondeterministic between
-runs. Overrunning is bounded and loud rather than silent — `linkCycleInFlight`
-logs a `Warn` under the CAS when it clears an expired lease, and the behaviour it
-degrades to is master's, where the tick was never suppressed at all.
+**Renewal, and what the TTL actually bounds.** `linkCycleLeaseTTL` (60s) bounds
+the gap between two consecutive **touches** of a lease — the acquire, and each
+`RenewLinkCycle` — not the whole cycle.
+
+That distinction was a defect before #6871's round 6. Only a member that actually
+cycles re-arms the lease, so the exposure was the tail of members visited *after*
+the last cycling one. `reth-count` is operator-settable to 128
+(`pkg/config/schema_chassis.go`), step 2.6 walks the members serially, and the
+dominant per-member cost — `ethtool -K <if> rxvlan off` — has a **20s** hard
+ceiling, not 15: `externalCommandTimeout` is 15s and `runCommandStdinTimeout` adds
+a 5s `WaitDelay` on top (`pkg/daemon/exec_timeout.go`). Four wedging members in
+that tail already exceed 60s. Worse, `rethToPhys` is a Go **map**, so which
+members land in the tail differs between runs — the same config would pass or
+fail at random. A larger constant would have been the same defect with a bigger
+number.
+
+So the daemon renews instead. `LinkController.RenewLinkCycle()` extends a lease
+that is **already held** and can never create one (`RenewLinkCycle` refuses unless
+`linkCycleInFlight()`, and its load/CAS pair loses to a concurrent release), and
+`programRethMemberMAC` calls it on **every** member's turn — including the members
+that need no cycle, since those are exactly the ones whose `ethtool` burns down a
+lease an earlier member took. The TTL therefore bounds one member interval, which
+is independent of N. It is on the `LinkController` interface rather than reached
+by an optional type assertion so a new implementation has to answer for it at
+compile time instead of silently no-opping the renewal.
+
+The TTL remains a backstop, not the mechanism: every path that takes a lease
+reaches a `NotifyLinkCycle`, so it is only for a caller that dies in between — but
+a stranded lease would suppress the reconcile loop permanently, which is worse
+than the race. Overrunning is bounded and loud rather than silent —
+`linkCycleInFlight` logs a `Warn` under the CAS when it clears an expired lease,
+and the behaviour it degrades to is master's, where the tick was never suppressed
+at all.
 
 **The rollback now reports.** `NotifyLinkCycle` returns an `error`. Its rebind is
 the documented inverse of `stop_workers`, and a failure used to be a `slog.Warn`
@@ -312,11 +383,13 @@ on that would be an over-rejection.
 | file | role |
 |------|------|
 | `pkg/dataplane/userspace/manager.go` | `linkCycleLeaseUntil` — the atomic deadline |
-| `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `linkCycleInFlight` + the TTL |
+| `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `RenewLinkCycle` / `linkCycleInFlight` + the monotonic epoch and the TTL |
+| `pkg/dataplane/userspace/manager_ha.go` | the `set_forwarding_state` deferral (covers the HA watchdog heartbeat) |
+| `pkg/daemon/daemon_apply_dataplane.go` | `programRethMemberMAC` — the per-member `RenewLinkCycle` |
 | `pkg/dataplane/userspace/process_status.go` | the tick-wide skip |
 | `pkg/dataplane/userspace/maps_sync.go` | the ctrl-write gate (covers `UpdateRGActive`) |
 | `pkg/dataplane/userspace/manager_status.go` | `errLinkCycleInFlight` + the three operator-verb gates |
-| `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` |
+| `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` + `LinkController.RenewLinkCycle()` |
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.NotifyLinkCycle()` — the live adapter carrying the rebind error to the daemon |
 
 ## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
@@ -328,8 +401,9 @@ Programming the virtual MAC can happen two ways:
   which sends `rebind` to the helper and recreates the workers with fresh
   sockets. This path arms the workers via the rebind, independent of the
   published snapshot's `DeferWorkers` flag.
-- **Live MAC set** (`IFF_LIVE_ADDR_CHANGE` driver, or the fast path that sets
-  the MAC while the link is still DOWN — no cycle): the initial dataplane
+- **Live MAC set** (the kernel accepted the address change on an UP link, or the
+  fast path set it while the link was still DOWN — either way, no cycle): the
+  initial dataplane
   apply of the commit ran with `SetDeferWorkers(true)` so worker startup was
   skipped (avoids the mlx5 zero-copy double-bind EBUSY). The published
   snapshot therefore carries `DeferWorkers=true` and is **workerless /

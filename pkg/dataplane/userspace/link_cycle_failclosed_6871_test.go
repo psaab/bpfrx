@@ -42,7 +42,17 @@ import (
 // daemon's CONSUMPTION of the error, never the manager's PRODUCTION of it; and
 // link_cycle_test.go calls the real m.NotifyLinkCycle() as a bare statement,
 // discarding the return. No daemon test constructs a real userspace.Manager.
-// Each cell below goes RED on BOTH reverts.
+//
+// The DISCRIMINATOR (cell 1, TestNotifyLinkCycleErrorsWhenRebindFails_6871) goes
+// RED on BOTH reverts — that is the property that matters, since a cell catching
+// only one of two independent severances leaves the other live. The other three
+// cells are CONTROLS and stay GREEN under both, which is what makes them
+// controls: they assert that a LANDED rebind, a helperless manager and a nil
+// manager adapter each still report success, and neither revert can break that
+// (both only ever turn an error into a nil). An earlier revision of this comment
+// said "each cell below goes RED on BOTH reverts", which would have made the
+// controls restatements of the discriminator rather than guards against
+// over-reach (#6871 round 6).
 //
 // Deliberately NO BPF maps: none of these cells needs one, so they RUN
 // unprivileged rather than SKIP. A cell that skips is not a cell that passed.

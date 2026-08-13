@@ -77640,9 +77640,20 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   deviations, confirmed at the unmodified PR head). Root run of
   `./pkg/dataplane/userspace/ ./pkg/daemon/`: 8 failures, byte-identical to the
   same run at the unmodified head 9060c6126 (sorted FAIL-set diff empty) — the
-  known pre-existing root-only set. `-race` clean on the userspace package. All
-  10 new cells RUN unprivileged; none skip. No Rust changed, so no cargo leg is
-  owed.
+  known pre-existing root-only set. `-race` clean on the userspace package. No
+  Rust changed, so no cargo leg is owed.
+  CORRECTION (#6871 round 6, Codex): the sentence that stood here — "All 10 new
+  cells RUN unprivileged; none skip" — was FALSE. Three leaf cells DO skip
+  without privilege, all in `link_cycle_lease_6871_test.go`:
+  `TestUpdateRGActiveCannotReEnableCtrlDuringLinkCycle_6871/{activation,demotion}`
+  and `TestNotifyLinkCycleReleasesLeaseBeforeItsOwnCtrlApply_6871`. They go
+  through `newLinkCycleTestManager`, which calls `rlimit.RemoveMemlock` (EPERM
+  unprivileged) because the ctrl gate they exercise lives in
+  `applyHelperStatusLocked` and reads real shim maps. Go reports a PARENT as PASS
+  when every subtest skipped, which is how the claim survived a green summary
+  line. Consequence, stated rather than implied: the `|| m.linkCycleInFlight()`
+  clause in `maps_sync.go` is bound ONLY under root. The tick and operator-verb
+  discriminators are deliberately map-free and DO run unprivileged.
   Mutation matrix, 6 revert cells + 4 comparative cells, every RED an ASSERTION
   (zero build breaks, zero skips): producer `return nil` -> RED / 3 guards
   GREEN; adapter swallows -> RED / same 3 GREEN; each of the three verb gates
@@ -77659,4 +77670,121 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
   pkg/daemon/daemon_reth.go, pkg/daemon/daemon_apply_dataplane.go,
   pkg/daemon/rg_state.go, pkg/daemon/rg_state_test.go,
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13 05:05 PDT
+- **Action**: #6871 round 6 — fold the Codex MERGE-NEEDS-MAJOR on the #5103
+  link-cycle lease. Seven items, two of them runtime.
+  F1 (blocking, runtime). A SEVENTH producer of the worker-respawn class
+  bypassed the lease. `SetHAWatchdog` (daemon_ha_sync.go) runs on its own 500ms
+  goroutine with NO applySem; its first/change/3s-backstop branch reaches
+  `syncHAStateLocked`, whose tail is `syncDesiredForwardingStateLocked` — a raw
+  `set_forwarding_state`, which lands in the helper's `handlers/forwarding.rs`
+  and calls `reconcile_status_bindings` UNCONDITIONALLY -> `afxdp.reconcile` ->
+  SPAWNS WORKER THREADS. Codex recorded the sequence with a privileged probe:
+  `[stop_workers update_ha_state set_forwarding_state]`, i.e. workers respawn
+  mid-cycle. The gate is placed at the EMITTER, not at `UpdateHAWatchdog`: three
+  callers reach it and only one was covered (the status tick has its own lease
+  skip; the compile path holds applySem), so gating the emitter closes the class
+  rather than the instance. It DEFERS (returns nil) rather than erroring — the
+  decision is level-triggered on `desiredForwardingArmedLocked` vs
+  `lastStatus.ForwardingArmed`, so the first pass after the lease ends publishes
+  the same delta, and the 1 Hz tick guarantees that within a second.
+  The watchdog's OTHER half is deliberately NOT suppressed, and this was the
+  decision to get right. `update_ha_state` is the ONLY refresh of the helper's
+  per-RG forwarding lease — `Coordinator::update_ha_state` ->
+  `HAGroupRuntime::active_lease_until` -> `ActiveUntil(watchdog +
+  HA_WATCHDOG_STALE_AFTER_SECS)`, **10s** (userspace-dp/src/afxdp/mod.rs) — and
+  `is_forwarding_active` consults it per packet. Gating it for the length of a
+  60s link-cycle lease would EXPIRE that lease and stop forwarding for the RG:
+  an outage, strictly worse than the race being closed. Its handler reaches no
+  worker spawn, so there is nothing to gain by suppressing it either.
+  F2 (blocking). The 60s TTL was not a bound for supported RETH counts. Only a
+  member that CYCLES re-arms the lease, so the exposure was the tail of members
+  visited after the last cycling one; `reth-count` is settable to 128
+  (schema_chassis.go) and the per-member `ethtool -K rxvlan off` has a **20s**
+  hard ceiling (externalCommandTimeout 15s + the 5s `WaitDelay` in
+  exec_timeout.go — the earlier note said 15s). Four wedging members in that tail
+  already exceed 60s, and `rethToPhys` is a Go MAP so the tail differs per run:
+  the same config passes or fails at random. Fixed by making the lease track the
+  SEQUENCE: `Manager.RenewLinkCycle` (new, on `dataplane.LinkController` so every
+  implementation answers at compile time) extends a lease that is ALREADY held
+  and can never create one, and `programRethMemberMAC` calls it on every member's
+  turn. The TTL now bounds ONE member interval — one `ethtool` plus netlink —
+  which is N-independent. A larger constant was rejected as the same defect with
+  a bigger number.
+  F3. The deadline discarded Go's monotonic clock (`time.Now().Add(TTL).UnixNano()`
+  compared against another `UnixNano`). Replaced with monotonic nanoseconds since
+  a package-level `linkCycleLeaseEpoch`; this appliance runs chrony and a first
+  sync can step the wall clock by minutes, which would expire a one-second-old
+  lease (re-opening the race) or strand a dead one.
+  F4. The operator-verb table only ever passed `true`. Extended to BOTH
+  directions (6 cells): the production gates are direction-BLIND, unlike the
+  #5648 protocol gate beside them, and the table has to be able to tell.
+  F5. The `_Log.md` "all 10 new cells RUN unprivileged; none skip" claim was
+  false — corrected in place above, naming the three cells that skip and the
+  `maps_sync.go` clause that is therefore root-only-bound.
+  F6. `manager_ha.go` claimed the helper-down retry floods "at 9+ lines/sec".
+  The loop is `reconcileRGStateLoop`'s 2s ticker (daemon_ha.go) plus event wakes,
+  so ~1.5 lines/sec on three RGs.
+  F7. The previous round's `liveSetErr` hoist — which recovered the actual
+  `setHardwareAddr` failure reason for the journal — had NO regression binding;
+  deleting the attribute left both suites green. Now bound. Also corrected the
+  three `docs/reth-mac.md` sites and `daemon_apply_dataplane.go`/`daemon_reth.go`
+  sentences that read a live-set outcome as an `IFF_LIVE_ADDR_CHANGE` verdict:
+  `dev_set_mac_address` refuses a BUSY device just as readily, so the cluster's
+  own mlx5 VFs can take the fallback transiently and the capability reading is
+  the wrong diagnosis on exactly this hardware.
+  F8. `errRethPrepareLinkCycle` said "after the af_xdp worker join" while the
+  class keys on `joinRan` — the prepare can fail at the DIAL, before the helper
+  reaches its `stop_workers` handler, so the join may not have happened. Reworded
+  to "after the af_xdp worker-join hook ran" plus the three test-file sentences
+  with the same overstatement. Runtime behaviour unchanged; the diagnosis was.
+  Also corrected a claim folded last round:
+  `link_cycle_failclosed_6871_test.go` said "each cell below goes RED on BOTH
+  reverts". Only the DISCRIMINATOR does; the healthy-helper, no-helper and
+  nil-manager cells are CONTROLS and stay green under both, which is what makes
+  them controls rather than restatements.
+  Validation. `go build ./...` rc=0; `go vet` rc=0 on pkg/dataplane/... and
+  pkg/daemon; `gofmt -l` clean on every file this change touches (the wider
+  package list has pre-existing deviations in files it does not touch). Full
+  `go test ./...` green. `./pkg/dataplane/... ./pkg/daemon/` run 3x with
+  `-count=1`, green every pass.
+  Mutation matrix — 6 revert cells, every RED an ASSERTION, zero build breaks:
+  M1 emitter lease gate removed -> `TestDesiredForwardingStateDeferredDuringLinkCycle_6871`
+  RED at "set_forwarding_state reached the helper DURING the link cycle:
+  [set_forwarding_state]" (3 guards GREEN: resume, watchdog-reachability,
+  watchdog-keeps-publishing). M2 `Manager.RenewLinkCycle` body emptied ->
+  `TestRenewLinkCycleExtendsALiveLease_6871` RED at "the lease expired
+  mid-sequence after 1m58s of member turns". M3 the daemon call site
+  `d.dp.Link().RenewLinkCycle()` deleted -> all four
+  `TestRethMemberMACRenewsTheLinkCycleLease_6871` cells RED at "RenewLinkCycle
+  calls = 0, want 1". M2 and M3 are INDEPENDENT severances of the same fix —
+  neither test catches the other's, which is why both exist. M4 monotonic
+  deadline reverted to `time.Now().Add(TTL).UnixNano()` ->
+  `TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871` RED at "lease deadline
+  1786622224814477730 is in the WALL-CLOCK domain". M5 the `"err", liveSetErr`
+  attribute deleted -> `TestRethMACFallbackLogsTheLiveSetError_6871` RED at "the
+  live-set failure reason never reached the journal". M6 all three verb gates
+  narrowed to `armed &&` / `registered &&` -> exactly the three new
+  disarm/deregister cells RED at "reached the helper DURING the link cycle",
+  arm/register cells GREEN. COMPARATIVE for M6: under the same mutation the
+  PRE-FOLD arm-only cells all PASS — the direction narrowing was a total escape,
+  which is the measurement rather than an argument.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/controllers.go,
+  pkg/dataplane/apply.go,
+  pkg/dataplane/userspace/link_cycle_ha_watchdog_6871_test.go (new),
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_operator_verbs_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_failclosed_6871_test.go,
+  pkg/daemon/daemon_apply_dataplane.go, pkg/daemon/daemon_reth.go,
+  pkg/daemon/reth_lease_renew_6871_test.go (new),
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/reth_commit_fold_5103_test.go,
+  pkg/daemon/reth_rollback_failure_6871_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go,
   docs/reth-mac.md, _Log.md

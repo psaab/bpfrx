@@ -49,16 +49,34 @@ type operatorWorkerVerb struct {
 
 // operatorWorkerVerbs is the complete set of Manager methods that reach a helper
 // handler capable of spawning workers and that an operator can invoke directly.
+//
+// BOTH DIRECTIONS of each verb are covered, and that is load-bearing rather than
+// thorough (#6871 round 6). The first cut of this table only ever passed `true`,
+// so narrowing all three production guards to `if armed && m.linkCycleInFlight()`
+// (or `if registered && ...`) left the whole package green — a disable or
+// deregister issued inside the protected window would have reached the helper's
+// teardown arm over sockets the cycle had just quiesced, untested. The gates are
+// deliberately direction-BLIND, unlike the #5648 protocol gate two lines below
+// them, and the table has to be able to tell the difference.
 func operatorWorkerVerbs() []operatorWorkerVerb {
 	return []operatorWorkerVerb{
-		{"forwarding", "set_forwarding_state", func(m *Manager) (ProcessStatus, error) {
+		{"forwarding_arm", "set_forwarding_state", func(m *Manager) (ProcessStatus, error) {
 			return m.SetForwardingArmed(true)
 		}},
-		{"queue", "set_queue_state", func(m *Manager) (ProcessStatus, error) {
+		{"forwarding_disarm", "set_forwarding_state", func(m *Manager) (ProcessStatus, error) {
+			return m.SetForwardingArmed(false)
+		}},
+		{"queue_register", "set_queue_state", func(m *Manager) (ProcessStatus, error) {
 			return m.SetQueueState(0, true, true)
 		}},
-		{"binding", "set_binding_state", func(m *Manager) (ProcessStatus, error) {
+		{"queue_deregister", "set_queue_state", func(m *Manager) (ProcessStatus, error) {
+			return m.SetQueueState(0, false, false)
+		}},
+		{"binding_register", "set_binding_state", func(m *Manager) (ProcessStatus, error) {
 			return m.SetBindingState(1, true, true)
+		}},
+		{"binding_deregister", "set_binding_state", func(m *Manager) (ProcessStatus, error) {
+			return m.SetBindingState(1, false, false)
 		}},
 	}
 }

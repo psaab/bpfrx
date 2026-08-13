@@ -259,11 +259,14 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 		// beforeCycle hook rather than run after it returns. Whether a cycle
 		// is needed is only knowable by attempting the live MAC set, so the
 		// hook is the only place that both KNOWS a cycle is coming and still
-		// runs before the link is touched. Most drivers (mlx5, virtio)
-		// support IFF_LIVE_ADDR_CHANGE, so the hook never fires and workers
-		// keep running — the cost is paid only on the drivers that force a
-		// cycle. programRethMACWithWorkerJoin owns the hook and the rollback
-		// of a prepare whose cycle then aborted.
+		// runs before the link is touched. On the cluster's own NICs (mlx5,
+		// virtio) the kernel almost always accepts the live set, so the hook
+		// does not fire and the workers keep running — the cost is paid only
+		// when it is refused. #6871: "almost always", not "always", and not
+		// keyed on IFF_LIVE_ADDR_CHANGE — dev_set_mac_address also refuses a
+		// live set on a BUSY device, so these same VFs can take the fallback
+		// transiently. programRethMACWithWorkerJoin owns the hook and the
+		// rollback of a prepare whose cycle then aborted.
 
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -463,8 +466,18 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 // the commit closed on exactly that class: an ordinary netlink MAC-set failure
 // has always been warn-only and stays so, because it disturbs nothing but the
 // member's MAC. Once the hook has run, the member is not merely on the wrong
-// MAC — ctrl is off and the workers are joined, so it is not forwarding.
-var errRethPrepareLinkCycle = errors.New("reth mac: link cycle failed after the af_xdp worker join")
+// MAC — ctrl is being driven to 0 and the workers may already be joined, so it
+// is not forwarding.
+//
+// #6871 (round 6): the message says the HOOK RAN, not "after the worker join", and the
+// difference is exactly why this sentinel keys on joinRan. PrepareLinkCycle can
+// fail on the DIAL or the WRITE, before the helper ever reaches its stop_workers
+// handler, so on that path the workers were NOT joined — and an earlier revision
+// of this string asserted they were. What the daemon CAN know is that the hook
+// ran, which is what makes the outcome unknown and the fail-closed escalation
+// correct. The runtime behaviour was already right; only the diagnosis was
+// overstated.
+var errRethPrepareLinkCycle = errors.New("reth mac: link cycle failed after the af_xdp worker-join hook ran")
 
 // programRethMemberMAC programs ONE RETH member's virtual MAC through the
 // #5103 worker-join wrapper and folds that member's outcome into the two
@@ -497,6 +510,35 @@ func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
 	linkCycled, prepareErr := d.programRethMACWithWorkerJoin(ifName, mac)
 	if prepareErr != nil {
 		commitErr = errors.Join(commitErr, prepareErr)
+	}
+	// #6871 (round 6): renew the link-cycle lease on EVERY member's turn,
+	// whether or not this one cycled.
+	//
+	// Without it the lease's TTL would have to cover the whole of step 2.6's
+	// loop, and no constant does. Only a member that actually cycles re-arms the
+	// lease (PrepareLinkCycle takes it), so the exposure is the tail of members
+	// visited AFTER the last cycling one — while `reth-count` is
+	// operator-settable to 128 (pkg/config/schema_chassis.go) and the dominant
+	// per-member cost, the `ethtool -K rxvlan off` step 2.6 runs right after this
+	// call, has a 20s hard ceiling (externalCommandTimeout + the 5s WaitDelay,
+	// exec_timeout.go). Four wedging members in that tail already exceed a 60s
+	// TTL. Worse, rethToPhys is a Go MAP, so that tail is a different set on
+	// every run: the same config would pass or fail at random, which is the
+	// failure shape hardest to reproduce and the one a bigger constant hides
+	// rather than fixes.
+	//
+	// Renewing here makes the TTL bound the interval between two consecutive
+	// members instead — one ethtool plus netlink — which is independent of N.
+	// This is the per-member step (step 2.6 reaches the wrapper only through
+	// this function, pinned by reth_hook_wired_5103_test.go), so a renewal here
+	// happens exactly once per member without a second call site to keep in sync.
+	//
+	// It cannot CREATE a lease: RenewLinkCycle refuses unless one is already
+	// live. So the overwhelmingly common apply — every member's MAC set live, no
+	// cycle anywhere — is completely unaffected, and this cannot become a way to
+	// suppress the 1 Hz reconcile with nothing obliged to release it.
+	if d.dp != nil {
+		d.dp.Link().RenewLinkCycle()
 	}
 	return commitErr, needLinkCycleRecovery || linkCycled
 }

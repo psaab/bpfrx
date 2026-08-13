@@ -143,6 +143,14 @@ type LinkController interface {
 	// nothing to re-arm them — indistinguishable from a clean rebind to the
 	// caller that reports the commit.
 	NotifyLinkCycle() error
+	// RenewLinkCycle extends a link-cycle lease that is already held, and does
+	// nothing when none is. The daemon calls it once per RETH member it walks
+	// so the lease's TTL bounds ONE loop iteration rather than the whole loop —
+	// there is no constant that bounds the latter, since the member count is
+	// operator-configurable up to 128 (#6871). It is part of this interface,
+	// not an optional type assertion, so a new implementation has to answer for
+	// it at compile time instead of silently no-opping the renewal.
+	RenewLinkCycle()
 }
 
 type FabricID uint8
@@ -301,6 +309,11 @@ type dataPlaneLinkController struct {
 func (c dataPlaneLinkController) SetDeferWorkers(bool) {}
 
 func (c dataPlaneLinkController) PrepareLinkCycle() error { return nil }
+
+// RenewLinkCycle on the eBPF-backed controller is a no-op for the same reason
+// PrepareLinkCycle is: this controller never takes a link-cycle lease, so there
+// is never one to extend.
+func (c dataPlaneLinkController) RenewLinkCycle() {}
 
 // NotifyLinkCycle on the eBPF-backed controller is always a success: the
 // DataPlane-level NotifyLinkCycle it forwards to is a no-op for the eBPF

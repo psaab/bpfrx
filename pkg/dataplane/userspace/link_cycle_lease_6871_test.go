@@ -297,29 +297,34 @@ func TestStatusTickResumesAfterLinkCycle_6871(t *testing.T) {
 	}
 }
 
+// fakeLinkCycleClock drives the lease's monotonic seam so the TTL can be walked
+// without sleeping out a real minute. It returns a setter for the elapsed value.
+func fakeLinkCycleClock(t *testing.T) func(time.Duration) {
+	t.Helper()
+	var elapsed time.Duration
+	old := linkCycleLeaseElapsed
+	linkCycleLeaseElapsed = func() time.Duration { return elapsed }
+	t.Cleanup(func() { linkCycleLeaseElapsed = old })
+	return func(d time.Duration) { elapsed += d }
+}
+
 // TestLinkCycleLeaseExpiresAfterTTL_6871 pins the backstop. NotifyLinkCycle is
 // reached on every path that takes a lease, but a caller that dies in between
 // would otherwise suppress the reconcile forever. The TTL bounds that.
-//
-// It drives the clock through the linkCycleLeaseNow seam rather than sleeping out
-// a real minute.
 func TestLinkCycleLeaseExpiresAfterTTL_6871(t *testing.T) {
-	now := time.Now()
-	old := linkCycleLeaseNow
-	linkCycleLeaseNow = func() time.Time { return now }
-	t.Cleanup(func() { linkCycleLeaseNow = old })
+	advance := fakeLinkCycleClock(t)
 
 	m := New()
 	m.acquireLinkCycleLease()
 	if !m.linkCycleInFlight() {
 		t.Fatal("the lease must be held immediately after acquire")
 	}
-	now = now.Add(linkCycleLeaseTTL - time.Second)
+	advance(linkCycleLeaseTTL - time.Second)
 	if !m.linkCycleInFlight() {
 		t.Fatal("the lease must still be held one second inside the TTL; a lease that " +
 			"expires early re-opens the race it exists to close")
 	}
-	now = now.Add(2 * time.Second)
+	advance(2 * time.Second)
 	if m.linkCycleInFlight() {
 		t.Fatalf("the lease must expire past %s: a stranded lease suppresses the 1 Hz "+
 			"reconcile loop permanently", linkCycleLeaseTTL)
@@ -330,8 +335,140 @@ func TestLinkCycleLeaseExpiresAfterTTL_6871(t *testing.T) {
 	}
 }
 
+// TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871 pins the CLOCK DOMAIN
+// (#6871 round 6). The deadline used to be time.Now().Add(TTL).UnixNano(),
+// compared against another UnixNano — a pure wall-clock comparison, with the
+// monotonic reading stripped by .UnixNano() on both sides. This appliance runs
+// chrony, and a first sync after boot can step the wall clock by minutes: a
+// forward step larger than the TTL expires a one-second-old lease and re-opens
+// the worker-restart race, and a backward step strands it.
+//
+// A test cannot step the system clock, so it asserts the domain directly, which
+// is the thing that decides the behaviour. A monotonic deadline is
+// "nanoseconds since this process started, plus the TTL" — for a test binary,
+// well under an hour. A wall-clock deadline is nanoseconds since 1970, ~1.7e18.
+// The two are nine orders of magnitude apart, so the assertion cannot be
+// satisfied by accident.
+//
+// RED-on-revert: put back
+// `m.linkCycleLeaseUntil.Store(time.Now().Add(linkCycleLeaseTTL).UnixNano())`
+// and this fails at "deadline ... is in the WALL-CLOCK domain".
+func TestLinkCycleLeaseDeadlineIsMonotonicNotWallClock_6871(t *testing.T) {
+	m := New()
+	m.acquireLinkCycleLease()
+
+	got := m.linkCycleLeaseUntil.Load()
+	// Generous ceiling: a test binary's uptime plus the TTL cannot approach an
+	// hour, and any Unix-epoch nanosecond value is ~1.7e18, far above it.
+	ceiling := int64(linkCycleLeaseTTL + time.Hour)
+	if got > ceiling {
+		t.Errorf("lease deadline %d is in the WALL-CLOCK domain (a Unix-epoch nanosecond "+
+			"value); it must be MONOTONIC nanoseconds since linkCycleLeaseEpoch, which for "+
+			"a test binary is under %d. A wall-clock deadline lets an NTP step longer than "+
+			"the %s TTL expire a live lease — re-opening the worker-restart race — or, "+
+			"stepping backwards, strand a dead one", got, ceiling, linkCycleLeaseTTL)
+	}
+	if got <= 0 {
+		t.Errorf("lease deadline = %d; it must be positive and non-zero, because 0 is the "+
+			"sentinel that means NO lease is held", got)
+	}
+}
+
+// TestRenewLinkCycleExtendsALiveLease_6871 is the discriminator for the #6871
+// round-6 F2 fix: the TTL bounds the interval between two consecutive RETH
+// members, not the whole loop.
+//
+// The fixture walks past the TTL in two hops, renewing between them, exactly as
+// the daemon does per member. Without the renewal the lease is gone before the
+// second hop finishes, which is the intermittent failure Codex measured: a
+// four-member apply whose ethtool calls each burn up to 20s exhausts a 60s TTL
+// while the cycle is still in flight, and because rethToPhys is a Go map the
+// same config passes or fails at random.
+//
+// RED-on-revert: make Manager.RenewLinkCycle a no-op body and this fails at
+// "the lease expired mid-sequence".
+func TestRenewLinkCycleExtendsALiveLease_6871(t *testing.T) {
+	advance := fakeLinkCycleClock(t)
+
+	m := New()
+	m.acquireLinkCycleLease()
+
+	// Member 1's turn: nearly a whole TTL of ethtool timeouts.
+	advance(linkCycleLeaseTTL - time.Second)
+	m.RenewLinkCycle()
+	// Member 2's turn: the same again. Past the ORIGINAL deadline by a full
+	// TTL-2s, so only a renewal can keep the lease alive here.
+	advance(linkCycleLeaseTTL - time.Second)
+
+	if !m.linkCycleInFlight() {
+		t.Errorf("the lease expired mid-sequence after %s of member turns, even though "+
+			"every member renewed it. The TTL must bound the gap between two members "+
+			"(one `ethtool`, 20s hard ceiling), not the whole rethToPhys loop — "+
+			"`reth-count` is settable to 128, so no constant bounds the loop, and the "+
+			"traversal is a Go map range so the overrun is nondeterministic (#6871)",
+			2*(linkCycleLeaseTTL-time.Second))
+	}
+}
+
+// TestRenewLinkCycleNeverCreatesALease_6871 is the over-reach guard, and the one
+// that keeps the renewal from becoming a way to wedge the reconcile loop.
+//
+// RenewLinkCycle runs on EVERY RETH member of EVERY apply — including the
+// overwhelmingly common case where every member's MAC is set live and no cycle
+// happens anywhere. If it could open a lease, those applies would suppress the
+// 1 Hz reconcile with nothing obliged to release it, which is a worse outage
+// than the race the lease closes.
+//
+// It stays GREEN under the revert above (a no-op RenewLinkCycle creates no lease
+// either), so it is a control and not a restatement of the discriminator.
+func TestRenewLinkCycleNeverCreatesALease_6871(t *testing.T) {
+	t.Run("no_lease_ever_taken", func(t *testing.T) {
+		m := New()
+		m.RenewLinkCycle()
+		if m.linkCycleInFlight() {
+			t.Error("renewal opened a lease with no cycle in flight: every no-cycle RETH " +
+				"apply would now suppress the reconcile loop, and nothing would release it")
+		}
+	})
+	t.Run("after_release", func(t *testing.T) {
+		m := New()
+		m.acquireLinkCycleLease()
+		m.releaseLinkCycleLease()
+		m.RenewLinkCycle()
+		if m.linkCycleInFlight() {
+			t.Error("renewal RESURRECTED a lease NotifyLinkCycle had already released; the " +
+				"load/CAS pair exists precisely so a release racing a renewal wins")
+		}
+	})
+	t.Run("after_ttl_expiry", func(t *testing.T) {
+		advance := fakeLinkCycleClock(t)
+		m := New()
+		m.acquireLinkCycleLease()
+		advance(linkCycleLeaseTTL + time.Second)
+		m.RenewLinkCycle()
+		if m.linkCycleInFlight() {
+			t.Error("renewal revived a lease the TTL backstop had already expired; the " +
+				"backstop exists for a caller that died mid-cycle, and a later renewal " +
+				"must not undo it")
+		}
+	})
+}
+
 // TestUpdateRGActiveCannotReEnableCtrlDuringLinkCycle_6871 is the second half of
 // the lease, and the one a tick-only guard does NOT cover.
+//
+// PRIVILEGE, stated because a summary line hides it (#6871 round 6): this cell
+// and TestNotifyLinkCycleReleasesLeaseBeforeItsOwnCtrlApply_6871 below are the
+// only #6871 cells that need real BPF maps — the ctrl gate they exercise lives
+// in applyHelperStatusLocked, which reads userspace_ctrl and userspace_bindings
+// off the shim and has no fake seam. newLinkCycleTestManager calls
+// rlimit.RemoveMemlock, which is EPERM unprivileged, so BOTH of them SKIP there.
+// Go reports a parent as PASS when every subtest skipped, so an unprivileged
+// `go test` shows this test green having executed nothing: the `||
+// m.linkCycleInFlight()` clause in maps_sync.go is bound ONLY under root. That is
+// three leaf cells (activation, demotion, and the release-ordering test), and it
+// is why the tick and operator-verb discriminators were deliberately built
+// map-free — those DO run unprivileged and cover the other lease consult sites.
 //
 // UpdateRGActive ends in applyHelperStatusLocked, which writes the ctrl gate. It
 // is driven by VRRP/cluster events and by reconcileRGStateLoop's 2s pass — NEITHER

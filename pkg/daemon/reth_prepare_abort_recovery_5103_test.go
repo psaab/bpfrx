@@ -44,11 +44,17 @@ import (
 // production signature (a void NotifyLinkCycle) could not have carried one
 // anyway. Both halves are fixed together: the interface returns an error and the
 // double can produce one.
+// #6871 round 6: renewCalls is the observable for the per-member lease renewal.
+// The renewal has to be COUNTED, not merely permitted: the TTL only stops being
+// a function of the RETH count if every member's turn touches the lease, so a
+// renewal that fires on some members and not others is the same intermittent
+// defect with extra steps.
 type abortRecoveryLinkController struct {
 	prepareErr   error
 	notifyErr    error
 	prepareCalls int
 	notifyCalls  int
+	renewCalls   int
 }
 
 func (c *abortRecoveryLinkController) SetDeferWorkers(bool) {}
@@ -62,6 +68,8 @@ func (c *abortRecoveryLinkController) NotifyLinkCycle() error {
 	c.notifyCalls++
 	return c.notifyErr
 }
+
+func (c *abortRecoveryLinkController) RenewLinkCycle() { c.renewCalls++ }
 
 // abortRecoveryTestDP is a RuntimeDataPlane whose only interesting surface is
 // the link controller. It reuses deferredMACReapplyTestDP for the rest of the
@@ -352,7 +360,13 @@ func TestRethMACNoJoinOrRollbackOnLiveSet_5103(t *testing.T) {
 // TestRethMACOrdinaryFailureStaysWarnOnly_5103 is the over-reach guard for the
 // COMMIT error. Failing a MAC set has always been warn-only, and widening that to
 // every programRethMAC error would fail commits that have always succeeded — a
-// behaviour change well outside #5103. Only the failed-join class is escalated.
+// behaviour change well outside #5103. Only the class where the worker-join HOOK
+// RAN is escalated — which is wider than "the join failed" (a post-join setDown
+// or link-up failure is in it) and also does not claim the join succeeded (the
+// hook can fail at the dial, before the helper's stop_workers handler runs).
+// #6871 round 6: an earlier revision of this sentence said "the failed-join
+// class", which was both narrower than the code and an assertion the daemon
+// cannot make.
 //
 // The fixture is an ordinary failure that cannot involve the hook: the member is
 // gone by the time programRethMAC looks it up, which is exactly what happens when
