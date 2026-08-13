@@ -2,6 +2,8 @@ package userspace
 
 import (
 	"errors"
+	"fmt"
+	"maps"
 	"slices"
 	"testing"
 
@@ -402,15 +404,462 @@ func TestExclusionClassesAgreeAcrossParentAndChild(t *testing.T) {
 	// the excluded `fab0` overlay, and it is contributed by its own loop that
 	// the refused index does not gate — filtering it would unbind the fabric.
 	//
+	// THE FABRIC LOOP IS ALSO A THIRD CONTRIBUTOR, and #6691 round 8 was wrong
+	// to bound the enumeration by "the predicate's callers". `add(fab.Parent-
+	// LinuxName)` (interfaces.go) and `key := uint32(fab.ParentIfindex)`
+	// (maps_sync.go) push unconditionally, and Rust replan_queues' fabric loop
+	// does too — none of the three asks this predicate or the refused index.
+	// Measured with a Tunnel-class member (`set interfaces fab0 fabric-options
+	// member-interfaces gr-0/0/3` with an interface-level tunnel on gr-0/0/3):
+	// the refused netdev IS in the ingress set and IS in the allowlist. That is
+	// PRE-EXISTING — master's fabric loop is identical — and it is NOT reachable
+	// for a secure tunnel, per the REFUTED note below. It is tracked as #6998
+	// rather than fixed here.
+	//
 	// REFUTED, and recorded so the next reader does not re-derive it: "a fabric
 	// parent could itself be an xfrmi, so the Fabrics loop is a fourth
-	// laundering site." It is not reachable. Measured with
-	// `set interfaces fab0 fabric-options member-interfaces st10` alongside
-	// `bind-interface st10`: the snapshot carries ZERO fabric rows, because
-	// compiler_derivations.go resolves LocalFabricMember only for a member with
-	// an FPC slot (`InterfaceSlot`), and `st10` has none. With no fabric row
-	// there is no ParentIfindex for the loop to append — ingress came back
-	// [10] and the allowlist [ge-0-0-0], with the xfrmi in neither.
+	// laundering site FOR THE SECURE-TUNNEL CLASS." It is not reachable.
+	// Measured with `set interfaces fab0 fabric-options member-interfaces st10`
+	// alongside `bind-interface st10`: the snapshot carries ZERO fabric rows,
+	// because compiler_derivations.go resolves LocalFabricMember only for a
+	// member with an FPC slot (`InterfaceSlot`), and `st10` has none. With no
+	// fabric row there is no ParentIfindex for the loop to append — ingress came
+	// back [10] and the allowlist [ge-0-0-0], with the xfrmi in neither. The
+	// Tunnel class reaches it because `gr-0/0/3` IS slot-shaped; the secure
+	// tunnel class cannot.
+}
+
+// TestExclusionClassesDisagreeTheOtherWayToo is the CONVERSE of
+// TestExclusionClassesAgreeAcrossParentAndChild, and its absence was the
+// #6691 round 9 blocker.
+//
+// Round 8 asked only "BASE excluded, child not" — the direction where a child
+// launders its parent. The other direction is "UNIT excluded, base not", and it
+// matters for a different reason: when the unit's netdev is the SAME netdev as
+// the base's (a unit-0 row with no vlan-id collapses onto the base netdev,
+// snapshotLinuxName), an ANY-owner refusal index poisons a netdev that an
+// ADMITTED row owns.
+//
+// For each class this measures the three facts that decide whether the
+// direction is dangerous — is the child excluded, is the base excluded, do they
+// share a netdev — and then asserts the invariant that makes the answer safe:
+// a netdev with a bindable owner is never refused.
+//
+// FAIL-ON-REVERT: restore the ANY-owner index (refuse as soon as one owner is
+// unbindable) and the Tunnel case goes RED on "netdev %q is refused even though
+// %s owns it and is bindable".
+func TestExclusionClassesDisagreeTheOtherWayToo(t *testing.T) {
+	defer stubLinkSnapshot5619(t, map[string]int{
+		"ge-0-0-5": 30, "fxp0": 22, "em0": 23, "gr-0-0-0": 24,
+		"st10": 11, "st10.0": 12, "lo0": 26, "ge-0-0-3": 21,
+	})()
+
+	for _, tc := range []struct {
+		class string
+		lines []string
+		// xfrm names the LIVE xfrm netdevs for this case.
+		xfrm  []string
+		base  string
+		child string
+		// The three measured facts.
+		wantChildExcluded bool
+		wantBaseExcluded  bool
+		wantSharedNetdev  bool
+	}{
+		{
+			// THE BLOCKER. A unit-level tunnel stanza on a base with no
+			// interface-level tunnel: the unit row ORs in unit.Tunnel, and its
+			// unit-0 LinuxName is the base netdev. Both halves are needed —
+			// without the OR the rows would agree, without the collapse they
+			// would not share a netdev.
+			class: "Tunnel",
+			lines: []string{
+				"set interfaces ge-0/0/5 vlan-tagging",
+				"set interfaces ge-0/0/5 unit 0 tunnel source 10.0.0.1",
+				"set interfaces ge-0/0/5 unit 0 tunnel destination 10.0.0.2",
+				"set interfaces ge-0/0/5 unit 100 vlan-id 100",
+				"set security zones security-zone trust interfaces ge-0/0/5.0",
+				"set security zones security-zone trust interfaces ge-0/0/5.100",
+			},
+			base:              "ge-0/0/5",
+			child:             "ge-0/0/5.0",
+			wantChildExcluded: true,
+			wantBaseExcluded:  false,
+			wantSharedNetdev:  true,
+		},
+		{
+			// The name arms strip at the first '.', so the unit tests the same
+			// string the base does. They cannot disagree in EITHER direction —
+			// which is why a shared netdev is harmless here.
+			class: "fxp name",
+			lines: []string{
+				"set interfaces fxp0 unit 0 family inet address 10.9.9.1/24",
+				"set security zones security-zone trust interfaces fxp0.0",
+			},
+			base:              "fxp0",
+			child:             "fxp0.0",
+			wantChildExcluded: true,
+			wantBaseExcluded:  true,
+			wantSharedNetdev:  true,
+		},
+		{
+			class: "em name",
+			lines: []string{
+				"set interfaces em0 unit 0 family inet address 10.99.0.1/24",
+				"set security zones security-zone trust interfaces em0.0",
+			},
+			base:              "em0",
+			child:             "em0.0",
+			wantChildExcluded: true,
+			wantBaseExcluded:  true,
+			wantSharedNetdev:  true,
+		},
+		{
+			class: "lo0 name",
+			lines: []string{
+				"set interfaces lo0 unit 0 family inet address 10.255.0.1/32",
+				"set security zones security-zone trust interfaces lo0.0",
+			},
+			base:              "lo0",
+			child:             "lo0.0",
+			wantChildExcluded: true,
+			wantBaseExcluded:  true,
+			wantSharedNetdev:  true,
+		},
+		{
+			// LocalFabric is one InterfaceConfig field copied onto both rows,
+			// and `fab` is a name arm, so this class is over-determined in both
+			// directions exactly as the forward test found.
+			class: "LocalFabric + fab name",
+			lines: []string{
+				"set chassis cluster reth-count 2",
+				"set chassis cluster authentication-key abcdefghijklmnopqrstuvwxyz012345",
+				"set interfaces fab0 fabric-options member-interfaces ge-0/0/3",
+				"set interfaces fab0 unit 0 family inet address 10.100.0.1/24",
+				"set security zones security-zone trust interfaces fab0.0",
+				"set interfaces ge-0/0/3 unit 0 family inet address 10.0.9.1/24",
+			},
+			base:              "fab0",
+			child:             "fab0.0",
+			wantChildExcluded: true,
+			wantBaseExcluded:  true,
+			wantSharedNetdev:  true,
+		},
+		{
+			// SecureTunnel DOES disagree this way — `bind-interface st10.0`
+			// owns the unit and not the base — but the rows do NOT share a
+			// netdev: the unit resolves to the device the xfrmi reconciler
+			// actually creates (`st10.0`) while the base keeps `st10`. That
+			// separation is snapshotLinuxName's #5619 arm, and it is what keeps
+			// this disagreement harmless. Measured, not assumed.
+			class: "SecureTunnel",
+			xfrm:  []string{"st10.0"},
+			lines: []string{
+				"set security ipsec vpn V bind-interface st10.0",
+				"set interfaces st10 unit 0 family inet address 192.0.2.1/24",
+				"set security zones security-zone trust interfaces st10.0",
+			},
+			base:              "st10",
+			child:             "st10.0",
+			wantChildExcluded: true,
+			wantBaseExcluded:  false,
+			wantSharedNetdev:  false,
+		},
+	} {
+		t.Run(tc.class, func(t *testing.T) {
+			defer stubXfrmNetdevs(t, tc.xfrm...)()
+			cfg := compileForTest5619(t, tc.lines...)
+			rows := buildInterfaceSnapshots(cfg)
+			base, child := rowByName(t, rows, tc.base), rowByName(t, rows, tc.child)
+
+			if got := userspaceUnbindableNetdev(child); got != tc.wantChildExcluded {
+				t.Fatalf("child %s unbindable = %v, want %v — the converse direction "+
+					"is not being exercised", tc.child, got, tc.wantChildExcluded)
+			}
+			if got := userspaceUnbindableNetdev(base); got != tc.wantBaseExcluded {
+				t.Fatalf("base %s unbindable = %v, want %v", tc.base, got, tc.wantBaseExcluded)
+			}
+			shared := base.LinuxName == child.LinuxName
+			if shared != tc.wantSharedNetdev {
+				t.Fatalf("base netdev %q vs child netdev %q: shared = %v, want %v. "+
+					"Whether the two rows land on ONE netdev is what decides if a "+
+					"disagreement can poison an admitted row",
+					base.LinuxName, child.LinuxName, shared, tc.wantSharedNetdev)
+			}
+
+			// THE INVARIANT. A netdev with a bindable owner is not refused —
+			// whichever row disagrees.
+			refused := buildUserspaceRefusedNetdevs(rows)
+			for _, owner := range []InterfaceSnapshot{base, child} {
+				if !userspaceOwnsItsNetdev(owner) || userspaceUnbindableNetdev(owner) {
+					continue
+				}
+				if refused.refusesName(owner.LinuxName) {
+					t.Errorf("netdev %q is refused even though %s owns it and is "+
+						"bindable — a sibling row's exclusion was read as a property "+
+						"of the device", owner.LinuxName, owner.Name)
+				}
+				if refused.refusesIfindex(owner.Ifindex) {
+					t.Errorf("ifindex %d (%s, netdev %q) is refused even though a "+
+						"bindable row owns it", owner.Ifindex, owner.Name, owner.LinuxName)
+				}
+			}
+		})
+	}
+
+	// Coverage: same six classes as the forward direction, so the two tests
+	// cannot drift apart and leave one direction short of an arm.
+	const wantClasses = 6
+	if got := len([]string{
+		"Tunnel", "fxp name", "em name", "lo0 name", "LocalFabric + fab name", "SecureTunnel",
+	}); got != wantClasses {
+		t.Fatalf("enumeration drifted: %d classes, want %d", got, wantClasses)
+	}
+}
+
+// TestAliasTableRefusesEvenWhenTheChildNetdevResolves binds the one refusal
+// guard that no reachable config distinguishes, by constructing the state that
+// would make it live instead of declaring it untestable.
+//
+// #6691 round 8 reported this guard as a surviving mutation and justified it
+// with "no test can distinguish it — that is a structural claim, not a bound
+// one". That was both wrong at the time (the guard WAS live, on the round-9
+// blocker config) and a weaker answer than was available.
+//
+// THE FIXTURE IS SYNTHETIC AND SAYS SO. `st10.5 vlan-id 100` names the netdev
+// `st10.100`, which does not exist on a box: the xfrmi reconciler never creates
+// it and the kernel cannot create a VLAN on an ARPHRD_NONE parent. So the
+// production path is dropped by the `Ifindex <= 0` guard before the refusal is
+// consulted, and this test stubs the netdev into existence to reach the line.
+// That is legitimate here because the invariant is about the SITE — the alias
+// table must not become the one place the refusal is not asked — and the
+// reachability it depends on is not this file's to guarantee: #5619 made three
+// of the four secure-tunnel spellings resolve to netdevs that previously did
+// not.
+//
+// FAIL-ON-REVERT: delete the `refused.refusesIfindex(...)` guard in
+// buildUserspaceIngressBindingAliases and this test goes RED with
+// `binding alias 12 -> 11 points at the refused xfrmi`.
+func TestAliasTableRefusesEvenWhenTheChildNetdevResolves(t *testing.T) {
+	const (
+		lanIfindex   = 10
+		xfrmiIfindex = 11
+		childIfindex = 12
+	)
+	defer stubLinkSnapshot5619(t, map[string]int{
+		"ge-0-0-0": lanIfindex,
+		"st10":     xfrmiIfindex,
+		// SYNTHETIC: see the doc comment. Production reports 0 here.
+		"st10.100": childIfindex,
+	})()
+	defer stubXfrmNetdevs(t, "st10")()
+
+	cfg := compileForTest5619(t,
+		"set security ipsec vpn V bind-interface st10",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces st10 vlan-tagging",
+		"set interfaces st10 unit 5 vlan-id 100",
+		"set interfaces st10 unit 5 family inet address 192.0.2.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/0.0",
+		"set security zones security-zone trust interfaces st10.5",
+	)
+	rows := buildInterfaceSnapshots(cfg)
+	child := rowByName(t, rows, "st10.5")
+
+	// PREMISES. Every one of the four guards ahead of the refusal must be
+	// passed, or the test proves nothing about the refusal.
+	if userspaceSkipsIngressInterface(child) {
+		t.Fatal("premise broken: the child row is itself excluded, so the loop " +
+			"drops it before the refusal is asked")
+	}
+	if child.Ifindex != childIfindex || child.ParentIfindex != xfrmiIfindex {
+		t.Fatalf("premise broken: child resolved to (ifindex %d, parent %d), want (%d, %d) "+
+			"— the stub is what puts this row past the `Ifindex <= 0` guard",
+			child.Ifindex, child.ParentIfindex, childIfindex, xfrmiIfindex)
+	}
+	if child.LogicalOnly {
+		t.Fatal("premise broken: a LogicalOnly row is dropped by its own guard")
+	}
+	refused := buildUserspaceRefusedNetdevs(rows)
+	if !refused.refusesIfindex(xfrmiIfindex) {
+		t.Fatalf("premise broken: ifindex %d is not refused, so the guard under test "+
+			"has nothing to refuse", xfrmiIfindex)
+	}
+
+	for childIdx, parentIdx := range buildUserspaceIngressBindingAliases(
+		&ConfigSnapshot{Interfaces: rows}) {
+		if parentIdx == uint32(xfrmiIfindex) {
+			t.Errorf("binding alias %d -> %d points at the refused xfrmi. The shim "+
+				"would treat frames on the child as arriving on a netdev the "+
+				"dataplane refused to bind, which has no READY binding — "+
+				"drop_degraded_transit (BINDING_MISSING)", childIdx, parentIdx)
+		}
+	}
+}
+
+// TestLogicalOnlyRowNeverOwnsANetdev pins the fact that let round 9 DELETE the
+// `!iface.LogicalOnly` clause from buildUserspaceRefusedNetdevs rather than keep
+// carrying it as an unfireable belt.
+//
+// A LogicalOnly row is a bondless RETH VLAN unit whose Linux VLAN child was
+// never created (shouldUseLogicalOnlyParentBoundRethVLAN). Its ifindex is
+// SYNTHETIC — a private high-range value naming no kernel netdev — so round 8
+// kept it out of the ifindex index explicitly. Under the ownership rule it is
+// already out: the same conditions that make a row LogicalOnly (VlanID > 0, a
+// resolved parent netdev with a different name) make it a VLAN CHILD, and a VLAN
+// child does not own the netdev it binds.
+//
+// This asserts the implication directly, so if either rule moves the redundancy
+// is caught here instead of silently becoming a real gap.
+func TestLogicalOnlyRowNeverOwnsANetdev(t *testing.T) {
+	const (
+		parentIfindex = 40
+		vlanID        = 80
+	)
+	defer stubLinkSnapshot5619(t, map[string]int{"lo": parentIfindex})()
+	defer stubXfrmNetdevs(t)()
+
+	cfg := &config.Config{}
+	cfg.System.DataplaneType = "userspace"
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"lo":    {Name: "lo", RedundantParent: "reth0"},
+		"reth0": {Name: "reth0", Units: map[int]*config.InterfaceUnit{vlanID: {Number: vlanID, VlanID: vlanID}}},
+	}
+
+	rows := buildInterfaceSnapshots(cfg)
+	unit := rowByName(t, rows, fmt.Sprintf("reth0.%d", vlanID))
+	if !unit.LogicalOnly {
+		t.Fatalf("premise broken: %s is not LogicalOnly — the fixture no longer "+
+			"produces the row this test is about", unit.Name)
+	}
+	if unit.Ifindex < syntheticInterfaceIfindexMin || unit.Ifindex > syntheticInterfaceIfindexMax {
+		t.Fatalf("premise broken: ifindex %d is outside the synthetic range [%d,%d]",
+			unit.Ifindex, syntheticInterfaceIfindexMin, syntheticInterfaceIfindexMax)
+	}
+	if userspaceOwnsItsNetdev(unit) {
+		t.Fatalf("a LogicalOnly row owns its netdev (LinuxName %q, ParentLinuxName %q, "+
+			"VLANID %d, bind target %q). Its ifindex %d is SYNTHETIC and names no kernel "+
+			"netdev, so it must not vote on whether a netdev may be bound — restore an "+
+			"explicit LogicalOnly guard in buildUserspaceRefusedNetdevs",
+			unit.LinuxName, unit.ParentLinuxName, unit.VLANID,
+			userspaceBindTargetNetdev(unit), unit.Ifindex)
+	}
+	if refused := buildUserspaceRefusedNetdevs(rows); refused.refusesIfindex(unit.Ifindex) {
+		t.Errorf("the synthetic ifindex %d entered the refused index", unit.Ifindex)
+	}
+}
+
+// TestRefusedNetdevNeedsEveryOwnerToAgree is the #6691 round 9 blocker guard: an
+// ANY-owner refusal index refuses a netdev an ADMITTED row owns.
+//
+// The two spellings are both here because they fail differently and a single
+// case would have reported the wrong scope. The `ge-*` one is the full damage —
+// the base row's name leaves the RSS allowlist AND its VLAN sibling leaves the
+// ingress map and the alias table. The WireGuard one is the REACHABILITY: `set
+// interfaces wgN unit 0 tunnel mode wireguard` is the canonical spelling
+// (verbatim in pkg/config/tunnelid_test.go and in an operator config in
+// docs/issues/issue-history.md), and it loses the allowlist entry with no VLAN
+// unit involved at all.
+//
+// Every expected value below is what origin/master produces for the same config,
+// asserted absolutely rather than as "not refused" — this is a no-regression
+// claim and it should read like one.
+//
+// FAIL-ON-REVERT: change buildUserspaceRefusedNetdevs back to refusing on ANY
+// unbindable owner and both subtests go RED — the ge case on the ingress set
+// (`[10 30]` for `[10 30 31]`), the allowlist (`[ge-0-0-0]` for
+// `[ge-0-0-0 ge-0-0-5]`) and the aliases (`map[]` for `map[31:30]`); the wg case
+// on the allowlist (`[ge-0-0-0]` for `[ge-0-0-0 wg1408]`).
+func TestRefusedNetdevNeedsEveryOwnerToAgree(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		live        map[string]int
+		lines       []string
+		wantIngress []uint32
+		wantRSS     []string
+		wantAliases map[uint32]uint32
+	}{
+		{
+			name: "unit-level tunnel on a data NIC",
+			live: map[string]int{"ge-0-0-0": 10, "ge-0-0-5": 30, "ge-0-0-5.100": 31},
+			lines: []string{
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+				"set interfaces ge-0/0/5 vlan-tagging",
+				"set interfaces ge-0/0/5 unit 0 tunnel source 10.0.0.1",
+				"set interfaces ge-0/0/5 unit 0 tunnel destination 10.0.0.2",
+				"set interfaces ge-0/0/5 unit 100 vlan-id 100",
+				"set security zones security-zone trust interfaces ge-0/0/0.0",
+				"set security zones security-zone trust interfaces ge-0/0/5.0",
+				"set security zones security-zone trust interfaces ge-0/0/5.100",
+			},
+			wantIngress: []uint32{10, 30, 31},
+			wantRSS:     []string{"ge-0-0-0", "ge-0-0-5"},
+			wantAliases: map[uint32]uint32{31: 30},
+		},
+		{
+			name: "canonical wireguard spelling",
+			live: map[string]int{"ge-0-0-0": 10, "wg1408": 40},
+			lines: []string{
+				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+				"set interfaces wg1408 unit 0 tunnel mode wireguard",
+				"set interfaces wg1408 unit 0 tunnel wireguard listen-port 51820",
+				"set interfaces wg1408 unit 0 tunnel wireguard private-key " +
+					"0000000000000000000000000000000000000000000000000000000000000001",
+				"set interfaces wg1408 unit 0 tunnel wireguard peer " +
+					"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa " +
+					"allowed-ips 10.9.0.0/24",
+				"set security zones security-zone trust interfaces ge-0/0/0.0",
+				"set security zones security-zone trust interfaces wg1408.0",
+			},
+			wantIngress: []uint32{10, 40},
+			wantRSS:     []string{"ge-0-0-0", "wg1408"},
+			wantAliases: map[uint32]uint32{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer stubLinkSnapshot5619(t, tc.live)()
+			defer stubXfrmNetdevs(t)()
+			cfg := compileForTest5619(t, tc.lines...)
+			rows := buildInterfaceSnapshots(cfg)
+
+			// PREMISES. Without the disagreement AND the shared netdev this
+			// config cannot discriminate the ANY rule from the ALL rule.
+			baseName := "ge-0/0/5"
+			if _, ok := cfg.Interfaces.Interfaces["wg1408"]; ok {
+				baseName = "wg1408"
+			}
+			base, unit := rowByName(t, rows, baseName), rowByName(t, rows, baseName+".0")
+			if userspaceUnbindableNetdev(base) {
+				t.Fatalf("premise broken: the %s base row is itself unbindable — then "+
+					"nothing is being poisoned", baseName)
+			}
+			if !userspaceUnbindableNetdev(unit) {
+				t.Fatalf("premise broken: the %s.0 unit row is NOT unbindable "+
+					"(Tunnel=%v) — the unit-level tunnel stanza is what makes the two "+
+					"rows disagree", baseName, unit.Tunnel)
+			}
+			if base.LinuxName != unit.LinuxName {
+				t.Fatalf("premise broken: base netdev %q != unit netdev %q — the unit-0 "+
+					"name collapse is what puts both rows on ONE netdev",
+					base.LinuxName, unit.LinuxName)
+			}
+
+			snap := &ConfigSnapshot{Interfaces: rows}
+			if got := buildUserspaceIngressIfindexes(snap); !slices.Equal(got, tc.wantIngress) {
+				t.Errorf("ingress-adjudication set = %v, want %v. An ifindex absent here "+
+					"takes cpumap_or_pass in the shim and syncInterfaceAttachments "+
+					"detaches XDP/TC from it", got, tc.wantIngress)
+			}
+			if got := UserspaceBoundLinuxInterfaces(cfg); !slices.Equal(got, tc.wantRSS) {
+				t.Errorf("RSS/AF_XDP allowlist = %v, want %v. Dropping a netdev here also "+
+					"removes its revert path: restoreDefaultRSSIndirection and "+
+					"applyCoalescence are both allowlist-scoped", got, tc.wantRSS)
+			}
+			if got := buildUserspaceIngressBindingAliases(snap); !maps.Equal(got, tc.wantAliases) {
+				t.Errorf("binding aliases = %v, want %v", got, tc.wantAliases)
+			}
+		})
+	}
 }
 
 // TestRetainedLiveXfrmiLeavesTheAdjudicatedSets is the F3 guard, and it

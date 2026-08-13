@@ -857,9 +857,17 @@ func configHasSecureTunnel(cfg *config.Config) bool {
 // caller disarms the helper and the commit aborts with an operator-visible
 // reason.
 //
-// Scoped to configs that actually derive an xfrmi, so an operator with no
-// route-based IPsec is never blocked by a helper-version mismatch that cannot
-// affect them.
+// Scoped by configHasSecureTunnel, which since #6691 round 8 is the SAME union
+// the row flag is — a config-derived xfrmi OR a LIVE xfrm netdev the config no
+// longer describes. So the honest statement of the scope is: an operator with
+// neither route-based IPsec NOR a leftover xfrm device is never blocked by a
+// helper-version mismatch that cannot affect them. The narrower "no route-based
+// IPsec" wording this comment used to carry outlived the widening it describes
+// and was measurably wrong: with zero VPNs configured, configHasSecureTunnel
+// returns false with no live xfrmi and TRUE with a stale live `st10`. The
+// arming is right — a stale xfrmi is exactly the case an operator cannot fix by
+// editing the config, so a pre-v5 helper must not stay armed for it — and only
+// the sentence was the defect.
 func (m *Manager) ensureSecureTunnelProtocolLocked(cfg *config.Config) error {
 	if !configHasSecureTunnel(cfg) {
 		return nil

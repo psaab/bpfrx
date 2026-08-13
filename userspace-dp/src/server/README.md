@@ -352,6 +352,71 @@ state built by `populate_interfaces`
 (`afxdp/forwarding_build/interfaces.rs`), which gates on `ifindex > 0` rather
 than on this predicate — so `name_to_ifindex` and the zone map see it.
 
+**The refused-netdev index, and why it takes EVERY owner rather than any
+(#6691 rounds 8 and 9).** Three of those four sets let a row contribute a
+netdev that is *not its own*: a VLAN child binds its physical parent (#2917).
+So a zoned sibling unit of a bound secure tunnel can hand the dataplane exactly
+the netdev the base row was refused for, and asking the row-level predicate
+again at each site cannot catch it — the child passes it. Round 8 answered with
+a netdev-keyed index: `buildUserspaceRefusedNetdevs`
+(`pkg/dataplane/userspace/ingress_exclusions.go`) on the Go side, and
+`snapshot_refuses_parent_netdev` / `binding_target_is_refused` (`planning.rs`)
+here, the latter read by BOTH the candidate loop and the plan-key filter so the
+#2915 hash/layout invariant is a property of the code.
+
+Round 8 refused a netdev as soon as *any* row was unbindable for it, and that
+was a regression: it reads a **disagreement between two rows** as a refusal.
+Rows do disagree. The Go builder sets a unit row's `tunnel` flag to
+`iface.Tunnel != nil || unit.Tunnel != nil`, and a unit-0 row with no vlan-id
+resolves to the BASE netdev, so `set interfaces wgN unit 0 tunnel mode
+wireguard` — the canonical WireGuard spelling — ships an unbindable `wgN.0` row
+and a bindable `wgN` base row on ONE netdev. Under the ANY rule the netdev left
+the Go RSS allowlist while this planner still planned a binding for it, and on
+a `ge-*` NIC the netdev's zoned VLAN sibling also left the ingress-adjudication
+map and the binding-alias table.
+
+Both planes now refuse a netdev only when **every row that OWNS it** — every
+row whose bind target is its own netdev, i.e. not a VLAN child redirecting onto
+a parent — is unbindable, and never when the netdev has no owner at all. The
+question the index answers is "is this netdev, as a DEVICE, one we must never
+bind?", and a device cannot be both: when its owners disagree, at least one
+owner is an ordinary data interface that will contribute the netdev on its own
+account, so refusing cannot prevent the binding and can only strip traffic.
+
+The secure-tunnel exclusion is unaffected, and it survives on the ownership
+half rather than on a special case: under `bind-interface st10` the only row
+whose netdev is `st10` is the base xfrmi row (a `unit 5 vlan-id 100` sibling
+resolves to `st10.100`), so that bucket is unanimous. A `unit 0` sibling shares
+the netdev but is itself a secure tunnel by the same ownership oracle, so that
+bucket is unanimous too.
+
+Two consequences worth knowing. First, for a row that owns its own netdev the
+refusal is now **structurally unreachable** — such a row only reaches the check
+after passing the row-level exclusion, so it is a bindable owner of its own
+bucket — which puts the Go rule in the same shape as this file's
+`binding_target_is_refused`, whose non-VLAN arm is the literal `false`. Second,
+the ANY rule diverged the planes in the dangerous direction: with a `mgmt`-zoned
+base plus a unit-0 tunnel row and a trust VLAN child, this planner produced NO
+binding for a netdev whose ifindex the Go ingress map still carried, and an
+ifindex in the ingress map with no READY binding is `drop_degraded_transit`
+(BINDING_MISSING). `a_netdev_with_a_bindable_owner_is_not_refused`
+(`main_tests.rs`) is the fail-on-revert guard for that shape.
+
+**The caller list is not an enumeration of the sets.** Round 8 bounded its own
+work with "a redirect can only launder within the sets the predicate gates, so
+the sites are the predicate's callers per plane, four in Go and two in Rust".
+That is false: the FABRIC loops contribute to the same sets without consulting
+the predicate or the index — `replan_queues`' fabric pass here, and
+`add(fab.ParentLinuxName)` / `key := uint32(fab.ParentIfindex)` in the Go
+`interfaces.go` / `maps_sync.go`. Measured with a Tunnel-class member
+(`set interfaces fab0 fabric-options member-interfaces gr-0/0/3`, interface-level
+tunnel on the member), the refused netdev is in the ingress set and in the
+allowlist. It is PRE-EXISTING (master's fabric loops are identical) and is NOT
+reachable for a secure tunnel — `LocalFabricMember` resolves only for
+slot-shaped member names, so an `st*` member yields no fabric row at all — so it
+is tracked as #6998 rather than folded here. To bound a laundering question,
+enumerate every CONTRIBUTOR to the set, not every caller of the predicate.
+
 It does **not** enter the **egress map**. `populate_egress` needs a source MAC
 and takes it from the interface's own `hardware_addr`, else the parent's MAC,
 else the `tunnel` flag. An xfrmi is `ARPHRD_NONE` (no MAC), has no parent

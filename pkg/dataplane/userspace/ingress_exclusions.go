@@ -7,10 +7,16 @@ import "strings"
 // Split out of maps_sync.go in #6691 round 8. The predicate is ~20 lines of
 // code carrying ~180 lines of rationale — five exclusion classes, each with a
 // documented reason and a documented cost — and keeping it inline pushed
-// maps_sync.go past the 2000-line refactor threshold on comment alone. It has
-// four call sites (enumerated in the secure-tunnel arm below), none of which
-// lives in maps_sync.go exclusively, so this is a pure move: no signature, no
-// behaviour and no caller changes.
+// maps_sync.go past the 2000-line refactor threshold on comment alone.
+//
+// The FILE CREATION (be8aec13e) was a pure move: same body, same signature, no
+// caller changes. What the file holds now is NOT — an earlier revision of this
+// header said "pure move: no signature, no behaviour and no caller changes" and
+// kept saying it after that stopped being true. Since the move, round 8 split
+// the predicate in two (userspaceUnbindableNetdev / userspaceSkipsIngressInterface),
+// added the refused-netdev index below, and changed behaviour at three call
+// sites; round 9 then re-founded that index on ownership. Describe what is here,
+// not how it got here.
 
 // userspaceUnbindableNetdev reports whether a row's OWN netdev is one the
 // userspace dataplane must never bind an AF_XDP socket to.
@@ -46,13 +52,30 @@ import "strings"
 //     regression, not a fix. TestParentRedirectKeepsAMgmtZonedParent is the
 //     negative control.
 //
-// Whether a class can actually leak is a separate question from where it
-// belongs, and only ONE class can: Tunnel and LocalFabric are read off the same
-// InterfaceConfig by both the base and the unit row, and the fxp/em/fab/lo0
-// arms test the BASE name, which a unit shares. SecureTunnel is the only class
-// keyed on something (the if_id) that a base and its unit can legitimately
-// disagree about. TestExclusionClassesAgreeAcrossParentAndChild pins that
-// enumeration so a new class cannot be added on the wrong side unnoticed.
+// Whether a class can actually DISAGREE between a base row and its unit row is
+// a separate question from where the class belongs, and it has to be asked in
+// BOTH directions. Round 8 asked only one of them and got the enumeration
+// wrong:
+//
+//   - BASE excluded, UNIT not. SecureTunnel is the only class that reaches
+//     this — it is keyed on the if_id, which a base and a non-zero unit
+//     necessarily derive differently. This is the F1 direction, and it is what
+//     the refused-netdev index below exists for.
+//   - UNIT excluded, BASE not. TUNNEL reaches this, and round 8 said it could
+//     not: "Tunnel and LocalFabric are read off the same InterfaceConfig by
+//     both the base and the unit row" is FALSE of Tunnel, because
+//     buildInterfaceSnapshots sets a unit row's flag to
+//     `iface.Tunnel != nil || unit.Tunnel != nil` (interfaces.go). A
+//     unit-level `tunnel` stanza on a base with no interface-level tunnel —
+//     `set interfaces wgN unit 0 tunnel mode wireguard` is the canonical
+//     spelling — gives Tunnel=true on the unit and false on the base. That
+//     direction is the #6691 round 9 blocker; see userspaceRefusedNetdevs.
+//     LocalFabric really is one field copied to both rows, and the
+//     fxp/em/fab/lo0 arms really do test the BASE name a unit shares.
+//
+// TestExclusionClassesAgreeAcrossParentAndChild pins both directions for every
+// class, so a new class cannot be added on the wrong side unnoticed and a
+// direction cannot go unmeasured again.
 func userspaceUnbindableNetdev(iface InterfaceSnapshot) bool {
 	if iface.Tunnel {
 		return true
@@ -140,8 +163,28 @@ func userspaceUnbindableNetdev(iface InterfaceSnapshot) bool {
 		// Each of the three set-changing sites can be handed this netdev by a
 		// row that is NOT this row — a zoned sibling unit redirecting onto its
 		// parent. userspaceRefusedNetdevs (below) is what makes the refusal
-		// travel with the NETDEV instead of stopping at the row, so the sites
-		// enumerated above cannot be re-entered sideways.
+		// travel with the NETDEV instead of stopping at the row.
+		//
+		// THE CALLER LIST IS NOT AN ENUMERATION OF THE SETS. Round 8 wrote
+		// that "the sites enumerated above cannot be re-entered sideways" and
+		// bounded its own work by "a redirect can only launder within the sets
+		// the predicate gates, so the sites are the predicate's callers per
+		// plane". Both sentences are false, and the counter-example is the
+		// FABRIC loop: buildUserspaceIngressIfindexes and
+		// UserspaceBoundLinuxInterfaces each finish with a `snapshot.Fabrics`
+		// pass that pushes fab.ParentIfindex / fab.ParentLinuxName
+		// UNCONDITIONALLY — it asks neither this predicate nor the index — and
+		// Rust replan_queues' fabric loop does the same. Measured with
+		// `set interfaces fab0 fabric-options member-interfaces gr-0/0/3` and an
+		// interface-level tunnel on gr-0/0/3: the refused netdev is in the
+		// ingress set AND in the RSS allowlist. That is PRE-EXISTING (master's
+		// fabric loop is identical) and is not reachable for a secure tunnel
+		// (LocalFabricMember resolves only for slot-shaped member names, so an
+		// `st*` member yields no fabric row at all — see the REFUTED note in
+		// TestExclusionClassesAgreeAcrossParentAndChild), so it is out of scope
+		// here and tracked as #6998. The correction that matters for a future
+		// reader: to bound a laundering question, enumerate every CONTRIBUTOR to
+		// the set, not every caller of the predicate.
 		//
 		// The AF_XDP binding PLAN itself is gated on the Rust side by the
 		// mirrored include_userspace_binding_interface (userspace-dp), off the
@@ -280,9 +323,33 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 	return false
 }
 
+// userspaceOwnsItsNetdev reports whether a row's AF_XDP binding would land on
+// its OWN netdev — i.e. the row is not a VLAN child redirecting onto a parent.
+//
+// It is the "which rows speak for this netdev" relation behind
+// userspaceRefusedNetdevs, and it is deliberately expressed through
+// userspaceBindTargetNetdev (the #2917 SSOT) rather than restating the VLAN
+// test: a VLAN child's LinuxName is the CHILD netdev, so the child says nothing
+// about whether the PARENT netdev may be bound. Rust's
+// snapshot_refuses_parent_netdev carries the identical qualifier
+// (`vlan_child_parent_netdev(p, &p_linux).is_none()`), so the two planes select
+// the same rows by the same sentence.
+//
+// A LogicalOnly row is a bondless RETH VLAN unit, so it is a VLAN child by
+// construction (shouldUseLogicalOnlyParentBoundRethVLAN requires unit.VlanID > 0
+// and a parent netdev whose name differs) and this relation already excludes it.
+// Round 8 carried a separate `!iface.LogicalOnly` clause for the same reason and
+// a review round was right that nothing could distinguish it: it was not merely
+// unbound, it was redundant with the rule above it.
+// TestLogicalOnlyRowNeverOwnsANetdev pins that, so the redundancy is a measured
+// fact and not this comment's assertion.
+func userspaceOwnsItsNetdev(iface InterfaceSnapshot) bool {
+	return userspaceBindTargetNetdev(iface) == iface.LinuxName
+}
+
 // userspaceRefusedNetdevs indexes — by ifindex AND by Linux name — every netdev
-// that some row in a snapshot has already been refused an AF_XDP binding for on
-// DEVICE grounds (userspaceUnbindableNetdev).
+// that the userspace dataplane must never bind an AF_XDP socket to, judged
+// across ALL the rows that own it.
 //
 // #6691 round 8. It exists because three of the four sets the exclusion gates
 // let a row contribute a netdev that is NOT its own: a VLAN child binds its
@@ -294,39 +361,120 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 // question at a redirect is about the TARGET netdev, so the answer has to be
 // indexed by netdev.
 //
+// EVERY OWNER, NOT ANY OWNER (#6691 round 9, and this is the correctness half).
+// Round 8 refused a netdev as soon as ANY row was unbindable for it, which reads
+// a DISAGREEMENT between two rows as a refusal. Rows do disagree — a unit row's
+// Tunnel flag is `iface.Tunnel != nil || unit.Tunnel != nil`, and a unit-0 row
+// with no vlan-id resolves to the BASE netdev — so
+//
+//	set interfaces wg1408 unit 0 tunnel mode wireguard
+//
+// (the canonical WireGuard spelling: verbatim in pkg/config/tunnelid_test.go and
+// in an operator config in docs/issues/issue-history.md) puts an unbindable
+// `wg1408.0` row and a bindable `wg1408` base row on ONE netdev. Round 8 refused
+// it, and the base row's own name being in the index took the base row out of
+// the RSS allowlist — measured, head vs master: allowlist `[ge-0-0-0]` where
+// master had `[ge-0-0-0 wg1408]`. The same shape on a `ge-*` NIC additionally
+// dropped its VLAN unit out of the ingress-adjudication map (`[10 30]` vs
+// `[10 30 31]`) and its child→parent alias, and an ifindex absent from
+// userspace_ingress_ifaces leaves the adjudicated path entirely
+// (cpumap_or_pass, userspace-xdp/src/lib.rs) with syncInterfaceAttachments
+// detaching XDP/TC from it.
+//
+// The question this index answers is "is this netdev, AS A DEVICE, one we must
+// never bind?" — and a device cannot be both. When the rows that own it
+// disagree, at least one row that owns it is an ordinary data interface, and
+// that row will contribute the netdev to the binding plan on its own account
+// whatever the redirect does. Refusing on a disagreement therefore cannot
+// prevent the binding; it can only strip traffic from rows that were entitled to
+// it. So the rule is: refuse only when every owner agrees, and never when the
+// netdev has no owner at all.
+//
+// F1 IS PRESERVED EXACTLY, and it survives on the ownership half rather than on
+// a special case. Under `bind-interface st10` with a zoned sibling
+// `st10 unit 5 vlan-id 100`, the only row whose LinuxName is `st10` is the base
+// xfrmi row — the sibling resolves to `st10.100` — so the bucket is a single
+// unbindable owner and `st10` stays refused. Under `bind-interface st10` with a
+// unit-0 sibling, BOTH rows resolve to `st10` and BOTH are SecureTunnel (the
+// unit inherits the ownership through Config.SecureTunnelNetdevForRef, and the
+// live-xfrmi half sees the same device), so the bucket is unanimous and the
+// netdev stays refused there too. Measured in
+// TestRefusedNetdevNeedsEveryOwnerToAgree.
+//
+// A COROLLARY WORTH KNOWING: for a row that owns its own netdev the refusal is
+// now structurally unreachable. Such a row only reaches a refusal check after
+// passing userspaceSkipsIngressInterface, and unbindable ⇒ skipped, so the row
+// is a bindable owner of its own bucket and the bucket cannot be unanimous.
+// The index can therefore only ever fire through a REDIRECT — which is the
+// property round 8 claimed and did not have. It also puts the Go rule in the
+// same shape as Rust's binding_target_is_refused, whose non-VLAN arm is the
+// literal constant `false`.
+//
 // BOTH keys are needed, and neither is redundant: the ingress map and the
 // aliases are ifindex-keyed, while the RSS allowlist is name-keyed and is
 // derived (UserspaceBoundLinuxInterfaces) without resolving ifindexes at all.
 //
-// Scope: built from rows, so it can only refuse a netdev some row NAMES. That
-// is sufficient here because every unit row's parent netdev is the base row's
+// Scope: built from rows, so it can only refuse a netdev some row OWNS. That is
+// sufficient here because every unit row's parent netdev is the base row's
 // netdev, and a unit exists only under a base in cfg.Interfaces.Interfaces — so
 // a redirect target always has a row. A netdev no row names cannot be
-// redirected onto in the first place.
+// redirected onto in the first place. It is NOT sufficient for the FABRIC loop,
+// which contributes to two of the same sets without consulting this index at
+// all; see the caller-list correction in userspaceUnbindableNetdev.
 type userspaceRefusedNetdevs struct {
 	ifindex map[int]struct{}
 	name    map[string]struct{}
 }
 
+// netdevOwnerTally counts, for one netdev key, how many rows own it and how many
+// of those call it unbindable. A key is refused only when the two are equal and
+// non-zero.
+type netdevOwnerTally struct {
+	owners     int
+	unbindable int
+}
+
+func (t netdevOwnerTally) refused() bool {
+	return t.owners > 0 && t.owners == t.unbindable
+}
+
 func buildUserspaceRefusedNetdevs(ifaces []InterfaceSnapshot) userspaceRefusedNetdevs {
+	byName := make(map[string]netdevOwnerTally)
+	byIfindex := make(map[int]netdevOwnerTally)
+	for _, iface := range ifaces {
+		if !userspaceOwnsItsNetdev(iface) {
+			continue
+		}
+		unbindable := userspaceUnbindableNetdev(iface)
+		if iface.LinuxName != "" {
+			tally := byName[iface.LinuxName]
+			tally.owners++
+			if unbindable {
+				tally.unbindable++
+			}
+			byName[iface.LinuxName] = tally
+		}
+		if iface.Ifindex > 0 {
+			tally := byIfindex[iface.Ifindex]
+			tally.owners++
+			if unbindable {
+				tally.unbindable++
+			}
+			byIfindex[iface.Ifindex] = tally
+		}
+	}
 	out := userspaceRefusedNetdevs{
 		ifindex: make(map[int]struct{}),
 		name:    make(map[string]struct{}),
 	}
-	for _, iface := range ifaces {
-		if !userspaceUnbindableNetdev(iface) {
-			continue
+	for name, tally := range byName {
+		if tally.refused() {
+			out.name[name] = struct{}{}
 		}
-		// A LogicalOnly row's ifindex is SYNTHETIC (a private high-range value
-		// standing in for a Linux VLAN child that was never created), so it
-		// names no kernel netdev and must not be indexed as one. Its LinuxName
-		// still is the netdev name the RSS allowlist would emit, so that key is
-		// kept.
-		if iface.Ifindex > 0 && !iface.LogicalOnly {
-			out.ifindex[iface.Ifindex] = struct{}{}
-		}
-		if iface.LinuxName != "" {
-			out.name[iface.LinuxName] = struct{}{}
+	}
+	for ifindex, tally := range byIfindex {
+		if tally.refused() {
+			out.ifindex[ifindex] = struct{}{}
 		}
 	}
 	return out

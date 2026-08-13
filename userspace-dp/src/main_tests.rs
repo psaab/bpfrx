@@ -4490,3 +4490,119 @@ fn orphan_vlan_child_still_rekeys_onto_an_unzoned_parent() {
 
     clear_rx_queue_count_override();
 }
+
+/// #6691 round 9: `snapshot_refuses_parent_netdev` must need EVERY owner of a
+/// netdev to be unbindable, not just one — the Rust half of the Go blocker in
+/// `buildUserspaceRefusedNetdevs`.
+///
+/// THE SNAPSHOT IS WHAT THE GO BUILDER SHIPS, not a hand-invented shape. A
+/// unit-level `tunnel` stanza sets `Tunnel` on the UNIT row only
+/// (`iface.Tunnel != nil || unit.Tunnel != nil`, interfaces.go), and a unit-0
+/// row with no vlan-id resolves to the BASE netdev (snapshotLinuxName's unit-0
+/// collapse) — so `ge-0/0/5` and `ge-0/0/5.0` arrive here as two rows on ONE
+/// netdev that disagree about whether it may be bound.
+///
+/// THE BASE ROW IS mgmt-ZONED ON PURPOSE, and that is the only shape that makes
+/// this observable rather than merely inconsistent. `buildInterfaceZoneMap` keys
+/// a base off whichever zone entry sorts first, so `security-zone mgmt
+/// interfaces ge-0/0/5.0` + `security-zone trust interfaces ge-0/0/5.100` really
+/// does produce base=mgmt with a trust VLAN unit — the shape
+/// `TestParentRedirectKeepsAMgmtZonedParent` exists for. With the base excluded
+/// for a ROW reason it supplies no candidate of its own, so under the ANY rule
+/// the trust VLAN child's re-key was the netdev's only route into the plan and
+/// refusing it left the plan with NO binding for a netdev whose ifindex the Go
+/// ingress map still carries. An ifindex in the ingress map with no READY
+/// binding is `drop_degraded_transit` (BINDING_MISSING).
+///
+/// FAIL-ON-REVERT: change `snapshot_refuses_parent_netdev` back to
+/// `.iter().any(...)` and this goes RED — planned came back without
+/// `ge-0-0-5` at all.
+#[test]
+fn a_netdev_with_a_bindable_owner_is_not_refused() {
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, include_userspace_binding_interface, replan_queues,
+        set_rx_queue_count_override, userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-5", 6);
+
+    // The base NIC. Bindable as a DEVICE; excluded only by its mgmt ZONE.
+    let base = InterfaceSnapshot {
+        name: "ge-0/0/5".to_string(),
+        linux_name: "ge-0-0-5".to_string(),
+        zone: "mgmt".to_string(),
+        ifindex: 30,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    // The unit-level tunnel row: Tunnel set, and collapsed onto the base netdev.
+    let tunnel_unit = InterfaceSnapshot {
+        name: "ge-0/0/5.0".to_string(),
+        linux_name: "ge-0-0-5".to_string(),
+        parent_linux_name: "ge-0-0-5".to_string(),
+        zone: "mgmt".to_string(),
+        tunnel: true,
+        ifindex: 30,
+        parent_ifindex: 30,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    // The trust-zoned VLAN child whose frames arrive on the base NIC's queues.
+    let vlan_child = InterfaceSnapshot {
+        name: "ge-0/0/5.100".to_string(),
+        linux_name: "ge-0-0-5.100".to_string(),
+        parent_linux_name: "ge-0-0-5".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 31,
+        parent_ifindex: 30,
+        vlan_id: 100,
+        rx_queues: 1,
+        ..Default::default()
+    };
+
+    // Premises. Without all three this cannot discriminate ANY from EVERY.
+    assert!(
+        !userspace_unbindable_netdev(&base),
+        "premise: the base row must be a BINDABLE device, or the two rows agree"
+    );
+    assert!(
+        userspace_unbindable_netdev(&tunnel_unit),
+        "premise: the unit row must be unbindable, or nothing is disagreeing"
+    );
+    assert!(
+        !include_userspace_binding_interface(&base),
+        "premise: the base must NOT be a candidate on its own (mgmt zone), or the \
+         netdev enters the plan regardless and the refusal is unobservable"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![base, tunnel_unit, vlan_child],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        planned.contains("ge-0-0-5"),
+        "the trust VLAN child produced no candidate because a SIBLING row on the \
+         same netdev is a tunnel. The netdev has a bindable owner, so it is not \
+         refused — and dropping it leaves the Go ingress map carrying ifindex 30 \
+         with no READY binding (drop_degraded_transit). Planned: {planned:?}"
+    );
+    let queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-5")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        queues.len(),
+        6,
+        "the re-key must use the PARENT's 6 hardware queues, not the child's lone \
+         software queue"
+    );
+
+    clear_rx_queue_count_override();
+}

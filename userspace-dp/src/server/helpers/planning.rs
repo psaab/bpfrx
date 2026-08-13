@@ -468,18 +468,47 @@ fn snapshot_has_parent_candidate(snapshot: &ConfigSnapshot, parent: &str) -> boo
 /// Deliberately mirrors `snapshot_has_parent_candidate`'s structure, including
 /// the "must be the netdev itself, not another VLAN child sharing the name
 /// string" guard, so the two answers are about the same row.
+///
+/// EVERY OWNER, NOT ANY OWNER (#6691 round 9). Round 8 refused as soon as ANY
+/// owning row was unbindable, which reads a DISAGREEMENT between two rows as a
+/// refusal. Rows do disagree: the Go builder sets a unit row's `tunnel` flag to
+/// `iface.Tunnel != nil || unit.Tunnel != nil`, and a unit-0 row with no vlan-id
+/// resolves to the BASE netdev, so `set interfaces ge-0/0/5 unit 0 tunnel ...`
+/// ships an unbindable `ge-0/0/5.0` row and a bindable `ge-0/0/5` row on ONE
+/// netdev. Under the ANY reading a zoned VLAN sibling of that NIC contributed no
+/// candidate at all — and when the NIC's own base row is excluded for a ROW
+/// reason (a `mgmt` zone, the shape `TestParentRedirectKeepsAMgmtZonedParent`
+/// exists for), nothing else supplied it either, so the plan lost a netdev whose
+/// ifindex the Go ingress map still carries. An ifindex in the ingress map with
+/// no READY binding is `drop_degraded_transit` (BINDING_MISSING) — the unsafe
+/// direction, by this file's own invariant.
+///
+/// Refusing only on unanimity keeps this in exact lock-step with the Go control
+/// plane's `buildUserspaceRefusedNetdevs`
+/// (`pkg/dataplane/userspace/ingress_exclusions.go`), which selects owners with
+/// the same sentence — `userspaceOwnsItsNetdev`, i.e. the bind target is the
+/// row's own netdev — and refuses only when every owner agrees. `secure_tunnel`
+/// is unaffected: for `bind-interface st10` the only row whose netdev is `st10`
+/// is the base xfrmi row (the sibling resolves to `st10.100`), so that bucket is
+/// unanimous and the netdev stays refused.
 fn snapshot_refuses_parent_netdev(snapshot: &ConfigSnapshot, parent: &str) -> bool {
-    snapshot.interfaces.iter().any(|p| {
-        if !userspace_unbindable_netdev(p) {
-            return false;
-        }
+    let mut owners = 0usize;
+    let mut unbindable = 0usize;
+    for p in &snapshot.interfaces {
         let p_linux = if p.linux_name.is_empty() {
             linux_ifname(&p.name)
         } else {
             p.linux_name.clone()
         };
-        p_linux == parent && vlan_child_parent_netdev(p, &p_linux).is_none()
-    })
+        if p_linux != parent || vlan_child_parent_netdev(p, &p_linux).is_some() {
+            continue;
+        }
+        owners += 1;
+        if userspace_unbindable_netdev(p) {
+            unbindable += 1;
+        }
+    }
+    owners > 0 && owners == unbindable
 }
 
 /// #6691 round 8: this row's AF_XDP binding would land on a netdev the snapshot

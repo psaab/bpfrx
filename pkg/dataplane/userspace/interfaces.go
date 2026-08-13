@@ -123,7 +123,7 @@ func userspaceBindTargetNetdev(iface InterfaceSnapshot) string {
 // userspaceSkipsIngressInterface(): include zoned non-tunnel interfaces
 // excluding fxp*, em*, fab*, lo0, mgmt/control zones, and RETH member
 // children — and, since #6691 round 8, excluding a row whose AF_XDP bind
-// TARGET is a netdev some other row was already refused for (a VLAN child
+// TARGET is a netdev EVERY owning row was refused for (a VLAN child
 // redirecting onto an excluded parent); plus every fabric's parent member (fab0/fab1 themselves are
 // IPVLAN overlays and are excluded above, but their physical parent is
 // where AF_XDP binds). For zoned VLAN units whose parent is the physical

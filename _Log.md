@@ -1,3 +1,192 @@
+## 2026-08-13 — #6691 round 9: the refused-netdev index refused a netdev an ADMITTED row owns
+
+- **Timestamp**: 2026-08-13 16:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Re-founded round 8's refused-netdev index on OWNERSHIP — refuse a
+  netdev only when EVERY row that owns it is unbindable, never on a
+  disagreement between two rows — on both planes, plus five claim corrections
+  round 8 owed and one pre-existing gap filed as #6998.
+- **File(s)**: `pkg/dataplane/userspace/ingress_exclusions.go`,
+  `pkg/dataplane/userspace/maps_sync.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go`,
+  `pkg/dataplane/userspace/snapshot_allowlist_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`, `_Log.md`
+
+  **B1 — round 8 introduced this, and it is reachable on the canonical
+  WireGuard spelling.** `buildInterfaceSnapshots` sets a unit row's Tunnel flag
+  to `iface.Tunnel != nil || unit.Tunnel != nil` (pre-existing, master line
+  304), and `snapshotLinuxName` collapses a unit-0 row with no vlan-id onto the
+  BASE netdev. So a unit-level `tunnel` stanza puts an UNBINDABLE unit row and
+  a BINDABLE base row on ONE netdev. Round 8's index refused a netdev as soon
+  as ANY row was unbindable for it, which reads that disagreement as a refusal
+  — and because a base row's own name is asked of the same index, it took the
+  base row out of the RSS allowlist.
+
+  Measured, head `1c5b8e69a` vs the same tree with the three round-8 guards
+  severed (which for these configs is exactly origin/master — no VPN, no live
+  xfrmi, so every SecureTunnel flag is false):
+
+  ```
+  set interfaces ge-0/0/5 vlan-tagging
+  set interfaces ge-0/0/5 unit 0 tunnel source 10.0.0.1
+  set interfaces ge-0/0/5 unit 0 tunnel destination 10.0.0.2
+  set interfaces ge-0/0/5 unit 100 vlan-id 100
+  set security zones security-zone trust interfaces ge-0/0/5.0
+  set security zones security-zone trust interfaces ge-0/0/5.100
+  (plus an unrelated LAN ge-0/0/0.0 in trust; ge-0-0-5=30, ge-0-0-5.100=31)
+
+                    HEAD                    SEVERED (= master)      ROUND 9
+  refused index     ifx{30} name{ge-0-0-5}  --                      empty
+  ingress           [10 30]                 [10 30 31]              [10 30 31]
+  RSS allowlist     [ge-0-0-0]              [ge-0-0-0 ge-0-0-5]     [ge-0-0-0 ge-0-0-5]
+  aliases           map[]                   map[31:30]              map[31:30]
+  ```
+
+  And on `set interfaces wg1408 unit 0 tunnel mode wireguard` — THE spelling,
+  verbatim in `pkg/config/tunnelid_test.go` and in an operator config in
+  `docs/issues/issue-history.md` — `wg1408` was admitted, `wg1408.0` refused,
+  both on ifindex 40 with linux name `wg1408`; the allowlist came back
+  `[ge-0-0-0]` at head against `[ge-0-0-0 wg1408]` on master, and is
+  `[ge-0-0-0 wg1408]` again at round 9.
+
+  An ifindex absent from `userspace_ingress_ifaces` takes `cpumap_or_pass`
+  (`userspace-xdp/src/lib.rs`) and `syncInterfaceAttachments`
+  (`manager_compile.go`) DetachXDP/DetachTCs it. Dropping a name from the
+  allowlist also removes the only revert path: `restoreDefaultRSSIndirection`
+  and `applyCoalescence` are both allowlist-scoped, so a reshaped NIC keeps
+  xpf's concentrated RSS table and pinned coalescence until daemon Stop. The
+  reviewer's scoping is preserved and correct: `applyRSSIndirectionOne` and
+  `applyCoalescenceOne` gate on `readDriver()==mlx5`, so the allowlist drop is
+  a no-op for a wg/gre netdev and observable harm needs the shared netdev to be
+  a real mlx5 data NIC — a unit-level tunnel authored on a `ge-*` NIC,
+  strict-valid but unusual.
+
+  **The fix, and which half correctness rests on.** A netdev's OWNERS are the
+  rows whose AF_XDP bind target is their own netdev — `userspaceOwnsItsNetdev`,
+  expressed through the #2917 SSOT `userspaceBindTargetNetdev` rather than a
+  restated VLAN test, and mirroring Rust's existing
+  `vlan_child_parent_netdev(p, &p_linux).is_none()` qualifier word for word.
+  A netdev is refused iff it has at least one owner and every owner is
+  unbindable.
+
+  Correctness rests on the OWNERSHIP half, not on the redirect half. The index
+  answers "is this netdev, AS A DEVICE, one we must never bind?", and a device
+  cannot be both — so when its owners disagree, at least one owner is an
+  ordinary data interface that will contribute the netdev to the binding plan
+  on its own account whatever the redirect does. Refusing on a disagreement
+  therefore cannot prevent the binding; it can only strip traffic from rows
+  entitled to it.
+
+  F1 is preserved exactly, and on the same half rather than a special case:
+  under `bind-interface st10` the only row whose LinuxName is `st10` is the
+  base xfrmi row (a `unit 5 vlan-id 100` sibling resolves to `st10.100`), so
+  that bucket is a single unbindable owner. A `unit 0` sibling DOES share the
+  netdev, and is itself SecureTunnel by the same ownership oracle plus the
+  live-xfrmi half — measured both ways, so the bucket is unanimous there too.
+
+  A corollary worth knowing: for a row that owns its own netdev the refusal is
+  now STRUCTURALLY unreachable (such a row only reaches the check after passing
+  `userspaceSkipsIngressInterface`, and unbindable ⇒ skipped, so it is a
+  bindable owner of its own bucket). The index can only fire through a
+  REDIRECT — the property round 8 claimed and did not have — which also puts
+  the Go rule in the same shape as Rust's `binding_target_is_refused`, whose
+  non-VLAN arm is the literal `false`.
+
+  **The Rust half moved with it, and not only for symmetry.** With a
+  `mgmt`-zoned base plus a unit-0 tunnel row and a trust VLAN child, the ANY
+  rule made `replan_queues` produce NO binding for a netdev whose ifindex the
+  Go ingress map still carried — and an ifindex in the ingress map with no
+  READY binding is `drop_degraded_transit` (BINDING_MISSING), the unsafe
+  direction by this code's own invariant. `snapshot_refuses_parent_netdev` now
+  tallies owners the same way.
+
+  **The `!iface.LogicalOnly` clause is DELETED, not re-justified.** A round-8
+  reviewer was right that nothing could distinguish it, and the reason is
+  better than "inert": it was REDUNDANT. A LogicalOnly row is a bondless RETH
+  VLAN unit, so `shouldUseLogicalOnlyParentBoundRethVLAN`'s own conditions
+  (`unit.VlanID > 0`, a resolved parent netdev with a different name) make it a
+  VLAN CHILD, which the ownership rule already excludes.
+  `TestLogicalOnlyRowNeverOwnsANetdev` asserts that implication on the real
+  fixture, so the redundancy is a measured fact rather than this paragraph's
+  assertion.
+
+  **N1 — the round-8 grid's M6 verdict was WRONG, and it is corrected here.**
+  Round 8 reported the alias-table guard as a surviving mutation and justified
+  it with "inert on every reachable config … no test can distinguish it — that
+  is a structural claim, not a bound one". That reasoning covered only the
+  SecureTunnel class. It was LIVE at `1c5b8e69a`: on the B1 config, severing
+  that line ALONE changed the alias table from `map[]` to `map[31:30]`
+  (measured firsthand at head, both with and without the guard). The
+  reachability came from the B1 defect itself and is gone with it. Re-checked
+  per class rather than for one class: for Tunnel and the four name arms a VLAN
+  child INHERITS the parent's exclusion and is dropped before the refusal is
+  reached; for LocalFabric and mgmt/control the parent is not in the index at
+  all; for SecureTunnel the child does not inherit but its own netdev
+  `st<N>.<vlan>` cannot exist. So it is inert again — and rather than report
+  that as an unbindable guard a second time,
+  `TestAliasTableRefusesEvenWhenTheChildNetdevResolves` STUBS the child netdev
+  into existence and binds the site. The fixture is labelled synthetic in its
+  own doc comment; the guard is retained because the invariant is about the
+  SITE, and #5619 has already made three of four secure-tunnel spellings
+  resolve to netdevs that previously did not.
+
+  **N3 — the enumeration bound round 8 used does not hold, and two sentences
+  are corrected.** "A redirect can only launder within the sets the predicate
+  gates, so the sites are the predicate's callers per plane" is false: the
+  FABRIC loops contribute to two of the same sets without asking the predicate
+  or the index — `add(fab.ParentLinuxName)` (`interfaces.go`),
+  `key := uint32(fab.ParentIfindex)` (`maps_sync.go`) and `replan_queues`'
+  fabric pass. Measured with a Tunnel-class member (`fab0 fabric-options
+  member-interfaces gr-0/0/3`, interface-level tunnel): the refused netdev is
+  in the ingress set AND in the allowlist. PRE-EXISTING — master's loops are
+  identical — and NOT reachable for a secure tunnel (`LocalFabricMember`
+  resolves only for slot-shaped member names, so an `st*` member yields zero
+  fabric rows), so it is filed as **#6998** rather than fixed here. Both false
+  sentences are corrected in `ingress_exclusions.go` and in the README, with
+  the rule stated: to bound a laundering question, enumerate every CONTRIBUTOR
+  to the set, not every caller of the predicate.
+
+  **N4/N5/N6 — three stale sentences, each measured before rewriting.**
+  `ensureSecureTunnelProtocolLocked`'s "scoped … so an operator with no
+  route-based IPsec is never blocked" outlived the round-8 widening of
+  `configHasSecureTunnel`: measured with zero VPNs, it returns false with no
+  live xfrmi and TRUE with a stale live `st10`. The arming is right (a stale
+  xfrmi is exactly what an operator cannot fix by editing the config); only the
+  sentence was the defect, and it now matches the architecture doc's wording.
+  `ingress_exclusions.go`'s file header still said "a pure move: no signature,
+  no behaviour and no caller changes" — true of `be8aec13e`, which created the
+  file, and false of everything since. And
+  `TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT` re-derived `want`
+  from the PRE-round-8 rule, so it encoded an invariant production does not
+  hold and stayed green only because its fixture had no refused row; the
+  derivation now applies the refusal AND the fixture gained a live-xfrm `st10`
+  with a zoned VLAN sibling so the filter is load-bearing (M7 below).
+
+  **Mutation grid — 7 Go + 2 Rust, each guard severed one at a time, every
+  mutation required to COMPILE (`go vet` / `cargo build --tests`) before its
+  result counted.**
+
+  | # | guard severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:145` ingress, `:155` allowlist) |
+  | M2 | RSS `refusesName` | KILLED (`:155` allowlist) |
+  | M3 | alias-table `refusesIfindex` (round-8's M6) | KILLED (`:692` "binding alias 12 -> 11 points at the refused xfrmi") |
+  | M4 | refused index: EVERY owner → ANY owner | KILLED (`:598` "netdev \"ge-0-0-5\" is refused even though ge-0/0/5 owns it and is bindable"; `:769`/`:774`/`:779` the B1 table) |
+  | M5 | refused index: refuse nothing | KILLED (`:145` "the excluded xfrmi (ifindex 11) is in the ingress-adjudication set [10 11]") |
+  | M6 | ownership qualifier dropped (`userspaceOwnsItsNetdev` → true) | KILLED (`:740` "a LogicalOnly row owns its netdev … LinuxName \"lo.80\"") |
+  | M7 | SSOT parity derivation reverted to the pre-round-8 rule | KILLED ("allowlist diverges from the bind-target SSOT: got [ge-0-0-1 ge-0-0-2], want [… st10]") |
+  | R1 | `snapshot_refuses_parent_netdev`: EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner_is_not_refused`) |
+  | R2 | `snapshot_refuses_parent_netdev`: refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit_its_refused_parent`) |
+
+  **R2's first run reported SURVIVED and the HARNESS was the defect**, recorded
+  because a mutation harness that silently under-runs inverts its own result:
+  the driver's Rust test list omitted
+  `orphan_vlan_child_cannot_readmit_its_refused_parent` — the F1 guard, the
+  only test that can see that mutation. Added and re-run; KILLED. The Go rows
+  were unaffected (their `-run` regex names every test in the file).
+
 ## 2026-08-13 — #6691 round 8c: a sibling unit laundered its own excluded xfrmi, and a live one the config forgot was invisible
 
 - **Timestamp**: 2026-08-13 14:20 (fix/5619-ipsec-passthrough-zone-policy)
