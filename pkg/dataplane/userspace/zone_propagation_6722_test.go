@@ -359,8 +359,9 @@ func TestQuarantineUnzonesTheBaseRow_6722(t *testing.T) {
 // The two mechanisms compose into a shape neither was designed for, and the
 // result is CORRECT — this test exists so a later reader does not "fix" it.
 //
-// The exemption's trigger has two halves: a co-resident parent row, and the
-// member's own zone being empty. Quarantine blanks a zone BY NAME
+// The exemption's trigger has two halves: the row being a projection of a
+// declared RETH's netdev, and the row's own zone being empty. Quarantine
+// blanks a zone BY NAME
 // (zones_quarantine.go), so it can manufacture the second half: zone a RETH
 // member explicitly into X, put its RETH in Y, and quarantine X. The member's
 // row blanks, the exemption then covers it, it casts no vote, and the ledger
@@ -386,6 +387,13 @@ func TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722(t *testing.T) {
 	}
 	lines := []string{
 		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+		// A DECLARED redundancy-group is what makes reth1 a RETH rather than an
+		// interface that merely happens to be named `reth1`. Both this file's
+		// exemption and the adjacent rethRG lookup key on it, so a config
+		// without it is a config where ge-0/0/1 is not a projection of anything
+		// — pinned by TestUndeclaredParentIsNotAProjection_6722. This test is
+		// about the quarantine, not about that distinction, so it declares one.
+		"set interfaces reth1 redundant-ether-options redundancy-group 2",
 		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
 		// The MEMBER is explicitly zoned into the doomed zone. That is the whole
 		// point: without an explicit member zone there is nothing for the
@@ -433,10 +441,10 @@ func TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722(t *testing.T) {
 			"must strip the colliding zone off the MEMBER row — that blanking is "+
 			"the half of the exemption trigger this test is about", member.Zone)
 	}
-	if member.RedundantParent == "" {
-		t.Fatalf("ge-0/0/1 carries no redundant_parent, so the exemption's OTHER " +
-			"half is absent and a resolved zone below would be explained by " +
-			"something other than the interaction under test")
+	if !member.RethProjection {
+		t.Fatalf("ge-0/0/1 is not marked a RETH projection, so the exemption's " +
+			"OTHER half is absent and a resolved zone below would be explained " +
+			"by something other than the interaction under test")
 	}
 	if reth.Zone != "lan" {
 		t.Fatalf("reth1.0 Zone = %q, want %q: the surviving zone must still be on "+

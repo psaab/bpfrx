@@ -77981,3 +77981,126 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-13 00:30 PDT
+- **Action**: #6722 B3 — decide the RETH-projection fact in Go instead of
+  re-deriving it in the helper; retire `redundant_parent` from the wire.
+  THE HOLE, measured end to end BEFORE the change through the real strict
+  `CompileConfig`, the real `buildSnapshot`, and the real
+  `build_forwarding_state`. One config line does it:
+    set interfaces st0 gigether-options redundant-parent st0
+    set interfaces st0 unit 0 family inet address 10.5.5.1/30
+    set interfaces st0 unit 1 family inet address 10.6.6.1/30
+    set security zones security-zone vpnb interfaces st0.1
+    set security policies default-policy deny-all
+  `*other != iface.name` stopped a row matching ITSELF but never stopped a
+  UNIT row matching its own BASE row, and base and unit-0 are co-resident on
+  one ifindex by the non-VLAN unit-0 collapse. Go emits
+  `st0`(zone vpnb, linux st0, ifindex 42), `st0.0`("", st0, 42),
+  `st0.1`(vpnb, st0.1, 43) — the base carries vpnb because
+  `buildInterfaceZoneMap` fans a unit-suffixed zone reference onto the base.
+  Rust then: `ledger[42]=Some(32521)`, `ifindex_to_zone_id[42]=Some(32521)`,
+  no egress row, `egress_zone_id(42)=32521`, zone pair (lan 21230 -> vpnb
+  32521), `action=Permit` against a `from-zone lan to-zone vpnb permit`.
+  Transit out a unit the operator deliberately left unzoned was PERMITTED.
+  AFTER, same JSON through the same Rust builder: `ledger[42]=None`,
+  `egress_zone_id(42)=0`, pair (21230, 0), `action=Deny`.
+  THE CHANGE, and why it is not a fourth conjunct. `reth_projection` (bool)
+  replaces `redundant_parent` (string). `rethProjectionNetdevs`
+  (pkg/dataplane/userspace/interfaces.go) decides it PER ROW from where the
+  parent's rows actually land — `snapshotLinuxName` evaluated on the parent,
+  the same function that creates the aliasing — rather than from any shape of
+  the operator's string. A row is a projection when its `redundant-parent`
+  names a DECLARED redundant-ethernet interface (present, `redundancy-group
+  N` — the same test the adjacent `rethRG` lookup already applies), that
+  interface is a DIFFERENT one, and the row lands on a netdev the parent's own
+  rows occupy. The Rust gate becomes
+  `iface.reth_projection && iface.zone.is_empty()` and the
+  `names_by_ifindex` pre-pass is deleted. The bare-prefix escape (`reth10`
+  silencing `reth1`'s members) is now UNREPRESENTABLE — the lookup is an exact
+  config-map key, not a prefix match.
+  WIRE. `redundant_parent` REMOVED, not kept: nothing else consumed it in
+  either language (grep), and `git show origin/master:` confirms it is absent
+  from both `protocol.go` and `snapshot.rs`, so it was introduced by this same
+  PR and no deployed binary reads it. Replacement is additive both ways
+  (`omitempty` / `#[serde(rename, default)]`, no `deny_unknown_fields`) and
+  both degraded directions are fail-CLOSED. `protocol_wire_v1.json`
+  REGENERATED with XPF_PROTOCOL_WIRE_REGEN=1, not hand-edited: one key
+  swapped, `"redundant_parent": ""` -> `"reth_projection": false`.
+  GO CELL TABLE — 7 mutations, whole-package run each (baseline pass=1187
+  fail=0), every RED an ASSERTION (the harness scores a build break as
+  UNKNOWN-BUILD; none occurred), production file restored byte-identical:
+    G1 drop `|| iface.RedundantParent == name`   -> RED 3 (Self-named E,
+       both the with-RG and reth-names-itself cells) pass=1184
+    G2 drop `|| reth.RedundancyGroup <= 0`       -> RED 2 (Undeclared F,
+       parent-without-redundancy-group) pass=1185
+    G3 drop the `netdevs[base]` insert           -> RED 1 (Unit rows B,
+       ge-0/0/1.0) pass=1186
+    G4 drop the `reth.Units` loop                -> RED 1 (Unit rows B,
+       ge-0/0/1.100) pass=1186
+    G5 key the BASE row on the interface         -> RED 1 (Peer node H,
+       ge-7/0/1) pass=1186
+    G5b key the UNIT row on the interface        -> RED 1 (Unit off the
+       netdevs G, ge-0/0/1.100) pass=1186
+    G6 never publish `out[name] = netdevs`       -> RED 7 pass=1180
+  The OVER-REACH GUARD `TestNonRethInterfacesCarryNoProjectionMark_6722`
+  stayed GREEN in all seven cells — it appears in no FAILED list.
+  RUST CELL TABLE — 3 mutations, `6722` cohort (baseline 13 pass / 0 fail),
+  every RED an assertion panic with its own message:
+    R1a gate ignores the mark (always consider) -> RED 8, incl. the whole B1
+        fail-open class (`unzoned_macless_unit_...`, both wg iface-tunnel
+        tests, both filter-log siblings, the live-forward log)
+    R1b gate ignores the field (always false)   -> RED 1
+        (`unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722`
+        — the bondless-RETH blackhole returns)
+    R2  drop `zone.is_empty()`                  -> RED 1
+        (`explicitly_zoned_reth_member_still_makes_the_ifindex_ambiguous_6722`)
+  TEST RESTRUCTURE, deliberate loss of cells. The r-1 four-cell diagonal bound
+  the OLD predicate's clauses (`*other != name`, the exact arm, the dotted
+  arm, the `.` boundary). Those clauses no longer exist, so four Rust fixtures
+  and five Rust tests were DELETED rather than kept as cells corresponding to
+  nothing. Every one of their configs crossed to the Go side as an input whose
+  answer is still pinned — self-reference (E), dangling parent (F2),
+  bare-prefix `reth10` (F3), parent-base-only and parent-unit-only (A and B) —
+  plus three shapes the old set had no cell for: self-parent WITH a
+  redundancy-group (E2), a `reth*` naming itself (E3), and the peer node's
+  member (H). `dangling_redundant_parent_tunnel_snapshot_6722` was dropped
+  rather than converted: with the flag false it is byte-identical to
+  `sibling_tunnel_units_snapshot_6722`, and its assertion is the one
+  `unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722` already
+  makes on those exact rows.
+  ONE CONFIG COMPLETION, called out rather than done quietly.
+  `TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722` declared a `reth1`
+  with NO `redundancy-group`. That was never load-bearing under the old
+  name-matching predicate but is under the new one; the config gained the line
+  it was always missing, with the reason in a comment, and the behaviour for
+  the UN-completed shape is pinned separately by F1. A `reth*` without a
+  declared redundancy group therefore fails CLOSED here (members keep voting,
+  egress stays at the 0 sentinel) — stated in the architecture doc. Every RETH
+  config in this repository declares one (grep: 12 files, all with
+  `redundancy-group`).
+  A DEFECT IN MY OWN DIFF, caught before commit: inserting
+  `rethProjectionNetdevs` above `snapshotLinuxName` STOLE that function's
+  doc comment ("...See drift-guard test in this package."). Moved below
+  `snapshotLinuxName` and the ownership re-verified.
+  AN OBSERVED HANG, not dismissed as a flake but scoped. The first (full-suite)
+  Rust matrix run wedged under mutation R1b: the test binary sat 8m41s in
+  `futex_do_wait` with 16s of CPU and live `afxdp::wg::engine` threads. That is
+  a WireGuard-engine test deadlock, orthogonal to a bool in the zone ledger —
+  and the identical full suite passed twice at this HEAD (rc=0, 4295+124
+  passed). The matrix was re-run scoped to the `6722` cohort, which is what the
+  Rust cells discriminate on; the full-suite green is reported separately.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/...` rc=0;
+  `cargo test --release` rc=0 (7 suites); gofmt clean on all four touched Go
+  files; rustfmt checked PER FILE, not crate-wide.
+  Advances #6713 / #6722.
+- **File(s)**: pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  pkg/dataplane/userspace/zone_propagation_6722_test.go,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/userspace-dataplane-architecture.md, _Log.md

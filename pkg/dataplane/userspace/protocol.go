@@ -262,27 +262,34 @@ type InterfaceSnapshot struct {
 	VLANID          int    `json:"vlan_id,omitempty"`
 	LocalFabric     string `json:"local_fabric_member,omitempty"`
 	RedundancyGroup int    `json:"redundancy_group,omitempty"`
-	// RedundantParent is the `gigether-options redundant-parent` RETH this
-	// row's interface is a physical member of ("" = not a RETH member). It is
-	// carried for exactly one purpose: to tell the Rust agreement ledger that
-	// this row is a PROJECTION of another row's netdev rather than an
-	// independent observer of it (#6722).
+	// RethProjection marks a row whose netdev is ALREADY described by a RETH's
+	// own row — a PROJECTION of that row rather than an independent observer of
+	// the netdev (#6722). It is the ANSWER, decided here where ResolveReth and
+	// the whole interface table are in hand; the Rust agreement ledger
+	// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs) reads the fact and
+	// re-derives nothing.
 	//
 	// ResolveReth (pkg/config/types.go) collapses a RETH onto its physical
-	// member's netdev, and snapshotLinuxName applies it to the reth base row
-	// AND its units, so `ge-0/0/1`, `reth1` and `reth1.0` are one ifindex —
-	// and a member's own units alias the matching reth unit the same way
-	// (`ge-0/0/1.100` onto `reth1.100`). Junos zones the RETH, never the
-	// member, so the member's rows arrive UNZONED and their "no zone" would
-	// otherwise be counted as a dissenting vote that makes the RETH's own zone
-	// ambiguous. Stamped on the member's base row and every one of its unit
-	// rows, since both alias.
+	// member's netdev, and snapshotLinuxName applies it to the reth base row AND
+	// its units, so `ge-0/0/1`, `reth1` and `reth1.0` are one ifindex — and a
+	// member's own units alias the matching reth unit the same way
+	// (`ge-0/0/1.100` onto `reth1.100`). Junos zones the RETH, never the member,
+	// so the member's rows arrive UNZONED and their "no zone" would otherwise be
+	// counted as a dissenting vote that makes the RETH's own zone ambiguous.
+	//
+	// Set PER ROW, by rethProjectionNetdevs (interfaces.go), from the netdevs
+	// the RETH's own rows land on. A member unit that resolves somewhere the
+	// RETH has no row is not marked, because it is observing a netdev of its
+	// own. This replaced a carried `redundant_parent` string that the helper had
+	// to interpret: unvalidated operator input, from which no re-derivation of
+	// "is a projection" survives contact with a config that names a parent the
+	// resolver never resolves through.
 	//
 	// Additive: an old Rust helper ignores the field (no deny_unknown_fields)
-	// and keeps today's fail-CLOSED behavior; an old Go binary omits it and a
-	// new helper defaults to "", likewise fail-closed. The degraded direction
-	// is the safe one.
-	RedundantParent           string                     `json:"redundant_parent,omitempty"`
+	// and keeps the pre-#6722 fail-CLOSED behavior; an old Go binary omits it
+	// and a new helper defaults to false, likewise fail-closed. The degraded
+	// direction is the safe one.
+	RethProjection            bool                       `json:"reth_projection,omitempty"`
 	UnitCount                 int                        `json:"unit_count"`
 	Tunnel                    bool                       `json:"tunnel"`
 	MTU                       int                        `json:"mtu,omitempty"`

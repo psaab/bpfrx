@@ -51,25 +51,6 @@ pub(super) fn populate_interfaces(
     // conflict can be introduced by ANY later row.
     let mut zone_agreement: BTreeMap<i32, Option<u16>> = BTreeMap::new();
 
-    // #6722 B1: every row name that lands on each ifindex, so the projection
-    // gate below can require a real parent row rather than trusting the
-    // `redundant_parent` string. Built in a pre-pass because a projection's
-    // parent row can be emitted either before or after it — the Go builder
-    // walks names sorted, so `ge-0/0/1` precedes `reth1` but `st0` does not
-    // precede `reth1`, and a gate that only looked backwards would be
-    // order-dependent. Rows are 2-3 per ifindex, so the linear scan below is
-    // cheaper than another map.
-    let mut names_by_ifindex: BTreeMap<i32, Vec<&str>> = BTreeMap::new();
-    for iface in &snapshot.interfaces {
-        if iface.ifindex <= 0 {
-            continue;
-        }
-        names_by_ifindex
-            .entry(iface.ifindex)
-            .or_default()
-            .push(iface.name.as_str());
-    }
-
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -156,8 +137,8 @@ pub(super) fn populate_interfaces(
         // `reth1` and `reth1.0` are ONE kernel netdev. A member's own units
         // alias the matching reth unit the same way — a VLAN unit resolves to
         // `LinuxIfName(ResolveReth(base)).<vlan>`, putting `ge-0/0/1.100` on
-        // `reth1.100`'s netdev — which is why the Go builder stamps
-        // `redundant_parent` on the member's unit rows too, not just its base.
+        // `reth1.100`'s netdev — which is why the Go builder marks the member's
+        // unit rows too, not just its base.
         //
         // Junos configs conventionally zone the RETH rather than the member, so
         // `buildInterfaceZoneMap` usually leaves the member's rows unzoned and
@@ -196,46 +177,43 @@ pub(super) fn populate_interfaces(
         // of them — the fabric IPVLAN is its own netdev with its own ifindex
         // (`snapshotLinuxName` never calls `ResolveFab`), so it never shares
         // one with its physical parent.
-        // The gate requires a PARENT ROW, not just the parent's NAME. #6722 B1:
-        // `redundant_parent` is an unvalidated operator string. The Go builder
-        // copies it onto every row of any interface carrying `gigether-options
-        // redundant-parent` (`interfaces.go:245`, `:318`), and no compiler pass
-        // requires the named parent to exist, to be a `reth*`, or to resolve
-        // back to this interface — `schema_interfaces.go` accepts
-        // `gigether-options` under ANY interface name, and grepping
-        // `compiler_validate_strict*.go` / `*_warn*.go` for it returns nothing.
+        // `reth_projection` is the DECIDED FACT, not evidence to weigh. The Go
+        // builder (`rethProjectionNetdevs`,
+        // `pkg/dataplane/userspace/interfaces.go`) answers it where the answer
+        // is knowable — it holds `ResolveReth` and the whole interface table —
+        // and marks a row only when the parent is a DECLARED
+        // redundant-ethernet interface, is a DIFFERENT interface, and its own
+        // rows land on this row's netdev.
         //
-        // So `!redundant_parent.is_empty()` means "this interface MENTIONED a
-        // redundant-parent", which is not the same as "this row is a projection
-        // of another row's netdev" — and the operator controls the difference.
-        // Measured: `set interfaces st0 gigether-options redundant-parent reth1`
-        // is ACCEPTED by strict `CompileConfig`, and without the parent-row
-        // requirement it silences `st0.0`'s vote and flips `egress_zone_id`
-        // from the fail-closed 0 to a resolved zone — re-opening the exact
-        // fail-open this exemption was written to close, on the very shape
-        // `reth_exemption_does_not_leak_to_iface_tunnel_units_6722` guards.
-        // A dangling parent (`reth1` never defined) does the same, and there
-        // master answers 0, so the unguarded form would REGRESS master.
+        // Deciding it there rather than here is what closes the class, and the
+        // class is worth naming. #6722 B1 carried the raw `redundant-parent`
+        // string on the wire and re-derived "is a projection" from row names.
+        // That string is unvalidated operator input: `schema_interfaces.go`
+        // accepts `gigether-options` under ANY interface name, and no compiler
+        // pass requires the named parent to exist, to be a `reth*`, or to
+        // resolve back to the interface naming it (grepping
+        // `compiler_validate_strict*.go` / `*_warn*.go` returns nothing). Three
+        // successive re-derivations were each holed by a config strict
+        // `CompileConfig` accepts — the last by `set interfaces st0
+        // gigether-options redundant-parent st0`, where `st0.0` matched its own
+        // co-resident BASE row (`st0`), exempted itself and flipped
+        // `egress_zone_id` from the fail-closed 0 to `vpnb`. A predicate over
+        // names is a predicate the operator can satisfy by choosing names; the
+        // resolver's own answer is not.
         //
-        // Requiring a co-resident row named `<parent>` or `<parent>.<unit>`
-        // encodes the actual invariant: this netdev is described by another
-        // row that IS the parent. That is what makes the projection a
-        // projection. `other != iface.name` keeps a self-referential
-        // `redundant-parent` naming its own interface from matching itself.
-        // Checked here rather than in Go because this function already treats
-        // the helper boundary as a fail-closed backstop (#2391/#2409/#2706),
-        // so the gate stays sound against a drifted or hostile snapshot.
-        let row_is_reth_member_projection = !iface.redundant_parent.is_empty()
-            && iface.zone.is_empty()
-            && names_by_ifindex.get(&iface.ifindex).is_some_and(|names| {
-                names.iter().any(|other| {
-                    *other != iface.name.as_str()
-                        && (*other == iface.redundant_parent.as_str()
-                            || other
-                                .strip_prefix(iface.redundant_parent.as_str())
-                                .is_some_and(|rest| rest.starts_with('.')))
-                })
-            });
+        // The helper-boundary backstop (#2391/#2409/#2706) is not weakened by
+        // trusting the field, and the bound is worth stating exactly rather
+        // than as "it fails closed". A mark can only ever WITHHOLD a vote, so a
+        // drifted or hostile snapshot that sets it spuriously either leaves the
+        // remaining contributing rows unanimous — in which case the ledger
+        // resolves THEIR zone, one this ifindex's own rows literally named — or
+        // leaves none, in which case the ifindex is absent from the ledger and
+        // `egress_zone_id` answers the 0 sentinel. It can never conjure a zone
+        // no row on the ifindex named, and `zone.is_empty()` keeps it from
+        // discarding an explicit zone on the marked row itself. Absent the
+        // field (an old Go binary) the row votes and the ifindex stays
+        // ambiguous: the pre-#6722-B2 fail-CLOSED behavior.
+        let row_is_reth_member_projection = iface.reth_projection && iface.zone.is_empty();
         if !row_is_reth_member_projection {
             match zone_agreement.entry(iface.ifindex) {
                 std::collections::btree_map::Entry::Vacant(slot) => {

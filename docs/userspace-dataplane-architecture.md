@@ -946,9 +946,10 @@ Scope of the fallback:
   was unaffected throughout (`ifindex_to_zone_id[24]` still carried `lan`); that
   asymmetry is the diagnostic tell.
 
-  So the Go builder stamps `redundant_parent` on every row of a RETH physical
-  member (base AND units), and `populate_interfaces` exempts a row that carries
-  it **and has no zone of its own** from voting. The `zone.is_empty()` half is
+  So the Go builder marks every row of a RETH physical member that lands on the
+  RETH's netdev (base AND units) with `reth_projection`, and
+  `populate_interfaces` exempts a row that carries it **and has no zone of its
+  own** from voting. The `zone.is_empty()` half is
   load-bearing: a member the operator EXPLICITLY zoned into a different zone than
   its RETH is a real statement about a real conflict, not an artefact of one
   device described by several rows, and it must keep failing closed
@@ -957,23 +958,41 @@ Scope of the fallback:
   and still vote (`reth_exemption_does_not_leak_to_iface_tunnel_units_6722`), and
   `fab0` is not a fourth mechanism at all: the fabric IPVLAN is its own netdev
   with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`).
-- The exemption requires a **parent ROW on the same ifindex**, not merely the
-  parent's NAME. `redundant_parent` is an unvalidated operator string: nothing
-  requires the interface it names to exist, to be a `reth*`, or to resolve back
-  to the row carrying it, and `schema_interfaces.go` accepts `gigether-options`
-  under any interface name. So `!redundant_parent.is_empty()` means "this
-  interface mentioned a redundant-parent", which is not the same claim as "this
-  row is a projection of another row's netdev" — and the operator controls the
-  difference. Measured: `set interfaces st0 gigether-options redundant-parent
-  reth1` is accepted by strict `CompileConfig`, and a name-only gate would then
-  silence `st0.0`'s vote and resolve `vpnb` for a unit deliberately left
-  unzoned, re-opening #6722 on the very shape the sentence above guards. A
-  dangling parent does the same on a physical interface, where master answers
-  `0` — so a name-only gate would be a REGRESSION, not merely a weaker fix.
-  Requiring a co-resident row named `<parent>` or `<parent>.<unit>` is what
-  makes the two claims above true rather than aspirational
-  (`dangling_redundant_parent_does_not_exempt_a_genuine_observer_6722` reds if
-  that requirement is dropped, and it is the only test that does).
+- **`reth_projection` is decided in Go, not re-derived in the helper.** The
+  wire carries the ANSWER; `populate_interfaces` reads it and computes nothing.
+  That split is the fix, not an implementation detail. The field's predecessor
+  carried the raw `redundant-parent` string, and `redundant-parent` is
+  unvalidated operator input: nothing requires the interface it names to exist,
+  to be a `reth*`, to declare a redundancy-group, or to differ from the
+  interface naming it, and `schema_interfaces.go` accepts `gigether-options`
+  under any interface name. Every re-derivation from that string was therefore a
+  predicate the operator could satisfy by choosing names, and three successive
+  spellings were holed in turn by configs strict `CompileConfig` accepts — the
+  last by `set interfaces st0 gigether-options redundant-parent st0`, where
+  `st0.0` matched its own co-resident BASE row (base and unit-0 are one netdev
+  by the non-VLAN unit-0 collapse), exempted itself, and flipped
+  `egress_zone_id` from the fail-closed `0` to `vpnb` — measured end to end
+  through the real builders as `ledger[42]=Some(32521)`, `egress_zone_id=32521`,
+  `action=Permit`.
+
+  `rethProjectionNetdevs` (`pkg/dataplane/userspace/interfaces.go`) answers it
+  where `ResolveReth` and the whole interface table are in hand. A row is a
+  projection when its `redundant-parent` names a **declared**
+  redundant-ethernet interface (present, `redundancy-group N`), that interface
+  is a **different** one, and the row **lands on a netdev the parent's own rows
+  occupy** — the last computed by evaluating `snapshotLinuxName` on the parent,
+  the same function that creates the aliasing. The Go-side cells are pinned per
+  clause in `pkg/dataplane/userspace/reth_member_projection_6722_test.go`
+  (`TestSelfNamedRedundantParentIsNotAProjection_6722`,
+  `TestUndeclaredParentIsNotAProjection_6722`,
+  `TestMemberUnitOffTheRethsNetdevsIsNotAProjection_6722`).
+
+  A `reth*` with no declared `redundancy-group` is accepted by the compiler and
+  is deliberately NOT treated as a RETH here — the same test the adjacent
+  `rethRG` lookup already applies. Its members keep voting, so such an ifindex
+  stays ambiguous and its egress zone stays at the `0` sentinel; declaring the
+  redundancy group is the fix. Every RETH config in this repository declares
+  one.
 
   The field is additive in both directions — `omitempty` on the Go side,
   `#[serde(default)]` on the Rust side, and no `deny_unknown_fields` anywhere in

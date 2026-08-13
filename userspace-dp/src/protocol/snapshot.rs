@@ -64,10 +64,10 @@ pub(crate) struct InterfaceSnapshot {
     pub local_fabric_member: String,
     #[serde(rename = "redundancy_group", default)]
     pub redundancy_group: i32,
-    /// #6722: the RETH this row's interface is a physical member of ("" = not
-    /// a RETH member). Carried for exactly one purpose — to tell the agreement
-    /// ledger in `forwarding_build::interfaces` that this row is a PROJECTION
-    /// of another row's netdev rather than an independent observer of it.
+    /// #6722: this row's netdev is ALREADY described by a RETH's own row, so
+    /// the row is a PROJECTION of that row rather than an independent observer
+    /// of the netdev. Consumed for exactly one purpose — the agreement ledger
+    /// in `forwarding_build::interfaces` withholds a projection's zone vote.
     ///
     /// `ResolveReth` (`pkg/config/types.go`) collapses a RETH onto its
     /// physical member's netdev, so `ge-0/0/1`, `reth1` and `reth1.0` are ONE
@@ -77,12 +77,23 @@ pub(crate) struct InterfaceSnapshot {
     /// RETH's own zone ambiguous and collapses the egress zone to the 0
     /// sentinel.
     ///
+    /// This is a DECIDED FACT, not an input to a decision. The Go builder
+    /// (`rethProjectionNetdevs`, `pkg/dataplane/userspace/interfaces.go`) owns
+    /// it because that is where `ResolveReth` and the full interface table
+    /// live: it marks a row only when the parent is a DECLARED
+    /// redundant-ethernet interface, is a DIFFERENT interface, and its own rows
+    /// actually land on this row's netdev. The predecessor of this field
+    /// carried the raw `redundant-parent` string and left the helper to
+    /// re-derive that from row names — unvalidated operator input, and every
+    /// spelling of the re-derivation admitted a config the resolver never
+    /// resolves through.
+    ///
     /// Additive via serde default: absent on snapshots from an old Go binary,
     /// in which case the member votes and the ifindex stays ambiguous — the
     /// pre-#6722-B2 fail-CLOSED behavior, which is the safe degraded
     /// direction.
-    #[serde(rename = "redundant_parent", default)]
-    pub redundant_parent: String,
+    #[serde(rename = "reth_projection", default)]
+    pub reth_projection: bool,
     #[serde(rename = "unit_count", default)]
     pub unit_count: usize,
     #[serde(default)]
