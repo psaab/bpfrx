@@ -34,7 +34,14 @@ const (
 	// drift — the embedded shim is the intended deploy target and is not broken
 	// — so `make generate` is the WRONG action. A rolling deploy cannot cross a
 	// shim-map ABI change because the new map can only be pinned after the stale
-	// pin is released; the fix is a full dataplane reload.
+	// pin is released, and releasing it requires UNLINKING the pin: `Cleanup()`
+	// (loader.go) does `os.RemoveAll(bpfPinPath)`, and it is reachable only from
+	// the `xpfd cleanup` subcommand (cmd/xpfd/main.go). A bpffs pin outlives the
+	// process that created it, so stopping and restarting xpfd does NOT release
+	// it — the operator hits the identical refusal on the next start. The
+	// message below must therefore name `xpfd cleanup`, not "a reload"; it said
+	// the latter until #6928, which is worse than an inaccurate comment because
+	// it is what an operator follows mid-upgrade with the dataplane down.
 	//
 	// #5364: this message is NOT reachable for a userspace_cpumap MaxEntries
 	// gap. That map is a BPF_MAP_TYPE_CPUMAP whose MaxEntries the kernel/loader
@@ -48,10 +55,11 @@ const (
 	// genuine cpumap Type/KeySize/ValueSize/Flags change.
 	userspaceShimStalePinRemediation = "The RUNNING daemon's pinned map predates " +
 		"this build's shim-map ABI. A rolling deploy CANNOT cross a shim-map ABI " +
-		"change: the new map can only be pinned after the stale pin is released. " +
-		"Do a FULL dataplane reload (stop xpfd so the old pin is released, then " +
-		"start it to load the new shim), accepting brief downtime — do NOT `make " +
-		"generate` (the embedded shim is the intended target, not broken). See " +
+		"change: the new map can only be pinned after the stale pin is released, " +
+		"and a bpffs pin OUTLIVES the process — restarting xpfd does NOT release " +
+		"it. Run `xpfd cleanup` (or reboot) to unpin, then start xpfd to load the " +
+		"new shim; brief downtime is unavoidable. Do NOT `make generate` (the " +
+		"embedded shim is the intended target, not broken). See " +
 		"pkg/dataplane/README.md (#1864)."
 	userspaceBindingsMapName           = "userspace_bindings"
 	userspaceIngressIfacesMapName      = "userspace_ingress_ifaces"

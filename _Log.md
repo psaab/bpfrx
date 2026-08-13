@@ -77902,3 +77902,77 @@ Every RED above is an assertion failure, not a build break.
   4279 passed / 0 failed plus 60, 8, 22, 31, 1, 2 passed and 0 failed.
   `userspace-xdp/` is untouched, so the shim `.o` and its manifest are
   unchanged and no `make generate` is owed.
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6928 round 4b — the bpffs-pin remediation correction reaches the
+  OPERATOR-FACING string. r4 fixed the claim in four comments; this fixes it
+  where an operator actually reads it, plus the doc the message points them at,
+  plus the two assertions that were defending the wrong text.
+
+  `pkg/dataplane/loader_userspace_shim.go` printed, on a live-pin ABI refusal:
+
+      Do a FULL dataplane reload (stop xpfd so the old pin is released,
+      then start it to load the new shim), accepting brief downtime
+
+  That instruction does not work, and the mechanism was verified rather than
+  inferred: releasing a pin means UNLINKING it, which is `Cleanup()` in
+  `loader.go:1245` doing `os.RemoveAll(bpfPinPath)`, and `Cleanup()` is
+  reachable only from the `xpfd cleanup` subcommand (`cmd/xpfd/main.go:213`).
+  A bpffs pin outlives the process that created it. So an operator hitting the
+  refusal, following our message, stops xpfd, starts it, and hits the identical
+  refusal — mid-upgrade, with the dataplane down. That is materially worse than
+  an inaccurate comment, which is why it is folded here rather than left with
+  the behavioural half (#6978, the question of whether the #1917 in-place
+  `xpfd upgrade` path calls `Cleanup()` at all).
+
+  Message now names the mechanism and states plainly that a restart is not
+  enough, kept short because it is read mid-incident.
+  `pkg/dataplane/README.md:328` carried the same instruction — and is the
+  document the message cites — so it is corrected too, with the reason recorded
+  so it is not re-simplified back to "a reload".
+
+  **The two assertions were defending the text, not the behaviour.**
+  `stalepin_remediation_5363_test.go:105` required the phrases
+  `"FULL dataplane reload"`, `"stale pin"`, `"released"`. Every one of those was
+  satisfied by the broken instruction — a phrase-presence assertion cannot tell
+  a correct instruction from an incorrect one. Replaced with the two properties
+  that make the message USEFUL: it names `xpfd cleanup`, and it says a restart
+  does NOT release the pin. The reasoning is written into the test so the next
+  person does not restore the old phrase to satisfy a string match.
+
+  The negative case at `:145` asserted the SSOT-drift path does not contain
+  `"FULL dataplane reload"`. That phrase no longer exists anywhere, so as
+  written the guard had become a no-op that could never fire again — a rewording
+  of the OTHER message silently retired it. Now pins the CONSTANT
+  (`userspaceShimStalePinRemediation`), which survives any rewording of either
+  message, plus a second assertion that the drift path must not tell the
+  operator to `xpfd cleanup` — that is destructive and wrong for a drift that
+  `make generate-userspace-xdp` fixes in place.
+- **File(s)**: pkg/dataplane/loader_userspace_shim.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go, pkg/dataplane/README.md,
+  _Log.md
+- **Validation**: two cells, each an assertion RED with `go vet` rc 0 first, and
+  the partition is exclusive — each cell reds exactly one test while the other
+  stays GREEN as its control.
+
+  | cell | SSOT-drift test | live-pin test |
+  |---|---|---|
+  | baseline | PASS | PASS |
+  | restore the OLD wording verbatim | PASS | **FAIL** |
+  | mis-wire the stale-pin remediation into the SSOT-drift site | **FAIL** | PASS |
+
+  Cell 2 reds with the pasted operator text and names what is missing:
+  "remediation must name `xpfd cleanup` — the only path that unpins bpffs state
+  and therefore the only thing that clears this refusal", on both subtests
+  (cpumap-genuine-valuesize-break and dnat-table-live-pin-drift).
+
+  A discarded cell, recorded because scoring it would have been wrong: my first
+  mis-wire swapped every `userspaceShimGenerateRemediation` use site at once
+  (10 of them) and produced `go vet` rc 1 — a BUILD break, not an assertion RED,
+  so the cell proves nothing. Re-run against exactly ONE site (the ValueSize
+  drift arm at `:390`), which is the edge of the claim, and it reds cleanly with
+  vet at 0.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/` both ok;
+  `go test ./pkg/refactoraudit/` ok. No Rust and no shim artefact touched.

@@ -98,13 +98,37 @@ func TestLivePinABIMismatchUsesStalePinRemediation(t *testing.T) {
 					t.Fatalf("err = %v, want substring %q", err, want)
 				}
 			}
-			// The remediation is the full-reload / stale-pin guidance...
+			// The remediation is the stale-pin guidance...
 			if !strings.Contains(msg, userspaceShimStalePinRemediation) {
 				t.Fatalf("err = %v, want stale-pin remediation constant", err)
 			}
-			for _, phrase := range []string{"FULL dataplane reload", "stale pin", "released"} {
+			// ...and it must be ACTIONABLE, not merely distinctive.
+			//
+			// This block used to require the phrases "FULL dataplane reload",
+			// "stale pin" and "released". Those pinned the message's WORDING and
+			// were satisfied by an instruction that did not work: the text told
+			// the operator to "stop xpfd so the old pin is released", and a bpffs
+			// pin outlives the process, so following it produced the identical
+			// refusal on the next start — mid-upgrade, with the dataplane down
+			// (#6928). A phrase-presence assertion cannot tell a correct
+			// instruction from an incorrect one; it defends the text, not the
+			// behaviour.
+			//
+			// So assert the two properties that make the message USEFUL: it names
+			// the mechanism that actually releases the pin (`Cleanup()` does
+			// os.RemoveAll(bpfPinPath) and is reachable only from `xpfd cleanup`),
+			// and it says plainly that a restart is not sufficient. Anyone
+			// rewording this must keep both, not restore a matching phrase.
+			if !strings.Contains(msg, "xpfd cleanup") {
+				t.Fatalf("err = %v, remediation must name `xpfd cleanup` — the only "+
+					"path that unpins bpffs state and therefore the only thing that "+
+					"clears this refusal", err)
+			}
+			for _, phrase := range []string{"restarting xpfd does NOT release", "OUTLIVES the process"} {
 				if !strings.Contains(msg, phrase) {
-					t.Fatalf("err = %v, want distinctive stale-pin phrase %q", err, phrase)
+					t.Fatalf("err = %v, remediation must state that a restart does NOT "+
+						"release the pin (missing %q); without it the operator's first "+
+						"instinct is a restart, which fails identically", err, phrase)
 				}
 			}
 			// ...and NEVER the "rebuild the shim" remediation.
@@ -141,8 +165,19 @@ func TestSSOTDriftKeepsGenerateRemediation(t *testing.T) {
 			t.Fatalf("err = %v, want substring %q (SSOT-drift site must keep make-generate)", err, want)
 		}
 	}
-	// The SSOT-drift remediation must NOT be the stale-pin one.
-	if strings.Contains(msg, "FULL dataplane reload") {
+	// The SSOT-drift remediation must NOT be the stale-pin one. Pin the
+	// CONSTANT rather than a phrase from it: the previous form matched on
+	// "FULL dataplane reload", so rewording the stale-pin message silently
+	// turned this guard into a no-op that could never fire again (#6928).
+	// Comparing against the constant survives any rewording of either message.
+	if strings.Contains(msg, userspaceShimStalePinRemediation) {
 		t.Fatalf("err = %v, embedded-vs-Go SSOT drift must NOT use the stale-pin remediation", err)
+	}
+	// And it must not smuggle in the stale-pin ACTION either: `xpfd cleanup`
+	// destroys all pinned dataplane state, which is the wrong and destructive
+	// answer to a drift that `make generate-userspace-xdp` fixes in place.
+	if strings.Contains(msg, "xpfd cleanup") {
+		t.Fatalf("err = %v, SSOT drift must not tell the operator to unpin — "+
+			"the embedded shim is rebuildable, the pinned state is not disposable", err)
 	}
 }

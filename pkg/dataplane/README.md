@@ -324,11 +324,19 @@ Guard layers (`build-userspace-xdp.sh`):
    this build's embedded shim against the RUNNING (old) daemon's pinned
    map, so the pin is ALWAYS the stale side. The embedded shim is the
    intended, un-broken target, so `make generate` is the WRONG action;
-   instead it prints `userspaceShimStalePinRemediation`, directing a FULL
-   dataplane reload (stop xpfd so the old pin is released, then start it to
-   load the new shim). A rolling deploy cannot cross a genuine shim-map ABI
-   change because the new map can only be pinned after the stale pin is
-   released.
+   instead it prints `userspaceShimStalePinRemediation`, directing the
+   operator to run `xpfd cleanup` (or reboot) and then start xpfd. A rolling
+   deploy cannot cross a genuine shim-map ABI change because the new map can
+   only be pinned after the stale pin is released.
+
+   **Restarting xpfd does NOT release the pin**, and this text said otherwise
+   until #6928. A bpffs pin outlives the process that created it: releasing
+   it means UNLINKING it, which is `Cleanup()` in `loader.go` doing
+   `os.RemoveAll(bpfPinPath)` — reachable only from the `xpfd cleanup`
+   subcommand (`cmd/xpfd/main.go`). An operator who stops and starts the
+   daemon hits the identical refusal on the next start, mid-upgrade, with
+   the dataplane down. Both this paragraph and the message string must keep
+   naming the mechanism rather than "a reload".
 
    **CPUMAP MaxEntries is CPU-sized, not a stale-pin signal (#5364):**
    `userspace_cpumap` is a `BPF_MAP_TYPE_CPUMAP`. The shim declares it as
