@@ -723,9 +723,43 @@ const MaxSourceNATPoolPrefixHosts = 65536
 // (`203.0.113.1/garbage`), or an over-capacity prefix (`/15`, `10.0.0.0/8`, a
 // v6 prefix shorter than `/112`) — makes the Rust allocator return false for
 // the member and mark the pool `InvalidPool`, so the Go grammar must reject it
-// too. netip.ParsePrefix (like the Rust `IpNet` parse) accepts a non-canonical
-// prefix with host bits set; the runtime masks to the network base, so the Go
-// side counts hosts off the prefix LENGTH exactly as Rust does.
+// too. netip.ParsePrefix accepts a non-canonical prefix with host bits set; the
+// runtime masks to the network base, so the Go side counts hosts off the prefix
+// LENGTH exactly as Rust does.
+//
+// GRAMMAR PARITY (#6812 F1 round 3). "Mirrors expand_pool_address" is a claim
+// about two PARSERS agreeing, and it is not established by sharing this
+// predicate between two Go call sites — that only makes the two GO sites agree.
+// A measured differential over both real parsers found the two sides disagreed
+// on six inputs, in both directions:
+//
+//   - `010.0.0.0/24` and its siblings (a leading-zero IPv4 octet inside a CIDR,
+//     including the embedded-v4 form `::ffff:010.0.0.0/120`). netip rejects a
+//     leading-zero octet; the Rust CIDR branch used to parse via `IpNet`, whose
+//     hand-rolled octet reader accepts up to three digits with any leading
+//     zeros, so the dataplane expanded a working 256-address allocator for a
+//     pool this predicate stamped `invalid_pool`. Closed in the RUNTIME (round
+//     3): expand_pool_address now parses its address half with the same
+//     `std::net::IpAddr` its bare branch always used, so the ambiguous spelling
+//     is InvalidPool on both sides — the verdict this predicate already gave.
+//     Widening Go instead would have blessed an octal-confusion spelling at
+//     commit, and mirrored a third-party crate's accident as policy.
+//   - `fe80::1%eth0` (a zone qualifier on a BARE member). netip.ParseAddr
+//     carries a zone; std::net::IpAddr has no zone model and refuses it. Closed
+//     HERE, by the zone check below: the CIDR form was already refused (netip
+//     .ParsePrefix rejects a zone outright), so only the bare form diverged.
+//     The pool-level reason is unchanged — SourceNATPoolUnusableReason writes
+//     the specific #5875 `zone_scoped_pool_address` after this clause — and so
+//     is the strict message, because validateSourceNATPoolAddressScopeStrict is
+//     registered BEFORE the grammar gate in both runUniformGates and the
+//     peer-effective SNAT gate set.
+//
+// The table that decides both is ONE file — userspace-dp/tests/fixtures/
+// snat_pool_grammar_v1.json — read by TestPoolAddressGrammarMatchesDataplane_6812
+// here and by nat_pool_grammar_parity_fixture (userspace-dp/src/nat/
+// tests_aggregate_budget.rs) through the real expand_pool_address. Neither side
+// keeps a copy, so the next divergence reds a test instead of surviving to a
+// review round.
 func sourceNATPoolAddressReason(addr string) (string, bool) {
 	if strings.Contains(addr, "/") {
 		p, err := netip.ParsePrefix(addr)
@@ -750,8 +784,16 @@ func sourceNATPoolAddressReason(addr string) (string, bool) {
 		}
 		return "", true
 	}
-	if _, err := netip.ParseAddr(addr); err != nil {
+	a, err := netip.ParseAddr(addr)
+	if err != nil {
 		return "is not a valid IP address (the dataplane cannot parse it and marks the pool unusable)", false
+	}
+	// #6812 F1 round 3: netip carries an IPv6 zone (`fe80::1%eth0`) that
+	// std::net::IpAddr — the parser expand_pool_address's bare branch uses —
+	// cannot represent, so accepting it here would claim a member is honorable
+	// that the dataplane refuses. The scoped CIDR form already failed above.
+	if a.Zone() != "" {
+		return "carries an IPv6 zone qualifier the dataplane cannot represent (it marks the pool unusable)", false
 	}
 	return "", true
 }
@@ -3106,11 +3148,21 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 	}
 	pools := cfg.Security.NAT.SourcePools
 	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Source...)
+	// #6812 F3: walk rule-sets in the order the DATAPLANE charges them. The
+	// snapshot builder STABLE-sorts its emitted rules by #4161 scope tier
+	// (SourceNATScopeTier) and resolve_pool_allocators charges that emitted
+	// slice in order, so a stable sort by the same tier — config order
+	// preserved within a tier, exactly as the builder preserves it —
+	// reproduces the dataplane's first-fit sequence. Ordering by rule-set NAME
+	// (through round 2) matched neither that order nor any Junos semantic: with
+	// two pools that each fit alone but not together, the alphabetically
+	// earlier rule-set took the budget, so an unrelated rename could poison the
+	// more-specific rule-set's pool. The sibling walks in this file still sort
+	// by name — they pick a deterministic first-reported OFFENDER for an error
+	// message, where name order is the friendlier choice and admission plays no
+	// part.
 	sort.SliceStable(rulesets, func(i, j int) bool {
-		if rulesets[i] == nil || rulesets[j] == nil {
-			return rulesets[i] != nil
-		}
-		return rulesets[i].Name < rulesets[j].Name
+		return natRuleSetScopeTier(rulesets[i]) < natRuleSetScopeTier(rulesets[j])
 	})
 	seen := make(map[string]bool)
 	var charges []sourceNATAggregatePoolCharge
@@ -3156,14 +3208,30 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 			for _, a := range SourceNATPoolMembers(pool) {
 				poolAddrs = checkedAddU64(poolAddrs, sourceNATPoolMemberHostCount(a))
 			}
-			// Port range mirrors the Rust allocator's defaulting (source.rs): an
-			// unset/zero low/high defaults to 1024/65535, and a reversed range yields
-			// a zero-width allocator (no bitmap). compileNATSource already defaults
-			// PortLow/PortHigh to 1024/65535, so a pool with no `port` leaf
-			// contributes the full 64,512-slot PAT range per address.
+			// Port range: CONSULT the shared resolver rather than recompute
+			// from the raw fields (#6812 F2 round 3). SourceNATPoolPortRange is
+			// what the snapshot builder ships to the dataplane
+			// (pkg/dataplane/userspace/nat_source.go), so reading it here is
+			// what makes the charge equal the capacity the allocator is asked
+			// to build — the same "consult, do not re-derive" rule round 2
+			// applied to the usability verdict, one field over.
+			//
+			// This is behavior-preserving on every config the compiler can
+			// produce: compileNATSource defaults an unset PortLow/PortHigh to
+			// 1024/65535 before the pool is stored, so the raw recompute and the
+			// resolver already agreed on the live path (measured: a referenced
+			// 3x /16 no-`port`-leaf config charges 4,227,858,432 slots per pool
+			// either way). What it removes is the DEPENDENCE on that distant
+			// defaulting: a *NATPool that reaches this walk without it — the
+			// resolver's own documented input, raw 0/0 — charged zero port slots
+			// and was admitted, while the builder shipped the resolved
+			// 1024-65535 and the dataplane charged 64,512 per address.
+			// The `ok=false` half cannot reach here (an unusable port range is
+			// already an invalid_port_range skip above), so this reads the pair.
+			portLow, portHigh, _ := SourceNATPoolPortRange(pool)
 			var portRange uint64
-			if pool.PortLow > 0 && pool.PortHigh >= pool.PortLow {
-				portRange = uint64(pool.PortHigh-pool.PortLow) + 1
+			if portHigh >= portLow && portLow > 0 {
+				portRange = uint64(portHigh-portLow) + 1
 			}
 			charges = append(charges, sourceNATAggregatePoolCharge{
 				name:    name,

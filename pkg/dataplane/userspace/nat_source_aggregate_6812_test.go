@@ -509,3 +509,74 @@ func TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812(t *testing.T
 		t.Fatalf("good: PoolAddresses = %v, want [172.16.0.0/16]", good.PoolAddresses)
 	}
 }
+
+// TestSnapshotPoisonFollowsEmittedScopeOrder_6812 is the #6812 F3 round 3
+// guard at the boundary that matters: the pool the Go budget walk admits must
+// be the pool the DATAPLANE charges first.
+//
+// The Rust resolver (resolve_pool_allocators, userspace-dp/src/nat/source.rs)
+// walks the emitted rule slice in order, and this builder STABLE-sorts that
+// slice by #4161 scope tier. So the interface-scoped rule-set is charged
+// first — and the Go walk, which decides the poison this builder stamps, must
+// use the same order or the surviving pool is chosen by an unrelated rule.
+//
+// `aaa`/`big` is zone-scoped (tier 1) and consumes 98% of the port-slot
+// budget; `zzz`/`small` is interface-scoped (tier 0, more specific). Each fits
+// alone, neither fits alongside the other. Through round 2 the walk ordered by
+// rule-set NAME, so `aaa` took the budget and the MORE-SPECIFIC rule-set's
+// pool was the one poisoned.
+//
+// RED-on-revert: restore the name sort in
+// config.sourceNATAggregateReferencedCharges and the emitted order flips —
+// snapshot[0] (small) comes back PoolUnusable=true.
+func TestSnapshotPoisonFollowsEmittedScopeOrder_6812(t *testing.T) {
+	tree := &config.ConfigTree{}
+	cmds := []string{
+		"set security nat source rule-set aaa from zone trust",
+		"set security nat source rule-set aaa to zone untrust",
+		"set security nat source rule-set aaa rule r0 match source-address 10.0.0.0/24",
+		"set security nat source rule-set aaa rule r0 then source-nat pool big",
+		"set security nat source pool big address 10.100.0.0/16",
+		"set security nat source pool big address 10.101.0.0/16",
+		"set security nat source rule-set zzz from interface ge-0/0/1.0",
+		"set security nat source rule-set zzz rule r0 match source-address 10.0.0.0/24",
+		"set security nat source rule-set zzz rule r0 then source-nat pool small",
+		"set security nat source pool small address 10.200.0.0/16",
+	}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	out := buildSourceNATSnapshots(cfg, nil)
+	if len(out) != 2 {
+		t.Fatalf("emitted %d rules, want 2", len(out))
+	}
+	// The emitted order is the order the dataplane charges.
+	if out[0].PoolName != "small" || out[1].PoolName != "big" {
+		t.Fatalf("emitted order = [%s %s], want [small big] (interface tier first)",
+			out[0].PoolName, out[1].PoolName)
+	}
+	if sourceNATScopeTier(out[0]) >= sourceNATScopeTier(out[1]) {
+		t.Fatalf("emitted tiers = [%d %d]; the fixture no longer discriminates on tier",
+			sourceNATScopeTier(out[0]), sourceNATScopeTier(out[1]))
+	}
+	// The FIRST-charged pool keeps its allocator; the later one is refused.
+	if out[0].PoolUnusable {
+		t.Fatalf("the first-charged pool %q was poisoned (%q) — the Go walk admitted a "+
+			"DIFFERENT pool than the dataplane charges first",
+			out[0].PoolName, out[0].PoolUnusableReason)
+	}
+	if !out[1].PoolUnusable || out[1].PoolUnusableReason != "aggregate_over_budget" {
+		t.Fatalf("second pool %q unusable=%v reason=%q, want aggregate_over_budget",
+			out[1].PoolName, out[1].PoolUnusable, out[1].PoolUnusableReason)
+	}
+}

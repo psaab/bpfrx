@@ -1,3 +1,102 @@
+## 2026-08-13 — #6812 round 3: the grammar the shared verdict is expressed in
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold Codex MERGE-NEEDS-MAJOR at `3b7c71cca` (three findings) into
+  PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json` (new),
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/nat_source_scope.go` (new),
+  `pkg/config/nat_pool_grammar_parity_6812_test.go` (new),
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### The correction round 2 owed
+
+Round 2's closing sentence — *"the two sides cannot disagree because there is
+one predicate"* — is false as written, and correcting it is the substance of
+this round. Sharing a predicate between the snapshot builder and the budget walk
+makes the two **Go** call sites agree. Go-vs-dataplane agreement is a claim
+about two **PARSERS**, and nothing in round 2 established it. Round 2 removed
+the last derived quantity; it did not remove the last unverified premise.
+
+### F1 — the cited instance was wrong; the class was real
+
+Codex cited `198.51.100.1/032`. Measured through the real `expand_pool_address`
+and the real `sourceNATPoolAddressReason` over a 53-entry table: **both sides
+reject it.** `ipnet`'s IPv4 prefix-length reader is `read_number(10, 2, 33)` — a
+two-DIGIT cap, not a canonical-form rule — so three-digit `/032` fails there
+too. Its IPv6 reader allows three digits, so `/064` does parse as `/64`, but
+every leading-zero-expressible prefix length is over `MAX_POOL_PREFIX_HOSTS`, so
+the pool is refused anyway. That agreement is a **coincidence of two unrelated
+bounds**, not a property; raising the host cap would split it, so the mask
+grammar is now pinned explicitly rather than left to arithmetic.
+
+The differential did find six real divergences, in both directions. Five plus
+one embedded-v4 variant are the same class: a **leading-zero IPv4 octet inside a
+CIDR** (`010.0.0.0/24`, `10.000.0.0/24`, `192.168.001.1/32`, `010.0.0.0/32`,
+`00.0.0.0/24`, `::ffff:010.0.0.0/120`) — Rust expanded a working 256-address
+allocator while Go stamped `invalid_pool` and poisoned the pool. Root cause: the
+CIDR branch parsed via `ipnet::IpNet`, which hand-rolls its own address parser
+(`read_number(10, 3, 0x100)` per octet), while the BARE branch used
+`std::net::IpAddr`, which rejects leading zeros exactly as Go's `netip` does.
+The function was self-inconsistent: `010.0.0.1` refused, `010.0.0.1/32`
+accepted. The sixth is the reverse direction: `netip.ParseAddr` accepts a zone
+on a bare member (`fe80::1%eth0`) that `std::net::IpAddr` cannot represent.
+
+Fixed in the RUNTIME for the octet class (the CIDR branch now parses its address
+half with the same `std::net::IpAddr` the bare branch always used; `IpNet` is
+off the pool-member path entirely) and in GO for the zone (there the runtime is
+the stricter side). Widening Go to match `ipnet` was rejected: it would bless an
+octal-confusion spelling at commit and mirror a third-party crate's accident as
+firewall policy. The direction chosen is narrowing and fail-closed and changes
+**no** pool's disposition — `InvalidPool` is the verdict Go already assigned;
+only the disagreement is removed.
+
+The class-level fix is a shared fixture, not six special cases:
+`userspace-dp/tests/fixtures/snat_pool_grammar_v1.json` is ONE table read by
+both sides (the #3612 AppID parity convention), asserting verdict AND expanded
+host count.
+
+### F2 — the guard fires; the reasoning under it did not hold
+
+The claimed zero-width port charge is **not reachable**: measured through the
+real `CompileConfigLenient`, `compileNATSource` defaults an unset range to
+1024/65535 before storing the pool, so three no-`port`-leaf `/16` pools charge
+4,227,858,432 slots each and the third is poisoned — what
+`TestAggregateOverBudgetPoolsPortCapacity_6812` has asserted all along. The
+SHAPE is real: a consumer re-deriving what a shared function answers, with the
+equivalence resting on a defaulting three files away and nothing binding them.
+The walk now consults `SourceNATPoolPortRange`; both halves of the equivalence
+are tested.
+
+### F3 — confirmed, and it falsified this PR's own prose
+
+Go ordered rule-sets by NAME; the builder emits STABLE-sorted by #4161 scope
+tier and `resolve_pool_allocators` charges that emitted slice in order. Worth
+stating precisely: this is **not** a Go/Rust disagreement in the shipped
+artefact — the poison travels on the wire and the parse loop honours it, so both
+sides always agree on which pools live. It is a defect of POLICY: the surviving
+pool was chosen by an alphabetical accident, contradicting the most-specific-wins
+precedence the builder enforces for matching one function later. It also made
+this PR's sentence *"the first-fit admission rule here mirrors it exactly — same
+order, same charge"* false on the order axis. The walk now sorts by the same
+tier through one shared definition (`config.SourceNATScopeTier`).
+
+### Mutation proof (each fix reds on revert, observed)
+
+| revert | test | observed RED |
+|---|---|---|
+| drop the Go zone check | `TestPoolAddressGrammarMatchesDataplane_6812` | `sourceNATPoolAddressReason("fe80::1%eth0") ok = true, want false` |
+| restore the raw port recompute | `TestAggregateChargeConsultsResolvedPortRange_6812` | `portCap = 0, want 12683575296` |
+| restore the name sort | `TestAggregateFirstFitFollowsEmittedScopeOrder_6812` | `charge order = [big small], want the interface-scoped pool (small) first` |
+| " | `TestSnapshotPoisonFollowsEmittedScopeOrder_6812` | `the first-charged pool "small" was poisoned ("aggregate_over_budget")` |
+| restore `parse::<IpNet>()` in the CIDR branch | `nat_pool_grammar_parity_fixture` | `expand_pool_address("010.0.0.0/24") = true, want false` |
+| " | `nat_pool_bare_and_host_cidr_grammars_agree` | `expand_pool_address("010.0.0.1") = false but expand_pool_address("010.0.0.1/32") = true` |
+
 ## 2026-08-13 — #6812 fold r2: the budget must ask the runtime's question, not a proxy for it (Codex gate, fifth unusability class)
 
 - **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)

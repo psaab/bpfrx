@@ -716,6 +716,37 @@ impl SourceNatRule {
 /// signal rather than a silently clamped pool.
 pub(crate) const MAX_POOL_PREFIX_HOSTS: u64 = 65536;
 
+/// Parse a CIDR mask field in the CANONICAL decimal spelling, or `None`
+/// (#6812 F1 round 3).
+///
+/// Canonical means: 1-3 ASCII digits, no leading zero unless the field is the
+/// single digit `0`, value `<= max`. That is exactly what Go's
+/// `netip.ParsePrefix` accepts, so the two sides agree on the mask field by
+/// construction.
+///
+/// `ipnet` instead reads the field with `read_number(10, 2, 33)` for IPv4 and
+/// `read_number(10, 3, 129)` for IPv6 — a DIGIT-COUNT cap, not a canonical-form
+/// rule. It therefore refuses `/032` (3 digits, v4) but accepts `/064` as `/64`
+/// (3 digits, v6). Neither spelling changes any pool's disposition today
+/// (every leading-zero-expressible prefix length is over `MAX_POOL_PREFIX_HOSTS`
+/// anyway, so both sides refuse the pool either way), but that agreement is a
+/// coincidence of two unrelated bounds, not a property. Raising
+/// `MAX_POOL_PREFIX_HOSTS` would turn it into a live divergence, so the mask
+/// grammar is pinned here rather than left to arithmetic.
+fn parse_canonical_prefix_len(mask: &str, max: u32) -> Option<u32> {
+    if mask.is_empty() || mask.len() > 3 || !mask.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if mask.len() > 1 && mask.starts_with('0') {
+        return None;
+    }
+    let value: u32 = mask.parse().ok()?;
+    if value > max {
+        return None;
+    }
+    Some(value)
+}
+
 /// Expand one source-NAT pool address entry into its constituent host
 /// addresses (#3049). A pool entry is either a bare IP, a host CIDR
 /// (`/32`, `/128`), or a subnet CIDR (e.g. `203.0.113.0/28`). Junos uses the
@@ -726,34 +757,80 @@ pub(crate) const MAX_POOL_PREFIX_HOSTS: u64 = 65536;
 ///
 /// Returns `false` if the entry does not parse or expands beyond
 /// `MAX_POOL_PREFIX_HOSTS` (caller marks the pool invalid).
-fn expand_pool_address(
+///
+/// # One address grammar for both forms (#6812 F1 round 3)
+///
+/// The CIDR branch parses its address half with the SAME `std::net::IpAddr`
+/// parser the bare branch uses, and its mask half with
+/// `parse_canonical_prefix_len` — it deliberately does NOT call
+/// `IpNet::from_str`. `ipnet` hand-rolls its own address parser
+/// (`ipnet::parser`, a fork of an old `std` implementation) whose octet reader
+/// is `read_number(10, 3, 0x100)`: any 1-3 digit decimal below 256, **leading
+/// zeros included**. `std` (since Rust 1.53) and Go's `netip.ParseAddr` both
+/// reject a leading-zero octet, because `010` is octal 8 to some resolvers and
+/// the ambiguity is a spoofing vector.
+///
+/// That made this function self-inconsistent and made it disagree with the Go
+/// control plane: `010.0.0.1` (bare) was refused here, while `010.0.0.1/32`
+/// (CIDR) was accepted as `10.0.0.1`, and the shared Go predicate
+/// (`sourceNATPoolAddressReason`, pkg/config/compiler_validate_strict_nat.go)
+/// refused both. Go therefore stamped `invalid_pool` on the snapshot and
+/// poisoned a pool this function would have expanded into a working allocator —
+/// an over-rejection on the tolerant load / peer-sync path (#1960 no-brick),
+/// the same harmful direction as the five #6812 F1 classes before it.
+///
+/// Parsing the address half with `std` closes it in the narrowing, fail-closed
+/// direction: the ambiguous spelling is now `InvalidPool` on BOTH sides, which
+/// is the verdict Go already assigned, so no config changes disposition —
+/// only the disagreement is removed. `nat_pool_grammar_parity_fixture`
+/// (tests_aggregate_budget.rs) pins the agreement over
+/// `tests/fixtures/snat_pool_grammar_v1.json` — the SAME file
+/// `TestPoolAddressGrammarMatchesDataplane_6812` reads on the Go side, so
+/// neither side keeps a copy of the table — and
+/// `nat_pool_bare_and_host_cidr_grammars_agree` drives the bare-vs-CIDR
+/// invariant directly.
+///
+/// Scope: `expand_pool_address` has exactly one production caller (the
+/// source-NAT pool parse loop below), so this is the source-NAT pool
+/// membership grammar only. Rule-set MATCH prefixes still parse via `IpNet`
+/// and are a separate question.
+pub(super) fn expand_pool_address(
     addr_str: &str,
     out_v4: &mut Vec<Ipv4Addr>,
     out_v6: &mut Vec<Ipv6Addr>,
 ) -> bool {
-    if addr_str.contains('/') {
+    if let Some((addr_part, mask_part)) = addr_str.split_once('/') {
         // CIDR form: enumerate every address in the prefix range.
-        match addr_str.parse::<IpNet>() {
-            Ok(IpNet::V4(net)) => {
-                let host_bits = (32 - net.prefix_len()) as u32;
+        match addr_part.parse::<IpAddr>() {
+            Ok(IpAddr::V4(ip)) => {
+                let Some(prefix_len) = parse_canonical_prefix_len(mask_part, 32) else {
+                    return false;
+                };
+                let host_bits = 32 - prefix_len;
                 let count = 1u64 << host_bits; // 1 for /32
                 if count > MAX_POOL_PREFIX_HOSTS {
                     return false;
                 }
-                let base = u32::from(net.network());
+                // Mask to the network base. `count` is <= MAX_POOL_PREFIX_HOSTS
+                // (65536) here, so the `as u32` narrowing cannot truncate; the
+                // over-cap prefixes that would overflow returned above.
+                let base = u32::from(ip) & !(count as u32 - 1);
                 for i in 0..count {
                     out_v4.push(Ipv4Addr::from(base.wrapping_add(i as u32)));
                 }
                 true
             }
-            Ok(IpNet::V6(net)) => {
-                let host_bits = (128 - net.prefix_len()) as u32;
+            Ok(IpAddr::V6(ip)) => {
+                let Some(prefix_len) = parse_canonical_prefix_len(mask_part, 128) else {
+                    return false;
+                };
+                let host_bits = 128 - prefix_len;
                 // host_bits >= 17 already exceeds the cap; avoid 1u128 << 64+.
                 if host_bits >= 64 || (1u128 << host_bits) > MAX_POOL_PREFIX_HOSTS as u128 {
                     return false;
                 }
                 let count = 1u128 << host_bits; // 1 for /128
-                let base = u128::from(net.network());
+                let base = u128::from(ip) & !(count - 1);
                 for i in 0..count {
                     out_v6.push(Ipv6Addr::from(base.wrapping_add(i)));
                 }

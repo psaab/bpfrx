@@ -260,62 +260,27 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 
 // Source-NAT context-specificity tiers (#4161). LOWER = more specific = higher
 // precedence, matching Junos rule-set selection (interface most specific).
+//
+// #6812 F3: the tier definition moved to pkg/config (SourceNATScopeTier) so the
+// emission order here and the aggregate budget walk's first-fit order
+// (config.sourceNATAggregateReferencedCharges) read ONE definition. These
+// aliases keep the local spelling for this file and its #4161 tests.
 const (
-	snatTierInterface       = 0
-	snatTierZone            = 1
-	snatTierRoutingInstance = 2
-	snatTierUnscoped        = 3
+	snatTierInterface       = config.SourceNATTierInterface
+	snatTierZone            = config.SourceNATTierZone
+	snatTierRoutingInstance = config.SourceNATTierRoutingInstance
+	snatTierUnscoped        = config.SourceNATTierUnscoped
 )
 
 // sourceNATScopeTier returns the Junos context-specificity tier of a
-// source-NAT rule-set snapshot (#4161). A rule-set may carry both a `from` and
-// a `to` context, and they may be of different kinds; either context narrows
-// the match, so the MORE-SPECIFIC of the two governs the rule-set's
-// precedence: tier = MIN(from-tier, to-tier). This MIN default is the
-// vSRX-pinned semantic (confirmed by the L-9 overlap tests).
+// source-NAT rule-set snapshot (#4161) — the MIN of its from- and to-context
+// tiers. The rule (including why an EMPTY context, not a zone literally named
+// "any", is the wildcard) lives on config.SourceNATScopeTier.
 func sourceNATScopeTier(s SourceNATRuleSnapshot) int {
-	from := scopeContextTier(s.FromInterface, s.FromZone, s.FromRoutingInstance)
-	to := scopeContextTier(s.ToInterface, s.ToZone, s.ToRoutingInstance)
-	if to < from {
-		return to
-	}
-	return from
-}
-
-// scopeContextTier maps a single from/to context to its specificity tier
-// (#4161): interface=0, zone=1, routing-instance=2.
-//
-// The wildcard / match-any context is the EMPTY string on every axis (all
-// three args ""), which falls through to snatTierUnscoped (3). That empty
-// value is exactly what the compiler emits for an absent `from`/`to` clause:
-// collectNATScopes (pkg/config/compiler_nat.go:1083-1088) defaults a missing
-// side to {kind:"zone", value:""} → FromZone/ToZone "" — the legacy
-// global/match-any scope. So "wildcard" here means empty, NOT a zone named
-// "any": a NON-EMPTY zone (tier 1) is always a SPECIFIC zone, and a literal
-// `from zone any` is FromZone="any", a specific zone literally named "any", not
-// a wildcard. This is CONSISTENT with the Rust eligibility check
-// (source.rs scope_matches: `!from_zone.is_empty() && from_zone != ingress`),
-// which only special-cases the empty string and matches "any" literally. NAT
-// rule-set from/to-contexts do NOT treat "any" as a wildcard (unlike security
-// policies' from-zone/to-zone). A future maintainer must not special-case
-// "any" as tier-unscoped — that would diverge from the matcher and mis-tier a
-// legitimately-named zone.
-//
-// A Junos from/to clause names exactly one kind of context; a hostile config
-// that sets more than one is ranked by its most-specific present field (the
-// Rust scope_matches AND-filters every set field regardless, so this only
-// affects precedence, never eligibility).
-func scopeContextTier(iface, zone, routingInstance string) int {
-	switch {
-	case iface != "":
-		return snatTierInterface
-	case zone != "":
-		return snatTierZone
-	case routingInstance != "":
-		return snatTierRoutingInstance
-	default:
-		return snatTierUnscoped
-	}
+	return config.SourceNATScopeTier(
+		s.FromInterface, s.FromZone, s.FromRoutingInstance,
+		s.ToInterface, s.ToZone, s.ToRoutingInstance,
+	)
 }
 
 // natProtoAny is the source-NAT match-term protocol wildcard, mirroring the

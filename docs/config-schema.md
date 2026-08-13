@@ -5427,10 +5427,27 @@ reserved for whole-dataplane selection where a rewrite shim
     `validateSourceNATPoolAddressGrammarStrict`
     (`compiler_validate_strict_nat.go`) closes the divergence by rejecting the
     exact shapes the dataplane rejects: each member must be a bare IP
-    (`netip.ParseAddr`) or a CIDR (`netip.ParsePrefix`, non-canonical allowed,
-    like the Rust `IpNet`) whose host count does not exceed the cap, and a
-    referenced pool must be non-empty. A `/16` (exactly 65536 hosts, at the cap)
-    is accepted, matching the Rust `count > MAX_POOL_PREFIX_HOSTS` comparison.
+    (`netip.ParseAddr`, with no IPv6 `%zone`) or a CIDR (`netip.ParsePrefix`;
+    host bits may be set, the runtime masks to the network base) whose host
+    count does not exceed the cap, and a referenced pool must be non-empty. A
+    `/16` (exactly 65536 hosts, at the cap) is accepted, matching the Rust
+    `count > MAX_POOL_PREFIX_HOSTS` comparison.
+    **Grammar parity is a tested claim, not an asserted one (#6812 F1 round
+    3).** "Mirrors the dataplane" is a claim about two PARSERS agreeing, and a
+    measured differential over both real parsers found six inputs where they did
+    not. The runtime's CIDR branch parsed via `ipnet::IpNet`, whose hand-rolled
+    octet reader accepts a leading-zero octet that `std` and `netip` both
+    reject, so `010.0.0.0/24` built a working 256-address allocator for a pool
+    this gate stamped `invalid_pool` — an over-rejection on the very tolerant
+    path #1960 exists for; and `netip.ParseAddr` accepted a bare `fe80::1%eth0`
+    that `std::net::IpAddr` cannot represent. Both are closed — the runtime now
+    parses its CIDR address half with the same `std::net::IpAddr` its bare
+    branch always used, and the Go predicate rejects a zone on a bare member —
+    and the agreement is pinned by a SHARED fixture,
+    `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json`, read by
+    `TestPoolAddressGrammarMatchesDataplane_6812` (Go) and
+    `nat_pool_grammar_parity_fixture` (Rust, through the real
+    `expand_pool_address`). Neither side keeps a copy of the table.
     The gate iterates ONLY pools a pool-mode rule references — the exact set the
     dataplane snapshot expands, so an unreferenced pool (never seen by the Rust
     grammar) is out of scope and the gate stays grammar-EQUIVALENT with live
@@ -5448,7 +5465,13 @@ reserved for whole-dataplane selection where a rewrite shim
     the Junos lexer admits `%` (`lexer.go` `isIdentChar`) and Go's
     `netip.ParseAddr` honors a zone, so the scoped literal passed the #5627
     grammar gate (a bare IP with a zone parses fine) and the snapshot builder
-    copied the raw string onto the wire. But the Rust allocator parses each pool
+    copied the raw string onto the wire. (Since #6812 F1 round 3 the #5627
+    grammar gate rejects a zone on a bare member too — it was one of the six
+    measured Go/Rust parser divergences. This gate still runs FIRST in both
+    `runUniformGates` and the #5876 peer-effective SNAT set, and
+    `SourceNATPoolUnusableReason` still writes `zone_scoped_pool_address` after
+    the membership-grammar clause, so the operator message and the wire reason
+    are unchanged.) But the Rust allocator parses each pool
     member as `std::net::IpAddr` (`expand_pool_address`,
     `userspace-dp/src/nat/source.rs`), which has **no scope model**, so the
     scoped form fails to parse, the whole pool is marked `InvalidPool`, and the
@@ -5565,6 +5588,26 @@ reserved for whole-dataplane selection where a rewrite shim
     precisely because it expands to a LARGE number, charging 98.4% of the
     port-capacity budget for an allocator that never exists).
 
+    **#6812 F2/F3 round 3 — the walk consults the resolved port range, and
+    admits pools in the order the DATAPLANE charges them.** Two consumers were
+    re-deriving what a shared function already answers. (F2) The charge
+    recomputed the port window from the raw `PortLow`/`PortHigh` fields instead
+    of consulting `SourceNATPoolPortRange`, the resolver the snapshot builder
+    ships — behaviour-identical on the live path, because `compileNATSource`
+    defaults an unset range to 1024-65535 before storing the pool, but a
+    correctness that rested on a defaulting three files away with nothing
+    binding the two together. (F3) The walk ordered rule-sets by NAME, which is
+    neither the emitted order nor any Junos semantic. The snapshot builder
+    STABLE-sorts its emitted rules by #4161 scope tier and
+    `resolve_pool_allocators` charges that emitted slice in order, so with two
+    pools that each fit alone but not together, an alphabetically earlier
+    ZONE-scoped rule-set took the budget and the more-specific INTERFACE-scoped
+    rule-set's pool was poisoned. The walk now stable-sorts by the same tier
+    through ONE shared definition (`config.SourceNATScopeTier`, which the
+    builder also calls), so the pool Go admits is the pool the dataplane charges
+    first. The sibling grammar/scope gates still sort by name — they pick a
+    deterministic first-reported OFFENDER, where admission plays no part.
+
     Fail-on-revert:
     `TestSourceNATAggregatePoolCountRejected` /
     `TestSourceNATAggregateAddressesRejected` /
@@ -5580,11 +5623,22 @@ reserved for whole-dataplane selection where a rewrite shim
     `TestSourceNATSnapshotAggregate{OverBudgetPoisoned,AtBudgetUnaffected}_6812` /
     `TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812` /
     `TestSourceNATSnapshotMixedMemberPoolsDoNotPoisonHealthy_6812` /
-    `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812`
-    (`pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`), and
+    `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812` /
+    `TestSnapshotPoisonFollowsEmittedScopeOrder_6812`
+    (`pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`),
+    `TestAggregateChargeConsultsResolvedPortRange_6812` /
+    `TestCompiledPoolCarriesDefaultedPortRange_6812` /
+    `TestAggregateFirstFitFollowsEmittedScopeOrder_6812` (F2/F3, in the
+    `pkg/config` aggregate file), the grammar-parity pair
+    `TestPoolAddressGrammarMatchesDataplane_6812` /
+    `TestPoolAddressHostCountMatchesDataplane_6812`
+    (`pkg/config/nat_pool_grammar_parity_6812_test.go`), and
     `nat::tests_aggregate_budget` (`userspace-dp/src/nat/tests_aggregate_budget.rs`),
     including `go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812`
-    for the disposition-equivalence claim.
+    for the disposition-equivalence claim and
+    `nat_pool_grammar_parity_fixture` /
+    `nat_pool_bare_and_host_cidr_grammars_agree` for the F1 round-3 parser
+    parity.
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix

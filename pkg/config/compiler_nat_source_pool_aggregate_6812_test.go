@@ -211,8 +211,22 @@ func TestAggregateBudgetExcludesUnusablePools_6812(t *testing.T) {
 		{
 			name:       "zone_scoped_pool_address",
 			wantReason: "zone_scoped_pool_address",
-			wantSum:    1, // netip parses a zoned bare address
-			about:      "a `%zone` member is not dataplane-representable (#5875); the builder marks the pool unusable",
+			// sourceNATPoolMemberHostCount still counts 1 (netip.ParseAddr
+			// honors a zone) — it is the GRAMMAR predicate, not the counter,
+			// that round 3 narrowed.
+			wantSum: 1,
+			// RE-CUT IN ROUND 3 — this cell now binds PRECEDENCE, not just zone
+			// detection. Through round 2 the bare `fe80::1%eth0` passed
+			// sourceNATPoolAddressReason (netip carries a zone), so
+			// zone_scoped_pool_address was the ONLY clause that fired and the
+			// clause ORDER did not matter to it. Round 3 made the grammar
+			// clause reject a zone too (std::net::IpAddr has no zone model, so
+			// the runtime refused this member all along), so the pool now trips
+			// BOTH clauses and this assertion holds only because the zone
+			// clause is written AFTER the grammar clause.
+			// TestZoneScopedBarePoolAddressKeepsItsSpecificReason_6812 states
+			// that as its own claim.
+			about: "a `%zone` member is not dataplane-representable (#5875); the builder marks the pool unusable",
 			cmds: func(i int, name string) []string {
 				return []string{
 					fmt.Sprintf("set security nat source pool %s address fe80::%d%%eth0", name, i+1),
@@ -403,12 +417,21 @@ func TestAggregateBudgetExcludesUnusablePools_6812(t *testing.T) {
 func TestBudgetChargeImpliesHonorableMembers_6812(t *testing.T) {
 	// The grammar surface: accepted and rejected shapes, v4 and v6, bare and
 	// CIDR, at and over the prefix cap.
+	//
+	// ROUND 3: `fe80::1%eth0` moved sides. It used to be ACCEPTED here (netip
+	// carries a zone) with a host count of 1, so it exercised premise 1's
+	// positive arm; it is now REJECTED, so premise 1 skips it and it exercises
+	// premise 2 instead (a pool carrying it must not be charged). The
+	// leading-zero-octet shapes are added for the same reason the round-3
+	// divergence existed: a member the Go predicate rejects must never carry a
+	// non-zero count into a charge.
 	members := []string{
 		"198.51.100.1", "198.51.100.0/32", "203.0.113.0/28", "10.0.0.0/16",
 		"2001:db8::1", "2001:db8::/128", "2001:db8::/112",
 		"not-an-ip", "203.0.113.1/garbage", "999.999.999.1", "",
 		"10.0.0.0/15", "10.0.0.0/8", "2001:db8::/111", "::/0",
 		"fe80::1%eth0", "fe80::/112%eth0",
+		"010.0.0.0/24", "192.168.001.1/32", "::ffff:010.0.0.0/120",
 	}
 	for _, m := range members {
 		_, ok := sourceNATPoolAddressReason(m)
@@ -495,4 +518,140 @@ func TestAggregateValidatorMatchesPoisonWalk_6812(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAggregateChargeConsultsResolvedPortRange_6812 pins #6812 F2 round 3: the
+// budget walk CONSULTS SourceNATPoolPortRange — the resolver the snapshot
+// builder ships to the dataplane — instead of recomputing the range from the
+// raw PortLow/PortHigh fields.
+//
+// This is a CONTRACT test, not a live-bug repro, and the distinction is the
+// point. compileNATSource defaults an unset port range to 1024/65535 before
+// storing the pool, so on every config the compiler can produce the two
+// agreed (TestCompiledPoolCarriesDefaultedPortRange_6812 pins that half).
+// The walk's correctness therefore RESTED on a defaulting three files away,
+// with nothing binding the two together: a *NATPool built any other way — the
+// resolver's own documented input, raw 0/0 — was charged ZERO port slots and
+// admitted, while the builder shipped the resolved 1024-65535 and the
+// dataplane charged 64,512 slots per address.
+//
+// FAIL-ON-REVERT: restoring `if pool.PortLow > 0 && pool.PortHigh >= pool.PortLow`
+// over the raw fields makes portCap 0 here and reds the test.
+func TestAggregateChargeConsultsResolvedPortRange_6812(t *testing.T) {
+	// Three /16 members, NO port range stamped — exactly the shape
+	// SourceNATPoolPortRange resolves to the 1024-65535 PAT default.
+	pool := &NATPool{
+		Name:      "p0",
+		Addresses: []string{"10.0.0.0/16", "10.1.0.0/16", "10.2.0.0/16"},
+	}
+	if pool.PortLow != 0 || pool.PortHigh != 0 {
+		t.Fatalf("fixture must carry an UNSET raw range, got %d-%d", pool.PortLow, pool.PortHigh)
+	}
+	lo, hi, ok := SourceNATPoolPortRange(pool)
+	if !ok || lo != 1024 || hi != 65535 {
+		t.Fatalf("SourceNATPoolPortRange = %d-%d ok=%v, want 1024-65535 ok=true", lo, hi, ok)
+	}
+	cfg := &Config{}
+	cfg.Security.NAT.SourcePools = map[string]*NATPool{"p0": pool}
+	cfg.Security.NAT.Source = []*NATRuleSet{{
+		Name:     "RS",
+		FromZone: "trust",
+		ToZone:   "untrust",
+		Rules:    []*NATRule{{Name: "r0", Then: NATThen{PoolName: "p0"}}},
+	}}
+
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	if len(charges) != 1 {
+		t.Fatalf("charges = %+v, want exactly one", charges)
+	}
+	const wantAddrs = 3 * 65536
+	const wantPortCap = wantAddrs * (65535 - 1024 + 1)
+	if charges[0].addrs != wantAddrs {
+		t.Fatalf("addrs = %d, want %d", charges[0].addrs, wantAddrs)
+	}
+	if charges[0].portCap != wantPortCap {
+		t.Fatalf("portCap = %d, want %d (a zero-width charge means the walk recomputed "+
+			"from the raw fields instead of consulting the resolver)",
+			charges[0].portCap, wantPortCap)
+	}
+	// And the charge is over the 2^33 budget, so the guard actually FIRES —
+	// a zero-width charge would have admitted this pool silently.
+	if poison := SourceNATAggregateOverBudgetPools(cfg); !poison["p0"] {
+		t.Fatalf("poison = %v, want p0 refused (%d port slots > %d budget)",
+			poison, uint64(wantPortCap), MaxSourceNATAggregatePortCapacity)
+	}
+}
+
+// TestCompiledPoolCarriesDefaultedPortRange_6812 pins the OTHER half of the
+// #6812 F2 equivalence: a pool with no `port` leaf leaves compileNATSource
+// with the 1024/65535 PAT default already stamped on its raw fields. Together
+// with TestAggregateChargeConsultsResolvedPortRange_6812 this bounds the fix
+// as behavior-preserving on the live path while the walk stops depending on it.
+func TestCompiledPoolCarriesDefaultedPortRange_6812(t *testing.T) {
+	cfg, err := CompileConfigLenient(snat5877Tree(t, snat5877Pools(1, distinctSlash16, "")...))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	pool := cfg.Security.NAT.SourcePools["p0"]
+	if pool == nil {
+		t.Fatal("pool p0 missing")
+	}
+	if pool.PortLow != 1024 || pool.PortHigh != 65535 {
+		t.Fatalf("compiled raw range = %d-%d, want the 1024-65535 default", pool.PortLow, pool.PortHigh)
+	}
+}
+
+// TestAggregateFirstFitFollowsEmittedScopeOrder_6812 pins #6812 F3 round 3:
+// the first-fit walk admits pools in the order the DATAPLANE charges them —
+// the emitted #4161 scope-tier order — not rule-set NAME order.
+//
+// `aaa` is a ZONE-scoped rule-set (tier 1) naming a 2x/16 pool that consumes
+// 98% of the 2^33 port-slot budget; `zzz` is an INTERFACE-scoped rule-set
+// (tier 0, MORE specific) naming a 1x/16 pool. Each fits alone; together they
+// do not. The snapshot builder stable-sorts its emitted rules by tier, so the
+// interface-scoped rule is emitted FIRST and resolve_pool_allocators charges
+// `small` first — which means `big` is the pool that must lose.
+//
+// FAIL-ON-REVERT: restoring the `rulesets[i].Name < rulesets[j].Name` sort
+// poisons `small` instead and reds this test.
+func TestAggregateFirstFitFollowsEmittedScopeOrder_6812(t *testing.T) {
+	cmds := []string{
+		"set security nat source rule-set aaa from zone trust",
+		"set security nat source rule-set aaa to zone untrust",
+		"set security nat source rule-set aaa rule r0 match source-address 10.0.0.0/24",
+		"set security nat source rule-set aaa rule r0 then source-nat pool big",
+		"set security nat source pool big address 10.100.0.0/16",
+		"set security nat source pool big address 10.101.0.0/16",
+		"set security nat source rule-set zzz from interface ge-0/0/1.0",
+		"set security nat source rule-set zzz rule r0 match source-address 10.0.0.0/24",
+		"set security nat source rule-set zzz rule r0 then source-nat pool small",
+		"set security nat source pool small address 10.200.0.0/16",
+	}
+	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	// Precondition: each pool fits ALONE, so the fixture is decided by ORDER
+	// and not by one pool being individually impossible.
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	if len(charges) != 2 {
+		t.Fatalf("charges = %+v, want two pools", charges)
+	}
+	for _, c := range charges {
+		if c.portCap > MaxSourceNATAggregatePortCapacity {
+			t.Fatalf("pool %s alone (%d slots) exceeds the budget; the fixture no longer "+
+				"discriminates on ORDER", c.name, c.portCap)
+		}
+	}
+	if charges[0].portCap+charges[1].portCap <= MaxSourceNATAggregatePortCapacity {
+		t.Fatalf("both pools fit together (%d + %d <= %d); the fixture no longer "+
+			"discriminates on ORDER", charges[0].portCap, charges[1].portCap,
+			MaxSourceNATAggregatePortCapacity)
+	}
+	// The interface-scoped rule-set is charged FIRST — the emitted order.
+	if charges[0].name != "small" {
+		t.Fatalf("charge order = [%s %s], want the interface-scoped pool (small) first",
+			charges[0].name, charges[1].name)
+	}
+	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), "big")
 }

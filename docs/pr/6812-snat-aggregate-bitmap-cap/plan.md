@@ -293,3 +293,137 @@ The `no_member_expands` cell was re-cut: it now binds through the shared verdict
 (`wantReason: "invalid_pool"`) rather than through the deleted zero-total rule,
 and every cell asserts its round-1 host-count sum exactly, so a case cannot be
 mistaken for a class it does not exercise.
+
+## Round 3 — the round-2 premise, corrected
+
+Codex re-gate at `3b7c71cca`: **MERGE-NEEDS-MAJOR**, three findings. The first
+undercuts the sentence round 2 leans on above: *"the two sides cannot disagree
+because there is one predicate."*
+
+**That sentence is false as written, and the correction is the round.** Sharing
+one predicate between the snapshot builder and the budget walk makes the two
+**Go** call sites agree. Whether Go and the dataplane agree is a claim about two
+**PARSERS**, and nothing in round 2 established it. Round 2 removed the last
+*derived quantity*; it did not remove the last *unverified premise*.
+
+### F1 — measured, and the cited instance was wrong
+
+The finding cited `198.51.100.1/032` (Go rejects a leading-zero prefix length,
+Rust's `IpNet` allegedly accepts it). Running the real `expand_pool_address`
+against the real `sourceNATPoolAddressReason` over a 53-entry table shows **both
+sides reject it**: `ipnet`'s prefix-length reader is `read_number(10, 2, 33)`
+for IPv4 — a two-DIGIT cap, not a canonical-form rule — so a three-digit `/032`
+fails to parse there too. Its IPv6 reader allows three digits, so `/064` *does*
+parse as `/64`, but every leading-zero-expressible prefix length is over
+`MAX_POOL_PREFIX_HOSTS` anyway, so the pool is refused regardless. **That
+agreement is a coincidence of two unrelated bounds, not a property** — raising
+the host cap would split them — so the mask grammar is now pinned explicitly
+(`parse_canonical_prefix_len`) instead of left to arithmetic.
+
+The general claim was right; the field was wrong. The measured differential
+found **six** divergences, in both directions:
+
+| member | Go (netip) | Rust (before) | class |
+|---|---|---|---|
+| `010.0.0.0/24` | reject | **accept, 256 hosts** | leading-zero IPv4 octet |
+| `10.000.0.0/24` | reject | **accept, 256** | " |
+| `192.168.001.1/32` | reject | **accept, 1** | " |
+| `010.0.0.0/32` | reject | **accept, 1** | " |
+| `00.0.0.0/24` | reject | **accept, 256** | " |
+| `::ffff:010.0.0.0/120` | reject | **accept, 256** | " (embedded v4) |
+| `fe80::1%eth0` | **accept** | reject | IPv6 zone on a bare member |
+
+Root cause: `expand_pool_address`'s CIDR branch parsed via `ipnet::IpNet`, which
+hand-rolls its own address parser (`read_number(10, 3, 0x100)` per octet —
+up to three digits with any leading zeros), while its BARE branch used
+`std::net::IpAddr`, which rejects a leading-zero octet exactly as Go's `netip`
+does. The function was self-inconsistent: `010.0.0.1` refused, `010.0.0.1/32`
+accepted as `10.0.0.1`.
+
+**Fix: in the runtime, not the predicate.** The CIDR branch now parses its
+address half with the same `std::net::IpAddr` the bare branch always used, and
+its mask half with `parse_canonical_prefix_len`; `IpNet` is no longer on the
+pool-member path at all. Rejected alternatives:
+
+- *Widen Go to match `ipnet`.* This blesses an octal-confusion spelling at
+  commit — `010` is 8 to some resolvers, which is why both `std` and `netip`
+  refuse it — and mirrors a third-party crate's accident as firewall policy.
+- *Document the divergence.* It is a live over-rejection: Go stamps
+  `invalid_pool`, the builder poisons the pool, and a pool the dataplane would
+  have installed translates nothing — on the tolerant load / peer-sync path
+  (#1960 no-brick), which is the path an operator recovers through.
+
+The chosen direction is narrowing and fail-closed, and it changes **no** pool's
+disposition: `InvalidPool` is the verdict Go already assigned. Only the
+disagreement is removed. The zone half is closed on the Go side instead, because
+there the runtime is the stricter one; the #5875 precedence is unaffected
+(`SourceNATPoolUnusableReason` writes `zone_scoped_pool_address` after the
+grammar clause, and the scope gate is registered before the grammar gate) and
+`TestZoneScopedBarePoolAddressKeepsItsSpecificReason_6812` binds that.
+
+**The class-level fix is the fixture.** `userspace-dp/tests/fixtures/
+snat_pool_grammar_v1.json` is ONE table read by both
+`TestPoolAddressGrammarMatchesDataplane_6812` (Go) and
+`nat_pool_grammar_parity_fixture` (Rust, through the real
+`expand_pool_address`) — same convention as the #3612 AppID parity guard.
+Neither side keeps a copy, verdict AND expanded host count are both asserted,
+and `nat_pool_bare_and_host_cidr_grammars_agree` separately drives the
+bare-vs-CIDR invariant inside Rust so the self-inconsistency cannot return by a
+different route.
+
+### F2 — the guard fires; the claim under it did not hold
+
+The finding says the aggregate walk recomputes the port range from raw fields,
+so a referenced pool with no `port` leaf charges a zero-width window and is
+admitted. **Measured through the real `CompileConfigLenient`: it does not.**
+`compileNATSource` defaults an unset `PortLow`/`PortHigh` to 1024/65535 before
+storing the pool, so three `/16` pools with no `port` leaf charge
+`portCap=4,227,858,432` each and the third is poisoned — which is exactly what
+`TestAggregateOverBudgetPoolsPortCapacity_6812` has been asserting all along.
+
+The SHAPE is real even though the instance is not: a consumer re-deriving what a
+shared function already answers, with the equivalence resting on a defaulting
+three files away and nothing binding the two. The walk now consults
+`SourceNATPoolPortRange` — the resolver the builder ships to the dataplane.
+Behaviour-preserving on the live path, and now a contract:
+`TestAggregateChargeConsultsResolvedPortRange_6812` drives a `*NATPool` with the
+raw 0/0 the resolver documents as its input (charging 0 before the fix,
+12,683,575,296 after), and `TestCompiledPoolCarriesDefaultedPortRange_6812` pins
+the other half so the claim "behaviour-preserving" is itself tested.
+
+### F3 — first-fit order, and a false claim in this PR's own prose
+
+Confirmed. Go ordered rule-sets by NAME; the builder emits rules STABLE-sorted
+by #4161 scope tier; `resolve_pool_allocators` charges that emitted slice in
+order. With two pools that each fit alone but not together, an alphabetically
+earlier ZONE-scoped rule-set took the budget and the more-specific
+INTERFACE-scoped rule-set's pool was poisoned `aggregate_over_budget`.
+
+Two things are worth stating precisely. First, this is **not** a Go/Rust
+disagreement in the shipped artefact: the poison travels on the wire and the
+Rust parse loop honours it, so both sides always agree on which pools live. It
+is a defect of POLICY — the surviving pool was chosen by an unrelated
+alphabetical accident, contradicting the Junos most-specific-wins precedence the
+builder enforces for matching one function later. Second, it made this PR's own
+sentence *"the first-fit admission rule here mirrors it exactly — same order,
+same charge"* false on the order axis.
+
+Fix: the walk stable-sorts by the same tier, through ONE definition —
+`config.SourceNATScopeTier`, moved out of `pkg/dataplane/userspace` so the
+builder and the walk call it rather than each spelling it. The sibling
+grammar/scope gates keep their name sort; they pick a deterministic
+first-reported OFFENDER for an error message, where admission plays no part.
+`TestAggregateFirstFitFollowsEmittedScopeOrder_6812` (with preconditions that
+each pool fits alone and the pair does not, so the fixture cannot decay into one
+that no longer discriminates on order) and
+`TestSnapshotPoisonFollowsEmittedScopeOrder_6812` (at the emission boundary)
+bind it.
+
+### Fixture re-cut
+
+No fixture cell changed meaning. The widened grammar rejects strictly more on
+the Rust side and one more shape on the Go side, and no existing cell uses a
+leading-zero octet or a zone-scoped bare member except the #5875 snapshot cell —
+which continues to bind `zone_scoped_pool_address` for the reason it always
+did, now verified by an explicit precedence test rather than by the clause order
+alone.

@@ -63,7 +63,7 @@
 use super::allocator::TranslatedTuple;
 use super::source::{
     SOURCE_NAT_AGGREGATE_BUDGET, SourceNatAggregateBudget, SourceNatAggregateUse,
-    SourceNatFailureReason, parse_source_nat_rules_with_budget,
+    SourceNatFailureReason, expand_pool_address, parse_source_nat_rules_with_budget,
     parse_source_nat_rules_with_previous,
 };
 use super::*;
@@ -849,5 +849,138 @@ fn go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812() {
             g.pool_addresses_v6, l.pool_addresses_v6,
             "{label}: expanded v6 membership diverged",
         );
+    }
+}
+
+/// #6812 F1 round 3 — the Rust half of the source-NAT pool address GRAMMAR
+/// parity guard.
+///
+/// The Go control plane decides, at commit AND on the tolerant load / peer-sync
+/// path, whether a pool member is one this expander will honor
+/// (`sourceNATPoolAddressReason`, pkg/config/compiler_validate_strict_nat.go).
+/// Round 2 made the snapshot builder and the aggregate budget walk SHARE that
+/// predicate — which makes the two GO sites agree, and says nothing about
+/// whether the two PARSERS agree.
+///
+/// They did not. The CIDR branch here used to parse via `IpNet`, whose
+/// hand-rolled octet reader accepts a leading-zero octet that `std` — and Go's
+/// `netip` — reject, so `010.0.0.0/24` built a working 256-address allocator
+/// for a pool Go had stamped `invalid_pool` and poisoned. Round 3 closed it by
+/// parsing the address half with the same `std::net::IpAddr` the bare branch
+/// always used.
+///
+/// This test reads `tests/fixtures/snat_pool_grammar_v1.json` — the SAME file
+/// `TestPoolAddressGrammarMatchesDataplane_6812` reads on the Go side. Neither
+/// side keeps a copy of the table, so a future edit to either parser that
+/// changes any verdict (or any expanded host COUNT) reds one of the two tests.
+///
+/// FAIL-ON-REVERT: restoring `addr_str.parse::<IpNet>()` in the CIDR branch
+/// turns the five leading-zero-octet rows from REJECT to ACCEPT and reds this.
+#[test]
+fn nat_pool_grammar_parity_fixture() {
+    let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("snat_pool_grammar_v1.json");
+    let raw = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("read {}: {}", fixture_path.display(), e));
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).expect("snat_pool_grammar_v1.json parses");
+    let cases = doc["cases"].as_array().expect("cases array");
+    assert!(!cases.is_empty(), "fixture must carry at least one case");
+
+    let mut accepted = 0usize;
+    for case in cases {
+        let addr = case["addr"].as_str().expect("addr string");
+        let want_ok = case["ok"].as_bool().expect("ok bool");
+        let want_hosts = case["hosts"].as_u64().expect("hosts number");
+        let note = case["note"].as_str().unwrap_or("");
+
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        let got_ok = expand_pool_address(addr, &mut v4, &mut v6);
+        assert_eq!(
+            got_ok, want_ok,
+            "expand_pool_address({addr:?}) = {got_ok}, want {want_ok}; the Go predicate              and this expander disagree about whether the member is honorable              (fixture note: {note})",
+        );
+        if !want_ok {
+            // A refused member must expand NOTHING: the caller ORs the failure
+            // into invalid_pool_address, but a partially-filled vector would
+            // still size an allocator.
+            assert_eq!(
+                v4.len() + v6.len(),
+                0,
+                "expand_pool_address({addr:?}) refused the member but still pushed                  {} v4 + {} v6 addresses",
+                v4.len(),
+                v6.len(),
+            );
+            continue;
+        }
+        accepted += 1;
+        assert_eq!(
+            (v4.len() + v6.len()) as u64,
+            want_hosts,
+            "expand_pool_address({addr:?}) expanded {} addresses, want {want_hosts}              (the aggregate budget charges this count and the allocator sizes an              occupancy bitmap from it)",
+            v4.len() + v6.len(),
+        );
+    }
+    assert!(
+        accepted >= 10,
+        "fixture exercises only {accepted} accepted members; the table must carry          both verdicts or an expander that refuses everything would pass",
+    );
+}
+
+/// #6812 F1 round 3: the two branches of `expand_pool_address` must accept the
+/// SAME address grammar. Before round 3 the bare branch used `std` and the CIDR
+/// branch used `ipnet`, so `010.0.0.1` was refused while `010.0.0.1/32` was
+/// accepted as `10.0.0.1` — a self-inconsistency inside one function, and the
+/// shape that let the CIDR form diverge from Go.
+///
+/// This drives the invariant directly rather than trusting the fixture rows to
+/// keep covering it: for every address in the table that has no mask, the bare
+/// verdict and the `/32`-or-`/128` verdict must match.
+#[test]
+fn nat_pool_bare_and_host_cidr_grammars_agree() {
+    let bare_addresses = [
+        "198.51.100.1",
+        "010.0.0.1",
+        "10.0.0.1",
+        "0.0.0.1",
+        "00.0.0.1",
+        "192.168.001.1",
+        "256.0.0.1",
+        "2001:db8::1",
+        "2001:0db8::1",
+        "::ffff:10.0.0.1",
+        "::ffff:010.0.0.1",
+        "fe80::1%eth0",
+        "not-an-ip",
+        "",
+    ];
+    for addr in bare_addresses {
+        let (mut b4, mut b6) = (Vec::new(), Vec::new());
+        let bare_ok = expand_pool_address(addr, &mut b4, &mut b6);
+        let host_mask = if addr.contains(':') { "/128" } else { "/32" };
+        let cidr = format!("{addr}{host_mask}");
+        let (mut c4, mut c6) = (Vec::new(), Vec::new());
+        let cidr_ok = expand_pool_address(&cidr, &mut c4, &mut c6);
+        assert_eq!(
+            bare_ok, cidr_ok,
+            "grammar split: expand_pool_address({addr:?}) = {bare_ok} but \
+             expand_pool_address({cidr:?}) = {cidr_ok}; the two branches must \
+             accept the same addresses",
+        );
+        if bare_ok {
+            assert_eq!(
+                (b4.len() + b6.len(), c4.len() + c6.len()),
+                (1, 1),
+                "a bare address and its host CIDR must each expand to exactly one host",
+            );
+            assert_eq!(
+                (b4, b6),
+                (c4, c6),
+                "a bare address and its host CIDR must expand to the SAME host",
+            );
+        }
     }
 }
