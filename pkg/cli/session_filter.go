@@ -437,8 +437,10 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 // accident of a zero value. Three populations legitimately carry no
 // ingress identity and MUST stay reachable by an interface-filtered show
 // and clear:
-//   - the reverse companion, whose real ingress is the forward flow's
-//     egress and is not resolved at install;
+//   - the reverse companion, whose own ingress has not been OBSERVED yet.
+//     The forward flow's egress IS resolved at install; it is the wrong
+//     datum, predicting where the reply will arrive rather than recording
+//     where it did, and routing may be asymmetric;
 //   - a peer-synced session: an ifindex is NODE-LOCAL, so the originating
 //     node's number names a different NIC here. It is deliberately not
 //     carried across the cluster wire — doing so would render a

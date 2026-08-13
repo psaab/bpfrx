@@ -73,8 +73,18 @@ type SessionValue struct {
 	// so it is present on bpfSessionValue and round-trips through the BPF
 	// mirror.
 	//
-	// SCOPE (#6965): the stamp is on every forward session the helper installs,
-	// but only some of those sessions reach THIS map, which is what
+	// SCOPE (#6965): the stamp is on every forward session installed FROM A
+	// RECEIVED FRAME — i.e. at the three frame-driven install sites, the only
+	// places an observed ingress binding exists to copy. Two production sites
+	// install a forward (is_reverse=false) session with 0 and are not
+	// exceptions to the rule but instances of it: the host-outbound GRE
+	// encapsulation path (afxdp/tunnel.rs), where firewall-originated traffic
+	// read off the TUN device never arrived on a binding, and the HA peer
+	// import (server/helpers/session_sync.rs), which deliberately does not
+	// carry the peer's node-local ifindex. Both are listed among the
+	// legitimate zeros below.
+	//
+	// Of the frame-driven stamps, only some reach THIS map, which is what
 	// IterateSessions — and therefore `show`/`clear security flow session` —
 	// enumerates. The helper's publish_bpf_conntrack_entry is called from only
 	// three sites in afxdp/poll_descriptor: the host-inbound (LocalMiss)
@@ -91,10 +101,12 @@ type SessionValue struct {
 	//
 	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
 	// populations legitimately carry 0 and MUST keep working:
-	//   - the reverse companion (its real ingress is the forward flow's egress,
-	//     which is unknown at install time). Note every pkg/cli show/clear call
-	//     site skips IsReverse != 0 before filtering, so a reverse row is never
-	//     interface-matched in the first place;
+	//   - the reverse companion (its own ingress has not been OBSERVED yet).
+	//     The forward flow's egress IS known at install — it is the wrong
+	//     datum, being a prediction of where the reply will arrive rather than
+	//     an observation of where it did, and routing may be asymmetric. Note
+	//     every pkg/cli show/clear call site skips IsReverse != 0 before
+	//     filtering, so a reverse row is never interface-matched anyway;
 	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
 	//     number names a different NIC on this node, so carrying it across the
 	//     cluster wire would be confidently wrong, worse than approximating);
@@ -103,12 +115,28 @@ type SessionValue struct {
 	//     binding to record;
 	//   - the helper's flow-cache descriptor seed, which is replay state for an
 	//     already-installed session and is never published as one.
+	//
+	// FABRIC INGRESS is the one population where this field and IngressZone
+	// name DIFFERENT interfaces, so the list above is not exhaustive without
+	// it. A frame arriving over the fabric carries a zone-encoded override, so
+	// IngressZone is the ORIGINATING chassis's zone while this stamp records
+	// the LOCAL fabric NIC the frame physically arrived on. Both answer
+	// different questions correctly; they simply disagree, and an exact
+	// interface filter follows the ifindex rather than the zone. Inert today —
+	// the fabric member is declared with no config unit, so it has no
+	// {ifindex, vlan} name, the lookup misses and the CLI falls back to the
+	// zone as before. See userspace-dp/src/session/entry.rs for the full note
+	// and the operator consequence if a unit is ever added.
 	// There is deliberately NO "pre-#4983 helper, rolling upgrade" population:
 	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
 	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
 	// ValueSize mismatch against the live pin, so a new daemon never reads an
-	// old helper's 136/184-byte rows — the remediation is a full dataplane
-	// reload, which starts from an empty map.
+	// old helper's 136/184-byte rows — the remediation is `xpfd cleanup` (or a
+	// reboot), which unpins the maps so the next load recreates them at the new
+	// size. NOT a restart: a bpffs pin outlives the process that made it, so
+	// stopping and starting xpfd leaves the old-size pin in place and the
+	// pre-flight refuses again. dataplane.Cleanup() is reachable only from the
+	// `xpfd cleanup` subcommand (cmd/xpfd/main.go).
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
@@ -122,7 +150,7 @@ type SessionValue struct {
 	// Until that lands, an interface-filtered SHOW is exact for rows this node
 	// owns and approximate for peer rows. An interface-filtered CLEAR is NOT
 	// exact even when typed on the console: `clearFilteredSessions`
-	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:252`), and
+	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
 	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
 	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
 	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`
@@ -293,8 +321,18 @@ type SessionValueV6 struct {
 	// so it is present on bpfSessionValue and round-trips through the BPF
 	// mirror.
 	//
-	// SCOPE (#6965): the stamp is on every forward session the helper installs,
-	// but only some of those sessions reach THIS map, which is what
+	// SCOPE (#6965): the stamp is on every forward session installed FROM A
+	// RECEIVED FRAME — i.e. at the three frame-driven install sites, the only
+	// places an observed ingress binding exists to copy. Two production sites
+	// install a forward (is_reverse=false) session with 0 and are not
+	// exceptions to the rule but instances of it: the host-outbound GRE
+	// encapsulation path (afxdp/tunnel.rs), where firewall-originated traffic
+	// read off the TUN device never arrived on a binding, and the HA peer
+	// import (server/helpers/session_sync.rs), which deliberately does not
+	// carry the peer's node-local ifindex. Both are listed among the
+	// legitimate zeros below.
+	//
+	// Of the frame-driven stamps, only some reach THIS map, which is what
 	// IterateSessions — and therefore `show`/`clear security flow session` —
 	// enumerates. The helper's publish_bpf_conntrack_entry is called from only
 	// three sites in afxdp/poll_descriptor: the host-inbound (LocalMiss)
@@ -311,10 +349,12 @@ type SessionValueV6 struct {
 	//
 	// 0 means "no ingress identity carried" and is NEVER a valid ifindex. These
 	// populations legitimately carry 0 and MUST keep working:
-	//   - the reverse companion (its real ingress is the forward flow's egress,
-	//     which is unknown at install time). Note every pkg/cli show/clear call
-	//     site skips IsReverse != 0 before filtering, so a reverse row is never
-	//     interface-matched in the first place;
+	//   - the reverse companion (its own ingress has not been OBSERVED yet).
+	//     The forward flow's egress IS known at install — it is the wrong
+	//     datum, being a prediction of where the reply will arrive rather than
+	//     an observation of where it did, and routing may be asymmetric. Note
+	//     every pkg/cli show/clear call site skips IsReverse != 0 before
+	//     filtering, so a reverse row is never interface-matched anyway;
 	//   - an HA peer-synced session (an ifindex is NODE-LOCAL — the peer's
 	//     number names a different NIC on this node, so carrying it across the
 	//     cluster wire would be confidently wrong, worse than approximating);
@@ -323,12 +363,28 @@ type SessionValueV6 struct {
 	//     binding to record;
 	//   - the helper's flow-cache descriptor seed, which is replay state for an
 	//     already-installed session and is never published as one.
+	//
+	// FABRIC INGRESS is the one population where this field and IngressZone
+	// name DIFFERENT interfaces, so the list above is not exhaustive without
+	// it. A frame arriving over the fabric carries a zone-encoded override, so
+	// IngressZone is the ORIGINATING chassis's zone while this stamp records
+	// the LOCAL fabric NIC the frame physically arrived on. Both answer
+	// different questions correctly; they simply disagree, and an exact
+	// interface filter follows the ifindex rather than the zone. Inert today —
+	// the fabric member is declared with no config unit, so it has no
+	// {ifindex, vlan} name, the lookup misses and the CLI falls back to the
+	// zone as before. See userspace-dp/src/session/entry.rs for the full note
+	// and the operator consequence if a unit is ever added.
 	// There is deliberately NO "pre-#4983 helper, rolling upgrade" population:
 	// `sessions`/`sessions_v6` are in the shim ABI pre-flight's checked set, and
 	// validateUserspaceShimLivePins (loader_userspace_shim.go) hard-refuses a
 	// ValueSize mismatch against the live pin, so a new daemon never reads an
-	// old helper's 136/184-byte rows — the remediation is a full dataplane
-	// reload, which starts from an empty map.
+	// old helper's 136/184-byte rows — the remediation is `xpfd cleanup` (or a
+	// reboot), which unpins the maps so the next load recreates them at the new
+	// size. NOT a restart: a bpffs pin outlives the process that made it, so
+	// stopping and starting xpfd leaves the old-size pin in place and the
+	// pre-flight refuses again. dataplane.Cleanup() is reachable only from the
+	// `xpfd cleanup` subcommand (cmd/xpfd/main.go).
 	// Consumers MUST fall back to the zone approximation for those (see
 	// sessionFilter.resolveIngressIfaces in pkg/cli), never treat 0 as "matches
 	// nothing" or "matches everything".
@@ -342,7 +398,7 @@ type SessionValueV6 struct {
 	// Until that lands, an interface-filtered SHOW is exact for rows this node
 	// owns and approximate for peer rows. An interface-filtered CLEAR is NOT
 	// exact even when typed on the console: `clearFilteredSessions`
-	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:252`), and
+	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
 	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
 	// (`pkg/grpcapi/server_sessions.go:508-515`, matched at `:578-583` and
 	// `:623-628`). So on zone `[reth0.50, reth0.80]`, clearing `reth0.50`

@@ -976,11 +976,16 @@ reverse-companion repair on the session-hit path (that third row is
 `is_reverse != 0`, which every `show`/`clear` call site skips before filtering,
 so it never surfaces a flow on its own). The ordinary TRANSIT forward
 install does NOT publish there: it calls `publish_live_session_entry`, which
-writes the shim's steering table (`session_map_fd`, a 36-byte key with a
+writes the shim's steering table (`session_map_fd`, a 40-byte key with a
 one-byte action value — a different map from the 144-byte conntrack value),
 plus `publish_shared_session` for the shared/HA maps.
 
-So the identity is stamped on every forward session, but reaches the operator
+So the identity is stamped on every forward session installed from a RECEIVED
+FRAME — the three frame-driven install sites, the only ones with an observed
+binding to copy. (The two forward installs that carry `0`, host-outbound GRE
+and the HA peer import, are not exceptions: neither has an observed local
+ingress. Both are enumerated under "`0` means no ingress identity carried"
+below.) Of those stamps, the identity reaches the operator
 surface only for the host-inbound and missing-neighbor-seed populations, and
 for peer-synced sessions the Go side installs directly. Transit sessions are
 absent from that map entirely — not carrying a zeroed identity, but having no
@@ -1039,16 +1044,40 @@ interface. Porting `resolveIngressIfaces` to them is tracked separately.
 The identity is stamped ONCE and never re-derived from the zone; re-deriving
 is the approximation it exists to remove.
 
+**Fabric ingress: the one path where the zone and the ifindex name DIFFERENT
+interfaces.** A frame arriving over the fabric carries a zone-encoded override
+(`poll_stages.rs`), which takes precedence over the ifindex->zone map in
+`forwarding/mod.rs`, so `ingress_zone` is the ORIGINATING chassis's zone. The
+identity stamp is unconditional and records the LOCAL fabric NIC the frame
+physically arrived on. Neither is wrong — they answer different questions — but
+an exact interface filter follows the ifindex, so the enumeration above is not
+exhaustive without this case.
+
+It is INERT in the shipped topology: the fabric member is declared only under
+`fab0 { fabric-options { member-interfaces { ... } } }` with no unit
+(`docs/ha-cluster-userspace.conf`), and `buildSessionEgressIfaces` keys on
+`{parent ifindex, unit VLAN}` — a unit-less interface produces no entry, so the
+lookup misses and the CLI falls back to the zone exactly as before. Give that
+member a unit and the behaviour changes: on node B,
+`show security flow session interface reth0.50` would stop matching a
+cross-chassis flow it used to reach through the wan zone, and the matching
+`clear` would leave it behind. No test or smoke covers this because the path is
+unreachable from the shipped config, not merely uncovered.
+
 **`0` means "no ingress identity carried" and is never a valid ifindex.** These
 populations legitimately carry `0`, and the CLI falls back to the zone
 approximation for all of them — never "matches nothing" (which would hide them
 from `show`/`clear`), never "matches everything":
 
 1. the REVERSE companion (`poll_descriptor` reverse install, `shared_ops`
-   synthesized companion) — its true ingress is the forward flow's egress
-   interface, unresolved at install. Note the CLI fallback is INERT for this
-   one: every `show`/`clear` call site skips `IsReverse != 0` rows before
-   reaching the filter, so a reverse entry is never interface-matched at all;
+   synthesized companion) — its own ingress has not been OBSERVED yet. The
+   forward flow's egress IS resolved at install (`resolution.egress_ifindex`),
+   so availability is not the reason: it is a PREDICTION of where the reply
+   will arrive rather than an observation of where it did, and routing may be
+   asymmetric, so there is nothing truthful to stamp. Note the CLI fallback is
+   INERT for this one: every `show`/`clear` call site skips `IsReverse != 0`
+   rows before reaching the filter, so a reverse entry is never
+   interface-matched at all;
 2. a PEER-SYNCED session (`server/helpers/session_sync.rs`) — an ifindex is
    NODE-LOCAL, so node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different
    numbers for the same logical RETH member. The identity is deliberately NOT
@@ -1100,7 +1129,12 @@ and the u16 inside the tail pad it forces, so the pair costs 8 bytes, not 16).
 `sessions`/`sessions_v6` are PINNED maps, so — exactly as for the #5460 flags
 widen — a rolling deploy cannot cross this: the pre-flight
 (`validateUserspaceShimLivePins`) refuses while the old daemon still forwards,
-and the remediation is a full dataplane reload with brief downtime. Sizes are
+and the remediation is `xpfd cleanup` (or a reboot) with brief downtime, which
+unpins the maps so the next load recreates them at the new size. Note it is NOT
+a restart: a bpffs pin outlives the process that made it, so stopping and
+starting `xpfd` leaves the old-size pin in place and the pre-flight refuses
+again — `dataplane.Cleanup()` is reachable only from the `xpfd cleanup`
+subcommand. Sizes are
 asserted in lockstep at `afxdp/bpf_map_tests.rs` and
 `pkg/dataplane/bpf_session_value_test.go`.
 

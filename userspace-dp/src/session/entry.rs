@@ -54,14 +54,19 @@ pub(crate) struct SessionMetadata {
     /// These populations legitimately carry `0`:
     ///   - the REVERSE companion — the reply's own ingress has not been
     ///     OBSERVED yet, and routing may be asymmetric, so there is nothing
-    ///     truthful to stamp. (An earlier revision said the forward flow's
-    ///     egress interface "is not resolved at install time". That reason is
-    ///     wrong — the installed decision already carries `egress_ifindex`.
-    ///     The real reason is that the forward egress is a PREDICTION of where
-    ///     the reply will arrive, not an observation of where it did, #6928
-    ///     review.) (the CLI
-    ///     never interface-matches a reverse row anyway: every show/clear call
-    ///     site skips `IsReverse != 0` first);
+    ///     truthful to stamp. (The CLI never interface-matches a reverse row
+    ///     anyway: every show/clear call site skips `IsReverse != 0` first.)
+    ///
+    ///     An earlier revision gave the reason as "the forward flow's egress
+    ///     interface is not resolved at install time". That is FALSE and was
+    ///     retracted in the #6928 review: the decision installed alongside
+    ///     this metadata already carries `resolution.egress_ifindex`, filled
+    ///     in by the FIB / local-delivery / fabric resolvers. The forward
+    ///     egress is available — it is simply the wrong datum, being a
+    ///     PREDICTION of where the reply will arrive rather than an
+    ///     OBSERVATION of where it did. Stamping it would put a confident
+    ///     value on an unobserved binding, which is the failure mode `0`
+    ///     exists to avoid.
     ///   - a PEER-SYNCED session — an ifindex is NODE-LOCAL, so the peer's
     ///     number names a different NIC here. Carrying it across the cluster
     ///     wire would produce a confidently WRONG interface name, strictly
@@ -75,8 +80,11 @@ pub(crate) struct SessionMetadata {
     /// `sessions_v6` are in the shim ABI pre-flight's checked set and a
     /// `ValueSize` mismatch against the live pin is a hard refusal
     /// (`validateUserspaceShimLivePins`), so a new daemon never reads an old
-    /// helper's 136/184-byte rows — the remediation is a full dataplane reload,
-    /// which starts from an empty map.
+    /// helper's 136/184-byte rows — the remediation is `xpfd cleanup` (or a
+    /// reboot), which unpins the maps so the next load recreates them at the
+    /// new size. NOT a restart: a bpffs pin outlives the process that made it,
+    /// so stopping and starting xpfd leaves the old-size pin in place and the
+    /// pre-flight refuses again.
     /// The MISSING-NEIGHBOR seed is NOT among them — it is a published forward
     /// session that outlives the neighbor resolution, so it is stamped from the
     /// frame's `meta` like the two other forward install sites. (Those two are
@@ -86,6 +94,31 @@ pub(crate) struct SessionMetadata {
     /// matching at all. #6928 review.)
     /// The Go consumer falls back to the zone approximation for every zero
     /// (never "matches nothing", never "matches everything").
+    ///
+    /// FABRIC INGRESS is the one population where this field and
+    /// `ingress_zone` name DIFFERENT interfaces, and the enumeration above is
+    /// not exhaustive without it. A frame arriving over the fabric carries a
+    /// zone-encoded override, so `ingress_zone` is the ORIGINATING chassis's
+    /// zone (`poll_stages.rs` `parse_zone_encoded_fabric_ingress_from_frame`,
+    /// given precedence over the ifindex->zone map in `forwarding/mod.rs`),
+    /// while this stamp is unconditional and records the LOCAL fabric NIC the
+    /// frame physically arrived on. Both are correct answers to different
+    /// questions; they simply disagree.
+    ///
+    /// Operator consequence, if the fabric member is ever given a config
+    /// unit: on node B, `show security flow session interface reth0.50` used
+    /// to match a cross-chassis flow through the wan zone and would stop
+    /// doing so, because the exact identity names the fabric NIC instead —
+    /// and the matching `clear` would leave it behind.
+    ///
+    /// It is INERT today: the fabric member is declared only under
+    /// `fab0 { fabric-options { member-interfaces { ... } } }` with no unit
+    /// (`docs/ha-cluster-userspace.conf`), and `buildSessionEgressIfaces`
+    /// keys on `{parent ifindex, unit VLAN}`, so a unit-less interface
+    /// produces no map entry, the lookup misses, and the CLI falls back to
+    /// the zone exactly as before. That is also why no test and no smoke
+    /// would surface it — the path is unreachable from the shipped topology,
+    /// not merely uncovered.
     pub(crate) ingress_ifindex: u32,
     /// #4983: the 802.1Q VLAN id this session's FIRST packet arrived with
     /// (`UserspaceDpMeta::ingress_vlan_id`). 0 means "no VLAN id recorded",

@@ -279,9 +279,12 @@ fn poll_descriptor_transit_install_stamps_ingress_binding_4983() {
 
 /// #4983 OVER-REACH guard, forward/reverse arm separation. The REVERSE
 /// companion installed by the SAME poll call must keep carrying NO ingress
-/// identity: its true ingress is the forward flow's EGRESS interface, which is
-/// not resolved at install time, so stamping the forward frame's binding onto
-/// it would name the wrong side of the flow.
+/// identity: its own ingress has not been OBSERVED yet. The forward flow's
+/// egress is resolved by then (`resolution.egress_ifindex`), so this is not an
+/// availability problem — that value predicts where the reply will arrive
+/// rather than recording where it did, and routing may be asymmetric, so
+/// stamping it (or the forward frame's own ingress) would name a binding
+/// nothing observed.
 ///
 /// This is what makes the pair a distinguishing fixture rather than a
 /// restatement: 11/50 on one entry and 0/0 on the other cannot both be

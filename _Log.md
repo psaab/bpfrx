@@ -77170,3 +77170,124 @@ Every RED above is an assertion failure, not a build break.
 - **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
   userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
   pkg/dataplane/types.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6928 (#4983) round 4 — hostile re-gate MERGE-NEEDS-MINOR at
+  6eca116db. B1 (blocking, second limb: a guard unable to fire) plus B2/B3/B4
+  and five cheap items. One production change: four compile-time offset
+  assertions. Everything else is claim correction.
+
+  **B1 — the Rust half of the ABI offset guard did not exist.** CONFIRMED
+  FIRSTHAND before writing anything: swapping the declaration order of
+  `ingress_ifindex` / `ingress_vlan_id` in BOTH `BpfSessionValueV4` and
+  `BpfSessionValueV6` puts the u16 at 136/184 and the u32 at 140/188 while
+  `size_of` stays 144/192, so `bpf_conntrack_struct_sizes_match_c` reports
+  **ok** and the crate suite passes. The Go half genuinely binds; only the
+  Rust side was open, and its consequence is the helper writing the VLAN id
+  where Go reads the ifindex — `{ifindex 24, VLAN 80}` becomes
+  `IngressIfindex=80, IngressVlanID=24`, the name lookup misses and every row
+  degrades to the zone, or names the WRONG NIC on a box that really has an
+  ifindex 80. Fixed with four `const _: [(); N] = [(); offset_of!(..)]`
+  assertions beside the structs, the same idiom `UserspaceDpMeta` already uses.
+
+  ONE CORRECTION TO THE FINDING, measured not argued: the transposed tree did
+  NOT come back fully green for me. `slowpath::tests::enqueue_refuses_frame_
+  above_live_mtu` failed once with "slow-path worker is not running". That is
+  a worker-startup flake under parallel load, not a layout consequence: on the
+  SAME transposed tree the test passes 6/6 when run alone, each run verified
+  to have actually executed (`ran=1`, verdict `ok`) rather than filtered out.
+  Reported rather than quietly folded, because "the whole suite stayed green"
+  is the evidence B1 rests on and it was 4278/1 here, not 4280/0.
+
+  **B2 — the retracted reverse-companion reason survived in 7 places.**
+  Verified all seven verbatim first; the brief was accurate. Also verified the
+  CORRECTION before propagating it into a shipped ABI header:
+  `ForwardingResolution::egress_ifindex` really is populated by the FIB,
+  local-delivery and fabric resolvers, and the reverse install sits in the same
+  scope as the forward decision — so "not resolved at install time" is false,
+  and the true reason is that the forward egress PREDICTS where the reply will
+  arrive rather than recording where it did (and routing may be asymmetric).
+  One phrasing now used at all eight sites (the seven plus the entry.rs SSOT,
+  whose parenthetical had become unreadable).
+
+  **B3 — a false universal at three sites.** Verified both counter-examples
+  carry `is_reverse: false` with `ingress_ifindex: 0`: `tunnel.rs` (literal
+  `is_reverse: false`) and `session_sync.rs` (`is_reverse: req.is_reverse`, so
+  a forward import lands there). Reworded to "every forward session installed
+  FROM A RECEIVED FRAME — the three frame-driven install sites", and both
+  counter-examples are now named as instances of the rule rather than
+  exceptions to it: neither has an observed local ingress to copy.
+
+  **B4 — the enumeration omitted fabric ingress**, the one population where
+  the zone and the ifindex name DIFFERENT interfaces. Verified the mechanism
+  (`poll_stages.rs` parses a zone-encoded override; `forwarding/mod.rs` gives
+  it precedence over the ifindex->zone map) and the inertness claim: the
+  fabric member appears in `docs/ha-cluster-userspace.conf` only under
+  `fab0 { fabric-options { member-interfaces { ge-0/0/0; } } }` with NO unit,
+  and the name map keys on `{parent ifindex, unit VLAN}`, so it has no entry
+  and the lookup falls back to the zone. Documented in entry.rs, types.go
+  (both families) and the README, including what changes if that member is
+  ever given a unit — and that the path is unreachable from the shipped
+  topology rather than merely uncovered, which is why no test or smoke sees it.
+
+  **Cheap items, each verified rather than taken on trust.** The shim steering
+  key: compiled the `#[repr(C)]` shape standalone, `size=40 align=2`, so
+  README's "36-byte key" is corrected to 40. The tail pad: 4 and 2 are the same
+  layout described from either end (the append grew the struct 136->140->144, a
+  4-byte pad; the u16 lands inside it at 140, leaving 2 unused), now stated once
+  in the header so a reader diffing it against `bpf_map_tests.rs` does not read
+  one as a bug. `cli_clear.go`: the peer-clear call is at :251, cited as :252
+  at two sites. The ABI remediation: `dataplane.Cleanup()` is reachable only
+  from the `xpfd cleanup` subcommand (`cmd/xpfd/main.go`), so "a full dataplane
+  reload" was wrong — a bpffs pin outlives the process, and a restart leaves
+  the old-size pin in place for the pre-flight to refuse again. Corrected at
+  three sites. And `session_sync.rs`, the only zero site with no rationale,
+  now has one.
+
+  NOT fixed here, by instruction: the #1917 in-place `xpfd upgrade` path
+  appears not to call `Cleanup()`, so an ABI flag day may not release the pin
+  on that path. The maintainer is filing it separately.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/server/helpers/session_sync.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  bpf/headers/xpf_conntrack.h, pkg/dataplane/types.go,
+  pkg/cli/session_filter.go, _Log.md
+- **Validation**: B1 is a two-cell proof, and the RED is a BUILD failure at the
+  assertion rather than a test failure.
+
+  GREEN cell — assertions present, layout untouched: `cargo build --release`
+  exit 0, zero errors. That is also the evidence the asserted numbers are the
+  real ones rather than copied hopefully from the C header.
+
+  RED cell — same tree, the two fields' declaration order swapped in both
+  structs: exit 101, and the ONLY errors are the four assertions, each naming
+  its field and both offsets:
+
+      error[E0308]: mismatched types
+        --> src/afxdp/bpf_map/mod.rs:292:22
+      expected an array with a size of 136, found one with a size of 140
+      expected an array with a size of 140, found one with a size of 136
+      expected an array with a size of 184, found one with a size of 188
+      expected an array with a size of 188, found one with a size of 184
+
+      error: could not compile `xpf-userspace-dp` due to 4 previous errors
+
+  Four errors, four assertions, no incidental breakage — the guard fires for
+  the reason claimed.
+
+  A harness note worth keeping: the first restore wiped the new assertions.
+  The probe restored with `git checkout --`, which reverts to HEAD, and the
+  assertions were uncommitted work in the same file — the documented
+  restore-from-HEAD trap, hit anyway. Rewritten to restore from a
+  pre-mutation snapshot and to assert afterwards that BOTH the two field
+  declarations and the four assertions are present, so a restore that
+  silently drops the fold's own edits fails loudly instead.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/` both ok;
+  `go test ./pkg/refactoraudit/` ok; `cargo test --release` exit 0 —
+  4279 passed / 0 failed plus 60, 8, 22, 31, 1, 2 passed and 0 failed.
+  `userspace-xdp/` is untouched, so the shim `.o` and its manifest are
+  unchanged and no `make generate` is owed.

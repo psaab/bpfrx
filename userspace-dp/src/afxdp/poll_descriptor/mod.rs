@@ -2759,11 +2759,15 @@ pub(super) fn poll_binding_process_descriptor(
                                     let reverse_metadata = SessionMetadata {
                                         ingress_zone: to_zone_id,
                                         egress_zone: from_zone_id,
-                                        // #4983: the reverse companion has NO ingress identity of its own. Its
-                                        // real ingress is the FORWARD flow's egress interface, which is not
-                                        // resolved at install time, and stamping the forward frame's ingress
-                                        // here would name the wrong side. Left 0 = "no identity carried"; the
-                                        // Go filter falls back to the zone approximation for it.
+                                        // #4983: the reverse companion has NO ingress identity of its own —
+                                        // the reply's ingress has not been OBSERVED yet, and routing may be
+                                        // asymmetric, so there is nothing truthful to stamp. Note the forward
+                                        // flow's egress IS available here (`decision.resolution.egress_ifindex`,
+                                        // resolved above); it is simply the wrong datum, being a prediction of
+                                        // where the reply will arrive rather than an observation of where it
+                                        // did. Stamping either it or the forward frame's own ingress would put
+                                        // a confident value on an unobserved binding. Left 0 = "no identity
+                                        // carried"; the Go filter falls back to the zone approximation.
                                         ingress_ifindex: 0,
                                         ingress_vlan_id: 0,
                                         owner_rg_id,

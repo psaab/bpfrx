@@ -234,6 +234,17 @@ pub(crate) fn build_synced_session_entry(
             },
         },
         metadata: crate::session::SessionMetadata {
+            // #4983: a peer-imported session carries NO ingress identity, and
+            // this is deliberate rather than unfinished. An ifindex is
+            // NODE-LOCAL -- node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are
+            // different numbers for the same logical RETH member -- so the
+            // originating node's value would name a different NIC here. It is
+            // therefore not put on the cluster wire at all, and 0 is the
+            // honest answer: the Go consumer falls back to the zone
+            // approximation, which is approximate but never confidently wrong.
+            // Note this install is `is_reverse: req.is_reverse`, so a FORWARD
+            // peer session lands here with 0 too -- see the scope note in
+            // pkg/dataplane/types.go.
             ingress_ifindex: 0,
             ingress_vlan_id: 0,
             // #919: prefer the wire u16 IDs when populated; fall back

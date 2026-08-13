@@ -72,8 +72,10 @@ struct session_value {
 	 * on -- the session's TRUE ingress-interface identity, stamped once at
 	 * install and never re-derived. Distinct from fib_ifindex above, which
 	 * is the resolved EGRESS. 0 means "no ingress identity carried" and is
-	 * NOT a valid ifindex: the reverse companion (whose real ingress is the
-	 * forward flow's egress, unknown at install), an HA peer-synced session
+	 * NOT a valid ifindex: the reverse companion (whose own ingress has not
+	 * been OBSERVED yet -- the forward flow's egress is known at install but
+	 * is a PREDICTION of where the reply will arrive, not an observation of
+	 * where it did, and routing may be asymmetric), an HA peer-synced session
 	 * (an ifindex is node-local -- the peer's number names a different NIC
 	 * here), and any pre-#4983 helper all leave it 0. Consumers MUST treat
 	 * 0 as "fall back to the zone approximation", never as "matches
@@ -83,8 +85,16 @@ struct session_value {
 	 * for untagged. Paired with ingress_ifindex it names the LOGICAL ingress
 	 * unit -- the same {parent ifindex, vlan} identity the egress side is
 	 * already resolved by (fib_ifindex/fib_vlan_id), so two units of one
-	 * trunk NIC are distinguishable. The struct tail-pads 2 bytes to its
-	 * 8-byte alignment: sizeof grows 136 -> 144, not 136 -> 152. */
+	 * trunk NIC are distinguishable.
+	 *
+	 * Padding, stated once so the figures elsewhere agree: appending
+	 * ingress_ifindex at the old 136/184 tail took the struct to 140/188, and
+	 * the 8-byte alignment padded it to 144/192 -- a 4-byte growth.
+	 * ingress_vlan_id then lands INSIDE that pad at 140/188, leaving 2 unused
+	 * bytes after it. So "4 bytes of tail pad" (the growth the append cost,
+	 * as bpf_map_tests.rs and the Rust mirror put it) and "2 bytes of tail
+	 * pad" (what remains unused) describe the SAME layout from either end.
+	 * sizeof grows 136 -> 144, not 136 -> 152. */
 	__u16 ingress_vlan_id;
 };
 

@@ -265,6 +265,36 @@ struct BpfSessionValueV6 {
     ingress_vlan_id: u16,
 }
 
+// #4983: WHERE the ingress-identity pair sits, not just how big the struct is.
+//
+// `bpf_conntrack_struct_sizes_match_c` cannot see a REORDER. Swapping the two
+// fields in both structs puts the u16 at 136/184 and the u32 at 140/188, and
+// `size_of` stays 144/192 — so the size test passes and the whole crate suite
+// passes. That was measured, not reasoned: the transposed tree ran the full
+// suite green. Nothing else catches it either — the
+// `build_conntrack_value_stamps_ingress_identity_*` tests compare struct
+// FIELDS, so they are transposition-blind by construction, and the C header
+// has no compiled consumer on this side.
+//
+// What a transposition costs at runtime: this helper writes the VLAN id where
+// Go reads the ifindex. A host-inbound session on {parent ifindex 24, VLAN 80}
+// goes onto the map as ifindex=80/vlan=24, Go lifts it as
+// IngressIfindex=80/IngressVlanID=24, `ifaceNamesByKey[{80,24}]` misses, and
+// every row silently degrades to the zone approximation — and on a box that
+// really does have an ifindex 80, the CLI names the WRONG NIC instead. Both
+// numbers are plausible, so nothing surfaces as an error.
+//
+// These are compile-time, so a transposition is a BUILD failure rather than a
+// test failure. The offsets are the ones C writes
+// (`bpf/headers/xpf_conntrack.h`), and they are the same four the Go mirror
+// pins in `TestBPFSessionValueIngressIdentityOffsets`
+// (`pkg/dataplane/bpf_session_value_test.go`) — three sides, one set of
+// numbers. Same idiom as `UserspaceDpMeta` in `afxdp/types/mod.rs`.
+const _: [(); 136] = [(); std::mem::offset_of!(BpfSessionValueV4, ingress_ifindex)];
+const _: [(); 140] = [(); std::mem::offset_of!(BpfSessionValueV4, ingress_vlan_id)];
+const _: [(); 184] = [(); std::mem::offset_of!(BpfSessionValueV6, ingress_ifindex)];
+const _: [(); 188] = [(); std::mem::offset_of!(BpfSessionValueV6, ingress_vlan_id)];
+
 /// Session flag constants matching C SESS_FLAG_* defines. `u16` because the
 /// `session_value.flags` field is `__u16` (SESS_FLAG_NPTV6 is bit 8, #5460).
 const SESS_FLAG_SNAT: u16 = 1 << 0;
