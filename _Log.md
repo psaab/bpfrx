@@ -80339,3 +80339,48 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13T15:52Z
+- **Action**: #6722 round 7 — the RETH-projection predicate's case split is FOUR-way,
+  not two, and the two uncovered rows were REACHABLE. `rethProjectionMembers`
+  (pkg/dataplane/userspace/interfaces.go) compares `snapshotLinuxName(parent)` against
+  `snapshotLinuxName(candidate)`, and that function resolves a `reth*` name through
+  `ResolveReth` and any other name through `LinuxIfName`, so EITHER side takes EITHER
+  arm: (reth,non-reth), (non-reth,non-reth), (reth,reth), (non-reth,reth). Rounds 4-6
+  argued the first two and called the reduction exhaustive. Measured at 195fcad51
+  driving the real `CompileConfig` + real `buildInterfaceSnapshots`, with
+  origin/master (edefb7570) as the control on the same configs: row 3
+  (`reth1 gigether-options redundant-parent reth0`) is ACCEPTED strict, gives
+  `RethToPhysical[reth0] = reth1`, S(reth0) = S(reth1) = "reth1", and marks reth1 —
+  the L3 owner — a projection of reth0; row 4 (the two-cycle `ge-0/0/1
+  redundant-parent reth1` beside `reth1 redundant-parent ge-0/0/1`) is ACCEPTED strict
+  and marks BOTH rows of the one ifindex. Master accepts both and marks nothing, so
+  each is an ifindex that was AMBIGUOUS (fail-closed at the 0 sentinel) now resolving
+  a zone. A third shape, `reth1 redundant-parent ge-0/0/1` without the cycle, marks
+  nothing but splits the resolvers: `ResolveKernelIfName` reads `RethToPhysical`
+  ungated for a dotted ref, so `ge-0/0/1.0` displays as `reth1` while the dataplane
+  binds `ge-0-0-1` (master shares this). Fixed at the COMMIT GATE, not with a fourth
+  predicate conjunct: `validateRethMemberStrict` gains a clause rejecting any `reth*`
+  interface that declares a `gigether-options redundant-parent`, placed after the
+  self-parent clause so that message is unchanged and testing the same
+  `strings.HasPrefix(name, "reth")` `snapshotLinuxName` uses. That empties rows 3 and
+  4 structurally — the loop only sees candidates that declare a redundant-parent, so
+  no candidate is ever a `reth*` name and the candidate side is unconditionally
+  `LinuxIfName(name)`. Not widened to "a redundant-parent must NAME a reth", which
+  would also close row 2 and thereby retire cell K, the only fixture binding the #5832
+  cross-gate dependency. New cells L (three strict rejections + tolerant-admit halves
+  + a control that the ordinary bondless membership on the same two names still
+  compiles and is still marked) and M (what the tolerant path does with rows 3/4, and
+  the bound: the silenced row has no units and no zone). Validation: neutering the new
+  clause reds exactly L1/L2/L3 with H/I/K green; neutering the SELF clause still reds
+  H1, so the new clause did not take over its fixture. go build/vet/test ./... pass;
+  cargo test --release passes. Merged origin/master (union-resolved `_Log.md`, both
+  sides pure insertions, predicted 1589 headings / 3005 entries and got exactly that)
+  and refreshed the LOC-only drift in docs/refactoring-audit-current.txt that this
+  branch's own compiler_opts.go growth introduced.
+- **File(s)**: pkg/config/compiler_validate_strict_reth_member.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  docs/userspace-dataplane-architecture.md, docs/refactoring-audit-current.txt,
+  _Log.md
