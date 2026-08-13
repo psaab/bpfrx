@@ -949,6 +949,23 @@ Scope of the fallback:
   and still vote (`reth_exemption_does_not_leak_to_iface_tunnel_units_6722`), and
   `fab0` is not a fourth mechanism at all: the fabric IPVLAN is its own netdev
   with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`).
+- The exemption requires a **parent ROW on the same ifindex**, not merely the
+  parent's NAME. `redundant_parent` is an unvalidated operator string: nothing
+  requires the interface it names to exist, to be a `reth*`, or to resolve back
+  to the row carrying it, and `schema_interfaces.go` accepts `gigether-options`
+  under any interface name. So `!redundant_parent.is_empty()` means "this
+  interface mentioned a redundant-parent", which is not the same claim as "this
+  row is a projection of another row's netdev" — and the operator controls the
+  difference. Measured: `set interfaces st0 gigether-options redundant-parent
+  reth1` is accepted by strict `CompileConfig`, and a name-only gate would then
+  silence `st0.0`'s vote and resolve `vpnb` for a unit deliberately left
+  unzoned, re-opening #6722 on the very shape the sentence above guards. A
+  dangling parent does the same on a physical interface, where master answers
+  `0` — so a name-only gate would be a REGRESSION, not merely a weaker fix.
+  Requiring a co-resident row named `<parent>` or `<parent>.<unit>` is what
+  makes the two claims above true rather than aspirational
+  (`dangling_redundant_parent_does_not_exempt_a_genuine_observer_6722` reds if
+  that requirement is dropped, and it is the only test that does).
 
   The field is additive in both directions — `omitempty` on the Go side,
   `#[serde(default)]` on the Rust side, and no `deny_unknown_fields` anywhere in

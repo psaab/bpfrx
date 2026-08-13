@@ -77802,3 +77802,37 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+## 2026-08-12 — #6722 B1: the projection gate must require a parent ROW
+
+- **Action**: narrowed the RETH-member ledger exemption from
+  `!redundant_parent.is_empty() && zone.is_empty()` to additionally require a
+  co-resident row named `<parent>` or `<parent>.<unit>` on the same ifindex.
+  Added the missing over-reach control and corrected the two universal claims
+  the narrow gate had made false.
+- **Why**: `redundant_parent` is an unvalidated operator string. No compiler
+  pass requires the named interface to exist, to be a `reth*`, or to resolve
+  back to the row carrying it, and `schema_interfaces.go` accepts
+  `gigether-options` under any interface name. The name-only gate therefore
+  exempted rows that are not projections. Measured: `set interfaces st0
+  gigether-options redundant-parent reth1` is ACCEPTED by strict
+  `CompileConfig`, silences `st0.0`'s dissenting vote, and flips
+  `egress_zone_id` from the fail-closed `0` to `vpnb` — re-opening the exact
+  #6722 fail-open on the shape
+  `reth_exemption_does_not_leak_to_iface_tunnel_units_6722` guards. A dangling
+  parent on a physical interface does the same, and there master answers `0`,
+  so the name-only form REGRESSED master rather than merely under-fixing.
+- **Evidence**: reverting only the parent-row requirement reds exactly one
+  test — the new control — as an assertion (rc=101, 0 `error[E…]` lines,
+  13 passed / 1 failed). Every other 6722 test stays green under that
+  mutation, including the B2 binder
+  `unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722`, so the
+  narrowing does not weaken what route B fixed and the new control is the only
+  thing that distinguishes the two gates. Full `cargo test --release` 4420
+  passed / 0 failed; `go build ./...` rc=0; rustfmt clean inside both edited
+  ranges (the remaining crate diffs at :100/:428/:480/:513 are pre-existing and
+  untouched — no crate-wide `cargo fmt` was run).
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/interfaces.rs`,
+  `userspace-dp/src/afxdp/test_fixtures.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`

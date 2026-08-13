@@ -44,6 +44,25 @@ pub(super) fn populate_interfaces(
     // the walk, because a conflict can be introduced by ANY later row.
     let mut zone_agreement: BTreeMap<i32, Option<u16>> = BTreeMap::new();
 
+    // #6722 B1: every row name that lands on each ifindex, so the projection
+    // gate below can require a real parent row rather than trusting the
+    // `redundant_parent` string. Built in a pre-pass because a projection's
+    // parent row can be emitted either before or after it — the Go builder
+    // walks names sorted, so `ge-0/0/1` precedes `reth1` but `st0` does not
+    // precede `reth1`, and a gate that only looked backwards would be
+    // order-dependent. Rows are 2-3 per ifindex, so the linear scan below is
+    // cheaper than another map.
+    let mut names_by_ifindex: BTreeMap<i32, Vec<&str>> = BTreeMap::new();
+    for iface in &snapshot.interfaces {
+        if iface.ifindex <= 0 {
+            continue;
+        }
+        names_by_ifindex
+            .entry(iface.ifindex)
+            .or_default()
+            .push(iface.name.as_str());
+    }
+
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -163,8 +182,46 @@ pub(super) fn populate_interfaces(
         // of them — the fabric IPVLAN is its own netdev with its own ifindex
         // (`snapshotLinuxName` never calls `ResolveFab`), so it never shares
         // one with its physical parent.
-        let row_is_reth_member_projection =
-            !iface.redundant_parent.is_empty() && iface.zone.is_empty();
+        // The gate requires a PARENT ROW, not just the parent's NAME. #6722 B1:
+        // `redundant_parent` is an unvalidated operator string. The Go builder
+        // copies it onto every row of any interface carrying `gigether-options
+        // redundant-parent` (`interfaces.go:245`, `:318`), and no compiler pass
+        // requires the named parent to exist, to be a `reth*`, or to resolve
+        // back to this interface — `schema_interfaces.go` accepts
+        // `gigether-options` under ANY interface name, and grepping
+        // `compiler_validate_strict*.go` / `*_warn*.go` for it returns nothing.
+        //
+        // So `!redundant_parent.is_empty()` means "this interface MENTIONED a
+        // redundant-parent", which is not the same as "this row is a projection
+        // of another row's netdev" — and the operator controls the difference.
+        // Measured: `set interfaces st0 gigether-options redundant-parent reth1`
+        // is ACCEPTED by strict `CompileConfig`, and without the parent-row
+        // requirement it silences `st0.0`'s vote and flips `egress_zone_id`
+        // from the fail-closed 0 to a resolved zone — re-opening the exact
+        // fail-open this exemption was written to close, on the very shape
+        // `reth_exemption_does_not_leak_to_iface_tunnel_units_6722` guards.
+        // A dangling parent (`reth1` never defined) does the same, and there
+        // master answers 0, so the unguarded form would REGRESS master.
+        //
+        // Requiring a co-resident row named `<parent>` or `<parent>.<unit>`
+        // encodes the actual invariant: this netdev is described by another
+        // row that IS the parent. That is what makes the projection a
+        // projection. `other != iface.name` keeps a self-referential
+        // `redundant-parent` naming its own interface from matching itself.
+        // Checked here rather than in Go because this function already treats
+        // the helper boundary as a fail-closed backstop (#2391/#2409/#2706),
+        // so the gate stays sound against a drifted or hostile snapshot.
+        let row_is_reth_member_projection = !iface.redundant_parent.is_empty()
+            && iface.zone.is_empty()
+            && names_by_ifindex.get(&iface.ifindex).is_some_and(|names| {
+                names.iter().any(|other| {
+                    *other != iface.name.as_str()
+                        && (*other == iface.redundant_parent.as_str()
+                            || other
+                                .strip_prefix(iface.redundant_parent.as_str())
+                                .is_some_and(|rest| rest.starts_with('.')))
+                })
+            });
         if !row_is_reth_member_projection {
             match zone_agreement.entry(iface.ifindex) {
                 std::collections::btree_map::Entry::Vacant(slot) => {

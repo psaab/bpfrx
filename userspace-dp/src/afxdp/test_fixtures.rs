@@ -1187,6 +1187,44 @@ pub(super) fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
     }
 }
 
+/// #6722 B1 OVER-REACH: the sibling-tunnel shape with `redundant-parent`
+/// added, and NO parent row on the ifindex.
+///
+/// ```text
+/// set interfaces st0 gigether-options redundant-parent reth1   # <-- the one line
+/// set interfaces st0 unit 0 family inet address 10.5.5.1/30
+/// set interfaces st0 unit 1 family inet address 10.6.6.1/30
+/// set security zones security-zone vpnb interfaces st0.1
+/// set security policies default-policy deny-all
+/// ```
+///
+/// Strict `CompileConfig` ACCEPTS this: `schema_interfaces.go` allows
+/// `gigether-options` under any interface name, and no validator requires the
+/// named parent to exist, to be a `reth*`, or to resolve back here. The Go
+/// builder then copies the string onto the base row AND every unit row, so
+/// `st0` and `st0.0` both carry `redundant_parent: "reth1"` while no row named
+/// `reth1` exists anywhere.
+///
+/// This is the exact shape that made the first spelling of the exemption
+/// (`!redundant_parent.is_empty() && zone.is_empty()`) re-open the #6722
+/// fail-open: `st0.0`'s dissenting vote was silenced, the ledger resolved
+/// `vpnb`, and traffic out a unit the operator deliberately left unzoned
+/// adjudicated into a zone. Requiring a co-resident PARENT ROW is what keeps
+/// it at the 0 sentinel.
+pub(super) fn dangling_redundant_parent_tunnel_snapshot_6722() -> ConfigSnapshot {
+    let mut snapshot = sibling_tunnel_units_snapshot_6722();
+    for iface in &mut snapshot.interfaces {
+        // The Go builder stamps the base row and its units alike; `st0.1` is on
+        // its own ifindex and carries it too, which is deliberate here — it
+        // must not become exempt either (it is zoned, so the `zone.is_empty()`
+        // half already stops it, and this fixture keeps that honest).
+        if iface.name == "st0" || iface.name.starts_with("st0.") {
+            iface.redundant_parent = "reth1".to_string();
+        }
+    }
+    snapshot
+}
+
 /// UNAMBIGUOUS shared ifindex — #6713 in its plainest deployed spelling.
 ///
 /// ```text

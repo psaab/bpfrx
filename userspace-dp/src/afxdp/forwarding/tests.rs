@@ -6032,3 +6032,52 @@ fn reth_exemption_does_not_leak_to_iface_tunnel_units_6722() {
     );
     assert_eq!(result.action, PolicyAction::Deny);
 }
+
+/// #6722 B1 OVER-REACH control 3: `redundant_parent` naming an interface that
+/// has NO row on this ifindex must NOT exempt anything.
+///
+/// This is the control the first spelling of the exemption did not have, and
+/// the reason it was wrong. `!redundant_parent.is_empty() && zone.is_empty()`
+/// trusts an operator string: `set interfaces st0 gigether-options
+/// redundant-parent reth1` is accepted by strict `CompileConfig` (nothing
+/// validates that `reth1` exists, is a `reth*`, or resolves back to `st0`),
+/// and the Go builder then copies it onto `st0` and `st0.0` alike. Under the
+/// unguarded gate `st0.0`'s dissenting vote was silenced, the ledger resolved
+/// `vpnb`, and transit out a unit the operator deliberately left in NO zone
+/// adjudicated INTO a zone -- the exact fail-open #6722 exists to close, in
+/// the exact shape control 2 above is written to guard.
+///
+/// The distinguishing property is a co-resident PARENT ROW. There is none here
+/// (`reth1` appears nowhere), so both rows must vote and the ifindex must stay
+/// ambiguous. Drop the parent-row requirement from the gate and this test reds
+/// while every other 6722 test stays green.
+///
+/// Its own `#[test]` body, for the same reason as controls 1 and 2.
+#[test]
+fn dangling_redundant_parent_does_not_exempt_a_genuine_observer_6722() {
+    let state = build_forwarding_state(&dangling_redundant_parent_tunnel_snapshot_6722());
+
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&SHARED_TUNNEL_IFINDEX_6722),
+        "no row named `reth1` shares this ifindex, so `st0.0` is not a \
+         projection of anything -- it is a genuine unzoned logical unit and \
+         must still make the ifindex ambiguous"
+    );
+    assert_eq!(
+        state.egress_zone_id(SHARED_TUNNEL_IFINDEX_6722),
+        0,
+        "the egress half must refuse to hand st0.0 its sibling's zone just \
+         because the operator typed a redundant-parent that resolves to nothing"
+    );
+
+    let (to_id, result) =
+        adjudicate_lan_transit_6722(&state, "192.168.99.7", SHARED_TUNNEL_IFINDEX_6722);
+    assert_eq!(to_id, 0, "to-zone must be the 0 sentinel");
+    assert_ne!(
+        to_id, TEST_SIBLING_VPN_ZONE_ID_6722,
+        "specifically NOT `vpnb` -- one config line must not re-open #6722"
+    );
+    assert_eq!(result.action, PolicyAction::Deny);
+}
