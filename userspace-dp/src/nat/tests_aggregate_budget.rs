@@ -949,10 +949,72 @@ fn nat_pool_grammar_parity_fixture() {
             "expand_pool_address({addr:?}) expanded {} addresses, want {want_hosts}              (the aggregate budget charges this count and the allocator sizes an              occupancy bitmap from it)",
             v4.len() + v6.len(),
         );
+
+        // #6812 B2: WHICH addresses, not just how many. A missing or wrong
+        // network-base mask changes the address SET while leaving the count
+        // identical, so the cardinality assertion above is blind to it — and
+        // round 3 replaced `IpNet::network()` with a hand-rolled mask, so this
+        // is exactly the line that needed a witness. Deleting both masks left
+        // the whole crate green before these assertions existed.
+        let expanded: Vec<String> = v4
+            .iter()
+            .map(|a| a.to_string())
+            .chain(v6.iter().map(|a| a.to_string()))
+            .collect();
+        if let Some(want_first) = case["first"].as_str() {
+            assert_eq!(
+                expanded.first().map(String::as_str),
+                Some(want_first),
+                "expand_pool_address({addr:?}) starts at {:?}, want {want_first:?} — the prefix was not masked to its network base",
+                expanded.first(),
+            );
+        }
+        if let Some(want_last) = case["last"].as_str() {
+            assert_eq!(
+                expanded.last().map(String::as_str),
+                Some(want_last),
+                "expand_pool_address({addr:?}) ends at {:?}, want {want_last:?}",
+                expanded.last(),
+            );
+        }
+        if let Some(want_all) = case["expanded"].as_array() {
+            let want: Vec<&str> = want_all
+                .iter()
+                .map(|v| v.as_str().expect("expanded entries are strings"))
+                .collect();
+            let got: Vec<&str> = expanded.iter().map(String::as_str).collect();
+            assert_eq!(
+                got, want,
+                "expand_pool_address({addr:?}) produced a different address SET; an unmasked prefix translates from addresses the operator never configured",
+            );
+        }
     }
     assert!(
         accepted >= 10,
         "fixture exercises only {accepted} accepted members; the table must carry          both verdicts or an expander that refuses everything would pass",
+    );
+    // #6812 B2 non-vacuity: the address-set assertions above are all
+    // conditional, so a fixture that dropped every annotation would pass
+    // silently — which is the state this finding was reported in.
+    let annotated = cases
+        .iter()
+        .filter(|c| !c["first"].is_null() || !c["expanded"].is_null())
+        .count();
+    assert!(
+        annotated >= 8,
+        "only {annotated} rows pin an expanded address range; the mask has no witness",
+    );
+    let host_bits_rows = cases
+        .iter()
+        .filter(|c| {
+            let a = c["addr"].as_str().unwrap_or("");
+            matches!(a, "10.0.0.1/24" | "203.0.113.10/28" | "2001:db8::ffff/120")
+                && (!c["first"].is_null() || !c["expanded"].is_null())
+        })
+        .count();
+    assert_eq!(
+        host_bits_rows, 3,
+        "the three HOST-BITS-SET rows are the only ones where a missing mask changes the answer; all three must carry an address-set assertion",
     );
 }
 
@@ -1170,4 +1232,66 @@ fn incremental_applies_cannot_creep_past_the_cap_6812() {
         2,
         "only two 80-slot pools fit a 200-slot budget; the live set must stop growing",
     );
+}
+
+/// #6812 B1: declining to poison a leading-zero member on the TOLERANT path
+/// does NOT restore translation — the runtime refuses it on its own.
+///
+/// This settles a migration option that was on the table for round 4: leave the
+/// narrowing at strict commit, and let the tolerant / peer-sync builder ship
+/// what it shipped at the merge base, so a persisted config keeps working. The
+/// option is only coherent if the RUNTIME still accepts the member. It does
+/// not, since round 3: `expand_pool_address` parses the CIDR address half with
+/// `std::net::IpAddr`, which refuses a leading-zero octet.
+///
+/// So a snapshot with `pool_unusable: false` — exactly what that option
+/// produces — still fails closed here, with `InvalidPool` reached by the parse
+/// loop itself rather than decoded from the Go verdict. Not poisoning is
+/// therefore not a migration strategy on its own; it would have to be bundled
+/// with reverting the round-3 narrowing, and that end state is the one the
+/// #5875 doctrine forbids: `ipnet` silently resolves the octal-ambiguous
+/// literal to its decimal reading and the pool translates from addresses that
+/// are not the ones `show configuration` displays.
+#[test]
+fn declining_to_poison_a_leading_zero_member_does_not_restore_it_6812() {
+    let snap = SourceNATRuleSnapshot {
+        pool_unusable: false,
+        pool_unusable_reason: String::new(),
+        ..pool_snap("r0", "p0", &["010.0.0.0/24"], SMALL_LOW, SMALL_HIGH)
+    };
+    assert!(
+        !snap.pool_unusable,
+        "precondition: the fixture models a builder that did NOT poison the pool",
+    );
+
+    reset_port_allocator_build_count();
+    let rules = parse_with_test_budget(&[snap], None);
+
+    assert_eq!(
+        rules[0].pool_failure,
+        Some(SourceNatFailureReason::InvalidPool),
+        "an unpoisoned leading-zero member must still fail closed at the runtime: \
+         leaving the tolerant builder alone cannot rescue this class",
+    );
+    assert_eq!(
+        rules[0].pool_addresses_v4.len() + rules[0].pool_addresses_v6.len(),
+        0,
+        "the member expanded to nothing, so there is no pool to translate from",
+    );
+    assert_eq!(
+        port_allocator_build_count(),
+        0,
+        "and no bitmap is built for it",
+    );
+
+    // Control: the SAME shape with the canonical spelling installs normally, so
+    // the refusal above is about the leading zero and not about the fixture.
+    reset_port_allocator_build_count();
+    let ok = parse_with_test_budget(
+        &[pool_snap("r0", "p0", &["10.0.0.0/29"], SMALL_LOW, SMALL_HIGH)],
+        None,
+    );
+    assert_eq!(ok[0].pool_failure, None);
+    assert_eq!(ok[0].pool_addresses_v4.len(), 8);
+    assert_eq!(port_allocator_build_count(), 1);
 }

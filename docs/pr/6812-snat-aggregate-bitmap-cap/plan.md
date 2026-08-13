@@ -565,3 +565,112 @@ reorders at **n=13**. The new fixture therefore uses 20 rule-sets interleaved
 across two tiers, and `sort.SliceStable -> sort.Slice` reds it with
 `charge order[0] = if05, want if00`. A second test puts a budget boundary
 between two same-tier rule-sets so the property decides which pool survives.
+
+## Round 4 amendment — a mask with no witness, and an option that is not one
+
+Two items arrived after round 4 was pushed. Both verified independently.
+
+### B2 — the round-3 network-base mask was bound by nothing
+
+Deleting BOTH masks from `expand_pool_address` left the whole crate green,
+including the two parity tests that carry the claim. The reason is structural:
+**the shared fixture asserted VERDICT and HOST COUNT, and a missing mask changes
+WHICH addresses are produced, never HOW MANY.** The two rows added for exactly
+this case carried the claim in a `note` string that no assertion read; every
+CIDR pool-address literal elsewhere in the crate is network-aligned, a
+`/32`/`/128`, or over-cap, so nothing pre-existing could see it either.
+
+The shipped mask is correct — that was verified — so nothing is wrong in
+production. It blocked because it is a coverage hole on a line THIS round
+rewrote (it replaced `IpNet::network()`), and because a comment asserted the
+opposite:
+
+> "A verdict-only table would not catch a masking or off-by-one drift on either
+> side (the round-3 Rust rewrite replaced IpNet::network() with its own mask)."
+
+That sentence is measured false and is corrected in place.
+
+Fixed by giving the fixture an address-SET dimension: optional `first` / `last`
+/ `expanded` fields, asserted Rust-side (where the expansion happens), with the
+Go side cross-checking that a row cannot contradict itself. Eleven rows carry
+one, including all three where host bits are set — the only rows where a missing
+mask changes the answer. The concrete case is encoded in full:
+`203.0.113.10/28` expands to `.0`-`.15` masked, and `.10`-`.25` unmasked —
+eight addresses in the NEXT `/28`, translating from IPs the operator never
+configured, with the budget charging 16 either way so nothing else notices.
+Two non-vacuity assertions keep the annotations from being silently dropped.
+
+### B1 — option (c) is not available, and the reason is measurable
+
+The proposal: stop poisoning this class on the tolerant / peer-sync builder
+path, keep the narrowing at strict commit, and let a persisted config keep
+working. It rests on the builder's poison being what stops the pool.
+
+**It is not.** Since round 3 the RUNTIME refuses a leading-zero octet on its
+own: `expand_pool_address` parses the CIDR address half with `std::net::IpAddr`.
+A snapshot with `pool_unusable: false` — exactly what option (c) produces —
+still reaches `InvalidPool`, with zero expanded addresses and no allocator.
+`declining_to_poison_a_leading_zero_member_does_not_restore_it_6812` measures
+it, against a canonical-spelling control that installs normally in the same
+shape.
+
+So (c) is not "stop poisoning"; it is "stop poisoning AND revert the round-3
+narrowing". And that end state is the one the objection to option (a) already
+rules out: `ipnet` silently resolves the octal-ambiguous literal to its decimal
+reading and the pool translates from addresses that are not the ones `show
+configuration` displays. (a) makes that guess by rewriting the address; (c)+
+revert makes it by leaving `ipnet` to rewrite it for us. Same guess, less
+visibility, and it would re-open the commit-vs-apply divergence that #5627 and
+this round exist to close.
+
+**Kept: refuse, and name the fix.** Unchanged from round 4.
+
+### What the amendment corrects in this document and elsewhere
+
+The pre-fix state at master was a **commit-vs-apply divergence** — strict commit
+rejecting since #5627 while the runtime installed — **not** a tolerant-path
+over-rejection. The over-rejection framing was true only relative to an earlier
+commit of this PR, which had already added the poison. Three prose sites carried
+the wrong framing; all three are corrected. The blast radius is also narrower
+than round 4 implied: **exactly** the leading-zero-octet CIDR family. Every
+other shape the membership clause catches was already fail-closed at the merge
+base — a mixed pool with an unparseable member and an over-capacity `/15` were
+both refused by the expander, and a bare `%zone` member was poisoned by the
+#5875 builder check — so round 2's "only the decider moves" argument holds for
+every class except this one.
+
+### A process note worth keeping
+
+The round-4 correction to the `expand_pool_address` doc comment **did not reach
+the commit**. The mutation harness took its restore snapshot BEFORE that edit
+and its final `cp` reverted it, so the round-4 report claimed a correction that
+was not in the tree. Backups for a mutation matrix must be taken after the last
+production edit, not before the first mutation.
+
+### A vacuity MECHANISM is a query, not a one-off fix
+
+Round 4 found that Go's `sort.Slice` preserves order for an **all-equal key**
+(pdqsort detects an already-sorted input), so a stability mutation against a
+single-keyed fixture is a no-op, and sized the new fixture at 20 rule-sets
+across two tiers so the mutation would distinguish.
+
+Its sibling `TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` had 17
+rule-sets **all at tier 1** — the very shape that had just been diagnosed. Under
+`sort.SliceStable -> sort.Slice` it **passed**, while its own doc comment and
+`docs/config-schema.md` both credited it with binding the tie-break. The
+mechanism had been applied to the test the finding named, and not carried one
+function over.
+
+Re-cut: four interface-scoped rule-sets are INTERLEAVED among sixteen
+zone-scoped ones, so the input is neither single-keyed nor already tier-sorted;
+the four tier-0 pools consume 4 addresses, so the address budget admits fifteen
+`/16`s and refuses the sixteenth, and WHICH zone pool loses depends only on
+config order among equals. Both same-tier tests now red under the mutation —
+the boundary one with `poison set = map[q01:true], missing "q15"`. The fixture
+also asserts its own preconditions (both tiers present, input NOT already
+tier-sorted), so it cannot silently regress to the single-keyed shape.
+
+**The rule this leaves behind: when you learn WHY a test failed to bind, that
+reason is a greppable predicate — run it over the neighbouring cells before
+closing the round.** "All-equal sort key", "asserts only a count", "fixture
+input is already canonical" are all queries, not observations.

@@ -37,6 +37,13 @@ type snatPoolGrammarCase struct {
 	OK    bool   `json:"ok"`
 	Hosts uint64 `json:"hosts"`
 	Note  string `json:"note"`
+	// #6812 B2: WHICH addresses the member expands to. Asserted on the RUST
+	// side, where the expansion happens (Go only counts). Carried here so this
+	// side can keep the row self-consistent — a fixture row that disagrees with
+	// itself would weaken the Rust assertion silently.
+	First    string   `json:"first"`
+	Last     string   `json:"last"`
+	Expanded []string `json:"expanded"`
 }
 
 func loadSNATPoolGrammarFixture(t *testing.T) snatPoolGrammarFixture {
@@ -91,9 +98,16 @@ func TestPoolAddressGrammarMatchesDataplane_6812(t *testing.T) {
 
 // TestPoolAddressHostCountMatchesDataplane_6812 asserts the expansion
 // CARDINALITY of every accepted member — the quantity the aggregate budget
-// charges and the quantity the dataplane sizes an occupancy bitmap for. A
-// verdict-only table would not catch a masking or off-by-one drift on either
-// side (the round-3 Rust rewrite replaced IpNet::network() with its own mask).
+// charges and the quantity the dataplane sizes an occupancy bitmap for.
+//
+// CORRECTION (#6812 B2). An earlier revision of this comment claimed a
+// cardinality assertion "would catch a masking or off-by-one drift". It does
+// not, and that was measured: deleting BOTH network-base masks from
+// expand_pool_address left the entire crate green, because a missing mask
+// changes WHICH addresses are produced and never HOW MANY. The claim was
+// carried only by `note` strings that no assertion read. The address SET is
+// pinned by the fixture's first/last/expanded fields, asserted Rust-side in
+// nat_pool_grammar_parity_fixture; this test covers the count alone.
 func TestPoolAddressHostCountMatchesDataplane_6812(t *testing.T) {
 	fx := loadSNATPoolGrammarFixture(t)
 	for _, c := range fx.Cases {
@@ -122,5 +136,51 @@ func TestZoneScopedBarePoolAddressKeepsItsSpecificReason_6812(t *testing.T) {
 	}
 	if got := SourceNATPoolUnusableReason(pool); got != "zone_scoped_pool_address" {
 		t.Fatalf("SourceNATPoolUnusableReason = %q, want zone_scoped_pool_address", got)
+	}
+}
+
+// TestPoolGrammarFixtureRowsAreSelfConsistent_6812 keeps the shared fixture
+// honest for the assertions the OTHER side runs (#6812 B2).
+//
+// The Rust address-set assertions are conditional on a row carrying first /
+// last / expanded, so a row whose annotation disagrees with its own `hosts`
+// would still pass there while pinning the wrong thing. Go cannot expand a
+// member, but it can refuse to let the table contradict itself.
+func TestPoolGrammarFixtureRowsAreSelfConsistent_6812(t *testing.T) {
+	fx := loadSNATPoolGrammarFixture(t)
+	annotated := 0
+	for _, c := range fx.Cases {
+		hasRange := c.First != "" || c.Last != ""
+		if !hasRange && len(c.Expanded) == 0 {
+			continue
+		}
+		annotated++
+		if !c.OK {
+			t.Errorf("%q is a REJECTED row but carries an expansion annotation; a refused "+
+				"member expands to nothing", c.Addr)
+			continue
+		}
+		if len(c.Expanded) > 0 && uint64(len(c.Expanded)) != c.Hosts {
+			t.Errorf("%q lists %d expanded addresses but declares hosts=%d — the row "+
+				"contradicts itself, so the Rust assertion pins the wrong set",
+				c.Addr, len(c.Expanded), c.Hosts)
+		}
+		if len(c.Expanded) > 0 {
+			if c.First != "" && c.Expanded[0] != c.First {
+				t.Errorf("%q: first=%q but expanded[0]=%q", c.Addr, c.First, c.Expanded[0])
+			}
+			if c.Last != "" && c.Expanded[len(c.Expanded)-1] != c.Last {
+				t.Errorf("%q: last=%q but expanded[last]=%q", c.Addr, c.Last,
+					c.Expanded[len(c.Expanded)-1])
+			}
+		}
+		if c.Hosts == 1 && c.First != "" && c.Last != "" && c.First != c.Last {
+			t.Errorf("%q expands to one host but declares first=%q last=%q",
+				c.Addr, c.First, c.Last)
+		}
+	}
+	if annotated < 8 {
+		t.Fatalf("only %d fixture rows pin an expanded address set; the network-base "+
+			"mask loses its witness below that", annotated)
 	}
 }

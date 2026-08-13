@@ -783,7 +783,12 @@ pub(crate) const MAX_POOL_PREFIX_HOSTS: u64 = 65536;
 /// `MAX_POOL_PREFIX_HOSTS` would turn it into a live divergence, so the mask
 /// grammar is pinned here rather than left to arithmetic.
 fn parse_canonical_prefix_len(mask: &str, max: u32) -> Option<u32> {
-    if mask.is_empty() || mask.len() > 3 || !mask.bytes().all(|b| b.is_ascii_digit()) {
+    // No length cap: a 4+ digit field either carries a leading zero (refused
+    // below) or exceeds `max` (refused at the end), and an absurdly long one
+    // fails the `parse` itself. A `mask.len() > 3` clause was measured to
+    // change 0 of 137,879 differential verdicts — it read like a bound guard
+    // and was not one.
+    if mask.is_empty() || !mask.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     if mask.len() > 1 && mask.starts_with('0') {
@@ -823,15 +828,38 @@ fn parse_canonical_prefix_len(mask: &str, max: u32) -> Option<u32> {
 /// control plane: `010.0.0.1` (bare) was refused here, while `010.0.0.1/32`
 /// (CIDR) was accepted as `10.0.0.1`, and the shared Go predicate
 /// (`sourceNATPoolAddressReason`, pkg/config/compiler_validate_strict_nat.go)
-/// refused both. Go therefore stamped `invalid_pool` on the snapshot and
-/// poisoned a pool this function would have expanded into a working allocator —
-/// an over-rejection on the tolerant load / peer-sync path (#1960 no-brick),
-/// the same harmful direction as the five #6812 F1 classes before it.
+/// refused both — so the STRICT commit gate has rejected the spelling since
+/// #5627 while this function installed it. That commit-vs-apply divergence is
+/// what the narrowing closes.
 ///
-/// Parsing the address half with `std` closes it in the narrowing, fail-closed
-/// direction: the ambiguous spelling is now `InvalidPool` on BOTH sides, which
-/// is the verdict Go already assigned, so no config changes disposition —
-/// only the disagreement is removed. `nat_pool_grammar_parity_fixture`
+/// # What moved, stated correctly (#6812 B1)
+///
+/// Two earlier revisions of this comment claimed the narrowing "changes no
+/// config's disposition", and described the pre-fix state as an over-rejection
+/// on the tolerant path. **Both are wrong, and the second inverts the
+/// direction.** At the merge base the tolerant path did NOT poison this class:
+/// `config.SourceNATPoolUnusableReason` does not exist there, and the
+/// membership-grammar clause that stamps `invalid_pool` was added mid-branch by
+/// this PR. So master had a commit-vs-apply divergence (strict rejects, runtime
+/// installs), not an over-rejection — and a pool carrying `010.0.0.0/24` really
+/// did translate at the merge base and really does fail closed now.
+///
+/// The blast radius is exactly the leading-zero-octet CIDR family. Every other
+/// shape the membership clause catches was already fail-closed at the merge
+/// base: a mixed pool with an unparseable member and an over-capacity `/15`
+/// were both refused by this function, and a bare `%zone` member was poisoned
+/// by the #5875 builder check.
+///
+/// The disposition change is kept deliberately, on the #5875 precedent (reject
+/// a non-representable literal, never silently rewrite it). Declining to poison
+/// it on the tolerant path is not an alternative — the runtime refuses the
+/// member on its own, so the pool fails closed either way; that is measured by
+/// `declining_to_poison_a_leading_zero_member_does_not_restore_it_6812`. The
+/// operator-facing half of the decision is `leadingZeroPoolAddressReason`,
+/// which names the canonical spelling, and the upgrade / peer-sync regression
+/// tests in pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go.
+///
+/// `nat_pool_grammar_parity_fixture`
 /// (tests_aggregate_budget.rs) pins the agreement over
 /// `tests/fixtures/snat_pool_grammar_v1.json` — the SAME file
 /// `TestPoolAddressGrammarMatchesDataplane_6812` reads on the Go side, so

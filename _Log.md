@@ -1,3 +1,82 @@
+## 2026-08-13 — #6812 round-4 amendment: a mask with no witness, an option that is not one, and a sibling that did not bind
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold the round-4 amendment (B2 new blocker, B1 reframed) into
+  PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `userspace-dp/tests/fixtures/snat_pool_grammar_v1.json`,
+  `pkg/config/nat_pool_grammar_parity_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### B2 — the round-3 network-base mask had no witness
+
+Deleting BOTH masks from `expand_pool_address` left the crate green. The shared
+fixture asserted VERDICT and HOST COUNT, and **a missing mask changes WHICH
+addresses are produced, never HOW MANY** — the claim lived only in `note`
+strings no assertion read. A comment asserting the opposite ("a verdict-only
+table would not catch a masking drift") was measured false and is corrected.
+
+Fixed by giving the fixture an address-SET dimension — optional `first` /
+`last` / `expanded`, asserted Rust-side, with the Go side refusing a row that
+contradicts itself. Eleven rows carry one, including all three where host bits
+are set. `203.0.113.10/28` is encoded in full: masked it is `.0`-`.15`,
+unmasked `.10`-`.25` — eight addresses in the NEXT `/28`, with the budget
+charging 16 either way.
+
+### B1 — option (c) is not available, and the reason is measurable
+
+Not poisoning on the tolerant builder path does not restore translation: since
+round 3 the RUNTIME refuses a leading-zero octet on its own. A snapshot with
+`pool_unusable: false` still reaches `InvalidPool` with zero expanded addresses
+(`declining_to_poison_a_leading_zero_member_does_not_restore_it_6812`, with a
+canonical-spelling control that installs normally). So (c) is "stop poisoning
+AND revert round 3", and that end state is the one the objection to (a) already
+rules out — `ipnet` silently resolves the ambiguous literal to its decimal
+reading. Decision unchanged: refuse, and name the fix.
+
+Corrected framing: master had a **commit-vs-apply divergence**, not a
+tolerant-path over-rejection; the over-rejection existed only relative to an
+earlier commit of this PR. Blast radius is exactly the leading-zero-octet CIDR
+family — every other shape was already fail-closed at the merge base.
+
+### A sibling that did not bind, found by re-running a mechanism as a query
+
+Round 4 established that `sort.Slice` preserves order for an ALL-EQUAL key, and
+sized its new fixture accordingly. The sibling
+`TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` had 17 rule-sets
+all at one tier — the diagnosed shape — and passed under the mutation while its
+own comment credited it with binding the tie-break. Re-cut to interleaved mixed
+tiers with explicit preconditions (both tiers present, input NOT already
+tier-sorted). Both same-tier tests now red on `sort.SliceStable -> sort.Slice`.
+
+**Rule kept: a discovered vacuity mechanism is a greppable predicate owed a
+sweep over neighbouring cells, not a fix for the one test that was named.**
+
+### Two process failures worth recording
+
+1. The round-4 correction to the `expand_pool_address` doc comment **never
+   reached the commit**: the mutation harness snapshotted before that edit and
+   its final restore reverted it, so the round-4 report claimed a correction
+   that was not in the tree. Backups for a mutation matrix must be taken after
+   the last production edit.
+2. The first attempt at the B2 assertions **silently did not apply**. The
+   `old` pattern assumed `\` line-continuations the file no longer had, the
+   python `assert` raised, the shell continued to the test (no `&&`, no
+   `set -e`), and the grep used to read the result did not match
+   `AssertionError`. A green test was read as success for an edit that never
+   happened. Re-done with an editor that fails loudly, and the mutation script
+   now runs under `set -eu` and prints `MUTATION APPLIED`.
+
+### Mutation proof
+
+| revert | test | observed RED |
+|---|---|---|
+| delete BOTH network-base masks | `nat_pool_grammar_parity_fixture` | `expand_pool_address("10.0.0.1/24") starts at Some("10.0.0.1"), want "10.0.0.0"` |
+| `sort.SliceStable` -> `sort.Slice` | `...FirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
+| " | `...SameTierBudgetBoundaryFollowsConfigOrder_6812` | `poison set = map[q01:true], missing "q15"` (GREEN before the re-cut) |
+
 ## 2026-08-13 — #6812 round 4: a disposition change I said did not happen, and an order-dependent backstop
 
 - **Timestamp**: 2026-08-13

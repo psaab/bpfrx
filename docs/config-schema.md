@@ -5437,9 +5437,12 @@ reserved for whole-dataplane selection where a rewrite shim
     measured differential over both real parsers found six inputs where they did
     not. The runtime's CIDR branch parsed via `ipnet::IpNet`, whose hand-rolled
     octet reader accepts a leading-zero octet that `std` and `netip` both
-    reject, so `010.0.0.0/24` built a working 256-address allocator for a pool
-    this gate stamped `invalid_pool` — an over-rejection on the very tolerant
-    path #1960 exists for; and `netip.ParseAddr` accepted a bare `fe80::1%eth0`
+    reject, so `010.0.0.0/24` built a working 256-address allocator while this
+    gate rejected it at strict commit — a commit-vs-apply divergence (an earlier
+    revision of this paragraph called it "an over-rejection on the tolerant
+    path", which inverts the direction: at master the tolerant path stamped
+    nothing for this class, see the disposition note below); and
+    `netip.ParseAddr` accepted a bare `fe80::1%eth0`
     that `std::net::IpAddr` cannot represent. Both are closed — the runtime now
     parses its CIDR address half with the same `std::net::IpAddr` its bare
     branch always used, and the Go predicate rejects a zone on a bare member —
@@ -5668,13 +5671,20 @@ reserved for whole-dataplane selection where a rewrite shim
     `incremental_applies_cannot_creep_past_the_cap_6812` for the reservation,
     `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` /
     `TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` for the
-    same-tier tie-break, and
+    same-tier tie-break (both use MIXED-tier fixtures of 20 rule-sets: Go's
+    `sort.Slice` preserves order for an all-equal key, so a single-keyed
+    same-tier fixture cannot distinguish a stable sort from an unstable one —
+    measured, and it is why the second of these was re-cut), and
     `TestLeadingZeroPoolMember{Upgrade,PeerSync}IsDiagnosable_6812` for the
     tolerant-path diagnostic. The reuse and failed-pool guards assert a
     PortAllocator CONSTRUCTION count (a thread-local `#[cfg(test)]` counter),
     not just the final allocator's identity or word count — an end-state
     assertion cannot see a bitmap that was built and discarded, which is the
-    exact behaviour those two rules exist to forbid.
+    exact behaviour those two rules exist to forbid. The shared grammar fixture
+    also pins WHICH addresses a member expands to (`first` / `last` /
+    `expanded`, asserted Rust-side): a missing network-base mask changes the
+    address set while leaving the host COUNT identical, so deleting both masks
+    left the crate green until those fields existed (#6812 B2).
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix

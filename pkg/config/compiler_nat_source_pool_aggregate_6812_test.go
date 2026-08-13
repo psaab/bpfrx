@@ -730,15 +730,30 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 // TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812 is the same
 // property at the place it decides something: a budget boundary falling
 // BETWEEN two same-tier rule-sets. Config order alone decides which pool keeps
-// its allocator, so an unstable tie-break would poison a different pool.
+// its allocator, so an unstable tie-break poisons a different pool.
 //
-// 16 same-tier zone-scoped pools of one /16 each exactly fill the address
-// budget (16 x 65,536 = 1,048,576); the 17th does not fit. It must be the
-// LAST-declared one that loses.
+// RE-CUT (#6812 round-4 amendment). The first version used 17 rule-sets ALL at
+// the zone tier — an ALL-EQUAL sort key — and therefore did not bind the
+// property its own comment claimed. Go's sort.Slice detects an already-ordered
+// input, so with one key value it preserves order at every size, and
+// sort.SliceStable -> sort.Slice left this test GREEN. That is the same
+// mechanism the sibling test was built to defeat; it was found by re-running
+// the mechanism as a query against neighbouring cells rather than by a new
+// review round.
+//
+// The fixture now INTERLEAVES four interface-scoped rule-sets (tier 0, one
+// host each) among sixteen zone-scoped ones (tier 1, one /16 each), so the
+// input is neither tier-sorted nor single-keyed and the sort has real work to
+// do. The four interface pools are charged first and consume 4 addresses, so
+// the 1,048,576-address budget admits fifteen /16 pools (4 + 15 x 65,536 =
+// 983,044) and refuses the sixteenth (4 + 1,048,576). WHICH zone pool that is
+// depends only on config order among equal-tier rule-sets — the property under
+// test.
 func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
+	const nZone, nIface = 16, 4
 	var cmds []string
-	for i := 0; i < 17; i++ {
-		rs := fmt.Sprintf("rs%02d", i)
+	emitZone := func(i int) {
+		rs := fmt.Sprintf("zrs%02d", i)
 		cmds = append(cmds,
 			fmt.Sprintf("set security nat source rule-set %s from zone z%d", rs, i),
 			fmt.Sprintf("set security nat source pool q%02d address 10.%d.0.0/16", i, 100+i),
@@ -747,17 +762,66 @@ func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
 			fmt.Sprintf("set security nat source pool q%02d port range 5000 to 5001", i),
 		)
 	}
+	emitIface := func(i int) {
+		rs := fmt.Sprintf("irs%02d", i)
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source rule-set %s from interface ge-0/0/%d.0", rs, i),
+			fmt.Sprintf("set security nat source pool p%02d address 203.0.113.%d", i, i+1),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 match source-address 10.0.0.0/24", rs),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 then source-nat pool p%02d", rs, i),
+			fmt.Sprintf("set security nat source pool p%02d port range 5000 to 5001", i),
+		)
+	}
+	// Interleave, so the declaration order is NOT already tier-sorted.
+	iface := 0
+	for i := 0; i < nZone; i++ {
+		emitZone(i)
+		if i%4 == 3 && iface < nIface {
+			emitIface(iface)
+			iface++
+		}
+	}
+	for ; iface < nIface; iface++ {
+		emitIface(iface)
+	}
+
 	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
 	if err != nil {
 		t.Fatalf("CompileConfigLenient: %v", err)
 	}
-	// Precondition: every rule-set really is the same tier, so the outcome is
-	// decided by config order and nothing else.
+
+	// Preconditions. (1) Both tiers are present and the input is NOT already
+	// sorted by tier — without that, an unstable sort has nothing to permute
+	// and the mutation is a no-op, which is exactly how the first version of
+	// this test went vacuous.
+	var tiers []int
 	for _, rs := range cfg.Security.NAT.Source {
-		if tier := natRuleSetScopeTier(rs); tier != SourceNATTierZone {
-			t.Fatalf("rule-set %s has tier %d, want %d — the fixture no longer tests a "+
-				"SAME-tier tie", rs.Name, tier, SourceNATTierZone)
+		tiers = append(tiers, natRuleSetScopeTier(rs))
+	}
+	if len(tiers) != nZone+nIface {
+		t.Fatalf("compiled %d rule-sets, want %d", len(tiers), nZone+nIface)
+	}
+	sorted := true
+	for i := 1; i < len(tiers); i++ {
+		if tiers[i] < tiers[i-1] {
+			sorted = false
 		}
 	}
-	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), "q16")
+	if sorted {
+		t.Fatal("declaration order is already tier-sorted; an unstable sort would have " +
+			"nothing to permute and this fixture would not bind stability")
+	}
+	// (2) The boundary must fall between two ZONE-tier rule-sets, so config
+	// order among EQUALS is what decides the loser.
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	if len(charges) != nZone+nIface {
+		t.Fatalf("charged %d pools, want %d", len(charges), nZone+nIface)
+	}
+	for i := 0; i < nIface; i++ {
+		if !strings.HasPrefix(charges[i].name, "p") {
+			t.Fatalf("charge[%d] = %s, want the interface-tier pools first", i, charges[i].name)
+		}
+	}
+
+	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), fmt.Sprintf("q%02d", nZone-1))
 }
