@@ -353,3 +353,144 @@ func TestQuarantineUnzonesTheBaseRow_6722(t *testing.T) {
 		t.Errorf("surviving zone zzzz missing from the published zone set")
 	}
 }
+
+// D: the QUARANTINE x RETH-MEMBER-EXEMPTION interaction.
+//
+// The two mechanisms compose into a shape neither was designed for, and the
+// result is CORRECT — this test exists so a later reader does not "fix" it.
+//
+// The exemption's trigger has two halves: a co-resident parent row, and the
+// member's own zone being empty. Quarantine blanks a zone BY NAME
+// (zones_quarantine.go), so it can manufacture the second half: zone a RETH
+// member explicitly into X, put its RETH in Y, and quarantine X. The member's
+// row blanks, the exemption then covers it, it casts no vote, and the ledger
+// resolves Y for the shared ifindex.
+//
+// Reading that as a bug is the trap. It RESTORES master rather than diverging
+// from it: emission is sorted by name, so master's last-write-wins
+// `populate_egress` already answered Y for this ifindex — the intermediate `0`
+// some intuitions expect was the anomaly, not the baseline. Post-fix egress
+// therefore agrees with ingress instead of contradicting it. And it is what the
+// quarantine contract already promises: the colliding zone is dropped AS IF IT
+// HAD NEVER BEEN CONFIGURED, so a member zoned only into a quarantined zone is
+// a member with no zone — which is exactly the case the exemption exists for.
+// Resolving to `0` here would mean honouring a zone the operator was just told
+// was discarded.
+//
+// The collision is REAL, not simulated: z174 and z214 genuinely fold to one
+// StableZoneID, and the premise is asserted so a change to the fold turns this
+// into a loud failure rather than a silently vacuous test.
+func TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatalf("test premise broken: z174/z214 no longer collide under the frozen fold")
+	}
+	lines := []string{
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
+		// The MEMBER is explicitly zoned into the doomed zone. That is the whole
+		// point: without an explicit member zone there is nothing for the
+		// quarantine to blank and the exemption would apply for the ordinary
+		// reason instead.
+		"set security zones security-zone z214 interfaces ge-0/0/1.0",
+		"set security zones security-zone z174 host-inbound-traffic system-services ping",
+		// The RETH carries the SURVIVING zone — the one the ledger must resolve.
+		"set security zones security-zone lan interfaces reth1.0",
+		"set security policies default-policy deny-all",
+	}
+	if _, err := config.CompileConfig(treeFromSet6722(t, lines)); err == nil {
+		t.Fatalf("strict CompileConfig accepted the z174/z214 collision: the " +
+			"commit-time gate is gone and this shape no longer reaches the quarantine")
+	}
+	cfg := compileWithStubbedLinks6722(t, lines,
+		map[string]int{"ge-0-0-1": 24, "reth1": 24},
+		map[string]string{"ge-0-0-1": "02:bf:72:01:00:01"}, true)
+
+	// PRECONDITION: the member really is zoned into the doomed zone before the
+	// quarantine runs. Without this the post-quarantine empty Zone would be the
+	// failure default rather than a scrub, and the test would pass on a config
+	// where z214 never reached the member at all.
+	if got := buildInterfaceZoneMap(cfg)["ge-0/0/1"]; got != "z214" {
+		t.Fatalf("pre-quarantine buildInterfaceZoneMap[ge-0/0/1] = %q, want %q: the "+
+			"member must carry the about-to-be-quarantined zone, or this test "+
+			"measures nothing", got, "z214")
+	}
+
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if len(snap.zoneIDCollisions) == 0 {
+		t.Fatalf("no collision reported: the quarantine pass never fired, so the "+
+			"member row was not scrubbed and this test is not exercising the "+
+			"interaction it names (zones=%d)", len(snap.Zones))
+	}
+
+	member := snapByName6722(t, snap.Interfaces, "ge-0/0/1")
+	reth := snapByName6722(t, snap.Interfaces, "reth1.0")
+
+	if member.Zone != "" {
+		t.Fatalf("post-quarantine ge-0/0/1 Zone = %q, want empty: the quarantine "+
+			"must strip the colliding zone off the MEMBER row — that blanking is "+
+			"the half of the exemption trigger this test is about", member.Zone)
+	}
+	if member.RedundantParent == "" {
+		t.Fatalf("ge-0/0/1 carries no redundant_parent, so the exemption's OTHER " +
+			"half is absent and a resolved zone below would be explained by " +
+			"something other than the interaction under test")
+	}
+	if reth.Zone != "lan" {
+		t.Fatalf("reth1.0 Zone = %q, want %q: the surviving zone must still be on "+
+			"the reth row, or there is nothing for the ledger to resolve",
+			reth.Zone, "lan")
+	}
+	if member.Ifindex != reth.Ifindex {
+		t.Fatalf("ge-0/0/1 ifindex %d != reth1.0 ifindex %d: the member and its "+
+			"reth must share ONE netdev for the ledger to have a collision to "+
+			"resolve at all", member.Ifindex, reth.Ifindex)
+	}
+
+	// The surviving zone must still be published, or the Rust side resolves it
+	// to InterfaceUnknownZone instead of propagating it.
+	published := false
+	for _, z := range snap.Zones {
+		if z.Name == "lan" {
+			published = true
+			break
+		}
+	}
+	if !published {
+		t.Fatalf("zone %q is not in the published zone set, so the Rust ledger "+
+			"could not resolve it even with the member exempted", "lan")
+	}
+
+	// CONTROL: exactly ONE of the colliding pair is quarantined — the
+	// later-sorting name. z214 is the doomed one and must be gone; z174 is the
+	// collision WINNER and legitimately survives.
+	//
+	// This control corrected a wrong assertion in this test's own first draft,
+	// which required BOTH names to vanish and failed for that reason rather than
+	// for anything about the interaction. Asserting the exact survivor is what
+	// distinguishes "the scrub ran" from "everything vanished" — and if
+	// everything HAD vanished, the member would be unzoned for a reason with
+	// nothing to do with the exemption, and every assertion above would hold
+	// vacuously.
+	var sawDoomed, sawWinner bool
+	for _, z := range snap.Zones {
+		switch z.Name {
+		case "z214":
+			sawDoomed = true
+		case "z174":
+			sawWinner = true
+		}
+	}
+	if sawDoomed {
+		t.Fatalf("quarantined zone %q is still published: the scrub did not run to "+
+			"completion, so the member's blank Zone above is not the quarantine's "+
+			"doing and the shape under test is not the one built", "z214")
+	}
+	if !sawWinner {
+		t.Fatalf("collision WINNER %q was scrubbed too: the quarantine is dropping "+
+			"both colliders rather than the later-sorting one, which would make the "+
+			"member unzoned for a reason unrelated to the exemption", "z174")
+	}
+}

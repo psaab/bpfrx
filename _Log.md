@@ -77836,3 +77836,75 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `userspace-dp/src/afxdp/test_fixtures.rs`,
   `userspace-dp/src/afxdp/forwarding/tests.rs`,
   `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6722 re-gate residue — N1 (pin the quarantine x RETH-member
+  interaction), N3 (doc contradiction on which direction is "safe"), N4 (a
+  convention stated as a code property).
+
+  **N1 — the interaction is CORRECT, and the test exists so nobody "fixes" it.**
+  Quarantine blanks a zone BY NAME (`zones_quarantine.go`), and an empty zone is
+  half the RETH-member exemption's trigger — so quarantine can manufacture that
+  trigger: zone a member explicitly into X, put its RETH in Y, quarantine X. The
+  member blanks, the exemption covers it, it casts no vote, and the ledger
+  resolves Y.
+
+  That RESTORES master rather than diverging from it: emission is sorted by
+  name, so master's last-write-wins `populate_egress` already answered Y for the
+  shared ifindex — the intermediate `0` some intuitions expect was the anomaly.
+  It is also exactly what the quarantine contract promises: the colliding zone
+  is dropped AS IF NEVER CONFIGURED, so a member zoned only into a quarantined
+  zone is a member with no zone, which is the case the exemption exists for.
+  Resolving `0` would mean honouring a zone the operator was just told was
+  discarded. All of that reasoning is in the test body, not just here.
+
+  `TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722` builds the shape with a
+  REAL collision — `z174`/`z214` genuinely fold to one StableZoneID — and
+  asserts the premise, so a change to the fold turns it into a loud failure
+  rather than a silently vacuous test. It also pins the strict-compiler
+  rejection, since the lenient path is the only way a colliding snapshot reaches
+  the quarantine at all.
+
+  **N3** — the degraded/absent-field direction was called "the safe one" while
+  the next bullet correctly says refusing to guess a zone is safe only to the
+  extent the default policy is. Under `permit-all` that direction is fail-OPEN.
+  Now scoped to "fail-CLOSED under the reference cluster's `deny-all`" with a
+  pointer to the bullet that states the `permit-all` case, and a note that the
+  two contradicted each other until this round.
+
+  **N4** — "Junos zones the RETH, never the member" is stated at
+  `forwarding_build/interfaces.rs` and in the architecture doc as a code
+  property. It is not one: `buildInterfaceZoneMap` enforces no such rule, and
+  the re-gate measured `zoneByInterface[ge-0/0/1] = "z214"` for a config that
+  zones the member. Reworded to "Junos configs conventionally zone the RETH
+  rather than the member", with the note that nothing depends on it — the
+  `zone.is_empty()` half of the gate is what handles the exception.
+- **File(s)**: pkg/dataplane/userspace/zone_propagation_6722_test.go,
+  docs/userspace-dataplane-architecture.md,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs, _Log.md
+- **Validation**: the new test was proven able to FAIL for its own reason before
+  being trusted green. Mutation: remove the interface-row blanking loop from
+  `quarantineCollidingZones` (the zone/policy scrub stays, so the collision is
+  still REPORTED — only the member blanking, which is exactly the half under
+  test, is removed). `go vet` rc 0 first, so the RED is an assertion:
+
+      --- FAIL: TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722
+        post-quarantine ge-0/0/1 Zone = "z214", want empty: the quarantine must
+        strip the colliding zone off the MEMBER row — that blanking is the half
+        of the exemption trigger this test is about
+
+  The sibling `TestQuarantineUnzonesTheBaseRow_6722` reds too, as it should —
+  both depend on that loop; the messages attribute to different rows.
+
+  A CORRECTION to my own first draft, recorded because the control caught it:
+  the final control asserted BOTH colliding names were scrubbed, and the test
+  failed for that reason rather than for anything about the interaction. Only
+  the later-sorting collider is quarantined — `z214` is dropped, `z174` is the
+  WINNER and legitimately survives. The control now asserts exactly that
+  asymmetry, which is what distinguishes "the scrub ran" from "everything
+  vanished"; had everything vanished, the member would be unzoned for a reason
+  unrelated to the exemption and every assertion above it would hold vacuously.
+
+  Gates: `go build ./...` rc 0; `go vet ./pkg/dataplane/userspace/` rc 0;
+  `go test ./pkg/dataplane/userspace/` ok; `cargo build --release` rc 0 (the
+  Rust change is comment-only).

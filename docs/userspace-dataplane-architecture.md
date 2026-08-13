@@ -918,8 +918,13 @@ Scope of the fallback:
   `LinuxIfName(ResolveReth(base)).<vlan>`, putting `ge-0/0/1.100` on
   `reth1.100`.
 
-  Junos zones the RETH, never the member, so `buildInterfaceZoneMap` leaves the
-  member's rows unzoned and `buildInterfaceSnapshots` emits them unfiltered.
+  Junos configs conventionally zone the RETH rather than the member, so
+  `buildInterfaceZoneMap` usually leaves the member's rows unzoned and
+  `buildInterfaceSnapshots` emits them unfiltered. This is convention, not a
+  code property — `buildInterfaceZoneMap` enforces no such rule and a config
+  zoning the member yields a zoned member row (measured:
+  `zoneByInterface[ge-0/0/1] = "z214"`). The gate does not rely on it; its
+  `zone.is_empty()` half handles the exception.
   Measured through the full `buildSnapshot` on `docs/ha-cluster-userspace.conf`
   (node 0 — the topology `test/incus/loss-userspace-cluster.env` points every HA
   smoke test at):
@@ -969,9 +974,13 @@ Scope of the fallback:
 
   The field is additive in both directions — `omitempty` on the Go side,
   `#[serde(default)]` on the Rust side, and no `deny_unknown_fields` anywhere in
-  `userspace-dp/src/protocol` — and the DEGRADED direction is the safe one: an
-  old helper ignores the key, an old Go binary omits it, and in both cases the
-  member votes and the ifindex stays ambiguous, i.e. the fail-CLOSED behaviour.
+  `userspace-dp/src/protocol` — and the DEGRADED direction is the fail-CLOSED
+  one under the reference cluster's `default-policy deny-all`: an old helper
+  ignores the key, an old Go binary omits it, and in both cases the member votes
+  and the ifindex stays ambiguous. Read the next bullet before calling that
+  "safe" without qualification — under `permit-all` the same degraded direction
+  is fail-OPEN, and the two bullets contradicted each other until #6722's
+  re-gate.
 
 - **Both directions of the 0 sentinel, stated.** The sections above argue the
   fail-CLOSED consequence because that is what the reference cluster runs

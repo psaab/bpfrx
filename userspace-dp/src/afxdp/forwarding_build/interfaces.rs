@@ -151,9 +151,15 @@ pub(super) fn populate_interfaces(
         // `reth1.100`'s netdev — which is why the Go builder stamps
         // `redundant_parent` on the member's unit rows too, not just its base.
         //
-        // Junos zones the RETH, never the member, so `buildInterfaceZoneMap`
-        // leaves the member's rows unzoned and `buildInterfaceSnapshots` emits
-        // them unfiltered. Counting that "no zone" as a dissenting vote makes
+        // Junos configs conventionally zone the RETH rather than the member, so
+        // `buildInterfaceZoneMap` usually leaves the member's rows unzoned and
+        // `buildInterfaceSnapshots` emits them unfiltered. That is CONVENTION,
+        // not a code property: `buildInterfaceZoneMap`
+        // (pkg/dataplane/userspace/zones.go) enforces no such rule, and a config
+        // that zones the member really does produce a zoned member row —
+        // measured, `zoneByInterface[ge-0/0/1] = "z214"`. Nothing here depends
+        // on the convention holding: the `zone.is_empty()` half of the gate
+        // below is exactly what handles the exception (#6722 re-gate). Counting that "no zone" as a dissenting vote makes
         // the RETH's own zone ambiguous: measured through the full
         // `buildSnapshot` on `docs/ha-cluster-userspace.conf` (node 0 — the
         // topology `test/incus/loss-userspace-cluster.env` points every HA
