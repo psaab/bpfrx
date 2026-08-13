@@ -5699,7 +5699,12 @@ reserved for whole-dataplane selection where a rewrite shim
     base makes the CLI/gRPC/REST deterministic mapping name a different address
     than the dataplane translates to, the #5794 invariant-8 forensic failure.
     `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` (pkg/nat)
-    reads the SAME fixture, so all three consumers are pinned to one table.
+    reads the SAME fixture, so all three consumers are pinned to one table —
+    on BOTH halves since #6812 F-C. The accept half pins the expansion identity;
+    the reject half caught `net.ParseCIDR` accepting a leading-zero mask
+    (`10.0.0.0/016` as `/16`) that every other layer refuses, which had the
+    deterministic surface reporting a 65,536-address mapping for a pool that
+    translates nothing.
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix

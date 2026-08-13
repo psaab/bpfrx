@@ -752,3 +752,84 @@ mutation — `go test ./...` under it produced exactly one failure.
 Provenance: the builder sort line is pre-existing and not authored by this PR.
 It is in scope because this PR's F3 claims an equality and shipped a binding
 for one side of it.
+
+## Round 6 — a guard that could not see the rule it exists to forbid
+
+Four items, none blocking.
+
+### F-A — the fixtures could not see a NAME tiebreak
+
+All three same-tier fixtures declared their rule-sets in ASCENDING suffix order
+(`if00..if09`, `zn00..zn09`, `q00..q15`). Within a tier that makes config order
+and ascending lexicographic NAME order the SAME sequence; across tiers
+`'i' < 'z'` makes name order match tier order too. So a stable sort keyed on
+(tier, PoolName ASC) — the realistic edit someone makes while "making the sort
+deterministic" — was GREEN on all three.
+
+That is worse than an ordinary coverage gap: a name tiebreak is precisely the
+rule F3 removed, and the walk's own comment says so ("Ordering by rule-set NAME
+matched neither that order nor any Junos semantic"). The guard that exists to
+stop that rule returning could not see it return.
+
+Fixed by declaring high-to-low in all three fixtures, so config order is no
+longer lexicographic, plus a precondition in the builder test that FATALS if
+declaration order is ever again ascending by name. Measured after:
+
+| mutation | before | after |
+|---|---|---|
+| walk (tier, Name ASC) | green | RED — `charge order[0] = if00, want if09`; `poison set = map[q15:true], missing "q00"` |
+| builder (tier, Name ASC) | green | RED — `emitted rule-set order[0] = if00, want if09` |
+
+The ORDER axis regressions still hold after the re-cut: `sort.Slice` reds both
+walk tests and the builder test, and the (tier, RULE NAME) mutation still reds
+contiguity ALONE (0 order lines, 20 SPLIT lines).
+
+Explicitly NOT conflated: a PoolName-only sort that ignores tier reds four
+pre-existing #4161 tests plus the snapshot poison test, so the tier axis was
+already covered. These fixtures bind the TIE-BREAK axis, which was not.
+
+### F-B — a summary comment describing pre-round-4 behaviour
+
+`sourceNATAggregateReferencedCharges`'s summary still said charges come back
+"(rule-sets sorted by name, ...)" — false since round 4, and contradicted 55
+lines below inside the same comment block. Corrected to name the actual rule
+(stable sort by #4161 tier, config order preserved within a tier).
+
+### F-C — VERIFIED, and fixed rather than documented
+
+Relayed unconfirmed, so measured first. Driving `expandPoolV4` over all 58
+fixture rows: **2 genuine v4 divergences**, both in the reject half —
+`198.51.100.1/032` accepted as 1 address, `10.0.0.0/016` accepted as 65,536.
+Cause confirmed directly: `net.ParseCIDR` reads a leading-zero prefix length,
+`netip.ParsePrefix` refuses it.
+
+(My first probe reported 14 disagreements. Twelve were artifacts of its own
+crude `accepted := err == nil && len > 0` test: `expandPoolV4` is the v4 mode-1
+path and deliberately SKIPS a colon-bearing member rather than rejecting it, so
+a v6 row yielding zero v4 addresses is correct-by-design. The reject-half walk
+classifies with `config.NATAddrFamily`, the same predicate production uses.)
+
+**Fixed, not narrowed.** The claim "all three consumers are pinned to one
+table" was true of the accept half only; the honest options were to narrow the
+sentence or to walk the reject half. Walking it exposes a real defect, so the
+sentence was not the thing that was wrong. A tolerant load with `10.0.0.0/016`
+gets a pool that translates nothing while `show`/gRPC/REST answer with a
+confident 65,536-address mapping — the invariant-8 forensic failure, one
+consumer over from the divergence class this whole PR exists to close.
+Narrowing the claim would have been the "document the divergence" option
+already rejected for F1.
+
+The fix is a `netip.ParsePrefix` check in `expandPoolV4`. Narrowing only: such
+a pool is already refused at commit and poisoned on the tolerant path, so no
+working config changes behaviour — the lookup reports an error instead of a
+fiction. `net.ParseCIDR` is pre-existing and untouched by the diff, so this is
+not a regression this PR introduced; it is a divergence the shared fixture made
+visible.
+
+### F-D — assertion (3) was not independent of (2)
+
+Within-set rule order reads `out[lo+r]`, which only identifies that rule-set's
+rules when its block is contiguous. Now gated on (2). Under `sort.Slice` the
+within-set line count drops 16 -> 10; the remaining 10 are CONTIGUOUS rule-sets
+whose two rules are genuinely out of order, which is a true (3) violation, so
+the gate removed the artifacts and kept the findings.

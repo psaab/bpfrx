@@ -118,6 +118,40 @@ func TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812(t *testing.T
 			"no-op under a missing mask, so those are the only rows that bind this",
 			hostBitsRows)
 	}
+
+	// The REJECT half (#6812 F-C). The loop above walks only accepted rows with
+	// a pinned expansion — 7 of 58 — so "all three consumers are pinned to one
+	// table" was true of the ACCEPT half only. Driving the rejects found two
+	// genuine v4 divergences: net.ParseCIDR takes `10.0.0.0/016` as `/16` and
+	// `198.51.100.1/032` as `/32`, where netip.ParsePrefix and the dataplane's
+	// parse_canonical_prefix_len both refuse the leading-zero mask. That made
+	// the deterministic surface answer a forward-mapping query with a
+	// 65,536-address pool for a member every other layer rejects.
+	rejected := 0
+	for _, c := range fx.Cases {
+		if c.OK || c.Addr == "" {
+			continue
+		}
+		// Only v4 members reach the v4 index space; expandPoolV4 deliberately
+		// SKIPS a colon-bearing member (mode-1) rather than rejecting it, so a
+		// v6 row proves nothing here and must not be counted as agreement.
+		if config.NATAddrFamily(config.NATCIDRIPPart(c.Addr)) != "v4" {
+			continue
+		}
+		rejected++
+		pool := &config.NATPool{Name: "p", Addresses: []string{c.Addr}}
+		got, lerr := expandPoolV4(pool, ModeV4)
+		if lerr == nil && len(got) > 0 {
+			t.Errorf("expandPoolV4(%q) ACCEPTED %d addresses, but the shared fixture — and "+
+				"therefore the commit gate and the dataplane — reject this member. The pool "+
+				"translates nothing while show/gRPC/REST report a confident mapping for it",
+				c.Addr, len(got))
+		}
+	}
+	if rejected < 8 {
+		t.Fatalf("only %d rejected v4 rows exercised; the reject half needs enough shapes "+
+			"to be worth asserting", rejected)
+	}
 }
 
 // netParseV4 reports whether the member is an IPv4 CIDR expandPoolV4 handles.

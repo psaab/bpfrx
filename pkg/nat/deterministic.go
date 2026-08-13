@@ -534,6 +534,31 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 		}
 		// fam == "v4": a dotted-quad host, optionally with a CIDR mask.
 		if strings.Contains(a, "/") {
+			// #6812 F-C: net.ParseCIDR's mask reader accepts a LEADING-ZERO
+			// prefix length — it takes `10.0.0.0/016` as `/16` — where
+			// netip.ParsePrefix (the control-plane grammar,
+			// sourceNATPoolAddressReason) and parse_canonical_prefix_len (the
+			// dataplane's, userspace-dp/src/nat/source.rs) both reject it.
+			//
+			// Without this check the deterministic surface is the most
+			// confident liar in the system: the pool is stamped `invalid_pool`
+			// and translates NOTHING, while `show`/gRPC/REST answer a
+			// forward-mapping query with a 65,536-address pool computed off a
+			// member no other layer accepts. That is the #5794 invariant-8
+			// forensic failure — the operator-facing map describing a pool the
+			// dataplane does not have — and it is the same divergence class
+			// #6812 exists to close, one consumer over.
+			//
+			// Narrowing only: every such pool is ALREADY refused at commit and
+			// poisoned on the tolerant path, so no config that works today
+			// changes behaviour; the lookup now reports an error instead of a
+			// fiction. Bound by the reject half of
+			// TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812.
+			if _, perr := netip.ParsePrefix(a); perr != nil {
+				return nil, lerrf(ErrCodeNotDeterministic,
+					"pool address %q is not a canonical CIDR (%v); the dataplane refuses it and the pool translates nothing",
+					a, perr)
+			}
 			_, ipnet, err := net.ParseCIDR(a)
 			if err != nil {
 				return nil, lerrf(ErrCodeNotDeterministic, "unparseable pool address %q", a)

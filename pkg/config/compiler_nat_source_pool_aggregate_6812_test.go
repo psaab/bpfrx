@@ -683,7 +683,10 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 	// Interface-scoped (tier 0) and zone-scoped (tier 1) rule-sets INTERLEAVED
 	// in config order, so the sort has real work to do and same-tier ties are
 	// spread across the slice rather than adjacent.
-	for i := 0; i < nPerTier; i++ {
+	// DESCENDING declaration (#6812 F-A): with ascending names, config order and
+	// ascending lexicographic NAME order are the SAME sequence within a tier,
+	// so a (tier, Name ASC) tiebreak — the very rule F3 removed — was GREEN.
+	for i := nPerTier - 1; i >= 0; i-- {
 		iface := fmt.Sprintf("if%02d", i)
 		zone := fmt.Sprintf("zn%02d", i)
 		cmds = append(cmds,
@@ -698,11 +701,12 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 		)
 	}
 	// Expected charge order: every interface-scoped pool in CONFIG order, then
-	// every zone-scoped pool in CONFIG order.
-	for i := 0; i < nPerTier; i++ {
+	// every zone-scoped pool in CONFIG order — which is DESCENDING by name, so
+	// a name tiebreak produces a different sequence and reds.
+	for i := nPerTier - 1; i >= 0; i-- {
 		wantOrder = append(wantOrder, fmt.Sprintf("if%02d", i))
 	}
-	for i := 0; i < nPerTier; i++ {
+	for i := nPerTier - 1; i >= 0; i-- {
 		wantOrder = append(wantOrder, fmt.Sprintf("zn%02d", i))
 	}
 
@@ -772,16 +776,19 @@ func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
 			fmt.Sprintf("set security nat source pool p%02d port range 5000 to 5001", i),
 		)
 	}
-	// Interleave, so the declaration order is NOT already tier-sorted.
-	iface := 0
-	for i := 0; i < nZone; i++ {
+	// Interleave, so the declaration order is NOT already tier-sorted, and go
+	// high-to-low so config order is not ascending NAME order either (#6812
+	// F-A) — otherwise a (tier, Name ASC) tiebreak is indistinguishable from
+	// the config order this test exists to pin.
+	iface := nIface - 1
+	for i := nZone - 1; i >= 0; i-- {
 		emitZone(i)
-		if i%4 == 3 && iface < nIface {
+		if i%4 == 0 && iface >= 0 {
 			emitIface(iface)
-			iface++
+			iface--
 		}
 	}
-	for ; iface < nIface; iface++ {
+	for ; iface >= 0; iface-- {
 		emitIface(iface)
 	}
 
@@ -823,5 +830,8 @@ func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
 		}
 	}
 
-	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), fmt.Sprintf("q%02d", nZone-1))
+	// The LAST-declared zone pool loses. With descending declaration that is
+	// q00 — under a (tier, Name ASC) tiebreak it would be q15 instead, which is
+	// what makes this assertion see a name tiebreak.
+	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), "q00")
 }

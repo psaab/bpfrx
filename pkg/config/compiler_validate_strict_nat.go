@@ -3105,8 +3105,9 @@ type sourceNATAggregatePoolCharge struct {
 
 // sourceNATAggregateReferencedCharges walks the DISTINCT pools a pool-mode
 // `then source-nat pool <name>` rule references and returns each pool's budget
-// charge in deterministic first-reference order (rule-sets sorted by name,
-// rules in config order, pools deduped by name). This is the SINGLE source of
+// charge in deterministic first-reference order (rule-sets STABLE-sorted by
+// #4161 scope tier — so config order is preserved WITHIN a tier — rules in
+// config order, pools deduped by name). This is the SINGLE source of
 // truth for the #5877 aggregate scoping + charge arithmetic: the strict
 // validator (validateSourceNATAggregateCardinalityStrict) sums it for the
 // whole-config reject, and SourceNATAggregateOverBudgetPools (#6812) first-fits

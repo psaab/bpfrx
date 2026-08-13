@@ -621,7 +621,15 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	// INTERLEAVED across two tiers so the input is neither single-keyed nor
 	// already tier-sorted, and >= 13 rule-sets so sort.Slice actually permutes
 	// (measured in round 4: pdqsort preserves order below that).
-	for i := 0; i < nPerTier; i++ {
+	// DESCENDING declaration (#6812 F-A). With if00..if09 declared in ascending
+	// order, config order and ascending lexicographic NAME order are the SAME
+	// sequence within a tier — and 'i' < 'z' makes name order match tier order
+	// across tiers too. A stable sort keyed on (tier, PoolName ASC) was
+	// therefore GREEN, and a name tiebreak is exactly the rule F3 removed
+	// ("ordering by rule-set NAME matched neither that order nor any Junos
+	// semantic"). Declaring high-to-low separates the two sequences so the
+	// guard can see that rule coming back.
+	for i := nPerTier - 1; i >= 0; i-- {
 		iface := fmt.Sprintf("if%02d", i)
 		zone := fmt.Sprintf("zn%02d", i)
 		cmds = append(cmds,
@@ -677,6 +685,25 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 			"nothing to permute and this fixture would not bind stability")
 	}
 
+	// F-A precondition: declaration order must NOT coincide with ascending
+	// lexicographic name order, or a (tier, Name ASC) tiebreak is invisible.
+	var declaredNames []string
+	for _, rs := range cfg.Security.NAT.Source {
+		declaredNames = append(declaredNames, rs.Name)
+	}
+	nameAscending := true
+	for i := 1; i < len(declaredNames); i++ {
+		if declaredNames[i] < declaredNames[i-1] {
+			nameAscending = false
+			break
+		}
+	}
+	if nameAscending {
+		t.Fatal("declared order is also ascending NAME order; a (tier, name) tiebreak " +
+			"would be indistinguishable from config order and this fixture could not " +
+			"see the rule F3 removed coming back")
+	}
+
 	out := buildSourceNATSnapshots(cfg, nil)
 	if len(out) != 2*nPerTier*rulesPerSet {
 		t.Fatalf("emitted %d rules, want %d", len(out), 2*nPerTier*rulesPerSet)
@@ -692,10 +719,10 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 		}
 	}
 	var wantRefs []string
-	for i := 0; i < nPerTier; i++ {
+	for i := nPerTier - 1; i >= 0; i-- {
 		wantRefs = append(wantRefs, fmt.Sprintf("if%02d", i))
 	}
-	for i := 0; i < nPerTier; i++ {
+	for i := nPerTier - 1; i >= 0; i-- {
 		wantRefs = append(wantRefs, fmt.Sprintf("zn%02d", i))
 	}
 	for i := range wantRefs {
@@ -720,9 +747,11 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 		}
 		lastIdx[s.PoolName] = i
 	}
+	split := map[string]bool{}
 	for name, lo := range firstIdx {
 		hi := lastIdx[name]
 		if hi-lo+1 != rulesPerSet {
+			split[name] = true
 			var between []string
 			for i := lo; i <= hi; i++ {
 				if out[i].PoolName != name {
@@ -737,7 +766,17 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	}
 
 	// (3) Within-rule-set rule order (Junos within-set order).
+	//
+	// GATED ON (2) (#6812 F-D). This reads out[lo+r], which only identifies
+	// THIS rule-set's rules when its block is contiguous. For a split rule-set
+	// the indices belong to whatever was interposed, so an ungated check emits
+	// failures that are artifacts of the (2) break rather than independent
+	// findings — under the sort.Slice mutation it produced 16 such lines for
+	// rule-sets whose own rules were in order.
 	for name, lo := range firstIdx {
+		if split[name] {
+			continue
+		}
 		for r := 0; r < rulesPerSet; r++ {
 			if got := out[lo+r].Name; got != fmt.Sprintf("r%d", r) {
 				t.Errorf("rule-set %s rule[%d] = %s, want r%d — within-rule-set config "+

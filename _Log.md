@@ -1,3 +1,45 @@
+## 2026-08-13 — #6812 round 6: a guard that could not see the rule it forbids
+
+- **Timestamp**: 2026-08-13
+- **Action**: fold the round-6 hostile review (F-A..F-D, none blocking).
+- **File(s)**: `pkg/nat/deterministic.go`,
+  `pkg/nat/pool_expansion_parity_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/deterministic-nat-cgnat.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+**F-A**: all three same-tier fixtures declared rule-sets in ASCENDING suffix
+order, so within a tier config order and ascending NAME order were the same
+sequence — a (tier, Name ASC) tiebreak was GREEN on all three. That is the very
+rule F3 removed, so the guard could not see it come back. Fixed by declaring
+high-to-low, plus a precondition that FATALS if declaration order is ever
+ascending by name again. Both halves now red on the name tiebreak; all ORDER
+regressions still hold.
+
+**F-B**: the walk's summary comment still claimed "rule-sets sorted by name" —
+false since round 4 and contradicted 55 lines below in the same block.
+
+**F-C**: verified before acting. 2 genuine v4 divergences (`198.51.100.1/032`,
+`10.0.0.0/016` accepted by `expandPoolV4`), cause `net.ParseCIDR` reading a
+leading-zero mask where `netip.ParsePrefix` refuses. My first probe said 14 —
+12 were artifacts of conflating "v6, skipped by design" with "rejected".
+FIXED rather than narrowed: the deterministic surface was reporting a
+65,536-address mapping for a pool that translates nothing. Narrowing the claim
+would have been the "document the divergence" option already rejected for F1.
+
+**F-D**: within-set order gated on contiguity; artifact lines 16 -> 10, the
+remaining 10 being genuine violations in contiguous rule-sets.
+
+| mutation | observed RED |
+|---|---|
+| walk (tier, Name ASC) | `charge order[0] = if00, want if09` + `poison set = map[q15:true], missing "q00"` |
+| builder (tier, Name ASC) | `emitted rule-set order[0] = if00, want if09` |
+| revert the `netip.ParsePrefix` check | `expandPoolV4("10.0.0.0/016") ACCEPTED 65536 addresses` |
+
+Whole matrix run under the diff-checksum guard; TREE RESTORED after every leg.
+
 ## 2026-08-13 — #6812 round-4 amendment: a mask with no witness, an option that is not one, and a sibling that did not bind
 
 - **Timestamp**: 2026-08-13
