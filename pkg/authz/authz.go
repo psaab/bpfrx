@@ -19,9 +19,17 @@
 // is on this host, the owning UID is read out of the kernel's socket table
 // (peer.go) — the caller supplies nothing and can forge nothing. That UID is
 // resolved to an OS account name via /etc/passwd and then to a login class via
-// `system login user <name> class <class>`. The result is the same class the
-// CLI would have applied, now enforced on the server side where it cannot be
+// `system login user <name> class <class>`. For every NON-ROOT caller the
+// passwd database names unambiguously, the result is the same class the CLI
+// would have applied, now enforced on the server side where it cannot be
 // skipped.
+//
+// The qualification is exact, not defensive. UID 0 is authorized
+// unconditionally here (PrincipalForUID short-circuits before reading cfg),
+// while the CLI honours an explicit `system login user root { class read-only; }`
+// — so for root the two surfaces CAN differ, by design and documented. And an
+// ambiguous uid resolves to no name at all on both surfaces since #6645, which
+// is agreement, but agreement on a denial rather than on a class.
 //
 // A configured `system services web-management api-auth` credential is the
 // second, weaker identity: it proves possession of a shared secret rather than
@@ -47,6 +55,7 @@ import (
 	"fmt"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/osident"
 )
 
 // Source records HOW a principal's identity was established. It exists so a
@@ -141,8 +150,12 @@ func (p Principal) String() string {
 //     authorized for everything. Denying UID 0 would be theater — root owns
 //     the config DB on disk and the daemon process itself.
 //  2. A principal carrying a login class is authorized iff that class holds
-//     `required` (config.ClassHasPermission — the same evaluator the CLI
-//     uses, so the two surfaces cannot disagree).
+//     `required` (config.ClassHasPermission — the same evaluator the CLI uses,
+//     so the two surfaces cannot disagree ABOUT WHAT A CLASS PERMITS). Which
+//     class a caller HOLDS is a separate question, answered by rule 1 for root
+//     and by the shared passwd resolver for everyone else; see the package
+//     comment for the one case (uid 0 with an explicit class) where the
+//     surfaces deliberately differ.
 //  3. Everything else is DENIED, including a peer UID that resolved to a real
 //     OS account which is not a configured login user. "Not in the RBAC
 //     model" is a reason to deny, not a reason to pick a default class.
@@ -208,11 +221,30 @@ func PrincipalForUID(cfg *config.Config, uid uint32) Principal {
 		return Principal{Source: SourcePeerUID, UID: 0, Username: "root", Superuser: true}
 	}
 	p := Principal{Source: SourcePeerUID, UID: uid}
-	name, ok := UsernameForUID(uid)
-	if !ok {
-		p.Detail = fmt.Sprintf("uid %d has no /etc/passwd entry", uid)
+	id := osident.ForUID(int(uid))
+	if !id.Resolved() {
+		// Say WHICH failure it was. "No passwd entry" was the only detail
+		// before #6645 because the old resolver had only that outcome; the
+		// shared resolver also refuses an AMBIGUOUS uid, and reporting that as
+		// "no entry" would send an operator hunting for a missing account when
+		// the real problem is two accounts sharing one uid.
+		//
+		// The RULE is single-sourced (osident); the WORDING is deliberately
+		// per-surface — this is a REST error body, pkg/cli's
+		// unidentifiedReason writes the longer console sentence for the same
+		// three reasons. Both must stay accurate; neither is the other's SSOT.
+		switch id.Reason {
+		case osident.ReasonAmbiguousUID:
+			p.Detail = fmt.Sprintf("uid %d is shared by more than one passwd account, "+
+				"so it does not name a single `system login user`", uid)
+		case osident.ReasonLookupFailed:
+			p.Detail = fmt.Sprintf("the passwd database could not be read for uid %d", uid)
+		default:
+			p.Detail = fmt.Sprintf("uid %d has no /etc/passwd entry", uid)
+		}
 		return p
 	}
+	name := id.Name
 	p.Username = name
 	class, ok := config.LoginUserClass(cfg, name)
 	if !ok {

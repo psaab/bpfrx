@@ -54,9 +54,16 @@ func TestCLIResolvesThroughTheSharedEvaluator_5561(t *testing.T) {
 		// compiler_system.go appended with no collision check — is now false.
 		// Keeping the line makes Commit() fail and the test cannot run at all.
 		//
-		// The ordering teeth are therefore unavailable BY CONSTRUCTION, not
-		// merely unused: with shadowing refused at commit, no committable config
-		// can make the built-ins-first order observable. What remains binding is
+		// The ordering teeth are therefore unavailable through NO CONFIG THE
+		// STRICT COMMIT PATH ADMITS. That is narrower than "by construction",
+		// which an earlier revision claimed and which is wrong:
+		// validateLoginClassShadowsBuiltinAST rejects strictly but WARNS
+		// leniently (f.verdict(lenient)), and both store_persist.go's load and
+		// Store.SyncApply take the lenient path — so a shadowing class can reach
+		// the ACTIVE config on an upgraded box or an HA standby, and the
+		// ordering would be observable there. The fixture removal still stands
+		// (the test drives Commit, which refuses); only the reason was
+		// over-strong (#6645). What remains binding is
 		// TestCLIResolveClassPermsCallsSharedEvaluator_5561 below, which is
 		// structural and is the guard that actually distinguishes sharing from
 		// an equivalent copy — the behavioural comparison here cannot, and does

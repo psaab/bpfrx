@@ -290,6 +290,18 @@ identity, so it is a real boundary rather than an advisory one:
   RBAC model says nothing about that account, which is a reason to deny. Grant
   it explicitly with `set system login user <account> class <class>` if it needs
   access.
+- A UID shared by **two passwd accounts** is denied on BOTH surfaces. The kernel
+  reports only the number, so the two callers are indistinguishable and naming
+  one of them would hand that account's class to the other. See "unidentifiable"
+  in the class table above — the REST gate and the CLI resolve this through the
+  same code since #6645, and a divergence here was a privilege escalation
+  between two legitimate accounts.
+- **The class table above governs both surfaces, with one exception**: the row
+  "uid 0 **with** an explicit `system login user root class <c>`" is honoured by
+  the CLI and NOT by the REST gate, which authorizes uid 0 unconditionally (see
+  "UID 0 is authorized unconditionally" above). Root can write the config
+  database directly, so the two are equivalent in effect; the table is the CLI's
+  answer, and this bullet is the REST caveat.
 - A local caller the server cannot identify is **denied**, and an `api-auth`
   credential does not substitute for it. In fact **no caller this host can PLACE
   ever reaches the credential check**: the credential speaks only for a caller

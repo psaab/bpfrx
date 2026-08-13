@@ -617,10 +617,14 @@ func NewServer(cfg Config) *Server {
 	// a cross-site page. Safe methods and header-key/Bearer clients are unaffected.
 	// #5561: enforce per-principal authorization on every state-changing route
 	// INSIDE the cross-site guard, so the order a mutation is evaluated in is
-	// (1) is this request cross-site provenance, (2) does the listener's
-	// api-auth policy admit it, (3) is the CALLER allowed to perform this
-	// action. Steps 1 and 2 are properties of the request; step 3 is the first
-	// one that asks who is making it. It sits inside the auth middleware
+	// (1) does the listener's api-auth policy admit it, (2) is this request of
+	// cross-site provenance, (3) is the CALLER allowed to perform this action.
+	// Steps 1 and 2 are properties of the request; step 3 is the first one that
+	// asks who is making it. (The enumeration listed 1 and 2 the other way round
+	// until #6645; the wrapping below is the authority — listenerHandler applies
+	// the auth middleware OUTSIDE this handler, so auth runs first. No runtime
+	// effect, but a reader reconstructing the order from the comment got it
+	// backwards.) It sits inside the auth middleware
 	// (applied per listener in listenerHandler) because a valid api-auth
 	// credential is one of the identities it considers.
 	sharedBase := mutationCrossSiteGuard(s.mutationAuthzGuard(mux))

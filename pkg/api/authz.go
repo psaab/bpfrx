@@ -231,8 +231,10 @@ const peerLookupTimeout = 5 * time.Second
 //
 // Deliberately far above any legitimate concurrency on a surface that answers a
 // handful of operator actions per second; it is a ceiling on unbounded growth,
-// not a throttle. Sized like the two queue caps in pkg/authz for the same
-// reason and with the same fail-closed direction.
+// not a throttle. Set for the same reason and with the same fail-closed
+// direction as the two queue caps in pkg/authz (maxPendingLookups,
+// maxHostAddrWaiters), though a quarter their size: those bound 4096 each,
+// this one 1024. "Sized like" overstated it.
 //
 // THE TRADEOFF THIS MAKES, stated so it can be disagreed with (#6645 r20).
 // The paragraph above gives the justification; these are the costs, and a

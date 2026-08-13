@@ -233,8 +233,26 @@ func TestUsernameForUIDParsesPasswd_5561(t *testing.T) {
 	if name, ok := UsernameForUID(0); !ok || name != "root" {
 		t.Errorf("uid 0 = (%q, %v), want (root, true)", name, ok)
 	}
-	if name, ok := UsernameForUID(5000); !ok || name != "first" {
-		t.Errorf("duplicate uid 5000 = (%q, %v), want the FIRST entry (first, true)", name, ok)
+	// A DUPLICATE uid must not resolve at all (#6645).
+	//
+	// This asserted the opposite until #6645 — "want the FIRST entry (first,
+	// true)" — and that assertion was defending a privilege escalation. With
+	// `first` and `second` sharing uid 5000, naming the first row hands
+	// `first`'s configured login class to `second`: two legitimate accounts,
+	// one of them silently promoted. The kernel gives us 5000 and nothing
+	// else, so the two callers are genuinely indistinguishable and there is no
+	// correct name to return; the only sound answer is to refuse and let the
+	// caller fail closed.
+	//
+	// The rule itself lives in pkg/osident (see lookupPasswd's comment), which
+	// this resolver now delegates to. That is the point: while pkg/authz held
+	// a second implementation, REST admitted the first row while the CLI
+	// refused — same uid, same passwd file, opposite verdicts, both suites
+	// green. TestRESTAndCLIAgreeOnAnAmbiguousUID_6645 (pkg/api) binds the
+	// cross-surface property end to end.
+	if name, ok := UsernameForUID(5000); ok {
+		t.Errorf("duplicate uid 5000 resolved to %q — an ambiguous uid must fail closed, "+
+			"never be attributed to whichever passwd row was read first", name)
 	}
 	if _, ok := UsernameForUID(9999); ok {
 		t.Error("an absent uid resolved to a name")

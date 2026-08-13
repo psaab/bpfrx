@@ -1,72 +1,55 @@
 package authz
 
 import (
-	"bufio"
 	"net"
-	"os"
-	"strconv"
-	"strings"
+
+	"github.com/psaab/xpf/pkg/osident"
 )
 
 // passwd.go maps a numeric UID to an OS account name (#5561).
 //
-// It parses /etc/passwd directly rather than using os/user, matching the
-// deliberate choice already made in pkg/daemon/login_password.go: os/user pulls
-// in cgo's libc resolver unless the binary is built with the osusergo tag, and
-// this daemon stays cgo-free. The account names it must resolve are the ones
-// the daemon itself provisioned with `useradd` (pkg/daemon/daemon_system.go),
-// which land in /etc/passwd; NSS-only identities (LDAP, systemd-homed) are not
-// part of the `system login user` model and are correctly not resolved.
-
-// passwdPath is the account database. It is a variable so a test can point the
-// resolver at a fixture; production never changes it.
-var passwdPath = "/etc/passwd"
-
-// UsernameForUID returns the account name for uid from /etc/passwd.
+// It DELEGATES to pkg/osident rather than scanning the database itself. That
+// package is the SSOT for "which account is this uid", already consumed by the
+// CLI, and it is dependency-free (`go list -deps ./pkg/osident` returns only
+// itself), so importing it here costs nothing and cannot cycle.
 //
-// On a duplicate UID it returns the FIRST matching entry, which is what libc's
-// getpwuid does; an operator who deliberately aliases two names onto one UID has
-// made them the same principal as far as the kernel is concerned, so there is no
-// more specific answer to give.
+// Why delegation rather than a second scanner, stated because this file HAD one
+// until #6645: the two implementations disagreed on duplicate UIDs, and the
+// disagreement was a privilege escalation. This file returned the FIRST
+// matching row — "what libc's getpwuid does" — while osident refuses to name an
+// ambiguous uid at all. On `admin:x:4242` + `bob:x:4242` with only
+// `system login user admin { class super-user; }` configured, REST admitted uid
+// 4242 as super-user and let it commit a candidate edit, while the CLI denied
+// the same caller as `unauthorized`. Both packages were green: nothing compared
+// the resolvers. See osident.lookupPasswd for the argument, and
+// TestRESTAndCLIAgreeOnAnAmbiguousUID_6645 for the binding.
 //
-// ok=false means the UID has no entry, or the database could not be read. Both
-// are an absence of identity: the caller must deny, never substitute a default.
+// (The no-cgo reasoning that motivated a hand-rolled scanner still holds and is
+// unchanged — osident parses the file directly for the same reason.)
+
+// UsernameForUID returns the account name for uid.
+//
+// ok=false means the UID has no entry, the entry is AMBIGUOUS (two accounts
+// share the uid), or the database could not be read. All three are an absence
+// of identity: the caller must deny, never substitute a default and never pick
+// one of the candidate names.
 func UsernameForUID(uid uint32) (string, bool) {
-	f, err := os.Open(passwdPath)
-	if err != nil {
-		return "", false
-	}
-	defer f.Close()
-
-	want := strconv.FormatUint(uint64(uid), 10)
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := sc.Text()
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		// name:passwd:uid:gid:gecos:home:shell
-		fields := strings.Split(line, ":")
-		if len(fields) < 3 {
-			continue
-		}
-		if fields[2] == want && fields[0] != "" {
-			return fields[0], true
-		}
-	}
-	return "", false
+	id := osident.ForUID(int(uid))
+	return id.Name, id.Resolved()
 }
 
 // SetPasswdPathForTest points the UID resolver at path and restores the
 // previous value through the returned function. Test-only; it exists so a
 // cross-package test (pkg/api) can exercise the real resolution path against a
 // fixture instead of depending on the accounts that happen to exist on the
-// machine running the suite. Dep-free — no test-only import leaks into the
-// production binary.
+// machine running the suite.
+//
+// It forwards to osident's seam so that pointing "the" passwd path at a fixture
+// moves BOTH surfaces at once. A local copy here would let a test configure the
+// REST resolver while the CLI kept reading /etc/passwd — the same split this
+// file exists to close.
 func SetPasswdPathForTest(path string) (restore func()) {
-	prev := passwdPath
-	passwdPath = path
-	return func() { passwdPath = prev }
+	return osident.SetPasswdPathForTest(path)
 }
 
 // SetProcNetTCPPathsForTest points the socket-table parser at fixtures and

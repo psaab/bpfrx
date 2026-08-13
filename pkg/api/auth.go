@@ -146,7 +146,17 @@ func CredentialCount(a *AuthConfig) int {
 	if a == nil {
 		return 0
 	}
-	n := len(a.Users)
+	// Count only users that can actually authenticate. checkAuthorization
+	// rejects `expected == ""`, so a `user bob { password ""; }` row
+	// authenticates nobody — exactly like the disabled/empty API keys filtered
+	// below. Counting it inflated the "withheld" warning on the user side only,
+	// which is an asymmetry an operator has to go and disprove (#6645).
+	n := 0
+	for _, secret := range a.Users {
+		if secret != "" {
+			n++
+		}
+	}
 	for key, ok := range a.APIKeys {
 		// constantTimeAPIKeyMatch skips `!valid || key == ""`, so both a
 		// disabled key and an empty-string key authenticate nobody and neither

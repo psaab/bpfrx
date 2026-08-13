@@ -78842,3 +78842,123 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   lives outside the test, and master can falsify it. This one announced its own
   premise, which is the only reason the failure was diagnosable in one run.
 - **File(s)**: pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6645 (#5561) fold — MAJOR-1, a privilege escalation created by a
+  MERGE rather than by either side's code, plus three MINORs and two NITs.
+
+  **MAJOR-1 — REST and the CLI resolved the same UID to different accounts.**
+  Reproduced firsthand through the production chain before anything was
+  changed: `/etc/passwd` with `admin:x:4242` and `bob:x:4242`, config granting
+  only `system login user admin { class super-user; }`, uid 4242 injected via
+  `PeerLookupFn` into a server built by `buildHTTPServer`:
+
+      authz.UsernameForUID(4242) = ("admin", true)
+      POST /api/v1/config/enter  -> 200, session issued
+      POST /api/v1/config/set    -> 200 {"success":true,"data":{"status":"ok"}}
+      candidate contains "escalated-by-bob"
+
+  So bob — not a login user at all — committed a candidate edit as super-user,
+  through admin's class, because `pkg/authz` returned the FIRST matching passwd
+  row. `pkg/osident` (master, #6706) refuses to name an ambiguous uid for
+  exactly this reason and the CLI denies the same caller as `unauthorized`.
+
+  Neither package was wrong on its own terms and both suites were green:
+  NOTHING compared the two resolvers. `pkg/osident` is absent at the pre-merge
+  head and present at master, so the divergence was created by the merge —
+  the second such interaction today, and unlike the other one it fails
+  silently, because a semantic conflict between two files that never call each
+  other has nothing to break.
+
+  Fixed by DELEGATION, not by copying the rule across: `osident.ForUID(uid)` is
+  new and is what `Current()` now calls, so one implementation answers "which
+  account is this uid" for every surface. `go list -deps ./pkg/osident` returns
+  only itself, so `pkg/authz` importing it cannot cycle — verified, not assumed.
+  `authz.SetPasswdPathForTest` forwards to osident's seam so a fixture moves
+  BOTH surfaces; a local copy would let a test configure REST while the CLI kept
+  reading /etc/passwd, which is the same split in miniature.
+
+  Two consequences I had to handle rather than discover later. `PrincipalForUID`
+  reported every unresolved uid as "has no /etc/passwd entry"; with ambiguity
+  now also unresolved, that would send an operator hunting for a missing
+  account when the real problem is two accounts sharing one uid — it now
+  distinguishes the three osident reasons. And `TestCurrentBodyCallsClassifyLookup_6706`
+  went RED correctly: extracting `ForUID` MOVED the boundary it was watching, so
+  asserting on `Current`'s body alone would have passed while proving nothing.
+  It now pins the whole chain `Current -> ForUID -> classifyLookup`, which is
+  strictly more than the single link it guarded before.
+
+  **The test that pinned the wrong side** (`authz_5561_test.go`, "want the FIRST
+  entry (first, true)") now asserts the denial, with the reasoning in the body:
+  it was an assertion defending a privilege escalation.
+
+  **MINOR-1** — "the same class the CLI would have applied" / "the two surfaces
+  cannot disagree" are now qualified. Both were false for uid 0, which REST
+  authorizes unconditionally while the CLI honours an explicit
+  `system login user root { class read-only; }`. The behaviour is fine and
+  documented; the unqualified claim was not. `docs/system-login.md` now says
+  which surface its class table describes, and carries the REST caveat plus the
+  ambiguous-uid row.
+
+  **MINOR-2** — the middleware enumeration said cross-site then api-auth; the
+  wrapping is api-auth then cross-site. No runtime effect, but a reader
+  reconstructing the order from the comment got it backwards.
+
+  **MINOR-3** — "unavailable BY CONSTRUCTION" is now "unavailable through no
+  config the STRICT commit path admits". `validateLoginClassShadowsBuiltinAST`
+  rejects strictly and WARNS leniently, and both `store_persist.go`'s load and
+  `Store.SyncApply` take the lenient path, so a shadowing class can reach the
+  ACTIVE config on an upgraded box or an HA standby. The fixture removal stands;
+  only the reason was over-strong.
+
+  **NIT-1** — `CredentialCount` counted every `Users` row while
+  `checkAuthorization` rejects an empty secret and the API-key arm filters
+  empties. A quoted-empty user secret inflated the `withheld` warning on one
+  side only; both arms now filter.
+
+  **NIT-2** — "sized like the two queue caps in pkg/authz" was 1024 against
+  4096/4096. Same reason and direction, quarter the size; said so.
+
+  TWO PATH SLIPS IN THE BRIEF, settled against the branch rather than guessed:
+  MINOR-3 is in `pkg/cli/permissions_shared_evaluator_5561_test.go`, not
+  `pkg/authz/`, and NIT-2 is `pkg/api/authz.go:234`, not `pkg/authz/authz.go` —
+  two different files named authz.go. Both texts were verbatim where they really
+  live. Nothing was invented to match a citation.
+- **File(s)**: pkg/osident/osident.go,
+  pkg/osident/current_calls_classifier_6706_test.go, pkg/authz/passwd.go,
+  pkg/authz/authz.go, pkg/authz/authz_5561_test.go,
+  pkg/api/authz_ambiguous_uid_6645_test.go, pkg/api/authz.go, pkg/api/auth.go,
+  pkg/api/server.go, pkg/cli/permissions_shared_evaluator_5561_test.go,
+  docs/system-login.md, _Log.md
+- **Validation**: RED-on-revert with `go vet` rc 0 first, so both failures are
+  assertions rather than build breaks. Restoring the pre-#6645 first-matching-row
+  scanner in `pkg/authz/passwd.go`:
+
+      pkg/api   FAIL TestRESTAndCLIAgreeOnAnAmbiguousUID_6645
+        "REST ADMITTED an ambiguous uid: POST /api/v1/config/enter -> 200.
+         uid 4242 is shared by admin and bob; only admin is granted super-user,
+         so admitting on the first passwd row hands admin's class to bob —
+         privilege escalation between two legitimate accounts. The CLI denied
+         the same caller as "unauthorized"."
+      pkg/authz FAIL TestUsernameForUIDParsesPasswd_5561
+        "duplicate uid 5000 resolved to "first" — an ambiguous uid must fail
+         closed, never be attributed to whichever passwd row was read first"
+
+  The new cross-surface test carries its own fixture control: `soleuser` holds
+  the SAME super-user class through the SAME config and passwd file, differing
+  only in being named by exactly one row, and REST must still ADMIT it. Without
+  that arm, "REST refused 4242" is equally explained by "4242 is not a
+  configured login user" and the assertion would be measuring the wrong thing.
+
+  A harness note: my first probe called `postRoute` on `config/enter` and THEN
+  `enterConfigure`, so the second open hit the configure lock and returned 409.
+  That 409 was my harness, not the gate — re-run with a single enter, the
+  escalation reproduced end to end. A row that does not add up gets re-run in
+  isolation before it is reported.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/authz/... ./pkg/api/... ./pkg/cli/... ./pkg/osident/...
+  ./pkg/daemon/...` all ok.
+
+  NOT re-derived, per instruction: the route enumeration (one ServeMux, 61
+  registrations, 19 mutating, tables equal to that set).
