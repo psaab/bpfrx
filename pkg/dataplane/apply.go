@@ -135,7 +135,14 @@ type LinkController interface {
 	// (#5103). A void return made a failed join indistinguishable from a
 	// successful one, so the link cycled with workers still live.
 	PrepareLinkCycle() error
-	NotifyLinkCycle()
+	// NotifyLinkCycle sends the "rebind" that recreates the AF_XDP workers
+	// PrepareLinkCycle joined. It is the documented inverse of "stop_workers",
+	// and the daemon uses it both to finish a cycle and to unwind an aborted
+	// one. It returns an error when the rebind did not land (#6871): a void
+	// return made a total forwarding outage — every worker stopped, ctrl off,
+	// nothing to re-arm them — indistinguishable from a clean rebind to the
+	// caller that reports the commit.
+	NotifyLinkCycle() error
 }
 
 type FabricID uint8
@@ -295,10 +302,16 @@ func (c dataPlaneLinkController) SetDeferWorkers(bool) {}
 
 func (c dataPlaneLinkController) PrepareLinkCycle() error { return nil }
 
-func (c dataPlaneLinkController) NotifyLinkCycle() {
+// NotifyLinkCycle on the eBPF-backed controller is always a success: the
+// DataPlane-level NotifyLinkCycle it forwards to is a no-op for the eBPF
+// dataplane (eBPF programs survive a link cycle, so there is nothing to rebind
+// and nothing that can fail), and a nil dp means no dataplane is wired at all.
+// The error exists for the userspace controller, which does the real rebind.
+func (c dataPlaneLinkController) NotifyLinkCycle() error {
 	if c.dp != nil {
 		c.dp.NotifyLinkCycle()
 	}
+	return nil
 }
 
 func NewDataPlaneHAController(dp DataPlane) HAController {

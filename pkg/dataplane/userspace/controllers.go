@@ -34,10 +34,13 @@ func (c userspaceLinkController) PrepareLinkCycle() error {
 	return nil
 }
 
-func (c userspaceLinkController) NotifyLinkCycle() {
+func (c userspaceLinkController) NotifyLinkCycle() error {
 	if c.manager != nil {
-		c.manager.NotifyLinkCycle()
+		return c.manager.NotifyLinkCycle()
 	}
+	// No manager wired: no workers were joined, so there is nothing to rebind
+	// and nothing to report. Mirrors PrepareLinkCycle's nil-manager reading.
+	return nil
 }
 
 type userspaceHAOps interface {

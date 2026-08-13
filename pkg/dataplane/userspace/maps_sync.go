@@ -412,11 +412,24 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if status.Enabled && m.rgTransitionInFlight.Load() {
-		// One or more RG transitions are in progress and the helper hasn't
-		// acked the HA state update yet. Keep ctrl disabled until
-		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
+	if status.Enabled && (m.rgTransitionInFlight.Load() || m.linkCycleInFlight()) {
+		// rgTransitionInFlight: one or more RG transitions are in progress and
+		// the helper hasn't acked the HA state update yet. Keep ctrl disabled
+		// until syncHAStateLocked succeeds to avoid re-enabling ctrl during the
 		// handoff (#279, #284).
+		//
+		// linkCycleInFlight (#6871): a RETH MAC link cycle has joined the
+		// workers and is taking the NIC down, so the XSK sockets this gate
+		// steers into are dead or about to be. The status tick is gated on the
+		// same lease and skips its whole body, but this is not only the tick's
+		// path: UpdateRGActive ends in applyHelperStatusLocked too, and it is
+		// driven by VRRP/cluster events and the 500ms RG reconcile pass, NEITHER
+		// of which is serialized on the daemon's applySem — so it can land in
+		// the middle of a cycle and re-enable ctrl on its own. Gating at the
+		// write is what makes the lease cover the producer rather than one
+		// caller of it. NotifyLinkCycle releases the lease at the top of its
+		// critical section, so its own post-rebind status apply is NOT gated
+		// here and a completed cycle re-enables ctrl on that call.
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.

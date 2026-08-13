@@ -239,8 +239,19 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 // beforeCycle (#5103) is invoked at most once, on the ONLY path that cycles the
 // link, and strictly BEFORE the first mutation of that link. It exists because
 // whether a cycle is needed cannot be predicted: the live set is ATTEMPTED
-// first, and only its failure proves the driver lacks IFF_LIVE_ADDR_CHANGE. A
-// rejected live set does not change link state — the kernel refuses the address
+// first, and the fallback runs on its failure.
+//
+// #6871: that failure does NOT prove the driver lacks IFF_LIVE_ADDR_CHANGE, and
+// an earlier revision of this comment said it did. The branch below is taken on
+// EVERY error from setHardwareAddr, and Linux's dev_set_mac_address path does
+// not consult that flag at all — it fails for a missing ndo_set_mac_address, a
+// wrong sa_family, an absent or busy device, or a driver/notifier rejection just
+// the same. So the fallback is "a live set was refused, for whatever reason, and
+// a cycle is the remaining option", which is why it is worth the cost only on the
+// drivers that actually need it. The distinction matters here: a cycle entered
+// for a transient reason still joins the workers and still drops forwarding.
+//
+// A rejected live set does not change link state — the kernel refuses the address
 // change outright — so at the moment beforeCycle runs the link is still exactly
 // as it was found, and returning an error from it aborts with nothing to undo.
 //

@@ -115,10 +115,18 @@ func TestApplyCallSiteSurfacesRethMemberCommitError_5103(t *testing.T) {
 
 	// --- THE #5103 F2 DISCRIMINATOR.
 	if err == nil {
+		// #6871: an earlier revision of this message said the member is left
+		// "administratively DOWN". It is not — a hook failure returns BEFORE
+		// setDown, so the link is untouched and still UP on its previous MAC.
+		// What IS left behind is the dataplane state the hook already applied:
+		// ctrl driven to 0 and the workers' state unknown (stop_workers failed,
+		// so they may or may not have been joined). That is the outage the
+		// commit must not report as success.
 		t.Fatal("the apply reported SUCCESS over a RETH member whose link cycle was " +
 			"ABORTED: programRethMemberMAC's commit error never reached " +
-			"applyDataplaneAndHACore's return. The member is left administratively " +
-			"DOWN with its AF_XDP workers joined and the commit says it worked (#5103)")
+			"applyDataplaneAndHACore's return. The link is untouched, but ctrl is off " +
+			"and the AF_XDP worker state is unknown, so the node is not forwarding — " +
+			"and the commit says it worked (#5103)")
 	}
 	if !errors.Is(err, errRethPrepareLinkCycle) {
 		t.Errorf("the apply failed, but not with the RETH prepare-abort classification: "+

@@ -77429,3 +77429,133 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   `go test ./pkg/daemon/...` rc=0 (both packages ok); `gofmt -l` clean.
   Advances #5103.
 - **File(s)**: pkg/daemon/reth_callsite_effect_5103_test.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #5103 / #6871 — hold the AF_XDP worker join across the RETH MAC
+  link cycle with a lease, and give the rollback a real failure signal.
+  Codex's leg at 16b65ec81 returned DO-NOT-MERGE with two RUNTIME blockers.
+  Both reproduced firsthand before writing anything.
+  B1 — the join was a MOMENT, not a barrier. `PrepareLinkCycle` joins the
+  workers and returns, releasing `m.mu`, and the daemon does not reach
+  `setDown` until several netlink calls later. Every other holder of `m.mu`
+  runs in that window. The 1 Hz status tick alone undoes the join five ways:
+  `syncSnapshotLocked`'s plan-key branch `stopLocked()`s and RESPAWNS the
+  helper process; `retryDeferredWorkerArmLocked` republishes with
+  `DeferWorkers=false`; `maybeAutoRebindBusyBindingsLocked` sends `rebind`
+  directly; `verifyBindingsMapLocked` repopulates rows a fail-closed ctrl
+  disable just cleared; `applyHelperStatusLocked` re-enables ctrl on sockets
+  whose queues are being destroyed. `stop_workers` preserves registered
+  bindings and `forwarding_armed`, so the Rust same-plan predicate sees
+  runnable-but-not-live bindings and restarts workers.
+  Scope: OPTION B, a tick-wide lease. A publish-scoped lease (Option A) closes
+  the reported symptom and provably leaves the same bug in three other places.
+  `m.linkCycleLeaseUntil` is an `atomic.Int64` DEADLINE — atomic for exactly
+  the reason `rgTransitionInFlight` is (the guard must survive `m.mu` being
+  released), a deadline rather than a bool because a stranded lease would
+  suppress the reconcile loop permanently, which is worse than the race.
+  `m.deferWorkers` was deliberately NOT reused as the substrate: it is set and
+  cleared entirely from outside the package, `PrepareLinkCycle`/
+  `NotifyLinkCycle` never touch it, and two of the five producers do not read
+  it.
+  Acquire: in `PrepareLinkCycle`, BEFORE the ctrl disable — the window opens at
+  the first mutation of dataplane state, and a `stop_workers` can fail after
+  the disable has already cleared binding rows. Release: at the TOP of
+  `NotifyLinkCycle`'s critical section, which is both the earliest correct
+  point (from there `m.mu` is held for the rest of the function, so no producer
+  can interleave) and the latest (it precedes EVERY return, including the
+  rebind failure — a release placed after those would strand the lease on
+  exactly the paths where forwarding is already down). Releasing there also
+  keeps the ctrl gate out of the way of `NotifyLinkCycle`'s own post-rebind
+  status apply, so a completed cycle re-enables ctrl on that call rather than
+  costing an extra tick of fail-closed transit.
+  Two consult sites. (1) The top of the status tick's critical section, which
+  skips the WHOLE body. Nothing is lost: every action in that body is
+  level-triggered on persistent manager state, so the next tick after release
+  services whatever is still outstanding. (2) The ctrl write in
+  `applyHelperStatusLocked`, alongside the existing `rgTransitionInFlight`
+  check — CONDITION 1 from the brief, traced to a verdict: `UpdateRGActive` IS
+  a producer of the ctrl-re-enable class. Path: `reconcileRGStateLoop` (500ms)
+  and the VRRP/cluster event handlers -> `d.dp.HA().SetRGActive` ->
+  `Manager.UpdateRGActive` -> `applyHelperStatusLocked`. None of those holds
+  `d.applySem`, so it lands mid-cycle on its own schedule, and its own
+  `rgTransitionInFlight` guard does not cover it (a demotion never sets the
+  flag; an activation clears it before the status apply). A tick-only lease
+  would have shipped with that hole.
+  CONDITION 2, lease release: `RegenerateNeighborSnapshot` (60s + netlink
+  debounce) and `SyncFabricState` -> `persistResolvedFabricsLocked` (30s) both
+  publish FIRST and then advance `m.generation`, `lastSnapshot.Generation` and
+  `m.publishedSnapshot` in LOCKSTEP to the same value. So they never leave the
+  tick's predicate (`publishedSnapshot < lastSnapshot.Generation`) true and
+  unserviceable, and the post-release reconcile sees a coherent "nothing
+  pending". A suppressed publish is retried, not lost. There IS a residual
+  hazard — a `Compile` pendingXSKStartup snapshot left genuinely unpublished
+  can be swallowed by either lockstep advance — but it is PRE-EXISTING and
+  independent of the lease (both run under `m.mu` and can land between any two
+  ticks); the lease widens its window by roughly one tick period for the
+  duration of a cycle. Filed separately rather than widening this diff.
+  B2 — the rollback was attempted, never guaranteed. `NotifyLinkCycle` was
+  void: a failed `rebind` was a `slog.Warn` and a bare return, so a CLEAN cycle
+  whose rebind failed left every worker stopped WHILE THE COMMIT REPORTED
+  SUCCESS. Chose the ERROR RETURN of the three offered (error / recovery debt /
+  guaranteed retry): it is the mechanism this PR already chose for
+  `PrepareLinkCycle`, it needs no new machinery (the daemon's
+  `errRethPrepareLinkCycle` + `errors.Join` fold already exists at both call
+  sites), and it is what makes the shipped claim "owns its own rollback" true
+  rather than merely asserted. `LinkController.NotifyLinkCycle()` now returns
+  `error`; `DataPlane.NotifyLinkCycle()` stays void (the eBPF Manager's is a
+  genuine no-op) and `LegacyDataPlaneAdapter` discards it with a note — that
+  adapter is not the live path. Error scope is deliberately narrow, mirroring
+  `PrepareLinkCycle`'s: it reports whether the REBIND landed, NOT whether the
+  subsequent `applyHelperStatusLocked` did. Folding the latter was tried and
+  reverted — it fails with "userspace_ctrl map not loaded" whenever no shim is
+  attached, which is a legitimate state, so folding it would fail commits on a
+  healthy deployment: the same over-rejection this PR already corrected once.
+  Fixed the fake: `abortRecoveryLinkController` only counted calls, so a failed
+  unwind was unobservable BY CONSTRUCTION. It now carries `notifyErr`.
+  Also pinned `needLinkCycleRecovery`, which had no behavioural binding at all.
+  `TestApplyFailsWhenPostCycleRebindFails_6871` makes it observable through the
+  apply's own returned error: the cycle completes cleanly (so the flag must be
+  armed) and the rebind only the armed flag reaches then fails.
+  Six claim contradictions from the Codex audit, all corrected: `docs/reth-mac.md`
+  "stops the workers whether it then succeeds or fails" (a `stop_workers` that
+  never reaches the helper joins nothing) and "every stop_workers empties
+  records" (a dial/write failure precedes the handler);
+  `daemon_apply_dataplane.go` "only the failed-worker-join class produces a
+  commit error" (the gate is "the hook RAN") and "cleared every binding row"
+  (`clearAllBindingRowsLocked` is best-effort and discards each Update error);
+  `daemon_reth.go` a failed live set "proves" no `IFF_LIVE_ADDR_CHANGE` (the
+  branch is taken on EVERY error, and Linux's MAC path never consults the flag);
+  `reth_callsite_effect_5103_test.go` "left administratively DOWN" (a hook
+  failure returns before `setDown` — the link is untouched and still UP).
+  Test seam: `statusLoopInterval` is now a package var so the concurrency test
+  can drive many real ticks in a fraction of a second. Production never
+  reassigns it; mirrors `linkCycleRebindSleep` in the same subsystem.
+  Validation. `go build ./...` rc=0; `go vet ./pkg/daemon/... ./pkg/dataplane/...`
+  rc=0; `gofmt -l` clean on every touched file; `go test ./...` (whole repo,
+  unprivileged) rc=0. The discriminator deliberately needs NO BPF maps — map
+  creation is EPERM here, so a map-backed fixture would have made it SKIP rather
+  than run. Under root the `pkg/dataplane/userspace` suite has 8 failures; the
+  identical 8 fail at the unmodified PR head 16b65ec81 in a detached worktree
+  (`diff` of the sorted FAIL sets is empty), so they are pre-existing root-only
+  failures, not regressions. No Rust changed, so no cargo leg is owed.
+  Mutation matrix, 15 cells, every RED an ASSERTION failure (zero build breaks,
+  zero skips): tick guard removed -> RED (discriminator) / GREEN (resume);
+  ctrl gate `|| linkCycleInFlight()` removed -> RED (UpdateRGActive) / GREEN
+  (NotifyLinkCycle's own apply); acquire removed -> RED x2 / GREEN (no-helper);
+  release moved to a defer -> RED (ctrl costs an extra tick) / GREEN (resume);
+  TTL expiry removed -> RED; rollback `NotifyLinkCycle` discarded -> RED /
+  GREEN; step 2.6b2 fold discarded -> RED / GREEN; `needLinkCycleRecovery=false`
+  after its assignment -> RED / GREEN (the #5103 call-site guard).
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/process_status.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/controllers.go,
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/apply.go, pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/daemon_reth.go, pkg/daemon/reth_rollback_failure_6871_test.go,
+  pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
+  pkg/daemon/reth_callsite_effect_5103_test.go,
+  pkg/daemon/policy_scheduler_apply_test.go, docs/reth-mac.md, _Log.md

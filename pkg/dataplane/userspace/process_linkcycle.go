@@ -133,24 +133,110 @@ func (m *Manager) DisableAndStopHelper() {
 	_ = m.disableCtrlBeforeTeardownLocked()
 }
 
+// linkCycleLeaseTTL bounds a single link-cycle lease. The lease is normally
+// ended by NotifyLinkCycle, which every path that takes one reaches (the cycle
+// completes and step 2.6b2 rebinds; or the cycle aborts and
+// programRethMACWithWorkerJoin rolls back with the same call). The TTL is the
+// backstop for the one case that does not: a caller that dies between the two.
+// A lease that never ends would suppress the 1 Hz reconcile FOREVER, which is a
+// worse failure than the race it exists to close.
+//
+// 60s is derived from the worst-case Prepare→Notify gap, not picked round. The
+// dominant term is externalCommandTimeout (pkg/daemon/exec_timeout.go, 15s) on
+// the per-member `ethtool -K rxvlan off` that step 2.6 runs after each member's
+// MAC program; a hung ethtool on a 2-RETH node is 30s, and NotifyLinkCycle then
+// pays its own 1s NIC settle. A member that cycles re-arms the lease itself, so
+// the exposure does not grow with the number of CYCLING members — only with the
+// non-cycling ones visited after the last cycle.
+const linkCycleLeaseTTL = 60 * time.Second
+
+// linkCycleLeaseNow is time.Now, indirected so a test can prove the TTL backstop
+// actually expires a stranded lease without sleeping one out. Production never
+// reassigns it. Mirrors linkCycleRebindSleep below.
+var linkCycleLeaseNow = time.Now
+
+// acquireLinkCycleLease opens the #6871 lease. Callers hold m.mu, but the lease
+// deliberately does not depend on it — it is read by the status loop from
+// outside m.mu's protection of the window it covers.
+func (m *Manager) acquireLinkCycleLease() {
+	m.linkCycleLeaseUntil.Store(linkCycleLeaseNow().Add(linkCycleLeaseTTL).UnixNano())
+}
+
+// releaseLinkCycleLease ends the lease. Idempotent — the release site runs
+// unconditionally at the top of NotifyLinkCycle's critical section, so a second
+// call (or a call with no lease held) is a no-op.
+func (m *Manager) releaseLinkCycleLease() {
+	m.linkCycleLeaseUntil.Store(0)
+}
+
+// linkCycleInFlight reports whether a RETH MAC link cycle currently owns the
+// dataplane. It self-heals a stranded lease past linkCycleLeaseTTL: the CAS
+// clears the deadline so the wedge cannot recur every tick, and the tick that
+// observes the expiry resumes reconciling immediately.
+func (m *Manager) linkCycleInFlight() bool {
+	until := m.linkCycleLeaseUntil.Load()
+	if until == 0 {
+		return false
+	}
+	if linkCycleLeaseNow().UnixNano() >= until {
+		if m.linkCycleLeaseUntil.CompareAndSwap(until, 0) {
+			slog.Warn("userspace: link-cycle lease expired without a rebind; resuming reconcile",
+				"ttl", linkCycleLeaseTTL)
+		}
+		return false
+	}
+	return true
+}
+
 // PrepareLinkCycle must be called BEFORE any link DOWN/UP cycle (e.g. RETH
 // MAC programming). It:
 //  1. Disables ctrl so the XDP shim stops redirecting to XSK
 //  2. Leaves the userspace shim attached with transit fail-closed
 //  3. Sends "stop_workers" to the Rust helper, which joins all worker
 //     threads — no thread touches UMEM after this returns
+//  4. Takes the #6871 link-cycle lease, which holds that join across the
+//     window where m.mu is NOT held (see below)
 //
 // The caller then performs the link DOWN/UP. Afterwards, NotifyLinkCycle
 // sends "rebind" to recreate workers with fresh AF_XDP sockets.
+//
+// #6871: the join alone is a MOMENT, not a barrier. This function releases m.mu
+// on return, and the daemon does not reach setDown until several netlink calls
+// later — so every other holder of m.mu runs in between. The 1 Hz status tick
+// alone restarts the workers four different ways in that window:
+//
+//   - syncSnapshotLocked's plan-key branch stopLocked()s and respawns the whole
+//     HELPER PROCESS (process_status.go);
+//   - retryDeferredWorkerArmLocked republishes with DeferWorkers=false to settle
+//     a #5134 debt (manager_worker_arm_5134.go);
+//   - maybeAutoRebindBusyBindingsLocked sends "rebind" directly — the exact
+//     inverse of the stop_workers just issued (maps_sync.go);
+//   - applyHelperStatusLocked re-enables ctrl, pointing the shim at XSK sockets
+//     whose queues the cycle is about to destroy (maps_sync.go).
+//
+// stop_workers keeps registered bindings and forwarding_armed, so the helper's
+// same-plan predicate sees runnable-but-not-live bindings and restarts workers
+// on any of those. The lease makes the tick skip its whole body while a cycle
+// owns the dataplane, and gates the ctrl re-enable at its source so the
+// non-tick callers of applyHelperStatusLocked (UpdateRGActive, driven by VRRP
+// events and the 500ms RG reconcile, which is NOT serialized on the daemon's
+// applySem) cannot re-enable it either.
 func (m *Manager) PrepareLinkCycle() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil || m.proc.Process == nil {
 		// No helper running: there are no workers to join, so a link cycle
 		// cannot race one. This is a genuine success, not a swallowed
-		// failure.
+		// failure. No lease either — there is nothing for it to protect, and
+		// taking one would suppress the reconcile for no reason.
 		return nil
 	}
+	// Take the lease BEFORE the first mutation of dataplane state. The window
+	// that needs covering opens at the ctrl disable, not at the successful
+	// join: disableCtrlBeforeTeardownLocked can clear every binding row
+	// fail-closed and then stop_workers can still fail, and a tick landing in
+	// THAT state would repopulate the rows it just cleared.
+	m.acquireLinkCycleLease()
 	// Disable ctrl BEFORE stopping workers. If the disable cannot be
 	// verified the wrapper clears all bindings fail-closed so the shim has
 	// no READY slot to redirect to while the workers are being joined.
@@ -211,17 +297,53 @@ var linkCycleRebindSleep = time.Sleep
 // NIC's UMR WQE queue overflows when all XSK sockets are recreated
 // simultaneously (rx_xsk_congst_umr), causing UMEM pages to not be mapped
 // and packets to be silently dropped despite successful XDP_REDIRECT.
-func (m *Manager) NotifyLinkCycle() {
+//
+// #6871: it returns an error, for the same reason PrepareLinkCycle does, and
+// with the same deliberately narrow scope — it reports whether the REBIND
+// landed, and nothing else (see the scope note at the status apply). This is the
+// designated inverse of "stop_workers" and the daemon uses it BOTH to complete a
+// cycle and to unwind an aborted one, but a failed rebind used to be a slog.Warn
+// and a bare return on a void function, so a clean cycle whose rebind failed left
+// every worker stopped WHILE THE COMMIT REPORTED SUCCESS: a silent total
+// dataplane outage on that node. The error return is what makes the daemon's
+// "this path owns its own rollback" claim true rather than attempted;
+// programRethMACWithWorkerJoin folds it into the same errRethPrepareLinkCycle
+// class as a failed join, and step 2.6b2 folds it into the commit error.
+//
+// It also ends the link-cycle lease, unconditionally, at the top of its critical
+// section — see the release site for why that is both the earliest and the
+// latest correct point.
+func (m *Manager) NotifyLinkCycle() error {
 	// Let the NIC fully tear down XSK zero-copy contexts before recreating
 	// sockets. mlx5 releases zero-copy queue resources asynchronously after
 	// socket close — binding a new socket to the same queue before teardown
 	// completes returns EBUSY. 1s gives the driver ample time.
+	//
+	// The lease is still held across this sleep. That is the point: m.mu is NOT
+	// held here, so without it the tick would have a full second of open season
+	// on a helper whose workers are joined and whose sockets are dead.
 	linkCycleRebindSleep(1 * time.Second)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// End the lease here, FIRST, and unconditionally.
+	//
+	// Earliest correct point: from this line on we hold m.mu for the rest of the
+	// function, so no other producer can interleave anyway — the lease exists
+	// only to cover the window where m.mu is NOT held, and that window just
+	// closed. Releasing here (rather than at the end) also keeps the ctrl gate in
+	// applyHelperStatusLocked out of the way of our own post-rebind status apply,
+	// so a completed cycle re-enables ctrl on this call instead of costing an
+	// extra tick of fail-closed transit.
+	//
+	// Latest correct point: it precedes every `return` below, including the
+	// no-helper early return and the rebind failure. A release placed after any
+	// of those would strand the lease on exactly the paths where forwarding is
+	// already down, turning a recoverable outage into a frozen reconcile loop
+	// until the TTL backstop fired.
+	m.releaseLinkCycleLease()
 	if m.proc == nil || m.proc.Process == nil {
-		return
+		return nil
 	}
 	// Ensure ctrl is disabled (PrepareLinkCycle should have done this,
 	// but guard against callers that skip it). The subsequent rebind
@@ -248,10 +370,30 @@ func (m *Manager) NotifyLinkCycle() {
 
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "rebind"}, &status); err != nil {
-		slog.Warn("userspace: rebind after link cycle failed", "err", err)
-		return
+		// #6871: was a Warn and a bare return. The workers are joined and ctrl
+		// is off at this point, so a rebind that does not land leaves this node
+		// forwarding nothing — and the void signature made that indistinguishable
+		// from a successful rebind to the one caller that reports the commit.
+		slog.Error("userspace: rebind after link cycle failed; workers stay stopped",
+			"err", err)
+		return fmt.Errorf("userspace: rebind after link cycle: %w", err)
 	}
-	_ = m.applyHelperStatusLocked(&status)
+	// SCOPE of the error contract, deliberately narrow and mirroring
+	// PrepareLinkCycle's: this function reports whether the REBIND landed, and
+	// nothing else. The status apply is logged but NOT folded in.
+	//
+	// Folding it was tried and is wrong for the same reason PrepareLinkCycle
+	// does not fold its ctrl-disable error: applyHelperStatusLocked fails with
+	// "userspace_ctrl map not loaded" whenever no shim is attached, which is a
+	// legitimate state, and in that state there is no redirect path for the
+	// binding rows to matter to. Returning there would fail a commit on a
+	// healthy deployment — an over-rejection in place of the under-rejection
+	// this change exists to fix. The caller's decision hinges on one thing:
+	// whether the workers stop_workers joined are running again, which is
+	// exactly the rebind.
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		slog.Warn("userspace: helper status apply after link-cycle rebind failed", "err", err)
+	}
 	// #2079 r11: the deferred apply (DeferWorkers) skipped the appliedSnapshot
 	// capture because the helper had not reconciled its forwarding state. The
 	// rebind above reconciles the bindings (and swaps the coordinator
@@ -277,4 +419,5 @@ func (m *Manager) NotifyLinkCycle() {
 	// pings generate hardware RX events that trigger NAPI, which posts
 	// fill ring WQEs so zero-copy XSK can receive packets.
 	m.bootstrapNAPIQueuesAsyncLocked("link-cycle")
+	return nil
 }

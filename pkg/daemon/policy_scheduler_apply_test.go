@@ -120,7 +120,7 @@ type noopLinkController struct{}
 
 func (noopLinkController) SetDeferWorkers(bool)    {}
 func (noopLinkController) PrepareLinkCycle() error { return nil }
-func (noopLinkController) NotifyLinkCycle()        {}
+func (noopLinkController) NotifyLinkCycle() error  { return nil }
 
 type runtimeOnlyPolicyUpdaterTestDP struct {
 	runtimeOnlyApplyTestDP

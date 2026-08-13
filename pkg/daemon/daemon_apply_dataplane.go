@@ -385,7 +385,19 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	if d.dp != nil && needLinkCycleRecovery {
 		// Actual link DOWN/UP occurred — old XSK sockets are dead.
 		// Rebind to create fresh sockets on the reinitialized queues.
-		d.dp.Link().NotifyLinkCycle()
+		//
+		// #6871: fold a failed rebind into the commit. Every member that cycled
+		// had its workers joined by PrepareLinkCycle and its ctrl disabled; this
+		// is the only call that undoes that. A rebind that does not land leaves
+		// the node forwarding nothing, and reporting the commit successful over
+		// it is a silent total outage. Same errRethPrepareLinkCycle class as a
+		// failed join — the observable state is identical.
+		if err := d.dp.Link().NotifyLinkCycle(); err != nil {
+			slog.Error("failed to rebind AF_XDP sockets after the RETH MAC link cycle; "+
+				"workers stay stopped", "err", err)
+			networkdErr = errors.Join(networkdErr,
+				fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err))
+		}
 		if d.ra != nil {
 			d.ra.ResendBurst()
 		}
@@ -461,8 +473,13 @@ var errRethPrepareLinkCycle = errors.New("reth mac: link cycle failed after the 
 // rebind (#5700) also use) and needLinkCycleRecovery (step 2.6b2's rebind gate).
 // It returns both, updated.
 //
-// Only the failed-worker-join class produces a commit error; an ordinary MAC-set
-// failure stays warn-only, as it always has. errors.Join, not assignment: an
+// Only the class where the worker-join HOOK RAN produces a commit error; an
+// ordinary MAC-set failure stays warn-only, as it always has. (#6871: an earlier
+// revision said "the failed-worker-join class", which was narrower than the code
+// — programRethMACWithWorkerJoin also classifies a post-join setDown, cycled
+// MAC-write or link-UP failure as commit-fatal, and deliberately so: the hook has
+// already stopped the workers by then. The gate is "the hook ran", and this
+// sentence now says the same thing the wrapper does.) errors.Join, not assignment: an
 // error already accumulated by an earlier step or an earlier member must not be
 // clobbered by this one. The recovery gate is ORed, not assigned: a member that
 // needs no cycle must not clear a gate an earlier member armed.
@@ -498,8 +515,11 @@ func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
 //
 // The DATAPLANE is not left as it was found, and that is true from the moment
 // the hook RUNS, not from the moment it fails. PrepareLinkCycle disables ctrl
-// (and clears every binding row if that disable could not be verified) before it
-// can fail on stop_workers, so a failed join leaves "the outcome is unknown" —
+// (and attempts to clear the binding rows if that disable could not be verified
+// — #6871: clearAllBindingRowsLocked is best-effort, it discards each map Update
+// error and no-ops entirely when the bindings map is not loaded, so "cleared" is
+// the intent, not a guarantee; the guarantee is that ctrl is being driven to 0)
+// before it can fail on stop_workers, so a failed join leaves "the outcome is unknown" —
 // but a SUCCEEDED join leaves the workers deliberately stopped, which is the
 // same forwarding state. After it returns nil, setDown and the cycled
 // setHardwareAddr are both still fallible and both yield linkCycled=false. So
@@ -634,7 +654,21 @@ func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAdd
 	// count; 2 on the loss cluster). Bounded, and only on a path where this
 	// node's forwarding is already down — but do not widen this loop, or move
 	// another sleeping call into it, without re-checking that budget.
-	d.dp.Link().NotifyLinkCycle()
+	//
+	// #6871: the rollback's own failure is now visible. NotifyLinkCycle was void
+	// and swallowed a failed rebind into a slog.Warn, so "this path owns its own
+	// rollback" was a claim the mechanism could not keep — an abort whose recovery
+	// ALSO failed produced exactly the same (false) evidence as one that recovered.
+	// The commit already fails on this branch either way; the rollback error is
+	// JOINED onto the abort cause rather than replacing it, because the abort is
+	// the more actionable of the two and must not be lost.
+	if rebindErr := d.dp.Link().NotifyLinkCycle(); rebindErr != nil {
+		slog.Error("userspace: the RETH MAC rollback rebind ALSO failed; this node's "+
+			"AF_XDP workers are stopped with nothing left to re-arm them",
+			"iface", ifName, "err", rebindErr)
+		return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle,
+			errors.Join(err, rebindErr))
+	}
 	return linkCycled, fmt.Errorf("%w: %w", errRethPrepareLinkCycle, err)
 }
 

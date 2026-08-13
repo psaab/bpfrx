@@ -36,8 +36,17 @@ import (
 
 // abortRecoveryLinkController counts both halves of the link-cycle protocol so a
 // test can tell a rollback rebind from no rebind at all.
+//
+// #6871: notifyErr exists because counting the call was the whole fake. A
+// rollback that FAILED was unobservable by construction — the double could only
+// ever report "the rebind was attempted", which is precisely the claim under
+// examination — so no test in this package could see a failed unwind, and the
+// production signature (a void NotifyLinkCycle) could not have carried one
+// anyway. Both halves are fixed together: the interface returns an error and the
+// double can produce one.
 type abortRecoveryLinkController struct {
 	prepareErr   error
+	notifyErr    error
 	prepareCalls int
 	notifyCalls  int
 }
@@ -49,7 +58,10 @@ func (c *abortRecoveryLinkController) PrepareLinkCycle() error {
 	return c.prepareErr
 }
 
-func (c *abortRecoveryLinkController) NotifyLinkCycle() { c.notifyCalls++ }
+func (c *abortRecoveryLinkController) NotifyLinkCycle() error {
+	c.notifyCalls++
+	return c.notifyErr
+}
 
 // abortRecoveryTestDP is a RuntimeDataPlane whose only interesting surface is
 // the link controller. It reuses deferredMACReapplyTestDP for the rest of the

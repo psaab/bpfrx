@@ -263,6 +263,20 @@ type Manager struct {
 
 	rgTransitionInFlight atomic.Bool // set before syncHAStateLocked, cleared on completion
 
+	// linkCycleLeaseUntil is the #6871 link-cycle lease: the deadline
+	// (UnixNano) until which an in-flight RETH MAC link DOWN/UP owns the
+	// dataplane, or 0 when no cycle is in flight. See the lease block in
+	// process_linkcycle.go for what it suppresses and why a deadline rather
+	// than a bare flag.
+	//
+	// atomic, and for exactly the reason rgTransitionInFlight above is: the
+	// guard has to survive m.mu being RELEASED. PrepareLinkCycle joins the
+	// workers and returns, dropping m.mu while the daemon takes the NIC down —
+	// and every other holder of m.mu is free to run in that window, including
+	// the 1 Hz status tick, which has four independent ways to undo the join
+	// before the link comes back up.
+	linkCycleLeaseUntil atomic.Int64
+
 	// neighborPrewarmInFlight is the #5104 singleflight guard for the async
 	// neighbor-resolve prewarm scan spawned by the status loop. The loop kicks
 	// a full scan every 1s for the first 60s (then every 10s on HA standby); a

@@ -130,9 +130,15 @@ accumulators: the commit error (joined, so an earlier step's error survives) and
 `needLinkCycleRecovery` (ORed, so a member needing no cycle cannot clear a gate
 an earlier member armed).
 
-**The gate is "the hook RAN", not "the hook FAILED".** `PrepareLinkCycle`
-disables `ctrl` and stops the workers whether it then succeeds or fails, so a
-*successful* join leaves the member just as un-forwarding as a failed one — and
+**The gate is "the hook RAN", not "the hook FAILED".** `PrepareLinkCycle` drives
+`ctrl` to 0 *before* it can fail on `stop_workers`, so by the time it returns —
+either way — the member is no longer forwarding. On success the workers are
+additionally joined; on failure their state is simply **unknown**, which is why
+the link must not be cycled (#6871: an earlier revision of this sentence said it
+"stops the workers whether it then succeeds or fails", which overstates the
+failure path — a `stop_workers` that never reaches the helper joins nothing). A
+*successful* join therefore leaves the member just as un-forwarding as a failed
+one — and
 `setDown` and the cycled `setHardwareAddr` are both still fallible after it
 returns. Both of those yield `linkCycled=false`, i.e. exactly the state above:
 prepare applied, cycle not completed, and neither `linkCycled` nor
@@ -164,9 +170,14 @@ Suppression is per-MEMBER, while step 2.6b2's gate is a per-APPLY accumulator, s
 an apply that mixes an aborted member with a cycled one pays two rebinds. Which
 of the two arms the 500ms zero-copy quiesce depends on the order step 2.6 visits
 the members in, and that order is a Go map range — so both orders hold. Every
-`stop_workers` empties `coord.workers.records`
+`stop_workers` **that reaches its handler** empties `coord.workers.records`
 (`WorkerManager::stop_and_clear` joins each worker thread, then `clear()`s), and
-`tear_down` samples `had_live_workers` from exactly that. If the ABORTED member
+`tear_down` samples `had_live_workers` from exactly that. The qualifier is
+load-bearing and #6871 added it: a prepare can fail on the *dial* or the *write*,
+before the helper ever runs the handler — precisely the failure class the
+rollback exists for — and then records are NOT cleared, so the sample is `true`
+and the quiesce is PAID rather than skipped. That costs an extra 500ms and
+nothing else; the two orders below describe the handler-ran case. If the ABORTED member
 is visited first, its rollback rebind recreates the workers but the cycled
 member's own `stop_workers` clears them again, so step 2.6b2's rebind sees
 `had_live_workers == false` and SKIPS the quiesce; if the CYCLED member is
@@ -192,6 +203,90 @@ path where this node's forwarding is already down.
 | `pkg/dataplane/userspace/process_linkcycle.go` | `Manager.PrepareLinkCycle()` — ctrl disable + `stop_workers`, returns the join error |
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.PrepareLinkCycle()` — the live production adapter from the daemon hook to the manager |
 | `userspace-dp/src/server/handlers/stop_workers.rs` | helper side of the join; `rebind.rs` is its inverse |
+
+## The Link-Cycle Lease Holds the Join Across the Cycle (#6871)
+
+The join above is a **moment, not a barrier**. `PrepareLinkCycle` takes `m.mu`,
+joins the workers, and releases it on return — and the daemon does not reach
+`setDown` until several netlink calls later. Every other holder of `m.mu` runs in
+that window, so "no thread touches UMEM once it returns" was true only for the
+instant it returned.
+
+The busiest producer in that window is the 1 Hz status tick, which undoes the
+join five different ways:
+
+| producer | file | what it does mid-cycle |
+|---|---|---|
+| plan-key restart | `process_status.go` (`syncSnapshotLocked`) | `stopLocked()` + `ensureProcessLocked()` — respawns the **helper process** |
+| #5134 worker arm | `manager_worker_arm_5134.go` | republishes the snapshot with `DeferWorkers=false` — starts the workers |
+| busy-binding auto-rebind | `maps_sync.go` (`maybeAutoRebindBusyBindingsLocked`) | sends `rebind` — the exact inverse of the `stop_workers` just issued |
+| bindings watchdog | `maps_sync.go` (`verifyBindingsMapLocked`) | repopulates binding rows a fail-closed ctrl disable had just cleared |
+| ctrl gate | `maps_sync.go` (`applyHelperStatusLocked`) | re-enables `ctrl`, steering transit into XSK sockets whose queues are being destroyed |
+
+`stop_workers` preserves registered bindings and `forwarding_armed`, so the Rust
+same-plan predicate sees runnable-but-not-live bindings and reconciles by
+restarting workers — which is why the first three are not hypothetical.
+
+**The lease.** `Manager.linkCycleLeaseUntil` is an `atomic.Int64` deadline, taken
+by `PrepareLinkCycle` and released by `NotifyLinkCycle`. It is atomic for the
+same reason `rgTransitionInFlight` is: the guard has to survive `m.mu` being
+released. It is consulted in exactly two places:
+
+- **at the top of the status tick's critical section**, which skips its *whole
+  body*. Nothing is lost — every action in that body is level-triggered on
+  persistent manager state (`publishedSnapshot` vs `lastSnapshot.Generation`,
+  `pendingWorkerArm`, `pendingHAStateClear`, `lastStatus.ForwardingArmed` vs
+  desired), so the next tick after the lease ends services whatever is still
+  outstanding.
+- **at the ctrl write in `applyHelperStatusLocked`**, alongside the existing
+  `rgTransitionInFlight` check. This is not redundant with the tick guard:
+  `UpdateRGActive` also ends in `applyHelperStatusLocked`, and it runs off VRRP
+  events and `reconcileRGState`'s 500ms pass — **neither serialized on the
+  daemon's `applySem`** — so it lands mid-cycle on its own schedule. Its own
+  `rgTransitionInFlight` guard does not help: a demotion never sets the flag, and
+  an activation clears it before the status apply.
+
+**Acquire point:** before the ctrl disable, not after a successful join. The
+window that needs covering opens at the first mutation of dataplane state, and a
+`stop_workers` can fail *after* the ctrl disable has already cleared binding rows.
+
+**Release point:** the top of `NotifyLinkCycle`'s critical section — the earliest
+correct point (from there we hold `m.mu` for the rest of the function, so no
+producer can interleave anyway) and the latest (it precedes every `return`,
+including the rebind failure, so a lease cannot be stranded on exactly the paths
+where forwarding is already down). Releasing there also keeps the ctrl gate out
+of the way of `NotifyLinkCycle`'s own post-rebind status apply, so a completed
+cycle re-enables `ctrl` on that call instead of costing an extra reconcile tick.
+
+**TTL backstop:** `linkCycleLeaseTTL` (60s). Every path that takes a lease reaches
+a `NotifyLinkCycle`, so the TTL is only for a caller that dies in between — but a
+stranded lease would suppress the reconcile loop permanently, which is worse than
+the race. 60s is derived from the worst-case Prepare→Notify gap: the dominant term
+is the 15s `externalCommandTimeout` on step 2.6's per-member `ethtool -K rxvlan
+off`, plus `NotifyLinkCycle`'s own 1s NIC settle. A cycling member re-arms the
+lease itself, so the exposure grows only with the non-cycling members visited
+after the last cycle.
+
+**The rollback now reports.** `NotifyLinkCycle` returns an `error`. Its rebind is
+the documented inverse of `stop_workers`, and a failure used to be a `slog.Warn`
+and a bare return on a void function — so a clean cycle whose rebind failed left
+every worker stopped **while the commit reported success**, a silent total
+dataplane outage. Both call sites now fold it into the commit under the same
+`errRethPrepareLinkCycle` class as a failed join: the per-member rollback joins it
+onto the abort cause (which stays, being the more actionable of the two), and step
+2.6b2 joins it into the apply's commit error. The error's scope is deliberately
+narrow, mirroring `PrepareLinkCycle`'s: it reports whether the **rebind** landed,
+not whether the subsequent status apply did — `applyHelperStatusLocked` fails with
+"userspace_ctrl map not loaded" whenever no shim is attached, and failing a commit
+on that would be an over-rejection.
+
+| file | role |
+|------|------|
+| `pkg/dataplane/userspace/manager.go` | `linkCycleLeaseUntil` — the atomic deadline |
+| `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `linkCycleInFlight` + the TTL |
+| `pkg/dataplane/userspace/process_status.go` | the tick-wide skip |
+| `pkg/dataplane/userspace/maps_sync.go` | the ctrl-write gate (covers `UpdateRGActive`) |
+| `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` |
 
 ## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
 

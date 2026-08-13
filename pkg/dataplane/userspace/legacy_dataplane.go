@@ -270,12 +270,18 @@ func (a *LegacyDataPlaneAdapter) BumpFIBGeneration() (uint32, error) {
 	return m.BumpFIBGeneration()
 }
 
+// NotifyLinkCycle on the adapter is NOT the live path, exactly as
+// PrepareLinkCycle below is not: the daemon reaches the manager through Link().
+// This method satisfies dataplane.DataPlane, whose NotifyLinkCycle is void
+// because the eBPF Manager's is a genuine no-op, so the manager's #6871 error has
+// nowhere to go here. It is discarded deliberately and only here — the live path
+// (userspaceLinkController.NotifyLinkCycle) propagates it to the commit.
 func (a *LegacyDataPlaneAdapter) NotifyLinkCycle() {
 	m, err := a.managerOrErr()
 	if err != nil {
 		return
 	}
-	m.NotifyLinkCycle()
+	_ = m.NotifyLinkCycle()
 }
 
 func (a *LegacyDataPlaneAdapter) SyncFabricState() {
