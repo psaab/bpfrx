@@ -65,6 +65,12 @@ mod binding_state;
 mod bpf_map;
 #[path = "checksum.rs"]
 mod checksum;
+// #4800: test-only exclusion between readers and movers of the process-global
+// new-flow contention counters. The mover side is taken inside the moving
+// functions, so the mover set is derived rather than inventoried.
+#[cfg(test)]
+#[path = "counter_test_lock.rs"]
+mod counter_test_lock;
 #[path = "ethernet.rs"]
 mod ethernet;
 #[path = "event_emit.rs"]

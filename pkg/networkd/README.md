@@ -88,14 +88,106 @@ Standard library only.
   an identical re-commit sees `writeIfChanged → (false, nil)` for every
   file (`changed==false`), skips the reload, and returns nil — a FALSE
   success masking a route leak / stranded NIC / management lockout. The
-  `Manager` now carries `reloadPending` / `reconfigurePending` debt: a
-  failed reload sets `reloadPending` and re-runs the idempotent reload on
-  the next `Apply` even with unchanged files, clearing the debt only on
-  success (and still returning the error until then). The per-interface
-  `networkctl reconfigure` follow-up is best-effort (warn-only, Apply
-  still returns nil) but is likewise retried from `reconfigurePending`
-  until it succeeds. Distinct from #2987 (write-error-fails-commit) and
-  the stale-file sweep.
+  A failed reload records the debt and re-runs the idempotent reload on
+  the next activation pass even with unchanged files, clearing the debt
+  only on success (and still returning the error until then). The
+  per-interface `networkctl reconfigure` follow-up is best-effort
+  (warn-only, Apply still returns nil) but is likewise retried from the
+  `Manager`'s `reconfigurePending` set until it succeeds. Distinct from
+  #2987 (write-error-fails-commit) and the stale-file sweep.
+  **`Clear()` owes the same debt (#5718 A7-b01-C001).** Removing the
+  managed files deactivates nothing until the reload lands, so a failed
+  reload in `Clear` records the debt too. The empty-glob case is
+  therefore NOT an unconditional `return nil`: with debt outstanding the
+  files are already gone but the kernel never re-read them, so `Clear`
+  re-runs the idempotent reload and reports failure until it succeeds.
+  Without this the SECOND `Clear` found nothing to remove and reported a
+  success it had not achieved while the removed addresses / VRFs / bonds
+  / renames stayed live.
+- **The reload debt has ONE holder and EVERY reload owner records into
+  it (#5718 fold F2).** The debt is process-scoped (`reloadDebt` in
+  `networkd.go`), not a `Manager` field, because `networkctl reload` acts
+  on the single host `systemd-networkd` and this package is not its only
+  owner: `pkg/daemon`'s `networkctlReload` runs it directly from FIVE
+  production sites — linksetup's post-rename reload (warn-only),
+  device-map's rename and teardown reloads, and bootstrap's teardown and
+  lifeline reloads — all touching the same `10-xpf-*` files. A `Manager`-scoped
+  bool left those owners unable to record anything, and the disagreement
+  resolved in the dangerous direction: their failed reload left the files
+  on disk unactivated while the flag stayed false, so the next `Apply`
+  with identical content took the `changed==false && !debt` branch and
+  reported the #4954 false success. `pkg/daemon` now brackets its
+  shell-out with the exported `BeginReload` / `NoteReloadResult` pair,
+  and `ReloadDebtOutstanding` lets it assert the POSTCONDITION of that
+  reporting rather than the debt epoch — an epoch is unchanged both when
+  a success is reported correctly and when reporting it is omitted
+  entirely, so the epoch could not see a dropped success report or a
+  `BeginReload()` moved after the shell-out (#5718 fold r4b).
+  The per-interface reconfigure debt stays `Manager` state — it names the
+  interfaces this Manager generated files for, and no other owner issues
+  a `networkctl reconfigure`.
+- **Discharging the debt is EPOCH-GUARDED, never a blind clear (#5718
+  fold F4).** The epoch advances every time debt is recorded, and a
+  successful reload may only clear the debt state it observed before it
+  started. Otherwise a concurrent owner's failure is lost: owner B's
+  reload re-reads the directory and succeeds, owner A then writes new
+  files and its reload fails and records the debt, and B — still between
+  its syscall and its bookkeeping — blind-stores `pending=false`. B's
+  reload provably predates A's files, so nothing activated them, yet A's
+  identical retry now sees `changed==false && !debt`, skips the reload
+  and returns nil. A debt cleared whose work never ran is a silent skip
+  of a reload the system believes it performed.
+- **The reload debt is global; Apply's TAIL is not (#5718 fold r4).**
+  Process-scoping the reload debt was right for the reload itself, but it
+  collapsed two obligations into one flag. "The kernel re-read the
+  directory" is global — any owner's successful `networkctl reload`
+  discharges it. Apply's activation pass also has a tail only Apply can
+  run: the per-interface `networkctl reconfigure` that applies bond/VLAN
+  addresses, and `restoreSlowPathRPFilter`. Both sit behind
+  `needReload`. So when Apply's own reload FAILED (returning early,
+  before the tail, and therefore recording no reconfigure debt) and
+  `pkg/daemon` then ran a successful reload, the global debt cleared and
+  the next unchanged Apply skipped the block entirely — addresses never
+  reconfigured, `rp_filter` left at networkd's default, silently
+  dropping locally-originated traffic via the slow-path TUN, and `nil`
+  returned. `Manager.activationPending` is set when Apply enters the
+  pass and cleared only after the tail completes, so no other owner can
+  discharge it.
+- **The write/remove-error path owes the tail too, and did not ARM it
+  (#5718 fold r7).** This paragraph used to end "the write-error path is
+  unaffected: it always returns a non-nil error, so it can never report a
+  false success", and that reasoning is what produced the bug. The error
+  return is truthful for THAT Apply. What it does not do is record the
+  obligation for the NEXT one: `activationPending = true` had a single
+  assignment, in the success path, which the error branch returns before
+  reaching — the tail was never armed, not merely skipped. The branch does
+  arm the GLOBAL debt, and any reload owner discharges that. So a
+  device-map teardown that removes the offending stale marker and reloads
+  successfully clears the global debt while performing neither tail
+  operation, and the byte-identical Apply that follows sees no change, no
+  global debt, no reconfigure debt and no activation debt — and returns
+  `nil` having run neither the per-interface `reconfigure` nor
+  `restoreSlowPathRPFilter`. The error branch now arms `activationPending`
+  before its own reload attempt, and deliberately does NOT clear it when
+  that reload succeeds: the reload is half the tail, and the reconfigure
+  half still has not run.
+- **The debt does not survive the PROCESS (#5718 fold r7, disclosed not
+  fixed).** `reloadDebt` is a package variable, so a daemon restart
+  between a failed reload and its retry drops the obligation with the
+  generated files sitting on disk unactivated — the LOST direction. This
+  is not a regression: the pre-PR `Manager.reloadPending` field had exactly
+  the same process lifetime, and making it durable means persisting it
+  outside the process, a larger change than this one. It is recorded here
+  because a reader just told the debt has "ONE holder" and is
+  "process-scoped" can reasonably read that as a durability claim, and it
+  is not one.
+- **`Manager.Clear()` has no production caller (#5718 fold).** It has
+  been exported and uncalled since this package was introduced (`git
+  log -S` finds no caller in history); the daemon uses only
+  `SetProtectedResolver` and `Apply`. Its contracts above are therefore
+  pinned by this package's tests alone, with no end-to-end consumer.
+  That is a live gap to close by wiring the teardown path that wants it
+  or retiring the method — not an endorsement of the current shape.
 - **An empty desired set is NOT a no-op (#2988).** `Apply(nil)` (last
   managed interface removed) still runs the `10-xpf-*` stale-file sweep
   and requests a reload so old addresses/bonds/bridges/renames don't

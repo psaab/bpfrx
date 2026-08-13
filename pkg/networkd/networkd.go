@@ -86,23 +86,159 @@ type Manager struct {
 	// mu guards the activation-debt fields below. Apply runs serialized under
 	// the daemon's applySem today, but the debt is process-durable state that
 	// outlives a single call, so it is locked defensively.
+	//
+	// The `networkctl reload` debt itself is NOT here — it is process-scoped
+	// (see the reloadDebt holder below). Only the per-interface reconfigure
+	// debt is Manager state, because `networkctl reconfigure <ifaces>` names
+	// the interfaces this Manager generated files for; no other reload owner
+	// in the process issues one.
 	mu sync.Mutex
-	// reloadPending records that a previous Apply wrote generated files to
-	// disk and then had `networkctl reload` FAIL (#4954). Because the files
-	// are already on disk, a later Apply with byte-identical content sees no
-	// change (writeIfChanged → changed=false) and would otherwise SKIP the
-	// reload and return nil — masking a config the kernel never activated as a
-	// green commit (route leak / stranded NIC / management lockout persists).
-	// The debt forces the next Apply to re-run the idempotent reload even with
-	// unchanged files, and is cleared only once the reload finally succeeds.
-	reloadPending bool
-	// reconfigurePending mirrors reloadPending for the per-interface
+	// reconfigurePending mirrors the reload debt for the per-interface
 	// `networkctl reconfigure` address-application follow-up (bonds / VLANs),
 	// which was warn-only and likewise never retried. It holds the logical
 	// interface names that still owe a reconfigure; the next activation pass
 	// retries them and clears the set on success.
 	reconfigurePending map[string]bool
+	// activationPending records that THIS Manager began an activation pass and
+	// did not finish it. It is deliberately NOT the process-wide reload debt.
+	//
+	// #5718 fold r4 BLOCKER 2: making the reload debt process-scoped collapsed
+	// two different obligations into one flag. "The kernel re-read the
+	// directory" is genuinely global — any owner's successful `networkctl
+	// reload` discharges it. But Apply's activation pass has a TAIL that only
+	// Apply can run: the per-interface `networkctl reconfigure` that applies
+	// bond/VLAN addresses, and restoreSlowPathRPFilter, which re-disables
+	// rp_filter on the userspace dataplane's slow-path TUN after networkd
+	// resets it. Both sit behind `needReload`.
+	//
+	// So when Apply's own reload FAILED (it returns early, before the tail, and
+	// therefore never records reconfigure debt) and pkg/daemon then ran a
+	// SUCCESSFUL reload of its own, the global debt cleared — and the next
+	// Apply with byte-identical files saw changed==false, no reload debt and no
+	// reconfigure debt, skipped the whole block, and returned nil. The kernel
+	// had re-read the files, but the addresses were never reconfigured and
+	// rp_filter was left at networkd's default, silently dropping
+	// locally-originated traffic via the TUN. An external owner discharged a
+	// postcondition it had no way to perform.
+	//
+	// This flag is set when Apply enters its activation pass and cleared only
+	// once that pass completes its tail, so no other owner can discharge it.
+	activationPending bool
 }
+
+// reloadDebt is the #4954 `networkctl reload` activation debt: a reload that
+// FAILED after generated files were already written to (or removed from) disk.
+// Because the files are already on disk, a later Apply with byte-identical
+// content sees no change (writeIfChanged → changed=false) and would otherwise
+// SKIP the reload and return nil — masking a config the kernel never activated
+// as a green commit (route leak / stranded NIC / management lockout persists).
+// The debt forces the next activation pass to re-run the idempotent reload
+// even with unchanged files, and is cleared only once a reload succeeds.
+//
+// #5718 fold F2 — ONE holder, EVERY owner. The debt is PROCESS-scoped, not
+// Manager-scoped, because `networkctl reload` acts on the single
+// systemd-networkd instance for the whole host and this Manager is not its
+// only owner. pkg/daemon shells out to `networkctl reload` directly through
+// its own networkctlReload helper from FIVE production call sites —
+// linksetup's post-rename reload (warn-only, linksetup.go), the device-map
+// rename and teardown reloads (device_map.go, via networkctlReloadFn), and the
+// bootstrap teardown and lifeline reloads (bootstrap.go) — all writing or
+// removing the same 10-xpf-* files this package generates. With a per-Manager bool those
+// owners could disagree with the Manager, and the disagreement resolves in the
+// dangerous direction: a daemon-side reload that fails leaves the files on
+// disk unactivated while the Manager's flag stays false, so the next Apply
+// takes the `changed==false && !reloadDebt` branch, skips the reload, and
+// reports the very #4954 false success the debt exists to prevent. Every
+// reload owner in the process now records into this holder — pkg/networkd via
+// noteReloadFailed / noteReloadSucceeded, pkg/daemon via the exported
+// BeginReload / NoteReloadResult pair.
+//
+// #5718 fold F4 — the clear is EPOCH-GUARDED, never a blind store. `epoch`
+// increments every time debt is RECORDED, and a successful reload may only
+// discharge the debt state it observed before it started. Without the guard a
+// concurrent owner's failure is silently lost:
+//
+//	owner B calls reload; the syscall returns success
+//	owner A writes new generated files
+//	owner A calls reload; it FAILS; A records the debt
+//	owner B resumes and blind-stores pending=false  ← A's debt is gone
+//
+// B's reload re-read the directory BEFORE A's files existed, so it cannot have
+// activated them, yet the operator is told the next identical Apply succeeded.
+// A debt cleared whose work never ran is a silent skip of a reload the system
+// believes it performed. With the guard, B's epoch snapshot no longer matches
+// and its clear is refused, so A's debt survives to force the retry.
+var reloadDebt struct {
+	mu      sync.Mutex
+	pending bool
+	epoch   uint64
+}
+
+// reloadDebtEpoch snapshots the debt epoch. Callers take it immediately BEFORE
+// running `networkctl reload` and hand it back to noteReloadSucceeded.
+func reloadDebtEpoch() uint64 {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	return reloadDebt.epoch
+}
+
+// reloadDebtOutstanding reports whether an activation is still owed.
+func reloadDebtOutstanding() bool {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	return reloadDebt.pending
+}
+
+// noteReloadFailed records the activation debt and advances the epoch so any
+// reload already in flight cannot clear it.
+func noteReloadFailed() {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	reloadDebt.pending = true
+	reloadDebt.epoch++
+}
+
+// noteReloadSucceeded discharges the debt observed at epoch. If another owner
+// recorded debt while this reload was in flight the epoch has moved, and this
+// reload provably cannot have activated that owner's files — so the clear is
+// refused and the debt survives for the next activation pass.
+func noteReloadSucceeded(epoch uint64) {
+	reloadDebt.mu.Lock()
+	defer reloadDebt.mu.Unlock()
+	if reloadDebt.epoch != epoch {
+		return
+	}
+	reloadDebt.pending = false
+}
+
+// BeginReload snapshots the #4954 activation-debt epoch before a `networkctl
+// reload` that this package does not run itself. Pair every call with
+// NoteReloadResult; see the reloadDebt holder for why the debt is
+// process-scoped rather than owned by a Manager.
+func BeginReload() uint64 { return reloadDebtEpoch() }
+
+// NoteReloadResult records the outcome of a `networkctl reload` executed
+// outside this package (pkg/daemon's linksetup, device-map and bootstrap
+// paths). epoch must come from the BeginReload that preceded the reload.
+func NoteReloadResult(epoch uint64, err error) {
+	if err != nil {
+		noteReloadFailed()
+		return
+	}
+	noteReloadSucceeded(epoch)
+}
+
+// ReloadDebtOutstanding reports whether a `networkctl reload` activation is
+// still owed process-wide. It exists so the other reload owners can assert the
+// POSTCONDITION of their reporting — a failure is carried forward, a success
+// discharges — rather than the proxy of whether the debt epoch happened to
+// move, which is unchanged both when a success is reported correctly and when
+// reporting it is omitted entirely.
+//
+// It does NOT report a Manager's own activation debt: `networkctl reconfigure`
+// and the slow-path rp_filter restore are Manager-scoped obligations no
+// external reload owner performs. See Manager.activationPending.
+func ReloadDebtOutstanding() bool { return reloadDebtOutstanding() }
 
 // SetProtectedResolver registers the management protected-set provider so
 // Apply can exempt the lifeline's files from the stale-file sweep. Called once
@@ -258,15 +394,41 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 		// get written/removed, but surface the error so the operator is not told
 		// a config was committed while a stale unit survives on disk.
 		nWrite, nRemove := len(writeErrs), len(removeErrs)
+		// #5718 fold r7 BLOCKER 1: this branch owes the Manager tail and never
+		// armed it. `activationPending` had exactly one assignment — in the
+		// success path below — so an Apply that failed a write or a stale
+		// removal returned from here with the tail NEVER ARMED, not merely
+		// skipped. The reload attempted just below is not the tail: the
+		// per-interface `networkctl reconfigure` and (on a failed reload)
+		// `restoreSlowPathRPFilter` are Manager-only work that no other reload
+		// owner performs.
+		//
+		// That matters because the GLOBAL debt this branch arms is discharged
+		// by ANY reload owner. A device-map teardown that removes the offending
+		// stale marker and reloads successfully (daemon/linksetup.go) clears the
+		// global debt while doing neither tail operation; the byte-identical
+		// Apply that follows then sees no change, no global debt, no
+		// reconfigure debt and no activation debt, and returns success having
+		// skipped the tail entirely — bond/VLAN addresses unapplied and
+		// `xpf-usp0`'s rp_filter left at 2, silently dropping slow-path traffic.
+		//
+		// Armed BEFORE the reload, like the success path, so an early return
+		// still records the obligation. Deliberately NOT cleared when the reload
+		// below succeeds: that reload is only the first half, and the
+		// reconfigure half has still not run.
+		m.mu.Lock()
+		m.activationPending = true
+		m.mu.Unlock()
 		if changed {
+			epoch := reloadDebtEpoch()
 			if err := runNetworkctl("reload"); err != nil {
 				// #4954: a failed reload here also owes activation debt so a
 				// later identical retry re-attempts it rather than reporting a
 				// false success.
-				m.setReloadPending(true)
+				noteReloadFailed()
 				writeErrs = append(writeErrs, fmt.Errorf("networkctl reload: %w", err))
 			} else {
-				m.setReloadPending(false)
+				noteReloadSucceeded(epoch)
 				restoreSlowPathRPFilter()
 			}
 		}
@@ -282,13 +444,24 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 	// without the debt the retry would skip the networkctl commands and return
 	// a false success. The debt is cleared only when the idempotent command
 	// finally succeeds.
+	debtOwed := reloadDebtOutstanding()
 	m.mu.Lock()
-	reloadDebt := m.reloadPending
 	reconfDebt := len(m.reconfigurePending) > 0
+	activationOwed := m.activationPending
 	m.mu.Unlock()
 
-	needReload := changed || reloadDebt
-	if needReload || reconfDebt {
+	needReload := changed || debtOwed
+	// #5718 fold r4 BLOCKER 2: activationOwed keeps this Manager's own tail —
+	// the per-interface reconfigure and restoreSlowPathRPFilter — reachable
+	// even when another reload owner discharged the global debt on our behalf.
+	// Without it, an external successful reload turns the next unchanged Apply
+	// into a no-op that skips postconditions only Apply can perform.
+	if needReload || reconfDebt || activationOwed {
+		// Mark the pass in flight BEFORE the reload can fail out, so an early
+		// return leaves the obligation recorded.
+		m.mu.Lock()
+		m.activationPending = true
+		m.mu.Unlock()
 		if needReload {
 			if changed {
 				slog.Info("networkd config updated, reloading", "interfaces", len(interfaces))
@@ -296,11 +469,12 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 				slog.Info("networkd re-running deferred reload after a prior failed reload",
 					"interfaces", len(interfaces))
 			}
+			epoch := reloadDebtEpoch()
 			if err := runNetworkctl("reload"); err != nil {
-				m.setReloadPending(true)
+				noteReloadFailed()
 				return fmt.Errorf("networkctl reload: %w", err)
 			}
-			m.setReloadPending(false)
+			noteReloadSucceeded(epoch)
 		}
 		// Dynamically created interfaces (bonds, VLANs) may not get their
 		// addresses applied by reload alone. Reconfigure all managed
@@ -330,16 +504,14 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 			m.setReconfigurePending(nil)
 		}
 		restoreSlowPathRPFilter()
+		// The tail completed, so this Manager owes nothing further. Cleared
+		// LAST and only here: every early return above leaves it set.
+		m.mu.Lock()
+		m.activationPending = false
+		m.mu.Unlock()
 	}
 
 	return nil
-}
-
-// setReloadPending records or clears the #4954 reload activation debt.
-func (m *Manager) setReloadPending(pending bool) {
-	m.mu.Lock()
-	m.reloadPending = pending
-	m.mu.Unlock()
 }
 
 // setReconfigurePending records the set of interface names that still owe a
@@ -418,9 +590,43 @@ func warnIfAllRPFilterOverrides(tunName string) {
 }
 
 // Clear removes all xpf-managed networkd files and reloads.
+//
+// NO PRODUCTION CALLER (#5718 fold). Clear has been exported and uncalled
+// since it was introduced with this package — `git log -S` finds no caller in
+// the repository's history, and the daemon's only uses of its Manager are
+// SetProtectedResolver and Apply (pkg/daemon/daemon_run_bringup.go,
+// daemon_apply_dataplane.go). It is exercised solely by this package's tests,
+// so its behaviour — including the activation-debt contract below — is pinned
+// by construction rather than by a consumer. Treat that as a live gap, not as
+// an endorsement: an exported method with no consumer accretes contracts
+// nothing validates end to end. Either wire the teardown path that wants it or
+// retire it; tracked separately so this PR does not change the API surface.
+//
+// #5718 A7-b01-C001: Clear participates in the #4954 reload-debt contract that
+// Apply owns. Removing the files is only half the job — until `networkctl
+// reload` succeeds the kernel still runs the config those files installed. The
+// pre-#5718 shape recorded no debt on reload failure and short-circuited on an
+// empty glob, so the SECOND Clear found nothing to remove, returned nil, and
+// reported a success it had not achieved while the removed addresses / VRFs /
+// renames stayed live. Clear now records the debt on failure and, on the empty
+// glob, discharges any outstanding debt by re-running the idempotent reload
+// instead of assuming "no files" means "nothing to activate".
 func (m *Manager) Clear() error {
 	matches, _ := filepath.Glob(filepath.Join(m.networkDir, filePrefix+"*"))
 	if len(matches) == 0 {
+		if !reloadDebtOutstanding() {
+			return nil
+		}
+		// Files are already gone but a prior activation never landed. Retry
+		// the reload rather than reporting a clear that the kernel never saw.
+		slog.Info("networkd clear re-running deferred reload after a prior failed reload")
+		epoch := reloadDebtEpoch()
+		if err := runNetworkctl("reload"); err != nil {
+			noteReloadFailed()
+			return fmt.Errorf("networkctl reload: %w", err)
+		}
+		noteReloadSucceeded(epoch)
+		restoreSlowPathRPFilter()
 		return nil
 	}
 
@@ -432,9 +638,15 @@ func (m *Manager) Clear() error {
 		}
 	}
 
+	epoch := reloadDebtEpoch()
 	if err := runNetworkctl("reload"); err != nil {
+		// The files are off disk but the kernel never re-read them; the next
+		// Clear/Apply MUST retry the activation instead of seeing an empty
+		// glob (or unchanged files) and returning a false success.
+		noteReloadFailed()
 		return fmt.Errorf("networkctl reload: %w", err)
 	}
+	noteReloadSucceeded(epoch)
 	restoreSlowPathRPFilter()
 	// #4900: a managed file that could not be removed must fail the Clear — a
 	// surviving 10-xpf-* unit re-applies removed host config (address / VRF /
