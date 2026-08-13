@@ -9,11 +9,17 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// secureTunnelIfNameCases is the shared classification table for the two-plane
-// `st<N>` mirror (#5619). The Rust half (`secure_tunnel_ifname_matches_go`,
-// userspace-dp/src/main_tests.rs) asserts the SAME table against
-// `is_secure_tunnel_ifname`. Keep the two lists identical — a name added on one
-// side only is exactly the drift this pair exists to catch.
+// secureTunnelIfNameCases is the classification table for the `st<N>` range
+// rule (#5619).
+//
+// It is NOT half of a two-plane mirror any more, whatever an earlier revision
+// of this comment said: it cited a Rust test `secure_tunnel_ifname_matches_go`
+// that does not exist. #6691 round 5 deleted `is_secure_tunnel_ifname` from
+// userspace-dp because the dataplane's question is OWNERSHIP, which only the
+// control plane can answer — that plane now reads the snapshot's
+// `secure_tunnel` flag. So this table pins one implementation, and its job is
+// to hold IsSecureTunnelIfName to the same bounds as the XFRMIfNameAndID
+// constructor it shares secureTunnelIndex with.
 var secureTunnelIfNameCases = []struct {
 	base string
 	want bool

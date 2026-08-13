@@ -431,9 +431,12 @@ func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {
 // stripped it of ingress adjudication, of its AF_XDP binding and of its RSS
 // entry — the traffic outage the excluding arm's own comment named.
 //
-// The oracle is Config.SecureTunnelNetdevForRef, which is also what decides
-// which xfrmi devices exist, so the dataplane and the reconciler cannot
-// disagree about which names are tunnels.
+// The oracle is Config.SecureTunnelNetdevForRef. pkg/routing/xfrm.go — which
+// actually creates the devices — does NOT call it; the two agree because both
+// derive names and if_ids through config.XFRMIfNameAndID and both treat an
+// if_id claimed by two distinct names as unresolvable. That is a shared
+// derivation, not a shared function, so it is a drift risk to re-check when
+// either side changes rather than a guarantee.
 //
 // Fails OPEN toward adjudication on an if_id collision, deliberately:
 // SecureTunnelNetdevForRef returns false when two DISTINCT bind-interface
@@ -481,8 +484,16 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 		// The rule itself lives in config.SecureTunnelUnitNetdev and is SHARED
 		// with config.ResolveKernelIfName and config.junosHostLinuxName — not
 		// re-derived here (#6691). Placed FIRST, matching ResolveKernelIfName's
-		// ordering (the st rule precedes the tunnel-name map there too).
-		// TestSecureTunnelResolverParity pins the resolvers together.
+		// ordering (the st rule precedes the tunnel-name map there too): an
+		// explicit `bind-interface` outranks the tunnel-name map, which is
+		// observable only on the config that names one ref as both, and is
+		// pinned there by TestSecureTunnelOwnershipPrecedesTheTunnelNameMap.
+		//
+		// It declines (ok=false) for a ref NO VPN binds, and the arms below
+		// then name the real device — the NIC, the VLAN device, the GRE
+		// device. Round 5 returned the verbatim ref instead, which shadowed
+		// every arm below for any `st`-spelled interface;
+		// TestUnownedSecureTunnelUnitResolvesToItsRealDevice pins all three.
 		//
 		// Why it cannot be reconstructed: a bare `bind-interface st0` and an
 		// explicit `bind-interface st0.0` derive ONE if_id under two DIFFERENT

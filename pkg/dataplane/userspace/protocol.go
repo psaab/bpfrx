@@ -265,11 +265,17 @@ type InterfaceSnapshot struct {
 	UnitCount       int    `json:"unit_count"`
 	Tunnel          bool   `json:"tunnel"`
 	// SecureTunnel reports that an IPsec configuration BINDS this interface
-	// — i.e. some `security ipsec vpn <name> bind-interface` derives this
-	// row's if_id (Config.SecureTunnelNetdevForRef). It is OWNERSHIP, not
+	// — i.e. some `security ipsec vpn <name> bind-interface` NAMES this row's
+	// xfrmi device (Config.SecureTunnelNetdevForRef). It is OWNERSHIP, not
 	// name shape: nothing reserves the `st` prefix, so a wildcard-authored
 	// `st5` with no VPN is an ordinary data interface and this stays false
 	// (#6691).
+	//
+	// "Names the device", not "derives the if_id" — the two differ, and the
+	// difference was a defect (#6691 round 6). strconv.Atoi erases a leading
+	// `+` and leading zeros, so `bind-interface st05` derives the SAME if_id
+	// as `st5` under a DIFFERENT device name; keying on the if_id alone set
+	// this flag on a NIC no VPN names, taking it out of the dataplane.
 	//
 	// Additive: an old Rust helper that does not know the field treats every
 	// interface as not-a-secure-tunnel, so an xfrmi would get an AF_XDP

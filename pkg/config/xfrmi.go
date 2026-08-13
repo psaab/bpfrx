@@ -28,10 +28,14 @@ import (
 //
 // The sign is accepted because strconv.Atoi accepts it: `st+5` parses to index
 // 5 and DOES yield a device, so it must classify as a secure tunnel. `st-3`
-// parses to -3 and yields nothing, so it must not. The Rust mirror
-// (is_secure_tunnel_ifname, userspace-dp/src/server/helpers/planning.rs) uses
-// `parse::<i64>()` plus the identical bounds for exactly this reason —
-// `str::parse` and Atoi agree on the sign forms.
+// parses to -3 and yields nothing, so it must not.
+//
+// There is no longer a Rust mirror of this rule to keep in step. #6691 round 5
+// DELETED `is_secure_tunnel_ifname` (userspace-dp/src/server/helpers/planning.rs)
+// rather than re-deriving the range on that plane: the dataplane's question is
+// ownership, which only the control plane can answer, so it now reads the
+// snapshot's `secure_tunnel` flag. This range therefore has exactly one
+// implementation, and the lexical question it answers is asked only in Go.
 func secureTunnelIndex(base string) (int, bool) {
 	if len(base) < 3 || base[:2] != "st" {
 		return 0, false
@@ -91,8 +95,8 @@ func XFRMIfNameAndID(bindIface string) (string, uint32) {
 // both are reached on the userspace path (loader.go CompileConfig →
 // compiler.go compileZones):
 //
-//	:72   resolveInterfaceRef          physName = config.LinuxIfName(ref)
-//	:757  buildInterfaceNetworkdModels XFRMIfNameAndID("<ifName>.<unit>")
+//	:73   resolveInterfaceRef          physName = config.LinuxIfName(ref)
+//	:805  buildInterfaceNetworkdModels XFRMIfNameAndID("<ifName>.<unit>")
 //
 // That file calls SecureTunnelUnitNetdev zero times. The migration is 3 of 5
 // resolvers, tracked as #6728-#6731, and userspace-dp/src/server/README.md
@@ -100,12 +104,16 @@ func XFRMIfNameAndID(bindIface string) (string, uint32) {
 // restore the absolute here without re-counting the call sites; an unqualified
 // "every" in a doc is what a later reader will rely on instead of grepping.
 //
-// Callers of the PREDICATE: SecureTunnelUnitNetdev (below) and
-// userspaceSkipsIngressInterface (pkg/dataplane/userspace/maps_sync.go), whose
-// Rust mirror is is_secure_tunnel_ifname. Before #5619 the dataplane copy
-// silently lacked the resolution rule, so a secure-tunnel unit resolved to a
-// nonexistent netdev, reported ifindex 0 / MTU 0 / no addresses, and fell out
-// of every ifindex-keyed dataplane set.
+// Callers of the PREDICATE, as of #6691 round 6: SecureTunnelUnitNetdev and
+// ResolveKernelIfName's verbatim fallback — both LEXICAL questions ("is this
+// ref shaped like an xfrmi unit at all?"). It is NOT the ownership test and
+// no longer gates any dataplane set: userspaceSkipsIngressInterface used to
+// call it and now reads the snapshot's SecureTunnel flag instead (round 5),
+// and the Rust mirror is_secure_tunnel_ifname was deleted rather than
+// re-derived. Before #5619 the dataplane copy silently lacked the RESOLUTION
+// rule, so a secure-tunnel unit resolved to a nonexistent netdev, reported
+// ifindex 0 / MTU 0 / no addresses, and fell out of every ifindex-keyed
+// dataplane set.
 //
 // Scope: this is the BASE-name test, and it answers exactly one question —
 // "would XFRMIfNameAndID build an xfrmi for this base?". It shares
@@ -151,19 +159,102 @@ func IsSecureTunnelIfName(base string) bool {
 // junos-host deny was scoped to a netdev that does not exist and the decrypted
 // traffic — arriving on `st0.0` — never matched it. A security guard that
 // cannot fire.
+//
+// THIS RESOLVER IS KEYED ON OWNERSHIP, NOT ON NAME SHAPE — the same rule the
+// exclusion predicate is keyed on, and the half that was left behind when the
+// predicate moved (#6691 round 6). An earlier revision returned ok=true with
+// the verbatim ref for EVERY `st<N>.<unit>` that no VPN owned, which made the
+// resolver lexical again one level down: nothing reserves the `st` prefix
+// (schema_interfaces.go accepts a wildcard interface name), so
+//
+//	set interfaces st5 unit 0 family inet address 192.0.2.1/24
+//
+// with no IPsec anywhere resolved to the netdev `st5.0` instead of the NIC
+// `st5`. At a name that exists on no box the row reports ifindex 0, and
+// userspace-dp/src/filter/compiler.rs skips `if iface.ifindex <= 0` — so the
+// unit's `filter input` never installed, nor its per-unit CoS, nor its
+// routing-instance binding. On a VLAN unit (`st5 unit 3 vlan-id 80`, real
+// device `st5.80`) it also took the junos-host DENY with it: the guard was
+// scoped to a netdev on no box and could not fire, verbatim the failure
+// TestJunosHostDenyScopeNamesTheSecureTunnelDevice exists to prevent. It also
+// shadowed the TunnelNameMap arm at both dataplane call sites, so a GRE unit
+// `st0.1` — real device `st0u1` — resolved to `st0.1` and fell out of
+// populate_interfaces, assign_interface_filters and populate_egress.
+//
+// So ok=false is returned whenever NOTHING binds the ref: the caller then runs
+// its ordinary resolution, which is what names the NIC, the VLAN device and
+// the GRE device. The one case that still returns the verbatim ref is an if_id
+// COLLISION, where routing creates NEITHER device (see
+// SecureTunnelNetdevForRef): the ref names nothing on the box, and the caller's
+// unit-0 collapse would alias the unit row onto `st<N>` — a name that is
+// equally absent but LOOKS resolvable, and which is also the BASE row's name,
+// so two rows would claim one netdev. Naming the absent-but-honest `st<N>.<M>`
+// keeps the rows distinct.
 func (c *Config) SecureTunnelUnitNetdev(ref string) (string, bool) {
 	base, _, hasUnit := strings.Cut(ref, ".")
 	if !hasUnit || !IsSecureTunnelIfName(base) {
 		return "", false
 	}
-	if dev, found := c.SecureTunnelNetdevForRef(ref); found {
+	switch dev, binding := c.secureTunnelBindingForRef(ref); binding {
+	case secureTunnelBound:
 		return dev, true
+	case secureTunnelIDCollision:
+		return LinuxIfName(ref), true
+	default:
+		return "", false
 	}
-	// No VPN binds this unit's if_id, so the xfrmi reconciler creates no
-	// device for it. The verbatim dotted ref names nothing on the box, which
-	// is the honest answer — the unit-0 collapse would instead alias the row
-	// onto `st<N>`, a name that is equally absent but LOOKS resolvable.
-	return LinuxIfName(ref), true
+}
+
+// secureTunnelBinding is the three-way answer to "does an IPsec configuration
+// bind this secure-tunnel ref, and can routing create the device?". The middle
+// state exists because "unbound" and "collides" are DIFFERENT facts with
+// different correct fallbacks — an unbound ref belongs to whatever ordinary
+// interface carries the name, a colliding one belongs to nothing at all.
+type secureTunnelBinding int
+
+const (
+	// secureTunnelUnbound: no configured VPN binds this ref. It is not a
+	// secure tunnel, whatever it is spelled.
+	secureTunnelUnbound secureTunnelBinding = iota
+	// secureTunnelBound: exactly one xfrmi device owns it, and routing
+	// creates that device.
+	secureTunnelBound
+	// secureTunnelIDCollision: distinct bind-interface strings derive this
+	// ref's if_id, so pkg/routing/xfrm.go creates NEITHER device.
+	secureTunnelIDCollision
+)
+
+// secureTunnelRefsNameOneDevice reports whether an authored `bind-interface`
+// string and an interface ref denote the SAME xfrmi unit. Callers must have
+// already established that the two derive the same if_id.
+//
+// #6691: the if_id ALONE cannot answer this, which is the defect this exists to
+// close. XFRMIfNameAndID derives the index with strconv.Atoi, and Atoi erases a
+// leading `+` and leading zeros — so `st5`, `st05`, `st+5` and `st0000005` all
+// derive if_id 0x50001 while LinuxIfName keeps them as four DIFFERENT device
+// names. Keying ownership on the if_id alone therefore let a VPN binding `st05`
+// claim a wildcard-authored NIC named `st5`: the NIC's rows came back
+// secureTunnel=true with an empty ingress set and an empty RSS allowlist, a
+// live interface removed from the dataplane by a VPN that never names it.
+// Commit does not stop this — ValidateSecureTunnelBindInterface only requires
+// if_id != 0, and `st05` is a perfectly good (if unusual) xfrmi name.
+//
+// Ownership is therefore decided on the BASE SPELLING, which is what the device
+// name is made of: pkg/routing/xfrm.go keys its desired set by
+// LinuxIfName(bindInterface), so `bind-interface st05` creates a device called
+// `st05` and NOTHING called `st5`. Comparing the authored bases directly is
+// exact here because every base that reaches this point is `st` followed by an
+// optionally-signed decimal (secureTunnelIndex enforces it) and LinuxIfName —
+// which only rewrites `/` to `-` — is the identity on such a name.
+//
+// The unit does not need comparing: given equal if_ids and equal base
+// spellings, the indexes are equal, so `stIndex<<16 | unit+1` forces the units
+// equal too. That is also why a bare `st0` owns the ref `st0.0` (a bare st<N>
+// IS unit 0) while `st10` does NOT own `st10.5`.
+func secureTunnelRefsNameOneDevice(bindIface, ref string) bool {
+	bindBase, _, _ := strings.Cut(bindIface, ".")
+	refBase, _, _ := strings.Cut(ref, ".")
+	return bindBase == refBase
 }
 
 // SecureTunnelNetdevForRef returns the Linux netdev the xfrmi reconciler
@@ -211,15 +302,37 @@ func (c *Config) SecureTunnelUnitNetdev(ref string) (string, bool) {
 // Strict commit rejects such a config (#2933) and apply refuses it (#2909), so
 // this governs only the tolerant-load path — which is precisely the path that
 // must not invent a device.
+//
+// OWNERSHIP AND THE COLLISION VETO ARE SEPARATE TESTS (#6691 round 6), because
+// they answer to different components. Ownership asks "is this ref THIS
+// device?" and is settled on the authored base spelling
+// (secureTunnelRefsNameOneDevice) — an if_id match alone let `bind-interface
+// st05` claim a NIC named `st5`. The veto asks "will routing create the device
+// at all?" and must stay keyed on the if_id, because that is the key
+// pkg/routing/xfrm.go collides on. Both are needed: drop the veto and a config
+// binding BOTH `st5` and `st05` would resolve `st5.0` to `st5`, a device
+// routing has already refused to create — the same divergence one spelling
+// over.
 func (c *Config) SecureTunnelNetdevForRef(ref string) (string, bool) {
+	dev, binding := c.secureTunnelBindingForRef(ref)
+	return dev, binding == secureTunnelBound
+}
+
+// secureTunnelBindingForRef is the shared core of SecureTunnelNetdevForRef and
+// SecureTunnelUnitNetdev. It reports the owning device name (empty unless the
+// binding is secureTunnelBound) and which of the three states the ref is in.
+func (c *Config) secureTunnelBindingForRef(ref string) (string, secureTunnelBinding) {
 	if c == nil {
-		return "", false
+		return "", secureTunnelUnbound
 	}
 	_, wantID := XFRMIfNameAndID(ref)
 	if wantID == 0 {
-		return "", false
+		return "", secureTunnelUnbound
 	}
-	best := ""
+	// claimant is the device name routing would create for this if_id; owner
+	// is the one that also NAMES this ref. They differ exactly in the `st05`
+	// vs `st5` case, which is the F2 defect.
+	claimant, owner := "", ""
 	for _, vpn := range c.Security.IPsec.VPNs {
 		if vpn == nil || vpn.BindInterface == "" {
 			continue
@@ -228,19 +341,24 @@ func (c *Config) SecureTunnelNetdevForRef(ref string) (string, bool) {
 		if id != wantID || name == "" {
 			continue
 		}
-		if best != "" && name != best {
+		if claimant != "" && name != claimant {
 			// Distinct names, one if_id: routing creates neither. Order of
 			// discovery does not matter — any iteration order reaches this
-			// branch once two distinct names have been seen, so the false
-			// result is a pure function of the config.
-			return "", false
+			// branch once two distinct names have been seen, so the result is
+			// a pure function of the config.
+			return "", secureTunnelIDCollision
 		}
-		best = name
+		claimant = name
+		if secureTunnelRefsNameOneDevice(vpn.BindInterface, ref) {
+			owner = name
+		}
 	}
-	if best == "" {
-		return "", false
+	if owner == "" {
+		// Either nothing derives this if_id at all, or something does but
+		// under a different base spelling — a device that is not this ref.
+		return "", secureTunnelUnbound
 	}
-	return best, true
+	return owner, secureTunnelBound
 }
 
 // ValidateSecureTunnelBindInterface reports whether a `security ipsec vpn

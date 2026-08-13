@@ -218,8 +218,21 @@ func (c *Config) ResolveKernelIfName(ref string) string {
 	// The whole rule lives in SecureTunnelUnitNetdev (xfrmi.go) so
 	// snapshotLinuxName and junosHostLinuxName apply the IDENTICAL one
 	// instead of hand-copied instances of it (#6691).
+	//
+	// The verbatim arm below is THIS function's own fallback, not part of the
+	// shared rule: when no VPN binds the unit, SecureTunnelUnitNetdev declines
+	// (ok=false) so the dataplane resolvers can name the ordinary interface —
+	// the NIC, the VLAN device, the GRE device — while this one keeps
+	// returning the ref, which is what it returned before #5619. The gate is
+	// IsSecureTunnelIfName rather than the unbounded `Atoi(base[2:])` this
+	// replaced, so an out-of-range `st65536.3` now falls through to the
+	// ordinary unit resolution and agrees with the snapshot (#6691): a name
+	// the xfrmi constructor rejects is an ordinary interface here too.
 	if dev, ok := c.SecureTunnelUnitNetdev(ref); ok {
 		return dev
+	}
+	if IsSecureTunnelIfName(base) {
+		return LinuxIfName(ref)
 	}
 
 	// IRB.

@@ -161,9 +161,11 @@ pair. The binding-candidate decision is a single shared invariant
 (`UserspaceBoundLinuxInterfaces` /
 `userspaceSkipsIngressInterface`) all filter through the same exclusion
 contract — `include_userspace_binding_interface` (zoned, non-tunnel,
-non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0`, `st<N>` secure
-tunnels, and `mgmt`/`control`
-zones). The hash MUST cover exactly the interfaces the planner acts on, so
+non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0`, interfaces carrying
+the snapshot's `secure_tunnel` flag, and `mgmt`/`control`
+zones). That flag is an OWNERSHIP verdict shipped by the control plane, not
+the name shape `st<N>` — an earlier revision of this line said `st<N>`, which
+the section 30 lines below already repudiates. The hash MUST cover exactly the interfaces the planner acts on, so
 a change to a non-candidate interface never spuriously bumps the plan key
 and a `ge-*`/`xe-*`/`et-*` netdev placed in a mgmt/control/tunnel/fabric
 context is never planned as an AF_XDP binding the rest of the system does
@@ -216,14 +218,28 @@ name dropped that interface out of the ingress map, the binding plan and the RSS
 allowlist: a traffic outage on a working NIC.
 
 The exclusion is therefore keyed on OWNERSHIP. An `st` name is a secure tunnel
-when an IPsec configuration BINDS it — `Config.SecureTunnelNetdevForRef`, the
-same resolver that decides which xfrmi devices exist — and an unowned `st5`
-keeps adjudication, binding and RSS.
+when an IPsec configuration BINDS it — `Config.SecureTunnelNetdevForRef` — and
+an unowned `st5` keeps adjudication, binding and RSS. `pkg/routing/xfrm.go`,
+which actually creates the xfrmi devices, does not call that resolver; the two
+agree because both derive names and if_ids through `config.XFRMIfNameAndID` and
+both treat one if_id claimed by two distinct names as unresolvable. A shared
+derivation, not a shared function.
 
-What DOES still change for an unbound `st` interface is the NAME: at the merge
-base `snapshotLinuxName` collapsed an unbound `st0 unit 0` to `st0`; at head it
-returns `st0.0`, because the resolver falls back to the verbatim ref when no VPN
-binds the unit.
+Ownership is decided on the AUTHORED BASE SPELLING, not on the if_id alone
+(#6691 round 6). `strconv.Atoi` erases a leading `+` and leading zeros, so
+`st5`, `st05` and `st+5` all derive if_id `0x50001` under three DIFFERENT device
+names — and routing creates the device under the authored name. Keying on the
+if_id alone let `bind-interface st05` claim a wildcard-authored NIC named `st5`
+and strip it of its binding. The if_id is still what the COLLISION veto keys
+on, because that is the key routing collides on.
+
+**The NAME of an unbound `st` interface is unchanged from the merge base.** A
+round-5 revision of this section claimed `snapshotLinuxName` now returns `st0.0`
+where the merge base returned `st0`; that was the resolver half of the exclusion
+still being keyed on the name shape, and it is fixed. When no VPN binds the
+unit, `SecureTunnelUnitNetdev` declines and the ordinary resolution names the
+real device — the NIC, the `parent.vlanid` VLAN device, the `TunnelNameMap` GRE
+device. Only a bound unit resolves through the authored `bind-interface`.
 
 The `st<N>` range still matters, but only as a LEXICAL rule and only where a
 lexical question is asked: `IsSecureTunnelIfName` accepts `st<N>` for N in
@@ -251,8 +267,8 @@ broader than the sweep:
 
 | site | disposition |
 |---|---|
-| `dataplane.resolveInterfaceRef` (`compiler_iface.go:72`) | over-matches `st*` (#6728); reconstructs the name from the ref (#6729) |
-| `dataplane.buildInterfaceNetworkdModels` (`compiler_iface.go:754`) | raw prefix branch drops every unit of `start0` (#6730) |
+| `dataplane.resolveInterfaceRef` (`compiler_iface.go:73`) | over-matches `st*` (#6728); reconstructs the name from the ref (#6729) |
+| `dataplane.buildInterfaceNetworkdModels` (`compiler_iface.go:805`) | raw prefix branch drops every unit of `start0` (#6730) |
 | ip-monitoring next-hop validator (`compiler_services.go:1058`) | raw prefix rejection, fails closed (#6731) |
 | `daemon.resolveConfigSubnetLinuxName` (`daemon_dhcp.go:279`) | has no production caller — referenced only by its own test |
 

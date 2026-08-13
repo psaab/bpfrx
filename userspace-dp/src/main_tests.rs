@@ -2399,13 +2399,14 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
 // to be stated deliberately, or a secure tunnel would be planned an XSK that
 // cannot come up and the shim would DROP the decrypted plaintext.
 
-/// The SAME classification table as the Go half
-/// (`secureTunnelIfNameCases`, pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go).
-/// Keep the two lists identical — a name added on one side only is exactly the
-/// two-plane drift this pair exists to catch.
-
 /// The real planner must produce NO binding for a secure tunnel, while still
 /// planning the ordinary data interface beside it.
+///
+/// There is no Rust classification table paired with the Go one any more, and
+/// the paragraph that described one has been removed: #6691 round 5 deleted
+/// `is_secure_tunnel_ifname` and made this plane read the snapshot's
+/// `secure_tunnel` flag, so the name shape is never re-derived here. This test
+/// sets that flag directly, which is exactly what the Go control plane ships.
 #[test]
 fn binding_candidate_excludes_secure_tunnel() {
     use crate::server::helpers::replan_queues;

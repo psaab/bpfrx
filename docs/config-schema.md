@@ -200,6 +200,16 @@ class):
   read "`bind-interface st0.0` materializes the st0 xfrmi device", which is the
   exact conflation #5619 exists to correct.
 
+  The bind string is taken VERBATIM; nothing canonicalizes the index. `st5`,
+  `st05` and `st+5` are three different device names that happen to derive one
+  XFRM if_id, and each admits only its own spelling as a zone-referenceable
+  base. Commit accepts all three (`ValidateSecureTunnelBindInterface` only
+  requires a nonzero if_id), and rejecting the unusual spellings was considered
+  and declined in #6691 — a new commit-time rejection would brick a persisted
+  or peer-synced config that already carries one (#1960 no-brick). Ownership is
+  therefore matched on the spelling, so `bind-interface st05` does not claim an
+  interface named `st5`.
+
 The tolerant load / peer-sync path downgrades to a warning
 (`opts.lenientZoneInterfaceDefined`) so an already-persisted or peer-synced
 config an older binary accepted still boots (#1960 no-brick); runtime behavior on

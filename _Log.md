@@ -1,3 +1,159 @@
+## 2026-08-13 — #6691 round 6: the exclusion moved to ownership, the RESOLVER did not
+
+- **Timestamp**: 2026-08-13 06:10 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a hostile MERGE-NEEDS-MAJOR at `b847bbfc2` — three blocking
+  findings, all reproduced firsthand before being fixed.
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/config/types.go`,
+  `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_ownership_6691_test.go`,
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/config-schema.md`, `docs/refactoring-audit-current.txt`
+
+  **The diagnosis, because it is the whole point.** Round 5 moved the EXCLUSION
+  predicate from a name shape to ownership. The NAME RESOLVER did not move.
+  `Config.SecureTunnelUnitNetdev` stayed purely lexical — it returned
+  `ok=true` with the verbatim ref for ANY `st<N>.<unit>` no VPN owned — and it
+  is consulted FIRST by all three resolvers. A half-moved two-part mechanism is
+  the worst outcome available: the half that moved is defended by tests, and the
+  half that stayed is what ships.
+
+  **F1 — an unowned `st<N>` unit resolved to a netdev that does not exist.**
+  Measured with `set interfaces st5 unit 0` and NO IPsec anywhere (nothing
+  reserves the `st` prefix; `schema_interfaces.go` takes a wildcard name, and on
+  bare metal `set chassis device-map` renames a real card to exactly this):
+
+  | ref | before | after |
+  |---|---|---|
+  | `st5.0` | `st5.0` | `st5` |
+  | `st5 unit 3 vlan-id 80` | `st5.3` | `st5.80` |
+  | junos-host scope (unit 0) | `[st5 st5.0]` | `[st5]` |
+
+  At a name that exists on no box the row reports ifindex 0, and
+  `userspace-dp/src/filter/compiler.rs` skips `if iface.ifindex <= 0` — so the
+  unit's `filter input` was never installed, nor its per-unit CoS, nor its
+  routing-instance binding. On the VLAN unit it also took the junos-host DENY
+  with it: the guard was scoped to a device on no box and could not fire, which
+  is verbatim what `TestJunosHostDenyScopeNamesTheSecureTunnelDevice` exists to
+  prevent.
+
+  **F2 — ownership keyed on `if_id`, a lossy digest of the authored string.**
+  `strconv.Atoi` erases a leading `+` and leading zeros, so `st5`, `st05`,
+  `st+5` and `st0000005` all derive if_id `0x50001` while `LinuxIfName` keeps
+  them as four DIFFERENT device names — and `pkg/routing/xfrm.go` creates the
+  device under the AUTHORED name. Measured: `bind-interface st05` plus a NIC
+  named `st5` left both `st5` rows `secureTunnel=true` with an empty ingress set
+  and an empty RSS allowlist. A live NIC removed from the dataplane by a VPN
+  that never names it.
+
+  **F3 — the `st` arm was placed BEFORE the `TunnelNameMap` lookup**, reversing
+  #6861 r5 at two NEW call sites. Strict-committable, no IPsec, no device-map:
+  `st0 unit 1 tunnel mode gre` has real device `st0u1`, and the snapshot
+  returned `st0.1`. `TestIpipUnitDeviceMatchesTheSnapshotOrdering_6861`
+  established TunnelNameMap-FIRST three PRs ago and stayed green throughout,
+  because it only checks `ResolveKernelIfName` and the TunnelNameMap-derived
+  live set — an ordering invariant bound at one call site does not survive a
+  second call site being added.
+
+  **The fix.** `SecureTunnelUnitNetdev` now returns `ok=false` when NOTHING
+  binds the ref, so each caller runs its ordinary resolution and names the real
+  device. The verbatim ref survives in exactly two places, both deliberate: an
+  if_id COLLISION (routing creates NEITHER device, and the unit-0 collapse would
+  alias the unit row onto `st<N>` — a name equally absent but which LOOKS
+  resolvable, and which is also the base row's name), and `ResolveKernelIfName`'s
+  own fallback, which keeps master's answer for an unowned unit. That fallback
+  is gated on `IsSecureTunnelIfName` rather than master's unbounded
+  `Atoi(base[2:])`, so an out-of-range `st65536.3` now falls through to the
+  ordinary unit resolution and AGREES with the snapshot instead of diverging.
+
+  For F2 the choice was between comparing the resolved NAME, canonicalizing the
+  index, and rejecting the non-canonical spelling at commit. **Name comparison,
+  and the reasoning is the #1960 no-brick doctrine.** Canonicalizing the index
+  or rejecting at commit both make `bind-interface st05` invalid — and a config
+  already carrying that spelling is persisted and peer-syncable, so the
+  rejection would brick it on reload rather than at authoring time. Name
+  comparison is resolver-local: `XFRMIfNameAndID`,
+  `ValidateSecureTunnelBindInterface` and `pkg/routing/xfrm.go` are all
+  untouched, so nothing that
+  commits today stops committing.
+
+  **The if_id collision veto is KEPT and is now a separate test**, which the
+  name comparison alone would have lost. If a config binds BOTH `st5` and
+  `st05`, routing sees one if_id under two names and creates NEITHER; ownership
+  by name would have resolved `st5.0` to `st5`, naming a device routing has
+  already refused to create — the same divergence one spelling over. So
+  `secureTunnelBindingForRef` answers three-way: bound / unbound / id-collision.
+  Ownership asks "is this ref THIS device?" (authored base spelling); the veto
+  asks "will routing create it at all?" (if_id, the key routing collides on).
+
+  **The PR's own proof was VACUOUS.** `TestUnownedStNameKeepsItsDataplaneRole`
+  still PASSED with `buildUserspaceIngressIfindexes` returning nil
+  unconditionally — measured, not inferred. Two of its three assertions asserted
+  nothing: the ingress branch was gated on `row.Ifindex > 0` with no link
+  snapshot stubbed, so every row carried 0; and the RSS assertion accepted
+  `n == row.LinuxName || n == "st5"`, which cannot tell the correct `st5` from
+  the round-5 `st5.0`. Only the predicate assertion bound, so the comment's
+  claim that the sets were "asserted per SET rather than through the predicate
+  alone" was false. Both are now live — the netdev is stubbed to ifindex 11 and
+  both sets are asserted against the ABSOLUTE name — and the repaired test REDs
+  on that same nil mutation.
+
+  **Mutation matrix — five cells, each an exact revert edit, all RED by
+  assertion; control green.**
+
+  | cell | revert edit | result |
+  |---|---|---|
+  | A | none (control) | rc=0 |
+  | M1 | `SecureTunnelUnitNetdev` unowned arm → `(LinuxIfName(ref), true)` | RED — 4 tests, 5 subtests |
+  | M2 | ownership by if_id alone (drop `secureTunnelRefsNameOneDevice`) | RED — `st05`, `st+5`, `st0000005` |
+  | M3 | `snapshotLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M4 | `junosHostLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M5 | `ResolveKernelIfName` st arm reverted to master | RED |
+
+  M3, M4 and the `types.go` revert were the reviewer's three "DO NOT BIND"
+  mutations — all three left the whole suite green before this round. The arm
+  order is observable only on the config that names one ref as BOTH a bound
+  xfrmi and a GRE tunnel, so that overlap is where it is now pinned; ownership
+  wins, matching `ResolveKernelIfName`'s long-standing ordering.
+
+  **Six stale citations folded**, several pointing at symbols this PR itself
+  deleted: `xfrmi.go` cited a Rust `is_secure_tunnel_ifname` using
+  `parse::<i64>()` that round 5 removed; it named `userspaceSkipsIngressInterface`
+  as a caller of the predicate, which it no longer is; the 5619 test cited a Rust
+  `secure_tunnel_ifname_matches_go` that does not exist; `interfaces.go` cited a
+  `TestSecureTunnelResolverParity` that does not exist; `main_tests.rs` carried an
+  orphan doc paragraph for that nonexistent shared table; and `server/README.md`
+  restated the exclusion as the NAME SHAPE `st<N>`, repudiated 30 lines later in
+  the same file. Two file:line cites were off by ~50 lines
+  (`compiler_iface.go:72/754` → `:73/:805`). The claim that
+  `SecureTunnelNetdevForRef` is "the same resolver that decides which xfrmi
+  devices exist" is corrected in both places that made it: `pkg/routing/xfrm.go`
+  does not call it — they agree by both deriving through `XFRMIfNameAndID`, which
+  is a shared derivation and a drift risk, not a guarantee.
+
+  **A pre-existing red gate on the branch, fixed here.** `TestHeatmapNotStale`
+  was FAILING at `b847bbfc2`: the PR grew `maps_sync.go` from master's 1953 to
+  2076, crossing the 2000-line tier boundary, and the round-5 gate run was
+  scoped to `pkg/dataplane`/`pkg/config`/`pkg/routing` so it never covered
+  `pkg/refactoraudit`. Heatmap regenerated;
+  `pkg/dataplane/userspace/maps_sync.go` is now recorded `[REFACTOR]`. The tier
+  is accepted rather than worked around — trimming comments to duck a threshold
+  would be gaming the gate — and the split is left as follow-up, since it is
+  orthogonal to this fold and PR #6698 is stacked on this branch.
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  green, `cargo test --release` rc=0 (4277 passed / 0 failed). `pkg/config` and
+  `pkg/dataplane/userspace` run 3x each, green every time. Two failures seen on
+  the first full pass were triaged, not waved through: `TestHeatmapNotStale` was
+  the real pre-existing red described above and is fixed; the `pkg/cluster`
+  `TestWaitForIdleTimesOutWhileQueueAdvances` and the Rust
+  `install_session_serializes_with_reconcile_removal` are load-dependent timing
+  flakes, both 3/3 green in isolation and neither in any file this round
+  touches. No shim source changed, so no `make generate` and no cluster smoke
+  owed.
+
 ## 2026-08-12 — #5619/#6691: merge master 4960e7bee; both conflicts were adjacency, not rewrite
 
 - **Timestamp**: 2026-08-12 19:05 (fix/5619-ipsec-passthrough-zone-policy)

@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -43,6 +44,12 @@ func stOwnershipConfig(t *testing.T, owned bool) *config.Config {
 	return compileForTest5619(t, lines...)
 }
 
+// stOwnershipLive is the ifindex the `st5` netdev is stubbed to exist at, and
+// `ge-0-0-0` beside it. Without a live link snapshot every row reports ifindex
+// 0, and the ingress-set assertion below cannot discriminate anything: both
+// membership branches would be comparing against 0.
+var stOwnershipLive = map[string]int{"st5": 11, "ge-0-0-0": 10}
+
 // TestUnownedStNameKeepsItsDataplaneRole is the RED-on-revert guard for the
 // round-5 blocker.
 //
@@ -55,6 +62,23 @@ func stOwnershipConfig(t *testing.T, owned bool) *config.Config {
 // the same name MUST still be excluded. Without it, "keep everything" would
 // pass the unowned half while silently reopening the #5619 gap the exclusion
 // exists for.
+//
+// #6691 round 6 — THIS TEST WAS VACUOUS AND IS THE PR'S OWN PROOF, so the
+// repair is recorded rather than quietly applied. Two of its three assertions
+// asserted nothing:
+//
+//   - the ingress-set assertion was `if row.Ifindex > 0 && ...`, and no link
+//     snapshot was stubbed, so every row carried ifindex 0 and the branch never
+//     ran. Making buildUserspaceIngressIfindexes return nil unconditionally
+//     left the test PASSING — measured, not inferred.
+//   - the RSS assertion accepted `n == row.LinuxName || n == "st5"`, which
+//     cannot distinguish the correct `st5` from the round-5 `st5.0`: whichever
+//     name the resolver produced, one of the two disjuncts matched it.
+//
+// Only the predicate assertion bound, so the previous comment's claim that the
+// sets were "asserted per SET rather than through the predicate alone" was
+// false. Both are now live: the netdev is stubbed into existence at a real
+// ifindex, and both sets are asserted against the ABSOLUTE expected name.
 func TestUnownedStNameKeepsItsDataplaneRole(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -66,6 +90,7 @@ func TestUnownedStNameKeepsItsDataplaneRole(t *testing.T) {
 		{"a VPN binds st5 — a real secure tunnel", true, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			defer stubLinkSnapshot5619(t, stOwnershipLive)()
 			cfg := stOwnershipConfig(t, tc.owned)
 
 			// Premise: the ownership oracle must actually disagree between the
@@ -87,6 +112,24 @@ func TestUnownedStNameKeepsItsDataplaneRole(t *testing.T) {
 				t.Fatal("premise broken: no st5.0 row in the snapshot")
 			}
 
+			// The netdev name is asserted ABSOLUTELY, and it is the same under
+			// both spellings: `bind-interface st5` creates a device called
+			// `st5`, and an unowned `st5` unit 0 collapses onto the NIC `st5`.
+			// Round 5 resolved the unowned case to `st5.0` instead — a name on
+			// no box, hence ifindex 0, hence out of every set below for a
+			// reason that has nothing to do with the predicate under test.
+			const wantDev = "st5"
+			if row.LinuxName != wantDev {
+				t.Fatalf("premise broken: st5.0 resolved to netdev %q, want %q — at any "+
+					"other name the row carries ifindex 0 and the set assertions below "+
+					"stop discriminating", row.LinuxName, wantDev)
+			}
+			if row.Ifindex != stOwnershipLive[wantDev] {
+				t.Fatalf("premise broken: st5.0 row has ifindex %d, want %d — the stub "+
+					"makes %q exist precisely so the ingress-set assertion is live",
+					row.Ifindex, stOwnershipLive[wantDev], wantDev)
+			}
+
 			if got := userspaceSkipsIngressInterface(row); got != tc.wantSkip {
 				t.Errorf("userspaceSkipsIngressInterface(st5.0) = %v, want %v — an `st` name "+
 					"is a secure tunnel because a VPN BINDS it, not because it is spelled "+
@@ -95,28 +138,21 @@ func TestUnownedStNameKeepsItsDataplaneRole(t *testing.T) {
 					"allowlist", got, tc.wantSkip)
 			}
 
-			// The three ifindex-keyed sets the predicate gates, asserted per
-			// SET rather than through the predicate alone — the predicate is
-			// the mechanism, these are the consequences an operator sees.
+			// The two ifindex-keyed sets the predicate gates, asserted per SET
+			// rather than through the predicate alone — the predicate is the
+			// mechanism, these are the consequences an operator sees.
 			snapshot := &ConfigSnapshot{Interfaces: buildInterfaceSnapshots(cfg)}
-			inIngress := false
-			for _, idx := range buildUserspaceIngressIfindexes(snapshot) {
-				if idx == uint32(row.Ifindex) && row.Ifindex > 0 {
-					inIngress = true
-				}
-			}
-			if row.Ifindex > 0 && inIngress == tc.wantSkip {
-				t.Errorf("st5.0 in the ingress-adjudication set = %v, want %v", inIngress, !tc.wantSkip)
+			inIngress := slices.Contains(
+				buildUserspaceIngressIfindexes(snapshot), uint32(row.Ifindex))
+			if inIngress == tc.wantSkip {
+				t.Errorf("st5.0 (ifindex %d) in the ingress-adjudication set = %v, want %v",
+					row.Ifindex, inIngress, !tc.wantSkip)
 			}
 
-			bound := false
-			for _, n := range UserspaceBoundLinuxInterfaces(cfg) {
-				if n == row.LinuxName || n == "st5" {
-					bound = true
-				}
-			}
+			bound := slices.Contains(UserspaceBoundLinuxInterfaces(cfg), wantDev)
 			if bound != tc.wantBound {
-				t.Errorf("st5 in the RSS/binding allowlist = %v, want %v", bound, tc.wantBound)
+				t.Errorf("%q in the RSS/binding allowlist = %v, want %v",
+					wantDev, bound, tc.wantBound)
 			}
 		})
 	}
