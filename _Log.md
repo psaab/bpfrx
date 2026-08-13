@@ -71295,6 +71295,46 @@ break — `go vet` confirmed passing under every revert.
   silently default to unrestricted. Corrected two further stale references to
   the deleted MORE PERMISSIVE advisory.
   **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/compiler_system.go, pkg/config/compiler_system_login_gates.go, pkg/config/types_system.go, pkg/config/login_class_deny_5831_test.go, pkg/config/compiler_system_login_packed_6662_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
+- **Timestamp**: 2026-08-13
+  **Action**: #6838 review fold r4 — the tolerant fold shipped a NEW
+  operator-facing claim that was false for a class NAME shadowing a
+  system-defined one. `class super-user { permissions all; deny-commands
+  "request system zeroize"; }` warned "The class is folded from {super-user} to
+  {configure,view}" while `resolveClassPerms` consulted the built-in table
+  first, so the runtime returned PermAll: zeroize allowed, secrets in
+  cleartext. Reproduced firsthand through the real peer-sync ingress on this
+  head AND on origin/master (edefb7570) — the SAME probe allows zeroize and
+  renders cleartext on both, so the runtime delta is zero and this is a message
+  defect, not a regression. Fixed as a message defect: the fold now skips a
+  name in `LoginClassPermissions`, per NAME, so the whole cohort is skipped
+  together. That also repairs a knock-on the fold had introduced — the #4304
+  advisory is the second and only other production reader of
+  `MappedPermissions`, and folding a shadowing class had turned its "mapped to
+  {super-user}" (true, the built-in grants everything) into "mapped to
+  {configure,view}", which is the precise sentence the #6701 warning beside it
+  calls out as untrue. Both claims are now back to what #6701 found. Nothing is
+  added in their place: #6701 already states the truth for this shape in the
+  same warning list, and whether an inert definition deserves more than a
+  warning is #6701's question. Also bound three message-rendering lines this
+  round's cohort fold had added or made load-bearing, each removable with the
+  full pkg/config + pkg/cli suites green — the `seen` leaf-name dedup (only
+  reachable once the cohort's leaves were concatenated), `sort.Strings(leaves)`,
+  and `unionPerms`' dedup scan — with ONE two-block fixture whose leaves
+  duplicate across blocks, arrive out of sorted order, and whose permission
+  sets overlap, so all three degrade the same rendered string on different
+  clauses. And pinned the strict gate's report-one CHOICE, which is
+  first-appearance-of-NAME rather than of the offending BLOCK: only an
+  alpha/beta/alpha straddle distinguishes the two rules, and the choice is an
+  operator-facing message no test constrained.
+  **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  rc=0 (whole tree, 62 packages ok, zero FAIL) on the merge result. Five
+  independent revert proofs, each observed RED: removing the shadowing guard
+  reds three separate assertions (narrowed MappedPermissions, the false fold
+  claim, the narrowed advisory); removing `sort.Strings(leaves)`, the `seen`
+  dedup, or `unionPerms`' dedup each reds the rendered-message comparison; and
+  reporting `rejections[len-1]` instead of `rejections[0]` reds the ordering
+  pin with `beta`.
+  **File(s)**: pkg/config/compiler_login_deny.go, pkg/config/login_class_deny_5831_test.go, pkg/cli/permissions_login_deny_fold_5831_test.go, docs/system-login.md, _Log.md
 - **Timestamp**: 2026-08-01 17:41
 - **Action**: #5173 round-5 fold — the #6676 guard claimed CLASS-COMPLETENESS
   over binding forms that a proc macro breaks, and understated its own

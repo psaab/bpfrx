@@ -703,3 +703,179 @@ func TestLoginClassRestrictiveClassificationIsEnforced_5831(t *testing.T) {
 		})
 	}
 }
+
+// TestLoginClassDenyRejectionMessageIsDedupedAndSorted binds the three
+// message-rendering lines this round's cohort fold added or made load-bearing
+// (#6838 review MINOR-2). Each was removable with the full pkg/config + pkg/cli
+// suites still green, so each is pinned here by the ONE string they all feed.
+//
+// The fixture is the shape that makes all three observable at once — two blocks
+// under one name, with an overlapping leaf, an out-of-order leaf pair, and
+// overlapping permission sets:
+//
+//   - collectLoginClassDenyRejections `seen` dedup — the two blocks BOTH carry
+//     `deny-configuration`, which only became reachable when this round started
+//     concatenating the cohort's leaves. Without it: "deny-commands /
+//     deny-configuration / deny-configuration".
+//   - collectLoginClassDenyRejections sort.Strings(leaves) — the leaves arrive
+//     as [deny-configuration, deny-configuration, deny-commands]. Without it:
+//     "deny-configuration / deny-commands".
+//   - unionPerms' linear dedup scan — both blocks hold `view`, so the before-set
+//     and the after-set each accumulate it twice. Without it: "folded from
+//     {clear,configure,view,view} to {configure,view,view}".
+//
+// All three are message-rendering only: no permission changes and no
+// accept/reject changes ride on them. They are pinned because an operator
+// message IS this gate's product, and a rejection reading "deny-commands /
+// deny-configuration / deny-configuration" reads like a parser bug in the
+// operator's own config.
+func TestLoginClassDenyRejectionMessageIsDedupedAndSorted(t *testing.T) {
+	src := `
+system {
+    login {
+        class limited {
+            permissions [ view configure ];
+            deny-configuration "security policies";
+        }
+        class limited {
+            permissions [ view clear ];
+            deny-configuration "system services";
+            deny-commands "request system zeroize";
+        }
+    }
+}
+`
+	p := NewParser(src)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+
+	// Guard the guard. Every one of the three reverts is only observable
+	// because of a specific property of this fixture, so assert the fixture
+	// rather than assume it: two blocks, one name, a leaf spelled on BOTH, the
+	// leaves recorded out of sorted order, and overlapping permission sets.
+	if len(cfg.System.Login.Classes) != 2 {
+		t.Fatalf("precondition: want the two-block duplicate-name shape; classes=%+v",
+			cfg.System.Login.Classes)
+	}
+	a, b := cfg.System.Login.Classes[0], cfg.System.Login.Classes[1]
+	if a.Name != "limited" || b.Name != "limited" {
+		t.Fatalf("precondition: both blocks must share a name; got %q and %q", a.Name, b.Name)
+	}
+	if len(a.DenyLeavesPresent) != 1 || a.DenyLeavesPresent[0] != "deny-configuration" {
+		t.Fatalf("precondition: first block must carry exactly deny-configuration; got %v",
+			a.DenyLeavesPresent)
+	}
+	if len(b.DenyLeavesPresent) != 2 ||
+		b.DenyLeavesPresent[0] != "deny-configuration" || b.DenyLeavesPresent[1] != "deny-commands" {
+		t.Fatalf("precondition: second block must carry deny-configuration THEN deny-commands "+
+			"(duplicated across blocks, and out of sorted order); got %v", b.DenyLeavesPresent)
+	}
+
+	var w string
+	for _, cand := range cfg.Warnings {
+		if strings.Contains(cand, "is NOT enforced by xpf's coarse RBAC model") {
+			w = cand
+		}
+	}
+	if w == "" {
+		t.Fatalf("tolerant path must warn about the unenforced restriction; warnings=%v", cfg.Warnings)
+	}
+
+	// ONE assertion, three reverts. Every substring below is a rendering
+	// product of a different unbound line, so removing any one of them fails
+	// this comparison on a different clause.
+	const want = `system login class "limited": deny-commands / deny-configuration is NOT enforced ` +
+		`by xpf's coarse RBAC model (downgraded to a warning on the tolerant load / peer-sync ` +
+		`path). The class is folded from {clear,configure,view} to {configure,view}.`
+	if !strings.Contains(w, want) {
+		t.Fatalf("rejection message is not deduplicated / sorted as rendered.\n want: %s\n  got: %s",
+			want, w)
+	}
+}
+
+// TestLoginClassDenyStrictReportsFirstNameNotFirstOffendingBlock pins the
+// strict gate's "report one, deterministically" CHOICE (#6838 review NIT).
+//
+// The rule is first-appearance-of-NAME, and only a straddle shape can tell it
+// apart from the competing first-appearance-of-the-OFFENDING-BLOCK rule: `alpha`
+// is defined first but its deny leaf lands on a LATER block, while `beta` sits
+// between them carrying a deny leaf of its own. Name order reports `alpha`;
+// block order reports `beta`.
+//
+// Neither rule is unsafe — both reject, and the message names the class and the
+// offending leaf, so neither saves the operator a search. It is pinned because
+// nothing else pins it: the choice is invisible until a config has two offending
+// classes, and it is the sort of thing a later refactor of
+// collectLoginClassDenyRejections would flip silently while changing an
+// operator-facing message.
+//
+// REVERT THAT REDS THIS: in validateLoginClassDenyStrict, report
+// rejections[len(rejections)-1] instead of rejections[0], or key the grouping on
+// the offending block rather than the name.
+func TestLoginClassDenyStrictReportsFirstNameNotFirstOffendingBlock(t *testing.T) {
+	src := `
+system {
+    login {
+        class alpha {
+            permissions [ view ];
+        }
+        class beta {
+            permissions [ view ];
+            deny-commands "request system zeroize";
+        }
+        class alpha {
+            permissions [ view ];
+            deny-configuration "security policies";
+        }
+    }
+}
+`
+	p := NewParser(src)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+
+	// Guard the guard: the straddle is the whole test. If the compiler ever
+	// merges the two `alpha` blocks, or the deny leaves stop being recorded,
+	// the two candidate rules stop disagreeing and this passes vacuously.
+	cfgL, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	if len(cfgL.System.Login.Classes) != 3 {
+		t.Fatalf("precondition: want alpha/beta/alpha as three blocks; classes=%+v",
+			cfgL.System.Login.Classes)
+	}
+	for i, want := range []struct {
+		name string
+		deny int
+	}{{"alpha", 0}, {"beta", 1}, {"alpha", 1}} {
+		lc := cfgL.System.Login.Classes[i]
+		if lc.Name != want.name || len(lc.DenyLeavesPresent) != want.deny {
+			t.Fatalf("precondition: block %d is %q with %d deny leaves, want %q with %d — "+
+				"the straddle (first NAME offends LATER than a middle class) is not configured",
+				i, lc.Name, len(lc.DenyLeavesPresent), want.name, want.deny)
+		}
+	}
+
+	_, err = CompileConfig(tree)
+	if err == nil {
+		t.Fatal("strict commit ACCEPTED a config with two unenforceable deny classes")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `system login class "alpha": deny-configuration is NOT enforced`) {
+		t.Errorf("strict gate does not report the FIRST class NAME (`alpha`, whose offending "+
+			"block is the LAST one) — the reporting rule changed: %s", msg)
+	}
+	if strings.Contains(msg, "beta") {
+		t.Errorf("strict gate reported `beta`, i.e. the first offending BLOCK rather than the "+
+			"first offending NAME: %s", msg)
+	}
+}

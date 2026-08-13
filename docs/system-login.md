@@ -419,6 +419,29 @@ narrowed to what it already held. The per-class warning reports the union on
 each side — *at most* this much before, *at most* this much after — because the
 config does not say which block answers.
 
+**The fold SKIPS a class name that shadows a built-in.** The same
+built-in-first lookup that makes a shadowing definition inert (see *built-in
+shadowing* below) means `MappedPermissions` is never read for such a name, so
+there is nothing for the floor to narrow. Folding it anyway changed no
+behaviour and produced two claims that were **false**: the per-class warning
+said the class had been "folded from `{super-user}` to `{configure,view}`"
+while `request system zeroize` stayed allowed and secrets stayed in cleartext,
+and the #4304 advisory — the fold's other reader — turned from `mapped to
+{super-user}` into `mapped to {configure,view}`, which is precisely the
+sentence the #6701 warning beside it calls out as untrue. The fold therefore
+stays silent for these names and leaves both claims as #6701 found them; the
+#6701 warning already states the truth for the shape, and the strict path
+rejects the config through that gate. This is a per-*name* skip, so a
+non-shadowing class in the same config is still folded normally.
+
+**Which class the strict gate names.** A config may carry several offending
+classes; the strict error reports exactly one, chosen by **first appearance of
+the class NAME** — not by the first offending *block*. So `class alpha` defined
+first, `class beta` carrying a deny, then a second `alpha` block carrying one,
+reports `alpha`. Both orderings are safe (both reject, and the message names
+the class *and* the offending leaf), but the choice is an operator-facing
+message and is pinned as a contract rather than left to the collection order.
+
 > [!WARNING]
 > **The fold reduces blast radius; it does not enforce the statement.** A
 > RETAINED bucket is a bucket where the deny does nothing, and the floor
@@ -494,6 +517,10 @@ the tolerant load / peer-sync path. Built-in-first precedence itself is
 deliberately unchanged: inverting it would let
 `class read-only permissions all` **escalate** a built-in, which is strictly
 worse. Pick a distinct class name, or reference the built-in directly.
+
+Inertness is why the #5831 deny fold skips these names on the tolerant path
+(above): nothing it could narrow is ever read, so folding one would only add a
+second, false narrowing claim next to the warning above.
 
 > **Compatibility break.** The system-defined names are `super-user`,
 > `operator`, `read-only`, `config-viewer` and `unauthorized`. A migrated vSRX

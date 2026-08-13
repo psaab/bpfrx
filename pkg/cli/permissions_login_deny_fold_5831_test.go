@@ -431,3 +431,173 @@ func TestFoldedClassResolvesThroughCustomTableNotBuiltins(t *testing.T) {
 		}
 	}
 }
+
+// TestFoldNeverClaimsAReductionTheBuiltinOverrides is the claim-truth guard for
+// a class NAME that shadows a system-defined one (#6838 review MINOR-1).
+//
+// `resolveClassPerms` consults `config.LoginClassPermissions` FIRST, so for such
+// a name the built-in answers and `MappedPermissions` — the only state the fold
+// can narrow — is never read at runtime. The fold used to run anyway and warn
+// that the class had been "folded from {super-user} to {configure,view}", while
+// `request system zeroize` stayed ALLOWED and secrets stayed in cleartext. That
+// is the B1 defect one spelling further out: an operator-facing claim of a
+// narrowing that did not happen, sitting in the same warning list as the #6701
+// warning stating the exact opposite ("this definition is INERT, so any
+// narrowing it expresses is silently not applied while the commit advisory
+// reports that it was").
+//
+// It is measurably NOT a runtime regression — the same probe against
+// origin/master allows zeroize and renders cleartext too — which is why the
+// assertions below MEASURE the runtime first and then require every warning to
+// agree with what was measured. A message-only defect is still a defect in a
+// gate whose entire product is an operator-facing claim.
+//
+// The knock-on is asserted too. `MappedPermissions` has exactly two production
+// readers; the second is the #4304 commit advisory, which reports the EFFECTIVE
+// set. Folding a shadowing class turned its advisory from "{super-user}" (true —
+// the built-in does grant everything) into "{configure,view}", i.e. made the
+// advisory say precisely what #6701 warns it falsely says.
+//
+// REVERT THAT REDS THIS: delete the `if _, builtin :=
+// LoginClassPermissions[r.class]; builtin { continue }` guard at the top of
+// foldLoginClassDenyToRepairableFloor's loop (pkg/config/compiler_login_deny.go).
+// The `noc-admin` subtest is the scope control — it must stay folded, so a guard
+// widened into "skip the fold entirely" reds too.
+func TestFoldNeverClaimsAReductionTheBuiltinOverrides(t *testing.T) {
+	const cfgSrc = `
+system {
+    login {
+        class super-user {
+            permissions all;
+            deny-commands "request system zeroize";
+        }
+        class noc-admin {
+            permissions [ view configure ];
+            deny-configuration "security policies";
+        }
+        user root {
+            class super-user;
+        }
+    }
+}
+`
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if _, err := store.SyncApply(cfgSrc, nil); err != nil {
+		t.Fatalf("tolerant peer-sync must not reject a previously-accepted config (#1960): %v", err)
+	}
+	cfg := store.ActiveConfig()
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Classes) != 2 {
+		t.Fatalf("precondition: want both class blocks; cfg=%+v", cfg)
+	}
+	// Guard the guard, in both directions: the shadowing name must really be a
+	// built-in and the control must really not be, or the two subtests below
+	// are the same test twice.
+	if _, builtin := config.LoginClassPermissions["super-user"]; !builtin {
+		t.Fatal("precondition: `super-user` must be a system-defined class for this test to mean anything")
+	}
+	if _, builtin := config.LoginClassPermissions["noc-admin"]; builtin {
+		t.Fatal("precondition: `noc-admin` must NOT be a built-in — it is the scope control")
+	}
+	var shadowed, control *config.LoginClass
+	for _, lc := range cfg.System.Login.Classes {
+		switch lc.Name {
+		case "super-user":
+			shadowed = lc
+		case "noc-admin":
+			control = lc
+		}
+		if len(lc.DenyLeavesPresent) == 0 {
+			t.Fatalf("precondition: class %q did not record its deny leaf, so the fold never "+
+				"considered it; class=%+v", lc.Name, lc)
+		}
+	}
+	if shadowed == nil || control == nil {
+		t.Fatalf("precondition: want one `super-user` and one `noc-admin` block; classes=%+v",
+			cfg.System.Login.Classes)
+	}
+
+	// MEASURE the runtime before judging any claim about it. The built-in
+	// answers, so this class holds everything — exactly as it did before the
+	// #5831 gate existed.
+	c := &CLI{store: store, userClass: "super-user"}
+	if err := c.checkPermission([]string{"request", "system", "zeroize"}); err != nil {
+		t.Fatalf("premise changed: the built-in no longer answers for a shadowing name (%v). "+
+			"If that is deliberate this test's subject has moved — re-derive it rather than "+
+			"relaxing it", err)
+	}
+	if c.showConfigRedacted() {
+		t.Fatal("premise changed: a shadowing class no longer renders cleartext secrets — " +
+			"the built-in PermAll is no longer what answers")
+	}
+	// ...and the fold must not have narrowed the dead state either, because the
+	// advisory reads it and would report the narrowing as effective.
+	var hasAll bool
+	for _, p := range shadowed.MappedPermissions {
+		if p == config.PermAll {
+			hasAll = true
+		}
+	}
+	if !hasAll {
+		t.Errorf("the fold narrowed a shadowing class's MappedPermissions to %v — nothing reads "+
+			"that at runtime except the #4304 advisory, which will now report a narrowing that "+
+			"did not happen", shadowed.MappedPermissions)
+	}
+
+	// The class-name slot is `system login class "<name>":`, and it must be
+	// matched with the quotes: describePerms renders PermAll as the string
+	// `super-user` too, so a bare Contains("super-user") cannot tell the class
+	// name apart from the permission name in ANY of these messages.
+	const shadowFoldClaim = `system login class "super-user": deny-commands is NOT enforced`
+	var advisory, inert, controlFold string
+	for _, w := range cfg.Warnings {
+		switch {
+		case strings.Contains(w, shadowFoldClaim):
+			t.Errorf("the fold claims a reduction for a class the built-in overrides — "+
+				"`request system zeroize` is ALLOWED and secrets render in cleartext, both "+
+				"measured above:\n  %s", w)
+		case strings.Contains(w, `system login class "super-user": recognized`):
+			advisory = w
+		case strings.Contains(w, `system login class super-user: "super-user" is a SYSTEM-DEFINED`):
+			inert = w
+		case strings.Contains(w, `system login class "noc-admin": deny-configuration is NOT enforced`):
+			controlFold = w
+		}
+	}
+
+	// The #4304 advisory must still report the set the runtime actually grants.
+	if advisory == "" {
+		t.Fatalf("no #4304 advisory for the shadowing class at all; warnings=%v", cfg.Warnings)
+	}
+	if !strings.Contains(advisory, "mapped to xpf coarse permissions {super-user}") {
+		t.Errorf("the advisory reports a narrowed permission set for a class whose built-in "+
+			"grants everything — this is the exact sentence the #6701 warning beside it calls "+
+			"out as false:\n  %s", advisory)
+	}
+
+	// POSITIVE CONTROL. Staying silent is only acceptable because #6701 states
+	// the truth for this shape in the same list. If that warning ever stops
+	// firing, the fold's silence becomes silence.
+	if inert == "" {
+		t.Fatalf("the #6701 INERT warning is gone, so the operator is now told NOTHING about a "+
+			"deny statement on a shadowing class; warnings=%v", cfg.Warnings)
+	}
+
+	// SCOPE CONTROL. The guard is per-NAME, not a switch that disables the fold.
+	if controlFold == "" {
+		t.Fatalf("the non-shadowing class was not folded — the guard is scoped wider than "+
+			"built-in-shadowing names; warnings=%v", cfg.Warnings)
+	}
+	if !strings.Contains(controlFold, "is folded from") {
+		t.Errorf("the non-shadowing class's warning no longer reports the fold: %s", controlFold)
+	}
+	for _, p := range control.MappedPermissions {
+		if p == config.PermAll {
+			t.Errorf("the non-shadowing class kept PermAll: %v", control.MappedPermissions)
+		}
+	}
+	cc := &CLI{store: store, userClass: "noc-admin"}
+	if err := cc.checkPermission([]string{"request", "system", "zeroize"}); err == nil {
+		t.Error("the non-shadowing control class was NOT folded at runtime — `request system " +
+			"zeroize` is still allowed")
+	}
+}

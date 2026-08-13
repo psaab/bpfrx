@@ -251,6 +251,43 @@ func foldLoginClassDenyToRepairableFloor(cfg *Config) []string {
 	}
 	warnings := make([]string, 0, len(rejections))
 	for _, r := range rejections {
+		// A class NAME shadowing a system-defined one is INERT, so there is
+		// nothing here to fold (#6838 review). pkg/cli resolveClassPerms
+		// consults config.LoginClassPermissions FIRST, so the built-in answers
+		// for such a name and MappedPermissions — the only state
+		// repairableFloorFold can narrow — is never read at runtime. Folding
+		// it anyway changes no behaviour and emits a warning asserting a
+		// reduction that did not happen: measured on the tolerant path,
+		// `class super-user { permissions all; deny-commands "request system
+		// zeroize"; }` still allows zeroize and still renders secrets in
+		// cleartext — identical to origin/master — while the warning claimed
+		// the class was folded to {configure,view}. That is the B1 defect one
+		// spelling further out: an operator-facing claim of a narrowing the
+		// runtime never applied.
+		//
+		// The knock-on matters as much as the warning. lc.MappedPermissions
+		// has exactly two production readers, and the other one is the #4304
+		// commit advisory (compiler_system.go loginClassAdvisoryWarnings),
+		// which reports the EFFECTIVE set. Folding a shadowing class turned
+		// its advisory from "mapped to {super-user}" — true, the built-in does
+		// grant everything — into "mapped to {configure,view}", which is the
+		// precise sentence the #6701 warning beside it calls out as false
+		// ("silently not applied while the commit advisory reports that it
+		// was"). Skipping leaves both claims where #6701 found them.
+		//
+		// This is NOT the name lookup B1 removed. That one keyed a map over
+		// the config's OWN blocks and so could disagree with the reader's
+		// tie-break; this reads the same static built-in table the reader
+		// itself consults first, and shadowing is a property of the NAME,
+		// which the whole cohort shares.
+		//
+		// Nothing is lost by staying silent: #6701 already states the truth
+		// for this shape in the same warning list, and the strict path rejects
+		// the config through that gate. Whether an inert definition deserves
+		// more than a warning is #6701's question, not this gate's.
+		if _, builtin := LoginClassPermissions[r.class]; builtin {
+			continue
+		}
 		// Fold every block carrying the name, and report the UNION on each
 		// side. The runtime resolves ONE of these blocks and the config does
 		// not say which, so the union is the honest claim: at most this much
