@@ -2611,6 +2611,16 @@ pub(super) fn poll_binding_process_descriptor(
                                                 .session_publish_errors
                                                 .fetch_add(1, Ordering::Relaxed);
                                         }
+                                        // #4800: the single place a locally
+                                        // learned transit forward flow is
+                                        // installed — count it per binding so
+                                        // the per-worker distribution of the
+                                        // allocate/publish/replicate work is
+                                        // observable, not inferred.
+                                        binding
+                                            .live
+                                            .new_flow_installs
+                                            .fetch_add(1, Ordering::Relaxed);
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,
                                             worker_ctx.shared_nat_sessions,

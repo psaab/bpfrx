@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -192,6 +193,121 @@ type Manager struct {
 	// (~1 KiB), allocated once, never reset for the life of the process. Its
 	// own locking makes it safe to touch without m.mu.
 	hbAuth heartbeatAuthState
+
+	// hbNonceOnce/hbSession/hbCounter are the SENDER half of the control-channel
+	// anti-replay nonce, scoped to the Manager — i.e. to one daemon incarnation.
+	//
+	// #6169: this used to be per-heartbeatSender, so every StartHeartbeat minted
+	// a fresh random session and restarted the counter. That made the receiver's
+	// bounded ring (heartbeatReplaySessions) a bound on peer SESSIONS rather
+	// than on peer daemon incarnations, and routine events mint sessions —
+	// RestartHeartbeat on a DHCP-triggered VRF rebind, the HA comms restart. A
+	// single long-lived daemon could therefore emit more than a ringful of
+	// distinct sessions under ONE boot epoch, and an attacker could churn the
+	// ring among them without the epoch floor ever rejecting anything.
+	//
+	// One incarnation now emits exactly one session with a counter that is
+	// monotonic across heartbeat restarts, so the epoch floor leaves an attacker
+	// at most heartbeatEpochSessionsPerEpoch sessions to replay PER EPOCH VALUE
+	// (heartbeatAuthState.highEpochSessions) and the ring rejects those on the
+	// watermark.
+	// Nothing regresses on the receiver: a heartbeat restart keeps the session
+	// and advances the counter, which the ring admits; a daemon restart builds a
+	// new Manager and so draws a fresh random session, which the ring admits as
+	// never-seen exactly as before.
+	hbNonceOnce sync.Once
+	hbSession   uint64
+	hbCounter   atomic.Uint64
+
+	// bootEpochOnce/bootEpoch/bootEpochReady hold this daemon incarnation's
+	// #6169 boot epoch: a persisted, increasing-across-restart counter carried
+	// in the signed heartbeat so the peer can order incarnations. NOT strictly
+	// increasing in every case — the persisted term is bounded, so a backward
+	// clock step larger than bootEpochMaxSkew regresses it (#6711). See the
+	// header comment in heartbeat_epoch.go.
+	//
+	// bootEpoch is published SYNCHRONOUSLY from the wall clock on first use,
+	// before any file is touched, so it is never 0 for a node that has asked
+	// for it — a storage fault cannot make this node emit epoch-less frames and
+	// be declared dead by a latched peer. Persistence is a refinement that runs
+	// off the send path (an fsync must never stall the 100ms send loop) and only
+	// ever RAISES the value, its one job being to survive a backward clock step.
+	// See Manager.heartbeatBootEpoch and refineBootEpoch.
+	//
+	// bootEpochReady is closed once the first refinement attempt finishes.
+	// NOTHING in production waits on it — StartHeartbeat used to, which stalled
+	// a node whose heartbeat was already stopped, and that wait was removed
+	// (initHeartbeatEpochState).
+	//
+	// IT IS NOT A JOIN, and this comment used to offer it to tests as one. The
+	// worker closes it from INSIDE its loop and then still calls
+	// releaseBootEpochRefine — which reads a package-var test seam — and may run
+	// further coalesced passes before returning, so a test that stops here
+	// returns with a live worker that the next test's seam assignment races.
+	// Tests join with awaitFirstRefine or waitBootEpochIdle. See
+	// Manager.heartbeatBootEpoch, whose comment is the long form.
+	//
+	// bootEpochWrote is the epoch this incarnation last persisted. Refinement is
+	// RE-RUN on every later heartbeat start (Manager.refreshBootEpoch), because
+	// the epoch is resolved against a file other incarnations also write: one
+	// that takes withEpochFileLock after us can raise the file above what we
+	// published and park us below the peer's floor. Behind the boot-time
+	// sync.Once alone that lasted for the life of the process. bootEpochWrote is
+	// what keeps the re-run idempotent — a file still holding our own value is
+	// left alone rather than chained from, which would ratchet the epoch by one
+	// per pass.
+	//
+	// bootEpochRefine is ONE WORD holding TWO bits — bootEpochRefiningBit admits
+	// one refine worker at a time, bootEpochPendingBit COALESCES a request that
+	// arrives while that worker is in flight — and their being one word is a
+	// correctness requirement, not packing. Two separate atomic.Bools could be
+	// observed torn: a requester that read "a worker is in flight" and then
+	// stored the pending bit after that worker's last check had nobody left to
+	// serve it. Every transition is a CAS on the pair, so a requester whose
+	// observation went stale fails its CAS and takes the in-flight slot itself.
+	// See Manager.startBootEpochRefine.
+	//
+	// Dropping the request instead of coalescing it lost exactly the request
+	// that was needed: the in-flight worker may already have completed its
+	// locked READ, so an update that lands after it is invisible to that pass,
+	// and the caller who lost the claim is the one asking for the re-read. It is
+	// a BIT, not a queue: at most one extra pass is ever outstanding, so a
+	// caller that must not block cannot build an unbounded backlog of fsync-ing
+	// workers.
+	//
+	// bootEpochWorker is the CURRENT refine worker's exit handle — nil when none
+	// is running — so Manager.Stop can join it with a bound and WITHOUT spawning
+	// a waiter of its own. A per-call `go func() { wg.Wait(); close(done) }()`
+	// helper is not cancelled by the caller's timeout, so every timed-out join
+	// left one goroutine parked for as long as the worker was wedged, which is
+	// forever.
+	//
+	// It is an atomic.Pointer, NOT a field under bootEpochRefineMu: that mutex
+	// is held across claimBootEpochRefine (and so across its
+	// epochRefineAfterLostClaim seam, where a requester can park indefinitely),
+	// while the join and the worker's exit are precisely the two operations that
+	// must not block. It is PUBLISHED under the mutex all the same, which is
+	// what keeps Stop's refuse-then-join ordering airtight; bootEpochStopped,
+	// under that mutex, refuses a spawn once Stop has begun.
+	// See Manager.joinBootEpochRefine.
+	bootEpochOnce     sync.Once
+	bootEpoch         atomic.Uint64
+	bootEpochReady    chan struct{}
+	bootEpochWrote    atomic.Uint64
+	bootEpochRefine   atomic.Uint32
+	bootEpochRefineMu sync.Mutex
+	bootEpochStopped  bool
+	bootEpochWorker   atomic.Pointer[bootEpochRefineWorker]
+
+	// lastEpochDowngradeWarn rate-limits the epoch-downgrade rejection warning.
+	// The rejection is operator-actionable — a peer rolled back to a pre-#6169
+	// build stays refused until the control-link PSK is rotated on BOTH nodes
+	// and xpfd is then restarted on this one; a bare restart is not reliable
+	// recovery, because an archived epoch-bearing frame replayed into the empty
+	// post-restart state re-arms the latch (see the arming site in
+	// admitAuthed) — so it must be visible. But the peer sends at 5-10/s,
+	// so an unguarded log would flood journald. Read/written under m.mu.
+	lastEpochDowngradeWarn time.Time
 
 	// hbStartMu serializes StartHeartbeat's stop-previous + socket-create +
 	// install sequence so two concurrent StartHeartbeat calls (e.g. a
@@ -405,7 +521,36 @@ func NewManager(nodeID, clusterID int) *Manager {
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 		failoverInProgress:             make(map[int]bool),
 		failoverGen:                    make(map[int]uint64),
+		bootEpochReady:                 make(chan struct{}),
 	}
+}
+
+// NoteEpochDowngradeHeartbeat surfaces a #6169 epoch-downgrade rejection.
+//
+// The peer previously proved it runs a build that signs a boot epoch, and is
+// now sending frames without one. That is either a replay of pre-upgrade
+// captures (the attack this closes) or a genuine rollback of the peer to a
+// pre-#6169 build — which is operator-actionable. Rate-limited to once per 30s
+// so a 5-10/s heartbeat stream cannot flood the log.
+//
+// THE RECOVERY THIS NAMES IS THE COMPLETE ONE, in order. Restarting xpfd clears
+// the process-scoped latch, but an attacker holding one archived epoch-bearing
+// frame re-arms it against the empty post-restart state — see the arming site
+// in admitAuthed. Rotating the control-link PSK first makes every
+// archived frame fail MAC verification, so it can never reach the latch. An
+// operator told only "restart" would loop.
+func (m *Manager) NoteEpochDowngradeHeartbeat() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if time.Since(m.lastEpochDowngradeWarn) < 30*time.Second {
+		return
+	}
+	m.lastEpochDowngradeWarn = time.Now()
+	slog.Warn("cluster: heartbeat refused — peer stopped signing a boot epoch it previously signed. " +
+		"This is a replayed pre-upgrade capture, or the peer was rolled back to a build older than #6169. " +
+		"If the rollback was intentional: rotate the control-link PSK on BOTH nodes FIRST, then restart " +
+		"xpfd on THIS node to clear the latch. Restarting alone is not enough — a replayed archived " +
+		"epoch frame re-arms the latch, and only rotating the PSK retires that capture")
 }
 
 // NodeID returns the local node ID.
@@ -514,7 +659,37 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 // Stop halts monitoring and heartbeat goroutines.
+//
+// It also joins the boot-epoch refine worker, which nothing used to wait for.
+// That worker is spawned from StartHeartbeat (initHeartbeatEpochState) or from
+// the first signed send (heartbeatBootEpoch, under bootEpochOnce), and it is
+// allowed to park indefinitely inside a flock or an fsync — so it OUTLIVING
+// Stop needs no race at all: a single sequential shutdown over a wedged store
+// reaches it. It would then still be storing to m.bootEpoch / m.bootEpochWrote
+// and writing the state file on a manager the daemon has finished tearing down,
+// and in tests it outlives the t.Cleanup that restores bootEpochPath / the
+// epochFlock and epochNowNanos seams it reads.
+//
+// The join is BOUNDED for the reason the wait in initHeartbeatEpochState had to
+// go: a storage fault must never stall the HA path, and this one runs directly
+// after VRRP priority-0. See Manager.joinBootEpochRefine for what a timeout
+// leaves behind.
+//
+// Stop is terminal, exactly like m.stopped: the flag is never cleared, so a
+// manager that has been stopped starts no further refinement. A late
+// heartbeatBootEpoch on a sender still winding down therefore still publishes
+// its wall-clock epoch — that store is synchronous and ahead of any I/O — and
+// simply skips the persistence refinement, which is the same degradation a
+// wedged store produces and which the design already treats as survivable.
 func (m *Manager) Stop() {
+	// Refuse new refine workers BEFORE joining the one already running, so a
+	// spawn cannot slip in behind the join and outlive it. startBootEpochRefine
+	// claims the slot and publishes the worker's exit channel under this same
+	// lock, so the two orders cannot interleave.
+	m.bootEpochRefineMu.Lock()
+	m.bootEpochStopped = true
+	m.bootEpochRefineMu.Unlock()
+
 	m.mu.Lock()
 	mon := m.monitor
 	sender := m.hbSender
@@ -545,5 +720,10 @@ func (m *Manager) Stop() {
 	}
 	if receiver != nil {
 		receiver.stop()
+	}
+	if !m.joinBootEpochRefine(bootEpochStopJoinBudget) {
+		slog.Warn("cluster: HA boot-epoch refinement still in flight after teardown; "+
+			"proceeding without it (its store is probably wedged — the shutdown path "+
+			"must not block on one)", "waited", bootEpochStopJoinBudget)
 	}
 }

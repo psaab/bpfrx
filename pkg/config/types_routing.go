@@ -136,10 +136,48 @@ type RouteFilter struct {
 
 // RoutingOptionsConfig holds static routing configuration.
 type RoutingOptionsConfig struct {
-	StaticRoutes              []*StaticRoute
-	Inet6StaticRoutes         []*StaticRoute // rib inet6.0 static routes
-	GenerateRoutes            []*GenerateRoute
-	ForwardingTableExport     string // forwarding-table { export <policy>; }
+	StaticRoutes      []*StaticRoute
+	Inet6StaticRoutes []*StaticRoute // rib inet6.0 static routes
+	GenerateRoutes    []*GenerateRoute
+	// ForwardingTableExport is the SELECTED `forwarding-table export` policy —
+	// the value nodeVal takes from the first `export` leaf of the first
+	// `forwarding-table` block, re-assigned per top-level `routing-options`
+	// root so the LAST root wins. It is NOT ForwardingTableExports[0]; see
+	// that field.
+	ForwardingTableExport string
+	// ForwardingTableExports is the FULL `forwarding-table export` list as
+	// authored (#6659). The leaf is declared `multi: true`, but the compiler
+	// read it with nodeVal and kept only the first policy — so a second policy
+	// was neither rendered NOR reference-checked, and a DANGLING reference in
+	// any slot but the first committed clean, defeating the very gate
+	// (validatePolicyReferencesStrict) whose error text warns that "the
+	// expected ECMP / consistent-hash load-balancing would be silently
+	// disabled".
+	//
+	// ForwardingTableExport remains what the FRR renderer consumes (resolveECMP
+	// derives ecmpMaxPaths from exactly one policy-statement).
+	// validateForwardingTableExportSingleStrict rejects a multi-valued list
+	// rather than letting it silently collapse. Honouring a full Junos export
+	// policy CHAIN is a separate renderer change, not this fix (#6674).
+	//
+	// #6673: the scalar is NOT element [0] of this list, and the list is read
+	// with multiLeafAuthoredValues so empty values are KEPT. Two shapes make
+	// the two differ, and both change which policy renders:
+	//
+	//   - an empty value in the first slot (`export [ "" p1 ];`, `export [ ];
+	//     export p1;`, `export { ""; p1; }`, or the flat-set `export ""` +
+	//     `export p1` pair). nodeVal selects "" — no export policy — which is
+	//     what an operator blanking the export gets; an empty-FILTERED [0]
+	//     promoted p1 into the selected slot instead.
+	//   - two top-level `routing-options` roots. compiler_dispatch.go calls
+	//     compileRoutingOptions once per root, so the scalar re-assigns (LAST
+	//     wins) while this list appends — [0] names the FIRST root's policy.
+	//
+	// Keeping empty values guarantees the list always contains the selected
+	// value, so the gates and diagnostics reading it describe the policy that
+	// actually renders. An empty entry is a selection, not a second policy:
+	// count with nonEmptyValues and skip empties when checking a reference.
+	ForwardingTableExports    []string
 	AutonomousSystem          uint32 // autonomous-system <number>
 	RibGroups                 map[string]*RibGroup
 	InterfaceRoutesRibGroup   string // global interface-routes { rib-group inet <name>; }
