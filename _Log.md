@@ -80037,8 +80037,8 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   fixture can reach — that the abandon un-suppresses the tick — with a CONTROL
   asserting the suppression was real first.
   Mutation matrix — 4 direct reverts RED, plus a comparative pair for F5:
-  restoring the self-reap -> both F1 cells RED ("the second lease has no live
-  heartbeat"); dropping `|| m.linkCycleInFlight()` -> the enabled/no_rg/link_cycle
+  restoring the self-reap -> THREE cells RED, not two as an earlier revision of
+  this entry said ("the second lease has no live heartbeat"); dropping `|| m.linkCycleInFlight()` -> the enabled/no_rg/link_cycle
   row RED; dropping the rgTransition term -> the enabled/rg/no_cycle row RED
   (so the truth table discriminates EACH disjunct, not just the new one);
   `AbandonLinkCycle` reporting without releasing -> 3 cells RED. F5 is a
@@ -80070,4 +80070,86 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
   pkg/dataplane/userspace/controllers_binding_table_6871_test.go,
   pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go (new),
+  docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 10 — fix a `-race` defect THIS PR introduces, close two
+  measured escapes from the round-9 guards, and correct three of my own claims.
+  F1: `go test -race` fails at the round-9 head — 1 run in 3, and every run under
+  `-count=5` on the link-cycle subset. The racing READER is this PR's heartbeat
+  goroutine (`startLinkCycleHeartbeat` -> `RenewLinkCycle` ->
+  `linkCycleLeaseDeadline`), the racing WRITER is this PR's `fakeLinkCycleClock`
+  seam, and the leak source is this PR's own derived binding table: a row drives
+  the real `PrepareLinkCycle` and never releases, so a heartbeat runs on the
+  PRODUCTION 15s ticker and outlives the test. Once a package run exceeds 15s
+  (this one takes 38-56s) the orphan beats and collides with a later swap.
+  MY ROUND-9 COMMIT MESSAGE WAS WRONG ABOUT THIS and the correction matters more
+  than the fix. I wrote that the residual `-race` failures were "different
+  timing-sensitive tests this diff does not touch, so -race on this package is
+  load-sensitive independently of #6871". Every clause of that is false for the
+  race itself: reader, writer and leak source are all this diff. I had observed
+  the *symptom* (different test names failing on different runs), inferred a
+  cause that exonerated my change, and shipped the inference as a finding. That
+  sends the next reader away from the defect, which is the exact harm this
+  campaign keeps paying for.
+  FIX, and NOT the one suggested. The review named three leaking sites and
+  proposed `t.Cleanup(m.releaseLinkCycleLease)` at each. I did that first and
+  MEASURED IT INSUFFICIENT — races persisted, because the leak class is any of
+  TWENTY `acquireLinkCycleLease` sites in this package's tests, not the three
+  that reach it via `PrepareLinkCycle`. Chasing sites is the "N is a lower bound"
+  trap again. So the seam itself is now race-free:
+  `linkCycleLeaseElapsedOverride` is an `atomic.Pointer[func() time.Duration]`
+  behind a plain `linkCycleLeaseElapsed()` function, and every test swaps through
+  one helper (`swapLinkCycleLeaseElapsed`) — a direct assignment no longer
+  compiles, which is the point. A leaked heartbeat is now harmless: it renews its
+  own dead Manager and races nothing. The central `t.Cleanup` in
+  `newLinkCycleProcessOnlyManager` stays as hygiene (it covers all 12
+  constructions through that helper) but is no longer what correctness rests on.
+  Production installs no override, so the path is one atomic load plus the same
+  `time.Since` it always did. Re-ran the reviewer's exact repro 3x after: 0 races,
+  0 failures, where it was red every run before.
+  F2: two MEASURED escapes from the round-9 acquisition guards, both compiling
+  production Go that takes a lease with both guards green — a method VALUE
+  (`prep := d.dp.Link().PrepareLinkCycle; prep()`), which has no `CallExpr` at
+  the selector at all, and a package-level initializer (`var x = func(...) {...
+  PrepareLinkCycle() }`), which is a `GenDecl` my per-`FuncDecl` walk never
+  inspected. Fixed by keying on ANY `*ast.SelectorExpr` rather than
+  `CallExpr.Fun`, and walking the whole file with a decl-kind switch so
+  `ValueSpec` initializers get a key. Green at HEAD with the widening alone, so
+  the stated exclusions (declaration, interface member, doc comment) all survive
+  it — none is a SelectorExpr. Over-inclusion is the safe direction and is now
+  stated as such.
+  F3: two of my round-9 doc insertions STOLE the sentence below them.
+  `docs/reth-mac.md` — my one-exit paragraph landed between the self-renewal
+  sentence and its continuation, so "The interval the TTL must cover is therefore
+  a constant" read as a consequence of "one exit needs no identity check" (wrong
+  antecedent AND a wrong claim — it is a consequence of the self-renewal). The
+  second split a pair so "Neither half is correct alone" read against the wrong
+  two things. Fixed by MOVING both insertions below the blocks they interrupted,
+  restoring the original adjacency, rather than patching around them. This is the
+  prose form of the insertion-steals-its-neighbour failure already on record.
+  F4: two of my own overstatements corrected. "Both F2 guards red on a planted
+  call site" — each reds on its OWN plant; one plant does not red both, and the
+  round-9 controls in fact show the tree-wide guard staying correctly SILENT on
+  an in-package acquire. "Restoring the self-reap reds both F1 cells" understated
+  it at two; it is three. The second is corrected in place in the round-9 entry
+  above (superseded phrasing verified absent by content, not by count); the first
+  lived only in the round-9 commit message, which is immutable, so it is
+  corrected here and on the PR.
+  Mutation matrix — 4 escapes RED + 2 controls behaving:
+  method-VALUE plant (tree-wide) RED naming
+  `pkg/daemon/daemon_reth.go:probeMethodValue6871`; package-level INITIALIZER
+  plant RED naming `probeInitializer6871`; in-package method-VALUE acquire RED
+  naming `manager_status.go:probeInPkgMethodValue6871`; a plant behind
+  `//go:build never_ever_built` RED (build tags over-include — the safe
+  direction, now measured rather than assumed). Controls: an ordinary call reds
+  the tree-wide guard, and an ordinary IN-PACKAGE acquire leaves the tree-wide
+  guard GREEN while the in-package guard reds it — so the second guard does bind
+  something the first structurally cannot, which is what round 9 claimed.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/link_cycle_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   docs/reth-mac.md, _Log.md

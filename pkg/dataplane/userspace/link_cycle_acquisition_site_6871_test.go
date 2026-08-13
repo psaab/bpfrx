@@ -80,12 +80,36 @@ func repoRootFromPackage(t *testing.T) string {
 	}
 }
 
-// callSitesOf returns "<relpath>:<enclosing func>" for every CALL of the named
-// method in non-test Go source under root.
+// callSitesOf returns "<relpath>:<enclosing decl>" for every REFERENCE to the
+// named method in non-test Go source under root.
 //
-// It keys on *ast.CallExpr, so a method DECLARATION, an interface member and a
-// doc comment naming the method are all correctly ignored — the distinction a
-// grep cannot make and the reason this is an AST walk.
+// It keys on any *ast.SelectorExpr whose selector is the method — not on
+// CallExpr.Fun (#6871 round 10, F2). Two escapes were MEASURED against the
+// CallExpr form, each plant being compiling production Go that takes a lease
+// with both guards green:
+//
+//	prep := d.dp.Link().PrepareLinkCycle   // method VALUE: no CallExpr at all
+//	prep()                                 // ...called through the variable
+//
+// A method value is the natural way to write a deferred or stored call, so this
+// is not an exotic shape. Selecting the method AT ALL is the thing worth
+// noticing; whether the call is syntactically adjacent is not.
+//
+// It also walks the whole FILE rather than each *ast.FuncDecl body, because a
+// package-level initializer is a *ast.GenDecl and was never inspected:
+//
+//	var takeLease = func(d *Daemon) error { return d.dp.Link().PrepareLinkCycle() }
+//
+// The stated exclusions all survive the widening, verified at HEAD: a method
+// DECLARATION is a FuncDecl whose name is an *ast.Ident, an interface MEMBER is
+// a Field name, and a doc comment is not in the AST — none is a SelectorExpr.
+// Over-inclusion is the safe direction here: an unrelated type with a
+// same-named method would appear as a new entry and be answered for, rather
+// than a real acquisition slipping past.
+//
+// BUILD TAGS are also the safe direction, and this was measured too: ParseFile
+// ignores build constraints, so a plant behind `//go:build never_ever_built` IS
+// caught.
 func callSitesOf(t *testing.T, root, method string) map[string]bool {
 	t.Helper()
 	out := map[string]bool{}
@@ -112,21 +136,33 @@ func callSitesOf(t *testing.T, root, method string) map[string]bool {
 		if rerr != nil {
 			rel = path
 		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == method {
-					out[rel+":"+fn.Name.Name] = true
+		record := func(where string, node ast.Node) {
+			ast.Inspect(node, func(n ast.Node) bool {
+				if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == method {
+					out[rel+":"+where] = true
 				}
 				return true
 			})
+		}
+		for _, decl := range file.Decls {
+			switch d := decl.(type) {
+			case *ast.FuncDecl:
+				if d.Body != nil {
+					record(d.Name.Name, d.Body)
+				}
+			case *ast.GenDecl:
+				// var/const initializers run at package init and can take a
+				// lease with no enclosing function at all.
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok || len(vs.Names) == 0 {
+						continue
+					}
+					for _, v := range vs.Values {
+						record(vs.Names[0].Name, v)
+					}
+				}
+			}
 		}
 		return nil
 	})

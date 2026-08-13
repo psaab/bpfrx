@@ -45,16 +45,14 @@ import (
 // deadlocks when Do is re-entered from inside its own function.
 func injectAtLeaseExpiryCheck(t *testing.T, elapsed time.Duration, inject func()) {
 	t.Helper()
-	old := linkCycleLeaseElapsed
 	fired := false
-	linkCycleLeaseElapsed = func() time.Duration {
+	swapLinkCycleLeaseElapsed(t, func() time.Duration {
 		if !fired {
 			fired = true
 			inject()
 		}
 		return elapsed
-	}
-	t.Cleanup(func() { linkCycleLeaseElapsed = old })
+	})
 }
 
 // TestLinkCycleInFlightHonoursALostExpiryCAS_6871 is the B1 discriminator.
@@ -148,12 +146,9 @@ func TestLinkCycleInFlightHonoursALostExpiryCAS_6871(t *testing.T) {
 // It stays GREEN under the B1 revert (the straight-line form expires a stranded
 // lease too), so it is a control rather than a restatement of the discriminator.
 func TestLinkCycleInFlightStillExpiresAStrandedLease_6871(t *testing.T) {
-	old := linkCycleLeaseElapsed
-	t.Cleanup(func() { linkCycleLeaseElapsed = old })
-
 	m := New()
 	m.linkCycleLeaseUntil.Store(int64(linkCycleLeaseTTL))
-	linkCycleLeaseElapsed = func() time.Duration { return linkCycleLeaseTTL + time.Second }
+	swapLinkCycleLeaseElapsed(t, func() time.Duration { return linkCycleLeaseTTL + time.Second })
 
 	if m.linkCycleInFlight() {
 		t.Fatal("a lease past its TTL with nothing renewing it must expire; a lease that " +

@@ -312,10 +312,19 @@ func TestStatusTickResumesAfterLinkCycle_6871(t *testing.T) {
 func fakeLinkCycleClock(t *testing.T) func(time.Duration) {
 	t.Helper()
 	var elapsed atomic.Int64
-	old := linkCycleLeaseElapsed
-	linkCycleLeaseElapsed = func() time.Duration { return time.Duration(elapsed.Load()) }
-	t.Cleanup(func() { linkCycleLeaseElapsed = old })
+	swapLinkCycleLeaseElapsed(t, func() time.Duration { return time.Duration(elapsed.Load()) })
 	return func(d time.Duration) { elapsed.Add(int64(d)) }
+}
+
+// swapLinkCycleLeaseElapsed installs a clock override for the duration of the
+// test and restores the previous one afterwards. Every test that fakes the clock
+// goes through here: the override is an atomic pointer (#6871 round 10), and a
+// direct assignment would not compile, which is the point — the previous plain
+// func var was raced by leaked heartbeats from other tests.
+func swapLinkCycleLeaseElapsed(t *testing.T, fn func() time.Duration) {
+	t.Helper()
+	prev := linkCycleLeaseElapsedOverride.Swap(&fn)
+	t.Cleanup(func() { linkCycleLeaseElapsedOverride.Store(prev) })
 }
 
 // TestLinkCycleLeaseExpiresAfterTTL_6871 pins the backstop. NotifyLinkCycle is

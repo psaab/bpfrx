@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -342,7 +343,31 @@ var linkCycleLeaseEpoch = time.Now()
 // indirected so a test can prove the TTL backstop actually expires a stranded
 // lease without sleeping one out. Production never reassigns it. Mirrors
 // linkCycleRebindSleep below.
-var linkCycleLeaseElapsed = func() time.Duration { return time.Since(linkCycleLeaseEpoch) }
+// #6871 round 10 (F1): ATOMIC, because a plain func var is data-raced by a
+// leaked heartbeat.
+//
+// A test that takes a real lease and does not release it leaves a heartbeat
+// goroutine running on the production 15s ticker. Once a package run exceeds
+// 15s — this one takes 38-56s — that orphan beats, calls RenewLinkCycle, and
+// READS this seam from its own goroutine, while a later test WRITES it. `go
+// test -race` reported exactly that, from three different leak sites.
+//
+// The seam is made race-free rather than the leaks chased one by one. There are
+// twenty acquisition sites in this package's tests and the next one added would
+// reopen the hole; an atomic override cannot be raced by any of them. Releasing
+// is still the right hygiene — newLinkCycleProcessOnlyManager does it centrally
+// — but it is no longer what CORRECTNESS depends on.
+//
+// Production never installs an override, so the hot path is one atomic load
+// returning nil plus the same time.Since it always did.
+var linkCycleLeaseElapsedOverride atomic.Pointer[func() time.Duration]
+
+func linkCycleLeaseElapsed() time.Duration {
+	if fn := linkCycleLeaseElapsedOverride.Load(); fn != nil {
+		return (*fn)()
+	}
+	return time.Since(linkCycleLeaseEpoch)
+}
 
 // linkCycleLeaseDeadline is the value stored in linkCycleLeaseUntil for a lease
 // taken or renewed now. It is monotonic nanoseconds since linkCycleLeaseEpoch,
