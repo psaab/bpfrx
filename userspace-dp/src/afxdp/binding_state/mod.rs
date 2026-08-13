@@ -696,6 +696,45 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) delta_loss_pending: AtomicBool,
 }
 
+// #6304: LAYOUT NEUTRALITY of the `#[cfg(test)]` admission-attempt instrument
+// (`pending_tx_admission_attempts`, `tx_inbox.rs`). This struct is the one whose
+// cross-core cacheline behaviour #6114 exists to fix, so an instrument that
+// moved anything in it would put a layout under test that production never has.
+//
+// These four asserts are deliberately NOT `#[cfg(test)]`. They are evaluated
+// once in the PRODUCTION configuration (`cargo build` / `make
+// build-userspace-dp`, instrument absent) and once in the TEST configuration
+// (`cargo test` / `make test-rust`, instrument present), against the same
+// literals — so an instrument that perturbed the layout could satisfy at most
+// one of the two builds. That is the cross-configuration comparison a `#[test]`
+// alone cannot make; the runtime cell in `binding_state/tests/tx_inbox.rs`
+// re-asserts these numbers and carries the reasoning.
+//
+// Measured, rustc 1.96.0, x86_64, both configurations:
+//   size 2304, align 64, offset(pending_tx_admitted) 2152,
+//   offset(delta_loss_pending) 2280.
+//
+// The two OFFSET asserts exist because size and align are NOT sufficient — both
+// counterfactuals were measured rather than argued:
+//   - a `#[cfg(test)]` `AtomicU64` FIELD declared ahead of `pending_tx_admitted`
+//     (the instrument shape an earlier round considered and declined) leaves
+//     size 2304 and align 64 UNCHANGED — it lands in existing tail slack — and
+//     moves `pending_tx_admitted` to 2160.
+//   - the same field declared LAST, after `delta_loss_pending`, leaves size,
+//     align and `pending_tx_admitted` all unchanged, and moves
+//     `delta_loss_pending` to 2288 (repr(Rust) reorders, so "declared last" is
+//     not "placed last").
+// A size-only guard would have called both of those harmless.
+//
+// If a legitimately new PRODUCTION field trips these, re-measure and update the
+// literals — the compile error reports the actual value. If only the TEST build
+// trips one, a test-only member has reached the struct and the instrument is no
+// longer layout-neutral.
+const _: [(); 2304] = [(); std::mem::size_of::<BindingLiveState>()];
+const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
+const _: [(); 2152] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];
+const _: [(); 2280] = [(); std::mem::offset_of!(BindingLiveState, delta_loss_pending)];
+
 impl BindingLiveState {
     pub(super) fn new() -> Self {
         Self {
