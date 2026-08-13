@@ -5631,69 +5631,217 @@ fn zone_counter_prev_state() -> ForwardingState {
     prev
 }
 
-/// A snapshot that keeps only zone 100 and trips the #2410 CoS queue-id
-/// fail-closed belt — a fallible step that runs AFTER the zone-counter
-/// block in the builder.
-fn zone_counter_rejected_snapshot() -> ConfigSnapshot {
+/// A snapshot with the given zone set and an extra defect, used to trip one
+/// named fallible integrity belt.
+fn zone_counter_snapshot_with_zones(zone_ids: &[u16]) -> ConfigSnapshot {
     ConfigSnapshot {
-        zones: vec![ZoneSnapshot {
-            name: "trust".into(),
-            id: 100,
-            ..Default::default()
-        }],
-        interfaces: vec![InterfaceSnapshot {
-            ifindex: 60,
-            cos_shaping_rate_bytes_per_sec: 1,
-            ..Default::default()
-        }],
-        class_of_service: Some(ClassOfServiceSnapshot {
-            forwarding_classes: vec![CoSForwardingClassSnapshot {
-                name: "voice".into(),
-                queue: 256, // outside u8 range — fails the build closed
-            }],
-            schedulers: vec![],
-            scheduler_maps: vec![],
-            dscp_classifiers: vec![],
-            ieee8021_classifiers: vec![],
-            dscp_rewrite_rules: vec![],
-        }),
+        zones: zone_ids
+            .iter()
+            .map(|&id| ZoneSnapshot {
+                name: format!("zone{id}"),
+                id,
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     }
 }
 
+/// The candidate zone set every rejection row below builds on: it DROPS live
+/// zone 200 and ADDS a brand-new zone 300, so one drive exercises both live-store
+/// mutations a rejected build must not make — the destructive `reconcile` prune
+/// of 200, and the `ZoneCounterSlotMap::build` get-or-create of 300.
+const ZONE_COUNTER_CANDIDATE_ZONES: [u16; 2] = [100, 300];
+
+/// One row per fallible integrity belt reachable in the builder: a snapshot
+/// carrying the candidate zone set plus that belt's defect, and the error it
+/// must raise.
+///
+/// The SPAN is what matters. #3719 duplicate-zone-id is the builder's FIRST
+/// fallible step and #2410 CoS queue-id its LAST, with #2240 NPTv6 and
+/// #3367/#2505 filter in between — so driving the two live-store assertions
+/// over the whole table binds the ORDERING invariant rather than one belt.
+/// A single-belt fixture does not: a fallible step relocated below the
+/// zone-counter work leaves it green (measured — moving the NPTv6 step below
+/// the prune left 4280 of 4281 tests passing).
+fn zone_counter_rejection_rows() -> Vec<(
+    &'static str,
+    ConfigSnapshot,
+    fn(&crate::policy::SnapshotIntegrityError) -> bool,
+)> {
+    let mut dup_zone = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+    // #3719: a second zone re-using id 300. The FIRST fallible step in the
+    // builder, so this row is the one that would still be above a relocated
+    // zone-counter block.
+    dup_zone.zones.push(ZoneSnapshot {
+        name: "clash".into(),
+        id: 300,
+        ..Default::default()
+    });
+
+    let mut nptv6 = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+    // #2240: an unparseable internal prefix.
+    nptv6.nptv6_rules = vec![crate::Nptv6RuleSnapshot {
+        name: "bad-parse".into(),
+        from_zone: String::new(),
+        internal_prefix: "not-a-prefix".into(),
+        external_prefix: "2001:db8:9::/48".into(),
+    }];
+
+    let mut filter = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+    // #3367: the Go side could not parse the term's tcp-flags expression, so
+    // the helper-side belt rejects rather than installing an unconstrained term.
+    filter.filters = vec![FirewallFilterSnapshot {
+        name: "f".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "t".into(),
+            action: "discard".into(),
+            tcp_flags_unparseable: true,
+            ..Default::default()
+        }],
+    }];
+
+    let mut cos = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
+    // #2410: a forwarding-class queue id outside 0..=255. The LAST fallible
+    // step in the builder.
+    cos.interfaces = vec![InterfaceSnapshot {
+        ifindex: 60,
+        cos_shaping_rate_bytes_per_sec: 1,
+        ..Default::default()
+    }];
+    cos.class_of_service = Some(ClassOfServiceSnapshot {
+        forwarding_classes: vec![CoSForwardingClassSnapshot {
+            name: "voice".into(),
+            queue: 256,
+        }],
+        schedulers: vec![],
+        scheduler_maps: vec![],
+        dscp_classifiers: vec![],
+        ieee8021_classifiers: vec![],
+        dscp_rewrite_rules: vec![],
+    });
+
+    vec![
+        ("#3719 duplicate zone id (first fallible step)", dup_zone, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::DuplicateZoneId { .. }
+                )
+            }
+        }),
+        ("#2240 NPTv6 unparseable rule", nptv6, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::Nptv6UnparseableRule { .. }
+                )
+            }
+        }),
+        ("#3367 filter unparseable tcp-flags", filter, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::UnrepresentableFilterTCPFlags { .. }
+                )
+            }
+        }),
+        ("#2410 CoS queue id (last fallible step)", cos, {
+            |e: &crate::policy::SnapshotIntegrityError| {
+                matches!(
+                    e,
+                    crate::policy::SnapshotIntegrityError::CosQueueIdOutOfRange { .. }
+                )
+            }
+        }),
+    ]
+}
+
 #[test]
 fn rejected_build_does_not_prune_live_zone_counters() {
-    let prev = zone_counter_prev_state();
+    // `ZoneCounterStore` is `Arc`-backed, so the build's carry-forward
+    // `clone()` is a handle on the SAME map the running workers fold into —
+    // not a copy. Pre-#5716 the build ran the destructive `reconcile()` (a
+    // `retain` to the incoming snapshot's zone set) in the middle of the
+    // builder, ahead of the fallible `filter_state` and `cos` steps. A
+    // snapshot that failed one of those was rejected by the reconcile/refresh
+    // preflight ("keeping previous forwarding state") — but the live store had
+    // already lost the removed zones' cumulative totals, so an operator's
+    // `show security zones` traffic counters silently reset on a commit that
+    // was never applied.
+    for (label, snapshot, expected) in zone_counter_rejection_rows() {
+        let prev = zone_counter_prev_state();
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &PolicyCounterStore::default(),
+            &crate::nat::NatCounterStore::default(),
+            Some(&prev),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            expected(&err),
+            "{label}: rejected through a different belt than the row names              ({err:?}) — the row is no longer exercising the belt it is here for"
+        );
 
-    let err = build_forwarding_state_with_policy_counters_and_previous(
-        &zone_counter_rejected_snapshot(),
-        &PolicyCounterStore::default(),
-        &crate::nat::NatCounterStore::default(),
-        Some(&prev),
-    )
-    .expect_err("an out-of-range CoS queue id must reject the snapshot");
-    assert!(
-        matches!(
-            err,
-            crate::policy::SnapshotIntegrityError::CosQueueIdOutOfRange { .. }
-        ),
-        "expected the CoS belt to be what rejected the build, got {err:?}"
-    );
+        let live = prev.zone_counter_store.snapshot();
+        assert_eq!(
+            live.len(),
+            2,
+            "{label}: a REJECTED build pruned the live zone-counter store;              `show security zones` totals reset on a commit that never applied"
+        );
+        assert!(
+            live.iter().any(|z| z.zone_id == 200),
+            "{label}: zone 200's totals were dropped by a build that was rejected"
+        );
+    }
+}
 
-    // The rejected build must have left the LIVE store untouched: the
-    // preflight keeps the previous forwarding state, and zone 200's
-    // cumulative totals must survive with it.
-    let live = prev.zone_counter_store.snapshot();
-    assert_eq!(
-        live.len(),
-        2,
-        "a REJECTED build pruned the live zone-counter store; \
-         `show security zones` totals reset on a commit that never applied"
-    );
-    assert!(
-        live.iter().any(|z| z.zone_id == 200),
-        "zone 200's totals were dropped by a build that was rejected"
-    );
+#[test]
+fn rejected_build_does_not_create_zone_blocks_in_the_live_store() {
+    // The mirror image of the prune, and the half the sparse snapshot hides.
+    // `ZoneCounterSlotMap::build` GET-OR-CREATES one atomic block per
+    // configured zone, resolved out of the store it is handed — and that is
+    // the carried-forward, `Arc`-shared, LIVE store. So a candidate that
+    // introduces a zone and is then REJECTED used to leave a zero-valued block
+    // for that zone behind in the live map. `snapshot()` omits all-zero rows,
+    // so operator-visible counts stay correct and nothing looks wrong; the map
+    // just grows by one orphaned block per rejected commit that adds or
+    // renumbers a zone, raising the cost of every snapshot, clear and
+    // reconcile. Assert on the block set, not the snapshot.
+    for (label, snapshot, expected) in zone_counter_rejection_rows() {
+        let prev = zone_counter_prev_state();
+        assert_eq!(
+            prev.zone_counter_store.tracked_zone_ids_for_test(),
+            vec![100, 200],
+            "{label}: fixture must start with exactly the two live zones"
+        );
+
+        let err = match build_forwarding_state_with_policy_counters_and_previous(
+            &snapshot,
+            &PolicyCounterStore::default(),
+            &crate::nat::NatCounterStore::default(),
+            Some(&prev),
+        ) {
+            Ok(_) => panic!("{label}: this snapshot must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            expected(&err),
+            "{label}: rejected through a different belt than the row names ({err:?})"
+        );
+
+        assert_eq!(
+            prev.zone_counter_store.tracked_zone_ids_for_test(),
+            vec![100, 200],
+            "{label}: a REJECTED build created a block for candidate-only zone \
+             300 in the LIVE store — runtime state the discarded build's caller \
+             never asked for, invisible to the sparse snapshot, and accumulating \
+             one block per rejected commit"
+        );
+    }
 }
 
 #[test]

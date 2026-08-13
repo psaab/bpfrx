@@ -169,18 +169,40 @@ counters (see below).
   [`docs/research/3643-dead-counters/plan.md`](research/3643-dead-counters/plan.md)
   §5A.
 
-  **Prune ordering (#5716).** The store is `Arc`-backed, so the carry-forward
-  `clone()` in `build_forwarding_state_with_policy_counters_and_previous` is a
-  handle on the LIVE map, not a copy. The prune that drops totals for zones the
-  incoming snapshot no longer configures is therefore the **last statement
-  before `Ok(state)`** — every fallible builder step (`?`) above it returns with
-  the live store untouched, so a snapshot the reconcile/refresh preflight
-  REJECTS ("keeping previous forwarding state") cannot also zero an operator's
-  `show security zones` totals for a commit that never applied. Any new fallible
-  step must go above that prune;
-  `rejected_build_does_not_prune_live_zone_counters` (with its
-  `accepted_build_still_prunes_zone_counters_for_removed_zones` control) in
-  `userspace-dp/src/afxdp/forwarding_build/tests.rs` is the guard.
+  **Rejected-build safety (#5716).** The store is `Arc`-backed, so the
+  carry-forward `clone()` in
+  `build_forwarding_state_with_policy_counters_and_previous` is a handle on the
+  LIVE map, not a copy. Binding a candidate to it mutates it **two** ways:
+  `ZoneCounterSlotMap::build` GET-OR-CREATES a block per configured zone, and
+  `reconcile` DROPS the blocks for zones the candidate no longer configures. A
+  snapshot the reconcile/refresh preflight REJECTS ("keeping previous forwarding
+  state") must do neither — the prune would zero an operator's
+  `show security zones` totals for a commit that never applied, and the
+  get-or-create would leave a zero-valued block behind for a candidate-only
+  zone (invisible to the sparse status snapshot, but accumulating one block per
+  rejected commit under ordinary config churn).
+
+  Both mutations therefore live in `attach_zone_counters`, which the public
+  entry point calls **after** the fallible `build_fallible_forwarding_state`
+  has returned `Ok`. That makes the ordering STRUCTURAL: a fallible step added
+  anywhere in the inner builder is above the `?` by construction. The earlier
+  shape put the prune last inside one big function and relied on a source-order
+  comment, which is not a guard — moving the NPTv6 `?` step below the prune left
+  the entire pre-existing Rust suite green (measured, #6832 fold r2: 4280 of
+  4281, the one failure being this round's new zone-block assertion, a different
+  defect).
+
+  Guards, in `userspace-dp/src/afxdp/forwarding_build/tests.rs`:
+  `rejected_build_does_not_prune_live_zone_counters` and
+  `rejected_build_does_not_create_zone_blocks_in_the_live_store` each drive
+  EVERY fallible integrity belt reachable in the builder — #3719 duplicate zone
+  id (the first) through #2410 CoS queue id (the last), via #2240 NPTv6 and
+  #3367 filter — so hoisting the binding above the `?` reds them. A single-belt
+  fixture does not bind the ordering: it stays green when a *different* belt
+  moves. `accepted_build_still_prunes_zone_counters_for_removed_zones` is the
+  anti-over-fix control. The create half is only observable through
+  `ZoneCounterStore::tracked_zone_ids_for_test`, since the operator-facing
+  `snapshot()` omits all-zero rows by design.
 
 - **POPULATE flood is still deferred.** Per-zone SYN/ICMP/UDP flood-event
   attribution is NEW drop-path accounting (the screen module holds per-zone

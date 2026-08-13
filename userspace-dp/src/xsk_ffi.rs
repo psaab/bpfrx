@@ -991,6 +991,14 @@ impl ReadRx<'_> {
 }
 
 impl Drop for ReadRx<'_> {
+    /// #5716: the condition is `read_count > 0` alone. It was
+    /// `!self.released && self.read_count > 0`, which meant a guard that read
+    /// anything AFTER an explicit `release()` reached drop with those reads
+    /// neither released nor cancelled — `cached_cons` ended ahead of the
+    /// kernel-facing `*consumer` and the slots were leaked for the life of the
+    /// socket. `read_rx_drop_releases_a_batch_read_after_an_explicit_release`
+    /// drives that shape; the reuse fixture beside it does NOT (it releases
+    /// everything it reads, so it never enters this branch).
     fn drop(&mut self) {
         if self.read_count > 0 {
             unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };

@@ -297,48 +297,54 @@ const REUSE_RING_CAPACITY: u32 = 8;
 
 /// The batch sizes each reuse fixture drives through its guard, in order.
 ///
-/// Three **distinct** sizes is the load-bearing property, not a stylistic
-/// choice. A fixture built only from 1s and 2s cannot separate "advance by
-/// the committed count" from "advance by a constant": `base_idx += 1` is
-/// correct for every one-slot batch and `base_idx += 2` for every two-slot
-/// batch, so one of the two constants survives. Measured on the pre-#6832
-/// fixtures, each of the four guards admitted exactly one of them —
-/// `WriteTx`/`WriteFill` passed `+= 1`, `ReadRx`/`ReadComplete` passed
-/// `+= 2`. 1 -> 3 -> 2 defeats both.
+/// What actually rejects a constant advance is the PER-OPERATION checkpoint,
+/// not the number of distinct sizes. With a cursor assertion after every
+/// terminal op, two distinct sizes already suffice: a batch of 1 rejects every
+/// constant except 1, and a following batch of 3 rejects the constant 1
+/// (cumulative 4 against 2). Three sizes are what the fixtures happen to use;
+/// they are not load-bearing, and a later reshape to two distinct sizes would
+/// keep the guard intact. What is NOT safe is collapsing to a single repeated
+/// size, or dropping the intermediate checkpoints — see below.
+///
+/// The intermediate checkpoints are the load-bearing part. Three applications
+/// of `+= 2` land on the same FINAL cursor as the correct advance
+/// (2+2+2 == 1+3+2), so a constant is invisible to an end-state-only check.
+/// Delete the checkpoints and the guard is gone while still looking like a
+/// guard. The last checkpoint specifically is redundant — the first two have
+/// already rejected every constant by the time it runs — but it is cheap and
+/// states the end state explicitly.
 ///
 /// DETECTED is not BOUND, and that is why this reshape was necessary rather
 /// than tidy. The constants that *did* red before this change red on
 /// **payload** assertions, never on a cursor one — a re-read descriptor came
 /// back with the wrong address (`read_rx` caught `left: 0xBB` against
-/// `right: 0xCC`). So the cursor advance was not half-covered by the old
-/// fixtures; it was covered nowhere and merely *detected* in two of the
-/// four, through the data a wrong cursor happened to corrupt. That detection
-/// survives only while the aliased slots hold distinguishable payloads, and
-/// it says nothing whatever about the two guards whose surviving constant
-/// left the data intact. The per-batch checkpoints below are the first
-/// assertions in this file to bind the advance itself.
-///
-/// The fixtures also assert the base cursor after **every** terminal op,
-/// including the last. That is necessary, not belt-and-braces: three
-/// applications of `+= 2` land on the same *final* cursor as the correct
-/// advance (2+2+2 == 1+3+2), so a constant is invisible to an
-/// end-state-only check and is caught only at the intermediate
-/// checkpoints. Delete those and the guard is gone while still looking
-/// like a guard.
+/// `right: 0xCC`). Measured on the pre-#6832 fixtures, each of the four guards
+/// admitted exactly one constant — `WriteTx`/`WriteFill` passed `+= 1`,
+/// `ReadRx`/`ReadComplete` passed `+= 2`. So the cursor advance was not
+/// half-covered by the old fixtures; it was covered nowhere and merely
+/// *detected* in two of the four, through the data a wrong cursor happened to
+/// corrupt. That detection survives only while the aliased slots hold
+/// distinguishable payloads, and it says nothing whatever about the two guards
+/// whose surviving constant left the data intact. The per-batch checkpoints
+/// below are the first assertions in this file to bind the advance itself.
 const REUSE_BATCHES: [u32; 3] = [1, 3, 2];
 
 /// Total slots a reuse fixture reserves / peeks: the sum of [`REUSE_BATCHES`].
 const REUSE_TOTAL: u32 = REUSE_BATCHES[0] + REUSE_BATCHES[1] + REUSE_BATCHES[2];
 
-// A later tidy-up that collapsed REUSE_BATCHES to uniform sizes would keep
-// the shape of these fixtures and delete their substance — they would still
-// read as "reuse across a terminal op" while no longer distinguishing a
-// count-sized advance from a constant one. Pin the real character.
+// FIXTURE SELF-CHECKS, not coverage. Both of these are assertions over test
+// constants alone, so no production edit can make either fail and neither
+// belongs in a count of what this file binds. They exist to fail the BUILD if
+// a later edit to the constants above quietly invalidates the fixtures that
+// consume them.
+//
+// At least two distinct batch sizes, so the runs still distinguish a
+// count-sized advance from a repeated-constant one.
 const _: () = assert!(
     REUSE_BATCHES[0] != REUSE_BATCHES[1]
-        && REUSE_BATCHES[1] != REUSE_BATCHES[2]
-        && REUSE_BATCHES[0] != REUSE_BATCHES[2],
-    "reuse fixtures need three DISTINCT batch sizes to reject a constant advance"
+        || REUSE_BATCHES[1] != REUSE_BATCHES[2]
+        || REUSE_BATCHES[0] != REUSE_BATCHES[2],
+    "reuse fixtures need at least two DISTINCT batch sizes to reject a constant advance"
 );
 // Each slot of a run must land in its own ring slot; otherwise a misplaced
 // write could alias onto the very value it was supposed to corrupt.
@@ -394,6 +400,19 @@ fn write_tx_insert_after_commit_appends_past_the_committed_slots() {
                     REUSE_TOTAL - submitted,
                     "origin {origin}: commit must consume the submitted slots"
                 );
+                // #6832 fold r2: asserted per commit, not only in aggregate.
+                // Three submits of a constant 2 reach the same TOTAL as the
+                // correct 1/3/2, so an aggregate-only check cannot see a commit
+                // that hands the kernel the wrong NUMBER of slots — which
+                // publishes descriptors the caller has not written yet, or
+                // strands ones it has.
+                assert_eq!(
+                    unsafe { *producer },
+                    base.wrapping_add(submitted),
+                    "origin {origin}: after commits summing to {submitted} slots \
+                     the kernel-facing producer did not advance by the \
+                     committed count"
+                );
             }
         }
         // Every slot holds its own descriptor: no batch overwrote a predecessor
@@ -402,20 +421,22 @@ fn write_tx_insert_after_commit_appends_past_the_committed_slots() {
             assert_eq!(
                 tx_slot(&tx.ring, base.wrapping_add(j)).addr,
                 reuse_payload(j),
-                "origin {origin}: slot {j} does not hold its own descriptor — a \
-                 post-commit insert landed on the wrong slot and corrupted a \
-                 descriptor already submitted to the kernel"
+                "origin {origin}: slot {j} does not hold its own descriptor. \
+                 The shape this guards: a post-commit insert landing on the \
+                 wrong slot, corrupting a descriptor already submitted to the \
+                 kernel"
             );
         }
-        // Every commit reached the kernel-facing producer pointer, and the
-        // drop-time cancel left cached_prod exactly there (no leaked slots).
-        // NB: this pair binds the terminal op's `reserved -= written`
-        // bookkeeping, NOT the cursor advance — `Drop` cancels
-        // `reserved - written`, so a commit that moved the cursor but left the
-        // reservation unshrunk cancels slots the kernel already owns. A wrong
-        // *cursor* leaves both equalities intact (measured: `+= 1` here was
-        // GREEN before #6832), which is why the per-batch checkpoints above
-        // are the ones that bind it.
+        // The drop-time cancel left cached_prod exactly on the producer (no
+        // leaked slots). NB: this pair binds the terminal op's
+        // `reserved -= written` bookkeeping, NOT the cursor advance — `Drop`
+        // cancels `reserved - written`, so a commit that moved the cursor but
+        // left the reservation unshrunk cancels slots the kernel already owns.
+        // A wrong *cursor* leaves both equalities intact (measured: `+= 1` here
+        // was GREEN before #6832), which is why the per-batch checkpoints above
+        // are the ones that bind it. The producer equality below is an end-state
+        // restatement of those checkpoints, which are what bind the per-commit
+        // submission count.
         assert_eq!(unsafe { *producer }, base.wrapping_add(REUSE_TOTAL));
         assert_eq!(tx.ring.cached_prod, unsafe { *producer });
     }
@@ -461,6 +482,14 @@ fn write_fill_insert_after_commit_appends_past_the_committed_slots() {
                     REUSE_TOTAL - submitted,
                     "origin {origin}: commit must consume the submitted slots"
                 );
+                // Per commit, not only in aggregate — see the `WriteTx` sibling.
+                assert_eq!(
+                    unsafe { *producer },
+                    base.wrapping_add(submitted),
+                    "origin {origin}: after commits summing to {submitted} slots \
+                     the kernel-facing producer did not advance by the \
+                     committed count"
+                );
             }
         }
         let ring = dq.rings.fill();
@@ -468,9 +497,10 @@ fn write_fill_insert_after_commit_appends_past_the_committed_slots() {
             assert_eq!(
                 fill_slot(ring, base.wrapping_add(j)),
                 reuse_payload(j),
-                "origin {origin}: slot {j} does not hold its own fill offset — a \
-                 post-commit insert overwrote an offset already submitted to the \
-                 kernel, and two RX slots would alias one UMEM frame"
+                "origin {origin}: slot {j} does not hold its own fill offset. \
+                 The shape this guards: a post-commit insert overwriting an \
+                 offset already submitted to the kernel, leaving two RX slots \
+                 aliasing one UMEM frame"
             );
         }
         assert_eq!(unsafe { *producer }, base.wrapping_add(REUSE_TOTAL));
@@ -511,9 +541,9 @@ fn read_complete_read_after_release_does_not_re_reap_released_entries() {
                     assert_eq!(
                         r.read(),
                         Some(reuse_payload(released + k)),
-                        "origin {origin}: entry {} was not reaped in order — a \
-                         reused reader re-read an already-released completion \
-                         address",
+                        "origin {origin}: entry {} was not reaped in order. \
+                         The shape this guards: a reused reader re-reading an \
+                         already-released completion address",
                         released + k
                     );
                 }
@@ -528,8 +558,9 @@ fn read_complete_read_after_release_does_not_re_reap_released_entries() {
                 assert_eq!(
                     unsafe { *consumer },
                     origin.wrapping_add(released),
-                    "origin {origin}: release did not reach the kernel-facing \
-                     consumer pointer"
+                    "origin {origin}: the kernel-facing consumer is not at the \
+                     released count. The shape this guards: a release that does \
+                     not reach the shared consumer pointer"
                 );
             }
             assert_eq!(
@@ -599,8 +630,10 @@ fn read_rx_read_after_release_stays_releasable() {
                 assert_eq!(
                     unsafe { *consumer },
                     origin.wrapping_add(released),
-                    "origin {origin}: a release did not advance the consumer — \
-                     those descriptors are permanently unreleasable"
+                    "origin {origin}: the consumer is not at the released \
+                     count. The shape this guards: the sticky-flag release, \
+                     which swallowed every release after the first and left \
+                     those descriptors permanently unreleasable"
                 );
             }
             assert!(
@@ -616,8 +649,89 @@ fn read_rx_read_after_release_stays_releasable() {
         assert_eq!(
             rx.ring.cached_cons,
             unsafe { *consumer },
-            "origin {origin}: cached_cons drifted ahead of the kernel consumer \
-             — leaked RX slots"
+            "origin {origin}: cached_cons is not on the kernel consumer. The \
+             shape this guards: cached_cons drifting AHEAD, which leaks those \
+             RX ring slots for the life of the socket"
+        );
+    }
+}
+
+#[test]
+fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
+    // B3 (#6832 fold r2): the `Drop` condition itself changed — it was
+    // `!self.released && self.read_count > 0` and is now `self.read_count > 0`
+    // — and no fixture drove it. The sibling above always releases everything
+    // it reads, so it leaves `read_count == 0` at drop and never enters the
+    // branch.
+    //
+    // This one does: it releases the first two batches explicitly, then reads
+    // PART of the third and lets `Drop` finish. That is the shape the sticky
+    // flag broke. Pre-#5716 `Drop` saw `released == true`, skipped the release
+    // entirely, and cancelled `peeked - read_count` against an unshrunk
+    // `peeked` — so `cached_cons` ended AHEAD of `*consumer` and those RX ring
+    // slots were leaked for the life of the socket. Post-#5716 the release
+    // reaches the kernel and the cancel covers exactly the peeked-but-unread
+    // remainder.
+    for origin in CURSOR_ORIGINS {
+        let mut rx = RingRx::new_for_test(-1, REUSE_RING_CAPACITY);
+        seed_cons_at(&mut rx.ring, origin);
+        for j in 0..REUSE_TOTAL {
+            rx.push_for_test(desc(reuse_payload(j)));
+        }
+        let consumer = rx.ring.consumer;
+
+        // Read part of the final batch and leave the rest peeked-but-unread,
+        // so the drop has BOTH a release and a non-zero cancel to do.
+        let released_explicitly = REUSE_BATCHES[0] + REUSE_BATCHES[1];
+        let dropped_read = REUSE_BATCHES[2] - 1;
+        assert!(
+            dropped_read > 0 && dropped_read < REUSE_BATCHES[2],
+            "fixture: the final batch must be partly read so drop does both a \
+             release and a cancel"
+        );
+        {
+            let mut r = rx.receive(REUSE_TOTAL);
+            let mut read_so_far = 0u32;
+            for n in [REUSE_BATCHES[0], REUSE_BATCHES[1]] {
+                for _ in 0..n {
+                    r.read().expect("descriptor inside the peek window");
+                }
+                r.release();
+                read_so_far += n;
+            }
+            assert_eq!(
+                unsafe { *consumer },
+                origin.wrapping_add(released_explicitly),
+                "origin {origin}: fixture precondition — the two explicit \
+                 releases must already have reached the kernel"
+            );
+            for k in 0..dropped_read {
+                assert_eq!(
+                    r.read()
+                        .expect("descriptor inside the peek window")
+                        .addr,
+                    reuse_payload(read_so_far + k),
+                    "origin {origin}: descriptor {} was not read in order after \
+                     a release",
+                    read_so_far + k
+                );
+            }
+            // No second `release()` — `Drop` owns this batch.
+        }
+        assert_eq!(
+            unsafe { *consumer },
+            origin.wrapping_add(released_explicitly + dropped_read),
+            "origin {origin}: the consumer is not at \
+             {released_explicitly}+{dropped_read}. The shape this guards: a \
+             drop that skips the descriptors read after an explicit release, \
+             leaving them unreleasable and leaking their RX slots"
+        );
+        assert_eq!(
+            rx.ring.cached_cons,
+            unsafe { *consumer },
+            "origin {origin}: cached_cons is not on the kernel consumer. The \
+             shape this guards: a drop-time cancel that does not cover exactly \
+             the peeked-but-unread remainder"
         );
     }
 }

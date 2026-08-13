@@ -373,6 +373,24 @@ impl ZoneCounterStore {
         }
     }
 
+    /// Test-only: every zone id the store currently holds a block for,
+    /// INCLUDING zones whose four totals are all zero.
+    ///
+    /// #5716: [`Self::snapshot`] is deliberately SPARSE — it omits all-zero
+    /// rows — so it cannot see a block that was get-or-created and never
+    /// counted into. That is exactly the residue a rejected config build
+    /// leaves behind if it resolves the candidate's zone blocks out of the
+    /// carried-forward (Arc-shared, LIVE) store, so a fixture asserting "a
+    /// rejected build did not mutate the live store" has to look HERE rather
+    /// than at the operator-visible snapshot.
+    #[cfg(test)]
+    pub(in crate::afxdp) fn tracked_zone_ids_for_test(&self) -> Vec<u16> {
+        let totals = self.totals.lock().expect("zone counter store poisoned");
+        let mut ids: Vec<u16> = totals.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Test-only handle to the map mutex, so a test can hold the shared store
     /// lock (as the ≤ 1 s snapshot/clear path does) and prove the per-batch fold
     /// still makes progress — the #5163 lock-freedom invariant.

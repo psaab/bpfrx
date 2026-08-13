@@ -197,7 +197,80 @@ pub(super) fn build_forwarding_state_with_counters(
     .expect("test snapshot must not produce policy integrity error")
 }
 
+/// Build a candidate `ForwardingState`, then — and only then — bind it to the
+/// carried-forward per-zone traffic-counter store.
+///
+/// #5716: that two-step shape is the load-bearing part. `ZoneCounterStore` is
+/// `Arc`-backed, so the carry-forward `clone()` is a HANDLE ON THE LIVE STORE
+/// the running workers are folding into, not a copy — and binding a candidate
+/// to it mutates it two ways: [`ZoneCounterSlotMap::build`] GET-OR-CREATES a
+/// block per configured zone, and `reconcile` DROPS the blocks for zones the
+/// candidate no longer configures. A snapshot rejected by one of the fallible
+/// integrity belts is discarded by the reconcile/refresh preflight, which keeps
+/// the previous forwarding state — so neither mutation may have happened.
+///
+/// Keeping every fallible step inside [`build_fallible_forwarding_state`] and
+/// doing the binding out here, after the `?`, makes that STRUCTURAL rather than
+/// positional. A fallible step added anywhere in the inner builder is above the
+/// `?` by construction, so it cannot be the "step below the prune" that
+/// reintroduces the bug. The earlier shape — one function with the prune as its
+/// last statement — relied on a source-order comment instead, and a source-order
+/// comment is not a guard: moving the NPTv6 `?` step below the prune left the
+/// entire pre-existing suite green (measured, #6832 fold r2 — 4280 of 4281, the
+/// one failure being this round's new zone-block assertion, a different defect).
+///
+/// `rejected_build_does_not_prune_live_zone_counters` /
+/// `rejected_build_does_not_create_zone_blocks_in_the_live_store` in
+/// `forwarding_build/tests.rs` exercise this over EVERY fallible belt reachable
+/// in the builder, so hoisting [`attach_zone_counters`] above the `?` reds them.
 pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
+    snapshot: &ConfigSnapshot,
+    policy_counters: &PolicyCounterStore,
+    nat_counters: &crate::nat::NatCounterStore,
+    previous: Option<&ForwardingState>,
+) -> Result<ForwardingState, crate::policy::SnapshotIntegrityError> {
+    let mut state =
+        build_fallible_forwarding_state(snapshot, policy_counters, nat_counters, previous)?;
+    attach_zone_counters(&mut state, snapshot, previous);
+    Ok(state)
+}
+
+/// #3651 per-zone traffic counters: carry the cumulative store forward from the
+/// previous state (first apply creates it) so totals survive config commits,
+/// then build this snapshot's slot map against it.
+///
+/// INFALLIBLE, and called only after the fallible builder has returned `Ok` —
+/// see [`build_forwarding_state_with_policy_counters_and_previous`]. Both
+/// statements below mutate the LIVE, `Arc`-shared store, so neither may run for
+/// a snapshot that is about to be rejected.
+///
+/// Prune-then-resolve rather than the reverse: `reconcile` retains exactly
+/// `configured` and `build` get-or-creates a subset of `configured` (it skips
+/// zone id 0 and stops at [`ZONE_COUNTER_ASSIGNABLE_SLOTS`]), so the two orders
+/// reach the same map — but pruning first means the map never transiently holds
+/// the union. A zone present in both the old and new config keeps its SAME
+/// atomic block either way, which is what stops the #5163 lock-free per-slot
+/// fold resetting or double-counting across a slot renumber.
+fn attach_zone_counters(
+    state: &mut ForwardingState,
+    snapshot: &ConfigSnapshot,
+    previous: Option<&ForwardingState>,
+) {
+    use crate::afxdp::zone_counters::{ZoneCounterSlotMap, ZoneCounterStore};
+    let zone_ids: Vec<u16> = snapshot.zones.iter().map(|z| z.id).collect();
+    let store = previous
+        .map(|p| p.zone_counter_store.clone())
+        .unwrap_or_else(ZoneCounterStore::default);
+    let configured: rustc_hash::FxHashSet<u16> = zone_ids.iter().copied().collect();
+    store.reconcile(&configured);
+    state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids, &store));
+    state.zone_counter_store = store;
+}
+
+/// Every fallible step of the forwarding build. Returns `Err` on any snapshot
+/// integrity violation, having touched NO live shared state — see the caller
+/// for why the per-zone counter binding is deliberately not done here.
+fn build_fallible_forwarding_state(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,
     nat_counters: &crate::nat::NatCounterStore,
@@ -377,32 +450,13 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         let (slot_map, _slots_to_zero) = ColdPathSlotMap::build(prev_map, &pairs);
         state.cold_path_slot_map = std::sync::Arc::new(slot_map);
     }
-    // #3651: build the per-zone traffic-counter slot map from the configured
-    // zone set and carry the cumulative store forward from the previous state
-    // (first apply creates it) so totals survive config commits. Unlike the
-    // cold-path histogram, the store is zone-id keyed, so the slot map is a
-    // plain rebuild with no previous-map retention / slot zero-out.
-    // #5716: the destructive prune is DEFERRED to the end of the build (see
-    // `zone_counter_prune` below). `ZoneCounterStore` is `Arc`-backed, so the
-    // carry-forward `clone()` here is a handle on the LIVE store the running
-    // workers are folding into — a `retain()` at this point would drop the
-    // removed zones' totals even when a LATER fallible step (`filter_state`,
-    // `cos`) rejects the snapshot and the reconcile/refresh preflight keeps
-    // the previous forwarding state. Building the slot map first is safe: it
-    // only get-or-creates the configured zones' blocks, and the deferred
-    // prune retains exactly that same configured set, so a surviving zone
-    // still keeps its SAME atomic block and the #5163 lock-free per-slot fold
-    // never resets or double-counts across a slot renumber.
-    let zone_counter_prune: rustc_hash::FxHashSet<u16> = {
-        use crate::afxdp::zone_counters::{ZoneCounterSlotMap, ZoneCounterStore};
-        let zone_ids: Vec<u16> = snapshot.zones.iter().map(|z| z.id).collect();
-        let store = previous
-            .map(|p| p.zone_counter_store.clone())
-            .unwrap_or_else(ZoneCounterStore::default);
-        state.zone_counter_slot_map = std::sync::Arc::new(ZoneCounterSlotMap::build(&zone_ids, &store));
-        state.zone_counter_store = store;
-        zone_ids.into_iter().collect()
-    };
+    // #3651 per-zone traffic counters are NOT built here. Binding this
+    // candidate to the carried-forward store mutates the LIVE, `Arc`-shared
+    // store (get-or-create per configured zone, plus the destructive prune), so
+    // it happens in `attach_zone_counters` after this fallible builder has
+    // returned `Ok` — see the doc comment on
+    // `build_forwarding_state_with_policy_counters_and_previous`.
+    //
     // Build filter state from snapshot. #2505: this is fallible — an
     // unresolvable `from protocol` token raises a SnapshotIntegrityError that
     // propagates here, aborting the reconcile preflight (before teardown /
@@ -624,18 +678,6 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // on the next apply and propagated atomically via the ha.runtime view.
     state.pending_neigh_timeout_ns =
         compute_pending_neigh_timeout_ns(&state.ifindex_to_name, &RealSysctlReader);
-
-    // #3651 memory hygiene / #5716 rejected-build safety: drop cumulative
-    // totals for zones this snapshot no longer configures. This is the ONLY
-    // destructive mutation of the carried-forward (Arc-shared, LIVE) store, so
-    // it MUST stay the last statement before `Ok(state)` — every `?` above
-    // returns with the live store untouched, which is what lets the
-    // reconcile/refresh preflight reject a snapshot and keep the previous
-    // forwarding state without also zeroing an operator's `show security
-    // zones` traffic counters. Adding a fallible step BELOW this line
-    // reintroduces the bug; `rejected_build_does_not_prune_live_zone_counters`
-    // in `forwarding_build/tests.rs` is the guard.
-    state.zone_counter_store.reconcile(&zone_counter_prune);
 
     Ok(state)
 }

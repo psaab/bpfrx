@@ -1,3 +1,92 @@
+## 2026-08-13 — #5716 (4/4): a REJECTED build still mutated the live zone-counter store
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r2)
+- **Action**: (2/2) fixed only half the hazard and then claimed the whole of
+  it. Its deferred prune is correct, but the prune is one of TWO mutations the
+  build makes to the carried-forward (`Arc`-shared, LIVE) `ZoneCounterStore`.
+  The other is `ZoneCounterSlotMap::build`, which GET-OR-CREATES an atomic
+  block per configured zone out of the store it is handed — and it still ran
+  ahead of the fallible `filter_state` and `cos` steps. Traced and reproduced:
+  live `{100, 200}`, candidate `{100, 300}` plus an out-of-range CoS queue id;
+  the build creates zone 300's block, CoS rejects, the prune is skipped, and
+  the live map keeps a zero-valued block for a zone that was never configured.
+  `ZoneCounterStore::snapshot` omits all-zero rows, so operator-visible counts
+  stay correct and nothing looks wrong — the map just grows by one orphaned
+  block per rejected commit that adds or renumbers a zone, raising the cost of
+  every snapshot, clear and reconcile. Reachable from ordinary config churn.
+
+  Fixed STRUCTURALLY rather than by moving another statement.
+  `build_forwarding_state_with_policy_counters_and_previous` is now a thin
+  wrapper over a private `build_fallible_forwarding_state` (every `?` step,
+  touching no live shared state) plus a private, infallible
+  `attach_zone_counters` that runs only after the `?`. A fallible step added
+  anywhere in the inner builder is above the `?` by construction, so it cannot
+  be the "step below the prune" that reintroduces the bug. Within
+  `attach_zone_counters` the order is prune-then-resolve: `reconcile` retains
+  exactly `configured` and `build` get-or-creates a subset of it, so the two
+  orders reach the same map, but pruning first means the map never transiently
+  holds the union. A surviving zone keeps its SAME atomic block either way,
+  which is what stops the #5163 lock-free per-slot fold resetting or
+  double-counting across a slot renumber.
+
+  Why structural and not a fifth comment: (2/2)'s claim that
+  "`rejected_build_does_not_prune_live_zone_counters` is the guard" against a
+  fallible step below the prune was FALSE, and measurably so. Moving the NPTv6
+  step below the prune left 4280 of 4281 Rust tests passing — i.e. every
+  pre-existing test, the single failure being this round's new zone-block
+  assertion, which reports the B1 defect and not the relocated step. A single-belt fixture cannot bind an
+  ordering invariant: it stays green whenever a DIFFERENT belt moves.
+
+  Also in this round, from the same review leg:
+
+  - The producer submission count was asserted only in aggregate. Three
+    submits of a constant 2 reach the same total as the correct 1/3/2, so the
+    end-state check could not see a commit handing the kernel the wrong NUMBER
+    of slots. Both producer fixtures now assert `*producer` after every commit.
+  - The changed `ReadRx::Drop` condition (`!released && read_count > 0` ->
+    `read_count > 0`) had no fixture: the existing reuse test releases
+    everything it reads, so it reaches drop with `read_count == 0` and never
+    enters the branch.
+  - `xsk_ffi_tests.rs`'s two `const _: () = assert!` blocks are assertions over
+    TEST CONSTANTS only — no production edit can fail either — and were being
+    read as coverage. Relabelled explicitly as fixture self-checks; the
+    pairwise-distinct one is relaxed to "at least two distinct", which is what
+    the fixtures actually need.
+  - Nine assertion messages diagnosed a specific CAUSE from a general equality
+    mismatch. Reworded to state the observation and name the guarded shape.
+  - Claim corrections in `mod.rs`, `snapshot.rs`,
+    `docs/userspace-dataplane-gaps.md` and three earlier `_Log.md` entries —
+    see the CORRECTED notes in (1/2), (2/2) and (3/3) below.
+
+- **Tests**: `rejected_build_does_not_prune_live_zone_counters` and the new
+  `rejected_build_does_not_create_zone_blocks_in_the_live_store` are now
+  table-driven over EVERY fallible integrity belt reachable in the builder —
+  #3719 duplicate zone id (the first fallible step), #2240 NPTv6, #3367 filter
+  tcp-flags, #2410 CoS queue id (the last) — and each row asserts it rejected
+  through the belt it names, so a row that starts failing early stops silently
+  passing. The create half needs a new
+  `ZoneCounterStore::tracked_zone_ids_for_test`, because the operator-facing
+  `snapshot()` is deliberately sparse and cannot see a zero-valued block.
+  `accepted_build_still_prunes_zone_counters_for_removed_zones` remains the
+  anti-over-fix control.
+
+  Reverts, each observed RED:
+
+  | fix | revert edit | observed |
+  |---|---|---|
+  | B1 zone-block create | (before fix) run the new test at PR head | `left: [100, 200, 300]`, `right: [100, 200]` |
+  | B1/B4 structural | call `attach_zone_counters` inside the fallible builder at its old position | both tests RED — prune `left: 1, right: 2`; create `left: [100, 300]`, `right: [100, 200]`, failing on the #3367 FILTER row, a belt the single-belt fixture never covered |
+  | B2 per-commit submit | `WriteTx::commit` submits a constant `2` | `write_tx_insert_after_commit_...` RED at the new checkpoint, `left: 2, right: 1`; with that one assertion removed the SAME mutation is GREEN, which is the finding |
+  | B3 drop release | `ReadRx::Drop` skips its release | `read_rx_drop_releases_a_batch_read_after_an_explicit_release` RED, `left: 4, right: 5`; the pre-existing `read_rx_read_after_release_stays_releasable` stayed GREEN, which is the finding |
+
+  Every RED is an assertion failure, not a build break.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/zone_counters.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `docs/userspace-dataplane-gaps.md`,
+  `_Log.md`
+
 ## 2026-08-05 — #5716 (3/3): ring-guard fixtures could not reject a constant advance
 
 - **Timestamp**: 2026-08-05 (fix/5716-afxdp-api-hardening, PR #6832 review fold)
@@ -21,13 +110,22 @@
 
   Each fixture now drives three DISTINCT batch sizes (`REUSE_BATCHES =
   [1, 3, 2]`) and asserts the base cursor after EVERY terminal op, not only at
-  the end. Both halves are load-bearing. Three sizes are needed because two
-  cannot discriminate. Asserting after every op is needed because three
-  applications of `+= 2` land on the same FINAL cursor as the correct advance
-  (2+2+2 == 1+3+2) — a constant is invisible to an end-state-only check and
-  shows up only at the intermediate checkpoints. A `const _: () = assert!`
-  pins the three sizes as pairwise distinct so a later tidy-up cannot keep the
-  shape of these fixtures while deleting their substance.
+  the end.
+
+  **CORRECTED by (4/4):** only the second half is load-bearing. "Three sizes
+  are needed because two cannot discriminate" is FALSE — it is true of the
+  ORIGINAL end-state-only fixtures, but once a checkpoint runs after every
+  terminal op, two distinct sizes already reject every constant (a batch of 1
+  rejects every constant but 1; a following batch of 3 rejects 1, at
+  cumulative 4 against 2). Three sizes are what these fixtures happen to use.
+  What IS load-bearing is the intermediate checkpoint: three applications of
+  `+= 2` land on the same FINAL cursor as the correct advance (2+2+2 == 1+3+2),
+  so a constant is invisible to an end-state-only check. The "assert after
+  every terminal op, INCLUDING the last" claim is also overstated — the final
+  checkpoint is redundant, since the first two have already rejected every
+  constant by the time it runs. A `const _: () = assert!` pins the sizes as
+  not-all-equal; it is a fixture self-check over test constants, not coverage,
+  and (4/4) relabels it as such.
 
   The batch sizes are producible through the production path: every insert
   site passes a variable-length slice (`scratch_prepared_tx.len()`,
@@ -88,7 +186,16 @@
   had already lost the removed zones' cumulative totals, so `show security
   zones` traffic counters reset on a commit that never applied. The prune is
   now the last statement before `Ok(state)`, with the retained zone set carried
-  in a local; every `?` above it returns with the store untouched.
+  in a local; every `?` above it returns without pruning the store.
+
+  **CORRECTED by (4/4):** "every `?` above it returns with the store
+  UNTOUCHED" was false as written. The prune is only one of the store's two
+  mutations; `ZoneCounterSlotMap::build`, still above the fallible steps,
+  GET-OR-CREATES a block per configured zone in that same live map, so a
+  rejected candidate carrying a new zone left a zero-valued block behind. The
+  true claim for this entry's shape is the narrower "does not PRUNE existing
+  totals". (4/4) moves both mutations below the fallible builder, at which
+  point "untouched" becomes accurate and is bound by a test.
 
   This is the RESIDUAL of #5171 rev-5605, not a duplicate: that fold saw the
   same Arc-shared-store hazard but fixed only the VALIDATION build
@@ -131,7 +238,11 @@
   `create -> insert/read* -> commit/release -> drop` (audited: bind.rs
   prime_fill_ring, tx/rings.rs reap+refill, tx/transmit, cos/queue_service x4,
   poll_descriptor), so nothing crosses a terminal op today — this is API
-  hardening, and the single-use path is bit-identical.
+  hardening, and the single-use path is observably equivalent (the guards' own
+  fields differ — `base_idx` now advances and `ReadRx` no longer carries the
+  `released` flag — so "bit-identical", as this entry originally read, was
+  wrong; what is unchanged is every effect on the rings and the kernel-facing
+  pointers).
 
 - **Tests**: `write_tx_insert_after_commit_appends_past_the_committed_slots`,
   `write_fill_insert_after_commit_appends_past_the_committed_slots`,
