@@ -294,60 +294,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
 			networkdErr, needLinkCycleRecovery = d.programRethMemberMAC(
 				linuxName, mac, networkdErr, needLinkCycleRecovery)
-			clearDadFailed(linuxName)
-			removeAutoLinkLocal(linuxName)
-			// Re-add link-local if this parent interface has IPv6 on unit 0.
-			// NDP Neighbor Solicitation requires a link-local source address.
-			if rethUnitHasIPv6(rethCfg, 0) {
-				ensureRethLinkLocal(linuxName)
-			}
-
-			// Re-disable VLAN RX offload after MAC programming.
-			// The iavf VF driver resets ethtool features (including
-			// rx-vlan-offload) during the link down/up cycle that
-			// programRethMAC requires. Without this, XDP cannot see
-			// VLAN tags in the packet data and drops VLAN traffic.
-			if out, err := runCommandTimeout("ethtool", "-K", linuxName, "rxvlan", "off"); err != nil {
-				slog.Warn("failed to re-disable rxvlan after RETH MAC",
-					"interface", linuxName, "err", err, "output", strings.TrimSpace(string(out)))
-			} else {
-				slog.Info("re-disabled VLAN RX offload after RETH MAC", "interface", linuxName)
-			}
-
-			// Propagate MAC change to VLAN sub-interfaces.
-			// Linux VLAN sub-interfaces don't always inherit the
-			// parent's MAC change after link down/up.
-			if parentLink, err := netlink.LinkByName(linuxName); err == nil {
-				parentIdx := parentLink.Attrs().Index
-				links, _ := netlink.LinkList()
-				for _, l := range links {
-					if l.Attrs().ParentIndex != parentIdx {
-						continue
-					}
-					subName := l.Attrs().Name
-					// Suppress auto link-local on VLAN sub-interfaces too.
-					setVLANSubAddrGenMode(subName)
-					if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
-						if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
-							slog.Warn("failed to propagate MAC to VLAN sub-interface",
-								"iface", subName, "err", err)
-						} else {
-							slog.Info("propagated RETH MAC to VLAN sub-interface",
-								"iface", subName, "mac", mac)
-						}
-					}
-					// Strip any stale auto link-local, then re-add a stable one
-					// if this VLAN sub-interface carries IPv6. The kernel suffix
-					// is the unit's vlan-id (e.g. "ge-7-0-1.180"), which may
-					// differ from the logical unit number rethCfg.Units is keyed
-					// by (`unit 80 vlan-id 180`); the repair resolves the vlan-id
-					// back to its unit(s) before checking for IPv6 — indexing
-					// Units[vid] directly silently skipped the repair (#5107).
-					// The whole decision+action lives in rethSubIfaceLinkLocalRepair
-					// (spy-tested); this loop only enumerates the child netdevs.
-					rethSubIfaceLinkLocalRepair(rethCfg, subName)
-				}
-			}
+			d.finishRethMemberLinkTail(linuxName, mac, rethCfg)
 		}
 	}
 
@@ -355,30 +302,7 @@ func (d *Daemon) applyDataplaneAndHACore(ctx context.Context, cfg *config.Config
 	// programming. Only needed when programRethMAC had to bring the
 	// interface DOWN/UP (link cycle), which removes all addresses
 	// including VRRP VIPs and stable link-locals.
-	if needLinkCycleRecovery && d.isNoRethVRRP() {
-		// Direct mode: re-add VIPs + stable link-locals for each RG
-		// where we are primary.
-		if d.cluster != nil {
-			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-				if d.cluster.IsLocalPrimary(rg.ID) {
-					d.directAddVIPs(rg.ID)
-					d.addStableRethLinkLocal(rg.ID)
-					d.scheduleDirectAnnounce(rg.ID, "link-cycle-recovery")
-				}
-			}
-		}
-	} else if needLinkCycleRecovery && d.vrrpMgr != nil {
-		d.vrrpMgr.ReconcileVIPs()
-		// Re-add stable link-locals for active RGs after MAC bounce.
-		if d.cluster != nil && cfg.Chassis.Cluster != nil {
-			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
-				s := d.getOrCreateRGState(rg.ID)
-				if s.IsActive() {
-					d.addStableRethLinkLocal(rg.ID)
-				}
-			}
-		}
-	}
+	d.reconcileAfterRethLinkCycle(cfg, needLinkCycleRecovery)
 
 	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
 	// Only needed when PrepareLinkCycle was called (macChangeNeeded=true
@@ -519,28 +443,177 @@ func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
 	// lease (PrepareLinkCycle takes it), so the exposure is the tail of members
 	// visited AFTER the last cycling one — while `reth-count` is
 	// operator-settable to 128 (pkg/config/schema_chassis.go) and the dominant
-	// per-member cost, the `ethtool -K rxvlan off` step 2.6 runs right after this
-	// call, has a 20s hard ceiling (externalCommandTimeout + the 5s WaitDelay,
-	// exec_timeout.go). Four wedging members in that tail already exceed a 60s
-	// TTL. Worse, rethToPhys is a Go MAP, so that tail is a different set on
-	// every run: the same config would pass or fail at random, which is the
-	// failure shape hardest to reproduce and the one a bigger constant hides
-	// rather than fixes.
+	// per-member cost, the `ethtool -K rxvlan off` finishRethMemberLinkTail runs
+	// right after this call, has a 20s hard ceiling (externalCommandTimeout + the
+	// 5s WaitDelay, exec_timeout.go). Four wedging members in that tail already
+	// exceed a 60s TTL. Worse, rethToPhys is a Go MAP, so that tail is a
+	// different set on every run: the same config would pass or fail at random,
+	// which is the failure shape hardest to reproduce and the one a bigger
+	// constant hides rather than fixes.
 	//
-	// Renewing here makes the TTL bound the interval between two consecutive
-	// members instead — one ethtool plus netlink — which is independent of N.
-	// This is the per-member step (step 2.6 reaches the wrapper only through
-	// this function, pinned by reth_hook_wired_5103_test.go), so a renewal here
-	// happens exactly once per member without a second call site to keep in sync.
+	// This renewal covers the MAC SET, and only that. It is deliberately NOT the
+	// only one, and an earlier revision of this comment claimed otherwise —
+	// "renewing here makes the TTL bound the interval between two consecutive
+	// members" was false, because this call lands BEFORE that member's ethtool
+	// and child-netdev work, so the interval between two consecutive renewals
+	// spanned member N's whole tail plus member N+1's MAC set. #6871 round 7
+	// added the other two renewal points that make the per-interval claim true:
+	// finishRethMemberLinkTail (after the ethtool + child loop) and
+	// reconcileAfterRethLinkCycle (after the VIP/link-local reconcile, the span
+	// that used to run all the way into NotifyLinkCycle unrenewed). What each
+	// interval does and does not bound is stated at linkCycleLeaseTTL
+	// (pkg/dataplane/userspace/process_linkcycle.go) rather than restated here.
 	//
 	// It cannot CREATE a lease: RenewLinkCycle refuses unless one is already
 	// live. So the overwhelmingly common apply — every member's MAC set live, no
 	// cycle anywhere — is completely unaffected, and this cannot become a way to
 	// suppress the 1 Hz reconcile with nothing obliged to release it.
-	if d.dp != nil {
-		d.dp.Link().RenewLinkCycle()
-	}
+	d.renewLinkCycleLease()
 	return commitErr, needLinkCycleRecovery || linkCycled
+}
+
+// renewLinkCycleLease extends a link-cycle lease that is already held. It is the
+// single place step 2.6 touches the lease, so every renewal point below reads
+// identically and a new one cannot silently skip the nil guard.
+//
+// It cannot CREATE a lease (Manager.RenewLinkCycle refuses unless one is live),
+// so calling it on an apply that cycled nothing — the overwhelming majority — is
+// a no-op, and it can never become a way to suppress the 1 Hz reconcile with
+// nothing obliged to release it.
+func (d *Daemon) renewLinkCycleLease() {
+	if d.dp == nil {
+		return
+	}
+	d.dp.Link().RenewLinkCycle()
+}
+
+// finishRethMemberLinkTail runs the per-member work that follows the MAC set:
+// DAD/link-local repair, the ethtool VLAN-RX-offload re-disable, and the MAC
+// propagation to this member's VLAN sub-interfaces. It renews the link-cycle
+// lease when it is done.
+//
+// #6871 (round 7): this is an EXTRACTION whose purpose is that renewal, and the
+// reason it is a function rather than an inline call is the same reason
+// programRethMemberMAC is one — inline, the only reachable guard would have been
+// a structural canary over the AST, and a structural canary is satisfied by a
+// statement that is unreachable, shadowed, or jumped over.
+//
+// Why the tail needs its own renewal. programRethMemberMAC renews at the end of
+// the MAC set, which is BEFORE any of this: the `ethtool -K rxvlan off` below has
+// a 20s hard ceiling (externalCommandTimeout 15s plus the 5s WaitDelay in
+// exec_timeout.go), and the child-netdev loop is cardinality-dependent — one
+// netlink round trip per VLAN sub-interface of this member, with no bound on how
+// many an operator configures. Renewing only at the MAC set therefore left every
+// member's tail, plus the next member's whole MAC set, inside ONE TTL window.
+// Renewing here splits that in two, so each window holds at most one 20s-ceiling
+// command. See linkCycleLeaseTTL (pkg/dataplane/userspace/process_linkcycle.go)
+// for what that does and does not let the TTL claim.
+//
+// The renewal is unconditional on this member's outcome, exactly as
+// programRethMemberMAC's is: a member that needed no cycle still spends the
+// ethtool ceiling, and the lease it is burning down may have been taken by an
+// EARLIER member.
+func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr, rethCfg *config.InterfaceConfig) {
+	clearDadFailed(linuxName)
+	removeAutoLinkLocal(linuxName)
+	// Re-add link-local if this parent interface has IPv6 on unit 0.
+	// NDP Neighbor Solicitation requires a link-local source address.
+	if rethUnitHasIPv6(rethCfg, 0) {
+		ensureRethLinkLocal(linuxName)
+	}
+
+	// Re-disable VLAN RX offload after MAC programming.
+	// The iavf VF driver resets ethtool features (including
+	// rx-vlan-offload) during the link down/up cycle that
+	// programRethMAC requires. Without this, XDP cannot see
+	// VLAN tags in the packet data and drops VLAN traffic.
+	if out, err := runCommandTimeout("ethtool", "-K", linuxName, "rxvlan", "off"); err != nil {
+		slog.Warn("failed to re-disable rxvlan after RETH MAC",
+			"interface", linuxName, "err", err, "output", strings.TrimSpace(string(out)))
+	} else {
+		slog.Info("re-disabled VLAN RX offload after RETH MAC", "interface", linuxName)
+	}
+
+	// Propagate MAC change to VLAN sub-interfaces.
+	// Linux VLAN sub-interfaces don't always inherit the
+	// parent's MAC change after link down/up.
+	if parentLink, err := netlink.LinkByName(linuxName); err == nil {
+		parentIdx := parentLink.Attrs().Index
+		links, _ := netlink.LinkList()
+		for _, l := range links {
+			if l.Attrs().ParentIndex != parentIdx {
+				continue
+			}
+			subName := l.Attrs().Name
+			// Suppress auto link-local on VLAN sub-interfaces too.
+			setVLANSubAddrGenMode(subName)
+			if !bytes.Equal(l.Attrs().HardwareAddr, mac) {
+				if err := netlink.LinkSetHardwareAddr(l, mac); err != nil {
+					slog.Warn("failed to propagate MAC to VLAN sub-interface",
+						"iface", subName, "err", err)
+				} else {
+					slog.Info("propagated RETH MAC to VLAN sub-interface",
+						"iface", subName, "mac", mac)
+				}
+			}
+			// Strip any stale auto link-local, then re-add a stable one
+			// if this VLAN sub-interface carries IPv6. The kernel suffix
+			// is the unit's vlan-id (e.g. "ge-7-0-1.180"), which may
+			// differ from the logical unit number rethCfg.Units is keyed
+			// by (`unit 80 vlan-id 180`); the repair resolves the vlan-id
+			// back to its unit(s) before checking for IPv6 — indexing
+			// Units[vid] directly silently skipped the repair (#5107).
+			// The whole decision+action lives in rethSubIfaceLinkLocalRepair
+			// (spy-tested); this loop only enumerates the child netdevs.
+			rethSubIfaceLinkLocalRepair(rethCfg, subName)
+		}
+	}
+	d.renewLinkCycleLease()
+}
+
+// reconcileAfterRethLinkCycle re-adds the VRRP VIPs and stable link-locals that
+// a RETH MAC link cycle removed (the DOWN/UP drops every kernel address on the
+// member), then renews the link-cycle lease.
+//
+// #6871 (round 7): this renewal covers the LAST unrenewed span, and it was the
+// worst one. The final member's tail is followed by this reconcile — netlink,
+// once per redundancy group — and then by step 2.6b2's NotifyLinkCycle, which is
+// what RELEASES the lease. Before this renewal existed, everything from the last
+// member's MAC set through this reconcile and into NotifyLinkCycle's own 1s NIC
+// settle had to fit in one TTL, with no renewal anywhere in it. After it, the
+// span from here to the release contains only that 1s sleep and one control
+// round trip.
+//
+// Renewing unconditionally is safe and deliberate: RenewLinkCycle cannot create a
+// lease, so an apply that cycled nothing is unaffected, and gating the renewal on
+// needLinkCycleRecovery would skip exactly the abort path — where the cycle DID
+// take a lease and then returned linkCycled=false.
+func (d *Daemon) reconcileAfterRethLinkCycle(cfg *config.Config, needLinkCycleRecovery bool) {
+	if needLinkCycleRecovery && d.isNoRethVRRP() {
+		// Direct mode: re-add VIPs + stable link-locals for each RG
+		// where we are primary.
+		if d.cluster != nil {
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				if d.cluster.IsLocalPrimary(rg.ID) {
+					d.directAddVIPs(rg.ID)
+					d.addStableRethLinkLocal(rg.ID)
+					d.scheduleDirectAnnounce(rg.ID, "link-cycle-recovery")
+				}
+			}
+		}
+	} else if needLinkCycleRecovery && d.vrrpMgr != nil {
+		d.vrrpMgr.ReconcileVIPs()
+		// Re-add stable link-locals for active RGs after MAC bounce.
+		if d.cluster != nil && cfg.Chassis.Cluster != nil {
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				s := d.getOrCreateRGState(rg.ID)
+				if s.IsActive() {
+					d.addStableRethLinkLocal(rg.ID)
+				}
+			}
+		}
+	}
+	d.renewLinkCycleLease()
 }
 
 // programRethMACWithWorkerJoin programs a RETH member's virtual MAC with the

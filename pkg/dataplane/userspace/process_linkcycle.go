@@ -147,17 +147,42 @@ func (m *Manager) DisableAndStopHelper() {
 // same input passes or fails between runs. Picking a bigger constant would be
 // the same defect with a bigger number.
 //
-// So the daemon renews instead — once per member, in programRethMemberMAC — and
-// the TTL now has to cover the interval between two consecutive members. The
-// dominant term there is the per-member `ethtool -K <if> rxvlan off`, whose HARD
-// ceiling is 20s, not 15: externalCommandTimeout is 15s and
+// So the daemon renews instead, at three points in step 2.6 (all of them via
+// Daemon.renewLinkCycleLease, pkg/daemon/daemon_apply_dataplane.go):
+//
+//	programRethMemberMAC        after this member's MAC set
+//	finishRethMemberLinkTail    after this member's ethtool + child-netdev loop
+//	reconcileAfterRethLinkCycle after the VIP/link-local reconcile, i.e. just
+//	                            before NotifyLinkCycle releases the lease
+//
+// which leaves these intervals for the TTL to cover:
+//
+//	acquire -> MAC-set renewal        3 netlink calls (down/set/up)
+//	MAC-set -> tail renewal           ONE `ethtool -K <if> rxvlan off` +
+//	                                  netlink, one round trip per child netdev
+//	tail -> next member's MAC-set     netlink + one control-socket round trip
+//	last tail -> reconcile renewal    netlink, one pass per redundancy group
+//	reconcile renewal -> release      NotifyLinkCycle's 1s settle + one round trip
+//
+// WHAT 60s ACTUALLY BUYS, stated as what it is. The one term here with a HARD
+// ceiling is the ethtool: 20s, not 15 — externalCommandTimeout is 15s and
 // runCommandStdinTimeout adds a 5s WaitDelay on top of it
-// (pkg/daemon/exec_timeout.go). Everything else in an iteration is netlink or a
-// single control-socket round-trip. 60s is 3x that ceiling and, because it is
-// per-member, it holds for ANY member count rather than for the deployed N=2
-// only. The last renewal is on the final member; between it and NotifyLinkCycle
-// sit that member's ethtool, step 2.6b's VIP/link-local reconcile (netlink) and
-// NotifyLinkCycle's own 1s NIC settle — still inside the TTL.
+// (pkg/daemon/exec_timeout.go). Exactly one interval contains one of those, so
+// 60s is 3x the only bounded term, for ANY member count rather than for the
+// deployed N=2 only. That is the whole of the guarantee.
+//
+// It is NOT an invariant, and #6871 round 6 overstated it as one ("still inside
+// the TTL"). Every interval above also contains netlink operations, and netlink
+// has no elapsed-time bound: a syscall can block, and both the child-netdev loop
+// and the per-RG reconcile scale with operator-controlled cardinality. A
+// sufficiently pathological box can exceed 60s in an interval that contains no
+// ethtool at all. 60s is an engineering estimate with a 3x margin over the only
+// measurable term — not a proof.
+//
+// That is acceptable because of what an overrun COSTS, which is bounded even
+// though the interval is not: see the paragraph below on degrading to master's
+// behaviour. An expiry loses the added protection for the remainder of that
+// cycle; it cannot produce a state master did not already have.
 //
 // The TTL remains what it always was: a backstop, not the mechanism. The lease
 // is normally ended by NotifyLinkCycle, which every path that takes one reaches
@@ -217,13 +242,24 @@ func (m *Manager) acquireLinkCycleLease() {
 // programRethMemberMAC), so the deadline tracks the sequence's actual progress
 // rather than a wall-clock estimate of its total length (#6871 round 6).
 //
-// It NEVER creates a lease. A renewal that could open one would let any caller
-// suppress the 1 Hz reconcile with no cycle in flight and nothing obliged to
-// release it — the daemon's loop runs on every RETH apply, the vast majority of
-// which never cycle a link at all. The load/CAS pair is what keeps that true
-// against a concurrent release: linkCycleInFlight below is checked first (which
-// also self-heals an already-expired deadline), and the CAS then fails rather
-// than resurrecting a lease NotifyLinkCycle released in between.
+// It never creates a lease FROM THE 0 SENTINEL, and it never resurrects one that
+// has already been retired to 0. That is the property that matters: a renewal
+// that could open a lease would let any caller suppress the 1 Hz reconcile with
+// no cycle in flight and nothing obliged to release it — the daemon's loop runs
+// on every RETH apply, the vast majority of which never cycle a link at all. The
+// load/CAS pair is what keeps it true against a concurrent release:
+// linkCycleInFlight below is checked first (which also self-heals an
+// already-expired deadline by CASing it to 0), and the CAS then re-reads and
+// fails rather than resurrecting a lease NotifyLinkCycle released in between.
+//
+// #6871 (round 7): "NEVER renews an expired lease" is stronger than the code and
+// an earlier revision claimed it. A renewal can pass the linkCycleInFlight check
+// while the lease is live, be descheduled past the deadline, and then CAS a
+// still-nonzero — and by then expired — deadline forward, because no reader
+// happened to observe the expiry and retire it to 0 in the interim. What is true
+// is narrower and still sufficient: the call BEGAN while a cycle genuinely owned
+// the dataplane, so it extends a real cycle rather than conjuring a phantom one,
+// and the overshoot is bounded by the deschedule window rather than unbounded.
 //
 // Renewing an unexpired lease that is already further out than the new deadline
 // is a no-op, so the ordering of renew against a fresh acquire does not matter.

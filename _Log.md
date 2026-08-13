@@ -1,3 +1,106 @@
+## 2026-08-13 — #6871 round 7: bind the production adapters; renew the lease where the time actually goes
+
+- **Timestamp**: 2026-08-13 (fix/5103-reth-worker-join)
+- **Action**: Codex returned MERGE-NEEDS-MAJOR at `1b645a614` with three
+  blocking findings that are one defect: this PR's tests reach PAST the
+  thin production adapters and drive the inner `Manager` methods, so the
+  adapters themselves are load-bearing and unguarded.
+
+  Reproduced firsthand before writing anything. Each of these edits left
+  `go test ./pkg/dataplane/userspace/ ./pkg/daemon/` fully GREEN:
+
+  | severance | before |
+  |---|---|
+  | `managerHAOps.UpdateHAWatchdog` -> `return nil` | GREEN |
+  | `userspaceHAController.SetHAWatchdog` -> `return nil` | GREEN |
+  | `userspaceLinkController.RenewLinkCycle` -> `{}` | GREEN |
+  | `userspaceLinkController.SetDeferWorkers` -> `{}` | GREEN |
+  | `managerHAOps.UpdateRGActive` -> `return nil` | GREEN |
+  | `userspaceHAController.SetRGActive` -> `return nil` | GREEN |
+  | `LegacyDataPlaneAdapter.PrepareLinkCycle` -> `return nil` | GREEN |
+  | `managerHAOps.UpdateFabricFwd` / `UpdateFabricFwd1` -> `return nil` | GREEN |
+  | `managerHAOps.SyncFabricState` / `userspaceHAController.SyncFabricState` -> `{}` | GREEN |
+
+  Only `PrepareLinkCycle` and `NotifyLinkCycle` on the link controller
+  were already bound, and only because the #5103/#6871 error-return work
+  happened to drive them through `Link()`.
+
+  So the fix is the CLASS, not the three instances. The sweep the fold
+  asked for found four more unbound seams beyond Codex's two — the
+  fabric pair, the RG-active pair, `SetDeferWorkers`, and (new in this
+  PR, so squarely in scope) the `LegacyDataPlaneAdapter.PrepareLinkCycle`
+  error return whose whole reason for existing is a divergence from
+  `Link()` that nothing checked.
+  `runtime_adapter_binding_6871_test.go` now drives EVERY method of both
+  production adapters through `m.Link()` / `m.HA()` — the constructors
+  the daemon uses, so severing a constructor is caught too — against an
+  observable only the real inner `Manager` produces: a control-socket
+  request, a manager field, the lease deadline, or the specific error a
+  missing BPF map raises. Deliberately map-free, so no cell SKIPs
+  unprivileged.
+
+  B3 (renewal density) was also real, and the round-6 comment claiming
+  the per-member renewal made the TTL bound "one member interval" was
+  false: `programRethMemberMAC` renews at the end of the MAC SET, which
+  is BEFORE that member's 20s-ceiling `ethtool` and its child-netdev
+  loop, and the FINAL member's tail ran through the VIP/link-local
+  reconcile into `NotifyLinkCycle` with no renewal at all. Two more
+  renewal points close those spans, each in an extracted function that
+  exists to be bindable (inline they were reachable only through
+  `applyDataplaneAndHACore`, i.e. only by a structural canary, which an
+  unreachable or shadowed statement satisfies): `finishRethMemberLinkTail`
+  and `reconcileAfterRethLinkCycle`, both routed through a new
+  `Daemon.renewLinkCycleLease` so the nil guard has one home.
+
+  What that buys is stated as what it is rather than restated as 60s.
+  Exactly one interval now holds the only term with a hard ceiling — the
+  20s ethtool — so 60s is 3x it, for any member count. It is NOT an
+  invariant: every interval also holds netlink, netlink has no
+  elapsed-time bound, and the child-netdev loop and per-RG reconcile
+  scale with operator-controlled cardinality. The code comment and
+  `docs/reth-mac.md` both now say "estimate with a 3x margin, not a
+  proof", and say why that is acceptable — an overrun degrades to
+  master's behaviour (loud Warn, reconcile resumes) rather than creating
+  a state master did not have.
+
+  Four claim corrections, all Codex's and all verified against the code:
+  the emitter gate covers callers that publish THROUGH
+  `syncDesiredForwardingStateLocked`, not the request type — `manager_ha.go`
+  and `manager_compile.go` build raw `set_forwarding_state` and are safe
+  only via `applySem`; "no worker spawn" is too absolute, since
+  `handlers/ha.rs` calls `refresh_status` (WG/GRE repair — but not
+  `reconcile_status_bindings`, and the records are cleared after a
+  successful `stop_workers`); "never renews an expired lease" is stronger
+  than the code, which can CAS a stale-but-nonzero deadline forward if
+  descheduled past it; and the composed watchdog assertion genuinely does
+  not exist.
+- **File(s)**: `pkg/dataplane/userspace/runtime_adapter_binding_6871_test.go`
+  (new), `pkg/dataplane/userspace/manager_ha.go`,
+  `pkg/dataplane/userspace/process_linkcycle.go`,
+  `pkg/dataplane/userspace/link_cycle_ha_watchdog_6871_test.go`,
+  `pkg/daemon/daemon_apply_dataplane.go`,
+  `pkg/daemon/reth_lease_renew_6871_test.go`, `docs/reth-mac.md`, `_Log.md`
+- **Validation**: the same 13-severance matrix re-run AFTER the fix — all
+  13 now RED, each at its own named cell, with the anchor verified to
+  match exactly once per file and the tree restored byte-for-byte between
+  runs. `go build ./...`, `go vet ./...`, and the FULL `go test ./...`
+  green (including `TestHeatmapNotStale`, run explicitly — the extraction
+  moves ~55 lines within `daemon_apply_dataplane.go`).
+  `pkg/dataplane/userspace` + `pkg/daemon` run 3x with no flake. `gofmt`
+  clean on every file touched.
+  ONE GAP LEFT OPEN, deliberately and named in the source: severing
+  `syncHAStateLocked`'s closing `return m.syncDesiredForwardingStateLocked()`
+  to `return nil` is still invisible to both packages — measured, not
+  assumed. Closing it needs `applyHelperStatusLocked` to succeed, which
+  needs real BPF maps, which makes the cell SKIP unprivileged; the
+  alternative is a production seam on the HA status path serving only a
+  test, which would then itself be the unbound thing. Its production
+  effect is bounded and self-healing (the decision is level-triggered;
+  the 1 Hz tick re-evaluates within a second).
+  NOT run: `make test-failover` or any cluster tooling. This changes
+  production behaviour on the RETH/VRRP MAC path, so a fresh smoke is
+  owed at this head and is scheduled centrally.
+
 ## 2026-08-05 — #5103: join the AF_XDP workers BEFORE the RETH MAC link cycle, not after
 
 - **Timestamp**: 2026-08-05 (fix/5103-reth-worker-join)

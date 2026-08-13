@@ -302,7 +302,19 @@ It is consulted in exactly four places:
   The gate sits at the **emitter**, not at `UpdateHAWatchdog`. Three callers
   reach it and only one was covered: the status tick is already inside its own
   lease skip, and the compile path runs under `applySem` (which the RETH MAC loop
-  also holds). Gating the emitter covers all three and any future fourth.
+  also holds). Gating the emitter covers all three, and any future caller that
+  publishes forwarding state *through `syncDesiredForwardingStateLocked`*.
+
+  It is **not** a chokepoint for the request type, and round 6 of this document
+  said it was. Three other sites build a raw `set_forwarding_state`:
+  `SetForwardingArmed` (`manager_status.go`), gated at its own entry point via
+  `errLinkCycleInFlight`; `disarmBeforeUnsupportedPublishLocked`
+  (`manager_ha.go`) and `disarmSnapshotProtocolFailureLocked`
+  (`manager_compile.go`), both **ungated**. Neither ungated site has a runtime
+  escape today — each is reachable only from the compile / policy-scheduler /
+  route-overlay publish paths, which serialize on `applySem`, which the RETH MAC
+  loop holds — but the reason is `applySem`, not this gate. A future publisher
+  that runs off `applySem`, as the watchdog heartbeat does, needs its own answer.
 
   It **defers** rather than failing: the decision is level-triggered on
   `desiredForwardingArmedLocked()` vs `lastStatus.ForwardingArmed`, so the first
@@ -317,9 +329,14 @@ It is consulted in exactly four places:
   `userspace-dp/src/afxdp/mod.rs`), and `is_forwarding_active` consults it per
   packet. Suppressing it for the length of a 60s link-cycle lease would expire
   that lease and stop forwarding for the RG — an **outage**, strictly worse than
-  the respawn race being closed. Its handler (`server/handlers/ha.rs`) reaches no
-  worker spawn, so there is nothing to gain by suppressing it either. The
-  kernel-visible shim watchdog map write is likewise never gated.
+  the respawn race being closed. Its handler (`server/handlers/ha.rs`) does call
+  `refresh_status`, which can repair the WG and GRE auxiliary threads — round 6
+  of this document said it "reaches no worker spawn", which is too absolute —
+  but it does **not** reach `reconcile_status_bindings` or any other spawn of the
+  AF_XDP **packet** workers, the only threads whose UMEM the cycle's unmap can
+  race, and after a successful `stop_workers` the helper has cleared its
+  worker/WG/GRE records anyway. So there is nothing to gain by suppressing it
+  either. The kernel-visible shim watchdog map write is likewise never gated.
 
 **Acquire point:** before the ctrl disable, not after a successful join. The
 window that needs covering opens at the first mutation of dataplane state, and a
@@ -350,14 +367,42 @@ fail at random. A larger constant would have been the same defect with a bigger
 number.
 
 So the daemon renews instead. `LinkController.RenewLinkCycle()` extends a lease
-that is **already held** and can never create one (`RenewLinkCycle` refuses unless
-`linkCycleInFlight()`, and its load/CAS pair loses to a concurrent release), and
-`programRethMemberMAC` calls it on **every** member's turn — including the members
-that need no cycle, since those are exactly the ones whose `ethtool` burns down a
-lease an earlier member took. The TTL therefore bounds one member interval, which
-is independent of N. It is on the `LinkController` interface rather than reached
-by an optional type assertion so a new implementation has to answer for it at
-compile time instead of silently no-opping the renewal.
+that is **already held** and can never create one from the `0` sentinel
+(`RenewLinkCycle` refuses unless `linkCycleInFlight()`, and its load/CAS pair
+loses to a concurrent release). It is on the `LinkController` interface rather
+than reached by an optional type assertion so a new implementation has to answer
+for it at compile time instead of silently no-opping the renewal.
+
+Round 6 renewed at **one** point — `programRethMemberMAC`, on every member's turn
+including the ones that need no cycle — and claimed that made the TTL bound "one
+member interval". That was wrong, and round 7 fixes it. The call lands at the end
+of the **MAC set**, before everything expensive in a member's turn, so the real
+interval between two renewals was member N's whole tail plus member N+1's MAC
+set, and the final tail ran to the release with no renewal in it at all. There
+are now three renewal points, all through `Daemon.renewLinkCycleLease`:
+
+| renewal point | what the preceding interval contains |
+|---|---|
+| `programRethMemberMAC` | 3 netlink calls (down / set / up) |
+| `finishRethMemberLinkTail` | **one** `ethtool -K rxvlan off` + one netlink round trip per VLAN child |
+| `reconcileAfterRethLinkCycle` | netlink, one pass per redundancy group |
+| *(release: `NotifyLinkCycle`)* | its 1s NIC settle + one control round trip |
+
+**What 60s actually buys.** Exactly one interval contains the only term with a
+hard ceiling — the 20s `ethtool` — so 60s is 3x that, for any member count rather
+than for the deployed N=2. That is the whole of the guarantee. It is **not an
+invariant**: every interval also contains netlink operations, netlink has no
+elapsed-time bound, and both the VLAN-child loop and the per-RG reconcile scale
+with operator-controlled cardinality. A pathological box can exceed 60s in an
+interval holding no `ethtool` at all. 60s is an engineering estimate with a 3x
+margin over the only measurable term, not a proof — and that is acceptable
+because of what an overrun costs, which *is* bounded (see the next paragraph).
+
+The last two renewals are *unconditional* on whether the member cycled. Gating
+them on `needLinkCycleRecovery` would look harmless and would skip exactly the
+abort path, where `programRethMACWithWorkerJoin` took a lease and then returned
+`linkCycled=false`. Renewing unconditionally is safe because the renewal cannot
+create a lease.
 
 The TTL remains a backstop, not the mechanism: every path that takes a lease
 reaches a `NotifyLinkCycle`, so it is only for a caller that dies in between — but
@@ -365,7 +410,18 @@ a stranded lease would suppress the reconcile loop permanently, which is worse
 than the race. Overrunning is bounded and loud rather than silent —
 `linkCycleInFlight` logs a `Warn` under the CAS when it clears an expired lease,
 and the behaviour it degrades to is master's, where the tick was never suppressed
-at all.
+at all. An overrun therefore loses the *added* protection for the remainder of
+that cycle; it cannot produce a state master did not already have. That is why a
+60s estimate is an acceptable backstop even though it is not an invariant.
+
+One further precision on the renewal, since round 6 overstated this too: it never
+renews an expired lease is stronger than the code. A renewal can pass the
+`linkCycleInFlight()` check while the lease is live, be descheduled past the
+deadline, and then CAS a still-nonzero — by then expired — deadline forward,
+because no reader happened to observe the expiry and retire it to `0` in the
+interim. What is true is narrower and still sufficient: the call **began** while a
+cycle genuinely owned the dataplane, so it extends a real cycle rather than
+conjuring one, and the overshoot is bounded by the deschedule window.
 
 **The rollback now reports.** `NotifyLinkCycle` returns an `error`. Its rebind is
 the documented inverse of `stop_workers`, and a failure used to be a `slog.Warn`
@@ -385,12 +441,42 @@ on that would be an over-rejection.
 | `pkg/dataplane/userspace/manager.go` | `linkCycleLeaseUntil` — the atomic deadline |
 | `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `RenewLinkCycle` / `linkCycleInFlight` + the monotonic epoch and the TTL |
 | `pkg/dataplane/userspace/manager_ha.go` | the `set_forwarding_state` deferral (covers the HA watchdog heartbeat) |
-| `pkg/daemon/daemon_apply_dataplane.go` | `programRethMemberMAC` — the per-member `RenewLinkCycle` |
+| `pkg/daemon/daemon_apply_dataplane.go` | `renewLinkCycleLease` + its three call sites — `programRethMemberMAC`, `finishRethMemberLinkTail`, `reconcileAfterRethLinkCycle` |
 | `pkg/dataplane/userspace/process_status.go` | the tick-wide skip |
 | `pkg/dataplane/userspace/maps_sync.go` | the ctrl-write gate (covers `UpdateRGActive`) |
 | `pkg/dataplane/userspace/manager_status.go` | `errLinkCycleInFlight` + the three operator-verb gates |
 | `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` + `LinkController.RenewLinkCycle()` |
 | `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.NotifyLinkCycle()` — the live adapter carrying the rebind error to the daemon |
+
+### The production adapters are load-bearing, and are tested as such
+
+The daemon never touches `*userspace.Manager`. It holds a
+`dataplane.RuntimeDataPlane` and reaches the dataplane through two thin seams:
+
+```
+Daemon -> dp.Link() -> userspaceLinkController -> Manager.<method>
+Daemon -> dp.HA()   -> userspaceHAController -> managerHAOps -> Manager.<method>
+```
+
+Every hop is a two-line forwarder, which is exactly why tests skip them: calling
+`m.UpdateHAWatchdog(1, ts)` is easier than building `dp.HA()` and calling
+`SetHAWatchdog(ctx, 1, ts)`, and the assertion reads the same. It is not the
+same. Before round 7, replacing any of these bodies with `return nil` left
+`pkg/dataplane/userspace` **and** `pkg/daemon` fully green while removing the
+behaviour from production entirely — measured, for seven distinct forwarders.
+
+The worst two are the watchdog hops: severing either stops the daemon's 500ms
+heartbeat from refreshing the helper's 10s per-RG forwarding lease, so the lease
+expires and the redundancy group **stops forwarding**. Severing
+`userspaceLinkController.RenewLinkCycle` removes every production renewal of the
+link-cycle lease while leaving all of its tests green.
+
+`pkg/dataplane/userspace/runtime_adapter_binding_6871_test.go` drives **every**
+method of both adapters through `m.Link()` / `m.HA()` — the same constructors the
+daemon uses, so severing a constructor is caught too — against an observable only
+the real inner `Manager` can produce (a control-socket request, a manager field,
+the lease deadline, or the specific error a missing BPF map raises). When adding
+a method to `LinkController` or `HAController`, add its cell there.
 
 ## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
 

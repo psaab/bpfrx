@@ -616,9 +616,28 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	// applySem, which the RETH MAC loop also holds — but UpdateHAWatchdog's does
 	// NOT: the daemon's watchdog heartbeat is its own 500ms goroutine
 	// (daemon_ha_sync.go) with no applySem, and its first/change/backstop branch
-	// reaches this function through syncHAStateLocked. Gating the emitter covers
-	// all three and any future fourth; gating UpdateHAWatchdog would have closed
-	// one hole and left the shape that produced it.
+	// reaches this function through syncHAStateLocked. Gating here covers all
+	// three, and any future caller that publishes forwarding state THROUGH THIS
+	// FUNCTION; gating UpdateHAWatchdog would have closed one hole and left the
+	// shape that produced it.
+	//
+	// #6871 (round 7): the scope of that sentence is exactly as written, and an
+	// earlier revision overstated it as "all three and any future fourth". This
+	// gate is not a chokepoint for the request type. Three other sites build a
+	// raw set_forwarding_state of their own and do not consult the lease:
+	//
+	//   - SetForwardingArmed (manager_status.go) — the operator verb, which is
+	//     gated at its OWN entry point instead (errLinkCycleInFlight);
+	//   - disarmBeforeUnsupportedPublishLocked (below in this file) — UNGATED,
+	//     reachable only from the compile/publish path, i.e. under applySem;
+	//   - disarmSnapshotProtocolFailureLocked (manager_compile.go) — UNGATED,
+	//     reachable from the same compile path and from the policy-scheduler and
+	//     route-overlay republishes, all of which serialize on applySem too.
+	//
+	// So there is no runtime escape today, but the reason is applySem for those
+	// two, not this gate. A future publisher that runs off applySem — as the
+	// watchdog heartbeat does — would need its own answer, and this line is the
+	// place that says so rather than implying it is already handled.
 	//
 	// The watchdog's OTHER half is deliberately NOT suppressed, and the reason is
 	// concrete rather than cautious. The shim map write in UpdateHAWatchdog is the
@@ -632,9 +651,19 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	// 60s — would expire the helper's forwarding lease outright. That is an
 	// OUTAGE, strictly worse than the respawn race being closed, and it is why
 	// the gate is on the set_forwarding_state emitter rather than on
-	// UpdateHAWatchdog as a whole. update_ha_state is also safe to let through on
-	// its own terms: its handler (server/handlers/ha.rs) reaches neither
-	// reconcile_status_bindings nor any other worker spawn.
+	// UpdateHAWatchdog as a whole.
+	//
+	// update_ha_state is also safe to let through on its own terms, though not
+	// for the absolute reason an earlier revision gave (#6871 round 7: "reaches
+	// neither reconcile_status_bindings nor any other worker spawn" is not
+	// literally true). Its handler (server/handlers/ha.rs) does call
+	// refresh_status on success, and refresh_status can repair the WG and GRE
+	// auxiliary threads. What it does NOT do is call reconcile_status_bindings or
+	// anything else that spawns the AF_XDP PACKET workers — the only threads
+	// whose UMEM a link cycle's unmap can race. And after a successful
+	// stop_workers the helper has already cleared its worker/WG/GRE records, so
+	// refresh_status finds nothing to repair either. The conclusion stands; the
+	// phrasing now matches the handler.
 	//
 	// Deferral, not loss: the decision is LEVEL-triggered on persistent state
 	// (desiredForwardingArmedLocked vs m.lastStatus.ForwardingArmed), so the

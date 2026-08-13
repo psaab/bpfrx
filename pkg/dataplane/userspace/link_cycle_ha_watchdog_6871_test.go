@@ -33,7 +33,12 @@ import (
 // that lease and stop forwarding outright: an outage in place of a race.
 // Gating the emitter also covers the two callers that were already safe (the
 // status tick, via its own lease skip; the compile path, via applySem) and any
-// future third, which gating one caller would not.
+// future caller that publishes THROUGH syncDesiredForwardingStateLocked, which
+// gating one caller would not. It is not a chokepoint for the request type:
+// three other sites build a raw set_forwarding_state, one gated at its own entry
+// (SetForwardingArmed) and two ungated but reachable only under applySem — see
+// the emitter's own comment in manager_ha.go for the inventory and why the
+// ungated pair has no runtime escape today.
 //
 // SCOPE OF THESE CELLS, stated rather than implied. They bind the gate at the
 // emitter, over a real control socket, on the request stream — the observable
@@ -46,6 +51,27 @@ import (
 // that is green because it never executed. The reachability half is covered
 // separately, and honestly, by
 // TestHAWatchdogPublishesOverTheControlSocket_6871 below.
+//
+// THE GAP THAT LEAVES, named rather than left implicit (#6871 round 7). Because
+// no cell reaches the tail, the tail LINE is unguarded: changing
+// syncHAStateLocked's closing `return m.syncDesiredForwardingStateLocked()`
+// (manager_ha.go) to `return nil` leaves pkg/dataplane/userspace AND pkg/daemon
+// fully green. That was measured, not assumed. Its production effect is bounded
+// and self-healing rather than an outage — the desired-forwarding decision is
+// level-triggered, so the 1 Hz status tick re-evaluates the same delta within a
+// second — but the composition genuinely has no test.
+//
+// It is left open deliberately: closing it needs applyHelperStatusLocked to
+// succeed, which needs real ctrl and bindings BPF maps, which needs privileges
+// this suite does not have. The two candidate fixes are both worse than the gap.
+// A map-backed cell would SKIP unprivileged, adding a fourth entry to the
+// three-leaf-cell privilege disclosure at
+// TestUpdateRGActiveCannotReEnableCtrlDuringLinkCycle_6871
+// (link_cycle_lease_6871_test.go) and buying a guard that does not run in the
+// environment most people run the suite in. A production
+// test seam threaded through applyHelperStatusLocked would put new indirection
+// on the HA status path — the hot path this whole change exists to protect — to
+// serve a test, and the seam itself would then be the unbound thing.
 
 // newWatchdogTestManager builds a map-free manager whose UpdateHAWatchdog can run
 // without a loaded BPF shim map: haWatchdogMapWrite is the production seam for
@@ -215,8 +241,11 @@ func TestHAWatchdogPublishesOverTheControlSocket_6871(t *testing.T) {
 // 60s. Suppressing update_ha_state for the length of a cycle would therefore
 // expire the helper's forwarding lease and stop forwarding for that RG: an
 // OUTAGE, strictly worse than the respawn race being closed. Its handler
-// (server/handlers/ha.rs) reaches no worker spawn, so there is nothing to gain
-// by suppressing it.
+// (server/handlers/ha.rs) does call refresh_status, which can repair the WG/GRE
+// auxiliary threads — but not reconcile_status_bindings or any other spawn of
+// the AF_XDP PACKET workers whose UMEM the cycle unmaps, and after a successful
+// stop_workers those records are cleared anyway. So there is nothing to gain by
+// suppressing it (#6871 round 7: "reaches no worker spawn" was too absolute).
 //
 // It stays GREEN under the discriminator's revert (that revert removes a gate;
 // this asserts traffic still flows).

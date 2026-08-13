@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"github.com/vishvananda/netlink"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // #6871 round 6: the link-cycle lease is renewed once per RETH member.
@@ -129,6 +131,138 @@ func TestRethMemberMACSkipsRenewWithNoDataplane_6871(t *testing.T) {
 		t.Error("the link WAS cycled, so the recovery gate must be armed; suppressing it " +
 			"here would hide a real cycle from a caller that later acquires a dataplane")
 	}
+}
+
+// #6871 round 7: the per-member renewal above is NOT enough on its own, and the
+// round-6 comment that said it made the TTL bound "the interval between two
+// consecutive members" was wrong.
+//
+// programRethMemberMAC renews at the end of the MAC SET. Everything expensive in
+// a member's turn happens AFTER that: the `ethtool -K <if> rxvlan off` with its
+// 20s hard ceiling, the child-netdev loop (one netlink round trip per VLAN
+// sub-interface, cardinality operator-controlled), and — after the LAST member —
+// step 2.6b's VIP/link-local reconcile followed by NotifyLinkCycle's own 1s NIC
+// settle. So the interval between two consecutive renewals actually spanned
+// member N's whole tail plus member N+1's MAC set, and the final tail ran to the
+// release with no renewal in it at all.
+//
+// The two cells below bind the renewals that close those spans. Both extracted
+// functions exist to BE bindable, for the same reason programRethMemberMAC does:
+// inline in applyDataplaneAndHACore they were reachable only with a live cluster
+// manager, a wired dataplane, a networkd writer and real netlink members, so the
+// only available guard would have been a structural canary — and a structural
+// canary is satisfied by a statement that is unreachable, shadowed or jumped
+// over.
+
+// stubRethTailCommand replaces the external-command seam for the duration of the
+// test so the tail's `ethtool` does not shell out. The tail is warn-only on
+// failure, so err drives which branch of the log runs, not whether the renewal
+// does — which is the point of the failing subtest below.
+func stubRethTailCommand(t *testing.T, err error) {
+	t.Helper()
+	prev := runCommandTimeout
+	runCommandTimeout = func(string, ...string) ([]byte, error) { return nil, err }
+	t.Cleanup(func() { runCommandTimeout = prev })
+}
+
+// TestRethMemberLinkTailRenewsTheLease_6871 binds the renewal that covers the
+// per-member TAIL — the 20s-ceiling ethtool and the child-netdev loop.
+//
+// RED-on-revert: delete the `d.renewLinkCycleLease()` call at the end of
+// finishRethMemberLinkTail and both subtests fail at "the member tail did not
+// renew".
+//
+// The failing-ethtool subtest is the load-bearing one. A wedged ethtool is
+// exactly the scenario the renewal exists for, so a renewal placed on the
+// success branch of that log — or skipped when the command errors — would leave
+// the lease burning down through the very case that motivated it.
+func TestRethMemberLinkTailRenewsTheLease_6871(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		ethtoolErr error
+	}{
+		{name: "ethtool_ok"},
+		{name: "ethtool_failed", ethtoolErr: errors.New("ethtool: operation timed out")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stubRethTailCommand(t, tc.ethtoolErr)
+			d, lc := newAbortRecoveryDaemon(nil)
+
+			// A deliberately absent interface: every netlink helper in the tail
+			// returns early on a failed lookup, so the cell exercises the tail's
+			// control flow without needing a real netdev or privileges.
+			d.finishRethMemberLinkTail("xpf6871-absent0", virtMAC5103, &config.InterfaceConfig{})
+
+			if lc.renewCalls != 1 {
+				t.Errorf("RenewLinkCycle calls = %d, want 1: the member tail did not renew the "+
+					"link-cycle lease. This span holds the `ethtool -K rxvlan off` (20s hard "+
+					"ceiling: externalCommandTimeout 15s plus the 5s WaitDelay) and one netlink "+
+					"round trip per VLAN sub-interface, and the renewal in programRethMemberMAC "+
+					"lands BEFORE all of it — so without this call the 60s TTL has to cover a "+
+					"member's whole tail plus the next member's MAC set (#6871)", lc.renewCalls)
+			}
+		})
+	}
+}
+
+// TestReconcileAfterRethLinkCycleRenewsTheLease_6871 binds the LAST renewal —
+// the one covering the span that used to run unrenewed all the way into
+// NotifyLinkCycle, which is what releases the lease.
+//
+// RED-on-revert: delete the `d.renewLinkCycleLease()` call at the end of
+// reconcileAfterRethLinkCycle and both subtests fail.
+//
+// Both polarities are driven on purpose. Gating the renewal on
+// needLinkCycleRecovery would look harmless and would skip exactly the abort
+// path: programRethMACWithWorkerJoin returns linkCycled=false for a cycle that
+// took a lease and then failed, so the gate would be false precisely when a
+// lease is outstanding. Renewing unconditionally is safe because RenewLinkCycle
+// cannot create one.
+func TestReconcileAfterRethLinkCycleRenewsTheLease_6871(t *testing.T) {
+	for _, needLinkCycleRecovery := range []bool{true, false} {
+		name := "cycled"
+		if !needLinkCycleRecovery {
+			name = "no_cycle"
+		}
+		t.Run(name, func(t *testing.T) {
+			d, lc := newAbortRecoveryDaemon(nil)
+
+			// No cluster manager and no VRRP manager, so neither reconcile branch
+			// has work to do; the renewal is the observable.
+			d.reconcileAfterRethLinkCycle(&config.Config{}, needLinkCycleRecovery)
+
+			if lc.renewCalls != 1 {
+				t.Errorf("RenewLinkCycle calls = %d, want 1: the post-cycle VIP/link-local "+
+					"reconcile did not renew the link-cycle lease. What follows it is "+
+					"NotifyLinkCycle, which RELEASES the lease — so without this call "+
+					"everything from the last member's MAC set through the ethtool, the "+
+					"child-netdev loop, the per-RG VIP reconcile and NotifyLinkCycle's own 1s "+
+					"NIC settle had to fit inside one TTL with no renewal anywhere in it "+
+					"(#6871)", lc.renewCalls)
+			}
+		})
+	}
+}
+
+// TestRethLeaseRenewalIsNilDataplaneSafe_6871 is the over-reach guard shared by
+// both new call sites: they route through Daemon.renewLinkCycleLease, whose nil
+// check is the only thing standing between a daemon with no dataplane wired and
+// a panic on d.dp.Link().
+//
+// It stays GREEN under either revert above (no call, no panic either way).
+func TestRethLeaseRenewalIsNilDataplaneSafe_6871(t *testing.T) {
+	stubRethTailCommand(t, nil)
+	d := &Daemon{} // d.dp is nil
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("a renewal panicked with no dataplane wired: %v. Both new call sites must "+
+				"be behind the same nil guard as the rest of the dataplane work on this path", r)
+		}
+	}()
+	d.finishRethMemberLinkTail("xpf6871-absent0", virtMAC5103, &config.InterfaceConfig{})
+	d.reconcileAfterRethLinkCycle(&config.Config{}, true)
+	d.renewLinkCycleLease()
 }
 
 // #6871 round 6: the RETH MAC live-set failure reason must reach the journal.
