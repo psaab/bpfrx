@@ -714,6 +714,34 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompileConfigLenient: %v", err)
 	}
+
+	// Preconditions (#6812 round 7). This fixture had none, so both shape
+	// assumptions its comment states — interleaved tiers, descending names —
+	// were load-bearing but unguarded. (1) the input must not already be
+	// tier-sorted, or an unstable sort has nothing to permute; (2) no tier may
+	// be declared in ascending name order, or a (tier, Name ASC) tiebreak is
+	// indistinguishable from the config order this test pins.
+	var tiers []int
+	var names []string
+	for _, rs := range cfg.Security.NAT.Source {
+		tiers = append(tiers, natRuleSetScopeTier(rs))
+		names = append(names, rs.Name)
+	}
+	if len(tiers) != 2*nPerTier {
+		t.Fatalf("compiled %d rule-sets, want %d", len(tiers), 2*nPerTier)
+	}
+	tierSorted := true
+	for i := 1; i < len(tiers); i++ {
+		if tiers[i] < tiers[i-1] {
+			tierSorted = false
+		}
+	}
+	if tierSorted {
+		t.Fatal("declaration order is already tier-sorted; an unstable sort would have " +
+			"nothing to permute and this fixture would not bind stability")
+	}
+	assertNoTierDeclaredNameAscending6812(t, tiers, names)
+
 	charges := sourceNATAggregateReferencedCharges(cfg)
 	var got []string
 	for _, c := range charges {
@@ -802,8 +830,10 @@ func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
 	// and the mutation is a no-op, which is exactly how the first version of
 	// this test went vacuous.
 	var tiers []int
+	var names []string
 	for _, rs := range cfg.Security.NAT.Source {
 		tiers = append(tiers, natRuleSetScopeTier(rs))
+		names = append(names, rs.Name)
 	}
 	if len(tiers) != nZone+nIface {
 		t.Fatalf("compiled %d rule-sets, want %d", len(tiers), nZone+nIface)
@@ -818,6 +848,11 @@ func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
 		t.Fatal("declaration order is already tier-sorted; an unstable sort would have " +
 			"nothing to permute and this fixture would not bind stability")
 	}
+	// (1b) No tier may be declared in ascending NAME order (#6812 F-A / round
+	// 7), or a (tier, Name ASC) tiebreak emits the same sequence as config
+	// order and the q00-vs-q15 assertion below cannot see it.
+	assertNoTierDeclaredNameAscending6812(t, tiers, names)
+
 	// (2) The boundary must fall between two ZONE-tier rule-sets, so config
 	// order among EQUALS is what decides the loser.
 	charges := sourceNATAggregateReferencedCharges(cfg)
@@ -834,4 +869,74 @@ func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
 	// q00 — under a (tier, Name ASC) tiebreak it would be q15 instead, which is
 	// what makes this assertion see a name tiebreak.
 	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), "q00")
+}
+
+// assertNoTierDeclaredNameAscending6812 is the #6812 F-A fixture tripwire for
+// the WALK-side fixtures: it fails unless every tier holding two or more
+// rule-sets is declared in an order that DIFFERS from ascending lexicographic
+// name order, and unless at least one such tier exists.
+//
+// Keyed on the RULE-SET name because that is what
+// sourceNATAggregateReferencedCharges sorts, and what its round-2 name ordering
+// — the rule F3 removed — actually used.
+//
+// Why per-tier and not over the whole sequence (round 7). A (tier, Name ASC)
+// stable sort consults the name ONLY among equal tiers, so the blindness that
+// matters is a tier whose declaration order already IS name-ascending: that
+// tier's charge sequence is then identical under both sorts. The first version
+// of this check (in the sibling builder fixture) asked whether the WHOLE
+// declared sequence was non-decreasing by name, which these interleaved
+// fixtures can never be — they emit if00 zn00 if01 zn01 ..., and "zn00" >
+// "if01" breaks monotonicity at index 2 whichever direction the loop runs — so
+// the flag was always false and the t.Fatal unreachable.
+//
+// A single-element tier is skipped rather than failed: it is trivially both
+// ascending and descending, so it neither discriminates nor blinds, and failing
+// on it would fire the tripwire on a fixture that is still sound.
+//
+// tiers and names are parallel slices in DECLARATION order. The builder-side
+// fixture in pkg/dataplane/userspace carries its own copy (different package;
+// a test helper cannot be shared across the two without exporting it from
+// production) keyed on PoolName, which is the only per-rule-set string the
+// emitted snapshot slice carries.
+func assertNoTierDeclaredNameAscending6812(t *testing.T, tiers []int, names []string) {
+	t.Helper()
+	if len(tiers) != len(names) {
+		t.Fatalf("precondition harness: %d tiers vs %d names — the caller's slices are "+
+			"not parallel", len(tiers), len(names))
+	}
+	var order []int
+	byTier := map[int][]string{}
+	for i, tier := range tiers {
+		if _, ok := byTier[tier]; !ok {
+			order = append(order, tier)
+		}
+		byTier[tier] = append(byTier[tier], names[i])
+	}
+	discriminating := 0
+	for _, tier := range order {
+		n := byTier[tier]
+		if len(n) < 2 {
+			continue
+		}
+		ascending := true
+		for i := 1; i < len(n); i++ {
+			if n[i] < n[i-1] {
+				ascending = false
+				break
+			}
+		}
+		if ascending {
+			t.Fatalf("tier %d is declared in ascending NAME order %v; that is the SAME "+
+				"sequence a (tier, name ASC) tiebreak emits, so this fixture could not see "+
+				"the rule #6812 F3 removed coming back. Re-cut the fixture so this tier's "+
+				"declaration order is not name-ascending.", tier, n)
+		}
+		discriminating++
+	}
+	if discriminating == 0 {
+		t.Fatal("no tier holds two or more rule-sets, so there is no within-tier tie: a " +
+			"(tier, name ASC) tiebreak would have nothing to reorder and this fixture " +
+			"cannot bind the tie-break rule at all")
+	}
 }

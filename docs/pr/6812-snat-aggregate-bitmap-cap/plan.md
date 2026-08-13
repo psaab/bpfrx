@@ -773,7 +773,44 @@ stop that rule returning could not see it return.
 
 Fixed by declaring high-to-low in all three fixtures, so config order is no
 longer lexicographic, plus a precondition in the builder test that FATALS if
-declaration order is ever again ascending by name. Measured after:
+declaration order is ever again ascending by name.
+
+**Round-7 correction.** That last clause was false as shipped in round 6. The
+precondition asked whether the WHOLE declared rule-set-name sequence was
+non-decreasing — a question this fixture shape can never answer yes to. It
+interleaves two tiers (`if00 zn00 if01 zn01 …`) and `"zn00" > "if01"`, so the
+global sequence is non-monotonic in BOTH directions; `nameAscending` was always
+false and the `t.Fatal` was unreachable. Measured on a scratch copy at
+`ba44bb85d`: re-cutting the three loops ascending left the check silent with
+pristine production AND with the `(tier, PoolName ASC)` builder mutation
+applied — the exact edit it existed to catch.
+
+The blindness that matters is ascending WITHIN a tier, because that is what a
+`(tier, name)` stable sort keys on. Round 7 replaces the check with a per-tier
+predicate — `assertNoTierDeclaredNameAscending6812`, one copy per package —
+that fails if ANY tier holding two or more rule-sets is declared in ascending
+name order, and fails if NO tier holds two (a fixture with no within-tier tie
+cannot bind the rule at all). It is now present in all three fixtures, not one:
+the descending re-cut is a shape assumption all three share, and a future
+re-cut is a per-file edit, so the tripwire belongs wherever the assumption
+lives. `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` also gains the
+tier-sortedness precondition its two siblings already had.
+
+Measured after (round 7):
+
+| step | old predicate | new predicate |
+|---|---|---|
+| ascending re-cut, production pristine | green (silent) | RED — `tier 0 is declared in ascending NAME order [if00 … if09]` |
+| ascending re-cut + `(tier, PoolName ASC)` | green (silent) | RED — same precondition line, before the assertion |
+| head fixture + `(tier, PoolName ASC)` | RED on the assertion | RED on the assertion (precondition does not shadow it) |
+| head fixture + walk `(tier, Name ASC)` | RED on the assertions | RED on the assertions (`charge order[0] = if00, want if09`; `poison set = map[q15:true], missing "q00"`) |
+| one rule-set per tier, tiers declared high-first | n/a | RED — `no tier holds two or more rule-sets` |
+
+The last row exists because the "no within-tier tie" belt would otherwise be
+unfalsifiable: the callers' tier-sortedness precondition shadows it for every
+multi-element shape, so it was driven directly to prove it is reachable.
+
+Round-6 measurement, retained:
 
 | mutation | before | after |
 |---|---|---|
@@ -820,11 +857,22 @@ Narrowing the claim would have been the "document the divergence" option
 already rejected for F1.
 
 The fix is a `netip.ParsePrefix` check in `expandPoolV4`. Narrowing only: such
-a pool is already refused at commit and poisoned on the tolerant path, so no
-working config changes behaviour — the lookup reports an error instead of a
-fiction. `net.ParseCIDR` is pre-existing and untouched by the diff, so this is
-not a regression this PR introduced; it is a divergence the shared fixture made
-visible.
+a pool translates NOTHING either way — the snapshot builder stamps it
+`invalid_pool` and it installs no allocator — so no working config changes
+behaviour; the lookup reports an error instead of a fiction. `net.ParseCIDR` is
+pre-existing and untouched by the diff, so this is not a regression this PR
+introduced; it is a divergence the shared fixture made visible.
+
+**Round-7 correction to this paragraph.** It also claimed such a pool is
+"already refused at commit". That conjunct is over-broad and is withdrawn:
+`validateSourceNATPoolAddressGrammarStrict` iterates pools reachable from a
+pool-mode rule's `Then.PoolName`, not the pool table, so an UNREFERENCED pool
+carrying `10.0.0.0/016` compiles STRICT-CLEAN. Measured both directions — the
+referenced spelling is refused (`source-nat pool "refd" ... address
+"10.1.0.0/016" is not a valid CIDR`), the unreferenced one compiles with
+`err = <nil>` and `SourceNATPoolUnusableReason == "invalid_pool"`. The
+conclusion is unchanged, because it rests on the pool being unusable, not on
+the commit gate.
 
 ### F-D — assertion (3) was not independent of (2)
 

@@ -685,24 +685,28 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 			"nothing to permute and this fixture would not bind stability")
 	}
 
-	// F-A precondition: declaration order must NOT coincide with ascending
-	// lexicographic name order, or a (tier, Name ASC) tiebreak is invisible.
-	var declaredNames []string
+	// F-A precondition: WITHIN EVERY TIER, declaration order must not coincide
+	// with ascending name order, or a (tier, name ASC) tiebreak is invisible.
+	//
+	// Keyed on PoolName, not the rule-set name: the slice this test sorts is
+	// emitted SNAPSHOTS, which carry no rule-set name, so PoolName is the only
+	// per-rule-set string a tiebreak on this sort could read. (The walk-side
+	// fixtures in pkg/config key on the rule-set name — that is what
+	// sourceNATAggregateReferencedCharges sorts, and what its round-2 name
+	// ordering actually used.) This fixture names each pool after its rule-set,
+	// so the two sequences coincide here anyway.
+	var declaredPools []string
 	for _, rs := range cfg.Security.NAT.Source {
-		declaredNames = append(declaredNames, rs.Name)
-	}
-	nameAscending := true
-	for i := 1; i < len(declaredNames); i++ {
-		if declaredNames[i] < declaredNames[i-1] {
-			nameAscending = false
-			break
+		pool := ""
+		for _, rule := range rs.Rules {
+			if rule != nil && rule.Then.PoolName != "" {
+				pool = rule.Then.PoolName
+				break
+			}
 		}
+		declaredPools = append(declaredPools, pool)
 	}
-	if nameAscending {
-		t.Fatal("declared order is also ascending NAME order; a (tier, name) tiebreak " +
-			"would be indistinguishable from config order and this fixture could not " +
-			"see the rule F3 removed coming back")
-	}
+	assertNoTierDeclaredNameAscending6812(t, declared, declaredPools)
 
 	out := buildSourceNATSnapshots(cfg, nil)
 	if len(out) != 2*nPerTier*rulesPerSet {
@@ -783,5 +787,73 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 					"order was not preserved", name, r, got, r)
 			}
 		}
+	}
+}
+
+// assertNoTierDeclaredNameAscending6812 is the #6812 F-A fixture tripwire. It
+// fails unless every tier holding two or more rule-sets is declared in an order
+// that DIFFERS from ascending lexicographic name order, and unless at least one
+// such tier exists.
+//
+// Why per-tier and not over the whole sequence (round 7). A (tier, name ASC)
+// stable sort consults the name ONLY among equal tiers, so the blindness that
+// matters is a tier whose declaration order already IS name-ascending — that
+// tier's emitted order is then identical under both sorts. The first version of
+// this check instead asked whether the WHOLE declared sequence was
+// non-decreasing by name, which these interleaved fixtures can never be: they
+// emit if00 zn00 if01 zn01 ..., and "zn00" > "if01" breaks monotonicity at index
+// 2 regardless of which direction the loop runs. The flag was therefore always
+// false and the t.Fatal unreachable. Measured on a scratch copy at ba44bb85d:
+// re-cutting the fixture loops ascending left the old check silent BOTH against
+// pristine production AND against the (tier, PoolName ASC) mutation it was
+// written to catch.
+//
+// A single-element tier is skipped rather than failed: it is trivially both
+// ascending and descending, so it neither discriminates nor blinds, and failing
+// on it would make the tripwire fire on a fixture that is still sound.
+//
+// tiers and names are parallel slices in DECLARATION order. The pkg/config
+// walk-side fixtures carry their own copy of this helper (different package;
+// a test helper cannot be shared across the two without exporting it from
+// production).
+func assertNoTierDeclaredNameAscending6812(t *testing.T, tiers []int, names []string) {
+	t.Helper()
+	if len(tiers) != len(names) {
+		t.Fatalf("precondition harness: %d tiers vs %d names — the caller's slices are "+
+			"not parallel", len(tiers), len(names))
+	}
+	var order []int
+	byTier := map[int][]string{}
+	for i, tier := range tiers {
+		if _, ok := byTier[tier]; !ok {
+			order = append(order, tier)
+		}
+		byTier[tier] = append(byTier[tier], names[i])
+	}
+	discriminating := 0
+	for _, tier := range order {
+		n := byTier[tier]
+		if len(n) < 2 {
+			continue
+		}
+		ascending := true
+		for i := 1; i < len(n); i++ {
+			if n[i] < n[i-1] {
+				ascending = false
+				break
+			}
+		}
+		if ascending {
+			t.Fatalf("tier %d is declared in ascending NAME order %v; that is the SAME "+
+				"sequence a (tier, name ASC) tiebreak emits, so this fixture could not see "+
+				"the rule #6812 F3 removed coming back. Re-cut the fixture so this tier's "+
+				"declaration order is not name-ascending.", tier, n)
+		}
+		discriminating++
+	}
+	if discriminating == 0 {
+		t.Fatal("no tier holds two or more rule-sets, so there is no within-tier tie: a " +
+			"(tier, name ASC) tiebreak would have nothing to reorder and this fixture " +
+			"cannot bind the tie-break rule at all")
 	}
 }

@@ -549,10 +549,20 @@ func expandPoolV4(pool *config.NATPool, mode Mode) ([]net.IP, *LookupError) {
 			// dataplane does not have — and it is the same divergence class
 			// #6812 exists to close, one consumer over.
 			//
-			// Narrowing only: every such pool is ALREADY refused at commit and
-			// poisoned on the tolerant path, so no config that works today
-			// changes behaviour; the lookup now reports an error instead of a
-			// fiction. Bound by the reject half of
+			// Narrowing only: such a pool TRANSLATES NOTHING either way — the
+			// snapshot builder stamps it `invalid_pool` and it installs no
+			// allocator — so no config that works today changes behaviour; the
+			// lookup now reports an error instead of a fiction.
+			//
+			// #6812 round 7 — the "already refused at commit" half of that
+			// sentence was over-broad and is now dropped. It holds only when a
+			// pool-mode rule REFERENCES the pool:
+			// validateSourceNATPoolAddressGrammarStrict walks RULE REFERENCES,
+			// not the pool table, so an UNREFERENCED pool carrying
+			// `10.0.0.0/016` compiles STRICT-CLEAN (measured). Such a pool is
+			// still stamped unusable, which is why the conclusion stands — it
+			// is unusability, not the commit gate, that carries it. Bound by
+			// the reject half of
 			// TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812.
 			if _, perr := netip.ParsePrefix(a); perr != nil {
 				return nil, lerrf(ErrCodeNotDeterministic,

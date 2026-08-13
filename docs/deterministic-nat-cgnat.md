@@ -272,8 +272,14 @@ it. Without the check the deterministic surface was the most confident liar in
 the system: the pool is stamped `invalid_pool` and translates NOTHING, while a
 forward-mapping query answered with a 65,536-address pool built off a member no
 other layer accepts — the invariant-8 forensic failure this section exists to
-prevent. Narrowing only: such a pool is already refused at commit and poisoned
-on the tolerant path, so the lookup now returns an error instead of a fiction.
+prevent. Narrowing only: such a pool TRANSLATES NOTHING either way — the
+snapshot builder stamps it `invalid_pool` and it installs no allocator — so the
+lookup now returns an error instead of a fiction. (Round 7 correction: this
+sentence also said "already refused at commit". That holds only for a pool a
+pool-mode rule REFERENCES —
+`validateSourceNATPoolAddressGrammarStrict` walks rule references, not the pool
+table, so an UNREFERENCED pool carrying `10.0.0.0/016` compiles strict-clean.
+It is still unusable, which is what carries the conclusion.)
 Bound by the REJECT half of
 `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812`, which reads
 the same `snat_pool_grammar_v1.json` the Rust expander and the Go grammar

@@ -1,3 +1,74 @@
+## 2026-08-13 — #6812 round 7: the F-A tripwire could not fire
+
+- **Timestamp**: 2026-08-13
+- **Action**: fix the unreachable round-6 name precondition (B1), extend it to
+  all three same-tier fixtures, retract the round-6 claim, narrow one
+  over-broad conjunct.
+- **File(s)**: `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/nat/deterministic.go`, `docs/deterministic-nat-cgnat.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`, `_Log.md`
+
+**B1 — the precondition was scoped globally, so it was unreachable.** Round 6
+added a check that the declared rule-set-name sequence is not non-decreasing.
+These fixtures interleave two tiers — `if00 zn00 if01 zn01 …` — and
+`"zn00" > "if01"`, so the global sequence is non-monotonic whichever direction
+the loop runs. `nameAscending` was therefore always false and the `t.Fatal`
+unreachable. Reproduced firsthand at `ba44bb85d` on a scratch worktree: with
+the three loops re-cut ascending the test PASSED against pristine production,
+and PASSED AGAIN with the `(tier, PoolName ASC)` builder mutation applied — the
+exact edit the guard exists to catch. Not an off-by-one; a scoping error.
+
+A `(tier, name)` stable sort consults the name only among EQUAL tiers, so the
+blindness that matters is a tier declared ascending by name. The check is now
+`assertNoTierDeclaredNameAscending6812`: group the declared rule-sets by tier,
+fail if any tier holding >= 2 is name-ascending, and fail if no tier holds >= 2
+(no within-tier tie => nothing to bind). Single-element tiers are skipped —
+trivially both ascending and descending, so failing on one would fire the
+tripwire on a sound fixture.
+
+Keyed per package on what that side's sort would actually read: `PoolName` in
+the builder fixture (the emitted snapshot slice carries no rule-set name), the
+RULE-SET name in the two walk fixtures (`sourceNATAggregateReferencedCharges`
+sorts rule-sets, and its round-2 name ordering used exactly that).
+
+**N-coverage — now in all three, not one.** The descending re-cut is a shape
+assumption all three fixtures share and a future re-cut is a per-file edit, so
+the tripwire belongs wherever the assumption lives. No adjacent blindness
+existed today (both walk fixtures are descending with >= 2 distinct tiers), so
+this is hardening. `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` had
+no preconditions at all and also gains the tier-sortedness check its two
+siblings already had.
+
+| step | old predicate | new predicate |
+|---|---|---|
+| ascending re-cut, production pristine | green (silent) | RED — `tier 0 is declared in ascending NAME order [if00 … if09]` |
+| ascending re-cut + `(tier, PoolName ASC)` | green (silent) | RED — same precondition, before the assertion |
+| head fixture + `(tier, PoolName ASC)` | RED on assertion | RED on assertion — precondition does NOT shadow it |
+| head fixture + walk `(tier, Name ASC)` | RED on assertions | RED on assertions (`charge order[0] = if00, want if09`; `poison set = map[q15:true], missing "q00"`) |
+| both walk fixtures re-cut ascending | n/a (no check) | RED — `tier 0 … [if00 … if09]`, `tier 1 … [zrs00 … zrs15]` |
+| one rule-set per tier, tiers high-first | n/a | RED — `no tier holds two or more rule-sets` |
+
+The last row was driven deliberately: the "no within-tier tie" belt is shadowed
+by the callers' tier-sortedness precondition for every multi-element shape, so
+it would otherwise be an unfalsifiable guard. It is reachable — a fixture with
+one rule-set per tier declared high-tier-first reaches it.
+
+**N1 — one conjunct narrowed, conclusion unchanged.** The `expandPoolV4`
+canonical-mask narrowing was justified as "such a pool is already refused at
+commit AND poisoned on the tolerant path". The first conjunct is over-broad:
+`validateSourceNATPoolAddressGrammarStrict` iterates pools reachable from a
+pool-mode rule's `Then.PoolName`, not the pool table, so an UNREFERENCED pool
+carrying `10.0.0.0/016` compiles STRICT-CLEAN. Measured both directions — the
+referenced spelling is refused at commit (`address "10.1.0.0/016" is not a
+valid CIDR`), the unreferenced one compiles with `err = <nil>` and
+`SourceNATPoolUnusableReason == "invalid_pool"`. The conclusion stands and is
+unchanged: it rests on the pool being UNUSABLE (it translates nothing and
+installs no allocator), not on the commit gate.
+
+**No Rust change.** No production behaviour change: the diff is test
+preconditions plus comment/doc text.
+
 ## 2026-08-13 — #6812 round 6: a guard that could not see the rule it forbids
 
 - **Timestamp**: 2026-08-13
@@ -17,6 +88,13 @@ rule F3 removed, so the guard could not see it come back. Fixed by declaring
 high-to-low, plus a precondition that FATALS if declaration order is ever
 ascending by name again. Both halves now red on the name tiebreak; all ORDER
 regressions still hold.
+
+> **RETRACTED IN ROUND 7** — the "plus a precondition that FATALS…" clause was
+> FALSE as written. The precondition asked whether the WHOLE declared name
+> sequence was non-decreasing, which this interleaved fixture shape can never
+> be (`zn00` > `if01`), so it was unreachable in both directions. The
+> descending re-cut itself was real and is what the round-6 mutation table
+> measures; only the tripwire was inert. See the 2026-08-13 round-7 entry.
 
 **F-B**: the walk's summary comment still claimed "rule-sets sorted by name" —
 false since round 4 and contradicted 55 lines below in the same block.
