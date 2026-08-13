@@ -521,13 +521,25 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 // emitted the #5832 hijack warning. Pinned by
 // TestCanonicalNameCollisionMarksWithoutAReth_6722.
 //
-// Rows 3 and 4 have the same tolerant-path status and the same bound, for the
-// same reason: `validateRethMemberStrict`'s reth clause is a warning there too,
-// so a grandfathered config can still present a `reth*` candidate. Measured on
-// the tolerant path, the marked reth carries no units (the gate's unit clause
-// covers it) and no zone, so the vote withheld is empty and the zone that wins
-// is one the operator wrote on a name resolving to that same device. Pinned by
-// TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722.
+// Rows 3 and 4 have the same tolerant-path status as row 2: the reth clause is
+// a warning there too, so a grandfathered config can still present a `reth*`
+// candidate and the mark still lands. What bounds it is NOT any property of
+// what the marked interface carries — measured, a marked reth on the tolerant
+// path can carry BOTH its own logical units and its own zone, because the
+// gate's unit clause is downgraded on that path exactly like the reth clause.
+// Two structural facts bound it instead, and both are bound by tests:
+//
+//  1. A marked row's vote is only ever WITHHELD when it is EMPTY. The Rust gate
+//     is `reth_projection && zone.is_empty()`, so a marked row that names a
+//     zone still votes. Withholding therefore cannot discard a zone the
+//     operator wrote; it can only let the ifindex resolve a zone another row on
+//     it named, or leave it with no contributing row and answer the 0 sentinel.
+//  2. UNIT rows are never marked — `buildInterfaceSnapshots` stamps
+//     `RethProjection: false` on every unit row unconditionally. A grandfathered
+//     reth that carries units keeps voting through them, so its unzoned units
+//     still hold the shared ifindex ambiguous.
+//
+// Pinned by TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722.
 //
 // The remaining `parent != name` test is the definition of a parent relation,
 // not a clause excluding a case: nothing is its own redundant parent, and a

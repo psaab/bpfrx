@@ -1033,8 +1033,14 @@ Scope of the fallback:
   redundant-parent ge-0/0/1` marks nothing, but `ResolveKernelIfName`
   (`pkg/config/types.go`) reads `RethToPhysical` UNGATED for a dotted ref, so
   `ge-0/0/1.0` DISPLAYS as `reth1` while the dataplane binds `ge-0-0-1` — a
-  resolver split master shares. In each case the mark converts an AMBIGUOUS
-  ifindex (fail-closed at the 0 sentinel) into one that resolves a zone.
+  resolver split master shares. In each of the first two the mark converts an
+  ifindex that answered the 0 sentinel into one that resolves a zone. The
+  mechanism differs on the two sides: master has no agreement ledger —
+  `populate_egress` inserts one `egress` entry per snapshot row keyed by
+  ifindex, so the LAST row wins, and `egress_zone_id` reads that map and
+  answers 0 when the last row on the ifindex is unzoned. The ledger added here
+  is what makes 0 the principled answer to DISAGREEMENT rather than an artifact
+  of row order.
 
   The reth clause of `validateRethMemberStrict` empties rows 3 and 4 as a
   property of the code, not as a failed search: `rethProjectionMembers` only

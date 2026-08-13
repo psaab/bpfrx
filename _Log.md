@@ -80384,3 +80384,54 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
   docs/userspace-dataplane-architecture.md, docs/refactoring-audit-current.txt,
   _Log.md
+
+- **Timestamp**: 2026-08-13T18:20Z
+- **Action**: #6722 round 8 — folded four claim/test items from the hostile review
+  at e17de05f1 (MERGE-NEEDS-MINOR, zero blocking; the four-case answer itself was
+  verified and holds, with no fifth case). **F1, and it CORRECTS the round-7
+  `_Log.md` entry above**: that entry, the `rethProjectionMembers` doc comment and
+  cell M all stated the tolerant-path bound as "the silenced row has no units and
+  no zone". Both halves are false. The parenthetical reason ("the gate's unit
+  clause covers it") is the load-bearing part and is wrong because on the TOLERANT
+  path the unit clause is downgraded to a warning exactly like the reth clause, so
+  it covers nothing there. Measured firsthand with real `CompileConfigLenient` +
+  real `buildInterfaceSnapshots`: `reth1 gigether-options redundant-parent reth0`
+  beside `reth1 unit 0 family inet address 10.0.61.1/24` compiles, marks `reth1`,
+  and emits a `reth1.0` row; adding `security-zone dmz interfaces reth1` yields a
+  marked row carrying zone `dmz`. Cell M also contradicted itself two lines apart,
+  and its own 2-cycle sub-case has `ge-0/0/1` marked AND zoned. The real bound is
+  two structural facts, both bound by assertions: a withheld vote is always an
+  EMPTY one (the Rust gate is `reth_projection && zone.is_empty()`, so a marked
+  row that names a zone still votes), and UNIT rows are never marked
+  (`buildInterfaceSnapshots` stamps `RethProjection: false` unconditionally), so a
+  grandfathered unit-carrying reth keeps voting through its units. **F2**: cell M's
+  "no `reth1.*` row exists" loop asserted a property of its own fixture — that
+  config declares no units, so no production edit could red it — under a comment
+  claiming the opposite. Replaced with a sub-case whose marked reth DOES carry a
+  unit, asserting the base row is marked and the unit row is NOT; measured, that
+  reds under the unit-row-stamp mutation where the old loop stayed green.
+  **F3**: the new validator message asserted unconditionally that the builder
+  "then marks %q as a PROJECTION" — false for its own `reth1 redundant-parent
+  ge-0/0/1` shape (cell L sub-case `reth-names-a-physical`), which marks nothing.
+  Split into the reth-parent case, the two-name cycle, and the non-cycling case
+  whose consequence is the resolver split instead. **F5**: "an ifindex that was
+  AMBIGUOUS — fail-closed against the 0 sentinel" attributed THIS branch's
+  agreement ledger to master. Verified: master has no ledger; `populate_egress`
+  inserts one `egress` entry per snapshot row keyed by ifindex (last row wins) and
+  `egress_zone_id` reads that map, answering 0 when the last row on the ifindex is
+  unzoned. Corrected in the test-file cell L block and the architecture doc; the
+  number (0) was right, the mechanism was not. **Also correcting the round-7
+  COMMIT message** (3f99ba49e, immutable): it says "Four pre-existing failures in
+  pkg/dataplane/userspace are the unix `sun_path` 108-byte limit under a long
+  TMPDIR and reproduce identically on origin/master". Under a SHORT TMPDIR there
+  are no failures at all — `go test ./pkg/dataplane/userspace/` is ok and the full
+  `go test ./...` exits 0. The four were an artifact of the long GOTMPDIR that run
+  used, not a property of the tree, and the message should not have conceded them.
+  Validation: go build/vet/test ./... clean; cargo test --release 4419 passed 0
+  failed; mutation — stamping the unit row from the projection map reds the new
+  cell-M sub-case (and cell F), neutering the reth clause still reds exactly
+  L1/L2/L3.
+- **File(s)**: pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  pkg/config/compiler_validate_strict_reth_member.go,
+  docs/userspace-dataplane-architecture.md, _Log.md

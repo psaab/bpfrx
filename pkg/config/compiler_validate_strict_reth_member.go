@@ -129,14 +129,21 @@ func validateRethMemberStrict(cfg *Config) error {
 					"identity of a redundant pair and is never a member port of "+
 					"another interface, so this makes the L3 owner a port of "+
 					"something else. `RethToPhysical` keys its map on the "+
-					"redundant-parent NAME, so %q becomes what %q resolves to: with "+
-					"a reth parent the parent's rows land on the netdev name %q, "+
-					"which no NIC is ever named, and the snapshot builder then marks "+
-					"%q as a PROJECTION of %q and withholds its egress-zone vote — "+
-					"the L3 owner silenced in favour of its own supposed parent. "+
-					"Name the physical ports (ge-/xe-/et-) as the members of %q and "+
-					"remove the redundant-parent line from it",
-				name, parent, name, parent, name, name, parent, name)
+					"redundant-parent NAME, so %q becomes what %q resolves to. With "+
+					"a reth parent, the parent's rows then land on the netdev name "+
+					"%q, which no NIC is ever named, and the snapshot builder marks "+
+					"%q a PROJECTION of %q and withholds its egress-zone vote — the "+
+					"L3 owner silenced in favour of its own supposed parent. With a "+
+					"non-reth parent it depends on whether that parent also names "+
+					"%q as ITS redundant parent: the two-name cycle marks BOTH rows "+
+					"on the shared device, and without the cycle nothing is marked "+
+					"but the resolvers split — `ResolveKernelIfName` honours the "+
+					"map entry for a dotted reference while the dataplane's "+
+					"`snapshotLinuxName` does not, so %q's units DISPLAY on one "+
+					"device and forward on another. Name the physical ports "+
+					"(ge-/xe-/et-) as the members of %q and remove the "+
+					"redundant-parent line from it",
+				name, parent, name, parent, name, name, parent, name, parent, name)
 		}
 		if _, ok := LookupInterface(cfg, parent); !ok {
 			return fmt.Errorf(

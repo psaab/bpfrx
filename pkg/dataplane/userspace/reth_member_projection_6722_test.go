@@ -50,7 +50,7 @@ import (
 //  3. Which of a RETH's DECLARED members is the projection is `RethToPhysical`'s
 //     node-affinity answer, not "declares redundant-parent": the peer node's
 //     member votes.
-//  4. The three incoherent memberships are commit REJECTIONS.
+//  4. The four incoherent memberships are commit REJECTIONS.
 //  5. A member unit that reaches the builder anyway — via the tolerant load /
 //     peer-sync path, where the gate is a warning — still VOTES, so its ifindex
 //     stays ambiguous and fails CLOSED.
@@ -87,12 +87,13 @@ import (
 // reading like a guard — it reds with D when the netdev comparison is dropped.
 // The measured cell table is in the commit message.
 //
-// K is the ODD ONE OUT and is here deliberately. The predicate has a second
-// satisfying branch in which no reth appears at all — two names that merely
-// CANONICALIZE onto one device (`ge-0/0/1` / `ge-0-0-1`) — and nothing in this
-// file or in `validateRethMemberStrict` excludes it. `validateInterfaceNameCollisionStrict`
-// (#5832) does. Soundness therefore depends on a gate this work never touched,
-// so K guards that dependency rather than a hunk of this diff.
+// K is the ODD ONE OUT and is here deliberately. ROW 2 of the four-case split
+// is a satisfying branch in which no reth appears at all — two names that
+// merely CANONICALIZE onto one device (`ge-0/0/1` / `ge-0-0-1`) — and nothing
+// in this file or in `validateRethMemberStrict` excludes it.
+// `validateInterfaceNameCollisionStrict` (#5832) does. Soundness therefore
+// depends on a gate this work never touched, so K guards that dependency rather
+// than a hunk of this diff.
 
 // A: the reference bondless-RETH LAN. Three rows, one ifindex, and only the
 // member is a projection.
@@ -717,9 +718,15 @@ func TestCanonicalNameCollisionMarksWithoutAReth_6722(t *testing.T) {
 //	                                        `ge-0-0-1`.
 //
 // Master accepts all three too and marks nothing (it has no `reth_projection`
-// field), so the first two are a delta this PR introduces: an ifindex that was
-// AMBIGUOUS — fail-closed against the 0 sentinel — resolves a zone instead.
-// The third is a resolver divergence master shares.
+// field), so the first two are a delta this PR introduces: an ifindex that
+// answered the 0 sentinel now resolves a zone instead. The MECHANISM differs on
+// the two sides and the difference is worth stating exactly — master has no
+// agreement ledger at all: `populate_egress` inserts one `egress` entry per
+// snapshot row keyed by ifindex, so the LAST row wins, and `egress_zone_id`
+// reads that map, answering 0 when the last row on the ifindex is unzoned. The
+// ledger this PR adds is what makes 0 the principled answer to DISAGREEMENT
+// rather than an artifact of row order. The third config is a resolver
+// divergence master shares.
 //
 // The clause is `strings.HasPrefix(name, "reth")` on the CANDIDATE, which is
 // the identical test `snapshotLinuxName` uses to decide whether to resolve, so
@@ -807,14 +814,36 @@ func TestRethNamingARedundantParentIsRejected_6722(t *testing.T) {
 // existed still boots and still reaches `buildInterfaceSnapshots`. This cell
 // RECORDS what it does there rather than endorsing it, and states the bound.
 //
-// The bound: the marked row is a `reth*` interface that carries NO logical
-// units (the gate's unit clause covers a member's units, and the mark is
-// stamped on base rows only) and NO zone (the Rust gate is `reth_projection &&
-// zone.is_empty()`, so a zoned reth still votes). Withholding an empty vote can
-// only let another row on the SAME ifindex win, and that row's zone is one the
-// operator wrote on a name that resolves to that device. It is still a
-// fail-OPEN delta against master, which holds the ifindex ambiguous — tolerated
-// on the tolerant path only, behind a warning that names the config.
+// THE BOUND IS NOT A PROPERTY OF WHAT THE MARKED ROW CARRIES. An earlier
+// version of this comment said the marked reth carries no units — "the gate's
+// unit clause covers it" — and no zone. Both halves are false, and the
+// parenthetical was the load-bearing part of the first: on the TOLERANT path
+// the unit clause is downgraded to a warning exactly like the reth clause, so
+// it covers nothing there. Measured, `set interfaces reth1 gigether-options
+// redundant-parent reth0` beside `set interfaces reth1 unit 0 family inet
+// address 10.0.61.1/24` compiles lenient, marks `reth1`, and emits a `reth1.0`
+// row; adding `set security zones security-zone dmz interfaces reth1` marks a
+// reth that carries a zone as well. The 2-cycle sub-case below has `ge-0/0/1`
+// marked AND zoned. Sub-case `reth-carrying-its-own-units` pins the first.
+//
+// What actually bounds it is two structural facts, both bound by assertions
+// rather than by the shape of a fixture:
+//
+//  1. A withheld vote is always an EMPTY one. The Rust gate is
+//     `reth_projection && zone.is_empty()`, so a marked row that names a zone
+//     still votes — pinned Rust-side, where dropping the `zone.is_empty()`
+//     conjunct reds the zoned cell and only it. Withholding can therefore never
+//     discard a zone the operator wrote: it can only let the ifindex resolve a
+//     zone another row on it named, or leave it with no contributing row at all
+//     and answer the 0 sentinel.
+//  2. UNIT rows are never marked. `buildInterfaceSnapshots` stamps
+//     `RethProjection: false` on every unit row unconditionally, so a
+//     grandfathered reth that carries units keeps voting through them and its
+//     unzoned units still hold the shared ifindex ambiguous.
+//
+// It remains a fail-OPEN delta against master, which has no agreement ledger
+// and reaches the 0 sentinel by row-sourced last-write-wins — tolerated on the
+// tolerant path only, behind a warning that names the config.
 func TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722(t *testing.T) {
 	// Row 3: reth parent, reth candidate.
 	cfg := compileWithStubbedLinks6722(t, []string{
@@ -855,13 +884,46 @@ func TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722(t *testing.
 			"the operator actually zoned is the one whose vote survives",
 			parent.RethProjection, parent.Zone, "lan")
 	}
-	// The bound, asserted rather than asserted-about: the silenced row has no
-	// logical units of its own, so the vote withheld carries no L3 statement.
-	for _, s := range snaps {
-		if strings.HasPrefix(s.Name, "reth1.") {
-			t.Errorf("snapshot row %q exists; the marked reth must carry no logical "+
-				"units, or withholding its vote silences a real L3 interface", s.Name)
-		}
+	// Bound (2), on a config where it can actually fail. The version of this
+	// cell that shipped in round 7 looped over `snaps` here asserting that no
+	// `reth1.*` row exists — a property of its own fixture, which declares no
+	// units, and which no production edit can red. The binding form is a config
+	// where the marked reth DOES carry a unit: the base row must be marked and
+	// the unit row must NOT be, so the unit keeps voting. Stamping the unit row
+	// from the projection map instead of the constant `false`
+	// (`buildInterfaceSnapshots`, interfaces.go) reds this.
+	units := compileWithStubbedLinks6722(t, []string{
+		"set interfaces reth1 gigether-options redundant-parent reth0",
+		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 unit 0 family inet address 10.0.62.1/24",
+		"set security zones security-zone lan interfaces reth0",
+	}, map[string]int{"reth1": 31}, nil, true)
+	if !warnsAboutRethMember6722(units.Warnings) {
+		t.Fatalf("CompileConfigLenient recorded no reth-member warning for the "+
+			"unit-carrying reth. Warnings: %v", units.Warnings)
+	}
+	unitSnaps := buildInterfaceSnapshots(units)
+	markedBase := snapByName6722(t, unitSnaps, "reth1")
+	// Premise, asserted because it is the half of the old comment that was
+	// false: the gate's UNIT clause is a warning on this path too, so a marked
+	// reth really can carry its own logical unit here.
+	markedUnit := snapByName6722(t, unitSnaps, "reth1.0")
+	if !markedBase.RethProjection {
+		t.Fatalf("reth1 base row RethProjection = false, want true: without the " +
+			"mark this sub-case is not measuring the unit-row exemption at all")
+	}
+	if markedUnit.RethProjection {
+		t.Errorf("reth1.0 RethProjection = true, want false: the mark is stamped on " +
+			"BASE rows only. A marked unit row would withhold the vote of a real, " +
+			"independently addressed L3 interface and hand its ifindex a zone the " +
+			"operator never wrote on it — this is what keeps a grandfathered " +
+			"unit-carrying reth fail-CLOSED on the tolerant path")
+	}
+	if markedUnit.Ifindex != markedBase.Ifindex {
+		t.Errorf("reth1.0 ifindex %d, reth1 ifindex %d, want equal: the unit row has "+
+			"to land on the SAME ifindex or its surviving vote does not bear on the "+
+			"one the mark silences", markedUnit.Ifindex, markedBase.Ifindex)
 	}
 
 	// Row 4: non-reth parent, reth candidate — the 2-cycle, where BOTH rows on
