@@ -4955,7 +4955,7 @@ enum TunnelPolicy6713 {
 }
 
 fn secure_tunnel_snapshot_6713(policy: TunnelPolicy6713) -> ConfigSnapshot {
-    ConfigSnapshot {
+    crate::afxdp::test_fixtures::v5(ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "lan".to_string(),
@@ -5117,7 +5117,7 @@ fn secure_tunnel_snapshot_6713(policy: TunnelPolicy6713) -> ConfigSnapshot {
             },
         }],
         ..Default::default()
-    }
+    })
 }
 
 /// Asserts the fixture still reproduces the #6713 shape: the tunnel is zoned,
@@ -5294,23 +5294,30 @@ fn secure_tunnel_operator_deny_is_attributed_to_its_rule_6713() {
     );
 }
 
-/// #6713 scoping guard, on the shape the GO BUILDER EMITS (#6722 r3). The
-/// fallback fires ONLY when the ifindex has NO `egress` row; an existing row
-/// carrying `zone_id == 0` must stay 0.
+/// #6713 scoping guard, RE-AIMED in #6722 round 10 at what it can still
+/// distinguish.
 ///
-/// The producible divergence is a zoned trunk with a declared-but-unzoned unit
-/// 0. Unit 0 collapses onto the base netdev, so `egress[90]` (last-write-wins,
-/// unit-0 row) carries 0 while `ifindex_to_zone_id[90]` carries the trunk's
-/// `lan`. Delete the `Some(0)` short-circuit and the fallback fires on that
-/// row, changing the adjudicated to-zone of every such interface from 0 to
-/// `lan` -- this test reds on the LONE mutation.
+/// WHAT IT USED TO CLAIM, and why that claim is dead. Through round 9 this
+/// bound `egress_zone_id`'s `Some(0)` short-circuit: the resolver read
+/// `state.egress` first, and a row carrying `zone_id == 0` had to stay 0 rather
+/// than fall through. That claim went VACUOUS at ad4f0c113, when
+/// `populate_egress` began sourcing `EgressInterface::zone_id` from the same
+/// ledger the fallback read — both arms then returned the same number for every
+/// state, and the mutation the doc named (filter zero before `or_else`) still
+/// returned 0. Round 10 collapsed the resolver to a single map read, so the
+/// short-circuit does not exist to bind.
 ///
-/// The pre-r3 fixture instead built an UNZONED physical parent carrying a
-/// zoned VLAN unit. That snapshot does not occur: `buildInterfaceZoneMap`
-/// writes `out[base]` for a unit-suffixed zone reference, so the parent row
-/// always arrives zoned (measured in
-/// `pkg/dataplane/userspace/zone_propagation_6722_test.go`). The guard was
-/// green on an impossible shape and stopped binding the short-circuit.
+/// WHAT IT BINDS NOW, measured rather than asserted. The fixture builds the one
+/// producible state in which the two maps DISAGREE: a zoned trunk with a
+/// declared-but-unzoned unit 0, where unit 0 collapses onto the base netdev, so
+/// `ifindex_to_zone_id[90]` carries the trunk's `lan` while the ledger has no
+/// entry at all. That divergence is what makes the ONE remaining choice
+/// observable — which map the egress half reads. Point the resolver at
+/// `ifindex_to_zone_id` and this test reds with `left: 1  right: 0`.
+///
+/// Kept rather than deleted for that reason, and re-documented rather than
+/// left under its old claim: a test whose doc names a mechanism the code no
+/// longer has reads as coverage it is not providing.
 #[test]
 fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
     let state = build_forwarding_state(&secure_tunnel_snapshot_6713(
@@ -5341,7 +5348,12 @@ fn unzoned_interface_with_egress_row_stays_zone_zero_6713() {
     let (_, to_id) = zone_pair_ids_for_flow(&state, LAN_IFINDEX_6713, TRUNK_UNIT0_IFINDEX_6713);
     assert_eq!(
         to_id, 0,
-        "an interface with an egress row carrying zone_id 0 must stay 0"
+        "the egress half must read `ifindex_unambiguous_zone_id`, NOT \
+         `ifindex_to_zone_id`. The latter is the INGRESS attribution map: it \
+         holds the last zoned row plus the child->parent propagation, so it \
+         carries `lan` for this ifindex while no identity on it was authored \
+         into a zone. Reading it here hands an interface a zone the operator \
+         never configured on it, which is the fail-OPEN direction"
     );
 }
 
@@ -6033,15 +6045,348 @@ fn reth_exemption_does_not_leak_to_iface_tunnel_units_6722() {
     assert_eq!(result.action, PolicyAction::Deny);
 }
 
-// #6722 B1: the projection gate is a three-conjunct predicate, and a Codex leg
-// measured that each of the three could be deleted INDIVIDUALLY with the whole
-// suite green. The four tests below bind them. Each is RED under exactly its
-// own removal and GREEN under the other two, so a cell table over them
-// distinguishes the conjuncts rather than the predicate as a lump.
+// ---------------------------------------------------------------------------
+// #6722 round 10: the helper CORROBORATES the Go builder's egress-zone answer,
+// it does not adjudicate one.
 //
-// The reason the gap existed is worth stating, because it recurs: the only
-// positive fixture (`reth_member_unzoned_row_snapshot_6722`) carries BOTH a
-// `reth1` base row and a `reth1.0` unit row, so it satisfies the disjunction
-// through EITHER arm. A fixture that satisfies a disjunction cannot bind either
-// branch of it — you need one fixture per arm, each carrying only that arm's
-// witness.
+// `stampEgressZones` (pkg/dataplane/userspace/interfaces.go) decides which zone
+// an ifindex egresses into and stamps it on every row; `populate_interfaces`
+// reads it. The four cells below drive the four states that decision can arrive
+// in, by varying ONLY `egress_zone` on the reference bondless-RETH fixture —
+// whose rows are `[ge-0/0/1="" reth1="lan" reth1.0="lan"]` on one ifindex, the
+// shape the HA cluster actually produces.
+//
+// The comment this block replaced described "the four tests below" binding a
+// three-conjunct projection gate. Those tests did not exist — the block was a
+// trailing comment with nothing after it — and the gate it described is gone.
+// ---------------------------------------------------------------------------
+
+/// The reference LAN fixture with every row's `egress_zone` replaced. Row zones
+/// are left alone, so `carried` on that ifindex is `{"", "lan"}`.
+fn reth_snapshot_with_claim_6722(claim: &str) -> crate::protocol::ConfigSnapshot {
+    let mut snapshot = reth_member_unzoned_row_snapshot_6722();
+    for iface in &mut snapshot.interfaces {
+        if iface.ifindex == LAN_IFINDEX_6722 {
+            iface.egress_zone = claim.to_string();
+        }
+    }
+    snapshot
+}
+
+/// A DECIDED-empty claim overrides UNANIMOUS row agreement and fails closed.
+///
+/// This is the cell that makes the Go decision load-bearing rather than
+/// decorative, and the fixture has to be the unanimous one to bind it. EVERY
+/// row on this ifindex names `lan` — so any rule that resolved from the rows,
+/// including the compatibility arm, would answer `lan` — while the builder
+/// stamps "".
+///
+/// That combination is producible, not contrived: a reth member that the
+/// operator zoned into the SAME zone as its reth and that also carries its own
+/// addressed unit. `buildInterfaceZoneMap` fans the member's zone down onto its
+/// unit, so all four rows read `lan`; `stampEgressZones` sees a member that is
+/// not a bare port, calls the device's ownership contested, and answers no
+/// zone. Preferring the rows there re-admits the measured #6722 fail-OPEN (a
+/// flow to the member unit's own subnet adjudicated in the RETH's zone).
+///
+/// An earlier revision of this cell used the ordinary reth fixture, whose
+/// member row is UNZONED. `carried` then holds `{"", "lan"}`, no rule resolves
+/// anything from it, and the mutation that prefers row agreement was measured
+/// GREEN — the cell could not distinguish the branch it named.
+#[test]
+fn decided_empty_egress_zone_overrides_row_agreement_6722() {
+    let mut snapshot = reth_member_unzoned_row_snapshot_6722();
+    for iface in &mut snapshot.interfaces {
+        if iface.ifindex == LAN_IFINDEX_6722 {
+            iface.zone = "lan".to_string();
+            iface.egress_zone = String::new();
+        }
+    }
+    // The precondition that makes this cell binding rather than decorative.
+    let carried: std::collections::BTreeSet<&str> = snapshot
+        .interfaces
+        .iter()
+        .filter(|i| i.ifindex == LAN_IFINDEX_6722)
+        .map(|i| i.zone.as_str())
+        .collect();
+    assert_eq!(
+        carried.into_iter().collect::<Vec<_>>(),
+        vec!["lan"],
+        "precondition: EVERY row on this ifindex must name `lan`, or a rule that \
+         resolved from the rows would answer nothing here anyway and this cell \
+         would not distinguish it from one that honours the builder"
+    );
+    let state = build_forwarding_state(&snapshot);
+
+    assert_eq!(
+        state.ifindex_to_zone_id.get(&LAN_IFINDEX_6722).copied(),
+        Some(TEST_LAN_ZONE_ID),
+        "precondition: the INGRESS half still resolves `lan`, so a 0 to-zone          below is the egress decision and not an empty state"
+    );
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "a builder decision of \"no single zone\" must keep the ifindex out of          the ledger even though its zoned rows agree with each other"
+    );
+
+    let (_, to_id, result) =
+        adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+    assert_eq!(
+        to_id, 0,
+        "the builder decided this ifindex identifies no zone; resolving `lan`          from the rows instead would readmit every shape the builder rejects          (a tunnel or a reth named as a member) as a fail-OPEN"
+    );
+    assert_eq!(result.action, PolicyAction::Deny);
+    assert_eq!(
+        result.policy_id,
+        crate::policy::DEFAULT_POLICY_SENTINEL_ID,
+        "with no to-zone the default policy decides, not `wan -> lan permit`"
+    );
+}
+
+/// An UNCORROBORATED claim is refused: the helper honours a zone only where a
+/// row on the ifindex literally names it.
+///
+/// This is the whole of the helper-boundary check on a field the helper
+/// otherwise trusts (#2391/#2409/#2706). A version-drifted or hostile snapshot
+/// can make the claim say anything; it cannot make it say a zone no row on that
+/// ifindex named.
+#[test]
+fn uncorroborated_egress_zone_claim_is_refused_6722() {
+    let state = build_forwarding_state(&reth_snapshot_with_claim_6722("wan"));
+
+    assert!(
+        state.zone_name_to_id.contains_key("wan"),
+        "precondition: `wan` is a REAL configured zone with a nonzero id, so          this cell fails for lack of corroboration rather than for lack of a          zone table entry"
+    );
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "no row on this ifindex carries `wan`, so the claim is uncorroborated          and must be refused"
+    );
+
+    let (_, to_id, _) =
+        adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+    assert_eq!(
+        to_id, 0,
+        "an uncorroborated claim must resolve the 0 sentinel; adopting it would          let a drifted snapshot CONJURE a zone the operator never put this          device in -- here `wan`, which would make WAN->LAN transit a          same-zone flow"
+    );
+}
+
+/// Rows on ONE ifindex carrying DIFFERENT claims fail closed. The builder
+/// stamps them identically, so a disagreement is version drift.
+#[test]
+fn conflicting_egress_zone_claims_on_one_ifindex_fail_closed_6722() {
+    let mut snapshot = reth_member_unzoned_row_snapshot_6722();
+    let mut first = true;
+    for iface in &mut snapshot.interfaces {
+        if iface.ifindex == LAN_IFINDEX_6722 {
+            iface.egress_zone = if first { "lan" } else { "wan" }.to_string();
+            first = false;
+        }
+    }
+    let state = build_forwarding_state(&snapshot);
+
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "rows on one ifindex claiming different egress zones is drift, and drift          must not be resolved by preferring whichever row is walked first"
+    );
+    let (_, to_id, _) =
+        adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+    assert_eq!(to_id, 0, "a conflicting claim resolves the 0 sentinel");
+}
+
+// RETIRED in the same round that introduced it:
+// `absent_egress_zone_claim_falls_back_to_row_unanimity_6722` bound the
+// compatibility arm — "no row carried `egress_zone`, so fall back to row
+// unanimity". The v5 protocol bump deleted that arm, because
+// `apply_snapshot`'s exact-equality version gate refuses a snapshot from a
+// control plane that does not carry the field, so the arm was unreachable in
+// production while 54 tests still exercised it. A test that binds a path
+// production cannot take is the vacuous-test class however green it looks, so
+// the arm and its binder went together rather than the binder being re-pointed
+// at something else.
+
+// ---------------------------------------------------------------------------
+// #6722 round 10: what the DECODER does with a snapshot from the other side of
+// the field change, and why that is a decoder property rather than a
+// compatibility path.
+//
+// This round DELETES `reth_projection` and ADDS `egress_zone`, and bumps
+// CONFIG_SNAPSHOT_PROTOCOL_VERSION 4 -> 5 because of it. The bump is what makes
+// the pairing safe: `apply_snapshot` and `bump_fib_generation` gate on EXACT
+// equality, so a v4 control plane's snapshot never reaches the builder at all.
+//
+// WHY THE BUMP WAS NOT OPTIONAL, measured: feeding the v4 Go builder's rows to
+// the v5 helper on the reference cluster (docs/ha-cluster-userspace.conf, node 0)
+// resolves egress zone 0 for BOTH ifindex 24 and ifindex 25, where origin/master
+// and the matched v5 pair resolve `lan` and `wan`. Ifindex 25 is the one that
+// settles it — the mixed pairing loses a zone even the PRE-#6722 helper resolved,
+// so it is strictly worse than either endpoint rather than an intermediate
+// state, and under `default-policy deny-all` that is a silent transit outage
+// carrying a version both halves agree on.
+//
+// The cell below is therefore NOT a compatibility path. It pins two decoder
+// properties that must hold regardless: the retired key does not make
+// deserialization fail (it would turn a version mismatch into a parse crash
+// rather than the clean refusal the gate gives), and an absent `egress_zone`
+// decodes to "" and answers the 0 sentinel.
+
+/// DECODER TOLERANCE + the absent-field default. A snapshot carrying the
+/// RETIRED `reth_projection` key and no `egress_zone` must deserialize (an error
+/// would turn a version mismatch into a parse crash instead of the clean refusal
+/// the version gate gives) and must resolve NO zone.
+///
+/// Not a compatibility path: at v5 such a snapshot is refused at
+/// `apply_snapshot` before it reaches the builder. These are properties of the
+/// decoder and of the empty-string default, which hold whatever the gate does.
+#[test]
+fn retired_wire_key_decodes_and_absent_egress_zone_fails_closed_6722() {
+    let snapshot = reth_member_unzoned_row_snapshot_6722();
+    let mut v = serde_json::to_value(&snapshot).expect("serialize");
+    for row in v
+        .get_mut("interfaces")
+        .and_then(|i| i.as_array_mut())
+        .expect("interfaces")
+        .iter_mut()
+    {
+        let obj = row.as_object_mut().expect("row");
+        // Exactly what the Go builder at c9b020695 emits for this config,
+        // captured from that builder rather than hand-written: the member row
+        // carries `reth_projection: true` and no row carries `egress_zone`.
+        obj.remove("egress_zone");
+        if obj.get("ifindex").and_then(|x| x.as_i64()) == Some(LAN_IFINDEX_6722 as i64)
+            && obj.get("zone").and_then(|z| z.as_str()).unwrap_or("").is_empty()
+        {
+            obj.insert("reth_projection".to_string(), serde_json::json!(true));
+        }
+    }
+
+    let round: crate::protocol::ConfigSnapshot = serde_json::from_value(v)
+        .expect(
+            "the decoder must accept a snapshot carrying the RETIRED key; an error \
+             here would turn a version mismatch into a parse crash instead of the \
+             clean refusal the version gate gives",
+        );
+    for iface in &round.interfaces {
+        if iface.ifindex == LAN_IFINDEX_6722 {
+            assert_eq!(
+                iface.egress_zone, "",
+                "precondition: no row carries the new field, so it decodes to the \
+                 empty string — the same state the builder stamps when it decides \
+                 an ifindex identifies no zone, which is why the field is a plain \
+                 String and not an Option"
+            );
+        }
+    }
+
+    let state = build_forwarding_state(&round);
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "an old xpfd's snapshot must not resolve a zone here: with no row \
+         carrying a claim the resolver has nothing to corroborate, so the \
+         ifindex is absent from the ledger and the egress row falls to 0"
+    );
+    let (_, to_id, result) =
+        adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+    assert_eq!(
+        to_id, 0,
+        "a snapshot with no claim must degrade to the PRE-#6722 fail-closed \
+         answer, not to a guess"
+    );
+    assert_ne!(
+        to_id, TEST_LAN_ZONE_ID,
+        "specifically NOT `lan` -- naming the value a fail-open would produce"
+    );
+    assert_eq!(result.action, PolicyAction::Deny);
+}
+
+/// The egress row's `zone_id` is ORDER-INVARIANT, because it comes from the
+/// ledger rather than from whichever row `populate_egress` wrote last.
+///
+/// WHY THIS CELL EXISTS, measured rather than assumed. After the fixture
+/// migration a mutation of the consumer -- sourcing `zone_id` from the row's own
+/// `zone` name, which is what `origin/master` did -- was applied to the whole
+/// crate. It reddened exactly ONE test tree-wide, the ambiguous-ifindex sibling
+/// of this one. Every other test that touches an egress zone survived, and not
+/// because the migration weakened them: for an ifindex with a single configured
+/// identity the ledger answer and the row's own zone are THE SAME VALUE, so no
+/// mutation swapping one for the other can be seen. Those tests bind that a zone
+/// reaches the policy decision; they cannot bind WHICH mechanism supplied it.
+///
+/// The one surviving discriminator answered 0 -- a sentinel. So the positive
+/// direction of B1, "the ledger's non-zero answer beats a dissenting row", had
+/// no cell at all. This is it.
+///
+/// The fixture is the reference LAN shape: ifindex 24 carries `ge-0/0/1`
+/// (unzoned member row), `reth1` and `reth1.0` (both `lan`), and the builder
+/// stamps `lan` on all three. Emitting the UNZONED row last is what separates
+/// the two mechanisms -- last-write-wins reads 0, the ledger reads `lan` -- and
+/// the assertion is that both orders agree.
+///
+/// Fail-on-revert MEASURED, not asserted: under that consumer mutation this cell
+/// fails with `left: 0, right: 1` (`TEST_LAN_ZONE_ID` is 1), and it passes on the
+/// unmutated tree. The two cells were run from separate sandbox copies, each
+/// asserting its own `Compiling xpf-userspace-dp` line, and their outcomes
+/// DIFFER -- which is what rules out one stale binary having produced both.
+#[test]
+fn egress_row_zone_is_order_invariant_not_last_write_6722() {
+    let forward = reth_member_unzoned_row_snapshot_6722();
+    let mut reversed = forward.clone();
+    reversed.interfaces.reverse();
+
+    // Precondition: reversing really does move the unzoned row last, or the cell
+    // measures nothing. Without this the fixture could be reordered later and
+    // this test would keep passing for a reason it does not name.
+    let last_on_ifindex = |snap: &crate::protocol::ConfigSnapshot| -> String {
+        snap.interfaces
+            .iter()
+            .filter(|i| i.ifindex == LAN_IFINDEX_6722)
+            .next_back()
+            .map(|i| i.zone.clone())
+            .expect("the fixture must have rows on the LAN ifindex")
+    };
+    assert_eq!(
+        last_on_ifindex(&forward),
+        "lan",
+        "precondition: in emission order the LAST row on this ifindex is zoned"
+    );
+    assert_eq!(
+        last_on_ifindex(&reversed),
+        "",
+        "precondition: reversed, the LAST row on this ifindex is the UNZONED \
+         member -- this is the difference the two mechanisms disagree about"
+    );
+
+    for (label, snapshot) in [("emission order", &forward), ("reversed", &reversed)] {
+        let state = build_forwarding_state(snapshot);
+        assert_eq!(
+            state
+                .egress
+                .get(&LAN_IFINDEX_6722)
+                .map(|i| i.zone_id)
+                .unwrap_or(0),
+            TEST_LAN_ZONE_ID,
+            "{label}: the egress row must carry the ledger's `lan`, not the zone \
+             of whichever row happened to be written last"
+        );
+
+        let (_, to_id, result) =
+            adjudicate_wan_to_lan_transit_6722(&state, "10.0.61.102", LAN_IFINDEX_6722);
+        assert_eq!(
+            to_id, TEST_LAN_ZONE_ID,
+            "{label}: transit must be adjudicated in `lan`"
+        );
+        assert_eq!(
+            result.action,
+            PolicyAction::Permit,
+            "{label}: the wan->lan permit must be reached; a 0 here would send \
+             this to the default deny instead"
+        );
+    }
+}

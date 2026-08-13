@@ -133,42 +133,49 @@ pub(in crate::afxdp) struct ForwardingState {
     /// read u16 directly; slow-path display sites translate via
     /// `zone_id_to_name`. Unknown / dropped zones map to `0`.
     pub(in crate::afxdp) ifindex_to_zone_id: FastMap<i32, u16>,
-    /// #6722: ifindex → the nonzero zone id that EVERY snapshot interface row
-    /// on that ifindex agrees on. An ifindex is ABSENT here whenever the rows
-    /// sharing it disagree — including the case where one row carries a zone
-    /// and another carries none — and absent whenever they all agree on "no
-    /// zone".
+    /// #6722: ifindex → the nonzero zone id this ifindex EGRESSES into, or
+    /// ABSENT when it identifies no single zone.
     ///
     /// This is NOT `ifindex_to_zone_id` with fewer entries by accident; it
     /// answers a different question. `ifindex_to_zone_id` answers "what zone
     /// should a packet ARRIVING on this ifindex be attributed to", and it
     /// deliberately takes the last zoned row plus the child→parent propagation
-    /// so a trunk parent inherits its unit's zone (#921/#3618). This map
-    /// answers "does this ifindex identify exactly one zone", which is the only
-    /// question the EGRESS half may safely ask: several logical units share one
+    /// so a trunk parent inherits its unit's zone (#921/#3618). This map answers
+    /// "does this ifindex identify exactly one zone", which is the only question
+    /// the EGRESS half may safely ask: several logical identities share one
     /// ifindex (`snapshotLinuxName` collapses a non-VLAN unit 0 onto its base
-    /// netdev), so an ifindex that several differently-zoned units share
-    /// identifies no single zone at all, and guessing one adjudicates transit
-    /// under a policy the operator never wrote for that interface.
+    /// netdev, a RETH onto its member, every unit of an interface-level tunnel
+    /// onto the tunnel device), so an ifindex several differently-zoned
+    /// identities share identifies no single zone at all, and guessing one
+    /// adjudicates transit under a policy the operator never wrote for that
+    /// interface.
     ///
-    /// Built in `forwarding_build::interfaces::populate_interfaces` from the
-    /// same validated `zone_name_to_id` lookup, over ALL rows (zoned and
-    /// unzoned alike) rather than only the zoned ones. Read by BOTH arms of the
-    /// egress resolver: [`ForwardingState::egress_zone_id`]'s fallback, and
-    /// `forwarding_build::interfaces::populate_egress`, which sources each
-    /// `EgressInterface::zone_id` from here rather than from the row (#6722 B1
-    /// — `state.egress` is written last-write-wins per ifindex, so a row-sourced
-    /// zone let the final row re-arm an ifindex this ledger holds ambiguous).
+    /// DECIDED IN GO, CORROBORATED HERE. The answer is `stampEgressZones`
+    /// (`pkg/dataplane/userspace/interfaces.go`), which has the two inputs this
+    /// side does not: the operator's AUTHORED `security-zone <z> interfaces
+    /// <ref>` bindings before `buildInterfaceZoneMap` fanned them up to bases
+    /// and down onto units, and `snapshotLinuxName` itself. It arrives as
+    /// `InterfaceSnapshot::egress_zone`, identical on every row of an ifindex.
+    /// `forwarding_build::interfaces::populate_interfaces` admits it only when a
+    /// row on that ifindex literally names that zone — a corroboration, so a
+    /// drifted or hostile snapshot can never conjure a zone no row named — and
+    /// otherwise leaves the ifindex absent, which resolves the 0 sentinel.
     ///
-    /// TEST-SCOPE LIMIT, recorded rather than left to be discovered. No public
-    /// test can distinguish an erroneous re-arm to `Some(0)` from a genuine
-    /// conflict: the flush omits BOTH from the map, and `egress_zone_id` ends in
-    /// `.unwrap_or(0)`, so both resolve to the same 0. The observable SECURITY
-    /// property — an ambiguous ifindex never adjudicates a zone — is pinned in
-    /// both arms, but this internal representation is not exhaustively
-    /// mutation-tested, and a mutation that turns a conflict into `Some(0)` will
-    /// not red. Anyone tightening this map should add an accessor before
-    /// relying on the distinction.
+    /// Rounds 4 through 9 of #6722 instead built this map HERE by polling the
+    /// rows and exempting the ones whose vote was an artefact. That approach
+    /// produced nine successive spellings, each closed by adding a case to a
+    /// predicate and each holed by a config shape it had not enumerated, because
+    /// a row's `zone` is the OUTCOME of the Go derivation and the outcome cannot
+    /// say whether the operator zoned THIS identity or whether the row inherited
+    /// another's words. There is no per-row classification left on this side.
+    ///
+    /// Read by BOTH arms of the egress path: [`ForwardingState::egress_zone_id`]
+    /// (now a single read of this map — see its doc for why the `egress` arm
+    /// went away) and `forwarding_build::interfaces::populate_egress`, which
+    /// sources each `EgressInterface::zone_id` from here rather than from the
+    /// row, because `state.egress` is written last-write-wins per ifindex and a
+    /// row-sourced zone let the final row re-arm an ifindex this map holds
+    /// ambiguous.
     pub(in crate::afxdp) ifindex_unambiguous_zone_id: FastMap<i32, u16>,
     pub(in crate::afxdp) zone_name_to_id: FastMap<String, u16>,
     pub(in crate::afxdp) zone_id_to_name: FastMap<u16, String>,
@@ -563,8 +570,8 @@ impl ForwardingState {
     /// no operator-authored permit could ever apply to LAN->tunnel transit and
     /// every packet fell to the default policy.
     ///
-    /// #6722, WHY THE FALLBACK IS NOT `ifindex_to_zone_id`. Several rows can
-    /// share ONE ifindex, by THREE distinct mechanisms in
+    /// #6722, WHY THIS IS NOT `ifindex_to_zone_id`. Several rows can share ONE
+    /// ifindex, by THREE distinct mechanisms in
     /// `pkg/dataplane/userspace/interfaces.go`'s `snapshotLinuxName`:
     ///
     /// (a) a non-VLAN unit 0 collapses onto its base netdev, so `st0` and
@@ -579,14 +586,10 @@ impl ForwardingState {
     /// (c) is the one that reaches a SHIPPED topology: `docs/ha-cluster-
     /// userspace.conf` is what `test/incus/loss-userspace-cluster.env` points
     /// every HA smoke test at, and it measures `ifindex 24: [ge-0/0/1=""
-    /// reth1="lan" reth1.0="lan"]`. Its member rows are NOT independent
-    /// observers — a RETH and its member are one kernel netdev — so they are
-    /// exempted from the ledger in `populate_interfaces` rather than counted
-    /// as dissent. (a) and (b) are genuine logical units and still vote.
+    /// reth1="lan" reth1.0="lan"]`. `fab0` is NOT a fourth mechanism: the fabric
+    /// IPVLAN is its own netdev with its own ifindex (`snapshotLinuxName` never
+    /// calls `ResolveFab`), so it never shares one with its physical parent.
     ///
-    /// `fab0` is NOT a fourth mechanism: the fabric IPVLAN is its own netdev
-    /// with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`), so
-    /// it never shares one with its physical parent.
     /// `ifindex_to_zone_id` is therefore a per-NETDEV map, not a per-unit one:
     /// it holds the LAST zoned row's zone plus the zone `populate_interfaces`
     /// propagates from a zoned child unit onto `parent_ifindex`. Reading it
@@ -609,14 +612,16 @@ impl ForwardingState {
     ///    interfaces of a colliding zone AFTER `buildInterfaceSnapshots` ran,
     ///    precisely so they fail CLOSED. A base whose zone was quarantined
     ///    arrives unzoned beside a surviving zoned child, the Rust child→parent
-    ///    propagation below re-zones the parent's ifindex, and reading
+    ///    propagation re-zones the parent's ifindex, and reading
     ///    `ifindex_to_zone_id` would hand the quarantine's deliberate
     ///    default-deny back the survivor's zone.
     ///
-    /// So the fallback reads `ifindex_unambiguous_zone_id`, which carries an
-    /// ifindex only when EVERY snapshot row on it agreed on one nonzero zone.
-    /// An ambiguous ifindex resolves to the 0 sentinel — the pre-#6713 answer,
-    /// against which no rule matches and the default policy decides.
+    /// So this reads `ifindex_unambiguous_zone_id`, which carries an ifindex
+    /// only when the Go builder decided that ifindex identifies exactly one
+    /// zone AND a row on it corroborated the name (`stampEgressZones` /
+    /// `forwarding_build::interfaces::populate_interfaces`). An ambiguous
+    /// ifindex resolves to the 0 sentinel — the pre-#6713 answer, against which
+    /// no rule matches and the default policy decides.
     ///
     /// This deliberately makes the two DIRECTIONS disagree for an ambiguous
     /// ifindex: ingress still attributes a packet arriving on it to
@@ -651,25 +656,25 @@ impl ForwardingState {
     /// separately and deliberately NOT papered over at this single read. Until
     /// then such a pair fails closed rather than guessing.
     ///
-    /// A row that exists and carries `zone_id == 0` is still left at 0, and that
-    /// short-circuit is LOAD-BEARING, not defensive: `populate_egress` is
-    /// last-write-wins across snapshot rows, so for a zoned trunk with a
-    /// declared-but-unzoned unit 0 (`ge-0/0/1` zoned, `ge-0/0/1.0` in no zone,
-    /// both MAC-ful, both ifindex 10) the unit-0 row wins and `egress[10]`
-    /// carries 0 while `ifindex_to_zone_id[10]` carries the trunk's zone.
-    /// Deleting the short-circuit changes the adjudicated to-zone of every such
-    /// interface. `unzoned_interface_with_egress_row_stays_zone_zero_6713`
-    /// builds exactly that shape and reds on its removal.
+    /// WHY THERE IS NO LONGER AN `egress` ARM. Through #6722 round 9 this read
+    /// `self.egress` first and fell back to the ledger, with a `Some(0)`
+    /// short-circuit documented as load-bearing. It stopped being either once
+    /// `populate_egress` began sourcing `EgressInterface::zone_id` from THIS
+    /// SAME ledger: `egress[i].zone_id` is then the ledger's value for `i`, or 0
+    /// where the ledger has no entry, so both arms returned the same number and
+    /// the short-circuit could not fire on a state the other arm would have
+    /// answered differently. The claimed binder,
+    /// `unzoned_interface_with_egress_row_stays_zone_zero_6713`, had gone
+    /// VACUOUS accordingly — its mutation (filter zero before `or_else`) still
+    /// returned 0. Collapsing to the single map read is exactly equivalent for
+    /// every state and leaves no branch to mutate; the binder that survives is
+    /// on the map this reads, not on the arm order (see that test's rewritten
+    /// body).
     #[inline]
     pub(in crate::afxdp) fn egress_zone_id(&self, egress_ifindex: i32) -> u16 {
-        self.egress
+        self.ifindex_unambiguous_zone_id
             .get(&egress_ifindex)
-            .map(|iface| iface.zone_id)
-            .or_else(|| {
-                self.ifindex_unambiguous_zone_id
-                    .get(&egress_ifindex)
-                    .copied()
-            })
+            .copied()
             .unwrap_or(0)
     }
 

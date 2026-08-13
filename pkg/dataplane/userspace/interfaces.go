@@ -198,10 +198,31 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			}
 		}
 	}
-	// #6722: which interfaces are a PROJECTION of the RETH they belong to —
-	// the ones a RETH's own rows were resolved onto, so member and RETH
-	// describe one netdev rather than two independent observers of it.
-	rethProjection := rethProjectionMembers(cfg)
+	// #6722: the operator's LITERAL zone bindings, before buildInterfaceZoneMap
+	// fanned them up to bases and down onto units. stampEgressZones (run after
+	// this loop) needs the provenance; see authoredZoneRefs in zones.go.
+	//
+	// Bindings to a zone the StableZoneID quarantine will DROP are removed here
+	// rather than scrubbed afterwards. quarantineCollidingZones runs after this
+	// builder and unzones the colliding zone's interfaces so they fail closed;
+	// scrubbing the egress answer at that point would be wrong, because losing
+	// one of two colliding bindings on an ifindex turns it from CONTESTED into
+	// unanimous and the survivor's zone is then the right answer. The zone-name
+	// set is the same one the quarantine uses — buildZoneSnapshots publishes
+	// exactly cfg.Security.Zones — so the two cannot disagree.
+	authored := authoredZoneRefs(cfg)
+	if dropped := quarantinedZoneNames(cfg); len(dropped) > 0 {
+		for ref, zone := range authored {
+			if _, drop := dropped[zone]; drop {
+				delete(authored, ref)
+			}
+		}
+	}
+	// Parallel to `out`: the egress-zone identity of each emitted row. Collected
+	// here rather than re-derived afterwards because the loop is where the
+	// aliasing is actually performed — `linuxUnit` vs `parentLinux` is the fact
+	// that decides whether a unit collapses onto its base netdev.
+	idents := make([]egressRowIdentity, 0, len(cfg.Interfaces.Interfaces))
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
 		names = append(names, name)
@@ -232,13 +253,13 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			VLANID:          0,
 			LocalFabric:     iface.LocalFabricMember,
 			RedundancyGroup: rg,
-			RethProjection:  rethProjection[name],
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
 			MTU:             mtu,
 			HardwareAddr:    hardwareAddr,
 			Addresses:       addresses,
 		})
+		idents = append(idents, egressRowIdentity{owner: name, identity: name})
 		if len(iface.Units) == 0 {
 			continue
 		}
@@ -304,8 +325,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				RXQueues:                  rxQueues,
 				VLANID:                    unit.VlanID,
 				LocalFabric:               iface.LocalFabricMember,
-				RedundancyGroup:           rg,    // inherit resolved RG (RETH parent or own)
-				RethProjection:            false, // #6722: never on a unit row — see rethProjectionMembers
+				RedundancyGroup:           rg, // inherit resolved RG (RETH parent or own)
 				UnitCount:                 0,
 				Tunnel:                    iface.Tunnel != nil || unit.Tunnel != nil,
 				MTU:                       mtu,
@@ -328,8 +348,29 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				CoSOversubscriptionGuaranteeFraction: coSUnitOversubscriptionFraction(cosUnit),
 				CoSPriorityLowMinShareBytes:          coSUnitPriorityLowMinShare(cosUnit),
 			})
+			// UNIT 0 that lands on its base's netdev is not a separate egress
+			// identity: it IS the interface. Junos treats unit 0 of an untagged
+			// interface as the interface, and `snapshotLinuxName` collapses it
+			// onto the base device to match.
+			//
+			// Both halves are load-bearing. Requiring `linuxUnit == parentLinux`
+			// keeps a VLAN unit 0 — which lands on `<dev>.<vlan>` — from being
+			// folded onto a base it does not share. Requiring unit NUMBER 0 keeps
+			// the fold off a unit that merely happens to share the device:
+			// `TunnelNameMap` maps EVERY unit of an interface-level WireGuard
+			// tunnel onto the tunnel netdev, so `wg0.0` and `wg0.1` are one
+			// device but two logical interfaces, and folding `wg0.1` onto `wg0`
+			// would let a zone authored on one of them decide for the other.
+			unitIdentity := unitName
+			if unitNum == 0 && linuxUnit == parentLinux {
+				unitIdentity = name
+			}
+			idents = append(idents, egressRowIdentity{owner: name, identity: unitIdentity, isUnit: true})
 		}
 	}
+	// #6722: decide each ifindex's EGRESS zone here, from the operator's authored
+	// bindings and this loop's own aliasing, and stamp the answer on every row.
+	stampEgressZones(cfg, out, idents, authored)
 	// #3362: stamp the per-interface host-inbound OVERRIDE onto each snapshot so
 	// the Rust dataplane can key the host-inbound admission check by ingress
 	// interface. Carried only for an interface that declared an interface-level
@@ -458,148 +499,288 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 	return config.LinuxIfName(ifName)
 }
 
-// rethProjectionMembers reports which interfaces are a PROJECTION of the
-// redundant-ethernet interface they name as their `gigether-options
-// redundant-parent` — that is, which ones the RETH's own rows have been
-// resolved ONTO, so that the member's row and the RETH's row describe one
-// kernel netdev rather than two independent observers of it.
+// egressRowIdentity is the egress-zone identity of one emitted snapshot row,
+// recorded by buildInterfaceSnapshots as it emits (#6722).
 //
-// #6722. `snapshotLinuxName` resolves a RETH through `ResolveReth`
-// (pkg/config/types.go) onto its LOCAL member's netdev, so on a bondless
-// cluster `reth1`, `reth1.0` and `ge-0/0/1` are three rows on ONE device.
-// Junos zones the RETH rather than the member, so the member's row arrives
-// unzoned. Counting that "no zone" as a dissenting vote in the Rust agreement
-// ledger (userspace-dp/src/afxdp/forwarding_build/interfaces.rs) holds the
-// ifindex ambiguous, collapses the egress zone to the 0 sentinel, and
-// blackholes every WAN->LAN transit flow on a bondless-RETH cluster.
+//   - owner    — the CONFIGURED interface this row belongs to. For a unit row
+//     that is the base interface name, not a string split of the row name: an
+//     interface may legally be NAMED with a dot (`ge-0/0/1.100`), and splitting
+//     would silently reattribute it to a different owner.
+//   - identity — the EGRESS identity this row speaks for. A unit whose netdev is
+//     its base's netdev speaks for the base; one on its own netdev speaks for
+//     itself. This is taken from the aliasing the builder just performed
+//     (`linuxUnit == parentLinux`), never re-derived from names.
+//   - isUnit   — whether the row is a logical unit row.
+type egressRowIdentity struct {
+	owner    string
+	identity string
+	isUnit   bool
+}
+
+// stampEgressZones decides the EGRESS security zone of every ifindex in the
+// snapshot and writes it onto each row's EgressZone (#6722).
 //
-// The predicate is the ALIAS ITSELF, asked of the function that creates it:
-// does the parent's base row resolve to the same netdev as this interface's?
-// Four earlier spellings re-derived that answer downstream — from the shape of
-// the `redundant-parent` string, then from co-resident row names, then from the
-// set of netdevs the parent's rows occupy — and each re-derivation was holed by
-// a config that made it disagree with `ResolveReth`. There is no second opinion
-// to disagree now: `snapshotLinuxName` is the aliasing, and the only question
-// left is which of a RETH's declared members it picked (`RethToPhysical`'s
-// node-affinity scoring), which is exactly what this comparison asks.
+// WHY THIS IS DECIDED HERE. `ForwardingState::egress_zone_id`
+// (userspace-dp/src/afxdp/types/forwarding.rs) must answer "which single zone
+// does this ifindex identify" — a nonzero to-zone is what makes an operator
+// `permit` match, so guessing one adjudicates transit under a policy that was
+// never written for that device. Answering it from the snapshot ROWS is not
+// possible, because a row's Zone is the OUTCOME of two derivations whose inputs
+// the rows no longer carry:
 //
-// THE CASE SPLIT IS FOUR-WAY, not two. `snapshotLinuxName` is
-// `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed name and
-// `LinuxIfName(x)` otherwise, and it is applied to BOTH sides of the
-// comparison, so `parent` and `name` each take either arm independently:
+//   - buildInterfaceZoneMap (zones.go) fans one authored reference up to a base
+//     and down onto units, so a row's Zone may be a restatement of a sentence
+//     the operator wrote about a DIFFERENT identity. Measured: for `ge-0/0/1`
+//     with unit 0 in `lan` and unit 1 in `dmz`, the BASE row carries "dmz" — a
+//     zone nothing on that netdev was ever put in, chosen because "dmz" sorts
+//     before "lan".
+//   - snapshotLinuxName collapses several configured identities onto one netdev
+//     (a non-VLAN unit 0 onto its base; a RETH and its member, via ResolveReth;
+//     every unit of an interface-level tunnel onto the tunnel device).
 //
-//	| parent   | name     | equality actually tested |
-//	|----------|----------|--------------------------|
-//	| reth     | non-reth | L(R(parent)) = L(name)   |
-//	| non-reth | non-reth | L(parent)    = L(name)   |
-//	| reth     | reth     | L(R(parent)) = L(R(name))|
-//	| non-reth | reth     | L(parent)    = L(R(name))|
+// #6722 tried FOUR times to reconstruct that provenance downstream by
+// classifying rows — from the raw `redundant-parent` string, from co-resident
+// row names, from the set of netdevs a parent's rows occupy, and finally by
+// asking snapshotLinuxName about the parent's BASE row. Each spelling was holed
+// by a config shape it had not enumerated, because provenance is not recoverable
+// from the outcome: by the time a row exists, "the operator zoned this device"
+// and "something else was zoned and this row inherited the words" look identical.
+// The enumeration was the defect, not any particular missing case. So the answer
+// is computed once, here, where both inputs are in hand, and shipped.
 //
-// Rounds 4-6 of #6722 argued only the first two and called them exhaustive.
-// They are not, and rows 3 and 4 were both measured REACHABLE under strict
-// `CompileConfig` before round 7 — each one marking a `reth*` interface, the
-// L3 owner, as a projection. What empties them is a property of
-// `validateRethMemberStrict`, not a failed search: its reth clause rejects any
-// `reth*` name that declares a `redundant-parent`, and this loop only ever
-// considers a `name` that declares one, so `name` is never a `reth*` name and
-// `snapshotLinuxName(name)` is unconditionally `LinuxIfName(name)`. Rows 3 and
-// 4 are then structurally unreachable rather than merely unwitnessed.
+// THE RULES, in order. For each ifindex > 0:
 //
-// DEPENDENCY, stated because it is not local to this file. Row 2 — no RETH
-// involved at all, the two names merely CANONICALIZING together, e.g.
-// `redundant-parent ge-0-0-1` on `ge-0/0/1` where `/`->`-` makes both
-// `ge-0-0-1` — is closed by `validateInterfaceNameCollisionStrict` (#5832), a
-// DIFFERENT gate from `validateRethMemberStrict`, rejecting two distinct names
-// that canonicalize to one device. The deference premise ("a member is an L2
-// port, the reth owns the L3") does not hold there, because neither side is a
-// reth. This predicate's soundness rests on #5832, so relaxing it reopens row
-// 2. #5832 is likewise a warning on the tolerant load / peer-sync path, where
-// the shape is therefore admissible: measured, the marked row's empty vote is
-// withheld and the ledger resolves the zone the operator wrote on the OTHER
-// name for that same device — a fail-OPEN delta against master, bounded to a
-// zone the operator did write on that device, on a config that has already
-// emitted the #5832 hijack warning. Pinned by
-// TestCanonicalNameCollisionMarksWithoutAReth_6722.
+//  1. CONTESTED OWNERSHIP → no zone. An ifindex carrying two or more distinct
+//     egress identities describes one kernel device that the config claims
+//     twice. That is legitimate for exactly one relation — a redundant-ethernet
+//     interface and the member port it resolves onto — and a fiction otherwise.
+//     See egressIdentitiesCohere.
+//  2. AUTHORED → that zone. Every `security-zone <z> interfaces <ref>` the
+//     operator literally wrote, resolved to an ifindex by the row that ref
+//     names. Exactly one distinct zone on the ifindex wins; two or more is a
+//     real conflict about a real device and resolves to no zone.
+//  3. TRUNK CARRIER → the units' unanimous zone. An ifindex with no authored
+//     reference and NO logical unit row on it is a bare tagged-parent netdev:
+//     its children all live on `<dev>.<vlan>` devices of their own. Attributing
+//     the zone its units unanimously carry matches both origin/master and the
+//     #921/#3618 ingress rule, and it is what keeps a `vlan-tagging` RETH's base
+//     ifindex zoned (the reference cluster's `reth0`/ifindex 25). If ANY unit
+//     row is on the ifindex, this rule does not fire: that unit is an identity
+//     on the device in its own right and rule 2 already had its say.
+//  4. Otherwise no zone. Rendered as "" and read by the helper as the 0
+//     sentinel, against which evaluate_policy_result_l3_aware matches no rule
+//     and the default policy decides.
 //
-// Rows 3 and 4 have the same tolerant-path status as row 2: the reth clause is
-// a warning there too, so a grandfathered config can still present a `reth*`
-// candidate and the mark still lands. What bounds it is NOT any property of
-// what the marked interface carries — measured, a marked reth on the tolerant
-// path can carry BOTH its own logical units and its own zone, because the
-// gate's unit clause is downgraded on that path exactly like the reth clause.
-// Two structural facts bound it instead, and both are bound by tests:
+// WHAT THIS MAKES UNREPRESENTABLE. There is no longer any per-row
+// classification predicate on the dataplane side — no "is this row a
+// projection", no exemption list, nothing for a new config shape to disagree
+// with. A row's Zone is never consulted to adjudicate; it is used only as
+// corroboration at the helper boundary (see populate_interfaces).
 //
-//  1. A marked row's vote is only ever WITHHELD when it is EMPTY. The Rust gate
-//     is `reth_projection && zone.is_empty()`, so a marked row that names a
-//     zone still votes. Withholding therefore cannot discard a zone the
-//     operator wrote; it can only let the ifindex resolve a zone another row on
-//     it named, or leave it with no contributing row and answer the 0 sentinel.
-//  2. UNIT rows are never marked — `buildInterfaceSnapshots` stamps
-//     `RethProjection: false` on every unit row unconditionally, so the mark can
-//     never silence an independently addressed L3 interface.
-//
-// It does NOT follow that a marked base row's units hold its ifindex ambiguous.
-// An earlier version of this comment said so; that is true only for a non-VLAN
-// unit 0, which collapses onto the base netdev. `snapshotLinuxName` sends a VLAN
-// unit to `L(R(name)).<vlan>` — a DIFFERENT netdev — so it votes on its own
-// ifindex and says nothing about the base's. Measured on `reth1 unit 100 vlan-id
-// 100` beside a zoned `reth0`: ifindex 31 carries only the zoned reth0 rows and
-// the unzoned MARKED reth1 row, so it resolves `lan` — where the same config
-// with `unit 0` puts `reth1.0` on ifindex 31 as well and resolves the 0
-// sentinel.
-//
-// A STRONGER bound holds for row 3 specifically: the mark is RUNTIME-INERT.
-// A row-3 mark requires `S(parent) == S(name)` with both `reth*`. `S(name)` is
-// `L(R(name))`, which is the marked reth's OWN name unless some interface
-// declares it as a redundant parent; if one does, `R(parent)` is a member of
-// `parent` and `R(name)` a member of `name`, two different interfaces, so the
-// equality needs a canonicalization collision — which is #5832's shape, not this
-// one. So absent a #5832 collision a row-3 mark always lands on the netdev name
-// `rethN`, and on the bondless-RETH model this whole mechanism exists for, a
-// reth is not a kernel device: `buildLinkSnapshot` resolves by name and answers
-// ifindex 0, and both `populate_interfaces` and `populate_egress` skip
-// `ifindex <= 0`. The row never reaches the ledger. Row 4 is NOT inert — its
-// netdev is a real physical member's — and is bounded by (1) instead.
-//
-// Pinned by TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722.
-//
-// The remaining `parent != name` test is the definition of a parent relation,
-// not a clause excluding a case: nothing is its own redundant parent, and a
-// self-reference makes `ResolveReth` a no-op so the comparison would otherwise
-// be trivially true and report an interface as a projection of ITSELF.
-// `validateRethMemberStrict` (pkg/config/compiler_validate_strict_reth_member.go)
-// rejects that config at commit; on the tolerant load / peer-sync path, where
-// that gate is downgraded to a warning (#1960 no-brick), this test is what keeps
-// that false fact off the wire. It is NOT what holds the zone line there:
-// measured on the self-parent shape (`st0` self-parenting, zone on `st0.1`),
-// dropping the test marks `st0`, but `buildInterfaceZoneMap`'s `out[base]` write
-// has already stamped the base row `vpnb`, so the Rust gate
-// `reth_projection && zone.is_empty()` is false and the row still votes. The
-// zone line is held by that base-row-only stamp plus the `out[base]` write —
-// see cell J in reth_member_projection_6722_test.go.
-//
-// Keyed by interface name because after `validateRethMemberStrict` a member has
-// exactly ONE row: the gate rejects a member carrying its own logical units, so
-// there are no member unit rows to classify. `buildInterfaceSnapshots` stamps
-// this on the BASE row only — a member unit that reaches the builder anyway,
-// through the lenient path, is an independently addressed L3 interface and must
-// keep voting, which leaves its ifindex ambiguous and fail-CLOSED.
-func rethProjectionMembers(cfg *config.Config) map[string]bool {
-	out := make(map[string]bool)
-	for name, iface := range cfg.Interfaces.Interfaces {
-		if iface == nil || iface.RedundantParent == "" || iface.RedundantParent == name {
+// WHAT IT DOES NOT. "A reth member is a bare L2 port" (egressMemberIsBarePort)
+// is a MODEL rule imported from Junos, not something derivable from the config,
+// and it stays a definition. It is now stated positively in one place and read
+// by both the commit gate (validateRethMemberStrict) and this builder, rather
+// than existing as a growing list of rejected shapes.
+func stampEgressZones(cfg *config.Config, out []InterfaceSnapshot, idents []egressRowIdentity, authored map[string]string) {
+	if cfg == nil || len(out) == 0 || len(out) != len(idents) {
+		return
+	}
+	type ifxState struct {
+		identities  map[string]string // identity -> owner
+		authored    map[string]bool
+		hasUnitRow  bool
+		rowsByIndex []int
+	}
+	states := make(map[int]*ifxState)
+	order := make([]int, 0, len(out))
+	for i := range out {
+		ifx := out[i].Ifindex
+		if ifx <= 0 {
 			continue
 		}
-		parent := cfg.Interfaces.Interfaces[iface.RedundantParent]
-		if parent == nil {
-			continue
+		st := states[ifx]
+		if st == nil {
+			st = &ifxState{identities: map[string]string{}, authored: map[string]bool{}}
+			states[ifx] = st
+			order = append(order, ifx)
 		}
-		parentNetdev := snapshotLinuxName(cfg, iface.RedundantParent, parent, nil)
-		if parentNetdev != "" && parentNetdev == snapshotLinuxName(cfg, name, iface, nil) {
-			out[name] = true
+		st.identities[idents[i].identity] = idents[i].owner
+		if idents[i].isUnit {
+			st.hasUnitRow = true
+		}
+		st.rowsByIndex = append(st.rowsByIndex, i)
+		// Rule 2's input: an authored reference NAMING THIS ROW. Keyed by the
+		// row's own name, so the ref lands on whatever ifindex the builder
+		// resolved that name to — the same aliasing, not a second opinion.
+		if z := authored[out[i].Name]; z != "" {
+			st.authored[z] = true
 		}
 	}
-	return out
+	sort.Ints(order)
+	for _, ifx := range order {
+		st := states[ifx]
+		zone := ""
+		switch {
+		case !egressIdentitiesCohere(cfg, st.identities):
+			zone = ""
+		case len(st.authored) == 1:
+			for z := range st.authored {
+				zone = z
+			}
+		case len(st.authored) > 1:
+			zone = ""
+		case !st.hasUnitRow:
+			zone = unanimousUnitZone(cfg, st.identities, authored)
+		}
+		for _, i := range st.rowsByIndex {
+			out[i].EgressZone = zone
+		}
+	}
+}
+
+// egressIdentitiesCohere reports whether the egress identities sharing one
+// ifindex describe a device the config claims coherently (#6722).
+//
+// One identity always coheres. Exactly two cohere only when one is a
+// redundant-ethernet interface and the other is a bare member port that names it
+// — the single relation under which two configured identities are DESIGNED to be
+// one netdev (`ResolveReth`, pkg/config/types.go). Three or more never cohere:
+// a reth resolves onto exactly one member, so a third claimant is always a
+// second, unrelated claim on the same device.
+//
+// Everything the ledger used to enumerate falls out of this:
+//
+//   - The reference bondless cluster — `{ge-0/0/1, reth1}` on ifindex 24 —
+//     coheres, which is the whole point of #6722: the member's rows must not
+//     make the RETH's own zone ambiguous.
+//   - An `interfaces ge-0-0-1` / `interfaces ge-0/0/1` canonicalization
+//     collision (#5832) does NOT cohere — neither side is a reth, so the
+//     deference premise ("the member is a port, the reth owns the L3") is
+//     absent. It fails closed, retiring the fail-OPEN delta the previous
+//     spelling admitted for that shape on the tolerant path.
+//   - A reth that names a redundant parent of its own does NOT cohere: a reth is
+//     never a member port. validateRethMemberStrict rejects it at commit; on the
+//     tolerant load / peer-sync path, where that gate is a warning (#1960
+//     no-brick), this is what holds the line.
+//   - A WireGuard or other tunnel interface named as a member does NOT cohere.
+//     A tunnel is an independently routed L3 endpoint, not a port, and the one
+//     that reaches the builder anyway carries its own routes onto the shared
+//     ifindex.
+//   - A member carrying its OWN logical units does NOT cohere. Its units are
+//     independently addressed L3 interfaces on the shared device, and their lack
+//     of a zone is a real operator statement.
+func egressIdentitiesCohere(cfg *config.Config, identities map[string]string) bool {
+	if len(identities) <= 1 {
+		return true
+	}
+	if len(identities) > 2 {
+		return false
+	}
+	owners := make([]string, 0, 2)
+	for _, owner := range identities {
+		owners = append(owners, owner)
+	}
+	if owners[0] == owners[1] {
+		// Two identities of ONE interface on one netdev — two units of an
+		// interface-level tunnel, say. The operator described two logical
+		// interfaces; the kernel gives them one device. Nothing designates
+		// either as the other's port, so the device identifies no single zone.
+		return false
+	}
+	return egressRethMemberOf(cfg, owners[0], owners[1]) ||
+		egressRethMemberOf(cfg, owners[1], owners[0])
+}
+
+// egressRethMemberOf reports whether `member` is a valid redundant-ethernet
+// member port of `reth` (#6722): `reth` is a reth interface, `member` names it
+// as its `gigether-options redundant-parent`, and `member` is a bare L2 port.
+func egressRethMemberOf(cfg *config.Config, member, reth string) bool {
+	if !strings.HasPrefix(reth, "reth") {
+		return false
+	}
+	if cfg.Interfaces.Interfaces[reth] == nil {
+		return false
+	}
+	ifc := cfg.Interfaces.Interfaces[member]
+	if ifc == nil || ifc.RedundantParent != reth {
+		return false
+	}
+	return egressMemberIsBarePort(member, ifc)
+}
+
+// egressMemberIsBarePort states POSITIVELY what a redundant-ethernet member is
+// allowed to be: a port that contributes a netdev and nothing else (#6722).
+//
+// Junos models a reth as ONE interface described by several nodes — the `rethN`
+// node owns the logical units, addresses, security zone and CoS, and each member
+// node contributes only a physical port. That model is why a member's row may
+// share the reth's ifindex without making it ambiguous, so the model's
+// conditions are exactly the conditions of the deference. An interface that
+// carries its own logical units, its own tunnel, or that is itself a reth has an
+// L3 identity of its own and is not a port.
+//
+// validateRethMemberStrict (pkg/config/compiler_validate_strict_reth_member.go)
+// rejects each of these at commit and quotes this rule; this is the runtime half
+// that must hold on the tolerant load / peer-sync path, where those rejections
+// are downgraded to warnings (#1960 no-brick).
+func egressMemberIsBarePort(name string, ifc *config.InterfaceConfig) bool {
+	if ifc == nil || strings.HasPrefix(name, "reth") {
+		return false
+	}
+	if ifc.Tunnel != nil {
+		return false
+	}
+	_, hasUnit := firstConfiguredUnit(ifc)
+	return !hasUnit
+}
+
+// firstConfiguredUnit reports the lowest configured (non-nil) logical unit of
+// ifc. A present-but-nil unit slot (tolerant load / HA config-sync, #3494/#5068)
+// is not a configured unit.
+func firstConfiguredUnit(ifc *config.InterfaceConfig) (int, bool) {
+	lowest, found := 0, false
+	for num, unit := range ifc.Units {
+		if unit == nil {
+			continue
+		}
+		if !found || num < lowest {
+			lowest, found = num, true
+		}
+	}
+	return lowest, found
+}
+
+// unanimousUnitZone implements rule 3 of stampEgressZones: the zone that every
+// AUTHORED unit reference of the interfaces claiming this ifindex agrees on, or
+// "" if they disagree or none exists (#6722).
+//
+// Only reached for an ifindex with no authored reference of its own AND no unit
+// row on it — a bare tagged-parent netdev whose children all live on their own
+// `<dev>.<vlan>` devices. Unzoned units are skipped rather than counted as
+// dissent: they are not on this netdev and say nothing about it.
+func unanimousUnitZone(cfg *config.Config, identities map[string]string, authored map[string]string) string {
+	seen := ""
+	for _, owner := range identities {
+		ifc := cfg.Interfaces.Interfaces[owner]
+		if ifc == nil {
+			continue
+		}
+		for num, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			z := authored[fmt.Sprintf("%s.%d", owner, num)]
+			if z == "" {
+				continue
+			}
+			if seen != "" && seen != z {
+				return ""
+			}
+			seen = z
+		}
+	}
+	return seen
 }
 
 // buildLinkSnapshot resolves a kernel interface's live ifindex/MTU/MAC/addresses.

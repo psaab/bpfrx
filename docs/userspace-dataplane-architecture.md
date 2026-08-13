@@ -845,16 +845,12 @@ Scope of the fallback:
      and reading it would hand the quarantine's deliberate default-deny back the
      survivor's zone.
 
-  So the fallback reads `ifindex_unambiguous_zone_id`, built in
-  `populate_interfaces` over ALL snapshot rows — zoned and unzoned alike. An
-  ifindex appears there only when every CONTRIBUTING row sharing it named the
-  SAME nonzero zone — a RETH member's row is a projection rather than an
-  independent observer and is exempt from voting (#6722 B2, below), so
-  unanimity is over the observers rather than over the raw row set;
-  disagreement (including "one row zoned, one row not") and unanimous "no
-  zone" are both absent, and `egress_zone_id` then resolves the **0 sentinel** —
-  the pre-#6713 answer, against which no exact, wildcard or `junos-global` rule
-  matches, so the default policy decides.
+  So the fallback reads `ifindex_unambiguous_zone_id`, which carries an ifindex
+  only when the **Go builder** decided that ifindex identifies exactly one zone
+  and a row on it corroborated the name. An ifindex Go left with no answer, and
+  one whose claim no row supports, are both absent, and `egress_zone_id` then
+  resolves the **0 sentinel** — the pre-#6713 answer, against which no exact,
+  wildcard or `junos-global` rule matches, so the default policy decides.
 
   This deliberately makes the two DIRECTIONS disagree for an ambiguous ifindex:
   ingress still attributes an arriving packet to `ifindex_to_zone_id`
@@ -910,208 +906,179 @@ Scope of the fallback:
   source and cannot disagree. Where the rows agree the value is identical to the
   row's own zone, so an ordinary single-unit interface is unaffected.
 
-- **A RETH member's row is a PROJECTION, not an observer (#6722 B2).**
-  A ledger is only sound if every row voting on an ifindex is an INDEPENDENT
-  observer of it. There is a third way several rows land on one ifindex, and it
-  is the only one that reaches a shipped topology: `ResolveReth`
-  (`pkg/config/types.go`) resolves a RETH to its PHYSICAL MEMBER, and
-  `snapshotLinuxName` applies it to the reth base row AND its units. So
-  `ge-0/0/1`, `reth1` and `reth1.0` are one netdev, and a member's own units
-  alias the matching reth unit the same way — a VLAN unit resolves to
-  `LinuxIfName(ResolveReth(base)).<vlan>`, putting `ge-0/0/1.100` on
-  `reth1.100`.
+- **The egress answer is decided in Go, and the helper corroborates it
+  (#6722 round 10).** `stampEgressZones`
+  (`pkg/dataplane/userspace/interfaces.go`) computes, per ifindex, the zone that
+  ifindex egresses into, and ships it as `InterfaceSnapshot.egress_zone`.
+  `populate_interfaces` reads it and adjudicates nothing.
 
-  Junos configs conventionally zone the RETH rather than the member, so
-  `buildInterfaceZoneMap` usually leaves the member's rows unzoned and
-  `buildInterfaceSnapshots` emits them unfiltered. This is convention, not a
-  code property — `buildInterfaceZoneMap` enforces no such rule and a config
-  zoning the member yields a zoned member row (measured:
-  `zoneByInterface[ge-0/0/1] = "z214"`). The gate does not rely on it; its
-  `zone.is_empty()` half handles the exception.
+  **Why the decision had to move.** Rounds 4 through 9 built the answer in Rust
+  by polling the rows — "do all rows on this ifindex agree?" — and exempting the
+  rows whose agreement or dissent was an artefact rather than an observation.
+  NINE spellings of that exemption were produced across the issue's life and
+  every one was holed by a config shape it had not enumerated: the raw
+  `redundant-parent` string re-derived from row names; co-resident row names;
+  the SET of netdevs the parent's rows occupy; and finally `snapshotLinuxName`
+  of the parent's BASE row, which was holed three more times in one round (a
+  multi-unit base row whose zone is fanned up from a sibling unit and votes
+  against unit 0; an AUTHORED dotted name `ge-0/0/1.100` aliasing `reth1.100`;
+  a WireGuard interface named as a reth member, which inherited the reth's zone
+  — the one fail-OPEN of the set).
+
+  The reason is structural. A row's `zone` is the OUTCOME of
+  `buildInterfaceZoneMap`'s derivation: a unit-suffixed reference also writes
+  `out[base]`, and a bare reference also writes `out[base.<unit>]` for every
+  unit. By the time a row exists, "the operator zoned this identity" and "some
+  other identity was zoned and this row inherited the words" are
+  indistinguishable — and several identities land on ONE netdev
+  (`snapshotLinuxName` collapses a non-VLAN unit 0 onto its base, a RETH onto
+  its member via `ResolveReth`, and every unit of an interface-level tunnel onto
+  the tunnel device). Provenance is not recoverable downstream from the outcome.
+  **The enumeration was the defect, not any particular missing case.**
+
+  So the provenance is carried instead. `authoredZoneRefs`
+  (`pkg/dataplane/userspace/zones.go`) records the operator's literal
+  `security-zone <z> interfaces <ref>` bindings before any fan-up or fan-down,
+  and `stampEgressZones` resolves them through the same aliasing the builder
+  performs. Three rules, in order:
+
+  1. **Contested ownership → no zone.** An ifindex carrying two or more distinct
+     egress identities is one kernel device the config claims twice. That is
+     legitimate for exactly one relation — a reth and the bare member port that
+     names it (`egressRethMemberOf` / `egressMemberIsBarePort`) — and a fiction
+     otherwise.
+  2. **Authored → that zone.** Every literal binding, resolved to an ifindex by
+     the row whose name it uses. Exactly one distinct zone wins; two or more is
+     a real conflict about a real device and resolves to no zone.
+  3. **Trunk carrier → the units' unanimous zone.** An ifindex with no authored
+     binding and NO logical unit row on it is a bare tagged-parent netdev whose
+     children all live on their own `<dev>.<vlan>` devices. It takes the zone its
+     units unanimously name — which is what keeps the reference cluster's
+     `reth0` base (ifindex 25) zoned `wan`, matching `origin/master`.
+
   Measured through the full `buildSnapshot` on `docs/ha-cluster-userspace.conf`
   (node 0 — the topology `test/incus/loss-userspace-cluster.env` points every HA
   smoke test at):
 
   ```
-  ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]   <-- DISAGREE
-  ifindex 25: [ge-0/0/2="" reth0="wan"]                 <-- DISAGREE
+  ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]  -> egress_zone "lan" (rule 2)
+  ifindex 25: [ge-0/0/2="" reth0="wan"]                -> egress_zone "wan" (rule 3)
   DefaultPolicy="deny"
   ```
 
-  Counting the member's "no zone" as dissent held those ifindexes ambiguous,
-  collapsed the egress zone to the 0 sentinel and — under `deny-all` — blackholed
-  every WAN→LAN, sfmix→LAN and tunnel→LAN transit flow on a bondless-RETH
-  cluster. LAN→WAN survived because its egress ifindex has a single row, which is
-  why an iperf3 smoke in the usual direction came back green. The INGRESS half
-  was unaffected throughout (`ifindex_to_zone_id[24]` still carried `lan`); that
-  asymmetry is the diagnostic tell.
+  Before #6722 those ifindexes went ambiguous, collapsed the egress zone to the
+  0 sentinel and — under `deny-all` — blackholed every WAN→LAN, sfmix→LAN and
+  tunnel→LAN transit flow on a bondless-RETH cluster. LAN→WAN survived because
+  its egress ifindex has a single identity, which is why an iperf3 smoke in the
+  usual direction came back green. The INGRESS half was unaffected throughout
+  (`ifindex_to_zone_id[24]` still carried `lan`); that asymmetry is the
+  diagnostic tell.
 
-  So the Go builder marks a RETH physical member's **base row** with
-  `reth_projection`, and
-  `populate_interfaces` exempts a row that carries it **and has no zone of its
-  own** from voting. The `zone.is_empty()` half is
-  load-bearing: a member the operator EXPLICITLY zoned into a different zone than
-  its RETH is a real statement about a real conflict, not an artefact of one
-  device described by several rows, and it must keep failing closed
-  (`explicitly_zoned_reth_member_still_makes_the_ifindex_ambiguous_6722`). The
-  exemption reaches nothing else — `st0.0` and `wg0.0` are genuine logical units
-  and still vote (`reth_exemption_does_not_leak_to_iface_tunnel_units_6722`), and
-  `fab0` is not a fourth mechanism at all: the fabric IPVLAN is its own netdev
-  with its own ifindex (`snapshotLinuxName` never calls `ResolveFab`).
-- **`reth_projection` is decided in Go, not re-derived in the helper.** The
-  wire carries the ANSWER; `populate_interfaces` reads it and computes nothing.
-  That split is the fix, not an implementation detail. But deciding it in Go was
-  not sufficient on its own: **four** successive spellings each RE-DERIVED the
-  resolver's answer downstream, and each was holed by a config strict
-  `CompileConfig` then accepted. B1 carried the raw `redundant-parent` string on
-  the wire and re-derived from row names; the next two re-derived from
-  co-resident rows — the last of those holed by `set interfaces st0
-  gigether-options redundant-parent st0`, where `st0.0` matched its own
-  co-resident BASE row (base and unit-0 are one netdev by the non-VLAN unit-0
-  collapse), exempted itself, and flipped `egress_zone_id` from the fail-closed
-  `0` to `vpnb` (measured as `ledger[42]=Some(32521)`, `egress_zone_id=32521`,
-  `action=Permit`). The fourth re-derived from the SET of netdevs the parent's
-  rows occupy, and was holed by a member unit carrying its OWN address:
-  `ge-0/0/1 unit 0 family inet address 10.9.9.1/30` lands exactly where
-  `reth1.0` lands, so it satisfied the netdev-set test — while installing its
-  own connected route `10.9.9.0/30 -> 24` and being a genuinely independent L3
-  interface. Measured, a flow `203.0.113.7 -> 10.9.9.2` resolved
-  `to_zone=lan` and was `Permit`ted where clearing the mark gives `to_zone=0`,
-  `Deny`. **Reconstruction was the defect, not any particular clause.**
+- **What this makes unrepresentable, and what it does not.** There is no longer
+  any per-row classification predicate on the dataplane side — no "is this row a
+  projection", no exemption list, nothing for a new config shape to disagree
+  with. A row's `zone` is never consulted to adjudicate. What the helper still
+  does is CORROBORATE: an ifindex takes `egress_zone` only if some row on it
+  literally names that zone, so a version-drifted or hostile snapshot can never
+  conjure a zone no row on the ifindex named (the #2391/#2409/#2706
+  helper-boundary property). An absent, unknown or uncorroborated answer
+  resolves 0.
 
-  Two things replaced it.
+  What it does NOT make unrepresentable is the model rule itself. "A reth member
+  is a bare L2 port — no logical units, no tunnel, not itself a reth" is
+  imported from Junos and is irreducibly a definition. It now lives in one place,
+  stated positively, and is read by both halves:
+  `validateRethMemberStrict` (`pkg/config/compiler_validate_strict_reth_member.go`)
+  hard-rejects a violation at commit, and `egressMemberIsBarePort` applies the
+  same rule at runtime for the tolerant load / peer-sync path where that
+  rejection is downgraded to a warning (#1960 no-brick). A violation admitted
+  there leaves the shared device with two independent claimants, so its ifindex
+  identifies no zone and fails CLOSED.
 
-  **`validateRethMemberStrict`** (`pkg/config/compiler_validate_strict_reth_member.go`)
-  makes the incoherent memberships UNREPRESENTABLE at commit. Junos models a
-  reth as one interface — the `rethN` node owns the units, addresses and zone,
-  each member contributes a physical port — and four authored shapes break
-  that: a member naming **itself**, a **reth** naming a redundant parent of its
-  own, a member naming a parent that is **not configured**, and a member
-  carrying its **own logical units** (the fail-open above; Junos rejects unit
-  configuration on a reth child for the same reason). Strict on commit /
-  commit-check; downgraded to a warning on the tolerant load / peer-sync paths
-  (`lenientRethMember`) so a config committed before the gate still boots
-  (#1960).
+  The five rejected shapes: a member naming **itself**; a **reth** naming a
+  redundant parent of its own; a member naming a parent that is **not
+  configured**; a member carrying its **own logical units**; and a member
+  carrying its **own tunnel**. The last two are the fail-OPEN pair — an
+  independently addressed member unit, and an independently routed WireGuard
+  endpoint, each silently inheriting the reth's zone.
 
-  **`rethProjectionMembers`** (`pkg/dataplane/userspace/interfaces.go`) is then
-  the alias itself, asked of `snapshotLinuxName` — the function that CREATES it:
-  does the named parent's base row resolve to the same netdev as this
-  interface's base row? After the gate a member has exactly one row, so the only
-  question left is which of a RETH's declared members `RethToPhysical`'s
-  node-affinity scoring picked — and that comparison IS the resolver's answer,
-  with no second opinion to disagree with it. The mark is stamped on the base
-  row only, so a member unit arriving through the lenient path is never silenced.
-  For a non-VLAN unit 0 — which collapses onto the base netdev — that keeps the
-  shared ifindex ambiguous (fail-closed); a VLAN unit lands on its own netdev and
-  bears on its own ifindex instead (#6722 round 9). The bound that holds in BOTH
-  cases is the Rust gate's `zone.is_empty()` conjunct: a withheld vote is always
-  an empty one.
+- **The snapshot wire contract moved to version 5 (#6722 round 10).** This
+  round DELETES `reth_projection` and ADDS `egress_zone`. A deletion cannot ride
+  an unchanged version the way this repo's additive fields do: two binaries built
+  either side of it both advertise the same number and read the same bytes
+  differently, and the number that would have collided is 4 — the one master
+  ships.
 
-  Note that a NAME can still satisfy the predicate — `ge-0/0/1.100` really does
-  resolve onto `reth1.100`'s netdev. That is not a hole; it is why the answer is
-  taken from the resolution rather than from the shape of the operator's string.
+  The mixed pairing is not an intermediate state. Measured, feeding the v4 Go
+  builder's rows to the v5 helper on `docs/ha-cluster-userspace.conf` (node 0):
 
-  **The case split over that comparison is FOUR-way, not two** (#6722 round 7;
-  rounds 4-6 argued two branches and called them exhaustive — they are not).
-  `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed
-  name and `LinuxIfName(x)` otherwise, and it is applied to the PARENT and to
-  the CANDIDATE, so each side takes either arm independently. Writing `L` for
-  `LinuxIfName` and `R` for `ResolveReth`:
+  ```
+  ifindex 24   egress zone 0    (origin/master and the matched v5 pair: lan)
+  ifindex 25   egress zone 0    (origin/master and the matched v5 pair: wan)
+  ```
 
-  | parent | candidate | equality actually tested | status |
-  |--------|-----------|--------------------------|--------|
-  | reth | non-reth | `L(R(parent)) = L(candidate)` | the designed case |
-  | non-reth | non-reth | `L(parent) = L(candidate)` | closed by **#5832** |
-  | reth | reth | `L(R(parent)) = L(R(candidate))` | closed by the reth clause |
-  | non-reth | reth | `L(parent) = L(R(candidate))` | closed by the reth clause |
+  Ifindex 25 is the one that settles it — the mixed pairing loses a zone even the
+  PRE-#6722 helper resolved, so it is strictly worse than either endpoint. Under
+  `default-policy deny-all` that is a silent transit outage carrying a version
+  both halves agree on.
 
-  Rows 3 and 4 were measured REACHABLE under strict `CompileConfig` at
-  `195fcad51`, with `origin/master` (`edefb7570`) as the control — master
-  accepts the same configs and marks nothing, so the mark is a delta this work
-  introduces. `set interfaces reth1 gigether-options redundant-parent reth0`
-  gives `RethToPhysical[reth0] = reth1`, so `S(reth0) = S(reth1) = "reth1"` and
-  **reth1 — the L3 owner — is marked a projection of reth0**, while reth0's own
-  rows land on the netdev name `reth1` that no NIC carries. The membership
-  two-cycle (`ge-0/0/1 redundant-parent reth1` beside `reth1 redundant-parent
-  ge-0/0/1`) marks **both** rows on the one ifindex. A non-cycling `reth1
-  redundant-parent ge-0/0/1` marks nothing, but `ResolveKernelIfName`
-  (`pkg/config/types.go`) reads `RethToPhysical` UNGATED for a dotted ref, so
-  `ge-0/0/1.0` DISPLAYS as `reth1` while the dataplane binds `ge-0-0-1` — a
-  resolver split master shares. In each of the first two the mark converts an
-  ifindex that answered the 0 sentinel into one that resolves a zone. The
-  mechanism differs on the two sides: master has no agreement ledger —
-  `populate_egress` inserts one `egress` entry per snapshot row keyed by
-  ifindex, so the LAST row wins, and `egress_zone_id` reads that map and
-  answers 0 when the last row on the ifindex is unzoned. The ledger added here
-  is what makes 0 the principled answer to DISAGREEMENT rather than an artifact
-  of row order.
+  `ensureEgressZoneProtocolLocked` (`pkg/dataplane/userspace/manager_compile.go`)
+  is the paired required-protocol gate. It is keyed on **equality**, not `>=`:
+  the helper's own `apply_snapshot` / `bump_fib_generation` gates are
+  exact-equality, so a helper NEWER than xpfd refuses our snapshot too, and a
+  `> N` spelling stays green at exactly the colliding value. It takes no config —
+  every snapshot carries `EgressZone`, so there is no shape to test — but it IS
+  conditional on having observed a helper version, because firing on "version
+  unknown" would abort every commit made while the helper is down (#1960
+  no-brick). **Operator ordering: upgrade xpfd and the helper together;
+  `make cluster-deploy` / `make test-deploy` already push and restart both.** A
+  partial upgrade is refused loudly with the observed version and the remedy
+  named.
 
-  The reth clause of `validateRethMemberStrict` empties rows 3 and 4 as a
-  property of the code, not as a failed search: `rethProjectionMembers` only
-  considers a candidate that declares a `redundant-parent`, so once no `reth*`
-  name may declare one, the candidate side is unconditionally
-  `LinuxIfName(name)` and both rows are unreachable. Its test is
-  `strings.HasPrefix(name, "reth")` — the identical test `snapshotLinuxName`
-  uses to decide whether to resolve, so the two cannot drift.
+  **What "refused" costs, corrected — this is NOT a keep-forwarding outcome.**
+  An earlier revision of this section claimed the running helper keeps
+  forwarding its previous-good image. Measured, it does not, and the two
+  outcomes have opposite availability profiles:
 
-  **Row 2's exclusion depends on #5832, and that dependency is not local.**
-  There **no reth is involved at all** and the two names merely CANONICALIZE
-  together — `set interfaces ge-0/0/1 gigether-options redundant-parent
-  ge-0-0-1`, with `/`->`-` making both `ge-0-0-1`. The deference argument above
-  says nothing about that branch, because neither side is a reth. What excludes
-  it is `validateInterfaceNameCollisionStrict` (**#5832**) — a different gate
-  from `validateRethMemberStrict`, rejecting two distinct names that
-  canonicalize to one Linux device. Relaxing #5832 reopens this, which is why
-  `TestCanonicalNameCollisionMarksWithoutAReth_6722` asserts the strict
-  rejection as a fail-on-revert guard. The reth clause is deliberately NOT
-  widened to "a redundant-parent must NAME a reth", which would also close row
-  2 — a second gate rejecting that test's config would leave it green with
-  #5832 relaxed, retiring the only fixture that binds the dependency.
+  - A bump with **no** gate would leave the helper to refuse the snapshot at
+    its own exact-equality check, keeping its previous-good image — available,
+    but with the failure legible only as a generic apply error.
+  - A bump **with** the gate, which is what this PR does, refuses in the
+    control plane FIRST: `ErrEgressZoneProtocolIncompatible` is a
+    required-protocol sentinel, so `disarmSnapshotProtocolFailClosedLocked`
+    DISARMS the helper and the commit aborts (#2138). Transit falls to the
+    kernel path — fail-CLOSED, deliberately, and consistent with every other
+    member of `requiredProtocolGateSentinels`.
 
-  On the tolerant load / peer-sync path #5832 is a warning too, so the shape is
-  admissible there. Measured: `ge-0/0/1` is marked with an empty zone, `ge-0-0-1`
-  carries `lan`, both on ifindex 24; the marked row's vote is withheld and the
-  ledger resolves `lan` where `origin/master`'s row-sourced last-write-wins gave
-  the 0 sentinel. That is a fail-OPEN delta, accepted on narrow and stated
-  grounds: it cannot reach the commit path, the config has already emitted
-  #5832's hijack warning naming that exact device, and the zone resolved is one
-  the operator did write on it. The same test records that behaviour so a change
-  to it is loud rather than silent.
+  `pkg/dataplane/userspace/egress_zone_failclosed_6722_test.go` measures this
+  against a recording helper rather than arguing it from the call graph: the
+  sentinel is returned, a `set_forwarding_state{Armed:false}` really reaches
+  the helper, and NO `apply_snapshot` is sent — nothing is half-applied. A
+  matched-version control proves the gate does not fence the ordinary path.
 
-  The cells are pinned in
-  `pkg/dataplane/userspace/reth_member_projection_6722_test.go`: the rejections
-  in `TestRethMemberWithOwnUnitsIsRejected_6722`,
-  `TestSelfNamedRedundantParentIsRejected_6722`,
-  `TestUnconfiguredRedundantParentIsRejected_6722` and
-  `TestRethNamingARedundantParentIsRejected_6722` (each also asserting the
-  tolerant path still ADMITS with a warning), what the tolerant path then does
-  with rows 3 and 4 in
-  `TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722`, the alias
-  comparison in
-  `TestPeerNodeRethMemberIsNotAProjection_6722` and
-  `TestRedundantParentThatDoesNotAliasMarksNothing_6722`, the lenient-path
-  fail-closed backstop in `TestGrandfatheredMemberUnitStillVotes_6722`, and the
-  cross-gate #5832 dependency in
-  `TestCanonicalNameCollisionMarksWithoutAReth_6722`.
+- **A deliberate behaviour change beyond the four findings: the #5832
+  canonical collision (#6722 round 10).** Two interface names that merely
+  CANONICALIZE onto one device (`ge-0/0/1` and `ge-0-0-1`), with a
+  `redundant-parent` between them and no reth anywhere, are rejected at commit
+  by `validateInterfaceNameCollisionStrict` but ADMITTED on the tolerant load /
+  peer-sync path. Measured on all three trees:
 
-  A `reth*` with no declared `redundancy-group` is no longer a special case
-  here. `ResolveReth` resolves it onto its member regardless of the redundancy
-  group, so the predicate does too — the earlier `redundancy-group N` clause
-  made the predicate disagree with the resolver that creates the alias, which
-  left such an ifindex at the `0` sentinel while the RETH's row plainly named a
-  zone. Every RETH config in this repository declares a redundancy group; the
-  `rethRG` lookup in the same file still requires one for its own purpose
-  (inheriting the HA flow-cache redundancy group onto member rows).
+  ```
+  origin/master (edefb7570)   egress_zone_id(24) = 0
+  PR head c9b020695           resolves `lan`        <-- fail-OPEN
+  now                         egress_zone_id(24) = 0
+  ```
 
-  The field is additive in both directions — `omitempty` on the Go side,
-  `#[serde(default)]` on the Rust side, and no `deny_unknown_fields` anywhere in
-  `userspace-dp/src/protocol` — and the DEGRADED direction is the fail-CLOSED
-  one under the reference cluster's `default-policy deny-all`: an old helper
-  ignores the key, an old Go binary omits it, and in both cases the member votes
-  and the ifindex stays ambiguous. Read the next bullet before calling that
-  "safe" without qualification — under `permit-all` the same degraded direction
-  is fail-OPEN, and the two bullets contradicted each other until #6722's
-  re-gate.
+  At the previous head the collision row is marked a projection, its empty vote
+  is withheld, and the ledger resolves the zone the operator wrote on the OTHER
+  name for that same device — a fail-OPEN this document previously admitted in
+  passing. `egressRethMemberOf` requires the PARENT to be a `reth*`, so neither
+  name is the other's member port and the device's ownership is contested. The
+  net effect is a RESTORATION of master, retiring a delta an earlier round of
+  this PR introduced; it is recorded here as its own change rather than as a
+  side effect because the config is accepted on the tolerant path and an
+  operator who has one will see the difference. Pinned by cell E4 of
+  `pkg/dataplane/userspace/egress_zone_identity_6722_test.go`.
 
 - **Both directions of the 0 sentinel, stated.** The sections above argue the
   fail-CLOSED consequence because that is what the reference cluster runs
@@ -1137,28 +1104,30 @@ Scope of the fallback:
   ledger adds is the enforcement: the gate now covers BOTH arms, so the
   pre-existing case is closed rather than merely narrowed.
 
-- A row that exists carrying `zone_id == 0` still stays 0. That short-circuit is
-  **load-bearing, not defensive**: a zoned trunk with a declared but unzoned
-  unit 0 (`ge-0/0/9` zoned `lan`, `ge-0/0/9.0` in no zone, both MAC-ful, both
-  ifindex 90) must resolve 0, and
-  `unzoned_interface_with_egress_row_stays_zone_zero_6713` reds on its removal.
+- **`egress_zone_id` no longer has an `egress` arm, and the reason is worth
+  recording.** Through round 9 it read `state.egress` first and fell back to the
+  ledger, with a `Some(0)` short-circuit documented as load-bearing. It stopped
+  being either once `populate_egress` began sourcing `EgressInterface::zone_id`
+  from the SAME ledger: `egress[i].zone_id` is then the ledger's value for `i`,
+  or 0 where the ledger has no entry, so both arms returned the same number for
+  every state and the short-circuit could not fire on one they would have
+  answered differently. Its claimed binder,
+  `unzoned_interface_with_egress_row_stays_zone_zero_6713`, had gone VACUOUS
+  accordingly — filtering zero before `or_else` still returned 0. The resolver is
+  now a single map read, exactly equivalent for every state and with no branch
+  left to mutate; the surviving binding is on the MAP it reads.
 
   For an ifindex that HAS an egress row the resolved to-zone is **not**
-  universally bit-identical to the pre-#6713 read, and an earlier revision of
-  this section wrongly claimed it was. It is bit-identical for every ifindex
-  whose rows AGREE — which is every ordinary single-unit interface, and so the
-  overwhelming majority — and it is deliberately DIFFERENT where they disagree.
-  `[Z, 0, Z]` is the direct counterexample: the pre-#6713 read returned the last
-  row's `Z`, the ledger returns `0`. That change IS the point of #6722, not an
-  incidental side effect, and it is the one case where an egress-row interface's
-  adjudicated to-zone moves.
+  universally bit-identical to the pre-#6713 read. It is bit-identical for every
+  ifindex whose identities agree — every ordinary single-unit interface, and so
+  the overwhelming majority — and it is deliberately DIFFERENT where they do
+  not. `origin/master` answered whichever row `populate_egress` wrote last,
+  which made the adjudicated zone a function of interface NAMING: for `ge-0/0/1`
+  with unit 0 in `lan` and unit 1 in `dmz`, master answers unit 0's `lan` only
+  because `ge-0/0/1.0` sorts after `ge-0/0/1`. Deciding it from the operator's
+  authored bindings gives the same `lan` for a stated reason rather than a
+  sorting accident.
 
-  Before #6722 B1 that outcome held only by EMISSION-ORDER luck — the unzoned
-  unit-0 row happened to be written last, so 0 won the last-write. Reverse the
-  order, as the WireGuard shape does, and the zone won instead. Sourcing the
-  egress row's zone from the ledger makes the short-circuit correct **by
-  construction**: an ifindex whose rows disagree carries 0 regardless of which
-  row the builder emits last.
 - `egress_zone_id` is the single egress-zone resolver: policy adjudication, the
   #3651 per-zone traffic counter, the filter-log `egress_zone_id` field (both
   the flow-cache-hit path via `filter_log_egress_zone_id` and

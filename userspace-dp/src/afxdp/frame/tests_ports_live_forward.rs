@@ -869,6 +869,14 @@ fn build_live_forward_request_emits_output_filter_log_event() {
         ..ForwardingState::default()
     };
     forwarding.ifindex_to_zone_id.insert(10, TEST_LAN_ZONE_ID);
+    // #6722: the EGRESS zone comes from `ifindex_unambiguous_zone_id`, not from
+    // the `egress` row. `populate_egress` sources `EgressInterface::zone_id`
+    // from this same map, so a hand-built state that sets one without the other
+    // models a state the builder cannot produce. Both are set here for that
+    // reason, not because the resolver reads both.
+    forwarding
+        .ifindex_unambiguous_zone_id
+        .insert(12, TEST_WAN_ZONE_ID);
     forwarding.egress.insert(
         12,
         EgressInterface {

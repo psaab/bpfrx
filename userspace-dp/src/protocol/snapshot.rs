@@ -64,40 +64,44 @@ pub(crate) struct InterfaceSnapshot {
     pub local_fabric_member: String,
     #[serde(rename = "redundancy_group", default)]
     pub redundancy_group: i32,
-    /// #6722: this row's netdev is ALREADY described by a RETH's own row, so
-    /// the row is a PROJECTION of that row rather than an independent observer
-    /// of the netdev. Consumed for exactly one purpose — the agreement ledger
-    /// in `forwarding_build::interfaces` withholds a projection's zone vote.
+    /// #6722: the security zone this row's IFINDEX egresses into, or "" for
+    /// none. Decided by the Go builder (`stampEgressZones`,
+    /// `pkg/dataplane/userspace/interfaces.go`); every row sharing an ifindex
+    /// carries the SAME value.
     ///
-    /// `ResolveReth` (`pkg/config/types.go`) collapses a RETH onto its
-    /// physical member's netdev, so `ge-0/0/1`, `reth1` and `reth1.0` are ONE
-    /// ifindex. Junos zones the RETH, never the member, so the member's row
-    /// arrives unzoned; counting that "no zone" as a dissenting vote makes the
-    /// RETH's own zone ambiguous and collapses the egress zone to the 0
-    /// sentinel.
+    /// It is NOT `zone` under another name. `zone` is this row's own zone and
+    /// feeds the INGRESS attribution (`ifindex_to_zone_id`, #921/#3618).
+    /// `egress_zone` answers "does this ifindex identify exactly one zone",
+    /// which is the only question the egress half may safely ask once several
+    /// configured identities share one netdev — `snapshotLinuxName` collapses a
+    /// non-VLAN unit 0 onto its base, a RETH onto its member, and every unit of
+    /// an interface-level tunnel onto the tunnel device.
     ///
-    /// This is a DECIDED FACT, not an input to a decision. The Go builder
-    /// (`rethProjectionMembers`, `pkg/dataplane/userspace/interfaces.go`) owns
-    /// it because that is where `ResolveReth` and the full interface table
-    /// live, and it asks `snapshotLinuxName` — the function that CREATES the
-    /// aliasing — whether the named parent's base row resolves to this
-    /// interface's netdev. Set on a member's BASE row only; a member that
-    /// configures its own logical units is rejected at commit
-    /// (`validateRethMemberStrict`), and one arriving via the tolerant
-    /// load / peer-sync path is an independently ADDRESSED L3 interface whose
-    /// vote must stand.
+    /// Deciding it in Go is what closed this class. `zone` is the OUTCOME of
+    /// `buildInterfaceZoneMap`'s fan-up/fan-down derivation, and the provenance
+    /// that outcome discards — did the operator zone THIS identity, or did it
+    /// inherit another's words — is not recoverable from the rows. #6722 tried
+    /// four times to reconstruct it here by classifying rows and each spelling
+    /// was holed by an unenumerated config shape.
     ///
-    /// Four earlier spellings RE-DERIVED that answer downstream — from the raw
-    /// `redundant-parent` string, from co-resident row names, then from the set
-    /// of netdevs the RETH's rows occupy — and each was holed by a config
-    /// strict `CompileConfig` then accepted.
+    /// A plain `String`, not an `Option`, because ABSENT and EMPTY are the same
+    /// state at protocol v5: an absent key decodes to `""` via
+    /// `#[serde(default)]`, which is also what the builder stamps when it
+    /// decides the ifindex identifies no zone, and both answer the 0 sentinel.
+    /// Telling them apart would only matter for a snapshot from a control plane
+    /// that predates the field, and `apply_snapshot`'s exact-equality version
+    /// gate refuses that snapshot before it reaches the builder.
     ///
-    /// Additive via serde default: absent on snapshots from an old Go binary,
-    /// in which case the member votes and the ifindex stays ambiguous — the
-    /// pre-#6722-B2 fail-CLOSED behavior, which is the safe degraded
-    /// direction.
-    #[serde(rename = "reth_projection", default)]
-    pub reth_projection: bool,
+    /// Read by `forwarding_build::interfaces::populate_interfaces`:
+    ///
+    /// - nonempty — honoured, but only if some row on the ifindex literally
+    ///   carries that zone NAME. A drifted or hostile snapshot can therefore
+    ///   never conjure a zone no row on the ifindex named.
+    /// - empty — the ifindex resolves the 0 sentinel: no zone pair matches and
+    ///   the default policy decides.
+    /// - rows on one ifindex disagreeing — drift; fails closed.
+    #[serde(rename = "egress_zone", default)]
+    pub egress_zone: String,
     #[serde(rename = "unit_count", default)]
     pub unit_count: usize,
     #[serde(default)]

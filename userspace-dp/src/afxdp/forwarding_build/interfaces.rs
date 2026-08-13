@@ -4,13 +4,11 @@
 //!
 //! 1. [`populate_interfaces`] — walks `snapshot.interfaces`,
 //!    populates `state.ifindex_to_*`, `state.ifindex_to_zone_id`,
-//!    `state.ifindex_unambiguous_zone_id` (#6722 — an ifindex only when
-//!    every CONTRIBUTING row sharing it named the same nonzero zone; a
-//!    RETH member's row is a PROJECTION of another row's netdev rather
-//!    than an independent observer of it and does not contribute, so
-//!    `[member="" reth1="lan" reth1.0="lan"]` resolves `lan` even though
-//!    not every row agrees; see `ForwardingState::egress_zone_id` and the
-//!    projection gate below),
+//!    `state.ifindex_unambiguous_zone_id` (#6722 — the Go builder's
+//!    `egress_zone` for that ifindex, admitted only when a row on it
+//!    literally names that zone; the helper corroborates rather than
+//!    adjudicates, see `ForwardingState::egress_zone_id` and the flush
+//!    below),
 //!    `state.tunnel_interfaces`, `state.local_v[46]`,
 //!    `state.interface_nat_v[46]`, `state.connected_v[46]`. Returns
 //!    an [`IfaceIndex`] context with `name_to_ifindex` /
@@ -34,6 +32,59 @@ pub(super) struct IfaceIndex {
     pub mac_by_ifindex: BTreeMap<i32, [u8; 6]>,
 }
 
+/// What the snapshot rows on ONE ifindex say about that ifindex's EGRESS zone
+/// (#6722).
+///
+/// The Go builder (`stampEgressZones`, `pkg/dataplane/userspace/interfaces.go`)
+/// decides the answer and stamps it on every row of an ifindex, so a well-formed
+/// snapshot yields `Decided` with one value. `Conflicting` is the only other
+/// state, and it is version drift or a hostile snapshot.
+///
+/// There is deliberately NO "the field was absent" variant. `egress_zone`
+/// carries `#[serde(default)]`, so an absent key decodes to `""` — the same
+/// state as a builder that decided the ifindex identifies no zone, and the same
+/// answer. That collapse is what the v5 protocol bump bought: an old control
+/// plane's snapshot is refused at `apply_snapshot`'s exact-equality version gate
+/// and never reaches this builder, so "absent" and "decided none" no longer need
+/// to be told apart. Round 10 briefly carried an `Option` and an `Absent` arm
+/// that fell back to row unanimity; the bump made that arm production-
+/// unreachable (measured: every non-test path here is behind the version gate,
+/// and the helper never replays a persisted snapshot — `write_state` is
+/// write-only), so it was removed rather than left as dead code that 54 tests
+/// pretended to cover.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EgressZoneClaim {
+    /// Every row on the ifindex carried this value. Empty means no zone.
+    Decided(String),
+    /// Rows on one ifindex carried DIFFERENT values. The builder stamps them
+    /// identically, so this is drift or a hostile snapshot; it fails closed.
+    Conflicting,
+}
+
+impl EgressZoneClaim {
+    fn merge(&self, egress_zone: &str) -> Self {
+        match self {
+            Self::Decided(have) if have == egress_zone => self.clone(),
+            _ => Self::Conflicting,
+        }
+    }
+
+    /// The zone name this ifindex egresses into, or `None` for the 0 sentinel.
+    /// `carried` is the set of zone names the ifindex's rows literally hold; a
+    /// nonempty answer is honoured only if one of them names it.
+    fn resolve(&self, carried: Option<&std::collections::BTreeSet<String>>) -> Option<String> {
+        let carried = carried?;
+        match self {
+            Self::Conflicting => None,
+            Self::Decided(zone) if zone.is_empty() => None,
+            // CORROBORATION: honour the builder's answer only where a row on the
+            // ifindex literally names that zone.
+            Self::Decided(zone) if carried.contains(zone) => Some(zone.clone()),
+            Self::Decided(_) => None,
+        }
+    }
+}
+
 pub(super) fn populate_interfaces(
     snapshot: &ConfigSnapshot,
     state: &mut ForwardingState,
@@ -43,13 +94,14 @@ pub(super) fn populate_interfaces(
     let mut name_to_ifindex = BTreeMap::new();
     let mut linux_to_ifindex = BTreeMap::new();
     let mut mac_by_ifindex = BTreeMap::new();
-    // #6722: ifindex → the zone every CONTRIBUTING row on it agrees on, or
-    // `None` once two of them disagreed. Not literally every row: the
-    // projection gate below withholds a RETH member's vote, because that row
-    // describes another row's netdev rather than observing its own. Flushed
-    // into `state.ifindex_unambiguous_zone_id` after the walk, because a
-    // conflict can be introduced by ANY later row.
-    let mut zone_agreement: BTreeMap<i32, Option<u16>> = BTreeMap::new();
+    // #6722: ifindex → the EGRESS zone name the Go builder stamped on its rows,
+    // or `None` once two rows on one ifindex claimed different ones (drift; Go
+    // stamps them identically). Flushed into
+    // `state.ifindex_unambiguous_zone_id` after the walk, alongside
+    // `zones_carried` — ifindex → the zone names its rows literally carry, which
+    // is what corroborates the claim.
+    let mut egress_zone_claim: BTreeMap<i32, EgressZoneClaim> = BTreeMap::new();
+    let mut zones_carried: BTreeMap<i32, std::collections::BTreeSet<String>> = BTreeMap::new();
 
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
@@ -95,165 +147,50 @@ pub(super) fn populate_interfaces(
                 }
             }
         };
-        // #6722: record what THIS row says about its ifindex, for every row
-        // that CONTRIBUTES (the projection gate below withholds a RETH
-        // member's vote; every other row votes) — an unzoned row's "no zone"
-        // is an opinion that must be able to conflict with a zoned sibling's. `zone_agreement[ifx] == None` means
-        // the rows sharing `ifx` disagree, so the ifindex identifies no single
-        // zone and `ForwardingState::egress_zone_id` must refuse to guess one.
-        // Recording unzoned rows is LOAD-BEARING, and proven so: skip them and
-        // `unzoned_macless_unit_does_not_inherit_a_zoned_siblings_zone_6722`,
-        // `divergently_zoned_sibling_units_do_not_pick_a_zone_6722` and both
-        // filter-log siblings go red, because the shared ifindex's only
-        // surviving opinion is the zoned base row's.
+        // #6722: record the Go builder's EGRESS answer for this ifindex, and
+        // (separately) the zone this row literally carries.
         //
-        // `None` is ABSORBING: the `!=` below is deliberately written against
-        // the whole `Option`, not against an unwrapped zone id, so a later row
-        // that happens to agree with the FIRST one cannot re-arm an ifindex
-        // already known ambiguous. Rewriting it as
-        // `if let Some(existing) = *slot.get() { ... } else { re-arm }` is
-        // green on every TWO-row fixture — two rows can only ENTER the state,
-        // never attempt to re-arm it — and reinstates the #6722 fail-open on a
-        // three-row one. The interface-level WireGuard fixtures are the
-        // three-row shapes that catch it
-        // (`unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722`,
-        // `vpnb` -> unzoned -> `vpnb` on one ifindex).
+        // The helper does not adjudicate. `stampEgressZones`
+        // (`pkg/dataplane/userspace/interfaces.go`) decides which zone an
+        // ifindex egresses into, because that decision needs two things the
+        // rows do not carry: the operator's AUTHORED
+        // `security-zone <z> interfaces <ref>` bindings before
+        // `buildInterfaceZoneMap` fanned them up to bases and down onto units,
+        // and `snapshotLinuxName`, the function that collapses several
+        // configured identities onto one netdev. A row's `zone` is the OUTCOME
+        // of that derivation, and the outcome does not say whether the operator
+        // zoned THIS identity or whether the row inherited another's words.
         //
-        // The ledger is fed ONLY by what a row literally carries, never by the
-        // child→parent propagation below, so it says what the SNAPSHOT said
-        // rather than what the ingress map was derived to hold. That exclusion
-        // is a design property, not a demonstrated guard: teaching the ledger
-        // from the propagation arm too leaves every test in this issue green,
-        // because the arm is skipped whenever the parent already disagrees and
-        // a parent with no snapshot row of its own also has no child pointing
-        // at it (an unresolvable link yields `ifindex == 0` on both rows).
-        // #6722 B2: a ledger is only sound if every row is an INDEPENDENT
-        // observer of its ifindex. An UNZONED physical RETH member's row is
-        // not — it is a PROJECTION of the RETH's own netdev.
+        // That is why the row-classifying ledger this replaced kept getting
+        // holed. It asked "do the rows sharing this ifindex agree?" and then
+        // grew an exemption list for the rows whose agreement or dissent was an
+        // artefact rather than an observation — a RETH member's projection row,
+        // then a multi-unit base row carrying a fanned-up zone, then an authored
+        // dotted name aliasing another interface's VLAN unit. Nine spellings
+        // across #6722's life, each closed by adding a case. Provenance is not
+        // reconstructible from the outcome, so it is carried instead.
         //
-        // `ResolveReth` (`pkg/config/types.go`) resolves a RETH to its member,
-        // and `snapshotLinuxName` (`pkg/dataplane/userspace/interfaces.go`)
-        // applies it to the reth base row AND its units, so `ge-0/0/1`,
-        // `reth1` and `reth1.0` are ONE kernel netdev.
-        //
-        // Only the member's BASE row is ever marked. A reth member is an L2
-        // port: `validateRethMemberStrict`
-        // (`pkg/config/compiler_validate_strict_reth_member.go`) rejects a
-        // member that configures its own logical units, so on the commit path a
-        // member has exactly one row. One that arrives anyway — through the
-        // tolerant load / peer-sync path, where that gate is downgraded to a
-        // warning (#1960) — is an independently ADDRESSED L3 interface: it
-        // installs its own connected route and local address on the shared
-        // ifindex, so its missing zone is a real operator statement and it must
-        // keep voting. Marking it was the measured #6722 fail-open (a flow to
-        // the member unit's own subnet resolved the RETH's zone and was
-        // permitted); leaving it to vote holds the ifindex ambiguous, which
-        // fails CLOSED.
-        //
-        // Junos configs conventionally zone the RETH rather than the member, so
-        // `buildInterfaceZoneMap` usually leaves the member's rows unzoned and
-        // `buildInterfaceSnapshots` emits them unfiltered. That is CONVENTION,
-        // not a code property: `buildInterfaceZoneMap`
-        // (pkg/dataplane/userspace/zones.go) enforces no such rule, and a config
-        // that zones the member really does produce a zoned member row —
-        // measured, `zoneByInterface[ge-0/0/1] = "z214"`. Nothing here depends
-        // on the convention holding: the `zone.is_empty()` half of the gate
-        // below is exactly what handles the exception (#6722 re-gate). Counting that "no zone" as a dissenting vote makes
-        // the RETH's own zone ambiguous: measured through the full
-        // `buildSnapshot` on `docs/ha-cluster-userspace.conf` (node 0 — the
-        // topology `test/incus/loss-userspace-cluster.env` points every HA
-        // smoke test at), `ifindex 24: [ge-0/0/1="" reth1="lan" reth1.0="lan"]`
-        // and `ifindex 25: [ge-0/0/2="" reth0="wan"]` under `default-policy
-        // deny-all`. That collapses the EGRESS zone to the 0 sentinel, against
-        // which `evaluate_policy_result_l3_aware` matches no rule at all
-        // (`policy.rs`, the `from_id != 0 && to_id != 0` gate), so every
-        // WAN->LAN, sfmix->LAN and tunnel->LAN transit flow on a bondless-RETH
-        // cluster blackholes. LAN->WAN survives because its egress ifindex has
-        // a single row, which is exactly why an iperf3 smoke in the usual
-        // direction comes back green.
-        //
-        // The `zone.is_empty()` half of the gate is LOAD-BEARING, not
-        // defensive. A member the operator EXPLICITLY zoned into a different
-        // zone than its RETH is a real statement about a real conflict, not an
-        // artefact of one device described by several rows, and it must keep
-        // failing closed. `explicitly_zoned_reth_member_still_makes_the_
-        // ifindex_ambiguous_6722` reds if this half is dropped.
-        //
-        // SCOPE, deliberately narrow. The other ways two rows share an ifindex
-        // are all genuine independent observers and still vote:
-        // the non-VLAN unit-0 collapse (`st0` / `st0.0`), interface-level
-        // tunnels (`wg0` / `wg0.0` / `wg0.1` via `TunnelNameMap`), and a
-        // recycled ifindex across two unrelated interfaces. `fab0` is NOT one
-        // of them — the fabric IPVLAN is its own netdev with its own ifindex
-        // (`snapshotLinuxName` never calls `ResolveFab`), so it never shares
-        // one with its physical parent.
-        // `reth_projection` is the DECIDED FACT, not evidence to weigh. The Go
-        // builder (`rethProjectionMembers`,
-        // `pkg/dataplane/userspace/interfaces.go`) answers it where the answer
-        // is knowable — it holds `ResolveReth` and the whole interface table —
-        // by asking `snapshotLinuxName`, the function that CREATES the
-        // aliasing, whether the named parent's base row resolves to the same
-        // netdev as this interface's.
-        //
-        // Deciding it there rather than here is what closes the class, and the
-        // class is worth naming, because FIVE spellings were needed. #6722 B1
-        // carried the raw `redundant-parent` string on the wire and re-derived
-        // "is a projection" from row names; the next three re-derived it from
-        // co-resident rows, then from the SET of netdevs the parent's rows
-        // occupied. Every one was a RECONSTRUCTION of the resolver's answer,
-        // and every one was holed by a config strict `CompileConfig` then
-        // accepted — `set interfaces st0 gigether-options redundant-parent
-        // st0`, where `st0.0` matched its own co-resident BASE row and flipped
-        // `egress_zone_id` from the fail-closed 0 to `vpnb`; then a member unit
-        // carrying its OWN address, which lands exactly where the RETH's unit
-        // lands and so satisfied the netdev-set test while being a genuinely
-        // independent L3 interface.
-        //
-        // Two things replaced the reconstruction. `validateRethMemberStrict`
-        // makes the incoherent memberships unrepresentable at commit — a member
-        // naming ITSELF, a RETH naming a redundant parent of its own, a member
-        // naming an unconfigured parent, and a member carrying its own units.
-        // The reth clause is the one that bounds the case split: the Go
-        // predicate compares `snapshotLinuxName` of the parent against
-        // `snapshotLinuxName` of the candidate, and that function resolves a
-        // `reth*` name through `ResolveReth` and any other name through
-        // `LinuxIfName`, so EITHER side can take EITHER arm and the split is
-        // four-way. #6722 rounds 4-6 argued two of the four and called them
-        // exhaustive; the two with a `reth*` CANDIDATE were measured reachable
-        // under strict `CompileConfig` and each marked a reth — the L3 owner —
-        // as a projection of something else. Forbidding a `reth*` candidate
-        // empties both. What is left is the alias itself, asked of
-        // the aliasing function, so there is no second opinion that can
-        // disagree with `ResolveReth`. Note that a NAME can still satisfy the
-        // predicate — `ge-0/0/1.100` really does resolve onto `reth1.100`'s
-        // netdev — which is precisely why the answer is taken from the
-        // resolution rather than from the shape of the operator's string.
-        //
-        // The helper-boundary backstop (#2391/#2409/#2706) is not weakened by
-        // trusting the field, and the bound is worth stating exactly rather
-        // than as "it fails closed". A mark can only ever WITHHOLD a vote, so a
-        // drifted or hostile snapshot that sets it spuriously either leaves the
-        // remaining contributing rows unanimous — in which case the ledger
-        // resolves THEIR zone, one this ifindex's own rows literally named — or
-        // leaves none, in which case the ifindex is absent from the ledger and
-        // `egress_zone_id` answers the 0 sentinel. It can never conjure a zone
-        // no row on the ifindex named, and `zone.is_empty()` keeps it from
-        // discarding an explicit zone on the marked row itself. Absent the
-        // field (an old Go binary) the row votes and the ifindex stays
-        // ambiguous: the pre-#6722-B2 fail-CLOSED behavior.
-        let row_is_reth_member_projection = iface.reth_projection && iface.zone.is_empty();
-        if !row_is_reth_member_projection {
-            match zone_agreement.entry(iface.ifindex) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(Some(row_zone_id));
-                }
-                std::collections::btree_map::Entry::Occupied(mut slot) => {
-                    if *slot.get() != Some(row_zone_id) {
-                        slot.insert(None);
-                    }
-                }
+        // What remains here is a CORROBORATION, not a decision, and it needs no
+        // predicate over rows: an ifindex takes `egress_zone` only if some row
+        // on it literally names that zone. A drifted or hostile snapshot can
+        // therefore never conjure a zone no row on the ifindex named — the
+        // helper-boundary property (#2391/#2409/#2706) the previous mark
+        // argued for, now with nothing left to disagree about. `None` means the
+        // rows disagreed about the answer itself (Go stamps every row on an
+        // ifindex identically, so this is drift) and fails closed.
+        match egress_zone_claim.entry(iface.ifindex) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(EgressZoneClaim::Decided(iface.egress_zone.clone()));
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let merged = slot.get().merge(&iface.egress_zone);
+                slot.insert(merged);
             }
         }
+        zones_carried
+            .entry(iface.ifindex)
+            .or_default()
+            .insert(iface.zone.clone());
         // `row_zone_id != 0` is EXACTLY the pre-#6722 `!iface.zone.is_empty()`
         // condition, not a narrowing of it: `zone_name_to_id_from_snapshot`
         // (`policy.rs`) skips `zone.id == 0` outright, so a zone NAME that
@@ -455,24 +392,35 @@ pub(super) fn populate_interfaces(
         }
     }
 
-    // #6722: flush the agreement ledger. An ifindex lands here only when every
-    // CONTRIBUTING row on it named the SAME nonzero zone — a RETH member's
-    // projection row never voted, so unanimity is over the independent
-    // observers, not over the raw row set; a conflict (`None`) and a
-    // unanimous "no zone" (`Some(0)`) are both left absent, and
-    // `ForwardingState::egress_zone_id` then resolves that ifindex to the 0
-    // sentinel — the pre-#6713 answer, against which no policy rule matches.
+    // #6722: flush the Go builder's egress answer, admitting an ifindex only
+    // when a row on it CORROBORATES the claim by literally naming that zone.
     //
-    // The `zone_id != 0` skip is a map-size choice, NOT a safety gate, and is
-    // labelled as such so nobody mutates it expecting a red: `egress_zone_id`
-    // ends in `.unwrap_or(0)`, so a stored `Some(0)` and an absent key resolve
-    // identically. Keeping the key out confines the map to interfaces that
-    // actually name a zone.
-    for (ifindex, agreed) in zone_agreement {
-        if let Some(zone_id) = agreed {
-            if zone_id != 0 {
+    // Every failure resolves the 0 sentinel — the pre-#6713 answer, against
+    // which `evaluate_policy_result_l3_aware` matches no rule and the default
+    // policy decides:
+    //
+    //   - `Decided("")`: the Go builder decided the ifindex identifies no single
+    //     zone (contested ownership, conflicting authored bindings, or none).
+    //   - `Conflicting`: rows on ONE ifindex disagreed about the answer itself.
+    //     The builder stamps every row on an ifindex identically, so this is
+    //     version drift or a hostile snapshot.
+    //   - uncorroborated: no row on the ifindex carries that zone name. This is
+    //     the whole of the helper-side check on a field it otherwise trusts, and
+    //     it is what keeps a drifted claim from CONJURING a zone.
+    //   - unknown name: `zone_name_to_id` has no entry, so the zone was dropped
+    //     at `populate_zones` (u8-overflow id) or never existed. Corroboration
+    //     makes this unreachable in practice — a row carrying an unresolvable
+    //     zone already returned `InterfaceUnknownZone` above — but a failed
+    //     lookup must not default to a real zone id.
+    for (ifindex, claim) in egress_zone_claim {
+        let Some(zone) = claim.resolve(zones_carried.get(&ifindex)) else {
+            continue;
+        };
+        match state.zone_name_to_id.get(&zone).copied() {
+            Some(zone_id) if zone_id != 0 => {
                 state.ifindex_unambiguous_zone_id.insert(ifindex, zone_id);
             }
+            _ => {}
         }
     }
 
@@ -540,59 +488,19 @@ pub(super) fn populate_egress(
                 zone: iface.zone.clone(),
             });
         }
-        // #6722 B1: take the row's zone from the AGREEMENT LEDGER, not from the
-        // row itself. `state.egress` is keyed by ifindex and written
-        // last-write-wins, so several units sharing one ifindex each overwrite
-        // the previous row's zone and the FINAL row decides — and
-        // `ForwardingState::egress_zone_id` reads this map BEFORE the ledger.
-        // Sourcing it from the row would therefore let a zoned sibling re-arm
-        // an ifindex the ledger holds ambiguous, entirely bypassing the #6722
-        // gate.
+        // #6722: take the row's zone from the LEDGER, not from the row itself.
+        // `state.egress` is keyed by ifindex and written last-write-wins, so
+        // several identities sharing one ifindex each overwrite the previous
+        // row's zone and the FINAL row decides. Sourcing it from the row would
+        // let whichever identity sorts last name the zone — which is how
+        // `origin/master` behaved, and why its answers here were a function of
+        // interface NAMING (measured: for `ge-0/0/1` with unit 0 in `lan` and
+        // unit 1 in `dmz`, master's egress zone is unit 0's `lan` only because
+        // "ge-0/0/1.0" sorts after "ge-0/0/1").
         //
-        // That is not hypothetical and it is not limited to MAC-less xfrmis. An
-        // interface-level WireGuard tunnel maps EVERY unit onto the base device
-        // (`TunnelNameMap`, `pkg/config/types.go` — the branch admits WireGuard
-        // despite its empty GRE-style `source`), and those rows carry
-        // `tunnel = true`, so the `src_mac` gate above admits them via
-        // `iface.tunnel.then_some([0; 6])` and they DO get egress rows. Zone
-        // only `wg0.1` and the last write puts its zone on the ifindex that
-        // unzoned `wg0.0` shares.
-        //
-        // The ledger is absent for an ifindex whose rows disagree AND for one
-        // whose rows unanimously name no zone; both must resolve 0, so a plain
-        // `unwrap_or(0)` is exactly right. Where the rows AGREE the value is
-        // identical to the row's own zone, so an ordinary single-unit interface
-        // is unaffected.
-        //
-        // #6722 B2, stated carefully because the earlier spelling of that last
-        // sentence was FALSE. "Single-unit" is a claim about the CONFIG, not
-        // about how many snapshot rows land on the netdev, and a bondless RETH
-        // is the counterexample: `reth1` with one unit still puts THREE rows on
-        // ifindex 24 (`ge-0/0/1`, `reth1`, `reth1.0`), because `ResolveReth`
-        // collapses the RETH onto its physical member. Before the projection
-        // exemption above, the member's unzoned row dissented and the ledger
-        // held the ifindex ambiguous, so that interface was very much affected
-        // — every WAN->LAN transit flow on the reference HA cluster blackholed.
-        // It is unaffected NOW for a specific reason: the member's rows cast no
-        // vote at all, so the surviving rows are unanimous and the ledger value
-        // is once again identical to the row's own zone.
-        //
-        // PROVENANCE, so a bisect is not misled: this ambiguity was already
-        // latent in the index-keyed `egress` map BEFORE #6713/#6722. On
-        // `origin/master` `egress_zone_id` was an `egress`-only read and
-        // `populate_egress` already took the row's own zone last-write-wins, so
-        // the WireGuard shape above already adjudicated `vpnb` there. #6713 did
-        // not create the defect; it added the fallback and routed more
-        // consumers through the same incomplete resolver. This change is what
-        // enforces the invariant across BOTH arms.
-        //
-        // This also makes the `Some(0)` short-circuit in `egress_zone_id`
-        // correct BY CONSTRUCTION rather than by emission-order luck. The
-        // pre-#6722 behaviour pinned by
-        // `unzoned_interface_with_egress_row_stays_zone_zero_6713` — a zoned
-        // trunk with an unzoned unit 0 landing on 0 — held only because the
-        // unzoned row happened to be emitted last. Reverse the order, as the
-        // WireGuard shape does, and the zone won instead.
+        // The ledger is absent for an ifindex Go declared no single zone for,
+        // and for one whose claim no row corroborated; both must resolve 0, so a
+        // plain `unwrap_or(0)` is exactly right.
         let zone_id = state
             .ifindex_unambiguous_zone_id
             .get(&iface.ifindex)

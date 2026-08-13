@@ -1701,17 +1701,19 @@ type compileOpts struct {
 	// lenientRethMember (#6722) downgrades the redundant-ethernet membership
 	// coherence gate (validateRethMemberStrict) from a hard compile error to a
 	// cfg.Warnings entry. A reth member is an L2 port whose L3 identity — units,
-	// addresses, zone — lives on the reth; the Rust egress-zone ledger defers to
-	// the reth's row on the shared netdev on exactly that basis. A member that
-	// names itself, names an unconfigured parent, or carries its own logical
-	// units breaks the premise, and the last of the three fails OPEN (an
-	// independently addressed member unit's missing zone is silently answered by
-	// the reth's). The strict commit / commit-check path hard-rejects so the
-	// incoherence is operator-visible; the tolerant load / peer-sync paths warn
-	// so an already-persisted or peer-synced config that predates this gate
-	// still BOOTS (#1960 no-brick). Bounded on the lenient path: the projection
-	// mark is stamped on a member's BASE row only, so a grandfathered member
-	// unit still votes and its ifindex stays ambiguous (fail-closed).
+	// addresses, tunnel, zone — lives on the reth; the egress-zone answer
+	// (stampEgressZones, pkg/dataplane/userspace/interfaces.go) treats a reth and
+	// its member as ONE device on exactly that basis. A member that names itself,
+	// names an unconfigured parent, carries its own logical units, or carries its
+	// own tunnel breaks the premise, and the last two fail OPEN (an
+	// independently addressed member unit, or an independently routed tunnel
+	// endpoint, silently inherits the reth's zone). The strict commit /
+	// commit-check path hard-rejects so the incoherence is operator-visible; the
+	// tolerant load / peer-sync paths warn so an already-persisted or peer-synced
+	// config that predates this gate still BOOTS (#1960 no-brick). Bounded on the
+	// lenient path by the SAME rule the gate states: a member that is not a bare
+	// port is not a member, so the shared device has two independent claimants
+	// and its ifindex identifies no zone (fail-closed).
 	// Same doctrine as lenientIfNameCollision.
 	lenientRethMember bool
 	// lenientReservedZoneNames (#3055) downgrades the reserved zone-name

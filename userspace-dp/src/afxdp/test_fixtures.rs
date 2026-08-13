@@ -6,8 +6,99 @@ use crate::{
     StaticNATRuleSnapshot, TunnelEndpointSnapshot, ZoneSnapshot,
 };
 
+/// FIXTURE PLUMBING, not a second copy of the resolver (#6722 round 10).
+///
+/// Hand-built `ConfigSnapshot`s in this file predate `egress_zone`. At protocol
+/// v5 that field is part of the contract — the Go builder stamps it on every row
+/// and `apply_snapshot`'s exact-equality version gate refuses any snapshot from a
+/// binary that does not — so a fixture that omits it models a snapshot the wire
+/// CANNOT CARRY. 54 tests were in that state; leaving them there is the
+/// vacuous-test class (they look like coverage of a path production cannot take).
+///
+/// This stamps the answer the Go builder produces for the shapes these fixtures
+/// actually contain: a SINGLE configured identity per ifindex, where the egress
+/// zone is simply the zone its rows name. It is deliberately WEAKER than
+/// `stampEgressZones` — it knows nothing about authored-vs-derived provenance,
+/// reth membership or contested ownership — and it is confined to the test
+/// fixture layer for exactly that reason. It is not consulted at runtime and it
+/// is not a fallback: production has no "the field was absent" path at all.
+///
+/// It only ever fills a row whose `egress_zone` is EMPTY, and only on an ifindex
+/// where no row has been stamped explicitly, so a fixture modelling a
+/// shared-netdev shape (the #6722 cells, which set `egress_zone` by hand) is
+/// never overwritten. An ifindex whose rows disagree, or any of whose rows is
+/// unzoned, is left empty — the fail-closed answer.
+///
+/// The cross-plane truth — which answer a REAL config produces — is bound on the
+/// Go side by `pkg/dataplane/userspace/egress_zone_identity_6722_test.go`, which
+/// drives the real `CompileConfig` and the real `buildInterfaceSnapshots`.
+///
+/// WHAT THE MIGRATION COSTS IN BINDING POWER, MEASURED. The risk in stamping 32
+/// fixtures mechanically is that a test starts passing for a NEW reason. That
+/// was checked rather than assumed: the consumer was mutated to source the
+/// egress row's `zone_id` from the row's own `zone` name — `origin/master`'s
+/// behaviour — and the whole crate re-run.
+///
+/// The mutation reds exactly ONE test tree-wide. That is not evidence of
+/// vacuity, and the reason matters: for an ifindex with a single configured
+/// identity the ledger's answer and the row's own zone ARE THE SAME VALUE, so
+/// no mutation swapping one for the other can be observed there. Those fixtures
+/// bind that a zone reaches the policy decision; they never bound WHICH
+/// mechanism supplied it, before the migration or after. The stamp changes what
+/// the fixture MODELS (from a snapshot the wire cannot carry to one it can), not
+/// what it PROVES.
+///
+/// That last sentence is measured, not argued. The same mutation was applied to
+/// the PRE-migration tree — the compat arm present, these fixtures unstamped —
+/// and the two failure SETS compared:
+///
+/// ```text
+/// pre-migration   reds: unzoned_iface_tunnel_unit_..._via_egress_row_6722
+/// post-migration  reds: unzoned_iface_tunnel_unit_..._via_egress_row_6722
+/// ```
+///
+/// Identical. **The migration removed no binding.** (Both cells also fail
+/// `shim_ipv6_ext_walk_matches_userspace_walker`, which reads a manifest outside
+/// the sandboxed subtree; it cancels on both sides.)
+///
+/// What the measurement did expose is a real gap, now closed: the single
+/// surviving discriminator asserted a 0 sentinel, so the positive direction of
+/// B1 — the ledger's non-zero answer beating a dissenting row — had no cell.
+/// `egress_row_zone_is_order_invariant_not_last_write_6722` is that cell.
+pub(super) fn v5(mut snapshot: ConfigSnapshot) -> ConfigSnapshot {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut zones: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
+    let mut explicit: BTreeSet<i32> = BTreeSet::new();
+    for iface in &snapshot.interfaces {
+        if iface.ifindex <= 0 {
+            continue;
+        }
+        if !iface.egress_zone.is_empty() {
+            explicit.insert(iface.ifindex);
+        }
+        zones
+            .entry(iface.ifindex)
+            .or_default()
+            .insert(iface.zone.clone());
+    }
+    for iface in &mut snapshot.interfaces {
+        if iface.ifindex <= 0 || explicit.contains(&iface.ifindex) {
+            continue;
+        }
+        let Some(names) = zones.get(&iface.ifindex) else {
+            continue;
+        };
+        if let [only] = names.iter().collect::<Vec<_>>().as_slice() {
+            if !only.is_empty() {
+                iface.egress_zone = (*only).clone();
+            }
+        }
+    }
+    snapshot
+}
+
 pub(super) fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: vec![ZoneSnapshot {
             name: "wan".to_string(),
             id: TEST_WAN_ZONE_ID,
@@ -88,11 +179,11 @@ pub(super) fn forwarding_snapshot(include_neighbor: bool) -> ConfigSnapshot {
             ..Default::default()
         }],
         ..Default::default()
-    }
+    })
 }
 
 pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "wan".to_string(),
@@ -199,7 +290,7 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
             vec![]
         },
         ..Default::default()
-    }
+    })
 }
 
 /// A WireGuard tunnel endpoint whose LOGICAL interface MTU (1420) differs
@@ -210,7 +301,7 @@ pub(super) fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
 /// MTU 1420. The 64-hex privkey + one peer with a valid pubkey make the row
 /// hydrate (a peerless / keyless WG row is dropped by `hydrate_wg_identity`).
 pub(super) fn wg_outer_mtu_snapshot() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "wan".to_string(),
@@ -296,7 +387,7 @@ pub(super) fn wg_outer_mtu_snapshot() -> ConfigSnapshot {
             preference: 0,
         }],
         ..Default::default()
-    }
+    })
 }
 
 /// #6340: a WG endpoint (id 1) with TWO cryptokey-routed peers whose AllowedIPs
@@ -437,7 +528,7 @@ pub(super) fn native_gre_pbr_action_snapshot(action: &str) -> ConfigSnapshot {
 }
 
 pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         // #2391: the interface references "wan"; define it so the forwarding
         // build does not fail closed (InterfaceUnknownZone).
         zones: vec![ZoneSnapshot {
@@ -530,11 +621,11 @@ pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> Con
             vec![]
         },
         ..Default::default()
-    }
+    })
 }
 
 pub(super) fn forwarding_snapshot_with_next_table_loop() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         routes: vec![RouteSnapshot {
             table: "inet.0".to_string(),
             family: "inet".to_string(),
@@ -545,11 +636,11 @@ pub(super) fn forwarding_snapshot_with_next_table_loop() -> ConfigSnapshot {
             preference: 0,
         }],
         ..Default::default()
-    }
+    })
 }
 
 pub(super) fn nat_snapshot() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: vec![
             // #3705: EVERY known zone is host-inbound ENFORCING (the build path
             // inserts an entry regardless of the flag). These fixture zones carry
@@ -693,7 +784,7 @@ pub(super) fn nat_snapshot() -> ConfigSnapshot {
             },
         ],
         ..Default::default()
-    }
+    })
 }
 
 pub(super) fn nat_snapshot_with_fabric() -> ConfigSnapshot {
@@ -732,7 +823,7 @@ pub(super) fn nat_snapshot_with_fabric() -> ConfigSnapshot {
 }
 
 pub(super) fn policy_deny_snapshot() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         // #2391: interfaces below reference "lan"/"wan"; the zone table must
         // define them or the forwarding build fails closed (InterfaceUnknownZone).
         // #3705: every known zone is host-inbound enforcing; carry
@@ -800,7 +891,7 @@ pub(super) fn policy_deny_snapshot() -> ConfigSnapshot {
             ..Default::default()
         }],
         ..Default::default()
-    }
+    })
 }
 
 pub(super) fn valid_meta() -> UserspaceDpMeta {
@@ -831,7 +922,7 @@ pub(super) fn vlan_icmp_reply_frame() -> Vec<u8> {
 }
 
 pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: vec![
             ZoneSnapshot {
                 name: "trust".to_string(),
@@ -937,7 +1028,7 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             },
         ],
         ..Default::default()
-    }
+    })
 }
 
 /// Compute the RFC 4443 ICMPv6 checksum over the IPv6 pseudo-header
@@ -1150,7 +1241,7 @@ fn tunnel_unit_row_6722(
 /// Both units are MAC-less, so NEITHER gets a `state.egress` row and the #6713
 /// fallback is the only thing that can resolve either to-zone.
 pub(super) fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1184,7 +1275,7 @@ pub(super) fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// UNAMBIGUOUS shared ifindex — #6713 in its plainest deployed spelling.
@@ -1200,7 +1291,7 @@ pub(super) fn sibling_tunnel_units_snapshot_6722() -> ConfigSnapshot {
 /// would break, and the reason the gate keys on DISAGREEMENT rather than on
 /// "more than one row shares this ifindex".
 pub(super) fn unanimous_shared_ifindex_tunnel_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1226,7 +1317,7 @@ pub(super) fn unanimous_shared_ifindex_tunnel_snapshot_6722() -> ConfigSnapshot 
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// Two units in DIFFERENT zones on one `st0`, with unit 0 in neither.
@@ -1243,7 +1334,7 @@ pub(super) fn unanimous_shared_ifindex_tunnel_snapshot_6722() -> ConfigSnapshot 
 /// sorts before "c". Reading `ifindex_to_zone_id` for the egress half would
 /// adjudicate unit 0's transit under a zone chosen by alphabetical accident.
 pub(super) fn divergent_zone_sibling_units_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1285,7 +1376,7 @@ pub(super) fn divergent_zone_sibling_units_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// POST-QUARANTINE shape: an UNZONED base beside a zoned child.
@@ -1309,7 +1400,7 @@ pub(super) fn divergent_zone_sibling_units_snapshot_6722() -> ConfigSnapshot {
 /// half must NOT read that — handing the quarantine's deliberate default-deny
 /// back the survivor's zone is the fail-open the quarantine exists to prevent.
 pub(super) fn quarantined_base_tunnel_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1343,7 +1434,7 @@ pub(super) fn quarantined_base_tunnel_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// REUSED ifindex: two UNRELATED interfaces (no parent/child link) landing on
@@ -1353,7 +1444,7 @@ pub(super) fn quarantined_base_tunnel_snapshot_6722() -> ConfigSnapshot {
 /// is no basis whatsoever for picking one of the two zones, so the egress half
 /// must resolve 0 and let the default policy decide.
 pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1405,7 +1496,7 @@ pub(super) fn reused_ifindex_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,7 +1570,7 @@ fn wg_row_6722(name: &str, zone: &str, address: Option<&str>) -> InterfaceSnapsh
 /// the unzoned unit-0 row happened to be emitted last and 0 won; here a zoned
 /// row is last and the zone wins.
 pub(super) fn wg_iface_tunnel_unzoned_unit_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1491,7 +1582,7 @@ pub(super) fn wg_iface_tunnel_unzoned_unit_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// `[none, none, vpnb]` — the ZERO SENTINEL first, with egress rows.
@@ -1502,7 +1593,7 @@ pub(super) fn wg_iface_tunnel_unzoned_unit_snapshot_6722() -> ConfigSnapshot {
 /// `populate_egress`'s last write is `vpnb` even though two of the three rows
 /// name no zone at all.
 pub(super) fn wg_iface_tunnel_sentinel_first_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1514,7 +1605,7 @@ pub(super) fn wg_iface_tunnel_sentinel_first_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// `[vpnb, vpnb, vpnb]` — THREE agreeing rows on one ifindex, with egress rows.
@@ -1532,7 +1623,7 @@ pub(super) fn wg_iface_tunnel_sentinel_first_snapshot_6722() -> ConfigSnapshot {
 /// operator's permit. Over-tightening into "several rows on one ifindex means
 /// no zone" would deny an ordinary WireGuard deployment.
 pub(super) fn wg_iface_tunnel_unanimous_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: tunnel_zones_6722(),
         interfaces: vec![
             lan_row_6722(),
@@ -1544,7 +1635,7 @@ pub(super) fn wg_iface_tunnel_unanimous_snapshot_6722() -> ConfigSnapshot {
         default_policy: "deny".to_string(),
         policies: tunnel_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,28 +1688,30 @@ pub(super) const WAN_IFINDEX_6722: i32 = 27;
 /// Every bondless-RETH row resolves to the physical member's netdev, so `name`
 /// is the only thing that distinguishes them.
 ///
-/// `projection` is HAND-STAMPED, and that limit is worth naming. These are
+/// `egress_zone` is HAND-STAMPED, and that limit is worth naming. These are
 /// ConfigSnapshot literals; the Rust harness cannot reach the Go builder, so
-/// nothing here exercises `rethProjectionMembers` — the function that actually
-/// DECIDES the flag. What these fixtures cover is the consumer: given a row
-/// marked (or not), does the ledger withhold (or count) its vote. Which rows a
-/// real config marks is covered on the other side of the wire, by
-/// `pkg/dataplane/userspace/reth_member_projection_6722_test.go`, whose
-/// fixtures are real `set` lines through the real strict `CompileConfig` and
-/// the real `buildInterfaceSnapshots`, and by
-/// `TestRethProjectionRoundTripsOnTheWire_6722`, which pins that the Go builder
-/// emits the `reth_projection` JSON key this struct decodes.
+/// nothing here exercises `stampEgressZones` — the function that actually
+/// DECIDES the answer. What these fixtures cover is the consumer: given rows
+/// carrying an answer, does the resolver honour it, and does the corroboration
+/// reject one no row supports. Which answer a real config produces is covered on
+/// the other side of the wire by
+/// `pkg/dataplane/userspace/egress_zone_identity_6722_test.go`, whose fixtures
+/// are real `set` lines through the real strict `CompileConfig` and the real
+/// `buildInterfaceSnapshots`, and by
+/// `TestEgressZoneCrossesTheWireAndTheQuarantine_6722`, which pins that the Go
+/// builder emits the `egress_zone` JSON key this struct decodes.
 ///
-/// The pairing matters because the PREDECESSOR of this field was hand-stamped
-/// here too, and the gate then re-derived its answer from `redundant_parent`.
-/// A fixture that sets a field the gate no longer reads is vacuous however
-/// green it looks. That cannot recur by accident now: `redundant_parent` is not
-/// a field of `InterfaceSnapshot` at all, so a fixture setting it does not
+/// The pairing matters because two PREDECESSORS of this field were hand-stamped
+/// here too, and the gate then re-derived its answer from something else — first
+/// from `redundant_parent`, then from co-resident rows. A fixture that sets a
+/// field the gate no longer reads is vacuous however green it looks. That cannot
+/// recur by accident now: neither `redundant_parent` nor `reth_projection` is a
+/// field of `InterfaceSnapshot` at all, so a fixture setting one does not
 /// compile.
 fn reth_row_6722(
     name: &str,
     zone: &str,
-    projection: bool,
+    egress_zone: &str,
     address: Option<&str>,
 ) -> InterfaceSnapshot {
     InterfaceSnapshot {
@@ -1627,9 +1720,10 @@ fn reth_row_6722(
         linux_name: "ge-0-0-1".to_string(),
         ifindex: LAN_IFINDEX_6722,
         mtu: 1500,
-        // Only the PHYSICAL MEMBER carries this; the reth rows are the
-        // AUTHORITY the exemption defers to and are never projections.
-        reth_projection: projection,
+        // The Go builder stamps ONE answer per ifindex, so every row here
+        // carries the same value — a fixture that varied it would be modelling
+        // version drift, which the builder treats as a conflict and fails closed.
+        egress_zone: egress_zone.to_string(),
         // Bondless RETH: the member netdev carries the RETH's virtual MAC, so
         // every row on it is MAC-ful and `populate_egress` gives all three an
         // egress row. This is the `state.egress` arm, not the #6713 fallback.
@@ -1718,25 +1812,29 @@ fn reth_policies_6722() -> Vec<PolicyRuleSnapshot> {
 /// `lan`.
 ///
 /// The ledger lands `Some(lan)` for this shape, and is order-independent in
-/// doing so. An earlier revision of this note said `None` (#6722 B2 review):
-/// that described the ledger BEFORE the projection exemption, when the member's
-/// unzoned vote counted and collided with the RETH's — the fail-CLOSED
-/// blackhole `unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722`
-/// exists to prevent. The member is a projection of the RETH's netdev, so it
-/// does not vote, and the two remaining rows agree.
+/// doing so — the answer comes from `egress_zone`, which the Go builder stamps
+/// identically on every row of the ifindex, so no row order can change it. The
+/// fail-CLOSED blackhole this prevents is pinned by
+/// `unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722`.
+///
+/// The `egress_zone` value here is what `stampEgressZones` really produces for
+/// this config, measured on the Go side by
+/// `TestBondlessRethMemberDoesNotContestTheRethsZone_6722`
+/// (pkg/dataplane/userspace/egress_zone_identity_6722_test.go), which drives the
+/// real `CompileConfig` + `buildInterfaceSnapshots` rather than a literal.
 pub(super) fn reth_member_unzoned_row_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: reth_zones_6722(),
         interfaces: vec![
             wan_row_6722(),
-            reth_row_6722("ge-0/0/1", "", true, None),
-            reth_row_6722("reth1", "lan", false, None),
-            reth_row_6722("reth1.0", "lan", false, Some("10.0.61.1/24")),
+            reth_row_6722("ge-0/0/1", "", "lan", None),
+            reth_row_6722("reth1", "lan", "lan", None),
+            reth_row_6722("reth1.0", "lan", "lan", Some("10.0.61.1/24")),
         ],
         default_policy: "deny".to_string(),
         policies: reth_policies_6722(),
         ..Default::default()
-    }
+    })
 }
 
 /// OVER-REACH CONTROL fixture: the member row carries its own EXPLICIT zone,
@@ -1748,19 +1846,21 @@ pub(super) fn reth_member_unzoned_row_snapshot_6722() -> ConfigSnapshot {
 /// ```
 ///
 /// That is a real operator statement about a real conflict, not an artefact of
-/// one netdev described three times, so it must keep failing CLOSED. The
-/// exemption is scoped to an UNZONED member row for exactly this reason.
+/// one netdev described three times, so it must keep failing CLOSED. TWO
+/// authored bindings land on this one ifindex, so `stampEgressZones` decides it
+/// identifies no single zone and stamps "" — which is why every row here
+/// carries an empty `egress_zone` while still carrying its own `zone`.
 pub(super) fn reth_member_explicitly_zoned_snapshot_6722() -> ConfigSnapshot {
-    ConfigSnapshot {
+    v5(ConfigSnapshot {
         zones: reth_zones_6722(),
         interfaces: vec![
             wan_row_6722(),
-            reth_row_6722("ge-0/0/1", "wan", true, None),
-            reth_row_6722("reth1", "lan", false, None),
-            reth_row_6722("reth1.0", "lan", false, Some("10.0.61.1/24")),
+            reth_row_6722("ge-0/0/1", "wan", "", None),
+            reth_row_6722("reth1", "lan", "", None),
+            reth_row_6722("reth1.0", "lan", "", Some("10.0.61.1/24")),
         ],
         default_policy: "deny".to_string(),
         policies: reth_policies_6722(),
         ..Default::default()
-    }
+    })
 }

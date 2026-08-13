@@ -1,3 +1,288 @@
+## 2026-08-13 — #6722 round 10: the ENUMERATION was the defect; the egress-zone answer moves to Go
+
+- **Timestamp**: 2026-08-13 (fix/6713-xfrmi-tozone, PR #6722)
+- **File(s)**: `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/zones.go`,
+  `pkg/dataplane/userspace/zones_quarantine.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/egress_zone_identity_6722_test.go` (replaces
+  `reth_member_projection_6722_test.go`),
+  `pkg/dataplane/userspace/zone_propagation_6722_test.go`,
+  `pkg/dataplane/userspace/egress_zone_protocol_6722_test.go`,
+  `pkg/dataplane/userspace/egress_zone_failclosed_6722_test.go`,
+  `pkg/dataplane/userspace/manager_compile.go`,
+  `pkg/config/compiler_validate_strict_reth_member.go`,
+  `pkg/config/compiler_opts.go`,
+  `pkg/config/compiler_uniformgates_routing_rib_rpm.go`,
+  `userspace-dp/src/protocol/snapshot.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/interfaces.rs`,
+  `userspace-dp/src/afxdp/types/forwarding.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`,
+  `userspace-dp/src/afxdp/test_fixtures.rs`,
+  `userspace-dp/src/afxdp/frame/tests_ports_live_forward.rs`,
+  `userspace-dp/tests/fixtures/protocol_wire_v1.json`,
+  `docs/userspace-dataplane-architecture.md`
+- **Action**: Two independent reviewer legs returned blocking at c9b020695 with
+  FOUR more runtime spellings of one defect — the sixth through ninth across the
+  PR's life, four of them in one round. Rather than add a fifth patch to the
+  predicate, the round replaces the mechanism.
+
+  **THE COUNT WAS THE FINDING.** The Rust ledger asked "do the rows sharing this
+  ifindex agree about its zone?" and then grew an exemption list for the rows
+  whose agreement or dissent turned out to be an artefact. It cannot answer that
+  question soundly, because a row's `Zone` is the OUTCOME of two Go-side
+  derivations whose inputs the rows no longer carry:
+  `buildInterfaceZoneMap`'s fan-up/fan-down (measured: for `ge-0/0/1` with unit
+  0 in `lan` and unit 1 in `dmz`, the BASE row carries "dmz", a zone nothing on
+  that netdev was put in, chosen because "dmz" sorts first) and
+  `snapshotLinuxName`'s aliasing (several configured identities on one netdev).
+  Every spelling was an attempt to reconstruct PROVENANCE from the outcome.
+  Provenance is not recoverable from the outcome, which is why each
+  reconstruction was holed by a config shape it had not enumerated.
+
+  **The structural replacement.** `authoredZoneRefs` (zones.go) records the
+  operator's literal `security-zone <z> interfaces <ref>` bindings before any
+  derivation. `stampEgressZones` (interfaces.go) resolves them through the same
+  aliasing the builder performs and decides, per ifindex, the zone that ifindex
+  EGRESSES into; the answer ships as `InterfaceSnapshot.EgressZone` and the
+  helper reads it. Three rules, in order: contested ownership (two egress
+  identities on one netdev with no valid reth membership between them) -> no
+  zone; exactly one authored binding -> that zone; no authored binding and no
+  unit row on the ifindex -> the units' unanimous zone (the tagged-parent
+  carrier, which is what keeps the reference cluster's `reth0` base zoned `wan`
+  and matches origin/master).
+
+  `rethProjectionMembers` and the `reth_projection` wire field are DELETED.
+  There is no per-row classification predicate on the dataplane side any more —
+  nothing for a new config shape to disagree with. What the helper still does is
+  CORROBORATE: it honours the answer only where a row on that ifindex literally
+  names that zone, preserving the #2391/#2409/#2706 property that a drifted or
+  hostile snapshot can never conjure a zone no row named.
+
+  **Measured, through the real `CompileConfig` + `buildInterfaceSnapshots`, all
+  four of the round's spellings and both required controls:**
+
+  | shape | at c9b020695 | now | origin/master |
+  |---|---|---|---|
+  | B1 `ge-0/0/1` units 0/1 in `lan`/`dmz`, ifindex 10 | 0 (fail-closed regression) | `lan` | `lan` |
+  | B1 control: rename `dmz` -> `aaa` so it sorts first | GREEN by accident | `lan` | `lan` |
+  | B1 control: single unit 0 | `lan` | `lan` | `lan` |
+  | C1 authored `ge-0/0/1.100` aliasing `reth1.100`, ifindex 32 | 0 | `lan` | `lan` |
+  | C2 WireGuard `wg0` as a reth member, ifindex 41 | `lan` (fail-OPEN) | none | none |
+  | C3 reth-as-member + #5832 collision, ifindex 31 | `lan` (fail-OPEN) | none | none |
+  | reference HA cluster ifindex 24 / 25 | `lan` / `wan` | `lan` / `wan` | `lan` / `wan` |
+
+  **C2 also gets a commit gate.** `validateRethMemberStrict` rejected member
+  logical UNITS but not a base-level `tunnel`, and a WireGuard interface
+  configures no unit at all, so the clause could not see it. The model rule is
+  now stated positively in one place — a reth member is a bare L2 port: no
+  logical units, no tunnel, not itself a reth — and read by BOTH the commit gate
+  and `egressMemberIsBarePort` in the builder, which is what holds the line on
+  the tolerant load / peer-sync path where the rejection is a warning (#1960).
+
+  **C5, the vacuous fixture.** `egress_zone_id`'s `Some(0)` short-circuit went
+  vacuous at ad4f0c113, when `populate_egress` began sourcing
+  `EgressInterface::zone_id` from the same ledger the fallback read: both arms
+  then returned the same number for every state, and the claimed binder's
+  mutation (filter zero before `or_else`) still returned 0. The resolver is now
+  a single map read — exactly equivalent for every state, with no branch left to
+  mutate — and the doc says so instead of calling the short-circuit
+  load-bearing.
+
+  **Wire encoding, and why the compatibility arm was DELETED again.** An
+  earlier revision of this round decoded `EgressZone` as `Option<String>` so
+  ABSENT (a Go binary predating the field) stayed distinguishable from EMPTY
+  (a decision that the ifindex identifies no zone), with absent falling back to
+  the pre-#6722 row-unanimity rule. The version bump below makes that arm
+  **production-unreachable**: every non-test caller sits behind an
+  exact-equality version gate, so no v5 helper can ever see a v4 producer's
+  rows. Leaving it would have left ~40 fixtures exercising a snapshot that
+  cannot exist — coverage in appearance only.
+
+  It is deleted: `egress_zone` is a plain `String`, and the 32 fixture literals
+  that relied on the absent arm are stamped explicitly. The stamping goes
+  through one helper, `test_fixtures::v5`, whose doc states that it is
+  deliberately WEAKER than `stampEgressZones` — it fills only EMPTY rows on
+  ifindexes with no explicit stamp, so a fixture can still express a
+  disagreement the production stamper would never emit. One test
+  (`absent_egress_zone_claim_falls_back_to_row_unanimity_6722`) tested only the
+  deleted arm and is retired with its reason recorded rather than rewritten
+  into something that looks like coverage; the wire cell is renamed
+  `retired_wire_key_decodes_and_absent_egress_zone_fails_closed_6722` to say
+  what it now measures.
+
+  **The migration's own risk, measured — and it found something.** A fixture
+  that starts passing for a NEW reason after a mechanical stamp is a vacuity, so
+  the consumer itself was mutated (`populate_egress` sourcing the egress row's
+  `zone_id` from the row's own zone name — `origin/master`'s behaviour — instead
+  of the #6722 ledger) and the whole crate re-run on a sandboxed copy.
+
+  It reds exactly ONE test tree-wide. The three migrated tests picked as likely
+  discriminators all stayed GREEN, and the reason is structural rather than a
+  defect in them: for an ifindex with a single configured identity the ledger's
+  answer and the row's own zone are THE SAME VALUE, so nothing that swaps one
+  for the other is observable. Those fixtures bind that a zone reaches the
+  policy decision; they never bound WHICH mechanism supplied it, before the
+  migration or after. The stamp changes what a fixture MODELS — from a snapshot
+  the wire cannot carry to one it can — not what it PROVES.
+
+  That is measured rather than argued. The same mutation was applied to the
+  PRE-migration tree (`git archive HEAD userspace-dp`, compat arm present,
+  fixtures unstamped) and the failure SETS compared:
+
+  | tree | tests the consumer mutation reds |
+  |---|---|
+  | pre-migration | `unzoned_iface_tunnel_unit_..._via_egress_row_6722` |
+  | post-migration | `unzoned_iface_tunnel_unit_..._via_egress_row_6722` |
+
+  Identical — **the migration removed no binding.** Reporting only the
+  post-migration count would have been a number with nothing to compare it to;
+  this is the comparison.
+
+  The gap the measurement did expose is real and is now closed. The single
+  surviving discriminator
+  (`unzoned_iface_tunnel_unit_does_not_inherit_a_siblings_zone_via_egress_row_6722`)
+  asserts a 0 SENTINEL, so the positive direction of B1 — the ledger's non-zero
+  answer beating a dissenting row — had no cell at all.
+  `egress_row_zone_is_order_invariant_not_last_write_6722` is that cell: the
+  reference LAN ifindex resolved in emission order and reversed, where reversing
+  puts the UNZONED member row last so last-write-wins reads 0 and the ledger
+  reads `lan`. Green on the tree, RED under the consumer mutation.
+
+  **Claim corrections folded.** The round-9 commit-check remedy pointed the
+  operator at the wrong interface (`%q` had moved from `name` to `parent`), and
+  its first consequence was stated across a branch where it is unreachable; both
+  are fixed and each consequence now names its sub-branch. Three near-verbatim
+  restatements of the corrected predicate in `compiler_opts.go`,
+  `compiler_uniformgates_routing_rib_rpm.go` and the architecture doc are
+  rewritten rather than patched, because the mechanism they describe is gone.
+  A trailing comment block in `userspace-dp/src/afxdp/forwarding/tests.rs`
+  announced "the four tests below" binding a three-conjunct projection gate;
+  there were no tests below it at all. It is replaced by cells that DO bind the
+  new resolution: decided-empty overrides row agreement; an uncorroborated
+  claim is refused; conflicting claims fail closed; and the retired wire key
+  decodes while an absent `egress_zone` fails closed. (A fifth cell binding the
+  compatibility arm was written and then retired with the arm itself — see the
+  wire-encoding note above.)
+  **THE WIRE CONTRACT CHANGED: ConfigSnapshotProtocolVersion 4 -> 5.** This
+  round DELETES `reth_projection` and ADDS `egress_zone`. A deletion cannot ride
+  an unchanged version the way an additive field can — two binaries either side
+  of it both advertise the same number and read the same bytes differently — and
+  the number that would have collided is 4, the one master ships.
+
+  My first pass on this argued NO bump, on the grounds that neither direction
+  misreads into a wrong zone. That reasoning was refuted by measurement.
+  MEASURED, v4 Go builder's rows into the v5 helper on
+  `docs/ha-cluster-userspace.conf` (node 0):
+
+  | ifindex | mixed pairing | origin/master | matched v5 pair |
+  |---|---|---|---|
+  | 24 | 0 | lan | lan |
+  | 25 | 0 | wan | wan |
+
+  Ifindex 25 is the one that settles it: the mixed pairing loses a zone even the
+  PRE-#6722 helper resolved, so it is strictly WORSE than either endpoint rather
+  than an intermediate state. My earlier claim that "both directions degrade to
+  the same fail-closed answer the pairing gave before this PR" was too strong,
+  and this is the measurement that refuted it. Under `default-policy deny-all`
+  the mixed window is a silent transit outage carrying a version both halves
+  agree on.
+
+  The other direction, measured on the real binary: the v5 builder's rows into
+  the helper at c9b020695 deserialize (no `deny_unknown_fields` anywhere in
+  `userspace-dp/src/protocol`, at that commit or this one), read
+  `reth_projection = false` from serde's default, and answer
+  `ledger[24] = None, to_zone = 0, action = Deny`.
+
+  Paired with `ensureEgressZoneProtocolLocked`, keyed on EQUALITY rather than
+  `>=`: the helper's own apply_snapshot / bump_fib gates are exact-equality, so a
+  NEWER helper refuses our snapshot too, and a `> N` spelling stays green at
+  exactly the colliding value. Deliberately unconditional in the config
+  dimension (every snapshot carries EgressZone) but conditional on having
+  OBSERVED a helper version — firing on "version unknown" would abort every
+  commit made while the helper is down, which is a brick rather than a fence
+  (#1960). Operator remedy is named in the error: upgrade xpfd and the helper
+  together, which `make cluster-deploy` / `make test-deploy` already do.
+
+  **What the gate COSTS, measured — and a correction.** An earlier revision of
+  this entry said the refusal leaves "the running helper forwarding its
+  previous-good image". It does not, and the difference matters because the two
+  outcomes have opposite availability profiles. A bump with NO gate would be the
+  keep-forwarding shape (the helper refuses at its own exact-equality check).
+  The gate deliberately trades that: `ErrEgressZoneProtocolIncompatible` joins
+  `requiredProtocolGateSentinels`, so the control plane refuses BEFORE
+  publishing, `disarmSnapshotProtocolFailClosedLocked` DISARMS the helper, and
+  transit falls to the kernel path (#2138) — fail-CLOSED, loud, legible.
+
+  `pkg/dataplane/userspace/egress_zone_failclosed_6722_test.go` measures this
+  against a recording helper instead of arguing it from five call sites: the
+  sentinel is returned; a `set_forwarding_state{Armed:false}` really reaches the
+  helper; NO `apply_snapshot` is sent (nothing half-applied); and the deferred
+  worker-arm debt survives so a later tick retries against an upgraded helper. A
+  matched-version control proves the gate does not fence the ordinary path —
+  without it, "no apply_snapshot was sent" would be evidence of nothing.
+  Both properties are mutation-bound, and on DIFFERENT assertions, so neither
+  cell's RED can be the other's:
+
+  | mutation | requests the helper saw | reds |
+  |---|---|---|
+  | gate relocated AFTER apply_snapshot | `[apply_snapshot status set_forwarding_state{armed:false}]` | ordering assertion |
+  | disarm dropped, gate kept | `[status]` | disarm assertion |
+
+  The control cell is green on both tests. An earlier attempt deleted the whole
+  gate block for these cells and got `[build failed]` twice — `errors` goes
+  unused — which is not a mutation result at all; the F2 spelling keeps
+  `errors.Join(err)` so the cell measures the disarm rather than the compiler.
+
+  **A DELIBERATE BEHAVIOUR CHANGE beyond the four findings.** The #5832
+  canonical-collision-without-a-reth shape — rejected at commit, ADMITTED on the
+  tolerant path — measured on all three trees: `origin/master` 0, PR head
+  c9b020695 `lan` (a fail-OPEN this PR's own doc admitted), now 0. So it
+  RESTORES master and retires a delta an earlier round of this PR introduced,
+  rather than changing what master does. Recorded as its own item because an
+  operator holding such a config will see the difference.
+
+  **The shipped cluster config is now a fixture, not just a smoke target.**
+  Rule 3 makes `docs/ha-cluster-userspace.conf` a live dependency: without it,
+  ifindex 25 (reth0's untagged base) fails closed against both master and the
+  previous head. `TestShippedClusterConfigResolvesBothRethIfindexes_6722` parses
+  that file through the real parser, the real `${node}` group expansion and the
+  real `CompileConfig`, and asserts ifindex 24 = `lan` / 25 = `wan`, so a conf
+  edit that moves a zone binding shows up here rather than on a cluster.
+
+  **C5 disposition.** `unzoned_interface_with_egress_row_stays_zone_zero_6713`
+  is KEPT and re-documented rather than deleted: measured, it still reds
+  (`left: 1  right: 0`) when the resolver is pointed at `ifindex_to_zone_id`,
+  so it binds the one remaining choice — WHICH MAP the egress half reads. Its
+  old doc claimed the `Some(0)` short-circuit, which no longer exists; a test
+  whose doc names a removed mechanism reads as coverage it is not providing.
+- **Validation**: `go test ./... -count=1` rc 0 (whole module). `make test-rust`
+  (the canonical release leg, `--bins --tests -- --test-threads=1`) rc 0 across
+  all seven targets — 4300 + 60 + 31 + 22 + 8 + 2 + 1 passed, 0 failed, 2
+  ignored. The wire golden was regenerated via `XPF_PROTOCOL_WIRE_REGEN=1` and
+  the stale `protocol_wire_v1.json.actual` drift artefact (written by a run
+  BEFORE the regeneration) removed.
+
+  Mutation evidence, all on sandboxed copies under `/dev/shm` so the worktree is
+  never written: the fail-closed cell's two properties (ordering, disarm) each
+  red under their own mutation and on DIFFERENT assertions; the new
+  order-invariance cell reds with `left: 0, right: 1`. The consumer-mutation
+  sweep over the whole crate is described above.
+
+  Two artefacts encountered and NOT reported as results: the sandbox copy fails
+  `shim_ipv6_ext_walk_matches_userspace_walker` because that test reads
+  `../pkg/dataplane/userspace_xdp_manifest.json`, outside the copied subtree (it
+  passes in the worktree, and it fails identically in control and mutation cells
+  so it cancels in the diff); and the three `wg::engine::engine_internal_tests`
+  concurrency cells hang past 60s whenever another cargo run shares the box, so
+  the sweep skips them.
+
+  NOT yet smoked on the cluster — the shipped `docs/ha-cluster-userspace.conf`
+  measurement above is a Go-side measurement, not a traffic test. The retained
+  shim `.o` and its manifest are byte-identical to `origin/master` (`git diff
+  origin/master...HEAD -- '*.o' pkg/dataplane/userspace_xdp_manifest.json` is
+  empty), so no `make generate` is owed; the helper BINARY does change.
+
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)

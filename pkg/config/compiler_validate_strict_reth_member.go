@@ -20,40 +20,34 @@ import (
 // `ge-0/0/1` are three rows describing ONE kernel netdev, and the RETH is the
 // one of the three that names the zone.
 //
-// The Rust forwarding builder relies on that: its egress-zone agreement ledger
-// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs) treats each snapshot
-// row as an INDEPENDENT observer of its ifindex and holds the ifindex ambiguous
-// when two rows disagree. A member's row is not an independent observer — it is
-// the RETH's port — so the Go builder marks it and the ledger withholds its
-// (empty) vote. That deference is only sound while the member really is nothing
-// but a port. Four authored shapes break it, and all four were accepted
-// before this gate:
+// The dataplane relies on that. `stampEgressZones`
+// (pkg/dataplane/userspace/interfaces.go) decides which security zone an ifindex
+// EGRESSES into, and an ifindex claimed by two configured identities identifies
+// no single zone unless one of them is the other's member port — the one
+// relation under which two identities are DESIGNED to be one netdev. The
+// deference is only sound while the member really is nothing but a port, so the
+// conditions of the model ARE the conditions of the deference. Five authored
+// shapes break it, and all five were accepted before this gate:
 //
 //   - A member naming ITSELF as its redundant parent. Nothing is its own
 //     parent; `RethToPhysical` maps the name to itself, `ResolveReth` becomes a
 //     no-op, and no aliasing happens at all — yet the interface would present
-//     as a member whose "parent" is the very row the deference silences.
+//     as a member whose "parent" is the very row the deference defers to.
 //
 //   - A RETH naming a redundant parent of ITS OWN (#6722 round 7). A reth is
 //     the L3 OWNER of a redundant pair, never a port, so this inverts the
-//     relation the deference is built on. It is also the ONLY way the CANDIDATE
-//     side of `rethProjectionMembers`' netdev comparison can be a `reth*` name,
-//     and `snapshotLinuxName` resolves that side through `ResolveReth` — which
-//     is what makes two further shapes satisfy the predicate, both measured
-//     ACCEPTED by strict `CompileConfig` before this clause and both marking a
-//     reth: `reth1 gigether-options redundant-parent reth0` (`RethToPhysical
-//     [reth0] = reth1`, so reth0's rows land on the netdev name `reth1` that no
-//     NIC carries, and reth1 is marked a projection of reth0), and the
-//     two-cycle `ge-0/0/1 redundant-parent reth1` beside `reth1
-//     redundant-parent ge-0/0/1`, where BOTH rows on the one ifindex are
-//     marked. A non-cycling `reth1 redundant-parent ge-0/0/1` marks nothing but
-//     still splits the two resolvers: `ResolveKernelIfName` (types.go) reads
-//     `RethToPhysical` UNGATED for a dotted ref, so `ge-0/0/1.0` displays as
-//     `reth1` while the dataplane binds `ge-0-0-1`.
+//     relation the deference is built on. Measured ACCEPTED by strict
+//     `CompileConfig` before this clause: `reth1 gigether-options
+//     redundant-parent reth0` gives `RethToPhysical[reth0] = reth1`, so reth0's
+//     rows land on the netdev name `reth1` that no NIC carries. A non-cycling
+//     `reth1 redundant-parent ge-0/0/1` splits the two resolvers instead:
+//     `ResolveKernelIfName` (types.go) reads `RethToPhysical` UNGATED for a
+//     dotted ref, so `ge-0/0/1.0` displays as `reth1` while the dataplane binds
+//     `ge-0-0-1`.
 //
 //   - A member naming a parent that is not configured. There is no RETH row on
-//     the shared netdev to defer TO, so the ifindex is left with no zone at all
-//     and every transit flow out of it fails closed against the 0 sentinel —
+//     the shared netdev to take the L3 identity from, so the ifindex is left
+//     with no zone at all and every transit flow out of it fails closed —
 //     silently, with a `redundant-parent` line that looks correct.
 //
 //   - A member carrying its OWN logical units. The gate fires on the PRESENCE
@@ -66,38 +60,28 @@ import (
 //     that ifindex, but only the RETH's is zoned. The member's unit is a real,
 //     independent L3 interface whose lack of a zone is a real operator
 //     statement — measured, a flow to the member unit's subnet resolved the
-//     RETH's zone and was PERMITTED where it must be denied. Junos does not
-//     allow logical-unit configuration on a reth child for exactly this reason:
-//     the child is L2-only and the reth owns the L3.
+//     RETH's zone and was PERMITTED where it must be denied.
 //
-// Rejecting these four is what lets the projection mark be the resolver's own
-// answer instead of a re-derivation of it: after this gate a member has exactly
-// one row, and the only question left is whether the RETH resolves onto THIS
-// member or onto its peer-node sibling — which is `ResolveReth`, asked directly.
+//   - A member carrying its own `tunnel` stanza (#6722 round 10). An
+//     interface-level WireGuard or GRE tunnel is an independently routed L3
+//     endpoint with its own peers and routes, and it declares NO logical unit,
+//     so the unit clause above cannot see it. Measured: `wg0 redundant-parent
+//     reth1` puts reth1, reth1.0 and wg0 on the TUN's ifindex and wg0 RECEIVED
+//     the LAN reth's zone, where origin/master answered none.
 //
-// The reth clause is also what makes the case split over that comparison
-// FINITE. `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a `reth*`
-// name and `LinuxIfName(x)` otherwise, and either side of the comparison can
-// be either, so the split is four-way, not two-way (#6722 round 7 — earlier
-// rounds argued two branches and called them exhaustive). Forbidding a `reth*`
-// CANDIDATE empties the two rows where the candidate is a reth, leaving the
-// candidate side unconditionally `LinuxIfName(name)`; the remaining two rows
-// are "the parent is a reth and resolves onto this member" (the designed case)
-// and "neither is a reth and the two names merely canonicalize together", the
-// second of which is rejected by `validateInterfaceNameCollisionStrict`
-// (#5832). Only then is the two-branch reading of the predicate true.
+// Rejecting these five is what lets the runtime deference be a single positive
+// rule instead of a growing list of exceptions: after this gate a member is a
+// bare port, and `egressMemberIsBarePort`
+// (pkg/dataplane/userspace/interfaces.go) states the same rule in the same terms
+// for the tolerant load / peer-sync path, where these rejections are downgraded
+// to warnings (#1960 no-brick) and a grandfathered config still presents them.
 //
 // Strict on commit / commit-check (hard reject, so the operator sees the
 // incoherence before it can silently mis-zone traffic); downgraded to a warning
-// on the tolerant load / peer-sync paths (opts.lenientRethMember) so a config
-// committed before this gate still boots (#1960 no-brick). What bounds the Go
-// builder for a shape that reaches it that way is that the mark is stamped on a
-// member's BASE row only, so a grandfathered member unit is never silenced. Note
-// that this does NOT by itself keep the BASE row's ifindex ambiguous: that
-// follows only for a non-VLAN unit 0, which collapses onto the base netdev — a
-// VLAN unit lands on `L(R(name)).<vlan>`, its own netdev (#6722 round 9). The
-// universal bound is the Rust gate's `zone.is_empty()` conjunct: a withheld vote
-// is always an EMPTY one, so a mark can never discard a zone the operator wrote.
+// on the tolerant paths via opts.lenientRethMember. What bounds a shape that
+// reaches the builder that way is the runtime half above: an incoherent
+// membership leaves the shared device with two independent claimants, so its
+// ifindex identifies no zone and fails CLOSED.
 func validateRethMemberStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -127,17 +111,22 @@ func validateRethMemberStrict(cfg *Config) error {
 				name)
 		}
 		if strings.HasPrefix(name, "reth") {
-			// The consequences below are stated as POSSIBILITIES on purpose.
-			// Which one follows depends on the rest of the config — on whether
-			// this interface wins `RethToPhysical`'s scoring against the
-			// parent's real physical ports, and on whether anything names it as
-			// ITS parent — and every earlier spelling asserted one of them
-			// unconditionally and was measured false for a shape this very gate
-			// rejects (#6722 rounds 8 and 9: a reth parent that already has a
-			// real member marks nothing; a two-name cycle whose reth has a
-			// lower-named third member marks neither cycle row). What IS
-			// unconditional is the entry into the scoring, so that is what the
-			// message asserts.
+			// The consequences are stated as POSSIBILITIES on purpose, and each
+			// one names the sub-branch it belongs to. Which of them follows
+			// depends on the rest of the config — on whether this interface wins
+			// `RethToPhysical`'s scoring against the parent's real physical
+			// ports, and on whether the parent is itself a reth — and every
+			// earlier spelling asserted one unconditionally and was measured
+			// false for a shape this very gate rejects (#6722 rounds 8 and 9: a
+			// reth parent that already has a real member marks nothing; a
+			// two-name cycle whose reth has a lower-named third member marks
+			// neither cycle row). What IS unconditional is the entry into the
+			// scoring and the contested device, so those two are stated flatly.
+			//
+			// The remedy names %q = `name` — the interface carrying the
+			// offending line — in both sub-branches. Round 9 pointed it at
+			// `parent`, which reads as advice to edit a physical port that has no
+			// members and no redundant-parent line of its own (#6722 round 10 N2).
 			return fmt.Errorf(
 				"interface %q is a redundant-ethernet interface and also names "+
 					"`gigether-options redundant-parent %s`; a reth OWNS the L3 "+
@@ -146,24 +135,25 @@ func validateRethMemberStrict(cfg *Config) error {
 					"something else. `RethToPhysical` keys its map on the "+
 					"redundant-parent NAME, so this line enters %q into the "+
 					"scoring for what %q resolves to, competing with %q's real "+
-					"physical ports. Depending on the rest of the config that can "+
-					"put %q's addresses, security zone and ifindex on the netdev "+
+					"physical ports. It leaves the shared device with two "+
+					"independent claimants and no member relation between them, so "+
+					"the snapshot builder refuses to name an egress security zone "+
+					"for it and every transit flow out of it falls to the default "+
+					"policy. When %s IS itself a reth, winning that scoring also "+
+					"puts %q's addresses, security zone and ifindex on the netdev "+
 					"name %q — which, a reth not being a kernel device, no NIC "+
-					"carries; it can make the snapshot builder mark %q a "+
-					"PROJECTION of %q and withhold its egress-zone vote, the L3 "+
-					"owner silenced in favour of its own supposed parent; and when "+
-					"%s is not itself a reth it splits the two resolvers, because "+
-					"`ResolveKernelIfName` honours this map entry for a dotted "+
-					"reference where the dataplane's `snapshotLinuxName` does not, "+
-					"so units under %s DISPLAY on one device and forward on "+
-					"another. Name the physical ports (ge-/xe-/et-) as the members "+
-					"of %q and remove the redundant-parent line from it",
+					"carries. When %s is NOT a reth it splits the two resolvers "+
+					"instead, because `ResolveKernelIfName` honours this map entry "+
+					"for a dotted reference where the dataplane's "+
+					"`snapshotLinuxName` does not, so units under %s DISPLAY on one "+
+					"device and forward on another. Name the physical ports "+
+					"(ge-/xe-/et-) as the members of %q and remove the "+
+					"redundant-parent line from it",
 				name, parent,
 				name, parent, parent,
-				parent, name,
-				name, parent,
+				parent, parent, name,
 				parent, parent,
-				parent)
+				name)
 		}
 		if _, ok := LookupInterface(cfg, parent); !ok {
 			return fmt.Errorf(
@@ -174,6 +164,30 @@ func validateRethMemberStrict(cfg *Config) error {
 					"of it is dropped — configure %q, or correct the "+
 					"redundant-parent name",
 				name, parent, parent, parent)
+		}
+		if ifc.Tunnel != nil {
+			// #6722 round 10. The unit clause below cannot reach this: an
+			// interface-level tunnel (WireGuard, GRE) configures its L3 identity
+			// in the `tunnel` stanza and may declare no logical unit at all, so
+			// a WireGuard member passed every clause of this gate — and
+			// WireGuard's own interface-level validation accepts the shape too.
+			// Measured: `wg0 redundant-parent reth1` puts reth1, reth1.0 and wg0
+			// on the TUN's ifindex, and the egress MAC gate admits wg0 through
+			// `iface.tunnel.then_some([0; 6])` where the reth's own rows fail it
+			// — so an independently ROUTED WireGuard endpoint received the LAN
+			// reth's zone. That is the fail-OPEN direction.
+			return fmt.Errorf(
+				"interface %q is a member of redundant-ethernet interface %q and "+
+					"also configures a `tunnel`; a reth member contributes a "+
+					"physical PORT and nothing else, while a tunnel interface is an "+
+					"independently routed L3 endpoint with its own peers and routes. "+
+					"`ResolveReth` collapses %q's addresses, security zone and "+
+					"ifindex onto %q's device, so traffic routed out %q would be "+
+					"evaluated in %q's zone. Name a physical port (ge-/xe-/et-) as "+
+					"the member of %q, or remove the redundant-parent line from %q",
+				name, parent,
+				parent, name, name, parent,
+				parent, name)
 		}
 		if unitNum, ok := firstUnitNumber(ifc); ok {
 			// Deliberately says what the gate KNOWS. It fires on the presence of

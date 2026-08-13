@@ -34,7 +34,31 @@ const (
 	// ensureScopedGlobalZoneSetProtocolLocked required-protocol gate in
 	// manager_compile.go, which DISARMS the helper and aborts the commit
 	// when the running helper is too old to represent a multi-zone scope.
-	ProtocolVersion                  = 4
+	//
+	// v5 (#6722): the per-interface EGRESS zone is decided by the Go builder
+	// and carried in InterfaceSnapshot.EgressZone; the reth_projection field
+	// that the previous contract carried is GONE. This is a field DELETION
+	// paired with an addition, so unlike an additive field it cannot ride an
+	// unchanged version: at v4 two binaries built either side of this change
+	// both advertise 4 and interpret the same bytes differently, and nothing
+	// on the wire distinguishes them.
+	//
+	// The mixed pairing is not merely "not yet fixed", which is why the bump
+	// is not optional. MEASURED, feeding the v4 Go builder's rows to the v5
+	// helper on the reference cluster (docs/ha-cluster-userspace.conf, node
+	// 0): egress zone of ifindex 24 = 0 and ifindex 25 = 0, where BOTH
+	// origin/master and the v5 pair resolve `lan` and `wan`. Ifindex 25 is the
+	// telling one — it loses a zone that even the pre-#6722 helper resolved —
+	// so the pairing is strictly worse than either endpoint, not an
+	// intermediate state. Under `default-policy deny-all` that is a silent
+	// transit outage whose only signature is a version both sides agree on.
+	//
+	// Paired with ensureEgressZoneProtocolLocked (manager_compile.go), which
+	// gates on EQUALITY rather than `>=`: the helper's own apply_snapshot and
+	// bump_fib_generation gates are exact-equality, so a helper at ANY other
+	// version refuses the snapshot, and a `>=` gate would stay green at
+	// exactly the value that collides.
+	ProtocolVersion                  = 5
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 
@@ -262,39 +286,50 @@ type InterfaceSnapshot struct {
 	VLANID          int    `json:"vlan_id,omitempty"`
 	LocalFabric     string `json:"local_fabric_member,omitempty"`
 	RedundancyGroup int    `json:"redundancy_group,omitempty"`
-	// RethProjection marks a row whose netdev is ALREADY described by a RETH's
-	// own row — a PROJECTION of that row rather than an independent observer of
-	// the netdev (#6722). It is the ANSWER, decided here where ResolveReth and
-	// the whole interface table are in hand; the Rust agreement ledger
-	// (userspace-dp/src/afxdp/forwarding_build/interfaces.rs) reads the fact and
-	// re-derives nothing.
+	// EgressZone is the security zone this row's IFINDEX egresses into, or "" for
+	// none (#6722). It is the ANSWER, decided in stampEgressZones (interfaces.go)
+	// where the operator's authored `security-zone ... interfaces <ref>` bindings
+	// and snapshotLinuxName's aliasing are both in hand. Every row sharing an
+	// ifindex carries the SAME value.
 	//
-	// ResolveReth (pkg/config/types.go) collapses a RETH onto its physical
-	// member's netdev, and snapshotLinuxName applies it to the reth base row AND
-	// its units, so `ge-0/0/1`, `reth1` and `reth1.0` are one ifindex. Junos
-	// zones the RETH, never the member, so the member's row arrives UNZONED and
-	// its "no zone" would otherwise be counted as a dissenting vote that makes
-	// the RETH's own zone ambiguous.
+	// It is NOT Zone with a different name. Zone is this row's own zone as
+	// buildInterfaceZoneMap derived it, and is what the INGRESS half attributes an
+	// arriving packet to (#921/#3618, unchanged). EgressZone answers the different
+	// question the egress half must ask — "does this ifindex identify exactly one
+	// zone" — for a netdev that several configured identities may share.
 	//
-	// Set by rethProjectionMembers (interfaces.go), which asks snapshotLinuxName
-	// — the function that CREATES the aliasing — whether the named parent's base
-	// row resolves to this interface's netdev. Set on a member's BASE row only:
-	// validateRethMemberStrict rejects a member that configures its own logical
-	// units, and one that arrives anyway via the tolerant load / peer-sync path
-	// is an independently ADDRESSED L3 interface whose vote must stand.
+	// The Rust helper honours it only when some row on the ifindex literally
+	// carries that zone NAME (forwarding_build::interfaces::populate_interfaces),
+	// so a drifted or hostile snapshot can never conjure a zone no row on the
+	// ifindex named. That is the whole of the helper-side check: there is no row
+	// classification left for a config shape to disagree with.
 	//
-	// This replaced four successive RE-DERIVATIONS of the resolver's answer —
-	// from the raw `redundant_parent` string, from co-resident row names, then
-	// from the set of netdevs the RETH's rows occupy. Each was holed by a config
-	// strict CompileConfig then accepted; the last by a member unit carrying its
-	// own address, which lands exactly where the RETH's unit lands and so passed
-	// the netdev-set test while being a real independent observer.
+	// Emitted UNCONDITIONALLY (no omitempty), because the helper must be able to
+	// tell "this Go binary decided the ifindex identifies no zone" from "this Go
+	// binary predates the field". The Rust side decodes it as Option<String>:
+	// absent is the old binary and falls back to the pre-#6722 row-unanimity
+	// rule; present-and-empty is a decision and resolves the 0 sentinel.
 	//
-	// Additive: an old Rust helper ignores the field (no deny_unknown_fields)
-	// and keeps the pre-#6722 fail-CLOSED behavior; an old Go binary omits it
-	// and a new helper defaults to false, likewise fail-closed. The degraded
-	// direction is the safe one.
-	RethProjection            bool                       `json:"reth_projection,omitempty"`
+	// MIXED-VERSION MATRIX, measured on both trees rather than reasoned.
+	// ConfigSnapshotProtocolVersion stays at 4: this repo bumps it when an old
+	// reader MISREADS a snapshot into a wrong answer (#5488's
+	// ErrScopedGlobalZoneSetProtocolIncompatible — an old helper reads only the
+	// singular match_from_zone and NARROWS a global deny, a fail-OPEN). Neither
+	// direction here misreads.
+	//
+	//	new Go -> OLD helper: measured by running the helper at c9b020695
+	//	  against the wire shape this builder emits — it deserializes (no
+	//	  deny_unknown_fields anywhere in userspace-dp/src/protocol, at that
+	//	  commit or this one), reads reth_projection=false from serde's default,
+	//	  and answers ledger[24]=None, to_zone=0, action=Deny.
+	//	old Go -> NEW helper: pinned in-tree by
+	//	  old_go_wire_shape_into_new_helper_fails_closed_6722 — the retired key
+	//	  is ignored, egress_zone is None, and the compat arm answers 0.
+	//
+	// Both directions LOSE the fix during a mixed window and neither invents a
+	// zone: a partially-upgraded bondless-RETH cluster keeps blackholing until
+	// both halves land, which is what it did already.
+	EgressZone                string                     `json:"egress_zone"`
 	UnitCount                 int                        `json:"unit_count"`
 	Tunnel                    bool                       `json:"tunnel"`
 	MTU                       int                        `json:"mtu,omitempty"`

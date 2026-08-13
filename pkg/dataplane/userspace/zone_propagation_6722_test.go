@@ -406,11 +406,15 @@ func TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722(t *testing.T) {
 		// inheriting the HA flow-cache redundancy group onto member rows.
 		"set interfaces reth1 redundant-ether-options redundancy-group 2",
 		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
-		// The MEMBER is explicitly zoned into the doomed zone. That is the whole
-		// point: without an explicit member zone there is nothing for the
-		// quarantine to blank and the exemption would apply for the ordinary
-		// reason instead.
-		"set security zones security-zone z214 interfaces ge-0/0/1.0",
+		// The MEMBER is explicitly zoned into the doomed zone, and the reference
+		// is on the member's BASE name rather than a `.0` unit. That matters:
+		// `ge-0/0/1` configures no logical unit, so a `ge-0/0/1.0` reference
+		// names a row that does not exist and lands on no ifindex at all —
+		// which made an earlier revision of this cell VACUOUS (measured: with
+		// the unit-suffixed ref, deleting stampEgressZones' quarantine exclusion
+		// left the whole package green). With the base reference the binding
+		// really does reach ifindex 24 and compete with the reth's.
+		"set security zones security-zone z214 interfaces ge-0/0/1",
 		"set security zones security-zone z174 host-inbound-traffic system-services ping",
 		// The RETH carries the SURVIVING zone — the one the ledger must resolve.
 		"set security zones security-zone lan interfaces reth1.0",
@@ -452,10 +456,23 @@ func TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722(t *testing.T) {
 			"must strip the colliding zone off the MEMBER row — that blanking is "+
 			"the half of the exemption trigger this test is about", member.Zone)
 	}
-	if !member.RethProjection {
-		t.Fatalf("ge-0/0/1 is not marked a RETH projection, so the exemption's " +
-			"OTHER half is absent and a resolved zone below would be explained " +
-			"by something other than the interaction under test")
+	if member.EgressZone != "lan" {
+		t.Fatalf("post-quarantine ge-0/0/1 EgressZone = %q, want %q. Losing one of "+
+			"two colliding zones turns this ifindex from CONTESTED into unanimous, "+
+			"so the SURVIVOR's zone is the right answer and the quarantine's "+
+			"deliberate default-deny applies to z214's interfaces, not to this "+
+			"device. stampEgressZones drops a binding to a to-be-quarantined zone "+
+			"BEFORE deciding, which is why blanking EgressZone afterwards would be "+
+			"wrong (it would leave this ifindex with no zone at all)",
+			member.EgressZone, "lan")
+	}
+	for _, s := range snap.Interfaces {
+		if s.EgressZone == "z214" {
+			t.Fatalf("interface %q carries EgressZone %q, a QUARANTINED zone; the "+
+				"quarantine drops that zone from the published set, so the Rust "+
+				"corroboration would reject it and the ifindex would silently lose "+
+				"its zone — the answer must never name a dropped zone", s.Name, s.EgressZone)
+		}
 	}
 	if reth.Zone != "lan" {
 		t.Fatalf("reth1.0 Zone = %q, want %q: the surviving zone must still be on "+
