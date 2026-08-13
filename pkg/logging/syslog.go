@@ -920,8 +920,66 @@ func ParseSeverity(name string) int {
 	}
 }
 
+// ParseFacilityChecked converts a facility name to its numeric code and
+// reports whether the name was RECOGNIZED (#5797).
+//
+// ParseFacility below collapses "unrecognized" and "local0" into the same
+// return value, so a caller cannot tell an authored `local0` from a typo that
+// silently became local0 — records then leave under a facility the operator
+// never wrote, and the remote collector's facility-based routing/filtering
+// silently misfiles them. Callers that can surface the difference (the daemon's
+// syslog client wiring) MUST use this form; ParseFacility is retained for
+// callers that genuinely only want the code.
+//
+// The recognized set is exactly ParseFacility's mapped names — no more, no
+// less. It is NOT derived from a config-side gate, because there is no gate to
+// derive it from: `system syslog <dest> <facility> <severity>` models the
+// facility as the schema's wildcard KEY (pkg/config syslogFacilitySeverityLeaf)
+// and attaches a validator only to the severity VALUE, so any facility spelling
+// whatsoever commits clean and arrives at the daemon verbatim. (pkg/config's
+// `syslogFacilities` enum does gate a facility name, but on the unrelated
+// `security log ... facility` leaf — do not mistake it for this surface.)
+// TestParseFacilityCheckedKnownSetIsExactlyParseFacility_5797 pins the
+// two-function agreement over the whole mapping table.
+//
+// `any` is deliberately NOT recognized: it is a selector wildcard meaningful to
+// the rsyslog-backed file/user destinations, not a numeric facility a host
+// client can stamp on a record.
+func ParseFacilityChecked(name string) (int, bool) {
+	switch name {
+	case "kern", "user", "daemon", "auth", "syslog",
+		"local0", "local1", "local2", "local3",
+		"local4", "local5", "local6", "local7",
+		"change-log":
+		return ParseFacility(name), true
+	default:
+		return FacilityLocal0, false
+	}
+}
+
+// FacilityIsWildcard reports whether name is the Junos "all facilities"
+// wildcard rather than a facility name to be mapped.
+//
+// #6829 A3: `set system syslog host <ip> any <sev>` is the CANONICAL Junos
+// form — it is the repo's own fixture in parser_system_test.go — and `any`
+// deliberately names no facility. ParseFacilityChecked correctly reports it
+// unmapped (it has no case, so it takes the local0 default like any other
+// unrecognized name), but a CALLER must not turn that into a substitution
+// warning: the #5797 warning says "records will carry a facility the
+// configuration does not name", which for `any` is literally false — the
+// configuration names none on purpose. Warning on the canonical form is exactly
+// the train-operators-to-ignore-it failure the warning exists to avoid.
+//
+// This is a caller-side suppression, not a mapping change: ParseFacility and
+// ParseFacilityChecked both still return FacilityLocal0 for `any`, unchanged.
+func FacilityIsWildcard(name string) bool { return name == "any" }
+
 // ParseFacility converts a facility name to its numeric code.
 // Returns FacilityLocal0 for unrecognized names.
+//
+// #5797: prefer ParseFacilityChecked at any call site that can report the
+// substitution — this form cannot distinguish an unmapped name from an
+// authored local0.
 func ParseFacility(name string) int {
 	switch name {
 	case "kern":

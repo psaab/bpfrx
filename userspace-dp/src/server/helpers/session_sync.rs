@@ -10,9 +10,42 @@
 use crate::afxdp::{self, SyncedSessionEntry};
 use crate::protocol::SessionSyncRequest;
 
+/// #4555/#6923: the second producer of a session key, and the one the packet
+/// path cannot vouch for.
+///
+/// The AF_XDP shim's over-limit refusal rests on an invariant about the session
+/// MAP, not about the packet in front of it: an IPv6 chain longer than
+/// `MAX_EXT_HDRS` leaves the shim holding an extension-header type as
+/// `protocol` with ports 0/0, and the refusal is that no such key can be
+/// present, so the lookup misses and the packet is redirected to userspace.
+/// `metadata_tuple_complete` (frame/inspect.rs) is what makes that true of the
+/// PACKET path. This is the other way a key enters the map: a peer reconstructs
+/// arbitrary `protocol`/`src_port`/`dst_port` off the wire, and the session map
+/// is global — the shim probes one map, whoever wrote the row. A synced row for
+/// an extension-header protocol therefore hands the shim a hit for exactly the
+/// chain it refused, and a peer-synced `LocalDelivery` row publishes
+/// `PASS_TO_KERNEL`, returning the frame to the kernel stack unfiltered.
+///
+/// Such a key is not producible by a correct peer — its own packet path refuses
+/// to build one — so this rejects rather than sanitises, and the caller
+/// surfaces the error on the control response instead of importing the row.
+fn reject_unresolved_ipv6_ext_protocol(req: &SessionSyncRequest) -> Result<(), String> {
+    if req.addr_family as i32 == libc::AF_INET6
+        && crate::afxdp::ipv6_ext_header_is_traversable(req.protocol)
+    {
+        return Err(format!(
+            "refusing synced session with unresolved IPv6 extension-header protocol {}: the walk \
+             traverses it, so it is never an upper-layer protocol a peer resolved",
+            req.protocol
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn build_synced_session_key(
     req: &SessionSyncRequest,
 ) -> Result<crate::session::SessionKey, String> {
+    reject_unresolved_ipv6_ext_protocol(req)?;
     Ok(crate::session::SessionKey {
         addr_family: req.addr_family,
         protocol: req.protocol,

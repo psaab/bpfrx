@@ -39,6 +39,204 @@ consumers. CoS queue status includes queue-scoped drain-phase counters so
 operators can separate guarantee bytes, surplus bytes, and non-exact bytes
 sent while exact queues were still backlogged.
 
+
+### Proving the shim/userspace parity guards actually bind
+
+`userspace-xdp/src/ipv6_ext_walk.rs` is guarded by
+`test/mutation/shim-ext-parity-acceptance.sh`, not by `make test` alone. The
+script mutates the walk across 16 mutation rows plus one negative control,
+bracketed by a green baseline (row 0) and a post-restore recheck, and requires
+the parity guards in
+`userspace-dp/src/afxdp/frame/tests_shim_ext_parity.rs` to red on each edit. It
+prints per-row accounting at the end, so the evidence quoted in a PR body is
+checkable against the matrix rather than against a bare `PASS`.
+
+One mutation per row, and one ARM per row where an edit applies to several: a
+row that mutated the GENERIC and AUTH revalidation bases together scored RED on
+either arm reding, so it could not support the claim about both that its label
+made.
+
+Rows 1-11 perturb an arm UNIFORMLY. Rows 12-15 are keyed on a SINGLE data value
+— `+8` only at `HdrExtLen == 4`, `+4` only at AH `HdrExtLen == 2`, Fragment
+advancing 7 only when `reserved != 0`, and the carried next-header UDP
+propagated as TCP. Each changes real packet classification and each was GREEN
+before the corpus gained its exhaustive dimension sweeps, because the corpus
+sampled 5 of 256 generic declared lengths, 3 of 256 AUTH ones, one value of the
+Fragment `reserved` byte, and declared TCP as the terminal in every single
+chain. A uniform-mutation matrix cannot find that class; only closing the
+dimension can. Row 16 is the same shape in a different axis — the post-advance
+revalidation skipped only for Routing(43) — and was green while the generic
+arm's eight next-header values shared one boundary witness between them.
+
+Run it whenever you change that walk. `make test` tells you the guards are
+green; it does not tell you they still bind, and this file has a history of the
+difference mattering: an earlier build gate used `cargo build --release`, which
+never compiles the `#[cfg(test)]`-only parity module, so a deliberate syntax
+error produced `BUILD rc=0 TEST rc=101` and was scored as "the guard fired".
+
+Two preflights run first and must themselves fail when broken — one proves the
+build gate really compiles the file under test, one proves a filter matching
+nothing is scored MISSING rather than `ok` (`cargo test` exits 0 on a filter that
+matches no test).
+
+The baseline is VERIFIED BEFORE IT IS CAPTURED, and an unverifiable baseline
+ABORTS. Three ways that used to fail open, all reproduced:
+
+* The gold copy was taken at the top of the script and git consulted 138 lines
+  later, so on a tree git could not speak for, the mutation had already become
+  the baseline. Replayed against an archive with no `.git`, the script printed
+  `UNVERIFIED` and ran every row against a `(len+1)*8 -> (len+1)*16` mutation
+  installed as "pristine", then "restored" it at the end.
+* "Not a git work tree" was a WARNING. It is now `ABORT` — a harness whose whole
+  subject is probes that report success without observing anything cannot make
+  an exception of itself.
+* `git diff` believes the INDEX for a path flagged `assume-unchanged` or
+  `skip-worktree`, so it never stats the file. `git update-index
+  --assume-unchanged` flipped `diff --quiet HEAD` from rc 1 to rc 0 with the
+  mutation still on disk, and the check reported "matches git HEAD (index
+  included)". The `ls-files -v` tag must now be `H`.
+
+The comparison is against `HEAD`, index included; comparing against the index
+alone let a STAGED mutation be captured as the pristine gold copy and restored
+as such.
+
+Scope of that check, precisely: exactly one path, `ipv6_ext_walk.rs`, because
+that is the file the script overwrites. The guard tests and the negative
+controls are NOT compared against git — they are covered behaviourally, by
+row 0 (green on the unmutated tree) and the NEG-CTL row (a semantically null edit must
+SURVIVE). Neither is a claim that the working tree matches `HEAD`.
+
+The corpus builder also carries non-vacuity floors. The assertions that CONSUME
+the corpus are of the form "this collection is empty" or "the loop visited every
+(offset, case) pair", and both hold trivially on an empty corpus — the guards
+that read the manifest's emitted facts, and both negative controls, do not
+consume it and are unaffected. (The coverage half used to be
+`compared == cases * offsets`, which was tautological: the counter incremented
+inside the loops it claimed to measure, so any edit that skipped a case skipped
+its increment too. It is now a visited set of `(l3, name)` pairs recorded AFTER
+each comparison, checked against a cross product built independently from the
+two inputs, plus a distinct-names assertion so the set cannot collapse two cases
+into one.)
+
+Those floors are named per SHAPE — per-arm boundary witness pairs, the
+chain-length boundary, the next-header sweep, the long-chain shape, the L3
+offsets, and each remaining named corpus BLOCK — and not as one size threshold,
+because a size threshold did not bind:
+a single `cases.len() >= 200` stood there while 256 of the ~310 cases came from
+one homogeneous next-header sweep, so cutting the corpus down to that sweep AND
+deleting the generic arm's post-advance bounds revalidation was measured to
+leave all five tests `ok`.
+
+Naming the shape is not enough either. The replacement floors counted CASES
+SATISFYING A PREDICATE, and three of the five predicates had degenerate
+satisfiers: a 40-byte packet declaring an arm "fails closed" without ever
+reaching that arm's boundary, one `DestOpt(len=6)` header lands on the same
+terminal offset as a seven-header chain, and a seven-byte buffer carries a
+next-header byte neither walker ever classifies. So each floor now binds its
+shape by CONSTRUCTION — the corpus must contain a locally rebuilt reference
+buffer, byte for byte — and, where the shape is behavioural, by MEASUREMENT
+with this crate's walker. The per-arm floor requires a WITNESS PAIR: the padded
+twin must resolve the terminal at exactly the advance target (proving the
+boundary was reached) and the tight twin, one byte shorter, must fail closed
+(attributing the refusal to the length check). The tight twin's fail-closed is
+the failure DEFAULT of the reference walker, so it is only attributable once the
+twin is asserted to be the padded one minus exactly its last byte — otherwise a
+generator that made the two differ in a header byte as well as in length would
+satisfy the pair while isolating nothing.
+
+"Per-arm" was also per-arm-MEMBER coverage of exactly one member. Eight
+next-header values enter the shim's single GENERIC `match` arm and share its
+advance and its post-advance revalidation, but only DestOpt had a boundary pair
+— so a revalidation skipped when `protocol == ROUTING` was a fail-open of
+precisely the shape that pair exists to catch, invisible to it, and invisible to
+the 256-value sweep as well (those buffers carry 20 bytes of slack past the
+advance target, and only a packet ENDING at or before the target can observe a
+missing bounds check). Every generic member now carries a pair, and the check is
+stated over EVERY ADVANCING ARM rather than over the arm the defect was found in
+— naming GENERIC and stopping there would repeat the mistake one level up. The
+membership is enumerated by asking the reference walker to classify all 256
+next-header values: GENERIC has 8 members (0, 43, 60, 135, 139, 140, 253, 254),
+AUTH exactly 1 (51), FRAGMENT exactly 1 (44), so GENERIC was the only arm that
+could carry the defect — but that is an OUTPUT of the loop, not an assumption in
+it, and a ninth value added to any advancing arm reds. `NoNextHeader` (59) and
+the 244 terminal values are excluded on purpose: they neither read nor advance,
+so there is no bound to weaken and a boundary pair would witness nothing; their
+property is bound by the 256-value sweep and the classification negative
+control. The acceptance matrix carries the one-member mutation as its own row.
+
+**A witness pair is worth its error FAMILY, and no more.** The pair's derivation
+— an error `a*l + b` vanishing at two distinct declared lengths is identically
+zero — is a statement about errors AFFINE in the declared length, and nothing in
+the corpus enforces that premise. `+ 8` only when `HdrExtLen == 4` is not
+affine, is a real classification regression, and vanishes at both witnesses and
+at every one of the 251 declared lengths the corpus did not sample. A seventh
+floor therefore sweeps four dimensions COMPLETELY: generic declared lengths,
+AUTH ones, all 256 values of the Fragment `reserved` byte (that arm has no
+declared length, so a byte neither walker reads is the analogous hiding place),
+and all 256 values of the next-header an extension header CARRIES. Presence is
+not enough for the first three — 256 buffers that all fail closed would satisfy
+it — so each value is also measured to resolve its terminal at that arm's own
+advance target.
+
+**One of those four is JOINT and three are MARGINAL, and the difference is part
+of the claim.** A marginal sweep of A with B held fixed says nothing about an
+error conditioned on A *and* B — the same shape, one level up, as the
+non-affine error two witnesses could not see. 256⁴ is not enumerable, so the
+design covers the four marginals plus the one pair the arm's own code makes
+reachable: the generic sweep is joint over (entering next-header × declared
+length), 8 × 256 = 2048 cases, because the entering value selects the `match`
+arm while `opt[1]` feeds its advance. Explicitly NOT covered: (declared length ×
+carried next-header), which is 256 × 256 = 65536 buffers of up to 2 KB and was
+judged not worth the corpus; every 3-way combination; and an arm reached as a
+LATER header, since every sweep case is a single extension header at offset 40.
+An error keyed on `opt[0] == 17 && opt[1] == 4` survives this floor. What
+measures whether that gap matters is the acceptance matrix, not a bigger corpus.
+
+Nor do the five shape floors SUBSUME a coverage floor, which is what deleting
+the old `handcrafted >= 40` count assumed. Between them they require ten
+boundary buffers, the two chain-length twins and the two long chains — 14
+hand-written cases before the 256-value sweep — so the intermediate chain
+lengths, the varied declared lengths, the truncation block, the minimal per-arm
+packets, the non-first fragments, the AH sweep and the #4517 Mobility cases
+could all be deleted with every floor green. Measured: dropping the ten
+varied-length HbH cases and the ten truncation cases takes the hand-written
+count 55 -> 35, which the old count floor caught and none of the shape floors
+does. A sixth floor now binds the BLOCKS themselves — each named category
+rebuilt locally and required in the corpus in full, so deleting a category names
+that category in the failure. Not restored as a count: the old threshold was
+arbitrary, and a count has degenerate satisfiers.
+
+The floors' reference buffers are built by `expect_chain`, deliberately NOT by
+the corpus's own `chain` generator. Rebuilding with `chain` and then looking the
+result up in a corpus `chain` produced is circular at the level of the
+generator: making `chain` write TCP at byte 6 for every one-header input
+collapses the 256-value sweep to a single distinct next-header value, no verdict
+moves on either walker, and the floor still reports 256 present. The
+cross-walker comparison catches a unilateral misclassification; it cannot catch
+a common-mode change to the inputs both walkers are fed. The next-header floor
+additionally reads back the value each corpus buffer CARRIES at byte 6 and
+requires 256 distinct ones.
+
+A floor is worth its predicate, never the prose beside it, so each one also
+states what it does NOT cover. They stop a shape being deleted between
+acceptance runs; they do not establish that the corpus is adequate, which is
+what the matrix above measures.
+
+The parity file also states, as a list rather than as an example, everything it
+asserts about the shim rather than runs: `parse_l2`'s L3 offsets, `parse_ipv6`'s
+arguments to the walk, `parse_l4`'s catch-all (which the `OverLimit` fold rests
+on), and the manifest-to-object relationship. The shim crate is `#![no_std]`
+over `aya-ebpf` and does not build for the host — `cargo build --target
+x86_64-unknown-linux-gnu` fails with "unwinding panics are not supported without
+std" — so its entry points cannot be executed from that test binary at all. An
+accurate list of what is asserted is worth more than naming one item, which
+reads as a claim that the rest are covered.
+
+Note `ipv6_ext_walk.rs` is a hashed input of `userspace_xdp_manifest.json`, so
+even a comment edit there requires `make generate` and trips
+`TestUserspaceXDPShimObjectMatchesSourceManifest` until you do. That is why this
+pointer lives here rather than in the file it describes.
+
 ## Shim artifact: pinned toolchain + verifier gates (#1864)
 
 `userspace_xdp_bpfel.o` (the retained Rust AF_XDP shim, built from
@@ -208,6 +406,77 @@ Guard layers (`build-userspace-xdp.sh`):
      a message pointing back to `make generate`.
      `TestUserspaceXDPManifestCoversTrackedShimInputs` additionally guards
      the input SET so a manifest hand-edit cannot drop or invent entries.
+6. **Verifier-headroom tripwire (#4555)** — every layer above is BINARY:
+   the object loads or it does not. That is exactly how the shim came to
+   sit at 990,796 of 1,000,000 processed insns (0.92% headroom) with all
+   five gates green, until a routine change to the IPv6 extension-header
+   walk hit the 1M wall and had to be redesigned around the budget. So
+   `shimverify` now also reads the verifier's own accounting
+   (`LogLevelStats` → `processed N insns (limit M)`) and refuses a
+   candidate that LOADS but leaves less than
+   `UserspaceShimMinVerifierHeadroomPct` (3%) unused.
+   - **Exit codes**: `0` PASS (measured, above the floor), `3` verifier
+     REJECT, `4` loads but below the floor, `5` loads but headroom could
+     NOT be measured, `6` loads and INSTALLS with the gate overridden,
+     `2` usage, `1` other. The recipe has an arm for each. An overridden
+     run gets its own code rather than `0`, so a non-interactive caller
+     can tell "measured and comfortably clear" from "we could not check,
+     and someone had the variable exported" without parsing stderr.
+   - **Unmeasurable is a failure, deliberately.** If the running kernel's
+     log carries no recognisable stats line the floor cannot be applied,
+     and passing there would switch the gate off at the one moment
+     headroom is unknown — reproducing the blind spot it exists to close.
+   - **Override**: `XPF_SHIM_ALLOW_LOW_HEADROOM=1` covers both refusals,
+     mirroring `XPF_SHIM_ALLOW_UNPINNED_INSTALL`. It is threaded through
+     the `sudo` hop explicitly (sudo scrubs the environment, so it would
+     otherwise be a silent no-op). Consuming it prints a loud banner
+     naming the object and the reason; a run that did NOT need it but has
+     it set prints a staleness note, because the variable lives in the
+     ambient environment and a value exported once would otherwise
+     disarm the gate forever.
+   - 3% is a tripwire, not a performance target: it says "the next change
+     here will not fit" while there is still room to plan. The comparison
+     is `<`, so an object leaving EXACTLY 3.00% passes;
+     `TestShimverifyDecision` carries a `970000/1000000` fixture, the only
+     one that distinguishes `<` from `<=`.
+   - **The decision lives in ONE place.** `decide()` maps
+     `(stats, override)` to the verdict, and `run()` only PRESENTS it —
+     `main()` is `os.Exit(run(...))` and nothing else. Before that, `main`
+     called `decide` and then independently REPEATED both predicates
+     (`!stats.Measured()`, `headroom < floor`) to pick its branch and its
+     `os.Exit`, so the unit-tested function was not the shipped gate:
+     rewriting main's low-headroom predicate to `if false` left `go build`,
+     `go vet` and the whole `cmd/shimverify` suite GREEN while a
+     990796/1000000 object printed `LOW-HEADROOM ... headroom 0.92%` and
+     exited **0**, which the recipe's `0) ;;` arm installs. `run` takes
+     argv, both streams, the environment and the verifier as parameters, so
+     `TestShimverifyRun` asserts the real exit status for every arm without
+     a kernel, root, or an object.
+   - **The recipe is matched as CODE, not as text.**
+     `TestBuildRecipeHandlesShimverifyExitCodes` reads
+     `build-userspace-xdp.sh` through a comment-stripping filter and
+     requires the verifier invocation at the START of a code line, in BOTH
+     branches of `run_verifier` (root and `sudo`). A plain
+     `strings.Contains` was satisfied by the script's own prose: replacing
+     the non-root invocation with
+     `true # sudo -n env "XPF_SHIM_ALLOW_LOW_HEADROOM=..." ...` left the
+     test green while a non-root `make generate` skipped verification
+     entirely and installed through the `0)` arm — the unverified-install
+     path this section says does not exist. The same filter (Rust flavour)
+     backs `TestShimCarriesFragHdrSizeAssertion`, where
+     `const _: () = assert!(true); // mem::size_of::<FragHdr>() == 8`
+     used to satisfy the check.
+     Of the two defences, the ANCHORING is what catches that mutation:
+     measured, with the comment filter edited to strip nothing, the
+     `true # sudo -n env ...` recipe still reds, because a line beginning
+     `true` does not begin `sudo`. The filter's own worth is narrower —
+     it stops a WHOLE-LINE comment satisfying a check — and narrower still
+     for the plain `XPF_SHIM_ALLOW_LOW_HEADROOM` mention assertion, which
+     the continuation lines of the recipe's multi-line `fail "..."`
+     diagnostics satisfy (the filter is line-oriented and does not carry
+     quote state across newlines). That assertion binds only that the
+     override is NAMED somewhere outside a comment; the two start-of-line
+     invocation checks are what bind the behaviour.
 
 **Recovery runbook** (symptom: `load Rust xdp_userspace collection:
 ... BPF program is too large. Processed 1000001 insn`, daemon in
@@ -328,6 +597,162 @@ authoritative list; quick recap:
   null checks.
 - xdp_zone fails the verifier on kernel 6.12 (NAT64 complexity); passes
   on 6.18+.
+
+### IPv6 extension-header walk: the shim's budget is nearly spent (#4555)
+
+The shim's `parse_ipv6` extension-header loop is fully unrolled, so every
+iteration duplicates each arm body and its `read_bytes` range
+re-validation. It is the single largest consumer of the 1M processed-insn
+verifier cap, and the pre-#4555 shim sat at **990,796 of 1,000,000 — under
+1% headroom**. Measured on the pinned toolchain via `cmd/shimverify`
+(kernel 7.0), varying only `MAX_EXT_HDRS` and whether the generic arm
+carries the full #4517 type set:
+
+| `MAX_EXT_HDRS` | #4517 types (135/139/140/253/254) | verdict | processed insns |
+|---|---|---|---|
+| 6 | no (pre-#4555) | PASS | 990,796 |
+| 6 | yes | PASS | 874,873 |
+| 7 | no | **REJECT** | — |
+| 7 | yes (current) | PASS | 947,188 |
+| 8 | no | **REJECT** | — |
+| 8 | yes | **REJECT** | 1,000,001 |
+
+Two things to carry away:
+
+- **8 is unreachable.** Do not "just bump it to match userspace" — the
+  candidate does not load, and `make generate` fails closed at the #1864
+  verify-then-install gate (the tracked `.o` is left untouched).
+- **The bound and the type set are coupled.** Widening the generic arm to
+  the full #4517 set is what makes bound 7 affordable: folding five more
+  next-header values into one shared arm body prunes more verifier state
+  than the five extra compares cost. Bound 7 with the narrow set is
+  rejected; with the wide set it passes with 5.3% headroom.
+
+**Parity relation.** `MAX_EXT_HDRS` (shim) and `MAX_IPV6_EXT_HEADERS`
+(`userspace-dp/src/afxdp/frame/inspect.rs`) are ITERATION counts whose
+loops exit differently, so they are deliberately NOT equal:
+
+- the shim spends one iteration per extension header and exits by
+  EXHAUSTION carrying the last declared next-header value straight into
+  `parse_l4` (no post-loop over-limit check) — it resolves chains of up to
+  `MAX_EXT_HDRS` extension headers;
+- `walk_ipv6_ext_chain` needs one FURTHER iteration to return the terminal
+  and folds exhaustion into the fail-closed `OverLimit` verdict
+  (#2292/#4743) — it resolves up to `MAX_IPV6_EXT_HEADERS - 1`.
+
+So the correct condition is `MAX_EXT_HDRS == MAX_IPV6_EXT_HEADERS - 1`
+(7 and 8): both walkers resolve 0..=7 extension headers and both refuse 8
+or more.
+
+**The two mismatch directions are not symmetric.** Only shim-BELOW-userspace
+is fail-closed: the shim's unresolved chain leaves the extension-header type
+in `ParsedPacket::protocol` with `parse_l4`'s catch-all ports 0/0, so the
+session key misses and the packet is redirected to userspace for full
+policy — it costs that flow the XDP fast path permanently, nothing more.
+
+That miss is **not** something the shim enforces. The shim probes a session
+map userspace writes, so "the key cannot be present" is a claim about the
+WRITERS, and #6923 found it false: `metadata_tuple_complete`
+(`userspace-dp/src/afxdp/frame/inspect.rs`) accepted every non-TCP/UDP
+metadata tuple, so the residual extension-header protocol with ports 0/0
+became a `SessionFlow`. That made `flow.is_none()` false, which SKIPPED the
+#4743 over-limit drop; an `application any` permit then matched a flow with
+no ports to fail on, and the session was installed and published under
+exactly the key the shim probes with. The unconditional over-limit refusal
+was in fact conditional on policy, and after one packet the chain had a fast
+path. Both writers now refuse an IPv6 key whose protocol is one the walk
+traverses — the packet path in `metadata_tuple_complete`, and the HA import
+in `build_synced_session_key`
+(`userspace-dp/src/server/helpers/session_sync.rs`), because the session map
+is global and the shim probes whatever row is present regardless of who
+wrote it. The refused set is `ipv6_ext_header_is_traversable`, held equal to
+the shim's own `eh_class` non-terminal set over all 256 values by
+`refused_protocol_set_equals_the_shim_traversable_set`. **A third writer
+into `USERSPACE_SESSIONS` must extend that refusal, or this paragraph goes
+back to being false.**
+
+Shim-ABOVE-userspace is the direction never to take: the shim would stamp a
+full 5-tuple and `l4_offset` for a chain `walk_ipv6_ext_chain` refuses with
+`OverLimit`, and hand that meta to consumers that trust it. Independently of
+that argument, bound 8 does not load — see the table above.
+
+**`parsed.protocol` is not only a session-key ingredient.** It also drives
+pre-session dispatch that terminates in the shim: ESP and non-native GRE to
+`cpumap_or_pass` (kernel XFRM / tunnel decap), WireGuard-to-firewall via
+`wg_steer_to_kernel`, ICMPv6 NDP 133-137 via `pass_local_control`. Widening
+the walked type set therefore re-routes packets between the XSK path and the
+kernel path — `IPv6 → Mobility → ESP` reached userspace over XSK before
+#4555 and now goes to the kernel stack, matching how `DestOpt → ESP` already
+behaved and how userspace-dp classifies the same chain. On the userspace
+side `meta.protocol` feeds NAT64 translation and L4 checksum recomputation
+(`frame/mod.rs`), so walk agreement matters well beyond telemetry.
+
+**How parity is enforced: the shim EMITS its facts (#4555).** The shim
+cannot be executed by userspace-dp's tests — it is `no_std`, built for
+`bpfel-unknown-none`. Four successive guards MODELLED it from source text
+and every one leaked to a more ordinary edit: a substring test on the
+advance arithmetic accepted an added `+ 8`; it also accepted a prepended
+`if opt[1] == 0 { break; }` (which rejects the ordinary 8-byte
+HbH/DestOpt); pinning whole arm bodies still ignored a statement inside the
+loop but outside the `match`; pinning the TEXT `size_of::<FragHdr>()` did
+not pin its VALUE; and the struct-layout resolver written to fix that
+skipped a field hidden behind a COMMENT.
+
+So the dependency is inverted, in two layers.
+
+**Emitted facts, for the artifact.** `userspace-xdp` emits
+`XPF_SHIM_FACTS` — a `#[used]` static whose fields rustc const-evaluates
+from the real types and the real classifier: `MAX_EXT_HDRS`,
+`size_of::<FragHdr>()`, and a 256-entry table produced by the same
+`eh_class` function the walk dispatches on. It lands in its own
+`.xpf_shim_facts` section (deliberately not `.rodata*`, which cilium/ebpf
+would surface as a runtime map), costs **zero** verifier budget (measured:
+947,188 insns with and without it), and `make generate` reads it back out
+of the object (`ReadShimFactsFromObject`) into the `shim_facts` block of
+`userspace_xdp_manifest.json`.
+
+**The executed walk, for behaviour.** Three scalars cannot witness what the
+walk DOES, and claiming otherwise was wrong: four edits to the shim — the
+generic advance to `* 16`, the AH advance to `* 8`, a statement added
+inside the loop but outside the `match`, and deleting the generic arm's
+post-advance bounds revalidation — all left the fact comparison green,
+because none of them changes `MAX_EXT_HDRS`, `FragHdr` or `eh_class`. So
+the walk itself lives in `userspace-xdp/src/ipv6_ext_walk.rs`, a module
+depending only on `core`, which `tests_shim_ext_parity.rs`
+`#[path]`-includes and RUNS on a corpus of real chains alongside
+`walk_ipv6_ext_chain`. Advance arithmetic, bounds revalidation and
+resolvable chain length are compared outcomes, not source-text claims.
+
+The two layers cover different things and both are needed. The corpus
+proves the walk behaves identically **in the dimension the shim
+represents**, which is narrower than "identically":
+`walk_ipv6_ext_headers` returns `(offset, protocol)` and nothing else, so
+the compared unit is terminal offset, terminal protocol, no-next-header
+and fail-closed. Fragment state is not compared because the shim has none
+to compare against. `walk_ipv6_ext_chain` additionally records the first
+Fragment header's raw bytes and a non-first-fragment flag, and the shim's
+blindness there is a real, OPEN divergence rather than an artefact of the
+comparison: on `IPv6 || Fragment(frag_off != 0, next = TCP)` the shim
+resolves `L4(48, TCP)` and `parse_l4` reads fragment PAYLOAD as a TCP
+header, where this crate refuses those bytes. That is **#6704** —
+pre-existing, not introduced by #4555, PINNED (not fixed) by
+`shim_is_not_more_permissive`, and closable only by a shim behaviour
+change with its own verifier cost. The emitted facts, meanwhile, travel
+with the artifact so a consumer of a prebuilt object — the Debian
+packaging path never compiles the shim crate — can check the walk's
+constants without a Rust toolchain.
+
+This also fixes a scope gap a compile-time assertion could not: an
+assertion in the shim only runs when the shim crate is COMPILED, which the
+Debian packaging path never does (`debian/rules` runs `make build`, and the
+daemon embeds the tracked `.o`). Facts recorded in the manifest travel with
+the artifact and are checkable wherever a prebuilt object is consumed.
+
+No source-text check remains. The exhaustion semantics that make the shim
+resolve `MAX_EXT_HDRS` headers were once argued to be unemittable — "a
+shape, not a value" — and kept as a narrow source scan. Executing the walk
+dissolves that: the corpus walks chains of 0..=10 extension headers and
+compares verdicts, so the resolvable length is measured on both sides.
 
 ## SR-IOV / driver constraints
 

@@ -27,11 +27,31 @@ package dataplane
 import (
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 )
+
+// UserspaceShimMinVerifierHeadroomPct is the committed floor for how much
+// of the kernel verifier's 1M processed-insn budget a shim candidate must
+// leave unused (#4555).
+//
+// The 2026-06-10 incident (#1864) was a shim object that blew the cap and
+// took both HA dataplanes down. The gates added after it are all BINARY —
+// the object either loads or it does not — so an object creeping toward
+// the wall is indistinguishable from a comfortable one until the day it
+// crosses. That is exactly what happened: master sat at 990,796/1,000,000
+// (0.92% headroom) with every gate green, and the next person to touch the
+// IPv6 extension-header walk discovered it as a REJECT after the work was
+// already done.
+//
+// 3% is deliberately loose. It is not a performance target; it is a
+// tripwire that says "the next change here will not fit" while there is
+// still room to plan. The current object sits at ~5.3%.
+const UserspaceShimMinVerifierHeadroomPct = 3.0
 
 // verifyShrinkHashMaxEntries is the verify-only ceiling applied to
 // hash-map MaxEntries before the anonymous load. The kernel allocates
@@ -73,14 +93,26 @@ func VerifyEmbeddedUserspaceShim() error {
 // on-disk candidate object. Used by cmd/shimverify as the build-time
 // gate in build-userspace-xdp.sh (verify-then-install).
 func VerifyUserspaceShimObject(path string) error {
+	_, err := VerifyUserspaceShimObjectStats(path)
+	return err
+}
+
+// VerifyUserspaceShimObjectStats is VerifyUserspaceShimObject plus the
+// kernel verifier's processed-insn accounting for a candidate that
+// LOADED, so the build-time gate can enforce
+// UserspaceShimMinVerifierHeadroomPct rather than only the hard 1M wall.
+// The returned stats are meaningful only when err is nil and
+// stats.Measured() is true.
+func VerifyUserspaceShimObjectStats(path string) (ShimVerifierStats, error) {
+	var stats ShimVerifierStats
 	if err := rlimit.RemoveMemlock(); err != nil {
-		return fmt.Errorf("remove memlock rlimit: %w", err)
+		return stats, fmt.Errorf("remove memlock rlimit: %w", err)
 	}
 	spec, err := ebpf.LoadCollectionSpec(path)
 	if err != nil {
-		return fmt.Errorf("load candidate spec from %s: %w", path, err)
+		return stats, fmt.Errorf("load candidate spec from %s: %w", path, err)
 	}
-	return verifyUserspaceShimSpecOnly(spec)
+	return verifyUserspaceShimSpecWithShrinkStats(spec, true)
 }
 
 // verifyUserspaceShimSpecOnly validates the spec exactly as the
@@ -101,8 +133,23 @@ func verifyUserspaceShimSpecOnly(spec *ebpf.CollectionSpec) error {
 // preserved #1864 REJECT object rejects both ways). Production
 // callers always shrink.
 func verifyUserspaceShimSpecWithShrink(spec *ebpf.CollectionSpec, shrink bool) error {
+	_, err := verifyUserspaceShimSpecWithShrinkStats(spec, shrink)
+	return err
+}
+
+// verifyUserspaceShimSpecWithShrinkStats is the implementation. It loads
+// with LogLevelStats so the verifier's processed-insn count is available
+// on SUCCESS as well as on reject — the binary PASS/REJECT verdict alone
+// cannot tell you the object is one edit away from the 1M wall, which is
+// how master came to sit at 0.92% headroom unnoticed (#4555).
+//
+// Requesting stats does not change the verdict: it only asks the kernel
+// to emit its summary line into the log buffer. A load that passes
+// without the flag passes with it.
+func verifyUserspaceShimSpecWithShrinkStats(spec *ebpf.CollectionSpec, shrink bool) (ShimVerifierStats, error) {
+	var stats ShimVerifierStats
 	if err := validateUserspaceShimSpec(spec); err != nil {
-		return fmt.Errorf("spec validation (production-load viability): %w", err)
+		return stats, fmt.Errorf("spec validation (production-load viability): %w", err)
 	}
 
 	vspec := spec.Copy()
@@ -117,21 +164,69 @@ func verifyUserspaceShimSpecWithShrink(spec *ebpf.CollectionSpec, shrink bool) e
 		}
 	}
 
-	coll, err := ebpf.NewCollection(vspec)
+	coll, err := ebpf.NewCollectionWithOptions(vspec, ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
+	})
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
-			return fmt.Errorf("%w: kernel verifier rejected %s:\n%s",
+			return stats, fmt.Errorf("%w: kernel verifier rejected %s:\n%s",
 				ErrUserspaceShimVerifierReject, userspaceShimEntryProg, verifierLogTail(ve))
 		}
-		return fmt.Errorf("verify-only collection load: %w", err)
+		return stats, fmt.Errorf("verify-only collection load: %w", err)
 	}
 	defer coll.Close()
 
-	if _, ok := coll.Programs[userspaceShimEntryProg]; !ok {
-		return fmt.Errorf("candidate object loaded but %s program is missing", userspaceShimEntryProg)
+	prog, ok := coll.Programs[userspaceShimEntryProg]
+	if !ok {
+		return stats, fmt.Errorf("candidate object loaded but %s program is missing", userspaceShimEntryProg)
 	}
-	return nil
+	stats = parseShimVerifierStats(prog.VerifierLog)
+	return stats, nil
+}
+
+// ShimVerifierStats carries the kernel verifier's own accounting for a
+// shim candidate that LOADED. Measured is false when the running
+// kernel's log did not carry a recognisable stats line — callers must
+// treat that as "cannot measure", never as "headroom is fine".
+type ShimVerifierStats struct {
+	ProcessedInsns int
+	InsnLimit      int
+}
+
+// Measured reports whether a usable processed-insn count was recovered.
+func (s ShimVerifierStats) Measured() bool {
+	return s.ProcessedInsns > 0 && s.InsnLimit > 0
+}
+
+// HeadroomPct is the percentage of the verifier's processed-insn budget
+// the candidate leaves unused. Zero when unmeasured.
+func (s ShimVerifierStats) HeadroomPct() float64 {
+	if !s.Measured() {
+		return 0
+	}
+	return 100 * float64(s.InsnLimit-s.ProcessedInsns) / float64(s.InsnLimit)
+}
+
+// shimVerifierStatsRe matches the kernel's end-of-verification summary,
+// e.g. "processed 947188 insns (limit 1000000) max_states_per_insn 34 ...".
+var shimVerifierStatsRe = regexp.MustCompile(`processed (\d+) insns \(limit (\d+)\)`)
+
+func parseShimVerifierStats(log string) ShimVerifierStats {
+	var stats ShimVerifierStats
+	m := shimVerifierStatsRe.FindStringSubmatch(log)
+	if len(m) != 3 {
+		return stats
+	}
+	processed, err := strconv.Atoi(m[1])
+	if err != nil {
+		return stats
+	}
+	limit, err := strconv.Atoi(m[2])
+	if err != nil {
+		return stats
+	}
+	return ShimVerifierStats{ProcessedInsns: processed, InsnLimit: limit}
 }
 
 func verifierLogTail(ve *ebpf.VerifierError) string {
