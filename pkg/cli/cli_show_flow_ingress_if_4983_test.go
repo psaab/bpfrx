@@ -277,9 +277,11 @@ func TestShowFlowSessionEgressIfColumnUnchanged4983(t *testing.T) {
 // dead code being tidied around: it is the compat path for the three
 // populations that legitimately carry no ingress identity (the reverse
 // companion, a peer-synced session whose originating ifindex is node-local
-// and deliberately not carried across the cluster wire, and a session
-// installed by a pre-#4983 helper mid rolling upgrade), plus the case of an
-// identity the running config can no longer name. If the column blanks for
+// and deliberately not carried across the cluster wire, and the host-outbound
+// GRE path, which has no ingress binding to record), plus the case of an
+// identity the running config can no longer name. #6928: a "pre-#4983 helper"
+// is NOT one of them — the shim ABI pre-flight hard-refuses a ValueSize
+// mismatch against the live pin. If the column blanks for
 // those, `show security flow session` prints rows with an empty If: field for
 // every HA-synced flow.
 //
@@ -303,7 +305,7 @@ func TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983(t *test
 		want    string
 	}{
 		{
-			// The reverse companion / peer-synced / pre-#4983 population.
+			// The reverse companion / peer-synced / host-outbound-GRE population.
 			name: "absent identity falls back to the ingress zone's interface",
 			zone: ingressIfColumnTrustZoneID,
 			want: "ge-0/0/8.0",

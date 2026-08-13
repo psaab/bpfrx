@@ -221,9 +221,11 @@ func TestMatchesV6IngressIdentityDoesNotMatchSiblingInterface4983(t *testing.T) 
 // Two sessions live in ONE test and are asserted to be treated DIFFERENTLY: a
 // session WITH an ingress identity is matched exactly, and a session WITHOUT
 // one (IngressIfindex 0 — the reverse companion, an HA peer-synced session
-// whose originating ifindex is node-local and deliberately not carried, or a
-// session installed by a pre-#4983 helper mid rolling upgrade) still answers
-// from the zone approximation. A test where every session carries the field —
+// whose originating ifindex is node-local and deliberately not carried, or the
+// host-outbound GRE path, which has no ingress binding to record) still answers
+// from the zone approximation. #6928: a "pre-#4983 helper" is NOT among those
+// populations — the shim ABI pre-flight hard-refuses a ValueSize mismatch
+// against the live pin, so a new daemon never reads an old helper's rows. A test where every session carries the field —
 // or none does — cannot see this branch at all.
 //
 // The two required properties: an absent identity must NOT silently drop the
@@ -256,7 +258,7 @@ func TestIngressIdentityAbsentFallsBackToZone4983(t *testing.T) {
 		t.Error("the session WITHOUT an ingress identity must remain reachable through " +
 			"the zone approximation: ingress ifindex 0 is not a valid interface and must " +
 			"never be read as \"matches nothing\", which would silently hide peer-synced " +
-			"and pre-#4983 sessions from show and clear (#4983)")
+			"and host-outbound-GRE sessions from show and clear (#4983)")
 	}
 
 	// The two sessions must genuinely diverge — if they agreed, the fallback

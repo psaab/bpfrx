@@ -445,7 +445,17 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 //     node's number names a different NIC here. It is deliberately not
 //     carried across the cluster wire — doing so would render a
 //     confidently WRONG interface, strictly worse than approximating;
-//   - a session installed by a pre-#4983 helper mid rolling upgrade.
+//   - the host-outbound GRE encapsulation path: firewall-self-originated
+//     traffic read off the TUN device has no ingress binding to record,
+//     so 0 is the correct answer rather than a gap.
+//
+// #6928: this list used to end with "a session installed by a pre-#4983
+// helper mid rolling upgrade". There is no such population. `sessions` /
+// `sessions_v6` are in the shim ABI pre-flight's checked set and
+// validateUserspaceShimLivePins hard-refuses a ValueSize mismatch against
+// the live pin, so a new daemon never reads an old helper's 136/184-byte
+// rows — see pkg/dataplane/types.go for the full account and the
+// mode-dependent recovery.
 //
 // A NON-ZERO ifindex the config cannot name (an interface deleted since
 // install, a tunnel/fabric ingress with no config unit) also falls back

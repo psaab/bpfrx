@@ -67,10 +67,17 @@ node-local — node 0's `ge-0-0-1` and node 1's `ge-7-0-1` are different numbers
 for the same logical RETH member — so carrying the originating node's value
 would make `show security flow session interface <name>` name the WRONG
 interface on the importing node, which is worse than approximating. A
-peer-synced session therefore lands in the same "no ingress identity carried"
-(`0`) branch as a pre-#4983 session and the CLI answers it from the ingress
-zone, exactly as it did before #4983. See "True ingress-interface identity on
-the session (#4983)" in `userspace-dp/src/session/README.md`.
+peer-synced session therefore lands in the "no ingress identity carried" (`0`)
+branch — alongside the reverse companion and the host-outbound GRE path — and
+the CLI answers it from the ingress zone, exactly as it did before #4983.
+
+That branch does NOT include "a pre-#4983 session" (#6928, corrected): a new
+daemon can never read one. `sessions` / `sessions_v6` are in the shim ABI
+pre-flight's checked set and `validateUserspaceShimLivePins` hard-refuses a
+`ValueSize` mismatch against the live pin, so the old-format rows are either
+already gone with the unpinned map or the load is refused outright. See "True
+ingress-interface identity on the session (#4983)" in
+`userspace-dp/src/session/README.md`.
 
 ### Userspace Mirror
 

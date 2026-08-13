@@ -80,11 +80,22 @@ pub(crate) struct SessionMetadata {
     /// `sessions_v6` are in the shim ABI pre-flight's checked set and a
     /// `ValueSize` mismatch against the live pin is a hard refusal
     /// (`validateUserspaceShimLivePins`), so a new daemon never reads an old
-    /// helper's 136/184-byte rows — the remediation is `xpfd cleanup` (or a
-    /// reboot), which unpins the maps so the next load recreates them at the
-    /// new size. NOT a restart: a bpffs pin outlives the process that made it,
-    /// so stopping and starting xpfd leaves the old-size pin in place and the
-    /// pre-flight refuses again.
+    /// helper's 136/184-byte rows. The targeted recovery is to unlink the ONE
+    /// named pin (`docs/operations/userspace-shim-pin-recovery.md`), after
+    /// which the next load recreates it at the new size.
+    /// Whether a plain restart suffices is MODE-DEPENDENT, and this note
+    /// asserted the wrong categorical until #6928. A bpffs pin does outlive the
+    /// process that made it, so a HITLESS shutdown (`Manager.Close`, which
+    /// preserves the pins on purpose) leaves the old-size pin in place and the
+    /// pre-flight refuses again — but a NON-hitless HA shutdown calls
+    /// `Manager.Teardown`, which `os.RemoveAll`s the pin path, so THERE a plain
+    /// restart is already enough. "NOT a restart" was as wrong as the "a
+    /// reload" it replaced. `xpfd cleanup` also clears it but is far broader
+    /// (every pinned dataplane map, plus the FRR managed routes).
+    /// The conclusion holds in every mode: either the pin is gone and the new
+    /// map is empty, or the pre-flight refuses and the new daemon never reads
+    /// the map. See `pkg/dataplane/types.go` for the canonical wording and
+    /// `TestCleanupProductionCallersMatchRemediation_6928` for the binding.
     /// The MISSING-NEIGHBOR seed is NOT among them — it is a published forward
     /// session that outlives the neighbor resolution, so it is stamped from the
     /// frame's `meta` like the two other forward install sites. (Those two are

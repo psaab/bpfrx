@@ -77,7 +77,13 @@ struct session_value {
 	 * is a PREDICTION of where the reply will arrive, not an observation of
 	 * where it did, and routing may be asymmetric), an HA peer-synced session
 	 * (an ifindex is node-local -- the peer's number names a different NIC
-	 * here), and any pre-#4983 helper all leave it 0. Consumers MUST treat
+	 * here), and the host-outbound GRE encapsulation path (self-originated
+	 * traffic read off the TUN device, which has no ingress binding to
+	 * record) all leave it 0. There is deliberately NO "pre-#4983 helper"
+	 * population here (#6928): this struct's size is part of the shim ABI
+	 * pre-flight's checked set, and validateUserspaceShimLivePins hard-refuses
+	 * a ValueSize mismatch against the live pin, so a new reader never sees an
+	 * old writer's 136/184-byte rows. Consumers MUST treat
 	 * 0 as "fall back to the zone approximation", never as "matches
 	 * nothing" or "matches everything". */
 	__u32 ingress_ifindex;

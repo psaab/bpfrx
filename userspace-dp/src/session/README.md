@@ -1018,13 +1018,37 @@ fallback artefact, not a filtering error — the row genuinely has no recorded
 interface — but the sentence above is scoped to the stamped case and does not
 carry to the fallback.
 
-That agreement covers the FALLBACK arms too, not just the precise one: when
-the identity is absent or names an interface the running config cannot
-resolve, the column falls back to the ingress zone's interface — and, for a
-zone that binds none, to the zone name — which is the same degradation
-`resolveIngressIfaces` applies. A blank column would be the disagreement,
-since those populations (§ "`0` means no ingress identity carried" below) are
-still selectable by an interface filter through the zone approximation.
+The DISPLAY side's own fallback chain, for completeness: an absent or an
+unnameable identity falls back to the ingress zone's FIRST interface, and a
+zone that binds none falls back to the zone NAME. Never to a blank column, and
+that part matters — those populations (§ "`0` means no ingress identity
+carried" below) ARE still selectable by an interface filter through the zone
+approximation, so a blank would hide a row the filter can still reach.
+
+**Verified at this head, because the paragraph that used to stand here said the
+two fallbacks were "the same degradation" and they are not.** They are
+different TYPES, built from the same config in different shapes:
+
+| side | map | built from | fallback yields |
+|---|---|---|---|
+| FILTER (`session_filter.go`, `populateIfaceMaps`) | `map[uint16][]string` | `append(zoneIfaces[zid], zone.Interfaces...)` | EVERY bound interface |
+| DISPLAY (`cli_show_flow.go`) | `map[uint16]string` | `zone.Interfaces[0]` | the FIRST one, else the zone name |
+
+`cli_show_flow.go` states the split itself where it builds them: use
+`populateIfaceMaps` "rather than the single-first-interface `zoneIfaces` built
+above for display", which "stay display-only". So the divergence is deliberate
+on the filter's side — an interface-filtered `show` must see every interface of
+a zone (#4792) — and simply not mirrored into the one-name column.
+
+Two consequences beyond the `[A, B]` example above. A zone binding NO interface
+gives the filter an empty slice, so `ifaceMatchesAny` is false and no interface
+filter selects that row at all, while the column prints the zone name — which
+is not an interface name and cannot be typed back into the filter. And the
+display chain is pinned by
+`TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983`
+(`pkg/cli/cli_show_flow_ingress_if_4983_test.go`), which asserts exactly those
+three arms; there is no corresponding test asserting the two sides agree,
+because they do not.
 
 **Which surfaces this applies to.** The consumer side landed in the IN-DAEMON
 CLI only (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
@@ -1096,8 +1120,22 @@ like one, but the ABI note below rules it out: `sessions` / `sessions_v6` are in
 the pre-flight's ABI-checked set (`userspaceABICheckedPinnedMaps`, which unions
 `userspaceShimSharedMapSpecs`), and `validateUserspaceShimLivePins` hard-refuses
 a `ValueSize` mismatch against the live pin — so a new daemon never comes up
-against an old helper's 136/184-byte map, and the remediation (full dataplane
-reload) starts from a freshly created, EMPTY map. A row written in the old
+against an old helper's 136/184-byte map. Every recovery path leaves the old pin
+GONE before the next load, so the map the new daemon reads is freshly created and
+EMPTY.
+
+Do NOT call that recovery "a reload" (this sentence did until #6928). A reload
+never releases a pin at all — a bpffs pin outlives the process that made it. The
+accurate, mode-dependent form is the one in `pkg/dataplane/types.go`: the
+targeted recovery is to unlink the ONE named pin
+(`docs/operations/userspace-shim-pin-recovery.md`); whether a plain restart is
+enough DEPENDS on how xpfd last stopped, because a HITLESS shutdown
+(`Manager.Close`) preserves the pins on purpose and hits the same refusal, while
+a NON-hitless HA shutdown calls `Manager.Teardown` — which `os.RemoveAll`s the
+pin path — so there a restart already suffices. The conclusion is unaffected in
+every one of those modes: either the old pin is gone and the new map is empty, or
+the pre-flight refuses and the new daemon does not read the map at all. There is
+no path on which old-format rows reach a new reader. A row written in the old
 format can therefore never be read by a new reader; the mixed state the
 population would describe is unreachable rather than merely rare.
 

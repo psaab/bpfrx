@@ -78080,3 +78080,69 @@ Every RED above is an assertion failure, not a build break.
   Advances #4983.
 - **File(s)**: pkg/dataplane/types.go, pkg/dataplane/bpf_session_value.go,
   bpf/headers/xpf_conntrack.h, userspace-dp/src/afxdp/bpf_map/mod.rs, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 / #6928 — two claim derivations. Both cite lists were treated
+  as pointers to a topic and re-resolved against the head; both counts were
+  short, and one of the two supplied "correct accounts" was itself defective.
+  ITEM 1 — the `session/README.md` internal contradiction is REAL, and the
+  passage at `:1012` ("the two diverge by construction") is the CORRECT one.
+  Derived from types, not prose: the FILTER's `zoneIfaces` is
+  `map[uint16][]string` built with `append(zoneIfaces[zid], zone.Interfaces...)`
+  (`session_filter.go`, `populateIfaceMaps`) and its fallback returns EVERY
+  bound interface; the DISPLAY's is `map[uint16]string` built with
+  `zone.Interfaces[0]` (`cli_show_flow.go`) and its fallback returns the FIRST,
+  else the zone name. `cli_show_flow.go` states the split itself where it builds
+  them ("rather than the single-first-interface zoneIfaces built above for
+  display ... stay display-only"). So the passage at `:1021` — "the same
+  degradation `resolveIngressIfaces` applies" — is false and has been replaced.
+  Two consequences the old text hid, now documented: a zone binding NO interface
+  gives the filter an empty slice, so `ifaceMatchesAny` is false and no
+  interface filter selects that row at all while the column prints the zone
+  NAME (not an interface name, and not typeable back into the filter); and the
+  display chain is pinned by
+  `TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983` while
+  nothing pins agreement, because there is none. Kept `:1012` verbatim — a
+  claim mis-triaged as wrong is a better outcome than a correct sentence
+  rewritten into a wrong one.
+  ITEM 2 — the reference account at `README.md:1094` is CORRECT IN SUBSTANCE
+  but carried a defect of its own, which is the more interesting half. Its
+  conclusion holds: `sessions`/`sessions_v6` are both in
+  `userspaceShimSharedMapSpecs`, `userspaceABICheckedPinnedMaps` unions that
+  into the checked set, `userspaceMapABIDiff` compares `ValueSize`, and
+  `validateUserspaceShimLivePins` returns an error on a diff — so no path
+  delivers old-format rows to a new reader. But it named the remediation "full
+  dataplane reload", and `loader_userspace_shim.go:37-39` says in terms that "a
+  reload ... never releases a pin at all" — the exact wording #6928 r5 already
+  corrected once. `entry.rs` carried the OPPOSITE superseded form ("NOT a
+  restart"), which the same comment records as equally false: a NON-hitless HA
+  shutdown calls `Manager.Teardown` -> `os.RemoveAll(bpfPinPath)`, so there a
+  restart does suffice. `pkg/dataplane/types.go` already had the fully corrected
+  mode-dependent account, so that is the reconciliation target rather than
+  `:1094` verbatim.
+  Site count: briefed as three, the sweep found FIVE asserting the stale
+  "pre-#4983 helper" population, and BOTH omissions were in the Rust mirror
+  (`afxdp/bpf_map/mod.rs:187` and `:257`, the v4/v6 twins) — the same shape as
+  the other lane's finding on the previous item, where a Go-side sweep
+  structurally cannot reach. Four test-comment restatements were found on top of
+  that. All nine reconciled to the `types.go` account; every surviving
+  `pre-#4983` mention in Go/Rust/C/docs is now either a NEGATION or a corrective
+  note, except two behaviour-parity references (`tests_session_ingress_identity.rs`,
+  `bpf_map_tests.rs`) that describe pre-#4983 BEHAVIOUR rather than a live
+  population and are correctly untouched.
+  The replacement third population is the HOST-OUTBOUND GRE path
+  (`afxdp/tunnel.rs`) — self-originated traffic off the TUN device with no
+  ingress binding to record — which is a real 0-carrying case per the README's
+  own enumeration, so the lists stay at three rather than shrinking to two.
+  Doc/comment only: no behavioural change, and none was found to be needed.
+  Validation: `go build ./...` rc=0; `go vet ./pkg/cli/... ./pkg/dataplane/...`
+  rc=0; `gofmt -l` clean on all touched Go files; `go test ./pkg/cli/...
+  ./pkg/dataplane/... -count=1` rc=0 (5 packages ok); `cargo test --release`
+  rc=0 (7 suites, 4406 passed, 0 failed) — run because Rust doc comments and a
+  shared C header comment changed.
+  Advances #4983.
+- **File(s)**: userspace-dp/src/session/README.md, userspace-dp/src/session/entry.rs,
+  userspace-dp/src/afxdp/bpf_map/mod.rs, bpf/headers/xpf_conntrack.h,
+  pkg/cli/session_filter.go, pkg/cli/session_filter_ingress_identity_4983_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go, docs/session-sync-architecture.md,
+  _Log.md

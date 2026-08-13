@@ -184,8 +184,12 @@ struct BpfSessionValueV4 {
     /// `SessionMetadata::ingress_ifindex` and never re-derived from the zone.
     /// Distinct from `fib_ifindex` above, which is the resolved EGRESS. `0`
     /// means "no ingress identity carried" (reverse companion / peer-synced /
-    /// pre-#4983 entry) and is never a valid ifindex; the Go consumer falls
-    /// back to the zone approximation for it. Appending this u32 on the
+    /// host-outbound GRE, which has no ingress binding to record) and is never
+    /// a valid ifindex; the Go consumer falls back to the zone approximation
+    /// for it. #6928: this parenthetical listed a "pre-#4983 entry" as a fourth
+    /// case; there is no such population, because a `ValueSize` mismatch
+    /// against the live pin is a hard refusal in the shim ABI pre-flight
+    /// (`validateUserspaceShimLivePins`) — see `session/entry.rs`. Appending this u32 on the
     /// existing 8-byte boundary + the compiler's 4-byte tail pad grows the
     /// struct 136 -> 144 (v4) / 184 -> 192 (v6) -- `ingress_vlan_id` below
     /// lands inside that same tail pad, so it costs nothing further.
@@ -254,8 +258,12 @@ struct BpfSessionValueV6 {
     /// `SessionMetadata::ingress_ifindex` and never re-derived from the zone.
     /// Distinct from `fib_ifindex` above, which is the resolved EGRESS. `0`
     /// means "no ingress identity carried" (reverse companion / peer-synced /
-    /// pre-#4983 entry) and is never a valid ifindex; the Go consumer falls
-    /// back to the zone approximation for it. Appending this u32 on the
+    /// host-outbound GRE, which has no ingress binding to record) and is never
+    /// a valid ifindex; the Go consumer falls back to the zone approximation
+    /// for it. #6928: this parenthetical listed a "pre-#4983 entry" as a fourth
+    /// case; there is no such population, because a `ValueSize` mismatch
+    /// against the live pin is a hard refusal in the shim ABI pre-flight
+    /// (`validateUserspaceShimLivePins`) — see `session/entry.rs`. Appending this u32 on the
     /// existing 8-byte boundary + the compiler's 4-byte tail pad grows the
     /// struct 136 -> 144 (v4) / 184 -> 192 (v6) -- `ingress_vlan_id` below
     /// lands inside that same tail pad, so it costs nothing further.
