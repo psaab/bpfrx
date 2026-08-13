@@ -163,7 +163,10 @@ pair. The binding-candidate decision is a single shared invariant
 contract — `include_userspace_binding_interface` (zoned, non-tunnel,
 non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0`, interfaces carrying
 the snapshot's `secure_tunnel` flag, and `mgmt`/`control`
-zones). That flag is an OWNERSHIP verdict shipped by the control plane, not
+zones). That flag is shipped by the control plane as an OWNERSHIP **or
+KERNEL-DEVICE-KIND** verdict since #6691 round 8 — an earlier revision of this
+sentence said ownership alone, which stopped being true when the live-xfrmi half
+landed — not
 the name shape `st<N>` — an earlier revision of this line said `st<N>`, which
 the section 30 lines below already repudiates. The hash MUST cover exactly the interfaces the planner acts on, so
 a change to a non-candidate interface never spuriously bumps the plan key
@@ -341,9 +344,14 @@ sets whose contents visibly change): `buildUserspaceIngressIfindexes` (the
 ingress-adjudication map), `UserspaceBoundLinuxInterfaces` (the name-keyed
 RSS/AF_XDP allowlist), `snapshotBindingPlanKey` (the plan-key hash — excluding
 the row is what keeps the key from churning when a tunnel appears or moves),
-and `buildUserspaceIngressBindingAliases`, which is measurably **inert** for
-this row because an xfrmi has no parent ifindex and is skipped by the
-`ParentIfindex` guard before the predicate is reached. The AF_XDP binding
+and `buildUserspaceIngressBindingAliases`, which is **inert** for the xfrmi's
+own row because an xfrmi has no parent ifindex. The ORDER in that sentence was
+wrong: `buildUserspaceIngressBindingAliases` calls
+`userspaceSkipsIngressInterface` FIRST and reaches the `ParentIfindex` guard
+after, so for the xfrmi's own row it is the predicate that drops it, not the
+guard. The guard is what drops a VLAN SIBLING, whose own netdev cannot exist on
+an ARPHRD_NONE parent — and a PLAIN sibling does reach the refusal, which is
+what `TestAliasTableRefusesOnAReachablePlainSibling` exercises. The AF_XDP binding
 **plan** is gated on this side by the mirrored
 `include_userspace_binding_interface`, off the `secure_tunnel` flag, not by a
 fifth Go call site. Since
@@ -414,7 +422,9 @@ tunnel on the member), the refused netdev is in the ingress set and in the
 allowlist. It is PRE-EXISTING (master's fabric loops are identical) and is NOT
 reachable for a secure tunnel — `LocalFabricMember` resolves only for
 slot-shaped member names, so an `st*` member yields no fabric row at all — so it
-is tracked as #6998 rather than folded here. To bound a laundering question,
+was CLOSED in round 9 (#6998) rather than deferred — the KIND-keyed
+member (a slot-shaped netdev that IS an xfrm device) is reachable, and all four
+loops now ask the refused index. To bound a laundering question,
 enumerate every CONTRIBUTOR to the set, not every caller of the predicate.
 
 It does **not** enter the **egress map**. `populate_egress` needs a source MAC

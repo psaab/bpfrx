@@ -628,7 +628,7 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	// arms normally. Fail closed: leave the helper disarmed and surface the
 	// error to the poll caller (logged), rather than re-arm a stale image.
 	if desired && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
-		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return err
 		}
 	}

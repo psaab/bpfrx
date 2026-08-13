@@ -46,7 +46,7 @@ const (
 	// believes is safe. The same-version equality check cannot see it, which
 	// is why the field needed the version and not just a new JSON tag.
 	// Paired with ensureSecureTunnelProtocolLocked (manager_compile.go).
-	ProtocolVersion                  = 5
+	ProtocolVersion                  = 6
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 
@@ -290,18 +290,31 @@ type InterfaceSnapshot struct {
 	//     apply proceeds on a deferred error, and a daemon restart leaves an
 	//     untracked one that no sweep enumerates. Only the kernel knows.
 	//
-	// The two cover different instants — the xfrmi reconciler runs during
-	// apply, so on the commit that CREATES a tunnel only the config knows —
-	// so the flag is their union and neither is redundant.
+	// The two cover different instants, so the flag is their union and neither
+	// is redundant. The instant that matters is narrower than "the commit that
+	// creates a tunnel", though: on the NORMAL apply path the daemon's
+	// interface/xfrmi reconcile runs BEFORE snapshot construction, so the
+	// device usually exists by the time the builder samples and the kernel half
+	// sees it. The config half is load-bearing where reconciliation has not run
+	// or did not succeed — a build that precedes it, or an xfrmi routing failed
+	// to create — not for every creation commit.
 	//
 	// It is OWNERSHIP or DEVICE KIND, never name shape: nothing reserves the
 	// `st` prefix, so a wildcard-authored `st5` with no VPN is an ordinary
 	// data interface, is not an xfrm device, and this stays false (#6691).
 	//
-	// NO PROTOCOL BUMP IS OWED for the kernel half: the field's meaning,
-	// type and JSON tag are unchanged, and its only Rust consumer
-	// (include_userspace_binding_interface) reads it identically at v5. What
-	// changed is the evidence the control plane accepts for the same claim.
+	// The field's MEANING, type and JSON tag are unchanged by the kernel half;
+	// what changed is the evidence the control plane accepts for the same
+	// claim. The version still moved to 6 in #6691 round 9, for a different
+	// reason: the REFUSAL RULE this flag feeds changed within the PR (ANY
+	// owner -> EVERY owner), so two helpers at the same number would plan
+	// different bindings for identical bytes.
+	//
+	// It is NOT read by one consumer. include_userspace_binding_interface was
+	// the only one when round 8 wrote that; userspace_unbindable_netdev and,
+	// through it, snapshot_refuses_parent_netdev / binding_target_is_refused
+	// read it too (planning.rs), which is how a VLAN child's redirect is
+	// refused.
 	//
 	// "Names the device", not "derives the if_id" — the two differ, and the
 	// difference was a defect (#6691 round 6). strconv.Atoi erases a leading

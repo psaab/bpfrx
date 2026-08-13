@@ -174,6 +174,13 @@ fn update_snapshot_binding_plan_key(hasher: &mut Sha256, snapshot: &ConfigSnapsh
         );
     }
     for fab in &snapshot.fabrics {
+        // #6691 round 9: a fabric whose parent netdev the snapshot REFUSES
+        // produces no candidate in `replan_queues`, so it must not be hashed
+        // here either — the #2915 hash/layout invariant, applied to the fabric
+        // loop for the same reason it already applies to the interface loop.
+        if snapshot_refuses_parent_netdev(snapshot, &fab.parent_linux_name) {
+            continue;
+        }
         // #3007: same effective-rx_queues resolution as the fabric candidate
         // loop in `replan_queues` — sysfs fallback when the snapshot is 0, then
         // `.max(1)` (fabric needs at least one TX queue). Keeps the key in lock
@@ -331,6 +338,11 @@ pub(crate) fn userspace_unbindable_netdev(iface: &InterfaceSnapshot) -> bool {
     // The two planes now agree by CONSTRUCTION rather than by convention: the
     // Go side computes the flag once and ships it, so there is no Rust-side
     // rule to keep in sync. An older control plane that omits the field leaves
+    // it false — and note which side each gate covers: the Go
+    // `ensureSecureTunnelProtocolLocked` detects an older HELPER (this binary)
+    // and refuses to publish to it. Nothing detects an older CONTROL PLANE from
+    // here; that direction is covered by the snapshot version equality check in
+    // `apply_snapshot`, which refuses a snapshot at any other version outright.
     // it false — see `ensureSecureTunnelProtocolLocked` (manager_compile.go),
     // the #6691 round 8 gate that disarms such a helper rather than letting it
     // plan the binding this arm exists to refuse.
@@ -668,6 +680,19 @@ pub(crate) fn replan_queues(
         // fabric-redirect packets via XSK TX (and receive fabric ingress).
         for fabric in &snapshot.fabrics {
             if fabric.parent_ifindex <= 0 || fabric.parent_linux_name.is_empty() {
+                continue;
+            }
+            // #6691 round 9: the fabric loop asks the refused index too. It did
+            // not before, and round 8 recorded that as unreachable — a judgement
+            // made when the exclusion was keyed on the ref's NAME. The kernel-kind
+            // half classifies by DEVICE KIND, so it refuses an xfrm device
+            // whatever it is called, and a slot-shaped `ge-0/0/0` created out of
+            // band is a legal `fabric-options member-interfaces` value. Measured
+            // Go-side on that config: the refused netdev went back into the
+            // ingress set and the RSS allowlist through the sibling loops. This is
+            // transparent to an ordinary fabric, whose physical parent is a data
+            // NIC that no exclusion class names.
+            if snapshot_refuses_parent_netdev(snapshot, &fabric.parent_linux_name) {
                 continue;
             }
             if seen_linux.contains(&fabric.parent_linux_name) {

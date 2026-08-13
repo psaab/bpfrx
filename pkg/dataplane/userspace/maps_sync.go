@@ -1601,18 +1601,39 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 			// netdev the predicate just excluded, and measured at head it did:
 			// the set came back [10 11] with 11 the live xfrmi.
 			//
-			// The WHOLE ROW is dropped, not just the parent key, because for a
-			// VLAN child the parent IS the bind target (userspaceBindTargetNetdev)
-			// — so keeping the child's own ifindex here while its binding is
-			// refused would put an ifindex in the ingress map with no READY
-			// binding, which the shim answers with drop_degraded_transit
-			// (BINDING_MISSING). "The ingress map and the binding plan move
-			// together or transit dies" is the invariant this arm is holding up;
-			// on every config reachable today the child's own netdev does not
-			// exist anyway (a VLAN device cannot be created on an ARPHRD_NONE
-			// xfrmi), so the two readings coincide and this is the one that
-			// stays right if that changes.
+			// WHICH ROWS THE REFUSED PARENT ACTUALLY DISQUALIFIES (#6691 round
+			// 9). Round 8 dropped the WHOLE ROW here and justified it with "for
+			// a VLAN child the parent IS the bind target". True — but this
+			// branch is entered on `ParentIfindex > 0`, which is every UNIT
+			// row, not every VLAN row. A plain unit (`st10 unit 5` with no
+			// vlan-id) merely CARRIES a parent ifindex; its bind target is its
+			// OWN netdev, so a refused parent says nothing about it.
+			//
+			// Measured before this round with secure `st10` at ifindex 11 and an
+			// ordinary live `st10.5` at 12: Go ingress came back [10] — 12
+			// missing — while the RSS allowlist named `st10.5` and the Rust
+			// planner made it a candidate. That is the ingress/plan split in
+			// the OTHER direction from the one round 8 fixed: a netdev with a
+			// binding but no ingress entry takes cpumap_or_pass and leaves the
+			// adjudicated path.
+			//
+			// So the parent key is always suppressed, and the row survives iff
+			// it binds its own netdev. For a VLAN child (bind target == the
+			// parent) the whole row still goes, which is what keeps an ifindex
+			// out of the ingress map with no READY binding —
+			// drop_degraded_transit (BINDING_MISSING) — the invariant round 8
+			// was holding up and this preserves.
 			if refused.refusesIfindex(iface.ParentIfindex) {
+				if !userspaceOwnsItsNetdev(iface) {
+					continue
+				}
+				if iface.Ifindex > 0 && !iface.LogicalOnly {
+					key := uint32(iface.Ifindex)
+					if !seen[key] {
+						seen[key] = true
+						out = append(out, key)
+					}
+				}
 				continue
 			}
 			if iface.Ifindex > 0 && !iface.LogicalOnly {
@@ -1642,6 +1663,16 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	for _, fab := range snapshot.Fabrics {
 		if fab.ParentIfindex <= 0 {
+			continue
+		}
+		// #6691 round 9: the sibling of the allowlist's fabric guard, and the
+		// same reachability — round 8's kernel-kind evidence refuses an xfrm
+		// device by DEVICE KIND, so a slot-shaped `ge-0/0/0` created out of band
+		// is both refused and a legal `fabric-options member-interfaces` value.
+		// Measured: ingress came back [20 21] with 20 the refused member. See
+		// UserspaceBoundLinuxInterfaces for why this is transparent to an
+		// ordinary fabric.
+		if refused.refusesIfindex(fab.ParentIfindex) {
 			continue
 		}
 		key := uint32(fab.ParentIfindex)

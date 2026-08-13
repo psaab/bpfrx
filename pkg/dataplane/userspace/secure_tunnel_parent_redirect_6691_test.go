@@ -38,7 +38,7 @@ func stubXfrmNetdevs(t *testing.T, names ...string) func() {
 			set[name] = true
 		}
 	}
-	liveXfrmNetdevs = func() map[string]bool { return set }
+	liveXfrmNetdevs = func() (map[string]bool, error) { return set, nil }
 	return func() { liveXfrmNetdevs = prev }
 }
 
@@ -187,9 +187,14 @@ func TestParentRedirectCannotReadmitTheExcludedXfrmi(t *testing.T) {
 // traffic off the dataplane — a forwarding regression wearing the fix's
 // clothes.
 //
-// FAIL-ON-REVERT: move the `mgmt`/`control` arm from
-// userspaceSkipsIngressInterface into userspaceUnbindableNetdev and this test
-// goes RED on both assertions.
+// FAIL-ON-REVERT, measured rather than asserted: move the `mgmt`/`control` arm
+// into netdevExclusionClasses and this test reds on the PLACEMENT assertion
+// (`a mgmt ZONE is a property of the row, not of the netdev`) — which is a
+// t.Fatal, so the ingress and allowlist assertions below it never run. Round 9
+// claimed it "goes RED on both assertions"; a review round measured only one
+// firing, and it was right. The same mutation also reds
+// TestExclusionClassesAgreeAcrossParentAndChild's coverage assertion, since a
+// new production class with no case is exactly what that now detects.
 func TestParentRedirectKeepsAMgmtZonedParent(t *testing.T) {
 	const parentIfindex = 21
 	defer stubLinkSnapshot5619(t, map[string]int{"ge-0-0-3": parentIfindex})()
@@ -251,7 +256,7 @@ func TestExclusionClassesAgreeAcrossParentAndChild(t *testing.T) {
 	})()
 	defer stubXfrmNetdevs(t, "st10")()
 
-	for _, tc := range []struct {
+	cases := []struct {
 		class string
 		lines []string
 		base  string
@@ -317,7 +322,7 @@ func TestExclusionClassesAgreeAcrossParentAndChild(t *testing.T) {
 			// over-determined. Both reasons agree across the two rows anyway:
 			// the name arm reads the shared BASE name, and LocalFabric is the
 			// same InterfaceConfig field copied to both rows (asserted below).
-			class: "LocalFabric + fab name",
+			class: "fab name",
 			lines: []string{
 				"set chassis cluster reth-count 2",
 				"set chassis cluster authentication-key abcdefghijklmnopqrstuvwxyz012345",
@@ -345,11 +350,21 @@ func TestExclusionClassesAgreeAcrossParentAndChild(t *testing.T) {
 			// two rows can disagree about, and it is the F1 defect.
 			wantDisagree: true,
 		},
-	} {
+	}
+	for _, tc := range cases {
 		t.Run(tc.class, func(t *testing.T) {
 			cfg := compileForTest5619(t, tc.lines...)
 			rows := buildInterfaceSnapshots(cfg)
 			base, child := rowByName(t, rows, tc.base), rowByName(t, rows, tc.child)
+
+			// POSITIVE CONTROL: the case must actually trigger the production
+			// class it names. Without this the coverage assertion below could be
+			// satisfied by a case that names a class and exercises another —
+			// coverage by label rather than by behaviour.
+			if got := userspaceNetdevExclusionClass(base); got != tc.class {
+				t.Fatalf("base %s is excluded by class %q, not the %q this case claims "+
+					"to exercise", tc.base, got, tc.class)
+			}
 
 			if !userspaceSkipsIngressInterface(base) {
 				t.Fatalf("premise broken: the %s base row is not excluded at all", tc.class)
@@ -383,50 +398,69 @@ func TestExclusionClassesAgreeAcrossParentAndChild(t *testing.T) {
 		})
 	}
 
-	// Coverage: the cases above must name every arm the predicate has, or a
-	// newly-added class silently escapes the enumeration.
-	const wantClasses = 6
-	if got := len([]string{
-		"Tunnel", "fxp name", "em name", "lo0 name", "LocalFabric + fab name", "SecureTunnel",
-	}); got != wantClasses {
-		t.Fatalf("enumeration drifted: %d classes, want %d", got, wantClasses)
+	// COVERAGE, read off the PRODUCTION table (#6691 round 9). This used to
+	// compare six hard-coded strings against a hard-coded 6, which no change to
+	// production could move — a review round measured the stated fail-on-revert
+	// contract ("add a new exclusion arm without adding it here and the coverage
+	// assertion fails") and found NO ASSERTION FIRES. A count of literals is not
+	// a coverage check; it is a restatement of itself.
+	//
+	// netdevExclusionClasses is now the production enumeration, so this compares
+	// the cases against the thing that decides. Adding an arm without a case
+	// fails here; a case naming a class it does not actually trigger fails in
+	// the per-case positive control above.
+	covered := map[string]bool{}
+	for _, tc := range cases {
+		covered[tc.class] = true
 	}
-	// That is every arm of userspaceUnbindableNetdev (Tunnel, the four name
-	// prefixes, SecureTunnel) plus the LocalFabric arm of
-	// userspaceSkipsIngressInterface. The remaining arm — `mgmt`/`control` —
-	// is covered by TestParentRedirectKeepsAMgmtZonedParent, which asserts the
-	// OPPOSITE placement on purpose: it CAN disagree and must still not be
-	// inherited, because the parent netdev really does carry the child's
-	// frames there.
+	for _, class := range netdevExclusionClasses {
+		if !covered[class.name] {
+			t.Errorf("exclusion class %q has no case in this test: a netdev class that "+
+				"nothing exercises can be added on the wrong side of the device/row split "+
+				"unnoticed, which is the defect this test exists to prevent", class.name)
+		}
+	}
+	for name := range covered {
+		found := false
+		for _, class := range netdevExclusionClasses {
+			if class.name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("case %q names no production exclusion class — the test table has "+
+				"drifted from netdevExclusionClasses", name)
+		}
+	}
+	// The remaining arm — `mgmt`/`control` — is deliberately NOT in
+	// netdevExclusionClasses: it lives in userspaceSkipsIngressInterface because
+	// it is a property of the ROW. TestParentRedirectKeepsAMgmtZonedParent
+	// asserts that placement on purpose. LocalFabric is the same, and is
+	// asserted inside the `fab name` case via wantLocal.
 	//
-	// The Fabrics loop is deliberately outside all of this. A fabric's binding
-	// candidate is its PHYSICAL parent (`ge-0-0-0`), a different netdev from
-	// the excluded `fab0` overlay, and it is contributed by its own loop that
-	// the refused index does not gate — filtering it would unbind the fabric.
-	//
-	// THE FABRIC LOOP IS ALSO A THIRD CONTRIBUTOR, and #6691 round 8 was wrong
-	// to bound the enumeration by "the predicate's callers". `add(fab.Parent-
-	// LinuxName)` (interfaces.go) and `key := uint32(fab.ParentIfindex)`
-	// (maps_sync.go) push unconditionally, and Rust replan_queues' fabric loop
-	// does too — none of the three asks this predicate or the refused index.
-	// Measured with a Tunnel-class member (`set interfaces fab0 fabric-options
-	// member-interfaces gr-0/0/3` with an interface-level tunnel on gr-0/0/3):
-	// the refused netdev IS in the ingress set and IS in the allowlist. That is
-	// PRE-EXISTING — master's fabric loop is identical — and it is NOT reachable
-	// for a secure tunnel, per the REFUTED note below. It is tracked as #6998
-	// rather than fixed here.
+	// THE FABRIC LOOPS WERE A THIRD CONTRIBUTOR, and #6691 round 8 was wrong to
+	// bound the enumeration by "the predicate's callers". `add(fab.Parent-
+	// LinuxName)` (interfaces.go), `key := uint32(fab.ParentIfindex)`
+	// (maps_sync.go) and Rust replan_queues' fabric loop pushed
+	// unconditionally. Round 9 CLOSED all three, because round 8 also made the
+	// gap reachable: the kernel-kind evidence refuses an xfrm device by DEVICE
+	// KIND, so a slot-shaped `ge-0/0/0` created out of band is both refused and
+	// a legal fabric member. Measured before the fix — refused index
+	// name{ge-0-0-0} ifx{20}, allowlist [ge-0-0-0 ge-0-0-3], ingress [20 21];
+	// after — allowlist [ge-0-0-3], ingress [21].
+	// TestFabricLoopCannotReadmitARefusedMember is the guard.
 	//
 	// REFUTED, and recorded so the next reader does not re-derive it: "a fabric
-	// parent could itself be an xfrmi, so the Fabrics loop is a fourth
-	// laundering site FOR THE SECURE-TUNNEL CLASS." It is not reachable.
-	// Measured with `set interfaces fab0 fabric-options member-interfaces st10`
-	// alongside `bind-interface st10`: the snapshot carries ZERO fabric rows,
-	// because compiler_derivations.go resolves LocalFabricMember only for a
-	// member with an FPC slot (`InterfaceSlot`), and `st10` has none. With no
-	// fabric row there is no ParentIfindex for the loop to append — ingress came
-	// back [10] and the allowlist [ge-0-0-0], with the xfrmi in neither. The
-	// Tunnel class reaches it because `gr-0/0/3` IS slot-shaped; the secure
-	// tunnel class cannot.
+	// member could be spelled `st10`, so the NAME-shaped secure-tunnel spelling
+	// reaches the fabric loops." It cannot. Measured with
+	// `set interfaces fab0 fabric-options member-interfaces st10` alongside
+	// `bind-interface st10`: the snapshot carries ZERO fabric rows, because
+	// compiler_derivations.go resolves LocalFabricMember only for a member with
+	// an FPC slot (`InterfaceSlot`), and `st10` has none. The reachable shape is
+	// the KIND-keyed one above, on a slot-shaped name — which is why the
+	// pre-round-8 "not reachable" reasoning did not survive round 8's own
+	// change.
 }
 
 // TestExclusionClassesDisagreeTheOtherWayToo is the CONVERSE of
@@ -530,7 +564,7 @@ func TestExclusionClassesDisagreeTheOtherWayToo(t *testing.T) {
 			// LocalFabric is one InterfaceConfig field copied onto both rows,
 			// and `fab` is a name arm, so this class is over-determined in both
 			// directions exactly as the forward test found.
-			class: "LocalFabric + fab name",
+			class: "fab name",
 			lines: []string{
 				"set chassis cluster reth-count 2",
 				"set chassis cluster authentication-key abcdefghijklmnopqrstuvwxyz012345",
@@ -617,48 +651,41 @@ func TestExclusionClassesDisagreeTheOtherWayToo(t *testing.T) {
 	}
 }
 
-// TestAliasTableRefusesEvenWhenTheChildNetdevResolves binds the one refusal
-// guard that no reachable config distinguishes, by constructing the state that
-// would make it live instead of declaring it untestable.
+// TestAliasTableRefusesOnAReachablePlainSibling binds the alias-table refusal —
+// and its FIXTURE is the round-9 correction, not the guard.
 //
-// #6691 round 8 reported this guard as a surviving mutation and justified it
-// with "no test can distinguish it — that is a structural claim, not a bound
-// one". That was both wrong at the time (the guard WAS live, on the round-9
-// blocker config) and a weaker answer than was available.
+// Round 8 reported this guard as a surviving mutation and called it structurally
+// untestable. Round 9 first "fixed" that by STUBBING a `st10.100` VLAN device
+// into existence, labelled synthetic. Both were wrong about the same thing: the
+// site is reachable on an ordinary config, and it was the FIXTURE that could not
+// reach it. A VLAN child's netdev cannot exist on an ARPHRD_NONE xfrmi, so the
+// `Ifindex <= 0` guard drops it before the refusal — but a PLAIN unit
+// (`st10 unit 5`, no vlan-id) resolves to its own `st10.5` netdev, gets a real
+// ifindex, and reaches the refusal with a refused ParentIfindex. No stub of a
+// device the kernel would refuse to create is required.
 //
-// THE FIXTURE IS SYNTHETIC AND SAYS SO. `st10.5 vlan-id 100` names the netdev
-// `st10.100`, which does not exist on a box: the xfrmi reconciler never creates
-// it and the kernel cannot create a VLAN on an ARPHRD_NONE parent. So the
-// production path is dropped by the `Ifindex <= 0` guard before the refusal is
-// consulted, and this test stubs the netdev into existence to reach the line.
-// That is legitimate here because the invariant is about the SITE — the alias
-// table must not become the one place the refusal is not asked — and the
-// reachability it depends on is not this file's to guarantee: #5619 made three
-// of the four secure-tunnel spellings resolve to netdevs that previously did
-// not.
+// The alias is suppressed for the same reason under either spelling: it would
+// tell the shim to treat frames on the child as arriving on a netdev the
+// dataplane refused to bind, which therefore has no READY binding —
+// drop_degraded_transit (BINDING_MISSING).
 //
 // FAIL-ON-REVERT: delete the `refused.refusesIfindex(...)` guard in
-// buildUserspaceIngressBindingAliases and this test goes RED with
+// buildUserspaceIngressBindingAliases and this reds with
 // `binding alias 12 -> 11 points at the refused xfrmi`.
-func TestAliasTableRefusesEvenWhenTheChildNetdevResolves(t *testing.T) {
+func TestAliasTableRefusesOnAReachablePlainSibling(t *testing.T) {
 	const (
 		lanIfindex   = 10
 		xfrmiIfindex = 11
-		childIfindex = 12
+		plainIfindex = 12
 	)
 	defer stubLinkSnapshot5619(t, map[string]int{
-		"ge-0-0-0": lanIfindex,
-		"st10":     xfrmiIfindex,
-		// SYNTHETIC: see the doc comment. Production reports 0 here.
-		"st10.100": childIfindex,
+		"ge-0-0-0": lanIfindex, "st10": xfrmiIfindex, "st10.5": plainIfindex,
 	})()
 	defer stubXfrmNetdevs(t, "st10")()
 
 	cfg := compileForTest5619(t,
 		"set security ipsec vpn V bind-interface st10",
 		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
-		"set interfaces st10 vlan-tagging",
-		"set interfaces st10 unit 5 vlan-id 100",
 		"set interfaces st10 unit 5 family inet address 192.0.2.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 		"set security zones security-zone trust interfaces st10.5",
@@ -666,22 +693,22 @@ func TestAliasTableRefusesEvenWhenTheChildNetdevResolves(t *testing.T) {
 	rows := buildInterfaceSnapshots(cfg)
 	child := rowByName(t, rows, "st10.5")
 
-	// PREMISES. Every one of the four guards ahead of the refusal must be
-	// passed, or the test proves nothing about the refusal.
+	// PREMISES. Every guard ahead of the refusal must be passed, or the test
+	// proves nothing about the refusal — which is precisely how the round-8
+	// report went wrong.
 	if userspaceSkipsIngressInterface(child) {
-		t.Fatal("premise broken: the child row is itself excluded, so the loop " +
+		t.Fatal("premise broken: the child row is itself excluded, so the alias loop " +
 			"drops it before the refusal is asked")
 	}
-	if child.Ifindex != childIfindex || child.ParentIfindex != xfrmiIfindex {
-		t.Fatalf("premise broken: child resolved to (ifindex %d, parent %d), want (%d, %d) "+
-			"— the stub is what puts this row past the `Ifindex <= 0` guard",
-			child.Ifindex, child.ParentIfindex, childIfindex, xfrmiIfindex)
+	if child.Ifindex != plainIfindex || child.ParentIfindex != xfrmiIfindex {
+		t.Fatalf("premise broken: child is (ifindex %d, parent %d), want (%d, %d) — a "+
+			"row that does not reach the `Ifindex <= 0` guard cannot exercise this site",
+			child.Ifindex, child.ParentIfindex, plainIfindex, xfrmiIfindex)
 	}
 	if child.LogicalOnly {
 		t.Fatal("premise broken: a LogicalOnly row is dropped by its own guard")
 	}
-	refused := buildUserspaceRefusedNetdevs(rows)
-	if !refused.refusesIfindex(xfrmiIfindex) {
+	if !buildUserspaceRefusedNetdevs(rows).refusesIfindex(xfrmiIfindex) {
 		t.Fatalf("premise broken: ifindex %d is not refused, so the guard under test "+
 			"has nothing to refuse", xfrmiIfindex)
 	}
@@ -983,7 +1010,7 @@ func TestRetainedLiveXfrmiLeavesTheAdjudicatedSets(t *testing.T) {
 			// The v5 protocol gate must arm for this snapshot too: a pre-v5
 			// helper ignores the flag, plans the binding, and the operator
 			// cannot fix it by editing the config.
-			if !configHasSecureTunnel(cfg) {
+			if !snapshotHasSecureTunnel(gateSnapshot(t, cfg)) {
 				t.Error("configHasSecureTunnel is false for a config whose snapshot DOES " +
 					"carry a flagged row — the gate would stay silent while a pre-v5 " +
 					"helper plans the binding this change exists to refuse")
@@ -1079,4 +1106,252 @@ func (f *fakeXfrmKernel) AddrAdd(netlink.Link, *netlink.Addr) error { return nil
 func (f *fakeXfrmKernel) AddrDel(netlink.Link, *netlink.Addr) error { return nil }
 func (f *fakeXfrmKernel) AddrList(netlink.Link, int) ([]netlink.Addr, error) {
 	return nil, nil
+}
+
+// TestXfrmNetdevNamesClassifiesByKernelKind binds the `Type() == "xfrm"`
+// discriminator — the single line that decides whether a netdev is a
+// route-based IPsec tunnel or an ordinary data NIC.
+//
+// It could not be bound before #6691 round 9. Every retained-xfrmi test presents
+// a kernel by replacing the whole liveXfrmNetdevs closure, so a mutation that
+// DELETES the kind filter — classifying every enumerated link as an xfrm
+// interface, which would strip every NIC on the box of its AF_XDP binding — left
+// the entire package green. A test that supplies the answer cannot check the
+// thing that computes it, so the classifier is split out and driven directly.
+//
+// FAIL-ON-REVERT: drop the `link.Type() != "xfrm"` guard from xfrmNetdevNames
+// and this reds on `ge-0-0-0` (an ordinary Device) being classified as an xfrm
+// netdev.
+func TestXfrmNetdevNamesClassifiesByKernelKind(t *testing.T) {
+	links := []netlink.Link{
+		&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "ge-0-0-0"}},
+		&netlink.Xfrmi{LinkAttrs: netlink.LinkAttrs{Name: "st10"}, Ifid: 0x50001},
+		&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: "veth0"}},
+		&netlink.Xfrmi{LinkAttrs: netlink.LinkAttrs{Name: "st0.0"}, Ifid: 0x1},
+		// A nil entry and an unnamed link are both skipped rather than panicking
+		// or inserting an empty key that would match every ""-named row.
+		nil,
+		&netlink.Xfrmi{LinkAttrs: netlink.LinkAttrs{Name: ""}},
+	}
+
+	got := xfrmNetdevNames(links)
+	want := map[string]bool{"st10": true, "st0.0": true}
+	if !maps.Equal(got, want) {
+		t.Fatalf("xfrmNetdevNames = %v, want %v. The kernel link KIND is the only "+
+			"thing separating a route-based IPsec tunnel from a data NIC here — a "+
+			"classifier that answers by name shape is the exact defect rounds 5 and 8 "+
+			"of this PR removed", got, want)
+	}
+	// Named explicitly: an ordinary NIC must never be classified, whatever it is
+	// called. `st5` is the wildcard-authored NIC four earlier rounds fought to
+	// keep adjudicated.
+	for _, name := range []string{"ge-0-0-0", "veth0", ""} {
+		if got[name] {
+			t.Errorf("%q was classified as an xfrm netdev", name)
+		}
+	}
+	if named := xfrmNetdevNames([]netlink.Link{
+		&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "st5"}},
+	}); len(named) != 0 {
+		t.Errorf("a Device named `st5` was classified as an xfrm netdev (%v) — the "+
+			"classifier fell back to name shape", named)
+	}
+}
+
+// TestFabricLoopCannotReadmitARefusedMember is the #6691 round 9 guard for the
+// third contributor round 8's enumeration missed.
+//
+// The fabric loops in UserspaceBoundLinuxInterfaces and
+// buildUserspaceIngressIfindexes (and replan_queues on the Rust side) push a
+// fabric's physical parent UNCONDITIONALLY. Round 8 recorded that as
+// unreachable for this predicate, reasoning that LocalFabricMember resolves only
+// for slot-shaped names so an `st*` member yields no fabric row. That was the
+// PRE-round-8 question: with the kernel-kind half, a device is refused for what
+// it IS, so a slot-shaped `ge-0/0/0` created or renamed out of band is both
+// refused AND a legal fabric member.
+//
+// FAIL-ON-REVERT: drop either fabric guard and this reds — the allowlist regains
+// `ge-0-0-0` and the ingress set regains ifindex 20.
+func TestFabricLoopCannotReadmitARefusedMember(t *testing.T) {
+	const (
+		memberIfindex = 20
+		lanIfindex    = 21
+	)
+	defer stubLinkSnapshot5619(t, map[string]int{
+		"ge-0-0-0": memberIfindex, "ge-0-0-3": lanIfindex, "fab0": 22,
+	})()
+	// The member netdev IS an xfrm device by kernel kind, under a slot-shaped
+	// name — the shape round 8's own change made reachable.
+	defer stubXfrmNetdevs(t, "ge-0-0-0")()
+
+	cfg := compileForTest5619(t,
+		"set chassis cluster reth-count 2",
+		"set chassis cluster authentication-key abcdefghijklmnopqrstuvwxyz012345",
+		"set interfaces fab0 fabric-options member-interfaces ge-0/0/0",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces ge-0/0/3 unit 0 family inet address 10.0.9.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/3.0",
+	)
+	snap, err := buildSnapshot(cfg, deriveUserspaceConfig(cfg), 0, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+
+	// PREMISES: without a fabric row naming the refused netdev this test is
+	// vacuous, and it was exactly the absence of such a row that made round 8
+	// call the case unreachable.
+	var fabricParent string
+	for _, fab := range snap.Fabrics {
+		if fab.ParentIfindex == memberIfindex {
+			fabricParent = fab.ParentLinuxName
+		}
+	}
+	if fabricParent != "ge-0-0-0" {
+		t.Fatalf("premise broken: no fabric row resolves to the member netdev "+
+			"(fabrics %+v) — a slot-shaped member is what makes this reachable", snap.Fabrics)
+	}
+	if !buildUserspaceRefusedNetdevs(snap.Interfaces).refusesName("ge-0-0-0") {
+		t.Fatal("premise broken: the member netdev is not refused, so the fabric " +
+			"loop has nothing to re-admit")
+	}
+
+	if got := UserspaceBoundLinuxInterfaces(cfg); slices.Contains(got, "ge-0-0-0") {
+		t.Errorf("RSS/AF_XDP allowlist = %v: the fabric loop put the refused member "+
+			"netdev back. An allowlist entry is permission to reshape that NIC's RSS "+
+			"table", got)
+	}
+	if got := buildUserspaceIngressIfindexes(snap); slices.Contains(got, uint32(memberIfindex)) {
+		t.Errorf("ingress-adjudication set = %v: the fabric loop put the refused "+
+			"member's ifindex %d back", got, memberIfindex)
+	}
+	// NEGATIVE CONTROL: the LAN must survive, or the guard is dropping the box
+	// rather than the member.
+	if got := buildUserspaceIngressIfindexes(snap); !slices.Contains(got, uint32(lanIfindex)) {
+		t.Fatalf("premise broken: the LAN (ifindex %d) fell out of the ingress set %v",
+			lanIfindex, got)
+	}
+}
+
+// TestPlainUnitKeepsItsOwnIfindexUnderARefusedParent is the #6691 round 9 guard
+// for the over-exclusion that ran the OTHER way.
+//
+// buildUserspaceIngressIfindexes' refused-parent arm dropped the WHOLE ROW,
+// which is right for a VLAN child (the parent IS its bind target) and wrong for
+// a plain unit that merely CARRIES a parent ifindex and binds its own netdev.
+// Measured before the fix with secure `st10` at 11 and an ordinary live
+// `st10.5` at 12: ingress came back [10] while the RSS allowlist named `st10.5`
+// and the Rust planner made it a candidate — a netdev with a binding and no
+// ingress entry, which takes cpumap_or_pass and leaves the adjudicated path.
+//
+// FAIL-ON-REVERT: restore the unconditional `continue` and this reds on ifindex
+// 12 missing from the ingress set.
+func TestPlainUnitKeepsItsOwnIfindexUnderARefusedParent(t *testing.T) {
+	const (
+		lanIfindex   = 10
+		xfrmiIfindex = 11
+		plainIfindex = 12
+	)
+	defer stubLinkSnapshot5619(t, map[string]int{
+		"ge-0-0-0": lanIfindex, "st10": xfrmiIfindex, "st10.5": plainIfindex,
+	})()
+	defer stubXfrmNetdevs(t, "st10")()
+
+	cfg := compileForTest5619(t,
+		"set security ipsec vpn V bind-interface st10",
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces st10 unit 5 family inet address 192.0.2.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/0.0",
+		"set security zones security-zone trust interfaces st10.5",
+	)
+	rows := buildInterfaceSnapshots(cfg)
+	plain := rowByName(t, rows, "st10.5")
+
+	// PREMISES. The row must bind its OWN netdev while carrying the refused
+	// parent — that combination is the whole finding.
+	if !userspaceOwnsItsNetdev(plain) {
+		t.Fatalf("premise broken: st10.5 does not own its netdev (bind target %q, "+
+			"LinuxName %q) — then dropping the row is correct and nothing is tested",
+			userspaceBindTargetNetdev(plain), plain.LinuxName)
+	}
+	if plain.ParentIfindex != xfrmiIfindex || plain.Ifindex != plainIfindex {
+		t.Fatalf("premise broken: st10.5 is (ifindex %d, parent %d), want (%d, %d)",
+			plain.Ifindex, plain.ParentIfindex, plainIfindex, xfrmiIfindex)
+	}
+
+	ingress := buildUserspaceIngressIfindexes(&ConfigSnapshot{Interfaces: rows})
+	if !slices.Contains(ingress, uint32(plainIfindex)) {
+		t.Errorf("ingress-adjudication set = %v, missing the plain unit's OWN ifindex "+
+			"%d. Its bind target is its own netdev, so a refused PARENT disqualifies "+
+			"nothing about it — and the RSS allowlist %v names it, so dropping it here "+
+			"splits the ingress map from the binding plan",
+			ingress, plainIfindex, UserspaceBoundLinuxInterfaces(cfg))
+	}
+	// The refused xfrmi itself must still be out — this must not become a way
+	// back in for the parent.
+	if slices.Contains(ingress, uint32(xfrmiIfindex)) {
+		t.Errorf("ingress-adjudication set = %v re-admitted the refused xfrmi %d",
+			ingress, xfrmiIfindex)
+	}
+}
+
+// TestXfrmDumpNamesKeepsAnInterruptedDump binds the ERROR POLICY half of the
+// kernel oracle — the half the first round-9b mutation grid found unbound.
+//
+// Severing the partial-dump handling back to round 8's
+// `if err != nil { return nil }` SURVIVED the whole package, because every test
+// presents a kernel by replacing the liveXfrmNetdevs closure and so never
+// reaches the policy. The policy is now a pure function of LinkList's own
+// (links, err) return, which is what makes it drivable.
+//
+// The two cases are not symmetric, and that asymmetry IS the fix:
+//
+//   - ErrDumpInterrupted comes WITH the links netlink managed to deserialize
+//     (link_linux.go: it returns early only for a non-interrupt error, then
+//     `return res, executeErr`). Discarding them discards real evidence — and
+//     the per-row buildLinkSnapshot lookups that follow still resolve the
+//     device, so the row ships Ifindex > 0 with SecureTunnel false: a live
+//     xfrmi fully adjudicated and RSS-bound.
+//   - A hard error comes with nothing, so there is no evidence to keep and the
+//     caller must be told it could not be classified rather than reading the
+//     empty result as "no xfrm devices on this box".
+//
+// FAIL-ON-REVERT: restore `if err != nil { return nil, nil }` and the
+// interrupted case reds on the xfrmi being dropped; drop the error return and
+// the hard-error case reds on err being nil.
+func TestXfrmDumpNamesKeepsAnInterruptedDump(t *testing.T) {
+	partial := []netlink.Link{
+		&netlink.Device{LinkAttrs: netlink.LinkAttrs{Name: "ge-0-0-0"}},
+		&netlink.Xfrmi{LinkAttrs: netlink.LinkAttrs{Name: "st10"}, Ifid: 0x50001},
+	}
+
+	t.Run("interrupted dump keeps its partial evidence", func(t *testing.T) {
+		got, err := xfrmDumpNames(partial, netlink.ErrDumpInterrupted)
+		if err != nil {
+			t.Fatalf("err = %v, want nil: an interrupted dump is not a failure to "+
+				"classify, it is a SHORTER classification", err)
+		}
+		if !got["st10"] {
+			t.Errorf("xfrmDumpNames = %v: the xfrm device netlink DID return was "+
+				"discarded. buildLinkSnapshot still resolves it afterwards, so the row "+
+				"ships Ifindex > 0 with SecureTunnel false — the live xfrmi is "+
+				"adjudicated and RSS-bound, which is the state this belt exists to "+
+				"catch", got)
+		}
+		if got["ge-0-0-0"] {
+			t.Errorf("xfrmDumpNames = %v classified an ordinary Device", got)
+		}
+	})
+
+	t.Run("hard error is reported, not read as an empty box", func(t *testing.T) {
+		wantErr := errors.New("netlink: socket closed")
+		got, err := xfrmDumpNames(nil, wantErr)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("err = %v, want %v: a caller that cannot distinguish "+
+				"'no xfrm devices' from 'I could not tell' has no conservative "+
+				"option available to it", err, wantErr)
+		}
+		if len(got) != 0 {
+			t.Errorf("xfrmDumpNames = %v, want empty on a dump that returned no links", got)
+		}
+	})
 }

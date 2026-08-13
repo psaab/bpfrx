@@ -109,7 +109,7 @@ func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	// disarm paths (shutdown, disarmSnapshotProtocolFailureLocked) must never be
 	// blocked, and this mirrors the ForwardingSupported guard above.
 	if armed && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
-		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot.Config); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 			return m.lastStatus, err
 		}
 	}

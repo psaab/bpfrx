@@ -36,10 +36,11 @@ var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-gl
 // (include_userspace_binding_interface) is AUTHORITATIVE on it: a route-based
 // IPsec xfrmi must not become an AF_XDP binding candidate.
 //
-// #6691 round 8: the flag is now set by CONFIG ownership or by the KERNEL link
-// kind, and configHasSecureTunnel asks both — so this gate fires for a stale
-// live xfrmi too, which is the case the operator cannot fix by editing the
-// config.
+// #6691 round 8: the flag is set by CONFIG ownership or by the KERNEL link
+// kind, so this gate fires for a stale live xfrmi too — the case the operator
+// cannot fix by editing the config. Round 9: the gate reads the flag off the
+// SNAPSHOT (snapshotHasSecureTunnel) instead of re-deriving it, so it cannot
+// disagree with what was built.
 //
 // A helper that predates the field ignores it and plans the candidate. That is
 // not a lost optimisation — the helper's queue count is the GLOBAL MINIMUM
@@ -294,7 +295,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// userspace-dp has entries it doesn't if apply_snapshot fails.
 	// Moved to the post-success path below (after line 343).
 	if pendingXSKStartup {
-		if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+		if err := m.ensureRequiredSnapshotProtocolLocked(snap); err != nil {
 			if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 				return result, errors.Join(err, disarmErr)
 			}
@@ -348,7 +349,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.ensureProcessLocked(ucfg); err != nil {
 		return result, err
 	}
-	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(snap); err != nil {
 		return result, m.disarmSnapshotProtocolFailClosedLocked(snap, err, samePlanRefresh)
 	}
 	if m.deferWorkers {
@@ -585,7 +586,7 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 		return nil
 	}
 
-	if err := m.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m.ensureRequiredSnapshotProtocolLocked(m.lastSnapshot); err != nil {
 		if disarmErr := m.disarmSnapshotProtocolFailureLocked(err); disarmErr != nil {
 			slog.Warn("userspace: failed to disarm helper after refusing snapshot publish",
 				"protocol_err", err, "err", disarmErr)
@@ -787,63 +788,48 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 	)
 }
 
-// configHasSecureTunnel reports whether the snapshot this config produces will
-// carry an InterfaceSnapshot with SecureTunnel set.
+// snapshotHasSecureTunnel reports whether this snapshot carries an
+// InterfaceSnapshot with SecureTunnel set.
 //
-// It asks the SAME question the snapshot builder asks — snapshotSecureTunnel,
-// over the same refs the builder walks — so the gate cannot arm for a config
-// whose snapshot carries no flagged row or stay silent for one that does.
-// Keying on the VPN stanza directly would diverge the moment a bind-interface
-// stops resolving to a netdev.
+// It asks the snapshot builder ITSELF (#6691 round 9), rather than asking the
+// same question over the same refs and asserting the two answers agree.
 //
-// #6691 round 8: that invariant is why the KERNEL half is here too. The
-// builder's flag became the union of config ownership and "the resolved netdev
-// is an xfrm interface" (snapshotSecureTunnel), so a gate that asked only the
-// config half would stay silent for a snapshot that DOES carry a flagged row —
-// exactly the divergence the paragraph above forbids. The stale-xfrmi state is
-// the one this covers: a pre-v5 helper refuses such a snapshot outright and
-// stays armed on its previous image, which is the window this gate exists to
-// close, and the operator cannot close it by editing the config.
+// Round 8 hand-mirrored the builder's walk here — config ownership first, then
+// a SECOND RTM_GETLINK dump for the kernel half — under a comment claiming the
+// gate "cannot arm for a config whose snapshot carries no flagged row or stay
+// silent for one that does". A review round measured that claim false, and the
+// mechanism was the second dump: with an xfrm device visible to the builder's
+// dump and gone by this one, the built snapshot carried SecureTunnel=true on
+// `st10` while this function returned FALSE, so the required-protocol gate
+// stayed silent for exactly the snapshot it exists to gate. Two samples of a
+// changing kernel are two answers; the invariant was never a property of the
+// code, only of the timing.
 //
-// The kernel half costs ONE RTM_GETLINK dump, taken only after the config half
-// has found nothing, and it is skipped entirely on a box with no xfrm devices
-// (the dump comes back empty). This runs on apply/publish/arm paths, never on
-// a poll tick.
-func configHasSecureTunnel(cfg *config.Config) bool {
-	if cfg == nil {
+// Reading the rows makes it a property of the code: there is ONE classification
+// per snapshot, taken by the builder that stamps the flag, so "arms iff the
+// snapshot carries a flagged row" is true by construction rather than by two
+// samples agreeing. It also costs NOTHING — no dump, no walk, just a scan of
+// rows the caller already has. Round 8's cost sentence ("ONE RTM_GETLINK dump,
+// taken only after the config half has found nothing … skipped entirely on a
+// box with no xfrm devices … never on a poll tick") was wrong three ways: the
+// dump was unconditional once the config half found nothing, "skipped on a box
+// with no xfrm devices" described the RESULT being empty rather than the dump
+// being skipped, and the poll-triggered arm reconciliation (manager_status.go,
+// manager_ha.go) does reach this gate.
+//
+// This does NOT eliminate every re-sample in the package — UserspaceBoundLinuxInterfaces
+// still builds its own snapshot from a bare *config.Config, because that is the
+// only thing its daemon call sites have. What it eliminates is the sample whose
+// disagreement was UNSAFE: a silent gate leaves a pre-v5 helper armed on its
+// previous-good image. The allowlist's remaining sample is conservative in its
+// own direction (see its degrade-to-nil path) and cannot leave a helper armed.
+func snapshotHasSecureTunnel(snap *ConfigSnapshot) bool {
+	if snap == nil {
 		return false
 	}
-	for name, iface := range cfg.Interfaces.Interfaces {
-		if iface == nil {
-			continue
-		}
-		if _, ok := cfg.SecureTunnelNetdevForRef(name); ok {
+	for _, iface := range snap.Interfaces {
+		if iface.SecureTunnel {
 			return true
-		}
-		for unitNum := range iface.Units {
-			if _, ok := cfg.SecureTunnelNetdevForRef(fmt.Sprintf("%s.%d", name, unitNum)); ok {
-				return true
-			}
-		}
-	}
-	liveXfrm := liveXfrmNetdevs()
-	if len(liveXfrm) == 0 {
-		return false
-	}
-	for name, iface := range cfg.Interfaces.Interfaces {
-		if iface == nil {
-			continue
-		}
-		if liveXfrm[snapshotLinuxName(cfg, name, iface, nil)] {
-			return true
-		}
-		for _, unit := range iface.Units {
-			if unit == nil {
-				continue
-			}
-			if liveXfrm[snapshotLinuxName(cfg, name, iface, unit)] {
-				return true
-			}
 		}
 	}
 	return false
@@ -868,8 +854,8 @@ func configHasSecureTunnel(cfg *config.Config) bool {
 // arming is right — a stale xfrmi is exactly the case an operator cannot fix by
 // editing the config, so a pre-v5 helper must not stay armed for it — and only
 // the sentence was the defect.
-func (m *Manager) ensureSecureTunnelProtocolLocked(cfg *config.Config) error {
-	if !configHasSecureTunnel(cfg) {
+func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
+	if !snapshotHasSecureTunnel(snap) {
 		return nil
 	}
 	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
@@ -936,7 +922,30 @@ func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) er
 	)
 }
 
-func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error {
+// ensureRequiredSnapshotProtocolLocked takes the SNAPSHOT, not the config
+// (#6691 round 9).
+//
+// Three of the four gates are pure config questions and read snap.Config
+// exactly as before. The fourth — the secure-tunnel gate — is not: the flag it
+// arms on is stamped by the snapshot builder from a sample of the KERNEL, and
+// asking the same question from a config a moment later is asking a different
+// kernel. Measured before this round, with an xfrm device visible to the
+// builder's dump and gone by the gate's: the built snapshot carried
+// SecureTunnel=true on `st10` while the gate returned false, so a pre-v5 helper
+// stayed ARMED on its previous-good image for exactly the snapshot the gate
+// exists to refuse.
+//
+// Passing the snapshot makes "arms iff the snapshot carries a flagged row" true
+// by construction rather than by two samples agreeing. Every call site already
+// had one in scope: the apply paths pass the snapshot they are about to
+// publish, and the poll/status/HA paths pass m.lastSnapshot, which is the
+// snapshot actually being enforced — a strictly better oracle than re-deriving
+// from config on a poll tick.
+func (m *Manager) ensureRequiredSnapshotProtocolLocked(snap *ConfigSnapshot) error {
+	var cfg *config.Config
+	if snap != nil {
+		cfg = snap.Config
+	}
 	if err := m.ensurePolicySchedulerProtocolLocked(cfg); err != nil {
 		return err
 	}
@@ -946,7 +955,7 @@ func (m *Manager) ensureRequiredSnapshotProtocolLocked(cfg *config.Config) error
 	if err := m.ensureScopedGlobalZoneSetProtocolLocked(cfg); err != nil {
 		return err
 	}
-	return m.ensureSecureTunnelProtocolLocked(cfg)
+	return m.ensureSecureTunnelProtocolLocked(snap)
 }
 
 // disarmSnapshotProtocolFailClosedLocked is the shared fail-closed action for a

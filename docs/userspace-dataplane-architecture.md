@@ -1615,7 +1615,7 @@ The invariant #5488 records is that **a compatibility extension which
 changes deny/reject COVERAGE must not be silently ignorable under an
 unchanged protocol version.**
 
-**Why it is at 5.** #5619/#6691 added
+**Why it is at 6.** #5619/#6691 added
 `InterfaceSnapshot.secure_tunnel`, and made it AUTHORITATIVE over AF_XDP
 binding admission: `include_userspace_binding_interface`
 (`userspace-dp/src/server/helpers/planning.rs`) refuses a candidate on
@@ -1662,22 +1662,38 @@ global emits neither side, so neither can be narrowed by a singular-only
 reader and neither is gated; that keeps the disarm blast radius to
 exactly the misrepresentable population.
 
-The v5 bump carries the matching gate,
+**Why it went from 5 to 6 inside the same PR.** #6691 round 8 shipped v5 with a
+refused-netdev index that refused a netdev as soon as ANY row was unbindable for
+it; round 9 replaced that with EVERY-owner unanimity. Those two readers accept
+identical bytes and plan DIFFERENT bindings — a round-8 v5 helper drops a zoned
+VLAN sibling of a flagged parent where a round-9 v5 helper keeps it. A version
+whose meaning depends on which round produced the binary is not a version, so it
+moved. Neither 5 nor 6 has ever shipped (#6691 is unmerged), so the bump costs
+nothing, and the Go-side assertion is now an EQUALITY
+(`ProtocolVersion != secureTunnelSnapshotProtocolVersion`) rather than
+`> 4`, which stayed green at the colliding value.
+
+The v6 bump carries the matching gate,
 `ensureSecureTunnelProtocolLocked`, with sentinel
 `ErrSecureTunnelProtocolIncompatible` (also registered in
-`requiredProtocolGateSentinels`). It arms off `configHasSecureTunnel`,
-which asks the SAME question the snapshot builder asks
-(`snapshotSecureTunnel`) over the same interface and unit refs — so it
-cannot arm for a config whose snapshot carries no flagged row, nor stay
-silent for one that does. Since #6691 round 8 that question has TWO
+`requiredProtocolGateSentinels`). It arms off `snapshotHasSecureTunnel`,
+which reads the flag off the SNAPSHOT the caller is publishing rather than
+re-deriving it. Round 8 hand-mirrored the builder's walk here and claimed the
+two "cannot diverge"; a review round measured them diverging, because the mirror
+took a SECOND RTM_GETLINK dump and an xfrm device visible to the builder and gone
+by the gate produced a flagged snapshot with a silent gate — the pre-v6 helper
+stayed armed on its previous-good image. Reading the rows makes "arms iff the
+snapshot carries a flagged row" true by construction, and costs no dump at all. Since #6691 round 8 the flag has TWO
 halves — config ownership (`Config.SecureTunnelNetdevForRef`) and the
-kernel's link kind (`liveXfrmNetdevs`) — and the gate asks both, because
-a stale live xfrmi is exactly the case an operator cannot fix by editing
-the config. Scoped that way, an operator with neither route-based IPsec
-nor a leftover xfrm device is never blocked by a helper-version mismatch
-that cannot affect them; the kernel half costs one `RTM_GETLINK` dump on
-the apply/publish/arm paths, taken only after the config half finds
-nothing, and never on a poll tick.
+kernel's link kind (`liveXfrmNetdevs`) — because a stale live xfrmi is exactly
+the case an operator cannot fix by editing the config. Scoped that way, an
+operator with neither route-based IPsec nor a leftover xfrm device is never
+blocked by a helper-version mismatch that cannot affect them. The kernel half
+costs one `RTM_GETLINK` dump per SNAPSHOT BUILD (the builder, once, for all
+rows) — not one per gate call, and the gate itself takes none. That dump no
+longer discards a partial result: netlink returns the links it did deserialize
+together with `ErrDumpInterrupted`, and round 8's `if err != nil { return nil }`
+threw away real evidence including the xfrm device itself.
 
 If the disarm ITSELF fails, the helper is still armed on its
 previous-good snapshot — and on a publish path whose classifier BPF maps

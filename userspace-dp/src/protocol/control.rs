@@ -54,7 +54,7 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// forwarding its previous-good image, so it is paired with
 /// `ensureSecureTunnelProtocolLocked` (pkg/dataplane/userspace/
 /// manager_compile.go), which disarms that helper and aborts the commit.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 5;
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 6;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level

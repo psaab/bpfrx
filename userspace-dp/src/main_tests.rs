@@ -4606,3 +4606,121 @@ fn a_netdev_with_a_bindable_owner_is_not_refused() {
 
     clear_rx_queue_count_override();
 }
+
+/// #6691 round 9: `replan_queues`' FABRIC loop must ask the refused index too.
+///
+/// Round 8 gated the interface loop and left the fabric loop unconditional,
+/// recording the gap as unreachable — a judgement made against the PRE-round-8
+/// exclusion, which was keyed on the ref's NAME. The kernel-kind half refuses a
+/// device for what it IS, so a slot-shaped `ge-0/0/0` created out of band is
+/// both refused and a legal `fabric-options member-interfaces` value; the Go
+/// control plane ships it as a fabric row whose parent netdev carries
+/// `secure_tunnel` on its own interface row.
+///
+/// Planning a binding onto it is the same #3091 collapse the exclusion exists to
+/// prevent: an xfrm interface has one RX queue and the planner takes the global
+/// minimum across candidates.
+///
+/// FAIL-ON-REVERT: drop the `snapshot_refuses_parent_netdev` guard from the
+/// fabric candidate loop and this reds — `ge-0-0-0` reappears in the plan and
+/// the LAN's queue count collapses from 6 to 1.
+#[test]
+fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+        userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-3", 6);
+    // The measured xfrmi property: exactly one RX queue.
+    set_rx_queue_count_override("ge-0-0-0", 1);
+
+    // The fabric MEMBER's own interface row: an xfrm device by kernel kind,
+    // under a slot-shaped name. This is what the Go builder ships.
+    let member = InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        zone: String::new(),
+        secure_tunnel: true,
+        ifindex: 20,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/3".to_string(),
+        linux_name: "ge-0-0-3".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 21,
+        rx_queues: 6,
+        ..Default::default()
+    };
+
+    // Premises. Without both, the fabric loop is not being tested.
+    assert!(
+        userspace_unbindable_netdev(&member),
+        "premise: the fabric member's netdev must be REFUSED, or there is nothing \
+         for the fabric loop to re-admit"
+    );
+    assert!(
+        lan.rx_queues > member.rx_queues,
+        "premise: the LAN must have MORE queues than the member, or the global \
+         minimum cannot move and the collapse assertion is vacuous"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![member, lan.clone()],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("ge-0-0-0"),
+        "the fabric loop planned an AF_XDP binding for a REFUSED member netdev. \
+         Its own interface row carries secure_tunnel; the fabric row re-admitted \
+         it without asking. Planned: {planned:?}"
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-3")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {} — the refused \
+         member entered the candidate list through the fabric loop and its single \
+         RX queue became the global minimum (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    // #2915: the plan-key HASH must drop exactly what the LAYOUT drops.
+    let without_fabric = ConfigSnapshot {
+        fabrics: Vec::new(),
+        ..snapshot.clone()
+    };
+    assert_eq!(
+        snapshot_binding_plan_key(&snapshot),
+        snapshot_binding_plan_key(&without_fabric),
+        "the plan key still hashes a fabric row that produces no candidate: the \
+         hash and the layout disagree about the binding plan (#2915)"
+    );
+
+    clear_rx_queue_count_override();
+}

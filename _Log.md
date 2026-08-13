@@ -1,3 +1,167 @@
+## 2026-08-13 — #6691 round 9b: the kernel evidence was sampled three times, and two of the guards meant to make round 8 safe could not fire
+
+- **Timestamp**: 2026-08-13 19:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded an independent Codex DO-NOT-MERGE (8 blocking) on top of
+  round 9. Two of the eight overturn earlier conclusions of MINE that a previous
+  round had endorsed; two more are guards that were incapable of failing.
+- **File(s)**: `pkg/dataplane/userspace/{ingress_exclusions,interfaces,maps_sync,manager_compile,protocol,manager_status,manager_ha,manager_overlay,process_status,manager_worker_arm_5134}.go`,
+  `pkg/dataplane/userspace/{secure_tunnel_parent_redirect_6691,secure_tunnel_protocol_6691,snapshot_allowlist,scoped_global_zoneset_*,manager_capabilities}_test.go`,
+  `userspace-dp/src/server/helpers/planning.rs`, `userspace-dp/src/protocol/control.rs`,
+  `userspace-dp/src/main_tests.rs`, `userspace-dp/src/server/README.md`,
+  `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **EVERY ITEM WAS MEASURED AT MY OWN HEAD (8de9691d8) BEFORE BEING CHANGED**,
+  because two of the eight were about round 9's fix rather than round 8's, and
+  one of the eight turned out to be ALREADY CLOSED by round 9. Reporting a fix
+  for something already fixed is the same failure as missing one.
+
+  **#2 GRE spelling — ALREADY CLOSED by round 9, reported as such.** The
+  `gr-0/0/0 unit 0 tunnel …` shape is the third combination of the round-9
+  blocker, and the EVERY-owner rule covers it identically to WireGuard: measured
+  at 8de9691d8, refused index empty, ingress [10 41], allowlist
+  [ge-0-0-0 gr-0-0-0], no divergence. Added as a case, not as a fix.
+
+  **#2b DIRECT own-ifindex path — NOT a hole under the EVERY rule, and the
+  reason is structural.** A row reaching the direct arm has passed
+  userspaceSkipsIngressInterface, and unbindable ⇒ skipped, so it is a BINDABLE
+  owner of its own ifindex bucket and that bucket cannot be unanimous. The
+  refusal is unaskable there. Adding the call would have been an inert conjunct;
+  the invariant is asserted instead.
+
+  **#3 — the over-exclusion ran the OTHER way, and round 9 did not fix it.**
+  buildUserspaceIngressIfindexes' refused-parent arm dropped the WHOLE ROW.
+  Correct for a VLAN child (the parent IS its bind target); wrong for a plain
+  unit that merely CARRIES a parent ifindex. Measured with secure `st10` at 11
+  and an ordinary live `st10.5` at 12: ingress [10] — 12 missing — while the RSS
+  allowlist named `st10.5` and Rust made it a candidate. A netdev with a binding
+  and no ingress entry takes cpumap_or_pass and leaves the adjudicated path — the
+  ingress/plan split in the opposite direction from the one round 8 fixed. The
+  parent key is now always suppressed and the row survives iff it owns its
+  netdev. After: ingress [10 12], with 11 still out.
+
+  **#1 — the FABRIC gap is REACHABLE, and the reachability is this PR's own
+  doing.** Round 8 recorded it as unreachable on the ground that
+  LocalFabricMember resolves only for slot-shaped names, so an `st*` member
+  yields no fabric row. That reasoning answered the PRE-round-8 question, when
+  the exclusion was keyed on the ref's NAME. Round 8's kernel-kind half refuses
+  a device for what it IS, so a slot-shaped `ge-0/0/0` created or renamed out of
+  band is BOTH refused AND a legal `fabric-options member-interfaces` value.
+  Measured: refused index name{ge-0-0-0} ifx{20}, yet allowlist
+  [ge-0-0-0 ge-0-0-3] and ingress [20 21]. All FOUR loops now ask the index —
+  two in Go, plus Rust's replan_queues layout AND its plan-key hash, so the
+  #2915 hash/layout invariant holds for fabrics too. After: allowlist
+  [ge-0-0-3], ingress [21]. **#6998 was filed by round 9 as pre-existing and is
+  now CLOSED by round 9b**, with its own repro re-measured: ingress [25],
+  allowlist [ge-0-0-9], the refused member in neither.
+
+  **#4 — the kernel evidence was sampled THREE times, fail-open, and one
+  disagreement was unsafe.** Measured with an oracle that shows the xfrm device
+  to the first dump only: the built snapshot carried SecureTunnel=true on `st10`
+  and correctly excluded it from ingress, while `configHasSecureTunnel`
+  re-enumerated and returned **false** — the required-protocol gate stayed
+  SILENT for exactly the snapshot it exists to refuse, leaving a pre-v6 helper
+  ARMED on its previous-good image. That falsified the function's own documented
+  invariant ("cannot … stay silent for one that does").
+
+  Fixed structurally rather than per-path: `ensureRequiredSnapshotProtocolLocked`
+  now takes the **snapshot**, not the config, and the secure-tunnel gate reads
+  the flag the builder stamped (`snapshotHasSecureTunnel`). Every call site
+  already had one in scope — the apply paths pass what they are about to
+  publish, the poll/status/HA paths pass `m.lastSnapshot`, which is what is
+  actually being enforced and is a better oracle than re-deriving. The gate now
+  takes NO dump at all. Measured after: gate `true` on the applied snapshot with
+  the sample count still 1.
+
+  Also fixed: `liveXfrmNetdevs` discarded a PARTIAL dump. netlink v1.3.1 returns
+  the links it did deserialize together with `ErrDumpInterrupted`
+  (link_linux.go returns early only for a non-interrupt error, then
+  `return res, executeErr`), so an interrupted dump threw away real evidence
+  INCLUDING the xfrm device, while the per-row buildLinkSnapshot lookups still
+  resolved it — the stale xfrmi came back Ifindex > 0 with SecureTunnel false,
+  the exact state the belt exists to catch. Round 8 called that "fails OPEN
+  because the config half is the primary"; it was not a considered trade.
+
+  **NOT claimed as eliminated:** UserspaceBoundLinuxInterfaces still takes its
+  own sample, because its three daemon call sites hold only a
+  `*config.Config`. That is documented at the site rather than papered over, and
+  its disagreement is conservative by construction — an allowlist entry is
+  permission to reshape a NIC, so doubt must NAME FEWER netdevs, which is what
+  the degrade-to-nil path and the partial-dump fix both do.
+
+  **#7 — the enumeration guard was TAUTOLOGICAL.** It compared six hard-coded
+  strings against a hard-coded 6. Codex's mutation (add an unenumerated
+  production exclusion class) fired NO assertion, so the fail-on-revert contract
+  in that test's own doc comment was false — and it is the guard round 9 quoted
+  on the PR as pinning its enumeration. Fixed by making PRODUCTION enumerate its
+  classes: the switch is now `netdevExclusionClasses`, a named table, and
+  `userspaceNetdevExclusionClass` returns WHICH class fired. The test asserts
+  both directions against that slice and adds a per-case positive control, so a
+  case cannot claim a class it does not trigger. Verified: the same mutation now
+  reds.
+
+  **#8 — the `Type() == "xfrm"` discriminator was UNBOUND.** Every test presents
+  a kernel by replacing the whole liveXfrmNetdevs closure, so deleting the kind
+  filter — a mutation that classifies EVERY link as an xfrm interface and would
+  strip every NIC of its AF_XDP binding — left the package green. A test that
+  supplies the answer cannot check the thing that computes it. Split into two
+  pure functions, `xfrmNetdevNames` (the classifier) and `xfrmDumpNames` (the
+  error policy), each driven directly. The FIRST 9b grid then found the error
+  policy still surviving, which is why it is two functions and not one.
+
+  **#5 — protocol bumped 5 → 6, assertion pinned to EQUALITY.** Not for the
+  kernel half: for the fact that the REFUSAL RULE the flag feeds changed inside
+  this PR. A round-8 v5 helper and a round-9 v5 helper accept identical bytes and
+  plan different bindings for a VLAN sibling of a flagged parent. A version whose
+  meaning depends on which round produced the binary is not a version. The old
+  assertion was `ProtocolVersion > 4`, which stays GREEN at the colliding value —
+  a weak assertion independent of reachability. Neither 5 nor 6 has shipped
+  (#6691 is unmerged), so the bump costs nothing.
+
+  **Claim corrections, each measured before rewriting.** The mgmt/control
+  device-predicate mutation fires ONLY the placement assertion (a t.Fatal, so the
+  ingress and allowlist assertions below never run) — round 9 said "both
+  assertions" and that was wrong. `configHasSecureTunnel`'s cost sentence was
+  wrong three ways (the dump was unconditional once the config half found
+  nothing; "skipped on a box with no xfrm devices" described the RESULT being
+  empty, not the dump being skipped; the poll-triggered arm reconciliation does
+  reach the gate). `secure_tunnel` is no longer read by one Rust consumer.
+  The allowlist builder DOES depend on ordinary link/ifindex resolution. The
+  README's ParentIfindex-guard ORDER was backwards — maps_sync calls the
+  predicate first. `ensureSecureTunnelProtocolLocked` detects an older HELPER,
+  not an older control plane. And "on the commit that CREATES a tunnel only the
+  config knows" is narrower than stated: on the normal apply path the interface
+  reconcile runs BEFORE snapshot construction.
+
+  **Mutation grid — 17 severances across two rounds, each required to COMPILE
+  first, ALL KILLED.**
+
+  | # | severed | result |
+  |---|---|---|
+  | M1 | ingress `refusesIfindex` | KILLED (`:145` ingress set) |
+  | M2 | RSS `refusesName` | KILLED (`:155` + the SSOT parity premise) |
+  | M3 | alias-table `refusesIfindex` | KILLED (`:719` alias -> refused xfrmi) |
+  | M4 | refused index EVERY → ANY | KILLED (`:632` + the B1 table) |
+  | M5 | refused index → refuse nothing | KILLED (`:145`) |
+  | M6 | ownership qualifier dropped | KILLED (`:767` LogicalOnly owns its netdev) |
+  | M7 | SSOT derivation → pre-round-8 rule | KILLED (allowlist diverges) |
+  | N1 | #3 whole-row drop restored | KILLED (`:1283` ingress missing ifindex 12) |
+  | N2 | #1 allowlist fabric guard | KILLED (`:1219` allowlist regains ge-0-0-0) |
+  | N3 | #1 ingress fabric guard | KILLED (`:1224` ingress regains 20) |
+  | N4 | #8 kind discriminator | KILLED (`:1140` ge-0-0-0 + veth0 classified) |
+  | N5 | #4a partial-dump discard | KILLED (`:1334` the xfrmi discarded) |
+  | N6 | #4c gate re-derives | KILLED (`:316` gate returned nil for a flagged snapshot) |
+  | N7 | #5 protocol back to 5 | KILLED (equality assertion) |
+  | N8 | #7 unenumerated production class | KILLED (placement + coverage) |
+  | R1 | Rust EVERY → ANY | KILLED (`a_netdev_with_a_bindable_owner…`) |
+  | R2 | Rust refuse nothing | KILLED (`orphan_vlan_child_cannot_readmit…`) |
+  | R3 | Rust fabric LAYOUT guard | KILLED (`fabric_loop_cannot_readmit…`) |
+  | R4 | Rust fabric PLAN-KEY guard | KILLED (same test, #2915 assertion) |
+
+  **The 9b grid's first pass found N5 and N6 unbound, and both were fixed rather
+  than reported.** N6 additionally reds on a PREMISE in its first form, which
+  would have misdirected a future reader to the fixture instead of production —
+  so the premise no longer expresses itself with the function under test.
+
 ## 2026-08-13 — #6691 round 9: the refused-netdev index refused a netdev an ADMITTED row owns
 
 - **Timestamp**: 2026-08-13 16:05 (fix/5619-ipsec-passthrough-zone-policy)

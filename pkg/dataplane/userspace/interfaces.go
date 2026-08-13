@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -137,10 +138,15 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		return nil
 	}
 	ucfg := deriveUserspaceConfig(cfg)
-	// Build a snapshot without depending on ifindex resolution — the
-	// allowlist is by Linux name (what `ethtool` consumes), so ifindex
-	// lookups are unnecessary here. We reuse the shared filter via the
-	// real builder to stay in lock-step with binding logic.
+	// Reuse the REAL builder so this stays in lock-step with binding logic.
+	//
+	// It does NOT skip ifindex resolution — an earlier revision said "build a
+	// snapshot without depending on ifindex resolution", and that is false of
+	// the code: buildSnapshot runs buildLinkSnapshot for every row and unit
+	// exactly as the apply path does. What is true is weaker and is the only
+	// thing the allowlist relies on: the RESULT is keyed by Linux NAME (what
+	// `ethtool` consumes), so an unresolvable ifindex does not by itself drop
+	// an entry here the way it would from the ingress map.
 	// #2514: buildSnapshot can return an error (e.g. an unresolvable
 	// address-book content-ID collision). This is a best-effort allowlist
 	// derivation, so on error we degrade to nil rather than propagating —
@@ -162,6 +168,22 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		seen[name] = struct{}{}
 		out = append(out, name)
 	}
+	// #6691 round 9: this builder takes its OWN sample of the kernel's xfrm
+	// devices (buildSnapshot -> buildInterfaceSnapshots -> liveXfrmNetdevs), a
+	// DIFFERENT instant from the applied snapshot's. Its daemon call sites
+	// (daemon_apply_tail.go, daemon_run_naming.go) hold only a *config.Config,
+	// so the sample cannot be inherited without changing the exported contract
+	// — and the honest thing is to say so and make the disagreement safe rather
+	// than claim it is impossible. Measured before this round: with an xfrm
+	// device visible to the applied build and gone by this one, the allowlist
+	// re-admitted the xfrmi that the ingress map had correctly excluded.
+	//
+	// Safe here means: an entry in this list is permission to RESHAPE a NIC's
+	// RSS table and pin its coalescing, so the conservative answer to any doubt
+	// is to name FEWER netdevs, never more. That is what the degrade-to-nil
+	// above does for a build error, and it is why liveXfrmNetdevs no longer
+	// discards a partial dump: the interrupted-dump case was the measured way
+	// this sample came back EMPTY and re-admitted a device.
 	refused := buildUserspaceRefusedNetdevs(snap.Interfaces)
 	for _, iface := range snap.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
@@ -188,6 +210,33 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 		add(bindTarget)
 	}
 	for _, fab := range snap.Fabrics {
+		// #6691 round 9: the fabric loop asks the refused index too. Round 8
+		// left it unconditional and recorded "not reachable for a secure
+		// tunnel", on the ground that compiler_derivations.go resolves
+		// LocalFabricMember only for a member with an FPC slot, so an `st*`
+		// member yields no fabric row. That reasoning asked the PRE-round-8
+		// question — when the exclusion was keyed on the ref's NAME.
+		//
+		// Round 8's kernel-kind half classifies by DEVICE KIND, so it refuses
+		// an xfrm device WHATEVER it is called, including a slot-shaped
+		// `ge-0/0/0` created or renamed out of band. That name IS a legal
+		// fabric member. Measured: with `fab0 fabric-options member-interfaces
+		// ge-0/0/0` and `ge-0-0-0` reporting kernel kind `xfrm`, the refused
+		// index held name{ge-0-0-0} and ifx{20} while this loop put ge-0-0-0
+		// straight back into the allowlist and the sibling loop in
+		// maps_sync.go put 20 back into the ingress set. The reachability was
+		// created by this PR's own change, so it is this PR's to close.
+		//
+		// This does NOT filter the ORDINARY fabric: fab0/fab1 are IPVLAN
+		// overlays excluded on their own row, and their physical parent is a
+		// data NIC that no exclusion class names, so it is not in the index and
+		// this guard is transparent. It fires only when the member netdev is
+		// one the dataplane may never bind — where the honest outcome is that
+		// the fabric gets no AF_XDP binding, not that it gets one onto an
+		// unbindable device.
+		if refused.refusesName(fab.ParentLinuxName) {
+			continue
+		}
 		add(fab.ParentLinuxName)
 	}
 	sort.Strings(out)
@@ -201,7 +250,18 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 	// #6691 round 8: resolved ONCE per snapshot, not per row — it is a single
 	// RTM_GETLINK dump, against the two netlink lookups buildLinkSnapshot
 	// already issues for every row.
-	liveXfrm := liveXfrmNetdevs()
+	liveXfrm, xfrmErr := liveXfrmNetdevs()
+	if xfrmErr != nil {
+		// The kernel half of snapshotSecureTunnel is unavailable for this
+		// build. Log LOUDLY and continue on the config half, which stays
+		// authoritative for every tunnel an IPsec stanza names — the gap this
+		// leaves is exactly the stale-xfrmi case, which no config-keyed
+		// predicate could have covered anyway. Failing the whole apply on a
+		// transient RTM_GETLINK error would brick commits for a belt.
+		slog.Error("userspace: could not classify xfrm netdevs; secure-tunnel "+
+			"exclusion falls back to configuration ownership only",
+			"err", xfrmErr)
+	}
 	zoneByInterface := buildInterfaceZoneMap(cfg)
 	ifaceRoutingInstance := buildInterfaceRoutingInstances(cfg)
 	usedSyntheticIfindexes := make(map[int]struct{})
@@ -532,21 +592,81 @@ func secureTunnelOwned(cfg *config.Config, ifName string) bool {
 // BELT, not a replacement for the ownership test: the xfrmi reconciler runs at
 // apply time, so on the commit that CREATES a tunnel the device may not exist
 // yet and only the config knows — the two halves cover different instants and
-// snapshotSecureTunnel takes the union. It fails OPEN (an unreadable link list
-// yields nil, i.e. today's behaviour) because the config half is the primary.
+// snapshotSecureTunnel takes the union.
 //
 // It cannot over-match: `xfrm` is the kernel link kind (netlink IFLA_INFO_KIND,
 // vishvananda/netlink *Xfrmi.Type()), so a wildcard-authored NIC named `st5` —
 // the interface four earlier rounds of this PR fought to keep adjudicated — is
 // not in this set, and no ordinary NIC ever can be.
 //
+// IT NO LONGER DISCARDS A PARTIAL DUMP (#6691 round 9). Round 8 wrote
+// `if err != nil { return nil }` and called the result "fails OPEN … because
+// the config half is the primary". That was not a considered trade: netlink
+// v1.3.1's LinkList returns the links it DID deserialize together with
+// ErrDumpInterrupted (link_linux.go — `if executeErr != nil &&
+// !errors.Is(executeErr, ErrDumpInterrupted) { return nil, executeErr }` then
+// `return res, executeErr`), so a dump interrupted by a concurrent link change
+// threw away REAL evidence, including the xfrm device itself, while the
+// per-row buildLinkSnapshot lookups that follow still resolved it — the stale
+// xfrmi came back Ifindex > 0 with SecureTunnel false, which is exactly the
+// state this belt exists to catch. The names are now taken from whatever the
+// dump did return, and only a HARD error (one that is not ErrDumpInterrupted,
+// i.e. one for which netlink itself returns no links) is reported to the
+// caller.
+//
+// The error is REPORTED rather than swallowed because "no xfrm devices" and "I
+// could not tell" are different answers with opposite safe handlings, and each
+// consumer resolves it in its own conservative direction — see
+// buildInterfaceSnapshots (logs and falls back to the config half, which is
+// still authoritative for everything it covers) and UserspaceBoundLinuxInterfaces
+// (degrades to touching no NIC at all).
+//
 // A package var so a test can present a kernel state without one; production
 // never assigns it.
-var liveXfrmNetdevs = func() map[string]bool {
-	links, err := netlink.LinkList()
-	if err != nil {
-		return nil
+var liveXfrmNetdevs = func() (map[string]bool, error) {
+	return xfrmDumpNames(netlink.LinkList())
+}
+
+// xfrmDumpNames is the ERROR POLICY half of liveXfrmNetdevs, split out for the
+// same reason xfrmNetdevNames was (#6691 round 9): it is the half a test cannot
+// otherwise reach, because every test presents a kernel by replacing the whole
+// closure. Taking LinkList's (links, err) pair as arguments makes the policy a
+// pure function of that pair.
+//
+// The policy: netlink v1.3.1 returns the links it DID deserialize together with
+// ErrDumpInterrupted (link_linux.go returns early only for a non-interrupt
+// error, then `return res, executeErr`). So an interrupted dump carries real
+// evidence and is used; only a HARD error — one for which netlink returns no
+// links at all — is reported to the caller, because "no xfrm devices" and "I
+// could not tell" are different answers with opposite safe handlings.
+//
+// Round 8 wrote `if err != nil { return nil }` and called it "fails OPEN …
+// because the config half is the primary". The interrupted case is the one that
+// bit: a dump interrupted by concurrent link churn threw away the xfrm device
+// while the per-row buildLinkSnapshot lookups still resolved it, so the stale
+// xfrmi came back Ifindex > 0 with SecureTunnel false — exactly the state the
+// belt exists to catch.
+func xfrmDumpNames(links []netlink.Link, err error) (map[string]bool, error) {
+	names := xfrmNetdevNames(links)
+	if err != nil && !errors.Is(err, netlink.ErrDumpInterrupted) {
+		return names, err
 	}
+	return names, nil
+}
+
+// xfrmNetdevNames is the CLASSIFIER half of liveXfrmNetdevs, split out so the
+// `Type() == "xfrm"` discriminator can be driven directly (#6691 round 9).
+//
+// It could not be before: every test presented a kernel by replacing the whole
+// liveXfrmNetdevs closure, so deleting the kind filter — a mutation that
+// classifies EVERY enumerated link as an xfrm interface, and would strip an
+// ordinary NIC of its AF_XDP binding — left the entire suite green. The
+// discriminator is the single thing standing between "this netdev is a
+// route-based IPsec tunnel" and "this netdev is a data NIC", so it is the one
+// line in this file that most needs a test that does not itself supply the
+// answer. TestXfrmNetdevNamesClassifiesByKernelKind feeds it a mixed link list
+// and is the fail-on-revert guard.
+func xfrmNetdevNames(links []netlink.Link) map[string]bool {
 	var out map[string]bool
 	for _, link := range links {
 		if link == nil || link.Type() != "xfrm" {
@@ -568,11 +688,12 @@ var liveXfrmNetdevs = func() map[string]bool {
 // CONFIG-ownership fact (an IPsec bind-interface derives this ref's if_id) OR
 // the KERNEL fact (the netdev this row resolves to is an xfrm interface).
 //
-// The flag's WIRE meaning is unchanged and no protocol bump is owed: it has
-// always meant "the dataplane must not adjudicate or bind this row's netdev,
-// because it is a route-based IPsec tunnel device", and both halves are that
-// same claim reached by different evidence. Rust reads the same `secure_tunnel`
-// field at the same v5 protocol version, and its only consumer is
+// The flag's WIRE meaning is unchanged by the kernel half: it has always meant
+// "the dataplane must not adjudicate or bind this row's netdev, because it is a
+// route-based IPsec tunnel device", and both halves are that same claim reached
+// by different evidence. (The version DID move to 6 in round 9 — for the
+// refusal-rule change, not for this.) Rust reads the same `secure_tunnel` field,
+// in more than one place since round 8; the first of them is
 // include_userspace_binding_interface.
 func snapshotSecureTunnel(cfg *config.Config, ref, netdev string, liveXfrm map[string]bool) bool {
 	if secureTunnelOwned(cfg, ref) {

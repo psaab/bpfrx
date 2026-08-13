@@ -3,6 +3,8 @@ package userspace
 import (
 	"errors"
 	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // #6691 B2 — the v5 protocol bump and its required-protocol gate.
@@ -34,6 +36,15 @@ import (
 // snapshot, so tracking the constant would make the test vacuous the moment
 // the constant moves again.
 const preV5SnapshotProtocolVersion = 4
+
+// secureTunnelSnapshotProtocolVersion is the version this PR must ship at, and
+// it is asserted by EQUALITY. #6691 round 9 raised it from 5 to 6 because the
+// refusal rule the `secure_tunnel` flag feeds changed WITHIN this PR: a round-8
+// v5 helper and a round-9 v5 helper would accept identical bytes and plan
+// different bindings for a VLAN sibling of a flagged parent. A version whose
+// meaning depends on which round produced the binary is not a version. Nothing
+// has shipped at either value, so the cost is zero.
+const secureTunnelSnapshotProtocolVersion = 6
 
 // preV5HelperAcceptsSnapshot models the exact-equality version gate a pre-v5
 // helper applies before touching any dataplane state
@@ -81,6 +92,20 @@ func preV5HelperPlansBinding(iface InterfaceSnapshot) bool {
 // and the gate assertion reds; drop the sentinel from
 // requiredProtocolGateSentinels and the abort-set assertion reds.
 func TestSecureTunnelFieldIsNotIgnorableByAPreV5Helper(t *testing.T) {
+	// EQUALITY, not `> preV5` (#6691 round 9). The inequality stayed green at
+	// the colliding value — the whole point of the finding — because a version
+	// whose MEANING changed inside this PR is not distinguished by being merely
+	// larger than the one before it. Round 8 shipped v5 with an ANY-owner
+	// refusal; round 9's EVERY-owner rule accepts the same bytes and re-keys an
+	// unflagged VLAN sibling onto its flagged parent where round 8 dropped it.
+	// Neither v5 nor v6 has ever shipped (#6691 is unmerged), so the bump costs
+	// nothing and buys a version number that means one thing.
+	if ProtocolVersion != secureTunnelSnapshotProtocolVersion {
+		t.Fatalf("ProtocolVersion = %d, want exactly %d. `secure_tunnel` is authoritative "+
+			"over binding admission AND the refusal rule it feeds changed inside this PR, so "+
+			"the version must move whenever either does — an inequality cannot say that",
+			ProtocolVersion, secureTunnelSnapshotProtocolVersion)
+	}
 	if ProtocolVersion <= preV5SnapshotProtocolVersion {
 		t.Fatalf("ProtocolVersion = %d, must be > %d: `secure_tunnel` became authoritative "+
 			"over binding admission, so a reader that cannot see it must not share our version",
@@ -130,7 +155,7 @@ func TestSecureTunnelFieldIsNotIgnorableByAPreV5Helper(t *testing.T) {
 	//    wiring is what is under test.
 	m := New()
 	m.lastStatus.ConfigSnapshotProtocolVersion = preV5SnapshotProtocolVersion
-	gateErr := m.ensureRequiredSnapshotProtocolLocked(cfg)
+	gateErr := m.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg))
 	if !errors.Is(gateErr, ErrSecureTunnelProtocolIncompatible) {
 		t.Errorf("ensureRequiredSnapshotProtocolLocked against a pre-v5 helper = %v, want "+
 			"ErrSecureTunnelProtocolIncompatible — the helper must be disarmed, not handed a "+
@@ -146,7 +171,7 @@ func TestSecureTunnelFieldIsNotIgnorableByAPreV5Helper(t *testing.T) {
 	// 4. A CURRENT HELPER IS NOT GATED.
 	m2 := New()
 	m2.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
-	if err := m2.ensureRequiredSnapshotProtocolLocked(cfg); err != nil {
+	if err := m2.ensureRequiredSnapshotProtocolLocked(gateSnapshot(t, cfg)); err != nil {
 		t.Errorf("current-version helper gated: %v, want nil", err)
 	}
 }
@@ -161,13 +186,13 @@ func TestSecureTunnelGateIsScopedToConfigsThatDeriveAnXfrmi(t *testing.T) {
 		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 	)
-	if configHasSecureTunnel(cfg) {
+	if snapshotHasSecureTunnel(gateSnapshot(t, cfg)) {
 		t.Fatal("premise broken: this config derives no xfrmi")
 	}
 
 	m := New()
 	m.lastStatus.ConfigSnapshotProtocolVersion = preV5SnapshotProtocolVersion
-	if err := m.ensureSecureTunnelProtocolLocked(cfg); err != nil {
+	if err := m.ensureSecureTunnelProtocolLocked(gateSnapshot(t, cfg)); err != nil {
 		t.Errorf("a config with no secure tunnel was gated against a pre-v5 helper: %v", err)
 	}
 }
@@ -180,16 +205,118 @@ func TestSecureTunnelGateSeesEverySpelling(t *testing.T) {
 	for _, tc := range secureTunnelSpellings {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, _, _ := spellingConfig(t, tc.bindIface, tc.ifName, tc.unit)
-			if !configHasSecureTunnel(cfg) {
+			if !snapshotHasSecureTunnel(gateSnapshot(t, cfg)) {
 				t.Fatalf("configHasSecureTunnel = false for bind-interface %q; the v5 gate "+
 					"would not arm and a pre-v5 helper would plan its binding", tc.bindIface)
 			}
 			m := New()
 			m.lastStatus.ConfigSnapshotProtocolVersion = preV5SnapshotProtocolVersion
-			if err := m.ensureSecureTunnelProtocolLocked(cfg); !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
+			if err := m.ensureSecureTunnelProtocolLocked(gateSnapshot(t, cfg)); !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
 				t.Fatalf("gate for bind-interface %q = %v, want ErrSecureTunnelProtocolIncompatible",
 					tc.bindIface, err)
 			}
 		})
+	}
+}
+
+// gateSnapshot builds the snapshot a required-protocol gate now takes (#6691
+// round 9). The gate reads the flags the BUILDER stamped rather than
+// re-deriving them from config, so a test must hand it a real snapshot for the
+// assertion to be about production's oracle.
+func gateSnapshot(t *testing.T, cfg *config.Config) *ConfigSnapshot {
+	t.Helper()
+	snap, err := buildSnapshot(cfg, deriveUserspaceConfig(cfg), 0, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot for gate: %v", err)
+	}
+	return snap
+}
+
+// TestSecureTunnelGateReadsTheAppliedSnapshot binds the #6691 round 9 fix for
+// the triple-sampled kernel evidence — and it is the guard that was missing:
+// the first round-9b mutation grid found "gate re-derives instead of reading
+// the snapshot" SURVIVING, because every other test hands the gate a snapshot it
+// built from the same stub a moment earlier, so re-deriving looks identical.
+//
+// The oracle must answer DIFFERENTLY on the second call for the two to be
+// distinguishable, which is exactly the production hazard: the builder's
+// RTM_GETLINK dump and any later one see different kernels. Round 8 sampled
+// twice and, measured, returned false for a snapshot carrying SecureTunnel=true
+// — so a pre-v6 helper stayed ARMED on its previous-good image for precisely the
+// snapshot this gate exists to refuse.
+//
+// FAIL-ON-REVERT: make snapshotHasSecureTunnel re-derive
+// (`buildInterfaceSnapshots(snap.Config)`) instead of reading snap.Interfaces
+// and this reds — the gate returns nil for a flagged snapshot.
+func TestSecureTunnelGateReadsTheAppliedSnapshot(t *testing.T) {
+	defer stubLinkSnapshot5619(t, map[string]int{"ge-0-0-0": 10, "st10": 11})()
+
+	prev := liveXfrmNetdevs
+	calls := 0
+	// A kernel that shows the xfrm device to the FIRST dump and nothing after —
+	// a device deleted between two samples, or a dump interrupted by concurrent
+	// link churn.
+	liveXfrmNetdevs = func() (map[string]bool, error) {
+		calls++
+		if calls == 1 {
+			return map[string]bool{"st10": true}, nil
+		}
+		return nil, nil
+	}
+	defer func() { liveXfrmNetdevs = prev }()
+
+	cfg := compileForTest5619(t,
+		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+		"set interfaces st10 unit 0 family inet address 192.0.2.1/24",
+		"set security zones security-zone trust interfaces ge-0/0/0.0",
+		"set security zones security-zone trust interfaces st10.0",
+	)
+	// The APPLIED snapshot — one build, one sample.
+	applied, err := buildSnapshot(cfg, deriveUserspaceConfig(cfg), 0, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("premise broken: the builder took %d samples, want 1", calls)
+	}
+
+	// PREMISES. The snapshot must carry the flag, and a SECOND sample must not
+	// see it — without both, re-deriving and reading are indistinguishable and
+	// this test is the vacuous one it replaces.
+	// Read the ROWS directly, not through snapshotHasSecureTunnel — the premise
+	// must not be expressed with the function under test, or a mutation of that
+	// function reds this as a "premise broken" and misdirects the next reader to
+	// the fixture instead of to production.
+	flagged := false
+	for _, iface := range applied.Interfaces {
+		if iface.SecureTunnel {
+			flagged = true
+			break
+		}
+	}
+	if !flagged {
+		t.Fatal("premise broken: the applied snapshot carries no flagged row")
+	}
+	if rebuilt := buildInterfaceSnapshots(cfg); func() bool {
+		for _, iface := range rebuilt {
+			if iface.SecureTunnel {
+				return true
+			}
+		}
+		return false
+	}() {
+		t.Fatal("premise broken: a re-derivation still sees the xfrmi, so the two " +
+			"oracles agree and nothing is being distinguished")
+	}
+
+	m := &Manager{}
+	m.lastStatus.ConfigSnapshotProtocolVersion = preV5SnapshotProtocolVersion
+	err = m.ensureSecureTunnelProtocolLocked(applied)
+	if !errors.Is(err, ErrSecureTunnelProtocolIncompatible) {
+		t.Fatalf("gate returned %v, want %v. The applied snapshot carries "+
+			"SecureTunnel=true and the helper is pre-v6, so the gate must fire — a "+
+			"gate that re-samples the kernel answers about a DIFFERENT instant and "+
+			"leaves that helper armed on its previous-good image",
+			err, ErrSecureTunnelProtocolIncompatible)
 	}
 }
