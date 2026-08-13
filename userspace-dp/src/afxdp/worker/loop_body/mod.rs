@@ -693,6 +693,7 @@ pub(crate) fn worker_loop(
                 purge_input_dscp_v4,
                 purge_input_dscp_v6,
                 loop_now_ns,
+                worker_id,
             );
             if purged_input_dscp > 0 {
                 debug_log!(
@@ -827,6 +828,7 @@ pub(crate) fn worker_loop(
                 &forwarding,
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
+                worker_id,
             )
         } else {
             WorkerCommandResults {
@@ -974,6 +976,7 @@ pub(crate) fn worker_loop(
             conntrack_v4_fd,
             conntrack_v6_fd,
             loop_now_ns,
+            worker_id,
         );
         if local_expired > 0 {
             if let Some(binding) = bindings.first() {
@@ -1623,6 +1626,7 @@ pub(crate) fn worker_loop(
 /// own key, so both directions' slots are covered. This is the reap path
 /// (bounded by the ~1/s GC sweep), so it adds no per-packet cost and does not
 /// regress the #2220 keepalive fast path.
+#[allow(clippy::too_many_arguments)]
 fn reap_expired_sessions(
     bindings: &mut [BindingWorker],
     expired_entries: &[crate::session::ExpiredSession],
@@ -1631,23 +1635,35 @@ fn reap_expired_sessions(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
     now_ns: u64,
+    // #6211 F2: THIS worker's id, taken from `WorkerLaunchPlan::worker_id` at
+    // the top of `worker_loop` — the worker's own identity established at
+    // spawn, NOT read off a `BindingWorker` slot.
+    //
+    // This is the reap that motivates the whole holder set. Post-failover the
+    // active's periodic `UpsertSynced` refresh stops and RSS lands traffic on
+    // exactly ONE worker, so the other N-1 replicas of a synced session idle out
+    // with nothing refreshing them. Whichever expires first must NOT free a
+    // `(pool_addr, port)` the still-forwarding worker is using.
+    worker_id: u32,
 ) {
     for expired_entry in expired_entries {
-        release_source_nat_allocation(
+        release_source_nat_allocation_for_worker(
             &forwarding.source_nat_rules,
             &expired_entry.key,
             expired_entry.decision.nat,
             expired_entry.metadata.is_reverse,
             now_ns,
+            worker_id,
         );
         // #4381: return the reaped NAT64 forward flow's translated pool port to
         // its allocator (self-gated on the forward NAT64 entry).
-        crate::nat64::release_nat64_allocation(
+        crate::nat64::release_nat64_allocation_for_worker(
             &forwarding.nat64,
             &expired_entry.key,
             expired_entry.decision.nat,
             expired_entry.metadata.is_reverse,
             now_ns,
+            worker_id,
         );
         delete_session_map_entry_for_removed_session_with_origin(
             session_map_fd,
@@ -1974,6 +1990,7 @@ mod flow_cache_invalidation_tests {
             -1,
             -1,
             1_000_000_000,
+            0,
         );
 
         assert!(
@@ -2008,6 +2025,7 @@ mod flow_cache_invalidation_tests {
             -1,
             -1,
             1_000_000_000,
+            0,
         );
 
         assert!(
@@ -2040,6 +2058,7 @@ mod flow_cache_invalidation_tests {
             -1,
             -1,
             1_000_000_000,
+            0,
         );
 
         assert!(

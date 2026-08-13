@@ -1255,6 +1255,7 @@ impl Nat64State {
 /// different translation — is untouched. For the single-reservation case the
 /// outcome is bit-identical; only the early exit is gone. Pinned by
 /// `nat64_6876_release_frees_every_prefix_holding_the_flow`.
+#[allow(clippy::too_many_arguments)]
 fn release_nat64_allocation_with_mode(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
@@ -1262,6 +1263,7 @@ fn release_nat64_allocation_with_mode(
     is_reverse: bool,
     now_ns: u64,
     rollback: bool,
+    holder: crate::nat::NatHolder,
 ) {
     if is_reverse || !nat.nat64 {
         return;
@@ -1283,13 +1285,27 @@ fn release_nat64_allocation_with_mode(
     // held in more than one prefix's allocator, and a prefix that does not hold
     // it is a cheap no-op (`release_flow` returns false on a tuple mismatch).
     for prefix in &nat64.prefixes {
-        release_nat64_pool_port(&prefix.port_allocator, flow, snat_v4, port, now_ns, rollback);
+        release_nat64_pool_port(
+            &prefix.port_allocator,
+            flow,
+            snat_v4,
+            port,
+            now_ns,
+            rollback,
+            holder,
+        );
     }
 }
 
 /// #4381: release a NAT64 forward flow's translated pool port on session
 /// teardown (reap / purge / delete-sync), mirroring
 /// `release_source_nat_allocation`.
+/// Compile-time completeness guard for #6211 F2: this untracked entry point is
+/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
+/// BUILD FAILURE in the non-test profile rather than a silent single-holder
+/// release of a reservation every worker holds. Production uses the
+/// `_for_worker` twin.
+#[cfg(test)]
 pub(crate) fn release_nat64_allocation(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
@@ -1297,12 +1313,49 @@ pub(crate) fn release_nat64_allocation(
     is_reverse: bool,
     now_ns: u64,
 ) {
-    release_nat64_allocation_with_mode(nat64, key, nat, is_reverse, now_ns, false);
+    release_nat64_allocation_with_mode(
+        nat64,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        false,
+        crate::nat::NatHolder::Untracked,
+    );
+}
+
+/// #6211 F2: release THIS worker's hold on a NAT64 reservation. The
+/// holder-aware twin of [`release_nat64_allocation`] — the synced NAT64 entry is
+/// reserved once per worker against one shared allocator, so only the last
+/// holder may free the translated `(pool v4, port)`.
+pub(crate) fn release_nat64_allocation_for_worker(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+    worker_id: u32,
+) {
+    release_nat64_allocation_with_mode(
+        nat64,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        false,
+        crate::nat::NatHolder::Worker(worker_id),
+    );
 }
 
 /// #4381: roll back a NAT64 forward flow's translated pool port on an
 /// install-failure / admission-refusal / ICMP-error-bounce path, mirroring
 /// `rollback_source_nat_allocation`.
+/// Compile-time completeness guard for #6211 F2: this untracked entry point is
+/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
+/// BUILD FAILURE in the non-test profile rather than a silent single-holder
+/// release of a reservation every worker holds. Production uses the
+/// `_for_worker` twin.
+#[cfg(test)]
 pub(crate) fn rollback_nat64_allocation(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
@@ -1310,7 +1363,36 @@ pub(crate) fn rollback_nat64_allocation(
     is_reverse: bool,
     now_ns: u64,
 ) {
-    release_nat64_allocation_with_mode(nat64, key, nat, is_reverse, now_ns, true);
+    release_nat64_allocation_with_mode(
+        nat64,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        true,
+        crate::nat::NatHolder::Untracked,
+    );
+}
+
+/// #6211 F2: roll back THIS worker's hold on a NAT64 reservation. The
+/// holder-aware twin of [`rollback_nat64_allocation`].
+pub(crate) fn rollback_nat64_allocation_for_worker(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    now_ns: u64,
+    worker_id: u32,
+) {
+    release_nat64_allocation_with_mode(
+        nat64,
+        key,
+        nat,
+        is_reverse,
+        now_ns,
+        true,
+        crate::nat::NatHolder::Worker(worker_id),
+    );
 }
 
 /// #4512: reserve a peer-synced NAT64 forward flow's translated pool port in
@@ -1341,11 +1423,53 @@ pub(crate) fn rollback_nat64_allocation(
 /// If the synced pool address is not a member of ANY local NAT64 pool (config
 /// drift between nodes) the reserve is skipped gracefully — no panic, no
 /// reservation on the wrong pool.
+/// Compile-time completeness guard for #6211 F2: this untracked entry point is
+/// TEST-ONLY, so a production caller that forgot to thread its `worker_id` is a
+/// BUILD FAILURE in the non-test profile rather than a silent single-holder
+/// release of a reservation every worker holds. Production uses the
+/// `_for_worker` twin.
+#[cfg(test)]
 pub(crate) fn reserve_synced_nat64_allocation(
     nat64: &Nat64State,
     key: &crate::session::SessionKey,
     nat: NatDecision,
     is_reverse: bool,
+) {
+    reserve_synced_nat64_allocation_with_holder(
+        nat64,
+        key,
+        nat,
+        is_reverse,
+        crate::nat::NatHolder::Untracked,
+    );
+}
+
+/// #6211 F2: reserve a synced NAT64 translation and record `worker_id` as a
+/// HOLDER. `handle_upsert_synced` runs on every worker against ONE shared NAT64
+/// allocator, so without the holder bit the first worker to reap or delete-sync
+/// frees a translated `(pool v4, port)` the other workers still forward through.
+pub(crate) fn reserve_synced_nat64_allocation_for_worker(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    worker_id: u32,
+) {
+    reserve_synced_nat64_allocation_with_holder(
+        nat64,
+        key,
+        nat,
+        is_reverse,
+        crate::nat::NatHolder::Worker(worker_id),
+    );
+}
+
+fn reserve_synced_nat64_allocation_with_holder(
+    nat64: &Nat64State,
+    key: &crate::session::SessionKey,
+    nat: NatDecision,
+    is_reverse: bool,
+    holder: crate::nat::NatHolder,
 ) {
     if is_reverse || !nat.nat64 {
         return;
@@ -1383,6 +1507,7 @@ pub(crate) fn reserve_synced_nat64_allocation(
             port,
             addr_index,
             prefix.deterministic_v6.is_some(),
+            holder,
         ) {
             break;
         }

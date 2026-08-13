@@ -77329,3 +77329,63 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
   _Log.md
+
+## 2026-08-12 — #6211 F2: per-worker holder set on synced NAT reservations
+
+- **Timestamp**: 2026-08-12
+- **Action**: Fix a NAT pool-port over-release on the HA standby. An HA-synced
+  session is fanned out to EVERY worker's session table
+  (`afxdp/ha/session_import.rs`) while the source-NAT / NAT64 allocator is one
+  shared `Arc`, so N workers reserve the same `(flow, translated)`.
+  `reserve_flow` returned `true` and did nothing when the flow already held the
+  tuple, so the N reserves collapsed into ONE record; `release_flow` then removed
+  it unconditionally, so the FIRST worker to let go freed a port the other N-1
+  were still forwarding through. Post-failover that is the steady state, not a
+  race: the active's periodic `UpsertSynced` refresh stops, RSS lands traffic on
+  exactly one worker, and the other replicas idle out with nothing refreshing
+  them — the first to expire in `reap_expired_sessions` frees the live worker's
+  port. N is 6 on the reference cluster.
+  - `LiveAllocation.holders: u128` — one bit per `worker_id`, OR-ed in at
+    `reserve_flow`'s AND `reserve_address_only`'s idempotent early return (both
+    where workers 2..N land and where an already-holding worker refreshes, so OR
+    is required — a counter would inflate on every re-sync and never drain).
+    `LiveAllocation` stays `Clone, Copy`; no `Vec`/`HashSet` added.
+  - `holders == 0` = untracked LOCAL allocation, frees on first release
+    (pre-fix contract, unchanged); a tracked reservation frees when the mask
+    empties. An `Untracked` release of a TRACKED reservation KEEPS it — an
+    under-release leaks a bounded, observable port, an over-release is the
+    security bug this closes.
+  - `worker_id` threaded from `WorkerLaunchPlan::worker_id` (the worker's own
+    identity at spawn, NOT read off a `BindingWorker` slot) through
+    `apply_worker_commands`, `reap_expired_sessions`,
+    `resolve_flow_session_decision`, `delete_terminal_filtered_session`,
+    `purge_translated_synced_hit`, the DSCP purge, and the 9 packet-path
+    rollbacks (`poll_descriptor`'s `_worker_id` was already a parameter and is
+    now live).
+  - Completeness is COMPILE-ENFORCED: the untracked entry points
+    (`release_source_nat_allocation`, `reserve_synced_source_nat_allocation`,
+    `rollback_source_nat_allocation` and their NAT64 twins) are `#[cfg(test)]`,
+    so the release build fails on any production caller that forgot its
+    worker id. `cargo build --release` is green with them excluded.
+  - `MAX_NAT_HOLDER_WORKERS = 128` tied to the `u128` width by
+    `const _: () = assert!(u128::BITS == MAX_NAT_HOLDER_WORKERS);`. Enforced at
+    the MINT site (`replan_bindings_from_candidates` refuses the whole plan),
+    NOT as a `--workers` cap: `queue_count` is computed independently of
+    `workers`, so ids span `[0, min(queue_count, workers))` and a raw cap would
+    false-refuse `--workers 200` on a 16-queue NIC (ids 0..15).
+- **Validation**: `cargo test --release` (exit code captured unpiped),
+  `go build ./...`, `gofmt -l` clean. Two-worker binder RED on revert with an
+  assertion, not a build break; refresh cell and mint-site cells as described in
+  the PR body.
+- **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/mod.rs, userspace-dp/src/nat64.rs,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/session_glue/mod.rs,
+  userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/session_glue/commands/upsert_synced.rs,
+  userspace-dp/src/afxdp/session_glue/commands/delete_synced.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+  userspace-dp/src/nat/tests_pool.rs, userspace-dp/src/main_tests.rs,
+  docs/session-sync-architecture.md,
+  userspace-dp/src/afxdp/session_glue/README.md, _Log.md

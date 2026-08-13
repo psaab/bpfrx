@@ -3985,7 +3985,7 @@ fn pool_snat_recycle_order_is_fifo_not_lifo() {
     for &idx in &free_order {
         let (flow, t) = seq[idx];
         assert!(
-            alloc.release_flow(flow, t, 2_000),
+            alloc.release_flow(flow, t, 2_000, NatHolder::Untracked),
             "release of a live flow must succeed"
         );
     }
@@ -6053,7 +6053,7 @@ fn pool_snat_lockfree_concurrent_churn_no_double_alloc_no_leak() {
                         // peer's legitimate reuse of the freed port is not a
                         // false collision.
                         live_set.lock().unwrap().remove(&(t.ip, t.port));
-                        assert!(alloc.release_flow(flow, t, 2_000), "release of a live flow");
+                        assert!(alloc.release_flow(flow, t, 2_000, NatHolder::Untracked), "release of a live flow");
                     }
                     Err(_) => {
                         exhausted.fetch_add(1, Ordering::Relaxed);
@@ -6116,7 +6116,7 @@ fn pool_snat_release_frees_bit_and_port_is_reusable() {
     );
 
     assert!(
-        alloc.release_flow(mk(5001), t1, 2_000),
+        alloc.release_flow(mk(5001), t1, 2_000, NatHolder::Untracked),
         "release the first flow"
     );
     assert_eq!(
@@ -6456,7 +6456,7 @@ fn pool_snat_gc_chunked_concurrent_alloc_release_stays_consistent() {
                         now_ns,
                     ) {
                         assert!(
-                            alloc.release_flow(flow, translated, now_ns + 1),
+                            alloc.release_flow(flow, translated, now_ns + 1, NatHolder::Untracked),
                             "release of a just-allocated unique flow must succeed"
                         );
                     }
@@ -6486,4 +6486,259 @@ fn pool_snat_gc_chunked_concurrent_alloc_release_stays_consistent() {
     let live = alloc.debug_live();
     assert!(live.lease_expirations.is_empty());
     assert!(live.lease_expirations_by_addr[0].is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #6211 F2 — per-worker holder set on a synced reservation
+// ---------------------------------------------------------------------------
+//
+// An HA-synced session is pushed to EVERY worker's session table
+// (`afxdp/ha/session_import.rs` fans `UpsertSynced` out to each worker's command
+// queue) while the source-NAT allocator is ONE shared `Arc`. So N workers reserve
+// the same `(flow, translated)` and each releases it independently — the reap,
+// the replicated `DeleteSynced`, and the alias purge all run per worker.
+//
+// Before the holder mask, `reserve_flow`'s idempotent early return collapsed the
+// N reserves into ONE record and `release_flow` removed it unconditionally, so
+// the FIRST worker to let go freed a `(pool_addr, port)` the other N-1 were still
+// forwarding through. That is not a narrow race: post-failover the active's
+// periodic `UpsertSynced` refresh stops and RSS lands traffic on exactly one
+// worker, so the other replicas idle out with nothing refreshing them and
+// whichever expires first frees the port the live worker is using.
+//
+// A single-worker fixture cannot express this property — it passes both before
+// and after the fix — so every cell below reserves on at least TWO workers.
+
+/// One single-address pool rule with a 2-port range, the fixture shape the
+/// #4388 synced-reservation tests already use.
+fn holder_pool_rules_6211_f2() -> Vec<SourceNatRule> {
+    parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10001,
+        ..SourceNATRuleSnapshot::default()
+    }])
+}
+
+fn holder_synced_nat_6211_f2() -> NatDecision {
+    NatDecision {
+        rewrite_src: Some("203.0.113.1".parse().unwrap()),
+        rewrite_src_port: Some(10000),
+        ..NatDecision::default()
+    }
+}
+
+// #6211 F2 FAIL-ON-REVERT (the binder). Two workers hold the same synced
+// reservation; retiring the FIRST must leave the port reserved for the second.
+//
+// Reverting the holder mask — restoring `release_flow` to remove
+// unconditionally, or dropping the `holders |= holder.bit()` from
+// `reserve_flow`'s idempotent early return (which is where worker 1 lands, since
+// worker 0 already inserted the record) — makes this assertion RED.
+//
+// Deliberately kept in its OWN body: pairing it with the "frees on the last
+// retire" guard below would mean the guard never executes once this assertion
+// fires.
+#[test]
+fn synced_reservation_survives_first_worker_retire_6211_f2() {
+    let rules = holder_pool_rules_6211_f2();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = holder_synced_nat_6211_f2();
+
+    // The same synced entry installed on two workers — what the fan-out does.
+    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 1);
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "precondition: both workers reserved the synced port"
+    );
+
+    // Worker 0 reaps its replica (post-failover: RSS moved the traffic to
+    // worker 1, so worker 0's copy idles out first).
+    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
+
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "#6211 F2: worker 1 still holds this synced session, so worker 0's \
+         retire must NOT free (203.0.113.1, 10000) — freeing it hands a live \
+         worker's NAT source tuple to the next local flow"
+    );
+}
+
+// #6211 F2 companion to the binder, in its OWN body: once the LAST worker
+// retires, the port really is freed. Without this a "never free" implementation
+// would satisfy the binder above while leaking every synced port.
+//
+// Stays GREEN under the revert (the pre-fix code frees on the first release, so
+// it is also free after the second) — this is a leak guard, not a restatement of
+// the fix.
+#[test]
+fn synced_reservation_frees_on_last_worker_retire_6211_f2() {
+    let rules = holder_pool_rules_6211_f2();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = holder_synced_nat_6211_f2();
+
+    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 1);
+
+    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
+    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_001, 1);
+
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "#6211 F2: the LAST holder's retire must free the pool port — holding \
+         it past the final release is a permanent standby leak that counts \
+         against max_tracked_flows"
+    );
+}
+
+// #6211 F2 REFRESH CELL — the cell a bare COUNTER fails.
+//
+// `reserve_flow`'s idempotent early return is not only where workers 2..N land;
+// it is the path an ALREADY-holding worker takes on every refresh (each HA
+// session-sync reconnect, each periodic re-`UpsertSynced`). A counter
+// incremented there would climb without bound and never drain to zero, so this
+// worker's single retire would leave the port reserved forever. OR is idempotent
+// where increment is not, which is why the holder set is a bitmask.
+//
+// GREEN both before and after the fix: it constrains the SHAPE of the fix.
+#[test]
+fn synced_reservation_refresh_by_one_worker_does_not_accumulate_holders_6211_f2() {
+    let rules = holder_pool_rules_6211_f2();
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    let synced_nat = holder_synced_nat_6211_f2();
+
+    // One worker, refreshed repeatedly — every re-sync of a live session.
+    for _ in 0..8 {
+        reserve_synced_source_nat_allocation_for_worker(
+            &rules,
+            &synced_key,
+            synced_nat,
+            false,
+            None,
+            3,
+        );
+    }
+    assert!(
+        rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "precondition: the refreshed reservation is held"
+    );
+
+    // ONE retire, because there is exactly ONE holder however many times it
+    // refreshed.
+    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 3);
+
+    assert!(
+        !rules[0].pool_allocator.debug_is_port_occupied(0, 10000),
+        "#6211 F2: a refresh must not add a holder — 8 re-reserves by worker 3 \
+         are still ONE holder, so worker 3's single retire frees the port. A \
+         refcount incremented on the idempotent path would sit at 8 and leak"
+    );
+}
+
+// #6211 F2 for the ADDRESS-ONLY (#5338) synced arm: `reserve_address_only` has
+// its own idempotent early return, so it needs the same holder treatment. The
+// observable is the reverse-identity token in `address_only_owners` (an
+// address-only flow claims no port bit on the occupancy bitmap).
+//
+// RED on revert for the same reason as the port-bearing binder.
+#[test]
+fn synced_address_only_token_survives_first_worker_retire_6211_f2() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "pool-snat-addr-only".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        pool_name: "my-pool".to_string(),
+        pool_addresses: vec!["203.0.113.1/32".to_string()],
+        port_low: 10000,
+        port_high: 10001,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let synced_key = session_key_from_src("10.0.61.50", 40000, "8.8.8.8", 443);
+    // Address-only: a pool source address with NO translated port — the wire
+    // keeps the packet's own source port.
+    let synced_nat = NatDecision {
+        rewrite_src: Some("203.0.113.1".parse().unwrap()),
+        rewrite_src_port: None,
+        ..NatDecision::default()
+    };
+
+    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 0);
+    reserve_synced_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, None, 1);
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "precondition: both workers hold ONE address-only reverse-identity token"
+    );
+
+    release_source_nat_allocation_for_worker(&rules, &synced_key, synced_nat, false, 2_000, 0);
+
+    assert_eq!(
+        rules[0].pool_allocator.debug_address_only_owners().len(),
+        1,
+        "#6211 F2: worker 1 still holds this synced address-only session, so \
+         worker 0's retire must NOT drop the reverse-identity token"
+    );
+}
+
+// #6211 F2 OVER-REACH GUARD: a LOCAL allocation is untouched by the holder set.
+//
+// RSS steers a 5-tuple to exactly one worker, so a locally allocated translation
+// has a single holder by construction and its record carries `holders == 0`. The
+// first release must free it — the pre-#6211-F2 contract — no matter which
+// worker id the release carries. A fix that made EVERY release refcounted would
+// leak every local NAT port; this cell is what separates the two.
+//
+// Stays GREEN under the revert.
+#[test]
+fn local_allocation_still_frees_on_first_release_6211_f2() {
+    let rules = holder_pool_rules_6211_f2();
+    let addrs = rules[0].pool_addresses_v4.clone();
+    let local_flow = SourceNatFlowKey {
+        protocol: 6,
+        src_ip: "10.0.61.51".parse().unwrap(),
+        dst_ip: "8.8.8.8".parse().unwrap(),
+        src_port: 40001,
+        dst_port: 443,
+    };
+    let translated = rules[0]
+        .pool_allocator
+        .allocate_translation(
+            local_flow,
+            PoolAddressFamily::V4(&addrs),
+            0,
+            false,
+            false,
+            PersistentNatPermit::TargetHostPort,
+            0,
+            1_000,
+        )
+        .expect("a fresh pool port must be available");
+    assert!(
+        rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, translated.port),
+        "precondition: the local allocation holds its port"
+    );
+
+    // The owning worker retires it exactly once.
+    assert!(
+        rules[0]
+            .pool_allocator
+            .release_flow(local_flow, translated, 2_000, NatHolder::Worker(5)),
+        "a local allocation is freed by its first release"
+    );
+    assert!(
+        !rules[0]
+            .pool_allocator
+            .debug_is_port_occupied(0, translated.port),
+        "#6211 F2 must not make LOCAL allocations refcounted — a local record \
+         carries no holder bits and frees on the first release"
+    );
 }

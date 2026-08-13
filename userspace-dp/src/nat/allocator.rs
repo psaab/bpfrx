@@ -134,6 +134,64 @@ impl PoolAddressFamily<'_> {
     }
 }
 
+/// #6211 F2: the widest `worker_id` the [`LiveAllocation::holders`] bitmask can
+/// represent. A worker whose id does not fit could set no bit on reserve and
+/// clear no bit on release — self-consistent, but it collapses that worker back
+/// to the pre-#6211-F2 single-holder behaviour (first release frees a port a
+/// still-forwarding worker holds). The bound is therefore enforced where worker
+/// ids are MINTED (`server::helpers::planning::replan_bindings_from_candidates`,
+/// which refuses the whole plan), not here — an out-of-range id must never reach
+/// the allocator in the first place.
+///
+/// Enforced at the mint site rather than on the raw `--workers` value because
+/// the effective id range is `min(queue_count, workers)`: `queue_count` is the
+/// per-interface RX-queue minimum, computed independently of `workers`, and the
+/// id is `queue_id % workers` with `queue_id < queue_count`. Capping `--workers`
+/// alone would refuse a SAFE configuration (`--workers 200` on a 16-queue NIC
+/// mints ids 0..15).
+pub(crate) const MAX_NAT_HOLDER_WORKERS: u32 = 128;
+
+/// Tie the mask WIDTH to the constant so the two cannot drift apart: widening
+/// `holders` without raising the bound (or vice versa) fails the build here
+/// rather than silently truncating a holder bit at runtime.
+const _: () = assert!(u128::BITS == MAX_NAT_HOLDER_WORKERS);
+
+/// #6211 F2: which worker is taking or dropping a reservation.
+///
+/// `Untracked` reproduces the pre-#6211-F2 contract exactly — a reserve sets no
+/// holder bit and a release frees on the first call. It is what every LOCAL
+/// allocation path (`allocate_translation` and friends) uses, because RSS steers
+/// a given 5-tuple to exactly ONE worker so a local allocation has exactly one
+/// holder by construction.
+///
+/// `Worker(id)` is used by the HA-synced reservation path, where the SAME
+/// `(flow, translated)` is reserved once per worker: `handle_upsert_synced` runs
+/// on every worker (`afxdp/ha/session_import.rs` fans the entry out to each
+/// worker's command queue) against ONE shared allocator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NatHolder {
+    Untracked,
+    Worker(u32),
+}
+
+impl NatHolder {
+    /// The holder's bit in [`LiveAllocation::holders`]. `Untracked` — and any id
+    /// the mint-site check should have refused — contributes no bit.
+    fn bit(self) -> u128 {
+        match self {
+            Self::Untracked => 0,
+            Self::Worker(id) => {
+                debug_assert!(
+                    id < MAX_NAT_HOLDER_WORKERS,
+                    "worker_id {id} exceeds MAX_NAT_HOLDER_WORKERS; \
+                     replan_bindings_from_candidates must refuse the plan"
+                );
+                1u128.checked_shl(id).unwrap_or(0)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LiveAllocation {
     translated: TranslatedTuple,
@@ -161,6 +219,36 @@ struct LiveAllocation {
     // bit; instead it clears the reverse-identity entry in `address_only_owners`.
     // `false` for every PAT / deterministic / persistent allocation.
     address_only: bool,
+    // #6211 F2: the set of WORKERS holding this reservation, one bit per
+    // `worker_id` (see `NatHolder` / `MAX_NAT_HOLDER_WORKERS`). An HA-synced
+    // session is pushed to EVERY worker's session table while the source-NAT
+    // allocator is a single shared `Arc`, so N workers reserve the same
+    // `(flow, translated)` and each releases it independently — the reap, the
+    // fanned-out `DeleteSynced`, and the alias purge all run per worker.
+    //
+    // Before this field the N reserves collapsed into one record (`reserve_flow`
+    // returns `true` and does nothing when the flow already holds this exact
+    // tuple) and the FIRST release freed the port while the other N-1 workers
+    // still held the session and forwarded through it. That is the steady state
+    // after any failover carrying a synced SNAT session older than the
+    // inactivity timeout: the active's periodic `UpsertSynced` refresh stops,
+    // RSS lands the traffic on exactly one worker, and the other N-1 replicas
+    // idle out with nothing refreshing them.
+    //
+    // `0` means "untracked" — a LOCAL allocation, which by construction has a
+    // single holder (RSS steers a 5-tuple to one worker) — and keeps the
+    // pre-#6211-F2 contract: the first release frees. A non-zero mask frees only
+    // when the LAST holder's bit clears.
+    //
+    // A bitmask rather than a counter because `reserve_flow`'s idempotent early
+    // return is BOTH where workers 2..N first land AND the path every refresh
+    // from an ALREADY-holding worker takes (each HA session-sync reconnect, each
+    // periodic re-`UpsertSynced`). OR is idempotent there; increment is not, and
+    // would inflate without bound and never drain to zero.
+    //
+    // `u128` keeps `LiveAllocation` `Copy` (both read paths use `.copied()`), so
+    // no `Vec`/`HashSet` allocation enters the per-flow record.
+    holders: u128,
 }
 
 /// #5269: reverse-identity ownership key for an address-only (port
@@ -1119,6 +1207,10 @@ impl PortAllocator {
                         addr_index: abs,
                         deterministic: false,
                         address_only: false,
+                        // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                        // one worker, so this record has a single holder by construction and
+                        // the first release frees it (pre-#6211-F2 contract, unchanged).
+                        holders: 0,
                     },
                 );
                 self.shared
@@ -1253,6 +1345,10 @@ impl PortAllocator {
                     addr_index: abs,
                     deterministic: false,
                     address_only: false,
+                    // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                    // one worker, so this record has a single holder by construction and
+                    // the first release frees it (pre-#6211-F2 contract, unchanged).
+                    holders: 0,
                 },
             );
             self.shared
@@ -1332,6 +1428,10 @@ impl PortAllocator {
                     addr_index,
                     deterministic: false,
                     address_only: false,
+                    // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                    // one worker, so this record has a single holder by construction and
+                    // the first release frees it (pre-#6211-F2 contract, unchanged).
+                    holders: 0,
                 },
             );
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
@@ -1376,17 +1476,62 @@ impl PortAllocator {
         }
     }
 
+    /// #6211 F2: drop `holder` from a reservation's holder set and report
+    /// whether the reservation must SURVIVE this release.
+    ///
+    /// Returns `true` when other workers still hold the flow, in which case the
+    /// caller returns without touching `live_by_flow`, the occupancy bitmap, the
+    /// persistent lease, or the address-only reverse-identity token — the port
+    /// stays claimed for the holders that remain.
+    ///
+    /// Returns `false` (proceed to free) in exactly two cases:
+    ///   - `holders == 0`, an UNTRACKED local allocation. RSS steers a 5-tuple
+    ///     to one worker, so a local allocation has a single holder by
+    ///     construction and the first release frees it — the pre-#6211-F2
+    ///     contract, bit-identical.
+    ///   - clearing this holder's bit empties the mask: the LAST worker holding
+    ///     an HA-synced reservation is releasing it.
+    ///
+    /// [`NatHolder::Untracked`] contributes no bit, so an untracked release of a
+    /// TRACKED reservation keeps it. That is the deliberate direction for a
+    /// release site that was never taught its worker id: an under-release leaks
+    /// a pool port (bounded, observable as `AllocatorExhausted`), whereas an
+    /// over-release hands a live worker's `(pool_addr, port)` to a new flow —
+    /// the NAT source collision this whole mechanism exists to prevent.
+    fn drop_holder_locked(
+        live: &mut PortAllocatorLiveState,
+        flow: &SourceNatFlowKey,
+        existing: LiveAllocation,
+        holder: NatHolder,
+    ) -> bool {
+        if existing.holders == 0 {
+            return false;
+        }
+        let remaining = existing.holders & !holder.bit();
+        if remaining == 0 {
+            return false;
+        }
+        if let Some(slot) = live.live_by_flow.get_mut(flow) {
+            slot.holders = remaining;
+        }
+        true
+    }
+
     pub(super) fn release_flow(
         &self,
         flow: SourceNatFlowKey,
         translated: TranslatedTuple,
         now_ns: u64,
+        holder: NatHolder,
     ) -> bool {
         let mut live = self.lock_live();
         let Some(existing) = live.live_by_flow.get(&flow).copied() else {
             return false;
         };
         if existing.translated != translated {
+            return false;
+        }
+        if Self::drop_holder_locked(&mut live, &flow, existing, holder) {
             return false;
         }
         live.live_by_flow.remove(&flow);
@@ -1455,12 +1600,16 @@ impl PortAllocator {
         flow: SourceNatFlowKey,
         translated: TranslatedTuple,
         now_ns: u64,
+        holder: NatHolder,
     ) -> bool {
         let mut live = self.lock_live();
         let Some(existing) = live.live_by_flow.get(&flow).copied() else {
             return false;
         };
         if existing.translated != translated {
+            return false;
+        }
+        if Self::drop_holder_locked(&mut live, &flow, existing, holder) {
             return false;
         }
         live.live_by_flow.remove(&flow);
@@ -1584,6 +1733,10 @@ impl PortAllocator {
                         addr_index: ip_idx,
                         deterministic: true,
                         address_only: false,
+                        // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                        // one worker, so this record has a single holder by construction and
+                        // the first release frees it (pre-#6211-F2 contract, unchanged).
+                        holders: 0,
                     },
                 );
                 self.shared
@@ -1662,6 +1815,10 @@ impl PortAllocator {
                         addr_index: ip_idx,
                         deterministic: true,
                         address_only: false,
+                        // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                        // one worker, so this record has a single holder by construction and
+                        // the first release frees it (pre-#6211-F2 contract, unchanged).
+                        holders: 0,
                     },
                 );
                 self.shared
@@ -1718,6 +1875,7 @@ impl PortAllocator {
         translated: TranslatedTuple,
         addr_index: usize,
         deterministic: bool,
+        holder: NatHolder,
     ) -> bool {
         if addr_index >= self.shared.occupancy.len() {
             return false;
@@ -1731,6 +1889,17 @@ impl PortAllocator {
         // freed WITHOUT recycling, matching its release path.
         if let Some(existing) = live.live_by_flow.get(&flow).copied() {
             if existing.translated == translated {
+                // #6211 F2: this early return is where workers 2..N land — the
+                // synced entry is fanned out to every worker and each calls
+                // through to here against the ONE shared allocator, so this is
+                // exactly where a new holder must be recorded. It is ALSO the
+                // path an already-holding worker takes on every refresh (HA
+                // session-sync reconnect, periodic re-upsert); OR is idempotent
+                // so a refresh cannot inflate the mask, which is precisely why
+                // this is a bitmask and not a counter.
+                if let Some(slot) = live.live_by_flow.get_mut(&flow) {
+                    slot.holders |= holder.bit();
+                }
                 return true;
             }
             live.live_by_flow.remove(&flow);
@@ -1757,6 +1926,10 @@ impl PortAllocator {
                 addr_index,
                 deterministic,
                 address_only: false,
+                // #6211 F2: the first holder. A stale-tuple replace lands here
+                // too, and correctly starts a FRESH mask — the previous tuple's
+                // holders were holding that tuple, not this one.
+                holders: holder.bit(),
             },
         );
         true
@@ -1789,6 +1962,7 @@ impl PortAllocator {
         &self,
         flow: SourceNatFlowKey,
         translated_ip: IpAddr,
+        holder: NatHolder,
     ) -> Result<TranslatedTuple, super::source::SourceNatFailureReason> {
         let translated = TranslatedTuple {
             ip: translated_ip,
@@ -1808,9 +1982,16 @@ impl PortAllocator {
         let mut live = self.lock_live();
         // Idempotent re-entry: a second packet of the same flow (racing session
         // install) reuses its first decision rather than re-keying.
-        if let Some(existing) = live.live_by_flow.get(&flow) {
+        //
+        // #6211 F2: this is also where workers 2..N land when a synced
+        // ADDRESS-ONLY (#5338) token is fanned out, and where an already-holding
+        // worker lands on every refresh — so record the holder here, exactly as
+        // `reserve_flow` does on its own early return.
+        if let Some(existing) = live.live_by_flow.get_mut(&flow) {
+            existing.holders |= holder.bit();
+            let translated = existing.translated;
             self.shared.reuses_total.fetch_add(1, Ordering::Relaxed);
-            return Ok(existing.translated);
+            return Ok(translated);
         }
         // Collision: the reverse identity is already owned by a DIFFERENT flow.
         // Two flows sharing one public reverse tuple cannot coexist (their
@@ -1836,6 +2017,8 @@ impl PortAllocator {
                 addr_index: 0,
                 deterministic: false,
                 address_only: true,
+                // #6211 F2: the first holder of this synced address-only token.
+                holders: holder.bit(),
             },
         );
         self.shared
@@ -1939,6 +2122,10 @@ impl PortAllocator {
                     addr_index: 0,
                     deterministic: false,
                     address_only: true,
+                    // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                    // one worker, so this record has a single holder by construction and
+                    // the first release frees it (pre-#6211-F2 contract, unchanged).
+                    holders: 0,
                 },
             );
             self.shared
@@ -2128,6 +2315,10 @@ impl PortAllocator {
                 addr_index,
                 deterministic: false,
                 address_only: true,
+                // #6211 F2: a LOCAL allocation. RSS steers a 5-tuple to exactly
+                // one worker, so this record has a single holder by construction and
+                // the first release frees it (pre-#6211-F2 contract, unchanged).
+                holders: 0,
             },
         );
         Ok(translated)
