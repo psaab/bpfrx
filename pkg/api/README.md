@@ -379,7 +379,8 @@ they superseded had already been captured:
 - The credential principal was minted *before* the enumeration. It is a value
   and `ReplaceAuth` swaps a pointer, so a rotated or revoked secret did not
   invalidate a principal already speaking. The credential is now re-validated
-  against the LIVE snapshot after the enumeration; a request whose secret was
+  against the LIVE snapshot after the enumeration (`authz.go`, the second
+  `s.credential(r)` inside the credential branch); a request whose secret was
   revoked mid-flight is denied. The re-check compares the *credential*, not
   snapshot pointer identity — the reconciler republishes on every commit, so
   pointer identity would 403 a valid caller for an unrelated commit.
@@ -388,8 +389,37 @@ The residual is named rather than papered over: a `/etc/passwd` read still
 separates the snapshot from the verdict on the peer-UID row. Snapshot and
 decision cannot be made simultaneous without holding the config store's lock
 across the whole gate; they can be made adjacent.
-`authz_freshness_5561_test.go` pins both, each with a control that must be
-ADMITTED so a reverted ordering cannot be "caught" by an unrelated 403.
+`authz_freshness_5561_test.go` pins the ordering above, each case with a
+control that must be ADMITTED so a reverted ordering cannot be "caught" by an
+unrelated 403.
+
+**What `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` actually
+proves, stated precisely (#6645 r21).** It proves a DISJUNCTION — that *at
+least one* live credential re-validation happens between `PeerLocalityFn` and
+the handler — not that the re-read inside the credential branch is the thing
+doing it. There are two independent live re-validations on that path, and they
+MASK EACH OTHER: reverting the credential branch to return the principal minted
+before the enumeration leaves the test green, because the mutation gate's second
+pass (`reauthorizeInputs`) still re-derives; deleting that second pass also
+leaves it green, because the credential branch still re-reads. Measured, at
+`-count=2`, all three cells:
+
+| mutation | result |
+|---|---|
+| credential branch returns the pre-enumeration principal | PASS |
+| second-pass `reauthorizeInputs` deleted | PASS |
+| **both** | **FAIL** |
+
+So no single-site deletion distinguishes, and an earlier revision of this
+section — which said the test "pins both" — overstated it.
+
+Isolating the credential-branch re-read specifically needs a case the second
+pass cannot answer: take a body-carrying route, withhold the body, block the
+FIRST pass inside `Config.PeerLocalityFn`, revoke the credential while it is
+parked, release locality, and require a prompt 403 *before* the body is
+supplied — the second pass has not run at that point, so only the branch's own
+re-read can produce the denial. That case is not written; until it is, treat
+the branch re-read as covered only by the disjunction above.
 
 **And the gate is not the last thing that blocks.** Ordering the gate's own
 blocking steps is necessary and was not sufficient, because the *handler* blocks

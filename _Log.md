@@ -75628,3 +75628,66 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   check that the tree is intact. The `is_reverse` gating claim was re-verified
   by reading `shared_ops.rs` at this SHA rather than carried from an earlier
   round.
+
+## 2026-08-12 — #5561 round 21: the in-flight-credential test proves a disjunction, not a site
+
+- **Timestamp**: 2026-08-12
+- **Action**: An independent Codex leg at `9833cf0e3` returned MERGE-NEEDS-MINOR,
+  confirming all seven of its A-G findings (four re-measured with the same
+  mutations used in round 20, including the seven-red/ten-green management
+  split). Three MINORs remain; one is a false claim in a shipping artifact and
+  is fixed here, two are test-synchronization defects filed rather than fixed.
+
+  **The README overstated what one test proves.** Round 20 flagged
+  `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` as surviving the
+  second-pass deletion and declined to claim it bound anything; the mechanism
+  is now understood. There are TWO live credential re-validations between
+  `PeerLocalityFn` and the handler — the re-read inside the credential branch
+  of `principalFrom`, and the mutation gate's second pass
+  (`reauthorizeInputs`) — and they MASK EACH OTHER. Measured here, `-count=2`,
+  all three cells:
+
+      credential branch returns the pre-enumeration principal  PASS
+      second-pass reauthorizeInputs deleted                    PASS
+      BOTH                                                     FAIL
+
+  So the test proves only the DISJUNCTION "at least one live re-validation
+  occurs", and no single-site deletion distinguishes. `pkg/api/README.md` said
+  it "pins both"; it now states the disjunction, carries the measured table,
+  and names the case that WOULD isolate the branch re-read (body-carrying
+  route, body withheld, first-pass `PeerLocalityFn` blocked, credential revoked
+  while parked, locality released, prompt 403 required BEFORE the body is
+  supplied — the second pass has not run at that point). That case is not
+  written and the text says so.
+
+  **A caution recorded because it nearly produced a false claim.** The first
+  attempt at the credential-branch mutation replaced `live, still :=
+  s.credential(r); if !still {...}` with `live, _ := s.credential(r)`. All
+  three cells came back GREEN, which reads as "the test binds nothing at all".
+  That was wrong: `credential()` returns a ZERO Principal when the credential
+  is invalid, so the mutated code still denied — the mutation did not reopen
+  the hole. The faithful pre-fix shape is to return the principal minted by the
+  FIRST `s.credential(r)` call, before the enumeration, which is what the
+  original defect did. A mutation that fails to reopen the defect is
+  indistinguishable from a test that binds, and the difference is only visible
+  by checking what the mutated code actually returns.
+
+  **Filed, not fixed (#6977).** Two async-observation defects, one class: the
+  body-window wait helper accepts any global `mutationBodyWaitersInFlight > 0`
+  rather than a delta the calling test established, while
+  `TestNoBodyRouteIsNotBufferedByTheGate_5561` returns with a request still
+  parked — so under shuffle a later test can consume a stale waiter edge; and
+  `TestPeerIdentityIsResolvedAtAccept_5561` checks exact resolver counts
+  immediately although the lookup is asynchronous and safe requests bypass the
+  mutation wait. Both are the leading explanation for the one unreproduced
+  `pkg/api` failure this branch saw: nothing leaks (a residue probe measured
+  `goroutines=2 slots=0 bodybytes=0` identically across three full iterations),
+  there is no data race (`-race` clean), and the failure needs one specific
+  interleaving — which is why ~20 further executions never reproduced it. The
+  issue carries that history so the UNKNOWN is tracked rather than mysterious.
+  Not fixed here: it spans several files and this PR is 21 rounds deep.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/authz/... ./pkg/api/...
+  ./pkg/cli/... ./pkg/daemon/...` at `-count=2` 0. Mutations restored and the
+  tree verified clean before committing.
+- **File(s)**: pkg/api/README.md, _Log.md
