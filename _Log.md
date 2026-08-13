@@ -51,6 +51,20 @@
   `TestBudgetChargeImpliesHonorableMembers_6812` binds the two premises the
   deletion rests on over the full grammar surface (honorable => countable, and
   no charge is ever zero-address through the real compiler).
+  **An ordering pinned only by a comment — FOUND, not designed in.** Placing
+  the membership clause below `zone_scoped_pool_address` is load-bearing: a
+  zone-scoped CIDR (`fe80::1%eth0/64`) fails the grammar too, so with the
+  clauses swapped it would report `invalid_pool` instead of the specific #5875
+  reason. That was written as a code comment and NOTHING tested it — the #5875
+  tests pin the STRICT diagnostic, which is protected by gate order (zone-scope
+  :163 precedes address-grammar :189), and the snapshot-side #5875 test uses a
+  bare `fe80::1%eth0`, which netip parses, so the clause order never mattered to
+  it. This was discovered while re-cutting the cells, not planned: an invariant
+  held only by prose is the same defect class this whole round is about (a
+  comment asserting a contract is not the contract — cf. correcting Codex's
+  citation of `compiler_validate_strict_nat.go:759`, a doc comment ASSERTING the
+  all-or-nothing rule, when the rule itself lives in `source.rs:923-936`,
+  `:959-960` and `:999`). A `zone_scoped_prefix` cell now binds it.
   **Fixture vacuity found while re-cutting.** `snatAggregateCfg_6812` emitted
   `10.<i>.0.0/16`, valid only for i < 256 — so at `MaxSourceNATPoolCount+1`
   pools, 769 of the 1,025 pools in the "healthy pools past the budget"
