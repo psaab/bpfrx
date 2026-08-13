@@ -286,6 +286,10 @@ type Daemon struct {
 	// config (make-before-break rebind on an endpoint change; live auth swap on
 	// an unchanged bind). nil when the API is not enabled (--api-addr empty).
 	mgmt *managementReconciler
+	// staleCertMu guards staleCertPending and staleCertGen, and publishes the
+	// mgmt pointer the stale-cert delivery path reads (#6827 round 5) — so that
+	// read is memory-model safe rather than a benign-looking data race.
+	staleCertMu sync.Mutex
 	// staleCertPending records that a `set system host-name` moved the kernel
 	// name and the management-TLS staleness diagnostic has NOT yet been
 	// delivered (#6827). It is a FLAG, not a stored name: the host name is read
@@ -302,16 +306,19 @@ type Daemon struct {
 	// early, and the load path's inferred heuristic declines cross-shape drift
 	// by design (see hostNameLikelyAccessIdentity's residual note).
 	//
+	// It is process-local: a debt still owed when the daemon stops is
+	// discarded, which is one of the two states that residual note covers.
+	//
 	// Guarded by staleCertMu.
+	staleCertPending bool
 	// staleCertGen advances on every rename. A delivery claims a generation and
 	// clears the debt only if it is still current, so a rename landing while an
 	// in-flight delivery is unlocked is not settled by that older delivery
-	// (#6827 round 5). d.mgmt is published under staleCertMu too, so the
-	// delivery path's read of it is memory-model safe.
-	staleCertMu      sync.Mutex
-	staleCertPending bool
-	staleCertGen     uint64
-	snmpAgent        *snmp.Agent
+	// (#6827 round 5).
+	//
+	// Guarded by staleCertMu.
+	staleCertGen uint64
+	snmpAgent    *snmp.Agent
 
 	// --- SNMP subsystem reconcile-on-commit state (#3967) ---
 	// The SNMP agent is a start-once-at-boot subsystem: the boot block in

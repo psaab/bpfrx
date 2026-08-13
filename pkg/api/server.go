@@ -1209,17 +1209,30 @@ const (
 // CHANGES the naming shape (`old-fw` → `newfw.example.com`, or the reverse) is
 // diagnosed at the commit — the rename path skips this function — but never on
 // a later boot, because from then on the load path sees a shape mismatch and
-// stays quiet. For a box that was ALREADY in that state before this diagnostic
-// shipped there was no commit to catch it, so it is never diagnosed at all. The
-// gap is bounded on two sides: it needs drift that pre-dates the feature AND a
-// rename that crossed the qualified/unqualified boundary. Shape-PRESERVING
-// drift — unqualified → unqualified, the ordinary case, including the worked
-// `old-fw` → `new-fw` — is still caught on every boot.
+// stays quiet. Two states reach that boot with no commit-time diagnosis behind
+// them, and only the first is about old boxes:
 //
-// Closing it would take a one-shot sweep at the first boot after an upgrade,
-// which means upgrade-scoped persistent state (a marker file or version stamp)
-// for a single narrow class — and it would fire on exactly the boxes where this
-// function cannot tell whether the name is in use, reintroducing the false
+//   - a box ALREADY drifted before this diagnostic shipped never had a commit
+//     to catch it;
+//   - on a box RUNNING this build, the commit's diagnosis is a PROCESS-LOCAL
+//     debt (Daemon.staleCertPending, pkg/daemon). A cross-shape rename
+//     committed while nothing was serving a certificate — HTTPS off, or its
+//     bind failed — is still owed when the daemon stops, and a restart
+//     discards it. Enabling `web-management https` afterwards then reaches only
+//     the load path, which declines the shape.
+//
+// So the gap needs a rename that crossed the qualified/unqualified boundary AND
+// either pre-dating drift or a debt that did not survive a restart. It is the
+// rename path, not this function, that catches the ordinary case, and
+// shape-PRESERVING drift — unqualified → unqualified, including the worked
+// `old-fw` → `new-fw` — is still caught on every boot by this one.
+//
+// Closing either half costs the same mechanism and is declined for the same
+// reason: a boot-after-upgrade sweep needs upgrade-scoped persistent state (a
+// marker file or version stamp), and a debt that outlives a restart needs the
+// pending flag persisted plus an invalidation story for a name that changed
+// again while the daemon was down. Both then fire on exactly the boxes where
+// this function cannot tell whether the name is in use, reintroducing the false
 // positive at the least convenient moment. Not worth the mechanism; recorded
 // here so the next reader knows the choice was made deliberately.
 func hostNameLikelyAccessIdentity(leaf *x509.Certificate, hostName string) bool {

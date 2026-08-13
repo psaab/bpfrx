@@ -69,11 +69,17 @@ type listenerLeg struct {
 // to answer "what is this box serving?" must test the state, not the pointer.
 //
 // It tests `stopping` rather than `stopCh` on purpose. A requested retirement
-// (stopLegLocked) is not observable through s.httpsLeg by construction: the
-// disable arm clears s.httpsLeg under lifeMu before retiring, and the rebind
-// arm installs the replacement before retiring the old one. So a stopCh test
-// would be an arm for a state that cannot occur — while the state that DOES
-// occur, root-context shutdown, closes no stopCh and would slip past it.
+// (stopLegLocked) is not observable through s.httpsLeg — but not for the reason
+// the shape of ReconcileHTTPS suggests. Its disable arm retires FIRST and clears
+// the field second (stopLegLocked(s.httpsLeg), then s.httpsLeg = nil), so the
+// interleaved state is written; what makes it unobservable is that the whole
+// switch runs under ONE lifeMu hold and every serving() caller takes lifeMu
+// (Server.HTTPSServing, Server.WarnStaleMgmtCertForHostName), so a reader lands
+// before the retirement or after the clear, never between. The rebind arm needs
+// no such argument: it installs the replacement before retiring the old leg, so
+// the leg being retired is never the installed one. So a stopCh test would be an
+// arm for a state that cannot occur — while the state that DOES occur,
+// root-context shutdown, closes no stopCh and would slip past it.
 // `stopping` is set at the TOP of both drain arms — requested retirement and
 // root-context shutdown — before Shutdown runs, so it covers that path from the
 // moment the listener closes through the goroutine's return. Together with

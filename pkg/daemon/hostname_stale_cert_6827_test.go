@@ -28,11 +28,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/psaab/xpf/pkg/api"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // seedDurableCert writes a cert/key pair into dir under the names
@@ -105,6 +107,13 @@ func stubHostname(t *testing.T, name string) {
 // reaches a nil reconciler. Skipping on nil would reproduce the exact silence
 // this diagnostic exists to remove, because the fallback — the load path's
 // INFERRED heuristic — declines precisely this shape.
+//
+// SCOPE: these subtests drive deliverStaleMgmtCertDiagnosis DIRECTLY, so they
+// bind the MECHANISM — a debt parked against a nil reconciler survives, and
+// settles once something is serving a certificate. They say nothing about
+// WHERE production calls that delivery from; the two deferred call sites are
+// bound separately, at their own call site, by
+// TestDeferredDeliveryIsWiredAtItsRetryPoints_6827.
 //
 // RED on revert: make noteStaleMgmtCertHostName return early when d.mgmt is nil
 // and boot_rename_is_diagnosed_once_mgmt_is_up logs nothing.
@@ -372,21 +381,185 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 	}
 }
 
-// NOT YET BOUND: the per-reconcile retry call site in reconcileWebManagement
-// (#6827 round 5). An attempt to bind it is deliberately NOT left here in a
-// passing-but-vacuous form.
+// newMgmtDeliveryDaemon builds the Daemon the two DEFERRED delivery call sites
+// need: a real configstore carrying setLines as the ACTIVE (committed)
+// configuration.
 //
-// What was tried and why it failed to bind: asserting on the warning TEXT does
-// not isolate the call site, because bringing HTTPS up makes the certificate
-// LOAD path emit the same message — that version passed with the retry deleted.
-// Asserting on the debt FLAG is the right observable, but driving
-// reconcileWebManagement from a bare &Daemon{} makes desired() resolve an empty
-// bind, so the reconcile DISABLES the HTTPS leg before the retry runs and the
-// delivery correctly reports nothing served. Binding it needs a Daemon with a
-// real configstore and web-management config so the reconcile is a no-op rather
-// than a teardown.
+// The store is what made both sites hard to bind, and it is load-bearing in a
+// different way at each. reconcileWebManagement reaches the retry through
+// managementReconciler.reconcile → committedDesired, which re-derives the WHOLE
+// desired state from store.ActiveConfig() (#5561 round 14): with no store that
+// derivation falls back to a bare &Daemon{}'s empty bind, so the reconcile
+// DISABLES the live HTTPS leg and the delivery then correctly reports nothing
+// served — a green test that proves nothing. startHTTPServer reaches its
+// delivery through managementReconciler.start, which dereferences
+// d.store.ActiveConfig() unconditionally.
+func newMgmtDeliveryDaemon(t *testing.T, setLines ...string) *Daemon {
+	t.Helper()
+	s, err := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))
+	if err != nil {
+		t.Fatalf("configstore.New: %v", err)
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	for _, line := range setLines {
+		if err := s.SetFromInput(line); err != nil {
+			t.Fatalf("set %q: %v", line, err)
+		}
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	return &Daemon{store: s}
+}
+
+// TestDeferredDeliveryIsWiredAtItsRetryPoints_6827 binds the two DEFERRED call
+// sites. The inline delivery inside noteStaleMgmtCertHostName is already bound
+// by the subtests above; these two are what make the debt ledger a RETRY
+// mechanism instead of "diagnose synchronously at the rename or never":
 //
-// Reported as still-unbound rather than papered over.
+//   - startHTTPServer (daemon_run_servers.go): the boot management start. The
+//     phase-4 boot config apply runs BEFORE the reconciler is constructed, so a
+//     `system host-name` applied at boot parks against a nil d.mgmt, and this is
+//     the first delivery that can see a reconciler at all.
+//   - reconcileWebManagement (management.go): every day-2 commit, so a debt
+//     incurred while HTTPS was down settles on the commit that brings it up.
+//
+// Both were unbound: deleting either call — or both, leaving only the inline one
+// — left the whole pkg/daemon suite green, so the entire justification for
+// keeping the flag pending was unmeasured.
+//
+// RED on revert: delete d.deliverStaleMgmtCertDiagnosis() from startHTTPServer
+// and the first subtest fails; delete it from reconcileWebManagement and the
+// second fails. Neither deletion is visible to the other.
+func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
+	t.Run("boot_start_delivers_a_debt_parked_before_the_reconciler_existed", func(t *testing.T) {
+		// No web-management stanza, so the boot start binds only the plain
+		// --api-addr HTTP leg on an ephemeral loopback port. That is deliberate:
+		// startHTTPServer CONSTRUCTS the api.Server itself, and the only cert-dir
+		// injection seam (Server.SetTLSCertDirForTest) exists after construction,
+		// so an in-process boot start cannot be handed a serving HTTPS leg
+		// without driving the production /etc/xpf/tls generator. The delivery is
+		// therefore observed where it is observable at boot — see below.
+		d := newMgmtDeliveryDaemon(t, "system host-name new-fw-6827")
+		d.opts.APIAddr = "127.0.0.1:0"
+
+		// The kernel-name read lives INSIDE deliverStaleMgmtCertDiagnosis, past
+		// its `!pending || mgmt == nil` early return, and nothing else on this
+		// path reads it (the only other osHostname caller in the package is
+		// applyHostname's already-applied guard, daemon_system.go, which
+		// startHTTPServer never reaches). So a read during startHTTPServer is a
+		// direct observation of the delivery running — and of it running AFTER
+		// d.mgmt is published, since an unpublished reconciler returns before the
+		// read.
+		var reads int
+		restore := osHostname
+		t.Cleanup(func() { osHostname = restore })
+		osHostname = func() (string, error) { reads++; return "new-fw-6827", nil }
+
+		// Boot order: the rename lands while startHTTPServer has not run, so the
+		// debt parks against a nil reconciler.
+		d.noteStaleMgmtCertHostName()
+		if reads != 0 {
+			t.Fatalf("with no reconciler the delivery must not even reach the kernel-name read, "+
+				"so this subtest's later count is attributable to the boot start alone; reads = %d", reads)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		t.Cleanup(func() { cancel(); wg.Wait() })
+		captureDaemonWarn(t, func() { d.startHTTPServer(ctx, &wg, nil) })
+
+		if reads == 0 {
+			t.Fatal("the boot management start did not attempt the parked diagnosis: the kernel " +
+				"name was never read, so deliverStaleMgmtCertDiagnosis did not run past its nil-reconciler " +
+				"guard. A host-name applied in the phase-4 boot apply is then never diagnosed, because " +
+				"the next boot's applyHostname sees the name already applied and returns early (#6827)")
+		}
+
+		// Negative control: nothing served a certificate, so the debt must
+		// SURVIVE the boot delivery. This is also why the WARN text cannot be the
+		// observable here — there is no certificate at boot to judge.
+		d.staleCertMu.Lock()
+		pending := d.staleCertPending
+		d.staleCertMu.Unlock()
+		if !pending {
+			t.Fatal("the boot delivery reached no served certificate, so it must not settle the debt")
+		}
+	})
+
+	t.Run("a_day2_reconcile_settles_a_debt_incurred_while_https_was_down", func(t *testing.T) {
+		d := newMgmtDeliveryDaemon(t,
+			"system services web-management http",
+			"system services web-management https",
+		)
+		reg := newFakeReg()
+		m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
+		d.mgmt = m
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		// Start SHORT of the committed state: HTTP only. That is the state a
+		// disabled-or-failed HTTPS bind leaves behind, and the state in which a
+		// rename incurs a debt no delivery can settle.
+		want := m.committedDesired(nil)
+		if !want.TLS || want.HTTPSAddr == "" {
+			t.Fatalf("fixture: the committed config must ask for HTTPS or the reconcile has "+
+				"nothing to bring up; desired = %+v", endpointOf(want))
+		}
+		httpOnly := want
+		httpOnly.TLS, httpOnly.HTTPSAddr = false, ""
+		if err := m.startTo(ctx, httpOnly); err != nil {
+			t.Fatalf("start HTTP leg: %v", err)
+		}
+
+		stubHostname(t, "new-fw-6827")
+		if out := captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() }); strings.Contains(out, "does not cover the current host-name") {
+			t.Fatalf("nothing is serving a certificate yet, so the rename cannot be diagnosed "+
+				"at the rename itself; got %q", out)
+		}
+		d.staleCertMu.Lock()
+		pending := d.staleCertPending
+		d.staleCertMu.Unlock()
+		if !pending {
+			t.Fatal("the fixture must leave a debt outstanding, otherwise the reconcile has " +
+				"nothing to settle and this subtest proves nothing")
+		}
+
+		// The stale durable pair the HTTPS leg LOADS when this reconcile binds it
+		// (#1916 D6).
+		dir := t.TempDir()
+		seedDurableCert(t, dir, "old-fw-6827", "127.0.0.1")
+		m.srv.SetTLSCertDirForTest(dir)
+
+		// applyConfigLocked's entry point, not reconcileTo: the wiring under test
+		// is reconcileWebManagement's, and reaching past it would bind the
+		// mechanism again rather than the call site.
+		captureDaemonWarn(t, func() {
+			if err := d.reconcileWebManagement(d.store.ActiveConfig()); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+		})
+		if m.srv.HTTPSCertForTest() == nil {
+			t.Fatal("the reconcile did not bring the HTTPS leg up, so there was no certificate " +
+				"for a retried delivery to reach and this subtest proves nothing")
+		}
+
+		// The DEBT FLAG, not the warning text. Bringing HTTPS up makes the
+		// certificate LOAD path emit the same "does not cover the current
+		// host-name" message, so a text assertion here passes with the retry
+		// DELETED. Only a delivery clears the flag.
+		d.staleCertMu.Lock()
+		pending = d.staleCertPending
+		d.staleCertMu.Unlock()
+		if pending {
+			t.Fatal("a web-management reconcile that brought HTTPS up left the host-name " +
+				"diagnosis still owed: nothing retried the delivery, so the debt survives every " +
+				"later commit on an unchanged endpoint and is discharged only by another rename (#6827)")
+		}
+	})
+}
 
 // TestDebtClearIsGenerationSafe_6827 pins the #6827-round-5 losing sequence: a
 // delivery runs UNLOCKED across the hostname read and the certificate

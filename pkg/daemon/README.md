@@ -435,7 +435,16 @@ Three properties carry the mechanism:
   `applyHostname` sees the name already applied and returns early, and the load
   path's inferred heuristic declines this shape by design. Delivery is retried
   at the rename, at the boot management start, and on every web-management
-  reconcile (so a later `web-management https` enable settles an old debt).
+  reconcile (so a later `web-management https` enable settles an old debt). The
+  two DEFERRED retry points are bound at their own call site by
+  `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on deliberately different
+  observables: the `reconcileWebManagement` one on the debt FLAG, because the
+  reconcile that brings HTTPS up makes `pkg/api`'s LOAD path emit the same
+  warning text (a text assertion there passes with the retry deleted); the
+  `startHTTPServer` one on the kernel-name read, which sits past the
+  nil-reconciler guard, because that call site cannot be handed a serving HTTPS
+  leg in-process — it constructs the `api.Server` itself and the cert-dir test
+  seam exists only afterwards.
 - **The name is read from the kernel at DELIVERY**, never stored at rename time,
   so a deferred diagnosis always describes the name the box has now and can
   never replay an intermediate or long-past rename.

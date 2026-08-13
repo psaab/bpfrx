@@ -9,23 +9,43 @@
 // before it publishes a credential grant) is what retries the bind.
 // #6827's mechanism — retain the root context, and re-CONSTRUCT from
 // reconcileTo's `m.srv == nil` branch — was removed rather than kept alongside
-// it: a second construction path would have bound a fresh api.Server with the
-// committed Auth already installed, bypassing everyLiveLegNamedBy and
-// publishNilDirectionLocked entirely, and two retry mechanisms that can disagree
-// are worse than either alone.
+// it, because on top of master's startTo it is UNREACHABLE. m.srv = srv runs
+// unconditionally before startTo's error return and api.NewServer never returns
+// nil, so once start has run m.srv stays non-nil for the reconciler's life; and
+// in the only state that DOES reach the nil-srv branch — start never ran — the
+// branch's own guard `if m.rootCtx == nil || next.Addr == "" { return nil }`
+// returns nil, because rootCtx was assigned only inside startTo. (An
+// API-disabled daemon does not even get here: startHTTPServer runs only under
+// `if d.opts.APIAddr != ""`, so it has d.mgmt == nil, not a nil-srv
+// reconciler.) Keeping it would have been dead code that reads like a second,
+// disagreeing retry path.
+//
+// It is NOT removed because reconstructing would have failed open. That was the
+// merge's original claim and it does not hold: master's recovery publishes the
+// same full credential set on that path. startTo's error arm sets m.cur, m.curSet
+// = mgmtEndpoint{}, false, so on the retry reconcile everyLiveLegNamedBy is
+// vacuously true, the grant is sanctioned, and ReplaceAuth(next.Auth) publishes
+// the whole set — the same outcome as constructing with next.Auth installed. The
+// nil-Auth case is unreachable off-loopback either way, because resolveAPIBinds'
+// #4047/#5127 clamp keys on hasAuth and clamps BOTH binds when it is false.
 //
 // management_bootretry_5561_test.go pins that both boot paths retry. What it
-// does NOT pin is the two directions the retry must NOT reach, which is what
-// these are:
+// does NOT pin is the directions the retry must NOT reach, which is what these
+// are:
 //
 //   - a reconcile that arrives before any start must not construct anything;
+//   - after a FAILED boot bind, a reconcile to an EMPTY HTTP bind must still
+//     bind nothing;
 //   - a SUCCESSFUL boot HTTPS bind must still record its fingerprint, so the
 //     `!srv.HTTPSServing()` clearing cannot be widened to an unconditional one
 //     that bounces a healthy leg on every commit.
 //
 // RED on revert: widen startTo's clearing to `if next.TLS` and
 // a_successful_boot_https_bind_records_its_fingerprint fails on the
-// fingerprint assertion.
+// fingerprint assertion; make reconcileTo's HTTP arm unconditional and
+// a_failed_boot_then_an_empty_bind_binds_nothing fails on its no-op assertion,
+// because api.Server refuses to reconcile the HTTP listener to an empty bind
+// address and the reconcile surfaces that as an error.
 package daemon
 
 import (
@@ -50,6 +70,38 @@ func TestMgmtBootRetryDoesNotOverReach_6827(t *testing.T) {
 		}
 		if ln := reg.get("10.0.0.1:8080"); ln != nil && ln.isOpen() {
 			t.Fatal("a reconcile before any start bound a listener")
+		}
+	})
+
+	t.Run("a_failed_boot_then_an_empty_bind_binds_nothing", func(t *testing.T) {
+		// This behaviour belonged to the half of the branch's
+		// a_disabled_api_still_does_not_construct that the merge dropped along
+		// with the mechanism it was written against. It is MASTER-owned now and
+		// holds for a different reason than it did on the branch: there, a nil
+		// m.srv plus the `next.Addr == ""` guard returned early; here the server
+		// is adopted, and what binds nothing is that startTo's error arm reset
+		// the fingerprint to mgmtEndpoint{}, so an empty desired Addr equals
+		// m.cur.addr and the HTTP arm sees no change. Incidental, and nothing in
+		// the package covered it — an --api-addr removal after a failed boot
+		// bind must not bring a listener up.
+		reg := newFakeReg()
+		reg.failAddr["10.0.0.1:8080"] = true
+		m := newTestMgmt(reg)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		if err := m.startTo(ctx, cfgFor(reg, "10.0.0.1:8080", false, "", nil)); err == nil {
+			t.Fatal("precondition: the boot HTTP bind must fail")
+		}
+		reg.failAddr["10.0.0.1:8080"] = false
+		if err := m.reconcileTo(cfgFor(reg, "", false, "", nil)); err != nil {
+			t.Fatalf("a reconcile to an empty HTTP bind must be a no-op: %v", err)
+		}
+		if ln := reg.get(""); ln != nil && ln.isOpen() {
+			t.Fatal("a reconcile to an EMPTY HTTP bind bound a listener — the API is off")
+		}
+		if ln := reg.get("10.0.0.1:8080"); ln != nil && ln.isOpen() {
+			t.Fatal("a reconcile to an empty HTTP bind re-bound the address the boot bind failed on")
 		}
 	})
 

@@ -1170,10 +1170,14 @@ under the daemon's errgroup. Nothing else imports this package.
       drain arms (requested retirement AND root-context shutdown), before
       `Shutdown`, so it covers the leg from the moment the listener closes
       through the goroutine's return. It does NOT test `stopCh`: a requested
-      retirement is
-      unobservable through `s.httpsLeg` by construction (the disable arm clears
-      the field before retiring; the rebind arm installs the replacement first),
-      so that would be an arm for a state that cannot occur. `serving()` is
+      retirement is unobservable through `s.httpsLeg`, though not by the
+      ordering — the disable arm retires the leg and THEN clears the field. What
+      makes the interval unobservable is that the whole `ReconcileHTTPS` switch
+      runs under ONE `lifeMu` hold and every `serving()` caller takes `lifeMu`,
+      so a reader lands before the retirement or after the clear, never between;
+      the rebind arm installs the replacement first, so the leg it retires is
+      never the installed one. Either way that would be an arm for a state that
+      cannot occur. `serving()` is
       stricter than `EffectiveHTTPAddr`'s inline check, which answers
       `show system services`, where a leg finishing a drain should still report
       its address.
@@ -1216,9 +1220,15 @@ under the daemon's errgroup. Nothing else imports this package.
         heuristic: the operator just chose the name, which is direct evidence
         rather than inference. **Accepted residual:** a rename that CROSSES the
         qualified/unqualified boundary is diagnosed at the commit but not on any
-        later boot, so a box already in that state before this shipped is never
-        diagnosed. Shape-preserving drift (the ordinary case) is still caught on
-        every boot. Closing it would need upgrade-scoped persistent state for one
+        later boot, so it is never diagnosed at all in the two states that had
+        no commit-time diagnosis behind them — a box already drifted before this
+        shipped, and a box RUNNING this build whose commit-time debt was still
+        OWED at shutdown (HTTPS off, or its bind failed) and was discarded by the
+        restart, `Daemon.staleCertPending` being process-local.
+        Shape-preserving drift (the ordinary case) is still caught on
+        every boot. Closing either half needs persistent state — an upgrade
+        marker, or a durable pending flag plus an invalidation story for a name
+        that changed again while the daemon was down — for one
         narrow class, and would re-fire the false positive on exactly the boxes
         the heuristic cannot judge — weighed and declined, see the comment on
         `hostNameLikelyAccessIdentity`.
@@ -1235,9 +1245,22 @@ under the daemon's errgroup. Nothing else imports this package.
     `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings on
     the rebind path) and `tls_stale_cert_6827_test.go` (the SAN-less cert, the
     unused-kernel-name false positive and its matched positive control, and the
-    rename entry point), with the daemon-side wiring — a host-name commit on an
-    UNCHANGED HTTPS endpoint reaching the diagnostic with the NEW name — pinned
-    by `pkg/daemon/hostname_stale_cert_6827_test.go`. All fail-on-revert.
+    rename entry point), with the daemon-side wiring pinned by
+    `pkg/daemon/hostname_stale_cert_6827_test.go`: a host-name commit on an
+    UNCHANGED HTTPS endpoint reaches the diagnostic with the NEW name, the debt
+    outlives a delivery that reached nothing, the generation fence defers a
+    rename that lands mid-delivery, and BOTH deferred retry points are bound at
+    their own call site. Those two are bound on different observables, and the
+    reason is worth stating rather than discovering twice:
+    `reconcileWebManagement`'s per-commit retry is bound on the debt FLAG,
+    because the reconcile that brings HTTPS up makes the certificate LOAD path
+    emit the same warning text — a text assertion there passes with the retry
+    deleted. `startHTTPServer`'s boot delivery is bound on the kernel-name read,
+    which sits past the nil-reconciler guard: that call site cannot be given a
+    serving HTTPS leg in-process, because `startHTTPServer` CONSTRUCTS the
+    `api.Server` itself and `SetTLSCertDirForTest` only exists after
+    construction, so the alternative is driving the production `/etc/xpf/tls`
+    generator. Deleting either call reds its own subtest and only its own.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

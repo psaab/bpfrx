@@ -1,3 +1,78 @@
+## 2026-08-13 — #6827 round 6: the two DEFERRED delivery call sites were unbound; the debt ledger's whole justification was unmeasured
+
+- **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
+- **Action**: Folded the post-merge hostile review at `d73835136`
+  (MERGE-NEEDS-MINOR, one blocking item).
+  **B1 (BLOCKING) — both deferred-delivery call sites were unbound.** The
+  daemon half of this PR is a debt ledger whose entire justification is that a
+  boot rename reaches a nil reconciler and must be RETRIED later. Measured, each
+  severed in its own cell: deleting `d.deliverStaleMgmtCertDiagnosis()` from
+  `startHTTPServer` left `pkg/daemon` GREEN; deleting it from
+  `reconcileWebManagement` left `pkg/daemon` GREEN; deleting BOTH — collapsing
+  the mechanism to "diagnose synchronously at the rename or never" — also left
+  it GREEN. Only ONE of the two was self-declared (the reconcile one, in a "NOT
+  YET BOUND" block); two artefacts read as if the boot one were covered
+  (`TestBootHostNameReachesTheDiagnostic_6827`, which calls the delivery
+  DIRECTLY, and a `pkg/api/README.md` "All fail-on-revert" sentence).
+  Now bound by `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on
+  deliberately different observables, from ONE fixture
+  (`newMgmtDeliveryDaemon`, a Daemon with a REAL configstore):
+  the reconcile site on the DEBT FLAG, because bringing HTTPS up makes
+  `pkg/api`'s LOAD path emit the same warning text (a text assertion passes with
+  the retry deleted, which is why the earlier attempt was abandoned); the boot
+  site on the KERNEL-NAME READ, which sits past the delivery's
+  `!pending || mgmt == nil` guard and which nothing else on that path performs.
+  The boot site cannot be driven end-to-end in-process: `startHTTPServer`
+  CONSTRUCTS the `api.Server` itself and `SetTLSCertDirForTest` exists only
+  after construction, so a serving HTTPS leg there would mean driving the
+  production `/etc/xpf/tls` generator.
+  **N3** — `listenerLeg.serving()`'s doc and `pkg/api/README.md` both said the
+  disable arm clears `s.httpsLeg` BEFORE retiring. `ReconcileHTTPS` does the
+  reverse (`stopLegLocked`, then `s.httpsLeg = nil`). The conclusion survives —
+  a `stopCh` test would arm an unreachable state — but because the whole switch
+  runs under ONE `lifeMu` hold and both `serving()` callers take `lifeMu`.
+  Corrected in both places.
+  **N5** — `hostNameLikelyAccessIdentity`'s residual note scoped the never-
+  diagnosed class to boxes drifted BEFORE this shipped. A box RUNNING this build
+  reaches the same silence: `staleCertPending` is process-local, so a
+  cross-shape rename committed while nothing served a certificate is discarded
+  by a restart. Note widened (and in `pkg/api/README.md`); the durable-debt
+  implementation is DECLINED for the same reason as the upgrade sweep it sits
+  beside — persistent state plus an invalidation story, re-firing the false
+  positive on exactly the boxes the heuristic cannot judge.
+  **N6** — verified with `go doc -u` (not by reading): the `// Guarded by
+  staleCertMu.` block ran straight into `// staleCertGen advances ...` above a
+  three-field group, so godoc attached the whole thing to `staleCertMu`. Split
+  so each field carries its own comment.
+  **N-accounting** — the merge commit message and its `_Log.md` entry are
+  corrected in place: the removal of the branch's listener-recovery arm is
+  justified by DEAD CODE, not by a fail-open (master's recovery publishes the
+  same full credential set on that path), and THREE things went from
+  `management_recovery_6827_test.go`, one of them a duplicate rather than a
+  casualty. The dropped `noAddr` half's behaviour — after a failed boot bind, a
+  reconcile to an EMPTY HTTP bind must bind nothing — had no replacement
+  anywhere in the package, so it is restored as
+  `a_failed_boot_then_an_empty_bind_binds_nothing`, framed as the master-owned,
+  incidentally-held behaviour it now is.
+- **Validation**: `go build ./...` rc 0; `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0; `go test ./pkg/api/ ./pkg/daemon/` rc 0 (`TMPDIR=/dev/shm/t`, per-cell
+  `GOCACHE` under `/dev/shm`). Four mutations driven to RED, each in its own
+  cell, restored and re-run GREEN: **MUT-A** delete the boot delivery →
+  `boot_start_delivers_a_debt_parked_before_the_reconciler_existed` fails
+  ("the boot management start did not attempt the parked diagnosis: the kernel
+  name was never read"), the reconcile subtest stays GREEN; **MUT-B** delete the
+  reconcile delivery → `a_day2_reconcile_settles_a_debt_incurred_while_https_was_down`
+  fails ("left the host-name diagnosis still owed: nothing retried the
+  delivery"), the boot subtest stays GREEN; **MUT-A+B** together → both fail and
+  the rest of `pkg/daemon` is unaffected; **ordering** — move the boot delivery
+  ABOVE the `d.mgmt` publish → MUT-A's subtest fails, so the read also binds the
+  publish-then-deliver order. The restored empty-bind guard is not vacuous:
+  making `reconcileTo`'s HTTP arm unconditional reds it.
+- **File(s)**: `pkg/daemon/hostname_stale_cert_6827_test.go`,
+  `pkg/daemon/management_recovery_6827_test.go`, `pkg/daemon/daemon.go`,
+  `pkg/daemon/README.md`, `pkg/api/listener.go`, `pkg/api/server.go`,
+  `pkg/api/README.md`, `_Log.md`
+
 ## 2026-08-13 — #6827 semantic merge with master: the listener-recovery half was master's fix in a second spelling
 
 - **Timestamp**: 2026-08-13 (fix/5719-api-hardening, PR #6827)
@@ -19,13 +94,24 @@
   survives: `startTo` ADOPTS the server whether or not the bind succeeded, so
   the retry runs through `reconcileTo`'s ordinary path. The branch's — retain
   the root context, re-CONSTRUCT from the `m.srv == nil` branch — was REMOVED,
-  not kept alongside. Keeping it would have bound a fresh `api.Server` with the
-  committed `Auth` already installed, bypassing `everyLiveLegNamedBy` and
-  `publishNilDirectionLocked` entirely; and master's `b27ab99b5` (an absent HTTP
-  leg imposes no requirement) is reachable ONLY because the server is adopted,
-  so the branch's mechanism would have re-stranded the state that commit fixed.
-  `m.rootCtx` and `startLocked` are gone; merged `startTo`/`reconcileTo` are
-  byte-identical to master's.
+  not kept alongside, because on top of master's `startTo` it is UNREACHABLE:
+  `m.srv = srv` runs unconditionally before the error return and
+  `api.NewServer` never returns nil, so the nil-srv branch is reachable only
+  when start never ran — and there the branch's own
+  `if m.rootCtx == nil || next.Addr == ""` guard returns nil, `rootCtx` being
+  assigned only inside `startTo`. (Corrected 2026-08-13: this entry first
+  argued the removal on a FAIL-OPEN — a fresh `api.Server` with the committed
+  `Auth` installed, bypassing `everyLiveLegNamedBy`/`publishNilDirectionLocked`.
+  That is false. Master's own recovery publishes the same full set on that path:
+  the error arm resets `m.cur, m.curSet` to `mgmtEndpoint{}, false`, so
+  `everyLiveLegNamedBy` is vacuously true, the grant is sanctioned, and
+  `ReplaceAuth(next.Auth)` publishes the whole set. The nil-Auth case is
+  unreachable off-loopback because the #4047/#5127 clamp keys on
+  `Auth != nil`.) Master's `b27ab99b5` (an absent HTTP leg imposes no
+  requirement) is reachable ONLY because the server is adopted, so taking the
+  branch's non-adopting `startTo` would have re-stranded the state that commit
+  fixed. `m.rootCtx` and `startLocked` are gone; merged
+  `startTo`/`reconcileTo` are byte-identical to master's.
   **PROSE CORRECTED** — `serving()`'s comment claimed "there is no third
   defer-set flag: it would be unbindable". Master added exactly that
   (`drained`, for reaping `s.retiring`). The comment now says why `drained` is
@@ -40,7 +126,13 @@
   over-reach guards that are still true and that master's
   `management_bootretry_5561_test.go` does not cover: a reconcile before any
   start must not construct, and a SUCCESSFUL boot HTTPS bind must still record
-  its fingerprint. The two subtests binding the removed mechanism are deleted.
+  its fingerprint. (Corrected 2026-08-13: THREE things went, not "two subtests
+  binding the removed mechanism". `boot_http_bind_failure_recovers_on_a_later_reconcile`
+  and the `noAddr` half of `a_disabled_api_still_does_not_construct` asserted
+  m.srv stays nil — those two bound the mechanism that lost.
+  `boot_https_bind_failure_retries_on_an_identical_reconcile` went as a
+  DUPLICATE of `management_bootretry_5561_test.go`; its own precondition
+  asserted the OPPOSITE, that the server IS adopted.)
 - **Validation**: `go build ./...` rc 0; `go vet ./pkg/api/... ./pkg/daemon/...`
   rc 0; `go test ./pkg/api/ ./pkg/daemon/` rc 0 (`TMPDIR=/dev/shm/t`). Two
   mutations driven to RED on real assertions with build+vet clean under each,
