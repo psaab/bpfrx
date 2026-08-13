@@ -211,8 +211,18 @@ pub(super) fn populate_interfaces(
         //
         // Two things replaced the reconstruction. `validateRethMemberStrict`
         // makes the incoherent memberships unrepresentable at commit — a member
-        // naming ITSELF, a member naming an unconfigured parent, and a member
-        // carrying its own units. What is left is the alias itself, asked of
+        // naming ITSELF, a RETH naming a redundant parent of its own, a member
+        // naming an unconfigured parent, and a member carrying its own units.
+        // The reth clause is the one that bounds the case split: the Go
+        // predicate compares `snapshotLinuxName` of the parent against
+        // `snapshotLinuxName` of the candidate, and that function resolves a
+        // `reth*` name through `ResolveReth` and any other name through
+        // `LinuxIfName`, so EITHER side can take EITHER arm and the split is
+        // four-way. #6722 rounds 4-6 argued two of the four and called them
+        // exhaustive; the two with a `reth*` CANDIDATE were measured reachable
+        // under strict `CompileConfig` and each marked a reth — the L3 owner —
+        // as a projection of something else. Forbidding a `reth*` candidate
+        // empties both. What is left is the alias itself, asked of
         // the aliasing function, so there is no second opinion that can
         // disagree with `ResolveReth`. Note that a NAME can still satisfy the
         // predicate — `ge-0/0/1.100` really does resolve onto `reth1.100`'s

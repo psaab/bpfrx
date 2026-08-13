@@ -984,13 +984,14 @@ Scope of the fallback:
   **`validateRethMemberStrict`** (`pkg/config/compiler_validate_strict_reth_member.go`)
   makes the incoherent memberships UNREPRESENTABLE at commit. Junos models a
   reth as one interface — the `rethN` node owns the units, addresses and zone,
-  each member contributes a physical port — and three authored shapes break
-  that: a member naming **itself**, a member naming a parent that is **not
-  configured**, and a member carrying its **own logical units** (the fail-open
-  above; Junos rejects unit configuration on a reth child for the same reason).
-  Strict on commit / commit-check; downgraded to a warning on the tolerant
-  load / peer-sync paths (`lenientRethMember`) so a config committed before the
-  gate still boots (#1960).
+  each member contributes a physical port — and four authored shapes break
+  that: a member naming **itself**, a **reth** naming a redundant parent of its
+  own, a member naming a parent that is **not configured**, and a member
+  carrying its **own logical units** (the fail-open above; Junos rejects unit
+  configuration on a reth child for the same reason). Strict on commit /
+  commit-check; downgraded to a warning on the tolerant load / peer-sync paths
+  (`lenientRethMember`) so a config committed before the gate still boots
+  (#1960).
 
   **`rethProjectionMembers`** (`pkg/dataplane/userspace/interfaces.go`) is then
   the alias itself, asked of `snapshotLinuxName` — the function that CREATES it:
@@ -1006,20 +1007,56 @@ Scope of the fallback:
   resolve onto `reth1.100`'s netdev. That is not a hole; it is why the answer is
   taken from the resolution rather than from the shape of the operator's string.
 
-  **The predicate's soundness depends on #5832, and that dependency is not
-  local.** `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a
-  `reth*`-prefixed name and `LinuxIfName(x)` otherwise, so reducing the
-  satisfying set gives exactly two branches: the intended one, where
-  `ResolveReth(parent)` really is this interface; and one where **no reth is
-  involved at all** and the two names merely CANONICALIZE together —
-  `set interfaces ge-0/0/1 gigether-options redundant-parent ge-0-0-1`, with
-  `/`->`-` making both `ge-0-0-1`. The deference argument above says nothing
-  about that second branch, because neither side is a reth. What excludes it is
-  `validateInterfaceNameCollisionStrict` (**#5832**) — a different gate from
-  `validateRethMemberStrict`, rejecting two distinct names that canonicalize to
-  one Linux device. Relaxing #5832 reopens this, which is why
+  **The case split over that comparison is FOUR-way, not two** (#6722 round 7;
+  rounds 4-6 argued two branches and called them exhaustive — they are not).
+  `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed
+  name and `LinuxIfName(x)` otherwise, and it is applied to the PARENT and to
+  the CANDIDATE, so each side takes either arm independently. Writing `L` for
+  `LinuxIfName` and `R` for `ResolveReth`:
+
+  | parent | candidate | equality actually tested | status |
+  |--------|-----------|--------------------------|--------|
+  | reth | non-reth | `L(R(parent)) = L(candidate)` | the designed case |
+  | non-reth | non-reth | `L(parent) = L(candidate)` | closed by **#5832** |
+  | reth | reth | `L(R(parent)) = L(R(candidate))` | closed by the reth clause |
+  | non-reth | reth | `L(parent) = L(R(candidate))` | closed by the reth clause |
+
+  Rows 3 and 4 were measured REACHABLE under strict `CompileConfig` at
+  `195fcad51`, with `origin/master` (`edefb7570`) as the control — master
+  accepts the same configs and marks nothing, so the mark is a delta this work
+  introduces. `set interfaces reth1 gigether-options redundant-parent reth0`
+  gives `RethToPhysical[reth0] = reth1`, so `S(reth0) = S(reth1) = "reth1"` and
+  **reth1 — the L3 owner — is marked a projection of reth0**, while reth0's own
+  rows land on the netdev name `reth1` that no NIC carries. The membership
+  two-cycle (`ge-0/0/1 redundant-parent reth1` beside `reth1 redundant-parent
+  ge-0/0/1`) marks **both** rows on the one ifindex. A non-cycling `reth1
+  redundant-parent ge-0/0/1` marks nothing, but `ResolveKernelIfName`
+  (`pkg/config/types.go`) reads `RethToPhysical` UNGATED for a dotted ref, so
+  `ge-0/0/1.0` DISPLAYS as `reth1` while the dataplane binds `ge-0-0-1` — a
+  resolver split master shares. In each case the mark converts an AMBIGUOUS
+  ifindex (fail-closed at the 0 sentinel) into one that resolves a zone.
+
+  The reth clause of `validateRethMemberStrict` empties rows 3 and 4 as a
+  property of the code, not as a failed search: `rethProjectionMembers` only
+  considers a candidate that declares a `redundant-parent`, so once no `reth*`
+  name may declare one, the candidate side is unconditionally
+  `LinuxIfName(name)` and both rows are unreachable. Its test is
+  `strings.HasPrefix(name, "reth")` — the identical test `snapshotLinuxName`
+  uses to decide whether to resolve, so the two cannot drift.
+
+  **Row 2's exclusion depends on #5832, and that dependency is not local.**
+  There **no reth is involved at all** and the two names merely CANONICALIZE
+  together — `set interfaces ge-0/0/1 gigether-options redundant-parent
+  ge-0-0-1`, with `/`->`-` making both `ge-0-0-1`. The deference argument above
+  says nothing about that branch, because neither side is a reth. What excludes
+  it is `validateInterfaceNameCollisionStrict` (**#5832**) — a different gate
+  from `validateRethMemberStrict`, rejecting two distinct names that
+  canonicalize to one Linux device. Relaxing #5832 reopens this, which is why
   `TestCanonicalNameCollisionMarksWithoutAReth_6722` asserts the strict
-  rejection as a fail-on-revert guard.
+  rejection as a fail-on-revert guard. The reth clause is deliberately NOT
+  widened to "a redundant-parent must NAME a reth", which would also close row
+  2 — a second gate rejecting that test's config would leave it green with
+  #5832 relaxed, retiring the only fixture that binds the dependency.
 
   On the tolerant load / peer-sync path #5832 is a warning too, so the shape is
   admissible there. Measured: `ge-0/0/1` is marked with an empty zone, `ge-0-0-1`
@@ -1034,9 +1071,13 @@ Scope of the fallback:
   The cells are pinned in
   `pkg/dataplane/userspace/reth_member_projection_6722_test.go`: the rejections
   in `TestRethMemberWithOwnUnitsIsRejected_6722`,
-  `TestSelfNamedRedundantParentIsRejected_6722` and
-  `TestUnconfiguredRedundantParentIsRejected_6722` (each also asserting the
-  tolerant path still ADMITS with a warning), the alias comparison in
+  `TestSelfNamedRedundantParentIsRejected_6722`,
+  `TestUnconfiguredRedundantParentIsRejected_6722` and
+  `TestRethNamingARedundantParentIsRejected_6722` (each also asserting the
+  tolerant path still ADMITS with a warning), what the tolerant path then does
+  with rows 3 and 4 in
+  `TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722`, the alias
+  comparison in
   `TestPeerNodeRethMemberIsNotAProjection_6722` and
   `TestRedundantParentThatDoesNotAliasMarksNothing_6722`, the lenient-path
   fail-closed backstop in `TestGrandfatheredMemberUnitStillVotes_6722`, and the

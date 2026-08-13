@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // validateRethMemberStrict rejects a config whose `gigether-options
@@ -25,13 +26,30 @@ import (
 // when two rows disagree. A member's row is not an independent observer — it is
 // the RETH's port — so the Go builder marks it and the ledger withholds its
 // (empty) vote. That deference is only sound while the member really is nothing
-// but a port. Three authored shapes break it, and all three were accepted
+// but a port. Four authored shapes break it, and all four were accepted
 // before this gate:
 //
 //   - A member naming ITSELF as its redundant parent. Nothing is its own
 //     parent; `RethToPhysical` maps the name to itself, `ResolveReth` becomes a
 //     no-op, and no aliasing happens at all — yet the interface would present
 //     as a member whose "parent" is the very row the deference silences.
+//
+//   - A RETH naming a redundant parent of ITS OWN (#6722 round 7). A reth is
+//     the L3 OWNER of a redundant pair, never a port, so this inverts the
+//     relation the deference is built on. It is also the ONLY way the CANDIDATE
+//     side of `rethProjectionMembers`' netdev comparison can be a `reth*` name,
+//     and `snapshotLinuxName` resolves that side through `ResolveReth` — which
+//     is what makes two further shapes satisfy the predicate, both measured
+//     ACCEPTED by strict `CompileConfig` before this clause and both marking a
+//     reth: `reth1 gigether-options redundant-parent reth0` (`RethToPhysical
+//     [reth0] = reth1`, so reth0's rows land on the netdev name `reth1` that no
+//     NIC carries, and reth1 is marked a projection of reth0), and the
+//     two-cycle `ge-0/0/1 redundant-parent reth1` beside `reth1
+//     redundant-parent ge-0/0/1`, where BOTH rows on the one ifindex are
+//     marked. A non-cycling `reth1 redundant-parent ge-0/0/1` marks nothing but
+//     still splits the two resolvers: `ResolveKernelIfName` (types.go) reads
+//     `RethToPhysical` UNGATED for a dotted ref, so `ge-0/0/1.0` displays as
+//     `reth1` while the dataplane binds `ge-0-0-1`.
 //
 //   - A member naming a parent that is not configured. There is no RETH row on
 //     the shared netdev to defer TO, so the ifindex is left with no zone at all
@@ -52,10 +70,22 @@ import (
 //     allow logical-unit configuration on a reth child for exactly this reason:
 //     the child is L2-only and the reth owns the L3.
 //
-// Rejecting these three is what lets the projection mark be the resolver's own
+// Rejecting these four is what lets the projection mark be the resolver's own
 // answer instead of a re-derivation of it: after this gate a member has exactly
 // one row, and the only question left is whether the RETH resolves onto THIS
 // member or onto its peer-node sibling — which is `ResolveReth`, asked directly.
+//
+// The reth clause is also what makes the case split over that comparison
+// FINITE. `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a `reth*`
+// name and `LinuxIfName(x)` otherwise, and either side of the comparison can
+// be either, so the split is four-way, not two-way (#6722 round 7 — earlier
+// rounds argued two branches and called them exhaustive). Forbidding a `reth*`
+// CANDIDATE empties the two rows where the candidate is a reth, leaving the
+// candidate side unconditionally `LinuxIfName(name)`; the remaining two rows
+// are "the parent is a reth and resolves onto this member" (the designed case)
+// and "neither is a reth and the two names merely canonicalize together", the
+// second of which is rejected by `validateInterfaceNameCollisionStrict`
+// (#5832). Only then is the two-branch reading of the predicate true.
 //
 // Strict on commit / commit-check (hard reject, so the operator sees the
 // incoherence before it can silently mis-zone traffic); downgraded to a warning
@@ -91,6 +121,22 @@ func validateRethMemberStrict(cfg *Config) error {
 					"name the redundant-ethernet interface this port belongs to, "+
 					"or remove the redundant-parent line",
 				name)
+		}
+		if strings.HasPrefix(name, "reth") {
+			return fmt.Errorf(
+				"interface %q is a redundant-ethernet interface and also names "+
+					"`gigether-options redundant-parent %s`; a reth OWNS the L3 "+
+					"identity of a redundant pair and is never a member port of "+
+					"another interface, so this makes the L3 owner a port of "+
+					"something else. `RethToPhysical` keys its map on the "+
+					"redundant-parent NAME, so %q becomes what %q resolves to: with "+
+					"a reth parent the parent's rows land on the netdev name %q, "+
+					"which no NIC is ever named, and the snapshot builder then marks "+
+					"%q as a PROJECTION of %q and withholds its egress-zone vote — "+
+					"the L3 owner silenced in favour of its own supposed parent. "+
+					"Name the physical ports (ge-/xe-/et-) as the members of %q and "+
+					"remove the redundant-parent line from it",
+				name, parent, name, parent, name, name, parent, name)
 		}
 		if _, ok := LookupInterface(cfg, parent); !ok {
 			return fmt.Errorf(

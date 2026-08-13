@@ -31,9 +31,10 @@ import (
 //
 //  1. `validateRethMemberStrict` (pkg/config/compiler_validate_strict_reth_member.go)
 //     rejects the incoherent memberships at commit — a member naming ITSELF,
-//     a member naming an unconfigured parent, and a member carrying its own
-//     logical units. Those shapes are now UNREPRESENTABLE on the commit path
-//     rather than excluded by a predicate clause.
+//     a RETH naming a redundant parent of its own, a member naming an
+//     unconfigured parent, and a member carrying its own logical units. Those
+//     shapes are now UNREPRESENTABLE on the commit path rather than excluded
+//     by a predicate clause.
 //  2. What remains is the ALIAS ITSELF, asked of `snapshotLinuxName` — the
 //     function that creates it: does the parent's base row resolve to the same
 //     netdev as this interface's base row? There is no second opinion left to
@@ -66,9 +67,20 @@ import (
 //	                                                      clause cannot also
 //	                                                      catch)
 //	drop the parent-exists clause                      -> I1/I2 (accepts)
-//	drop the `opts.lenientRethMember` downgrade        -> G/H/I lenient halves
+//	drop the reth clause of validateRethMemberStrict   -> L1/L2/L3 (accepts)
+//	drop the `opts.lenientRethMember` downgrade        -> G/H/I/L lenient halves
 //	drop `parent != name` from rethProjectionMembers   -> J (self-parent)
 //	relax validateInterfaceNameCollisionStrict (#5832) -> K (strict accepts)
+//
+// L and M are round 7. The predicate's case split is FOUR-way, not two —
+// `snapshotLinuxName` resolves a `reth*` name through `ResolveReth` and any
+// other name through `LinuxIfName`, and it is applied to the parent AND the
+// candidate, so each side takes either arm independently. Rounds 4-6 argued the
+// two rows with a non-reth candidate and called them exhaustive. The other two
+// were measured REACHABLE under strict `CompileConfig`, each marking a `reth*`
+// interface — the L3 owner — as a projection of something else. L is the
+// commit rejection that empties them; M records what the tolerant path still
+// admits.
 //
 // B is the OVER-REACH GUARD: it stays green under every one of those, because
 // its config declares no `redundant-parent` at all. C is a BINDING cell despite
@@ -672,6 +684,221 @@ func TestCanonicalNameCollisionMarksWithoutAReth_6722(t *testing.T) {
 		t.Errorf("ge-0-0-1 RethProjection = %v Zone = %q, want false and %q: the row "+
 			"the operator actually zoned is the one whose vote survives",
 			parent.RethProjection, parent.Zone, "lan")
+	}
+}
+
+// L: a `reth*` interface that declares a `redundant-parent` of its OWN.
+//
+// This is the clause that makes the case split over `rethProjectionMembers`'
+// comparison FINITE, and it exists because rounds 4-6 got the split wrong.
+// `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a `reth*` name and
+// `LinuxIfName(x)` otherwise, and the predicate applies it to BOTH the parent
+// and the candidate, so the split is four-way. Rows 3 and 4 — the ones with a
+// `reth*` CANDIDATE — were argued away as covered by rows 1 and 2 and were not.
+// Measured at 195fcad51 with strict `CompileConfig`, against origin/master
+// (edefb7570) as the control:
+//
+//	reth1 redundant-parent reth0            ACCEPTED. RethToPhysical[reth0] =
+//	                                        reth1, so S(reth0) = S(reth1) =
+//	                                        "reth1" and reth1 — the L3 owner —
+//	                                        is marked a projection of reth0.
+//	                                        reth0's own rows land on the netdev
+//	                                        name `reth1`, which no NIC carries.
+//	ge-0/0/1 redundant-parent reth1 beside  ACCEPTED. S = "ge-0-0-1" on both
+//	reth1 redundant-parent ge-0/0/1         sides in BOTH directions, so BOTH
+//	                                        rows of the one ifindex are marked.
+//	reth1 redundant-parent ge-0/0/1         ACCEPTED, marks nothing (S(reth1) =
+//	                                        "reth1" != "ge-0-0-1"), but
+//	                                        RethToPhysical[ge-0/0/1] = reth1 and
+//	                                        `ResolveKernelIfName` reads that map
+//	                                        UNGATED for a dotted ref, so
+//	                                        `ge-0/0/1.0` DISPLAYS as `reth1`
+//	                                        while the dataplane binds
+//	                                        `ge-0-0-1`.
+//
+// Master accepts all three too and marks nothing (it has no `reth_projection`
+// field), so the first two are a delta this PR introduces: an ifindex that was
+// AMBIGUOUS — fail-closed against the 0 sentinel — resolves a zone instead.
+// The third is a resolver divergence master shares.
+//
+// The clause is `strings.HasPrefix(name, "reth")` on the CANDIDATE, which is
+// the identical test `snapshotLinuxName` uses to decide whether to resolve, so
+// the two cannot drift. It empties rows 3 and 4 as a property of the code
+// rather than as a failed search: `rethProjectionMembers` only ever considers
+// a `name` that declares a `redundant-parent`, so after this clause no `name`
+// it sees is a `reth*` name and `snapshotLinuxName(name)` is unconditionally
+// `LinuxIfName(name)`.
+//
+// FAIL-ON-REVERT: drop the reth clause from `validateRethMemberStrict` and all
+// three sub-cases compile. The control at the end keeps that from passing by
+// nothing ever compiling.
+//
+// Deliberately NOT done: the stronger clause "a redundant-parent must NAME a
+// `reth*` interface" would also close row 2, but row 2 is already closed by
+// #5832 and cell K exists to guard that cross-gate dependency — a second gate
+// rejecting K's config would make K green even with #5832 relaxed, retiring the
+// only fixture that binds it.
+func TestRethNamingARedundantParentIsRejected_6722(t *testing.T) {
+	cases := []struct {
+		name  string
+		lines []string
+	}{
+		{
+			// Row 3: reth parent, reth candidate.
+			name: "reth-names-a-reth",
+			lines: []string{
+				"set interfaces reth1 gigether-options redundant-parent reth0",
+				"set interfaces reth0 redundant-ether-options redundancy-group 1",
+				"set interfaces reth0 unit 0 family inet address 10.0.61.1/24",
+				"set security zones security-zone lan interfaces reth0",
+			},
+		},
+		{
+			// Row 4: non-reth parent, reth candidate — the membership 2-cycle.
+			name: "two-cycle",
+			lines: []string{
+				"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+				"set interfaces reth1 gigether-options redundant-parent ge-0/0/1",
+				"set security zones security-zone lan interfaces ge-0/0/1",
+			},
+		},
+		{
+			// Row 4 without the cycle: marks nothing, but pollutes
+			// RethToPhysical with a NON-reth key, which ResolveKernelIfName
+			// honours and snapshotLinuxName does not.
+			name: "reth-names-a-physical",
+			lines: []string{
+				"set interfaces ge-0/0/1 unit 0 family inet address 10.0.61.1/24",
+				"set interfaces reth1 gigether-options redundant-parent ge-0/0/1",
+				"set security zones security-zone lan interfaces ge-0/0/1",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertRethMemberRejected6722(t, tc.lines, "is a redundant-ethernet interface")
+		})
+	}
+
+	// The control: the reference bondless-RETH membership — the SAME two
+	// interface names, with the redundant-parent line on the PHYSICAL port
+	// where it belongs — still compiles and is still marked.
+	_, snaps := buildSnapshotsFromSet6722(t, []string{
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+		"set interfaces reth1 redundant-ether-options redundancy-group 2",
+		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone lan interfaces reth1",
+	}, map[string]int{"ge-0-0-1": 24},
+		map[string]string{"ge-0-0-1": "02:bf:72:01:00:01"})
+	if member := snapByName6722(t, snaps, "ge-0/0/1"); !member.RethProjection {
+		t.Errorf("ge-0/0/1 RethProjection = false, want true: the reth clause must " +
+			"reject a reth that declares a redundant-parent WITHOUT rejecting the " +
+			"ordinary membership that declares it on the physical port — without " +
+			"this control the sub-tests above would pass on a blanket refusal to " +
+			"compile anything with a reth in it")
+	}
+}
+
+// M: the reth-as-member LENIENT-PATH cell — the tolerant-load counterpart of
+// cell L, and the analogue of cell K for rows 3 and 4.
+//
+// `validateRethMemberStrict` is downgraded to a warning on the tolerant load /
+// peer-sync path (#1960 no-brick), so a config committed before cell L's clause
+// existed still boots and still reaches `buildInterfaceSnapshots`. This cell
+// RECORDS what it does there rather than endorsing it, and states the bound.
+//
+// The bound: the marked row is a `reth*` interface that carries NO logical
+// units (the gate's unit clause covers a member's units, and the mark is
+// stamped on base rows only) and NO zone (the Rust gate is `reth_projection &&
+// zone.is_empty()`, so a zoned reth still votes). Withholding an empty vote can
+// only let another row on the SAME ifindex win, and that row's zone is one the
+// operator wrote on a name that resolves to that device. It is still a
+// fail-OPEN delta against master, which holds the ifindex ambiguous — tolerated
+// on the tolerant path only, behind a warning that names the config.
+func TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722(t *testing.T) {
+	// Row 3: reth parent, reth candidate.
+	cfg := compileWithStubbedLinks6722(t, []string{
+		"set interfaces reth1 gigether-options redundant-parent reth0",
+		"set interfaces reth0 redundant-ether-options redundancy-group 1",
+		"set interfaces reth0 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone lan interfaces reth0",
+	}, map[string]int{"reth1": 31}, nil, true)
+
+	if !warnsAboutRethMember6722(cfg.Warnings) {
+		t.Fatalf("CompileConfigLenient recorded no reth-member warning; this cell "+
+			"needs the grandfathered shape ADMITTED with a signal. Warnings: %v",
+			cfg.Warnings)
+	}
+	// Premise: the reth CANDIDATE is what makes this row 3 rather than row 1.
+	// `RethToPhysical` keys on the redundant-parent name, so reth0 resolves onto
+	// reth1 — the direction that inverts the deference.
+	if got := cfg.ResolveReth("reth0"); got != "reth1" {
+		t.Fatalf("ResolveReth(reth0) = %q, want reth1: this cell is about a RETH "+
+			"being the resolution target, so a config where it is not would be "+
+			"measuring some other row of the split", got)
+	}
+	snaps := buildInterfaceSnapshots(cfg)
+	marked := snapByName6722(t, snaps, "reth1")
+	parent := snapByName6722(t, snaps, "reth0")
+	if marked.Ifindex != 31 || parent.Ifindex != 31 {
+		t.Fatalf("reth1 ifindex %d, reth0 ifindex %d, want both 31: the shared "+
+			"netdev is the premise", marked.Ifindex, parent.Ifindex)
+	}
+	if !marked.RethProjection || marked.Zone != "" {
+		t.Errorf("reth1 RethProjection = %v Zone = %q, want true and empty. This is "+
+			"the recorded lenient-path behaviour, not an endorsement: a change here "+
+			"means row 3 of the split moved and the strict clause in cell L needs "+
+			"re-deriving", marked.RethProjection, marked.Zone)
+	}
+	if parent.RethProjection || parent.Zone != "lan" {
+		t.Errorf("reth0 RethProjection = %v Zone = %q, want false and %q: the row "+
+			"the operator actually zoned is the one whose vote survives",
+			parent.RethProjection, parent.Zone, "lan")
+	}
+	// The bound, asserted rather than asserted-about: the silenced row has no
+	// logical units of its own, so the vote withheld carries no L3 statement.
+	for _, s := range snaps {
+		if strings.HasPrefix(s.Name, "reth1.") {
+			t.Errorf("snapshot row %q exists; the marked reth must carry no logical "+
+				"units, or withholding its vote silences a real L3 interface", s.Name)
+		}
+	}
+
+	// Row 4: non-reth parent, reth candidate — the 2-cycle, where BOTH rows on
+	// the ifindex are marked. The zone survives only because the zoned row's
+	// mark is inert under `zone.is_empty()`.
+	cycle := compileWithStubbedLinks6722(t, []string{
+		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
+		"set interfaces reth1 gigether-options redundant-parent ge-0/0/1",
+		"set security zones security-zone lan interfaces ge-0/0/1",
+	}, map[string]int{"ge-0-0-1": 24}, nil, true)
+	if !warnsAboutRethMember6722(cycle.Warnings) {
+		t.Fatalf("CompileConfigLenient recorded no reth-member warning for the "+
+			"2-cycle. Warnings: %v", cycle.Warnings)
+	}
+	cycleSnaps := buildInterfaceSnapshots(cycle)
+	phys := snapByName6722(t, cycleSnaps, "ge-0/0/1")
+	reth := snapByName6722(t, cycleSnaps, "reth1")
+	if phys.Ifindex != 24 || reth.Ifindex != 24 {
+		t.Fatalf("ge-0/0/1 ifindex %d, reth1 ifindex %d, want both 24",
+			phys.Ifindex, reth.Ifindex)
+	}
+	if !phys.RethProjection || !reth.RethProjection {
+		t.Errorf("2-cycle marks: ge-0/0/1 = %v, reth1 = %v, want both true. Each "+
+			"names the other as its redundant parent and `RethToPhysical` resolves "+
+			"each onto the other, so the predicate holds in BOTH directions and "+
+			"every row on the ifindex is declared a non-observer of it",
+			phys.RethProjection, reth.RethProjection)
+	}
+	if phys.Zone != "lan" {
+		t.Errorf("ge-0/0/1 Zone = %q, want lan: the zone the operator wrote is what "+
+			"keeps this ifindex from losing every vote — the Rust gate is "+
+			"`reth_projection && zone.is_empty()`, so the zoned row's mark is inert "+
+			"and its vote is the one that resolves", phys.Zone)
+	}
+	if reth.Zone != "" {
+		t.Errorf("reth1 Zone = %q, want empty: the silenced row must be the unzoned "+
+			"one", reth.Zone)
 	}
 }
 

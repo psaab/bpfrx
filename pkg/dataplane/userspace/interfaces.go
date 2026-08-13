@@ -483,23 +483,51 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 // left is which of a RETH's declared members it picked (`RethToPhysical`'s
 // node-affinity scoring), which is exactly what this comparison asks.
 //
-// DEPENDENCY, stated because it is not local to this file. `snapshotLinuxName`
-// is `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed name and
-// `LinuxIfName(x)` otherwise, so the comparison has a SECOND way to hold: when
-// no RETH is involved at all and the two names merely CANONICALIZE together —
-// `redundant-parent ge-0-0-1` on `ge-0/0/1`, where `/`->`-` makes both
-// `ge-0-0-1`. The deference premise ("a member is an L2 port, the reth owns the
-// L3") does not hold there, because neither side is a reth. What makes that
-// branch unreachable on the commit path is `validateInterfaceNameCollisionStrict`
-// (#5832) — a DIFFERENT gate from `validateRethMemberStrict`, rejecting two
-// distinct names that canonicalize to one device. This predicate's soundness
-// rests on it, so relaxing #5832 reopens this. #5832 is likewise a warning on
-// the tolerant load / peer-sync path, where the shape is therefore admissible:
-// measured, the marked row's empty vote is withheld and the ledger resolves the
-// zone the operator wrote on the OTHER name for that same device — a fail-OPEN
-// delta against master, bounded to a zone the operator did write on that
-// device, on a config that has already emitted the #5832 hijack warning.
-// Pinned by TestCanonicalNameCollisionMarksWithoutAReth_6722.
+// THE CASE SPLIT IS FOUR-WAY, not two. `snapshotLinuxName` is
+// `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed name and
+// `LinuxIfName(x)` otherwise, and it is applied to BOTH sides of the
+// comparison, so `parent` and `name` each take either arm independently:
+//
+//	| parent   | name     | equality actually tested |
+//	|----------|----------|--------------------------|
+//	| reth     | non-reth | L(R(parent)) = L(name)   |
+//	| non-reth | non-reth | L(parent)    = L(name)   |
+//	| reth     | reth     | L(R(parent)) = L(R(name))|
+//	| non-reth | reth     | L(parent)    = L(R(name))|
+//
+// Rounds 4-6 of #6722 argued only the first two and called them exhaustive.
+// They are not, and rows 3 and 4 were both measured REACHABLE under strict
+// `CompileConfig` before round 7 — each one marking a `reth*` interface, the
+// L3 owner, as a projection. What empties them is a property of
+// `validateRethMemberStrict`, not a failed search: its reth clause rejects any
+// `reth*` name that declares a `redundant-parent`, and this loop only ever
+// considers a `name` that declares one, so `name` is never a `reth*` name and
+// `snapshotLinuxName(name)` is unconditionally `LinuxIfName(name)`. Rows 3 and
+// 4 are then structurally unreachable rather than merely unwitnessed.
+//
+// DEPENDENCY, stated because it is not local to this file. Row 2 — no RETH
+// involved at all, the two names merely CANONICALIZING together, e.g.
+// `redundant-parent ge-0-0-1` on `ge-0/0/1` where `/`->`-` makes both
+// `ge-0-0-1` — is closed by `validateInterfaceNameCollisionStrict` (#5832), a
+// DIFFERENT gate from `validateRethMemberStrict`, rejecting two distinct names
+// that canonicalize to one device. The deference premise ("a member is an L2
+// port, the reth owns the L3") does not hold there, because neither side is a
+// reth. This predicate's soundness rests on #5832, so relaxing it reopens row
+// 2. #5832 is likewise a warning on the tolerant load / peer-sync path, where
+// the shape is therefore admissible: measured, the marked row's empty vote is
+// withheld and the ledger resolves the zone the operator wrote on the OTHER
+// name for that same device — a fail-OPEN delta against master, bounded to a
+// zone the operator did write on that device, on a config that has already
+// emitted the #5832 hijack warning. Pinned by
+// TestCanonicalNameCollisionMarksWithoutAReth_6722.
+//
+// Rows 3 and 4 have the same tolerant-path status and the same bound, for the
+// same reason: `validateRethMemberStrict`'s reth clause is a warning there too,
+// so a grandfathered config can still present a `reth*` candidate. Measured on
+// the tolerant path, the marked reth carries no units (the gate's unit clause
+// covers it) and no zone, so the vote withheld is empty and the zone that wins
+// is one the operator wrote on a name resolving to that same device. Pinned by
+// TestRethNamingARedundantParentMarksTheRethOnTheLenientPath_6722.
 //
 // The remaining `parent != name` test is the definition of a parent relation,
 // not a clause excluding a case: nothing is its own redundant parent, and a
