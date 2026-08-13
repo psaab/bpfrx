@@ -353,9 +353,13 @@ pool-member path at all. Rejected alternatives:
   have installed translates nothing — on the tolerant load / peer-sync path
   (#1960 no-brick), which is the path an operator recovers through.
 
-The chosen direction is narrowing and fail-closed, and it changes **no** pool's
-disposition: `InvalidPool` is the verdict Go already assigned. Only the
-disagreement is removed. The zone half is closed on the Go side instead, because
+The chosen direction is narrowing and fail-closed. **The claim that stood here —
+that it changes no pool's disposition — is false, and round 4 below corrects
+it**: on the TOLERANT path a pool with an `010.0.0.0/24` member goes from
+translating to poisoned across this branch. `InvalidPool` is the verdict the Go
+predicate already assigned, which is why the round-3 leg reached that
+conclusion; but the Go predicate itself only started assigning it one commit
+earlier, in round 2. The zone half is closed on the Go side instead, because
 there the runtime is the stricter one; the #5875 precedence is unaffected
 (`SourceNATPoolUnusableReason` writes `zone_scoped_pool_address` after the
 grammar clause, and the scope gate is registered before the grammar gate) and
@@ -427,3 +431,137 @@ leading-zero octet or a zone-scoped bare member except the #5875 snapshot cell �
 which continues to bind `zone_scoped_pool_address` for the reason it always
 did, now verified by an explicit precedence test rather than by the clause order
 alone.
+
+## Round 4 — a disposition change I said did not happen, and a backstop that was order-dependent
+
+Codex re-gate at `8f9b53b44`: **MERGE-NEEDS-MAJOR**, three findings. The first
+falsifies a claim this document made in round 3.
+
+### F1 — the tolerant path moved, and the movement is round 2's, not round 3's
+
+Round 3 argued the narrowing "changes no pool's disposition: `InvalidPool` is
+the verdict Go already assigned". True on the STRICT path — `netip.ParsePrefix`
+has rejected `010.0.0.0/24` since #5627 — and **false on the tolerant one**:
+
+| tree | tolerant snapshot | runtime |
+|---|---|---|
+| merge base `edefb7570` | `PoolUnusable=false` | `ipnet` reads it as `10.0.0.0/24`, allocator built, **flows translate** |
+| this branch | `PoolUnusable=true`, `invalid_pool` | `Unavailable`, **packets dropped** |
+
+A config on disk today, or arriving from an older primary over peer-sync, goes
+from working SNAT to a persistent silent outage across the upgrade.
+
+**The attribution matters and was missed by every leg, including mine.**
+`config.SourceNATPoolUnusableReason` **does not exist at the merge base**
+(`git show edefb7570:pkg/config/compiler_validate_strict_nat.go` has no such
+function). The membership-grammar clause that stamps `invalid_pool` arrived in
+ROUND 2 (`bc1329ae0`); round 3's Rust narrowing only stopped the runtime
+disagreeing with a poison Go had already begun applying. Reverting round 3
+alone would restore the divergence without restoring the pool. So the question
+is not "narrow Rust or not" — it is **"should the shared verdict refuse a
+non-canonical literal"**.
+
+### The decision: keep the refusal, make the diagnostic name the fix
+
+Three options were on the table: normalize on the tolerant path, keep the
+poison and make it loud, or something else. **Kept, deliberately**, for reasons
+in descending strength:
+
+1. **#5875 already settled this exact question in this exact subsystem, and
+   chose reject over rewrite.** Its rationale is in the code:
+   "stripping the `%zone` silently would change the modeled address, so the fix
+   rejects rather than rewrites". A leading zero is the WEAKER case of the two —
+   `010` has two readings (decimal 10, octal 8) where `fe80::1%eth0` has exactly
+   one. Normalizing here would overturn a settled doctrine for the worse case.
+2. **Normalizing installs a NAT pool on a guess that nothing reveals.**
+   `show configuration` would print `010.0.0.0/24` while the dataplane
+   translated from `10.0.0.0/24`. A stopped pool is loud — packets drop, two log
+   channels fire. A silently reinterpreted pool is quiet and wrong, which is the
+   worse failure mode for a firewall.
+3. **The merge base was already making this promise.** Its warning said the
+   dataplane "marks the pool unusable (InvalidPool) and drops it at runtime,
+   silently stopping translation" — aspirational there. This branch makes the
+   code honest.
+
+**Where the framing of option (b) needed re-scoping.** "Make it loud" implies
+adding a signal. Both channels already exist and already fire: the compiler's
+downgraded gate message lands in `cfg.Warnings`, which the daemon logs at apply
+(`slog.Warn("config validation", ...)`, daemon_apply.go), and the snapshot
+builder logs its own `slog.Warn` naming the pool and reason. Adding a third
+would have been noise. What was actually missing is that the message says
+**"is not a valid CIDR"** for a string that looks exactly like one — so the
+operator cannot see that the fix is deleting one character. The deliverable is
+therefore a SPECIFIC diagnostic, not new plumbing:
+
+> address `"010.0.0.0/24"` spells an octet with a leading zero; write it as
+> `"10.0.0.0/24"` — a leading zero is octal to some parsers, so the dataplane
+> refuses the ambiguous spelling rather than guessing, and marks the whole pool
+> unusable (this pool translates nothing until the address is corrected)
+
+`canonicalPoolAddressHint` computes the canonical spelling and is used ONLY to
+render that sentence — never to substitute. It reports a rewrite only when the
+rewrite is what made an unparseable literal parse, so it can never suggest a
+change to an address that already works, and never invents a suggestion for an
+unrelated malformation.
+
+Regression tests drive the real tolerant entries, which nothing had ever
+covered: `CompileConfigLenient` (tolerant load) and `CompileConfigForNodeLenient`
+(peer-sync, both node ids) — asserting the compile SUCCEEDS (#1960 no-brick
+holds), that the warning names both spellings and says translation stopped, that
+the pool is poisoned, and that the raw literal still ships unmodified.
+
+### F2 — CONFIRMED by measurement: the backstop was order-dependent
+
+Verified before touching anything, since the finding was relayed unreproduced.
+Two live pools A and B at 160 of a 200-slot test budget, plus a new C worth 80:
+
+| snapshot order | C | live occupancy |
+|---|---|---|
+| `A, B, C` (the existing test) | `OverBudget` | 16 words |
+| `C, A, B` | **admitted, bitmap built** | **24 words = 240 slots vs a 200 cap** |
+
+Same pools, same reuse map, opposite outcome from ORDER alone — and it repeats,
+one extra pool per apply. `resolve_pool_allocators` charged a reused key where
+it MET it, so a new key earlier in the slice was admitted against a `used` total
+that did not yet include the reused keys behind it, and those are then accepted
+unconditionally.
+
+Go-side poisoning hides this for snapshots this control plane generates, which
+is exactly why it mattered: this boundary exists as the INDEPENDENT backstop for
+a tolerated, older-control-plane or handcrafted snapshot, where no Go poison is
+coming.
+
+Fixed by splitting the resolver into two phases: phase 1 charges every DISTINCT
+key that will be reused, phase 2 admits. Reused keys are still always accepted
+(never kill last-good state) and are charged exactly once; new-key admission now
+sees the true live total whatever order the snapshot arrives in. The new test
+asserts the refusal, a zero construction count, the preserved live identities,
+and order-INVARIANCE directly; a second test drives three incremental applies
+and asserts the live set stops at the cap instead of growing per generation.
+
+### F3 — the guards did not bind, and one proposed mutation needed re-sizing
+
+Two were end-state assertions blind to a transient allocation: identity of the
+final allocator, and its occupancy-word count. Both survive a throwaway
+`PortAllocator::new` immediately before the reuse lookup — the pre-#6812
+build-then-discard behaviour. Fixed with a THREAD-LOCAL construction counter
+(`reset_port_allocator_build_count` / `port_allocator_build_count`); process-
+global counters in Rust tests produced a master-red flake once already (#6819),
+and `resolve_pool_allocators` is synchronous on the caller's thread, so a
+thread-local counts exactly the constructions the test under it caused.
+
+The third is the same-tier tie-break. **The property is true** — both slices
+derive from `cfg.Security.NAT.Source` and a stable sort preserves config order
+within a tier — but nothing pinned it, and the round-3 fixtures put the two
+competing rule-sets in DIFFERENT tiers, so they bind the tier ordering only.
+
+**The proposed mutation needed a correctly sized fixture to be distinguishing
+at all.** Measured directly: Go's `sort.Slice` runs an insertion sort below
+n=12 and detects an already-ordered input above it, so with an all-equal key it
+preserves order at every size tried (2, 8, 13, 16, 32, 64) — a small same-tier
+fixture would leave `sort.Slice` and `sort.SliceStable` observationally
+identical and no test could red. With MIXED tiers and same-tier ties it first
+reorders at **n=13**. The new fixture therefore uses 20 rule-sets interleaved
+across two tiers, and `sort.SliceStable -> sort.Slice` reds it with
+`charge order[0] = if05, want if00`. A second test puts a budget boundary
+between two same-tier rule-sets so the property decides which pool survives.

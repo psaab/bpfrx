@@ -655,3 +655,109 @@ func TestAggregateFirstFitFollowsEmittedScopeOrder_6812(t *testing.T) {
 	}
 	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), "big")
 }
+
+// TestAggregateFirstFitSameTierFollowsConfigOrder_6812 pins the STABILITY half
+// of #6812 F3, which the round-3 tests left unbound.
+//
+// The round-3 fixtures put the two competing rule-sets in DIFFERENT tiers, so
+// they bind the tier ORDERING and nothing else: swapping sort.SliceStable for
+// an unstable tier-only sort leaves them green. The property that carries the
+// rest of the claim — that a same-tier tie resolves in CONFIG order, which is
+// what makes the walk's sequence equal the builder's emitted sequence — had no
+// test at all.
+//
+// The fixture size is load-bearing. Go's sort.Slice runs an insertion sort
+// below n=12 and detects an already-ordered input above it, so a handful of
+// same-tier rule-sets would be order-preserving under an unstable sort too and
+// the mutation would be indistinguishable. Measured directly: with MIXED tiers
+// and same-tier ties, sort.Slice first reorders equal elements at n=13. This
+// fixture uses 20 rule-sets across two tiers, where sort.Slice was observed to
+// permute same-tier entries.
+//
+// FAIL-ON-REVERT: sort.SliceStable -> sort.Slice in
+// sourceNATAggregateReferencedCharges reds this.
+func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
+	const nPerTier = 10
+	var cmds []string
+	var wantOrder []string
+	// Interface-scoped (tier 0) and zone-scoped (tier 1) rule-sets INTERLEAVED
+	// in config order, so the sort has real work to do and same-tier ties are
+	// spread across the slice rather than adjacent.
+	for i := 0; i < nPerTier; i++ {
+		iface := fmt.Sprintf("if%02d", i)
+		zone := fmt.Sprintf("zn%02d", i)
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source rule-set %s from interface ge-0/0/%d.0", iface, i),
+			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", iface, 100+i),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 match source-address 10.0.0.0/24", iface),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 then source-nat pool %s", iface, iface),
+			fmt.Sprintf("set security nat source rule-set %s from zone trust%d", zone, i),
+			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", zone, 200+i),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 match source-address 10.0.0.0/24", zone),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 then source-nat pool %s", zone, zone),
+		)
+	}
+	// Expected charge order: every interface-scoped pool in CONFIG order, then
+	// every zone-scoped pool in CONFIG order.
+	for i := 0; i < nPerTier; i++ {
+		wantOrder = append(wantOrder, fmt.Sprintf("if%02d", i))
+	}
+	for i := 0; i < nPerTier; i++ {
+		wantOrder = append(wantOrder, fmt.Sprintf("zn%02d", i))
+	}
+
+	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	var got []string
+	for _, c := range charges {
+		got = append(got, c.name)
+	}
+	if len(got) != len(wantOrder) {
+		t.Fatalf("charged %d pools, want %d: %v", len(got), len(wantOrder), got)
+	}
+	for i := range wantOrder {
+		if got[i] != wantOrder[i] {
+			t.Fatalf("charge order[%d] = %s, want %s — a same-tier tie was not resolved in "+
+				"CONFIG order, so the walk no longer reproduces the builder's emitted "+
+				"sequence.\n got: %v\nwant: %v", i, got[i], wantOrder[i], got, wantOrder)
+		}
+	}
+}
+
+// TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812 is the same
+// property at the place it decides something: a budget boundary falling
+// BETWEEN two same-tier rule-sets. Config order alone decides which pool keeps
+// its allocator, so an unstable tie-break would poison a different pool.
+//
+// 16 same-tier zone-scoped pools of one /16 each exactly fill the address
+// budget (16 x 65,536 = 1,048,576); the 17th does not fit. It must be the
+// LAST-declared one that loses.
+func TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812(t *testing.T) {
+	var cmds []string
+	for i := 0; i < 17; i++ {
+		rs := fmt.Sprintf("rs%02d", i)
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source rule-set %s from zone z%d", rs, i),
+			fmt.Sprintf("set security nat source pool q%02d address 10.%d.0.0/16", i, 100+i),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 match source-address 10.0.0.0/24", rs),
+			fmt.Sprintf("set security nat source rule-set %s rule r0 then source-nat pool q%02d", rs, i),
+			fmt.Sprintf("set security nat source pool q%02d port range 5000 to 5001", i),
+		)
+	}
+	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	// Precondition: every rule-set really is the same tier, so the outcome is
+	// decided by config order and nothing else.
+	for _, rs := range cfg.Security.NAT.Source {
+		if tier := natRuleSetScopeTier(rs); tier != SourceNATTierZone {
+			t.Fatalf("rule-set %s has tier %d, want %d — the fixture no longer tests a "+
+				"SAME-tier tie", rs.Name, tier, SourceNATTierZone)
+		}
+	}
+	assertPoison(t, SourceNATAggregateOverBudgetPools(cfg), "q16")
+}

@@ -510,16 +510,40 @@ impl PendingPoolAllocator {
 ///    allocator and `reserve_flow` on an empty allocator returns false
 ///    gracefully, so no consumer can observe the difference.
 /// 3. AGGREGATE BUDGET — distinct keys are charged (count / addresses /
-///    port capacity) in deterministic first-seen order. A REUSED key consumes
-///    budget but is ALWAYS accepted: a no-op re-apply must not kill live
-///    state, and charging it stops a two-step apply from creeping past the
-///    cap one generation at a time (two full-range /16 pools, then the same
-///    two plus a third — the review's 1.48 GiB scenario via incremental
-///    applies). A NEW key is admitted only if it fits the remaining budget
-///    (first-fit: a refused key consumes nothing, so a later smaller key can
-///    still install); a refused key marks every referencing rule
-///    `OverBudget` — fail-closed with a dataplane diagnostic — and builds no
-///    bitmap.
+///    port capacity). A REUSED key consumes budget but is ALWAYS accepted: a
+///    no-op re-apply must not kill live state, and charging it stops a
+///    two-step apply from creeping past the cap one generation at a time (two
+///    full-range /16 pools, then the same two plus a third — the review's
+///    1.48 GiB scenario via incremental applies). A NEW key is admitted only
+///    if it fits the remaining budget (first-fit: a refused key consumes
+///    nothing, so a later smaller key can still install); a refused key marks
+///    every referencing rule `OverBudget` — fail-closed with a dataplane
+///    diagnostic — and builds no bitmap.
+///
+/// # Reused keys are RESERVED before any new key is admitted (#6812 F2 round 4)
+///
+/// Invariant 3 above is order-sensitive if reuse is charged where it is met.
+/// A single pass charging in snapshot order lets a NEW key be admitted against
+/// a `used` total that does not yet include reused keys appearing LATER in the
+/// slice — and those keys are then accepted unconditionally, so the live set
+/// ends up over the cap. Measured, with two live pools A and B at 160 of a
+/// 200-slot budget and a new C worth 80:
+///
+/// | snapshot order | C | live |
+/// |---|---|---|
+/// | `A, B, C` | refused | 160 |
+/// | `C, A, B` | **admitted, bitmap built** | **240 — over the cap** |
+///
+/// Same pools, same reuse map, opposite outcome from ORDER alone; and it
+/// repeats, one extra pool per apply. The Go-side poison hides it for
+/// snapshots this control plane generates, which is precisely why it mattered:
+/// this boundary exists as the INDEPENDENT backstop for a tolerated,
+/// older-control-plane, or handcrafted snapshot, where no Go poison is coming.
+///
+/// Phase 1 therefore charges every DISTINCT key that will be reused, before
+/// phase 2 admits anything. Reused keys are still always accepted and are
+/// charged exactly once; new-key admission now sees the true live total
+/// whatever order the snapshot arrives in.
 fn resolve_pool_allocators(
     out: &mut [SourceNatRule],
     pendings: &[Option<PendingPoolAllocator>],
@@ -529,6 +553,25 @@ fn resolve_pool_allocators(
     let mut pool_allocators = FxHashMap::<SourceNatPoolAllocatorKey, PortAllocator>::default();
     let mut refused_keys = FxHashMap::<SourceNatPoolAllocatorKey, ()>::default();
     let mut used = SourceNatAggregateUse::default();
+
+    // PHASE 1: reserve the reused keys. These are accepted unconditionally in
+    // phase 2, so their charge is not a prediction — it is live state this
+    // apply is already committed to holding.
+    let mut reserved = FxHashMap::<SourceNatPoolAllocatorKey, ()>::default();
+    for (rule, pending) in out.iter().zip(pendings.iter()) {
+        let Some(pending) = pending else {
+            continue;
+        };
+        let key = rule.allocator_key_for(pending.port_low, pending.port_high);
+        if !previous_allocators.contains_key(&key) || reserved.contains_key(&key) {
+            continue;
+        }
+        used = used.saturating_with(pending.charge());
+        reserved.insert(key, ());
+    }
+
+    // PHASE 2: assign. Reused keys were charged in phase 1 and must NOT be
+    // charged again here.
     for (rule, pending) in out.iter_mut().zip(pendings.iter()) {
         let Some(pending) = pending else {
             continue;
@@ -545,11 +588,17 @@ fn resolve_pool_allocators(
         }
         let charge = pending.charge();
         if let Some(existing) = previous_allocators.get(&key) {
-            // Reuse preserves last-good live state: always accepted, but the
-            // key still CONSUMES budget (see invariant 3). `used` is the
-            // cumulative live set; a reused key that alone overflows (legacy
-            // pre-cap state) saturates `used`, which only refuses NEW keys.
-            used = used.saturating_with(charge);
+            // Reuse preserves last-good live state: always accepted. Its
+            // budget was charged in PHASE 1 — charging it again here would
+            // double-count, and charging it ONLY here is the #6812 F2 defect
+            // (a new key earlier in the slice would be admitted against a
+            // `used` that omits it). A reused key that alone overflows (legacy
+            // pre-cap state) saturated `used` in phase 1, which only refuses
+            // NEW keys.
+            debug_assert!(
+                reserved.contains_key(&key),
+                "a previously-allocated key must have been reserved in phase 1",
+            );
             pool_allocators.insert(key, existing.clone());
             rule.pool_allocator = existing.clone();
             continue;

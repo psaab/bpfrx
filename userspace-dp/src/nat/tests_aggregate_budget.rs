@@ -60,7 +60,9 @@
 
 #![allow(unused_imports)]
 
-use super::allocator::TranslatedTuple;
+use super::allocator::{
+    TranslatedTuple, port_allocator_build_count, reset_port_allocator_build_count,
+};
 use super::source::{
     SOURCE_NAT_AGGREGATE_BUDGET, SourceNatAggregateBudget, SourceNatAggregateUse,
     SourceNatFailureReason, expand_pool_address, parse_source_nat_rules_with_budget,
@@ -212,7 +214,21 @@ fn reuse_consumes_budget_and_preserves_last_good() {
         pool_snap("r1", "p1", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
         pool_snap("r2", "p2", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
     ];
+    // #6812 F3 round 4: count CONSTRUCTIONS across the apply, not just the
+    // identity of the allocator each rule ends up holding. Identity alone is an
+    // end-state assertion: a throwaway `PortAllocator::new(...)` immediately
+    // before the reuse lookup restores the pre-#6812 build-then-discard
+    // behaviour with every identity assertion still green. Exactly ONE
+    // construction is legal here — the third pool is refused, so the only
+    // build that may happen is... none at all.
+    reset_port_allocator_build_count();
     let apply2 = parse_with_test_budget(&snaps_abc, Some(&apply1));
+    assert_eq!(
+        port_allocator_build_count(),
+        0,
+        "apply 2 reuses both live keys and refuses the third: it must construct NO \
+         PortAllocator at all (a build-then-discard reuse path shows up here as 2)",
+    );
 
     assert_eq!(
         apply2[0].pool_allocator.debug_shared_identity(),
@@ -247,7 +263,17 @@ fn failed_pool_builds_no_bitmap() {
         pool_unusable_reason: "invalid_pool".to_string(),
         ..pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH)
     }];
+    reset_port_allocator_build_count();
     let rules = parse_with_test_budget(&snaps, None);
+    // #6812 F3 round 4: the word count of the FINAL allocator is blind to a
+    // transient bitmap that is built and then dropped — which is precisely the
+    // pre-#6812 behaviour this rule exists to forbid. Count constructions.
+    assert_eq!(
+        port_allocator_build_count(),
+        0,
+        "a failed pool must construct NO PortAllocator at all; the final allocator's \
+         word count cannot see a bitmap that was built and discarded",
+    );
     assert_eq!(
         rules[0].pool_failure,
         Some(SourceNatFailureReason::InvalidPool)
@@ -983,4 +1009,165 @@ fn nat_pool_bare_and_host_cidr_grammars_agree() {
             );
         }
     }
+}
+
+
+/// #6812 F2 round 4: a REUSED key must reserve its budget before ANY new key
+/// is admitted, so the aggregate backstop cannot be walked past by reordering
+/// the snapshot.
+///
+/// `resolve_pool_allocators` charged a reused key where it MET it. A snapshot
+/// ordering the new key FIRST therefore admitted it against a `used` total
+/// that did not yet include the reused keys behind it — and those are then
+/// accepted unconditionally, so the live set lands over the cap. Measured
+/// before the fix, with A and B live at 160 of a 200-slot budget:
+///
+/// | order | C | live occupancy |
+/// |---|---|---|
+/// | `A, B, C` | `OverBudget` | 16 words |
+/// | `C, A, B` | admitted, bitmap BUILT | 24 words (240 slots) |
+///
+/// Same pools, same reuse map, opposite outcome from ORDER alone, and it
+/// repeats one pool per apply. The Go-side poison masks it for snapshots this
+/// control plane generates — which is the point: this boundary exists as the
+/// INDEPENDENT backstop for a tolerated, older-control-plane or handcrafted
+/// snapshot, where no Go poison is coming.
+///
+/// FAIL-ON-REVERT: move the reused-key charge back into phase 2 (charge at the
+/// `previous_allocators` hit, drop the phase-1 loop) and `p2` is admitted here
+/// with a freshly built 8-word bitmap.
+#[test]
+fn reused_keys_reserve_budget_before_a_new_key_is_admitted_6812() {
+    // Apply 1: A and B go live, 160 of the 200-slot budget.
+    let snaps_ab = vec![
+        pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        pool_snap("r1", "p1", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+    ];
+    let apply1 = parse_with_test_budget(&snaps_ab, None);
+    assert!(
+        apply1.iter().all(|r| r.pool_failure.is_none()),
+        "precondition: both pools must go live in apply 1",
+    );
+
+    // Apply 2, NEW KEY FIRST: p2 must still be refused — p0 and p1 are live
+    // and will be accepted unconditionally, so only 40 of 200 slots remain.
+    let snaps_cab = vec![
+        pool_snap("r2", "p2", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        pool_snap("r1", "p1", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+    ];
+    reset_port_allocator_build_count();
+    let apply2 = parse_with_test_budget(&snaps_cab, Some(&apply1));
+
+    assert_eq!(
+        apply2[0].pool_failure,
+        Some(SourceNatFailureReason::OverBudget),
+        "the NEW key was admitted ahead of the reused keys behind it in the slice: \
+         the aggregate backstop can be walked past by reordering the snapshot",
+    );
+    assert_eq!(
+        port_allocator_build_count(),
+        0,
+        "the refused new key must build no bitmap and the two reused keys must \
+         build nothing either",
+    );
+    assert_eq!(apply2[0].pool_allocator.debug_occupancy_words(), 0);
+
+    // The two live pools are untouched — reservation must never kill last-good
+    // state, which is the property that made reuse unconditional to begin with.
+    assert_eq!(apply2[1].pool_failure, None);
+    assert_eq!(apply2[2].pool_failure, None);
+    assert_eq!(
+        apply2[1].pool_allocator.debug_shared_identity(),
+        apply1[0].pool_allocator.debug_shared_identity(),
+    );
+    assert_eq!(
+        apply2[2].pool_allocator.debug_shared_identity(),
+        apply1[1].pool_allocator.debug_shared_identity(),
+    );
+
+    // Order-INVARIANCE, stated directly: the same three pools and the same
+    // reuse map must reach the same verdict whichever order they arrive in.
+    let snaps_abc = vec![
+        pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        pool_snap("r1", "p1", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+        pool_snap("r2", "p2", SMALL_POOL, SMALL_LOW, SMALL_HIGH),
+    ];
+    let apply2_abc = parse_with_test_budget(&snaps_abc, Some(&apply1));
+    let refused_cab: Vec<&str> = apply2
+        .iter()
+        .filter(|r| r.pool_failure == Some(SourceNatFailureReason::OverBudget))
+        .map(|r| r.pool_name.as_str())
+        .collect();
+    let refused_abc: Vec<&str> = apply2_abc
+        .iter()
+        .filter(|r| r.pool_failure == Some(SourceNatFailureReason::OverBudget))
+        .map(|r| r.pool_name.as_str())
+        .collect();
+    assert_eq!(
+        refused_cab, refused_abc,
+        "the refused set must not depend on snapshot ORDER",
+    );
+}
+
+/// #6812 F2 round 4: the creep this reservation exists to stop, driven across
+/// THREE applies rather than asserted.
+///
+/// Each apply presents one brand-new pool ahead of every live one — the shape
+/// an incremental config edit produces once the emitted order puts the new
+/// rule-set first. Without reservation each apply admits its new key against a
+/// `used` of zero, so the live set grows by one pool per generation without
+/// limit. With it, the live set stops at the budget and stays there.
+#[test]
+fn incremental_applies_cannot_creep_past_the_cap_6812() {
+    let mut live = parse_with_test_budget(
+        &[pool_snap("r0", "p0", SMALL_POOL, SMALL_LOW, SMALL_HIGH)],
+        None,
+    );
+    let mut names = vec!["p0".to_string()];
+
+    for round in 1..4 {
+        let fresh = format!("p{round}");
+        // NEW pool first, then every pool already live.
+        let mut snaps = vec![pool_snap(
+            &format!("r{round}"),
+            &fresh,
+            SMALL_POOL,
+            SMALL_LOW,
+            SMALL_HIGH,
+        )];
+        for (i, n) in names.iter().enumerate() {
+            snaps.push(pool_snap(&format!("rl{i}"), n, SMALL_POOL, SMALL_LOW, SMALL_HIGH));
+        }
+        let next = parse_with_test_budget(&snaps, Some(&live));
+
+        let live_slots: u64 = next
+            .iter()
+            .filter(|r| r.pool_failure.is_none())
+            .map(|r| r.pool_allocator.debug_occupancy_words() as u64)
+            .sum::<u64>()
+            * 10; // 10 ports per word in this fixture (SMALL_HIGH-SMALL_LOW+1)
+        assert!(
+            live_slots <= TEST_BUDGET.max_port_capacity,
+            "generation {round}: live set is {live_slots} slots against a {} cap — the \
+             backstop crept past its budget one apply at a time",
+            TEST_BUDGET.max_port_capacity,
+        );
+
+        if next
+            .iter()
+            .find(|r| r.pool_name == fresh)
+            .expect("the new pool is in the snapshot")
+            .pool_failure
+            .is_none()
+        {
+            names.push(fresh);
+        }
+        live = next;
+    }
+    assert_eq!(
+        names.len(),
+        2,
+        "only two 80-slot pools fit a 200-slot budget; the live set must stop growing",
+    );
 }

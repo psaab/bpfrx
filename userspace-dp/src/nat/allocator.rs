@@ -802,8 +802,43 @@ impl Default for PortAllocator {
     }
 }
 
+/// Test-only PortAllocator CONSTRUCTION counter (#6812 F3 round 4).
+///
+/// The #6812 guards previously asserted only on the FINAL allocator a rule
+/// carries — its identity, or its occupancy-word count. Both are end-state
+/// assertions, and both are blind to the exact defect the reuse-before-build
+/// and no-bitmap-for-a-failed-pool rules exist to prevent: a `PortAllocator::
+/// new` that is built and then discarded. A throwaway construction immediately
+/// before the reuse lookup restores the pre-#6812 build-then-discard behaviour
+/// with every one of those assertions still green.
+///
+/// THREAD-LOCAL, deliberately. A process-global counter is shared by every test
+/// `cargo test` runs in parallel and produced a master-red flake once already
+/// (#6819). `resolve_pool_allocators` and everything it calls are synchronous
+/// on the caller's thread, so a thread-local counts exactly the constructions
+/// the test under it caused, with no serialisation and no cross-test coupling.
+#[cfg(test)]
+thread_local! {
+    static PORT_ALLOCATOR_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: reset the calling thread's construction counter and return a
+/// probe that reports constructions since the reset.
+#[cfg(test)]
+pub(super) fn reset_port_allocator_build_count() {
+    PORT_ALLOCATOR_BUILDS.with(|c| c.set(0));
+}
+
+/// Test-only: PortAllocator constructions on this thread since the last reset.
+#[cfg(test)]
+pub(super) fn port_allocator_build_count() -> usize {
+    PORT_ALLOCATOR_BUILDS.with(|c| c.get())
+}
+
 impl PortAllocator {
     pub(crate) fn new(num_addresses: usize, port_low: u16, port_high: u16) -> Self {
+        #[cfg(test)]
+        PORT_ALLOCATOR_BUILDS.with(|c| c.set(c.get() + 1));
         let counters = (0..num_addresses).map(|_| AtomicU32::new(0)).collect();
         let range = if port_low == 0 || port_high == 0 || port_low > port_high {
             0

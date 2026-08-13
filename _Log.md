@@ -1,3 +1,105 @@
+## 2026-08-13 — #6812 round 4: a disposition change I said did not happen, and an order-dependent backstop
+
+- **Timestamp**: 2026-08-13
+- **Action**: Fold Codex MERGE-NEEDS-MAJOR at `8f9b53b44` (three blocking
+  findings) into PR #6815 / issue #6812.
+- **File(s)**: `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/allocator.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/nat_source_scope.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go` (new),
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+### F1 — the round-3 claim was false on the path that matters
+
+Round 3 said the narrowing "changes no pool's disposition". True on the STRICT
+path; **false on the TOLERANT one**. A pool with an `010.0.0.0/24` member goes
+from `PoolUnusable=false` — `ipnet` reading it as `10.0.0.0/24`, allocator
+built, flows translating — to poisoned, `Unavailable`, packets dropped. A config
+on disk today, or synced from an older primary, loses SNAT across the upgrade.
+
+**Attribution, which every leg including mine had wrong.**
+`config.SourceNATPoolUnusableReason` **does not exist at the merge base**. The
+clause that stamps `invalid_pool` arrived in ROUND 2 (`bc1329ae0`); round 3's
+Rust narrowing only stopped the runtime disagreeing with a poison Go had already
+begun applying. Reverting round 3 alone restores the divergence without
+restoring the pool. The question is therefore not "narrow Rust or not" but
+"should the shared verdict refuse a non-canonical literal".
+
+**Decision: keep the refusal.** #5875 settled the structurally identical case in
+this same subsystem and chose reject over rewrite — "stripping the `%zone`
+silently would change the modeled address, so the fix rejects rather than
+rewrites" — and a leading zero is the WEAKER case, since `010` has two readings
+where `fe80::1%eth0` has one. Normalizing would install a NAT pool on a guess
+`show configuration` would never reveal: a stopped pool is loud, a silently
+reinterpreted one is quiet and wrong.
+
+**Where "make it loud" needed re-scoping.** Both operator channels already exist
+and already fire — `cfg.Warnings` is logged at apply by daemon_apply.go, and the
+snapshot builder logs its own warning naming pool and reason. A third would be
+noise. What was missing is that the message says "is not a valid CIDR" for a
+string that looks exactly like one, so the operator cannot see the fix is one
+character. Replaced with a specific diagnostic naming the canonical spelling and
+why the ambiguous one is refused. `canonicalPoolAddressHint` renders that
+sentence and is never used to substitute; it reports a rewrite only when the
+rewrite is what made an unparseable literal parse.
+
+Upgrade + peer-sync regression tests drive the real tolerant entries
+(`CompileConfigLenient`, `CompileConfigForNodeLenient` at both node ids), which
+nothing had covered.
+
+### F2 — CONFIRMED by measurement, then fixed
+
+Verified before touching anything. Two live pools at 160 of a 200-slot budget
+plus a new pool worth 80:
+
+| snapshot order | new pool | live occupancy |
+|---|---|---|
+| `A, B, C` (existing test) | `OverBudget` | 16 words |
+| `C, A, B` | **admitted, bitmap built** | **24 words = 240 slots vs a 200 cap** |
+
+Same pools, same reuse map, opposite outcome from ORDER alone, repeating one
+pool per apply. The resolver charged a reused key where it MET it, so a new key
+earlier in the slice was admitted against a total that omitted the reused keys
+behind it. Go-side poisoning masks it for snapshots this control plane
+generates — which is the point: this boundary is the INDEPENDENT backstop for
+tolerated, older-control-plane and handcrafted snapshots.
+
+Fixed by a two-phase resolver: phase 1 reserves every distinct reused key,
+phase 2 admits. Reused keys stay unconditionally accepted and are charged once.
+
+### F3 — guards that could not see a transient allocation
+
+Two were end-state assertions (final allocator identity; final occupancy-word
+count), both blind to a build-then-discard. Fixed with a THREAD-LOCAL
+construction counter — process-global counters in Rust tests caused a master-red
+flake once already (#6819), and the resolver is synchronous on the caller's
+thread.
+
+The third, same-tier tie-break: the property is true but nothing pinned it.
+**The proposed mutation needed a correctly sized fixture to be distinguishing at
+all** — measured, Go's `sort.Slice` preserves order at every size tried (2..64)
+with an all-equal key, so a small same-tier fixture leaves `sort.Slice` and
+`sort.SliceStable` observationally identical. With MIXED tiers and same-tier
+ties it first reorders at **n=13**. The new fixture uses 20 rule-sets across two
+tiers.
+
+### Mutation proof — 5/5 observed RED
+
+| revert | test | observed RED |
+|---|---|---|
+| drop the leading-zero hint branch | `TestLeadingZeroPoolMember{Upgrade,PeerSync,StrictRejection}...` | `no warning named the leading-zero member` |
+| `sort.SliceStable` -> `sort.Slice` | `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
+| charge reuse in phase 2 again | `reused_keys_reserve_budget_before_a_new_key_is_admitted_6812` + `incremental_applies_cannot_creep_past_the_cap_6812` | `the NEW key was admitted ahead of the reused keys behind it` |
+| throwaway `PortAllocator::new` before the reuse lookup | `reuse_consumes_budget_and_preserves_last_good` | `it must construct NO PortAllocator at all` |
+| eager build for a FAILED pool | `failed_pool_builds_no_bitmap` | `the final allocator word count cannot see a bitmap that was built and discarded` |
+
+The last two are the guards Codex named as unbinding: both now red on exactly
+the mutation he described, and both did so on the new construction-count
+assertion while the pre-existing identity / word-count assertions stayed green.
+
 ## 2026-08-13 — #6812 round 3: the grammar the shared verdict is expressed in
 
 - **Timestamp**: 2026-08-13

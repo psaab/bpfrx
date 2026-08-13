@@ -1,5 +1,103 @@
 package config
 
+import (
+	"fmt"
+	"net/netip"
+	"strings"
+)
+
+// leadingZeroPoolAddressReason renders the operator-facing reason for a pool
+// member that is rejected ONLY because it spells an octet with a leading zero
+// (#6812 F1 round 4).
+//
+// The generic reason ("is not a valid CIDR") is actively unhelpful here:
+// `010.0.0.0/24` LOOKS like a valid CIDR, so an operator reading it has no way
+// to see that the fix is deleting one character. This one names the canonical
+// spelling and says why the ambiguous one is refused.
+//
+// It matters most on the TOLERANT path. A pool carrying such a member is
+// marked unusable and stops translating, and the config reached that path
+// precisely because it was persisted (or peer-synced from a primary) that
+// predates the #5627 grammar gate — so the operator meets this as a NAT outage
+// after an upgrade, not as a commit error they can iterate on.
+func leadingZeroPoolAddressReason(addr, canonical string) string {
+	return fmt.Sprintf(
+		"spells an octet with a leading zero (%q); write it as %q — a leading zero is "+
+			"octal to some parsers, so the dataplane refuses the ambiguous spelling rather "+
+			"than guessing, and marks the whole pool unusable (this pool translates nothing "+
+			"until the address is corrected)",
+		addr, canonical)
+}
+
+// canonicalPoolAddressHint returns the canonical spelling of a pool address
+// literal that differs from `addr` ONLY by leading zeros in its dotted-decimal
+// octets, or "" when no such rewrite makes it parseable (#6812 F1 round 4).
+//
+// The result is a DIAGNOSTIC, never a substitution: nothing in the compiler or
+// the snapshot builder installs it. #5875 settled that doctrine for the
+// structurally identical `%zone` case — "stripping the %zone silently would
+// change the modeled address, so the fix rejects rather than rewrites" — and a
+// leading zero is the weaker case of the two, since `010` has two readings
+// (decimal 10, octal 8) where `fe80::1%eth0` has one. Rewriting it silently
+// would install a NAT pool on a guess that `show configuration` would never
+// reveal.
+//
+// Only a rewrite that turns an UNPARSEABLE literal into a parseable one is
+// reported, so the hint can never suggest a change to an address that already
+// works, and never invents a suggestion for an unrelated malformation
+// (`not-an-ip`, `10.0.0.256/24`, a bad mask).
+func canonicalPoolAddressHint(addr string) string {
+	if !strings.Contains(addr, ".") {
+		return ""
+	}
+	addrPart, maskPart, hasMask := strings.Cut(addr, "/")
+	fields := strings.Split(addrPart, ".")
+	changed := false
+	for i, f := range fields {
+		// Strip leading zeros from the TRAILING digit run only, so the
+		// `::ffff:010.0.0.0` form (whose first field carries the v6 prefix)
+		// is handled without touching the hextets.
+		start := len(f)
+		for start > 0 && f[start-1] >= '0' && f[start-1] <= '9' {
+			start--
+		}
+		digits := f[start:]
+		if len(digits) < 2 || digits[0] != '0' {
+			continue
+		}
+		trimmed := strings.TrimLeft(digits, "0")
+		if trimmed == "" {
+			trimmed = "0"
+		}
+		fields[i] = f[:start] + trimmed
+		changed = true
+	}
+	if !changed {
+		return ""
+	}
+	candidate := strings.Join(fields, ".")
+	if hasMask {
+		candidate += "/" + maskPart
+	}
+	// Report only if the rewrite is what made it parseable.
+	if hasMask {
+		if _, err := netip.ParsePrefix(addr); err == nil {
+			return ""
+		}
+		if _, err := netip.ParsePrefix(candidate); err != nil {
+			return ""
+		}
+		return candidate
+	}
+	if _, err := netip.ParseAddr(addr); err == nil {
+		return ""
+	}
+	if _, err := netip.ParseAddr(candidate); err != nil {
+		return ""
+	}
+	return candidate
+}
+
 // Source-NAT context-specificity tiers (#4161). LOWER = more specific = higher
 // precedence, matching Junos rule-set selection (interface most specific).
 //

@@ -764,6 +764,9 @@ func sourceNATPoolAddressReason(addr string) (string, bool) {
 	if strings.Contains(addr, "/") {
 		p, err := netip.ParsePrefix(addr)
 		if err != nil {
+			if hint := canonicalPoolAddressHint(addr); hint != "" {
+				return leadingZeroPoolAddressReason(addr, hint), false
+			}
 			return "is not a valid CIDR (the dataplane cannot expand it and marks the pool unusable)", false
 		}
 		addrBits := 32
@@ -786,6 +789,9 @@ func sourceNATPoolAddressReason(addr string) (string, bool) {
 	}
 	a, err := netip.ParseAddr(addr)
 	if err != nil {
+		if hint := canonicalPoolAddressHint(addr); hint != "" {
+			return leadingZeroPoolAddressReason(addr, hint), false
+		}
 		return "is not a valid IP address (the dataplane cannot parse it and marks the pool unusable)", false
 	}
 	// #6812 F1 round 3: netip carries an IPv6 zone (`fe80::1%eth0`) that

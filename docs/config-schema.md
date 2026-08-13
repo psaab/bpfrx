@@ -5448,6 +5448,22 @@ reserved for whole-dataplane selection where a rewrite shim
     `TestPoolAddressGrammarMatchesDataplane_6812` (Go) and
     `nat_pool_grammar_parity_fixture` (Rust, through the real
     `expand_pool_address`). Neither side keeps a copy of the table.
+    **The disposition of a leading-zero member DID move, and the move is
+    deliberate (#6812 F1 round 4).** On the TOLERANT path a pool carrying
+    `010.0.0.0/24` went from translating (the merge base shipped it unpoisoned
+    and `ipnet` read it as `10.0.0.0/24`) to poisoned and dropping. The poison
+    is not the runtime narrowing's: `SourceNATPoolUnusableReason` does not exist
+    at the merge base, and its membership-grammar clause is what stamps
+    `invalid_pool`. It is kept on the #5875 precedent — a non-representable
+    literal is REJECTED, never silently rewritten, and `010` is the weaker case
+    of the two since it has two readings where `%zone` has one. Normalizing
+    would install a pool on a guess `show configuration` could not reveal. What
+    the operator gets instead is a diagnostic that names the one-character fix
+    ("spells an octet with a leading zero (`010.0.0.0/24`); write it as
+    `10.0.0.0/24` … this pool translates nothing until the address is
+    corrected"), on both tolerant entries — it rides `cfg.Warnings`, which the
+    daemon logs at apply. Upgrade and peer-sync regression tests live in
+    `pkg/dataplane/userspace/nat_pool_leading_zero_upgrade_6812_test.go`.
     The gate iterates ONLY pools a pool-mode rule references — the exact set the
     dataplane snapshot expands, so an unreferenced pool (never seen by the Rust
     grammar) is out of scope and the gate stays grammar-EQUIVALENT with live
@@ -5558,7 +5574,16 @@ reserved for whole-dataplane selection where a rewrite shim
     live state, and a two-step apply cannot creep past the cap one
     generation at a time), and a new key that does not fit fails its rules
     closed with the `source_nat_pool_over_budget` dataplane diagnostic
-    instead of materialising the bitmap; (3) the `aggregate_over_budget`
+    instead of materialising the bitmap. **Reused keys are RESERVED in a
+    first phase, before any new key is admitted (#6812 F2 round 4)** —
+    charging reuse where the walk MET it made the backstop order-dependent:
+    with two pools live at 160 of a 200-slot test budget and a new pool worth
+    80, the order `A,B,C` refused the newcomer while `C,A,B` admitted it and
+    built its bitmap, landing 240 slots against the cap, repeating one pool
+    per apply. Go-side poisoning masks that for snapshots this control plane
+    generates, which is exactly why it mattered: this boundary is the
+    INDEPENDENT backstop for tolerated, older-control-plane and handcrafted
+    snapshots; (3) the `aggregate_over_budget`
     wire reason maps to the new `OverBudget` failure variant (an older
     helper's catch-all maps it to `InvalidPool` — still fail-closed, so the
     marker is wire-skew safe).
@@ -5638,7 +5663,18 @@ reserved for whole-dataplane selection where a rewrite shim
     for the disposition-equivalence claim and
     `nat_pool_grammar_parity_fixture` /
     `nat_pool_bare_and_host_cidr_grammars_agree` for the F1 round-3 parser
-    parity.
+    parity, plus (round 4)
+    `reused_keys_reserve_budget_before_a_new_key_is_admitted_6812` /
+    `incremental_applies_cannot_creep_past_the_cap_6812` for the reservation,
+    `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` /
+    `TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` for the
+    same-tier tie-break, and
+    `TestLeadingZeroPoolMember{Upgrade,PeerSync}IsDiagnosable_6812` for the
+    tolerant-path diagnostic. The reuse and failed-pool guards assert a
+    PortAllocator CONSTRUCTION count (a thread-local `#[cfg(test)]` counter),
+    not just the final allocator's identity or word count — an end-state
+    assertion cannot see a bitmap that was built and discarded, which is the
+    exact behaviour those two rules exist to forbid.
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix
