@@ -165,20 +165,29 @@ func validateFlowTraceFlagsAndFiltersAST(nodes []*Node, prefix string, lenient b
 				toPath := joinNodePath(secPath, []string{"flow", "traceoptions"})
 
 				// flag tokens
+				//
+				// #6659: read EVERY value, not just the first. `flag` is a
+				// multi-value leaf, and reading it via nodeVal made this gate
+				// fail OPEN: `flag [ basic-datapath totally-bogus ]` validated
+				// only `basic-datapath` and committed clean, so an unknown flag
+				// in any slot but the first was never rejected — while the same
+				// one-sided read in the compiler silently dropped it. The two
+				// halves of the contract have to walk the same value set.
 				for _, flagNode := range toNode.FindChildren("flag") {
-					v := nodeVal(flagNode)
-					if v == "" || flowTraceImplementedFlags[v] {
-						continue
+					for _, v := range firewallMatchValues(flagNode) {
+						if v == "" || flowTraceImplementedFlags[v] {
+							continue
+						}
+						path := joinNodePath(toPath, []string{"flag"})
+						msg := fmt.Sprintf("%s: unknown flow trace flag %q "+
+							"(supported: basic-datapath, session)", path, v)
+						if lenient {
+							warnings = append(warnings, msg+
+								" (ignored: unknown flag dropped, defaults apply)")
+							continue
+						}
+						return fmt.Errorf("%s", msg)
 					}
-					path := joinNodePath(toPath, []string{"flag"})
-					msg := fmt.Sprintf("%s: unknown flow trace flag %q "+
-						"(supported: basic-datapath, session)", path, v)
-					if lenient {
-						warnings = append(warnings, msg+
-							" (ignored: unknown flag dropped, defaults apply)")
-						continue
-					}
-					return fmt.Errorf("%s", msg)
 				}
 
 				// packet-filter source/destination prefixes
@@ -692,9 +701,16 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 			}
 		}
 		for _, flagNode := range toNode.FindChildren("flag") {
-			if v := nodeVal(flagNode); v != "" {
-				to.Flags = append(to.Flags, v)
-			}
+			// #6659: `flag` is a multi-value leaf — `flag [ basic-datapath
+			// session ]` collapses onto Keys[1:] and `flag { basic-datapath;
+			// session; }` onto Children. nodeVal read only the FIRST value, so
+			// every flag after the first was silently dropped and the operator
+			// debugging a live problem got less tracing than they asked for
+			// with no diagnostic. Worse, the strict validator below
+			// (validateFlowTraceFlagsAndFiltersAST) read the same one side, so an
+			// UNKNOWN flag in any slot but the first committed CLEAN — a
+			// validation fail-open. firewallMatchValues accumulates both sides.
+			to.Flags = append(to.Flags, firewallMatchValues(flagNode)...)
 		}
 		for _, pfInst := range namedInstances(toNode.FindChildren("packet-filter")) {
 			pf := &TracePacketFilter{Name: pfInst.name}

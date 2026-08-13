@@ -66,4 +66,23 @@ func (c *xpfCollector) initNATDescriptors() {
 		"Total source NAT pool allocator exhaustion events in the userspace dataplane.",
 		[]string{"pool", "rule"}, nil,
 	)
+	c.userspaceSNATPoolLiveLockAcquisitionsTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_live_lock_acquisitions_total",
+		"Acquisitions of this source NAT pool's residual live-state mutex "+
+			"on the helper's production allocate/reserve/release/rollback/GC "+
+			"paths. The DENOMINATOR for the contended counter below: a "+
+			"contention rate is only interpretable against the acquisition "+
+			"rate that produced it. Excludes the status-poll snapshot, which "+
+			"reads these very counters (#4800).",
+		[]string{"pool", "rule"}, nil,
+	)
+	c.userspaceSNATPoolLiveLockContendedTotal = prometheus.NewDesc(
+		"xpf_userspace_source_nat_pool_live_lock_contended_total",
+		"Subset of source NAT pool live-state mutex acquisitions that found "+
+			"the mutex already held and had to block. Divided by "+
+			"..._live_lock_acquisitions_total this is the NAT allocator's "+
+			"share of new-flow-install serialization — the measurement the "+
+			"#2852 Phase-2 sharding decision is gated on (#4800).",
+		[]string{"pool", "rule"}, nil,
+	)
 }
