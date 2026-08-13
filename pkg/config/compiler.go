@@ -310,6 +310,24 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 		return nil, vlanMapErr
 	}
 
+	// #6662 / #6701 (#6706 review blocker): the `system login` packed-body and
+	// built-in-class-shadow gates, as BOTH-NODE-effective unions. Pre-expansion
+	// for the same reason as the #5878/#5879/#6178 gates above — a `groups
+	// node1` login body that only the PEER's `${node}` expansion selects is
+	// stripped before an expanded-view gate could see it, commits green on the
+	// origin, and reaches the standby through the tolerant sync path where it
+	// only warns. See compiler_system_login_gates.go.
+	loginPackedWarnings, loginPackedErr := validateLoginPackedStatementsAST(
+		tree, opts.lenientLoginPackedStatements)
+	if loginPackedErr != nil {
+		return nil, loginPackedErr
+	}
+	loginShadowWarnings, loginShadowErr := validateLoginClassShadowsBuiltinAST(
+		tree, opts.lenientLoginClassShadowsBuiltin)
+	if loginShadowErr != nil {
+		return nil, loginShadowErr
+	}
+
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -341,6 +359,15 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
+	cfg.Warnings = append(cfg.Warnings, loginPackedWarnings...)
+	cfg.Warnings = append(cfg.Warnings, loginShadowWarnings...)
+	// #6706: record that a `system login` path was authored packed, so the
+	// daemon can tell "RBAC never configured" from "RBAC configured and dropped"
+	// — both of which arrive here as System.Login == nil. Set from the BROADER
+	// detector, not from len(loginPackedWarnings): the reporting gate is silent
+	// for the short prefixes, and those are precisely the ones whose packed and
+	// nested spellings disagree about whether the CLI denies or permits.
+	cfg.System.LoginDroppedByPacking = loginPathPackedAnywhere(tree)
 	return cfg, nil
 }
 
@@ -358,8 +385,20 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // node-aware TOLERANT paths that compile an already-active / peer-synced
 // config the local operator did not just author: Store.SyncApply (HA
 // peer-sync ingress) and the read-only peer-interface display re-compiles
-// (cli_show_interfaces.go, server_show_interfaces.go). MUST NOT be used on
-// the candidate-commit path — see CompileConfigLenient.
+// (cli_show_interfaces.go, server_show_interfaces.go). MUST NOT be used to
+// decide whether a CANDIDATE commit is accepted — see CompileConfigLenient.
+//
+// ONE deliberate exception, and it does not weaken that rule (#6861 F3):
+// ValidatePeerEffectiveStrict (compiler_peer_effective.go) calls this from a
+// strict commit helper. It is not using the lenient compile as the acceptance
+// decision — it is using it to MODEL what the standby's tolerant SyncApply will
+// instantiate, and then re-imposes strictness by running
+// peerEffectiveStrictSubjects over the result. The candidate's own acceptance
+// still comes from the strict CompileConfig on the local view. Reading that
+// call as a violation and "fixing" it to the strict compiler would break the
+// peer gate: a peer view that will not strict-compile is exactly the case it
+// must inspect, and a compile error there is swallowed by its
+// `err != nil -> return nil` arm.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, lenientCompileOpts())
 }
@@ -463,6 +502,28 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 		return nil, vlanMapErr
 	}
 
+	// #6662 / #6701 (#6706 review blocker): the `system login` packed-body and
+	// built-in-class-shadow gates, as BOTH-NODE-effective unions. This is the
+	// site the blocker turned on: with the gates running post-expansion on the
+	// single local view, `groups node1 { system login ... }` + `apply-groups
+	// "${node}"` committed green on node 0 (the body was already stripped) and
+	// arrived at node 1 through Store.SyncApply, which is lenient and only
+	// warns — so the shadowing/packed body was live on the peer with no strict
+	// check anywhere. Evaluating BOTH node views here makes the verdict
+	// HA-symmetric: whichever node commits rejects it. Same doctrine as
+	// #5878/#5879/#6178 above, and the same argument
+	// compiler_peer_effective_snat.go (#5876) makes for source NAT.
+	loginPackedWarnings, loginPackedErr := validateLoginPackedStatementsAST(
+		tree, opts.lenientLoginPackedStatements)
+	if loginPackedErr != nil {
+		return nil, loginPackedErr
+	}
+	loginShadowWarnings, loginShadowErr := validateLoginClassShadowsBuiltinAST(
+		tree, opts.lenientLoginClassShadowsBuiltin)
+	if loginShadowErr != nil {
+		return nil, loginShadowErr
+	}
+
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {
 		return nil, fmt.Errorf("apply-groups: %w", err)
@@ -490,6 +551,15 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	cfg.Warnings = append(cfg.Warnings, unitAliasWarnings...)
 	cfg.Warnings = append(cfg.Warnings, qinqWarnings...)
 	cfg.Warnings = append(cfg.Warnings, vlanMapWarnings...)
+	cfg.Warnings = append(cfg.Warnings, loginPackedWarnings...)
+	cfg.Warnings = append(cfg.Warnings, loginShadowWarnings...)
+	// #6706: record that a `system login` path was authored packed, so the
+	// daemon can tell "RBAC never configured" from "RBAC configured and dropped"
+	// — both of which arrive here as System.Login == nil. Set from the BROADER
+	// detector, not from len(loginPackedWarnings): the reporting gate is silent
+	// for the short prefixes, and those are precisely the ones whose packed and
+	// nested spellings disagree about whether the CLI denies or permits.
+	cfg.System.LoginDroppedByPacking = loginPathPackedAnywhere(tree)
 	return cfg, nil
 }
 

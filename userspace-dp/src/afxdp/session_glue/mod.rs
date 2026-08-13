@@ -865,16 +865,113 @@ pub(super) fn apply_worker_commands(
 }
 
 
+/// #4800: calls to [`replicate_session_upsert`] (one per new flow), and the
+/// total number of `UpsertSynced` commands those calls enqueued — the
+/// second is `calls * sibling_worker_count`, so the ratio recovers the
+/// N-way fan-out multiplier without the analysis layer having to know the
+/// worker count out of band.
+pub(crate) static SESSION_REPLICATION_UPSERTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SESSION_REPLICATION_ENQUEUED: AtomicU64 = AtomicU64::new(0);
+
+/// #4800: sibling worker-queue mutex acquisitions in
+/// [`replicate_session_upsert`] that found the queue already held.
+///
+/// The denominator is `SESSION_REPLICATION_ENQUEUED`, which is incremented
+/// once per sibling IMMEDIATELY BEFORE that sibling's acquisition — so the
+/// pair is a ratio over acquisitions actually ATTEMPTED, at every instant and
+/// not merely once a call has returned. Booking the whole fan-out up front
+/// (the pre-fix order) understated contention by the sibling count for any
+/// scrape landing mid-call.
+pub(crate) static SESSION_REPLICATION_LOCK_CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+/// #4800: sum of the per-call deepest sibling-queue depth observed at
+/// replication push time. Divided by `SESSION_REPLICATION_UPSERTS` over the
+/// same window this is the MEAN worst-sibling depth per replicated flow —
+/// the queue-backlog statistic the analysis layer actually uses.
+///
+/// This exists because the high-water max below CANNOT be differenced. A
+/// process-lifetime `fetch_max` never falls, so across any window
+/// `after - before == 0` means either "no backlog" or "a backlog up to the
+/// previous all-time high" — ambiguous over the entire useful range — while
+/// the absolute value stays elevated forever after one spike. Reading the
+/// max as a window value made every cell after the first spike report a
+/// replication backlog, which is exactly the site the #2852 Phase-2
+/// decision turns on: a systematic bias toward the wrong answer. A SUM is
+/// differenceable by construction and carries no history into the next
+/// window.
+///
+/// Contention and depth remain distinct findings: contention says producers
+/// collided on the mutex, depth says the consuming worker is not draining as
+/// fast as producers enqueue. Different failures, different remedies.
+///
+/// Accumulated once per call (the max across this call's siblings) rather
+/// than once per enqueue, so the cost stays O(1) in the sibling count.
+pub(crate) static SESSION_REPLICATION_QUEUE_DEPTH_SUM: AtomicU64 = AtomicU64::new(0);
+
+/// #4800: high-water sibling-queue depth observed at replication push time
+/// (monotonic max, never reset).
+///
+/// OPERATOR GAUGE ONLY — "the deepest this queue has ever been since the
+/// helper started". It is deliberately NOT an input to any harness verdict:
+/// see `SESSION_REPLICATION_QUEUE_DEPTH_SUM` above for why a lifetime max
+/// cannot answer a per-window question. Do not wire it back into an
+/// attribution; `newflow_ceiling_analyze.py` has a guard test asserting it
+/// cannot produce a culprit.
+///
+/// Sampled once per call (the max across this call's siblings) rather than
+/// once per enqueue, so the cost is O(1) in the sibling count.
+pub(crate) static SESSION_REPLICATION_QUEUE_DEPTH_MAX: AtomicU64 = AtomicU64::new(0);
+
 pub(super) fn replicate_session_upsert(
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     entry: &SyncedSessionEntry,
 ) {
+    // #4800: in test builds only, hold the shared side of the counter lock for
+    // the whole fan-out, so a reading test excludes this mover without the
+    // caller having to opt in. The previous hand-written inventory had already
+    // missed two real movers (`coordinator::sync_worker_session_tables` and
+    // `promote::maybe_promote_synced_session`).
+    //
+    // This does NOT make the mover set closed: the `SESSION_REPLICATION_*`
+    // statics are `pub(crate)` and any module can bump one directly, and
+    // `worker_queue::lock_recover_counting` takes an arbitrary counter. It
+    // covers the movers reachable through today's call graph, which is a
+    // convention, not an invariant. See `afxdp::counter_test_lock`.
+    #[cfg(test)]
+    let _counter_guard = crate::afxdp::counter_test_lock::counter_mover_guard();
     let replica = synced_replica_entry(entry);
+    // #4800: two O(1) counter updates per call rather than per sibling.
+    SESSION_REPLICATION_UPSERTS.fetch_add(1, Ordering::Relaxed);
+    let mut deepest = 0u64;
     for commands in worker_commands {
+        // #4800: count this sibling's acquisition ATTEMPT immediately before
+        // making it, NOT the whole fan-out up front.
+        //
+        // Pre-booking `worker_commands.len()` here made the contention ratio
+        // structurally wrong for any scrape taken mid-call, which is every
+        // scrape under load. With 16 sibling queues and queue 0 held, the old
+        // order recorded 16 enqueues and 1 contended acquisition and then
+        // BLOCKED — a scrape in that window reports 6.25% contention, under the
+        // analyzer's 10% threshold, while 100% of the acquisitions actually
+        // attempted had blocked. The denominator counted work that had not been
+        // tried yet. Incrementing per iteration keeps `contended <= enqueued` a
+        // ratio over ATTEMPTED acquisitions at every instant, and leaves the
+        // at-rest value identical (every attempt completes), so the fan-out
+        // ratio `enqueued / upserts` is unchanged.
+        SESSION_REPLICATION_ENQUEUED.fetch_add(1, Ordering::Relaxed);
         // #1807: recover-and-push — `if let Ok` silently DROPPED the
         // UpsertSynced replica for a poisoned worker queue.
-        let mut pending = worker_queue::lock_recover(commands);
+        // #4800: ...and count the acquisitions that had to block.
+        let mut pending =
+            worker_queue::lock_recover_counting(commands, &SESSION_REPLICATION_LOCK_CONTENDED);
         pending.push_back(WorkerCommand::UpsertSynced(replica.clone()));
+        deepest = deepest.max(pending.len() as u64);
+    }
+    if deepest != 0 {
+        // The SUM is the differenceable statistic the harness reads; the MAX
+        // is the operator's all-time high-water and is never a verdict input.
+        SESSION_REPLICATION_QUEUE_DEPTH_SUM.fetch_add(deepest, Ordering::Relaxed);
+        SESSION_REPLICATION_QUEUE_DEPTH_MAX.fetch_max(deepest, Ordering::Relaxed);
     }
 }
 
@@ -1418,3 +1515,9 @@ pub(super) fn enforce_session_ha_resolution(
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+// #4800: publish + sibling-replication contention accounting for the
+// new-flow-install ceiling harness. Kept in its own file rather than
+// appended to `tests.rs` (already ~7k lines).
+#[cfg(test)]
+#[path = "newflow_contention_tests.rs"]
+mod newflow_contention_tests;

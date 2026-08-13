@@ -132,6 +132,43 @@ func runUniformGatesLogFeedRouting(tree *ConfigTree, cfg *Config, opts compileOp
 		}
 	}
 
+	// #6659: a multi-policy `routing-options forwarding-table export` chain.
+	// The leaf is declared `multi: true` and Junos accepts a chain, but the FRR
+	// renderer honours exactly one policy (resolveECMP derives ecmpMaxPaths from
+	// a single policy-statement). The compiler read the leaf with nodeVal, so a
+	// chain silently collapsed to the single value nodeVal selected AND the
+	// dropped names escaped the reference gate directly above — a dangling
+	// policy in slot 2 committed clean on the very scenario that gate exists to
+	// catch. The compiler now accumulates all values (so the gate above checks
+	// every one) and this gate rejects the multi-valued case so the collapse is
+	// loud instead of silent. Strict on commit / commit-check; lenient on load /
+	// peer-sync (warn — #1960; ForwardingTableExport still carries that same
+	// selected policy, so rendering on the tolerant path is exactly pre-#6659).
+	// Reuses lenientRoutingExportRef like the sibling gate above.
+	//
+	// #6673: this wrapper must NOT name a SLOT. It used to say "only the FIRST
+	// policy is honoured", which contradicts the error it wraps: the renderer
+	// uses the SELECTED policy, and across two top-level `routing-options` roots
+	// the last root wins, so `export p1` then `export p2` renders p2 while the
+	// wrapper claimed p1. The wrapped error already quotes the policy that takes
+	// effect; the wrapper defers to it. "AT MOST one", not "exactly one": the
+	// selected slot can be an authored blank (`export [ "" p1 p2 ];`), and then
+	// resolveECMP looks nothing up and NO policy renders.
+	if err := validateForwardingTableExportSingleStrict(cfg); err != nil {
+		if opts.lenientRoutingExportRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("routing-options forwarding-table export LIST FORM IS NOT SUPPORTED — "+
+					"the ECMP render honours AT MOST ONE policy (the one the wrapped "+
+					"error names — none at all when the selected value is empty) and "+
+					"the rest have no "+
+					"effect on load-balancing; configure one export policy (support for the Junos "+
+					"export policy CHAIN is tracked in #6674). Downgraded to a warning on the "+
+					"tolerant load / peer-sync path so an already-persisted config still boots: %v", err))
+		} else {
+			return err
+		}
+	}
+
 	// #2881: policy community cross-reference gate. A policy term's
 	// `from community <name>` (rendered `match community <name>`) and
 	// `then community delete <name>` (rendered `set comm-list <name> delete`,
