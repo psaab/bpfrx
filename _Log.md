@@ -77376,3 +77376,56 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #5103 F2 — bind the CALLER -> `programRethMemberMAC` boundary
+  behaviourally. Tests only; no production change.
+  The helper is bound (`reth_commit_fold_5103_test.go`) and the call site is
+  bound STRUCTURALLY (`reth_hook_wired_5103_test.go`: one call, `=` not `:=`,
+  two assignment targets, not under a constant-false branch). Nothing bound the
+  step between them — that the value the helper returns is still the value
+  `applyDataplaneAndHACore` reports. An AST canary cannot express reachability;
+  it can only say the call is WRITTEN, not that its result is CONSUMED. This
+  insertion satisfies every structural assertion and keeps the effect from
+  reaching production:
+
+      prevNetworkdErr6871 := networkdErr
+      networkdErr, needLinkCycleRecovery = d.programRethMemberMAC(
+          linuxName, mac, networkdErr, needLinkCycleRecovery)
+      networkdErr = prevNetworkdErr6871 // effect discarded
+
+  Measured under it: `go vet ./pkg/daemon/` rc=0, and the ENTIRE pre-existing
+  `pkg/daemon` suite rc=0 with ZERO failures — the AST canary included. The
+  escape was complete.
+  `reth_callsite_effect_5103_test.go` closes it by driving the REAL
+  `applyConfigLocked` body (no `applyBodyForTest` seam — the same approach
+  `apply_ctx_cancel_test.go` uses) with a one-member RETH config, the
+  `withRethOps` fake link forcing a cycle, and an `abortRecoveryTestDP` whose
+  `PrepareLinkCycle` fails. The observable is the apply's own returned error:
+  the abort is classified `errRethPrepareLinkCycle`, folded into the commit
+  accumulator, and handed to `applyTailReconciles`. Under the discard mutation
+  the full `pkg/daemon` suite now has exactly ONE failure, this guard, at
+  "the apply reported SUCCESS over a RETH member whose link cycle was ABORTED".
+  A `prepareCalls == 1` precondition runs first so a fixture that never reached
+  the hook fails loudly instead of passing vacuously.
+  The over-reach control is a SEPARATE top-level test (a control sharing a body
+  with its binder never runs once the binder fails): same fixture, join
+  SUCCEEDS, apply must return nil. It stays GREEN under the discard mutation
+  and would go RED if the guard were widened to "the apply errors whenever a
+  RETH member is processed".
+  Note on shape: an earlier round answered "the canary is defeatable" by
+  extracting the logic into a testable helper, which MOVED the unbound boundary
+  up to the caller rather than closing it — and arrived wearing the evidence of
+  a fix. This round binds the boundary itself rather than extracting again.
+  Adjacent sweep (no change made): every other bare-statement call in that loop
+  (`ensureRethLinkOriginalName`, `setRethIPv6Knobs`, `clearDadFailed`,
+  `removeAutoLinkLocal`, `ensureRethLinkLocal`, `setVLANSubAddrGenMode`,
+  `fixRethLinkFile`) returns NOTHING, so there is no result to discard, and
+  `renameRethMember`'s string IS consumed. The only other discarded result in
+  `applyDataplaneAndHACore` is `links, _ := netlink.LinkList()` at
+  `daemon_apply_dataplane.go:319` — pre-existing, untouched by this PR, and
+  reported separately.
+  Validation: `go build ./...` rc=0; `go vet ./pkg/daemon/` rc=0;
+  `go test ./pkg/daemon/...` rc=0 (both packages ok); `gofmt -l` clean.
+  Advances #5103.
+- **File(s)**: pkg/daemon/reth_callsite_effect_5103_test.go, _Log.md
