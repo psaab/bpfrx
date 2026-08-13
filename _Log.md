@@ -78799,3 +78799,46 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #5561 round 21b — the master merge was NOT semantically free, and
+  a clean textual merge hid it.
+
+  Merging master `4960e7bee` conflicted only on `_Log.md`, so the merge looked
+  free. The post-merge gate then failed DETERMINISTICALLY at `-count=2`:
+  `TestCLIResolvesThroughTheSharedEvaluator_5561` could no longer even reach
+  its assertions, because `Commit()` now refuses its fixture:
+
+      system login class super-user: "super-user" is a SYSTEM-DEFINED login
+      class, and the built-in definition always wins at runtime ... this
+      definition is INERT ... (#6701)
+
+  That fixture line was deliberate. It shadowed a built-in to give the
+  BEHAVIOURAL half teeth against the ordering a CLI-only inline special case
+  would get wrong, and its comment justified itself on the premise that "the
+  config path genuinely admits" the collision — schema_system.go validating
+  against built-ins UNION custom classes, compiler_system.go appending with no
+  collision check. **#6701 on master closed exactly that hole**, so the premise
+  is now false and the line cannot commit.
+
+  Removed the line and rewrote the comment to say why, rather than deleting it
+  silently: the ordering teeth are now unavailable BY CONSTRUCTION — with
+  shadowing refused at commit, no committable config can make the
+  built-ins-first order observable — and what remains binding is the
+  STRUCTURAL guard, which is the one that distinguishes sharing from an
+  equivalent copy in any case.
+
+  **Mutation re-proved after the change**, because editing a test invalidates
+  its earlier proof: re-applying the faithful-copy mutant to
+  `CLI.resolveClassPerms` still REDs
+  `TestCLIResolveClassPermsCallsSharedEvaluator_5561` at `-count=2`
+  ("contains 0 call(s) to config.ResolveClassPermissions, want exactly 1"),
+  and the behavioural half still passes under it — unchanged from round 20, so
+  the fixture removal cost nothing the structural guard was not already
+  carrying.
+
+  **Lesson worth keeping**: a fixture whose comment asserts a property of the
+  CONFIG LANGUAGE ("this collision is admitted") is a claim about code that
+  lives outside the test, and master can falsify it. This one announced its own
+  premise, which is the only reason the failure was diagnosable in one run.
+- **File(s)**: pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md

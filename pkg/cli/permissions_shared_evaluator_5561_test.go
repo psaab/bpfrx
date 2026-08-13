@@ -38,23 +38,29 @@ func TestCLIResolvesThroughTheSharedEvaluator_5561(t *testing.T) {
 		"set system login class noc-admin permissions all",
 		"set system login class viewer-plus permissions [ view clear ]",
 		"set system login class nothing-at-all permissions view",
-		// A custom class SHADOWING a built-in name, which the config path
-		// genuinely admits: schema_system.go validates `user ... class` against
-		// built-ins UNION custom classes, and compiler_system.go appends every
-		// parsed class with no collision check. It is the fixture that gives this
-		// test teeth against the ORDER a duplicated evaluator would get wrong.
+		// A custom class SHADOWING a built-in name used to be the fixture that
+		// gave this test teeth against the ORDER a duplicated evaluator would
+		// get wrong: config.ResolveClassPermissions checks BUILT-INS FIRST, so a
+		// `set system login class super-user permissions view` line left the
+		// shared answer at PermAll while a CLI-only inline special case — which
+		// keeps one syntactic shared call and so satisfies the structural guard
+		// below — would answer [view] and RED this test.
 		//
-		// config.ResolveClassPermissions checks BUILT-INS FIRST, so the shared
-		// answer for "super-user" is PermAll and this line changes nothing while
-		// the CLI routes through it. A plausible CLI-only special case — resolve
-		// config-defined classes inline, fall through to the shared evaluator
-		// otherwise — keeps ONE syntactic shared call and so passes the
-		// structural guard below, and passed the whole pkg/cli suite before this
-		// line existed. With it, the CLI answers [view] where the shared
-		// evaluator answers [all] and this test REDs. Without it, the two guards
-		// between them bind "the body calls the shared evaluator" but not "the
-		// answer comes from it".
-		"set system login class super-user permissions view",
+		// That line is GONE because it no longer commits. #6701 (on master,
+		// merged into this branch) rejects a login class shadowing a
+		// system-defined name at commit check, so the premise the fixture rested
+		// on — that "the config path genuinely admits" the collision, because
+		// schema_system.go validated against built-ins UNION custom classes and
+		// compiler_system.go appended with no collision check — is now false.
+		// Keeping the line makes Commit() fail and the test cannot run at all.
+		//
+		// The ordering teeth are therefore unavailable BY CONSTRUCTION, not
+		// merely unused: with shadowing refused at commit, no committable config
+		// can make the built-ins-first order observable. What remains binding is
+		// TestCLIResolveClassPermsCallsSharedEvaluator_5561 below, which is
+		// structural and is the guard that actually distinguishes sharing from
+		// an equivalent copy — the behavioural comparison here cannot, and does
+		// not claim to.
 	}
 	if _, err := store.LoadSet(strings.Join(sets, "\n")); err != nil {
 		t.Fatalf("LoadSet(): %v", err)
