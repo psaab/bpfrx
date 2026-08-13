@@ -457,6 +457,20 @@ func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {
 // and TestSecureTunnelAddsNothingToTheAdjudicatedSets caught it on the
 // multi-digit `st10.5` spelling: the tunnel resolved as unowned and re-entered
 // the ingress-adjudication set.
+//
+// The BASE row is not an alias for its unit row, and passing the base name for
+// the base row is not a lesser version of passing the unit ref (#6691 round
+// 7). The two rows carry DIFFERENT netdevs — `st5` and, under
+// `bind-interface st5.0`, `st5.0` — so they get different answers, and the
+// resolver is directional for exactly that reason: `bind-interface st5.0`
+// owns the `st5.0` row and not the `st5` row. Round 6 answered both the same
+// and a live NIC named `st5` lost its ingress adjudication and its RSS entry
+// to a VPN whose device is `st5.0`. Consequence to know: under the canonical
+// `bind-interface st0.0` the BASE row `st0` now reports false, and being zoned
+// it contributes its name to the name-keyed AF_XDP/RSS allowlist even though
+// no `st0` netdev exists — which is what origin/master does for it, and what
+// this allowlist already does for any zoned interface whose netdev is absent
+// (a `ge-0/0/9` with no card behaves identically). Both measured.
 func secureTunnelOwned(cfg *config.Config, ifName string) bool {
 	if cfg == nil {
 		return false

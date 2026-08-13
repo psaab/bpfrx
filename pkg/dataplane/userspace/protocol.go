@@ -277,6 +277,14 @@ type InterfaceSnapshot struct {
 	// as `st5` under a DIFFERENT device name; keying on the if_id alone set
 	// this flag on a NIC no VPN names, taking it out of the dataplane.
 	//
+	// "THIS ROW's device", and the row decides which name that is (#6691
+	// round 7). A UNIT row's netdev comes from the authored bind-interface,
+	// so `st5.0` is the xfrmi under either spelling. A BASE row's netdev is
+	// `LinuxIfName(ifName)` — literally `st5` — so it is the xfrmi only under
+	// a bare `bind-interface st5`. Round 6 compared only the base part of
+	// each name, which set this flag on the `st5` row for a VPN whose device
+	// is `st5.0`, and a live NIC lost its AF_XDP/RSS binding to it.
+	//
 	// Additive: an old Rust helper that does not know the field treats every
 	// interface as not-a-secure-tunnel, so an xfrmi would get an AF_XDP
 	// binding it cannot use — the #5619 GAP, which both planes' comments

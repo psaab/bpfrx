@@ -1,3 +1,153 @@
+## 2026-08-13 — #6691 round 7: the veto fired before ownership, and ownership was not directional
+
+- **Timestamp**: 2026-08-13 09:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR at `0e807ec1a` — two blocking
+  findings, both reproduced firsthand against `origin/master` as a control
+  before anything was changed.
+- **File(s)**: `pkg/config/xfrmi.go`, `pkg/dataplane/userspace/interfaces.go`,
+  `pkg/dataplane/userspace/protocol.go`,
+  `pkg/dataplane/userspace/secure_tunnel_binding_order_6691_test.go` (new),
+  `pkg/dataplane/userspace/secure_tunnel_unowned_resolution_6691_test.go`,
+  `userspace-dp/src/server/README.md`
+
+  **The diagnosis.** Round 6 got the DECOMPOSITION right and the EVALUATION
+  wrong. Splitting one key into two questions — ownership by the authored
+  spelling, the routing veto by if_id — is correct and stands; the questions
+  really are independent, because a device can be owned-but-not-created (a
+  collision) or created-but-not-this-ref's. What round 6 got wrong is that it
+  asked them in the wrong ORDER, and asked the first one SYMMETRICALLY.
+
+  **F1 — the collision veto fired before ownership was established.**
+  `secureTunnelBindingForRef` returned `secureTunnelIDCollision` from inside
+  the scan loop, so a collision between two spellings that name NEITHER of the
+  ref's devices still vetoed the ref. Measured through the REAL tolerant
+  compiler (`CompileConfigLenient` — the #2933 gate hard-rejects this at
+  commit, so the tolerant load / peer-sync path is the only way in, and it is
+  precisely the path the veto exists to govern) plus the real snapshot builder,
+  with `st5` stubbed live at ifindex 11:
+
+      set security ipsec vpn a bind-interface st05
+      set security ipsec vpn b bind-interface st0005
+      set interfaces st5 unit 0 family inet address 192.0.2.1/24
+
+  | measurement | origin/master | `0e807ec1a` | after |
+  |---|---|---|---|
+  | `SecureTunnelUnitNetdev("st5.0")` | n/a (no such function) | `("st5.0", true)` | `("", false)` |
+  | `st5.0` row netdev / ifindex | `st5` / 11 | `st5.0` / 0 | `st5` / 11 |
+  | RSS + AF_XDP allowlist | `[ge-0-0-0 st5]` | `[ge-0-0-0 st5 st5.0]` | `[ge-0-0-0 st5]` |
+
+  Both bindings derive if_id `0x50001` and neither creates a device called
+  `st5`, so their collision is real and routing will refuse both — it is simply
+  not `st5.0`'s collision. At a name on no box the row reports ifindex 0 and
+  `userspace-dp/src/filter/compiler.rs` skips `if iface.ifindex <= 0`: no
+  `filter input`, no per-unit CoS, no routing-instance binding, and the
+  junos-host deny scoped to a device that does not exist. The phantom `st5.0`
+  in the name-keyed allowlist is the other half.
+
+  **F2 — ownership was not directional.** The predicate compared BASES ONLY,
+  which is symmetric, and the relation is not: a DOTTED ref (`st5.0`) is a
+  logical unit that resolves through either authored spelling, while a BARE ref
+  (`st5`) is a base row whose netdev `snapshotLinuxName` sets to
+  `LinuxIfName(ifName)` — literally `st5` — so it is an xfrmi only under a bare
+  `bind-interface st5`. Measured with a real NIC `st5` at ifindex 11 carrying a
+  zoned unit 3, and a VPN binding `st5.0`:
+
+  | measurement | origin/master | `0e807ec1a` | after |
+  |---|---|---|---|
+  | `SecureTunnelNetdevForRef("st5")` | n/a | `("st5.0", true)` | `("", false)` |
+  | `st5` row `secureTunnel` / skipIngress | n/a / false | true / true | false / false |
+  | RSS + AF_XDP allowlist | `[ge-0-0-0 st5 st5.3]` | `[ge-0-0-0 st5.3]` | `[ge-0-0-0 st5 st5.3]` |
+
+  A live NIC removed from the dataplane by a VPN whose device is `st5.0` —
+  the same harm the round-6 `st05` finding describes, one spelling over. Note
+  what the master column says: `origin/master` carries NO secure-tunnel
+  exclusion arm at all (`userspaceSkipsIngressInterface` there has no
+  `iface.SecureTunnel` case), so both defects were introduced by this PR and
+  both fixes return these two configs to master's answers exactly.
+
+  **The decomposition was checked, not assumed.** The reviewer invited the
+  finding that these are not two independent questions. They are: with
+  `bind-interface st5` and `bind-interface st05` both present, `st5.0` HAS an
+  owner (`st5`) AND collides, and the veto must still fire — routing creates
+  neither device. That case is the negative control in the new test, and it is
+  why accumulating the collision across the whole loop (rather than dropping
+  the veto) is the fix. Both facts stay order-independent: `owner` is set by
+  any binding that names the ref, `collision` once two distinct names are seen,
+  and with no collision every claimant carries one name so `owner` is unique.
+
+  **Consequence accepted and stated, not hidden.** Under the canonical
+  `bind-interface st0.0`, the BASE row `st0` now reports `secureTunnel=false`,
+  and being zoned it contributes `st0` to the name-keyed AF_XDP/RSS allowlist
+  even though no `st0` netdev exists. Measured: `origin/master` does exactly
+  the same for that config, and the allowlist already behaves this way for any
+  zoned interface whose netdev is absent — a `ge-0/0/9` with no card is in it
+  on master too. It has no ifindex guard by design (it is consumed by name,
+  by `ethtool`), so this is a pre-existing property of that set rather than a
+  new class, and suppressing it would mean re-asserting that the `st0` row is
+  the xfrmi, which is the F2 defect.
+
+  **Mutation matrix — seven cells, each an exact revert edit on a clean tree,
+  restored and verified byte-identical by sha256; control green.** Scope
+  `./pkg/config/... ./pkg/dataplane/...`.
+
+  | cell | revert edit | result |
+  |---|---|---|
+  | A | none (control) | rc=0 |
+  | R7-M1 | collision verdict returned from inside the scan loop (round-6 order) | RED — `CollisionVetoRequiresAnOwner/neither name owns the ref` |
+  | R7-M2 | bare-ref arm `return !bindHasUnit` → `return true` (round-6 base-only compare) | RED — `BareRowRequiresTheBareSpelling/st5.0` |
+  | M1 | `SecureTunnelUnitNetdev` unowned arm → `(LinuxIfName(ref), true)` | RED — 3 tests / 5 subtests |
+  | M2 | ownership by if_id alone (drop the `bindInterfaceOwnsRef` call) | RED — 3 tests / 5 subtests |
+  | M3 | `snapshotLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M4 | `junosHostLinuxName` st arm moved AFTER `TunnelNameMap` | RED |
+  | M5 | `ResolveKernelIfName` st arm reverted to master | RED |
+
+  **Which cells now bind differently, checked rather than assumed** — a
+  reordering fix is exactly the kind that can retire an existing cell silently.
+
+  - **M1 GAINED a test and lost none.** Measured at `0e807ec1a` (both at this
+    scope and at the full `./...`) it REDs 2 tests / 4 subtests
+    (`TestUnownedStNameKeepsItsDataplaneRole` ×1,
+    `TestUnownedSecureTunnelUnitResolvesToItsRealDevice` ×3); after this round
+    it REDs those same 4 plus the new collision sub-test. A strict superset.
+  - **M2 likewise:** it kept `OwnershipRequiresTheAuthoredSpelling`
+    (`st05`/`st+5`/`st0000005`) and gained both new tests.
+  - **M3, M4, M5 are unchanged** — same single test each
+    (`OwnershipPrecedesTheTunnelNameMap` for M3/M4,
+    `ResolveKernelIfNameUsesTheAuthoredBindInterface/st0` for M5).
+  - **One existing cell now binds for a DIFFERENT reason.** In
+    `TestSecureTunnelAddsNothingToTheAdjudicatedSets`, the `dotted_st0_0`
+    spelling's BASE row `st0` used to be held out of the ingress set by the
+    secure-tunnel arm; it is now held out only by `Ifindex <= 0`, because that
+    fixture stubs `st0.0` and not `st0`. Two independent reasons before, one
+    now. The `bare_st0` spelling is unaffected — there the base row IS the
+    device, stubbed at ifindex 42, and the arm is the only thing excluding it.
+  - **Two fixtures were vacuous for the NEW properties and are annotated as
+    such rather than left to look like coverage:**
+    `TestSecureTunnelOwnershipRequiresTheAuthoredSpelling` carries ONE VPN (so
+    no collision is reachable and the ORDER is invisible in it) and only BARE
+    spellings (so the DIRECTION is invisible too).
+  - **`FailsClosedUnderCollision` / `FallsBackUnderCollision` keep their
+    verdicts but reach them by a new route:** ownership is now established
+    first and the veto applied after, so those two also prove the ref was in
+    scope, which they previously could not distinguish.
+
+  **A round-6 claim corrected.** The round-6 entry below records M1 as
+  "RED — 4 tests, 5 subtests". Re-measured at that exact commit it is 2 tests
+  / 4 subtests, at both the scoped and the full `./...` scope. The cell was
+  and is RED; the count was wrong.
+
+- **Validation**: `go build ./...` rc=0, `go vet ./...` rc=0, `go test ./...`
+  rc=0 (62 packages ok, zero failures — no flakes on this pass),
+  `cargo test --release` rc=0 (main target 4277 passed / 0 failed, the same
+  number the merge entry below records; 4401 across all 7 test binaries).
+  `origin/master` is unchanged at `edefb7570` and IS this branch's merge base,
+  so no merge was needed and `git merge-tree --write-tree` is clean. No Rust
+  source changed this round, so no `make generate` and no cluster smoke are
+  owed. The mutation matrix above ran at scope
+  `./pkg/config/... ./pkg/dataplane/...`; the M1 baseline comparison was taken
+  at both that scope and the full `./...` so the "superset" claim does not rest
+  on a narrower run.
+
 ## 2026-08-13 — #6691: merge master edefb7570; the only conflict was _Log.md
 
 - **Timestamp**: 2026-08-13 07:05 (fix/5619-ipsec-passthrough-zone-policy)

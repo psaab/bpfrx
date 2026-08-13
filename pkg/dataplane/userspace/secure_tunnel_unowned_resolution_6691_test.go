@@ -174,9 +174,16 @@ func TestUnownedSecureTunnelUnitResolvesToItsRealDevice(t *testing.T) {
 // commit-time rejection would brick a persisted or peer-synced config that
 // already carries the spelling (#1960).
 //
-// Fail-on-revert: drop the secureTunnelRefsNameOneDevice call from
+// Fail-on-revert: drop the bindInterfaceOwnsRef call from
 // secureTunnelBindingForRef (ownership by if_id alone) and every assertion in
 // the `st05` row goes RED.
+//
+// #6691 round 7: this fixture carries ONE VPN, so no if_id collision is ever
+// possible in it and the ORDER of the ownership and veto tests is invisible
+// here. TestSecureTunnelCollisionVetoRequiresAnOwner is where that order is
+// bound. Both spellings below are BARE, so the DIRECTION of ownership is
+// likewise invisible here; TestSecureTunnelBareRowRequiresTheBareSpelling
+// carries that.
 func TestSecureTunnelOwnershipRequiresTheAuthoredSpelling(t *testing.T) {
 	for _, tc := range []struct {
 		bindIface string

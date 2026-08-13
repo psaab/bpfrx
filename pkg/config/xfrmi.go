@@ -224,9 +224,9 @@ const (
 	secureTunnelIDCollision
 )
 
-// secureTunnelRefsNameOneDevice reports whether an authored `bind-interface`
-// string and an interface ref denote the SAME xfrmi unit. Callers must have
-// already established that the two derive the same if_id.
+// bindInterfaceOwnsRef reports whether the xfrmi device an authored
+// `bind-interface` string creates IS the device an interface ref denotes.
+// Callers must have already established that the two derive the same if_id.
 //
 // #6691: the if_id ALONE cannot answer this, which is the defect this exists to
 // close. XFRMIfNameAndID derives the index with strconv.Atoi, and Atoi erases a
@@ -239,22 +239,49 @@ const (
 // Commit does not stop this — ValidateSecureTunnelBindInterface only requires
 // if_id != 0, and `st05` is a perfectly good (if unusual) xfrmi name.
 //
-// Ownership is therefore decided on the BASE SPELLING, which is what the device
-// name is made of: pkg/routing/xfrm.go keys its desired set by
+// Ownership is therefore decided on the AUTHORED SPELLING, which is what the
+// device name is made of: pkg/routing/xfrm.go keys its desired set by
 // LinuxIfName(bindInterface), so `bind-interface st05` creates a device called
-// `st05` and NOTHING called `st5`. Comparing the authored bases directly is
+// `st05` and NOTHING called `st5`. Comparing the authored strings directly is
 // exact here because every base that reaches this point is `st` followed by an
 // optionally-signed decimal (secureTunnelIndex enforces it) and LinuxIfName —
 // which only rewrites `/` to `-` — is the identity on such a name.
 //
-// The unit does not need comparing: given equal if_ids and equal base
-// spellings, the indexes are equal, so `stIndex<<16 | unit+1` forces the units
-// equal too. That is also why a bare `st0` owns the ref `st0.0` (a bare st<N>
-// IS unit 0) while `st10` does NOT own `st10.5`.
-func secureTunnelRefsNameOneDevice(bindIface, ref string) bool {
-	bindBase, _, _ := strings.Cut(bindIface, ".")
-	refBase, _, _ := strings.Cut(ref, ".")
-	return bindBase == refBase
+// THE RELATION IS DIRECTIONAL, and #6691 round 7 is the round that got that
+// right. An earlier revision compared BASES ONLY, which is symmetric, and a
+// symmetric test cannot express "the device is `st5.0`, so the row named `st5`
+// is not it":
+//
+//   - A DOTTED ref (`st5.0`) is a LOGICAL UNIT. Its device is whatever spelling
+//     the operator authored, because a bare `st5` and an explicit `st5.0` are
+//     the same xfrmi under two names (pkg/routing/xfrm.go). Both authored
+//     spellings own it. The unit does not need comparing: given equal if_ids
+//     and equal bases the indexes are equal, so `stIndex<<16 | unit+1` forces
+//     the units equal too — which is why a bare `st0` owns `st0.0` while
+//     `st10` does NOT own `st10.5`.
+//   - A BARE ref (`st5`) is a BASE ROW, and a base row's netdev is the ref
+//     itself — snapshotLinuxName keeps `LinuxIfName(ifName)` for it and does
+//     NOT consult this resolver. So it is an xfrmi only when a VPN authored
+//     that exact bare name. `bind-interface st5.0` creates `st5.0` and nothing
+//     called `st5`, so it must not claim the `st5` row.
+//
+// Measured on the second half, with `bind-interface st5.0` and a real NIC
+// `st5` (nothing reserves the prefix) carrying a zoned unit 3: the base row
+// came back `LinuxName "st5"`, ifindex 11, `secureTunnel=true`, and `st5`
+// was ABSENT from the RSS/AF_XDP allowlist — the same live-NIC removal the
+// `st05` half above describes, one spelling over.
+func bindInterfaceOwnsRef(bindIface, ref string) bool {
+	bindBase, _, bindHasUnit := strings.Cut(bindIface, ".")
+	refBase, _, refHasUnit := strings.Cut(ref, ".")
+	if bindBase != refBase {
+		return false
+	}
+	if !refHasUnit {
+		// The base row's netdev IS the bare ref; only a bare authored
+		// spelling creates a device under that name.
+		return !bindHasUnit
+	}
+	return true
 }
 
 // SecureTunnelNetdevForRef returns the Linux netdev the xfrmi reconciler
@@ -305,14 +332,19 @@ func secureTunnelRefsNameOneDevice(bindIface, ref string) bool {
 //
 // OWNERSHIP AND THE COLLISION VETO ARE SEPARATE TESTS (#6691 round 6), because
 // they answer to different components. Ownership asks "is this ref THIS
-// device?" and is settled on the authored base spelling
-// (secureTunnelRefsNameOneDevice) — an if_id match alone let `bind-interface
-// st05` claim a NIC named `st5`. The veto asks "will routing create the device
-// at all?" and must stay keyed on the if_id, because that is the key
-// pkg/routing/xfrm.go collides on. Both are needed: drop the veto and a config
-// binding BOTH `st5` and `st05` would resolve `st5.0` to `st5`, a device
-// routing has already refused to create — the same divergence one spelling
-// over.
+// device?" and is settled on the authored spelling (bindInterfaceOwnsRef) — an
+// if_id match alone let `bind-interface st05` claim a NIC named `st5`. The veto
+// asks "will routing create the device at all?" and must stay keyed on the
+// if_id, because that is the key pkg/routing/xfrm.go collides on. Both are
+// needed: drop the veto and a config binding BOTH `st5` and `st05` would
+// resolve `st5.0` to `st5`, a device routing has already refused to create —
+// the same divergence one spelling over.
+//
+// AND THEY ARE ASKED IN THAT ORDER (#6691 round 7). Round 6 evaluated the veto
+// first, so a collision between two spellings that name NEITHER of the ref's
+// devices still vetoed the ref — see secureTunnelBindingForRef for the
+// measured counterexample. A veto is only the ref's to cast once something has
+// said the ref is in scope.
 func (c *Config) SecureTunnelNetdevForRef(ref string) (string, bool) {
 	dev, binding := c.secureTunnelBindingForRef(ref)
 	return dev, binding == secureTunnelBound
@@ -321,6 +353,38 @@ func (c *Config) SecureTunnelNetdevForRef(ref string) (string, bool) {
 // secureTunnelBindingForRef is the shared core of SecureTunnelNetdevForRef and
 // SecureTunnelUnitNetdev. It reports the owning device name (empty unless the
 // binding is secureTunnelBound) and which of the three states the ref is in.
+//
+// OWNERSHIP IS SETTLED BEFORE THE VETO IS CONSULTED, and the order is the
+// contract (#6691 round 7):
+//
+//	no name owner        -> unbound
+//	owner + collision    -> collision veto
+//	owner + no collision -> bound
+//
+// Round 6 answered the two questions in the opposite order — it returned
+// secureTunnelIDCollision from inside the loop, before anything had asked
+// whether the ref was in scope at all — and a veto that fires for a ref nobody
+// owns is a veto cast on someone else's device. Measured, through the real
+// lenient compiler (strict commit rejects the config under #2933, so this is
+// the tolerant load / peer-sync path the veto exists to govern):
+//
+//	set security ipsec vpn a bind-interface st05
+//	set security ipsec vpn b bind-interface st0005
+//	set interfaces st5 unit 0 family inet address 192.0.2.1/24
+//
+// Both bindings derive if_id 0x50001 and NEITHER names `st5`, yet the
+// collision branch fired and SecureTunnelUnitNetdev returned ("st5.0", true).
+// The `st5.0` row therefore reported the netdev `st5.0` — a name on no box, so
+// ifindex 0 — instead of collapsing onto the real NIC `st5` at ifindex 11: its
+// `filter input`, its per-unit CoS and its routing-instance binding never
+// installed, the junos-host deny was scoped to a device that does not exist,
+// and a phantom `st5.0` entered the AF_XDP/RSS allowlist.
+//
+// The collision must still be detected across the WHOLE loop rather than
+// short-circuited, so it is accumulated. That keeps the result a pure function
+// of the config: `owner` is set by any binding that names the ref, `collision`
+// once two distinct names have been seen, and both are order-independent (with
+// no collision every claimant carries the same name, so `owner` is unique).
 func (c *Config) secureTunnelBindingForRef(ref string) (string, secureTunnelBinding) {
 	if c == nil {
 		return "", secureTunnelUnbound
@@ -331,8 +395,9 @@ func (c *Config) secureTunnelBindingForRef(ref string) (string, secureTunnelBind
 	}
 	// claimant is the device name routing would create for this if_id; owner
 	// is the one that also NAMES this ref. They differ exactly in the `st05`
-	// vs `st5` case, which is the F2 defect.
+	// vs `st5` case, which is the round-6 F2 defect.
 	claimant, owner := "", ""
+	collision := false
 	for _, vpn := range c.Security.IPsec.VPNs {
 		if vpn == nil || vpn.BindInterface == "" {
 			continue
@@ -342,21 +407,23 @@ func (c *Config) secureTunnelBindingForRef(ref string) (string, secureTunnelBind
 			continue
 		}
 		if claimant != "" && name != claimant {
-			// Distinct names, one if_id: routing creates neither. Order of
-			// discovery does not matter — any iteration order reaches this
-			// branch once two distinct names have been seen, so the result is
-			// a pure function of the config.
-			return "", secureTunnelIDCollision
+			// Distinct names, one if_id: routing creates neither.
+			collision = true
 		}
 		claimant = name
-		if secureTunnelRefsNameOneDevice(vpn.BindInterface, ref) {
+		if bindInterfaceOwnsRef(vpn.BindInterface, ref) {
 			owner = name
 		}
 	}
 	if owner == "" {
 		// Either nothing derives this if_id at all, or something does but
-		// under a different base spelling — a device that is not this ref.
+		// under a spelling that names a DIFFERENT device — not this ref. A
+		// collision among those other spellings is not this ref's business:
+		// the devices routing refuses to create are theirs, not its.
 		return "", secureTunnelUnbound
+	}
+	if collision {
+		return "", secureTunnelIDCollision
 	}
 	return owner, secureTunnelBound
 }

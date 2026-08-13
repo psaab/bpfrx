@@ -225,13 +225,31 @@ agree because both derive names and if_ids through `config.XFRMIfNameAndID` and
 both treat one if_id claimed by two distinct names as unresolvable. A shared
 derivation, not a shared function.
 
-Ownership is decided on the AUTHORED BASE SPELLING, not on the if_id alone
+Ownership is decided on the AUTHORED SPELLING, not on the if_id alone
 (#6691 round 6). `strconv.Atoi` erases a leading `+` and leading zeros, so
 `st5`, `st05` and `st+5` all derive if_id `0x50001` under three DIFFERENT device
 names — and routing creates the device under the authored name. Keying on the
 if_id alone let `bind-interface st05` claim a wildcard-authored NIC named `st5`
 and strip it of its binding. The if_id is still what the COLLISION veto keys
 on, because that is the key routing collides on.
+
+That comparison is DIRECTIONAL, and the two questions are asked in a fixed
+order (#6691 round 7):
+
+    no name owner        -> unbound
+    owner + collision    -> collision veto
+    owner + no collision -> bound
+
+A DOTTED ref (`st5.0`) is a logical unit and resolves through either authored
+spelling, because a bare `st5` and an explicit `st5.0` are one xfrmi under two
+names. A BARE ref (`st5`) is a base row whose netdev is literally `st5`, so it
+is a secure tunnel only when a VPN authored that exact bare name — round 6
+compared bases only, and `bind-interface st5.0` therefore claimed the `st5`
+row and stripped a live NIC of its binding. Ordering matters for the same
+reason: round 6 returned the collision verdict before ownership had been
+established, so two spellings colliding on an if_id (`st05` and `st0005`)
+vetoed `st5.0` even though neither of them creates a device called `st5`, and
+the unit row named a netdev that exists on no box.
 
 **The NAME of an unbound `st` interface is unchanged from the merge base.** A
 round-5 revision of this section claimed `snapshotLinuxName` now returns `st0.0`
