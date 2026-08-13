@@ -69945,3 +69945,54 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6812 S1 — bind the production budget WIRING (the cap was enforced
+  only in tests that injected their own budget), plus an S3 doc sentence.
+  Every behavioural test in `tests_aggregate_budget.rs` drives
+  `parse_source_nat_rules_with_budget(.., &TEST_BUDGET)` — an injected budget.
+  Production calls `parse_source_nat_rules_with_previous`, which forwards
+  `&SOURCE_NAT_AGGREGATE_BUDGET`. Nothing bound THAT. Measured: leaving the
+  constant untouched (so `real_budget_matches_go_5877_constants` still passes)
+  and replacing only the budget the production entry forwards with an infinite
+  one left `cargo test --release --bins nat::` at 273 passed, 0 failed — ZERO
+  failures. The parity test asserts the constant's VALUES; the `admitted_with`
+  tests call the arithmetic directly; neither observes that production USES it.
+  Cap logic bound, cap wiring unbound — the same caller/callee split as #5103
+  F2.
+  `production_entry_enforces_the_real_pool_count_budget_6812` drives the
+  PRODUCTION entry with 1025 single-address pools and asserts the 1025th comes
+  back `OverBudget`. Under the severed-wiring mutation it is the ONLY failure in
+  the module: `left: None, right: Some(OverBudget)`.
+  Axis choice is deliberate and recorded in the test body: the fixture crosses
+  `max_pools` (1024), NOT `max_port_capacity` (2^33). Crossing port capacity
+  honestly would materialise ~8.6e9 occupancy slots — a test that gets deleted
+  for being slow, and a guard nobody runs is not a guard. Pool count crosses a
+  REAL budget for ~10,240 occupancy bits total, and `max_addresses` /
+  `max_port_capacity` stay far below their limits so the refusal cannot be
+  attributed to another axis.
+  Two preconditions run BEFORE the discriminator: the production entry returned
+  one rule per snapshot (a fixture that never entered the path would otherwise
+  pass silently — the same class as the defect being closed), and the first
+  pool is healthy (proving the refusal is a BUDGET refusal, not a wholesale
+  parse failure).
+  `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` is the
+  over-reach control in its OWN body — a control sharing a body with its binder
+  never runs once the binder fails. Exactly 1024 pools must ALL install. It
+  stays GREEN under the severed-wiring mutation and reds on an off-by-one in
+  the first-fit accounting or a production entry forwarding a SMALLER budget.
+  S3 (doc only): the `SourceNatAggregateBudget` doc now states precisely what
+  is bounded and why the ordering is right. The budget runs AFTER the parse
+  loop, so address vectors are already expanded and only the occupancy BITMAP
+  is gated — deliberate, because the bitmap is the exhaustion vector by ~3
+  orders of magnitude (a full-range /16 pool: ~262 KB as addresses vs ~528 MB
+  as bitmap). Recorded so the next reader does not "fix" the ordering on the
+  theory that the guard sits downstream of the growth it limits.
+  NOT addressed here (S2, filed separately): `nat64.rs:940` constructs a second
+  production `PortAllocator` (`pool_v4.len()` x 64512 fixed slots) with no
+  aggregate budget, and the Go #5877 gate body carries no `nat64` reference —
+  uncovered on both planes.
+  Validation: `cargo build --release` rc=0; `cargo test --release --bins nat::`
+  275 passed, 0 failed. Advances #6812.
+- **File(s)**: userspace-dp/src/nat/tests_aggregate_budget.rs,
+  userspace-dp/src/nat/source.rs, _Log.md

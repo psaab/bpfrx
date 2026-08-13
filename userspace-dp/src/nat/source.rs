@@ -390,6 +390,19 @@ impl SourceNatRule {
 /// every pool and built each address's occupancy bitmap EAGERLY — three
 /// full-range /16 pools materialise 12,683,575,296 bitmap bits (~1.48 GiB)
 /// and can stall or OOM the dataplane during an upgrade boot / HA convergence.
+///
+/// WHAT THIS BOUNDS, precisely, because the ordering invites a wrong reading:
+/// the budget is checked in `resolve_pool_allocators`, which runs AFTER the
+/// parse loop — so the pools' ADDRESS VECTORS (`pool_addresses_v4/v6`) are
+/// already expanded when it runs, and only the per-address occupancy BITMAP is
+/// gated (`PortAllocator::new` is reached solely from the `admitted_with(..) ==
+/// Some` arm). That is deliberate and it is the right split: the bitmap is the
+/// exhaustion vector by roughly three orders of magnitude. A full-range /16
+/// pool costs 65536 x 4 B = ~262 KB as addresses against 65536 x 64512 bits =
+/// ~528 MB as bitmap. Bounding the address vectors too would mean restructuring
+/// the parse loop to defer expansion, for ~0.05% of the memory. Do not "fix"
+/// the ordering on the theory that the guard sits downstream of the growth it
+/// limits — for the quantity that matters it sits upstream (#6812).
 /// The values MUST match the Go constants
 /// (`MaxSourceNATPoolCount` / `MaxSourceNATAggregatePoolAddresses` /
 /// `MaxSourceNATAggregatePortCapacity`); the parity is pinned by

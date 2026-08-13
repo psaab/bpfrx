@@ -44,6 +44,7 @@ use super::allocator::TranslatedTuple;
 use super::source::{
     SOURCE_NAT_AGGREGATE_BUDGET, SourceNatAggregateBudget, SourceNatAggregateUse,
     SourceNatFailureReason, parse_source_nat_rules_with_budget,
+    parse_source_nat_rules_with_previous,
 };
 use super::*;
 use crate::SourceNATRuleSnapshot;
@@ -383,5 +384,139 @@ fn real_budget_matches_go_5877_constants() {
         3 * 4_227_858_432u64,
         12_683_575_296,
         "the review's 12,683,575,296-bit (~1.48 GiB) figure is the pre-fix sum this gate now refuses"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #6812 F-Q3: bind the PRODUCTION budget WIRING, not just the budget logic.
+//
+// Every test above drives `parse_source_nat_rules_with_budget` with
+// `TEST_BUDGET` — an injected, scaled-down budget. Production calls
+// `parse_source_nat_rules_with_previous`, which passes
+// `&SOURCE_NAT_AGGREGATE_BUDGET`. Nothing bound THAT. Measured before these
+// tests existed: leaving the constant untouched (so
+// `real_budget_matches_go_5877_constants` still passes) and replacing only the
+// budget the production entry forwards with
+// `SourceNatAggregateBudget { max_pools: u64::MAX, max_addresses: u64::MAX,
+// max_port_capacity: u64::MAX }` left `cargo test --release --bins nat::` at
+// 273 passed, 0 failed — ZERO failures. The real budget could be swapped for an
+// infinite one and the suite did not notice, because the parity test asserts
+// the constant's VALUES and the `admitted_with` tests call the arithmetic
+// directly; neither observes that production USES it.
+//
+// WHY THE POOL-COUNT AXIS. These two cross the real budget by DISTINCT POOL
+// COUNT (`max_pools` = 1024), not by port capacity. Crossing
+// `max_port_capacity` (2^33) honestly would mean materialising ~8.6 billion
+// occupancy slots in a unit test — a test that is eventually deleted for being
+// slow, and a guard nobody runs is not a guard. Pool count crosses a REAL
+// budget exactly and costs almost nothing: 1024 single-address pools over a
+// 10-port range is ~10,240 occupancy bits total. Do not "improve" these into
+// the port-capacity form. `max_addresses` (1,048,576) and `max_port_capacity`
+// stay far below their limits here, so the ONLY budget these fixtures cross is
+// the pool count — the refusal cannot be attributed to another axis.
+
+/// One pool-mode rule per distinct pool, each a single /32 with a 10-port
+/// range: 1 pool + 1 address + 10 port slots of charge apiece.
+fn one_address_pool_snaps_6812(count: usize) -> Vec<SourceNATRuleSnapshot> {
+    (0..count)
+        .map(|i| {
+            let addr = format!("10.{}.{}.1/32", (i / 256) & 0xff, i % 256);
+            pool_snap(
+                &format!("r{i}"),
+                &format!("p{i}"),
+                &[addr.as_str()],
+                10_000,
+                10_009,
+            )
+        })
+        .collect()
+}
+
+/// #6812 FAIL-ON-REVERT for the WIRING: the production entry must enforce the
+/// REAL `SOURCE_NAT_AGGREGATE_BUDGET`, not merely be capable of enforcing some
+/// budget handed to it.
+///
+/// RED when the budget the production entry forwards is widened (the severed-
+/// wiring mutation above): the 1025th pool is admitted and its rule comes back
+/// healthy instead of `OverBudget`.
+#[test]
+fn production_entry_enforces_the_real_pool_count_budget_6812() {
+    let over = SOURCE_NAT_AGGREGATE_BUDGET.max_pools as usize + 1; // 1025
+    let snaps = one_address_pool_snaps_6812(over);
+
+    // The PRODUCTION entry — no injectable budget. This is the whole point.
+    let rules =
+        parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default());
+
+    // --- PRECONDITION 1: the production path was actually entered and
+    // returned a rule per snapshot. A fixture that never reached
+    // parse_source_nat_rules_with_previous would otherwise pass silently —
+    // the same class as the defect being closed here.
+    assert_eq!(
+        rules.len(),
+        over,
+        "the production entry did not return one rule per snapshot, so the fixture \
+         never drove the path under test"
+    );
+
+    // --- PRECONDITION 2: pools BELOW the cap are healthy. This proves the
+    // refusal below is a BUDGET refusal and not a wholesale parse failure
+    // (a malformed fixture would fail every rule, and the reason assertion
+    // would then be reporting something else entirely).
+    assert!(
+        rules[0].pool_failure.is_none(),
+        "the first pool — far below every budget — failed with {:?}; the fixture is \
+         malformed, so a refusal further down would prove nothing about the budget",
+        rules[0].pool_failure
+    );
+
+    // --- THE DISCRIMINATOR: the pool that crosses max_pools is refused, and
+    // refused for the BUDGET reason specifically.
+    assert_eq!(
+        rules[over - 1].pool_failure,
+        Some(SourceNatFailureReason::OverBudget),
+        "the {over}th distinct pool was admitted past the real \
+         SOURCE_NAT_AGGREGATE_BUDGET.max_pools ({}); the production entry is not \
+         forwarding the real budget, so the cap is enforced only in tests that \
+         inject their own",
+        SOURCE_NAT_AGGREGATE_BUDGET.max_pools
+    );
+}
+
+/// #6812 OVER-REACH CONTROL, deliberately its own test body — a control that
+/// shares a body with its binder never runs once the binder fails, so it can
+/// never be observed to hold independently.
+///
+/// A config sitting exactly AT the pool-count budget must install completely.
+/// This fails for its own reason: an off-by-one in the first-fit accounting, or
+/// a production entry forwarding a budget SMALLER than the real one, refuses
+/// the 1024th pool and reds here while leaving the binder above green. It stays
+/// GREEN under the severed-wiring mutation (which only ever admits more), which
+/// is what makes it a control rather than a restatement of the binder.
+#[test]
+fn production_entry_admits_a_config_at_the_real_pool_count_budget_6812() {
+    let at = SOURCE_NAT_AGGREGATE_BUDGET.max_pools as usize; // 1024
+    let snaps = one_address_pool_snaps_6812(at);
+
+    let rules =
+        parse_source_nat_rules_with_previous(&snaps, None, &NatCounterStore::default());
+
+    assert_eq!(
+        rules.len(),
+        at,
+        "the production entry did not return one rule per snapshot, so this control \
+         is not controlling for anything"
+    );
+    let refused: Vec<&str> = rules
+        .iter()
+        .filter(|r| r.pool_failure == Some(SourceNatFailureReason::OverBudget))
+        .map(|r| r.pool_name.as_str())
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "a config sitting exactly AT the pool-count budget had {} pool(s) refused \
+         ({:?}...): the cap is rejecting configs it must admit",
+        refused.len(),
+        &refused[..refused.len().min(3)]
     );
 }
