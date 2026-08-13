@@ -309,6 +309,46 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "session_publish_errors_total", default)]
     pub session_publish_errors_total: u64,
+    /// #4800: cross-worker contention accounting for the per-new-flow
+    /// install path, so a connection-rate run can name the saturated
+    /// synchronization point instead of inferring one from a flattened
+    /// new-flows/sec curve.
+    ///
+    /// Read as pairs: `..._lock_contended_total / ..._lock_acquisitions_total`
+    /// is the publish leg's blocked fraction, and
+    /// `session_replication_lock_contended_total / session_replication_enqueued_total`
+    /// the replication leg's. `session_replication_enqueued_total /
+    /// session_replication_upserts_total` recovers the N-way sibling
+    /// fan-out. `session_replication_queue_depth_max` is a monotonic
+    /// high-water gauge, not a counter — do not `rate()` it.
+    ///
+    /// The NAT-allocator leg is per pool and rides `source_nat_pools`
+    /// (`live_lock_acquisitions_total` / `live_lock_contended_total`)
+    /// rather than these process-global fields. All additive / defaulted
+    /// for backward compatibility.
+    #[serde(rename = "shared_session_publishes_total", default)]
+    pub shared_session_publishes_total: u64,
+    #[serde(rename = "shared_session_publish_lock_acquisitions_total", default)]
+    pub shared_session_publish_lock_acquisitions_total: u64,
+    #[serde(rename = "shared_session_publish_lock_contended_total", default)]
+    pub shared_session_publish_lock_contended_total: u64,
+    #[serde(rename = "session_replication_upserts_total", default)]
+    pub session_replication_upserts_total: u64,
+    #[serde(rename = "session_replication_enqueued_total", default)]
+    pub session_replication_enqueued_total: u64,
+    #[serde(rename = "session_replication_lock_contended_total", default)]
+    pub session_replication_lock_contended_total: u64,
+    /// #4800: sum of the per-call deepest sibling-queue depth. Divided by
+    /// `session_replication_upserts_total` over the same window this is the
+    /// MEAN worst-sibling depth per replicated flow — the differenceable
+    /// backlog statistic. The `_max` below is a process-lifetime high-water
+    /// that CANNOT be differenced (it never falls, so a zero delta is
+    /// ambiguous and the absolute value stays elevated forever after one
+    /// spike) and is therefore operator context only, never a verdict input.
+    #[serde(rename = "session_replication_queue_depth_sum", default)]
+    pub session_replication_queue_depth_sum: u64,
+    #[serde(rename = "session_replication_queue_depth_max", default)]
+    pub session_replication_queue_depth_max: u64,
     /// #2244: total failed `dnat_table` reverse-SNAT BPF-map publishes
     /// summed across worker bindings. The `dnat_table` is the reverse
     /// lookup the embedded-ICMP NAT path consults to map an inbound ICMP

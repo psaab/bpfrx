@@ -105,6 +105,8 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 	}
 
 	// proxy-arp { interface <name> { address <addr>; } }
+	//
+	// proxyARPAddressValues is defined below compileNAT (see #6659).
 	if err := forEachChild(node.Children, "proxy-arp", func(proxyNode *Node) error {
 		for _, inst := range namedInstances(proxyNode.FindChildren("interface")) {
 			entry := &ProxyARPEntry{Interface: inst.name}
@@ -137,8 +139,33 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 					}
 				}
 
-				// Single address
-				if v := nodeVal(prop); v != "" {
+				// Single address, or a bracket / block LIST of addresses
+				// (#6659). `address [ 192.0.2.1 192.0.2.2 ]` collapses onto
+				// Keys[1:] and `address { 192.0.2.1; 192.0.2.2; }` onto
+				// Children; nodeVal read only the first, so every address
+				// after the first silently got NO proxy-ARP entry — the
+				// firewall answered ARP for one address of the authored set and
+				// stayed silent for the rest, so inbound traffic to them was
+				// never drawn to this box.
+				//
+				// The DROP itself is a pure value-drop, not a validation
+				// fail-open. But restoring the tail changes what a malformed
+				// address does: it used to be discarded at compile, and it now
+				// MATERIALISES into Addresses, where the installer
+				// (pkg/dataplane/proxyarp.go) fails netip.ParsePrefix, logs a
+				// bounded warning and skips it — a silently-inert entry. Before
+				// #6659 proxy-ARP addresses carried NO commit-time validator at
+				// all, so a malformed address in the FIRST slot committed clean
+				// too. Widening a read requires widening its validator in the
+				// same change, so validateProxyARPAddressesStrict now checks
+				// EVERY value with the installer's own parse (strict rejects,
+				// tolerant warns — see compiler_uniformgates_firewall_nat2.go).
+				//
+				// Read via proxyARPAddressValues rather than firewallMatchValues
+				// so a MALFORMED range that fell through the two branches above
+				// does not widen at all: it keeps master's single-value read,
+				// which is what the dataplane installed before #6659 (#6673).
+				for _, v := range proxyARPAddressValues(prop) {
 					addr := v
 					if !strings.Contains(addr, "/") {
 						addr += "/32"
@@ -154,6 +181,173 @@ func compileNAT(node *Node, sec *SecurityConfig) error {
 	}
 
 	return nil
+}
+
+// proxyARPAddressValues extracts every address a proxy-arp `address` node
+// carries, across BOTH parser AST shapes (#6659 — the proxy-ARP instance of the
+// #2419 dual-shape class):
+//
+//   - single      `address 192.0.2.1;`            → Keys=["address","192.0.2.1"]
+//   - bracket     `address [ 192.0.2.1 .2 ];`     → Keys=["address",".1",".2"]
+//     (the lexer strips `[`/`]`, so the list collapses onto ONE node's Keys)
+//   - block       `address { 192.0.2.1; .2; }`    → one child leaf per address
+//
+// It differs from firewallMatchValues in exactly one way: A MALFORMED RANGE
+// DOES NOT WIDEN. The caller handles `address <low> to <high>` in two earlier
+// branches, but those `continue` only on a WELL-FORMED range; a malformed one —
+// a `to` child with an empty endpoint, a bracket that leads with the keyword
+// (`address [ to 192.0.2.1 ]`), a `to` anywhere past the range slot
+// (`address [ .1 .2 to .9 ]`), or a range riding on a BLOCK child's own Keys
+// (`address { .1; .2 to .9; }`) — falls through to here. For those, this helper
+// returns master's single-value read (nodeVal) and nothing else.
+// proxyARPMalformedRange decides that, and it decides it over the statement's
+// whole token stream rather than a list of positions — see its comment for why
+// the position list is what kept failing.
+//
+// #6673: the reason is INSTALLATION parity, not compile-verdict parity, and the
+// earlier "skip the `to` token" spelling got the second without the first.
+// Measured against origin/master with the installer's own gate
+// (netip.ParsePrefix, pkg/dataplane/proxyarp.go), for `address [ to 192.0.2.1 ]`
+// master compiled ["to/32"] and installed NOTHING, while the token-skip
+// spelling compiled ["192.0.2.1/32"] and installed an NTF_PROXY neighbour plus
+// the interface proxy responder. The appliance answered ARP for the orphan high
+// endpoint of a malformed range — an address master never claimed. Same for
+// `address { to; 192.0.2.5; }` (master {}, skip-spelling {192.0.2.5/32}) and,
+// worse, for `address [ .1 .2 to .9 ]`, where the skip spelling installed .2 and
+// .9 on top of master's .1.
+//
+// Falling back to nodeVal makes that exact: for a malformed range this helper
+// yields master's compiled value, minus the bare keyword — and "to/32" is the
+// one value master compiled that could never install. Dropping the keyword
+// instead of emitting it also keeps the accept/reject verdict identical: #6659
+// added validateProxyARPAddressesStrict, which parses every value with
+// netip.ParsePrefix, so materialising "to/32" would HARD-REJECT at strict
+// commit a config master accepted — an invented rejection, the other failure
+// mode this must avoid.
+//
+// SCOPE OF THE PARITY CLAIM, stated narrowly because an earlier revision of
+// this comment asserted a universal the code did not have. What is measured, by
+// compiling a corpus of proxy-arp `address` spellings on this tree and on
+// origin/master and filtering both through the installer's own
+// netip.ParsePrefix gate: for every spelling in that corpus whose token stream
+// contains a `to`, installed(head) == installed(master), in both directions —
+// nothing promoted, and nothing that master answered ARP for gone inert. That
+// is a claim about a corpus plus a detector that provably sees every `to`, NOT
+// a proof over all inputs.
+//
+// The RESIDUAL, which is deliberate: the veto is per STATEMENT, so a malformed
+// range suppresses the #6659 widening for the whole statement it appears in —
+// `address { .1; .2 to .9; 198.51.100.1; }` yields .1 alone, dropping the
+// well-formed 198.51.100.1 authored beside the broken range. That is exactly
+// what master installs, and exactly what the already-shipped bracket form does
+// (`address [ .1 .2 to .9 ]` → .1), so it keeps the two spellings consistent
+// and preserves parity; per-CHILD vetoing would instead install an address
+// master never claimed, which is the regression this whole arm exists to
+// prevent. Separate `address` statements are separate nodes, so a malformed one
+// never suppresses a well-formed SIBLING STATEMENT — only its own operands.
+//
+// Not fixed here, and pre-existing on both trees: a block-form range does not
+// EXPAND (`address { .1 to .9; }` compiles .1 alone on master and on this
+// tree). Making it expand is a behaviour change to the compiler's range
+// handling, not a parity fix, so it is out of this arm's scope.
+//
+// The #6659 widening is untouched where it belongs: a WELL-FORMED list
+// (`address [ .1 .2 ]`, `address { .1; .2; }`) still contributes every value,
+// which is the fail-open this arm was widened to fix. Pinned by
+// TestProxyARPAddresses6673MalformedRangeInstallsExactlyWhatMasterInstalled.
+func proxyARPAddressValues(prop *Node) []string {
+	// A malformed range keeps master's single-value read. nodeVal is master's
+	// exact reader (Keys[1], else the first child's name), so the only value
+	// dropped here is the grammar keyword itself.
+	if proxyARPMalformedRange(prop) {
+		if v := nodeVal(prop); v != "" && v != proxyARPRangeKeyword {
+			return []string{v}
+		}
+		return nil
+	}
+	var vals []string
+	for _, k := range prop.Keys[1:] {
+		if k != "" {
+			vals = append(vals, k)
+		}
+	}
+	for _, vn := range prop.Children {
+		if len(vn.Keys) >= 1 && vn.Keys[0] != "" {
+			vals = append(vals, vn.Keys[0])
+		}
+	}
+	return vals
+}
+
+// proxyARPRangeKeyword is the `address <low> to <high>` range separator.
+const proxyARPRangeKeyword = "to"
+
+// proxyARPMalformedRange reports whether a proxy-arp `address` STATEMENT that
+// REACHED the caller's single/list branch still carries a range keyword
+// anywhere in its token stream. Both well-formed range shapes are consumed and
+// `continue`d before that point, so a surviving `to` means the statement is a
+// broken range rather than a list of addresses (#6673).
+//
+// This deliberately does NOT enumerate the positions a `to` can occupy. Two
+// earlier spellings did, and each shipped a live regression at the first
+// position the enumeration had not anticipated:
+//
+//   - the first checked only prop.Keys[1:], and missed `address { to; .5; }`;
+//   - the second added Children[i].Keys[0], and missed the BLOCK form
+//     `address { .1; .2 to .9; }`, where the range rides on a child's OWN Keys
+//     (Children[1].Keys = [".2","to",".9"]) so Keys[0] is the address and the
+//     `to` at Keys[1] is invisible.
+//
+// Measured, the parser puts a `to` in at least four distinct places for this
+// one statement — prop.Keys[n], Children[i].Keys[0], Children[i].Keys[n>0]
+// (`address { .1 .2 to .9; ... }`), and Children[i].Children[j].Keys[0]
+// (`address { .1 { to .9; } ... }`, which nests arbitrarily deep). Enumerating
+// them is a losing game, so this walks the whole subtree the parser built for
+// this ONE statement and asks whether the range keyword is among its tokens.
+// That is position-independent by construction: every token the parser keeps
+// lands in some node's Keys within this subtree, so no shape — present or
+// future, hierarchical, bracketed or flat-set — can hide a `to` from it.
+//
+// It cannot false-positive on a well-formed list either: "to" is not a
+// parseable address, so an `address` statement whose tokens include it is
+// malformed no matter which slot it sits in.
+func proxyARPMalformedRange(prop *Node) bool {
+	// prop.Keys[0] is the statement keyword itself — the caller reaches here
+	// only for a node whose Name() is "address" — so the root scan starts at 1.
+	// Every DEEPER node's Keys[0] is a value slot (that is where
+	// `address { to; ... }` puts the keyword), so those scan from 0.
+	for _, k := range prop.Keys[1:] {
+		if k == proxyARPRangeKeyword {
+			return true
+		}
+	}
+	for _, vn := range prop.Children {
+		if nodeSubtreeHasKey(vn, proxyARPRangeKeyword) {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeSubtreeHasKey reports whether want appears as any key of n or of any
+// node beneath it. Used to detect a grammar keyword anywhere in the token
+// stream of a single statement, independent of which AST shape the parser
+// chose for it (#6673).
+func nodeSubtreeHasKey(n *Node, want string) bool {
+	if n == nil {
+		return false
+	}
+	for _, k := range n.Keys {
+		if k == want {
+			return true
+		}
+	}
+	for _, c := range n.Children {
+		if nodeSubtreeHasKey(c, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func compileNAT64(node *Node, sec *SecurityConfig) error {
