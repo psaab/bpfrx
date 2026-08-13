@@ -68,6 +68,29 @@ pub(crate) struct InterfaceSnapshot {
     pub unit_count: usize,
     #[serde(default)]
     pub tunnel: bool,
+    /// #6691: the Go control plane resolved that an IPsec configuration BINDS
+    /// this interface — some `security ipsec vpn <name> bind-interface`
+    /// derives its if_id (`Config.SecureTunnelNetdevForRef`).
+    ///
+    /// OWNERSHIP, not name shape. Nothing reserves the `st` prefix, so a
+    /// wildcard-authored `st5` with no VPN is an ordinary data interface and
+    /// this stays false. Classifying by shape here used to strip such an
+    /// interface of its AF_XDP binding — a traffic outage on a working NIC.
+    ///
+    /// Absent from an older Go control plane's snapshot, in which case serde
+    /// defaults it to false and an xfrmi would receive a binding it cannot
+    /// use. That is the #5619 gap, which both planes' comments rank as less
+    /// bad than the outage the shape test caused.
+    ///
+    /// Serialized only when TRUE, mirroring the Go side's `omitempty`, so a
+    /// snapshot with no secure tunnels is byte-identical to the pre-#6691
+    /// wire format (`protocol_wire_v1.json`).
+    #[serde(
+        rename = "secure_tunnel",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub secure_tunnel: bool,
     #[serde(default)]
     pub mtu: i32,
     #[serde(rename = "hardware_addr", default)]

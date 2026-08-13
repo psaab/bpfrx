@@ -178,178 +178,92 @@ func TestSecureTunnelClassifierAgreesWithConstructor(t *testing.T) {
 	}
 }
 
-// TestSecureTunnelOutOfRangeStNameKeepsItsDataplaneBinding is the #6691
-// behavioural consequence, at the EDGE of the range rather than in its middle.
+// TestSecureTunnelRangeBoundsWhatCanBeOwned is the #6691 behavioural
+// consequence at the EDGE of the `st<N>` range, restated for round 5's
+// ownership keying.
 //
-// `st65535` is a secure tunnel and must be excluded; `st65536` is one character
-// longer, is NOT a secure tunnel (no if_id fits), and must keep both its
-// ingress adjudication and its AF_XDP binding. A classifier bounded anywhere
-// other than exactly 0x10000 fails one of these two.
-func TestSecureTunnelOutOfRangeStNameKeepsItsDataplaneBinding(t *testing.T) {
-	for _, tc := range []struct {
-		base    string
-		skipped bool // want: excluded from the dataplane sets
-	}{
-		{base: "st65535", skipped: true},
-		{base: "st65536", skipped: false},
-		{base: "st-3", skipped: false},
-		{base: "st+5", skipped: true},
-	} {
-		t.Run(tc.base, func(t *testing.T) {
-			snap := InterfaceSnapshot{
-				Name: tc.base + ".0", LinuxName: tc.base, Zone: "trust", Ifindex: 11,
+// The range no longer decides what is EXCLUDED — ownership does. What the
+// range still decides is what can be OWNED AT ALL: `XFRMIfNameAndID` builds an
+// if_id only for an index in [0, 65536), so an out-of-range name resolves to
+// if_id 0 and `SecureTunnelNetdevForRef` refuses it even when an operator
+// authors it verbatim as a `bind-interface`. That is the coherent version of
+// the old rationale, which justified the 0x10000 bound with "names are
+// wildcard-authorable and nothing reserves `st`" — an argument equally true of
+// `st5`, and therefore an argument against keying on the name at all.
+//
+// The 2x2 that matters:
+//
+//	in range  + a VPN binds it   -> a real tunnel, excluded
+//	in range  + no VPN           -> an ordinary NIC, adjudicated  <- the r5 blocker
+//	out range + a VPN "binds" it -> NOT AUTHORABLE: #5297 rejects the
+//	                                bind-interface at commit, so the state
+//	                                cannot exist to be misclassified
+//	out range + no VPN           -> an ordinary NIC, adjudicated
+//
+// The third row is asserted as a commit REJECTION rather than as a snapshot
+// verdict, which is a stronger statement than the old test made: an
+// out-of-range name cannot be owned because it cannot be authored as a
+// bind-interface at all.
+func TestSecureTunnelRangeBoundsWhatCanBeOwned(t *testing.T) {
+	for _, base := range []string{"st65535", "st65536", "st-3", "st+5"} {
+		for _, bound := range []bool{true, false} {
+			label := base + "/unbound"
+			if bound {
+				label = base + "/bound"
 			}
-			if got := userspaceSkipsIngressInterface(snap); got != tc.skipped {
-				verb := "was excluded from"
-				why := "it is an ordinary data interface — no xfrmi is created for an " +
-					"index outside [0, 65536), so excluding it is a traffic outage"
-				if tc.skipped {
-					verb = "stayed in"
-					why = "it IS a secure tunnel; admitting it steers decrypted plaintext " +
-						"to an XSK that cannot bind on a virtual netdev"
+			t.Run(label, func(t *testing.T) {
+				_, ifID := config.XFRMIfNameAndID(base)
+				inRange := ifID != 0
+				lines := []string{
+					fmt.Sprintf("set interfaces %s unit 0 family inet address 192.0.2.1/24", base),
+					fmt.Sprintf("set security zones security-zone trust interfaces %s.0", base),
 				}
-				t.Errorf("%q %s the dataplane ingress set — %s", snap.Name, verb, why)
-			}
-		})
-	}
-}
-
-// TestSecureTunnelUnitResolvesToTheDeviceTheReconcilerCreates is the direct
-// #5619 assertion, across every spelling.
-//
-// The netdev is the AUTHORED bind-interface verbatim, so it cannot be
-// reconstructed from the unit ref: `bind-interface st0` and `bind-interface
-// st0.0` both describe unit ref `st0.0` yet yield devices `st0` and `st0.0`.
-// Reconstruction is right for one spelling and wrong for the other.
-func TestSecureTunnelUnitResolvesToTheDeviceTheReconcilerCreates(t *testing.T) {
-	for _, tc := range secureTunnelSpellings {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, unitRef, wantDev := spellingConfig(t, tc.bindIface, tc.ifName, tc.unit)
-
-			iface := cfg.Interfaces.Interfaces[tc.ifName]
-			if iface == nil {
-				t.Fatalf("interface %q missing from compiled config", tc.ifName)
-			}
-			unit := iface.Units[tc.unit]
-			if unit == nil {
-				t.Fatalf("unit %d missing from interface %q", tc.unit, tc.ifName)
-			}
-
-			if got := snapshotLinuxName(cfg, tc.ifName, iface, unit); got != wantDev {
-				t.Errorf("snapshotLinuxName(%s unit %d) = %q, want %q — with "+
-					"`bind-interface %s` the reconciler creates that device, and a name "+
-					"synthesized from the unit ref instead addresses a netdev that exists "+
-					"on no box", tc.ifName, tc.unit, got, wantDev, tc.bindIface)
-			}
-
-			restore := stubLinkSnapshot5619(t, map[string]int{wantDev: 42, "ge-0-0-0": 11})
-			defer restore()
-			var seen bool
-			for _, s := range buildInterfaceSnapshots(cfg) {
-				if s.Name != unitRef {
-					continue
+				if bound {
+					lines = append([]string{
+						fmt.Sprintf("set security ipsec vpn v bind-interface %s", base),
+					}, lines...)
 				}
-				seen = true
-				if s.Ifindex != 42 {
-					t.Errorf("%s Ifindex = %d, want 42 — the unit must resolve to the real "+
-						"xfrmi netdev %q", unitRef, s.Ifindex, wantDev)
-				}
-			}
-			if !seen {
-				t.Fatalf("premise broken: no %q unit in the snapshot", unitRef)
-			}
-		})
-	}
-}
 
-// TestSecureTunnelResolverParity is the drift guard the #5619 defect needed.
-//
-// config.ResolveKernelIfName documents that snapshotLinuxName "must be kept in
-// sync" with it, but nothing enforced that. Asserted across every spelling, so
-// the two must agree at the BARE/DOTTED boundary and not merely on the one
-// shape both happened to get right.
-func TestSecureTunnelResolverParity(t *testing.T) {
-	for _, tc := range secureTunnelSpellings {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, unitRef, wantDev := spellingConfig(t, tc.bindIface, tc.ifName, tc.unit)
-
-			iface := cfg.Interfaces.Interfaces[tc.ifName]
-			unit := iface.Units[tc.unit]
-			ssot := cfg.ResolveKernelIfName(unitRef)
-			dataplane := snapshotLinuxName(cfg, tc.ifName, iface, unit)
-
-			if dataplane != ssot {
-				t.Errorf("resolver drift on %q (bind-interface %q): ResolveKernelIfName=%q "+
-					"snapshotLinuxName=%q — a mismatch means the dataplane looks up a netdev "+
-					"the rest of the system does not agree exists",
-					unitRef, tc.bindIface, ssot, dataplane)
-			}
-			if ssot != wantDev {
-				t.Errorf("ResolveKernelIfName(%q) = %q, want %q (the device "+
-					"`bind-interface %s` creates)", unitRef, ssot, wantDev, tc.bindIface)
-			}
-		})
-	}
-}
-
-// TestSecureTunnelStaysOutOfDataplaneSets is the safety half of #5619, across
-// every spelling.
-//
-// Fixing the name makes the xfrmi ifindex RESOLVE, which would otherwise admit
-// it to the ingress-adjudication map and the AF_XDP binding plan. The dataplane
-// cannot own an xfrmi end-to-end (no path to hand plaintext back INTO it for
-// egress, and no zero-copy XSK on a virtual netdev), so admitting it would make
-// the shim claim the interface and drop_degraded_transit DROP the decrypted
-// plaintext. The exclusion must be explicit, not an accident of a broken name.
-func TestSecureTunnelStaysOutOfDataplaneSets(t *testing.T) {
-	for _, tc := range secureTunnelSpellings {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg, unitRef, wantDev := spellingConfig(t, tc.bindIface, tc.ifName, tc.unit)
-			restore := stubLinkSnapshot5619(t, map[string]int{wantDev: 42, "ge-0-0-0": 11})
-			defer restore()
-
-			snaps := buildInterfaceSnapshots(cfg)
-
-			// PREMISE: the fix DID resolve the ifindex. Otherwise this passes
-			// vacuously for the pre-#5619 reason (ifindex 0), proving nothing.
-			var resolved bool
-			for _, s := range snaps {
-				if s.Name == unitRef {
-					if s.LinuxName != wantDev || s.Ifindex != 42 {
-						t.Fatalf("premise broken: %s resolved to linux=%q ifindex=%d, want "+
-							"linux=%q ifindex=42 — this test must exercise a RESOLVED xfrmi, "+
-							"not the pre-fix ifindex-0 accident",
-							unitRef, s.LinuxName, s.Ifindex, wantDev)
+				if bound && !inRange {
+					// The state is not authorable: #5297 refuses an
+					// out-of-range bind-interface at commit. Assert THAT,
+					// rather than compiling a config the product rejects.
+					if _, err := compileMayFail5619(lines...); err == nil {
+						t.Fatalf("commit ACCEPTED bind-interface %q, which resolves to no "+
+							"XFRM interface — the route-based VPN would commit and carry "+
+							"no traffic", base)
 					}
-					resolved = true
+					return
 				}
-			}
-			if !resolved {
-				t.Fatalf("premise broken: no %q unit in the snapshot", unitRef)
-			}
+				cfg := compileForTest5619(t, lines...)
 
-			for _, s := range snaps {
-				if s.Name != unitRef && s.Name != tc.ifName {
-					continue
+				// Ownership is only POSSIBLE in range; that is the whole role
+				// the range now plays.
+				_, canBeOwned := cfg.SecureTunnelNetdevForRef(base + ".0")
+				if canBeOwned != (bound && inRange) {
+					t.Fatalf("premise broken: ownership=%v for bound=%v inRange=%v",
+						canBeOwned, bound, inRange)
 				}
-				if !userspaceSkipsIngressInterface(s) {
-					t.Errorf("userspaceSkipsIngressInterface(%q) = false; a secure tunnel must "+
-						"be excluded — admitting it makes the shim claim the xfrmi and DROP "+
-						"decrypted plaintext it cannot deliver to an XSK", s.Name)
+
+				var row InterfaceSnapshot
+				var found bool
+				for _, r := range buildInterfaceSnapshots(cfg) {
+					if r.Name == base+".0" {
+						row, found = r, true
+					}
 				}
-			}
-			for _, ifindex := range buildUserspaceIngressIfindexes(&ConfigSnapshot{Interfaces: snaps}) {
-				if ifindex == 42 {
-					t.Errorf("the xfrmi ifindex entered userspace_ingress_ifaces (spelling %q)",
-						tc.bindIface)
+				if !found {
+					t.Fatalf("premise broken: no %s.0 row in the snapshot", base)
 				}
-			}
-			for _, name := range UserspaceBoundLinuxInterfaces(cfg) {
-				if name == wantDev || name == tc.ifName {
-					t.Errorf("secure tunnel %q entered the AF_XDP/RSS allowlist", name)
+
+				wantSkip := canBeOwned
+				if got := userspaceSkipsIngressInterface(row); got != wantSkip {
+					t.Errorf("userspaceSkipsIngressInterface(%s.0) = %v, want %v — the "+
+						"exclusion follows OWNERSHIP; the range only bounds which names "+
+						"an if_id can exist for", base, got, wantSkip)
 				}
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -441,10 +355,17 @@ func TestSecureTunnelUnitReportsMTUAndAddresses(t *testing.T) {
 
 			prev := buildLinkSnapshot
 			defer func() { buildLinkSnapshot = prev }()
+			// #6691 r6: the LIVE address must differ from the CONFIGURED one.
+			// This stub used to return 10.5.5.1/30 — the same value
+			// spellingConfig authors — and production merges the configured
+			// address into the row, so the assertion below held whether or not
+			// the live lookup resolved. A fixture true by construction cannot
+			// detect the defect it was written for. 10.5.5.2/30 can only reach
+			// the row through buildLinkSnapshot.
 			buildLinkSnapshot = func(name string) (int, int, string, []InterfaceAddressSnapshot) {
 				if name == wantDev {
 					return 42, 1400, "", []InterfaceAddressSnapshot{
-						{Family: "inet", Address: "10.5.5.1/30"},
+						{Family: "inet", Address: "10.5.5.2/30"},
 					}
 				}
 				return 0, 0, "", nil
@@ -462,12 +383,14 @@ func TestSecureTunnelUnitReportsMTUAndAddresses(t *testing.T) {
 				}
 				var live bool
 				for _, addr := range s.Addresses {
-					if addr.Address == "10.5.5.1/30" {
+					if addr.Address == "10.5.5.2/30" {
 						live = true
 					}
 				}
 				if !live {
-					t.Errorf("%s addresses = %v, want the live 10.5.5.1/30", unitRef, s.Addresses)
+					t.Errorf("%s addresses = %v, want the LIVE 10.5.5.2/30 — which only "+
+						"buildLinkSnapshot can supply, so its absence means the unit "+
+						"resolved to a netdev the lookup missed", unitRef, s.Addresses)
 				}
 			}
 			if !found {
@@ -642,10 +565,15 @@ func TestSecureTunnelNetdevForRefFailsClosedUnderCollision(t *testing.T) {
 	// Repeated: a map-order-dependent implementation could fail closed on one
 	// iteration order and resolve on another.
 	for i := 0; i < 50; i++ {
-		if got, ok := cfg.SecureTunnelNetdevForRef("st0.0"); ok {
-			t.Fatalf("SecureTunnelNetdevForRef resolved %q under an if_id collision; "+
-				"pkg/routing creates NEITHER colliding device, so no name is correct here "+
-				"(iteration %d)", got, i)
+		// #6691 r6: BOTH halves of the documented contract. Checking only
+		// `ok` let a hypothetical ("st0", false) return pass — the doc
+		// promises the name is empty too, and a caller that reads the name
+		// without checking ok would then attach forwarding state to a device
+		// pkg/routing has guaranteed is absent.
+		if got, ok := cfg.SecureTunnelNetdevForRef("st0.0"); ok || got != "" {
+			t.Fatalf("SecureTunnelNetdevForRef = (%q, %v) under an if_id collision, want "+
+				"(\"\", false); pkg/routing creates NEITHER colliding device, so no name "+
+				"is correct here (iteration %d)", got, ok, i)
 		}
 	}
 
@@ -692,6 +620,22 @@ func TestSecureTunnelUnitNetdevFallsBackUnderCollision(t *testing.T) {
 
 // compileForTest5619 runs the REAL parser + compiler so these tests exercise
 // the deployed config path rather than a hand-built Config literal.
+// compileMayFail5619 is compileForTest5619 for cases where the REJECTION is the
+// assertion: it returns the compile error instead of failing the test.
+func compileMayFail5619(lines ...string) (*config.Config, error) {
+	tree := &config.ConfigTree{}
+	for _, line := range lines {
+		path, err := config.ParseSetCommand(line)
+		if err != nil {
+			return nil, err
+		}
+		if err := tree.SetPath(path); err != nil {
+			return nil, err
+		}
+	}
+	return config.CompileConfig(tree)
+}
+
 func compileForTest5619(t *testing.T, lines ...string) *config.Config {
 	t.Helper()
 	tree := &config.ConfigTree{}

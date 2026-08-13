@@ -190,28 +190,49 @@ name — the reconciler creates the device under the AUTHORED `bind-interface`
 string, which for `bind-interface st0.0` is `st0.0` and for `bind-interface st0`
 is `st0`, so it is read back from the config rather than reconstructed from the
 ref (`Config.SecureTunnelUnitNetdev`) — which is why the exclusion is now
-stated explicitly on both planes
-(`is_secure_tunnel_ifname` here, `config.IsSecureTunnelIfName` in Go) and
-pinned by `binding_candidate_excludes_secure_tunnel` +
-`secure_tunnel_ifname_matches_go`.
+stated explicitly on both planes. Since #6691 round 5 it is keyed on
+OWNERSHIP: the Go control plane resolves `Config.SecureTunnelNetdevForRef` once
+and ships the verdict as the snapshot's `secure_tunnel` flag, and this plane
+reads that flag. Pinned by `binding_candidate_excludes_secure_tunnel` here and
+`TestUnownedStNameKeepsItsDataplaneRole` in Go.
 
-**An unbound `st` interface is NOT unaffected.** The claim that "a deployment
-without a bound VPN sees no change at all" was made earlier and is false, in two
-independent ways. First, the name: at the merge base `snapshotLinuxName`
-collapsed an unbound `st0 unit 0` to `st0`; at head it returns `st0.0`, because
-the resolver falls back to the verbatim ref when no VPN binds the unit. Second,
-the exclusion: it keys on the interface NAME, not on the presence of a VPN, so
-`set interfaces st0 unit 0 …` with no `security ipsec vpn` at all is still
-dropped from the ingress map, the binding plan and the RSS allowlist. Authoring
-an `st`-named interface without a route-based VPN is not a supported topology —
-`st` is the secure-tunnel namespace — but the honest statement is that the
-change is scoped by name, not by whether a tunnel is configured.
+**An unbound `st` interface keeps its dataplane role.** An earlier revision said
+the exclusion "keys on the interface NAME, not on the presence of a VPN", and
+justified it with "authoring an `st`-named interface without a route-based VPN
+is not a supported topology — `st` is the secure-tunnel namespace". Both halves
+were wrong, and together they were the #6691 round-5 blocker.
 
-The name range is part of that scoping: `IsSecureTunnelIfName` /
-`is_secure_tunnel_ifname` accept only `st<N>` for N in `[0, 65536)`, the range
-`XFRMIfNameAndID` will build an if_id for. Interface names are wildcard-
-authorable and nothing reserves the `st` prefix, so `st65536` is an ordinary
-data interface and must keep its adjudication and its AF_XDP binding (#6691).
+Nothing reserves the `st` prefix. The Go schema (`schema_interfaces.go`) accepts
+a wildcard interface name, so
+
+```
+set interfaces st5 unit 0 family inet address 192.0.2.1/24
+set security zones security-zone trust interfaces st5.0
+```
+
+is a valid config naming a real physical NIC with no VPN anywhere — supported by
+construction, because the config language admits it. Keying the exclusion on the
+name dropped that interface out of the ingress map, the binding plan and the RSS
+allowlist: a traffic outage on a working NIC.
+
+The exclusion is therefore keyed on OWNERSHIP. An `st` name is a secure tunnel
+when an IPsec configuration BINDS it — `Config.SecureTunnelNetdevForRef`, the
+same resolver that decides which xfrmi devices exist — and an unowned `st5`
+keeps adjudication, binding and RSS.
+
+What DOES still change for an unbound `st` interface is the NAME: at the merge
+base `snapshotLinuxName` collapsed an unbound `st0 unit 0` to `st0`; at head it
+returns `st0.0`, because the resolver falls back to the verbatim ref when no VPN
+binds the unit.
+
+The `st<N>` range still matters, but only as a LEXICAL rule and only where a
+lexical question is asked: `IsSecureTunnelIfName` accepts `st<N>` for N in
+`[0, 65536)`, the range `XFRMIfNameAndID` builds an if_id for, and
+`SecureTunnelUnitNetdev` uses it to resolve `st<N>.<unit>` to a netdev name. It
+is no longer an input to the exclusion on either plane, so the range boundary
+can no longer strip a live interface of its binding. What the range still
+decides is what can be OWNED at all: an out-of-range name yields no if_id, and
+#5297 rejects it as a `bind-interface` at commit, so it can never be a tunnel.
 
 **Search scope of the "one resolver" claim — it is narrower than "every
 resolver in the tree".** #6691 unified the secure-tunnel rule across the three
@@ -220,8 +241,10 @@ the userspace dataplane and the junos-host `iifname` scope:
 `Config.ResolveKernelIfName` (`pkg/config/types.go`),
 `userspace.snapshotLinuxName` (`pkg/dataplane/userspace/interfaces.go`) and
 `config.junosHostLinuxName` (`pkg/config/junos_host_deny.go`), all now calling
-`Config.SecureTunnelUnitNetdev`, plus the Rust classifier mirror
-`is_secure_tunnel_ifname`.
+`Config.SecureTunnelUnitNetdev`. The Rust classifier mirror that used to sit
+alongside them is gone: round 5 replaced it with the snapshot's `secure_tunnel`
+flag, so the name grammar is no longer duplicated across the language boundary
+and cannot drift.
 
 Audited and deliberately NOT changed, each filed instead so this claim is not
 broader than the sweep:

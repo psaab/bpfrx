@@ -1678,25 +1678,38 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 		return true
 	case base == "lo0":
 		return true
-	case config.IsSecureTunnelIfName(base):
+	case iface.SecureTunnel:
 		// #5619: an IPsec secure tunnel is NOT adjudicated by the userspace
 		// dataplane, and this arm says so out loud.
 		//
-		// EXACTLY what is matched: `base` is the row's name with any unit
-		// suffix stripped (above), and IsSecureTunnelIfName accepts exactly
-		// the base names XFRMIfNameAndID will build an xfrmi for — `st`
-		// followed by an index in [0, 65536). So every spelling of a real
-		// secure tunnel is covered — a bare `st0`, the usual `st0.0`, and a
-		// multi-digit interface AND unit like `st10.5` (base `st10`) — while
-		// everything that cannot BE an xfrmi stays adjudicated: `stx` and
-		// `start0` (non-numeric), and — the #6691 fix — `st65536` and `st-3`,
-		// which are out of if_id range and so are just ordinary wildcard-
-		// authorable data interfaces. This is a base-name match, not a
-		// whole-string match and not a bare HasPrefix("st"); over-matching
-		// here silently drops a real data interface out of adjudication AND
-		// out of its AF_XDP binding, which is a traffic outage, worse than the
-		// gap below. TestSecureTunnelStaysOutOfDataplaneSets and
-		// TestSecureTunnelNonTunnelStNamesStayAdjudicated pin both directions.
+		// KEYED ON OWNERSHIP, NOT ON NAME SHAPE (#6691 round 5). The row's
+		// SecureTunnel flag is set by the snapshot builder from
+		// Config.SecureTunnelNetdevForRef — some `security ipsec vpn <name>
+		// bind-interface` derives this interface's if_id — so this arm
+		// excludes exactly the interfaces an IPsec configuration actually
+		// binds.
+		//
+		// It used to test config.IsSecureTunnelIfName(base), which is a
+		// LEXICAL predicate: `st` followed by an index in [0, 65536). Nothing
+		// reserves the `st` prefix — schema_interfaces.go accepts a wildcard
+		// interface name — so
+		//
+		//	set interfaces st5 unit 0 family inet address 192.0.2.1/24
+		//	set security zones security-zone trust interfaces st5.0
+		//
+		// is a valid config naming a real physical NIC with no VPN anywhere,
+		// and the lexical arm dropped it out of adjudication, out of the
+		// AF_XDP binding plan and out of the RSS allowlist. That is the
+		// traffic outage the previous revision of this comment named while
+		// causing it. TestUnownedStNameKeepsItsDataplaneRole pins both
+		// directions of the ownership rule — the unowned `st5` keeps its role,
+		// and an `st5` a VPN binds still loses it.
+		//
+		// The lexical predicate is still right for LEXICAL questions —
+		// SecureTunnelUnitNetdev uses it to resolve `st<N>.<unit>` to a netdev
+		// name — and remains the classifier the constructor-agreement guard
+		// pins. It is only wrong as an OWNERSHIP test, which is what this arm
+		// asks.
 		//
 		// Route-based IPsec decrypts in the KERNEL XFRM stack, which delivers
 		// the plaintext on the xfrmi netdev (xfrmi_rcv_cb sets skb->dev, then

@@ -252,18 +252,31 @@ type InterfaceSnapshot struct {
 	// across VRF boundaries (#2388). Additive: an old Rust helper that does
 	// not know the field treats every interface as the default instance
 	// (the pre-#2388 global behavior); an old Go binary omits it.
-	RoutingInstance           string                     `json:"routing_instance,omitempty"`
-	LinuxName                 string                     `json:"linux_name,omitempty"`
-	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
-	Ifindex                   int                        `json:"ifindex,omitempty"`
-	ParentIfindex             int                        `json:"parent_ifindex,omitempty"`
-	LogicalOnly               bool                       `json:"logical_only,omitempty"`
-	RXQueues                  int                        `json:"rx_queues,omitempty"`
-	VLANID                    int                        `json:"vlan_id,omitempty"`
-	LocalFabric               string                     `json:"local_fabric_member,omitempty"`
-	RedundancyGroup           int                        `json:"redundancy_group,omitempty"`
-	UnitCount                 int                        `json:"unit_count"`
-	Tunnel                    bool                       `json:"tunnel"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
+	LinuxName       string `json:"linux_name,omitempty"`
+	ParentLinuxName string `json:"parent_linux_name,omitempty"`
+	Ifindex         int    `json:"ifindex,omitempty"`
+	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
+	LogicalOnly     bool   `json:"logical_only,omitempty"`
+	RXQueues        int    `json:"rx_queues,omitempty"`
+	VLANID          int    `json:"vlan_id,omitempty"`
+	LocalFabric     string `json:"local_fabric_member,omitempty"`
+	RedundancyGroup int    `json:"redundancy_group,omitempty"`
+	UnitCount       int    `json:"unit_count"`
+	Tunnel          bool   `json:"tunnel"`
+	// SecureTunnel reports that an IPsec configuration BINDS this interface
+	// — i.e. some `security ipsec vpn <name> bind-interface` derives this
+	// row's if_id (Config.SecureTunnelNetdevForRef). It is OWNERSHIP, not
+	// name shape: nothing reserves the `st` prefix, so a wildcard-authored
+	// `st5` with no VPN is an ordinary data interface and this stays false
+	// (#6691).
+	//
+	// Additive: an old Rust helper that does not know the field treats every
+	// interface as not-a-secure-tunnel, so an xfrmi would get an AF_XDP
+	// binding it cannot use — the #5619 GAP, which both planes' comments
+	// already rank as less bad than the outage over-matching causes. An old
+	// Go binary omits it.
+	SecureTunnel              bool                       `json:"secure_tunnel,omitempty"`
 	MTU                       int                        `json:"mtu,omitempty"`
 	HardwareAddr              string                     `json:"hardware_addr,omitempty"`
 	Addresses                 []InterfaceAddressSnapshot `json:"addresses,omitempty"`

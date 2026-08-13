@@ -70252,3 +70252,86 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_conn_gen.go, pkg/cluster/sync_conn_read.go,
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
+
+## 2026-08-12 — #5619 round 6: key the secure-tunnel exclusion on OWNERSHIP, not name shape
+
+- **Timestamp**: 2026-08-12
+- **Action**: The round-5 blocker was UNFIXED at `91c08e0a6` — the only commit
+  since the r5 verdict was a claim retraction, and a claim retraction does not
+  fix a runtime regression.
+
+  **The defect.** Interface names are wildcard-authorable and nothing reserves
+  the `st` prefix, so this is a valid config naming a real physical NIC with no
+  VPN anywhere:
+
+      set interfaces st5 unit 0 family inet address 192.0.2.1/24
+      set security zones security-zone trust interfaces st5.0
+
+  `userspaceSkipsIngressInterface` excluded on `config.IsSecureTunnelIfName` —
+  `st` plus an index in [0, 65536) — which matches `st5`, dropping the physical
+  ifindex out of ingress adjudication, out of the binding-plan inputs and out
+  of the RSS allowlist, with Rust independently refusing the binding. The
+  arm's own comment named that failure mode ("a traffic outage") and
+  over-matched anyway.
+
+  **The fix: ownership, resolved once, shipped.** An `st` name is a secure
+  tunnel because an IPsec configuration BINDS it. `secureTunnelOwned` consults
+  `Config.SecureTunnelNetdevForRef` — the same resolver that decides which
+  xfrmi devices exist — and the verdict rides the snapshot as
+  `InterfaceSnapshot.SecureTunnel`. Both planes read that flag, so they agree
+  by CONSTRUCTION rather than by convention.
+
+  **The Rust name grammar is DELETED, not corrected.** With the decision made
+  from ownership, `is_secure_tunnel_ifname` had nothing left to decide and
+  could only drift from the Go one, so it and its hand-maintained mirror table
+  are gone. That closes the "two hand-written artifacts compared to each other"
+  item by removing the second artifact rather than guarding it.
+
+  **A bug my own fix introduced, caught by an existing guard.** The first
+  version resolved the UNIT row's ownership from the BASE name.
+  `TestSecureTunnelAddsNothingToTheAdjudicatedSets` went RED on the
+  `multidigit_st10_5` spelling: the if_id is `stIndex<<16 | unit+1`, so `st10.5`
+  and `st10` derive DIFFERENT ids and a VPN binding `st10.5` does not own
+  `st10`. Only unit 0 coincides. The unit row now resolves from the unit ref
+  and the helper's doc says so.
+
+  **The range rationale, made coherent.** The old test asserted that in-range
+  `st` names are excluded and out-of-range ones are not — pure name-shape
+  semantics, the belief the blocker rests on. Replaced by
+  `TestSecureTunnelRangeBoundsWhatCanBeOwned`, which states what the range NOW
+  decides: not what is excluded, but what can be OWNED. In range + bound is a
+  tunnel; in range + unbound is an ordinary NIC; out of range + bound is NOT
+  AUTHORABLE — #5297 rejects the bind-interface at commit — asserted as a
+  commit rejection, which is a stronger statement than the old test made.
+
+  **Two weak assertions closed.** The collision guard checked only `ok` and
+  never the documented empty name, so a hypothetical `("st0", false)` passed
+  it; it now asserts both halves. The live-address fixture stubbed the SAME
+  address the config authors, and production merges the configured value, so
+  the assertion held whether or not the live lookup resolved — the stub now
+  returns an address only `buildLinkSnapshot` can supply.
+
+  **A process failure worth recording.** Running `cargo fmt -- <one file>`
+  reformatted the WHOLE crate: ~330 files, including
+  `userspace-xdp/src/ipv6_ext_walk.rs`, which put the shim source out of
+  lockstep with the tracked object and turned
+  `TestUserspaceXDPShimObjectMatchesSourceManifest` RED. `cargo fmt` takes a
+  package, not a path; `--` passes the file to rustfmt but the package is still
+  formatted. Every unintended file was reverted and the four Rust edits
+  re-applied by hand. Both suspect failures were measured at the PRISTINE head
+  first rather than assumed pre-existing: the manifest guard was mine; a
+  `slowpath` failure in the same run was a load flake and passes in isolation
+  on both revisions.
+
+  **Validation.** RED at `91c08e0a6` with no fix:
+  `TestUnownedStNameKeepsItsDataplaneRole/no_VPN_binds_st5` — "= true, want
+  false" plus "st5 in the RSS/binding allowlist = false, want true" — while the
+  owned control PASSED, so the guard is not "keep everything". GREEN after the
+  fix at `-count=2`. `go build ./...` 0; `go test ./pkg/dataplane/...
+  ./pkg/config/... ./pkg/routing/...` GO_RC=0; `cargo test` CARGO_RC=0
+  (4257 passed).
+- **File(s)**: pkg/dataplane/userspace/interfaces.go, maps_sync.go,
+  protocol.go, secure_tunnel_ifname_5619_test.go,
+  secure_tunnel_ownership_6691_test.go (new),
+  userspace-dp/src/protocol/snapshot.rs, server/helpers/planning.rs,
+  src/main_tests.rs, src/server/README.md, _Log.md

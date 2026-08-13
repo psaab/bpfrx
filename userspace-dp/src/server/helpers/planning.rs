@@ -282,57 +282,31 @@ pub(crate) fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> 
     }
     // #5619: an IPsec secure tunnel gets no AF_XDP binding.
     //
-    // EXACTLY what is matched: `base` is the interface name with any unit
-    // suffix stripped (above), and `is_secure_tunnel_ifname` accepts exactly
-    // the base names the Go constructor builds an xfrmi for — `st` followed by
-    // an index in `[0, 65536)`. Every spelling of a real tunnel is covered —
-    // bare `st0`, the usual `st0.0`, and a multi-digit interface AND unit like
-    // `st10.5` (base `st10`) — while `stx` / `start0` (non-numeric) and
-    // `st65536` / `st-3` (out of if_id range, so ordinary data interfaces)
-    // keep their bindings. Over-matching here silently strips a real data
-    // interface of its AF_XDP binding — a traffic outage, worse than the gap
-    // below, and exactly what #6691 fixed.
+    // KEYED ON OWNERSHIP, NOT ON NAME SHAPE (#6691 round 5). `secure_tunnel`
+    // is set by the Go control plane from `Config.SecureTunnelNetdevForRef` —
+    // some `security ipsec vpn <name> bind-interface` derives this interface's
+    // if_id — so this excludes exactly the interfaces an IPsec configuration
+    // actually binds.
     //
-    // Route-based IPsec decrypts in the kernel XFRM stack and the plaintext
-    // is delivered on the xfrmi netdev; the dataplane has no path to hand a
-    // plaintext frame back INTO an xfrmi for the egress direction, so it
-    // cannot own the interface end-to-end. An xfrmi is also a virtual netdev
-    // with no `ndo_bpf`/`ndo_xsk_wakeup`, so an XSK cannot bind zero-copy
-    // there at all.
+    // This used to call a local `is_secure_tunnel_ifname(base)` mirroring
+    // `config.IsSecureTunnelIfName`: `st` followed by an index in
+    // `[0, 65536)`. Nothing reserves the `st` prefix (the Go schema accepts a
+    // wildcard interface name), so a wildcard-authored `st5` with no VPN
+    // anywhere is an ordinary physical NIC, and the shape test stripped it of
+    // its AF_XDP binding — a traffic outage on a working interface. That local
+    // predicate is DELETED rather than corrected: with the decision made from
+    // ownership, a second hand-maintained copy of the name grammar had nothing
+    // left to decide and could only drift from the Go one.
     //
-    // This is the Rust half of a two-plane mirror: the Go control plane makes
-    // the SAME exclusion in `userspaceSkipsIngressInterface`
-    // (pkg/dataplane/userspace/maps_sync.go), which gates the ingress
-    // adjudication map and the RSS allowlist. Both planes must agree — the Go
-    // snapshot ships every interface regardless, so this predicate is an
-    // INDEPENDENT gate on the binding plan, not a restatement of the Go one.
-    // `binding_candidate_excludes_secure_tunnel` pins it.
-    if is_secure_tunnel_ifname(base) {
+    // The two planes now agree by CONSTRUCTION rather than by convention: the
+    // Go side computes the flag once and ships it, so there is no Rust-side
+    // rule to keep in sync. An older control plane that omits the field leaves
+    // it false and the xfrmi gets a binding it cannot use — the gap below,
+    // which is the safer direction.
+    if iface.secure_tunnel {
         return false;
     }
     !matches!(iface.zone.as_str(), "mgmt" | "control")
-}
-
-/// #5619: `st<N>` with N in `[0, 65536)` — the secure-tunnel base-name shape.
-///
-/// Mirrors `config.IsSecureTunnelIfName` (pkg/config/xfrmi.go), which shares
-/// its range check with `XFRMIfNameAndID`. The bound is NOT decoration: an
-/// index >= 0x10000 (or a negative one) yields no if_id and so no xfrmi, and
-/// interface names are wildcard-authorable with no `st` reservation — `st65536`
-/// is an ordinary data interface. #6691: without the bound this predicate
-/// stripped that interface of its AF_XDP binding, a traffic outage on a valid
-/// interface. A classifier must not admit names the constructor rejects.
-///
-/// `parse::<i64>()` rather than an all-digits test is deliberate: the Go side
-/// classifies with `strconv.Atoi`, which also accepts a leading `+`/`-`. An
-/// all-digits test would diverge on `st+5`, which parses to index 5 and DOES
-/// yield a device. `st-3` parses to -3 and is rejected by the range check on
-/// both planes. `secure_tunnel_ifname_matches_go` pins the shared table.
-pub(crate) fn is_secure_tunnel_ifname(base: &str) -> bool {
-    match base.strip_prefix("st") {
-        Some(rest) => matches!(rest.parse::<i64>(), Ok(idx) if (0..0x1_0000).contains(&idx)),
-        None => false,
-    }
 }
 
 /// #3091: a VLAN-child interface (e.g. `reth0.80` → Linux netdev

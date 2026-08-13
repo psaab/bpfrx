@@ -2403,55 +2403,6 @@ fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
 /// (`secureTunnelIfNameCases`, pkg/dataplane/userspace/secure_tunnel_ifname_5619_test.go).
 /// Keep the two lists identical — a name added on one side only is exactly the
 /// two-plane drift this pair exists to catch.
-#[test]
-fn secure_tunnel_ifname_matches_go() {
-    use crate::server::helpers::is_secure_tunnel_ifname;
-
-    let cases: &[(&str, bool)] = &[
-        ("st0", true),
-        ("st1", true),
-        ("st9", true),
-        ("st10", true),
-        ("st0000", true),
-        // Go classifies with strconv.Atoi, which accepts a sign. `st+5` parses
-        // to index 5 and DOES yield a device, so both planes classify it as a
-        // tunnel. (An earlier comment here claimed XFRMIfNameAndID refuses this
-        // spelling; it does not.)
-        ("st+5", true),
-        // #6691 range boundary, mirroring the Go `secureTunnelIndex` bound. The
-        // if_id is `stIndex<<16 | unit+1`, so an index >= 0x10000 (or a negative
-        // one) yields no if_id and no xfrmi. Interface names are wildcard-
-        // authorable with no `st` reservation, so `st65536` is an ordinary data
-        // interface: classifying it as a tunnel strips its AF_XDP binding, a
-        // traffic outage on a valid interface.
-        ("st65535", true),
-        ("st65536", false),
-        ("st99999", false),
-        ("st-1", false),
-        ("st-3", false),
-        ("st", false),
-        ("stx", false),
-        ("st0x", false),
-        ("start0", false),
-        ("", false),
-        ("ge-0-0-0", false),
-        ("lo0", false),
-        ("fxp0", false),
-        ("em0", false),
-        ("fab0", false),
-        ("reth0", false),
-        ("gr-0-0-0", false),
-    ];
-    for (base, want) in cases {
-        assert_eq!(
-            is_secure_tunnel_ifname(base),
-            *want,
-            "is_secure_tunnel_ifname({base:?}) disagrees with the Go mirror \
-             config.IsSecureTunnelIfName — the two planes must classify every \
-             name identically (#5619)"
-        );
-    }
-}
 
 /// The real planner must produce NO binding for a secure tunnel, while still
 /// planning the ordinary data interface beside it.
@@ -2475,6 +2426,9 @@ fn binding_candidate_excludes_secure_tunnel() {
             // this row must be excluded on its own merits.
             InterfaceSnapshot {
                 name: "st0.0".to_string(),
+                // #6691 r5: ownership is resolved by the Go control plane and
+                // shipped in the snapshot; no Rust-side name rule exists now.
+                secure_tunnel: true,
                 linux_name: "st0.0".to_string(),
                 zone: "vpn".to_string(),
                 ifindex: 42,
@@ -2535,6 +2489,9 @@ fn secure_tunnel_adds_nothing_to_the_binding_plan() {
     };
     let tunnel = InterfaceSnapshot {
         name: "st0.0".to_string(),
+        // #6691 r5: ownership is resolved by the Go control plane and
+        // shipped in the snapshot; no Rust-side name rule exists now.
+        secure_tunnel: true,
         linux_name: "st0.0".to_string(),
         zone: "vpn".to_string(),
         ifindex: 42,

@@ -230,6 +230,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			RedundancyGroup: rg,
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
+			SecureTunnel:    secureTunnelOwned(cfg, name),
 			MTU:             mtu,
 			HardwareAddr:    hardwareAddr,
 			Addresses:       addresses,
@@ -302,6 +303,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				RedundancyGroup:           rg, // inherit resolved RG (RETH parent or own)
 				UnitCount:                 0,
 				Tunnel:                    iface.Tunnel != nil || unit.Tunnel != nil,
+				SecureTunnel:              secureTunnelOwned(cfg, unitName),
 				MTU:                       mtu,
 				HardwareAddr:              hardwareAddr,
 				Addresses:                 addresses,
@@ -415,6 +417,49 @@ func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {
 		return ""
 	}
 	return unit.DSCPRewriteRule
+}
+
+// secureTunnelOwned reports whether an IPsec configuration BINDS ifName —
+// i.e. some `security ipsec vpn <name> bind-interface` derives the same if_id.
+//
+// #6691 round 5: this replaces a NAME-SHAPE test as the input to the
+// secure-tunnel exclusion. An `st` name is a secure tunnel because a VPN binds
+// it, not because it is spelled that way, and nothing reserves the prefix —
+// pkg/config/schema_interfaces.go accepts a wildcard interface name, so
+// `set interfaces st5 unit 0 family inet address ...` with no VPN anywhere is
+// a valid config naming an ordinary physical NIC. Classifying it by shape
+// stripped it of ingress adjudication, of its AF_XDP binding and of its RSS
+// entry — the traffic outage the excluding arm's own comment named.
+//
+// The oracle is Config.SecureTunnelNetdevForRef, which is also what decides
+// which xfrmi devices exist, so the dataplane and the reconciler cannot
+// disagree about which names are tunnels.
+//
+// Fails OPEN toward adjudication on an if_id collision, deliberately:
+// SecureTunnelNetdevForRef returns false when two DISTINCT bind-interface
+// strings derive one if_id, because routing then creates NEITHER device. The
+// row keeps its dataplane role, which for a device that does not exist means
+// its ifindex stays 0 and every ifindex-keyed set skips it anyway. That is the
+// direction both planes' comments already rank safer: the gap costs a binding
+// an xfrmi could not have used, over-matching costs a live interface its
+// traffic.
+//
+// PASS THE REF THAT NAMES THE ROW, not the base name. The if_id is
+// `stIndex<<16 | unit+1`, so the unit is part of it: `st10.5` and `st10` derive
+// DIFFERENT if_ids and a VPN binding `st10.5` does not own `st10`. Only for
+// unit 0 do the two coincide — a bare `st5` IS unit 0, which is the same
+// property that makes `st0` and `st0.0` a collision rather than two tunnels.
+//
+// An earlier revision of this fix passed the base name for the unit row too,
+// and TestSecureTunnelAddsNothingToTheAdjudicatedSets caught it on the
+// multi-digit `st10.5` spelling: the tunnel resolved as unowned and re-entered
+// the ingress-adjudication set.
+func secureTunnelOwned(cfg *config.Config, ifName string) bool {
+	if cfg == nil {
+		return false
+	}
+	_, ok := cfg.SecureTunnelNetdevForRef(ifName)
+	return ok
 }
 
 // NOTE: Keep in sync with (*Config).ResolveKernelIfName in
