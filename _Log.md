@@ -204,6 +204,15 @@
      correctness fix, so there is no black-box observation that separates the
      two orderings at this call site.
 
+     **(SUPERSEDED by fold r2 below — the last two sentences of this paragraph
+     are FALSE as written.** The measurement stands: the mutation leaves every
+     single-threaded test green. The CONCLUSION drawn from it does not. The
+     ordering IS observable to a concurrent producer, because the transient
+     reservation elevates the target's `pending_tx_admitted` while it is held.
+     "Nothing differs" was established by walking one invocation to completion,
+     and a state created and destroyed inside a call is invisible to that call
+     by construction. See fold r2.)
+
      Closed with what CAN be pinned: a source canary asserting the call site
      reaches the queue through `sample_then_admit_mirror_clone` (the single
      home of the ordering, itself covered by the #6114 fail-on-revert tests)
@@ -249,6 +258,11 @@
      inside the module cannot fire because it disappears with it. It lives in
      `mirror/mod_tests.rs`, registered independently from `mirror/mod.rs:87`.
 
+     **(CORRECTED by fold r2: the declaration is THREE lines, not nine — the
+     comment above it is not part of it. And this round's canary caught only
+     DELETION: rewriting the predicate to `#[cfg(any())]` unregisters the module
+     just as completely and passed. Both fixed below.)**
+
   MUTATION MATRIX (each applied to production, run, reverted, `git diff` then
   verified clean; exit codes captured unpiped; every RED confirmed to be an
   ASSERTION failure, with the only `^error` line being the harness's own
@@ -282,6 +296,152 @@
   ifindexes the call site actually resolves. They now share one
   `LiveCallSiteFixture` + `run_stage`, so adding the fourth test cost ~60 lines
   instead of ~210 and the topology is defined exactly once.
+
+## 2026-08-13 — #6304 fold r2: the ordering IS observable, and my r1 conclusion was a scope error
+
+- **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
+- **Action**: folded a second Codex MERGE-NEEDS-MAJOR. Four findings plus three
+  claim corrections. Every one was re-measured here rather than taken on trust,
+  because that leg ran without Cargo and without reading the two doc files in
+  the diff — its outcomes were source-derived. All four reproduced.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `userspace-dp/src/afxdp/mirror/mod_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`. NO production file changed —
+  `flow_cache_hit.rs` is byte-identical to the pre-fold head (verified with
+  `git diff` after every mutation).
+
+  F1. **THE ORDERING IS OBSERVABLE, AND r1's "functionally inert" was wrong.**
+     Round 1 concluded that reserve-before-sample changes nothing any test can
+     see, added a source canary instead, and recorded the conclusion in the test
+     doc, in `docs/userspace-dataplane-gaps.md`, and in the r1 entry above. The
+     measurement behind it was sound and still reproduces. The inference was a
+     SCOPE error: "no state differs" was established by walking ONE invocation
+     to completion, and a state created and destroyed inside a call is invisible
+     to that call by construction — and visible to anyone racing it. While the
+     transient reservation is held, the target's `pending_tx_admitted` is one
+     higher, so a producer on another worker sees the queue full and its request
+     is DROPPED. `mirror/mod_tests.rs::
+     live_mirror_admission_reserves_slot_against_interleaving_producer` already
+     demonstrates that exclusion. Reserve-first can lose a second producer's
+     clone that sample-first would have admitted — a lost mirror clone, not just
+     bus traffic.
+
+     Both false sentences are corrected in place (test doc, gaps doc, and the r1
+     entry above carries a SUPERSEDED note rather than being rewritten). The
+     `:886` claim that the #6114 tests catch a reserve-before-sample introduced
+     inside the shared helper is corrected too: they catch the HISTORICAL
+     early-return form, not a helper rewritten to reserve first and then
+     suppress on a sampler decline.
+
+     Then the choice Codex put: bind the concurrent case, or label the gap. I
+     LABELLED IT, and bound what is deterministically bindable either side of
+     it. The window is a pair of atomic RMWs entirely inside
+     `stage_flow_cache_hit` with no production hook to synchronise against; a
+     racing-producer test would fail only probabilistically, which is a flake,
+     not a binding. Adding one would have looked like coverage and been worth
+     less than saying so. What IS new and deterministic:
+     `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304`
+     drives the mirror target at a soft cap of exactly ONE slot and uses an
+     interleaving producer as the instrument — after a non-sampled packet and
+     after a declined rewrite the slot must be free; after an ADMITTED clone it
+     must be taken (that cell is the positive control that the cap binds at all,
+     without which the two `is_ok()` cells would be vacuous). It reds on any
+     reservation this call site takes and fails to hand back.
+
+  F2. **THE ROLLBACK FIXTURE WAS NOT PARSER-PRODUCIBLE.** It declared IHL 15
+     (60 bytes) with `total_len` 40 in a 58-byte frame while the metadata put L4
+     at 38; a shim deriving L4 from that header would put it at 78, past the end
+     of the frame. Same domain-parity class the VLAN fixture was caught on in
+     r1 — caught in one place, reintroduced in another.
+
+     Codex's prescribed remedy (rebuild it so metadata and bytes agree) turns
+     out to be IMPOSSIBLE for IPv4, and establishing that is the substance of
+     this item. `parse_ipv4` (`userspace-xdp/src/lib.rs:1236`) does
+     `read_bytes(data, data_end, l3_offset, ihl)?` before deriving `l4_offset`,
+     so a shim-delivered IPv4 packet always satisfies `frame.len() - l3 >= ihl`;
+     `ipv4_declared_l3_end` (`frame/inspect.rs:1156-1160`) then clamps the
+     trimmed payload UP to at least `ihl`. Together those make
+     `l3_payload.len() < ihl` — the only bail gate BOTH rewriters share and
+     apply pre-commit — unreachable for any self-consistent frame the shim can
+     deliver. The other declines are one-sided: the generic path REPAIRS a port
+     mismatch, and it handles non-first fragments the descriptor path bails on.
+
+     So the fixture is relabelled as what it actually is: a frame whose bytes
+     changed AFTER the shim described them (NIC DMA into a recycled UMEM frame)
+     — the hazard `expected_ports` and the #5466/#4965 preflight-then-commit
+     contract exist for, and under which meta/frame disagreement is the DEFINING
+     property, not a defect. `dma_raced_short_ihl_frame` builds it by disturbing
+     exactly one byte of the pristine frame, and the test passes the PRISTINE
+     frame's metadata. The rollback branch is thereby documented as
+     defense-in-depth against a post-parse frame change rather than a hot-path
+     case — which is itself the reason nothing else in the suite covered it.
+
+     The reachability claim is MEASURED, not argued: a new over-reach guard,
+     `live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304`,
+     feeds the SELF-CONSISTENT IHL-15 packet (40 bytes of RFC 791 NOP options,
+     an honest 80-byte datagram, metadata derived from it) and the in-place
+     rewrite SUCCEEDS. The frame builder is now parameterised by option words
+     with `total_len`, frame length and metadata all derived, and `test_meta`
+     computes `l4_offset` from the frame's own IHL instead of hardcoding 38 —
+     the hardcode is what let the metadata detach from the fixture in the first
+     place.
+
+  F3. **THE REGISTRATION CANARY CAUGHT DELETION BUT NOT DISABLING.** Rewriting
+     `#[cfg(test)]` to `#[cfg(any())]` removes the module from every build while
+     leaving both matched substrings in the file. MEASURED: under that edit the
+     r1 canary PASSED (rc=0) and all eight module guards silently stopped
+     compiling. The canary now matches the three-line block CONTIGUOUSLY,
+     `#[cfg(test)]` included, and reds on both edits. (It is still source text,
+     so it pins the declaration's FORM — noted in its doc.)
+
+  F4. **AN UNRELATED PRODUCTION LINE WAS UNBOUND.** `run_stage` built
+     `DebugPollCounters` and dropped it unread, so `telemetry.dbg.forward += 1`
+     / `.tx += 1` could be deleted from EITHER staging arm with the whole module
+     green — an undercounted forward-debug metric on every established-flow
+     cache hit. In scope: the module's remit is this staging function's
+     observable effects. `StageRun` now carries both counters and
+     `live_flow_cache_callsite_accounts_debug_forward_and_tx_6304` asserts them
+     on the in-place arm AND the fallback arm.
+
+  ALSO CORRECTED (claims, no behaviour): the non-sampled test's doc said a call
+  site letting an unsampled packet through to admission "ENQUEUES a real clone"
+  — false, it can drop the admission after sampling declines; it now names the
+  mutation it actually distinguishes and points at the canary for the other.
+  The r1 entry's "nine-line `mod` declaration" is three lines. And the frame
+  fixture was called "well-formed" while both checksum fields are zero: nothing
+  on this path verifies them (both rewriters apply incremental deltas only), so
+  no decision under test changes, but the doc now says that instead of claiming
+  a wire-valid packet.
+
+  MUTATION MATRIX (each applied to production, run, reverted, `git diff` verified
+  clean afterwards; exit codes unpiped; every RED confirmed to be an ASSERTION,
+  never a compile break — the only `^error` line in any run is cargo's own
+  "test failed" summary):
+
+  | mutation | result |
+  |---|---|
+  | M1 `#[cfg(test)]` -> `#[cfg(any())]` | registration canary RED; the 8 module guards VANISH from the run. With the r1 canary restored: **PASSES, rc=0** — the finding, reproduced |
+  | M1b delete the 3-line declaration | registration canary RED |
+  | M2 delete `dbg.forward += 1` (in-place arm) | debug-counter test RED (`left: 0, right: 1`); 8 GREEN |
+  | M3 delete `dbg.forward += 1` (fallback arm) | debug-counter test RED; 8 GREEN |
+  | M4 leak the reservation on the declined-rewrite path | stranding test RED (rollback cell); 8 GREEN — the pre-existing `queued.is_empty()` did NOT catch it |
+  | M5 reserve-first + leak on decline | delegation canary RED + stranding test RED (non-sampled cell); 7 GREEN |
+  | R1 reserve-first + correct drop (Codex's F1 mutation) | delegation canary RED only; stranding test GREEN — **this is the labelled gap, measured** |
+  | R2 defer the sampler commit on `Sampled(Err)` | full-queue test RED; 8 GREEN |
+  | R3 `Sampled(Ok(_)) => None` | admitted-clone RED + stranding-test control RED; 7 GREEN |
+  | R4 hoist the sampler commit above the rewrite check | rollback test RED (`left: 1, right: 0`); 8 GREEN — **the rollback binding SURVIVES the F2 fixture rebuild** |
+  | R5 `resolve_mirror_config(.., 0)` — drop the VLAN id | 5 RED; wiring binding intact |
+
+  OVER-REACH GUARDS: R1 reds exactly one test and leaves the eight others green
+  — that is the gap being labelled rather than a claim of coverage. R2/R3/R4
+  each red their own cell and leave the IP-options guard green, which is what
+  separates it from a restatement of the fix. M4 reds ONLY the new stranding
+  test, proving the older rollback assertions were blind to a leaked admission.
+
+- **Validation**: full `cargo test --release` rc=0 both parallel and
+  `--test-threads=1`: 4283 passed / 0 failed / 2 ignored in the bin target, plus
+  60 + 8 + 22 + 31 + 1 + 2 in the integration targets. `CARGO_TARGET_DIR` and
+  `TMPDIR` private to this lane; no crate-wide `cargo fmt`.
 
 ## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
 

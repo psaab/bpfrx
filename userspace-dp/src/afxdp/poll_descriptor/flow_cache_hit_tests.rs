@@ -68,9 +68,12 @@ fn test_key() -> crate::session::SessionKey {
 /// TTL-expiry arm above the mirror block does not divert it into a Time
 /// Exceeded reply.
 ///
-/// `version_ihl` is the IPv4 version/IHL byte. `0x45` is the well-formed
-/// packet every test but the rollback one uses; the rollback test passes an
-/// IHL that overruns the frame so BOTH in-place rewriters decline.
+/// `option_words` is the number of 32-bit IPv4 option words, so the IHL nibble
+/// is `5 + option_words` and the header is genuinely that long: `total_len`,
+/// the frame length and the metadata offsets all follow from it. Every test
+/// here uses a self-consistent frame; the rollback test corrupts ONE byte of
+/// this frame AFTER construction, which is the only way that decline is
+/// reachable (see `dma_raced_short_ihl_frame`).
 ///
 /// The 802.1Q tag is PHYSICALLY present because the shim only ever reports a
 /// non-zero `ingress_vlan_id` together with `ingress_vlan_present`, and the
@@ -78,11 +81,23 @@ fn test_key() -> crate::session::SessionKey {
 /// `poll_stages.rs:551`, `rewrite_plan_eth_from_parts`). A fixture with
 /// `ingress_vlan_id = 80` and an untagged frame is a meta/frame pair the wire
 /// format cannot produce.
-fn vlan_tagged_tcp_v4_frame(version_ihl: u8) -> Vec<u8> {
+///
+/// Both checksum fields (IPv4 header at [28..30], TCP at [50..52] of the
+/// no-option frame) are left ZERO, which no correct sender emits. Nothing on
+/// this path verifies either one — XDP receives whatever the NIC DMA'd, and
+/// both rewriters only apply INCREMENTAL deltas
+/// (`adjust_ipv4_header_checksum`, `recompute_l4_checksum_ipv4`) rather than
+/// validating the inbound value — so the zero does not change any decision
+/// under test. It does mean the frame is not a wire-valid packet end to end,
+/// only in every field these tests read.
+fn vlan_tagged_tcp_v4_frame(option_words: usize) -> Vec<u8> {
     let key = test_key();
     let (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) = (key.src_ip, key.dst_ip) else {
         unreachable!("test key is v4")
     };
+    let ihl_words = 5 + option_words;
+    assert!(ihl_words <= 15, "IPv4 IHL nibble is 4 bits");
+    let total_len = (ihl_words * 4 + 20) as u16;
     let mut frame = Vec::new();
     // Ethernet dst + src, then the 802.1Q TPID.
     frame.extend_from_slice(&[
@@ -91,12 +106,17 @@ fn vlan_tagged_tcp_v4_frame(version_ihl: u8) -> Vec<u8> {
     // 802.1Q TCI (PCP 0, DEI 0, VID 80), then the inner ether_type.
     frame.extend_from_slice(&INGRESS_VLAN_ID.to_be_bytes());
     frame.extend_from_slice(&[0x08, 0x00]);
-    // IPv4: total len 40, TTL 64, proto TCP.
-    frame.extend_from_slice(&[
-        version_ihl, 0x00, 0x00, 0x28, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
-    ]);
+    // IPv4: version 4 + the declared IHL, TTL 64, proto TCP.
+    frame.push(0x40 | ihl_words as u8);
+    frame.push(0x00);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&[0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00]);
     frame.extend_from_slice(&src_ip.octets());
     frame.extend_from_slice(&dst_ip.octets());
+    // IPv4 options: one NOP (type 1) per byte. Padding a header out with NOPs
+    // is legal per RFC 791 §3.1 and is what a router emits when it has to
+    // preserve header length without carrying an option.
+    frame.extend(std::iter::repeat_n(0x01u8, option_words * 4));
     // TCP: ports, seq, ack, offset 5 / ACK, window, csum, urg.
     frame.extend_from_slice(&key.src_port.to_be_bytes());
     frame.extend_from_slice(&key.dst_port.to_be_bytes());
@@ -104,11 +124,52 @@ fn vlan_tagged_tcp_v4_frame(version_ihl: u8) -> Vec<u8> {
     frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     frame.extend_from_slice(&[0x50, 0x10, 0xfa, 0xf0]);
     frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(
+        frame.len(),
+        18 + total_len as usize,
+        "the frame must carry exactly the datagram it declares"
+    );
     frame
 }
 
 fn tcp_v4_ack_frame() -> Vec<u8> {
-    vlan_tagged_tcp_v4_frame(0x45)
+    vlan_tagged_tcp_v4_frame(0)
+}
+
+/// The rollback fixture: a frame whose IPv4 IHL nibble was overwritten to 15
+/// (60 bytes) AFTER the shim parsed and described it, leaving an L3 payload
+/// (40 bytes) shorter than the header the packet now declares.
+///
+/// DOMAIN PARITY, stated exactly. This is NOT a frame the parser could have
+/// produced together with `test_meta`'s offsets: `parse_ipv4`
+/// (`userspace-xdp/src/lib.rs`) does `read_bytes(data, data_end, l3_offset,
+/// ihl)?` before deriving `l4_offset`, so a shim-delivered IPv4 packet ALWAYS
+/// satisfies `frame.len() - l3 >= ihl`, and `ipv4_declared_l3_end` then clamps
+/// the trimmed payload UP to at least `ihl`. Those two facts together mean no
+/// self-consistent, shim-produced IPv4 frame can make either in-place rewriter
+/// take its `l3_payload.len() < ihl` bail — verified firsthand by
+/// `live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304`,
+/// which feeds the SELF-CONSISTENT IHL-15 packet (40 bytes of options, an
+/// honest 80-byte datagram) and watches the rewrite succeed.
+///
+/// What IS reachable, and what this fixture models, is the frame changing
+/// under the descriptor after the shim wrote the metadata — NIC DMA into a
+/// recycled UMEM frame. That hazard is exactly why `expected_ports` exists as
+/// a "DMA race guard" and why #5466/#4965 made both rewriters run every bail
+/// gate against the PRISTINE frame before the first UMEM write. Under it the
+/// metadata legitimately describes the packet the shim SAW, not the bytes now
+/// in the buffer, so `test_meta`'s `l4_offset = 38` is correct provenance
+/// rather than an impossible claim. The rollback branch it drives is therefore
+/// defense-in-depth, not a hot-path case — which is precisely why nothing else
+/// in the suite covered it.
+fn dma_raced_short_ihl_frame() -> Vec<u8> {
+    let mut frame = tcp_v4_ack_frame();
+    // version 4, IHL 15 (= 60 bytes) over the 40-byte L3 payload actually
+    // present. Only the version/IHL byte is disturbed: the ports at [38..42]
+    // still match the flow tuple, so the descriptor path's DMA-race port gate
+    // is NOT what declines here — the header-length gate is.
+    frame[18] = 0x4f;
+    frame
 }
 
 fn test_meta(frame: &[u8]) -> UserspaceDpMeta {
@@ -128,8 +189,12 @@ fn test_meta(frame: &[u8]) -> UserspaceDpMeta {
         ingress_vlan_id: INGRESS_VLAN_ID,
         ingress_vlan_present: 1,
         l3_offset: 18,
-        l4_offset: 38,
-        payload_offset: 58,
+        // Derived from the frame the way `parse_ipv4` derives them — L4 starts
+        // after the IHL the header declares, and the payload after the TCP data
+        // offset. Hardcoding 38/58 silently detached the metadata from any
+        // fixture carrying IPv4 options.
+        l4_offset: 18 + ((frame[18] & 0x0f) as u16) * 4,
+        payload_offset: frame.len() as u16,
         // The shim reports the FULL wire length (`packet_len = data_end - data`,
         // `userspace-xdp/src/lib.rs:566`), and the reinject path agrees
         // (`coordinator/inject.rs:73` uses `frame_len`). `pkt_len` feeds the
@@ -282,6 +347,13 @@ enum MirrorTargetQueue {
     WithRoom,
     /// Driven to its cap, so admission reports `QueueFullCrossWorker`.
     AtCap,
+    /// EMPTY, but with a soft cap of exactly one slot — so the target's
+    /// `pending_tx_admitted` accounting becomes externally observable: any
+    /// admission this call site holds or strands excludes an interleaving
+    /// producer's `try_enqueue_tx_owned`, exactly as
+    /// `mirror/mod_tests.rs::live_mirror_admission_reserves_slot_against_interleaving_producer`
+    /// demonstrates.
+    CapOneEmpty,
 }
 
 /// Owns every referent a `WorkerContext` borrows so the four call-site tests
@@ -313,6 +385,9 @@ struct LiveCallSiteFixture {
 impl LiveCallSiteFixture {
     fn new(queue: MirrorTargetQueue) -> Self {
         let target_live = Arc::new(BindingLiveState::new());
+        if queue == MirrorTargetQueue::CapOneEmpty {
+            target_live.set_max_pending_tx(1);
+        }
         if queue == MirrorTargetQueue::AtCap {
             target_live.set_max_pending_tx(1);
             assert!(
@@ -443,6 +518,12 @@ struct StageRun {
     tx_counters: WorkerTxCounters,
     scratch: WorkerScratch,
     mirror_sample_counter: u64,
+    /// `telemetry.dbg` after the call. `run_stage` used to build this and drop
+    /// it unread, which left `telemetry.dbg.forward += 1` / `.tx += 1` on BOTH
+    /// staging arms deletable with the whole module green — an undercounted
+    /// forward/tx debug counter on every successful in-place cache hit.
+    dbg_forward: u64,
+    dbg_tx: u64,
 }
 
 /// Drive the LIVE call site once.
@@ -458,6 +539,19 @@ struct StageRun {
 fn run_stage(
     fixture: &LiveCallSiteFixture,
     frame: &[u8],
+    initial_sample_counter: u64,
+) -> StageRun {
+    let meta = test_meta(frame);
+    run_stage_with_meta(fixture, frame, meta, initial_sample_counter)
+}
+
+/// `run_stage` with the shim metadata supplied explicitly, for the rollback
+/// fixture — whose UMEM bytes changed AFTER the shim described them, so the
+/// metadata must be the one derived from the PRISTINE frame.
+fn run_stage_with_meta(
+    fixture: &LiveCallSiteFixture,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
     initial_sample_counter: u64,
 ) -> StageRun {
     let mut area = MmapArea::new(2 * 1024 * 1024).expect("umem mmap");
@@ -490,7 +584,6 @@ fn run_stage(
         counters: &mut counters,
     };
 
-    let meta = test_meta(frame);
     let flow = SessionFlow {
         src_ip: test_key().src_ip,
         dst_ip: test_key().dst_ip,
@@ -529,6 +622,8 @@ fn run_stage(
         tx_counters: tx_counters_state,
         scratch: scratch_state,
         mirror_sample_counter,
+        dbg_forward: dbg.forward,
+        dbg_tx: dbg.tx,
     }
 }
 
@@ -542,8 +637,15 @@ fn run_stage(
 /// `compare_exchange_weak(AcqRel)` ever executes, so a zero drop counter was
 /// satisfied by the queue being full rather than by the packet being declined
 /// — the assertion could not tell the two apart. With room, a call site that
-/// let an unsampled packet through to admission ENQUEUES a real clone, and the
-/// target-queue assertion below fails.
+/// DROPS the sampler and clones unconditionally lands a real frame on the
+/// target and the queue assertion below fails.
+///
+/// Scope, precisely: that is the mutation this cell distinguishes. A call site
+/// that still consults the sampler but consults it AFTER reserving — taking an
+/// admission and handing it back on `NotSampled` — enqueues nothing and passes
+/// every assertion here. See
+/// `live_flow_cache_callsite_delegates_to_the_shared_sampler_6304` for what
+/// covers that mutation and what it does not.
 ///
 /// The mirror result is recorded ONLY inside the successful in-place-rewrite
 /// branch, so the positive controls are load-bearing too: without them a
@@ -810,14 +912,19 @@ fn live_flow_cache_callsite_selected_admitted_clone_reaches_target_6304() {
 /// generic path REPAIRS ports via `restore_l4_tuple_from_meta` /
 /// `enforce_expected_ports` rather than declining, so only the descriptor path
 /// would bail.
+///
+/// That decline is reachable ONLY for a frame whose bytes changed after the
+/// shim described them, which is what `dma_raced_short_ihl_frame` builds and
+/// documents — the metadata passed here is therefore the PRISTINE frame's, the
+/// one the shim actually emitted.
 #[test]
 fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
     let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
-    // version 4, IHL 15 (= 60 bytes) over a 40-byte L3 payload.
-    let frame = vlan_tagged_tcp_v4_frame(0x4f);
+    let pristine = tcp_v4_ack_frame();
+    let frame = dma_raced_short_ihl_frame();
     // rate = 2 with counter = 0 -> SELECTED, so the sampler has something to
     // roll back and admission is genuinely taken and released.
-    let run = run_stage(&fixture, &frame, 0);
+    let run = run_stage_with_meta(&fixture, &frame, test_meta(&pristine), 0);
 
     // --- POSITIVE CONTROLS: the packet really did take the fallback, and it
     // took it because the rewrite declined rather than because the flow-cache
@@ -868,25 +975,48 @@ fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
     );
 }
 
-/// #6304 (call-site delegation canary). The sample-before-reserve ORDERING is
-/// a shared-cacheline property, not a functional one: inlining
-/// `admit_mirror_clone_to_live` above the sampler at this call site and
-/// discarding the reservation when the sampler declines produces byte-identical
-/// observable behaviour — the reservation is taken with an AcqRel CAS and given
-/// straight back by `PendingTxAdmission::drop`, so no counter, queue, or frame
-/// differs. That was verified firsthand: the mutation compiles and every
-/// behavioural test in this module stays green.
+/// #6304 (call-site delegation canary). Inlining `admit_mirror_clone_to_live`
+/// above the sampler at this call site and discarding the reservation when the
+/// sampler declines is INDISTINGUISHABLE to a single-threaded observer of one
+/// completed invocation: the reservation is taken with an AcqRel CAS and given
+/// straight back by `PendingTxAdmission::drop` before the call returns, so
+/// every counter, queue and frame this module can read afterwards is
+/// unchanged. Verified firsthand — the mutation compiles and every behavioural
+/// test in this module stays green.
 ///
-/// What CAN be pinned is that the call site does not open-code the reservation
-/// at all. `sample_then_admit_mirror_clone` is the single home for the #6114
-/// ordering invariant and is itself covered by the fail-on-revert tests in
-/// `mirror/mod_tests.rs`; as long as this call site goes through it, the
-/// ordering is inherited rather than restated.
+/// That is a statement about what a COMPLETED call leaves behind, and nothing
+/// more. The ordering is genuinely observable to a CONCURRENT producer: while
+/// the transient reservation is held, the target's `pending_tx_admitted` is one
+/// higher, so another worker pushing to the same mirror target sees the queue
+/// full and its request is dropped —
+/// `mirror/mod_tests.rs::live_mirror_admission_reserves_slot_against_interleaving_producer`
+/// demonstrates exactly that exclusion. Reserve-first can therefore lose a
+/// second producer's clone that sample-first would have admitted. The earlier
+/// claim that no behavioural test COULD catch this mutation was a scope error:
+/// state created and destroyed inside one call is invisible to that call by
+/// construction, and visible to anyone racing it.
 ///
-/// Limits, stated plainly: this is a source-text canary, not a runtime
-/// observation. It does not catch a reserve-before-sample introduced INSIDE
-/// the shared helper (the #6114 tests do), and it would need updating if the
-/// helper is legitimately renamed.
+/// COVERAGE GAP, stated plainly rather than papered over. No test in this
+/// module observes that transient window, and none here can do so
+/// deterministically: the window is a pair of atomic RMWs entirely inside
+/// `stage_flow_cache_hit`, with no production hook a test could synchronise
+/// against, so a racing-producer test would fail only probabilistically —
+/// a flake, not a binding. What IS bound deterministically is the pair of
+/// properties either side of that window:
+///   - the reservation the call site takes is externally visible and must be
+///     handed back, not stranded —
+///     `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304`;
+///   - the call site does not open-code the reservation at all, which is what
+///     this canary pins. `sample_then_admit_mirror_clone` is the single home
+///     for the #6114 ordering invariant, so going through it inherits the
+///     ordering rather than restating it.
+///
+/// Limits of the canary itself: it is source text, not a runtime observation,
+/// and it would need updating if the helper is legitimately renamed. It does
+/// NOT catch every reserve-before-sample defect inside the shared helper —
+/// the #6114 tests catch the historical form, where the helper returned early
+/// with the reservation already taken; a rewrite of the helper that reserved
+/// first and then suppressed on a sampler decline would be caught by neither.
 #[test]
 fn live_flow_cache_callsite_delegates_to_the_shared_sampler_6304() {
     let src = include_str!("flow_cache_hit.rs");
@@ -900,7 +1030,215 @@ fn live_flow_cache_callsite_delegates_to_the_shared_sampler_6304() {
         !src.contains("admit_mirror_clone_to_live("),
         "#6304: stage_flow_cache_hit must NOT call `admit_mirror_clone_to_live` \
          directly — open-coding the reservation at this call site reintroduces \
-         the O(PPS) cross-core true-sharing #6114 removed, and does so without \
-         changing any observable counter, so no behavioural test can catch it"
+         the O(PPS) cross-core true-sharing #6114 removed, and — for a single \
+         completed invocation — without changing any observable counter"
     );
+}
+
+/// #6304 (shared-capacity accounting). The mirror target's
+/// `pending_tx_admitted` is not private bookkeeping: every OTHER producer of
+/// that binding is gated on it, so an admission this call site holds is an
+/// admission nobody else can use. `mirror/mod_tests.rs::
+/// live_mirror_admission_reserves_slot_against_interleaving_producer` pins the
+/// mechanism; this pins the consequence at the LIVE call site — after
+/// `stage_flow_cache_hit` returns, the only capacity still consumed is
+/// capacity a real clone occupies.
+///
+/// Driven at a soft cap of exactly ONE slot, so a single stranded admission is
+/// the difference between an interleaving producer being served and being
+/// dropped. The `admitted` cell is the positive control: it proves the cap is
+/// genuinely binding, so the two `is_ok()` cells below are informative rather
+/// than vacuously true of an unbounded queue.
+///
+/// This does NOT cover the transient reserve-then-release window (see
+/// `live_flow_cache_callsite_delegates_to_the_shared_sampler_6304`); a call
+/// site that reserved before sampling and correctly dropped the reservation
+/// passes every cell here. What it does cover is the whole class where the
+/// reservation is taken and never handed back — the sampler declines but the
+/// admission outlives the call, the rewrite declines but the rollback leaks it,
+/// or an `Err` admission is dropped without release — each of which silently
+/// shrinks the mirror target's usable clone queue for every worker feeding it.
+#[test]
+fn live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304() {
+    // --- NON-SAMPLED: rate = 2, counter = 1 -> declined by the sampler.
+    let declined = LiveCallSiteFixture::new(MirrorTargetQueue::CapOneEmpty);
+    let run = run_stage(&declined, &tcp_v4_ack_frame(), 1);
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED"
+    );
+    assert!(
+        declined
+            .target_live
+            .try_enqueue_tx_owned(probe_tx_request())
+            .is_ok(),
+        "#6304: a non-sampled packet must leave the mirror target's single \
+         admission slot free for another producer"
+    );
+
+    // --- SELECTED but the rewrite declines: the admission is taken for real
+    // and must be released on the rollback path.
+    let rolled_back = LiveCallSiteFixture::new(MirrorTargetQueue::CapOneEmpty);
+    let pristine = tcp_v4_ack_frame();
+    let run = run_stage_with_meta(
+        &rolled_back,
+        &dma_raced_short_ihl_frame(),
+        test_meta(&pristine),
+        0,
+    );
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 0,
+        "control: both in-place rewriters must have declined"
+    );
+    assert!(
+        rolled_back
+            .target_live
+            .try_enqueue_tx_owned(probe_tx_request())
+            .is_ok(),
+        "#6304: the admission reserved before a rewrite that then declined must \
+         be RELEASED — stranding it permanently shrinks the mirror target's \
+         clone queue by one slot per declined packet"
+    );
+
+    // --- POSITIVE CONTROL: the cap really is one slot. A SELECTED packet whose
+    // clone IS admitted occupies it, and the same probe now fails; draining the
+    // owner side gives the slot back.
+    let admitted = LiveCallSiteFixture::new(MirrorTargetQueue::CapOneEmpty);
+    let run = run_stage(&admitted, &tcp_v4_ack_frame(), 0);
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED"
+    );
+    assert_eq!(
+        admitted.ingress_live.mirrored_packets.load(Ordering::Relaxed),
+        1,
+        "control: the clone must have been admitted and enqueued"
+    );
+    assert!(
+        admitted
+            .target_live
+            .try_enqueue_tx_owned(probe_tx_request())
+            .is_err(),
+        "control: a soft cap of one slot is genuinely binding — an ADMITTED \
+         clone excludes the interleaving producer, which is what makes the two \
+         `is_ok()` assertions above meaningful"
+    );
+    let mut queued = VecDeque::new();
+    admitted.target_live.take_pending_tx_into(&mut queued);
+    assert_eq!(queued.len(), 1, "control: the drained request is the clone");
+    assert!(
+        admitted
+            .target_live
+            .try_enqueue_tx_owned(probe_tx_request())
+            .is_ok(),
+        "control: draining the owner side releases the admission again"
+    );
+}
+
+/// A stand-in for another worker pushing to the same mirror target.
+fn probe_tx_request() -> TxRequest {
+    TxRequest {
+        bytes: vec![0x5a; 64],
+        expected_ports: None,
+        expected_addr_family: 0,
+        expected_protocol: 0,
+        flow_key: None,
+        egress_ifindex: MIRROR_OUT_BIND_IFINDEX,
+        cos_queue_id: None,
+        dscp_rewrite: None,
+        mirror_clone: false,
+        enqueue_ns: 0,
+    }
+}
+
+/// #6304 (over-reach guard / domain parity). The SELF-CONSISTENT counterpart of
+/// the rollback fixture: an IPv4 header that honestly declares IHL 15, carries
+/// 40 bytes of NOP options, and whose `total_len`, frame length and metadata
+/// offsets all agree — i.e. exactly what `parse_ipv4` in the shim would deliver.
+///
+/// It must take the in-place path and COMMIT the sampler. That is the load
+/// bearing half: it proves the rollback fixture's decline comes from the frame
+/// having CHANGED after parse, not from "IHL 15" being intrinsically
+/// unrewritable, and so proves the claim
+/// `dma_raced_short_ihl_frame` makes about reachability rather than asserting
+/// it. It also guards the option-carrying geometry itself — a rewrite that
+/// assumed a fixed 20-byte IPv4 header would read the L4 ports out of the
+/// option block and bail the DMA-race gate here.
+///
+/// Stays GREEN under every #6304 sampler revert — reserve-before-sample,
+/// deferring the commit on `Sampled(Err)`, dropping the `Sampled(Ok)` arm,
+/// hoisting the commit above the rewrite check, and leaking the reservation —
+/// measured, not assumed. It is not inert, though: the sampler-commit
+/// assertion below needs the mirror config to resolve, so it joins the
+/// ingress-VLAN wiring binding and reds if that resolution is dropped.
+#[test]
+fn live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    // IHL 15: 10 option words on top of the 20-byte base header.
+    let frame = vlan_tagged_tcp_v4_frame(10);
+    assert_eq!(frame.len(), 98, "18 L2 + 60 IPv4 (options) + 20 TCP");
+    assert_eq!(frame[18] & 0x0f, 15, "the IHL nibble the rollback frame fakes");
+    let run = run_stage(&fixture, &frame, 0);
+
+    assert!(
+        matches!(run.outcome, FlowCacheOutcome::Consumed),
+        "the cached flow must be consumed by the fast path"
+    );
+    assert_eq!(
+        run.tx_counters.pending_in_place_tx_packets, 1,
+        "#6304 domain parity: a SELF-CONSISTENT IHL-15 frame rewrites in place. \
+         The rollback fixture declines because its bytes changed after the shim \
+         described them — not because a long IPv4 header cannot be rewritten"
+    );
+    assert!(
+        run.scratch.scratch_forwards.is_empty(),
+        "and it does not take the PendingForwardRequest fallback"
+    );
+    assert_eq!(
+        run.mirror_sample_counter, 1,
+        "the sampler commits on the successful-rewrite path"
+    );
+}
+
+/// #6304 (staging telemetry). Both staging arms bump the debug forward/tx
+/// counters — the in-place arm at the end of the successful-rewrite branch, the
+/// fallback arm after `build_live_forward_request_from_frame` succeeds. Neither
+/// was read by any test, so both increments were deletable with the module
+/// green: an undercounted forward-debug metric on every established-flow cache
+/// hit, on whichever arm was cut.
+#[test]
+fn live_flow_cache_callsite_accounts_debug_forward_and_tx_6304() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let in_place = run_stage(&fixture, &tcp_v4_ack_frame(), 0);
+    assert_eq!(
+        in_place.tx_counters.pending_in_place_tx_packets, 1,
+        "control: this is the in-place arm"
+    );
+    assert_eq!(
+        in_place.dbg_forward, 1,
+        "#6304: the in-place staging arm accounts one forwarded packet"
+    );
+    assert_eq!(
+        in_place.dbg_tx, 1,
+        "#6304: ...and one TX, on the same arm"
+    );
+
+    let fallback = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let pristine = tcp_v4_ack_frame();
+    let run = run_stage_with_meta(
+        &fallback,
+        &dma_raced_short_ihl_frame(),
+        test_meta(&pristine),
+        0,
+    );
+    assert_eq!(
+        run.scratch.scratch_forwards.len(),
+        1,
+        "control: this is the PendingForwardRequest fallback arm"
+    );
+    assert_eq!(
+        run.dbg_forward, 1,
+        "#6304: the fallback staging arm accounts one forwarded packet too"
+    );
+    assert_eq!(run.dbg_tx, 1, "#6304: ...and one TX");
 }

@@ -130,6 +130,29 @@ and asserts the sampler does not advance, because `tx/dispatch` re-runs mirror
 selection on the fallback path and committing here would silently halve the
 flow's effective mirror rate.
 
+That decline is reachable ONLY for a frame whose bytes changed AFTER the shim
+described them — NIC DMA into a recycled UMEM frame, the hazard `expected_ports`
+and the #5466/#4965 preflight-then-commit contract exist for — so the fixture
+models exactly that and the metadata it passes is the PRISTINE frame's.
+`parse_ipv4` (`userspace-xdp/src/lib.rs`) does `read_bytes(data, data_end,
+l3_offset, ihl)?` before deriving `l4_offset`, so a shim-delivered IPv4 packet
+always satisfies `frame.len() - l3 >= ihl`, and `ipv4_declared_l3_end` then
+clamps the trimmed payload UP to at least `ihl`: no self-consistent, shim-
+produced IPv4 frame can take the `l3_payload.len() < ihl` bail at all. That is
+measured, not argued —
+`live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304` feeds
+the SELF-CONSISTENT IHL-15 packet (40 bytes of NOP options, an honest 80-byte
+datagram, metadata derived from it) and the rewrite succeeds. The rollback
+branch is therefore defense-in-depth against a post-parse frame change rather
+than a hot-path case, which is why nothing else in the suite covered it. An
+earlier revision of the fixture asserted an IHL the parser could not have
+emitted alongside those offsets and called the pair well-formed.
+
+The same module also binds `telemetry.dbg.forward` / `.tx` on BOTH staging arms.
+`run_stage` built the debug counters and dropped them unread, so either
+increment could be deleted with every guard above green — an undercounted
+forward-debug metric on every established-flow cache hit.
+
 The fixtures also keep every ifindex DISTINCT — wire VLAN 80 on physical
 ifindex 6 resolving to logical unit 20080, and mirror output unit 200 resolving
 through `forwarding.egress[].bind_ifindex` to physical XSK port 22 — because
@@ -143,20 +166,56 @@ resolves at all) and passing `config.output_ifindex` to admission unresolved
 Each of these reds under its own call-site-only mutation while both #6114 tests
 stay green — with ONE measured exception worth recording, because it bounds
 what this kind of test can prove. Reserve-before-sample INLINED at the call site
-(rather than reverting the shared helper) is FUNCTIONALLY INERT: the reservation
-is taken with an AcqRel CAS and handed straight back by
-`PendingTxAdmission::drop`, so no counter, queue, frame, or sampler value
-differs, and at cap it is not even reachable —
+(rather than reverting the shared helper) is indistinguishable to a
+SINGLE-THREADED observer of one COMPLETED invocation: the reservation is taken
+with an AcqRel CAS and handed straight back by `PendingTxAdmission::drop` before
+the call returns, so no counter, queue, frame, or sampler value differs
+afterwards, and at cap it is not even reachable —
 `try_acquire_pending_tx_admission` bails at its relaxed
-`admitted >= admission_cap` load before the `compare_exchange_weak`. #6114 was a
-shared-cacheline fix, not a correctness fix, so no black-box assertion separates
-the two orderings here. What is pinned instead is DELEGATION: a source canary
-asserts the call site reaches the queue through `sample_then_admit_mirror_clone`
-and never calls `admit_mirror_clone_to_live` directly, so the ordering is
-inherited from the helper the #6114 tests already bind. A second canary, living
-in `mirror/mod_tests.rs` because one inside the module could not fire, asserts
-the test module is still registered at all — deleting its nine-line `mod`
-declaration unregisters every guard above with no build error. The
+`admitted >= admission_cap` load before the `compare_exchange_weak`.
+
+That scope matters, and an earlier revision of this note got it wrong by
+dropping it: the ordering IS observable to a CONCURRENT producer. While the
+transient reservation is held the target's `pending_tx_admitted` is one higher,
+so another worker pushing to the same mirror target sees the queue full and its
+request is dropped — `mirror/mod_tests.rs::
+live_mirror_admission_reserves_slot_against_interleaving_producer` demonstrates
+exactly that exclusion. Reserve-first can therefore LOSE a second producer's
+clone that sample-first would have admitted. State created and destroyed inside
+one call is invisible to that call by construction and visible to anyone racing
+it; "no state differs" was established by walking one invocation to completion,
+which cannot decide the concurrent case.
+
+No test observes that transient window, and none deterministically can: it is a
+pair of atomic RMWs entirely inside `stage_flow_cache_hit`, with no production
+hook to synchronise against, so a racing-producer test would fail only
+probabilistically. That gap is recorded rather than papered over. What IS bound
+either side of it:
+
+- DELEGATION — a source canary asserts the call site reaches the queue through
+  `sample_then_admit_mirror_clone` and never calls `admit_mirror_clone_to_live`
+  directly, so the ordering is inherited from the helper the #6114 tests already
+  bind. (Those tests catch the historical early-return form inside the helper;
+  a helper rewritten to reserve first and then suppress on a sampler decline
+  would be caught by neither, which is why the canary pins the wiring.)
+- SHARED-CAPACITY ACCOUNTING —
+  `live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304` drives
+  the target at a soft cap of exactly one slot, so an interleaving producer is
+  the instrument: after a non-sampled packet and after a declined rewrite the
+  slot must be free, and after an admitted clone it must be taken. That reds on
+  any reservation the call site takes and fails to hand back (measured: leaking
+  it on the rollback path reds only that test, with the whole rest of the suite
+  green).
+
+A second canary, living in `mirror/mod_tests.rs` because one inside the module
+could not fire, asserts the test module is still registered at all — deleting
+its three-line `#[cfg(test)] #[path] mod` declaration unregisters every guard
+above with no build error. It matches the block CONTIGUOUSLY, `#[cfg(test)]`
+included, because unregistering needs no deletion: rewriting the predicate to
+`#[cfg(any())]` removes the module from every build while leaving the `#[path]`
+attribute and the `mod` item in place, and a canary looking for those two
+substrings independently passed under exactly that edit (measured — all eight
+module guards silently stopped compiling and the suite stayed green). The
 mirror clone is captured BEFORE the in-place rewrite and `packet_frame` ALIASES
 the UMEM, so the fixtures slice `raw_frame` out of the UMEM as the poll loop
 does: hand them a detached heap buffer instead and "the clone carries the
