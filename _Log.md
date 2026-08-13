@@ -113,6 +113,33 @@ be findable from the mutable ones.
 | unmask the GO deterministic base | `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` | `expandPoolV4("10.0.0.1/24") starts at 10.0.0.1, want 10.0.0.0` |
 
 
+### Builder half of F3 (same day): the unpinned side of the equality
+
+- **Action**: bind the emission-order half of #6812 F3.
+- **File(s)**: `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+Round 4 pinned the WALK's stable sort. The BUILDER's (`nat_source.go`, #4161
+tier sort) was pinned by nothing — `sort.SliceStable` -> `sort.Slice` left the
+whole Go suite green — and it is the half the Rust first-match matcher
+consumes, so a permutation misroutes rather than merely reorders.
+
+`TestBuilderEmittedOrderIsStableWithinATier_6812` asserts three invariants the
+production comment claims, separately: config order within a tier, rule-set
+CONTIGUITY, within-set rule order. It is the only test in the repo that reds on
+the builder mutation.
+
+**Contiguity proved independent, not asserted.** A stable sort keyed on
+(tier, RULE NAME) preserves every rule-set's first-reference order while
+splitting its rules across nine others: assertion (1) stays GREEN, (2) reds
+with `if00 SPLIT: its 2 rules span indices 0..10`. So a config-order-only
+assertion would not have caught the split — which is the half with the
+misrouting consequence.
+
+Ran under the diff-checksum harness guard adopted this round; TREE RESTORED
+(checksum match) after both mutations.
+
+
 ## 2026-08-13 — #6812 round 4: a disposition change I said did not happen, and an order-dependent backstop
 
 - **Timestamp**: 2026-08-13

@@ -711,3 +711,44 @@ that file actually runs — does not. `TestLeadingZeroHintIsBoundInThisPackage_6
 closes it, and also pins the negative half (the hint must never fire for an
 address that already works, nor invent a suggestion for an unrelated
 malformation).
+
+### The BUILDER half of F3 — the half with a dataplane consequence
+
+F3's deliverable is an EQUALITY: a same-tier tie resolves in config order,
+"which is what makes the walk's sequence equal the builder's emitted sequence".
+Round 4 pinned the WALK
+(`compiler_validate_strict_nat.go`, `sort.SliceStable(rulesets, ...)`). The
+BUILDER's sort (`nat_source.go`, the #4161 tier sort) was pinned by nothing:
+swapping it for `sort.Slice` left the entire Go suite green.
+
+The unpinned half is the one that matters. The walk's order decides which pool
+wins a budget slot; the builder's order is what the Rust matcher consumes, and
+`match_source_nat_result_for_tuple` is FIRST-MATCH on that slice precisely
+because it arrives pre-tiered — the production comment says so. Break the order
+and a flow takes another rule-set's translation.
+
+Three invariants are claimed by the comment above that sort, and they are now
+asserted SEPARATELY so a failure names which one broke: rule-sets in config
+order within a tier; each rule-set's rules CONTIGUOUS; rules in within-set
+order.
+
+**Contiguity is not implied by config order, and that is proved rather than
+argued.** Two mutations:
+
+| mutation | (1) order | (2) contiguity |
+|---|---|---|
+| `sort.SliceStable` -> `sort.Slice` | RED — `order[1] = if09, want if01` | RED — `if07 SPLIT: rules at 11..14 with [if05/r0@12 if03/r1@13] between` |
+| stable sort by (tier, RULE NAME) | **green** | RED — `if00 SPLIT: rules at 0..10 with nine other rule-sets between` |
+
+The second mutation keeps every rule-set's FIRST reference in config order
+while lifting its second rule past nine others — first-references ascending,
+blocks shredded. A config-order-only assertion passes it. That is why the
+contiguity check exists as its own assertion rather than as a consequence of a
+full-sequence comparison.
+
+The new test is also the ONLY thing in the repo that reds on the builder
+mutation — `go test ./...` under it produced exactly one failure.
+
+Provenance: the builder sort line is pre-existing and not authored by this PR.
+It is in scope because this PR's F3 claims an equality and shipped a binding
+for one side of it.

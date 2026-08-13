@@ -5673,7 +5673,12 @@ reserved for whole-dataplane selection where a rewrite shim
     `incremental_applies_cannot_creep_past_the_cap_6812` for the reservation,
     `TestAggregateFirstFitSameTierFollowsConfigOrder_6812` /
     `TestAggregateSameTierBudgetBoundaryFollowsConfigOrder_6812` for the
-    same-tier tie-break (both use MIXED-tier fixtures of 20 rule-sets: Go's
+    same-tier tie-break on the WALK side and
+    `TestBuilderEmittedOrderIsStableWithinATier_6812` for the BUILDER side —
+    F3 is an EQUALITY between two sequences and each half needs its own
+    binding; the builder half is the one with a dataplane consequence, since
+    the Rust matcher is first-match on the emitted slice and a split rule-set
+    misroutes (both use MIXED-tier fixtures of 20 rule-sets: Go's
     `sort.Slice` preserves order for an all-equal key, so a single-keyed
     same-tier fixture cannot distinguish a stable sort from an unstable one —
     measured, and it is why the second of these was re-cut), and

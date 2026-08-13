@@ -580,3 +580,169 @@ func TestSnapshotPoisonFollowsEmittedScopeOrder_6812(t *testing.T) {
 			out[1].PoolName, out[1].PoolUnusable, out[1].PoolUnusableReason)
 	}
 }
+
+// TestBuilderEmittedOrderIsStableWithinATier_6812 binds the BUILDER half of
+// the #6812 F3 equality. Round 4 pinned the WALK
+// (config.sourceNATAggregateReferencedCharges); this pins the emission side,
+// which is the half with a dataplane consequence.
+//
+// F3's deliverable is an EQUALITY — a same-tier tie resolves in config order,
+// which is what makes the walk's first-reference sequence equal the builder's
+// emitted sequence. Only one half was pinned. Swapping THIS sort
+// (nat_source.go, the #4161 tier sort) for an unstable one left the entire Go
+// suite green.
+//
+// THREE invariants, asserted separately so a failure names which one broke.
+// The comment above the production sort claims all three; only the first is
+// implied by the walk-side test:
+//
+//  1. rule-sets appear in config order WITHIN a tier;
+//  2. each rule-set's rules stay CONTIGUOUS — "rule-sets never interleave";
+//  3. rules keep their within-rule-set config order.
+//
+// (2) is the one with teeth and it is NOT implied by (1). An unstable sort can
+// keep every rule-set's FIRST rule in config order while lifting its second
+// rule past another rule-set's — first-references still ascending, blocks
+// split. Measured under sort.Slice: if03's two rules land at indices 10 and 13
+// with if07 and if05 between them.
+//
+// Why that is misrouting rather than an ordering nit: the Rust matcher
+// (match_source_nat_result_for_tuple, userspace-dp/src/nat/source.rs) is
+// FIRST-MATCH on this slice precisely because the slice arrives pre-tiered —
+// the production comment says so ("this is why the Rust first-match loop is
+// deliberately left unchanged: it reads a pre-tiered Vec"). Split a rule-set
+// and a flow matching if03/r1 takes if07/r0's translation instead.
+//
+// FAIL-ON-REVERT: sort.SliceStable -> sort.Slice in buildSourceNATSnapshots.
+func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
+	const nPerTier, rulesPerSet = 10, 2
+	tree := &config.ConfigTree{}
+	var cmds []string
+	// INTERLEAVED across two tiers so the input is neither single-keyed nor
+	// already tier-sorted, and >= 13 rule-sets so sort.Slice actually permutes
+	// (measured in round 4: pdqsort preserves order below that).
+	for i := 0; i < nPerTier; i++ {
+		iface := fmt.Sprintf("if%02d", i)
+		zone := fmt.Sprintf("zn%02d", i)
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source rule-set %s from interface ge-0/0/%d.0", iface, i),
+			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", iface, 100+i),
+			fmt.Sprintf("set security nat source rule-set %s from zone trust%d", zone, i),
+			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", zone, 200+i),
+		)
+		// TWO rules per rule-set: contiguity is vacuous with one.
+		for r := 0; r < rulesPerSet; r++ {
+			cmds = append(cmds,
+				fmt.Sprintf("set security nat source rule-set %s rule r%d match source-address 10.0.%d.0/24", iface, r, r),
+				fmt.Sprintf("set security nat source rule-set %s rule r%d then source-nat pool %s", iface, r, iface),
+				fmt.Sprintf("set security nat source rule-set %s rule r%d match source-address 10.0.%d.0/24", zone, r, r),
+				fmt.Sprintf("set security nat source rule-set %s rule r%d then source-nat pool %s", zone, r, zone),
+			)
+		}
+	}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+
+	// Precondition: the DECLARED order alternates tiers, so an unstable sort
+	// has something to permute. Without this the fixture silently decays into
+	// the all-equal-key shape that makes the mutation a no-op.
+	var declared []int
+	for _, rs := range cfg.Security.NAT.Source {
+		declared = append(declared, config.SourceNATScopeTier(
+			rs.FromInterface, rs.FromZone, rs.FromRoutingInstance,
+			rs.ToInterface, rs.ToZone, rs.ToRoutingInstance))
+	}
+	if len(declared) != 2*nPerTier {
+		t.Fatalf("compiled %d rule-sets, want %d", len(declared), 2*nPerTier)
+	}
+	alreadySorted := true
+	for i := 1; i < len(declared); i++ {
+		if declared[i] < declared[i-1] {
+			alreadySorted = false
+		}
+	}
+	if alreadySorted {
+		t.Fatal("declared order is already tier-sorted; an unstable sort would have " +
+			"nothing to permute and this fixture would not bind stability")
+	}
+
+	out := buildSourceNATSnapshots(cfg, nil)
+	if len(out) != 2*nPerTier*rulesPerSet {
+		t.Fatalf("emitted %d rules, want %d", len(out), 2*nPerTier*rulesPerSet)
+	}
+
+	// (1) Rule-set FIRST references, in emitted order, per tier.
+	var firstRefs []string
+	seen := map[string]bool{}
+	for _, s := range out {
+		if !seen[s.PoolName] {
+			seen[s.PoolName] = true
+			firstRefs = append(firstRefs, s.PoolName)
+		}
+	}
+	var wantRefs []string
+	for i := 0; i < nPerTier; i++ {
+		wantRefs = append(wantRefs, fmt.Sprintf("if%02d", i))
+	}
+	for i := 0; i < nPerTier; i++ {
+		wantRefs = append(wantRefs, fmt.Sprintf("zn%02d", i))
+	}
+	for i := range wantRefs {
+		if firstRefs[i] != wantRefs[i] {
+			// Errorf, not Fatalf: the contiguity check below is a SEPARATE
+			// invariant and a mutation that breaks both should report both.
+			t.Errorf("emitted rule-set order[%d] = %s, want %s — a same-tier tie was not "+
+				"resolved in CONFIG order, so the emitted sequence no longer equals the "+
+				"budget walk's.\n got: %v\nwant: %v", i, firstRefs[i], wantRefs[i],
+				firstRefs, wantRefs)
+			break
+		}
+	}
+
+	// (2) CONTIGUITY — independent of (1), and the invariant the Rust
+	// first-match matcher relies on.
+	firstIdx := map[string]int{}
+	lastIdx := map[string]int{}
+	for i, s := range out {
+		if _, ok := firstIdx[s.PoolName]; !ok {
+			firstIdx[s.PoolName] = i
+		}
+		lastIdx[s.PoolName] = i
+	}
+	for name, lo := range firstIdx {
+		hi := lastIdx[name]
+		if hi-lo+1 != rulesPerSet {
+			var between []string
+			for i := lo; i <= hi; i++ {
+				if out[i].PoolName != name {
+					between = append(between, fmt.Sprintf("%s/%s@%d", out[i].PoolName, out[i].Name, i))
+				}
+			}
+			t.Errorf("rule-set %s SPLIT: its %d rules span indices %d..%d with %v between "+
+				"them. The Rust matcher is first-match on this slice, so a flow matching a "+
+				"later rule of %s takes the interposed rule-set's translation instead",
+				name, rulesPerSet, lo, hi, between, name)
+		}
+	}
+
+	// (3) Within-rule-set rule order (Junos within-set order).
+	for name, lo := range firstIdx {
+		for r := 0; r < rulesPerSet; r++ {
+			if got := out[lo+r].Name; got != fmt.Sprintf("r%d", r) {
+				t.Errorf("rule-set %s rule[%d] = %s, want r%d — within-rule-set config "+
+					"order was not preserved", name, r, got, r)
+			}
+		}
+	}
+}
