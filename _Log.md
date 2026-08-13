@@ -1,3 +1,82 @@
+## 2026-08-13 — #6211/#6876 PR1 part 1: the NAT64 release kept the first-hit break this PR removed from source NAT
+
+- **Timestamp**: 2026-08-13 (fix/6211-synced-snat-rule-identity)
+- **Action**: Folded three of the four PR1 items from the Codex DO-NOT-MERGE
+  review. F2 (the per-worker reservation refcount) is NOT in this commit — it
+  is blocked on a design question reported to the lead (see below).
+
+  **F7a — the NAT64 release stopped at the first prefix that freed the flow.**
+  `release_nat64_allocation_with_mode` swept `nat64.prefixes` but `break`ed on
+  the first allocator that returned true. That is the SAME first-hit break this
+  PR REMOVED from `release_source_nat_allocation_with_mode`, left in place in
+  the parallel path — while the source-NAT comment explains at length why the
+  break is wrong and calls the resulting retention permanent. The PR fixed one
+  of two parallel paths and left the other contradicting its own reasoning.
+
+  Two prefixes come to hold ONE flow with no config edit, because the reserve
+  is occupancy-dependent: `reserve_synced_nat64_allocation` takes the first
+  prefix whose allocator ACCEPTS. A prefix whose port is transiently held by an
+  unrelated local flow is skipped and the reservation lands on a later prefix;
+  when the earlier one frees and the synced session refreshes (every HA
+  session-sync reconnect and every periodic re-upsert re-runs the reserve), the
+  same flow is held in both. One release then freed one and stranded the other
+  forever — nothing else removes a `live_by_flow` entry.
+
+  **The "at most one allocator" invariant was rewritten, not re-scoped.** The
+  sweep's stated justification was "Before #6211 the reserve was a pure function
+  of `rules`", scoping the invariant to an UNCHANGED rule set. That premise is
+  false on master, and master documents that it is false: its reserve loop has
+  the same per-rule fall-through and its own comment says a collision "leaves
+  the rule untouched and tries the next". Selection has ALWAYS been
+  occupancy-dependent, so a flow could already be held in two allocators with
+  the rule set untouched. The comment now says that, and the trailing
+  "(every pre-#6211 config)" parenthetical — which the rewrite falsified — was
+  corrected rather than left standing.
+
+  **Two stale citations** in the release-sweep rationale: the
+  `rollback_source_nat_allocation` sites are `:2644`/`:4912`, not `:2634`/`:4902`
+  (those are ordinary comment lines ten above). The other three were correct.
+
+- **File(s)**: `userspace-dp/src/nat64.rs`, `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat64_tests.rs`
+
+- **RED shown, not claimed.** `nat64_6876_release_frees_every_prefix_holding_the_flow`
+  reaches the two-prefix state through the production path (a squatting local
+  flow makes prefix A refuse, the reservation lands in B, the squatter retires,
+  the synced session refreshes into A) and then issues ONE release. Against the
+  unfixed code it fails as an ASSERTION, not a build break:
+
+      panicked at src/nat64_tests.rs:5567:5:
+      prefix B still owns the released flow's port: the NAT64 release stopped
+      at the FIRST prefix that freed it ...
+
+  Prefix A's assertion PASSES in the same run, so the guard discriminates
+  rather than merely failing. With the break removed: guard `ok`, and the full
+  suite is `CARGO_RC=0`, 4288 passed / 0 failed in the main suite (7 suites,
+  zero failures). `go build ./...` rc=0 (no Go changed). Exit codes captured
+  unpiped. No `cargo fmt` was run: the diff is three files, and the only
+  non-comment change is the removed `break`.
+
+  The observable is `reserve_nat64_pool_port`'s bool rather than "which port a
+  fresh allocation hands out" — a freed port goes on the recycle queue and is
+  not reissued immediately, which `nat64_4381_release_frees_the_port`'s
+  `assert_ne!` already pins.
+
+- **F2 (per-worker refcount) DEFERRED within PR1, reported to the lead.** The
+  agreed design was a holder-set bitmask keyed by `worker_id`, with the width
+  made structurally impossible to exceed. Verification found that assumption
+  false: `records: BTreeMap<u32, WorkerRuntimeRecord>` and
+  `coordinator/worker_manager.rs:70-79` documents that worker ids are SPARSE —
+  unregister handlers can remove the bindings carrying the low ids while a
+  high-id worker survives — so a sparse id >= 64 sets no bit with only two live
+  workers. There is no constant to assert against either: `MAX_WORKERS_SCRATCH
+  = 32` was removed and a test now exercises 40 slots. A bare counter is worse
+  still, and not only on worker exit: `reserve_flow` early-returns on a
+  same-tuple re-reserve, the path every refresh takes from the same worker, so
+  a counter incremented there inflates without bound and never drains.
+  Awaiting the lead's decision between bounding ids where they are assigned and
+  moving the peer-synced reservation to a single coordinator-owned take/release.
+
 ## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
 
 - **Timestamp**: 2026-08-12 (fix/5173-shim-queue-mis-steer, PR #6676)

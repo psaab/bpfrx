@@ -856,28 +856,35 @@ fn release_source_nat_allocation_with_mode(
     // #6211: free from EVERY allocator that holds this exact
     // `(flow, translated)` — do NOT stop at the first.
     //
-    // Before #6211 the reserve was a pure function of `rules`, so a re-upsert
-    // of the same session always re-entered the SAME allocator and
-    // short-circuited on `reserve_flow`'s idempotence. Scope that precisely:
-    // the "at most one allocator holds a given flow" invariant held against an
-    // UNCHANGED `rules`, not unconditionally. `parse_source_nat_rules_with_previous`
+    // State the reason accurately, because the sweep rests on it (#6876): the
+    // reserve has NEVER been a pure function of `rules`, so the "at most one
+    // allocator holds a given flow" invariant did not hold even against an
+    // UNCHANGED rule set. `reserve_synced_on_first_pool_owner` takes the first
+    // rule whose allocator ACCEPTS and skips one that refuses — selection is
+    // OCCUPANCY-dependent. That is pre-#6211 behaviour, not something this fix
+    // introduced: the pre-#6211 loop had the same per-rule fall-through and its
+    // own comment described it ("a collision on the standby ... leaves the rule
+    // untouched and tries the next"). So a rule that refused while an unrelated
+    // local flow held the identity, and accepted later once that flow retired,
+    // could ALREADY put one flow in two allocators across a re-upsert — every
+    // live session re-upserts on HA session-sync reconnect and on a
+    // post-delete-journal-overflow resync — with the rule set untouched.
+    //
+    // Two other routes reach the same state. `parse_source_nat_rules_with_previous`
     // carries allocators over keyed on `allocator_key()` alone, so an edit that
-    // reshuffled which rule a session matched could already strand a flow in a
-    // carried-over allocator. #6211 does not create that hazard; it makes it
-    // reachable without any config edit at all, because pass 1 and pass 2 can
-    // disagree on an unchanged rule set. A first-hit `break` was sufficient only
-    // under the narrower invariant.
-    // The #6211 two-pass selection breaks that invariant — pass 1 and pass 2
-    // can choose DIFFERENT rules for the same session at different times (a
-    // zone delete/renumber, or a rule-set `from zone` / `match` edit, flips
-    // `synced_zones` to `None` or moves pass 1's candidate set), and the two
-    // rules' allocators are independent. A re-upsert then reserves the flow a
-    // SECOND time in a different allocator (every live session re-upserts on
-    // HA session-sync reconnect and on a post-delete-journal-overflow
-    // resync). With a first-hit `break` the teardown freed one and left the
-    // other holding its `(pool_addr, port)` forever: a permanent standby pool
-    // leak that also counted against `max_tracked_flows` until the allocator
-    // reported `AllocatorExhausted`. Nothing reaps it — `live_by_flow` is only
+    // reshuffled which rule a session matched could strand a flow in a
+    // carried-over allocator. And #6211's two-pass selection adds a third:
+    // pass 1 and pass 2 can choose DIFFERENT rules for the same session at
+    // different times (a zone delete/renumber, or a rule-set `from zone` /
+    // `match` edit, flips `synced_zones` to `None` or moves pass 1's candidate
+    // set), and the two rules' allocators are independent.
+    //
+    // A first-hit `break` was never sufficient under any of them, and the cost
+    // of getting it wrong is unbounded: the teardown freed one allocator and
+    // left the other holding its `(pool_addr, port)` forever — a permanent
+    // standby pool leak that also counted against `max_tracked_flows` until
+    // the allocator reported `AllocatorExhausted`. Nothing reaps it —
+    // `live_by_flow` is only
     // removed by `release_flow` / `rollback_flow` / the stale-tuple replace in
     // `reserve_flow`, and `gc_expired_chunked` sweeps persistent LEASES, not
     // live flows. A config change does not rebuild the allocator either:
@@ -888,15 +895,17 @@ fn release_source_nat_allocation_with_mode(
     // `rollback_flow` return false unless `live_by_flow[flow].translated`
     // equals THIS `translated` tuple, so an allocator holding a different
     // flow — or the same flow under a different translation — is untouched.
-    // For the single-reservation case (every pre-#6211 config, and every
-    // config where selection never moved) the outcome is bit-identical; only
-    // the early exit is gone.
+    // For the single-reservation case — whenever selection never moved, which
+    // is the overwhelmingly common one — the outcome is bit-identical; only
+    // the early exit is gone. Note this is NOT the same as "every pre-#6211
+    // config": occupancy-dependent selection predates #6211, so a pre-#6211
+    // config could already hold one flow in two allocators (see above).
     //
     // That early exit was NOT on a cold path, so state the cost honestly rather
     // than waving it off. This body backs `rollback_source_nat_allocation` as
     // well as the release, and that has five non-test call sites, all of them on
     // the packet path in `afxdp/poll_descriptor/mod.rs` (:2313, :2374, :2472,
-    // :2634, :4902) — :2374 is the admission-refusal arm, i.e. the flood regime.
+    // :2644, :4912) — :2374 is the admission-refusal arm, i.e. the flood regime.
     // Per refused SNAT'ed flow the sweep takes K allocator locks instead of
     // (owning index + 1), where K is the pool-mode rule count. This is a
     // mechanism statement: no throughput measurement was taken and none is
