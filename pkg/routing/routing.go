@@ -37,6 +37,21 @@ import (
 type Manager struct {
 	nlHandle *netlink.Handle // sole owner; closed exactly once in Close()
 
+	// closeHandleFn performs the handle-release step of Close. New() binds it
+	// to the handle it just created; the partial *ForTest constructors in
+	// test_seams.go leave it nil along with nlHandle.
+	//
+	// #5718 fold r3: the step is indirected so the #848 ORDERING contract —
+	// keepalives drain BEFORE the handle is released — is testable without a
+	// live netlink handle. Observing it through a real *netlink.Handle means
+	// the test skips wherever netlink is unavailable, and a skipped test
+	// reports PASS: it then accepts every implementation, so a mutation run
+	// against it yields a green cell that looks like evidence and is not. A
+	// guard that only fires on a box with netlink is not a guard for the merge
+	// gate. Binding the release to an injectable step lets the contract hold in
+	// CI, with the real-handle test kept as a supplementary check.
+	closeHandleFn func()
+
 	vrf      *vrfManager
 	routes   *routeReader
 	tunnel   *tunnelManager
@@ -57,6 +72,10 @@ func New() (*Manager, error) {
 		return nil, fmt.Errorf("netlink handle: %w", err)
 	}
 	m := &Manager{nlHandle: h}
+	// Bind the release step to the handle we just created, so a later
+	// reassignment of m.nlHandle cannot redirect Close at the handle this
+	// Manager actually owns.
+	m.closeHandleFn = h.Close
 	m.vrf = &vrfManager{ops: h}
 	m.routes = &routeReader{ops: h}
 	// tunnel depends on vrf for BindInterfaceToVRF (no lock-ordering
@@ -80,10 +99,19 @@ func New() (*Manager, error) {
 // the domain split; there is no daemon caller of Close today). It drains
 // keepalive goroutines via tunnel.stopAll() BEFORE closing the handle so
 // no in-flight keepalive tick can use-after-close the handle (#848).
+// #5718 A7-b02-C01: the tunnel domain is nil-guarded for the same reason
+// nlHandle is. The partial test-manager constructors in test_seams.go
+// (NewManagerWithRuleOpsForTest, NewManagerWithRouteListerForTest) wire only
+// the domains their callers exercise and leave m.tunnel nil, so an unguarded
+// m.tunnel.stopAll() panics: stopAll takes t.mu on a nil *tunnelManager
+// (tunnel_keepalive_runner.go). A caller must be able to `defer m.Close()` on
+// any Manager this package hands out, including a partial one.
 func (m *Manager) Close() error {
-	m.tunnel.stopAll()
-	if m.nlHandle != nil {
-		m.nlHandle.Close()
+	if m.tunnel != nil {
+		m.tunnel.stopAll()
+	}
+	if m.closeHandleFn != nil {
+		m.closeHandleFn()
 	}
 	return nil
 }

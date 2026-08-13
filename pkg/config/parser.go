@@ -127,6 +127,13 @@ func ParseSetCommand(input string) ([]string, error) {
 	return path, err
 }
 
+// ParseSetCommandQuoted is ParseSetCommand plus the per-token quote provenance
+// SetPathQuoted needs (#6673). See ParseSetVerbQuoted.
+func ParseSetCommandQuoted(input string) ([]string, []bool, error) {
+	_, path, quoted, err := ParseSetVerbQuoted(input)
+	return path, quoted, err
+}
+
 // ParseSetVerb parses a single flat command into its verb and path. The
 // verb is one of "set", "delete", "deactivate", or "activate"; a line with
 // no recognized leading verb is reported as "set" with the whole line as
@@ -136,11 +143,28 @@ func ParseSetCommand(input string) ([]string, error) {
 // callers (configstore LoadSet / LoadMerge) switch on the returned verb to
 // flip Node.Inactive instead of re-adding an active node.
 func ParseSetVerb(input string) (verb string, path []string, err error) {
+	verb, path, _, err = ParseSetVerbQuoted(input)
+	return verb, path, err
+}
+
+// ParseSetVerbQuoted is ParseSetVerb plus per-token QUOTE PROVENANCE: quoted[i]
+// reports whether path[i] was authored as a quoted string rather than a bare
+// word (#6673).
+//
+// The flat-set path is one of the two ways an operator authors a bracketed
+// list, and it is the one where the bracket lands on a CHILD node's keys
+// (SetPath), so it must carry the same bit the hierarchical parser records in
+// parseKeys — otherwise `set … commands [ "set" "system host-name x" ]` reaches
+// the compiler indistinguishable from the single unquoted command
+// `set … commands set system host-name x`, and the two members FUSE into a
+// command the operator never wrote. Callers that do not care keep using
+// ParseSetVerb / ParseSetCommand.
+func ParseSetVerbQuoted(input string) (verb string, path []string, quoted []bool, err error) {
 	lexer := NewLexer(input)
 
 	tok := lexer.Next()
 	if tok.Type != TokenIdentifier {
-		return "", nil, fmt.Errorf("expected identifier, got %s", tok.Type)
+		return "", nil, nil, fmt.Errorf("expected identifier, got %s", tok.Type)
 	}
 
 	switch tok.Value {
@@ -148,9 +172,11 @@ func ParseSetVerb(input string) (verb string, path []string, err error) {
 		verb = tok.Value
 	default:
 		// No recognized prefix -- the first token is part of the path and
-		// the verb defaults to set (a bare path).
+		// the verb defaults to set (a bare path). It reached here as a
+		// TokenIdentifier, so it is bare by construction.
 		verb = verbSet
 		path = append(path, tok.Value)
+		quoted = append(quoted, false)
 	}
 
 	for {
@@ -168,7 +194,7 @@ func ParseSetVerb(input string) (verb string, path []string, err error) {
 			// success. Permit at most one terminating semicolon, then require EOF;
 			// reject any subsequent token with its line/column.
 			if next := lexer.Next(); next.Type != TokenEOF {
-				return "", nil, fmt.Errorf(
+				return "", nil, nil, fmt.Errorf(
 					"unexpected token %s after ';' at line %d, column %d (only one statement per line)",
 					next.Type, next.Line, next.Column)
 			}
@@ -176,16 +202,17 @@ func ParseSetVerb(input string) (verb string, path []string, err error) {
 		}
 		if tok.Type == TokenIdentifier || tok.Type == TokenString {
 			path = append(path, tok.Value)
+			quoted = append(quoted, tok.Type == TokenString)
 		} else {
-			return "", nil, fmt.Errorf("unexpected token %s at line %d, column %d",
+			return "", nil, nil, fmt.Errorf("unexpected token %s at line %d, column %d",
 				tok.Type, tok.Line, tok.Column)
 		}
 	}
 
 	if len(path) == 0 {
-		return "", nil, fmt.Errorf("empty path")
+		return "", nil, nil, fmt.Errorf("empty path")
 	}
-	return verb, path, nil
+	return verb, path, quoted, nil
 }
 
 // parseStatements parses zero or more statements until EOF or '}'.
@@ -360,6 +387,13 @@ func (p *Parser) parseStatement() *Node {
 	for i, k := range keys {
 		if i > 0 && kinds[i] == TokenIdentifier && k == inactiveMarker {
 			keys = keys[:i]
+			// Truncate the kinds in lockstep. The leading-marker branch above
+			// already re-slices both; this one dropped only the keys, which
+			// left kinds LONGER than keys for every statement carrying an
+			// inline marker — invisible while kinds was consulted by index
+			// against keys, but a length mismatch the moment anything derives
+			// a per-key slice from it (#6673 quote provenance).
+			kinds = kinds[:i]
 			// The governed tokens were only on the key line of a leaf; a
 			// trailing `{ ... }` cannot follow an inline marker in valid
 			// Junos, so nothing more to consume here.
@@ -369,6 +403,18 @@ func (p *Parser) parseStatement() *Node {
 
 	line := p.lexer.Peek().Line
 	col := p.lexer.Peek().Column
+
+	// #6673: carry the source token KINDS onto the node as quote provenance.
+	// Both marker paths above re-slice `kinds` in lockstep with `keys`, so it
+	// still describes exactly the keys that survived; the loop is written over
+	// `keys` (and range-checks `kinds`) so a future divergence degrades to
+	// "provenance unknown" rather than panicking on a stale length.
+	quoted := make([]bool, len(keys))
+	for i := range keys {
+		if i < len(kinds) {
+			quoted[i] = kinds[i] == TokenString
+		}
+	}
 
 	tok := p.lexer.Peek()
 	switch tok.Type {
@@ -382,35 +428,41 @@ func (p *Parser) parseStatement() *Node {
 		} else {
 			p.addErrorf(closeTok.Line, closeTok.Column, "expected '}', got %s", closeTok)
 		}
-		return &Node{
+		n := &Node{
 			Keys:     keys,
 			Children: children,
 			Inactive: inactive,
 			Line:     line,
 			Column:   col,
 		}
+		n.setKeysQuoted(quoted)
+		return n
 
 	case TokenSemicolon:
 		// Leaf: keys ;
 		p.lexer.Next() // consume ;
-		return &Node{
+		n := &Node{
 			Keys:     keys,
 			IsLeaf:   true,
 			Inactive: inactive,
 			Line:     line,
 			Column:   col,
 		}
+		n.setKeysQuoted(quoted)
+		return n
 
 	default:
 		// No semicolon or brace -- treat as implicit leaf
 		// (some Junos statements can omit trailing semicolon at EOF)
-		return &Node{
+		n := &Node{
 			Keys:     keys,
 			IsLeaf:   true,
 			Inactive: inactive,
 			Line:     line,
 			Column:   col,
 		}
+		n.setKeysQuoted(quoted)
+		return n
 	}
 }
 

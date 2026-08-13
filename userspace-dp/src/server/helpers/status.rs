@@ -90,6 +90,23 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.
     state.status.session_publish_errors_total = state.afxdp.session_publish_errors_total();
+    // #4800: new-flow-install contention surface — the publish and
+    // replication legs. The NAT-allocator leg rides source_nat_pools.
+    state.status.shared_session_publishes_total = state.afxdp.shared_session_publishes_total();
+    state.status.shared_session_publish_lock_acquisitions_total =
+        state.afxdp.shared_session_publish_lock_acquisitions_total();
+    state.status.shared_session_publish_lock_contended_total =
+        state.afxdp.shared_session_publish_lock_contended_total();
+    state.status.session_replication_upserts_total =
+        state.afxdp.session_replication_upserts_total();
+    state.status.session_replication_enqueued_total =
+        state.afxdp.session_replication_enqueued_total();
+    state.status.session_replication_lock_contended_total =
+        state.afxdp.session_replication_lock_contended_total();
+    state.status.session_replication_queue_depth_sum =
+        state.afxdp.session_replication_queue_depth_sum();
+    state.status.session_replication_queue_depth_max =
+        state.afxdp.session_replication_queue_depth_max();
     // #2244: total failed dnat_table reverse-SNAT BPF-map publishes. The
     // cause-side signal for dnat_table capacity pressure that silently
     // breaks embedded-ICMP NAT reversal (PMTUD / traceroute).
