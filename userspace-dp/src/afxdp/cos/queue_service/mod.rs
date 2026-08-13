@@ -975,122 +975,92 @@ fn select_exact_cos_guarantee_queue_waterfill(
     if queue_count == 0 || root.exact_queues_by_rate_ascending.is_empty() {
         return None;
     }
-    // Phase 1 epoch refill. The BUDGET is refilled on two triggers:
-    //   (a) `pass1 == 0` — budget spent. Covers both the genuine Phase-2
-    //       wrap (the `None` path zeroes pass1 and arms wrap-pending) and a
-    //       mid-walk Phase-1 exact-fit honor that subtracted the last bytes.
-    //       Also the first-call path (pass1 seeds to 0 in the builder).
-    //   (b) #1743 time-based: `elapsed >= COS_GUARANTEE_VISIT_NS` since the
-    //       last refill. Phase-2 selections do NOT decrement `pass1`, so
-    //       under saturation `pass1` freezes at a small non-zero value below
-    //       every remaining quantum and small classes stop being honored;
-    //       the time tick refreshes the budget once per 200µs window.
-    //
-    // The honored BITSET, however, is cleared (allowing re-honoring) ONLY on
-    // a genuine epoch boundary: the time tick OR a Phase-2 WRAP
-    // (`waterfill_epoch_wrap_pending`). #1743 r3: a bare mid-walk `pass1 == 0`
-    // refills the budget but must NOT clear the bits, else an all-min-quantum
-    // exact-fit config livelocks Phase 1 on q0 and never reaches Phase 2.
-    //
-    // CRITICAL: NEITHER refill path resets `waterfill_phase2_cursor`
-    // (#1743 r2 — only the genuine Phase-2 wrap at the end-of-function `None`
-    // path does) so the descending RR walk advances through ALL large classes
-    // across epochs rather than restarting at the largest (the
-    // residual-starvation regression #1630 r4 caught).
-    let elapsed_since_refresh = now_ns.saturating_sub(root.waterfill_epoch_start_ns);
-    let time_refresh = elapsed_since_refresh >= COS_GUARANTEE_VISIT_NS;
-    let exhausted = root.waterfill_pass1_remaining_bytes == 0;
-    if time_refresh || exhausted {
-        // fraction is clamped 0.0..1.0 at config-apply time; the
-        // dispatch gate also requires fraction > 0. We use f64 → u64
-        // with a floor + saturating cast guarded by the multiplication.
-        let frac = root.oversubscription_guarantee_fraction;
-        let raw_pass1 = if root.shaping_rate_bytes == 0 {
-            // Transparent (unshaped) root: there is no shaper-delivered
-            // cap to anchor against, so fall back to the legacy
-            // `quantum_sum × fraction` over the current eligible set.
-            // The result fits in u64 because quantum_sum ≤ 512 KB ×
-            // N_queues and fraction ≤ 1.0.
-            let mut quantum_sum: u64 = 0;
-            for &qi in &root.exact_queues_by_rate_ascending {
-                quantum_sum =
-                    quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
-            }
-            ((quantum_sum as f64) * frac).floor() as u64
-        } else {
-            // #1743 Hunk A: anchor pass1 to the shaper-delivered bytes
-            // per epoch × fraction — the documented contract "fraction ×
-            // cap" where cap = shaper × VISIT_NS (docs/fairness-regimes.md).
-            // The legacy `quantum_sum × fraction` over-provisioned pass1
-            // by ~4× for any oversubscribed config (Σ R_i > shaper), so
-            // Phase 2 never fired and the selector degenerated to
-            // ascending RR over all classes. shaping_rate_bytes is
-            // bytes/sec; the u128 product is overflow-safe.
-            let cap_per_epoch = ((root.shaping_rate_bytes as u128)
-                * (COS_GUARANTEE_VISIT_NS as u128)
-                / 1_000_000_000u128) as u64;
-            ((cap_per_epoch as f64) * frac).floor() as u64
-        };
-        // AGY RISK-1 (Codex code-r1 #2): a tiny-positive fraction floors
-        // `raw_pass1` to 0 on EITHER branch — the dispatch gate admits any
-        // `fraction > 0`, including transparent + tiny-fraction. A zero
-        // budget makes `exhausted` true on every selector call → refill +
-        // cursor-reset thrash → Phase-2 starves from index 0. Clamp BOTH
-        // branches to at least one min-quantum so the smallest class is
-        // honorable and the exhausted path can't fire every call. (The
-        // clamp is a no-op for normal fractions where raw_pass1 already
-        // exceeds the smallest quantum.)
-        let pass1 = raw_pass1.max(COS_GUARANTEE_QUANTUM_MIN_BYTES);
-        root.waterfill_pass1_remaining_bytes = pass1;
-        root.waterfill_epoch_start_ns = now_ns;
-        // #1743 (Codex code-r3): clear the persistent honored bitset ONLY on
-        // a genuine epoch boundary — the time tick OR a Phase-2 WRAP
-        // (`waterfill_epoch_wrap_pending`, set by the end-of-function `None`
-        // path). A bare `exhausted` (pass1 == 0) that did NOT come from a
-        // wrap — e.g. a Phase-1 exact-fit honor that subtracted the last
-        // bytes mid-walk — must NOT clear the bits: clearing there re-enabled
-        // a degenerate all-min-quantum livelock where q0 is honored, pass1
-        // hits 0, the next call clears its bit, q0 is re-honored, and Phase 2
-        // is never reached. With the bits intact, the already-honored small
-        // queue is skipped (the `i < 64` check below), so the walk advances
-        // to the next queue or breaks to Phase 2 — guaranteeing forward
-        // progress. The budget is still refilled on a bare `exhausted` so
-        // Phase 1 can resume against the un-honored queues.
-        let epoch_boundary = time_refresh || root.waterfill_epoch_wrap_pending;
-        if epoch_boundary {
-            root.waterfill_honored_epoch_bits = 0;
-        }
-        root.waterfill_epoch_wrap_pending = false;
-        // #1743 (Codex code-r2): the refill never resets the Phase-2 cursor.
-        // The cursor's ONLY reset is the genuine Phase-2 WRAP at the
-        // end-of-function `None` path (which also re-arms epoch_wrap_pending),
-        // so the descending walk advances continuously across epochs — the
-        // #1630 r4 continuity invariant.
-        //
-        // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
-        // here (no `queue` borrowed yet) on every refill, either trigger.
-        root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
-    }
-    // Phase 1: ascending-rate walk. Pick the first runnable queue
-    // whose secondary_budget ≤ pass1_remaining that has NOT already been
-    // honored this epoch.
-    //
-    // #1732: the honored set is the persistent `waterfill_honored_epoch_bits`
-    // on `root`, keyed by the ASCENDING-VEC ORDINAL `i` (NOT `queue_idx`).
-    // It is read by BOTH phases and cleared at the epoch refill above, so
-    // each queue is honored at most once per epoch: without the Phase-1 skip
-    // the smallest-rate queue would be re-honored on every selector call and
-    // monopolise the Phase-1 budget (the lowest-rate skew this fix targets).
-    // Iterating by index over the persistent vec avoids the per-call heap
-    // clone the old code used solely to dodge the `&mut root.queues` borrow
-    // conflict; `queue_idx` is copied out (a `Copy` `usize`) before the
-    // `&mut` borrow, so borrow-split holds with no allocation.
+    // Phase 1 epoch refill (#4408 Increment 3a). See
+    // `refill_waterfill_epoch` for the two refill triggers, the
+    // epoch-boundary gate on the honored bitset, and the #1743 r2/r3
+    // ordering hazard that keeps that block atomic.
+    refill_waterfill_epoch(root, now_ns);
     let ascending_len = root.exact_queues_by_rate_ascending.len();
     debug_assert!(
         ascending_len <= 64,
         "waterfill honored bitset is u64; >64 exact guarantee queues on one \
          interface is unsupported (ordinal bit range overflow)"
     );
+    // Phase 1: ascending-rate walk (#4408 Increment 3b). `None` means
+    // "budget exhausted or nothing eligible" — both of the original body's
+    // non-selecting Phase-1 exits — and falls through to Phase 2.
+    if let Some(selection) = waterfill_phase1_select(
+        root,
+        queue_fast_path,
+        now_ns,
+        lease_telemetry,
+        queue_count,
+        ascending_len,
+    ) {
+        return Some(selection);
+    }
+    // Phase 2: descending-rate residual walk (#4408 Increment 3b). `None`
+    // means the descending cycle serviced nothing, which is the genuine
+    // Phase-2 WRAP handled by the tail below.
+    if let Some(selection) = waterfill_phase2_select(
+        root,
+        queue_fast_path,
+        now_ns,
+        lease_telemetry,
+        queue_count,
+        ascending_len,
+    ) {
+        return Some(selection);
+    }
+    // Genuine Phase-2 WRAP: a full descending cycle serviced nothing, so the
+    // epoch is fully consumed. Reset the Phase-1 budget and the cursor for
+    // the next call, and arm `epoch_wrap_pending` so the refill above clears
+    // the honored bitset (a true epoch boundary). #1743 (Codex r3): this is
+    // the ONLY place that arms the honored-bits clear besides the time tick —
+    // a bare mid-walk `pass1 == 0` does not, which avoids the all-min-quantum
+    // re-honor livelock.
+    root.waterfill_pass1_remaining_bytes = 0;
+    root.waterfill_phase2_cursor = 0;
+    root.waterfill_epoch_wrap_pending = true;
+    None
+}
+
+// Phase 1: ascending-rate walk. Pick the first runnable queue
+// whose secondary_budget ≤ pass1_remaining that has NOT already been
+// honored this epoch.
+//
+// #1732: the honored set is the persistent `waterfill_honored_epoch_bits`
+// on `root`, keyed by the ASCENDING-VEC ORDINAL `i` (NOT `queue_idx`).
+// It is read by BOTH phases and cleared at the epoch refill above, so
+// each queue is honored at most once per epoch: without the Phase-1 skip
+// the smallest-rate queue would be re-honored on every selector call and
+// monopolise the Phase-1 budget (the lowest-rate skew this fix targets).
+// Iterating by index over the persistent vec avoids the per-call heap
+// clone the old code used solely to dodge the `&mut root.queues` borrow
+// conflict; `queue_idx` is copied out (a `Copy` `usize`) before the
+// `&mut` borrow, so borrow-split holds with no allocation.
+//
+// #4408 Increment 3b: lifted verbatim out of
+// `select_exact_cos_guarantee_queue_waterfill`. Every non-selecting exit of
+// this walk — the `break` and loop exhaustion alike — already converged on
+// the SAME successor in the original body, so `None` encodes them faithfully
+// rather than inventing an outcome protocol. `#[inline(always)]` +
+// same-module keeps the post-inline IR the shape it was (plan §2d); no
+// coldness claim is made or needed.
+//
+// The interior of this walk is NOT further decomposable: `queue`'s `&mut`
+// borrow of `root.queues` coexists with reads of the disjoint `root.tokens`
+// and then ends so `count_park_reason`/`park_cos_queue` can take `&mut root`
+// whole. That is NLL-precise; splitting inside would have to re-derive it.
+#[inline(always)]
+fn waterfill_phase1_select(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
+    queue_count: usize,
+    ascending_len: usize,
+) -> Option<ExactCoSQueueSelection> {
     for i in 0..ascending_len {
         let queue_idx = root.exact_queues_by_rate_ascending[i];
         // #1732: at-most-once Phase-1 honor per epoch. Skip a queue already
@@ -1266,17 +1236,37 @@ fn select_exact_cos_guarantee_queue_waterfill(
             }),
         });
     }
-    // Phase 2: descending-rate walk over queues NOT honored in Phase 1
-    // this epoch.
-    //
-    // #1732: this reads the SAME persistent `waterfill_honored_epoch_bits`
-    // that Phase 1 sets, keyed by the ascending-vec ORDINAL `pos_from_end`,
-    // so it correctly skips queues that already took their Phase-1 guarantee
-    // this epoch and serves the residual to the larger un-honored queues —
-    // the documented descending-residual intent. (Previously this checked an
-    // empty function-local `honored_mask`, which is why the old comment here
-    // admitted it only "approximated".) Iterating `exact_queues_by_rate_
-    // ascending` by index avoids the heap clone the old code used.
+    None
+}
+
+// Phase 2: descending-rate walk over queues NOT honored in Phase 1
+// this epoch.
+//
+// #1732: this reads the SAME persistent `waterfill_honored_epoch_bits`
+// that Phase 1 sets, keyed by the ascending-vec ORDINAL `pos_from_end`,
+// so it correctly skips queues that already took their Phase-1 guarantee
+// this epoch and serves the residual to the larger un-honored queues —
+// the documented descending-residual intent. (Previously this checked an
+// empty function-local `honored_mask`, which is why the old comment here
+// admitted it only "approximated".) Iterating `exact_queues_by_rate_
+// ascending` by index avoids the heap clone the old code used.
+//
+// #4408 Increment 3b: lifted verbatim out of
+// `select_exact_cos_guarantee_queue_waterfill`. Every non-selecting exit of
+// this walk — the `break` and loop exhaustion alike — already converged on
+// the SAME successor in the original body, so `None` encodes them faithfully
+// rather than inventing an outcome protocol. `#[inline(always)]` +
+// same-module keeps the post-inline IR the shape it was (plan §2d); no
+// coldness claim is made or needed.
+#[inline(always)]
+fn waterfill_phase2_select(
+    root: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+    now_ns: u64,
+    lease_telemetry: &mut CoSQueueLeaseAcquireTelemetry,
+    queue_count: usize,
+    ascending_len: usize,
+) -> Option<ExactCoSQueueSelection> {
     let mut phase2_idx = root.waterfill_phase2_cursor;
     if phase2_idx >= ascending_len {
         phase2_idx = 0;
@@ -1385,17 +1375,119 @@ fn select_exact_cos_guarantee_queue_waterfill(
             phase1_honor: None,
         });
     }
-    // Genuine Phase-2 WRAP: a full descending cycle serviced nothing, so the
-    // epoch is fully consumed. Reset the Phase-1 budget and the cursor for
-    // the next call, and arm `epoch_wrap_pending` so the refill above clears
-    // the honored bitset (a true epoch boundary). #1743 (Codex r3): this is
-    // the ONLY place that arms the honored-bits clear besides the time tick —
-    // a bare mid-walk `pass1 == 0` does not, which avoids the all-min-quantum
-    // re-honor livelock.
-    root.waterfill_pass1_remaining_bytes = 0;
-    root.waterfill_phase2_cursor = 0;
-    root.waterfill_epoch_wrap_pending = true;
     None
+}
+
+// Phase 1 epoch refill. The BUDGET is refilled on two triggers:
+//   (a) `pass1 == 0` — budget spent. Covers both the genuine Phase-2
+//       wrap (the `None` path zeroes pass1 and arms wrap-pending) and a
+//       mid-walk Phase-1 exact-fit honor that subtracted the last bytes.
+//       Also the first-call path (pass1 seeds to 0 in the builder).
+//   (b) #1743 time-based: `elapsed >= COS_GUARANTEE_VISIT_NS` since the
+//       last refill. Phase-2 selections do NOT decrement `pass1`, so
+//       under saturation `pass1` freezes at a small non-zero value below
+//       every remaining quantum and small classes stop being honored;
+//       the time tick refreshes the budget once per 200µs window.
+//
+// The honored BITSET, however, is cleared (allowing re-honoring) ONLY on
+// a genuine epoch boundary: the time tick OR a Phase-2 WRAP
+// (`waterfill_epoch_wrap_pending`). #1743 r3: a bare mid-walk `pass1 == 0`
+// refills the budget but must NOT clear the bits, else an all-min-quantum
+// exact-fit config livelocks Phase 1 on q0 and never reaches Phase 2.
+//
+// CRITICAL: NEITHER refill path resets `waterfill_phase2_cursor`
+// (#1743 r2 — only the genuine Phase-2 wrap at the end-of-function `None`
+// path does) so the descending RR walk advances through ALL large classes
+// across epochs rather than restarting at the largest (the
+// residual-starvation regression #1630 r4 caught).
+//
+// #4408 Increment 3a: lifted verbatim out of
+// `select_exact_cos_guarantee_queue_waterfill` so the selector reads as
+// three named phases rather than one 432-line body. This block MUST stay
+// atomic: the order of the `waterfill_epochs` bump, the
+// `epoch_boundary`-gated honored-bitset clear, and the
+// `waterfill_epoch_wrap_pending = false` reset IS the #1743 r3 livelock
+// fix. Do not split it further into "compute budget" + "clear bits".
+//
+// `#[inline(always)]` + same-module is deliberate: the post-inline IR is
+// by construction the shape it was before the split, so no coldness claim
+// is made or needed (plan §2d).
+#[inline(always)]
+fn refill_waterfill_epoch(root: &mut CoSInterfaceRuntime, now_ns: u64) {
+    let elapsed_since_refresh = now_ns.saturating_sub(root.waterfill_epoch_start_ns);
+    let time_refresh = elapsed_since_refresh >= COS_GUARANTEE_VISIT_NS;
+    let exhausted = root.waterfill_pass1_remaining_bytes == 0;
+    if time_refresh || exhausted {
+        // fraction is clamped 0.0..1.0 at config-apply time; the
+        // dispatch gate also requires fraction > 0. We use f64 → u64
+        // with a floor + saturating cast guarded by the multiplication.
+        let frac = root.oversubscription_guarantee_fraction;
+        let raw_pass1 = if root.shaping_rate_bytes == 0 {
+            // Transparent (unshaped) root: there is no shaper-delivered
+            // cap to anchor against, so fall back to the legacy
+            // `quantum_sum × fraction` over the current eligible set.
+            // The result fits in u64 because quantum_sum ≤ 512 KB ×
+            // N_queues and fraction ≤ 1.0.
+            let mut quantum_sum: u64 = 0;
+            for &qi in &root.exact_queues_by_rate_ascending {
+                quantum_sum =
+                    quantum_sum.saturating_add(cos_guarantee_quantum_bytes(&root.queues[qi]));
+            }
+            ((quantum_sum as f64) * frac).floor() as u64
+        } else {
+            // #1743 Hunk A: anchor pass1 to the shaper-delivered bytes
+            // per epoch × fraction — the documented contract "fraction ×
+            // cap" where cap = shaper × VISIT_NS (docs/fairness-regimes.md).
+            // The legacy `quantum_sum × fraction` over-provisioned pass1
+            // by ~4× for any oversubscribed config (Σ R_i > shaper), so
+            // Phase 2 never fired and the selector degenerated to
+            // ascending RR over all classes. shaping_rate_bytes is
+            // bytes/sec; the u128 product is overflow-safe.
+            let cap_per_epoch = ((root.shaping_rate_bytes as u128)
+                * (COS_GUARANTEE_VISIT_NS as u128)
+                / 1_000_000_000u128) as u64;
+            ((cap_per_epoch as f64) * frac).floor() as u64
+        };
+        // AGY RISK-1 (Codex code-r1 #2): a tiny-positive fraction floors
+        // `raw_pass1` to 0 on EITHER branch — the dispatch gate admits any
+        // `fraction > 0`, including transparent + tiny-fraction. A zero
+        // budget makes `exhausted` true on every selector call → refill +
+        // cursor-reset thrash → Phase-2 starves from index 0. Clamp BOTH
+        // branches to at least one min-quantum so the smallest class is
+        // honorable and the exhausted path can't fire every call. (The
+        // clamp is a no-op for normal fractions where raw_pass1 already
+        // exceeds the smallest quantum.)
+        let pass1 = raw_pass1.max(COS_GUARANTEE_QUANTUM_MIN_BYTES);
+        root.waterfill_pass1_remaining_bytes = pass1;
+        root.waterfill_epoch_start_ns = now_ns;
+        // #1743 (Codex code-r3): clear the persistent honored bitset ONLY on
+        // a genuine epoch boundary — the time tick OR a Phase-2 WRAP
+        // (`waterfill_epoch_wrap_pending`, set by the end-of-function `None`
+        // path). A bare `exhausted` (pass1 == 0) that did NOT come from a
+        // wrap — e.g. a Phase-1 exact-fit honor that subtracted the last
+        // bytes mid-walk — must NOT clear the bits: clearing there re-enabled
+        // a degenerate all-min-quantum livelock where q0 is honored, pass1
+        // hits 0, the next call clears its bit, q0 is re-honored, and Phase 2
+        // is never reached. With the bits intact, the already-honored small
+        // queue is skipped (the `i < 64` check below), so the walk advances
+        // to the next queue or breaks to Phase 2 — guaranteeing forward
+        // progress. The budget is still refilled on a bare `exhausted` so
+        // Phase 1 can resume against the un-honored queues.
+        let epoch_boundary = time_refresh || root.waterfill_epoch_wrap_pending;
+        if epoch_boundary {
+            root.waterfill_honored_epoch_bits = 0;
+        }
+        root.waterfill_epoch_wrap_pending = false;
+        // #1743 (Codex code-r2): the refill never resets the Phase-2 cursor.
+        // The cursor's ONLY reset is the genuine Phase-2 WRAP at the
+        // end-of-function `None` path (which also re-arms epoch_wrap_pending),
+        // so the descending walk advances continuously across epochs — the
+        // #1630 r4 continuity invariant.
+        //
+        // #1628 site 1: completed-epoch / Phase-1-refill counter. Bumped
+        // here (no `queue` borrowed yet) on every refill, either trigger.
+        root.waterfill_epochs = root.waterfill_epochs.wrapping_add(1);
+    }
 }
 
 // Selects the next non-exact guarantee queue for service. Rotates
