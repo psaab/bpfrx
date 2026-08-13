@@ -78104,3 +78104,70 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-13 00:50 PDT
+- **Action**: #6722 B3 addendum — three relayed items verified firsthand; two
+  of the three premises were wrong and are corrected here.
+  ITEM 1, the fixture-vacuity warning ("the 4 existing fixtures hand-stamp
+  `redundant_parent`, so under an intrinsic gate they go green BY
+  CONSTRUCTION"). The class is real and is the right thing to worry about; it
+  does not apply to what shipped, and cannot. `redundant_parent` was REMOVED
+  from `InterfaceSnapshot` in Rust — `grep -rn redundant_parent userspace-dp/`
+  returns ZERO hits — so a fixture setting it does not COMPILE. The vacuity is
+  structurally impossible rather than avoided. The four fixtures named were
+  DELETED, not carried with a dead field, and their configs crossed to the Go
+  side where the decision lives. `reth_projection` is read at exactly ONE Rust
+  site (the ledger gate) and written at exactly TWO Go sites (the two stamp
+  points); measured by grep, recorded here so a later reader does not have to
+  re-derive it.
+  Requested disclosure added to `reth_row_6722`: the stamp IS hand-built, it
+  exercises the CONSUMER not the decider, and the decider's coverage lives in
+  `reth_member_projection_6722_test.go` (real `set` lines -> real strict
+  `CompileConfig` -> real `buildInterfaceSnapshots`) plus the wire round-trip
+  test. The Rust harness cannot reach the Go builder, so through-the-builder
+  Rust fixtures are not available; said so rather than implying coverage.
+  ITEM 2, the quarantine test's sort-order justification. CONFIRMED WRONG, with
+  a correction to the correction. The relayed claim was that an `xe-`-named
+  member sorts after its reth so master answers 0, "true for `ge-*`, false for
+  `xe-*`/`et-*`". Measured on the actual sort: `ge-0/0/1` < `reth1` (member
+  first) and `xe-0/0/1` > `reth1` (member last) — so the `xe-` half holds — but
+  `et-0/0/1` < `reth1` ('e' < 'r'), so `et-` behaves like `ge-`, NOT like
+  `xe-`. The master-restoration sentence is removed either way: it is name
+  dependent and false for an ordinary Junos 10G member name. The
+  quarantine-contract argument, which is name-independent, is kept and is what
+  the pinned outcome now rests on. The corrected fact is recorded in the test
+  comment so the next reader does not re-inherit the `et-` error.
+  ITEM 3, the `9c6cddc70` note. The relayed premise "that commit is not on this
+  branch" is FALSE: `git merge-base --is-ancestor 9c6cddc70 cb12ffaae` exits 0
+  — it IS on this branch, three commits back. The conclusion (PR body, not a
+  code edit) is nonetheless right, for the opposite reason: a landed commit
+  message is immutable without a rebase, which is forbidden here. Its claim
+  that two universals were "restored as guarantees" was FALSE WHEN WRITTEN —
+  the v3 self-parent hole made the unit-0-collapse class exemptable, which is
+  precisely one of the universals it claimed to guarantee — and is TRUE NOW,
+  for a different reason (the netdev-landing requirement, not the parent-row
+  requirement). Posted to the PR rather than edited.
+  THE #5699 SCOPE CLAIM, verified by MEASUREMENT rather than by two agreeing
+  readings. Built the FULL snapshot at dcd031d58 and at cb12ffaae from one
+  config — two-node bondless RETH (`ge-0/0/1` + `ge-7/0/1` under `reth1`,
+  `ge-0/0/2` under `reth0`), v4 and v6 addresses, a VLAN unit, and
+  host-inbound-traffic on both zones — in a throwaway detached worktree, and
+  diffed including `BuildZoneHostInboundViews` output. With the two projection
+  keys stripped the documents are BYTE-IDENTICAL: `host_inbound_views`
+  identical, addresses identical, zones identical, everything else identical.
+  So the #5699 objection provably does not transfer — nothing on the address or
+  host-inbound path moved. The objection was about propagating the RETH's ZONE
+  (one address into two host-inbound views); this change writes a boolean that
+  `BuildZoneHostInboundViews` cannot even see, since that builder takes
+  `*config.Config` and the flag lives on the downstream `InterfaceSnapshot`.
+  ONE BEHAVIOURAL DELTA, and it is the one I added a cell for: `ge-7/0/1`, the
+  PEER node's member, carried `redundant_parent: "reth1"` at dcd031d58 and is
+  NOT marked at cb12ffaae. `RethToPhysical` resolves `reth1` onto `ge-0/0/1`,
+  so no RETH row lands on `ge-7-0-1` and the peer's row is an independent
+  observer. Pinned by `TestPeerNodeRethMemberIsNotAProjection_6722`; now also
+  visible in a full-snapshot diff on a realistic two-node config.
+  Validation: `go test ./pkg/dataplane/...` rc=0; `cargo test --release` rc=0
+  (7 suites, 4419 passed); rustfmt clean per file on `test_fixtures.rs`.
+  Advances #6713 / #6722.
+- **File(s)**: pkg/dataplane/userspace/zone_propagation_6722_test.go,
+  userspace-dp/src/afxdp/test_fixtures.rs, _Log.md

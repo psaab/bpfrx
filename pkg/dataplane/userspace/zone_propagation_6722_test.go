@@ -367,16 +367,24 @@ func TestQuarantineUnzonesTheBaseRow_6722(t *testing.T) {
 // row blanks, the exemption then covers it, it casts no vote, and the ledger
 // resolves Y for the shared ifindex.
 //
-// Reading that as a bug is the trap. It RESTORES master rather than diverging
-// from it: emission is sorted by name, so master's last-write-wins
-// `populate_egress` already answered Y for this ifindex — the intermediate `0`
-// some intuitions expect was the anomaly, not the baseline. Post-fix egress
-// therefore agrees with ingress instead of contradicting it. And it is what the
-// quarantine contract already promises: the colliding zone is dropped AS IF IT
-// HAD NEVER BEEN CONFIGURED, so a member zoned only into a quarantined zone is
-// a member with no zone — which is exactly the case the exemption exists for.
-// Resolving to `0` here would mean honouring a zone the operator was just told
-// was discarded.
+// Reading that as a bug is the trap. It is what the quarantine contract
+// already promises: the colliding zone is dropped AS IF IT HAD NEVER BEEN
+// CONFIGURED, so a member zoned only into a quarantined zone is a member with
+// no zone — which is exactly the case the exemption exists for. Resolving to
+// `0` here would mean honouring a zone the operator was just told was
+// discarded.
+//
+// An earlier revision justified the same outcome a second way, by claiming it
+// RESTORES master: emission is name-sorted, so master's last-write-wins
+// `populate_egress` supposedly already answered Y. That argument is NAME
+// DEPENDENT and was removed rather than reworded. `buildInterfaceSnapshots`
+// sorts interface names, and whether the member precedes its RETH is a fact
+// about the member's prefix: `ge-0/0/1` and `et-0/0/1` sort BEFORE `reth1`
+// (member first, master answers Y), but `xe-0/0/1` sorts AFTER it (member
+// last, master answers 0). Junos names 10G ports `xe-`, so the "master already
+// said Y" half is false for a real and ordinary member name. The pinned
+// outcome below is unchanged — it rests on the quarantine contract above,
+// which is name-independent.
 //
 // The collision is REAL, not simulated: z174 and z214 genuinely fold to one
 // StableZoneID, and the premise is asserted so a change to the fold turns this

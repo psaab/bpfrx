@@ -1596,6 +1596,25 @@ pub(super) const WAN_IFINDEX_6722: i32 = 27;
 /// A row on the LAN RETH's SHARED netdev (`ge-0-0-1`, `LAN_IFINDEX_6722`).
 /// Every bondless-RETH row resolves to the physical member's netdev, so `name`
 /// is the only thing that distinguishes them.
+///
+/// `projection` is HAND-STAMPED, and that limit is worth naming. These are
+/// ConfigSnapshot literals; the Rust harness cannot reach the Go builder, so
+/// nothing here exercises `rethProjectionNetdevs` — the function that actually
+/// DECIDES the flag. What these fixtures cover is the consumer: given a row
+/// marked (or not), does the ledger withhold (or count) its vote. Which rows a
+/// real config marks is covered on the other side of the wire, by
+/// `pkg/dataplane/userspace/reth_member_projection_6722_test.go`, whose
+/// fixtures are real `set` lines through the real strict `CompileConfig` and
+/// the real `buildInterfaceSnapshots`, and by
+/// `TestRethProjectionRoundTripsOnTheWire_6722`, which pins that the Go builder
+/// emits the `reth_projection` JSON key this struct decodes.
+///
+/// The pairing matters because the PREDECESSOR of this field was hand-stamped
+/// here too, and the gate then re-derived its answer from `redundant_parent`.
+/// A fixture that sets a field the gate no longer reads is vacuous however
+/// green it looks. That cannot recur by accident now: `redundant_parent` is not
+/// a field of `InterfaceSnapshot` at all, so a fixture setting it does not
+/// compile.
 fn reth_row_6722(
     name: &str,
     zone: &str,
