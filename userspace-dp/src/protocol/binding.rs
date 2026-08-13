@@ -103,6 +103,15 @@ pub struct WorkerRuntimeStatus {
     /// forever; nonzero means the preflight/install pairing has a bug.
     #[serde(rename = "session_install_partial", default)]
     pub session_install_partial: u64,
+    /// #4800: cumulative locally-learned transit forward-flow installs on
+    /// this worker — the per-worker share of the SNAT-allocate /
+    /// `publish_shared_session` / `replicate_session_upsert` path. Divided
+    /// by the run window this is the worker's new-flows/sec; compared
+    /// across workers it shows whether a connection-rate ceiling is a
+    /// genuine cross-worker lock bound or just one saturated RX queue.
+    /// `default` so an older daemon that predates the counter emits 0.
+    #[serde(rename = "new_flow_installs", default)]
+    pub new_flow_installs: u64,
     /// #925: true if the worker_loop thread panicked and the supervisor
     /// caught it. Set once on first panic; never cleared in Phase 1.
     /// Operators see DEAD in `cli show chassis forwarding` and must

@@ -34,6 +34,7 @@ fn snapshot_roundtrip() {
         session_create_drops: 31,
         session_install_admission_refused: 17,
         session_install_partial: 1,
+        new_flow_installs: 9_876,
     };
     atomics.publish(&c, 0);
     let s = atomics.snapshot();
@@ -68,6 +69,8 @@ fn snapshot_roundtrip() {
         c.session_install_admission_refused
     );
     assert_eq!(s.session_install_partial, c.session_install_partial);
+    // #4800: per-worker transit new-flow installs survive publish/snapshot.
+    assert_eq!(s.new_flow_installs, c.new_flow_installs);
 }
 
 #[test]

@@ -13,10 +13,17 @@
 //! green.
 //!
 //! So nothing here is modelled or re-described. Everything the walk needs is in
-//! this file, it depends only on `core`, and userspace-dp's parity test
-//! `#[path]`-includes THIS FILE and runs it on real byte buffers. Advance
-//! arithmetic, bounds revalidation and resolvable chain length stop being
-//! claims about source text and become observable outcomes.
+//! this file, it depends only on `core`, and userspace-dp's parity test pulls
+//! THIS FILE in through a module-path attribute and runs it on real byte
+//! buffers. Advance arithmetic, bounds revalidation and resolvable chain length
+//! stop being claims about source text and become observable outcomes.
+//!
+//! That attribute is described rather than SPELLED, here and at the `lib.rs`
+//! call site, and deliberately: #5173's confinement bound refuses the token
+//! pair `[` `path` anywhere under `userspace-xdp/src`, because an attribute
+//! that redirects a module pulls source in from outside the directory every
+//! one of its other bounds walks. Prose tripping it is a spurious RED, so the
+//! prose is worded around it. Do not re-spell it.
 //!
 //! Nothing in here may take a dependency on `aya`, on a BPF map, or on `std` —
 //! that is what keeps it host-compilable, and it is the whole point.

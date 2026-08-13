@@ -1211,6 +1211,17 @@ func collectCoSDSCPCodePoints(node *Node) ([]uint8, error) {
 		}
 		return nil
 	}
+	// #6697 / #6659: this reads the node's own tail and NEVER child.Children,
+	// so the hierarchical BLOCK spelling `code-points { ef; }` compiles to
+	// nothing. Because `add` below is the ONLY place a code point is checked,
+	// that spelling is a GATE ESCAPE and not merely a value-drop:
+	// `code-points { totally-bogus; }` commits CLEAN where the identical token
+	// in `code-points [ totally-bogus ]` is REJECTED "is not a valid DSCP alias
+	// or 0..63 value". Verified through configstore.CheckText. All four
+	// collectCoS{DSCP,8021}{CodePoints,RewriteCodePoint} readers below share
+	// this shape. A widened read MUST keep the per-value check on the path for
+	// the newly-read values; see docs/config-schema.md, "A one-sided read is a
+	// GATE ESCAPE".
 	for _, child := range node.FindChildren("code-points") {
 		for _, raw := range child.Keys[1:] {
 			if err := add(raw); err != nil {
