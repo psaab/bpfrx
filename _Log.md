@@ -546,6 +546,410 @@
   `rustfmt --check` alone and carries the same 9 pre-existing deviations as its
   parent commit, none added.
 
+## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
+- **Action**: Folded a Codex MERGE-NEEDS-MAJOR taken at 1da594597. It
+  independently confirmed the round-16 F1 finding (both nil-publication call
+  sites are line-executed, only the post-rebind result is discriminatingly
+  asserted) and added one item round 16 did not have: incorrect BEHAVIOUR, not a
+  missing guard.
+
+  **MAJOR — an absent HTTP leg counted as a listener at an unnamed address, and
+  stranded a live HTTPS leg in an absorbing empty set.** `everyLiveLegNamedBy`
+  documented "the HTTP leg is always serving, at e.addr". That premise is false
+  when the HTTP leg has NEVER bound: `m.cur` starts zeroed and `startTo`
+  re-zeroes it on a boot bind failure. The gate then compared "" against
+  next.Addr, read FALSE, and treated the absent leg as a listener the config does
+  not name.
+
+  Reachable sequence, reproduced firsthand before any fix: the boot HTTP bind at
+  H fails (api.Server.Start returns before it reaches the HTTPS leg, so nothing
+  is serving); a later commit retries — H still fails, but the HTTPS leg at S
+  BINDS and becomes the only live listener, at exactly the address `next` names.
+  A subsequent password rotation from {A} to {B} then publishes the early
+  intersection {A} ∩ {B} = ∅, and the late full-publish gate re-reads the same
+  predicate — still false, because m.cur.addr is still "" — so it never
+  converges. The live, correctly-named HTTPS listener rejects EVERY credential.
+
+  Neither exit named in AuthForRetainedListener's own contract exists here.
+  "Converge the bind" is unreachable while the HTTP bind keeps failing, and
+  "commit the address that is actually serving" is not expressible at all:
+  resolveAPIBinds always yields a concrete Addr, so no committed config can make
+  next.Addr equal "". Re-committing repeats ∅ ∩ {B} = ∅, which is absorbing.
+
+  **It is a regression of this branch, verified against origin/master rather
+  than taken on report.** Master has neither predicate; its startTo returns early
+  on a boot bind failure leaving m.srv nil, so reconcileTo short-circuits and
+  NEITHER leg is ever retried; and its publish is gated on a plain httpOK with no
+  intersection at all. The state is reachable only because round 14 made startTo
+  adopt the server so the bind CAN be retried — a fix that put the reconciler
+  into a configuration the round-13 gate could not describe.
+
+  Fixed by treating an empty e.addr as "that leg is not serving, so it imposes no
+  requirement" — symmetric with the arm that already says exactly that for a
+  cleared tls flag, and the same reading mgmtAddrIsLoopback already gives an
+  empty bind. Guarded by
+  TestMgmtLiveHTTPSLegIsGrantedWhenTheHTTPLegNeverBound_5561; dropping the
+  `e.addr != ""` guard reds it alone across pkg/daemon + pkg/api, build and vet
+  clean.
+
+  This also falsified pkg/daemon/README.md's "every state that can reach ∅ has an
+  EXIT", which assumed HTTP is always live at cur.addr. Corrected in place with
+  the sequence that breaks it, not softened.
+
+  **Two more failure-default assertions**, the same shape as round 16's F5.
+  `TestMgmtBootHTTPBindFailureIsRetriedByTheNextCommit_5561` asserted
+  `m.curSet == false` on a FRESH reconciler — the zero value — so deleting
+  startTo's error-path `m.cur, m.curSet = mgmtEndpoint{}, false` left it green.
+  It now seeds a converged fingerprint first, which makes the RESET observable;
+  the seeding is documented as pinning a defensive reset rather than a state
+  production reaches, which is precisely why nothing pinned it.
+  `TestScopedRemotePeerStillReachesTheCredential_5561` asserted only
+  `Local == false` and `OK == false`, both zero values of PeerIdentity. It now
+  also requires the Detail the off-box return path explicitly sets, and adds a
+  discrimination control (the same scoped shape with the caller's address
+  assigned to this host must be denied). Both bind independently: stubbing the
+  off-box verdict to a zero PeerIdentity reds the first, disabling the scoped
+  couldBeLocal reds the second.
+
+  **Filed, not fixed here.** #6733 — the REST config GET surface returns
+  URL/hostname fields unredacted (LicenseAutoUpdate, ArchiveSites, DynamicDNS
+  Server/URLTemplate/CheckIPURL, RPM http-get Target, DynamicAddress FeedServers,
+  plus two raw-AST-only leaks). The redaction pass is NAME-keyed while these
+  values are sensitive by CONTENT, so it is structural rather than a list of
+  misses. Verified UNCHANGED from origin/master — pre-existing, deliberately not
+  folded. #6734 — the round-16 F6 latent slot divergence: pkg/api substitutes a
+  fresh authSlot for nil in two independent places, so a future site passing nil
+  to both would pin a slot the handler never reads. Not reachable today (all four
+  production sites thread one non-nil pointer), and closing it means an ownership
+  change across all four.
+
+- **File(s)**: `pkg/daemon/management.go`,
+  `pkg/daemon/management_authsanction_5561_test.go`,
+  `pkg/daemon/management_bootretry_5561_test.go`, `pkg/daemon/README.md`,
+  `pkg/authz/peer_5561_test.go`
+- **Validation**: `go build ./...` rc 0; `go vet ./...` rc 0; full `go test ./...`;
+  `-race` on `pkg/api` + `pkg/daemon` + `pkg/authz` + `pkg/config`. Four mutations
+  driven to RED-with-real-assertion with build and vet clean under each, then
+  reverted and diffed byte-identical.
+
+## 2026-08-01 — #5561 round 16: the pre-rebind nil publish had ZERO coverage, and three places claimed it had some
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)
+- **Action**: A coverage-and-accuracy round. No runtime behaviour changed in
+  `reconcileTo` / `publishNilDirectionLocked`; an independent review at
+  1da594597 established with true exit codes that no fail-open exists there.
+  What existed was an untested load-bearing call site and three claims that it
+  was tested.
+
+  **F1 (blocking) — reconcileTo's PRE-rebind `else { publishNilDirectionLocked() }`
+  arm was silent to delete.** Confirmed before writing anything: removing the
+  whole arm left `go build ./...` rc 0, `go vet` rc 0, `ok pkg/daemon`, `ok
+  pkg/api`. Every existing nil-direction case drives a rebind that FAILS, and on
+  that path the pre-rebind call is redundant — the off-loopback leg is RETAINED,
+  keeps following the server-wide snapshot, and the POST-rebind call publishes
+  the same deny-all against the same unchanged `m.cur`.
+
+  The path where it is load-bearing is the rebind that SUCCEEDS. A live leg
+  serves 10.0.0.1:80 under a committed credential; the operator commits `delete
+  system services web-management api-auth`; the #4047/#5127 clamp pulls the bind
+  to 127.0.0.1:80 and this time it binds. `ReconcileHTTP` then RETIRES the old
+  leg, and `api.Server.trackRetiring` PINS it to whatever `s.auth` holds at that
+  instant (`leg.slot.pin`). The post-rebind publish cannot repair that pin:
+  `m.cur` is loopback by then so the committed nil is what goes out, and
+  `authSlot.tighten` drops a nil `next` by design. Without the pre-rebind
+  publish the pin captures the DELETED credential, which then keeps
+  authenticating on the routable address for the whole bounded drain plus every
+  keep-alive connection already accepted.
+
+  Guarded by `TestMgmtRemovedCredentialNeverSurvivesOnTheRetiredLeg_5561`
+  (`pkg/daemon/management_nilpublish_5561_test.go`), which asserts the
+  consumer-visible fact — the retired leg's own handler must refuse
+  `webadmin:secret-a`, and must refuse an unauthenticated caller too (the pin is
+  DENY-ALL, not nil) — with the live loopback leg admitting the unauthenticated
+  request as the control that this is a scoped suppression and not a lockout.
+  Reaching a retired leg from pkg/daemon needed one new cross-package accessor,
+  `api.Server.HTTPHandlerForTest`: the handler is taken BEFORE the reconcile,
+  because afterwards `s.httpLeg` has been replaced and `s.retiring` holds the old
+  leg only until it drains (any later `ReplaceAuth` prunes it), so reading it
+  after the fact is a race.
+
+  Mutation proof: deleting the pre-rebind arm leaves build rc 0 and vet rc 0 and
+  reds EXACTLY ONE test across `pkg/daemon` + `pkg/api` — this one — on a real
+  assertion ("secret-a still authenticates on the RETIRED listener at
+  \"10.0.0.1:80\"").
+
+  **The call site and the deny-all arm are not separable, and that is a property
+  of the code, not of the test.** Deleting `ReplaceAuth(&api.AuthConfig{})`
+  inside the helper reds six (the five pre-existing retained-path cases plus this
+  one). It cannot be otherwise: `publishNilDirectionLocked` has exactly two arms
+  selected by `m.cur.allLoopback()`, and the pre-rebind call takes the DENY-ALL
+  arm precisely when a live leg is off-loopback — which is the only situation in
+  which the pre-rebind publish has any security content at all. When
+  `allLoopback()` is true pre-rebind the call publishes nil, which pins the
+  retired leg to PASS-THROUGH, i.e. strictly more permissive than the mutation,
+  so there is no property to assert in that direction. The discriminator is
+  therefore the red SET, and it is decisive: the call site is red-alone under its
+  own deletion. The converse isolation already exists — a scenario whose
+  post-rebind state is NOT all-loopback reds for the deny-all arm and stays green
+  for the call site, because the post-rebind deny-all then TIGHTENS the pin away.
+
+  **F2 — a godoc binding defect introduced in round 15.** No blank line separated
+  `everyLiveLegNamedBy`'s 21-line doc from the new `allLoopback` comment, so
+  godoc bound the whole block to `allLoopback` and `everyLiveLegNamedBy` had NO
+  doc at all (verified both ways with `go doc -all -u ./pkg/daemon`). The orphaned
+  text is the round-13 grant-gate argument — "read BEFORE the rebinds / read
+  AFTER" — that both `reconcileTo` call sites depend on for their justification,
+  including the one F1 is about, so it was MOVED onto its own function rather
+  than merely separated (a free-floating block would be dropped from godoc
+  entirely).
+
+  **F3 — two revert instructions that were not executable.**
+  `management_authstale_5561_test.go` told a future reader to "restore the `if
+  committed != nil` guard in `withCommittedAuth`", a function this commit range
+  DELETED. Replaced with the mutation that actually reds it — drop the generation
+  fence, i.e. make `committedDesired` return `m.desired(cfg)` without consulting
+  the store — verified: build 0, vet 0, RED at "the stale replay was expected to
+  retry the committed loopback bind and FAIL". The second instruction claimed
+  that gating the nil publish on the rebind OUTCOME makes "the live snapshot go
+  nil"; implemented and run, that mutation leaves the case GREEN, because under
+  the generation fence the replay reconciles to the COMMITTED loopback endpoint
+  whose bind the fixture refuses, so an outcome gate reads false and deny-all
+  publishes. The property is still bound — `allLoopback` mutated to `return true`
+  reds it on "api-auth was removed entirely while the live listener is
+  10.0.0.2:80" — so the text was rewritten to name that mutation and to say which
+  predicate the case actually binds.
+
+  **F4 (discretionary, taken)** — `m.lastHTTPAttempt = next.Addr` in `reconcileTo`
+  was likewise silent to delete. Display-only, but wrong in a way that misdirects:
+  after a boot bind failure at X and a day-2 reconcile to Y that also fails,
+  `show system services` reported X — an address nothing is retrying.
+  `TestEffectiveHTTPListenerReportsTheRETRIED_Address_6401` reds alone on its
+  deletion, build and vet clean.
+
+  **F5 (discretionary, taken)** — two test names outlived their behaviour.
+  `...RemoveAuthDeferredWhenHTTPRebindFails_5866` no longer defers anything (round
+  14 made it publish deny-all immediately) and is now
+  `...RemoveAuthDeniesAllWhenHTTPRebindFails_5866`; the prose calling that
+  direction "still defers" was corrected at the same time.
+  `...WithCommittedNilKeepsOffLoopbackAuth_5561` asserts `CredentialCount == 0`,
+  i.e. it keeps no credential, and is now
+  `...WithCommittedNilNeverDropsOffLoopbackToNoAuth_5561`.
+
+  **F7 (discretionary, taken)** — `pkg/api/auth.go` told the operator that one exit
+  from an empty credential set is "commit the address that is actually serving".
+  True for the ∅ that function produces (the non-nil intersection, whose config
+  carries a credential), false for the deny-all reached via the nil direction:
+  that config has no api-auth, so `resolveAPIBinds` re-clamps any off-loopback
+  address it names straight back to loopback. Scoped the claim and named the
+  nil-direction exits.
+
+  **F6 (discretionary, NOT taken)** — `pkg/api/listener.go` and `server.go` each
+  independently substitute a fresh slot for a nil, so a hypothetical future site
+  passing nil to BOTH `buildHTTPServer` and `serveLegLocked` would give the
+  handler slot X and the leg slot Y and make the pin a silent no-op. Not reachable
+  today (all four production sites verified consistent) and closing it properly
+  means making the leg OWN its slot and hand it to the handler — a signature and
+  ownership change, not a coverage fix, and this round deliberately changed no
+  runtime behaviour.
+
+- **File(s)**: `pkg/daemon/management.go` (F2 doc move only),
+  `pkg/daemon/management_nilpublish_5561_test.go` (new),
+  `pkg/daemon/management_authstale_5561_test.go`,
+  `pkg/daemon/management_5866_test.go`,
+  `pkg/daemon/management_authsanction_5561_test.go`,
+  `pkg/daemon/effective_listeners_6401_test.go`, `pkg/daemon/README.md`,
+  `pkg/api/server.go` (HTTPHandlerForTest), `pkg/api/auth.go` (comment scope)
+- **Validation**: `go build ./...` rc 0; `go vet ./...` rc 0; full `go test ./...`;
+  `-race` on `pkg/api` + `pkg/daemon` + `pkg/config`. Every new/renamed test name
+  confirmed present in `-count=1 -v` output (a polluted GOCACHE has silently
+  skipped new subtests before). Four mutations run to RED-with-real-assertion and
+  reverted byte-identically; one run to GREEN to disprove a claim.
+
+## 2026-08-01 — #5561 round 11: the budget mechanism was right, its denomination and arbitration were not
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-per-principal-authz, PR #6645)
+- **Action**: Two MAJORs and three MINORs on the round-10 fold. Round 10's own
+  three fixes all survived re-gate and were not re-litigated. Both MAJORs
+  reproduced firsthand before any fix.
+
+  **The design question first.** Round 9 introduced an unbounded body buffer;
+  round 10 bounded it with per-route ceilings plus a 64 MiB aggregate byte
+  budget; round 10's budget then created a privilege-crossing denial neither
+  master nor round 9 had. Rather than patch a third time, the mechanism was
+  re-examined: the budget SURVIVES, because bounding the memory a caller can
+  make the daemon hold is the right idea and there is no cheaper way to state
+  it. Two things about round 10's budget were wrong, and they are independent
+  defects rather than one bug with two symptoms — a wrong UNIT and a wrong
+  ARBITRATION.
+
+  **MAJOR 1a — the budget was denominated in DECLARED bytes.** `admitMutationBody`
+  reserved `min(Content-Length, ceiling)` up front and held it for the request's
+  whole lifetime. A Content-Length is a promise; the memory only exists once the
+  bytes do. Measured amplification 65536x: 1024 half-open `POST
+  /api/v1/diagnostics/ping` with `Content-Length: 65536` and one byte sent, from
+  a `read-only` (PermView) principal, filled the entire 64 MiB with ~1 KB of
+  traffic. Fixed by charging the buffer as it GROWS: `bufferMutationBody` is now
+  io.ReadAll with its growth steps charged against a per-request `bodyBudget`, so
+  a half-open request holds one 512-byte allocation and is charged for one
+  512-byte allocation. A grow charges the old allocation AND the new one across
+  the copy, so the number bounds peak resident bytes — which also closes the
+  reviewer's NOTE 6 (the old budget was ~100 MiB resident for a 64 MiB name)
+  rather than documenting it. Also removes the reserve<=0 skip, so the HTTP/2
+  `content-length: 0`-on-an-open-stream row (MINOR 5) is inside the accounting
+  by construction: there is no declaration-based path left to slip past.
+
+  **MAJOR 1b — the budget was one undivided pool.** Pass 1 guarantees only that
+  a buffering caller is authorized for the route it called, and the cheapest
+  permission on the surface is authorized for something — so view-tier traffic
+  and a super-user's commit drew on the same bytes and the view tier could take
+  all of them. Fixed with `mutationBodyTierCeilings`, a reserve ladder keyed on
+  the permission the ROUTE requires (view/clear/control 16 MiB, config 48 MiB,
+  maint 64 MiB out of the same 64 MiB total): a request is admitted only while
+  the running total is within ITS tier's share, so whatever the view tier takes,
+  a whole-configuration load is permanently out of its reach. Keyed on the route
+  rather than the caller deliberately — it is the action being protected, and
+  pass 1 has already established that only a holder of that permission gets
+  here, so a super-user's pings draw on the view tier like anyone else's and
+  cannot crowd out that same super-user's commit. Total across tiers is
+  unchanged, so the memory bound is unchanged.
+
+  **MAJOR 2 — the no-body class covered 2 of the 7 routes meeting its own
+  definition.** `config/enter`, `exit`, `commit`, `commit-check` (signature
+  literally `_ *http.Request`) and `confirm` all answer from the
+  X-Config-Session header alone, yet all five PARKED on a withheld body and each
+  reserved 1 MiB of MAJOR 1's budget while doing so. All five reclassified
+  `mutationBodyNone`. The old guard could not fire because it asked "did this
+  request park", which the GATE decides — a tautology about the classification
+  it was meant to discriminate, and its control asserted `config/enter` "DOES
+  decode one", which is false. Replaced with
+  `TestNoBodyClassMatchesTheHandlersThatDecode_5561`: it sends every guarded
+  route a malformed body and requires the set that answers 400 "invalid JSON
+  body" to be exactly the complement of the class. That probe found a false
+  positive in ITSELF on the first run — `dhcp/identifiers/clear` answers "No
+  DHCP clients running" and returns BEFORE its decode when `s.dhcp` is nil, so
+  an unwired fixture reported it as a no-body route. Acting on that would have
+  moved a route whose handler DOES block on the caller out of the second
+  adjudication's ordering. The fixture now wires a real `dhcp.Manager`, and the
+  hazard is written into the test.
+
+  **SEQUENCING.** The freshness tests parked on `config/enter`, so reclassifying
+  it first would have left them passing while no longer reaching the window they
+  exist to test. Both were moved to `POST /api/v1/config/set` — a route whose
+  HANDLER decodes before it does anything else — BEFORE the reclassification.
+
+  **MINOR 3 — nothing bound the release.** Dropping `defer release()` left the
+  aggregate test green in isolation; it was caught only by whichever later test
+  inherited the poisoned global.
+  `TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` now drives handler-
+  returned, caller-hung-up-mid-body and body-overran-the-ceiling and asserts the
+  counter is whole after each.
+
+  **MINOR 4 / NOTE 7 — documented rather than only benefited from.**
+  `withCommittedAuth`'s one-directional override leaves the api-auth REMOVAL
+  direction unpinned (a deleted credential is resurrected by a stale replay);
+  the comment and `pkg/daemon/README.md` now state that cost and why the
+  asymmetry is still the right choice. `dhcp/identifiers/clear`'s 413 threshold
+  moving 16 MiB -> 64 KiB is now stated in both the table and `pkg/api/README.md`.
+
+  Validation. Both MAJORs reproduced at `e4e015342` before fixing. TRUE parent
+  RED by assertion at `e4e015342` with `go build ./...` rc 0 and `go vet` rc 0
+  there, on `TestHalfOpenBodyIsChargedForWhatItHoldsNotWhatItDeclared_5561`,
+  `TestLowPrivilegeCallerCannotDenyAPrivilegedOne_5561`,
+  `TestViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` and
+  `TestNoBodyClassMatchesTheHandlersThatDecode_5561`; every other `_5561` case
+  green there, so the reds are the findings and not collateral. The guards on
+  mechanisms this round INTRODUCES cannot be parent-RED, so they were proved by
+  mutation instead, each with build rc 0 / vet rc 0: flattening the tier ladder
+  reds both tier guards and leaves the denomination and aggregate guards green;
+  moving a genuine body-taker INTO the no-body class reds the partition guard in
+  the other direction; dropping the release reds the release guard IN ISOLATION;
+  pointing the freshness tests back at `config/enter` reds them with "no request
+  ever parked", which is the sequencing hazard closed.
+- **File(s)**: `pkg/api/authz.go`,
+  `pkg/api/authz_bodybudget_fairness_5561_test.go` (new),
+  `pkg/api/authz_bodybudget_5561_test.go`,
+  `pkg/api/authz_bodywindow_5561_test.go`,
+  `pkg/api/authz_freshness_5561_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/management.go`, `pkg/daemon/README.md`, `_Log.md`
+
+## 2026-08-01 — #5561 round 10: fold three MAJOR findings on PR #6645
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Three MAJORs, two of them introduced by the round-9 fold. All
+  three confirmed firsthand before fixing; none refuted.
+
+  **MAJOR 1 — the second adjudication did not re-check the credential for
+  attributed LOCAL callers.** `principalFrom` re-validated the api-auth
+  credential only inside its off-box branch, which the peer-UID row returns
+  before ever reaching. So a configured administrator ON THIS HOST could
+  present secret A, withhold its body, let another session rotate A to B, and
+  still have the mutation run — pass 2 refreshed the login class and nothing
+  else. The nil -> non-nil direction is the same hole in its worst spelling: a
+  request admitted through `dynamicAuthMiddleware`'s nil-snapshot pass-through
+  stayed credentialless after a commit ADDED api-auth. Fixed by re-evaluating
+  the listener's own authentication gate at the top of `principalFrom`, on
+  every row, routed through `credentialPrincipalUser` (`authCheck`'s two
+  exemptions are /health and /metrics, both GET, which `isSafeHTTPMethod`
+  returned before the gate ran). New test drives the INTERSECTION the existing
+  matrix omits (local attributed caller x credential change), both spellings,
+  each with a control that must be ADMITTED. TRUE parent RED at fe827f73f
+  (build rc 0, vet rc 0, got 200 want 403 on both rows; controls green).
+
+  **MAJOR 2 — the round-9 fold introduced an aggregate-unbounded body-buffer
+  DoS.** Every authorized POST reached `bufferMutationBody`, which retained up
+  to 16 MiB per request with no per-route ceiling and no aggregate bound; the
+  gate holds that buffer for as long as the CALLER takes to finish sending
+  (apiReadTimeout, 30s). Worse, `security/sessions/clear` used to reject a
+  body-carrying clear immediately without reading a byte, and that rejection
+  moved behind the caller-controlled read. Fixed in three parts rather than
+  papered with a comment: (a) `restMutationBodyLimits`, a per-route ceiling —
+  `config/load` keeps 16 MiB, config edits 1 MiB, diagnostics and
+  `system/action` 64 KiB, and the two routes whose handlers never touch the
+  body are NOT buffered at all, restoring their immediate answer;
+  `dhcp/identifiers/clear` is deliberately NOT in that class because #4794 made
+  it decode an optional body, so it keeps the ordering. (b)
+  `mutationBodyBudgetBytes` (64 MiB), an aggregate admission bound — a request
+  reserves min(Content-Length, ceiling) for its whole lifetime and is refused
+  429 past the budget, which is what makes the availability claim the two-pass
+  design is justified by actually true. (c) a completeness test keeping the
+  permission and body-limit tables from diverging. Tests bind the AGGREGATE
+  property (concurrent withheld-body requests exceeding the budget must be
+  REFUSED, with controls that one request on an idle budget IS admitted and
+  that some of the burst gets in). The no-body test carries a body-taking
+  CONTROL that must still park, so the probe discriminates. RED proved by
+  mutating the fix out (per-route ceilings removed, aggregate bound removed;
+  symbols kept so build rc 0 / vet rc 0): the three specific guards RED, the
+  table-completeness test and the round-9 freshness guards GREEN. The no-body
+  half is additionally TRUE parent RED at fe827f73f.
+
+  **MAJOR 3 — a failed rebind left a REVOKED credential live.** HEAD published
+  every non-nil auth snapshot unconditionally, before the rebind. On the apply
+  path a caller that snapshots `store.ActiveConfig()` and then waits on the
+  apply semaphore (the DHCP lease-change callback) can be overtaken by a commit
+  and replay a superseded config: the replay published the SUPERSEDED
+  credential, its own rebind failed, and the listener the newer commit had
+  moved to kept serving under the credential that commit REPLACED. Verified the
+  "pre-existing" boundary firsthand rather than taking it on trust: at
+  origin/master (ad9591177) the stale-replay case PASSES and the round-7
+  rotation case FAILS; at fe827f73f the reverse. So the widening IS this PR's,
+  and restoring master's httpOK gate would ship the round-7 fail-open back.
+  Fixed by pinning the CREDENTIAL half to the store's ACTIVE config
+  (`withCommittedAuth`) before handing the desired config to `reconcileTo` —
+  never turning a non-nil publish into a nil one, so it cannot relax the
+  #4047/#5127 clamp. Only the credential is pinned; the stale ENDPOINT is the
+  general stale-snapshot apply defect (#6716) and stays there. Test drives BOTH
+  directions in one file for exactly the reason above. TRUE parent RED at
+  fe827f73f on the stale case with the round-7 case green.
+
+  Validation: `go build ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race ./pkg/api/... ./pkg/daemon/... ./pkg/config/...` all ok, and
+  the full `go test ./...` Go suite rc 0 with zero FAIL lines.
+- **File(s)**: `pkg/api/authz.go`, `pkg/api/authz_bodywindow_5561_test.go`,
+  `pkg/api/authz_bodybudget_5561_test.go`, `pkg/api/README.md`,
+  `pkg/daemon/management.go`, `pkg/daemon/management_authstale_5561_test.go`,
+  `pkg/daemon/README.md`, `_Log.md`
 ## 2026-08-12 — #6676 r9: the r9 brief was unrecoverable, and BOTH Aug-1 Codex escapes are already closed at this head
 
 - **Timestamp**: 2026-08-12 (fix/5173-shim-queue-mis-steer, PR #6676)
@@ -5338,6 +5742,255 @@ Validation: `go build ./...` rc 0; `go test ./pkg/config/ -count=1` ok;
   `pkg/config/compiler_chassis_packed_monitor_6588_test.go` (new),
   `docs/config-schema.md`, `_Log.md`
 
+## 2026-08-01 — #5561 review round 3: the identity cost, and two over-strong claims
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Round-3 review returned REQUEST CHANGES with 1 MAJOR + 4 MINOR.
+  The authorization logic itself was re-verified clean — both round-1 exploits
+  re-run and dead, TIME_WAIT/uid-0 now doubly enforced, all six precedence rows
+  driven including the off-box row returning 200.
+  **MAJOR — the identity cost 6-9 ms per CONNECTION, unbounded.** Reading
+  /proc/net/tcp{,6} is not proportional to row count: the kernel walks its
+  entire TCP hash table, sized from RAM. Measured on an idle box (11 and 39
+  rows) at 4.3 ms and 10.1 ms raw, 6.2 ms for a hit and 8.9 ms for a miss;
+  cross-checked outside Go at 200 x `cat /proc/net/tcp` = 3.24 s. A connect
+  loop at ~110 conn/s saturates a core inside xpfd with NO credentials on the
+  default posture — the same unprivileged local population #5561 exists to
+  constrain. This is a direct consequence of the round-1/round-2 direction
+  (resolve eagerly; then fix the accept-loop DoS without going back to lazy):
+  the cost moved off the accept loop rather than disappearing.
+  **Fixed by single-flighting** (`pkg/authz/socketscan.go`): one goroutine reads
+  the tables and every waiter registered before that read STARTED is answered
+  from it; a waiter arriving mid-read is served by the next one. The security
+  property is preserved exactly — the batch is taken under the same lock the
+  request was appended under, so a connection accepted at T is still only ever
+  answered from a read that started at or after T. Measured: 60 concurrent
+  connections cost 2 reads (38 without batching).
+  **The old accept-loop guard was scoped narrower than its claim.** It asserted
+  only that two lookups STARTED concurrently — liveness, not cost. Kept (it
+  still pins the serialization property) and joined by a COST guard that counts
+  actual table reads.
+  **MINOR-1** — the interface-address cache refreshed on every MISS, which is
+  the flooding case; 200 misses drove 200 enumerations while two comments
+  claimed "at most once per TTL". Rate-limited for hits and misses alike, and
+  the comments now match.
+  **MINOR-2** — the scoped-address refusal ran BEFORE the locality test, so an
+  IPv6 link-local management bind denied every credentialed remote admin. Moved
+  after: only a scoped peer we would otherwise have to ATTRIBUTE is refused.
+  **MINOR-3** — DNAT-to-loopback denies all remote admins. Documented as the
+  most plausible of the three residuals (it over-denies, never admits).
+  **MINOR-4** — the 5 s lookup timeout was per-request; a wedged table cost 5 s
+  on every request of a connection. Deadline now stamped at accept.
+  **Two doc corrections, both stated too strongly in my favour.** The loopback
+  rule is CONSERVATIVE, not a kernel guarantee — route_localnet=1,
+  IP_TRANSPARENT and DNAT-to-loopback all defeat martian filtering — but it
+  fails SAFE under all three, because each classifies a REMOTE caller as local
+  and a local caller with no socket row is denied. And the netns residual is
+  narrower than I wrote: `unshare -Urn` yields a namespace with only `lo`, and
+  attaching a veth needs CAP_NET_ADMIN in the HOST namespace, so it requires a
+  root-configured container runtime rather than an unprivileged user.
+- **File(s)**: `pkg/authz/socketscan.go` (new), `pkg/authz/peer.go`,
+  `pkg/authz/peer_5561_test.go`, `pkg/api/authz.go`,
+  `pkg/api/config_authz_5561_test.go`, `pkg/api/README.md`,
+  `docs/system-login.md`
+- **Validation**: 5 mutations, `go build ./...` and `go vet ./...` CLEAN under
+  each, all assertion-level. (MAJOR) remove single-flighting -> "60 connections
+  cost 38 socket-table reads (limit 12)", with every correctness test still
+  green, proving the batching changed cost and not semantics. (MINOR-1) refresh
+  on every miss -> "200 cache MISSES drove 200 interface enumerations".
+  (MINOR-2) move the zone check before locality -> "a scope-qualified peer that
+  is NOT on this host was reported LOCAL ... denies every credentialed remote
+  administrator". (MINOR-4) per-request timer -> "a second request on the SAME
+  connection waited 5.024321093s". Full `go test ./... -count=1` green (exit 0).
+## 2026-08-01 — #5561 review round 2: four MAJORs from Codex, all in my own gate
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Round-2 review returned DO-NOT-MERGE with four MAJORs. Round-1's
+  two fixes were confirmed real and test-bound; these are four further holes
+  in the same gate.
+  **MAJOR A — the precedence claim was still not implemented, and the code
+  contradicted our own doc.** In the `(OK, Local)` branch, a UID that resolved
+  to a real OS account with no `system login user` stanza fell through to
+  `s.credential(r)` — so an *attributed* local account outside the login model
+  became full-power via the shared secret, exactly the population #5561
+  constrains. `docs/system-login.md` already said such a caller is denied; the
+  code did not. The doc was right. The rule is now: **a local caller never
+  reaches the credential check.** If a local account needs access it gets a
+  class — that is the one place access is supposed to be written down. No
+  legitimate workflow was identified that needs the fallback; the remedy (grant
+  a class) is one commit and is documented.
+  **MAJOR B — netns callers were classified REMOTE, so they got the credential.**
+  Absence from THIS namespace's socket table (and from its `InterfaceAddrs`) is
+  not evidence of being off-box. This was the same unsound "not found means
+  remote" inference as round 1's MAJOR 2, one layer down. Fixed by bounding
+  "remote" with a kernel guarantee instead of an inference: **a connection
+  DELIVERED on a loopback address cannot have come from off-box** (the kernel
+  drops martian packets carrying loopback addresses on a real interface), so
+  the entire default management posture is local by construction whatever the
+  socket table says. The off-loopback residual (a container veth peer is
+  genuinely indistinguishable from a remote client) is stated in
+  pkg/api/README.md rather than papered over — and that surface is the one
+  #4047 already requires api-auth for.
+  **MAJOR C — IPv6 zone was discarded.** `/proc/net/tcp6` prints only the 128
+  address bits, never the scope id, so two link-local callers on different
+  interfaces render an identical key and the first established row wins —
+  order-dependent identity, the same defect class as matching on ports alone.
+  A scope-qualified peer address is now REFUSED (local-and-unattributable)
+  rather than guessed at.
+  **MAJOR D — accept-loop DoS, a direct cost of the eager resolution added in
+  round 1.** `ConnContext` runs serially in http.Server's accept loop and a
+  peer with no socket row cost a full walk of both tables, so connection churn
+  serialized those walks behind Accept and could fill the listen backlog —
+  locking out remote administrators before api-auth was evaluated. Fixed
+  without returning to lazy resolution (that reopens round 1's MAJOR 2): the
+  lookup is STARTED at accept but runs in its own goroutine, and locality is
+  now classified from addresses BEFORE any table read, so a peer that cannot
+  be local does zero socket-table work. The host-address set is cached 1s and
+  refreshed at most once per second on a miss, so a flood cannot amplify
+  through that either.
+  **MINOR** — `Config.PeerLookupFn` was returned verbatim, letting an injected
+  resolver construct the invalid `(OK=true, Local=false)` state `LookupPeer`
+  never produces. Normalized at the boundary.
+- **File(s)**: `pkg/authz/peer.go`, `pkg/authz/passwd.go`,
+  `pkg/authz/peer_5561_test.go`, `pkg/api/authz.go`,
+  `pkg/api/config_authz_5561_test.go`, `pkg/api/README.md`,
+  `docs/system-login.md`
+- **Validation**: 5 mutations, `go build ./...` and `go vet ./...` CLEAN under
+  each, each an assertion-level red. (A) restore the credential fallthrough
+  for an attributed local account -> all four routes admitted with the secret;
+  the discriminating control — an attributed local UID that IS in the login
+  model — stays green. (B) drop the loopback-delivery guarantee -> "a
+  connection DELIVERED on a loopback address was reported off-box". (C) drop
+  the zone guard -> "a scope-qualified peer was attributed uid 0". (D1) drop
+  the locality pre-classification -> "a routable, non-local peer read the
+  socket table". (D2) resolve inline in ConnContext -> "only 1 of 2 peer
+  lookups started while the first was still running". Note the C test was
+  strengthened mid-round: its first form red on a weak assertion because a
+  hand-written /proc hex fixture never matched, so the mutation was not
+  exposing the misattribution it guards. The fixture is now built from the
+  encoder (pinned independently by TestProcAddrEncoding_5561) and the mutation
+  exposes uid 0. Full `go test ./... -count=1` green (exit 0).
+## 2026-08-01 — #5561 review round 1: two MAJOR authorization bypasses in my own fix
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth, PR #6645)
+- **Action**: Hostile review returned DO-NOT-MERGE with two MAJORs. Both
+  reproduced firsthand before touching code; both were the same shape —
+  **a guard scoped narrower than the claim it protected**.
+  **MAJOR 1 — peer-UID spoofing, default posture.** `netlink.SocketGet` does
+  NOT do an exact 4-tuple lookup. It issues `SOCK_DIAG_BY_FAMILY` with
+  `NLM_F_DUMP`, and `inet_diag_dump_icsk` filters on family, states,
+  `idiag_sport` and `idiag_dport` — the addresses in `id` are IGNORED — then
+  the library returns `msgs[0]` without comparing the reply's `SocketID`
+  against the request. Identity was decided by port pair alone. Reproduced:
+  with one real socket at `127.0.0.2:35591 -> 127.0.0.1:38849`, a query for
+  `127.0.0.9:35591` (no socket at all) returned uid 1000, and the raw reply's
+  id carried source `127.0.0.2`. Since all of 127/8 is bindable unprivileged,
+  a local user who reuses a root-owned connection's source port is reported
+  as root. The `/proc` parser was correct from the start — it compares full
+  local AND remote addresses — but it ran second as a fallback and therefore
+  never ran. **Fix:** netlink removed entirely; the socket table is read
+  directly and matched in full. A "fast path" whose reply must be re-verified
+  against the request buys nothing on a surface answering a few operator
+  actions per second, and every line of it is another place to assume the
+  kernel filtered something it did not.
+  **MAJOR 2 — the precedence rule was switched off by the caller.** The PR,
+  the README and a test all asserted that a peer UID outranks an api-auth
+  credential. It did — but only when the lookup SUCCEEDED, and the caller
+  controlled that. My own rationale for lazy resolution ("the client is
+  blocked awaiting a response, so the socket is ESTABLISHED for exactly the
+  window that matters") assumed a cooperative client; `shutdown(SHUT_WR)`
+  leaves ESTABLISHED and still lets the caller read the response. Reproduced
+  on the real path: the same `read-only` account with the same valid
+  credential got 403 when polite and **200 on `/config/enter`** (and 400s
+  from inside the handlers on set/commit/system-action) when it half-closed
+  first. **Fix, two parts:** resolution moved to `connContext` (accept time,
+  once per connection, not caller-timed); and `LookupPeer` now returns a
+  THREE-state answer — attributed / local-but-unattributable / not-on-this-
+  host — with the middle state a HARD DENY that no credential substitutes
+  for. "Local" is decided by the socket table AND by the address, so a caller
+  whose socket is gone entirely (RST) is still local if its address is
+  loopback or one of ours. That address rule is what makes correctness
+  independent of winning a race; eager resolution removes the attack.
+  **Third-instance sweep** (the review asked for one). Two further
+  credential-fallthrough paths found in my own code and fixed: a v4-mapped
+  row lives in `/proc/net/tcp6` even when Go reports the peer as plain
+  IPv4, and scanning only the v4 file would have reported that caller
+  off-box — the credential path; and an ABSENT socket table was treated as
+  "no row found" rather than "we looked nowhere", same consequence. Both
+  now fail closed. A path/method sweep (percent-encoding, dot segments,
+  encoded slash, double slash, case, trailing slash, query, fragment,
+  HEAD/OPTIONS/TRACE/GET against a POST-only route) found no fourth: every
+  trick 403s at the table, safe methods 405 at the mux.
+- **File(s)**: `pkg/authz/peer.go` (rewritten), `pkg/authz/passwd.go`,
+  `pkg/authz/peer_5561_test.go` (rewritten), `pkg/api/authz.go`,
+  `pkg/api/server.go`, `pkg/api/config_authz_5561_test.go`,
+  `pkg/api/README.md`, `docs/system-login.md`
+- **Validation**: 4 mutations, `go build ./...` and `go vet ./...` CLEAN under
+  each, each reding as an assertion with the negative controls green.
+  (A) restore port-only matching → `TestLookupPeerRejectsAddressMismatch_5561`
+  reports uid 1000 for four addresses with no socket. (B1) restore the
+  credential fallthrough for an unattributable local caller →
+  `TestUnattributableLocalCallerCannotBorrowCredential_5561` and the real-path
+  `TestHalfCloseCannotBorrowCredential_5561` both red; the "remote caller with
+  a credential is still admitted" control stays green. (B2) drop the address
+  rule → the loopback and management-IP branches red. (B3) revert eager to
+  lazy resolution → `TestPeerIdentityIsResolvedAtAccept_5561` observes 0
+  lookups for a connection carrying two safe requests. Full
+  `go test ./... -count=1` green (exit 0).
+## 2026-08-01 — #5561 REST config mutation endpoints had no per-principal auth
+
+- **Timestamp**: 2026-08-01 (fix/5561-rest-config-auth)
+- **Action**: Closed the RBAC bypass on the HTTP control surface. Every
+  state-changing route on `127.0.0.1:8080` — `config/set`, `config/load`,
+  the commit family, the clear verbs, diagnostics and `system/action` — now
+  requires a server-derived principal that holds the action's login-class
+  permission. Verified unfixed on `origin/master` 8a69bef9a first:
+  `dynamicAuthMiddleware` returns `next.ServeHTTP` unconditionally when
+  `s.auth.Load()` is nil, which is the default on a loopback bind.
+  **Identity.** The peer UID is read from the kernel socket table
+  (INET_DIAG via `netlink.SocketGet`, falling back to `/proc/net/tcp{,6}`),
+  resolved through `/etc/passwd` to an account name and then to a class via
+  `system login user <name> class`. `SO_PEERCRED` cannot answer for an
+  AF_INET listener, and moving the surface to a Unix socket would have cost
+  a new transport, config knob, packaging change and client migration for an
+  identity the kernel already exposes on the existing socket. **Only
+  `TCP_ESTABLISHED` is accepted**: the kernel reports UID 0 for a TIME_WAIT
+  mini-socket, so without the state check a caller that closes right after
+  writing the request is reported as root. That escalation was confirmed
+  empirically by mutation, not argued.
+  **Fail-closed shape.** The route table is an allow-list keyed on the exact
+  registered `"METHOD /path"`; a non-safe method with no entry is denied, so
+  a future POST route added without an entry is inert rather than open. UID 0
+  is authorized without consulting passwd or the config (root owns the config
+  DB; a config dependency would lock the operator out of a box that has not
+  loaded one). An api-auth credential remains a full-power principal, but a
+  peer UID that resolves to a login user outranks it, so a `read-only`
+  account holding the API password stays read-only.
+  **Blast radius.** One population changes: a non-root local UID that is not
+  a configured `system login user` and presents no credential. Nothing
+  in-tree is in it (the CLI speaks gRPC; deploy/day-0/harness tooling reads
+  `/metrics` only). Reads, `/health`, `/metrics` and the SSE streams are
+  untouched; a denial cannot brick a running box.
+  **Shared, not per-surface.** The decision lives in `pkg/authz` and the
+  class evaluator moved to `pkg/config` with `pkg/cli` delegating to it, so
+  #5278 (the same hole on gRPC) is a thin interceptor over the same
+  `authz.Authorize` rather than a second policy that drifts.
+- **File(s)**: `pkg/authz/authz.go` (new), `pkg/authz/peer.go` (new),
+  `pkg/authz/passwd.go` (new), `pkg/authz/authz_5561_test.go` (new),
+  `pkg/authz/peer_5561_test.go` (new), `pkg/config/login_perms.go` (new),
+  `pkg/api/authz.go` (new), `pkg/api/config_authz_5561_test.go` (new),
+  `pkg/api/server.go`, `pkg/cli/permissions.go`, `pkg/api/README.md`,
+  `docs/system-login.md`
+- **Validation**: 4 mutations, `go build ./...` and `go vet ./...` CLEAN
+  under each, each reding as an assertion. (1) Removing the guard call site
+  in `NewServer` → every mutating route returns 200/400/503 instead of 403
+  ("an unauthenticated local process reached the handler"); the two negative
+  controls stay green. (2) Disabling `ClassHasPermission` → only the four
+  "class lacks permission" subtests red. (3) Removing the `TCP_ESTABLISHED`
+  requirement → "closed connection reported uid 0 — a caller could escalate
+  to root by closing its socket after sending the request", running as uid
+  1000. (4) Dropping `ConnContext` from `buildHTTPSServer` → the listener
+  scan names the exact literal. Full `go test ./... -count=1` green.
 ## 2026-07-31 — #6611 review round 2: guard scoped narrower than its claim
 
 - **Timestamp**: 2026-07-31 (fix/6611-control-channel-auth, PR #6624)
@@ -71788,6 +72441,746 @@ break — `go vet` confirmed passing under every revert.
   pkg/config/compiler_opts.go,
   pkg/config/compiler_policy_valueless_match_6526_test.go,
   docs/config-schema.md, _Log.md
+- **Timestamp**: 2026-08-01
+- **Action**: #5561 round-5 fold — close the stale-negative locality window that
+  let a LOCAL caller reach the api-auth credential row. Round 4 rate-limited the
+  interface-address snapshot refresh for misses as well as hits (fixing a real
+  per-connection amplification), which made a NEGATIVE answer cacheable for up to
+  `localAddrTTL`. The negative is the one verdict that admits: `LookupPeer`
+  short-circuits on `!couldBeLocal` before reading the socket table, so a caller
+  from an address added to this host within the last second was adjudicated
+  through the shared secret instead of its login class. Address adds are watchable
+  by any unprivileged account (`ip monitor address`) and this box adds them
+  routinely (VRRP VIPs, DHCP, RA). Fixed by re-deriving locality from a FRESH,
+  single-flighted interface enumeration (`authz.PeerCouldBeLocalNow`) at the
+  credential row itself, after the credential validates — so a caller holding no
+  credential drives zero enumerations and the round-4 amplification fix is kept
+  intact, while a caller that IS local is denied regardless of how new its
+  address is. The re-check is a one-way narrowing: it can only turn an admission
+  into a denial. Corrected the comment and doc, which had argued the window was
+  safe in the OPPOSITE direction ("cannot escape a class it holds") — it granted
+  access rather than over-denying. Mutation-proved both halves: removing the
+  pkg/api call site reds only `TestBrandNewLocalAddressCannotBorrowCredential_5561`
+  (83 other assertions green), and making the re-check read the cache instead of
+  enumerating reds only `TestBrandNewLocalAddressIsNotOffBox_5561` (128 green);
+  `go build ./...` and `go vet` rc=0 in both worlds.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go, pkg/api/authz.go,
+  pkg/api/server.go, pkg/api/config_authz_5561_test.go, pkg/api/README.md,
+  docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-5 fold, second pass)
+- **Action**: #5561 — adopt the reviewer's derived fix for the localAddrTTL
+  negative window and fold 3 MINORs. LookupPeer no longer short-circuits on a
+  NEGATIVE address answer: the batched socket-table read runs first and
+  `couldBeLocal` is consulted only where the table has nothing to say, because a
+  row hit proves locality from the kernel rather than from a cached snapshot. The
+  early-out existed purely to keep churn off the table and the single-flight
+  batcher had already retired that argument (reviewer measured 120 concurrent
+  fresh connections = 3 reads / 82 ms). Kept the credential-row re-derivation
+  (`authz.PeerCouldBeLocalNow`) as well, because the restructure does NOT cover
+  the "no row at all" case — a local caller that reset its own socket before the
+  read still meets the stale negative there, and the handler runs even when the
+  response cannot be delivered. Error path now falls back to the address rule in
+  BOTH directions, so an unreadable /proc denies a local caller without locking
+  out every remote administrator (bit-identical to what the early-out gave). The
+  zone check moved ahead of the read and branches on locality, preserving both
+  the scoped-local refusal and the scoped-remote credential path. MINORs: a
+  socket-table row that matches the 4-tuple but will not parse is now recorded as
+  `malformed` (local, unattributable, denied) and logged once per file per scan
+  instead of silently dropped — dropping it became unsafe once the table is read
+  first; `batcher.pending` capped at 4096 with a fail-closed refusal; the
+  anti-drift route scanner widened from server.go-with-a-mux-named-`mux` to every
+  non-test file and any receiver, proven against a testdata fixture because every
+  real route happens to use the narrow shape. Six mutations, each build+vet rc=0
+  with an assertion red: restore the early-out (2 tests red, 46 pass), drop
+  malformed rows (1 test, 3 subtests red, 746 pass), remove the queue cap (1 red,
+  749 pass), narrow the route scanner (1 red, 749 pass), remove the credential-row
+  confirmation (1 red, 749 pass), make the confirmation read the cache (1 red, 749
+  pass).
+- **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go,
+  pkg/authz/peer_5561_test.go, pkg/api/authz.go,
+  pkg/api/config_authz_5561_test.go, pkg/api/testdata/routescan/,
+  pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-5 fold, third pass)
+- **Action**: #5561 — close an UNGUARDED property found by parent edge-mutation.
+  The ordering of the two checks in `principal()` (locality re-derivation INSIDE
+  the credential branch, so an uncredentialed caller drives no enumeration) is
+  property P2, and nothing defended it: hoisting the check above the credential
+  test left build, vet and the whole suite green. Worse, the test that was
+  supposed to guard it —
+  `TestUncredentialedCallerDrivesNoInterfaceEnumeration_5561` — was VACUOUS for
+  TWO independent reasons, each making its expected value the failure default.
+  (1) It counted `authz.HostAddrScansForTest()` over a LOOPBACK listener, but
+  `PeerCouldBeLocalNow` short-circuits on `loopbackDelivery` BEFORE enumerating,
+  so the counter reads 0 whether the check runs early, late or never. (2) It sent
+  uncredentialed requests to a server WITH api-auth configured, but
+  `dynamicAuthMiddleware` wraps the authz guard (`listenerHandler`), so a missing
+  or wrong credential is 401'd upstream and `principal()` is never reached at
+  all. Replaced with two tests on the correct premise — the ordering is
+  observable exactly where `s.credential` can fail INSIDE `principal()`, i.e. a
+  listener with NO api-auth snapshot.
+  `TestUncredentialedCallerDrivesNoLocalityRecheck_5561` counts invocations of
+  the locality seam (an invocation count cannot be satisfied by the check never
+  happening) and asserts ZERO without a credential AND exactly ONE with a valid
+  one — the second half defeats the "deleted entirely" default.
+  `TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561` binds a REAL routable
+  host address so both connection ends are off-loopback and the real enumeration
+  runs, with a precondition skip if the kernel sources from loopback; it asserts
+  zero enumerations uncredentialed, and >=1 enumeration plus a 403 with a valid
+  credential (the end-to-end P1 proof on the production path, no locality
+  injection). Corrected the `principal()` comment, which claimed the ordering
+  protects "the flooding population" without stating that api-auth listeners are
+  already gated upstream — the same overstatement that produced the vacuous test.
+  Documented the 60-connection cost test's deliberately loose `maxReads = 12`
+  bound and, explicitly, what it does NOT cover (it absorbs the 2x regression the
+  hoist causes). Mutations: hoist above the credential check — build rc=0 (0
+  bytes), vet rc=0 (0 bytes), both new guards red as assertions ("25 requests
+  ... drove 25 locality re-derivations", "10 uncredentialed requests drove 10
+  REAL interface enumerations"), 751 pass; delete the check entirely — build and
+  vet rc=0, the two "valid credential" halves red plus
+  TestBrandNewLocalAddressCannotBorrowCredential_5561, 750 pass.
+- **File(s)**: pkg/api/authz.go, pkg/api/config_authz_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6, Codex MERGE-NEEDS-MAJOR fold)
+- **Action**: #5561 — fold 3 MAJORs + 1 MINOR from Codex xhigh at `b1f07c07a`.
+  (MAJOR 3) TWO cost guards were near-vacuous beside the strong one the parent
+  had verified: the real-scan test asserted `scans != 0` (1, 2 or 100 all pass)
+  and the batching test allowed 50 enumerations for 400 calls while claiming
+  "N concurrent callers cost ONE". The claim was also WRONG — a waiter arriving
+  mid-scan is served by the NEXT scan, so the promise is "callers that overlap a
+  scan share the scan after it", i.e. bounded by elapsed-time/scan-duration, not
+  by caller count. Both now assert EXACT counts; the batching test is
+  deterministic (one caller held inside scan 1, the rest queued behind it,
+  release, require exactly 2) rather than timing-dependent. (MAJOR 1) The netns
+  residual's safety ARGUMENT was wrong: "an unprivileged user cannot get there"
+  fails because a process in an ALREADY-PROVISIONED container (docker/k8s/nspawn)
+  is handed a veth and needs no capability of its own. Restated the bound as what
+  it actually is — a caller this host cannot place is governed by the api-auth
+  credential, which is what #4047 makes it for — and said plainly that a
+  container holding the secret has a remote administrator's power. (MAJOR 2) A
+  SUCCESSFUL enumeration finding nothing is not proof of off-box; errors fail
+  closed, omissions cannot. Reachable by riding system address churn (VRRP VIP
+  moves every failover). Documented the semantics of `false` precisely, recorded
+  that BOTH observations are used (accept-time `id.Local` denies before the
+  credential row), named what neither covers (an address that appears and
+  vanishes between the two samples, needing RTM_NEWADDR to close), and added
+  `TestAcceptTimeVerdictIsNotDiscarded_5561` pinning that the later observation
+  may not overrule the earlier. (MINOR 4) Capped `hostAddrScan.waiters` at 4096,
+  fail-closed to "local"; corrected the batching claim in the code comment.
+  Five mutations, each build+vet rc=0 with EMPTY stderr and a named assertion:
+  non-binding waiter cap -> peer_5561_test.go:1159; batching removed ->
+  peer_5561_test.go:897; waiters answered from a scan older than their arrival ->
+  peer_5561_test.go:910 ("drove 1 enumerations, want exactly 2" — the staleness
+  direction a ceiling could never catch); re-derivation run twice per request ->
+  config_authz_5561_test.go:1416 AND :1540 (both exact-count asserts, which the
+  old `!= 0` / `> callers/4` forms would have passed); accept-time verdict
+  discarded -> config_authz_5561_test.go:1594.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
+  pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6b, residual framing)
+- **Action**: #5561 — the residual list claimed the address-snapshot lag "is
+  closed rather than tolerated". Closed WITHOUT A DIRECTION is the same error the
+  list previously made the other way. It closes the case that motivated it (an
+  address ADDED recently, where a stale cache said not-local) and is
+  DEFINITIONALLY unable to close the reverse — a fresh scan cannot observe an
+  address that is already gone. Restructured the section around the shape both
+  remaining residuals share, which the parent named: the re-derivation answers
+  "is this address on this host, in my namespace, right now", while
+  authorization needs "was this caller local when it connected". Those come apart
+  SPATIALLY (a caller local to the box but outside the daemon's netns — the
+  container case) and TEMPORALLY (local at accept, gone by the scan — the VRRP/
+  DHCP churn case). Both now read as instances of one shape rather than unrelated
+  curiosities, the brand-new-address entry is retitled "the direction that IS
+  closed", its Bounds paragraph is scoped to that direction, and the section
+  states plainly that neither remaining case is a regression: before #5561 any
+  api-auth secret holder had full power unconditionally, so this is a narrowing
+  with a race hole rather than a new hole. No code change. The 2x-regression
+  mutation the parent asked for on the round-6 exact-count asserts: build rc=0
+  (0 bytes), vet rc=0 (0 bytes), a batch scanned twice reds BOTH —
+  config_authz_5561_test.go:1540 ("drove 2 interface enumerations, want exactly
+  1") and peer_5561_test.go:910 ("drove 4 enumerations, want exactly 2"), 754
+  pass. The forms these replaced both ADMIT that mutation: `scans != 0` passes on
+  2, and `scans > callers/4` (>50) passes on 4.
+- **File(s)**: pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6c, residual header)
+- **Action**: #5561 — the residual section header still contradicted its own
+  body. Round 6b promoted the under-denial into the text but left the header
+  enumerating three items and calling the set "the first two over-deny; the third
+  is closed" — with a fourth case (address churn) buried as a sub-paragraph
+  inside the brand-new-address bullet, so an auditor counting bullets could not
+  map the header onto the list. Promoted the temporal case to its OWN bullet and
+  replaced the header with an explicit four-row table naming each residual's KIND
+  (over-denies / open-spatial / closed / open-temporal), followed by one line
+  that states the discrimination outright: only #1 over-denies, only #3 is
+  closed, #2 and #4 are open and both grant. The header now names its own prior
+  error, as the netns and localAddrTTL corrections do, so a reader who stops at
+  the header still gets the right answer — which is the whole reason this
+  mattered. Documentation only; no code change (`go build` rc=0, pkg/authz +
+  pkg/api rc=0).
+- **File(s)**: pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-6d, claim sweep)
+- **Action**: #5561 — three rounds of correcting the NAMED sentence had left
+  sibling sentences asserting the same thing elsewhere. Swept each CLAIM from
+  several angles instead of one phrase, and fixed every site. (A) "a local caller
+  never reaches the credential check" lived in THREE places — pkg/api/authz.go
+  principal(), pkg/api/README.md, docs/system-login.md — and is contradicted by
+  the netns bullet, since a same-host container does reach it. Replaced
+  everywhere with "a caller this host can PLACE never reaches the credential
+  check", plus the definition: placement is NAMESPACE-scoped and TIME-scoped, and
+  a caller this host cannot place is governed by the credential, which is what
+  #4047 makes it for. (B) "closes the window" appeared undirected in
+  pkg/api/authz.go principal(), README's row-4 paragraph, README's "Two changes
+  close it", and peer.go's no-row comment; all four now say WHICH direction (the
+  ADDED one) and that the reverse is unreachable by a scan. (C) the false
+  batching promise survived in TWO places, only one of which was named: peer.go's
+  hostAddrScanner doc AND socketscan.go, whose socket batcher has the identical
+  batch-before-read structure and therefore the identical imprecision — "N
+  connections arriving together cost ONE read" is the stronger claim the
+  discipline deliberately does not make. Both now state the real bound (elapsed
+  time over scan duration) with the measured numbers (60 -> 2, 120 -> 3). A
+  further angle-sweep caught a fourth shape nobody named: "the classification
+  over-denies; it never inverts" in peer.go and README read as a global claim
+  while being scoped to the loopback rule — now explicitly scoped, since two
+  residuals do grant. Documentation only. go build rc=0, go vet rc=0, go test
+  ./... rc=0 (60 ok, 0 FAIL), -race rc=0.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go, pkg/api/authz.go,
+  pkg/api/README.md, docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-7, Codex 5-MAJOR fold — PARTIAL)
+- **Action**: #5561 — folded 2 of 5 round-7 MAJORs plus one MINOR; 3 remain and
+  are listed for the next pass. MAJOR-3 (partial enumeration failure read as a
+  successful omission): `scanTableInto` now returns (read, absent) and
+  `socketQuery` tracks `filesFailed`, so "tcp clean+empty, tcp6 present but
+  unreadable" is a FAILURE rather than "no row". First attempt over-corrected —
+  an ABSENT tcp6 (IPv6-less kernel) became a failure and reddened
+  `TestProcParserRejectsNonEstablishedRow_5561`, correctly; ENOENT is now
+  discriminated from unreadable. Then the deeper half: `LookupPeer`'s error
+  branch had FALLEN BACK to `couldBeLocal`, so an unrecognised caller was
+  reported off-box on an observation never made. A failed read is UNKNOWN and now
+  denies everyone. That inverted the two guards the parent predicted would fight
+  — `TestUnreadableTableStillReportsARoutablePeerOffBox_5561` (renamed
+  `TestUnreadableTableDeniesEveryone_5561`) and the remote half of
+  `TestSaturatedBatcherFailsClosed_5561` — both of which encoded the fail-open as
+  REQUIRED; their redding is the fix, not a regression. MAJOR-1 (revoked local
+  principal): `principal()` and `Authorize()` took two independent
+  `ActiveConfig()` reads, so a class copied from config A was evaluated against
+  config B; both now take ONE snapshot passed by the caller, and Authorize
+  re-validates the class against it. MINOR (MAJOR-5a): the two per-request
+  `slog.Warn` on denied/unguarded mutations are now `slog.Debug` — caller-driven
+  and unauthenticated, so Warn there is a log-amplification lever and violates
+  the project logging rule. Mutation: disabling the partial-failure branch gives
+  build rc=0 (0 bytes), vet rc=0 (0 bytes), and reds ONLY
+  TestPartialTableReadFailsClosed_5561's unreadable subtest at
+  peer_5561_test.go:1211, 53 pass — with the absent-tcp6 negative control green
+  in both worlds.
+- **NOT DONE, carried:** MAJOR-2 (revoked api-auth credential in flight),
+  MAJOR-4 (cleartext secret-bearing URLs on unauthenticated GETs — DDNS
+  Server/URLTemplate/CheckIPURL, FeedServer.URL; `secretIndices` is keyword-based
+  so `url`/`server` never match), MAJOR-5b (timed-out request does not cancel its
+  accept-time lookup goroutine), and the
+  `TestResolveClassPermissionsIsSharedWithTheCLI_5561` binding gap.
+- **File(s)**: pkg/authz/peer.go, pkg/authz/socketscan.go,
+  pkg/authz/peer_5561_test.go, pkg/api/authz.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-7b, MAJOR-2)
+- **Action**: #5561 — MAJOR-2 (revoked api-auth credential stays full-power).
+  The mechanism is not the instruction window it was reported as: `ReplaceAuth`
+  sat inside `if httpOK` in pkg/daemon/management.go, so when the HTTP leg's OWN
+  rebind FAILED and the old listener was retained, a credential ROTATION was
+  never published at all — the retained listener kept honouring the REVOKED
+  secret indefinitely, until some later reconcile happened to succeed. Permanent,
+  not a race. The surrounding comment already had the right argument for the
+  wrong scope: a non-nil Auth only ADDS a requirement and so cannot fail open,
+  which is true of ANY live bind including one retained by a failure, so gating
+  it on httpOK bought nothing and cost revocation. Non-nil Auth is now published
+  unconditionally; dropping to NO auth still defers on !httpOK and still requires
+  the live HTTPS to be off or loopback, because THAT direction removes a
+  requirement. Guard: TestMgmtReconcileRotationHonoredDespiteHTTPRebindFailure_5561.
+  Verified first that NO existing test bound it — the mutation passed green
+  before the guard was written. Mutation with the guard: build rc=0 (0 bytes),
+  vet rc=0 (0 bytes), reds only the new test at management_5866_test.go:590
+  ("still authorizes \"old-secret\""), 29 pass, and the opposite-direction
+  control TestMgmtReconcileRemoveAuthDeferredWhenHTTPRebindFails_5866 green in
+  BOTH worlds.
+- **NOT DONE, carried:** MAJOR-5b (a timed-out request does not cancel its
+  accept-time lookup goroutine) and the
+  TestResolveClassPermissionsIsSharedWithTheCLI_5561 binding gap. MAJOR-4 is out
+  of scope — filed as #6703.
+- **File(s)**: pkg/daemon/management.go, pkg/daemon/management_5866_test.go,
+  _Log.md
+
+- **Timestamp**: 2026-08-01 (round-7c, MAJOR-5b + binding gap — round 7 COMPLETE)
+- **Action**: #5561 — closed the last two round-7 items. MAJOR-5b: the
+  per-connection deadline stops the REQUEST waiting but nothing stopped the
+  accept-time goroutine, so continued connections against a wedged enumeration
+  accumulated goroutines without limit, driven by a caller that never
+  authenticates. Cancellation is NOT available — the wedge is inside
+  `localAddrsFn()` holding `localAddrCache.mu`, where a context cannot help — so
+  the fix is admission control: `peerLookupSlots`, cap 1024, and past it the
+  connection resolves IMMEDIATELY to an unattributable LOCAL identity (a denial,
+  the same answer a timed-out lookup gives) without spawning anything. Confirmed
+  first that no existing test bound it. Mutation (spawn regardless in the default
+  branch): build rc=0 (0 bytes), vet rc=0 (0 bytes), reds ONLY
+  TestWedgedLookupsDoNotAccumulate_5561 at config_authz_5561_test.go:1668 — and
+  TestLookupDeadlineIsPerConnection_5561 stays PASS in BOTH worlds, which is
+  itself the proof that the existing deadline test never bound cancellation.
+  Binding gap: TestResolveClassPermissionsIsSharedWithTheCLI_5561 calls
+  `config.ResolveClassPermissions` directly and never enters pkg/cli, so it pins
+  the helper's BEHAVIOUR while proving nothing about the CLI using it. Added
+  TestCLIResolvesThroughTheSharedEvaluator_5561 in pkg/cli, driving the CLI's own
+  store-bound adapter and requiring agreement with the shared function across
+  built-in AND config-defined classes — the custom classes carry the assertion,
+  since a built-ins-only duplicate agrees on every built-in and diverges only
+  there. Mutation (swap the CLI to a duplicated built-ins-only evaluator): build
+  rc=0, vet rc=0, reds the NEW guard at
+  permissions_shared_evaluator_5561_test.go:61 while the OLD test stays PASS —
+  direct proof it never bound the sharing it is named for.
+- **File(s)**: pkg/api/authz.go, pkg/api/config_authz_5561_test.go,
+  pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-8 PARTIAL — findings 4 and 7)
+- **Action**: #5561 Codex round 3 returned 7 MAJORs. Folded 2; 5 remain and are
+  listed below with analysis, not left implicit. FINDING 4 (sibling fail-open):
+  the scoped-IPv6 branch answered from the CACHED classification without
+  consulting either socket table, so a scoped caller the snapshot did not
+  recognise went off-box — the credential row — on ZERO observations. Same defect
+  the error path was corrected for one branch up, left in a sibling. It now reads
+  the table first: a matching row PROVES a socket exists here (locality from the
+  kernel) even though /proc carries no scope id to attribute it by; an
+  unreadable/absent-everything table denies; only a genuinely-observed absence
+  lets the address classification decide, preserving the MINOR-2 property that a
+  scoped remote still reaches the credential.
+  `TestScopedRemotePeerStillReachesTheCredential_5561` required BOTH tables
+  ABSENT and Local=false — i.e. it encoded the zero-observation fail-open as
+  required — and now uses present-but-empty tables. FINDING 7 (the sharing guard
+  still did not bind): a BEHAVIOURAL test compares outputs and therefore cannot
+  distinguish "these share an implementation" from "these have equivalent
+  implementations"; my earlier custom-class reasoning held only against a
+  built-ins-only duplicate, not a faithful one. Added
+  `TestCLIResolveClassPermsCallsSharedEvaluator_5561`, a STRUCTURAL AST check
+  that `CLI.resolveClassPerms` contains exactly one call to
+  `config.ResolveClassPermissions` (the #6706 shape). Mutation with a FAITHFUL
+  inline copy of the real evaluator body: build rc=0 (0 bytes), vet rc=0 (0
+  bytes), the behavioural guard PASSES and only the structural one reds at
+  permissions_shared_evaluator_5561_test.go:153 — exactly one FAIL.
+- **NOT DONE, carried (5 of 7):** findings 1-3 share ONE root — an authorization
+  decision made against state captured BEFORE a boundary the request later
+  crosses (`pending.wait`, the request-body read, listener reconcile). They want
+  one mechanism (decide after every blocking boundary / revalidate at the
+  mutation boundary), not three patches. Findings 5+6: the admission cap I added
+  in round 7c starts at ACCEPT before authentication, is package-global across
+  every listener and Server, converts would-be SUCCESSES into denials, and its
+  slot RELEASE is untested (delete the release defer and the guard stays green).
+- **File(s)**: pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
+  pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round-9 — findings 1, 2, 3, 5 CLOSED; MINOR-1..5)
+- **Action**: #5561 closed the four carried MAJORs the previous three rounds
+  deferred, each with an EDGE mutation as well as a centre one. FINDING 1
+  (TOCTOU): `mutationAuthzGuard` read the active config and THEN called
+  `principal()`, whose first act is `pendingPeer.wait` — the gate's only
+  unbounded block, up to `peerLookupTimeout` (5s). The decision was evaluated
+  against a snapshot up to five seconds stale, so a commit demoting or deleting a
+  principal did not reach its own in-flight request, and the width is
+  caller-influenced (connect while the socket table is contended). Split into
+  `authorizeInputs` (wait FIRST, snapshot after) + `principalFrom`; the residual
+  is now a passwd read on the UID row and a locality re-derivation on the
+  credential row, both stated in the doc comment. Binding this needed a real
+  happens-before edge: the first draft signalled from `PeerLookupFn`, which
+  `connContext` runs at ACCEPT, so the commit landed BEFORE the gate ran and the
+  mutant PASSED. Added `peerWaitersInFlight` /
+  `PeerIdentityWaitersForTest()` — the request-side twin of the existing
+  `PeerLookupSlotsInUseForTest()` accept-side gauge — so a test can observe "the
+  gate has started and has read nothing yet". FINDING 2 (credential outlives its
+  snapshot): `CredentialPrincipal` is a value and `ReplaceAuth` swaps a pointer,
+  so a revoked or rotated secret did not invalidate a principal already in
+  flight — across `peerIsLocalNow`, which takes `hostAddrScan`'s single-flight
+  and genuinely blocks. Re-validate against the LIVE snapshot AFTER that step
+  (re-check the credential, not pointer identity: `reconcileTo` republishes on
+  every commit, so pointer identity would 403 valid callers). FINDING 3
+  (serve-before-auth): `ReconcileHTTP` binds AND SERVES before returning, while
+  `reconcileTo` published auth at the END, with a whole `ReconcileHTTPS`
+  (keypair + bind) inside the window — worst case a loopback->off-box rebind that
+  ADDS the credential the #4047 clamp requires, so the new routable listener
+  served through `dynamicAuthMiddleware`'s nil-snapshot pass-through. Hoisted the
+  NON-NIL publish above both rebinds (only ADDS a requirement, the same argument
+  round 7 used to make it unconditional); the nil publish stays below, since it
+  REMOVES one and its gates read `m.cur`. FINDING 5 (untested release):
+  `TestWedgedLookupsDoNotAccumulate_5561` fills the pool by direct channel send,
+  so the acquire-site release defer was unexercised — deleting it turns a
+  concurrency ceiling into a lifetime budget (the 1024th connection ever accepted
+  locks the management plane out). New guard pins acquire, release+reuse, AND
+  that the REFUSAL arm touches the accounting in neither direction.
+- **Mutation evidence**: all eight build rc=0 / vet rc=0 with empty stderr, and
+  each named test red as an ASSERTION. M1 cfg-before-wait and M1e (fresh cfg for
+  `Authorize`, stale for the principal) both red
+  `TestConfigSnapshotIsReadAfterThePeerWait_5561` commit-during-wait while its
+  controls PASS — exactly one test fails across all of pkg/api. M2 (pre-block
+  principal returned) and M2e (re-validation present but BEFORE the blocking
+  step) both red `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` on
+  BOTH credential shapes, controls PASS, one test failing across pkg/api. M3
+  (publish at the end) and M3e (publish after the HTTP bind, before the HTTPS
+  reconcile) both red the two new pkg/daemon guards — M3e is the edge that proves
+  they bind "before the HTTP bind", not merely "before the HTTPS reconcile". M4
+  (release defer deleted) reds the release assertion; M4e (refusal arm
+  over-releases) reds the refusal assertion. M6 (duplicate Detail restored) reds
+  the new pkg/authz guard.
+- **MINORs**: MINOR-1 `LookupPeer`'s scoped-branch header said "skip the table
+  entirely" three lines above an unconditional `findPeerSocket` — rewritten to
+  state what the code does and why the early-out must not come back. MINOR-2
+  pkg/api/README.md promised a broken `/proc` "does not silently lock out every
+  remote administrator", which `f6092cb4f` made false two commits later;
+  rewritten to say deny-unconditional, why that direction is right (an
+  availability outage versus a privilege-boundary bypass), and that an ABSENT
+  table is not a failed read. MINOR-3 added `set system login class super-user
+  permissions view` to the sharing fixture: proven load-bearing — the review's
+  "Mutation D" (a CLI-only special case keeping one shared call) passes both
+  guards and all of pkg/cli WITHOUT that line and reds with `CLI resolved [0],
+  shared evaluator resolved [5]` WITH it. MINOR-5 the two scoped local-denial
+  states now carry distinct Details, guarded.
+- **Docs**: pkg/api/README.md gains the freshness contract (every input read
+  after the last blocking step; the credential re-validated after the
+  enumeration; the passwd-read residual named) and the admission pool's
+  three-rule accounting contract. pkg/daemon/README.md + the
+  managementReconciler type doc replace "auth publishes as soon as the HTTP leg
+  is at its desired bind" — now false for the tightening direction — with the
+  asymmetric rule the code enforces: a TIGHTENING publishes first and
+  unconditionally, a LOOSENING publishes last and stays gated.
+- **File(s)**: pkg/api/authz.go, pkg/api/authz_freshness_5561_test.go,
+  pkg/api/README.md, pkg/authz/peer.go, pkg/authz/peer_5561_test.go,
+  pkg/daemon/management.go, pkg/daemon/management_authpublish_5561_test.go,
+  pkg/daemon/README.md, pkg/cli/permissions_shared_evaluator_5561_test.go,
+  _Log.md
+
+- **Timestamp**: 2026-08-01 (round-10 — finding 1 + MINOR-7 fixed; 2,3,4,5,6,8 triaged PRE-EXISTING and filed)
+- **Action**: #5561 round-10 fold. Codex returned MERGE-NEEDS-MAJOR with six
+  MAJORs and two MINORs. Triage first: findings 2, 3, 4, 5, 6 and 8 all cite
+  files this branch does not touch (`daemon_apply.go`, `daemon_dhcp.go`,
+  `daemon_feeds.go`, `daemon_apply_commit.go`, `daemon_run.go`,
+  `daemon_run_servers.go`, `pkg/api/listener.go`), and the two functions in the
+  one file the branch DOES touch that they name — `managementReconciler.start`
+  and `startTo` — are byte-identical to `origin/master`. They are daemon
+  LIFECYCLE defects, not request-path ones, and folding six of them into a REST
+  authorization change makes it unreviewable. Filed as #6716 (queued apply
+  republishes a revoked credential from a stale config + a false applied-stamp),
+  #6717 (nil auth publish races the ASYNC listener retirement — unauthenticated
+  read window), #6718 (first-commit-confirmed rollback never reconciles
+  management), #6719 (HA startup installs a stale auth snapshot; `d.mgmt`
+  published unsynchronized), #6720 (tolerant peer sync promotes then skips the
+  management reconcile), #6721 (a BOOT bind failure is never retried, contrary
+  to two comments).
+- **Finding 1 — FIXED HERE, because it falsified this PR's own claim.**
+  pkg/api/README.md said "Every input to the decision is read after the last
+  thing that can block." It was not: the gate is not the last thing that blocks.
+  The HANDLER is, on the one input the caller owns outright — its request body.
+  `decodeJSONBody` reads it after the middleware returned its verdict, for up to
+  `apiReadTimeout` (30s), and the caller chooses how long that takes. Send
+  headers for `POST /api/v1/system/action`, withhold the body, let another
+  session revoke the credential or demote the class, then supply
+  `{"action":"reboot"}` — the box reboots on an authorization made 30 seconds
+  earlier. Same TOCTOU class the PR exists to close, one layer later.
+  `mutationAuthzGuard` now adjudicates TWICE with the body drained between.
+  Pass 1 is fail-fast and comes first for AVAILABILITY, not authorization:
+  buffering before deciding would let any caller that can open a socket park up
+  to `maxRequestBodyBytes` (16 MiB) of daemon memory per connection behind a 30s
+  read timeout, from a `read-only` shell account. Pass 2 re-reads the LIVE half
+  (config snapshot + credential); the connection-fixed half (accept-time UID and
+  the credential row's locality enumeration) is memoized on a new
+  `requestIdentity`, so adjudicating twice still costs exactly ONE interface
+  enumeration — `TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561` stays
+  green and the new guard asserts the count itself. The drain is bounded at
+  `maxRequestBodyBytes+1`, one byte past the handlers' own cap, so an oversized
+  body still reaches `MaxBytesReader` and still answers 413 — outcomes preserved
+  byte for byte.
+- **MINOR-7 — FIXED HERE**, because `config.LoginUserClass` is new in this PR.
+  A tolerant load / peer sync keeps a `system login user` whose name the schema
+  rejects (#1960 downgrades it to a warning); `applySystemLogin` then REFUSES to
+  provision it, but `LoginUserClass` exact-matched it anyway, so an OS account
+  that happened to bear the name was handed a class the runtime had declined to
+  realize. It now applies the identical validator and resolves such a user like
+  an absent one. Cannot deny anyone the daemon actually provisioned —
+  provisioning runs the same check.
+- **Mutation evidence**: build+vet asserted rc 0 before every red. (A) delete
+  the pass-2 re-adjudication, keep the drain: build+vet CLEAN,
+  `TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` reds on BOTH
+  revocation shapes (`got 200, want 403`) while the round-9 guards
+  (`TestConfigSnapshotIsReadAfterThePeerWait_5561`,
+  `TestRevokedCredentialCannotFinishAnInFlightRequest_5561`,
+  `TestOffLoopbackCredentialRowEnumeratesOnlyOnce_5561`) stay green — specific,
+  not a blanket break. (B) EDGE: delete the drain, KEEP pass 2 — build+vet
+  CLEAN, the same test reds (the gate never parks in the body read), so the
+  guard binds both halves, not just the re-check. (C) delete the
+  `ValidateLoginUsername` gate: build+vet CLEAN,
+  `TestTolerantlyLoadedInvalidUsernameGrantsNoClass_5561` reds with `uid 4250
+  resolved to ... class "super-user"` while its VALID-name control passes.
+- **Contested/none**: nothing contested. The confirmed-invariant list Codex
+  supplied was left untouched.
+- **Docs**: pkg/api/README.md's freshness section gains the body layer — the
+  three-step table (fail-fast / drain / re-decide), why pass 1 comes first
+  (availability, with the 16 MiB × N arithmetic), and two named residuals
+  (locality answered from pass 1's enumeration, so an address added during the
+  body window is unseen; a handler that read its body in pieces would reopen a
+  window the gate cannot see). docs/system-login.md gains the invalid-username
+  policy and the after-the-body re-adjudication.
+- **File(s)**: pkg/api/authz.go, pkg/api/authz_freshness_5561_test.go,
+  pkg/api/README.md, pkg/authz/authz_5561_test.go, pkg/config/login_perms.go,
+  docs/system-login.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (#5561 round-12 — Codex MAJOR-1 + MAJOR-2 CONFIRMED
+  and fixed; 2 test overclaims closed)
+- **Action**: Fixed the two credential-publication interleavings an independent
+  Codex review found in the web-management reconcile, and corrected the comment
+  that had justified one of them on a false premise.
+- **The central question — can a RETAINED listener be non-loopback?** YES,
+  established firsthand before any fix. The #4047/#5127 clamp is evaluated by
+  `resolveAPIBinds` against the config being APPLIED, using that config's own
+  api-auth, and is never re-evaluated against the listener that is serving. So a
+  config carrying a credential binds off-loopback legitimately; when a later
+  commit REMOVES api-auth its own bind is clamped to loopback, and if that bind
+  fails the off-loopback listener is RETAINED. Evidence, from the reproduction
+  before the fix: `removed-auth desired: addr="127.0.0.1:80" auth=<nil>` /
+  `retained live HTTP bind: "10.0.0.2:80" loopback=false` /
+  `post-replay snapshot on the OFF-BOX retained listener: Users[webadmin:secret-a]`.
+  Round 11's comment justified leaving the nil direction unpinned on the claim
+  that a resurrected credential "over-restricts a management API that is clamped
+  to loopback regardless" — false for exactly this path, and the outcome is
+  UNDER-restriction: a deleted secret authorizing `POST /api/v1/system/action`
+  from off-box. The comment is rewritten to state the clamp's real scope.
+- **MAJOR-1 (stale replay vs a committed NIL) — CONFIRMED, fixed**:
+  `withCommittedAuth` now propagates the ACTIVE config's credential policy
+  unconditionally, including nil. Codex's warning that letting the ACTIVE nil
+  overwrite would instead expose a retained off-box listener with NO auth is
+  correct against the OLD nil gate, so the gate moved too: the nil publish is now
+  gated on `mgmtAddrIsLoopback(m.cur.addr)` — the address the live listener is
+  actually bound to — instead of on the HTTP rebind outcome. The rebind-outcome
+  test was a PROXY for "the live bind is the one whose clamp justified the nil",
+  and a stale replay breaks the proxy: its endpoint came from a config that
+  carried a credential, so it is legitimately off-loopback and can bind
+  successfully. Guarded in both directions.
+- **MAJOR-2 (a non-nil publish can RELAX) — CONFIRMED, fixed**: the comment's
+  "every non-nil auth change is strictly more restrictive" is true only against a
+  NIL live snapshot. Adopted Codex's ordering — intersection before the bind, the
+  complete set after convergence — via `api.AuthForRetainedListener(live, next)`.
+  A nil `live` is the UNIVERSAL set (the pass-through posture), which is what
+  keeps the round-9 hoist publishing whole; an endpoint-unchanged commit
+  publishes whole because there is no retained listener to protect. Users match
+  on the (name, secret) PAIR, so a rotation is a revocation plus a grant and only
+  the revocation lands early.
+- **Deliberate consequence, stated**: the intersection can be EMPTY, which denies
+  everyone on a listener retained by a failed rebind until a later reconcile
+  converges. Considered and rejected a principal-name-scoped variant that would
+  have preserved four existing assertions unchanged: it only rescues same-
+  username rotations (a `{admin}`→`{other}` replacement still empties the set),
+  so it buys an inconsistent guarantee for a weaker rule, and it would let a
+  secret the operator scoped to a loopback endpoint work off-box. The REST API is
+  not the box's lifeline (console/SSH + the local CLI are untouched), the state
+  already returns an error and shows `Failed` in `show system services`, and
+  reconcileTo now logs the withheld count.
+  **[CORRECTED in round 13]** the `Failed` claim is FALSE — `show system
+  services` reports the RETAINED leg as `Listening` (it is serving), renders no
+  HTTPS row at all, and `applyConfig` logs the reconcile error as a warning while
+  the commit reports SUCCESS. The state is silent outside the log. It was also
+  reachable with NOTHING retained anywhere, and unexitable there; round 13 fixes
+  that and rests the argument on exitability, not diagnosability.
+- **Four existing assertions inverted, deliberately** — each keeps the security
+  property it was written for and loses only an availability corollary that IS
+  MAJOR-2's shape (the retained listener also GAINING the new credential), and
+  each gains a convergence control so the withhold cannot be satisfied by an
+  implementation that simply stopped publishing:
+  `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866` (admin still
+  revoked; `other` withheld), `...RotationHonored...` →
+  `TestMgmtReconcileRotationRevokesDespiteHTTPRebindFailure_5561`,
+  `TestMgmtFailedRebindStillPublishesACommittedRotation_5561` →
+  `...StillRevokes...`, `TestMgmtCredentialRotationPrecedesTheRebind_5561` (the
+  new socket must not be bound under the SUPERSEDED secret — the property its own
+  doc comment names).
+- **Test overclaims closed** (both from Codex): `management_authstale_5561_test.go`'s
+  fixture always supplied non-nil auth, which is precisely why MAJOR-1 went
+  unseen — added `mgmtAuthConfigRemoveAuth`; `management_authpublish_5561_test.go`
+  recorded a mutable pointer (now deep-copied) and checked only that `admin`
+  EXISTS (now checks the password).
+- **RED-then-GREEN**: both MAJORs reproduced BEFORE any fix. Mutation-proved
+  after, build+vet rc=0 in every state: (M1) restore round-10's
+  `committed != nil` guard → `TestMgmtStaleReplayCannotResurrectRemovedAuth_5561`
+  + `...WithCommittedNilKeepsOffLoopbackAuth_5561` red, rest green. (M2) publish
+  the full set before the rebind → the four grant-half guards red, rest green.
+  (M3) gate the nil publish on `httpOK` instead of the live bind address →
+  `TestMgmtStaleReplayWithCommittedNilKeepsOffLoopbackAuth_5561` red alone.
+- **File(s)**: pkg/api/auth.go, pkg/api/server.go,
+  pkg/api/auth_retained_5561_test.go, pkg/api/README.md,
+  pkg/daemon/management.go, pkg/daemon/management_5866_test.go,
+  pkg/daemon/management_authstale_5561_test.go,
+  pkg/daemon/management_authpublish_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (#5561 round-13 — Claude MAJOR-1 + MAJOR-2 CONFIRMED
+  by probe before any fix; MAJOR-3 docs contract; MINOR false claim)
+- **Action**: the round-12 grant-half gate `rebinding && len(errs) == 0` was
+  ITSELF a proxy — the same defect class this PR fixes, one level up. Replaced it
+  with the property: `mgmtEndpoint.everyLiveLegNamedBy(next)`, read BEFORE the
+  rebinds (is anything about to move off what `next` names?) and AGAIN after (did
+  everything land on it?). Per leg: the HTTP leg is always serving at `cur.addr`;
+  the HTTPS leg is serving only when `cur.tls` is set, because
+  `api.Server.ReconcileHTTPS` assigns `s.httpsLeg` only after BOTH the keypair
+  and the bind succeed (`pkg/api/listener.go:217-229`).
+- **MAJOR-1 reproduced firsthand** (probe, before any fix): live HTTP
+  `10.0.0.1:80` + `{webadmin: secret-a}`; ONE commit rotates to `secret-b` AND
+  enables HTTPS on `10.0.0.1:443`, whose bind fails. `cur = {addr:10.0.0.1:80
+  httpsAddr: tls:false}` — the HTTP listener is at exactly the address the commit
+  named and never moved, and NO HTTPS listener exists. Yet
+  `live snapshot = &{Users:map[] APIKeys:map[]}` (credCount 0): the management
+  API 401s every caller while the commit reports success. The state had NO EXIT —
+  identical re-commit credCount=0, further rotation credCount=0 (∅ is absorbing:
+  `∅ ∩ X = ∅`), only backing the HTTPS enable out recovered (credCount=1). The
+  fix has two halves because the predicate is read twice, and each half owns a
+  DIFFERENT reachable shape: the never-moved case is settled by the early read
+  alone, the converged-HTTP-move-plus-failed-TLS-enable case only by the late one.
+- **MAJOR-2 reproduced firsthand**: deleting
+  `(!m.cur.tls || mgmtAddrIsLoopback(m.cur.httpsAddr))` from the nil gate left
+  `go test ./pkg/daemon/` fully green on the round-12 head. The state is real —
+  removing api-auth clamps BOTH binds to loopback, the HTTP leg converges and the
+  HTTPS leg's bind fails, so `cur = {addr:127.0.0.1:8080 httpsAddr:10.0.0.1:8443
+  tls:true}` and the sibling conjunct is satisfied; without this one the snapshot
+  goes `<nil>`, an unauthenticated off-loopback mutating REST API. Now pinned by
+  `TestMgmtNilAuthNeverDropsARetainedOffLoopbackHTTPSLeg_5561`, whose
+  preconditions assert the HTTP address IS loopback so it can never degrade into
+  a duplicate of the sibling guard.
+- **∅ stays representable, deliberately** — refusing it would mean keeping a
+  credential the committed config no longer carries alive on a listener the
+  operator asked to leave, which is the round-7 fail-open. What was wrong was
+  entering it with nothing retained anywhere and no way out. It is now reachable
+  only while some listener really is serving an unnamed address, and both exits
+  (converge the bind; commit the address that is actually serving) are one commit
+  away — pinned by `TestMgmtWithheldGrantIsExitableByASubsequentCommit_5561`,
+  which first asserts the absorbing behaviour it is testing the exit from.
+- **MINOR — a false claim corrected, not re-argued**: "shows `Failed` in
+  `show system services`" is FALSE. `effectiveHTTPListener()` returns
+  StateListening in both failure states (the retained leg IS serving);
+  `sysservices.Listeners` has gRPC and HTTP rows only, so an HTTPS bind failure
+  is invisible under any state value; `daemon_apply.go` swallows the error into a
+  `slog.Warn` and the commit reports SUCCESS. Corrected in `pkg/api/README.md`,
+  `pkg/api/auth.go`, and the round-12 `_Log.md` entry, and the acceptability
+  argument now rests on EXITABILITY, not diagnosability. The state is otherwise
+  silent; a dedicated HTTPS row in `show system services` would be a real
+  improvement and is deliberately not in this change (it changes the CLI output
+  and the gRPC listener contract).
+- **MAJOR-3 — `pkg/daemon/README.md` rewritten**: it documented the SUPERSEDED
+  contract on four points (an "unconditional" non-nil publish; the removed
+  `httpOK` gate; `withCommittedAuth` "never turning a non-nil publish into a nil
+  one" — the opposite of the shipped code; and the "already clamped to loopback"
+  premise this PR declares FALSE, presented as deliberate design). Stale
+  `httpOK` reference in `management_5866_test.go` fixed too.
+- **RED-then-GREEN**, `go build ./...` and `go vet` rc 0 in EVERY state:
+  `TestMgmtFailedHTTPSEnableStillGrantsOnTheUnmovedListener_5561` RED on the
+  round-12 head (`live snapshot = &{Users:map[] APIKeys:map[]}`), GREEN after.
+  Six mutations, each reddening only its own guards: (A) restore
+  `rebinding && len(errs) == 0` on the LATE gate → `...AfterAConvergedHTTPMove`
+  red ALONE (the unmoved case is settled by the early read, so it correctly does
+  not); (F) restore `rebinding` on the EARLY gate → `...OnTheUnmovedListener` red
+  ALONE — the two halves are separately bound; (B) delete the HTTPS conjunct of
+  the nil gate → `...NeverDropsARetainedOffLoopbackHTTPSLeg` red alone; (C)
+  publish the full set before the rebind → the five grant-half guards red; (D)
+  drop the "no HTTPS leg is serving" branch of the predicate (over-restrict) → 8
+  red; (E) drop its HTTP-address half (under-restrict) → the 4 grant-withholding
+  guards red.
+- **File(s)**: pkg/daemon/management.go, pkg/api/auth.go,
+  pkg/daemon/management_authsanction_5561_test.go,
+  pkg/daemon/management_5866_test.go, pkg/daemon/README.md, pkg/api/README.md,
+  _Log.md
+
+## 2026-08-01 — #5561 round 14: fence the management desired state to ONE committed generation
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold the five MAJORs from the independent Codex review of
+  `47bbef4fc`. Four of them are consequences of one root cause the last four
+  rounds patched around: `reconcile` derived the ENDPOINT from a possibly-stale
+  configuration and then repaired only its auth field. Round 14 fences the
+  generation instead of adjusting another predicate.
+- **The fence (MAJOR 1 + MAJOR 3)** — `withCommittedAuth` (endpoint from `cfg`,
+  credentials from the store) is replaced by `committedDesired` (BOTH from
+  `store.ActiveConfig()`). The hybrid it produced belonged to no committed
+  generation, and nothing downstream could reason about it:
+  - with the committed policy NIL, the hybrid is C0's OFF-LOOPBACK endpoint
+    under C1's nil auth. Nil auth has no pre-bind publication and `ReconcileHTTP`
+    serves before it returns, so the listener binds and serves unauthenticated;
+    the post-bind gate only suppresses ANOTHER nil store and cannot restore
+    authentication. Permanent, routable, unauthenticated mutating API (MAJOR 1).
+  - with it non-nil, the hybrid's `next` NAMES the stale address, so
+    `everyLiveLegNamedBy` reads TRUE and the whole committed set publishes at an
+    endpoint the commit never authorized it for (MAJOR 3). **Round 13 did not
+    close this** — it sharpened WHICH question is asked; the hybrid corrupts the
+    `next` the question is asked ABOUT. Confirmed by mutation, not by reading.
+- **The claim in the header comment was FALSE as written** and is corrected:
+  "the apply path already runs commits one at a time, so a newer generation can
+  never race or complete out of order behind an older one". Applies are
+  serialized; their CONTENT is not ordered. `daemon_dhcp.go:85` snapshots
+  `ActiveConfig()` and THEN waits on the apply semaphore, so an OLDER generation
+  can be the LAST one applied while no two applies ever interleave.
+- **MAJOR 2 — per-leg auth snapshots** (`authSlot`, `pkg/api`). `stopLegLocked`
+  only closes a channel; the socket keeps accepting until the serve goroutine
+  reaches `Shutdown`, and what it accepted is served for the whole drain, while
+  `ReconcileHTTP`/`ReconcileHTTPS` return immediately and the reconciler then
+  publishes. A credential authorized for the NEW address was therefore valid on
+  the address the same commit RETIRED. Each leg now carries its own slot: LIVE
+  legs FOLLOW `s.auth` (the #5866 live swap is byte-for-byte unchanged), a leg
+  is PINNED at retirement to what it was already serving, and `ReplaceAuth` only
+  ever intersects a pinned slot — revocations still land on a draining listener,
+  grants and nils never do.
+- **MAJOR 4 — a nil publish that cannot land becomes DENY-ALL, not the deleted
+  secret.** When `next.Auth == nil` and a live leg is still off-loopback, rounds
+  7-13 left the live snapshot ALONE: the credential the operator had just
+  deleted went on authenticating there for as long as the loopback bind kept
+  failing. Indefinite, and the exact inversion of the instruction. The single
+  `publishNilDirectionLocked` (called before AND after the rebinds) publishes
+  nil once every live leg is loopback and the EMPTY (deny-all) set otherwise —
+  the same over-restrict-and-retry posture the intersection takes. **Two tests
+  pinned the unsafe behaviour and are inverted with the property restated**
+  (`management_5866_test.go`, `management_authsanction_5561_test.go`); the two
+  stale-replay tests whose premise the fence removes are restated around the
+  fence itself. That is the second time on this PR a test locked in what it was
+  meant to prevent.
+- **MAJOR 5 — boot retry debt was not real debt.** Every "over-restrict and let
+  the next commit converge" argument in this file is only as good as the
+  convergence, and two boot paths had none. A boot HTTP bind failure returned
+  before `m.srv` was assigned, so `reconcileTo`'s `m.srv == nil` short-circuit
+  made every later reconcile a silent no-op — management down for the life of
+  the process. A boot HTTPS failure is deliberately non-fatal, but `startTo`
+  recorded the DESIRED HTTPS fingerprint as CONVERGED, so the leg-changed test
+  was false on every subsequent commit and `ReconcileHTTPS` was never called
+  again. `startTo` now adopts the server whether or not the bind succeeded (it
+  holds no socket on that path) and asks the new `api.Server.HTTPSServing()`
+  rather than inferring convergence from a nil error.
+- **Also**: the fourth inverted assertion (`management_authpublish_5561_test.go`)
+  checked only "non-nil and not old", which a premature publish of the NEW
+  secret satisfies — it now asserts the empty intersection the socket is
+  actually created under. And `AuthForRetainedListener(nil, next)` aliased
+  `next` while the no-alias test claimed neither operand is ever shared; the
+  universal-live branch now returns a copy, with a test that takes that branch.
+- **RED-then-GREEN**, `go build ./...` and `go vet ./pkg/api/... ./pkg/daemon/...`
+  rc 0 in EVERY state (mutant and restored). Eight mutations, each reddening
+  only its own guards with a clean control: (1) endpoint from `cfg`, auth from
+  the store → the three stale-replay guards red; (2) no pin at retirement → both
+  retired-leg guards red, live-leg control green; (3) `tighten` applies a nil →
+  the no-auth guard red ALONE; (4) delete the deny-all arm → five guards red;
+  (5) drop the server on a boot HTTP bind failure → the HTTP retry guard red;
+  (6) record an unserved HTTPS fingerprint → the HTTPS retry guard red; (7)
+  return `next` itself on universal-live → the alias guard red; (8) publish the
+  whole set early → the strengthened ordering assertion red. The first attempt
+  at (5) also dropped `m.srv` on the SUCCESS path and reddened its controls —
+  a mutation wider than the claim, redone faithfully.
+- **File(s)**: pkg/daemon/management.go, pkg/api/listener.go, pkg/api/server.go,
+  pkg/api/auth.go, pkg/api/listener_retiredauth_5561_test.go,
+  pkg/api/auth_retained_5561_test.go, pkg/api/config_authz_5561_test.go,
+  pkg/api/server_authswap_5866_test.go, pkg/api/tls_san_5719_test.go,
+  pkg/daemon/management_bootretry_5561_test.go,
+  pkg/daemon/management_authstale_5561_test.go,
+  pkg/daemon/management_authsanction_5561_test.go,
+  pkg/daemon/management_authpublish_5561_test.go,
+  pkg/daemon/management_5866_test.go, pkg/daemon/README.md, pkg/api/README.md,
+  _Log.md
 - **Timestamp**: 2026-08-01 17:41
 - **Action**: #5173 round-5 fold — the #6676 guard claimed CLASS-COMPLETENESS
   over binding forms that a proc macro breaks, and understated its own
@@ -75036,6 +76429,223 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/cluster/sync_config_gen_reset_race_5084_test.go,
   pkg/cluster/README.md, docs/sync-protocol.md, _Log.md
 
+## 2026-08-07 — #5561 round 18: the view tier could 429 the clear tier
+
+- **Timestamp**: 2026-08-07
+- **Action**: F1 — the round-11 tier ladder gave `PermView`, `PermClear`
+  and `PermControl` the same 16 MiB share and tested each ceiling against
+  the AGGREGATE, which is not a ladder between three equal shares: a view
+  tier at its own ceiling left the clear tier nothing. Measured on the
+  unmutated tree, 383 read-only sockets on `POST /api/v1/diagnostics/ping`
+  pinned the aggregate at 16777216 and a super-user's 24-byte
+  `POST /api/v1/dhcp/identifiers/clear` answered 429 — a cheap permission
+  denying a privileged one, CREATED by round 11 (master has no budget at
+  all). `PermView` is now `mutationBodyBudgetBytes/8` (8 MiB); clear and
+  control stay at 16 MiB, so every privilege step reserves the largest
+  body the tier above it carries (16-8 >= 64 KiB, 48-16 >= 16 MiB,
+  64-48 >= 64 KiB) and 8 MiB still holds 128 concurrent maximum-size view
+  bodies. New behavioural guard `TestViewTierFloodCannotDenyTheClearTier_5561`
+  saturates the view tier by OBSERVATION (bulk flood, then top-up rounds
+  until one is refused) and requires the clear route to be served. The
+  ladder test gained the structural row that was missing: it checked view
+  and clear each against the CONFIGURE tier and never against each other,
+  so the new block walks every privilege step with both sides derived —
+  the order from `config.LoginClassPermissions` through
+  `config.ClassHasPermission`, the size from `restMutationPermissions` x
+  `restMutationBodyLimits` — plus a concurrency floor catching the
+  opposite error of starving a tier to buy separation.
+  F2 — `TestConfigSnapshotIsReadAfterThePeerWait_5561` did not bind its
+  own name: hoisting `cfg := s.activeConfig()` back to before
+  `pending.wait` left it GREEN, because pass 2 re-reads the snapshot
+  unconditionally and 403s either way. The orderings differ on WHEN the
+  denial lands, so the case now drives a body-carrying route
+  (`config/set`) with the body declared and never sent and requires the
+  403 while the body is withheld; its control arm requires the same
+  request to PARK with no commit. Not a fail-open — a stale pass-1
+  snapshot can only be more permissive and pass 2 governs the handler.
+  F3 — merged `origin/master`; `_Log.md` was the only conflict.
+- **Validation**: `go build ./...` 0; `go test ./pkg/api/... ./pkg/authz/...
+  ./pkg/config/...` 0; `gofmt -l pkg/api/` empty; `go vet` rc=0 before every
+  mutation cell. M1 (`PermView` back to `budget/4`): both new guards RED with
+  assertions, `...LowPrivilegeCallerCannotDenyAPrivilegedOne_5561` and
+  `...ViewTierSaturationLeavesHeadroomForTheConfigureTier_5561` stay GREEN.
+  M2 (`PermView` to `budget/512`): concurrency floor REDs, step check green.
+  M3 (snapshot hoisted): freshness guard RED on both revocation shapes,
+  controls green. M4 (`config/set` -> `mutationBodyNone`): control arm REDs.
+  M5 (pass 2 deleted): freshness guard PASSES (binds pass 1 alone), the
+  round-10 guard REDs. `_Log.md` union verified structurally — diffing each
+  pre-merge file against the result yields only `a` hunks adding exactly the
+  other side's 1393 / 1754 lines.
+- **File(s)**: pkg/api/authz.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go,
+  pkg/api/authz_freshness_5561_test.go, pkg/api/README.md, _Log.md
+
+## 2026-08-07 — #5561 round 19: the tier ladder was denominated in body bytes, not charge
+
+- **Timestamp**: 2026-08-07
+- **Action**: F1 — `mutationBodyTierCeilings` reserves each privilege step
+  against the tiers below it, and round 18 sized those steps in BODY
+  bytes while `bodyBudget` charges the buffer's PEAK. `bufferMutationBody`
+  read `limit+1` bytes to detect an oversized body, so a body of exactly
+  `limit` filled `cap == limit` and then grew once more — and a grow
+  charges the old allocation and the new one across the copy. Measured
+  against production by binary-searching the smallest ceiling that admits
+  a max-size body: `2*limit+1`, i.e. 33554433 for a 16 MiB
+  `POST /api/v1/config/load`, against a configure−clear step of exactly
+  33554432. One byte short: with the clear tier pinned at its 16777216
+  ceiling (reachable exactly — 255 sockets parked at 65536, one at 32768,
+  64 at the 512-byte initial buffer), a super-user's 16 MiB `config/load`
+  answered 429 for the whole `apiReadTimeout`, renewably, driven by an
+  `operator` or by any custom class holding nothing but `permissions
+  clear`. Fixed at the allocation, not at the ladder: the over-limit
+  probe byte now lands in a one-byte scratch array and the buffer never
+  grows past `limit`, so the measured peak drops to `1.5*limit`
+  (25165824) — the doubling floor, since a growing buffer necessarily
+  holds the old and new allocations at once. The existing 48/16 MiB step
+  satisfies that with 8 MiB to spare, so no ceiling moved. Two comments
+  that were false about the code are corrected: 48 MiB holds ONE 16 MiB
+  candidate and refuses the second (it holds two after the fix), and the
+  sufficiency criterion is now stated in peak bytes at every step, not
+  just the broken one. The concurrency note also said 128 concurrent
+  max-size view bodies; measured 127.
+  F2 — the `PermControl` tier row was VACUOUS, not a live denial
+  primitive: no route in `restMutationPermissions` requires that
+  permission and `mutationBodyTierCeiling` is only ever called with a
+  route's requirement, so the row was never consulted. Removed; the
+  unlisted-permission fallback already assigns the smallest share, so a
+  later `PermControl` route is bounded from the moment it exists. The
+  test comment claiming clear and control are "incomparable because
+  nothing distinguishes them" was false — `mapJunosPermissions` has
+  distinct arms for `clear` and `control`/`reset`, so a custom class
+  separates them — and so was the note that the row would "bite once a
+  route is added". Widening `strictlyBelow` to custom classes was
+  REJECTED after checking the consequence: once any single Junos token
+  can stand alone, no two coarse permissions are ordered by subset and
+  the derivation returns an EMPTY step set, which would silently make
+  every requirement in the file vacuous. The scope is documented instead.
+  F3 — `CredentialCount` counted `len(a.APIKeys)` including entries
+  mapped to false, which `constantTimeAPIKeyMatch` rejects and
+  `AuthForRetainedListener` does not copy, so the reconciler's `withheld`
+  warning over-reported by one per disabled key. Log-only.
+- **Validation**: `go build ./...` 0; `go vet ./...` 0; `gofmt -l pkg/api/`
+  empty; `go test ./pkg/api/ ./pkg/authz/ ./pkg/cli/ ./pkg/config/
+  ./pkg/daemon/` all ok. `make audit-check` up to date. Pristine control
+  GREEN first. M1 (buffer grows to `limit+1` again, pre-round-19 oversize
+  check restored so the 413 boundary is unchanged):
+  `TestBodyBudgetTiersLeaveThePrivilegedTiersUnreachable_5561` RED —
+  "the configure tier stands only 33554432 bytes above the clear tier
+  (50331648 vs 16777216), less than the 33554433 the gate is CHARGED for
+  a single configure-tier request" — and
+  `TestATierAtItsCeilingCannotRefuseTheTierAboveIt_5561/clear_at_ceiling_vs_configure`
+  RED with an observed 429; the concurrency floor also RED at 63 of 64.
+  Over-reach guards GREEN under M1:
+  `TestBufferedBodyLimitBoundaryIsUnchanged_5561` (all three rows),
+  `TestBodyBudgetReservationIsReleasedOnEveryExitPath_5561` (all three
+  exit paths incl. the 413),
+  `TestHalfOpenBodyIsChargedForWhatItHoldsNotWhatItDeclared_5561`,
+  `TestEveryGuardedRouteDeclaresABodyTier_5561`. M2 (`PermControl` row
+  re-added at `budget/4`): `TestEveryGuardedRouteDeclaresABodyTier_5561`
+  RED on the new no-vacuous-row arm; both ladder cases stay GREEN, which
+  is the evidence that the row really was vacuous. M3
+  (`CredentialCount` back to `len`): the new
+  `TestCredentialCountIgnoresDisabledAPIKeys_5561` RED. Every mutation
+  restored by `cp` from a saved pristine copy, `git status --porcelain`
+  clean of markers before committing. PR still MERGEABLE/CLEAN against
+  `origin/master`, which has not touched `pkg/api/` since the merge base.
+- **File(s)**: pkg/api/authz.go, pkg/api/auth.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go,
+  pkg/api/auth_retained_5561_test.go, pkg/api/README.md, _Log.md
+
+## 2026-08-12 — #5561 round 20: verify the stale round-3 verdict firsthand, then disclose the cap
+
+- **Timestamp**: 2026-08-12
+- **Action**: The newest posted verdict (Codex round 3, DO-NOT-MERGE, 7 MAJORs)
+  was against `7f77f7364` — posted 2026-08-01, seven days and roughly twelve
+  rounds before this head, and **not an ancestor of it** (the branch was
+  rebased since). A verdict in that state cannot be folded as written: several
+  of its findings were closed by later rounds, and one of them attacks a
+  mechanism a later round deliberately kept. So each finding was verified
+  FIRSTHAND at the head, with a distinguishing mutation, and only the survivor
+  was acted on.
+
+  **Method.** For every finding: locate the production line that closes it,
+  then make the single-line edit that should reopen it and require the guard to
+  go RED. A commit message claiming a fix is not evidence, and neither is a
+  code comment describing one — comments outlive the code they describe. Every
+  RED below was run at `-count=2` so a single stray failure could not be
+  mistaken for a mutation kill.
+
+  **F1 — closed and bound.** `authorizeInputs` (`pkg/api/authz.go:485`) reads
+  the config snapshot AFTER the blocking peer wait, and `mutationAuthzGuard`
+  re-adjudicates at the mutation boundary via `reauthorizeInputs` (`:520`,
+  called `:857`). Mutation: hoist `s.activeConfig()` above the wait →
+  `TestConfigSnapshotIsReadAfterThePeerWait_5561` RED on both the demoted and
+  deleted arms, with a message that distinguishes the pass-1 ordering from the
+  pass-2 gate.
+
+  **F2 — closed and bound.** Mutation: delete `cfg, p = s.reauthorizeInputs(r,
+  ri)` → `TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` RED on
+  BOTH arms (`class-demoted-while-body-withheld` and
+  `credential-revoked-while-body-withheld`), controls green. Noted for the
+  record: `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` survives
+  that mutation. It is not vacuous — it guards a DIFFERENT window (the gap
+  between minting the CredentialPrincipal and the decision, held open through
+  `Config.PeerLocalityFn`), so its own distinguishing mutation lives in the
+  credential re-validation, not in the second pass.
+
+  **F3 — closed and bound, seven ways.** Mutation: delete the PRE-rebind
+  `m.srv.ReplaceAuth(publish)` (`pkg/daemon/management.go:426`) → seven tests
+  RED, including `TestMgmtNewListenerNeverServesUnderTheOldAuth_5561` (the
+  verdict's exact complaint) and `TestMgmtFailedRebindStillRevokesACommittedRotation_5561`,
+  with ten sibling tests staying PASS.
+
+  **F4 — closed in CODE, not only in prose.** `pkg/authz/peer.go:504` now
+  consults `findPeerSocket` inside the `ct.Zone != ""` branch BEFORE any
+  address classification, failing closed on a read error and on a found or
+  malformed row. Mutation: drop `Local: true` from the unreadable-table arm →
+  `TestScopedPeerWithNoObservationDenies_5561/no_table_could_be_read` RED,
+  sibling subtest PASS.
+
+  **F5 — LIVE, and the only survivor.** The cap is real and still there;
+  an earlier screen of this round reported it "gone" because the grep was
+  scoped to `pkg/authz` while the cap lives in `pkg/api/authz.go:236/241/356/358`.
+  Decision: ACCEPT the cap, because the alternative under a wedged
+  `localAddrsFn` — where cancellation is unavailable because the wedge is under
+  a mutex — is unbounded goroutine accumulation on the management plane driven
+  by an unauthenticated caller. Bounded denial beats unbounded growth. But the
+  comment ARGUED the case without stating its costs, and an argument is not a
+  refutation, so the constant's doc now states the tradeoff plainly: the slot is
+  taken at accept before authentication, past the cap requests are DENIED rather
+  than queued, and the pool is process-global so saturation on one listener
+  denies on all. A maintainer can now disagree with it. The refinements that
+  would remove the cost rather than bound it (per-listener budget, post-auth
+  acquisition) are filed as #6974.
+
+  **F6 — closed and bound.** Mutation: delete `defer func() { <-peerLookupSlots }()`
+  (`pkg/api/authz.go:358`) → `TestPeerLookupSlotsAreReturned_5561` RED: "a
+  FINISHED lookup did not return its token, so the pool is a lifetime budget
+  rather than a concurrency ceiling". The test acquires through production
+  `connContext`, which is what the older `TestWedgedLookupsDoNotAccumulate_5561`
+  could not do.
+
+  **F7 — closed, and closed with the structural binding the verdict asked for.**
+  Mutation: swap the shared call for a FAITHFUL copy — the exact mutant the
+  verdict named. `TestCLIResolvesThroughTheSharedEvaluator_5561` stayed **PASS**,
+  confirming the verdict's reasoning that behaviour comparison cannot
+  distinguish sharing from an equivalent copy; `TestCLIResolveClassPermsCallsSharedEvaluator_5561`
+  (an AST check requiring exactly one `config.ResolveClassPermissions` call in
+  `CLI.resolveClassPerms`) went RED. That pair is the finding's resolution.
+
+  **Flake, disclosed as UNKNOWN.** One run of `./pkg/authz/... ./pkg/api/...`
+  failed once at this head and never again: `-count=5` (4365 test runs),
+  `-race -count=2`, and three `-shuffle=on` legs were all clean. The failing
+  test name is unrecoverable — the output was truncated before it was read. It
+  is NOT labelled benign, and no "pre-existing on master" claim is made, because
+  an unreproduced failure attributes to neither branch nor master.
+
+  **Validation.** `go build ./...` 0. Every mutation restored and the tree
+  verified clean before committing.
+- **File(s)**: pkg/api/authz.go, _Log.md
 ## 2026-08-06 — #4800 fold r1: the analyzer could report a confident wrong answer
 
 - **Timestamp**: 2026-08-06
@@ -76626,6 +78236,68 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   by reading `shared_ops.rs` at this SHA rather than carried from an earlier
   round.
 
+## 2026-08-12 — #5561 round 21: the in-flight-credential test proves a disjunction, not a site
+
+- **Timestamp**: 2026-08-12
+- **Action**: An independent Codex leg at `9833cf0e3` returned MERGE-NEEDS-MINOR,
+  confirming all seven of its A-G findings (four re-measured with the same
+  mutations used in round 20, including the seven-red/ten-green management
+  split). Three MINORs remain; one is a false claim in a shipping artifact and
+  is fixed here, two are test-synchronization defects filed rather than fixed.
+
+  **The README overstated what one test proves.** Round 20 flagged
+  `TestRevokedCredentialCannotFinishAnInFlightRequest_5561` as surviving the
+  second-pass deletion and declined to claim it bound anything; the mechanism
+  is now understood. There are TWO live credential re-validations between
+  `PeerLocalityFn` and the handler — the re-read inside the credential branch
+  of `principalFrom`, and the mutation gate's second pass
+  (`reauthorizeInputs`) — and they MASK EACH OTHER. Measured here, `-count=2`,
+  all three cells:
+
+      credential branch returns the pre-enumeration principal  PASS
+      second-pass reauthorizeInputs deleted                    PASS
+      BOTH                                                     FAIL
+
+  So the test proves only the DISJUNCTION "at least one live re-validation
+  occurs", and no single-site deletion distinguishes. `pkg/api/README.md` said
+  it "pins both"; it now states the disjunction, carries the measured table,
+  and names the case that WOULD isolate the branch re-read (body-carrying
+  route, body withheld, first-pass `PeerLocalityFn` blocked, credential revoked
+  while parked, locality released, prompt 403 required BEFORE the body is
+  supplied — the second pass has not run at that point). That case is not
+  written and the text says so.
+
+  **A caution recorded because it nearly produced a false claim.** The first
+  attempt at the credential-branch mutation replaced `live, still :=
+  s.credential(r); if !still {...}` with `live, _ := s.credential(r)`. All
+  three cells came back GREEN, which reads as "the test binds nothing at all".
+  That was wrong: `credential()` returns a ZERO Principal when the credential
+  is invalid, so the mutated code still denied — the mutation did not reopen
+  the hole. The faithful pre-fix shape is to return the principal minted by the
+  FIRST `s.credential(r)` call, before the enumeration, which is what the
+  original defect did. A mutation that fails to reopen the defect is
+  indistinguishable from a test that binds, and the difference is only visible
+  by checking what the mutated code actually returns.
+
+  **Filed, not fixed (#6977).** Two async-observation defects, one class: the
+  body-window wait helper accepts any global `mutationBodyWaitersInFlight > 0`
+  rather than a delta the calling test established, while
+  `TestNoBodyRouteIsNotBufferedByTheGate_5561` returns with a request still
+  parked — so under shuffle a later test can consume a stale waiter edge; and
+  `TestPeerIdentityIsResolvedAtAccept_5561` checks exact resolver counts
+  immediately although the lookup is asynchronous and safe requests bypass the
+  mutation wait. Both are the leading explanation for the one unreproduced
+  `pkg/api` failure this branch saw: nothing leaks (a residue probe measured
+  `goroutines=2 slots=0 bodybytes=0` identically across three full iterations),
+  there is no data race (`-race` clean), and the failure needs one specific
+  interleaving — which is why ~20 further executions never reproduced it. The
+  issue carries that history so the UNKNOWN is tracked rather than mysterious.
+  Not fixed here: it spans several files and this PR is 21 rounds deep.
+
+  **Validation.** `go build ./...` 0; `go test ./pkg/authz/... ./pkg/api/...
+  ./pkg/cli/... ./pkg/daemon/...` at `-count=2` 0. Mutations restored and the
+  tree verified clean before committing.
+- **File(s)**: pkg/api/README.md, _Log.md
 ## 2026-08-01
 
 - **Timestamp**: 2026-08-01
@@ -77675,3 +79347,294 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
   pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
   _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #5561 round 21b — the master merge was NOT semantically free, and
+  a clean textual merge hid it.
+
+  Merging master `4960e7bee` conflicted only on `_Log.md`, so the merge looked
+  free. The post-merge gate then failed DETERMINISTICALLY at `-count=2`:
+  `TestCLIResolvesThroughTheSharedEvaluator_5561` could no longer even reach
+  its assertions, because `Commit()` now refuses its fixture:
+
+      system login class super-user: "super-user" is a SYSTEM-DEFINED login
+      class, and the built-in definition always wins at runtime ... this
+      definition is INERT ... (#6701)
+
+  That fixture line was deliberate. It shadowed a built-in to give the
+  BEHAVIOURAL half teeth against the ordering a CLI-only inline special case
+  would get wrong, and its comment justified itself on the premise that "the
+  config path genuinely admits" the collision — schema_system.go validating
+  against built-ins UNION custom classes, compiler_system.go appending with no
+  collision check. **#6701 on master closed exactly that hole**, so the premise
+  is now false and the line cannot commit.
+
+  Removed the line and rewrote the comment to say why, rather than deleting it
+  silently: the ordering teeth are now unavailable BY CONSTRUCTION — with
+  shadowing refused at commit, no committable config can make the
+  built-ins-first order observable — and what remains binding is the
+  STRUCTURAL guard, which is the one that distinguishes sharing from an
+  equivalent copy in any case.
+
+  **Mutation re-proved after the change**, because editing a test invalidates
+  its earlier proof: re-applying the faithful-copy mutant to
+  `CLI.resolveClassPerms` still REDs
+  `TestCLIResolveClassPermsCallsSharedEvaluator_5561` at `-count=2`
+  ("contains 0 call(s) to config.ResolveClassPermissions, want exactly 1"),
+  and the behavioural half still passes under it — unchanged from round 20, so
+  the fixture removal cost nothing the structural guard was not already
+  carrying.
+
+  **Lesson worth keeping**: a fixture whose comment asserts a property of the
+  CONFIG LANGUAGE ("this collision is admitted") is a claim about code that
+  lives outside the test, and master can falsify it. This one announced its own
+  premise, which is the only reason the failure was diagnosable in one run.
+- **File(s)**: pkg/cli/permissions_shared_evaluator_5561_test.go, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6645 (#5561) fold — MAJOR-1, a privilege escalation created by a
+  MERGE rather than by either side's code, plus three MINORs and two NITs.
+
+  **MAJOR-1 — REST and the CLI resolved the same UID to different accounts.**
+  Reproduced firsthand through the production chain before anything was
+  changed: `/etc/passwd` with `admin:x:4242` and `bob:x:4242`, config granting
+  only `system login user admin { class super-user; }`, uid 4242 injected via
+  `PeerLookupFn` into a server built by `buildHTTPServer`:
+
+      authz.UsernameForUID(4242) = ("admin", true)
+      POST /api/v1/config/enter  -> 200, session issued
+      POST /api/v1/config/set    -> 200 {"success":true,"data":{"status":"ok"}}
+      candidate contains "escalated-by-bob"
+
+  So bob — not a login user at all — committed a candidate edit as super-user,
+  through admin's class, because `pkg/authz` returned the FIRST matching passwd
+  row. `pkg/osident` (master, #6706) refuses to name an ambiguous uid for
+  exactly this reason and the CLI denies the same caller as `unauthorized`.
+
+  Neither package was wrong on its own terms and both suites were green:
+  NOTHING compared the two resolvers. `pkg/osident` is absent at the pre-merge
+  head and present at master, so the divergence was created by the merge —
+  the second such interaction today, and unlike the other one it fails
+  silently, because a semantic conflict between two files that never call each
+  other has nothing to break.
+
+  Fixed by DELEGATION, not by copying the rule across: `osident.ForUID(uid)` is
+  new and is what `Current()` now calls, so one implementation answers "which
+  account is this uid" for every surface. `go list -deps ./pkg/osident` returns
+  only itself, so `pkg/authz` importing it cannot cycle — verified, not assumed.
+  `authz.SetPasswdPathForTest` forwards to osident's seam so a fixture moves
+  BOTH surfaces; a local copy would let a test configure REST while the CLI kept
+  reading /etc/passwd, which is the same split in miniature.
+
+  Two consequences I had to handle rather than discover later. `PrincipalForUID`
+  reported every unresolved uid as "has no /etc/passwd entry"; with ambiguity
+  now also unresolved, that would send an operator hunting for a missing
+  account when the real problem is two accounts sharing one uid — it now
+  distinguishes the three osident reasons. And `TestCurrentBodyCallsClassifyLookup_6706`
+  went RED correctly: extracting `ForUID` MOVED the boundary it was watching, so
+  asserting on `Current`'s body alone would have passed while proving nothing.
+  It now pins the whole chain `Current -> ForUID -> classifyLookup`, which is
+  strictly more than the single link it guarded before.
+
+  **The test that pinned the wrong side** (`authz_5561_test.go`, "want the FIRST
+  entry (first, true)") now asserts the denial, with the reasoning in the body:
+  it was an assertion defending a privilege escalation.
+
+  **MINOR-1** — "the same class the CLI would have applied" / "the two surfaces
+  cannot disagree" are now qualified. Both were false for uid 0, which REST
+  authorizes unconditionally while the CLI honours an explicit
+  `system login user root { class read-only; }`. The behaviour is fine and
+  documented; the unqualified claim was not. `docs/system-login.md` now says
+  which surface its class table describes, and carries the REST caveat plus the
+  ambiguous-uid row.
+
+  **MINOR-2** — the middleware enumeration said cross-site then api-auth; the
+  wrapping is api-auth then cross-site. No runtime effect, but a reader
+  reconstructing the order from the comment got it backwards.
+
+  **MINOR-3** — "unavailable BY CONSTRUCTION" is now "unavailable through no
+  config the STRICT commit path admits". `validateLoginClassShadowsBuiltinAST`
+  rejects strictly and WARNS leniently, and both `store_persist.go`'s load and
+  `Store.SyncApply` take the lenient path, so a shadowing class can reach the
+  ACTIVE config on an upgraded box or an HA standby. The fixture removal stands;
+  only the reason was over-strong.
+
+  **NIT-1** — `CredentialCount` counted every `Users` row while
+  `checkAuthorization` rejects an empty secret and the API-key arm filters
+  empties. A quoted-empty user secret inflated the `withheld` warning on one
+  side only; both arms now filter.
+
+  **NIT-2** — "sized like the two queue caps in pkg/authz" was 1024 against
+  4096/4096. Same reason and direction, quarter the size; said so.
+
+  TWO PATH SLIPS IN THE BRIEF, settled against the branch rather than guessed:
+  MINOR-3 is in `pkg/cli/permissions_shared_evaluator_5561_test.go`, not
+  `pkg/authz/`, and NIT-2 is `pkg/api/authz.go:234`, not `pkg/authz/authz.go` —
+  two different files named authz.go. Both texts were verbatim where they really
+  live. Nothing was invented to match a citation.
+- **File(s)**: pkg/osident/osident.go,
+  pkg/osident/current_calls_classifier_6706_test.go, pkg/authz/passwd.go,
+  pkg/authz/authz.go, pkg/authz/authz_5561_test.go,
+  pkg/api/authz_ambiguous_uid_6645_test.go, pkg/api/authz.go, pkg/api/auth.go,
+  pkg/api/server.go, pkg/cli/permissions_shared_evaluator_5561_test.go,
+  docs/system-login.md, _Log.md
+- **Validation**: RED-on-revert with `go vet` rc 0 first, so both failures are
+  assertions rather than build breaks. Restoring the pre-#6645 first-matching-row
+  scanner in `pkg/authz/passwd.go`:
+
+      pkg/api   FAIL TestRESTAndCLIAgreeOnAnAmbiguousUID_6645
+        "REST ADMITTED an ambiguous uid: POST /api/v1/config/enter -> 200.
+         uid 4242 is shared by admin and bob; only admin is granted super-user,
+         so admitting on the first passwd row hands admin's class to bob —
+         privilege escalation between two legitimate accounts. The CLI denied
+         the same caller as "unauthorized"."
+      pkg/authz FAIL TestUsernameForUIDParsesPasswd_5561
+        "duplicate uid 5000 resolved to "first" — an ambiguous uid must fail
+         closed, never be attributed to whichever passwd row was read first"
+
+  The new cross-surface test carries its own fixture control: `soleuser` holds
+  the SAME super-user class through the SAME config and passwd file, differing
+  only in being named by exactly one row, and REST must still ADMIT it. Without
+  that arm, "REST refused 4242" is equally explained by "4242 is not a
+  configured login user" and the assertion would be measuring the wrong thing.
+
+  A harness note: my first probe called `postRoute` on `config/enter` and THEN
+  `enterConfigure`, so the second open hit the configure lock and returned 409.
+  That 409 was my harness, not the gate — re-run with a single enter, the
+  escalation reproduced end to end. A row that does not add up gets re-run in
+  isolation before it is reported.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/authz/... ./pkg/api/... ./pkg/cli/... ./pkg/osident/...
+  ./pkg/daemon/...` all ok.
+
+  NOT re-derived, per instruction: the route enumeration (one ServeMux, 61
+  registrations, 19 mutating, tables equal to that set).
+
+## 2026-08-13 — #5561 round 22: isolate the credential re-read; de-couple three process-global test edges
+
+- **Timestamp**: 2026-08-13
+- **Action**: Three test-quality findings on PR #6645. No production file is
+  touched — `git diff` over `pkg/api/authz.go`, `pkg/api/server.go` and
+  `pkg/authz/` is empty — so the gate's behaviour is unchanged and only what the
+  suite can PROVE about it moves.
+
+  **F1 — the masking round 21 named is now closed by a case, not by a caveat.**
+  Round 21 measured that `TestRevokedCredentialCannotFinishAnInFlightRequest_5561`
+  proves a DISJUNCTION: two live credential re-validations sit between
+  `Config.PeerLocalityFn` and the handler — the re-read inside `principalFrom`'s
+  credential branch, and the gate's second pass (`reauthorizeInputs`, whose
+  `principalFrom` re-validates at the top for every row) — and each masks the
+  other's deletion. Re-measured firsthand at this head before writing anything,
+  because a stale premise is not a licence to write a test:
+
+      mutation                                   old case   NEW case
+      credential branch returns the principal
+        minted BEFORE the enumeration            PASS       FAIL
+      second pass reauthorizeInputs deleted      PASS       PASS
+      both                                       FAIL       FAIL
+
+  New case `TestCredentialRereadDeniesBeforeTheBodyIsSupplied_5561`
+  (`authz_freshness_5561_test.go`) asks the question before the second pass
+  exists: a body-carrying route (`POST /api/v1/config/set`, mutationBodyEdit)
+  whose body is DECLARED and never sent, pass 1 blocked inside
+  `Config.PeerLocalityFn`, the credential revoked while it is parked, locality
+  released — and a 403 required WITHOUT the body. Only pass 1 runs before the
+  body, and within pass 1 only the branch's own re-read can see a revocation
+  that landed after the check at the top of `principalFrom`, so the denial has
+  exactly one possible author. Both credential shapes (Basic, X-API-Key) are
+  driven, as in the case above, because `credentialPrincipalUser` has two arms.
+  RED-on-revert observed as an ASSERTION, not a build break:
+
+      authz_freshness_5561_test.go:530: nothing answered within 5s while the
+      body was withheld. Pass 1 therefore ADMITTED a request whose api-auth
+      credential had already been revoked, and the gate is parked in its body
+      drain [...]
+
+  The OVER-REACH GUARD is the middle row: the new case stays GREEN when the
+  second pass is deleted, so it isolates the branch re-read rather than
+  restating the disjunction. Its control arm must PARK rather than answer,
+  which is what makes "prompt" an assertion instead of a hope.
+
+  **F2 — the body-window waiter edge is process-global, and a case was leaving
+  one parked.** `waitForMutationBodyWaiter` accepts ANY count above zero, and
+  `TestNoBodyRouteIsNotBufferedByTheGate_5561` ends by design with a control
+  request parked on a body it never finishes. Measured at the unmodified PR head
+  with a probe: `waiters=1 admitted=512` at the end of that case's body,
+  `waiters=0 admitted=0` once its cleanups had run. So the leak is REAL and the
+  cross-test misattribution it enables is real in principle — but it was NOT
+  reproduced: the subtest's own `t.Cleanup` closes the connection and the
+  handler unparks before the next case's body runs, and a probe test placed
+  immediately after read 0/0 on three consecutive runs. Reported as a race that
+  is now closed by construction rather than one that was caught in the act.
+  New `waitForGateQuiescent` is called BEFORE the request is opened at every
+  case that waits on the edge, and `authzServer`'s cleanup now closes the server
+  and waits for both counters to reach zero — which puts the failure on the case
+  that leaks rather than on whichever innocent case `-shuffle` runs next. The
+  no-body control hangs up and drains explicitly.
+
+  **F3 — two async probes had no quiescence edge, and one of them has a
+  deterministic repro.** `connContext` returns its admission token in the
+  goroutine's LAST defer and `close(p.done)` is deferred after it, so `p.done`
+  closes FIRST: a case that joins on it, or simply drives HTTP and reads the
+  response, returns while the token is still out. With one token already held,
+  `TestPeerLookupSlotsAreReturned_5561` can fill only `maxConcurrentPeerLookups-1`
+  more and reads one OVER. A throwaway preceding case that leaves exactly that
+  state made it fail with an ASSERTION and nothing wrong in production:
+
+      authz_freshness_5561_test.go:455: pool holds 1024 tokens before the case
+      starts, want 1023
+
+  Fixed by an initial `waitSlots(t, 0, ...)`; the same repro then passes, taking
+  2.01s — the held-token window absorbed rather than mistaken for a defect.
+  Separately, `TestPeerIdentityIsResolvedAtAccept_5561` sampled exact resolver
+  counts the moment its responses landed, but every request it makes is SAFE and
+  a safe method returns from `mutationAuthzGuard` before `authorizeInputs` — so
+  nothing on the request path waits for the accept-time lookup and the sample can
+  read 0 where it wants 1. It now reads through new
+  `waitForPeerLookupsToFinish` (count reached AND pool empty; zero occupancy is
+  the only edge that says every lookup started has finished), which keeps the
+  equality assertions meaning what they say.
+
+  **Relation to the flake disclosed as UNKNOWN on 2026-08-12** (`_Log.md`, the
+  round-21 entry): one run of `./pkg/authz/... ./pkg/api/...` failed once at that
+  head and never again, with the test name truncated before it was read. F3's
+  mechanism is a candidate — same package pair, same head, and it was introduced
+  by the very commit that added `TestPeerLookupSlotsAreReturned_5561` — but the
+  name is unrecoverable, so this is NOT claimed as the identification. The
+  mechanism is now closed either way.
+
+  **Validation.** `gofmt -l pkg/api/` clean; `go build ./...` rc 0;
+  `go vet ./pkg/api/...` rc 0; `go test ./pkg/api/` rc 0 (39s); four `-shuffle`
+  legs (seeds 1-4) rc 0; `-race -count=2` rc 0 (90s); the nine touched cases at
+  `-count=5 -shuffle=on` rc 0; `./pkg/authz/... ./pkg/api/...` three times at
+  `-shuffle=on` rc 0. Every mutation restored and the production file verified
+  byte-clean before committing.
+- **File(s)**: pkg/api/authz_freshness_5561_test.go,
+  pkg/api/authz_bodywindow_5561_test.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go,
+  pkg/api/config_authz_5561_test.go, pkg/api/README.md, _Log.md
+
+- **Timestamp**: 2026-08-13T12:45Z
+- **Action**: #6645 pre-merge fold — corrected a FALSE claim in production source and
+  unasserted two client-side socket-close errors. `pkg/api/authz.go` claimed the
+  standalone configure->maint assertion "requires the budget's free space above the
+  configure ceiling to cover a max-size load". It does not: the real assertion at
+  `authz_bodybudget_fairness_5561_test.go:783` uses `needFor(mutationBodySmall)`, and
+  the load form is arithmetically false (budget-configure = 64-48 = 16 MiB, while
+  needFor(mutationBodyLoad) peaks at 24 MiB). The `mutationBodyLoad` assertions in
+  that file are quantified over view and clear only. Anyone implementing the sentence
+  as written would produce a RED test against a correct ladder. Also unasserted the
+  `conn.Close()` errors at `authz_bodywindow_5561_test.go:309` and
+  `authz_bodybudget_fairness_5561_test.go:410` — both closes are load-bearing (one
+  releases the gate for the next case, one IS the abort under test) but their errors
+  bind nothing in production; the binding assertions are the quiescence/settle waits
+  that follow. Validation: go build + go vet clean, `go test ./pkg/api/...` ok 37.7s,
+  gofmt clean on all three files. Parent mutation proof at this head: deleting the
+  entire second adjudication (`reauthorizeInputs` + its `Authorize` guard,
+  authz.go:892-896) compiles cleanly and reds exactly
+  `TestLocalCallerCredentialIsRevalidatedAfterTheBody_5561` and
+  `TestAuthorizationIsRemadeAfterTheCallerSuppliesItsBody_5561` — the TOCTOU fix is
+  independently bound.
+- **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
+  pkg/api/authz_bodybudget_fairness_5561_test.go
