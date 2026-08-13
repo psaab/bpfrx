@@ -720,9 +720,12 @@
      lines above — carries a one-line pointer so a reader arriving at either draws
      the right conclusion.
 
-  Validation: `cargo test --release` GREEN at the delivered head — 4264 passed /
-  0 failed / 2 ignored in the main binary under the #6657 filter, plus
-  60 + 8 + 22 + 31 + 1 + 2 in the integration binaries.
+  Validation: full `cargo test --release`, UNFILTERED, GREEN at the delivered
+  head — 4289 passed / 0 failed / 2 ignored in the main binary (4284 at the
+  pre-fold head plus the five cells this round adds), and 60 + 8 + 22 + 31 + 1 + 2
+  in the integration binaries. The two #6657 families that the mutation matrix
+  excluded both PASSED in that unfiltered run, which is consistent with their
+  being load-triggered rather than deterministic.
   Full `go test ./...` GREEN. `CARGO_TARGET_DIR` private to this lane; no crate-wide
   `cargo fmt` — each touched file checked in place with
   `rustfmt --edition 2024 --check` against its own parent content and carrying the
