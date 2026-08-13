@@ -738,7 +738,7 @@ ctrlReady:
 		// slot.
 		if binding.QueueID >= bindingQueuesPerIface {
 			return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-				"update userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (ifindex=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
+				"update userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (ifindex=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
 				binding.QueueID, uint32(bindingQueuesPerIface), binding.Ifindex,
 			))
 		}
@@ -781,7 +781,7 @@ ctrlReady:
 			// from the parent's binding, so bound it here too.
 			if binding.QueueID >= bindingQueuesPerIface {
 				return m.failClosedUserspaceCtrlLocked(ctrlMap, ctrl, fmt.Errorf(
-					"update aliased userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (child=%d parent=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/lib.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
+					"update aliased userspace_bindings: queue-id=%d >= stride=%d would alias the adjacent ifindex queue-0 slot (child=%d parent=%d) — cap the helper queue count or raise BINDING_QUEUES_PER_IFACE in userspace-xdp/src/binding_index.rs (mirrored in pkg/dataplane/constants.go) (#4894)",
 					binding.QueueID, uint32(bindingQueuesPerIface), childIfindex, parentIfindex,
 				))
 			}
