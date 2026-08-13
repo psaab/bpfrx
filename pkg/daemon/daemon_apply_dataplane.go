@@ -554,10 +554,15 @@ func (d *Daemon) programRethMemberMAC(ifName string, mac net.HardwareAddr,
 // the double rebind that call site's own comment warns gets EBUSY on mlx5
 // zero-copy queues.
 //
-// Reachability is narrow — a driver without IFF_LIVE_ADDR_CHANGE (not the
-// cluster's mlx5/virtio NICs) plus a control-socket or netlink failure in the
-// same window — and the direction is fail-CLOSED throughout: ctrl is off, so
-// transit is dropped, never passed.
+// Reachability is narrower than the common case but NOT confined to exotic
+// drivers, and an earlier revision of this note said it was. Entering the class
+// takes any refused live MAC set plus a control-socket or netlink failure in the
+// same window. The first term is not "a driver without IFF_LIVE_ADDR_CHANGE":
+// programRethMAC falls back on EVERY error from setHardwareAddr, and
+// dev_set_mac_address fails the same way for a busy or absent device or a
+// notifier rejection — so a transient refusal on the cluster's own mlx5 VFs
+// enters this abort/rollback class too. What stays true is the direction:
+// fail-CLOSED throughout, ctrl is off, so transit is dropped, never passed.
 func (d *Daemon) programRethMACWithWorkerJoin(ifName string, mac net.HardwareAddr) (linkCycled bool, commitErr error) {
 	// joinRan, not joinFailed: set AFTER the nil-dataplane guard, so it means
 	// exactly "the hook ran, and the dataplane may be half torn down". A nil

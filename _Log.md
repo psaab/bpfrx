@@ -77474,7 +77474,10 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   services whatever is still outstanding. (2) The ctrl write in
   `applyHelperStatusLocked`, alongside the existing `rgTransitionInFlight`
   check — CONDITION 1 from the brief, traced to a verdict: `UpdateRGActive` IS
-  a producer of the ctrl-re-enable class. Path: `reconcileRGStateLoop` (500ms)
+  a producer of the ctrl-re-enable class. Path: `reconcileRGStateLoop` (2s
+  ticker, plus early wakes on dropped-event notifications; an earlier revision
+  of this entry said 500ms, which was inherited from a stale comment in
+  `pkg/daemon/rg_state.go` and is corrected there too)
   and the VRRP/cluster event handlers -> `d.dp.HA().SetRGActive` ->
   `Manager.UpdateRGActive` -> `applyHelperStatusLocked`. None of those holds
   `d.applySem`, so it lands mid-cycle on its own schedule, and its own
@@ -77559,3 +77562,101 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/daemon/reth_prepare_abort_recovery_5103_test.go,
   pkg/daemon/reth_callsite_effect_5103_test.go,
   pkg/daemon/policy_scheduler_apply_test.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6871 hostile-review fold: bind the rebind error at the live
+  adapter, and close the sixth worker-respawn producer (the operator verbs).
+  F1 (blocking). The production line that makes the #6871 fail-closed rebind
+  real could be severed TWO independent ways with the entire suite still green:
+  `return fmt.Errorf("userspace: rebind after link cycle: %w", err)` ->
+  `return nil` in `process_linkcycle.go` (the PRODUCER), and
+  `_ = c.manager.NotifyLinkCycle(); return nil` in `controllers.go` (the
+  TRANSPORT). Reproduced firsthand: with the new suite hidden, each revert
+  leaves `go test ./pkg/dataplane/userspace/` fully green. The daemon-side
+  tests drive `abortRecoveryLinkController.notifyErr`, a FAKE, so they bind the
+  daemon's CONSUMPTION of the error and never the manager's PRODUCTION of it;
+  `link_cycle_test.go` calls the real `m.NotifyLinkCycle()` as a bare
+  statement, discarding the return; no daemon test constructs a real
+  `userspace.Manager`. New `link_cycle_failclosed_6871_test.go` mirrors the
+  #5103 Prepare-half suite structurally: four cells, ALL through `m.Link()` —
+  rebind failure names "rebind"; healthy helper answers both and returns nil;
+  no helper returns nil; nil-manager adapter returns nil. Each of the first
+  cell's assertions goes RED under BOTH reverts.
+  F2. Sixth producer. `SetForwardingArmed` / `SetQueueState` / `SetBindingState`
+  take only `m.mu` and never consulted the lease. They are reachable ONLY from
+  outside the daemon (`request chassis cluster data-plane userspace ...` via
+  `pkg/cli/cli_request_chassis.go` and gRPC `SystemAction` via
+  `pkg/grpcapi/server_diag_system_action.go`), and neither call site is
+  serialized on `applySem` — there is no `applySem` use anywhere in `pkg/cli`
+  or `pkg/grpcapi`. Each lands in a helper handler that reaches
+  `afxdp.reconcile` and SPAWNS WORKER THREADS (`handlers/forwarding.rs`
+  unconditionally; `handlers/binding.rs` / `handlers/queue.rs` on
+  `registration_changed`). So an operator or automation firing one between
+  `PrepareLinkCycle` and `setDown` — a window up to `externalCommandTimeout` of
+  `ethtool` per RETH member — respawns workers into a NIC about to unmap their
+  UMEM, which is the use-after-unmap #5103 exists to prevent. The ctrl gate at
+  `maps_sync.go` does NOT cover it: the spawn happens INSIDE the helper, before
+  the status this manager applies, so the gate has nothing left to un-spawn.
+  Gated at the three verbs with `errLinkCycleInFlight`, NOT centrally in
+  `requestLocked`: `requestLocked` also carries the cycle's own `stop_workers`,
+  sent AFTER the lease is taken, so a central gate would need an exemption list
+  for exactly the requests that take and release the lease. Both directions are
+  refused, not only arming — a disarm does not spawn but still drives
+  `afxdp.reconcile`'s teardown arm over sockets the cycle quiesced, and nothing
+  inside the daemon calls these three, so the broader scope blocks no internal
+  path (unlike the #5648 gate beside it, which is scoped to `armed==true`
+  precisely because the daemon's own disarm paths must never be refused).
+  F3. A wrong cadence in seven places. `reconcileRGStateLoop`
+  (`daemon_ha.go:611`) is `time.NewTicker(2 * time.Second)`, not 500ms.
+  Corrected at `maps_sync.go`, `process_linkcycle.go`, `docs/reth-mac.md`,
+  `link_cycle_lease_6871_test.go` (comment + failure message), this log, and at
+  the stale pre-existing source the rest inherited it from,
+  `pkg/daemon/rg_state.go` — plus its echo in `rg_state_test.go`, whose derived
+  "6 lines/sec" was wrong for the same reason. The load-bearing half of the
+  claim is unchanged and verified: the loop is its own goroutine calling
+  `SetRGActive` with no `applySem`.
+  F4. Two claim sites contradicting a correction this PR itself made.
+  `daemon_reth.go` logged "driver does not support live change" on a branch
+  taken on EVERY `setHardwareAddr` error; it now says the live set was refused
+  and CARRIES the actual error (hoisted to `liveSetErr`, previously scoped to
+  the `if` and lost). `daemon_apply_dataplane.go`'s "Reachability is narrow — a
+  driver without IFF_LIVE_ADDR_CHANGE (not the cluster's mlx5/virtio NICs)"
+  understated reachability: a transient refusal on an mlx5 VF enters the same
+  abort/rollback class.
+  F5. A test that passed for the wrong reason.
+  `TestStatusTickSendsNothingWhileLinkCycleInFlight_6871` still passed with
+  `statusLoopInterval` inlined back to `time.Second` — the 300ms hold then held
+  zero ticks, so `requestsBetween` came back empty vacuously. Added an
+  equal-length pre-cycle CONTROL window requiring >= 2 polls. Verified
+  comparatively: under the severed seam the PRE-FOLD test body PASSES and the
+  new one FAILS at "only 0 status polls in a 300ms control window".
+  Also: the 60s TTL doc now names its assumption — it is the N=2 worst case
+  (15s x (1 + members visited after the last cycling one)), the traversal is a
+  Go map range so the tail is nondeterministic, and >= 4 wedging members
+  afterwards exceed it; overrun is loud (Warn under the CAS) and degrades to
+  master's behaviour.
+  Validation. `go build ./...` rc=0; `go vet` rc=0 on both packages; `gofmt -l`
+  clean on every touched file (the other files it lists are pre-existing
+  deviations, confirmed at the unmodified PR head). Root run of
+  `./pkg/dataplane/userspace/ ./pkg/daemon/`: 8 failures, byte-identical to the
+  same run at the unmodified head 9060c6126 (sorted FAIL-set diff empty) — the
+  known pre-existing root-only set. `-race` clean on the userspace package. All
+  10 new cells RUN unprivileged; none skip. No Rust changed, so no cargo leg is
+  owed.
+  Mutation matrix, 6 revert cells + 4 comparative cells, every RED an ASSERTION
+  (zero build breaks, zero skips): producer `return nil` -> RED / 3 guards
+  GREEN; adapter swallows -> RED / same 3 GREEN; each of the three verb gates
+  removed individually -> RED on that verb / 2 guards GREEN; statusLoopInterval
+  seam severed -> RED on the density guard / resume guard GREEN. Comparative:
+  with the new suites hidden, both F1 reverts AND all three gates removed leave
+  the package green; the pre-fold tick test passes under the severed seam.
+  Advances #5103.
+- **File(s)**: pkg/dataplane/userspace/manager_status.go,
+  pkg/dataplane/userspace/process_linkcycle.go,
+  pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/link_cycle_failclosed_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_operator_verbs_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
+  pkg/daemon/daemon_reth.go, pkg/daemon/daemon_apply_dataplane.go,
+  pkg/daemon/rg_state.go, pkg/daemon/rg_state_test.go,
+  docs/reth-mac.md, _Log.md

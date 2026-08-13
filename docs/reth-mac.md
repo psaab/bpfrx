@@ -230,7 +230,7 @@ restarting workers — which is why the first three are not hypothetical.
 **The lease.** `Manager.linkCycleLeaseUntil` is an `atomic.Int64` deadline, taken
 by `PrepareLinkCycle` and released by `NotifyLinkCycle`. It is atomic for the
 same reason `rgTransitionInFlight` is: the guard has to survive `m.mu` being
-released. It is consulted in exactly two places:
+released. It is consulted in exactly three places:
 
 - **at the top of the status tick's critical section**, which skips its *whole
   body*. Nothing is lost — every action in that body is level-triggered on
@@ -241,10 +241,33 @@ released. It is consulted in exactly two places:
 - **at the ctrl write in `applyHelperStatusLocked`**, alongside the existing
   `rgTransitionInFlight` check. This is not redundant with the tick guard:
   `UpdateRGActive` also ends in `applyHelperStatusLocked`, and it runs off VRRP
-  events and `reconcileRGState`'s 500ms pass — **neither serialized on the
-  daemon's `applySem`** — so it lands mid-cycle on its own schedule. Its own
+  events and `reconcileRGStateLoop`'s 2s pass (`daemon_ha.go`, which also wakes
+  early on dropped-event notifications) — **neither serialized on the daemon's
+  `applySem`** — so it lands mid-cycle on its own schedule. Its own
   `rgTransitionInFlight` guard does not help: a demotion never sets the flag, and
   an activation clears it before the status apply.
+- **at the three operator worker-affecting verbs** in `manager_status.go`
+  (`SetForwardingArmed`, `SetQueueState`, `SetBindingState`), which return
+  `errLinkCycleInFlight`. This is the sixth producer, and the only one reachable
+  from *outside* the daemon: `request chassis cluster data-plane userspace
+  forwarding|queue|binding ...` in the CLI (`cli_request_chassis.go`) and gRPC
+  `SystemAction` (`server_diag_system_action.go`). Neither call site is
+  serialized on `applySem` — there is no `applySem` use anywhere in `pkg/cli` or
+  `pkg/grpcapi` — so an operator or an automation can fire one into the middle
+  of a cycle. Each lands in a helper handler that reaches `afxdp.reconcile` and
+  **spawns worker threads** (`handlers/forwarding.rs` calls
+  `reconcile_status_bindings` unconditionally; `handlers/binding.rs` and
+  `handlers/queue.rs` on `registration_changed`). The ctrl gate above cannot
+  cover it: the spawn happens *inside the helper*, before the status this
+  manager applies, so the gate has nothing left to un-spawn.
+
+  Gated at the verbs rather than centrally in `requestLocked` because
+  `requestLocked` also carries the cycle's own `stop_workers`, sent *after* the
+  lease is taken — a central gate would need an exemption list for exactly the
+  requests that take and release the lease. Both directions are refused, not
+  only arming: a disarm does not spawn, but it still drives `afxdp.reconcile`'s
+  teardown arm over sockets the cycle has quiesced, and nothing inside the
+  daemon calls these three, so the broader scope blocks no internal path.
 
 **Acquire point:** before the ctrl disable, not after a successful join. The
 window that needs covering opens at the first mutation of dataplane state, and a
@@ -261,11 +284,17 @@ cycle re-enables `ctrl` on that call instead of costing an extra reconcile tick.
 **TTL backstop:** `linkCycleLeaseTTL` (60s). Every path that takes a lease reaches
 a `NotifyLinkCycle`, so the TTL is only for a caller that dies in between — but a
 stranded lease would suppress the reconcile loop permanently, which is worse than
-the race. 60s is derived from the worst-case Prepare→Notify gap: the dominant term
-is the 15s `externalCommandTimeout` on step 2.6's per-member `ethtool -K rxvlan
-off`, plus `NotifyLinkCycle`'s own 1s NIC settle. A cycling member re-arms the
-lease itself, so the exposure grows only with the non-cycling members visited
-after the last cycle.
+the race. 60s is derived from the Prepare→Notify gap **at the deployed N=2
+topology**, and that assumption is the load-bearing part: the dominant term is the
+15s `externalCommandTimeout` on step 2.6's per-member `ethtool -K rxvlan off`,
+plus `NotifyLinkCycle`'s own 1s NIC settle. A cycling member re-arms the lease
+itself, so exposure is 15s × (1 + members visited *after* the last cycling one) —
+30s on a 2-RETH node, half the TTL. It is **not** a general bound: four or more
+wedging members visited after the last cycle exceed it, and since that traversal
+is a Go map range, which members land in the tail is nondeterministic between
+runs. Overrunning is bounded and loud rather than silent — `linkCycleInFlight`
+logs a `Warn` under the CAS when it clears an expired lease, and the behaviour it
+degrades to is master's, where the tick was never suppressed at all.
 
 **The rollback now reports.** `NotifyLinkCycle` returns an `error`. Its rebind is
 the documented inverse of `stop_workers`, and a failure used to be a `slog.Warn`
@@ -286,7 +315,9 @@ on that would be an over-rejection.
 | `pkg/dataplane/userspace/process_linkcycle.go` | `acquireLinkCycleLease` / `releaseLinkCycleLease` / `linkCycleInFlight` + the TTL |
 | `pkg/dataplane/userspace/process_status.go` | the tick-wide skip |
 | `pkg/dataplane/userspace/maps_sync.go` | the ctrl-write gate (covers `UpdateRGActive`) |
+| `pkg/dataplane/userspace/manager_status.go` | `errLinkCycleInFlight` + the three operator-verb gates |
 | `pkg/dataplane/apply.go` | `LinkController.NotifyLinkCycle() error` |
+| `pkg/dataplane/userspace/controllers.go` | `userspaceLinkController.NotifyLinkCycle()` — the live adapter carrying the rebind error to the daemon |
 
 ## Deferred AF_XDP Worker Arming After a Live MAC Change (#5134)
 

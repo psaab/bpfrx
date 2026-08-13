@@ -75,12 +75,58 @@ func (m *Manager) CachedStatus() (ProcessStatus, bool) {
 	return m.lastStatus, true
 }
 
+// errLinkCycleInFlight refuses an operator worker-affecting verb while a RETH
+// MAC link cycle owns the dataplane (#6871).
+//
+// The three verbs below — `request chassis cluster data-plane userspace
+// forwarding|queue|binding ...` via the CLI (cli_request_chassis.go) and via
+// gRPC SystemAction (server_diag_system_action.go) — are the SIXTH producer of
+// the worker-respawn class, and the only one reachable from outside the daemon.
+// Each ends in a helper handler that calls reconcile_status_bindings
+// (handlers/forwarding.rs unconditionally on a set_forwarding_state;
+// handlers/binding.rs and handlers/queue.rs when registration_changed), which
+// reaches afxdp.reconcile and SPAWNS WORKER THREADS. Neither call site is
+// serialized on the daemon's applySem — there is no applySem use anywhere in
+// pkg/cli or pkg/grpcapi — so an operator or an automation can issue one in the
+// window PrepareLinkCycle opens: the workers are joined, and the daemon has not
+// reached setDown yet (up to externalCommandTimeout of `ethtool` per RETH
+// member). Respawned workers then meet a NIC unmapping its UMEM pages, which is
+// the use-after-unmap #5103 exists to prevent.
+//
+// The ctrl gate in applyHelperStatusLocked does NOT cover this. It correctly
+// holds ctrl.Enabled=0, but the spawn happens INSIDE the helper, before the
+// response this manager applies — so the gate cannot un-spawn what the request
+// already started.
+//
+// Scoped at the verbs rather than centrally in requestLocked deliberately:
+// requestLocked is also the transport for the link cycle's OWN "stop_workers",
+// which PrepareLinkCycle sends AFTER it takes the lease, so a central gate would
+// have to exempt exactly the requests that take and release the lease — an
+// exemption list that is silently wrong the first time a request type is added.
+//
+// Both directions are refused, not only the arming one. A disarm/deregister does
+// not spawn, but it still drives afxdp.reconcile's teardown arm across AF_XDP
+// socket state that PrepareLinkCycle has just quiesced, and whether a given
+// (registered, armed) pair reconciles at all is a per-verb helper-side detail
+// (binding.rs and queue.rs reconcile only on registration_changed, forwarding.rs
+// always). Excluding the whole window is simpler than tracking that. Nothing
+// internal is blocked by the broader scope: unlike the #5648 protocol gate
+// below — which is scoped to armed==true precisely because the daemon's own
+// disarm paths must never be refused — these three verbs have NO caller inside
+// the daemon. They are operator-interactive, and the cycle is seconds long.
+var errLinkCycleInFlight = errors.New(
+	"userspace: a RETH MAC link cycle is in flight (workers are joined and the " +
+		"NIC is cycling); retry once the cycle completes")
+
 func (m *Manager) SetForwardingArmed(armed bool) (ProcessStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	if m.linkCycleInFlight() {
+		return m.lastStatus, errLinkCycleInFlight
 	}
 	if armed && !m.lastStatus.Capabilities.ForwardingSupported {
 		if len(m.lastStatus.Capabilities.UnsupportedReasons) == 0 {
@@ -136,6 +182,9 @@ func (m *Manager) SetQueueState(queueID uint32, registered, armed bool) (Process
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
 	}
+	if m.linkCycleInFlight() {
+		return m.lastStatus, errLinkCycleInFlight
+	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "set_queue_state",
@@ -160,6 +209,9 @@ func (m *Manager) SetBindingState(slot uint32, registered, armed bool) (ProcessS
 
 	if m.proc == nil {
 		return ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	if m.linkCycleInFlight() {
+		return m.lastStatus, errLinkCycleInFlight
 	}
 	var status ProcessStatus
 	req := ControlRequest{

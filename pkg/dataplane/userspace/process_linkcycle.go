@@ -141,13 +141,24 @@ func (m *Manager) DisableAndStopHelper() {
 // A lease that never ends would suppress the 1 Hz reconcile FOREVER, which is a
 // worse failure than the race it exists to close.
 //
-// 60s is derived from the worst-case Prepare→Notify gap, not picked round. The
+// 60s is derived from the Prepare→Notify gap at the deployed topology, not
+// picked round — but it is the N=2 worst case, not a general bound, and the
+// assumption is worth stating because it is the thing that would go stale. The
 // dominant term is externalCommandTimeout (pkg/daemon/exec_timeout.go, 15s) on
 // the per-member `ethtool -K rxvlan off` that step 2.6 runs after each member's
-// MAC program; a hung ethtool on a 2-RETH node is 30s, and NotifyLinkCycle then
-// pays its own 1s NIC settle. A member that cycles re-arms the lease itself, so
-// the exposure does not grow with the number of CYCLING members — only with the
-// non-cycling ones visited after the last cycle.
+// MAC program, and NotifyLinkCycle then pays its own 1s NIC settle. A member
+// that cycles re-arms the lease itself, so exposure is 15s x (1 + the number of
+// members visited AFTER the last cycling one) — on a 2-RETH node that is 30s,
+// half the TTL. It does NOT hold for arbitrary N: four or more wedging members
+// visited after the last cycle would exceed 60s. That traversal is a Go map
+// range, so which members fall after the last cycling one is nondeterministic
+// between runs.
+//
+// Overrunning is bounded and loud rather than silent: linkCycleInFlight logs a
+// Warn under the CAS when it clears an expired lease, and the state it degrades
+// to is master's — the pre-#6871 behaviour where the tick was never suppressed
+// at all. So an N large enough to blow the TTL loses the added protection for
+// the tail of that cycle; it does not introduce a new failure mode.
 const linkCycleLeaseTTL = 60 * time.Second
 
 // linkCycleLeaseNow is time.Now, indirected so a test can prove the TTL backstop
@@ -219,8 +230,12 @@ func (m *Manager) linkCycleInFlight() bool {
 // on any of those. The lease makes the tick skip its whole body while a cycle
 // owns the dataplane, and gates the ctrl re-enable at its source so the
 // non-tick callers of applyHelperStatusLocked (UpdateRGActive, driven by VRRP
-// events and the 500ms RG reconcile, which is NOT serialized on the daemon's
-// applySem) cannot re-enable it either.
+// events and by reconcileRGStateLoop's 2s pass, which is NOT serialized on the
+// daemon's applySem) cannot re-enable it either.
+//
+// The operator worker-affecting verbs are the sixth producer and are gated at
+// their own entry points rather than here — see errLinkCycleInFlight in
+// manager_status.go for why the gate cannot live in requestLocked.
 func (m *Manager) PrepareLinkCycle() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

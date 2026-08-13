@@ -423,8 +423,10 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// steers into are dead or about to be. The status tick is gated on the
 		// same lease and skips its whole body, but this is not only the tick's
 		// path: UpdateRGActive ends in applyHelperStatusLocked too, and it is
-		// driven by VRRP/cluster events and the 500ms RG reconcile pass, NEITHER
-		// of which is serialized on the daemon's applySem — so it can land in
+		// driven by VRRP/cluster events and by reconcileRGStateLoop's 2s pass
+		// (daemon_ha.go, which also wakes early on dropped-event
+		// notifications), NEITHER of which is serialized on the daemon's
+		// applySem — so it can land in
 		// the middle of a cycle and re-enable ctrl on its own. Gating at the
 		// write is what makes the lease cover the producer rather than one
 		// caller of it. NotifyLinkCycle releases the lease at the top of its

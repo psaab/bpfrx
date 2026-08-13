@@ -191,6 +191,11 @@ func requestsBetween(t *testing.T, reqs []string, open, close string) []string {
 // listing the status/apply_snapshot requests that landed between the
 // stop_workers and the rebind.
 func TestStatusTickSendsNothingWhileLinkCycleInFlight_6871(t *testing.T) {
+	// The hold below and the control window above it MUST be the same length:
+	// the control window is what proves the hold is dense enough for an empty
+	// result to mean anything.
+	const hold = 300 * time.Millisecond
+
 	fastStatusLoop(t, 20*time.Millisecond)
 	skipLinkCycleRebindSleep(t)
 	m, srv := newLeaseTestManager(t)
@@ -200,12 +205,31 @@ func TestStatusTickSendsNothingWhileLinkCycleInFlight_6871(t *testing.T) {
 	// talking to this helper.
 	waitForRequest(t, srv, "status", 2*time.Second)
 
+	// DENSITY, and it is what makes the empty window below load-bearing.
+	// waitForRequest proves the loop is ALIVE; it does not prove the hold is
+	// long enough to CONTAIN ticks. Inline statusLoopInterval back to its
+	// production 1s at process_status.go and this test still passed — the 300ms
+	// window then held zero ticks, so requestsBetween came back empty for the
+	// wrong reason and the guard was green with the seam severed. Measure an
+	// equal-length control window with no cycle in flight and require at least
+	// two polls in it, so a seam that stops taking effect fails HERE, loudly,
+	// instead of silently emptying the discriminator.
+	countBefore := countRequests(srv.requests(), "status")
+	time.Sleep(hold)
+	if ticks := countRequests(srv.requests(), "status") - countBefore; ticks < 2 {
+		t.Fatalf("only %d status polls in a %s control window with NO cycle in flight. The "+
+			"discriminator below holds a cycle open for the same %s, so an empty window "+
+			"there would prove nothing — the tick simply never fires inside it. Either "+
+			"fastStatusLoop no longer reaches the loop's interval or the hold is too "+
+			"short. Requests: %v", ticks, hold, hold, srv.requests())
+	}
+
 	if err := m.PrepareLinkCycle(); err != nil {
 		t.Fatalf("PrepareLinkCycle: %v", err)
 	}
-	// Hold the cycle open for many tick periods. Every one of them is an
-	// opportunity for the tick to undo the join.
-	time.Sleep(300 * time.Millisecond)
+	// Hold the cycle open for the same window the control run just proved dense.
+	// Every tick in it is an opportunity for the loop to undo the join.
+	time.Sleep(hold)
 	if err := m.NotifyLinkCycle(); err != nil {
 		t.Fatalf("NotifyLinkCycle: %v", err)
 	}
@@ -310,7 +334,7 @@ func TestLinkCycleLeaseExpiresAfterTTL_6871(t *testing.T) {
 // the lease, and the one a tick-only guard does NOT cover.
 //
 // UpdateRGActive ends in applyHelperStatusLocked, which writes the ctrl gate. It
-// is driven by VRRP/cluster events and by reconcileRGState's 500ms pass — NEITHER
+// is driven by VRRP/cluster events and by reconcileRGStateLoop's 2s pass — NEITHER
 // of which is serialized on the daemon's applySem — so it lands in the middle of a
 // link cycle on its own schedule. Its existing rgTransitionInFlight guard does not
 // help: on a demotion the flag is never set, and on an activation it is CLEARED
@@ -387,8 +411,8 @@ func TestUpdateRGActiveCannotReEnableCtrlDuringLinkCycle_6871(t *testing.T) {
 				t.Errorf("ctrl was re-enabled (Enabled=%d) while a RETH MAC link cycle held "+
 					"the dataplane. The workers are joined and the NIC is going down, so the "+
 					"shim is now redirecting transit into dead XSK sockets. UpdateRGActive is "+
-					"not on the status tick — it runs off VRRP events and the 500ms RG "+
-					"reconcile, neither serialized on applySem — so a tick-scoped guard does "+
+					"not on the status tick — it runs off VRRP events and reconcileRGStateLoop's "+
+					"2s pass, neither serialized on applySem — so a tick-scoped guard does "+
 					"not reach it (#6871)", got.Enabled)
 			}
 		})

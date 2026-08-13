@@ -279,13 +279,25 @@ func programRethMAC(ifName string, mac net.HardwareAddr, beforeCycle func() erro
 	// mlx5 zero-copy AF_XDP sockets break on link cycle — the driver
 	// doesn't reinitialize XSK WQEs after link UP. If the driver
 	// supports IFF_LIVE_ADDR_CHANGE, this succeeds without any cycle.
-	if err := ops.setHardwareAddr(link, mac); err == nil {
+	liveSetErr := ops.setHardwareAddr(link, mac)
+	if liveSetErr == nil {
 		slog.Info("RETH MAC set without link cycle", "iface", ifName)
 		return false, nil
 	}
 	// Fallback: bring link down, set MAC, bring back up.
-	slog.Info("RETH MAC requires link cycle (driver does not support live change)",
-		"iface", ifName)
+	//
+	// Say only what the failure proves. This branch is taken on EVERY error from
+	// setHardwareAddr, and a refused live set does NOT establish that the driver
+	// lacks IFF_LIVE_ADDR_CHANGE — dev_set_mac_address fails identically for a
+	// missing ndo_set_mac_address, a wrong sa_family, an absent or busy device,
+	// or a notifier rejection (see the beforeCycle contract above, which this
+	// line used to contradict: it says exactly this, forty lines up, while the
+	// log claimed the opposite). The remaining option is the same either way,
+	// but the journal must not assert a driver capability it did not observe —
+	// and it is the only place the actual reason survives, since the fallback
+	// swallows it. So carry the error instead of guessing at its cause.
+	slog.Info("RETH MAC live set refused; falling back to a link cycle",
+		"iface", ifName, "err", liveSetErr)
 	// #5103: the worker join belongs HERE — after the live-set attempt has
 	// proven a cycle is unavoidable, and before setDown, the first mutation.
 	// The barrier must precede the NIC queue/link teardown so no thread or DMA
