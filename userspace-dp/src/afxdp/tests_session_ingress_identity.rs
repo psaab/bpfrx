@@ -370,7 +370,11 @@ fn run_missing_neighbor_seed_flow() -> SessionTable {
 /// carries for its whole life.
 ///
 /// RED on reverting `build_missing_neighbor_session_metadata`'s stamp to 0
-/// while the two policy-admitted install sites stay stamped.
+/// while the two other FRAME-DRIVEN install sites stay stamped. ("Frame-driven",
+/// not "policy-admitted": the transit install is policy-admitted, but the
+/// LocalDelivery install also runs for a `JunosHostLocalPolicy::NoMatch`
+/// host-bound flow that the zone's host-inbound set admits with no junos-host
+/// policy matching at all — #6928 review.)
 #[test]
 fn poll_descriptor_missing_neighbor_seed_stamps_ingress_binding_4983() {
     let sessions = run_missing_neighbor_seed_flow();

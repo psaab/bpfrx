@@ -256,8 +256,10 @@ func TestValidateUserspaceShimSpecLivePinABI(t *testing.T) {
 			}
 			// #5363: a live-pin mismatch is a STALE-PIN case (the running
 			// daemon's pin predates this build's shim ABI), so the remediation
-			// must be the full-reload guidance, NOT `make generate` — the
-			// embedded shim is the intended target, not broken.
+			// must be the stale-pin guidance
+			// (`userspaceShimStalePinRemediation` — since #6928 the TARGETED
+			// single-pin unlink, not a "full reload"), NOT `make generate` —
+			// the embedded shim is the intended target, not broken.
 			for _, want := range []string{tt.wantMap, tt.wantField, "ABI-incompatible", userspaceShimStalePinRemediation} {
 				if !strings.Contains(err.Error(), want) {
 					t.Fatalf("err = %v, want substring %q", err, want)

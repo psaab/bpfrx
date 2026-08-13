@@ -369,8 +369,13 @@ Guard layers (`build-userspace-xdp.sh`):
    CPU-count-sized (per-CPU ARRAY/HASH maps keep their declared `MaxEntries`
    and replicate the VALUE per-CPU; XskMap keeps its declared size), so every
    other map keeps a strict `MaxEntries` check, and a genuine cpumap
-   Type/KeySize/ValueSize/Flags break still yields the full-reload
-   remediation.
+   Type/KeySize/ValueSize/Flags break still yields the stale-pin
+   remediation (`userspaceShimStalePinRemediation`). Since #6928 that
+   constant is the TARGETED single-pin unlink plus a mode-dependent note
+   on restart — NOT a "full reload". Nothing in the product reloads a
+   bpffs pin: a pin outlives the process that made it, so "full-reload"
+   was only ever a label for the constant, never an instruction an
+   operator could follow.
 
    **Residual (documented, not caught here):** a *same-size* Go/Rust
    value **field reorder** — identical `KeySize`/`ValueSize`/`Type`/

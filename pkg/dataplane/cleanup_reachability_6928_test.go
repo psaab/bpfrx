@@ -38,6 +38,19 @@ import (
 // text that describes it. It is not a proxy for the message's correctness: it
 // is the same kind of fact the message asserts.
 //
+// LIMIT, stated rather than left implied (#6928 review). This pins WHO calls
+// `Cleanup()` — the exact direct-caller set. It does NOT pin mode PLACEMENT or
+// REACHABILITY: that a call sits in the non-hitless arm specifically, or that
+// anything reaches it at all. A call-graph instrument cannot express
+// reachability, and this one does not try. The companion below narrows that
+// gap by asserting both shutdown arms still appear in
+// `pkg/daemon/daemon_run_shutdown.go`, but it is a SUBSTRING check on the file
+// text, so it proves the two call expressions are still WRITTEN there — not
+// which branch each sits in, and it would be satisfied by the text appearing
+// inside a comment. The mode-dependence of the remediation ultimately rests on
+// reading that file, not on this pair of tests. What the pair does buy is that
+// neither fact can change SILENTLY.
+//
 // Deliberately NOT asserted here: the message's wording. Recording that the
 // prose must contain some phrase is what produced two wrong-but-green rounds.
 // stalepin_remediation_5363_test.go keeps only the NEGATIVE — that the
@@ -134,10 +147,14 @@ func TestCleanupProductionCallersMatchRemediation_6928(t *testing.T) {
 
 	got := findCleanupCallers(t, root)
 
-	// --- PRECONDITION: the walk found something. A walk that silently matched
-	// nothing (wrong root, changed AST shape, over-eager SkipDir) would make
-	// every assertion below pass vacuously — the same failure mode this test
-	// exists to close one level up.
+	// --- DIAGNOSTIC, not a vacuity guard. Stating that precisely, because the
+	// first version of this comment claimed the latter and was wrong (#6928
+	// review): a walk that silently matched nothing (wrong root, changed AST
+	// shape, over-eager SkipDir) does NOT pass vacuously. The comparison below
+	// is against a NONEMPTY `want`, so an empty result already fails it, and
+	// the >= 2 check fails too. What this arm buys is the right DIAGNOSIS —
+	// "the walk is broken" instead of a zero-vs-two diff that reads as though
+	// the production call sites had been deleted.
 	if len(got) == 0 {
 		t.Fatalf("found ZERO production callers of Cleanup() under %s; the walk is "+
 			"broken, not the code — Cleanup() is called at least from "+
@@ -176,9 +193,16 @@ func TestCleanupProductionCallersMatchRemediation_6928(t *testing.T) {
 
 // TestNonHitlessShutdownReachesTeardown_6928 is the other half of the claim:
 // that the second caller is on the ordinary shutdown path rather than some
-// decommission-only helper. Without this, `Teardown` could be dead code and the
-// caller-set test above would still pass while the mode-dependent wording was
-// describing a path nothing takes.
+// decommission-only helper. Without it, `Teardown` could lose its shutdown call
+// site entirely and the caller-set test above would still pass while the
+// mode-dependent wording described a path nothing takes.
+//
+// It NARROWS that gap; it does not close it (#6928 review). A substring check
+// proves the two call expressions are still written in the file — not that
+// `d.dp.Teardown()` is the arm a NON-hitless shutdown takes, and not that
+// either line is reached rather than sitting in a comment. Read the file for
+// that. Do not describe this test as proving `Teardown` "cannot become dead
+// code".
 //
 // Kept as a source assertion rather than a behavioural one deliberately:
 // exercising it for real means calling Cleanup(), which does

@@ -969,12 +969,21 @@ plane reads them as `dataplane.SessionValue.IngressIfindex` /
 the helper's in-memory `SessionEntry`, and that is a different question from
 what `show security flow session` can see. That command enumerates the BPF
 conntrack map (`pkg/dataplane/maps_session.go`'s `Manager.IterateSessions`
-over `m.maps["sessions"]`), and only three install sites ever write it:
-`publish_bpf_conntrack_entry`'s callers in `afxdp/poll_descriptor` — the
-host-inbound `LocalMiss` install, the `MissingNeighborSeed` install, and the
+over `m.maps["sessions"]`), and inside the HELPER only three install sites ever
+write it: `publish_bpf_conntrack_entry`'s callers in `afxdp/poll_descriptor` —
+the host-inbound `LocalMiss` install, the `MissingNeighborSeed` install, and the
 reverse-companion repair on the session-hit path (that third row is
 `is_reverse != 0`, which every `show`/`clear` call site skips before filtering,
-so it never surfaces a flow on its own). The ordinary TRANSIT forward
+so it never surfaces a flow on its own).
+
+"Inside the helper" is load-bearing, because the map has a writer OUTSIDE it
+(#6928 review). Every HA peer-synced row reaches the same `sessions` /
+`sessions_v6` map from the GO side:
+`Manager.SetClusterSyncedSessionV4`/`V6` (`pkg/dataplane/userspace/manager_ha.go`)
+call `bpfShim.SetSessionV4`/`V6`, which is `maps_session.go`'s
+`m.maps["sessions"].Update`. That is the "for peer-synced sessions the Go side
+installs directly" case named below; the three-site count is a claim about the
+Rust helper's publication sites, never about the map's writers. The ordinary TRANSIT forward
 install does NOT publish there: it calls `publish_live_session_entry`, which
 writes the shim's steering table (`session_map_fd`, a 40-byte key with a
 one-byte action value — a different map from the 144-byte conntrack value),
@@ -1021,9 +1030,14 @@ carry to the fallback.
 The DISPLAY side's own fallback chain, for completeness: an absent or an
 unnameable identity falls back to the ingress zone's FIRST interface, and a
 zone that binds none falls back to the zone NAME. Never to a blank column, and
-that part matters — those populations (§ "`0` means no ingress identity
-carried" below) ARE still selectable by an interface filter through the zone
-approximation, so a blank would hide a row the filter can still reach.
+that part matters — WHERE THE INGRESS ZONE BINDS AT LEAST ONE INTERFACE, those
+populations (§ "`0` means no ingress identity carried" below) are still
+selectable by an interface filter through the zone approximation, so a blank
+would hide a row the filter can still reach. That qualifier is not decoration:
+where the zone binds NONE, the filter cannot reach the row at all, which is the
+first of the two consequences spelled out below (#6928 review). The
+never-blank rule is still right there — the column prints the zone name — but
+its justification is the bound-interface case, not every case.
 
 **Verified at this head, because the paragraph that used to stand here said the
 two fallbacks were "the same degradation" and they are not.** They are
@@ -1166,13 +1180,22 @@ sync-only trailing fields: `session_value` grows 136 -> 144 and
 and the u16 inside the tail pad it forces, so the pair costs 8 bytes, not 16).
 `sessions`/`sessions_v6` are PINNED maps, so — exactly as for the #5460 flags
 widen — a rolling deploy cannot cross this: the pre-flight
-(`validateUserspaceShimLivePins`) refuses while the old daemon still forwards,
-and the remediation is `xpfd cleanup` (or a reboot) with brief downtime, which
-unpins the maps so the next load recreates them at the new size. Note it is NOT
-a restart: a bpffs pin outlives the process that made it, so stopping and
-starting `xpfd` leaves the old-size pin in place and the pre-flight refuses
-again — `dataplane.Cleanup()` is reachable only from the `xpfd cleanup`
-subcommand. Sizes are
+(`validateUserspaceShimLivePins`) refuses while the old daemon still forwards.
+The TARGETED remediation is to unlink the ONE named pin
+(`docs/operations/userspace-shim-pin-recovery.md`); `xpfd cleanup` also clears
+it but is far broader (every pinned dataplane map plus the FRR managed routes).
+Either way there is brief downtime and the next load recreates the map at the
+new size.
+
+Whether a plain RESTART is enough is MODE-DEPENDENT, exactly as the paragraph
+above this one says — do not restate it here as "it is NOT a restart" (#6928).
+That categorical form was as wrong as the "a reload" it replaced: a HITLESS
+shutdown (`Manager.Close`) preserves the pins on purpose and hits the same
+refusal, but a NON-hitless HA shutdown calls `Manager.Teardown` →
+`dataplane.Cleanup()`, which unpins everything, so on that path a restart
+already suffices. `Cleanup()` therefore has TWO production callers, not one,
+and `pkg/dataplane/cleanup_reachability_6928_test.go` pins that call graph so
+the categorical wording cannot come back green. Sizes are
 asserted in lockstep at `afxdp/bpf_map_tests.rs` and
 `pkg/dataplane/bpf_session_value_test.go`.
 

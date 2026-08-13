@@ -17,10 +17,16 @@ import (
 // Before this the column was derived from the ingress zone's FIRST configured
 // interface (zoneIfaces[val.IngressZone]). Once the FILTER became exact, the
 // two disagreed on exactly the sessions the feature exists for: `show security
-// flow session interface lo.50` would select precisely the sessions that
-// arrived on lo.50 and then print `If: ge-0/0/8.0` for every one of them. A
-// filter and a column that answer the same question differently read as a bug
-// in the filter.
+// flow session interface lo.50` would select the sessions that arrived on
+// lo.50 and then print `If: ge-0/0/8.0` for every one of them. A filter and a
+// column that answer the same question differently read as a bug in the
+// filter.
+//
+// "the sessions that arrived on lo.50" is the INGRESS ARM only (#6928 review):
+// matchesV4/matchesV6 OR the ingress and egress arms, so an `interface` filter
+// also selects sessions that merely EGRESS there. That OR is deliberate and
+// out of scope here — this test is about the ingress column agreeing with the
+// ingress arm, and its fixtures do not exercise the egress one.
 //
 // Harness note: buildSessionEgressIfaces resolves names through the real
 // net.InterfaceByName, so the fixture's ingress interface has to be a netdev

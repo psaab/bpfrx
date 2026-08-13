@@ -78011,12 +78011,19 @@ Every RED above is an assertion failure, not a build break.
   the same kind of fact, not a proxy. `cleanup_reachability_6928_test.go`
   parses the repo (go/ast, non-test files) and pins the production caller set
   of `Cleanup()` to exactly {cmd/xpfd/main.go:main, loader.go:Teardown}, with a
-  precondition that the walk found ANY caller (a broken walk would pass
-  vacuously — the same failure mode one level up) and a second assertion that
-  >= 2 callers exist, so a collapse back to the single CLI caller reds and
-  forces the wording to be revisited. A companion pins that both shutdown arms
-  (`d.dp.Close()` / `d.dp.Teardown()`) still exist, so `Teardown` cannot become
-  dead code while the mode-dependent wording survives.
+  zero-caller arm that DIAGNOSES a broken walk (it is not a vacuity guard —
+  the exact comparison is against a nonempty want, so an empty result already
+  reds; corrected in r6 after this entry claimed otherwise) and a second
+  assertion that >= 2 callers exist, so a collapse back to the single CLI
+  caller reds and forces the wording to be revisited. A companion asserts both
+  shutdown arms (`d.dp.Close()` / `d.dp.Teardown()`) are still WRITTEN in
+  daemon_run_shutdown.go. Scope of that companion, corrected in r6: it is a
+  substring check on the file text, so it proves the call expressions are still
+  present — NOT which branch each sits in, and not that either is reached
+  rather than sitting in a comment. It narrows the dead-code gap; it does not
+  close it. The caller-set test likewise pins WHO calls Cleanup(), not mode
+  placement or reachability — the honest limit of a call-graph instrument, now
+  stated in the test doc rather than implied.
   The phrase-presence block is replaced by a NEGATIVE on the two claims the
   code disproves ("restarting xpfd does NOT release", "reachable only from").
   RED-first, both verified: severing `Teardown` -> `Cleanup` reds the
@@ -78189,3 +78196,125 @@ Every RED above is an assertion failure, not a build break.
   pkg/cli/session_filter.go, pkg/cli/session_filter_ingress_identity_4983_test.go,
   pkg/cli/cli_show_flow_ingress_if_4983_test.go, docs/session-sync-architecture.md,
   _Log.md
+
+- **Timestamp**: 2026-08-13
+  **Action**: #4983 review round 6 (Codex MERGE-NEEDS-MAJOR at c0b7b4f2e) —
+  claim corrections only; ZERO behavioural change (every changed line in every
+  file is a comment, verified mechanically: `git diff -U0` minus comment-prefixed
+  lines is 0 for all five production files and all five test files).
+
+  **F1, the self-contradiction this PR introduced.** `pkg/dataplane/types.go`
+  narrowed the exactness claim on locally-owned rows at `:155` (exact ONLY for a
+  row whose {ifindex, vlan} names a currently-configured unit; three local shapes
+  besides peer rows are approximate) and then REASSERTED the superseded form 27
+  lines later at `:182`: "it is exact where this node is the authority". Both
+  twins. The counterexample is the recycled-ifindex bullet the same block already
+  carries: a row installed for interface A as {17, 0}, A removed, the kernel
+  reuses 17 for a configured B, the per-query `ifaceNamesByKey` maps the old row
+  onto B, and filter AND `If:` column report B — a confident WRONG name on a row
+  this node owns outright. Rewritten to say local authority buys exactness only
+  for the nameable subset, and to keep the two-sided bound (the clear path also
+  leaves this node, #6975). Same failure shape as the `session/README.md`
+  contradiction this PR already resolved once.
+
+  **F2 — mis-triaged, corrected in the doc rather than accepted.** Codex reported
+  a THIRD undocumented shape: a valid non-VLAN unit (`ge-0/0/0 unit 3`, no
+  `vlan-id`) binding child netdev `ge-0-0-0.3` and installing `{child-ifindex, 0}`
+  against the CLI's `{parent-ifindex, 3}`. Verified firsthand and the MECHANISM is
+  wrong: the row carries the PARENT ifindex, not the child. `meta.ingress_ifindex`
+  is the physical AF_XDP bind — `forwarding_build/interfaces.rs:292` keys
+  `ingress_logical_ifindex` as `(bind_ifindex, vlan_id) -> iface.ifindex` with
+  `bind_ifindex = parent_ifindex` for every unit row, so the logical child index
+  is what the map resolves TO, never what the row carries (`poll_descriptor`
+  itself calls it "the raw physical `meta.ingress_ifindex`"). Only the VLAN half
+  diverges — and that shape is ALREADY the third documented bullet ("a unit whose
+  number is populated and whose traffic is untagged keys 0 on the wire and
+  `number` in the map, and misses"). The doc listed three shapes, not two. Rather
+  than leave a bullet a reader can misread the same way twice, the bullet now
+  names the concrete config (`ge-0/0/0 unit 3`) and states explicitly that BOTH
+  sides key the physical parent, so nobody goes hunting for a `ge-0-0-0.3` ifindex
+  that is not in the row.
+
+  **F3 — a filter description that was false.** `cli_show_flow.go` and its test
+  preamble said an `interface` filter "would select exactly / precisely the
+  sessions that arrived" there. `matchesV4`/`matchesV6` OR the ingress and egress
+  arms (`!ifaceMatchesAny(inIfs) && !ifaceMatchesAny(outIfs)`,
+  session_filter.go:269), so a session that arrived on A and EGRESSES B matches a
+  filter for B. The OR is intentional — an operator naming an interface wants
+  flows crossing it in either direction — so the sentence was fixed, not the
+  behaviour, and both sites now name the OR and note it is also why the column can
+  legitimately print a name other than the one filtered on.
+
+  **F4 — superseded accounts still restated, swept across Go, Rust and C.** The
+  count "seven" was not trusted; the sweep found eight, and the sharpest was the
+  cross-language mirror again:
+  - `session/README.md` ABI note still said "Note it is NOT a restart ...
+    `Cleanup()` is reachable only from the `xpfd cleanup` subcommand" — 35 lines
+    AFTER the corrected mode-dependent account in the SAME file, and exactly the
+    categorical claim r5 was reverted for. Replaced with the targeted single-pin
+    remediation plus the mode-dependence, and an explicit "do not restate it here"
+    with the pointer to `cleanup_reachability_6928_test.go`.
+  - `bpf/headers/xpf_conntrack.h:91` still equated VID 0 with untagged. The v6
+    twin (`:172`) and the Go/Rust mirrors were corrected in earlier rounds; this
+    one was missed. Now carries the priority-tagged case and cites the in-tree
+    counterexample (`frame/prop_tests/inspect.rs`, real tag, PCP 5, VID 0).
+  - `poll_descriptor/mod.rs` and `tests_session_ingress_identity.rs` called the
+    other two producers "policy-admitted". A host-bound SYN can take
+    `JunosHostLocalPolicy::NoMatch` and be admitted solely by the zone's
+    host-inbound set. Both now say FRAME-DRIVEN and name the exception.
+  - `session/README.md:972` said only three install sites ever write the conntrack
+    map. A peer-synced row reaches it Go-side:
+    `SetClusterSyncedSessionV4`/`V6` -> `bpfShim.SetSessionV4`/`V6` ->
+    `m.maps["sessions"].Update`. The claim is now scoped to the HELPER's three
+    publication sites, with the Go writer named.
+  - `session/README.md:1025` said the zero/unnameable populations remain
+    selectable, while `:1043` correctly said a zero-interface zone yields an empty
+    slice and no match. Scoped to "where the ingress zone binds at least one
+    interface", pointing at the consequence below. The same unqualified claim in
+    `pkg/cli/session_filter.go`'s `resolveIngressIfaces` doc got the same clause.
+  - `pkg/dataplane/README.md:372`, `stalepin_remediation_5363_test.go:15`/`:30`,
+    and `userspace_shim_loader_test.go:259` still labelled the constant
+    "full-reload"/"full-dataplane-reload" remediation. Since #6928 the constant is
+    the TARGETED single-pin unlink; nothing in the product reloads a bpffs pin, so
+    the label named an action no operator can perform. All four now say stale-pin
+    and name the constant.
+
+  **F5 — two of my own artefacts, both corrected.**
+  - `cleanup_reachability_6928_test.go:137` claimed the zero-caller arm stopped
+    the rest passing "vacuously". PROVEN FALSE firsthand: with that arm disabled
+    (`if false &&`) and `got` forced to nil, the test still fails at the exact
+    comparison — `production callers of Cleanup() changed. got: <empty> want:
+    cmd/xpfd/main.go:main, pkg/dataplane/loader.go:Teardown`. The arm is a
+    DIAGNOSTIC (it names a broken walk instead of showing a zero-vs-two diff that
+    reads as deleted call sites), so the arm was kept and the claim rewritten.
+    Probe reverted via Edit, file restored byte-identical, suite re-run green.
+  - Two `_Log.md` claims from the r5 entry overstated the companion: the same
+    vacuity claim, and "so `Teardown` cannot become dead code". The companion is a
+    substring check on `daemon_run_shutdown.go`, so it proves the two call
+    expressions are still WRITTEN there — not which branch each sits in, and it
+    would be satisfied by the text appearing in a comment. Corrected in place.
+
+  **Honest limit now stated, not implied.** The caller-set check pins WHO calls
+  `Cleanup()` — the exact direct-caller set — and NOT mode placement or
+  reachability. A call-graph instrument cannot express reachability. That limit,
+  and the substring companion's narrower one, are now in the test doc rather than
+  left for the next reviewer to rediscover; the companion's own doc no longer
+  claims to close the dead-code gap, only to narrow it.
+
+  Validation: `gofmt -l` clean on every file touched (the eight files gofmt still
+  lists are unformatted at HEAD too, none of them touched here); `go build ./...`
+  exit 0; `go vet ./pkg/dataplane/... ./pkg/cli/...` exit 0; `go test -count=1
+  ./pkg/dataplane/... ./pkg/cli/...` all ok (dataplane 2.9s, userspace 17.3s, cli
+  4.1s); `cargo check --all-targets` exit 0; the five `tests_session_ingress_identity`
+  binding tests 5 passed / 0 failed. No test assertion was changed anywhere, so no
+  fail-on-revert is owed for this round — the only RED run was the F5-a probe
+  above, which exists to prove the claim I wrote is true.
+  Advances #4983.
+- **File(s)**: pkg/dataplane/types.go, pkg/dataplane/README.md,
+  pkg/dataplane/cleanup_reachability_6928_test.go,
+  pkg/dataplane/stalepin_remediation_5363_test.go,
+  pkg/dataplane/userspace_shim_loader_test.go, pkg/cli/cli_show_flow.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go, pkg/cli/session_filter.go,
+  bpf/headers/xpf_conntrack.h, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/README.md, _Log.md

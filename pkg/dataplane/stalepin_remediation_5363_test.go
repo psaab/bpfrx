@@ -12,8 +12,14 @@ import (
 // embedded shim's map ABI differs from the RUNNING daemon's LIVE pinned map,
 // the live pin is ALWAYS the stale side — it is the OLD daemon's map, while the
 // embedded shim is the intended (and un-broken) deploy target. So the
-// remediation must be the full-dataplane-reload guidance, NEVER `make generate`
-// (which would tell the operator to rebuild a shim that is not broken).
+// remediation must be the stale-pin guidance
+// (`userspaceShimStalePinRemediation`), NEVER `make generate` (which would tell
+// the operator to rebuild a shim that is not broken).
+//
+// "full-dataplane-reload" was this comment's original NAME for that constant
+// and is retired (#6928 review): the constant now instructs a TARGETED
+// single-pin unlink, and no reload releases a bpffs pin at all — so the old
+// label described an action nothing performs.
 //
 // This is direction-INDEPENDENT: it holds both when the embedded shape is the
 // larger side AND when it is the smaller side. Both cases exercise the SAME
@@ -27,7 +33,7 @@ import (
 // by livePinRefABI and is no longer rejected (see TestCPUMapLivePinPossibleCPU*).
 // The cases below therefore use a genuine cpumap ABI break (a ValueSize change)
 // and a genuine non-cpumap MaxEntries drift, both of which are still stale-pin
-// mismatches that must carry the full-reload remediation.
+// mismatches that must carry the stale-pin remediation.
 //
 // RED-on-revert: with the pre-#5363 code the live-pin error appended
 // userspaceShimGenerateRemediation ("Re-run `make generate-userspace-xdp`."),

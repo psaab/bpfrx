@@ -87,8 +87,14 @@ struct session_value {
 	 * 0 as "fall back to the zone approximation", never as "matches
 	 * nothing" or "matches everything". */
 	__u32 ingress_ifindex;
-	/* #4983: the 802.1Q VLAN id the session's first packet arrived with, 0
-	 * for untagged. Paired with ingress_ifindex it names the LOGICAL ingress
+	/* #4983: the 802.1Q VLAN id the session's first packet arrived with. 0 is
+	 * BOTH an untagged frame AND an 802.1p priority-tagged one (a real 802.1Q
+	 * tag with VID 0 and PCP/DEI set); this bare VID does not distinguish
+	 * them, so do NOT read 0 as "arrived untagged" (#6928 -- the counter-
+	 * example is in-tree at userspace-dp/src/afxdp/frame/prop_tests/inspect.rs,
+	 * a real tag with PCP 5 and VID 0). The TX side DOES distinguish, via
+	 * TxVlanTag on tag PRESENCE (#2149).
+	 * Paired with ingress_ifindex it names the LOGICAL ingress
 	 * unit -- the same {parent ifindex, vlan} identity the egress side is
 	 * already resolved by (fib_ifindex/fib_vlan_id), so two units of one
 	 * trunk NIC are distinguishable.

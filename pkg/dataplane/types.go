@@ -168,7 +168,15 @@ type SessionValue struct {
 	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
 	//     THE WIRE. Those agree when the unit number equals the vlan id, or
 	//     when both are 0; a unit whose number is populated and whose traffic
-	//     is untagged keys 0 on the wire and `number` in the map, and misses.
+	//     is untagged — a plain `ge-0/0/0 unit 3` with no `vlan-id`, the
+	//     concrete case — keys 0 on the wire and `number` in the map, and
+	//     misses. Only the VLAN half diverges there: BOTH sides name the
+	//     PHYSICAL parent netdev. The helper binds AF_XDP to the parent and
+	//     stamps that bind (`UserspaceDpMeta::ingress_ifindex`); the LOGICAL
+	//     child ifindex is what `ingress_logical_ifindex` maps the
+	//     {parent, vid} pair TO, never what the row carries. So a reader
+	//     chasing this miss should not go looking for a `ge-0-0-0.3` child
+	//     ifindex in the row — it is not there (#6928 review).
 	// (Note the collision the map DOES avoid: units do not collapse onto
 	// {ifindex, 0}, because that same number-fallback separates them; a
 	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
@@ -180,8 +188,15 @@ type SessionValue struct {
 	// DELETES peer flows actually received on `reth0.80`.
 	//
 	// Do not read the local exactness this field buys as an end-to-end
-	// guarantee: it is exact where this node is the authority, and the clear
-	// path leaves this node. #6975 carries the trace and the fix shape.
+	// guarantee. It is bounded on BOTH sides, and the local bound is the one
+	// easy to lose: "this node is the authority" does NOT upgrade to "exact"
+	// — the three shapes enumerated above are all rows this node owns
+	// outright, and the recycled-ifindex one is not even a miss. An interface
+	// removed and its kernel index reused by a configured sibling makes the
+	// filter AND the `If:` column report that SIBLING, confidently, for a
+	// locally-owned row. Local authority buys exactness only for the nameable
+	// subset. On the other side the clear path leaves this node entirely.
+	// #6975 carries the trace and the fix shape.
 	//
 	// REST is a separate case and is NOT merely approximate: pkg/api
 	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
@@ -441,7 +456,15 @@ type SessionValueV6 struct {
 	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
 	//     THE WIRE. Those agree when the unit number equals the vlan id, or
 	//     when both are 0; a unit whose number is populated and whose traffic
-	//     is untagged keys 0 on the wire and `number` in the map, and misses.
+	//     is untagged — a plain `ge-0/0/0 unit 3` with no `vlan-id`, the
+	//     concrete case — keys 0 on the wire and `number` in the map, and
+	//     misses. Only the VLAN half diverges there: BOTH sides name the
+	//     PHYSICAL parent netdev. The helper binds AF_XDP to the parent and
+	//     stamps that bind (`UserspaceDpMeta::ingress_ifindex`); the LOGICAL
+	//     child ifindex is what `ingress_logical_ifindex` maps the
+	//     {parent, vid} pair TO, never what the row carries. So a reader
+	//     chasing this miss should not go looking for a `ge-0-0-0.3` child
+	//     ifindex in the row — it is not there (#6928 review).
 	// (Note the collision the map DOES avoid: units do not collapse onto
 	// {ifindex, 0}, because that same number-fallback separates them; a
 	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
@@ -453,8 +476,15 @@ type SessionValueV6 struct {
 	// DELETES peer flows actually received on `reth0.80`.
 	//
 	// Do not read the local exactness this field buys as an end-to-end
-	// guarantee: it is exact where this node is the authority, and the clear
-	// path leaves this node. #6975 carries the trace and the fix shape.
+	// guarantee. It is bounded on BOTH sides, and the local bound is the one
+	// easy to lose: "this node is the authority" does NOT upgrade to "exact"
+	// — the three shapes enumerated above are all rows this node owns
+	// outright, and the recycled-ifindex one is not even a miss. An interface
+	// removed and its kernel index reused by a configured sibling makes the
+	// filter AND the `If:` column report that SIBLING, confidently, for a
+	// locally-owned row. Local authority buys exactness only for the nameable
+	// subset. On the other side the clear path leaves this node entirely.
+	// #6975 carries the trace and the fix shape.
 	//
 	// REST is a separate case and is NOT merely approximate: pkg/api
 	// sessions.go REJECTS any filtered clear with HTTP 400 rather than

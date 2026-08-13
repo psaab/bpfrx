@@ -436,7 +436,10 @@ func (f *sessionFilter) ifaceMatchesAny(ifNames []string) bool {
 // the #4792 approximation — and that fallback is deliberate, not an
 // accident of a zero value. Three populations legitimately carry no
 // ingress identity and MUST stay reachable by an interface-filtered show
-// and clear:
+// and clear — as far as the zone approximation can carry them, which is
+// nowhere if the ingress zone binds NO interface: the fallback is then an
+// empty slice, ifaceMatchesAny is false, and no interface filter selects
+// the row at all (#6928 review; session/README.md states the same limit):
 //   - the reverse companion, whose own ingress has not been OBSERVED yet.
 //     The forward flow's egress IS resolved at install; it is the wrong
 //     datum, predicting where the reply will arrive rather than recording

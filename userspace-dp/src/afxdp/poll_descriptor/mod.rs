@@ -4818,8 +4818,14 @@ pub(super) fn poll_binding_process_descriptor(
                                         from_zone_id,
                                         to_zone_id,
                                         // #4983: stamp the seed's TRUE ingress identity from the
-                                        // frame that created it, exactly as the two policy-admitted
-                                        // install sites above do. This seed is published to the BPF
+                                        // frame that created it, exactly as the two other
+                                        // FRAME-DRIVEN install sites above do. ("Frame-driven",
+                                        // not "policy-admitted": the transit install is
+                                        // policy-admitted, but the LocalDelivery install also runs
+                                        // for a `JunosHostLocalPolicy::NoMatch` host-bound flow
+                                        // that the zone's host-inbound set admits with no
+                                        // junos-host policy matching at all -- #6928 review.)
+                                        // This seed is published to the BPF
                                         // conntrack map below and is never re-installed once the
                                         // neighbor resolves, so it is the session's only chance to
                                         // record where the flow actually arrived.
