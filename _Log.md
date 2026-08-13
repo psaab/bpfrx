@@ -546,115 +546,188 @@
   `rustfmt --check` alone and carries the same 9 pre-existing deviations as its
   parent commit, none added.
 
-## 2026-08-13 — #6304 fold r4: the layout objection was true of a FIELD, not of an instrument; and a sweep found the pattern one line to the left
+## 2026-08-13 — #6304 fold r4: the layout objection was true of a FIELD and false of the INSTRUMENT, measured both ways; and a sweep of every `record_*` call found sites that bind nothing
 
 - **Timestamp**: 2026-08-13 (fix/6304-mirror-callsite-bound-sv, PR #6882)
-- **Action**: folded a Codex MERGE-NEEDS-MAJOR whose blocking finding
-  contradicted a judgement r3 made and the parent ratified. Codex was RIGHT, and
-  the way it was right matters: r3's rejection of the instrument was sound about
-  the specific form it evaluated and unsound as a generalisation.
+- **Action**: folded a Codex MERGE-NEEDS-MAJOR whose blocking finding contradicted
+  a judgement r3 made and the parent ratified — that no layout-neutral instrument
+  for the #6114 ordering was available. Codex was right, and the shape of its being
+  right is the point: r3's rejection was sound about the specific form it evaluated
+  and unsound as a generalisation. Settled here with `size_of` / `align_of` /
+  `offset_of` numbers rather than with a better argument.
 - **File(s)**: `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
-  `userspace-dp/src/afxdp/binding_state/mod.rs`, `userspace-dp/src/policy.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/policy.rs`,
   `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
-  `docs/userspace-dataplane-gaps.md`, `_Log.md`. `flow_cache_hit.rs` and
-  `mirror/resolver.rs` are byte-identical to the pre-fold head — restored from
-  saved copies and re-diffed after every mutation.
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`.
+  `poll_descriptor/flow_cache_hit.rs`, `mirror/resolver.rs` and `mirror/mod.rs` are
+  byte-identical to the pre-fold head (sha256-compared, not eyeballed).
 
-  F1. **THE LAYOUT OBJECTION WAS ABOUT A FIELD, AND I APPLIED IT TO THE
+  PROVENANCE, because it bears on how much of this was inherited. The first lane on
+  this round died on an expired login with everything uncommitted, in a worktree the
+  hand-off brief did not name. The work was recovered by patch from
+  `/var/tmp/f6882r2` — MINUS a leftover mutation that lane had left applied to
+  production code (`record_zone_traffic`'s ingress/egress zone arguments swapped in
+  `flow_cache_hit.rs`), which its own draft log described as byte-identical to the
+  head. It was not. A dirty worktree mid-matrix is the harness, not authorship.
+  Every measurement below was then re-run in this lane against a fresh worktree
+  under a fail-closed harness — and that re-run mattered: it CONTRADICTED two rows
+  of the inherited table (F3).
+
+  Harness: `set -euo pipefail`, an `APPLIED <id>` marker plus an independent
+  `git diff --quiet` check before any result is believed, and a
+  `git diff | sha256sum` compared against the pristine value before and after every
+  cell (start and end both `e3b0c442…`, the empty-diff hash). It also had a defect
+  worth recording: `failed=$(grep … FAILED)` under `set -e` + `pipefail` KILLED the
+  matrix on the first GREEN cell, because grep exits 1 when it matches nothing. The
+  failure mode was loud (the matrix stopped) rather than silent (a GREEN recorded as
+  a result), but a `|| true` now guards it, and the guard is load-bearing: the first
+  GREEN cell was a real finding.
+
+  Two documented pre-existing load failures are excluded from the matrix runs and
+  from the counts below — `afxdp::wg::engine::engine_internal_tests::*` (three cells
+  that WEDGE indefinitely under load; four other agents' test binaries were wedged
+  on the same box, up to 2h57m) and the CoS-lease seqlock cell
+  `v8_epoch_seqlock_snapshot_never_tears_tag_grace`. Both are #6657, both were
+  previously attributed against a detached `origin/master` worktree where they
+  reproduce, and neither is reachable from any mutated line. Filtered baseline:
+  4263 passed / 0 failed / 2 ignored / 25 filtered out, plus 60 + 8 + 22 + 31 + 1 + 2
+  green in the integration binaries.
+
+  F1. **THE LAYOUT OBJECTION WAS ABOUT A FIELD, AND IT WAS APPLIED TO THE
      INSTRUMENT.** r3 declined a `#[cfg(test)]` acquisition counter because
      `BindingLiveState` is the struct whose cross-core cacheline behaviour #6114
-     exists to fix, so a test-only FIELD puts a different layout under test than
-     the one that ships. That reasoning is correct — and it is a reason to reject
-     the field, not the measurement. A `#[cfg(test)]` THREAD-LOCAL lives in its
-     own storage: `BindingLiveState` is byte-identical with and without it, and
-     `#[cfg(test)]` is false for every non-test build so nothing reaches the
-     shipped hot path. The pattern was already in the tree — #6294's
-     `OUTER_ROUTE_RESOLVE_COUNT` in `afxdp/frame/wg.rs`, thread-local for exactly
-     the parallel-`cargo test` determinism reason that rules out a global atomic.
-     Candidates checked before implementing, so the enumeration is a record and
-     not a search order: an existing PRODUCTION counter cannot work, because the
-     only shared state a declined packet touches under reserve-first is
-     `pending_tx_admitted` (incremented, then returned by
-     `PendingTxAdmission::drop` — net zero) and the refusal arm passes
-     `record_overflow = false`, so a refused reservation bumps nothing either;
-     observing at the CALL SITE cannot work, because `MirrorTargetMap` is a
-     concrete struct with no injection point and a lookup mutates nothing; a
-     racing-producer test observes the real window but only probabilistically;
-     a global `static AtomicU64` is layout-neutral but not deterministic under
-     the default parallel run.
+     exists to fix, so a test-only FIELD puts a different layout under test than the
+     one that ships. That is a reason to reject the field, not the measurement. A
+     `#[cfg(test)]` THREAD-LOCAL lives in its own storage, and the tree already
+     carried the pattern — #6294's `OUTER_ROUTE_RESOLVE_COUNT` in
+     `afxdp/frame/wg.rs`, thread-local rather than a process-global atomic for
+     exactly the parallel-`cargo test` determinism reason.
+
+     Neutrality MEASURED. `BindingLiveState`, rustc 1.96.0, x86_64:
+
+     | instrument | size | align | off(`pending_tx_admitted`) | off(`delta_loss_pending`) |
+     |---|---|---|---|---|
+     | none — production build | 2304 | 64 | 2152 | 2280 |
+     | `cfg(test)` THREAD-LOCAL (taken) | 2304 | 64 | 2152 | 2280 |
+     | `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | not measured |
+     | `cfg(test)` FIELD declared last | 2304 | 64 | 2152 | **2288** |
+
+     Four `const _: [(); N]` asserts beside the struct pin all four numbers and are
+     deliberately NOT `cfg`-gated, so the same literals are evaluated in the
+     production build AND the test build — an instrument that perturbed the struct
+     could satisfy at most one. That is the cross-configuration comparison a
+     `#[test]` cannot make alone;
+     `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
+     re-asserts the same numbers at runtime and carries the reasoning.
+
+     The counterfactuals also correct the objection rather than confirming it: a
+     `cfg(test)` FIELD does not change the struct's SIZE — it lands in existing tail
+     slack. It moves OFFSETS. A size-only guard would have called both field shapes
+     harmless, and `repr(Rust)` reorders, so even a field declared LAST moved a
+     neighbour declared before it.
 
      `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`
      asserts a declined packet makes ZERO calls into
-     `try_acquire_pending_tx_admission`, with a SELECTED packet at one and a
-     SELECTED packet against a FULL target also at one — the third cell is what
-     makes the zero mean "never asked" rather than "asked and was refused".
+     `try_acquire_pending_tx_admission`, with a SELECTED packet at one and a SELECTED
+     packet against a FULL target also at one — the third cell is what makes the zero
+     mean "never asked" rather than "asked and was refused". The bump sits BEFORE the
+     cap load for the same reason. Measured, one mutation at a time, whole crate:
 
      | mutation | result |
      |---|---|
-     | reserve-first INSIDE `sample_then_admit_mirror_clone` (reserve, drop on decline) | new cell RED (`left: 1, right: 0`), other 4284 GREEN — **including the delegation canary** |
-     | reserve-first OPEN-CODED at the call site | new cell RED **and** delegation canary RED, other 4283 GREEN |
-     | as above but through `use ...::admit_mirror_clone_to_live as reserve_clone_slot;` with a comment retaining the required spelling | new cell RED, delegation canary GREEN, other 4284 GREEN |
+     | reserve-first INSIDE `sample_then_admit_mirror_clone` (reserve, drop on decline) | 4262 passed / 1 failed — ONLY the attempt-count cell; the delegation canary stays GREEN |
+     | reserve-first OPEN-CODED at the call site, plain spelling | 4261 / 2 — attempt-count AND delegation canary |
+     | reserve-first through `use …::admit_mirror_clone_to_live as reserve_clone_slot;`, with a comment retaining the spelling the canary requires | 4262 / 1 — attempt-count only, canary GREEN |
 
-     The first row is the finding: that mutation was caught by NOTHING before
-     this round. The third verifies a claim r3 asserted about the canary's rename
-     escape without testing it.
+     The first row is the finding: that mutation was caught by NOTHING before this
+     round. The third confirms the rename escape r3 asserted about its own canary
+     without testing it.
 
-  F2. **CODEX'S NAMED LINE WAS ALREADY BOUND — REFUTED, THREE WAYS.**
-     `record_mirror_clone_result` at `flow_cache_hit.rs:478` is not unbound. The
-     leg volunteered that test files were outside its read scope and asked for
-     empirical confirmation; the empirical answer is that deleting the call reds
-     the suite, and so do both properties the fold was asked to add: forcing the
-     byte argument to 0 reds (`mirrored_bytes` is asserted at the exact frame
-     length), and forcing the result to `Enqueued` reds (the failure counters are
-     asserted on the full-queue path). Recorded as an explicit NON-defect so the
-     next round does not re-derive it.
+  F2. **CODEX'S NAMED LINE WAS ALREADY BOUND — REFUTED, RECORDED AS A NON-DEFECT.**
+     `record_mirror_clone_result` at `flow_cache_hit.rs:478` is not unbound. The leg
+     volunteered that test files were outside its read scope and asked for empirical
+     confirmation; severing the call reds FOUR cells, forcing its byte argument to 0
+     reds `…_selected_admitted_clone_reaches_target_6304`, and forcing its result to
+     `Enqueued` reds two more. Written down so the next round does not re-derive it.
 
-  F3. **THE SWEEP FOUND THE PATTERN, ONE LINE AND TWO LINES TO THE LEFT.** The
-     hypothesis behind the sweep was right even though the reported instance was
-     not. Every `record_*` call in the file, deleted one at a time against the
-     FULL crate:
+  F3. **THE SWEEP — AND IT CONTRADICTED THE INHERITED TABLE.** Every `record_*` call
+     in `stage_flow_cache_hit`, one single-line production edit at a time, whole
+     crate, at the pre-fix head:
 
-     | site | verdict |
+     | # | site | edit | result |
+     |---|---|---|---|
+     | S1 | `filter::record_filter_counter` TX/output side (#2573) | walk reduced to `.for_each(\|_counter\| {})` | **GREEN 4263/0 — UNBOUND** |
+     | S2 | `filter::record_filter_counter` INPUT side (#3777) | same | RED — `afxdp::tests_txn_flow_cache::txn_flow_cache_hit_replays_input_filter_then_count_3777` |
+     | S3 | `policy::record_policy_hit_counter` (#3073) | call replaced by `let _ = counter;` | RED — `…_recounts_the_established_policy_hit_6304` (added this round; GREEN before it) |
+     | S4 | `zone_counters::record_zone_traffic` (#3651) | call deleted | RED — `…_accounts_per_zone_traffic_6304` (added this round; GREEN before it) |
+     | S5 | `record_mirror_clone_result` (#6304) | call replaced by `let _ = (…);` | RED — 4 cells |
+     | S6 | `tx_counters.record_in_place_l2_rewrite` | call deleted | RED — `…_accounts_vlan_pop_l2_rewrite_6304` (added in r3) |
+
+     The inherited table reported S1 and S2 as bound. S2 is; **S1 is not**, and the
+     reason is sharper than "no fixture populates the list", though that is also true
+     of this module: the ONE crate-wide test that puts a real counter on the TX-side
+     cached `tx_selection` is
+     `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779`, and both of its
+     assertions on that counter are NEGATIVE — the seed packet charges it on the COLD
+     path (`== 1`), and the TTL=1 cache-hit packet must NOT charge it (`== 1` again).
+     Deleting the hit-path replay satisfies both. A test that looks like coverage for
+     #2573's replay is coverage for #3779's suppression, and only that.
+
+     `live_flow_cache_callsite_replays_every_filter_count_term_6304` closes it. TWO
+     tx-side counters, because #2573's guarantee is that ALL matched count terms
+     replay and not merely the last, so a single-counter assertion is satisfied by a
+     walk that stops after one. The input side is asserted at this call site too
+     rather than delegated to the txn-level test: #3777 exists precisely because the
+     TX side had been fixed and the input side had not, so the two demonstrably
+     regress independently.
+
+     Three shapes of the same class now, all invisible to a coverage report and all
+     visible to a one-line deletion: UNREACHABLE behind a false guard (the policy
+     counter), REACHED but landing in a no-op arm (the zone counter, and r3's
+     `record_in_place_l2_rewrite`), and REACHED but iterating an EMPTY collection so
+     the closure holding the call never runs (both filter replays).
+
+     Argument cells, same method, same head — the counters bind their ARGUMENTS and
+     not merely their occurrence:
+
+     | mutation | result |
      |---|---|
-     | `filter::record_filter_counter` TX-side (#2573) | RED — bound |
-     | `filter::record_filter_counter` INPUT-side (#3777) | RED — bound |
-     | `policy::record_policy_hit_counter` (#3073) | **GREEN — unbound** |
-     | `zone_counters::record_zone_traffic` (#3651) | **GREEN — unbound** |
-     | `record_mirror_clone_result` (#6304) | RED — bound (F2) |
-     | `tx_counters.record_in_place_l2_rewrite` | RED — bound by r3 |
+     | `record_zone_traffic` ingress/egress zone arguments SWAPPED | RED — `…_accounts_per_zone_traffic_6304` |
+     | `record_zone_traffic` byte argument -> `0u64` | RED — same cell |
+     | `record_policy_hit_counter` byte argument -> `0u64` | RED — `…_recounts_the_established_policy_hit_6304` |
+     | `record_mirror_clone_result` byte argument -> `0usize` | RED — `…_selected_admitted_clone_reaches_target_6304` |
+     | `record_mirror_clone_result` result forced to `Enqueued` | RED — 2 cells |
 
-     Both survivors are the mechanism r3 named, in its two shapes. The policy
-     counter is UNREACHABLE: every fixture leaves `policy_counter: None` with
-     `policy_counter_idx: 0` and `ForwardingState::default()` has no rule at
-     index 0, so `resolve_session_hit_counter` returns `None` and the guarded
-     block never executes. The zone counter RUNS on every fixture and does
-     nothing: the default slot map is empty and `EGRESS_IFINDEX` is absent from
-     `forwarding.egress`, so both slot lookups are 0 and `record_zone_traffic`
-     returns at its first branch — the same "only reachable arm is a no-op" shape
-     as r3's `record_in_place_l2_rewrite`. Bound by
-     `live_flow_cache_callsite_recounts_the_established_policy_hit_6304` (a bound
-     handle on the entry; asserts packets AND bytes, the byte cell separating
-     `meta.pkt_len` from a stripped length) and
-     `live_flow_cache_callsite_accounts_per_zone_traffic_6304` (a
-     `with_zone_accounting` fixture builder, kept a builder so the ten existing
-     cells keep their calibration; asserts both directions, since the two zone
-     ids resolve independently). `PolicyRuleCounter` gained a `#[cfg(test)]`
-     `test_byte_count` beside the existing `test_packet_count`.
+     SCOPE, stated with a measurement rather than by assertion, and it turned up two
+     more. The swept set is the calls named `record_*`. `stage_flow_cache_hit` makes
+     two OTHER per-packet accounting calls that are not — `sessions.touch_if_stale(..)`
+     (#918 staleness) and `sessions.account_packet(..)` (#2501 byte/packet accounting,
+     #2749 TCP-flags/DSCP capture for the SESSION_CLOSE RT_FLOW record). Deleting
+     EITHER leaves the whole crate GREEN, 4264 passed / 0 failed on each, so both are
+     unbound at this call site. NOT closed in this round and not silently dropped
+     either: neither is a telemetry `record_*` call, and binding the session table's
+     per-packet accounting is its own piece of work. Recorded here and in
+     `docs/userspace-dataplane-gaps.md` so the next round starts from the measurement
+     instead of rediscovering it.
 
-  F4. **`enqueue_tx_owned` RETURNS `Ok(())` ON A DROP.** Documented at the
-     definition rather than changed: `push_redirect_inbox` implements the
-     drop-newest contract, so an overflowed request is discarded and the caller
-     is told nothing. The doc names `try_enqueue_tx_owned` and
-     `try_reserve_mirror_tx_owned` as the acceptance-reporting alternatives, and
-     `enqueue_tx` — which has the identical property two lines above — carries a
-     one-line pointer so a reader arriving at either draws the right conclusion.
+  F4. **`enqueue_tx_owned` RETURNS `Ok(())` ON A DROP.** Documented at the definition
+     rather than changed: `push_redirect_inbox` implements the drop-newest contract,
+     so an overflowed request is discarded and the caller is told nothing. The doc
+     names `try_enqueue_tx_owned` and `try_reserve_mirror_tx_owned` as the
+     acceptance-reporting alternatives, and `enqueue_tx` — identical property, two
+     lines above — carries a one-line pointer so a reader arriving at either draws
+     the right conclusion.
 
-  Validation: `cargo test --release` GREEN both parallel and at
-  `--test-threads=1`. `CARGO_TARGET_DIR` private to this lane; no crate-wide
-  `cargo fmt` — each touched file checked with `rustfmt --edition 2024 --check`
-  against its parent content IN PLACE (measuring a copy in `$TMPDIR` is wrong:
-  rustfmt follows `mod` declarations, so a detached copy silently reports 0), and
-  every file carries the same deviation count as its parent, none added.
+  Validation: `cargo test --release` GREEN at the delivered head — 4264 passed /
+  0 failed / 2 ignored in the main binary under the #6657 filter, plus
+  60 + 8 + 22 + 31 + 1 + 2 in the integration binaries.
+  Full `go test ./...` GREEN. `CARGO_TARGET_DIR` private to this lane; no crate-wide
+  `cargo fmt` — each touched file checked in place with
+  `rustfmt --edition 2024 --check` against its own parent content and carrying the
+  same deviation count (mod.rs 14, tests/tx_inbox.rs 0, tx_inbox.rs 1,
+  flow_cache_hit_tests.rs 9, policy.rs 102), none added.
 
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 

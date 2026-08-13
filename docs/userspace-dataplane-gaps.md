@@ -286,35 +286,73 @@ caught by nothing at all. Also bound either side of the window:
   green).
 
 **Telemetry call sites in this function, swept individually.** Two rounds found
-an unbound `record_*` call by deleting one line, so the whole set was deleted one
+an unbound `record_*` call by severing one line, so the whole set was severed one
 at a time against the full crate rather than continuing one report at a time.
-`filter::record_filter_counter` (both the #2573 TX-side and the #3777 input-side
-replay), `record_mirror_clone_result`, and
-`tx_counters.record_in_place_l2_rewrite` all RED. Two did not, and both are the
-"looks covered, binds nothing" shape in its two forms:
+The sweep was then re-run rather than inherited, and the re-run changed two rows.
 
-- `policy::record_policy_hit_counter` (#3073) was UNREACHABLE — every fixture
-  left `policy_counter: None` with `policy_counter_idx: 0` against a
+| site | single-line production edit | result |
+|---|---|---|
+| `filter::record_filter_counter` TX/output side (#2573) | walk reduced to `.for_each(\|_counter\| {})` | **was GREEN — UNBOUND** |
+| `filter::record_filter_counter` INPUT side (#3777) | same | RED — `txn_flow_cache_hit_replays_input_filter_then_count_3777` |
+| `policy::record_policy_hit_counter` (#3073) | call replaced by `let _ = counter;` | **was GREEN — UNBOUND** |
+| `zone_counters::record_zone_traffic` (#3651) | call deleted | **was GREEN — UNBOUND** |
+| `record_mirror_clone_result` (#6304) | call replaced by `let _ = (..);` | RED — 4 cells |
+| `tx_counters.record_in_place_l2_rewrite` | call deleted | RED — the r3 cell |
+
+Three sites bound nothing, in THREE shapes of one failure:
+
+- `policy::record_policy_hit_counter` was UNREACHABLE — every fixture left
+  `policy_counter: None` with `policy_counter_idx: 0` against a
   `ForwardingState::default()` policy snapshot, so `resolve_session_hit_counter`
   returned `None` and the guarded block never ran. Bound by
-  `live_flow_cache_callsite_recounts_the_established_policy_hit_6304`, which
-  binds a real counter handle onto the cached entry and asserts packets AND
-  bytes — the byte cell distinguishes `meta.pkt_len` from a stripped L3 length,
-  which the packet count alone cannot.
-- `zone_counters::record_zone_traffic` (#3651) RAN on every fixture and did
-  nothing — an empty `ZoneCounterSlotMap` and an `EGRESS_IFINDEX` absent from
+  `live_flow_cache_callsite_recounts_the_established_policy_hit_6304`, which binds
+  a real counter handle onto the cached entry and asserts packets AND bytes — the
+  byte cell distinguishes `meta.pkt_len` from a stripped L3 length, which the
+  packet count alone cannot.
+- `zone_counters::record_zone_traffic` RAN on every fixture and did nothing — an
+  empty `ZoneCounterSlotMap` and an `EGRESS_IFINDEX` absent from
   `forwarding.egress` make both slot lookups 0, and the function returns at
   `if ingress_slot == 0 && egress_slot == 0`. Bound by
   `live_flow_cache_callsite_accounts_per_zone_traffic_6304` through a
   `with_zone_accounting` fixture builder. Both directions are asserted, because
   the ingress zone comes from the shim metadata and the egress zone from
-  `egress_zone_id(..)` — two independent resolutions, and asserting one leaves
-  the other free.
+  `egress_zone_id(..)` — two independent resolutions, and asserting one leaves the
+  other free.
+- the TX-side `filter::record_filter_counter` RAN and iterated an EMPTY
+  collection, so the closure holding the call never executed. Crate-wide, the one
+  test that puts a real counter on the cached TX-side `tx_selection` is
+  `txn_flow_cache_hit_ttl_check_precedes_egress_accounting_3779`, and both of its
+  assertions on that counter are NEGATIVE — the seed packet charges it on the COLD
+  path, and the TTL=1 cache-hit packet must NOT charge it. Severing the hit-path
+  replay satisfies both, so a test that looks like coverage for #2573's replay is
+  coverage for #3779's suppression. Bound by
+  `live_flow_cache_callsite_replays_every_filter_count_term_6304`, which carries
+  TWO tx-side handles (#2573's guarantee is that ALL matched count terms replay,
+  not just the last) and asserts the input side at this call site as well, since
+  #3777 exists because the two sides regressed independently once already.
+
+The arguments are bound too, not merely the occurrence: swapping
+`record_zone_traffic`'s ingress/egress zone arguments, zeroing its byte argument,
+zeroing `record_policy_hit_counter`'s byte argument, zeroing
+`record_mirror_clone_result`'s frame length, and forcing its result to `Enqueued`
+each red exactly the cell that asserts that property.
+
+SCOPE, stated with a measurement rather than an assertion. The swept set is the
+calls named `record_*`. `stage_flow_cache_hit` makes two other per-packet
+accounting calls that are not: `sessions.touch_if_stale(..)` (#918 staleness) and
+`sessions.account_packet(..)` (#2501 byte/packet accounting, #2749 TCP-flags and
+DSCP capture for the SESSION_CLOSE RT_FLOW record). Deleting EITHER leaves the
+whole crate green — 4264 passed, 0 failed, on each — so both are unbound at this
+call site. They are recorded here rather than closed in the round that found them,
+because neither is a telemetry `record_*` call and binding the session table's
+accounting is its own piece of work.
 
 The generalisation worth keeping: a telemetry call reached by every test is not
-thereby covered. It binds nothing if its arguments select a no-op arm, and
-nothing if a guard above it is false in every fixture. Neither is visible in a
-coverage report; both are visible to a one-line deletion.
+thereby covered. It binds nothing if a guard above it is false in every fixture,
+nothing if its arguments select a no-op arm, nothing if the collection it walks is
+empty — and nothing if the only test holding a live handle asserts the case where
+it must NOT fire. None of the four is visible in a coverage report; all four are
+visible to a one-line severance.
 
 A second canary, living in `mirror/mod_tests.rs` because one inside the module
 could not fire, asserts the test module is still registered at all — deleting
