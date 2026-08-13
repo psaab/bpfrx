@@ -6049,8 +6049,23 @@ fn reth_exemption_does_not_leak_to_iface_tunnel_units_6722() {
 ///
 /// The distinguishing property is a co-resident PARENT ROW. There is none here
 /// (`reth1` appears nowhere), so both rows must vote and the ifindex must stay
-/// ambiguous. Drop the parent-row requirement from the gate and this test reds
-/// while every other 6722 test stays green.
+/// ambiguous.
+///
+/// Drop the parent-row requirement — the whole
+/// `names_by_ifindex.get(..).is_some_and(..)` clause — and this test reds.
+/// The rider that used to follow, "while every other 6722 test stays green",
+/// is NO LONGER TRUE and was removed rather than reworded: measured under
+/// exactly that mutation, THREE tests red — this one,
+/// `self_referential_redundant_parent_does_not_exempt_its_own_row_6722` and
+/// `bare_prefix_sibling_does_not_exempt_the_member_6722` (pass=15 fail=3).
+/// That is the correct outcome, not a regression: those two are the negative
+/// bindings for two conjuncts INSIDE the clause this mutation deletes whole,
+/// so deleting it necessarily takes them with it. The exclusivity claim was
+/// true only while this test was the clause's sole guard.
+///
+/// For a mutation that reds THIS test alone, delete a narrower thing: the
+/// `.get(&iface.ifindex)` lookup's requirement that the map contain the
+/// ifindex at all. The per-conjunct cells live with their own tests below.
 ///
 /// Its own `#[test]` body, for the same reason as controls 1 and 2.
 #[test]
@@ -6080,4 +6095,148 @@ fn dangling_redundant_parent_does_not_exempt_a_genuine_observer_6722() {
         "specifically NOT `vpnb` -- one config line must not re-open #6722"
     );
     assert_eq!(result.action, PolicyAction::Deny);
+}
+
+// #6722 B1: the projection gate is a three-conjunct predicate, and a Codex leg
+// measured that each of the three could be deleted INDIVIDUALLY with the whole
+// suite green. The four tests below bind them. Each is RED under exactly its
+// own removal and GREEN under the other two, so a cell table over them
+// distinguishes the conjuncts rather than the predicate as a lump.
+//
+// The reason the gap existed is worth stating, because it recurs: the only
+// positive fixture (`reth_member_unzoned_row_snapshot_6722`) carries BOTH a
+// `reth1` base row and a `reth1.0` unit row, so it satisfies the disjunction
+// through EITHER arm. A fixture that satisfies a disjunction cannot bind either
+// branch of it — you need one fixture per arm, each carrying only that arm's
+// witness.
+
+/// #6722 B1 CONJUNCT 1 — `*other != iface.name` (self-exclusion).
+///
+/// `redundant_parent` is an unvalidated operator string, so an interface may
+/// name ITSELF: `set interfaces ge-0/0/1 gigether-options redundant-parent
+/// ge-0/0/1` compiles. Such a row is its own netdev, not a projection of
+/// another row's, and its unzoned vote is real.
+///
+/// RED-on-revert: drop `*other != iface.name.as_str()` and `ge-0/0/1` matches
+/// itself, exempting its own vote — the ledger resolves `lan` for an ifindex
+/// whose own netdev row carries no zone, and this fails at "a row that names
+/// ITSELF".
+#[test]
+fn self_referential_redundant_parent_does_not_exempt_its_own_row_6722() {
+    let state = build_forwarding_state(&reth_self_referential_parent_snapshot_6722());
+
+    // POSITIVE CONTROL: the fixture really does put both rows on one ifindex,
+    // so the ledger has something to adjudicate.
+    assert!(
+        state.egress.contains_key(&LAN_IFINDEX_6722),
+        "precondition: both rows land on the LAN ifindex and it has an egress row"
+    );
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "a row that names ITSELF as its redundant-parent is not a projection of \
+         another row's netdev -- it IS that netdev, so its unzoned vote must \
+         stand and the ifindex must stay ambiguous"
+    );
+    assert_eq!(
+        state.egress_zone_id(LAN_IFINDEX_6722),
+        0,
+        "and the egress half must fail CLOSED rather than inherit `lan` from a \
+         sibling the self-reference silenced"
+    );
+}
+
+/// #6722 B1 CONJUNCT 2 — the EXACT-parent arm (`*other == redundant_parent`).
+///
+/// A RETH with a zone and no configured unit emits only its base row, so the
+/// exact arm is the only one that can fire. This is the positive direction:
+/// the exemption MUST apply, or the reference bondless-RETH LAN regresses to
+/// the #6722 B2 blackhole whenever the operator has not configured a unit.
+///
+/// RED-on-revert: delete `*other == iface.redundant_parent.as_str() ||` and
+/// `reth1` no longer matches (`strip_prefix("reth1")` yields `""`, which does
+/// not start with `.`), so the member votes, the ledger lands `None`, and this
+/// fails at "the exact-parent arm".
+#[test]
+fn parent_base_row_alone_exempts_the_member_6722() {
+    let state = build_forwarding_state(&reth_parent_base_row_only_snapshot_6722());
+
+    assert_eq!(
+        state
+            .ifindex_unambiguous_zone_id
+            .get(&LAN_IFINDEX_6722)
+            .copied(),
+        Some(TEST_LAN_ZONE_ID),
+        "the exact-parent arm must exempt the member when the ifindex carries \
+         the parent BASE row and no dotted unit: `reth1` is the only witness, \
+         so nothing else can carry this exemption"
+    );
+    assert_eq!(
+        state.egress_zone_id(LAN_IFINDEX_6722),
+        TEST_LAN_ZONE_ID,
+        "and the egress half must resolve `lan` rather than the 0 sentinel"
+    );
+}
+
+/// #6722 B1 CONJUNCT 3 — the DOTTED-parent arm (`<parent>.<unit>`).
+///
+/// Zoning the UNIT rather than the base is ordinary Junos, and the quarantine
+/// pass can also blank a base's zone while its unit survives. Then the dotted
+/// row is the only witness and the dotted arm is the only one that can fire.
+///
+/// RED-on-revert: delete the `strip_prefix(...).is_some_and(...)` arm and
+/// `reth1.0` no longer matches (it is not equal to `reth1`), so the member
+/// votes, the ledger lands `None`, and this fails at "the dotted-parent arm".
+#[test]
+fn parent_unit_row_alone_exempts_the_member_6722() {
+    let state = build_forwarding_state(&reth_parent_unit_row_only_snapshot_6722());
+
+    assert_eq!(
+        state
+            .ifindex_unambiguous_zone_id
+            .get(&LAN_IFINDEX_6722)
+            .copied(),
+        Some(TEST_LAN_ZONE_ID),
+        "the dotted-parent arm must exempt the member when the ifindex carries \
+         `reth1.0` and no `reth1` base: the dotted row is the only witness, so \
+         nothing else can carry this exemption"
+    );
+    assert_eq!(
+        state.egress_zone_id(LAN_IFINDEX_6722),
+        TEST_LAN_ZONE_ID,
+        "and the egress half must resolve `lan` rather than the 0 sentinel"
+    );
+}
+
+/// #6722 B1 CONJUNCT 3, OVER-REACH: the `.` boundary in the dotted arm.
+///
+/// `reth10` is an ordinary RETH name that happens to have `reth1` as a bare
+/// textual prefix. It is a DIFFERENT interface and cannot make `ge-0/0/1` a
+/// projection of anything. The `.` is what separates "a unit of my parent"
+/// from "a name that merely starts the same way".
+///
+/// This is the direction the two tests above cannot reach: they establish that
+/// each arm FIRES, not that the dotted arm STOPS at the dot. Relax
+/// `rest.starts_with('.')` to `.is_some()` and this reds at "a bare textual
+/// prefix"; it stays GREEN under either arm's outright deletion, since both of
+/// those only ever remove an exemption.
+#[test]
+fn bare_prefix_sibling_does_not_exempt_the_member_6722() {
+    let state = build_forwarding_state(&reth_bare_prefix_sibling_snapshot_6722());
+
+    assert!(
+        !state
+            .ifindex_unambiguous_zone_id
+            .contains_key(&LAN_IFINDEX_6722),
+        "`reth10` is a DIFFERENT interface that merely shares a textual prefix \
+         with `reth1` -- it is not `ge-0/0/1`'s parent, so the member's unzoned \
+         vote must stand and the ifindex must stay ambiguous"
+    );
+    assert_eq!(
+        state.egress_zone_id(LAN_IFINDEX_6722),
+        0,
+        "and the egress half must fail CLOSED: a prefix coincidence must not \
+         hand the member a zone the operator never gave its netdev"
+    );
 }

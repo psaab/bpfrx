@@ -847,8 +847,11 @@ Scope of the fallback:
 
   So the fallback reads `ifindex_unambiguous_zone_id`, built in
   `populate_interfaces` over ALL snapshot rows — zoned and unzoned alike. An
-  ifindex appears there only when EVERY row sharing it named the SAME nonzero
-  zone; disagreement (including "one row zoned, one row not") and unanimous "no
+  ifindex appears there only when every CONTRIBUTING row sharing it named the
+  SAME nonzero zone — a RETH member's row is a projection rather than an
+  independent observer and is exempt from voting (#6722 B2, below), so
+  unanimity is over the observers rather than over the raw row set;
+  disagreement (including "one row zoned, one row not") and unanimous "no
   zone" are both absent, and `egress_zone_id` then resolves the **0 sentinel** —
   the pre-#6713 answer, against which no exact, wildcard or `junos-global` rule
   matches, so the default policy decides.

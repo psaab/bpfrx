@@ -1598,9 +1598,13 @@ pub(super) fn wg_iface_tunnel_unanimous_snapshot_6722() -> ConfigSnapshot {
 //     snapshotLinuxName(reth1.0) -> LinuxIfName(ResolveReth("reth1")) = ge-0-0-1
 //     snapshotLinuxName(ge-0/0/1)-> LinuxIfName("ge-0/0/1")           = ge-0-0-1
 //
-// Junos zones the RETH, never its member, so `buildInterfaceZoneMap`
-// (`pkg/dataplane/userspace/zones.go`) leaves the member row UNZONED and
-// `buildInterfaceSnapshots` emits it unfiltered. Three rows, one ifindex,
+// Junos zones the RETH, and ORDINARILY not its member, so
+// `buildInterfaceZoneMap` (`pkg/dataplane/userspace/zones.go`) leaves the
+// member row UNZONED and `buildInterfaceSnapshots` emits it unfiltered. Not
+// "never": zoning the member explicitly is accepted, and
+// `reth_member_explicitly_zoned_snapshot_6722` below is exactly that config —
+// which is why the exemption is scoped to an UNZONED member row rather than to
+// member rows generally. Three rows, one ifindex,
 // and the member's "no zone" DISAGREES with the RETH's.
 //
 // Measured through the full `buildSnapshot` on the reference cluster config
@@ -1726,10 +1730,18 @@ fn reth_policies_6722() -> Vec<PolicyRuleSnapshot> {
 /// ```
 ///
 /// Row order matches `buildInterfaceSnapshots`, which walks interface names
-/// SORTED — `ge-0/0/1` sorts before `reth1`, so the member votes FIRST and the
-/// two agreeing RETH rows follow. That ordering is why the pre-#6722 code
+/// SORTED — `ge-0/0/1` sorts before `reth1`, so the member row comes FIRST and
+/// the two RETH rows follow. That ordering is why the pre-#6722 code
 /// (`populate_egress` last-write-wins on the row's own zone) happened to land
-/// `lan` and why the ledger, which is order-independent, lands `None` instead.
+/// `lan`.
+///
+/// The ledger lands `Some(lan)` for this shape, and is order-independent in
+/// doing so. An earlier revision of this note said `None` (#6722 B2 review):
+/// that described the ledger BEFORE the projection exemption, when the member's
+/// unzoned vote counted and collided with the RETH's — the fail-CLOSED
+/// blackhole `unzoned_reth_member_row_does_not_strip_the_reths_egress_zone_6722`
+/// exists to prevent. The member is a projection of the RETH's netdev, so it
+/// does not vote, and the two remaining rows agree.
 pub(super) fn reth_member_unzoned_row_snapshot_6722() -> ConfigSnapshot {
     ConfigSnapshot {
         zones: reth_zones_6722(),
@@ -1764,6 +1776,126 @@ pub(super) fn reth_member_explicitly_zoned_snapshot_6722() -> ConfigSnapshot {
             reth_row_6722("ge-0/0/1", "wan", "reth1", None),
             reth_row_6722("reth1", "lan", "", None),
             reth_row_6722("reth1.0", "lan", "", Some("10.0.61.1/24")),
+        ],
+        default_policy: "deny".to_string(),
+        policies: reth_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// SELF-REFERENCE fixture: the unzoned row names ITSELF as its
+/// redundant-parent, and the only other row on the ifindex is an independent
+/// zoned observer.
+///
+/// ```text
+/// set interfaces ge-0/0/1 gigether-options redundant-parent ge-0/0/1
+/// set security zones security-zone lan interfaces reth1
+/// ```
+///
+/// Nothing rejects that line — `redundant_parent` is an unvalidated operator
+/// string (see the gate's own note in `forwarding_build/interfaces.rs`), and
+/// no compiler pass requires the named parent to DIFFER from the interface
+/// naming it. `ge-0/0/1` is therefore NOT a projection of another row\'s
+/// netdev: it is its own netdev, and its "no zone" is a real statement that
+/// must keep the ifindex ambiguous.
+///
+/// Deliberately WITHOUT a `reth1.0`: the only candidates the gate can scan are
+/// the self row and the independent `reth1`, so `*other != iface.name` is the
+/// single conjunct standing between this shape and a fail-open. Drop it and
+/// `ge-0/0/1` matches ITSELF, exempts its own vote, and the ledger resolves
+/// `lan` for an ifindex whose own netdev row is unzoned.
+pub(super) fn reth_self_referential_parent_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: reth_zones_6722(),
+        interfaces: vec![
+            wan_row_6722(),
+            reth_row_6722("ge-0/0/1", "", "ge-0/0/1", None),
+            reth_row_6722("reth1", "lan", "", None),
+        ],
+        default_policy: "deny".to_string(),
+        policies: reth_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// EXACT-PARENT-ARM fixture: the ifindex carries the parent BASE row and no
+/// dotted unit at all.
+///
+/// ```text
+/// set interfaces ge-0/0/1 gigether-options redundant-parent reth1
+/// set security zones security-zone lan interfaces reth1
+/// # ... and NO `reth1 unit 0`, so no `reth1.0` row exists
+/// ```
+///
+/// Real: a RETH with a zone and no configured unit still emits its base row.
+/// This is the positive case for `*other == redundant_parent` ALONE — the
+/// reference fixture above carries BOTH `reth1` and `reth1.0`, so it satisfies
+/// the disjunction through either arm and cannot bind either one.
+pub(super) fn reth_parent_base_row_only_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: reth_zones_6722(),
+        interfaces: vec![
+            wan_row_6722(),
+            reth_row_6722("ge-0/0/1", "", "reth1", None),
+            reth_row_6722("reth1", "lan", "", None),
+        ],
+        default_policy: "deny".to_string(),
+        policies: reth_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// DOTTED-PARENT-ARM fixture: the ifindex carries a dotted UNIT of the parent
+/// and NO parent base row.
+///
+/// ```text
+/// set interfaces ge-0/0/1 gigether-options redundant-parent reth1
+/// set interfaces reth1 unit 0 family inet address 10.0.61.1/24
+/// set security zones security-zone lan interfaces reth1.0
+/// ```
+///
+/// Real: zoning the UNIT rather than the base is ordinary Junos and leaves the
+/// base row unzoned; `zones_quarantine.go` can also blank a base\'s zone while
+/// its unit survives, which lands the same shape. This is the positive case
+/// for the DOTTED arm alone.
+pub(super) fn reth_parent_unit_row_only_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: reth_zones_6722(),
+        interfaces: vec![
+            wan_row_6722(),
+            reth_row_6722("ge-0/0/1", "", "reth1", None),
+            reth_row_6722("reth1.0", "lan", "", Some("10.0.61.1/24")),
+        ],
+        default_policy: "deny".to_string(),
+        policies: reth_policies_6722(),
+        ..Default::default()
+    }
+}
+
+/// BARE-PREFIX fixture: the co-resident row\'s name merely STARTS WITH the
+/// redundant-parent\'s name, with no `.` boundary.
+///
+/// ```text
+/// set interfaces ge-0/0/1 gigether-options redundant-parent reth1
+/// set security zones security-zone lan interfaces reth10
+/// ```
+///
+/// `reth10` is an ordinary RETH name (Junos allows `reth0`..`reth127`) that
+/// has `reth1` as a bare textual prefix. It is a DIFFERENT interface, so it
+/// cannot make `ge-0/0/1` a projection of anything, and `ge-0/0/1`\'s unzoned
+/// vote must stand.
+///
+/// This is what the `.` in `rest.starts_with(\'.\')` exists for. Relax the
+/// dotted arm to a bare `strip_prefix(...).is_some()` and `reth10` starts
+/// exempting `reth1`\'s members — a textual coincidence silencing a real
+/// observer. Two rows only, so the exact arm cannot rescue the match.
+pub(super) fn reth_bare_prefix_sibling_snapshot_6722() -> ConfigSnapshot {
+    ConfigSnapshot {
+        zones: reth_zones_6722(),
+        interfaces: vec![
+            wan_row_6722(),
+            reth_row_6722("ge-0/0/1", "", "reth1", None),
+            reth_row_6722("reth10", "lan", "", None),
         ],
         default_policy: "deny".to_string(),
         policies: reth_policies_6722(),

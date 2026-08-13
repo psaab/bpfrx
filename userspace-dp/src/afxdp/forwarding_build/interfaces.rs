@@ -5,8 +5,12 @@
 //! 1. [`populate_interfaces`] — walks `snapshot.interfaces`,
 //!    populates `state.ifindex_to_*`, `state.ifindex_to_zone_id`,
 //!    `state.ifindex_unambiguous_zone_id` (#6722 — an ifindex only when
-//!    EVERY row sharing it named the same nonzero zone; see
-//!    `ForwardingState::egress_zone_id`),
+//!    every CONTRIBUTING row sharing it named the same nonzero zone; a
+//!    RETH member's row is a PROJECTION of another row's netdev rather
+//!    than an independent observer of it and does not contribute, so
+//!    `[member="" reth1="lan" reth1.0="lan"]` resolves `lan` even though
+//!    not every row agrees; see `ForwardingState::egress_zone_id` and the
+//!    projection gate below),
 //!    `state.tunnel_interfaces`, `state.local_v[46]`,
 //!    `state.interface_nat_v[46]`, `state.connected_v[46]`. Returns
 //!    an [`IfaceIndex`] context with `name_to_ifindex` /
@@ -39,9 +43,12 @@ pub(super) fn populate_interfaces(
     let mut name_to_ifindex = BTreeMap::new();
     let mut linux_to_ifindex = BTreeMap::new();
     let mut mac_by_ifindex = BTreeMap::new();
-    // #6722: ifindex → the zone every row on it agrees on, or `None` once two
-    // rows disagreed. Flushed into `state.ifindex_unambiguous_zone_id` after
-    // the walk, because a conflict can be introduced by ANY later row.
+    // #6722: ifindex → the zone every CONTRIBUTING row on it agrees on, or
+    // `None` once two of them disagreed. Not literally every row: the
+    // projection gate below withholds a RETH member's vote, because that row
+    // describes another row's netdev rather than observing its own. Flushed
+    // into `state.ifindex_unambiguous_zone_id` after the walk, because a
+    // conflict can be introduced by ANY later row.
     let mut zone_agreement: BTreeMap<i32, Option<u16>> = BTreeMap::new();
 
     // #6722 B1: every row name that lands on each ifindex, so the projection
@@ -107,9 +114,10 @@ pub(super) fn populate_interfaces(
                 }
             }
         };
-        // #6722: record what THIS row says about its ifindex, for every row —
-        // an unzoned row's "no zone" is an opinion that must be able to
-        // conflict with a zoned sibling's. `zone_agreement[ifx] == None` means
+        // #6722: record what THIS row says about its ifindex, for every row
+        // that CONTRIBUTES (the projection gate below withholds a RETH
+        // member's vote; every other row votes) — an unzoned row's "no zone"
+        // is an opinion that must be able to conflict with a zoned sibling's. `zone_agreement[ifx] == None` means
         // the rows sharing `ifx` disagree, so the ifindex identifies no single
         // zone and `ForwardingState::egress_zone_id` must refuse to guess one.
         // Recording unzoned rows is LOAD-BEARING, and proven so: skip them and
@@ -442,7 +450,9 @@ pub(super) fn populate_interfaces(
     }
 
     // #6722: flush the agreement ledger. An ifindex lands here only when every
-    // row on it named the SAME nonzero zone; a conflict (`None`) and a
+    // CONTRIBUTING row on it named the SAME nonzero zone — a RETH member's
+    // projection row never voted, so unanimity is over the independent
+    // observers, not over the raw row set; a conflict (`None`) and a
     // unanimous "no zone" (`Some(0)`) are both left absent, and
     // `ForwardingState::egress_zone_id` then resolves that ifindex to the 0
     // sentinel — the pre-#6713 answer, against which no policy rule matches.

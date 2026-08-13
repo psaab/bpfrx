@@ -77908,3 +77908,76 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   Gates: `go build ./...` rc 0; `go vet ./pkg/dataplane/userspace/` rc 0;
   `go test ./pkg/dataplane/userspace/` ok; `cargo build --release` rc 0 (the
   Rust change is comment-only).
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6722 B1 — bind the three individually-removable conjuncts of the
+  RETH-projection gate, and correct the claims the binding falsified.
+  The predicate itself is unchanged and was not re-derived (a Codex leg had
+  already established soundness by construction and order-independence). What
+  it lacked was discrimination: each of its three conjuncts could be deleted
+  ALONE with the whole suite green, because the single positive fixture
+  (`reth_member_unzoned_row_snapshot_6722`) carries BOTH a `reth1` base row and
+  a `reth1.0` unit row and therefore satisfies the disjunction through EITHER
+  arm. A fixture that satisfies a disjunction cannot bind either branch — one
+  fixture per arm, each carrying only that arm's witness, is the fix.
+  FOUR fixtures + four tests, one per conjunct plus one for the dot boundary:
+  `reth_self_referential_parent_snapshot_6722` (an interface naming ITSELF as
+  its redundant-parent — accepted by strict CompileConfig, and without
+  `*other != iface.name` it matches itself and exempts its own vote);
+  `reth_parent_base_row_only_snapshot_6722` (parent base row, no dotted unit —
+  the exact arm alone); `reth_parent_unit_row_only_snapshot_6722` (dotted unit,
+  no base row — the dotted arm alone; also the quarantine shape, where a base
+  loses its zone while its unit survives); and
+  `reth_bare_prefix_sibling_snapshot_6722` (`reth10` beside a member whose
+  parent is `reth1` — an ordinary RETH name that has the parent as a BARE
+  textual prefix). The last is the one the `.` in `rest.starts_with('.')`
+  exists for and was not directly tested at all.
+  Mutation matrix, 4 cells, PERFECT DIAGONAL — each cell REDs exactly its own
+  binding and leaves the other three GREEN, and every pre-existing 6722 control
+  stays green in every cell (cohort pass=17 fail=1 throughout). Every RED is an
+  ASSERTION: the harness scores a build break as UNKNOWN-BUILD and none
+  occurred. Restore verified byte-identical with a clean re-run rc=0.
+    M1 drop `*other != iface.name`      -> self-reference test RED, others GREEN
+    M2 drop the exact-parent arm        -> parent-base test RED, others GREEN
+    M3 drop the dotted-parent arm       -> parent-unit test RED, others GREEN
+    M4 `starts_with('.')` -> `is_some()` -> bare-prefix test RED, others GREEN
+  A CLAIM MY OWN CHANGE FALSIFIED, corrected in the same commit: control 3
+  (`dangling_redundant_parent_does_not_exempt_a_genuine_observer_6722`) said
+  "drop the parent-row requirement from the gate and this test reds while every
+  other 6722 test stays green". Measured under exactly that mutation now:
+  THREE tests red (pass=15 fail=3) — control 3 plus the self-reference and
+  bare-prefix bindings, because those two guard conjuncts INSIDE the clause
+  that mutation deletes whole. That is correct behaviour, not a regression; the
+  exclusivity rider was true only while control 3 was the clause's sole guard.
+  Removed rather than reworded, with the measured counts recorded and a pointer
+  to the narrower mutation that still reds control 3 alone. This also settles
+  the optional item from the brief (the control's distinguishing edit spanning
+  more than the clause it names) — same finding, measured.
+  Comment corrections: briefed as three sites, the sweep found SIX. The two the
+  brief did not name are `docs/userspace-dataplane-architecture.md` ("An
+  ifindex appears there only when EVERY row sharing it named the SAME nonzero
+  zone") and the per-row record comment in `interfaces.rs`. All four "every
+  row" sites now read "every CONTRIBUTING row", with the projection exemption
+  named. Note the miss was NOT the Rust mirror this time — it was a Markdown
+  doc plus a second comment in the same Rust file — which is consistent with
+  the discriminator: this claim is about ledger BEHAVIOUR, not a struct field
+  with a cross-language mirror, so `types/forwarding.rs`'s "over ALL rows
+  (zoned and unzoned alike)" is about which rows are CONSIDERED and is correct
+  as written; left alone.
+  Two fixture-comment corrections: "Junos zones the RETH, never its member" is
+  contradicted by `reth_member_explicitly_zoned_snapshot_6722` in the same file
+  (now "ordinarily not its member", with the contradiction named as the reason
+  the exemption is scoped to UNZONED members); and the reference fixture's note
+  that the ledger "lands `None`" described pre-exemption behaviour — it lands
+  `Some(lan)`, which is the whole point of #6722 B2.
+  Validation: `cargo test --release` rc=0 (7 suites, 4300 passed, 0 failed).
+  rustfmt checked per-file, NOT crate-wide: `test_fixtures.rs` is clean;
+  `forwarding/tests.rs` and `interfaces.rs` report 371 and 56 diff lines, and
+  the UNMODIFIED head reports the identical 371 and 56, with the highest hunk
+  at line 5682 against additions starting at 6125 — so every deviation is
+  pre-existing and none is in the added range.
+  Advances #6713 / #6722.
+- **File(s)**: userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding_build/interfaces.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
