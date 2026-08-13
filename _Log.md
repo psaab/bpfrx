@@ -78080,3 +78080,46 @@ Every RED above is an assertion failure, not a build break.
   Advances #4983.
 - **File(s)**: pkg/dataplane/types.go, pkg/dataplane/bpf_session_value.go,
   bpf/headers/xpf_conntrack.h, userspace-dp/src/afxdp/bpf_map/mod.rs, _Log.md
+
+- **Timestamp**: 2026-08-12
+- **Action**: #4983 — adjudicate the "exact for rows this node owns" claim on
+  the session ingress identity. Verdict: it does NOT hold as written; narrowed
+  at both sites. Doc/comment only, no behaviour change.
+  Sweep first (cites are topic pointers, not lines): the claim restates at
+  exactly TWO sites, `pkg/dataplane/types.go:155` and `:410` (v4 + v6), with a
+  companion "exact where this node is the authority" at `:165`/`:420`. No Rust
+  or C restatement — the Rust mirror documents the FIELD, not the resolver's
+  exactness, so this one is Go-only. Count matched the brief this time.
+  The mechanism: `sessionFilter.resolveIngressIfaces`
+  (pkg/cli/session_filter.go:456) returns ONE name only on a hit in
+  `ifaceNamesByKey`, else falls back to `zoneIfaces[ingressZone]`. That map is
+  rebuilt per query by `buildSessionEgressIfacesWithLookup`
+  (pkg/cli/session_display.go:44) from the CURRENT config and the CURRENT
+  kernel ifindex — while the row's ifindex was recorded at INSTALL.
+  Three shapes tested:
+  1. UNNAMEABLE ifindex — non-zero but no current config unit (unit deleted
+     since install, tunnel/fabric ingress). MISSES, falls back to the zone.
+     Approximate, not exact. The resolver's own doc comment states this
+     (session_filter.go:450-455). CLAIM FALSE.
+  2. RECYCLED ifindex — the kernel reassigns an index over the node's
+     lifetime, so a stale ifindex can HIT a key now owned by a DIFFERENT
+     interface. Worse than approximate: one confident WRONG name instead of a
+     zone list. CLAIM FALSE.
+  3. NON-VLAN UNIT — the brief's "unit-0 collapse" hypothesis is REFUTED.
+     `sessionDisplayVLANID` falls back to `unit.Number` when `VlanID == 0`, so
+     units do NOT collide onto `{ifindex, 0}`. But that same fallback creates a
+     different gap: the map keys a unit under `vlan-id` ELSE `unit number`,
+     while the row carries the VID OBSERVED ON THE WIRE. They agree only when
+     unit number == vlan id, or both are 0. A unit with a populated number
+     whose traffic is untagged keys 0 on the wire and `number` in the map, and
+     misses. The function's own doc acknowledges the config "may only populate
+     one of them". CLAIM FALSE, by a different mechanism than the brief's.
+  Narrowed both sites to state the precondition (exact only on a hit against a
+  currently-configured unit) and enumerate the three shapes, including the
+  collision the map DOES avoid, so the refuted hypothesis is not re-derived.
+  Nothing behavioural touched; the recycled-ifindex shape is a real correctness
+  wrinkle in an operator-facing filter, but fixing it is a different PR and was
+  not in scope — reported rather than acted on.
+  Validation: `go build ./...` rc=0; `go test ./pkg/dataplane/ ./pkg/cli/`
+  rc=0; `gofmt -l` clean. Advances #4983.
+- **File(s)**: pkg/dataplane/types.go, _Log.md

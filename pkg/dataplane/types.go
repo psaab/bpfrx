@@ -153,7 +153,25 @@ type SessionValue struct {
 	// Porting them is tracked in #6975.
 	//
 	// Until that lands, an interface-filtered SHOW is exact for rows this node
-	// owns and approximate for peer rows. An interface-filtered CLEAR is NOT
+	// owns ONLY when the row's {ifindex, vlan} names a currently-configured
+	// unit; it is approximate for peer rows and for three local shapes besides
+	// (#6928 derivation). `sessionFilter.resolveIngressIfaces` returns a single
+	// name only on a hit in `ifaceNamesByKey`, and that map is rebuilt per
+	// query from the CURRENT config and the CURRENT kernel ifindex:
+	//   - a non-zero ifindex the config cannot name (unit deleted since
+	//     install, tunnel/fabric ingress with no config unit) MISSES and falls
+	//     back to the zone — the resolver's own doc says so;
+	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
+	//     different interface, which is worse than approximate: it renders one
+	//     confident WRONG name rather than a zone list;
+	//   - the map keys a unit under `vlan-id`, else `unit number`
+	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
+	//     THE WIRE. Those agree when the unit number equals the vlan id, or
+	//     when both are 0; a unit whose number is populated and whose traffic
+	//     is untagged keys 0 on the wire and `number` in the map, and misses.
+	// (Note the collision the map DOES avoid: units do not collapse onto
+	// {ifindex, 0}, because that same number-fallback separates them; a
+	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
 	// exact even when typed on the console: `clearFilteredSessions`
 	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
 	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
@@ -408,7 +426,25 @@ type SessionValueV6 struct {
 	// Porting them is tracked in #6975.
 	//
 	// Until that lands, an interface-filtered SHOW is exact for rows this node
-	// owns and approximate for peer rows. An interface-filtered CLEAR is NOT
+	// owns ONLY when the row's {ifindex, vlan} names a currently-configured
+	// unit; it is approximate for peer rows and for three local shapes besides
+	// (#6928 derivation). `sessionFilter.resolveIngressIfaces` returns a single
+	// name only on a hit in `ifaceNamesByKey`, and that map is rebuilt per
+	// query from the CURRENT config and the CURRENT kernel ifindex:
+	//   - a non-zero ifindex the config cannot name (unit deleted since
+	//     install, tunnel/fabric ingress with no config unit) MISSES and falls
+	//     back to the zone — the resolver's own doc says so;
+	//   - a RECYCLED ifindex can HIT a key the kernel has since reassigned to a
+	//     different interface, which is worse than approximate: it renders one
+	//     confident WRONG name rather than a zone list;
+	//   - the map keys a unit under `vlan-id`, else `unit number`
+	//     (`sessionDisplayVLANID`), while the row carries the VID OBSERVED ON
+	//     THE WIRE. Those agree when the unit number equals the vlan id, or
+	//     when both are 0; a unit whose number is populated and whose traffic
+	//     is untagged keys 0 on the wire and `number` in the map, and misses.
+	// (Note the collision the map DOES avoid: units do not collapse onto
+	// {ifindex, 0}, because that same number-fallback separates them; a
+	// first-writer-wins insert still decides any genuine key collision.) An interface-filtered CLEAR is NOT
 	// exact even when typed on the console: `clearFilteredSessions`
 	// unconditionally propagates to the peer (`pkg/cli/cli_clear.go:251`), and
 	// the peer matches by `zone.Interfaces[0]` for EVERY session in the zone
