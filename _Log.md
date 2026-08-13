@@ -1,3 +1,61 @@
+## 2026-08-12 — #5619/#6691: merge master 4960e7bee; both conflicts were adjacency, not rewrite
+
+- **Timestamp**: 2026-08-12 19:05 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Merged `origin/master` (`4960e7bee`) into the #6691 secure-tunnel
+  ownership branch (`81962949f`) so the runtime-blocker fix is gated against
+  what it will actually land on. Result `5b2cfba97`.
+
+  **Two files conflicted; neither was a semantic collision.** Master's side is
+  the #6676/#5173 shim queue-coordinate work (`3f6faf297`, `4de0f9319`,
+  `a40766dad`, `2794010a1`, `db6b22576`), already merged to master, so none of
+  its hunks could be dropped.
+
+  `userspace-dp/src/main_tests.rs` — master added 1525 lines and this branch
+  added 152, both immediately after the same section separator. Relative to the
+  merge base BOTH sides are pure additions: neither deleted or altered a line
+  the other owns. A naive union would nonetheless have been WRONG here, because
+  each side's last test ends mid-`assert_eq!` and the two shared a single
+  trailing `);\n}` — dropping the markers alone would have left this branch's
+  assertion unterminated and fused two tests into one. Resolved instead by
+  composing from the three merge stages (base head + this branch's block +
+  master's block + base tail) and then proving the composition: it differs from
+  each parent by exactly the other parent's insertion (1525 and 152 lines
+  respectively) with ZERO deleted lines on either side.
+
+  `_Log.md` — both sides appended at the head and at the tail. Union-resolved
+  and checked the same way: zero lines lost from either parent.
+
+  Tree-wide anchored marker sweep (`^(<<<<<<< |=======$|>>>>>>> |\|\|\|\|\|\|\|)`)
+  returns nothing, `_Log.md` included; the anchor matters because this file
+  accumulates prose ABOUT conflict markers.
+
+- **File(s)**: `userspace-dp/src/main_tests.rs`, `_Log.md`
+
+- **Validation on the MERGE RESULT, not the pre-merge head** — the point being
+  that a conflict-free-looking merge can still fail to compile (master adds a
+  constructor while the branch adds required fields) or break a test (a guard
+  arriving with master closes a hole a fixture depended on). Neither shape
+  occurred here:
+    - `cargo test --release`: rc=0, 4401 passed / 0 failed across 7 suites
+      (main suite 4277, up from 4257 pre-merge — master's new shim tests).
+    - `TestUserspaceXDPShimObjectMatchesSourceManifest`: PASS, run explicitly
+      by name so a SKIP could not be read as a pass.
+    - `go build ./...` rc=0; `go vet` rc=0; `go test` on `pkg/dataplane`,
+      `pkg/config`, `pkg/routing` rc=0 (6/6 packages ok).
+    - `git diff --stat origin/master...HEAD -- userspace-xdp/` is EMPTY, and the
+      branch diff carries no `.o`/binary artifact — so no `make generate` and no
+      cluster smoke are owed.
+  All exit codes captured unpiped. An earlier Go run showed six socket tests
+  failing with `bind: invalid argument`; that was the 108-byte `sun_path` limit
+  hit by my own long TMPDIR prefix, not the merge — re-run under a short TMPDIR,
+  all green.
+
+- **#6691 fix confirmed intact after the merge**: `case iface.SecureTunnel:`
+  (`maps_sync.go:1705`, shifted from 1681 by master), `secureTunnelOwned`
+  (`interfaces.go:457`), the `secure_tunnel` serde field still omitted-when-false
+  on both planes, and `is_secure_tunnel_ifname` still deleted — only the comment
+  recording why it went remains.
+
 ## 2026-08-01 — #5619 PR1 round 6: four Codex MAJORs folded; a security guard that could not fire
 
 - **Timestamp**: 2026-08-01 20:46 (fix/6691-secure-tunnel-ifname-r4)
