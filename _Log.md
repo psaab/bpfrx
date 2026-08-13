@@ -77,6 +77,42 @@ sweep over neighbouring cells, not a fix for the one test that was named.**
 | `sort.SliceStable` -> `sort.Slice` | `...FirstFitSameTierFollowsConfigOrder_6812` | `charge order[0] = if05, want if00` |
 | " | `...SameTierBudgetBoundaryFollowsConfigOrder_6812` | `poison set = map[q01:true], missing "q15"` (GREEN before the re-cut) |
 
+### Amendment follow-up (same day): cross-language stake, B3, and an uneditable claim
+
+- **Action**: fold the hostile leg's B2 stake analysis, B3, and the remaining
+  prose corrections.
+- **File(s)**: `pkg/nat/pool_expansion_parity_6812_test.go` (new),
+  `pkg/config/nat_pool_grammar_parity_6812_test.go`, `docs/config-schema.md`,
+  `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+
+**The mask's stake is CROSS-LANGUAGE.** `pkg/nat/deterministic.go` expands the
+same pool from `net.ParseCIDR`'s already-masked `ipnet.IP`, and
+`lookupForwardInPool` INDEXES that slice to answer the operator-facing
+deterministic-NAT query. A drifted Rust base makes the Go lookup and the actual
+dataplane translation disagree by the host-bits offset — the #5794 invariant-8
+forensic failure, on a line this PR authored. A pool declared `10.0.0.1/24`
+would SNAT from `10.0.0.1`..`10.0.1.0`, one address into the neighbouring
+prefix. `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` binds
+it against the SAME fixture; the one table now pins THREE consumers.
+
+**B3**: deleting both `canonicalPoolAddressHint` branches left the
+package-scoped `go test ./pkg/config/ -run '6812|LeadingZero'` GREEN, because
+every binding test lived in `pkg/dataplane/userspace`. Closed in-package, with
+the negative half pinned too.
+
+**A false claim in an artefact that cannot be edited.** The round-3 commit
+message `8f9b53b44` says the fixture asserts "verdict AND expanded host count,
+so a masking drift is caught too". The second clause is false. A pushed commit
+message is not editable without rewriting shared history, so the correction
+lives here and in the plan. A false claim in an immutable artefact still has to
+be findable from the mutable ones.
+
+| revert | test | observed RED |
+|---|---|---|
+| delete both `canonicalPoolAddressHint` branches | `TestLeadingZeroHintIsBoundInThisPackage_6812` (package-scoped run) | `reason does not name the canonical spelling "10.0.0.0/24"` |
+| unmask the GO deterministic base | `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` | `expandPoolV4("10.0.0.1/24") starts at 10.0.0.1, want 10.0.0.0` |
+
+
 ## 2026-08-13 — #6812 round 4: a disposition change I said did not happen, and an order-dependent backstop
 
 - **Timestamp**: 2026-08-13

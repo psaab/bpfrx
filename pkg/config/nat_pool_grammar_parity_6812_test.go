@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -182,5 +184,52 @@ func TestPoolGrammarFixtureRowsAreSelfConsistent_6812(t *testing.T) {
 	if annotated < 8 {
 		t.Fatalf("only %d fixture rows pin an expanded address set; the network-base "+
 			"mask loses its witness below that", annotated)
+	}
+}
+
+// TestLeadingZeroHintIsBoundInThisPackage_6812 closes a package-scoping hole
+// (#6812 B3): the leading-zero diagnostic is PRODUCED here
+// (sourceNATPoolAddressReason -> canonicalPoolAddressHint,
+// compiler_validate_strict_nat.go) but every test that binds it lives in
+// pkg/dataplane/userspace. Deleting both hint branches therefore left
+// `go test ./pkg/config/ -run '6812|LeadingZero'` GREEN — a full-tree run
+// catches it, a package-scoped one cannot, and a package-scoped run is what a
+// maintainer touching this file will do.
+//
+// FAIL-ON-REVERT: drop either canonicalPoolAddressHint branch and this reds.
+func TestLeadingZeroHintIsBoundInThisPackage_6812(t *testing.T) {
+	for _, tc := range []struct {
+		addr      string
+		canonical string
+	}{
+		{"010.0.0.0/24", "10.0.0.0/24"},
+		{"192.168.001.1/32", "192.168.1.1/32"},
+		{"010.0.0.1", "10.0.0.1"},
+		{"::ffff:010.0.0.0/120", "::ffff:10.0.0.0/120"},
+	} {
+		reason, ok := sourceNATPoolAddressReason(tc.addr)
+		if ok {
+			t.Errorf("%q must be rejected", tc.addr)
+			continue
+		}
+		if !strings.Contains(reason, "leading zero") {
+			t.Errorf("%q: reason does not name the cause: %s", tc.addr, reason)
+		}
+		if !strings.Contains(reason, strconv.Quote(tc.canonical)) {
+			t.Errorf("%q: reason does not name the canonical spelling %q, so the operator "+
+				"cannot see the fix is one character: %s", tc.addr, tc.canonical, reason)
+		}
+	}
+
+	// The hint must never fire for an address that already works, nor invent a
+	// suggestion for an unrelated malformation — it would be telling the
+	// operator to make a change that does not help.
+	for _, addr := range []string{
+		"10.0.0.0/24", "198.51.100.1", "2001:db8::1", // already valid
+		"not-an-ip", "10.0.0.256/24", "203.0.113.1/garbage", "10.0.0.0/33",
+	} {
+		if hint := canonicalPoolAddressHint(addr); hint != "" {
+			t.Errorf("canonicalPoolAddressHint(%q) = %q, want no suggestion", addr, hint)
+		}
 	}
 }

@@ -674,3 +674,40 @@ tier-sorted), so it cannot silently regress to the single-keyed shape.
 reason is a greppable predicate — run it over the neighbouring cells before
 closing the round.** "All-equal sort key", "asserts only a count", "fixture
 input is already canonical" are all queries, not observations.
+
+### The mask's stake, and a claim in a commit message that cannot be edited
+
+The reviewer who found B2 established that the stake is **cross-language**, not
+just "wrong addresses". `pkg/nat/deterministic.go` expands the same pool CIDR
+from `net.ParseCIDR`'s `ipnet.IP` — already masked — and `lookupForwardInPool`
+INDEXES that slice to answer the operator-facing deterministic-NAT query. A
+drifted Rust base therefore makes the Go lookup and the actual dataplane
+translation disagree by exactly the host-bits offset: the #5794 invariant-8
+forensic failure, on a line this PR authored. Concretely, a pool declared
+`address 10.0.0.1/24` would SNAT from `10.0.0.1` through `10.0.1.0` — one
+address in the NEIGHBOURING prefix — with the whole suite green.
+
+`TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` binds it
+against the SAME fixture, so the one-table property now spans three consumers:
+the Rust expander, the Go grammar predicate, and the Go deterministic expander.
+Mutating the Go base to skip the mask reds it with
+`expandPoolV4("10.0.0.1/24") starts at 10.0.0.1, want 10.0.0.0`.
+
+**A correction that cannot be applied where it was made.** The round-3 commit
+message (`8f9b53b44`) claims the fixture asserts "verdict AND expanded host
+count, so a masking drift is caught too". The second clause is false — a
+masking drift is exactly what a count cannot catch. The commit is pushed and
+shared, so the message is not editable without rewriting history; the
+correction is recorded here and in `_Log.md` instead. A false claim in an
+immutable artefact still has to be findable from the mutable ones.
+
+### B3 — a production line whose only binding lived in another package
+
+Deleting both `canonicalPoolAddressHint` branches left
+`go test ./pkg/config/ -run '6812|LeadingZero'` GREEN: the production line is in
+`pkg/config`, and all three tests binding it were in `pkg/dataplane/userspace`.
+A full-tree run catches it; a package-scoped run — what a maintainer editing
+that file actually runs — does not. `TestLeadingZeroHintIsBoundInThisPackage_6812`
+closes it, and also pins the negative half (the hint must never fire for an
+address that already works, nor invent a suggestion for an unrelated
+malformation).

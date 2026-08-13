@@ -5428,7 +5428,9 @@ reserved for whole-dataplane selection where a rewrite shim
     (`compiler_validate_strict_nat.go`) closes the divergence by rejecting the
     exact shapes the dataplane rejects: each member must be a bare IP
     (`netip.ParseAddr`, with no IPv6 `%zone`) or a CIDR (`netip.ParsePrefix`;
-    host bits may be set, the runtime masks to the network base) whose host
+    host bits may be set, the runtime masks to the network base — documented since
+    #5627 but UNOBSERVED until #6812 B2, and now pinned by the fixture's
+    `first`/`last`/`expanded` fields on all three host-bits-set rows) whose host
     count does not exceed the cap, and a referenced pool must be non-empty. A
     `/16` (exactly 65536 hosts, at the cap) is accepted, matching the Rust
     `count > MAX_POOL_PREFIX_HOSTS` comparison.
@@ -5684,7 +5686,15 @@ reserved for whole-dataplane selection where a rewrite shim
     also pins WHICH addresses a member expands to (`first` / `last` /
     `expanded`, asserted Rust-side): a missing network-base mask changes the
     address set while leaving the host COUNT identical, so deleting both masks
-    left the crate green until those fields existed (#6812 B2).
+    left the crate green until those fields existed (#6812 B2). The stake is
+    CROSS-LANGUAGE, not merely wrong addresses: `pkg/nat/deterministic.go`
+    expands the same pool from `net.ParseCIDR`'s already-masked `ipnet.IP`, and
+    `lookupForwardInPool` INDEXES that slice to answer the operator-facing
+    "which external address does this subscriber get?" query — so a drifted Rust
+    base makes the CLI/gRPC/REST deterministic mapping name a different address
+    than the dataplane translates to, the #5794 invariant-8 forensic failure.
+    `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` (pkg/nat)
+    reads the SAME fixture, so all three consumers are pinned to one table.
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix
