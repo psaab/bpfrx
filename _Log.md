@@ -78296,3 +78296,84 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   userspace-dp/src/afxdp/test_fixtures.rs,
   userspace-dp/src/protocol/snapshot.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6722 round 3 fold — name the cross-gate dependency the predicate
+  actually rests on, and correct three claims that outlived the code they
+  described. Hostile re-gate at `893a8a757` returned MERGE-NEEDS-MINOR with the
+  strict-path spelling search EMPTY: the reviewer reduced the predicate's
+  satisfying set algebraically rather than probing shapes, giving exactly two
+  branches — (a) `ResolveReth(parent) == name`, the intended semantics, and
+  (b) `LinuxIfName(X) == LinuxIfName(P)` for distinct names, a `/` vs `-`
+  canonicalization collision. All four findings were re-measured here before
+  anything was edited; none was taken on the report's authority.
+  F1 (the one that mattered) — branch (b) fires with NO reth anywhere.
+  Measured through the real `CompileConfig` + `buildInterfaceSnapshots`:
+  `set interfaces ge-0/0/1 gigether-options redundant-parent ge-0-0-1` beside
+  `ge-0-0-1 unit 0 family inet address 10.0.61.1/24` gives `ge-0/0/1
+  mark=true zone="" ifindex=24` and `ge-0-0-1 mark=false zone="lan" ifindex=24`
+  — `ResolveReth("ge-0/0/1")` returns `ge-0/0/1`, so nothing is aliased and the
+  deference premise ("a member is an L2 port, the reth owns the L3") does not
+  apply to either side. The unzoned row's vote is withheld, the ledger resolves
+  `lan`, master gave the 0 sentinel: a fail-OPEN delta. NOT a blocker — strict
+  `CompileConfig` REJECTS it, measured, with #5832's canonical-name hijack
+  message — but the DEFECT was that the dependency was undocumented and
+  unguarded. `rethProjectionMembers`' soundness rests on
+  `validateInterfaceNameCollisionStrict` (#5832), a gate this work never
+  touched, and `grep` found no mention of #5832 in any changed file or doc.
+  Fixed three ways: a DEPENDENCY paragraph in `rethProjectionMembers` naming
+  #5832 and stating the bound; a doc bullet deriving both branches explicitly;
+  and cell K, `TestCanonicalNameCollisionMarksWithoutAReth_6722`, whose strict
+  half is the fail-on-revert guard and whose lenient half RECORDS the residual
+  behaviour rather than endorsing it. MUTATION PROOF: relaxing the #5832 gate
+  to a warning on every path (`if opts.lenientIfNameCollision` -> `if true` at
+  the `compiler_uniformgates_routing_rib_rpm.go` call site) reds cell K, and
+  reds NOTHING ELSE — 1 of the 6722 cells failing, which is precisely the
+  justification for adding it: the dependency was unguarded from this side.
+  F2 — a test comment citing a test that does not exist. `zone_propagation_6722_test.go`
+  said a declared `redundancy-group` is what makes `reth1` a RETH, so a config
+  without one is a config where `ge-0/0/1` is not a projection of anything,
+  "pinned by TestUndeclaredParentIsNotAProjection_6722". BOTH halves verified
+  false: measured with the `redundancy-group` line removed, strict compile
+  ACCEPTS and `ge-0/0/1` is still marked (`ResolveReth` resolves a `reth*` onto
+  its member regardless of the group), and `TestUndeclaredParentIsNotAProjection_6722`
+  has exactly one occurrence in the whole tree — that comment. Residue of the
+  removed RG clause, and it contradicted the architecture doc, which gets it
+  right. Rewritten to say why the group is declared (a real bondless-RETH LAN
+  declares one) and what still keys on it (`rethRG`, for the HA flow-cache RG).
+  F3 — `parent != name` described as "what holds the line on the tolerant load /
+  peer-sync path". Measured on the self-parent shape with the clause dropped:
+  `st0` is marked, but `buildInterfaceZoneMap`'s `out[base]` write has already
+  stamped the base row `vpnb`, so the Rust gate `reth_projection &&
+  zone.is_empty()` is FALSE and the row still votes — still fail-closed. The
+  clause is kept (cheap, and correct as the definition of a parent relation),
+  but the sentence now says what it really does — keeps a false fact off the
+  wire — and credits the zone line to the base-row-only stamp plus `out[base]`.
+  F4 — a rejection message asserting what the gate does not know. Measured: all
+  four unit shapes, including `unit 0` with no family and `unit 0 description
+  member-port`, are rejected with a message claiming "Two independently
+  addressed units on one device install competing connected routes and local
+  addresses". Neither of the first two carries an address. The REJECTION is
+  correct (Junos forbids logical units on a reth child — parity), so the
+  message was reworded to lead with the parity rule and treat the addressed
+  case as the consequence guarded against; the asserted fragment the tests
+  match on ("also configures `unit") is unchanged. The doc-comment bullet above
+  the validator got the same correction so the two do not disagree.
+  Validation: `go build ./...` rc=0, `go vet` rc=0, `go test ./...` rc=0 with
+  61 packages ok / 0 FAIL; `cargo test --release --no-fail-fast` rc=0 with 4419
+  passed / 0 failed / 2 ignored. rc captured directly on every leg, never
+  through a pipe — the prior leg's false `BUILD_RC=0` came from `$?` reading
+  `tail`'s status. `shared_cos_lease::v8_epoch_seqlock_snapshot_never_tears_tag_grace`
+  flaked twice during a contended first run; characterised rather than waved
+  off, and the earlier entry's account is now corroborated with a comparison it
+  did not have: 12 INTERLEAVED runs on this branch and on a scratch
+  `origin/master` worktree under the same load gave 12/12 green on BOTH, and
+  the module is byte-identical to master. Load-dependent thread starvation in a
+  liveness precondition, not a regression. No Rust file changed in this round,
+  so no crate-wide `cargo fmt` was run.
+  Advances #6713 / #6722.
+- **File(s)**: pkg/config/compiler_validate_strict_reth_member.go,
+  pkg/dataplane/userspace/interfaces.go,
+  pkg/dataplane/userspace/reth_member_projection_6722_test.go,
+  pkg/dataplane/userspace/zone_propagation_6722_test.go,
+  docs/userspace-dataplane-architecture.md, _Log.md

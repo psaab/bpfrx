@@ -483,14 +483,38 @@ func snapshotLinuxName(cfg *config.Config, ifName string, iface *config.Interfac
 // left is which of a RETH's declared members it picked (`RethToPhysical`'s
 // node-affinity scoring), which is exactly what this comparison asks.
 //
+// DEPENDENCY, stated because it is not local to this file. `snapshotLinuxName`
+// is `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed name and
+// `LinuxIfName(x)` otherwise, so the comparison has a SECOND way to hold: when
+// no RETH is involved at all and the two names merely CANONICALIZE together —
+// `redundant-parent ge-0-0-1` on `ge-0/0/1`, where `/`->`-` makes both
+// `ge-0-0-1`. The deference premise ("a member is an L2 port, the reth owns the
+// L3") does not hold there, because neither side is a reth. What makes that
+// branch unreachable on the commit path is `validateInterfaceNameCollisionStrict`
+// (#5832) — a DIFFERENT gate from `validateRethMemberStrict`, rejecting two
+// distinct names that canonicalize to one device. This predicate's soundness
+// rests on it, so relaxing #5832 reopens this. #5832 is likewise a warning on
+// the tolerant load / peer-sync path, where the shape is therefore admissible:
+// measured, the marked row's empty vote is withheld and the ledger resolves the
+// zone the operator wrote on the OTHER name for that same device — a fail-OPEN
+// delta against master, bounded to a zone the operator did write on that
+// device, on a config that has already emitted the #5832 hijack warning.
+// Pinned by TestCanonicalNameCollisionMarksWithoutAReth_6722.
+//
 // The remaining `parent != name` test is the definition of a parent relation,
 // not a clause excluding a case: nothing is its own redundant parent, and a
 // self-reference makes `ResolveReth` a no-op so the comparison would otherwise
-// be trivially true and silence the interface's own row.
+// be trivially true and report an interface as a projection of ITSELF.
 // `validateRethMemberStrict` (pkg/config/compiler_validate_strict_reth_member.go)
-// rejects that config at commit; this test is what holds the line on the
-// tolerant load / peer-sync path, where that gate is downgraded to a warning
-// (#1960 no-brick).
+// rejects that config at commit; on the tolerant load / peer-sync path, where
+// that gate is downgraded to a warning (#1960 no-brick), this test is what keeps
+// that false fact off the wire. It is NOT what holds the zone line there:
+// measured on the self-parent shape (`st0` self-parenting, zone on `st0.1`),
+// dropping the test marks `st0`, but `buildInterfaceZoneMap`'s `out[base]` write
+// has already stamped the base row `vpnb`, so the Rust gate
+// `reth_projection && zone.is_empty()` is false and the row still votes. The
+// zone line is held by that base-row-only stamp plus the `out[base]` write —
+// see cell J in reth_member_projection_6722_test.go.
 //
 // Keyed by interface name because after `validateRethMemberStrict` a member has
 // exactly ONE row: the gate rejects a member carrying its own logical units, so

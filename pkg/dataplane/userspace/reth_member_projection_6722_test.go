@@ -68,11 +68,19 @@ import (
 //	drop the parent-exists clause                      -> I1/I2 (accepts)
 //	drop the `opts.lenientRethMember` downgrade        -> G/H/I lenient halves
 //	drop `parent != name` from rethProjectionMembers   -> J (self-parent)
+//	relax validateInterfaceNameCollisionStrict (#5832) -> K (strict accepts)
 //
 // B is the OVER-REACH GUARD: it stays green under every one of those, because
 // its config declares no `redundant-parent` at all. C is a BINDING cell despite
 // reading like a guard — it reds with D when the netdev comparison is dropped.
 // The measured cell table is in the commit message.
+//
+// K is the ODD ONE OUT and is here deliberately. The predicate has a second
+// satisfying branch in which no reth appears at all — two names that merely
+// CANONICALIZE onto one device (`ge-0/0/1` / `ge-0-0-1`) — and nothing in this
+// file or in `validateRethMemberStrict` excludes it. `validateInterfaceNameCollisionStrict`
+// (#5832) does. Soundness therefore depends on a gate this work never touched,
+// so K guards that dependency rather than a hunk of this diff.
 
 // A: the reference bondless-RETH LAN. Three rows, one ifindex, and only the
 // member is a projection.
@@ -589,6 +597,81 @@ func TestSelfNamedRedundantParentIsNotAProjectionOnTheLenientPath_6722(t *testin
 				"unzoned (the StableZoneID quarantine blanks Zone after this "+
 				"builder runs)", row.Name)
 		}
+	}
+}
+
+// K: the predicate's OTHER satisfying branch, and the gate that closes it.
+//
+// `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a `reth*`-prefixed
+// name and `LinuxIfName(x)` otherwise, so the parent/child netdev comparison
+// also holds when NO reth is involved and the two names merely canonicalize
+// together: `ge-0/0/1` and `ge-0-0-1` both become `ge-0-0-1`. The deference
+// premise this whole mechanism rests on — a member is an L2 port, the reth owns
+// the L3 — says nothing about that config, because neither side is a reth.
+//
+// What makes the branch unreachable is `validateInterfaceNameCollisionStrict`
+// (#5832), NOT anything in this file or in `validateRethMemberStrict`. That is
+// a real cross-gate dependency, so it gets a cell: the strict half below is the
+// FAIL-ON-REVERT guard. Relax or remove #5832 and the strict assertion reds,
+// which is the signal to revisit `rethProjectionMembers` — not to re-point this
+// test.
+//
+// The lenient half RECORDS rather than endorses. #5832 is a warning on the
+// tolerant load / peer-sync path too, so the shape is admissible there and the
+// marked row's empty vote is withheld: the ledger resolves `lan` onto ifindex
+// 24 where master's row-sourced last-write-wins gave the 0 sentinel. That is a
+// fail-OPEN delta, and it is tolerated on three grounds worth stating so a
+// later reader does not have to re-derive them — it cannot reach the commit
+// path at all, the config has already produced the #5832 hijack warning naming
+// this exact device, and the zone it resolves is one the operator did write on
+// that device rather than an unrelated neighbour's.
+func TestCanonicalNameCollisionMarksWithoutAReth_6722(t *testing.T) {
+	lines := []string{
+		"set interfaces ge-0/0/1 gigether-options redundant-parent ge-0-0-1",
+		"set interfaces ge-0-0-1 unit 0 family inet address 10.0.61.1/24",
+		"set security zones security-zone lan interfaces ge-0-0-1.0",
+	}
+
+	// The strict half: #5832 is what keeps this branch off the commit path.
+	_, err := config.CompileConfig(treeFromSet6722(t, lines))
+	if err == nil {
+		t.Fatalf("strict CompileConfig ACCEPTED two names that canonicalize to one "+
+			"device while one names the other as its redundant-parent. "+
+			"rethProjectionMembers marks the pair, and its soundness argument (the "+
+			"reth owns the L3) does not apply here because neither side is a reth "+
+			"— #5832's collision gate is what makes that unreachable. Config: %v",
+			lines)
+	}
+	if !strings.Contains(err.Error(), "canonicalize to the same Linux device name") {
+		t.Errorf("strict CompileConfig error = %q, want the #5832 canonical-name "+
+			"collision rejection: another validator firing first would leave the "+
+			"dependency this cell exists to guard unmeasured", err)
+	}
+
+	// The lenient half: what the admitted shape actually does.
+	cfg := compileWithStubbedLinks6722(t, lines, map[string]int{"ge-0-0-1": 24}, nil, true)
+	if got := cfg.ResolveReth("ge-0/0/1"); got != "ge-0/0/1" {
+		t.Fatalf("ResolveReth(ge-0/0/1) = %q, want ge-0/0/1: this cell is about the "+
+			"branch where NO reth resolution happens, so an aliasing config here "+
+			"would be measuring the ordinary case instead", got)
+	}
+	member := snapByName6722(t, buildInterfaceSnapshots(cfg), "ge-0/0/1")
+	parent := snapByName6722(t, buildInterfaceSnapshots(cfg), "ge-0-0-1")
+	if member.Ifindex != 24 || parent.Ifindex != 24 {
+		t.Fatalf("ge-0/0/1 ifindex %d, ge-0-0-1 ifindex %d, want both 24: the shared "+
+			"netdev is the whole premise", member.Ifindex, parent.Ifindex)
+	}
+	if !member.RethProjection || member.Zone != "" {
+		t.Errorf("ge-0/0/1 RethProjection = %v Zone = %q, want true and empty. This "+
+			"is the recorded lenient-path behaviour, not an endorsement: a change "+
+			"here means the predicate's satisfying set moved and the #5832 "+
+			"dependency argued in rethProjectionMembers needs re-deriving",
+			member.RethProjection, member.Zone)
+	}
+	if parent.RethProjection || parent.Zone != "lan" {
+		t.Errorf("ge-0-0-1 RethProjection = %v Zone = %q, want false and %q: the row "+
+			"the operator actually zoned is the one whose vote survives",
+			parent.RethProjection, parent.Zone, "lan")
 	}
 }
 

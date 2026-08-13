@@ -1006,6 +1006,31 @@ Scope of the fallback:
   resolve onto `reth1.100`'s netdev. That is not a hole; it is why the answer is
   taken from the resolution rather than from the shape of the operator's string.
 
+  **The predicate's soundness depends on #5832, and that dependency is not
+  local.** `snapshotLinuxName` is `LinuxIfName(ResolveReth(x))` for a
+  `reth*`-prefixed name and `LinuxIfName(x)` otherwise, so reducing the
+  satisfying set gives exactly two branches: the intended one, where
+  `ResolveReth(parent)` really is this interface; and one where **no reth is
+  involved at all** and the two names merely CANONICALIZE together —
+  `set interfaces ge-0/0/1 gigether-options redundant-parent ge-0-0-1`, with
+  `/`->`-` making both `ge-0-0-1`. The deference argument above says nothing
+  about that second branch, because neither side is a reth. What excludes it is
+  `validateInterfaceNameCollisionStrict` (**#5832**) — a different gate from
+  `validateRethMemberStrict`, rejecting two distinct names that canonicalize to
+  one Linux device. Relaxing #5832 reopens this, which is why
+  `TestCanonicalNameCollisionMarksWithoutAReth_6722` asserts the strict
+  rejection as a fail-on-revert guard.
+
+  On the tolerant load / peer-sync path #5832 is a warning too, so the shape is
+  admissible there. Measured: `ge-0/0/1` is marked with an empty zone, `ge-0-0-1`
+  carries `lan`, both on ifindex 24; the marked row's vote is withheld and the
+  ledger resolves `lan` where `origin/master`'s row-sourced last-write-wins gave
+  the 0 sentinel. That is a fail-OPEN delta, accepted on narrow and stated
+  grounds: it cannot reach the commit path, the config has already emitted
+  #5832's hijack warning naming that exact device, and the zone resolved is one
+  the operator did write on it. The same test records that behaviour so a change
+  to it is loud rather than silent.
+
   The cells are pinned in
   `pkg/dataplane/userspace/reth_member_projection_6722_test.go`: the rejections
   in `TestRethMemberWithOwnUnitsIsRejected_6722`,
@@ -1013,8 +1038,10 @@ Scope of the fallback:
   `TestUnconfiguredRedundantParentIsRejected_6722` (each also asserting the
   tolerant path still ADMITS with a warning), the alias comparison in
   `TestPeerNodeRethMemberIsNotAProjection_6722` and
-  `TestRedundantParentThatDoesNotAliasMarksNothing_6722`, and the lenient-path
-  fail-closed backstop in `TestGrandfatheredMemberUnitStillVotes_6722`.
+  `TestRedundantParentThatDoesNotAliasMarksNothing_6722`, the lenient-path
+  fail-closed backstop in `TestGrandfatheredMemberUnitStillVotes_6722`, and the
+  cross-gate #5832 dependency in
+  `TestCanonicalNameCollisionMarksWithoutAReth_6722`.
 
   A `reth*` with no declared `redundancy-group` is no longer a special case
   here. `ResolveReth` resolves it onto its member regardless of the redundancy

@@ -395,12 +395,15 @@ func TestQuarantinedMemberZoneLetsTheRethZoneResolve_6722(t *testing.T) {
 	}
 	lines := []string{
 		"set interfaces ge-0/0/1 gigether-options redundant-parent reth1",
-		// A DECLARED redundancy-group is what makes reth1 a RETH rather than an
-		// interface that merely happens to be named `reth1`. Both this file's
-		// exemption and the adjacent rethRG lookup key on it, so a config
-		// without it is a config where ge-0/0/1 is not a projection of anything
-		// — pinned by TestUndeclaredParentIsNotAProjection_6722. This test is
-		// about the quarantine, not about that distinction, so it declares one.
+		// The redundancy group is declared because a real bondless-RETH LAN
+		// declares one — NOT because the projection mark depends on it. Measured:
+		// drop this line and strict CompileConfig still accepts, and ge-0/0/1 is
+		// still marked, because `ResolveReth` resolves a `reth*` onto its member
+		// regardless of the redundancy group and the predicate IS that
+		// resolution. An earlier `redundancy-group N` clause was removed for
+		// exactly that reason (docs/userspace-dataplane-architecture.md). The
+		// adjacent `rethRG` lookup still keys on the group, for its own purpose:
+		// inheriting the HA flow-cache redundancy group onto member rows.
 		"set interfaces reth1 redundant-ether-options redundancy-group 2",
 		"set interfaces reth1 unit 0 family inet address 10.0.61.1/24",
 		// The MEMBER is explicitly zoned into the doomed zone. That is the whole

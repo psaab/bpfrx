@@ -38,7 +38,10 @@ import (
 //     and every transit flow out of it fails closed against the 0 sentinel —
 //     silently, with a `redundant-parent` line that looks correct.
 //
-//   - A member carrying its OWN logical units. This is the one that fails OPEN.
+//   - A member carrying its OWN logical units. The gate fires on the PRESENCE
+//     of a unit — Junos forbids logical-unit configuration on a reth child
+//     outright, so a family-less `unit 0` is rejected for parity — and an
+//     ADDRESSED unit is the case that fails OPEN.
 //     `ge-0/0/1 unit 0 family inet address 10.9.9.1/30` beside `reth1 unit 0
 //     family inet address 10.0.61.1/24` puts TWO independently addressed L3
 //     units on ONE netdev: both install connected routes and local addresses on
@@ -100,14 +103,24 @@ func validateRethMemberStrict(cfg *Config) error {
 				name, parent, parent, parent)
 		}
 		if unitNum, ok := firstUnitNumber(ifc); ok {
+			// Deliberately says what the gate KNOWS. It fires on the presence of
+			// a logical unit, not on that unit being addressed: `unit 0` with no
+			// family, and `unit 0 description member-port`, are rejected too, and
+			// neither installs a route. The rejection is right for both (Junos
+			// forbids logical-unit configuration on a reth child outright — this
+			// is parity), so the message states the parity rule as the reason and
+			// the addressed case as the consequence it guards against, rather
+			// than asserting an address the config may not carry.
 			return fmt.Errorf(
 				"interface %q is a member of redundant-ethernet interface %q and "+
 					"also configures `unit %d`; a reth member is an L2 port and "+
 					"the reth owns the logical units, addresses and security zone "+
-					"of the shared device. Two independently addressed units on "+
-					"one device install competing connected routes and local "+
-					"addresses while only the reth's carries a zone, so traffic "+
-					"to the member unit's subnet is evaluated in the RETH's zone "+
+					"of the shared device, so Junos does not allow logical-unit "+
+					"configuration on a reth child. Any address on that unit makes "+
+					"it a second, independently addressed L3 interface on the SAME "+
+					"device as the reth's unit — a competing connected route on an "+
+					"ifindex where only the reth's row names a zone, so traffic to "+
+					"the member unit's subnet is evaluated in the RETH's zone "+
 					"— move the unit configuration onto %q",
 				name, parent, unitNum, parent)
 		}
