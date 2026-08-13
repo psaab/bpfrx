@@ -131,6 +131,11 @@ type SessionValue struct {
 	// Do not read the local exactness this field buys as an end-to-end
 	// guarantee: it is exact where this node is the authority, and the clear
 	// path leaves this node. #6975 carries the trace and the fix shape.
+	//
+	// REST is a separate case and is NOT merely approximate: pkg/api
+	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
+	// degrading it to a clear-all, so there is no approximate REST clear to
+	// be wrong about (#6928 review).
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first
@@ -158,9 +163,13 @@ type SessionValue struct {
 	// Because this field is sync-only, the BPF conntrack maps are NOT
 	// registered at sizeof(SessionValue): they use the dedicated on-map ABI
 	// type bpfSessionValue (bpf_session_value.go), which omits Generation and
-	// matches the C/Rust 128-byte layout. Registering at sizeof(SessionValue)
-	// would over-size value_size by 8 bytes and OOB-write the Rust helper's
-	// lookup buffer (#2360). Do NOT mirror Generation into the BPF map.
+	// matches the C/Rust layout — 144 bytes for v4 post-#4983 (128 was the
+	// figure before the #5460 flags widen and this issue's ingress-identity
+	// growth; corrected here, #6928 review). Registering at sizeof(SessionValue)
+	// would over-size value_size and OOB-write the Rust helper's smaller lookup
+	// buffer (#2360). The excess is NOT a fixed 8 bytes either: SessionValue
+	// carries several sync-only trailing fields, so the gap is whatever they sum
+	// to. Do NOT mirror Generation into the BPF map.
 	Generation uint64
 
 	// PolicyCounterIdx is the #3073 1-based handle to the admitting rule's
@@ -342,6 +351,11 @@ type SessionValueV6 struct {
 	// Do not read the local exactness this field buys as an end-to-end
 	// guarantee: it is exact where this node is the authority, and the clear
 	// path leaves this node. #6975 carries the trace and the fix shape.
+	//
+	// REST is a separate case and is NOT merely approximate: pkg/api
+	// sessions.go REJECTS any filtered clear with HTTP 400 rather than
+	// degrading it to a clear-all, so there is no approximate REST clear to
+	// be wrong about (#6928 review).
 	IngressIfindex uint32
 
 	// IngressVlanID is the #4983 ingress 802.1Q VLAN id the session's first

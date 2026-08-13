@@ -52,8 +52,14 @@ pub(crate) struct SessionMetadata {
     ///
     /// `0` means "no ingress identity carried" and is NEVER a valid ifindex.
     /// These populations legitimately carry `0`:
-    ///   - the REVERSE companion — its true ingress is the forward flow's
-    ///     egress interface, which is not resolved at install time (the CLI
+    ///   - the REVERSE companion — the reply's own ingress has not been
+    ///     OBSERVED yet, and routing may be asymmetric, so there is nothing
+    ///     truthful to stamp. (An earlier revision said the forward flow's
+    ///     egress interface "is not resolved at install time". That reason is
+    ///     wrong — the installed decision already carries `egress_ifindex`.
+    ///     The real reason is that the forward egress is a PREDICTION of where
+    ///     the reply will arrive, not an observation of where it did, #6928
+    ///     review.) (the CLI
     ///     never interface-matches a reverse row anyway: every show/clear call
     ///     site skips `IsReverse != 0` first);
     ///   - a PEER-SYNCED session — an ifindex is NODE-LOCAL, so the peer's
@@ -73,12 +79,20 @@ pub(crate) struct SessionMetadata {
     /// which starts from an empty map.
     /// The MISSING-NEIGHBOR seed is NOT among them — it is a published forward
     /// session that outlives the neighbor resolution, so it is stamped from the
-    /// frame's `meta` like the two policy-admitted install sites.
+    /// frame's `meta` like the two other forward install sites. (Those two are
+    /// not both "policy-admitted": the transit install is, but the LocalDelivery
+    /// one also runs for a `JunosHostLocalPolicy::NoMatch` host-bound flow —
+    /// admitted by the zone's host-inbound set with no junos-host policy
+    /// matching at all. #6928 review.)
     /// The Go consumer falls back to the zone approximation for every zero
     /// (never "matches nothing", never "matches everything").
     pub(crate) ingress_ifindex: u32,
     /// #4983: the 802.1Q VLAN id this session's FIRST packet arrived with
-    /// (`UserspaceDpMeta::ingress_vlan_id`; 0 = untagged). Stamped at install
+    /// (`UserspaceDpMeta::ingress_vlan_id`). 0 means "no VLAN id recorded",
+    /// which is USUALLY untagged but is not synonymous with it: a
+    /// priority-tagged frame carries VID 0 with the tag present
+    /// (`afxdp/frame/prop_tests/inspect.rs` covers exactly that shape), so a
+    /// consumer must not infer "no tag" from a zero here (#6928 review). Stamped at install
     /// alongside `ingress_ifindex` and meaningful only with it: the PAIR is
     /// the logical ingress unit, and it is deliberately the same
     /// `{parent ifindex, vlan}` identity the Go side already resolves the

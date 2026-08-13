@@ -89,11 +89,20 @@ fn ingress_identity_snapshot() -> crate::ConfigSnapshot {
         ifindex: INGRESS_LOGICAL_IFINDEX,
         parent_ifindex: INGRESS_PARENT_IFINDEX,
         vlan_id: INGRESS_VLAN_ID as i32,
-        // Same redundancy group as the fixture's other LAN interface so the
-        // shared `txn_ha_state()` placement (RG 1 + RG 2 forwarding-active)
-        // owns this ingress too — an RG the local node does not own resolves
-        // HAInactive and installs nothing.
-        redundancy_group: 2,
+        // RG 1, matching `nat_snapshot`'s reth0.80 — its SIBLING unit on this
+        // same parent. It must match: RG is a BASE-interface property, and the
+        // snapshot builder resolves it once per base and stamps that one value
+        // onto every unit (`pkg/dataplane/userspace/interfaces.go:214-218`
+        // resolves `rg`, `:302` writes it into each unit). Two units of one
+        // parent with DIFFERENT RGs is therefore a shape production cannot
+        // emit. An earlier revision used RG 2 here and justified it as "same
+        // RG as the fixture's other LAN interface" — true of reth1.0, but
+        // reth1.0 is a different base; the unit that constrains this one is
+        // reth0.80 (#6928 review, Codex #9). Behaviour is unchanged either way:
+        // ownership derives from the EGRESS resolution (reth0.80, RG 1) at
+        // `forwarding/ha.rs`, not from the ingress unit's RG, and RG 1 is
+        // forwarding-active in the shared `txn_ha_state()`.
+        redundancy_group: 1,
         hardware_addr: "02:bf:72:00:50:08".to_string(),
         addresses: vec![InterfaceAddressSnapshot {
             family: "inet".to_string(),
@@ -435,8 +444,11 @@ fn local_miss_identity_snapshot() -> crate::ConfigSnapshot {
         ifindex: LOCAL_LOGICAL_IFINDEX,
         parent_ifindex: LOCAL_PARENT_IFINDEX,
         vlan_id: LOCAL_VLAN_ID as i32,
-        // Same RG as the fixture's other LAN units so the shared
-        // `txn_ha_state()` placement owns this ingress too.
+        // RG 2 is producible here BECAUSE this unit is the only one on its
+        // parent (ifindex 7): with no sibling unit there is no base-RG conflict
+        // to create. See the reth0.50 note above for why a differing RG on a
+        // SHARED parent would not be. RG 2 is forwarding-active in the shared
+        // `txn_ha_state()`, so the local node owns this ingress.
         redundancy_group: 2,
         hardware_addr: "02:bf:72:00:70:07".to_string(),
         addresses: vec![InterfaceAddressSnapshot {
