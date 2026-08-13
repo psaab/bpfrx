@@ -1,3 +1,131 @@
+## 2026-08-13 — #6691 round 8b: the version doc still said "why it is at 4", and the round-8 evidence re-measured independently
+
+- **Timestamp**: 2026-08-13 12:40 (fix/5619-ipsec-passthrough-zone-policy)
+- **Action**: Second pass over the round-8 fold. Re-established every load-bearing
+  claim from scratch rather than inheriting it, found one real documentation
+  regression the fold introduced, and widened the mutation matrix from three Go
+  mutations to six.
+- **File(s)**: `docs/userspace-dataplane-architecture.md`, `_Log.md`
+
+  **The doc regression.** The v5 bump left
+  `docs/userspace-dataplane-architecture.md` carrying a section literally headed
+  **"Why it is at 4"** — the SSOT prose explaining what the config-snapshot
+  protocol version means and why it currently holds its value. Bumping the
+  constant to 5 in three places and leaving that heading is exactly the shape
+  this repo's doc-contract rule exists to catch: the next reader reconciling
+  `ProtocolVersion = 5` against a doc that explains version 4 has no way to tell
+  which one is stale. Retitled the #4626/#5488 paragraph to "Why it went to 4"
+  (it is history now, not the current state) and added a **"Why it is at 5"**
+  block carrying the measured reason, plus a paragraph naming
+  `ensureSecureTunnelProtocolLocked` / `ErrSecureTunnelProtocolIncompatible` and
+  its `configHasSecureTunnel` arming predicate alongside the existing #5488 gate
+  description. No code change.
+
+  **B1 re-established independently, not inherited.** The three legs of the
+  queue-collapse argument were each measured here rather than read:
+
+  - an xfrm interface really does have exactly one RX queue. `unshare -rn` with
+    a private sysfs mount, `ip link add name xfrmprobe0 type xfrm dev lo if_id
+    7`: `numrxqueues 1` / `numtxqueues 1`, `/sys/class/net/xfrmprobe0/queues`
+    holds exactly `rx-0` and `tx-0`, and `/sys/class/net/xfrmprobe0/type` is
+    `65534` (ARPHRD_NONE). `lo` as a control shows the same single pair.
+  - BOTH planes count that same sysfs entry, so neither can disagree with the
+    device: `userspaceRXQueueCount` (`interfaces.go:706-724`) reads
+    `/sys/class/net/<if>/queues` and counts `rx-` prefixed dirs;
+    `rx_queue_count` (`planning.rs:666-683`) reads the same path with the same
+    prefix filter.
+  - `replan_bindings_from_candidates` takes the global minimum verbatim:
+    `let queue_count = candidates.iter().map(|(_, rx)| *rx).min().unwrap_or(0)`.
+
+  Corroboration nobody had cited: the SAME function already re-keys a 1-queue
+  VLAN child onto its parent's hardware queue count expressly so it "still
+  cannot collapse the min", naming #3091. The codebase independently treats
+  this exact failure class as a regression — the xfrmi is the same defect
+  through an unnamed door, which is why the exclusion is load-bearing rather
+  than an optimisation.
+
+  **The missing link, and it inverts the review's framing.** The round-8 write-up
+  argued the exclusion is right; it did not establish that MASTER is wrong, and
+  the review leg's charge was specifically that the exclusion "deletes a WORKING
+  inbound policy path". So: does master actually admit the row? Probed the
+  snapshot builder directly for a zoned `bind-interface st0.0` —
+
+      row "st0.0": Zone="vpn" Tunnel=false SecureTunnel=true LocalFabric=""
+      master's binding predicate would ADMIT this row: true
+
+  `Tunnel` is `iface.Tunnel != nil || unit.Tunnel != nil`, the GRE/IPIP `tunnel`
+  stanza — a route-based IPsec unit does not set it, so nothing else in the
+  predicate keeps the row out. Master's `interfaces.go:262` populates `RXQueues`
+  from the same `userspaceRXQueueCount` this branch uses (identical line on both
+  revisions), which on a real box is the xfrmi's 1.
+
+  So the path the exclusion "deletes" is not a working policy path. On master
+  today, an operator who zones a route-based IPsec tunnel silently re-plans
+  every physical interface on the box onto one queue and one worker. That is a
+  live #3091-class regression this PR CLOSES, not one it opens — and it is why
+  the answer to B1 is neither "narrow the exclusion" nor "restore the path", but
+  "the exclusion is correct and the reason on record was the wrong one".
+
+  **The v5 gate is reached from production, not just from its test.**
+  `ensureRequiredSnapshotProtocolLocked` has seven production call sites
+  (`manager_compile.go:292`, `:346`, `:583`; `manager_worker_arm_5134.go:70`;
+  `process_status.go:92`; `manager_overlay.go:180`; `manager_ha.go:631`;
+  `manager_status.go:112`) and `pkg/daemon/daemon_apply.go:413` delegates the
+  commit-abort decision to `IsRequiredProtocolGateError`. A sentinel that no
+  path consults is the recurring failure mode this campaign keeps finding; it
+  is not this one.
+
+  **Mutation matrix — six Go mutations, all RED, each on its intended
+  assertion.** Every mutation applied to a fresh `/dev/shm` copy; the
+  worktree's `git status --porcelain` checksum captured before and after each
+  batch and identical both times, so nothing under test was ever the mutated
+  tree.
+
+  | # | mutation | assertion that went RED |
+  |---|----------|-------------------------|
+  | G1 | unwire `ensureSecureTunnelProtocolLocked` from the dispatcher | `secure_tunnel_protocol_6691_test.go:135` |
+  | G2 | drop the sentinel from `requiredProtocolGateSentinels` | `:142` — gate fires, commit would NOT abort |
+  | G3 | revert Go `ProtocolVersion` 5 → 4 | lockstep parity (`5488_test.go:396`) + `:85` collision + all FOUR spellings |
+  | G4 | `configHasSecureTunnel` always TRUE | `:165` — the no-xfrmi negative control |
+  | G5 | `configHasSecureTunnel` always FALSE | `:135`, `:142` and all four spellings at `:184` |
+  | G6 | gate body inert (`return nil` first) | `:135`, `:142` and all four spellings at `:190` |
+
+  G4 and G5 are new here. They matter because the arming predicate is the one
+  place this gate can fail SILENTLY in either direction — over-arming disarms
+  every operator who has no route-based IPsec at all, under-arming leaves the
+  upgrade it exists to stop wide open — and only the pair binds both.
+
+  **One claim of round 8's own was wrong and is corrected in place.** The
+  round-8 entry below described the `maps_sync.go` → `ingress_exclusions.go`
+  split as moving the predicate and its rationale "verbatim". Checked by
+  extracting `userspaceSkipsIngressInterface` from `bcb5335cc:maps_sync.go` and
+  from the new file and diffing with comments stripped: the EXECUTABLE body is
+  byte-identical, 29 code lines on both revisions, so the "no behaviour change"
+  half of the claim holds. The COMMENT block is not verbatim — it carries the
+  four-call-site correction made in the same commit. A refactor commit that
+  says "verbatim" is asking the next reviewer to skip the diff, so the word is
+  not one to leave standing loosely.
+
+  Full `go build ./...` + `go vet ./...` + `go test ./...` green at this head.
+  Full `cargo test --release` green: exit 0, seven targets, 4402 tests, zero
+  failures.
+
+  **A note on the Rust leg, because the first attempt looked like a red.** The
+  first `cargo test --release` reached 4335 passing tests and then sat in three
+  `afxdp::wg::engine` serial tests for over ten minutes; a direct run of the
+  built binary then reported one failure,
+  `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, panicking on
+  "readers must have validated at least one snapshot (test not vacuous)". Both
+  were box contention — load average was 31 on 16 cores with several concurrent
+  cargo suites. The three wg tests pass in 0.37s in isolation on that same
+  binary, the seqlock test passes 3/3 in isolation, and a second full pass of
+  the same binary was 4278/0. None of the three subsystems (wg engine, shared
+  CoS lease, HA counters) is touched by this branch, and the same
+  one-test-fails pattern is on record for a BASELINE run and for unrelated
+  branches. Recorded rather than dropped: a load-sensitive non-vacuity guard
+  that reds under contention is indistinguishable from a real red at a glance,
+  and the next agent to hit it should not have to re-derive that.
+
 ## 2026-08-13 — #6691 round 8: the exclusion's stated reason could not be established; the real one could
 
 - **Timestamp**: 2026-08-13 10:35 (fix/5619-ipsec-passthrough-zone-policy)
@@ -117,9 +245,15 @@
     `TestSecureTunnelOwnershipPrecedesVlanID` pins the order without arguing it
     is the right one, and names the consequence if it moves.
   - `maps_sync.go` had crossed the 2000-line refactor threshold on comment.
-    `userspaceSkipsIngressInterface` and its ~180 lines of rationale moved
-    verbatim to `ingress_exclusions.go`; the file drops 2130 → 1925, below both
-    the threshold and master's 1953. Pure motion — no signature, behaviour or
+    `userspaceSkipsIngressInterface` and its ~180 lines of rationale moved to
+    `ingress_exclusions.go`; the file drops 2130 → 1925, below both
+    the threshold and master's 1953. (Round 8b correction: an earlier draft of
+    this line said the block moved "verbatim". The EXECUTABLE body did — it is
+    byte-identical across the move, 29 code lines on both revisions, verified by
+    extracting the function from `bcb5335cc:maps_sync.go` and from the new file
+    and diffing with comments stripped. The COMMENT block did not: it carries
+    the call-site correction two bullets above, made in the same commit.) No
+    signature, behaviour or
     caller change. Audit regenerated: `[REFACTOR] 2076` → `[WATCH] 1925`.
 
   Validation: `go build ./...`, `go vet`, full `go test ./...`; full
