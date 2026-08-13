@@ -1005,6 +1005,14 @@ column of the detailed `show` output is resolved from the same identity
 (`sessionIngressIf` in `pkg/cli/cli_show_flow.go`), so the filter and the
 displayed interface name cannot disagree.
 
+That agreement covers the FALLBACK arms too, not just the precise one: when
+the identity is absent or names an interface the running config cannot
+resolve, the column falls back to the ingress zone's interface — and, for a
+zone that binds none, to the zone name — which is the same degradation
+`resolveIngressIfaces` applies. A blank column would be the disagreement,
+since those populations (§ "`0` means no ingress identity carried" below) are
+still selectable by an interface filter through the zone approximation.
+
 **Which surfaces this applies to.** The consumer side landed in the IN-DAEMON
 CLI only (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
 the same session table and still answer an `interface` filter from the ingress

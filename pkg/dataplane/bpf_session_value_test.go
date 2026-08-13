@@ -234,6 +234,20 @@ func TestSessionMapRegisteredAtConntrackABISize(t *testing.T) {
 // -> SessionValue round trip, and Generation is dropped (the BPF map never
 // stores it). The authoritative Generation lives in the Go session table / on
 // the cluster sync wire, so dropping it at the map boundary is correct.
+//
+// What this test can and cannot see, because it is a SYMMETRIC composition
+// (orig.toBPF().sessionValue()): it detects any field a SINGLE direction drops
+// or corrupts, since the other direction cannot put the value back. It is
+// structurally blind to the SAME mistake made in BOTH directions — most
+// obviously a transposition, where toBPF writes v.IngressVlanID into
+// IngressIfindex and sessionValue reads it back out of IngressIfindex into
+// IngressVlanID. That composes to the identity and passes here while every
+// on-map record is written and read at the wrong offset.
+//
+// The two direction-specific tests below cover exactly that residual, and
+// TestBPFSessionValueIngressIdentityOffsets covers the Go-vs-C layout. All
+// three are needed: this one for per-direction loss, the direction tests for
+// symmetric mis-assignment, the offsets test for a struct reorder.
 func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 	orig := SessionValue{
 		State:            3,
@@ -265,6 +279,12 @@ func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 		FibDmac:          [6]byte{1, 2, 3, 4, 5, 6},
 		FibSmac:          [6]byte{6, 5, 4, 3, 2, 1},
 		FibGen:           99,
+		// #4983: NON-ZERO, and deliberately different from each other and from
+		// FibIfindex/FibVlanID above. A zero here would make the round trip
+		// pass with both conversion directions dropping the field entirely
+		// (0 -> absent -> 0), which is exactly what it did before.
+		IngressIfindex:   11,
+		IngressVlanID:    50,
 		Generation:       0x1122334455667788, // sync-only — must NOT survive to the map
 		PolicyCounterIdx: 7,                  // #3301 sync-only — must NOT survive to the map
 	}
@@ -308,6 +328,8 @@ func TestSessionValueBPFRoundTripDropsGeneration(t *testing.T) {
 		FibDmac:          [6]byte{9, 8, 7, 6, 5, 4},
 		FibSmac:          [6]byte{4, 5, 6, 7, 8, 9},
 		FibGen:           77,
+		IngressIfindex:   14, // #4983, non-zero and distinct — see the v4 note
+		IngressVlanID:    80,
 		Generation:       0x8877665544332211,
 		PolicyCounterIdx: 11, // #3301 sync-only — must NOT survive to the map
 	}
@@ -372,5 +394,104 @@ func TestBPFSessionValueIngressIdentityOffsets(t *testing.T) {
 				"CLI filters confidently on the wrong interface",
 				tc.name, tc.got, tc.want)
 		}
+	}
+}
+
+// #4983 conversion-direction fixtures. ifindex and VLAN id are deliberately
+// DIFFERENT numbers within each family, and different across families, so that
+// an assertion which reads the wrong field of the pair fails on the value
+// rather than coincidentally agreeing.
+const (
+	convIngressIfindexV4 uint32 = 11
+	convIngressVlanIDV4  uint16 = 50
+	convIngressIfindexV6 uint32 = 14
+	convIngressVlanIDV6  uint16 = 80
+)
+
+// TestSessionValueToBPFCarriesIngressIdentity pins the WRITE direction on its
+// own: SessionValue -> bpfSessionValue must place the #4983 ingress identity
+// into the matching on-map fields, for both address families.
+//
+// Split out from the round trip deliberately. The round trip composes both
+// directions, so it passes whenever the two agree — including when they agree
+// on the WRONG field. Asserting on the intermediate bpf value is the only way
+// to state "toBPF puts the ifindex in the ifindex slot".
+//
+// RED on revert: delete `IngressIfindex: v.IngressIfindex` (or the VlanID line)
+// from either toBPF in bpf_session_value.go and the corresponding case fails,
+// naming the field and the family.
+func TestSessionValueToBPFCarriesIngressIdentity(t *testing.T) {
+	gotV4 := SessionValue{
+		IngressIfindex: convIngressIfindexV4,
+		IngressVlanID:  convIngressVlanIDV4,
+	}.toBPF()
+	if gotV4.IngressIfindex != convIngressIfindexV4 {
+		t.Errorf("v4 toBPF().IngressIfindex = %d, want %d — the ifindex slot of the "+
+			"on-map record does not carry the session's ingress ifindex (dropped, "+
+			"or written from the wrong source field), so the CLI reads a binding "+
+			"the packet never arrived on, or none at all (#4983)",
+			gotV4.IngressIfindex, convIngressIfindexV4)
+	}
+	if gotV4.IngressVlanID != convIngressVlanIDV4 {
+		t.Errorf("v4 toBPF().IngressVlanID = %d, want %d — without the VLAN half "+
+			"two units of one trunk NIC are indistinguishable on the map (#4983)",
+			gotV4.IngressVlanID, convIngressVlanIDV4)
+	}
+
+	gotV6 := SessionValueV6{
+		IngressIfindex: convIngressIfindexV6,
+		IngressVlanID:  convIngressVlanIDV6,
+	}.toBPF()
+	if gotV6.IngressIfindex != convIngressIfindexV6 {
+		t.Errorf("v6 toBPF().IngressIfindex = %d, want %d (#4983)",
+			gotV6.IngressIfindex, convIngressIfindexV6)
+	}
+	if gotV6.IngressVlanID != convIngressVlanIDV6 {
+		t.Errorf("v6 toBPF().IngressVlanID = %d, want %d (#4983)",
+			gotV6.IngressVlanID, convIngressVlanIDV6)
+	}
+}
+
+// TestBPFSessionValueLiftsIngressIdentity pins the READ direction on its own:
+// an on-map entry that already carries the #4983 identity must surface it on
+// the Go SessionValue the CLI and the HA sync path read.
+//
+// The fixture is a bpfSessionValue built DIRECTLY rather than produced by
+// toBPF. Feeding this direction from the other one would reintroduce the
+// symmetry the round trip already has, and the point of this test is to
+// observe the lift against a value toBPF never touched — which is the real
+// case: the record was written by the Rust helper, not by Go.
+//
+// RED on revert: delete `IngressIfindex: v.IngressIfindex` (or the VlanID
+// line) from either sessionValue in bpf_session_value.go.
+func TestBPFSessionValueLiftsIngressIdentity(t *testing.T) {
+	gotV4 := bpfSessionValue{
+		IngressIfindex: convIngressIfindexV4,
+		IngressVlanID:  convIngressVlanIDV4,
+	}.sessionValue()
+	if gotV4.IngressIfindex != convIngressIfindexV4 {
+		t.Errorf("v4 sessionValue().IngressIfindex = %d, want %d — a record the "+
+			"helper wrote WITH an ingress binding is lifted with the wrong value "+
+			"in the ifindex field (dropped, or read from the wrong on-map field), "+
+			"so the exact interface filter either points at the wrong NIC or "+
+			"silently degrades to the zone approximation for every live "+
+			"session (#4983)", gotV4.IngressIfindex, convIngressIfindexV4)
+	}
+	if gotV4.IngressVlanID != convIngressVlanIDV4 {
+		t.Errorf("v4 sessionValue().IngressVlanID = %d, want %d (#4983)",
+			gotV4.IngressVlanID, convIngressVlanIDV4)
+	}
+
+	gotV6 := bpfSessionValueV6{
+		IngressIfindex: convIngressIfindexV6,
+		IngressVlanID:  convIngressVlanIDV6,
+	}.sessionValue()
+	if gotV6.IngressIfindex != convIngressIfindexV6 {
+		t.Errorf("v6 sessionValue().IngressIfindex = %d, want %d (#4983)",
+			gotV6.IngressIfindex, convIngressIfindexV6)
+	}
+	if gotV6.IngressVlanID != convIngressVlanIDV6 {
+		t.Errorf("v6 sessionValue().IngressVlanID = %d, want %d (#4983)",
+			gotV6.IngressVlanID, convIngressVlanIDV6)
 	}
 }

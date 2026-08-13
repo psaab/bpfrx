@@ -71302,3 +71302,131 @@ Every RED above is an assertion failure, not a build break.
   = 140, want 136` and its three siblings, each naming the transposition.
   `go build ./...` 0; `go vet ./pkg/dataplane/... ./pkg/cli/...` 0;
   `go test ./pkg/dataplane/... ./pkg/cli/...` all packages ok.
+
+- **Timestamp**: 2026-08-12
+- **Action**: #6928 (#4983) round 3 — close the last three Codex blockers (#5,
+  #8, #7). Every one was CONFIRMED by running the reviewer's own mutation
+  before anything was written; one of the three is confirmed only at a
+  narrower scope than it was filed, and that correction is recorded below
+  rather than folded silently.
+
+  **#5 — both Go conversion directions are deletable with tests green.**
+  CONFIRMED: deleting all four `IngressIfindex`/`IngressVlanID` assignment
+  pairs from `toBPF`/`sessionValue` (v4 and v6) left
+  `go test ./pkg/dataplane/` **ok**. Cause is exactly as filed —
+  `TestSessionValueBPFRoundTripDropsGeneration` left both identity fields at
+  0, so `0 -> absent -> 0` compares equal.
+
+  Fixed in two parts, because the round-trip fixture alone does not cover the
+  residual. (a) The round-trip fixture now carries non-zero, mutually distinct
+  values (v4 11/50, v6 14/80). (b) Two new direction-specific tests assert on
+  the intermediate value: `TestSessionValueToBPFCarriesIngressIdentity`
+  (SessionValue -> bpfSessionValue) and
+  `TestBPFSessionValueLiftsIngressIdentity` (bpfSessionValue built DIRECTLY,
+  not via toBPF, -> SessionValue). The direct construction is deliberate: the
+  real case is a record the Rust helper wrote, which Go's writer never touched.
+
+  **#8 — the claimed egress-FIB control cannot fire.** CONFIRMED AS FILED AT
+  SUBTEST SCOPE, REFUTED AT PACKAGE SCOPE, and the distinction matters. With
+  `resolveEgressIfaces`' precise arm deleted,
+  `TestIngressIdentityDoesNotDisturbEgressMatching4983` and all three of its
+  subtests still **PASS** — the fixture's `FibIfindex=12` resolves to
+  `ge-0/0/1`, which was the untrust zone's only member, so precise answer and
+  zone fallback were the same one-element list. But the package does NOT stay
+  green: the PRE-EXISTING
+  `TestMatchesV4_InterfaceFilter/matches_egress_via_FIB_lookup`
+  (`session_display_test.go:163`) FAILS, because its FIB name `ge-0/0/2` is
+  outside the egress zone. So the arm was never unbound; what was unbound is
+  its NARROWING half, and what was wrong is this PR's own subtest presenting
+  as a control it could not be.
+
+  Both fixed. The untrust zone now binds two interfaces (`ge-0/0/1`,
+  `ge-0/0/4`), so the zone fallback is a strict superset of any FIB-precise
+  answer, and `TestEgressFIBIdentityDoesNotMatchEgressZoneSibling4983` asserts
+  the sibling is EXCLUDED (v4 + v6) with a built-in fixture control: with
+  `FibIfindex=0` the same session must still reach `ge-0/0/4` through the
+  fallback, or the exclusion would be explained by unreachability instead of
+  narrowing. The old subtest keeps its over-reach charter and now says so, and
+  names both real bindings.
+
+  Producibility was checked before the shape was relied on, per the standing
+  warning: `populateIfaceMaps` does
+  `zoneIfaces[zid] = append(zoneIfaces[zid], zone.Interfaces...)` and #4792
+  exists precisely because a zone binds more than one interface. Each member
+  is a separate NIC with its own `unit 0` and its own ifindex; no
+  redundancy-group or reth property is involved, so there is no
+  base-interface constraint to violate (unlike the retired `reth0.50` at RG2
+  beside `reth0.80` at RG1).
+
+  **#7 — the display fallback is unguarded.** CONFIRMED, and wider than
+  filed: replacing `sessionIngressIf`'s zone fallback with `return ""` left
+  the ENTIRE `pkg/cli` package green, not just the two added display tests.
+  Added `TestShowFlowSessionIngressIfColumnFallsBackWhenIdentityUnusable4983`
+  covering the three ways the resolver is asked — identity absent, identity
+  present but unnameable, and zone binding no interfaces — the first two
+  expecting the zone's interface and the third the zone NAME. The fixture
+  builder is parameterised (`ingressIfColumnCLIWith`) so one config drives the
+  precise arm and every fallback arm; the empty `quarantine` zone goes through
+  the real parser and commit, and the builder asserts it survived with zero
+  interfaces, so the last-resort arm is reachable by construction rather than
+  by assumption.
+
+  README: the column's FALLBACK symmetry with the filter is now stated. It
+  previously described only the precise arm, which reads as if a blank column
+  were acceptable for the populations that carry no identity — the exact
+  behaviour the new tests forbid.
+- **File(s)**: pkg/dataplane/bpf_session_value_test.go,
+  pkg/cli/session_filter_ingress_identity_4983_test.go,
+  pkg/cli/cli_show_flow_ingress_if_4983_test.go,
+  userspace-dp/src/session/README.md, _Log.md
+- **Validation**: no production code changed in this round — all three
+  findings were binding/claim gaps. Every cell below ran `go vet` first and
+  got rc 0, so each RED is an assertion failure and not a build break.
+
+  #5 matrix (4 tests x 5 cells). `transpose` is the negative control the
+  finding asked for: `toBPF` writes `uint32(v.IngressVlanID)` and
+  `sessionValue` reads it back symmetrically, the "identical mistake in both
+  directions" a round trip composes away.
+
+  | cell | round trip | offsets | toBPF | lift |
+  |---|---|---|---|---|
+  | baseline | PASS | PASS | PASS | PASS |
+  | delete both directions | FAIL | PASS | FAIL | FAIL |
+  | **transpose both directions** | **PASS** | PASS | **FAIL** | **FAIL** |
+  | delete v4 toBPF only | FAIL | PASS | FAIL | PASS |
+  | delete v4 sessionValue only | FAIL | PASS | PASS | FAIL |
+
+  The transpose row is the whole point: the round trip is structurally blind
+  to it while both direction tests RED (`v4 toBPF().IngressIfindex = 50, want
+  11`). Rows 4 and 5 show each direction test binds its OWN direction. The
+  offsets guard is PASS in every row — it pins layout, not assignment, so the
+  three tests are orthogonal rather than overlapping.
+
+  #8 mutation: delete `resolveEgressIfaces`' precise arm.
+  `TestEgressFIBIdentityDoesNotMatchEgressZoneSibling4983` **FAILS** —
+  "session egresses ge-0/0/1 per its FIB result but matched a filter for
+  ge-0/0/4, the OTHER interface of the same egress zone" plus the v6 sibling
+  assertion — while `TestIngressIdentityDoesNotDisturbEgressMatching4983`
+  stays PASS on all three subtests, which is the recorded evidence that it is
+  an over-reach guard and not a control.
+
+  #7 matrix. Cell A: whole fallback -> `""`. All three new subtests FAIL;
+  `TestShowFlowSessionIngressIfColumnUsesRecordedIdentity4983` and
+  `TestShowFlowSessionEgressIfColumnUnchanged4983` stay PASS — the built-in
+  control showing the new tests reach an arm the existing ones never touch.
+  Cell B: only the final `return zoneName` -> `""`, keeping the zoneIfaces
+  arm. ONLY the zone-with-no-interfaces subtest FAILS; the other two PASS. So
+  each arm is separately bound, not covered as a block.
+
+  A process note worth keeping: the first #5 matrix run was VOID and was
+  discarded, not reported. The probe helper's `restore` branch sat below its
+  own occurrence-count assert, so the assert tripped and the restore never
+  ran; cells 2-4 executed against cell 1's still-mutated tree and printed
+  four identical rows. Four cells agreeing exactly is the tell. Fixed by
+  hoisting `restore` above the assert and scoping the cleanliness check to
+  the mutated paths, then re-running from a verified-clean baseline.
+
+  Gates: `go build ./...` rc 0; `go vet ./...` rc 0;
+  `go test ./pkg/dataplane/ ./pkg/cli/ -count=2` both ok;
+  `go test ./pkg/refactoraudit/` ok (three test files grew).
+  `git status --short` shows only the four files above.
