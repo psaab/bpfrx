@@ -478,6 +478,13 @@ func mergeLeafListInto(dst, src *Node) {
 		seen[v] = true
 		if dst.IsLeaf {
 			dst.Keys = append(dst.Keys, v)
+			// #6673: the inherited member arrives as a VALUE with no authored
+			// token of its own on dst. Extend the mask only when dst already
+			// carries one, so the length invariant holds and the union never
+			// upgrades an inherited value into an authored quote.
+			if len(dst.KeysQuoted) == len(dst.Keys)-1 {
+				dst.KeysQuoted = append(dst.KeysQuoted, false)
+			}
 		} else {
 			dst.Children = append(dst.Children, &Node{
 				Keys:          []string{v},

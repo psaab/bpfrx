@@ -87,6 +87,13 @@ make test-cluster-lock-lib # Self-test the #1875 lock + #4020 destructive-smoke
 make test-cluster-env-lib # Self-test the cluster-env resolver (#5024): $FW0/
                      #   $FW1/$CLUSTER_LAN_HOST derive from each env's VM0/VM1/
                      #   LAN_HOST and get INCUS_REMOTE-qualified (no cluster)
+make test-newflow-ceiling-lib # Self-test the #4800 connection-rate analysis
+                     #   layer (synthetic snapshot pairs -> new-flows/sec +
+                     #   which contention site saturated) and the newflow-gen
+                     #   generator crate, which lives outside the dataplane
+                     #   workspaces so root `cargo test` does not reach it.
+                     #   Hermetic — no cluster. See
+                     #   docs/userspace-newflow-ceiling.md
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
 make test-logs       # journalctl -u xpfd -n 50

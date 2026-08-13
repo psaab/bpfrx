@@ -39,6 +39,10 @@ pub(crate) fn source_nat_pool_statuses(rules: &[SourceNatRule]) -> Vec<SourceNat
                 allocations_total: snap.allocations_total,
                 reuses_total: snap.reuses_total,
                 exhaustion_total: snap.exhaustion_total,
+                // #4800: residual map-mutex contention for the new-flow
+                // ceiling harness.
+                live_lock_acquisitions_total: snap.live_lock_acquisitions_total,
+                live_lock_contended_total: snap.live_lock_contended_total,
             }
         })
         .collect()
