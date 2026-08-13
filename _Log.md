@@ -718,6 +718,162 @@ control-plane only, no dataplane artifact.
   `pkg/config/compiler_validate_warn_routing.go`,
   `pkg/config/parser_routing_test.go`, `docs/feature-gaps.md`,
   `docs/feature-coverage.md`, `_Log.md`
+## 2026-08-12 — #6706 round 11: the tolerant packed-login path was an RBAC hole, and five shipped claims were false
+
+- **Timestamp**: 2026-08-12 (fold/6706-rbac-identity, PR #6706)
+- **Action**: verified every Codex DO-NOT-MERGE finding BY RUNNING IT (Codex
+  could not run tests at all — its `go test` died on a read-only `/tmp`, so its
+  whole RED/GREEN ledger was analysis); fixed the one real runtime hole plus a
+  real test-analyzer gap; corrected seven false claims across code and docs.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler.go,
+  pkg/config/compiler_system_login_gates.go, pkg/config/testdata/golden_4406.json,
+  pkg/daemon/cli_rbac.go, pkg/daemon/daemon_run.go, pkg/osident/osident.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/config/compiler_system_login_packed_6662_test.go,
+  pkg/daemon/cli_rbac_dropped_login_6706_test.go, docs/system-login.md,
+  docs/config-schema.md, _Log.md
+
+BASELINE FIRST. The suite is GREEN at the PR head (9c2115096) across osident,
+cli, daemon, config, configstore and cmd/cli. Codex never established that, so
+nothing in its report distinguished "this assertion fails" from "no assertion
+ran".
+
+RUNTIME HOLE (the only one, and it is real). A `system login` path packed onto
+an ancestor statement line compiles the whole stanza away. Measured at the head:
+
+    system login user alice class ops;   -> strict REJECTED | lenient System.Login = NIL
+    system { login user alice class ops; } -> strict REJECTED | lenient Login = non-nil, EMPTY
+    system { login; }                    -> ACCEPTED | Login = NON-NIL (0 users)
+    system login;                        -> ACCEPTED | Login = NIL
+
+Strict commit rejects the first two, so an operator typing them never gets
+there. The TOLERANT ingress does not: Store.Load at boot and Store.SyncApply
+from a peer downgrade the finding to a warning and KEEP the config (#1960
+no-brick). `applyCLILoginClass` then took its `cfg.System.Login == nil` early
+return, so SetUserClass was never called and the shell ran with an EMPTY class
+— pkg/cli's legacy allow-everything mode: every command permitted and
+showConfigRedacted false, so IKE PSKs, SNMP communities and authentication-keys
+render in CLEARTEXT. On a config that reads as restrictive. Driven end to end
+and confirmed: `SetUserClass called=false class=""`.
+
+The last two rows are the second half. `system { login; }` and `system login;`
+are the SAME text in two spellings and they disagree — nested denies every
+non-root caller, packed permits everyone. The gate stays silent on that prefix
+on purpose (rejecting it would reject config master accepts), but its stated
+justification, "inert in both spellings", was false.
+
+FIX. `Config.System.LoginDroppedByPacking` carries the one bit the daemon was
+missing: "a `system login` path was AUTHORED but did not compile", which is what
+separates a deployment that never configured RBAC from one whose RBAC was
+dropped — both of which arrive as `Login == nil`. It is set by
+`loginPathPackedAnywhere`, deliberately BROADER than the reporting gate so it
+covers the short prefixes too, and `applyCLILoginClass` resolves through
+`ResolveLoginClass` instead of returning when it is set. Non-root callers get
+`unauthorized`; uid 0 keeps the console lifeline; a config with no `system
+login` at all is untouched. No new commit rejection: reporting and runtime
+posture are separate decisions and only the second one changed.
+
+The golden behaviour-preservation baseline (golden_4406.json) moved by exactly
+18 lines, every one of them `"LoginDroppedByPacking": false`, with zero
+deletions and zero changed values.
+
+CORRECTION (#6706 review r11). An earlier revision of this paragraph read "the
+golden itself is the proof that the flag defaults false and changes nothing for
+existing configuration". The second half of that was FALSE, and it is the kind
+of sentence a maintainer would read as "no operator can be affected". Eighteen
+false-valued fixtures prove exactly eighteen fixtures default false; they say
+nothing about configurations outside the golden. Behaviour DOES change for
+existing accepted configuration:
+
+    system login;        (packed, names no user and no class)
+
+commits clean today with no warning — the reporting gate deliberately stays
+silent for prefixes that name nobody — and now sets the flag, so
+`applyCLILoginClass` refuses the legacy unset-class mode and every non-root
+caller is stamped `unauthorized`. Measured through the real daemon path:
+`SetUserClass called=true class="unauthorized"`; the same config with no
+`login` token at all gives `called=false`, so the flag is the whole difference.
+
+That change is DELIBERATE and is the direction this PR aligns on: the nested
+spelling `system { login; }` already denied (it compiles a non-nil but empty
+LoginConfig, so `ResolveLoginClass` returns ClassUnidentified — the flag plays
+no part), so marking the packed spelling makes the two spellings of identical
+text agree. Whether a content-free `system login` should deny at ALL, in either
+spelling, is a separate open question filed as #6972; it is deliberately not
+decided here, because the two candidate answers both reach outside this diff
+(permitting requires changing the nested empty-stanza path, pre-existing #6662;
+rejecting at commit would refuse configs that commit clean today, against the
+#1960 no-brick rule).
+
+TEST-ANALYZER GAP (Codex was right, and I proved it by mutating production).
+`TestSetUserClassCallersResolveThroughTheSharedResolver_6701` claims the class
+written is "the VALUE cli.ResolveLoginClass returned". Inserting
+`class = "super-user"` between the resolver call and the SetUserClass call in
+applyCLILoginClass — the #6701 defect verbatim — left BOTH repository-facing
+canaries GREEN, because the argument identifier had still been assigned from the
+resolver at some point. The analyzer now un-binds an identifier that is
+reassigned from a non-resolver expression at a position after the assignment
+that bound it; the same production mutation is now caught by name. Position
+rather than "any assignment" so the legitimate `class := "unauthorized"`
+pre-initialisation is not falsely rejected — three synthetic discriminator rows
+pin both directions, including that control.
+
+TEST ROLE LABELS, measured rather than assumed. Disabling
+`validateLoginPackedStatementsAST` entirely partitions the packed-test file in
+one run: thirteen tests go RED (they bind the gate) and six stay GREEN. The six
+are positive controls and are now labelled as such IN THE FILE, with the
+measurement that establishes it, rather than counted as gate coverage. Same for
+the canary file: exactly two of its six tests are repository-facing; the other
+four run the analyzer over a synthetic `const src` and cannot observe a change
+to pkg/daemon or cmd/cli at all. Nothing was deleted.
+
+The subtest at compiler_system_login_packed_6662_test.go:1204 was the worst of
+them — a positive control whose comment asserted the FALSE permissive invariant
+above ("compile to nothing in BOTH spellings"). Its accept assertion is correct
+and stands; the rationale is replaced by assertions of the actual divergence in
+both directions, plus the flag and a negative control for it.
+
+CLAIM CORRECTIONS, all verified false by measurement first:
+
+  - osident.go "pkg/cli fails closed on both" — false at uid 0. All three
+    unresolved Reasons (ambiguous, no row, unreadable) resolve uid 0 to
+    `super-user` while `user toor class read-only` is configured.
+  - osident.go "a narrowing and never a promotion" — false at uid 0, same
+    mechanism.
+  - osident.go IsRoot "never to OVERRIDE an explicit configured class" — the
+    default does not override a class that MATCHED, but when the lookup fails
+    there is no name to match with, so an explicit class written for an alias is
+    not applied and the caller lands on super-user. Indistinguishable from an
+    override from the operator's side. The BEHAVIOUR is deliberate and already
+    documented honestly in identity.go decision 1; only osident.go contradicted
+    it.
+  - daemon_run.go "the default is the restrictive class, not super-user" — two
+    of three outcomes. The third, an unset class, is more permissive than
+    super-user.
+  - docs/system-login.md "not an escalation path: changing `system login`
+    requires `configure`, which none of the restricted classes hold" — the
+    premise is false for CUSTOM classes. Measured: a session bound to a custom
+    class holding `[view configure]` is denied `request system reboot` with
+    showConfigRedacted true; after that same session commits
+    `permissions all` on its own class, both flip — allowed, and secrets in
+    cleartext — with no re-login. Only the class NAME is session-bound;
+    `resolveClassPerms` reads the ACTIVE config on every check. Replaced with
+    the four-row asymmetry table.
+  - docs/system-login.md "The CLI's class comes from the OS credential" — scoped
+    to the in-process console shell. The remote `cli` has no class at all; its
+    credential only renders the prompt and the gRPC listener has no
+    per-principal auth (#5278). The doc contradicted its own Scope paragraph.
+  - docs/system-login.md + docs/config-schema.md "declares nothing in either
+    spelling" — the measured divergence above.
+
+Validation: three mutations, three scoped RED signatures — the daemon branch
+reverted (4 rows red, controls green), the detector narrowed to the reportable
+shapes (ONLY the two short-prefix rows red), and the flag never set (red in both
+pkg/config and pkg/daemon). Plus the production-reassignment mutation, GREEN
+before the analyzer fix and RED after. go build rc=0, go vet rc=0, and the FULL
+`go test ./...` rc=0 with ZERO failures. No cluster tooling: control-plane only,
+no dataplane artifact.
+
 ## 2026-08-06 — #4555 round 10: the over-limit refusal was conditional on policy
 
 - **Timestamp**: 2026-08-06 (fix/4555-ext-hdr-parity, PR #6655)
@@ -75310,3 +75466,1053 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   check that the tree is intact. The `is_reverse` gating claim was re-verified
   by reading `shared_ops.rs` at this SHA rather than carried from an earlier
   round.
+
+## 2026-08-01
+
+- **Timestamp**: 2026-08-01
+- **Action**: RBAC identity + `system login` packed-body gates (#6701, #6662).
+  (1) #6701: the in-process CLI decided WHICH configured user you are from
+  `os.Getenv("USER")` and handed `super-user` on a non-match. Since #5278
+  provisions every login-class user with a real shell account, a
+  `class read-only` operator ran `USER=nobody xpf` — or unset it — and got the
+  highest class; the `!found` branch also promoted any OS account merely
+  present on the box. Added `pkg/osident` (real uid -> passwd, stdlib-only leaf
+  package), `cli.ResolveLoginClass` (fail-closed to `unauthorized`, an
+  empty-but-PRESENT permission set, with a Junos-parity uid-0 default that an
+  explicit `user root class <c>` overrides), and `daemon.applyCLILoginClass`.
+  The empty-string class stays the legacy no-RBAC allow-everything mode and is
+  reached only when there is no `system login` stanza at all. (2) #6662: a
+  packed `user alice class ops;` / `class ops permissions [ ... ];` compiled an
+  EMPTY object with a clean commit — namedInstances leaves the body on Keys and
+  the login compiler walks .Children. An empty class IS the legacy
+  allow-everything shortcut, and the `deny-commands` MORE-PERMISSIVE advisory is
+  guarded on `DenyCommands != ""`, so the bug disabled the guard by dropping the
+  field the guard reads. Added `validateLoginPackedStatementsAST` (strict at
+  commit, warn on the tolerant path) covering `login class`/`login user` at the
+  instance line plus inline `authentication` one level down. Flat-set is
+  unaffected and guarded. (3) Sibling found sweeping the #6701 fail-open: a
+  custom `class super-user { permissions view; }` is INERT (resolveClassPerms
+  consults the built-in table first) while the advisory reports the narrowing as
+  applied — added `validateLoginClassShadowsBuiltinAST`. (4) Structural (not
+  behavioural) canaries: no production code may read `$USER`/`$LOGNAME` for
+  identity; each of the three sites must CALL `osident.Current()` (an equivalent
+  inline copy fails); `SetUserClass` has one allowlisted caller. Each canary
+  ships a synthetic detector proving it is not vacuous.
+- **File(s)**: pkg/osident/osident.go, pkg/osident/osident_test.go,
+  pkg/osident/user_env_canary_test.go, pkg/osident/adoption_canary_test.go,
+  pkg/cli/identity.go, pkg/cli/identity_6701_test.go, pkg/cli/cli.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/daemon/cli_rbac.go,
+  pkg/daemon/cli_rbac_6701_test.go, pkg/daemon/daemon_run.go,
+  cmd/cli/main.go, cmd/cli/identity_6701_test.go,
+  pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go,
+  pkg/config/compiler_opts.go, pkg/config/compiler_prewalk.go,
+  docs/system-login.md, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-01 (round 2)
+- **Action**: #6706 self-audit against the over-reach / precedence vectors.
+  Found and fixed a regression of my own (uid 0 LISTED WITH NO CLASS resolved to
+  `unauthorized`, demoting the console root shell on an ordinary additive
+  `user root authentication ssh-ed25519` stanza — a lockout of the lifeline);
+  a permissive-direction miss (uid 0 resolving through a passwd alias such as
+  `toor` silently skipped an explicit `user root class <c>`); and a VACUOUS test
+  of my own (`TestUnauthorizedClassCannotBeWidened_6701` built a Config by hand
+  with a nil store, so resolveClassPerms never read it — it stayed GREEN when
+  built-in precedence was inverted). The vacuous test was found by mutation
+  M15, not by reading; rewritten to drive Store.SyncApply (the real tolerant
+  ingress) with a premise check on the compiled struct. Also verified
+  apply-groups coverage (the gate runs post-expansion; applied bodies rejected,
+  nested still compiles) and corrected an overclaimed scope note: the
+  unapplied-group assertion holds STRUCTURALLY (ExpandGroups deletes the groups
+  stanza before the gate runs) and is not mutation-bound, so it is now labelled
+  documentation rather than a guard.
+- **File(s)**: pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
+  pkg/config/compiler_system_login_packed_6662_test.go, docs/system-login.md,
+  _Log.md
+
+- **Timestamp**: 2026-08-01 (round 3 — independent-review folds)
+- **Action**: #6706 folds. MINOR-2: nothing bound the daemon to the shared
+  resolver — mutation M15 inlined a faithful copy into applyCLILoginClass and
+  the WHOLE suite stayed green. Added a structural canary (every SetUserClass
+  writer must CALL cli.ResolveLoginClass) with a synthetic detector; proved it
+  reds on an inline copy while pkg/daemon + pkg/osident behavioural tests stay
+  GREEN. MINOR-4: the completeness drift guard skipped every schema node with
+  args != 0 — guard scope narrower than the claim. Widened to every
+  children-bearing node at any arity, which required the gate to know each
+  statement's arity (an args-bearing block carries its arg on Keys in the
+  CORRECT nested spelling, so `len(Keys) > 1` would reject the very form the
+  gate accepts); loginBlockOnlyStatements now records arity and a guard asserts
+  it equals the schema's. MINOR-1: the id.Resolved() test in candidateNames is
+  the ONLY protection against an unidentifiable caller matching a configured
+  user, and `system login user "" { class super-user; }` compiles CLEAN
+  (measured). Bound it, and separated PROTECTION from MESSAGE — mutation showed
+  the review's cited line (!id.Resolved() in ResolveLoginClass) selects only the
+  denial wording. MAJOR-1 was verified FALSE at ac5c47639 by the coordinator
+  (already closed by the round-2 fix) and left untouched. MINOR-3 (uid-collision
+  surface) recorded in the PR body as an accepted consequence. OBS-2: verified
+  firsthand that pkg/cli.New has ONE caller gated on isInteractive() and that
+  pkg/grpcapi + pkg/api contain ZERO permission checks; rewrote the PR body to
+  stop claiming a CLI RBAC boundary. Did NOT file a new issue for the
+  enforcement gap — #5278, #5561 and #6660 already cover it.
+- **File(s)**: pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go, _Log.md
+
+- **Timestamp**: 2026-08-01 (round 4 — independent Codex review folds)
+- **Action**: #6706 folds. BLOCKER-A (identity): production builds are
+  `CGO_ENABLED=0`, where `os/user.LookupId` returns the cached `user.Current()`
+  and pure-Go `current()` FABRICATES a user from `$USER` + `$HOME` with a nil
+  error whenever the passwd lookup fails — so `USER=admin HOME=/tmp cli` on a
+  box whose uid has no passwd row resolved to `admin`, reopening #6701 one layer
+  below the audited call sites. Verified firsthand in the Go 1.24 source
+  (lookup.go:48, lookup_stubs.go:23) and reproduced. Replaced the lookup with a
+  direct, environment-free `/etc/passwd` scan (equivalent to what pure-Go
+  `os/user` reads under the shipped build, minus the fallback) plus an
+  `os/user`-import canary. BLOCKER-B (gates): both login gates ran POST group
+  expansion on the single local view, so `groups node1 { system login ... }` +
+  `apply-groups "${node}"` committed green on node 0 and reached the peer only
+  through the lenient `Store.SyncApply`, live and never strict-checked. Moved
+  both gates PRE-expansion as both-node unions, following the #5878/#5879/#6178
+  precedent (the AST-layer analogue of the #5876 peer-effective SNAT replay).
+  MAJOR (duplicate uids): an ambiguous uid now fails closed with its own
+  Reason — refused the "already a compromised host" argument, since it is
+  escalation between two legitimate accounts; uid 0 stays exempt so an aliased
+  root keeps the console. MINOR-4: the canary predicate only required both
+  symbol names in one function — replaced with a real dataflow check (the
+  resolver's result must be the setter's argument) plus method-value detection,
+  and widened both canary walks from pkg/+cmd/ to the module root. MINOR-5:
+  corrected the packed-user consequence text (post-#6701 it fails closed, not
+  allow-all), and rendered every rewrite suggestion through `quoteKey` so a
+  quoted class name / deny-commands regex stays pasteable. Narrowed the osident
+  adoption canary's comment to the adoption claim it can actually see.
+  Documented the `config-viewer` shadowing break in `docs/system-login.md` and
+  annotated the vSRX excerpt that trips it.
+- **Validation**: `go build -buildvcs=false ./...` + `go vet ./...` rc 0; full
+  `go test ./...` green. Mutation-proved each fix with build+vet CLEAN first:
+  restoring `os/user.LookupId` reds 3 named osident tests under CGO_ENABLED=0
+  and 2 under cgo; restricting the node views to the committing node reds 6
+  named sub-tests of TestLoginGatesRejectPeerOnlyNodeGroupBody_6706 while both
+  false-positive guards stay PASS; dropping `quoteKey` reds exactly the two
+  quoting tests; and each canary evasion (behaviour-preserving re-derivation,
+  method value) reds TestSetUserClassCallersResolveThroughTheSharedResolver_6701
+  by name while pkg/daemon's behavioural suite stays GREEN.
+- **File(s)**: pkg/osident/osident.go, pkg/osident/passwd_6706_test.go,
+  pkg/osident/adoption_canary_test.go, pkg/osident/user_env_canary_test.go,
+  pkg/cli/identity.go, pkg/cli/identity_6701_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/config/compiler.go,
+  pkg/config/compiler_prewalk.go, pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go, docs/system-login.md,
+  docs/junos-config-display-reference.md, _Log.md
+
+## 2026-08-01 — #6706 fold r5: make the canaries bind, and match os/user's passwd rule
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold all eight findings from the r4 hostile re-gate on PR #6706
+  at `072d3e9f1`. Four were guards that could not fire or fired falsely; four
+  were claims that overstated what the code does.
+- **F1 (MATERIAL — guard could not fire).** `isNestedModuleRoot` used a bare
+  `os.Stat`, so a DIRECTORY named `go.mod` counted as a module marker and made
+  both #6701 canaries skip a package the toolchain genuinely compiles. cmd/go's
+  own rule (`modload/search.go`) requires a regular file. Added `!info.IsDir()`
+  in both `pkg/osident/user_env_canary_test.go` and
+  `pkg/cli/userclass_entrypoint_canary_test.go`. PROVEN: `mkdir -p evilpkg/go.mod`
+  with a planted `os.Getenv("USER")` — `go list ./evilpkg` names it, `go build`
+  rc 0, canary REDs at `evilpkg/evil.go:5:28`; drop the `!IsDir()` term and it
+  goes GREEN with the violation still live.
+- **F7 (false red).** `./...` also excludes `_`-prefixed directories; the walks
+  did not. PROVEN: `_scratch/old.go` with a violation — `go list ./...` reports
+  0 packages for it, build rc 0, and the canary FAILED. Both walks now skip `_`
+  as well as `.`; head is green and reverting reproduces the false red. This is
+  the exact false-red class the previous commit set out to kill.
+- **F3 (control did not bind the code under test).** The anti-vacuity control
+  re-implemented the AST predicate inline, so breaking the real walk's copy left
+  the control green. Extracted the single `identityEnvHits(fset, f)` used by
+  BOTH. PROVEN: disabling the selector match inside the shared predicate now
+  reds the control with "the REAL detector found []", build rc 0. Its comment
+  previously named three failure modes it did not cover; it now states that it
+  binds the predicate only, that wrong-root/wrong-suffix are caught by the
+  `filesScanned == 0` Fatal, and that swallowed parse errors are caught by
+  nothing.
+- **F4 (fail-closed availability regression + a test that could not bind it).**
+  `lookupPasswd` accepted rows os/user rejects: NIS compat lines (`+alice::1000`),
+  truncated rows (`bob:x:1000`), and zero-padded uids (`01000` via Atoi). Because
+  this lookup fails CLOSED on ambiguity, one stray row at a LIVE uid turned a
+  legitimate operator into ReasonAmbiguousUID and denied them — and it falsified
+  the package doc's claim that every uid with a local row resolves identically.
+  Now mirrors `matchUserIndexValue` exactly: >= 7 fields, name non-empty and not
+  `+`/`-`, uid compared as a STRING, uid and gid both parseable. Verified against
+  the stdlib source, not the review's summary. The existing test could not bind
+  this (all six subtests stayed green through the change), so the fixture gained
+  one of each rejected shape AT alice's own uid. PROVEN: reverting the parity fix
+  reds exactly the five uid-1000 cases and leaves the four unrelated ones green,
+  build+vet rc 0.
+- **F5 (the only false runtime claim).** Decision 1 said an explicit class wins
+  "for any uid including 0". It does not: matching is BY NAME, so with uid 0
+  shared by root and toor, osident reports ReasonAmbiguousUID with an empty Name,
+  nothing matches, and `system login user toor class read-only` is silently not
+  applied — the caller gets super-user. Left as-is (uid 0 owns the config DB, the
+  daemon and the secrets; the alternative locks the console out over a passwd
+  alias) but no longer misreported: the comment states the case, and the reason
+  string no longer claims "uid 0 is not configured under `system login`" when it
+  may well be, under a name we failed to resolve.
+- **F2/F6/F8 (claims).** The skip's justification said "this repository carries
+  an in-tree checkout with its own go.mod" — false; `git ls-files | grep go.mod`
+  returns one line, the root. The subject is `wt-master/`, UNTRACKED agent
+  scratch, which is precisely why the skip must key on the marker rather than a
+  name. Also recorded that "not in `./...`" is not "does not ship" (a `replace`
+  directive would link a nested module in), and that the detector requires a
+  string LITERAL, so `const k = "USER"; os.Getenv(k)` escapes the "at any site"
+  headline. Reachability swept: zero production `syscall.Getenv`/`os.LookupEnv`
+  identity reads; three `os.Environ()` uses, all `pkg/upgrade` building a child
+  environment.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0, `go test -race`
+  on osident/cli/config/daemon clean, full `go test ./...` clean, `gofmt` clean.
+  Build+vet asserted rc 0 under every mutation, so no red above is a build break.
+- **File(s)**: pkg/osident/user_env_canary_test.go, pkg/osident/osident.go,
+  pkg/osident/passwd_6706_test.go, pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/cli/identity.go, _Log.md
+
+## 2026-08-01 — #6706 fold r6: one row must not deny everyone; make the last four guards bind
+
+- **Timestamp**: 2026-08-01 (round 6 — independent hostile re-gate folds)
+- **Action**: Fold all eight findings from the r5 hostile re-gate on PR #6706
+  at `d0c326082`. Six were material (one real runtime defect, four guards that
+  could not fire, one claim wider than its guard); two were prose. Every
+  finding was REPRODUCED at head before it was fixed, and every fix was proven
+  by mutation with `go build ./...` and `go vet ./...` rc 0 in BOTH states, so
+  no red below is a build break.
+- **F6 (MATERIAL — real runtime, fail-closed availability).** `lookupPasswd`
+  read the passwd database with a `bufio.Scanner` capped at 64KiB. A Scanner
+  aborts the WHOLE scan with `ErrTooLong` on the first over-long line and cannot
+  resume, so the error reached `Current()` as `ReasonLookupFailed`, which
+  pkg/cli treats as unidentified. One pathological row for an UNRELATED account
+  therefore denied EVERY non-root operator. REPRODUCED at head: with
+  `alice:x:1000:...` plus a 70KiB-GECOS row for uid 4242, `lookupPasswd(1000)`
+  returned `"" / bufio.Scanner: token too long` where os/user still returned
+  `alice`. Replaced with os/user's own chunked reader (`readPasswdRow`):
+  accumulate until the row has its six colons, then drain the tail without
+  accumulating. Memory is now bounded by the position of the sixth colon —
+  exactly the standard library's bound — instead of by a fixed cap whose only
+  effect was to move the cliff. PROVEN: restoring the Scanner (with `io.EOF`
+  kept referenced so the revert is an ASSERTION, not an unused-import build
+  break) reds the five oversized parity rows and
+  `TestOversizedRowDoesNotDenyEveryOperator_6706`, and leaves the other 30
+  parity rows green.
+- **F1 (MATERIAL — guard could not fire, security direction).** Both canary
+  walks skipped `node_modules`. cmd/go has NO such rule — `modload/search.go`
+  excludes exactly `.`-prefixed, `_`-prefixed and `testdata`, and prunes
+  `vendor` separately — so a package under `node_modules/` that `go build ./...`
+  genuinely compiles was invisible to all three #6701 canaries. REPRODUCED at
+  head with `node_modules/zzpkg/x.go` carrying BOTH defect shapes: `go list`
+  named the package, build and vet rc 0, all three canaries green. Dropped the
+  term; `skipCanaryDir` is now bit-for-bit the toolchain's directory rule in
+  both files. PROVEN: the same planted package now reds all three canaries by
+  file:line:col.
+- **F2 (MATERIAL — false red, half-closed at r5).** `./...` excludes `_`/`.`
+  prefixed FILES and build-constrained files too; the walks implemented the rule
+  for DIRECTORIES only. REPRODUCED at head: `pkg/osident/_scratch.go` (absent
+  even from `go list`'s IgnoredGoFiles) and `pkg/osident/zz_windows.go` each
+  produced a canary FAILURE with build and vet rc 0. Both walks now ask
+  `go/build`'s own matcher (`build.Default.MatchFile`) rather than restating its
+  rule, which covers the `_`/`.` prefix, `_GOOS`/`_GOARCH` suffixes and
+  `//go:build` constraints in one call. An unanswerable constraint (parse error)
+  SCANS the file — on an unanswerable question the guard should fire, not fall
+  silent. PROVEN: the same three planted files are now green.
+- **F3 (MATERIAL — allowlist bypass in the one file the allowlist fences).** The
+  entrypoint canary tracked a running `enclosing` key that was set on entering a
+  FuncDecl and never cleared, so a `*ast.GenDecl` appearing AFTER a function
+  inherited that function's key. REPRODUCED at head by appending
+  `var zzRogueSetter = zzRogueShell.SetUserClass` to the real
+  `pkg/daemon/cli_rbac.go`, after `applyCLILoginClass`: it took the allowlisted
+  key, and build rc 0, vet rc 0, both canaries ok. The predicate is now
+  `setUserClassRefs`, which iterates `f.Decls` and keys each reference on its
+  TOP-LEVEL declaration — a package-level reference gets
+  `<pkg>::<package-level declaration>`, a key no allowlist entry can hold. The
+  synthetic control now calls that same function instead of re-implementing it.
+  PROVEN twice: the planted bypass reds by file:line, and reverting the
+  predicate to a running `enclosing` reds the new
+  `TestPackageLevelClassWriteIsNotAllowlistedByANeighbour_6701`.
+- **F4 (MATERIAL — two parity terms bound by nothing, one dead).** REPRODUCED:
+  removing `fields[0] == ""` or the gid `Atoi` left `./pkg/osident/`,
+  `./pkg/cli/` and `./pkg/daemon/` all green. The gid term is not cosmetic —
+  without it `badgid:x:1000:NOTANUM::/h:/s` aliases uid 1000 and DENIES alice.
+  Fixture gained `badgid:...` and `:x:1000:1000::/h:/s`. The empty-name term
+  needed one more step: `lookupPasswd`'s own `name != ""` filter MASKED it, so
+  removing the term surfaced as an index panic rather than as a parity failure.
+  `matchPasswdRow` now returns `(name, isEntry)` and the caller keys on the
+  boolean, which makes the term answerable by an assertion. Swept all six terms
+  one at a time: each reds, build+vet rc 0 in every case. The seventh —
+  stdlib's `Atoi(parts[2])` — is DEAD once the uid is compared against
+  `strconv.Itoa`'s canonical output; re-added as a `panic()` it never fires, so
+  it is deleted rather than kept as a term no mutation can bind.
+- **F8 (claim wider than guard).** The r5 comment credited the
+  `filesScanned == 0` Fatal with catching a wrong root and a wrong suffix
+  filter. REPRODUCED as false for both: a wrong root is caught EARLIER by the
+  go.mod Fatal, `.go` -> `t.go` left 74 files scanned, and a PARTIAL directory
+  skip (adding `daemon` to the skip set, with a live `os.Getenv("USER")` planted
+  in pkg/daemon) left 680 files scanned and every canary green. Replaced the
+  floor with `traversalSentinels` — the three #6701 defect sites plus the
+  resolver and its identity source, named as repository-relative paths. PROVEN:
+  both defects now red all three canaries with the unscanned file named.
+- **F5 (prose).** The package doc claimed parity with os/user "for every uid
+  that HAS a local row", which the ambiguity refusal falsifies outright and the
+  64KiB cap falsified a second time. Scoped to "for a READABLE database, every
+  uid the file maps to exactly ONE account name", with the two deliberate
+  divergences listed. Rather than leave it as prose a fourth time, the claim is
+  now BOUND: `TestPasswdReaderMatchesOsUser_6706` runs 34 row shapes through
+  both this reader and a verbatim transcription of os/user's
+  `readColonFile` + `matchUserIndexValue`, and requires the names to agree.
+- **F7 (prose).** `identity.go` said an explicit class "cannot win when the
+  caller has no name". FALSIFIED firsthand by driving the real
+  `ResolveLoginClass`: `candidateNames` injects the literal `"root"` for uid 0,
+  so uid 0 with `ReasonAmbiguousUID` and `user root class read-only` resolves to
+  read-only. The same run refuted "false in exactly ONE reachable case" —
+  `ReasonNoPasswdEntry` and `ReasonLookupFailed` at uid 0 drop an alias class
+  identically, so it is three Reasons. Corrected to "cannot win when the caller
+  has no name AND the stanza is written for an alias other than `root`", and
+  pinned by the new `TestRootAliasClassMatrix_6706`.
+- **Validation**: `go build -buildvcs=false ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race -count=1 ./pkg/osident/... ./pkg/cli/... ./pkg/config/...
+  ./pkg/daemon/...` rc 0, `gofmt` clean on every touched file. Full
+  `go test ./...`: 68 packages, only `pkg/ddns` red, and NOT this PR's —
+  `TestSurfaceARealBackendForcedRefreshSucceeds` failed with
+  `tcp listen: listen tcp 127.0.0.1:52240: bind: address already in use`. The PR
+  touches zero files under pkg/ddns, and `go test ./pkg/ddns/` alone passes 3/3
+  at this head. Mechanism, checked firsthand: `newFakeDNSServer`
+  (`backend_rfc2136_test.go:85-94`) binds UDP on `127.0.0.1:0`, then binds TCP on
+  the port number the kernel handed the UDP socket — a port another listener can
+  take in between. That is the #6726 family (whose title names only
+  `TestRFC2136ReplaceOwnedAdoptsOwnNameOnReadd`); it is a port RACE rather than a
+  literal fixed port, and it reaches more functions than the issue lists.
+  Build and vet asserted
+  rc 0 under every mutation above; the one mutation that broke the build (a
+  first attempt at the uid-compare term) was redone as a compiling mutation
+  before its red was counted.
+- **File(s)**: pkg/osident/osident.go, pkg/osident/passwd_6706_test.go,
+  pkg/osident/user_env_canary_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/cli/identity.go,
+  pkg/cli/identity_6701_test.go, _Log.md
+
+## 2026-08-01 — #6706 fold r7: the guard asked the wrong build; make the traversal rule provable
+
+- **Timestamp**: 2026-08-01
+- **Action**: Fold all six findings from the r7 hostile re-gate on PR #6706
+  (`22adac5bd`). Every one was a guard whose stated scope was wider than what it
+  checked; **two of the six were introduced by the r6 round that fixed the first
+  batch**, which is why this round replaces the "read the code and believe the
+  comment" pattern with predicates that are proven against the toolchain and
+  against each other. All six confirmed firsthand before being fixed; no runtime
+  defect this round.
+- **F1 (MAJOR).** `compiledByGoBuild` called `build.Default.MatchFile`, and
+  `build.Default.CgoEnabled` is the AMBIENT `CGO_ENABLED` of the `go test`
+  process — 1 on any machine with a C compiler. The Makefile builds `xpfd`
+  (:37) and `cli` (:41) with `CGO_ENABLED=0`. Reproduced by planting
+  `pkg/daemon/zz_nocgo_probe.go` (`//go:build !cgo`) with BOTH defect shapes:
+  `CGO_ENABLED=0 go list ./pkg/daemon` named it and the ambient one did not;
+  `go build ./...` and `go vet ./...` were **rc 0 under both settings**; the
+  three canaries were **rc 0 — GREEN** ambient and **rc 1 — RED** under
+  `CGO_ENABLED=0`. Two claims were false as written and are rewritten: the
+  "every non-test .go file the toolchain would compile" scope, and a KNOWN LIMIT
+  paragraph that justified the build-context limit with a `//go:build windows`
+  example — the GOOS axis, not the cgo axis where guard and appliance actually
+  differ. **Took the UNION, not the pin.** Pinning `CgoEnabled=false` fixes the
+  whole defect; the union does that AND covers `//go:build cgo` files, which
+  suits a canary whose remit is explicitly prospective, at a cost bounded by an
+  invariant the pin also satisfies — everything scanned is compiled by SOME
+  toolchain configuration on this GOOS/GOARCH, so it can never red on code no
+  `go build` compiles. Today it is a no-op: zero production files carry any
+  `//go:build` line.
+- **F2 (MINOR).** `skipCanaryDir` claimed to be "EXACTLY cmd/go's own directory
+  rule". Read `modload/search.go` (go1.26.4) firsthand: `.`/`_`/`testdata` set
+  `want = false` and SkipDir at :129-131 *before* the directory is added, but a
+  `vendor` directory is added as a package at :139-148 and only THEN has its
+  SUBTREE pruned at :150-152. Reproduced with `pkg/vendor/zzprobe.go`: `go list
+  ./...` reported `github.com/psaab/xpf/pkg/vendor`, build and vet rc 0, all
+  three canaries green. The rule is now expressed on the PATH — descend into a
+  `vendor` directory, skip every directory whose parent is one.
+- **F3 (MINOR).** The allowlist canary's premise, "SetUserClass is the ONE write
+  to the RBAC class", was checked by nothing: both canaries key on the SELECTOR
+  name and `userClass` is package-private to the package where the command
+  handlers live. Reproduced with `func (c *CLI) zzPromote() { c.userClass =
+  "super-user" }` — build rc 0, vet rc 0, all canaries plus the whole `pkg/cli`
+  and `pkg/daemon` suites GREEN. New `classFieldWrites` predicate + a
+  one-entry `allowedClassFieldWriters`; it catches assignment, tuple
+  assignment, `&c.userClass`, a composite-literal key, `for c.userClass = range`
+  and a package-level closure, and does NOT flag `permissions.go`'s five reads.
+- **F4 (MINOR).** `pkg/daemon/daemon_run.go:723` is the one production line that
+  decides whose identity the RBAC class is computed about, and it was bound by
+  nothing. Reproduced the review's decoy — `_ = osident.Current()` kept for the
+  adoption canary, with `osident.Identity{UID: 0, Name: "root"}` handed to
+  `applyCLILoginClass` — which is #6701 restored in full, and got build rc 0,
+  vet rc 0 and `go test ./pkg/cli/... ./pkg/osident/... ./pkg/daemon/...` rc 0.
+  New `pkg/daemon/cli_rbac_wiring_6706_test.go` requires exactly one call site
+  and a literal `osident.Current()` as its identity argument.
+- **F5 (NIT).** The memory bound is NOT "the position of the sixth colon" (r6's
+  claim, and the r6 commit message's). Measured against `readPasswdRow`: an
+  8 MiB colon-free row retains all 8388608 bytes, the same row with five colons
+  retains all of it, and a row whose sixth colon is at byte 12 with an 8 MiB
+  shell field retains 4096. The bound is `min(row length, first read-chunk
+  boundary at or after the sixth colon)` — still exactly `os/user`'s, so the
+  parity claim is untouched.
+- **F6 (NIT).** `identity.go`'s decision-1 scoping was a correct SUFFICIENT
+  condition presented as a characterization. `candidateNames` returns an EMPTY
+  slice when the caller is neither resolved nor uid 0, so an unnamed non-root
+  caller matches no stanza of ANY name. Rewritten as the characterization, and
+  `TestRootAliasClassMatrix_6706` now drives uid 1001 unnamed against `root`,
+  `""` and `alice` stanzas across all three unresolved Reasons.
+- **New guards, each mutation-proven.** `walkCanaryFiles` is now ONE traversal
+  shared by all three walks. `TestCanaryWalkRuleMatchesTheToolchain_6706` drives
+  it over a 17-entry fixture module and cross-checks the expectations against
+  `go list ./...` run under CGO_ENABLED=0 AND =1 — the oracle half is what makes
+  the first half non-circular, since three rounds of this PR shipped a rule that
+  disagreed with cmd/go while its comment claimed equality.
+  `TestCanaryTraversalHelpersMatchTheOsidentCopy_6706` requires the five
+  duplicated helpers to be byte-identical between `pkg/cli` and `pkg/osident`
+  (comparing decl source from `Pos()` to `End()`, which excludes the
+  legitimately-differing doc comments), which is what carries the osident-side
+  proof across to the pkg/cli copies.
+- **RED-then-GREEN, build and vet rc 0 in BOTH states, every mutation.** The
+  four planted escapes now red: `//go:build !cgo` probe (ambient run), `pkg/vendor`
+  package, `c.userClass =` write, call-site decoy. The evasion forms red too:
+  `&c.userClass`, `&CLI{userClass:}`, a package-level closure, a SECOND
+  `applyCLILoginClass` call site. The guard-guards red: reverting
+  `compiledByGoBuild` to `build.Default` reds the `zz_nocgo.go` fixture row;
+  reverting `skipCanaryDir` to `name == "vendor"` reds the `vendor/probe.go`
+  row; drifting ONE copy of `skipCanaryDir` reds the parity test by declaration
+  name; dropping `id.IsRoot()` from `candidateNames` (a real escalation — uid
+  1001 unnamed gets super-user) reds six of the new matrix subtests.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0,
+  `go test -race -count=1 ./pkg/osident/... ./pkg/cli/... ./pkg/config/...
+  ./pkg/daemon/...` rc 0, full `go test ./...` rc 0. `gofmt -l` clean on every
+  touched file (11 pre-existing non-gofmt files under `pkg/daemon` are identical
+  at the base commit and were not touched). The known `#6709` `pkg/ddns` flake —
+  `newFakeDNSServer` binds UDP on `:0` then binds TCP on that same port number —
+  did not fire on these runs.
+- **File(s)**: pkg/osident/user_env_canary_test.go,
+  pkg/osident/canary_walk_rule_6706_test.go, pkg/osident/osident.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/cli/canary_helper_parity_6706_test.go, pkg/cli/identity.go,
+  pkg/cli/identity_6701_test.go, pkg/daemon/cli_rbac_wiring_6706_test.go,
+  _Log.md
+
+## 2026-08-01 — #6706 fold r8→r9: three guards that could not fire, and a false justification
+
+- **Timestamp**: 2026-08-01
+- **Action**: Round-9 fold of PR #6706 at `a4daf0831`. An independent review at
+  that exact head confirmed the RUNTIME path is correct — identity comes from
+  the kernel real uid (`osident.go` → `daemon_run.go:723`, `cli.go`,
+  `cmd/cli/main.go`), no `USER`/`LOGNAME`, no `os/user`, no caller-supplied
+  source. Every change below is to the GUARDS. Round 8 closed six findings;
+  three of the guards it wrote did not bind what they claimed, and one of its
+  own justifications was false.
+- **F1 — the `import "C"` over-scan was NOT bounded; round 8's justification was
+  false.** Round 8 chose the UNION of both cgo build contexts over pinning
+  `CGO_ENABLED=0`, justified by "everything scanned is compiled by SOME
+  toolchain configuration, so it can never produce a red that no `go build`
+  agrees with". Reproduced firsthand that it can: a file carrying BOTH
+  `//go:build !cgo` and `import "C"` is accepted by `MatchFile` under the
+  shipped context (the cgo split happens in `ImportDir`, not `MatchFile`) while
+  `CGO_ENABLED=0 go list` puts it in `IgnoredGoFiles` (it imports C) and
+  `CGO_ENABLED=1` ignores it (the constraint is false). Planted at
+  `pkg/zzf1probe/probe.go`: build and vet rc 0 under BOTH settings, `go list`
+  reporting it ignored under both, and `TestNoIdentityFromEnvironment_6701` RED
+  on a `$USER` read no configuration compiles. FIX: `compiledByGoBuild` now
+  derives the file set from real package loading — the union of `GoFiles`,
+  `CgoFiles` and `InvalidGoFiles` from `build.Context.ImportDir`, memoised per
+  directory (619 dirs, ~530ms). `InvalidGoFiles` is unioned deliberately: it is
+  the set go/build could not CLASSIFY, and on an unanswerable question the guard
+  should fire. Round 8's property is preserved and re-verified: a `//go:build
+  !cgo` file carrying a real `$USER` read still REDs, and so does a legitimate
+  cgo source (`CgoFiles`).
+- **F2 — traversal equality with cmd/go was FALSE; `go.mod ignore` was not the
+  sole residual.** A SYMLINKED walk root makes `filepath.WalkDir` visit nothing
+  (it Lstats its root), while `go list ./...` from that path reports every
+  package — a divergence in the SILENT direction. `walkCanaryFiles` now resolves
+  the root with `EvalSymlinks` and `rebaseCanaryPath` maps visited paths back
+  under the caller's spelling, so `filepath.Rel(root, path)` still answers.
+  Symlinked SUBdirectories needed nothing: cmd/go ignores those too
+  (`modload/search.go` warns and returns), verified by planting one. The
+  `ignore` directive is now genuinely the sole residual, and the comment says so
+  with that qualifier.
+- **F3 — the oracle had a coverage hole.** `assertFixtureMatchesGoList` read
+  only `.GoFiles`, so a legitimate cgo source — declared in the table — was
+  validated by nothing. It now reads `.GoFiles` AND `.CgoFiles`, via a
+  tab-per-file template (a package with no CgoFiles cannot be confused with a
+  malformed line) and stdout-only parsing so a `go list` warning cannot enter
+  the file set.
+- **F4 — `classFieldWrites` was not decoy-proof; the anti-vacuity check was
+  defeatable.** Reproduced both: `(c.userClass) = "super-user"` (LHS is an
+  `*ast.ParenExpr`) and `*c = CLI{}` (whole-object) each gave build rc 0, vet rc
+  0 and every canary green. The second is a privilege escalation, not
+  bookkeeping: it sets the class to `""`, which `checkPermission` and
+  `showConfigRedacted` both read as the legacy allow-everything mode. (`*c =
+  *other` is blocked by `go vet`'s copylocks — CLI holds a `sync.Mutex` — but
+  `*c = CLI{}` is not, and an incidental fence in another tool is not this
+  canary's coverage.) FIX: parentheses are unwrapped at every LHS position;
+  whole-object writes are recognised through a declared `*CLI` (receiver,
+  parameter, `var`) and through an embedded `x.CLI`; two further forms found
+  while sweeping are closed — a POSITIONAL `CLI{a, b}` literal (no
+  `KeyValueExpr` to see) and `c.userClass++` (`IncDecStmt` is not an
+  `AssignStmt`). Both allowlists now carry an entry-PRESENCE floor
+  (`requiredSetUserClassCallers` / `requiredClassFieldWriters`): the stale-entry
+  loop asks only "is every allowlisted key still seen?", which an EMPTY map
+  satisfies vacuously, and that vacuity was the half of the round-8 escape that
+  the parenthesised write needed.
+- **F5 — the RBAC wiring predicate was defeatable by same-name shadowing.**
+  Reproduced: a local `osident := struct{ Current func() ... }{...}` returning a
+  forged uid 0, with the real package imported as `kernelident`, gave build rc
+  0, vet rc 0 and ALL #6701/#6706 canaries green — #6701 restored in full. FIX:
+  `go/types` binding verification. `bindQualifiers` type-checks package daemon
+  against STUB imports (every dependency fabricated empty) and reads
+  `Info.Uses`; the qualifier must resolve to a `*types.PkgName` whose
+  `Imported().Path()` is `github.com/psaab/xpf/pkg/osident`. Stdlib only, ~120ms
+  over 69 files, no package loader. The check is also more CORRECT than the
+  spelling it replaces: a genuine aliased import is now accepted.
+- **RED-then-GREEN, 16 mutations, build and vet rc 0 in EVERY state.** Each fix
+  was mutated out by edit and the specific guard reds with a real assertion:
+  restoring `MatchFile` reds the `zz_nocgo_importsc.go` fixture row; dropping
+  `EvalSymlinks` reds the symlink test with an empty visited set; dropping
+  `rebaseCanaryPath` reds it on relativisation; a GoFiles-only oracle reds
+  `zz_cgo_importsc.go`; an identity `unparenExpr` reds three forms; removing the
+  whole-object arm reds five; removing the positional and IncDec arms reds one
+  each; a spelling-based `bindsToOsident` reds the shadowed forgeries. EDGE
+  mutations, aimed at the boundary rather than the centre: a ONE-level
+  `unparenExpr` reds only `doubleParenAssign`; a whole-object arm that does not
+  unparen reds only `wholeObjectParen`; a binder that resolves the qualifier but
+  drops the PATH check reds only `shadow.Current()`. The allowlist floor was
+  isolated by reconstructing the round-8 world (blind detector + parenthesised
+  setter) and emptying the map: ONLY the floor reds, proving it binds
+  independently of the detector.
+- **Named limits rather than silence**: a whole-value write into a COLLECTION
+  element (`shells[0] = CLI{}`) is not recognised — the LHS is an `IndexExpr`
+  and deciding it needs the element type; there is no `[]CLI`, `[]*CLI` or
+  map-of-CLI in the tree (grepped). A narrower RHS-keyed rule was rejected
+  because partial coverage of a form invites the belief that the form is
+  covered. reflect/unsafe stay outside any AST predicate.
+- **Docs**: no operator-facing doc changed. These are test-only structural
+  canaries; the runtime identity/class contract `docs/system-login.md`
+  documents is untouched. The claims that were falsified lived in the test-file
+  comments (the "bounded over-scan" paragraph and the traversal-equality claim)
+  and are corrected there.
+- **Validation**: `go build ./...` rc 0, `go vet ./...` rc 0, focused
+  `6701|6706` suites rc 0 under BOTH `CGO_ENABLED=0` and `CGO_ENABLED=1` with
+  every new test NAME confirmed present in `-v` output, full `go test ./...` rc
+  0. `gofmt -l` clean on all five touched files.
+- **File(s)**: pkg/osident/user_env_canary_test.go,
+  pkg/osident/canary_walk_rule_6706_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go,
+  pkg/cli/canary_helper_parity_6706_test.go,
+  pkg/daemon/cli_rbac_wiring_6706_test.go, _Log.md
+- **Timestamp**: 2026-08-05 09:41
+- **Action**: #6819 — five `ha_tests` (in fact SEVEN, on THREE counters) shared
+  process-global `AtomicU64` statics as their before/after baseline, so cargo's
+  in-process parallelism made each test's assertion depend on what every other
+  test happened to do. Measured at pristine `origin/master` ad9591177 with a
+  bounded harness: `FAIL FAIL HUNG FAIL FAIL`, with a #6819 participant failing
+  in 5 of 5 runs. Moved `SESSION_INSTALL_STALE_IGNORED`,
+  `SESSION_DELETE_STALE_IGNORED` (#2170) and `SYNCED_IMPORT_CAP_DROPS` (#5674)
+  out of `bpf_map/metrics.rs` and onto `SessionManager` as per-Coordinator
+  fields (`install_stale_ignored`, `delete_stale_ignored`, `import_cap_drops`),
+  beside the existing per-instance `export_seq`. Every bump site
+  (`ha/session_import.rs`) and every read site (`coordinator/status.rs`)
+  already held a `&self` Coordinator, and production constructs exactly one
+  Coordinator (`server/lifecycle.rs`), so the exported values are unchanged —
+  this is a test-isolation fix with no production behaviour change.
+  [CORRECTED 2026-08-05 16:10, gate fold: this entry originally said "the
+  gRPC/Prometheus values are unchanged", which was wrong twice. This crate has
+  NO gRPC dependency and none of the three counters is in `proto/`; and only
+  `import_cap_drops` reaches Prometheus (`server/helpers/status.rs` ->
+  `protocol::control` -> the Go status struct ->
+  `xpf_userspace_synced_import_cap_drops_total`). The two stale counters have
+  no wire or metric surface at all — their accessors are reachable only from
+  `ha_tests.rs`.]
+  `ha_tests.rs` is untouched: no assertion weakened, no `--test-threads=1`, no
+  `#[serial]`. The issue's own suggested fix — "make the assertions
+  DELTA-based" — was already in place and is not sufficient: the tests capture
+  `let before = ...` and assert `before + 1`, but a concurrent test's increment
+  lands INSIDE that capture window. Only a per-instance home removes the
+  dependency. After: 10 runs, a #6819 participant failed in 0 of 10. The suite
+  itself is 5 PASS / 2 FAIL / 3 HUNG — every residual failure is #6657
+  (CoS-lease seqlock `v8_epoch_seqlock_snapshot_never_tears_tag_grace`, and an
+  unbounded blocking recv wedging at 7 threads in
+  `__skb_wait_for_more_packets`), a separate defect that this PR does not
+  touch. Red-on-revert: 7 of 7 tests go RED on an assertion when the guard each
+  one covers is reverted.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/metrics.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 14:52
+- **Action**: #6819 gate fold (§7 test-acceptance findings). Three findings,
+  each verified against the code before acting. (F1) Both #5674 admission
+  tests set `synced_import_cap_override`, which returns from the `#[cfg(test)]`
+  branch of `synced_import_cap` BEFORE the production expression is evaluated —
+  a test-only seam shadowing the production path, so deleting its trailing
+  `.saturating_mul(2)` left both tests green. Made `synced_import_cap`
+  `pub(super)` (ha_tests is `crate::afxdp::ha::tests`, a SIBLING of
+  `session_import`, so a private fn was unreachable) and added
+  `synced_import_cap_production_formula_is_twice_the_logical_ceiling`, which
+  runs with the override at its default 0 and pins entry-cap == 2x logical
+  ceiling, plus `assert_ne!` against the bare ceiling (what dropping the 2x
+  yields) and a `DEFAULT_MAX_SESSIONS > 0` precondition so `0 == 2*0` cannot
+  make the claim vacuous. (F2) The two non-poison rejection tests accepted a
+  guard that refuses the WHOLE category while counting once, so each now
+  carries its own positive control (newer install applies and does not count;
+  applied equal-generation delete does not count). The two poison rejection
+  tests get scope comments naming the control test that supplies their
+  selectivity. (F3, priority) The poison negative control exercised only
+  NEWER/EQUAL operations with both stale expectations at the per-instance zero
+  baseline, so it accepted DELETING the generation guard outright — a negative
+  control that accepts removal of the thing it controls for. It now also probes
+  the stale direction after recovery (stale install and stale delete each
+  refused and counted exactly once), and the recoveries assertion tightened
+  from `> before` to `>= before + 4` (the poisoning count); kept a LOWER bound,
+  with the reason in the comment, because `SHARED_SESSION_POISON_RECOVERIES`
+  is the one counter still process-global (bumped inside `lock_shared_recover`,
+  which takes only the mutex and has no per-Coordinator home) so a concurrent
+  test can only push it up — `>=` cannot false-FAIL where `==` could.
+  Validation: four-cell mutation matrix, each mutation run against BOTH test
+  generations so a mutation the old tests already caught could not be credited
+  to the new one. Drop-the-2x PASSES both old cap tests and FAILS the new one;
+  delete-the-generation-guard PASSES the old negative control and FAILS the new
+  one. Full `cargo test --release` rc=0 (4234 passed, 0 failed), `go test
+  ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha/session_import.rs,
+  userspace-dp/src/afxdp/ha_tests.rs, _Log.md
+- **Timestamp**: 2026-08-05 16:24
+- **Action**: #6819 gate fold round 2 (R3 + doc accuracy). (R3) The gated suite
+  could not detect a regression of the fix. Every assertion on the three
+  counters is a DELTA capture (`before + 1` / `== before`), and `make test-rust`
+  pins `-- --test-threads=1` (Makefile:114-116, adopted to dodge the #6657
+  `__skb_wait_for_more_packets` socket wedge) — under serial execution a
+  process-global satisfies every one of those identically, so reverting any
+  counter to a static shipped GREEN. Added
+  `refusal_counters_are_per_coordinator_not_process_global`: drives one refusal
+  of each kind on a BUSY Coordinator and asserts an IDLE one, live in the same
+  process, saw none of them. It does not depend on interleaving, so it reds at
+  any thread count. Proof under the gate flag: reverting
+  `install_stale_ignored` to its original `metrics.rs` static REDS the new test
+  while the other 29 `ha::` tests run and pass — the pre-existing suite
+  genuinely cannot see the revert. WHICH assertion reds depends on the run
+  mode, and the original claim of `ha_tests.rs:738` was only true of the
+  ISOLATED run: libtest orders alphabetically under `--test-threads=1`, so
+  `current_generation_…`/`delete_synced_session_gen_…`/`over_ceiling_import_…`
+  all bump the restored global BEFORE `refusal_counters_…` runs, and the
+  PRECONDITION at the top of the test trips first. Fixed in the 2026-08-05
+  18:05 entry by giving the preconditions the same diagnostic as the payload
+  assertions, so the message is reachable in the mode the gate actually uses. (DOC) Corrected the
+  export-surface claim at three sites: this crate has NO gRPC dependency and
+  none of the three counters is in `proto/`; only `import_cap_drops` reaches
+  Prometheus (`server/helpers/status.rs:102` -> `protocol/control.rs:334` ->
+  `protocol_status.go:279` -> `metrics_userspace.go:672`), and the two stale
+  counters have no wire or metric surface — their accessors are reachable only
+  from `ha_tests.rs`. The earlier 2026-08-05 09:41 entry carries an inline
+  correction. (README) Recorded that the concurrency mechanism is MEASURED
+  (revert reds 24/60 parallel vs 0/12 serial for the cap counter; 43/60 vs 0/5
+  for the stale pair) AND that the sanctioned gate structurally cannot observe
+  it. (NOTE) Documented that per-instance scoping makes every `..._before`
+  capture 0, degenerating three `== before` assertions to `0 == 0` — recorded
+  where those assertions live, with why the family is still bound.
+  Gates: `cargo test --release --bins --tests -- --test-threads=1` rc=0
+  (4235 passed, 0 failed, 2 ignored), `go test ./...` rc=0.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/coordinator/session_manager.rs,
+  userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 17:38
+- **Action**: #6819 README — cited the independent cross-PR measurement of the
+  counter flake. While gating #6843, a lane measured parallel `cargo test --
+  afxdp::ha` over 40 iterations: 34/40 FAILED at that PR's HEAD and 34/40 at an
+  `origin/master` CONTROL with the PR's files reverted and its tests confirmed
+  absent. The identical rate with and without the change under review is what
+  identifies the flake as pre-existing and specific to these counters rather
+  than caused by any one PR, and it root-caused the failures to
+  `SESSION_INSTALL_STALE_IGNORED`/`SESSION_DELETE_STALE_IGNORED` being
+  process-global under `assert_eq!(total, before)` — as a family, not one test.
+  That is unmutated evidence from a lane with no stake in #6862, stronger than
+  the mutation numbers already cited. Also recorded the coupling explicitly:
+  the `--test-threads=1` that hides this defect exists to dodge a DIFFERENT one
+  (#6657).
+  NOTE ON THE GATE RUN: `cargo test --release --bins --tests --
+  --test-threads=1` returned rc=101 on this README-only change, failing
+  `afxdp::types::shared_cos_lease::tests::v8_epoch_seqlock_snapshot_never_tears_tag_grace`.
+  That is NOT this change — the diff since the previous green gate is one .md
+  file and no test reads it. Characterized it instead of re-running for green:
+  the test fails 2 of 10 runs ALONE in the process under `--test-threads=1`, so
+  its race is INTERNAL to the test (it spawns its own threads, which
+  `--test-threads=1` does not serialize). That distinguishes it from #6819
+  (cross-test, masked by serial execution) and from the #6657 wg-engine hang.
+  Reported to the #6657 owner.
+- **File(s)**: userspace-dp/src/session/README.md, _Log.md
+- **Timestamp**: 2026-08-05 18:05
+- **Action**: #6819 gate fold round 3 (two MINORs). (M1) The `#6819`
+  diagnostics in `refusal_counters_are_per_coordinator_not_process_global` were
+  UNREACHABLE in the mode the gate actually runs. libtest executes
+  alphabetically under `--test-threads=1`, so `current_generation_…` (c),
+  `delete_synced_session_gen_…` (d) and `over_ceiling_import_…` (o) all bump a
+  restored global BEFORE `refusal_counters_…` (r) runs — the bare
+  `assert_eq!(x, 0)` PRECONDITIONS tripped first and reported `left: 1,
+  right: 0` with no explanation, while the carefully-worded payload assertions
+  forty lines below fired only when the test was run in ISOLATION. Gave the
+  three preconditions the same named diagnostic, so a future engineer who
+  reintroduces the regression reads why in either run mode. Generalisable: a
+  diagnostic is only as good as the run mode that REACHES it — when a test has
+  a precondition and a payload assertion, check which fires under the
+  SANCTIONED invocation, not the filtered one used while developing. (M2)
+  Corrected the `ha_tests.rs:738` line cite: under the conditions stated
+  alongside it (the other 29 `ha::` tests running) the revert reds at the
+  precondition, not 738; 738 is the isolated-run line. Corrected in the
+  2026-08-05 16:24 entry and in the PR body.
+  NOT FOLDED: #6891 — a live cross-test counter flake of exactly the shape this
+  PR's README rule warns about (`GRE_DECAP_CHECKSUM_INVALID_DROPS`, equality
+  assert, 18/60 RED at this branch's HEAD and 16/40 at the merge base — equal
+  rate, so pre-existing). Filed separately; it raises #6891's priority, not
+  this PR's scope.
+- **File(s)**: userspace-dp/src/afxdp/ha_tests.rs, _Log.md
+
+- **Timestamp**: 2026-08-05 15:10
+- **Action**: #6851 fold — two MAJORs on the #4626 policy-id-zero guard, both
+  verified firsthand before folding.
+
+  MAJOR 1, the SEVENTH resolver. `EventReader.resolvePolicyName`
+  (`pkg/logging/ringbuf.go`) resolves RT_FLOW record names independently of the
+  six session-row builders and indexed `er.policyNames` directly. It already
+  special-cased `DefaultPolicySentinelID` (#3057) but not
+  `UnattributedPolicyID`, so every host-inbound / fabric / tunnel / pre-#3056 /
+  older-peer record named the FIRST configured policy. This is the surface that
+  matters most: RT_FLOW records go to syslog and ship off-box, so the wrong
+  attribution is durable and lands in what an auditor reads later.
+
+  MAJOR 2, peer fan-out. `fetchPeerSessions` did `resp.Peer = peerResp` — the
+  peer's response attached UNCHANGED, names included. The #4626 guard resolves a
+  name from a raw id for rows THIS node renders; it does not cover a name
+  arriving as DATA from an old peer that resolved it wrongly itself. REST
+  (`writeSessionList` → `pr.GetPeer()`), gRPC clients and the CLI all republish
+  that string, so `fetchPeerSessions` is the single choke point for all three.
+
+  DECISION on MAJOR 2, and why. Override the name for RESERVED ids only; keep
+  the peer's name for everything else. Policy ids are NODE-LOCAL
+  (`compilePolicies` assigns from the local config's rule ordering), so the peer
+  is authoritative for the names of its own sessions and re-resolving an
+  unreserved peer id against the LOCAL map would name whichever local policy
+  occupies that slot — a fresh misattribution firing on every mixed-config
+  cluster, not a fix. The two choices are identical against a same-version peer
+  (it already sends `unattributed`); they differ only for an older peer, which
+  is the population that needs correcting. Pinned by mutation M4.
+
+  STRUCTURE. Added `dataplane.ReservedPolicyName(id) (string, bool)` as the SSOT
+  for "which ids must never reach a name map", and expressed `SessionPolicyName`,
+  the new `PeerSessionPolicyName`, and the logging resolver through it. The
+  logging site keeps its own numeric fallback so it cannot call
+  `SessionPolicyName` directly; an earlier draft probed
+  `SessionPolicyName(nil, id)` for a non-empty result, which works only because
+  a nil map yields "" for unreserved ids — a property nobody is obliged to
+  preserve and whose loss would silently route unreserved ids away from the
+  caller's map. Replaced with the explicit predicate.
+
+  Also FUSED the peer guard with the attach it protects
+  (`attachPeerSessions` sanitizes AND assigns). Two statements at the call site
+  would let a future edit drop the guard and keep the attach — silent and green,
+  the exact failure mode of this PR. Fused, dropping the guard drops the
+  fan-out, which fails loudly.
+
+  ENUMERATION, re-run rather than inherited (the count has grown at every
+  count: briefed 2, previous lane 6, gate 7). Every `policyNames[...]` index in
+  the tree is now: the helper itself, `compilePolicies` building the map, and
+  the logging resolver (fixed). Six routed session builders + logging = SEVEN
+  resolvers; the peer pass-through is the only place a name arrives as data.
+  Checked and CLEARED as carrying no policy name: the other two peer fan-outs
+  (`GetSessionSummaryResponse` is counts only; `GetZonePairSummaryResponse` holds
+  `ZonePairSessionSummary`, which is zone pairs + protocol counts) — verified by
+  enumerating their generated struct fields, not by assuming. Downstream
+  consumers (`pkg/api/sse.go`, `server_show_events.go`,
+  `cli_show_security_log.go`, `monitor.go`, `cmd/cli/show_flow.go`) read an
+  already-resolved string and are fixed transitively.
+
+  MUTATIONS (each restored + re-verified green):
+  - M1 map-first, the shape that looks like a guard: reserved check moved AFTER
+    the map lookup in the logging resolver → RED on
+    `TestResolvePolicyNameZeroIsNotTheFirstPolicy_6851`. Note the
+    no-published-map test stays GREEN under it, which is why the OCCUPIED-map
+    fixture is the load-bearing one.
+  - M2 peer-name-first (trust a non-empty peer string before the reserved
+    check) → 3 RED.
+  - M3 guard dropped, attach kept → 3 RED; the fusion holds.
+  - M4 the REJECTED alternative (discard the peer's name for unreserved ids too,
+    as "re-resolve everything locally" would) → RED on the unreserved control.
+    The decision is pinned, not accidental.
+
+  SUPERSEDED #3057 ASSERTION, called out because the brief did not anticipate
+  it. Routing the logging resolver through the guard broke a PRE-EXISTING test:
+  `TestResolvePolicyNameSentinelRendersDefaultPolicy` asserted "a genuine policy
+  ID 0 still resolves to the first configured policy". That is precisely the
+  claim #4626 retires — the same claim the six session surfaces already stopped
+  making — so the assertion was updated, not the fix weakened. The test's actual
+  #3057 purpose (the sentinel must not alias the first policy) is untouched, and
+  I STRENGTHENED it in the other direction: id 0 must now also not render as
+  `default-policy`, so a "fix" collapsing both reserved ids onto one name would
+  fail rather than pass. The supersession is documented in the test comment.
+  Under mutation M1 that test now reds ALONGSIDE the new one.
+
+  SCOPE LIMIT, stated rather than implied: the tests drive `attachPeerSessions`,
+  so they bind the sanitize-and-attach pair. They do NOT bind
+  `fetchPeerSessions`' call to it — that needs a live `cluster.Manager` with
+  `PeerAlive()` plus an authenticated peer dial, neither reachable from a unit
+  test. Replacing the call with a bare `resp.Peer = peerResp` would not be
+  caught. Recorded in the source next to the function.
+- **File(s)**: pkg/dataplane/policy_display.go, pkg/logging/ringbuf.go,
+  pkg/grpcapi/server_sessions.go, pkg/logging/policy_id_zero_6851_test.go,
+  pkg/grpcapi/peer_policy_name_6851_test.go, docs/junos-cli-reference.md,
+  _Log.md
+
+## 2026-08-05 — #5078 follow-ups: dead sync downgrade guard + a test that could not fail
+
+- **Timestamp**: 2026-08-05
+- **Action**: Two findings from reviewing the #5078 branch, plus the doc
+  half. (1) F-B: `TestSyncAuthHandshakeDowngradeGuardRejects` documented a
+  RED-on-revert that could not fire — flipping its only precondition
+  (`newAuthSync(t, key, true)` -> `false`) left it PASSING, because after
+  #5078 `syncAuthDecision` rejects every unkeyed peer on a keyed node
+  regardless of `peerAuthSeen`. It was a duplicate of
+  `TestSyncAuthHandshakeKeyedNodeRejectsLegacyPeer` wearing a
+  downgrade-guard name; deleted with a comment recording why. (2) F-A: the
+  sync-side downgrade guard it was named for was itself dead —
+  `syncPeerAuthSeen` had ZERO callers and `syncAuthedEver` was write-only
+  in effect (stored in `wrapSyncConn`, read only by the orphan). Go does
+  not flag unused methods, so it compiled green. Deleted, along with
+  `SyncAuthProvider.HeartbeatPeerAuthSeen()` (its only consumer through
+  the interface), the fake's implementation, and the now-meaningless
+  `authSeen` parameter of `newAuthSync`. (3) Docs: the `sync_auth.go`
+  package doc and the `pkg/cluster/README.md` PR-C section still described
+  keyed-node dual-accept, the deleted `pendingFrame` path, the removed
+  sync downgrade guard, and a two-method provider wiring.
+- **Scope verified, not assumed**: `Manager.HeartbeatPeerAuthSeen` is NOT
+  removed — still exported, still consumed by the gRPC fabric listener
+  (`pkg/grpcapi/fabric_auth.go`) and the control-link status string
+  (`status.go`). The #4107 HEARTBEAT downgrade guard is separate state
+  (`heartbeatAuthDecision` over `heartbeatAuthState.peerAuthenticated`),
+  so deleting the sync pair cannot disarm it;
+  `TestHeartbeatAuthDecision/key/legacy-after-peer-authed` and
+  `TestControlLinkAuthStatus` still pass.
+- **Not landed, deliberately**: my own `clusterCommsNeedRestart` guard +
+  `cluster_authkey_no_comms_restart_5078_test.go`. The branch already
+  carries `TestAuthKeyChangeDoesNotRestartClusterComms_5078`, which binds
+  the same property and additionally covers key ROTATION. A second test
+  for one property is noise.
+- **Validation**: `go build ./...` 0; `go vet ./pkg/cluster/ ./pkg/grpcapi/
+  ./pkg/daemon/` 0; `go test -count=1 ./pkg/cluster/ ./pkg/grpcapi/` 0;
+  full `go test ./pkg/... ./cmd/...` exit 0 (59 packages, zero failures).
+- **File(s)**: pkg/cluster/sync_auth.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_admission_test.go,
+  pkg/cluster/sync_accept_test.go, pkg/cluster/README.md, _Log.md
+
+## 2026-08-05 — #6865 gate fold: bind the call site, retarget two RED labels
+
+- **Timestamp**: 2026-08-05
+- **Action**: F1 — added `TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078`.
+  The step-20 decision in `daemon_apply_tail.go` is INLINE, so the existing
+  struct test could not see it: adding `|| keyChanged` there, with
+  `clusterTransportKey`/`clusterTransportFromConfig` byte-identical, produced
+  the permanent deadlock with a green suite. New test observes
+  `clusterCommsGen` across a real `applyTailReconciles`. F2 — retargeted the
+  RED-on-revert on `...KeyedNodeRejectsLegacyPeer`: it claimed "restore the
+  grace in syncAuthDecision", which does NOT fail it (the arm discards the
+  accept bit); it actually binds the arm returning nil. F3 — matrix comment
+  still described the deleted migration window as current and named the
+  removed `peerAuthSeen` param. F4 — de-duplicated a doubled paragraph in
+  `sync_auth.go`. F6 — assert the `reason` substring, since nil key is the
+  failure default of every error path. README — procedure 2 can itself
+  produce the keyed-primary/unkeyed-secondary deadlock if the connection
+  drops mid-rollout.
+- **Validation**: `go test -count=1 ./pkg/cluster/ ./pkg/daemon/` exit 0.
+  M2 (call-site `|| keyChanged`, struct untouched): struct test PASSES, new
+  call-site test FAILS, positive control passes. M4 (legacy arm returns nil):
+  `...KeyedNodeRejectsLegacyPeer` FAILS at the err==nil assertion.
+- **File(s)**: pkg/daemon/cluster_transport_key_5078_test.go,
+  pkg/cluster/sync_auth_test.go, pkg/cluster/sync_auth.go,
+  pkg/cluster/README.md, _Log.md
+
+## 2026-08-07 — #6706 r11 fold: the `system login` packed gate saw one of three levels
+
+- **Timestamp**: 2026-08-07
+- **Action**: F1 (MAJOR) — `validateLoginPackedStatementsAST` walked
+  `system` → `login` → `<instance>` with `forEachChild`/`FindChildren`, both
+  of which match on `Keys[0]`. With the path packed onto an ANCESTOR line
+  neither gate recorded anything: the `login` node then carries
+  `Keys=["login","user","alice",…]` with zero children so `FindChildren`
+  returns nothing, and the `system` node has empty `Children` so the inner
+  walk never runs. Measured firsthand through `configstore.CheckText` (the
+  real commit / `commit check` / `xpfd check-config` pipeline) at the parent
+  commit: `system { login user alice class read-only; }` → ACCEPT, 0 users;
+  `system login user alice class read-only;` → ACCEPT, `System.Login == nil`;
+  a whole file written that way → ACCEPT, zero warnings. The level the gate
+  DID cover is the fail-CLOSED one (empty class → `unauthorized`); both it
+  missed are fail-OPEN, and `System.Login == nil` is precisely
+  `applyCLILoginClass`'s early return → `SetUserClass` never called →
+  `c.userClass == ""` → `checkPermission` nil for every command and
+  `showConfigRedacted` false. Fixed by generalising the walk to the two
+  ancestor levels with per-level consequence text, riding the same
+  `lenientLoginPackedStatements` flag (#1960 warn on the tolerant ingress)
+  and the same `forEachClusterNodeView` both-node union.
+  Scoped wider than the review described, with evidence: `system login {
+  user alice { class ops; } }` and `system { login user alice { class ops;
+  } }` also drop everything, so the rule is "the path must descend into a
+  nested block at every step", not "the body must not be on the instance
+  line". `system login;` / `system login user;` declare nothing in either
+  spelling and stay accepted; `inactive:` config is pruned by
+  `cloneForExpansion` before any gate and stays accepted.
+  Also fixed a mirror-image over-reach in the sibling shadow gate: under a
+  prefix-packed `login` node its children are an INSTANCE body, so a `class
+  <n>` child there is a user's class ASSIGNMENT, and the gate reported
+  `system login class read-only: this definition is INERT` for a definition
+  never written. The stanza is still rejected — by the new ancestor arm.
+  F2 — `isWholeHolderWrite`'s `*ast.StarExpr` arm required an `*ast.Ident`
+  operand, so `*a.cli = CLI{}` through a real production `*CLI` field
+  (three exist) was recorded nowhere. Added a `holderPointerFieldNames`
+  pre-pass over the whole production tree and a SelectorExpr operand arm;
+  updated the KNOWN LIMITS block, whose collection-element excuse never
+  covered the field form. F3 — split `classifyLookup` out of `Current` as a
+  PURE function so the `name != ""` term is reachable by argument rather
+  than through a repointable package-level hook; the term was unbindable and
+  that is the exact shape `lookupPasswd`'s own comment forbids 15 lines
+  earlier. F4 — `osident.go` claimed an unknown uid "resolves to
+  `unidentified`"; no such value exists (`Name` is `""`, `String()` renders
+  `uid-<n>`, and `pkg/cli`'s `ClassUnidentified` is `"unauthorized"`).
+- **Validation**: `go build ./...`, `go vet ./...`, and
+  `go test ./pkg/config/ ./pkg/configstore/... ./pkg/cli/ ./pkg/daemon/
+  ./pkg/osident/ ./cmd/cli/` exit 0.
+  Mutation matrix, pristine control first, restored by `cp` each time:
+  M1 (drop the `system`-level arm) — the `system`-line sub-tests RED on
+  "compiled with NO error — the gate did not fire"; every `login`-line
+  sub-test and every over-reach guard stayed GREEN.
+  M2 (drop the `login`-level arm) — mirror image: `login`-line RED,
+  `system`-line GREEN.
+  M3 (drop the shadow-gate skip) — RED on "the shadow gate misread a user's
+  class ASSIGNMENT as a class DEFINITION"; bound on the LENIENT path, since
+  strict returns the packed error first and a strict-only assertion would
+  stay green.
+  M4 (drop the SelectorExpr operand arm) with `*a.cli = CLI{}` inserted at
+  `cli_show_chassis.go`: vet rc 0, `TestSetUserClassHasOneProductionCaller`
+  **ok** — the escape reproduced. With the fix, the same insertion REDs
+  naming file:line. Negative control `a.cli.userClass = ""` at the same site
+  through the same field REDs in both states, isolating the escape to the
+  write FORM.
+  M5 (`case err == nil && name != "":` → `case err == nil:`) — `./pkg/cli`,
+  `./pkg/daemon`, `./cmd/cli` all ok as the review reported, `./pkg/osident`
+  now RED on "Reason = 0, want ReasonLookupFailed".
+- **File(s)**: pkg/config/compiler_system_login_gates.go,
+  pkg/config/compiler_system_login_packed_6662_test.go,
+  pkg/configstore/login_path_packed_6706_test.go,
+  pkg/cli/userclass_entrypoint_canary_test.go, pkg/osident/osident.go,
+  pkg/osident/passwd_6706_test.go, docs/system-login.md,
+  docs/config-schema.md, _Log.md
+## 2026-08-12 — #6706 review r11: fold the Codex DO-NOT-MERGE findings
+
+- **Timestamp**: 2026-08-12
+- **Method note**: `cx6706b.log:151` states in Codex's own words that it
+  executed no tests and that its 45-RED/7-MIXED/20-GREEN ledger is static
+  analysis. All five blocking findings were therefore re-verified by RUNNING
+  them; the ledger's counts are not repeated as fact anywhere.
+- **F1 (remote CLI unauthorized) — SCOPE, not a regression.** Measured:
+  `applyCLILoginClass` has exactly one production call site
+  (`daemon_run.go:729`, the in-process console); `grpcapi/server.go:436` is a
+  bare `net.Listen("tcp")` with no interceptor and no SO_PEERCRED anywhere;
+  `cmd/cli/main.go:66` uses `osident.Current()` for the prompt only. The remote
+  path was unauthorized before this PR too, so the PR owes the description, not
+  the boundary. Filed as **#6973** with the three measurements.
+- **F2 (`system login;` denies an innocent config) — REAL, kept as-is after a
+  fix was written and REVERTED.** The obvious narrowing (apply the reporting
+  gate's content test to the detector) was implemented with a two-arm fixture
+  and proven RED. It was then thrown away, because measuring a comment it would
+  have overridden showed the narrowing makes the two spellings DISAGREE:
+  `system { login; }` compiles a non-nil empty LoginConfig and denies via
+  ResolveLoginClass without consulting the flag, while the narrowed packed
+  spelling would permit. Trading a lockout for a spelling-dependent
+  authorization outcome is worse than either consistent answer. Option 1
+  (both spellings deny) is kept; the open question is filed as **#6972** with
+  the four-row measurement, and the reasoning is recorded AT the detector so
+  the next reader does not re-narrow it.
+- **F3 (uid-0 alias promotes on lookup failure) — kept, claim amended.**
+  Measured: resolved alias -> `read-only`; all three unresolved Reasons ->
+  `super-user`. Deliberate per identity.go decision 1 (uid 0 already owns the
+  config DB, daemon process and on-disk secrets; denying risks a console
+  lockout over an unreadable passwd). `osident.go`'s "both NARROW" now says the
+  divergences narrow the IDENTITY and that a narrower identity is NOT a
+  narrower class — at uid 0 it inverts — with the matrix inline.
+  `TestRootAliasClassMatrix_6706` now says it pins a deliberate decision so it
+  is not "corrected" into a denial by someone who meets the matrix first.
+- **F4 (node-aware flag unbound) — FIXED with a two-arm fixture.** Measured
+  first: reverting ONLY `compiler.go:550` left every package `ok`.
+  `TestLoginDroppedFlagIsPerNodeView_6706` drives node 0 and node 1 of one
+  config whose packed stanza exists only in node1's group;
+  `TestLoginDroppedFlagNodeViewsDisagree_6706` asserts the two views DIFFER, so
+  collapsing the two assignment sites into one whole-tree computation is RED
+  even though each single-node arm could survive it. RED on the revert:
+  "node 1: LoginDroppedByPacking = false, want true" with node 0 still passing.
+- **F5 (classifyLookup guard cannot fire) — FIXED.** Measured: inlining an
+  equivalent switch into `Current` and leaving `classifyLookup` dead left
+  osident/cli/daemon/cmd-cli all `ok`, because the existing test compares a
+  VALUE. New `TestCurrentBodyCallsClassifyLookup_6706` binds the CALL via go/ast
+  scoped to Current's own body, with a synthetic negative control proving the
+  walk rejects an inlined body. Under the mutation the OLD test still PASSES
+  while the new one FAILS — the exact discrimination.
+- **Claim correction (blocking)**: `_Log.md`'s "the golden itself is the proof
+  that the flag defaults false and changes nothing for existing configuration"
+  was FALSE. Eighteen false-valued fixtures prove eighteen fixtures; `system
+  login;` is existing accepted configuration whose behaviour changes, silently.
+  Rewritten to state what changed, why it is deliberate, and where the open
+  question lives.
+- **#6966 checked, no collision**: it is a POSITION miss (`login` at `Keys[3]`
+  behind another packed system key, seen by neither arm); F2 was an over-fire
+  on a shape the detector does see. Different axes; #6966 stays open and must
+  not be closed against this PR.
+- **Validation**: `go test ./pkg/config/... ./pkg/configstore/... ./pkg/daemon/...
+  ./pkg/cli/... ./pkg/osident/... ./cmd/cli/...` rc=0, every package ok.
+  `go vet` rc=0 on the touched packages; `gofmt -l` clean on every touched file.
+- **File(s)**: pkg/config/compiler_system_login_gates.go,
+  pkg/config/login_dropped_node_aware_6706_test.go,
+  pkg/osident/osident.go, pkg/osident/current_calls_classifier_6706_test.go,
+  pkg/cli/identity_6701_test.go, _Log.md
+
+## 2026-08-12 — #6706 review r11b: finish the completeness-claim sweep
+
+- **Timestamp**: 2026-08-12
+- **Action**: Close the remaining five claims from the Codex log's section 10.
+  The sweep rule exists because these cluster: two had already been confirmed
+  and fixed (`_Log.md` "changes nothing for existing configuration",
+  `osident.go:48` "both NARROW"), so the rest were worked as a class rather
+  than left for the next reviewer to re-find.
+- **Measured, not asserted**: `daemon_run.go:728` called the UNSET class "the
+  one outcome more permissive than super-user". Driven through the real
+  `checkPermission` / `showConfigRedacted` for five representative commands:
+  unset denies 0/5 and renders cleartext; super-user denies 0/5 and renders
+  cleartext. They are BEHAVIOURALLY EQUIVALENT, not ordered — corrected to say
+  so and to name the two mechanisms (`userClass == ""` short-circuits;
+  super-user holds PermAll).
+- **The other four**:
+  - `compiler_system_login_gates.go:229-232` — "making the RUNTIME agree costs
+    nothing an operator can see" is counterexampled by the very lockout this
+    review measured (every non-root command flips to denied, silently). Removed
+    and replaced with what it actually costs. This is the same sentence class
+    as the `_Log.md` claim, and more load-bearing because it sits AT the
+    detector.
+  - `types_system.go:58-61` — "Strict commit rejects, so on that path the flag
+    is never read" is false: strict rejects prefixes that NAME something but
+    ACCEPTS the content-free ones, which commit strictly and set the flag. A
+    strict commit is a live path for it.
+  - `docs/system-login.md:423-427` — the system-line row still described the
+    runtime as fail-OPEN. It is fail-CLOSED since #6706; the old text is kept
+    as explicit history and the open question points at #6972.
+  - `docs/config-schema.md:1297-1302` — described BOTH ancestor levels as
+    fail-open with `System.Login == nil`. Only the system level was ever nil;
+    the login level compiles a NON-nil empty LoginConfig and denies through
+    ResolveLoginClass without consulting the flag. Tense corrected and the
+    two mechanisms distinguished.
+- **Validation**: `go test ./pkg/config/... ./pkg/configstore/... ./pkg/daemon/...
+  ./pkg/cli/... ./pkg/osident/... ./cmd/cli/...` rc=0, all 8 packages ok.
+  `gofmt -l` clean on every touched file. Claims-only round: no production
+  logic changed, which is why the test count is unmoved.
+- **File(s)**: pkg/daemon/daemon_run.go, pkg/config/compiler_system_login_gates.go,
+  pkg/config/types_system.go, docs/system-login.md, docs/config-schema.md,
+  _Log.md

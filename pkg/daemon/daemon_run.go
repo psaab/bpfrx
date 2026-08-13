@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipmon"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/osident"
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
@@ -716,21 +717,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return ""
 		}())
 
-		// Set RBAC login class from config (default to super-user if user not found)
-		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Login != nil {
-			osUser := os.Getenv("USER")
-			found := false
-			for _, u := range cfg.System.Login.Users {
-				if u.Name == osUser {
-					shell.SetUserClass(u.Class)
-					found = true
-					break
-				}
-			}
-			if !found {
-				shell.SetUserClass("super-user")
-			}
-		}
+		// Set the RBAC login class for the in-process console shell (#6701).
+		// See applyCLILoginClass (cli_rbac.go) for why identity comes from the
+		// kernel, and for the THREE outcomes — an earlier revision of this
+		// comment said "the default is the restrictive class, not super-user",
+		// which is only two of them (#6706 review r11): a caller RBAC cannot
+		// place gets the restrictive class, uid 0 keeps the Junos super-user
+		// default, and a config with no `system login` at all leaves the class
+		// UNSET, which is pkg/cli's legacy allow-everything mode. An earlier
+		// revision called that "more permissive than super-user"; measured, the
+		// two are BEHAVIOURALLY EQUIVALENT — checkPermission returns nil for
+		// every command under both (`userClass == ""` short-circuits;
+		// super-user holds PermAll) and showConfigRedacted is false for both,
+		// so secrets render in cleartext either way (permissions.go).
+		applyCLILoginClass(shell, d.store.ActiveConfig(), osident.Current())
 
 		// Run CLI in a goroutine so we can still handle signals
 		errCh := make(chan error, 1)

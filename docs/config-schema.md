@@ -1820,6 +1820,87 @@ Consequences worth knowing when adding a reader:
   compiled routes is a hard commit error ("at least one then preferred-route
   route is required"), so the operator is told rather than left with a silent
   no-op.
+- **`system login` is the fail-closed example with a dedicated gate (#6662).**
+  Where `ip-monitoring` gets its rejection for free (an empty policy is
+  independently invalid), an empty login class is *structurally* fine, so the
+  drop needed its own AST gate:
+  `validateLoginPackedStatementsAST` (`compiler_system_login_gates.go`), wired
+  in `runPreWalkGates`, strict at commit / warn on the tolerant path
+  (`lenientLoginPackedStatements`). It covers `login class <n>` and
+  `login user <n>` at the instance line, plus `authentication` — the one login
+  body statement the compiler reads exclusively through `.Children` — written
+  inline one level down.
+
+  It is worth stating **why** this one had to reject rather than compile
+  something. Every downstream safety net in the stanza is guarded on
+  NON-EMPTINESS, so an empty compile silences the whole belt at once: an empty
+  user class is `pkg/cli`'s deliberate legacy "no RBAC configured" shortcut
+  (allow every command, render secrets in cleartext), and the
+  `deny-commands` "MORE PERMISSIVE" advisory is guarded on
+  `lc.DenyCommands != ""` — the field the bug dropped is the field the guard
+  reads. Unpacking instead would have to be exactly right for every leaf to
+  avoid minting a wrong-but-non-empty class, which is worse than an empty one;
+  both accepted spellings already work, so the operator has a mechanical
+  rewrite. See `docs/system-login.md` for the operator-facing table.
+
+  **The gate reproduces `namedInstances`' two-shape branch rather than calling
+  it**, because it needs the number of leading IDENTITY keys and that helper
+  discards it: `len(Keys) >= 2` is the node itself (identity 2), otherwise it
+  is a child of a bare `user { }` container (identity 1). Branching on the
+  shape — rather than sniffing `Keys[0]` against the keyword — stays correct
+  for an instance literally named `user` or `class`.
+
+  **The packing has THREE levels, and the gate's first revision saw only one
+  (#6706).** The walk descends with `forEachChild` and `FindChildren`, which
+  both match on `Keys[0]`, so a path packed onto an ANCESTOR line was invisible
+  to it: with the instance on the `login` line that node carries
+  `Keys=["login","user","alice",…]` and zero children, so `FindChildren("user")`
+  returns nothing; with `login` on the `system` line, `sys.Children` is empty
+  and the inner walk never runs. Measured through `configstore.CheckText` — the
+  real commit / `commit check` / `xpfd check-config` pipeline — both
+  `system { login user alice class ops; }` and `system login user alice class
+  ops;` committed GREEN and compiled nothing.
+
+  The sharp form of why that mattered: the one level the gate covered is the
+  one whose runtime outcome is fail-CLOSED (an instance with an empty class
+  resolves to `unauthorized`), while the two it missed were the fail-OPEN ones —
+  `System.Login == nil` used to hit `pkg/daemon` `applyCLILoginClass`'s early
+  return, so `SetUserClass` was never called and `pkg/cli` ran with an empty
+  class: allow every command, render secrets in cleartext.
+
+  That description is now HISTORICAL for the system level, and the tense is
+  load-bearing (corrected #6706 review r11). `LoginDroppedByPacking` suppresses
+  that early return, so a system-line packed path no longer fails open: a
+  non-root caller gets `unauthorized` and root keeps its default. The
+  login-line level was never nil-Login in the first place — it compiles a
+  NON-nil but empty `LoginConfig`, which denies through `ResolveLoginClass`
+  without consulting the flag at all. Both spellings therefore deny today, by
+  two different mechanisms; #6972 asks whether a content-free prefix should.
+
+  The generalisation is one predicate at two node levels — a `system` node with
+  `Keys[1] == "login"`, or a `login` node with any key beyond its own — and a
+  finding at an ancestor SUBSUMES everything below it, since the stanza the
+  operator wrote does not exist at all. A prefix that stops before an instance
+  NAME and has no children below (`system login;`, `system login user;`) names
+  no user and no class, so there is nothing dropped to report and it is not
+  rejected. It does NOT "declare nothing in either spelling" — an earlier
+  revision said that and it is false (#6706 review r11): the nested
+  `system { login; }` compiles a non-nil empty `LoginConfig` and denies every
+  non-root caller, while the packed `system login;` compiles nil and reaches the
+  legacy allow-everything mode. Reporting and runtime posture are separate
+  decisions; the divergence is closed by `Config.System.LoginDroppedByPacking`
+  (set by `loginPathPackedAnywhere` for EVERY packed shape, reported or not) and
+  `pkg/daemon` `applyCLILoginClass`, which refuses the legacy unset-class mode
+  when it is set. Both REPORTING arms ride the same
+  `lenientLoginPackedStatements` flag as the instance arm and the same
+  `forEachClusterNodeView` both-node union.
+
+  The sibling shadow gate (`validateLoginClassShadowsBuiltinAST`) skips a
+  `login` node carrying extra keys for the mirror-image reason: its children are
+  then an INSTANCE body, so reading a `class <n>` child there misreads a user's
+  class ASSIGNMENT as a class DEFINITION — it reported `system login class
+  read-only: this definition is INERT` for a definition never written. The
+  stanza is still rejected, by the ancestor arm, which names the real defect.
 
 **The two collapses COMPOSE, and a monitor statement hits both.** The packed
 collapse above is orthogonal to the `#2419` bracket collapse at the top of this
