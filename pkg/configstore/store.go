@@ -412,18 +412,49 @@ func compileTreeStrict(tree *config.ConfigTree, nodeID int) (*config.Config, err
 	if err := crossCheckRAIntervals(compiled); err != nil {
 		return nil, err
 	}
-	// #5876: a chassis-cluster commit must prove BOTH node-effective source-NAT
-	// views are representable before promotion, not only the submitting node's.
+	// #5876 + #4785: a chassis-cluster commit must adjudicate the REGISTERED
+	// peer-effective concerns on BOTH node-effective views before promotion, not
+	// only the submitting node's. Two qualifiers, both load-bearing. "The
+	// registered concerns", because the registry holds exactly two subjects
+	// (source NAT and the emitted-IPIP endpoint) — "adjudicates the
+	// peer-effective view" would claim a completeness it does not have (#6861
+	// re-gate C2). And "adjudicate", not "prove installable": the peer gate
+	// below is conditional on the peer view COMPILING, and a peer view that does
+	// not compile is deliberately left unadjudicated (see
+	// ValidatePeerEffectiveStrict, and the #6861 F2 paragraph further down for
+	// the case where that swallow bit).
 	// This gate compiles for the local node alone (CompileConfigForNode above),
 	// so a ${node} apply-group substitution / per-node rewrite that selects a
-	// source-NAT pool or reference valid on the origin but invalid on the peer
-	// passes green — then the standby lenient-loads the synced snapshot and
-	// silently fails its SNAT closed. Re-run the strict SOURCE-NAT validators
-	// against the peer's effective compile (the same CompileConfigForNodeLenient
-	// transform the standby applies) so a peer-only pool/reference error is
-	// rejected here, at the one strict gate that ever sees this config.
+	// source-NAT pool valid on the origin but invalid on the peer — or a
+	// peer-only `ip-*` interface whose inferred `mode ipip` the dataplane drops
+	// in both directions — passes green. What synchronises is the RAW group
+	// tree, and the standby ingests it leniently (Store.SyncApply), so the
+	// defect installs on the peer with no strict check anywhere. Re-run the
+	// registered strict subjects against the peer's effective compile (the same
+	// CompileConfigForNodeLenient transform the standby applies) so a peer-only
+	// error is rejected here, at the one strict gate that ever sees this config.
 	// Standalone (nodeID < 0) has no peer and is a no-op.
-	if err := config.ValidatePeerEffectiveSourceNATStrict(tree, nodeID); err != nil {
+	//
+	// #6861 F2: the gate must be handed the tree the PEER will actually
+	// compile, not the raw candidate. Store.SyncApply runs
+	// rewriteRetiredDataplaneType BEFORE compileTreeLenient, so a peer
+	// `groups nodeN` block carrying a retired `system dataplane-type` leaf
+	// compiles fine on the standby but fails the unconditional retirement
+	// validator here. ValidatePeerEffectiveStrict treats a peer view that
+	// will not compile as out of scope and returns nil — so the gate
+	// returned SUCCESS WITHOUT EVER RUNNING ITS IPIP SUBJECT, and the
+	// standby then stripped the retired leaf and installed the dead tunnel.
+	// Reproduced end-to-end before this fix: node0 committed green, node1's
+	// SyncApply installed `ip-0/0/0` mode ipip.
+	//
+	// The rewrite is applied to a CLONE. Mutating the candidate here would
+	// silently strip the operator's own leaf out of the tree being
+	// committed — the strict local path must keep rejecting it, and the
+	// peer group's leaf must survive to sync so the standby's own
+	// tolerance is what handles it.
+	peerTree := tree.Clone()
+	rewriteRetiredDataplaneType(peerTree, SyncCaller)
+	if err := config.ValidatePeerEffectiveStrict(peerTree, nodeID); err != nil {
 		return nil, err
 	}
 	return compiled, nil

@@ -183,6 +183,93 @@ connectionless and exempt:
   all leaked as "no filter". A syslog host that lists several
   `<facility> <severity>` pairs is folded to one client filter via
   `MoreRestrictiveMinSeverity` (the most restrictive pair wins).
+- **Unmapped facility names are reported, not silent (#5797).**
+  `ParseFacility` returns `FacilityLocal0` for any name it does not know,
+  which makes an authored `local0` indistinguishable from a name the
+  mapper simply lacks — and the mapper lacks the **Junos** facility
+  vocabulary outright. Junos writes `authorization`, `kernel`,
+  `interactive-commands`, `conflict-log`, `pfe`; `ParseFacility` knows only
+  the BSD/rsyslog spellings (`auth`, `kern`, ...). So an ordinary Junos
+  `host H authorization critical` forwards under **local0** today and the
+  collector's facility-based routing misfiles it, with no signal.
+  `ParseFacilityChecked` returns the "was this recognized" bit so the
+  daemon can warn; the substituted code is unchanged, because which
+  facility a record actually goes out under is an operator-visible contract
+  question still owned by #5797. Note there is no commit gate to lean on
+  instead: `system syslog <dest> <facility> <severity>` models the facility
+  as the schema's wildcard KEY and validates only the severity VALUE, so
+  every spelling commits clean.
+
+  As of #6829 ALL THREE `ParseFacility` call sites that install a client use
+  the checked form and warn: `applySystemSyslog` (host streams), the
+  security/audit stream wiring in `daemon_system.go`, and the CLI commit
+  mirror in `pkg/cli/apply.go`. The last two were previously left on the
+  unchecked form on the argument that the schema enum gates them — true on the
+  STRICT path only. `configstore.Store` downgrades that gate to a warning on
+  `Load` (boot) and `SyncApply` (HA peer sync), which is the same reachability
+  class the severity belt exists for, so the two were treated inconsistently.
+  Untold, an unmappable name sends every record on those streams out under
+  local0 while `show system syslog` still reports the authored name.
+
+  The `any` wildcard does NOT warn. `set system syslog host <ip> any <sev>` is
+  the canonical Junos form and names no facility deliberately, so the
+  substitution warning's own text — "records will carry a facility the
+  configuration does not name" — is false for it. `logging.FacilityIsWildcard`
+  is the single definition all three call sites share; it suppresses the
+  warning only, and does not change what `ParseFacility` returns.
+- **rsyslog selector tokens are grammar-checked, per POSITION (#5797).** The
+  `file` and `user` destinations do not use `SyslogClient` at all — the
+  daemon builds an rsyslog selector `<facility>.<severity>` and writes a
+  managed drop-in. #4902 belted the file NAME and user TOKEN on that line
+  but not the two selector tokens, so an rsyslog metacharacter in either
+  one escaped the selector and injected configuration. The two tokens do
+  not share a threat model: the severity is enum-gated at commit and so
+  only arrives unsafe on the tolerant load / peer-sync path, while the
+  unvalidated facility reaches the render site verbatim from an ORDINARY
+  commit (`set system syslog file audit "daemon;*.* /tmp/pwn" info` passes
+  commit-check). The belt is the only thing standing between that string
+  and a written rsyslog directive, so it is bound at the render site by
+  `pkg/daemon/syslog_selector_render_5797_test.go`, not only by the
+  predicates' own unit tests.
+
+  The belt is **position-aware**, because rsyslog's two selector positions
+  have different grammars (rsyslog.conf(5), sysklogd format) and a single
+  allowlist applied to both is necessarily their intersection:
+
+  | position | accepted | rendered example |
+  |---|---|---|
+  | facility | empty (folds to `*`), `any` (folds to `*`), exact `*`, or a comma-separated list of `[A-Za-z0-9-]` names | `auth,authpriv.info`, `*.info` |
+  | severity | empty (folds to `*`), a `[A-Za-z0-9-]` name, exact `*`, or one of the `=` / `!` / `!=` priority modifiers in front of a name or `*` | `daemon.*`, `daemon.=info`, `daemon.!=debug` |
+
+  The comma is admitted **per member**: `auth,authpriv` renders, while
+  `auth,`, `,auth`, `auth,,authpriv` and `auth,authpriv;*.* /tmp/pwn` do
+  not. The comma operator is deliberately NOT accepted in the severity
+  position — rsyslog defines it for multiple facilities "with the same
+  priority pattern", and multiple priorities are written as `;`-joined
+  selectors, so `daemon.info,err` was never a valid selector and admitting
+  it would widen the accept set without recovering any working config.
+
+  Everything rejected for structural reasons is still rejected in **both**
+  positions: whitespace, `.`, `;`, `:`, `/`, control bytes, and arbitrary
+  punctuation. `daemon;*.* /tmp/pwn` is dropped; that is the injection
+  #5797 exists for. The space is the load-bearing byte rather than the
+  newline — a literal newline cannot reach these tokens (the lexer folds it
+  to a space), while a space pushes attacker-chosen text into the rsyslog
+  ACTION position.
+
+  Accepting `*` and the comma list costs nothing, which is why they are in
+  rather than out. The render is `fmt.Sprintf("%s.%s", facility, severity)`,
+  so a whole-token `*` can only ever produce `*.<severity>` — one byte, no
+  room for a payload — and each list member is checked individually. Both
+  spellings pass commit-check and both rendered a working drop-in before
+  any belt existed, so rejecting them would not have hardened the render
+  path: it would have warned-and-reconciled-AWAY an operator's working
+  destination on upgrade (the drop-in is not merely left unwritten,
+  `reconcileSyslogDropins` removes it). What the belt still refuses to do
+  is decide which facility NAMES are honoured — that is the deferred
+  mapping question above, and the `change-log` → `local6` remap and
+  `any` → `*` fold remain whole-token comparisons, so a list member spelled
+  `change-log` or `any` is passed through verbatim.
 - **Lazy connect — receiver down at apply does not disable the stream
   (#3351).** A TCP/TLS receiver that is unreachable at config-apply or
   boot must NOT permanently silence the stream. `NewSyslogClientTransport`

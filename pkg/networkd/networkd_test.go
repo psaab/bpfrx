@@ -677,6 +677,10 @@ func TestApplyPreservesProtectedFiles(t *testing.T) {
 // lists each call received and restores the original on cleanup.
 func stubNetworkctl(t *testing.T) *[][]string {
 	t.Helper()
+	// The #4954 activation debt is process-scoped (#5718 fold F2), so start
+	// every stubbed test from a clean debt: a leaked debt would make an
+	// otherwise-unchanged Apply shell out an extra time.
+	resetReloadDebtForTest(t)
 	orig := runNetworkctl
 	var calls [][]string
 	runNetworkctl = func(args ...string) error {

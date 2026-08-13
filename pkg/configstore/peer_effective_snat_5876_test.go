@@ -13,7 +13,7 @@ import (
 // STORE wiring: compileTreeStrict compiles the local node clean, then the
 // peer-effective SNAT gate rejects.
 //
-// FAIL-ON-REVERT: drop the config.ValidatePeerEffectiveSourceNATStrict call from
+// FAIL-ON-REVERT: drop the config.ValidatePeerEffectiveStrict call from
 // compileTreeStrict (leaving the local compile) and compileTreeStrict(tree, 0)
 // returns nil — this test goes RED.
 
