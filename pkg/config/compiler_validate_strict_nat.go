@@ -3268,10 +3268,34 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 // pools = 12,683,575,296 bitmap bits, ~1.48 GiB). The Rust apply boundary
 // independently enforces the same budgets (resolve_pool_allocators in
 // userspace-dp/src/nat/source.rs) as the final backstop; the first-fit
-// admission rule here mirrors it exactly — same order, same charge, and (since
-// #6812 F1) the same EXCLUSIONS, see sourceNATAggregateReferencedCharges — so
-// Go and the dataplane agree on WHICH pools live. That agreement is a tested
-// claim, not an asserted one: TestAggregateBudgetExcludesUnusablePools_6812
+// admission rule here mirrors it — same charge, and (since #6812 F1) the same
+// EXCLUSIONS, see sourceNATAggregateReferencedCharges — so Go and the dataplane
+// agree on WHICH pools live.
+//
+// ORDER, precisely (#6812 round 8 — an earlier revision of this comment said
+// "same order" flatly, which holds only for a FIRST apply). This walk is a
+// single first-fit pass in emitted first-reference order. resolve_pool_allocators
+// is TWO passes: phase 1 reserves every DISTINCT key already present in
+// `previous_allocators` — reused keys are accepted unconditionally, so their
+// charge is live state rather than a prediction — and only then does phase 2
+// admit NEW keys against that total (source.rs, "Reused keys are RESERVED
+// before any new key is admitted", #6812 F2 round 4). With an empty
+// `previous_allocators` phase 1 reserves nothing and phase 2 walks the slice in
+// order, so the two sequences are identical. On a RE-apply they are not: Rust
+// charges all reused keys before any new one; this walk charges in slice order
+// throughout.
+//
+// The agreement claim survives that, because the two are not independent
+// deciders. The poison this walk computes travels on the wire, and the Rust
+// parse loop builds no PendingPoolAllocator for a rule whose pool already
+// failed — so a pool this walk poisons reaches neither Rust phase, and Rust
+// re-derives admission over the reduced set. The reserve-first order exists for
+// the snapshots no Go poison is coming for (a tolerated, older control plane's,
+// or handcrafted snapshot), which is what makes that boundary an INDEPENDENT
+// backstop rather than a second opinion.
+//
+// That agreement is a tested claim, not an asserted one:
+// TestAggregateBudgetExcludesUnusablePools_6812
 // (this package) and TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812
 // (pkg/dataplane/userspace) drive the Go half, and
 // production_entry_admits_a_healthy_pool_after_failed_pools_6812

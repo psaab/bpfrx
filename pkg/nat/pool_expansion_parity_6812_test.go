@@ -127,6 +127,18 @@ func TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812(t *testing.T
 	// parse_canonical_prefix_len both refuse the leading-zero mask. That made
 	// the deterministic surface answer a forward-mapping query with a
 	// 65,536-address pool for a member every other layer rejects.
+	//
+	// The assertion is ERROR, not "empty output" (#6812 round 8). Through
+	// round 7 it fired only for `lerr == nil && len(got) > 0`, which leaves
+	// EMPTY SUCCESS admissible — and empty success is what a per-member SKIP
+	// produces. Measured at 52f7e735a: changing the netip.ParsePrefix branch in
+	// expandPoolV4 from `return nil, lerrf(...)` to `continue` left this test
+	// GREEN, because every fixture row is a SINGLE-member pool, so skipping its
+	// only member returns (nil, nil). That is not a lesser failure than
+	// acceptance: lookupForwardInPool would report "no mapping" for a pool the
+	// caller believes is configured, and the mixed-member half below shows the
+	// same skip silently PARTIALLY translating a pool the dataplane refuses
+	// whole.
 	rejected := 0
 	for _, c := range fx.Cases {
 		if c.OK || c.Addr == "" {
@@ -141,16 +153,77 @@ func TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812(t *testing.T
 		rejected++
 		pool := &config.NATPool{Name: "p", Addresses: []string{c.Addr}}
 		got, lerr := expandPoolV4(pool, ModeV4)
-		if lerr == nil && len(got) > 0 {
-			t.Errorf("expandPoolV4(%q) ACCEPTED %d addresses, but the shared fixture — and "+
-				"therefore the commit gate and the dataplane — reject this member. The pool "+
-				"translates nothing while show/gRPC/REST report a confident mapping for it",
-				c.Addr, len(got))
+		if lerr != nil {
+			continue
 		}
+		t.Errorf("expandPoolV4(%q) returned NO ERROR (%d addresses), but the shared "+
+			"fixture — and therefore the commit gate and the dataplane — reject this "+
+			"member. The pool translates nothing; this surface must say so with an "+
+			"error, not by returning an empty (or partial) mapping that reads as a "+
+			"correctly-configured pool with nothing allocated yet",
+			c.Addr, len(got))
 	}
 	if rejected < 8 {
 		t.Fatalf("only %d rejected v4 rows exercised; the reject half needs enough shapes "+
 			"to be worth asserting", rejected)
+	}
+
+	// MIXED-MEMBER, both orders (#6812 round 8). The single-member rows above
+	// cannot distinguish "the pool fails" from "that member is skipped" — with
+	// one member the two produce the same empty result. A pool carrying one
+	// refused member ALONGSIDE a good one can, and it is the shape with the
+	// operator-visible consequence: under a per-member skip the pool reports a
+	// working 1-address mapping while the Rust parse loop ORs
+	// expand_pool_address over every member and fails the WHOLE pool
+	// SourceNatFailureReason::InvalidPool (userspace-dp/src/nat/source.rs) — so
+	// the dataplane translates nothing and the deterministic surface names an
+	// external address for a subscriber that has none. All-or-nothing is the
+	// same clause SourceNATPoolUnusableReason enforces one layer up (#6812 F1
+	// round 2); this is that clause at the expander.
+	//
+	// BOTH orders matter. With the refused member FIRST a skip yields empty
+	// success; with it SECOND the good member is already in `out`, so a skip
+	// yields NON-EMPTY partial success. Only the second shape would have been
+	// visible to the round-7 assertion, and only for pools declared that way.
+	const goodMember = "198.51.100.7/32"
+	mixed := 0
+	for _, c := range fx.Cases {
+		if c.OK || c.Addr == "" {
+			continue
+		}
+		if config.NATAddrFamily(config.NATCIDRIPPart(c.Addr)) != "v4" {
+			continue
+		}
+		mixed++
+		for _, members := range [][]string{
+			{c.Addr, goodMember},
+			{goodMember, c.Addr},
+		} {
+			pool := &config.NATPool{Name: "p", Addresses: append([]string(nil), members...)}
+			got, lerr := expandPoolV4(pool, ModeV4)
+			if lerr == nil {
+				t.Errorf("expandPoolV4(pool %v) returned NO ERROR and %d addresses %v. One "+
+					"member is refused by the shared grammar fixture, and the dataplane fails "+
+					"the WHOLE pool for it — a per-member skip here reports a working partial "+
+					"pool for a pool that translates nothing", members, len(got), got)
+				continue
+			}
+			if len(got) != 0 {
+				t.Errorf("expandPoolV4(pool %v) reported an error AND returned %d addresses "+
+					"%v; a failed pool must expand to nothing", members, len(got), got)
+			}
+		}
+	}
+	if mixed < 8 {
+		t.Fatalf("only %d mixed-member pools exercised; the all-or-nothing half needs "+
+			"enough refused shapes to be worth asserting", mixed)
+	}
+	// The good member must itself be acceptable, or every mixed pool above
+	// fails for the wrong reason and the all-or-nothing claim is vacuous.
+	if got, lerr := expandPoolV4(&config.NATPool{Name: "p", Addresses: []string{goodMember}}, ModeV4); lerr != nil || len(got) != 1 {
+		t.Fatalf("control: expandPoolV4(%q) = %v, %v — the mixed-member fixtures need this "+
+			"member to expand cleanly on its own, or they prove nothing about the REFUSED "+
+			"member poisoning the pool", goodMember, got, lerr)
 	}
 }
 

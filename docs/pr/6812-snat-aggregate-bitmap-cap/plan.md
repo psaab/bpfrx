@@ -881,3 +881,204 @@ rules when its block is contiguous. Now gated on (2). Under `sort.Slice` the
 within-set line count drops 16 -> 10; the remaining 10 are CONTIGUOUS rule-sets
 whose two rules are genuinely out of order, which is a true (3) violation, so
 the gate removed the artifacts and kept the findings.
+
+## Round 8 — the same blindness one nesting level in, and an assertion that admitted empty success
+
+Three live findings from a Codex leg that ran at the pre-round-7 head; all three
+re-verified at `52f7e735a` before anything was changed. A fourth (the anti-vacuity
+guard checks global rather than per-tier name order) was already closed by round 7
+and is recorded here as a non-defect: the guard at head IS per-tier
+(`assertNoTierDeclaredNameAscending6812`), two reviewers reached that shape
+independently.
+
+### B1 — round 7 de-correlated the rule-SET names and left the RULES correlated
+
+Round 7's fix was right and incomplete. `TestBuilderEmittedOrderIsStableWithinATier_6812`
+declares rule-sets high-to-low so a `(tier, name ASC)` tiebreak is visible — and
+then declares each rule-set's two rules `r0` then `r1`, which is config order AND
+ascending name order at once. Assertion (3) ("rules keep their within-rule-set
+config order") therefore could not see a within-set sort.
+
+Measured at `52f7e735a`, not argued: inserting
+
+```go
+mutRules := append([]*config.NATRule(nil), rs.Rules...)
+sort.SliceStable(mutRules, func(i, j int) bool { return mutRules[i].Name < mutRules[j].Name })
+```
+
+ahead of the emit loop in `buildSourceNATSnapshotsWithFeeds` left the whole test
+**GREEN**. This is the identical property the PR exists to protect — config order
+and lexicographic name order being the same sequence — one level in from where
+round 7 corrected it.
+
+Fixed three ways:
+
+1. The rule loop declares `r1` before `r0` (and the per-rule match address rides
+   on the same index, so a sort keyed on `MatchSourceAddresses` is de-correlated
+   too). Under the mutation the test now reds on the assertion:
+   `rule-set if05 rule[0] = r0, want r1 ... Declared: [r1 r0]; emitted block: [r0 r1]`.
+2. Assertion (3) no longer re-derives `r%d`. It reads the DECLARED rule sequence
+   out of the compiled config and requires the emitted block to reproduce it, so
+   a future re-cut of the fixture loop cannot leave the expectation pointing the
+   other way.
+3. `assertNoRuleSetDeclaredRuleNameAscending6812` — the round-7 tripwire one level
+   in. It fails if any rule-set with two or more rules is declared name-ascending,
+   and fails if no rule-set discriminates at all. Proven reachable the way round 7
+   proved its own: re-cutting the loop ascending reds against PRISTINE production
+   with `rule-set for pool if00 declares its rules in ascending NAME order [r0 r1]`.
+
+### The third level — enumerated, not assumed
+
+Every generated name in the ordering fixtures, and whether a production sort
+could key on it:
+
+| generated | fixture direction | reachable as a sort key? | status |
+|---|---|---|---|
+| rule-set name (`if%02d`/`zn%02d`) | descending | yes — the outer `sort.SliceStable` comparator | de-correlated (round 7) |
+| pool name (same strings) | descending | yes — `SourceNATRuleSnapshot.PoolName` | de-correlated (round 7); this is what the tripwire keys on |
+| **rule name (`r%d`)** | **was ascending** | **yes — `SourceNATRuleSnapshot.Name`** | **B1, fixed here** |
+| rule match address (`10.0.%d.0/24`) | rode on the rule index | yes — `MatchSourceAddresses` | de-correlated as a side effect of B1 |
+| from-interface (`ge-0/0/%d.0`) | descending | yes — a scope field on the snapshot | already de-correlated |
+| from-zone (`trust%d`) | descending | yes — a scope field on the snapshot | already de-correlated |
+| pool address (`10.%d.0.1`, 100+i / 200+i) | descending (all three digits, so lexicographic == numeric) | yes — `PoolAddresses[0]` | already de-correlated |
+| counter ID | n/a — `natCounterIDs` is nil in this fixture | no: constant 0, not discriminating | n/a |
+
+There is no fourth level: below the rule there is no per-rule collection this
+builder emits in a caller-visible order.
+
+The first-fit fixtures (`p0/p1/p2`, `bad0..badN` + `good`) DO declare pools in
+ascending name order, and that is deliberate rather than an oversight: none of
+them asserts an order. `TestAggregateOverBudgetPoolsFirstFit_6812` refuses `p1`
+because `p1` alone exceeds the address budget, which is order-independent; the
+`bad*`/`good` fixtures need only that `good` is charged last, which a name sort
+preserves (`"bad9" < "good"`). Recorded so a later reader does not "fix" them
+into fixtures that prove less.
+
+### B1b — the walk side had no rule-level assertion either
+
+`sourceNATAggregateReferencedCharges` documents three ordering clauses; rounds 4
+and 7 bound the rule-set one, and nothing asserted "rules in config order". Every
+walk-side ordering fixture declares exactly ONE rule per rule-set, so there is no
+within-set order to permute at all.
+
+`TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812` asserts it directly:
+one rule-set (single tier, so the tier sort is a no-op and only the rule walk can
+reorder anything), four rules declared `r03 r02 r01 r00` referencing pools
+`qb qd qa qc`, with the three candidate sequences kept pairwise distinct and that
+distinctness asserted so the fixture cannot decay:
+
+```
+declaration order:  qb qd qa qc   <- the walk must reproduce this
+rule-name ASC:      qc qa qd qb
+pool-name ASC:      qa qb qc qd
+```
+
+Under the same sort inserted into the charge walk it reds with
+`charge order = [qc qa qd qb], want [qb qd qa qc]`.
+
+One honest qualifier, because what detected it was an accident. The same mutation
+also reds `TestAggregateOverBudgetPoolsAddresses_6812` and
+`TestAggregateOverBudgetPoolsCount_6812` (`poison set = map[p999:true], missing
+"p1024"`). Those are count/address BUDGET fixtures; they move only because their
+1,025 rules are named `r0..r1024` and `"r1000" < "r999"` lexicographically. Zero-pad
+those names — a plausible readability edit — and both go blind while the clause
+stays unbound.
+
+### B2 — the reject assertion did not bind all-or-nothing
+
+`TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812`'s reject half
+fired only for `lerr == nil && len(got) > 0`. Empty success was admissible — and
+empty success is exactly what a per-member SKIP produces, because every fixture row
+is a SINGLE-member pool. Measured at `52f7e735a`: changing the `netip.ParsePrefix`
+branch in `expandPoolV4` from `return nil, lerrf(...)` to `continue` left the test
+GREEN.
+
+Two changes:
+
+- The per-row assertion now requires a NON-NIL error. Under the `continue`
+  mutation it reds on twelve rows, e.g. `expandPoolV4("10.0.0.0/016") returned NO
+  ERROR (0 addresses)`.
+- A MIXED-member half, in BOTH orders. `[refused, 198.51.100.7/32]` and
+  `[198.51.100.7/32, refused]` must each fail with zero addresses. This is the
+  shape with the operator-visible consequence: the Rust parse loop ORs
+  `expand_pool_address` over every member and fails the WHOLE pool
+  `SourceNatFailureReason::InvalidPool`, so a per-member skip reports a working
+  1-address mapping for a pool that translates nothing. Under the mutation:
+  `expandPoolV4(pool [198.51.100.1/032 198.51.100.7/32]) returned NO ERROR and 1
+  addresses [198.51.100.7]`. A control asserts the good member expands cleanly on
+  its own, so the mixed rows cannot pass for the wrong reason.
+
+Note the order asymmetry the round-7 assertion depended on: with the refused member
+FIRST a skip yields empty success (invisible), with it SECOND it yields non-empty
+partial success (visible). Only the second shape was ever in reach.
+
+### B3 — "same order" is true only of a FIRST apply
+
+`SourceNATAggregateOverBudgetPools`' doc comment said the Go first-fit rule
+"mirrors it exactly — same order, same charge". The order half is false whenever
+`previous_allocators` is non-empty. `resolve_pool_allocators` is TWO passes
+(source.rs, "Reused keys are RESERVED before any new key is admitted", #6812 F2
+round 4): phase 1 charges every distinct REUSED key, phase 2 then admits NEW keys
+against that total. The Go walk is a single first-fit pass in emitted order
+throughout. With an empty previous map the sequences coincide; on a re-apply they
+do not.
+
+The 60,000-config differential could not see this because it models the Rust gate
+in Go — it reproduces the admission arithmetic, not the two-pass structure.
+
+The Go/Rust AGREEMENT claim is unaffected and is left standing. The two are not
+independent deciders: the poison this walk computes travels on the wire, and the
+Rust parse loop builds no `PendingPoolAllocator` for a rule whose pool already
+failed, so a poisoned pool reaches neither Rust phase and Rust re-derives
+admission over the reduced set. The reserve-first order exists for the snapshots
+no Go poison is coming for — a tolerated, older control plane's, or handcrafted
+snapshot — which is precisely what makes that boundary an INDEPENDENT backstop
+rather than a second opinion.
+
+Corrected at both live sites (the `SourceNATAggregateOverBudgetPools` doc comment
+and `TestSnapshotPoisonFollowsEmittedScopeOrder_6812`'s "walks the emitted rule
+slice in order"). The round-3 narrative above quotes the sentence as it stood then
+and is accurate as history; this section is its correction.
+
+### Deferred, with the site list — capacity surfaces still count a refused member
+
+Codex's remaining finding is real, verified at head, and DELIBERATELY NOT FIXED
+HERE. `expandPoolV4` now refuses a pool with a non-canonical member, but four
+other operator-facing surfaces still derive capacity from `len(pool.Addresses)`,
+which counts members the grammar refuses. Because the pool predicate is
+all-or-nothing, such a pool installs NO allocator and its true capacity is zero.
+
+Measured at `52f7e735a` for a pool `{Addresses: ["10.0.0.0/016"], Deterministic:
+{BlockSize: 512}}`, whose `SourceNATPoolUnusableReason` is `"invalid_pool"`:
+
+| site | reports |
+|---|---|
+| `pkg/cli/cli_show_nat.go:206` and `:349` | 64,512 total ports |
+| `pkg/api/metrics_nat.go:31` | 64,512 (`natPoolTotalPorts` gauge) |
+| `pkg/api/metrics_nat.go:109` (`deterministicPoolBlockCapacity`) | 126 blocks |
+| `pkg/grpcapi/server_nat.go:132` | 64,512 |
+| `pkg/api/nat.go:271` | address count 1, and `:277` PRESERVES it when the runtime reports `AddressCount == 0` — so "the helper has zero addresses" never reaches the operator |
+
+That is SIX call sites in four files, not four; the line numbers in the review ran
+one commit back. Adjacent but differently derived: `deterministicSubscriberCapacity`
+publishes `host_count = 256` on `natPoolDeterministicInfo` for the same pool, from
+the subscriber CIDR rather than from the pool members.
+
+Why it is not in this PR: it lives entirely in `pkg/cli`, `pkg/api` and
+`pkg/grpcapi`, none of which this 21-file diff touches; it changes what four
+operator surfaces REPORT (including a Prometheus gauge, which is a
+monitoring-visible contract) and each owes its own test; and there is a design
+question underneath that a separate change should settle rather than half-answer.
+All six sites use the MEMBER count, so a healthy `203.0.113.0/24` pool already
+reports 1 where the dataplane installs 256. A one-place derivation — capacity
+from the same grammar the dataplane accepts — should settle zero-on-unusable AND
+member-vs-expanded together. Fixing only the first half here would leave the same
+shape half-closed.
+
+Recommended shape for the follow-up: one exported helper in `pkg/config` beside
+`SourceNATPoolUnusableReason` returning the reportable address cardinality (0 when
+the pool is unusable, the expanded honorable count otherwise), with all six sites
+consulting it. What that makes unrepresentable: a surface that reports capacity
+for a pool the dataplane refused, because there is no longer a per-consumer
+expression to get wrong — the same "consult the verdict, do not re-derive it"
+rule round 2 applied to the budget walk, one layer out.

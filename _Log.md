@@ -79871,3 +79871,60 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13T18:05Z
+- **Action**: #6815 round 8 — folded three live Codex blockers, all re-verified at
+  the round-7 head `52f7e735a` before anything changed. (B1) Round 7 de-correlated
+  the rule-SET names from declaration order and left the RULES inside each rule-set
+  declared `r0` then `r1` — config order and ascending name order at once. Measured
+  on a scratch worktree, not argued: inserting a `sort.SliceStable(rs.Rules, byName)`
+  ahead of the emit loop in `buildSourceNATSnapshotsWithFeeds` left
+  `TestBuilderEmittedOrderIsStableWithinATier_6812` entirely GREEN. Rules now declare
+  descending; assertion (3) reads the DECLARED sequence out of the compiled config
+  instead of re-deriving `r%d`, so a re-cut cannot leave the expectation behind; and
+  `assertNoRuleSetDeclaredRuleNameAscending6812` is the round-7 tripwire one level in
+  (proven reachable — re-cutting the loop ascending reds against PRISTINE production
+  with `rule-set for pool if00 declares its rules in ascending NAME order [r0 r1]`,
+  while the descending fixture under the mutation reds on the ASSERTION, so the
+  precondition does not shadow it). Enumerated every other generated name in these
+  fixtures against "could a production sort key on it": rule-set/pool names, match
+  address, from-interface, from-zone and pool address are all already descending;
+  the counter ID is constant. No fourth level exists. (B1b) The walk side had NO
+  rule-level assertion — every `pkg/config` ordering fixture declares one rule per
+  rule-set. Added `TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812`
+  (one rule-set so the tier sort is a no-op; four rules `r03 r02 r01 r00` referencing
+  pools `qb qd qa qc`, with the three candidate sequences asserted pairwise
+  distinct). Qualifier recorded because what detected it was an accident: the same
+  mutation also reds the count/address budget fixtures, but only because their 1,025
+  rules are named `r0..r1024` and `"r1000" < "r999"` — zero-pad those names and both
+  go blind. (B2) The reject half of
+  `TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812` fired only for
+  `nil error && nonempty output`, so EMPTY SUCCESS was admissible — and every fixture
+  row is a single-member pool, so a per-member skip produces exactly that. Measured:
+  changing the `netip.ParsePrefix` branch in `expandPoolV4` to `continue` left it
+  GREEN. Now requires a non-nil error per row, plus a MIXED-member half in BOTH
+  orders with a control that the good member expands alone; under the mutation the
+  mixed row reds `expandPoolV4(pool [198.51.100.1/032 198.51.100.7/32]) returned NO
+  ERROR and 1 addresses [198.51.100.7]`. (B3) Corrected a false claim this PR
+  authored: `SourceNATAggregateOverBudgetPools` said the Go first-fit rule "mirrors
+  it exactly — same order". `resolve_pool_allocators` is TWO passes — reused keys
+  reserved in phase 1, new keys admitted in phase 2 — so the sequences coincide only
+  when `previous_allocators` is empty. The Go/Rust AGREEMENT claim is unaffected and
+  is left standing, with the reason stated: the Go poison travels on the wire and a
+  poisoned pool reaches neither Rust phase. Corrected at both live sites; the round-3
+  narrative in plan.md quotes the sentence as it stood and is accurate as history.
+  DEFERRED with a site list rather than half-fixed: four operator surfaces still
+  derive capacity from `len(pool.Addresses)`, which counts a refused member — six
+  call sites in `pkg/cli`/`pkg/api`/`pkg/grpcapi`, none of which this PR touches.
+  Measured for a `10.0.0.0/016` pool (`SourceNATPoolUnusableReason == "invalid_pool"`,
+  so no allocator is installed): 64,512 ports at cli_show_nat.go:206 and :349,
+  metrics_nat.go:31 and grpcapi/server_nat.go:132; 126 deterministic blocks at
+  metrics_nat.go:109; and REST nat.go:271 keeps the config-derived count when the
+  runtime reports `AddressCount == 0`. Validation: `go test ./pkg/config/ ./pkg/nat/
+  ./pkg/dataplane/userspace/` all ok (29.9s / 0.1s / 20.4s), FULL_RC=0; gofmt and
+  go vet clean on the touched files. No Rust source changed.
+- **File(s)**: pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  pkg/nat/pool_expansion_parity_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md

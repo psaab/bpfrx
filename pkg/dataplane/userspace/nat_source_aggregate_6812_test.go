@@ -18,6 +18,7 @@ package userspace
 
 import (
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -515,10 +516,19 @@ func TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812(t *testing.T
 // be the pool the DATAPLANE charges first.
 //
 // The Rust resolver (resolve_pool_allocators, userspace-dp/src/nat/source.rs)
-// walks the emitted rule slice in order, and this builder STABLE-sorts that
-// slice by #4161 scope tier. So the interface-scoped rule-set is charged
-// first — and the Go walk, which decides the poison this builder stamps, must
-// use the same order or the surviving pool is chosen by an unrelated rule.
+// walks the emitted rule slice, and this builder STABLE-sorts that slice by
+// #4161 scope tier. So the interface-scoped rule-set is charged first — and
+// the Go walk, which decides the poison this builder stamps, must use the same
+// order or the surviving pool is chosen by an unrelated rule.
+//
+// "Walks it in order" needs one qualifier (#6812 round 8). The resolver makes
+// TWO passes: phase 1 reserves every distinct key already in
+// `previous_allocators`, phase 2 then admits new keys against that total. Only
+// with an empty previous map — a fresh apply, which is what this fixture and
+// the Go walk both model — is that a single in-order pass. On a re-apply, all
+// REUSED keys are charged before any new one; they are accepted
+// unconditionally, so it is only the new keys whose fate the order decides,
+// and among those phase 2 preserves emitted order.
 //
 // `aaa`/`big` is zone-scoped (tier 1) and consumes 98% of the port-slot
 // budget; `zzz`/`small` is interface-scoped (tier 0, more specific). Each fits
@@ -639,7 +649,21 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", zone, 200+i),
 		)
 		// TWO rules per rule-set: contiguity is vacuous with one.
-		for r := 0; r < rulesPerSet; r++ {
+		//
+		// DESCENDING (#6812 round 8) — the SAME blindness the rule-SET loop
+		// above fixes, one nesting level in. Round 7 de-correlated the
+		// rule-set names from declaration order and left the RULES inside each
+		// rule-set declared r0 then r1, which is both config order AND
+		// ascending name order. Measured at 52f7e735a on a scratch copy:
+		// sorting each rule-set's Rules by Rule.Name before the emit loop in
+		// buildSourceNATSnapshotsWithFeeds left this whole test GREEN, because
+		// the sort had nothing to permute. Declaring r1 before r0 separates the
+		// two sequences so assertion (3) can see a within-set name sort.
+		//
+		// The match address rides on r for the same reason: keyed on the rule
+		// index, it reverses with the loop, so a sort keyed on the emitted
+		// MatchSourceAddresses is de-correlated too.
+		for r := rulesPerSet - 1; r >= 0; r-- {
 			cmds = append(cmds,
 				fmt.Sprintf("set security nat source rule-set %s rule r%d match source-address 10.0.%d.0/24", iface, r, r),
 				fmt.Sprintf("set security nat source rule-set %s rule r%d then source-nat pool %s", iface, r, iface),
@@ -696,6 +720,12 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	// ordering actually used.) This fixture names each pool after its rule-set,
 	// so the two sequences coincide here anyway.
 	var declaredPools []string
+	// declaredRules is the DECLARED within-rule-set rule-name sequence, keyed
+	// by the pool the rule-set references — the key the emitted snapshots
+	// carry. Assertion (3) below compares the emitted block against THIS
+	// rather than against a re-derived `r%d`, so a future re-cut of the
+	// fixture loop cannot leave the expectation behind pointing the other way.
+	declaredRules := map[string][]string{}
 	for _, rs := range cfg.Security.NAT.Source {
 		pool := ""
 		for _, rule := range rs.Rules {
@@ -705,8 +735,17 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 			}
 		}
 		declaredPools = append(declaredPools, pool)
+		for _, rule := range rs.Rules {
+			if rule != nil {
+				declaredRules[pool] = append(declaredRules[pool], rule.Name)
+			}
+		}
 	}
 	assertNoTierDeclaredNameAscending6812(t, declared, declaredPools)
+	// F-A one level in (#6812 round 8): the same precondition for the RULES
+	// inside each rule-set. Without it, assertion (3) cannot see a within-set
+	// sort keyed on Rule.Name.
+	assertNoRuleSetDeclaredRuleNameAscending6812(t, declaredRules)
 
 	out := buildSourceNATSnapshots(cfg, nil)
 	if len(out) != 2*nPerTier*rulesPerSet {
@@ -781,12 +820,80 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 		if split[name] {
 			continue
 		}
+		want := declaredRules[name]
+		if len(want) != rulesPerSet {
+			t.Fatalf("rule-set for pool %s declared %d rules %v, want %d — the fixture "+
+				"no longer emits the rule count assertion (3) walks", name, len(want), want, rulesPerSet)
+		}
 		for r := 0; r < rulesPerSet; r++ {
-			if got := out[lo+r].Name; got != fmt.Sprintf("r%d", r) {
-				t.Errorf("rule-set %s rule[%d] = %s, want r%d — within-rule-set config "+
-					"order was not preserved", name, r, got, r)
+			if got := out[lo+r].Name; got != want[r] {
+				t.Errorf("rule-set %s rule[%d] = %s, want %s — within-rule-set config "+
+					"order was not preserved. Declared: %v; emitted block: %v",
+					name, r, got, want[r], want, ruleNames6812(out[lo:lo+rulesPerSet]))
 			}
 		}
+	}
+}
+
+// ruleNames6812 projects a snapshot block to its rule names, for failure text.
+func ruleNames6812(block []SourceNATRuleSnapshot) []string {
+	names := make([]string, 0, len(block))
+	for _, s := range block {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
+// assertNoRuleSetDeclaredRuleNameAscending6812 is assertNoTierDeclaredNameAscending6812
+// one nesting level in (#6812 round 8), and it exists for the identical reason.
+//
+// The rule-SET tripwire keys on the rule-set/pool name, which is what a
+// (tier, name ASC) tiebreak on the OUTER sort would read. It says nothing
+// about the rules INSIDE a rule-set. Those are emitted in `rs.Rules` order and
+// nothing outside this fixture pins that order, so a sort of each rule-set's
+// rules by Rule.Name — or any within-block reorder keyed on a per-rule string
+// that ascends with declaration — is invisible whenever the fixture declares
+// r0 before r1. Measured at 52f7e735a: inserting exactly that sort ahead of the
+// emit loop in buildSourceNATSnapshotsWithFeeds left the whole test GREEN.
+//
+// rules maps a rule-set (keyed by the pool it references — the key the emitted
+// snapshots carry) to its DECLARED rule-name sequence. Rule-sets with fewer
+// than two rules are skipped rather than failed: with one rule there is no
+// within-set order to permute, so such a rule-set neither discriminates nor
+// blinds. At least one rule-set must discriminate, or assertion (3) is vacuous
+// for the whole fixture.
+func assertNoRuleSetDeclaredRuleNameAscending6812(t *testing.T, rules map[string][]string) {
+	t.Helper()
+	keys := make([]string, 0, len(rules))
+	for k := range rules {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic failure text
+	discriminating := 0
+	for _, k := range keys {
+		n := rules[k]
+		if len(n) < 2 {
+			continue
+		}
+		ascending := true
+		for i := 1; i < len(n); i++ {
+			if n[i] < n[i-1] {
+				ascending = false
+				break
+			}
+		}
+		if ascending {
+			t.Fatalf("rule-set for pool %s declares its rules in ascending NAME order %v; "+
+				"that is the SAME sequence a within-rule-set (name ASC) sort emits, so "+
+				"assertion (3) could not see one. Re-cut the fixture so this rule-set's "+
+				"rule declaration order is not name-ascending.", k, n)
+		}
+		discriminating++
+	}
+	if discriminating == 0 {
+		t.Fatal("no rule-set declares two or more rules, so there is no within-rule-set " +
+			"order to preserve: assertion (3) would have nothing to check and this " +
+			"fixture cannot bind the within-set order clause at all")
 	}
 }
 

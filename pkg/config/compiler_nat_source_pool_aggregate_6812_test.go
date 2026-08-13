@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -755,6 +756,138 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 			t.Fatalf("charge order[%d] = %s, want %s — a same-tier tie was not resolved in "+
 				"CONFIG order, so the walk no longer reproduces the builder's emitted "+
 				"sequence.\n got: %v\nwant: %v", i, got[i], wantOrder[i], got, wantOrder)
+		}
+	}
+}
+
+// TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812 is the #6812 F3
+// order equality at the THIRD nesting level (round 8).
+//
+// sourceNATAggregateReferencedCharges documents three ordering clauses:
+// rule-sets stable-sorted by scope tier, RULES IN CONFIG ORDER, pools deduped
+// by name. Rounds 4 and 7 bound the first (and round 7 de-correlated the
+// rule-set names so a name tiebreak on it is visible). NOTHING ASSERTED the
+// second: every ordering fixture on this side declares exactly ONE rule per
+// rule-set, so there is no within-set order to permute at all.
+//
+// It was not completely undetectable — and the distinction matters, because
+// what detected it was an accident. Measured at 52f7e735a: inserting a
+// `sort.SliceStable(rs.Rules, byName)` ahead of the charge walk also reds
+// TestAggregateOverBudgetPoolsAddresses_6812 and
+// TestAggregateOverBudgetPoolsCount_6812 ("poison set = map[p999:true],
+// missing p1024"). Those two are COUNT/ADDRESS budget fixtures, not order
+// fixtures; they move only because their 1,025 rules are named r0..r1024 and
+// "r1000" < "r999" lexicographically, so a name sort permutes them. Zero-pad
+// those names — a plausible readability edit — and both go blind while the
+// clause stays unbound. This test asserts the clause instead of catching it
+// sideways.
+//
+// The builder-side sibling (TestBuilderEmittedOrderIsStableWithinATier_6812,
+// pkg/dataplane/userspace) does assert within-set order, but through round 7
+// declared its rules r0-then-r1 — config order AND ascending name order at
+// once — and was measured GREEN under exactly this mutation. Both halves are
+// now de-correlated.
+//
+// This fixture isolates the rule walk. ONE rule-set, so every rule sits at the
+// same tier and the tier sort is a no-op — the only thing that can reorder the
+// charges is the rule walk itself. Four rules reference four different pools,
+// and the three candidate sequences are kept pairwise distinct (asserted
+// below, so the fixture cannot decay into one that no longer discriminates):
+//
+//	declaration order:  qb qd qa qc   <- what the walk must reproduce
+//	rule-name ASC:      qc qa qd qb
+//	pool-name ASC:      qa qb qc qd
+//
+// FAIL-ON-REVERT: sorting rs.Rules by Name (or charges by pool name) before
+// the charge walk in sourceNATAggregateReferencedCharges reds the sequence
+// assertion.
+func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
+	// rule name -> pool it references, in DECLARATION order. The permutation is
+	// deliberate: neither ascending nor descending in either coordinate.
+	decl := []struct{ rule, pool string }{
+		{"r03", "qb"},
+		{"r02", "qd"},
+		{"r01", "qa"},
+		{"r00", "qc"},
+	}
+	cmds := []string{"set security nat source rule-set RS from zone trust"}
+	for i, d := range decl {
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source pool %s address 203.0.113.%d", d.pool, i+1),
+			fmt.Sprintf("set security nat source rule-set RS rule %s match source-address 10.0.%d.0/24", d.rule, i),
+			fmt.Sprintf("set security nat source rule-set RS rule %s then source-nat pool %s", d.rule, d.pool),
+		)
+	}
+
+	cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+
+	// PRECONDITION (a): the compiler preserved declaration order, so the
+	// sequence below really is config order and not an artifact of the AST.
+	if n := len(cfg.Security.NAT.Source); n != 1 {
+		t.Fatalf("compiled %d rule-sets, want 1 — a second rule-set would let the TIER "+
+			"sort do the reordering this test attributes to the rule walk", n)
+	}
+	var gotDeclRules, gotDeclPools []string
+	for _, rule := range cfg.Security.NAT.Source[0].Rules {
+		gotDeclRules = append(gotDeclRules, rule.Name)
+		gotDeclPools = append(gotDeclPools, rule.Then.PoolName)
+	}
+	var wantDeclRules, wantDeclPools []string
+	for _, d := range decl {
+		wantDeclRules = append(wantDeclRules, d.rule)
+		wantDeclPools = append(wantDeclPools, d.pool)
+	}
+	if strings.Join(gotDeclRules, ",") != strings.Join(wantDeclRules, ",") {
+		t.Fatalf("compiled rule order %v != declared %v — the fixture's premise (config "+
+			"order survives compilation) does not hold", gotDeclRules, wantDeclRules)
+	}
+
+	// PRECONDITION (b): the three candidate sequences must be pairwise
+	// DISTINCT, or "follows config order" is indistinguishable from "follows
+	// one of the sorts" and this test proves nothing. This is the same
+	// discrimination the per-tier name tripwire enforces for the rule-SET
+	// level, stated directly because there is only one rule-set here.
+	byRuleName := append([]string(nil), wantDeclPools...)
+	sortPoolsByKey6812(byRuleName, wantDeclRules)
+	byPoolName := append([]string(nil), wantDeclPools...)
+	sort.Strings(byPoolName)
+	config0 := strings.Join(wantDeclPools, ",")
+	if config0 == strings.Join(byRuleName, ",") {
+		t.Fatalf("declaration order %v equals rule-name-ASC order — a within-rule-set "+
+			"sort on Rule.Name would emit the same sequence and be invisible here",
+			wantDeclPools)
+	}
+	if config0 == strings.Join(byPoolName, ",") {
+		t.Fatalf("declaration order %v equals pool-name-ASC order %v — a sort on the pool "+
+			"name would emit the same sequence and be invisible here", wantDeclPools, byPoolName)
+	}
+
+	charges := sourceNATAggregateReferencedCharges(cfg)
+	var got []string
+	for _, c := range charges {
+		got = append(got, c.name)
+	}
+	if strings.Join(got, ",") != config0 {
+		t.Fatalf("charge order = %v, want %v — the budget walk did not charge this "+
+			"rule-set's rules in CONFIG order, so a budget boundary falling between two "+
+			"rules of ONE rule-set poisons a different pool than the builder emits.\n"+
+			"rule-name ASC would give %v; pool-name ASC would give %v",
+			got, wantDeclPools, byRuleName, byPoolName)
+	}
+}
+
+// sortPoolsByKey6812 reorders pools[] into ascending order of the parallel
+// keys[] — the sequence a sort on that key would produce. Insertion sort; the
+// slices are fixture-sized.
+func sortPoolsByKey6812(pools, keys []string) {
+	k := append([]string(nil), keys...)
+	for i := 1; i < len(pools); i++ {
+		for j := i; j > 0 && k[j] < k[j-1]; j-- {
+			k[j], k[j-1] = k[j-1], k[j]
+			pools[j], pools[j-1] = pools[j-1], pools[j]
 		}
 	}
 }
