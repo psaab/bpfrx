@@ -199,13 +199,18 @@ counters (see below).
   rather than exhaustively — #3719 duplicate zone id (the first `?`) and #2410
   CoS queue id (the last, with nothing fallible after it), via #2240 NPTv6 and
   #3367 filter — so hoisting the binding back into the fallible region reds
-  them. Span, not count: every position the binding could be relocated to and
-  still be a defect has a `?` below it, hence lies above the LAST belt, so the
-  CoS row sees all of them. (A hoist below the last `?` stays green, correctly
-  — nothing after it can reject.) The dup-zone row REJECTS before any relocated
-  block could run, so it stays green under a relocation; its job is to pin
-  where the fallible region begins, which is what makes "the last belt" a
-  checkable bracket rather than one arbitrary belt.
+  them. Span, not count: every STRAIGHT-LINE statement position the binding
+  could be relocated to and still be a defect has a `?` below it, hence lies
+  above the LAST belt, so the CoS row sees all of them. (A hoist below the last
+  `?` stays green, correctly — nothing after it can reject. A relocation into a
+  conditionally-evaluated closure a row's snapshot never enters is outside the
+  quantifier, and is stated in the builder's doc comment rather than assumed
+  away.) The dup-zone row pins where the fallible region BEGINS, which is what
+  makes "the last belt" a checkable bracket rather than one arbitrary belt. It
+  stays green only for a relocation strictly BELOW it — it rejects first, so
+  the relocated block never runs — and those are exactly the ones the CoS row
+  catches; a hoist ABOVE it, to the top of the fallible region, reds the
+  dup-zone row of both zone tests (measured, #6832 fold r4).
   A single-belt fixture binds neither: it stays green when a *different* belt
   moves. `accepted_build_still_prunes_zone_counters_for_removed_zones` is the
   anti-over-fix control. The create half is only observable through

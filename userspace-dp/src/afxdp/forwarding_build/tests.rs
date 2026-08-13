@@ -5661,12 +5661,15 @@ const ZONE_COUNTER_CANDIDATE_ZONES: [u16; 2] = [100, 300];
 /// The SPAN is what matters, not the count. #3719 duplicate-zone-id is the
 /// builder's FIRST fallible step and #2410 CoS queue-id its LAST (nothing
 /// fallible follows it), with #2240 NPTv6 and #3367/#2505 filter in between.
-/// Every position the zone-counter work could be relocated to and still be a
-/// DEFECT is a position with a `?` below it — and every one of those is above
-/// the LAST belt, so the CoS row observes the relocation wherever it lands.
-/// That is the row that binds the ordering invariant. The dup-zone row is what
+/// Every STRAIGHT-LINE statement position the zone-counter work could be
+/// relocated to and still be a DEFECT is a position with a `?` below it — and
+/// every one of those is above the LAST belt, so the CoS row observes the
+/// relocation wherever it lands. That is the row that binds the ordering
+/// invariant. (Straight-line is the quantifier's real scope: a relocation into
+/// a conditionally-evaluated closure a given row's snapshot never enters would
+/// escape that row — see the builder's doc comment.) The dup-zone row is what
 /// makes "the last belt" a checkable bracket instead of an arbitrary pick: it
-/// pins where the fallible region begins.
+/// pins where the fallible region begins, and reds under a hoist above it.
 ///
 /// A single-belt fixture binds neither: a fallible step relocated below the
 /// zone-counter work leaves it green (measured — moving the NPTv6 step below
@@ -5682,11 +5685,17 @@ fn zone_counter_rejection_rows() -> Vec<(
 )> {
     let mut dup_zone = zone_counter_snapshot_with_zones(&ZONE_COUNTER_CANDIDATE_ZONES);
     // #3719: a second zone re-using id 300. The FIRST fallible step in the
-    // builder. Note the polarity: because it rejects before any relocated
-    // zone-counter block could run, this row is the one that STAYS GREEN under
-    // a relocation — the CoS row is what reds. Its job is to pin where the
-    // fallible region begins, so "the last belt" names a bracketed region
-    // rather than one arbitrary belt.
+    // builder. Its job is to pin where the fallible region BEGINS, so "the
+    // last belt" names a bracketed region rather than one arbitrary belt.
+    //
+    // Polarity, stated exactly, because an earlier round overshot it: this row
+    // stays green only for a relocation strictly BELOW it — it rejects before
+    // the relocated block could run — and those are precisely the relocations
+    // the CoS row catches. A hoist ABOVE it, to the top of
+    // `build_fallible_forwarding_state`, reds THIS row in both zone tests
+    // (measured, #6832 fold r4: `left: 1, right: 2` on the prune test and
+    // `left: [100, 300], right: [100, 200]` on the create test, both reported
+    // against this row's label).
     dup_zone.zones.push(ZoneSnapshot {
         name: "clash".into(),
         id: 300,

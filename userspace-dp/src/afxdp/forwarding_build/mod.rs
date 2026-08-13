@@ -225,14 +225,28 @@ pub(super) fn build_forwarding_state_with_counters(
 /// not over all ten of the inner builder's `?` sites: the first `?` (#3719
 /// duplicate zone id), the last (#2410 CoS queue id — no fallible step follows
 /// it), and #2240 NPTv6 / #3367 filter in between. Span, not count. Every
-/// position a relocated [`attach_zone_counters`] could occupy and still be a
-/// DEFECT is one with a `?` below it, and every such position is above the
-/// last belt — so the last row observes all of them. (A hoist BELOW the last
-/// `?` would stay green, and correctly: nothing after it can reject.) The
-/// first row is what
-/// makes "the last" a checkable bracket rather than an arbitrary pick. Six
-/// more rows would only widen the second, weaker class — a single BELT moved
-/// below the binding, which is caught by that belt's own row and by no other.
+/// STRAIGHT-LINE statement position a relocated [`attach_zone_counters`] could
+/// occupy and still be a DEFECT is one with a `?` below it, and every such
+/// position is above the last belt — so the last row observes all of them. (A
+/// hoist BELOW the last `?` would stay green, and correctly: nothing after it
+/// can reject.) The quantifier is over straight-line positions on purpose:
+/// a relocation INTO a conditionally-evaluated sub-expression that a given
+/// row's snapshot never enters — a closure such as the one building
+/// `session_opening_overrides`, which runs only for a snapshot configuring a
+/// screen with a non-zero `syn-flood timeout` — escapes that row. Contrived
+/// for a refactor of this shape, but not excluded by the argument, so it is
+/// stated rather than assumed away.
+///
+/// The first row is what makes "the last" a checkable bracket rather than an
+/// arbitrary pick, and it is not a passive marker: hoisting the binding ABOVE
+/// it, to the top of the fallible region, reds the dup-zone row of BOTH zone
+/// tests (measured, #6832 fold r4 — `left: 1, right: 2` on the prune test and
+/// `left: [100, 300], right: [100, 200]` on the create test, each reported
+/// against the `#3719 duplicate zone id (first fallible step)` label). It is
+/// green only for relocations strictly BELOW it, which are exactly the ones
+/// the CoS row catches. Six more rows would only widen the second, weaker
+/// class — a single BELT moved below the binding, which is caught by that
+/// belt's own row and by no other.
 pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,

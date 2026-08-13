@@ -420,13 +420,13 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
 /// carry-over (NAT/source-NAT allocator reuse, cold-path slot retention,
 /// zone-counter totals). But `ForwardingState::zone_counter_store` is a
 /// `Clone`-shares-the-inner-`Arc<Mutex>` store, and the build's
-/// `attach_zone_counters` step ends with
+/// `attach_zone_counters` step OPENS with
 /// `state.zone_counter_store.reconcile(&configured)` — an in-place `retain`
-/// UNDER THE SHARED LOCK — after get-or-creating a block per configured zone
-/// in that same map. With `Some(&coord.forwarding)` a VALIDATION build would
-/// prune the LIVE, published `coord.forwarding.zone_counter_store`, dropping
-/// cumulative per-zone traffic totals for any zone absent from the candidate
-/// snapshot — a mutation of the live observability surface
+/// UNDER THE SHARED LOCK — and only THEN get-or-creates a block per configured
+/// zone in that same map. With `Some(&coord.forwarding)` a VALIDATION build
+/// would prune the LIVE, published `coord.forwarding.zone_counter_store`,
+/// dropping cumulative per-zone traffic totals for any zone absent from the
+/// candidate snapshot — a mutation of the live observability surface
 /// (`show security zones` / REST / Prometheus) that the discarded build's
 /// caller never intended, and that the fail-closed restore cannot undo.
 /// `None` gives the discarded build FRESH default counter stores, so it
@@ -438,8 +438,9 @@ pub(super) fn validate_map_pins(snapshot: &ConfigSnapshot) -> Result<(), super::
 /// REJECTS the snapshot touches the store not at all. A validation build that
 /// ACCEPTS still runs `attach_zone_counters` to completion and would still hit
 /// the live store — and "accepted" is the common case here, since this gate
-/// exists to admit deferred applies.
-/// `previous = None` therefore remains load-bearing; do not relax it.
+/// exists to admit deferred applies. `previous = None` therefore remains
+/// load-bearing; do not relax it.
+///
 /// Verdict PARITY with reconcile is preserved: NONE
 /// of the fallible integrity legs (duplicate-zone-id, tunnel TTL, interface
 /// address, egress, route family/preference, neighbor family, NPTv6, filter

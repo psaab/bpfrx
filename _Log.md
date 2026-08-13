@@ -1,3 +1,131 @@
+## 2026-08-13 — #5716 (6/6): the round about overshooting corrections overshot one
+
+- **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r4)
+- **Action**: No production behaviour changes. Six claim corrections, one
+  compile-time fixture guard, and a full PR-body replacement, all raised by the
+  hostile review at 5fda3744d (verdict MERGE-NEEDS-MINOR, zero blocking, 14
+  measured mutation cells). Every item was re-verified against the tree at
+  5fda3744d before being edited; the one that was already right is called out
+  as such below rather than edited to match the report.
+
+  **F1 — r3's correction overshot, in the round whose subject was corrections
+  that overshoot.** r3 replaced a false "EVERY fallible belt" claim with a span
+  argument, and in doing so asserted at three sites that the dup-zone row
+  "REJECTS before ANY relocated block could run, so it stays GREEN under a
+  relocation — the CoS row is what reds". MEASURED AND REFUTED. Relocating
+  `attach_zone_counters` to the TOP of `build_fallible_forwarding_state`, above
+  the first `?`, reds BOTH zone tests ON THE DUP-ZONE ROW:
+
+  | test | reported row | observed |
+  |---|---|---|
+  | `rejected_build_does_not_prune_live_zone_counters` | `#3719 duplicate zone id (first fallible step)` | `left: 1, right: 2` |
+  | `rejected_build_does_not_create_zone_blocks_in_the_live_store` | same row | `left: [100, 300], right: [100, 200]` |
+
+  Both are assertion failures, not build breaks (cargo exit 101; the second was
+  run under its own name because the first pass's `zone_counter` filter does
+  not match it). The row is green only for relocations strictly BELOW it —
+  which are precisely the ones the CoS row catches. So the r3 sentence
+  UNDERSTATES what the dup-zone row buys: it is not a passive marker of where
+  the fallible region begins, it reds on a hoist above it.
+
+  Corrected at the two in-tree sites that carried the clause verbatim — the
+  dup_zone inline comment in `forwarding_build/tests.rs` and
+  `docs/userspace-dataplane-gaps.md` — plus the builder doc comment in
+  `forwarding_build/mod.rs`. The third site named in the report is the r3
+  COMMIT MESSAGE, which is immutable; its in-tree copy, the r3 `_Log.md` entry
+  below, turned out NOT to carry the false clause (it says only that the row
+  makes "the last belt" a checkable bracket, which is true), so that entry
+  gains the reds-under-hoist fact rather than a correction.
+
+  Sub-item, folded rather than left: the span argument is a STRAIGHT-LINE
+  position argument, and it was universally quantified over "positions". A
+  relocation INTO a conditionally-evaluated sub-expression that a given row's
+  snapshot never enters — the `session_opening_overrides` `filter_map` closure,
+  which runs only for a snapshot configuring a screen with a non-zero
+  `syn-flood timeout` — would escape that row. Contrived for a refactor of this
+  shape, but not excluded by the argument. The quantifier is now narrowed to
+  straight-line statement positions at all three sites, with the escape stated
+  in the builder doc comment rather than assumed away.
+
+  **F2 — a claim this PR introduced contradicted its own sibling comment.**
+  `coordinator/reconcile/snapshot.rs`, rewritten by this PR, said
+  `attach_zone_counters` "ends with `state.zone_counter_store.reconcile(&configured)`
+  ... AFTER get-or-creating a block per configured zone in that same map". The
+  real order is the reverse — `reconcile(&configured)` first, then
+  `ZoneCounterSlotMap::build` get-or-creates, then the assignment — which is
+  what `attach_zone_counters`'s own doc says ("prune-then-resolve rather than
+  the reverse ... pruning first means the map never transiently holds the
+  union"). Two comments in one PR gave opposite orders. Only the order sentence
+  is changed; the paragraph's CONCLUSION (`previous = None` stays load-bearing)
+  is correct, unaffected, and untouched.
+
+  **F3 — citation rot inside the shipping commit.** The r3 `_Log.md` entry
+  cited the ten `?` sites as `mod.rs` 288, 293, 305, 306, 317, 321, 330, 423,
+  473, 478 with the body running to 683. Those are the PARENT commit's numbers:
+  the same commit's doc-comment edit pushed the function down 21 lines, so at
+  5fda3744d they were 309, 314, 326, 327, 338, 342, 351, 444, 494, 499 with the
+  body ending at 704. Re-derived at head rather than by adding 21, and the
+  count re-verified: still exactly TEN try-operator sites, first
+  `reject_duplicate_zone_ids`, last `build_cos_state`, nothing fallible after
+  it. The entry now cites the belts BY NAME, because a name does not rot;
+  the numbers follow as a convenience, at the r4 tree (323, 328, 340, 341, 352,
+  356, 365, 458, 508, 513; body ends 718).
+
+  **F4 — a false absolute in the sentence whose stated job was precision.**
+  "the cancel half DOES run in `write_tx_two_inserts_append_not_overwrite` and
+  `write_tx_single_insert_writes_base` ... but neither asserts anything after
+  the guard drops" is literally false: the first has three `assert_eq!` after
+  the guard's scope closes, the second two, and the `write_fill` twins the
+  same. The TRUE claim is that none of them asserts anything that can OBSERVE
+  the drop — every post-drop assertion reads ring slot contents written during
+  `insert`, none reads `cached_prod` or `*producer`. Measured, not inferred:
+  with BOTH producer cancel halves severed
+  (`WriteTx::drop` and `WriteFill::drop`), all four fixtures RAN and stayed
+  GREEN — `test result: ok. 4 passed; 0 failed; ...; 4283 filtered out`, the
+  count asserted so a zero-test false green cannot be mistaken for a pass.
+  Reworded at the source comment and in the r3 `_Log.md` entry below.
+
+  **F5 — a vacuity hazard in r3's own fixtures.** The three
+  terminal-op-then-`Drop` fixtures compute `REUSE_BATCHES[2] - 1`, which needs
+  `REUSE_BATCHES[2] >= 2`, and NOTHING pinned it: the two `const _` self-checks
+  pin only "at least two distinct sizes" and "total <= capacity", both of which
+  `[1, 3, 1]` satisfies. Under `[1, 3, 1]`, `read_complete_drop_*` and
+  `write_tx_drop_*` fail loudly on their runtime `assert!(dropped > 0 && ...)`,
+  but `write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit` OMITS
+  that assert and would pass VACUOUSLY — a drop with nothing to submit. Under
+  `[_, _, 0]` the subtraction underflows. Fixed with a third `const _` self-check
+  (`REUSE_BATCHES[2] >= 2`) rather than a per-fixture runtime assert: it fails
+  at COMPILE time, covers all three fixtures at once, and cannot be forgotten
+  on a fourth. The fill twin also gains the runtime assert its two siblings
+  carry — redundant under the const, but the ASYMMETRY is what let the hole
+  exist, and a future reader should not have to decide whether its absence
+  meant something.
+
+  **F6 — the PR body described a shape r2 replaced.** It still said "the prune
+  is now the last statement before `Ok(state)`", which is exactly what r2
+  rejected as insufficient; its red-on-revert table was the r1 six-cell matrix
+  with nothing from r2/r3; the docs paragraph described a "prune-ordering
+  contract" the gaps doc no longer states; and the "the wrap-origin loop needs
+  one more serial release pass before merge" caveat read as outstanding though
+  r3 discharged it. All r2/r3 evidence lived only in PR comments. The body is
+  REPLACED, not appended to — the body is what a merger reads.
+
+  **F7 — nit.** A ragged mid-sentence wrap in the builder doc ("The / first row
+  is what / makes ..."), fixed as part of the F1 rewrite of that paragraph.
+
+- **Validation**: full `cargo test --release` and full `go test ./...`, each
+  with a completion sentinel echoed after the suite — a killed run whose output
+  still holds earlier "test result: ok" blocks reads as success to a naive
+  grep, which is the trap the reviewer hit. Results in the round's commit
+  message. Mutation cells run in an isolated `/dev/shm` worktree; the review
+  tree was never mutated, and the mutation tree was restored to clean after
+  each cell. No shim object changed, so no cluster smoke is owed.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding_build/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`,
+  `userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`,
+  `userspace-dp/src/xsk_ffi_tests.rs`, `docs/userspace-dataplane-gaps.md`,
+  `_Log.md`
+
 ## 2026-08-13 — #5716 (5/5): three false claims, and the sibling guards the r2 Drop fix skipped
 
 - **Timestamp**: 2026-08-13 (fix/5716-afxdp-api-hardening, PR #6832 review fold r3)
@@ -21,19 +149,30 @@
   cross-referenced from the comment and from `docs/userspace-dataplane-gaps.md`.
 
   **(2) "EVERY fallible belt" is false in four places, and the guard is still
-  sound.** `build_fallible_forwarding_state` has TEN `?` sites (`mod.rs` 288,
-  293, 305, 306, 317, 321, 330, 423, 473, 478). The rejection table drives
-  FOUR (288, 423, 473, 478). The POSITIONAL claims around it are true — 288 is
-  the first `?`, 478 is the last, and the function body runs to 683 with no `?`
-  after — so this is a false claim that does NOT imply a coverage hole, and no
-  belt rows were added. What the four rows actually buy, stated exactly in each
-  of the corrected sites: every position `attach_zone_counters` could be
-  relocated to and still be a DEFECT is a position with a `?` below it, and
-  every such position lies above the LAST belt — so the CoS row observes the
-  relocation wherever it lands. That is the row that binds the ordering. The
-  dup-zone row makes "the last belt" a checkable bracket rather than an
-  arbitrary pick. Six more rows would only widen the second, weaker class (one
-  BELT moved below the binding, caught by that belt's own row and no other).
+  sound.** `build_fallible_forwarding_state` has TEN `?` sites. Cited by NAME
+  because line numbers rot and this citation did — see the r4 entry's F3 — in
+  source order: `reject_duplicate_zone_ids`, `populate_tunnel_endpoints`,
+  `populate_interfaces`, `populate_egress`, `populate_routes`,
+  `populate_neighbors`, `parse_policy_state_with_counters`,
+  `Nptv6State::try_from_snapshots`, `parse_filter_state_with_three_color_preserving`,
+  `build_cos_state`. At the r4 tree those are `mod.rs` 323, 328, 340, 341, 352,
+  356, 365, 458, 508, 513, with the body ending at 718; the names are the
+  authoritative citation, the numbers are a convenience valid as of this round.
+  The rejection table drives FOUR — `reject_duplicate_zone_ids`, NPTv6, filter
+  state, CoS. The POSITIONAL claims around it are true:
+  `reject_duplicate_zone_ids` is the first `?`, `build_cos_state` the last, and
+  the rest of the body carries no `?` after it — so this is a false claim that
+  does NOT imply a coverage hole, and no belt rows were added. What the four
+  rows actually buy, stated exactly in each of the corrected sites: every
+  straight-line statement position `attach_zone_counters` could be relocated to
+  and still be a DEFECT is a position with a `?` below it, and every such
+  position lies above the LAST belt — so the CoS row observes the relocation
+  wherever it lands. That is the row that binds the ordering. The dup-zone row
+  makes "the last belt" a checkable bracket rather than an arbitrary pick — and
+  it reds under a hoist ABOVE it, which the sentence this entry originally
+  carried denied; corrected in r4 F1. Six more rows would only widen the
+  second, weaker class (one BELT moved below the binding, caught by that belt's
+  own row and no other).
   Corrected at `forwarding_build/mod.rs`, `forwarding_build/tests.rs`,
   `docs/userspace-dataplane-gaps.md`, and in the r2 `_Log.md` entry below,
   which carried the same sentence.
@@ -56,9 +195,15 @@
   leaves scope. The cancel half DOES run in
   `write_tx_two_inserts_append_not_overwrite`,
   `write_tx_single_insert_writes_base` and their `write_fill` twins — but none
-  of them asserts anything after the guard drops, so it ran unobserved. In the
-  reuse fixtures the reservation is fully consumed, which makes their post-drop
-  `cached_prod == *producer` pair a check on a `Drop` that did nothing.
+  of them asserts anything that can OBSERVE the drop, so it ran unobserved.
+  (Each of the four DOES assert after the guard's scope closes — three
+  `assert_eq!` in the two-insert fixtures, two in the single-insert ones — but
+  only on ring slot contents written during `insert` and untouched by the drop;
+  none reads `cached_prod` or `*producer` post-drop. The r3 draft of this
+  sentence said "none of them asserts anything after the guard drops", which is
+  literally false; corrected in r4 F4.) In the reuse fixtures the reservation
+  is fully consumed, which makes their post-drop `cached_prod == *producer`
+  pair a check on a `Drop` that did nothing.
 
 - **Sweep**: four guards x eight shapes. BOUND cells included deliberately — a
   sweep reported as failures only cannot be told apart from one that ran out of

@@ -332,11 +332,11 @@ const REUSE_BATCHES: [u32; 3] = [1, 3, 2];
 /// Total slots a reuse fixture reserves / peeks: the sum of [`REUSE_BATCHES`].
 const REUSE_TOTAL: u32 = REUSE_BATCHES[0] + REUSE_BATCHES[1] + REUSE_BATCHES[2];
 
-// FIXTURE SELF-CHECKS, not coverage. Both of these are assertions over test
-// constants alone, so no production edit can make either fail and neither
-// belongs in a count of what this file binds. They exist to fail the BUILD if
-// a later edit to the constants above quietly invalidates the fixtures that
-// consume them.
+// FIXTURE SELF-CHECKS, not coverage. All three of these are assertions over
+// test constants alone, so no production edit can make any of them fail and
+// none belongs in a count of what this file binds. They exist to fail the
+// BUILD if a later edit to the constants above quietly invalidates the
+// fixtures that consume them.
 //
 // At least two distinct batch sizes, so the runs still distinguish a
 // count-sized advance from a repeated-constant one.
@@ -349,6 +349,19 @@ const _: () = assert!(
 // Each slot of a run must land in its own ring slot; otherwise a misplaced
 // write could alias onto the very value it was supposed to corrupt.
 const _: () = assert!(REUSE_TOTAL <= REUSE_RING_CAPACITY);
+// The terminal-op-then-`Drop` fixtures leave the FINAL batch partly done, at
+// `REUSE_BATCHES[2] - 1`, so the drop has both a submit/release AND a non-zero
+// cancel to do. That needs a final batch of at least 2, and NOTHING above pins
+// it: `[1, 3, 1]` satisfies both self-checks above, and under it those fixtures
+// reach drop with nothing left to submit — they would pass VACUOUSLY, binding a
+// `Drop` that did nothing. `[_, _, 0]` is worse still: the subtraction
+// underflows. Compile-time rather than per-fixture, so it covers all three at
+// once and cannot be forgotten on a fourth.
+const _: () = assert!(
+    REUSE_BATCHES[2] >= 2,
+    "the drop fixtures need a final batch of at least 2 so REUSE_BATCHES[2] - 1 \
+     leaves work for Drop; at 1 they pass vacuously and at 0 they underflow"
+);
 
 /// Distinct non-zero payload for the `j`-th slot of a reuse run. Monotone in
 /// `j`, and never 0 (the test ring backing is zero-initialised), so a write
@@ -752,10 +765,14 @@ fn read_rx_drop_releases_a_batch_read_after_an_explicit_release() {
 //     with `written`/`read_count` at 0.
 //   * The cancel half DOES run in `write_tx_two_inserts_append_not_overwrite`
 //     and `write_tx_single_insert_writes_base` (and their `write_fill`
-//     twins), which leave part of the reservation unused. But neither asserts
-//     anything after the guard drops, so it ran unobserved. In the reuse
-//     fixtures the reservation is fully consumed, which makes their post-drop
-//     `cached_prod == *producer` pair a check on a `Drop` that did nothing.
+//     twins), which leave part of the reservation unused. Each of those four
+//     does assert after the guard drops — but only on RING SLOT CONTENTS,
+//     written during `insert` and untouched by the drop. None reads
+//     `cached_prod` or `*producer` post-drop, so nothing they assert can
+//     OBSERVE the drop's effects: sever the cancel and all four stay green.
+//     In the reuse fixtures the reservation is fully consumed, which makes
+//     their post-drop `cached_prod == *producer` pair a check on a `Drop` that
+//     did nothing.
 //
 // The three fixtures below are the same shape as the `ReadRx` one, one per
 // remaining guard: run the first two batches to the terminal op explicitly,
@@ -929,6 +946,11 @@ fn write_fill_drop_submits_a_batch_inserted_after_an_explicit_commit() {
 
         let committed = REUSE_BATCHES[0] + REUSE_BATCHES[1];
         let dropped_written = REUSE_BATCHES[2] - 1;
+        assert!(
+            dropped_written > 0 && dropped_written < REUSE_BATCHES[2],
+            "fixture: the final batch must be partly inserted so drop does both \
+             a submit and a cancel"
+        );
         let base;
         {
             let mut w = dq.fill(REUSE_TOTAL);
