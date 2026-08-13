@@ -1,3 +1,116 @@
+## 2026-08-13 — #6812 fold r2: the budget must ask the runtime's question, not a proxy for it (Codex gate, fifth unusability class)
+
+- **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
+- **Action**: Codex re-gate at `a00a03fc1` returned MERGE-NEEDS-MAJOR. Four of
+  five questions came back clean (the `SourceNATPoolUnusableReason` extraction
+  is faithful; the skip is not too wide; the `pkg/nat` delegation is
+  behaviour-preserving). The blocking one is that F1 is still reachable on the
+  tolerant / peer-sync path through a FIFTH unusability class — and the
+  existence of a fifth class after round 1 closed four was the real finding.
+  **The class.** The dataplane's pool grammar is ALL-OR-NOTHING:
+  `parse_source_nat_rules_inner` ORs `expand_pool_address` over every member
+  into one `invalid_pool_address` flag and fails the WHOLE pool as
+  `InvalidPool` (`userspace-dp/src/nat/source.rs`), so the
+  `pool_mode && total_pool > 0 && pool_failure.is_none()` gate builds no
+  `PendingPoolAllocator` and the pool occupies no slot in
+  `resolve_pool_allocators`. Round 1's budget walk instead SUMMED per-member
+  host counts and skipped only a zero total, which agrees with the runtime only
+  when EVERY member fails. Two shapes escaped: `[198.51.100.1, not-an-ip]`
+  sums to 1 + 0 = 1, and `10.0.0.0/15` counts 131,072 — twice the 65,536
+  `MaxSourceNATPoolPrefixHosts` / `MAX_POOL_PREFIX_HOSTS` cap the expander
+  enforces. All three Codex claims verified firsthand before building:
+  measured through the real `CompileConfigLenient` +
+  `SourceNATAggregateOverBudgetPools`, 1,024 mixed-membership pools ahead of one
+  healthy pool gave `poison[good] = true` / `aggregate_over_budget` (the
+  original F1 defect, alive), and one `/15` pool charged
+  `addrs=131072 portCap=8,455,716,864` — 98.4% of the 2^33 port-capacity budget
+  for an allocator that never exists.
+  **The fix — a shared verdict, not a fifth condition.**
+  `config.SourceNATPoolUnusableReason`, the predicate the snapshot builder
+  ALREADY stamps on the wire, gained an all-or-nothing membership clause built
+  from the EXISTING `sourceNATPoolAddressReason` — the per-member mirror of
+  `expand_pool_address` that the #5627 strict grammar gate uses. The budget
+  walk's pre-existing `SourceNATPoolUnusableReason(pool) != ""` skip then covers
+  both shapes with NO new condition, so the charged set and the poisoned set
+  cannot disagree by construction; there is no derived quantity left for a sixth
+  spelling. The wire reason is `invalid_pool`, which
+  `source_nat_failure_reason_from_snapshot` already decoded to
+  `SourceNatFailureReason::InvalidPool` — the exact variant the parse loop
+  assigned for these pools on its own — so the dataplane disposition is
+  UNCHANGED and only the decider moves control-plane-ward, where the budget can
+  see it. Precedence places the clause between `empty_pool` and
+  `zone_scoped_pool_address`: `netip.ParsePrefix` rejects a zone qualifier, so
+  `fe80::/112%eth0` fails the grammar too, and only a later zone write keeps it
+  reporting the specific #5875 reason; all three pre-existing reasons stay
+  reachable under exactly their old conditions.
+  **Made unrepresentable, not merely excluded.** The `poolAddrs == 0` skip was
+  DELETED rather than kept as a belt — it is unreachable now that the shared
+  verdict is all-or-nothing (any unparseable member already excludes the pool;
+  no members reports `empty_pool`; a parsing member counts >= 1), so a charged
+  pool always sums to >= 1. A deleted branch cannot be tested, so
+  `TestBudgetChargeImpliesHonorableMembers_6812` binds the two premises the
+  deletion rests on over the full grammar surface (honorable => countable, and
+  no charge is ever zero-address through the real compiler).
+  **Fixture vacuity found while re-cutting.** `snatAggregateCfg_6812` emitted
+  `10.<i>.0.0/16`, valid only for i < 256 — so at `MaxSourceNATPoolCount+1`
+  pools, 769 of the 1,025 pools in the "healthy pools past the budget"
+  over-reach control were UNPARSEABLE and never healthy. The old zero-total rule
+  skipped them silently; the shared verdict names them, which is how it
+  surfaced. Fixed via `distinctSlash16_6812` plus a by-name precondition in the
+  fixture builder. The `no_member_expands` cell was re-cut to bind through the
+  shared verdict (`wantReason: "invalid_pool"`) instead of the deleted rule, and
+  every cell now asserts its round-1 host-count sum EXACTLY so a case cannot be
+  mistaken for a class it does not exercise (sum 0 = already excluded by round
+  1; sum non-zero = charged by round 1, excluded only now).
+  **Claim correction folded (Codex, non-blocking).** Round 1's account of the
+  strict path cited `validateSourceNATPoolStrict` and
+  `validateSourceNATPoolAddressScopeStrict` as what keeps unusable pools away
+  from the aggregate sum. The real order in `runUniformGatesNAT` is port-range
+  (:109), pool-reference (:134), zone-scope (:163), ADDRESS-GRAMMAR (:189),
+  aggregate (:228). The conclusion holds — strict acceptance is unchanged — but
+  it is the address-grammar gate at :189, omitted from the original account,
+  that covers the empty, malformed, mixed-invalid and over-capacity membership
+  shapes; the two cited gates cover only the port range and the `%zone`
+  qualifier. Corrected in `_Log.md` (round-1 entry), the plan doc and the code
+  comments.
+- **File(s)**: `pkg/config/compiler_validate_strict_nat.go`,
+  `pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`,
+  `pkg/dataplane/userspace/nat_source.go`,
+  `pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`,
+  `userspace-dp/src/nat/source.rs`,
+  `userspace-dp/src/nat/tests_aggregate_budget.rs`,
+  `docs/config-schema.md`, `docs/pr/6812-snat-aggregate-bitmap-cap/plan.md`
+- **Validation**: RED-on-revert measured for each fix, not asserted.
+  (1) Remove the membership-grammar clause from `SourceNATPoolUnusableReason`:
+  `TestAggregateBudgetExcludesUnusablePools_6812` reds on
+  `no_member_expands` / `some_member_fails` / `member_over_capacity`, and with
+  its precondition bypassed the DISCRIMINATOR itself reds — "the healthy pool
+  was poisoned aggregate_over_budget by 1024 pools that build NO allocator";
+  `TestSourceNATSnapshotMixedMemberPoolsDoNotPoisonHealthy_6812` and
+  `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812` red at the
+  snapshot boundary the same way.
+  (2) Point the `"invalid_pool"` arm of
+  `source_nat_failure_reason_from_snapshot` at any other variant:
+  `go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812` reds
+  (`left: Some(EmptyPool)` / `right: Some(InvalidPool)`).
+  (3) Swap the membership-grammar and zone clauses inside
+  `SourceNATPoolUnusableReason`: the new `zone_scoped_prefix` cell reds with
+  `reason = "invalid_pool", want "zone_scoped_pool_address"`. The clause
+  ordering was documented in a comment and otherwise UNBOUND — no existing test
+  covered the snapshot reason for a zone-scoped CIDR (`fe80::1%eth0/64`); the
+  #5875 tests cover the STRICT diagnostic, which is protected by gate order
+  (zone-scope :163 precedes address-grammar :189), not by clause order.
+  The over-capacity spelling was deliberately NOT left in the 1,024-pool
+  count-budget fixture: there it cannot starve the healthy pool (the address
+  budget refuses those pools first under first-fit, so they consume nothing and
+  the discriminator passes for an unrelated reason). It is driven instead by a
+  two-pool port-capacity fixture where one over-capacity `/15` (8,455,716,864
+  slots) starves a healthy full `/16` (4,227,858,432) — total 12,683,575,296,
+  the review's own R73 number — and the discriminator genuinely fails on revert.
+  `go build ./...` clean; `go test ./...` green; `cargo test --release` green;
+  `nat::` run 3x for flake; gofmt clean on every touched file (no crate-wide
+  `cargo fmt`).
+
 ## 2026-08-13 — #6812 fold: failed pools must not charge the aggregate budget (Codex gate F1-F4)
 
 - **Timestamp**: 2026-08-13 (fix/6812-snat-aggregate-bitmap-cap)
@@ -25,15 +138,27 @@
   both reading it — the builder to poison, the walk to SKIP. The walk also
   skips a pool whose members all fail to expand (zero addresses), which Rust
   skips via its `total_pool > 0` gate and fails as InvalidPool instead.
+  **[CORRECTED IN ROUND 2 — see the round-2 entry below. That zero-total skip
+  approximated an all-or-nothing runtime contract with a SUM and left a fifth
+  unusability class open; it has been replaced by the shared verdict and
+  deleted.]**
   Precedence in the extracted predicate preserves the builder's original
   last-writer-wins order (invalid_port_range over zone_scoped_pool_address over
   empty_pool) so shipped reasons are unchanged; the three per-condition
   `slog.Warn` lines collapse to one carrying `reason`.
-  No strict-path change: `validateSourceNATPoolStrict` and
-  `validateSourceNATPoolAddressScopeStrict` run EARLIER in `runUniformGates`
-  than the aggregate gate, so an unusable pool never reaches the aggregate sum
-  on a strict commit — and the resource claim is unaffected either way, since a
-  pool that builds no allocator costs no allocator memory.
+  No strict-path change — but **[CORRECTED IN ROUND 2]** the two gates named
+  here were the wrong ones. The order in `runUniformGatesNAT` is port-range
+  (`validateSourceNATPoolStrict`, :109), pool-reference
+  (`validateNATPoolReferencesStrict`, :134), zone-scope
+  (`validateSourceNATPoolAddressScopeStrict`, :163), ADDRESS-GRAMMAR
+  (`validateSourceNATPoolAddressGrammarStrict`, :189), aggregate
+  (`validateSourceNATAggregateCardinalityStrict`, :228). The conclusion holds —
+  strict acceptance is unchanged, every gate precedes the aggregate one — but it
+  is the ADDRESS-GRAMMAR gate at :189, omitted from the original account, that
+  covers the empty, malformed, mixed-invalid and over-capacity membership
+  shapes; the two gates cited cover only the port range and the `%zone`
+  qualifier. The resource claim is unaffected either way, since a pool that
+  builds no allocator costs no allocator memory.
   **F2 — the at-limit control did not prove all pools install.**
   `production_entry_admits_a_config_at_the_real_pool_count_budget_6812` filtered
   only for `OverBudget`, so mutating the fixture's `/32` members to a malformed

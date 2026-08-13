@@ -1,6 +1,6 @@
 [REFACTOR]   5193  userspace-dp/src/afxdp/poll_descriptor/mod.rs
 [REFACTOR]   3770  userspace-dp/src/policy.rs
-[REFACTOR]   3666  pkg/config/compiler_validate_strict_nat.go
+[REFACTOR]   3706  pkg/config/compiler_validate_strict_nat.go
 [REFACTOR]   3565  userspace-dp/src/nat64.rs
 [REFACTOR]   2605  pkg/config/compiler_system.go
 [REFACTOR]   2488  userspace-dp/src/nat/allocator.rs
@@ -17,7 +17,7 @@
 [REFACTOR]   2074  pkg/dhcprelay/relay.go
 [REFACTOR]   2073  pkg/dataplane/userspace/manager_ha.go
 [REFACTOR]   2056  userspace-dp/src/afxdp/frame/inspect.rs
-[REFACTOR]   2035  userspace-dp/src/nat/source.rs
+[REFACTOR]   2042  userspace-dp/src/nat/source.rs
 [REFACTOR]   2034  userspace-dp/src/afxdp/frame/mod.rs
 [WATCH]      1990  pkg/grpcapi/server_sessions.go
 [WATCH]      1953  pkg/dataplane/userspace/maps_sync.go

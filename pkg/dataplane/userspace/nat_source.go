@@ -103,7 +103,9 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 					poolNoTranslation = pool.PortNoTranslation
 					portLow, portHigh, _ = config.SourceNATPoolPortRange(pool)
 					// #6812 F1: ONE predicate decides a pool is unusable from its
-					// DEFINITION — empty membership, a `%zone` member that is not
+					// DEFINITION — empty membership, a member the Rust expander
+					// cannot honor (unparseable, malformed mask, or an
+					// over-capacity prefix; round 2), a `%zone` member that is not
 					// dataplane-representable (#5875), or a port range the parser
 					// rejected (#5457). config.SourceNATPoolUnusableReason is the
 					// SSOT that the aggregate budget walk
@@ -114,6 +116,18 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 					// still consumed the whole pool-count budget and the next
 					// healthy pool was poisoned "aggregate_over_budget" — a pool
 					// the dataplane would have installed.
+					//
+					// Round 2 widened the predicate rather than adding a second
+					// skip beside it, because the runtime's pool grammar is
+					// ALL-OR-NOTHING: `expand_pool_address` failing on ONE member
+					// fails the whole pool as InvalidPool. A pool mixing a valid
+					// member with a bad one was therefore marked usable here,
+					// charged the budget, and installed nothing there. The
+					// "invalid_pool" reason it now carries decodes to exactly the
+					// SourceNatFailureReason::InvalidPool the Rust parse loop
+					// reached on its own, so the dataplane disposition of such a
+					// pool is unchanged — but it is now visible in this warning
+					// and excluded from the budget.
 					if reason := config.SourceNATPoolUnusableReason(pool); reason != "" {
 						slog.Warn("userspace snapshot: marking source NAT rule with unusable pool",
 							"rule", rule.Name, "pool", rule.Then.PoolName, "reason", reason,

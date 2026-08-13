@@ -144,6 +144,13 @@ fn source_nat_failure_reason_from_snapshot(reason: &str) -> SourceNatFailureReas
         "missing_pool" => SourceNatFailureReason::MissingPool,
         "empty_pool" => SourceNatFailureReason::EmptyPool,
         "invalid_port_range" => SourceNatFailureReason::InvalidPortRange,
+        // #6812 F1 round 2: the Go snapshot builder now emits this for a pool
+        // with ANY member `expand_pool_address` would refuse — an unparseable
+        // token, a malformed mask, or an over-capacity prefix. It decodes to the
+        // SAME variant the parse loop below assigns from its own
+        // `invalid_pool_address` flag, so the disposition of such a pool is
+        // unchanged; deciding it Go-side is what lets the aggregate budget walk
+        // exclude the pool it knows builds no allocator.
         "invalid_pool" => SourceNatFailureReason::InvalidPool,
         "wrong_address_family" => SourceNatFailureReason::WrongAddressFamily,
         "allocator_exhausted" => SourceNatFailureReason::AllocatorExhausted,

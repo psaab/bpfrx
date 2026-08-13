@@ -774,3 +774,80 @@ fn repeated_references_to_a_reused_key_are_charged_once() {
         "pool B carries no bitmap, so it did not install"
     );
 }
+
+/// #6812 F1 round 2 — the DISPOSITION-EQUIVALENCE claim that licenses moving
+/// the "this pool's membership is unhonorable" verdict from this parse loop to
+/// the shared Go predicate.
+///
+/// The Go builder now stamps `pool_unusable=true` / `"invalid_pool"` on a pool
+/// with ANY member `expand_pool_address` would refuse, so the budget walk can
+/// exclude it. That is only sound if the resulting rule is INDISTINGUISHABLE
+/// from the one this loop produced when Go said nothing and the loop reached
+/// the verdict itself via its own `invalid_pool_address` flag.
+///
+/// Both wire shapes are built for the same two pools — a mixed
+/// honorable/malformed membership, and an over-capacity `/15` — and the
+/// resulting rules are compared field for field on everything the disposition
+/// turns on: the failure reason, the absence of an allocator, and the expanded
+/// address vectors.
+///
+/// RED-on-revert: change the `"invalid_pool"` arm of
+/// `source_nat_failure_reason_from_snapshot` to any other variant (e.g.
+/// `EmptyPool`) and the reason comparison fails — the Go-side verdict would
+/// then report a disposition the dataplane never reached on its own.
+#[test]
+fn go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812() {
+    for (label, members) in [
+        ("mixed_membership", vec!["198.51.100.1", "not-an-ip"]),
+        ("over_capacity_member", vec!["10.0.0.0/15"]),
+    ] {
+        // PRE-ROUND-2 WIRE: Go said nothing; this loop decides.
+        let loop_decided = parse_source_nat_rules(&[pool_snap("r0", "p", &members, 1024, 65535)]);
+        // POST-ROUND-2 WIRE: Go decided, and says so.
+        let go_decided = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+            pool_unusable: true,
+            pool_unusable_reason: "invalid_pool".to_string(),
+            ..pool_snap("r0", "p", &members, 1024, 65535)
+        }]);
+
+        assert_eq!(loop_decided.len(), 1, "{label}: loop-decided rule count");
+        assert_eq!(go_decided.len(), 1, "{label}: go-decided rule count");
+        let (l, g) = (&loop_decided[0], &go_decided[0]);
+
+        // The premise: this loop really does refuse the pool on its own, and
+        // refuses it as InvalidPool. Without this the equality below could hold
+        // because BOTH sides are wrong.
+        assert_eq!(
+            l.pool_failure,
+            Some(SourceNatFailureReason::InvalidPool),
+            "{label}: the parse loop must refuse this membership on its own — \
+             one member expand_pool_address rejects fails the WHOLE pool",
+        );
+
+        assert_eq!(
+            g.pool_failure, l.pool_failure,
+            "{label}: the Go-side verdict reports a different failure reason than the \
+             parse loop reached on its own; moving the decision changed the disposition",
+        );
+        assert_eq!(
+            g.pool_allocator.debug_occupancy_words(),
+            0,
+            "{label}: the Go-decided rule built an occupancy bitmap for a pool the \
+             dataplane refuses",
+        );
+        assert_eq!(
+            l.pool_allocator.debug_occupancy_words(),
+            0,
+            "{label}: the loop-decided rule built an occupancy bitmap for a pool the \
+             dataplane refuses",
+        );
+        assert_eq!(
+            g.pool_addresses_v4, l.pool_addresses_v4,
+            "{label}: expanded v4 membership diverged",
+        );
+        assert_eq!(
+            g.pool_addresses_v6, l.pool_addresses_v6,
+            "{label}: expanded v6 membership diverged",
+        );
+    }
+}

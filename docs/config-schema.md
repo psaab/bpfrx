@@ -5538,7 +5538,34 @@ reserved for whole-dataplane selection where a rewrite shim
     instead of materialising the bitmap; (3) the `aggregate_over_budget`
     wire reason maps to the new `OverBudget` failure variant (an older
     helper's catch-all maps it to `InvalidPool` — still fail-closed, so the
-    marker is wire-skew safe). Fail-on-revert:
+    marker is wire-skew safe).
+
+    **#6812 F1 — which pools the budget CHARGES is the runtime's own
+    verdict, not a derived quantity.** A pool the dataplane refuses builds no
+    allocator, so charging it Go-side refuses a HEALTHY pool the dataplane
+    would install — fail-closed over-rejection on the tolerant / peer-sync
+    recovery path (#1960 no-brick). The budget walk therefore excludes any
+    pool `config.SourceNATPoolUnusableReason` calls unusable, and the snapshot
+    builder poisons exactly that same set, so the two cannot drift.
+
+    That predicate is ALL-OR-NOTHING over pool membership because the
+    dataplane is: `expand_pool_address` failing on ONE member sets
+    `invalid_pool_address` and fails the WHOLE pool as `InvalidPool`
+    (`userspace-dp/src/nat/source.rs`). A pool of
+    `[198.51.100.1, not-an-ip]`, or one carrying an over-capacity `10.0.0.0/15`
+    (131,072 hosts against the 65,536 `MaxSourceNATPoolPrefixHosts` cap),
+    installs nothing at runtime and is now excluded from the budget for that
+    reason, carrying the wire reason `invalid_pool` — which
+    `source_nat_failure_reason_from_snapshot` decodes to the same
+    `InvalidPool` the parse loop reached on its own, so the dataplane
+    disposition is unchanged and only the DECIDER moves. An earlier revision
+    approximated this by summing per-member host counts and skipping a
+    zero total, which agreed with the runtime only when EVERY member failed;
+    the mixed and over-capacity shapes above escaped it (the second one
+    precisely because it expands to a LARGE number, charging 98.4% of the
+    port-capacity budget for an allocator that never exists).
+
+    Fail-on-revert:
     `TestSourceNATAggregatePoolCountRejected` /
     `TestSourceNATAggregateAddressesRejected` /
     `TestSourceNATAggregatePortCapacityRejected` /
@@ -5547,9 +5574,17 @@ reserved for whole-dataplane selection where a rewrite shim
     `TestAggregateOverBudgetPools{PortCapacity,Addresses,Count,FirstFit,Unreferenced}_6812` /
     `TestAggregateValidatorMatchesPoisonWalk_6812`
     (`pkg/config/compiler_nat_source_pool_aggregate_6812_test.go`),
-    `TestSourceNATSnapshotAggregate{OverBudgetPoisoned,AtBudgetUnaffected}_6812`
+    `TestAggregateBudgetExcludesUnusablePools_6812` /
+    `TestBudgetChargeImpliesHonorableMembers_6812`
+    (same file),
+    `TestSourceNATSnapshotAggregate{OverBudgetPoisoned,AtBudgetUnaffected}_6812` /
+    `TestSourceNATSnapshotUnusablePoolsDoNotPoisonHealthy_6812` /
+    `TestSourceNATSnapshotMixedMemberPoolsDoNotPoisonHealthy_6812` /
+    `TestSourceNATSnapshotOverCapacityPoolDoesNotStarveHealthy_6812`
     (`pkg/dataplane/userspace/nat_source_aggregate_6812_test.go`), and
-    `nat::tests_aggregate_budget` (`userspace-dp/src/nat/tests_aggregate_budget.rs`).
+    `nat::tests_aggregate_budget` (`userspace-dp/src/nat/tests_aggregate_budget.rs`),
+    including `go_side_invalid_pool_verdict_matches_the_parse_loop_verdict_6812`
+    for the disposition-equivalence claim.
   - `security nat static rule-set rule then static-nat prefix-name <addr>`
     (#4290) — the NAMED form of `then static-nat prefix <ip>`. `prefix-name`
     references a global `security address-book` entry whose literal prefix
