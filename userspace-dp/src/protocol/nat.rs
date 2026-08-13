@@ -421,4 +421,15 @@ pub(crate) struct SourceNatPoolStatus {
     pub reuses_total: u64,
     #[serde(rename = "exhaustion_total", default)]
     pub exhaustion_total: u64,
+    /// #4800: acquisitions of this pool's residual `live` map mutex on the
+    /// production allocate/reserve/release/rollback/GC paths, and the
+    /// subset of those that found it already held. The connection-rate
+    /// harness scrapes the PAIR — a contended count without its
+    /// denominator cannot distinguish "the allocator mutex saturated" from
+    /// "the allocator ran hot but never blocked". `default` so an older
+    /// helper that predates the counters decodes as 0.
+    #[serde(rename = "live_lock_acquisitions_total", default)]
+    pub live_lock_acquisitions_total: u64,
+    #[serde(rename = "live_lock_contended_total", default)]
+    pub live_lock_contended_total: u64,
 }

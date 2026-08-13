@@ -345,6 +345,18 @@ test-cluster-lock-lib:
 test-cluster-env-lib:
 	bash ./test/incus/cluster-env-selftest.sh
 
+# Self-test the #4800 new-flow-ceiling analysis layer: the function that
+# turns two helper counter snapshots into "N new flows/sec, and here is
+# which synchronization site saturated". Hermetic — synthetic snapshot
+# pairs only; no incus, cluster, network or helper. Also builds and unit-
+# tests the connection-rate generator, which lives outside the dataplane
+# workspaces so `cargo test` at the root does not reach it.
+# Run this after touching newflow_ceiling_analyze.py or newflow-gen.
+test-newflow-ceiling-lib:
+	cd test/incus && python3 -m unittest newflow_ceiling_analyze_test
+	cargo test --release --manifest-path test/incus/newflow-gen/Cargo.toml
+	bash -n ./test/incus/newflow-ceiling-harness.sh
+
 test-ssh:
 	./test/incus/setup.sh ssh
 

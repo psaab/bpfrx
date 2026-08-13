@@ -5413,3 +5413,169 @@ func TestBulkAckNoPendingIgnored(t *testing.T) {
 		t.Fatal("#5272: a matching outbound BulkAck must clear the pending epoch")
 	}
 }
+
+// #5718 fold r7 BLOCKER 2 FAIL-ON-REVERT: an owed cold-prime must have a firing
+// edge that does not depend on an event that has already passed.
+//
+// `needColdPrime` had exactly one consumer — `shouldColdPrime` in installConn —
+// so its only edge was a connection INSTALL that becomes active. The survivor
+// re-drive in handleDisconnect, the one other path that could pay the
+// obligation, was gated solely on `!outboundBulkAcked`. That flag is sticky for
+// the life of the PROCESS: written true once in sync_conn_read.go and cleared
+// nowhere, not on a full disconnect and not on a supersession. So an ack earned
+// by a PRIOR peer incarnation suppresses the re-drive for the CURRENT one.
+//
+// The reachable sequence: a new peer incarnation supersedes fabric 0, which
+// arms needColdPrime and starts a bulk; the same new peer's fabric 1 joins
+// passively while that bulk runs; fabric 0's write then fails and BulkSync
+// disconnects it. The obligation is armed, the survivor is already installed so
+// no further install can fire it, and the old incarnation's ack suppresses the
+// only other path. It stays armed forever. The incremental sweep only ships
+// sessions newer than its watermark, so established flows are never repaired
+// and a failover to that peer blackholes them.
+//
+// ATTRIBUTION, not just end state. `pendingBulkAckEpoch` is pre-set to a
+// sentinel and sampled INSIDE the bulk override, which doBulkSync runs as its
+// fast-population pre-step BEFORE it stamps its own epoch. The re-drive
+// goroutine zeroes that field immediately before calling doBulkSync, and it is
+// the only path reachable here that does (the full-disconnect branch also
+// zeroes it, but it is not taken — fabric 1 survives, which the IsConnected
+// assert pins). Sampling after doBulkSync returns would read the bulk's own
+// fresh epoch and prove nothing. So seeing the sentinel gone AT THE OVERRIDE
+// means THIS path drove the bulk, not that something else happened to re-prime.
+//
+// RED on revert: restore the gate to `!s.outboundBulkAcked.Load()` (or restore
+// the goroutine's re-check to bail on that flag alone) and this fails with
+// "an owed cold-prime had no firing edge".
+func TestOwedColdPrimeRedrivesOnSurvivorDespitePriorIncarnationAck_5718(t *testing.T) {
+	c0local, c0peer := net.Pipe()
+	defer c0peer.Close()
+	c1local, c1peer := net.Pipe()
+	defer c1peer.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", &mockSweepDP{})
+	ss.IsPrimaryFn = func() bool { return true }
+	redriven := make(chan struct{}, 1)
+	epochAtBulk := make(chan uint64, 1)
+	ss.BulkSyncOverride = func() error {
+		select {
+		case epochAtBulk <- ss.pendingBulkAckEpoch.Load():
+		default:
+		}
+		select {
+		case redriven <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+
+	// The sticky ack a PRIOR incarnation earned, and the CURRENT incarnation's
+	// cold-prime still owed because its active-fabric bulk is failing now.
+	ss.outboundBulkAcked.Store(true)
+	ss.needColdPrime.Store(true)
+	// Attribution sentinel: only the re-drive goroutine zeroes this on the path
+	// this test takes, and only before doBulkSync stamps its own epoch.
+	const redriveSentinel = 4242
+	ss.pendingBulkAckEpoch.Store(redriveSentinel)
+	ss.mu.Lock()
+	ss.conn0 = c0local
+	ss.conn1 = c1local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	go func() {
+		for {
+			if _, _, err := readSyncFrame(c1peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	// The active bulk's write-failure path, after fabric 1 had already joined.
+	ss.handleDisconnect(c0local)
+	select {
+	case <-redriven:
+	case <-time.After(2 * time.Second):
+		t.Fatal("an owed cold-prime had no firing edge: needColdPrime stayed armed, " +
+			"the survivor was already installed so no further install could consume it, " +
+			"and the prior incarnation's sticky outboundBulkAcked suppressed the re-drive")
+	}
+	if !ss.IsConnected() {
+		t.Fatal("attribution: fabric 1 must survive — if both fabrics dropped this " +
+			"took the full-disconnect branch and proves nothing about the survivor path")
+	}
+	select {
+	case got := <-epochAtBulk:
+		if got != 0 {
+			t.Fatalf("attribution: pendingBulkAckEpoch was %d when the bulk ran, want 0 "+
+				"(sentinel was %d) — the re-drive goroutine is what zeroes it before "+
+				"driving, so a surviving sentinel means some other path drove this bulk "+
+				"and the test is not binding the fix", got, redriveSentinel)
+		}
+	default:
+		t.Fatal("attribution: the bulk override never sampled the epoch")
+	}
+	// DISCHARGE: a satisfied obligation must not stay armed, or every later
+	// survivor disconnect re-bulks an already-primed peer.
+	deadline := time.Now().Add(2 * time.Second)
+	for ss.needColdPrime.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ss.needColdPrime.Load() {
+		t.Fatal("a successful re-drive must DISCHARGE needColdPrime — leaving it armed " +
+			"trades a lost obligation for one that can never be paid off")
+	}
+	ss.Stop()
+}
+
+// OVER-REACH GUARD for the widened gate, GREEN under the revert: with the
+// obligation NOT owed, a survivor disconnect must still NOT re-bulk. This is
+// the #466 flap-suppression optimization the gate exists to preserve, and it is
+// what separates "give the obligation an edge" from "re-bulk on every
+// disconnect". Steady state: our outbound bulk was acked by the CURRENT peer
+// and no cold-prime is owed.
+func TestNoRedriveWhenNoColdPrimeOwed_5718(t *testing.T) {
+	c0local, c0peer := net.Pipe()
+	defer c0peer.Close()
+	c1local, c1peer := net.Pipe()
+	defer c1peer.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", &mockSweepDP{})
+	ss.IsPrimaryFn = func() bool { return true }
+	var mu sync.Mutex
+	redrives := 0
+	ss.BulkSyncOverride = func() error {
+		mu.Lock()
+		redrives++
+		mu.Unlock()
+		return nil
+	}
+	ss.bulkEverCompleted.Store(true)
+	ss.outboundBulkAcked.Store(true)
+	ss.needColdPrime.Store(false)
+	ss.mu.Lock()
+	ss.conn0 = c0local
+	ss.conn1 = c1local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	go func() {
+		for {
+			if _, _, err := readSyncFrame(c1peer); err != nil {
+				return
+			}
+		}
+	}()
+
+	ss.handleDisconnect(c0local)
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	got := redrives
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("re-drive ran %d times with no cold-prime owed, want 0 — the "+
+			"needColdPrime arm must not degrade into re-bulking on every survivor "+
+			"disconnect (#466 flap suppression)", got)
+	}
+	ss.Stop()
+}
