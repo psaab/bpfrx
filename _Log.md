@@ -71302,3 +71302,60 @@ Every RED above is an assertion failure, not a build break.
   = 140, want 136` and its three siblings, each naming the transposition.
   `go build ./...` 0; `go vet ./pkg/dataplane/... ./pkg/cli/...` 0;
   `go test ./pkg/dataplane/... ./pkg/cli/...` all packages ok.
+## 2026-08-12 — #4983 round 4: fixture realism (#9) + the claim sweep (#10/#11/#12)
+
+- **Timestamp**: 2026-08-12
+- **Context**: a separate Codex leg (`cx6928.log`, DO-NOT-MERGE) pinned
+  `0e5d35f11`, two folds behind. Re-verified every blocking finding at the
+  current head BEFORE acting; three of eight were already closed by later
+  rounds (see below). This entry covers the two items scoped to this agent.
+- **#9 — my own fixture asserted a topology production cannot emit.**
+  `ingress_identity_snapshot` gave `reth0.50` RG 2 while `nat_snapshot`'s
+  `reth0.80` — its SIBLING unit on the same parent 11 — is RG 1. Verified the
+  constraint firsthand rather than taking it on report:
+  `pkg/dataplane/userspace/interfaces.go:214-218` resolves ONE `rg` per base
+  interface (own, else inherited from the RETH parent) and `:302` stamps that
+  single value onto every unit, so two units of one parent cannot differ.
+  Changed to RG 1 and replaced the justification, which had cited reth1.0 — a
+  DIFFERENT base, so not the unit that constrains this one. Behaviour is
+  unchanged because ownership derives from the EGRESS resolution (reth0.80,
+  RG 1), not the ingress unit's RG. The second site (`reth2.70`, parent 7) keeps
+  RG 2 and now says WHY that one is producible: it is the only unit on its
+  parent, so there is no sibling to conflict with.
+  A fixture change owes a fresh mutation check, so the F3 guard was re-proven
+  RED against the corrected fixture (`left: 0, right: 11`), not assumed.
+- **Claim sweep, done as one pass** (the class clusters — this is the second
+  PR in a row where it held):
+  - **#10** `session/README.md`: "the filter and the displayed interface name
+    cannot disagree" is true only for a non-zero, nameable identity. On the
+    fallback the filter considers EVERY zone interface while the display uses
+    the first, so a zero-identity row in zone `[A,B]` is selected by
+    `interface B` and prints `If: A`. Scoped, with the divergence named.
+  - **#11a** `session/entry.rs`: the reverse companion's zero was justified as
+    "the forward flow's egress interface is not resolved at install time".
+    False — the installed decision already carries `egress_ifindex`. The real
+    reason is that the forward egress PREDICTS where the reply will arrive
+    rather than observing where it did, and routing may be asymmetric.
+  - **#11b** "0 = untagged" is not synonymous: a priority-tagged frame carries
+    VID 0 with the tag present (`afxdp/frame/prop_tests/inspect.rs`). Reworded
+    to "no VLAN id recorded" with the caveat.
+  - **#11c** "the two policy-admitted install sites" — the LocalDelivery install
+    also runs for a `JunosHostLocalPolicy::NoMatch` host-bound flow, admitted by
+    the zone's host-inbound set with no junos-host policy matching. Corrected in
+    `entry.rs` and `README.md`.
+  - **#12a** `pkg/dataplane/types.go` still described the C/Rust layout as 128
+    bytes and the over-size as "exactly eight". Corrected to 144 (v4,
+    post-#4983) and to "whatever the sync-only trailing fields sum to". Swept
+    for other instances of the stale number: this was the only surviving one.
+  - **#12b** the same file called REST show/clear "approximate". `pkg/api/
+    sessions.go:783` REJECTS a filtered clear with HTTP 400 rather than
+    degrading it, so there is no approximate REST clear. Corrected at both
+    copies.
+  - **#12c** (pre-#4983 mixed-helper population conflicting with the ABI note)
+    was already fixed in round 2 — verified present, not re-done.
+- **Validation**: `cargo test --release` rc=0, 4261 passed / 0 failed;
+  `go test ./pkg/cli/... ./pkg/dataplane/...` rc=0. `rustfmt --check` clean on
+  the two touched .rs files; `gofmt -l` clean on `types.go`.
+- **File(s)**: userspace-dp/src/afxdp/tests_session_ingress_identity.rs,
+  userspace-dp/src/session/entry.rs, userspace-dp/src/session/README.md,
+  pkg/dataplane/types.go, _Log.md

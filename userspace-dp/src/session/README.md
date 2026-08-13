@@ -1003,7 +1003,15 @@ interface identity for both directions and two units of a single trunk NIC —
 `reth0.50` vs `reth0.80` — do not alias onto the parent. The `In: ... If:`
 column of the detailed `show` output is resolved from the same identity
 (`sessionIngressIf` in `pkg/cli/cli_show_flow.go`), so the filter and the
-displayed interface name cannot disagree.
+displayed interface name cannot disagree — but ONLY for a non-zero, nameable
+identity. For a zero or unresolvable one the two diverge by construction
+(#6928 review): the FILTER falls back to considering every interface bound to
+the zone (`resolveIngressIfaces`), while the DISPLAY falls back to the zone's
+first/representative interface (`sessionIngressIf`). So a zero-identity row in
+zone `[A, B]` is selected by `interface B` yet prints `If: A`. That is a
+fallback artefact, not a filtering error — the row genuinely has no recorded
+interface — but the sentence above is scoped to the stamped case and does not
+carry to the fallback.
 
 **Which surfaces this applies to.** The consumer side landed in the IN-DAEMON
 CLI only (`pkg/cli`) — the console session on `xpfd`. Two other surfaces read
@@ -1060,7 +1068,10 @@ The MISSING-NEIGHBOR seed (`build_missing_neighbor_session_metadata`) is NOT in
 that list: it is a forward session installed when a flow's first packet races
 an unresolved ARP/NDP, it is published to the conntrack map, and the
 pending-neighbor retry sweep never re-installs it — so it is stamped from the
-frame's `meta` exactly like the two policy-admitted install sites.
+frame's `meta` exactly like the two other forward install sites. Those two are
+not both policy-admitted: the transit install is, but the LocalDelivery install
+also runs for a `JunosHostLocalPolicy::NoMatch` host-bound flow, admitted by the
+zone's host-inbound set with no junos-host policy matching at all (#6928 review).
 
 That leaves exactly THREE production sites that stamp the pair — the TRANSIT
 forward install and the HOST-INBOUND (`LocalMiss`) install, both in
