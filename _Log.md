@@ -80644,3 +80644,77 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   (six failures on an unmutated control run mid-round, zero on the quiescent
   full-suite run).
 - **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 14 — make the lease guards judge a call's EXECUTION
+  EXTENT, not only its position; give the callback dependency a behavioural
+  binding
+
+  Round 13 established that a reference must be in CALLEE position to be filed
+  under an enclosing declaration. Codex's re-review showed position is not
+  containment: `callSitesOf` attributed every callee selector under a `FuncDecl`
+  to that declaration, function literals included, so two forms were green
+  against it. Both were measured against the round-13 guard at 419ef99a7, both
+  RC=0:
+
+    PLANT A  an acquisition inside a func literal assigned to a package-level
+             var and invoked from a function the apply never reaches
+    PLANT B  `go m.acquireLinkCycleLease()`
+    PLANT C  `hooks.acquireLinkCycleLease[0]()` substituted FOR the real
+             `m.acquireLinkCycleLease()` — both guards green with the manager
+             taking no lease at all (Codex B2, the IndexExpr unwrap plus the
+             name-only key)
+
+  A call's key now carries the form for every way of writing it the AST cannot
+  prove runs inside the enclosing declaration's extent — `[in a func literal]`,
+  `[started by a go statement]`. Ordinary flow, `defer`, and an immediately
+  invoked literal are contained and unmarked. `classifyRef` walks the real
+  ancestor chain (ast.Inspect push/pop) rather than two name-keyed passes.
+  Identity is the selector's full source text, not the method name.
+
+  THE AST CANNOT ESTABLISH TEMPORAL CONTAINMENT IN GENERAL, and the guard now
+  says so instead of implying otherwise. The daemon's own production site is a
+  marked one: the acquisition is written in the `beforeCycle` callback and is
+  covered only because `programRethMAC` invokes it synchronously. So every
+  marked site must name a behavioural test in `linkCycleUnprovenFormBindings`,
+  the guard scans the tree for that test, and a marked site with no binding, a
+  binding naming a test that does not exist, and a binding for a site no longer
+  allowlisted each fail.
+
+  `TestRethMACHookRunsOnTheCallersGoroutine_6871` is that proof for the daemon
+  site: the hook must run on the caller's goroutine, which puts it inside the
+  dynamic extent of the `programRethMAC` call. Deliberately stricter than
+  required — a spawn-and-join hook is contained and still fails it, because that
+  is a different containment argument and should be re-argued.
+
+  MEASURED (all `-count=1`, plants reverted after each):
+    round-13 guard  A,B,C -> RC=0, RC=0, RC=0
+    round-14 guard  A -> `[in a func literal]`; B -> `[started by a go
+                    statement]`; C -> escape + "no longer acquires the lease".
+                    In A and B the ordinary call one line away keeps satisfying
+                    the allowlist (the "no longer acquires" arm stays silent),
+                    and C shows that arm firing — so the failure is about the
+                    FORM, not about the name being present.
+    guard mutations D (drop the marker from both maps) -> RED naming the marker
+                    the scanner DERIVES from the production closure; D2 (same
+                    method name, different receiver text) -> RED; E (binding
+                    names a renamed-away test) -> RED; F (marked site, no
+                    binding) -> RED.
+    production mutations of programRethMAC's callback invocation: `go
+                    beforeCycle()` -> RED; spawn-and-JOIN -> RED naming both
+                    goroutine ids while EVERY other TestRethMAC test and both
+                    static guards stay green, which is the coverage the AST
+                    cannot supply.
+
+  CORRECTION recorded rather than glossed. Removing the `IndexExpr` unwrap is a
+  classification fix, not the thing that closes plant C: restoring the unwrap
+  alone leaves C RED, because `refKey`'s selector identity no longer lets it
+  reach the allowlisted key. Round 13 needed the unwrap AND the name-only key
+  together. Round 13's "over-inclusion is always fail-safe" is also corrected —
+  it holds for what a decoy ADDS, not for the allowlist's assertion that a
+  listed site still EXISTS, which any key-reproducing decoy defeated.
+
+  No executable production change: the two production files touched by the
+  measurement were reverted, and the committed diff is tests plus docs.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/daemon/reth_worker_join_order_5103_test.go, docs/reth-mac.md, _Log.md

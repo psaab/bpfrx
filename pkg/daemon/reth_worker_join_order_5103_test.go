@@ -3,6 +3,8 @@ package daemon
 import (
 	"errors"
 	"net"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -194,6 +196,97 @@ func TestRethMACNoJoinWhenMACAlreadyCorrect_5103(t *testing.T) {
 	if cycled || joined || len(events) != 0 {
 		t.Errorf("a member already on its virtual MAC must be a no-op; cycled=%v joined=%v "+
 			"events=%v", cycled, joined, events)
+	}
+}
+
+// goIDFromStack reads this goroutine's id out of the runtime.Stack header
+// ("goroutine 42 [running]:\n..."). It returns 0 for any header it does not
+// recognise, and every caller below FATALS on 0: a reader that quietly returned
+// a constant would make the identity comparison it feeds trivially true, which
+// is the one way this test could go green while proving nothing.
+func goIDFromStack() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	const prefix = "goroutine "
+	s := string(buf[:n])
+	if !strings.HasPrefix(s, prefix) {
+		return 0
+	}
+	s = s[len(prefix):]
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	id, err := strconv.ParseUint(s[:i], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+// TestRethMACHookRunsOnTheCallersGoroutine_6871 is the dependency the #6871
+// acquisition-site guard cannot see, made checkable.
+//
+// The daemon's ONE link-cycle lease acquisition is written inside the
+// beforeCycle closure in programRethMACWithWorkerJoin, and what keeps that lease
+// inside applyDataplaneAndHACore's deferred abandonLinkCycleLease is not where
+// the call is WRITTEN — it is that programRethMAC INVOKES the callback
+// synchronously. The static guard
+// (pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go) marks that
+// site "[in a func literal]" precisely because no AST fact establishes this, and
+// its linkCycleUnprovenFormBindings map names THIS test as the substitute. Do
+// not rename it without updating that entry — the map checks the name exists.
+//
+// The assertion is goroutine identity, which is the strongest available form: a
+// hook body that executes on the caller's goroutine necessarily runs inside the
+// dynamic extent of the programRethMAC call, so it has completed before
+// programRethMAC returns and therefore before programRethMACWithWorkerJoin does.
+//
+// It is deliberately STRICTER than the property strictly required. A hook
+// dispatched to another goroutine and then joined before returning would also be
+// contained, and would fail here. That is the wanted direction: it would be a
+// real change to the containment argument, and it should have to be re-argued
+// rather than pass silently.
+//
+// A hook that ran on another goroutine WITHOUT being joined fails in two ways
+// and neither is a pass: unsynchronised writes to `ran`/`hookGoID` are a data
+// race that -race reports, and without -race the reads most likely see the zero
+// values and fatal on "never ran".
+func TestRethMACHookRunsOnTheCallersGoroutine_6871(t *testing.T) {
+	var events []string
+	withRethOps(t, newRecordingRethOps(t, &events, curMAC5103, true /* force the cycle */))
+
+	caller := goIDFromStack()
+	if caller == 0 {
+		t.Fatal("fixture: could not read the test goroutine's id from the runtime.Stack " +
+			"header, so the identity comparison below would compare 0 against 0")
+	}
+
+	ran := false
+	var hookGoID uint64
+	cycled, err := programRethMAC("ge-0-0-1", virtMAC5103, func() error {
+		ran = true
+		hookGoID = goIDFromStack()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("programRethMAC: %v", err)
+	}
+	if !cycled {
+		t.Fatal("expected the refused live set to force a cycle; on any other path the hook " +
+			"is not invoked at all and this test would assert nothing")
+	}
+	if !ran {
+		t.Fatal("the beforeCycle hook never ran on the cycle path")
+	}
+	if hookGoID != caller {
+		t.Fatalf("beforeCycle ran on goroutine %d but programRethMAC was called from %d.\n"+
+			"The daemon takes its link-cycle lease inside this hook, and the only thing "+
+			"bounding that lease is applyDataplaneAndHACore's deferred "+
+			"abandonLinkCycleLease. A hook that does not complete within the "+
+			"programRethMAC call can take the lease after that defer has run, and since "+
+			"#6871 round 8 the lease renews itself — so it would suppress the 1 Hz "+
+			"reconcile for the life of the process (#6871 round 14)", hookGoID, caller)
 	}
 }
 

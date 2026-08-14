@@ -509,6 +509,43 @@ allowlisted `PrepareLinkCycle`, leaking it through a package-level variable, and
 calling it after the apply returned left the only matching selector in the
 allowlisted declaration and both guards green.
 
+**Callee position is not temporal containment, and the allowlist now says which
+it has (#6871 round 14).** Round 13's key named the declaration a call is written
+in, on the reading that reaching the call requires being there. True — and it
+says nothing about *when* the call runs relative to that declaration. Two forms
+were green against it, both compiled: an acquisition inside a func literal that
+escapes to a package-level variable and is invoked after the apply returns, and
+`go m.acquireLinkCycleLease()`, whose goroutine can outlive the whole apply. So a
+call's key now carries the form — `[in a func literal]`, `[started by a go
+statement]` — for every way of writing it that the AST cannot prove runs inside
+the enclosing declaration's extent. Ordinary flow, `defer`, and an immediately
+invoked literal are contained and carry no marker; anything else cannot come to
+rest on a key that reads as a proof.
+
+That distinction is not academic here, because **the daemon's one production
+acquisition is itself a marked site**: it is written in the `beforeCycle`
+callback, and what keeps it inside `applyDataplaneAndHACore`'s deferred abandon
+is that `programRethMAC` invokes that callback synchronously — a fact about
+another package that no local AST inspection reaches. Establishing containment in
+general needs whole-program call-graph and escape analysis, which these guards do
+not do and do not claim. What they do instead is make the gap explicit and
+force it to be paid for elsewhere: every marked site must name a behavioural test
+in `linkCycleUnprovenFormBindings`, that test must exist (checked by scanning the
+tree, so renaming it away fails the guard), and for this site it is
+`TestRethMACHookRunsOnTheCallersGoroutine_6871`, which asserts the hook runs on
+the caller's goroutine. A callback dispatched to another goroutine and joined
+before returning would also be contained, and fails that test deliberately: it is
+a different containment argument and should have to be made again.
+
+Call identity is also the selector's **full source text**, not the method name
+(#6871 round 14). Under a name-only key, any same-named call written in the
+allowlisted declaration held its entry up after the real acquisition was deleted
+— measured, with `hooks.acquireLinkCycleLease[0]()` substituted for
+`m.acquireLinkCycleLease()` and both guards still green while the manager took no
+lease at all. What that does *not* reach is a decoy with identical source text
+resolving to a different type; distinguishing those needs `go/types` over the
+whole module, which these guards deliberately do not run.
+
 **`linkCycleInFlight` re-reads on a lost CAS (#6871 round 8).** Four writers
 touch the lease word: the expiry CAS in `linkCycleInFlight`, `RenewLinkCycle`'s
 CAS, `acquireLinkCycleLease`'s `Store`, and `releaseLinkCycleLease`'s `Store(0)`
