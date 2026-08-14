@@ -3089,6 +3089,31 @@ picking one. Production tests:
 `compiler_nat_terminal_action_5628_test.go` (RED on revert, flat + hierarchical
 zero/two/valid + #3850 last-wins preservation).
 
+The gate has a SECOND registration: `validateSourceNATStrictView`
+(`compiler_peer_effective_snat.go`), the source-NAT subject of the #5876
+peer-effective strict list. Both are load-bearing and neither substitutes for
+the other. `runUniformGates` adjudicates the SUBMITTING node's view; the
+peer-effective run adjudicates the PEER's `${node}` / `groups nodeN` expansion,
+and it is the only strict adjudication that view ever gets, because the standby
+ingests the synced config through `Store.SyncApply` →
+`CompileConfigForNodeLenient`, where this gate is downgraded to a warning. A
+peer-only contradiction therefore commits green on the origin and lands
+malformed on the standby unless the peer-effective call runs. Deleting that call
+left four packages green until #6820 added
+`TestPeerOnlyNATTerminalActionRejectedAtOriginCommit_6820` (plus a
+node1-perspective and a both-views-clean over-reject control) in
+`compiler_peer_effective_nat_terminal_action_6820_test.go`.
+
+Both rejection MESSAGES are content-bound by
+`TestNATTerminalActionMessageContent_6820`, not just their firing. They are
+operator-visible on both paths — verbatim at strict commit, wrapped into a
+`cfg.Warnings` entry on the tolerant one — and the 2+-action text used to state
+a mechanism the compiler had stopped using (a packed-key/child-order pick),
+which no test could see. It now says what actually happens: every authored
+action is published and the DATAPLANE resolves the rule by a fixed precedence
+(`off` > `interface` > `pool` for SNAT, `off` > `pool` for DNAT), discarding the
+rest.
+
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land
 there very differently, and the difference is load-bearing:
@@ -3137,9 +3162,20 @@ there very differently, and the difference is load-bearing:
   Rust test building its snapshot directly cannot see a Go edit that drops the
   pool. Note a claim quantified over
   "2+ actions" cannot be discharged by pairwise fixtures alone — the three-action
-  `interface` + `off` + `pool` shape is pinned separately by
-  `off_wins_over_all_three_actions_5717`, because two pairwise tests both survive
-  a predicate that mishandles only the three-action case.
+  `interface` + `off` + `pool` shape needs its own fixture, because two pairwise
+  tests both survive a predicate that mishandles only the three-action case. It
+  needs one on EACH SIDE of the language boundary, which is the correction #6820's
+  re-gate made: `off_wins_over_all_three_actions_5717` pins the Rust resolution
+  but HAND-BUILDS its `SourceNATRuleSnapshot`, so it never crosses Go
+  publication, and the three Go sub-tests were all pairwise. That gap was
+  measured, not inferred — publishing `Off: rule.Then.Off &&
+  !(rule.Then.Interface && rule.Then.PoolName != "")` (correct on every pair,
+  wrong only on the triple) kept the whole Go suite green while the operator's
+  authored `off` published as `Off=false` and Rust translated on the
+  `interface_mode` branch. The Go half is now pinned by the
+  `hierarchical single-node interface+off+pool` sub-test of
+  `TestTolerantContradictorySNATCarriesOff_5717`, which drives the triple through
+  a real tolerant compile.
 
 - **Zero actions is NOT inert.** It installs no translation, but the matched
   traffic FALLS THROUGH — and what it falls through TO depends on what follows
@@ -3165,6 +3201,19 @@ there very differently, and the difference is load-bearing:
   `actionless_rule_with_no_later_rule_passes_untranslated_5717` pin BOTH
   dispositions, so neither the "inert" framing nor the "always translated by a
   later rule" framing can silently return.
+
+  The no-later-rule test asserts on `SourceNatLookup`, via
+  `match_source_nat_result_for_tuple`, and NOT on the `Option`-returning
+  `match_source_nat` wrapper (#6820 re-gate). The wrapper folds
+  `NoMatch | Unavailable(_) => None`, so a `None` assertion cannot tell
+  "forwarded untranslated" from "dropped" — precisely the distinction the test
+  name makes. Production splits them oppositely: `NoMatch` becomes
+  `Ok(NatDecision::default())` and the packet is forwarded, while `Unavailable`
+  becomes `Err` and `poll_descriptor` records a source-NAT failure and recycles
+  the descriptor — the packet is DROPPED. The wrapper is also reachable in a
+  non-test build only through `match_source_nat_for_flow`, which carries
+  `#[cfg_attr(not(test), allow(dead_code))]`; `match_source_nat_result_for_tuple`
+  is the live entry point.
 
 **More production flips — IPsec leaf-complete option containers (PR-C, #4313).**
 Three additional `security` subtrees now set `closedWorld:true`

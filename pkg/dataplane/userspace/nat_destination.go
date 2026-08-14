@@ -125,8 +125,9 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// (userspace-dp/src/nat/destination.rs) branches on `off` alone and
 			// never reads the pool, and `DnatTable::from_snapshots` independently
 			// refuses to parse an off entry's pool address. A snapshot carrying
-			// both Off=true and a usable pool — which this builder never emits but
-			// a mixed-version peer could — still resolves to the exemption; see
+			// both Off=true and a usable pool — which this builder never emits,
+			// but a mixed-version xpfd/helper pair can, since the snapshot IS the
+			// xpfd->helper wire form — still resolves to the exemption; see
 			// dnat_off_exemption_is_decided_by_off_not_by_an_empty_pool_6820.
 			if !isOff {
 				var ok bool

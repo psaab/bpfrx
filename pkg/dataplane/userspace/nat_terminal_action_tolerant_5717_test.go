@@ -179,6 +179,67 @@ security {
 				"want true (pre-#5628 `else if` chain kept one field only)")
 		}
 	})
+
+	// The TRIPLE, driven through Go publication (#6820 re-gate). The three
+	// sub-tests above are pairwise (off+pool flat, off+pool hierarchical,
+	// interface+off), and the Rust triple fixture
+	// (off_wins_over_all_three_actions_5717) HAND-BUILDS its
+	// SourceNATRuleSnapshot, so it never crosses this builder. Between them they
+	// leave the three-action shape unbound at the Go->Rust boundary: a publication
+	// predicate correct on every PAIR and wrong only on the TRIPLE — measured
+	// shape `Off: rule.Then.Off && !(rule.Then.Interface && rule.Then.PoolName !=
+	// "")` — published `Off=false` for this rule with the whole Go suite green,
+	// and Rust then took the `interface_mode` branch: the operator's authored
+	// `off` became active interface translation.
+	//
+	// A claim quantified over "2+ actions" cannot be discharged by pairwise
+	// fixtures on either side of the boundary — it has to be driven end-to-end
+	// on the three-action shape, which is what this does.
+	t.Run("hierarchical single-node interface+off+pool", func(t *testing.T) {
+		cfg := compileHierLenient5717(t, `
+security {
+  nat {
+    source {
+      pool p1 { address 203.0.113.10; }
+      rule-set rs1 {
+        from zone trust;
+        to zone untrust;
+        rule r1 {
+          match { source-address 10.0.0.0/24; }
+          then { source-nat { interface; off; pool p1; } }
+        }
+      }
+    }
+  }
+}`)
+		s := sourceSnapByName5717(t, buildSourceNATSnapshots(cfg, nil), "r1")
+		if !s.Off {
+			t.Errorf("triple `interface; off; pool` snapshot Off = false, want true — "+
+				"with Off dropped the Rust matcher falls to its `interface_mode` branch "+
+				"and TRANSLATES the source onto the egress address, the inverse of the "+
+				"authored exemption. Pairwise fixtures cannot see this: %+v", s)
+		}
+		if !s.InterfaceMode {
+			t.Errorf("triple snapshot InterfaceMode = false, want true — every authored "+
+				"action must reach the dataplane so the strict gate still counts THREE "+
+				"on the next commit: %+v", s)
+		}
+		if s.PoolName != "p1" {
+			t.Errorf("triple snapshot PoolName = %q, want p1", s.PoolName)
+		}
+		if len(s.PoolAddresses) != 1 || s.PoolAddresses[0] != "203.0.113.10" {
+			t.Errorf("triple snapshot PoolAddresses = %v, want [203.0.113.10] — the "+
+				"resolved pool must survive alongside its name; Rust derives pool_mode "+
+				"from either field", s.PoolAddresses)
+		}
+		// The Rust half of the triple (off actually winning over the other two)
+		// stays in off_wins_over_all_three_actions_5717 — a Go test cannot run
+		// the matcher. What this adds is the half that fixture cannot reach: the
+		// three fields it hand-builds are the ones this compile really publishes.
+		// Also bind the tolerant-path warning, the only operator-visible signal
+		// for the rule (`show` renders one selected action, never the conflict).
+		requireCardinalityWarning5717(t, cfg, "r1")
+	})
 }
 
 // TestTolerantContradictorySNATWithoutOffCarriesBothActions_5717 pins the
@@ -280,16 +341,31 @@ func requireCardinalityWarning5717(t *testing.T, cfg *config.Config, rule string
 		prefix, want, len(cfg.Warnings), cfg.Warnings)
 }
 
-// TestTolerantContradictoryDNATResolvesExempt_5717 pins the DNAT half, where
-// the precedence decision is made in GO rather than in Rust: the destination
-// snapshot builder's `isOff` short-circuit
-// (pkg/dataplane/userspace/nat_destination.go) must publish a pool-less
-// EXEMPTION entry for a contradictory `off` + `pool` rule, never a translating
-// entry pointing at the pool address.
+// TestTolerantContradictoryDNATResolvesExempt_5717 pins the DNAT half of the
+// publication contract: the destination snapshot builder's `isOff`
+// short-circuit (pkg/dataplane/userspace/nat_destination.go) must publish a
+// pool-less EXEMPTION entry for a contradictory `off` + `pool` rule, never a
+// translating entry pointing at the pool address.
+//
+// That short-circuit is CANONICALIZATION, not the precedence decision. The
+// decision is made in Rust on both paths: `DnatEntry::to_outcome`
+// (userspace-dp/src/nat/destination.rs) branches on `off` ALONE and never reads
+// the pool, so an entry carrying both still resolves to the exemption. An
+// earlier revision of this comment said the DNAT precedence "is made in GO
+// rather than in Rust"; that is the same shape of false-mechanism claim this
+// test file exists to retire, and the corrected wording lives at
+// nat_destination.go's `isOff` block, compiler_validate_strict_nat.go's
+// CONTRADICTORY bullet, and docs/config-schema.md (#6820).
 //
 // RED on revert: dropping the `if !isOff` guard around the pool lookup makes
 // the builder resolve and attach the pool address, so PoolAddress is no longer
-// empty — the exemption publishes as a translation to 10.0.0.5.
+// empty. Precisely: what is lost is the CANONICAL FORM, not the exemption —
+// `DnatEntry::to_outcome` still exempts on `off` alone, and `from_snapshots`
+// still refuses to parse an off entry's pool. Saying the mutation makes "the
+// exemption publish as a translation" would over-claim in the same direction
+// this file exists to correct (#6820). The reason the canonical form is worth
+// binding anyway: it is what keeps the two independent Rust belts from being
+// the SOLE thing between a malformed rule and a translation.
 func TestTolerantContradictoryDNATResolvesExempt_5717(t *testing.T) {
 	check := func(t *testing.T, cfg *config.Config) {
 		t.Helper()
@@ -304,8 +380,12 @@ func TestTolerantContradictoryDNATResolvesExempt_5717(t *testing.T) {
 		}
 		if s.PoolAddress != "" {
 			t.Errorf("tolerant contradictory DNAT snapshot PoolAddress = %q, want empty "+
-				"— an exemption entry must carry NO pool, otherwise the authored "+
-				"exemption publishes as a translation to that address", s.PoolAddress)
+				"— an exemption entry must carry NO pool. The two Rust belts "+
+				"(`DnatEntry::to_outcome` branching on `off` alone, `from_snapshots` "+
+				"refusing an off entry's pool) would still exempt this rule, so what a "+
+				"non-empty pool costs is the canonical form that keeps them from being "+
+				"the only thing standing between a malformed rule and a translation",
+				s.PoolAddress)
 		}
 	}
 

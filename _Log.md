@@ -79396,3 +79396,112 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13T22:10Z
+- **Action**: #6820 re-gate round 2 — folded four blocking review findings on the
+  #5628 NAT terminal-action gate, plus five claim corrections. Every blocking item
+  was re-measured firsthand at `ecf81adbc` before any edit; all three mutations the
+  reviewer reported as surviving were reproduced verbatim.
+
+  **B1 — the interface+off+pool TRIPLE was unbound across the Go->Rust boundary.**
+  Publishing `Off: rule.Then.Off && !(rule.Then.Interface && rule.Then.PoolName !=
+  "")` at `pkg/dataplane/userspace/nat_source.go:188` — a predicate correct on every
+  PAIR and wrong only on the triple — left `go test ./pkg/dataplane/userspace/
+  ./pkg/config/` at FULL_RC=0. The published rule carried `Off=false
+  InterfaceMode=true PoolName=p1`, and the Rust matcher then took the
+  `interface_mode` branch: the operator's authored `off` became active translation.
+  Nothing caught it because the only triple fixture,
+  `off_wins_over_all_three_actions_5717`, HAND-BUILDS its `SourceNATRuleSnapshot`
+  and never crosses Go publication, while all three Go sub-tests were pairwise.
+  Added a `hierarchical single-node interface+off+pool` sub-test to
+  `TestTolerantContradictorySNATCarriesOff_5717` that drives the triple through a
+  real tolerant compile. The original mutation, re-applied verbatim, now reds it at
+  `nat_terminal_action_tolerant_5717_test.go:217` (FULL_RC=1).
+
+  **B2 — the "passes untranslated" test could not tell FORWARD from DROP.**
+  `actionless_rule_with_no_later_rule_passes_untranslated_5717` asserted
+  `match_source_nat(...) == None`, but that wrapper folds
+  `SourceNatLookup::NoMatch | Unavailable(_) => None` (source.rs:1092-1093),
+  erasing exactly the distinction its name makes. Production splits the two
+  oppositely: `NoMatch -> Ok(NatDecision::default())` forwards the packet, while
+  `Unavailable(failure) -> Err(failure)`
+  (poll_descriptor/nat_exception.rs:84-91) reaches `record_source_nat_failure` +
+  `scratch_recycle.push` + `continue` (poll_descriptor/mod.rs:2273-2284) — the
+  packet is DROPPED. The wrapper is also reachable in a non-test build only via
+  `match_source_nat_for_flow`, which carries
+  `#[cfg_attr(not(test), allow(dead_code))]`. Rewrote the test to call
+  `match_source_nat_result_for_tuple` — the live entry point — with a real TCP
+  tuple and to match on `SourceNatLookup` exhaustively. Comparative proof under one
+  ISOLATING mutation (only "matched an actionless rule, then exhausted the list"
+  returns `Unavailable`; every other `NoMatch` untouched): at `ecf81adbc` the test
+  is GREEN (FULL_RC=0, sibling green too); with the rewrite the SAME mutation reds
+  precisely that one test (FULL_RC=101, 26 passed / 1 failed, sibling still green).
+
+  **B3 — the peer-effective strict call was unbound.** Deleting the
+  `validateNATTerminalActionCardinalityStrict` call at
+  `compiler_peer_effective_snat.go:87` left pkg/config, pkg/configstore,
+  pkg/dataplane/userspace and pkg/cluster ALL green (FULL_RC=0). That call is the
+  only strict adjudication the peer's `${node}` view ever gets — the standby
+  ingests via `Store.SyncApply -> CompileConfigForNodeLenient`, where this gate is
+  a warning. Added `compiler_peer_effective_nat_terminal_action_6820_test.go`: a
+  candidate whose rule carries one action on node0 and two on node1 via
+  `apply-groups "${node}"`, with the pool defined identically under BOTH group
+  blocks so an earlier subject (`validateNATPoolReferencesStrict`) cannot absorb
+  the rejection. Plus a node1-perspective control and a both-views-clean
+  over-reject control. The deletion now reds at line 79 (FULL_RC=1).
+
+  **B4 — a LIVE operator-facing string stated a mechanism the compiler does not
+  use.** The 2+-action rejection said "the compiler would silently pick one by
+  packed-key/child order, so an intended exemption can publish as a translation" —
+  emitted by the very compile that publishes all three actions, and contradicted
+  116 lines earlier in the same file by "The rule records EVERY field (the
+  else-if->if setter change)". It is operator-visible twice: verbatim at strict
+  commit, and wrapped into `cfg.Warnings` on the tolerant path. Replaced with what
+  actually happens — every action is published and the DATAPLANE resolves the rule
+  by a fixed precedence, discarding the rest — and made the precedence clause a
+  parameter of the shared `check` closure so a destination-NAT rule is not told
+  `interface` beats `pool`. Same correction applied to the counterfactual at
+  `compiler_validate_strict_nat.go:2751-2755` and the present-tense claim at
+  `compiler_opts.go:1993`.
+
+  **Found during the fold, not in the review:** `compiler_opts.go:1999` still said
+  "a leniently-loaded actionless rule is inert" — the exact Claim-2 falsehood this
+  PR exists to retire — four lines below the PR's own corrected wording in the same
+  comment. Corrected.
+
+  **N1-N5.** N1: `nat_terminal_action_tolerant_5717_test.go:284` still said the
+  DNAT "precedence decision is made in GO rather than in Rust", falsifying the PR's
+  own `nat_destination.go:121-122` assertion that those comments "have been
+  corrected"; rewritten to say the Go short-circuit is CANONICALIZATION and
+  `DnatEntry::to_outcome` decides. The same comment's RED-on-revert note (`:290-292`)
+  and the `PoolAddress` assertion message over-claimed in the same direction —
+  dropping the `if !isOff` guard makes the builder attach a pool, but the two
+  independent Rust belts still exempt the rule, so what the mutation costs is the
+  CANONICAL FORM, not the exemption; both rewritten to say that. N2: `tests_source.rs:958` called the
+  no-later-rule outcome "a fail-open", contradicting the corrected gate text;
+  rewritten. N3: `nat_destination.go:126-127` justified the fixture as a shape "a
+  mixed-version PEER could" emit — verified false (HA config sync ships
+  configuration TEXT via `encodeConfigPayload`, and `pkg/cluster/` references no
+  snapshot type; the receiver recompiles locally). Replaced with the real skew
+  path: a mixed-version xpfd/helper pair, since `DestinationNATRuleSnapshot` IS the
+  wire form (`protocol.go:126`, JSON-tagged). N4: both rejection messages were
+  content-unbound — no `*_test.go` asserted either text — so the B4 rewrite could
+  have said anything; added `TestNATTerminalActionMessageContent_6820`, proven RED
+  under three cells (one distinctive phrase reverted; the source precedence clause
+  leaked onto the destination kind; the zero-action message reverted to its
+  single-outcome wording). N5: the PR body's universal ("Every new test proven RED
+  under an isolating mutation", 5 rows against ~12 tests) is replaced by the
+  per-finding table.
+
+  **Validation.** `go build ./...` rc 0; `go test ./...` FULL_RC=0; `cargo test`
+  (full userspace-dp) FULL_RC=0; `gofmt -l` clean on every touched Go file.
+  Mutation harness: mutated COPIES only, `--no-preserve=timestamps`, per-cell
+  GOCACHE/CARGO_TARGET_DIR, `CARGO_INCREMENTAL=0`, APPLIED_MARKER required, FULL_RC
+  echoed per cell, `go vet` checked separately so a RED is an assertion and not a
+  build break.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/config/compiler_peer_effective_nat_terminal_action_6820_test.go,
+  pkg/dataplane/userspace/nat_destination.go,
+  pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
+  userspace-dp/src/nat/tests_source.rs, docs/config-schema.md, _Log.md

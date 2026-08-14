@@ -54,6 +54,104 @@ func wantCardinalityReject5628(t *testing.T, name string, err error) {
 	}
 }
 
+// TestNATTerminalActionMessageContent_6820 binds what the two rejection
+// messages SAY, not merely that they fire.
+//
+// wantCardinalityReject5628 matches on "translation action", which both arities
+// share and neither owns. That left the message bodies content-unbound: #6820
+// rewrote the 2+-action text — it used to claim "the compiler would silently
+// pick one by packed-key/child order, so an intended exemption can publish as a
+// translation", a mechanism the compiler stopped using at #5628 and which the
+// same file's CONTRADICTORY bullet already contradicted — and the whole edit
+// landed with no test able to see it. These strings are operator-visible on
+// BOTH paths: verbatim in the strict commit rejection, and wrapped into a
+// cfg.Warnings entry on the tolerant load / peer-sync path
+// (compiler_uniformgates_firewall_nat2.go), which is the only signal an
+// operator gets there since `show` renders one selected action.
+//
+// Asserted per-arity and per-kind, because the mechanism sentence differs: the
+// precedence clause is a parameter of the shared `check` closure, so a source
+// rule must name the `interface`/`pool` ordering and a destination rule — which
+// has no `interface` action at all — must not.
+func TestNATTerminalActionMessageContent_6820(t *testing.T) {
+	twoActionSNAT := buildTree(t, []string{
+		"set security nat source pool P address 203.0.113.5",
+		"set security nat source rule-set RS from zone trust",
+		"set security nat source rule-set RS to zone untrust",
+		"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
+		"set security nat source rule-set RS rule R1 then source-nat pool P",
+		"set security nat source rule-set RS rule R1 then source-nat off",
+	})
+	_, err := CompileConfig(twoActionSNAT)
+	if err == nil {
+		t.Fatal("CompileConfig ACCEPTED a two-action source-NAT rule")
+	}
+	for _, want := range []string{
+		"2 mutually-exclusive translation actions",
+		"published to the dataplane",
+		"fixed precedence",
+		"`off` wins over `interface`, and `interface` over `pool`",
+		"all but one action is silently discarded",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("2+-action SNAT rejection missing %q — the message must describe the "+
+				"mechanism the compiler ACTUALLY uses (publish-all + dataplane precedence), "+
+				"not the pre-#5628 packed-key/child-order pick: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "packed-key") || strings.Contains(err.Error(), "child order") {
+		t.Errorf("2+-action rejection still tells the operator the compiler picks an "+
+			"action by packed-key/child order; it records every field (#5628) and the "+
+			"dataplane resolves them: %v", err)
+	}
+
+	twoActionDNAT := buildTree(t, []string{
+		"set security nat destination pool PD address 10.0.0.5",
+		"set security nat destination rule-set RD from zone untrust",
+		"set security nat destination rule-set RD rule R1 match destination-address 198.51.100.1/32",
+		"set security nat destination rule-set RD rule R1 then destination-nat pool PD",
+		"set security nat destination rule-set RD rule R1 then destination-nat off",
+	})
+	_, err = CompileConfig(twoActionDNAT)
+	if err == nil {
+		t.Fatal("CompileConfig ACCEPTED a two-action destination-NAT rule")
+	}
+	if !strings.Contains(err.Error(), "`off` wins over `pool`") {
+		t.Errorf("2+-action DNAT rejection must name the DESTINATION precedence: %v", err)
+	}
+	if strings.Contains(err.Error(), "`interface`") {
+		t.Errorf("2+-action DNAT rejection names `interface`, an action a destination-NAT "+
+			"rule cannot carry — the precedence clause leaked across kinds: %v", err)
+	}
+
+	// The ZERO-action message was rewritten by this PR too ("falls through —
+	// translated by a later broader rule if one matches, otherwise left
+	// untranslated", replacing a claim that a later rule always exists). Bind
+	// both halves of that disjunction so neither can silently return to the
+	// single-outcome wording.
+	zeroAction := buildTree(t, []string{
+		"set security nat source rule-set RS from zone trust",
+		"set security nat source rule-set RS to zone untrust",
+		"set security nat source rule-set RS rule R1 match source-address 10.0.0.0/24",
+	})
+	_, err = CompileConfig(zeroAction)
+	if err == nil {
+		t.Fatal("CompileConfig ACCEPTED a zero-action source-NAT rule")
+	}
+	for _, want := range []string{
+		"carries no translation action",
+		"does not stop rule evaluation",
+		"translated by a later broader rule if one matches",
+		"otherwise left untranslated",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("zero-action rejection missing %q — the message must state BOTH "+
+				"fall-through outcomes; asserting only the translated one presumes a "+
+				"later rule exists (#6820): %v", want, err)
+		}
+	}
+}
+
 // --- VALID single-action rules must COMPILE clean (flat + hierarchical) ------
 
 func TestNATTerminalActionValidSingle_5628(t *testing.T) {

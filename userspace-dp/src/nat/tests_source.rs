@@ -953,16 +953,34 @@ fn actionless_rule_falls_through_to_later_broader_rule_5717() {
 ///
 /// The gate comment said the matched traffic "FALLS THROUGH to a later, broader
 /// rule and is translated by it". The first half is right; the second half
-/// presumes a later rule EXISTS. `match_source_nat` reaches the actionless
-/// `else` arm, `continue`s, runs out of rules, and returns no decision — the
-/// packet leaves UNTRANSLATED. That is still a fail-open against an intended
-/// exemption (the operator wanted no translation and got no translation only by
-/// accident), but it is a DIFFERENT outcome from being translated by a later
-/// rule, and the sibling test above pins only the two-rule shape.
+/// presumes a later rule EXISTS. The matcher reaches the actionless `else` arm,
+/// `continue`s, runs out of rules, and reports `NoMatch` — the packet is
+/// FORWARDED, untranslated. The disposition then coincides with the intended
+/// exemption, so nothing is observably wrong on the wire today; what is wrong is
+/// the RULE, which is non-terminal, so adding any later broader rule turns the
+/// same config into the sibling's case and the packet IS translated against the
+/// operator's intent. Calling this outcome itself "a fail-open" (an earlier
+/// revision did) conflates a live wrong disposition with a latent one, and
+/// contradicts the corrected gate wording at
+/// compiler_validate_strict_nat.go's ZERO-actions bullet.
 ///
 /// One rule in the slice, deliberately: adding a later rule is exactly what the
 /// sibling does, and it is the presence of that rule that the old wording
 /// silently assumed.
+///
+/// ASSERTED ON `SourceNatLookup`, NOT ON THE `Option` WRAPPER (#6820 re-gate).
+/// The wrapper `match_source_nat` folds `NoMatch | Unavailable(_) => None`
+/// (source.rs), so an `assert_eq!(..., None)` is satisfied by BOTH — the exact
+/// distinction this test's name makes. Production splits them oppositely:
+/// `NoMatch => Ok(NatDecision::default())` forwards the packet untranslated,
+/// while `Unavailable(failure) => Err(failure)`
+/// (afxdp/poll_descriptor/nat_exception.rs) funnels into
+/// `record_source_nat_failure` + `scratch_recycle.push` + `continue` in
+/// afxdp/poll_descriptor/mod.rs — the packet is DROPPED. The wrapper is also
+/// reachable in production only through `match_source_nat_for_flow`, which is
+/// `#[cfg_attr(not(test), allow(dead_code))]`; the live entry point is
+/// `match_source_nat_result_for_tuple`, which is what this calls, with a real
+/// TCP tuple rather than the address-only `protocol: None` sentinel.
 #[test]
 fn actionless_rule_with_no_later_rule_passes_untranslated_5717() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
@@ -973,20 +991,43 @@ fn actionless_rule_with_no_later_rule_passes_untranslated_5717() {
         // No off, no interface_mode, no pool — the actionless shape.
         ..SourceNATRuleSnapshot::default()
     }]);
-    assert_eq!(
-        match_source_nat(
-            &rules,
-            &NatScopeCtx::default(),
-            "lan",
-            "wan",
-            "10.0.61.102".parse().expect("src"),
-            "172.16.80.200".parse().expect("dst"),
-            Some("172.16.80.8".parse().expect("egress")),
-            None,
-        ),
+    let mut counter = None;
+    let lookup = match_source_nat_result_for_tuple(
+        &rules,
+        &NatScopeCtx::default(),
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some(PROTO_TCP),
+        44444,
+        443,
+        Some("172.16.80.8".parse().expect("egress")),
         None,
-        "an actionless rule with NO later rule must yield NO decision — the packet          passes untranslated. If this reports an exemption the actionless          disposition became terminal (a migration-contract change tracked on          #5717); if it reports a rewrite, the actionless arm started translating          on a rule that names no terminal action at all"
+        0,
+        false,
+        false,
+        &mut counter,
     );
+    match lookup {
+        SourceNatLookup::NoMatch => {}
+        SourceNatLookup::Unavailable(f) => panic!(
+            "actionless rule with NO later rule reported Unavailable({:?}) — production \
+             maps Unavailable to Err and DROPS the packet (nat_exception.rs -> \
+             record_source_nat_failure + continue). The rule names no terminal action \
+             at all; turning that into a drop is a fail-CLOSED regression that the \
+             `Option`-returning wrapper cannot see, because it folds NoMatch and \
+             Unavailable to the same None",
+            f.reason
+        ),
+        SourceNatLookup::Matched(d) => panic!(
+            "actionless rule with NO later rule reported Matched({d:?}) — a rewrite \
+             means the actionless arm started translating on a rule that names no \
+             terminal action; a default (no-rewrite) decision means the actionless \
+             disposition became TERMINAL, a migration-contract change tracked on #5717 \
+             that must be reviewed, not landed silently"
+        ),
+    }
 }
 
 /// #5717 (#6820 gate): a contradictory rule WITHOUT `off` — source NAT

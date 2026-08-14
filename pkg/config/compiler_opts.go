@@ -1990,13 +1990,17 @@ type compileOpts struct {
 	// exemption silently disappears and the traffic falls through: translated by
 	// a later broader rule if one matches, otherwise left untranslated) or TWO+
 	// mutually-exclusive actions inside
-	// one block (`off` + `pool`, `interface` + `pool` — the compiler silently
-	// picks one by packed-key / child order, so an exemption can publish as a
-	// translation) was previously accepted. The strict commit / commit-check
+	// one block (`off` + `pool`, `interface` + `pool` — before #5628 the compiler
+	// picked one by packed-key / child order; it now records every field and the
+	// DATAPLANE resolves the rule by a fixed precedence, so all but one authored
+	// action is silently discarded) was previously accepted. The strict commit /
+	// commit-check
 	// path hard-rejects so the malformed rule is operator-visible; the tolerant
 	// load / peer-sync paths downgrade to a warning so an already-persisted or
 	// peer-synced config an older binary accepted still BOOTS (#1960 fail-
-	// closed-on-load class) — a leniently-loaded actionless rule is inert, and a
+	// closed-on-load class) — a leniently-loaded actionless rule is NOT inert
+	// (see the ZERO-actions wording above: it is emitted and falls through), and
+	// a
 	// contradictory one now records BOTH fields (the else-if→if setter change),
 	// so the Rust dataplane's off-precedence governs its resolution (off wins →
 	// exempt), unifying the hierarchical path with the pre-existing flat-set

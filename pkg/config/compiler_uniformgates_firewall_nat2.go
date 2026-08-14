@@ -206,8 +206,13 @@ func runUniformGatesFirewallNAT2(tree *ConfigTree, cfg *Config, opts compileOpts
 	// through — translated by a later broader rule if one matches, otherwise
 	// untranslated); a rule
 	// with TWO+ mutually-exclusive actions inside one block let the compiler
-	// silently pick one by packed-key/child order (an exemption can publish as a
-	// translation — the inverse of the authored action). Strict on commit /
+	// silently pick one by packed-key/child order (an exemption COULD then
+	// publish as a translation — the inverse of the authored action). Both
+	// clauses are past tense on purpose: since #5628 the compiler records every
+	// field and the dataplane resolves them by a fixed precedence, so the
+	// present-tense form of this sentence is false — see the corrected
+	// rejection text on validateNATTerminalActionCardinalityStrict (#6820).
+	// Strict on commit /
 	// commit-check (hard reject so the malformed rule is operator-visible);
 	// lenient on load / peer-sync (warn — #1960 no-brick). What happens on that
 	// tolerant path differs per shape: a contradiction CONTAINING `off`
