@@ -212,6 +212,20 @@ type axisGroup6812 struct {
 	slots []any
 }
 
+// NOTE for this package's copy, kept OUTSIDE the shared region so the twins stay
+// textually identical: the nil-pointee case below is not hypothetical here —
+// PersistentNATConfig and DeterministicNATConfig are both reached from NATPool,
+// which this fixture sweeps, and both are nil in every fixture pool.
+// BEGIN SHARED COLLECTOR (#6812 round 11). This block is DUPLICATED verbatim
+// in the sibling package's sweep file, because a Go test helper cannot be shared
+// across packages without exporting it from production — and paying production
+// API surface for test convenience is the wrong trade. What matters is not that
+// there is one copy but that the two copies DO NOT DISAGREE, which is a weaker
+// and cheaper property: TestAxisCollectorTwinsAgree_6812 runs both collectors
+// over an identical probe value and requires identical column sets, and
+// TestAxisCollectorTwinsAreTextuallyIdentical_6812 requires this marked region
+// to match byte for byte. A deliberate divergence is still possible — it just
+// has to be declared in those tests instead of appearing silently.
 const axisKeyMaxDepth6812 = 8
 
 // #6812 round 10 claimed a two-way dichotomy — a field is SWEPT or it STOPS the
@@ -219,8 +233,7 @@ const axisKeyMaxDepth6812 = 8
 // SILENTLY SKIPPED, and it landed on precisely the case the round claimed to
 // close: with every fixture pointer nil, a nil pointee emitted only `.nil` and
 // every field of the pointee was skipped, so adding a field to
-// PersistentNATConfig or DeterministicNATConfig changed no column — and BOTH are
-// reached from NATPool, which this fixture sweeps. A `[]byte`
+// PersistentNATConfig or DeterministicNATConfig changed no column. A `[]byte`
 // emitted `.len` and `[0]` and dropped the rest; a map emitted only `.len`, so
 // three one-entry maps keyed {N:2}, {N:0}, {N:1} were indistinguishable while a
 // comparator keying on the sole key reorders them.
@@ -426,6 +439,8 @@ func axisEncodeMap6812(t *testing.T, v reflect.Value, depth int) string {
 	return b.String()
 }
 
+// END SHARED COLLECTOR (#6812 round 11).
+
 // sweepAxes6812 asserts the round-9 anti-coincidence property — declaration
 // order is not sorted on this column, in EITHER direction — for every column
 // every group's slots emit, and requires every constant column to be
@@ -529,6 +544,15 @@ func sweepAxes6812(t *testing.T, what string, groups []axisGroup6812, exempt map
 	// Report the split rather than leaving it to be re-derived by whoever asks
 	// next whether this fixture is closed. `go test -v` prints all three lists,
 	// and the middle one is the answer to "what is still blind here".
+	//
+	// READ A RISING BLIND COUNT AS THE FIX WORKING, NOT AS A REGRESSION. Round 10
+	// reported 74 fixture-constant columns; round 11 reports 140, over a column
+	// universe that grew from 108 cells to 188. Nothing became blind. The
+	// collector stopped SILENTLY SKIPPING nil pointees, list schemas and
+	// container contents, so holes that already existed started being counted.
+	// A blind-spot count that rises after a fix to the instrument is the
+	// instrument seeing further; the number to be suspicious of is one that
+	// falls without a named reason.
 	var guardedNames, blindNames, nonAxisNames []string
 	for col := range guarded {
 		guardedNames = append(guardedNames, col)

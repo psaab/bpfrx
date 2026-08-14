@@ -230,6 +230,16 @@ type axisGroup6812 struct {
 	slots []any
 }
 
+// BEGIN SHARED COLLECTOR (#6812 round 11). This block is DUPLICATED verbatim
+// in the sibling package's sweep file, because a Go test helper cannot be shared
+// across packages without exporting it from production — and paying production
+// API surface for test convenience is the wrong trade. What matters is not that
+// there is one copy but that the two copies DO NOT DISAGREE, which is a weaker
+// and cheaper property: TestAxisCollectorTwinsAgree_6812 runs both collectors
+// over an identical probe value and requires identical column sets, and
+// TestAxisCollectorTwinsAreTextuallyIdentical_6812 requires this marked region
+// to match byte for byte. A deliberate divergence is still possible — it just
+// has to be declared in those tests instead of appearing silently.
 const axisKeyMaxDepth6812 = 8
 
 // #6812 round 10 claimed a two-way dichotomy — a field is SWEPT or it STOPS the
@@ -443,6 +453,8 @@ func axisEncodeMap6812(t *testing.T, v reflect.Value, depth int) string {
 	return b.String()
 }
 
+// END SHARED COLLECTOR (#6812 round 11).
+
 // sweepAxes6812 asserts the round-9 anti-coincidence property — declaration
 // order is not sorted on this column, in EITHER direction — for every column
 // every group's slots emit, and requires every constant column to be registered.
@@ -549,6 +561,15 @@ func sweepAxes6812(t *testing.T, what string, groups []axisGroup6812, exempt map
 	// Report the split rather than leaving it to be re-derived by whoever asks
 	// next whether this fixture is closed. `go test -v` prints all three lists,
 	// and the middle one is the answer to "what is still blind here".
+	//
+	// READ A RISING BLIND COUNT AS THE FIX WORKING, NOT AS A REGRESSION. Round 10
+	// reported 74 fixture-constant columns; round 11 reports 140, over a column
+	// universe that grew from 108 cells to 188. Nothing became blind. The
+	// collector stopped SILENTLY SKIPPING nil pointees, list schemas and
+	// container contents, so holes that already existed started being counted.
+	// A blind-spot count that rises after a fix to the instrument is the
+	// instrument seeing further; the number to be suspicious of is one that
+	// falls without a named reason.
 	var guardedNames, blindNames, nonAxisNames []string
 	for col := range guarded {
 		guardedNames = append(guardedNames, col)

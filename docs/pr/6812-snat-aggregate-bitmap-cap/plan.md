@@ -1582,3 +1582,35 @@ The blind count rose because the sweep now enumerates the pointee fields, list
 schemas and container totals it previously skipped — every one of those was a
 hole before, it was simply not counted. The reclassifications move 12 cells from
 blind to non-axis in the other direction.
+
+### The twins, bound rather than merged
+
+The collector is duplicated across `pkg/config` and `pkg/dataplane/userspace`,
+because a Go test helper cannot be shared across packages without exporting it
+from production — and paying production API surface for test convenience is the
+wrong trade. The risk that buys is drift.
+
+The property needed is not ONE COPY, it is THE TWO COPIES DO NOT DISAGREE, which
+is weaker and cheaper. Two tests bind it:
+
+- `TestAxisCollectorTwinsAgree_6812` runs each package's collector over an
+  identical probe value — one exercising every handled kind, including the four
+  forms round 11 repaired — and compares the fingerprint to ONE checked-in
+  golden. A change to either copy alone reds, naming the columns that differ.
+- `TestAxisCollectorTwinsAreTextuallyIdentical_6812` compares the marked
+  `BEGIN/END SHARED COLLECTOR` region byte for byte. This catches what the probe
+  cannot: a divergence on a path the probe does not reach. The behavioural test
+  is only as good as the probe's coverage; this one is indifferent to it.
+
+A deliberate divergence remains possible — it just has to be declared in these
+tests instead of appearing silently.
+
+It found one immediately. Its first run failed: the `pkg/config` copy carried an
+extra clause in a comment, added by hand during the round-11 splice
+(`"…changed no column — and BOTH are"` against `"…changed no column. A []byte"`).
+That is exactly the drift the test exists for, on a change made an hour earlier,
+by the person who knew about the constraint. The package-specific note moved
+outside the marked region.
+
+Measured: dropping the slice `.len` column in ONE twin reds both halves —
+`differ at region line 141`, and `ONLY IN THE GOLDEN (5)`.
