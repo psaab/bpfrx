@@ -1384,3 +1384,64 @@ aggregate allocator budget exceeded (count 2/2, ...)`. MUT-C is recorded as an
 explicit NON-counterexample: it under-charges rather than over-charges, so B
 still fits; the F2 order defect it reopens is bound by the reuse-ordering
 fixtures, not by this one.
+
+### The measurement: base vs head
+
+Two questions, and they need different denominators. (A) Did round 9 actually
+have the blind spots M1 names? (B) Can the replacement fail?
+
+**A — production tiebreaks, applied identically to the PR base (`a1db9f734`,
+round 9's fixtures) and to this head.** Package scope at both, `-count=1`, so a
+GREEN at base means the WHOLE package missed it, not just the fixture.
+
+| cell | mutation in the production comparator | base | head |
+|---|---|---|---|
+| A1 | `(tier, CounterID ASC)` | **GREEN** | RED |
+| A2 | `(tier, len(PoolAddresses) ASC)` | **GREEN** | RED |
+| A3 | `(tier, PortLow ASC)` | **GREEN** | RED |
+| A4 | walk: stable-sort `rs.Rules` by pool cardinality | RED* | RED |
+
+Every head RED is `TestBuilderEmittedOrderIsStableWithinATier_6812` (A1-A3) or
+`TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812` (A4).
+
+\* A4 needs the honest footnote. At package scope the base is RED — but through
+`TestMultipleSNATRules`, an unrelated fixture whose data happens to move under a
+cardinality sort. Narrowed to the #6812 order fixture, the base is **GREEN**
+(cell A4b) while `TestMultipleSNATRules` alone is RED (A4c). So the property was
+caught sideways by accident and not by the fixture that asserts it — the same
+shape the round-8 comment describes for the two budget fixtures, and the reason
+"the package is red" is not the same claim as "the fixture binds it".
+
+**B — the sweep must be able to fail.** Head only; a belt that cannot fail
+proves nothing. Every cell reds through the axis sweep itself, not through a
+downstream assertion.
+
+| cell | mutation | result |
+|---|---|---|
+| B1 | add a field to `SourceNATRuleSnapshot` (production struct) | RED — unregistered constant column |
+| B2 | pool cardinality back to a constant 1 | RED |
+| B3 | `buildSourceNATSnapshots(cfg, nil)` — the round-9 call | RED |
+| B4 | delete one registry entry | RED |
+| B5 | register a column that VARIES | RED — stale entry |
+| B6 | port range back to the 1024-65535 default | RED |
+| C1 | walk side: register a column the fixture now guards | RED — stale entry |
+| C2 | walk side: add a field to `NATPool` | RED — unregistered constant column |
+
+B1 and C2 are the closure claim itself: a field added to a production struct
+that nobody remembers to think about fails the fixture rather than silently
+widening the blind set. That is what round 9 claimed and did not have.
+
+### What the fixtures now guard, counted rather than asserted
+
+`go test -v` prints the split. Builder fixture, per-TIER grouping: 11 columns
+guarded, 23 fixture-constant (unguarded, each registered with why), 0
+production-constant. Per-RULE-SET grouping: 3 guarded, 25 fixture-constant, 6
+production-constant — the six scope fields, which
+`buildSourceNATSnapshotsWithFeeds` stamps from `rs` for every rule of a rule-set,
+so within one block they cannot vary for any config. Walk-side fixture: 11
+guarded, 26 fixture-constant, 3 production-constant (`Rule.nil`, `Pool.nil` —
+the walk skips both before charging — and `Rule.Then.Type`, which
+`compileNATSource` only ever writes as `NATSource`, itself the zero value).
+
+Round 9 guarded 6 cells across the two fixtures by hand. This is 25, with 74
+named holes rather than an unbounded unnamed set.

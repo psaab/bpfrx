@@ -80008,3 +80008,61 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   zero FAIL**. That is the figure of record; the earlier "66 ok" conflated
   packages-with-tests and `no test files` lines and came from the unforced run.
 - **File(s)**: _Log.md
+
+- **Timestamp**: 2026-08-14T06:55Z
+- **Action**: #6815 round 10 — the closure claim was still a LIST, one level up,
+  plus three claim corrections. Codex: MERGE-NEEDS-MINOR, no runtime-behaviour
+  defect. (M1) Round 9 said the axis set was closed BY CONSTRUCTION; both
+  fixtures still MANUALLY ENUMERATED the helper calls, so a column with no call
+  stayed silent — the list had moved from axis names to helper calls, which is
+  round 9's own diagnosis of round 8 applied to round 9. Three columns it left
+  open, each confirmed by measurement against the WHOLE package at the PR base
+  a1db9f734: a `(tier, CounterID ASC)` tiebreak GREEN (the fixture passed nil
+  for the ID map so every ID was zero), `(tier, len(PoolAddresses) ASC)` GREEN
+  (one member per pool), `(tier, PortLow ASC)` GREEN (default range everywhere).
+  All three RED at this head. Replacement: `sweepAxes6812`, one twin per
+  package, REFLECTS over the value the production comparator reads — one column
+  per struct field recursing into nested structs and pointers, a `.len` column
+  per slice/map, the first element's columns when non-empty, and a HARD FAILURE
+  for any kind with no order-preserving key encoding. Adding a field to
+  SourceNATRuleSnapshot reds the fixture (cell B1); adding one to NATPool reds
+  the walk fixture (C2). Round 9's silent constant exemption is gone: a constant
+  column must be REGISTERED as `fixtureConstantAxes6812` (an admitted blind
+  spot) or `productionConstantAxes6812` (invariant for every production input),
+  an unregistered constant fails with the full offender list, and an entry that
+  is constant in no swept group fails as stale. Where closure STOPS is written
+  down rather than left implicit — keys derived from fields by arithmetic are
+  not reflectable, so `.len` is swept mechanically and the rest are declared as
+  fields of a wrapper struct the sweep treats like any other column; that
+  wrapper's field list is the only list left. Counted rather than asserted:
+  25 columns guarded across the two fixtures (11 per-tier + 3 per-rule-set on
+  the builder, 11 on the walk) against 6 by hand in round 9, and 74 named holes
+  plus 9 provable non-axes. (M2) The transformation-coverage claim was wider
+  than the measurement — reversal and nonzero rotation are caught elementwise
+  but a PARTITION is caught only when it changes this fixture, and `[1,0,2]` is
+  already stably partitioned by match address `< 10.0.2.0/24`; corrected to
+  "transformations that realise a nonidentity permutation on this data". (M3)
+  "Rust's pendings are exactly A" is false with a shared pool — pendings are
+  per-RULE, a multiset with repeats; corrected to distinct-key granularity, with
+  the reason distinct pool names give distinct keys. (M4) The Rust
+  fail-on-revert rationale named a line it no longer holds: after phase-one
+  reservation, deleting the reuse-path `pool_allocators.insert` is GREEN
+  (measured, cargo release, --test-threads=1); dropping phase 1's distinct-key
+  dedup is RED and is the replacement rationale, with the phase-1-charge
+  deletion recorded as an explicit non-counterexample.
+  Harness notes worth keeping. A `cargo test ... ; echo RC=$? | tee` reported
+  the TEE's exit code to the runner — the real rc (101, a build failure from a
+  missing sibling crate) was only in the log, so the first Rust baseline would
+  have read as a pass. The mutation harness restored files with `git checkout
+  --`, which cannot restore an UNTRACKED file; two of the swept files are new,
+  so it would have aborted mid-matrix leaving a mutation in the tree. Changed to
+  a content backup. And a `go test ./...` was started on the same worktree the
+  mutation matrix was mutating — killed and its output discarded rather than
+  reported, since it may have compiled a mutated tree.
+- **File(s)**: pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go (new),
+  pkg/config/nat_source_axis_sweep_6812_test.go (new),
+  pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go,
+  userspace-dp/src/nat/tests_aggregate_budget.rs,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
