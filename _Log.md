@@ -80066,3 +80066,60 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_validate_strict_nat.go,
   userspace-dp/src/nat/tests_aggregate_budget.rs,
   docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T08:40Z
+- **Action**: #6815 round 11 — the round-10 dichotomy had a THIRD outcome, and it
+  landed on the case round 10 claimed to close. Codex at cade69ad9: no
+  production regression; the headline property false, measured by a
+  switch-for-switch probe of the collector. "Swept, or stops the test" was
+  missing SILENTLY SKIPPED: a nil pointer emitted `.nil` and skipped every
+  pointee field, so adding a field to PersistentNATConfig or
+  DeterministicNATConfig — both nil in every fixture pool — changed no column at
+  all; a `[]byte` emitted `.len` and `[0]` and dropped the rest; a map emitted
+  only `.len`, so three one-entry maps keyed {N:2}, {N:0}, {N:1} were
+  indistinguishable while a comparator keying on the sole key reorders them; a
+  nil interface hid its payload schema; and time.Time was walked as wall/ext/loc,
+  whose lexicographic order is not chronological. A PARTIAL column is worse than
+  no column because it reads as coverage. The collector now gives every kind
+  exactly one of five outcomes: an order-preserving column; a TOTAL column over
+  contents (`.all` for sequences, sorted `.entries` for maps); the contained
+  TYPE's schema with ABSENT keys when the value is missing (nil pointee, empty
+  list, empty map); an explicit `…-UNENCODED` declaration the registry forces
+  someone to justify (nil interface — its dynamic type is genuinely unknowable);
+  or a hard stop. Keys are tagged present ("\x01"+key) / absent ("\x00") so an
+  absent value cannot collide with a legitimately empty string. Measured, all
+  RED with controls green: P1 drop the pointee-schema walk; P2 drop `.all`; P3
+  drop `.entries`; P4 drop the UNENCODED declaration; P5 walk time.Time as a
+  struct; P6 drop the empty-list schema walk; **W1 add a field to
+  PersistentNATConfig, a PRODUCTION type, reds the walk fixture** — the round-10
+  claim, now true. X1-X3 re-confirm the round-10 (tier, CounterID), (tier,
+  len(PoolAddresses)) and (tier, PortLow) cells still bind, so round 11 unbound
+  nothing. REGISTRY: `productionConstant` truth is no longer prose — every such
+  entry carries a WITNESS, an independently built sequence constructed to make
+  the column vary if the claim were false, and
+  TestProductionConstantAxesAreWitnessed_6812 requires each claimed column to
+  EXIST in the witness projection and be constant in every group. Measured:
+  marking Snapshot.PoolName production-constant reds. The witnesses found
+  something themselves — one rule-set carrying all six scope clauses is NOT a
+  representable input, because compileNATSource expands a multi-kind from/to into
+  the CROSS PRODUCT (six clauses on one named rule-set compile to nine
+  rule-sets), so the witness uses one from-kind and one to-kind per rule-set and
+  groups on the rule-NAME prefix rather than on scope, which would be circular.
+  `Pool.nil` moves to fixture-constant: CompileConfigLenient permits a dangling
+  pool reference (compiler_nat_pool_ref_5626_test.go:164) and the charge walk
+  skips it (:3192), so it is order-irrelevant AFTER filtering — not invariant for
+  every input, which is what the definition says. Three columns were classified
+  pessimistically and are corrected with firsthand verification, each now
+  production-constant WITH a witness: Match.Protocol/Protocols (sole non-test
+  writer is compiler_nat_destination.go:167-169), Pool.Address/Port/PortRaw
+  (compileNATSource builds pools fresh at :471 and is the sole SourcePools writer
+  at :686; the only writers of those three are on DNAT pool objects), and
+  Snapshot.AddressPersistent (one config-global bit, types_security.go:620,
+  stamped by nat_source.go:223). Split, with the caveat that the column universe
+  GREW because the collector now sees what it skipped: builder per-tier 13/44/1,
+  builder per-rule-set 4/47/7, walk 13/49/10 — 30 guarded / 140 fixture-constant
+  / 18 production-constant over 188 cells, against round 10's 25/74/9 over 108.
+- **File(s)**: pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go,
+  pkg/dataplane/userspace/nat_source_axis_collector_6812_test.go (new),
+  pkg/config/nat_source_axis_sweep_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md

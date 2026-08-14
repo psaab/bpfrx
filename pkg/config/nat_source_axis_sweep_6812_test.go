@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 )
 
 // #6812 round 10: the axis sweep, CLOSED OVER THE STRUCT RATHER THAN OVER A
@@ -51,6 +53,15 @@ import (
 
 // axisExemption6812 records a column a fixture does not vary, and — the
 // distinction round 10 turns on — whether it can vary in production at all.
+//
+// Round 11: the productionConstant claim is no longer taken on trust. Round 10
+// checked fixture constancy and stale names mechanically and left the harder
+// half — "is this really invariant for every production input?" — as prose.
+// Marking, say, a per-rule PoolName production-constant would have stayed green,
+// and Junos allows a pool per rule. That is the registry's own version of the
+// hole it exists to close. Every productionConstant entry now carries a WITNESS:
+// an independently built sequence, constructed to make the column VARY if the
+// claim were false. TestProductionConstantAxesAreWitnessed_6812 runs them.
 type axisExemption6812 struct {
 	// productionConstant is true ONLY when the column is invariant for every
 	// input the production path can produce. A stable sort keyed on such a
@@ -63,6 +74,7 @@ type axisExemption6812 struct {
 	// a hole that is known and one that is not.
 	productionConstant bool
 	why                string
+	witness            axisWitness6812
 }
 
 // fixtureConstantAxes6812 registers columns this fixture happens not to vary
@@ -72,11 +84,17 @@ func fixtureConstantAxes6812(why string, cols ...string) map[string]axisExemptio
 }
 
 // productionConstantAxes6812 registers columns that cannot vary for ANY
-// production input, so exempting them costs nothing. Use it only where that is
-// provable; the conservative direction is fixtureConstantAxes6812, which
-// over-reports blindness rather than under-reporting it.
-func productionConstantAxes6812(why string, cols ...string) map[string]axisExemption6812 {
-	return newAxisExemptions6812(true, why, cols...)
+// production input, so exempting them costs nothing. It REQUIRES a witness —
+// see axisWitness6812. The conservative direction remains
+// fixtureConstantAxes6812, which over-reports blindness rather than
+// under-reporting it and needs no witness because it claims nothing.
+func productionConstantAxes6812(why string, w axisWitness6812, cols ...string) map[string]axisExemption6812 {
+	out := newAxisExemptions6812(true, why, cols...)
+	for c, ex := range out {
+		ex.witness = w
+		out[c] = ex
+	}
+	return out
 }
 
 func newAxisExemptions6812(production bool, why string, cols ...string) map[string]axisExemption6812 {
@@ -85,6 +103,88 @@ func newAxisExemptions6812(production bool, why string, cols ...string) map[stri
 		out[c] = axisExemption6812{productionConstant: production, why: why}
 	}
 	return out
+}
+
+// axisWitness6812 is the ADVERSARIAL evidence behind a productionConstant
+// claim: an independently constructed sequence in which the column would vary
+// if the claim were false. A witness that merely rebuilds the fixture proves
+// nothing — it must populate, on purpose, whatever the claim says can never
+// differ.
+type axisWitness6812 struct {
+	name   string
+	groups func(t *testing.T) []axisGroup6812
+}
+
+// assertProductionConstantWitnesses6812 runs every witness a table references
+// and requires each claimed column to EXIST in the witness projection and be
+// CONSTANT within every one of its groups. A column that is absent fails as
+// loudly as one that varies: a claim about a column the witness never emits is
+// not a checked claim.
+func assertProductionConstantWitnesses6812(t *testing.T, what string, tables ...map[string]axisExemption6812) {
+	t.Helper()
+	byWitness := map[string][]string{}
+	witnesses := map[string]axisWitness6812{}
+	for _, tbl := range tables {
+		for col, ex := range tbl {
+			if !ex.productionConstant {
+				continue
+			}
+			if ex.witness.groups == nil {
+				t.Fatalf("%s: column %q is registered production-constant (%q) with NO "+
+					"witness. The claim is that no production input can make it vary; "+
+					"supply a sequence that would make it vary if that were false.",
+					what, col, ex.why)
+			}
+			byWitness[ex.witness.name] = append(byWitness[ex.witness.name], col)
+			witnesses[ex.witness.name] = ex.witness
+		}
+	}
+	names := make([]string, 0, len(byWitness))
+	for n := range byWitness {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		cols := byWitness[n]
+		sort.Strings(cols)
+		groups := witnesses[n].groups(t)
+		if len(groups) == 0 {
+			t.Fatalf("%s: witness %q produced no groups", what, n)
+		}
+		for _, g := range groups {
+			if len(g.slots) < 2 {
+				t.Fatalf("%s: witness %q group %s has %d slots; a one-element sequence is "+
+					"constant on every column and witnesses nothing",
+					what, n, g.label, len(g.slots))
+			}
+			seen := map[string][]string{}
+			for i, slot := range g.slots {
+				collectAxisKeys6812(t, "", reflect.ValueOf(slot), true, 0, func(col, key string) {
+					for len(seen[col]) < i {
+						seen[col] = append(seen[col], "")
+					}
+					seen[col] = append(seen[col], key)
+				})
+			}
+			for _, col := range cols {
+				vals, ok := seen[col]
+				if !ok {
+					t.Fatalf("%s: witness %q group %s emits no column %q, so the "+
+						"production-constant claim on it is unchecked. Either the column "+
+						"was renamed or the witness does not reach the same type.",
+						what, n, g.label, col)
+				}
+				for len(vals) < len(g.slots) {
+					vals = append(vals, "")
+				}
+				if !axisIsConstant6812(vals) {
+					t.Fatalf("%s: column %q is registered PRODUCTION-CONSTANT but VARIES in "+
+						"witness %q group %s: %q. The claim is false — reclassify it as a "+
+						"fixture-constant blind spot.", what, col, n, g.label, vals)
+				}
+			}
+		}
+	}
 }
 
 // mergeAxisExemptions6812 unions exemption tables, panicking on a duplicate
@@ -114,12 +214,69 @@ type axisGroup6812 struct {
 
 const axisKeyMaxDepth6812 = 8
 
+// #6812 round 10 claimed a two-way dichotomy — a field is SWEPT or it STOPS the
+// test. A switch-for-switch probe of the collector found a third outcome,
+// SILENTLY SKIPPED, and it landed on precisely the case the round claimed to
+// close: with every fixture pointer nil, a nil pointee emitted only `.nil` and
+// every field of the pointee was skipped, so adding a field to
+// PersistentNATConfig or DeterministicNATConfig changed no column — and BOTH are
+// reached from NATPool, which this fixture sweeps. A `[]byte`
+// emitted `.len` and `[0]` and dropped the rest; a map emitted only `.len`, so
+// three one-entry maps keyed {N:2}, {N:0}, {N:1} were indistinguishable while a
+// comparator keying on the sole key reorders them.
+//
+// A PARTIAL column is worse than no column, because it reads as coverage.
+//
+// Round 11 removes the third outcome. Every kind the collector meets does
+// exactly one of:
+//
+//	(a) contribute an ORDER-PRESERVING column for its own value;
+//	(b) contribute a TOTAL column over its contents (`.all`, `.entries`) — a
+//	    column no change to those contents can be invisible to;
+//	(c) enumerate the contained TYPE's schema with ABSENT keys, when the value
+//	    is missing (a nil pointer, an empty list/map). The columns still exist,
+//	    so a field added to the contained type still produces one and still has
+//	    to be registered;
+//	(d) declare itself UNENCODABLE by emitting a `…-UNENCODED` column, which the
+//	    registry then forces someone to justify in writing;
+//	(e) STOP the test.
+//
+// Keys are TAGGED. A present value encodes as "\x01"+key, an absent one as
+// "\x00". Absent sorts below every present key, and a uniform present-prefix
+// preserves order among present keys — so a column that is absent in some slots
+// and present in others is comparable, and "absent" can never collide with a
+// legitimately empty string.
+const (
+	axisAbsentKey6812  = "\x00"
+	axisPresentTag6812 = "\x01"
+)
+
+func axisLeaf6812(present bool, key string) string {
+	if !present {
+		return axisAbsentKey6812
+	}
+	return axisPresentTag6812 + key
+}
+
+func axisUintKey6812(u uint64) string { return fmt.Sprintf("%020d", u) }
+func axisIntKey6812(i int64) string   { return axisUintKey6812(uint64(i) + 1<<63) }
+func axisBoolKey6812(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+var axisTimeType6812 = reflect.TypeOf(time.Time{})
+
 // collectAxisKeys6812 flattens v into every column a comparator could key on,
-// calling add(column, key) once per column. The key encoding is chosen so that
-// LEXICOGRAPHIC order of the key equals the field's NATURAL order — otherwise a
-// numerically ascending column could read as non-monotone and the sweep would
-// claim coverage it does not have.
-func collectAxisKeys6812(t *testing.T, path string, v reflect.Value, depth int, add func(col, key string)) {
+// calling add(column, key) once per column.
+//
+// `present` false means the VALUE is missing and only its TYPE is being walked —
+// a nil pointer's pointee, an empty slice's element, an empty map's key/value.
+// Every leaf under it emits the absent key, which keeps the column in existence
+// (so a new field is still caught) without inventing a value.
+func collectAxisKeys6812(t *testing.T, path string, v reflect.Value, present bool, depth int, add func(col, key string)) {
 	t.Helper()
 	if depth > axisKeyMaxDepth6812 {
 		t.Fatalf("axis sweep: recursion past depth %d at %q — the sweep cannot enumerate a "+
@@ -128,52 +285,145 @@ func collectAxisKeys6812(t *testing.T, path string, v reflect.Value, depth int, 
 	}
 	switch v.Kind() {
 	case reflect.String:
-		add(path, v.String())
+		add(path, axisLeaf6812(present, v.String()))
 	case reflect.Bool:
-		if v.Bool() {
-			add(path, "1")
-		} else {
-			add(path, "0")
-		}
+		add(path, axisLeaf6812(present, axisBoolKey6812(v.Bool())))
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-		add(path, fmt.Sprintf("%020d", v.Uint()))
+		add(path, axisLeaf6812(present, axisUintKey6812(v.Uint())))
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		// Offset binary: +2^63 maps the signed range onto the unsigned one
 		// order-preservingly, so the zero-padded decimal sorts numerically
 		// including negatives.
-		add(path, fmt.Sprintf("%020d", uint64(v.Int())+1<<63))
-	case reflect.Slice, reflect.Array, reflect.Map:
-		add(path+".len", fmt.Sprintf("%020d", v.Len()))
-		if v.Kind() != reflect.Map && v.Len() > 0 {
-			// The first element is what a lexicographic sort of the slice reads
-			// first. An EMPTY slice contributes no element column at all; the
-			// `.len` registration is what records that the fixture leaves this
-			// list unpopulated and every key derived from its CONTENTS is
-			// therefore unguarded too.
-			collectAxisKeys6812(t, path+"[0]", v.Index(0), depth+1, add)
-		}
-	case reflect.Pointer, reflect.Interface:
-		if v.IsNil() {
-			add(path+".nil", "1")
+		add(path, axisLeaf6812(present, axisIntKey6812(v.Int())))
+	case reflect.Struct:
+		// time.Time would otherwise walk into wall/ext/loc — three columns whose
+		// lexicographic order is NOT chronological, i.e. a partial column that
+		// reads as coverage. One ordered column instead.
+		if v.Type() == axisTimeType6812 {
+			var nanos int64
+			if present {
+				nanos = v.Interface().(time.Time).UnixNano()
+			}
+			add(path, axisLeaf6812(present, axisIntKey6812(nanos)))
 			return
 		}
-		add(path+".nil", "0")
-		collectAxisKeys6812(t, path, v.Elem(), depth+1, add)
-	case reflect.Struct:
 		tp := v.Type()
 		for i := 0; i < tp.NumField(); i++ {
 			sub := tp.Field(i).Name
 			if path != "" {
 				sub = path + "." + sub
 			}
-			collectAxisKeys6812(t, sub, v.Field(i), depth+1, add)
+			collectAxisKeys6812(t, sub, v.Field(i), present, depth+1, add)
 		}
+	case reflect.Pointer:
+		add(path+".nil", axisLeaf6812(present, axisBoolKey6812(v.IsNil())))
+		if !present || v.IsNil() {
+			// (c) The pointee's SCHEMA still emits columns. This is the case
+			// round 10 got wrong: without it a field added to a type every
+			// fixture leaves nil changes nothing at all.
+			collectAxisKeys6812(t, path, reflect.Zero(v.Type().Elem()), false, depth+1, add)
+			return
+		}
+		collectAxisKeys6812(t, path, v.Elem(), true, depth+1, add)
+	case reflect.Interface:
+		add(path+".nil", axisLeaf6812(present, axisBoolKey6812(v.IsNil())))
+		if !present || v.IsNil() {
+			// (d) A nil interface hides its payload schema: the dynamic type is
+			// not knowable from the static one, so there is nothing to
+			// enumerate. Declare it rather than skip it — the registry then
+			// makes someone write down why that is acceptable.
+			add(path+".dynamic-UNENCODED", axisAbsentKey6812)
+			return
+		}
+		// A change of concrete type is itself an axis a comparator can read.
+		add(path+".dynamic-type", axisLeaf6812(true, v.Elem().Type().String()))
+		collectAxisKeys6812(t, path, v.Elem(), true, depth+1, add)
+	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice {
+			// nil and empty are DIFFERENT states and a comparator can see both.
+			add(path+".nil", axisLeaf6812(present, axisBoolKey6812(v.IsNil())))
+		}
+		add(path+".len", axisLeaf6812(present, axisUintKey6812(uint64(v.Len()))))
+		// (b) TOTAL over contents: every element, in order. No element past the
+		// first can change without changing this column.
+		add(path+".all", axisLeaf6812(present && v.Len() > 0, axisEncodeSeq6812(t, v, depth+1)))
+		if present && v.Len() > 0 {
+			collectAxisKeys6812(t, path+"[0]", v.Index(0), true, depth+1, add)
+			return
+		}
+		collectAxisKeys6812(t, path+"[0]", reflect.Zero(v.Type().Elem()), false, depth+1, add)
+	case reflect.Map:
+		add(path+".nil", axisLeaf6812(present, axisBoolKey6812(v.IsNil())))
+		add(path+".len", axisLeaf6812(present, axisUintKey6812(uint64(v.Len()))))
+		// (b) TOTAL over contents. Map iteration has no order, so the entries
+		// are SORTED before joining, which makes the column a function of the
+		// contents alone. This is what makes {N:2}, {N:0}, {N:1} three distinct
+		// keys instead of three identical `.len=1`s.
+		add(path+".entries", axisLeaf6812(present && v.Len() > 0, axisEncodeMap6812(t, v, depth+1)))
+		if present && v.Len() > 0 {
+			return
+		}
+		collectAxisKeys6812(t, path+"{key}", reflect.Zero(v.Type().Key()), false, depth+1, add)
+		collectAxisKeys6812(t, path+"{value}", reflect.Zero(v.Type().Elem()), false, depth+1, add)
 	default:
+		// (e) Floats have no order-preserving fixed-width decimal encoding here,
+		// and chan/func/unsafe.Pointer have no meaningful order at all.
 		t.Fatalf("axis sweep: field %q has kind %s, for which this sweep has no "+
-			"ORDER-PRESERVING key encoding. Add one. Skipping it would drop a column "+
-			"silently, which is the exact failure this sweep exists to prevent.",
-			path, v.Kind())
+			"ORDER-PRESERVING key encoding. Add one, or give the containing type a "+
+			"`…-UNENCODED` declaration. Skipping it would drop a column silently, which "+
+			"is the exact failure this sweep exists to prevent.", path, v.Kind())
 	}
+}
+
+// axisEncodeValue6812 renders ONE value as a single total string: every column
+// it would emit, sorted by column name and joined. Injective over the value, so
+// nothing about it can be invisible to a caller that embeds this.
+func axisEncodeValue6812(t *testing.T, v reflect.Value, depth int) string {
+	t.Helper()
+	cols := map[string]string{}
+	collectAxisKeys6812(t, "", v, true, depth, func(col, key string) {
+		cols[col] = key
+	})
+	names := make([]string, 0, len(cols))
+	for c := range cols {
+		names = append(names, c)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, c := range names {
+		fmt.Fprintf(&b, "%s=%s\x1e", c, cols[c])
+	}
+	return b.String()
+}
+
+// axisEncodeSeq6812 renders a slice/array in order, length-tagged per element so
+// the concatenation stays injective.
+func axisEncodeSeq6812(t *testing.T, v reflect.Value, depth int) string {
+	t.Helper()
+	var b strings.Builder
+	for i := 0; i < v.Len(); i++ {
+		e := axisEncodeValue6812(t, v.Index(i), depth)
+		fmt.Fprintf(&b, "%08d:%s\x1d", len(e), e)
+	}
+	return b.String()
+}
+
+// axisEncodeMap6812 renders a map as its SORTED (key, value) pairs.
+func axisEncodeMap6812(t *testing.T, v reflect.Value, depth int) string {
+	t.Helper()
+	entries := make([]string, 0, v.Len())
+	iter := v.MapRange()
+	for iter.Next() {
+		entries = append(entries,
+			axisEncodeValue6812(t, iter.Key(), depth)+"\x1f"+
+				axisEncodeValue6812(t, iter.Value(), depth))
+	}
+	sort.Strings(entries)
+	var b strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&b, "%08d:%s\x1d", len(e), e)
+	}
+	return b.String()
 }
 
 // sweepAxes6812 asserts the round-9 anti-coincidence property — declaration
@@ -201,7 +451,7 @@ func sweepAxes6812(t *testing.T, what string, groups []axisGroup6812, exempt map
 		cols := map[string][]string{}
 		for i, slot := range g.slots {
 			seen := map[string]bool{}
-			collectAxisKeys6812(t, "", reflect.ValueOf(slot), 0, func(col, key string) {
+			collectAxisKeys6812(t, "", reflect.ValueOf(slot), true, 0, func(col, key string) {
 				if seen[col] {
 					t.Fatalf("axis sweep %s / %s: column %q emitted twice for slot %d",
 						what, g.label, col, i)
@@ -340,19 +590,52 @@ type ruleAxisSlot6812 struct {
 // discriminate. The other twenty-six are admitted blind spots.
 var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 	productionConstantAxes6812(
-		"sourceNATAggregateReferencedCharges SKIPS a nil rule, a rule with no pool "+
-			"reference, and a pool name that resolves to nothing, all before it charges "+
-			"anything — so within the charged sequence both pointers are non-nil by "+
-			"construction, for every config, and a comparator cannot key on a variation "+
-			"the walk removed.",
-		"Rule.nil", "Pool.nil",
+		"compileNATSource appends only non-nil rules (compiler_nat_source.go:969 is "+
+			"the sole non-test append into Security.NAT.Source), so no config the "+
+			"compiler produces puts a nil in the slice this fixture walks. The charge "+
+			"walk's own `rule == nil` guard is defensive.",
+		walkWitness6812(),
+		"Rule.nil",
+	),
+	fixtureConstantAxes6812(
+		"NOT production-constant, corrected in round 11. Round 10 classified this "+
+			"alongside Rule.nil on the argument that the charge walk filters a dangling "+
+			"pool reference out before charging (compiler_validate_strict_nat.go:3192) — "+
+			"true, and a different statement from the registry's own definition. "+
+			"CompileConfigLenient PERMITS a dangling reference "+
+			"(compiler_nat_pool_ref_5626_test.go:164), so `Pool` CAN be nil for a config "+
+			"the compiler produces; what makes it constant HERE is this fixture's own "+
+			"precondition, which Fatalfs on a nil pool. Order-irrelevant after filtering "+
+			"is not the same as invariant for every input, so the entry moves rather "+
+			"than the definition.",
+		"Pool.nil",
 	),
 	productionConstantAxes6812(
 		"every rule reachable through cfg.Security.NAT.Source is produced by "+
 			"compileNATSource, whose only write to this field is NATSource — and "+
 			"NATSource is NATType's zero value, so an unwritten field carries it too. "+
 			"The column is NATSource for every config the compiler can produce.",
+		walkWitness6812(),
 		"Rule.Then.Type",
+	),
+	productionConstantAxes6812(
+		"a source rule cannot carry a protocol match. The ONLY non-test writer of "+
+			"Match.Protocol / Match.Protocols is compiler_nat_destination.go:167-169, "+
+			"and destination rules never enter Security.NAT.Source. Round 10 recorded "+
+			"these as fixture blind spots, which over-reported the hole.",
+		walkWitness6812(),
+		"Rule.Match.Protocol", "Rule.Match.Protocols.len", "Rule.Match.Protocols.nil",
+		"Rule.Match.Protocols.all", "Rule.Match.Protocols[0]",
+	),
+	productionConstantAxes6812(
+		"the DNAT-compat scalars cannot be set on a SOURCE pool. compileNATSource "+
+			"constructs its pools fresh (`pool := &NATPool{Name: inst.name}`, "+
+			"compiler_nat_source.go:471) and is the sole writer of SourcePools (:686); "+
+			"the only non-test writers of Address / Port / PortRaw are in "+
+			"compiler_nat_destination.go, on DNAT pool objects this map never aliases. "+
+			"Round 10 recorded these as fixture blind spots too.",
+		walkWitness6812(),
+		"Pool.Address", "Pool.Port", "Pool.PortRaw",
 	),
 	fixtureConstantAxes6812(
 		"the fixture gives each rule ONE literal source prefix and no address-book "+
@@ -360,13 +643,40 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 			"at their zero value — and with them every key derived from those lists' "+
 			"CONTENTS is unguarded too, not just the lengths. Production sets any of "+
 			"them per rule.",
-		"Rule.Match.SourceAddresses.len", "Rule.Match.SourceAddressName",
-		"Rule.Match.SourceAddressNames.len", "Rule.Match.DestinationAddress",
-		"Rule.Match.DestinationAddresses.len", "Rule.Match.DestinationAddressName",
-		"Rule.Match.DestinationAddressNames.len", "Rule.Match.DestinationPort",
-		"Rule.Match.DestinationPorts.len", "Rule.Match.InvalidDestinationPorts.len",
-		"Rule.Match.ReversedDestinationPortRanges.len", "Rule.Match.Protocol",
-		"Rule.Match.Protocols.len", "Rule.Match.Application", "Rule.Match.Applications.len",
+		"Rule.Match.SourceAddresses.len", "Rule.Match.SourceAddresses.nil",
+		"Rule.Match.SourceAddressName",
+		"Rule.Match.SourceAddressNames.len", "Rule.Match.SourceAddressNames.nil",
+		"Rule.Match.SourceAddressNames.all", "Rule.Match.SourceAddressNames[0]",
+		"Rule.Match.DestinationAddress",
+		"Rule.Match.DestinationAddresses.len", "Rule.Match.DestinationAddresses.nil",
+		"Rule.Match.DestinationAddresses.all", "Rule.Match.DestinationAddresses[0]",
+		"Rule.Match.DestinationAddressName",
+		"Rule.Match.DestinationAddressNames.len", "Rule.Match.DestinationAddressNames.nil",
+		"Rule.Match.DestinationAddressNames.all", "Rule.Match.DestinationAddressNames[0]",
+		"Rule.Match.DestinationPort",
+		"Rule.Match.DestinationPorts.len", "Rule.Match.DestinationPorts.nil",
+		"Rule.Match.DestinationPorts.all", "Rule.Match.DestinationPorts[0]",
+		"Rule.Match.InvalidDestinationPorts.len", "Rule.Match.InvalidDestinationPorts.nil",
+		"Rule.Match.InvalidDestinationPorts.all", "Rule.Match.InvalidDestinationPorts[0]",
+		"Rule.Match.ReversedDestinationPortRanges.len",
+		"Rule.Match.ReversedDestinationPortRanges.nil",
+		"Rule.Match.ReversedDestinationPortRanges.all",
+		"Rule.Match.ReversedDestinationPortRanges[0]",
+		"Rule.Match.Application",
+		"Rule.Match.Applications.len", "Rule.Match.Applications.nil",
+		"Rule.Match.Applications.all", "Rule.Match.Applications[0]",
+	),
+	fixtureConstantAxes6812(
+		"round-11 POINTEE-SCHEMA columns, and the reason round 11 exists. Every pool "+
+			"here leaves `PersistentNAT` and `Deterministic` nil, and round 10's collector "+
+			"emitted only `.nil` and SILENTLY SKIPPED every field behind the pointer — so "+
+			"adding a field to PersistentNATConfig or DeterministicNATConfig changed no "+
+			"column at all. The collector now walks the pointee TYPE with absent keys, so "+
+			"those fields have columns and a new one lands here unregistered. They are "+
+			"constant because no fixture pool is persistent-NAT or deterministic-CGNAT, "+
+			"and a comparator keying on a populated one is unguarded.",
+		"Pool.PersistentNAT.Permit", "Pool.PersistentNAT.InactivityTimeout",
+		"Pool.Deterministic.BlockSize", "Pool.Deterministic.HostAddress",
 	),
 	fixtureConstantAxes6812(
 		"every rule here is plain pool-mode source NAT: no `then source-nat interface` "+
@@ -379,8 +689,95 @@ var walkRuleAxisExemptions6812 = mergeAxisExemptions6812(
 			"marker (every range here is valid), and no pool is routing-instance-scoped, "+
 			"port-overloaded, no-translation, persistent-NAT or deterministic-CGNAT. A "+
 			"tiebreak keyed on any of them would reorder a config that sets it.",
-		"Pool.Address", "Pool.Port", "Pool.PortRaw", "Pool.PortRangeInvalidSpec",
+		"Pool.PortRangeInvalidSpec", "Pool.Addresses.nil",
 		"Pool.PortNoTranslation", "Pool.PortOverloadingFactor", "Pool.RoutingInstance",
 		"Pool.PersistentNAT.nil", "Pool.Deterministic.nil",
 	),
 )
+
+// walkWitness6812 is the adversarial sequence behind this package's
+// production-constant claims (#6812 round 11). Each claim says a column cannot
+// vary for any production input; this config is built to make it vary if that
+// were false:
+//
+//   - it carries DESTINATION NAT alongside source NAT, with a DNAT rule that
+//     sets `match protocol tcp` and a DNAT pool that sets both `address` and
+//     `port`. Those are exactly the fields claimed unreachable from the source
+//     side, and here they are populated — on the other side of the compiler;
+//   - its source rule-set's rules reference DIFFERENT pools, so a false claim on
+//     any pool-derived column fails instead of passing quietly;
+//   - it declares several rules per rule-set, so `Rule.nil` is witnessed over a
+//     real sequence rather than a singleton.
+//
+// Groups are per source RULE-SET, which is the scope the walk's rule order is
+// asserted at.
+func walkWitness6812() axisWitness6812 {
+	return axisWitness6812{
+		name: "source + destination NAT, DNAT protocol/address/port populated",
+		groups: func(t *testing.T) []axisGroup6812 {
+			t.Helper()
+			cmds := []string{
+				// The DNAT half: the fields the source-side claims say are
+				// unreachable, set on purpose.
+				"set security nat destination pool dp address 203.0.113.200",
+				"set security nat destination pool dp address port 8080",
+				"set security nat destination rule-set DRS from zone untrust",
+				"set security nat destination rule-set DRS rule dr0 match protocol tcp",
+				"set security nat destination rule-set DRS rule dr0 match destination-address 198.51.100.9/32",
+				"set security nat destination rule-set DRS rule dr0 then destination-nat pool dp",
+				// The source half, one rule-set, three rules, three pools.
+				"set security nat source rule-set WRS from zone trust",
+			}
+			for r := 0; r < 3; r++ {
+				pool := fmt.Sprintf("wq%d", r)
+				cmds = append(cmds,
+					fmt.Sprintf("set security nat source pool %s address 198.51.%d.1", pool, 200+r),
+					fmt.Sprintf("set security nat source pool %s port range %d to %d", pool, 3000+100*r, 3050+100*r),
+					fmt.Sprintf("set security nat source rule-set WRS rule wr%d match source-address 10.7.%d.0/24", r, r),
+					fmt.Sprintf("set security nat source rule-set WRS rule wr%d then source-nat pool %s", r, pool),
+				)
+			}
+			cfg, err := CompileConfigLenient(snat5877Tree(t, cmds...))
+			if err != nil {
+				t.Fatalf("witness CompileConfigLenient: %v", err)
+			}
+			// The DNAT half must really have compiled, or the witness is not
+			// adversarial and the claims it backs are unchecked.
+			if n := len(cfg.Security.NAT.Destination.RuleSets); n == 0 {
+				t.Fatalf("witness compiled NO destination rule-sets; the claims that a source " +
+					"rule cannot carry a protocol match, and a source pool cannot carry the " +
+					"DNAT-compat scalars, would then be witnessed against a config that has " +
+					"no destination side at all")
+			}
+			var groups []axisGroup6812
+			for _, rs := range cfg.Security.NAT.Source {
+				var slots []any
+				for _, rule := range rs.Rules {
+					pool := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
+					if pool == nil {
+						t.Fatalf("witness rule %s references unknown pool %q", rule.Name, rule.Then.PoolName)
+					}
+					lo, hi, ok := SourceNATPoolPortRange(pool)
+					if !ok {
+						t.Fatalf("witness pool %q has an unusable port range", pool.Name)
+					}
+					width := int(hi) - int(lo) + 1
+					slots = append(slots, ruleAxisSlot6812{
+						Rule:                rule,
+						Pool:                pool,
+						DerivedPortWidth:    width,
+						DerivedPortCapacity: len(SourceNATPoolMembers(pool)) * width,
+					})
+				}
+				groups = append(groups, axisGroup6812{label: "witness rule-set " + rs.Name, slots: slots})
+			}
+			return groups
+		},
+	}
+}
+
+// TestProductionConstantAxesAreWitnessed_6812 is the round-11 answer to "the
+// productionConstant truth is not mechanically checked".
+func TestProductionConstantAxesAreWitnessed_6812(t *testing.T) {
+	assertProductionConstantWitnesses6812(t, "walk axis registry", walkRuleAxisExemptions6812)
+}

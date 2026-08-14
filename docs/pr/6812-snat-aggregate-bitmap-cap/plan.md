@@ -1445,3 +1445,140 @@ the walk skips both before charging — and `Rule.Then.Type`, which
 
 Round 9 guarded 6 cells across the two fixtures by hand. This is 25, with 74
 named holes rather than an unbounded unnamed set.
+
+## Round 11 — "swept or stops the test" had a third outcome
+
+Codex at `cade69ad9`: no production regression, and the round's headline
+property false. A switch-for-switch probe of the collector found **SILENTLY
+SKIPPED** sitting between the two outcomes round 10 claimed, and it landed on
+precisely the case round 10 said it had closed.
+
+| field form | round-10 outcome |
+|---|---|
+| **nil pointer, every fixture** | `.nil` swept, **every pointee field skipped** |
+| `[]byte` | `.len` and `[0]`; everything past the first element skipped |
+| map with a struct key | `.len` only — key, value, nil-vs-empty all skipped |
+| nil interface | `.nil` only; the payload schema is hidden |
+| `time.Time` | swept as `wall`/`ext`/`loc.nil` — not chronological |
+
+The first row is the one that matters. `PersistentNATConfig` and
+`DeterministicNATConfig` are nil in every fixture pool, so adding a field to
+either changed **no emitted column** — while round 10's own text said a new
+field "cannot be silently omitted". And the map counterexample is concrete:
+three one-entry maps keyed `{N:2}`, `{N:0}`, `{N:1}` all emitted `M.len=1`
+alone, so a comparator keying on the sole key reorders them with the sweep
+green.
+
+**A partial column is worse than no column, because it reads as coverage.**
+
+### The fix is the disappearance of the third outcome, not another `case`
+
+Every kind the collector meets now does exactly one of five things:
+
+1. contribute an **order-preserving** column for its own value;
+2. contribute a **TOTAL** column over its contents — `.all` for a sequence,
+   `.entries` for a map (sorted, so it is a function of contents and not of
+   iteration order). No change to those contents can be invisible to it;
+3. enumerate the contained **TYPE's schema with ABSENT keys** when the value is
+   missing — a nil pointer's pointee, an empty list's element, an empty map's
+   key and value. The columns still exist, so a field added to the contained
+   type still produces one and still has to be registered;
+4. **declare itself UNENCODABLE** (`…-UNENCODED`), which the registry then
+   forces someone to justify in writing. A nil interface takes this path: its
+   dynamic type genuinely is not knowable from the static one;
+5. **stop the test** — the `default` arm. Floats have no order-preserving
+   fixed-width decimal here; chan/func/unsafe.Pointer have no order at all.
+
+Keys are TAGGED: present values encode as `"\x01"+key`, absent ones as `"\x00"`.
+Absent sorts below every present key, a uniform present-prefix preserves order
+among present keys, and "absent" can never collide with a legitimately empty
+string.
+
+`nat_source_axis_collector_6812_test.go` asserts the four repaired forms
+directly, against synthetic types, because the property belongs to the collector
+rather than to any NAT fixture. Outcome 5 needs no case: a kind the switch does
+not handle reaches a `default` that fails, which is a property of the language.
+
+### Measured
+
+Controls green. Every cell RED.
+
+| cell | mutation | result |
+|---|---|---|
+| P1 | drop the nil-pointer schema walk | RED — `a NIL pointer emitted no "P.Alpha" column` |
+| P2 | drop the total `.all` | RED — `{7,1,2}` and `{7,9,2}` collide |
+| P3 | drop the total `.entries` | RED — 3 distinct maps → 1 key |
+| P4 | drop the UNENCODED declaration | RED |
+| P5 | walk `time.Time` as a plain struct | RED — ordering not chronological |
+| P6 | drop the empty-list schema walk | RED — 13 columns vanish from the fixture |
+| **W1** | **add a field to `PersistentNATConfig`, a PRODUCTION type every fixture leaves nil** | **RED** |
+| X1-X3 | the round-10 `(tier, CounterID)`, `(tier, len(PoolAddresses))`, `(tier, PortLow)` tiebreaks | RED — round 11 unbound nothing |
+
+W1 is the round-10 claim, now true: a field added to a type no fixture ever
+populates fails the fixture instead of passing quietly.
+
+### The registry: a claim that was not checked, and one that was wrong
+
+**`productionConstant` truth is now mechanically checked.** Round 10 checked
+fixture constancy and stale names and left the harder half as prose — marking a
+per-rule `PoolName` production-constant would have stayed green, and Junos
+allows a pool per rule. Every such entry now carries a **WITNESS**: an
+independently built sequence constructed to make the column vary if the claim
+were false. `TestProductionConstantAxesAreWitnessed_6812` runs them and requires
+each claimed column to EXIST in the witness projection and be constant in every
+group — an absent column fails as loudly as a varying one, because a claim about
+a column the witness never emits is not a checked claim.
+
+Measured: marking `Snapshot.PoolName` production-constant reds with
+`VARIES in witness … group witness rule-set wb: ["\x01wp10" "\x01wp11" "\x01wp12"]`.
+
+The witnesses found something on their own. Building one rule-set carrying all
+six scope clauses is **not a representable input**: `compileNATSource` expands a
+multi-kind `from`/`to` into the CROSS PRODUCT of from-kind × to-kind — six
+clauses on one named rule-set compile to NINE rule-sets, each with exactly one
+of each. The witness therefore uses one from-kind and one to-kind per rule-set
+and groups on the rule-NAME prefix; grouping on a scope field would have been
+circular, since scope constancy is the thing being witnessed.
+
+**`Pool.nil` was misclassified and moves.** `CompileConfigLenient` permits a
+dangling pool reference (`compiler_nat_pool_ref_5626_test.go:164`) and the
+charge walk skips it (`compiler_validate_strict_nat.go:3192`), so it is
+order-irrelevant AFTER filtering — a different statement from the registry's own
+"invariant for every production input". What makes it constant in the fixture is
+the fixture's own precondition. The entry moves to fixture-constant rather than
+the definition moving to accommodate it.
+
+### Three columns were pessimistically classified; verified and corrected
+
+Each verified here, not relayed:
+
+- **`Rule.Match.Protocol` / `Protocols.*`** — the only non-test writer is
+  `compiler_nat_destination.go:167-169`, and destination rules never enter
+  `Security.NAT.Source`.
+- **`Pool.Address` / `Port` / `PortRaw`** — `compileNATSource` builds its pools
+  fresh (`pool := &NATPool{Name: inst.name}`, `compiler_nat_source.go:471`) and
+  is the sole writer of `SourcePools` (`:686`); the only non-test writers of
+  those three fields are in `compiler_nat_destination.go`, on DNAT pool objects
+  this map never aliases.
+- **`Snapshot.AddressPersistent`** — one config-global bit
+  (`types_security.go:620`) stamped onto every rule by `nat_source.go:223`.
+
+All three are now production-constant WITH a witness whose config populates them
+on the other side of the compiler.
+
+### The split, with its derivation
+
+The column universe GREW, because the collector now sees what it used to skip —
+so these are not comparable to round 10's counts as a like-for-like regression.
+
+| sweep | columns | guarded | fixture-constant | production-constant |
+|---|---|---|---|---|
+| builder, per tier | 58 | 13 | 44 | 1 |
+| builder, per rule-set | 58 | 4 | 47 | 7 |
+| walk, per rule-set | 72 | 13 | 49 | 10 |
+
+Round 10 reported 25 / 74 / 9 over 108 cells; this is 30 / 140 / 18 over 188.
+The blind count rose because the sweep now enumerates the pointee fields, list
+schemas and container totals it previously skipped — every one of those was a
+hole before, it was simply not counted. The reclassifications move 12 cells from
+blind to non-axis in the other direction.
