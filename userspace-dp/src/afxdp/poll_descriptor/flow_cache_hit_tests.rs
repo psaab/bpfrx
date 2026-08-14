@@ -1995,9 +1995,39 @@ fn live_flow_cache_callsite_replays_every_filter_count_term_6304() {
 ///
 /// The UNTRANSLATED run is not a duplicate of the other cells: it binds the two
 /// `is_some()` GUARDS rather than the increments. Dropping either guard and
-/// bumping unconditionally leaves the translated run's assertions satisfied and
-/// reds only here, which is the mutation that would report every forwarded
-/// packet as NAT'd.
+/// bumping unconditionally leaves the translated run's rows satisfied and reds
+/// only there, which is the mutation that would report every forwarded packet
+/// as NAT'd.
+///
+/// WHY THE DISCRIMINATORS ARE AGGREGATED RATHER THAN ASSERTED IN SEQUENCE. The
+/// property this test exists to demonstrate is that the three increments are
+/// bound INDEPENDENTLY. A sequence of `assert_eq!`s cannot demonstrate that,
+/// and an earlier revision of this test did not: the first divergence panics,
+/// so in the "delete the forward increment" cell the SNAT and DNAT assertions
+/// never executed at all. Distinct failure LINES across three cells prove only
+/// that the rows read distinct FIELDS; they say nothing about what the
+/// unexecuted rows would have done in that same run, which is the whole claim.
+/// Every row below is therefore evaluated into `observed` and reported by a
+/// single assertion at the end, so a mutation cell names which rows diverged
+/// out of six that all ran.
+///
+/// THE PROPERTY CLAIMED, stated precisely because it is NOT "exactly one row
+/// reds". Deleting production increment X reds every row ABOUT X and no row
+/// about either other increment. TWO rows are about the forward increment on
+/// purpose: `nat/forward` binds the increment itself, and `plain/forward` binds
+/// its POSITION outside both `is_some()` NAT guards — an increment moved inside
+/// them still satisfies the translated run, so without the second row that
+/// motion is invisible. The forward cell therefore reds two rows, and both name
+/// forward. Per-assertion uniqueness would be a property about this test's own
+/// redundancy; per-increment independence is the property about the production
+/// code, and it is the one asserted here.
+///
+/// The POSITIVE CONTROLS above the rows are PRECONDITIONS, not discriminators,
+/// and they deliberately still panic on the spot: a run that did not forward,
+/// or did not really translate the frame, can say nothing about the counters,
+/// and the honest outcome is to abort rather than report six meaningless rows.
+/// When reading a mutation matrix, a control panic is a broken FIXTURE; only
+/// the aggregate assertion at the end is a result about the production code.
 #[test]
 fn live_flow_cache_callsite_accounts_forward_and_nat_packets_6304() {
     let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
@@ -2012,70 +2042,115 @@ fn live_flow_cache_callsite_accounts_forward_and_nat_packets_6304() {
         1,
     );
 
-    // --- POSITIVE CONTROLS: the packet reached the accounting block, and the
-    // translation the two NAT counters are about is genuinely on the wire.
+    // The UNTRANSLATED comparison run. Staged here, beside the translated run,
+    // so that BOTH runs have executed before the first row is evaluated — a
+    // divergence in either is then reported by the same aggregate assertion.
+    let plain_fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let plain = run_stage(&plain_fixture, &frame, 1);
+
+    // --- PRECONDITIONS (panicking, by design — see the doc comment): the
+    // packet reached the accounting block, the translation the two NAT counters
+    // are about is genuinely on the wire, and the untranslated run forwarded
+    // too. A failure here is a broken FIXTURE, not a result about the counters.
     assert!(
         matches!(nat.outcome, FlowCacheOutcome::Consumed),
-        "control: the cached flow must be consumed by the fast path"
+        "precondition: the cached flow must be consumed by the fast path"
     );
     assert_eq!(
         nat.tx_counters.pending_in_place_tx_packets, 1,
-        "control: the in-place hairpin rewrite must have SUCCEEDED"
+        "precondition: the in-place hairpin rewrite must have SUCCEEDED"
     );
     let staged = nat
         .tx_frame
         .as_ref()
-        .expect("control: the rewritten frame must be staged for TX");
+        .expect("precondition: the rewritten frame must be staged for TX");
     assert_eq!(
         &staged[30..34],
         &SNAT_SRC_IP.octets(),
-        "control: the SOURCE address was really translated — without this the \
-         `snat_packets` assertion below would be counting a NAT the descriptor \
+        "precondition: the SOURCE address was really translated — without this \
+         the `snat_packets` row below would be counting a NAT the descriptor \
          never applied"
     );
     assert_eq!(
         &staged[34..38],
         &DNAT_DST_IP.octets(),
-        "control: ...and the DESTINATION address too, to a DIFFERENT value, so \
-         a rewrite that wrote one address into both slots is visible"
+        "precondition: ...and the DESTINATION address too, to a DIFFERENT \
+         value, so a rewrite that wrote one address into both slots is visible"
     );
-
-    // --- THE DISCRIMINATORS, one per production line.
-    assert_eq!(
-        nat.counters.forward_candidate_packets, 1,
-        "#6304: a forwarded cache hit must charge `forward_candidate_packets` \
-         — the per-binding forward counter every operator view of this path \
-         reads"
-    );
-    assert_eq!(
-        nat.counters.snat_packets, 1,
-        "#6304: ...and a hit whose cached decision carries a source rewrite \
-         must charge `snat_packets`"
-    );
-    assert_eq!(
-        nat.counters.dnat_packets, 1,
-        "#6304: ...and one carrying a destination rewrite must charge \
-         `dnat_packets`"
-    );
-
-    // --- THE GUARDS: an UNTRANSLATED flow charges the forward counter and
-    // NEITHER NAT counter.
-    let plain_fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
-    let plain = run_stage(&plain_fixture, &frame, 1);
     assert_eq!(
         plain.tx_counters.pending_in_place_tx_packets, 1,
-        "control: the untranslated flow forwards in place too"
+        "precondition: the untranslated flow forwards in place too"
     );
-    assert_eq!(
-        plain.counters.forward_candidate_packets, 1,
-        "#6304: NAT or not, a forwarded cache hit is a forward candidate"
+
+    // --- THE DISCRIMINATORS. Every row is EVALUATED here and none is asserted
+    // on its own, so that a mutation cell reports the complete set of rows that
+    // moved rather than only the first. `(row, actual, expected, why)`.
+    let observed: [(&str, u64, u64, &str); 6] = [
+        (
+            "nat/forward_candidate_packets",
+            nat.counters.forward_candidate_packets,
+            1,
+            "a forwarded cache hit must charge `forward_candidate_packets` — the \
+             per-binding forward counter every operator view of this path reads",
+        ),
+        (
+            "nat/snat_packets",
+            nat.counters.snat_packets,
+            1,
+            "a hit whose cached decision carries a source rewrite must charge \
+             `snat_packets`",
+        ),
+        (
+            "nat/dnat_packets",
+            nat.counters.dnat_packets,
+            1,
+            "...and one carrying a destination rewrite must charge `dnat_packets`",
+        ),
+        (
+            "plain/forward_candidate_packets",
+            plain.counters.forward_candidate_packets,
+            1,
+            "NAT or not, a forwarded cache hit is a forward candidate. This row \
+             binds the forward increment's POSITION outside both `is_some()` NAT \
+             guards — an increment moved inside them still satisfies the \
+             translated run, so nothing else here would see that motion",
+        ),
+        (
+            "plain/snat_packets",
+            plain.counters.snat_packets,
+            0,
+            "a flow with no source rewrite must NOT be reported as SNAT'd — \
+             dropping the `rewrite_src.is_some()` guard and bumping \
+             unconditionally reds this row and no other",
+        ),
+        (
+            "plain/dnat_packets",
+            plain.counters.dnat_packets,
+            0,
+            "...nor as DNAT'd, which is the same statement for \
+             `rewrite_dst.is_some()`",
+        ),
+    ];
+
+    let diverged: Vec<String> = observed
+        .iter()
+        .filter(|(_, actual, expected, _)| actual != expected)
+        .map(|(row, actual, expected, why)| {
+            format!("  {row}: got {actual}, want {expected} — #6304: {why}")
+        })
+        .collect();
+    assert!(
+        diverged.is_empty(),
+        "#6304: {} of {} accounting rows diverged. ALL {} were evaluated before \
+         this assertion, so the list below is COMPLETE and every row absent \
+         from it held in the SAME run — which is what makes the three \
+         increments independently bound rather than merely separately \
+         readable:\n{}",
+        diverged.len(),
+        observed.len(),
+        observed.len(),
+        diverged.join("\n")
     );
-    assert_eq!(
-        plain.counters.snat_packets, 0,
-        "#6304: a flow with no source rewrite must NOT be reported as SNAT'd — \
-         dropping the `rewrite_src.is_some()` guard reds here and nowhere else"
-    );
-    assert_eq!(plain.counters.dnat_packets, 0, "#6304: ...nor as DNAT'd");
 }
 
 /// #6304 (per-hit observed bytes, at the SEAM). `stage_flow_cache_hit` opens by

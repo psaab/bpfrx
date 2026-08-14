@@ -79920,3 +79920,74 @@ citations resolves EXACTLY at the head of the #5716 AF_XDP-API-hardening branch
 `forwarding_build/tests.rs:5601`, `forwarding_build/mod.rs:266`, `_Log.md:226`),
 which is where that review was actually written. Routed there rather than
 folded here.
+
+## 2026-08-13 — #6304 round 4 (B1): aggregate the accounting rows so independence is observable
+
+- **Timestamp**: 2026-08-13
+- **Action**: replace the three sequential counter assertions in
+  `live_flow_cache_callsite_accounts_forward_and_nat_packets_6304` with a
+  six-row non-panicking aggregation asserted once at the end; state the property
+  claimed; re-measure the mutation matrix
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+
+WHAT WAS WRONG WITH THE ROUND-3 MATRIX, which is recorded above this entry and
+is superseded by it. The three counter assertions lived in ONE test and it
+panicked on the first failure, so in every cell the later assertions never ran:
+deleting the forward increment red at `:2044` and the SNAT and DNAT assertions
+were never reached; deleting SNAT red at `:2050` and DNAT was never reached.
+Three distinct failure LINES prove the three assertions read three distinct
+FIELDS. They cannot prove same-run independence, because the rows whose silence
+was being read as "still green" had not executed. Separately, the round-3 claim
+that each mutation reds exactly one assertion was not supported even in
+principle: deleting the forward increment also falsifies the untranslated
+forward assertion at `:2069`, which simply never got the chance to fire.
+
+Codex called this BLOCKING at round 4 and the classification is right for this
+PR specifically. The deliverable here IS the accounting bindings, so a finding
+that the bindings do not demonstrate what they claim lands on the deliverable
+rather than beside it; the usual "test plumbing, fold and merge" disposition
+does not apply.
+
+THE FIX. All six discriminators are evaluated into an `observed` array and
+reported by a SINGLE assertion, so every row runs in every cell and the failure
+message is the complete set of rows that moved. The untranslated run is staged
+next to the translated one, before the first row is read, so both runs have
+completed before anything is judged. The positive controls stay panicking and
+are relabelled PRECONDITIONS: a run that did not forward, or did not really
+translate the frame, can say nothing about the counters, and aborting is more
+honest than reporting six meaningless rows. That split is what lets a mutation
+matrix distinguish a broken FIXTURE from a result.
+
+THE PROPERTY CLAIMED, decided rather than left implicit. It is NOT "exactly one
+row reds". It is: deleting production increment X reds every row ABOUT X and no
+row about either other increment. Two rows are about the forward increment
+deliberately — `nat/forward` binds the increment, `plain/forward` binds its
+POSITION outside both `is_some()` NAT guards, since an increment moved inside
+them still satisfies the translated run — so the forward cell reds two rows and
+both name forward. The duplicate forward dependency is therefore KEPT, with the
+claim narrowed to match it, rather than deleted to rescue a stronger-sounding
+claim that was about the test's own redundancy instead of the production code.
+
+RE-MEASURED, tree `/var/tmp/f6882r3` at `37d22ac39` + this change,
+`cargo test --bin xpf-userspace-dp <test>`, each cell mutated from a clean
+production file and restored after. Every cell reached the aggregate assertion,
+so in all five the preconditions held and the red is an assertion about
+production code, never an expired precondition:
+
+| mutation | rc | rows evaluated | rows diverged | failure kind | duration |
+|---|---|---|---|---|---|
+| baseline, unmutated | 0 | 6 | none | — | 0.01s |
+| delete `forward_candidate_packets += 1` (`flow_cache_hit.rs:333`) | 101 | 6 of 6 | `nat/forward` + `plain/forward` (2) | assertion | 0.01s |
+| delete `snat_packets += 1` (`:347`) | 101 | 6 of 6 | `nat/snat` only (1) | assertion | 0.01s |
+| delete `dnat_packets += 1` (`:350`) | 101 | 6 of 6 | `nat/dnat` only (1) | assertion | 0.01s |
+| `rewrite_src.is_some()` -> `true` (`:346`) | 101 | 6 of 6 | `plain/snat` only (1) | assertion | 0.04s |
+| `rewrite_dst.is_some()` -> `true` (`:349`) | 101 | 6 of 6 | `plain/dnat` only (1) | assertion | 0.02s |
+
+The forward cell is the one the old matrix could not read: it now shows the two
+NAT rows EXECUTING and HOLDING while both forward rows move. The two guard cells
+were not in the round-4 brief; they were measured because the test's own prose
+claims each guard is bound and reds "no other" row, and a claim in prose that
+can be measured should not be argued. Durations are uniform and near zero here —
+these are pure unit cells with no polling, so no red in this matrix can be a
+precondition timeout, and the assertion-vs-precondition column is established by
+the panic SITE (all five at the aggregate assertion, none at a control).
