@@ -79841,3 +79841,82 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+## 2026-08-13 — #6304 round 3: bind the batch accounting triple + the lookup byte argument
+
+- **Timestamp**: 2026-08-13
+- **Action**: Close four unbound accounting sites at the flow-cache-hit call
+  site; correct the scope claimed for the `BindingLiveState` layout guard.
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `docs/userspace-dataplane-gaps.md`, `_Log.md`
+
+Four sites in `stage_flow_cache_hit` ran on every forwarded packet and were
+read by nothing. Three are `BatchCounters` fields the harness itself hid:
+`run_stage` built a `BatchCounters::default()` and dropped it, so `StageRun`
+had nowhere to report them from. The fourth is an ARGUMENT rather than a
+counter — `lookup_counted(.., meta.pkt_len)` — unbound in the
+reaches-past-the-adapter shape, since the only other callers invoke the callee
+directly with a literal.
+
+Retention alone would not have closed the NAT pair. Their guards read
+`cached_decision.nat.rewrite_src`/`rewrite_dst`, and every fixture in the
+module carried `NatDecision::default()`, so both lines were unreachable as well
+as unread. `nat_translated_entry` supplies a cached decision AND a matching
+descriptor, with the checksum deltas derived from the same
+`compute_*_csum_delta` helpers the seed path uses so the fixture cannot drift
+from the constructor; the cell asserts the translated addresses on the staged
+TX bytes, so the counters cannot claim a translation the wire never carried.
+
+MUTATION PROOF, four cells, each a full `cargo test --bins` invocation
+(`--skip wg::engine::engine_internal_tests`, a known load artefact) so the RED
+and the greens it is contrasted against share one run. Baseline 4268 passed /
+0 failed; every cell 4267 passed / 1 failed, so no cell has a collapsed
+denominator.
+
+| mutation (production line) | RED test | assertion line |
+|---|---|---|
+| delete `telemetry.counters.forward_candidate_packets += 1` (`flow_cache_hit.rs:333`) | `..._accounts_forward_and_nat_packets_6304` | `:2044` (left 0, right 1) |
+| delete `telemetry.counters.snat_packets += 1` (`:347`) | same test | `:2050` (left 0, right 1) |
+| delete `telemetry.counters.dnat_packets += 1` (`:350`) | same test | `:2055` (left 0, right 1) |
+| `meta.pkt_len` -> `0` (`:108`) | `..._counts_observed_bytes_on_the_hit_6304` | `:2126` (`Some(0)` vs `Some(58)`) |
+
+The three counter mutations red THREE DIFFERENT assertions, which is the
+property that matters: had deleting the snat line red the dnat assertion, the
+two would not be independently bound. Each counter mutation also leaves the
+observed-bytes cell green and vice versa.
+
+LAYOUT-GUARD SCOPE, corrected. The four un-gated `const _: [(); N]` asserts at
+`binding_state/mod.rs:752-755` (verified: four of them, module scope, no `cfg`
+attribute) are a TRIPWIRE for one hazard, not a layout fingerprint. Size,
+alignment and two offsets do not determine where the other fields sit, so a
+perturbation moving only UNPINNED fields satisfies all four literals in both
+build configurations. They are also toolchain- and target-specific:
+`BindingLiveState` is `repr(Rust)` and the crate pins neither a `rust-version`
+nor a toolchain file. That failure direction is safe — a changed value is a
+compile ERROR carrying the actual number, never a silent accept — so the
+response to a trip is to re-measure, not to widen. The earlier prose said an
+instrument "that perturbed the layout could satisfy at most one" build; the
+honest bound is "that moved ANY OF THESE FOUR VALUES". The un-gated const also
+means the runtime mirror cell can never FAIL, since the build breaks before the
+test binary exists; it is a readable mirror, not an independent check.
+
+The original prescription — un-gated const asserts, after a size-only guard
+missed an offset change — narrows here rather than being overturned. It is
+still stricter than a test. It is not proof of whole-struct equality.
+
+MISATTRIBUTED FINDINGS, recorded so the next round does not chase them. The
+round-3 dispatch also carried a block about constant-ambiguous `Drop` fixtures
+(`read_rx_drop_…`, `read_complete_drop_…`, `write_tx_drop_…`,
+`write_fill_drop_…`), a `[0,2,2]` distinct-NONZERO const-assert hole, and seven
+stale-prose citations. None of it belongs to this PR. `xsk_ffi_tests.rs` here
+is 265 lines and contains none of those fixtures or prose;
+`forwarding_build/tests.rs` is 5587 lines, so the cited `:5601` does not exist;
+`zone_counters.rs` here is byte-identical to master. Every one of those
+citations resolves EXACTLY at the head of the #5716 AF_XDP-API-hardening branch
+(`xsk_ffi_tests.rs:352/673/777/787/857/858/937`,
+`forwarding_build/tests.rs:5601`, `forwarding_build/mod.rs:266`, `_Log.md:226`),
+which is where that review was actually written. Routed there rather than
+folded here.
