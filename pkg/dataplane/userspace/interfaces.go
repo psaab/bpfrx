@@ -184,7 +184,7 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 	// above does for a build error, and it is why liveXfrmNetdevs no longer
 	// discards a partial dump: the interrupted-dump case was the measured way
 	// this sample came back EMPTY and re-admitted a device.
-	refused := buildUserspaceRefusedNetdevs(snap.Interfaces, snap.Fabrics)
+	refused := buildUserspaceRefusedNetdevs(snap)
 	for _, iface := range snap.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue

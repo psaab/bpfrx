@@ -163,7 +163,12 @@ func (m *Manager) SyncFabricState() {
 	if build == nil {
 		build = buildFabricSnapshots
 	}
-	fabrics := build(m.lastSnapshot.Config)
+	// #6691 round 11: the refresh carries MACs, ifindexes and link state — never
+	// a device-level binding verdict. The builder re-samples the kernel, and a
+	// verdict re-decided here would apply to a snapshot whose interface rows are
+	// still the applied ones, on two planes that neither replan on this path.
+	// alignFabricVerdicts (fabric.go) holds the reasoning.
+	fabrics := alignFabricVerdicts(build(m.lastSnapshot.Config), m.lastSnapshot)
 	if len(fabrics) == 0 {
 		return
 	}

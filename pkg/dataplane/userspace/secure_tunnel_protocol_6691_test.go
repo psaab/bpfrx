@@ -186,7 +186,7 @@ func TestSecureTunnelGateIsScopedToConfigsThatDeriveAnXfrmi(t *testing.T) {
 		"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
 		"set security zones security-zone trust interfaces ge-0/0/0.0",
 	)
-	if snapshotHasSecureTunnel(gateSnapshot(t, cfg)) {
+	if snapshotRequiresRefusalProtocol(gateSnapshot(t, cfg)) {
 		t.Fatal("premise broken: this config derives no xfrmi")
 	}
 
@@ -205,7 +205,7 @@ func TestSecureTunnelGateSeesEverySpelling(t *testing.T) {
 	for _, tc := range secureTunnelSpellings {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, _, _ := spellingConfig(t, tc.bindIface, tc.ifName, tc.unit)
-			if !snapshotHasSecureTunnel(gateSnapshot(t, cfg)) {
+			if !snapshotRequiresRefusalProtocol(gateSnapshot(t, cfg)) {
 				t.Fatalf("configHasSecureTunnel = false for bind-interface %q; the v5 gate "+
 					"would not arm and a pre-v5 helper would plan its binding", tc.bindIface)
 			}
@@ -245,7 +245,7 @@ func gateSnapshot(t *testing.T, cfg *config.Config) *ConfigSnapshot {
 // — so a pre-v6 helper stayed ARMED on its previous-good image for precisely the
 // snapshot this gate exists to refuse.
 //
-// FAIL-ON-REVERT: make snapshotHasSecureTunnel re-derive
+// FAIL-ON-REVERT: make snapshotRequiresRefusalProtocol re-derive
 // (`buildInterfaceSnapshots(snap.Config)`) instead of reading snap.Interfaces
 // and this reds — the gate returns nil for a flagged snapshot.
 func TestSecureTunnelGateReadsTheAppliedSnapshot(t *testing.T) {
@@ -283,7 +283,7 @@ func TestSecureTunnelGateReadsTheAppliedSnapshot(t *testing.T) {
 	// PREMISES. The snapshot must carry the flag, and a SECOND sample must not
 	// see it — without both, re-deriving and reading are indistinguishable and
 	// this test is the vacuous one it replaces.
-	// Read the ROWS directly, not through snapshotHasSecureTunnel — the premise
+	// Read the ROWS directly, not through snapshotRequiresRefusalProtocol — the premise
 	// must not be expressed with the function under test, or a mutation of that
 	// function reds this as a "premise broken" and misdirects the next reader to
 	// the fixture instead of to production.
@@ -348,7 +348,7 @@ func TestSecureTunnelGateReadsTheAppliedSnapshot(t *testing.T) {
 func TestSecureTunnelGateNeedsAnObservedVersion(t *testing.T) {
 	cfg, _, _ := spellingConfig(t, "st0", "st0", 0)
 	snap := gateSnapshot(t, cfg)
-	if !snapshotHasSecureTunnel(snap) {
+	if !snapshotRequiresRefusalProtocol(snap) {
 		t.Fatal("premise broken: the snapshot carries no flagged row, so the gate " +
 			"is scoped out and neither subtest measures the conditionality")
 	}

@@ -240,7 +240,7 @@ func TestUserspaceBoundLinuxInterfaces_MatchesBindTargetSSOT(t *testing.T) {
 	// non-skipped zoned snapshot row whose bind target is not a refused netdev,
 	// exactly as UserspaceBoundLinuxInterfaces must.
 	rows := buildInterfaceSnapshots(cfg)
-	refused := buildUserspaceRefusedNetdevs(rows, nil)
+	refused := buildUserspaceRefusedNetdevs(&ConfigSnapshot{Interfaces: rows})
 	seen := map[string]struct{}{}
 	for _, iface := range rows {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {

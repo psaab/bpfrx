@@ -481,6 +481,15 @@ func userspaceOwnsItsNetdev(iface InterfaceSnapshot) bool {
 // is now a voter in the unanimity, which is the property that makes "refuse only
 // when every owner agrees" safe rather than merely conservative.
 //
+// ONE DEVICE, ONE VERDICT (#6691 round 11). Round 10 made the fabric parent an
+// owner UNCONDITIONALLY, which is right where the bucket was empty and wrong
+// where it was not: on a member that also has an interface stanza it put two
+// owners on one device, computing their verdicts from different evidence, and
+// every way of making those two disagree became a fail-open (a canonical alias
+// and a re-sampled kernel were both reachable). The fabric now votes only where
+// no row does — see snapshotNetdevVotes, which is also where the owner set and
+// the protocol gate's scope are settled together.
+//
 // F1 IS PRESERVED EXACTLY, and it survives on the ownership half rather than on
 // a special case. Under `bind-interface st10` with a zoned sibling
 // `st10 unit 5 vlan-id 100`, the only row whose LinuxName is `st10` is the base
@@ -535,22 +544,32 @@ func userspaceOwnsItsNetdev(iface InterfaceSnapshot) bool {
 // TestAliasTableRefusesEvenWhenTheChildNetdevResolves constructs that state
 // directly and is the fail-on-revert guard.
 //
-// Scope: built from the CONTRIBUTORS to the gated sets — interface rows and
-// fabric parents — so it can refuse only a netdev one of those names. For the
-// VLAN redirect that is automatically complete: every unit row's parent netdev
-// is the base row's netdev, and a unit exists only under a base in
-// cfg.Interfaces.Interfaces, so a redirect target always has a row. For the
-// FABRIC loops it took round 10 to become true; see fabricParentUnbindable. A
-// THIRD contributor added later must join this tally too — that is the
-// enumeration the caller-list correction in userspaceUnbindableNetdev is about.
+// Scope: built from the CONTRIBUTORS to the gated sets, which snapshotNetdevVotes
+// enumerates ONCE for every consumer. For the VLAN redirect the coverage is
+// automatic: every unit row's parent netdev is the base row's netdev, and a unit
+// exists only under a base in cfg.Interfaces.Interfaces, so a redirect target
+// always has a row. For the FABRIC loops it took round 10 to become true; see
+// fabricParentUnbindable. A THIRD contributor added later joins by joining that
+// enumeration — which is also what puts it in the protocol gate's scope, so the
+// two cannot drift the way they did in round 10.
 type userspaceRefusedNetdevs struct {
 	ifindex map[int]struct{}
 	name    map[string]struct{}
 }
 
-// netdevOwnerTally counts, for one netdev key, how many rows own it and how many
-// of those call it unbindable. A key is refused only when the two are equal and
-// non-zero.
+// netdevOwnerTally counts, for one netdev key, how many contributors speak for
+// it and how many of those call it unbindable.
+//
+// A key is refused only when the two are EQUAL AND NON-ZERO. The zero-owner case
+// falls through to "not refused" deliberately, and that is safe only because
+// every contributor registers as an OWNER before it can call a netdev
+// unbindable — so a key present in this map always has owners >= 1. Round 10
+// made that true for the fabric parent (fabricParentUnbindable); before it, a
+// fabric member named with no interface stanza reached here with owners == 0 and
+// fell through fail-OPEN. A future contributor that records unbindable WITHOUT
+// recording ownership reopens exactly that hole, which is why the ownership and
+// the verdict are declared together in snapshotNetdevVotes rather than at the
+// call sites.
 type netdevOwnerTally struct {
 	owners     int
 	unbindable int
@@ -560,41 +579,174 @@ func (t netdevOwnerTally) refused() bool {
 	return t.owners > 0 && t.owners == t.unbindable
 }
 
-func buildUserspaceRefusedNetdevs(ifaces []InterfaceSnapshot, fabrics []FabricSnapshot) userspaceRefusedNetdevs {
-	byName := make(map[string]netdevOwnerTally)
-	byIfindex := make(map[int]netdevOwnerTally)
-	own := func(name string, ifindex int, unbindable bool) {
-		if name != "" {
-			tally := byName[name]
-			tally.owners++
-			if unbindable {
-				tally.unbindable++
-			}
-			byName[name] = tally
-		}
-		if ifindex > 0 {
-			tally := byIfindex[ifindex]
-			tally.owners++
-			if unbindable {
-				tally.unbindable++
-			}
-			byIfindex[ifindex] = tally
-		}
+// netdevVoteRole says how a contributor's verdict is counted.
+type netdevVoteRole uint8
+
+const (
+	// netdevVoteAbstains — this contributor hands the dataplane the netdev (or
+	// speaks about it) but casts no verdict on it. A VLAN child abstains about
+	// its PARENT: it binds the parent, so it says nothing about whether the
+	// parent may be bound.
+	netdevVoteAbstains netdevVoteRole = iota
+	// netdevVoteOwner — speaks for the netdev on its own account.
+	netdevVoteOwner
+	// netdevVoteFallback — speaks only where no owner does.
+	netdevVoteFallback
+)
+
+// netdevVote is one contributor's evidence about one netdev: who speaks for it,
+// what they say, and whether saying it needs a protocol version.
+//
+// #6691 round 11. It exists because round 10 added a SECOND producer of netdev
+// verdicts (the fabric parent) and had to remember to teach every consumer about
+// it — the tally learned, the required-protocol gate did not, and the gate that
+// exists to stop an under-version helper staying armed was silent for exactly
+// the verdict the version bump was for. A hand-maintained second list is the
+// defect, not the omission: the repair is that ONE enumeration answers "who
+// contributes a netdev verdict", and both the tally and the gate read it.
+type netdevVote struct {
+	name    string
+	ifindex int
+	role    netdevVoteRole
+	// unbindable is this contributor's device-level verdict.
+	unbindable bool
+	// verdictNeedsProtocol is true when this contributor's unbindable verdict
+	// reaches the helper ONLY as a snapshot field introduced by a protocol
+	// bump, so a helper that predates the field cannot reproduce the decision
+	// from the bytes it does read. It is what scopes
+	// ensureSecureTunnelProtocolLocked, and each contributor declares it for
+	// itself — a contributor that ships a new verdict field and leaves this
+	// false is the round-10 regression again.
+	verdictNeedsProtocol bool
+}
+
+// snapshotNetdevVotes enumerates every contributor to the sets the binding
+// exclusion gates, with the verdict each one casts.
+//
+// THE FABRIC IS A FALLBACK VOTER, NOT A CO-VOTER (#6691 round 11), and that is
+// the correctness half. Round 10 made the fabric parent an owner unconditionally,
+// which puts TWO owners on one device whenever the member also has an interface
+// stanza — and those two owners compute their verdicts from different evidence,
+// so they can DISAGREE about one device. The unanimity rule reads a disagreement
+// as an admission, so every way of making them disagree is a fail-OPEN:
+//
+//   - CANONICAL ALIASES. `fabric-options member-interfaces gr-0/0/3` with the
+//     stanza authored `gr-0-0-3` is one netdev under two authored names, both
+//     legal (the member MUST be slash-spelled for InterfaceSlot to resolve it;
+//     the stanza name is a wildcard). The row voted unbindable on its `tunnel`
+//     stanza and the fabric's exact map lookup missed it and voted bindable, so
+//     the GRE device was admitted. Round 9, with no fabric vote at all, refused
+//     it correctly.
+//   - SAMPLING. The fabric rows and the interface rows are judged against one
+//     kernel xfrm sample at build time, but SyncFabricState rebuilt the fabric
+//     rows alone; see alignFabricVerdicts (fabric.go).
+//
+// Both were fixed at their source, and neither fix is what makes this safe: a
+// third way for one device's two owners to disagree would be a third fail-open.
+// The invariant is that A DEVICE HAS ONE VERDICT, so where a row already speaks
+// for the netdev the fabric does not vote at all, and where none does the
+// fabric's vote is the only one and unanimity is over a bucket of one. That
+// preserves round 9's rule exactly for row-owned netdevs and round 10's fix
+// exactly for ownerless ones, and it is never less refusing than either:
+// suppressing a bindable fabric vote can only turn "not refused" into "refused".
+//
+// The same walk answers the PROTOCOL question, which is what stops the two
+// scopes drifting again: a fabric verdict needs the wire only where it is
+// load-bearing, and a row's secure-tunnel flag needs it always — Rust's
+// include_userspace_binding_interface reads that flag PER ROW, so it changes the
+// row's own admission whether or not the row owns a netdev anyone else contests.
+func snapshotNetdevVotes(snap *ConfigSnapshot) []netdevVote {
+	if snap == nil {
+		return nil
 	}
-	for _, iface := range ifaces {
-		if !userspaceOwnsItsNetdev(iface) {
+	owned := make(map[string]struct{}, len(snap.Interfaces))
+	votes := make([]netdevVote, 0, len(snap.Interfaces)+len(snap.Fabrics))
+	for _, iface := range snap.Interfaces {
+		role := netdevVoteAbstains
+		if userspaceOwnsItsNetdev(iface) {
+			role = netdevVoteOwner
+			if iface.LinuxName != "" {
+				owned[iface.LinuxName] = struct{}{}
+			}
+		}
+		votes = append(votes, netdevVote{
+			name:       iface.LinuxName,
+			ifindex:    iface.Ifindex,
+			role:       role,
+			unbindable: userspaceUnbindableNetdev(iface),
+			// The v5 field. Present on the row => an older helper plans a
+			// binding this control plane refuses, independently of any tally.
+			verdictNeedsProtocol: iface.SecureTunnel,
+		})
+	}
+	// The rows are walked first so `owned` is complete before any fabric vote is
+	// classified.
+	for _, fab := range snap.Fabrics {
+		if fab.ParentLinuxName == "" {
+			// Nothing is emitted for a parent with no netdev (both fabric loops
+			// guard on the name/ifindex), so there is nothing to judge.
 			continue
 		}
-		own(iface.LinuxName, iface.Ifindex, userspaceUnbindableNetdev(iface))
+		_, hasOwner := owned[fab.ParentLinuxName]
+		role := netdevVoteFallback
+		if hasOwner {
+			role = netdevVoteAbstains
+		}
+		votes = append(votes, netdevVote{
+			name:       fab.ParentLinuxName,
+			ifindex:    fab.ParentIfindex,
+			role:       role,
+			unbindable: fab.ParentUnbindable,
+			// The v7 field, and only where it decides something: with an owning
+			// row present the helper reaches the same verdict from the row's own
+			// pre-v7 fields, so arming there would abort a commit over a
+			// difference that does not exist.
+			verdictNeedsProtocol: fab.ParentUnbindable && !hasOwner,
+		})
 	}
-	// A fabric parent is an owner of its netdev even when no interface row is
-	// (#6691 round 10) — the fabric loops emit it into the same sets a row
-	// does, and a fabric MEMBER needs no stanza. Its verdict rides on the
-	// snapshot (fabricParentUnbindable) because the Rust plane, which runs the
-	// mirror of this tally, cannot recompute it: the kernel-kind half of the
-	// evidence is Go-side netlink.
-	for _, fab := range fabrics {
-		own(fab.ParentLinuxName, fab.ParentIfindex, fab.ParentUnbindable)
+	return votes
+}
+
+// snapshotRequiresRefusalProtocol reports whether this snapshot carries an
+// unbindable verdict that a helper predating the current protocol cannot
+// reproduce — the scope of ensureSecureTunnelProtocolLocked.
+//
+// Derived from snapshotNetdevVotes rather than from its own walk of the
+// snapshot: the enumeration that decides which contributors have a verdict is
+// the enumeration that decides which verdicts need the wire, so a contributor
+// cannot be in one and out of the other.
+func snapshotRequiresRefusalProtocol(snap *ConfigSnapshot) bool {
+	for _, vote := range snapshotNetdevVotes(snap) {
+		if vote.verdictNeedsProtocol {
+			return true
+		}
+	}
+	return false
+}
+
+func buildUserspaceRefusedNetdevs(snap *ConfigSnapshot) userspaceRefusedNetdevs {
+	byName := make(map[string]netdevOwnerTally)
+	byIfindex := make(map[int]netdevOwnerTally)
+	for _, vote := range snapshotNetdevVotes(snap) {
+		if vote.role == netdevVoteAbstains {
+			continue
+		}
+		if vote.name != "" {
+			tally := byName[vote.name]
+			tally.owners++
+			if vote.unbindable {
+				tally.unbindable++
+			}
+			byName[vote.name] = tally
+		}
+		if vote.ifindex > 0 {
+			tally := byIfindex[vote.ifindex]
+			tally.owners++
+			if vote.unbindable {
+				tally.unbindable++
+			}
+			byIfindex[vote.ifindex] = tally
+		}
 	}
 	out := userspaceRefusedNetdevs{
 		ifindex: make(map[int]struct{}),

@@ -623,7 +623,7 @@ func TestExclusionClassesDisagreeTheOtherWayToo(t *testing.T) {
 
 			// THE INVARIANT. A netdev with a bindable owner is not refused —
 			// whichever row disagrees.
-			refused := buildUserspaceRefusedNetdevs(rows, nil)
+			refused := buildUserspaceRefusedNetdevs(&ConfigSnapshot{Interfaces: rows})
 			for _, owner := range []InterfaceSnapshot{base, child} {
 				if !userspaceOwnsItsNetdev(owner) || userspaceUnbindableNetdev(owner) {
 					continue
@@ -708,7 +708,7 @@ func TestAliasTableRefusesOnAReachablePlainSibling(t *testing.T) {
 	if child.LogicalOnly {
 		t.Fatal("premise broken: a LogicalOnly row is dropped by its own guard")
 	}
-	if !buildUserspaceRefusedNetdevs(rows, nil).refusesIfindex(xfrmiIfindex) {
+	if !buildUserspaceRefusedNetdevs(&ConfigSnapshot{Interfaces: rows}).refusesIfindex(xfrmiIfindex) {
 		t.Fatalf("premise broken: ifindex %d is not refused, so the guard under test "+
 			"has nothing to refuse", xfrmiIfindex)
 	}
@@ -771,7 +771,7 @@ func TestLogicalOnlyRowNeverOwnsANetdev(t *testing.T) {
 			unit.LinuxName, unit.ParentLinuxName, unit.VLANID,
 			userspaceBindTargetNetdev(unit), unit.Ifindex)
 	}
-	if refused := buildUserspaceRefusedNetdevs(rows, nil); refused.refusesIfindex(unit.Ifindex) {
+	if refused := buildUserspaceRefusedNetdevs(&ConfigSnapshot{Interfaces: rows}); refused.refusesIfindex(unit.Ifindex) {
 		t.Errorf("the synthetic ifindex %d entered the refused index", unit.Ifindex)
 	}
 }
@@ -1010,7 +1010,7 @@ func TestRetainedLiveXfrmiLeavesTheAdjudicatedSets(t *testing.T) {
 			// The v5 protocol gate must arm for this snapshot too: a pre-v5
 			// helper ignores the flag, plans the binding, and the operator
 			// cannot fix it by editing the config.
-			if !snapshotHasSecureTunnel(gateSnapshot(t, cfg)) {
+			if !snapshotRequiresRefusalProtocol(gateSnapshot(t, cfg)) {
 				t.Error("configHasSecureTunnel is false for a config whose snapshot DOES " +
 					"carry a flagged row — the gate would stay silent while a pre-v5 " +
 					"helper plans the binding this change exists to refuse")
@@ -1210,7 +1210,7 @@ func TestFabricLoopCannotReadmitARefusedMember(t *testing.T) {
 		t.Fatalf("premise broken: no fabric row resolves to the member netdev "+
 			"(fabrics %+v) — a slot-shaped member is what makes this reachable", snap.Fabrics)
 	}
-	if !buildUserspaceRefusedNetdevs(snap.Interfaces, snap.Fabrics).refusesName("ge-0-0-0") {
+	if !buildUserspaceRefusedNetdevs(snap).refusesName("ge-0-0-0") {
 		t.Fatal("premise broken: the member netdev is not refused, so the fabric " +
 			"loop has nothing to re-admit")
 	}

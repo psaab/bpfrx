@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -98,7 +99,7 @@ func TestOwnerlessFabricParentIsRefused(t *testing.T) {
 			"the global minimum and every interface collapses to one worker (#3091)")
 	}
 
-	refused := buildUserspaceRefusedNetdevs(snap.Interfaces, snap.Fabrics)
+	refused := buildUserspaceRefusedNetdevs(snap)
 	if !refused.refusesName("ge-0-0-0") {
 		t.Error("refusesName(ge-0-0-0) = false: the fabric's own emission does not " +
 			"count as an owner, so the unanimity is taken over an empty bucket")
@@ -161,7 +162,7 @@ func TestOwnerlessBindableFabricParentStaysAdmitted(t *testing.T) {
 				"takes the fabric parent out of the ingress map and the AF_XDP plan")
 		}
 	}
-	refused := buildUserspaceRefusedNetdevs(snap.Interfaces, snap.Fabrics)
+	refused := buildUserspaceRefusedNetdevs(snap)
 	if refused.refusesName("ge-0-0-0") || refused.refusesIfindex(memberIfindex) {
 		t.Fatal("the ownerless fabric parent is refused with no class matching it. " +
 			"An ownerless netdev is not refusable BY BEING ownerless; it is refusable " +
@@ -374,9 +375,25 @@ func TestXfrmDumpFailureIsLoggedNotSwallowed(t *testing.T) {
 // hoist in buildSnapshot), so identical inputs give identical verdicts. This
 // test drives it across the classes rather than trusting the reading.
 //
+// MATCHED BY NETDEV (#6691 round 11). This test used to pair a row with a fabric
+// only when `iface.Name == fab.ParentInterface`, i.e. when the two carried the
+// same AUTHORED spelling — so the one shape that actually produced a
+// disagreement was invisible to it. LinuxIfName maps '/' to '-' and nothing
+// else, so a member `gr-0/0/3` and a stanza `gr-0-0-3` are one device under two
+// legal names, and the exact-name pairing skipped precisely that pair. The
+// netdev is the identity both planes key on, so it is the identity this pairing
+// uses; base rows only (a unit row sharing the base netdev is the disagreement
+// production IS allowed to produce).
+//
+// Since round 11 a base/fabric disagreement is no longer itself a fail-open —
+// the fabric abstains where a row owns the netdev (snapshotNetdevVotes) — but
+// the verdict still ships on the wire and still scopes the protocol gate where
+// it is ownerless, so an honest verdict is still the contract.
+//
 // FAIL-ON-REVERT: give fabricParentUnbindable a different evidence source
-// — a second kernel sample, or the unit-level tunnel flag instead of the
-// interface-level one — and a row/fabric pair disagrees here.
+// — a second kernel sample, the unit-level tunnel flag instead of the
+// interface-level one, or an exact-spelling lookup of the parent's stanza —
+// and a row/fabric pair disagrees here.
 func TestFabricAndBaseRowNeverDisagree(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -405,6 +422,19 @@ func TestFabricAndBaseRowNeverDisagree(t *testing.T) {
 			lines: []string{
 				"set interfaces fab0 fabric-options member-interfaces ge-0/0/0",
 				"set interfaces ge-0/0/0 unit 0 family inet address 10.0.1.1/24",
+			},
+		},
+		{
+			// #6691 round 11: ONE device, two legal authored spellings. The
+			// member must be slash-spelled (InterfaceSlot resolves the node from
+			// it); the stanza name is a wildcard, so it may be either. An
+			// exact-spelling lookup of the parent's stanza misses the tunnel and
+			// the fabric votes bindable against an unbindable base row.
+			name: "canonical alias between the member and its stanza",
+			lines: []string{
+				"set interfaces gr-0-0-3 tunnel source 10.0.0.1",
+				"set interfaces gr-0-0-3 tunnel destination 10.0.0.2",
+				"set interfaces fab0 fabric-options member-interfaces gr-0/0/3",
 			},
 		},
 		{
@@ -442,9 +472,10 @@ func TestFabricAndBaseRowNeverDisagree(t *testing.T) {
 					continue
 				}
 				for _, iface := range snap.Interfaces {
-					// BASE rows only: the row whose name has no unit suffix and
-					// whose netdev is the fabric parent.
-					if iface.LinuxName != fab.ParentLinuxName || iface.Name != fab.ParentInterface {
+					// BASE rows only, paired by NETDEV: the row whose name has
+					// no unit suffix and whose netdev is the fabric parent —
+					// whatever spelling either of them was authored with.
+					if iface.LinuxName != fab.ParentLinuxName || strings.Contains(iface.Name, ".") {
 						continue
 					}
 					if got := userspaceUnbindableNetdev(iface); got != fab.ParentUnbindable {

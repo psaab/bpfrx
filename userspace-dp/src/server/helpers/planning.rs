@@ -510,19 +510,12 @@ fn snapshot_has_parent_candidate(snapshot: &ConfigSnapshot, parent: &str) -> boo
 /// interface row for it, so round 9 planned a binding on an unbindable ownerless
 /// parent. The fabric's vote rides on the snapshot as
 /// `FabricSnapshot.parent_unbindable` rather than being recomputed here: half
-/// the evidence is a kernel link-kind dump only the Go plane takes.
+/// the evidence is a kernel link-kind dump only the Go plane takes. Round 11
+/// then narrowed WHERE that vote counts to the ownerless case it was written
+/// for — see the fallback comment in the body.
 fn snapshot_refuses_parent_netdev(snapshot: &ConfigSnapshot, parent: &str) -> bool {
     let mut owners = 0usize;
     let mut unbindable = 0usize;
-    for fab in &snapshot.fabrics {
-        if fab.parent_linux_name.is_empty() || fab.parent_linux_name != parent {
-            continue;
-        }
-        owners += 1;
-        if fab.parent_unbindable {
-            unbindable += 1;
-        }
-    }
     for p in &snapshot.interfaces {
         let p_linux = if p.linux_name.is_empty() {
             linux_ifname(&p.name)
@@ -535,6 +528,30 @@ fn snapshot_refuses_parent_netdev(snapshot: &ConfigSnapshot, parent: &str) -> bo
         owners += 1;
         if userspace_unbindable_netdev(p) {
             unbindable += 1;
+        }
+    }
+    // THE FABRIC IS A FALLBACK VOTER (#6691 round 11), counted only where no row
+    // speaks for the netdev. Round 10 counted it beside any owning row, which put
+    // TWO owners on one device with their verdicts computed from different
+    // evidence — the Go side from a config lookup plus a kernel dump, this side
+    // from a wire field decided at a different instant. A unanimity rule reads
+    // any disagreement as an admission, so every way to make those two differ
+    // was a fail-OPEN; two were reachable (a canonical alias in the member's
+    // name, and a fabric refresh re-sampling the kernel between applies) and both
+    // are fixed at their source in the control plane. This rule is what makes a
+    // third one harmless: A DEVICE HAS ONE VERDICT — the row's where a row
+    // exists, the fabric's where none does, which is the ownerless case round 10
+    // was written for. Mirrors Go's snapshotNetdevVotes exactly
+    // (pkg/dataplane/userspace/ingress_exclusions.go).
+    if owners == 0 {
+        for fab in &snapshot.fabrics {
+            if fab.parent_linux_name.is_empty() || fab.parent_linux_name != parent {
+                continue;
+            }
+            owners += 1;
+            if fab.parent_unbindable {
+                unbindable += 1;
+            }
         }
     }
     owners > 0 && owners == unbindable

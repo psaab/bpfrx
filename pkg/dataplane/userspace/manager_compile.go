@@ -39,8 +39,10 @@ var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-gl
 // #6691 round 8: the flag is set by CONFIG ownership or by the KERNEL link
 // kind, so this gate fires for a stale live xfrmi too — the case the operator
 // cannot fix by editing the config. Round 9: the gate reads the flag off the
-// SNAPSHOT (snapshotHasSecureTunnel) instead of re-deriving it, so it cannot
-// disagree with what was built.
+// SNAPSHOT instead of re-deriving it, so it cannot disagree with what was built.
+// Round 11: it reads every CONTRIBUTOR's verdict off that snapshot
+// (snapshotRequiresRefusalProtocol), because round 10's fabric-parent verdict is
+// carried by no row and a row scan could not see it.
 //
 // A helper that predates the field ignores it and plans the candidate. That is
 // not a lost optimisation — the helper's queue count is the GLOBAL MINIMUM
@@ -788,53 +790,6 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 	)
 }
 
-// snapshotHasSecureTunnel reports whether this snapshot carries an
-// InterfaceSnapshot with SecureTunnel set.
-//
-// It asks the snapshot builder ITSELF (#6691 round 9), rather than asking the
-// same question over the same refs and asserting the two answers agree.
-//
-// Round 8 hand-mirrored the builder's walk here — config ownership first, then
-// a SECOND RTM_GETLINK dump for the kernel half — under a comment claiming the
-// gate "cannot arm for a config whose snapshot carries no flagged row or stay
-// silent for one that does". A review round measured that claim false, and the
-// mechanism was the second dump: with an xfrm device visible to the builder's
-// dump and gone by this one, the built snapshot carried SecureTunnel=true on
-// `st10` while this function returned FALSE, so the required-protocol gate
-// stayed silent for exactly the snapshot it exists to gate. Two samples of a
-// changing kernel are two answers; the invariant was never a property of the
-// code, only of the timing.
-//
-// Reading the rows makes it a property of the code: there is ONE classification
-// per snapshot, taken by the builder that stamps the flag, so "arms iff the
-// snapshot carries a flagged row" is true by construction rather than by two
-// samples agreeing. It also costs NOTHING — no dump, no walk, just a scan of
-// rows the caller already has. Round 8's cost sentence ("ONE RTM_GETLINK dump,
-// taken only after the config half has found nothing … skipped entirely on a
-// box with no xfrm devices … never on a poll tick") was wrong three ways: the
-// dump was unconditional once the config half found nothing, "skipped on a box
-// with no xfrm devices" described the RESULT being empty rather than the dump
-// being skipped, and the poll-triggered arm reconciliation (manager_status.go,
-// manager_ha.go) does reach this gate.
-//
-// This does NOT eliminate every re-sample in the package — UserspaceBoundLinuxInterfaces
-// still builds its own snapshot from a bare *config.Config, because that is the
-// only thing its daemon call sites have. What it eliminates is the sample whose
-// disagreement was UNSAFE: a silent gate leaves an under-version helper armed on its
-// previous-good image. The allowlist's remaining sample is conservative in its
-// own direction (see its degrade-to-nil path) and cannot leave a helper armed.
-func snapshotHasSecureTunnel(snap *ConfigSnapshot) bool {
-	if snap == nil {
-		return false
-	}
-	for _, iface := range snap.Interfaces {
-		if iface.SecureTunnel {
-			return true
-		}
-	}
-	return false
-}
-
 // ensureSecureTunnelProtocolLocked is the fail-closed half of the #5619/#6691
 // protocol bumps — v5 (the SecureTunnel field), v6 (the every-owner refusal
 // rule) and v7 (the fabric parent's verdict), which is why it compares against
@@ -847,19 +802,41 @@ func snapshotHasSecureTunnel(snap *ConfigSnapshot) bool {
 // caller disarms the helper and the commit aborts with an operator-visible
 // reason.
 //
-// Scoped by configHasSecureTunnel, which since #6691 round 8 is the SAME union
-// the row flag is — a config-derived xfrmi OR a LIVE xfrm netdev the config no
-// longer describes. So the honest statement of the scope is: an operator with
-// neither route-based IPsec NOR a leftover xfrm device is never blocked by a
-// helper-version mismatch that cannot affect them. The narrower "no route-based
-// IPsec" wording this comment used to carry outlived the widening it describes
-// and was measurably wrong: with zero VPNs configured, configHasSecureTunnel
-// returns false with no live xfrmi and TRUE with a stale live `st10`. The
-// arming is right — a stale xfrmi is exactly the case an operator cannot fix by
-// editing the config, so an under-version helper must not stay armed for it — and only
-// the sentence was the defect.
+// Scoped by snapshotRequiresRefusalProtocol (ingress_exclusions.go), which asks
+// the CONTRIBUTOR ENUMERATION whether this snapshot carries an unbindable
+// verdict a pre-bump helper cannot reproduce. Three earlier scopes were narrower
+// and each was wrong for the same reason — they named the evidence they knew
+// about instead of asking who produces it:
+//
+//   - "no route-based IPsec" outlived the round-8 widening. With zero VPNs
+//     configured the scope is false with no live xfrmi and TRUE with a stale
+//     live `st10`, which is right: a stale xfrmi is exactly the case an operator
+//     cannot fix by editing the config, so an under-version helper must not stay
+//     armed for it.
+//   - A hand-mirrored re-derivation (round 8) took a SECOND RTM_GETLINK dump, so
+//     an xfrm device visible to the builder's dump and gone by this one left the
+//     gate silent for a snapshot carrying SecureTunnel=true. Two samples of a
+//     changing kernel are two answers; round 9 made it a property of the code by
+//     reading the applied rows, of which there is ONE classification per
+//     snapshot.
+//   - Reading the rows ALONE (round 9) then went silent for round 10's fabric
+//     verdict, which is carried by no row at all — the #6691 round 11 blocker,
+//     and the reason the scope is now derived from the same enumeration the
+//     verdict is rather than from a second list beside it.
+//
+// The honest statement of the scope: an operator whose snapshot contains no
+// verdict the older helper would decide differently is never blocked by a
+// version mismatch that cannot affect them.
+//
+// This does NOT eliminate every re-sample in the package —
+// UserspaceBoundLinuxInterfaces still builds its own snapshot from a bare
+// *config.Config, because that is the only thing its daemon call sites have.
+// What it eliminates is the sample whose disagreement was UNSAFE: a silent gate
+// leaves an under-version helper armed on its previous-good image. The
+// allowlist's remaining sample is conservative in its own direction (see its
+// degrade-to-nil path) and cannot leave a helper armed.
 func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
-	if !snapshotHasSecureTunnel(snap) {
+	if !snapshotRequiresRefusalProtocol(snap) {
 		return nil
 	}
 	if m.lastStatus.ConfigSnapshotProtocolVersion >= ProtocolVersion {
@@ -901,9 +878,11 @@ func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
 		return nil
 	}
 	return fmt.Errorf(
-		"%w: helper config snapshot protocol version %d < required %d for route-based IPsec secure tunnels "+
-			"(an older helper ignores the secure_tunnel flag and plans an AF_XDP binding for the xfrmi; its "+
-			"single RX queue then becomes the global minimum and collapses every interface to one queue and one worker)",
+		"%w: helper config snapshot protocol version %d < required %d for a device-level AF_XDP binding refusal "+
+			"(a route-based IPsec secure tunnel, or a fabric parent netdev refused with no interface stanza to "+
+			"carry the flags; an older helper cannot read the verdict and plans an AF_XDP binding for that "+
+			"netdev, and an xfrm device's single RX queue then becomes the global minimum and collapses every "+
+			"interface to one queue and one worker)",
 		ErrSecureTunnelProtocolIncompatible,
 		m.lastStatus.ConfigSnapshotProtocolVersion,
 		ProtocolVersion,

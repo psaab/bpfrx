@@ -4677,16 +4677,20 @@ fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
             name: "fab0".to_string(),
             parent_linux_name: "ge-0-0-0".to_string(),
             parent_ifindex: 20,
-            // #6691 round 10: the fabric is now an OWNER of this netdev, so its
-            // vote has to match what the Go builder would actually ship. The
-            // base row and the fabric parent are judged from the SAME evidence
-            // (fabricParentUnbindable reads the same config and the same kernel
-            // sample as the row), so a snapshot where the row says unbindable
-            // and the fabric says bindable is not producible — and leaving this
-            // `false` would make the fixture assert against a state production
-            // cannot reach, while quietly turning a unanimous bucket into a
-            // disagreement (which correctly ADMITS). Go-side
-            // TestFabricAndBaseRowNeverDisagree pins the invariant.
+            // #6691 round 10: the fabric votes on this netdev too, so its vote
+            // is set to what the Go builder ships for this config — the base row
+            // and the fabric parent are judged from the same config and the same
+            // kernel sample (fabricParentUnbindable), so they agree here.
+            //
+            // Round 10 also called the disagreeing snapshot "not producible",
+            // and round 11 measured two ways to produce it: a canonical alias
+            // between the member's name and its stanza, and a fabric refresh
+            // re-sampling the kernel between applies. Both are fixed at their
+            // source in the control plane, and the rule changed as well — a
+            // fabric vote is counted only where no row owns the netdev — so this
+            // fixture no longer depends on the agreement for its verdict. See
+            // `fabric_vote_cannot_overturn_an_owning_row` below, which drives
+            // exactly the disagreement this comment used to call impossible.
             parent_unbindable: true,
             rx_queues: 1,
             ..Default::default()
@@ -4867,6 +4871,117 @@ fn ownerless_fabric_parent_is_refused() {
         "an ownerless fabric parent with no refusal was dropped: being ownerless \
          is not what refuses a netdev, the control plane's verdict is. \
          Planned: {planned:?}"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 11: a fabric vote must not overturn the verdict of a row that
+/// OWNS the netdev.
+///
+/// Round 10 counted the fabric parent as an owner beside any interface row, so
+/// one device could have TWO owners whose verdicts came from DIFFERENT evidence
+/// — this plane reads a wire field, the Go plane reads a config lookup plus a
+/// kernel dump — and the unanimity rule reads any disagreement as an ADMISSION.
+/// So every way to make those two differ was a fail-open, and round 10's own
+/// fixture comment (above) called the disagreeing snapshot unproducible. Two
+/// producers were then measured on the control plane: a canonical alias between
+/// the member's name and its interface stanza (`gr-0/0/3` vs `gr-0-0-3`, one
+/// device, both spellings legal), and a fabric refresh re-sampling the kernel
+/// between applies.
+///
+/// Both are fixed at their source, and this rule is what makes a THIRD one
+/// harmless: a device has ONE verdict — the row's where a row exists, the
+/// fabric's where none does.
+///
+/// The fixture is the disagreement itself: an unbindable member row with a
+/// fabric row that says bindable. Under the round-10 tally that is
+/// `owners=2, unbindable=1` → not refused → the netdev is planned and its single
+/// RX queue becomes the global minimum (#3091).
+///
+/// FAIL-ON-REVERT: count the fabric vote unconditionally (drop the `owners == 0`
+/// guard in `snapshot_refuses_parent_netdev`) and this reds on both the planned
+/// set and the collapsed LAN queue count.
+#[test]
+fn fabric_vote_cannot_overturn_an_owning_row() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+        userspace_unbindable_netdev,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-3", 6);
+    set_rx_queue_count_override("ge-0-0-0", 1);
+
+    let member = InterfaceSnapshot {
+        name: "ge-0/0/0".to_string(),
+        linux_name: "ge-0-0-0".to_string(),
+        zone: String::new(),
+        secure_tunnel: true,
+        ifindex: 20,
+        rx_queues: 1,
+        ..Default::default()
+    };
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/3".to_string(),
+        linux_name: "ge-0-0-3".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 21,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    assert!(
+        userspace_unbindable_netdev(&member),
+        "premise: the owning row must REFUSE the netdev, or there is no verdict \
+         for the fabric vote to overturn"
+    );
+
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![member, lan.clone()],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            // THE DISAGREEMENT. The row says unbindable; the fabric says
+            // bindable.
+            parent_unbindable: false,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("ge-0-0-0"),
+        "a fabric row voting `bindable` overturned the verdict of the only row \
+         that describes the device, and the refused netdev was planned. A \
+         disagreement between two owners of ONE device is not evidence of \
+         bindability — it is evidence that one of them was computed from the \
+         wrong input. Planned: {planned:?}"
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-3")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {} — the refused \
+         netdev entered the candidate list on the fabric's vote and its single \
+         RX queue became the global minimum (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
     );
 
     clear_rx_queue_count_override();

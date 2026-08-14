@@ -59,8 +59,8 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 				"NOT inert there and the mixed-version story for the smoke cluster is "+
 				"different from the one this matrix describes", flagged)
 		}
-		if snapshotHasSecureTunnel(&ConfigSnapshot{Interfaces: rows}) {
-			t.Fatal("snapshotHasSecureTunnel disagrees with the row scan above")
+		if snapshotRequiresRefusalProtocol(&ConfigSnapshot{Interfaces: rows}) {
+			t.Fatal("snapshotRequiresRefusalProtocol disagrees with the row scan above")
 		}
 		t.Logf("reference cluster: %d interface rows, 0 flagged — gate inert, "+
 			"version-equality check is the only mechanism", len(rows))

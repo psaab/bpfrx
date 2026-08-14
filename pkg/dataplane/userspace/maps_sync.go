@@ -1588,7 +1588,7 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	}
 	seen := make(map[uint32]bool)
 	out := make([]uint32, 0)
-	refused := buildUserspaceRefusedNetdevs(snapshot.Interfaces, snapshot.Fabrics)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
@@ -1726,7 +1726,7 @@ func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]ui
 		return nil
 	}
 	out := make(map[uint32]uint32)
-	refused := buildUserspaceRefusedNetdevs(snapshot.Interfaces, snapshot.Fabrics)
+	refused := buildUserspaceRefusedNetdevs(snapshot)
 	for _, iface := range snapshot.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
