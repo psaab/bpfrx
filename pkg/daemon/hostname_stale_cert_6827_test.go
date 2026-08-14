@@ -104,9 +104,18 @@ func stubHostname(t *testing.T, name string) {
 //
 // The first config apply runs in startup phase 4 while startHTTPServer
 // constructs d.mgmt much later in Run, so a `system host-name` applied at boot
-// reaches a nil reconciler. Skipping on nil would reproduce the exact silence
-// this diagnostic exists to remove, because the fallback — the load path's
-// INFERRED heuristic — declines precisely this shape.
+// reaches a nil reconciler. Skipping on nil would reproduce the silence this
+// diagnostic exists to remove, and the load path is not a fallback that covers
+// it: it runs only while a certificate is being LOADED, which on an unchanged
+// endpoint next happens at a restart or an HTTPS rebind — so the operator hears
+// nothing for the remaining life of the process. (The worked shape here,
+// `old-fw-6827` → `new-fw-6827`, is shape-PRESERVING, so the load path's
+// INFERRED heuristic would accept it whenever it finally runs; it is a
+// CROSS-shape rename that the heuristic declines outright, and for that one the
+// parked debt is the only diagnosis there will ever be. #6827 round 6: the
+// original comment here claimed the heuristic "declines precisely this shape",
+// which is the opposite of what hostNameLikelyAccessIdentity does with two
+// unqualified names.)
 //
 // SCOPE: these subtests drive deliverStaleMgmtCertDiagnosis DIRECTLY, so they
 // bind the MECHANISM — a debt parked against a nil reconciler survives, and
@@ -292,7 +301,15 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 	t.Run("failed_sethostname_is_not_diagnosed", func(t *testing.T) {
 		d := &Daemon{}
 		stubHostname(t, "old-fw-6827")
-		serveStaleCert(t, d, "old-fw-6827")
+		// The cert covers NEITHER name (#6827 round 6). The earlier fixture
+		// minted for "old-fw-6827" — the name the kernel still has after the
+		// rejected rename — so a spurious note WOULD have been silent: the
+		// delivery reads the kernel name, finds it covered, and says nothing
+		// while quietly clearing the debt. Deleting applyHostname's error return,
+		// or calling noteStaleMgmtCertHostName in the failure arm, left this
+		// subtest GREEN. With a certificate that covers neither name, a note that
+		// should not have happened is loud.
+		serveStaleCert(t, d, "cert-fw-6827")
 		restore := sethostname
 		t.Cleanup(func() { sethostname = restore })
 		sethostname = func([]byte) error { return os.ErrPermission }
@@ -306,6 +323,18 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 		})
 		if strings.Contains(out, "does not cover the current host-name") {
 			t.Fatalf("a rename the kernel rejected must not be diagnosed; got %q", out)
+		}
+		// And assert the LEDGER directly, not only the log. `pending` alone
+		// cannot see a spurious note — the delivery inside it reaches this live
+		// leg and clears the flag straight back to false — but the generation
+		// only ever advances, so it witnesses the note whatever the certificate
+		// covers.
+		d.staleCertMu.Lock()
+		gen, pending := d.staleCertGen, d.staleCertPending
+		d.staleCertMu.Unlock()
+		if gen != 0 || pending {
+			t.Fatalf("a rename the kernel REJECTED must leave the stale-cert ledger untouched; "+
+				"got generation %d pending %v", gen, pending)
 		}
 	})
 }
@@ -440,8 +469,28 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 		// startHTTPServer CONSTRUCTS the api.Server itself, and the only cert-dir
 		// injection seam (Server.SetTLSCertDirForTest) exists after construction,
 		// so an in-process boot start cannot be handed a serving HTTPS leg
-		// without driving the production /etc/xpf/tls generator. The delivery is
-		// therefore observed where it is observable at boot — see below.
+		// without driving the production /etc/xpf/tls generator.
+		//
+		// WHAT THIS CELL PROVES, AND WHAT IT DOES NOT (#6827 round 6 — stated
+		// rather than implied, because the earlier comment read as if it proved
+		// the whole chain). It proves that startHTTPServer attempts the parked
+		// delivery, and that the attempt happens AFTER the management server has
+		// been constructed — the two facts that make the call site the right one.
+		// It does NOT prove that the delivery reached a certificate, emitted a
+		// warning, or discharged the debt: none of those are observable at boot
+		// in-process, for the construction-order reason above. Those three are
+		// bound at the OTHER retry point instead, where the seam does exist —
+		// a_day2_reconcile_settles_a_debt_incurred_while_https_was_down (reach +
+		// discharge, on the debt flag) and
+		// TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827 (the same, end to end
+		// from reconcileWebManagement).
+		//
+		// Known residual: replacing the production delivery with a bare
+		// osHostname() call would also satisfy this cell. The read is the only
+		// in-process trace a delivery leaves when nothing is served, so no
+		// assertion here can tell those two apart; a genuinely stronger cell
+		// needs a pre-construction certificate seam on api.Config, which is a
+		// production knob added for one test and was declined.
 		d := newMgmtDeliveryDaemon(t, "system host-name new-fw-6827")
 		d.opts.APIAddr = "127.0.0.1:0"
 
@@ -454,9 +503,22 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 		// d.mgmt is published, since an unpublished reconciler returns before the
 		// read.
 		var reads int
+		var srvUpAtRead bool
 		restore := osHostname
 		t.Cleanup(func() { osHostname = restore })
-		osHostname = func() (string, error) { reads++; return "new-fw-6827", nil }
+		osHostname = func() (string, error) {
+			reads++
+			// Capture the ORDERING, not just the fact of the call: a delivery
+			// hoisted above mgmt.start would still read the name (d.mgmt is
+			// published first) but could never reach a certificate, because no
+			// server exists yet.
+			if d.mgmt != nil {
+				d.mgmt.mu.Lock()
+				srvUpAtRead = d.mgmt.srv != nil
+				d.mgmt.mu.Unlock()
+			}
+			return "new-fw-6827", nil
+		}
 
 		// Boot order: the rename lands while startHTTPServer has not run, so the
 		// debt parks against a nil reconciler.
@@ -476,6 +538,10 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 				"name was never read, so deliverStaleMgmtCertDiagnosis did not run past its nil-reconciler " +
 				"guard. A host-name applied in the phase-4 boot apply is then never diagnosed, because " +
 				"the next boot's applyHostname sees the name already applied and returns early (#6827)")
+		}
+		if !srvUpAtRead {
+			t.Fatal("the boot delivery ran BEFORE the management server was constructed: it can " +
+				"never reach a certificate from there, so the retry point is decorative (#6827)")
 		}
 
 		// Negative control: nothing served a certificate, so the debt must
@@ -561,25 +627,133 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 	})
 }
 
-// TestDebtClearIsGenerationSafe_6827 pins the #6827-round-5 losing sequence: a
-// delivery runs UNLOCKED across the hostname read and the certificate
-// inspection, so a rename committed in that window bumps the generation and
-// must NOT be settled by the older delivery's evidence.
+// TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827 is the FAIL-ON-REVERT guard
+// for the #6827-round-6 BLOCKER, driven end-to-end from the daemon's own commit
+// entry point.
+//
+// An HTTPS serve loop that terminates unexpectedly leaves the leg INSTALLED with
+// only `dead` set (api.listenerLeg — removing it there would need lifeMu, which
+// deadlocks a shutdown racing the exit). Two independent things then treated
+// that corpse as a converged listener:
+//
+//   - the reconciler's leg-changed test compared only the FINGERPRINT, which
+//     still matched the committed endpoint, so ReconcileHTTPS was never called;
+//   - and had it been called, the same-address arm returned nil on a non-nil
+//     pointer, so it would have done nothing.
+//
+// Either one alone makes HTTPS unrecoverable on an UNCHANGED configuration for
+// the life of the process, and takes the stale-cert debt with it: the debt
+// clears only against a served certificate, so it can never be discharged and
+// the restart that finally rebinds HTTPS also discards it.
+//
+// RED on revert: drop `|| (next.TLS && !m.srv.HTTPSServing())` from
+// reconcileTo's HTTPS arm, OR restore `s.httpsLeg != nil && ...` in
+// api.Server.ReconcileHTTPS — each on its own fails the "HTTPS is back" and
+// "debt settled" assertions below.
+func TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827(t *testing.T) {
+	d := newMgmtDeliveryDaemon(t,
+		"system services web-management http",
+		"system services web-management https",
+	)
+	reg := newFakeReg()
+	m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
+	d.mgmt = m
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	want := m.committedDesired(nil)
+	if !want.TLS || want.HTTPSAddr == "" {
+		t.Fatalf("fixture: the committed config must ask for HTTPS; desired = %+v", endpointOf(want))
+	}
+	httpOnly := want
+	httpOnly.TLS, httpOnly.HTTPSAddr = false, ""
+	if err := m.startTo(ctx, httpOnly); err != nil {
+		t.Fatalf("start HTTP leg: %v", err)
+	}
+	dir := t.TempDir()
+	seedDurableCert(t, dir, "old-fw-6827", "127.0.0.1")
+	m.srv.SetTLSCertDirForTest(dir)
+	captureDaemonWarn(t, func() {
+		if err := d.reconcileWebManagement(d.store.ActiveConfig()); err != nil {
+			t.Fatalf("bring HTTPS up: %v", err)
+		}
+	})
+	if !m.srv.HTTPSServing() {
+		t.Fatal("fixture: the HTTPS leg must be serving before it can die")
+	}
+
+	// The serve loop terminates on its own: closing the listener under it makes
+	// Accept fail, which is the production shape of an unexpected serve exit
+	// (serveLegLocked's serveErr arm, not a requested retirement). The `dead`
+	// flag is therefore set by production, not by this test.
+	httpsLn := reg.get(want.HTTPSAddr)
+	if httpsLn == nil {
+		t.Fatalf("fixture: no listener recorded at %q", want.HTTPSAddr)
+	}
+	httpsLn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.srv.HTTPSServing() {
+		if time.Now().After(deadline) {
+			t.Fatal("the HTTPS serve goroutine did not observe its closed listener")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// A rename now incurs a debt nothing can settle: no certificate is served.
+	stubHostname(t, "new-fw-6827")
+	captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() })
+	d.staleCertMu.Lock()
+	pending := d.staleCertPending
+	d.staleCertMu.Unlock()
+	if !pending {
+		t.Fatal("fixture: with the HTTPS leg dead nothing serves a certificate, so the " +
+			"diagnosis must still be owed")
+	}
+
+	// The operator's next commit — on the SAME configuration they never touched.
+	out := captureDaemonWarn(t, func() {
+		if err := d.reconcileWebManagement(d.store.ActiveConfig()); err != nil {
+			t.Fatalf("reconcile over a dead HTTPS leg: %v", err)
+		}
+	})
+	if !m.srv.HTTPSServing() {
+		t.Fatal("a commit on an unchanged configuration left the DEAD HTTPS leg in place: the " +
+			"management TLS plane is down until the daemon restarts, and no configuration " +
+			"change can bring it back (#6827 round 6)")
+	}
+	d.staleCertMu.Lock()
+	pending = d.staleCertPending
+	d.staleCertMu.Unlock()
+	if pending {
+		t.Fatalf("the rebuilt HTTPS leg serves a certificate again, so the outstanding host-name "+
+			"diagnosis must be discharged — otherwise the debt is permanently undischargeable "+
+			"and a restart drops it; log was %q", out)
+	}
+}
+
+// TestDebtClearIsGenerationSafe_6827 pins the #6827-round-5 losing sequence,
+// with the round-6 tightening: the kernel-name read runs UNLOCKED, so a rename
+// committed after it must neither settle the debt with the older delivery's
+// evidence NOR be reported under the name that delivery read.
 //
 // The race is reachable: applySem serializes commits with each other, but the
-// boot delivery (daemon_run_servers.go, on the Run goroutine) runs OUTSIDE it
-// while cluster comms are already up (started inside the phase-4 boot apply),
-// so a peer SyncApply -> applyHostname can bump the generation while the boot
-// delivery sits in its unlocked window.
+// boot delivery (daemon_run_servers.go, on the Run goroutine) runs OUTSIDE it,
+// and cluster comms are already running by then — Daemon.Run starts them right
+// after the mutating startup phases and well before startHTTPServer — so a peer
+// SyncApply -> applyHostname can bump the generation while the boot delivery
+// sits in its unlocked window.
 //
-// Both subtests drive the PRODUCTION comparison — an earlier version of this
+// Every subtest drives the PRODUCTION comparison — an earlier version of this
 // test re-implemented `d.staleCertGen == gen` in its own body and asserted on
 // its own arithmetic, so the fence could be replaced by an unconditional clear
 // with the whole suite still green.
 //
-// RED on revert: `if true || d.staleCertGen == gen` (unconditional clear) fails
-// the first subtest; `if false && d.staleCertGen == gen` (never clear) fails the
-// second. Neither direction passes both.
+// RED on revert: `if false && d.staleCertGen != gen` (never abandon) fails the
+// first and third subtests; `if true || d.staleCertGen != gen` (always abandon)
+// fails the second. Neither direction passes all three. Deleting
+// `d.staleCertGen++` from noteStaleMgmtCertHostName fails the third only — the
+// first two supply their own generation movement, which is exactly why the
+// third exists.
 func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 	t.Run("a_rename_landing_mid_delivery_is_not_settled", func(t *testing.T) {
 		d := &Daemon{}
@@ -587,8 +761,8 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 
 		// osHostname is read INSIDE the unlocked window, so stubbing it is the
 		// seam that lands a rename exactly where the race is: after this delivery
-		// sampled the generation, before it decides whether to clear. It fires
-		// ONCE, so the surviving debt is deliverable on a later attempt.
+		// sampled the generation, before it re-validates it. It fires ONCE, so the
+		// surviving debt is deliverable on a later attempt.
 		restore := osHostname
 		t.Cleanup(func() { osHostname = restore })
 		var raced bool
@@ -599,7 +773,7 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 				d.staleCertGen++ // a newer `set system host-name` commits mid-delivery
 				d.staleCertMu.Unlock()
 			}
-			return "new-fw-6827", nil
+			return "interim-fw-6827", nil
 		}
 
 		d.staleCertMu.Lock()
@@ -607,12 +781,19 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 		d.staleCertMu.Unlock()
 
 		out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
-		if !strings.Contains(out, "does not cover the current host-name") {
-			t.Fatalf("the delivery itself must still run and diagnose; got %q", out)
-		}
 		if !raced {
 			t.Fatal("the stub never fired, so no rename landed in the unlocked window and " +
 				"this subtest proves nothing")
+		}
+		// Round 6: the superseded delivery must ABANDON, not warn. Round 5 checked
+		// the generation only AFTER the warning was already emitted, so this
+		// sequence logged a staleness diagnosis naming a host name the box had
+		// already left — and the fence, which runs later, cannot retract a line
+		// that is out.
+		if out != "" {
+			t.Fatalf("a delivery whose generation was superseded must emit NOTHING — the name it "+
+				"read is no longer the one the debt is about, and the clear-side fence cannot "+
+				"retract an emitted line; got %q", out)
 		}
 		d.staleCertMu.Lock()
 		pending, gen := d.staleCertPending, d.staleCertGen
@@ -625,9 +806,143 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 				"generation — the newer debt is lost permanently (#6827 round 5)")
 		}
 
-		// The surviving debt is still deliverable (the fence defers it, not drops it).
-		if again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); !strings.Contains(again, "new-fw-6827") {
+		// The surviving debt is still deliverable (the fence defers it, not drops
+		// it), and the delivery that DOES speak names the current kernel identity.
+		if again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); !strings.Contains(again, "interim-fw-6827") {
 			t.Fatalf("the outstanding newer debt must still be deliverable; got %q", again)
+		}
+	})
+
+	t.Run("a_real_rename_mid_delivery_advances_the_generation", func(t *testing.T) {
+		// The two subtests around this one move the generation THEMSELVES, so
+		// both stay green with the production `d.staleCertGen++` deleted: they
+		// prove the fence reacts to a moving generation, not that anything moves
+		// it (#6827 round 6). This one drives the rename through
+		// noteStaleMgmtCertHostName and never touches staleCertGen.
+		//
+		// The shape is the one where the increment is load-bearing in production:
+		// the NEWER rename's own delivery reaches nothing (HTTPS is still down),
+		// and the commit carrying it then brings HTTPS up — so the OLDER delivery
+		// is the one that finds a certificate. Without a generation to tell them
+		// apart it settles the newer rename's debt with its own older evidence,
+		// and that diagnosis is gone for the life of the process.
+		d := newMgmtDeliveryDaemon(t,
+			"system services web-management http",
+			"system services web-management https",
+		)
+		reg := newFakeReg()
+		m := newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
+		d.mgmt = m
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		want := m.committedDesired(nil)
+		httpOnly := want
+		httpOnly.TLS, httpOnly.HTTPSAddr = false, ""
+		if err := m.startTo(ctx, httpOnly); err != nil {
+			t.Fatalf("start HTTP leg: %v", err)
+		}
+		dir := t.TempDir()
+		seedDurableCert(t, dir, "old-fw-6827", "127.0.0.1")
+		m.srv.SetTLSCertDirForTest(dir)
+
+		// Debt #1, incurred while nothing serves a certificate.
+		stubHostname(t, "first-fw-6827")
+		d.noteStaleMgmtCertHostName()
+		d.staleCertMu.Lock()
+		pending, firstGen := d.staleCertPending, d.staleCertGen
+		d.staleCertMu.Unlock()
+		if !pending {
+			t.Fatal("fixture: nothing served a certificate, so the debt must still stand")
+		}
+
+		restore := osHostname
+		t.Cleanup(func() { osHostname = restore })
+		var raced bool
+		osHostname = func() (string, error) {
+			if !raced {
+				raced = true
+				// A second `set system host-name` commits while this delivery is
+				// in its unlocked window — through PRODUCTION, so the generation
+				// moves only if noteStaleMgmtCertHostName moves it. Its own
+				// delivery reaches nothing: HTTPS is still down at this instant.
+				d.noteStaleMgmtCertHostName()
+				// ...and the same commit brings HTTPS up, so the OLDER delivery
+				// below is the first one to find a served certificate.
+				if err := m.reconcileTo(want); err != nil {
+					t.Errorf("enable HTTPS mid-delivery: %v", err)
+				}
+			}
+			return "second-fw-6827", nil
+		}
+
+		captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
+		if !raced {
+			t.Fatal("the stub never fired, so no second rename landed and this subtest proves nothing")
+		}
+		if m.srv.HTTPSCertForTest() == nil {
+			t.Fatal("fixture: HTTPS did not come up mid-delivery, so the older delivery reached " +
+				"no certificate and could not have cleared anything either way")
+		}
+		d.staleCertMu.Lock()
+		pending, gen := d.staleCertPending, d.staleCertGen
+		d.staleCertMu.Unlock()
+		if gen == firstGen {
+			t.Fatalf("a real `set system host-name` must ADVANCE the generation: it is still %d, "+
+				"so no delivery can tell the two renames apart", gen)
+		}
+		if !pending {
+			t.Fatal("the older delivery settled the SECOND rename's debt with its own evidence — " +
+				"that diagnosis is now lost for the life of the process (#6827 round 6)")
+		}
+		// And the surviving debt is genuinely deliverable now that HTTPS is up.
+		again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
+		if !strings.Contains(again, "second-fw-6827") {
+			t.Fatalf("the outstanding debt must settle on the next retry, naming the current "+
+				"kernel identity; got %q", again)
+		}
+	})
+
+	t.Run("an_unreadable_kernel_name_settles_nothing", func(t *testing.T) {
+		// The read guard (#6827 round 6). An empty or failed os.Hostname leaves no
+		// identity to judge the certificate against — but the delivery would still
+		// REACH one, and warnStaleCertForHostName reports "answered" whenever it
+		// does, so the debt would clear on the strength of nothing. The operator
+		// gets silence (warnStaleHostName declines an empty name) and no retry.
+		for _, c := range []struct {
+			name string
+			read func() (string, error)
+		}{
+			{"read_failed", func() (string, error) { return "", os.ErrPermission }},
+			{"empty_name", func() (string, error) { return "", nil }},
+			// A failed read that still returns a name is the same case: the value
+			// is not trustworthy, so it must not be used to settle anything.
+			{"error_with_a_name", func() (string, error) { return "new-fw-6827", os.ErrPermission }},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				d := &Daemon{}
+				serveStaleCert(t, d, "old-fw-6827")
+				d.staleCertMu.Lock()
+				d.staleCertPending, d.staleCertGen = true, 1
+				d.staleCertMu.Unlock()
+
+				restore := osHostname
+				t.Cleanup(func() { osHostname = restore })
+				osHostname = c.read
+
+				out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
+				if out != "" {
+					t.Fatalf("with no usable kernel name there is nothing to diagnose; got %q", out)
+				}
+				d.staleCertMu.Lock()
+				pending := d.staleCertPending
+				d.staleCertMu.Unlock()
+				if !pending {
+					t.Fatal("a delivery that could not read the kernel name cleared the debt " +
+						"anyway: the diagnosis is discharged with no identity behind it and is " +
+						"never retried (#6827 round 6)")
+				}
+			})
 		}
 	})
 

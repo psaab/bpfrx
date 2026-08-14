@@ -1128,24 +1128,31 @@ under the daemon's errgroup. Nothing else imports this package.
       way a cert goes stale:
       - `generateSelfSignedCertAt` calls `warnStaleLoadedCert` on the
         load-success path — boot, and any HTTPS enable/rebind;
-      - `Server.WarnStaleMgmtCertForHostName` is called by
-        `Daemon.applyHostname` immediately after a successful `set system
-        host-name`. The load path could never see a rename: the HTTPS leg is
-        rebuilt only when the TLS flag or the HTTPS bind address changes
+      - `Server.WarnStaleMgmtCertForHostName` is reached from
+        `Daemon.applyHostname` after a successful `set system host-name` — not
+        synchronously: the rename records a DEBT and the daemon's delivery path
+        makes the call, at the rename when a certificate is already served and
+        otherwise at the first later retry point that finds one. The load path
+        could never see a rename: the HTTPS leg is rebuilt only when the TLS
+        flag or the HTTPS bind address changes
         (`managementReconciler.reconcileTo`), so a rename on an unchanged
         endpoint reloads nothing. And `reconcileWebManagement` runs EARLY in
         `applyConfigLocked` while the kernel name is set in the apply tail, so
         even a commit that DID move the HTTPS bind would have diagnosed the OLD
         name — which is why this entry point takes the host name as a
-        PARAMETER (the caller passes the name it just applied) instead of
-        re-reading `os.Hostname()`.
+        PARAMETER instead of re-reading `os.Hostname()` itself: the read moves
+        to the daemon, which performs it after `Sethostname` has returned and
+        abandons the delivery if a newer rename has since been recorded.
         At BOOT this hook runs before its own dependency exists: the first
         config apply is startup phase 4 while `startHTTPServer` builds `d.mgmt`
         later in `Run`. So a rename records a DEBT (`Daemon.staleCertPending`)
-        and `deliverStaleMgmtCertDiagnosis` retries it — at the rename, at the
-        boot management start, and on every web-management reconcile. Skipping
-        on nil would reproduce the original silence, because the load-path
-        fallback declines exactly this shape (see the narrowing rule below).
+        and `deliverStaleMgmtCertDiagnosis` retries it — at the boot management
+        start, and on every web-management reconcile. Skipping on nil would
+        reproduce the original silence: the load path is not a fallback that
+        covers it, because it runs only while a certificate is being loaded,
+        which on an unchanged endpoint next happens at a restart or an HTTPS
+        rebind (and for a CROSS-shape rename it declines even then — see the
+        narrowing rule below).
         Two properties matter:
         - **The debt clears only when a delivery actually reaches a served
           certificate** (`WarnStaleMgmtCertForHostName` returns that). Clearing
@@ -1156,20 +1163,34 @@ under the daemon's errgroup. Nothing else imports this package.
           durable on disk, so the staleness outlives the listener and the debt
           must outlive it too.
         - **The host name is read from the kernel at DELIVERY, never stored at
-          rename time.** A deferred diagnosis therefore always describes the
-          name the box has now, so it can never replay an intermediate or
-          long-past rename — and marking the debt and attempting delivery are a
-          single path, so a rename racing `d.mgmt`'s publication cannot be
-          silently dropped.
-      Both entry points read the LIVE HTTPS leg via `listenerLeg.serving()` —
-      not a non-nil pointer. An unexpected serve exit leaves the leg INSTALLED
-      with `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed with
-      `stopping` set; diagnosing either reports a certificate no socket is
+          rename time.** A deferred diagnosis is therefore never the replay of a
+          name captured at some earlier commit — and marking the debt and
+          attempting delivery are a single path, so a rename racing `d.mgmt`'s
+          publication cannot be silently dropped. The delivery is also
+          GENERATION-FENCED before it speaks: one whose rename has been
+          superseded abandons without warning and without clearing, so it cannot
+          emit a name a recorded rename has already replaced. What is NOT
+          promised is that the emitted name is the kernel's current one —
+          `Sethostname` moves the kernel name before the new generation is
+          recorded, and nothing keyed on that generation can cover the gap
+          between the two.
+      The RENAME entry point reads the LIVE HTTPS leg via
+      `listenerLeg.serving()` — not a non-nil pointer. (The load path has no leg
+      to read: it runs inside cert generation, before any leg exists, and judges
+      the pair it just loaded.) An unexpected serve exit leaves the leg
+      INSTALLED with `dead` set, and ROOT-CONTEXT SHUTDOWN leaves it installed
+      with `stopping` set; diagnosing either reports a certificate no socket is
       presenting. `serving()` therefore tests BOTH: `dead` for a
       self-termination, and `stopping` — stored explicitly at the top of both
       drain arms (requested retirement AND root-context shutdown), before
-      `Shutdown`, so it covers the leg from the moment the listener closes
-      through the goroutine's return. It does NOT test `stopCh`: a requested
+      `Shutdown`, so it covers the leg from the moment the drain is decided
+      through the goroutine's return (the listener closes an instant later, in
+      `Shutdown`, and already-accepted requests drain for up to 5s — `serving()`
+      answers "is this the leg in front of clients", not "is every byte done").
+      The same predicate now gates `ReconcileHTTPS`'s same-address no-op, so a
+      dead leg is REBUILT rather than mistaken for a converged one (#6827 round
+      6): before that, a self-terminated HTTPS leg could not be replaced by any
+      commit and HTTPS stayed down until a restart. It does NOT test `stopCh`: a requested
       retirement is unobservable through `s.httpsLeg`, though not by the
       ordering — the disable arm retires the leg and THEN clears the field. What
       makes the interval unobservable is that the whole `ReconcileHTTPS` switch
@@ -1223,8 +1244,15 @@ under the daemon's errgroup. Nothing else imports this package.
         later boot, so it is never diagnosed at all in the two states that had
         no commit-time diagnosis behind them — a box already drifted before this
         shipped, and a box RUNNING this build whose commit-time debt was still
-        OWED at shutdown (HTTPS off, or its bind failed) and was discarded by the
-        restart, `Daemon.staleCertPending` being process-local.
+        OWED at shutdown and was discarded by the restart,
+        `Daemon.staleCertPending` being process-local. That second state has
+        more ways in than the obvious one, each an ordinary configuration rather
+        than a fault: HTTPS disabled, its bind failed, its serve loop terminated
+        and no later commit rebuilt the leg, the API disabled entirely
+        (`--api-addr` empty, so there is no reconciler to deliver through), the
+        boot HTTP start failed, the kernel name unreadable at every delivery, or
+        startup aborted on a signal (#5807) after the phase-4 config apply but
+        before the management server was built.
         Shape-preserving drift (the ordinary case) is still caught on
         every boot. Closing either half needs persistent state — an upgrade
         marker, or a durable pending flag plus an invalidation story for a name
@@ -1243,24 +1271,38 @@ under the daemon's errgroup. Nothing else imports this package.
     `tls_san_5719_test.go` (SAN presence, hostname classification, the
     non-ASCII no-abort guard, the bind-host mgmt-IP/DNS threading +
     `buildHTTPSServer` host-extraction, and the stale-cert mismatch warnings on
-    the rebind path) and `tls_stale_cert_6827_test.go` (the SAN-less cert, the
-    unused-kernel-name false positive and its matched positive control, and the
-    rename entry point), with the daemon-side wiring pinned by
+    the rebind path) and `tls_stale_cert_6827_test.go` (the SAN-less cert — one
+    fixture for the REACH the check adds where both per-identity gates decline,
+    a second with a warnable bind host so the TERMINAL `return` is observable at
+    all; the unused-kernel-name false positive and its matched positive control;
+    the rename entry point; and the two leg-state transitions driven by the real
+    serve goroutine — `stopping` on a root-context drain, `dead` on an
+    unexpected serve exit, plus the reconcile that REPLACES a dead leg), with
+    the daemon-side wiring pinned by
     `pkg/daemon/hostname_stale_cert_6827_test.go`: a host-name commit on an
     UNCHANGED HTTPS endpoint reaches the diagnostic with the NEW name, the debt
-    outlives a delivery that reached nothing, the generation fence defers a
-    rename that lands mid-delivery, and BOTH deferred retry points are bound at
-    their own call site. Those two are bound on different observables, and the
-    reason is worth stating rather than discovering twice:
-    `reconcileWebManagement`'s per-commit retry is bound on the debt FLAG,
-    because the reconcile that brings HTTPS up makes the certificate LOAD path
-    emit the same warning text — a text assertion there passes with the retry
-    deleted. `startHTTPServer`'s boot delivery is bound on the kernel-name read,
-    which sits past the nil-reconciler guard: that call site cannot be given a
-    serving HTTPS leg in-process, because `startHTTPServer` CONSTRUCTS the
-    `api.Server` itself and `SetTLSCertDirForTest` only exists after
-    construction, so the alternative is driving the production `/etc/xpf/tls`
-    generator. Deleting either call reds its own subtest and only its own.
+    outlives a delivery that reached nothing, an unreadable kernel name settles
+    nothing, the generation fence defers a rename that lands mid-delivery (once
+    with the test supplying the competing rename, once driving it through the
+    production note path so the `staleCertGen++` itself is bound), a dead HTTPS
+    leg is rebuilt by the next commit so the debt is dischargeable at all, and
+    BOTH deferred retry points are bound at their own call site. Those two are
+    bound on different observables, and the reason is worth stating rather than
+    discovering twice: `reconcileWebManagement`'s per-commit retry is bound on
+    the debt FLAG, because the reconcile that brings HTTPS up makes the
+    certificate LOAD path emit the same warning text — a text assertion there
+    passes with the retry deleted. `startHTTPServer`'s boot delivery is bound on
+    the kernel-name read plus the fact that the management server already
+    exists when it happens; that call site cannot be given a serving HTTPS leg
+    in-process, because `startHTTPServer` CONSTRUCTS the `api.Server` itself and
+    `SetTLSCertDirForTest` only exists after construction, so the alternative is
+    driving the production `/etc/xpf/tls` generator. Deleting either call reds
+    its own subtest and only its own. The boot cell's limit is stated in the
+    test rather than implied: it proves the call happens and happens after the
+    server is built, NOT that it reached a certificate, warned, or discharged
+    anything — replacing the delivery with a bare `osHostname()` would satisfy
+    it, and a stronger cell needs a pre-construction certificate seam on
+    `api.Config`, which was declined as a production knob added for one test.
 - The status-poll path (1 Hz) shares the userspace dataplane control socket
   with HA sync, session installs, snapshot sync, and forwarding sync.
   Adding a new caller at >1 Hz here will starve session installs during

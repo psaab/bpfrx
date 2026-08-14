@@ -47,20 +47,26 @@ type listenerLeg struct {
 	// with no lock breaks that lock-ordering cycle (#6401 round-3 fix).
 	dead atomic.Bool
 	// stopping is set the moment a graceful drain BEGINS — before Shutdown, not
-	// after the goroutine returns. Between those two points the listener is
-	// already closed (Shutdown closes it) so no new client can reach the
-	// certificate, yet a flag stored only when the goroutine RETURNS would stay
-	// false for up to the 5s drain window (#6827 round 5). For "is a certificate
-	// in front of clients right now?" the answer during a drain is NO: the
-	// process is on its way down and a staleness warning is noise. Callers that
-	// want "what address is this leg finishing on" (EffectiveHTTPAddr)
-	// deliberately do not consult this.
+	// after the goroutine returns. A flag stored only when the goroutine RETURNS
+	// would stay false for the whole drain window, up to 5s (#6827 round 5).
+	//
+	// It marks INTENT, and the socket state trails it by a hair: it is stored
+	// just before Shutdown, which is what closes the listener, and requests
+	// already accepted keep being served until they finish or the 5s deadline
+	// expires. So a `stopping` leg is not instantaneously silent. It is still
+	// the right answer to "is a certificate in front of clients right now?",
+	// which is a question about whether to warn an operator: this leg is on its
+	// way out, no new client will reach it, and a staleness warning about it is
+	// noise. Callers that want "what address is this leg finishing on"
+	// (EffectiveHTTPAddr) deliberately do not consult it.
 	stopping atomic.Bool
 }
 
-// serving reports whether this leg is actually carrying traffic right now: it
+// serving reports whether this leg is the one in front of clients right now: it
 // exists, holds a listener, and its serve goroutine has neither self-terminated
-// (`dead`) nor begun a graceful drain (`stopping`).
+// (`dead`) nor begun a graceful drain (`stopping`). It is a state question, not
+// an instantaneous claim that no byte is in flight — a leg that has just entered
+// its drain can still be finishing accepted requests (see `stopping`).
 //
 // A non-nil leg pointer is NOT that question (#6827). An unexpected serve exit
 // sets `dead` and leaves the leg INSTALLED in s.httpsLeg; a root-context
@@ -339,11 +345,21 @@ func (s *Server) ReconcileHTTP(addr string) error {
 // listener (#5866), leaving the live HTTP listener untouched — this is the fix
 // for the whole-server rebuild that re-bound the still-held HTTP socket on a
 // TLS-enable (EADDRINUSE). useTLS=false or addr=="" disables HTTPS. A same-addr
-// enabled call is a no-op. On enable/rebind the new HTTPS listener (with its
-// durable self-signed cert — loaded AS-IS from disk on a rebind, freshly minted
-// only when no on-disk pair exists, #1916 D6) is bound and serving BEFORE any
-// old one is retired. A cert or bind failure retains the previous HTTPS state
-// (fail-closed) and returns the error for retry debt.
+// call over a leg that is actually SERVING is a no-op. On enable/rebind the new
+// HTTPS listener (with its durable self-signed cert — loaded AS-IS from disk on
+// a rebind, freshly minted only when no on-disk pair exists, #1916 D6) is bound
+// and serving BEFORE any old one is retired. A cert or bind failure retains the
+// previous HTTPS state (fail-closed) and returns the error for retry debt.
+//
+// The same-addr no-op tests listenerLeg.serving(), NOT a non-nil pointer
+// (#6827 round 6). An unexpected serve exit marks the leg `dead` and leaves it
+// INSTALLED in s.httpsLeg, so a pointer test called that address converged and
+// returned nil — a same-address reconcile could never resurrect HTTPS, and
+// neither could any other commit, because the reconciler above it never even
+// reached this call (its own converged fingerprint still matched). The dead leg
+// was a permanent, restart-only dead end on an UNCHANGED configuration. Asking
+// whether a socket is really carrying traffic makes the rebind the recovery
+// path it was always documented to be.
 func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 	s.lifeMu.Lock()
 	defer s.lifeMu.Unlock()
@@ -355,7 +371,7 @@ func (s *Server) ReconcileHTTPS(useTLS bool, addr string) error {
 			s.httpsLeg = nil
 		}
 		return nil
-	case s.httpsLeg != nil && s.httpsLeg.srv.Addr == addr:
+	case s.httpsLeg.serving() && s.httpsLeg.srv.Addr == addr:
 		return nil
 	default:
 		slot := s.newAuthSlot()

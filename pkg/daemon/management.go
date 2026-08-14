@@ -447,10 +447,25 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		}
 	}
 
-	// HTTPS leg: enable / disable / rebind ONLY if the HTTPS bind or TLS flag
-	// changed. api.Server.ReconcileHTTPS never touches the live HTTP listener, so
-	// a TLS enable can no longer collide with the retained HTTP socket.
-	if next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr {
+	// HTTPS leg: enable / disable / rebind if the HTTPS bind or TLS flag changed
+	// — or if the leg this reconciler RECORDED as converged is no longer serving
+	// (#6827 round 6). api.Server.ReconcileHTTPS never touches the live HTTP
+	// listener, so a TLS enable can no longer collide with the retained HTTP
+	// socket.
+	//
+	// The fingerprint records what the last SUCCESSFUL reconcile bound; it is not
+	// evidence that the socket is still up. An unexpected serve-loop exit marks
+	// the leg dead and leaves it INSTALLED (api.listenerLeg.dead — it cannot be
+	// removed under lifeMu without deadlocking a shutdown that races the exit),
+	// so on every later commit the fingerprint test above matched, ReconcileHTTPS
+	// was never called, and HTTPS stayed down until a restart even though the
+	// operator's configuration never changed. Worse, nothing could clear it: the
+	// stale-cert delivery below can only settle its debt against a served
+	// certificate, so the diagnosis stayed permanently owed too. Asking the
+	// server what is actually serving is the same question startTo asks after the
+	// boot bind (#5561 round 14, MAJOR 5); this is that check applied to the
+	// steady state rather than only to boot.
+	if next.TLS != m.cur.tls || next.HTTPSAddr != m.cur.httpsAddr || (next.TLS && !m.srv.HTTPSServing()) {
 		if err := m.srv.ReconcileHTTPS(next.TLS, next.HTTPSAddr); err != nil {
 			errs = append(errs, err)
 		} else {
@@ -555,14 +570,42 @@ func (d *Daemon) noteStaleMgmtCertHostName() {
 // diagnosis if one is owed and a management certificate is actually being
 // served, clearing the debt ONLY on success (#6827).
 //
-// Called from three places, all of them retry points rather than one-shot
-// drains: the rename itself, the boot management start, and every
-// web-management reconcile (so a later `web-management https` enable settles a
-// debt incurred while HTTPS was down).
+// Called from three places. The rename itself is the INITIAL attempt; the boot
+// management start and every web-management reconcile are RETRY points, so a
+// debt incurred while nothing was serving (HTTPS off, its bind failed, or the
+// reconciler did not exist yet) settles on the commit that brings a certificate
+// up rather than being lost.
 //
 // The host name is read from the kernel HERE, not stored at rename time. That
 // removes the "replayed a rename from arbitrarily far back" hazard at its
-// root: whenever this speaks, it describes the name the box has right now.
+// root: a deferred diagnosis never describes a name captured at some earlier
+// commit.
+//
+// GENERATION FENCE (#6827 round 5, tightened in round 6). The kernel read runs
+// unlocked, so a rename can land after it. The rest of the delivery — the
+// re-validation, the certificate inspection, and the clear — therefore runs
+// under staleCertMu in ONE hold, and a delivery whose generation has been
+// superseded abandons WITHOUT emitting anything:
+//
+//   - it must not clear, because settling a newer rename's debt with an older
+//     delivery's evidence loses that diagnosis permanently;
+//   - it must not WARN either, because the name it read is no longer the one the
+//     box has. Round 5 checked the generation only after the warning was already
+//     out, so a rename landing in the window made the appliance log a diagnosis
+//     naming the PREVIOUS host name — a line the fence could not retract. Losing
+//     nothing: the newer rename's own noteStaleMgmtCertHostName calls this
+//     function itself, so the newest name is diagnosed by the newest delivery.
+//
+// Holding the mutex across warnStaleCertForHostName is deadlock-free: the order
+// is always staleCertMu → managementReconciler.mu → api.Server.lifeMu, and
+// nothing under those re-enters the Daemon.
+//
+// What this does NOT promise — and what the prose used to claim — is that the
+// emitted name is the kernel's CURRENT one. sethostname moves the kernel name
+// BEFORE applyHostname records the new generation, so between those two points
+// a delivery legitimately reads, validates, and reports a name the kernel has
+// just left. No generation-based fence can close that window; what it does close
+// is every case where the competing rename has actually been recorded.
 func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 	if d == nil {
 		return
@@ -575,21 +618,22 @@ func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 	}
 	hostName, err := osHostname()
 	if err != nil || hostName == "" {
-		return // cannot describe the current identity; stay in debt
+		// Cannot describe the current identity, so there is no identity to judge
+		// the certificate against: stay in debt. Delivering with an empty name
+		// would reach a certificate, report the question ANSWERED, and clear the
+		// debt on the strength of nothing — warnStaleHostName declines an empty
+		// name, so the operator would get silence and no retry.
+		return
+	}
+	d.staleCertMu.Lock()
+	defer d.staleCertMu.Unlock()
+	if d.staleCertGen != gen {
+		return // a newer rename owns the diagnosis now; it runs its own delivery
 	}
 	if !mgmt.warnStaleCertForHostName(hostName) {
 		return // nothing serving a certificate yet; the debt stands
 	}
-	// Clear ONLY the generation this delivery claimed (#6827 round 5). The
-	// hostname read and certificate inspection above run UNLOCKED, so a rename
-	// committed while they were in flight bumps the generation; an unconditional
-	// clear would settle that newer debt with an older delivery's evidence and
-	// lose it permanently.
-	d.staleCertMu.Lock()
-	if d.staleCertGen == gen {
-		d.staleCertPending = false
-	}
-	d.staleCertMu.Unlock()
+	d.staleCertPending = false
 }
 
 // warnStaleCertForHostName forwards to the live api.Server under mu so it cannot

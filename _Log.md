@@ -79624,3 +79624,34 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13T14:10Z
+- **Action**: #6827 round 6 — folded a Codex MERGE-NEEDS-MAJOR (7 blocking). B1 RUNTIME:
+  a dead HTTPS leg made the stale-cert debt permanently undischargeable. An unexpected
+  serve-loop exit marks the leg `dead` and leaves it INSTALLED, so the reconciler's
+  fingerprint test still matched the committed endpoint (ReconcileHTTPS never called)
+  and ReconcileHTTPS's own same-address arm returned nil on a non-nil pointer. HTTPS
+  was unrecoverable on an UNCHANGED configuration for the life of the process. Fixed at
+  both levels: the api-side no-op now tests `listenerLeg.serving()`, and reconcileTo's
+  HTTPS arm also fires on `next.TLS && !m.srv.HTTPSServing()`. B2 RUNTIME: the delivery
+  emitted its warning BEFORE re-checking the generation, so a rename landing after the
+  kernel read logged a diagnosis naming the previous host name — a line the clear-side
+  fence could not retract. The re-validation, certificate inspection and clear now run
+  under one staleCertMu hold and a superseded delivery abandons silently. B3/B4:
+  `d.staleCertGen++` and the unreadable-kernel-name guard were both unbound (the race
+  test supplied its own increment). B5/B6/B7: three assertions could not fail on their
+  own fixtures — the rejected-rename cert covered the kernel name, the bind-failure test
+  asserts a state no implementation reaches, and the no-SAN terminality assertion used a
+  loopback fixture where both downstream predicates decline anyway. Fixtures replaced,
+  not assertions. Nine claim defects corrected across server.go, listener.go,
+  management.go, both READMEs and the tests (applyHostname does not call Warn
+  synchronously; the deferred name is not guaranteed current; only the rename entry
+  point reads a live leg; `stopping` precedes Shutdown; the rename call is the INITIAL
+  attempt; the load heuristic ACCEPTS the worked unqualified→unqualified shape; cluster
+  comms start after the phase-4 apply, not inside it), plus the restart-residual cause
+  list widened from two causes to seven. Validation: `go test ./pkg/daemon ./pkg/api`
+  rc 0; 9-cell mutation matrix, every new assertion has a production line whose
+  deletion reds it and only it.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/README.md,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/daemon/management.go,
+  pkg/daemon/README.md, pkg/daemon/hostname_stale_cert_6827_test.go

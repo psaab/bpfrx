@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // #6827: three defects in the #5719 stale-management-cert diagnostic, all of
@@ -58,10 +59,17 @@ func (l *stubLn) Accept() (net.Conn, error) { <-l.closed; return nil, net.ErrClo
 func (l *stubLn) Close() error              { close(l.closed); return nil }
 func (l *stubLn) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
 
-// newLeg builds a listenerLeg in the SERVING state: a listener installed, the
-// serve loop not exited, no retirement requested. Constructing it directly
-// (rather than binding a socket) keeps the test deterministic —
-// WarnStaleMgmtCertForHostName reads only the leg state and srv.
+// newLeg hand-builds a listenerLeg holding the field values serving() reports as
+// live: a listener installed, `dead` unset, `stopping` unset. It starts NO serve
+// goroutine and binds no socket — nothing is accepting connections on this leg,
+// and the flags are the test's own, not production's.
+//
+// That is deliberate, and it is why it may only be used to exercise the
+// certificate-selection half of WarnStaleMgmtCertForHostName, which reads just
+// leg state + srv. The flags themselves are set by serveLegLocked, and tests
+// that assert on THAT drive the real goroutine instead:
+// TestDrainFlagIsSetByTheRealServeGoroutine_6827 for `stopping`,
+// TestUnexpectedServeExitLeavesADeadInstalledLeg_6827 for `dead`.
 func newLeg(cert tls.Certificate, addr string) *listenerLeg {
 	return &listenerLeg{
 		srv: &http.Server{
@@ -73,11 +81,55 @@ func newLeg(cert tls.Certificate, addr string) *listenerLeg {
 	}
 }
 
-// legServing returns a Server whose LIVE HTTPS leg serves cert at addr.
+// legServing returns a Server whose HTTPS leg carries cert at addr in the
+// hand-built state newLeg describes (installed and flagged live; no serve
+// goroutine).
 func legServing(cert tls.Certificate, addr string) *Server {
 	s := &Server{}
 	s.httpsLeg = newLeg(cert, addr)
 	return s
+}
+
+// errLn is a listener whose Accept fails PERMANENTLY, which is what drives the
+// production unexpected-serve-exit path: http.Server.Serve returns a
+// non-net.Error immediately (no retry), so serveLegLocked's serveErr arm runs
+// and marks the leg dead while leaving it installed.
+type errLn struct{}
+
+func (errLn) Accept() (net.Conn, error) { return nil, errors.New("listener terminated") }
+func (errLn) Close() error              { return nil }
+func (errLn) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8443} }
+
+// startWithDeadHTTPSLeg starts a Server whose HTTPS leg self-terminates, and
+// returns once the leg is INSTALLED and dead. Both facts are asserted here, so a
+// caller's later assertion cannot be satisfied by a leg that was never installed
+// at all (the state a failed BIND leaves, which is a different case).
+func startWithDeadHTTPSLeg(t *testing.T, cert tls.Certificate, addr string) (*Server, context.CancelFunc) {
+	t.Helper()
+	s := &Server{listen: func(network, a string) (net.Listener, error) { return errLn{}, nil }}
+	s.httpsServer = &http.Server{
+		Addr:      addr,
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := s.Start(ctx); err != nil {
+		cancel()
+		t.Fatalf("start: %v", err)
+	}
+	if s.httpsLeg == nil {
+		cancel()
+		t.Fatal("precondition: the listen call SUCCEEDED, so the leg must be installed — " +
+			"a test about a dead installed leg must not silently become a test about a failed bind")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !s.httpsLeg.dead.Load() {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the serve goroutine did not mark the leg dead after a permanent Accept failure")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return s, cancel
 }
 
 const (
@@ -87,63 +139,95 @@ const (
 )
 
 // TestLoadedCertWithoutSANsWarns_6827 is a FAIL-ON-REVERT guard for the SILENT
-// no-SAN certificate (#6827).
+// no-SAN certificate (#6827), in two subtests that deliberately differ ONLY in
+// the management identities in play — because the two halves of the check are
+// observable on DIFFERENT fixtures and one fixture cannot see both.
 //
 // Both per-identity predicates gate out loopback and "localhost" on the premise
 // that "the durable cert always carries the loopback SANs". That premise holds
 // for a cert THIS build minted, but the load path takes whatever is on disk: a
 // pair persisted by an older build (or placed by an operator) can carry no SAN
-// extension at all. With a CN-only cert, hostname `localhost` and bind
-// 127.0.0.1, bindHostWarnable and hostnameSANWarnable are BOTH false, so the old
-// code returned before it ever parsed the leaf — total silence on the most
-// broken certificate possible, while every modern client rejects it for
-// `https://localhost` AND `https://127.0.0.1` (CN is not consulted without a
-// SAN).
-//
-// RED on revert: drop the warnCertNoSANs call from warnStaleLoadedCert (or make
-// certHasNoSANs always return false) and the load emits nothing.
+// extension at all.
 func TestLoadedCertWithoutSANsWarns_6827(t *testing.T) {
-	resetTLSSeams(t)
-	tlsHostname = func() (string, error) { return "localhost", nil }
-	dir, certPath, keyPath := tlsPaths(t)
-
-	// Seed a CN-only pair (genPair carries no DNSNames/IPAddresses at all) so the
-	// load path finds a usable-but-SAN-less certificate on disk.
-	certPEM, keyPEM := genPair(t)
-	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	out := captureWarn(t, func() {
-		cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, "127.0.0.1")
-		if err != nil {
-			t.Fatalf("load: %v", err)
+	// loadSANLessAs seeds a CN-only pair (genPair carries no DNSNames/IPAddresses
+	// at all) so the load path finds a usable-but-SAN-less certificate on disk,
+	// then LOADS it under hostName/bindHost and returns what the load logged.
+	loadSANLessAs := func(t *testing.T, hostName, bindHost string) string {
+		t.Helper()
+		resetTLSSeams(t)
+		tlsHostname = func() (string, error) { return hostName, nil }
+		dir, certPath, keyPath := tlsPaths(t)
+		certPEM, keyPEM := genPair(t)
+		if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+			t.Fatal(err)
 		}
-		leaf, perr := x509.ParseCertificate(cert.Certificate[0])
-		if perr != nil {
-			t.Fatalf("parse: %v", perr)
+		if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+			t.Fatal(err)
 		}
-		// Precondition: the seeded pair was LOADED as-is, not re-minted (a
-		// re-mint would add the loopback SANs and make the case vacuous). Read
-		// the leaf directly rather than through certHasNoSANs — the predicate is
-		// part of what this test pins, so routing the precondition through it
-		// would report a fixture failure when the predicate is what broke.
-		if len(leaf.DNSNames) != 0 || len(leaf.IPAddresses) != 0 {
-			t.Fatalf("fixture re-minted: DNS %v IP %v", leaf.DNSNames, leaf.IPAddresses)
+		return captureWarn(t, func() {
+			cert, err := generateSelfSignedCertAt(dir, certPath, keyPath, bindHost)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			leaf, perr := x509.ParseCertificate(cert.Certificate[0])
+			if perr != nil {
+				t.Fatalf("parse: %v", perr)
+			}
+			// Precondition: the seeded pair was LOADED as-is, not re-minted (a
+			// re-mint would add the loopback SANs and make the case vacuous). Read
+			// the leaf directly rather than through certHasNoSANs — the predicate is
+			// part of what this test pins, so routing the precondition through it
+			// would report a fixture failure when the predicate is what broke.
+			if len(leaf.DNSNames) != 0 || len(leaf.IPAddresses) != 0 {
+				t.Fatalf("fixture re-minted: DNS %v IP %v", leaf.DNSNames, leaf.IPAddresses)
+			}
+		})
+	}
+
+	t.Run("loopback_only_identities_are_still_diagnosed", func(t *testing.T) {
+		// The REACH half. With hostname `localhost` and bind 127.0.0.1,
+		// bindHostWarnable and hostnameSANWarnable are BOTH false, so the old code
+		// returned before it ever parsed the leaf — total silence on the most
+		// broken certificate possible, while every modern client rejects it for
+		// `https://localhost` AND `https://127.0.0.1` (CN is not consulted without
+		// a SAN). Only warnCertNoSANs can speak here, which is what makes this
+		// fixture the one that proves the check ADDS reach.
+		//
+		// RED on revert: drop the warnCertNoSANs call from warnStaleLoadedCert (or
+		// make certHasNoSANs always return false) and the load emits NOTHING AT
+		// ALL.
+		out := loadSANLessAs(t, "localhost", "127.0.0.1")
+		if !strings.Contains(out, noSANMsg) {
+			t.Fatalf("a SAN-less management cert must be diagnosed; got log %q", out)
 		}
 	})
 
-	if !strings.Contains(out, noSANMsg) {
-		t.Fatalf("a SAN-less management cert must be diagnosed; got log %q", out)
-	}
-	// Terminal: the per-identity lines would each report "does not cover X" for a
-	// cert that covers no X whatsoever, burying the finding under symptoms.
-	if strings.Contains(out, hostNameMsg) || strings.Contains(out, bindHostMsg) {
-		t.Fatalf("the no-SAN diagnostic must be terminal, not accompanied by per-identity lines; got %q", out)
-	}
+	t.Run("the_no_san_diagnostic_is_terminal", func(t *testing.T) {
+		// The TERMINAL half, and it needs a fixture with a warnable identity —
+		// which the loopback one above is not (#6827 round 6). Keeping only its
+		// `return` under test there was vacuous: with `localhost` / 127.0.0.1 both
+		// downstream predicates decline independently, so deleting the `return`
+		// changed nothing observable and the terminality assertion could not fail.
+		//
+		// A NON-loopback bind can be reported, so here the two arms genuinely
+		// compete. (The host-name line stays silent even on the revert, and
+		// unavoidably so: warnStaleHostName's inferred heuristic needs a
+		// shape-matching DNS SAN, which a SAN-less leaf cannot have. So the bind
+		// host is the only per-identity line a SAN-less cert can ever produce on
+		// the load path, and it is the discriminator here.)
+		//
+		// RED on revert: keep warnCertNoSANs but delete its `return` in
+		// warnStaleLoadedCert and the bind-host line joins the no-SAN line.
+		out := loadSANLessAs(t, "no-san-fw-6827", "10.0.0.1")
+		if !strings.Contains(out, noSANMsg) {
+			t.Fatalf("a SAN-less management cert must be diagnosed; got log %q", out)
+		}
+		if strings.Contains(out, hostNameMsg) || strings.Contains(out, bindHostMsg) {
+			t.Fatalf("the no-SAN diagnostic must be terminal — the per-identity lines would each "+
+				"report \"does not cover X\" for a cert that covers no X whatsoever, burying the "+
+				"finding under symptoms; got %q", out)
+		}
+	})
 }
 
 // TestUnusedKernelHostNameIsSilent_6827 is the FALSE-POSITIVE guard, and its two
@@ -468,11 +552,23 @@ func TestDrainFlagIsSetByTheRealServeGoroutine_6827(t *testing.T) {
 }
 
 // TestHTTPSBindFailureIsNotReportedAsServing_6827 pins the #6827-round-5
-// finding that Start() returns SUCCESS when the HTTPS bind fails. A caller that
-// reads only the error concludes HTTPS is up; HTTPSServing is the honest signal.
+// finding that Start() returns SUCCESS when the HTTPS bind fails: HTTPS is
+// best-effort at boot, so a bind failure must leave the HTTP plane up rather
+// than fail the whole start. A caller that reads only the error therefore
+// cannot conclude HTTPS is up, which is what HTTPSServing exists to answer.
 //
-// RED on revert: make HTTPSServing return a bare `s.httpsLeg != nil`, or have
-// it ignore the bind outcome, and a failed bind reports as serving.
+// RED on revert: make Start return the HTTPS bind error and the first assertion
+// fails.
+//
+// What this does NOT bind is the SHAPE of the HTTPSServing predicate (#6827
+// round 6). The comment here used to claim a bare `s.httpsLeg != nil` would
+// report a failed bind as serving; it would not, because ReconcileHTTPS/Start
+// install a leg only AFTER the listen call succeeds, so this path leaves the
+// pointer nil under every implementation and the second assertion holds
+// vacuously. It is kept as the honest negative — nothing serving after a failed
+// bind — and the predicate's two real clauses are bound where an INSTALLED leg
+// is not serving: `stopping` by TestDrainFlagIsSetByTheRealServeGoroutine_6827,
+// `dead` by TestUnexpectedServeExitLeavesADeadInstalledLeg_6827.
 func TestHTTPSBindFailureIsNotReportedAsServing_6827(t *testing.T) {
 	cert := mintCert(t, "old-fw", "10.0.0.1")
 	s := &Server{listen: func(network, addr string) (net.Listener, error) {
@@ -487,7 +583,89 @@ func TestHTTPSBindFailureIsNotReportedAsServing_6827(t *testing.T) {
 	if err := s.Start(ctx); err != nil {
 		t.Fatalf("Start must stay best-effort for HTTPS and return nil, got %v", err)
 	}
+	if s.httpsLeg != nil {
+		t.Fatal("precondition: a failed bind must install NO leg — if it ever installs one, " +
+			"this test silently becomes a test about an installed leg and the assertion below " +
+			"stops being vacuous by accident rather than by design")
+	}
 	if s.HTTPSServing() {
 		t.Fatal("a failed HTTPS bind must not report as serving (#6827 round 5)")
+	}
+}
+
+// TestUnexpectedServeExitLeavesADeadInstalledLeg_6827 binds the `dead` clause of
+// listenerLeg.serving() on the state production actually produces: the serve
+// loop exits on its own, sets `dead`, and the leg stays INSTALLED in s.httpsLeg
+// (it cannot be removed there — that would need lifeMu, which deadlocks a
+// shutdown racing the exit, #6401 round 3).
+//
+// The flag is set by serveLegLocked, not by the test, so this is the complement
+// of the hand-built subtests in TestWarnStaleMgmtCertForHostName_6827 — those
+// store `dead` themselves and stay green if production stops setting it.
+//
+// RED on revert: delete `leg.dead.Store(true)` from serveLegLocked's serveErr
+// arm, or drop `!l.dead.Load()` from serving(), and a leg whose socket is gone
+// reports as serving and gets diagnosed.
+func TestUnexpectedServeExitLeavesADeadInstalledLeg_6827(t *testing.T) {
+	s, cancel := startWithDeadHTTPSLeg(t, mintCert(t, "old-fw", "10.0.0.1"), "10.0.0.1:8443")
+	defer cancel()
+
+	if s.HTTPSServing() {
+		t.Fatal("a leg whose serve loop terminated unexpectedly is still INSTALLED, but no " +
+			"socket is behind it: HTTPSServing must report false")
+	}
+	out := captureWarn(t, func() {
+		if s.WarnStaleMgmtCertForHostName("new-fw") {
+			t.Error("a dead leg presents no certificate, so the question is UNanswered and the " +
+				"caller still owes the diagnosis")
+		}
+	})
+	if out != "" {
+		t.Fatalf("a dead leg must not be diagnosed; got %q", out)
+	}
+}
+
+// TestReconcileHTTPSReplacesADeadLeg_6827 is the FAIL-ON-REVERT guard for the
+// #6827-round-6 BLOCKER: a dead HTTPS leg was a permanent dead end.
+//
+// An unexpected serve exit leaves the leg installed with `dead` set. The
+// same-address no-op then read `s.httpsLeg != nil && addr matches` and returned
+// nil, so even a reconcile aimed directly at the configured address could not
+// rebind — HTTPS stayed down for the life of the process on an UNCHANGED
+// configuration, and with it every debt that can only be settled against a
+// served certificate (the host-name staleness diagnosis). Nothing short of a
+// restart escaped it.
+//
+// RED on revert: restore `case s.httpsLeg != nil && s.httpsLeg.srv.Addr == addr`
+// in ReconcileHTTPS and the reconcile returns nil having done nothing — the same
+// dead leg is still installed and HTTPSServing stays false.
+func TestReconcileHTTPSReplacesADeadLeg_6827(t *testing.T) {
+	const addr = "10.0.0.1:8443"
+	cert := mintCert(t, "old-fw", "10.0.0.1")
+	s, cancel := startWithDeadHTTPSLeg(t, cert, addr)
+	defer cancel()
+	dead := s.httpsLeg
+
+	// The address is UNCHANGED — this is the reconcile an operator's next commit
+	// makes on a configuration they never touched.
+	s.certGen = func(string) (tls.Certificate, error) { return cert, nil }
+	s.listen = func(network, a string) (net.Listener, error) { return newStubLn(), nil }
+	if err := s.ReconcileHTTPS(true, addr); err != nil {
+		t.Fatalf("reconcile over a dead leg: %v", err)
+	}
+
+	if s.httpsLeg == dead {
+		t.Fatal("the reconcile left the DEAD leg installed: a same-address call was treated as " +
+			"converged because the pointer was non-nil, so HTTPS can never come back without a " +
+			"daemon restart (#6827 round 6)")
+	}
+	if !s.HTTPSServing() {
+		t.Fatal("after a reconcile to the configured address the HTTPS leg must be serving again")
+	}
+	// The consequence that makes it a blocker rather than a cosmetic one: with a
+	// certificate served again, an outstanding diagnosis is deliverable.
+	if !s.WarnStaleMgmtCertForHostName("new-fw") {
+		t.Fatal("the replacement leg must present a certificate, so a pending host-name " +
+			"diagnosis can finally be discharged")
 	}
 }

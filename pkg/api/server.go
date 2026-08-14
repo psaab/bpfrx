@@ -1215,11 +1215,20 @@ const (
 //   - a box ALREADY drifted before this diagnostic shipped never had a commit
 //     to catch it;
 //   - on a box RUNNING this build, the commit's diagnosis is a PROCESS-LOCAL
-//     debt (Daemon.staleCertPending, pkg/daemon). A cross-shape rename
-//     committed while nothing was serving a certificate — HTTPS off, or its
-//     bind failed — is still owed when the daemon stops, and a restart
-//     discards it. Enabling `web-management https` afterwards then reaches only
-//     the load path, which declines the shape.
+//     debt (Daemon.staleCertPending, pkg/daemon), and a restart discards
+//     whatever is still owed. A cross-shape rename reaches that restart
+//     undelivered whenever no delivery between the rename and the shutdown
+//     found a served certificate. The ways in are more than the obvious one and
+//     worth naming, because each is an ordinary configuration rather than a
+//     fault: HTTPS disabled; its bind failed; the HTTPS serve loop terminated
+//     and no later commit rebuilt it (the rebuild itself is #6827 round 6 — the
+//     dead leg used to be unrecoverable, so this was permanent rather than
+//     merely pending); the API disabled entirely (--api-addr empty, so there is
+//     no reconciler to deliver through); the boot HTTP start failed; the kernel
+//     name could not be read at any delivery; or startup aborted on a signal
+//     (#5807) after the phase-4 config apply but before the management server
+//     was built. Enabling `web-management https` after the restart then reaches
+//     only the load path, which declines the shape.
 //
 // So the gap needs a rename that crossed the qualified/unqualified boundary AND
 // either pre-dating drift or a debt that did not survive a restart. It is the
@@ -1351,8 +1360,15 @@ func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hos
 
 // WarnStaleMgmtCertForHostName re-runs the stale-certificate diagnostic against
 // the certificate the LIVE HTTPS leg is serving, for an EXPLICITLY supplied
-// kernel host name. Daemon.applyHostname calls it immediately after a successful
-// `set system host-name` (#6827).
+// kernel host name (#6827).
+//
+// A `set system host-name` commit reaches it through the daemon, but NOT
+// synchronously: Daemon.applyHostname records a debt and the daemon's delivery
+// path (noteStaleMgmtCertHostName → deliverStaleMgmtCertDiagnosis) makes the
+// call — at the rename when a certificate is already being served, and
+// otherwise at whichever later retry point first finds one. The name it passes
+// is read from the kernel at that moment, so this function is handed a live
+// identity rather than one captured at commit time.
 //
 // It exists because the load-path diagnostic could never see a rename. Two
 // independent reasons, and a fix for either alone is not enough:
@@ -1367,9 +1383,11 @@ func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hos
 //     the dataplane apply, so a credential revocation lands even on an aborting
 //     commit) while the kernel host name is set late, in the apply tail. So even
 //     a commit that DID change the HTTPS bind would have diagnosed the OLD
-//     kernel name. Taking the name as a parameter removes that hazard entirely:
-//     the caller passes the name it just applied, rather than this code racing
-//     os.Hostname() against the apply order.
+//     kernel name. Taking the name as a PARAMETER moves the read out of this
+//     function, which has no idea where in an apply it is running, and into the
+//     daemon, which does: it reads the kernel only after Sethostname has
+//     returned, and a delivery whose rename has since been superseded abandons
+//     before it gets here (pkg/daemon deliverStaleMgmtCertDiagnosis).
 //
 // It returns whether it actually reached a certificate — false means no live
 // HTTPS leg was serving, so the question could not be answered and the CALLER

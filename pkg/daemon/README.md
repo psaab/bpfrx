@@ -390,6 +390,22 @@ credential revocation is enforced even on an apply that returns early
     `ReconcileHTTPS` was never called again. `startTo` now adopts the server
     whether or not the bind succeeded, and asks `api.Server.HTTPSServing()`
     rather than inferring convergence from a nil error.
+  - **A converged fingerprint is not a live listener** (#6827 round 6). The
+    same inference failed in the STEADY state, not just at boot: an HTTPS serve
+    loop that terminates unexpectedly marks its leg `dead` and leaves it
+    INSTALLED (it cannot be unlinked there without taking `lifeMu`, which
+    deadlocks a shutdown racing the exit). The fingerprint still matched the
+    committed endpoint, so `reconcileTo`'s leg-changed test was false on every
+    later commit and `ReconcileHTTPS` was never called; and had it been called,
+    its same-address arm returned `nil` on a non-nil pointer. HTTPS was
+    therefore unrecoverable on an UNCHANGED configuration for the life of the
+    process — and with it any stale-cert diagnosis, which can only be
+    discharged against a served certificate. The HTTPS arm now also fires when
+    `next.TLS && !m.srv.HTTPSServing()`, and the api-side no-op tests
+    `listenerLeg.serving()` instead of the pointer. Pinned by
+    `TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827` (daemon, end to end from
+    `reconcileWebManagement`) and `TestReconcileHTTPSReplacesADeadLeg_6827`
+    (`pkg/api`).
 
   Pinned by `TestMgmtReconcileRevokeHonoredDespiteHTTPSBindFailure_5866`
   (revocation honored across a failing HTTPS rebind),
@@ -433,9 +449,12 @@ Three properties carry the mechanism:
   that). Clearing it whenever the delivery merely RAN loses the diagnosis
   permanently when HTTPS is off or its bind failed: the next boot's
   `applyHostname` sees the name already applied and returns early, and the load
-  path's inferred heuristic declines this shape by design. Delivery is retried
-  at the rename, at the boot management start, and on every web-management
-  reconcile (so a later `web-management https` enable settles an old debt). The
+  path's inferred heuristic declines a CROSS-SHAPE rename by design (a
+  shape-preserving one it would still catch, but only at the next certificate
+  load — a restart or an HTTPS rebind, not the commit). Delivery is attempted at
+  the rename itself and RETRIED at the boot management start and on every
+  web-management reconcile (so a later `web-management https` enable — or the
+  rebuild of an HTTPS leg whose serve loop died — settles an old debt). The
   two DEFERRED retry points are bound at their own call site by
   `TestDeferredDeliveryIsWiredAtItsRetryPoints_6827`, on deliberately different
   observables: the `reconcileWebManagement` one on the debt FLAG, because the
@@ -446,18 +465,30 @@ Three properties carry the mechanism:
   leg in-process — it constructs the `api.Server` itself and the cert-dir test
   seam exists only afterwards.
 - **The name is read from the kernel at DELIVERY**, never stored at rename time,
-  so a deferred diagnosis always describes the name the box has now and can
-  never replay an intermediate or long-past rename.
-- **The clear is generation-fenced.** The hostname read and the certificate
-  inspection run UNLOCKED, so `staleCertGen` is sampled before them and the
-  clear applies only if it still matches. A rename landing in that window (the
-  boot delivery runs on the `Run` goroutine outside `applySem`, while cluster
-  comms — started inside the phase-4 boot apply — can drive a peer `SyncApply`
-  into `applyHostname`) therefore survives instead of being settled by the older
-  delivery's evidence. Pinned by `TestDebtClearIsGenerationSafe_6827`, whose
-  second subtest is the negative control: with no concurrent rename the debt
-  MUST settle, so the fence is proven to narrow the clear rather than suppress
-  it.
+  so a deferred diagnosis is never the replay of a name captured at some earlier
+  commit. It is NOT a guarantee that the emitted name is the kernel's current
+  one: `Sethostname` moves the kernel name before `applyHostname` records the
+  new generation, so a delivery can legitimately read, validate and report a
+  name the kernel has just left. No generation-based fence can close that
+  window — it is the gap between the two, not the gap this fence covers.
+- **The delivery is generation-fenced, before it speaks.** The kernel read runs
+  unlocked; `staleCertGen` is sampled before it and RE-VALIDATED after it, under
+  `staleCertMu` held across the certificate inspection and the clear. A delivery
+  whose generation has been superseded abandons without warning and without
+  clearing — it must not settle a newer rename's debt with older evidence, and
+  must not emit a diagnosis naming a host name that a recorded rename has
+  already replaced (round 5 checked only on the clear side, after the warning
+  was already out). Nothing is lost: the newer rename's own
+  `noteStaleMgmtCertHostName` runs its own delivery. The race is reachable
+  because the boot delivery runs on the `Run` goroutine outside `applySem` while
+  cluster comms — started right after the mutating startup phases, before
+  `startHTTPServer` — can drive a peer `SyncApply` into `applyHostname`. Pinned
+  by `TestDebtClearIsGenerationSafe_6827`: one subtest supplies the competing
+  rename itself, one drives it through the production note path (so the
+  `staleCertGen++` is bound, not just the comparison), one is the negative
+  control where an unraced delivery MUST settle, and one pins the
+  unreadable-kernel-name guard that would otherwise discharge the debt with no
+  identity behind it.
 
 #### Effective-listener snapshot for `show system services` (#6385/#6401)
 
