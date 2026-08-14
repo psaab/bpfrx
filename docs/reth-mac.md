@@ -397,11 +397,54 @@ are now three renewal points, all through `Daemon.renewLinkCycleLease`:
 | `reconcileAfterRethLinkCycle` | netlink, one pass per redundancy group |
 | *(release: `NotifyLinkCycle`)* | its 1s NIC settle + one control round trip |
 
-The last two renewals are *unconditional* on whether the member cycled. Gating
-them on `needLinkCycleRecovery` would look harmless and would skip exactly the
-abort path, where `programRethMACWithWorkerJoin` took a lease and then returned
-`linkCycled=false`. Renewing unconditionally is safe because the renewal cannot
-create a lease.
+The last two renewals are *unconditional* on whether the member cycled, and that
+is safe because the renewal cannot create a lease.
+
+**It buys nothing on the abort path, and this table used to say it did (#6871
+round 15).** The claim was that gating on `needLinkCycleRecovery` "would skip
+exactly the abort path, where `programRethMACWithWorkerJoin` took a lease and
+then returned `linkCycled=false`". By the time these renewals run there is no
+lease on that path: the rollback calls `NotifyLinkCycle`, whose first act is
+`releaseLinkCycleLease`, and it does so *inside* the per-member loop — so the
+word is already `0` and `RenewLinkCycle` refuses to renew from the `0` sentinel.
+Whenever a lease is still held at those lines, `needLinkCycleRecovery` is true,
+so the gate would have been equivalent. Ungated is still the better shape: it
+does not depend on an accumulator staying in step with the lease. But the reason
+is "no gate is needed", not "the gate would lose a case".
+
+### The lease ends at the FIRST repair of the apply, not the last (#6871 round 15)
+
+`NotifyLinkCycle` releases unconditionally, and in a **mixed** multi-member apply
+— one member cycles, a later one aborts — the aborted member's in-loop rollback
+is the first `NotifyLinkCycle`, so it ends the lease while the cycled member's
+apply is still running. Everything after it (the remaining members' tails, both
+renewals above, and step 2.6b2's own `NotifyLinkCycle`) runs with the word at
+`0`, which makes those renewals no-ops.
+
+This is not fixed by refcounting acquisitions against releases, and it is worth
+saying why, because that is the obvious reading. They do not pair: an acquisition
+is per **member** (each member's `PrepareLinkCycle`), while a release is one per
+**repair** — one per aborted member's rollback, plus at most one for the whole
+apply at step 2.6b2, which sits *outside* the per-member loop and is gated on
+`needLinkCycleRecovery`. A two-member apply where **both** members cycle
+therefore takes two leases and issues exactly one release, so a refcount would
+leave the count at 1 on the most ordinary multi-member path, strand the lease
+until the deferred `abandonLinkCycleLease`, and make that backstop log its
+"apply is leaving with a lease still held" error on every such commit.
+
+What actually makes the early release safe is that a rebind is **helper-global**,
+not per member: `NotifyLinkCycle` recreates every worker with fresh sockets and
+re-enables ctrl, so the state the lease protects — a torn-down helper that a 1 Hz
+tick could repopulate — has been repaired for the cycled member too by the time
+the aborted member's rollback returns. Step 2.6b2's later rebind is then the
+redundant-but-safe double rebind described above.
+
+The residual, stated rather than left implicit: if the rollback's rebind
+**fails**, the lease has already been released (the release deliberately precedes
+every `return` in `NotifyLinkCycle`, including that one) and the helper is not
+repaired. That is the same trade already argued for the single-member case — a
+stranded lease on a path where forwarding is down would add a frozen reconcile
+loop to an outage in progress — and the commit fails on that path regardless.
 
 **Round 7's answer was still an estimate, and round 8 stopped estimating.** The
 round-7 claim — "exactly one interval contains the only term with a hard ceiling,

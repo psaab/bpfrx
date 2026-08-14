@@ -627,10 +627,23 @@ func (d *Daemon) finishRethMemberLinkTail(linuxName string, mac net.HardwareAddr
 // span from here to the release contains only that 1s sleep and one control
 // round trip.
 //
-// Renewing unconditionally is safe and deliberate: RenewLinkCycle cannot create a
-// lease, so an apply that cycled nothing is unaffected, and gating the renewal on
-// needLinkCycleRecovery would skip exactly the abort path — where the cycle DID
-// take a lease and then returned linkCycled=false.
+// Renewing unconditionally is safe: RenewLinkCycle cannot create a lease, so an
+// apply that cycled nothing is unaffected.
+//
+// It is not, however, load-bearing, and an earlier revision claimed it was
+// (#6871 round 15). That revision said gating on needLinkCycleRecovery "would
+// skip exactly the abort path — where the cycle DID take a lease and then
+// returned linkCycled=false". The abort path has no lease left to renew by the
+// time this runs: programRethMACWithWorkerJoin's rollback calls NotifyLinkCycle,
+// whose FIRST act is releaseLinkCycleLease, and that happens inside the
+// per-member loop above — so the word is already 0 here and RenewLinkCycle
+// refuses to renew from the 0 sentinel. Whenever a lease IS still held at this
+// line, needLinkCycleRecovery is true (the only way to take one and return
+// linkCycled=false is to fail after the join, which routes through that same
+// rollback), so the gate the ungating was defending against would have been
+// equivalent. Ungated is still the right shape — it does not depend on an
+// accumulator staying in sync with the lease — but the reason is "no gate is
+// needed", not "the gate would lose the abort path".
 func (d *Daemon) reconcileAfterRethLinkCycle(cfg *config.Config, needLinkCycleRecovery bool) {
 	if needLinkCycleRecovery && d.isNoRethVRRP() {
 		// Direct mode: re-add VIPs + stable link-locals for each RG

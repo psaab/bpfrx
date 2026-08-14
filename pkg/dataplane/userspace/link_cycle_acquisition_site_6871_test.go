@@ -63,30 +63,46 @@ import (
 // (Daemon -> dp.Link() -> userspaceLinkController -> Manager, or via
 // LegacyDataPlaneAdapter). They are listed rather than pattern-excluded so that
 // moving the chain shows up here as a diff rather than as silence.
-var linkCycleAcquisitionSites = map[string]string{
+var linkCycleAcquisitionSites = map[string]acquisitionSite{
 	"pkg/daemon/daemon_apply_dataplane.go:(*Daemon).programRethMACWithWorkerJoin: " +
-		"d.dp.Link().PrepareLinkCycle [in a func literal]": "" +
+		"d.dp.Link().PrepareLinkCycle [in a func literal beforeCycle]": {occurrences: 1, reason: "" +
 		"the ONLY production acquisition site. It sits inside step 2.6 of " +
 		"applyDataplaneAndHACore, which defers abandonLinkCycleLease over its whole " +
 		"body — but it is written in the beforeCycle CALLBACK, so being inside that " +
 		"defer is a property of programRethMAC invoking the callback synchronously, " +
 		"which no AST fact establishes. The proof is behavioural and lives in the " +
-		"test named by linkCycleUnprovenFormBindings",
+		"test named by linkCycleUnprovenFormBindings"},
 	"pkg/dataplane/userspace/controllers.go:(userspaceLinkController).PrepareLinkCycle: " +
-		"c.manager.PrepareLinkCycle": "" +
-		"adapter hop: userspaceLinkController forwards to Manager",
+		"c.manager.PrepareLinkCycle": {occurrences: 1, reason: "" +
+		"adapter hop: userspaceLinkController forwards to Manager"},
 	"pkg/dataplane/userspace/legacy_dataplane.go:(*LegacyDataPlaneAdapter).PrepareLinkCycle: " +
-		"m.PrepareLinkCycle": "" +
-		"adapter hop: LegacyDataPlaneAdapter forwards to Manager",
+		"m.PrepareLinkCycle": {occurrences: 1, reason: "" +
+		"adapter hop: LegacyDataPlaneAdapter forwards to Manager"},
 }
 
 // linkCycleInPackageAcquisitionSites is the same allowlist for the in-package
 // guard below, whose subject is the unexported acquireLinkCycleLease.
-var linkCycleInPackageAcquisitionSites = map[string]string{
-	"process_linkcycle.go:(*Manager).PrepareLinkCycle: m.acquireLinkCycleLease": "" +
+var linkCycleInPackageAcquisitionSites = map[string]acquisitionSite{
+	"process_linkcycle.go:(*Manager).PrepareLinkCycle: m.acquireLinkCycleLease": {occurrences: 1, reason: "" +
 		"the one in-package acquisition, in ordinary statement flow: reaching it " +
 		"requires PrepareLinkCycle to be running and it returns before PrepareLinkCycle " +
-		"does, so the daemon's deferred abandon covers it",
+		"does, so the daemon's deferred abandon covers it"},
+}
+
+// acquisitionSite is one allowlist entry.
+//
+// occurrences is asserted, not decorative (#6871 round 15). A map keyed on
+// anything at all collapses duplicates, and the duplicate that matters here is a
+// SECOND escaping call written in the declaration the allowlist permits ONE call
+// in. Recording occurrences and checking the number is what makes the container
+// unable to hide it; the key alone never can, whatever the key is made of.
+//
+// A count above 1 is legitimate — two branches of one function can both take a
+// lease — but it has to be written down, because "two calls where the allowlist
+// remembers one" is otherwise indistinguishable from the escape.
+type acquisitionSite struct {
+	occurrences int
+	reason      string
 }
 
 // linkCycleUnprovenFormBindings names, for every allowlisted site whose FORM the
@@ -102,7 +118,7 @@ var linkCycleInPackageAcquisitionSites = map[string]string{
 // same way — by the test being renamed or deleted somewhere else entirely.
 var linkCycleUnprovenFormBindings = map[string]string{
 	"pkg/daemon/daemon_apply_dataplane.go:(*Daemon).programRethMACWithWorkerJoin: " +
-		"d.dp.Link().PrepareLinkCycle [in a func literal]": "" +
+		"d.dp.Link().PrepareLinkCycle [in a func literal beforeCycle]": "" +
 		"TestRethMACHookRunsOnTheCallersGoroutine_6871",
 }
 
@@ -187,17 +203,83 @@ func declSiteKey(d *ast.FuncDecl) string {
 //	         and invoked from anywhere, at any time, by anyone. The enclosing
 //	         declaration bounds nothing, so there is no key that could honestly
 //	         file it, and it is reported as a violation on its own.
+//
+// Both fields hold every OCCURRENCE, not a set of keys. A map[string]bool
+// merges two references that render the same key, and "two escaping literals in
+// the declaration that is allowed one call" is exactly what that looks like
+// (#6871 round 15) — measured, as a second d.dp.Link().PrepareLinkCycle()
+// literal planted in programRethMACWithWorkerJoin plus an invoker outside the
+// apply, compiling with the whole suite green. So the key answers WHICH site and
+// the slice answers HOW MANY, and the guards assert both.
 type methodRefs struct {
-	calls   map[string]bool // see refKey
-	escapes []string        // "<relpath>:<line>: <expr> in <enclosing decl>"
+	calls   map[string][]string // refKey -> every "<relpath>:<line>" that produced it
+	escapes []string            // "<relpath>:<line>: <expr> in <enclosing decl>"
 }
 
 // The form markers. They appear in a call's key, so a form the AST cannot prove
 // temporally contained can never land on the same key as one it can.
+//
+// markFuncLit is a PREFIX: it is closed either bare or with the literal's label
+// (see funcLitMark). markGo is complete — a go statement has nothing to name.
 const (
-	markFuncLit = "[in a func literal]"
+	markFuncLit = "[in a func literal"
 	markGo      = "[started by a go statement]"
 )
+
+// funcLitMark renders the func-literal marker for the literal at chain[j],
+// naming it when the source does.
+//
+// WHY THE LABEL (#6871 round 15). Two distinct literals in one declaration, both
+// calling the same selector, produce the same key without it — and a key is what
+// the allowlist matches, so replacing the real closure with a different escaping
+// one would keep the entry satisfied. The label is the thing that is genuinely
+// per-occurrence and does NOT churn: the assignment target ("beforeCycle") is
+// stable across every edit that moves the call, which a file:line position is
+// not.
+//
+// It is a refinement, NOT the fix on its own, and this distinction is the whole
+// lesson of the round: round 13 keyed on the method NAME and collided on names;
+// round 14 replaced that with the selector's SOURCE TEXT and inherited a
+// different collision, because source text is not unique either. Swapping one
+// colliding key for another only moves the collision domain. What makes this
+// sound is that methodRefs.calls now records every OCCURRENCE and the guards
+// assert the count, so a collision this label does not resolve — two anonymous
+// literals, or two assignments to the same name — is reported rather than
+// silently merged.
+func funcLitMark(chain []ast.Node, j int) string {
+	if label := funcLitLabel(chain, j); label != "" {
+		return markFuncLit + " " + label + "]"
+	}
+	return markFuncLit + "]"
+}
+
+// funcLitLabel names the func literal at chain[j] from what the source binds it
+// to, and returns "" when nothing does (an inline argument, a return value).
+func funcLitLabel(chain []ast.Node, j int) string {
+	if j == 0 {
+		return ""
+	}
+	lit := chain[j]
+	switch p := chain[j-1].(type) {
+	case *ast.AssignStmt:
+		for i, rhs := range p.Rhs {
+			if ast.Node(rhs) == lit && i < len(p.Lhs) {
+				return types.ExprString(p.Lhs[i])
+			}
+		}
+	case *ast.ValueSpec:
+		for i, v := range p.Values {
+			if ast.Node(v) == lit && i < len(p.Names) {
+				return p.Names[i].Name
+			}
+		}
+	case *ast.KeyValueExpr:
+		if ast.Node(p.Value) == lit {
+			return types.ExprString(p.Key)
+		}
+	}
+	return ""
+}
 
 // refKey names one reference: where it is written, and — for a call — how.
 //
@@ -341,7 +423,7 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 		}
 		litCall, litIdx, invoked := invokedBy(chain, j)
 		if !invoked {
-			add(markFuncLit)
+			add(funcLitMark(chain, j))
 			continue
 		}
 		if litIdx > 0 {
@@ -400,7 +482,7 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 // literal and has no SelectorExpr at all. See declSiteKey.
 func callSitesOf(t *testing.T, root, method string) methodRefs {
 	t.Helper()
-	refs := methodRefs{calls: map[string]bool{}}
+	refs := methodRefs{calls: map[string][]string{}}
 	fset := token.NewFileSet()
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -442,11 +524,13 @@ func callSitesOf(t *testing.T, root, method string) methodRefs {
 					full := make([]ast.Node, len(chain)+1)
 					copy(full, chain)
 					full[len(chain)] = sel
+					at := fmt.Sprintf("%s:%d", rel, fset.Position(sel.Pos()).Line)
 					if marks, isCall := classifyRef(full); isCall {
-						refs.calls[refKey(rel, where, sel, marks)] = true
+						key := refKey(rel, where, sel, marks)
+						refs.calls[key] = append(refs.calls[key], at)
 					} else {
-						refs.escapes = append(refs.escapes, fmt.Sprintf("%s:%d: %s in %s",
-							rel, fset.Position(sel.Pos()).Line, types.ExprString(sel), where))
+						refs.escapes = append(refs.escapes, fmt.Sprintf("%s: %s in %s",
+							at, types.ExprString(sel), where))
 					}
 				}
 				chain = append(chain, n)
@@ -549,7 +633,7 @@ func testFuncNamed(t *testing.T, root, name string) bool {
 //
 // Without the third check this file would ship the exact defect it was written
 // to correct — a reason asserting a proof that has since been renamed away.
-func requireUnprovenFormsAreBound(t *testing.T, root string, sites map[string]string) {
+func requireUnprovenFormsAreBound(t *testing.T, root string, sites map[string]acquisitionSite) {
 	t.Helper()
 	for key := range sites {
 		// The markers themselves, not "contains a bracket": a selector's source
@@ -589,6 +673,52 @@ func requireUnprovenFormsAreBound(t *testing.T, root string, sites map[string]st
 	}
 }
 
+// compareToAllowlist reports the three ways a scan can disagree with an
+// allowlist, and the third is the one round 14 could not express (#6871 round
+// 15): a key present in both, at a DIFFERENT NUMBER of sites than the entry
+// records. Round 14 stored calls in a map[string]bool, so a second call
+// rendering the same key merged into the first and the disagreement had no way
+// to be seen — which is how a second escaping literal in the allowlisted
+// declaration passed.
+func compareToAllowlist(got map[string][]string, allow map[string]acquisitionSite) (added, removed, miscounted []string) {
+	for key, at := range got {
+		site, ok := allow[key]
+		if !ok {
+			added = append(added, key)
+			continue
+		}
+		if len(at) != site.occurrences {
+			miscounted = append(miscounted, fmt.Sprintf(
+				"%s: %d occurrence(s) at %v, allowlist records %d", key, len(at), at, site.occurrences))
+		}
+	}
+	for key := range allow {
+		if _, ok := got[key]; !ok {
+			removed = append(removed, key)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
+	sort.Strings(miscounted)
+	return added, removed, miscounted
+}
+
+// reportAcquisitionMiscounts fails when a site is written more times than the
+// allowlist accounts for, naming each position.
+func reportAcquisitionMiscounts(t *testing.T, method string, miscounted []string) {
+	t.Helper()
+	if len(miscounted) == 0 {
+		return
+	}
+	t.Errorf("%s is called a different number of times than the allowlist records: %v.\n"+
+		"An allowlist entry permits a specific number of acquisitions at a site, not a "+
+		"name that may appear any number of times. A SECOND call in a declaration that "+
+		"is allowed one is the escape this check exists for — it renders the same key as "+
+		"the legitimate one, so nothing about the key could distinguish them. If the "+
+		"extra call is genuinely inside a guaranteed release, raise the entry's "+
+		"occurrences and say why each one is.", method, miscounted)
+}
+
 // TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871 is the guard the TTL
 // comment names. It is tree-wide on purpose: LinkController lives in
 // pkg/dataplane and any package in the module can hold one.
@@ -611,19 +741,8 @@ func TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871(t *testing.T) {
 	}
 	reportLeaseRefEscapes(t, "PrepareLinkCycle", refs.escapes)
 
-	var added, removed []string
-	for site := range got {
-		if _, ok := linkCycleAcquisitionSites[site]; !ok {
-			added = append(added, site)
-		}
-	}
-	for site := range linkCycleAcquisitionSites {
-		if !got[site] {
-			removed = append(removed, site)
-		}
-	}
-	sort.Strings(added)
-	sort.Strings(removed)
+	added, removed, miscounted := compareToAllowlist(got, linkCycleAcquisitionSites)
+	reportAcquisitionMiscounts(t, "PrepareLinkCycle", miscounted)
 
 	if len(added) > 0 {
 		t.Errorf("NEW PrepareLinkCycle call site(s), not on the allowlist: %v.\n"+
@@ -633,7 +752,7 @@ func TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871(t *testing.T) {
 			"safe is not the TTL — it is that applyDataplaneAndHACore defers "+
 			"abandonLinkCycleLease over the whole extent that can take one. Confirm the "+
 			"new site is inside a guaranteed release, then add it here with the reason. "+
-			"A key carrying %s or %s says the call is only written in that declaration "+
+			"A key carrying %s] or %s says the call is only written in that declaration "+
 			"and may run after it has returned — that one needs a behavioural proof in "+
 			"linkCycleUnprovenFormBindings, not a sentence.",
 			added, markFuncLit, markGo)
@@ -667,20 +786,14 @@ func TestLinkCycleLeaseIsAcquiredOnlyByPrepare_6871(t *testing.T) {
 	got := refs.calls
 	requireUnprovenFormsAreBound(t, repoRootFromPackage(t), linkCycleInPackageAcquisitionSites)
 
-	want := linkCycleInPackageAcquisitionSites
-	var unexpected []string
-	for site := range got {
-		if _, ok := want[site]; !ok {
-			unexpected = append(unexpected, site)
-		}
-	}
-	sort.Strings(unexpected)
+	unexpected, missing, miscounted := compareToAllowlist(got, linkCycleInPackageAcquisitionSites)
 
 	if len(got)+len(refs.escapes) == 0 {
 		t.Fatal("found ZERO acquireLinkCycleLease references in this package; the scan is " +
 			"broken and this guard proves nothing")
 	}
 	reportLeaseRefEscapes(t, "acquireLinkCycleLease", refs.escapes)
+	reportAcquisitionMiscounts(t, "acquireLinkCycleLease", miscounted)
 	if len(unexpected) > 0 {
 		t.Errorf("link-cycle lease acquired outside PrepareLinkCycle: %v. Callers outside "+
 			"this package are funnelled through PrepareLinkCycle, whose one production "+
@@ -688,11 +801,9 @@ func TestLinkCycleLeaseIsAcquiredOnlyByPrepare_6871(t *testing.T) {
 			"has no such guarantee, and a self-renewing lease that is never released "+
 			"suppresses the reconcile loop permanently", unexpected)
 	}
-	for site := range want {
-		if !got[site] {
-			t.Errorf("PrepareLinkCycle no longer acquires the lease (%s not found). Either "+
-				"the acquisition moved — in which case this guard now constrains nothing — "+
-				"or the lease is not being taken at all", site)
-		}
+	for _, site := range missing {
+		t.Errorf("PrepareLinkCycle no longer acquires the lease (%s not found). Either "+
+			"the acquisition moved — in which case this guard now constrains nothing — "+
+			"or the lease is not being taken at all", site)
 	}
 }

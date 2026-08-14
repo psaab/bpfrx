@@ -4,6 +4,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -20,7 +23,9 @@ import (
 // SCOPE, stated rather than implied — and this canary is deliberately SMALLER
 // than it was in #5103 r4.
 //
-// It asserts three call-shape claims about pkg/daemon/daemon_apply_dataplane.go:
+// It asserts three call-shape claims about PACKAGE DAEMON — every non-test file,
+// derived from the directory, not one named file (#6871 round 15; see
+// packageGoFiles for the escape that forced the widening):
 //
 //  1. exactly one programRethMAC call site, taking 3 args, the third not the
 //     literal `nil` (the hook is really passed);
@@ -53,17 +58,94 @@ import (
 // silent drop has to be a deliberate control-flow edit rather than a plausible
 // refactor.
 func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
-	const file = "daemon_apply_dataplane.go"
+	files := packageGoFiles(t)
 
 	fset := token.NewFileSet()
-	f, err := parser.ParseFile(fset, file, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", file, err)
-	}
-
 	calls := 0
 	wrapperCalls := 0
 	memberCalls := 0
+	for _, file := range files {
+		f, err := parser.ParseFile(fset, file, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		countRethCallSites(t, fset, file, f, &calls, &wrapperCalls, &memberCalls)
+	}
+	const where = "package daemon"
+	// Guard the guard: a rename or a move would otherwise make this pass by
+	// finding nothing to check.
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 programRethMAC call site in %s, found %d — this canary "+
+			"is keyed to that call site and is not checking anything otherwise", where, calls)
+	}
+	// The apply loop must go through the wrapper, not around it: calling
+	// programRethMAC directly from the loop would keep the hook and lose the
+	// rollback of an aborted cycle (#5103 F4), with every behavioural test in
+	// reth_prepare_abort_recovery_5103_test.go still green because they drive
+	// the wrapper. Exactly one call also means the wrapper has exactly one
+	// consumer — programRethMemberMAC — so the loop cannot bypass the fold by
+	// calling the wrapper itself.
+	if wrapperCalls != 1 {
+		t.Fatalf("expected exactly 1 programRethMACWithWorkerJoin call site in %s, found %d",
+			where, wrapperCalls)
+	}
+	if memberCalls != 1 {
+		t.Fatalf("expected exactly 1 programRethMemberMAC call site in %s, found %d — the "+
+			"per-member fold of the commit error and the rebind gate (#5103, bound "+
+			"behaviourally by reth_commit_fold_5103_test.go) is reached from nowhere else",
+			where, memberCalls)
+	}
+}
+
+// packageGoFiles lists this package's non-test Go files, DERIVED from the
+// directory rather than named (#6871 round 15).
+//
+// The three counts above are "exactly one call site". Round 14 asked that
+// question of one file, so it answered a narrower one — "exactly one in
+// daemon_apply_dataplane.go" — and a second caller written in any sibling file
+// of the same package was invisible. Measured: a
+// reassertRethMemberMACOnRGTransition calling programRethMACWithWorkerJoin,
+// appended to daemon_reth.go, kept the whole suite green; the identical function
+// appended to the parsed file failed with "found 2".
+//
+// That is not a hazard the count merely fails to notice. The wrapper's success
+// path returns without NotifyLinkCycle — step 2.6b2 owns the release — so a
+// caller outside applyDataplaneAndHACore acquires a lease that nothing releases,
+// and since round 8 the heartbeat re-arms it forever: the reconcile stays
+// suppressed for the life of the process.
+//
+// PACKAGE SCOPE IS COMPLETE HERE, and that is an argument rather than a
+// convenience. All three functions are unexported, so the set of possible
+// callers is exactly this package — no wider walk can find one that this misses.
+// Compare linkCycleAcquisitionSites, whose subject (PrepareLinkCycle) IS
+// exported and therefore needs the module-wide walk it does.
+func packageGoFiles(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		files = append(files, name)
+	}
+	if len(files) == 0 {
+		t.Fatal("no non-test Go files found in the package directory; this canary would " +
+			"count zero call sites and fail for the wrong reason")
+	}
+	sort.Strings(files)
+	return files
+}
+
+// countRethCallSites accumulates the three call-site counts for one file, and
+// checks the two claims that are about a call's SHAPE rather than its number.
+func countRethCallSites(t *testing.T, fset *token.FileSet, file string, f *ast.File,
+	calls, wrapperCalls, memberCalls *int) {
+	t.Helper()
 	// stack tracks the enclosing nodes so the member call site can be tested for
 	// reachability, not merely for existence.
 	var stack []ast.Node
@@ -81,9 +163,9 @@ func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
 			switch sel.Sel.Name {
 			case "programRethMACWithWorkerJoin":
-				wrapperCalls++
+				*wrapperCalls++
 			case "programRethMemberMAC":
-				memberCalls++
+				*memberCalls++
 				checkRethMemberCallSite(t, fset, file, call, stack)
 			}
 			return true
@@ -92,7 +174,7 @@ func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
 		if !ok || id.Name != "programRethMAC" {
 			return true
 		}
-		calls++
+		*calls++
 		if len(call.Args) != 3 {
 			t.Errorf("%s:%d: programRethMAC called with %d args, want 3 — the third is the "+
 				"beforeCycle worker-join hook (#5103)",
@@ -107,30 +189,6 @@ func TestDaemonPassesRethBeforeCycleHook_5103(t *testing.T) {
 		}
 		return true
 	})
-
-	// Guard the guard: a rename or a move would otherwise make this pass by
-	// finding nothing to check.
-	if calls != 1 {
-		t.Fatalf("expected exactly 1 programRethMAC call site in %s, found %d — this canary "+
-			"is keyed to that call site and is not checking anything otherwise", file, calls)
-	}
-	// The apply loop must go through the wrapper, not around it: calling
-	// programRethMAC directly from the loop would keep the hook and lose the
-	// rollback of an aborted cycle (#5103 F4), with every behavioural test in
-	// reth_prepare_abort_recovery_5103_test.go still green because they drive
-	// the wrapper. Exactly one call also means the wrapper has exactly one
-	// consumer — programRethMemberMAC — so the loop cannot bypass the fold by
-	// calling the wrapper itself.
-	if wrapperCalls != 1 {
-		t.Fatalf("expected exactly 1 programRethMACWithWorkerJoin call site in %s, found %d",
-			file, wrapperCalls)
-	}
-	if memberCalls != 1 {
-		t.Fatalf("expected exactly 1 programRethMemberMAC call site in %s, found %d — the "+
-			"per-member fold of the commit error and the rebind gate (#5103, bound "+
-			"behaviourally by reth_commit_fold_5103_test.go) is reached from nowhere else",
-			file, memberCalls)
-	}
 }
 
 // checkRethMemberCallSite asserts claim 3: the fold's result is assigned back

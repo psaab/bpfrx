@@ -80718,3 +80718,73 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   measurement were reverted, and the committed diff is tests plus docs.
 - **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   pkg/daemon/reth_worker_join_order_5103_test.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-14
+- **Action**: #6871 round 15 — close two key/scope holes an independent hostile
+  review measured, and correct the renewal claim at both sites
+
+  F1 (BLOCKING). Round 14's key carried the selector's SOURCE TEXT, which fixed
+  round 13's name collision and INHERITED a different one: source text is not
+  unique either, and `calls` was a `map[string]bool`, so two distinct func
+  literals in one declaration calling the same selector merged into one entry.
+  Reproduced at aec8e7881: a second escaping `d.dp.Link().PrepareLinkCycle()`
+  literal in `programRethMACWithWorkerJoin` plus an invoker outside the apply
+  compiled with `go test ./...` RC=0.
+
+  Replacing a colliding key with another key moves the collision domain; it does
+  not remove it. So the container changed, not just the key: `calls` is now
+  `map[string][]string` (key -> every position), allowlist entries carry an
+  asserted `occurrences`, and a func literal is additionally LABELLED by what
+  the source binds it to (`[in a func literal beforeCycle]`), which is
+  per-occurrence and does not churn the way a file:line would. The label and the
+  count are independently load-bearing and each has a plant the other misses.
+
+  F2 (BLOCKING). `reth_hook_wired_5103_test.go` parsed ONE named file, so its
+  three "exactly one call site" counts answered a narrower question. A
+  `reassertRethMemberMACOnRGTransition` calling programRethMACWithWorkerJoin,
+  appended to daemon_reth.go, kept the suite green; the identical function in
+  the parsed file failed with "found 2". The consequence is the hazard the PR
+  exists for: the wrapper's success path returns without NotifyLinkCycle, so a
+  second caller acquires a self-renewing lease nothing releases. Now derives the
+  file set from the package directory. Package scope is COMPLETE here as an
+  argument, not a convenience: all three functions are unexported.
+
+  F3 (MEDIUM, runtime) — the premise is right, the prescribed refcount is NOT,
+  and this was settled by reading the loop boundaries rather than by assertion.
+  The lease does end at the FIRST NotifyLinkCycle, which in a mixed apply is an
+  aborted member's in-loop rollback, and the later renewals are no-ops off the 0
+  sentinel. But acquisitions and releases do not pair: acquire is per MEMBER,
+  release is per REPAIR — one per aborted member plus at most one for the whole
+  apply at step 2.6b2, which sits OUTSIDE the per-member loop
+  (daemon_apply_dataplane.go:341 vs the loop ending at :317). A two-member apply
+  where BOTH cycle takes two leases and issues one release, so a refcount would
+  leave the count at 1 on the most ordinary multi-member path and make the
+  deferred abandon log its "leaving with a lease still held" error on every such
+  commit. What makes the early release safe is that a rebind is helper-GLOBAL:
+  NotifyLinkCycle recreates every worker and re-enables ctrl, so the cycled
+  member's torn-down state is repaired too. Residual stated: a rollback whose
+  rebind FAILS has already released — the same trade already argued for the
+  single-member case, on a path where the commit fails anyway. Written into
+  process_linkcycle.go at the release and into docs/reth-mac.md as a section.
+
+  F4 (CLAIM). Both sites justified the unconditional renewals by an abort path
+  whose lease is already released. Corrected: renewing ungated is right because
+  no gate is needed, not because a gate would lose a case.
+
+  MEASURED, all -count=1. Round-14 guard vs the three new plants: RC=0, RC=0
+  (label-defeating variant), RC=0. Round-15: the differently-labelled literal
+  RED as a new site; the SAME-labelled literal RED only on the count, naming
+  both positions; the sibling-file caller RED as "in package daemon, found 2".
+  Round 14's own three plants stay RED (no regression).
+
+  NO EXECUTABLE PRODUCTION CHANGE: comment-stripped daemon_apply_dataplane.go
+  and process_linkcycle.go hash identically to HEAD, so the 14/14 cluster smoke
+  at aec8e7881 still certifies this binary.
+
+  HARNESS CORRECTION worth recording: the plant script reverts with `git
+  checkout --`, which silently discarded an uncommitted production comment edit
+  mid-matrix and left a plant in the tree. Production edits are now committed
+  BEFORE any plant runs, so the revert restores them instead of erasing them.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/daemon/reth_hook_wired_5103_test.go, pkg/daemon/daemon_apply_dataplane.go,
+  pkg/dataplane/userspace/process_linkcycle.go, docs/reth-mac.md, _Log.md
