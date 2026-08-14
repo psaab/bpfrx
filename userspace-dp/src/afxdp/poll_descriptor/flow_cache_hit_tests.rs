@@ -52,6 +52,12 @@ const MIRROR_OUT_LOGICAL_IFINDEX: i32 = 200;
 /// is keyed by.
 const MIRROR_OUT_BIND_IFINDEX: i32 = 22;
 const BINDING_INDEX: usize = 0;
+/// #6304: the post-SNAT source address `nat_translated_entry` rewrites to.
+/// Distinct from the DNAT address below so a rewrite that applied one of them
+/// to both slots is visible.
+const SNAT_SRC_IP: Ipv4Addr = Ipv4Addr::new(172, 16, 50, 8);
+/// #6304: the post-DNAT destination address `nat_translated_entry` rewrites to.
+const DNAT_DST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 61, 55);
 
 fn test_key() -> crate::session::SessionKey {
     crate::session::SessionKey {
@@ -82,8 +88,9 @@ fn test_key() -> crate::session::SessionKey {
 /// `ingress_vlan_id = 80` and an untagged frame is a meta/frame pair the wire
 /// format cannot produce.
 ///
-/// Both checksum fields (IPv4 header at [28..30], TCP at [50..52] of the
-/// no-option frame) are left ZERO, which no correct sender emits. Nothing on
+/// Both checksum fields (IPv4 header at [28..30], TCP at [54..56] of the
+/// no-option frame — the TCP header starts at 38, and its checksum is at +16)
+/// are left ZERO, which no correct sender emits. Nothing on
 /// this path verifies either one — XDP receives whatever the NIC DMA'd, and
 /// both rewriters only apply INCREMENTAL deltas
 /// (`adjust_ipv4_header_checksum`, `recompute_l4_checksum_ipv4`) rather than
@@ -342,10 +349,20 @@ fn policy_counted_entry(counter: &Arc<crate::policy::PolicyRuleCounter>) -> Flow
 ///
 /// The stock fixture leaves `tx_selection: CachedTxSelectionDescriptor::default()`
 /// and `input_filter_counters: CachedFilterCounters::default()`, i.e. two EMPTY
-/// counter lists. Both replays are `for_each` walks over those lists, so their
-/// bodies never execute and severing either is invisible to the whole crate —
-/// measured, and the reason
+/// counter lists. Both replays are `for_each` walks over those lists, so neither
+/// body executes on any fixture in THIS module — which is why
 /// `live_flow_cache_callsite_replays_every_filter_count_term_6304` exists.
+///
+/// The two sides were NOT equally unbound crate-wide, and an earlier revision of
+/// this comment said they were. Severing the TX/output walk leaves the whole
+/// crate green; severing the INPUT walk reds
+/// `txn_flow_cache_hit_replays_input_filter_then_count_3777`
+/// (`afxdp/tests_txn_flow_cache.rs`), which drives two packets of one flow
+/// through the full descriptor path and asserts the input counter reaches 2.
+/// Both measured, one mutation at a time. The input assertion here is therefore
+/// a SECOND, call-site-local binding rather than the only one — worth keeping,
+/// since #3777 exists precisely because the two sides regressed independently
+/// once already, but not worth overclaiming.
 ///
 /// `tx` is a SLICE, not one handle, because #2573's guarantee is specifically
 /// that ALL matched `then count` terms are replayed rather than only the last: a
@@ -364,6 +381,50 @@ fn filter_counted_entry(
             .push(counter.clone());
     }
     entry.descriptor.input_filter_counters.push(input.clone());
+    entry
+}
+
+/// #6304: `cached_entry` carrying a real SNAT **and** a real DNAT.
+///
+/// The stock fixture's decision is `NatDecision::default()` — both
+/// `rewrite_src` and `rewrite_dst` `None` — so the two `if
+/// cached_decision.nat.rewrite_*.is_some()` guards at the call site are FALSE
+/// on every packet this module has ever staged and neither
+/// `telemetry.counters.snat_packets` nor `.dnat_packets` can be reached. A cell
+/// that merely retained the counters would still not exercise those two lines.
+///
+/// BOTH halves move together. `RewriteDescriptor::from_forward_decision` copies
+/// `decision.nat.rewrite_src`/`rewrite_dst` into `descriptor.rewrite_src_ip`/
+/// `rewrite_dst_ip` and derives the two checksum deltas from the same pair, so
+/// a fixture that set the decision alone would be one production never
+/// produces: the descriptor fast path reads the DESCRIPTOR, so it would forward
+/// the frame un-translated while the counters claimed a translation. The deltas
+/// come from the same `compute_*_csum_delta` helpers the seed path uses rather
+/// than being hand-computed, so the fixture cannot drift from the constructor.
+///
+/// Ports are deliberately NOT rewritten: `authoritative_forward_ports` derives
+/// the DMA-race gate's expected pair from `flow.forward_key`, which is the
+/// PRE-NAT tuple, and the frame carries exactly that pair — so an address-only
+/// translation keeps the in-place descriptor rewrite on its success path and
+/// the positive control below is a real one.
+fn nat_translated_entry() -> FlowCacheEntry {
+    let mut entry = cached_entry();
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(SNAT_SRC_IP)),
+        rewrite_dst: Some(IpAddr::V4(DNAT_DST_IP)),
+        ..NatDecision::default()
+    };
+    let key = test_key();
+    let flow = SessionFlow {
+        src_ip: key.src_ip,
+        dst_ip: key.dst_ip,
+        forward_key: key,
+    };
+    entry.decision.nat = nat;
+    entry.descriptor.rewrite_src_ip = nat.rewrite_src;
+    entry.descriptor.rewrite_dst_ip = nat.rewrite_dst;
+    entry.descriptor.ip_csum_delta = crate::afxdp::checksum::compute_ip_csum_delta(&flow, &nat);
+    entry.descriptor.l4_csum_delta = crate::afxdp::checksum::compute_l4_csum_delta(&flow, &nat);
     entry
 }
 
@@ -434,10 +495,16 @@ enum MirrorTargetQueue {
     CapOneEmpty,
 }
 
-/// Owns every referent a `WorkerContext` borrows so the four call-site tests
-/// below share ONE wiring definition. Before the fold each test carried its
-/// own ~200-line copy, and the mirror maps drifted apart from the ifindexes
-/// the call site actually resolves.
+/// Owns every referent a `WorkerContext` borrows so EVERY call-site test below
+/// shares ONE wiring definition. Before the fold each test carried its own
+/// ~200-line copy, and the mirror maps drifted apart from the ifindexes the
+/// call site actually resolves.
+///
+/// Deliberately not "the N tests below": the module has grown three times since
+/// this comment was written and a literal count went stale on each of them. The
+/// exception worth naming instead is
+/// `live_flow_cache_callsite_delegates_to_the_shared_sampler_6304`, which reads
+/// source text rather than running the stage and so borrows nothing from here.
 struct LiveCallSiteFixture {
     ingress_live: Arc<BindingLiveState>,
     target_live: Arc<BindingLiveState>,
@@ -645,6 +712,35 @@ struct StageRun {
     /// worker-local sampler declined; see
     /// `live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304`.
     admission_attempts: u64,
+    /// #6304: the per-RX-batch accounting counters after the call. `run_stage`
+    /// used to build these and drop them unread, so
+    /// `forward_candidate_packets`, `snat_packets` and `dnat_packets` — all
+    /// three flushed onto the operator-visible `BindingLiveState` atomics by
+    /// `BatchCounters::flush` (`afxdp/mod.rs`) — were deletable with the
+    /// whole module green. Bound by
+    /// `live_flow_cache_callsite_accounts_forward_and_nat_packets_6304`.
+    counters: BatchCounters,
+    /// #6304: the bytes the in-place arm actually staged for TX, read out of
+    /// the UMEM at the queued `PreparedTxRequest`'s `(offset, len)` before the
+    /// mapping is dropped. `None` when nothing was staged in place.
+    ///
+    /// Needed because a cached descriptor and a cached DECISION can disagree —
+    /// this module has been bitten by that once already — so a fixture claiming
+    /// a translation has to show the translated bytes rather than assert them.
+    tx_frame: Option<Vec<u8>>,
+    /// #6304: the cached entry's `observed_bytes` after the call, or `None` if
+    /// the entry is no longer in the cache.
+    ///
+    /// This is the only view of what the call site PASSED to
+    /// `lookup_counted` as its byte argument. Every other caller of
+    /// `lookup_counted` in the tree invokes it directly with a literal, so they
+    /// bind the CALLEE's accumulation and nothing binds this call site's choice
+    /// of `meta.pkt_len` — changing it to `0` leaves lookup behaviour intact and
+    /// silently zeroes per-hit observed bytes. `Option` rather than a
+    /// `unwrap_or(0)`: a MISSING entry must not be reported as a zero byte
+    /// count, which is the mutation. See
+    /// `live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304`.
+    cached_observed_bytes: Option<u64>,
 }
 
 /// Drive the LIVE call site once.
@@ -757,6 +853,26 @@ fn run_stage_with_entry(
         &mut telemetry,
     );
     let admission_attempts = crate::afxdp::binding_state::pending_tx_admission_attempts();
+    // #6304: lift the staged TX bytes out of the UMEM before the mapping dies
+    // with this function's frame.
+    let tx_frame = tx_pipeline_state
+        .pending_tx_prepared
+        .front()
+        .and_then(|prepared| area.slice(prepared.offset as usize, prepared.len as usize))
+        .map(<[u8]>::to_vec);
+    // #6304: read the hit entry's accumulated byte count back out. The
+    // `#[cfg(test)]` `lookup` is the ZERO-adding variant of the same
+    // `lookup_with_observed_bytes` body, so this read cannot itself move the
+    // number it is reporting.
+    let cached_observed_bytes = flow_state
+        .flow_cache
+        .lookup(
+            &flow.forward_key,
+            FlowCacheLookup::for_packet(meta, ValidationState::default(), &fixture.forwarding),
+            1,
+            &fixture.rg_epochs,
+        )
+        .map(|entry| entry.observed_bytes);
 
     StageRun {
         outcome,
@@ -767,6 +883,9 @@ fn run_stage_with_entry(
         dbg_forward: dbg.forward,
         dbg_tx: dbg.tx,
         admission_attempts,
+        counters,
+        tx_frame,
+        cached_observed_bytes,
     }
 }
 
@@ -823,8 +942,10 @@ fn live_flow_cache_callsite_nonsampled_produces_no_clone_6304() {
     assert!(
         queued.is_empty(),
         "#6304: a NON-sampled packet must not enqueue a clone on the mirror \
-         target — the target had ROOM, so a call site that admitted before \
-         consulting the sampler lands a real frame here"
+         target — the target had ROOM, so a call site that DROPPED the sampler \
+         and cloned unconditionally lands a real frame here. (Reserve-before- \
+         sample does NOT land one: it still consults the sampler and hands the \
+         reservation back, which is why that mutation needs the attempt count.)"
     );
     assert_eq!(
         fixture.ingress_live.mirrored_packets.load(Ordering::Relaxed),
@@ -1033,12 +1154,19 @@ fn live_flow_cache_callsite_selected_admitted_clone_reaches_target_6304() {
 
 /// #6304 (rewrite-failure rollback): sampling and admission run BEFORE the
 /// in-place rewrite, but the sampler commit and the clone delivery are
-/// deliberately deferred until the rewrite succeeds. Every other test in this
-/// module requires a SUCCESSFUL rewrite, so hoisting
+/// deliberately deferred until the rewrite succeeds. Hoisting
 ///
 ///     if let Some(next_counter) = mirror_next_counter { *mirror_sample_counter = next_counter; }
 ///
-/// above the `if let Some(rewrite_result)` check is green under all three.
+/// above the `if let Some(rewrite_result)` check is green everywhere else in
+/// the module: the DECLINED rewrite is the only state that can tell a committed
+/// sampler from a rolled-back one, and this cell and the fallback arms of
+/// `..._leaves_no_admission_stranded_on_target_6304` /
+/// `..._accounts_debug_forward_and_tx_6304` are the only three places a rewrite
+/// declines at all — and of those three, only this one reads the sampler.
+/// (An earlier revision said "every other test requires a SUCCESSFUL rewrite …
+/// green under all three", which was a count of the module as it stood then and
+/// was wrong on both halves once the fallback arms were added.)
 ///
 /// Here BOTH in-place rewriters decline and the packet takes the
 /// `PendingForwardRequest` fallback, where `tx/dispatch` re-runs mirror
@@ -1307,9 +1435,15 @@ fn live_flow_cache_callsite_nonsampled_makes_no_shared_admission_attempt_6304() 
 /// site that reserved before sampling and correctly dropped the reservation
 /// passes every cell here. What it does cover is the whole class where the
 /// reservation is taken and never handed back — the sampler declines but the
-/// admission outlives the call, the rewrite declines but the rollback leaks it,
-/// or an `Err` admission is dropped without release — each of which silently
-/// shrinks the mirror target's usable clone queue for every worker feeding it.
+/// admission outlives the call, or the rewrite declines but the rollback leaks
+/// it — each of which silently shrinks the mirror target's usable clone queue
+/// for every worker feeding it.
+///
+/// Not in that class, though an earlier revision of this comment listed it: a
+/// `Sampled(Err(..))` admission. That arm carries a `MirrorCloneResult`, not a
+/// token — the reservation FAILED, so there is nothing to release — and an
+/// enqueue error on an admission that WAS granted keeps the token owned, so
+/// `PendingTxAdmission::drop` releases it. Neither shape can strand a slot.
 #[test]
 fn live_flow_cache_callsite_leaves_no_admission_stranded_on_target_6304() {
     // --- NON-SAMPLED: rate = 2, counter = 1 -> declined by the sampler.
@@ -1456,8 +1590,16 @@ fn live_flow_cache_callsite_ip_options_frame_takes_the_in_place_path_6304() {
 /// counters — the in-place arm at the end of the successful-rewrite branch, the
 /// fallback arm after `build_live_forward_request_from_frame` succeeds. Neither
 /// was read by any test, so both increments were deletable with the module
-/// green: an undercounted forward-debug metric on every established-flow cache
-/// hit, on whichever arm was cut.
+/// green: an undercounted forward-debug metric on whichever arm was cut.
+///
+/// Scope, stated exactly rather than as "every cache hit": both increments sit
+/// INSIDE the forwarding disposition arm and after successful staging, so a hit
+/// that never reaches them — a cached terminal drop or a red policer (which
+/// return above), a TTL-expired packet (diverted to Time Exceeded), a
+/// LocalDelivery/Discard disposition, or a fallback whose builder returned
+/// `None` — is not undercounted by the deletion because it never counted.
+/// What regresses is every established-flow hit that FORWARDS, which on a
+/// long-lived permitted flow is nearly all of them.
 #[test]
 fn live_flow_cache_callsite_accounts_debug_forward_and_tx_6304() {
     let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
@@ -1521,10 +1663,12 @@ fn live_flow_cache_callsite_accounts_debug_forward_and_tx_6304() {
 /// The three sibling counters are asserted ZERO as well, so the cell binds the
 /// CLASSIFICATION and not merely "some counter advanced". Measured: rewiring
 /// the `VlanPopDescriptor` arm of `record_in_place_l2_rewrite` to bump the PUSH
-/// counter instead reds this test alone, with the other nine #6304 guards
-/// green. Hardcoding the ARGUMENT to `SameLength` at the call site collapses
-/// onto the deletion mutation — that arm is an empty block, so the pop counter
-/// stays at 0 either way.
+/// counter instead reds this cell and no other #6304 guard — re-measured at the
+/// round-3 head rather than carried forward, since the module has grown twice
+/// since the first measurement and the original note pinned a literal count
+/// ("the other nine") that went stale immediately. Hardcoding the ARGUMENT to
+/// `SameLength` at the call site collapses onto the deletion mutation — that arm
+/// is an empty block, so the pop counter stays at 0 either way.
 #[test]
 fn live_flow_cache_callsite_accounts_vlan_pop_l2_rewrite_6304() {
     let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
@@ -1740,17 +1884,29 @@ fn live_flow_cache_callsite_accounts_per_zone_traffic_6304() {
     );
 }
 
-/// #6304 (#2573 + #3777 filter `then count` replay). BOTH `record_filter_counter`
-/// call sites at `flow_cache_hit.rs` sever with the whole crate GREEN — measured,
-/// 4263 passed / 0 failed with the TX-side walk reduced to `.for_each(|_| {})` —
-/// because no fixture in this module has ever put a counter in either list to
-/// walk. This closes both.
+/// #6304 (#2573 + #3777 filter `then count` replay). Neither `record_filter_counter`
+/// call site at `flow_cache_hit.rs` was reachable from ANY fixture in this module —
+/// no fixture had ever put a counter in either list to walk — so this closes both
+/// at the call site. Their crate-wide severance results DIFFER, and stating that
+/// precisely matters more than the symmetry:
 ///
-/// Fourth and fifth instances of the class in this function, and a THIRD shape of
-/// it. `record_policy_hit_counter` was unreachable behind a `None` guard;
-/// `record_zone_traffic` ran and landed in a no-op arm; these two run and iterate
-/// an EMPTY collection, so the closure that holds the call never executes at all.
-/// A coverage report marks the `for_each` line as covered in every case.
+///   - TX/output walk reduced to `.for_each(|_| {})`: whole crate GREEN
+///     (measured, 4263 passed / 0 failed at the head that first measured it).
+///   - INPUT walk reduced the same way: RED —
+///     `txn_flow_cache_hit_replays_input_filter_then_count_3777`
+///     (`afxdp/tests_txn_flow_cache.rs`) already drove two packets of one flow
+///     through the full descriptor path and asserted the input counter reaches 2.
+///
+/// So the input assertion below is a second binding, not the first one. An
+/// earlier revision of this comment claimed both severed green — the same
+/// miscount this PR exists to fix, reintroduced in its own prose.
+///
+/// Fourth and fifth instances of the unreachable-telemetry class in this
+/// function, and a THIRD shape of it. `record_policy_hit_counter` was
+/// unreachable behind a `None` guard; `record_zone_traffic` ran and landed in a
+/// no-op arm; these two run and iterate an EMPTY collection, so the closure that
+/// holds the call never executes at all. A coverage report marks the `for_each`
+/// line as covered in every case.
 ///
 /// What it costs when it regresses: `show firewall counter` reports only each
 /// flow's seed packet. The flow cache serves most packets of a long-lived flow,
@@ -1811,5 +1967,186 @@ fn live_flow_cache_callsite_replays_every_filter_count_term_6304() {
         "#6304/#3777: ...and the interface INPUT filter's `then count` handle too. \
          The input side regressed independently of the output side once already, \
          which is why #3777 exists as a separate issue"
+    );
+}
+
+/// #6304 (per-batch forward + NAT accounting). Three counters on
+/// `BatchCounters` — `forward_candidate_packets`, `snat_packets`,
+/// `dnat_packets` — were bumped by this call site and read by nothing. Each is
+/// flushed onto the operator-visible `BindingLiveState` atomic of the same name
+/// by `BatchCounters::flush` (`afxdp/mod.rs`), published through
+/// `binding_state/snapshot.rs`, and carried on the wire by
+/// `protocol/binding.rs`, so deleting any one of them silently under-reports a
+/// live per-binding counter for every established-flow cache hit that forwards.
+///
+/// A SIXTH shape of the class this module keeps finding, and the plainest: the
+/// increments were reachable and did run — `run_stage` simply constructed
+/// `BatchCounters::default()` and dropped it, so `StageRun` had nowhere to
+/// report them from. Retaining the struct is what makes them assertable at all.
+///
+/// The NAT pair needs more than retention. Their guards read
+/// `cached_decision.nat.rewrite_src`/`rewrite_dst`, and every fixture in this
+/// module carried `NatDecision::default()` — both `None` — so the two lines were
+/// unreachable as well as unread. `nat_translated_entry` supplies a decision AND
+/// a descriptor carrying a real SNAT and a real DNAT; the frame assertions below
+/// are what keep that fixture honest rather than merely asserted, since a
+/// descriptor/decision disagreement would let the counters claim a translation
+/// the wire never carried.
+///
+/// The UNTRANSLATED run is not a duplicate of the other cells: it binds the two
+/// `is_some()` GUARDS rather than the increments. Dropping either guard and
+/// bumping unconditionally leaves the translated run's assertions satisfied and
+/// reds only here, which is the mutation that would report every forwarded
+/// packet as NAT'd.
+#[test]
+fn live_flow_cache_callsite_accounts_forward_and_nat_packets_6304() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    // rate = 2 with counter = 1 -> NOT sampled: this cell is about the batch
+    // accounting, so the mirror block stays out of the way.
+    let nat = run_stage_with_entry(
+        &fixture,
+        &frame,
+        test_meta(&frame),
+        nat_translated_entry(),
+        1,
+    );
+
+    // --- POSITIVE CONTROLS: the packet reached the accounting block, and the
+    // translation the two NAT counters are about is genuinely on the wire.
+    assert!(
+        matches!(nat.outcome, FlowCacheOutcome::Consumed),
+        "control: the cached flow must be consumed by the fast path"
+    );
+    assert_eq!(
+        nat.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED"
+    );
+    let staged = nat
+        .tx_frame
+        .as_ref()
+        .expect("control: the rewritten frame must be staged for TX");
+    assert_eq!(
+        &staged[30..34],
+        &SNAT_SRC_IP.octets(),
+        "control: the SOURCE address was really translated — without this the \
+         `snat_packets` assertion below would be counting a NAT the descriptor \
+         never applied"
+    );
+    assert_eq!(
+        &staged[34..38],
+        &DNAT_DST_IP.octets(),
+        "control: ...and the DESTINATION address too, to a DIFFERENT value, so \
+         a rewrite that wrote one address into both slots is visible"
+    );
+
+    // --- THE DISCRIMINATORS, one per production line.
+    assert_eq!(
+        nat.counters.forward_candidate_packets, 1,
+        "#6304: a forwarded cache hit must charge `forward_candidate_packets` \
+         — the per-binding forward counter every operator view of this path \
+         reads"
+    );
+    assert_eq!(
+        nat.counters.snat_packets, 1,
+        "#6304: ...and a hit whose cached decision carries a source rewrite \
+         must charge `snat_packets`"
+    );
+    assert_eq!(
+        nat.counters.dnat_packets, 1,
+        "#6304: ...and one carrying a destination rewrite must charge \
+         `dnat_packets`"
+    );
+
+    // --- THE GUARDS: an UNTRANSLATED flow charges the forward counter and
+    // NEITHER NAT counter.
+    let plain_fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let plain = run_stage(&plain_fixture, &frame, 1);
+    assert_eq!(
+        plain.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the untranslated flow forwards in place too"
+    );
+    assert_eq!(
+        plain.counters.forward_candidate_packets, 1,
+        "#6304: NAT or not, a forwarded cache hit is a forward candidate"
+    );
+    assert_eq!(
+        plain.counters.snat_packets, 0,
+        "#6304: a flow with no source rewrite must NOT be reported as SNAT'd — \
+         dropping the `rewrite_src.is_some()` guard reds here and nowhere else"
+    );
+    assert_eq!(plain.counters.dnat_packets, 0, "#6304: ...nor as DNAT'd");
+}
+
+/// #6304 (per-hit observed bytes, at the SEAM). `stage_flow_cache_hit` opens by
+/// calling `flow_cache.lookup_counted(.., meta.pkt_len)`; the callee folds that
+/// argument into the hit entry's `observed_bytes`, which is what
+/// `show flow-cache` reports per cached flow and what the #4800 connection-rate
+/// analysis reads.
+///
+/// The ARGUMENT is what was unbound, not the accumulation. `stage_flow_cache_hit`
+/// is the ONLY production caller of `lookup_counted`; the other five in the tree
+/// (`afxdp/flow_cache_tests.rs` x4 and `binding_state/tests/debug_state.rs` x1,
+/// enumerated firsthand) are tests invoking it DIRECTLY with a literal 1500 or
+/// 900, so they all bind the callee and none binds what this call site chooses to
+/// pass. Replacing `meta.pkt_len` with `0` keeps
+/// every lookup decision identical (the byte argument feeds nothing but the
+/// accumulator) and silently zeroes per-hit observed bytes on the fast path that
+/// serves most packets of a long-lived flow. That is the "tests reach past the
+/// adapter and leave the seam unbound" shape: it is only visible to a cell that
+/// drives the STAGE and reads the entry afterwards.
+///
+/// Two runs, because a single zero-seeded entry cannot separate `+=` from `=`.
+/// The pre-loaded run starts the entry at a non-zero count, so a call site
+/// passing 0 reads back the seed unchanged while a callee that ASSIGNED would
+/// read back the packet length alone.
+///
+/// The read itself uses the `#[cfg(test)]` `lookup`, the zero-adding variant of
+/// the same `lookup_with_observed_bytes` body, so observing the number cannot
+/// move it. `Option` rather than a defaulted 0: an entry evicted out of the cache
+/// must not be reported as a zero byte count, which is exactly the mutation.
+#[test]
+fn live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304() {
+    let fixture = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let frame = tcp_v4_ack_frame();
+    // rate = 2 with counter = 1 -> NOT sampled; the mirror block is irrelevant
+    // here and stays out of the way.
+    let fresh = run_stage(&fixture, &frame, 1);
+
+    // --- POSITIVE CONTROL: the packet took the cache-hit path at all. Without
+    // it, a fixture that started missing would report `None` and look like a
+    // different failure than the one this cell is about.
+    assert_eq!(
+        fresh.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the in-place hairpin rewrite must have SUCCEEDED, so the \
+         lookup above it was a HIT"
+    );
+
+    // --- THE DISCRIMINATOR.
+    assert_eq!(
+        fresh.cached_observed_bytes,
+        Some(frame.len() as u64),
+        "#6304: the cache-hit lookup must charge the entry the FULL wire length \
+         the shim reported. Passing 0 (or an L3-stripped length) at the call \
+         site leaves every lookup decision unchanged and silently zeroes the \
+         per-flow observed-byte count"
+    );
+
+    // --- ...and it ACCUMULATES onto what the entry already carried, rather
+    // than replacing it.
+    let carried = LiveCallSiteFixture::new(MirrorTargetQueue::WithRoom);
+    let mut preloaded = cached_entry();
+    preloaded.observed_bytes = 4096;
+    let second = run_stage_with_entry(&carried, &frame, test_meta(&frame), preloaded, 1);
+    assert_eq!(
+        second.tx_counters.pending_in_place_tx_packets, 1,
+        "control: the pre-loaded entry is hit on the same fast path"
+    );
+    assert_eq!(
+        second.cached_observed_bytes,
+        Some(4096 + frame.len() as u64),
+        "#6304: a hit ADDS this packet to the flow's running total — reading \
+         back the seed alone means the call site passed 0, and reading back the \
+         packet length alone means the count was assigned rather than folded"
     );
 }

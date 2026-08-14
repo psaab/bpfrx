@@ -118,6 +118,16 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 /// unchanged and moves `delta_loss_pending` 2280 -> 2288. A size-only guard
 /// calls both of those layout-neutral, and both would be exactly the
 /// perturbation #6114 cares about.
+///
+/// WHAT THIS CELL CAN AND CANNOT DO. It cannot FAIL. The four `const _`
+/// asserts beside the struct are not `cfg`-gated, so a wrong value in the test
+/// configuration is a compile error and this binary never gets built — the
+/// assertions below execute, always pass, and exist as a readable mirror of the
+/// numbers plus their reasoning, not as an independent check. Nor are four
+/// pinned values a whole-struct fingerprint: a perturbation that moves only
+/// unpinned fields satisfies all four. See the comment beside the struct for the
+/// full scope, including why `repr(Rust)` plus an unpinned toolchain makes these
+/// literals a build tripwire rather than a portable invariant.
 #[test]
 fn admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304() {
     assert_eq!(

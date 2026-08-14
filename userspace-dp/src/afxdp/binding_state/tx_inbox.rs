@@ -115,7 +115,11 @@ impl Drop for PendingTxAdmission {
 impl BindingLiveState {
     /// `Ok(())` here is NOT an acceptance receipt — see `enqueue_tx_owned`
     /// below, whose doc comment covers both. `push_redirect_inbox` drops the
-    /// request on overflow and this signature has no way to say so.
+    /// request on overflow and this body never reports it: the `Err(String)`
+    /// variant COULD carry the drop, and no path here ever constructs one, so
+    /// the function is `Ok`-only in practice. (An earlier revision said the
+    /// signature had no way to say so, which blamed the type for a choice the
+    /// implementation makes.)
     pub(in crate::afxdp) fn enqueue_tx(&self, req: TxRequest) -> Result<(), String> {
         self.push_redirect_inbox(req);
         Ok(())
@@ -128,10 +132,18 @@ impl BindingLiveState {
     /// drop-newest contract documented on it, so a request refused by the soft
     /// cap or the ring hard cap is discarded, `tx_errors` and
     /// `redirect_inbox_overflow_drops` are bumped, and the caller is told
-    /// nothing. That is deliberate: the callers are hot-path redirect producers
-    /// with no useful recovery for a full destination inbox, so the outcome is
-    /// reported through the counters rather than the return value, and the
-    /// `Result` exists only to match the shared enqueue signature.
+    /// nothing. That is deliberate: the outcome is reported through the counters
+    /// rather than the return value.
+    ///
+    /// The `Result` is NOT vestigial, and an earlier revision said it existed
+    /// "only to match the shared enqueue signature" with callers having "no
+    /// useful recovery". The CoS TX drain (`tx/drain/mod.rs`) threads
+    /// `Err(req)` back out of both Step 1 and Step 2 and falls through to the
+    /// next step — its own comment records that the signature "MUST be honored
+    /// for cascade-equivalence". So there IS a caller with a recovery path; what
+    /// is true is that this body never exercises it, which makes the cascade's
+    /// fallthrough dead today rather than unnecessary. Introducing a real `Err`
+    /// here would change that caller's behaviour, not just its type-checking.
     ///
     /// A caller that must know whether its request was ACCEPTED wants
     /// `try_enqueue_tx_owned`, which hands the unqueued `TxRequest` back as

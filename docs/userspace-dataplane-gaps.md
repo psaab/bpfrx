@@ -157,7 +157,39 @@ emitted alongside those offsets and called the pair well-formed.
 The same module also binds `telemetry.dbg.forward` / `.tx` on BOTH staging arms.
 `run_stage` built the debug counters and dropped them unread, so either
 increment could be deleted with every guard above green — an undercounted
-forward-debug metric on every established-flow cache hit.
+forward-debug metric on every established-flow cache hit **that forwards**. Both
+increments sit inside the forwarding-disposition arm and after successful
+staging, so a cached terminal drop, a red policer, a TTL-expired packet, a
+LocalDelivery/Discard disposition, or a fallback whose builder returned `None`
+never reached them and is not undercounted by the deletion. On a long-lived
+permitted flow that qualifier excludes almost nothing, but it is not "every
+hit", and an earlier revision of this line said it was.
+
+The `BatchCounters` triple on the same arm — `forward_candidate_packets`,
+`snat_packets`, `dnat_packets` — was unbound for the same structural reason and
+one more: `run_stage` constructed `BatchCounters::default()` and dropped it, so
+`StageRun` had nowhere to report them from, AND every fixture carried
+`NatDecision::default()`, which makes the two `rewrite_*.is_some()` guards false
+on every packet the module ever staged. Retention alone would have left the NAT
+pair unreachable as well as unread. All three flush onto the operator-visible
+`BindingLiveState` atomics of the same name (`BatchCounters::flush`,
+`afxdp/mod.rs`) and reach the wire through `protocol/binding.rs`.
+`live_flow_cache_callsite_accounts_forward_and_nat_packets_6304` closes them with
+a fixture whose cached DECISION and cached DESCRIPTOR both carry a real SNAT and
+a real DNAT, and asserts the translated addresses on the staged TX bytes so the
+counters cannot claim a translation the wire never carried; an untranslated
+second run binds the two guards rather than the two increments.
+
+`lookup_counted`'s byte ARGUMENT was unbound in the "reaches past the adapter"
+shape: every other caller in the tree (`flow_cache_tests.rs`,
+`debug_state.rs`) invokes `lookup_counted` DIRECTLY with a literal, so they all
+bind the callee's accumulation, and nothing bound what the cache-hit call site
+chooses to pass. Replacing `meta.pkt_len` with `0` there leaves every lookup
+decision identical and silently zeroes per-hit observed bytes — the number
+`show flow-cache` reports per cached flow and the #4800 connection-rate analysis
+reads. `live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304` drives
+the stage and reads the entry back, on a fresh entry and on one pre-loaded with a
+non-zero count so `+=` is distinguishable from `=`.
 
 Two lines above those, the `record_in_place_l2_rewrite(rewrite_result
 .l2_rewrite)` call was deletable with the WHOLE CRATE green — at the pre-fold
@@ -251,14 +283,29 @@ Two things follow, and the second corrects the earlier note rather than restatin
 it. (1) The thread-local moves nothing, and four `const _: [(); N]` asserts
 beside the struct hold it to that: they are deliberately NOT `cfg`-gated, so the
 same literals are evaluated in the production build AND the test build, and an
-instrument that perturbed the struct could satisfy at most one of the two. That
-is the cross-configuration comparison a `#[test]` cannot make on its own, since
-it only ever observes the test configuration. (2) The reason to decline a
+instrument that moved ANY OF THOSE FOUR VALUES could satisfy at most one of the
+two. That is the cross-configuration comparison a `#[test]` cannot make on its
+own, since it only ever observes the test configuration. (2) The reason to decline a
 `cfg(test)` FIELD is NOT that it changes the struct's size — measured, it does
 not; it lands in existing tail slack. It moves OFFSETS, the #6114 counter's own
 among them, so a size-only guard would have called both field shapes harmless.
 `repr(Rust)` reorders, so even a field declared LAST moves a neighbour — which is
 why the sentinel offset is pinned as well as the counter's.
+
+What those four asserts are NOT, stated so the guard is not read as stronger than
+it is. Size, alignment and two field offsets do not fingerprint a ~90-field
+struct: a perturbation that moves only UNPINNED fields satisfies all four
+literals in both configurations. They are a tripwire aimed at one hazard — a
+`cfg(test)` member reaching this struct, in the two shapes measured above — not a
+proof that the test-configuration layout equals the production one. They are also
+toolchain- and target-specific: `BindingLiveState` is `repr(Rust)` and the crate
+pins neither a `rust-version` nor a toolchain file, so a compiler upgrade can trip
+these literals with nothing in the source having moved. That failure direction is
+safe (a changed value is a compile ERROR carrying the actual number, never a
+silent accept), but it means the right response to a trip is to re-measure, not to
+widen the guard. The runtime cell in `binding_state/tests/tx_inbox.rs` mirrors the
+same four numbers and, for the same reason, cannot FAIL — the un-gated `const _`
+fails the build first, so the test binary carrying it would never be produced.
 
 Measured, at the head that added it: reverting `sample_then_admit_mirror_clone`
 itself to reserve-first (reserve, then drop the reservation when the sampler
@@ -337,15 +384,35 @@ zeroing `record_policy_hit_counter`'s byte argument, zeroing
 `record_mirror_clone_result`'s frame length, and forcing its result to `Enqueued`
 each red exactly the cell that asserts that property.
 
-SCOPE, stated with a measurement rather than an assertion. The swept set is the
-calls named `record_*`. `stage_flow_cache_hit` makes two other per-packet
-accounting calls that are not: `sessions.touch_if_stale(..)` (#918 staleness) and
-`sessions.account_packet(..)` (#2501 byte/packet accounting, #2749 TCP-flags and
-DSCP capture for the SESSION_CLOSE RT_FLOW record). Deleting EITHER leaves the
-whole crate green — 4264 passed, 0 failed, on each — so both are unbound at this
-call site. They are recorded here rather than closed in the round that found them,
-because neither is a telemetry `record_*` call and binding the session table's
-accounting is its own piece of work.
+SCOPE, stated with a measurement rather than an assertion. The swept set was the
+calls named `record_*`. That name is not the boundary of the per-packet
+accounting `stage_flow_cache_hit` performs, and an earlier revision of this
+paragraph said there were only two others. The full non-`record_*` set, as of the
+round-3 head:
+
+- `sessions.touch_if_stale(..)` (#918 staleness) and `sessions.account_packet(..)`
+  (#2501 byte/packet accounting, #2749 TCP-flags and DSCP capture for the
+  SESSION_CLOSE RT_FLOW record). Deleting EITHER leaves the whole crate green —
+  4264 passed, 0 failed, on each — so both are STILL unbound at this call site.
+  Recorded rather than closed: binding the session table's accounting is its own
+  piece of work.
+- `flow_cache.lookup_counted(.., meta.pkt_len)` — per-hit observed bytes. Its
+  byte argument is now bound by
+  `live_flow_cache_callsite_counts_observed_bytes_on_the_hit_6304`.
+- `apply_cached_three_color_policers(.., meta.pkt_len as u64)` — the cached
+  policer consumes credit per packet from its byte argument. Not swept.
+- The direct field increments: `telemetry.counters.forward_candidate_packets` /
+  `.snat_packets` / `.dnat_packets`, `telemetry.dbg.forward` / `.tx`, and
+  `tx_counters.pending_in_place_tx_packets`. All are now bound (see above); none
+  of them is a `record_*` CALL, and a sweep keyed on that spelling would have
+  missed every one. (`tx_counters.record_in_place_l2_rewrite(..)`, two lines
+  from three of them, IS named `record_*` and IS in the table above — which is
+  how the sweep reached that neighbourhood at all and then walked past its
+  neighbours.)
+
+The generalisation: a sweep keyed on a NAME is a proxy for the property "every
+per-packet accounting effect is bound". It found three real gaps and then
+under-reported its own residue by four, which is what a proxy does.
 
 The generalisation worth keeping: a telemetry call reached by every test is not
 thereby covered. It binds nothing if a guard above it is false in every fixture,

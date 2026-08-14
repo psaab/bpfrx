@@ -616,11 +616,28 @@
 
      Four `const _: [(); N]` asserts beside the struct pin all four numbers and are
      deliberately NOT `cfg`-gated, so the same literals are evaluated in the
-     production build AND the test build — an instrument that perturbed the struct
-     could satisfy at most one. That is the cross-configuration comparison a
-     `#[test]` cannot make alone;
+     production build AND the test build — an instrument that moved ANY OF THOSE
+     FOUR VALUES could satisfy at most one. That is the cross-configuration
+     comparison a `#[test]` cannot make alone;
      `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
      re-asserts the same numbers at runtime and carries the reasoning.
+
+     SCOPE of that guard, corrected in round 3 (Codex): four pinned values are a
+     TRIPWIRE, not a layout fingerprint. Size, alignment and two offsets do not
+     determine where the other ~90 fields sit, so a perturbation that moves only
+     UNPINNED fields satisfies all four literals in both configurations. The guard
+     is aimed at one hazard — a `cfg(test)` member reaching this struct, in the two
+     shapes measured above — and is not a proof of layout EQUALITY between the two
+     configurations. It is also toolchain- and target-specific: `BindingLiveState`
+     is `repr(Rust)` and the crate pins neither `rust-version` nor a toolchain file,
+     so a compiler upgrade can trip these literals with nothing in the source having
+     moved. That direction is safe (a changed value is a compile ERROR reporting the
+     actual number, never a silent accept) but it is brittle, and the response to a
+     trip is to re-measure, not to widen. The un-gated `const _` also means the
+     runtime cell can never FAIL — the build breaks first — so it is a readable
+     mirror of the numbers, not an independent check. The original prescription here
+     (un-gated const asserts, after a size-only guard missed an offset change) was
+     mine; this correction narrows it to what it actually buys.
 
      The counterfactuals also correct the objection rather than confirming it: a
      `cfg(test)` FIELD does not change the struct's SIZE — it lands in existing tail

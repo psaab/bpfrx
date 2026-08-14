@@ -705,10 +705,29 @@ pub(in crate::afxdp) struct BindingLiveState {
 // once in the PRODUCTION configuration (`cargo build` / `make
 // build-userspace-dp`, instrument absent) and once in the TEST configuration
 // (`cargo test` / `make test-rust`, instrument present), against the same
-// literals — so an instrument that perturbed the layout could satisfy at most
-// one of the two builds. That is the cross-configuration comparison a `#[test]`
-// alone cannot make; the runtime cell in `binding_state/tests/tx_inbox.rs`
-// re-asserts these numbers and carries the reasoning.
+// literals — so an instrument that moved ANY OF THESE FOUR VALUES could satisfy
+// at most one of the two builds. That is the cross-configuration comparison a
+// `#[test]` alone cannot make; the runtime cell in
+// `binding_state/tests/tx_inbox.rs` re-asserts these numbers and carries the
+// reasoning.
+//
+// WHAT THIS IS, exactly. Four pinned values are a TRIPWIRE, not a layout
+// fingerprint. Size, alignment and two field offsets do not determine the
+// placement of the other ~90 fields, so a perturbation that moves only unpinned
+// fields satisfies all four literals in both configurations and passes
+// unnoticed. The guard is chosen for the specific hazard — a `#[cfg(test)]`
+// member reaching this struct — and the two offsets are the two shapes that
+// hazard takes (see the measured counterfactuals below); it is not a proof that
+// the test-configuration struct is layout-EQUAL to the production one.
+//
+// It is also a toolchain-and-target tripwire, not a portable invariant.
+// `BindingLiveState` is `repr(Rust)`, and this crate pins neither a
+// `rust-version` nor a toolchain file, so field placement is whatever the
+// compiler in use chooses. That direction of failure is safe — a changed value
+// is a compile ERROR reporting the actual number, never a silent accept — but it
+// does mean a toolchain upgrade or a different target can trip these literals
+// without anything in this file having moved. Re-measure and update; do not
+// widen the guard to make it stop failing.
 //
 // Measured, rustc 1.96.0, x86_64, both configurations:
 //   size 2304, align 64, offset(pending_tx_admitted) 2152,
