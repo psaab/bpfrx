@@ -103,10 +103,30 @@ func (errLn) Accept() (net.Conn, error) { return nil, errors.New("listener termi
 func (errLn) Close() error              { return nil }
 func (errLn) Addr() net.Addr            { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8443} }
 
-// startWithDeadHTTPSLeg starts a Server whose HTTPS leg self-terminates, and
-// returns once the leg is INSTALLED and dead. Both facts are asserted here, so a
-// caller's later assertion cannot be satisfied by a leg that was never installed
-// at all (the state a failed BIND leaves, which is a different case).
+// startWithDeadHTTPSLeg starts a Server whose HTTPS leg self-terminates and
+// returns once that leg is INSTALLED and its serve goroutine has FINISHED.
+//
+// It asserts the installation — a caller's later assertion must not be satisfied
+// by a leg that was never installed at all, which is the state a failed BIND
+// leaves and a different case — and it deliberately does NOT assert `dead`.
+//
+// That is the #6827-round-7 correction. This helper used to poll `dead` on a 5s
+// deadline and t.Fatal, which made it a SETUP GUARD on the very flag the M8
+// mutation deletes: under that mutation both callers died HERE, at the shared
+// precondition, and neither ever reached its own assertion. The matrix recorded
+// two reds where there was one timeout on one entry path, and the tell was in
+// the durations — 5.00s and 5.00s, round deadline values rather than the cost of
+// real work.
+//
+// Server.Wait is the barrier instead. It blocks until every leg goroutine has
+// returned, this server has exactly one leg, and it reads nothing that is under
+// test — so when it returns, whatever the exit path stored is settled and the
+// CALLER's assertion is the thing that speaks. A mutation that stops the exit
+// path storing `dead` now reds on "HTTPSServing must report false" and on "the
+// reconcile left the DEAD leg installed", which is what those cells claim to
+// bind. (A mutation that stopped the goroutine returning at all would hang here
+// rather than fail at 5s; the package timeout catches it with a full goroutine
+// dump, which says more than a deadline message.)
 func startWithDeadHTTPSLeg(t *testing.T, cert tls.Certificate, addr string) (*Server, context.CancelFunc) {
 	t.Helper()
 	s := &Server{listen: func(network, a string) (net.Listener, error) { return errLn{}, nil }}
@@ -124,14 +144,7 @@ func startWithDeadHTTPSLeg(t *testing.T, cert tls.Certificate, addr string) (*Se
 		t.Fatal("precondition: the listen call SUCCEEDED, so the leg must be installed — " +
 			"a test about a dead installed leg must not silently become a test about a failed bind")
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for !s.httpsLeg.dead.Load() {
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatal("the serve goroutine did not mark the leg dead after a permanent Accept failure")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	s.Wait() // join the serve goroutine; assert nothing it stored
 	return s, cancel
 }
 
@@ -718,18 +731,6 @@ func (l *killableLn) Accept() (net.Conn, error) {
 // code described as "the socket is already closed, nothing left to drain".
 func (l *killableLn) kill() { close(l.killed); _ = l.Listener.Close() }
 
-// waitUntil polls cond for up to 5s, failing with msg if it never holds.
-func waitUntil(t *testing.T, cond func() bool, msg string) {
-	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatal(msg)
-		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
 // requestOn replays one authenticated request on an already-established
 // connection and returns its status. It writes the request by hand instead of
 // using an http.Client so the test controls WHICH connection carries it: a
@@ -855,8 +856,17 @@ func TestDeadLegConnectionCannotOutliveRevocation_6827(t *testing.T) {
 	}
 
 	// (1) The listener dies under the leg. The held connection is untouched.
+	//
+	// Wait, not a poll: it joins the one leg this server has, so the exit path
+	// has fully run by the time it returns and the state below is settled rather
+	// than sampled (#6827 round 7 — a polled precondition on a flag under test
+	// reds as a deadline expiry and hides which assertion actually fired).
 	kln.kill()
-	waitUntil(t, dead.dead.Load, "the serve goroutine never marked the self-terminated leg dead")
+	s.Wait()
+	if !dead.dead.Load() || !dead.drained.Load() {
+		t.Fatalf("precondition: after the serve goroutine returned, a self-terminated leg must "+
+			"read dead AND drained; got dead=%v drained=%v", dead.dead.Load(), dead.drained.Load())
+	}
 
 	// (2) Recovery on an UNCHANGED configuration retires the dead leg, pinning
 	// its slot at the credential that is about to be revoked.
@@ -872,11 +882,10 @@ func TestDeadLegConnectionCannotOutliveRevocation_6827(t *testing.T) {
 	// (3) The next commit revokes the credential the held connection is using.
 	s.ReplaceAuth(&AuthConfig{Users: map[string]string{"successor": "different-secret"}})
 
-	// `drained` is the flag pruneRetiredLocked spends to stop tightening this
-	// leg's pin. Once it is up, the leg's claim is that nothing can still be
-	// presenting credentials on it — so that is the moment to check.
-	waitUntil(t, dead.drained.Load, "the dead leg never reported drained")
-
+	// `drained` — asserted above, before the recovery — is the flag
+	// pruneRetiredLocked spends to stop tightening this leg's pin. The leg's
+	// claim is that nothing can still be presenting credentials on it. This is
+	// the request that tests the claim.
 	code, err = requestOn(conn, br, addr, user, secret)
 	if err == nil && code == http.StatusOK {
 		t.Fatalf("a connection accepted by a leg that has since died and been retired was still "+

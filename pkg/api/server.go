@@ -892,6 +892,31 @@ func (s *Server) HTTPHandlerForTest() http.Handler {
 	return s.httpLeg.srv.Handler
 }
 
+// HTTPSLegDrainedForTest reports whether the installed HTTPS leg's serve
+// goroutine has FINISHED (its listener is gone and every connection it accepted
+// has been finished or severed). False when no leg is installed. Test-only, and
+// specifically a CROSS-PACKAGE precondition helper (#6827 round 7).
+//
+// It exists because a test that arranges a dead leg needs to know the exit path
+// has run, and the obvious way to ask — polling HTTPSServing() until it goes
+// false — reads `dead`, which is the flag such a test is usually there to bind.
+// A mutation that stops `dead` being stored then hangs the poll until its
+// deadline and the cell reds at the SETUP rather than at its own assertion:
+// evidence that the precondition is load-bearing, not that the property is
+// bound. `drained` is stored unconditionally by the goroutine's defer on every
+// exit path, so it answers "has the exit happened" without consulting anything
+// under test.
+//
+// Server.Wait is the better barrier where it applies (it joins deterministically
+// rather than polling), but it joins EVERY leg, so a caller whose server also
+// has a live HTTP leg — the shape the daemon reconciler always has — cannot use
+// it and needs this.
+func (s *Server) HTTPSLegDrainedForTest() bool {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	return s.httpsLeg != nil && s.httpsLeg.drained.Load()
+}
+
 // HTTPSCertForTest returns the served TLS leaf certificate, or nil when the
 // server is HTTP-only (#5866). Test-only: lets a cross-package test read the cert
 // the LIVE HTTPS leg is serving after a reconcile, to assert that the durable

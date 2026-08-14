@@ -490,6 +490,8 @@ func TestRenameAndGenerationBumpAreOneCriticalSection_6827(t *testing.T) {
 
 	observed := make(chan uint64, 1)
 	var renamed string
+	var earlyGen uint64
+	var early bool
 	sethostname = func(b []byte) error {
 		renamed = string(b) // the KERNEL name moves here
 		go func() {
@@ -498,11 +500,15 @@ func TestRenameAndGenerationBumpAreOneCriticalSection_6827(t *testing.T) {
 			d.staleCertMu.Unlock()
 			observed <- gen
 		}()
+		// RECORD here, assert after the rename returns. Asserting inside the seam
+		// consumed the channel value the closing assertion then waited 5s for, so
+		// a genuine catch reported itself twice — once truthfully and once as "the
+		// observer never acquired staleCertMu", which was the opposite of what had
+		// just happened. A cell must not describe its own catch with the wrong
+		// message, and it must not spend a deadline doing it.
 		select {
-		case gen := <-observed:
-			t.Errorf("staleCertMu was FREE while the kernel name was moving: an observer read "+
-				"generation %d for a box already renamed to %q, which is exactly the window a "+
-				"concurrent delivery re-validates in (#6827 round 7)", gen, renamed)
+		case g := <-observed:
+			earlyGen, early = g, true
 		case <-time.After(100 * time.Millisecond):
 			// Still blocked — the rename holds the fence, as it must.
 		}
@@ -514,6 +520,11 @@ func TestRenameAndGenerationBumpAreOneCriticalSection_6827(t *testing.T) {
 	}
 	if renamed != "new-fw-6827" {
 		t.Fatalf("fixture: the kernel seam was never called, so nothing was fenced; renamed = %q", renamed)
+	}
+	if early {
+		t.Fatalf("staleCertMu was FREE while the kernel name was moving: an observer read "+
+			"generation %d for a box already renamed to %q, which is exactly the window a "+
+			"concurrent delivery re-validates in (#6827 round 7)", earlyGen, renamed)
 	}
 
 	select {
@@ -811,8 +822,17 @@ func TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827(t *testing.T) {
 		t.Fatalf("fixture: no listener recorded at %q", want.HTTPSAddr)
 	}
 	httpsLn.Close()
+	// Wait on `drained`, NOT on HTTPSServing() (#6827 round 7). This server also
+	// has a live HTTP leg, so Server.Wait cannot be the barrier here — it would
+	// block until daemon shutdown — and the poll has to stay. But it must not
+	// poll the flag this cell exists to bind: HTTPSServing() reads `dead`, so a
+	// mutation that stops `dead` being stored made this loop run to its deadline
+	// and the cell red HERE, at the setup, instead of at "a dead HTTPS leg must
+	// be rebuilt by the next reconcile" below. `drained` is stored by the serve
+	// goroutine's defer on every exit path, so it reports that the exit happened
+	// without consulting anything under test.
 	deadline := time.Now().Add(5 * time.Second)
-	for m.srv.HTTPSServing() {
+	for !m.srv.HTTPSLegDrainedForTest() {
 		if time.Now().After(deadline) {
 			t.Fatal("the HTTPS serve goroutine did not observe its closed listener")
 		}

@@ -79724,3 +79724,58 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md,
   pkg/api/server.go, pkg/daemon/management.go, pkg/daemon/daemon_system.go,
   pkg/daemon/hostname_stale_cert_6827_test.go, pkg/daemon/README.md
+
+- **Timestamp**: 2026-08-13T23:40Z
+- **Action**: #6827 round 7b — repaired the EVIDENCE the round-7 entry above rests on, after the
+  round-6 lane read my M8 durations back to me. The M8 row reported six reds; five of them
+  carried times of 5.00s / 5.01s / 5.00s / 5.01s / 3.00s, and only one (0.10s) was an
+  assertion firing. A red clustered at a round deadline value is a poll expiring, not a
+  property failing. Three of those five were SETUP GUARDS on the very flag M8 deletes:
+  `startWithDeadHTTPSLeg` polled `dead` for 5s and `t.Fatal`ed, so
+  `TestUnexpectedServeExitLeavesADeadInstalledLeg_6827` and
+  `TestReconcileHTTPSReplacesADeadLeg_6827` — which SHARE that helper, one entry path
+  between them — died there and NEITHER ever reached "HTTPSServing must report false" or
+  "the reconcile left the DEAD leg installed"; and the daemon rebuild cell polled
+  `HTTPSServing()`, which reads the same flag.
+  Fixed at the fixtures, not at the row. `startWithDeadHTTPSLeg` now uses `Server.Wait()`
+  — a deterministic join of the one leg that server has, reading nothing under test — and
+  asserts only the installation. The new B1 cell does the same after its kill, then asserts
+  dead+drained explicitly as a labelled, immediate precondition. The daemon cell keeps a
+  poll (its server also has a live HTTP leg, so `Wait` would block until shutdown) but
+  polls the new `api.Server.HTTPSLegDrainedForTest()`: `drained` is stored by the
+  goroutine's defer on every exit path, so it reports THAT the exit happened without
+  consulting the flag under test.
+  Re-measured M8 on the repaired tree: same six cells, but now
+  `serve_exit_wait_deadlock_6401_test.go:85` (0.10s),
+  `tls_stale_cert_6827_test.go:630` "HTTPSServing must report false" (0.00s),
+  `tls_stale_cert_6827_test.go:674` "the reconcile left the DEAD leg installed" (0.00s) and
+  `effective_listeners_6401_test.go:154` (3.00s) fail on their own ASSERTIONS, and only two
+  fail at a precondition — both immediate and self-labelled. So M8's blast radius is
+  unchanged (it is a shared production precondition) but four of the six now witness a
+  property instead of a timeout.
+  **A refinement of the heuristic, because it would otherwise condemn a legitimate cell.**
+  `TestEffectiveHTTPListenerServeExitFails` reds at 3.00s and that is CORRECT: its poll IS
+  its assertion (it waits for `effectiveHTTPListener()` to report Failed, which is the
+  property). The discriminator is not the duration but whether the polled predicate is the
+  asserted property or a precondition for it. Durations are the trigger to go and look.
+  Also fixed one of my own: under B2a the fence cell asserted INSIDE the syscall seam,
+  consuming the channel value its closing assertion then waited 5s for — so a genuine catch
+  reported itself twice, once truthfully and once as "the observer never acquired
+  staleCertMu", the opposite of what had happened. It now records in the seam and asserts
+  after the rename returns: B2a reds in 0.00s with one true message.
+  Validation on the repaired tree: `go test ./... -count=1` FULL_RC=0 (62 packages, zero
+  failures). Cells: B1 RED 0.00s (only cell in `pkg/api`, its own assertion); B2a RED 0.00s
+  (only cell in `pkg/daemon`); B2b RED 0.00s (`failed_sethostname_is_not_diagnosed` only);
+  B3 RED 0.00s (the sibling-delivery subtest only); B2c GREEN (the measured non-binding,
+  unchanged); M8 as above.
+  **PROVENANCE, corrected against a measurement rather than relayed.** The round-6 lane
+  states B1's consequence was ENABLED by its recovery. Checked at `ccc2f6b09`: pre-round-6
+  `ReconcileHTTPS` still reached `stopLegLocked` on a dead leg through its `!want` arm (a
+  TLS disable) and its default arm (an HTTPS-bind change), so the pin-then-prune was
+  reachable before round 6 — but only via a commit that disabled TLS or moved the bind.
+  What round 6 added is reachability on an UNCHANGED configuration, through the
+  same-address recovery and the reconciler's `!HTTPSServing()` arm, which fires on every
+  commit while the leg is dead. That is the common case, so the fix belongs with the
+  recovery either way; the claim is narrowed to what the code shows.
+- **File(s)**: pkg/api/server.go, pkg/api/tls_stale_cert_6827_test.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go
