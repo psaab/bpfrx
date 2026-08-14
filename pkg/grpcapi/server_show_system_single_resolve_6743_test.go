@@ -12,10 +12,12 @@ import (
 
 // Codex PR #6743 r7-F3: the buffer renders must take exactly ONE resolution.
 //
-// Before this round they took three — dataplane.Published(s.dp), then
-// s.dpProbe(), then s.dp.GetMapStats() — each an independent load of the
-// #2114 cell. A setDataplane(nil) landing between them re-created the exact
-// confusion Published() was introduced to prevent: the publication check
+// Before this round they took three — dataplane.Published(s.dp) (a
+// predicate that no longer exists; it was `Unwrap(p) != nil` and was
+// deleted in r2-B6), then s.dpProbe(), then s.dp.GetMapStats() — each an
+// independent load of the #2114 cell. A setDataplane(nil) landing between
+// them re-created the exact confusion that check existed to prevent: the
+// publication check
 // passed against a live backend, the later loads resolved nil, and the
 // render printed "No BPF maps available" — a statement about a LOADED
 // backend's maps — for a daemon that no longer had a backend at all.
@@ -66,9 +68,14 @@ func (*mapStatsBackend) GetMapStats() []dataplane.MapStats {
 
 // TestShowBuffersResolvesBackendOnce is the fail-on-revert guard.
 //
-// Revert either render to `if dataplane.Published(s.dp)` + `s.dpProbe()` +
-// `s.dp.GetMapStats()` and the second and third loads see the emptied cell:
-// the output becomes "No BPF maps available" and these assertions go RED.
+// Revert either render to a THREE-load shape — a publication check that
+// resolves the cell itself (`if dataplane.Unwrap(s.dp) != nil`, which is
+// what the deleted Published() predicate was), then `s.dpProbe()`, then
+// `s.dp.GetMapStats()` — and the second and third loads see the emptied
+// cell: the output becomes "No BPF maps available" and these assertions go
+// RED. The predicate itself was deleted in r2-B6 precisely because it
+// offered that second resolution as a one-liner; the revert is spelled out
+// here rather than named so this instruction stays executable.
 func TestShowBuffersResolvesBackendOnce(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

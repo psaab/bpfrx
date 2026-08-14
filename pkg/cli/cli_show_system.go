@@ -26,10 +26,12 @@ func (c *CLI) showSystemBuffers() error {
 	// the map branch and print "No BPF maps available" (a claim about a
 	// loaded backend's maps) instead of "Dataplane not loaded".
 	//
-	// r7: ONE resolution feeds every decision here. Published(), dpProbe()
-	// and c.dp.GetMapStats() were three independent cell loads, so a
-	// setDataplane(nil) between them re-created the very confusion
-	// Published() was added to prevent.
+	// r7: ONE resolution feeds every decision here. dataplane.Published()
+	// (a predicate deleted in r2-B6 — it was `Unwrap(p) != nil`),
+	// dpProbe() and c.dp.GetMapStats() were three independent cell loads,
+	// so a setDataplane(nil) between them re-created the very confusion
+	// that check was added to prevent. Do not reintroduce a separate
+	// publication predicate here; it is the second resolution.
 	backend := dataplane.Unwrap(c.dp)
 	if backend == nil {
 		fmt.Println("Dataplane not loaded")

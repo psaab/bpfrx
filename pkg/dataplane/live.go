@@ -69,13 +69,23 @@ func Unwrap(provider any) any {
 	return provider
 }
 
-// Published reports whether provider currently resolves to a backend.
+// #6743 r2-B6: a `Published(provider any) bool` predicate used to live
+// here, as the answer to "the pre-#2114 code asked `dp == nil`, what does
+// it ask now?". It was DELETED rather than re-wired, and deliberately not
+// reintroduced, because r7 established the stronger rule that supersedes
+// it: ONE resolution feeds every decision in a render.
 //
-// Consumers use it where the pre-#2114 code asked `dp == nil`: with a live
-// indirection the handle is permanently non-nil, so `dp != nil` no longer
-// means "a dataplane exists" and a render keyed on it would report a
-// backend-shaped answer ("No BPF maps available") for a daemon that has no
-// backend at all ("Dataplane not loaded").
-func Published(provider any) bool {
-	return Unwrap(provider) != nil
-}
+// Published(p) was exactly `Unwrap(p) != nil`, so a site that asked
+// Published(dp) and then probed dpProbe() resolved the cell TWICE — and a
+// setDataplane(nil) landing between the two re-created the very confusion
+// the publication check existed to prevent (the check passed against
+// backend A; the probe then resolved nil; the render described neither).
+// The surviving sites therefore bind `backend := Unwrap(dp)` to a local
+// and make BOTH the publication decision and every capability assertion
+// against that single value — see showBuffers (pkg/grpcapi), the CLI peer
+// (pkg/cli/cli_show_system.go), the WireGuard renders (r2-B4) and
+// forwardingStatusDataplane (r2-B7).
+//
+// Restoring the predicate would re-offer the two-resolution shape at every
+// new call site, which is the regression r7 removed; a reviewer measured it
+// at zero callers before this deletion.

@@ -47,12 +47,34 @@ usable. Two consequences the code makes explicit:
   for the drainer, which stayed captured at loop entry and kept draining a
   disowned backend at 10 Hz on the fast fallback branch) and re-installs
   its callbacks when a rollback + corrected re-arm replaces the stream
-  instance. Behavioural guards live in `daemon_dp_escape_test.go` (gRPC)
-  and `daemon_dp_escape_rest_test.go` (REST);
-  `daemon_dp_escape_canary_test.go` is the syntactic fence that covers the
-  console-CLI site and any future management consumer;
-  `daemon_ha_userspace_stream_live_test.go` drives the event-stream loop
-  across a `setDataplane(nil)` and across a stream replacement.
+  instance. `handleEventStreamFullResync` likewise resolves its session
+  exporter from the cell on every call, so a full resync after a rollback
+  + corrected re-arm exports from the CURRENT backend rather than the
+  torn-down one (#6743 r2-B8, bound by
+  `full_resync_per_call_6743_test.go`). Behavioural guards live in
+  `daemon_dp_escape_test.go` (gRPC) and `daemon_dp_escape_rest_test.go`
+  (REST); `daemon_ha_userspace_stream_live_test.go` drives the event-stream
+  loop across a `setDataplane(nil)`, across a stream replacement, and —
+  on the reconcile-cadence branch, which needs its own connected-stream
+  fixture — across a backend republication (#6743 r2-B3).
+
+  The console-CLI site has TWO halves, and neither covers it alone
+  (corrected in #6743 r2 — an earlier revision of this paragraph said the
+  canary "covers" the site, which was falsified by two compiled escapes
+  that left the whole package green):
+  - `daemon_dp_escape_canary_test.go` is the SYNTACTIC fence. It asserts
+    that no production function sources a management-probe value from
+    anywhere other than an in-place `liveDataplane()` call — keyed on the
+    POSITION of a type assertion and on DATA FLOW, not on a declaration
+    form or on the presence of the name, both of which were escapable.
+    Its stated limit is in the file header and is real: the AST cannot
+    establish temporal containment in general, so a wiring that crosses a
+    function boundary is outside it.
+  - `TestConsoleCLIProbeWiringFollowsTheCell` is the BEHAVIOURAL half: it
+    drives the site's exact wiring through the `cliDataPlane` interface
+    across a publication and a disown. The site itself is inside
+    `if isInteractive()`, so no unit test can execute the real block —
+    which is why the structural half exists at all.
 - **The indirection must not ERASE capabilities.** Go computes a method
   set statically, so `liveDataPlane`'s is exactly its declared forwarders:
   the MANDATORY management surface and nothing else. Consumers reach
@@ -82,8 +104,13 @@ usable. Two consequences the code makes explicit:
   permanently non-nil adapter, so a render keyed on the field describes a
   backend that may not be there — `show system buffers` answered "No BPF
   maps available" (a claim about a loaded backend's maps) for a daemon
-  whose startup arm failed. Those sites ask `dataplane.Published(dp)`
-  instead (#6743 r6-F3). For the same reason a clear that RACES the
+  whose startup arm failed. Those sites bind `backend :=
+  dataplane.Unwrap(dp)` to a local and make BOTH the publication decision
+  (`backend == nil`) and every capability assertion against that ONE value
+  (#6743 r6-F3, single-resolution form since r7 — an earlier revision of
+  this line said they ask `dataplane.Published(dp)`, which was never true
+  of the merged code; that predicate resolved the cell a second time and
+  was deleted in r2-B6). For the same reason a clear that RACES the
   disown fails inside the forwarder with `dataplane.ErrNotPublished`;
   `pkg/grpcapi` maps it to `codes.Unavailable`, matching what its
   `dp == nil || !IsLoaded()` pre-check returns for the identical

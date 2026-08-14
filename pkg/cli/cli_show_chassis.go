@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -101,11 +102,22 @@ func (a forwardingStatusCLIUserspaceDataPlane) Status() (dpuserspace.ProcessStat
 }
 
 func (c *CLI) forwardingStatusDataplane() fwdstatus.DataPlaneAccessor {
-	if c == nil || c.dp == nil {
+	if c == nil {
+		return nil
+	}
+	// #2114/#6743 r2-B7: same single-resolution publication check as the
+	// gRPC peer in pkg/grpcapi/server_show_forwarding.go, and for the same
+	// reason: `c.dp == nil` is permanently false under the daemon's live
+	// indirection, so an emptied cell returned the non-userspace `base`
+	// wrapper and fwdstatus.Build reported "Buffer utilization 0 percent"
+	// with BufferKnown=TRUE — a zero that every downstream consumer is
+	// told to trust — where the nil-dp control says "unknown (see #878)".
+	backend := dataplane.Unwrap(c.dp)
+	if backend == nil {
 		return nil
 	}
 	base := forwardingStatusCLIDataPlane{cli: c}
-	if _, ok := c.dpProbe().(cliUserspaceStatusProvider); ok {
+	if _, ok := backend.(cliUserspaceStatusProvider); ok {
 		return forwardingStatusCLIUserspaceDataPlane{forwardingStatusCLIDataPlane: base}
 	}
 	return base

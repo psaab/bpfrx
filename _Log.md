@@ -1,3 +1,129 @@
+## 2026-08-13 — #2114 / PR #6743 round 2b: seven surviving mutation sites, plus a seventh AST-escape class
+
+- **Timestamp**: 2026-08-13 (fix/2114-dp-accessor, PR #6743)
+- **Action**: Folded an independent reviewer's round-2 findings (B1-B8, N1-N5).
+  Every claim was re-measured before it was acted on, and every fix is bound by
+  a mutation that goes RED. Harness:
+  `$CLAUDE_JOB_DIR/tmp/runmut.sh` (copies the tree to a scratch dir on /tmp,
+  applies the reviewer's own `muts/*.py` verbatim, `go build -buildvcs=false`,
+  then `go test -buildvcs=false -count=1 <pkgs>`).
+
+  **B1 — the gRPC optional-capability probe's Unwrap was unbound.** Severing
+  `return dataplane.Unwrap(s.dp)` -> `return s.dp` in `pkg/grpcapi/runtime.go`
+  left FULL_RC=0 across the complete importer set. The identical mutation IS
+  killed in both siblings (`pkg/cli/runtime.go`, `pkg/api/api.go`) — the round-8
+  sweep bound pkg/api, pkg/cli, pkg/dataplane and pkg/dataplane/userspace and
+  missed pkg/grpcapi. With the unwrap gone every optional probe answers "absent"
+  on a HEALTHY backend: the session cursor drops to the O(N^2) paging fallback,
+  the userspace inject/queue/binding controls go dark, and WireGuard,
+  deterministic NAT, policies text and forwarding all pick the non-userspace
+  wrapper. Bound by `pkg/grpcapi/optional_probe_unwraps_6743_test.go`.
+
+  **B2 — the escape canary was silent at the one site it exists to cover.** The
+  round-4 scanner asked "does this function DECLARE a probe-typed variable
+  (`*ast.ValueSpec` with a named type)?" and "does its body mention the NAME
+  liveDataplane?". Both are proxies, and both were escapable at
+  `daemon_run.go`'s console-CLI block: a `:=` carrying a `TypeAssertExpr` has no
+  ValueSpec so the function was skipped entirely (C6), and a DISCARDED
+  `_, _ = d.liveDataplane()` next to a capture-once assertion satisfied the name
+  check (C7). Rebuilt on POSITION and DATA FLOW as R1-R4.
+
+  Then a SEVENTH escape of the same family, which the rebuild did not close:
+  callee position proves a value CAME FROM liveDataplane() and says nothing
+  about WHEN. `go func() { if live, ok := d.liveDataplane(); ok { cliDP = live }
+  }()` satisfies R1, R2 and R4 while the console is handed the nil zero value
+  (and the write races the read). Measured as a SURVIVOR, FULL_RC=0. Closed by
+  R5: an assignment inside a FuncLit that is not invoked in place — `go`,
+  `defer`, or merely stored — confers no liveness. An immediately-invoked
+  literal still does, so R5 keys on DEFERRAL rather than on the presence of a
+  FuncLit; that distinction has its own fixture.
+
+  The canary's header now STATES what the AST cannot do rather than implying
+  otherwise: R5 enumerates the deferring forms syntactically, so a wiring that
+  crosses a function boundary (`go d.wireConsole()`) or an ordering that depends
+  on runtime control flow remains outside it. A green run means "no probe value
+  in a production function body is sourced from anywhere other than an in-place
+  liveDataplane() call" — not "the probe is live when the consumer uses it".
+
+  **B3 — the drainer binder's scope claim was false.** Its comment claimed a
+  fail-on-revert covering "the resolutions", plural; it covered only the
+  fast-branch site. `countingDeltaDrainerDP` deliberately does not implement the
+  event-stream provider, so `connected` is false on every tick and the entire
+  `if connected` block is DEAD in that fixture — the mutated behaviour was not
+  merely unasserted, it was unexecuted. Added
+  `TestEventStreamFallbackLoop_DrainerReresolvedOnTheConnectedBranch` with a
+  connected-stream fixture, and corrected the comment.
+
+  **B4/B7 — the publication-check set was derived programmatically, not from
+  the review.** Grepping for a `dp == nil` gate followed by a `dpProbe()` call
+  across pkg/api, pkg/cli, pkg/daemon, pkg/dataplane and pkg/grpcapi returns
+  NINE sites. Seven are not defects: their gate arm and their probe-miss arm
+  produce the identical outcome, so a permanently-false gate is redundant rather
+  than wrong, and the three that also test `!dp.IsLoaded()` are covered by that
+  half (`liveDataPlane.IsLoaded()` resolves the cell). The two that DO diverge
+  are `forwardingStatusDataplane` in pkg/grpcapi and pkg/cli.
+
+  That pair is worse than the WireGuard renders the same round fixed. An empty
+  cell fell past the guard, returned the non-userspace `base` wrapper, and
+  `fwdstatus.Build` took its BPF-map arm — where `GetMapStats()` is empty, the
+  max-occupancy loop leaves maxPct at 0, and `BufferKnown` is set to TRUE:
+
+        EMPTY-CELL  "Buffer utilization   0 percent"
+        NIL-DP      "Buffer utilization   unknown (see #878)"   <- control
+
+  A misleading string is read by a human; `BufferKnown = true` tells every
+  downstream consumer the number is trustworthy. The binders assert the trust
+  bit BEFORE the text, so a fix that only changed the string would not pass.
+
+  **B5, B8 — two unbound single-resolution properties in HA actuation.** The
+  "ONE snapshot per reconcile pass" change (blackhole routes + takeover
+  readiness) and the per-call exporter resolution in
+  `handleEventStreamFullResync` both reverted to master's behaviour with the
+  suite green. Both are now bound by fixtures that CHANGE the cell mid-flight
+  and assert on WHICH backend each call reached — an identity assertion, not a
+  count, because a count passes under the latch (two calls, two exports, both
+  from the wrong backend).
+
+  **B6 — `dataplane.Published` had zero callers; DELETED.** Not re-wired.
+  `Published(p)` was exactly `Unwrap(p) != nil`, so a site that asked it and
+  then probed resolved the cell TWICE — the two-resolution race r7 removed.
+  Restoring the calls would reintroduce it at every new call site. The five
+  documents that claimed the code asks `dataplane.Published(dp)` (N1) were false
+  before this deletion and are corrected to the single-resolution shape the code
+  actually uses; a fail-on-revert instruction that named the predicate is
+  respelled so it stays executable.
+
+  **N2, N3, N4, N5.** The README's claim that the canary "covers" the console-CLI
+  site was falsified by B2 and is replaced by an explicit two-halves account.
+  The `-race` gate EXCLUDED the PR's own concurrency tests — a NAME filter over a
+  PROPERTY-defined set, matching 19 of 1118 tests and none of the seven
+  event-stream binders. Widening it once would leave the mechanism intact, so
+  `TestRaceGateCoversTheConcurrencyBinders` now parses the Makefile recipe and
+  fails if any test in the declared concurrency files stops matching; the
+  residual (the file list is hand-maintained) is stated in the file.
+  `ClearCounters` mapped `ErrNotPublished` to `codes.Internal`, reporting daemon
+  lifecycle state as a server fault — now `dataplaneActionError`. N5 (the
+  standalone event-stream path never re-wires a replacement stream) is
+  pre-existing in shape and is DOCUMENTED at the site rather than fixed blind.
+
+- **File(s)**: Makefile; docs/pr/1373-retire-ebpf-dataplane/README.md;
+  pkg/cli/cli_show_chassis.go; pkg/cli/cli_show_security_wireguard.go;
+  pkg/cli/cli_show_system.go; pkg/cli/forwarding_publication_check_6743_test.go;
+  pkg/cli/wireguard_publication_check_6743_test.go; pkg/daemon/README.md;
+  pkg/daemon/daemon_dp_escape_canary_test.go;
+  pkg/daemon/daemon_ha_userspace_stream.go;
+  pkg/daemon/daemon_ha_userspace_stream_live_test.go;
+  pkg/daemon/full_resync_per_call_6743_test.go;
+  pkg/daemon/race_gate_coverage_6743_test.go;
+  pkg/daemon/reconcile_one_snapshot_6743_test.go; pkg/dataplane/live.go;
+  pkg/dataplane/retirement_boundary_canary_test.go;
+  pkg/grpcapi/forwarding_publication_check_6743_test.go;
+  pkg/grpcapi/optional_probe_unwraps_6743_test.go;
+  pkg/grpcapi/server_cluster.go; pkg/grpcapi/server_show_forwarding.go;
+  pkg/grpcapi/server_show_security_text.go; pkg/grpcapi/server_show_system.go;
+  pkg/grpcapi/server_show_system_single_resolve_6743_test.go;
+  pkg/grpcapi/wireguard_publication_check_6743_test.go
+
 ## 2026-08-01 — #5561 round 16b: a Codex leg found a RUNTIME regression the hostile Claude review missed
 
 - **Timestamp**: 2026-08-01 (fix/5561-rest-authz-r16, PR #6645)

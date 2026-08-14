@@ -94,6 +94,25 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 		// installed. wireUserspaceEventStreamCallbacks re-reads the cell
 		// every 500 ms until a provider with a stream appears, so an empty
 		// cell here is a retry, not a latch.
+		//
+		// KNOWN GAP (#6743 r2-N5), stated because the sentence above is
+		// true of the FIRST wiring only and reads as if the whole path were
+		// self-correcting. wireUserspaceEventStreamCallbacks RETURNS once
+		// it installs, and this arm returns with it. The re-install on a
+		// REPLACED stream instance — the `es != wired` block r6-F4 added —
+		// lives in eventStreamFallbackLoop, which this path never runs. So
+		// on a standalone (no-cluster) daemon, a commit-confirmed rollback
+		// that closes the armed backend's stream followed by a corrected
+		// re-arm that constructs a new one leaves the replacement stream
+		// with no callbacks: its dataplane events accumulate in the
+		// callback-not-ready queue instead of reaching the event buffer,
+		// until the daemon restarts.
+		//
+		// This is PRE-EXISTING in shape — the clustered path had the same
+		// hole before r6-F4 and this arm was never converted — and is left
+		// alone here rather than fixed blind: the fix is either to run a
+		// stream-watch loop on this path too or to hoist the re-install
+		// into the wiring helper, and both want their own binder.
 		d.wireUserspaceEventStreamCallbacks(ctx)
 		return
 	}

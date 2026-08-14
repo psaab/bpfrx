@@ -125,17 +125,29 @@ func waitForDrainsForDrainTest(t *testing.T, dp *countingDeltaDrainerDP, what st
 	}
 }
 
-// TestEventStreamFallbackLoop_DrainerReresolvedPerTick is the F1 binder, in
-// BOTH directions.
+// TestEventStreamFallbackLoop_DrainerReresolvedPerTick is the F1 binder for
+// the DISCONNECTED (fast, 100 ms) branch's resolution, in BOTH directions.
+//
+// SCOPE — corrected in #6743 r2 (B3). An earlier revision of this comment
+// claimed the test failed on hoisting "the resolutions" in
+// eventStreamFallbackLoop, plural. It binds exactly ONE of the two:
+// countingDeltaDrainerDP deliberately does not implement the event-stream
+// provider, so `connected` is false on every tick here and the entire
+// `if connected` block — including its own
+// `drainer, hasDrainer := d.currentSessionDeltaDrainer()` — is DEAD in this
+// fixture. Hoisting only that site to a loop-entry capture left pkg/daemon
+// FULL_RC=0 (measured at 710a87569). The connected branch's resolution is
+// bound by TestEventStreamFallbackLoop_DrainerReresolvedOnTheConnectedBranch.
 //
 // Fail-on-revert: hoist the `drainer, hasDrainer := d.currentSessionDeltaDrainer()`
-// resolutions in eventStreamFallbackLoop back to a single capture at loop
-// entry and this test fails on the FIRST assertion — the disowned backend
-// keeps being drained at 10 Hz for the goroutine's life, because the loop's
-// commsCtx is cancelled only by stopClusterComms, never by a dataplane
-// disown. The second assertion covers the reverse arm the same revert also
-// breaks: a backend published AFTER loop entry is never picked up, because
-// the capture-once shape latched hasDrainer=false.
+// resolution in the DISCONNECTED branch (the one after the `continue` that
+// ends the connected block) back to a single capture at loop entry and this
+// test fails on the FIRST assertion — the disowned backend keeps being
+// drained at 10 Hz for the goroutine's life, because the loop's commsCtx is
+// cancelled only by stopClusterComms, never by a dataplane disown. The
+// second assertion covers the reverse arm the same revert also breaks: a
+// backend published AFTER loop entry is never picked up, because the
+// capture-once shape latched hasDrainer=false.
 func TestEventStreamFallbackLoop_DrainerReresolvedPerTick(t *testing.T) {
 	runDrainerReresolutionBinder(t, func(d *Daemon, ctx context.Context) {
 		d.eventStreamFallbackLoop(ctx, nil)
@@ -473,3 +485,152 @@ var (
 	_ dataplane.RuntimeDataPlane   = (*replaceableStreamDP)(nil)
 	_ userspaceEventStreamProvider = (*replaceableStreamDP)(nil)
 )
+
+// --- #6743 r2 B3: the CONNECTED branch's drainer resolution -------------
+
+// connectedStreamDrainerDP is a publishable backend that BOTH counts
+// DrainSessionDeltas calls and exposes an event stream. It is the
+// complement of countingDeltaDrainerDP: because the stream is connected,
+// eventStreamFallbackLoop reports connected==true on every tick and takes
+// the RECONCILE branch (5 s cadence) — the branch whose own drainer
+// resolution countingDeltaDrainerDP can never reach.
+type connectedStreamDrainerDP struct {
+	runtimeOnlyApplyTestDP
+	es     *dpuserspace.EventStream
+	drains atomic.Int64
+}
+
+func (c *connectedStreamDrainerDP) EventStream() *dpuserspace.EventStream { return c.es }
+
+func (c *connectedStreamDrainerDP) DrainSessionDeltas(uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
+	c.drains.Add(1)
+	return nil, dpuserspace.ProcessStatus{}, nil
+}
+
+// connectedEventStreamForDrainTest starts an event stream and dials it, so
+// IsConnected() is true. The client conn is kept open for the test's life:
+// if it dropped, the loop would fall to the DISCONNECTED branch and the
+// test would silently measure the already-bound site instead.
+func connectedEventStreamForDrainTest(t *testing.T, ctx context.Context) *dpuserspace.EventStream {
+	t.Helper()
+	es, path := startEventStreamForRewireTest(t, ctx, "connected.sock")
+	conn, err := dialEventStreamForRewireTest(t, path)
+	if err != nil {
+		t.Fatalf("dial event stream: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	deadline := time.Now().Add(20 * time.Second)
+	for !es.IsConnected() {
+		if time.Now().After(deadline) {
+			t.Fatal("event stream never reported a connected client: the loop would take " +
+				"the DISCONNECTED branch and this test would bind the wrong site")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return es
+}
+
+func waitForDrainsOnConnectedBranch(t *testing.T, dp *connectedStreamDrainerDP, what string) int64 {
+	t.Helper()
+	// The connected branch runs at the 5 s reconcile cadence, so the
+	// deadline has to clear several of those ticks.
+	deadline := time.Now().Add(40 * time.Second)
+	for {
+		if n := dp.drains.Load(); n > 0 {
+			return n
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no DrainSessionDeltas call %s", what)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// TestEventStreamFallbackLoop_DrainerReresolvedOnTheConnectedBranch binds
+// the resolution at the reconcile-cadence site (#6743 r2 B3).
+//
+// WHY IT NEEDED ITS OWN FIXTURE. The sibling binder above is built on a
+// backend with no event stream, so `connected` is false on every tick and
+// the whole `if connected` block is unreachable there — the mutated
+// behaviour is not merely unasserted, it is unexecuted. Measured at
+// 710a87569: hoisting ONLY the connected branch's
+// `drainer, hasDrainer := d.currentSessionDeltaDrainer()` to a loop-entry
+// capture left pkg/daemon FULL_RC=0.
+//
+// WHY THE ARMS ARE A REPUBLICATION, NOT A DISOWN. A disown empties the
+// cell, which also removes the provider, which flips `connected` to false
+// and drops the loop into the already-bound fast branch — so a disown
+// cannot observe this site at all. The commit-confirmed rollback's
+// corrected re-arm CAN: it publishes a DIFFERENT backend while the stream
+// stays up. The fixture therefore holds the stream constant across the
+// swap, which is exactly what isolates the drainer resolution from the
+// provider and stream resolutions the sibling tests already cover.
+//
+// Fail-on-revert: hoist that one resolution to loop entry. The captured
+// drainer keeps draining the SUPERSEDED backend at the 0.2 Hz reconcile
+// cadence — the r7-F1 escape, slower — and the newly published one is
+// never drained at all, so its deltas never reach session sync.
+func TestEventStreamFallbackLoop_DrainerReresolvedOnTheConnectedBranch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	es := connectedEventStreamForDrainTest(t, ctx)
+
+	d := &Daemon{
+		cluster: clusterManagerPrimaryForRGs(0),
+		store:   storeWithActiveConfigForDrainTest(t),
+	}
+	if !d.cluster.IsLocalPrimaryAny() {
+		t.Fatal("test setup: node must be primary for some RG or the drain is unreachable")
+	}
+	d.sessionSync = connectedSyncPairForDrainTest(t, ctx)
+
+	first := &connectedStreamDrainerDP{es: es}
+	d.setDataplane(first)
+
+	loopDone := make(chan struct{})
+	go func() {
+		defer close(loopDone)
+		// wired == es, so the `es != wired` re-install block never fires
+		// and this test is blind to it — one fixture, one arm.
+		d.eventStreamFallbackLoop(ctx, es)
+	}()
+
+	waitForDrainsOnConnectedBranch(t, first, "against the published backend: the loop "+
+		"never reached the reconcile drain")
+
+	// CONTROL: the branch under test is the CONNECTED one. Without this a
+	// dropped client conn would silently move the whole test onto the fast
+	// branch, whose resolution is bound elsewhere.
+	if !d.eventStreamConnected.Load() {
+		t.Fatal("the loop is reporting DISCONNECTED: this test is measuring the fast " +
+			"branch, not the reconcile branch it exists to bind")
+	}
+
+	// The corrected re-arm publishes a NEW backend behind the SAME stream.
+	second := &connectedStreamDrainerDP{es: es}
+	d.setDataplane(second)
+
+	waitForDrainsOnConnectedBranch(t, second, "against the REPUBLISHED backend: the "+
+		"reconcile branch captured its drainer at loop entry, so the superseded backend "+
+		"kept being drained and the new one never was")
+
+	if !d.eventStreamConnected.Load() {
+		t.Fatal("the loop dropped to DISCONNECTED mid-test: the republication arm did " +
+			"not measure the reconcile branch")
+	}
+
+	// The superseded backend must stop being drained. Sample AFTER the new
+	// one has been seen, then let a full reconcile tick pass.
+	settle := first.drains.Load()
+	time.Sleep(6 * time.Second)
+	if got := first.drains.Load(); got != settle {
+		t.Fatalf("DrainSessionDeltas ran %d more times on the SUPERSEDED backend (%d -> %d) "+
+			"after a new one was published: the reconcile branch captured the drainer "+
+			"instead of re-resolving it from the #2114 cell", got-settle, settle, got)
+	}
+
+	cancel()
+	<-loopDone
+}

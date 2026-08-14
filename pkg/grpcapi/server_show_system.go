@@ -446,10 +446,12 @@ func (s *Server) showBuffers(cfg *config.Config, buf *strings.Builder) error {
 	// about a loaded backend's maps) for a firewall that has no backend at
 	// all.
 	//
-	// r7: ONE resolution feeds every decision in this render. Published(),
-	// dpProbe() and s.dp.GetMapStats() were three INDEPENDENT cell loads,
-	// so a setDataplane(nil) landing between them re-created the exact
-	// confusion Published() was added to prevent: the publication check
+	// r7: ONE resolution feeds every decision in this render.
+	// dataplane.Published() (a predicate deleted in r2-B6 — it was
+	// `Unwrap(p) != nil`), dpProbe() and s.dp.GetMapStats() were three
+	// INDEPENDENT cell loads, so a setDataplane(nil) landing between them
+	// re-created the exact confusion that check was added to prevent: the
+	// publication check
 	// passed against backend A, the status probe then resolved nil, and the
 	// map arm printed "No BPF maps available" for a daemon that no longer
 	// had a backend at all. Resolving once and asserting every capability
