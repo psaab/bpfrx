@@ -892,10 +892,17 @@ func (s *Server) HTTPHandlerForTest() http.Handler {
 	return s.httpLeg.srv.Handler
 }
 
-// HTTPSLegDrainedForTest reports whether the installed HTTPS leg's serve
-// goroutine has FINISHED (its listener is gone and every connection it accepted
-// has been finished or severed). False when no leg is installed. Test-only, and
-// specifically a CROSS-PACKAGE precondition helper (#6827 round 7).
+// HTTPSLegDrainedForTest reports whether the installed HTTPS leg has finished
+// its EXIT PATH AND ITS DRAIN — the listener is gone and every connection it
+// accepted has been finished or severed. False when no leg is installed.
+// Test-only, and specifically a CROSS-PACKAGE precondition helper (#6827 round
+// 7).
+//
+// It does NOT report that the serve goroutine has returned (#6827 round 8). The
+// goroutine's defers run LIFO, so `drained` is stored BEFORE `wg.Done`, and a
+// caller can observe true inside that window. That is the right granularity for
+// a precondition — the drain is what the caller is waiting on — but a test that
+// needs the goroutine itself to be gone must use Server.Wait.
 //
 // It exists because a test that arranges a dead leg needs to know the exit path
 // has run, and the obvious way to ask — polling HTTPSServing() until it goes

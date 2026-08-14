@@ -455,14 +455,15 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 // can open.
 //
 // It is asserted from INSIDE the syscall seam because that is the only instant
-// at which the two can disagree. An observer goroutine tries to take staleCertMu
-// exactly then: under the fence it cannot, and its first possible read already
-// carries the bump.
-//
-// A timing assertion, but a one-sided one: the failing direction (the mutex is
-// free while the name moves) is immediate and does not depend on the wait being
-// long enough, while the passing direction cannot be produced by slowness — the
-// mutex is genuinely held for the whole hold, however long the test waits.
+// at which the two can disagree, and it asserts with a SYNCHRONOUS
+// sync.Mutex.TryLock (#6827 round 8). An earlier version spawned an observer
+// goroutine and waited 100ms for it — which was probabilistic in the direction
+// that matters: nothing guarantees the observer is scheduled inside the window,
+// so a run could pass by never having looked. The round-7 comment here claimed
+// the passing direction "cannot be produced by slowness", and that was wrong.
+// TryLock removes the scheduler from the question entirely: it runs on this
+// goroutine, at the instant the kernel name moves, and its answer is the state
+// of the mutex — false while the fence holds, true the moment it does not.
 //
 // RED on revert: take staleCertMu only for the ledger write and leave the
 // syscall outside it — the exact pre-round-7 shape, where applyHostname called
@@ -474,10 +475,12 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 // assumed: a shape that holds the mutex across the syscall, releases it, and
 // re-takes it for the bump stays GREEN. That shape is still defective — the gap
 // between the two holds is a window in which the name has moved and the
-// generation has not — but the window is a few instructions wide and no
-// scheduler-based probe can be made to land in it reliably; the observer here is
-// released at the unlock and loses the race to the re-acquire. The guard against
-// that shape is structural instead: the fenced function holds the mutex with a
+// generation has not — but it is unobservable for a MECHANICAL reason, not
+// merely a narrow one: the first Unlock happens while the mutex is still in
+// NORMAL mode, so the re-acquiring goroutine wins the fast-path CAS and any
+// woken waiter simply re-queues. A waiter is not handed the mutex in that
+// window, so no probe of any kind lands in it. The guard against that shape is
+// structural instead: the fenced function holds the mutex with a
 // single `defer`ed unlock over a body with no intermediate release, which is
 // visible on inspection in a way an interleaving is not. The two ORDERINGS
 // inside the hold are bound behaviourally — ledger-after-syscall by
@@ -488,30 +491,23 @@ func TestRenameAndGenerationBumpAreOneCriticalSection_6827(t *testing.T) {
 	restoreSet := sethostname
 	t.Cleanup(func() { sethostname = restoreSet })
 
-	observed := make(chan uint64, 1)
 	var renamed string
-	var earlyGen uint64
-	var early bool
+	var free bool
+	var genWhileFree uint64
 	sethostname = func(b []byte) error {
 		renamed = string(b) // the KERNEL name moves here
-		go func() {
-			d.staleCertMu.Lock()
-			gen := d.staleCertGen
+		// TryLock is NOT reentrant-friendly and that is exactly the point: this
+		// goroutine already holds staleCertMu if the fence is doing its job, so
+		// a successful acquisition here means the mutex was FREE while the kernel
+		// name was moving — the window a concurrent delivery re-validates in.
+		if d.staleCertMu.TryLock() {
+			free = true
+			genWhileFree = d.staleCertGen
 			d.staleCertMu.Unlock()
-			observed <- gen
-		}()
-		// RECORD here, assert after the rename returns. Asserting inside the seam
-		// consumed the channel value the closing assertion then waited 5s for, so
-		// a genuine catch reported itself twice — once truthfully and once as "the
-		// observer never acquired staleCertMu", which was the opposite of what had
-		// just happened. A cell must not describe its own catch with the wrong
-		// message, and it must not spend a deadline doing it.
-		select {
-		case g := <-observed:
-			earlyGen, early = g, true
-		case <-time.After(100 * time.Millisecond):
-			// Still blocked — the rename holds the fence, as it must.
 		}
+		// RECORD here, assert after the rename returns: a t.Fatal inside the seam
+		// would unwind through production's deferred unlock and report a second,
+		// false symptom on the way out.
 		return nil
 	}
 
@@ -521,23 +517,18 @@ func TestRenameAndGenerationBumpAreOneCriticalSection_6827(t *testing.T) {
 	if renamed != "new-fw-6827" {
 		t.Fatalf("fixture: the kernel seam was never called, so nothing was fenced; renamed = %q", renamed)
 	}
-	if early {
-		t.Fatalf("staleCertMu was FREE while the kernel name was moving: an observer read "+
-			"generation %d for a box already renamed to %q, which is exactly the window a "+
-			"concurrent delivery re-validates in (#6827 round 7)", earlyGen, renamed)
+	if free {
+		t.Fatalf("staleCertMu was FREE while the kernel name was moving: it read generation %d "+
+			"for a box already renamed to %q, which is exactly the window a concurrent delivery "+
+			"re-validates in (#6827 round 7)", genWhileFree, renamed)
 	}
 
-	select {
-	case gen := <-observed:
-		// The observer was released by the unlock at the END of the fenced
-		// section, so the earliest generation it can possibly see is the bumped
-		// one. A 0 here would mean the bump landed after the mutex was released.
-		if gen != 1 {
-			t.Fatalf("the first read possible after the rename must already carry the bump; "+
-				"got generation %d", gen)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the observer never acquired staleCertMu after the rename returned")
+	// And the generation the fence recorded is visible the moment it is released.
+	d.staleCertMu.Lock()
+	gen := d.staleCertGen
+	d.staleCertMu.Unlock()
+	if gen != 1 {
+		t.Fatalf("the rename must have recorded exactly one generation under the fence; got %d", gen)
 	}
 }
 

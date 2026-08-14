@@ -36,7 +36,9 @@ type listenerLeg struct {
 	// It means "nothing this leg accepted is still being served" — no further
 	// request can be admitted AND no response is still in flight (#6827 round 8;
 	// round 7 stated only the first half, which is the half Shutdown alone
-	// already provides, so it understated what the flag has to promise).
+	// already provides, so it understated what the flag has to promise). Modulo
+	// HIJACKED connections, which Go excludes from both Shutdown and Close and
+	// which this package has none of, by gate — see drainLeg.
 	// Server.pruneRetiredLocked spends it as exactly that: a drained leg stops
 	// being tightened by ReplaceAuth because there is nothing left for a
 	// revocation to reach. That reading is only true because EVERY exit path now

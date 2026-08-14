@@ -289,6 +289,12 @@ type Daemon struct {
 	// staleCertMu guards staleCertPending and staleCertGen, and publishes the
 	// mgmt pointer the stale-cert delivery path reads (#6827 round 5) — so that
 	// read is memory-model safe rather than a benign-looking data race.
+	//
+	// ONLY that read. `mgmt` is still read unguarded elsewhere (daemon_run_servers.go
+	// and reconcileWebManagement), exactly as it was before #6827 — the publish
+	// was unsynchronised on every path then, and this PR narrowed the problem to
+	// the path it touched rather than solving it. Do not read this as "mgmt is
+	// guarded"; it is not, and the remaining readers are tracked separately.
 	staleCertMu sync.Mutex
 	// staleCertPending records that a `set system host-name` moved the kernel
 	// name and the management-TLS staleness diagnostic has NOT yet been

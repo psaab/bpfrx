@@ -79824,3 +79824,55 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   dirty even when the harness restores by content — check the tree, do not assume the restore
   ran.
 - **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md
+
+- **Timestamp**: 2026-08-14T09:10Z
+- **Action**: #6827 round 8b — folded the reviewer supplement plus four Codex corrections,
+  two of which contradict prose I shipped at `baae30371` and were verified against the
+  go1.26.4 source before I touched anything. **(1) `legDrainTimeout` bounds the SHUTDOWN, not
+  the drain.** `net/http.Server.Close` takes no context and closes `s.activeConn` serially
+  (`server.go:3100-3118`), and on an HTTPS leg each entry is a `*tls.Conn` whose `Close` →
+  `closeNotify` sets its OWN 5s write deadline (`crypto/tls/conn.go:1471-1483`). A peer
+  stalling its receive window therefore costs up to 5s EACH, in series, so the worst case
+  grows with connection count. My "the bound this function promises is real" was false.
+  Corrected at `legDrainTimeout`, at `drainLeg` and in `pkg/api/README.md`, with the
+  knock-on stated rather than hand-waved: `Server.Wait` holds `lifeMu` across the drain and
+  `WarnStaleMgmtCertForHostName` waits on `lifeMu` under `staleCertMu`, so a rename racing
+  shutdown waits for it — and the earlier "well inside TimeoutStopSec=20" reassurance does
+  NOT hold at scale. Bounding the sever phase for real needs per-connection tracking with
+  concurrent deadlined closes; deliberately not taken in an eighth round, and the claim is
+  narrowed instead of the code being widened. **(2) Hijacked connections escape the drain.**
+  Verified in the stdlib docs: `Shutdown` "does not attempt to close nor wait for hijacked
+  connections", `Close` "does not even know about" them, and a hijacked conn is deleted from
+  `activeConn`. So `drained` can be stored while such a connection is still usable, and the
+  force-close cannot help — the handle is gone. Two reviewers noted pkg/api has no hijacker
+  and read that as closing the case; it makes it UNREACHABLE, not enforced. Chose the third
+  option deliberately — narrow the stated invariant AND gate it: new
+  `TestNoHijackerInThisPackage_6827` walks the AST of every production file for a
+  `http.Hijacker` assertion or a `.Hijack()` call (AST, not text, so the comments about
+  hijacking are not false positives) and fails with what `drainLeg` would have to grow.
+  **(3) The fence cell was probabilistic while claiming otherwise.** Its observer goroutine
+  might never be scheduled inside the 100ms window, so a pass could mean "never looked".
+  Replaced with a synchronous `sync.Mutex.TryLock` inside the syscall seam — no goroutine, no
+  sleep, and the answer is the state of the mutex. Cell now runs in 0.00s and MUT-B2a still
+  reds it in 0.00s naming the free-mutex generation. The split-hold non-binding now carries
+  the MECHANISM rather than "a few instructions wide": the first Unlock happens in normal
+  mode, so the re-acquirer wins the fast-path CAS and any woken waiter re-queues — no probe
+  of any kind lands there. **(4) The documented lock order was inaccurate.** I wrote a nested
+  three-lock chain staleCertMu → mgmt.mu → lifeMu; `warnStaleCertForHostName` releases m.mu
+  before calling the server, so the real shape is two independent edges. Corrected at both
+  sites. Also: `drained` is NOT the goroutine's "last act" (defers are LIFO, so it precedes
+  `wg.Done`) — corrected at the field and at `HTTPSLegDrainedForTest`, which proves the exit
+  path and drain completed, not that the goroutine returned; `d.mgmt` is guarded for the
+  stale-cert read ONLY and the field comment now says so explicitly, so nobody reads the PR
+  as having fixed the other readers; and `drainLeg` now states that the original defect's arm
+  called NO `Shutdown` at all, so the F2 correction cannot be misread as undercutting B1.
+  On the deadline in the fixture: the reviewer asked for the full 5s because "the deadline is
+  the thing under test". Split the difference on the merits — `unexpected_serve_exit` (the arm
+  the defect was in) now runs at the PRODUCTION 5s so the shipped value is exercised end to
+  end, the other two keep the seam, and new `TestLegDrainTimeoutDefault_6827` pins the shipped
+  value so a leaked override cannot retune production silently. Whole cell: 5.33s.
+  Validation: `go test ./... -count=1` FULL_RC=0 (62 packages). Cells re-run on this tree:
+  B2a RED 0.00s (fence cell only); F1a/F1b/B1 unchanged from round 8.
+- **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
+  pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
+  pkg/daemon/daemon.go, pkg/daemon/hostname_stale_cert_6827_test.go

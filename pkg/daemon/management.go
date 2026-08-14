@@ -571,9 +571,13 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 //
 // There is no lock-order inversion. staleCertMu is a LEAF here — the only thing
 // inside the hold is the syscall seam, which acquires nothing — whereas the
-// delivery path takes it at the TOP of staleCertMu → managementReconciler.mu →
-// api.Server.lifeMu. Nothing takes staleCertMu while already holding one of
-// those.
+// delivery path takes it at the TOP of two SEPARATE edges: staleCertMu →
+// managementReconciler.mu, and staleCertMu → api.Server.lifeMu. They are not a
+// nested three-lock chain (#6827 round 8 corrected that, which was conservative
+// but inaccurate): warnStaleCertForHostName takes m.mu only to read m.srv and
+// RELEASES it before calling into the server, so mgmt.mu and lifeMu are never
+// held at the same time. Nothing takes staleCertMu while already holding
+// either.
 //
 // Do not split the hold. Releasing after the syscall and re-taking for the
 // ledger write re-opens the window at a narrower width — the name has moved and
@@ -646,9 +650,10 @@ func (d *Daemon) renameHostNotingStaleMgmtCert(name string) error {
 // second then finds a settled debt, an unmoved generation, and warns again.
 // One rename, two identical WARN lines.
 //
-// Holding the mutex across warnStaleCertForHostName is deadlock-free: the order
-// is always staleCertMu → managementReconciler.mu → api.Server.lifeMu, and
-// nothing under those re-enters the Daemon.
+// Holding the mutex across warnStaleCertForHostName is deadlock-free: the edges
+// are always staleCertMu → managementReconciler.mu and staleCertMu →
+// api.Server.lifeMu — never both at once, since m.mu is released before the
+// server call — and nothing under either re-enters the Daemon.
 //
 // The emitted name IS the kernel's current one, for every rename this daemon
 // performs (#6827 round 7). Rounds 5 and 6 claimed otherwise — that Sethostname

@@ -1040,22 +1040,25 @@ func (f *streamFixture) assertSevered(t *testing.T) {
 // from drainLeg, or replace the `drainLeg(srv)` call in the stopCh/rootDone arm
 // with a bare bounded `srv.Shutdown`, and the stream survives its leg.
 func TestInFlightResponseIsSeveredOnEveryLegExit_6827(t *testing.T) {
-	// Reach the DEADLINE arm quickly. The production value is 5s; the case under
-	// test is what happens when it expires, and that is a property of the arm,
-	// not of the number.
-	restore := legDrainTimeout
-	t.Cleanup(func() { legDrainTimeout = restore })
-	legDrainTimeout = 150 * time.Millisecond
-
+	// The deadline arm is what these cases exercise, and reaching it costs the
+	// timeout. ONE case pays the production 5s so the shipped value is exercised
+	// end to end; the other two shorten it, because what expiry DOES is a
+	// property of the arm rather than of the number, and 15s in every future run
+	// of this package buys the same assertion three times.
+	// TestLegDrainTimeoutDefault_6827 pins the shipped value separately, so a
+	// leaked override cannot quietly retune production.
 	for _, tc := range []struct {
-		name string
-		end  func(t *testing.T, f *streamFixture, cancel context.CancelFunc)
+		name          string
+		productionCap bool
+		end           func(t *testing.T, f *streamFixture, cancel context.CancelFunc)
 	}{
 		{
 			// serveLegLocked's serveErr arm: the listener dies under a leg that
-			// is mid-response.
-			name: "unexpected_serve_exit",
-			end:  func(_ *testing.T, f *streamFixture, _ context.CancelFunc) { f.kln.kill() },
+			// is mid-response. This is the arm the original defect was in, so it
+			// is the one that runs at the real 5s deadline.
+			name:          "unexpected_serve_exit",
+			productionCap: true,
+			end:           func(_ *testing.T, f *streamFixture, _ context.CancelFunc) { f.kln.kill() },
 		},
 		{
 			// The stopCh arm, reached the way production reaches it: a commit
@@ -1074,6 +1077,11 @@ func TestInFlightResponseIsSeveredOnEveryLegExit_6827(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if !tc.productionCap {
+				restore := legDrainTimeout
+				t.Cleanup(func() { legDrainTimeout = restore })
+				legDrainTimeout = 150 * time.Millisecond
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			f := newStreamFixture(t, ctx)
