@@ -513,6 +513,7 @@
     "parent_ifindex": 0,
     "parent_interface": "",
     "parent_linux_name": "",
+    "parent_unbindable": false,
     "peer_address": "",
     "peer_mac": "",
     "rx_queues": 0,

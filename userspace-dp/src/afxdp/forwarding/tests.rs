@@ -340,6 +340,7 @@ fn fabric_ingress_prefers_local_active_owner_resolution_over_fabric_redirect() {
 fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
     let mut snapshot = nat_snapshot();
     snapshot.fabrics = vec![FabricSnapshot {
+        parent_unbindable: false,
         name: "fab0".to_string(),
         parent_interface: "ge-0/0/0".to_string(),
         parent_linux_name: "ge-0-0-0".to_string(),
@@ -4791,6 +4792,7 @@ fn select_route_next_hop_consistent_under_liveness_flip_between_passes() {
 
 fn fabric_snapshot_template() -> FabricSnapshot {
     FabricSnapshot {
+        parent_unbindable: false,
         name: "fab0".into(),
         parent_interface: "ge-0/0/0".into(),
         parent_linux_name: "ge-0-0-0".into(),

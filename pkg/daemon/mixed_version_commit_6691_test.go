@@ -14,22 +14,37 @@ import (
 )
 
 // TestMixedVersionHelperRefusalFailsTheCommit_6691 is the COMMIT-PATH half of
-// the #6691 round 9b mixed-version matrix: what a v6 control plane does when it
-// meets a v5 helper on a config the secure-tunnel gate does NOT arm for — which
-// is every reference cluster this project runs (the loss userspace cluster
-// compiles to 16 interface rows and zero flagged ones; see
+// the #6691 mixed-version matrix: what a control plane does when it
+// meets an under-version helper on a config the secure-tunnel gate does NOT
+// arm for — which is every reference cluster this project runs (the loss
+// userspace cluster compiles to 16 interface rows and zero flagged ones; see
 // TestMixedVersionMatrix_6691).
 //
 // This exists because the existing #5679 proof injects a GENERIC apply failure
-// ("control-socket sync failed"). That leaves the step from "the helper refused
-// on version" to "the commit fails via the deferred path" as a READ of the
-// classification rather than a measurement of it. A protocol bump is exactly
-// the change where that step should not be assumed: #6722 bumped 4 -> 5 the
-// same day on a matrix that generalised from one measurement and was wrong.
+// ("control-socket sync failed"), which leaves open whether the CLASSIFICATION
+// is specific to that wording. Here the injected error carries the helper's
+// actual refusal text, so the classification is measured against the string
+// that will really arrive.
 //
-// So the injected error is the REAL one — the string the helper emits
-// (server/handlers/snapshot.rs), wrapped the way process_control.go wraps an
-// ok=false response and publishSnapshotFailClosedLocked wraps that.
+// WHAT THIS TEST DOES NOT PROVE, stated plainly because an earlier revision of
+// this comment implied otherwise ("the injected error is the REAL one … wrapped
+// the way process_control.go wraps an ok=false response"). It is a pre-formed
+// error VALUE handed to a fake dataplane. No control socket is opened, no helper
+// response is decoded, and process_control.go's ok=false handling never runs.
+// The refusal string here is a hand-copied literal, so this test cannot catch a
+// change to the text the helper emits or to how the Go side wraps it — a
+// reworded refusal would leave this test green and the classification untested
+// for the new wording.
+//
+// The two ends of that chain are pinned elsewhere, and NEITHER is pinned by this
+// test: the emitted text by userspace-dp/src/server/tests.rs (the helper's own
+// assertion on "unsupported snapshot protocol version"), and the pass-through by
+// process_control.go, which returns errors.New(resp.Error) verbatim. That
+// pass-through is READ, not measured, in this round.
+//
+// What IS measured here is the step the #5679 proof left as a read: an apply
+// error carrying this text takes the ORDINARY class, so the commit fails through
+// the deferred path and the helper is NOT disarmed.
 //
 // The measured outcome is a CLEAN REFUSAL, not a wrong answer: the commit
 // FAILS, and because the class is not a gate sentinel the helper is NOT
@@ -49,16 +64,16 @@ func TestMixedVersionHelperRefusalFailsTheCommit_6691(t *testing.T) {
 		refusal error
 	}{
 		{
-			// Direction A: new Go (v6) publishing to an old helper (v5).
-			name:    "v6 control plane against a v5 helper",
-			refusal: errors.New("unsupported snapshot protocol version 6 (want 5)"),
+			// Direction A: new Go (v7) publishing to an old helper (v6).
+			name:    "v7 control plane against a v6 helper",
+			refusal: errors.New("unsupported snapshot protocol version 7 (want 6)"),
 		},
 		{
-			// Direction B: an old control plane (v5) publishing to this helper
-			// (v6). The helper's check is `snapshot.version != CONST`, so the
+			// Direction B: an old control plane (v6) publishing to this helper
+			// (v7). The helper's check is `snapshot.version != CONST`, so the
 			// two directions are the same line with the operands swapped.
-			name:    "v5 control plane against a v6 helper",
-			refusal: errors.New("unsupported snapshot protocol version 5 (want 6)"),
+			name:    "v6 control plane against a v7 helper",
+			refusal: errors.New("unsupported snapshot protocol version 6 (want 7)"),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -54,7 +54,22 @@ use super::snapshot::{ConfigSnapshot, FabricSnapshot, NeighborSnapshot, Userspac
 /// forwarding its previous-good image, so it is paired with
 /// `ensureSecureTunnelProtocolLocked` (pkg/dataplane/userspace/
 /// manager_compile.go), which disarms that helper and aborts the commit.
-pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 6;
+///
+/// v6 (#6691 round 9): the REFUSAL RULE over that same field changed from "any
+/// owning row calls this netdev unbindable" to "every owning row does"
+/// (`snapshot_refuses_parent_netdev`). No field moved — the SEMANTICS of the
+/// existing rows did, which is the case an unchanged version number cannot
+/// express: a v5 helper and a v6 control plane both say "5" and disagree about
+/// which netdevs may be bound.
+///
+/// v7 (#6691 round 10): `FabricSnapshot.parent_unbindable` is AUTHORITATIVE
+/// over whether a fabric parent netdev may be bound. A fabric member needs no
+/// interface stanza, so the parent commonly has no row to carry the
+/// device-level flags; a v6 helper decodes the absent field to `false` and
+/// plans an AF_XDP binding on a netdev the control plane refused. The reachable
+/// shape is a live xfrmi under a slot-shaped name used as a fabric member: one
+/// RX queue, global-minimum queue planning, #3091 again.
+pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 7;
 pub(crate) const INJECT_PACKET_TUPLE_PROTOCOL_VERSION: i32 = 1;
 
 /// #3651: one per-zone traffic-volume row inside the `ProcessStatus`-level

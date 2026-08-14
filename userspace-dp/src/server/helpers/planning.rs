@@ -343,9 +343,6 @@ pub(crate) fn userspace_unbindable_netdev(iface: &InterfaceSnapshot) -> bool {
     // and refuses to publish to it. Nothing detects an older CONTROL PLANE from
     // here; that direction is covered by the snapshot version equality check in
     // `apply_snapshot`, which refuses a snapshot at any other version outright.
-    // it false — see `ensureSecureTunnelProtocolLocked` (manager_compile.go),
-    // the #6691 round 8 gate that disarms such a helper rather than letting it
-    // plan the binding this arm exists to refuse.
     //
     // WHY, in the order the reasons can actually be established (#6691 round 8).
     //
@@ -503,9 +500,29 @@ fn snapshot_has_parent_candidate(snapshot: &ConfigSnapshot, parent: &str) -> boo
 /// is unaffected: for `bind-interface st10` the only row whose netdev is `st10`
 /// is the base xfrmi row (the sibling resolves to `st10.100`), so that bucket is
 /// unanimous and the netdev stays refused.
+///
+/// A FABRIC PARENT IS AN OWNER (#6691 round 10), and getting the owner set wrong
+/// is the whole failure mode of a unanimity rule: an EMPTY bucket answers "not
+/// refused", which is right when nothing emits the netdev and catastrophic when
+/// something does and was not counted. `set interfaces fab0 fabric-options
+/// member-interfaces ge-0/0/0` emits that netdev into the fabric candidate loop
+/// and (Go-side) into the ingress map and RSS allowlist WITHOUT creating an
+/// interface row for it, so round 9 planned a binding on an unbindable ownerless
+/// parent. The fabric's vote rides on the snapshot as
+/// `FabricSnapshot.parent_unbindable` rather than being recomputed here: half
+/// the evidence is a kernel link-kind dump only the Go plane takes.
 fn snapshot_refuses_parent_netdev(snapshot: &ConfigSnapshot, parent: &str) -> bool {
     let mut owners = 0usize;
     let mut unbindable = 0usize;
+    for fab in &snapshot.fabrics {
+        if fab.parent_linux_name.is_empty() || fab.parent_linux_name != parent {
+            continue;
+        }
+        owners += 1;
+        if fab.parent_unbindable {
+            unbindable += 1;
+        }
+    }
     for p in &snapshot.interfaces {
         let p_linux = if p.linux_name.is_empty() {
             linux_ifname(&p.name)

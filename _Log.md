@@ -80784,3 +80784,82 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   independently bound.
 - **File(s)**: pkg/api/authz.go, pkg/api/authz_bodywindow_5561_test.go,
   pkg/api/authz_bodybudget_fairness_5561_test.go
+
+- **Timestamp**: 2026-08-13T18:35Z
+- **Action**: #6691 round 10 — Codex MERGE-NEEDS-MAJOR at `4cf507638`: two runtime
+  blockers, a refuted claim of mine, and four stale-prose minors.
+  **B1 (zero-owner fabric fall-through).** `userspaceRefusedNetdevs` was built from
+  interface ROWS and refused only on `owners > 0 && owners == unbindable`. A fabric
+  MEMBER NEEDS NO INTERFACE STANZA, so `set interfaces fab0 fabric-options
+  member-interfaces ge-0/0/0` emits that netdev into the ingress map and the RSS
+  allowlist with ZERO rows owning it, and a unanimity rule over an empty bucket
+  answers "not refused". Measured at `4cf507638` with a live-xfrm `ge-0-0-0`:
+  `rows OWNING ge-0-0-0: 0`, `refusesName=false`, `refusesIfindex(20)=false`,
+  ingress `[20 21]`, allowlist `[ge-0-0-0 ge-0-0-3]` — the refused device in both
+  sets, on both planes. Round 9 had asked the RIGHT question of an oracle that could
+  not answer it. FIXED BY CORRECTING THE OWNER SET, not by a fourth conjunct: an
+  emitted fabric parent IS an owner, so it carries a verdict
+  (`fabricParentUnbindable`, which hands a synthetic row to the SAME
+  `netdevExclusionClasses` table rather than restating any class) and is tallied like
+  any other owner. "Ownerless" is NOT itself a refusal — the reference cluster's own
+  `fab0 member-interfaces ge-0/0/0` has no row, so refusing on absence would strip
+  the fabric parent from every cluster this project runs; that is a named negative
+  control on both planes. The verdict rides the wire as
+  `FabricSnapshot.ParentUnbindable` because the Rust plane cannot recompute it (the
+  kernel-link-kind half is a Go-side RTM_GETLINK dump), which forces protocol 6->7.
+  Also hoisted the xfrm sample into `buildSnapshot` so the rows and the fabric
+  parents are judged against ONE dump — two samples of a changing kernel put a
+  netdev's owners on opposite sides of the unanimity for no reason but sampling.
+  **B2 (gate armed with no observed version).** `ensureSecureTunnelProtocolLocked`
+  compared `lastStatus.ConfigSnapshotProtocolVersion` against `ProtocolVersion` and
+  armed whenever the live status request also failed — i.e. it armed on the ABSENCE
+  of a reading. Reachable: the deferred-worker arm (manager_worker_arm_5134.go)
+  reaches this gate BEFORE any helper liveness check. The value alone cannot separate
+  "no helper answered" from "a helper answered without the field" (both 0, opposite
+  verdicts), so the observation is now explicit and inseparable from the status:
+  `setLastStatusLocked` / `clearLastStatusLocked` move `lastStatus` and
+  `helperStatusObserved` together at all seven assignment sites. Scoped to THIS gate;
+  the three siblings are #7002.
+  **M1 (my claim, refuted).** `TestMixedVersionHelperRefusalFailsTheCommit_6691` said
+  the injected error was "the REAL one ... wrapped the way process_control.go wraps an
+  ok=false response". It is a pre-formed error VALUE: no socket, no decode, no
+  `resp.Error` pass-through. Took the option the lead authorized — the comment now
+  states plainly what the test does not prove and names where each end of the chain
+  IS pinned.
+  **MINORs.** Bound the previously-untestable xfrm-dump diagnostic by extracting
+  `sampleLiveXfrmNetdevs` (Codex's deletion-survivor claim CONFIRMED firsthand: with
+  round 10's test removed, deleting the `slog.Error` leaves the whole package green
+  at 25.8s); removed a duplicated comment fragment at planning.rs ~340; corrected the
+  round-9 "closed all four loops" paragraph, which read as done and was not; retired
+  the pinned `v5`/`pre-v5` wording now that three versions share one gate.
+  **Validation.** 8/8 Go mutations + 1/1 Rust mutation killed, each by the intended
+  assertion — sever the fabric owner arm (Go and Rust), force the verdict false,
+  bypass the class table, un-hoist the sample, delete the diagnostic, delete/invert
+  the observed-version conditional, and substitute a `version > 0` shortcut for the
+  explicit marker (that last one reds ONLY the "helper answers without the field"
+  cell, which is why the marker is not redundant). Full Go suite: 61 packages ok;
+  `pkg/ddns` failed on `bind: address already in use` from a concurrent agent and is
+  clean in isolation. Full Rust suite green with `FULL_RC=0`. The wire fixture
+  `protocol_wire_v1.json` was REGENERATED (one added key) rather than hand-edited.
+  Fixing the round-9 Rust fixture surfaced a real invariant worth pinning: a BASE row
+  and a fabric parent on one netdev must never disagree (production computes both
+  from identical inputs), because that disagreement would re-admit the device from
+  the other side — `TestFabricAndBaseRowNeverDisagree`.
+- **File(s)**: pkg/dataplane/userspace/fabric.go,
+  pkg/dataplane/userspace/ingress_exclusions.go,
+  pkg/dataplane/userspace/interfaces.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/manager_status.go,
+  pkg/dataplane/userspace/manager_compile.go, pkg/dataplane/userspace/maps_sync.go,
+  pkg/dataplane/userspace/process.go,
+  pkg/dataplane/userspace/fabric_ownerless_parent_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_protocol_6691_test.go,
+  pkg/dataplane/userspace/mixed_version_matrix_6691_test.go,
+  pkg/dataplane/userspace/secure_tunnel_parent_redirect_6691_test.go,
+  pkg/dataplane/userspace/snapshot_allowlist_test.go,
+  pkg/daemon/mixed_version_commit_6691_test.go,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/server/helpers/planning.rs, userspace-dp/src/main_tests.rs,
+  userspace-dp/src/server/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, _Log.md

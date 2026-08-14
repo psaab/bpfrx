@@ -31,7 +31,7 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 // the multi-zone SHAPE rather than the action so it covers both directions.
 var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-global zone-set snapshot protocol incompatible")
 
-// ErrSecureTunnelProtocolIncompatible is the #5619/#6691 v5 gate. The snapshot
+// ErrSecureTunnelProtocolIncompatible is the #5619/#6691 gate. The snapshot
 // carries InterfaceSnapshot.SecureTunnel, and the helper's binding admission
 // (include_userspace_binding_interface) is AUTHORITATIVE on it: a route-based
 // IPsec xfrmi must not become an AF_XDP binding candidate.
@@ -50,7 +50,7 @@ var ErrScopedGlobalZoneSetProtocolIncompatible = errors.New("userspace scoped-gl
 // ships). So an ignored flag re-plans EVERY physical interface on the box onto
 // one queue and one worker: the #3091 single-worker regression, on a config
 // this control plane has already decided is safe. Neither the version-equality
-// check (same advertised version on both sides before the v5 bump) nor the
+// check (same advertised version on both sides before the #5619 bumps) nor the
 // snapshot content hash can see it, because nothing about the bytes is wrong —
 // only the reader is.
 var ErrSecureTunnelProtocolIncompatible = errors.New("userspace secure-tunnel snapshot protocol incompatible")
@@ -820,7 +820,7 @@ func (m *Manager) ensureScopedGlobalZoneSetProtocolLocked(cfg *config.Config) er
 // This does NOT eliminate every re-sample in the package — UserspaceBoundLinuxInterfaces
 // still builds its own snapshot from a bare *config.Config, because that is the
 // only thing its daemon call sites have. What it eliminates is the sample whose
-// disagreement was UNSAFE: a silent gate leaves a pre-v5 helper armed on its
+// disagreement was UNSAFE: a silent gate leaves an under-version helper armed on its
 // previous-good image. The allowlist's remaining sample is conservative in its
 // own direction (see its degrade-to-nil path) and cannot leave a helper armed.
 func snapshotHasSecureTunnel(snap *ConfigSnapshot) bool {
@@ -836,8 +836,12 @@ func snapshotHasSecureTunnel(snap *ConfigSnapshot) bool {
 }
 
 // ensureSecureTunnelProtocolLocked is the fail-closed half of the #5619/#6691
-// v5 bump. The bump makes a pre-v5 helper REFUSE the snapshot outright, which
-// stops it from planning a binding for the xfrmi — but a refused snapshot
+// protocol bumps — v5 (the SecureTunnel field), v6 (the every-owner refusal
+// rule) and v7 (the fabric parent's verdict), which is why it compares against
+// ProtocolVersion rather than a pinned number: each of the three changes what
+// an older helper does with the same snapshot, and the gate's job is the same
+// for all of them. The bump makes an older helper REFUSE the snapshot outright,
+// which stops it from planning a binding for the xfrmi — but a refused snapshot
 // leaves that helper ARMED on its previous-good image while the commit reports
 // success. This gate closes that window the way the sibling gates do: the
 // caller disarms the helper and the commit aborts with an operator-visible
@@ -852,7 +856,7 @@ func snapshotHasSecureTunnel(snap *ConfigSnapshot) bool {
 // and was measurably wrong: with zero VPNs configured, configHasSecureTunnel
 // returns false with no live xfrmi and TRUE with a stale live `st10`. The
 // arming is right — a stale xfrmi is exactly the case an operator cannot fix by
-// editing the config, so a pre-v5 helper must not stay armed for it — and only
+// editing the config, so an under-version helper must not stay armed for it — and only
 // the sentence was the defect.
 func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
 	if !snapshotHasSecureTunnel(snap) {
@@ -867,6 +871,34 @@ func (m *Manager) ensureSecureTunnelProtocolLocked(snap *ConfigSnapshot) error {
 		if status.ConfigSnapshotProtocolVersion >= ProtocolVersion {
 			return nil
 		}
+	}
+	// ARM ON AN OBSERVED VERSION, NEVER ON THE ABSENCE OF ONE (#6691 round 10).
+	//
+	// Reaching here without helperStatusObserved means no helper has ever
+	// answered this Manager: lastStatus is a zero value and the live status
+	// request just failed too. The version compared above was 0 because there
+	// is no helper to have a version, not because a helper reported an old one
+	// — so there is nothing to be incompatible WITH, and arming would disarm a
+	// dataplane and abort the operator's commit on the strength of a reading
+	// that never happened.
+	//
+	// It is reachable, not defensive. The deferred-worker arm
+	// (manager_worker_arm_5134.go) calls this gate through
+	// ensureRequiredSnapshotProtocolLocked BEFORE any helper liveness check, so
+	// a pending-XSK re-arm attempted while the helper is down took the abort
+	// path on a config that had merely acquired a live xfrm device.
+	//
+	// An observed 0 still arms: a helper that answers without the field IS too
+	// old, and helperStatusObserved is what separates that from silence —
+	// the value alone cannot (manager.go).
+	//
+	// SCOPE: this gate only. The three sibling required-protocol gates in this
+	// file share the shape and the question of what each SHOULD do when the
+	// helper has never reported is #7002, which has to weigh each one's own
+	// fail-closed argument. Fixing the one this PR introduces is not a licence
+	// to change three others under the same commit.
+	if !m.helperStatusObserved {
+		return nil
 	}
 	return fmt.Errorf(
 		"%w: helper config snapshot protocol version %d < required %d for route-based IPsec secure tunnels "+
@@ -931,7 +963,7 @@ func (m *Manager) ensurePersistentSourceNATProtocolLocked(cfg *config.Config) er
 // asking the same question from a config a moment later is asking a different
 // kernel. Measured before this round, with an xfrm device visible to the
 // builder's dump and gone by the gate's: the built snapshot carried
-// SecureTunnel=true on `st10` while the gate returned false, so a pre-v5 helper
+// SecureTunnel=true on `st10` while the gate returned false, so an under-version helper
 // stayed ARMED on its previous-good image for exactly the snapshot the gate
 // exists to refuse.
 //

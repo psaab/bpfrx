@@ -706,6 +706,7 @@ pub(super) fn nat_snapshot_with_fabric() -> ConfigSnapshot {
         ..Default::default()
     });
     snapshot.fabrics = vec![FabricSnapshot {
+        parent_unbindable: false,
         name: "fab0".to_string(),
         parent_interface: "ge-0/0/0".to_string(),
         parent_linux_name: "ge-0-0-0".to_string(),

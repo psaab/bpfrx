@@ -46,7 +46,28 @@ const (
 	// believes is safe. The same-version equality check cannot see it, which
 	// is why the field needed the version and not just a new JSON tag.
 	// Paired with ensureSecureTunnelProtocolLocked (manager_compile.go).
-	ProtocolVersion                  = 6
+	//
+	// v6 (#6691 round 9): the REFUSAL RULE over that same field changed from
+	// "any owning row calls this netdev unbindable" to "every owning row
+	// does" (userspaceRefusedNetdevs, mirrored by
+	// snapshot_refuses_parent_netdev). No field moved — the SEMANTICS of the
+	// existing rows did, which is precisely the case an unchanged version
+	// number cannot express: a v5 helper and a v6 control plane both say "5"
+	// and disagree about which netdevs may be bound, so a netdev one plane
+	// admits the other refuses and the two produce different binding plans
+	// from one snapshot. A wire change with no new field still needs the
+	// version.
+	//
+	// v7 (#6691 round 10): FabricSnapshot.ParentUnbindable is AUTHORITATIVE
+	// over whether a fabric parent netdev may be bound. A fabric member needs
+	// no interface stanza, so the parent commonly has no row to carry the
+	// device-level flags, and a v6 helper — which decodes the absent field to
+	// false — plans an AF_XDP binding on a netdev this control plane refused.
+	// The reachable shape is a live xfrmi under a slot-shaped name used as a
+	// fabric member: one RX queue, global-minimum queue planning, #3091 again.
+	// Paired with ensureSecureTunnelProtocolLocked, which gates the whole
+	// secure-tunnel contract on the helper being at ProtocolVersion.
+	ProtocolVersion                  = 7
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
 
@@ -389,12 +410,30 @@ type FabricSnapshot struct {
 	ParentInterface string `json:"parent_interface,omitempty"`
 	ParentLinuxName string `json:"parent_linux_name,omitempty"`
 	ParentIfindex   int    `json:"parent_ifindex,omitempty"`
-	OverlayLinux    string `json:"overlay_linux_name,omitempty"`
-	OverlayIfindex  int    `json:"overlay_ifindex,omitempty"`
-	RXQueues        int    `json:"rx_queues,omitempty"`
-	PeerAddress     string `json:"peer_address,omitempty"`
-	LocalMAC        string `json:"local_mac,omitempty"`
-	PeerMAC         string `json:"peer_mac,omitempty"`
+	// ParentUnbindable is the device-level verdict for the parent netdev: the
+	// userspace dataplane must never bind an AF_XDP socket to it (#6691 round
+	// 10, fabricParentUnbindable).
+	//
+	// It rides on the wire because a fabric MEMBER NEEDS NO INTERFACE STANZA,
+	// so the parent netdev routinely has no InterfaceSnapshot to carry the
+	// flags — and the Rust plane, which runs the mirror of the Go unanimity
+	// tally, cannot recompute the verdict from what it has: the kernel-kind
+	// half of the secure-tunnel evidence is a Go-side RTM_GETLINK dump.
+	//
+	// NOT omitempty, for the same reason as Up below: this field decides
+	// whether a netdev enters the ingress-adjudication map and the AF_XDP
+	// binding plan, and an operator reading a snapshot dump is entitled to see
+	// the verdict rather than infer it from an absence. An absent field decodes
+	// to false (bindable) in Rust, which is the pre-round-10 behaviour, and is
+	// why the protocol version moved to 7 — a v6 reader silently plans the
+	// binding this flag exists to refuse.
+	ParentUnbindable bool   `json:"parent_unbindable"`
+	OverlayLinux     string `json:"overlay_linux_name,omitempty"`
+	OverlayIfindex   int    `json:"overlay_ifindex,omitempty"`
+	RXQueues         int    `json:"rx_queues,omitempty"`
+	PeerAddress      string `json:"peer_address,omitempty"`
+	LocalMAC         string `json:"local_mac,omitempty"`
+	PeerMAC          string `json:"peer_mac,omitempty"`
 	// Up is the local fabric parent link's carrier/oper state (#4082). The
 	// Rust dataplane prefers an UP fabric when resolving the cross-chassis
 	// redirect, so a dual-fabric cluster fails over to the secondary when the

@@ -941,6 +941,7 @@ fn queue_planner_includes_fabric_parent_interface() {
             },
         ],
         fabrics: vec![FabricSnapshot {
+            parent_unbindable: false,
             name: "fab0".to_string(),
             parent_interface: "ge-0/0/0".to_string(),
             parent_linux_name: "ge-0-0-0".to_string(),
@@ -980,6 +981,7 @@ fn queue_planner_deduplicates_fabric_parent_already_in_interfaces() {
             ..Default::default()
         }],
         fabrics: vec![FabricSnapshot {
+            parent_unbindable: false,
             name: "fab0".to_string(),
             parent_interface: "ge-0/0/0".to_string(),
             parent_linux_name: "ge-0-0-0".to_string(),
@@ -4675,6 +4677,17 @@ fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
             name: "fab0".to_string(),
             parent_linux_name: "ge-0-0-0".to_string(),
             parent_ifindex: 20,
+            // #6691 round 10: the fabric is now an OWNER of this netdev, so its
+            // vote has to match what the Go builder would actually ship. The
+            // base row and the fabric parent are judged from the SAME evidence
+            // (fabricParentUnbindable reads the same config and the same kernel
+            // sample as the row), so a snapshot where the row says unbindable
+            // and the fabric says bindable is not producible — and leaving this
+            // `false` would make the fixture assert against a state production
+            // cannot reach, while quietly turning a unanimous bucket into a
+            // disagreement (which correctly ADMITS). Go-side
+            // TestFabricAndBaseRowNeverDisagree pins the invariant.
+            parent_unbindable: true,
             rx_queues: 1,
             ..Default::default()
         }],
@@ -4720,6 +4733,140 @@ fn fabric_loop_cannot_readmit_a_refused_member_netdev() {
         snapshot_binding_plan_key(&without_fabric),
         "the plan key still hashes a fabric row that produces no candidate: the \
          hash and the layout disagree about the binding plan (#2915)"
+    );
+
+    clear_rx_queue_count_override();
+}
+
+/// #6691 round 10: a fabric parent netdev that NO INTERFACE ROW OWNS is still
+/// refusable, and the fabric's own snapshot row is what carries the verdict.
+///
+/// THE FIXTURE'S POINT IS WHAT IT OMITS. The round-9 guard above builds an
+/// `InterfaceSnapshot` for `ge-0-0-0` carrying `secure_tunnel: true` — and
+/// `snapshot_refuses_parent_netdev` tallies OWNERS, so that row is the only
+/// reason the netdev was refusable at all. A fabric member needs no interface
+/// stanza on the Go side, so the row is routinely absent while the fabric loops
+/// still push the netdev into the candidate list. With zero owners the
+/// unanimity `owners > 0 && owners == unbindable` answers "not refused", and
+/// round 9 planned an AF_XDP binding on the refused device.
+///
+/// This snapshot therefore carries the LAN row and nothing else: the member has
+/// no row, only `FabricSnapshot.parent_unbindable`, which is the wire field the
+/// Go plane computes from evidence (kernel link kind) this process cannot see.
+///
+/// FAIL-ON-REVERT: drop the fabric arm from `snapshot_refuses_parent_netdev`
+/// and this reds on both the planned set and the collapsed LAN queue count.
+#[test]
+fn ownerless_fabric_parent_is_refused() {
+    use crate::protocol::FabricSnapshot;
+    use crate::server::helpers::{
+        clear_rx_queue_count_override, replan_queues, set_rx_queue_count_override,
+    };
+
+    clear_rx_queue_count_override();
+    set_rx_queue_count_override("ge-0-0-3", 6);
+    set_rx_queue_count_override("ge-0-0-0", 1);
+
+    let lan = InterfaceSnapshot {
+        name: "ge-0/0/3".to_string(),
+        linux_name: "ge-0-0-3".to_string(),
+        zone: "trust".to_string(),
+        ifindex: 21,
+        rx_queues: 6,
+        ..Default::default()
+    };
+    let snapshot = ConfigSnapshot {
+        // DELIBERATELY no row for ge-0-0-0 — see above.
+        interfaces: vec![lan.clone()],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            parent_unbindable: true,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // PREMISE: nothing in `interfaces` owns the member netdev. If a future
+    // edit adds one back, this silently becomes the round-9 test.
+    assert!(
+        !snapshot
+            .interfaces
+            .iter()
+            .any(|i| i.linux_name == "ge-0-0-0"),
+        "premise: the ownerless case needs NO interface row for the fabric parent"
+    );
+
+    let bindings = replan_queues(Some(&snapshot), 6, &[]);
+    let planned = bindings
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        !planned.contains("ge-0-0-0"),
+        "the fabric loop planned an AF_XDP binding for a netdev the control plane \
+         marked unbindable. No interface row speaks for it, so `parent_unbindable` \
+         is the only evidence this plane has. Planned: {planned:?}"
+    );
+    let lan_queues = bindings
+        .iter()
+        .filter(|b| b.interface == "ge-0-0-3")
+        .map(|b| b.queue_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        lan_queues.len(),
+        lan.rx_queues,
+        "the LAN was planned onto {} queue(s), not its own {} — the ownerless \
+         refused parent entered the candidate list and its single RX queue became \
+         the global minimum (#3091). Planned: {:?}",
+        lan_queues.len(),
+        lan.rx_queues,
+        bindings
+            .iter()
+            .map(|b| (b.interface.clone(), b.queue_id))
+            .collect::<Vec<_>>(),
+    );
+
+    // #2915: the plan-key HASH must drop exactly what the LAYOUT drops.
+    let without_fabric = ConfigSnapshot {
+        fabrics: Vec::new(),
+        ..snapshot.clone()
+    };
+    assert_eq!(
+        snapshot_binding_plan_key(&snapshot),
+        snapshot_binding_plan_key(&without_fabric),
+        "the plan key hashes an ownerless fabric row that produces no candidate: \
+         the hash and the layout disagree about the binding plan (#2915)"
+    );
+
+    // NEGATIVE CONTROL, and it is the REFERENCE CLUSTER's own shape: an
+    // ownerless fabric parent that is NOT unbindable must still be planned.
+    // loss:xpf-userspace-fw0/fw1 authors `fab0 fabric-options member-interfaces
+    // ge-0/0/0` with no interface row for it, so "ownerless => refused" would
+    // take the fabric parent out of every cluster this project runs.
+    let bindable = ConfigSnapshot {
+        interfaces: vec![lan],
+        fabrics: vec![FabricSnapshot {
+            name: "fab0".to_string(),
+            parent_linux_name: "ge-0-0-0".to_string(),
+            parent_ifindex: 20,
+            parent_unbindable: false,
+            rx_queues: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let planned = replan_queues(Some(&bindable), 6, &[])
+        .iter()
+        .map(|b| b.interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        planned.contains("ge-0-0-0"),
+        "an ownerless fabric parent with no refusal was dropped: being ownerless \
+         is not what refuses a netdev, the control plane's verdict is. \
+         Planned: {planned:?}"
     );
 
     clear_rx_queue_count_override();

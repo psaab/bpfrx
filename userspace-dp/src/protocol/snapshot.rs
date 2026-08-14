@@ -484,6 +484,21 @@ pub(crate) struct FabricSnapshot {
     pub parent_linux_name: String,
     #[serde(rename = "parent_ifindex", default)]
     pub parent_ifindex: i32,
+    /// #6691 round 10: the device-level verdict for the parent netdev — the
+    /// dataplane must never bind an AF_XDP socket to it.
+    ///
+    /// A fabric MEMBER needs no interface stanza, so the parent netdev usually
+    /// has no `InterfaceSnapshot` in this snapshot at all, and
+    /// `snapshot_refuses_parent_netdev`'s unanimity tally over an empty owner
+    /// set answers "not refused". This field is that missing owner's vote. It
+    /// is computed Go-side because half its evidence is a kernel RTM_GETLINK
+    /// dump (link kind `xfrm`) this process does not take.
+    ///
+    /// `default` decodes an absent field to `false` = bindable, which is the
+    /// pre-round-10 behaviour; the protocol version moved to 7 so a control
+    /// plane that relies on the flag never meets a helper that ignores it.
+    #[serde(rename = "parent_unbindable", default)]
+    pub parent_unbindable: bool,
     #[serde(rename = "overlay_linux_name", default)]
     pub overlay_linux_name: String,
     #[serde(rename = "overlay_ifindex", default)]

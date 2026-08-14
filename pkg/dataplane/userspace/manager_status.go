@@ -25,7 +25,32 @@ func (m *Manager) recordHelperStatusLocked(status *ProcessStatus) {
 		es := m.eventStream.Status()
 		status.EventStream = &es
 	}
-	m.lastStatus = *status
+	m.setLastStatusLocked(*status)
+}
+
+// setLastStatusLocked stores a helper status AND the fact that one has been
+// observed, so no caller can record the first without the second (#6691 round
+// 10).
+//
+// The pair is what lets a required-protocol gate distinguish "a helper reported
+// a version too old for this snapshot" from "no helper has reported at all" —
+// two states that both leave ConfigSnapshotProtocolVersion at a value below
+// ProtocolVersion, and only one of which is an incompatibility. Keeping them in
+// one function is deliberate: a bool maintained separately at seven assignment
+// sites is a bool that drifts, and a drifted one here silently re-arms the gate
+// on absence.
+func (m *Manager) setLastStatusLocked(status ProcessStatus) {
+	m.lastStatus = status
+	m.helperStatusObserved = true
+}
+
+// clearLastStatusLocked forgets the helper status and the observation together.
+// It is called where the helper is gone (stopLocked, a restart): a version read
+// from a process that no longer exists is not an observation about the one that
+// replaces it.
+func (m *Manager) clearLastStatusLocked() {
+	m.lastStatus = ProcessStatus{}
+	m.helperStatusObserved = false
 }
 
 func (m *Manager) Status() (ProcessStatus, error) {

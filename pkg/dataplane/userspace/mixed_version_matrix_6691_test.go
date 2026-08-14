@@ -76,11 +76,15 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 	// is intact and disarming it would take a working dataplane down for a
 	// handshake disagreement.
 	t.Run("helper version refusal takes the ordinary deferred path", func(t *testing.T) {
-		// The exact string the helper produces (server/handlers/snapshot.rs),
-		// wrapped as process_control.go wraps an ok=false response and as
-		// publishSnapshotFailClosedLocked wraps that.
+		// A LITERAL copy of the string the helper produces
+		// (server/handlers/snapshot.rs), shaped the way process_control.go
+		// returns an ok=false response. Nothing here opens a socket or decodes a
+		// helper reply, so this measures the CLASSIFICATION of that text, not
+		// that the text is what a helper emits — see
+		// TestMixedVersionHelperRefusalFailsTheCommit_6691 (pkg/daemon), which
+		// states the same limit.
 		helperRefusal := fmt.Errorf("publish userspace snapshot: %w",
-			errors.New("unsupported snapshot protocol version 6 (want 5)"))
+			errors.New("unsupported snapshot protocol version 7 (want 6)"))
 		if IsRequiredProtocolGateError(helperRefusal) {
 			t.Fatal("a version refusal is classified as a required-protocol-gate error, " +
 				"so it would ABORT the commit and DISARM the helper. That is wrong for " +
@@ -88,10 +92,10 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 				"its previous-good image, and disarming it converts a handshake " +
 				"disagreement into a dataplane outage")
 		}
-		// Symmetric direction: an older control plane's v5 snapshot refused by
-		// this v6 helper produces the mirror-image string, same classification.
+		// Symmetric direction: an older control plane's v6 snapshot refused by
+		// this v7 helper produces the mirror-image string, same classification.
 		older := fmt.Errorf("publish userspace snapshot: %w",
-			errors.New("unsupported snapshot protocol version 5 (want 6)"))
+			errors.New("unsupported snapshot protocol version 6 (want 7)"))
 		if IsRequiredProtocolGateError(older) {
 			t.Fatal("the reverse direction is classified as a gate error")
 		}
@@ -115,19 +119,21 @@ func TestMixedVersionMatrix_6691(t *testing.T) {
 
 	// (4) THE TWO PLANES AGREE ON THE NUMBER. A bump that moved only one side
 	// would make every pairing a mismatch — including matched deployments.
-	t.Run("both planes are at 6", func(t *testing.T) {
-		if ProtocolVersion != 6 {
-			t.Fatalf("Go ProtocolVersion = %d, want 6", ProtocolVersion)
+	t.Run("both planes are at 7", func(t *testing.T) {
+		if ProtocolVersion != secureTunnelSnapshotProtocolVersion {
+			t.Fatalf("Go ProtocolVersion = %d, want %d", ProtocolVersion,
+				secureTunnelSnapshotProtocolVersion)
 		}
 		raw, err := os.ReadFile("../../../userspace-dp/src/protocol/control.rs")
 		if err != nil {
 			t.Skipf("Rust protocol constant unavailable: %v", err)
 		}
-		want := "pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = 6;"
+		want := fmt.Sprintf("pub(crate) const CONFIG_SNAPSHOT_PROTOCOL_VERSION: i32 = %d;",
+			secureTunnelSnapshotProtocolVersion)
 		if !strings.Contains(string(raw), want) {
-			t.Fatalf("Rust CONFIG_SNAPSHOT_PROTOCOL_VERSION is not 6 — the planes "+
+			t.Fatalf("Rust CONFIG_SNAPSHOT_PROTOCOL_VERSION is not %d — the planes "+
 				"disagree, so EVERY pairing is a mismatch, matched ones included. "+
-				"Expected the line %q", want)
+				"Expected the line %q", secureTunnelSnapshotProtocolVersion, want)
 		}
 	})
 }

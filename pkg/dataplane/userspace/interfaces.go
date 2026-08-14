@@ -184,7 +184,7 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 	// above does for a build error, and it is why liveXfrmNetdevs no longer
 	// discards a partial dump: the interrupted-dump case was the measured way
 	// this sample came back EMPTY and re-admitted a device.
-	refused := buildUserspaceRefusedNetdevs(snap.Interfaces)
+	refused := buildUserspaceRefusedNetdevs(snap.Interfaces, snap.Fabrics)
 	for _, iface := range snap.Interfaces {
 		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
 			continue
@@ -243,15 +243,23 @@ func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
 	return out
 }
 
-func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
-	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
-		return nil
-	}
-	// #6691 round 8: resolved ONCE per snapshot, not per row — it is a single
-	// RTM_GETLINK dump, against the two netlink lookups buildLinkSnapshot
-	// already issues for every row.
-	liveXfrm, xfrmErr := liveXfrmNetdevs()
-	if xfrmErr != nil {
+// sampleLiveXfrmNetdevs takes the ONE kernel xfrm-device sample a snapshot
+// build is entitled to and applies the fail-open policy for a dump that failed.
+//
+// #6691 round 8 resolved this ONCE per snapshot rather than per row — it is a
+// single RTM_GETLINK dump, against the two netlink lookups buildLinkSnapshot
+// already issues for every row. Round 10 made it a NAMED function because the
+// sample now has two consumers in one build (the interface rows AND the fabric
+// parents, buildSnapshot), and re-sampling for the second would let the two
+// disagree about the same device within one snapshot.
+//
+// The diagnostic is the whole error handling, so it is part of the contract and
+// TestXfrmDumpFailureIsLoggedNotSwallowed binds it. Round 9 left it as a bare
+// slog.Error inside a 200-line builder, where no test could reach it and a
+// silent deletion would have looked like a cleanup.
+func sampleLiveXfrmNetdevs() map[string]bool {
+	liveXfrm, err := liveXfrmNetdevs()
+	if err != nil {
 		// The kernel half of snapshotSecureTunnel is unavailable for this
 		// build. Log LOUDLY and continue on the config half, which stays
 		// authoritative for every tunnel an IPsec stanza names — the gap this
@@ -260,7 +268,24 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		// transient RTM_GETLINK error would brick commits for a belt.
 		slog.Error("userspace: could not classify xfrm netdevs; secure-tunnel "+
 			"exclusion falls back to configuration ownership only",
-			"err", xfrmErr)
+			"err", err)
+	}
+	return liveXfrm
+}
+
+// buildInterfaceSnapshots builds the interface rows against a FRESH kernel xfrm
+// sample. buildSnapshot does NOT use it: a build that also produces fabric
+// parents must share one sample across both, via buildInterfaceSnapshotsFrom.
+func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
+	}
+	return buildInterfaceSnapshotsFrom(cfg, sampleLiveXfrmNetdevs())
+}
+
+func buildInterfaceSnapshotsFrom(cfg *config.Config, liveXfrm map[string]bool) []InterfaceSnapshot {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
 	}
 	zoneByInterface := buildInterfaceZoneMap(cfg)
 	ifaceRoutingInstance := buildInterfaceRoutingInstances(cfg)

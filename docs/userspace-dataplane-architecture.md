@@ -1662,18 +1662,49 @@ global emits neither side, so neither can be narrowed by a singular-only
 reader and neither is gated; that keeps the disarm blast radius to
 exactly the misrepresentable population.
 
-**Why it went from 5 to 6 inside the same PR.** #6691 round 8 shipped v5 with a
+**Why it went 5 -> 6 -> 7 inside the same PR.** #6691 round 8 shipped v5 with a
 refused-netdev index that refused a netdev as soon as ANY row was unbindable for
 it; round 9 replaced that with EVERY-owner unanimity. Those two readers accept
 identical bytes and plan DIFFERENT bindings — a round-8 v5 helper drops a zoned
 VLAN sibling of a flagged parent where a round-9 v5 helper keeps it. A version
 whose meaning depends on which round produced the binary is not a version, so it
-moved. Neither 5 nor 6 has ever shipped (#6691 is unmerged), so the bump costs
-nothing, and the Go-side assertion is now an EQUALITY
-(`ProtocolVersion != secureTunnelSnapshotProtocolVersion`) rather than
+moved. Round 10 then moved it again, for a NEW FIELD:
+`FabricSnapshot.parent_unbindable`. None of 5, 6 or 7 has ever shipped (#6691 is
+unmerged), so the bumps cost nothing, and the Go-side assertion is now an
+EQUALITY (`ProtocolVersion != secureTunnelSnapshotProtocolVersion`) rather than
 `> 4`, which stayed green at the colliding value.
 
-The v6 bump carries the matching gate,
+**What v7 adds, and why a row-derived index was not enough.** The unanimity rule
+is only as good as its enumeration of OWNERS, and a unanimity over an EMPTY
+bucket answers "not refused" — right when nothing emits the netdev, catastrophic
+when something does and was not counted. A fabric MEMBER needs no interface
+stanza: `set interfaces fab0 fabric-options member-interfaces ge-0/0/0` pushes
+that netdev into the ingress-adjudication map and the RSS allowlist (and into the
+Rust candidate loop) with ZERO interface rows owning it. Measured on the round-9
+head with a live-xfrm `ge-0-0-0`: `rows OWNING ge-0-0-0: 0`, both `refuses*`
+false, the netdev present in both sets. Round 9's four fabric guards asked the
+right question of an oracle that could not answer it.
+
+Round 10 fixed the ORACLE rather than the loops, which are unchanged. An emitted
+fabric parent IS an owner of its netdev, so it carries a verdict —
+`fabricParentUnbindable` (`pkg/dataplane/userspace/fabric.go`), which hands a
+synthetic row to the SAME `netdevExclusionClasses` table an interface row is
+judged by, so a class added there covers fabric parents automatically — and it is
+tallied like any other owner. Being ownerless is NOT itself a refusal: the
+reference cluster authors exactly this stanza with no row for the member, so
+refusing on absence would strip the fabric parent out of every cluster this
+project runs. The verdict rides the wire because the Rust plane cannot recompute
+it: half the evidence is a Go-side RTM_GETLINK dump of kernel link kinds. That
+dump is also now taken ONCE per snapshot and shared by the row builder and the
+fabric builder, so two samples of a changing kernel cannot put one netdev's
+owners on opposite sides of the unanimity.
+
+A related invariant is worth stating because it is what keeps "a disagreement
+admits" safe: a BASE row and a fabric parent on the same netdev never disagree,
+since production computes both from identical config fields and the same kernel
+sample. The disagreements the rule tolerates are between a UNIT row and its base.
+
+The secure-tunnel bump carries the matching gate,
 `ensureSecureTunnelProtocolLocked`, with sentinel
 `ErrSecureTunnelProtocolIncompatible` (also registered in
 `requiredProtocolGateSentinels`). It arms off `snapshotHasSecureTunnel`,
@@ -1694,6 +1725,21 @@ rows) — not one per gate call, and the gate itself takes none. That dump no
 longer discards a partial result: netlink returns the links it did deserialize
 together with `ErrDumpInterrupted`, and round 8's `if err != nil { return nil }`
 threw away real evidence including the xfrm device itself.
+
+**The gate arms on an OBSERVED version, never on the absence of one** (#6691
+round 10). `lastStatus.ConfigSnapshotProtocolVersion == 0` is two states with
+opposite verdicts — "no helper has ever answered" (nothing to be incompatible
+with) and "a helper answered without the field" (genuinely too old) — and the
+value alone cannot separate them, so the observation is recorded explicitly:
+`setLastStatusLocked` / `clearLastStatusLocked` move `lastStatus` and
+`helperStatusObserved` together at every assignment site, and the gate returns
+nil when nothing has ever been observed. Without it the gate armed on silence,
+which is reachable: the deferred-worker arm
+(`manager_worker_arm_5134.go`) calls `ensureRequiredSnapshotProtocolLocked`
+BEFORE any helper liveness check, so a pending-XSK re-apply attempted while the
+helper was down disarmed the dataplane and aborted the commit on a reading that
+never happened. The three sibling required-protocol gates keep the older
+behaviour pending #7002, which has to weigh each one's own fail-closed argument.
 
 If the disarm ITSELF fails, the helper is still armed on its
 previous-good snapshot — and on a publish path whose classifier BPF maps

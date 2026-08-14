@@ -127,6 +127,19 @@ while the version stayed at 3, so a pre-#4626 helper at the same advertised
 version read only the singular field and NARROWED a multi-zone global deny (a
 rolling-upgrade fail-open).
 
+A bump is owed for a SEMANTIC change too, not only a new field: #6691 moved
+5 -> 6 for a refusal rule that reinterpreted existing rows (no field changed),
+then 6 -> 7 for `FabricSnapshot.parent_unbindable`. That last field exists
+because a fabric MEMBER needs no interface stanza on the Go side, so the parent
+netdev usually has no `InterfaceSnapshot` to carry the device-level flags, and
+`snapshot_refuses_parent_netdev`'s unanimity tally over an EMPTY owner set
+answers "not refused" — this plane then plans an AF_XDP binding on a netdev the
+control plane refused. The fabric's own vote is computed Go-side because half
+its evidence (kernel link kind `xfrm`) is an RTM_GETLINK dump this process does
+not take. `ownerless_fabric_parent_is_refused` is the fail-on-revert guard, and
+it carries the reference cluster's shape as its negative control: an ownerless
+parent that is NOT marked unbindable must still be planned.
+
 The helper also reports `config_snapshot_protocol_version` in status so a new
 daemon can fail closed before sending snapshots that require newer runtime
 semantics to an older helper binary that predates the gate. If the daemon

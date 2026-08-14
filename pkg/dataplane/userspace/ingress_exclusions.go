@@ -244,6 +244,20 @@ var netdevExclusionClasses = []netdevExclusionClass{
 // reader: to bound a laundering question, enumerate every CONTRIBUTOR to
 // the set, not every caller of the predicate.
 //
+// AND ROUND 9 CLOSED THEM WITH THE WRONG INSTRUMENT, which is worth
+// keeping visible because the loops READ correct after that round and
+// were not. Each loop asked userspaceRefusedNetdevs about the parent
+// netdev — but that index was built from interface ROWS, and the very
+// example above (`fabric-options member-interfaces ge-0/0/0`) names a
+// member that needs no interface stanza. Asking a row-derived index
+// about an ownerless netdev returns "not refused", so all four loops
+// asked the right question of an oracle that could not answer it, and
+// an unbindable ownerless parent went through unchanged. Round 10 fixed
+// the ORACLE (fabricParentUnbindable, tallied by
+// buildUserspaceRefusedNetdevs) rather than the loops, which are
+// unchanged and now correct. Enumerating the contributors is necessary;
+// it is not sufficient unless each contributor also gets a VOTE.
+//
 // The AF_XDP binding PLAN itself is gated on the Rust side by the
 // mirrored include_userspace_binding_interface (userspace-dp), off the
 // secure_tunnel flag this row carries — not by a fifth Go call site.
@@ -439,13 +453,33 @@ func userspaceOwnsItsNetdev(iface InterfaceSnapshot) bool {
 // detaching XDP/TC from it.
 //
 // The question this index answers is "is this netdev, AS A DEVICE, one we must
-// never bind?" — and a device cannot be both. When the rows that own it
-// disagree, at least one row that owns it is an ordinary data interface, and
-// that row will contribute the netdev to the binding plan on its own account
-// whatever the redirect does. Refusing on a disagreement therefore cannot
-// prevent the binding; it can only strip traffic from rows that were entitled to
-// it. So the rule is: refuse only when every owner agrees, and never when the
-// netdev has no owner at all.
+// never bind?" — and a device cannot be both. When the owners disagree, at least
+// one of them is an ordinary data interface, and that one will contribute the
+// netdev to the binding plan on its own account whatever the redirect does.
+// Refusing on a disagreement therefore cannot prevent the binding; it can only
+// strip traffic from rows that were entitled to it. So the rule is: refuse only
+// when every owner agrees.
+//
+// WHICH MAKES THE OWNER SET THE WHOLE CORRECTNESS ARGUMENT (#6691 round 10). A
+// unanimity rule over an EMPTY bucket answers "not refused", which is right when
+// it means "nothing emits this netdev" and catastrophic when it means "something
+// emits it and I did not count that something". Round 9 built the tally from
+// interface rows only, and a FABRIC MEMBER NEEDS NO INTERFACE STANZA:
+//
+//	set interfaces fab0 fabric-options member-interfaces ge-0/0/0
+//
+// emits ge-0-0-0's ifindex into the ingress-adjudication map and its name into
+// the RSS allowlist with zero rows owning it, so an ownerless unbindable parent
+// — a live xfrmi under a slot-shaped name, the reachable case — passed both
+// loops on both planes. Measured at 4cf507638 with that config plus a live-xfrm
+// ge-0-0-0: `rows OWNING ge-0-0-0: 0`, `refusesName = false`, and the netdev in
+// both sets.
+//
+// The fix is NOT a fourth conjunct. It is that the owner set was wrong: an
+// emitted fabric parent IS an owner, so it is tallied like one, carrying the
+// verdict fabricParentUnbindable computed for it. Every contributor to the sets
+// is now a voter in the unanimity, which is the property that makes "refuse only
+// when every owner agrees" safe rather than merely conservative.
 //
 // F1 IS PRESERVED EXACTLY, and it survives on the ownership half rather than on
 // a special case. Under `bind-interface st10` with a zoned sibling
@@ -501,13 +535,14 @@ func userspaceOwnsItsNetdev(iface InterfaceSnapshot) bool {
 // TestAliasTableRefusesEvenWhenTheChildNetdevResolves constructs that state
 // directly and is the fail-on-revert guard.
 //
-// Scope: built from rows, so it can only refuse a netdev some row OWNS. That is
-// sufficient here because every unit row's parent netdev is the base row's
-// netdev, and a unit exists only under a base in cfg.Interfaces.Interfaces — so
-// a redirect target always has a row. A netdev no row names cannot be
-// redirected onto in the first place. It is NOT sufficient for the FABRIC loop,
-// which contributes to two of the same sets without consulting this index at
-// all; see the caller-list correction in userspaceUnbindableNetdev.
+// Scope: built from the CONTRIBUTORS to the gated sets — interface rows and
+// fabric parents — so it can refuse only a netdev one of those names. For the
+// VLAN redirect that is automatically complete: every unit row's parent netdev
+// is the base row's netdev, and a unit exists only under a base in
+// cfg.Interfaces.Interfaces, so a redirect target always has a row. For the
+// FABRIC loops it took round 10 to become true; see fabricParentUnbindable. A
+// THIRD contributor added later must join this tally too — that is the
+// enumeration the caller-list correction in userspaceUnbindableNetdev is about.
 type userspaceRefusedNetdevs struct {
 	ifindex map[int]struct{}
 	name    map[string]struct{}
@@ -525,30 +560,41 @@ func (t netdevOwnerTally) refused() bool {
 	return t.owners > 0 && t.owners == t.unbindable
 }
 
-func buildUserspaceRefusedNetdevs(ifaces []InterfaceSnapshot) userspaceRefusedNetdevs {
+func buildUserspaceRefusedNetdevs(ifaces []InterfaceSnapshot, fabrics []FabricSnapshot) userspaceRefusedNetdevs {
 	byName := make(map[string]netdevOwnerTally)
 	byIfindex := make(map[int]netdevOwnerTally)
+	own := func(name string, ifindex int, unbindable bool) {
+		if name != "" {
+			tally := byName[name]
+			tally.owners++
+			if unbindable {
+				tally.unbindable++
+			}
+			byName[name] = tally
+		}
+		if ifindex > 0 {
+			tally := byIfindex[ifindex]
+			tally.owners++
+			if unbindable {
+				tally.unbindable++
+			}
+			byIfindex[ifindex] = tally
+		}
+	}
 	for _, iface := range ifaces {
 		if !userspaceOwnsItsNetdev(iface) {
 			continue
 		}
-		unbindable := userspaceUnbindableNetdev(iface)
-		if iface.LinuxName != "" {
-			tally := byName[iface.LinuxName]
-			tally.owners++
-			if unbindable {
-				tally.unbindable++
-			}
-			byName[iface.LinuxName] = tally
-		}
-		if iface.Ifindex > 0 {
-			tally := byIfindex[iface.Ifindex]
-			tally.owners++
-			if unbindable {
-				tally.unbindable++
-			}
-			byIfindex[iface.Ifindex] = tally
-		}
+		own(iface.LinuxName, iface.Ifindex, userspaceUnbindableNetdev(iface))
+	}
+	// A fabric parent is an owner of its netdev even when no interface row is
+	// (#6691 round 10) — the fabric loops emit it into the same sets a row
+	// does, and a fabric MEMBER needs no stanza. Its verdict rides on the
+	// snapshot (fabricParentUnbindable) because the Rust plane, which runs the
+	// mirror of this tally, cannot recompute it: the kernel-kind half of the
+	// evidence is Go-side netlink.
+	for _, fab := range fabrics {
+		own(fab.ParentLinuxName, fab.ParentIfindex, fab.ParentUnbindable)
 	}
 	out := userspaceRefusedNetdevs{
 		ifindex: make(map[int]struct{}),
