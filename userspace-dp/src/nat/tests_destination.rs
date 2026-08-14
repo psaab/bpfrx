@@ -2082,8 +2082,11 @@ fn dnat_all_valid_reports_no_parse_errors() {
 /// Every other `off: true` fixture in this file also leaves `pool_address`
 /// empty — exactly the shape Go emits — so the suite could not tell "Rust
 /// ignores the pool" from "Go removed the pool". This one carries BOTH `off`
-/// and a usable pool, i.e. the snapshot Go never produces (a hand-built or
-/// mixed-version peer snapshot would).
+/// and a usable pool, i.e. the snapshot Go never produces — a hand-built one, or
+/// a mixed-version xpfd/helper pair, since `DestinationNATRuleSnapshot` is the
+/// xpfd->helper wire form. NOT a "mixed-version peer" (#6820 round 3): HA config
+/// sync ships configuration TEXT and the receiver recompiles locally, so a peer
+/// never transports a snapshot at all.
 ///
 /// Two arms, because a bare `None` is also what a DROPPED entry returns:
 ///   - control: the SAME rule with `off: false` must TRANSLATE, proving the

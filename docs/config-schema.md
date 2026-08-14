@@ -3109,10 +3109,15 @@ Both rejection MESSAGES are content-bound by
 operator-visible on both paths — verbatim at strict commit, wrapped into a
 `cfg.Warnings` entry on the tolerant one — and the 2+-action text used to state
 a mechanism the compiler had stopped using (a packed-key/child-order pick),
-which no test could see. It now says what actually happens: every authored
-action is published and the DATAPLANE resolves the rule by a fixed precedence
-(`off` > `interface` > `pool` for SNAT, `off` > `pool` for DNAT), discarding the
-rest.
+which no test could see. It now says what actually happens — and says it
+PER KIND, because the two kinds do not share a mechanism (#6820 round 3). For
+source NAT every authored action is published and the DATAPLANE resolves the
+rule `off` > `interface` > `pool`. For destination NAT the COMPILER resolves
+`off` itself: `buildDestinationNATSnapshots` short-circuits on `isOff`, never
+looks the pool up, and publishes `PoolAddress: ""`, so "every action is
+published" is false for a DNAT rule; the dataplane's `off` > `pool` branch then
+covers any entry that arrives carrying both. Either way all but one authored
+action is discarded, and the survivor is not chosen by configuration order.
 
 *What the tolerant path actually does (#5717).* Only a malformed rule reaches
 the lenient arm — the strict commit path rejects it — but the two arities land

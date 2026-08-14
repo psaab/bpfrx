@@ -88,7 +88,7 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 	}
 	for _, want := range []string{
 		"2 mutually-exclusive translation actions",
-		"published to the dataplane",
+		"every one of them is published to the dataplane",
 		"fixed precedence",
 		"`off` wins over `interface`, and `interface` over `pool`",
 		"all but one action is silently discarded",
@@ -116,12 +116,27 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 	if err == nil {
 		t.Fatal("CompileConfig ACCEPTED a two-action destination-NAT rule")
 	}
-	if !strings.Contains(err.Error(), "`off` wins over `pool`") {
+	if !strings.Contains(err.Error(), "`off`-over-`pool` precedence") {
 		t.Errorf("2+-action DNAT rejection must name the DESTINATION precedence: %v", err)
 	}
 	if strings.Contains(err.Error(), "`interface`") {
 		t.Errorf("2+-action DNAT rejection names `interface`, an action a destination-NAT "+
-			"rule cannot carry — the precedence clause leaked across kinds: %v", err)
+			"rule cannot carry — the mechanism clause leaked across kinds: %v", err)
+	}
+	// The kind-specific MECHANISM, not just the ordering (#6820 round 3). The DNAT
+	// builder short-circuits on `isOff` and never resolves the pool
+	// (pkg/dataplane/userspace/nat_destination.go), so telling a DNAT operator
+	// that "every one of them is published to the dataplane" — true only of SNAT —
+	// describes a path their rule does not take. A shared sentence here is
+	// necessarily false for one of the two kinds.
+	if !strings.Contains(err.Error(), "the compiler resolves `off` itself") {
+		t.Errorf("2+-action DNAT rejection must say the COMPILER resolves `off` (pool-less "+
+			"exemption, no pool lookup), not that every action reaches the dataplane: %v", err)
+	}
+	if strings.Contains(err.Error(), "every one of them is published") {
+		t.Errorf("2+-action DNAT rejection claims every action is published — false for "+
+			"destination NAT, whose builder skips pool resolution entirely for an `off` "+
+			"rule and publishes an empty PoolAddress: %v", err)
 	}
 
 	// The ZERO-action message was rewritten by this PR too ("falls through —

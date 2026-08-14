@@ -79505,3 +79505,88 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/dataplane/userspace/nat_destination.go,
   pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
   userspace-dp/src/nat/tests_source.rs, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:05Z
+- **Action**: #6820 round 3 — claim-only corrections after a Codex MERGE-NEEDS-MINOR
+  at `663a828c2` (zero runtime findings; "no production line whose deletion leaves
+  the relevant Go or Rust suite green"). Six items, all verified firsthand before
+  editing.
+
+  **1 (operator-facing).** The 2+-action rejection said "every one of them is
+  published to the dataplane". FALSE for destination NAT:
+  `buildDestinationNATSnapshots` short-circuits on `isOff`
+  (`nat_destination.go:115`), never resolves the pool, and publishes
+  `PoolAddress: ""` (`:570`). The two kinds do not share a mechanism, so a shared
+  sentence is necessarily false for one of them. Replaced the `precedence`
+  parameter of the shared `check` closure with a whole-clause `mechanism`
+  parameter: source NAT keeps "every one of them is published to the dataplane,
+  which resolves the rule by a fixed precedence — `off` wins over `interface`,
+  and `interface` over `pool`"; destination NAT gets "the compiler resolves `off`
+  itself, publishing a pool-less exemption and never looking the pool up, and the
+  dataplane applies the same `off`-over-`pool` precedence to any entry that
+  carries both". Same correction in the validator's own doc comment and at
+  `docs/config-schema.md`, where the false summary sat immediately before the
+  correct pool-less explanation.
+
+  **2.** `compiler_opts.go` claimed a contradictory rule records "BOTH fields"
+  (three for `interface`+`off`+`pool`) and that "off-precedence governs"
+  universally (false for `interface`+`pool`, which carries no `off`), and said an
+  actionless rule "is emitted" (true for SNAT; the DNAT builder SKIPS it).
+  Rewritten to state the kind split and to scope off-precedence to
+  `off`-bearing contradictions.
+
+  **3.** The peer-effective test said precedence discards "whatever the operator
+  authored second". Author order is irrelevant, and in this very fixture the
+  second-authored `off` is the one that WINS.
+
+  **4.** `tests_destination.rs` still cited a "mixed-version peer snapshot" — the
+  same refuted shape as round 2's N3. HA config sync ships configuration TEXT and
+  the receiver recompiles; the real skew path is a mixed-version xpfd/helper pair.
+
+  **5.** Two sites claimed the retained snapshot fields let the strict gate "count
+  them on the next commit". Inverted: `validateNATTerminalActionCardinalityStrict`
+  counts `natThenTerminalActionCount(rule.Then)` on the COMPILED CONFIGURATION,
+  upstream of snapshot construction, and the next commit recompiles from the AST.
+  What the else-if→if change fixed is `rule.Then`; the snapshot question is
+  separate and downstream.
+
+  **6.** The node1 control was called a "commit". It runs
+  `ValidatePeerEffectiveStrict` alone; a real node1 commit also compiles node1's
+  own two-action view and REJECTS, so the label asserted the opposite of the
+  truth.
+
+  **Harness.** Applied the witnessed-green rule: a survivor claim IS a green, and
+  a green is credible only if a named RED occurred in the same invocation and
+  package. Each survivor cell therefore carries an unconditional SENTINEL test
+  alongside the mutation. Re-measured at `ecf81adbc`: B1 survivor → only the
+  sentinel red across `pkg/dataplane/userspace` + `pkg/config`; the ONE-CONJUNCT
+  adjacency control (`&& !(PoolName != "")`) → sentinel + the two off+pool
+  sub-tests, proving the harness discriminates on that exact line; B3 survivor →
+  only the sentinel across four packages (with round-2's new test file removed,
+  since `git checkout <base> -- pkg` leaves files absent at base in place and the
+  first attempt was contaminated by exactly that); B2 survivor (Rust) → 278
+  passed / 1 failed, the failure being the cargo sentinel. Round 3's own message
+  edit is bound by two RED cells: leaking the source mechanism onto the
+  destination kind reds `compiler_nat_terminal_action_5628_test.go:133` and
+  `:137`; dropping the publish-all clause from the source mechanism reds `:97`.
+
+  **This round is NOT executable-free.** Item 1 rewrites a production string
+  literal, so the binary changes. Measured on `cmd/xpfd` built `-trimpath` at
+  both heads: `.text` 285a52a8… → 320a739b…, `.rodata` 17a5c719… → b8b433ac….
+  The runtime gates therefore do NOT carry from `663a828c2`; both were re-run at
+  this tree instead.
+
+  **Validation.** `go build ./...` rc 0; `go test -count=1 ./...` FULL_RC=0;
+  `cargo test` (full userspace-dp, `--test-threads=4`) FULL_RC=0 — which also
+  closes round 2's outstanding cargo gate, whose parallel run had parked ~5.5h on
+  the #6157 wg-engine futex shape at 4340 passed / 0 failed under host
+  oversubscription. One intermediate `go test ./...` reported FULL_RC=1 on three
+  `pkg/ddns` cases, all `bind: address already in use` from ephemeral-port
+  collisions with ~12 concurrent test runs on this host; `pkg/ddns` alone is rc 0
+  and the re-run of the full suite is FULL_RC=0. gofmt clean on every touched Go
+  file.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go, pkg/config/compiler_opts.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go,
+  pkg/config/compiler_peer_effective_nat_terminal_action_6820_test.go,
+  pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
+  userspace-dp/src/nat/tests_destination.rs, docs/config-schema.md, _Log.md

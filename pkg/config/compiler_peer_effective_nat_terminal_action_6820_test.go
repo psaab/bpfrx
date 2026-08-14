@@ -21,8 +21,14 @@ import (
 // peer-effective run is the ONLY strict adjudication the peer view ever gets. A
 // `${node}` / `groups nodeN` divergence that adds a second terminal action on
 // the peer alone therefore commits green on the origin and lands malformed on
-// the standby, where the dataplane resolves it by the fixed precedence and
-// discards whatever the operator authored second.
+// the standby, where a FIXED precedence picks the survivor and the other
+// authored action is discarded.
+//
+// Not "whatever was authored second" — author order is irrelevant to the
+// precedence, and in this fixture the second-authored action (`off`, from the
+// node1 group) is the one that WINS over the top-level `pool P`. An
+// order-flavoured description would be doubly wrong: wrong about the mechanism,
+// and wrong about this very case.
 //
 // Set-command construction per CLAUDE.md: ParseSetCommand + tree.SetPath via
 // buildTreeFromSet, never NewParser (which merges newline-separated set lines
@@ -94,18 +100,26 @@ func TestPeerOnlyNATTerminalActionRejectedAtOriginCommit_6820(t *testing.T) {
 // one that rejects this candidate from EITHER node's perspective (which would
 // mean the divergence, not the peer view, is what it sees).
 //
-//   - The node1-perspective run must ACCEPT: from node1 the peer is node0,
-//     whose effective view carries one action. Rejecting here would prove the
-//     gate is reading the submitting node's own view, not the peer's.
+//   - The node1-perspective run of THIS GATE must ACCEPT: from node1 the peer
+//     is node0, whose effective view carries one action. Rejecting here would
+//     prove the gate is reading the submitting node's own view, not the peer's.
+//     Note the scope precisely (#6820 round 3): this calls
+//     ValidatePeerEffectiveStrict alone, so it proves peer-effective acceptance
+//     and nothing more. It is NOT "node1 commits clean" — a real node1 commit
+//     also compiles node1's OWN view, which carries the two-action rule and is
+//     rejected by the same gate through runUniformGates. Calling this leg a
+//     commit would assert the opposite of what a node1 commit does.
 //   - A candidate with the SAME two-action divergence removed must be accepted
 //     from both perspectives, so the rejection above is attributable to the
 //     extra `off` and nothing else about `${node}` expansion.
 func TestPeerEffectiveNATTerminalActionSymmetryAndCleanCase_6820(t *testing.T) {
 	diverged := buildTreeFromSet(t, peerDivergentSNATTerminalAction())
 	if err := ValidatePeerEffectiveStrict(diverged, 1); err != nil {
-		t.Fatalf("node1 commit REJECTED although its peer (node0) carries exactly one "+
-			"terminal action — the gate is adjudicating the submitting node's own "+
-			"view, not the peer's: %v", err)
+		t.Fatalf("the PEER-EFFECTIVE gate run from node1 REJECTED although its peer "+
+			"(node0) carries exactly one terminal action — the gate is adjudicating "+
+			"the submitting node's own view, not the peer's. (This is the gate alone, "+
+			"not a node1 commit: a node1 commit ALSO compiles node1's own two-action "+
+			"view and is rejected.): %v", err)
 	}
 
 	clean := []string{

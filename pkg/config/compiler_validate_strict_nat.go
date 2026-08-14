@@ -2748,17 +2748,21 @@ func natThenTerminalActionCount(then NATThen) int {
 //     for why the two are not the same outcome (#6820).
 //
 //   - TWO OR MORE actions (contradictory, mutually-exclusive translations such
-//     as `off` + `pool` or `interface` + `pool` inside ONE block): the compiler
-//     publishes EVERY authored action (the #5628 else-if→if setter change) and
-//     the DATAPLANE then resolves the rule by a FIXED precedence — `off`, then
-//     `interface`, then `pool` for source NAT; `off` over `pool` for
-//     destination NAT — so all but one authored action is silently discarded
-//     and the surviving one is chosen by that precedence, not by anything the
-//     operator wrote. Do NOT say the compiler "picks one by packed-key / child
-//     order": it did before #5628 and does not now, and the CONTRADICTORY
-//     bullet below says so explicitly (#6820 re-gate). Nor is the discarded
-//     action always harmless — `interface` + `pool P` translates onto the
-//     egress interface address and never uses P.
+//     as `off` + `pool` or `interface` + `pool` inside ONE block): all but one
+//     authored action is silently discarded, and the survivor is chosen by a
+//     FIXED precedence, not by anything the operator wrote. WHERE that happens
+//     differs by kind, and the two do NOT share a mechanism (#6820 round 3):
+//     source NAT publishes every authored field (the #5628 else-if→if setter
+//     change) and the DATAPLANE picks `off` > `interface` > `pool`; destination
+//     NAT resolves `off` in the COMPILER — buildDestinationNATSnapshots
+//     short-circuits on `isOff`, skips the pool lookup entirely and publishes
+//     `PoolAddress: ""` — so "every action is published" is FALSE for a DNAT
+//     rule and must not be written as a shared sentence. Do NOT say the compiler
+//     "picks one by packed-key / child order" either: it did before #5628 and
+//     does not now, and the CONTRADICTORY bullet below says so explicitly
+//     (#6820 re-gate). Nor is the discarded action always harmless —
+//     `interface` + `pool P` translates onto the egress interface address and
+//     never uses P.
 //
 // This counts actions WITHIN one complete then-block only. Duplicate `then`
 // CONTAINERS are #3850's intentional last-wins merge (compileNAT resets
@@ -2857,12 +2861,17 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	if cfg == nil {
 		return nil
 	}
-	// precedence names the DATAPLANE's fixed resolution order for this NAT kind
-	// and rides into the 2+-action message. It differs per kind (destination NAT
-	// has no `interface` action at all), so it is a parameter rather than a
-	// constant: a message that told a destination-NAT operator `interface` beats
-	// `pool` would name a mechanism their rule cannot reach.
-	check := func(kind, actions, precedence string, rulesets []*NATRuleSet) error {
+	// mechanism is the WHOLE per-kind explanation of how the surviving action is
+	// chosen, not just a precedence ordering, because the two kinds do not share
+	// a mechanism (#6820 round 3). Source NAT forwards every authored field and
+	// the DATAPLANE picks; destination NAT resolves `off` in the COMPILER —
+	// buildDestinationNATSnapshots short-circuits on `isOff`, skips pool
+	// resolution entirely, and publishes `PoolAddress: ""`
+	// (pkg/dataplane/userspace/nat_destination.go) — so "every one of them is
+	// published" is simply false for a DNAT rule. A shared sentence would have to
+	// be false for one kind, and this is operator-facing text, so it is a
+	// parameter.
+	check := func(kind, actions, mechanism string, rulesets []*NATRuleSet) error {
 		sorted := append([]*NATRuleSet(nil), rulesets...)
 		sort.SliceStable(sorted, func(i, j int) bool {
 			if sorted[i] == nil || sorted[j] == nil {
@@ -2891,13 +2900,12 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 				case n >= 2:
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
-							"translation actions (expected exactly one of %s); every one of them "+
-							"is published to the dataplane, which resolves the rule by a fixed "+
-							"precedence (%s) rather than by what was configured, so all but one "+
-							"action is silently discarded. (Duplicate `then` CONTAINERS resolve "+
+							"translation actions (expected exactly one of %s); %s, so all but "+
+							"one action is silently discarded and the survivor is not the one "+
+							"you configured first or last. (Duplicate `then` CONTAINERS resolve "+
 							"last-wins per #3850; this rejects contradictory actions inside one "+
 							"block.)",
-						kind, rs.Name, rule.Name, n, actions, precedence)
+						kind, rs.Name, rule.Name, n, actions, mechanism)
 				}
 			}
 		}
@@ -2905,14 +2913,18 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 	}
 	if err := check("source",
 		"`source-nat interface`, `source-nat pool <p>`, or `source-nat off`",
-		"`off` wins over `interface`, and `interface` over `pool`",
+		"every one of them is published to the dataplane, which resolves the rule "+
+			"by a fixed precedence — `off` wins over `interface`, and `interface` "+
+			"over `pool`",
 		cfg.Security.NAT.Source); err != nil {
 		return err
 	}
 	if cfg.Security.NAT.Destination != nil {
 		if err := check("destination",
 			"`destination-nat pool <p>` or `destination-nat off`",
-			"`off` wins over `pool`",
+			"the compiler resolves `off` itself, publishing a pool-less exemption "+
+				"and never looking the pool up, and the dataplane applies the same "+
+				"`off`-over-`pool` precedence to any entry that carries both",
 			cfg.Security.NAT.Destination.RuleSets); err != nil {
 			return err
 		}

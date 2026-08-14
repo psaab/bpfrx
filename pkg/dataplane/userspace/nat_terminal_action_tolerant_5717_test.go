@@ -221,8 +221,9 @@ security {
 		}
 		if !s.InterfaceMode {
 			t.Errorf("triple snapshot InterfaceMode = false, want true — every authored "+
-				"action must reach the dataplane so the strict gate still counts THREE "+
-				"on the next commit: %+v", s)
+				"action must reach the dataplane, which is where the precedence is "+
+				"applied; dropping one here silently reduces the rule the dataplane "+
+				"resolves: %+v", s)
 		}
 		if s.PoolName != "p1" {
 			t.Errorf("triple snapshot PoolName = %q, want p1", s.PoolName)
@@ -254,10 +255,20 @@ security {
 // InterfaceMode is true — the Rust tests would still pass, because interface
 // mode wins there either way. This test is what binds the Go builder.
 //
-// What surviving both fields buys, precisely: the published rule keeps the
-// contradiction, so the strict gate still counts TWO terminal actions and
-// rejects the rule on the next commit, and the Rust matcher still sees a
-// pool-mode rule whose `interface` precedence it must honour. It does NOT keep
+// What surviving both fields buys, precisely: the Rust matcher still sees a
+// pool-mode rule whose `interface` precedence it must honour, so the precedence
+// is exercised on the shape the operator actually wrote rather than on a
+// single-action rule the compiler invented.
+//
+// It does NOT feed the strict gate. An earlier revision said the retained
+// snapshot fields let the gate "still count TWO terminal actions and reject the
+// rule on the next commit"; that inverts the dependency (#6820 round 3).
+// validateNATTerminalActionCardinalityStrict counts
+// natThenTerminalActionCount(rule.Then) on the COMPILED CONFIGURATION, upstream
+// of snapshot construction — the next commit recompiles from the AST and never
+// reads a snapshot. What the else-if→if setter change fixed is `rule.Then`
+// itself; this test covers the separate, downstream question of whether the
+// builder then forwards those fields. It does NOT keep
 // the contradiction visible to `show`: both source-NAT renderers select ONE
 // action to display — pkg/cli/cli_show_nat.go initialises `action` as
 // "interface" and overwrites it with `pool <name>` whenever PoolName is
