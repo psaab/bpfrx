@@ -80546,3 +80546,101 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
   pkg/dataplane/userspace/process_linkcycle.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-14
+- **Action**: #6871 round 13b — fold the hostile leg's two MINORs. MINOR-1 binds
+  the gate's reader (a constant reader was caught by nothing). MINOR-2 turned
+  out to be larger than the reported mislabel: the round-12 table is not
+  reproducible at head AT ANY SCOPE, because the tree it was measured on no
+  longer exists.
+
+  HEAD CERTIFICATION FIRST, because it decides whether a smoke is owed. Both
+  production files parsed with go/parser (comments dropped) and re-printed with
+  go/printer are byte-identical between a5e9ecd06 and this branch:
+  process_linkcycle.go sha256 9be501b6b07dce0f..., daemon_apply_dataplane.go
+  89608582ee50867a.... The round-13 B1 fix is entirely in the test file and in
+  comments, so the 14/14 smoke at 57d45d8ab still carries. No re-run owed.
+
+  MINOR-1 — the reader was unbound. Forced to return a CONSTANT, leaseSeamCaller
+  degenerates the gate to "every goroutine, from every call site, is the owner",
+  restoring the vacuity rounds 12 and 13 closed. Measured: with the constant
+  planted, `go test ./pkg/dataplane/userspace/ -skip
+  TestLeaseSeamCallerDistinguishes...` fails only three eventstream tests, and
+  the UNMUTATED control fails a SUPERSET of six of the same load-sensitive
+  eventstream tests — so the constant is invisible to the whole package, and the
+  three are load flakes rather than a plant effect. The new
+  TestLeaseSeamCallerDistinguishesGoroutinesAndCallSites_6871 catches it,
+  firing two assertions by name: the frame half reported in-flight from a plain
+  test function, and a second goroutine reported the same id (424242).
+
+  It binds both halves and both directions: id non-zero, id STABLE across two
+  reads on one goroutine, id DIFFERENT on a second goroutine, frame half FALSE
+  from a plain test function and TRUE from inside Manager.linkCycleInFlight, and
+  the id unchanged by call depth.
+
+  B2 DECISION, narrowed by the hostile leg's evidence and stated because the
+  lead asked for a reason if I deviated. Their measurement (100,000 goroutines,
+  0 reused ids, 0 parse failures; forcing a parse error reds all three cells
+  loudly) argues for the cheap prefix check over a per-manager seam, and I agree
+  — the seam would add a production field to serve a fixture, and it is not
+  built. But the prefix check does NOT address what B2 actually is. Goid reuse
+  and parse failure are about whether the reader IDENTIFIES the right goroutine;
+  the consumable one-shot is about the installing goroutine's own earlier read
+  through linkCycleLeaseDeadline, where identification is perfectly correct and
+  still wrong. So: prefix check YES, per-manager seam NO, and the frame gate as
+  well, because it is the only one of the three that closes the measured defect.
+
+  MINOR-2 — the reported fix was a scope relabel; the measurement says the
+  numbers are gone entirely. Round 12's table attributed its false greens to a
+  scope. They were a property of a TREE STATE: the round-11 fixture with the
+  four acquisitions in link_cycle_lease_6871_test.go unreleased. Round 12 closed
+  all four (each now pairs t.Cleanup(m.releaseLinkCycleLease) with its acquire,
+  and release stops AND JOINS the beat), so no heartbeat outlives its test.
+
+  Re-measured at head with the same instrument — gate OFF, 15s -> 200us beat, B1
+  reverted so both cells are obliged to fail — and counting non-owner arrivals at
+  the seam DIRECTLY rather than inferring them from outcomes, split into those
+  that can win the one-shot (before `fired`) and those that cannot:
+
+	scope                              false greens   pre-fire   post-fire
+	this file's tests, -count=100 ...   0/100  0/100      0        0 and 4
+	+ link_cycle_lease_6871_test.go .   0/100  0/100      0          10
+	whole package, -count=20 .......    0/12   0/12       0           0
+
+  The lead's and the hostile leg's DIRECTION is confirmed — arrivals scale with
+  scope and come from the leak-bearing file, 10 against 0. Their replacement
+  numbers (15/62, 12/62) are not, and neither are round 12's: at head not one
+  arrival landed before the one-shot had fired, so there is no false green to
+  attribute to any scope. Reported rather than quietly adopted, because a number
+  attributed to the wrong tree is exactly what this round is correcting.
+
+  The whole-package denominator is 12 rather than 20 because the run hit `go
+  test`'s 10-minute default timeout at iteration 12 — verified as a timeout
+  panic, not the off-goroutine t.Fatal panic round 12 attributed its own
+  truncation to.
+
+  This does NOT weaken the gate. What justifies it at head needs no thief:
+  self-consumption by the installing goroutine reproduces 100/100 (round 13 B2,
+  cell b1). The cross-goroutine steal is the case that no longer reproduces here,
+  and the gate retires a producer that returns the moment anyone adds an
+  unreleased acquire — which is the argument for gating rather than for chasing
+  releases.
+
+  NIT, answered rather than left: the lead called `if owner == 0 { t.Fatal }`
+  unfireable. Severing it is unfireable given a WORKING prefix parse, but the
+  check's real trigger is a header-format change, and cell b8 fires it — 20
+  iterations, every cell red at the t.Fatal. Kept.
+
+  HARNESS CORRECTION worth recording. The first scope run reported "0 of 0" for
+  two cells: /dev/shm was 100% full and both were build breaks. A zero
+  denominator reads exactly like a clean result. The harness now gates on
+  build-break markers BEFORE counting and refuses a zero denominator, and TMPDIR
+  moved to /var/tmp (still short enough for sun_path). The 18 B1/B2 cells were
+  re-checked and are unaffected: no space or build failure in any of their logs,
+  no nonzero BUILD_RC, no zero denominator.
+
+  VALIDATION: `go test ./...` re-run at this head. The package's known
+  load-sensitive eventstream/deadline tests flake under concurrent agent load
+  (six failures on an unmutated control run mid-round, zero on the quiescent
+  full-suite run).
+- **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go, _Log.md

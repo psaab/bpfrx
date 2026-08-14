@@ -73,43 +73,62 @@ import (
 //	entered, no CAS is attempted, and nothing is tested.
 //
 // Fixed and B1-reverted implementations return true identically there, so the
-// cell PASSES VACUOUSLY. Measured with B1 REVERTED — so both cells are OBLIGED
-// to fail — and the beat accelerated 15s -> 200us, -test.count in one binary so
-// leaked beats accumulate. Every PASS below is therefore a FALSE GREEN:
+// cell PASSES VACUOUSLY.
 //
-//	                                          renewal    fresh_prepare
-//	whole package, HEAD fixture .............   5 / 20       7 / 20
-//	whole package, the four leaks in
-//	  link_cycle_lease_6871_test.go closed ..   4 / 20       5 / 20
-//	whole package, this gate + those closures   0 / 20       0 / 20
-//	this file's tests only, HEAD fixture ....  13 / 54      13 / 54
-//	this file's tests only, this gate .......   0 / 100      0 / 100
+// ROUND 12 MEASURED THAT ON A TREE THAT NO LONGER EXISTS, and this comment
+// carried its numbers as though they were properties of a scope (#6871 round
+// 13). They were properties of a tree state: the round-11 fixture with the four
+// acquisitions in link_cycle_lease_6871_test.go left UNRELEASED. Round 12 closed
+// all four — each now pairs t.Cleanup(m.releaseLinkCycleLease) with its acquire,
+// which STOPS AND JOINS the heartbeat — and with no heartbeat outliving its
+// test, no thief exists to win the one-shot.
 //
-// (The 54 is not a typo: that run died at iteration 54 on a stolen inject
-// calling t.Fatal off-goroutine. See the panic note below.)
+// Re-measured at head with the same instrument (gate OFF, beat accelerated
+// 15s -> 200us, B1 REVERTED so both cells are OBLIGED to fail), counting seam
+// arrivals by a non-owner goroutine directly rather than inferring them from
+// outcomes, and splitting the arrivals that can WIN the one-shot (before `fired`
+// is set) from the ones that cannot:
 //
-// The SECOND ROW is why the gate is the fix and the releases are only hygiene.
-// Closing every unreleased acquire in the file that owns both LIVE leaks barely
-// moves the number, because the seam is process-global and any other file's next
-// unreleased acquire re-supplies a thief. Enumerating leak sites is a race the
-// next acquisition site wins; owning the injection is not.
+//	scope                              false greens   pre-fire   post-fire
+//	this file's tests, -count=100 ...   0/100  0/100      0        0 and 4
+//	+ link_cycle_lease_6871_test.go .   0/100  0/100      0          10
+//	whole package, -count=20 .......    0/12   0/12       0           0
 //
-// The steal was also observed DIRECTLY rather than inferred: an instrumented
-// build of that second row printed the installing and the firing goroutine ids
-// whenever they differed, and over six package runs it reported exactly one
-// mismatch — firing from `startLinkCycleHeartbeat.func1` via RenewLinkCycle ->
-// linkCycleInFlight -> linkCycleLeaseElapsed, on a goroutine created long before
-// the test — against exactly one false green, the same cell in the same run.
+// (0 and 4 is two separate runs of the same cell, so a post-fire arrival there
+// is at the edge of the noise. The whole-package denominator is 12 because the
+// run hit `go test`'s 10-minute default timeout at iteration 12 — a truncation,
+// not a signal, and NOT the off-goroutine panic round 12 attributed the earlier
+// truncation to.)
+//
+// WHAT SURVIVES, and it is the direction round 12 and the round-13 hostile
+// review both argued: thief ARRIVALS scale with scope, and they come from the
+// leak-bearing file rather than from this one — 10 against 0. What does NOT
+// survive is any false green attributable to a scope, because at head not one
+// arrival landed before the one-shot had already fired. The old row labelled
+// "this file's tests only" could not have been measured at that scope, and the
+// parenthetical about a run dying at iteration 54 on a stolen inject is not
+// reproducible either.
+//
+// SO THE GATE IS NOT JUSTIFIED BY THAT TABLE ANY MORE, and it does not need to
+// be. What justifies it at head needs no thief at all: the installing
+// goroutine's OWN earlier read of the seam consumes the one-shot, measured
+// 100/100 vacuous with an intervening read and B1 reverted (see the round-13
+// note below). A cross-goroutine steal is the case round 12 could still
+// reproduce and this tree cannot; self-consumption is the case that reproduces
+// exactly, and the two gates close both.
 //
 // THE DIRECTION IS THE OPPOSITE OF WHAT ROUND 11 WROTE HERE, and it is spelled
 // out because the 75000x acceleration above is exactly the instrument the next
 // lane will reach for. Round 11 said a stolen injection leaves "the lease word
 // it expected to move unmoved" and can therefore only RED a cell, never green
 // one. Backwards: the steal is precisely what MOVES the word early — it REMOVES
-// the expiry the reader was going to observe. A steal greens VACUOUSLY. It reds
+// the expiry the reader was going to observe. A steal greens VACUOUSLY, and reds
 // only on the narrow ordering where the reader's own CAS(stale -> 0) commits
-// before the thief's store lands, measured at HEAD as 4 of 200 accumulating
-// iterations and 1 of 200 separate invocations, all in fresh_prepare_wins_the_cas.
+// before the thief's store lands. Round 12 put numbers on that narrow ordering
+// (4 of 200 accumulating iterations, 1 of 200 separate invocations, all in
+// fresh_prepare_wins_the_cas); those belong to the same pre-closure tree as the
+// table above and do not reproduce here either. The DIRECTION is what matters
+// and it is a consequence of what inject() does to the word, not of a count.
 //
 // ATOMIC, and no longer the thing that makes this race-free (#6871 round 13).
 // Round 11 made the flag an atomic.Bool because the closure WAS read from more
@@ -144,6 +163,13 @@ import (
 // calls t.Fatal from the heartbeat goroutine; that is the panic round 12
 // reproduced (1 in a 100-iteration B1-reverted run), and it is not a double
 // injection. Neither producer fired at HEAD: 0 panics in 200 accelerated runs.
+//
+// That reproduction belongs to the same pre-closure tree as the table above
+// (#6871 round 13): with the four acquisitions released, no beat outlives its
+// test, so the stolen-injection producer has nothing to fire from and cannot be
+// re-demonstrated here. The gate still retires it — a producer that is currently
+// unreachable is exactly the kind that returns the moment someone adds an
+// unreleased acquire, which is why the fix is the gate and not the releases.
 //
 // At the production 15s beat the collision is vanishingly unlikely rather than
 // impossible — the window is microseconds wide against a 15s period, so a beat
@@ -246,6 +272,88 @@ func leaseSeamCaller() (uint64, bool) {
 		return 0, false
 	}
 	return id, bytes.Contains(rest, []byte(leaseSeamInFlightFrame))
+}
+
+// TestLeaseSeamCallerDistinguishesGoroutinesAndCallSites_6871 binds the reader
+// the gate is built on (#6871 round 13).
+//
+// NEITHER HALF IS OBSERVABLE FROM THE CELLS BELOW, which is the whole reason
+// this exists. Force leaseSeamCaller to return a CONSTANT id and a constant
+// true and the gate degenerates to "every goroutine, from every call site, is
+// the owner" — restoring exactly the vacuity rounds 12 and 13 closed — and the
+// entire suite stays GREEN, because nothing else drives a second goroutine or a
+// second call site through it. A guard whose reader can be replaced by a
+// constant with no test noticing is a guard bound by nothing.
+//
+// This is a FUTURE-REGRESSION gap rather than a present inability to fire: the
+// realistic failure is a runtime stack-header change, and that fails the prefix
+// check, returns 0, and injectAtLeaseExpiryCheck t.Fatals loudly. It is closed
+// anyway because it is five assertions.
+func TestLeaseSeamCallerDistinguishesGoroutinesAndCallSites_6871(t *testing.T) {
+	self, inFlight := leaseSeamCaller()
+	if self == 0 {
+		t.Fatal("leaseSeamCaller reported id 0 from a plain test goroutine: the " +
+			"runtime.Stack header did not start with \"goroutine \", so the gate can no " +
+			"longer identify anyone and every cell in this file is about to fail closed")
+	}
+	if inFlight {
+		t.Error("leaseSeamCaller reported IN-FLIGHT from a plain test function. The frame " +
+			"half must be false anywhere but inside Manager.linkCycleInFlight, or the gate " +
+			"admits this goroutine's reads from linkCycleLeaseDeadline too — which is the " +
+			"consumable one-shot round 13 exists to close")
+	}
+
+	// Stable across two reads on one goroutine: the gate stores an owner and
+	// compares a LATER read against it, so an unstable id would reject the
+	// installer's own injection and turn every cell vacuous in the other
+	// direction.
+	if again, _ := leaseSeamCaller(); again != self {
+		t.Errorf("two reads on one goroutine returned different ids (%d then %d)", self, again)
+	}
+
+	// Different on a different goroutine. A constant reader satisfies every
+	// assertion above and fails this one.
+	other := make(chan uint64, 1)
+	go func() {
+		id, _ := leaseSeamCaller()
+		other <- id
+	}()
+	if got := <-other; got == self {
+		t.Errorf("a second goroutine reported the SAME id (%d) as this one. Telling a "+
+			"stolen injection from the installer's own is the gate's entire job, and a "+
+			"reader that cannot distinguish two goroutines admits every thief", got)
+	}
+
+	// And TRUE from inside linkCycleInFlight — the half a rename of that method
+	// would silently empty, leaving a gate that admits nobody.
+	m := New()
+	t.Cleanup(m.releaseLinkCycleLease)
+	m.linkCycleLeaseUntil.Store(int64(linkCycleLeaseTTL))
+	var sawInFlight atomic.Bool
+	var sawID atomic.Uint64
+	swapLinkCycleLeaseElapsed(t, func() time.Duration {
+		id, inF := leaseSeamCaller()
+		if inF {
+			sawInFlight.Store(true)
+			sawID.Store(id)
+		}
+		return 0
+	})
+	if !m.linkCycleInFlight() {
+		t.Fatal("fixture: a lease at elapsed=0 with a full-TTL deadline must read as in " +
+			"flight; the seam below was not exercised on the intended path")
+	}
+	if !sawInFlight.Load() {
+		t.Errorf("leaseSeamCaller did not report in-flight for a read made from INSIDE "+
+			"Manager.linkCycleInFlight, so leaseSeamInFlightFrame (%q) no longer names that "+
+			"frame. Every cell in this file then injects nothing — caught by the vacuity "+
+			"check as a red, but a red for the wrong reason", leaseSeamInFlightFrame)
+	}
+	if got := sawID.Load(); got != self {
+		t.Errorf("the read from inside linkCycleInFlight reported id %d, but this goroutine "+
+			"is %d — the id must not depend on call depth, or the owner comparison fails "+
+			"for the installer's own injection", got, self)
+	}
 }
 
 // TestLinkCycleInFlightHonoursALostExpiryCAS_6871 is the B1 discriminator.
