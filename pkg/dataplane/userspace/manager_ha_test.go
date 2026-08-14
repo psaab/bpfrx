@@ -1030,6 +1030,65 @@ func TestStopLockedClearsLastStatus(t *testing.T) {
 	}
 }
 
+// TestStopLockedClearsStatusAfterARealProcessTeardown covers the OTHER clear in
+// stopLocked (#6691 round 11).
+//
+// stopLocked clears the helper status twice: once in the `m.proc == nil` early
+// return and once after the real teardown (shutdown request, Wait, escalate,
+// m.proc = nil). Every existing stopLocked test runs with proc == nil and so
+// exercises only the first, and the observation marker is asserted elsewhere by
+// calling clearLastStatusLocked directly — so deleting the second clear left the
+// suite green while a stopped helper kept a stale PID, a stale
+// ForwardingArmed and, worse, a stale ConfigSnapshotProtocolVersion with
+// helperStatusObserved still true. That combination is exactly what the
+// required-protocol gates read: a version belonging to a dead process, treated
+// as an observation about its replacement.
+//
+// The Cmd is deliberately never Started, so Wait returns immediately and the
+// teardown walks the real branch without a signal, a kill or a 2s timeout.
+//
+// FAIL-ON-REVERT: delete the clearLastStatusLocked call that follows
+// `m.proc = nil` and this reds; the two pre-existing stopLocked tests do not.
+func TestStopLockedClearsStatusAfterARealProcessTeardown(t *testing.T) {
+	self, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+
+	m := New()
+	// A control socket path that resolves to nothing: the shutdown request and
+	// the ctrl disable fail fast and are ignored by stopLocked, as they are on a
+	// helper that has already died.
+	m.cfg.ControlSocket = filepath.Join(t.TempDir(), "absent.sock")
+	m.proc = &exec.Cmd{Process: self}
+	m.setLastStatusLocked(ProcessStatus{
+		PID:                           4321,
+		Enabled:                       true,
+		ForwardingArmed:               true,
+		ConfigSnapshotProtocolVersion: ProtocolVersion,
+	})
+	if !m.helperStatusObserved {
+		t.Fatal("premise broken: setLastStatusLocked did not record the observation")
+	}
+
+	m.stopLocked()
+
+	if m.proc != nil {
+		t.Fatal("premise broken: stopLocked did not take the real-process branch")
+	}
+	if m.lastStatus.PID != 0 || m.lastStatus.Enabled || m.lastStatus.ForwardingArmed {
+		t.Errorf("lastStatus after a real teardown = %+v, want the zero value: the "+
+			"helper is gone, and a status left behind describes a process that no "+
+			"longer exists", m.lastStatus)
+	}
+	if m.lastStatus.ConfigSnapshotProtocolVersion != 0 || m.helperStatusObserved {
+		t.Errorf("protocol observation survived the teardown (version=%d observed=%v). "+
+			"The required-protocol gates arm on an OBSERVED version; keeping one from a "+
+			"dead process makes the next commit decide against a helper that never answered",
+			m.lastStatus.ConfigSnapshotProtocolVersion, m.helperStatusObserved)
+	}
+}
+
 // startFakeHAControlHelper starts a unix-socket helper that captures the Type of
 // every ControlRequest it receives (one request per connection, matching
 // requestDetailedLocked's fresh-dial-per-request behavior) and replies OK. The
