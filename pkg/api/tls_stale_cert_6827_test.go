@@ -1,11 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -667,5 +670,218 @@ func TestReconcileHTTPSReplacesADeadLeg_6827(t *testing.T) {
 	if !s.WarnStaleMgmtCertForHostName("new-fw") {
 		t.Fatal("the replacement leg must present a certificate, so a pending host-name " +
 			"diagnosis can finally be discharged")
+	}
+}
+
+// killableLn is a REAL loopback listener whose accept loop can be made to fail
+// PERMANENTLY on demand, leaving the connections it already accepted untouched.
+//
+// That combination is the whole point, and it is what errLn cannot express:
+// errLn fails from the first Accept, so a leg built on it never has a connection
+// to lose. Production's unexpected serve-loop exit is the other shape — the
+// listener dies under a leg that has been serving, and the sockets it handed to
+// http.Server outlive it.
+type killableLn struct {
+	net.Listener
+	killed chan struct{}
+}
+
+func newKillableLn(t *testing.T) *killableLn {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("bind loopback listener: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return &killableLn{Listener: ln, killed: make(chan struct{})}
+}
+
+func (l *killableLn) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		return c, nil
+	}
+	select {
+	case <-l.killed:
+		// Report a plain error rather than the underlying net.ErrClosed: it is
+		// not a net.Error, so http.Server.Serve cannot classify it as temporary
+		// and retry — it returns, which is the exit serveLegLocked's serveErr arm
+		// exists for.
+		return nil, errors.New("listener terminated")
+	default:
+		return nil, err
+	}
+}
+
+// kill closes the LISTENING socket only. Every connection already accepted stays
+// open and stays served by the leg's http.Server — the state the pre-round-7
+// code described as "the socket is already closed, nothing left to drain".
+func (l *killableLn) kill() { close(l.killed); _ = l.Listener.Close() }
+
+// waitUntil polls cond for up to 5s, failing with msg if it never holds.
+func waitUntil(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(msg)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// requestOn replays one authenticated request on an already-established
+// connection and returns its status. It writes the request by hand instead of
+// using an http.Client so the test controls WHICH connection carries it: a
+// Transport is free to open a fresh one, and a fresh connection would reach the
+// replacement leg and prove nothing about the dead leg's.
+func requestOn(conn net.Conn, br *bufio.Reader, host, user, secret string) (int, error) {
+	cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + secret))
+	req := "GET /api/v1/system/info HTTP/1.1\r\nHost: " + host + "\r\n" +
+		"Authorization: Basic " + cred + "\r\n\r\n"
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return 0, err
+	}
+	if _, err := io.WriteString(conn, req); err != nil {
+		return 0, err
+	}
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	// Drain the body so the connection stays reusable for the next replay.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return 0, err
+	}
+	return resp.StatusCode, nil
+}
+
+// TestDeadLegConnectionCannotOutliveRevocation_6827 is the FAIL-ON-REVERT guard
+// for the #6827-round-7 credential-lifetime defect: a leg that self-terminated
+// went on serving the connections it had already accepted, under a credential
+// the operator had since revoked.
+//
+// The trace has three steps and every one of them is production's:
+//
+//  1. An unexpected serve-loop exit marked the leg `dead` and returned. Serve
+//     closes the LISTENER, so nothing new arrives — but the HTTP/1 keep-alive
+//     and HTTP/2 connections it already accepted keep being served by the same
+//     http.Server, under the same credential slot. `drained` went up anyway, set
+//     by the goroutine's defer, with those connections still live.
+//  2. The recovery reconcile (#6827 round 6) installs a replacement and retires
+//     the dead leg, which PINS its slot to whatever the server-wide snapshot
+//     holds at that instant — the pre-revocation credential.
+//  3. The next commit revokes it. ReplaceAuth walks the retiring legs to tighten
+//     their pins, but pruneRetiredLocked drops this one FIRST, because `drained`
+//     says it is finished. The pin is never intersected, and the surviving
+//     connection keeps being admitted by the revoked credential.
+//
+// The three existing recovery cells cannot see any of it: they drive the exit
+// with errLn, which fails from the first Accept, so no connection is ever
+// accepted and there is nothing to survive. The case was unreachable in the
+// fixture, not absent from production.
+//
+// RED on revert: delete the `drainLeg(srv)` call from serveLegLocked's serveErr
+// arm. The kill leaves the held connection open, and the final replay is
+// answered 200 by the dead leg under the revoked credential.
+func TestDeadLegConnectionCannotOutliveRevocation_6827(t *testing.T) {
+	const user, secret = "operator", "s3cret-6827"
+	cert := mintCert(t, "old-fw", "127.0.0.1")
+
+	kln := newKillableLn(t)
+	addr := kln.Addr().String()
+
+	s := &Server{
+		// The pre-auth base the per-listener auth gate wraps. A bare 200 is the
+		// sharpest possible signal for this cell: reaching it means the gate
+		// ADMITTED the request, which is the thing under test — not what any
+		// particular route would have returned.
+		sharedBase: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}),
+		certGen: func(string) (tls.Certificate, error) { return cert, nil },
+	}
+	firstBind := true
+	s.listen = func(network, a string) (net.Listener, error) {
+		if firstBind {
+			firstBind = false
+			return kln, nil
+		}
+		// The replacement leg needs to exist and report serving; nothing in this
+		// cell connects to it, so it never has to accept anything.
+		return newStubLn(), nil
+	}
+	s.auth.Store(&AuthConfig{Users: map[string]string{user: secret}})
+	// Build the leg the PRODUCTION way, so the handler's slot and the leg's slot
+	// are the same object. A hand-built http.Server would leave serveLegLocked
+	// substituting a slot the handler never reads, and the pin/tighten path this
+	// cell is about would be bypassed entirely.
+	s.httpsSlot = s.newAuthSlot()
+	srv, err := s.buildHTTPSServer(addr, s.httpsSlot)
+	if err != nil {
+		t.Fatalf("build HTTPS server: %v", err)
+	}
+	s.httpsServer = srv
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer s.Wait() // runs after cancel(): joins both legs' serve goroutines
+	defer cancel()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	dead := s.httpsLeg
+	if dead == nil {
+		t.Fatal("precondition: the listen call succeeded, so the HTTPS leg must be installed")
+	}
+
+	// One connection, held open across everything that follows. The certificate
+	// is a self-signed fixture and chain validation is not what this cell is
+	// about, so the client skips verification.
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // self-signed fixture
+	if err != nil {
+		t.Fatalf("dial the HTTPS leg: %v", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+
+	code, err := requestOn(conn, br, addr, user, secret)
+	if err != nil {
+		t.Fatalf("precondition request on the held connection: %v", err)
+	}
+	if code != http.StatusOK {
+		t.Fatalf("precondition: the credential must be ACCEPTED on this connection before "+
+			"anything is revoked, otherwise the assertion below passes for the wrong reason; got %d", code)
+	}
+
+	// (1) The listener dies under the leg. The held connection is untouched.
+	kln.kill()
+	waitUntil(t, dead.dead.Load, "the serve goroutine never marked the self-terminated leg dead")
+
+	// (2) Recovery on an UNCHANGED configuration retires the dead leg, pinning
+	// its slot at the credential that is about to be revoked.
+	if err := s.ReconcileHTTPS(true, addr); err != nil {
+		t.Fatalf("recovery reconcile over the dead leg: %v", err)
+	}
+	if s.httpsLeg == dead {
+		t.Fatal("precondition: the recovery reconcile must install a REPLACEMENT leg — without " +
+			"the retirement of the dead one there is no pin, and this cell is not testing the " +
+			"path it claims (#6827 round 6)")
+	}
+
+	// (3) The next commit revokes the credential the held connection is using.
+	s.ReplaceAuth(&AuthConfig{Users: map[string]string{"successor": "different-secret"}})
+
+	// `drained` is the flag pruneRetiredLocked spends to stop tightening this
+	// leg's pin. Once it is up, the leg's claim is that nothing can still be
+	// presenting credentials on it — so that is the moment to check.
+	waitUntil(t, dead.drained.Load, "the dead leg never reported drained")
+
+	code, err = requestOn(conn, br, addr, user, secret)
+	if err == nil && code == http.StatusOK {
+		t.Fatalf("a connection accepted by a leg that has since died and been retired was still "+
+			"admitted (%d) under a REVOKED credential: the leg reports drained, so ReplaceAuth "+
+			"has stopped tightening its pinned slot, and nothing else will ever revoke it "+
+			"(#6827 round 7)", code)
 	}
 }

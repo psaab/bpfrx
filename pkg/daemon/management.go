@@ -546,24 +546,66 @@ func (m *managementReconciler) reconcileTo(next api.Config) error {
 		endpointOf(next).summary(), joined)
 }
 
-// noteStaleMgmtCertHostName records that the kernel host name just moved and
-// immediately attempts to deliver the management-TLS staleness diagnostic
-// (#6827). Marking and attempting are ONE path: the previous shape branched on
-// `d.mgmt == nil` outside staleCertMu while startHTTPServer published d.mgmt
-// and drained separately, so a rename landing in that window neither refreshed
-// the parked state nor got diagnosed.
+// renameHostNotingStaleMgmtCert moves the kernel host name AND records that the
+// management-TLS staleness diagnostic is owed, as one indivisible step (#6827
+// round 7). It returns the Sethostname error, if any; on failure the ledger is
+// untouched, because a rename that did not happen has no staleness to diagnose.
+//
+// The single hold of staleCertMu is the whole point of the function, and it is
+// what makes the emitted host name provably CURRENT rather than merely likely.
+// deliverStaleMgmtCertDiagnosis samples the generation, reads the kernel name
+// unlocked, then takes staleCertMu across the re-validation, the certificate
+// inspection and the warning. While the bump lived outside this hold — the
+// pre-round-7 shape, where applyHostname called Sethostname and the ledger was
+// advanced only afterwards — there was a window in which the kernel name had
+// already moved and no generation had yet recorded the move, so a delivery
+// could re-validate successfully and warn under the name the box had just left.
+//
+// Fencing the syscall and the bump together orders the two critical sections,
+// and both orders are correct:
+//
+//   - the delivery acquires first: Sethostname cannot run until it lets go, so
+//     the name being reported is still the kernel's at the moment it is emitted;
+//   - this acquires first: the generation has already advanced by the time the
+//     delivery re-validates, so the older delivery abandons without emitting.
+//
+// There is no lock-order inversion. staleCertMu is a LEAF here — the only thing
+// inside the hold is the syscall seam, which acquires nothing — whereas the
+// delivery path takes it at the TOP of staleCertMu → managementReconciler.mu →
+// api.Server.lifeMu. Nothing takes staleCertMu while already holding one of
+// those.
+//
+// Do not split the hold. Releasing after the syscall and re-taking for the
+// ledger write re-opens the window at a narrower width — the name has moved and
+// the generation has not — and no test can catch it: the gap is a few
+// instructions, and the probe in
+// TestRenameAndGenerationBumpAreOneCriticalSection_6827 loses the race to the
+// re-acquire (measured GREEN on that mutant). The single deferred unlock over a
+// body with no intermediate release is the guard.
+//
+// What this does NOT cover, and it is the only residual: a privileged process
+// OUTSIDE xpfd can call sethostname(2) directly. That moves the kernel name with
+// no generation movement at all, so a delivery sitting in its unlocked window
+// can still report the name it read a moment earlier. Every rename the daemon
+// itself performs is fenced.
+//
+// The caller must attempt the delivery — applyHostname does, as its last act.
+// Marking and attempting stay ONE path for the reason round 1 established: the
+// previous shape branched on `d.mgmt == nil` outside staleCertMu while
+// startHTTPServer published d.mgmt and drained separately, so a rename landing
+// in that window neither refreshed the parked state nor got diagnosed.
 //
 // This is deliberately NOT part of reconcile(): reconcile runs early in the
 // apply, before applyHostname, so it can only ever observe the OLD kernel name.
-func (d *Daemon) noteStaleMgmtCertHostName() {
-	if d == nil {
-		return
-	}
+func (d *Daemon) renameHostNotingStaleMgmtCert(name string) error {
 	d.staleCertMu.Lock()
+	defer d.staleCertMu.Unlock()
+	if err := sethostname([]byte(name)); err != nil {
+		return err
+	}
 	d.staleCertPending = true
 	d.staleCertGen++
-	d.staleCertMu.Unlock()
-	d.deliverStaleMgmtCertDiagnosis()
+	return nil
 }
 
 // deliverStaleMgmtCertDiagnosis delivers a pending host-name staleness
@@ -581,9 +623,9 @@ func (d *Daemon) noteStaleMgmtCertHostName() {
 // root: a deferred diagnosis never describes a name captured at some earlier
 // commit.
 //
-// GENERATION FENCE (#6827 round 5, tightened in round 6). The kernel read runs
-// unlocked, so a rename can land after it. The rest of the delivery — the
-// re-validation, the certificate inspection, and the clear — therefore runs
+// GENERATION FENCE (#6827 round 5, tightened in rounds 6 and 7). The kernel
+// read runs unlocked, so a rename can land after it. The rest of the delivery —
+// the re-validation, the certificate inspection, and the clear — therefore runs
 // under staleCertMu in ONE hold, and a delivery whose generation has been
 // superseded abandons WITHOUT emitting anything:
 //
@@ -593,19 +635,30 @@ func (d *Daemon) noteStaleMgmtCertHostName() {
 //     box has. Round 5 checked the generation only after the warning was already
 //     out, so a rename landing in the window made the appliance log a diagnosis
 //     naming the PREVIOUS host name — a line the fence could not retract. Losing
-//     nothing: the newer rename's own noteStaleMgmtCertHostName calls this
-//     function itself, so the newest name is diagnosed by the newest delivery.
+//     nothing: the newer rename's own applyHostname calls this function itself,
+//     so the newest name is diagnosed by the newest delivery.
+//
+// The re-validation tests BOTH ledger fields, not the generation alone (#6827
+// round 7). Two deliveries can legitimately be in flight for ONE rename — the
+// boot delivery from startHTTPServer racing the rename's own attempt, or a
+// reconcile retry racing either — and they sample the same generation, so a
+// generation-only re-check passes for both. The first warns and clears; the
+// second then finds a settled debt, an unmoved generation, and warns again.
+// One rename, two identical WARN lines.
 //
 // Holding the mutex across warnStaleCertForHostName is deadlock-free: the order
 // is always staleCertMu → managementReconciler.mu → api.Server.lifeMu, and
 // nothing under those re-enters the Daemon.
 //
-// What this does NOT promise — and what the prose used to claim — is that the
-// emitted name is the kernel's CURRENT one. sethostname moves the kernel name
-// BEFORE applyHostname records the new generation, so between those two points
-// a delivery legitimately reads, validates, and reports a name the kernel has
-// just left. No generation-based fence can close that window; what it does close
-// is every case where the competing rename has actually been recorded.
+// The emitted name IS the kernel's current one, for every rename this daemon
+// performs (#6827 round 7). Rounds 5 and 6 claimed otherwise — that Sethostname
+// moves the kernel name before the generation is recorded, so no
+// generation-based fence could close the gap. That was a property of where the
+// lock was taken, not of the mechanism: renameHostNotingStaleMgmtCert now holds
+// staleCertMu ACROSS both the syscall and the bump, so the generation exists
+// before the window can open and the two critical sections are ordered either
+// way round (see its doc). The residual is a privileged rename from OUTSIDE the
+// daemon, which no in-process fence can observe.
 func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 	if d == nil {
 		return
@@ -627,6 +680,13 @@ func (d *Daemon) deliverStaleMgmtCertDiagnosis() {
 	}
 	d.staleCertMu.Lock()
 	defer d.staleCertMu.Unlock()
+	if !d.staleCertPending {
+		// A sibling delivery for the SAME generation already settled it while
+		// this one was reading the kernel name. The debt is discharged and the
+		// operator has the line; warning again would just duplicate it (#6827
+		// round 7).
+		return
+	}
 	if d.staleCertGen != gen {
 		return // a newer rename owns the diagnosis now; it runs its own delivery
 	}

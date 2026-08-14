@@ -433,11 +433,12 @@ re-minted by a later `set system host-name`, so its SANs go stale and clients
 verifying by host name start failing. `pkg/api`'s own load-path diagnostic
 cannot see a plain rename — the HTTPS leg is rebuilt only when the TLS flag or
 the HTTPS bind address changes, so a rename on an unchanged endpoint reloads
-nothing. `Daemon.noteStaleMgmtCertHostName` closes that gap from the apply side.
-It is called from `applyHostname` AFTER `Sethostname` succeeds (ordering is the
-point: before it, the diagnostic would read the OLD kernel name), and it is
-deliberately NOT part of `reconcile()`, which runs early in the apply and can
-only ever see the old name.
+nothing. `Daemon.renameHostNotingStaleMgmtCert` closes that gap from the apply
+side. `applyHostname` calls it in place of a bare `Sethostname` — it performs
+the rename AND records the debt under ONE hold of `staleCertMu` (#6827 round 7,
+see the fence bullet below) — and then delivers the diagnosis as its last act.
+The delivery is deliberately NOT part of `reconcile()`, which runs early in the
+apply and can only ever see the old name.
 
 Marking and delivering are ONE path (`deliverStaleMgmtCertDiagnosis`), because
 at BOOT the hook runs before its own dependency exists — the first config apply
@@ -466,11 +467,18 @@ Three properties carry the mechanism:
   seam exists only afterwards.
 - **The name is read from the kernel at DELIVERY**, never stored at rename time,
   so a deferred diagnosis is never the replay of a name captured at some earlier
-  commit. It is NOT a guarantee that the emitted name is the kernel's current
-  one: `Sethostname` moves the kernel name before `applyHostname` records the
-  new generation, so a delivery can legitimately read, validate and report a
-  name the kernel has just left. No generation-based fence can close that
-  window — it is the gap between the two, not the gap this fence covers.
+  commit. It IS the kernel's current name for every rename the daemon performs
+  (#6827 round 7). Rounds 5 and 6 claimed otherwise — that `Sethostname` moves
+  the name before the generation is recorded, so no fence could close the gap —
+  but that was a property of where the lock was taken.
+  `renameHostNotingStaleMgmtCert` holds `staleCertMu` ACROSS both the syscall
+  and the bump, so the generation exists before the window can open: a delivery
+  either warns while
+  the rename is still blocked on the mutex (name still current) or finds the
+  generation already moved and abandons. The residual is a privileged
+  `sethostname(2)` from OUTSIDE the daemon, which no in-process fence can see.
+  Bound by `TestRenameAndGenerationBumpAreOneCriticalSection_6827`, which
+  observes from inside the syscall seam that the mutex is held.
 - **The delivery is generation-fenced, before it speaks.** The kernel read runs
   unlocked; `staleCertGen` is sampled before it and RE-VALIDATED after it, under
   `staleCertMu` held across the certificate inspection and the clear. A delivery
@@ -478,15 +486,20 @@ Three properties carry the mechanism:
   clearing — it must not settle a newer rename's debt with older evidence, and
   must not emit a diagnosis naming a host name that a recorded rename has
   already replaced (round 5 checked only on the clear side, after the warning
-  was already out). Nothing is lost: the newer rename's own
-  `noteStaleMgmtCertHostName` runs its own delivery. The race is reachable
+  was already out). The re-validation tests `staleCertPending` as well as the
+  generation (#6827 round 7): two deliveries for ONE rename — the boot delivery
+  racing the rename's own attempt, say — sample the same generation, so a
+  generation-only re-check lets the second one duplicate the line the first has
+  already emitted. Nothing is lost by either arm: the newer rename's own
+  `applyHostname` runs its own delivery. The race is reachable
   because the boot delivery runs on the `Run` goroutine outside `applySem` while
   cluster comms — started right after the mutating startup phases, before
   `startHTTPServer` — can drive a peer `SyncApply` into `applyHostname`. Pinned
   by `TestDebtClearIsGenerationSafe_6827`: one subtest supplies the competing
   rename itself, one drives it through the production note path (so the
   `staleCertGen++` is bound, not just the comparison), one is the negative
-  control where an unraced delivery MUST settle, and one pins the
+  control where an unraced delivery MUST settle, one overlaps two
+  same-generation deliveries so the second must stay silent, and one pins the
   unreadable-kernel-name guard that would otherwise discharge the debt with no
   identity behind it.
 

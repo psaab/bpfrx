@@ -1052,6 +1052,20 @@ under the daemon's errgroup. Nothing else imports this package.
       PINNED at retirement to what it was already serving, after which
       `ReplaceAuth` only intersects it. Revocations still reach a draining
       listener; grants and nils never do.
+    - **Every leg exit DRAINS its connections** (#6827 round 7, `drainLeg`).
+      `ReplaceAuth` keeps tightening a retired leg's pin only while the leg is on
+      `s.retiring`, and `pruneRetiredLocked` reaps it the moment `drained` is
+      set — so `drained` has to mean "no connection this leg accepted can serve
+      another request". It did not. The unexpected-serve-exit arm returned
+      WITHOUT any `Shutdown`: `Serve` closes the listener on its way out, but the
+      HTTP/1 keep-alive and HTTP/2 connections it had already accepted kept being
+      served, under a slot the recovery reconcile then PINNED and the next
+      `ReplaceAuth` PRUNED before tightening — a revoked credential going on
+      working on a socket the box believed was gone. All three exits (requested
+      retirement, root-context shutdown, unexpected exit) now run a bounded
+      `Shutdown` followed by `Close` on deadline. `Close` is not optional: this
+      server runs with no `WriteTimeout` by design, so an SSE stream or a slow
+      reader outlives any deadline `Shutdown` alone respects.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
@@ -1169,11 +1183,14 @@ under the daemon's errgroup. Nothing else imports this package.
           publication cannot be silently dropped. The delivery is also
           GENERATION-FENCED before it speaks: one whose rename has been
           superseded abandons without warning and without clearing, so it cannot
-          emit a name a recorded rename has already replaced. What is NOT
-          promised is that the emitted name is the kernel's current one —
-          `Sethostname` moves the kernel name before the new generation is
-          recorded, and nothing keyed on that generation can cover the gap
-          between the two.
+          emit a name a recorded rename has already replaced. The emitted name IS
+          the kernel's current one for every rename the daemon performs (#6827
+          round 7): `Daemon.renameHostNotingStaleMgmtCert` holds `staleCertMu`
+          across BOTH the `Sethostname` and the generation bump, so the two
+          critical sections are ordered and neither order can produce a stale
+          line. Rounds 5 and 6 recorded that gap as unclosable; it was closable
+          by moving the lock acquisition ahead of the syscall. A privileged
+          `sethostname(2)` from outside the daemon remains unfenceable.
       The RENAME entry point reads the LIVE HTTPS leg via
       `listenerLeg.serving()` — not a non-nil pointer. (The load path has no leg
       to read: it runs inside cert generation, before any leg exists, and judges
@@ -1183,14 +1200,17 @@ under the daemon's errgroup. Nothing else imports this package.
       presenting. `serving()` therefore tests BOTH: `dead` for a
       self-termination, and `stopping` — stored explicitly at the top of both
       drain arms (requested retirement AND root-context shutdown), before
-      `Shutdown`, so it covers the leg from the moment the drain is decided
+      the drain, so it covers the leg from the moment the drain is decided
       through the goroutine's return (the listener closes an instant later, in
-      `Shutdown`, and already-accepted requests drain for up to 5s — `serving()`
-      answers "is this the leg in front of clients", not "is every byte done").
+      `Shutdown`, and already-accepted requests drain for up to `legDrainTimeout`
+      — `serving()` answers "is this the leg in front of clients", not "is every
+      byte done").
       The same predicate now gates `ReconcileHTTPS`'s same-address no-op, so a
       dead leg is REBUILT rather than mistaken for a converged one (#6827 round
       6): before that, a self-terminated HTTPS leg could not be replaced by any
-      commit and HTTPS stayed down until a restart. It does NOT test `stopCh`: a requested
+      commit and HTTPS stayed down until a restart. The dead leg's CONNECTIONS
+      are taken down too (#6827 round 7) — see the leg-drain bullet above; the
+      recovery alone left them serving. It does NOT test `stopCh`: a requested
       retirement is unobservable through `s.httpsLeg`, though not by the
       ordering — the disable arm retires the leg and THEN clears the field. What
       makes the interval unobservable is that the whole `ReconcileHTTPS` switch
@@ -1277,7 +1297,8 @@ under the daemon's errgroup. Nothing else imports this package.
     all; the unused-kernel-name false positive and its matched positive control;
     the rename entry point; and the two leg-state transitions driven by the real
     serve goroutine — `stopping` on a root-context drain, `dead` on an
-    unexpected serve exit, plus the reconcile that REPLACES a dead leg), with
+    unexpected serve exit, the reconcile that REPLACES a dead leg, and the held
+    connection that must not outlive a revocation), with
     the daemon-side wiring pinned by
     `pkg/daemon/hostname_stale_cert_6827_test.go`: a host-name commit on an
     UNCHANGED HTTPS endpoint reaches the diagnostic with the NEW name, the debt

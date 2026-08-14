@@ -79670,3 +79670,57 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   ephemeral port — is a collision with a concurrent agent, not a regression: the package
   passes standalone (rc 0).
 - **File(s)**: docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-08-13T22:55Z
+- **Action**: #6827 round 7 — folded a Codex "would not merge" (2 MAJOR, 1 MINOR) plus a
+  correction to one of my own round-6 claims. **B1 RUNTIME (credential lifetime).** An
+  unexpected `ServeTLS`/`Serve` exit marked the leg `dead` and returned WITHOUT any
+  `Shutdown`: `Serve` closes the listener on its way out, but the HTTP/1 keep-alive and
+  HTTP/2 connections it had already accepted kept being served. `drained` — the goroutine's
+  last act — therefore went up with live connections behind it, and `pruneRetiredLocked`
+  spends that flag as "nothing left for a revocation to reach": the recovery reconcile
+  (round 6) PINNED the dead leg's auth slot, the next `ReplaceAuth` PRUNED it before
+  tightening, and a credential the operator had revoked went on being accepted on a socket
+  the box believed was gone. Fixed with `drainLeg` on ALL THREE exits (requested
+  retirement, root-context shutdown, unexpected exit): bounded `Shutdown` then `Close` on
+  deadline. `Close` is not optional — this server runs with no `WriteTimeout` by design, so
+  an SSE stream or a slow reader outlives any deadline `Shutdown` alone respects. The three
+  existing recovery cells could not see any of it: they drive the exit with `errLn`, which
+  fails from the FIRST Accept, so no connection is ever accepted and nothing can survive.
+  New cell `TestDeadLegConnectionCannotOutliveRevocation_6827` binds a REAL loopback
+  socket, holds one TLS connection across the kill + recovery + revocation, and asserts it
+  cannot be admitted once the leg reports drained. **B2 (my round-6 claim was wrong).**
+  Rounds 5 and 6 argued no generation fence could make the emitted host name provably
+  current, because `Sethostname` moves the kernel name before the generation is recorded.
+  That was a property of where the lock was taken, not of the mechanism. New
+  `Daemon.renameHostNotingStaleMgmtCert` holds `staleCertMu` ACROSS the syscall AND the
+  bump, so the two critical sections are ordered either way round: delivery first (the
+  rename cannot move the name until it lets go) or rename first (the delivery re-validates
+  against a moved generation and abandons). No lock-order inversion — the fence is a LEAF
+  hold around the syscall seam, while delivery takes the mutex at the top of staleCertMu ->
+  managementReconciler.mu -> api.Server.lifeMu. The residual is a privileged
+  `sethostname(2)` from outside the daemon, which is now stated instead of the blanket
+  impossibility claim. **B3.** The delivery's re-validation tested the generation alone, so
+  two same-generation deliveries (boot racing the rename's own attempt) both warned; it now
+  requires `staleCertPending` too.
+  **CORRECTION to the round-6 entry above**: it claimed "every new assertion has a
+  production line whose deletion reds it and only it". That is false for M8. Deleting
+  `leg.dead.Store(true)` reds SIX cells across two packages — the three #6827 recovery
+  cells, the new B1 cell, and the pre-existing `TestServeExitDoesNotDeadlockConcurrentWait_6401`
+  + `TestEffectiveHTTPListenerServeExitFails` — because `dead` is a production precondition
+  the whole dead-leg cohort shares. Measured here, not inferred. M1 is the same shape. The
+  cells that DO isolate are M4, M5a/M5b, M7 and this round's B1/B2a/B2b/B3.
+  Validation: control `go test ./pkg/api ./pkg/daemon -count=1` rc 0; mutation cells — B1
+  (delete `drainLeg` from the serveErr arm) RED, only the new cell, whole `pkg/api`; M8
+  re-measured RED across six cells as above; B2a (leave the syscall outside the hold — the
+  literal pre-round-7 shape) RED, only the new fence cell; B2b (write the ledger before the
+  syscall) RED, only `failed_sethostname_is_not_diagnosed`; B3 (drop the `pending`
+  re-check) RED, only the new sibling-delivery subtest. One measured NON-binding, recorded
+  rather than glossed: B2c — hold the mutex across the syscall, release, re-take for the
+  bump — stays GREEN. That shape is still defective, but the gap is a few instructions and
+  the probe loses the race to the re-acquire; the guard against it is structural (one
+  `defer`red unlock over a body with no intermediate release) and is documented as such at
+  the function and in the test.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md,
+  pkg/api/server.go, pkg/daemon/management.go, pkg/daemon/daemon_system.go,
+  pkg/daemon/hostname_stale_cert_6827_test.go, pkg/daemon/README.md

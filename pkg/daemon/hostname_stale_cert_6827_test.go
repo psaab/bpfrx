@@ -81,13 +81,38 @@ func seedDurableCert(t *testing.T, dir, dnsName, mgmtIP string) {
 // daemon with the API disabled (no reconciler) and a reconciler whose server
 // never bound must both be no-ops rather than a panic on the apply path.
 func TestWarnStaleMgmtCertForHostNameWithoutServer_6827(t *testing.T) {
-	(&Daemon{}).noteStaleMgmtCertHostName()
+	noteRename(t, &Daemon{}, "new-fw-6827")
 	(&Daemon{}).deliverStaleMgmtCertDiagnosis()
 
 	reg := newFakeReg()
 	d := &Daemon{}
 	d.mgmt = newManagementReconciler(d, api.Config{ListenFunc: reg.listen})
-	d.noteStaleMgmtCertHostName()
+	noteRename(t, d, "new-fw-6827")
+	d.deliverStaleMgmtCertDiagnosis()
+}
+
+// noteRename drives the production sequence a `set system host-name` commit runs
+// once applyHostname's guards have passed: the FENCED rename — kernel seam
+// stubbed to a no-op so an unprivileged test can run it — followed by the
+// delivery attempt applyHostname makes as its last act (#6827 round 7).
+//
+// It is the successor to the bare noteStaleMgmtCertHostName() call these cells
+// used. Recording a debt is no longer separable from renaming: the syscall and
+// the ledger write are one critical section, so a test that wants a debt has to
+// go through the rename, exactly as production does.
+//
+// It deliberately does NOT touch osHostname. The delivery-time kernel read is a
+// different seam (stubHostname) and several cells drive the two independently —
+// including one that calls this from INSIDE an osHostname stub, to land a
+// competing rename in a delivery's unlocked window.
+func noteRename(t *testing.T, d *Daemon, name string) {
+	t.Helper()
+	restore := sethostname
+	t.Cleanup(func() { sethostname = restore })
+	sethostname = func([]byte) error { return nil }
+	if err := d.renameHostNotingStaleMgmtCert(name); err != nil {
+		t.Fatalf("fenced rename to %q: %v", name, err)
+	}
 	d.deliverStaleMgmtCertDiagnosis()
 }
 
@@ -124,8 +149,9 @@ func stubHostname(t *testing.T, name string) {
 // bound separately, at their own call site, by
 // TestDeferredDeliveryIsWiredAtItsRetryPoints_6827.
 //
-// RED on revert: make noteStaleMgmtCertHostName return early when d.mgmt is nil
-// and boot_rename_is_diagnosed_once_mgmt_is_up logs nothing.
+// RED on revert: make deliverStaleMgmtCertDiagnosis return early when d.mgmt is
+// nil WITHOUT parking the debt, and boot_rename_is_diagnosed_once_mgmt_is_up
+// logs nothing.
 func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 	t.Run("boot_rename_is_diagnosed_once_mgmt_is_up", func(t *testing.T) {
 		d := &Daemon{}
@@ -184,8 +210,8 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 
 	// #6827 r3: bind applyHostname's already-applied early return.
 	//
-	// It was innocuous before this PR and is LOAD-BEARING after it, because
-	// noteStaleMgmtCertHostName is reachable only past it. Deleting the guard
+	// It was innocuous before this PR and is LOAD-BEARING after it, because the
+	// fenced rename and its delivery are reachable only past it. Deleting the guard
 	// left the whole pkg/daemon + pkg/api suite GREEN, so nothing noticed —
 	// while in production every commit carrying an unchanged `system host-name`
 	// would re-fire the debt and its delivery, and a box with a genuinely stale
@@ -245,7 +271,7 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 			t.Fatalf("start HTTP leg: %v", err)
 		}
 
-		if out := captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() }); out != "" {
+		if out := captureDaemonWarn(t, func() { noteRename(t, d, "new-fw-6827") }); out != "" {
 			t.Fatalf("with no certificate served there is nothing to diagnose yet; got %q", out)
 		}
 		d.staleCertMu.Lock()
@@ -276,7 +302,7 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 		// diagnosis cannot describe a name the box no longer has.
 		d := &Daemon{}
 		stubHostname(t, "interim-fw-6827")
-		d.noteStaleMgmtCertHostName()
+		noteRename(t, d, "interim-fw-6827")
 		stubHostname(t, "final-fw-6827")
 		serveStaleCert(t, d, "old-fw-6827")
 		out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
@@ -292,7 +318,7 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 		d := &Daemon{}
 		stubHostname(t, "still-fw-6827")
 		serveStaleCert(t, d, "still-fw-6827")
-		out := captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() })
+		out := captureDaemonWarn(t, func() { noteRename(t, d, "still-fw-6827") })
 		if strings.Contains(out, "does not cover the current host-name") {
 			t.Fatalf("a covered host name must not warn; got %q", out)
 		}
@@ -306,7 +332,7 @@ func TestBootHostNameReachesTheDiagnostic_6827(t *testing.T) {
 		// rejected rename — so a spurious note WOULD have been silent: the
 		// delivery reads the kernel name, finds it covered, and says nothing
 		// while quietly clearing the debt. Deleting applyHostname's error return,
-		// or calling noteStaleMgmtCertHostName in the failure arm, left this
+		// or writing the ledger before the syscall inside the fence, left this
 		// subtest GREEN. With a certificate that covers neither name, a note that
 		// should not have happened is loud.
 		serveStaleCert(t, d, "cert-fw-6827")
@@ -377,15 +403,21 @@ func captureDaemonWarn(t *testing.T, fn func()) string {
 }
 
 // TestRenameIsNotedOnlyAfterSethostname_6827 binds the ORDERING that Fix 2's
-// whole mechanism rests on: the debt is recorded (and delivery attempted) only
-// AFTER the kernel name has actually moved.
+// whole mechanism rests on: the diagnosis is attempted only AFTER the kernel
+// name has actually moved.
 //
-// Moving noteStaleMgmtCertHostName above the Sethostname call previously left
-// every test green, so the ordering was unproven — and ordering is the point.
-// The stub records the kernel name observed at the moment the note fires.
+// Hoisting the delivery above the rename previously left every test green, so
+// the ordering was unproven — and ordering is the point. The stub records the
+// kernel name observed at the moment the delivery reads it.
 //
-// RED on revert: call noteStaleMgmtCertHostName before sethostname in
-// applyHostname and the observed name is the PRE-rename one.
+// RED on revert: move applyHostname's deliverStaleMgmtCertDiagnosis call above
+// renameHostNotingStaleMgmtCert and the observed name is the PRE-rename one.
+// (Deleting that call outright reds this too — the capture comes back empty.)
+//
+// The sibling ordering INSIDE the fence — the ledger write must not precede the
+// syscall — is bound by failed_sethostname_is_not_diagnosed, which asserts the
+// ledger is untouched when the kernel rejects the rename. Moving the write above
+// the syscall dirties it there.
 func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 	d := &Daemon{}
 	restoreSet, restorePath := sethostname, hostnamePath
@@ -407,6 +439,94 @@ func TestRenameIsNotedOnlyAfterSethostname_6827(t *testing.T) {
 	if !strings.Contains(out, "new-fw-6827") {
 		t.Fatalf("the diagnosis must observe the POST-rename kernel name — noting before "+
 			"Sethostname would report %q; got %q", "old-fw-6827", out)
+	}
+}
+
+// TestRenameAndGenerationBumpAreOneCriticalSection_6827 binds the #6827-round-7
+// FENCE: staleCertMu is held ACROSS the Sethostname and the generation bump, so
+// no observer can ever see a kernel name that has moved with a generation that
+// has not.
+//
+// That interval is the whole of what rounds 5 and 6 declared unclosable. Their
+// argument was that the syscall moves the name before the ledger records it, so
+// a delivery in its unlocked window could re-validate against an unmoved
+// generation and warn under the name the box had just left. It is closable, and
+// this is the property that closes it — the generation exists before the window
+// can open.
+//
+// It is asserted from INSIDE the syscall seam because that is the only instant
+// at which the two can disagree. An observer goroutine tries to take staleCertMu
+// exactly then: under the fence it cannot, and its first possible read already
+// carries the bump.
+//
+// A timing assertion, but a one-sided one: the failing direction (the mutex is
+// free while the name moves) is immediate and does not depend on the wait being
+// long enough, while the passing direction cannot be produced by slowness — the
+// mutex is genuinely held for the whole hold, however long the test waits.
+//
+// RED on revert: take staleCertMu only for the ledger write and leave the
+// syscall outside it — the exact pre-round-7 shape, where applyHostname called
+// Sethostname and the generation moved afterwards. The observer then acquires
+// the mutex mid-rename and reads generation 0 for a box that has already been
+// renamed (measured: reds this cell and nothing else in pkg/daemon).
+//
+// What it does NOT distinguish, stated because it was measured rather than
+// assumed: a shape that holds the mutex across the syscall, releases it, and
+// re-takes it for the bump stays GREEN. That shape is still defective — the gap
+// between the two holds is a window in which the name has moved and the
+// generation has not — but the window is a few instructions wide and no
+// scheduler-based probe can be made to land in it reliably; the observer here is
+// released at the unlock and loses the race to the re-acquire. The guard against
+// that shape is structural instead: the fenced function holds the mutex with a
+// single `defer`ed unlock over a body with no intermediate release, which is
+// visible on inspection in a way an interleaving is not. The two ORDERINGS
+// inside the hold are bound behaviourally — ledger-after-syscall by
+// failed_sethostname_is_not_diagnosed, generation-actually-moves by
+// a_real_rename_mid_delivery_advances_the_generation.
+func TestRenameAndGenerationBumpAreOneCriticalSection_6827(t *testing.T) {
+	d := &Daemon{}
+	restoreSet := sethostname
+	t.Cleanup(func() { sethostname = restoreSet })
+
+	observed := make(chan uint64, 1)
+	var renamed string
+	sethostname = func(b []byte) error {
+		renamed = string(b) // the KERNEL name moves here
+		go func() {
+			d.staleCertMu.Lock()
+			gen := d.staleCertGen
+			d.staleCertMu.Unlock()
+			observed <- gen
+		}()
+		select {
+		case gen := <-observed:
+			t.Errorf("staleCertMu was FREE while the kernel name was moving: an observer read "+
+				"generation %d for a box already renamed to %q, which is exactly the window a "+
+				"concurrent delivery re-validates in (#6827 round 7)", gen, renamed)
+		case <-time.After(100 * time.Millisecond):
+			// Still blocked — the rename holds the fence, as it must.
+		}
+		return nil
+	}
+
+	if err := d.renameHostNotingStaleMgmtCert("new-fw-6827"); err != nil {
+		t.Fatalf("fenced rename: %v", err)
+	}
+	if renamed != "new-fw-6827" {
+		t.Fatalf("fixture: the kernel seam was never called, so nothing was fenced; renamed = %q", renamed)
+	}
+
+	select {
+	case gen := <-observed:
+		// The observer was released by the unlock at the END of the fenced
+		// section, so the earliest generation it can possibly see is the bumped
+		// one. A 0 here would mean the bump landed after the mutex was released.
+		if gen != 1 {
+			t.Fatalf("the first read possible after the rename must already carry the bump; "+
+				"got generation %d", gen)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the observer never acquired staleCertMu after the rename returned")
 	}
 }
 
@@ -444,8 +564,8 @@ func newMgmtDeliveryDaemon(t *testing.T, setLines ...string) *Daemon {
 }
 
 // TestDeferredDeliveryIsWiredAtItsRetryPoints_6827 binds the two DEFERRED call
-// sites. The inline delivery inside noteStaleMgmtCertHostName is already bound
-// by the subtests above; these two are what make the debt ledger a RETRY
+// sites. The delivery applyHostname makes inline with the rename is already
+// bound by the subtests above; these two are what make the debt ledger a RETRY
 // mechanism instead of "diagnose synchronously at the rename or never":
 //
 //   - startHTTPServer (daemon_run_servers.go): the boot management start. The
@@ -522,7 +642,7 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 
 		// Boot order: the rename lands while startHTTPServer has not run, so the
 		// debt parks against a nil reconciler.
-		d.noteStaleMgmtCertHostName()
+		noteRename(t, d, "new-fw-6827")
 		if reads != 0 {
 			t.Fatalf("with no reconciler the delivery must not even reach the kernel-name read, "+
 				"so this subtest's later count is attributable to the boot start alone; reads = %d", reads)
@@ -581,7 +701,7 @@ func TestDeferredDeliveryIsWiredAtItsRetryPoints_6827(t *testing.T) {
 		}
 
 		stubHostname(t, "new-fw-6827")
-		if out := captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() }); strings.Contains(out, "does not cover the current host-name") {
+		if out := captureDaemonWarn(t, func() { noteRename(t, d, "new-fw-6827") }); strings.Contains(out, "does not cover the current host-name") {
 			t.Fatalf("nothing is serving a certificate yet, so the rename cannot be diagnosed "+
 				"at the rename itself; got %q", out)
 		}
@@ -701,7 +821,7 @@ func TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827(t *testing.T) {
 
 	// A rename now incurs a debt nothing can settle: no certificate is served.
 	stubHostname(t, "new-fw-6827")
-	captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() })
+	captureDaemonWarn(t, func() { noteRename(t, d, "new-fw-6827") })
 	d.staleCertMu.Lock()
 	pending := d.staleCertPending
 	d.staleCertMu.Unlock()
@@ -751,7 +871,7 @@ func TestADeadHTTPSLegIsRebuiltByTheNextReconcile_6827(t *testing.T) {
 // RED on revert: `if false && d.staleCertGen != gen` (never abandon) fails the
 // first and third subtests; `if true || d.staleCertGen != gen` (always abandon)
 // fails the second. Neither direction passes all three. Deleting
-// `d.staleCertGen++` from noteStaleMgmtCertHostName fails the third only — the
+// `d.staleCertGen++` from renameHostNotingStaleMgmtCert fails the third only — the
 // first two supply their own generation movement, which is exactly why the
 // third exists.
 func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
@@ -818,7 +938,7 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 		// both stay green with the production `d.staleCertGen++` deleted: they
 		// prove the fence reacts to a moving generation, not that anything moves
 		// it (#6827 round 6). This one drives the rename through
-		// noteStaleMgmtCertHostName and never touches staleCertGen.
+		// the production fenced rename and never touches staleCertGen.
 		//
 		// The shape is the one where the increment is load-bearing in production:
 		// the NEWER rename's own delivery reaches nothing (HTTPS is still down),
@@ -848,7 +968,7 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 
 		// Debt #1, incurred while nothing serves a certificate.
 		stubHostname(t, "first-fw-6827")
-		d.noteStaleMgmtCertHostName()
+		noteRename(t, d, "first-fw-6827")
 		d.staleCertMu.Lock()
 		pending, firstGen := d.staleCertPending, d.staleCertGen
 		d.staleCertMu.Unlock()
@@ -864,9 +984,9 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 				raced = true
 				// A second `set system host-name` commits while this delivery is
 				// in its unlocked window — through PRODUCTION, so the generation
-				// moves only if noteStaleMgmtCertHostName moves it. Its own
+				// moves only if renameHostNotingStaleMgmtCert moves it. Its own
 				// delivery reaches nothing: HTTPS is still down at this instant.
-				d.noteStaleMgmtCertHostName()
+				noteRename(t, d, "second-fw-6827")
 				// ...and the same commit brings HTTPS up, so the OLDER delivery
 				// below is the first one to find a served certificate.
 				if err := m.reconcileTo(want); err != nil {
@@ -955,7 +1075,7 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 		stubHostname(t, "new-fw-6827")
 		serveStaleCert(t, d, "old-fw-6827")
 
-		out := captureDaemonWarn(t, func() { d.noteStaleMgmtCertHostName() })
+		out := captureDaemonWarn(t, func() { noteRename(t, d, "new-fw-6827") })
 		if !strings.Contains(out, "new-fw-6827") {
 			t.Fatalf("the rename must be diagnosed; got %q", out)
 		}
@@ -968,6 +1088,58 @@ func TestDebtClearIsGenerationSafe_6827(t *testing.T) {
 		}
 		if again := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() }); again != "" {
 			t.Fatalf("a settled debt must not re-warn; got %q", again)
+		}
+	})
+
+	t.Run("a_sibling_that_already_settled_the_same_generation_silences_this_one", func(t *testing.T) {
+		// #6827 round 7. TWO deliveries for ONE rename: the boot delivery from
+		// startHTTPServer racing the rename's own attempt, or a reconcile retry
+		// racing either. Both sample pending=true at the SAME generation, so a
+		// re-validation that tests only the generation passes for both — the
+		// first warns and clears, the second finds the generation unmoved and
+		// warns again. One rename, two identical lines at the operator.
+		//
+		// The subtest above cannot see it: its second delivery starts AFTER the
+		// clear, so it returns at the `!pending` early return without ever
+		// reaching the re-validation. The overlap is what makes the case, and the
+		// kernel-name read is the seam that produces it deterministically.
+		//
+		// RED on revert: drop `if !d.staleCertPending` from the re-validation in
+		// deliverStaleMgmtCertDiagnosis and the outer delivery duplicates the
+		// diagnosis the sibling has already delivered.
+		d := &Daemon{}
+		serveStaleCert(t, d, "old-fw-6827")
+		d.staleCertMu.Lock()
+		d.staleCertPending, d.staleCertGen = true, 1
+		d.staleCertMu.Unlock()
+
+		restore := osHostname
+		t.Cleanup(func() { osHostname = restore })
+		var siblingOut string
+		var fired bool
+		osHostname = func() (string, error) {
+			if !fired {
+				fired = true
+				// The sibling runs to completion inside the outer delivery's
+				// unlocked window: same generation, reaches the certificate,
+				// warns, and clears the debt.
+				siblingOut = captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
+			}
+			return "new-fw-6827", nil
+		}
+
+		out := captureDaemonWarn(t, func() { d.deliverStaleMgmtCertDiagnosis() })
+		if !fired {
+			t.Fatal("the stub never fired, so the two deliveries never overlapped and this " +
+				"subtest proves nothing")
+		}
+		if !strings.Contains(siblingOut, "new-fw-6827") {
+			t.Fatalf("fixture: the SIBLING must be the one that delivered the diagnosis, "+
+				"otherwise there is no settled debt for the outer delivery to re-warn; got %q", siblingOut)
+		}
+		if out != "" {
+			t.Fatalf("the debt was already settled at this generation, so the second delivery "+
+				"must stay silent rather than duplicate the line; got %q", out)
 		}
 	})
 }

@@ -32,6 +32,18 @@ type listenerLeg struct {
 	// drained is set by the serve goroutine as its LAST act, so a retired leg can
 	// be reaped from Server.retiring without joining it. Atomic for the same
 	// lock-ordering reason as dead.
+	//
+	// It means "no connection this leg accepted can serve another request", and
+	// Server.pruneRetiredLocked spends it as exactly that: a drained leg stops
+	// being tightened by ReplaceAuth because there is nothing left for a
+	// revocation to reach. That reading is only true because EVERY exit path now
+	// runs drainLeg before this store (#6827 round 7). Before it, the
+	// unexpected-exit arm returned without calling Shutdown at all: Serve closes
+	// the LISTENER on its way out, but the HTTP/1 keep-alive and HTTP/2
+	// connections it had already accepted kept being served — so the flag went up
+	// with live connections behind it, the prune dropped the leg, and its pinned
+	// slot stopped tightening while those connections were still presenting
+	// credentials on it.
 	drained atomic.Bool
 	// dead is set when the leg's serve loop exits UNEXPECTEDLY — the listener
 	// terminated on its own, not via a requested shutdown (stopLegLocked /
@@ -48,17 +60,19 @@ type listenerLeg struct {
 	dead atomic.Bool
 	// stopping is set the moment a graceful drain BEGINS — before Shutdown, not
 	// after the goroutine returns. A flag stored only when the goroutine RETURNS
-	// would stay false for the whole drain window, up to 5s (#6827 round 5).
+	// would stay false for the whole drain window, up to legDrainTimeout (#6827
+	// round 5).
 	//
 	// It marks INTENT, and the socket state trails it by a hair: it is stored
-	// just before Shutdown, which is what closes the listener, and requests
-	// already accepted keep being served until they finish or the 5s deadline
-	// expires. So a `stopping` leg is not instantaneously silent. It is still
-	// the right answer to "is a certificate in front of clients right now?",
-	// which is a question about whether to warn an operator: this leg is on its
-	// way out, no new client will reach it, and a staleness warning about it is
-	// noise. Callers that want "what address is this leg finishing on"
-	// (EffectiveHTTPAddr) deliberately do not consult it.
+	// just before the drain, which is what closes the listener, and requests
+	// already accepted keep being served until they finish or legDrainTimeout
+	// expires and they are severed. So a `stopping` leg is not instantaneously
+	// silent — but it is silent within a bound. It is still the right answer to
+	// "is a certificate in front of clients right now?", which is a question
+	// about whether to warn an operator: this leg is on its way out, no new
+	// client will reach it, and a staleness warning about it is noise. Callers
+	// that want "what address is this leg finishing on" (EffectiveHTTPAddr)
+	// deliberately do not consult it.
 	stopping atomic.Bool
 }
 
@@ -95,7 +109,7 @@ type listenerLeg struct {
 // `drained` is NOT a candidate here even though it is set on every exit
 // (#5561 round 14). It is stored from a defer as the goroutine's LAST act, which
 // makes it the right answer to "has this leg finished, so retiring can reap it?"
-// and the wrong answer to this one: throughout the 5s drain — the whole window
+// and the wrong answer to this one: throughout the drain — the whole window
 // in which the socket is already closed but the goroutine has not returned — it
 // still reads false. A predicate built on it would call a closing listener live
 // for the entire window that matters.
@@ -109,11 +123,45 @@ func (l *listenerLeg) serving() bool {
 	return l != nil && l.ln != nil && !l.dead.Load() && !l.stopping.Load()
 }
 
+// legDrainTimeout bounds how long the connections a leg already accepted have to
+// finish once that leg is on its way out. It applies to every exit — requested
+// retirement, root-context shutdown, and an unexpected serve-loop exit.
+const legDrainTimeout = 5 * time.Second
+
+// drainLeg takes srv out of service and does not return until no connection it
+// accepted can serve another request.
+//
+// Shutdown alone is NOT that guarantee (#6827 round 7), which is why the
+// force-close is not optional. Shutdown stops accepting, closes idle
+// connections, waits for the active ones to go idle, and on deadline returns
+// ctx.Err() with whatever is still active LEFT OPEN. This server deliberately
+// runs with no WriteTimeout (SSE streams and large scrapes must not be
+// severed), so "still active" has no upper bound of its own: a subscribed event
+// stream, or a slow-reading client, outlives the deadline indefinitely. Close
+// severs every tracked connection, so the bound this function promises is real.
+//
+// A leg's whole reason to stop mattering is that its credential policy stops
+// being maintained the moment it drains (listenerLeg.drained,
+// Server.pruneRetiredLocked). A connection that outlives the drain therefore
+// keeps being judged by a snapshot no ReplaceAuth will ever tighten again — a
+// credential the operator has revoked goes on working on a socket the box
+// believes is gone.
+func drainLeg(srv *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), legDrainTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		// Deadline (or a listener-close error): stop asking and sever.
+		_ = srv.Close()
+	}
+}
+
 // serveLegLocked launches srv on ln in a background goroutine registered on the
 // server wait group, and returns the leg. The goroutine serves until (a) the
 // listener terminates on its own, (b) the leg is explicitly retired
 // (stopLegLocked), or (c) the daemon root context is cancelled — then it runs a
-// bounded 5s graceful drain (Shutdown closes ln + unblocks Serve) and joins.
+// bounded graceful drain (drainLeg) and joins. Every one of the three ends in
+// that drain: (a) closes the listener but not the connections behind it, so it
+// needs the drain for exactly the same reason the other two do.
 // Caller holds lifeMu (so rootCtx is set and reads are consistent).
 // slot is the credential slot srv's handler was built with (buildHTTPServer /
 // buildHTTPSServer); every production call site supplies the same one, so the
@@ -148,8 +196,10 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 		}
 		select {
 		case err := <-serveErr:
-			// The listener terminated on its own (not a requested shutdown); the
-			// socket is already closed, nothing left to drain.
+			// The listener terminated on its own (not a requested shutdown), so
+			// the LISTENING socket is already closed — but the connections it
+			// accepted before it died are not (#6827 round 7). They are still
+			// being served, by this srv, under this leg's credential slot.
 			if err != nil && err != http.ErrServerClosed {
 				slog.Error("API listener terminated unexpectedly", "addr", srv.Addr, "tls", isTLS, "err", err)
 			}
@@ -163,15 +213,23 @@ func (s *Server) serveLegLocked(srv *http.Server, ln net.Listener, isTLS bool, s
 			// clear. A leg already retired/replaced by a reconcile takes the
 			// stopCh path below instead, so this only fires on a genuine
 			// self-termination.
+			//
+			// Stored BEFORE the drain, not after: serving() must flip the instant
+			// the socket dies so a reconcile can rebuild the leg, rather than a
+			// whole drain timeout later.
 			leg.dead.Store(true)
+			// Then take the accepted connections down. Without this the flag said
+			// the leg was gone while it was still answering requests, and
+			// `drained` — set by the defer immediately below — told
+			// pruneRetiredLocked there was nothing left for a ReplaceAuth to
+			// tighten (#6827 round 7).
+			drainLeg(srv)
 			return
 		case <-leg.stopCh:
 		case <-rootDone:
 		}
 		leg.stopping.Store(true)
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(sctx)
+		drainLeg(srv)
 		<-serveErr // join the Serve goroutine before the leg is considered drained
 	}()
 	return leg
@@ -222,6 +280,12 @@ func (s *Server) trackRetiring(leg *listenerLeg) {
 
 // pruneRetiredLocked compacts s.retiring down to the legs that are still
 // draining and returns it. Caller holds retireMu.
+//
+// Dropping a leg here ENDS the tightening ReplaceAuth would otherwise keep
+// applying to its pinned slot, so the reap is only sound while `drained` means
+// what serveLegLocked now makes it mean: every connection the leg accepted has
+// been finished or severed (drainLeg), so there is no longer anyone for a
+// revocation to reach.
 func (s *Server) pruneRetiredLocked() []*listenerLeg {
 	live := s.retiring[:0]
 	for _, leg := range s.retiring {

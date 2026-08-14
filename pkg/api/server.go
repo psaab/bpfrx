@@ -1364,7 +1364,7 @@ func warnStaleHostName(leaf *x509.Certificate, hostName, bindHost string, ev hos
 //
 // A `set system host-name` commit reaches it through the daemon, but NOT
 // synchronously: Daemon.applyHostname records a debt and the daemon's delivery
-// path (noteStaleMgmtCertHostName → deliverStaleMgmtCertDiagnosis) makes the
+// path (renameHostNotingStaleMgmtCert → deliverStaleMgmtCertDiagnosis) makes the
 // call — at the rename when a certificate is already being served, and
 // otherwise at whichever later retry point first finds one. The name it passes
 // is read from the kernel at that moment, so this function is handed a live
