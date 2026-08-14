@@ -79971,12 +79971,40 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   zero `[refused, good]`. Harness note: `/dev/shm` filled mid-round, so the
   mutation sweeps were re-run with an explicit VOID classification for
   build/infra failures — a vanished GOCACHE would otherwise read as a red. Both
-  config sweeps reproduced exactly with no VOID cells. Validation: `go test
-  ./...` FULL_RC recorded below; gofmt and go vet clean on touched files. No
-  Rust source changed.
+  config sweeps reproduced exactly with no VOID cells. Validation: gofmt and go
+  vet clean on touched files. No Rust source changed. VALIDATION RECORD
+  CORRECTED, see the entry below.
 - **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
   pkg/config/compiler_validate_strict_nat.go, pkg/config/nat_source_scope.go,
   pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
   pkg/dataplane/userspace/nat_source.go,
   pkg/nat/pool_expansion_parity_6812_test.go,
   docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:35Z
+- **Action**: #6815 round 9 — validation-record correction, plus a re-verification
+  after a shared-tmpfs cache deletion. The parent swept `/dev/shm` and removed
+  `gc-f6815r9` mid-round. My FINAL validation had already moved to a GOCACHE
+  under the job directory, but BOTH builder-fixture mutation sweeps had run
+  against the tmpfs one, so both halves were re-run on the safe cache with a
+  classifier that treats ENOSPC, `build failed`, and a zero exit without an `ok`
+  line as VOID rather than as a result. Both reproduced EXACTLY — 5 blind cells
+  before the permutation, 14 of 14 RED after, zero VOID. Every number in the
+  round-9 plan and commit stands. (The tmpfs directory now exists again at 513 MB
+  with an mtime inside the round, i.e. it was removed and partially rebuilt; that
+  is the shape that makes a straddling cell unreadable, which is why the re-run
+  was owed rather than optional.)
+  CORRECTION. The round-9 commit message and the previous log entry recorded
+  `go test ./...` as exit 0 with 66 packages ok. That run did NOT pass
+  `-count=1`, so an unknown share of it was CACHE-SERVED and the exit code was
+  not evidence the suite had actually executed. Forced with `-count=1` it failed:
+  `pkg/ipmon TestDebounceCoalescing`, "no actuation after debounce window". Run
+  down rather than waved off — `pkg/ipmon` is untouched by this PR (0 files in
+  the range `edefb7570...7547b379f`); the assertion sleeps 40 ms of WALL CLOCK
+  and then requires the debounce goroutine to have actuated, which a loaded box
+  can miss; it passes 5/5 in isolation at the PR head and 8/8 at the PR BASE, so
+  it is pre-existing and load-dependent, not a regression this PR introduced. A
+  second forced `-count=1` full run is clean: **exit 0, 62 packages with tests,
+  zero FAIL**. That is the figure of record; the earlier "66 ok" conflated
+  packages-with-tests and `no test files` lines and came from the unforced run.
+- **File(s)**: _Log.md
