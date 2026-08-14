@@ -193,11 +193,20 @@ func (m *Manager) DisableAndStopHelper() {
 // BLOCKED forever inside the cycle — and there, holding is the right answer: the
 // workers really are joined and reconciling really would be wrong.
 //
-// The TTL therefore covers exactly one residual: a lease acquired outside that
-// deferred extent by some future call site. There is none today —
-// PrepareLinkCycle has a single production caller, daemon_apply_dataplane.go —
-// and two guards fail if one appears, in
-// link_cycle_acquisition_site_6871_test.go:
+// WHAT THE TTL DOES NOT COVER, stated first because an earlier revision of this
+// paragraph had it exactly backwards (#6871 round 13). It said the TTL "covers
+// exactly one residual: a lease acquired outside that deferred extent". It
+// covers that residual not at all. acquireLinkCycleLease starts the heartbeat
+// unconditionally, wherever it is called from, and the heartbeat re-arms the
+// deadline every 15s for as long as the word is non-zero — so a lease taken
+// outside the daemon's deferred abandon is precisely the lease the TTL can never
+// reach. It renews itself until the process exits.
+//
+// That is not a footnote. It means the two guards below are not a supplement to
+// a TTL backstop, they are the ONLY thing standing between a second acquisition
+// site and a permanently suppressed reconcile loop, and a reader who believes
+// the TTL will eventually clean up after a leaked acquisition will under-weight
+// exactly the check that matters. In link_cycle_acquisition_site_6871_test.go:
 //
 //	TestLinkCycleLeaseHasExactlyOneAcquisitionSite_6871  tree-wide: every
 //	    production CALL of PrepareLinkCycle must be on an allowlist, because
@@ -207,17 +216,24 @@ func (m *Manager) DisableAndStopHelper() {
 //	    could take a lease WITHOUT going through PrepareLinkCycle and inherit
 //	    none of the daemon's deferred release
 //
+// Both also reject a reference that is not a CALL — a method value can be stored
+// and invoked from anywhere later, so no enclosing declaration bounds it, and
+// keying one by its neighbours was itself a measured escape (#6871 round 13).
+//
 // #6871 round 9 (F2): this paragraph previously named the first of those as
 // existing enforcement, and it did not exist — the only match for the name in
 // the tree was this comment. The factual claim was true and the guard was
 // absent, which is the worse of the two failures: it is the reason the next
 // reader does not add the check.
 //
-// Overrunning stays bounded and loud rather than silent: linkCycleInFlight logs
-// a Warn under the CAS when it retires an expired lease, and the state it
-// degrades to is master's — the pre-#6871 behaviour where the tick was never
-// suppressed at all. An overrun loses the added protection for the tail of that
-// cycle; it does not introduce a new failure mode.
+// WHAT THE TTL DOES COVER is a heartbeat that is alive but STARVED: four missed
+// beats — a GC pause, a saturated box, a goroutine that does not get scheduled —
+// which is the margin the 4x above is chosen for. That case stays bounded and
+// loud rather than silent: linkCycleInFlight logs a Warn under the CAS when it
+// retires an expired lease, and the state it degrades to is master's — the
+// pre-#6871 behaviour where the tick was never suppressed at all. An overrun
+// loses the added protection for the tail of that cycle; it does not introduce a
+// new failure mode.
 const linkCycleLeaseTTL = 60 * time.Second
 
 // linkCycleLeaseHeartbeat is the period at which a live lease renews itself, and
@@ -490,9 +506,18 @@ func (m *Manager) RenewLinkCycle() {
 	}
 }
 
-// releaseLinkCycleLease ends the lease. Idempotent — the release site runs
-// unconditionally at the top of NotifyLinkCycle's critical section, so a second
-// call (or a call with no lease held) is a no-op.
+// releaseLinkCycleLease ends the lease. Idempotent in EFFECT — the release site
+// runs unconditionally at the top of NotifyLinkCycle's critical section, so a
+// second call, or a call with no lease held, leaves the same state behind.
+//
+// Not a no-op, though, and an earlier revision said it was (#6871 round 13). The
+// two halves of a lease are retired by different writers and can be out of step:
+// linkCycleInFlight's backstop CAS clears the WORD while deliberately leaving the
+// heartbeat goroutine running (see startLinkCycleHeartbeat on why the reap was
+// removed). A release arriving in that state finds Load()==0 and still does real
+// work — it stops and JOINS the heartbeat. That is the point: "no lease" and
+// "nothing is still beating for it" are not the same condition, and this is the
+// only thing that makes them one.
 //
 // Heartbeat FIRST, then the word. Ordering is not load-bearing either way —
 // RenewLinkCycle refuses to renew from the 0 sentinel, so a beat racing the
@@ -558,10 +583,13 @@ func (m *Manager) AbandonLinkCycle() bool {
 // #6871 (round 8): the expiry branch RE-READS on a lost CAS instead of reporting
 // the expiry it failed to commit, and that is a correctness fix, not tidying.
 //
-// Three writers touch this word: this expiry CAS, RenewLinkCycle's CAS, and
-// acquireLinkCycleLease's Store. Either of the other two can land between the
-// Load above and the CAS below, and when one does, the CAS FAILS — the word no
-// longer holds the value that was read. The previous form returned false anyway:
+// FOUR writers touch this word: this expiry CAS, RenewLinkCycle's CAS,
+// acquireLinkCycleLease's Store, and releaseLinkCycleLease's Store(0) — which an
+// earlier revision omitted while listing its outcome in the table below, so the
+// count and the table contradicted each other (#6871 round 13). Any of the other
+// three can land between the Load above and the CAS below, and when one does,
+// the CAS FAILS — the word no longer holds the value that was read. The previous
+// form returned false anyway:
 //
 //	if m.linkCycleLeaseUntil.CompareAndSwap(until, 0) { warn }
 //	return false                     // CAS result discarded
@@ -608,7 +636,11 @@ func (m *Manager) linkCycleInFlight() bool {
 //  1. Disables ctrl so the XDP shim stops redirecting to XSK
 //  2. Leaves the userspace shim attached with transit fail-closed
 //  3. Sends "stop_workers" to the Rust helper, which joins all worker
-//     threads — no thread touches UMEM after this returns
+//     threads — so no thread touches UMEM after a SUCCESSFUL return. That
+//     qualifier is the contract (#6871 round 13): if the request fails this
+//     function returns an error with the workers possibly still running, which
+//     is exactly why the error is returned rather than logged, and why the
+//     caller must not cycle the link on it
 //  4. Takes the #6871 link-cycle lease, which holds that join across the
 //     window where m.mu is NOT held (see below). The daemon renews it once per
 //     RETH member (RenewLinkCycle), so the lease tracks the loop's progress
@@ -769,8 +801,18 @@ func (m *Manager) NotifyLinkCycle() error {
 	// Latest correct point: it precedes every `return` below, including the
 	// no-helper early return and the rebind failure. A release placed after any
 	// of those would strand the lease on exactly the paths where forwarding is
-	// already down, turning a recoverable outage into a frozen reconcile loop
-	// until the TTL backstop fired.
+	// already down, adding a frozen reconcile loop on top of an outage that is
+	// already in progress.
+	//
+	// For HOW LONG is not "until the TTL backstop fires", and an earlier revision
+	// said it was (#6871 round 13). Two things are wrong with that. The daemon
+	// defers abandonLinkCycleLease over the whole apply, so a lease stranded on
+	// one of these returns is dropped when applyDataplaneAndHACore returns — much
+	// sooner than 60s. And the TTL could not have fired first anyway: the
+	// heartbeat re-arms the deadline every 15s for as long as the word is
+	// non-zero, so inside that extent expiry is not the mechanism that ends
+	// anything. The backstop is for a STARVED heartbeat, not for a missed
+	// release.
 	m.releaseLinkCycleLease()
 	if m.proc == nil || m.proc.Process == nil {
 		return nil

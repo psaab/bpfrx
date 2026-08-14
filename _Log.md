@@ -80386,3 +80386,163 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
   pkg/dataplane/userspace/link_cycle_lease_6871_test.go,
   pkg/dataplane/userspace/process_linkcycle.go, _Log.md
+
+- **Timestamp**: 2026-08-13
+- **Action**: #6871 round 13 — both lease-acquisition guards were blind to a
+  METHOD VALUE, which Codex compiled into a working escape; plus the fixture's
+  one-shot injection was consumable by the installing goroutine, and nine
+  comment/doc claims were false.
+
+  B1 (BLOCKING, fixed). `callSitesOf` recorded any `*ast.SelectorExpr` naming the
+  target and keyed it by its enclosing declaration. Round 10 widened it to that
+  from `CallExpr.Fun` for a good reason — a method value has no CallExpr — but
+  the widening was not sufficient, because keying a method VALUE by its enclosing
+  declaration files it under whatever key that declaration has, and the
+  declaration bounds nothing:
+
+	var escapedAcquire func()
+	// inside (*Manager).PrepareLinkCycle — the one allowlisted site:
+	take := m.acquireLinkCycleLease
+	escapedAcquire = func() { m.mu.Lock(); defer m.mu.Unlock(); take() }
+	take()
+	func TakeLeaseOutsideApply() { escapedAcquire() }   // no selector at all
+
+  The only selector naming the method sits in the allowlisted declaration, so the
+  scan produced exactly the expected key and both guards passed. Calling
+  `TakeLeaseOutsideApply` after the daemon's apply has returned takes a lease
+  outside the deferred `abandonLinkCycleLease`, and since round 8 made the lease
+  renew itself that suppresses the 1 Hz reconcile for the life of the process.
+
+  THE GUARD IS THE DELIVERABLE, so a guard that cannot see this is not weak, it
+  does not hold. The rule is now positional: `callSitesOf` returns `methodRefs`
+  splitting CALLS (the selector is a CallExpr's callee, after unwrapping paren
+  and generic-instantiation forms) from ESCAPES (every other reference form).
+  Escapes are reported by BOTH guards as violations regardless of the enclosing
+  declaration, because no allowlist entry can honestly cover a value that can be
+  stored and invoked anywhere.
+
+  Third escape of one family in this campaign — #6676's binding_slot callee
+  substitution and #6706's `*x.field = CLI{}` write form were both an AST matcher
+  matching a NAME where the property is about a POSITION.
+
+  SIBLING CANARY AUDIT (asked for, and reported either way). Five other AST/text
+  canaries in pkg/dataplane/userspace plus the named #5103 sibling:
+    - `maps_decouple_test.go` — `.Map(literal)` is callee-only, but a SECOND
+      canary (`TestNoMapNameLiteralAliasesOutsideRegistry`) already exists
+      specifically to close the const-alias / parenthesized-selector / METHOD-
+      ALIAS bypasses. Answered, not holed.
+    - `controllers_binding_table_6871_test.go` — enumerates method DECLARATIONS
+      (FuncDecl + receiver). A declaration has no non-callee form. Not applicable.
+    - `manager_coupling_test.go` — struct/type shape. Not applicable.
+    - `worker_count_single_source_5718_test.go` — the `cfg.Workers` count is
+      position-FREE (any read in any position counts, the safe direction); the
+      clamp-helper prohibition is `call.Fun.(*ast.Ident)`-only, so
+      `f := heartbeatZeroSlots; f(...)` would evade it. Same family, different
+      property and issue — reported, not changed here.
+    - `pkg/daemon/reth_hook_wired_5103_test.go` — exact-count assertions, so a
+      method-value SUBSTITUTION drops the count to 0 and fails loudly. A method
+      value ADDED alongside the direct call would be invisible. Weaker instance,
+      fails-safe on the substitution form.
+    - `shim_loader_boundary_test.go` — `strings.Contains` over function source;
+      `.Load()` / `.Compile(cfg)` would not match a method value. Text-level
+      instance of the same family, on a #1476 boundary property. Reported.
+
+  B1 PROOF — 10 cells, each a fresh source copy with its own GOCACHE, GOTMPDIR
+  and TMPDIR, `set -euo pipefail`, an APPLIED marker required on disk, and a
+  BUILD_RC gate so a plant that does not compile is not scored. 10/10 MATCH:
+
+	plant                                   guard=HEAD   guard=FIXED
+	none (control)                            GREEN         GREEN
+	A  method value @ process_linkcycle:669   GREEN         RED
+	B  ordinary 2nd call @ :670               GREEN         GREEN
+	C  method value in NotifyLinkCycle        RED           RED
+	D  PrepareLinkCycle method value in the
+	   allowlisted daemon declaration         GREEN         RED
+
+  A and B are ONE LINE APART with different outcomes under the fixed guard, which
+  is the anti-staleness evidence and also the substantive point: the guard now
+  discriminates the FORM of a reference, not its name or its neighbourhood. The
+  reference trees were md5-verified unchanged after the grid.
+
+  B2 (fixed). Codex confirmed the round-12 goroutine gate closes the reported
+  thief, but ANY earlier `linkCycleLeaseElapsed()` call on the INSTALLING
+  goroutine consumes the one-shot. Reproduced: with an intervening read inserted
+  after installation and the production lost-CAS fix reverted, the HEAD fixture
+  passes 100/100 VACUOUSLY. "My goroutine" was only ever a proxy for "my call";
+  the gate now requires the read to be made BY the installing goroutine AND FROM
+  INSIDE `Manager.linkCycleInFlight`, and a `t.Cleanup` fails the cell if the
+  injection never ran at all — a stricter gate must not be able to trade one
+  false green for another.
+
+  Chose the frame gate over a per-manager injection seam because the seam would
+  mean adding a field to the production Manager to serve a fixture, and because
+  the frame states the property directly. `leaseSeamGoID` became
+  `leaseSeamCaller`, which VERIFIES the "goroutine " prefix rather than skipping
+  its length — an unverified skip makes an undocumented runtime format an
+  unstated dependency, and a changed header would have yielded a parsed id from
+  whatever followed.
+
+  B2 PROOF — 8 more isolated cells, 50 iterations each unless noted:
+
+	cell  fixture  plants               result
+	b1    HEAD     revert + interven.   GREEN  100/100 vacuous (the defect)
+	b2    FIXED    revert + interven.   RED    100/100 discriminator fails
+	b3    HEAD     revert               RED    100/100  (so: brittleness,
+	b4    FIXED    revert               RED    100/100   not an inert assertion)
+	b5    FIXED    none                 GREEN
+	b6    FIXED    intervening read     GREEN  (no false red introduced)
+	b7    FIXED    frame name broken    RED    60 vacuity failures (x20 iters)
+	b8    FIXED    header prefix broken RED    fails loudly at install
+
+  b7 and b8 are the controls for the two new belts: neither is decorative.
+
+  B3 — nine claim corrections, each verified against the code before editing.
+  All nine were REAL:
+   1. `process_linkcycle.go` + `docs/reth-mac.md` said the TTL backstops a lease
+      acquired outside the deferred extent. It backstops it NOT AT ALL — the
+      heartbeat re-arms the deadline every 15s wherever the lease was taken, so
+      such a lease renews itself until the process exits. This is the sentence
+      that made B1 sound survivable. Both now say so, and say what the TTL DOES
+      cover: a heartbeat that is alive but starved past four beats.
+   2. "every production CALL of PrepareLinkCycle" — now true by construction, and
+      the allowlist doc says why a call is the only form a key can bound.
+   3. "no thread touches UMEM after this returns" holds only on a SUCCESSFUL
+      join; a `stop_workers` error returns with workers possibly live. Fixed in
+      the numbered contract, at `docs/reth-mac.md:73`, and in the round-9
+      "true only for the instant it returned" correction, which repeated it.
+   4. `releaseLinkCycleLease` with no lease is NOT a no-op: the expiry CAS can
+      clear the word while leaving the heartbeat alive, and release stops and
+      JOINS it. It is idempotent in effect, which is a different claim.
+   5. FOUR writers touch the lease word, not three — `releaseLinkCycleLease`'s
+      `Store(0)` was omitted from the count while its outcome was listed in the
+      table three lines below.
+   6. A release placed after an early return would not "wait for the TTL": the
+      daemon's deferred abandon drops it at the end of the apply, and the TTL
+      could not have fired first anyway because the heartbeat keeps re-arming it.
+   7. The race test's "no goroutines" is false — the fresh-prepare injection
+      starts the heartbeat. Corrected, with what actually makes it deterministic.
+   8. The ATOMIC paragraph claimed cross-goroutine protection the code no longer
+      provides: `&&` short-circuits, so a non-owner returns before touching
+      `fired`. The measurement it cites was taken against the UNGATED round-11
+      closure. Rewritten to say the atomic is retained deliberately, not
+      load-bearing, and that `fakeLinkCycleClock`'s counter still is.
+   9. "none of this is reachable" at the production 15s beat is stronger than the
+      measurement: unlikely, not impossible.
+
+  NON-DEFECT, recorded so a later round does not re-open it. Codex traced the
+  lease lifecycle and found NO finite production path that leaves an acquired
+  lease unreleased: no helper means no acquisition; a `stop_workers` failure is
+  after acquisition and the wrapper's rollback `NotifyLinkCycle` releases before
+  its no-helper/rebind-error returns; post-join setDown/MAC-write failures take
+  the same rollback; a link-up failure reports `linkCycled=true` which arms the
+  final step-2.6b2 `NotifyLinkCycle`; rebind failures are after `NotifyLinkCycle`
+  already released; panics and later early returns are covered by the outer
+  `defer d.abandonLinkCycleLease()`. Release runs more than once on normal and
+  mixed-member paths, but retirement is state-idempotent, and `RenewLinkCycle`
+  observes the zero sentinel so no retired lease is resurrected.
+
+  VALIDATION: `go test ./...` green. Rust untouched. The 18 mutation cells above
+  are the discriminating evidence; the two grids are 10/10 and 8/8 MATCH.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  pkg/dataplane/userspace/link_cycle_lease_race_6871_test.go,
+  pkg/dataplane/userspace/process_linkcycle.go, docs/reth-mac.md, _Log.md

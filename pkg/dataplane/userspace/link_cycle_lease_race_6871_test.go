@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"bytes"
 	"runtime"
 	"strconv"
 	"sync/atomic"
@@ -36,8 +37,16 @@ import (
 // reads the word, then calls linkCycleLeaseElapsed(), then CASes what it read.
 // The clock seam therefore sits EXACTLY in the Load->CAS window, so code run
 // from inside it interleaves precisely where a competing goroutine does on a
-// real box. That makes the repro deterministic instead of a timing lottery: no
-// sleeps, no goroutines, no scheduler dependence.
+// real box. That makes the repro deterministic instead of a timing lottery: the
+// interleaving is produced by the seam rather than by the scheduler, so there
+// are no sleeps and nothing the assertion depends on is timing-sensitive.
+//
+// It is not goroutine-FREE, and an earlier revision said it was (#6871 round
+// 13). fresh_prepare_wins_the_cas injects a real acquireLinkCycleLease, which
+// starts the lease's heartbeat goroutine. Nothing below waits on it: the first
+// beat is one linkCycleLeaseHeartbeat (15s) away, the assertion runs
+// immediately, and the cell's t.Cleanup releases the lease, which stops and
+// JOINS that goroutine before the subtest ends.
 
 // injectAtLeaseExpiryCheck installs a linkCycleLeaseElapsed seam that runs
 // inject EXACTLY ONCE — on the first read BY THE GOROUTINE THAT INSTALLED IT —
@@ -102,16 +111,30 @@ import (
 // before the thief's store lands, measured at HEAD as 4 of 200 accumulating
 // iterations and 1 of 200 separate invocations, all in fresh_prepare_wins_the_cas.
 //
-// ATOMIC, not a plain bool (#6871 round 11), because this closure is read from
-// more than one goroutine — the gate above narrows WHO may inject, not who may
-// read. Round 10 made linkCycleLeaseElapsedOverride an atomic.Pointer, which
-// makes the SWAP race-free; it does not make the closure the pointer points AT
-// goroutine-safe. fakeLinkCycleClock's counter is an atomic.Int64 for exactly
-// this reason; this flag was the one capture that had not been given the same
-// treatment, and `go test -race` reported a genuine WARNING: DATA RACE on it
-// (read here, previous write from startLinkCycleHeartbeat.func1) once the
-// heartbeat period is shortened enough to widen the collision window. Measured:
+// ATOMIC, and no longer the thing that makes this race-free (#6871 round 13).
+// Round 11 made the flag an atomic.Bool because the closure WAS read from more
+// than one goroutine: linkCycleLeaseElapsedOverride is an atomic.Pointer, which
+// makes the SWAP race-free without making the closure it points AT
+// goroutine-safe, and `go test -race` reported a genuine WARNING: DATA RACE on
+// this flag (read here, previous write from startLinkCycleHeartbeat.func1) once
+// the heartbeat period is shortened enough to widen the collision window —
 // 1 race report before, 0 after, -race -count=5.
+//
+// That measurement was taken against the UNGATED closure. The gate added in
+// round 12 and tightened in round 13 is evaluated with `&&`, so it
+// short-circuits: a caller that is not the installing goroutine, or is not
+// inside linkCycleInFlight, returns before `fired` is touched at all. Only the
+// owner ever reaches the flag, so a plain bool would today be sufficient AND
+// race-free, and describing the atomic as the protection would be describing
+// round 11's code.
+//
+// It stays because it costs one uncontended CAS on a test-only path and it is
+// the half that remains correct if the gate is ever loosened — and because
+// CompareAndSwap is the natural spelling of "commit the flag BEFORE inject
+// runs", which is what makes the re-entrant read from inside inject a no-op
+// rather than infinite recursion. fakeLinkCycleClock's counter is an
+// atomic.Int64 for the original reason and is NOT gated, so there the atomic is
+// still load-bearing.
 //
 // The off-goroutine `panic: Fail in goroutine after ... has completed` has TWO
 // producers and each half retires one. The atomic retires the double injection —
@@ -122,54 +145,107 @@ import (
 // reproduced (1 in a 100-iteration B1-reverted run), and it is not a double
 // injection. Neither producer fired at HEAD: 0 panics in 200 accelerated runs.
 //
-// At the production 15s beat none of this is reachable — the collision window is
-// microseconds against a 15s period, and the discriminator is 200/200 RED under
-// the B1 revert there.
+// At the production 15s beat the collision is vanishingly unlikely rather than
+// impossible — the window is microseconds wide against a 15s period, so a beat
+// CAN land in it — and it was not observed there: the discriminator is 200/200
+// RED under the B1 revert (#6871 round 13 corrected an earlier "none of this is
+// reachable", which is a stronger claim than the measurement supports).
+//
+// THE GOROUTINE ID IS NOT ENOUGH ON ITS OWN (#6871 round 13). "My goroutine" was
+// only ever a proxy for "my call", and the two come apart: linkCycleLeaseElapsed
+// is reached from linkCycleLeaseDeadline as well as from linkCycleInFlight, so
+// ANY earlier same-goroutine read consumes the one-shot and the injection then
+// runs somewhere other than the Load->CAS window it is meant to occupy. That was
+// measured, not supposed — an intervening read placed right after installation,
+// with the production lost-CAS fix reverted so both cells are OBLIGED to fail,
+// passed 100/100.
+//
+// So the gate states the property directly: the read must be made BY the
+// installing goroutine AND FROM INSIDE Manager.linkCycleInFlight. The goroutine
+// half rejects a leaked heartbeat's beat (which does reach linkCycleInFlight,
+// via RenewLinkCycle); the frame half rejects this goroutine's own reads from
+// anywhere else. Neither is redundant.
+//
+// AND THE CELL FAILS IF THE INJECTION NEVER RAN. A stricter gate can only turn a
+// false green into a different false green if "did not fire" stays silent, so
+// t.Cleanup asserts it fired. That also covers the gate going stale — rename
+// linkCycleInFlight without updating leaseSeamInFlightFrame and every cell here
+// fails loudly instead of quietly testing nothing.
 func injectAtLeaseExpiryCheck(t *testing.T, elapsed time.Duration, inject func()) {
 	t.Helper()
-	owner := leaseSeamGoID()
+	owner, _ := leaseSeamCaller()
 	if owner == 0 {
-		t.Fatal("fixture: could not read this goroutine's id, so a stolen injection " +
-			"could not be told from this test's own; refusing to run a cell that would " +
-			"pass vacuously")
+		t.Fatal("fixture: could not read this goroutine's id from the runtime.Stack " +
+			"header, so a stolen injection could not be told from this test's own; " +
+			"refusing to run a cell that would pass vacuously")
 	}
 	var fired atomic.Bool
+	// Registered BEFORE swapLinkCycleLeaseElapsed's restore, so cleanup LIFO
+	// uninstalls the override first and nothing can flip the flag under the check.
+	t.Cleanup(func() {
+		if !fired.Load() {
+			t.Errorf("fixture: the injection never ran. Every assertion in this cell is " +
+				"about what linkCycleInFlight does when a competing writer lands inside its " +
+				"Load->CAS window, and no writer landed there — so the cell proved nothing " +
+				"and would have passed either way. Either the seam is no longer reached from " +
+				"linkCycleInFlight, or leaseSeamInFlightFrame no longer names that frame")
+		}
+	})
 	swapLinkCycleLeaseElapsed(t, func() time.Duration {
-		if leaseSeamGoID() == owner && fired.CompareAndSwap(false, true) {
+		if id, inFlight := leaseSeamCaller(); inFlight && id == owner &&
+			fired.CompareAndSwap(false, true) {
 			inject()
 		}
 		return elapsed
 	})
 }
 
-// leaseSeamGoID returns the calling goroutine's id, parsed out of the header
-// runtime.Stack writes ("goroutine <id> [running]:\n...").
+// leaseSeamInFlightFrame is the traceback spelling of the ONE call site whose
+// read is the Load->CAS window. runtime.Stack renders a method frame as
+// "<importpath>.(*Manager).linkCycleInFlight(...)", and inlined frames are
+// expanded rather than elided, so a compiler decision cannot silently empty this
+// match.
+const leaseSeamInFlightFrame = ".(*Manager).linkCycleInFlight("
+
+// leaseSeamCaller reports the calling goroutine's id and whether the call is
+// being made from inside Manager.linkCycleInFlight, both read out of one
+// runtime.Stack dump.
 //
-// Same technique, and for the same reason, as pkg/logging's goID (#2287): the
-// property under test belongs to ONE goroutine's Load->CAS window, so the
-// fixture has to tell its own read of the shared seam from a concurrent one, and
-// no flag can make that distinction — a flag records THAT someone read, never
-// WHO. Test-only, and only while an injecting override is installed, which is
-// microseconds; runtime.Stack for the current goroutine alone does not stop the
-// world.
-func leaseSeamGoID() uint64 {
-	var buf [64]byte
+// The id uses the same technique, and for the same reason, as pkg/logging's goID
+// (#2287): the property under test belongs to ONE goroutine's Load->CAS window,
+// so the fixture has to tell its own read of the process-global seam from a
+// concurrent one, and no flag can make that distinction — a flag records THAT
+// someone read, never WHO.
+//
+// The header prefix is VERIFIED rather than assumed (#6871 round 13). Skipping
+// len("goroutine ") bytes without checking them makes an undocumented runtime
+// format an unstated dependency: a changed header would silently yield a parsed
+// id from whatever happened to follow, and the gate would then admit or reject
+// on a number that means nothing. A mismatch returns 0, which the caller turns
+// into a t.Fatal at install time.
+//
+// Test-only, and only while an injecting override is installed. runtime.Stack
+// for the current goroutine alone does not stop the world; the buffer is 8 KiB
+// because the frame match needs the frames, and a truncated dump fails CLOSED
+// (no match -> no injection -> the vacuity check above fires).
+func leaseSeamCaller() (uint64, bool) {
+	var buf [8 << 10]byte
 	n := runtime.Stack(buf[:], false)
-	const prefix = "goroutine "
 	s := buf[:n]
-	if len(s) < len(prefix) {
-		return 0
+	const prefix = "goroutine "
+	if !bytes.HasPrefix(s, []byte(prefix)) {
+		return 0, false
 	}
-	s = s[len(prefix):]
+	rest := s[len(prefix):]
 	i := 0
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+	for i < len(rest) && rest[i] >= '0' && rest[i] <= '9' {
 		i++
 	}
-	id, err := strconv.ParseUint(string(s[:i]), 10, 64)
+	id, err := strconv.ParseUint(string(rest[:i]), 10, 64)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return id
+	return id, bytes.Contains(rest, []byte(leaseSeamInFlightFrame))
 }
 
 // TestLinkCycleInFlightHonoursALostExpiryCAS_6871 is the B1 discriminator.

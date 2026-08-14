@@ -70,12 +70,18 @@ exercised and the member never gets its post-cycle recovery.
 
 ## The AF_XDP Worker Join Precedes the Link Cycle (#5103)
 
-`PrepareLinkCycle`'s contract is that **no thread touches UMEM once it
-returns** — it disables `ctrl` so the XDP shim stops redirecting to XSK, then
-sends `stop_workers` so the Rust helper joins every worker thread. That barrier
-therefore has to land **before** the NIC tears down its queues, not after: a
-worker still reading UMEM while the driver unmaps those pages is a
+`PrepareLinkCycle`'s contract is that **no thread touches UMEM once it returns
+successfully** — it disables `ctrl` so the XDP shim stops redirecting to XSK,
+then sends `stop_workers` so the Rust helper joins every worker thread. That
+barrier therefore has to land **before** the NIC tears down its queues, not
+after: a worker still reading UMEM while the driver unmaps those pages is a
 use-after-unmap.
+
+The success qualifier is the whole reason the function returns an `error`
+(#6871 round 13; earlier revisions stated the contract unconditionally). If
+`stop_workers` fails, `PrepareLinkCycle` returns with the workers **possibly
+still running**, and the caller must not cycle the link — which is exactly what
+`programRethMACWithWorkerJoin` does with it.
 
 It cannot simply be hoisted above `programRethMAC`. Whether a cycle happens at
 all is only knowable by **attempting** the live MAC set: if the kernel accepts
@@ -223,8 +229,10 @@ path where this node's forwarding is already down.
 The join above is a **moment, not a barrier**. `PrepareLinkCycle` takes `m.mu`,
 joins the workers, and releases it on return — and the daemon does not reach
 `setDown` until several netlink calls later. Every other holder of `m.mu` runs in
-that window, so "no thread touches UMEM once it returns" was true only for the
-instant it returned.
+that window, so "no thread touches UMEM once it returns successfully" was true
+only for the instant it returned. (On a failed join it was not true even then —
+see the qualifier above; this section is about the window that follows a join
+that did succeed.)
 
 The busiest producer in that window is the 1 Hz status tick, which undoes the
 join five different ways:
@@ -467,23 +475,46 @@ the busy-binding auto-rebind that recreates workers is gated by
 rate limit, and `lastStatus.ForwardingArmed`. So the honest figure is **seconds**,
 not one tick. An earlier revision implied the latter (#6871 round 9).
 
-The TTL is now a backstop for exactly one residual: a lease acquired outside that
-deferred extent by some future call site. There is none today —
-`PrepareLinkCycle` has a single production caller — and since #6871 round 9 that
-is **enforced** rather than merely stated: `link_cycle_acquisition_site_6871_test.go`
-walks the whole module for `PrepareLinkCycle` calls against an allowlist, and
-separately pins that the unexported `acquireLinkCycleLease` is reached only from
+**The TTL does not back an out-of-extent acquisition up at all**, and an earlier
+revision of this paragraph claimed the opposite — that the TTL "is now a backstop
+for exactly one residual: a lease acquired outside that deferred extent" (#6871
+round 13). `acquireLinkCycleLease` starts the heartbeat wherever it is called
+from, and the heartbeat re-arms the deadline every 15s for as long as the word is
+non-zero. A lease taken outside the daemon's deferred `AbandonLinkCycle` is
+therefore precisely the lease the TTL can never reach: it renews itself until the
+process exits.
+
+What the TTL *does* back up is a heartbeat that is alive but **starved** — four
+missed beats, which is what the 4x margin is chosen for. That case stays bounded
+and loud rather than silent: `linkCycleInFlight` logs a `Warn` under the CAS when
+it retires an expired lease, and the behaviour it degrades to is master's, where
+the tick was never suppressed at all.
+
+Which makes the guards the *only* thing covering a second acquisition site, not a
+supplement to a timer. Since #6871 round 9 the property is **enforced** rather
+than merely stated: `link_cycle_acquisition_site_6871_test.go` walks the whole
+module for `PrepareLinkCycle` calls against an allowlist, and separately pins that
+the unexported `acquireLinkCycleLease` is reached only from
 `Manager.PrepareLinkCycle` (an in-package caller would bypass the chokepoint
 entirely). Round 8's comment named the first of those as existing enforcement
-when no such test existed. Overrunning stays bounded and loud rather
-than silent: `linkCycleInFlight` logs a `Warn` under the CAS when it retires an
-expired lease, and the behaviour it degrades to is master's, where the tick was
-never suppressed at all.
+when no such test existed.
 
-**`linkCycleInFlight` re-reads on a lost CAS (#6871 round 8).** Three writers
+Both guards classify by **position**, not by name (#6871 round 13). A selector
+that is a call's callee is a call site and is checked against the allowlist;
+every other reference form — a method value above all — is rejected outright,
+because a value can be stored and invoked anywhere later, so the declaration it
+was written in bounds nothing. The escape that forced this was compiled, not
+imagined: taking `m.acquireLinkCycleLease` as a method value *inside* the
+allowlisted `PrepareLinkCycle`, leaking it through a package-level variable, and
+calling it after the apply returned left the only matching selector in the
+allowlisted declaration and both guards green.
+
+**`linkCycleInFlight` re-reads on a lost CAS (#6871 round 8).** Four writers
 touch the lease word: the expiry CAS in `linkCycleInFlight`, `RenewLinkCycle`'s
-CAS, and `acquireLinkCycleLease`'s `Store`. Either of the latter two can land
-between the reader's `Load` and its CAS, and the reader's CAS then **fails**. The
+CAS, `acquireLinkCycleLease`'s `Store`, and `releaseLinkCycleLease`'s `Store(0)`
+— which an earlier revision left out of the count while listing its outcome in
+the table below (#6871 round 13). Any of the other three can land between the
+reader's `Load` and its CAS, and the reader's CAS then **fails**. The
 previous code returned `false` regardless, discarding the CAS result — but the
 value the word moved *to* is what decides the answer:
 
