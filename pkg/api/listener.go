@@ -29,9 +29,18 @@ type listenerLeg struct {
 	// serving at that instant, and from then on only ever tightens — see
 	// authSlot and Server.ReplaceAuth.
 	slot *authSlot
-	// drained is set by the serve goroutine as its LAST act, so a retired leg can
-	// be reaped from Server.retiring without joining it. Atomic for the same
-	// lock-ordering reason as dead.
+	// drained is set by the serve goroutine after its body and its drain have
+	// finished, so a retired leg can be reaped from Server.retiring without
+	// joining it. Atomic for the same lock-ordering reason as dead.
+	//
+	// It is NOT the goroutine's last act, and the difference is observable
+	// (#6827 round 8): the defers run LIFO — `defer s.wg.Done()` is registered
+	// first, `defer leg.drained.Store(true)` second — so this store happens
+	// BEFORE wg.Done. A reader that sees drained cannot conclude the goroutine
+	// has returned; it can conclude the exit path and the drain are complete,
+	// which is what every caller here actually needs. Server.Wait, which waits
+	// on wg.Done, is the strictly stronger barrier and is what the tests use
+	// where they can.
 	//
 	// It means "nothing this leg accepted is still being served" — no further
 	// request can be admitted AND no response is still in flight (#6827 round 8;
@@ -128,18 +137,45 @@ func (l *listenerLeg) serving() bool {
 	return l != nil && l.ln != nil && !l.dead.Load() && !l.stopping.Load()
 }
 
-// legDrainTimeout bounds how long the connections a leg already accepted have to
-// finish once that leg is on its way out. It applies to every exit — requested
+// legDrainTimeout is how long the connections a leg already accepted have to
+// finish GRACEFULLY once that leg is on its way out, on every exit — requested
 // retirement, root-context shutdown, and an unexpected serve-loop exit.
+//
+// It bounds the SHUTDOWN, not drainLeg, and the difference is not academic
+// (#6827 round 8). The sever that follows has no deadline of its own and is not
+// O(1): http.Server.Close takes no context and closes s.activeConn SERIALLY
+// (net/http/server.go), and on an HTTPS leg each of those is a *tls.Conn whose
+// Close sends close_notify under a five-second write deadline of its OWN
+// (crypto/tls/conn.go closeNotify). A peer that stalls its receive window
+// therefore costs up to five seconds EACH, one after another, so the worst-case
+// drain grows with the number of such connections rather than sitting at five
+// seconds. The knock-on is worth knowing before someone rediscovers it as a
+// hang: Server.Wait holds lifeMu across the drain, and
+// WarnStaleMgmtCertForHostName holds staleCertMu while waiting for lifeMu, so a
+// `set system host-name` racing daemon shutdown waits for whatever the drain
+// takes. Bounding the sever phase for real needs per-connection tracking with
+// concurrent deadlined closes, which is a larger change than #6827; what is
+// claimed here is only what is true.
 //
 // A var, not a const, so a test can reach the DEADLINE arm — the one where
 // Shutdown gives up and drainLeg severs what is left — without spending five
-// seconds per case (#6827 round 8). Production never assigns it.
+// seconds in every case (#6827 round 8). Production never assigns it, and
+// TestLegDrainTimeoutDefault_6827 pins the shipped value so a leaked override
+// cannot retune it silently.
 var legDrainTimeout = 5 * time.Second
 
 // drainLeg takes srv out of service and does not return until nothing it
 // accepted is still being served: no further request can be admitted, and any
-// response still in flight has been severed.
+// response still in flight has been severed. HIJACKED connections are the one
+// exception and they are excluded by construction, not by accident — see below.
+//
+// None of what follows weakens why the drain exists at all. The defect that
+// motivated it (#6827 round 7) was an exit arm that called NO Shutdown
+// WHATSOEVER: with keep-alives never disabled, a connection accepted before the
+// listener died went on serving FURTHER requests under a credential the
+// operator had since revoked. "Shutdown stops further requests" and "that arm
+// was serving further requests" are both true, because that arm was not
+// calling Shutdown.
 //
 // Shutdown delivers the FIRST half and not the second, and that split is
 // the whole reason Close is here (#6827 round 8 — round 7 asserted the same
@@ -168,6 +204,18 @@ var legDrainTimeout = 5 * time.Second
 // that is judged by a snapshot no ReplaceAuth will ever tighten again. The
 // in-flight half is the data story: a response authorized under the old policy
 // goes on delivering after the box believes the socket is gone.
+//
+// HIJACKED CONNECTIONS ARE OUT OF SCOPE, deliberately and enforceably (#6827
+// round 8). Go excludes them from BOTH calls — Shutdown "does not attempt to
+// close nor wait for hijacked connections", Close "does not even know about"
+// them — and a hijacked conn is removed from srv.activeConn, so it can outlive
+// this function with `drained` set. Adding the force-close does not fix that;
+// nothing here can, because the handle is gone. This package therefore has no
+// hijacker at all, and that is a GATE rather than an accident:
+// TestNoHijackerInThisPackage_6827 fails if one is introduced, and says what
+// drainLeg would then have to grow (per-connection tracking via an
+// http.Server.ConnState hook, which fires with StateHijacked and hands you the
+// net.Conn, plus closing those conns here).
 func drainLeg(srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), legDrainTimeout)
 	defer cancel()

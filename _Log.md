@@ -79876,3 +79876,35 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/api/listener.go, pkg/api/server.go, pkg/api/drain_scope_6827_test.go,
   pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md, pkg/daemon/management.go,
   pkg/daemon/daemon.go, pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T09:45Z
+- **Action**: #6827 round 8c — **correcting my own delivery report.** The round-8b commit
+  `047c9e38d` did NOT contain three of the changes the entry above and my report to the lead
+  claimed for it. The mechanism is worth writing down because it is silent: the listener.go
+  edits were applied by ONE python script that asserts every anchor and writes the file ONCE
+  at the end, so when the fourth anchor was stale the script raised and **none** of its three
+  earlier edits were written. The traceback was followed by `BUILD_OK` from the next command
+  in the same cell, and I read the pair as success. `go build` cannot fail on missing COMMENT
+  edits, so the build proved nothing about them — the same "which process authored this exit
+  code" trap, one level up: I checked that something succeeded rather than that the intended
+  change was present.
+  What was missing at `047c9e38d`, all of it comment-only: `legDrainTimeout`'s correction
+  (that it bounds the Shutdown and not the drain, with the serial-Close + per-connection
+  tls close_notify mechanism and the Server.Wait/staleCertMu knock-on); `drainLeg`'s
+  hijacked-connections out-of-scope paragraph — which the new gate test's failure message
+  points at with "see drainLeg", so the pointer dangled; `drainLeg`'s clause recording that
+  the original defect's arm called NO Shutdown at all; and `listenerLeg.drained`'s "not the
+  goroutine's last act" correction. What HAD landed, because they were separate calls:
+  `pkg/api/README.md` (all of the above in prose), the hijack gate test itself, the
+  TryLock fence rewrite, the lock-order edges, the mgmt half-guard note, and
+  `HTTPSLegDrainedForTest`'s semantics. So the README described corrections the source
+  comments did not carry — the exact divergence this PR spent round 8 arguing is dangerous,
+  since the next reader reasons from the code.
+  Applied all four here, individually, each verified present by grep rather than by a build
+  that cannot see them. Also added the SCOPE note the reviewer supplement asked for on the
+  streaming cell: the fixture holds ONE connection, so `assertSevered`'s bounded wait is
+  sound for it and is NOT evidence of a per-leg wall-clock bound — what the cell binds is
+  that the deadline arm severs rather than abandons, which holds at any N.
+  Validation: `gofmt` clean on every touched file, `go vet ./pkg/api ./pkg/daemon` clean,
+  `go test ./pkg/api ./pkg/daemon -count=1` rc 0, `go test ./... -count=1` FULL_RC=0.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go

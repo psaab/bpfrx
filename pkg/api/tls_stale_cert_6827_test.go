@@ -1039,6 +1039,15 @@ func (f *streamFixture) assertSevered(t *testing.T) {
 // RED on revert (each measured over the whole package): delete `_ = srv.Close()`
 // from drainLeg, or replace the `drainLeg(srv)` call in the stopCh/rootDone arm
 // with a bare bounded `srv.Shutdown`, and the stream survives its leg.
+//
+// SCOPE, because the shape of this cell suggests more than it proves: the
+// fixture holds exactly ONE connection. assertSevered's bounded wait is sound
+// for that, and it is NOT evidence of a per-leg wall-clock bound. There is no
+// such bound — legDrainTimeout caps the Shutdown, while the sever that follows
+// closes connections serially with a five-second TLS close_notify deadline
+// EACH, so the real worst case grows with connection count (see
+// legDrainTimeout). What this cell binds is that the deadline arm severs rather
+// than abandons, which is a property of the arm and holds at any N.
 func TestInFlightResponseIsSeveredOnEveryLegExit_6827(t *testing.T) {
 	// The deadline arm is what these cases exercise, and reaching it costs the
 	// timeout. ONE case pays the production 5s so the shipped value is exercised
