@@ -33,7 +33,10 @@ type listenerLeg struct {
 	// be reaped from Server.retiring without joining it. Atomic for the same
 	// lock-ordering reason as dead.
 	//
-	// It means "no connection this leg accepted can serve another request", and
+	// It means "nothing this leg accepted is still being served" — no further
+	// request can be admitted AND no response is still in flight (#6827 round 8;
+	// round 7 stated only the first half, which is the half Shutdown alone
+	// already provides, so it understated what the flag has to promise).
 	// Server.pruneRetiredLocked spends it as exactly that: a drained leg stops
 	// being tightened by ReplaceAuth because there is nothing left for a
 	// revocation to reach. That reading is only true because EVERY exit path now
@@ -126,31 +129,51 @@ func (l *listenerLeg) serving() bool {
 // legDrainTimeout bounds how long the connections a leg already accepted have to
 // finish once that leg is on its way out. It applies to every exit — requested
 // retirement, root-context shutdown, and an unexpected serve-loop exit.
-const legDrainTimeout = 5 * time.Second
+//
+// A var, not a const, so a test can reach the DEADLINE arm — the one where
+// Shutdown gives up and drainLeg severs what is left — without spending five
+// seconds per case (#6827 round 8). Production never assigns it.
+var legDrainTimeout = 5 * time.Second
 
-// drainLeg takes srv out of service and does not return until no connection it
-// accepted can serve another request.
+// drainLeg takes srv out of service and does not return until nothing it
+// accepted is still being served: no further request can be admitted, and any
+// response still in flight has been severed.
 //
-// Shutdown alone is NOT that guarantee (#6827 round 7), which is why the
-// force-close is not optional. Shutdown stops accepting, closes idle
-// connections, waits for the active ones to go idle, and on deadline returns
-// ctx.Err() with whatever is still active LEFT OPEN. This server deliberately
-// runs with no WriteTimeout (SSE streams and large scrapes must not be
-// severed), so "still active" has no upper bound of its own: a subscribed event
-// stream, or a slow-reading client, outlives the deadline indefinitely. Close
-// severs every tracked connection, so the bound this function promises is real.
+// Shutdown delivers the FIRST half and not the second, and that split is
+// the whole reason Close is here (#6827 round 8 — round 7 asserted the same
+// conclusion from the wrong mechanism, which is worse than useless because the
+// next reader reasons from the stated mechanism and this one would tell them
+// the Close is redundant).
 //
-// A leg's whole reason to stop mattering is that its credential policy stops
-// being maintained the moment it drains (listenerLeg.drained,
-// Server.pruneRetiredLocked). A connection that outlives the drain therefore
-// keeps being judged by a snapshot no ReplaceAuth will ever tighten again — a
-// credential the operator has revoked goes on working on a socket the box
-// believes is gone.
+// Measured, not argued:
+//
+//   - FURTHER REQUESTS: Shutdown sets `inShutdown`, which makes `doKeepAlives()`
+//     false. Idle connections are closed outright, and a connection Shutdown is
+//     still waiting on finishes its current response and then closes rather than
+//     reading another request. So a surviving connection CANNOT serve a second
+//     request — Shutdown alone is sufficient for that half.
+//   - THE RESPONSE ALREADY IN FLIGHT: Shutdown does not terminate it. It WAITS
+//     for it, and when the deadline expires it returns ctx.Err() and leaves the
+//     response open and still streaming. This server deliberately runs with no
+//     WriteTimeout (SSE streams and large scrapes must not be severed), so an
+//     in-flight response has no upper bound of its own: a subscribed event
+//     stream outlives the deadline indefinitely, still writing to its client, on
+//     a leg the box has already marked `drained`. Close is what ends it.
+//
+// Both halves matter, for different reasons. The request half is the credential
+// story: a leg's policy stops being maintained the moment it drains
+// (listenerLeg.drained, Server.pruneRetiredLocked), so a request admitted after
+// that is judged by a snapshot no ReplaceAuth will ever tighten again. The
+// in-flight half is the data story: a response authorized under the old policy
+// goes on delivering after the box believes the socket is gone.
 func drainLeg(srv *http.Server) {
 	ctx, cancel := context.WithTimeout(context.Background(), legDrainTimeout)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		// Deadline (or a listener-close error): stop asking and sever.
+		// Deadline (or a listener-close error): stop asking and sever. NOT
+		// optional and NOT redundant — see above, and
+		// TestInFlightResponseIsSeveredOnEveryLegExit_6827, which reds if this
+		// line goes.
 		_ = srv.Close()
 	}
 }

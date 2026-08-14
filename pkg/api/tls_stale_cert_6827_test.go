@@ -894,3 +894,197 @@ func TestDeadLegConnectionCannotOutliveRevocation_6827(t *testing.T) {
 			"(#6827 round 7)", code)
 	}
 }
+
+// streamFixture is a leg serving ONE endless streaming response, held open by a
+// client, so a test can end the leg underneath an IN-FLIGHT response.
+//
+// The endlessness is load-bearing. Shutdown closes IDLE connections outright, so
+// a fixture whose handler returns leaves nothing for the force-close to do and
+// passes with `Close` deleted — vacuously. The handler here keeps writing until
+// its connection dies, which is what makes Shutdown WAIT and then give up.
+type streamFixture struct {
+	s    *Server
+	leg  *listenerLeg
+	kln  *killableLn
+	conn net.Conn
+	body io.ReadCloser
+}
+
+// newStreamFixture starts an HTTPS leg on a real loopback socket, opens one
+// connection, and returns once a streaming response is in flight — headers read
+// and at least one chunk received, so the handler is provably past its first
+// flush and the connection is ACTIVE rather than idle.
+func newStreamFixture(t *testing.T, ctx context.Context) *streamFixture {
+	t.Helper()
+	cert := mintCert(t, "old-fw", "127.0.0.1")
+	kln := newKillableLn(t)
+	addr := kln.Addr().String()
+
+	// No WriteTimeout is set by buildHTTPSServer, deliberately (SSE + large
+	// scrapes). That property is what gives an in-flight response an unbounded
+	// life, so the fixture must not "fix" it with a timeout of its own — doing so
+	// would sever the stream for a reason that has nothing to do with drainLeg.
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	s := &Server{
+		sharedBase: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			f, ok := w.(http.Flusher)
+			if !ok {
+				return
+			}
+			f.Flush()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := io.WriteString(w, "tick\n"); err != nil {
+					return // the connection went away: severed, or the test ended
+				}
+				f.Flush()
+				time.Sleep(2 * time.Millisecond)
+			}
+		}),
+		certGen: func(string) (tls.Certificate, error) { return cert, nil },
+	}
+	s.listen = func(network, a string) (net.Listener, error) { return kln, nil }
+	s.httpsSlot = s.newAuthSlot()
+	srv, err := s.buildHTTPSServer(addr, s.httpsSlot)
+	if err != nil {
+		t.Fatalf("build HTTPS server: %v", err)
+	}
+	s.httpsServer = srv
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	leg := s.httpsLeg
+	if leg == nil {
+		t.Fatal("precondition: the listen call succeeded, so the HTTPS leg must be installed")
+	}
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // self-signed fixture
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, "GET /stream HTTP/1.1\r\nHost: "+addr+"\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response headers: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	buf := make([]byte, 8)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("precondition: the response must be IN FLIGHT before the leg ends, so the "+
+			"connection is ACTIVE rather than idle and the drain has something to wait on; "+
+			"first chunk read failed: %v", err)
+	}
+	return &streamFixture{s: s, leg: leg, kln: kln, conn: conn, body: resp.Body}
+}
+
+// assertSevered drains the stream until the read errors, which is the only
+// honest form of the assertion: after the server closes a connection the client
+// keeps returning bytes that were already buffered, so a SINGLE read succeeding
+// proves nothing (measured — three reads and 19 buffered bytes before the error
+// surfaced). If bytes keep arriving past the bound, the response outlived the
+// drain and the leg's `drained` flag is a lie.
+func (f *streamFixture) assertSevered(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	buf := make([]byte, 512)
+	var total, reads int
+	for {
+		if err := f.conn.SetReadDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
+			t.Fatalf("set read deadline: %v", err)
+		}
+		n, err := f.body.Read(buf)
+		total += n
+		reads++
+		if err != nil {
+			return // severed, as it must be
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the response was STILL STREAMING %v after the leg finished draining "+
+				"(%d reads, %d bytes): Shutdown waits for an in-flight response and gives up on "+
+				"it at the deadline, so without the force-close a leg reports drained while it "+
+				"is still delivering to a client under a policy nothing will ever tighten "+
+				"(#6827 round 8)", 2*time.Second, reads, total)
+		}
+	}
+}
+
+// TestInFlightResponseIsSeveredOnEveryLegExit_6827 is the FAIL-ON-REVERT guard
+// for `drainLeg`'s FORCE-CLOSE, on all three ways a leg ends.
+//
+// Round 7 added the drain and wrote "the force-close is not optional" — and
+// bound none of it. `_ = srv.Close()` could be deleted, or the retirement and
+// root-context arms reverted to the pre-round-7 bare `Shutdown`, with
+// `go test ./pkg/api/` still green. The only bound property was that the
+// serve-exit arm called `drainLeg` at all.
+//
+// What escapes without the Close is exactly what the round-7 prose claimed to
+// have closed: Shutdown WAITS for an in-flight response and, at the deadline,
+// returns and leaves it running. The leg then stores `drained` — the flag
+// `pruneRetiredLocked` reads as "nothing left for a revocation to reach" — while
+// a response authorized under the old policy is still being delivered.
+//
+// RED on revert (each measured over the whole package): delete `_ = srv.Close()`
+// from drainLeg, or replace the `drainLeg(srv)` call in the stopCh/rootDone arm
+// with a bare bounded `srv.Shutdown`, and the stream survives its leg.
+func TestInFlightResponseIsSeveredOnEveryLegExit_6827(t *testing.T) {
+	// Reach the DEADLINE arm quickly. The production value is 5s; the case under
+	// test is what happens when it expires, and that is a property of the arm,
+	// not of the number.
+	restore := legDrainTimeout
+	t.Cleanup(func() { legDrainTimeout = restore })
+	legDrainTimeout = 150 * time.Millisecond
+
+	for _, tc := range []struct {
+		name string
+		end  func(t *testing.T, f *streamFixture, cancel context.CancelFunc)
+	}{
+		{
+			// serveLegLocked's serveErr arm: the listener dies under a leg that
+			// is mid-response.
+			name: "unexpected_serve_exit",
+			end:  func(_ *testing.T, f *streamFixture, _ context.CancelFunc) { f.kln.kill() },
+		},
+		{
+			// The stopCh arm, reached the way production reaches it: a commit
+			// that turns HTTPS off retires the leg.
+			name: "requested_retirement",
+			end: func(t *testing.T, f *streamFixture, _ context.CancelFunc) {
+				if err := f.s.ReconcileHTTPS(false, ""); err != nil {
+					t.Fatalf("disable HTTPS: %v", err)
+				}
+			},
+		},
+		{
+			// The rootDone arm: daemon shutdown.
+			name: "root_context_shutdown",
+			end:  func(_ *testing.T, _ *streamFixture, cancel context.CancelFunc) { cancel() },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			f := newStreamFixture(t, ctx)
+
+			tc.end(t, f, cancel)
+			f.s.Wait() // the leg's goroutine has returned, so the drain is over
+
+			if !f.leg.drained.Load() {
+				t.Fatal("precondition: after the serve goroutine returned the leg must report drained")
+			}
+			f.assertSevered(t)
+		})
+	}
+}

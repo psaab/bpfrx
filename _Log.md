@@ -79779,3 +79779,48 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   recovery either way; the claim is narrowed to what the code shows.
 - **File(s)**: pkg/api/server.go, pkg/api/tls_stale_cert_6827_test.go,
   pkg/daemon/hostname_stale_cert_6827_test.go
+
+- **Timestamp**: 2026-08-14T07:55Z
+- **Action**: #6827 round 8 — hostile review at `d7157b7e1` returned MERGE-NEEDS-MINOR with no
+  runtime defect, and two items about the round-7 work itself. **F1 (blocking): the
+  force-close was bound by NOTHING.** `_ = srv.Close()` could be deleted, and the
+  retirement/root arm reverted to the pre-round-7 bare `Shutdown`, with `go test ./pkg/api/
+  -count=1` green both times. The only bound property was that the serveErr arm called
+  `drainLeg` at all — so the half of the drain guarantee I called "not optional" was exactly
+  the half a later edit could delete silently, restoring the vulnerability with `drained`
+  still reporting true. New `TestInFlightResponseIsSeveredOnEveryLegExit_6827` holds an
+  in-flight streaming response across each of the three leg exits and asserts it is severed.
+  `legDrainTimeout` becomes a `var` (production never assigns it) so the DEADLINE arm — the
+  case under test — is reachable without 5s per subtest; the cell runs in 0.47s.
+  **F2: my justification named the wrong mechanism, and I verified that firsthand before
+  rewriting it.** A standalone probe measured both halves: after `Shutdown`, a second request
+  on a surviving keep-alive connection fails (`unexpected EOF`) — `inShutdown` makes
+  `doKeepAlives()` false — so "Shutdown alone is NOT that guarantee [no connection can serve
+  another request]" was FALSE. What `Shutdown` does not do is terminate the response already
+  in flight: with a 300ms deadline it returned `context deadline exceeded` and the stream kept
+  delivering; only `Close` ended it. Conclusion unchanged, reason corrected at `drainLeg`, at
+  the `drained` field, and in `pkg/api/README.md` — it matters because the stated mechanism is
+  what the next reader reasons from, and the round-7 version would have told them the `Close`
+  was redundant. The `drained` invariant is restated to what drainLeg actually provides:
+  "nothing this leg accepted is still being served" — no further request AND no response in
+  flight. Round 7 stated only the first half, which is the half `Shutdown` alone already gives.
+  The probe also produced a test-design fact worth keeping: after the server severs a
+  connection the client still returns BUFFERED bytes (measured: 3 reads / 19 bytes before the
+  error), so the assertion must drain until the read errors — a single successful read proves
+  nothing either way.
+  Validation on this tree: control `go test ./pkg/api ./pkg/daemon -count=1` rc 0.
+  Mutations, each over the whole `pkg/api` package, with what fired and how long:
+  F1a (delete `_ = srv.Close()`) RED — all three subtests, 2.40s each, each failing on
+  `assertSevered`'s own bounded wait, which IS the asserted property (severed within the
+  bound), not a setup guard; F1b (retirement/root arm back to a bare `Shutdown`) RED —
+  `requested_retirement` and `root_context_shutdown` at 2.41s, `unexpected_serve_exit` GREEN,
+  a clean adjacency pair INSIDE one test proving the three cases bind three distinct call
+  sites; B1 (delete `drainLeg` from the serveErr arm) RED — the held-connection cell at 0.01s
+  on its assertion PLUS `unexpected_serve_exit` at 2.26s, and the other two subtests green.
+  One harness note, reported rather than buried: the F1b cell was killed by a command timeout
+  mid-run, which left the mutation APPLIED in the worktree. Caught immediately by checking
+  `git diff` before doing anything else, restored by content, verified by md5 and a rebuild,
+  and only then re-run with a longer budget. An interrupted mutation cell leaves the tree
+  dirty even when the harness restores by content — check the tree, do not assume the restore
+  ran.
+- **File(s)**: pkg/api/listener.go, pkg/api/tls_stale_cert_6827_test.go, pkg/api/README.md

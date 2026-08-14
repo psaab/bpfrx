@@ -1055,17 +1055,30 @@ under the daemon's errgroup. Nothing else imports this package.
     - **Every leg exit DRAINS its connections** (#6827 round 7, `drainLeg`).
       `ReplaceAuth` keeps tightening a retired leg's pin only while the leg is on
       `s.retiring`, and `pruneRetiredLocked` reaps it the moment `drained` is
-      set — so `drained` has to mean "no connection this leg accepted can serve
-      another request". It did not. The unexpected-serve-exit arm returned
-      WITHOUT any `Shutdown`: `Serve` closes the listener on its way out, but the
-      HTTP/1 keep-alive and HTTP/2 connections it had already accepted kept being
+      set — so `drained` has to mean **"nothing this leg accepted is still being
+      served"**: no further request admitted AND no response still in flight.
+      It meant neither. The unexpected-serve-exit arm returned WITHOUT any
+      `Shutdown`: `Serve` closes the listener on its way out, but the HTTP/1
+      keep-alive and HTTP/2 connections it had already accepted kept being
       served, under a slot the recovery reconcile then PINNED and the next
       `ReplaceAuth` PRUNED before tightening — a revoked credential going on
       working on a socket the box believed was gone. All three exits (requested
       retirement, root-context shutdown, unexpected exit) now run a bounded
-      `Shutdown` followed by `Close` on deadline. `Close` is not optional: this
-      server runs with no `WriteTimeout` by design, so an SSE stream or a slow
-      reader outlives any deadline `Shutdown` alone respects.
+      `Shutdown` followed by `Close` on deadline.
+      **Both halves of that, and which call does which (#6827 round 8 — round 7
+      named the wrong mechanism here).** `Shutdown` sets `inShutdown`, so
+      `doKeepAlives()` goes false: idle connections are closed and a connection
+      it is still waiting on finishes its current response and then closes, so
+      **no further request** is possible from `Shutdown` alone — measured. What
+      `Shutdown` does not do is END the response already in flight; it WAITS for
+      it and, at the deadline, returns `ctx.Err()` leaving it open and streaming.
+      This server runs with no `WriteTimeout` by design (SSE, large scrapes), so
+      that response has no bound of its own and outlives the drain indefinitely
+      on a leg already marked `drained`. `Close` is what ends it, which is why it
+      is not optional and not redundant. Bound by
+      `TestInFlightResponseIsSeveredOnEveryLegExit_6827` across all three exits;
+      deleting the `Close`, or reverting the retirement/root arm to a bare
+      `Shutdown`, reds it — before round 8 both edits left the package green.
   - The HTTP and HTTPS listeners run in INDEPENDENT legs (`listener.go`), each
     make-before-break: `ReconcileHTTP(addr)` rebinds only the HTTP leg and
     `ReconcileHTTPS(tls, addr)` enables / disables / rebinds only the HTTPS leg —
@@ -1297,8 +1310,9 @@ under the daemon's errgroup. Nothing else imports this package.
     all; the unused-kernel-name false positive and its matched positive control;
     the rename entry point; and the two leg-state transitions driven by the real
     serve goroutine — `stopping` on a root-context drain, `dead` on an
-    unexpected serve exit, the reconcile that REPLACES a dead leg, and the held
-    connection that must not outlive a revocation), with
+    unexpected serve exit, the reconcile that REPLACES a dead leg, the held
+    connection that must not outlive a revocation, and the in-flight response
+    severed on all three leg exits), with
     the daemon-side wiring pinned by
     `pkg/daemon/hostname_stale_cert_6827_test.go`: a host-name commit on an
     UNCHANGED HTTPS endpoint reaches the diagnostic with the NEW name, the debt
