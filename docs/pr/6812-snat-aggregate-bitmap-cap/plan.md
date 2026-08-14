@@ -1082,3 +1082,162 @@ consulting it. What that makes unrepresentable: a surface that reports capacity
 for a pool the dataplane refused, because there is no longer a per-consumer
 expression to get wrong — the same "consult the verdict, do not re-derive it"
 rule round 2 applied to the budget walk, one layer out.
+
+## Round 9 — the anti-coincidence property, asked mechanically
+
+Codex returned MERGE-NEEDS-MINOR with zero runtime defects at `1995806ee`. Two
+minors and a set of stale claims. Everything below was re-measured at that head
+before being changed; the mutation harness now classifies a build/infra failure
+as **VOID** rather than as a red, after `/dev/shm` filled mid-round.
+
+### M1 — round 8 permuted the columns it was thinking about
+
+Round 8's walk-side fixture permuted the rule and pool NAMES and then generated
+the match address and the pool member address from the loop index `i`. Both
+ascended with declaration order. Its comment claimed the fixture was "neither
+ascending nor descending in either coordinate", which was also false of the rule
+column: `r03 r02 r01 r00` is exactly descending.
+
+Measured at `1995806ee`, sorting each rule-set's rules in the charge walk:
+
+| axis | ASC | DESC |
+|---|---|---|
+| `Rule.Name` | RED | **GREEN — blind** |
+| `Match.SourceAddress` | **GREEN — blind** | RED |
+| `Then.PoolName` | RED | RED |
+
+The `Match.SourceAddress ASC` cell is worse than the round-8 finding it mirrors:
+the rule-name sort at least reds two neighbouring budget fixtures by accident,
+whereas the match-address sort left the **entire `pkg/config` suite** green.
+
+Every column is now an independent permutation — neither the identity nor its
+reverse, and pairwise distinct so each axis fails for its own reason. All six
+cells are RED.
+
+### The generalisation: sweep VALUES, and sweep DIRECTIONS
+
+Round 8 enumerated generated NAMES against "could a production sort key on it".
+That enumeration was sound for what it covered and missed an axis that is not a
+name. Two dimensions were being confused with one: *which key* a sort reads, and
+*which direction* it sorts in. Both were swept by measurement this round, at
+both mutation sites of the builder fixture (a within-rule-set rule sort, and a
+tiebreak appended to the tier comparator):
+
+| axis | site | ASC | DESC (before) |
+|---|---|---|---|
+| `Rule.Name` | within-set | RED | **GREEN** |
+| `Match.SourceAddress` | within-set | RED | **GREEN** |
+| `PoolName` | tiebreak | RED | **GREEN** |
+| `Name` | tiebreak | RED | RED |
+| `PoolAddresses[0]` | tiebreak | RED | **GREEN** |
+| `FromInterface` | tiebreak | RED | **GREEN** |
+| `FromZone` | tiebreak | RED | **GREEN** |
+
+Five blind cells, and the cause is structural rather than incidental: rounds 7
+and 8 each fixed an ascending coincidence by re-cutting the fixture DESCENDING,
+which trades one monotone direction for the other. `Name`-at-tiebreak is the
+lone exception because a rule-name tiebreak at the rule-SET level splits every
+rule-set's block, which contiguity assertion (2) catches in either direction.
+
+Fixed by emitting a PERMUTATION rather than a direction, at both levels
+(`declOrder`, and `ruleOrder` with **three** rules per rule-set — two cannot be
+de-correlated from both directions, since any two-element sequence is ascending
+or descending by construction). All fourteen cells are now RED. The `wantRefs`
+expectation is derived from the declared sequence stable-sorted by tier rather
+than transcribed, so a future re-cut cannot leave it behind.
+
+### Is the set closed?
+
+**Axes: yes, and by construction rather than by exhaustion.** The belt does not
+enumerate — `assertDeclarationOrderIsNotSortedBy6812` is called on every column
+the fixture emits, and asks the question mechanically. A new column added later
+that nobody remembers to permute fails the belt rather than silently widening
+the blind set. That is the difference between this and the round-8 answer, which
+was a list.
+
+**Directions: yes, both, now checked explicitly.**
+
+**One case is deliberately exempt, and it is not a hole.** A column that is
+CONSTANT is a non-axis: a stable sort keyed on a value identical for every
+element cannot permute anything, so there is nothing to be blind to. This is not
+hypothetical — zone-tier rule-sets carry no `from interface` and interface-tier
+ones carry no `from zone`, so each of those axes is empty for half the fixture.
+Requiring them to be permuted would demand that a fixture discriminate a
+mutation that cannot exist.
+
+**What is still out of scope, stated rather than left implicit:** a
+non-order-preserving mutation that is not a sort at all (a reversal, a rotation,
+a shuffle). Assertion (1) compares the emitted sequence against the declared one
+elementwise, so it catches any of those on the rule-set axis, and assertion (3)
+does the same within a rule-set — but that is coverage by the assertions, not by
+this precondition, which only ever claimed to keep sorts visible.
+
+### M2 — "only on a first apply" replaced one categorical claim with another
+
+Round 8 corrected "same order" to "identical on a first apply, NOT identical on
+a re-apply". The second half is too strong. Empty `previous_allocators`
+**guarantees** the sequences coincide; a re-apply **may** differ and need not —
+an all-reused apply coincides trivially, and so does any apply whose reused keys
+already precede its new ones in emitted order. Phase 1 also reserves only the
+keys that are BOTH viable in this apply AND present in `previous_allocators`; a
+previously-allocated but currently-poisoned key gets no pending and is not
+reserved.
+
+The comment now carries the admission proof rather than the assertion that the
+two sides "are not independent deciders". Let `A` be the set this walk admits.
+First-fit admits greedily only while the running total fits, so `charge(A)` is
+within every budget. The poison travels on the wire and Rust builds no pending
+for a failed pool, so Rust's pendings are exactly `A`. Phase 1 reserves `R ⊆ A`;
+phase 2 accepts reused keys unconditionally and admits a new key `k` when
+`used + charge(k)` fits — and `R`, the new keys already processed, and `k` are
+DISJOINT subsets of `A`, so that sum is bounded by `charge(A)`, which fits. Rust
+refuses nothing this walk admitted, in any emitted order. The live set is
+exactly `A`.
+
+Three further sites carried the uncorrected unconditional claim and now carry
+the qualified one: `sourceNATAggregateReferencedCharges`' head comment,
+`SourceNATScopeTier` (`nat_source_scope.go`), and the builder's poison comment
+(`pkg/dataplane/userspace/nat_source.go`), which also said Rust "independently
+refuses the same set" — it re-derives admission over what survives, and by the
+proof above refuses none of it.
+
+### M3 — the two-order rationale did not hold for its own mutation
+
+The mixed-member comment justified driving both member orders by an asymmetry —
+refused-first yields empty success, refused-second yields non-empty partial. That
+is true of a SINGLE-member pool and false of these: under the `continue` mutation
+the loop skips the bad member and appends the good one in either order, so both
+return `[198.51.100.7]`. The mutation is caught either way and the stated reason
+is not the reason.
+
+Withdrawn and replaced with the two that hold:
+
+1. All-or-nothing is a property of the member SET, not of a position. The Rust
+   contract ORs `expand_pool_address` over every member, so a validation reading
+   only `addrs[0]`, or short-circuiting once one member expands, is
+   position-dependent in a way the contract forbids — and a fixture that only
+   ever puts the refused member in one slot cannot see it.
+2. The two positions differ in the internal state at the point of refusal. With
+   the good member first, `out` is already non-empty when the failure fires,
+   which is the only arrangement making the "reported an error AND returned
+   addresses" assertion non-vacuous. Measured rather than asserted: substituting
+   `return out, err` for `return nil, err` reds 12 rows, and every one is a
+   `[good, refused]` pool — zero `[refused, good]` rows fire, because their
+   `out` is still empty at the point of failure.
+
+### Confirmed by Codex, recorded so no later round re-opens them
+
+- The per-rule-set tripwire is reachable AND correctly layered: an ascending
+  fixture reaches and fails it; with the descending fixture plus a
+  `Rule.Name`-ascending production mutation the tripwire passes, contiguity
+  stays valid, and assertion (3) fails against the declared sequence — the
+  intended reason, not the precondition shadowing it. The round-8 layering
+  argument is confirmed.
+- The rejected-member assertions are sound: replacing the canonical-prefix error
+  with `continue` fails the singleton and both mixed-member orders.
+- The Go/Rust agreement reasoning holds on re-apply, by the `charge(A)` bound
+  now written into the comment.
+- No executable production line changed in round 8 — only the comment at
+  `compiler_validate_strict_nat.go:3268`. That independently confirms the
+  `.text`/`.rodata` measurement showing the cluster smoke carries from
+  `52f7e735a` to `1995806ee`.

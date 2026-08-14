@@ -3158,9 +3158,12 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 	// #6812 F3: walk rule-sets in the order the DATAPLANE charges them. The
 	// snapshot builder STABLE-sorts its emitted rules by #4161 scope tier
 	// (SourceNATScopeTier) and resolve_pool_allocators charges that emitted
-	// slice in order, so a stable sort by the same tier — config order
-	// preserved within a tier, exactly as the builder preserves it —
-	// reproduces the dataplane's first-fit sequence. Ordering by rule-set NAME
+	// slice in that order — exactly so on a first apply; on a re-apply it
+	// charges the REUSED keys first and then walks the remainder in slice
+	// order, which cannot change which pools live (see the ORDER note on
+	// SourceNATAggregateOverBudgetPools). So a stable sort by the same tier —
+	// config order preserved within a tier, exactly as the builder preserves
+	// it — reproduces the dataplane's first-fit sequence. Ordering by rule-set NAME
 	// (through round 2) matched neither that order nor any Junos semantic: with
 	// two pools that each fit alone but not together, the alphabetically
 	// earlier rule-set took the budget, so an unrelated rename could poison the
@@ -3272,27 +3275,45 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 // EXCLUSIONS, see sourceNATAggregateReferencedCharges — so Go and the dataplane
 // agree on WHICH pools live.
 //
-// ORDER, precisely (#6812 round 8 — an earlier revision of this comment said
-// "same order" flatly, which holds only for a FIRST apply). This walk is a
-// single first-fit pass in emitted first-reference order. resolve_pool_allocators
-// is TWO passes: phase 1 reserves every DISTINCT key already present in
-// `previous_allocators` — reused keys are accepted unconditionally, so their
-// charge is live state rather than a prediction — and only then does phase 2
-// admit NEW keys against that total (source.rs, "Reused keys are RESERVED
-// before any new key is admitted", #6812 F2 round 4). With an empty
-// `previous_allocators` phase 1 reserves nothing and phase 2 walks the slice in
-// order, so the two sequences are identical. On a RE-apply they are not: Rust
-// charges all reused keys before any new one; this walk charges in slice order
-// throughout.
+// ORDER, precisely. Two earlier revisions of this comment were wrong in
+// opposite directions: round 7's said "same order" flatly, and round 8's
+// replaced it with "identical on a first apply, NOT identical on a re-apply" —
+// also too categorical, in the narrower direction.
 //
-// The agreement claim survives that, because the two are not independent
-// deciders. The poison this walk computes travels on the wire, and the Rust
-// parse loop builds no PendingPoolAllocator for a rule whose pool already
-// failed — so a pool this walk poisons reaches neither Rust phase, and Rust
-// re-derives admission over the reduced set. The reserve-first order exists for
-// the snapshots no Go poison is coming for (a tolerated, older control plane's,
-// or handcrafted snapshot), which is what makes that boundary an INDEPENDENT
-// backstop rather than a second opinion.
+// What is actually true. This walk is a single first-fit pass in emitted
+// first-reference order. resolve_pool_allocators is TWO passes: phase 1
+// reserves the distinct keys that are BOTH viable in this apply AND already
+// present in `previous_allocators` — reused keys are accepted unconditionally,
+// so their charge is live state rather than a prediction — and only then does
+// phase 2 admit NEW keys against that total (source.rs, "Reused keys are
+// RESERVED before any new key is admitted", #6812 F2 round 4). Note "viable":
+// a rule whose pool already failed gets no PendingPoolAllocator, so a
+// previously-allocated but currently-poisoned key is NOT reserved.
+//
+//   - Empty `previous_allocators` GUARANTEES the sequences coincide: phase 1
+//     reserves nothing and phase 2 walks the slice in order.
+//   - A re-apply MAY differ, and need not. An all-reused apply coincides
+//     trivially (phase 2 admits nothing new); so does any apply whose reused
+//     keys already precede its new ones in emitted order. The sequences differ
+//     only when a NEW key is emitted before some reused key.
+//
+// AND THE DIFFERENCE CANNOT CHANGE THE OUTCOME, which is the part that matters
+// and is stronger than the round-8 wording ("they are not independent
+// deciders") on its own. Let A be the set this walk admits. First-fit admits
+// greedily and only while the running total fits, so charge(A) is within every
+// budget. The poison travels on the wire and the Rust parse loop builds no
+// pending for a failed pool, so Rust's pendings are exactly A. Phase 1 reserves
+// R, a subset of A. Phase 2 accepts every reused key unconditionally and admits
+// a new key k when used + charge(k) fits — and R, the new keys already
+// processed, and k are DISJOINT subsets of A, so that sum is bounded by
+// charge(A), which fits. Rust therefore refuses nothing this walk admitted, in
+// any emitted order. The live set is exactly A.
+//
+// The reserve-first order still earns its keep for the snapshots no Go poison
+// is coming for — a tolerated, older control plane's, or handcrafted snapshot,
+// where A is whatever arrived rather than something this walk computed. That is
+// what makes the boundary an INDEPENDENT backstop rather than a second
+// opinion.
 //
 // That agreement is a tested claim, not an asserted one:
 // TestAggregateBudgetExcludesUnusablePools_6812

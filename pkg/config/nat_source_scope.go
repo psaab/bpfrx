@@ -122,7 +122,10 @@ const (
 //
 //  1. the userspace snapshot builder STABLE-SORTS its emitted rules by this
 //     tier (pkg/dataplane/userspace/nat_source.go), which is the order the Rust
-//     allocator resolver walks; and
+//     allocator resolver walks — exactly so on a first apply; on a re-apply it
+//     reserves the REUSED allocator keys before walking the remainder in slice
+//     order, a difference that provably cannot change which pools live (see the
+//     ORDER note on SourceNATAggregateOverBudgetPools); and
 //  2. sourceNATAggregateReferencedCharges walks referenced pools in this same
 //     order, so the pool Go admits first is the pool the dataplane charges
 //     first.

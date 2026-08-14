@@ -181,10 +181,31 @@ func TestDeterministicPoolExpansionMatchesSharedGrammarFixture_6812(t *testing.T
 	// same clause SourceNATPoolUnusableReason enforces one layer up (#6812 F1
 	// round 2); this is that clause at the expander.
 	//
-	// BOTH orders matter. With the refused member FIRST a skip yields empty
-	// success; with it SECOND the good member is already in `out`, so a skip
-	// yields NON-EMPTY partial success. Only the second shape would have been
-	// visible to the round-7 assertion, and only for pools declared that way.
+	// WHY BOTH ORDERS (#6812 round 9 — the round-8 rationale here was wrong and
+	// is withdrawn). It said the refused member FIRST yields empty success and
+	// SECOND yields non-empty partial success. That is true of a SINGLE-member
+	// pool, not of these: under the `continue` mutation the loop skips the bad
+	// member and appends the good one in EITHER order, so both return
+	// [198.51.100.7] and the stated asymmetry does not distinguish them. The
+	// mutation is caught either way.
+	//
+	// The real reasons to drive both:
+	//
+	//  1. All-or-nothing is a property of the member SET, not of a position. The
+	//     Rust contract ORs expand_pool_address over every member, so a
+	//     validation that inspects only `addrs[0]`, or short-circuits once one
+	//     member has expanded, is position-dependent in a way the contract
+	//     forbids — and a fixture that only ever puts the refused member in one
+	//     slot cannot see that.
+	//  2. The two positions differ in the INTERNAL STATE at the point of
+	//     refusal. With the good member first, `out` is already non-empty when
+	//     the failure fires, which is the only arrangement under which the
+	//     "reported an error AND returned addresses" assertion below is
+	//     non-vacuous — a `return out, err` in place of `return nil, err` is
+	//     invisible when `out` is empty. Measured, so this is a bound claim and
+	//     not a stated one: that substitution reds 12 rows, and EVERY ONE of
+	//     them is a `[good, refused]` pool. Zero `[refused, good]` rows fire,
+	//     because their `out` is still empty at the point of failure.
 	const goodMember = "198.51.100.7/32"
 	mixed := 0
 	for _, c := range fx.Cases {

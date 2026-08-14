@@ -33,10 +33,16 @@ func buildSourceNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map[stri
 	// every pool's per-address occupancy bitmap (three full-range /16 pools =
 	// 12,683,575,296 bitmap bits, ~1.48 GiB). The marked pools install nothing
 	// (fail-closed, matching the missing/empty/invalid markers below) and the
-	// Rust boundary independently refuses the same set — the first-fit
-	// admission rule is shared (SourceNATAggregateOverBudgetPools /
+	// Rust boundary independently re-derives admission over what survives —
+	// the first-fit rule is shared (SourceNATAggregateOverBudgetPools /
 	// resolve_pool_allocators), so Go and the dataplane agree on which pools
-	// live. The over-budget compile warning still tells the operator to shrink
+	// live. Precisely: a poisoned pool builds no PendingPoolAllocator, so the
+	// set Rust considers is exactly the set Go admitted, whose total charge
+	// already fits every budget — Rust therefore refuses none of it, whatever
+	// order the slice arrives in and whether or not its keys are reused (the
+	// argument is written out on SourceNATAggregateOverBudgetPools). Rust
+	// refusing a pool of its OWN is reserved for the snapshots no Go poison is
+	// coming for: a tolerated, older control plane's, or handcrafted one. The over-budget compile warning still tells the operator to shrink
 	// the config; this marker makes the degraded state per-pool visible.
 	overBudgetPools := config.SourceNATAggregateOverBudgetPools(cfg)
 	out := make([]SourceNATRuleSnapshot, 0)

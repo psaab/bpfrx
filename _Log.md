@@ -79928,3 +79928,55 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_validate_strict_nat.go,
   pkg/nat/pool_expansion_parity_6812_test.go,
   docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
+
+- **Timestamp**: 2026-08-14T01:20Z
+- **Action**: #6815 round 9 — Codex MERGE-NEEDS-MINOR, zero runtime defects at
+  `1995806ee`. (M1) Round 8's walk-side fixture permuted the rule and pool NAMES
+  and then generated the match address and the pool member address from the loop
+  index, so both ascended with declaration order; its comment also claimed the
+  names were "neither ascending nor descending", which is false of the rule
+  column (`r03 r02 r01 r00` is descending). Measured: a `Match.SourceAddress`
+  sort in the charge walk left the ENTIRE `pkg/config` suite green — strictly
+  worse than the round-8 finding it mirrors, which at least reds two budget
+  fixtures by accident. Every column is now an independent permutation, and all
+  six axis x direction cells are RED. (Generalisation) Round 8 enumerated
+  generated NAMES; two dimensions were being confused with one — WHICH key a
+  sort reads, and WHICH DIRECTION it sorts in. Swept both by measurement at both
+  mutation sites of the builder fixture: all seven ascending cells were visible
+  and FIVE reverse cells were blind, because rounds 7 and 8 each fixed an
+  ascending coincidence by re-cutting DESCENDING, trading one monotone direction
+  for the other. Fixed by emitting a PERMUTATION at both levels (`declOrder`,
+  and `ruleOrder` with THREE rules per rule-set — two cannot be de-correlated
+  from both directions); all fourteen cells now RED. `wantRefs` is derived from
+  the declared sequence stable-sorted by tier rather than transcribed. The
+  closure claim is now by CONSTRUCTION, not by list:
+  `assertDeclarationOrderIsNotSortedBy6812` is called on every column and asks
+  the question mechanically, so a column added later that nobody remembers to
+  permute fails the belt. One deliberate exemption, and it is not a hole — a
+  CONSTANT column is a non-axis (a stable sort on a constant cannot permute
+  anything); this is real, since zone-tier rule-sets carry no `from interface`
+  and interface-tier ones carry no `from zone`. (M2) Round 8 replaced one
+  categorical claim with another: empty previous state GUARANTEES equality, but
+  a re-apply merely CAN differ — an all-reused apply coincides, as does any
+  apply whose reused keys already precede its new ones. Phase 1 also reserves
+  only keys BOTH viable now AND previously allocated. The comment now carries
+  Codex's admission proof: `charge(A)` fits every budget, Rust's pendings are
+  exactly `A`, and `R`/processed-new/`k` are disjoint subsets of `A`, so Rust
+  refuses nothing Go admitted in any order. Three further sites carried the
+  uncorrected claim and now carry the qualified one. (M3) The mixed-member
+  two-order rationale was false for its own mutation — under `continue` both
+  orders skip the bad member and return the good address. Withdrawn; replaced
+  with position-independence of the all-or-nothing contract, plus the internal-
+  state reason, measured: `return out, err` reds 12 rows, all `[good, refused]`,
+  zero `[refused, good]`. Harness note: `/dev/shm` filled mid-round, so the
+  mutation sweeps were re-run with an explicit VOID classification for
+  build/infra failures — a vanished GOCACHE would otherwise read as a red. Both
+  config sweeps reproduced exactly with no VOID cells. Validation: `go test
+  ./...` FULL_RC recorded below; gofmt and go vet clean on touched files. No
+  Rust source changed.
+- **File(s)**: pkg/config/compiler_nat_source_pool_aggregate_6812_test.go,
+  pkg/config/compiler_validate_strict_nat.go, pkg/config/nat_source_scope.go,
+  pkg/dataplane/userspace/nat_source_aggregate_6812_test.go,
+  pkg/dataplane/userspace/nat_source.go,
+  pkg/nat/pool_expansion_parity_6812_test.go,
+  docs/pr/6812-snat-aggregate-bitmap-cap/plan.md, _Log.md
