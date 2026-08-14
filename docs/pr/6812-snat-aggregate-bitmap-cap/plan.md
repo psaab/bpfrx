@@ -1148,12 +1148,24 @@ than transcribed, so a future re-cut cannot leave it behind.
 
 ### Is the set closed?
 
+> **SUPERSEDED BY ROUND 10.** Two of the three claims below are wrong and one is
+> wider than what is measured. They are left in place because the record of what
+> was claimed matters; each carries its correction, and the round-10 section at
+> the end of this document has the full replacement.
+
 **Axes: yes, and by construction rather than by exhaustion.** The belt does not
 enumerate — `assertDeclarationOrderIsNotSortedBy6812` is called on every column
 the fixture emits, and asks the question mechanically. A new column added later
 that nobody remembers to permute fails the belt rather than silently widening
 the blind set. That is the difference between this and the round-8 answer, which
 was a list.
+
+> **Wrong.** Both fixtures MANUALLY ENUMERATE the helper calls
+> (`nat_source_aggregate_6812_test.go:812`,
+> `compiler_nat_source_pool_aggregate_6812_test.go:893`). Round 9 moved the list
+> up one level — from axis names to helper calls — and a column with no call was
+> still silent. Round 9's own sentence, "round 8's answer was a list, and a list
+> is exactly what failed", applied to round 9 too.
 
 **Directions: yes, both, now checked explicitly.**
 
@@ -1165,12 +1177,26 @@ ones carry no `from zone`, so each of those axes is empty for half the fixture.
 Requiring them to be permuted would demand that a fixture discriminate a
 mutation that cannot exist.
 
+> **Right in principle, wrong in application.** The argument is sound only when
+> the key is invariant for all relevant PRODUCTION inputs. These columns are not
+> — they are constant in the fixture only, which is a blind spot rather than a
+> non-axis. Fixture-only constancy is not regression coverage.
+
 **What is still out of scope, stated rather than left implicit:** a
 non-order-preserving mutation that is not a sort at all (a reversal, a rotation,
 a shuffle). Assertion (1) compares the emitted sequence against the declared one
 elementwise, so it catches any of those on the rule-set axis, and assertion (3)
 does the same within a rule-set — but that is coverage by the assertions, not by
 this precondition, which only ever claimed to keep sorts visible.
+
+> **Wider than what is measured.** Reversal and nonzero rotation are caught,
+> because the elementwise comparison sees distinct identities in changed
+> positions. A PARTITION is caught only when it actually changes this fixture,
+> and the `[1,0,2]` rule order is already stably partitioned by match address
+> `< 10.0.2.0/24` — so that partition is invisible. The accurate claim is
+> narrower: the elementwise comparisons catch transformations that realise a
+> NONIDENTITY PERMUTATION ON THIS DATA. "Any of those" is not true of the
+> partition family in general.
 
 ### M2 — "only on a first apply" replaced one categorical claim with another
 
@@ -1241,3 +1267,120 @@ Withdrawn and replaced with the two that hold:
   `compiler_validate_strict_nat.go:3268`. That independently confirms the
   `.text`/`.rodata` measurement showing the cluster smoke carries from
   `52f7e735a` to `1995806ee`.
+
+## Round 10 — the closure claim was still a list, one level up
+
+Codex: MERGE-NEEDS-MINOR, no runtime-behaviour defect. Four items, all in test
+plumbing and prose. Round 9's own diagnosis of round 8 — "the answer was a list,
+and a list is exactly what failed" — turned out to describe round 9.
+
+### M1 — "closed by construction" was false, and the constant exemption was applied where it does not hold
+
+Round 9 claimed the axis set was closed by construction because
+`assertDeclarationOrderIsNotSortedBy6812` ran on every column in both
+directions. Both fixtures still MANUALLY ENUMERATED the calls
+(`nat_source_aggregate_6812_test.go:812`,
+`compiler_nat_source_pool_aggregate_6812_test.go:893`). Adding a column without
+adding a call stayed silent; the list had moved from axis names to helper calls,
+not gone away.
+
+Three concrete columns it left open, all named by Codex and all confirmed here:
+
+- **`CounterID`.** The builder fixture called `buildSourceNATSnapshots(cfg, nil)`
+  so every emitted ID was zero, while production supplies populated FNV-derived
+  IDs. A stable `(tier, CounterID)` tiebreak reorders production.
+- **Pool cardinality.** Every pool carried exactly one member, so a sort by
+  `len(PoolAddresses)` — or by any charge derived from it — was a no-op.
+- **Port capacity.** Every pool sat at the default 1024-65535 range, so the
+  range, its width, and members × width were all constant.
+
+And the exemption. Round 9 skipped a CONSTANT column silently, arguing a stable
+sort keyed on a value identical for every element cannot permute anything. That
+argument is sound only when the key is invariant for all relevant PRODUCTION
+inputs. These columns are constant in the FIXTURE and settable in production —
+a blind spot, not a non-axis. Fixture-only constancy is not regression coverage.
+
+**What replaced it.** `sweepAxes6812` (new, one twin per package:
+`pkg/dataplane/userspace/nat_source_axis_sweep_6812_test.go`,
+`pkg/config/nat_source_axis_sweep_6812_test.go`) REFLECTS over the value the
+production comparator reads:
+
+- one column per struct field, recursing into nested structs and pointers;
+- one `.len` column per slice or map, plus the first element's columns when the
+  slice is non-empty;
+- a field whose kind has no ORDER-PRESERVING key encoding is a hard FAILURE, not
+  a skip — otherwise a new field type would silently drop a column, which is the
+  exact failure being closed.
+
+So a field added to `SourceNATRuleSnapshot`, `NATRule`, `NATMatch`, `NATThen` or
+`NATPool` later joins the sweep with no edit to any fixture. That is closure at
+FIELD granularity, by construction.
+
+A constant column is no longer skipped. It must be REGISTERED, and the
+registration records which of the two kinds it is — `fixtureConstantAxes6812`
+(an admitted blind spot) or `productionConstantAxes6812` (invariant for every
+production input, so exempting it costs nothing). An unregistered constant fails
+with the full list of offenders; a registered column that is constant in no
+swept group fails as stale. The registries are therefore the honest enumeration,
+and they are checked rather than asserted.
+
+**Where closure stops, stated plainly rather than left for round 11.** Keys
+DERIVED from fields by arithmetic are not enumerable by reflection: a comparator
+may key on `PortHigh-PortLow+1`, on a computed budget charge, or on a prefix
+length, and no walk can enumerate the functions someone might write. Field-level
+closure does not imply derived-key coverage — every pool member address can
+differ while every pool has exactly one member. Two mitigations, both explicit:
+`.len` is swept mechanically, which covers the cardinality shape; and the
+remaining derived keys are declared as FIELDS OF A WRAPPER STRUCT
+(`snapshotAxisSlot6812`, `ruleAxisSlot6812`) that the sweep then treats like any
+other column. That wrapper's field list is a list. It is the only one left, it
+is in one place, and it is visible.
+
+### M2 — the transformation-coverage claim was wider than what is measured
+
+Round 9 wrote that assertion (1) "catches any of those" — reversal, rotation,
+shuffle — because it compares elementwise. Reversal and nonzero rotation are
+caught: the comparison sees distinct identities in changed positions. A
+PARTITION is caught only when it actually changes this fixture, and the
+`[1,0,2]` rule order is already stably partitioned by match address
+`< 10.0.2.0/24` (10.0.1.0/24 and 10.0.0.0/24 keep their order ahead of
+10.0.2.0/24), so that partition is invisible. Corrected in place: the
+elementwise comparisons catch transformations that realise a NONIDENTITY
+PERMUTATION ON THIS DATA — not the partition family in general.
+
+### M3 — the re-apply proof sentence is false with a shared pool
+
+`compiler_validate_strict_nat.go` said "Rust's pendings are exactly A". Pendings
+are per-RULE, so a pool referenced by several rule-sets contributes several —
+a multiset with repeats, not the set A. The runtime argument is unaffected, and
+Codex verified why: multiple references to one key are charged once by
+`reserved`, assigned once through `pool_allocators`, and refused consistently
+through `refused_keys`, so the disjointness argument holds at DISTINCT-KEY
+granularity. The sentence now says exactly that, and adds the reason distinct
+pool NAMES give distinct keys — the key carries the pool name alongside the
+expanded members and the port range, and the builder derives all three from the
+pool, so every rule referencing one pool ships the same three.
+
+### M4 — a fail-on-revert rationale that no longer names its own line
+
+`userspace-dp/src/nat/tests_aggregate_budget.rs` justified
+`repeated_references_to_a_reused_key_are_charged_once` by deleting the reuse-path
+`pool_allocators.insert`. Phase-one reservation (the F2 fix) moved the charge:
+`reserved` charges each distinct reused key once BEFORE phase 2, and phase 2's
+reuse branch charges nothing, so that deletion no longer double-charges.
+
+Measured rather than reasoned, cargo release, `--test-threads=1`:
+
+| cell | mutation | result |
+|---|---|---|
+| control | none | GREEN |
+| MUT-A | delete the reuse-path `pool_allocators.insert` (the rationale on record) | **GREEN** |
+| MUT-B | drop phase 1's distinct-key dedup, charging every REFERENCE | **RED** |
+| MUT-C | delete phase 1's charge entirely | GREEN |
+
+MUT-A confirms the finding. MUT-B is the replacement rationale — it is the line
+that binds "charged ONCE" now, and it reds with `pool "B" refused at apply:
+aggregate allocator budget exceeded (count 2/2, ...)`. MUT-C is recorded as an
+explicit NON-counterexample: it under-charges rather than over-charges, so B
+still fits; the F2 order defect it reopens is bound by the reuse-ordering
+fixtures, not by this one.

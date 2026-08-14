@@ -724,13 +724,34 @@ fn production_entry_admits_a_healthy_pool_after_failed_pools_6812() {
 /// #6812 F3 — repeated references to a REUSED allocator key are charged ONCE.
 ///
 /// Current behaviour is correct; nothing bound it. The inversion that found the
-/// gap: deleting the `pool_allocators.insert(key, existing.clone())` on the
-/// reuse path of `resolve_pool_allocators` (userspace-dp/src/nat/source.rs)
-/// left all 279 `nat::` tests green. Without that insertion the second rule
-/// referencing the SAME previous pool misses the this-apply cache, takes the
-/// previous-apply branch again, and charges the key a SECOND time — so with
-/// `max_pools = 2` the genuinely new pool B is refused `OverBudget` even though
-/// only two distinct allocators are live.
+/// gap, when the test was written, was deleting the `pool_allocators.insert`
+/// on the reuse path of `resolve_pool_allocators`: the second rule referencing
+/// the same previous pool then missed the this-apply cache, took the
+/// previous-apply branch again, and charged the key a SECOND time.
+///
+/// THAT RATIONALE IS STALE, and this note replaces it rather than quietly
+/// dropping it (#6812 round 10). The F2 fix — phase-one reservation — moved the
+/// charge. `reserved` now charges each distinct reused key exactly once BEFORE
+/// phase 2 runs, and phase 2's reuse branch charges nothing at all, so deleting
+/// that insert no longer double-charges anything. Measured at this head, cargo
+/// release, `--test-threads=1`: control GREEN, the insert deleted GREEN. The
+/// test still holds the property; it no longer holds the line its rationale
+/// named.
+///
+/// FAIL-ON-REVERT, re-derived and measured: drop the distinct-key dedup in
+/// PHASE 1 — `if !previous_allocators.contains_key(&key) || reserved
+/// .contains_key(&key)` reduced to the first conjunct, so every REFERENCE to a
+/// reused key is charged instead of every distinct key. Measured RED:
+///
+///   xpf-dp: source-nat pool "B" refused at apply: aggregate allocator budget
+///   exceeded (count 2/2, ...)
+///   assertion `left == right` failed: ... left: Some(OverBudget), right: None
+///
+/// That is the line that binds "charged ONCE" now. Deleting phase 1's charge
+/// ENTIRELY (`used = used.saturating_with(pending.charge())`) is GREEN here and
+/// is not a counterexample: it under-charges rather than over-charges, so B
+/// still fits — the #6812 F2 order defect that mutation reopens is bound by the
+/// reuse-ordering fixtures, not by this one.
 ///
 /// The scenario is not exotic: several rules pointing at one shared SNAT pool
 /// is the ordinary way to write this config, and the damage lands on a re-apply

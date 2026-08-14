@@ -3302,12 +3302,21 @@ func sourceNATAggregateReferencedCharges(cfg *Config) []sourceNATAggregatePoolCh
 // deciders") on its own. Let A be the set this walk admits. First-fit admits
 // greedily and only while the running total fits, so charge(A) is within every
 // budget. The poison travels on the wire and the Rust parse loop builds no
-// pending for a failed pool, so Rust's pendings are exactly A. Phase 1 reserves
-// R, a subset of A. Phase 2 accepts every reused key unconditionally and admits
-// a new key k when used + charge(k) fits — and R, the new keys already
-// processed, and k are DISJOINT subsets of A, so that sum is bounded by
-// charge(A), which fits. Rust therefore refuses nothing this walk admitted, in
-// any emitted order. The live set is exactly A.
+// pending for a failed pool, so the set of DISTINCT ALLOCATOR KEYS represented
+// by the non-nil pendings is exactly A. The pendings themselves are per-RULE
+// and a shared pool has one per referencing rule, so they are a multiset with
+// repeats — the statement holds only at distinct-key granularity, and that is
+// the granularity everything downstream works at: `reserved` charges a key
+// once, `pool_allocators` assigns it once, and `refused_keys` refuses it
+// consistently. Distinct pool NAMES map to distinct keys, because the key
+// carries the pool name alongside the expanded members and the port range, and
+// this builder derives all three from the pool (SourceNATPoolMembers /
+// SourceNATPoolPortRange), so every rule referencing one pool ships the same
+// three. Phase 1 reserves R, a subset of A. Phase 2 accepts every reused key
+// unconditionally and admits a new key k when used + charge(k) fits — and R,
+// the new keys already processed, and k are DISJOINT subsets of A, so that sum
+// is bounded by charge(A), which fits. Rust therefore refuses nothing this walk
+// admitted, in any emitted order. The live set is exactly A.
 //
 // The reserve-first order still earns its keep for the snapshots no Go poison
 // is coming for — a tolerated, older control plane's, or handcrafted snapshot,

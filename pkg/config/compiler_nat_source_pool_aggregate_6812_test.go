@@ -805,14 +805,20 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 //
 // Ranks in parentheses are each value's position in ITS COLUMN's ascending
 // order. No column is the identity permutation (ascending) or its reverse
-// (descending), and the four permutations are pairwise distinct, so each axis
-// fails for its own reason rather than shadowing another:
+// (descending), and the permutations are pairwise distinct, so each axis fails
+// for its own reason rather than shadowing another. Round 10 added the last
+// three columns — pool cardinality and the port range, which round 9 held
+// identical for every pool and therefore could not see (see PRECONDITION (c)):
 //
-//	slot   rule     pool    match source-address   pool member
-//	  0    r07 (2)  qb (1)  10.0.3.0/24 (3)        203.0.113.2 (1)
-//	  1    r02 (0)  qd (3)  10.0.0.0/24 (0)        203.0.113.3 (2)
-//	  2    r09 (3)  qa (0)  10.0.2.0/24 (2)        203.0.113.1 (0)
-//	  3    r05 (1)  qc (2)  10.0.1.0/24 (1)        203.0.113.4 (3)
+//	slot  rule     pool    match source-address  pool member      members  port range
+//	  0   r07 (2)  qb (1)  10.0.3.0/24 (3)       203.0.113.2 (1)  2 (2)    3000-3999 (2/0)
+//	  1   r02 (0)  qd (3)  10.0.0.0/24 (0)       203.0.113.3 (2)  1 (0)    1200-9200 (0/3)
+//	  2   r09 (3)  qa (0)  10.0.2.0/24 (2)       203.0.113.1 (0)  3 (3)    5000-5099 (3/1)
+//	  3   r05 (1)  qc (2)  10.0.1.0/24 (1)       203.0.113.4 (3)  1 (1)    2000-8000 (1/2)
+//
+// The derived keys those two columns feed are permuted too, and asserted:
+// port-range WIDTH 1000, 8001, 100, 6001 and allocator CAPACITY (members ×
+// width) 2000, 8001, 300, 6001 — neither ascending nor descending.
 //
 // The rule names are ZERO-PADDED on purpose. `r0..r10` style names sort
 // "r10" < "r9", which is precisely how the two neighbouring budget fixtures
@@ -825,19 +831,40 @@ func TestAggregateFirstFitSameTierFollowsConfigOrder_6812(t *testing.T) {
 // config rather than from the table — so a future edit to the table cannot
 // quietly reintroduce a monotone column.
 //
-// FAIL-ON-REVERT: a stable sort of rs.Rules keyed on Name, Match.SourceAddress
-// or Then.PoolName — in EITHER direction — reds the sequence assertion.
+// FAIL-ON-REVERT: a stable sort of rs.Rules keyed on Name, Match.SourceAddress,
+// Then.PoolName, the referenced pool's NAME, first member, member COUNT, port
+// low/high, or the width or allocator capacity derived from those — in EITHER
+// direction — reds the sequence assertion. The last five joined the list in
+// round 10; before it they were identical for every pool here and a sort keyed
+// on any of them was a measured no-op.
 func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
-	decl := []struct{ rule, pool, match, poolAddr string }{
-		{"r07", "qb", "10.0.3.0/24", "203.0.113.2"},
-		{"r02", "qd", "10.0.0.0/24", "203.0.113.3"},
-		{"r09", "qa", "10.0.2.0/24", "203.0.113.1"},
-		{"r05", "qc", "10.0.1.0/24", "203.0.113.4"},
+	decl := []struct {
+		rule, pool, match, poolAddr string
+		// #6812 round 10: two more columns, each of which round 9's four helper
+		// calls could not see because the FIXTURE held it constant while
+		// production varies it. Every pool used to carry exactly one member at
+		// the default 1024-65535 range, so a sort by len(Addresses), by the
+		// port-range width, or by the allocator charge this very walk computes
+		// was a no-op here and not in general. Extra members ride on `extra`;
+		// the FIRST member stays as it was so the Addresses[0] permutation is
+		// untouched.
+		extra  []string
+		lo, hi int
+	}{
+		{"r07", "qb", "10.0.3.0/24", "203.0.113.2", []string{"198.51.100.7"}, 3000, 3999},
+		{"r02", "qd", "10.0.0.0/24", "203.0.113.3", nil, 1200, 9200},
+		{"r09", "qa", "10.0.2.0/24", "203.0.113.1", []string{"198.51.100.9", "198.51.100.19"}, 5000, 5099},
+		{"r05", "qc", "10.0.1.0/24", "203.0.113.4", nil, 2000, 8000},
 	}
 	cmds := []string{"set security nat source rule-set RS from zone trust"}
 	for _, d := range decl {
 		cmds = append(cmds,
-			fmt.Sprintf("set security nat source pool %s address %s", d.pool, d.poolAddr),
+			fmt.Sprintf("set security nat source pool %s address %s", d.pool, d.poolAddr))
+		for _, a := range d.extra {
+			cmds = append(cmds, fmt.Sprintf("set security nat source pool %s address %s", d.pool, a))
+		}
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source pool %s port range %d to %d", d.pool, d.lo, d.hi),
 			fmt.Sprintf("set security nat source rule-set RS rule %s match source-address %s", d.rule, d.match),
 			fmt.Sprintf("set security nat source rule-set RS rule %s then source-nat pool %s", d.rule, d.pool),
 		)
@@ -883,17 +910,47 @@ func TestAggregateChargeOrderFollowsWithinRuleSetRuleOrder_6812(t *testing.T) {
 	for _, rule := range cfg.Security.NAT.Source[0].Rules {
 		declMatch = append(declMatch, rule.Match.SourceAddress)
 		pool := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
-		if pool == nil || len(pool.Addresses) != 1 {
-			t.Fatalf("rule %s references pool %q with %d members; this fixture gives each "+
-				"pool exactly one member so the pool-address axis is well defined",
-				rule.Name, rule.Then.PoolName, len(pool.Addresses))
+		if pool == nil || len(pool.Addresses) == 0 {
+			t.Fatalf("rule %s references pool %q with no members; the pool-address axis is "+
+				"not defined", rule.Name, rule.Then.PoolName)
 		}
+		// FIRST member: round 10 gives the pools DIFFERENT cardinalities so the
+		// length is an axis of its own, and the first member keeps the round-8
+		// permutation this named guard was written for.
 		declPoolAddr = append(declPoolAddr, pool.Addresses[0])
 	}
 	assertDeclarationOrderIsNotSortedBy6812(t, "Rule.Name", gotDeclRules)
 	assertDeclarationOrderIsNotSortedBy6812(t, "Then.PoolName", gotDeclPools)
 	assertDeclarationOrderIsNotSortedBy6812(t, "Match.SourceAddress", declMatch)
 	assertDeclarationOrderIsNotSortedBy6812(t, "pool member address", declPoolAddr)
+
+	// PRECONDITION (c), ASKED OF THE STRUCT (#6812 round 10). The four calls
+	// above are the named regression guards for the specific columns rounds 7
+	// and 8 found coming back; they are a LIST, which is the shape of blindness
+	// this fixture keeps reproducing one level up. sweepAxes6812 reflects over
+	// every field of the rule the walk reads AND of the pool it resolves
+	// (nat_source_axis_sweep_6812_test.go), so a field added to NATRule /
+	// NATMatch / NATThen / NATPool later joins the sweep with no edit here, and
+	// a column this fixture holds constant must be REGISTERED rather than
+	// silently skipped.
+	var slots []any
+	for _, rule := range cfg.Security.NAT.Source[0].Rules {
+		pool := cfg.Security.NAT.SourcePools[rule.Then.PoolName]
+		lo, hi, ok := SourceNATPoolPortRange(pool)
+		if !ok {
+			t.Fatalf("rule %s references pool %q with an unusable port range; this fixture "+
+				"configures a valid range on every pool", rule.Name, rule.Then.PoolName)
+		}
+		width := int(hi) - int(lo) + 1
+		slots = append(slots, ruleAxisSlot6812{
+			Rule:                rule,
+			Pool:                pool,
+			DerivedPortWidth:    width,
+			DerivedPortCapacity: len(SourceNATPoolMembers(pool)) * width,
+		})
+	}
+	sweepAxes6812(t, "charged rule",
+		[]axisGroup6812{{label: "rule-set RS", slots: slots}}, walkRuleAxisExemptions6812)
 
 	// The sequences each candidate sort would produce, for the failure text —
 	// so a red names WHICH sort the walk started behaving like.
@@ -946,29 +1003,21 @@ func poolsSortedByKey6812(pools, keys []string) []string {
 // measured GREEN against the whole pkg/config suite. Asking the question
 // mechanically, of every column, removes the dependence on remembering.
 //
+// A CONSTANT column is NOT handled here (#6812 round 10). Round 9 skipped one
+// silently, arguing that a stable sort keyed on a value identical for every
+// element cannot permute anything. That is true of the FIXTURE and says nothing
+// about production: fixture-only constancy is a blind spot, not a non-axis.
+// Classifying a constant column is sweepAxes6812's job — it demands an explicit
+// registration that records whether the column is invariant in production too.
+// Callers must therefore filter constants out before calling this; a constant
+// sequence reaching here reports as ASCENDING, which is technically true and
+// unhelpful.
+//
 // Fewer than three values is a hard failure rather than a skip: a two-element
 // sequence is ascending or descending by construction, so it CANNOT be
 // de-correlated from both directions and any claim that it is would be false.
 func assertDeclarationOrderIsNotSortedBy6812(t *testing.T, axis string, values []string) {
 	t.Helper()
-	// A CONSTANT column is a non-axis, not a blind spot (#6812 round 9). A
-	// stable sort keyed on a value that is the same for every element cannot
-	// permute anything, so it can never produce a wrong order — there is
-	// nothing for this fixture to be blind TO. This is not hypothetical: the
-	// zone-tier rule-sets carry no `from interface` and the interface-tier ones
-	// carry no `from zone`, so each of those axes is empty for half the
-	// fixture. Requiring them to be permuted would be requiring a fixture to
-	// discriminate a mutation that does not exist.
-	constant := true
-	for _, v := range values {
-		if v != values[0] {
-			constant = false
-			break
-		}
-	}
-	if constant {
-		return
-	}
 	if len(values) < 3 {
 		t.Fatalf("axis %q has %d values %v; a sequence shorter than three is ascending or "+
 			"descending by construction, so it cannot be de-correlated from BOTH sort "+

@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // snatAggregateCfg_6812 compiles (lenient — the tolerant path this guard
@@ -646,6 +647,36 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	// sort directions. Three can.
 	ruleOrder := []int{1, 0, 2}
 	nPerTier, rulesPerSet := len(declOrder), len(ruleOrder)
+	// #6812 round 10: three more columns, each of which the round-9 sweep could
+	// not see because the FIXTURE held it constant while production varies it.
+	// Round 9 exempted a constant column silently on the argument that a stable
+	// sort keyed on it cannot permute anything — true of this fixture, and
+	// nothing at all about production. These three were the named cases:
+	//
+	//   - poolMembers6812: pool CARDINALITY. Every pool used to carry exactly
+	//     one member, so a sort by len(PoolAddresses) — or by any charge derived
+	//     from it — was a no-op here and not in general.
+	//   - portLow6812 / portHigh6812: the port RANGE, and with it the derived
+	//     per-pool port capacity (members × range width): 2000, 8001, 300, 6001,
+	//     1000, 1500, 100, 21003, 2000, 4001 across the declaration slots —
+	//     neither ascending nor descending.
+	//   - counter IDs, below: the fixture passed nil for the ID map, so every
+	//     emitted CounterID was zero while production supplies populated
+	//     FNV-derived IDs. A stable (tier, CounterID) tiebreak reorders
+	//     production and was invisible here.
+	//
+	// Each is an INDEPENDENT permutation of its own column, for the same reason
+	// the walk-side fixture's four columns are: an axis that shadows another
+	// cannot fail for its own reason.
+	poolMembers6812 := []int{2, 1, 3, 1, 2, 3, 1, 3, 2, 1}
+	portLow6812 := []int{3000, 1200, 5000, 2000, 6000, 1500, 4000, 2500, 7000, 1800}
+	portHigh6812 := []int{3999, 9200, 5099, 8000, 6499, 1999, 4099, 9500, 7999, 5800}
+	// Counter IDs: 100*idOrder6812[slot] + idRuleOrder6812[rule position], so
+	// the column is permuted BOTH across rule-sets within a tier and across the
+	// rules within one rule-set — the two groupings the sweep checks.
+	idOrder6812 := []int{3, 7, 0, 9, 2, 5, 8, 1, 6, 4}
+	idRuleOrder6812 := []int{2, 0, 1}
+	natCounterIDs := map[string]uint32{}
 	tree := &config.ConfigTree{}
 	var cmds []string
 	// INTERLEAVED across two tiers so the input is neither single-keyed nor
@@ -659,7 +690,7 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	// sort keyed on (tier, PoolName ASC) was therefore GREEN, and a name
 	// tiebreak is exactly the rule F3 removed ("ordering by rule-set NAME
 	// matched neither that order nor any Junos semantic").
-	for _, i := range declOrder {
+	for k, i := range declOrder {
 		iface := fmt.Sprintf("if%02d", i)
 		zone := fmt.Sprintf("zn%02d", i)
 		cmds = append(cmds,
@@ -667,6 +698,20 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", iface, 100+i),
 			fmt.Sprintf("set security nat source rule-set %s from zone trust%d", zone, i),
 			fmt.Sprintf("set security nat source pool %s address 10.%d.0.1", zone, 200+i),
+		)
+		// Cardinality and port range, permuted per slot. The FIRST member stays
+		// keyed on i so the PoolAddresses[0] column keeps the declOrder
+		// permutation it already had; the extra members ride on k, which is what
+		// makes the .len column an independent one.
+		for m := 2; m <= poolMembers6812[k]; m++ {
+			cmds = append(cmds,
+				fmt.Sprintf("set security nat source pool %s address 10.%d.0.%d", iface, 100+i, m),
+				fmt.Sprintf("set security nat source pool %s address 10.%d.0.%d", zone, 200+i, m),
+			)
+		}
+		cmds = append(cmds,
+			fmt.Sprintf("set security nat source pool %s port range %d to %d", iface, portLow6812[k], portHigh6812[k]),
+			fmt.Sprintf("set security nat source pool %s port range %d to %d", zone, portLow6812[k], portHigh6812[k]),
 		)
 		// The RULES inside each rule-set, permuted (#6812 rounds 8 and 9) — the
 		// same blindness the rule-set loop above fixes, one nesting level in.
@@ -680,13 +725,17 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 		// The match address rides on r for the same reason: keyed on the rule
 		// index, it inherits the permutation, so a sort keyed on the emitted
 		// MatchSourceAddresses is de-correlated in both directions too.
-		for _, r := range ruleOrder {
+		for j, r := range ruleOrder {
 			cmds = append(cmds,
 				fmt.Sprintf("set security nat source rule-set %s rule r%d match source-address 10.0.%d.0/24", iface, r, r),
 				fmt.Sprintf("set security nat source rule-set %s rule r%d then source-nat pool %s", iface, r, iface),
 				fmt.Sprintf("set security nat source rule-set %s rule r%d match source-address 10.0.%d.0/24", zone, r, r),
 				fmt.Sprintf("set security nat source rule-set %s rule r%d then source-nat pool %s", zone, r, zone),
 			)
+			id := uint32(100*idOrder6812[k] + idRuleOrder6812[j])
+			rule := fmt.Sprintf("r%d", r)
+			natCounterIDs[dataplane.NATCounterKey(dataplane.NATCounterTypeSource, iface, rule)] = 10000 + id
+			natCounterIDs[dataplane.NATCounterKey(dataplane.NATCounterTypeSource, zone, rule)] = 20000 + id
 		}
 	}
 	for _, cmd := range cmds {
@@ -743,10 +792,6 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	// rather than against a re-derived `r%d`, so a future re-cut of the
 	// fixture loop cannot leave the expectation behind pointing the other way.
 	declaredRules := map[string][]string{}
-	// Round 9: the remaining per-declaration-slot axes, for the mechanical
-	// both-direction sweep below.
-	declaredMatch := map[string][]string{}
-	var declaredIface, declaredZone, declaredPoolAddr []string
 	for _, rs := range cfg.Security.NAT.Source {
 		pool := ""
 		for _, rule := range rs.Rules {
@@ -759,16 +804,7 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 		for _, rule := range rs.Rules {
 			if rule != nil {
 				declaredRules[pool] = append(declaredRules[pool], rule.Name)
-				declaredMatch[pool] = append(declaredMatch[pool], rule.Match.SourceAddress)
 			}
-		}
-		declaredIface = append(declaredIface, rs.FromInterface)
-		declaredZone = append(declaredZone, rs.FromZone)
-		if p := cfg.Security.NAT.SourcePools[pool]; p != nil && len(p.Addresses) == 1 {
-			declaredPoolAddr = append(declaredPoolAddr, p.Addresses[0])
-		} else {
-			t.Fatalf("pool %q does not carry exactly one member; the pool-address axis "+
-				"below is not well defined", pool)
 		}
 	}
 	assertNoTierDeclaredNameAscending6812(t, declared, declaredPools)
@@ -777,54 +813,73 @@ func TestBuilderEmittedOrderIsStableWithinATier_6812(t *testing.T) {
 	// sort keyed on Rule.Name.
 	assertNoRuleSetDeclaredRuleNameAscending6812(t, declaredRules)
 
-	// THE SAME QUESTION, MECHANICALLY, OF EVERY AXIS — IN BOTH DIRECTIONS
-	// (#6812 round 9). The two tripwires above are the named regression guards
-	// for the specific rules rounds 7 and 8 found coming back, and they ask
-	// only "is this column ASCENDING?" of the two NAME columns. That is the
-	// shape of blindness this fixture keeps reproducing: the author permutes
-	// the columns they are thinking about and the others stay monotone.
-	//
-	// Measured at 1995806ee, sweeping every axis at both mutation sites: all
-	// seven ascending cells were visible and FIVE reverse cells were blind —
-	// (tier, PoolName DESC), (tier, PoolAddresses[0] DESC), (tier,
-	// FromInterface DESC), (tier, FromZone DESC), and within-rule-set
-	// Rule.Name DESC — because rounds 7 and 8 re-cut the fixture from ascending
-	// to DESCENDING, which trades one monotone direction for the other. The
-	// loops now emit a PERMUTATION, and this belt is what keeps them one.
-	assertTierAxisIsNotSorted := func(axis string, values []string) {
-		t.Helper()
-		byTier := map[int][]string{}
-		var order []int
-		for k, tier := range declared {
-			if _, ok := byTier[tier]; !ok {
-				order = append(order, tier)
-			}
-			byTier[tier] = append(byTier[tier], values[k])
-		}
-		for _, tier := range order {
-			assertDeclarationOrderIsNotSortedBy6812(t,
-				fmt.Sprintf("%s within tier %d", axis, tier), byTier[tier])
-		}
-	}
-	// Rule-set-level axes: everything a (tier, X) tiebreak on the emitted
-	// snapshot could read. The tier sort is STABLE, so the property that
-	// matters is per-tier, not over the whole sequence.
-	assertTierAxisIsNotSorted("PoolName", declaredPools)
-	assertTierAxisIsNotSorted("pool member address", declaredPoolAddr)
-	assertTierAxisIsNotSorted("FromInterface", declaredIface)
-	assertTierAxisIsNotSorted("FromZone", declaredZone)
-	// Rule-level axes, per rule-set.
-	for _, pool := range declaredPools {
-		assertDeclarationOrderIsNotSortedBy6812(t,
-			fmt.Sprintf("Rule.Name within rule-set %s", pool), declaredRules[pool])
-		assertDeclarationOrderIsNotSortedBy6812(t,
-			fmt.Sprintf("Match.SourceAddress within rule-set %s", pool), declaredMatch[pool])
-	}
-
-	out := buildSourceNATSnapshots(cfg, nil)
+	out := buildSourceNATSnapshots(cfg, natCounterIDs)
 	if len(out) != 2*nPerTier*rulesPerSet {
 		t.Fatalf("emitted %d rules, want %d", len(out), 2*nPerTier*rulesPerSet)
 	}
+
+	// THE SAME QUESTION, ASKED OF THE STRUCT (#6812 round 10). Round 9 asked it
+	// "of every axis, in both directions" — but through a hand-written list of
+	// helper calls, so a column nobody remembered was still silently unguarded,
+	// and CounterID, pool cardinality and port capacity all were. sweepAxes6812
+	// reflects over every field of the value the production comparator reads
+	// (nat_source_axis_sweep_6812_test.go), so a field added to
+	// SourceNATRuleSnapshot later joins the sweep with no edit here, and a
+	// constant column must be REGISTERED rather than silently skipped.
+	//
+	// The sweep reads DECLARATION-ORDER snapshots reconstructed by identity
+	// below, NOT the sorted `out` — a precondition computed from the output of
+	// the mutation under test could pass vacuously.
+	byIdentity := map[string]SourceNATRuleSnapshot{}
+	for _, s := range out {
+		id := s.PoolName + "\x00" + s.Name
+		if _, dup := byIdentity[id]; dup {
+			t.Fatalf("two emitted snapshots share (PoolName=%s, Name=%s); the sweep below "+
+				"identifies declaration slots by that pair", s.PoolName, s.Name)
+		}
+		byIdentity[id] = s
+	}
+	tierSlots := map[int][]any{}
+	ruleSetSlots := map[string][]any{}
+	var tierOrder []int
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			s, ok := byIdentity[rule.Then.PoolName+"\x00"+rule.Name]
+			if !ok {
+				t.Fatalf("declared rule %s/%s emitted no snapshot", rule.Then.PoolName, rule.Name)
+			}
+			slot := snapshotAxisSlot6812{
+				Snapshot:            s,
+				DerivedPortCapacity: len(s.PoolAddresses) * (int(s.PortHigh) - int(s.PortLow) + 1),
+			}
+			tier := sourceNATScopeTier(s)
+			if _, seen := tierSlots[tier]; !seen {
+				tierOrder = append(tierOrder, tier)
+			}
+			tierSlots[tier] = append(tierSlots[tier], slot)
+			ruleSetSlots[s.PoolName] = append(ruleSetSlots[s.PoolName], slot)
+		}
+	}
+	var tierGroups []axisGroup6812
+	for _, tier := range tierOrder {
+		tierGroups = append(tierGroups, axisGroup6812{
+			label: fmt.Sprintf("tier %d", tier), slots: tierSlots[tier],
+		})
+	}
+	// The tier sort is STABLE, so a (tier, X) tiebreak permutes only within one
+	// tier — the property has to hold per tier, not over the whole sequence.
+	sweepAxes6812(t, "emitted snapshot, per tier", tierGroups, builderTierAxisExemptions6812)
+	var ruleSetGroups []axisGroup6812
+	for _, pool := range declaredPools {
+		ruleSetGroups = append(ruleSetGroups, axisGroup6812{
+			label: "rule-set " + pool, slots: ruleSetSlots[pool],
+		})
+	}
+	// One level in: a within-block reorder permutes only inside one rule-set.
+	sweepAxes6812(t, "emitted snapshot, per rule-set", ruleSetGroups, builderRuleSetAxisExemptions6812)
 
 	// (1) Rule-set FIRST references, in emitted order, per tier.
 	var firstRefs []string
@@ -945,29 +1000,21 @@ func ruleNames6812(block []SourceNATRuleSnapshot) []string {
 // helper cannot be shared across packages without exporting it from
 // production.
 //
+// A CONSTANT column is NOT handled here (#6812 round 10). Round 9 skipped one
+// silently, arguing that a stable sort keyed on a value identical for every
+// element cannot permute anything. That is true of the FIXTURE and says nothing
+// about production: fixture-only constancy is a blind spot, not a non-axis.
+// Classifying a constant column is sweepAxes6812's job — it demands an explicit
+// registration that records whether the column is invariant in production too.
+// Callers must therefore filter constants out before calling this; a constant
+// sequence reaching here reports as ASCENDING, which is technically true and
+// unhelpful.
+//
 // Fewer than three values is a hard failure rather than a skip: a two-element
 // sequence is ascending or descending by construction, so it CANNOT be
 // de-correlated from both directions and any claim that it is would be false.
 func assertDeclarationOrderIsNotSortedBy6812(t *testing.T, axis string, values []string) {
 	t.Helper()
-	// A CONSTANT column is a non-axis, not a blind spot (#6812 round 9). A
-	// stable sort keyed on a value that is the same for every element cannot
-	// permute anything, so it can never produce a wrong order — there is
-	// nothing for this fixture to be blind TO. This is not hypothetical: the
-	// zone-tier rule-sets carry no `from interface` and the interface-tier ones
-	// carry no `from zone`, so each of those axes is empty for half the
-	// fixture. Requiring them to be permuted would be requiring a fixture to
-	// discriminate a mutation that does not exist.
-	constant := true
-	for _, v := range values {
-		if v != values[0] {
-			constant = false
-			break
-		}
-	}
-	if constant {
-		return
-	}
 	if len(values) < 3 {
 		t.Fatalf("axis %q has %d values %v; a sequence shorter than three is ascending or "+
 			"descending by construction, so it cannot be de-correlated from BOTH sort "+
