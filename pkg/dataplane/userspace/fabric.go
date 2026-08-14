@@ -212,11 +212,18 @@ func fabricParentUnbindable(cfg *config.Config, parentName, parentLinux string, 
 // and returned a verdict about a device the config does describe, which under
 // round 10's co-voting fabric admitted a refused GRE device.
 //
-// The exact hit is tried first as a fast path; the scan below is what makes the
-// answer right for an alias. It is deterministic without needing to be sorted:
-// validateInterfaceNameCollisionStrict (pkg/config) rejects a config in which
-// two authored names canonicalize to one Linux name, so at most one stanza can
-// match — and the fast path takes the same stanza the scan would.
+// The exact hit is tried first as a fast path — it can only hit a stanza whose
+// own name is already the Linux name, so it selects what the scan would.
+//
+// The scan takes the lexicographically LAST matching name rather than the first
+// one the map hands back. A committed config cannot have two:
+// validateInterfaceNameCollisionStrict (pkg/config) rejects one where two
+// authored names canonicalize to a single Linux name. But a verdict must not be
+// decided by Go's map iteration order on a config that never reached that gate,
+// and "last" is not arbitrary — it is the same name that validator names as the
+// winner ("the lexicographically later name would silently win") when two
+// stanzas contend for one device. The verdict then describes the stanza that
+// wins the device.
 func interfaceConfigForNetdev(cfg *config.Config, linuxName string) *config.InterfaceConfig {
 	if cfg == nil || linuxName == "" {
 		return nil
@@ -224,12 +231,19 @@ func interfaceConfigForNetdev(cfg *config.Config, linuxName string) *config.Inte
 	if ifc, ok := config.LookupInterface(cfg, linuxName); ok {
 		return ifc
 	}
+	var (
+		bestName string
+		best     *config.InterfaceConfig
+	)
 	for name, ifc := range cfg.Interfaces.Interfaces {
-		if ifc != nil && config.LinuxIfName(name) == linuxName {
-			return ifc
+		if ifc == nil || config.LinuxIfName(name) != linuxName {
+			continue
+		}
+		if best == nil || name > bestName {
+			bestName, best = name, ifc
 		}
 	}
-	return nil
+	return best
 }
 
 // fabricParentUp reports whether the fabric parent link's carrier/oper state is
