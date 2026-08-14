@@ -50,10 +50,13 @@ thread_local! {
     /// storage; `#[cfg(test)]` is false for any non-test build, so the bump below
     /// does not exist in the shipped hot path either.
     ///
-    /// Both halves of that are MEASURED, next to the struct in
-    /// `binding_state/mod.rs`, where four `const _: [(); N]` asserts pin size,
-    /// align and two field offsets in BOTH build configurations. With this
-    /// thread-local, all four are identical to the production build. A
+    /// What is MEASURED, next to the struct in `binding_state/mod.rs`, is four
+    /// values: four `const _: [(); N]` asserts pin size, align and two field
+    /// offsets in BOTH build configurations, and with this thread-local all
+    /// four are identical to the production build. That is the claim — none of
+    /// the four moved — and not the broader one that the layout is unchanged:
+    /// the struct's other ~90 fields are unpinned, so a perturbation confined
+    /// to them would satisfy all four. A
     /// `#[cfg(test)]` FIELD is not — and not in the way the objection originally
     /// assumed: it leaves the SIZE unchanged (it lands in existing tail slack) and
     /// moves OFFSETS, `pending_tx_admitted`'s own included. See that comment for

@@ -79991,3 +79991,98 @@ can be measured should not be argued. Durations are uniform and near zero here �
 these are pure unit cells with no polling, so no red in this matrix can be a
 precondition timeout, and the assertion-vs-precondition column is established by
 the panic SITE (all five at the aggregate assertion, none at a control).
+
+## 2026-08-13 — #6304 round 4 (B2+B3): the tripwire is unpinned, and every claim narrowed to the four measured values
+
+- **Timestamp**: 2026-08-13
+- **Action**: record that nothing pins the four `const _` layout asserts, with
+  the cost of deleting them measured; narrow every statement of "layout
+  neutrality" to "none of the four pinned values moved"
+- **File(s)**: `userspace-dp/src/afxdp/binding_state/mod.rs`,
+  `userspace-dp/src/afxdp/binding_state/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/binding_state/tests/tx_inbox.rs`,
+  `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`,
+  `docs/userspace-dataplane-gaps.md`
+
+B2 — THE TRIPWIRE IS ITSELF UNPINNED. Measured on tree `/var/tmp/f6882r3` at
+`37d22ac39`, `cargo test --bin xpf-userspace-dp admission_attempt_instrument`,
+each cell mutated from a clean file and restored:
+
+| cell | rc | outcome |
+|---|---|---|
+| delete ALL FOUR `const _` (mod.rs:752-755) | 0 | test binary compiles, mirrored runtime cell PASSES |
+| delete only :752 (size) | 0 | same |
+| delete only :753 (align) | 0 | same |
+| delete only :754 (`pending_tx_admitted`) | 0 | same |
+| delete only :755 (`delta_loss_pending`) | 0 | same |
+| RED CONTROL: `const` literal 2304 -> 2305 | 101 | E0308 at compile time |
+| RED CONTROL: runtime cell literal 2304 -> 2305 | 101 | assertion `left == right` |
+
+The two RED controls ran in the SAME invocation as the green cells, so the
+greens are credible rather than a filter that matched nothing: the asserts are
+live while present, and the runtime cell does exercise its assertions.
+
+DECISION: documented as unpinned, NOT given a canary. The only shapes available
+for guarding a source construct are a match on its NAME or its TEXT. Both are
+proxies satisfiable by a differently-spelled equivalent, both red on a harmless
+rename while staying green on a semantic gutting, and this repo has been bitten
+by that shape repeatedly (#6871, #6743, #6676 among them). A guard that is itself
+a `const` would be exactly as deletable as what it guards, and guarding IT is the
+same problem one level up. No runtime witness is possible either: what the four
+lines assert is a statement about the PRODUCTION configuration, and a test binary
+is by construction the test configuration.
+
+WHAT DELETION COSTS, measured rather than asserted, with a `cfg(test)` `AtomicU64`
+declared ahead of `pending_tx_admitted` (the hazard's own shape):
+
+| cell | production `cargo build` | test build / run |
+|---|---|---|
+| H1 asserts present, literals untouched | rc=0 | rc=101, reports 2152 -> 2160 AND 2280 -> 2288 |
+| H2 asserts present, literals re-measured to 2160/2288 | rc=101, reports 2160 -> 2152 and 2288 -> 2280 | rc=0 |
+| H3 asserts DELETED, runtime cell re-measured to 2160/2288 | rc=0 | rc=0 — perturbation accepted in SILENCE |
+
+H2 is the "could satisfy at most one of the two builds" claim, previously argued
+and now measured: the guard cannot be made green by re-measuring in whichever
+configuration is in front of you. H3 is what deleting the four lines costs, and
+it is the difference between them and the runtime cell — the runtime cell CAN be
+re-measured green and they cannot. That pair is written into the file beside the
+asserts, so a future deleter reads what they are giving up in numbers instead of
+a plea not to.
+
+H1 also fills in a cell the round-3 table recorded as "not measured": the
+FIELD-ahead shape moves `delta_loss_pending` 2280 -> 2288 as well as
+`pending_tx_admitted` 2152 -> 2160. The docs table now carries the measured value.
+
+B3 — PROSE NARROWED. The honest claim is that NONE OF THE FOUR PINNED VALUES
+MOVED, which is a real result and a narrower one. Every statement of it now says
+that:
+  - `docs/userspace-dataplane-gaps.md` "Layout neutrality is MEASURED" ->
+    "Four layout values are MEASURED", with the scope paragraph named as part of
+    the claim rather than a caveat on it.
+  - same doc, "(1) The thread-local moves nothing" -> "moves none of those four
+    values", stating explicitly that a perturbation confined to the other ~90
+    fields would not show up.
+  - `binding_state/mod.rs` heading "LAYOUT NEUTRALITY of ..." -> "FOUR PINNED
+    LAYOUT VALUES, tripping if ... moves any of them"; and "the instrument is no
+    longer layout-neutral" -> "has moved one of these four values".
+  - `binding_state/tx_inbox.rs` "Both halves of that are MEASURED" -> "What is
+    MEASURED ... is four values", with the unpinned ~90 named.
+  - `binding_state/tests/tx_inbox.rs` doc headline "does not perturb
+    `BindingLiveState`" -> "moves none of FOUR PINNED ... layout values", and the
+    test RENAMED
+    `admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304`
+    -> `..._leaves_four_pinned_layout_values_unchanged_6304`, since the name was
+    itself a statement of the overclaim. The reference at `_Log.md:622` is a
+    historical round-3 entry and is left as written; this entry supersedes it.
+  - `poll_descriptor/flow_cache_hit_tests.rs` carried the STRONGEST form of the
+    overclaim, and it was introduced by this PR: "A thread-local is
+    layout-neutral (that struct is BYTE-IDENTICAL with and without it)". That is
+    a whole-struct equality claim which the corrected scope paragraph elsewhere
+    in the same PR flatly contradicts. Replaced with the four-value statement,
+    as was the second instance further down the same file.
+
+Not touched, deliberately: the parts Codex confirmed accurate — the
+whole-struct-fingerprint disclaimer, the `repr(Rust)`/unpinned-toolchain note,
+and the remeasure-don't-widen prescription. Also left alone is
+`binding_state/mod.rs:11`, whose "byte-identical" is about code MOTION of moved
+items in an earlier PR and is not in this PR's diff.

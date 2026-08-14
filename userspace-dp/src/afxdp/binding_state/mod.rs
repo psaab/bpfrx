@@ -696,8 +696,11 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) delta_loss_pending: AtomicBool,
 }
 
-// #6304: LAYOUT NEUTRALITY of the `#[cfg(test)]` admission-attempt instrument
-// (`pending_tx_admission_attempts`, `tx_inbox.rs`). This struct is the one whose
+// #6304: FOUR PINNED LAYOUT VALUES, tripping if the `#[cfg(test)]`
+// admission-attempt instrument (`pending_tx_admission_attempts`, `tx_inbox.rs`)
+// moves any of them. Not a statement of whole-struct layout neutrality — see
+// "WHAT THIS IS, exactly" below, which bounds the claim rather than qualifying
+// it. This struct is the one whose
 // cross-core cacheline behaviour #6114 exists to fix, so an instrument that
 // moved anything in it would put a layout under test that production never has.
 //
@@ -747,8 +750,46 @@ pub(in crate::afxdp) struct BindingLiveState {
 //
 // If a legitimately new PRODUCTION field trips these, re-measure and update the
 // literals — the compile error reports the actual value. If only the TEST build
-// trips one, a test-only member has reached the struct and the instrument is no
-// longer layout-neutral.
+// trips one, a test-only member has reached the struct and has moved one of
+// these four values.
+//
+// WHAT PINS THESE FOUR LINES — nothing, deliberately, and the cost of that is
+// measured rather than waved at. On this tree, deleting all four compiles the
+// complete test binary and the mirrored runtime cell in
+// `binding_state/tests/tx_inbox.rs` still PASSES; each line is individually
+// deletable with the same result. Nothing in the tree observes their absence.
+//
+// They are given no guard of their own because the only shapes available for
+// guarding a source construct are a match on its NAME or on its TEXT, and both
+// are proxies — a differently-spelled equivalent satisfies them, and they red on
+// a harmless rename while staying green on a semantic gutting. A guard that is
+// itself a `const` is no better: it would be exactly as deletable as what it
+// guards, and guarding IT is the same problem one level up. Every tripwire
+// terminates somewhere; this one terminates at itself, and says so here rather
+// than implying a completeness it does not have.
+//
+// Nor could a runtime witness exist even in principle. What these four lines
+// assert is a statement about the PRODUCTION configuration, and a test binary is
+// by construction the TEST configuration, so no `#[test]` can observe whether
+// they are present in the build that matters.
+//
+// What their presence buys, measured with a `#[cfg(test)]` `AtomicU64` declared
+// ahead of `pending_tx_admitted` — the hazard's own shape:
+//   - asserts present, literals untouched: `cargo build` (production) SUCCEEDS,
+//     because the field does not exist there, and the test build FAILS reporting
+//     2152 -> 2160 AND 2280 -> 2288.
+//   - asserts present, literals re-measured to 2160/2288 so the test build
+//     passes: the test build then SUCCEEDS and `cargo build` FAILS, reporting
+//     the same two values back the other way. That is the "at most one of the
+//     two builds" property, and it is what makes this guard un-satisfiable by
+//     re-measuring in whichever configuration happens to be in front of you.
+//   - asserts DELETED and the runtime cell's own literals re-measured to
+//     2160/2288: the production build and the test run BOTH pass, and the
+//     test-only perturbation is accepted in silence.
+// The last cell is exactly what deleting these four lines costs. It is also the
+// difference between them and the runtime cell: the runtime cell can be
+// re-measured green, and these cannot. Removing them is therefore a reviewable
+// act, not cleanup.
 const _: [(); 2304] = [(); std::mem::size_of::<BindingLiveState>()];
 const _: [(); 64] = [(); std::mem::align_of::<BindingLiveState>()];
 const _: [(); 2152] = [(); std::mem::offset_of!(BindingLiveState, pending_tx_admitted)];

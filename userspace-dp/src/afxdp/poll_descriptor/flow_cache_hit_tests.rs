@@ -1280,9 +1280,13 @@ fn live_flow_cache_callsite_rewrite_failure_rolls_back_sampler_6304() {
 /// (`afxdp/binding_state/tx_inbox.rs`) via a `#[cfg(test)]` THREAD-LOCAL —
 /// deliberately not a `#[cfg(test)]` field on `BindingLiveState`, which would
 /// change the layout of the very struct whose cross-core cacheline behaviour
-/// #6114 exists to fix. A thread-local is layout-neutral (that struct is
-/// byte-identical with and without it) and, unlike a process-global atomic,
-/// stays deterministic under the default parallel `cargo test`.
+/// #6114 exists to fix. A thread-local lives in its own storage, and FOUR
+/// pinned values of that struct — size, align and two field offsets — are
+/// measured unmoved with and without it, in both build configurations
+/// (`binding_state/mod.rs`). That is a tripwire on the one hazard, NOT a claim
+/// that the struct is byte-identical: its other ~90 fields are unpinned. Unlike
+/// a process-global atomic, a thread-local also stays deterministic under the
+/// default parallel `cargo test`.
 ///
 /// Bound alongside it are the two properties either side of the window:
 ///   - the reservation the call site takes is externally visible and must be
@@ -1347,8 +1351,9 @@ fn live_flow_cache_callsite_delegates_to_the_shared_sampler_6304() {
 /// the admission primitive for a declined packet whatever it then does with the
 /// result. See `pending_tx_admission_attempts` in
 /// `afxdp/binding_state/tx_inbox.rs` for why the counter is a thread-local and
-/// not a `#[cfg(test)]` field on `BindingLiveState` (layout neutrality on the
-/// exact struct #6114 is about) and not a process-global atomic (determinism
+/// not a `#[cfg(test)]` field on `BindingLiveState` (four pinned layout values
+/// on the exact struct #6114 is about, measured unmoved — not whole-struct
+/// neutrality) and not a process-global atomic (determinism
 /// under the default parallel `cargo test`).
 ///
 /// The target has ROOM in the declined arm, and that is load-bearing: at cap

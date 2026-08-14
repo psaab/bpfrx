@@ -93,7 +93,10 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
     assert_eq!(live.tx_errors.load(Ordering::Relaxed), 0);
 }
 
-/// #6304: the admission-attempt instrument does not perturb `BindingLiveState`.
+/// #6304: the admission-attempt instrument moves none of FOUR PINNED
+/// `BindingLiveState` layout values. Stated that narrowly on purpose — it is
+/// what was measured, and it is weaker than "does not perturb the struct",
+/// which the last paragraph here explains this cell cannot show.
 ///
 /// `try_acquire_pending_tx_admission` carries a `#[cfg(test)]` bump into a
 /// THREAD-LOCAL counter so
@@ -129,7 +132,7 @@ fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
 /// full scope, including why `repr(Rust)` plus an unpinned toolchain makes these
 /// literals a build tripwire rather than a portable invariant.
 #[test]
-fn admission_attempt_instrument_leaves_binding_live_state_layout_unchanged_6304() {
+fn admission_attempt_instrument_leaves_four_pinned_layout_values_unchanged_6304() {
     assert_eq!(
         std::mem::size_of::<BindingLiveState>(),
         2304,

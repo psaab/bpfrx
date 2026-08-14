@@ -268,20 +268,26 @@ that enqueues a redirect bumps the same counter, so a global would be a
 load-sensitive flake. The pattern already exists in the tree —
 `OUTER_ROUTE_RESOLVE_COUNT` in `afxdp/frame/wg.rs`.
 
-Layout neutrality is MEASURED, not asserted — "a thread-local lives in its own
-storage" is a claim about the compiler, and the struct it is a claim about is the
-one #6114 is entirely concerned with. `BindingLiveState`, rustc 1.96.0, x86_64:
+Four layout values are MEASURED rather than asserted — "a thread-local lives in
+its own storage" is a claim about the compiler, and the struct it is a claim
+about is the one #6114 is entirely concerned with. What was measured is size,
+alignment and two field offsets. That is a tripwire aimed at one hazard, not
+whole-struct neutrality; the scope paragraph below is part of the claim, not a
+caveat on it. `BindingLiveState`, rustc 1.96.0, x86_64:
 
 | instrument | size | align | off(`pending_tx_admitted`) | off(`delta_loss_pending`) |
 |---|---|---|---|---|
 | none — production build | 2304 | 64 | 2152 | 2280 |
 | `cfg(test)` THREAD-LOCAL (the one taken) | 2304 | 64 | 2152 | 2280 |
-| `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | not measured |
+| `cfg(test)` FIELD ahead of the counter | 2304 | 64 | **2160** | **2288** |
 | `cfg(test)` FIELD declared last | 2304 | 64 | 2152 | **2288** |
 
 Two things follow, and the second corrects the earlier note rather than restating
-it. (1) The thread-local moves nothing, and four `const _: [(); N]` asserts
-beside the struct hold it to that: they are deliberately NOT `cfg`-gated, so the
+it. (1) The thread-local moves none of those four values, and four
+`const _: [(); N]` asserts beside the struct hold it to that — none of the four,
+which is a real result and a narrower one than "moves nothing": the other ~90
+fields are not pinned and a perturbation confined to them would not show up.
+They are deliberately NOT `cfg`-gated, so the
 same literals are evaluated in the production build AND the test build, and an
 instrument that moved ANY OF THOSE FOUR VALUES could satisfy at most one of the
 two. That is the cross-configuration comparison a `#[test]` cannot make on its
@@ -306,6 +312,32 @@ silent accept), but it means the right response to a trip is to re-measure, not 
 widen the guard. The runtime cell in `binding_state/tests/tx_inbox.rs` mirrors the
 same four numbers and, for the same reason, cannot FAIL — the un-gated `const _`
 fails the build first, so the test binary carrying it would never be produced.
+
+And nothing pins the four asserts themselves. Measured: deleting all four
+compiles the complete test binary and the mirrored runtime cell still passes,
+and each line is individually deletable with the same result. They are given no
+guard of their own on purpose. The only shapes available for guarding a source
+construct are a match on its NAME or on its TEXT, both of which are proxies a
+differently-spelled equivalent satisfies, and a guard that is itself a `const`
+would be exactly as deletable as what it guards. No runtime witness is possible
+either: what the four lines assert is a statement about the PRODUCTION
+configuration, and a test binary is by construction the test configuration.
+Every tripwire terminates somewhere and this one terminates at itself, so the
+scope is written down instead.
+
+What their presence buys is measured, with a `cfg(test)` `AtomicU64` declared
+ahead of `pending_tx_admitted` — the hazard's own shape. Asserts present and
+literals untouched: `cargo build` succeeds and the test build fails, reporting
+2152 -> 2160 and 2280 -> 2288. Asserts present and literals re-measured to
+2160/2288 so the test build passes: the test build succeeds and `cargo build`
+then fails, reporting the two values back the other way — the "at most one of
+the two builds" property, which is what makes the guard un-satisfiable by
+re-measuring in whichever configuration is in front of you. Asserts DELETED and
+the runtime cell's own literals re-measured to 2160/2288: production build and
+test run both pass and the test-only perturbation is accepted in silence. That
+last cell is what deleting the four lines costs, and it is the difference
+between them and the runtime cell — the runtime cell can be re-measured green,
+and they cannot.
 
 Measured, at the head that added it: reverting `sample_then_admit_mirror_clone`
 itself to reserve-first (reserve, then drop the reservation when the sampler
