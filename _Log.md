@@ -80086,3 +80086,41 @@ whole-struct-fingerprint disclaimer, the `repr(Rust)`/unpinned-toolchain note,
 and the remeasure-don't-widen prescription. Also left alone is
 `binding_state/mod.rs:11`, whose "byte-identical" is about code MOTION of moved
 items in an earlier PR and is not in this PR's diff.
+
+## 2026-08-13 — #6304 round 4 (B1 addendum): the row count is pinned by the array type
+
+- **Timestamp**: 2026-08-13
+- **Action**: record the measured type-level pin on the aggregated row set
+- **File(s)**: `userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit_tests.rs`
+
+The obvious objection to replacing six `assert_eq!`s with one aggregated
+assertion is that a row could then be dropped from the array and the test would
+still pass with less coverage — the same silent-loss exposure a deleted
+`assert_eq!` has. It does not apply here, and the reason is measured rather than
+argued: `observed` is annotated `[(&str, u64, u64, &str); 6]`, so deleting the
+`plain/dnat_packets` row fails the test build with E0308 (rc=101, tree
+`/var/tmp/f6882r3`, `cargo test --no-run --bin xpf-userspace-dp`).
+
+This is worth stating next to the B2 entry above because it is the pin B2 could
+NOT have. It is a TYPE-level constraint, so it cannot be satisfied by a
+differently-spelled equivalent — unlike a canary matching a NAME or the TEXT of
+an assertion, which is the proxy shape this tree keeps being bitten by. Where
+such a pin is available it should be taken; the four `const _` layout asserts
+are unpinned because no equivalent exists for them, not because pinning was
+judged unnecessary.
+
+FULL SUITE, tree `/var/tmp/f6882r3` at `01728e1c5`:
+`cargo test --bin xpf-userspace-dp` -> rc=0, 4292 passed, 0 failed, 2 ignored,
+34.37s. An earlier invocation of the same command returned rc=101 and that was
+NOT an assertion: the log carries 0 `FAILED` lines, 0 panics and 4289 `... ok`,
+and ends in `signal: 15, SIGTERM` with three `afxdp::wg::engine` concurrency
+tests still running past 60s on a box at load average ~25 with 11 sibling cargo
+runs. The exit code reported a termination, not a result; the clean re-run is
+the measurement.
+
+`cargo fmt --check` is not a gate in this crate (hundreds of pre-existing
+diffs). The relevant check is that this round added none: the file it wrote new
+code in, `flow_cache_hit_tests.rs`, has exactly the same ten rustfmt diff sites
+at `37d22ac39` and at this head — 35/570/753/948/1055/1094/1240 unchanged, and
+the last three shifted 1496/1563/1612 -> 1501/1568/1617 by the five lines the
+prose edit above them added. No diff falls in the new test body.

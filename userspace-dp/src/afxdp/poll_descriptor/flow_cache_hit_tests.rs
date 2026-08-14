@@ -2027,6 +2027,13 @@ fn live_flow_cache_callsite_replays_every_filter_count_term_6304() {
 /// redundancy; per-increment independence is the property about the production
 /// code, and it is the one asserted here.
 ///
+/// The `[_; 6]` annotation on `observed` is load-bearing, not decoration:
+/// deleting a row is a COMPILE error (E0308, measured), so the aggregation
+/// cannot quietly lose a discriminator the way a deleted `assert_eq!` would.
+/// That is a type-level constraint rather than a match on a name or on source
+/// text, so a differently-spelled equivalent cannot satisfy it — add a row and
+/// the count must be updated deliberately.
+///
 /// The POSITIVE CONTROLS above the rows are PRECONDITIONS, not discriminators,
 /// and they deliberately still panic on the spot: a run that did not forward,
 /// or did not really translate the frame, can say nothing about the counters,
