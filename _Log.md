@@ -80788,3 +80788,71 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
 - **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
   pkg/daemon/reth_hook_wired_5103_test.go, pkg/daemon/daemon_apply_dataplane.go,
   pkg/dataplane/userspace/process_linkcycle.go, docs/reth-mac.md, _Log.md
+
+- **Timestamp**: 2026-08-14
+- **Action**: #6871 round 16 — stop collapsing the MARKER list, reject an
+  unreachable decoy, and make the behavioural-proof binding require a test that
+  actually runs
+
+  Codex reviewed aec8e7881 (round 14) and found a nested-literal escape:
+
+	beforeCycle := func() error {
+	    prepare := func() { _ = d.dp.Link().PrepareLinkCycle() }
+	    go prepare()
+	    return nil
+	}
+
+  MEASURED AT 3557017da FIRST, because the finding was raised against the
+  PREVIOUS head. That exact plant is already RED at round 15: the labels round
+  15 added render the two nesting levels as different marker texts, so the
+  dedup no longer collapses them. Codex's finding is real for round 14 and was
+  closed by round 15 as a side effect rather than on purpose.
+
+  The residual it left is the shadowed spelling, and that one WAS green:
+
+	beforeCycle := func() error {
+	    beforeCycle := func() { _ = d.dp.Link().PrepareLinkCycle() }
+	    go beforeCycle()
+	    return nil
+	}
+
+  Same marker text at both levels -> deduplicated to one -> key byte-identical
+  to the allowlisted single-level one. This is the round-15 defect in a
+  different container: a list of boundaries that collapses equal entries
+  destroys nesting DEPTH exactly as map[string]bool destroyed multiplicity. The
+  dedup is gone; marks is now every boundary in order.
+
+  Also measured, from the lead's supplement: the removed-direction decoy closes
+  only PARTLY under multiplicity. A decoy in a DIFFERENT literal is caught by
+  the label (RED). A decoy in the SAME literal behind `if false`, with the real
+  call deleted, keeps both the key and the count and was GREEN. Added a third
+  marker, `[under a constant-false if]`. General reachability stays
+  undecidable; what bounds THAT residual is the daemon's own suite, since an
+  acquisition that stops happening changes observable behaviour.
+
+  Codex's binding-check finding confirmed live at round 15 and FIXED rather
+  than recorded as a philosophical limit: the check was "a receiverless
+  declaration with this name exists", which a `//go:build never` dummy and a
+  non-test function both satisfy — both measured GREEN. It now asks go/build
+  whether the file is in the current build context and requires a
+  `func TestXxx(*testing.T)` signature. Note the deliberate asymmetry with
+  callSitesOf, which does NOT consult build constraints: for an acquisition
+  SITE, a false build tag must not hide it; for a PROOF, being excluded from
+  the build is disqualifying. The one honest residual is that nothing judges
+  whether the named test proves what the entry claims.
+
+  F3 preconditions written down as the lead asked: >=2 RETH members, member A's
+  live set refused and its cycle completing, a LATER member B's live set
+  refused and B failing after the join, and B's rollback rebind failing. Steps
+  2-3 are ordered by Go map range, so it is nondeterministic across runs. Not a
+  regression against master (master had no lease at all).
+
+  MEASURED, all -count=1. Round 15 vs the six new plants: N1 RED, N2 GREEN, R1
+  RED, R2 GREEN, B1 GREEN, B2 GREEN. Round 16: all six RED, each with a
+  distinct message. Regression sweep: round-14 A/B/C and round-15 F1/F1B/F1C
+  all still RED; guard mutations D/D2/E/F all still RED; clean head green.
+
+  NO EXECUTABLE PRODUCTION CHANGE in this round either — the only non-test file
+  touched is docs/reth-mac.md.
+- **File(s)**: pkg/dataplane/userspace/link_cycle_acquisition_site_6871_test.go,
+  docs/reth-mac.md, _Log.md

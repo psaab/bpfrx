@@ -3,6 +3,7 @@ package userspace
 import (
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -222,9 +223,46 @@ type methodRefs struct {
 // markFuncLit is a PREFIX: it is closed either bare or with the literal's label
 // (see funcLitMark). markGo is complete — a go statement has nothing to name.
 const (
-	markFuncLit = "[in a func literal"
-	markGo      = "[started by a go statement]"
+	markFuncLit     = "[in a func literal"
+	markGo          = "[started by a go statement]"
+	markUnreachable = "[under a constant-false if]"
 )
+
+// isConstFalseIf reports whether chain[j] is an `if false { ... }` whose body
+// contains the reference — a call that cannot execute (#6871 round 16).
+//
+// It is here for the REMOVED half of the allowlist, not the added half. The
+// allowlist asserts each listed site still exists, and this defeats that
+// assertion without changing the key or the count:
+//
+//	beforeCycle := func() error {
+//	    if false { return d.dp.Link().PrepareLinkCycle() }   // decoy
+//	    return nil                                            // the real one, gone
+//	}
+//
+// Measured green before this check. Marking it changes the key, so the entry
+// reads as missing — which it is.
+//
+// ONLY the constant-false case, and the general one is not reachable from here.
+// A runtime-false condition, an earlier return, or a goto over the call are all
+// undecidable syntactically; reth_hook_wired_5103_test.go says the same thing
+// about its own reachability check and for the same reason. What bounds that
+// residual is not this file: an acquisition that stops happening changes
+// observable behaviour, so the daemon's own suite fails (14 tests, measured).
+// The direction with NO such backstop is an added-but-never-invoked
+// acquisition, which is what the rest of this guard is for.
+func isConstFalseIf(chain []ast.Node, j int) bool {
+	ifStmt, ok := chain[j].(*ast.IfStmt)
+	if !ok {
+		return false
+	}
+	lit, ok := ifStmt.Cond.(*ast.Ident)
+	if !ok || lit.Name != "false" {
+		return false
+	}
+	// Only the BODY is unreachable; an else branch under `if false` runs.
+	return j+1 < len(chain) && ast.Node(ifStmt.Body) == chain[j+1]
+}
 
 // funcLitMark renders the func-literal marker for the literal at chain[j],
 // naming it when the source does.
@@ -401,14 +439,25 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 	if !ok {
 		return nil, false
 	}
-	add := func(m string) {
-		for _, have := range marks {
-			if have == m {
-				return
-			}
-		}
-		marks = append(marks, m)
-	}
+	// EVERY boundary, in order, WITHOUT deduplication (#6871 round 16). marks is
+	// the chain of things between the call and its declaration, so collapsing
+	// equal entries destroys the nesting DEPTH — which is the same mistake, in a
+	// different container, that round 15 fixed in refs.calls. Measured: with the
+	// duplicates removed,
+	//
+	//	beforeCycle := func() error {
+	//	    beforeCycle := func() { _ = d.dp.Link().PrepareLinkCycle() }
+	//	    go beforeCycle()
+	//	    return nil
+	//	}
+	//
+	// renders the same marker at both nesting levels, the two collapse into one,
+	// and the key becomes byte-identical to the allowlisted single-level one —
+	// green, with the acquisition launched on a goroutine that outlives the
+	// apply. The unshadowed spelling of that escape (an inner literal named
+	// anything else) is caught by the labels alone, which is why round 15 closed
+	// it without meaning to; this is the residual that survived.
+	add := func(m string) { marks = append(marks, m) }
 	if callIdx > 0 {
 		if g, ok := chain[callIdx-1].(*ast.GoStmt); ok && g.Call == call {
 			add(markGo)
@@ -418,6 +467,10 @@ func classifyRef(chain []ast.Node) (marks []string, isCall bool) {
 	// is written in. Each one that is not immediately invoked defers the call
 	// to whenever that literal's value is invoked, if ever.
 	for j := callIdx - 1; j >= 0; j-- {
+		if isConstFalseIf(chain, j) {
+			add(markUnreachable)
+			continue
+		}
 		if _, ok := chain[j].(*ast.FuncLit); !ok {
 			continue
 		}
@@ -587,9 +640,30 @@ func reportLeaseRefEscapes(t *testing.T, method string, escapes []string) {
 }
 
 // testFuncNamed reports whether a Go test function of that name exists anywhere
-// under root. Deliberately a whole-tree scan and not a lookup in this package:
-// the proof a marked site leans on lives wherever the dependency lives, which
-// for the daemon's callback site is pkg/daemon.
+// under root, IS COMPILED, and has a test's signature. Deliberately a whole-tree
+// scan and not a lookup in this package: the proof a marked site leans on lives
+// wherever the dependency lives, which for the daemon's callback site is
+// pkg/daemon.
+//
+// All three conditions are load-bearing, and two of them were missing until
+// #6871 round 16. The check was "a receiverless declaration with this name
+// exists", which two things satisfy without proving anything, both measured
+// green:
+//
+//   - a same-named dummy behind `//go:build never`. That is not a weak test, it
+//     is not in ANY test binary — parser.ParseFile reads build-constrained files
+//     happily, which is the property this file relies on ELSEWHERE (a plant
+//     behind a false build tag is still caught as an acquisition site). Here the
+//     same property inverts: for a PROOF, being excluded from the build is
+//     disqualifying. So this one asks go/build whether the file is in the
+//     current build context, while callSitesOf deliberately does not.
+//   - an ordinary function that happens to carry the name. `go test` runs
+//     nothing that is not func TestXxx(*testing.T).
+//
+// The residual is one sentence and it is real: nothing here judges whether the
+// named test PROVES what the allowlist entry says it proves. That needs a
+// reader. What this rules out is the test not running at all, which is not a
+// semantic question and should never have been filed as one.
 func testFuncNamed(t *testing.T, root, name string) bool {
 	t.Helper()
 	found := false
@@ -608,13 +682,19 @@ func testFuncNamed(t *testing.T, root, name string) bool {
 		if !strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
+		// Build constraints and GOOS/GOARCH filename suffixes both, under the
+		// context this suite is running in.
+		inBuild, merr := build.Default.MatchFile(filepath.Dir(path), filepath.Base(path))
+		if merr != nil || !inBuild {
+			return nil
+		}
 		file, perr := parser.ParseFile(fset, path, nil, 0)
 		if perr != nil {
 			return nil
 		}
 		for _, decl := range file.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
-			if ok && fd.Recv == nil && fd.Name.Name == name {
+			if ok && fd.Recv == nil && fd.Name.Name == name && isGoTestSignature(fd) {
 				found = true
 			}
 		}
@@ -624,6 +704,22 @@ func testFuncNamed(t *testing.T, root, name string) bool {
 		t.Fatalf("walk %s for %s: %v", root, name, err)
 	}
 	return found
+}
+
+// isGoTestSignature reports whether fd is something `go test` will actually run:
+// func TestXxx(*testing.T), no results.
+func isGoTestSignature(fd *ast.FuncDecl) bool {
+	if !strings.HasPrefix(fd.Name.Name, "Test") {
+		return false
+	}
+	if fd.Type.Results != nil && len(fd.Type.Results.List) > 0 {
+		return false
+	}
+	params := fd.Type.Params
+	if params == nil || len(params.List) != 1 || len(params.List[0].Names) != 1 {
+		return false
+	}
+	return types.ExprString(params.List[0].Type) == "*testing.T"
 }
 
 // requireUnprovenFormsAreBound enforces the contract on marked keys in both

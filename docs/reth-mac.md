@@ -446,6 +446,26 @@ repaired. That is the same trade already argued for the single-member case — a
 stranded lease on a path where forwarding is down would add a frozen reconcile
 loop to an outage in progress — and the commit fails on that path regardless.
 
+**The preconditions for that residual, written down because its trigger is map
+order.** Reaching it needs all of:
+
+1. **two or more RETH members** in one apply (`cfg.RethToPhysical()`);
+2. one member — call it A — whose **live MAC set is refused**, so it takes a
+   lease and completes its cycle;
+3. a **later** member B whose live set is also refused, so it takes a lease and
+   then fails after the join (a `PrepareLinkCycle` error, or a `setDown` /
+   cycled-MAC-write failure), routing it into the rollback; **and**
+4. B's rollback rebind itself failing.
+
+Steps 2 and 3 are ordered by the `rethToPhys` **Go map range**, so whether a
+given apply hits this is not deterministic across runs — the shape this document
+elsewhere calls the worst to reproduce. The end state is workers joined, ctrl
+off, and no lease.
+
+It is **not a regression against master**: master had no lease at all, so it had
+neither the suppression nor this gap. It is a known limit of the lease as
+designed, recorded here rather than silently carried.
+
 **Round 7's answer was still an estimate, and round 8 stopped estimating.** The
 round-7 claim — "exactly one interval contains the only term with a hard ceiling,
 the 20s `ethtool`, so 60s is 3x the only bounded term" — was honest and
@@ -564,6 +584,25 @@ statement]` — for every way of writing it that the AST cannot prove runs insid
 the enclosing declaration's extent. Ordinary flow, `defer`, and an immediately
 invoked literal are contained and carry no marker; anything else cannot come to
 rest on a key that reads as a proof.
+
+**Markers are a list, not a set (#6871 round 16).** They describe the chain of
+boundaries between the call and its declaration, so collapsing equal entries
+destroys the nesting depth — the same multiplicity mistake as the call map,
+in a different container. With duplicates removed, an inner literal that
+*shadows the outer one's name* renders the same marker at both levels, the two
+merge, and the key becomes byte-identical to the allowlisted single-level one
+while the acquisition is launched on a goroutine that outlives the apply.
+Measured green before the fix. A third marker, `[under a constant-false if]`,
+covers a decoy written to keep an allowlist entry satisfied after the real
+acquisition is deleted; general reachability is undecidable syntactically, and
+what bounds *that* residual is the daemon's own suite, because an acquisition
+that stops happening changes observable behaviour.
+
+The named behavioural proof is checked for three things — that it exists, that
+its file is **in the build** (a `//go:build never` dummy is in no test binary at
+all), and that it has a `func TestXxx(*testing.T)` signature `go test` will
+actually run. What is left is one honest sentence: nothing verifies the named
+test *proves* what the entry says it proves. That needs a reader.
 
 That distinction is not academic here, because **the daemon's one production
 acquisition is itself a marked site**: it is written in the `beforeCycle`
