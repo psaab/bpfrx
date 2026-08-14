@@ -2901,8 +2901,8 @@ func validateNATTerminalActionCardinalityStrict(cfg *Config) error {
 					return fmt.Errorf(
 						"%s-nat rule-set %q rule %q: `then` carries %d mutually-exclusive "+
 							"translation actions (expected exactly one of %s); %s, so all but "+
-							"one action is silently discarded and the survivor is not the one "+
-							"you configured first or last. (Duplicate `then` CONTAINERS resolve "+
+							"one action is silently discarded and the survivor is not chosen "+
+							"by configuration order. (Duplicate `then` CONTAINERS resolve "+
 							"last-wins per #3850; this rejects contradictory actions inside one "+
 							"block.)",
 						kind, rs.Name, rule.Name, n, actions, mechanism)

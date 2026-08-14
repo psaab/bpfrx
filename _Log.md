@@ -79590,3 +79590,33 @@ no wording changed. Zero `afxdp/ha.rs` citations remain in the file. No
   pkg/config/compiler_peer_effective_nat_terminal_action_6820_test.go,
   pkg/dataplane/userspace/nat_terminal_action_tolerant_5717_test.go,
   userspace-dp/src/nat/tests_destination.rs, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-08-14T03:20Z
+- **Action**: #6820 round 4 — one-line correction to the operator-facing string round 3
+  itself introduced. The 2+-action rejection ended "…the survivor is not the one you
+  configured **first or last**". For a 2-action rule that is literally false: one action
+  IS first and the other IS last. This PR's own DNAT fixture is an instance —
+  `destination-nat pool PD` authored first, `off` second, and `off` wins.
+
+  The instructive part is where the error was and was not. Three renderings of the same
+  fix shipped together; `docs/config-schema.md:3120` and
+  `compiler_peer_effective_nat_terminal_action_6820_test.go` both carry the precise form
+  ("not chosen BY configuration order"), which is true. Only the operator-facing string
+  took the loose paraphrase — in a round whose entire subject was an operator-facing
+  sentence stating a mechanism the compiler does not use. The paraphrase reads better,
+  and the runtime string is exactly where "reads better" wins over "is true".
+
+  Fixed by adopting the docs/test wording verbatim rather than trying to make "first or
+  last" defensible, so all three renderings are now one sentence. Bound in
+  `TestNATTerminalActionMessageContent_6820` as an exact-phrase assertion with a comment
+  recording the pull toward the looser form, since the next editor will feel it too.
+
+  **Mutation.** Restoring round 3's paraphrase reds
+  `compiler_nat_terminal_action_5628_test.go:108` — FULL_RC=1, the only failure.
+
+  **Validation.** `go build ./...` rc 0; `go test -count=1 ./...` FULL_RC=0; `cargo test`
+  (full userspace-dp) FULL_RC=0; gofmt clean. Gates re-run at this tree, not carried —
+  the edit is the same operator-facing string literal, so the binary moves again, which
+  is the expected consequence of the fix rather than a finding.
+- **File(s)**: pkg/config/compiler_validate_strict_nat.go,
+  pkg/config/compiler_nat_terminal_action_5628_test.go, _Log.md

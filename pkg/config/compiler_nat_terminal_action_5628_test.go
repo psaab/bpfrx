@@ -92,6 +92,17 @@ func TestNATTerminalActionMessageContent_6820(t *testing.T) {
 		"fixed precedence",
 		"`off` wins over `interface`, and `interface` over `pool`",
 		"all but one action is silently discarded",
+		// #6820 round 4: the survivor clause must be the PRECISE form, the one
+		// docs/config-schema.md and the peer-effective test already carry. Round
+		// 3 shipped a looser paraphrase here — "not the one you configured first
+		// or last" — which is literally FALSE for a 2-action rule, where one
+		// action IS first and the other IS last (this test's own DNAT fixture
+		// authors `pool PD` first and `off` second, and `off` wins). Three
+		// renderings of one fix went out together and the operator-facing one was
+		// the wrong one, in a round whose subject was an operator-facing sentence
+		// being false. Assert the exact phrase, because the loose form reads
+		// better and that is precisely where it wins.
+		"the survivor is not chosen by configuration order",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("2+-action SNAT rejection missing %q — the message must describe the "+
